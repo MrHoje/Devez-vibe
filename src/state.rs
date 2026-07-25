@@ -24,7 +24,7 @@ struct SlashCommand {
     takes_argument: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 9] = [
+const SLASH_COMMANDS: [SlashCommand; 10] = [
     SlashCommand {
         name: "/model",
         description: "Switch model and reasoning",
@@ -68,6 +68,11 @@ const SLASH_COMMANDS: [SlashCommand; 9] = [
     SlashCommand {
         name: "/quit",
         description: "Exit Devez CLI",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/exit",
+        description: "Alias for /quit",
         takes_argument: false,
     },
 ];

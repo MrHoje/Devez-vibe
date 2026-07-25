@@ -27,6 +27,8 @@ Codex의 인증, 하네스 프롬프트, 도구, 스킬, `AGENTS.md`, 샌드박�
 - 보낸 프롬프트는 전체 행에 은은한 Claude형 배경색 적용
 - Sol·Terra·Luna·GPT-5.5 모델 색상을 picker와 statusline에 공통 적용
 - `/` 명령 자동완성 및 키보드 모델 선택기
+- `/` 명령 자동완성 패널을 하단 입력 영역 바로 위에 고정
+- `/exit`을 `/quit`과 같은 정상 종료 명령으로 지원
 - `Ctrl+Backspace`/`Ctrl+W` 단어 삭제, `Ctrl+K`/`Ctrl+U` 줄 삭제,
   `Ctrl+Y` 복원, `Alt+B`/`Alt+F` 단어 이동, `Ctrl+J` 줄바꿈
 - Markdown 제목·목록·인용·코드 블록 표현

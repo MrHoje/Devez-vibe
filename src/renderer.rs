@@ -451,14 +451,13 @@ fn normal_frame(
         lines.push(PaintLine::blank());
     }
 
+    let dock_index = lines.len();
     if !suggestions.is_empty() {
         lines.extend(suggestion_lines(suggestions, width));
-        lines.push(PaintLine::blank());
     }
 
     let (input_lines, input_cursor_line, input_cursor_col) =
         input_lines(editor, width, "", "Ask Codex to build, fix, or explain…");
-    let dock_index = lines.len();
     let cursor_line = lines.len() + input_cursor_line;
     lines.extend(input_lines);
     lines.push(status_line_row(status.line, &status.fallback, width));
@@ -1407,14 +1406,14 @@ fn set_tone(out: &mut Stdout, tone: Tone) -> Result<()> {
             b: 233,
         },
         Tone::ModelSol => Color::Rgb {
-            r: 248,
-            g: 113,
-            b: 113,
-        },
-        Tone::ModelTerra => Color::Rgb {
             r: 245,
             g: 158,
             b: 11,
+        },
+        Tone::ModelTerra => Color::Rgb {
+            r: 232,
+            g: 121,
+            b: 107,
         },
         Tone::ModelLuna => Color::Rgb {
             r: 167,
@@ -1534,6 +1533,42 @@ mod tests {
         assert!(prompt_rows.iter().all(|row| !row.prefix.contains('│')));
         assert!(prompt_rows.iter().all(|row| !row.text.ends_with(' ')));
         assert!(prompt_rows.iter().all(|row| !row.text.contains('│')));
+    }
+
+    #[test]
+    fn slash_suggestions_dock_directly_above_the_composer() {
+        let mut editor = Editor::default();
+        editor.set_text("/");
+        let suggestions = vec![SuggestionView {
+            command: "/model".to_owned(),
+            description: "Switch model".to_owned(),
+            selected: true,
+        }];
+        let mut frame = normal_frame(
+            &[],
+            &editor,
+            None,
+            &suggestions,
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+            },
+            80,
+        );
+        fit_frame(&mut frame, 20);
+
+        let suggestion_end = frame
+            .lines
+            .iter()
+            .position(|line| line.text.starts_with('╰'))
+            .expect("suggestion panel bottom");
+        assert!(
+            frame.lines[suggestion_end + 1]
+                .text
+                .chars()
+                .all(|ch| ch == '─')
+        );
     }
 
     #[test]
