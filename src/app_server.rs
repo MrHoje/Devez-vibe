@@ -270,6 +270,16 @@ fn codex_command(resolved: &Path) -> Command {
             .and_then(|extension| extension.to_str())
             .unwrap_or_default();
         if extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat") {
+            // `codex.js` only locates the vendored binary and re-spawns it, so going
+            // straight to that binary saves a whole Node boot on every launch.
+            if let Some(root) = resolved.parent()
+                && let Some(binary) = vendored_codex_binary(root)
+            {
+                let mut command = Command::new(binary);
+                command.args(["app-server", "--listen", "stdio://"]);
+                return command;
+            }
+
             if let Some(root) = resolved.parent() {
                 let script = root
                     .join("node_modules")
@@ -306,6 +316,42 @@ fn codex_command(resolved: &Path) -> Command {
     let mut command = Command::new(resolved);
     command.args(["app-server", "--listen", "stdio://"]);
     command
+}
+
+/// Finds the platform binary the `@openai/codex` npm package vendors, mirroring the
+/// lookup `bin/codex.js` performs. `root` is the directory holding the npm shim.
+#[cfg(windows)]
+fn vendored_codex_binary(root: &Path) -> Option<PathBuf> {
+    let triple = match std::env::consts::ARCH {
+        "x86_64" => "x86_64-pc-windows-msvc",
+        "aarch64" => "aarch64-pc-windows-msvc",
+        _ => return None,
+    };
+    let platform_package = format!(
+        "codex-win32-{}",
+        match std::env::consts::ARCH {
+            "x86_64" => "x64",
+            _ => "arm64",
+        }
+    );
+    let codex_package = root.join("node_modules").join("@openai").join("codex");
+    // npm hoists the platform package beside `codex`; nested installs keep their own copy.
+    let roots = [
+        codex_package
+            .join("node_modules")
+            .join("@openai")
+            .join(&platform_package)
+            .join("vendor"),
+        root.join("node_modules")
+            .join("@openai")
+            .join(&platform_package)
+            .join("vendor"),
+        codex_package.join("vendor"),
+    ];
+    roots
+        .into_iter()
+        .map(|vendor| vendor.join(triple).join("bin").join("codex.exe"))
+        .find(|binary| binary.is_file())
 }
 
 fn resolve_command(command: &Path) -> PathBuf {

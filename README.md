@@ -46,8 +46,9 @@ cargo run --release
 주요 옵션:
 
 ```text
-devez [--resume [SESSION] | --continue] [--model MODEL] [--effort EFFORT]
-      [--cwd PATH] [--codex PATH]
+dvz [--resume [SESSION] | --continue] [--model MODEL] [--effort EFFORT]
+    [--cwd PATH] [--codex PATH] [--theme THEME]
+dvz update
 ```
 
 `--resume`만 입력하면 검색 가능한 세션 피커를 열고, `--continue`는 현재 폴더의

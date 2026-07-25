@@ -1,0 +1,36 @@
+{
+  "name": "devez-cli",
+  "version": "0.4.9",
+  "description": "Stable terminal UI for the official Codex app-server",
+  "keywords": [
+    "codex",
+    "cli",
+    "tui",
+    "terminal",
+    "app-server"
+  ],
+  "homepage": "https://github.com/MrHoje/Devez-cli#readme",
+  "bugs": "https://github.com/MrHoje/Devez-cli/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MrHoje/Devez-cli.git"
+  },
+  "license": "MIT",
+  "bin": {
+    "dvz": "bin/dvz.exe"
+  },
+  "files": [
+    "bin/dvz.exe",
+    "README.md",
+    "LICENSE"
+  ],
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -80,13 +80,7 @@ pub struct ThemePalette {
     pub purple: Rgb,
     pub pink: Rgb,
     pub orange: Rgb,
-    /// Indigo lives between `blue` and `purple` so the status line can tell
-    /// `eff: high` apart from the branch and the 5h window.
-    pub indigo: Rgb,
-    /// Sky-leaning blue reserved for the status line branch segment.
-    pub branch: Rgb,
-    /// Emerald reserved for the status line context (`ctx:`) segment.
-    pub context: Rgb,
+    pub status: StatusLinePalette,
     pub code: Rgb,
     pub syntax_comment: Rgb,
     pub syntax_string: Rgb,
@@ -103,6 +97,33 @@ pub struct ThemePalette {
     pub model_change_bg: Rgb,
 }
 
+/// Status line colors, kept apart from the rest of the palette because they are
+/// copied verbatim from DevezCode's `Resources/StatusLine/statusline.js` so both
+/// products paint the same row. That script maximizes saturation on light
+/// backgrounds to keep the segments tellable apart, which trades away the
+/// background contrast the other palette colors are held to — see
+/// `status_line_colors_stay_visible`. Do not "fix" these values in isolation;
+/// change them together with the shared script or the two drift apart.
+#[derive(Clone, Copy)]
+pub struct StatusLinePalette {
+    /// Fallback for segments with no color of their own (`MAIN`).
+    pub text: Rgb,
+    /// The ` | ` between segments (`SEP`).
+    pub separator: Rgb,
+    pub branch: Rgb,
+    /// The `ctx:` segment (`CTX`).
+    pub context: Rgb,
+    pub effort_low: Rgb,
+    pub effort_medium: Rgb,
+    pub effort_high: Rgb,
+    pub effort_xhigh: Rgb,
+    pub effort_max: Rgb,
+    /// The 5h window segment (`TIME`).
+    pub five_hour: Rgb,
+    /// The `week:` segment (`WEEK`).
+    pub weekly: Rgb,
+}
+
 pub const MINIMAL: ThemePalette = ThemePalette {
     background: Rgb(0xF8, 0xFA, 0xFC),
     foreground: Rgb(0x0F, 0x17, 0x2A),
@@ -116,9 +137,19 @@ pub const MINIMAL: ThemePalette = ThemePalette {
     purple: Rgb(0x7C, 0x3A, 0xED),
     pink: Rgb(0xBE, 0x18, 0x5D),
     orange: Rgb(0xBC, 0x4C, 0x00),
-    indigo: Rgb(0x43, 0x38, 0xCA),
-    branch: Rgb(0x03, 0x69, 0xA1),
-    context: Rgb(0x00, 0x79, 0x5C),
+    status: StatusLinePalette {
+        text: Rgb(0x0F, 0x14, 0x22),
+        separator: Rgb(0x0F, 0x14, 0x22),
+        branch: Rgb(0x00, 0x91, 0xD1),
+        context: Rgb(0x00, 0x8E, 0x5A),
+        effort_low: Rgb(0xD1, 0x9F, 0x00),
+        effort_medium: Rgb(0x00, 0xA7, 0x40),
+        effort_high: Rgb(0x43, 0x38, 0xCA),
+        effort_xhigh: Rgb(0x7C, 0x00, 0xD1),
+        effort_max: Rgb(0xD1, 0x00, 0x00),
+        five_hour: Rgb(0x00, 0x5E, 0xD1),
+        weekly: Rgb(0x35, 0x00, 0xD1),
+    },
     code: Rgb(0x0F, 0x17, 0x2A),
     syntax_comment: Rgb(0x00, 0x80, 0x00),
     syntax_string: Rgb(0xA3, 0x15, 0x15),
@@ -148,9 +179,19 @@ pub const SOFT: ThemePalette = ThemePalette {
     purple: Rgb(0x68, 0x4B, 0x8A),
     pink: Rgb(0x8F, 0x3D, 0x5A),
     orange: Rgb(0x9A, 0x4D, 0x12),
-    indigo: Rgb(0x43, 0x38, 0xCA),
-    branch: Rgb(0x2F, 0x6E, 0x8F),
-    context: Rgb(0x1F, 0x6B, 0x52),
+    status: StatusLinePalette {
+        text: Rgb(0x16, 0x12, 0x0C),
+        separator: Rgb(0x16, 0x12, 0x0C),
+        branch: Rgb(0x00, 0x8D, 0xCC),
+        context: Rgb(0x00, 0x8B, 0x58),
+        effort_low: Rgb(0xCC, 0x9C, 0x00),
+        effort_medium: Rgb(0x00, 0xA3, 0x3F),
+        effort_high: Rgb(0x43, 0x38, 0xCA),
+        effort_xhigh: Rgb(0x79, 0x00, 0xCC),
+        effort_max: Rgb(0xCC, 0x00, 0x00),
+        five_hour: Rgb(0x00, 0x5B, 0xCC),
+        weekly: Rgb(0x33, 0x00, 0xCC),
+    },
     code: Rgb(0x2A, 0x26, 0x20),
     syntax_comment: Rgb(0x32, 0x6A, 0x32),
     syntax_string: Rgb(0x98, 0x3B, 0x34),
@@ -180,9 +221,19 @@ pub const DARK: ThemePalette = ThemePalette {
     purple: Rgb(0xA7, 0x8B, 0xFA),
     pink: Rgb(0xF4, 0x72, 0xB6),
     orange: Rgb(0xFB, 0x92, 0x3C),
-    indigo: Rgb(0x9B, 0xA1, 0xD6),
-    branch: Rgb(0x8F, 0xB8, 0xE8),
-    context: Rgb(0x34, 0xC8, 0x9A),
+    status: StatusLinePalette {
+        text: Rgb(0xC7, 0xC8, 0xCB),
+        separator: Rgb(0x82, 0x90, 0xA0),
+        branch: Rgb(0x82, 0xAC, 0xDA),
+        context: Rgb(0x32, 0xB7, 0x86),
+        effort_low: Rgb(0xC0, 0x97, 0x14),
+        effort_medium: Rgb(0x3C, 0x8A, 0x58),
+        effort_high: Rgb(0x9B, 0xA1, 0xD6),
+        effort_xhigh: Rgb(0x9A, 0x77, 0xDB),
+        effort_max: Rgb(0xD7, 0x65, 0x64),
+        five_hour: Rgb(0x57, 0x91, 0xD7),
+        weekly: Rgb(0x93, 0x7B, 0xD7),
+    },
     code: Rgb(0xE8, 0xE8, 0xE8),
     syntax_comment: Rgb(0x6A, 0x99, 0x55),
     syntax_string: Rgb(0xCE, 0x91, 0x78),
@@ -291,9 +342,6 @@ mod tests {
                 ("purple", palette.purple),
                 ("pink", palette.pink),
                 ("orange", palette.orange),
-                ("indigo", palette.indigo),
-                ("branch", palette.branch),
-                ("context", palette.context),
                 ("code", palette.code),
                 ("syntax_comment", palette.syntax_comment),
                 ("syntax_string", palette.syntax_string),
@@ -347,26 +395,66 @@ mod tests {
                 ThemeKind::Soft => SOFT,
                 ThemeKind::Dark => DARK,
             };
+            let status = palette.status;
             assert_all_distinct(
                 theme,
                 &[
-                    ("branch", palette.branch),
-                    ("ctx", palette.context),
-                    ("5h", palette.blue),
-                    ("week", palette.purple),
-                    ("separator", palette.muted),
+                    ("branch", status.branch),
+                    ("ctx", status.context),
+                    ("5h", status.five_hour),
+                    ("week", status.weekly),
+                    ("separator", status.separator),
                 ],
             );
             assert_all_distinct(
                 theme,
                 &[
-                    ("eff: low", palette.warning),
-                    ("eff: medium", palette.success),
-                    ("eff: high", palette.indigo),
-                    ("eff: xhigh", palette.purple),
-                    ("eff: max", palette.error),
+                    ("eff: low", status.effort_low),
+                    ("eff: medium", status.effort_medium),
+                    ("eff: high", status.effort_high),
+                    ("eff: xhigh", status.effort_xhigh),
+                    ("eff: max", status.effort_max),
                 ],
             );
+        }
+    }
+
+    /// The status line is exempt from the 4.5:1 bar that
+    /// `every_theme_has_readable_core_contrast` holds the rest of the palette
+    /// to, because its colors mirror DevezCode's shared statusline script,
+    /// which favours hue separation over contrast on light backgrounds. This
+    /// floor is only a backstop against a segment going invisible: the lowest
+    /// today is Soft `eff: low` at 2.17:1.
+    #[test]
+    fn status_line_colors_stay_visible() {
+        for theme in ThemeKind::ALL {
+            let palette = match theme {
+                ThemeKind::Minimal => MINIMAL,
+                ThemeKind::Soft => SOFT,
+                ThemeKind::Dark => DARK,
+            };
+            let status = palette.status;
+            let segments = [
+                ("text", status.text),
+                ("separator", status.separator),
+                ("branch", status.branch),
+                ("ctx", status.context),
+                ("eff: low", status.effort_low),
+                ("eff: medium", status.effort_medium),
+                ("eff: high", status.effort_high),
+                ("eff: xhigh", status.effort_xhigh),
+                ("eff: max", status.effort_max),
+                ("5h", status.five_hour),
+                ("week", status.weekly),
+            ];
+            for (name, color) in segments {
+                let ratio = contrast_ratio(color, palette.background);
+                assert!(
+                    ratio >= 2.0,
+                    "{} status {name} contrast is only {ratio:.2}:1",
+                    theme.display_name()
+                );
+            }
         }
     }
 

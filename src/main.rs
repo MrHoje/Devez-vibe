@@ -1,5 +1,6 @@
 mod app_server;
 mod editor;
+mod pricing;
 mod renderer;
 mod state;
 mod theme;
@@ -7,32 +8,36 @@ mod update;
 
 use std::{
     env,
+    future::Future,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
 use app_server::{AppServer, ServerEvent};
 use arboard::Clipboard;
 use clap::Parser;
-use crossterm::event::{Event, EventStream};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use editor::Editor;
 use futures_util::StreamExt;
 use renderer::{BlockKind, Renderer, TerminalSession, View};
 use serde_json::{Value, json};
 use state::{
-    AccountPlan, Action, AppState, ModelInfo, SessionInfo, SessionPicker, SessionPickerResult,
-    load_model_context_windows,
+    AccountPlan, Action, AppState, LoginMethod, ModelInfo, SPINNER, SessionInfo, SessionPicker,
+    SessionPickerResult, load_model_context_windows,
 };
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 
 #[derive(Parser)]
 #[command(
-    name = "devez",
+    name = "dvz",
     version,
     about = "Stable terminal UI for the official Codex app-server"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Resume by ID/name, or open the session picker when no value is given.
     #[arg(
         short = 'r',
@@ -69,9 +74,81 @@ struct Cli {
     theme: Option<String>,
 }
 
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Install the latest published release from npm.
+    Update,
+}
+
+/// Native terminal selection happens outside crossterm, so watch the clipboard
+/// and bridge successful copy-on-select changes back into the TUI notice.
+struct ClipboardWatcher {
+    clipboard: Option<Clipboard>,
+    #[cfg(windows)]
+    revision: Option<u32>,
+    #[cfg(not(windows))]
+    last_text: Option<String>,
+}
+
+impl ClipboardWatcher {
+    fn new() -> Self {
+        #[cfg(windows)]
+        {
+            Self {
+                clipboard: Clipboard::new().ok(),
+                revision: clipboard_win::seq_num().map(|revision| revision.get()),
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            let mut clipboard = Clipboard::new().ok();
+            let last_text = clipboard
+                .as_mut()
+                .and_then(|clipboard| clipboard.get_text().ok());
+            Self {
+                clipboard,
+                last_text,
+            }
+        }
+    }
+
+    fn copied_char_count(&mut self) -> Option<usize> {
+        #[cfg(windows)]
+        {
+            let revision = clipboard_win::seq_num()?.get();
+            if self.revision == Some(revision) {
+                return None;
+            }
+            self.revision = Some(revision);
+            return self
+                .clipboard
+                .as_mut()?
+                .get_text()
+                .ok()
+                .filter(|text| !text.is_empty())
+                .map(|text| text.chars().count());
+        }
+
+        #[cfg(not(windows))]
+        {
+            let text = self.clipboard.as_mut()?.get_text().ok()?;
+            if self.last_text.as_deref() == Some(text.as_str()) {
+                return None;
+            }
+            let count = text.chars().count();
+            self.last_text = Some(text);
+            (count > 0).then_some(count)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Some(Command::Update)) {
+        return update::run_self_update();
+    }
     let selected_theme = theme::load(cli.theme.as_deref())?;
     theme::set_current(selected_theme);
     let mut server = AppServer::spawn(&cli.codex).await?;
@@ -112,15 +189,73 @@ async fn run(cli: &Cli, server: &mut AppServer) -> Result<()> {
                 .unwrap_or(requested_model_name.as_str()),
         )
     };
-    let thread_response = start_or_resume_thread(
-        server,
-        is_resuming.then_some(resume_id.as_str()),
-        model_override,
-        cli.cwd.as_ref().map(|_| cwd.as_path()),
-        &cwd,
+    // `thread/start` can take seconds, so the composer goes up first and the wait
+    // happens behind a spinner instead of a blank terminal.
+    let terminal = TerminalSession::enter()?;
+    let mut renderer = Renderer::new(theme::current());
+    renderer.clear_screen()?;
+    let startup = await_startup(
+        &mut renderer,
+        start_or_resume_thread(
+            server,
+            is_resuming.then_some(resume_id.as_str()),
+            model_override,
+            cli.cwd.as_ref().map(|_| cwd.as_path()),
+            &cwd,
+        ),
+        read_account_plan(server),
     )
-    .await?;
+    .await;
+    let ui_result = match startup {
+        Ok(Some(startup)) => {
+            open_session(
+                server,
+                &mut renderer,
+                startup,
+                account,
+                models,
+                cli,
+                &cwd,
+                requested_model_name,
+                is_resuming,
+            )
+            .await
+        }
+        Ok(None) => Ok(()),
+        Err(error) => Err(error),
+    };
+    let _ = renderer.finish();
+    drop(terminal);
+    ui_result
+}
 
+/// What [`await_startup`] hands back once the slow launch requests land.
+struct Startup {
+    thread_response: Value,
+    account_plan: AccountPlan,
+    /// Whatever the user typed into the composer while waiting.
+    typed: String,
+}
+
+/// Builds the session state from a resolved [`Startup`] and runs the UI. Split out
+/// of [`run`] so every exit path still restores the terminal.
+#[allow(clippy::too_many_arguments)]
+async fn open_session(
+    server: &mut AppServer,
+    renderer: &mut Renderer,
+    startup: Startup,
+    account: String,
+    models: Vec<ModelInfo>,
+    cli: &Cli,
+    cwd: &Path,
+    requested_model_name: String,
+    is_resuming: bool,
+) -> Result<()> {
+    let Startup {
+        thread_response,
+        account_plan,
+        typed,
+    } = startup;
     let thread = thread_response
         .get("thread")
         .context("thread 응답에 thread가 없습니다.")?;
@@ -155,10 +290,12 @@ async fn run(cli: &Cli, server: &mut AppServer) -> Result<()> {
         &actual_model,
         actual_effort.as_deref(),
     );
-    state.set_account_plan(read_account_plan(server).await);
-    let _ = refresh_integrations(server, &mut state, false).await;
+    state.set_account_plan(account_plan);
     if is_resuming {
         state.load_history(thread);
+    }
+    if !typed.is_empty() {
+        state.handle_paste(&typed);
     }
 
     let (update_tx, update_rx) = mpsc::channel(1);
@@ -168,13 +305,101 @@ async fn run(cli: &Cli, server: &mut AppServer) -> Result<()> {
         }
     });
 
-    let terminal = TerminalSession::enter()?;
-    let mut renderer = Renderer::new(theme::current());
+    // The real frame replaces the startup spinner before the slash-command
+    // catalogue is fetched, so the wait never blocks a usable screen.
     renderer.clear_screen()?;
-    let ui_result = event_loop(server, &mut state, &mut renderer, update_rx).await;
-    let _ = renderer.finish();
-    drop(terminal);
-    ui_result
+    draw(&mut state, renderer)?;
+    let _ = refresh_integrations(server, &mut state, false).await;
+    event_loop(server, &mut state, renderer, update_rx).await
+}
+
+/// Keeps the composer painted while the launch requests are in flight. Returns
+/// `Ok(None)` when the user quits before the session is ready.
+async fn await_startup(
+    renderer: &mut Renderer,
+    thread: impl Future<Output = Result<Value>>,
+    plan: impl Future<Output = AccountPlan>,
+) -> Result<Option<Startup>> {
+    let mut editor = Editor::default();
+    let mut events = EventStream::new();
+    let mut spinner_tick = tokio::time::interval(Duration::from_millis(120));
+    spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let started = Instant::now();
+    let mut frame = 0;
+    let pending = async { tokio::join!(thread, plan) };
+    tokio::pin!(pending);
+
+    loop {
+        renderer.render(
+            &[],
+            View {
+                live_blocks: Vec::new(),
+                overlay: None,
+                editor: &editor,
+                welcome: None,
+                suggestions: Vec::new(),
+                activity: Some(format!(
+                    "{} 세션 준비 중… {}s",
+                    SPINNER[frame],
+                    started.elapsed().as_secs()
+                )),
+                footer: String::new(),
+                status_line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+        )?;
+
+        tokio::select! {
+            (thread_response, account_plan) = &mut pending => {
+                return Ok(Some(Startup {
+                    thread_response: thread_response?,
+                    account_plan,
+                    typed: editor.text(),
+                }));
+            }
+            event = events.next() => {
+                match event {
+                    Some(Ok(Event::Key(key))) => {
+                        if quits_startup(key) {
+                            return Ok(None);
+                        }
+                        edit_while_waiting(&mut editor, key);
+                    }
+                    Some(Ok(Event::Paste(text))) => editor.insert_str(&text),
+                    Some(Ok(Event::Resize(_, _))) => renderer.relayout()?,
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return Err(error.into()),
+                    None => return Ok(None),
+                }
+            }
+            _ = spinner_tick.tick() => frame = (frame + 1) % SPINNER.len(),
+        }
+    }
+}
+
+fn quits_startup(key: KeyEvent) -> bool {
+    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        && matches!(key.code, KeyCode::Char('c' | 'd'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// Composer editing available before the session exists: enough to start typing a
+/// prompt, but no submit — there is nothing to submit to yet.
+fn edit_while_waiting(editor: &mut Editor, key: KeyEvent) {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return;
+    }
+    match key.code {
+        KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => editor.insert(ch),
+        KeyCode::Backspace => editor.backspace(),
+        KeyCode::Delete => editor.delete(),
+        KeyCode::Left => editor.move_left(),
+        KeyCode::Right => editor.move_right(),
+        KeyCode::Home => editor.move_home(),
+        KeyCode::End => editor.move_end(),
+        _ => {}
+    }
 }
 
 async fn resolve_startup_session(
@@ -233,7 +458,7 @@ async fn choose_startup_session(sessions: Vec<SessionInfo>, cwd: &Path) -> Resul
                 SessionPickerResult::Select(thread_id) => break Ok(Some(thread_id)),
             },
             Some(Ok(Event::Paste(text))) => picker.handle_paste(&text),
-            Some(Ok(Event::Resize(_, _))) => {}
+            Some(Ok(Event::Resize(_, _))) => renderer.relayout()?,
             Some(Ok(_)) => {}
             Some(Err(error)) => break Err(error.into()),
             None => break Ok(None),
@@ -255,6 +480,8 @@ async fn event_loop(
     let mut terminal_events = EventStream::new();
     let mut activity_tick = tokio::time::interval(Duration::from_millis(120));
     activity_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut clipboard_watcher = ClipboardWatcher::new();
+    let mut resize = ResizeTracker::new();
     draw(state, renderer)?;
 
     loop {
@@ -267,7 +494,11 @@ async fn event_loop(
                         state.handle_paste(&text);
                         Action::None
                     }
-                    Some(Ok(Event::Resize(_, _))) => Action::None,
+                    Some(Ok(Event::Resize(columns, rows))) => {
+                        resize.observe((columns, rows));
+                        // The relayout lands on the settle tick, not here.
+                        Action::Tick(false)
+                    }
                     Some(Ok(_)) => Action::None,
                     Some(Err(error)) => {
                         state.push_notice(BlockKind::Error, "터미널 입력 오류", error.to_string());
@@ -312,7 +543,22 @@ async fn event_loop(
                 Action::None
             }
             _ = activity_tick.tick() => {
-                Action::Tick(state.tick())
+                let mut redraw = state.tick();
+                if let Some(count) = clipboard_watcher.copied_char_count() {
+                    state.set_copy_notice(count);
+                    redraw = true;
+                }
+                // Ctrl+wheel font zoom changes the cell grid without always
+                // sending a `Resize`, so the size is polled here as well.
+                resize.observe(terminal_size());
+                if resize.settled() {
+                    renderer.relayout()?;
+                    redraw = true;
+                } else if resize.pending() {
+                    // Nothing painted onto a grid that is still moving survives.
+                    redraw = false;
+                }
+                Action::Tick(redraw)
             }
         };
 
@@ -326,6 +572,61 @@ async fn event_loop(
         }
     }
     Ok(())
+}
+
+/// Terminal geometry changes arrive in bursts: dragging a window edge, or
+/// holding Ctrl+wheel to zoom the font, fires one event per step. Every one of
+/// those steps leaves the terminal reflowing rows we wrapped ourselves, so
+/// painting into them mid-drag only stacks debris. This holds the repaint until
+/// the grid stops moving, then asks for exactly one exact layout.
+struct ResizeTracker {
+    size: (u16, u16),
+    settle_at: Option<Instant>,
+}
+
+impl ResizeTracker {
+    /// How still the grid has to be before it counts as the user having stopped.
+    /// Short enough that a single resize still feels immediate.
+    const SETTLE: Duration = Duration::from_millis(80);
+
+    fn new() -> Self {
+        Self {
+            size: terminal_size(),
+            settle_at: None,
+        }
+    }
+
+    /// Records the geometry the terminal is at now, arming a relayout when it
+    /// differs from the last one seen.
+    fn observe(&mut self, size: (u16, u16)) {
+        if size == self.size {
+            return;
+        }
+        self.size = size;
+        self.settle_at = Some(Instant::now() + Self::SETTLE);
+    }
+
+    /// True while a relayout is owed but the grid is still moving.
+    fn pending(&self) -> bool {
+        self.settle_at.is_some()
+    }
+
+    /// Fires once the grid has held still, so a drag is laid out at the size it
+    /// ended on rather than at every step along the way.
+    fn settled(&mut self) -> bool {
+        let Some(deadline) = self.settle_at else {
+            return false;
+        };
+        if Instant::now() < deadline {
+            return false;
+        }
+        self.settle_at = None;
+        true
+    }
+}
+
+fn terminal_size() -> (u16, u16) {
+    crossterm::terminal::size().unwrap_or((100, 30))
 }
 
 /// Waits for the background update check; parks forever once the channel is done.
@@ -377,6 +678,11 @@ async fn execute_action(
             }
         }
         Action::NewThread => {
+            // The app-server spends about five seconds inside `thread/start`,
+            // and the event loop cannot redraw while this action is awaited,
+            // so the notice has to be painted before the request goes out.
+            state.set_waiting_notice("새 세션을 시작하는 중…");
+            draw(state, renderer)?;
             let response = server
                 .request(
                     "thread/start",
@@ -425,6 +731,9 @@ async fn execute_action(
             Err(error) => state.push_notice(BlockKind::Error, "세션 목록 실패", error.to_string()),
         },
         Action::ResumeThread(target) => {
+            // `thread/resume` is as slow as `thread/start`; see Action::NewThread.
+            state.set_waiting_notice("세션을 불러오는 중…");
+            draw(state, renderer)?;
             let current_cwd = state.cwd.clone();
             let result = async {
                 let thread_id =
@@ -540,9 +849,13 @@ async fn execute_action(
         Action::ReturnFromSide => {
             let child_thread = state.thread_id.clone();
             let parent_thread = state.side_parent_thread_id().map(ToOwned::to_owned);
+            // `thread/resume` rebuilds the view from stored history, which knows
+            // nothing about a turn still in flight. Carry it across by hand.
+            let parent_turn = state.take_side_parent_turn();
             if let Some(parent_thread) = parent_thread {
                 match resume_into_state(server, state, renderer, &parent_thread).await {
                     Ok(()) => {
+                        state.restore_turn(parent_turn);
                         if let Err(error) = server
                             .request("thread/unsubscribe", json!({ "threadId": child_thread }))
                             .await
@@ -674,40 +987,21 @@ async fn execute_action(
                 }
             }
         }
-        Action::StartLogin => {
-            if let Some(login_id) = state.active_login_id() {
-                state.push_notice(
-                    BlockKind::Warning,
-                    "이미 로그인 중",
-                    format!("진행 중인 로그인이 있습니다: {login_id}"),
-                );
-                return Ok(false);
+        Action::StartLogin(method) => {
+            // The modal normally blocks input, so this only guards a stale login id.
+            if let Some(login_id) = state.active_login_id().map(ToOwned::to_owned) {
+                let _ = server
+                    .request("account/login/cancel", json!({ "loginId": login_id }))
+                    .await;
             }
             match server
-                .request("account/login/start", json!({ "type": "chatgpt" }))
+                .request(
+                    "account/login/start",
+                    json!({ "type": method.param_type() }),
+                )
                 .await
             {
-                Ok(response) => {
-                    let login_id = response.get("loginId").and_then(Value::as_str);
-                    let auth_url = response.get("authUrl").and_then(Value::as_str);
-                    match (login_id, auth_url) {
-                        (Some(login_id), Some(auth_url)) => {
-                            state.begin_login(login_id.to_owned(), auth_url.to_owned());
-                            if let Err(error) = open_url(auth_url) {
-                                state.push_notice(
-                                    BlockKind::Warning,
-                                    "브라우저 열기 실패",
-                                    format!("{error}\n위 URL을 직접 열어주세요."),
-                                );
-                            }
-                        }
-                        _ => state.push_notice(
-                            BlockKind::Error,
-                            "로그인 실패",
-                            "app-server가 loginId 또는 authUrl을 반환하지 않았습니다.",
-                        ),
-                    }
-                }
+                Ok(response) => start_login_flow(state, method, &response),
                 Err(error) => state.push_notice(BlockKind::Error, "로그인 실패", error.to_string()),
             }
         }
@@ -1097,7 +1391,11 @@ async fn execute_action(
                 state.push_notice(BlockKind::Error, "오류 응답 실패", error.to_string());
             }
         }
-        Action::ClearScreen => renderer.clear_screen()?,
+        // Both /clear and Ctrl+L land here, so the welcome comes back either way.
+        Action::ClearScreen => {
+            state.reset_welcome();
+            renderer.clear_screen()?;
+        }
         Action::Quit => return Ok(true),
     }
     Ok(false)
@@ -1145,16 +1443,17 @@ async fn refresh_integrations(
     state: &mut AppState,
     force_reload: bool,
 ) -> Result<()> {
-    let skills = list_skills(server, &state.cwd, force_reload).await;
-    let plugins = server
-        .request(
+    // Independent lookups, so pay the slowest one instead of their sum.
+    let (skills, plugins, apps) = tokio::join!(
+        list_skills(server, &state.cwd, force_reload),
+        server.request(
             "plugin/installed",
             json!({
                 "cwds": [state.cwd]
             }),
-        )
-        .await;
-    let apps = list_apps(server, &state.thread_id, force_reload).await;
+        ),
+        list_apps(server, &state.thread_id, force_reload),
+    );
     let mut errors = Vec::new();
     match skills {
         Ok(response) => state.update_skills(&response),
@@ -1745,6 +2044,50 @@ fn draw(state: &mut AppState, renderer: &mut Renderer) -> Result<()> {
     renderer.render(&committed, view)
 }
 
+/// Moves `/login` into its waiting state from an `account/login/start` response.
+/// The browser flow returns `authUrl`; the device flow returns a code to type.
+fn start_login_flow(state: &mut AppState, method: LoginMethod, response: &Value) {
+    let login_id = response.get("loginId").and_then(Value::as_str);
+    match method {
+        LoginMethod::Browser => {
+            let auth_url = response.get("authUrl").and_then(Value::as_str);
+            match (login_id, auth_url) {
+                (Some(login_id), Some(auth_url)) => {
+                    state.begin_login(login_id.to_owned(), auth_url.to_owned());
+                    if let Err(error) = open_url(auth_url) {
+                        state.push_notice(
+                            BlockKind::Warning,
+                            "브라우저 열기 실패",
+                            format!("{error}\n위 Sign-in URL을 직접 열어주세요."),
+                        );
+                    }
+                }
+                _ => state.push_notice(
+                    BlockKind::Error,
+                    "로그인 실패",
+                    "app-server가 loginId 또는 authUrl을 반환하지 않았습니다.",
+                ),
+            }
+        }
+        LoginMethod::DeviceCode => {
+            let url = response.get("verificationUrl").and_then(Value::as_str);
+            let user_code = response.get("userCode").and_then(Value::as_str);
+            match (login_id, url, user_code) {
+                (Some(login_id), Some(url), Some(user_code)) => state.begin_device_login(
+                    login_id.to_owned(),
+                    url.to_owned(),
+                    user_code.to_owned(),
+                ),
+                _ => state.push_notice(
+                    BlockKind::Error,
+                    "로그인 실패",
+                    "app-server가 verificationUrl 또는 userCode를 반환하지 않았습니다.",
+                ),
+            }
+        }
+    }
+}
+
 /// Re-reads the identity and entitlements after a login or an `account/updated`
 /// notification. Best-effort: a failure leaves the previous values in place.
 async fn refresh_account(server: &AppServer, state: &mut AppState) {
@@ -1998,6 +2341,41 @@ fn resolve_cwd(requested: Option<&Path>) -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    /// Text typed while `thread/start` is still running has to survive into the
+    /// session, otherwise the head start the spinner buys is worthless.
+    #[test]
+    fn typing_during_startup_is_kept_and_editable() {
+        let mut editor = Editor::default();
+        for ch in "hi!".chars() {
+            edit_while_waiting(&mut editor, press(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        edit_while_waiting(&mut editor, press(KeyCode::Backspace, KeyModifiers::NONE));
+
+        assert_eq!(editor.text(), "hi");
+    }
+
+    /// Enter must not submit before a thread exists, and Ctrl+C still bails out.
+    #[test]
+    fn startup_composer_refuses_submit_but_honours_quit() {
+        let mut editor = Editor::default();
+        edit_while_waiting(&mut editor, press(KeyCode::Char('a'), KeyModifiers::NONE));
+        edit_while_waiting(&mut editor, press(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(editor.text(), "a");
+        assert!(quits_startup(press(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!quits_startup(press(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE
+        )));
+    }
+
     #[test]
     fn plugin_resolution_prefers_exact_identity_and_preserves_policy() {
         let response = json!({
@@ -2079,5 +2457,25 @@ mod tests {
         let skill = resolve_skill(&response, "C:/two/SKILL.md").expect("path match");
         assert_eq!(skill.name, "review");
         assert!(!skill.enabled);
+    }
+
+    #[test]
+    fn a_resize_burst_lays_out_once_after_the_grid_stops_moving() {
+        let mut resize = ResizeTracker::new();
+        let (columns, rows) = resize.size;
+
+        resize.observe((columns, rows));
+        assert!(!resize.pending(), "the same grid is not a resize");
+
+        resize.observe((columns - 1, rows));
+        resize.observe((columns - 2, rows));
+        assert!(resize.pending(), "a relayout is owed");
+        assert!(!resize.settled(), "but not while the drag is still moving");
+
+        std::thread::sleep(ResizeTracker::SETTLE + Duration::from_millis(20));
+
+        assert!(resize.settled(), "the size the drag ended on is laid out");
+        assert!(!resize.settled(), "and only once");
+        assert!(!resize.pending());
     }
 }

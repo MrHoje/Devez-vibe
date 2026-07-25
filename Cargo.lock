@@ -301,6 +301,7 @@ dependencies = [
  "arboard",
  "chrono",
  "clap",
+ "clipboard-win",
  "crossterm",
  "futures-util",
  "reqwest",

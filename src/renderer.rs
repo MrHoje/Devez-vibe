@@ -118,6 +118,9 @@ pub struct ComposerMode {
     pub label: String,
     pub accent: ModeAccent,
     pub fast_mode: bool,
+    /// What the thread is estimated to have cost so far. Absent before the first
+    /// turn reports usage, and whenever the model has no published rate.
+    pub cost: Option<String>,
 }
 
 pub struct View<'a> {
@@ -195,14 +198,30 @@ impl Renderer {
         self.theme = selected_theme;
         theme::set_current(selected_theme);
         self.apply_terminal_theme()?;
+        self.relayout()
+    }
+
+    /// Lays the transcript out again for the current cell grid. A window resize
+    /// or a Ctrl+wheel font zoom leaves the terminal reflowing rows we wrapped
+    /// ourselves, which splits them in places we never chose, so the whole
+    /// screen is rebuilt at the new width instead. `render` repaints the live
+    /// frame straight after, since `reset_screen` drops the frame bookkeeping.
+    pub fn relayout(&mut self) -> Result<()> {
         self.reset_screen()?;
-        let history = self.history.clone();
         let width = terminal_size().unwrap_or((100, 30)).0.max(20);
+        // Moved out so the blocks can be printed without cloning the transcript;
+        // put back whether or not a write fails partway.
+        let history = std::mem::take(&mut self.history);
+        let mut outcome = Ok(());
         for block in &history {
             let lines = block_lines(block, width);
-            self.print_permanent(block, &lines)?;
+            if let Err(error) = self.print_permanent(block, &lines) {
+                outcome = Err(error);
+                break;
+            }
         }
-        Ok(())
+        self.history = history;
+        outcome
     }
 
     fn reset_screen(&mut self) -> Result<()> {
@@ -320,10 +339,10 @@ impl Renderer {
     }
 
     fn print_permanent(&mut self, block: &Block, lines: &[PaintLine]) -> Result<()> {
-        let assistant = matches!(block.kind, BlockKind::Assistant);
+        let tagged = copy_metadata_applies(block.kind);
         for (index, line) in lines.iter().enumerate() {
-            if assistant {
-                let marker_skip = usize::from(index == 0 && line.prefix == "● ")
+            if tagged {
+                let marker_skip = usize::from(index == 0 && is_copy_marker(&line.prefix))
                     * UnicodeWidthStr::width(line.prefix.as_str());
                 let join_next = usize::from(copy_joins_next(line));
                 let prefix_width = UnicodeWidthStr::width(line.prefix.as_str());
@@ -455,6 +474,8 @@ struct StatusArea {
 enum Tone {
     Plain,
     Muted,
+    /// Muted *and* italic: reserved for reasoning summaries.
+    Thinking,
     Accent,
     User,
     Success,
@@ -546,6 +567,17 @@ fn normal_frame(
     for block in live {
         lines.extend(block_lines(block, width));
     }
+    if !live.is_empty() {
+        lines.push(PaintLine::blank());
+    }
+
+    let dock_index = lines.len();
+    if !suggestions.is_empty() {
+        lines.extend(suggestion_lines(suggestions, width));
+    }
+
+    // Transient rows ride directly above the composer rule so they stay pinned to
+    // the prompt instead of scrolling away with the conversation.
     if let Some(activity) = activity {
         lines.extend(wrapped_line(
             "",
@@ -555,24 +587,25 @@ fn normal_frame(
             false,
             width,
         ));
-        lines.push(PaintLine::blank());
-    } else if !live.is_empty() {
+    }
+    if let Some(notice) = status.composer_notice.as_deref() {
+        lines.extend(wrapped_line(
+            "",
+            Tone::Success,
+            notice,
+            Tone::Success,
+            false,
+            width,
+        ));
+    }
+    // One blank row keeps a transient message off the composer rule; without a
+    // transient row the composer stays flush against whatever is above it.
+    if activity.is_some() || status.composer_notice.is_some() {
         lines.push(PaintLine::blank());
     }
 
-    let dock_index = lines.len();
-    if !suggestions.is_empty() {
-        lines.extend(suggestion_lines(suggestions, width));
-    }
-
-    let (input_lines, input_cursor_line, input_cursor_col) = input_lines(
-        editor,
-        width,
-        "",
-        "",
-        status.composer_notice.as_deref(),
-        status.composer_mode.as_ref(),
-    );
+    let (input_lines, input_cursor_line, input_cursor_col) =
+        input_lines(editor, width, "", "", status.composer_mode.as_ref());
     let cursor_line = lines.len() + input_cursor_line;
     lines.extend(input_lines);
     lines.push(status_line_row(status.line, &status.fallback, width));
@@ -596,11 +629,12 @@ fn welcome_lines(welcome: WelcomeView, width: u16) -> Vec<PaintLine> {
     let left = welcome_info_rows(&welcome, inner_width);
 
     if inner_width < WELCOME_SPLIT_MIN {
-        let mut lines = vec![panel_top(inner_width)];
+        let mut lines = vec![panel_top(inner_width), panel_padding_row(panel_width)];
         lines.extend(
             left.into_iter()
                 .map(|(text, tone, bold)| panel_line(&text, panel_width, tone, bold)),
         );
+        lines.push(panel_padding_row(panel_width));
         lines.push(panel_bottom(inner_width));
         return lines;
     }
@@ -620,6 +654,7 @@ fn welcome_lines(welcome: WelcomeView, width: u16) -> Vec<PaintLine> {
         bold: false,
         tail: Vec::new(),
     }];
+    lines.push(split_panel_line(None, left_width, None, right_width));
     for row in 0..left.len().max(right.len()) {
         lines.push(split_panel_line(
             left.get(row),
@@ -628,6 +663,7 @@ fn welcome_lines(welcome: WelcomeView, width: u16) -> Vec<PaintLine> {
             right_width,
         ));
     }
+    lines.push(split_panel_line(None, left_width, None, right_width));
     lines.push(PaintLine {
         prefix: String::new(),
         prefix_tone: Tone::Border,
@@ -780,6 +816,49 @@ fn panel_span(width: u16) -> usize {
     (width as usize).saturating_sub(1).max(20)
 }
 
+/// A titled rule such as `╭─ Sign in ────╮`, closed with `corner`.
+fn panel_rule_row(opening: &str, label: &str, corner: char, panel_width: usize) -> PaintLine {
+    let label = compact_right(label, panel_width.saturating_sub(6));
+    let used = UnicodeWidthStr::width(opening)
+        + UnicodeWidthStr::width(label.as_str())
+        + 1  // the space after the label
+        + 1; // the closing corner
+    PaintLine {
+        prefix: opening.to_owned(),
+        prefix_tone: Tone::Border,
+        text: format!("{label} "),
+        tone: if corner == '╮' {
+            Tone::Accent
+        } else {
+            Tone::Muted
+        },
+        bold: corner == '╮',
+        tail: vec![PaintSpan {
+            text: format!("{}{corner}", "─".repeat(panel_width.saturating_sub(used))),
+            tone: Tone::Border,
+            bold: false,
+        }],
+    }
+}
+
+/// Pads a wrapped panel row out to `panel_width` and caps it with `│`.
+fn close_panel_row(mut line: PaintLine, panel_width: usize) -> PaintLine {
+    let used = UnicodeWidthStr::width(line.prefix.as_str())
+        + UnicodeWidthStr::width(line.text.as_str())
+        + line
+            .tail
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+            .sum::<usize>();
+    let padding = panel_width.saturating_sub(used + 1);
+    line.tail.push(PaintSpan {
+        text: format!("{}│", " ".repeat(padding)),
+        tone: Tone::Border,
+        bold: false,
+    });
+    line
+}
+
 fn panel_top(inner_width: usize) -> PaintLine {
     PaintLine {
         prefix: String::new(),
@@ -857,6 +936,7 @@ fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine
             bold: false,
         }],
     }];
+    lines.push(panel_padding_row(panel_width));
     for suggestion in suggestions.iter().take(6) {
         let marker = if suggestion.selected { "❯" } else { " " };
         let content = format!(
@@ -874,8 +954,15 @@ fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine
             suggestion.selected,
         ));
     }
+    lines.push(panel_padding_row(panel_width));
     lines.push(panel_bottom(inner_width));
     lines
+}
+
+/// A bordered blank row. Every boxed list gets one under its top rule and one
+/// above its bottom rule, so the contents never sit flush against the border.
+fn panel_padding_row(panel_width: usize) -> PaintLine {
+    panel_line("", panel_width, Tone::Muted, false)
 }
 
 fn panel_line(text: &str, width: usize, tone: Tone, bold: bool) -> PaintLine {
@@ -964,59 +1051,55 @@ fn overlay_frame(
             });
         }
         OverlayStyle::Panel => {
-            let title_width = UnicodeWidthStr::width(overlay.title.as_str());
-            lines.push(PaintLine {
-                prefix: "╭─ ".to_owned(),
-                prefix_tone: Tone::Border,
-                text: format!("{} ", overlay.title),
-                tone: Tone::Accent,
-                bold: true,
-                tail: vec![PaintSpan {
-                    text: "─".repeat(
-                        (width as usize)
-                            .saturating_sub(title_width)
-                            .saturating_sub(5),
-                    ),
-                    tone: Tone::Border,
-                    bold: false,
-                }],
-            });
+            // A closed box: every row lands on exactly `panel_width` columns.
+            let panel_width = panel_span(width);
+            lines.push(panel_rule_row("╭─ ", &overlay.title, '╮', panel_width));
+            lines.push(panel_padding_row(panel_width));
             for row in overlay.lines {
+                // An empty row is padding of the caller's own. It still needs
+                // both borders, so it cannot go through the wrapping path,
+                // which yields no rows at all for empty text.
+                if row.text.is_empty() {
+                    lines.push(panel_padding_row(panel_width));
+                    continue;
+                }
                 for (part_index, part) in row.text.lines().enumerate() {
                     let prefix = if part_index == 0 {
                         if row.selected { "│ ❯ " } else { "│   " }
                     } else {
                         "│     "
                     };
-                    lines.extend(wrapped_line(
+                    // Reserve the closing border before wrapping, not after.
+                    let wrapped = wrapped_line_with_continuation(
                         prefix,
+                        "│   ",
                         Tone::Border,
                         part,
                         if row.muted { Tone::Muted } else { Tone::Plain },
                         row.selected && part_index == 0,
-                        width,
-                    ));
+                        (panel_width.saturating_sub(1)).min(u16::MAX as usize) as u16,
+                    );
+                    lines.extend(
+                        wrapped
+                            .into_iter()
+                            .map(|line| close_panel_row(line, panel_width)),
+                    );
                 }
             }
-            lines.push(PaintLine {
-                prefix: "╰─ ".to_owned(),
-                prefix_tone: Tone::Border,
-                text: overlay.hint,
-                tone: Tone::Muted,
-                bold: false,
-                tail: Vec::new(),
-            });
+            lines.push(panel_padding_row(panel_width));
+            lines.push(panel_rule_row("╰─ ", &overlay.hint, '╯', panel_width));
         }
     }
     let mut cursor_line = lines.len() - 1;
     let mut cursor_col = 0;
     let show_cursor = if let Some(editor) = overlay.input {
+        // The composer rule reads as part of the picker without this gap.
+        lines.push(PaintLine::blank());
         let (input, input_cursor_line, input_cursor_col) = input_lines(
             editor,
             width,
             overlay.input_label,
             overlay.input_placeholder,
-            None,
             status.composer_mode.as_ref(),
         );
         cursor_line = lines.len() + input_cursor_line;
@@ -1168,6 +1251,97 @@ fn trim_spans(spans: &mut Vec<PaintSpan>, max_width: usize) {
     }
 }
 
+/// Rows of tool output kept on screen, matching Claude Code's cap. Whatever is
+/// left over is reported as a count instead of being printed.
+const TOOL_OUTPUT_ROWS: usize = 5;
+
+/// Command and tool results: the heading, then at most [`TOOL_OUTPUT_ROWS`] rows
+/// of raw output and a muted `… +N lines`. Output is printed verbatim rather
+/// than through the markdown pipeline — a shell writes text, not documents.
+fn tool_lines(block: &Block, width: u16) -> Vec<PaintLine> {
+    let mut lines = wrapped_line("● ", Tone::User, &block.title, Tone::Plain, true, width);
+    // Trailing blank rows are noise, and a shell almost always leaves one.
+    let rows = block
+        .body
+        .trim_end_matches(['\n', '\r'])
+        .lines()
+        .collect::<Vec<_>>();
+    if block.body.is_empty() || rows.is_empty() {
+        return lines;
+    }
+    let shown = rows.len().min(TOOL_OUTPUT_ROWS);
+    for row in &rows[..shown] {
+        lines.extend(wrapped_line(
+            "  ",
+            Tone::Muted,
+            row,
+            Tone::Muted,
+            false,
+            width,
+        ));
+    }
+    let hidden = rows.len() - shown;
+    if hidden > 0 {
+        lines.extend(wrapped_line(
+            "  ",
+            Tone::Muted,
+            &format!("… +{hidden} lines"),
+            Tone::Muted,
+            false,
+            width,
+        ));
+    }
+    lines
+}
+
+/// Title the app-server's reasoning summaries stream under, and the only one
+/// that renders as a bare thought instead of a labelled section.
+const THINKING_TITLE: &str = "Thinking…";
+
+/// Reasoning summaries, shaped like Claude Code's: a narrow `∴` gutter and a
+/// single dim italic paragraph. The summary's own line breaks are folded away
+/// so a long thought stays a handful of wrapped rows rather than a document
+/// that pushes the rest of the turn off screen. Markdown is left as written —
+/// there are no headings or bullets to render inside one paragraph.
+fn reasoning_lines(block: &Block, width: u16) -> Vec<PaintLine> {
+    let body = block.body.split_whitespace().collect::<Vec<_>>().join(" ");
+    // `/plan` output shares this block kind but keeps its heading.
+    let titled = block.title != THINKING_TITLE;
+    let mut lines = if titled {
+        wrapped_line("✻ ", Tone::Muted, &block.title, Tone::Plain, true, width)
+    } else {
+        Vec::new()
+    };
+    if body.is_empty() {
+        if !titled {
+            // Nothing has streamed yet, so the label stands in for the thought.
+            lines.extend(wrapped_line(
+                "✻ ",
+                Tone::Muted,
+                THINKING_TITLE,
+                Tone::Thinking,
+                false,
+                width,
+            ));
+        }
+        return lines;
+    }
+    let (prefix, prefix_tone) = if titled {
+        ("  ", Tone::Muted)
+    } else {
+        ("∴ ", Tone::Thinking)
+    };
+    lines.extend(wrapped_line(
+        prefix,
+        prefix_tone,
+        &body,
+        Tone::Thinking,
+        false,
+        width,
+    ));
+    lines
+}
+
 fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     if matches!(block.kind, BlockKind::Welcome) {
         let mut values = block.body.lines();
@@ -1188,6 +1362,12 @@ fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     }
     if matches!(block.kind, BlockKind::User) {
         return user_prompt_lines(block, width);
+    }
+    if matches!(block.kind, BlockKind::Reasoning) {
+        return reasoning_lines(block, width);
+    }
+    if matches!(block.kind, BlockKind::Tool) {
+        return tool_lines(block, width);
     }
     if matches!(block.kind, BlockKind::ModelChange) {
         return vec![
@@ -1216,10 +1396,9 @@ fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
             unreachable!("handled above")
         }
         BlockKind::User => unreachable!("user blocks are rendered separately"),
-        BlockKind::Assistant => ("● ", Tone::Accent),
-        BlockKind::Reasoning => ("✻ ", Tone::Muted),
-        BlockKind::Tool => ("● ", Tone::User),
-        BlockKind::Diff => ("● ", Tone::Accent),
+        BlockKind::Reasoning | BlockKind::Tool => unreachable!("handled above"),
+        BlockKind::Assistant => ("● ", Tone::Plain),
+        BlockKind::Diff => ("● ", Tone::Plain),
         BlockKind::Warning => ("▲ ", Tone::Warning),
         BlockKind::Error => ("✕ ", Tone::Error),
         BlockKind::System => ("◆ ", Tone::Muted),
@@ -1356,7 +1535,7 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     if block.body.is_empty() {
         lines.extend(wrapped_line(
             "❯ ",
-            Tone::Accent,
+            Tone::Plain,
             "",
             Tone::UserPrompt,
             true,
@@ -1369,7 +1548,7 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         lines.extend(wrapped_line(
             if index == 0 { "❯ " } else { "  " },
             if index == 0 {
-                Tone::Accent
+                Tone::Plain
             } else {
                 Tone::Muted
             },
@@ -1406,7 +1585,7 @@ fn markdown_line(
     bold: bool,
     width: u16,
 ) -> Vec<PaintLine> {
-    if !text.contains('`') && !text.contains("**") {
+    if !text.contains('`') && !text.contains("**") && !text.contains('[') {
         return wrapped_line(prefix, prefix_tone, text, tone, bold, width);
     }
 
@@ -1427,10 +1606,16 @@ fn markdown_line(
             index += end + 2;
             continue;
         }
+        if let Some((label, consumed)) = inline_link(rest) {
+            push_highlight_span(&mut spans, &label, Tone::Accent, strong);
+            index += consumed;
+            continue;
+        }
 
         let next_marker = [
             rest.find("**").unwrap_or(rest.len()),
             rest.find('`').unwrap_or(rest.len()),
+            rest.find('[').unwrap_or(rest.len()),
         ]
         .into_iter()
         .min()
@@ -1445,6 +1630,53 @@ fn markdown_line(
     }
 
     styled_lines(prefix, prefix_tone, spans, tone, bold, width)
+}
+
+/// Collapses `[label](url)` — and the `![alt](url)` image form — down to the
+/// label so a model's file links stop leaking raw markdown into the transcript.
+/// A `:line` (or `:line:column`) tail on the target is worth reading, so it gets
+/// grafted onto the label; the rest of the path is noise the label already says.
+/// Returns the text to paint plus how many bytes of `rest` it consumed.
+fn inline_link(rest: &str) -> Option<(String, usize)> {
+    let image = rest.starts_with("![");
+    let body = if image { &rest[1..] } else { rest };
+    let after_bracket = body.strip_prefix('[')?;
+    let close = after_bracket.find("](")?;
+    let label = &after_bracket[..close];
+    if label.contains('[') {
+        return None;
+    }
+    let after_paren = &after_bracket[close + 2..];
+    let end = after_paren.find(')')?;
+    let target = &after_paren[..end];
+    let consumed = usize::from(image) + 1 + close + 2 + end + 1;
+
+    let mut text = label.to_owned();
+    if text.is_empty() {
+        text = target.to_owned();
+    } else if let Some(suffix) = line_suffix(target)
+        && !text.ends_with(&suffix)
+    {
+        text.push_str(&suffix);
+    }
+    Some((text, consumed))
+}
+
+/// The `:83` / `:83:12` tail of a file target, or `None` when the trailing
+/// colon group isn't a position — a drive letter or a URL port is not a line.
+fn line_suffix(target: &str) -> Option<String> {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return None;
+    }
+    let is_number = |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    let (head, tail) = target.rsplit_once(':')?;
+    if !is_number(tail) || head.len() <= 1 {
+        return None;
+    }
+    match head.rsplit_once(':') {
+        Some((_, middle)) if is_number(middle) => Some(format!(":{middle}:{tail}")),
+        _ => Some(format!(":{tail}")),
+    }
 }
 
 fn code_line(
@@ -1865,8 +2097,23 @@ fn wrapped_line(
     bold: bool,
     width: u16,
 ) -> Vec<PaintLine> {
+    let continuation = " ".repeat(UnicodeWidthStr::width(prefix));
+    wrapped_line_with_continuation(prefix, &continuation, prefix_tone, text, tone, bold, width)
+}
+
+/// Like [`wrapped_line`], but the caller chooses what folded rows are prefixed
+/// with — bordered panels need to repeat their `│` instead of blanking it out.
+fn wrapped_line_with_continuation(
+    prefix: &str,
+    continuation: &str,
+    prefix_tone: Tone,
+    text: &str,
+    tone: Tone,
+    bold: bool,
+    width: u16,
+) -> Vec<PaintLine> {
     let width = width as usize;
-    let prefix_width = UnicodeWidthStr::width(prefix);
+    let prefix_width = UnicodeWidthStr::width(prefix).max(UnicodeWidthStr::width(continuation));
     let available = width.saturating_sub(prefix_width).max(4);
     let options = textwrap::Options::new(available)
         .break_words(true)
@@ -1891,7 +2138,7 @@ fn wrapped_line(
             prefix: if index == 0 {
                 prefix.to_owned()
             } else {
-                " ".repeat(prefix_width)
+                continuation.to_owned()
             },
             prefix_tone,
             text: part.into_owned(),
@@ -1914,12 +2161,36 @@ fn copy_joins_next(line: &PaintLine) -> bool {
     line.tail.iter().any(|span| span.tone == Tone::CopyJoin)
 }
 
+/// Gutter glyphs that label a block instead of belonging to its text, so a copy
+/// should start past them. Card corners (`╭─ `) are deliberately absent: they
+/// frame a block rather than mark one, and trimming them would leave the copied
+/// card missing only its top-left edge.
+const COPY_MARKERS: [&str; 5] = ["● ", "✻ ", "▲ ", "✕ ", "◆ "];
+
+fn is_copy_marker(prefix: &str) -> bool {
+    COPY_MARKERS.contains(&prefix)
+}
+
+/// Blocks whose lines carry `devez-copy-v1` metadata. Excludes the ones drawn as
+/// cards, whose box art is content the reader asked to see.
+fn copy_metadata_applies(kind: BlockKind) -> bool {
+    matches!(
+        kind,
+        BlockKind::Assistant
+            | BlockKind::Reasoning
+            | BlockKind::Tool
+            | BlockKind::Diff
+            | BlockKind::Warning
+            | BlockKind::Error
+            | BlockKind::System
+    )
+}
+
 fn input_lines(
     editor: &Editor,
     width: u16,
     label: &str,
     placeholder: &str,
-    notice: Option<&str>,
     mode: Option<&ComposerMode>,
 ) -> (Vec<PaintLine>, usize, usize) {
     let panel_width = (width as usize).saturating_sub(1).max(16);
@@ -1972,7 +2243,7 @@ fn input_lines(
     }
 
     let mut rows = Vec::with_capacity(raw_rows.len() + 2);
-    rows.push(input_top_line(panel_width, label, notice, mode));
+    rows.push(input_top_line(panel_width, label, mode));
     for (index, raw) in raw_rows.into_iter().enumerate() {
         let is_placeholder = editor.is_empty() && index == 0;
         let content = if is_placeholder {
@@ -2016,19 +2287,10 @@ const COMPOSER_RULE_MIN: usize = 4;
 const COMPOSER_MODE_GAP: usize = 2;
 /// Rule segment trailing the mode badge, so the line reads as unbroken.
 const COMPOSER_MODE_TAIL_RULE: usize = 2;
-/// Blank columns between the rule and a transient notice.
-const COMPOSER_NOTICE_GAP: usize = 1;
-/// Below this a transient notice is dropped instead of ellipsized into noise.
-const COMPOSER_NOTICE_MIN: usize = 4;
 /// Separator between the permission mode and the fast-tier flag.
 const COMPOSER_BADGE_SEPARATOR: &str = " · ";
 
-fn input_top_line(
-    panel_width: usize,
-    label: &str,
-    notice: Option<&str>,
-    mode: Option<&ComposerMode>,
-) -> PaintLine {
+fn input_top_line(panel_width: usize, label: &str, mode: Option<&ComposerMode>) -> PaintLine {
     let left = if label.is_empty() {
         String::new()
     } else {
@@ -2051,24 +2313,7 @@ fn input_top_line(
         Some(spans)
     });
 
-    // Transient notices dock to the left of the mode badge.
-    let notice_span = notice.and_then(|notice| {
-        (budget >= COMPOSER_NOTICE_GAP + COMPOSER_NOTICE_MIN).then(|| {
-            let text = compact_right(notice, budget - COMPOSER_NOTICE_GAP);
-            budget -= UnicodeWidthStr::width(text.as_str()) + COMPOSER_NOTICE_GAP;
-            text
-        })
-    });
-
     let mut tail = Vec::new();
-    if let Some(text) = notice_span {
-        tail.push(rule_gap(COMPOSER_NOTICE_GAP));
-        tail.push(PaintSpan {
-            text,
-            tone: Tone::Success,
-            bold: false,
-        });
-    }
     if let Some(spans) = badge {
         tail.push(rule_gap(COMPOSER_MODE_GAP));
         tail.extend(spans);
@@ -2091,44 +2336,75 @@ fn input_top_line(
     }
 }
 
-/// Widest badge that fits in `budget`: mode plus fast flag, mode alone, or nothing.
-/// The parts are never ellipsized — a half-written mode name is worse than none.
+/// Widest badge that fits in `budget`, dropping segments from the right until it
+/// does: mode · fast flag · estimated cost. The parts are never ellipsized — a
+/// half-written mode name or a clipped price is worse than none.
 fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<Vec<PaintSpan>> {
     let mode_span = PaintSpan {
         text: mode.label.clone(),
         tone: mode_accent_tone(mode.accent),
         bold: false,
     };
-    let mode_width = UnicodeWidthStr::width(mode.label.as_str());
 
     let fast_label = if mode.fast_mode {
         "Fast On"
     } else {
         "Fast Off"
     };
-    let with_fast = mode_width
-        + UnicodeWidthStr::width(COMPOSER_BADGE_SEPARATOR)
-        + UnicodeWidthStr::width(fast_label);
-    if with_fast <= budget {
-        return Some(vec![
-            mode_span,
+    let fast_spans = [
+        separator_span(),
+        PaintSpan {
+            text: fast_label.to_owned(),
+            tone: if mode.fast_mode {
+                Tone::FastOn
+            } else {
+                Tone::FastOff
+            },
+            bold: false,
+        },
+    ];
+
+    let cost_spans = mode.cost.as_deref().map(|cost| {
+        vec![
+            separator_span(),
             PaintSpan {
-                text: COMPOSER_BADGE_SEPARATOR.to_owned(),
-                tone: Tone::Muted,
+                text: cost.to_owned(),
+                tone: Tone::Plain,
                 bold: false,
             },
-            PaintSpan {
-                text: fast_label.to_owned(),
-                tone: if mode.fast_mode {
-                    Tone::FastOn
-                } else {
-                    Tone::FastOff
-                },
-                bold: false,
-            },
-        ]);
+        ]
+    });
+
+    // Assemble every segment, then note where each rung of the ladder ends so
+    // the badge can be peeled back from the right until it fits.
+    let mut spans = vec![mode_span];
+    let through_mode = spans.len();
+    spans.extend(fast_spans);
+    let through_fast = spans.len();
+    spans.extend(cost_spans.into_iter().flatten());
+
+    for keep in [spans.len(), through_fast, through_mode] {
+        if spans_width(&spans[..keep]) <= budget {
+            spans.truncate(keep);
+            return Some(spans);
+        }
     }
-    (mode_width <= budget).then(|| vec![mode_span])
+    None
+}
+
+fn separator_span() -> PaintSpan {
+    PaintSpan {
+        text: COMPOSER_BADGE_SEPARATOR.to_owned(),
+        tone: Tone::Muted,
+        bold: false,
+    }
+}
+
+fn spans_width(spans: &[PaintSpan]) -> usize {
+    spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+        .sum()
 }
 
 fn rule_gap(width: usize) -> PaintSpan {
@@ -2142,7 +2418,9 @@ fn rule_gap(width: usize) -> PaintSpan {
 fn mode_accent_tone(accent: ModeAccent) -> Tone {
     match accent {
         ModeAccent::Calm => Tone::Muted,
-        ModeAccent::Safe => Tone::Context,
+        // Not `Context`: that tone carries the status line's contrast-exempt
+        // emerald, and this badge sits on the composer rule instead.
+        ModeAccent::Safe => Tone::Success,
         ModeAccent::Danger => Tone::Warning,
     }
 }
@@ -2257,30 +2535,30 @@ fn set_tone(out: &mut Stdout, tone: Tone) -> Result<()> {
     let palette = theme::palette();
     let color = match tone {
         Tone::Plain => rgb_color(palette.foreground),
-        Tone::Muted => rgb_color(palette.muted),
+        Tone::Muted | Tone::Thinking => rgb_color(palette.muted),
         Tone::Accent => rgb_color(palette.accent),
         Tone::User => rgb_color(palette.blue),
         Tone::Success => rgb_color(palette.success),
         Tone::Warning => rgb_color(palette.warning),
         Tone::Error => rgb_color(palette.error),
         Tone::Code => rgb_color(palette.code),
-        Tone::EffortLow => rgb_color(palette.warning),
-        Tone::EffortMedium => rgb_color(palette.success),
-        Tone::EffortHigh => rgb_color(palette.indigo),
-        Tone::EffortXHigh => rgb_color(palette.purple),
-        Tone::EffortMax => rgb_color(palette.error),
-        Tone::Context => rgb_color(palette.context),
-        Tone::StatusText => rgb_color(palette.foreground),
-        Tone::StatusSeparator => rgb_color(palette.muted),
+        Tone::EffortLow => rgb_color(palette.status.effort_low),
+        Tone::EffortMedium => rgb_color(palette.status.effort_medium),
+        Tone::EffortHigh => rgb_color(palette.status.effort_high),
+        Tone::EffortXHigh => rgb_color(palette.status.effort_xhigh),
+        Tone::EffortMax => rgb_color(palette.status.effort_max),
+        Tone::Context => rgb_color(palette.status.context),
+        Tone::StatusText => rgb_color(palette.status.text),
+        Tone::StatusSeparator => rgb_color(palette.status.separator),
         Tone::UserPrompt => rgb_color(palette.foreground),
         Tone::ModelSol => rgb_color(palette.orange),
         Tone::ModelTerra => rgb_color(palette.pink),
         Tone::ModelLuna => rgb_color(palette.purple),
         Tone::Model55 => rgb_color(palette.blue),
         Tone::Border => rgb_color(palette.border),
-        Tone::Branch => rgb_color(palette.branch),
-        Tone::LimitFiveHour => rgb_color(palette.blue),
-        Tone::LimitWeekly => rgb_color(palette.purple),
+        Tone::Branch => rgb_color(palette.status.branch),
+        Tone::LimitFiveHour => rgb_color(palette.status.five_hour),
+        Tone::LimitWeekly => rgb_color(palette.status.weekly),
         Tone::FastOn => rgb_color(palette.success),
         Tone::FastOff => rgb_color(palette.muted),
         Tone::ModelChange => rgb_color(palette.foreground),
@@ -2297,6 +2575,9 @@ fn set_tone(out: &mut Stdout, tone: Tone) -> Result<()> {
         Tone::CopyJoin => Color::Reset,
     };
     queue!(out, SetForegroundColor(color))?;
+    if tone == Tone::Thinking {
+        queue!(out, SetAttribute(Attribute::Italic))?;
+    }
     Ok(())
 }
 
@@ -2365,7 +2646,7 @@ mod tests {
         let mut editor = Editor::default();
         editor.set_text("wrapped-prompt-text");
 
-        let (rows, _, _) = input_lines(&editor, 18, "", "placeholder", None, None);
+        let (rows, _, _) = input_lines(&editor, 18, "", "placeholder", None);
         let prompt_rows = &rows[1..rows.len() - 1];
 
         assert!(prompt_rows.len() > 1);
@@ -2390,7 +2671,7 @@ mod tests {
         let block = Block::new(
             BlockKind::Update,
             "Update Available",
-            "New version 0.11.9 is available. Run: devez update",
+            "New version 0.11.9 is available. Run: dvz update",
         );
         let lines = block_lines(&block, 80);
 
@@ -2402,7 +2683,7 @@ mod tests {
         assert_eq!(lines[1].text, "Update Available");
         assert!(lines[1].bold);
         assert!(lines[2].text.contains("0.11.9"));
-        assert!(lines[2].text.ends_with("devez update"));
+        assert!(lines[2].text.ends_with("dvz update"));
         assert!(lines[4].text.is_empty());
     }
 
@@ -2571,21 +2852,102 @@ mod tests {
         );
     }
 
+    /// Summaries end with `[file](path:line)` links; the raw markdown used to wrap
+    /// mid-path across two rows, so the label — plus the line number — is all we keep.
     #[test]
-    fn copy_notice_is_right_aligned_on_the_composer_top_rule() {
-        let line = input_top_line(50, "", Some("Copied 12 chars to clipboard"), None);
-        let width = UnicodeWidthStr::width(line.text.as_str())
-            + line
-                .tail
-                .iter()
-                .map(|span| UnicodeWidthStr::width(span.text.as_str()))
-                .sum::<usize>();
-
-        assert_eq!(width, 50);
-        assert_eq!(
-            line.tail.last().map(|span| span.text.as_str()),
-            Some("Copied 12 chars to clipboard")
+    fn markdown_renderer_collapses_links_to_their_label() {
+        let lines = markdown_line(
+            "",
+            Tone::Plain,
+            "변경: [src/main.rs](C:/Source/DevezCLI/src/main.rs:83), [Cargo.toml](C:/Source/DevezCLI/Cargo.toml:29)",
+            Tone::Plain,
+            false,
+            200,
         );
+        let line = &lines[0];
+        let rendered = std::iter::once(line.text.as_str())
+            .chain(line.tail.iter().map(|span| span.text.as_str()))
+            .collect::<String>();
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(rendered, "변경: src/main.rs:83, Cargo.toml:29");
+    }
+
+    #[test]
+    fn markdown_renderer_leaves_bracket_text_alone() {
+        let lines = markdown_line(
+            "",
+            Tone::Plain,
+            "[Enter] 완료 후 계속",
+            Tone::Plain,
+            false,
+            80,
+        );
+        assert_eq!(lines[0].text, "[Enter] 완료 후 계속");
+        assert_eq!(line_suffix("https://example.com:8080"), None);
+        assert_eq!(line_suffix("src/main.rs:83:12").as_deref(), Some(":83:12"));
+    }
+
+    /// The notice used to share the composer rule with the permission badge; it now
+    /// owns the row directly above it so neither has to be squeezed.
+    #[test]
+    fn transient_notice_sits_on_its_own_row_above_the_composer_rule() {
+        let editor = Editor::default();
+        let frame = normal_frame(
+            &[],
+            &editor,
+            None,
+            &[],
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: Some("Apps refreshed".to_owned()),
+                composer_mode: None,
+            },
+            80,
+        );
+
+        let notice = frame
+            .lines
+            .iter()
+            .position(|line| line.text == "Apps refreshed")
+            .expect("notice row");
+        assert_eq!(frame.lines[notice].tone, Tone::Success);
+        assert!(frame.lines[notice + 1] == PaintLine::blank());
+        assert!(!frame.lines[notice + 2].text.is_empty());
+        assert!(frame.lines[notice + 2].text.chars().all(|ch| ch == '─'));
+    }
+
+    /// Activity is pinned to the composer, so it stays visible while the model works.
+    #[test]
+    fn activity_sits_directly_above_the_composer_rule() {
+        let editor = Editor::default();
+        let frame = normal_frame(
+            &[],
+            &editor,
+            None,
+            &[],
+            Some("✶ Working… 2s · Esc to interrupt"),
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+
+        let activity = frame
+            .lines
+            .iter()
+            .position(|line| line.text.contains("Working…"))
+            .expect("activity row");
+        assert_eq!(frame.lines[activity].tone, Tone::Accent);
+        // One blank row separates the activity line from the composer rule.
+        assert!(frame.lines[activity + 1] == PaintLine::blank());
+        assert!(!frame.lines[activity + 2].text.is_empty());
+        assert!(frame.lines[activity + 2].text.chars().all(|ch| ch == '─'));
     }
 
     fn rule_width(line: &PaintLine) -> usize {
@@ -2602,13 +2964,14 @@ mod tests {
             label: label.to_owned(),
             accent,
             fast_mode,
+            cost: None,
         }
     }
 
     #[test]
     fn permission_mode_and_fast_flag_sit_inside_the_composer_rule() {
         let mode = test_mode("Full Access", ModeAccent::Danger, true);
-        let line = input_top_line(50, "", None, Some(&mode));
+        let line = input_top_line(50, "", Some(&mode));
         let texts = line
             .tail
             .iter()
@@ -2626,7 +2989,7 @@ mod tests {
     #[test]
     fn fast_off_is_toned_down_beside_the_permission_mode() {
         let mode = test_mode("Default", ModeAccent::Safe, false);
-        let line = input_top_line(50, "", None, Some(&mode));
+        let line = input_top_line(50, "", Some(&mode));
         let texts = line
             .tail
             .iter()
@@ -2639,9 +3002,10 @@ mod tests {
     }
 
     #[test]
-    fn composer_rule_keeps_notice_left_of_the_permission_mode() {
-        let mode = test_mode("Read Only", ModeAccent::Calm, false);
-        let line = input_top_line(60, "", Some("Copied 12 chars to clipboard"), Some(&mode));
+    fn estimated_cost_rides_beside_the_permission_mode() {
+        let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
+        mode.cost = Some("$0.95".to_owned());
+        let line = input_top_line(60, "", Some(&mode));
         let texts = line
             .tail
             .iter()
@@ -2652,22 +3016,38 @@ mod tests {
         assert_eq!(
             texts,
             [
-                " ",
-                "Copied 12 chars to clipboard",
                 "  ",
-                "Read Only",
+                "Full Access",
                 " · ",
-                "Fast Off",
+                "Fast On",
+                " · ",
+                "$0.95",
                 " ",
                 "──"
             ]
         );
     }
 
+    /// The cost is the first thing to go: it is the least load-bearing segment.
+    #[test]
+    fn the_cost_is_dropped_before_the_fast_flag() {
+        let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
+        mode.cost = Some("$0.95".to_owned());
+        let line = input_top_line(32, "", Some(&mode));
+        let texts = line
+            .tail
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rule_width(&line), 32);
+        assert_eq!(texts, ["  ", "Full Access", " · ", "Fast On", " ", "──"]);
+    }
+
     #[test]
     fn tight_composer_rule_keeps_the_mode_and_drops_the_fast_flag() {
         let mode = test_mode("Full Access", ModeAccent::Danger, true);
-        let line = input_top_line(24, "", None, Some(&mode));
+        let line = input_top_line(24, "", Some(&mode));
         let texts = line
             .tail
             .iter()
@@ -2681,7 +3061,7 @@ mod tests {
     #[test]
     fn narrow_composer_rule_drops_the_badge_instead_of_ellipsizing() {
         let mode = test_mode("Full Access", ModeAccent::Danger, true);
-        let line = input_top_line(9, "", None, Some(&mode));
+        let line = input_top_line(9, "", Some(&mode));
 
         assert!(line.tail.is_empty());
         assert_eq!(rule_width(&line), 9);
@@ -2735,13 +3115,91 @@ mod tests {
 
         assert_eq!(user_lines[0].prefix, "❯ ");
         assert_eq!(user_lines[0].text, "hello");
-        assert!(user_lines[0].prefix_tone == Tone::Accent);
+        assert!(user_lines[0].prefix_tone == Tone::Plain);
         assert!(user_lines[0].tone == Tone::UserPrompt);
         assert!(user_lines[0].bold);
         assert_eq!(assistant_lines[0].prefix, "● ");
         assert_eq!(assistant_lines[0].text, "hi");
         assert!(user_lines.iter().all(|line| line.text != "You"));
         assert!(assistant_lines.iter().all(|line| line.text != "Codex"));
+    }
+
+    #[test]
+    fn tool_output_keeps_five_rows_and_counts_the_rest() {
+        let body = (1..=12)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = block_lines(&Block::new(BlockKind::Tool, "Bash · ls", body), 200);
+
+        let texts = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            [
+                "Bash · ls",
+                "line 1",
+                "line 2",
+                "line 3",
+                "line 4",
+                "line 5",
+                "… +7 lines"
+            ]
+        );
+        assert_eq!(lines[6].tone, Tone::Muted);
+    }
+
+    #[test]
+    fn short_tool_output_is_shown_whole_without_a_count() {
+        let lines = block_lines(&Block::new(BlockKind::Tool, "Bash · pwd", "/src\n"), 200);
+
+        let texts = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["Bash · pwd", "/src"]);
+    }
+
+    #[test]
+    fn thinking_blocks_fold_into_one_italic_paragraph() {
+        let block = Block::new(
+            BlockKind::Reasoning,
+            "Thinking…",
+            "**Weighing options**\n\nFirst thought.\n\nSecond thought.",
+        );
+
+        let lines = block_lines(&block, 200);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].prefix, "∴ ");
+        assert_eq!(
+            lines[0].text,
+            "**Weighing options** First thought. Second thought."
+        );
+        assert_eq!(lines[0].tone, Tone::Thinking);
+        assert!(!lines[0].bold);
+        assert!(lines.iter().all(|line| line.text != "Thinking…"));
+    }
+
+    #[test]
+    fn empty_thinking_block_shows_the_label() {
+        let lines = block_lines(&Block::new(BlockKind::Reasoning, "Thinking…", ""), 80);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].prefix, "✻ ");
+        assert_eq!(lines[0].text, "Thinking…");
+    }
+
+    #[test]
+    fn plan_blocks_keep_their_heading() {
+        let lines = block_lines(&Block::new(BlockKind::Reasoning, "Plan", "step one"), 80);
+
+        assert_eq!(lines[0].text, "Plan");
+        assert!(lines[0].bold);
+        assert_eq!(lines[1].prefix, "  ");
+        assert_eq!(lines[1].text, "step one");
     }
 
     #[test]
@@ -2828,7 +3286,8 @@ mod tests {
                 "width {width}: rows are not all {expected} columns"
             );
             assert!(
-                painted(&lines[1]).contains(&format!("v{}", crate::update::CURRENT_VERSION)),
+                lines.iter().any(|line| painted(line)
+                    .contains(&format!("v{}", crate::update::CURRENT_VERSION))),
                 "width {width}: version missing from the headline"
             );
         }
@@ -2840,7 +3299,11 @@ mod tests {
 
         assert!(painted(&lines[0]).contains('┬'));
         assert!(painted(lines.last().expect("bottom border")).contains('┴'));
-        assert!(painted(&lines[1]).contains("What's new"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| painted(line).contains("What's new"))
+        );
         // Every body row carries the divider, so the column never collapses.
         assert!(
             lines[1..lines.len() - 1].iter().all(|line| line
@@ -2901,6 +3364,164 @@ mod tests {
                 panel_span(width)
             );
         }
+    }
+
+    #[test]
+    fn panel_overlay_keeps_its_border_when_a_row_folds() {
+        // An unbreakable run far wider than the terminal, like an OAuth URL.
+        let long = "a".repeat(400);
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                title: "Sign in to ChatGPT".to_owned(),
+                lines: vec![OverlayLine {
+                    text: long,
+                    selected: false,
+                    muted: true,
+                }],
+                hint: "Esc cancel".to_owned(),
+                style: OverlayStyle::Panel,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            },
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+
+        let panel = frame
+            .lines
+            .iter()
+            .filter(|line| {
+                let painted = painted(line);
+                painted.starts_with('│') || painted.starts_with('╭') || painted.starts_with('╰')
+            })
+            .collect::<Vec<_>>();
+        let body = panel
+            .iter()
+            .filter(|line| line.prefix.starts_with('│'))
+            .collect::<Vec<_>>();
+
+        assert!(body.len() > 1, "the row should have folded");
+        // Every folded row keeps the left border instead of blanking it out.
+        assert!(
+            body.iter().all(|line| line.prefix.starts_with('│')),
+            "a folded row lost its border"
+        );
+        // Closed box: identical width on every row, and corners on the rules.
+        let expected = panel_span(80);
+        assert!(
+            panel.iter().all(|line| painted_width(line) == expected),
+            "panel rows are not all {expected} columns: {:?}",
+            panel
+                .iter()
+                .map(|line| painted_width(line))
+                .collect::<Vec<_>>()
+        );
+        assert!(painted(panel[0]).ends_with('╮'), "top-right corner missing");
+        assert!(
+            painted(panel.last().expect("bottom rule")).ends_with('╯'),
+            "bottom-right corner missing"
+        );
+        assert!(
+            body.iter().all(|line| painted(line).ends_with('│')),
+            "a body row lost its right border"
+        );
+    }
+
+    #[test]
+    fn a_panel_pads_inside_its_borders() {
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                title: "Resume session".to_owned(),
+                lines: vec![OverlayLine {
+                    text: "yesterday's session".to_owned(),
+                    selected: true,
+                    muted: false,
+                }],
+                hint: "Esc cancel".to_owned(),
+                style: OverlayStyle::Panel,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            },
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+
+        let body = frame
+            .lines
+            .iter()
+            .filter(|line| line.prefix.starts_with('│'))
+            .collect::<Vec<_>>();
+
+        assert_eq!(body.len(), 3, "the row should sit between two padding rows");
+        for row in [body[0], body[2]] {
+            let painted = painted(row);
+            assert!(painted.ends_with('│'), "padding row lost its right border");
+            assert!(
+                painted.trim_matches(|ch| ch == '│' || ch == ' ').is_empty(),
+                "padding row is not blank: {painted}"
+            );
+        }
+        assert!(
+            body.iter()
+                .all(|line| painted_width(line) == panel_span(80)),
+            "padding rows do not match the panel width"
+        );
+    }
+
+    #[test]
+    fn a_picker_with_a_search_field_keeps_a_gap_above_the_composer() {
+        let editor = Editor::default();
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                title: "Resume session · 1 · this folder".to_owned(),
+                lines: vec![OverlayLine {
+                    text: "yesterday's session  ·  2h ago".to_owned(),
+                    selected: true,
+                    muted: false,
+                }],
+                hint: "↑↓ navigate  Enter resume  Esc cancel".to_owned(),
+                style: OverlayStyle::Panel,
+                input: Some(&editor),
+                input_label: "Search",
+                input_placeholder: "Search by name…",
+            },
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+
+        let bottom = frame
+            .lines
+            .iter()
+            .position(|line| painted(line).ends_with('╯'))
+            .expect("panel bottom rule");
+        assert!(
+            painted(&frame.lines[bottom + 1]).trim().is_empty(),
+            "the session list runs straight into the composer"
+        );
+        assert!(
+            !painted(&frame.lines[bottom + 2]).trim().is_empty(),
+            "the composer should start right after the gap"
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     editor::Editor,
+    pricing::{self, TokenTotals},
     renderer::{
         Block, BlockKind, ComposerMode, ModeAccent, OverlayLine, OverlayStyle, OverlayView,
         StatusLineView, SuggestionView, View, WelcomeView,
@@ -17,7 +18,7 @@ use crate::{
     theme::{self, ThemeKind},
 };
 
-const SPINNER: [&str; 8] = ["✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳"];
+pub const SPINNER: [&str; 8] = ["✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳"];
 
 /// The permission presets Codex exposes through `/permissions`, cycled with Shift+Tab.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -467,7 +468,7 @@ pub enum Action {
     ShowDiff,
     ShowMcp,
     McpLogin(String),
-    StartLogin,
+    StartLogin(LoginMethod),
     CancelLogin(String),
     Logout,
     ShowPlugins,
@@ -501,6 +502,40 @@ pub struct PluginUninstallTarget {
     pub display_name: String,
 }
 
+/// Sign-in flows offered by `/login`, mirroring `LoginAccountParams` variants
+/// that do not require pasting a secret into the composer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LoginMethod {
+    Browser,
+    DeviceCode,
+}
+
+impl LoginMethod {
+    const CHOICES: [Self; 2] = [Self::Browser, Self::DeviceCode];
+
+    /// `LoginAccountParams` tag sent to `account/login/start`.
+    pub fn param_type(self) -> &'static str {
+        match self {
+            Self::Browser => "chatgpt",
+            Self::DeviceCode => "chatgptDeviceCode",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Browser => "ChatGPT 계정으로 로그인",
+            Self::DeviceCode => "기기 코드로 로그인",
+        }
+    }
+
+    fn detail(self) -> &'static str {
+        match self {
+            Self::Browser => "브라우저가 열립니다",
+            Self::DeviceCode => "코드를 다른 기기에 입력합니다",
+        }
+    }
+}
+
 enum ConfirmedAction {
     InstallPlugin(PluginInstallTarget),
     UninstallPlugin(PluginUninstallTarget),
@@ -519,6 +554,14 @@ impl ConfirmedAction {
 
 struct SideParent {
     thread_id: String,
+    /// The turn the parent was still streaming when the fork opened. Returning
+    /// hands it back so the spinner and `Esc` keep working on it.
+    turn: Option<ParentTurn>,
+}
+
+struct ParentTurn {
+    id: String,
+    started_at: Instant,
 }
 
 struct ActiveItem {
@@ -567,11 +610,15 @@ enum PendingInteraction {
         detail: Vec<String>,
         action: ConfirmedAction,
     },
+    /// Claude-Code-style list that picks the sign-in flow before starting it.
+    LoginMethodPicker {
+        selected: usize,
+    },
     /// Waiting on the browser half of `account/login/start`. Cleared by the
     /// `account/login/completed` notification or by cancelling.
     Login {
         login_id: String,
-        auth_url: String,
+        waiting_on: Vec<String>,
     },
 }
 
@@ -1775,7 +1822,9 @@ impl SessionPicker {
             hint: "↑↓ navigate  Enter resume  Ctrl+A all projects  Esc cancel".to_owned(),
             style: OverlayStyle::Panel,
             input: Some(&self.query),
-            input_label: "Search",
+            // The placeholder already says what the field is for; labelling the
+            // rule above it as well just says it twice.
+            input_label: "",
             input_placeholder: "Search by name, prompt, ID, or folder…",
         }
     }
@@ -1813,7 +1862,11 @@ pub struct AppState {
     active_order: Vec<String>,
     active: HashMap<String, ActiveItem>,
     pending: Option<PendingInteraction>,
-    total_tokens: u64,
+    /// Tokens the *current* prompt occupies, not the thread's running tally.
+    /// The tally climbs past the window on every turn and is not a context gauge.
+    context_tokens: u64,
+    /// The running tally, which is what billing counts.
+    token_totals: TokenTotals,
     context_window: Option<u64>,
     transient_status: Option<String>,
     show_welcome: bool,
@@ -1881,7 +1934,8 @@ impl AppState {
             active_order: Vec::new(),
             active: HashMap::new(),
             pending: None,
-            total_tokens: 0,
+            context_tokens: 0,
+            token_totals: TokenTotals::default(),
             context_window,
             transient_status: None,
             show_welcome: true,
@@ -2005,7 +2059,39 @@ impl AppState {
     /// Opens the modal that waits for the browser half of the OAuth flow.
     pub fn begin_login(&mut self, login_id: String, auth_url: String) {
         self.commit_welcome_card();
-        self.pending = Some(PendingInteraction::Login { login_id, auth_url });
+        // OAuth URLs run past 400 characters. Folding one inside a bordered modal
+        // swallows the screen, so the full URL lives in the scrollback instead.
+        self.committed
+            .push(Block::new(BlockKind::System, "Sign-in URL", auth_url));
+        self.pending = Some(PendingInteraction::Login {
+            login_id,
+            waiting_on: vec![
+                "브라우저에서 로그인을 완료하세요.".to_owned(),
+                "열리지 않으면 위 Sign-in URL을 사용하세요.".to_owned(),
+            ],
+        });
+    }
+
+    /// Device-code variant: the user types `user_code` on another device.
+    pub fn begin_device_login(&mut self, login_id: String, url: String, user_code: String) {
+        self.commit_welcome_card();
+        self.committed.push(Block::new(
+            BlockKind::System,
+            "Sign-in URL",
+            format!("{url}\ncode: {user_code}"),
+        ));
+        self.pending = Some(PendingInteraction::Login {
+            login_id,
+            waiting_on: vec![
+                format!("코드: {user_code}"),
+                "위 URL을 열고 이 코드를 입력하세요.".to_owned(),
+            ],
+        });
+    }
+
+    /// Opens the sign-in method list.
+    pub fn open_login_picker(&mut self) {
+        self.pending = Some(PendingInteraction::LoginMethodPicker { selected: 0 });
     }
 
     /// Login id of an in-flight `/login`, so a caller can cancel it.
@@ -2098,7 +2184,18 @@ impl AppState {
             label: self.permission_mode().label().to_owned(),
             accent: self.permission_mode().accent(),
             fast_mode: self.effective_fast_mode(),
+            cost: self.estimated_cost(),
         }
+    }
+
+    /// Estimated spend for the thread so far. `None` before the first turn
+    /// reports usage, or when the model has no published rate.
+    fn estimated_cost(&self) -> Option<String> {
+        if self.token_totals.is_empty() {
+            return None;
+        }
+        pricing::estimate_usd(self.selected_model_name(), self.token_totals)
+            .map(pricing::format_usd)
     }
 
     pub fn selected_model_name(&self) -> &str {
@@ -2139,13 +2236,41 @@ impl AppState {
     }
 
     pub fn set_copy_notice(&mut self, count: usize) {
-        self.composer_notice = Some((format!("Copied {count} chars to clipboard"), Instant::now()));
+        self.set_composer_notice(format!("Copied {count} chars to clipboard"));
+    }
+
+    /// One-off events (skills reloaded, model rerouted, …) share the composer
+    /// notice slot with the copy message: it sits where the eye already is and
+    /// `tick` clears it after 1.4s. The status line is for standing state only,
+    /// so nothing parks there waiting for a new thread to wipe it.
+    fn set_composer_notice(&mut self, message: String) {
+        self.composer_notice = Some((message, Instant::now()));
     }
 
     pub fn side_parent_thread_id(&self) -> Option<&str> {
         self.side_parent
             .as_ref()
             .map(|parent| parent.thread_id.as_str())
+    }
+
+    /// Lifts the parent's still-live turn out before `thread/resume` rebuilds
+    /// the state from scratch. `None` once the turn has ended on its own.
+    pub fn take_side_parent_turn(&mut self) -> Option<(String, Instant)> {
+        self.side_parent
+            .as_mut()?
+            .turn
+            .take()
+            .map(|turn| (turn.id, turn.started_at))
+    }
+
+    /// Puts a turn that outlived a side conversation back in front of the user.
+    pub fn restore_turn(&mut self, turn: Option<(String, Instant)>) {
+        let Some((turn_id, started_at)) = turn else {
+            return;
+        };
+        self.turn_id = Some(turn_id);
+        self.turn_started_at = Some(started_at);
+        self.busy = true;
     }
 
     pub fn enter_side_thread(
@@ -2157,6 +2282,14 @@ impl AppState {
     ) {
         let parent = SideParent {
             thread_id: self.thread_id.clone(),
+            turn: self
+                .turn_id
+                .clone()
+                .filter(|_| self.busy)
+                .map(|id| ParentTurn {
+                    id,
+                    started_at: self.turn_started_at.unwrap_or_else(Instant::now),
+                }),
         };
         self.prepare_resume();
         self.side_parent = Some(parent);
@@ -2260,7 +2393,8 @@ impl AppState {
         self.active.clear();
         self.active_order.clear();
         self.pending = None;
-        self.total_tokens = 0;
+        self.context_tokens = 0;
+        self.token_totals = TokenTotals::default();
         self.context_window = None;
         self.transient_status = None;
         self.side_parent = None;
@@ -2292,8 +2426,20 @@ impl AppState {
         self.push_notice(
             BlockKind::Update,
             "Update Available",
-            format!("New version {latest} is available. Run: devez update"),
+            format!("New version {latest} is available. Run: dvz update"),
         );
+    }
+
+    /// Notice painted before a slow round-trip. The event loop cannot redraw
+    /// while an action awaits, so callers set this and draw once up front.
+    pub fn set_waiting_notice(&mut self, message: impl Into<String>) {
+        self.set_composer_notice(message.into());
+    }
+
+    /// Brings the welcome panel back after the screen is wiped, so a cleared
+    /// terminal looks like a fresh start instead of a bare composer.
+    pub fn reset_welcome(&mut self) {
+        self.show_welcome = true;
     }
 
     pub fn drain_committed(&mut self) -> Vec<Block> {
@@ -2753,12 +2899,29 @@ impl AppState {
         }
     }
 
+    /// A parent turn keeps streaming behind a `/btw` fork. Its output stays out
+    /// of the fork's view, but the end of the turn has to land somewhere so we
+    /// do not restore a spinner for a turn that already finished.
+    fn note_background_turn(&mut self, thread_id: &str, method: &str) {
+        if method != "turn/completed" {
+            return;
+        }
+        if let Some(parent) = self
+            .side_parent
+            .as_mut()
+            .filter(|parent| parent.thread_id == thread_id)
+        {
+            parent.turn = None;
+        }
+    }
+
     pub fn handle_notification(&mut self, method: &str, params: &Value) {
-        if params
+        if let Some(thread_id) = params
             .get("threadId")
             .and_then(Value::as_str)
-            .is_some_and(|thread_id| thread_id != self.thread_id)
+            .filter(|thread_id| *thread_id != self.thread_id)
         {
+            self.note_background_turn(thread_id, method);
             return;
         }
         match method {
@@ -2858,11 +3021,19 @@ impl AppState {
             }
             "thread/tokenUsage/updated" => {
                 if let Some(usage) = params.get("tokenUsage") {
-                    self.total_tokens = usage
-                        .get("total")
-                        .and_then(|total| total.get("totalTokens"))
+                    // `ThreadTokenUsage.total` accumulates every turn of the
+                    // thread, so it runs past the window and cannot gauge the
+                    // context. `last` is what the current prompt occupies.
+                    self.context_tokens = usage
+                        .get("last")
+                        .and_then(|last| last.get("totalTokens"))
                         .and_then(Value::as_u64)
-                        .unwrap_or(self.total_tokens);
+                        .unwrap_or(self.context_tokens);
+                    // Billing counts every turn, so the tally is the right input
+                    // for the traffic and cost figures on the composer rule.
+                    if let Some(total) = usage.get("total") {
+                        self.token_totals = TokenTotals::from_breakdown(total);
+                    }
                     self.context_window = usage
                         .get("modelContextWindow")
                         .and_then(Value::as_u64)
@@ -2906,15 +3077,15 @@ impl AppState {
                     params.get("fromModel").and_then(Value::as_str),
                     params.get("toModel").and_then(Value::as_str),
                 ) {
-                    self.transient_status = Some(format!("{from} → {to}로 전환됨"));
+                    self.set_composer_notice(format!("{from} → {to}로 전환됨"));
                 }
             }
             "skills/changed" => {
-                self.transient_status = Some("Skills refreshed".to_owned());
+                self.set_composer_notice("Skills refreshed".to_owned());
             }
             "app/list/updated" => {
                 self.update_apps(params);
-                self.transient_status = Some("Apps refreshed".to_owned());
+                self.set_composer_notice("Apps refreshed".to_owned());
             }
             "mcpServer/oauthLogin/completed" => {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("MCP");
@@ -3130,7 +3301,10 @@ impl AppState {
                 ));
                 Action::None
             }
-            "/login" => Action::StartLogin,
+            "/login" => {
+                self.open_login_picker();
+                Action::None
+            }
             "/logout" => {
                 self.confirm_logout();
                 Action::None
@@ -3215,14 +3389,8 @@ impl AppState {
             "/resume" if parts.len() == 1 => Action::OpenResume,
             "/resume" => Action::ResumeThread(parts[1..].join(" ")),
             "/continue" => Action::OpenResume,
-            "/btw" | "/side" if self.busy => {
-                self.committed.push(Block::new(
-                    BlockKind::Warning,
-                    "진행 중",
-                    "현재 응답을 중단한 뒤 사이드 대화를 시작하세요.",
-                ));
-                Action::None
-            }
+            // `/btw` is for asking something *while* the main turn runs, so it
+            // never waits for the turn to finish.
             "/btw" | "/side" => Action::StartSide((parts.len() > 1).then(|| parts[1..].join(" "))),
             "/compact" if self.busy => {
                 self.committed.push(Block::new(
@@ -3616,16 +3784,51 @@ impl AppState {
                     Action::None
                 }
             },
-            PendingInteraction::Login { login_id, auth_url } => match key.code {
-                KeyCode::Char('o') => {
-                    let target = auth_url.clone();
-                    self.pending = Some(PendingInteraction::Login { login_id, auth_url });
-                    Action::OpenUrl(target)
+            PendingInteraction::LoginMethodPicker { selected } => {
+                let last = LoginMethod::CHOICES.len() - 1;
+                match key.code {
+                    KeyCode::Up | KeyCode::Left => {
+                        self.pending = Some(PendingInteraction::LoginMethodPicker {
+                            selected: selected.saturating_sub(1),
+                        });
+                        Action::None
+                    }
+                    KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
+                        self.pending = Some(PendingInteraction::LoginMethodPicker {
+                            selected: (selected + 1).min(last),
+                        });
+                        Action::None
+                    }
+                    KeyCode::Char(digit @ '1'..='9') => {
+                        let index = digit as usize - '1' as usize;
+                        match LoginMethod::CHOICES.get(index) {
+                            Some(method) => Action::StartLogin(*method),
+                            None => {
+                                self.pending =
+                                    Some(PendingInteraction::LoginMethodPicker { selected });
+                                Action::None
+                            }
+                        }
+                    }
+                    KeyCode::Enter => Action::StartLogin(LoginMethod::CHOICES[selected.min(last)]),
+                    KeyCode::Esc => Action::None,
+                    _ => {
+                        self.pending = Some(PendingInteraction::LoginMethodPicker { selected });
+                        Action::None
+                    }
                 }
+            }
+            PendingInteraction::Login {
+                login_id,
+                waiting_on,
+            } => match key.code {
                 KeyCode::Esc => Action::CancelLogin(login_id),
                 // Everything else keeps waiting; only the server ends this state.
                 _ => {
-                    self.pending = Some(PendingInteraction::Login { login_id, auth_url });
+                    self.pending = Some(PendingInteraction::Login {
+                        login_id,
+                        waiting_on,
+                    });
                     Action::None
                 }
             },
@@ -3964,31 +4167,40 @@ impl AppState {
                 input_label: "",
                 input_placeholder: "",
             }),
-            PendingInteraction::Login { auth_url, .. } => Some(OverlayView {
-                title: "Sign in to ChatGPT".to_owned(),
-                lines: vec![
-                    OverlayLine {
-                        text: "브라우저에서 로그인을 완료하세요.".to_owned(),
-                        selected: false,
-                        muted: false,
-                    },
-                    OverlayLine {
-                        text: auth_url.clone(),
+            PendingInteraction::LoginMethodPicker { selected } => Some(OverlayView {
+                title: "Select login method".to_owned(),
+                lines: LoginMethod::CHOICES
+                    .iter()
+                    .enumerate()
+                    .map(|(index, method)| OverlayLine {
+                        text: format!("{}. {}  ·  {}", index + 1, method.label(), method.detail()),
+                        selected: index == *selected,
+                        muted: index != *selected,
+                    })
+                    .collect(),
+                hint: "↑↓ select   Enter confirm   Esc cancel".to_owned(),
+                style: OverlayStyle::Panel,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            }),
+            PendingInteraction::Login { waiting_on, .. } => Some(OverlayView {
+                title: "Signing in".to_owned(),
+                lines: waiting_on
+                    .iter()
+                    .enumerate()
+                    .map(|(index, text)| OverlayLine {
+                        text: text.clone(),
+                        selected: index == 0,
+                        muted: index != 0,
+                    })
+                    .chain(std::iter::once(OverlayLine {
+                        text: "완료되면 이 창이 자동으로 닫힙니다.".to_owned(),
                         selected: false,
                         muted: true,
-                    },
-                    OverlayLine {
-                        text: "[o] 브라우저 다시 열기".to_owned(),
-                        selected: true,
-                        muted: false,
-                    },
-                    OverlayLine {
-                        text: "완료되면 자동으로 닫힙니다.".to_owned(),
-                        selected: false,
-                        muted: true,
-                    },
-                ],
-                hint: "o reopen   Esc cancel".to_owned(),
+                    }))
+                    .collect(),
+                hint: "Esc cancel".to_owned(),
                 style: OverlayStyle::Panel,
                 input: None,
                 input_label: "",
@@ -4106,8 +4318,9 @@ impl AppState {
             .map(|started| started.elapsed().as_secs())
             .unwrap_or(0);
         Some(format!(
-            "{} Working… {}s · Esc to interrupt",
-            SPINNER[self.spinner_frame], elapsed
+            "{} Working… {} · Esc to interrupt",
+            SPINNER[self.spinner_frame],
+            format_elapsed(elapsed)
         ))
     }
 
@@ -4116,9 +4329,11 @@ impl AppState {
             (window > 0).then(|| {
                 format!(
                     "ctx: {}/{} ({}%)",
-                    format_token_count(self.total_tokens),
+                    format_token_count(self.context_tokens),
                     format_token_count(window),
-                    self.total_tokens.saturating_mul(100) / window
+                    // A prompt cannot really outgrow its window, but a stale
+                    // reading should not print an impossible percentage.
+                    (self.context_tokens.saturating_mul(100) / window).min(100)
                 )
             })
         });
@@ -4487,11 +4702,14 @@ fn completed_item_block(item: &Value) -> Option<Block> {
                         88
                     )
                 ),
+                // The renderer shows only the first few rows and counts the rest,
+                // so this cap is a memory guard: keep it high enough that the
+                // count it reports is the real one for any ordinary command.
                 collapse_output(
                     item.get("aggregatedOutput")
                         .and_then(Value::as_str)
                         .unwrap_or_default(),
-                    14,
+                    400,
                 ),
             ))
         }
@@ -4582,6 +4800,17 @@ fn file_changes_body(changes: &[Value]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Wall-clock elapsed for the activity row: `42s`, `1m 10s`, `1h 3m 49s`. A long
+/// turn reads as minutes rather than as a three-digit second count.
+fn format_elapsed(seconds: u64) -> String {
+    let (hours, minutes, seconds) = (seconds / 3_600, (seconds % 3_600) / 60, seconds % 60);
+    match (hours, minutes) {
+        (0, 0) => format!("{seconds}s"),
+        (0, _) => format!("{minutes}m {seconds}s"),
+        _ => format!("{hours}h {minutes}m {seconds}s"),
+    }
 }
 
 fn format_duration(duration_ms: u64) -> String {
@@ -5109,6 +5338,249 @@ mod tests {
     }
 
     #[test]
+    fn clearing_the_screen_brings_the_welcome_panel_back() {
+        let mut state = test_state();
+        // A first submit commits the welcome card and hides the live panel.
+        state.editor.insert_str("hello");
+        state.submit_editor();
+        assert!(state.view().welcome.is_none());
+
+        assert!(matches!(
+            state.run_slash_command("/clear"),
+            Action::ClearScreen
+        ));
+        state.reset_welcome();
+
+        assert!(state.view().welcome.is_some());
+    }
+
+    #[test]
+    fn ctrl_l_reaches_the_same_clear_action_as_the_command() {
+        let mut state = test_state();
+
+        let action = state.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+
+        assert!(matches!(action, Action::ClearScreen));
+    }
+
+    #[test]
+    fn login_puts_the_url_in_scrollback_and_waits_in_a_modal() {
+        let mut state = test_state();
+        let url = format!(
+            "https://auth.openai.com/oauth/authorize?state={}",
+            "x".repeat(300)
+        );
+
+        // /login only opens the method list; nothing is sent yet.
+        assert!(matches!(state.run_slash_command("/login"), Action::None));
+
+        state.begin_login("login-1".to_owned(), url.clone());
+
+        assert_eq!(state.active_login_id(), Some("login-1"));
+        // The URL is scrollback, not modal content, so the panel cannot be flooded.
+        let block = state.committed.last().expect("sign-in url block");
+        assert_eq!(block.title, "Sign-in URL");
+        assert_eq!(block.body, url);
+        let overlay = state.overlay_view().expect("login overlay");
+        assert!(overlay.lines.iter().all(|line| !line.text.contains("http")));
+    }
+
+    #[test]
+    fn login_method_list_selects_with_arrows_digits_or_enter() {
+        let mut state = test_state();
+        state.run_slash_command("/login");
+
+        // Claude-Code-style list: numbered rows with the first one highlighted.
+        let overlay = state.overlay_view().expect("login method list");
+        assert_eq!(overlay.title, "Select login method");
+        assert_eq!(overlay.lines.len(), LoginMethod::CHOICES.len());
+        assert!(overlay.lines[0].text.starts_with("1. "));
+        assert!(overlay.lines[0].selected);
+        assert_eq!(overlay.hint, "↑↓ select   Enter confirm   Esc cancel");
+
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let confirmed = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            confirmed,
+            Action::StartLogin(LoginMethod::DeviceCode)
+        ));
+
+        state.run_slash_command("/login");
+        let by_digit = state.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert!(matches!(by_digit, Action::StartLogin(LoginMethod::Browser)));
+    }
+
+    #[test]
+    fn login_method_list_can_be_dismissed() {
+        let mut state = test_state();
+        state.run_slash_command("/login");
+
+        let action = state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(matches!(action, Action::None));
+        assert!(state.overlay_view().is_none());
+    }
+
+    #[test]
+    fn waiting_modal_only_offers_cancel() {
+        let mut state = test_state();
+        state.begin_login("login-1".to_owned(), "https://example.test/auth".to_owned());
+
+        let overlay = state.overlay_view().expect("login overlay");
+        assert_eq!(overlay.hint, "Esc cancel");
+
+        // The removed affordances no longer fire; the modal just keeps waiting.
+        for key in ['o', 'c', 'y'] {
+            let action = state.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+            assert!(matches!(action, Action::None), "'{key}' should be inert");
+            assert_eq!(state.active_login_id(), Some("login-1"));
+        }
+
+        let cancelled = state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(cancelled, Action::CancelLogin(id) if id == "login-1"));
+    }
+
+    #[test]
+    fn device_login_shows_the_code_and_keeps_the_url_in_scrollback() {
+        let mut state = test_state();
+
+        state.begin_device_login(
+            "login-2".to_owned(),
+            "https://auth.openai.com/device".to_owned(),
+            "ABCD-1234".to_owned(),
+        );
+
+        let block = state.committed.last().expect("sign-in url block");
+        assert!(block.body.contains("https://auth.openai.com/device"));
+        assert!(block.body.contains("ABCD-1234"));
+        let overlay = state.overlay_view().expect("login overlay");
+        assert!(overlay.lines[0].text.contains("ABCD-1234"));
+        assert!(overlay.lines.iter().all(|line| !line.text.contains("http")));
+    }
+
+    #[test]
+    fn login_methods_map_to_app_server_param_types() {
+        assert_eq!(LoginMethod::Browser.param_type(), "chatgpt");
+        assert_eq!(LoginMethod::DeviceCode.param_type(), "chatgptDeviceCode");
+    }
+
+    #[test]
+    fn login_completed_notification_closes_the_modal_and_queues_a_refresh() {
+        let mut state = test_state();
+        state.begin_login("login-1".to_owned(), "https://example.test".to_owned());
+
+        state.handle_notification(
+            "account/login/completed",
+            &json!({
+                "loginId": "login-1", "success": true, "error": null
+            }),
+        );
+
+        assert_eq!(state.active_login_id(), None);
+        assert!(state.take_account_refresh());
+        // The flag is consumed, so the event loop refreshes exactly once.
+        assert!(!state.take_account_refresh());
+    }
+
+    /// One-off events belong in the composer notice next to the copy message,
+    /// not in the status line where they used to park until the next thread.
+    #[test]
+    fn one_off_events_land_in_the_composer_notice_and_expire() {
+        for (method, params, expected) in [
+            ("skills/changed", json!({}), "Skills refreshed"),
+            ("app/list/updated", json!({ "apps": [] }), "Apps refreshed"),
+            (
+                "model/rerouted",
+                json!({ "fromModel": "Sol", "toModel": "Luna" }),
+                "Sol → Luna로 전환됨",
+            ),
+        ] {
+            let mut state = test_state();
+
+            state.handle_notification(method, &params);
+
+            let view = state.view();
+            assert_eq!(view.composer_notice.as_deref(), Some(expected), "{method}");
+            assert_eq!(
+                view.status_line.and_then(|status| status.notice),
+                None,
+                "{method} should not park on the status line"
+            );
+
+            state.composer_notice = state.composer_notice.take().map(|(notice, _)| {
+                (
+                    notice,
+                    Instant::now() - std::time::Duration::from_millis(1_500),
+                )
+            });
+            assert!(state.tick(), "{method} should redraw once it expires");
+            assert_eq!(state.view().composer_notice, None, "{method}");
+        }
+    }
+
+    #[test]
+    fn failed_login_reports_the_server_error_and_skips_the_refresh() {
+        let mut state = test_state();
+        state.begin_login("login-1".to_owned(), "https://example.test".to_owned());
+
+        state.handle_notification(
+            "account/login/completed",
+            &json!({
+                "loginId": "login-1", "success": false, "error": "browser closed"
+            }),
+        );
+
+        assert_eq!(state.active_login_id(), None);
+        assert!(!state.take_account_refresh());
+        assert!(
+            state
+                .committed
+                .iter()
+                .any(|block| block.body.contains("browser closed"))
+        );
+    }
+
+    #[test]
+    fn logout_asks_before_dropping_credentials() {
+        let mut state = test_state();
+
+        assert!(matches!(state.run_slash_command("/logout"), Action::None));
+
+        // Signing out needs a browser round trip to undo, so it confirms first.
+        let overlay = state.overlay_view().expect("logout confirmation");
+        assert!(overlay.title.contains("로그아웃"));
+
+        let confirmed = state.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        assert!(matches!(confirmed, Action::Logout));
+    }
+
+    #[test]
+    fn declined_logout_leaves_the_account_untouched() {
+        let mut state = test_state();
+        let before = state.account.clone();
+        state.run_slash_command("/logout");
+
+        let declined = state.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+
+        assert!(matches!(declined, Action::None));
+        assert!(state.overlay_view().is_none());
+        assert_eq!(state.account, before);
+    }
+
+    #[test]
+    fn applying_logout_clears_the_cached_identity() {
+        let mut state = test_state();
+        state.set_account_plan(AccountPlan::from_rate_limits(&rate_limits_fixture()));
+
+        state.apply_logout();
+
+        assert_eq!(state.welcome_view().plan, "—");
+        assert_eq!(state.welcome_view().credits, ["none available".to_owned()]);
+        assert!(state.account.contains("signed out"));
+    }
+
+    #[test]
     fn permission_mode_starts_from_the_configured_sandbox_mode() {
         assert_eq!(
             parse_permission_mode("sandbox_mode = \"danger-full-access\"\n"),
@@ -5313,6 +5785,31 @@ mod tests {
     }
 
     #[test]
+    fn the_resume_picker_pads_inside_its_border_and_leaves_the_search_rule_bare() {
+        let picker = SessionPicker::new(
+            vec![SessionInfo {
+                id: "current".to_owned(),
+                name: Some("Current project".to_owned()),
+                preview: String::new(),
+                cwd: r"C:\work\current".to_owned(),
+                updated_at: 2,
+            }],
+            r"C:\work\current".to_owned(),
+            None,
+        );
+
+        let view = picker.overlay_view();
+
+        // The padding rows come from the panel renderer, so the picker itself
+        // contributes only the session.
+        assert_eq!(view.lines.len(), 1);
+        assert!(
+            view.input_label.is_empty(),
+            "the placeholder already names the field"
+        );
+    }
+
+    #[test]
     fn effort_requires_an_explicit_supported_level() {
         let model = ModelInfo {
             id: "model".to_owned(),
@@ -5411,7 +5908,7 @@ mod tests {
         state
             .committed
             .push(Block::new(BlockKind::Assistant, "", "old response"));
-        state.total_tokens = 42;
+        state.context_tokens = 42;
         state.context_window = Some(100);
         state.transient_status = Some("old status".to_owned());
         state.busy = true;
@@ -5422,13 +5919,87 @@ mod tests {
 
         assert!(state.editor.is_empty());
         assert!(state.committed.is_empty());
-        assert_eq!(state.total_tokens, 0);
+        assert_eq!(state.context_tokens, 0);
         assert_eq!(state.context_window, None);
         assert_eq!(state.transient_status, None);
         assert!(!state.busy);
         assert_eq!(state.turn_id, None);
         assert!(state.turn_started_at.is_none());
         assert!(state.view().welcome.is_some());
+    }
+
+    #[test]
+    fn side_conversation_starts_while_a_turn_is_running() {
+        let mut state = busy_state_with_live_turn();
+
+        let action = state.run_slash_command("/btw");
+
+        assert!(matches!(action, Action::StartSide(None)));
+        assert!(
+            !state
+                .committed
+                .iter()
+                .any(|block| matches!(block.kind, BlockKind::Warning))
+        );
+    }
+
+    #[test]
+    fn returning_from_a_side_conversation_restores_the_live_parent_turn() {
+        let mut state = busy_state_with_live_turn();
+
+        state.enter_side_thread(
+            "fork-thread".to_owned(),
+            "cwd".to_owned(),
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+        assert!(!state.busy, "the fork starts idle");
+
+        let parked = state.take_side_parent_turn();
+        state.prepare_resume();
+        state.set_thread(
+            "main-thread".to_owned(),
+            "cwd".to_owned(),
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+        state.restore_turn(parked);
+
+        assert!(state.busy);
+        assert_eq!(state.turn_id.as_deref(), Some("live-turn"));
+        assert!(state.turn_started_at.is_some());
+    }
+
+    #[test]
+    fn a_parent_turn_that_ends_during_the_side_conversation_is_not_restored() {
+        let mut state = busy_state_with_live_turn();
+        state.enter_side_thread(
+            "fork-thread".to_owned(),
+            "cwd".to_owned(),
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+
+        state.handle_notification("turn/completed", &json!({ "threadId": "main-thread" }));
+
+        assert!(state.take_side_parent_turn().is_none());
+        assert!(!state.busy);
+    }
+
+    fn busy_state_with_live_turn() -> AppState {
+        let model = test_model("gpt-5.6-sol", "GPT-5.6-Sol", true);
+        let mut state = AppState::new(
+            "main-thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![model],
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+        state.busy = true;
+        state.turn_id = Some("live-turn".to_owned());
+        state.turn_started_at = Some(Instant::now());
+        state
     }
 
     #[test]
@@ -5837,5 +6408,65 @@ mod tests {
                 enabled: true
             } if query == "calendar"
         ));
+    }
+
+    /// The thread tally outgrows the window within a few turns, so reading it as
+    /// context usage produced readings like `1103k/258k (426%)`.
+    #[test]
+    fn context_gauge_tracks_the_last_turn_not_the_thread_tally() {
+        let mut state = test_state();
+        state.handle_notification(
+            "thread/tokenUsage/updated",
+            &json!({
+                "tokenUsage": {
+                    "total": { "totalTokens": 1_103_000 },
+                    "last": { "totalTokens": 96_400 },
+                    "modelContextWindow": 258_000
+                }
+            }),
+        );
+
+        assert_eq!(state.context_tokens, 96_400);
+        assert_eq!(state.context_window, Some(258_000));
+        assert_eq!(
+            state.status_line().context.as_deref(),
+            Some("ctx: 96k/258k (37%)")
+        );
+    }
+
+    #[test]
+    fn composer_badge_reports_an_estimated_cost_from_the_billed_totals() {
+        let mut state = test_state();
+        state.handle_notification(
+            "thread/tokenUsage/updated",
+            &json!({
+                "tokenUsage": {
+                    "total": {
+                        "totalTokens": 580_000,
+                        "inputTokens": 570_000,
+                        "cachedInputTokens": 500_000,
+                        "cacheWriteInputTokens": 40_000,
+                        "outputTokens": 10_000
+                    },
+                    "last": { "totalTokens": 96_400 },
+                    "modelContextWindow": 258_000
+                }
+            }),
+        );
+
+        // gpt-5.6 at $5/$30 per million: 30k fresh input (0.15) + 40k cache
+        // write ×1.25 (0.25) + 500k cache read ×0.1 (0.25) + 10k output (0.30).
+        assert_eq!(state.composer_mode().cost.as_deref(), Some("$0.95"));
+        assert_eq!(state.token_totals.input_new, 30_000);
+    }
+
+    #[test]
+    fn long_turns_read_as_minutes_instead_of_raw_seconds() {
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(42), "42s");
+        assert_eq!(format_elapsed(70), "1m 10s");
+        assert_eq!(format_elapsed(229), "3m 49s");
+        assert_eq!(format_elapsed(3_600), "1h 0m 0s");
+        assert_eq!(format_elapsed(3_829), "1h 3m 49s");
     }
 }

@@ -1,9 +1,11 @@
 use std::{
     env, fs,
     path::PathBuf,
+    process::Command,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 /// npm package that publishes the `devez` binary.
@@ -41,6 +43,29 @@ pub async fn check_for_update() -> Option<String> {
     };
 
     is_newer(&latest, CURRENT_VERSION).then_some(latest)
+}
+
+/// Hands the upgrade to a detached console. Windows keeps a lock on the running
+/// executable, so npm can only replace it once this process has exited.
+pub fn run_self_update() -> Result<()> {
+    println!("Devez CLI v{CURRENT_VERSION} · 최신 버전 설치를 시작합니다.");
+    println!("새 창에서 `npm install -g {PACKAGE}@latest`가 실행됩니다.");
+    println!("설치가 끝나면 `dvz`를 다시 실행하세요.");
+
+    Command::new("cmd")
+        .args([
+            "/C",
+            "start",
+            "Devez CLI update",
+            "cmd",
+            "/C",
+            &format!(
+                "timeout /t 1 /nobreak >nul & npm install -g {PACKAGE}@latest & echo. & pause"
+            ),
+        ])
+        .spawn()
+        .context("업데이트 프로세스를 시작하지 못했습니다. npm이 설치되어 있는지 확인하세요.")?;
+    Ok(())
 }
 
 async fn fetch_latest() -> Option<String> {
