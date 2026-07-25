@@ -75,6 +75,8 @@ fn find_rollout(root: &Path, thread_id: &str) -> Option<PathBuf> {
 /// build does not know — is dropped on its own; the rest of the file still reads.
 pub fn parse(text: &str) -> Rollout {
     let mut events = Vec::new();
+    // Exec calls whose output has not arrived yet: `call_id` → index in `events`.
+    let mut pending: Vec<(String, usize)> = Vec::new();
     for line in text.lines() {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -88,6 +90,46 @@ pub fn parse(text: &str) -> Rollout {
             continue;
         };
         match payload.get("type").and_then(Value::as_str).unwrap_or_default() {
+            "custom_tool_call" => {
+                let input = payload.get("input").and_then(Value::as_str).unwrap_or_default();
+                let Some(command) = shell_command(input) else {
+                    continue;
+                };
+                let call_id = payload
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                pending.push((call_id, events.len()));
+                events.push(RolloutEvent {
+                    ts,
+                    kind: RolloutKind::Exec {
+                        command,
+                        output: String::new(),
+                        exit_code: None,
+                        duration_ms: None,
+                    },
+                });
+            }
+            "custom_tool_call_output" => {
+                let call_id = payload.get("call_id").and_then(Value::as_str).unwrap_or_default();
+                let Some(position) = pending.iter().position(|(id, _)| id == call_id) else {
+                    continue;
+                };
+                let (_, index) = pending.remove(position);
+                let text = output_text(payload.get("output"));
+                if let RolloutKind::Exec {
+                    output,
+                    exit_code,
+                    duration_ms,
+                    ..
+                } = &mut events[index].kind
+                {
+                    *exit_code = parse_exit_code(&text);
+                    *duration_ms = parse_wall_time_ms(&text);
+                    *output = text;
+                }
+            }
             "reasoning" => {
                 let summary = summary_text(payload.get("summary"));
                 if summary.is_empty() {
@@ -136,6 +178,100 @@ fn summary_text(value: Option<&Value>) -> String {
         .filter_map(|part| part.get("text").and_then(Value::as_str))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The shell command inside an `exec` call's script, or `None` when the script
+/// is doing something else — applying a patch, above all.
+fn shell_command(input: &str) -> Option<String> {
+    let shell = input.find("tools.shell_command(")?;
+    // A patch body can quote anything, including this module's own markers, so the
+    // first tool call in the script decides what the call was for.
+    if input
+        .find("tools.apply_patch(")
+        .is_some_and(|patch| patch < shell)
+    {
+        return None;
+    }
+    let arguments = balanced_object(&input[shell..])?;
+    match serde_json::from_str::<Value>(arguments).ok()?.get("command")? {
+        Value::String(command) => Some(command.clone()),
+        Value::Array(parts) => Some(
+            parts
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        _ => None,
+    }
+}
+
+/// The first `{…}` run in `text`, counting nesting and ignoring braces inside
+/// strings. The call's arguments are hand-written JavaScript, so a plain
+/// `find('}')` would stop at the first brace a command happens to contain.
+fn balanced_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (offset, character) in text[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            '{' if !quoted => depth += 1,
+            '}' if !quoted => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..start + offset + character.len_utf8()]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn output_text(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+/// The inner `Exit code: N` the code-mode wrapper prints for the command itself.
+fn parse_exit_code(output: &str) -> Option<i64> {
+    let index = output.find("Exit code:")?;
+    let rest = output[index + "Exit code:".len()..].trim_start();
+    let digits = rest
+        .chars()
+        .take_while(|character| character.is_ascii_digit() || *character == '-')
+        .collect::<String>();
+    digits.parse().ok()
+}
+
+/// The wrapper's own `Wall time 1.6 seconds` line — the first of the two, which
+/// covers the whole script rather than one command inside it.
+fn parse_wall_time_ms(output: &str) -> Option<u64> {
+    let index = output.find("Wall time")?;
+    let rest = output[index + "Wall time".len()..]
+        .trim_start()
+        .trim_start_matches(':')
+        .trim_start();
+    let number = rest
+        .chars()
+        .take_while(|character| character.is_ascii_digit() || *character == '.')
+        .collect::<String>();
+    let seconds = number.parse::<f64>().ok()?;
+    Some((seconds * 1000.0).round() as u64)
 }
 
 #[cfg(test)]
@@ -214,5 +350,77 @@ mod tests {
             RolloutKind::AssistantMessage { text } if text == "wanted"
         ));
         assert!(missing.is_none());
+    }
+
+    /// Helper for the exec tests: the single `Exec` event a rollout produced.
+    fn only_exec(rollout: &Rollout) -> (&str, &str, Option<i64>, Option<u64>) {
+        rollout
+            .events
+            .iter()
+            .find_map(|event| match &event.kind {
+                RolloutKind::Exec {
+                    command,
+                    output,
+                    exit_code,
+                    duration_ms,
+                } => Some((command.as_str(), output.as_str(), *exit_code, *duration_ms)),
+                _ => None,
+            })
+            .expect("one exec event")
+    }
+
+    #[test]
+    fn a_string_shell_command_becomes_an_exec_event() {
+        let rollout = parse(
+            r#"{"timestamp":"2026-07-25T15:08:36.373Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_one","input":"const r = await tools.shell_command({\"command\":\"cargo test --quiet\",\"workdir\":\"C:\\\\Source\"});\nconsole.log(r);"}}"#,
+        );
+
+        let (command, _, _, _) = only_exec(&rollout);
+        assert_eq!(command, "cargo test --quiet");
+    }
+
+    #[test]
+    fn an_array_shell_command_is_joined_with_spaces() {
+        let rollout = parse(
+            r#"{"timestamp":"2026-07-25T15:08:36.373Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_one","input":"await tools.shell_command({\"command\":[\"bash\",\"-lc\",\"ls\"]});"}}"#,
+        );
+
+        let (command, _, _, _) = only_exec(&rollout);
+        assert_eq!(command, "bash -lc ls");
+    }
+
+    #[test]
+    fn an_apply_patch_exec_call_makes_no_exec_event() {
+        let rollout = parse(
+            r#"{"timestamp":"2026-07-25T15:09:40.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_patch","input":"const patch = \"*** Begin Patch\";\nawait tools.apply_patch({\"patch\":patch});"}}"#,
+        );
+
+        assert!(rollout.events.is_empty());
+    }
+
+    #[test]
+    fn output_is_paired_by_call_id_with_its_exit_code_and_wall_time() {
+        let rollout = parse(
+            r#"{"timestamp":"2026-07-25T15:08:36.373Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_one","input":"await tools.shell_command({\"command\":\"rg TODO\"});"}}
+{"timestamp":"2026-07-25T15:08:38.010Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_one","output":[{"type":"input_text","text":"Script completed\nWall time 1.6 seconds\nOutput:\n"},{"type":"input_text","text":"Exit code: 3\nWall time: 0.5 seconds\nOutput:\nsrc/main.rs:12\n"}]}}"#,
+        );
+
+        let (command, output, exit_code, duration_ms) = only_exec(&rollout);
+        assert_eq!(command, "rg TODO");
+        assert!(output.contains("src/main.rs:12"));
+        assert_eq!(exit_code, Some(3));
+        assert_eq!(duration_ms, Some(1600));
+    }
+
+    #[test]
+    fn an_exec_without_its_output_still_produces_an_event() {
+        let rollout = parse(
+            r#"{"timestamp":"2026-07-25T15:08:36.373Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_one","input":"await tools.shell_command({\"command\":\"rg TODO\"});"}}"#,
+        );
+
+        let (_, output, exit_code, duration_ms) = only_exec(&rollout);
+        assert!(output.is_empty());
+        assert_eq!(exit_code, None);
+        assert_eq!(duration_ms, None);
     }
 }
