@@ -13,6 +13,7 @@
 - Apply the same picker to runtime `/resume` and startup `dvz --resume`.
 - Preserve search and all existing picker key bindings.
 - Keep existing `Panel` and `Picker` overlay rendering unchanged.
+- Keep three blank columns between compact row content and the right border.
 - Add no dependencies.
 
 ---
@@ -248,3 +249,106 @@ Expected: all tests PASS.
 git add -- src/state.rs
 git commit -m "feat: compact resume session picker"
 ```
+
+### Task 3: Compact Row Right Inset
+
+**Files:**
+- Modify: `src/renderer.rs:1518-1565`
+- Modify: `src/renderer.rs:1820-1845`
+- Test: `src/renderer.rs:5378-5420`
+
+**Interfaces:**
+- Consumes: existing `compact_right`, `panel_line`, and `OverlayStyle::CompactPanel`
+- Produces: `panel_line_keep_left_inset(text: &str, width: usize, right_inset: usize, tone: Tone, bold: bool) -> PaintLine`
+
+- [ ] **Step 1: Extend the compact panel test with the failing inset assertion**
+
+After obtaining the selected option row in
+`compact_panel_keeps_each_option_on_one_physical_row`, add:
+
+```rust
+let option = painted(option_rows[0]);
+assert!(
+    option.ends_with("…   │"),
+    "truncated row lost its three-column right inset: {option}"
+);
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `cargo test renderer::tests::compact_panel_keeps_each_option_on_one_physical_row -- --nocapture`
+
+Expected: FAIL because the current compact row ends with `…│`.
+
+- [ ] **Step 3: Add the inset-aware row helper**
+
+Add this helper beside `panel_line_keep_left`:
+
+```rust
+fn panel_line_keep_left_inset(
+    text: &str,
+    width: usize,
+    right_inset: usize,
+    tone: Tone,
+    bold: bool,
+) -> PaintLine {
+    let inner_width = width.saturating_sub(2);
+    let inset = right_inset.min(inner_width);
+    let content_width = inner_width.saturating_sub(inset);
+    let single_line = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    let content = if content_width == 0 {
+        String::new()
+    } else {
+        compact_right(&single_line, content_width)
+    };
+    panel_line(
+        &format!("{content}{}", " ".repeat(inset)),
+        width,
+        tone,
+        bold,
+    )
+}
+```
+
+In the `OverlayStyle::CompactPanel` arm, replace
+`panel_line_keep_left(...)` with:
+
+```rust
+panel_line_keep_left_inset(
+    &format!(" {marker} {}", row.text),
+    panel_width,
+    3,
+    if row.selected {
+        Tone::Accent
+    } else if row.muted {
+        Tone::Muted
+    } else {
+        Tone::Plain
+    },
+    row.selected,
+)
+```
+
+Do not change command suggestions or the existing `Panel` renderer.
+
+- [ ] **Step 4: Run focused and full verification**
+
+Run: `cargo test renderer::tests::compact_panel_keeps_each_option_on_one_physical_row -- --nocapture`
+
+Expected: PASS.
+
+Run: `cargo fmt --check`
+
+Expected: exit code 0.
+
+Run: `cargo test`
+
+Expected: all tests PASS unless an unrelated concurrent workspace change has introduced a separately identified failure.
+
+- [ ] **Step 5: Commit**
+
+Do not commit `src/renderer.rs` while it contains unrelated user changes.
+Leave the verified source edit in the working tree and report that state.
