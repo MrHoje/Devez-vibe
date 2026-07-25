@@ -229,7 +229,7 @@ impl Renderer {
                 "\x1b]10;{}\x07\x1b]11;{}\x07\x1b]12;{}\x07",
                 palette.foreground.hex(),
                 palette.background.hex(),
-                palette.accent.hex()
+                palette.foreground.hex()
             ))
         )?;
         self.out.flush()?;
