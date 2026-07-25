@@ -18,7 +18,7 @@ Codex의 인증, 하네스 프롬프트, 도구, 스킬, `AGENTS.md`, 샌드박�
 - 좌우 테두리와 복사용 공백이 없는 Claude Code형 하단 composer
 - Git 브랜치, 모델, effort, context, 5h/주간 한도, Fast 상태를 표시하는 하단 상태줄
 - 모델별 실제 유효 context window를 첫 입력 전부터 표시
-- 시작과 `/new` 세션 전환 시 터미널을 비우고 새 화면으로 전환
+- 시작과 `/new` 세션 전환 시 화면과 스크롤백을 비우고 새 화면으로 전환
 - Codex CLI 정렬을 유지하고 hidden 모델을 제외한 `/model` 피커
 - `/model sol`, `/model terra`, `/model luna`, `/model spark` 등 짧은 모델 별칭
 - 모델 번호 표시 및 피커에서 `1`~`9` 숫자키 즉시 선택

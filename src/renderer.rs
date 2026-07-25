@@ -147,7 +147,13 @@ impl Renderer {
         self.cursor_line = 0;
         self.last_width = 0;
         self.last_height = 0;
-        execute!(self.out, Clear(ClearType::All), MoveTo(0, 0), Show)?;
+        execute!(
+            self.out,
+            Clear(ClearType::All),
+            Clear(ClearType::Purge),
+            MoveTo(0, 0),
+            Show
+        )?;
         Ok(())
     }
 
@@ -1166,7 +1172,7 @@ fn input_lines(
                 )
             },
         ),
-        tone: Tone::Border,
+        tone: Tone::Muted,
         bold: false,
         tail: Vec::new(),
     });
@@ -1200,9 +1206,9 @@ fn input_lines(
     }
     rows.push(PaintLine {
         prefix: String::new(),
-        prefix_tone: Tone::Border,
+        prefix_tone: Tone::Muted,
         text: "─".repeat(panel_width),
-        tone: Tone::Border,
+        tone: Tone::Muted,
         bold: false,
         tail: Vec::new(),
     });
@@ -1518,6 +1524,8 @@ mod tests {
         assert!(prompt_rows.len() > 1);
         assert!(!rows[0].text.contains("Message"));
         assert!(rows[0].text.chars().all(|ch| ch == '─'));
+        assert!(rows[0].tone == Tone::Muted);
+        assert!(rows.last().is_some_and(|row| row.tone == Tone::Muted));
         assert!(!rows[0].text.contains(['╭', '╮', '╰', '╯']));
         assert!(
             rows.last()
