@@ -13,6 +13,8 @@ the command suggestion UI while keeping session search and navigation.
 - Format rows as relative time followed by the session name or first prompt.
 - In all-projects mode, append the session folder on the same row.
 - Truncate overflowing content on the right with an ellipsis.
+- Keep three blank columns between compact row content and the right border,
+  including when an ellipsis is shown.
 - Keep search, Up/Down, Enter, Ctrl+A, PageUp/PageDown, and Esc behavior.
 - Preserve the conversation or welcome content above the dock.
 
@@ -23,8 +25,9 @@ It uses a resume-specific 10-row window and produces single-line rows.
 
 Add a compact overlay style in `renderer.rs`. It shares the bordered visual
 language and right-side truncation behavior of command suggestions, but retains
-overlay input support for the session search field. Existing panel and picker
-overlays are unchanged.
+overlay input support for the session search field. A compact-only row helper
+reserves a three-column right inset before truncation. Existing panel, picker,
+and command suggestion rows are unchanged.
 
 ## Verification
 
@@ -32,4 +35,6 @@ overlays are unchanged.
   all-projects formatting.
 - Renderer tests verify compact rows never wrap and that the dock preserves
   content above it.
+- Renderer tests verify truncated compact rows keep exactly three blank columns
+  before the right border.
 - Run the focused state and renderer tests, then the full test suite.
