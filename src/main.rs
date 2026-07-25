@@ -206,6 +206,7 @@ async fn choose_startup_session(sessions: Vec<SessionInfo>, cwd: &Path) -> Resul
                 footer: "Resume a Codex session".to_owned(),
                 status_line: None,
                 composer_notice: None,
+                composer_mode: None,
             },
         )?;
         match events.next().await {
@@ -598,7 +599,8 @@ async fn start_turn(server: &AppServer, state: &mut AppState, text: String) {
         }],
         "model": state.selected_model_name(),
         "effort": state.selected_effort(),
-        "serviceTier": state.service_tier()
+        "serviceTier": state.service_tier(),
+        "permissions": state.permission_profile()
     });
     match server.request("turn/start", params).await {
         Ok(response) => {

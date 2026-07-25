@@ -21,7 +21,6 @@ pub enum BlockKind {
     Assistant,
     Reasoning,
     Tool,
-    Success,
     ModelChange,
     Warning,
     Error,
@@ -99,6 +98,19 @@ pub struct StatusLineView {
     pub notice: Option<String>,
 }
 
+/// How prominently a composer mode badge is painted on the composer top rule.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ModeAccent {
+    Calm,
+    Safe,
+    Danger,
+}
+
+pub struct ComposerMode {
+    pub label: String,
+    pub accent: ModeAccent,
+}
+
 pub struct View<'a> {
     pub live_blocks: Vec<Block>,
     pub overlay: Option<OverlayView<'a>>,
@@ -109,6 +121,7 @@ pub struct View<'a> {
     pub footer: String,
     pub status_line: Option<StatusLineView>,
     pub composer_notice: Option<String>,
+    pub composer_mode: Option<ComposerMode>,
 }
 
 pub struct TerminalSession;
@@ -160,6 +173,7 @@ impl Renderer {
         self.last_height = 0;
         execute!(
             self.out,
+            Print("\x1b]777;devez-copy-clear\x07"),
             Clear(ClearType::All),
             Clear(ClearType::Purge),
             MoveTo(0, 0),
@@ -174,6 +188,7 @@ impl Renderer {
             fallback: view.footer,
             line: view.status_line,
             composer_notice: view.composer_notice,
+            composer_mode: view.composer_mode,
         };
         let mut frame = if let Some(overlay) = view.overlay {
             overlay_frame(&view.live_blocks, overlay, status, width.max(20))
@@ -199,7 +214,7 @@ impl Renderer {
             self.erase_live()?;
             for block in committed {
                 let lines = block_lines(block, width.max(20));
-                self.print_permanent(&lines)?;
+                self.print_permanent(block, &lines)?;
             }
             self.out.flush()?;
             let available_rows = cursor_position()
@@ -249,8 +264,21 @@ impl Renderer {
         Ok(())
     }
 
-    fn print_permanent(&mut self, lines: &[PaintLine]) -> Result<()> {
-        for line in lines {
+    fn print_permanent(&mut self, block: &Block, lines: &[PaintLine]) -> Result<()> {
+        let assistant = matches!(block.kind, BlockKind::Assistant);
+        for (index, line) in lines.iter().enumerate() {
+            if assistant {
+                let marker_skip = usize::from(index == 0 && line.prefix == "● ")
+                    * UnicodeWidthStr::width(line.prefix.as_str());
+                let join_next = usize::from(copy_joins_next(line));
+                let prefix_width = UnicodeWidthStr::width(line.prefix.as_str());
+                queue!(
+                    self.out,
+                    Print(format!(
+                        "\x1b]777;devez-copy-v1;{marker_skip};{join_next};{prefix_width}\x07"
+                    ))
+                )?;
+            }
             print_line(&mut self.out, line)?;
             queue!(self.out, Print("\r\n"))?;
         }
@@ -365,9 +393,10 @@ struct StatusArea {
     fallback: String,
     line: Option<StatusLineView>,
     composer_notice: Option<String>,
+    composer_mode: Option<ComposerMode>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tone {
     Plain,
     Muted,
@@ -397,6 +426,7 @@ enum Tone {
     FastOn,
     FastOff,
     ModelChange,
+    CopyJoin,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -476,6 +506,7 @@ fn normal_frame(
         "",
         "Ask Codex to build, fix, or explain…",
         status.composer_notice.as_deref(),
+        status.composer_mode.as_ref(),
     );
     let cursor_line = lines.len() + input_cursor_line;
     lines.extend(input_lines);
@@ -736,6 +767,7 @@ fn overlay_frame(
             overlay.input_label,
             overlay.input_placeholder,
             None,
+            status.composer_mode.as_ref(),
         );
         cursor_line = lines.len() + input_cursor_line;
         cursor_col = input_cursor_col;
@@ -902,7 +934,7 @@ fn trim_spans(spans: &mut Vec<PaintSpan>, max_width: usize) {
 fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     if matches!(block.kind, BlockKind::Welcome) {
         let mut values = block.body.lines();
-        return welcome_lines(
+        let mut lines = welcome_lines(
             WelcomeView {
                 model: values.next().unwrap_or_default().to_owned(),
                 effort: values.next().unwrap_or_default().to_owned(),
@@ -911,6 +943,8 @@ fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
             },
             width,
         );
+        lines.push(PaintLine::blank());
+        return lines;
     }
     if matches!(block.kind, BlockKind::User) {
         return user_prompt_lines(block, width);
@@ -933,6 +967,7 @@ fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
                 bold: false,
                 tail: Vec::new(),
             },
+            PaintLine::blank(),
         ];
     }
 
@@ -942,7 +977,6 @@ fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         BlockKind::Assistant => ("● ", Tone::Accent),
         BlockKind::Reasoning => ("✻ ", Tone::Muted),
         BlockKind::Tool => ("● ", Tone::User),
-        BlockKind::Success => ("✓ ", Tone::Success),
         BlockKind::Warning => ("▲ ", Tone::Warning),
         BlockKind::Error => ("✕ ", Tone::Error),
         BlockKind::System => ("◆ ", Tone::Muted),
@@ -1137,6 +1171,7 @@ fn wrapped_line(
         }];
     }
 
+    let part_count = wrapped.len();
     wrapped
         .into_iter()
         .enumerate()
@@ -1150,9 +1185,21 @@ fn wrapped_line(
             text: part.into_owned(),
             tone,
             bold,
-            tail: Vec::new(),
+            tail: if index + 1 < part_count {
+                vec![PaintSpan {
+                    text: String::new(),
+                    tone: Tone::CopyJoin,
+                    bold: false,
+                }]
+            } else {
+                Vec::new()
+            },
         })
         .collect()
+}
+
+fn copy_joins_next(line: &PaintLine) -> bool {
+    line.tail.iter().any(|span| span.tone == Tone::CopyJoin)
 }
 
 fn input_lines(
@@ -1161,6 +1208,7 @@ fn input_lines(
     label: &str,
     placeholder: &str,
     notice: Option<&str>,
+    mode: Option<&ComposerMode>,
 ) -> (Vec<PaintLine>, usize, usize) {
     let panel_width = (width as usize).saturating_sub(1).max(16);
     let first_prefix = "  ❯ ";
@@ -1212,7 +1260,7 @@ fn input_lines(
     }
 
     let mut rows = Vec::with_capacity(raw_rows.len() + 2);
-    rows.push(input_top_line(panel_width, label, notice));
+    rows.push(input_top_line(panel_width, label, notice, mode));
     for (index, raw) in raw_rows.into_iter().enumerate() {
         let is_placeholder = editor.is_empty() && index == 0;
         let content = if is_placeholder {
@@ -1253,41 +1301,94 @@ fn input_lines(
     (rows, cursor_row + 1, cursor_column)
 }
 
-fn input_top_line(panel_width: usize, label: &str, notice: Option<&str>) -> PaintLine {
+/// Shortest rule stub kept on the composer top line so the frame never collapses.
+const COMPOSER_RULE_MIN: usize = 4;
+/// Blank columns between the rule and the mode badge.
+const COMPOSER_MODE_GAP: usize = 2;
+/// Blank columns between the mode badge and the panel edge.
+const COMPOSER_MODE_MARGIN: usize = 1;
+/// Blank columns between the rule and a transient notice.
+const COMPOSER_NOTICE_GAP: usize = 1;
+/// Below this the badge is dropped instead of being ellipsized into noise.
+const COMPOSER_MODE_MIN: usize = 4;
+
+fn input_top_line(
+    panel_width: usize,
+    label: &str,
+    notice: Option<&str>,
+    mode: Option<&ComposerMode>,
+) -> PaintLine {
     let left = if label.is_empty() {
         String::new()
     } else {
         format!("── {label} ")
     };
-    let notice = notice
-        .map(|notice| compact_right(notice, panel_width.saturating_sub(6)))
-        .unwrap_or_default();
-    let notice_width = UnicodeWidthStr::width(notice.as_str());
     let left_width = UnicodeWidthStr::width(left.as_str());
-    let fill =
-        panel_width.saturating_sub(left_width + notice_width + usize::from(!notice.is_empty()));
+    // Right-hand badges eat into this budget; whatever survives stays as rule.
+    let mut budget = panel_width.saturating_sub(left_width + COMPOSER_RULE_MIN);
+
+    // The mode is persistent state, so it anchors the far right.
+    let mode_span = mode.and_then(|mode| {
+        let reserved = COMPOSER_MODE_GAP + COMPOSER_MODE_MARGIN;
+        (budget >= reserved + COMPOSER_MODE_MIN).then(|| {
+            let text = compact_right(&mode.label, budget - reserved);
+            budget -= UnicodeWidthStr::width(text.as_str()) + reserved;
+            (text, mode_accent_tone(mode.accent))
+        })
+    });
+
+    // Transient notices dock to the left of the mode badge.
+    let notice_span = notice.and_then(|notice| {
+        (budget >= COMPOSER_NOTICE_GAP + COMPOSER_MODE_MIN).then(|| {
+            let text = compact_right(notice, budget - COMPOSER_NOTICE_GAP);
+            budget -= UnicodeWidthStr::width(text.as_str()) + COMPOSER_NOTICE_GAP;
+            text
+        })
+    });
+
+    let mut tail = Vec::new();
+    if let Some(text) = notice_span {
+        tail.push(rule_gap(COMPOSER_NOTICE_GAP));
+        tail.push(PaintSpan {
+            text,
+            tone: Tone::Success,
+            bold: false,
+        });
+    }
+    if let Some((text, tone)) = mode_span {
+        tail.push(rule_gap(COMPOSER_MODE_GAP));
+        tail.push(PaintSpan {
+            text,
+            tone,
+            bold: false,
+        });
+        tail.push(rule_gap(COMPOSER_MODE_MARGIN));
+    }
+
+    let fill = (COMPOSER_RULE_MIN + budget).min(panel_width.saturating_sub(left_width));
     PaintLine {
         prefix: String::new(),
         prefix_tone: Tone::Muted,
         text: format!("{left}{}", "─".repeat(fill)),
         tone: Tone::Muted,
         bold: false,
-        tail: if notice.is_empty() {
-            Vec::new()
-        } else {
-            vec![
-                PaintSpan {
-                    text: " ".to_owned(),
-                    tone: Tone::Muted,
-                    bold: false,
-                },
-                PaintSpan {
-                    text: notice,
-                    tone: Tone::Success,
-                    bold: false,
-                },
-            ]
-        },
+        tail,
+    }
+}
+
+fn rule_gap(width: usize) -> PaintSpan {
+    PaintSpan {
+        text: " ".repeat(width),
+        tone: Tone::Muted,
+        bold: false,
+    }
+}
+
+fn mode_accent_tone(accent: ModeAccent) -> Tone {
+    match accent {
+        ModeAccent::Calm => Tone::Muted,
+        ModeAccent::Safe => Tone::Context,
+        ModeAccent::Danger => Tone::Warning,
     }
 }
 
@@ -1358,6 +1459,9 @@ fn print_line(out: &mut Stdout, line: &PaintLine) -> Result<()> {
         ResetColor
     )?;
     for span in &line.tail {
+        if span.tone == Tone::CopyJoin {
+            continue;
+        }
         set_tone(out, span.tone)?;
         if span.bold {
             queue!(out, SetAttribute(Attribute::Bold))?;
@@ -1537,6 +1641,7 @@ fn set_tone(out: &mut Stdout, tone: Tone) -> Result<()> {
             g: 226,
             b: 238,
         },
+        Tone::CopyJoin => Color::Reset,
     };
     queue!(out, SetForegroundColor(color))?;
     Ok(())
@@ -1599,7 +1704,7 @@ mod tests {
         let mut editor = Editor::default();
         editor.set_text("wrapped prompt text");
 
-        let (rows, _, _) = input_lines(&editor, 18, "", "placeholder", None);
+        let (rows, _, _) = input_lines(&editor, 18, "", "placeholder", None, None);
         let prompt_rows = &rows[1..rows.len() - 1];
 
         assert!(prompt_rows.len() > 1);
@@ -1626,15 +1731,32 @@ mod tests {
         );
         let lines = block_lines(&block, 80);
 
-        assert_eq!(lines.len(), 2);
-        assert!(lines.iter().all(|line| line.tone == Tone::ModelChange));
+        assert_eq!(lines.len(), 3);
+        assert!(lines[..2].iter().all(|line| line.tone == Tone::ModelChange));
         assert_eq!(lines[1].prefix, "    ");
         assert!(lines[1].text.starts_with('↳'));
+        assert!(lines[2].text.is_empty());
+    }
+
+    #[test]
+    fn assistant_visual_wraps_are_marked_for_copy_reconstruction() {
+        let lines = wrapped_line(
+            "● ",
+            Tone::Accent,
+            "this response wraps across multiple terminal rows",
+            Tone::Plain,
+            false,
+            18,
+        );
+
+        assert!(lines.len() > 1);
+        assert!(lines[..lines.len() - 1].iter().all(copy_joins_next));
+        assert!(!copy_joins_next(lines.last().expect("last row")));
     }
 
     #[test]
     fn copy_notice_is_right_aligned_on_the_composer_top_rule() {
-        let line = input_top_line(50, "", Some("Copied 12 chars to clipboard"));
+        let line = input_top_line(50, "", Some("Copied 12 chars to clipboard"), None);
         let width = UnicodeWidthStr::width(line.text.as_str())
             + line
                 .tail
@@ -1647,6 +1769,67 @@ mod tests {
             line.tail.last().map(|span| span.text.as_str()),
             Some("Copied 12 chars to clipboard")
         );
+    }
+
+    fn rule_width(line: &PaintLine) -> usize {
+        UnicodeWidthStr::width(line.text.as_str())
+            + line
+                .tail
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+                .sum::<usize>()
+    }
+
+    #[test]
+    fn permission_mode_sits_padded_on_the_right_of_the_composer_rule() {
+        let mode = ComposerMode {
+            label: "Full Access".to_owned(),
+            accent: ModeAccent::Danger,
+        };
+        let line = input_top_line(50, "", None, Some(&mode));
+        let texts = line
+            .tail
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rule_width(&line), 50);
+        assert!(line.text.chars().all(|ch| ch == '─'));
+        // Two blank columns off the rule, the badge, then one column of edge margin.
+        assert_eq!(texts, ["  ", "Full Access", " "]);
+        assert_eq!(line.tail[1].tone, Tone::Warning);
+    }
+
+    #[test]
+    fn composer_rule_keeps_notice_left_of_the_permission_mode() {
+        let mode = ComposerMode {
+            label: "Read Only".to_owned(),
+            accent: ModeAccent::Calm,
+        };
+        let line = input_top_line(60, "", Some("Copied 12 chars to clipboard"), Some(&mode));
+        let texts = line
+            .tail
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rule_width(&line), 60);
+        assert_eq!(
+            texts,
+            [" ", "Copied 12 chars to clipboard", "  ", "Read Only", " "]
+        );
+    }
+
+    #[test]
+    fn narrow_composer_rule_drops_the_permission_mode_instead_of_ellipsizing() {
+        let mode = ComposerMode {
+            label: "Full Access".to_owned(),
+            accent: ModeAccent::Danger,
+        };
+        let line = input_top_line(9, "", None, Some(&mode));
+
+        assert!(line.tail.is_empty());
+        assert_eq!(rule_width(&line), 9);
     }
 
     #[test]
@@ -1668,6 +1851,7 @@ mod tests {
                 fallback: String::new(),
                 line: None,
                 composer_notice: None,
+                composer_mode: None,
             },
             80,
         );
@@ -1760,6 +1944,7 @@ mod tests {
                 fallback: String::new(),
                 line: None,
                 composer_notice: None,
+                composer_mode: None,
             },
             80,
         );

@@ -11,12 +11,57 @@ use serde_json::{Map, Value, json};
 use crate::{
     editor::Editor,
     renderer::{
-        Block, BlockKind, OverlayLine, OverlayStyle, OverlayView, StatusLineView, SuggestionView,
-        View, WelcomeView,
+        Block, BlockKind, ComposerMode, ModeAccent, OverlayLine, OverlayStyle, OverlayView,
+        StatusLineView, SuggestionView, View, WelcomeView,
     },
 };
 
 const SPINNER: [&str; 8] = ["✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳"];
+
+/// The permission presets Codex exposes through `/permissions`, cycled with Shift+Tab.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PermissionMode {
+    ReadOnly,
+    Default,
+    FullAccess,
+}
+
+impl PermissionMode {
+    const CYCLE: [Self; 3] = [Self::ReadOnly, Self::Default, Self::FullAccess];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "Read Only",
+            Self::Default => "Default",
+            Self::FullAccess => "Full Access",
+        }
+    }
+
+    /// Built-in permission profile id understood by the app-server.
+    pub fn profile(self) -> &'static str {
+        match self {
+            Self::ReadOnly => ":read-only",
+            Self::Default => ":workspace",
+            Self::FullAccess => ":danger-full-access",
+        }
+    }
+
+    fn accent(self) -> ModeAccent {
+        match self {
+            Self::ReadOnly => ModeAccent::Calm,
+            Self::Default => ModeAccent::Safe,
+            Self::FullAccess => ModeAccent::Danger,
+        }
+    }
+
+    fn next(self) -> Self {
+        let index = Self::CYCLE
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(0);
+        Self::CYCLE[(index + 1) % Self::CYCLE.len()]
+    }
+}
 
 struct SlashCommand {
     name: &'static str,
@@ -548,6 +593,7 @@ pub struct AppState {
     last_assistant_markdown: Option<String>,
     composer_notice: Option<(String, Instant)>,
     status_metadata_refreshed_at: Instant,
+    permission_mode: PermissionMode,
 }
 
 impl AppState {
@@ -609,11 +655,28 @@ impl AppState {
             last_assistant_markdown: None,
             composer_notice: None,
             status_metadata_refreshed_at: Instant::now(),
+            permission_mode: read_permission_mode(),
         }
     }
 
     pub fn selected_model(&self) -> Option<&ModelInfo> {
         self.models.get(self.selected_model)
+    }
+
+    pub fn permission_mode(&self) -> PermissionMode {
+        self.permission_mode
+    }
+
+    /// Permission profile id to send with `turn/start`.
+    pub fn permission_profile(&self) -> &'static str {
+        self.permission_mode().profile()
+    }
+
+    fn composer_mode(&self) -> ComposerMode {
+        ComposerMode {
+            label: self.permission_mode().label().to_owned(),
+            accent: self.permission_mode().accent(),
+        }
     }
 
     pub fn selected_model_name(&self) -> &str {
@@ -651,24 +714,6 @@ impl AppState {
 
     pub fn set_fast_mode(&mut self, enabled: bool) {
         self.fast_mode = enabled;
-        self.transient_status = Some(if enabled {
-            "Fast On".to_owned()
-        } else {
-            "Fast Off".to_owned()
-        });
-        self.committed.push(Block::new(
-            BlockKind::Success,
-            if enabled {
-                "Fast mode enabled"
-            } else {
-                "Fast mode disabled"
-            },
-            if enabled {
-                "Faster inference with increased usage"
-            } else {
-                "Default service tier"
-            },
-        ));
     }
 
     pub fn set_copy_notice(&mut self, count: usize) {
@@ -821,6 +866,11 @@ impl AppState {
     }
 
     pub fn drain_committed(&mut self) -> Vec<Block> {
+        if self.show_welcome && !self.committed.is_empty() {
+            let pending = std::mem::take(&mut self.committed);
+            self.commit_welcome_card();
+            self.committed.extend(pending);
+        }
         std::mem::take(&mut self.committed)
     }
 
@@ -853,6 +903,7 @@ impl AppState {
                 .composer_notice
                 .as_ref()
                 .map(|(notice, _)| notice.clone()),
+            composer_mode: Some(self.composer_mode()),
         }
     }
 
@@ -955,6 +1006,11 @@ impl AppState {
         }
 
         match key.code {
+            // Shift+Tab arrives as BackTab on terminals without the Kitty keyboard protocol.
+            KeyCode::BackTab => {
+                self.cycle_permission_mode();
+                Action::None
+            }
             KeyCode::Char('c') if ctrl => {
                 if self.busy {
                     Action::Interrupt
@@ -1333,7 +1389,7 @@ impl AppState {
         if text.starts_with('/') && !text.contains('\n') {
             return self.run_slash_command(&text);
         }
-        self.show_welcome = false;
+        self.commit_welcome_card();
         self.committed
             .push(Block::new(BlockKind::User, "You", text.clone()));
         if self.busy {
@@ -1351,7 +1407,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    "/model [MODEL] [EFFORT]  모델과 effort 선택\n/fast  빠른 서비스 티어 전환\n/effort [LEVEL]  추론 수준\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/diff  git diff 표시\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈",
+                    "/model [MODEL] [EFFORT]  모델과 effort 선택\n/fast  빠른 서비스 티어 전환\n/effort [LEVEL]  추론 수준\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/diff  git diff 표시\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\nEsc 또는 Ctrl+C  실행 중단\nShift+Tab  권한 모드 전환 (Read Only / Default / Full Access)\nCtrl+Enter / Shift+Enter  줄바꿈",
                 ));
                 Action::None
             }
@@ -1505,8 +1561,12 @@ impl AppState {
                     BlockKind::System,
                     "Status",
                     format!(
-                        "thread: {}\nmodel: {model}\neffort: {}\ncwd: {}",
-                        self.thread_id, self.selected_effort, self.cwd
+                        "thread: {}\nmodel: {model}\neffort: {}\npermissions: {} ({})\ncwd: {}",
+                        self.thread_id,
+                        self.selected_effort,
+                        self.permission_mode.label(),
+                        self.permission_mode.profile(),
+                        self.cwd
                     ),
                 ));
                 Action::None
@@ -2022,9 +2082,13 @@ impl AppState {
         self.context_window = context_window.or(self.context_window);
         self.committed.push(Block::new(
             BlockKind::ModelChange,
-            "Model changed",
+            "✓ Model changed",
             format!("↳ {model_name} · {selected_effort}"),
         ));
+    }
+
+    fn cycle_permission_mode(&mut self) {
+        self.permission_mode = self.permission_mode.next();
     }
 
     fn apply_effort(&mut self, effort: &str) {
@@ -2035,9 +2099,13 @@ impl AppState {
         if !model.supports_effort(effort) {
             return;
         }
+        let model_name = model.display_name.clone();
         self.selected_effort = effort.to_owned();
-        self.committed
-            .push(Block::new(BlockKind::Success, "Effort changed", effort));
+        self.committed.push(Block::new(
+            BlockKind::ModelChange,
+            "✓ Effort changed",
+            format!("↳ {model_name} · {effort}"),
+        ));
     }
 
     fn commit_welcome_card(&mut self) {
@@ -2678,6 +2746,37 @@ fn read_fast_mode() -> bool {
         .is_some_and(|config| parse_fast_mode(&config))
 }
 
+fn read_permission_mode() -> PermissionMode {
+    codex_home()
+        .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
+        .and_then(|config| parse_permission_mode(&config))
+        .unwrap_or(PermissionMode::Default)
+}
+
+fn parse_permission_mode(config: &str) -> Option<PermissionMode> {
+    config
+        .lines()
+        .take_while(|line| !line.trim_start().starts_with('['))
+        .filter_map(|line| line.split('#').next())
+        .filter_map(|line| line.split_once('='))
+        .find_map(|(key, value)| {
+            (key.trim() == "sandbox_mode").then(|| {
+                match value
+                    .trim()
+                    .trim_matches(['"', '\''])
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "read-only" => Some(PermissionMode::ReadOnly),
+                    "workspace-write" => Some(PermissionMode::Default),
+                    "danger-full-access" => Some(PermissionMode::FullAccess),
+                    _ => None,
+                }
+            })
+        })
+        .flatten()
+}
+
 fn codex_home() -> Option<PathBuf> {
     env::var_os("CODEX_HOME")
         .map(PathBuf::from)
@@ -2737,6 +2836,70 @@ mod tests {
     }
 
     #[test]
+    fn shift_tab_cycles_permission_modes_and_wraps() {
+        let mut state = test_state();
+        state.permission_mode = PermissionMode::ReadOnly;
+
+        let expected = [
+            PermissionMode::Default,
+            PermissionMode::FullAccess,
+            PermissionMode::ReadOnly,
+        ];
+        for mode in expected {
+            let action = state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+
+            assert!(matches!(action, Action::None));
+            assert_eq!(state.permission_mode(), mode);
+        }
+        assert_eq!(state.permission_profile(), ":read-only");
+    }
+
+    #[test]
+    fn shift_tab_still_cycles_while_a_slash_command_is_being_typed() {
+        let mut state = test_state();
+        state.permission_mode = PermissionMode::Default;
+        state.editor.insert_str("/mo");
+
+        state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+
+        assert_eq!(state.permission_mode(), PermissionMode::FullAccess);
+        assert_eq!(state.editor.text(), "/mo");
+    }
+
+    #[test]
+    fn permission_mode_starts_from_the_configured_sandbox_mode() {
+        assert_eq!(
+            parse_permission_mode("sandbox_mode = \"danger-full-access\"\n"),
+            Some(PermissionMode::FullAccess)
+        );
+        assert_eq!(
+            parse_permission_mode("approval_policy = \"never\"\nsandbox_mode = \"read-only\"\n"),
+            Some(PermissionMode::ReadOnly)
+        );
+        assert_eq!(
+            parse_permission_mode("sandbox_mode = \"workspace-write\"\n"),
+            Some(PermissionMode::Default)
+        );
+        // Values under a table header belong to that table, not the root config.
+        assert_eq!(
+            parse_permission_mode("[windows]\nsandbox_mode = \"read-only\"\n"),
+            None
+        );
+        assert_eq!(parse_permission_mode("model = \"gpt-5.6\"\n"), None);
+    }
+
+    #[test]
+    fn status_command_reports_the_active_permission_profile() {
+        let mut state = test_state();
+        state.permission_mode = PermissionMode::FullAccess;
+
+        state.run_slash_command("/status");
+
+        let body = &state.committed.last().expect("status block").body;
+        assert!(body.contains("permissions: Full Access (:danger-full-access)"));
+    }
+
+    #[test]
     fn modified_enter_keys_insert_newlines_without_submitting() {
         for modifiers in [KeyModifiers::CONTROL, KeyModifiers::SHIFT] {
             let mut state = test_state();
@@ -2754,13 +2917,36 @@ mod tests {
     fn fast_and_btw_commands_dispatch_real_actions() {
         let mut state = test_state();
         assert!(matches!(
-            state.run_slash_command("/fast"),
+            state.run_slash_command("/fast on"),
             Action::SetFast(true)
         ));
         assert!(matches!(
             state.run_slash_command("/btw quick question"),
             Action::StartSide(Some(message)) if message == "quick question"
         ));
+    }
+
+    #[test]
+    fn fast_mode_is_shown_only_by_the_persistent_statusline() {
+        let mut state = test_state();
+
+        state.set_fast_mode(true);
+
+        assert!(state.fast_mode);
+        assert!(state.committed.is_empty());
+        assert!(state.transient_status.is_none());
+    }
+
+    #[test]
+    fn pending_output_is_always_placed_below_the_welcome_card() {
+        let mut state = test_state();
+        state.push_notice(BlockKind::System, "Done", "Ready");
+
+        let blocks = state.drain_committed();
+
+        assert!(matches!(blocks[0].kind, BlockKind::Welcome));
+        assert!(matches!(blocks[1].kind, BlockKind::System));
+        assert!(!state.show_welcome);
     }
 
     #[test]
@@ -2774,8 +2960,34 @@ mod tests {
 
         assert!(matches!(state.committed[0].kind, BlockKind::Welcome));
         assert!(matches!(state.committed[1].kind, BlockKind::ModelChange));
+        assert_eq!(state.committed[1].title, "✓ Model changed");
         assert!(state.committed[1].body.starts_with("↳ "));
         assert!(!state.show_welcome);
+    }
+
+    #[test]
+    fn first_prompt_keeps_the_welcome_card_above_the_user_message() {
+        let mut state = test_state();
+        state.editor.insert_str("hello");
+
+        let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(action, Action::Submit(message) if message == "hello"));
+        assert!(matches!(state.committed[0].kind, BlockKind::Welcome));
+        assert!(matches!(state.committed[1].kind, BlockKind::User));
+        assert!(!state.show_welcome);
+    }
+
+    #[test]
+    fn effort_change_uses_the_same_checked_card_as_model_change() {
+        let mut state = test_state();
+
+        state.apply_effort("xhigh");
+
+        let card = state.committed.last().expect("effort card");
+        assert!(matches!(card.kind, BlockKind::ModelChange));
+        assert_eq!(card.title, "✓ Effort changed");
+        assert_eq!(card.body, "↳ GPT-5.6 Sol · xhigh");
     }
 
     #[test]
