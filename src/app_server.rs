@@ -168,23 +168,7 @@ impl AppServer {
     }
 
     pub async fn initialize(&self) -> Result<Value> {
-        let response = self
-            .request(
-                "initialize",
-                json!({
-                    "clientInfo": {
-                        "name": "devez-cli",
-                        "title": "Devez CLI",
-                        "version": env!("CARGO_PKG_VERSION")
-                    },
-                    "capabilities": {
-                        "experimentalApi": true,
-                        "requestAttestation": false,
-                        "mcpServerOpenaiFormElicitation": false
-                    }
-                }),
-            )
-            .await?;
+        let response = self.request("initialize", initialize_params()).await?;
         self.notify("initialized", None)?;
         Ok(response)
     }
@@ -261,6 +245,21 @@ impl AppServer {
             .send(message)
             .map_err(|_| anyhow!("app-server에 메시지를 보낼 수 없습니다."))
     }
+}
+
+fn initialize_params() -> Value {
+    json!({
+        "clientInfo": {
+            "name": "devez-cli",
+            "title": "Devez CLI",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "capabilities": {
+            "experimentalApi": true,
+            "requestAttestation": false,
+            "mcpServerOpenaiFormElicitation": true
+        }
+    })
 }
 
 fn codex_command(resolved: &Path) -> Command {
@@ -383,5 +382,26 @@ fn format_rpc_error(error: &Value) -> String {
     match code {
         Some(code) => format!("{message} ({code})"),
         None => message.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initialize_enables_interactive_mcp_forms() {
+        let params = initialize_params();
+
+        assert_eq!(
+            params
+                .pointer("/capabilities/mcpServerOpenaiFormElicitation")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            params.pointer("/clientInfo/name").and_then(Value::as_str),
+            Some("devez-cli")
+        );
     }
 }

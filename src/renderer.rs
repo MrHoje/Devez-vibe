@@ -12,15 +12,20 @@ use crossterm::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::editor::Editor;
+use crate::{
+    editor::Editor,
+    theme::{self, Rgb, ThemeKind},
+};
 
 #[derive(Clone, Copy)]
 pub enum BlockKind {
     Welcome,
+    Update,
     User,
     Assistant,
     Reasoning,
     Tool,
+    Diff,
     ModelChange,
     Warning,
     Error,
@@ -43,12 +48,15 @@ impl Block {
         }
     }
 
-    pub fn welcome(model: &str, effort: &str, cwd: &str, account: &str) -> Self {
-        Self::new(
-            BlockKind::Welcome,
-            "DEVEZ CLI",
-            format!("{model}\n{effort}\n{cwd}\n{account}"),
-        )
+    /// Credits come last so the variable-length list survives the round trip
+    /// through [`BlockKind::Welcome`]'s newline-delimited body.
+    pub fn welcome(plan: &str, cwd: &str, account: &str, credits: &[String]) -> Self {
+        let mut body = format!("{plan}\n{cwd}\n{account}");
+        for line in credits {
+            body.push('\n');
+            body.push_str(line);
+        }
+        Self::new(BlockKind::Welcome, "DEVEZ CLI", body)
     }
 }
 
@@ -75,8 +83,9 @@ pub struct OverlayLine {
 }
 
 pub struct WelcomeView {
-    pub model: String,
-    pub effort: String,
+    pub plan: String,
+    /// Reset-credit rows: a summary first, then one line per credit.
+    pub credits: Vec<String>,
     pub cwd: String,
     pub account: String,
 }
@@ -94,7 +103,6 @@ pub struct StatusLineView {
     pub context: Option<String>,
     pub five_hour_percent: Option<u8>,
     pub weekly_percent: Option<u8>,
-    pub fast_mode: bool,
     pub notice: Option<String>,
 }
 
@@ -109,6 +117,7 @@ pub enum ModeAccent {
 pub struct ComposerMode {
     pub label: String,
     pub accent: ModeAccent,
+    pub fast_mode: bool,
 }
 
 pub struct View<'a> {
@@ -140,6 +149,7 @@ impl Drop for TerminalSession {
             stdout(),
             ResetColor,
             SetAttribute(Attribute::Reset),
+            Print("\x1b]110\x07\x1b]111\x07\x1b]112\x07"),
             Show,
             DisableBracketedPaste
         );
@@ -153,20 +163,49 @@ pub struct Renderer {
     cursor_line: usize,
     last_width: u16,
     last_height: u16,
+    theme: ThemeKind,
+    history: Vec<Block>,
 }
 
 impl Renderer {
-    pub fn new() -> Self {
+    pub fn new(selected_theme: ThemeKind) -> Self {
+        theme::set_current(selected_theme);
         Self {
             out: stdout(),
             previous_lines: Vec::new(),
             cursor_line: 0,
             last_width: 0,
             last_height: 0,
+            theme: selected_theme,
+            history: Vec::new(),
         }
     }
 
     pub fn clear_screen(&mut self) -> Result<()> {
+        self.history.clear();
+        self.apply_terminal_theme()?;
+        self.reset_screen()
+    }
+
+    pub fn set_theme(&mut self, selected_theme: ThemeKind) -> Result<()> {
+        if self.theme == selected_theme {
+            return Ok(());
+        }
+        self.erase_live()?;
+        self.theme = selected_theme;
+        theme::set_current(selected_theme);
+        self.apply_terminal_theme()?;
+        self.reset_screen()?;
+        let history = self.history.clone();
+        let width = terminal_size().unwrap_or((100, 30)).0.max(20);
+        for block in &history {
+            let lines = block_lines(block, width);
+            self.print_permanent(block, &lines)?;
+        }
+        Ok(())
+    }
+
+    fn reset_screen(&mut self) -> Result<()> {
         self.previous_lines.clear();
         self.cursor_line = 0;
         self.last_width = 0;
@@ -179,6 +218,21 @@ impl Renderer {
             MoveTo(0, 0),
             Show
         )?;
+        Ok(())
+    }
+
+    fn apply_terminal_theme(&mut self) -> Result<()> {
+        let palette = theme::palette();
+        queue!(
+            self.out,
+            Print(format!(
+                "\x1b]10;{}\x07\x1b]11;{}\x07\x1b]12;{}\x07",
+                palette.foreground.hex(),
+                palette.background.hex(),
+                palette.accent.hex()
+            ))
+        )?;
+        self.out.flush()?;
         Ok(())
     }
 
@@ -216,6 +270,7 @@ impl Renderer {
                 let lines = block_lines(block, width.max(20));
                 self.print_permanent(block, &lines)?;
             }
+            self.history.extend(committed.iter().cloned());
             self.out.flush()?;
             let available_rows = cursor_position()
                 .map(|(_, row)| height.saturating_sub(row).max(1) as usize)
@@ -426,6 +481,16 @@ enum Tone {
     FastOn,
     FastOff,
     ModelChange,
+    SyntaxComment,
+    SyntaxString,
+    SyntaxKeyword,
+    SyntaxNumber,
+    SyntaxType,
+    SyntaxFunction,
+    InlineCode,
+    DiffAdded,
+    DiffRemoved,
+    DiffHeader,
     CopyJoin,
 }
 
@@ -504,7 +569,7 @@ fn normal_frame(
         editor,
         width,
         "",
-        "Ask Codex to build, fix, or explain…",
+        "",
         status.composer_notice.as_deref(),
         status.composer_mode.as_ref(),
     );
@@ -521,63 +586,52 @@ fn normal_frame(
     }
 }
 
+/// Narrowest inner width that still leaves both columns readable; below this the
+/// welcome panel collapses to a single column.
+const WELCOME_SPLIT_MIN: usize = 62;
+
 fn welcome_lines(welcome: WelcomeView, width: u16) -> Vec<PaintLine> {
-    let panel_width = (width as usize).clamp(34, 76);
+    let panel_width = panel_span(width);
     let inner_width = panel_width.saturating_sub(2);
-    let mut lines = Vec::new();
-    lines.push(PaintLine {
+    let left = welcome_info_rows(&welcome, inner_width);
+
+    if inner_width < WELCOME_SPLIT_MIN {
+        let mut lines = vec![panel_top(inner_width)];
+        lines.extend(
+            left.into_iter()
+                .map(|(text, tone, bold)| panel_line(&text, panel_width, tone, bold)),
+        );
+        lines.push(panel_bottom(inner_width));
+        return lines;
+    }
+
+    // The right column is reserved for release notes, so give it a fixed slice
+    // and let the info column absorb the rest of the terminal.
+    let right_width = (inner_width * 2 / 5).clamp(26, 52);
+    let left_width = inner_width - right_width - 1;
+    let left = welcome_info_rows(&welcome, left_width);
+    let right = welcome_notes_rows(right_width);
+
+    let mut lines = vec![PaintLine {
         prefix: String::new(),
         prefix_tone: Tone::Border,
-        text: format!("╭{}╮", "─".repeat(inner_width)),
+        text: format!("╭{}┬{}╮", "─".repeat(left_width), "─".repeat(right_width)),
         tone: Tone::Border,
         bold: false,
         tail: Vec::new(),
-    });
-    lines.push(panel_line(
-        "  ✦  DEVEZ CLI",
-        panel_width,
-        Tone::Accent,
-        true,
-    ));
-    lines.push(panel_line(
-        "     Devez with Codex",
-        panel_width,
-        Tone::Muted,
-        false,
-    ));
-    lines.push(panel_line("", panel_width, Tone::Plain, false));
-    lines.push(panel_line(
-        &format!("  Model    {} · {}", welcome.model, welcome.effort),
-        panel_width,
-        Tone::Plain,
-        false,
-    ));
-    lines.push(panel_line(
-        &format!("  Account  {}", welcome.account),
-        panel_width,
-        Tone::Plain,
-        false,
-    ));
-    lines.push(panel_line(
-        &format!(
-            "  Folder   {}",
-            compact_text(&welcome.cwd, inner_width.saturating_sub(11))
-        ),
-        panel_width,
-        Tone::Plain,
-        false,
-    ));
-    lines.push(panel_line("", panel_width, Tone::Plain, false));
-    lines.push(panel_line(
-        "  /help commands  ·  /model switch model",
-        panel_width,
-        Tone::Muted,
-        false,
-    ));
+    }];
+    for row in 0..left.len().max(right.len()) {
+        lines.push(split_panel_line(
+            left.get(row),
+            left_width,
+            right.get(row),
+            right_width,
+        ));
+    }
     lines.push(PaintLine {
         prefix: String::new(),
         prefix_tone: Tone::Border,
-        text: format!("╰{}╯", "─".repeat(inner_width)),
+        text: format!("╰{}┴{}╯", "─".repeat(left_width), "─".repeat(right_width)),
         tone: Tone::Border,
         bold: false,
         tail: Vec::new(),
@@ -585,17 +639,220 @@ fn welcome_lines(welcome: WelcomeView, width: u16) -> Vec<PaintLine> {
     lines
 }
 
+type PanelRow = (String, Tone, bool);
+
+/// Columns taken by the two-space margin plus the widest row label.
+const WELCOME_LABEL_WIDTH: usize = 11;
+
+fn welcome_info_rows(welcome: &WelcomeView, column_width: usize) -> Vec<PanelRow> {
+    let mut rows = vec![
+        (
+            format!(
+                "  ✦  DEVEZ CLI  v{}  with Codex",
+                crate::update::CURRENT_VERSION
+            ),
+            Tone::Accent,
+            true,
+        ),
+        (String::new(), Tone::Plain, false),
+        (format!("  Plan     {}", welcome.plan), Tone::Plain, false),
+    ];
+
+    // First credit row sits beside the label; the rest hang under the value column.
+    let mut credits = welcome.credits.iter();
+    rows.push((
+        format!("  Resets   {}", credits.next().map_or("—", String::as_str)),
+        Tone::Plain,
+        false,
+    ));
+    rows.extend(credits.map(|line| {
+        (
+            format!("{}{line}", " ".repeat(WELCOME_LABEL_WIDTH)),
+            Tone::Muted,
+            false,
+        )
+    }));
+
+    rows.extend([
+        (
+            format!("  Account  {}", welcome.account),
+            Tone::Plain,
+            false,
+        ),
+        (
+            format!(
+                "  Folder   {}",
+                compact_text(
+                    &welcome.cwd,
+                    column_width.saturating_sub(WELCOME_LABEL_WIDTH)
+                )
+            ),
+            Tone::Plain,
+            false,
+        ),
+        (String::new(), Tone::Plain, false),
+        (
+            "  /help commands  ·  /model switch model".to_owned(),
+            Tone::Muted,
+            false,
+        ),
+    ]);
+    rows
+}
+
+/// Release notes, wrapped to the column so long lines fold instead of truncating.
+fn welcome_notes_rows(column_width: usize) -> Vec<PanelRow> {
+    let mut rows = vec![
+        ("  What's new".to_owned(), Tone::Accent, true),
+        (String::new(), Tone::Plain, false),
+    ];
+    if crate::update::RELEASE_NOTES.is_empty() {
+        rows.push(("  —".to_owned(), Tone::Muted, false));
+        return rows;
+    }
+    let indent = 2;
+    let options = textwrap::Options::new(column_width.saturating_sub(indent + 1).max(8))
+        .break_words(false)
+        .subsequent_indent("  ")
+        .word_separator(textwrap::WordSeparator::UnicodeBreakProperties);
+    for note in crate::update::RELEASE_NOTES {
+        rows.extend(textwrap::wrap(note, &options).into_iter().map(|folded| {
+            (
+                format!("{}{folded}", " ".repeat(indent)),
+                Tone::Muted,
+                false,
+            )
+        }));
+    }
+    rows
+}
+
+/// One body row of the split welcome panel: `│ left │ right │`.
+fn split_panel_line(
+    left: Option<&PanelRow>,
+    left_width: usize,
+    right: Option<&PanelRow>,
+    right_width: usize,
+) -> PaintLine {
+    let (left_text, left_tone, left_bold) = column_cell(left, left_width);
+    let (right_text, right_tone, right_bold) = column_cell(right, right_width);
+    PaintLine {
+        prefix: "│".to_owned(),
+        prefix_tone: Tone::Border,
+        text: left_text,
+        tone: left_tone,
+        bold: left_bold,
+        tail: vec![
+            PaintSpan {
+                text: "│".to_owned(),
+                tone: Tone::Border,
+                bold: false,
+            },
+            PaintSpan {
+                text: right_text,
+                tone: right_tone,
+                bold: right_bold,
+            },
+            PaintSpan {
+                text: "│".to_owned(),
+                tone: Tone::Border,
+                bold: false,
+            },
+        ],
+    }
+}
+
+/// Pads a row to exactly `width` columns so the panel borders stay aligned.
+fn column_cell(row: Option<&PanelRow>, width: usize) -> PanelRow {
+    // One column is held back so content never kisses the divider.
+    let content_width = width.saturating_sub(1);
+    let (text, tone, bold) = match row {
+        // Head-first truncation: rows that need their tail (paths) arrive pre-compacted.
+        Some((text, tone, bold)) => (compact_right(text, content_width), *tone, *bold),
+        None => (String::new(), Tone::Plain, false),
+    };
+    let padding = width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+    (format!("{text}{}", " ".repeat(padding)), tone, bold)
+}
+
+/// Panels share the composer's span so their borders line up with the rule.
+fn panel_span(width: u16) -> usize {
+    (width as usize).saturating_sub(1).max(20)
+}
+
+fn panel_top(inner_width: usize) -> PaintLine {
+    PaintLine {
+        prefix: String::new(),
+        prefix_tone: Tone::Border,
+        text: format!("╭{}╮", "─".repeat(inner_width)),
+        tone: Tone::Border,
+        bold: false,
+        tail: Vec::new(),
+    }
+}
+
+fn panel_bottom(inner_width: usize) -> PaintLine {
+    PaintLine {
+        prefix: String::new(),
+        prefix_tone: Tone::Border,
+        text: format!("╰{}╯", "─".repeat(inner_width)),
+        tone: Tone::Border,
+        bold: false,
+        tail: Vec::new(),
+    }
+}
+
+/// Full-width update banner: a rule, the headline, the hint, and a closing rule.
+fn update_lines(block: &Block, width: u16) -> Vec<PaintLine> {
+    let rule_width = (width as usize).max(1);
+    let text_width = rule_width.saturating_sub(1);
+    let rule = || PaintLine {
+        prefix: String::new(),
+        prefix_tone: Tone::Border,
+        text: "─".repeat(rule_width),
+        tone: Tone::Border,
+        bold: false,
+        tail: Vec::new(),
+    };
+    vec![
+        rule(),
+        PaintLine {
+            prefix: " ".to_owned(),
+            prefix_tone: Tone::Accent,
+            text: compact_text(&block.title, text_width),
+            tone: Tone::Accent,
+            bold: true,
+            tail: Vec::new(),
+        },
+        PaintLine {
+            prefix: " ".to_owned(),
+            prefix_tone: Tone::Muted,
+            text: compact_text(&block.body, text_width),
+            tone: Tone::Muted,
+            bold: false,
+            tail: Vec::new(),
+        },
+        rule(),
+        PaintLine::blank(),
+    ]
+}
+
 fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine> {
-    let panel_width = (width as usize).clamp(34, 76);
+    let panel_width = panel_span(width);
     let inner_width = panel_width.saturating_sub(2);
+    const HEADER: &str = "Commands ";
+    // "╭─ " + header + rule + "╮" has to land on exactly panel_width columns.
+    let header_rule = panel_width
+        .saturating_sub(3 + UnicodeWidthStr::width(HEADER) + 1)
+        .max(1);
     let mut lines = vec![PaintLine {
         prefix: "╭─ ".to_owned(),
         prefix_tone: Tone::Border,
-        text: "Commands ".to_owned(),
+        text: HEADER.to_owned(),
         tone: Tone::Muted,
         bold: false,
         tail: vec![PaintSpan {
-            text: "─".repeat(inner_width.saturating_sub(11)),
+            text: format!("{}╮", "─".repeat(header_rule)),
             tone: Tone::Border,
             bold: false,
         }],
@@ -617,14 +874,7 @@ fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine
             suggestion.selected,
         ));
     }
-    lines.push(PaintLine {
-        prefix: String::new(),
-        prefix_tone: Tone::Border,
-        text: format!("╰{}╯", "─".repeat(inner_width)),
-        tone: Tone::Border,
-        bold: false,
-        tail: Vec::new(),
-    });
+    lines.push(panel_bottom(inner_width));
     lines
 }
 
@@ -829,9 +1079,11 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         _ => Tone::StatusText,
     };
     let mut spans = Vec::new();
-    if let Some(branch) = status.branch.filter(|branch| !branch.is_empty()) {
-        push_status_span(&mut spans, compact_right(&branch, 32), Tone::Branch);
-    }
+    let branch = status
+        .branch
+        .filter(|branch| !branch.is_empty())
+        .unwrap_or_else(|| "--".to_owned());
+    push_status_span(&mut spans, compact_right(&branch, 24), Tone::Branch);
     push_status_span(
         &mut spans,
         compact_right(&status.model, 28),
@@ -841,13 +1093,10 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
     if let Some(context) = status.context.filter(|context| !context.is_empty()) {
         push_status_span(&mut spans, context, Tone::Context);
     }
-    push_status_span(
-        &mut spans,
-        status
-            .five_hour_percent
-            .map_or_else(|| "5h: --".to_owned(), |percent| format!("5h: {percent}%")),
-        Tone::LimitFiveHour,
-    );
+    // The 5h window is dropped entirely when unknown rather than shown as a stub.
+    if let Some(percent) = status.five_hour_percent {
+        push_status_span(&mut spans, format!("5h: {percent}%"), Tone::LimitFiveHour);
+    }
     push_status_span(
         &mut spans,
         status.weekly_percent.map_or_else(
@@ -856,19 +1105,7 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         ),
         Tone::LimitWeekly,
     );
-    push_status_span(
-        &mut spans,
-        if status.fast_mode {
-            "Fast On"
-        } else {
-            "Fast Off"
-        },
-        if status.fast_mode {
-            Tone::FastOn
-        } else {
-            Tone::FastOff
-        },
-    );
+    // Fast On/Off lives on the composer top rule beside the permission mode.
     if let Some(notice) = status.notice.filter(|notice| !notice.is_empty()) {
         push_status_span(&mut spans, notice, Tone::Muted);
     }
@@ -892,7 +1129,7 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
 fn push_status_span(spans: &mut Vec<PaintSpan>, text: impl Into<String>, tone: Tone) {
     if spans.is_empty() {
         spans.push(PaintSpan {
-            text: format!(" {}", text.into()),
+            text: text.into(),
             tone,
             bold: false,
         });
@@ -936,15 +1173,18 @@ fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         let mut values = block.body.lines();
         let mut lines = welcome_lines(
             WelcomeView {
-                model: values.next().unwrap_or_default().to_owned(),
-                effort: values.next().unwrap_or_default().to_owned(),
+                plan: values.next().unwrap_or_default().to_owned(),
                 cwd: values.next().unwrap_or_default().to_owned(),
                 account: values.next().unwrap_or_default().to_owned(),
+                credits: values.map(ToOwned::to_owned).collect(),
             },
             width,
         );
         lines.push(PaintLine::blank());
         return lines;
+    }
+    if matches!(block.kind, BlockKind::Update) {
+        return update_lines(block, width);
     }
     if matches!(block.kind, BlockKind::User) {
         return user_prompt_lines(block, width);
@@ -972,11 +1212,14 @@ fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     }
 
     let (marker, tone) = match block.kind {
-        BlockKind::Welcome | BlockKind::ModelChange => unreachable!("handled above"),
+        BlockKind::Welcome | BlockKind::Update | BlockKind::ModelChange => {
+            unreachable!("handled above")
+        }
         BlockKind::User => unreachable!("user blocks are rendered separately"),
         BlockKind::Assistant => ("● ", Tone::Accent),
         BlockKind::Reasoning => ("✻ ", Tone::Muted),
         BlockKind::Tool => ("● ", Tone::User),
+        BlockKind::Diff => ("● ", Tone::Accent),
         BlockKind::Warning => ("▲ ", Tone::Warning),
         BlockKind::Error => ("✕ ", Tone::Error),
         BlockKind::System => ("◆ ", Tone::Muted),
@@ -996,7 +1239,9 @@ fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         return lines;
     }
 
+    let force_diff = matches!(block.kind, BlockKind::Diff);
     let mut code = false;
+    let mut code_language = String::new();
     for raw_line in block.body.lines() {
         let trimmed = raw_line.trim_start();
         if let Some(language) = trimmed.strip_prefix("```") {
@@ -1020,6 +1265,11 @@ fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
                 bold: false,
                 tail: Vec::new(),
             });
+            if code {
+                code_language.clear();
+            } else {
+                code_language = language.trim().to_ascii_lowercase();
+            }
             code = !code;
             continue;
         }
@@ -1027,18 +1277,21 @@ fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         if code {
             let (prefix, prefix_tone) =
                 body_prefix(&mut first_content, marker, tone, "  │ ", Tone::Muted);
-            lines.extend(wrapped_line(
+            lines.extend(code_line(
                 &prefix,
                 prefix_tone,
                 raw_line,
-                Tone::Code,
-                false,
+                &code_language,
                 width,
             ));
+        } else if force_diff {
+            let (prefix, prefix_tone) =
+                body_prefix(&mut first_content, marker, tone, "  ", Tone::Muted);
+            lines.extend(diff_line(&prefix, prefix_tone, raw_line, width));
         } else if trimmed.starts_with('#') {
             let (prefix, prefix_tone) =
                 body_prefix(&mut first_content, marker, tone, "  ", Tone::Muted);
-            lines.extend(wrapped_line(
+            lines.extend(markdown_line(
                 &prefix,
                 prefix_tone,
                 trimmed.trim_start_matches('#').trim_start(),
@@ -1052,7 +1305,7 @@ fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         {
             let (prefix, prefix_tone) =
                 body_prefix(&mut first_content, marker, tone, "  • ", Tone::Accent);
-            lines.extend(wrapped_line(
+            lines.extend(markdown_line(
                 &prefix,
                 prefix_tone,
                 item,
@@ -1074,7 +1327,7 @@ fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         } else {
             let (prefix, prefix_tone) =
                 body_prefix(&mut first_content, marker, tone, "  ", Tone::Muted);
-            lines.extend(wrapped_line(
+            lines.extend(markdown_line(
                 &prefix,
                 prefix_tone,
                 raw_line,
@@ -1145,6 +1398,465 @@ fn body_prefix(
     }
 }
 
+fn markdown_line(
+    prefix: &str,
+    prefix_tone: Tone,
+    text: &str,
+    tone: Tone,
+    bold: bool,
+    width: u16,
+) -> Vec<PaintLine> {
+    if !text.contains('`') && !text.contains("**") {
+        return wrapped_line(prefix, prefix_tone, text, tone, bold, width);
+    }
+
+    let mut spans = Vec::new();
+    let mut index = 0;
+    let mut strong = bold;
+    while index < text.len() {
+        let rest = &text[index..];
+        if rest.starts_with("**") {
+            strong = !strong;
+            index += 2;
+            continue;
+        }
+        if let Some(after_tick) = rest.strip_prefix('`')
+            && let Some(end) = after_tick.find('`')
+        {
+            push_highlight_span(&mut spans, &after_tick[..end], Tone::InlineCode, false);
+            index += end + 2;
+            continue;
+        }
+
+        let next_marker = [
+            rest.find("**").unwrap_or(rest.len()),
+            rest.find('`').unwrap_or(rest.len()),
+        ]
+        .into_iter()
+        .min()
+        .unwrap_or(rest.len());
+        let take = if next_marker == 0 {
+            rest.chars().next().map(char::len_utf8).unwrap_or(0)
+        } else {
+            next_marker
+        };
+        push_highlight_span(&mut spans, &rest[..take], tone, strong);
+        index += take;
+    }
+
+    styled_lines(prefix, prefix_tone, spans, tone, bold, width)
+}
+
+fn code_line(
+    prefix: &str,
+    prefix_tone: Tone,
+    text: &str,
+    language: &str,
+    width: u16,
+) -> Vec<PaintLine> {
+    if matches!(language, "diff" | "patch") {
+        return diff_line(prefix, prefix_tone, text, width);
+    }
+
+    styled_lines(
+        prefix,
+        prefix_tone,
+        highlight_code(text, language),
+        Tone::Code,
+        false,
+        width,
+    )
+}
+
+fn styled_lines(
+    prefix: &str,
+    prefix_tone: Tone,
+    spans: Vec<PaintSpan>,
+    fallback_tone: Tone,
+    fallback_bold: bool,
+    width: u16,
+) -> Vec<PaintLine> {
+    let prefix_width = UnicodeWidthStr::width(prefix);
+    let available = (width as usize).saturating_sub(prefix_width).max(1);
+    let mut rows: Vec<Vec<PaintSpan>> = vec![Vec::new()];
+    let mut used = 0;
+
+    for span in spans {
+        for ch in span.text.chars() {
+            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + char_width > available && used > 0 {
+                rows.push(Vec::new());
+                used = 0;
+            }
+            push_highlight_span(
+                rows.last_mut().expect("at least one styled row"),
+                &ch.to_string(),
+                span.tone,
+                span.bold,
+            );
+            used += char_width;
+        }
+    }
+
+    if rows.len() == 1 && rows[0].is_empty() {
+        rows[0].push(PaintSpan {
+            text: String::new(),
+            tone: fallback_tone,
+            bold: fallback_bold,
+        });
+    }
+
+    let row_count = rows.len();
+    rows.into_iter()
+        .enumerate()
+        .map(|(index, mut row)| {
+            let first = row.remove(0);
+            if index + 1 < row_count {
+                row.push(PaintSpan {
+                    text: String::new(),
+                    tone: Tone::CopyJoin,
+                    bold: false,
+                });
+            }
+            PaintLine {
+                prefix: if index == 0 {
+                    prefix.to_owned()
+                } else {
+                    " ".repeat(prefix_width)
+                },
+                prefix_tone,
+                text: first.text,
+                tone: first.tone,
+                bold: first.bold,
+                tail: row,
+            }
+        })
+        .collect()
+}
+
+fn diff_line(prefix: &str, prefix_tone: Tone, text: &str, width: u16) -> Vec<PaintLine> {
+    let tone = if text.starts_with("+++") || text.starts_with("---") {
+        Tone::DiffHeader
+    } else if text.starts_with('+') {
+        Tone::DiffAdded
+    } else if text.starts_with('-') {
+        Tone::DiffRemoved
+    } else if text.starts_with("@@")
+        || text.starts_with("diff ")
+        || text.starts_with("index ")
+        || text.starts_with("new file ")
+        || text.starts_with("deleted file ")
+        || text.starts_with("rename ")
+    {
+        Tone::DiffHeader
+    } else {
+        Tone::Code
+    };
+    wrapped_line(prefix, prefix_tone, text, tone, false, width)
+}
+
+fn highlight_code(text: &str, language: &str) -> Vec<PaintSpan> {
+    let mut spans = Vec::new();
+    let mut index = 0;
+    let hash_comment = matches!(
+        language,
+        "py" | "python"
+            | "rb"
+            | "ruby"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "ps1"
+            | "powershell"
+    );
+    let sql_comment = matches!(language, "sql");
+
+    while index < text.len() {
+        let rest = &text[index..];
+        let starts_hash_comment = hash_comment
+            && rest.starts_with('#')
+            && (index == 0
+                || text[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|ch| ch.is_whitespace()));
+        if rest.starts_with("//") || (sql_comment && rest.starts_with("--")) || starts_hash_comment
+        {
+            push_highlight_span(&mut spans, rest, Tone::SyntaxComment, false);
+            break;
+        }
+        if rest.starts_with("/*") || rest.starts_with("<!--") {
+            let terminator = if rest.starts_with("/*") { "*/" } else { "-->" };
+            let end = rest[2..]
+                .find(terminator)
+                .map(|offset| index + 2 + offset + terminator.len())
+                .unwrap_or(text.len());
+            push_highlight_span(&mut spans, &text[index..end], Tone::SyntaxComment, false);
+            index = end;
+            continue;
+        }
+
+        let ch = rest
+            .chars()
+            .next()
+            .expect("index is on a character boundary");
+        if matches!(ch, '"' | '\'' | '`') {
+            if ch == '\''
+                && language == "rust"
+                && rest[1..].chars().next().is_some_and(is_identifier_start)
+                && !rest[1..].contains('\'')
+            {
+                push_highlight_span(&mut spans, "'", Tone::Code, false);
+                index += 1;
+                continue;
+            }
+            let mut end = index + ch.len_utf8();
+            let mut escaped = false;
+            while end < text.len() {
+                let next = text[end..]
+                    .chars()
+                    .next()
+                    .expect("end is on a character boundary");
+                end += next.len_utf8();
+                if next == ch && !escaped {
+                    break;
+                }
+                escaped = next == '\\' && !escaped;
+                if next != '\\' {
+                    escaped = false;
+                }
+            }
+            push_highlight_span(&mut spans, &text[index..end], Tone::SyntaxString, false);
+            index = end;
+            continue;
+        }
+
+        if ch.is_ascii_digit() {
+            let end = take_while(text, index, |candidate| {
+                candidate.is_ascii_alphanumeric() || matches!(candidate, '.' | '_' | 'x' | 'X')
+            });
+            push_highlight_span(&mut spans, &text[index..end], Tone::SyntaxNumber, false);
+            index = end;
+            continue;
+        }
+
+        if is_identifier_start(ch) {
+            let end = take_while(text, index, is_identifier_continue);
+            let identifier = &text[index..end];
+            let next = text[end..]
+                .chars()
+                .find(|candidate| !candidate.is_whitespace());
+            let (tone, bold) = if is_literal_constant(identifier) {
+                (Tone::SyntaxNumber, false)
+            } else if is_keyword(identifier) {
+                (Tone::SyntaxKeyword, true)
+            } else if identifier
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_uppercase())
+            {
+                (Tone::SyntaxType, true)
+            } else if next == Some('(') {
+                (Tone::SyntaxFunction, false)
+            } else {
+                (Tone::Code, false)
+            };
+            push_highlight_span(&mut spans, identifier, tone, bold);
+            index = end;
+            continue;
+        }
+
+        let end = index + ch.len_utf8();
+        push_highlight_span(&mut spans, &text[index..end], Tone::Code, false);
+        index = end;
+    }
+
+    spans
+}
+
+fn take_while(text: &str, start: usize, predicate: impl Fn(char) -> bool) -> usize {
+    let mut end = start;
+    for ch in text[start..].chars() {
+        if !predicate(ch) {
+            break;
+        }
+        end += ch.len_utf8();
+    }
+    end
+}
+
+fn is_identifier_start(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_alphabetic()
+}
+
+fn is_identifier_continue(ch: char) -> bool {
+    is_identifier_start(ch) || ch.is_ascii_digit()
+}
+
+fn is_keyword(identifier: &str) -> bool {
+    let identifier = identifier.to_ascii_lowercase();
+    matches!(
+        identifier.as_str(),
+        "abstract"
+            | "alter"
+            | "and"
+            | "as"
+            | "assert"
+            | "async"
+            | "await"
+            | "base"
+            | "bool"
+            | "boolean"
+            | "break"
+            | "by"
+            | "byte"
+            | "case"
+            | "catch"
+            | "char"
+            | "checked"
+            | "class"
+            | "const"
+            | "continue"
+            | "crate"
+            | "create"
+            | "decimal"
+            | "def"
+            | "delegate"
+            | "delete"
+            | "do"
+            | "double"
+            | "drop"
+            | "dynamic"
+            | "else"
+            | "enum"
+            | "event"
+            | "export"
+            | "extends"
+            | "extern"
+            | "final"
+            | "finally"
+            | "float"
+            | "fn"
+            | "for"
+            | "foreach"
+            | "from"
+            | "fun"
+            | "function"
+            | "global"
+            | "group"
+            | "having"
+            | "if"
+            | "impl"
+            | "import"
+            | "in"
+            | "inner"
+            | "insert"
+            | "int"
+            | "integer"
+            | "interface"
+            | "internal"
+            | "into"
+            | "is"
+            | "join"
+            | "left"
+            | "let"
+            | "limit"
+            | "lock"
+            | "long"
+            | "match"
+            | "mod"
+            | "mut"
+            | "nameof"
+            | "namespace"
+            | "new"
+            | "not"
+            | "object"
+            | "on"
+            | "operator"
+            | "or"
+            | "order"
+            | "out"
+            | "outer"
+            | "override"
+            | "package"
+            | "partial"
+            | "private"
+            | "protected"
+            | "pub"
+            | "public"
+            | "readonly"
+            | "record"
+            | "ref"
+            | "required"
+            | "return"
+            | "right"
+            | "sbyte"
+            | "sealed"
+            | "select"
+            | "self"
+            | "set"
+            | "short"
+            | "sizeof"
+            | "stackalloc"
+            | "static"
+            | "string"
+            | "struct"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "trait"
+            | "try"
+            | "type"
+            | "typeof"
+            | "uint"
+            | "ulong"
+            | "unchecked"
+            | "unsafe"
+            | "update"
+            | "use"
+            | "ushort"
+            | "using"
+            | "var"
+            | "values"
+            | "virtual"
+            | "void"
+            | "volatile"
+            | "where"
+            | "while"
+            | "with"
+            | "yield"
+    )
+}
+
+fn is_literal_constant(identifier: &str) -> bool {
+    matches!(
+        identifier.to_ascii_lowercase().as_str(),
+        "true" | "false" | "null" | "none" | "nil"
+    )
+}
+
+fn push_highlight_span(spans: &mut Vec<PaintSpan>, text: &str, tone: Tone, bold: bool) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = spans.last_mut()
+        && last.tone == tone
+        && last.bold == bold
+    {
+        last.text.push_str(text);
+        return;
+    }
+    spans.push(PaintSpan {
+        text: text.to_owned(),
+        tone,
+        bold,
+    });
+}
+
 fn wrapped_line(
     prefix: &str,
     prefix_tone: Tone,
@@ -1211,8 +1923,8 @@ fn input_lines(
     mode: Option<&ComposerMode>,
 ) -> (Vec<PaintLine>, usize, usize) {
     let panel_width = (width as usize).saturating_sub(1).max(16);
-    let first_prefix = "  ❯ ";
-    let continuation_prefix = "    ";
+    let first_prefix = "> ";
+    let continuation_prefix = "  ";
     let content_width = panel_width
         .saturating_sub(UnicodeWidthStr::width(first_prefix))
         .max(4);
@@ -1274,11 +1986,8 @@ fn input_lines(
             } else {
                 continuation_prefix.to_owned()
             },
-            prefix_tone: if index == 0 {
-                Tone::Accent
-            } else {
-                Tone::Muted
-            },
+            // Prompt marker and cursor stay in the terminal's own colour.
+            prefix_tone: Tone::Plain,
             text: content,
             tone: if is_placeholder {
                 Tone::Muted
@@ -1305,12 +2014,14 @@ fn input_lines(
 const COMPOSER_RULE_MIN: usize = 4;
 /// Blank columns between the rule and the mode badge.
 const COMPOSER_MODE_GAP: usize = 2;
-/// Blank columns between the mode badge and the panel edge.
-const COMPOSER_MODE_MARGIN: usize = 1;
+/// Rule segment trailing the mode badge, so the line reads as unbroken.
+const COMPOSER_MODE_TAIL_RULE: usize = 2;
 /// Blank columns between the rule and a transient notice.
 const COMPOSER_NOTICE_GAP: usize = 1;
-/// Below this the badge is dropped instead of being ellipsized into noise.
-const COMPOSER_MODE_MIN: usize = 4;
+/// Below this a transient notice is dropped instead of ellipsized into noise.
+const COMPOSER_NOTICE_MIN: usize = 4;
+/// Separator between the permission mode and the fast-tier flag.
+const COMPOSER_BADGE_SEPARATOR: &str = " · ";
 
 fn input_top_line(
     panel_width: usize,
@@ -1328,18 +2039,21 @@ fn input_top_line(
     let mut budget = panel_width.saturating_sub(left_width + COMPOSER_RULE_MIN);
 
     // The mode is persistent state, so it anchors the far right.
-    let mode_span = mode.and_then(|mode| {
-        let reserved = COMPOSER_MODE_GAP + COMPOSER_MODE_MARGIN;
-        (budget >= reserved + COMPOSER_MODE_MIN).then(|| {
-            let text = compact_right(&mode.label, budget - reserved);
-            budget -= UnicodeWidthStr::width(text.as_str()) + reserved;
-            (text, mode_accent_tone(mode.accent))
-        })
+    let badge = mode.and_then(|mode| {
+        // Blanks either side of the badge plus the rule stub that trails it.
+        let reserved = COMPOSER_MODE_GAP + 1 + COMPOSER_MODE_TAIL_RULE;
+        let spans = fitting_badge_spans(mode, budget.saturating_sub(reserved))?;
+        let width = spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+            .sum::<usize>();
+        budget -= width + reserved;
+        Some(spans)
     });
 
     // Transient notices dock to the left of the mode badge.
     let notice_span = notice.and_then(|notice| {
-        (budget >= COMPOSER_NOTICE_GAP + COMPOSER_MODE_MIN).then(|| {
+        (budget >= COMPOSER_NOTICE_GAP + COMPOSER_NOTICE_MIN).then(|| {
             let text = compact_right(notice, budget - COMPOSER_NOTICE_GAP);
             budget -= UnicodeWidthStr::width(text.as_str()) + COMPOSER_NOTICE_GAP;
             text
@@ -1355,14 +2069,15 @@ fn input_top_line(
             bold: false,
         });
     }
-    if let Some((text, tone)) = mode_span {
+    if let Some(spans) = badge {
         tail.push(rule_gap(COMPOSER_MODE_GAP));
+        tail.extend(spans);
+        tail.push(rule_gap(1));
         tail.push(PaintSpan {
-            text,
-            tone,
+            text: "─".repeat(COMPOSER_MODE_TAIL_RULE),
+            tone: Tone::Muted,
             bold: false,
         });
-        tail.push(rule_gap(COMPOSER_MODE_MARGIN));
     }
 
     let fill = (COMPOSER_RULE_MIN + budget).min(panel_width.saturating_sub(left_width));
@@ -1374,6 +2089,46 @@ fn input_top_line(
         bold: false,
         tail,
     }
+}
+
+/// Widest badge that fits in `budget`: mode plus fast flag, mode alone, or nothing.
+/// The parts are never ellipsized — a half-written mode name is worse than none.
+fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<Vec<PaintSpan>> {
+    let mode_span = PaintSpan {
+        text: mode.label.clone(),
+        tone: mode_accent_tone(mode.accent),
+        bold: false,
+    };
+    let mode_width = UnicodeWidthStr::width(mode.label.as_str());
+
+    let fast_label = if mode.fast_mode {
+        "Fast On"
+    } else {
+        "Fast Off"
+    };
+    let with_fast = mode_width
+        + UnicodeWidthStr::width(COMPOSER_BADGE_SEPARATOR)
+        + UnicodeWidthStr::width(fast_label);
+    if with_fast <= budget {
+        return Some(vec![
+            mode_span,
+            PaintSpan {
+                text: COMPOSER_BADGE_SEPARATOR.to_owned(),
+                tone: Tone::Muted,
+                bold: false,
+            },
+            PaintSpan {
+                text: fast_label.to_owned(),
+                tone: if mode.fast_mode {
+                    Tone::FastOn
+                } else {
+                    Tone::FastOff
+                },
+                bold: false,
+            },
+        ]);
+    }
+    (mode_width <= budget).then(|| vec![mode_span])
 }
 
 fn rule_gap(width: usize) -> PaintSpan {
@@ -1434,17 +2189,16 @@ fn compact_right(text: &str, max_width: usize) -> String {
 }
 
 fn print_line(out: &mut Stdout, line: &PaintLine) -> Result<()> {
-    let user_prompt = line.tone == Tone::UserPrompt;
-    let model_change = line.tone == Tone::ModelChange;
-    if user_prompt || model_change {
-        queue!(
-            out,
-            SetBackgroundColor(Color::Rgb {
-                r: if model_change { 47 } else { 45 },
-                g: 43,
-                b: if model_change { 52 } else { 39 },
-            })
-        )?;
+    let palette = theme::palette();
+    let background = match line.tone {
+        Tone::UserPrompt => Some(palette.user_prompt_bg),
+        Tone::ModelChange => Some(palette.model_change_bg),
+        Tone::DiffAdded => Some(palette.diff_add_bg),
+        Tone::DiffRemoved => Some(palette.diff_remove_bg),
+        _ => None,
+    };
+    if let Some(background) = background {
+        queue!(out, SetBackgroundColor(rgb_color(background)))?;
     }
     set_tone(out, line.prefix_tone)?;
     queue!(out, Print(&line.prefix))?;
@@ -1473,14 +2227,10 @@ fn print_line(out: &mut Stdout, line: &PaintLine) -> Result<()> {
             ResetColor
         )?;
     }
-    if user_prompt || model_change {
+    if let Some(background) = background {
         queue!(
             out,
-            SetBackgroundColor(Color::Rgb {
-                r: if model_change { 47 } else { 45 },
-                g: 43,
-                b: if model_change { 52 } else { 39 },
-            }),
+            SetBackgroundColor(rgb_color(background)),
             Clear(ClearType::UntilNewLine),
             ResetColor
         )?;
@@ -1504,147 +2254,58 @@ fn model_tone(model: &str) -> Option<Tone> {
 }
 
 fn set_tone(out: &mut Stdout, tone: Tone) -> Result<()> {
+    let palette = theme::palette();
     let color = match tone {
-        Tone::Plain => Color::Reset,
-        Tone::Muted => Color::Rgb {
-            r: 128,
-            g: 128,
-            b: 128,
-        },
-        Tone::Accent => Color::Rgb {
-            r: 216,
-            g: 142,
-            b: 93,
-        },
-        Tone::User => Color::Rgb {
-            r: 104,
-            g: 171,
-            b: 255,
-        },
-        Tone::Success => Color::Rgb {
-            r: 91,
-            g: 192,
-            b: 134,
-        },
-        Tone::Warning => Color::Rgb {
-            r: 232,
-            g: 184,
-            b: 73,
-        },
-        Tone::Error => Color::Rgb {
-            r: 238,
-            g: 99,
-            b: 99,
-        },
-        Tone::Code => Color::Rgb {
-            r: 183,
-            g: 203,
-            b: 224,
-        },
-        Tone::EffortLow => Color::Rgb {
-            r: 220,
-            g: 172,
-            b: 18,
-        },
-        Tone::EffortMedium => Color::Rgb {
-            r: 63,
-            g: 157,
-            b: 99,
-        },
-        Tone::EffortHigh => Color::Rgb {
-            r: 177,
-            g: 185,
-            b: 249,
-        },
-        Tone::EffortXHigh => Color::Rgb {
-            r: 175,
-            g: 135,
-            b: 255,
-        },
-        Tone::EffortMax => Color::Rgb {
-            r: 248,
-            g: 113,
-            b: 113,
-        },
-        Tone::Context => Color::Rgb {
-            r: 52,
-            g: 211,
-            b: 153,
-        },
-        Tone::StatusText => Color::Rgb {
-            r: 229,
-            g: 231,
-            b: 235,
-        },
-        Tone::StatusSeparator => Color::Rgb {
-            r: 147,
-            g: 164,
-            b: 184,
-        },
-        Tone::UserPrompt => Color::Rgb {
-            r: 240,
-            g: 238,
-            b: 233,
-        },
-        Tone::ModelSol => Color::Rgb {
-            r: 245,
-            g: 158,
-            b: 11,
-        },
-        Tone::ModelTerra => Color::Rgb {
-            r: 232,
-            g: 121,
-            b: 107,
-        },
-        Tone::ModelLuna => Color::Rgb {
-            r: 167,
-            g: 139,
-            b: 250,
-        },
-        Tone::Model55 => Color::Rgb {
-            r: 96,
-            g: 165,
-            b: 250,
-        },
-        Tone::Border => Color::Rgb {
-            r: 255,
-            g: 255,
-            b: 255,
-        },
-        Tone::Branch => Color::Rgb {
-            r: 147,
-            g: 197,
-            b: 253,
-        },
-        Tone::LimitFiveHour => Color::Rgb {
-            r: 96,
-            g: 165,
-            b: 250,
-        },
-        Tone::LimitWeekly => Color::Rgb {
-            r: 167,
-            g: 139,
-            b: 250,
-        },
-        Tone::FastOn => Color::Rgb {
-            r: 91,
-            g: 192,
-            b: 134,
-        },
-        Tone::FastOff => Color::Rgb {
-            r: 128,
-            g: 128,
-            b: 128,
-        },
-        Tone::ModelChange => Color::Rgb {
-            r: 232,
-            g: 226,
-            b: 238,
-        },
+        Tone::Plain => rgb_color(palette.foreground),
+        Tone::Muted => rgb_color(palette.muted),
+        Tone::Accent => rgb_color(palette.accent),
+        Tone::User => rgb_color(palette.blue),
+        Tone::Success => rgb_color(palette.success),
+        Tone::Warning => rgb_color(palette.warning),
+        Tone::Error => rgb_color(palette.error),
+        Tone::Code => rgb_color(palette.code),
+        Tone::EffortLow => rgb_color(palette.warning),
+        Tone::EffortMedium => rgb_color(palette.success),
+        Tone::EffortHigh => rgb_color(palette.indigo),
+        Tone::EffortXHigh => rgb_color(palette.purple),
+        Tone::EffortMax => rgb_color(palette.error),
+        Tone::Context => rgb_color(palette.context),
+        Tone::StatusText => rgb_color(palette.foreground),
+        Tone::StatusSeparator => rgb_color(palette.muted),
+        Tone::UserPrompt => rgb_color(palette.foreground),
+        Tone::ModelSol => rgb_color(palette.orange),
+        Tone::ModelTerra => rgb_color(palette.pink),
+        Tone::ModelLuna => rgb_color(palette.purple),
+        Tone::Model55 => rgb_color(palette.blue),
+        Tone::Border => rgb_color(palette.border),
+        Tone::Branch => rgb_color(palette.branch),
+        Tone::LimitFiveHour => rgb_color(palette.blue),
+        Tone::LimitWeekly => rgb_color(palette.purple),
+        Tone::FastOn => rgb_color(palette.success),
+        Tone::FastOff => rgb_color(palette.muted),
+        Tone::ModelChange => rgb_color(palette.foreground),
+        Tone::SyntaxComment => rgb_color(palette.syntax_comment),
+        Tone::SyntaxString => rgb_color(palette.syntax_string),
+        Tone::SyntaxKeyword => rgb_color(palette.syntax_keyword),
+        Tone::SyntaxNumber => rgb_color(palette.syntax_number),
+        Tone::SyntaxType => rgb_color(palette.syntax_type),
+        Tone::SyntaxFunction => rgb_color(palette.syntax_function),
+        Tone::InlineCode => rgb_color(palette.accent),
+        Tone::DiffAdded => rgb_color(palette.diff_add),
+        Tone::DiffRemoved => rgb_color(palette.diff_remove),
+        Tone::DiffHeader => rgb_color(palette.diff_header),
         Tone::CopyJoin => Color::Reset,
     };
     queue!(out, SetForegroundColor(color))?;
     Ok(())
+}
+
+fn rgb_color(color: Rgb) -> Color {
+    Color::Rgb {
+        r: color.0,
+        g: color.1,
+        b: color.2,
+    }
 }
 
 #[cfg(test)]
@@ -1702,7 +2363,7 @@ mod tests {
     #[test]
     fn composer_rows_do_not_emit_side_borders_or_copy_padding() {
         let mut editor = Editor::default();
-        editor.set_text("wrapped prompt text");
+        editor.set_text("wrapped-prompt-text");
 
         let (rows, _, _) = input_lines(&editor, 18, "", "placeholder", None, None);
         let prompt_rows = &rows[1..rows.len() - 1];
@@ -1712,6 +2373,8 @@ mod tests {
         assert!(rows[0].text.chars().all(|ch| ch == '─'));
         assert!(rows[0].tone == Tone::Muted);
         assert!(rows.last().is_some_and(|row| row.tone == Tone::Muted));
+        assert_eq!(prompt_rows[0].prefix, "> ");
+        assert_eq!(prompt_rows[1].prefix, "  ");
         assert!(!rows[0].text.contains(['╭', '╮', '╰', '╯']));
         assert!(
             rows.last()
@@ -1720,6 +2383,27 @@ mod tests {
         assert!(prompt_rows.iter().all(|row| !row.prefix.contains('│')));
         assert!(prompt_rows.iter().all(|row| !row.text.ends_with(' ')));
         assert!(prompt_rows.iter().all(|row| !row.text.contains('│')));
+    }
+
+    #[test]
+    fn update_banner_spans_the_full_width_between_two_rules() {
+        let block = Block::new(
+            BlockKind::Update,
+            "Update Available",
+            "New version 0.11.9 is available. Run: devez update",
+        );
+        let lines = block_lines(&block, 80);
+
+        assert_eq!(lines.len(), 5);
+        assert!(lines[0].text.chars().all(|ch| ch == '─'));
+        assert_eq!(UnicodeWidthStr::width(lines[0].text.as_str()), 80);
+        assert_eq!(lines[0].text, lines[3].text);
+        assert_eq!(lines[1].prefix, " ");
+        assert_eq!(lines[1].text, "Update Available");
+        assert!(lines[1].bold);
+        assert!(lines[2].text.contains("0.11.9"));
+        assert!(lines[2].text.ends_with("devez update"));
+        assert!(lines[4].text.is_empty());
     }
 
     #[test]
@@ -1755,6 +2439,139 @@ mod tests {
     }
 
     #[test]
+    fn code_highlighter_distinguishes_keywords_types_functions_and_literals() {
+        let lines = code_line(
+            "",
+            Tone::Plain,
+            "pub struct DevezClient { retries: 3, name: \"cli\", run: build() } // ready",
+            "rust",
+            120,
+        );
+        let line = &lines[0];
+        let mut spans = vec![PaintSpan {
+            text: line.text.clone(),
+            tone: line.tone,
+            bold: line.bold,
+        }];
+        spans.extend(line.tail.clone());
+
+        assert!(
+            spans
+                .iter()
+                .any(|span| { span.text.contains("pub") && span.tone == Tone::SyntaxKeyword })
+        );
+        assert!(spans.iter().any(|span| {
+            span.text == "DevezClient" && span.tone == Tone::SyntaxType && span.bold
+        }));
+        assert!(
+            spans
+                .iter()
+                .any(|span| { span.text.contains('3') && span.tone == Tone::SyntaxNumber })
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| { span.text.contains("\"cli\"") && span.tone == Tone::SyntaxString })
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| { span.text == "build" && span.tone == Tone::SyntaxFunction })
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| { span.text.contains("// ready") && span.tone == Tone::SyntaxComment })
+        );
+    }
+
+    #[test]
+    fn code_highlighter_handles_sql_and_block_comments() {
+        let sql = highlight_code("SELECT id FROM users -- active rows", "sql");
+        assert!(sql.iter().any(|span| {
+            span.text == "SELECT" && span.tone == Tone::SyntaxKeyword && span.bold
+        }));
+        assert!(sql.iter().any(|span| {
+            span.text.contains("-- active rows") && span.tone == Tone::SyntaxComment
+        }));
+
+        let rust = highlight_code("let result: DevezClient = true; /* ready */", "rust");
+        assert!(rust.iter().any(|span| {
+            span.text == "DevezClient" && span.tone == Tone::SyntaxType && span.bold
+        }));
+        assert!(
+            rust.iter()
+                .any(|span| span.text == "true" && span.tone == Tone::SyntaxNumber)
+        );
+        assert!(
+            rust.iter().any(|span| {
+                span.text.contains("/* ready */") && span.tone == Tone::SyntaxComment
+            })
+        );
+    }
+
+    #[test]
+    fn hash_comments_require_a_comment_boundary() {
+        let shell = highlight_code("echo value#suffix # comment", "bash");
+        assert!(shell.iter().any(|span| {
+            span.text.contains("value#suffix") && span.tone != Tone::SyntaxComment
+        }));
+        assert!(
+            shell
+                .iter()
+                .any(|span| { span.text == "# comment" && span.tone == Tone::SyntaxComment })
+        );
+    }
+
+    #[test]
+    fn diff_renderer_assigns_add_remove_and_header_semantics() {
+        assert_eq!(
+            diff_line("", Tone::Plain, "+added()", 80)[0].tone,
+            Tone::DiffAdded
+        );
+        assert_eq!(
+            diff_line("", Tone::Plain, "-removed()", 80)[0].tone,
+            Tone::DiffRemoved
+        );
+        assert_eq!(
+            diff_line("", Tone::Plain, "@@ -1 +1 @@", 80)[0].tone,
+            Tone::DiffHeader
+        );
+        assert_eq!(
+            diff_line("", Tone::Plain, "+++ b/src/main.rs", 80)[0].tone,
+            Tone::DiffHeader
+        );
+    }
+
+    #[test]
+    fn markdown_renderer_hides_markup_and_colors_inline_code() {
+        let lines = markdown_line(
+            "",
+            Tone::Plain,
+            "Use **DevezClient** with `ThemeKind`.",
+            Tone::Plain,
+            false,
+            100,
+        );
+        let line = &lines[0];
+        let rendered = std::iter::once(line.text.as_str())
+            .chain(line.tail.iter().map(|span| span.text.as_str()))
+            .collect::<String>();
+
+        assert_eq!(rendered, "Use DevezClient with ThemeKind.");
+        assert!(
+            line.tail
+                .iter()
+                .any(|span| span.text == "ThemeKind" && span.tone == Tone::InlineCode)
+        );
+        assert!(
+            line.tail
+                .iter()
+                .any(|span| span.text == "DevezClient" && span.bold)
+        );
+    }
+
+    #[test]
     fn copy_notice_is_right_aligned_on_the_composer_top_rule() {
         let line = input_top_line(50, "", Some("Copied 12 chars to clipboard"), None);
         let width = UnicodeWidthStr::width(line.text.as_str())
@@ -1780,12 +2597,17 @@ mod tests {
                 .sum::<usize>()
     }
 
+    fn test_mode(label: &str, accent: ModeAccent, fast_mode: bool) -> ComposerMode {
+        ComposerMode {
+            label: label.to_owned(),
+            accent,
+            fast_mode,
+        }
+    }
+
     #[test]
-    fn permission_mode_sits_padded_on_the_right_of_the_composer_rule() {
-        let mode = ComposerMode {
-            label: "Full Access".to_owned(),
-            accent: ModeAccent::Danger,
-        };
+    fn permission_mode_and_fast_flag_sit_inside_the_composer_rule() {
+        let mode = test_mode("Full Access", ModeAccent::Danger, true);
         let line = input_top_line(50, "", None, Some(&mode));
         let texts = line
             .tail
@@ -1795,17 +2617,30 @@ mod tests {
 
         assert_eq!(rule_width(&line), 50);
         assert!(line.text.chars().all(|ch| ch == '─'));
-        // Two blank columns off the rule, the badge, then one column of edge margin.
-        assert_eq!(texts, ["  ", "Full Access", " "]);
+        // Two blanks off the rule, the badge, then the rule resumes for two columns.
+        assert_eq!(texts, ["  ", "Full Access", " · ", "Fast On", " ", "──"]);
         assert_eq!(line.tail[1].tone, Tone::Warning);
+        assert_eq!(line.tail[3].tone, Tone::FastOn);
+    }
+
+    #[test]
+    fn fast_off_is_toned_down_beside_the_permission_mode() {
+        let mode = test_mode("Default", ModeAccent::Safe, false);
+        let line = input_top_line(50, "", None, Some(&mode));
+        let texts = line
+            .tail
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rule_width(&line), 50);
+        assert_eq!(texts, ["  ", "Default", " · ", "Fast Off", " ", "──"]);
+        assert_eq!(line.tail[3].tone, Tone::FastOff);
     }
 
     #[test]
     fn composer_rule_keeps_notice_left_of_the_permission_mode() {
-        let mode = ComposerMode {
-            label: "Read Only".to_owned(),
-            accent: ModeAccent::Calm,
-        };
+        let mode = test_mode("Read Only", ModeAccent::Calm, false);
         let line = input_top_line(60, "", Some("Copied 12 chars to clipboard"), Some(&mode));
         let texts = line
             .tail
@@ -1816,16 +2651,36 @@ mod tests {
         assert_eq!(rule_width(&line), 60);
         assert_eq!(
             texts,
-            [" ", "Copied 12 chars to clipboard", "  ", "Read Only", " "]
+            [
+                " ",
+                "Copied 12 chars to clipboard",
+                "  ",
+                "Read Only",
+                " · ",
+                "Fast Off",
+                " ",
+                "──"
+            ]
         );
     }
 
     #[test]
-    fn narrow_composer_rule_drops_the_permission_mode_instead_of_ellipsizing() {
-        let mode = ComposerMode {
-            label: "Full Access".to_owned(),
-            accent: ModeAccent::Danger,
-        };
+    fn tight_composer_rule_keeps_the_mode_and_drops_the_fast_flag() {
+        let mode = test_mode("Full Access", ModeAccent::Danger, true);
+        let line = input_top_line(24, "", None, Some(&mode));
+        let texts = line
+            .tail
+            .iter()
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rule_width(&line), 24);
+        assert_eq!(texts, ["  ", "Full Access", " ", "──"]);
+    }
+
+    #[test]
+    fn narrow_composer_rule_drops_the_badge_instead_of_ellipsizing() {
+        let mode = test_mode("Full Access", ModeAccent::Danger, true);
         let line = input_top_line(9, "", None, Some(&mode));
 
         assert!(line.tail.is_empty());
@@ -1899,7 +2754,6 @@ mod tests {
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
                 five_hour_percent: Some(12),
                 weekly_percent: Some(34),
-                fast_mode: false,
                 notice: Some("connected".to_owned()),
             }),
             "",
@@ -1913,7 +2767,140 @@ mod tests {
                 .sum::<usize>();
 
         assert!(width <= 32);
-        assert!(line.text.starts_with(" main"));
+        assert!(line.text.starts_with("main"));
+    }
+
+    #[test]
+    fn status_line_keeps_an_empty_branch_slot_at_the_far_left() {
+        let line = status_line_row(
+            Some(StatusLineView {
+                branch: None,
+                model: "GPT-5.6 Sol".to_owned(),
+                effort: "high".to_owned(),
+                context: None,
+                five_hour_percent: None,
+                weekly_percent: None,
+                notice: None,
+            }),
+            "",
+            80,
+        );
+
+        assert_eq!(line.text, "--");
+    }
+
+    fn painted(line: &PaintLine) -> String {
+        let mut out = line.prefix.clone();
+        out.push_str(&line.text);
+        for span in &line.tail {
+            out.push_str(&span.text);
+        }
+        out
+    }
+
+    fn painted_width(line: &PaintLine) -> usize {
+        UnicodeWidthStr::width(line.prefix.as_str())
+            + UnicodeWidthStr::width(line.text.as_str())
+            + line
+                .tail
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+                .sum::<usize>()
+    }
+
+    fn test_welcome() -> WelcomeView {
+        WelcomeView {
+            plan: "Pro Lite".to_owned(),
+            credits: vec!["3 available".to_owned(), "· 2026-08-01  6d left".to_owned()],
+            cwd: "C:/Source/DevezCLI".to_owned(),
+            account: "dev@example.com".to_owned(),
+        }
+    }
+
+    #[test]
+    fn welcome_panel_fills_the_terminal_and_shows_the_version() {
+        for width in [70u16, 90, 140] {
+            let lines = welcome_lines(test_welcome(), width);
+            let expected = panel_span(width);
+
+            assert!(
+                lines.iter().all(|line| painted_width(line) == expected),
+                "width {width}: rows are not all {expected} columns"
+            );
+            assert!(
+                painted(&lines[1]).contains(&format!("v{}", crate::update::CURRENT_VERSION)),
+                "width {width}: version missing from the headline"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_welcome_panel_reserves_a_notes_column() {
+        let lines = welcome_lines(test_welcome(), 110);
+
+        assert!(painted(&lines[0]).contains('┬'));
+        assert!(painted(lines.last().expect("bottom border")).contains('┴'));
+        assert!(painted(&lines[1]).contains("What's new"));
+        // Every body row carries the divider, so the column never collapses.
+        assert!(
+            lines[1..lines.len() - 1].iter().all(|line| line
+                .tail
+                .iter()
+                .filter(|span| span.text == "│")
+                .count()
+                == 2)
+        );
+    }
+
+    #[test]
+    fn narrow_welcome_panel_collapses_to_one_column() {
+        let lines = welcome_lines(test_welcome(), 50);
+
+        assert!(!painted(&lines[0]).contains('┬'));
+        assert!(
+            lines
+                .iter()
+                .all(|line| !painted(line).contains("What's new"))
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| painted_width(line) == panel_span(50))
+        );
+    }
+
+    #[test]
+    fn commands_panel_closes_its_top_right_corner_at_every_width() {
+        let suggestions = vec![
+            SuggestionView {
+                command: "/model".to_owned(),
+                description: "Switch model and reasoning".to_owned(),
+                selected: true,
+            },
+            SuggestionView {
+                command: "/effort".to_owned(),
+                description: "Set reasoning effort".to_owned(),
+                selected: false,
+            },
+        ];
+
+        for width in [40u16, 80, 160] {
+            let lines = suggestion_lines(&suggestions, width);
+            let top = painted(&lines[0]);
+
+            assert!(top.starts_with("╭─ Commands "), "width {width}: {top}");
+            assert!(
+                top.ends_with('╮'),
+                "width {width}: top-right corner missing"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| painted_width(line) == panel_span(width)),
+                "width {width}: rows are not all {} columns",
+                panel_span(width)
+            );
+        }
     }
 
     #[test]
@@ -1977,11 +2964,11 @@ mod tests {
     }
 
     #[test]
-    fn panel_borders_use_the_single_white_border_tone() {
+    fn panel_borders_use_the_theme_border_tone() {
         let lines = welcome_lines(
             WelcomeView {
-                model: "GPT-5.6-Sol".to_owned(),
-                effort: "high".to_owned(),
+                plan: "Pro".to_owned(),
+                credits: vec!["none available".to_owned()],
                 cwd: "C:\\work".to_owned(),
                 account: "ChatGPT".to_owned(),
             },

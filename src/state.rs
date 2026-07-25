@@ -14,6 +14,7 @@ use crate::{
         Block, BlockKind, ComposerMode, ModeAccent, OverlayLine, OverlayStyle, OverlayView,
         StatusLineView, SuggestionView, View, WelcomeView,
     },
+    theme::{self, ThemeKind},
 };
 
 const SPINNER: [&str; 8] = ["✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳"];
@@ -69,7 +70,7 @@ struct SlashCommand {
     takes_argument: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 17] = [
+const SLASH_COMMANDS: [SlashCommand; 24] = [
     SlashCommand {
         name: "/model",
         description: "Switch model and reasoning",
@@ -83,6 +84,41 @@ const SLASH_COMMANDS: [SlashCommand; 17] = [
     SlashCommand {
         name: "/effort",
         description: "Set reasoning effort",
+        takes_argument: true,
+    },
+    SlashCommand {
+        name: "/theme",
+        description: "Switch Minimal, Soft, or Dark theme",
+        takes_argument: true,
+    },
+    SlashCommand {
+        name: "/login",
+        description: "Sign in to a ChatGPT account",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/logout",
+        description: "Sign out of the current account",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/mcp",
+        description: "Show MCP servers or start OAuth login",
+        takes_argument: true,
+    },
+    SlashCommand {
+        name: "/plugins",
+        description: "List, install, enable, disable, or uninstall plugins",
+        takes_argument: true,
+    },
+    SlashCommand {
+        name: "/skills",
+        description: "List, enable, or disable Codex skills",
+        takes_argument: true,
+    },
+    SlashCommand {
+        name: "/apps",
+        description: "List, enable, or disable Codex apps",
         takes_argument: true,
     },
     SlashCommand {
@@ -156,6 +192,176 @@ const SLASH_COMMANDS: [SlashCommand; 17] = [
         takes_argument: false,
     },
 ];
+
+/// At most this many credits are listed before the rest are summarised.
+const CREDIT_LIST_LIMIT: usize = 4;
+
+/// One `available` rate-limit reset credit.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ResetCredit {
+    /// Server-supplied label, for example `Full reset`.
+    pub title: String,
+    /// Expiry as a Unix timestamp; `None` when the server reported no expiry.
+    pub expires_at: Option<u64>,
+}
+
+/// Plan and rate-limit-reset entitlements, from `account/rateLimits/read`.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct AccountPlan {
+    /// Display label such as `Pro Lite`; `None` when the server did not report one.
+    pub plan: Option<String>,
+    /// Reset credits still marked `available`, soonest expiry first.
+    pub credits: Vec<ResetCredit>,
+    /// The server's own tally, which can exceed the listed credits.
+    pub available_credits: usize,
+}
+
+impl AccountPlan {
+    pub fn from_rate_limits(root: &Value) -> Self {
+        let plan = root
+            .get("rateLimits")
+            .and_then(|limits| limits.get("planType"))
+            .and_then(Value::as_str)
+            .filter(|plan| !plan.is_empty())
+            .map(plan_label);
+
+        let reset_credits = root.get("rateLimitResetCredits");
+        let mut credits = reset_credits
+            .and_then(|credits| credits.get("credits"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter(|credit| {
+                credit
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_none_or(|status| status.eq_ignore_ascii_case("available"))
+            })
+            .map(|credit| ResetCredit {
+                title: credit
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Reset")
+                    .to_owned(),
+                expires_at: credit.get("expiresAt").and_then(Value::as_u64),
+            })
+            .collect::<Vec<_>>();
+        // Soonest expiry first; undated credits sink to the bottom.
+        credits.sort_by_key(|credit| credit.expires_at.unwrap_or(u64::MAX));
+
+        // Trust the server's tally when present; it counts what it will honour.
+        let available_credits = reset_credits
+            .and_then(|credits| credits.get("availableCount"))
+            .and_then(Value::as_u64)
+            .map_or(credits.len(), |count| count as usize);
+
+        Self {
+            plan,
+            credits,
+            available_credits,
+        }
+    }
+
+    pub fn plan_display(&self) -> String {
+        self.plan.clone().unwrap_or_else(|| "—".to_owned())
+    }
+
+    /// Welcome-panel rows: a summary followed by one line per credit.
+    pub fn credit_lines(&self) -> Vec<String> {
+        self.credit_lines_at(unix_now())
+    }
+
+    /// Split out from [`Self::credit_lines`] so the wording is testable.
+    fn credit_lines_at(&self, now: u64) -> Vec<String> {
+        if self.available_credits == 0 && self.credits.is_empty() {
+            return vec!["none available".to_owned()];
+        }
+        let mut lines = vec![format!("{} available", self.available_credits)];
+        for credit in self.credits.iter().take(CREDIT_LIST_LIMIT) {
+            lines.push(format!(
+                "· {}",
+                match credit.expires_at {
+                    Some(expiry) if expiry > now => format!(
+                        "{}  {} left",
+                        format_date(expiry),
+                        short_duration(expiry - now)
+                    ),
+                    Some(expiry) => format!("{}  expired", format_date(expiry)),
+                    None => format!("{}  no expiry", credit.title),
+                }
+            ));
+        }
+        if let Some(hidden) = self.credits.len().checked_sub(CREDIT_LIST_LIMIT)
+            && hidden > 0
+        {
+            lines.push(format!("· +{hidden} more"));
+        }
+        lines
+    }
+}
+
+/// Maps the server's `planType` onto the wording OpenAI uses for the plan.
+fn plan_label(raw: &str) -> String {
+    let key = raw
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    match key.as_str() {
+        "free" => "Free".to_owned(),
+        "go" => "Go".to_owned(),
+        "plus" => "Plus".to_owned(),
+        // The two Pro tiers are named by their usage multiplier rather than by
+        // the server's slug, which says nothing about how much quota you get.
+        "prolite" => "Pro 5x".to_owned(),
+        "pro" => "Pro 20x".to_owned(),
+        "team" => "Team".to_owned(),
+        "selfservebusinessusagebased" => "Business (usage-based)".to_owned(),
+        "business" => "Business".to_owned(),
+        "enterprisecbpusagebased" => "Enterprise (usage-based)".to_owned(),
+        "enterprise" => "Enterprise".to_owned(),
+        "edu" => "Edu".to_owned(),
+        _ => title_case(raw),
+    }
+}
+
+fn title_case(raw: &str) -> String {
+    let mut chars = raw.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Local-date label (`2026-08-01`) for a Unix timestamp.
+fn format_date(timestamp: u64) -> String {
+    chrono::DateTime::from_timestamp(timestamp as i64, 0)
+        .map(|instant| {
+            instant
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d")
+                .to_string()
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// Coarse "12d" / "5h" / "8m" label for a future span.
+fn short_duration(seconds: u64) -> String {
+    match seconds {
+        0..=59 => "<1m".to_owned(),
+        60..=3_599 => format!("{}m", seconds / 60),
+        3_600..=86_399 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
 
 #[derive(Clone)]
 pub struct ModelInfo {
@@ -259,11 +465,56 @@ pub enum Action {
     Compact,
     Copy(String),
     ShowDiff,
+    ShowMcp,
+    McpLogin(String),
+    StartLogin,
+    CancelLogin(String),
+    Logout,
+    ShowPlugins,
+    PreparePluginInstall(String),
+    PreparePluginUninstall(String),
+    SetPlugin { query: String, enabled: bool },
+    InstallPlugin(PluginInstallTarget),
+    UninstallPlugin(PluginUninstallTarget),
+    ShowSkills,
+    SetSkill { name: String, enabled: bool },
+    ShowApps,
+    SetApp { query: String, enabled: bool },
+    RefreshSkills,
+    OpenUrl(String),
+    SetTheme(ThemeKind),
     Quit,
     ClearScreen,
     Tick(bool),
     RpcResponse { id: Value, result: Value },
     RpcError { id: Value, message: String },
+}
+
+pub struct PluginInstallTarget {
+    pub plugin_name: String,
+    pub marketplace_path: Option<String>,
+    pub remote_marketplace_name: Option<String>,
+}
+
+pub struct PluginUninstallTarget {
+    pub plugin_id: String,
+    pub display_name: String,
+}
+
+enum ConfirmedAction {
+    InstallPlugin(PluginInstallTarget),
+    UninstallPlugin(PluginUninstallTarget),
+    Logout,
+}
+
+impl ConfirmedAction {
+    fn into_action(self) -> Action {
+        match self {
+            Self::InstallPlugin(target) => Action::InstallPlugin(target),
+            Self::UninstallPlugin(target) => Action::UninstallPlugin(target),
+            Self::Logout => Action::Logout,
+        }
+    }
 }
 
 struct SideParent {
@@ -281,6 +532,9 @@ enum PendingInteraction {
     },
     EffortPicker {
         effort_index: usize,
+    },
+    ThemePicker {
+        theme_index: usize,
     },
     SessionPicker(SessionPicker),
     Approval {
@@ -300,6 +554,55 @@ enum PendingInteraction {
         editor: Editor,
         answers: BTreeMap<String, String>,
     },
+    McpForm(McpForm),
+    McpApproval(McpApproval),
+    McpUrl {
+        id: Value,
+        server_name: String,
+        message: String,
+        url: String,
+    },
+    Confirm {
+        title: String,
+        detail: Vec<String>,
+        action: ConfirmedAction,
+    },
+    /// Waiting on the browser half of `account/login/start`. Cleared by the
+    /// `account/login/completed` notification or by cancelling.
+    Login {
+        login_id: String,
+        auth_url: String,
+    },
+}
+
+#[derive(Clone)]
+struct SkillBinding {
+    name: String,
+    path: String,
+    enabled: bool,
+}
+
+#[derive(Clone)]
+struct MentionBinding {
+    trigger: String,
+    name: String,
+    path: String,
+}
+
+struct McpApproval {
+    id: Value,
+    server_name: String,
+    message: String,
+    detail: Vec<String>,
+    options: Vec<McpApprovalOption>,
+    selected: usize,
+}
+
+struct McpApprovalOption {
+    label: String,
+    description: String,
+    action: &'static str,
+    persist: Option<&'static str>,
 }
 
 struct Question {
@@ -313,6 +616,938 @@ struct Question {
 struct QuestionOption {
     label: String,
     description: String,
+}
+
+struct McpForm {
+    id: Value,
+    server_name: String,
+    message: String,
+    fields: Vec<McpField>,
+    current: usize,
+    editor: Editor,
+    selected: usize,
+    checked: Vec<bool>,
+    content: Map<String, Value>,
+    validation_error: Option<String>,
+}
+
+struct McpField {
+    name: String,
+    title: String,
+    description: String,
+    required: bool,
+    default: Option<Value>,
+    kind: McpFieldKind,
+}
+
+enum McpFieldKind {
+    Text {
+        format: Option<String>,
+        min_length: Option<usize>,
+        max_length: Option<usize>,
+    },
+    Number {
+        integer: bool,
+        minimum: Option<f64>,
+        maximum: Option<f64>,
+    },
+    Boolean,
+    SingleSelect(Vec<McpOption>),
+    MultiSelect {
+        options: Vec<McpOption>,
+        min_items: Option<usize>,
+        max_items: Option<usize>,
+    },
+}
+
+struct McpOption {
+    value: String,
+    label: String,
+}
+
+impl McpApproval {
+    fn parse(id: Value, params: &Value) -> Option<Self> {
+        if !mcp_schema_is_message_only(params.get("requestedSchema")) {
+            return None;
+        }
+
+        let meta = params.get("_meta").and_then(Value::as_object);
+        let is_tool_approval = meta
+            .and_then(|meta| meta.get("codex_approval_kind"))
+            .and_then(Value::as_str)
+            == Some("mcp_tool_call");
+        let mut options = vec![McpApprovalOption {
+            label: "Allow".to_owned(),
+            description: if is_tool_approval {
+                "Run the tool and continue.".to_owned()
+            } else {
+                "Allow this request and continue.".to_owned()
+            },
+            action: "accept",
+            persist: None,
+        }];
+        if mcp_persist_supported(meta, "session") {
+            options.push(McpApprovalOption {
+                label: "Allow for this session".to_owned(),
+                description: if is_tool_approval {
+                    "Run the tool and remember this choice for this session.".to_owned()
+                } else {
+                    "Allow this request for this session.".to_owned()
+                },
+                action: "accept",
+                persist: Some("session"),
+            });
+        }
+        if mcp_persist_supported(meta, "always") {
+            options.push(McpApprovalOption {
+                label: "Always allow".to_owned(),
+                description: if is_tool_approval {
+                    "Run the tool and remember this choice for future calls.".to_owned()
+                } else {
+                    "Always allow this request.".to_owned()
+                },
+                action: "accept",
+                persist: Some("always"),
+            });
+        }
+        if is_tool_approval {
+            options.push(McpApprovalOption {
+                label: "Cancel".to_owned(),
+                description: "Cancel this tool call.".to_owned(),
+                action: "cancel",
+                persist: None,
+            });
+        } else {
+            options.extend([
+                McpApprovalOption {
+                    label: "Deny".to_owned(),
+                    description: "Decline this request and continue.".to_owned(),
+                    action: "decline",
+                    persist: None,
+                },
+                McpApprovalOption {
+                    label: "Cancel".to_owned(),
+                    description: "Cancel this request.".to_owned(),
+                    action: "cancel",
+                    persist: None,
+                },
+            ]);
+        }
+
+        Some(Self {
+            id,
+            server_name: params
+                .get("serverName")
+                .and_then(Value::as_str)
+                .unwrap_or("MCP")
+                .to_owned(),
+            message: params
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("이 요청을 허용할까요?")
+                .to_owned(),
+            detail: mcp_approval_detail(meta),
+            options,
+            selected: 0,
+        })
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> Option<Value> {
+        match key.code {
+            KeyCode::Esc => Some(mcp_elicitation_response("cancel", None)),
+            KeyCode::Up => {
+                self.selected = self.selected.saturating_sub(1);
+                None
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                self.selected = (self.selected + 1).min(self.options.len().saturating_sub(1));
+                None
+            }
+            KeyCode::Char(ch) if ch.is_ascii_digit() => {
+                let index = ch.to_digit(10)?.checked_sub(1)? as usize;
+                if index >= self.options.len() {
+                    return None;
+                }
+                self.selected = index;
+                self.response()
+            }
+            KeyCode::Char('y') => {
+                self.selected = 0;
+                self.response()
+            }
+            KeyCode::Char('n') => {
+                self.selected = self
+                    .options
+                    .iter()
+                    .position(|option| matches!(option.action, "decline" | "cancel"))
+                    .unwrap_or(self.options.len().saturating_sub(1));
+                self.response()
+            }
+            KeyCode::Enter => self.response(),
+            _ => None,
+        }
+    }
+
+    fn response(&self) -> Option<Value> {
+        let option = self.options.get(self.selected)?;
+        let meta = option.persist.map(|persist| json!({ "persist": persist }));
+        Some(mcp_elicitation_response_with_meta(
+            option.action,
+            None,
+            meta,
+        ))
+    }
+}
+
+fn mcp_schema_is_message_only(schema: Option<&Value>) -> bool {
+    schema.is_none_or(|schema| {
+        schema.is_null()
+            || schema.as_object().is_some_and(|schema| {
+                schema
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(Map::is_empty)
+            })
+    })
+}
+
+fn mcp_persist_supported(meta: Option<&Map<String, Value>>, expected: &str) -> bool {
+    match meta.and_then(|meta| meta.get("persist")) {
+        Some(Value::String(value)) => value == expected,
+        Some(Value::Array(values)) => values.iter().any(|value| value.as_str() == Some(expected)),
+        _ => false,
+    }
+}
+
+fn mcp_approval_detail(meta: Option<&Map<String, Value>>) -> Vec<String> {
+    let Some(meta) = meta else {
+        return Vec::new();
+    };
+    let mut values = meta
+        .get("tool_params_display")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    let entry = entry.as_object()?;
+                    let name = entry
+                        .get("display_name")
+                        .and_then(Value::as_str)
+                        .or_else(|| entry.get("name").and_then(Value::as_str))?;
+                    let value = entry.get("value")?;
+                    Some(format!("{name}: {}", compact_json(value)))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if values.is_empty() {
+        values = meta
+            .get("tool_params")
+            .and_then(Value::as_object)
+            .map(|params| {
+                params
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {}", compact_json(value)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        values.sort();
+    }
+    values.truncate(3);
+    values
+}
+
+fn compact_json(value: &Value) -> String {
+    value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| value.to_string())
+        .chars()
+        .take(80)
+        .collect()
+}
+
+impl McpForm {
+    fn parse(id: Value, params: &Value) -> Result<Self, String> {
+        let server_name = params
+            .get("serverName")
+            .and_then(Value::as_str)
+            .unwrap_or("MCP")
+            .to_owned();
+        let message = params
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("추가 입력이 필요합니다.")
+            .to_owned();
+        let schema = params
+            .get("requestedSchema")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "렌더링할 수 있는 MCP 폼 스키마가 없습니다.".to_owned())?;
+        let properties = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "MCP 폼에 properties가 없습니다.".to_owned())?;
+        let required = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut fields = Vec::with_capacity(properties.len());
+        for (name, definition) in properties {
+            fields.push(parse_mcp_field(
+                name,
+                definition,
+                required.iter().any(|entry| entry.as_str() == Some(name)),
+            )?);
+        }
+        let mut form = Self {
+            id,
+            server_name,
+            message,
+            fields,
+            current: 0,
+            editor: Editor::default(),
+            selected: 0,
+            checked: Vec::new(),
+            content: Map::new(),
+            validation_error: None,
+        };
+        form.reset_controls();
+        Ok(form)
+    }
+
+    fn reset_controls(&mut self) {
+        self.editor = Editor::default();
+        self.selected = 0;
+        self.checked.clear();
+        let Some(field) = self.fields.get(self.current) else {
+            return;
+        };
+        match &field.kind {
+            McpFieldKind::Text { .. } | McpFieldKind::Number { .. } => {
+                if let Some(default) = field.default.as_ref() {
+                    let value = default
+                        .as_str()
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| default.to_string());
+                    self.editor.set_text(&value);
+                }
+            }
+            McpFieldKind::Boolean => {
+                self.selected = match field.default.as_ref().and_then(Value::as_bool) {
+                    Some(false) if field.required => 0,
+                    Some(true) if field.required => 1,
+                    Some(false) => 1,
+                    Some(true) => 2,
+                    None => 0,
+                };
+            }
+            McpFieldKind::SingleSelect(options) => {
+                let offset = usize::from(!field.required);
+                if let Some(default) = field.default.as_ref().and_then(Value::as_str) {
+                    self.selected = options
+                        .iter()
+                        .position(|option| option.value == default)
+                        .map(|index| index + offset)
+                        .unwrap_or(0);
+                }
+            }
+            McpFieldKind::MultiSelect { options, .. } => {
+                let defaults = field
+                    .default
+                    .as_ref()
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                self.checked = options
+                    .iter()
+                    .map(|option| {
+                        defaults
+                            .iter()
+                            .any(|value| value.as_str() == Some(&option.value))
+                    })
+                    .collect();
+            }
+        }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> Option<Value> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if key.code == KeyCode::Esc {
+            return Some(mcp_elicitation_response("cancel", None));
+        }
+        if alt && key.code == KeyCode::Char('d') {
+            return Some(mcp_elicitation_response("decline", None));
+        }
+
+        let Some(field) = self.fields.get(self.current) else {
+            return Some(mcp_elicitation_response(
+                "accept",
+                Some(Value::Object(std::mem::take(&mut self.content))),
+            ));
+        };
+        match &field.kind {
+            McpFieldKind::Text { .. } | McpFieldKind::Number { .. } => match key.code {
+                KeyCode::Enter => return self.commit_current(),
+                KeyCode::Backspace if ctrl => self.editor.delete_word_left(),
+                KeyCode::Backspace => self.editor.backspace(),
+                KeyCode::Delete => self.editor.delete(),
+                KeyCode::Left if ctrl || alt => self.editor.move_word_left(),
+                KeyCode::Right if ctrl || alt => self.editor.move_word_right(),
+                KeyCode::Left => self.editor.move_left(),
+                KeyCode::Right => self.editor.move_right(),
+                KeyCode::Home => self.editor.move_home(),
+                KeyCode::End => self.editor.move_end(),
+                KeyCode::Char('w') if ctrl => self.editor.delete_word_left(),
+                KeyCode::Char('k') if ctrl => self.editor.delete_to_line_end(),
+                KeyCode::Char('u') if ctrl => self.editor.delete_to_line_start(),
+                KeyCode::Char('y') if ctrl => self.editor.yank(),
+                KeyCode::Char(ch) if !ctrl && !alt => self.editor.insert(ch),
+                _ => {}
+            },
+            McpFieldKind::Boolean => match key.code {
+                KeyCode::Up | KeyCode::Left => self.selected = 0,
+                KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
+                    let maximum = if field.required { 1 } else { 2 };
+                    self.selected = (self.selected + 1).min(maximum);
+                }
+                KeyCode::Char(' ') => {
+                    let count = if field.required { 2 } else { 3 };
+                    self.selected = (self.selected + 1) % count;
+                }
+                KeyCode::Enter => return self.commit_current(),
+                _ => {}
+            },
+            McpFieldKind::SingleSelect(options) => match key.code {
+                KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Tab => {
+                    let count = options.len() + usize::from(!field.required);
+                    self.selected = (self.selected + 1).min(count.saturating_sub(1));
+                }
+                KeyCode::Enter => return self.commit_current(),
+                _ => {}
+            },
+            McpFieldKind::MultiSelect { options, .. } => match key.code {
+                KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Tab => {
+                    self.selected = (self.selected + 1).min(options.len().saturating_sub(1));
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(checked) = self.checked.get_mut(self.selected) {
+                        *checked = !*checked;
+                    }
+                }
+                KeyCode::Enter => return self.commit_current(),
+                _ => {}
+            },
+        }
+        None
+    }
+
+    fn commit_current(&mut self) -> Option<Value> {
+        let field = &self.fields[self.current];
+        match mcp_field_value(field, &mut self.editor, self.selected, &self.checked) {
+            Ok(Some(value)) => {
+                self.content.insert(field.name.clone(), value);
+            }
+            Ok(None) => {
+                self.content.remove(&field.name);
+            }
+            Err(error) => {
+                self.validation_error = Some(error);
+                return None;
+            }
+        }
+        self.validation_error = None;
+        self.current += 1;
+        if self.current == self.fields.len() {
+            return Some(mcp_elicitation_response(
+                "accept",
+                Some(Value::Object(std::mem::take(&mut self.content))),
+            ));
+        }
+        self.reset_controls();
+        None
+    }
+}
+
+fn parse_mcp_field(name: &str, definition: &Value, required: bool) -> Result<McpField, String> {
+    let object = definition
+        .as_object()
+        .ok_or_else(|| format!("MCP 필드 '{name}'의 스키마가 올바르지 않습니다."))?;
+    let title = object
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or(name)
+        .to_owned();
+    let description = object
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let default = object
+        .get("default")
+        .filter(|value| !value.is_null())
+        .cloned();
+    let field_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("string");
+    let kind = if field_type == "array" {
+        let items = object
+            .get("items")
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("MCP 다중 선택 필드 '{name}'에 items가 없습니다."))?;
+        McpFieldKind::MultiSelect {
+            options: parse_mcp_options(items)
+                .ok_or_else(|| format!("MCP 필드 '{name}'의 선택 항목을 해석할 수 없습니다."))?,
+            min_items: object
+                .get("minItems")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize),
+            max_items: object
+                .get("maxItems")
+                .and_then(Value::as_u64)
+                .map(|value| value as usize),
+        }
+    } else if let Some(options) = parse_mcp_options(object) {
+        McpFieldKind::SingleSelect(options)
+    } else {
+        match field_type {
+            "string" => McpFieldKind::Text {
+                format: object
+                    .get("format")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                min_length: object
+                    .get("minLength")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize),
+                max_length: object
+                    .get("maxLength")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize),
+            },
+            "number" | "integer" => McpFieldKind::Number {
+                integer: field_type == "integer",
+                minimum: object.get("minimum").and_then(Value::as_f64),
+                maximum: object.get("maximum").and_then(Value::as_f64),
+            },
+            "boolean" => McpFieldKind::Boolean,
+            unsupported => {
+                return Err(format!(
+                    "MCP 필드 '{name}'의 형식 '{unsupported}'은 지원하지 않습니다."
+                ));
+            }
+        }
+    };
+    Ok(McpField {
+        name: name.to_owned(),
+        title,
+        description,
+        required,
+        default,
+        kind,
+    })
+}
+
+fn parse_mcp_options(object: &Map<String, Value>) -> Option<Vec<McpOption>> {
+    if let Some(entries) = object.get("oneOf").and_then(Value::as_array) {
+        return Some(
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    Some(McpOption {
+                        value: entry.get("const")?.as_str()?.to_owned(),
+                        label: entry
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .unwrap_or_else(|| {
+                                entry.get("const").and_then(Value::as_str).unwrap_or("")
+                            })
+                            .to_owned(),
+                    })
+                })
+                .collect(),
+        )
+        .filter(|options: &Vec<McpOption>| !options.is_empty());
+    }
+    if let Some(entries) = object.get("anyOf").and_then(Value::as_array) {
+        return Some(
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    Some(McpOption {
+                        value: entry.get("const")?.as_str()?.to_owned(),
+                        label: entry
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .unwrap_or_else(|| {
+                                entry.get("const").and_then(Value::as_str).unwrap_or("")
+                            })
+                            .to_owned(),
+                    })
+                })
+                .collect(),
+        )
+        .filter(|options: &Vec<McpOption>| !options.is_empty());
+    }
+    let values = object.get("enum").and_then(Value::as_array)?;
+    let names = object.get("enumNames").and_then(Value::as_array);
+    Some(
+        values
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| {
+                let value = value.as_str()?.to_owned();
+                let label = names
+                    .and_then(|names| names.get(index))
+                    .and_then(Value::as_str)
+                    .unwrap_or(&value)
+                    .to_owned();
+                Some(McpOption { value, label })
+            })
+            .collect(),
+    )
+    .filter(|options: &Vec<McpOption>| !options.is_empty())
+}
+
+fn mcp_field_value(
+    field: &McpField,
+    editor: &mut Editor,
+    selected: usize,
+    checked: &[bool],
+) -> Result<Option<Value>, String> {
+    match &field.kind {
+        McpFieldKind::Text {
+            format,
+            min_length,
+            max_length,
+        } => {
+            let value = editor.text().to_owned();
+            if value.is_empty() {
+                return if field.required {
+                    Err(format!("{}은(는) 필수 항목입니다.", field.title))
+                } else {
+                    Ok(None)
+                };
+            }
+            let length = value.chars().count();
+            if min_length.is_some_and(|minimum| length < minimum) {
+                return Err(format!(
+                    "{}은(는) 최소 {}자여야 합니다.",
+                    field.title,
+                    min_length.unwrap_or_default()
+                ));
+            }
+            if max_length.is_some_and(|maximum| length > maximum) {
+                return Err(format!(
+                    "{}은(는) 최대 {}자까지 입력할 수 있습니다.",
+                    field.title,
+                    max_length.unwrap_or_default()
+                ));
+            }
+            if format.as_deref() == Some("email") && !looks_like_email(&value) {
+                return Err("올바른 이메일 주소를 입력하세요.".to_owned());
+            }
+            if format.as_deref() == Some("uri") && !looks_like_uri(&value) {
+                return Err("올바른 URI를 입력하세요.".to_owned());
+            }
+            if format.as_deref() == Some("date")
+                && chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d").is_err()
+            {
+                return Err("날짜를 YYYY-MM-DD 형식으로 입력하세요.".to_owned());
+            }
+            if format.as_deref() == Some("date-time")
+                && chrono::DateTime::parse_from_rfc3339(&value).is_err()
+            {
+                return Err("날짜와 시간을 RFC 3339 형식으로 입력하세요.".to_owned());
+            }
+            Ok(Some(Value::String(value)))
+        }
+        McpFieldKind::Number {
+            integer,
+            minimum,
+            maximum,
+        } => {
+            let input = editor.text();
+            let raw = input.trim();
+            if raw.is_empty() {
+                return if field.required {
+                    Err(format!("{}은(는) 필수 항목입니다.", field.title))
+                } else {
+                    Ok(None)
+                };
+            }
+            let number = raw
+                .parse::<f64>()
+                .map_err(|_| "숫자를 입력하세요.".to_owned())?;
+            if *integer && number.fract() != 0.0 {
+                return Err("정수를 입력하세요.".to_owned());
+            }
+            if minimum.is_some_and(|minimum| number < minimum) {
+                return Err(format!(
+                    "{} 이상을 입력하세요.",
+                    minimum.unwrap_or_default()
+                ));
+            }
+            if maximum.is_some_and(|maximum| number > maximum) {
+                return Err(format!(
+                    "{} 이하를 입력하세요.",
+                    maximum.unwrap_or_default()
+                ));
+            }
+            if *integer {
+                let integer = raw
+                    .parse::<i64>()
+                    .map_err(|_| "지원 범위 안의 정수를 입력하세요.".to_owned())?;
+                Ok(Some(Value::Number(integer.into())))
+            } else {
+                serde_json::Number::from_f64(number)
+                    .map(Value::Number)
+                    .map(Some)
+                    .ok_or_else(|| "유효한 숫자를 입력하세요.".to_owned())
+            }
+        }
+        McpFieldKind::Boolean if !field.required && selected == 0 => Ok(None),
+        McpFieldKind::Boolean => Ok(Some(Value::Bool(if field.required {
+            selected == 1
+        } else {
+            selected == 2
+        }))),
+        McpFieldKind::SingleSelect(options) => {
+            let offset = usize::from(!field.required);
+            if selected < offset {
+                return Ok(None);
+            }
+            options
+                .get(selected - offset)
+                .map(|option| Some(Value::String(option.value.clone())))
+                .ok_or_else(|| "선택 항목이 없습니다.".to_owned())
+        }
+        McpFieldKind::MultiSelect {
+            options,
+            min_items,
+            max_items,
+        } => {
+            let values = options
+                .iter()
+                .zip(checked)
+                .filter(|(_, checked)| **checked)
+                .map(|(option, _)| Value::String(option.value.clone()))
+                .collect::<Vec<_>>();
+            if field.required && values.is_empty() {
+                return Err(format!("{}에서 하나 이상 선택하세요.", field.title));
+            }
+            if min_items.is_some_and(|minimum| values.len() < minimum) {
+                return Err(format!(
+                    "최소 {}개를 선택하세요.",
+                    min_items.unwrap_or_default()
+                ));
+            }
+            if max_items.is_some_and(|maximum| values.len() > maximum) {
+                return Err(format!(
+                    "최대 {}개까지 선택할 수 있습니다.",
+                    max_items.unwrap_or_default()
+                ));
+            }
+            if values.is_empty() && !field.required {
+                Ok(None)
+            } else {
+                Ok(Some(Value::Array(values)))
+            }
+        }
+    }
+}
+
+fn mcp_elicitation_response(action: &str, content: Option<Value>) -> Value {
+    mcp_elicitation_response_with_meta(action, content, None)
+}
+
+fn mcp_elicitation_response_with_meta(
+    action: &str,
+    content: Option<Value>,
+    meta: Option<Value>,
+) -> Value {
+    json!({
+        "action": action,
+        "content": content,
+        "_meta": meta
+    })
+}
+
+fn looks_like_email(value: &str) -> bool {
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
+}
+
+fn looks_like_uri(value: &str) -> bool {
+    value
+        .split_once(':')
+        .is_some_and(|(scheme, rest)| !scheme.is_empty() && !rest.is_empty())
+}
+
+fn parse_skill_bindings(response: &Value) -> Vec<SkillBinding> {
+    response
+        .get("data")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .get("skills")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+        })
+        .filter_map(|skill| {
+            Some(SkillBinding {
+                name: skill.get("name")?.as_str()?.to_owned(),
+                path: skill.get("path")?.as_str()?.to_owned(),
+                enabled: skill
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+            })
+        })
+        .collect()
+}
+
+fn parse_plugin_mentions(response: &Value) -> Vec<MentionBinding> {
+    let mut mentions = Vec::new();
+    for marketplace in response
+        .get("marketplaces")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        if marketplace.get("name").and_then(Value::as_str).is_none() {
+            continue;
+        }
+        for plugin in marketplace
+            .get("plugins")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            if plugin.get("installed").and_then(Value::as_bool) != Some(true)
+                || plugin.get("enabled").and_then(Value::as_bool) == Some(false)
+            {
+                continue;
+            }
+            let Some(plugin_name) = plugin.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(plugin_id) = plugin.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let display_name = plugin
+                .get("interface")
+                .and_then(|interface| interface.get("displayName"))
+                .and_then(Value::as_str)
+                .unwrap_or(plugin_name);
+            let path = format!("plugin://{plugin_id}");
+            let mut triggers = vec![slugify_mention(plugin_name)];
+            let display_trigger = slugify_mention(display_name);
+            if !triggers.contains(&display_trigger) {
+                triggers.push(display_trigger);
+            }
+            mentions.extend(triggers.into_iter().map(|trigger| MentionBinding {
+                trigger,
+                name: display_name.to_owned(),
+                path: path.clone(),
+            }));
+        }
+    }
+    mentions
+}
+
+fn parse_app_mentions(response: &Value) -> Vec<MentionBinding> {
+    let mut mentions = Vec::new();
+    for app in response
+        .get("data")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        if app.get("isAccessible").and_then(Value::as_bool) != Some(true)
+            || app.get("isEnabled").and_then(Value::as_bool) == Some(false)
+        {
+            continue;
+        }
+        let Some(id) = app.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = app.get("name").and_then(Value::as_str).unwrap_or(id);
+        let path = format!("app://{id}");
+        let mut triggers = vec![slugify_mention(id)];
+        let name_trigger = slugify_mention(name);
+        if !triggers.contains(&name_trigger) {
+            triggers.push(name_trigger);
+        }
+        mentions.extend(triggers.into_iter().map(|trigger| MentionBinding {
+            trigger,
+            name: name.to_owned(),
+            path: path.clone(),
+        }));
+    }
+    mentions
+}
+
+fn slugify_mention(value: &str) -> String {
+    let mut result = String::new();
+    let mut separator = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if separator && !result.is_empty() {
+                result.push('-');
+            }
+            result.push(ch.to_ascii_lowercase());
+            separator = false;
+        } else {
+            separator = true;
+        }
+    }
+    result
+}
+
+fn mention_triggers(text: &str) -> Vec<String> {
+    let mut triggers = Vec::new();
+    let chars = text.char_indices().collect::<Vec<_>>();
+    for (position, (_, ch)) in chars.iter().enumerate() {
+        if !matches!(ch, '$' | '@') {
+            continue;
+        }
+        if position
+            .checked_sub(1)
+            .and_then(|index| chars.get(index))
+            .is_some_and(|(_, previous)| {
+                previous.is_ascii_alphanumeric() || matches!(previous, '_' | '-' | '.')
+            })
+        {
+            continue;
+        }
+        let start = chars
+            .get(position + 1)
+            .map(|(index, _)| *index)
+            .unwrap_or(text.len());
+        let end = chars[position + 1..]
+            .iter()
+            .find(|(_, candidate)| {
+                !(candidate.is_ascii_alphanumeric() || matches!(candidate, '-' | '_' | ':' | '.'))
+            })
+            .map(|(index, _)| *index)
+            .unwrap_or(text.len());
+        if end > start {
+            triggers.push(text[start..end].to_owned());
+        }
+    }
+    triggers
 }
 
 #[derive(Clone)]
@@ -594,6 +1829,12 @@ pub struct AppState {
     composer_notice: Option<(String, Instant)>,
     status_metadata_refreshed_at: Instant,
     permission_mode: PermissionMode,
+    account_plan: AccountPlan,
+    /// Set when a login lands, so the event loop re-reads the account over RPC.
+    account_refresh_due: bool,
+    skills: Vec<SkillBinding>,
+    mentions: Vec<MentionBinding>,
+    app_mentions: Vec<MentionBinding>,
 }
 
 impl AppState {
@@ -656,11 +1897,191 @@ impl AppState {
             composer_notice: None,
             status_metadata_refreshed_at: Instant::now(),
             permission_mode: read_permission_mode(),
+            account_plan: AccountPlan::default(),
+            account_refresh_due: false,
+            skills: Vec::new(),
+            mentions: Vec::new(),
+            app_mentions: Vec::new(),
         }
     }
 
     pub fn selected_model(&self) -> Option<&ModelInfo> {
         self.models.get(self.selected_model)
+    }
+
+    pub fn set_account_plan(&mut self, plan: AccountPlan) {
+        self.account_plan = plan;
+    }
+
+    pub fn update_skills(&mut self, response: &Value) {
+        self.skills = parse_skill_bindings(response);
+    }
+
+    pub fn update_plugins(&mut self, response: &Value) {
+        self.mentions = parse_plugin_mentions(response);
+    }
+
+    pub fn update_apps(&mut self, response: &Value) {
+        self.app_mentions = parse_app_mentions(response);
+    }
+
+    pub fn turn_input(&self, text: String) -> Vec<Value> {
+        let triggers = mention_triggers(&text);
+        let mut input = vec![json!({
+            "type": "text",
+            "text": text,
+            "text_elements": []
+        })];
+        let mut added_paths = Vec::new();
+        for skill in &self.skills {
+            if skill.enabled
+                && triggers
+                    .iter()
+                    .any(|trigger| trigger.eq_ignore_ascii_case(&skill.name))
+                && !added_paths.contains(&skill.path)
+            {
+                input.push(json!({
+                    "type": "skill",
+                    "name": skill.name,
+                    "path": skill.path
+                }));
+                added_paths.push(skill.path.clone());
+            }
+        }
+        for mention in &self.mentions {
+            if triggers
+                .iter()
+                .any(|trigger| trigger.eq_ignore_ascii_case(&mention.trigger))
+                && !added_paths.contains(&mention.path)
+            {
+                input.push(json!({
+                    "type": "mention",
+                    "name": mention.name,
+                    "path": mention.path
+                }));
+                added_paths.push(mention.path.clone());
+            }
+        }
+        for mention in &self.app_mentions {
+            if triggers
+                .iter()
+                .any(|trigger| trigger.eq_ignore_ascii_case(&mention.trigger))
+                && !added_paths.contains(&mention.path)
+            {
+                input.push(json!({
+                    "type": "mention",
+                    "name": mention.name,
+                    "path": mention.path
+                }));
+                added_paths.push(mention.path.clone());
+            }
+        }
+        input
+    }
+
+    pub fn confirm_plugin_install(
+        &mut self,
+        target: PluginInstallTarget,
+        marketplace: &str,
+        description: Option<&str>,
+        disclosure: Vec<String>,
+    ) {
+        let mut detail = vec![
+            format!("Plugin: {}", target.plugin_name),
+            format!("Marketplace: {marketplace}"),
+        ];
+        if let Some(description) = description.filter(|text| !text.is_empty()) {
+            detail.push(description.to_owned());
+        }
+        detail.extend(disclosure);
+        detail.push("설치하면 포함된 Skill, MCP 서버와 Hook이 Codex에 추가됩니다.".to_owned());
+        self.pending = Some(PendingInteraction::Confirm {
+            title: "플러그인을 설치할까요?".to_owned(),
+            detail,
+            action: ConfirmedAction::InstallPlugin(target),
+        });
+    }
+
+    /// Opens the modal that waits for the browser half of the OAuth flow.
+    pub fn begin_login(&mut self, login_id: String, auth_url: String) {
+        self.commit_welcome_card();
+        self.pending = Some(PendingInteraction::Login { login_id, auth_url });
+    }
+
+    /// Login id of an in-flight `/login`, so a caller can cancel it.
+    pub fn active_login_id(&self) -> Option<&str> {
+        match self.pending.as_ref() {
+            Some(PendingInteraction::Login { login_id, .. }) => Some(login_id.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn finish_login(&mut self, success: bool, error: Option<&str>) {
+        if matches!(self.pending, Some(PendingInteraction::Login { .. })) {
+            self.pending = None;
+        }
+        if success {
+            self.push_notice(
+                BlockKind::System,
+                "로그인 완료",
+                "계정 정보를 갱신했습니다.",
+            );
+        } else {
+            self.push_notice(
+                BlockKind::Error,
+                "로그인 실패",
+                error.unwrap_or("알 수 없는 오류로 로그인이 완료되지 않았습니다."),
+            );
+        }
+    }
+
+    pub fn cancel_login_notice(&mut self) {
+        self.pending = None;
+        self.push_notice(BlockKind::Warning, "로그인 취소", "로그인을 중단했습니다.");
+    }
+
+    pub fn confirm_logout(&mut self) {
+        self.pending = Some(PendingInteraction::Confirm {
+            title: "로그아웃할까요?".to_owned(),
+            detail: vec![
+                format!("Account: {}", self.account),
+                "다시 사용하려면 /login으로 재인증해야 합니다.".to_owned(),
+            ],
+            action: ConfirmedAction::Logout,
+        });
+    }
+
+    /// Clears the cached identity so the welcome panel stops advertising a
+    /// session that no longer has credentials.
+    pub fn apply_logout(&mut self) {
+        self.account = "signed out".to_owned();
+        self.account_plan = AccountPlan::default();
+        self.push_notice(
+            BlockKind::Warning,
+            "로그아웃",
+            "계정 연결을 해제했습니다. /login으로 다시 로그인하세요.",
+        );
+    }
+
+    /// Replaces the cached identity after a successful `/login`.
+    pub fn set_account(&mut self, account: String) {
+        self.account = account;
+    }
+
+    /// True once per account change, so the event loop refreshes over RPC exactly once.
+    pub fn take_account_refresh(&mut self) -> bool {
+        std::mem::take(&mut self.account_refresh_due)
+    }
+
+    pub fn confirm_plugin_uninstall(&mut self, target: PluginUninstallTarget) {
+        self.pending = Some(PendingInteraction::Confirm {
+            title: "플러그인을 제거할까요?".to_owned(),
+            detail: vec![
+                format!("Plugin: {}", target.display_name),
+                "포함된 Skill과 MCP 연결이 새 세션부터 제거됩니다.".to_owned(),
+            ],
+            action: ConfirmedAction::UninstallPlugin(target),
+        });
     }
 
     pub fn permission_mode(&self) -> PermissionMode {
@@ -676,6 +2097,7 @@ impl AppState {
         ComposerMode {
             label: self.permission_mode().label().to_owned(),
             accent: self.permission_mode().accent(),
+            fast_mode: self.effective_fast_mode(),
         }
     }
 
@@ -865,6 +2287,15 @@ impl AppState {
         self.committed.push(Block::new(kind, title, body));
     }
 
+    /// Announce a newer published release above the composer history.
+    pub fn push_update_available(&mut self, latest: &str) {
+        self.push_notice(
+            BlockKind::Update,
+            "Update Available",
+            format!("New version {latest} is available. Run: devez update"),
+        );
+    }
+
     pub fn drain_committed(&mut self) -> Vec<Block> {
         if self.show_welcome && !self.committed.is_empty() {
             let pending = std::mem::take(&mut self.committed);
@@ -885,12 +2316,7 @@ impl AppState {
             live_blocks,
             overlay: self.overlay_view(),
             editor: &self.editor,
-            welcome: self.show_welcome.then(|| WelcomeView {
-                model: self.selected_model_display_name().to_owned(),
-                effort: self.selected_effort.clone(),
-                cwd: self.cwd.clone(),
-                account: self.account.clone(),
-            }),
+            welcome: self.show_welcome.then(|| self.welcome_view()),
             suggestions: if self.pending.is_none() {
                 self.slash_suggestion_views()
             } else {
@@ -936,6 +2362,16 @@ impl AppState {
                 editor,
                 ..
             }) => editor.insert_str(text),
+            Some(PendingInteraction::McpForm(form))
+                if form.fields.get(form.current).is_some_and(|field| {
+                    matches!(
+                        &field.kind,
+                        McpFieldKind::Text { .. } | McpFieldKind::Number { .. }
+                    )
+                }) =>
+            {
+                form.editor.insert_str(text);
+            }
             Some(PendingInteraction::SessionPicker(picker)) => picker.handle_paste(text),
             Some(_) => {}
             None => {
@@ -1129,6 +2565,12 @@ impl AppState {
 
     pub fn begin_server_request(&mut self, id: Value, method: &str, params: &Value) -> Action {
         if self.pending.is_some() {
+            if method == "mcpServer/elicitation/request" {
+                return Action::RpcResponse {
+                    id,
+                    result: mcp_elicitation_response("cancel", None),
+                };
+            }
             return Action::RpcError {
                 id,
                 message: "다른 사용자 입력을 처리 중입니다.".to_owned(),
@@ -1216,20 +2658,98 @@ impl AppState {
                 Action::None
             }
             "mcpServer/elicitation/request" => {
-                self.committed.push(Block::new(
-                    BlockKind::Warning,
-                    "MCP 입력 요청",
-                    "이 초기 버전은 MCP 폼 입력을 아직 지원하지 않아 요청을 취소했습니다.",
-                ));
-                Action::RpcResponse {
-                    id,
-                    result: json!({ "action": "cancel", "content": null, "_meta": null }),
+                let mode = params.get("mode").and_then(Value::as_str).unwrap_or("form");
+                if mode == "url" {
+                    let Some(url) = params.get("url").and_then(Value::as_str) else {
+                        return Action::RpcResponse {
+                            id,
+                            result: mcp_elicitation_response("decline", None),
+                        };
+                    };
+                    self.pending = Some(PendingInteraction::McpUrl {
+                        id,
+                        server_name: params
+                            .get("serverName")
+                            .and_then(Value::as_str)
+                            .unwrap_or("MCP")
+                            .to_owned(),
+                        message: params
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("브라우저에서 계속하세요.")
+                            .to_owned(),
+                        url: url.to_owned(),
+                    });
+                    return Action::None;
+                }
+                if mcp_schema_is_message_only(params.get("requestedSchema")) {
+                    let meta = params.get("_meta").and_then(Value::as_object);
+                    if meta
+                        .and_then(|meta| meta.get("codex_approval_kind"))
+                        .and_then(Value::as_str)
+                        == Some("tool_suggestion")
+                        && let Some(url) = meta
+                            .and_then(|meta| meta.get("install_url"))
+                            .and_then(Value::as_str)
+                    {
+                        self.pending = Some(PendingInteraction::McpUrl {
+                            id,
+                            server_name: meta
+                                .and_then(|meta| meta.get("tool_name"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("Codex App")
+                                .to_owned(),
+                            message: meta
+                                .and_then(|meta| meta.get("suggest_reason"))
+                                .and_then(Value::as_str)
+                                .or_else(|| params.get("message").and_then(Value::as_str))
+                                .unwrap_or("브라우저에서 연결을 완료하세요.")
+                                .to_owned(),
+                            url: url.to_owned(),
+                        });
+                        return Action::None;
+                    }
+                    if let Some(approval) = McpApproval::parse(id.clone(), params) {
+                        self.pending = Some(PendingInteraction::McpApproval(approval));
+                        return Action::None;
+                    }
+                }
+                match McpForm::parse(id.clone(), params) {
+                    Ok(form) => {
+                        self.pending = Some(PendingInteraction::McpForm(form));
+                        Action::None
+                    }
+                    Err(error) => {
+                        self.committed.push(Block::new(
+                            BlockKind::Warning,
+                            "MCP 폼을 표시할 수 없음",
+                            format!("{error}\n서버 요청을 안전하게 거부했습니다."),
+                        ));
+                        Action::RpcResponse {
+                            id,
+                            result: mcp_elicitation_response("decline", None),
+                        }
+                    }
                 }
             }
             _ => Action::RpcError {
                 id,
                 message: format!("지원하지 않는 서버 요청: {method}"),
             },
+        }
+    }
+
+    fn clear_resolved_server_request(&mut self, request_id: &Value) {
+        let matches = match self.pending.as_ref() {
+            Some(PendingInteraction::Approval { id, .. })
+            | Some(PendingInteraction::UserInput { id, .. })
+            | Some(PendingInteraction::McpUrl { id, .. }) => id == request_id,
+            Some(PendingInteraction::McpForm(form)) => &form.id == request_id,
+            Some(PendingInteraction::McpApproval(approval)) => &approval.id == request_id,
+            _ => false,
+        };
+        if matches {
+            self.pending = None;
         }
     }
 
@@ -1242,6 +2762,22 @@ impl AppState {
             return;
         }
         match method {
+            "serverRequest/resolved" => {
+                if let Some(request_id) = params.get("requestId") {
+                    self.clear_resolved_server_request(request_id);
+                }
+            }
+            "account/login/completed" => {
+                let success = params
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let error = params.get("error").and_then(Value::as_str);
+                self.finish_login(success, error);
+                self.account_refresh_due |= success;
+            }
+            // Plan or auth mode changed underneath us; pull the fresh values.
+            "account/updated" => self.account_refresh_due = true,
             "turn/started" => {
                 if let Some(turn_id) = params
                     .get("turn")
@@ -1373,6 +2909,66 @@ impl AppState {
                     self.transient_status = Some(format!("{from} → {to}로 전환됨"));
                 }
             }
+            "skills/changed" => {
+                self.transient_status = Some("Skills refreshed".to_owned());
+            }
+            "app/list/updated" => {
+                self.update_apps(params);
+                self.transient_status = Some("Apps refreshed".to_owned());
+            }
+            "mcpServer/oauthLogin/completed" => {
+                let name = params.get("name").and_then(Value::as_str).unwrap_or("MCP");
+                let success = params
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.committed.push(Block::new(
+                    if success {
+                        BlockKind::System
+                    } else {
+                        BlockKind::Error
+                    },
+                    if success {
+                        "MCP connected"
+                    } else {
+                        "MCP connection failed"
+                    },
+                    if success {
+                        format!("{name} 인증이 완료되었습니다.")
+                    } else {
+                        params
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("OAuth 인증을 완료하지 못했습니다.")
+                            .to_owned()
+                    },
+                ));
+            }
+            "mcpServer/startupStatus/updated" => {
+                let status = params
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if status == "failed" {
+                    let name = params.get("name").and_then(Value::as_str).unwrap_or("MCP");
+                    let reconnect = params.get("failureReason").and_then(Value::as_str)
+                        == Some("reauthenticationRequired");
+                    let detail = if reconnect {
+                        format!("인증이 만료되었습니다. /mcp login {name}")
+                    } else {
+                        params
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("MCP 서버를 시작하지 못했습니다.")
+                            .to_owned()
+                    };
+                    self.committed.push(Block::new(
+                        BlockKind::Warning,
+                        format!("{name} unavailable"),
+                        detail,
+                    ));
+                }
+            }
             "thread/compacted" => self.committed.push(Block::new(
                 BlockKind::System,
                 "Context compacted",
@@ -1407,7 +3003,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    "/model [MODEL] [EFFORT]  모델과 effort 선택\n/fast  빠른 서비스 티어 전환\n/effort [LEVEL]  추론 수준\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/diff  git diff 표시\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\nEsc 또는 Ctrl+C  실행 중단\nShift+Tab  권한 모드 전환 (Read Only / Default / Full Access)\nCtrl+Enter / Shift+Enter  줄바꿈",
+                    "/model [MODEL] [EFFORT]  모델과 effort 선택\n/fast  빠른 서비스 티어 전환\n/effort [LEVEL]  추론 수준\n/theme [minimal|soft|dark]  화면 테마\n/mcp [login NAME]  MCP 서버와 OAuth\n/plugins [install|uninstall|enable|disable NAME]  플러그인 관리\n/skills [enable|disable NAME]  Skill 관리\n/apps [enable|disable NAME]  App 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/diff  git diff 표시\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/login  ChatGPT 계정 로그인\n/logout  계정 연결 해제\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$skill-name, $app-name 또는 @plugin-name  명시적으로 사용\nEsc 또는 Ctrl+C  실행 중단\nShift+Tab  권한 모드 전환 (Read Only / Default / Full Access)\nCtrl+Enter / Shift+Enter  줄바꿈",
                 ));
                 Action::None
             }
@@ -1505,6 +3101,109 @@ impl AppState {
                 }
                 Action::None
             }
+            "/theme" if parts.len() == 1 => {
+                self.pending = Some(PendingInteraction::ThemePicker {
+                    theme_index: theme::current().index(),
+                });
+                Action::None
+            }
+            "/theme" if parts.len() == 2 => {
+                let Some(selected) = ThemeKind::parse(parts[1]) else {
+                    self.committed.push(Block::new(
+                        BlockKind::Error,
+                        "지원하지 않는 테마",
+                        "minimal, soft, dark 중 하나를 선택하세요.",
+                    ));
+                    return Action::None;
+                };
+                self.apply_theme(selected)
+            }
+            "/mcp" if parts.len() == 1 => Action::ShowMcp,
+            "/mcp" if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("login") => {
+                Action::McpLogin(parts[2..].join(" "))
+            }
+            "/mcp" => {
+                self.committed.push(Block::new(
+                    BlockKind::Error,
+                    "Usage",
+                    "/mcp 또는 /mcp login SERVER",
+                ));
+                Action::None
+            }
+            "/login" => Action::StartLogin,
+            "/logout" => {
+                self.confirm_logout();
+                Action::None
+            }
+            "/plugins" if parts.len() == 1 => Action::ShowPlugins,
+            "/plugins" if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("install") => {
+                Action::PreparePluginInstall(parts[2..].join(" "))
+            }
+            "/plugins" if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("uninstall") => {
+                Action::PreparePluginUninstall(parts[2..].join(" "))
+            }
+            "/plugins" if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("enable") => {
+                Action::SetPlugin {
+                    query: parts[2..].join(" "),
+                    enabled: true,
+                }
+            }
+            "/plugins" if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("disable") => {
+                Action::SetPlugin {
+                    query: parts[2..].join(" "),
+                    enabled: false,
+                }
+            }
+            "/plugins" => {
+                self.committed.push(Block::new(
+                    BlockKind::Error,
+                    "Usage",
+                    "/plugins 또는 /plugins install|uninstall|enable|disable NAME",
+                ));
+                Action::None
+            }
+            "/skills" if parts.len() == 1 => Action::ShowSkills,
+            "/skills" if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("enable") => {
+                Action::SetSkill {
+                    name: parts[2..].join(" "),
+                    enabled: true,
+                }
+            }
+            "/skills" if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("disable") => {
+                Action::SetSkill {
+                    name: parts[2..].join(" "),
+                    enabled: false,
+                }
+            }
+            "/skills" => {
+                self.committed.push(Block::new(
+                    BlockKind::Error,
+                    "Usage",
+                    "/skills 또는 /skills enable|disable NAME",
+                ));
+                Action::None
+            }
+            "/apps" if parts.len() == 1 => Action::ShowApps,
+            "/apps" if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("enable") => {
+                Action::SetApp {
+                    query: parts[2..].join(" "),
+                    enabled: true,
+                }
+            }
+            "/apps" if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("disable") => {
+                Action::SetApp {
+                    query: parts[2..].join(" "),
+                    enabled: false,
+                }
+            }
+            "/apps" => {
+                self.committed.push(Block::new(
+                    BlockKind::Error,
+                    "Usage",
+                    "/apps 또는 /apps enable|disable NAME",
+                ));
+                Action::None
+            }
             "/resume" | "/continue" if self.busy => {
                 self.committed.push(Block::new(
                     BlockKind::Warning,
@@ -1561,9 +3260,10 @@ impl AppState {
                     BlockKind::System,
                     "Status",
                     format!(
-                        "thread: {}\nmodel: {model}\neffort: {}\npermissions: {} ({})\ncwd: {}",
+                        "thread: {}\nmodel: {model}\neffort: {}\ntheme: {}\npermissions: {} ({})\ncwd: {}",
                         self.thread_id,
                         self.selected_effort,
+                        theme::current().display_name(),
                         self.permission_mode.label(),
                         self.permission_mode.profile(),
                         self.cwd
@@ -1711,6 +3411,27 @@ impl AppState {
                 self.pending = Some(PendingInteraction::EffortPicker { effort_index });
                 Action::None
             }
+            PendingInteraction::ThemePicker { mut theme_index } => {
+                match key.code {
+                    KeyCode::Esc => return Action::None,
+                    KeyCode::Up | KeyCode::Left => {
+                        theme_index = theme_index.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
+                        theme_index = (theme_index + 1).min(ThemeKind::ALL.len() - 1);
+                    }
+                    KeyCode::Char(ch) if ('1'..='3').contains(&ch) => {
+                        let selected = ThemeKind::ALL[ch.to_digit(10).unwrap_or(1) as usize - 1];
+                        return self.apply_theme(selected);
+                    }
+                    KeyCode::Enter => {
+                        return self.apply_theme(ThemeKind::ALL[theme_index]);
+                    }
+                    _ => {}
+                }
+                self.pending = Some(PendingInteraction::ThemePicker { theme_index });
+                Action::None
+            }
             PendingInteraction::SessionPicker(mut picker) => match picker.handle_key(key) {
                 SessionPickerResult::None => {
                     self.pending = Some(PendingInteraction::SessionPicker(picker));
@@ -1823,6 +3544,91 @@ impl AppState {
                 });
                 Action::None
             }
+            PendingInteraction::McpApproval(mut approval) => {
+                let id = approval.id.clone();
+                if let Some(result) = approval.handle_key(key) {
+                    Action::RpcResponse { id, result }
+                } else {
+                    self.pending = Some(PendingInteraction::McpApproval(approval));
+                    Action::None
+                }
+            }
+            PendingInteraction::McpForm(mut form) => {
+                let id = form.id.clone();
+                if let Some(result) = form.handle_key(key) {
+                    Action::RpcResponse { id, result }
+                } else {
+                    self.pending = Some(PendingInteraction::McpForm(form));
+                    Action::None
+                }
+            }
+            PendingInteraction::McpUrl {
+                id,
+                server_name,
+                message,
+                url,
+            } => match key.code {
+                KeyCode::Char('o') => {
+                    let target = url.clone();
+                    self.pending = Some(PendingInteraction::McpUrl {
+                        id,
+                        server_name,
+                        message,
+                        url,
+                    });
+                    Action::OpenUrl(target)
+                }
+                KeyCode::Char('y') | KeyCode::Enter => Action::RpcResponse {
+                    id,
+                    result: mcp_elicitation_response("accept", None),
+                },
+                KeyCode::Char('n') => Action::RpcResponse {
+                    id,
+                    result: mcp_elicitation_response("decline", None),
+                },
+                KeyCode::Esc => Action::RpcResponse {
+                    id,
+                    result: mcp_elicitation_response("cancel", None),
+                },
+                _ => {
+                    self.pending = Some(PendingInteraction::McpUrl {
+                        id,
+                        server_name,
+                        message,
+                        url,
+                    });
+                    Action::None
+                }
+            },
+            PendingInteraction::Confirm {
+                title,
+                detail,
+                action,
+            } => match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => action.into_action(),
+                KeyCode::Char('n') | KeyCode::Esc => Action::None,
+                _ => {
+                    self.pending = Some(PendingInteraction::Confirm {
+                        title,
+                        detail,
+                        action,
+                    });
+                    Action::None
+                }
+            },
+            PendingInteraction::Login { login_id, auth_url } => match key.code {
+                KeyCode::Char('o') => {
+                    let target = auth_url.clone();
+                    self.pending = Some(PendingInteraction::Login { login_id, auth_url });
+                    Action::OpenUrl(target)
+                }
+                KeyCode::Esc => Action::CancelLogin(login_id),
+                // Everything else keeps waiting; only the server ends this state.
+                _ => {
+                    self.pending = Some(PendingInteraction::Login { login_id, auth_url });
+                    Action::None
+                }
+            },
         }
     }
 
@@ -1913,6 +3719,28 @@ impl AppState {
                     input_placeholder: "",
                 })
             }
+            PendingInteraction::ThemePicker { theme_index } => Some(OverlayView {
+                title: "Select theme".to_owned(),
+                lines: ThemeKind::ALL
+                    .iter()
+                    .enumerate()
+                    .map(|(index, candidate)| OverlayLine {
+                        text: format!(
+                            "{}. {}  ·  {}",
+                            index + 1,
+                            candidate.display_name(),
+                            candidate.description()
+                        ),
+                        selected: index == *theme_index,
+                        muted: false,
+                    })
+                    .collect(),
+                hint: "1-3 select   ↑↓ navigate   Enter apply   Esc cancel".to_owned(),
+                style: OverlayStyle::Picker,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            }),
             PendingInteraction::SessionPicker(picker) => Some(picker.overlay_view()),
             PendingInteraction::Approval {
                 title,
@@ -1949,6 +3777,246 @@ impl AppState {
                     title: title.clone(),
                     lines,
                     hint: "y / a / n".to_owned(),
+                    style: OverlayStyle::Panel,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                })
+            }
+            PendingInteraction::McpApproval(approval) => {
+                let mut lines = vec![
+                    OverlayLine {
+                        text: approval.message.clone(),
+                        selected: false,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: approval.server_name.clone(),
+                        selected: false,
+                        muted: true,
+                    },
+                ];
+                lines.extend(approval.detail.iter().map(|detail| OverlayLine {
+                    text: detail.clone(),
+                    selected: false,
+                    muted: true,
+                }));
+                lines.extend(approval.options.iter().enumerate().map(|(index, option)| {
+                    OverlayLine {
+                        text: format!("{}. {} — {}", index + 1, option.label, option.description),
+                        selected: index == approval.selected,
+                        muted: false,
+                    }
+                }));
+                Some(OverlayView {
+                    title: "MCP approval".to_owned(),
+                    lines,
+                    hint: "↑↓ select   Enter confirm   Esc cancel".to_owned(),
+                    style: OverlayStyle::Panel,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                })
+            }
+            PendingInteraction::McpForm(form) => {
+                let field = form.fields.get(form.current)?;
+                let mut lines = vec![
+                    OverlayLine {
+                        text: form.message.clone(),
+                        selected: false,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: format!(
+                            "{} · {}/{}{}",
+                            form.server_name,
+                            form.current + 1,
+                            form.fields.len(),
+                            if field.required { " · required" } else { "" }
+                        ),
+                        selected: false,
+                        muted: true,
+                    },
+                ];
+                if !field.description.is_empty() {
+                    lines.push(OverlayLine {
+                        text: field.description.clone(),
+                        selected: false,
+                        muted: true,
+                    });
+                }
+                let text_input = matches!(
+                    &field.kind,
+                    McpFieldKind::Text { .. } | McpFieldKind::Number { .. }
+                );
+                match &field.kind {
+                    McpFieldKind::Boolean => {
+                        let labels = if field.required {
+                            vec!["No", "Yes"]
+                        } else {
+                            vec!["Not set", "No", "Yes"]
+                        };
+                        lines.extend(labels.into_iter().enumerate().map(|(index, label)| {
+                            OverlayLine {
+                                text: label.to_owned(),
+                                selected: index == form.selected,
+                                muted: false,
+                            }
+                        }));
+                    }
+                    McpFieldKind::SingleSelect(options) => {
+                        if !field.required {
+                            lines.push(OverlayLine {
+                                text: "Not set".to_owned(),
+                                selected: form.selected == 0,
+                                muted: true,
+                            });
+                        }
+                        let offset = usize::from(!field.required);
+                        lines.extend(options.iter().enumerate().map(|(index, option)| {
+                            OverlayLine {
+                                text: option.label.clone(),
+                                selected: index + offset == form.selected,
+                                muted: false,
+                            }
+                        }));
+                    }
+                    McpFieldKind::MultiSelect { options, .. } => {
+                        lines.extend(options.iter().enumerate().map(|(index, option)| {
+                            OverlayLine {
+                                text: format!(
+                                    "[{}] {}",
+                                    if form.checked.get(index) == Some(&true) {
+                                        "x"
+                                    } else {
+                                        " "
+                                    },
+                                    option.label
+                                ),
+                                selected: index == form.selected,
+                                muted: false,
+                            }
+                        }));
+                    }
+                    McpFieldKind::Text { .. } | McpFieldKind::Number { .. } => {}
+                }
+                if let Some(error) = form.validation_error.as_ref() {
+                    lines.push(OverlayLine {
+                        text: format!("! {error}"),
+                        selected: false,
+                        muted: false,
+                    });
+                }
+                Some(OverlayView {
+                    title: field.title.clone(),
+                    lines,
+                    hint: if text_input {
+                        "Enter next   Alt+D decline   Esc cancel".to_owned()
+                    } else if matches!(&field.kind, McpFieldKind::MultiSelect { .. }) {
+                        "↑↓ move   Space toggle   Enter next   Alt+D decline   Esc cancel"
+                            .to_owned()
+                    } else {
+                        "↑↓ select   Enter next   Alt+D decline   Esc cancel".to_owned()
+                    },
+                    style: OverlayStyle::Panel,
+                    input: text_input.then_some(&form.editor),
+                    input_label: "Value",
+                    input_placeholder: "",
+                })
+            }
+            PendingInteraction::McpUrl {
+                server_name,
+                message,
+                url,
+                ..
+            } => Some(OverlayView {
+                title: format!("{server_name} · Continue in browser"),
+                lines: vec![
+                    OverlayLine {
+                        text: message.clone(),
+                        selected: false,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: url.clone(),
+                        selected: false,
+                        muted: true,
+                    },
+                    OverlayLine {
+                        text: "[o] 브라우저 열기".to_owned(),
+                        selected: true,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: "[Enter] 완료 후 계속".to_owned(),
+                        selected: false,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: "[n] 거부".to_owned(),
+                        selected: false,
+                        muted: false,
+                    },
+                ],
+                hint: "o open   Enter continue   n decline   Esc cancel".to_owned(),
+                style: OverlayStyle::Panel,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            }),
+            PendingInteraction::Login { auth_url, .. } => Some(OverlayView {
+                title: "Sign in to ChatGPT".to_owned(),
+                lines: vec![
+                    OverlayLine {
+                        text: "브라우저에서 로그인을 완료하세요.".to_owned(),
+                        selected: false,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: auth_url.clone(),
+                        selected: false,
+                        muted: true,
+                    },
+                    OverlayLine {
+                        text: "[o] 브라우저 다시 열기".to_owned(),
+                        selected: true,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: "완료되면 자동으로 닫힙니다.".to_owned(),
+                        selected: false,
+                        muted: true,
+                    },
+                ],
+                hint: "o reopen   Esc cancel".to_owned(),
+                style: OverlayStyle::Panel,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            }),
+            PendingInteraction::Confirm { title, detail, .. } => {
+                let mut lines = detail
+                    .iter()
+                    .map(|text| OverlayLine {
+                        text: text.clone(),
+                        selected: false,
+                        muted: false,
+                    })
+                    .collect::<Vec<_>>();
+                lines.push(OverlayLine {
+                    text: "[y] 계속".to_owned(),
+                    selected: true,
+                    muted: false,
+                });
+                lines.push(OverlayLine {
+                    text: "[n] 취소".to_owned(),
+                    selected: false,
+                    muted: false,
+                });
+                Some(OverlayView {
+                    title: title.clone(),
+                    lines,
+                    hint: "y / n".to_owned(),
                     style: OverlayStyle::Panel,
                     input: None,
                     input_label: "",
@@ -2061,7 +4129,6 @@ impl AppState {
             context,
             five_hour_percent: self.five_hour_percent,
             weekly_percent: self.weekly_percent,
-            fast_mode: self.effective_fast_mode(),
             notice: self.transient_status.clone(),
         }
     }
@@ -2108,17 +4175,37 @@ impl AppState {
         ));
     }
 
+    fn apply_theme(&mut self, selected: ThemeKind) -> Action {
+        self.commit_welcome_card();
+        self.committed.push(Block::new(
+            BlockKind::ModelChange,
+            "✓ Theme changed",
+            format!("↳ {}", selected.display_name()),
+        ));
+        Action::SetTheme(selected)
+    }
+
     fn commit_welcome_card(&mut self) {
         if !self.show_welcome {
             return;
         }
+        let welcome = self.welcome_view();
         self.committed.push(Block::welcome(
-            self.selected_model_display_name(),
-            &self.selected_effort,
-            &self.cwd,
-            &self.account,
+            &welcome.plan,
+            &welcome.cwd,
+            &welcome.account,
+            &welcome.credits,
         ));
         self.show_welcome = false;
+    }
+
+    fn welcome_view(&self) -> WelcomeView {
+        WelcomeView {
+            plan: self.account_plan.plan_display(),
+            credits: self.account_plan.credit_lines(),
+            cwd: self.cwd.clone(),
+            account: self.account.clone(),
+        }
     }
 
     fn effort_index_for_model(&self, model_index: usize) -> usize {
@@ -2866,6 +4953,161 @@ mod tests {
         assert_eq!(state.editor.text(), "/mo");
     }
 
+    /// Shape captured from a real `account/rateLimits/read` response.
+    fn rate_limits_fixture() -> Value {
+        json!({
+            "rateLimits": {
+                "limitId": "codex",
+                "planType": "prolite",
+                "primary": { "usedPercent": 76, "windowDurationMins": 10080, "resetsAt": 1785276047 },
+                "secondary": null,
+                "credits": { "hasCredits": false, "unlimited": false, "balance": "0" }
+            },
+            "rateLimitResetCredits": {
+                "availableCount": 3,
+                "credits": [
+                    { "id": "a", "resetType": "codexRateLimits", "status": "available",
+                      "grantedAt": 1782932634, "expiresAt": 1785524634, "title": "Full reset" },
+                    { "id": "b", "resetType": "codexRateLimits", "status": "available",
+                      "grantedAt": 1783890530, "expiresAt": 1786482530, "title": "Full reset" },
+                    { "id": "c", "resetType": "codexRateLimits", "status": "available",
+                      "grantedAt": 1783964213, "expiresAt": 1786556213, "title": "Full reset" }
+                ]
+            }
+        })
+    }
+
+    #[test]
+    fn account_plan_reads_the_plan_and_reset_credits() {
+        let plan = AccountPlan::from_rate_limits(&rate_limits_fixture());
+
+        assert_eq!(plan.plan.as_deref(), Some("Pro 5x"));
+        assert_eq!(plan.available_credits, 3);
+        assert_eq!(plan.plan_display(), "Pro 5x");
+        // Soonest expiry first, regardless of the order the server sent them.
+        assert_eq!(
+            plan.credits
+                .iter()
+                .map(|credit| credit.expires_at)
+                .collect::<Vec<_>>(),
+            [Some(1785524634), Some(1786482530), Some(1786556213)]
+        );
+
+        let lines = plan.credit_lines_at(1785524634 - 12 * 86_400);
+
+        assert_eq!(lines[0], "3 available");
+        assert_eq!(lines.len(), 4, "one summary row plus one row per credit");
+        // Dates render in local time, so assert the shape and the relative span.
+        assert!(
+            lines[1].starts_with("· 20") && lines[1].ends_with("  12d left"),
+            "unexpected credit row: {}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn credit_rows_list_each_expiry_and_cap_long_lists() {
+        let credits = (0..6)
+            .map(|index| json!({ "status": "available", "expiresAt": 1_000 + index * 86_400 }))
+            .collect::<Vec<_>>();
+        let plan = AccountPlan::from_rate_limits(&json!({
+            "rateLimitResetCredits": { "availableCount": 6, "credits": credits }
+        }));
+
+        let lines = plan.credit_lines_at(0);
+
+        assert_eq!(lines[0], "6 available");
+        // Summary + CREDIT_LIST_LIMIT rows + the overflow note.
+        assert_eq!(lines.len(), 1 + CREDIT_LIST_LIMIT + 1);
+        assert_eq!(lines.last().map(String::as_str), Some("· +2 more"));
+    }
+
+    #[test]
+    fn credit_rows_fall_back_when_an_expiry_is_missing() {
+        let plan = AccountPlan::from_rate_limits(&json!({
+            "rateLimitResetCredits": {
+                "credits": [{ "status": "available", "title": "Full reset" }]
+            }
+        }));
+
+        assert_eq!(
+            plan.credit_lines_at(0),
+            [
+                "1 available".to_owned(),
+                "· Full reset  no expiry".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn account_plan_labels_every_known_plan_type() {
+        // Every variant of the app-server's PlanType enum, plus separator forms.
+        for (raw, expected) in [
+            ("free", "Free"),
+            ("go", "Go"),
+            ("plus", "Plus"),
+            ("prolite", "Pro 5x"),
+            ("pro_lite", "Pro 5x"),
+            ("PRO-LITE", "Pro 5x"),
+            ("pro", "Pro 20x"),
+            ("PRO", "Pro 20x"),
+            ("team", "Team"),
+            ("self_serve_business_usage_based", "Business (usage-based)"),
+            ("business", "Business"),
+            ("enterprise_cbp_usage_based", "Enterprise (usage-based)"),
+            ("enterprise", "Enterprise"),
+            ("edu", "Edu"),
+            // Unknown plans pass through rather than being hidden.
+            ("startup", "Startup"),
+        ] {
+            assert_eq!(plan_label(raw), expected, "planType {raw}");
+        }
+    }
+
+    #[test]
+    fn account_plan_degrades_when_the_server_reports_nothing() {
+        let plan = AccountPlan::from_rate_limits(&json!({}));
+
+        assert_eq!(plan, AccountPlan::default());
+        assert_eq!(plan.plan_display(), "—");
+        assert_eq!(plan.credit_lines(), ["none available".to_owned()]);
+    }
+
+    #[test]
+    fn account_plan_ignores_spent_credits_and_flags_expiry() {
+        let plan = AccountPlan::from_rate_limits(&json!({
+            "rateLimitResetCredits": {
+                "credits": [
+                    { "status": "consumed", "expiresAt": 100 },
+                    { "status": "available", "expiresAt": 500 }
+                ]
+            }
+        }));
+
+        assert_eq!(plan.available_credits, 1);
+        assert_eq!(
+            plan.credits
+                .iter()
+                .map(|c| c.expires_at)
+                .collect::<Vec<_>>(),
+            [Some(500)]
+        );
+        assert!(plan.credit_lines_at(600)[1].ends_with("  expired"));
+    }
+
+    #[test]
+    fn welcome_card_carries_the_plan_instead_of_the_model() {
+        let mut state = test_state();
+        state.set_account_plan(AccountPlan::from_rate_limits(&rate_limits_fixture()));
+
+        let welcome = state.welcome_view();
+
+        assert_eq!(welcome.plan, "Pro 5x");
+        assert_eq!(welcome.credits[0], "3 available");
+        assert_eq!(welcome.credits.len(), 4);
+        assert_eq!(welcome.cwd, state.cwd);
+    }
+
     #[test]
     fn permission_mode_starts_from_the_configured_sandbox_mode() {
         assert_eq!(
@@ -2927,14 +5169,31 @@ mod tests {
     }
 
     #[test]
-    fn fast_mode_is_shown_only_by_the_persistent_statusline() {
+    fn fast_mode_is_shown_only_by_the_composer_badge() {
         let mut state = test_state();
 
         state.set_fast_mode(true);
 
         assert!(state.fast_mode);
+        assert!(state.composer_mode().fast_mode);
         assert!(state.committed.is_empty());
         assert!(state.transient_status.is_none());
+    }
+
+    #[test]
+    fn composer_badge_carries_both_permission_mode_and_fast_tier() {
+        let mut state = test_state();
+        state.permission_mode = PermissionMode::ReadOnly;
+        state.set_fast_mode(false);
+
+        let badge = state.composer_mode();
+
+        assert_eq!(badge.label, "Read Only");
+        assert!(!badge.fast_mode);
+
+        state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+
+        assert_eq!(state.composer_mode().label, "Default");
     }
 
     #[test]
@@ -2988,6 +5247,25 @@ mod tests {
         assert!(matches!(card.kind, BlockKind::ModelChange));
         assert_eq!(card.title, "✓ Effort changed");
         assert_eq!(card.body, "↳ GPT-5.6 Sol · xhigh");
+    }
+
+    #[test]
+    fn theme_command_supports_picker_and_direct_selection() {
+        let mut state = test_state();
+
+        assert!(matches!(state.run_slash_command("/theme"), Action::None));
+        let overlay = state.overlay_view().expect("theme picker");
+        assert_eq!(overlay.lines.len(), 3);
+        assert!(overlay.lines[0].text.contains("Minimal"));
+        state.pending = None;
+
+        assert!(matches!(
+            state.run_slash_command("/theme soft"),
+            Action::SetTheme(ThemeKind::Soft)
+        ));
+        let card = state.committed.last().expect("theme card");
+        assert_eq!(card.title, "✓ Theme changed");
+        assert_eq!(card.body, "↳ Soft");
     }
 
     #[test]
@@ -3198,5 +5476,366 @@ mod tests {
             state.view().status_line.and_then(|status| status.context),
             Some("ctx: 0k/258k (0%)".to_owned())
         );
+    }
+
+    #[test]
+    fn mcp_form_returns_typed_structured_content() {
+        let params = json!({
+            "serverName": "example",
+            "message": "Configure the tool",
+            "mode": "form",
+            "requestedSchema": {
+                "type": "object",
+                "required": ["a_name", "b_count", "d_mode", "e_tags"],
+                "properties": {
+                    "a_name": {
+                        "type": "string",
+                        "title": "Name",
+                        "minLength": 2
+                    },
+                    "b_count": {
+                        "type": "integer",
+                        "default": 3,
+                        "minimum": 1
+                    },
+                    "c_enabled": {
+                        "type": "boolean"
+                    },
+                    "d_mode": {
+                        "type": "string",
+                        "enum": ["safe", "fast"],
+                        "enumNames": ["Safe", "Fast"]
+                    },
+                    "e_tags": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["rust", "cli"]
+                        },
+                        "minItems": 1
+                    }
+                }
+            }
+        });
+        let mut form = McpForm::parse(json!(7), &params).expect("valid form");
+
+        form.editor.set_text("Devez");
+        assert!(form.handle_key(KeyEvent::from(KeyCode::Enter)).is_none());
+        assert_eq!(form.editor.text(), "3");
+        assert!(form.handle_key(KeyEvent::from(KeyCode::Enter)).is_none());
+        assert!(form.handle_key(KeyEvent::from(KeyCode::Enter)).is_none());
+        assert!(form.handle_key(KeyEvent::from(KeyCode::Enter)).is_none());
+        assert!(
+            form.handle_key(KeyEvent::from(KeyCode::Char(' ')))
+                .is_none()
+        );
+        let response = form
+            .handle_key(KeyEvent::from(KeyCode::Enter))
+            .expect("accepted response");
+
+        assert_eq!(
+            response.get("action").and_then(Value::as_str),
+            Some("accept")
+        );
+        assert_eq!(
+            response.pointer("/content/a_name").and_then(Value::as_str),
+            Some("Devez")
+        );
+        assert_eq!(
+            response.pointer("/content/b_count").and_then(Value::as_i64),
+            Some(3)
+        );
+        assert!(response.pointer("/content/c_enabled").is_none());
+        assert_eq!(
+            response.pointer("/content/d_mode").and_then(Value::as_str),
+            Some("safe")
+        );
+        assert_eq!(
+            response
+                .pointer("/content/e_tags/0")
+                .and_then(Value::as_str),
+            Some("rust")
+        );
+    }
+
+    #[test]
+    fn mcp_form_validates_required_fields_and_can_cancel() {
+        let params = json!({
+            "serverName": "example",
+            "message": "Email",
+            "mode": "form",
+            "requestedSchema": {
+                "type": "object",
+                "required": ["email"],
+                "properties": {
+                    "email": {
+                        "type": "string",
+                        "format": "email"
+                    }
+                }
+            }
+        });
+        let mut form = McpForm::parse(json!(1), &params).expect("valid form");
+
+        assert!(form.handle_key(KeyEvent::from(KeyCode::Enter)).is_none());
+        assert!(form.validation_error.is_some());
+        form.editor.set_text("invalid");
+        assert!(form.handle_key(KeyEvent::from(KeyCode::Enter)).is_none());
+        assert!(form.validation_error.is_some());
+        let response = form
+            .handle_key(KeyEvent::from(KeyCode::Esc))
+            .expect("cancel response");
+        assert_eq!(
+            response.get("action").and_then(Value::as_str),
+            Some("cancel")
+        );
+        assert!(response.get("content").is_some_and(Value::is_null));
+    }
+
+    #[test]
+    fn unsupported_mcp_forms_decline_instead_of_breaking_the_turn() {
+        let mut state = test_state();
+        let action = state.begin_server_request(
+            json!(9),
+            "mcpServer/elicitation/request",
+            &json!({
+                "serverName": "custom",
+                "message": "Unsupported",
+                "mode": "openai/form",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "file": { "type": "file" }
+                    }
+                }
+            }),
+        );
+
+        match action {
+            Action::RpcResponse { result, .. } => {
+                assert_eq!(
+                    result.get("action").and_then(Value::as_str),
+                    Some("decline")
+                );
+            }
+            _ => panic!("unsupported form should be declined"),
+        }
+    }
+
+    #[test]
+    fn mcp_url_prompt_opens_without_losing_the_pending_reply() {
+        let mut state = test_state();
+        let action = state.begin_server_request(
+            json!(4),
+            "mcpServer/elicitation/request",
+            &json!({
+                "serverName": "github",
+                "message": "Authorize",
+                "mode": "url",
+                "url": "https://example.com/auth",
+                "elicitationId": "elicit-1"
+            }),
+        );
+        assert!(matches!(action, Action::None));
+
+        let open = state.handle_key(KeyEvent::from(KeyCode::Char('o')));
+        assert!(matches!(open, Action::OpenUrl(ref url) if url == "https://example.com/auth"));
+        let accept = state.handle_key(KeyEvent::from(KeyCode::Enter));
+        match accept {
+            Action::RpcResponse { result, .. } => {
+                assert_eq!(result.get("action").and_then(Value::as_str), Some("accept"));
+            }
+            _ => panic!("URL prompt should accept after browser flow"),
+        }
+    }
+
+    #[test]
+    fn resolved_server_request_closes_only_the_matching_prompt() {
+        let mut state = test_state();
+        state.begin_server_request(
+            json!(4),
+            "mcpServer/elicitation/request",
+            &json!({
+                "serverName": "github",
+                "message": "Authorize",
+                "mode": "url",
+                "url": "https://example.com/auth",
+                "elicitationId": "elicit-1"
+            }),
+        );
+        state.handle_notification(
+            "serverRequest/resolved",
+            &json!({ "threadId": state.thread_id.clone(), "requestId": 7 }),
+        );
+        assert!(matches!(
+            state.pending,
+            Some(PendingInteraction::McpUrl { .. })
+        ));
+        state.handle_notification(
+            "serverRequest/resolved",
+            &json!({ "threadId": state.thread_id.clone(), "requestId": 4 }),
+        );
+        assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn mcp_tool_approval_returns_requested_persist_scope() {
+        let mut state = test_state();
+        let action = state.begin_server_request(
+            json!(12),
+            "mcpServer/elicitation/request",
+            &json!({
+                "serverName": "calendar",
+                "message": "Create an event?",
+                "mode": "form",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {}
+                },
+                "_meta": {
+                    "codex_approval_kind": "mcp_tool_call",
+                    "persist": ["session", "always"],
+                    "tool_params_display": [{
+                        "name": "title",
+                        "display_name": "Title",
+                        "value": "Roadmap"
+                    }]
+                }
+            }),
+        );
+        assert!(matches!(action, Action::None));
+        assert!(matches!(
+            state.pending,
+            Some(PendingInteraction::McpApproval(ref approval))
+                if approval.options.len() == 4 && approval.detail == ["Title: Roadmap"]
+        ));
+
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Down)),
+            Action::None
+        ));
+        let response = state.handle_key(KeyEvent::from(KeyCode::Enter));
+        match response {
+            Action::RpcResponse { result, .. } => {
+                assert_eq!(result.get("action").and_then(Value::as_str), Some("accept"));
+                assert_eq!(
+                    result.pointer("/_meta/persist").and_then(Value::as_str),
+                    Some("session")
+                );
+            }
+            _ => panic!("MCP approval should return a scoped accept response"),
+        }
+    }
+
+    #[test]
+    fn explicit_skill_plugin_and_app_mentions_become_typed_turn_items() {
+        let mut state = test_state();
+        state.update_skills(&json!({
+            "data": [{
+                "cwd": "cwd",
+                "errors": [],
+                "skills": [
+                    {
+                        "name": "review",
+                        "path": "C:/skills/review/SKILL.md",
+                        "description": "Review",
+                        "enabled": true,
+                        "scope": "user"
+                    },
+                    {
+                        "name": "disabled",
+                        "path": "C:/skills/disabled/SKILL.md",
+                        "description": "Disabled",
+                        "enabled": false,
+                        "scope": "user"
+                    }
+                ]
+            }]
+        }));
+        state.update_plugins(&json!({
+            "marketplaces": [{
+                "name": "openai-bundled",
+                "plugins": [{
+                    "id": "github@openai-bundled",
+                    "name": "github",
+                    "installed": true,
+                    "enabled": true,
+                    "interface": { "displayName": "GitHub Tools" }
+                }]
+            }]
+        }));
+        state.update_apps(&json!({
+            "data": [{
+                "id": "calendar",
+                "name": "Calendar",
+                "isAccessible": true,
+                "isEnabled": true
+            }]
+        }));
+
+        let input = state.turn_input(
+            "$review check this with @github-tools and $calendar; ignore $disabled".to_owned(),
+        );
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[1].get("type").and_then(Value::as_str), Some("skill"));
+        assert_eq!(
+            input[1].get("path").and_then(Value::as_str),
+            Some("C:/skills/review/SKILL.md")
+        );
+        assert_eq!(
+            input[2].get("type").and_then(Value::as_str),
+            Some("mention")
+        );
+        assert_eq!(
+            input[2].get("path").and_then(Value::as_str),
+            Some("plugin://github@openai-bundled")
+        );
+        assert_eq!(
+            input[3].get("path").and_then(Value::as_str),
+            Some("app://calendar")
+        );
+    }
+
+    #[test]
+    fn mention_tokens_do_not_treat_email_addresses_as_plugins() {
+        assert_eq!(
+            mention_triggers("mail foo@sample.com, then use @sample"),
+            vec!["sample".to_owned()]
+        );
+    }
+
+    #[test]
+    fn integration_slash_commands_dispatch_app_server_actions() {
+        let mut state = test_state();
+        assert!(matches!(state.run_slash_command("/mcp"), Action::ShowMcp));
+        assert!(matches!(
+            state.run_slash_command("/mcp login github"),
+            Action::McpLogin(ref name) if name == "github"
+        ));
+        assert!(matches!(
+            state.run_slash_command("/plugins install browser"),
+            Action::PreparePluginInstall(ref name) if name == "browser"
+        ));
+        assert!(matches!(
+            state.run_slash_command("/plugins disable browser"),
+            Action::SetPlugin {
+                ref query,
+                enabled: false
+            } if query == "browser"
+        ));
+        assert!(matches!(
+            state.run_slash_command("/skills disable imagegen"),
+            Action::SetSkill {
+                ref name,
+                enabled: false
+            } if name == "imagegen"
+        ));
+        assert!(matches!(
+            state.run_slash_command("/apps enable calendar"),
+            Action::SetApp {
+                ref query,
+                enabled: true
+            } if query == "calendar"
+        ));
     }
 }
