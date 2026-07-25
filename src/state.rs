@@ -24,11 +24,16 @@ struct SlashCommand {
     takes_argument: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 10] = [
+const SLASH_COMMANDS: [SlashCommand; 17] = [
     SlashCommand {
         name: "/model",
         description: "Switch model and reasoning",
         takes_argument: true,
+    },
+    SlashCommand {
+        name: "/fast",
+        description: "Toggle the model's fast service tier",
+        takes_argument: false,
     },
     SlashCommand {
         name: "/effort",
@@ -48,6 +53,36 @@ const SLASH_COMMANDS: [SlashCommand; 10] = [
     SlashCommand {
         name: "/continue",
         description: "Alias for /resume",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/btw",
+        description: "Start an ephemeral side conversation",
+        takes_argument: true,
+    },
+    SlashCommand {
+        name: "/side",
+        description: "Alias for /btw",
+        takes_argument: true,
+    },
+    SlashCommand {
+        name: "/compact",
+        description: "Compact the current conversation",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/copy",
+        description: "Copy the last response as Markdown",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/diff",
+        description: "Show the current git diff",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/usage",
+        description: "Show account usage limits",
         takes_argument: false,
     },
     SlashCommand {
@@ -86,6 +121,7 @@ pub struct ModelInfo {
     pub default_effort: String,
     pub is_default: bool,
     pub context_window: Option<u64>,
+    pub fast_service_tier: Option<String>,
 }
 
 #[derive(Clone)]
@@ -116,6 +152,24 @@ impl ModelInfo {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             context_window: value.get("contextWindow").and_then(Value::as_u64),
+            fast_service_tier: value
+                .get("serviceTiers")
+                .and_then(Value::as_array)
+                .and_then(|tiers| {
+                    tiers.iter().find_map(|tier| {
+                        let is_fast = tier
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| name.eq_ignore_ascii_case("fast"));
+                        is_fast
+                            .then(|| {
+                                tier.get("id")
+                                    .and_then(Value::as_str)
+                                    .map(ToOwned::to_owned)
+                            })
+                            .flatten()
+                    })
+                }),
         })
     }
 
@@ -154,11 +208,21 @@ pub enum Action {
     NewThread,
     OpenResume,
     ResumeThread(String),
+    SetFast(bool),
+    StartSide(Option<String>),
+    ReturnFromSide,
+    Compact,
+    Copy(String),
+    ShowDiff,
     Quit,
     ClearScreen,
-    Tick,
+    Tick(bool),
     RpcResponse { id: Value, result: Value },
     RpcError { id: Value, message: String },
+}
+
+struct SideParent {
+    thread_id: String,
 }
 
 struct ActiveItem {
@@ -480,6 +544,9 @@ pub struct AppState {
     five_hour_percent: Option<u8>,
     weekly_percent: Option<u8>,
     fast_mode: bool,
+    side_parent: Option<SideParent>,
+    last_assistant_markdown: Option<String>,
+    composer_notice: Option<(String, Instant)>,
     status_metadata_refreshed_at: Instant,
 }
 
@@ -538,6 +605,9 @@ impl AppState {
             five_hour_percent,
             weekly_percent,
             fast_mode: read_fast_mode(),
+            side_parent: None,
+            last_assistant_markdown: None,
+            composer_notice: None,
             status_metadata_refreshed_at: Instant::now(),
         }
     }
@@ -560,6 +630,84 @@ impl AppState {
 
     pub fn selected_effort(&self) -> &str {
         &self.selected_effort
+    }
+
+    pub fn service_tier(&self) -> &str {
+        if self.effective_fast_mode() {
+            self.selected_model()
+                .and_then(|model| model.fast_service_tier.as_deref())
+                .unwrap_or("priority")
+        } else {
+            "default"
+        }
+    }
+
+    pub fn effective_fast_mode(&self) -> bool {
+        self.fast_mode
+            && self
+                .selected_model()
+                .is_some_and(|model| model.fast_service_tier.is_some())
+    }
+
+    pub fn set_fast_mode(&mut self, enabled: bool) {
+        self.fast_mode = enabled;
+        self.transient_status = Some(if enabled {
+            "Fast On".to_owned()
+        } else {
+            "Fast Off".to_owned()
+        });
+        self.committed.push(Block::new(
+            BlockKind::Success,
+            if enabled {
+                "Fast mode enabled"
+            } else {
+                "Fast mode disabled"
+            },
+            if enabled {
+                "Faster inference with increased usage"
+            } else {
+                "Default service tier"
+            },
+        ));
+    }
+
+    pub fn set_copy_notice(&mut self, count: usize) {
+        self.composer_notice = Some((format!("Copied {count} chars to clipboard"), Instant::now()));
+    }
+
+    pub fn side_parent_thread_id(&self) -> Option<&str> {
+        self.side_parent
+            .as_ref()
+            .map(|parent| parent.thread_id.as_str())
+    }
+
+    pub fn enter_side_thread(
+        &mut self,
+        thread_id: String,
+        cwd: String,
+        model: &str,
+        effort: Option<&str>,
+    ) {
+        let parent = SideParent {
+            thread_id: self.thread_id.clone(),
+        };
+        self.prepare_resume();
+        self.side_parent = Some(parent);
+        self.set_thread(thread_id, cwd, model, effort);
+        self.show_welcome = false;
+        self.transient_status = Some("Side · Ctrl+C to return".to_owned());
+        self.committed.push(Block::new(
+            BlockKind::System,
+            "Side conversation",
+            "Ephemeral fork · Ctrl+C to return to the main thread",
+        ));
+    }
+
+    pub fn begin_side_prompt(&mut self, text: String) {
+        self.show_welcome = false;
+        self.committed
+            .push(Block::new(BlockKind::User, "You", text));
+        self.busy = true;
     }
 
     pub fn set_thread(
@@ -608,6 +756,9 @@ impl AppState {
             };
             for item in items {
                 if let Some(block) = completed_item_block(item) {
+                    if matches!(block.kind, BlockKind::Assistant) {
+                        self.last_assistant_markdown = Some(block.body.clone());
+                    }
                     self.committed.push(block);
                 }
             }
@@ -645,6 +796,9 @@ impl AppState {
         self.total_tokens = 0;
         self.context_window = None;
         self.transient_status = None;
+        self.side_parent = None;
+        self.last_assistant_markdown = None;
+        self.composer_notice = None;
         self.show_welcome = false;
         self.busy = false;
         self.turn_id = None;
@@ -695,10 +849,15 @@ impl AppState {
             activity: self.activity(),
             footer: String::new(),
             status_line: Some(self.status_line()),
+            composer_notice: self
+                .composer_notice
+                .as_ref()
+                .map(|(notice, _)| notice.clone()),
         }
     }
 
-    pub fn tick(&mut self) {
+    pub fn tick(&mut self) -> bool {
+        let mut redraw = self.busy;
         if self.busy {
             self.spinner_frame = (self.spinner_frame + 1) % SPINNER.len();
         }
@@ -708,6 +867,15 @@ impl AppState {
             self.fast_mode = read_fast_mode();
             self.status_metadata_refreshed_at = Instant::now();
         }
+        if self
+            .composer_notice
+            .as_ref()
+            .is_some_and(|(_, shown_at)| shown_at.elapsed().as_millis() >= 1_400)
+        {
+            self.composer_notice = None;
+            redraw = true;
+        }
+        redraw
     }
 
     pub fn handle_paste(&mut self, text: &str) {
@@ -753,7 +921,7 @@ impl AppState {
                 _ => {}
             }
         }
-        if !slash_matches.is_empty() && !ctrl && !alt {
+        if !slash_matches.is_empty() && !ctrl && !alt && !shift {
             match key.code {
                 KeyCode::Up => {
                     self.command_selection = self.command_selection.saturating_sub(1);
@@ -790,6 +958,8 @@ impl AppState {
             KeyCode::Char('c') if ctrl => {
                 if self.busy {
                     Action::Interrupt
+                } else if self.editor.is_empty() && self.side_parent.is_some() {
+                    Action::ReturnFromSide
                 } else if self.editor.is_empty() {
                     Action::Quit
                 } else {
@@ -839,7 +1009,7 @@ impl AppState {
                 self.editor.move_word_right();
                 Action::None
             }
-            KeyCode::Enter if alt || shift => {
+            KeyCode::Enter if alt || shift || ctrl => {
                 self.editor.newline();
                 Action::None
             }
@@ -1008,6 +1178,13 @@ impl AppState {
     }
 
     pub fn handle_notification(&mut self, method: &str, params: &Value) {
+        if params
+            .get("threadId")
+            .and_then(Value::as_str)
+            .is_some_and(|thread_id| thread_id != self.thread_id)
+        {
+            return;
+        }
         match method {
             "turn/started" => {
                 if let Some(turn_id) = params
@@ -1174,9 +1351,37 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    "/model [MODEL] [EFFORT]  모델과 effort 선택\n/effort [LEVEL]  추론 수준\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/status  현재 설정\n/clear  화면 정리\n/quit  종료\n\nEsc 또는 Ctrl+C  실행 중단\nAlt+Enter  줄바꿈",
+                    "/model [MODEL] [EFFORT]  모델과 effort 선택\n/fast  빠른 서비스 티어 전환\n/effort [LEVEL]  추론 수준\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/diff  git diff 표시\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈",
                 ));
                 Action::None
+            }
+            "/fast" => {
+                if self
+                    .selected_model()
+                    .is_none_or(|model| model.fast_service_tier.is_none())
+                {
+                    self.committed.push(Block::new(
+                        BlockKind::Error,
+                        "Fast mode unavailable",
+                        "현재 모델은 Fast 서비스 티어를 지원하지 않습니다.",
+                    ));
+                    Action::None
+                } else {
+                    let enabled = match parts.get(1).map(|value| value.to_ascii_lowercase()) {
+                        Some(value) if value == "on" => true,
+                        Some(value) if value == "off" => false,
+                        Some(_) => {
+                            self.committed.push(Block::new(
+                                BlockKind::Error,
+                                "Usage",
+                                "/fast [on|off]",
+                            ));
+                            return Action::None;
+                        }
+                        None => !self.effective_fast_mode(),
+                    };
+                    Action::SetFast(enabled)
+                }
             }
             "/model" if parts.len() == 1 => {
                 let effort_index = self
@@ -1255,6 +1460,36 @@ impl AppState {
             "/resume" if parts.len() == 1 => Action::OpenResume,
             "/resume" => Action::ResumeThread(parts[1..].join(" ")),
             "/continue" => Action::OpenResume,
+            "/btw" | "/side" if self.busy => {
+                self.committed.push(Block::new(
+                    BlockKind::Warning,
+                    "진행 중",
+                    "현재 응답을 중단한 뒤 사이드 대화를 시작하세요.",
+                ));
+                Action::None
+            }
+            "/btw" | "/side" => Action::StartSide((parts.len() > 1).then(|| parts[1..].join(" "))),
+            "/compact" if self.busy => {
+                self.committed.push(Block::new(
+                    BlockKind::Warning,
+                    "진행 중",
+                    "현재 응답이 끝난 뒤 컨텍스트를 압축하세요.",
+                ));
+                Action::None
+            }
+            "/compact" => Action::Compact,
+            "/copy" => match self.last_assistant_markdown.clone() {
+                Some(markdown) => Action::Copy(markdown),
+                None => {
+                    self.committed.push(Block::new(
+                        BlockKind::Warning,
+                        "Nothing to copy",
+                        "완료된 답변이 아직 없습니다.",
+                    ));
+                    Action::None
+                }
+            },
+            "/diff" => Action::ShowDiff,
             "/new" if self.busy => {
                 self.committed.push(Block::new(
                     BlockKind::Warning,
@@ -1273,6 +1508,22 @@ impl AppState {
                         "thread: {}\nmodel: {model}\neffort: {}\ncwd: {}",
                         self.thread_id, self.selected_effort, self.cwd
                     ),
+                ));
+                Action::None
+            }
+            "/usage" => {
+                let five_hour = self
+                    .five_hour_percent
+                    .map(|value| format!("{value}%"))
+                    .unwrap_or_else(|| "—".to_owned());
+                let weekly = self
+                    .weekly_percent
+                    .map(|value| format!("{value}%"))
+                    .unwrap_or_else(|| "—".to_owned());
+                self.committed.push(Block::new(
+                    BlockKind::System,
+                    "Usage",
+                    format!("5h: {five_hour}\nweek: {weekly}"),
                 ));
                 Action::None
             }
@@ -1750,12 +2001,13 @@ impl AppState {
             context,
             five_hour_percent: self.five_hour_percent,
             weekly_percent: self.weekly_percent,
-            fast_mode: self.fast_mode,
+            fast_mode: self.effective_fast_mode(),
             notice: self.transient_status.clone(),
         }
     }
 
     fn apply_model(&mut self, index: usize, effort: Option<&str>) {
+        self.commit_welcome_card();
         let Some(model) = self.models.get(index) else {
             return;
         };
@@ -1769,13 +2021,14 @@ impl AppState {
         self.selected_effort = selected_effort.clone();
         self.context_window = context_window.or(self.context_window);
         self.committed.push(Block::new(
-            BlockKind::Success,
-            "Model 변경",
-            format!("{model_name} · {selected_effort}"),
+            BlockKind::ModelChange,
+            "Model changed",
+            format!("↳ {model_name} · {selected_effort}"),
         ));
     }
 
     fn apply_effort(&mut self, effort: &str) {
+        self.commit_welcome_card();
         let Some(model) = self.selected_model() else {
             return;
         };
@@ -1785,6 +2038,19 @@ impl AppState {
         self.selected_effort = effort.to_owned();
         self.committed
             .push(Block::new(BlockKind::Success, "Effort changed", effort));
+    }
+
+    fn commit_welcome_card(&mut self) {
+        if !self.show_welcome {
+            return;
+        }
+        self.committed.push(Block::welcome(
+            self.selected_model_display_name(),
+            &self.selected_effort,
+            &self.cwd,
+            &self.account,
+        ));
+        self.show_welcome = false;
     }
 
     fn effort_index_for_model(&self, model_index: usize) -> usize {
@@ -1827,6 +2093,9 @@ impl AppState {
             return;
         }
         if let Some(block) = completed_item_block(item) {
+            if matches!(block.kind, BlockKind::Assistant) {
+                self.last_assistant_markdown = Some(block.body.clone());
+            }
             self.committed.push(block);
         }
     }
@@ -1860,6 +2129,9 @@ impl AppState {
     fn flush_orphaned_active(&mut self) {
         for id in std::mem::take(&mut self.active_order) {
             if let Some(item) = self.active.remove(&id) {
+                if matches!(item.block.kind, BlockKind::Assistant) {
+                    self.last_assistant_markdown = Some(item.block.body.clone());
+                }
                 self.committed.push(item.block);
             }
         }
@@ -2420,10 +2692,14 @@ fn parse_fast_mode(config: &str) -> bool {
         .filter_map(|line| line.split_once('='))
         .find_map(|(key, value)| {
             (key.trim() == "service_tier").then(|| {
-                value
-                    .trim()
-                    .trim_matches(['"', '\''])
-                    .eq_ignore_ascii_case("fast")
+                matches!(
+                    value
+                        .trim()
+                        .trim_matches(['"', '\''])
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "fast" | "priority"
+                )
             })
         })
         .unwrap_or(false)
@@ -2445,7 +2721,80 @@ mod tests {
             default_effort: "high".to_owned(),
             is_default,
             context_window: None,
+            fast_service_tier: Some("priority".to_owned()),
         }
+    }
+
+    fn test_state() -> AppState {
+        AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![test_model("gpt-5.6-sol", "GPT-5.6 Sol", true)],
+            "gpt-5.6-sol",
+            Some("high"),
+        )
+    }
+
+    #[test]
+    fn modified_enter_keys_insert_newlines_without_submitting() {
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::SHIFT] {
+            let mut state = test_state();
+            state.editor.insert_str("first");
+
+            let action = state.handle_key(KeyEvent::new(KeyCode::Enter, modifiers));
+
+            assert!(matches!(action, Action::None));
+            assert_eq!(state.editor.text(), "first\n");
+            assert!(!state.busy);
+        }
+    }
+
+    #[test]
+    fn fast_and_btw_commands_dispatch_real_actions() {
+        let mut state = test_state();
+        assert!(matches!(
+            state.run_slash_command("/fast"),
+            Action::SetFast(true)
+        ));
+        assert!(matches!(
+            state.run_slash_command("/btw quick question"),
+            Action::StartSide(Some(message)) if message == "quick question"
+        ));
+    }
+
+    #[test]
+    fn model_change_commits_welcome_before_the_change_card() {
+        let mut state = test_state();
+        state
+            .models
+            .push(test_model("gpt-5.6-terra", "GPT-5.6 Terra", false));
+
+        state.apply_model(1, Some("xhigh"));
+
+        assert!(matches!(state.committed[0].kind, BlockKind::Welcome));
+        assert!(matches!(state.committed[1].kind, BlockKind::ModelChange));
+        assert!(state.committed[1].body.starts_with("↳ "));
+        assert!(!state.show_welcome);
+    }
+
+    #[test]
+    fn model_catalog_exposes_the_fast_service_tier() {
+        let model = ModelInfo::from_value(&json!({
+            "id": "gpt-5.6-sol",
+            "model": "gpt-5.6-sol",
+            "displayName": "GPT-5.6 Sol",
+            "supportedReasoningEfforts": [{"reasoningEffort": "high"}],
+            "defaultReasoningEffort": "high",
+            "serviceTiers": [{
+                "id": "priority",
+                "name": "Fast",
+                "description": "1.5x speed"
+            }]
+        }))
+        .expect("model");
+
+        assert_eq!(model.fast_service_tier.as_deref(), Some("priority"));
     }
 
     #[test]
@@ -2490,6 +2839,7 @@ mod tests {
             default_effort: "high".to_owned(),
             is_default: true,
             context_window: None,
+            fast_service_tier: Some("priority".to_owned()),
         };
         let mut state = AppState::new(
             "thread".to_owned(),

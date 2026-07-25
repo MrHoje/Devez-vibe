@@ -11,6 +11,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use app_server::{AppServer, ServerEvent};
+use arboard::Clipboard;
 use clap::Parser;
 use crossterm::event::{Event, EventStream};
 use editor::Editor;
@@ -204,6 +205,7 @@ async fn choose_startup_session(sessions: Vec<SessionInfo>, cwd: &Path) -> Resul
                 activity: None,
                 footer: "Resume a Codex session".to_owned(),
                 status_line: None,
+                composer_notice: None,
             },
         )?;
         match events.next().await {
@@ -279,12 +281,11 @@ async fn event_loop(
                 }
             }
             _ = activity_tick.tick() => {
-                state.tick();
-                Action::Tick
+                Action::Tick(state.tick())
             }
         };
 
-        let redraw = !matches!(&action, Action::Tick) || state.busy;
+        let redraw = !matches!(&action, Action::Tick(false));
         let should_quit = execute_action(server, state, renderer, action).await?;
         if redraw {
             draw(state, renderer)?;
@@ -304,31 +305,8 @@ async fn execute_action(
 ) -> Result<bool> {
     match action {
         Action::None => {}
-        Action::Tick => {}
-        Action::Submit(text) => {
-            let params = json!({
-                "threadId": state.thread_id,
-                "input": [{
-                    "type": "text",
-                    "text": text,
-                    "text_elements": []
-                }],
-                "model": state.selected_model_name(),
-                "effort": state.selected_effort()
-            });
-            match server.request("turn/start", params).await {
-                Ok(response) => {
-                    if let Some(turn_id) = response
-                        .get("turn")
-                        .and_then(|turn| turn.get("id"))
-                        .and_then(Value::as_str)
-                    {
-                        state.set_turn_started(turn_id.to_owned());
-                    }
-                }
-                Err(error) => state.set_request_failed(error.to_string()),
-            }
-        }
+        Action::Tick(_) => {}
+        Action::Submit(text) => start_turn(server, state, text).await,
         Action::Steer(text) => {
             let Some(turn_id) = state.turn_id.clone() else {
                 state.set_request_failed("활성 turn ID가 없어 추가 입력을 보낼 수 없습니다.");
@@ -365,6 +343,7 @@ async fn execute_action(
                     json!({
                         "cwd": state.cwd,
                         "model": state.selected_model_name(),
+                        "serviceTier": state.service_tier(),
                         "sessionStartSource": "clear",
                         "threadSource": "devez-cli"
                     }),
@@ -416,6 +395,183 @@ async fn execute_action(
                 state.push_notice(BlockKind::Error, "세션 재개 실패", error.to_string());
             }
         }
+        Action::SetFast(enabled) => {
+            let service_tier = if enabled {
+                state
+                    .selected_model()
+                    .and_then(|model| model.fast_service_tier.as_deref())
+                    .unwrap_or("priority")
+                    .to_owned()
+            } else {
+                "default".to_owned()
+            };
+            let update = server
+                .request(
+                    "thread/settings/update",
+                    json!({
+                        "threadId": state.thread_id,
+                        "serviceTier": service_tier
+                    }),
+                )
+                .await;
+            match update {
+                Ok(_) => {
+                    state.set_fast_mode(enabled);
+                    if let Err(error) = server
+                        .request(
+                            "config/value/write",
+                            json!({
+                                "keyPath": "service_tier",
+                                "value": service_tier,
+                                "mergeStrategy": "upsert"
+                            }),
+                        )
+                        .await
+                    {
+                        state.push_notice(
+                            BlockKind::Warning,
+                            "Fast 설정 저장 실패",
+                            error.to_string(),
+                        );
+                    }
+                }
+                Err(error) => {
+                    state.push_notice(BlockKind::Error, "Fast 전환 실패", error.to_string())
+                }
+            }
+        }
+        Action::StartSide(prompt) => {
+            let response = server
+                .request(
+                    "thread/fork",
+                    json!({
+                        "threadId": state.thread_id,
+                        "model": state.selected_model_name(),
+                        "serviceTier": state.service_tier(),
+                        "ephemeral": true,
+                        "threadSource": "devez-cli"
+                    }),
+                )
+                .await;
+            match response {
+                Ok(response) => {
+                    let thread_id = response
+                        .get("thread")
+                        .and_then(|thread| thread.get("id"))
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                    let cwd = response
+                        .get("cwd")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&state.cwd)
+                        .to_owned();
+                    let model = response
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| state.selected_model_name())
+                        .to_owned();
+                    let effort = response
+                        .get("reasoningEffort")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                    if let Some(thread_id) = thread_id {
+                        renderer.clear_screen()?;
+                        state.enter_side_thread(thread_id, cwd, &model, effort.as_deref());
+                        if let Some(prompt) = prompt {
+                            state.begin_side_prompt(prompt.clone());
+                            start_turn(server, state, prompt).await;
+                        }
+                    } else {
+                        state.push_notice(
+                            BlockKind::Error,
+                            "Side conversation failed",
+                            "thread/fork 응답에 thread ID가 없습니다.",
+                        );
+                    }
+                }
+                Err(error) => state.push_notice(
+                    BlockKind::Error,
+                    "Side conversation failed",
+                    error.to_string(),
+                ),
+            }
+        }
+        Action::ReturnFromSide => {
+            let child_thread = state.thread_id.clone();
+            let parent_thread = state.side_parent_thread_id().map(ToOwned::to_owned);
+            if let Some(parent_thread) = parent_thread {
+                match resume_into_state(server, state, renderer, &parent_thread).await {
+                    Ok(()) => {
+                        if let Err(error) = server
+                            .request("thread/unsubscribe", json!({ "threadId": child_thread }))
+                            .await
+                        {
+                            state.push_notice(
+                                BlockKind::Warning,
+                                "Side cleanup failed",
+                                error.to_string(),
+                            );
+                        }
+                    }
+                    Err(error) => state.push_notice(
+                        BlockKind::Error,
+                        "메인 대화 복귀 실패",
+                        error.to_string(),
+                    ),
+                }
+            }
+        }
+        Action::Compact => {
+            match server
+                .request(
+                    "thread/compact/start",
+                    json!({ "threadId": state.thread_id }),
+                )
+                .await
+            {
+                Ok(_) => state.push_notice(
+                    BlockKind::System,
+                    "Compacting context",
+                    "Codex가 대화 컨텍스트를 압축하고 있습니다.",
+                ),
+                Err(error) => state.push_notice(BlockKind::Error, "압축 실패", error.to_string()),
+            }
+        }
+        Action::Copy(text) => {
+            match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(&text)) {
+                Ok(()) => state.set_copy_notice(text.chars().count()),
+                Err(error) => state.push_notice(BlockKind::Error, "복사 실패", error.to_string()),
+            }
+        }
+        Action::ShowDiff => {
+            let output = tokio::process::Command::new("git")
+                .args(["diff", "--no-ext-diff", "--"])
+                .current_dir(&state.cwd)
+                .output()
+                .await;
+            match output {
+                Ok(output) if output.status.success() => {
+                    let diff = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                    state.push_notice(
+                        BlockKind::System,
+                        "Git diff",
+                        if diff.is_empty() {
+                            "No tracked changes".to_owned()
+                        } else {
+                            diff
+                        },
+                    );
+                }
+                Ok(output) => state.push_notice(
+                    BlockKind::Error,
+                    "Git diff 실패",
+                    String::from_utf8_lossy(&output.stderr).trim(),
+                ),
+                Err(error) => {
+                    state.push_notice(BlockKind::Error, "Git diff 실패", error.to_string())
+                }
+            }
+        }
         Action::RpcResponse { id, result } => {
             if let Err(error) = server.respond(id, result) {
                 state.push_notice(BlockKind::Error, "응답 전송 실패", error.to_string());
@@ -430,6 +586,32 @@ async fn execute_action(
         Action::Quit => return Ok(true),
     }
     Ok(false)
+}
+
+async fn start_turn(server: &AppServer, state: &mut AppState, text: String) {
+    let params = json!({
+        "threadId": state.thread_id,
+        "input": [{
+            "type": "text",
+            "text": text,
+            "text_elements": []
+        }],
+        "model": state.selected_model_name(),
+        "effort": state.selected_effort(),
+        "serviceTier": state.service_tier()
+    });
+    match server.request("turn/start", params).await {
+        Ok(response) => {
+            if let Some(turn_id) = response
+                .get("turn")
+                .and_then(|turn| turn.get("id"))
+                .and_then(Value::as_str)
+            {
+                state.set_turn_started(turn_id.to_owned());
+            }
+        }
+        Err(error) => state.set_request_failed(error.to_string()),
+    }
 }
 
 fn draw(state: &mut AppState, renderer: &mut Renderer) -> Result<()> {

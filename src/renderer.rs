@@ -16,11 +16,13 @@ use crate::editor::Editor;
 
 #[derive(Clone, Copy)]
 pub enum BlockKind {
+    Welcome,
     User,
     Assistant,
     Reasoning,
     Tool,
     Success,
+    ModelChange,
     Warning,
     Error,
     System,
@@ -40,6 +42,14 @@ impl Block {
             title: title.into(),
             body: body.into(),
         }
+    }
+
+    pub fn welcome(model: &str, effort: &str, cwd: &str, account: &str) -> Self {
+        Self::new(
+            BlockKind::Welcome,
+            "DEVEZ CLI",
+            format!("{model}\n{effort}\n{cwd}\n{account}"),
+        )
     }
 }
 
@@ -98,6 +108,7 @@ pub struct View<'a> {
     pub activity: Option<String>,
     pub footer: String,
     pub status_line: Option<StatusLineView>,
+    pub composer_notice: Option<String>,
 }
 
 pub struct TerminalSession;
@@ -162,6 +173,7 @@ impl Renderer {
         let status = StatusArea {
             fallback: view.footer,
             line: view.status_line,
+            composer_notice: view.composer_notice,
         };
         let mut frame = if let Some(overlay) = view.overlay {
             overlay_frame(&view.live_blocks, overlay, status, width.max(20))
@@ -352,6 +364,7 @@ struct Frame {
 struct StatusArea {
     fallback: String,
     line: Option<StatusLineView>,
+    composer_notice: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -383,6 +396,7 @@ enum Tone {
     LimitWeekly,
     FastOn,
     FastOff,
+    ModelChange,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -456,8 +470,13 @@ fn normal_frame(
         lines.extend(suggestion_lines(suggestions, width));
     }
 
-    let (input_lines, input_cursor_line, input_cursor_col) =
-        input_lines(editor, width, "", "Ask Codex to build, fix, or explain…");
+    let (input_lines, input_cursor_line, input_cursor_col) = input_lines(
+        editor,
+        width,
+        "",
+        "Ask Codex to build, fix, or explain…",
+        status.composer_notice.as_deref(),
+    );
     let cursor_line = lines.len() + input_cursor_line;
     lines.extend(input_lines);
     lines.push(status_line_row(status.line, &status.fallback, width));
@@ -716,6 +735,7 @@ fn overlay_frame(
             width,
             overlay.input_label,
             overlay.input_placeholder,
+            None,
         );
         cursor_line = lines.len() + input_cursor_line;
         cursor_col = input_cursor_col;
@@ -880,11 +900,44 @@ fn trim_spans(spans: &mut Vec<PaintSpan>, max_width: usize) {
 }
 
 fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
+    if matches!(block.kind, BlockKind::Welcome) {
+        let mut values = block.body.lines();
+        return welcome_lines(
+            WelcomeView {
+                model: values.next().unwrap_or_default().to_owned(),
+                effort: values.next().unwrap_or_default().to_owned(),
+                cwd: values.next().unwrap_or_default().to_owned(),
+                account: values.next().unwrap_or_default().to_owned(),
+            },
+            width,
+        );
+    }
     if matches!(block.kind, BlockKind::User) {
         return user_prompt_lines(block, width);
     }
+    if matches!(block.kind, BlockKind::ModelChange) {
+        return vec![
+            PaintLine {
+                prefix: "  ".to_owned(),
+                prefix_tone: Tone::ModelChange,
+                text: block.title.clone(),
+                tone: Tone::ModelChange,
+                bold: true,
+                tail: Vec::new(),
+            },
+            PaintLine {
+                prefix: "    ".to_owned(),
+                prefix_tone: Tone::ModelChange,
+                text: block.body.clone(),
+                tone: Tone::ModelChange,
+                bold: false,
+                tail: Vec::new(),
+            },
+        ];
+    }
 
     let (marker, tone) = match block.kind {
+        BlockKind::Welcome | BlockKind::ModelChange => unreachable!("handled above"),
         BlockKind::User => unreachable!("user blocks are rendered separately"),
         BlockKind::Assistant => ("● ", Tone::Accent),
         BlockKind::Reasoning => ("✻ ", Tone::Muted),
@@ -1107,6 +1160,7 @@ fn input_lines(
     width: u16,
     label: &str,
     placeholder: &str,
+    notice: Option<&str>,
 ) -> (Vec<PaintLine>, usize, usize) {
     let panel_width = (width as usize).saturating_sub(1).max(16);
     let first_prefix = "  ❯ ";
@@ -1158,23 +1212,7 @@ fn input_lines(
     }
 
     let mut rows = Vec::with_capacity(raw_rows.len() + 2);
-    let top_label = (!label.is_empty()).then(|| format!(" {label} "));
-    rows.push(PaintLine {
-        prefix: String::new(),
-        prefix_tone: Tone::Muted,
-        text: top_label.map_or_else(
-            || "─".repeat(panel_width),
-            |label| {
-                format!(
-                    "──{label}{}",
-                    "─".repeat(panel_width.saturating_sub(2 + label.len()))
-                )
-            },
-        ),
-        tone: Tone::Muted,
-        bold: false,
-        tail: Vec::new(),
-    });
+    rows.push(input_top_line(panel_width, label, notice));
     for (index, raw) in raw_rows.into_iter().enumerate() {
         let is_placeholder = editor.is_empty() && index == 0;
         let content = if is_placeholder {
@@ -1213,6 +1251,44 @@ fn input_lines(
     });
 
     (rows, cursor_row + 1, cursor_column)
+}
+
+fn input_top_line(panel_width: usize, label: &str, notice: Option<&str>) -> PaintLine {
+    let left = if label.is_empty() {
+        String::new()
+    } else {
+        format!("── {label} ")
+    };
+    let notice = notice
+        .map(|notice| compact_right(notice, panel_width.saturating_sub(6)))
+        .unwrap_or_default();
+    let notice_width = UnicodeWidthStr::width(notice.as_str());
+    let left_width = UnicodeWidthStr::width(left.as_str());
+    let fill =
+        panel_width.saturating_sub(left_width + notice_width + usize::from(!notice.is_empty()));
+    PaintLine {
+        prefix: String::new(),
+        prefix_tone: Tone::Muted,
+        text: format!("{left}{}", "─".repeat(fill)),
+        tone: Tone::Muted,
+        bold: false,
+        tail: if notice.is_empty() {
+            Vec::new()
+        } else {
+            vec![
+                PaintSpan {
+                    text: " ".to_owned(),
+                    tone: Tone::Muted,
+                    bold: false,
+                },
+                PaintSpan {
+                    text: notice,
+                    tone: Tone::Success,
+                    bold: false,
+                },
+            ]
+        },
+    }
 }
 
 fn compact_text(text: &str, max_width: usize) -> String {
@@ -1258,13 +1334,14 @@ fn compact_right(text: &str, max_width: usize) -> String {
 
 fn print_line(out: &mut Stdout, line: &PaintLine) -> Result<()> {
     let user_prompt = line.tone == Tone::UserPrompt;
-    if user_prompt {
+    let model_change = line.tone == Tone::ModelChange;
+    if user_prompt || model_change {
         queue!(
             out,
             SetBackgroundColor(Color::Rgb {
-                r: 45,
+                r: if model_change { 47 } else { 45 },
                 g: 43,
-                b: 39,
+                b: if model_change { 52 } else { 39 },
             })
         )?;
     }
@@ -1292,13 +1369,13 @@ fn print_line(out: &mut Stdout, line: &PaintLine) -> Result<()> {
             ResetColor
         )?;
     }
-    if user_prompt {
+    if user_prompt || model_change {
         queue!(
             out,
             SetBackgroundColor(Color::Rgb {
-                r: 45,
+                r: if model_change { 47 } else { 45 },
                 g: 43,
-                b: 39,
+                b: if model_change { 52 } else { 39 },
             }),
             Clear(ClearType::UntilNewLine),
             ResetColor
@@ -1455,6 +1532,11 @@ fn set_tone(out: &mut Stdout, tone: Tone) -> Result<()> {
             g: 128,
             b: 128,
         },
+        Tone::ModelChange => Color::Rgb {
+            r: 232,
+            g: 226,
+            b: 238,
+        },
     };
     queue!(out, SetForegroundColor(color))?;
     Ok(())
@@ -1517,7 +1599,7 @@ mod tests {
         let mut editor = Editor::default();
         editor.set_text("wrapped prompt text");
 
-        let (rows, _, _) = input_lines(&editor, 18, "", "placeholder");
+        let (rows, _, _) = input_lines(&editor, 18, "", "placeholder", None);
         let prompt_rows = &rows[1..rows.len() - 1];
 
         assert!(prompt_rows.len() > 1);
@@ -1533,6 +1615,38 @@ mod tests {
         assert!(prompt_rows.iter().all(|row| !row.prefix.contains('│')));
         assert!(prompt_rows.iter().all(|row| !row.text.ends_with(' ')));
         assert!(prompt_rows.iter().all(|row| !row.text.contains('│')));
+    }
+
+    #[test]
+    fn model_change_uses_a_background_card_and_indented_turn_marker() {
+        let block = Block::new(
+            BlockKind::ModelChange,
+            "Model changed",
+            "↳ GPT-5.6 Terra · xhigh",
+        );
+        let lines = block_lines(&block, 80);
+
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|line| line.tone == Tone::ModelChange));
+        assert_eq!(lines[1].prefix, "    ");
+        assert!(lines[1].text.starts_with('↳'));
+    }
+
+    #[test]
+    fn copy_notice_is_right_aligned_on_the_composer_top_rule() {
+        let line = input_top_line(50, "", Some("Copied 12 chars to clipboard"));
+        let width = UnicodeWidthStr::width(line.text.as_str())
+            + line
+                .tail
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+                .sum::<usize>();
+
+        assert_eq!(width, 50);
+        assert_eq!(
+            line.tail.last().map(|span| span.text.as_str()),
+            Some("Copied 12 chars to clipboard")
+        );
     }
 
     #[test]
@@ -1553,6 +1667,7 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                composer_notice: None,
             },
             80,
         );
@@ -1644,6 +1759,7 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                composer_notice: None,
             },
             80,
         );
