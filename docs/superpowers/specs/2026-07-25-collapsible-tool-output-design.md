@@ -17,7 +17,9 @@ left click on that heading expands or collapses that block's output.
 - New Bash blocks start collapsed.
 - Inline mode keeps Bash blocks collapsed because previously printed terminal
   scrollback cannot be retracted safely and mouse capture is intentionally off.
-- Non-Bash tool, file-change, reasoning, and message blocks are unchanged.
+- Plan steps, reasoning, live activity/progress, non-Bash tools, file changes,
+  and messages remain visible and unchanged. Only the stdout/stderr body beneath
+  a Bash heading is collapsed.
 
 ## Architecture
 
@@ -61,4 +63,3 @@ from the newly composed fullscreen frame before the next click is handled.
 - Clicking output, composer, or blank rows does nothing.
 - Rewrapping after resize preserves expansion identities.
 - Inline mode remains collapsed and does not capture click events.
-
