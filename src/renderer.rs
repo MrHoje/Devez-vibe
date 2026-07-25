@@ -371,6 +371,7 @@ enum Tone {
     ModelTerra,
     ModelLuna,
     Model55,
+    Border,
     Branch,
     LimitFiveHour,
     LimitWeekly,
@@ -471,9 +472,9 @@ fn welcome_lines(welcome: WelcomeView, width: u16) -> Vec<PaintLine> {
     let mut lines = Vec::new();
     lines.push(PaintLine {
         prefix: String::new(),
-        prefix_tone: Tone::Accent,
+        prefix_tone: Tone::Border,
         text: format!("╭{}╮", "─".repeat(inner_width)),
-        tone: Tone::Accent,
+        tone: Tone::Border,
         bold: false,
         tail: Vec::new(),
     });
@@ -484,7 +485,7 @@ fn welcome_lines(welcome: WelcomeView, width: u16) -> Vec<PaintLine> {
         true,
     ));
     lines.push(panel_line(
-        "     Codex, with a calmer terminal",
+        "     Devez with Codex",
         panel_width,
         Tone::Muted,
         false,
@@ -520,9 +521,9 @@ fn welcome_lines(welcome: WelcomeView, width: u16) -> Vec<PaintLine> {
     ));
     lines.push(PaintLine {
         prefix: String::new(),
-        prefix_tone: Tone::Muted,
+        prefix_tone: Tone::Border,
         text: format!("╰{}╯", "─".repeat(inner_width)),
-        tone: Tone::Muted,
+        tone: Tone::Border,
         bold: false,
         tail: Vec::new(),
     });
@@ -533,12 +534,16 @@ fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine
     let panel_width = (width as usize).clamp(34, 76);
     let inner_width = panel_width.saturating_sub(2);
     let mut lines = vec![PaintLine {
-        prefix: String::new(),
-        prefix_tone: Tone::Muted,
-        text: format!("╭─ Commands {}", "─".repeat(inner_width.saturating_sub(11))),
+        prefix: "╭─ ".to_owned(),
+        prefix_tone: Tone::Border,
+        text: "Commands ".to_owned(),
         tone: Tone::Muted,
         bold: false,
-        tail: Vec::new(),
+        tail: vec![PaintSpan {
+            text: "─".repeat(inner_width.saturating_sub(11)),
+            tone: Tone::Border,
+            bold: false,
+        }],
     }];
     for suggestion in suggestions.iter().take(6) {
         let marker = if suggestion.selected { "❯" } else { " " };
@@ -559,9 +564,9 @@ fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine
     }
     lines.push(PaintLine {
         prefix: String::new(),
-        prefix_tone: Tone::Muted,
+        prefix_tone: Tone::Border,
         text: format!("╰{}╯", "─".repeat(inner_width)),
-        tone: Tone::Muted,
+        tone: Tone::Border,
         bold: false,
         tail: Vec::new(),
     });
@@ -573,12 +578,16 @@ fn panel_line(text: &str, width: usize, tone: Tone, bold: bool) -> PaintLine {
     let content = compact_text(text, inner_width);
     let padding = inner_width.saturating_sub(UnicodeWidthStr::width(content.as_str()));
     PaintLine {
-        prefix: String::new(),
-        prefix_tone: Tone::Muted,
-        text: format!("│{content}{}│", " ".repeat(padding)),
+        prefix: "│".to_owned(),
+        prefix_tone: Tone::Border,
+        text: format!("{content}{}", " ".repeat(padding)),
         tone,
         bold,
-        tail: Vec::new(),
+        tail: vec![PaintSpan {
+            text: "│".to_owned(),
+            tone: Tone::Border,
+            bold: false,
+        }],
     }
 }
 
@@ -652,20 +661,20 @@ fn overlay_frame(
         OverlayStyle::Panel => {
             let title_width = UnicodeWidthStr::width(overlay.title.as_str());
             lines.push(PaintLine {
-                prefix: String::new(),
-                prefix_tone: Tone::Accent,
-                text: format!(
-                    "╭─ {} {}",
-                    overlay.title,
-                    "─".repeat(
-                        (width as usize)
-                            .saturating_sub(title_width)
-                            .saturating_sub(5)
-                    )
-                ),
+                prefix: "╭─ ".to_owned(),
+                prefix_tone: Tone::Border,
+                text: format!("{} ", overlay.title),
                 tone: Tone::Accent,
                 bold: true,
-                tail: Vec::new(),
+                tail: vec![PaintSpan {
+                    text: "─".repeat(
+                        (width as usize)
+                            .saturating_sub(title_width)
+                            .saturating_sub(5),
+                    ),
+                    tone: Tone::Border,
+                    bold: false,
+                }],
             });
             for row in overlay.lines {
                 for (part_index, part) in row.text.lines().enumerate() {
@@ -676,11 +685,7 @@ fn overlay_frame(
                     };
                     lines.extend(wrapped_line(
                         prefix,
-                        if row.selected {
-                            Tone::Accent
-                        } else {
-                            Tone::Muted
-                        },
+                        Tone::Border,
                         part,
                         if row.muted { Tone::Muted } else { Tone::Plain },
                         row.selected && part_index == 0,
@@ -690,7 +695,7 @@ fn overlay_frame(
             }
             lines.push(PaintLine {
                 prefix: "╰─ ".to_owned(),
-                prefix_tone: Tone::Muted,
+                prefix_tone: Tone::Border,
                 text: overlay.hint,
                 tone: Tone::Muted,
                 bold: false,
@@ -819,7 +824,7 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
     });
     PaintLine {
         prefix: String::new(),
-        prefix_tone: Tone::Muted,
+        prefix_tone: Tone::Border,
         text: first.text,
         tone: first.tone,
         bold: first.bold,
@@ -1161,7 +1166,7 @@ fn input_lines(
                 )
             },
         ),
-        tone: Tone::Muted,
+        tone: Tone::Border,
         bold: false,
         tail: Vec::new(),
     });
@@ -1195,9 +1200,9 @@ fn input_lines(
     }
     rows.push(PaintLine {
         prefix: String::new(),
-        prefix_tone: Tone::Muted,
+        prefix_tone: Tone::Border,
         text: "─".repeat(panel_width),
-        tone: Tone::Muted,
+        tone: Tone::Border,
         bold: false,
         tail: Vec::new(),
     });
@@ -1396,14 +1401,14 @@ fn set_tone(out: &mut Stdout, tone: Tone) -> Result<()> {
             b: 233,
         },
         Tone::ModelSol => Color::Rgb {
-            r: 245,
-            g: 158,
-            b: 11,
-        },
-        Tone::ModelTerra => Color::Rgb {
             r: 248,
             g: 113,
             b: 113,
+        },
+        Tone::ModelTerra => Color::Rgb {
+            r: 245,
+            g: 158,
+            b: 11,
         },
         Tone::ModelLuna => Color::Rgb {
             r: 167,
@@ -1414,6 +1419,11 @@ fn set_tone(out: &mut Stdout, tone: Tone) -> Result<()> {
             r: 96,
             g: 165,
             b: 250,
+        },
+        Tone::Border => Color::Rgb {
+            r: 255,
+            g: 255,
+            b: 255,
         },
         Tone::Branch => Color::Rgb {
             r: 147,
@@ -1620,5 +1630,28 @@ mod tests {
             }
         }
         assert!(model_tone("GPT-5.4").is_none());
+    }
+
+    #[test]
+    fn panel_borders_use_the_single_white_border_tone() {
+        let lines = welcome_lines(
+            WelcomeView {
+                model: "GPT-5.6-Sol".to_owned(),
+                effort: "high".to_owned(),
+                cwd: "C:\\work".to_owned(),
+                account: "ChatGPT".to_owned(),
+            },
+            80,
+        );
+
+        assert!(lines.first().is_some_and(|line| line.tone == Tone::Border));
+        assert!(lines.last().is_some_and(|line| line.tone == Tone::Border));
+        assert!(lines[1].prefix_tone == Tone::Border);
+        assert!(
+            lines[1]
+                .tail
+                .first()
+                .is_some_and(|span| span.tone == Tone::Border)
+        );
     }
 }

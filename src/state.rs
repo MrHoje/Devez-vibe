@@ -80,6 +80,7 @@ pub struct ModelInfo {
     pub efforts: Vec<EffortInfo>,
     pub default_effort: String,
     pub is_default: bool,
+    pub context_window: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -109,6 +110,7 @@ impl ModelInfo {
                 .get("isDefault")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            context_window: value.get("contextWindow").and_then(Value::as_u64),
         })
     }
 
@@ -502,6 +504,9 @@ impl AppState {
             .unwrap_or_else(|| "high".to_owned());
         let branch = read_git_branch(&cwd);
         let (five_hour_percent, weekly_percent) = read_codex_usage();
+        let context_window = models
+            .get(selected_model)
+            .and_then(|model| model.context_window);
 
         Self {
             editor: Editor::default(),
@@ -518,7 +523,7 @@ impl AppState {
             active: HashMap::new(),
             pending: None,
             total_tokens: 0,
-            context_window: None,
+            context_window,
             transient_status: None,
             show_welcome: true,
             command_selection: 0,
@@ -575,6 +580,7 @@ impl AppState {
         {
             self.selected_model = index;
         }
+        self.context_window = self.selected_model().and_then(|model| model.context_window);
         self.selected_effort = self
             .selected_model()
             .map(|model| {
@@ -1083,7 +1089,10 @@ impl AppState {
                         .and_then(|total| total.get("totalTokens"))
                         .and_then(Value::as_u64)
                         .unwrap_or(self.total_tokens);
-                    self.context_window = usage.get("modelContextWindow").and_then(Value::as_u64);
+                    self.context_window = usage
+                        .get("modelContextWindow")
+                        .and_then(Value::as_u64)
+                        .or(self.context_window);
                 }
             }
             "error" => {
@@ -1750,8 +1759,10 @@ impl AppState {
             .unwrap_or(&model.default_effort)
             .to_owned();
         let model_name = model.display_name.clone();
+        let context_window = model.context_window;
         self.selected_model = index;
         self.selected_effort = selected_effort.clone();
+        self.context_window = context_window.or(self.context_window);
         self.committed.push(Block::new(
             BlockKind::Success,
             "Model 변경",
@@ -2276,11 +2287,7 @@ fn compact_command(command: &str, max_chars: usize) -> String {
 }
 
 fn format_token_count(tokens: u64) -> String {
-    if tokens >= 1_000 {
-        format!("{}k", tokens.saturating_add(500) / 1_000)
-    } else {
-        tokens.to_string()
-    }
+    format!("{}k", tokens.saturating_add(500) / 1_000)
 }
 
 fn read_git_branch(cwd: &str) -> Option<String> {
@@ -2337,6 +2344,43 @@ fn read_codex_usage() -> (Option<u8>, Option<u8>) {
     parse_codex_usage(&root)
 }
 
+pub fn load_model_context_windows(models: &mut [ModelInfo]) {
+    let Some(root) = codex_home()
+        .and_then(|home| fs::read_to_string(home.join("models_cache.json")).ok())
+        .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+    else {
+        return;
+    };
+    apply_model_context_cache(models, &root);
+}
+
+fn apply_model_context_cache(models: &mut [ModelInfo], root: &Value) {
+    let Some(cached_models) = root.get("models").and_then(Value::as_array) else {
+        return;
+    };
+    for model in models
+        .iter_mut()
+        .filter(|model| model.context_window.is_none())
+    {
+        let Some(cached) = cached_models.iter().find(|cached| {
+            cached
+                .get("slug")
+                .and_then(Value::as_str)
+                .is_some_and(|slug| slug == model.id || slug == model.model)
+        }) else {
+            continue;
+        };
+        let Some(raw_window) = cached.get("context_window").and_then(Value::as_u64) else {
+            continue;
+        };
+        let effective_percent = cached
+            .get("effective_context_window_percent")
+            .and_then(Value::as_u64)
+            .unwrap_or(100);
+        model.context_window = Some(raw_window.saturating_mul(effective_percent) / 100);
+    }
+}
+
 fn parse_codex_usage(root: &Value) -> (Option<u8>, Option<u8>) {
     (
         usage_percent(root, "five_hour"),
@@ -2352,12 +2396,15 @@ fn usage_percent(root: &Value, key: &str) -> Option<u8> {
 }
 
 fn read_fast_mode() -> bool {
-    let codex_home = env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".codex")));
-    codex_home
+    codex_home()
         .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
         .is_some_and(|config| parse_fast_mode(&config))
+}
+
+fn codex_home() -> Option<PathBuf> {
+    env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".codex")))
 }
 
 fn parse_fast_mode(config: &str) -> bool {
@@ -2392,6 +2439,7 @@ mod tests {
                 .collect(),
             default_effort: "high".to_owned(),
             is_default,
+            context_window: None,
         }
     }
 
@@ -2436,6 +2484,7 @@ mod tests {
             ],
             default_effort: "high".to_owned(),
             is_default: true,
+            context_window: None,
         };
         let mut state = AppState::new(
             "thread".to_owned(),
@@ -2552,6 +2601,35 @@ mod tests {
         assert_eq!(
             parse_git_branch("ref: refs/heads/feature/status-line\n"),
             Some("feature/status-line".to_owned())
+        );
+    }
+
+    #[test]
+    fn model_cache_seeds_effective_context_before_the_first_turn() {
+        let mut models = vec![test_model("gpt-5.6-sol", "GPT-5.6-Sol", true)];
+        apply_model_context_cache(
+            &mut models,
+            &json!({
+                "models": [{
+                    "slug": "gpt-5.6-sol",
+                    "context_window": 272_000,
+                    "effective_context_window_percent": 95
+                }]
+            }),
+        );
+        assert_eq!(models[0].context_window, Some(258_400));
+
+        let state = AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            models,
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+        assert_eq!(
+            state.view().status_line.and_then(|status| status.context),
+            Some("ctx: 0k/258k (0%)".to_owned())
         );
     }
 }

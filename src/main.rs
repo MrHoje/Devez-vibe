@@ -17,7 +17,10 @@ use editor::Editor;
 use futures_util::StreamExt;
 use renderer::{BlockKind, Renderer, TerminalSession, View};
 use serde_json::{Value, json};
-use state::{Action, AppState, ModelInfo, SessionInfo, SessionPicker, SessionPickerResult};
+use state::{
+    Action, AppState, ModelInfo, SessionInfo, SessionPicker, SessionPickerResult,
+    load_model_context_windows,
+};
 use tokio::time::MissedTickBehavior;
 
 #[derive(Parser)]
@@ -149,6 +152,7 @@ async fn run(cli: &Cli, server: &mut AppServer) -> Result<()> {
 
     let terminal = TerminalSession::enter()?;
     let mut renderer = Renderer::new();
+    renderer.clear_screen()?;
     let ui_result = event_loop(server, &mut state, &mut renderer).await;
     let _ = renderer.finish();
     drop(terminal);
@@ -183,6 +187,7 @@ async fn resolve_startup_session(
 async fn choose_startup_session(sessions: Vec<SessionInfo>, cwd: &Path) -> Result<Option<String>> {
     let terminal = TerminalSession::enter()?;
     let mut renderer = Renderer::new();
+    renderer.clear_screen()?;
     let mut picker = SessionPicker::new(sessions, cwd.to_string_lossy().into_owned(), None);
     let editor = Editor::default();
     let mut events = EventStream::new();
@@ -606,13 +611,15 @@ fn path_matches(value: &str, path: &Path) -> bool {
 }
 
 fn parse_models(response: &Value) -> Vec<ModelInfo> {
-    response
+    let mut models = response
         .get("data")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(ModelInfo::from_value)
-        .collect()
+        .collect::<Vec<_>>();
+    load_model_context_windows(&mut models);
+    models
 }
 
 fn choose_model<'a>(models: &'a [ModelInfo], requested: Option<&str>) -> Result<&'a ModelInfo> {
