@@ -2,6 +2,7 @@ mod app_server;
 mod editor;
 mod pricing;
 mod renderer;
+mod rollout;
 mod state;
 mod theme;
 mod update;
