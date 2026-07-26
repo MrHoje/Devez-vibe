@@ -1943,6 +1943,9 @@ impl SessionPicker {
     /// visible window, so it is resolved against the same window the rows were
     /// painted from; one click resumes, exactly as Enter on that row would.
     pub fn click_row(&mut self, row: usize) -> SessionPickerResult {
+        if row >= RESUME_PICKER_ROWS {
+            return SessionPickerResult::None;
+        }
         let filtered = self.filtered();
         let start = visible_window(Some(self.selected), filtered.len(), RESUME_PICKER_ROWS).start;
         let Some(session) = filtered.get(start + row) else {
