@@ -357,6 +357,23 @@ fn replace_history_block(history: &mut Vec<Block>, incoming: Block) -> bool {
     true
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewportRelation {
+    Before,
+    Overlapping,
+    After,
+}
+
+fn viewport_relation(changed: Range<usize>, viewport: Range<usize>) -> ViewportRelation {
+    if changed.end <= viewport.start {
+        ViewportRelation::Before
+    } else if changed.start >= viewport.end {
+        ViewportRelation::After
+    } else {
+        ViewportRelation::Overlapping
+    }
+}
+
 impl Renderer {
     pub fn new(selected_theme: ThemeKind, mode: RenderMode) -> Self {
         theme::set_current(selected_theme);
@@ -762,34 +779,9 @@ impl Renderer {
         width: u16,
         height: u16,
     ) -> Result<()> {
-        let before = self.wrapped.len();
-        let replaced = committed
-            .iter()
-            .cloned()
-            .fold(false, |replaced, block| {
-                replace_history_block(&mut self.history, block) || replaced
-            });
-        if self.wrapped_width == width && !replaced {
-            for block in committed {
-                self.wrapped.extend(block_group_lines(
-                    block,
-                    width,
-                    self.shell_display_mode,
-                    self.expanded_tools.contains(&block.id()),
-                ));
-            }
-        } else {
-            self.rewrap(width);
-        }
-        let row_delta = self.wrapped.len() as isize - before as isize;
-        // Someone who scrolled up is reading; holding their distance from the
-        // bottom would drag the text out from under them as output lands. The
-        // distance grows with the new rows instead, so the page stays still.
-        if self.scroll_back > 0 {
-            self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
-        }
-
         let rows = height as usize;
+        let old_view_rows = split_rows(rows, frame.lines.len(), self.wrapped.len()).0;
+        self.commit_fullscreen_blocks(committed, width, old_view_rows);
         let (view_rows, live_rows) = split_rows(rows, frame.lines.len(), self.wrapped.len());
         // Padding the live frame is what puts the composer on the bottom row
         // *without* dragging the welcome card and the live blocks down with it:
@@ -813,6 +805,75 @@ impl Renderer {
         self.last_height = height;
         self.out.flush()?;
         Ok(())
+    }
+
+    fn commit_fullscreen_blocks(&mut self, committed: &[Block], width: u16, view_rows: usize) {
+        if self.wrapped_width != width {
+            for block in committed.iter().cloned() {
+                replace_history_block(&mut self.history, block);
+            }
+            self.rewrap(width);
+            return;
+        }
+
+        for block in committed {
+            let before = self.wrapped.len();
+            let replacement = self
+                .history
+                .iter()
+                .position(|existing| existing.id() == block.id())
+                .map(|index| {
+                    let changed_start = self.history[..index]
+                        .iter()
+                        .flat_map(|existing| {
+                            block_group_lines(
+                                existing,
+                                width,
+                                self.shell_display_mode,
+                                self.expanded_tools.contains(&existing.id()),
+                            )
+                        })
+                        .count();
+                    let changed_end = changed_start
+                        + block_group_lines(
+                            &self.history[index],
+                            width,
+                            self.shell_display_mode,
+                            self.expanded_tools.contains(&block.id()),
+                        )
+                        .len();
+                    changed_start..changed_end
+                });
+            replace_history_block(&mut self.history, block.clone());
+
+            if let Some(changed) = replacement {
+                let viewport_start = before
+                    .saturating_sub(view_rows)
+                    .saturating_sub(self.scroll_back);
+                let viewport_end = (viewport_start + view_rows).min(before);
+                let relation = viewport_relation(changed, viewport_start..viewport_end);
+                self.rewrap(width);
+                // Before: rewrap moves the viewport start with the content.
+                // Overlap: keep downstream visible content pinned. Only a
+                // replacement wholly after the viewport changes its distance
+                // from the bottom.
+                if self.scroll_back > 0 && relation == ViewportRelation::After {
+                    let row_delta = self.wrapped.len() as isize - before as isize;
+                    self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
+                }
+            } else {
+                self.wrapped.extend(block_group_lines(
+                    block,
+                    width,
+                    self.shell_display_mode,
+                    self.expanded_tools.contains(&block.id()),
+                ));
+                if self.scroll_back > 0 {
+                    let row_delta = self.wrapped.len() as isize - before as isize;
+                    self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
+                }
+            }
+        }
     }
 
     fn rewrap(&mut self, width: u16) {
@@ -6699,6 +6760,123 @@ mod tests {
         assert_eq!(history.len(), 3);
         assert_eq!(history[1].title, "Shell · 1 command · completed");
         assert_eq!(history[2].title, "After");
+    }
+
+    fn expanding_shell_replacement() -> (Block, Block) {
+        let anchor = Block::new(BlockKind::Tool, "Running 1 shell command", "");
+        let child = Block::new(
+            BlockKind::Tool,
+            "Shell · cargo test · exit 0",
+            "output one\noutput two\noutput three",
+        );
+        let mut completed = Block::shell_group(
+            BlockKind::Tool,
+            "Shell · 1 command · completed",
+            vec![child],
+        );
+        completed.adopt_id(&anchor);
+        (anchor, completed)
+    }
+
+    fn transcript_view(renderer: &Renderer, view_rows: usize) -> Vec<String> {
+        let start = renderer
+            .wrapped
+            .len()
+            .saturating_sub(view_rows)
+            .saturating_sub(renderer.scroll_back);
+        renderer.wrapped[start..start + view_rows]
+            .iter()
+            .map(painted)
+            .collect()
+    }
+
+    fn transcript_rows(count: usize, prefix: &str) -> Vec<Block> {
+        (0..count)
+            .map(|index| Block::new(BlockKind::Assistant, "Codex", format!("{prefix}{index}")))
+            .collect()
+    }
+
+    #[test]
+    fn fullscreen_replacement_before_the_viewport_keeps_the_same_content_visible() {
+        let (anchor, completed) = expanding_shell_replacement();
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.shell_display_mode = ShellDisplayMode::Expand;
+        renderer.history = std::iter::once(anchor)
+            .chain(transcript_rows(12, "after"))
+            .collect();
+        renderer.rewrap(80);
+        let view_rows = 4;
+        let desired_start = 4;
+        renderer.scroll_back = renderer.wrapped.len() - view_rows - desired_start;
+        let before = transcript_view(&renderer, view_rows);
+        let scroll_back = renderer.scroll_back;
+
+        renderer.commit_fullscreen_blocks(&[completed], 80, view_rows);
+
+        assert_eq!(renderer.scroll_back, scroll_back);
+        assert_eq!(transcript_view(&renderer, view_rows), before);
+    }
+
+    #[test]
+    fn fullscreen_replacement_after_the_viewport_adjusts_to_keep_its_content_visible() {
+        let (anchor, completed) = expanding_shell_replacement();
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.shell_display_mode = ShellDisplayMode::Expand;
+        renderer.history = transcript_rows(12, "before")
+            .into_iter()
+            .chain(std::iter::once(anchor))
+            .collect();
+        renderer.rewrap(80);
+        let view_rows = 4;
+        renderer.scroll_back = renderer.wrapped.len() - view_rows;
+        let before = transcript_view(&renderer, view_rows);
+        let scroll_back = renderer.scroll_back;
+
+        renderer.commit_fullscreen_blocks(&[completed], 80, view_rows);
+
+        assert!(renderer.scroll_back > scroll_back);
+        assert_eq!(transcript_view(&renderer, view_rows), before);
+    }
+
+    #[test]
+    fn fullscreen_replacement_overlapping_the_viewport_keeps_downstream_content_stable() {
+        let (anchor, completed) = expanding_shell_replacement();
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.shell_display_mode = ShellDisplayMode::Expand;
+        renderer.history = transcript_rows(4, "before")
+            .into_iter()
+            .chain(std::iter::once(anchor))
+            .chain(transcript_rows(4, "after"))
+            .collect();
+        renderer.rewrap(80);
+        let view_rows = 4;
+        let anchor_start = renderer
+            .history
+            .iter()
+            .take(4)
+            .flat_map(|block| {
+                block_group_lines(
+                    block,
+                    80,
+                    renderer.shell_display_mode,
+                    renderer.expanded_tools.contains(&block.id()),
+                )
+            })
+            .count();
+        renderer.scroll_back = renderer.wrapped.len() - view_rows - anchor_start;
+        let downstream = transcript_view(&renderer, view_rows)
+            .last()
+            .cloned()
+            .expect("visible downstream row");
+        let scroll_back = renderer.scroll_back;
+
+        renderer.commit_fullscreen_blocks(&[completed], 80, view_rows);
+
+        assert_eq!(renderer.scroll_back, scroll_back);
+        assert_eq!(
+            transcript_view(&renderer, view_rows).last(),
+            Some(&downstream)
+        );
     }
 
     #[test]
