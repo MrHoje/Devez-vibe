@@ -2,12 +2,12 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-test("workflow checks pull requests and weekly upstream changes", () => {
+test("workflow only runs when manually dispatched", () => {
   const workflow = readFileSync(".github/workflows/codex-compatibility.yml", "utf8");
 
-  assert.match(workflow, /pull_request:/);
-  assert.match(workflow, /cron: '0 9 \* \* 1'/);
   assert.match(workflow, /workflow_dispatch:/);
+  assert.doesNotMatch(workflow, /pull_request:/);
+  assert.doesNotMatch(workflow, /schedule:/);
   assert.match(workflow, /if: always\(\)/);
   assert.match(workflow, /retention-days: 30/);
 });

@@ -1,9 +1,6 @@
 name: Codex CLI compatibility
 
 on:
-  pull_request:
-  schedule:
-    - cron: '0 9 * * 1'
   workflow_dispatch:
     inputs:
       mode:
@@ -24,10 +21,10 @@ jobs:
         with:
           node-version: 22
       - name: Check approved baseline
-        if: github.event_name == 'pull_request' || inputs.mode == 'baseline'
+        if: inputs.mode == 'baseline'
         run: node scripts/check-codex-compatibility.mjs --mode baseline
       - name: Check latest Codex CLI
-        if: github.event_name == 'schedule' || inputs.mode == 'latest'
+        if: inputs.mode == 'latest'
         run: node scripts/check-codex-compatibility.mjs --mode latest
       - name: Upload compatibility artifacts
         if: always()

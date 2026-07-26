@@ -16,8 +16,8 @@ node scripts/check-codex-compatibility.mjs --mode baseline --update-baseline
 ```
 
 결과는 `artifacts/codex-compatibility/compatibility-report.md`에, 변경된 스키마는
-`schema.ts`와 `schema.diff`에 남습니다. GitHub Actions는 PR에서 기준 검사를 하고,
-매주 월요일에는 최신 Codex CLI를 검사합니다.
+`schema.ts`와 `schema.diff`에 남습니다. GitHub Actions 화면에서 **Codex CLI
+compatibility**를 열고 **Run workflow**를 눌러 원하는 검사 모드를 선택해 실행합니다.
 
 ## 변경이 발견됐을 때
 
