@@ -12,7 +12,10 @@
 
 use std::{
     env, fs,
+    fs::OpenOptions,
+    io::Write,
     path::PathBuf,
+    process,
     sync::{Mutex, PoisonError},
 };
 
@@ -32,6 +35,7 @@ static REPORTER: Mutex<Option<Reporter>> = Mutex::new(None);
 struct Reporter {
     base: PathBuf,
     room: String,
+    owner_token: String,
     /// Mirrors of what is already on disk. A turn ticks several times a second
     /// and almost none of those ticks change anything, so the files are only
     /// rewritten when a value actually moves.
@@ -43,6 +47,9 @@ struct Reporter {
 /// Binds this process to its DevezCode room, if it has one. Call once at
 /// startup: the room is fixed for the life of the process.
 pub fn init() {
+    if !tracking_agent_matches(env::var("DEVEZCODE_TRACKING_AGENT").ok().as_deref()) {
+        return;
+    }
     let Some(room) = env::var("DEVEZCODE_ROOM_ID")
         .ok()
         .map(|room| sanitize(&room))
@@ -50,17 +57,20 @@ pub fn init() {
     else {
         return;
     };
-    let Some(base) = env::var_os("APPDATA").map(|app_data| {
-        PathBuf::from(app_data)
-            .join("DevezCode")
-            .join("devezcli")
-    }) else {
+    let Some(base) = env::var_os("APPDATA")
+        .map(|app_data| PathBuf::from(app_data).join("DevezCode").join("devezcli"))
+    else {
         return;
     };
+    let owner_token = process::id().to_string();
+    if !try_claim_owner(&base, &room, &owner_token) {
+        return;
+    }
 
     let reporter = Reporter {
         base,
         room,
+        owner_token,
         session: String::new(),
         busy: false,
         waiting: false,
@@ -69,9 +79,8 @@ pub fn init() {
     // spinner would spin from the first frame of this one.
     reporter.write("busy", IDLE);
     reporter.write("waiting", READY);
-    if let Ok(mut slot) = REPORTER.lock() {
-        *slot = Some(reporter);
-    }
+    let mut slot = REPORTER.lock().unwrap_or_else(PoisonError::into_inner);
+    *slot = Some(reporter);
 }
 
 /// Publishes the session state DevezCode paints around the terminal. Called
@@ -106,12 +115,14 @@ pub fn note_prompt(text: &str) {
 /// Clears the transient state on the way out, so a closed session does not sit
 /// there spinning in the host.
 pub fn finish() {
-    with(|reporter| {
+    let mut slot = REPORTER.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(mut reporter) = slot.take() {
         reporter.busy = false;
         reporter.waiting = false;
         reporter.write("busy", IDLE);
         reporter.write("waiting", READY);
-    });
+        release_owner(&reporter.base, &reporter.room, &reporter.owner_token);
+    }
 }
 
 fn with(action: impl FnOnce(&mut Reporter)) {
@@ -125,6 +136,9 @@ fn with(action: impl FnOnce(&mut Reporter)) {
 
 impl Reporter {
     fn write(&self, kind: &str, value: &str) {
+        if !owns_room(&self.base, &self.room, &self.owner_token) {
+            return;
+        }
         let dir = self.base.join(kind);
         if fs::create_dir_all(&dir).is_err() {
             return;
@@ -166,6 +180,7 @@ fn summarize(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn room_ids_lose_path_characters() {
@@ -184,5 +199,73 @@ mod tests {
     fn summary_cuts_on_character_boundaries() {
         let long = "가".repeat(SUMMARY_CHARS + 50);
         assert_eq!(summarize(&long).chars().count(), SUMMARY_CHARS);
+    }
+
+    #[test]
+    fn tracking_agent_must_be_devezcli() {
+        assert!(tracking_agent_matches(Some("devezcli")));
+        assert!(tracking_agent_matches(Some("DevezCLI")));
+        assert!(!tracking_agent_matches(Some("claude")));
+        assert!(!tracking_agent_matches(None));
+    }
+
+    #[test]
+    fn first_process_owns_the_room_until_it_releases() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = env::temp_dir().join(format!("devezcli-owner-{}-{nonce}", std::process::id()));
+        let room = "room-test";
+
+        assert!(try_claim_owner(&base, room, "root"));
+        assert!(!try_claim_owner(&base, room, "nested"));
+        assert!(owns_room(&base, room, "root"));
+        assert!(!owns_room(&base, room, "nested"));
+
+        release_owner(&base, room, "nested");
+        assert!(owns_room(&base, room, "root"));
+        release_owner(&base, room, "root");
+        assert!(try_claim_owner(&base, room, "next-root"));
+
+        let _ = fs::remove_dir_all(base);
+    }
+}
+
+fn tracking_agent_matches(agent: Option<&str>) -> bool {
+    agent.is_some_and(|value| value.eq_ignore_ascii_case("devezcli"))
+}
+
+fn owner_path(base: &std::path::Path, room: &str) -> PathBuf {
+    base.join("owners").join(format!("{room}.txt"))
+}
+
+fn try_claim_owner(base: &std::path::Path, room: &str, token: &str) -> bool {
+    let path = owner_path(base, room);
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    if fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let Ok(mut file) = OpenOptions::new().write(true).create_new(true).open(&path) else {
+        return false;
+    };
+    if file.write_all(token.as_bytes()).is_ok() {
+        true
+    } else {
+        drop(file);
+        let _ = fs::remove_file(path);
+        false
+    }
+}
+
+fn owns_room(base: &std::path::Path, room: &str, token: &str) -> bool {
+    fs::read_to_string(owner_path(base, room)).is_ok_and(|owner| owner.trim() == token)
+}
+
+fn release_owner(base: &std::path::Path, room: &str, token: &str) {
+    if owns_room(base, room, token) {
+        let _ = fs::remove_file(owner_path(base, room));
     }
 }
