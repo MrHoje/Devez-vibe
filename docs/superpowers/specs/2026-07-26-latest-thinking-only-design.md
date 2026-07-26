@@ -1,9 +1,11 @@
-# Latest Thinking Only Design
+# Compact Thinking and Shell Display Design
 
 ## Goal
 
 Prevent repeated reasoning updates from filling the transcript by keeping only
-the latest `Thinking…` block in each uninterrupted reasoning run.
+the latest `Thinking…` block in each uninterrupted reasoning run. Keep Shell
+headings compact by using the same count-and-status summary for both single and
+multi-command executions.
 
 ## Behavior
 
@@ -16,6 +18,19 @@ the latest `Thinking…` block in each uninterrupted reasoning run.
 - An empty latest reasoning block still renders the existing `Thinking…` label.
 - `Plan` blocks remain unchanged even though they also use `BlockKind::Reasoning`
   in some protocol paths; only the exact `Thinking…` title participates.
+
+## Shell Summary
+
+- One successful command renders
+  `▸ Shell · 1 command · all passed · <duration>`.
+- Multiple successful commands render
+  `▸ Shell · N commands · all passed · <duration>`.
+- Any failures render
+  `▸ Shell · N commands · M failed · <duration>` with warning styling.
+- Unknown results use `completed`; missing duration is omitted.
+- The collapsed heading never exposes the executable path or command text.
+- Expanding the heading shows the actual command and its output, including for
+  a one-command group.
 
 ## Architecture
 
@@ -32,6 +47,10 @@ Use the helper at both transcript entry points:
 The renderer remains responsible only for painting one reasoning block as its
 existing dim italic paragraph. It does not infer history relationships.
 
+Shell result construction always creates a Shell group, including when it has
+one child. The existing group renderer then supplies the common summary heading
+and reveals child command details only while expanded.
+
 ## Edge Cases
 
 - Identical and different consecutive summaries both keep only the latest.
@@ -39,6 +58,8 @@ existing dim italic paragraph. It does not infer history relationships.
 - Reasoning updates from different turns never replace each other.
 - Active streaming deltas remain one active block and need no extra merging.
 - Non-`Thinking…` reasoning blocks are preserved.
+- A single live or resumed command uses singular `command`.
+- Single-command failures use `1 command · 1 failed`.
 
 ## Tests
 
@@ -48,3 +69,7 @@ existing dim italic paragraph. It does not infer history relationships.
 - Resumed rollout reasoning blocks follow the same rule.
 - Plan and other reasoning-titled blocks are not collapsed.
 - Empty latest Thinking renders the existing label.
+- Single live and resumed Shell results hide their command path when collapsed.
+- Expanding a single Shell summary reveals the original command and output.
+- Singular/plural, success, failure, unknown status, and missing duration
+  summaries render correctly.
