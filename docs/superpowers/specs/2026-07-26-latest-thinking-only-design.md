@@ -21,16 +21,20 @@ multi-command executions.
 
 ## Shell Summary
 
-- One successful command renders
-  `▸ Shell · 1 command · all passed · <duration>`.
-- Multiple successful commands render
-  `▸ Shell · N commands · all passed · <duration>`.
+- One successful or status-unknown command renders
+  `▸ Shell · 1 command · completed · <duration>`.
+- Multiple successful or status-unknown commands render
+  `▸ Shell · N commands · completed · <duration>`.
 - Any failures render
   `▸ Shell · N commands · M failed · <duration>` with warning styling.
-- Unknown results use `completed`; missing duration is omitted.
+- Successful and unknown results use the same `completed` label; missing
+  duration is omitted.
 - The collapsed heading never exposes the executable path or command text.
+- The collapsed heading always occupies one physical terminal row. When it is
+  wider than the available cells, the renderer truncates it with an ellipsis
+  instead of wrapping.
 - Expanding the heading shows the actual command and its output, including for
-  a one-command group.
+  a one-command group; expanded details may use multiple rows.
 
 ## Architecture
 
@@ -70,6 +74,7 @@ and reveals child command details only while expanded.
 - Plan and other reasoning-titled blocks are not collapsed.
 - Empty latest Thinking renders the existing label.
 - Single live and resumed Shell results hide their command path when collapsed.
+- Long collapsed Shell summaries remain one physical row.
 - Expanding a single Shell summary reveals the original command and output.
 - Singular/plural, success, failure, unknown status, and missing duration
   summaries render correctly.
