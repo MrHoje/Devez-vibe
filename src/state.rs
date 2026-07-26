@@ -2208,6 +2208,9 @@ pub struct AppState {
     composer_images: Vec<String>,
     pub thread_id: String,
     pub turn_id: Option<String>,
+    /// Set when the user interrupts after `turn/start` answers but before the
+    /// app-server has announced that the turn is active.
+    pending_interrupt: bool,
     pub busy: bool,
     pub cwd: String,
     account: String,
@@ -2306,6 +2309,7 @@ impl AppState {
             composer_images: Vec::new(),
             thread_id,
             turn_id: None,
+            pending_interrupt: false,
             busy: false,
             cwd,
             account,
@@ -2449,6 +2453,7 @@ impl AppState {
     pub fn cancel_queued_prompt(&mut self) {
         self.busy = false;
         self.turn_id = None;
+        self.pending_interrupt = false;
         self.turn_started_at = None;
         self.push_notice(
             BlockKind::Warning,
@@ -2887,6 +2892,7 @@ impl AppState {
         }
         self.branch = read_git_branch(&self.cwd);
         self.turn_id = None;
+        self.pending_interrupt = false;
         self.busy = false;
         self.turn_started_at = None;
         self.active.clear();
@@ -2959,12 +2965,49 @@ impl AppState {
         self.turn_started_at.get_or_insert_with(Instant::now);
     }
 
+    /// Returns an interrupt the user requested while `turn/start` was still
+    /// becoming active. The turn id is only populated by `turn/started`, so
+    /// consuming this value cannot send an interrupt against a pending turn.
+    pub fn take_pending_interrupt(&mut self) -> Option<String> {
+        if self.pending_interrupt {
+            let turn_id = self.turn_id.clone()?;
+            self.pending_interrupt = false;
+            Some(turn_id)
+        } else {
+            None
+        }
+    }
+
     pub fn set_request_failed(&mut self, message: impl Into<String>) {
         self.busy = false;
         self.turn_id = None;
+        self.pending_interrupt = false;
         self.turn_started_at = None;
         self.committed
             .push(Block::new(BlockKind::Error, "요청 실패", message));
+    }
+
+    /// Interrupt an active turn immediately, or remember the request until the
+    /// app-server announces that a just-started turn is active.
+    fn request_interrupt(&mut self) -> Action {
+        // Before `thread/start` binds a session, the main-loop startup helper
+        // owns queued-prompt cancellation. Keep its established Ctrl+C/Esc
+        // path rather than treating that as a pending turn.
+        if self.thread_pending() {
+            return Action::Interrupt;
+        }
+        if self.turn_id.is_some() {
+            return Action::Interrupt;
+        }
+        if !self.pending_interrupt {
+            self.pending_interrupt = true;
+            self.push_notice(
+                BlockKind::Warning,
+                "중단 요청됨",
+                "turn이 시작되는 즉시 중단합니다.",
+            );
+        }
+        Action::Tick(true)
     }
 
     pub fn open_session_picker(&mut self, sessions: Vec<SessionInfo>) {
@@ -3071,6 +3114,7 @@ impl AppState {
         self.show_welcome = false;
         self.busy = false;
         self.turn_id = None;
+        self.pending_interrupt = false;
         self.turn_started_at = None;
         self.last_completed_duration = None;
     }
@@ -3347,7 +3391,7 @@ impl AppState {
             }
             KeyCode::Char('c') if ctrl => {
                 if self.busy {
-                    Action::Interrupt
+                    self.request_interrupt()
                 } else if self.editor.is_empty() && self.side_parent.is_some() {
                     Action::ReturnFromSide
                 } else if self.editor.is_empty() {
@@ -3404,7 +3448,7 @@ impl AppState {
                 Action::None
             }
             KeyCode::Enter => self.submit_editor(),
-            KeyCode::Esc if self.busy => Action::Interrupt,
+            KeyCode::Esc if self.busy => self.request_interrupt(),
             KeyCode::Backspace if ctrl => {
                 self.editor.delete_word_left();
                 self.command_selection = 0;
@@ -3729,6 +3773,7 @@ impl AppState {
             "turn/completed" => {
                 self.busy = false;
                 self.turn_id = None;
+                self.pending_interrupt = false;
                 self.last_completed_duration =
                     self.turn_started_at.map(|started| started.elapsed());
                 self.turn_started_at = None;
@@ -7290,6 +7335,35 @@ mod tests {
             "gpt-5.6-sol",
             Some("high"),
         )
+    }
+
+    #[test]
+    fn esc_while_turn_is_starting_defers_one_interrupt_until_started() {
+        let mut state = test_state();
+        state.busy = true;
+        state.turn_started_at = Some(Instant::now());
+
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::Tick(true)
+        ));
+        assert_eq!(state.take_pending_interrupt(), None);
+
+        state.set_turn_started("turn-1".to_owned());
+        assert_eq!(state.take_pending_interrupt().as_deref(), Some("turn-1"));
+        assert_eq!(state.take_pending_interrupt(), None);
+    }
+
+    #[test]
+    fn failed_start_clears_a_deferred_interrupt() {
+        let mut state = test_state();
+        state.busy = true;
+
+        state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        state.set_request_failed("start failed");
+        state.set_turn_started("next-turn".to_owned());
+
+        assert_eq!(state.take_pending_interrupt(), None);
     }
 
     #[test]

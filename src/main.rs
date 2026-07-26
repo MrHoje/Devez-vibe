@@ -682,10 +682,14 @@ async fn event_loop(
                 match server_event {
                     Some(ServerEvent::Notification { method, params }) => {
                         state.handle_notification(&method, &params);
+                        let interrupt_after_start = method == "turn/started"
+                            && state.take_pending_interrupt().is_some();
                         if state.take_account_refresh() {
                             refresh_account(server, state).await;
                         }
-                        if method == "skills/changed" {
+                        if interrupt_after_start {
+                            Action::Interrupt
+                        } else if method == "skills/changed" {
                             Action::RefreshSkills
                         } else {
                             Action::None
@@ -2535,15 +2539,9 @@ async fn start_turn(server: &AppServer, state: &mut AppState, text: String) {
         "permissions": state.permission_profile()
     });
     match server.request("turn/start", params).await {
-        Ok(response) => {
-            if let Some(turn_id) = response
-                .get("turn")
-                .and_then(|turn| turn.get("id"))
-                .and_then(Value::as_str)
-            {
-                state.set_turn_started(turn_id.to_owned());
-            }
-        }
+        // The response reserves an id, but the app-server makes it
+        // interruptible only after the subsequent `turn/started` notification.
+        Ok(_) => {}
         Err(error) => state.set_request_failed(error.to_string()),
     }
 }
