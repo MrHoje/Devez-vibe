@@ -345,6 +345,18 @@ pub(crate) enum SelectionResult {
     None,
 }
 
+fn replace_history_block(history: &mut Vec<Block>, incoming: Block) -> bool {
+    let Some(existing) = history
+        .iter_mut()
+        .find(|existing| existing.id() == incoming.id())
+    else {
+        history.push(incoming);
+        return false;
+    };
+    *existing = incoming;
+    true
+}
+
 impl Renderer {
     pub fn new(selected_theme: ThemeKind, mode: RenderMode) -> Self {
         theme::set_current(selected_theme);
@@ -750,9 +762,14 @@ impl Renderer {
         width: u16,
         height: u16,
     ) -> Result<()> {
-        self.history.extend(committed.iter().cloned());
-        let grew_by = if self.wrapped_width == width {
-            let before = self.wrapped.len();
+        let before = self.wrapped.len();
+        let replaced = committed
+            .iter()
+            .cloned()
+            .fold(false, |replaced, block| {
+                replace_history_block(&mut self.history, block) || replaced
+            });
+        if self.wrapped_width == width && !replaced {
             for block in committed {
                 self.wrapped.extend(block_group_lines(
                     block,
@@ -761,16 +778,15 @@ impl Renderer {
                     self.expanded_tools.contains(&block.id()),
                 ));
             }
-            self.wrapped.len() - before
         } else {
             self.rewrap(width);
-            0
-        };
+        }
+        let row_delta = self.wrapped.len() as isize - before as isize;
         // Someone who scrolled up is reading; holding their distance from the
         // bottom would drag the text out from under them as output lands. The
         // distance grows with the new rows instead, so the page stays still.
         if self.scroll_back > 0 {
-            self.scroll_back += grew_by;
+            self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
         }
 
         let rows = height as usize;
@@ -6662,6 +6678,27 @@ mod tests {
 
         assert!(renderer.expanded_tools.contains(&id));
         assert!(renderer.wrapped.iter().any(|line| line.text == "two"));
+    }
+
+    #[test]
+    fn fullscreen_replaces_an_anchored_shell_instead_of_appending_it() {
+        let anchor = Block::new(BlockKind::Tool, "Running 1 shell command", "");
+        let mut completed = Block::new(
+            BlockKind::Tool,
+            "Shell · 1 command · completed",
+            "done",
+        );
+        completed.adopt_id(&anchor);
+        let mut history = vec![
+            Block::new(BlockKind::Assistant, "Before", ""),
+            anchor,
+            Block::new(BlockKind::Assistant, "After", ""),
+        ];
+
+        assert!(replace_history_block(&mut history, completed));
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[1].title, "Shell · 1 command · completed");
+        assert_eq!(history[2].title, "After");
     }
 
     #[test]

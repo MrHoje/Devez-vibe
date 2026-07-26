@@ -659,8 +659,8 @@ struct ActiveItem {
     shell_batch: Option<String>,
 }
 
-#[derive(Default)]
 struct ShellBatch {
+    anchor: Block,
     members: Vec<String>,
     completed: HashMap<String, ShellResult>,
 }
@@ -2999,31 +2999,12 @@ impl AppState {
     }
 
     pub fn view(&self) -> View<'_> {
-        let shell_count = self
-            .active_order
-            .iter()
-            .filter_map(|id| self.active.get(id))
-            .filter(|item| item.block.title.starts_with("Shell ·"))
-            .count();
-        let mut shell_status_added = false;
         let live_blocks = self
             .active_order
             .iter()
             .filter_map(|id| self.active.get(id))
             .filter_map(|item| {
-                if !item.block.title.starts_with("Shell ·") {
-                    return Some(item.block.clone());
-                }
-                if shell_status_added {
-                    return None;
-                }
-                shell_status_added = true;
-                let noun = if shell_count == 1 { "command" } else { "commands" };
-                Some(Block::new(
-                    BlockKind::Tool,
-                    format!("Running {shell_count} shell {noun}"),
-                    "",
-                ))
+                (!item.block.title.starts_with("Shell ·")).then(|| item.block.clone())
             })
             .collect::<Vec<_>>();
         View {
@@ -5741,9 +5722,23 @@ impl AppState {
         if !was_active {
             self.active_order.push(id.to_owned());
             if let Some(batch_id) = shell_batch.as_ref() {
+                if !self.shell_batches.contains_key(batch_id) {
+                    let mut anchor =
+                        Block::new(BlockKind::Tool, "Running 1 shell command", "");
+                    anchor.adopt_id(&block);
+                    self.committed.push(anchor.clone());
+                    self.shell_batches.insert(
+                        batch_id.clone(),
+                        ShellBatch {
+                            anchor,
+                            members: Vec::new(),
+                            completed: HashMap::new(),
+                        },
+                    );
+                }
                 self.shell_batches
-                    .entry(batch_id.clone())
-                    .or_default()
+                    .get_mut(batch_id)
+                    .expect("shell batch inserted")
                     .members
                     .push(id.to_owned());
             }
@@ -5847,7 +5842,9 @@ impl AppState {
             .iter()
             .filter_map(|id| batch.completed.remove(id))
             .collect::<Vec<_>>();
-        self.committed.push(shell_results_block(results));
+        let mut completed = shell_results_block(results);
+        completed.adopt_id(&batch.anchor);
+        self.committed.push(completed);
     }
 
     fn flush_orphaned_active(&mut self) {
@@ -5868,7 +5865,9 @@ impl AppState {
                 }
             }
             if !results.is_empty() {
-                self.committed.push(shell_results_block(results));
+                let mut completed = shell_results_block(results);
+                completed.adopt_id(&batch.anchor);
+                self.committed.push(completed);
             }
         }
         for id in std::mem::take(&mut self.active_order) {
@@ -6963,7 +6962,7 @@ mod tests {
     }
 
     #[test]
-    fn active_shell_commands_are_grouped_into_one_status_row() {
+    fn active_shell_commands_do_not_duplicate_the_committed_anchor() {
         let mut state = test_state();
         for id in ["cmd-1", "cmd-2"] {
             state.start_item(&json!({
@@ -6980,7 +6979,39 @@ mod tests {
             .map(|block| block.title)
             .collect::<Vec<_>>();
 
-        assert_eq!(titles, ["Running 2 shell commands"]);
+        assert!(titles.is_empty());
+        assert_eq!(state.committed.len(), 1);
+        assert_eq!(state.committed[0].title, "Running 1 shell command");
+    }
+
+    #[test]
+    fn completed_shell_group_reuses_its_running_anchor_id() {
+        let mut state = test_state();
+        state.show_welcome = false;
+        state.start_item(&json!({
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "command": "rg TODO"
+        }));
+
+        let anchors = state.drain_committed();
+        assert_eq!(anchors.len(), 1);
+        let anchor_id = anchors[0].id();
+        assert!(state.view().live_blocks.is_empty());
+
+        state.complete_item(&json!({
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "command": "rg TODO",
+            "status": "completed",
+            "exitCode": 0,
+            "aggregatedOutput": "done"
+        }));
+
+        let completed = state.drain_committed();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id(), anchor_id);
+        assert_eq!(completed[0].title, "Shell · 1 command · completed");
     }
 
     #[test]
@@ -7048,6 +7079,7 @@ mod tests {
     #[test]
     fn live_overlapping_shells_commit_as_one_group() {
         let mut state = test_state();
+        state.show_welcome = false;
         state.start_item(&json!({
             "id": "cmd-1",
             "type": "commandExecution",
@@ -7058,6 +7090,8 @@ mod tests {
             "type": "commandExecution",
             "command": "git status --short"
         }));
+        let anchors = state.drain_committed();
+        assert_eq!(anchors.len(), 1);
 
         state.complete_item(&json!({
             "id": "cmd-2",
@@ -7078,8 +7112,9 @@ mod tests {
             "aggregatedOutput": "match"
         }));
 
-        assert_eq!(state.committed.len(), 1);
-        let group = &state.committed[0];
+        let completed = state.drain_committed();
+        assert_eq!(completed.len(), 1);
+        let group = &completed[0];
         assert_eq!(group.title, "Shell · 2 commands · 1 failed · 18ms");
         assert!(matches!(group.kind, BlockKind::Warning));
         assert_eq!(group.children().len(), 2);
@@ -7121,12 +7156,16 @@ mod tests {
     #[test]
     fn sequential_shells_are_separate() {
         let mut state = test_state();
+        state.show_welcome = false;
+        let mut completed = Vec::new();
         for (id, command) in [("cmd-1", "rg TODO"), ("cmd-2", "git status --short")] {
             state.start_item(&json!({
                 "id": id,
                 "type": "commandExecution",
                 "command": command
             }));
+            let anchors = state.drain_committed();
+            assert_eq!(anchors.len(), 1);
             state.complete_item(&json!({
                 "id": id,
                 "type": "commandExecution",
@@ -7134,24 +7173,23 @@ mod tests {
                 "status": "completed",
                 "exitCode": 0
             }));
+            completed.extend(state.drain_committed());
         }
 
-        assert_eq!(state.committed.len(), 2);
+        assert_eq!(completed.len(), 2);
         assert!(
-            state
-                .committed
+            completed
                 .iter()
                 .all(|block| block.title == "Shell · 1 command · completed")
         );
         assert!(
-            state
-                .committed
+            completed
                 .iter()
                 .all(|block| block.children().len() == 1)
         );
-        assert!(state.committed[0].children()[0].title.contains("rg TODO"));
+        assert!(completed[0].children()[0].title.contains("rg TODO"));
         assert!(
-            state.committed[1].children()[0]
+            completed[1].children()[0]
                 .title
                 .contains("git status --short")
         );
