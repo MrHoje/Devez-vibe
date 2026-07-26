@@ -35,8 +35,8 @@ use paste::PasteBurst;
 use renderer::{BlockKind, Pick, RenderMode, Renderer, SelectionResult, TerminalSession, View};
 use serde_json::{Value, json};
 use state::{
-    AccountPlan, Action, AppState, LoginMethod, ModelInfo, SessionInfo, SessionPicker,
-    SessionPickerResult, ShellDisplayMode, load_model_context_windows,
+    AccountPlan, Action, AppState, DiffDisplayMode, LoginMethod, ModelInfo, SessionInfo,
+    SessionPicker, SessionPickerResult, ShellDisplayMode, load_model_context_windows,
 };
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 
@@ -131,7 +131,12 @@ async fn run(cli: &Cli, server: &mut AppServer) -> Result<()> {
         bail!("app-server가 사용 가능한 모델을 반환하지 않았습니다.");
     }
 
-    let requested_model_name = choose_model(&models, cli.model.as_deref())?.model.clone();
+    let startup_model = resolve_startup_model(
+        &models,
+        cli.model.as_deref(),
+        cli.effort.as_deref(),
+        &read_startup_config(),
+    )?;
     let cwd = resolve_cwd(cli.cwd.as_deref())?;
     let resume_id = resolve_startup_session(cli, server, &cwd).await?;
     let Some(resume_id) = resume_id else {
@@ -141,11 +146,7 @@ async fn run(cli: &Cli, server: &mut AppServer) -> Result<()> {
     let model_override = if is_resuming {
         cli.model.clone()
     } else {
-        Some(
-            cli.model
-                .clone()
-                .unwrap_or_else(|| requested_model_name.clone()),
-        )
+        Some(startup_model.model.clone())
     };
 
     // Everything the first frame shows — plan, cwd, account, model, limits, branch —
@@ -156,8 +157,8 @@ async fn run(cli: &Cli, server: &mut AppServer) -> Result<()> {
         cwd.to_string_lossy().into_owned(),
         account,
         models,
-        &requested_model_name,
-        cli.effort.as_deref(),
+        &startup_model.model,
+        Some(&startup_model.effort),
     );
 
     let render_mode = renderer::load_render_mode(cli.renderer.as_deref())?;
@@ -173,7 +174,8 @@ async fn run(cli: &Cli, server: &mut AppServer) -> Result<()> {
         &resume_id,
         is_resuming,
         model_override.as_deref(),
-        &requested_model_name,
+        &startup_model.model,
+        &startup_model.effort,
     )
     .await;
     let _ = renderer.finish();
@@ -206,6 +208,7 @@ async fn start_session(
     is_resuming: bool,
     model_override: Option<&str>,
     requested_model_name: &str,
+    requested_effort: &str,
 ) -> Result<()> {
     let startup = await_thread(
         server,
@@ -242,25 +245,20 @@ async fn start_session(
         .and_then(Value::as_str)
         .unwrap_or(requested_model_name)
         .to_owned();
-    let actual_effort = cli.effort.clone().or_else(|| {
-        thread_response
-            .get("reasoningEffort")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-    });
-    validate_effort(state.models(), &actual_model, actual_effort.as_deref())?;
+    let actual_effort = thread_response
+        .get("reasoningEffort")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| is_resuming.then(|| cli.effort.clone()).flatten())
+        .unwrap_or_else(|| requested_effort.to_owned());
+    validate_effort(state.models(), &actual_model, Some(&actual_effort))?;
     let actual_cwd = thread_response
         .get("cwd")
         .and_then(Value::as_str)
         .unwrap_or_else(|| cwd.to_str().unwrap_or("."))
         .to_owned();
 
-    state.attach_thread(
-        thread_id,
-        actual_cwd,
-        &actual_model,
-        actual_effort.as_deref(),
-    );
+    state.attach_thread(thread_id, actual_cwd, &actual_model, Some(&actual_effort));
     if is_resuming {
         state.load_history(thread, None);
     }
@@ -321,7 +319,12 @@ async fn await_thread(
                 match event {
                     Some(Ok(Event::Key(key))) => {
                         renderer.clear_selection();
-                        state.handle_key(paste_burst.observe(key, Instant::now()))
+                        let action = state.handle_key(paste_burst.observe(key, Instant::now()));
+                        if attach_pasted_editor_image(state, &paste_burst) {
+                            Action::None
+                        } else {
+                            action
+                        }
                     }
                     Some(Ok(Event::Mouse(mouse))) => renderer_mouse_action(renderer, &mouse, |pick| pick_action(state, pick)),
                     Some(Ok(Event::Paste(text))) => {
@@ -501,6 +504,7 @@ async fn choose_startup_session(
                 composer_notice: composer_notice.clone(),
                 composer_mode: None,
                 shell_display_mode: ShellDisplayMode::Collapse,
+                diff_display_mode: DiffDisplayMode::Collapse,
             },
         )?;
         match events.next().await {
@@ -643,9 +647,13 @@ async fn event_loop(
                             Some(delta) => Action::Tick(renderer.scroll(delta)),
                             None => state.handle_key(key),
                         };
+                        if attach_pasted_editor_image(state, &paste_burst) {
+                            Action::None
+                        } else {
                         match action {
                             Action::Tick(false) if cleared => Action::Tick(true),
                             action => action,
+                        }
                         }
                     }
                     Some(Ok(Event::Mouse(mouse))) => renderer_mouse_action(renderer, &mouse, |pick| pick_action(state, pick)),
@@ -843,9 +851,8 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
             state.cycle_permission_mode();
             Action::Tick(true)
         }
-        Pick::ShellDisplayMode => {
-            Action::PersistShellDisplayMode(state.cycle_shell_display_mode())
-        }
+        Pick::ShellDisplayMode => Action::PersistShellDisplayMode(state.cycle_shell_display_mode()),
+        Pick::DiffDisplayMode => Action::PersistDiffDisplayMode(state.cycle_diff_display_mode()),
         Pick::FastMode => state.run_command("/fast"),
         Pick::Model => state.run_command("/model"),
         Pick::EffortSetting => state.run_command("/effort"),
@@ -1041,6 +1048,21 @@ async fn execute_action(
                 state.push_notice(
                     BlockKind::Warning,
                     "Shell 표시 설정 저장 실패",
+                    error.to_string(),
+                );
+            }
+        }
+        Action::PersistDiffDisplayMode(mode) => {
+            if let Err(error) = server
+                .request(
+                    "config/value/write",
+                    config_value_write_params("diff_display_mode", mode.config_value()),
+                )
+                .await
+            {
+                state.push_notice(
+                    BlockKind::Warning,
+                    "Diff 표시 설정 저장 실패",
                     error.to_string(),
                 );
             }
@@ -1686,10 +1708,7 @@ async fn execute_action(
             let writes = [("model", model), ("model_reasoning_effort", effort)];
             for (key, value) in writes {
                 if let Err(error) = server
-                    .request(
-                        "config/value/write",
-                        config_value_write_params(key, &value),
-                    )
+                    .request("config/value/write", config_value_write_params(key, &value))
                     .await
                 {
                     state.push_notice(
@@ -1725,13 +1744,7 @@ async fn start_new_thread(
     renderer: &mut Renderer,
 ) -> Result<bool> {
     // Read the request out of the old session before it is torn down.
-    let params = json!({
-        "cwd": state.cwd,
-        "model": state.selected_model_name(),
-        "serviceTier": state.service_tier(),
-        "sessionStartSource": "clear",
-        "threadSource": "devez-cli"
-    });
+    let params = new_thread_params(&state.cwd, None, Some(state.service_tier()), "clear");
     let previous_thread = state.thread_id.clone();
 
     renderer.clear_screen()?;
@@ -2037,6 +2050,26 @@ fn config_value_write_params(key_path: &str, value: &str) -> Value {
         "value": value,
         "mergeStrategy": "upsert"
     })
+}
+
+fn new_thread_params(
+    cwd: &str,
+    model: Option<&str>,
+    service_tier: Option<&str>,
+    session_start_source: &str,
+) -> Value {
+    let mut params = json!({
+        "cwd": cwd,
+        "sessionStartSource": session_start_source,
+        "threadSource": "devez-cli"
+    });
+    if let Some(model) = model {
+        params["model"] = json!(model);
+    }
+    if let Some(service_tier) = service_tier {
+        params["serviceTier"] = json!(service_tier);
+    }
+    params
 }
 
 async fn list_skills(server: &AppServer, cwd: &str, force_reload: bool) -> Result<Value> {
@@ -2537,6 +2570,18 @@ fn attach_pasted_local_image(state: &mut AppState, text: &str) -> bool {
     true
 }
 
+fn attach_pasted_editor_image(state: &mut AppState, burst: &PasteBurst) -> bool {
+    if !burst.is_active() {
+        return false;
+    }
+    let text = state.editor.text();
+    if !attach_pasted_local_image(state, &text) {
+        return false;
+    }
+    state.editor.clear();
+    true
+}
+
 fn local_image_path_from_paste(text: &str) -> Option<PathBuf> {
     let path = PathBuf::from(text.trim());
     if !path.is_file() {
@@ -2707,12 +2752,7 @@ async fn start_or_resume_thread(
         server
             .request(
                 "thread/start",
-                json!({
-                    "cwd": new_cwd.to_string_lossy(),
-                    "model": model,
-                    "sessionStartSource": "startup",
-                    "threadSource": "devez-cli"
-                }),
+                new_thread_params(new_cwd.to_string_lossy().as_ref(), model, None, "startup"),
             )
             .await
     }
@@ -2817,6 +2857,63 @@ fn choose_model<'a>(models: &'a [ModelInfo], requested: Option<&str>) -> Result<
         .context("기본 모델을 찾을 수 없습니다.")
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StartupModelSelection {
+    model: String,
+    effort: String,
+}
+
+/// The first frame is drawn before `thread/start` answers, so it must use the
+/// same root-level Codex defaults the server will use for a new thread.
+fn resolve_startup_model(
+    models: &[ModelInfo],
+    cli_model: Option<&str>,
+    cli_effort: Option<&str>,
+    config: &str,
+) -> Result<StartupModelSelection> {
+    let configured_model = root_config_value(config, "model");
+    let model = match cli_model {
+        Some(requested) => choose_model(models, Some(requested))?,
+        None => configured_model
+            .and_then(|requested| models.iter().find(|model| model.matches_query(requested)))
+            .unwrap_or(choose_model(models, None)?),
+    };
+
+    let effort = match cli_effort {
+        Some(effort) => {
+            validate_effort(models, &model.model, Some(effort))?;
+            effort.to_owned()
+        }
+        None => root_config_value(config, "model_reasoning_effort")
+            .filter(|effort| model.supports_effort(effort))
+            .unwrap_or(&model.default_effort)
+            .to_owned(),
+    };
+
+    Ok(StartupModelSelection {
+        model: model.model.clone(),
+        effort,
+    })
+}
+
+fn read_startup_config() -> String {
+    state::codex_home()
+        .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
+        .unwrap_or_default()
+}
+
+fn root_config_value<'a>(config: &'a str, name: &str) -> Option<&'a str> {
+    config
+        .lines()
+        .take_while(|line| !line.trim_start().starts_with('['))
+        .filter_map(|line| line.split('#').next())
+        .filter_map(|line| line.split_once('='))
+        .find_map(|(key, value)| {
+            (key.trim() == name).then(|| value.trim().trim_matches(['"', '\'']))
+        })
+        .filter(|value| !value.is_empty())
+}
+
 fn validate_effort(models: &[ModelInfo], model_name: &str, effort: Option<&str>) -> Result<()> {
     let Some(effort) = effort else {
         return Ok(());
@@ -2893,13 +2990,12 @@ mod tests {
     #[test]
     fn clicking_shell_badge_cycles_the_global_mode() {
         let mut state = starting_state();
+        let before = state.shell_display_mode();
 
-        assert!(matches!(
-            pick_action(&mut state, Pick::ShellDisplayMode),
-            Action::PersistShellDisplayMode(ShellDisplayMode::Expand)
-        ));
+        let action = pick_action(&mut state, Pick::ShellDisplayMode);
 
-        assert_eq!(state.shell_display_mode(), ShellDisplayMode::Expand);
+        assert!(matches!(action, Action::PersistShellDisplayMode(_)));
+        assert_ne!(state.shell_display_mode(), before);
     }
 
     /// The effort picker only has rows once a model has published its tiers, so
@@ -2927,6 +3023,100 @@ mod tests {
         )
     }
 
+    fn model(name: &str, default_effort: &str, is_default: bool, efforts: &[&str]) -> ModelInfo {
+        ModelInfo {
+            id: name.to_owned(),
+            model: name.to_owned(),
+            display_name: name.to_owned(),
+            efforts: efforts
+                .iter()
+                .map(|id| EffortInfo {
+                    id: (*id).to_owned(),
+                })
+                .collect(),
+            default_effort: default_effort.to_owned(),
+            is_default,
+            context_window: None,
+            fast_service_tier: None,
+        }
+    }
+
+    #[test]
+    fn startup_model_uses_the_configured_model_and_effort_before_first_draw() {
+        let models = vec![
+            model("gpt-5.6-sol", "low", true, &["low", "high"]),
+            model("gpt-5.6-terra", "high", false, &["low", "high"]),
+        ];
+
+        let selection = resolve_startup_model(
+            &models,
+            None,
+            None,
+            "model = \"gpt-5.6-terra\"\nmodel_reasoning_effort = \"high\"\n",
+        )
+        .expect("a valid Codex config should resolve");
+
+        assert_eq!(selection.model, "gpt-5.6-terra");
+        assert_eq!(selection.effort, "high");
+    }
+
+    #[test]
+    fn startup_model_cli_options_override_the_configured_defaults() {
+        let models = vec![
+            model("gpt-5.6-sol", "low", true, &["low", "high"]),
+            model("gpt-5.6-terra", "high", false, &["low", "high"]),
+        ];
+
+        let selection = resolve_startup_model(
+            &models,
+            Some("sol"),
+            Some("high"),
+            "model = \"gpt-5.6-terra\"\nmodel_reasoning_effort = \"low\"\n",
+        )
+        .expect("CLI values should take precedence");
+
+        assert_eq!(selection.model, "gpt-5.6-sol");
+        assert_eq!(selection.effort, "high");
+    }
+
+    #[test]
+    fn startup_model_ignores_an_unsupported_configured_effort() {
+        let models = vec![model("gpt-5.6-sol", "low", true, &["low"])];
+
+        let selection =
+            resolve_startup_model(&models, None, None, "model_reasoning_effort = \"xhigh\"\n")
+                .expect("an obsolete config value should not prevent startup");
+
+        assert_eq!(
+            selection,
+            StartupModelSelection {
+                model: "gpt-5.6-sol".to_owned(),
+                effort: "low".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn startup_model_ignores_an_unknown_configured_model() {
+        let models = vec![model("gpt-5.6-sol", "low", true, &["low"])];
+
+        let selection = resolve_startup_model(
+            &models,
+            None,
+            None,
+            "model = \"retired-model\"\nmodel_reasoning_effort = \"low\"\n",
+        )
+        .expect("an obsolete configured model should fall back to the catalog default");
+
+        assert_eq!(
+            selection,
+            StartupModelSelection {
+                model: "gpt-5.6-sol".to_owned(),
+                effort: "low".to_owned(),
+            }
+        );
+    }
+
     #[test]
     fn config_value_write_params_include_the_required_merge_strategy() {
         assert_eq!(
@@ -2943,6 +3133,19 @@ mod tests {
                 "keyPath": "shell_display_mode",
                 "value": "expand",
                 "mergeStrategy": "upsert"
+            })
+        );
+    }
+
+    #[test]
+    fn fresh_threads_include_the_model_selected_for_the_first_frame() {
+        assert_eq!(
+            new_thread_params("C:\\repo", Some("gpt-5.6-terra"), None, "startup"),
+            json!({
+                "cwd": "C:\\repo",
+                "model": "gpt-5.6-terra",
+                "sessionStartSource": "startup",
+                "threadSource": "devez-cli"
             })
         );
     }
@@ -2982,15 +3185,40 @@ mod tests {
 
     #[test]
     fn pasted_local_image_path_accepts_a_real_image_file() {
-        let path = std::env::temp_dir().join(format!(
-            "devez-paste-image-{}.png",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("devez-paste-image-{}.png", std::process::id()));
         std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
 
         let parsed = local_image_path_from_paste(&format!("{}\r\n", path.display()));
 
         assert_eq!(parsed.as_deref(), Some(path.as_path()));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pasted_key_burst_replaces_an_image_path_in_the_editor() {
+        let path = std::env::temp_dir().join(format!(
+            "devez-paste-burst-image-{}.png",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+        let mut state = starting_state();
+        state.editor.set_text(path.to_string_lossy());
+        let base = Instant::now();
+        let mut burst = PasteBurst::new();
+        burst.observe(KeyEvent::from(KeyCode::Char('a')), base);
+        burst.observe(
+            KeyEvent::from(KeyCode::Char('b')),
+            base + Duration::from_millis(1),
+        );
+        burst.observe(
+            KeyEvent::from(KeyCode::Char('c')),
+            base + Duration::from_millis(2),
+        );
+
+        assert!(attach_pasted_editor_image(&mut state, &burst));
+        assert!(state.editor.is_empty());
+        assert_eq!(state.composer_image_count(), 1);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -3008,16 +3236,20 @@ mod tests {
         assert!(state.view().overlay.is_some(), "the effort picker is open");
     }
 
-    /// Fast is a toggle, not a picker: the click flips the tier the same way
-    /// `/fast` does, and reports it so the badge repaints.
+    /// Fast opens the same On/Off picker as `/fast`, so a click never changes a
+    /// service tier without showing the choice first.
     #[test]
-    fn clicking_the_fast_badge_toggles_the_service_tier() {
+    fn clicking_the_fast_badge_opens_the_service_tier_picker() {
         let mut state = state_with_a_model();
 
         assert!(matches!(
             pick_action(&mut state, Pick::FastMode),
-            Action::SetFast(true)
+            Action::None
         ));
+        assert_eq!(
+            state.view().overlay.map(|overlay| overlay.title),
+            Some("Fast".to_owned())
+        );
     }
 
     /// An open picker is no reason to make the other reading dead: clicking it

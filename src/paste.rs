@@ -71,6 +71,10 @@ impl PasteBurst {
         }
     }
 
+    pub fn is_active(&self) -> bool {
+        !self.disabled && self.run >= MIN_RUN
+    }
+
     /// Reads `key` and hands back the key the application should act on.
     ///
     /// Only `Enter` and `Tab` are ever rewritten, and only mid-burst: `Enter`
@@ -192,6 +196,17 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn fast_character_run_is_reported_as_a_paste() {
+        let base = Instant::now();
+        let mut burst = PasteBurst::new();
+        burst.observe(press(KeyCode::Char('a')), base);
+        burst.observe(press(KeyCode::Char('b')), base + Duration::from_millis(1));
+        burst.observe(press(KeyCode::Char('c')), base + Duration::from_millis(2));
+
+        assert!(burst.is_active());
     }
 
     #[test]

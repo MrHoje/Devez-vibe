@@ -51,9 +51,62 @@ pub enum ShellDisplayMode {
     Expand,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DiffDisplayMode {
+    Hide,
+    #[default]
+    Collapse,
+    Expand,
+}
+
+impl DiffDisplayMode {
+    fn from_config_value(value: &str) -> Option<Self> {
+        match value
+            .trim()
+            .trim_matches(['"', '\''])
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "hide" => Some(Self::Hide),
+            "collapse" => Some(Self::Collapse),
+            "expand" => Some(Self::Expand),
+            _ => None,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Hide => "Hide",
+            Self::Collapse => "Collapse",
+            Self::Expand => "Expand",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Hide => Self::Collapse,
+            Self::Collapse => Self::Expand,
+            Self::Expand => Self::Hide,
+        }
+    }
+
+    pub const fn config_value(self) -> &'static str {
+        match self {
+            Self::Hide => "hide",
+            Self::Collapse => "collapse",
+            Self::Expand => "expand",
+        }
+    }
+}
+
 impl ShellDisplayMode {
     fn from_config_value(value: &str) -> Option<Self> {
-        match value.trim().trim_matches(['"', '\'']).to_ascii_lowercase().as_str() {
+        match value
+            .trim()
+            .trim_matches(['"', '\''])
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "hide" => Some(Self::Hide),
             "collapse" => Some(Self::Collapse),
             "expand" => Some(Self::Expand),
@@ -129,7 +182,7 @@ struct SlashCommand {
     takes_argument: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 24] = [
+const SLASH_COMMANDS: [SlashCommand; 25] = [
     SlashCommand {
         name: "/model",
         description: "Switch model and reasoning",
@@ -137,8 +190,8 @@ const SLASH_COMMANDS: [SlashCommand; 24] = [
     },
     SlashCommand {
         name: "/fast",
-        description: "Toggle the model's fast service tier",
-        takes_argument: false,
+        description: "Choose the model's fast service tier",
+        takes_argument: true,
     },
     SlashCommand {
         name: "/effort",
@@ -217,8 +270,13 @@ const SLASH_COMMANDS: [SlashCommand; 24] = [
     },
     SlashCommand {
         name: "/diff",
-        description: "Show the current git diff",
-        takes_argument: false,
+        description: "Choose how file changes are displayed",
+        takes_argument: true,
+    },
+    SlashCommand {
+        name: "/shell",
+        description: "Choose how shell commands are displayed",
+        takes_argument: true,
     },
     SlashCommand {
         name: "/usage",
@@ -583,6 +641,7 @@ pub enum Action {
     },
     /// Save the transcript's Shell display preference for future sessions.
     PersistShellDisplayMode(ShellDisplayMode),
+    PersistDiffDisplayMode(DiffDisplayMode),
     Quit,
     ClearScreen,
     Tick(bool),
@@ -723,6 +782,10 @@ enum PendingInteraction {
     EffortPicker {
         effort_index: usize,
     },
+    SettingPicker {
+        setting: DisplaySetting,
+        selected: usize,
+    },
     /// Second step of `/model`: how long the pick should last. Asked after the
     /// model is chosen so the common case (this session) stays two keystrokes.
     ModelScope {
@@ -779,6 +842,30 @@ enum PendingInteraction {
         login_id: String,
         waiting_on: Vec<String>,
     },
+}
+
+#[derive(Clone, Copy)]
+enum DisplaySetting {
+    Shell,
+    Diff,
+    Fast,
+}
+
+impl DisplaySetting {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Shell => "Shell",
+            Self::Diff => "Diff",
+            Self::Fast => "Fast",
+        }
+    }
+
+    fn choices(self) -> &'static [&'static str] {
+        match self {
+            Self::Shell | Self::Diff => &["Hide", "Collapse", "Expand"],
+            Self::Fast => &["On", "Off"],
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1888,6 +1975,7 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
         PendingInteraction::ModelPicker { .. }
             | PendingInteraction::ModelScope { .. }
             | PendingInteraction::EffortPicker { .. }
+            | PendingInteraction::SettingPicker { .. }
             | PendingInteraction::SessionPicker(_)
     )
 }
@@ -2153,6 +2241,7 @@ pub struct AppState {
     status_metadata_refreshed_at: Instant,
     permission_mode: PermissionMode,
     shell_display_mode: ShellDisplayMode,
+    diff_display_mode: DiffDisplayMode,
     account_plan: AccountPlan,
     /// Set when a login lands, so the event loop re-reads the account over RPC.
     account_refresh_due: bool,
@@ -2247,6 +2336,7 @@ impl AppState {
             status_metadata_refreshed_at: Instant::now(),
             permission_mode: read_permission_mode(),
             shell_display_mode: read_shell_display_mode(),
+            diff_display_mode: read_diff_display_mode(),
             account_plan: AccountPlan::default(),
             account_refresh_due: false,
             skills: Vec::new(),
@@ -2628,6 +2718,10 @@ impl AppState {
         self.shell_display_mode
     }
 
+    pub fn diff_display_mode(&self) -> DiffDisplayMode {
+        self.diff_display_mode
+    }
+
     /// Permission profile id to send with `turn/start`.
     pub fn permission_profile(&self) -> &'static str {
         self.permission_mode().profile()
@@ -2639,6 +2733,7 @@ impl AppState {
             accent: self.permission_mode().accent(),
             fast_mode: self.effective_fast_mode(),
             shell_display_mode: self.shell_display_mode().label().to_owned(),
+            diff_display_mode: self.diff_display_mode().label().to_owned(),
             cost: self.estimated_cost(),
         }
     }
@@ -3024,9 +3119,10 @@ impl AppState {
             .active_order
             .iter()
             .filter_map(|id| self.active.get(id))
-            .filter_map(|item| {
-                (!item.block.title.starts_with("Shell ·")).then(|| item.block.clone())
-            })
+            // A Shell item can briefly carry the app-server's running title
+            // instead of its eventual Shell title. Its batch membership is the
+            // stable discriminator, and keeps Hide from flashing it.
+            .filter_map(|item| item.shell_batch.is_none().then(|| item.block.clone()))
             .collect::<Vec<_>>();
         View {
             live_blocks,
@@ -3050,6 +3146,7 @@ impl AppState {
                 .map(|(notice, _)| notice.clone()),
             composer_mode: Some(self.composer_mode()),
             shell_display_mode: self.shell_display_mode(),
+            diff_display_mode: self.diff_display_mode(),
         }
     }
 
@@ -3701,7 +3798,7 @@ impl AppState {
                 self.append_delta(params, BlockKind::Reasoning, "Thinking…");
             }
             "item/commandExecution/outputDelta" => {
-                self.append_delta(params, BlockKind::Tool, "Command");
+                self.append_shell_delta(params);
             }
             "item/plan/delta" => {
                 self.append_delta(params, BlockKind::Reasoning, "Plan");
@@ -3889,11 +3986,11 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    "/model [MODEL] [EFFORT]  모델과 effort 선택\n/fast  빠른 서비스 티어 전환\n/effort [LEVEL]  추론 수준\n/theme [minimal|soft|dark]  화면 테마\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/diff  git diff 표시\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/login  ChatGPT 계정 로그인\n/logout  계정 연결 해제\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nShift+Tab  권한 모드 전환 (Read Only / Default / Full Access)\nCtrl+Enter / Shift+Enter  줄바꿈",
+                    "/model [MODEL] [EFFORT]  모델과 effort 선택\n/fast [on|off]  Fast 서비스 티어 선택\n/effort [LEVEL]  추론 수준\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/login  ChatGPT 계정 로그인\n/logout  계정 연결 해제\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nShift+Tab  권한 모드 전환 (Read Only / Default / Full Access)\nCtrl+Enter / Shift+Enter  줄바꿈",
                 ));
                 Action::None
             }
-            "/fast" => {
+            "/fast" if parts.len() == 1 => {
                 if self
                     .selected_model()
                     .is_none_or(|model| model.fast_service_tier.is_none())
@@ -3905,20 +4002,37 @@ impl AppState {
                     ));
                     Action::None
                 } else {
-                    let enabled = match parts.get(1).map(|value| value.to_ascii_lowercase()) {
-                        Some(value) if value == "on" => true,
-                        Some(value) if value == "off" => false,
-                        Some(_) => {
+                    self.open_setting_picker(
+                        DisplaySetting::Fast,
+                        self.effective_fast_mode().then_some(0).unwrap_or(1),
+                    );
+                    Action::None
+                }
+            }
+            "/fast" if parts.len() == 2 => {
+                if self
+                    .selected_model()
+                    .is_none_or(|model| model.fast_service_tier.is_none())
+                {
+                    self.committed.push(Block::new(
+                        BlockKind::Error,
+                        "Fast mode unavailable",
+                        "현재 모델은 Fast 서비스 티어를 지원하지 않습니다.",
+                    ));
+                    Action::None
+                } else {
+                    match parts[1].to_ascii_lowercase().as_str() {
+                        "on" => Action::SetFast(true),
+                        "off" => Action::SetFast(false),
+                        _ => {
                             self.committed.push(Block::new(
                                 BlockKind::Error,
                                 "Usage",
                                 "/fast [on|off]",
                             ));
-                            return Action::None;
+                            Action::None
                         }
-                        None => !self.effective_fast_mode(),
-                    };
-                    Action::SetFast(enabled)
+                    }
                 }
             }
             "/model" if parts.len() == 1 => {
@@ -4142,7 +4256,18 @@ impl AppState {
                     Action::None
                 }
             },
-            "/diff" => Action::ShowDiff,
+            "/shell" if parts.len() == 1 => {
+                self.open_setting_picker(DisplaySetting::Shell, self.shell_display_mode as usize);
+                Action::None
+            }
+            "/shell" if parts.len() == 2 => {
+                self.set_display_setting(DisplaySetting::Shell, parts[1])
+            }
+            "/diff" if parts.len() == 1 => {
+                self.open_setting_picker(DisplaySetting::Diff, self.diff_display_mode as usize);
+                Action::None
+            }
+            "/diff" if parts.len() == 2 => self.set_display_setting(DisplaySetting::Diff, parts[1]),
             "/new" if self.busy => {
                 self.committed.push(Block::new(
                     BlockKind::Warning,
@@ -4335,6 +4460,31 @@ impl AppState {
                     _ => {}
                 }
                 self.pending = Some(PendingInteraction::EffortPicker { effort_index });
+                Action::None
+            }
+            PendingInteraction::SettingPicker {
+                setting,
+                mut selected,
+            } => {
+                let count = setting.choices().len();
+                match key.code {
+                    KeyCode::Esc => return Action::None,
+                    KeyCode::Left | KeyCode::Up => selected = selected.saturating_sub(1),
+                    KeyCode::Char('p') if ctrl => selected = selected.saturating_sub(1),
+                    KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
+                        selected = (selected + 1).min(count - 1);
+                    }
+                    KeyCode::Char('n') if ctrl => selected = (selected + 1).min(count - 1),
+                    KeyCode::Char(ch) if !ctrl && !alt && ('1'..='9').contains(&ch) => {
+                        let index = ch.to_digit(10).unwrap_or(1) as usize - 1;
+                        if index < count {
+                            return self.apply_setting_picker(setting, index);
+                        }
+                    }
+                    KeyCode::Enter => return self.apply_setting_picker(setting, selected),
+                    _ => {}
+                }
+                self.pending = Some(PendingInteraction::SettingPicker { setting, selected });
                 Action::None
             }
             PendingInteraction::ThemePicker { mut theme_index } => {
@@ -4754,6 +4904,24 @@ impl AppState {
                     input_placeholder: "",
                 })
             }
+            PendingInteraction::SettingPicker { setting, selected } => Some(OverlayView {
+                closable: true,
+                title: setting.title().to_owned(),
+                lines: Vec::new(),
+                slider: Some(EffortSlider {
+                    efforts: setting
+                        .choices()
+                        .iter()
+                        .map(|choice| (*choice).to_owned())
+                        .collect(),
+                    selected: *selected,
+                }),
+                hint: "←→ to adjust  ·  Enter to confirm  ·  Esc to cancel".to_owned(),
+                style: OverlayStyle::Picker,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            }),
             PendingInteraction::ThemePicker { theme_index } => Some(OverlayView {
                 closable: false,
                 title: "Theme".to_owned(),
@@ -5496,6 +5664,11 @@ impl AppState {
         self.shell_display_mode
     }
 
+    pub fn cycle_diff_display_mode(&mut self) -> DiffDisplayMode {
+        self.diff_display_mode = self.diff_display_mode.next();
+        self.diff_display_mode
+    }
+
     /// Runs a slash command the composer never typed — what a click on the
     /// chrome that owns the same setting resolves to. Ignored while the session
     /// is blocked on an answer, so a stray click cannot swap the model out from
@@ -5639,10 +5812,71 @@ impl AppState {
                     }
                 }
             }
+            Some(PendingInteraction::SettingPicker { setting, selected }) => {
+                if step < setting.choices().len() {
+                    self.apply_setting_picker(setting, step)
+                } else {
+                    self.pending = Some(PendingInteraction::SettingPicker { setting, selected });
+                    Action::Tick(false)
+                }
+            }
             other => {
                 self.pending = other;
                 Action::Tick(false)
             }
+        }
+    }
+
+    fn open_setting_picker(&mut self, setting: DisplaySetting, selected: usize) {
+        self.pending = Some(PendingInteraction::SettingPicker {
+            setting,
+            selected: selected.min(setting.choices().len().saturating_sub(1)),
+        });
+    }
+
+    fn set_display_setting(&mut self, setting: DisplaySetting, value: &str) -> Action {
+        let Some(selected) = setting
+            .choices()
+            .iter()
+            .position(|choice| choice.eq_ignore_ascii_case(value))
+        else {
+            self.committed.push(Block::new(
+                BlockKind::Error,
+                "Usage",
+                format!(
+                    "/{} [{}]",
+                    setting.title().to_ascii_lowercase(),
+                    setting.choices().join("|")
+                ),
+            ));
+            return Action::None;
+        };
+        self.apply_setting_picker(setting, selected)
+    }
+
+    fn apply_setting_picker(&mut self, setting: DisplaySetting, selected: usize) -> Action {
+        match setting {
+            DisplaySetting::Shell => {
+                let mode = match selected {
+                    0 => ShellDisplayMode::Hide,
+                    1 => ShellDisplayMode::Collapse,
+                    2 => ShellDisplayMode::Expand,
+                    _ => self.shell_display_mode,
+                };
+                self.shell_display_mode = mode;
+                Action::PersistShellDisplayMode(mode)
+            }
+            DisplaySetting::Diff => {
+                let mode = match selected {
+                    0 => DiffDisplayMode::Hide,
+                    1 => DiffDisplayMode::Collapse,
+                    2 => DiffDisplayMode::Expand,
+                    _ => self.diff_display_mode,
+                };
+                self.diff_display_mode = mode;
+                Action::PersistDiffDisplayMode(mode)
+            }
+            DisplaySetting::Fast => Action::SetFast(selected == 0),
         }
     }
 
@@ -5727,6 +5961,7 @@ impl AppState {
         let was_active = self.active.contains_key(id);
         if let Some(existing) = self.active.get(id) {
             block.adopt_id(&existing.block);
+            block.body = existing.block.body.clone();
         }
         let shell_batch = if existing_batch.is_some() {
             existing_batch
@@ -5743,8 +5978,7 @@ impl AppState {
             self.active_order.push(id.to_owned());
             if let Some(batch_id) = shell_batch.as_ref() {
                 if !self.shell_batches.contains_key(batch_id) {
-                    let mut anchor =
-                        Block::new(BlockKind::Tool, "Running 1 shell command", "");
+                    let mut anchor = Block::new(BlockKind::Tool, "Running 1 shell command", "");
                     anchor.adopt_id(&block);
                     self.committed.push(anchor.clone());
                     self.shell_batches.insert(
@@ -5780,6 +6014,9 @@ impl AppState {
         if let Some(mut block) = completed_item_block(&self.cwd, item) {
             if let Some(active) = active.as_ref() {
                 block.adopt_id(&active.block);
+                if block.body.is_empty() {
+                    block.body = active.block.body.clone();
+                }
             }
             if let (Some(id), Some(batch_id)) = (
                 id,
@@ -5817,6 +6054,75 @@ impl AppState {
             &mut self.ensure_active(item_id, kind, title).block.body,
             delta,
         );
+    }
+
+    /// Command output can arrive before `item/started`. Mark it as Shell at the
+    /// first byte so Shell: Hide never paints the generic running Tool frame.
+    fn append_shell_delta(&mut self, params: &Value) {
+        let Some(item_id) = params.get("itemId").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(delta) = params.get("delta").and_then(Value::as_str) else {
+            return;
+        };
+        self.mark_active_shell(item_id);
+        append_capped(
+            &mut self
+                .active
+                .get_mut(item_id)
+                .expect("shell output is active")
+                .block
+                .body,
+            delta,
+        );
+    }
+
+    fn mark_active_shell(&mut self, item_id: &str) {
+        let existing_batch = self
+            .active
+            .get(item_id)
+            .and_then(|active| active.shell_batch.clone());
+        if existing_batch.is_some() {
+            return;
+        }
+        let batch_id = self
+            .active_order
+            .iter()
+            .filter_map(|active_id| self.active.get(active_id))
+            .find_map(|active| active.shell_batch.clone())
+            .unwrap_or_else(|| item_id.to_owned());
+        if !self.active.contains_key(item_id) {
+            self.active_order.push(item_id.to_owned());
+            self.active.insert(
+                item_id.to_owned(),
+                ActiveItem {
+                    block: Block::new(BlockKind::Tool, "Shell · command", ""),
+                    shell_batch: None,
+                },
+            );
+        }
+        let active = self.active.get_mut(item_id).expect("active shell exists");
+        active.shell_batch = Some(batch_id.clone());
+        active.block.title = "Shell · command".to_owned();
+
+        if !self.shell_batches.contains_key(&batch_id) {
+            let mut anchor = Block::new(BlockKind::Tool, "Running 1 shell command", "");
+            anchor.adopt_id(&active.block);
+            self.committed.push(anchor.clone());
+            self.shell_batches.insert(
+                batch_id.clone(),
+                ShellBatch {
+                    anchor,
+                    members: Vec::new(),
+                    completed: HashMap::new(),
+                },
+            );
+        }
+        self.shell_batches
+            .get_mut(&batch_id)
+            .expect("shell batch inserted")
+            .members
+            .push(item_id.to_owned());
     }
 
     fn ensure_active(&mut self, item_id: &str, kind: BlockKind, title: &str) -> &mut ActiveItem {
@@ -6832,6 +7138,13 @@ fn read_shell_display_mode() -> ShellDisplayMode {
         .unwrap_or_default()
 }
 
+fn read_diff_display_mode() -> DiffDisplayMode {
+    codex_home()
+        .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
+        .and_then(|config| parse_diff_display_mode(&config))
+        .unwrap_or_default()
+}
+
 fn parse_shell_display_mode(config: &str) -> Option<ShellDisplayMode> {
     config
         .lines()
@@ -6839,8 +7152,19 @@ fn parse_shell_display_mode(config: &str) -> Option<ShellDisplayMode> {
         .filter_map(|line| line.split('#').next())
         .filter_map(|line| line.split_once('='))
         .find_map(|(key, value)| {
-            (key.trim() == "shell_display_mode")
-                .then(|| ShellDisplayMode::from_config_value(value))
+            (key.trim() == "shell_display_mode").then(|| ShellDisplayMode::from_config_value(value))
+        })
+        .flatten()
+}
+
+fn parse_diff_display_mode(config: &str) -> Option<DiffDisplayMode> {
+    config
+        .lines()
+        .take_while(|line| !line.trim_start().starts_with('['))
+        .filter_map(|line| line.split('#').next())
+        .filter_map(|line| line.split_once('='))
+        .find_map(|(key, value)| {
+            (key.trim() == "diff_display_mode").then(|| DiffDisplayMode::from_config_value(value))
         })
         .flatten()
 }
@@ -7013,6 +7337,53 @@ mod tests {
         assert!(titles.is_empty());
         assert_eq!(state.committed.len(), 1);
         assert_eq!(state.committed[0].title, "Running 1 shell command");
+    }
+
+    #[test]
+    fn shell_output_before_started_never_enters_the_live_transcript() {
+        let mut state = test_state();
+        state.show_welcome = false;
+
+        state.handle_notification(
+            "item/commandExecution/outputDelta",
+            &json!({ "itemId": "cmd-1", "delta": "early output" }),
+        );
+
+        assert!(state.view().live_blocks.is_empty());
+        let anchor = state.drain_committed();
+        assert_eq!(anchor.len(), 1);
+        assert_eq!(anchor[0].title, "Running 1 shell command");
+
+        state.start_item(&json!({
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "command": "rg TODO"
+        }));
+        assert_eq!(state.active["cmd-1"].block.body, "early output");
+        state.complete_item(&json!({
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "command": "rg TODO",
+            "status": "completed",
+            "exitCode": 0
+        }));
+
+        let completed = state.drain_committed();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].children()[0].body, "early output");
+    }
+
+    #[test]
+    fn live_shell_is_hidden_by_batch_membership_not_its_running_title() {
+        let mut state = test_state();
+        state.start_item(&json!({
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "command": "rg TODO"
+        }));
+        state.active.get_mut("cmd-1").unwrap().block.title = "Running shell command".to_owned();
+
+        assert!(state.view().live_blocks.is_empty());
     }
 
     #[test]
@@ -7213,11 +7584,7 @@ mod tests {
                 .iter()
                 .all(|block| block.title == "Shell · 1 command · completed")
         );
-        assert!(
-            completed
-                .iter()
-                .all(|block| block.children().len() == 1)
-        );
+        assert!(completed.iter().all(|block| block.children().len() == 1));
         assert!(completed[0].children()[0].title.contains("rg TODO"));
         assert!(
             completed[1].children()[0]
@@ -7918,7 +8285,10 @@ mod tests {
             parse_shell_display_mode("[ui]\nshell_display_mode = \"hide\"\n"),
             None
         );
-        assert_eq!(parse_shell_display_mode("shell_display_mode = \"other\"\n"), None);
+        assert_eq!(
+            parse_shell_display_mode("shell_display_mode = \"other\"\n"),
+            None
+        );
     }
 
     #[test]
@@ -7957,6 +8327,40 @@ mod tests {
             state.run_slash_command("/btw quick question"),
             Action::StartSide(Some(message)) if message == "quick question"
         ));
+    }
+
+    #[test]
+    fn shell_diff_and_fast_commands_open_selectable_setting_pickers() {
+        let mut state = test_state();
+
+        assert!(matches!(state.run_slash_command("/shell"), Action::None));
+        let shell = state.overlay_view().expect("shell picker");
+        assert_eq!(shell.title, "Shell");
+        assert_eq!(
+            shell.slider.as_ref().expect("steps").efforts,
+            ["Hide", "Collapse", "Expand"]
+        );
+        assert!(matches!(
+            state.click_effort_step(2),
+            Action::PersistShellDisplayMode(ShellDisplayMode::Expand)
+        ));
+
+        assert!(matches!(state.run_slash_command("/diff"), Action::None));
+        assert_eq!(state.overlay_view().expect("diff picker").title, "Diff");
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            Action::None
+        ));
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::PersistDiffDisplayMode(DiffDisplayMode::Hide)
+        ));
+
+        assert!(matches!(state.run_slash_command("/fast"), Action::None));
+        let fast = state.overlay_view().expect("fast picker");
+        assert_eq!(fast.title, "Fast");
+        assert_eq!(fast.slider.as_ref().expect("steps").efforts, ["On", "Off"]);
+        assert!(matches!(state.click_effort_step(0), Action::SetFast(true)));
     }
 
     #[test]

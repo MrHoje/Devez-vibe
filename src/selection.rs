@@ -123,6 +123,7 @@ pub(crate) struct CopyLine {
     pub join_next: bool,
     pub marker_width: usize,
     pub prefix_width: usize,
+    pub content_columns: Option<Range<usize>>,
 }
 
 pub(crate) fn extract_text(lines: &[CopyLine], range: CellRange) -> String {
@@ -142,6 +143,14 @@ pub(crate) fn extract_text(lines: &[CopyLine], range: CellRange) -> String {
         }
 
         if let Some(mut columns) = range.columns_for_row(row, width) {
+            if let Some(content) = &line.content_columns {
+                columns.start = columns.start.max(content.start);
+                columns.end = columns.end.min(content.end);
+            }
+            if columns.start >= columns.end {
+                previous_row = Some(row);
+                continue;
+            }
             let continuation_width = if row > 0 && lines[row - 1].join_next {
                 line.prefix_width
             } else {
@@ -356,6 +365,7 @@ mod tests {
             join_next: false,
             marker_width: 0,
             prefix_width: 0,
+            content_columns: None,
         }
     }
 
@@ -409,12 +419,14 @@ mod tests {
                 join_next: true,
                 marker_width: 2,
                 prefix_width: 2,
+                content_columns: None,
             },
             CopyLine {
                 text: "  world".to_owned(),
                 join_next: false,
                 marker_width: 0,
                 prefix_width: 2,
+                content_columns: None,
             },
             line("next"),
         ];
@@ -454,6 +466,7 @@ mod tests {
             join_next: false,
             marker_width: 2,
             prefix_width: 2,
+            content_columns: None,
         }];
 
         assert_eq!(

@@ -28,7 +28,7 @@ use crate::{
         CellPosition, CellRange, CopyLine, Selection, SelectionFinish, extract_text,
         selected_char_count, selection_chunks,
     },
-    state::ShellDisplayMode,
+    state::{DiffDisplayMode, ShellDisplayMode},
     theme::{self, Rgb, ThemeKind},
 };
 
@@ -233,6 +233,7 @@ pub struct ComposerMode {
     pub accent: ModeAccent,
     pub fast_mode: bool,
     pub shell_display_mode: String,
+    pub diff_display_mode: String,
     /// What the thread is estimated to have cost so far. Absent before the first
     /// turn reports usage, and whenever the model has no published rate.
     pub cost: Option<String>,
@@ -253,6 +254,7 @@ pub struct View<'a> {
     pub composer_notice: Option<String>,
     pub composer_mode: Option<ComposerMode>,
     pub shell_display_mode: ShellDisplayMode,
+    pub diff_display_mode: DiffDisplayMode,
 }
 
 pub struct TerminalSession {
@@ -323,8 +325,12 @@ pub struct Renderer {
     /// the whole screen every keystroke, and re-wrapping the transcript each
     /// time would make typing cost O(transcript).
     wrapped: Vec<PaintLine>,
+    /// User prompt rows in `wrapped`, used to keep the current scroll context
+    /// visible after its original block has moved above the viewport.
+    prompt_anchors: Vec<PromptAnchor>,
     wrapped_width: u16,
     shell_display_mode: ShellDisplayMode,
+    diff_display_mode: DiffDisplayMode,
     expanded_tools: HashSet<u64>,
     hovered_tool: Option<u64>,
     painted_hovered_tool: Option<u64>,
@@ -334,6 +340,21 @@ pub struct Renderer {
     painted_hovered_pick: Option<Pick>,
     selection: Selection,
     painted_selection: Option<CellRange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PromptAnchor {
+    rows: Range<usize>,
+    text: String,
+}
+
+impl PromptAnchor {
+    fn new(rows: Range<usize>, text: impl Into<String>) -> Self {
+        Self {
+            rows,
+            text: text.into(),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -388,8 +409,10 @@ impl Renderer {
             history: Vec::new(),
             scroll_back: 0,
             wrapped: Vec::new(),
+            prompt_anchors: Vec::new(),
             wrapped_width: 0,
             shell_display_mode: ShellDisplayMode::Collapse,
+            diff_display_mode: DiffDisplayMode::Collapse,
             expanded_tools: HashSet::new(),
             hovered_tool: None,
             painted_hovered_tool: None,
@@ -434,6 +457,7 @@ impl Renderer {
     pub fn clear_screen(&mut self) -> Result<()> {
         self.history.clear();
         self.wrapped.clear();
+        self.prompt_anchors.clear();
         self.wrapped_width = 0;
         self.scroll_back = 0;
         self.expanded_tools.clear();
@@ -597,6 +621,7 @@ impl Renderer {
                     0
                 },
                 prefix_width: UnicodeWidthStr::width(line.prefix.as_str()),
+                content_columns: composer_content_columns(line),
             })
             .collect()
     }
@@ -630,11 +655,14 @@ impl Renderer {
         // put back whether or not a write fails partway.
         let history = std::mem::take(&mut self.history);
         let mut outcome = Ok(());
-        for block in visible_transcript_blocks(&history, self.shell_display_mode) {
+        for block in
+            visible_transcript_blocks(&history, self.shell_display_mode, self.diff_display_mode)
+        {
             let lines = block_group_lines(
                 block,
                 width,
                 self.shell_display_mode,
+                self.diff_display_mode,
                 self.expanded_tools.contains(&block.id()),
             );
             if let Err(error) = self.print_permanent(block, &lines) {
@@ -688,9 +716,11 @@ impl Renderer {
     }
 
     pub fn render(&mut self, committed: &[Block], view: View<'_>) -> Result<()> {
-        let mode_changed = self.shell_display_mode != view.shell_display_mode;
+        let mode_changed = self.shell_display_mode != view.shell_display_mode
+            || self.diff_display_mode != view.diff_display_mode;
         if mode_changed {
             self.shell_display_mode = view.shell_display_mode;
+            self.diff_display_mode = view.diff_display_mode;
             self.wrapped_width = 0;
             if self.mode == RenderMode::Inline {
                 self.relayout()?;
@@ -712,6 +742,7 @@ impl Renderer {
                 width.max(20),
                 &self.expanded_tools,
                 self.shell_display_mode,
+                self.diff_display_mode,
             )
         } else {
             normal_frame_with_expansion(
@@ -726,6 +757,7 @@ impl Renderer {
                 width.max(20),
                 &self.expanded_tools,
                 self.shell_display_mode,
+                self.diff_display_mode,
             )
         };
 
@@ -740,6 +772,7 @@ impl Renderer {
                 &self.history,
                 committed,
                 self.shell_display_mode,
+                self.diff_display_mode,
             );
         let needs_full_repaint = self.previous_lines.is_empty()
             || self.last_width != width
@@ -753,11 +786,16 @@ impl Renderer {
                 self.record_inline_history(committed);
                 self.relayout()?;
             } else {
-                for block in visible_transcript_blocks(committed, self.shell_display_mode) {
+                for block in visible_transcript_blocks(
+                    committed,
+                    self.shell_display_mode,
+                    self.diff_display_mode,
+                ) {
                     let lines = block_group_lines(
                         block,
                         width.max(20),
                         self.shell_display_mode,
+                        self.diff_display_mode,
                         false,
                     );
                     self.print_permanent(block, &lines)?;
@@ -807,12 +845,24 @@ impl Renderer {
         fit_frame(&mut frame, live_rows);
         let max_back = self.wrapped.len() - view_rows;
         self.scroll_back = self.scroll_back.min(max_back);
+        let normal_start = max_back - self.scroll_back;
+        let mut sticky = (self.scroll_back > 0)
+            .then(|| sticky_prompt_for_viewport(&self.prompt_anchors, normal_start, width))
+            .flatten();
+        let transcript_rows = view_rows.saturating_sub(usize::from(sticky.is_some()));
+        let max_back = self.wrapped.len() - transcript_rows;
+        self.scroll_back = self.scroll_back.min(max_back);
+        let start = max_back - self.scroll_back;
+        if sticky.is_some() {
+            sticky = sticky_prompt_for_viewport(&self.prompt_anchors, start, width);
+        }
         let (screen, cursor_line) = compose_screen(
             &self.wrapped,
             frame.lines,
             view_rows,
-            max_back - self.scroll_back,
+            start,
             frame.cursor_line,
+            sticky,
         );
 
         self.reconcile_selection(&screen);
@@ -853,6 +903,7 @@ impl Renderer {
                                 existing,
                                 width,
                                 self.shell_display_mode,
+                                self.diff_display_mode,
                                 self.expanded_tools.contains(&existing.id()),
                             )
                         })
@@ -862,6 +913,7 @@ impl Renderer {
                             &self.history[index],
                             width,
                             self.shell_display_mode,
+                            self.diff_display_mode,
                             self.expanded_tools.contains(&block.id()),
                         )
                         .len();
@@ -885,12 +937,20 @@ impl Renderer {
                     self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
                 }
             } else {
-                self.wrapped.extend(block_group_lines(
+                let start = self.wrapped.len();
+                let lines = block_group_lines(
                     block,
                     width,
                     self.shell_display_mode,
+                    self.diff_display_mode,
                     self.expanded_tools.contains(&block.id()),
-                ));
+                );
+                let end = start + lines.len().saturating_sub(1);
+                self.wrapped.extend(lines);
+                if matches!(block.kind, BlockKind::User) && start < end {
+                    self.prompt_anchors
+                        .push(PromptAnchor::new(start..end, prompt_anchor_text(block)));
+                }
                 if self.scroll_back > 0 {
                     let row_delta = self.wrapped.len() as isize - before as isize;
                     self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
@@ -900,17 +960,29 @@ impl Renderer {
     }
 
     fn rewrap(&mut self, width: u16) {
-        self.wrapped = visible_transcript_blocks(&self.history, self.shell_display_mode)
-            .into_iter()
-            .flat_map(|block| {
-                block_group_lines(
-                    block,
-                    width,
-                    self.shell_display_mode,
-                    self.expanded_tools.contains(&block.id()),
-                )
-            })
-            .collect();
+        let mut wrapped = Vec::new();
+        let mut prompt_anchors = Vec::new();
+        for block in visible_transcript_blocks(
+            &self.history,
+            self.shell_display_mode,
+            self.diff_display_mode,
+        ) {
+            let start = wrapped.len();
+            let lines = block_group_lines(
+                block,
+                width,
+                self.shell_display_mode,
+                self.diff_display_mode,
+                self.expanded_tools.contains(&block.id()),
+            );
+            let end = start + lines.len().saturating_sub(1);
+            wrapped.extend(lines);
+            if matches!(block.kind, BlockKind::User) && start < end {
+                prompt_anchors.push(PromptAnchor::new(start..end, prompt_anchor_text(block)));
+            }
+        }
+        self.wrapped = wrapped;
+        self.prompt_anchors = prompt_anchors;
         self.wrapped_width = width;
     }
 
@@ -942,11 +1014,11 @@ impl Renderer {
                 )
             });
             let selected_columns =
-                selection.and_then(|range| range.columns_for_row(row, painted_line_width(line)));
+                selection.and_then(|range| selection_columns_for_line(line, range, row));
             let previously_selected_columns = self.painted_selection.and_then(|range| {
                 self.previous_lines
                     .get(row)
-                    .and_then(|previous| range.columns_for_row(row, painted_line_width(previous)))
+                    .and_then(|previous| selection_columns_for_line(previous, range, row))
             });
             if !repaint_all
                 && self.previous_lines.get(row) == Some(line)
@@ -1128,10 +1200,15 @@ fn compose_screen(
     view_rows: usize,
     start: usize,
     live_cursor_line: usize,
+    sticky: Option<PaintLine>,
 ) -> (Vec<PaintLine>, usize) {
     let start = start.min(wrapped.len());
-    let end = (start + view_rows).min(wrapped.len());
+    let transcript_rows = view_rows.saturating_sub(usize::from(sticky.is_some()));
+    let end = (start + transcript_rows).min(wrapped.len());
     let mut screen = Vec::with_capacity(view_rows + live.len());
+    if let Some(sticky) = sticky {
+        screen.push(sticky);
+    }
     screen.extend(wrapped[start..end].iter().cloned());
     // `split_rows` never asks for more transcript than there is, so this only
     // guards the invariant rather than laying anything out.
@@ -1139,6 +1216,40 @@ fn compose_screen(
     let cursor_line = screen.len() + live_cursor_line;
     screen.extend(live);
     (screen, cursor_line)
+}
+
+fn prompt_anchor_text(block: &Block) -> String {
+    block
+        .body
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn sticky_prompt_for_viewport(
+    anchors: &[PromptAnchor],
+    viewport_start: usize,
+    width: u16,
+) -> Option<PaintLine> {
+    let anchor = anchors
+        .iter()
+        .rev()
+        .find(|anchor| anchor.rows.end <= viewport_start)?;
+    let prefix = "❯ ";
+    Some(PaintLine {
+        prefix: prefix.to_owned(),
+        prefix_tone: Tone::Plain,
+        text: compact_right(
+            &anchor.text,
+            usize::from(width).saturating_sub(UnicodeWidthStr::width(prefix)),
+        ),
+        tone: Tone::UserPrompt,
+        bold: true,
+        tool_heading: None,
+        pick: None,
+        tail: Vec::new(),
+    })
 }
 
 fn move_to_row(out: &mut Stdout, current_row: &mut usize, target_row: usize) -> Result<()> {
@@ -1206,6 +1317,8 @@ enum Tone {
     ModelLuna,
     Model55,
     Border,
+    /// Composer padding and side rules: visible chrome, never selectable text.
+    ComposerChrome,
     Branch,
     LimitFiveHour,
     LimitWeekly,
@@ -1245,6 +1358,8 @@ pub enum Pick {
     PermissionMode,
     /// The shell-display badge: cycles between hidden, collapsed, and expanded output.
     ShellDisplayMode,
+    /// The file-diff badge: cycles between hidden, summary, and full patch output.
+    DiffDisplayMode,
     /// The `Fast On`/`Fast Off` badge: toggles the fast service tier.
     FastMode,
     /// The status line's model name: opens `/model`.
@@ -1465,6 +1580,32 @@ fn painted_line_width(line: &PaintLine) -> usize {
     UnicodeWidthStr::width(painted_line_text(line).as_str())
 }
 
+/// The composer frame is printable so it stays stable across terminal themes,
+/// but its side rules and right-hand fill are not prompt text.
+fn composer_content_columns(line: &PaintLine) -> Option<Range<usize>> {
+    (line
+        .tail
+        .last()
+        .is_some_and(|span| span.tone == Tone::ComposerChrome && span.text == "│"))
+    .then(|| {
+        let start = UnicodeWidthStr::width(line.prefix.as_str());
+        start..start + UnicodeWidthStr::width(line.text.as_str())
+    })
+}
+
+fn selection_columns_for_line(
+    line: &PaintLine,
+    range: CellRange,
+    row: usize,
+) -> Option<Range<usize>> {
+    let mut selected = range.columns_for_row(row, painted_line_width(line))?;
+    if let Some(content) = composer_content_columns(line) {
+        selected.start = selected.start.max(content.start);
+        selected.end = selected.end.min(content.end);
+    }
+    (selected.start < selected.end).then_some(selected)
+}
+
 /// A drag paints only once it covers two characters. A click that wobbles by a
 /// hair — or that lands inside a wide glyph and drifts to its other cell — is a
 /// click, and flashing a highlight under a single character reads as noise
@@ -1479,8 +1620,7 @@ fn selection_is_worth_painting(range: CellRange, lines: &[PaintLine]) -> bool {
             break;
         };
         let text = painted_line_text(line);
-        let Some(columns) = range.columns_for_row(row, UnicodeWidthStr::width(text.as_str()))
-        else {
+        let Some(columns) = selection_columns_for_line(line, range, row) else {
             continue;
         };
         count += selected_char_count(&text, &columns, MINIMUM - count);
@@ -1514,6 +1654,7 @@ fn normal_frame(
         width,
         &HashSet::new(),
         ShellDisplayMode::Collapse,
+        DiffDisplayMode::Collapse,
     )
 }
 
@@ -1530,6 +1671,7 @@ fn normal_frame_with_expansion(
     width: u16,
     expanded_tools: &HashSet<u64>,
     shell_display_mode: ShellDisplayMode,
+    diff_display_mode: DiffDisplayMode,
 ) -> Frame {
     let mut lines = Vec::new();
     if let Some(welcome) = welcome {
@@ -1537,11 +1679,12 @@ fn normal_frame_with_expansion(
         lines.push(PaintLine::blank());
     }
 
-    for block in visible_transcript_blocks(live, shell_display_mode) {
+    for block in visible_transcript_blocks(live, shell_display_mode, diff_display_mode) {
         lines.extend(block_group_lines(
             block,
             width,
             shell_display_mode,
+            diff_display_mode,
             expanded_tools.contains(&block.id()),
         ));
     }
@@ -1561,20 +1704,13 @@ fn normal_frame_with_expansion(
     if !suggestions.is_empty() {
         lines.extend(suggestion_lines(suggestions, width));
     }
-    // The row directly above the composer is always reserved — blank when there
-    // is nothing to say, and the notice when there is. Keeping it there
-    // unconditionally is what stops a notice appearing or expiring from
-    // resizing the frame and shoving the transcript up or down a row.
+    // Keep the spacer directly above the composer reserved so a notice appearing
+    // on the bottom rule never resizes the frame or moves the transcript.
     if lines.last() == Some(&PaintLine::blank()) {
         lines.pop();
         dock_index = dock_index.min(lines.len());
     }
-    lines.push(match status.composer_notice.as_deref() {
-        // Folded onto one row for the same reason: a notice long enough to wrap
-        // would grow the frame.
-        Some(notice) => notice_row(notice, width),
-        None => PaintLine::blank(),
-    });
+    lines.push(PaintLine::blank());
 
     // Recalled history is labelled on the composer rule, so the position stays
     // visible for as long as the entry does.
@@ -1588,6 +1724,7 @@ fn normal_frame_with_expansion(
         width,
         &recalled,
         "",
+        status.composer_notice.as_deref(),
         status.composer_mode.as_ref(),
     );
     let cursor_line = lines.len() + input_cursor_line;
@@ -1600,24 +1737,6 @@ fn normal_frame_with_expansion(
         cursor_col: input_cursor_col,
         show_cursor: true,
         dock_index,
-    }
-}
-
-/// The transient notice that labels the composer rule. It is deliberately a
-/// single row: it lives in the frame's reserved spacer row, so it must never
-/// wrap.
-fn notice_row(notice: &str, width: u16) -> PaintLine {
-    let text = compact_right(notice, width as usize);
-    let padding = (width as usize).saturating_sub(UnicodeWidthStr::width(text.as_str()));
-    PaintLine {
-        prefix: String::new(),
-        prefix_tone: Tone::Accent,
-        text: format!("{}{}", " ".repeat(padding), text),
-        tone: Tone::Accent,
-        bold: false,
-        tool_heading: None,
-        pick: None,
-        tail: Vec::new(),
     }
 }
 
@@ -2327,6 +2446,7 @@ fn overlay_frame(
         width,
         &HashSet::new(),
         ShellDisplayMode::Collapse,
+        DiffDisplayMode::Collapse,
     )
 }
 
@@ -2338,6 +2458,7 @@ fn overlay_frame_with_expansion(
     width: u16,
     expanded_tools: &HashSet<u64>,
     shell_display_mode: ShellDisplayMode,
+    diff_display_mode: DiffDisplayMode,
 ) -> Frame {
     let mut lines = Vec::new();
     // A picker docks over the transcript rather than replacing the screen, so the
@@ -2348,11 +2469,12 @@ fn overlay_frame_with_expansion(
         lines.extend(welcome_lines(welcome, width));
         lines.push(PaintLine::blank());
     }
-    for block in visible_transcript_blocks(live, shell_display_mode) {
+    for block in visible_transcript_blocks(live, shell_display_mode, diff_display_mode) {
         lines.extend(block_group_lines(
             block,
             width,
             shell_display_mode,
+            diff_display_mode,
             expanded_tools.contains(&block.id()),
         ));
     }
@@ -2537,6 +2659,7 @@ fn overlay_frame_with_expansion(
             width,
             overlay.input_label,
             overlay.input_placeholder,
+            None,
             status.composer_mode.as_ref(),
         );
         cursor_line = lines.len() + input_cursor_line;
@@ -2766,6 +2889,16 @@ fn is_thinking_block(block: &Block) -> bool {
     matches!(block.kind, BlockKind::Reasoning) && block.title == THINKING_TITLE
 }
 
+fn is_file_change_block(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::FileChange)
+}
+
+/// Compaction is a transcript milestone, not a response boundary. In Shell Hide
+/// it must not keep the stale pre-command thinking placeholder alive.
+fn is_context_compaction_block(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::System) && block.title == "Context compacted"
+}
+
 /// Shell anchors are deliberately ordinary tool blocks while they run, so
 /// Collapse can still show their progress. Hide filters them alongside completed
 /// Shell groups before rendering; that also lets two thoughts separated only by
@@ -2773,6 +2906,7 @@ fn is_thinking_block(block: &Block) -> bool {
 fn visible_transcript_blocks<'a>(
     blocks: &'a [Block],
     shell_display_mode: ShellDisplayMode,
+    diff_display_mode: DiffDisplayMode,
 ) -> Vec<&'a Block> {
     let mut visible: Vec<&Block> = Vec::with_capacity(blocks.len());
     for block in blocks {
@@ -2781,12 +2915,23 @@ fn visible_transcript_blocks<'a>(
         {
             continue;
         }
-        if is_thinking_block(block)
-            && visible
-                .last()
-                .is_some_and(|previous| is_thinking_block(previous))
-        {
-            visible.pop();
+        if diff_display_mode == DiffDisplayMode::Hide && is_file_change_block(block) {
+            continue;
+        }
+        if is_thinking_block(block) {
+            let prior_thinking = visible
+                .iter()
+                .rposition(|previous| is_thinking_block(previous));
+            let adjacent_thinking = prior_thinking.is_some_and(|index| index + 1 == visible.len());
+            let only_compaction_since = shell_display_mode == ShellDisplayMode::Hide
+                && prior_thinking.is_some_and(|index| {
+                    visible[index + 1..]
+                        .iter()
+                        .all(|previous| is_context_compaction_block(previous))
+                });
+            if adjacent_thinking || only_compaction_since {
+                visible.remove(prior_thinking.expect("thinking index present"));
+            }
         }
         visible.push(block);
     }
@@ -2797,14 +2942,26 @@ fn hidden_thinking_merge_at_history_boundary(
     history: &[Block],
     committed: &[Block],
     shell_display_mode: ShellDisplayMode,
+    diff_display_mode: DiffDisplayMode,
 ) -> bool {
     if shell_display_mode != ShellDisplayMode::Hide {
         return false;
     }
-    let history = visible_transcript_blocks(history, shell_display_mode);
-    let committed = visible_transcript_blocks(committed, shell_display_mode);
-    history.last().is_some_and(|block| is_thinking_block(block))
-        && committed.first().is_some_and(|block| is_thinking_block(block))
+    let before = visible_transcript_blocks(history, shell_display_mode, diff_display_mode);
+    if before.is_empty() || committed.is_empty() {
+        return false;
+    }
+    let mut combined = Vec::with_capacity(history.len() + committed.len());
+    combined.extend_from_slice(history);
+    combined.extend_from_slice(committed);
+    let after = visible_transcript_blocks(&combined, shell_display_mode, diff_display_mode);
+
+    // Inline output is permanent once printed. If filtering the just-completed
+    // batch removes an older thought (including across a compaction card), repaint
+    // the transcript instead of leaving that stale Thinking row on screen.
+    before
+        .iter()
+        .any(|previous| !after.iter().any(|current| current.id() == previous.id()))
 }
 
 fn bash_lines(block: &Block, width: u16, expanded: bool) -> Vec<PaintLine> {
@@ -2955,6 +3112,44 @@ fn append_bash_preview_output(
 /// but low enough that a sweeping refactor can't push the turn off screen.
 const FILE_CHANGE_ROWS: usize = 40;
 
+fn file_change_summary_lines(block: &Block, width: u16) -> Vec<PaintLine> {
+    let mut lines = file_change_heading_lines(block, width);
+    let (added, removed) = file_change_counts(block);
+    lines.extend(wrapped_line(
+        "  ⎿ ",
+        Tone::Muted,
+        &format!("Added {added} · Removed {removed}"),
+        Tone::Muted,
+        false,
+        width,
+    ));
+    lines
+}
+
+fn file_change_heading_lines(block: &Block, width: u16) -> Vec<PaintLine> {
+    let mut lines = wrapped_line("● ", Tone::Plain, &block.title, Tone::Plain, true, width);
+    for line in &mut lines {
+        line.tool_heading = Some(block.id());
+    }
+    lines
+}
+
+fn file_change_counts(block: &Block) -> (usize, usize) {
+    block
+        .body
+        .lines()
+        .skip(1)
+        .fold((0usize, 0usize), |(added, removed), row| {
+            if row.starts_with('+') && !row.starts_with("+++") {
+                (added + 1, removed)
+            } else if row.starts_with('-') && !row.starts_with("---") {
+                (added, removed + 1)
+            } else {
+                (added, removed)
+            }
+        })
+}
+
 /// File edits use an `Update(path)` heading, line counts hanging off it under a
 /// `⎿`, then the patch itself in a line-number
 /// gutter. `+`/`-` rows carry the diff tint the whole way to the right edge, which
@@ -2962,7 +3157,7 @@ const FILE_CHANGE_ROWS: usize = 40;
 /// numbers rather than printed — the gutter says the same thing somewhere more
 /// useful.
 fn file_change_lines(block: &Block, width: u16) -> Vec<PaintLine> {
-    let mut lines = wrapped_line("● ", Tone::Plain, &block.title, Tone::Plain, true, width);
+    let mut lines = file_change_heading_lines(block, width);
     let mut rows = block.body.lines();
     if let Some(summary) = rows.next() {
         lines.extend(styled_lines(
@@ -3326,9 +3521,16 @@ fn block_group_lines(
     block: &Block,
     width: u16,
     shell_display_mode: ShellDisplayMode,
+    diff_display_mode: DiffDisplayMode,
     expanded: bool,
 ) -> Vec<PaintLine> {
-    let mut lines = block_lines_with_mode(block, width, shell_display_mode, expanded);
+    let mut lines = block_lines_with_mode(
+        block,
+        width,
+        shell_display_mode,
+        diff_display_mode,
+        expanded,
+    );
     while matches!(lines.last(), Some(line) if line == &PaintLine::blank()) {
         lines.pop();
     }
@@ -3342,6 +3544,7 @@ fn block_lines_with_mode(
     block: &Block,
     width: u16,
     shell_display_mode: ShellDisplayMode,
+    diff_display_mode: DiffDisplayMode,
     expanded: bool,
 ) -> Vec<PaintLine> {
     if is_bash_block(block) {
@@ -3377,7 +3580,13 @@ fn block_lines_with_mode(
         return tool_lines(block, width);
     }
     if matches!(block.kind, BlockKind::FileChange) {
-        return file_change_lines(block, width);
+        return match diff_display_mode {
+            DiffDisplayMode::Hide => Vec::new(),
+            DiffDisplayMode::Collapse if expanded => file_change_lines(block, width),
+            DiffDisplayMode::Collapse => file_change_summary_lines(block, width),
+            DiffDisplayMode::Expand if expanded => file_change_summary_lines(block, width),
+            DiffDisplayMode::Expand => file_change_lines(block, width),
+        };
     }
     if matches!(block.kind, BlockKind::ModelChange) {
         let mut lines = vec![PaintLine {
@@ -3555,7 +3764,13 @@ fn block_lines_with_mode(
 
 #[cfg(test)]
 fn block_lines_with_expansion(block: &Block, width: u16, expanded: bool) -> Vec<PaintLine> {
-    block_lines_with_mode(block, width, ShellDisplayMode::Collapse, expanded)
+    block_lines_with_mode(
+        block,
+        width,
+        ShellDisplayMode::Collapse,
+        DiffDisplayMode::Expand,
+        expanded,
+    )
 }
 
 fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
@@ -4236,19 +4451,25 @@ fn input_lines(
     width: u16,
     label: &str,
     placeholder: &str,
+    notice: Option<&str>,
     mode: Option<&ComposerMode>,
 ) -> (Vec<PaintLine>, usize, usize) {
     let (display, editor_cursor) = composer_display(editor, composer_images);
     let display_chars = display.chars().collect::<Vec<_>>();
     let panel_width = (width as usize).saturating_sub(1).max(16);
+    let side_prefix = "│ ";
     let first_prefix = "> ";
     let continuation_prefix = "  ";
     let content_width = panel_width
-        .saturating_sub(UnicodeWidthStr::width(first_prefix))
+        .saturating_sub(
+            UnicodeWidthStr::width(side_prefix) + UnicodeWidthStr::width(first_prefix) + 1,
+        )
         .max(4);
     let mut raw_rows = vec![String::new()];
     let mut row = 0;
-    let mut column = UnicodeWidthStr::width(first_prefix);
+    let input_prefix_width =
+        UnicodeWidthStr::width(side_prefix) + UnicodeWidthStr::width(first_prefix);
+    let mut column = input_prefix_width;
     let mut cursor_row = 0;
     let mut cursor_column = column;
 
@@ -4261,20 +4482,16 @@ fn input_lines(
         if ch == '\n' {
             raw_rows.push(String::new());
             row += 1;
-            column = UnicodeWidthStr::width(continuation_prefix);
+            column = input_prefix_width;
             continue;
         }
 
         let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        let content_column = column.saturating_sub(UnicodeWidthStr::width(if row == 0 {
-            first_prefix
-        } else {
-            continuation_prefix
-        }));
+        let content_column = column.saturating_sub(input_prefix_width);
         if content_column + ch_width > content_width && !raw_rows[row].is_empty() {
             raw_rows.push(String::new());
             row += 1;
-            column = UnicodeWidthStr::width(continuation_prefix);
+            column = input_prefix_width;
             if index == editor.cursor() {
                 cursor_row = row;
                 cursor_column = column;
@@ -4292,21 +4509,22 @@ fn input_lines(
     let mut rows = Vec::with_capacity(raw_rows.len() + 2);
     rows.push(input_top_line(panel_width, label, mode));
     for (index, raw) in raw_rows.into_iter().enumerate() {
-        let is_placeholder = editor.is_empty() && index == 0;
+        let is_placeholder = editor.is_empty() && composer_images.is_empty() && index == 0;
         let content = if is_placeholder {
             placeholder.to_owned()
         } else {
             raw
         };
+        let prompt_prefix = if index == 0 {
+            first_prefix
+        } else {
+            continuation_prefix
+        };
+        let content_width = UnicodeWidthStr::width(content.as_str());
         rows.push(PaintLine {
-            prefix: if index == 0 {
-                first_prefix.to_owned()
-            } else {
-                continuation_prefix.to_owned()
-            },
-            // Prompt marker and cursor stay in the terminal's own colour.
-            prefix_tone: Tone::Plain,
-            text: content,
+            prefix: side_prefix.to_owned(),
+            prefix_tone: Tone::Border,
+            text: format!("{prompt_prefix}{content}"),
             tone: if is_placeholder {
                 Tone::Muted
             } else {
@@ -4315,21 +4533,28 @@ fn input_lines(
             bold: false,
             tool_heading: None,
             pick: None,
-            tail: Vec::new(),
+            tail: vec![
+                PaintSpan {
+                    text: " ".repeat(panel_width.saturating_sub(
+                        UnicodeWidthStr::width(side_prefix)
+                            + UnicodeWidthStr::width(prompt_prefix)
+                            + content_width
+                            + 1,
+                    )),
+                    tone: Tone::ComposerChrome,
+                    bold: false,
+                },
+                PaintSpan {
+                    text: "│".to_owned(),
+                    tone: Tone::ComposerChrome,
+                    bold: false,
+                },
+            ],
         });
     }
     // Both composer rules share the welcome card's border colour, so the frame
     // around the prompt reads as the same furniture the panels are drawn from.
-    rows.push(PaintLine {
-        prefix: String::new(),
-        prefix_tone: Tone::Border,
-        text: "─".repeat(panel_width),
-        tone: Tone::Border,
-        bold: false,
-        tool_heading: None,
-        pick: None,
-        tail: Vec::new(),
-    });
+    rows.push(input_bottom_line(panel_width, notice));
 
     (rows, cursor_row + 1, cursor_column)
 }
@@ -4340,6 +4565,10 @@ const COMPOSER_RULE_MIN: usize = 4;
 const COMPOSER_MODE_GAP: usize = 2;
 /// Rule segment trailing the mode badge, so the line reads as unbroken.
 const COMPOSER_MODE_TAIL_RULE: usize = 2;
+/// Blank columns between the bottom rule and a transient notice.
+const COMPOSER_NOTICE_GAP: usize = 2;
+/// Rule segment trailing a transient notice at the right edge.
+const COMPOSER_NOTICE_TAIL_RULE: usize = 2;
 /// Separator between the permission mode and the fast-tier flag.
 const COMPOSER_BADGE_SEPARATOR: &str = " · ";
 
@@ -4378,6 +4607,11 @@ fn input_top_line(panel_width: usize, label: &str, mode: Option<&ComposerMode>) 
             badge
                 .shell_display_mode_index
                 .map(|index| (badge_start + index, Pick::ShellDisplayMode)),
+        );
+        picks.extend(
+            badge
+                .diff_display_mode_index
+                .map(|index| (badge_start + index, Pick::DiffDisplayMode)),
         );
         picks.push((badge_start + badge.mode_index, Pick::PermissionMode));
         picks.extend(
@@ -4437,8 +4671,52 @@ fn input_top_line(panel_width: usize, label: &str, mode: Option<&ComposerMode>) 
     .with_picks(&picks)
 }
 
+fn input_bottom_line(panel_width: usize, notice: Option<&str>) -> PaintLine {
+    let Some(notice) = notice else {
+        return PaintLine {
+            prefix: String::new(),
+            prefix_tone: Tone::Border,
+            text: "─".repeat(panel_width),
+            tone: Tone::Border,
+            bold: false,
+            tool_heading: None,
+            pick: None,
+            tail: Vec::new(),
+        };
+    };
+
+    let reserved = COMPOSER_NOTICE_GAP + 1 + COMPOSER_NOTICE_TAIL_RULE;
+    let notice = compact_right(notice, panel_width.saturating_sub(reserved));
+    let fill =
+        "─".repeat(panel_width.saturating_sub(UnicodeWidthStr::width(notice.as_str()) + reserved));
+    PaintLine {
+        prefix: String::new(),
+        prefix_tone: Tone::Border,
+        text: fill,
+        tone: Tone::Border,
+        bold: false,
+        tool_heading: None,
+        pick: None,
+        tail: vec![
+            rule_gap(COMPOSER_NOTICE_GAP),
+            PaintSpan {
+                text: notice,
+                tone: Tone::Accent,
+                bold: false,
+            },
+            rule_gap(1),
+            PaintSpan {
+                text: "─".repeat(COMPOSER_NOTICE_TAIL_RULE),
+                tone: Tone::Border,
+                bold: false,
+            },
+        ],
+    }
+}
+
 /// Widest badge that fits in `budget`: estimated cost · permission mode ·
-/// Shell display mode · fast flag. Tightening drops cost, then fast, then Shell;
+/// Shell display mode · Diff display mode · fast flag. Tightening drops cost,
+/// then fast, then Diff, then Shell;
 /// permission mode remains. Parts are never ellipsized — a half-written mode
 /// name or a clipped price is worse than none.
 fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans> {
@@ -4465,6 +4743,11 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
 
     let shell_display_mode_span = PaintSpan {
         text: format!("Shell: {}", mode.shell_display_mode),
+        tone: Tone::Muted,
+        bold: false,
+    };
+    let diff_display_mode_span = PaintSpan {
+        text: format!("Diff: {}", mode.diff_display_mode),
         tone: Tone::Muted,
         bold: false,
     };
@@ -4495,33 +4778,45 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
                 cost_spans,
                 vec![mode_span.clone(), separator_span()],
                 vec![shell_display_mode_span.clone(), separator_span()],
+                vec![diff_display_mode_span.clone(), separator_span()],
                 vec![fast_span.clone()],
             ]
             .concat(),
             shell_display_mode_index: Some(cost_width + 2),
+            diff_display_mode_index: Some(cost_width + 4),
             mode_index: cost_width,
-            fast_index: Some(cost_width + 4),
+            fast_index: Some(cost_width + 6),
         },
         BadgeSpans {
             spans: [
                 vec![mode_span.clone(), separator_span()],
                 vec![shell_display_mode_span.clone(), separator_span()],
+                vec![diff_display_mode_span.clone(), separator_span()],
                 vec![fast_span],
             ]
             .concat(),
             shell_display_mode_index: Some(2),
+            diff_display_mode_index: Some(4),
             mode_index: 0,
-            fast_index: Some(4),
+            fast_index: Some(6),
         },
         BadgeSpans {
-            spans: vec![mode_span.clone(), separator_span(), shell_display_mode_span],
+            spans: vec![
+                mode_span.clone(),
+                separator_span(),
+                shell_display_mode_span,
+                separator_span(),
+                diff_display_mode_span,
+            ],
             shell_display_mode_index: Some(2),
+            diff_display_mode_index: Some(4),
             mode_index: 0,
             fast_index: None,
         },
         BadgeSpans {
             spans: vec![mode_span],
             shell_display_mode_index: None,
+            diff_display_mode_index: None,
             mode_index: 0,
             fast_index: None,
         },
@@ -4537,6 +4832,7 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
 struct BadgeSpans {
     spans: Vec<PaintSpan>,
     shell_display_mode_index: Option<usize>,
+    diff_display_mode_index: Option<usize>,
     mode_index: usize,
     fast_index: Option<usize>,
 }
@@ -4893,7 +5189,7 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::ModelTerra => palette.pink,
         Tone::ModelLuna => palette.purple,
         Tone::Model55 => palette.blue,
-        Tone::Border => palette.border,
+        Tone::Border | Tone::ComposerChrome => palette.border,
         Tone::Branch => palette.status.branch,
         Tone::LimitFiveHour => palette.status.five_hour,
         Tone::LimitWeekly => palette.status.weekly,
@@ -5142,11 +5438,11 @@ mod tests {
     }
 
     #[test]
-    fn composer_rows_do_not_emit_side_borders_or_copy_padding() {
+    fn composer_rows_render_as_a_closed_box() {
         let mut editor = Editor::default();
         editor.set_text("wrapped-prompt-text");
 
-        let (rows, _, _) = input_lines(&editor, &[], 18, "", "placeholder", None);
+        let (rows, _, _) = input_lines(&editor, &[], 18, "", "placeholder", None, None);
         let prompt_rows = &rows[1..rows.len() - 1];
 
         assert!(prompt_rows.len() > 1);
@@ -5155,16 +5451,42 @@ mod tests {
         // Both rules are drawn in the same border colour the welcome card uses.
         assert!(rows[0].tone == Tone::Border);
         assert!(rows.last().is_some_and(|row| row.tone == Tone::Border));
-        assert_eq!(prompt_rows[0].prefix, "> ");
-        assert_eq!(prompt_rows[1].prefix, "  ");
+        assert_eq!(painted(&prompt_rows[0]), "│ > wrapped-prom│");
+        assert_eq!(painted(&prompt_rows[1]), "│   pt-text     │");
         assert!(!rows[0].text.contains(['╭', '╮', '╰', '╯']));
         assert!(
             rows.last()
                 .is_some_and(|row| row.text.chars().all(|ch| ch == '─'))
         );
-        assert!(prompt_rows.iter().all(|row| !row.prefix.contains('│')));
-        assert!(prompt_rows.iter().all(|row| !row.text.ends_with(' ')));
-        assert!(prompt_rows.iter().all(|row| !row.text.contains('│')));
+    }
+
+    #[test]
+    fn fullscreen_composer_copy_excludes_the_box_chrome() {
+        let mut editor = Editor::default();
+        editor.set_text("copy");
+        let (rows, _, _) = input_lines(&editor, &[], 18, "", "placeholder", None, None);
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = rows;
+
+        assert!(renderer.begin_selection(0, 1));
+        assert!(renderer.update_selection(16, 1));
+        assert_eq!(
+            renderer.finish_selection(16, 1),
+            SelectionResult::Copy("> copy".to_owned())
+        );
+    }
+
+    #[test]
+    fn fullscreen_composer_highlight_excludes_the_box_chrome() {
+        let mut editor = Editor::default();
+        editor.set_text("copy");
+        let (rows, _, _) = input_lines(&editor, &[], 18, "", "placeholder", None, None);
+        let range = CellRange {
+            start: CellPosition { column: 0, row: 1 },
+            end: CellPosition { column: 16, row: 1 },
+        };
+
+        assert_eq!(selection_columns_for_line(&rows[1], range, 1), Some(2..8));
     }
 
     #[test]
@@ -5203,6 +5525,16 @@ mod tests {
 
         assert_eq!(display, r"[Image #1] inspect C:\tmp\ordinary.png");
         assert_eq!(cursor, display.chars().count());
+    }
+
+    #[test]
+    fn input_lines_show_image_labels_when_the_text_editor_is_empty() {
+        let editor = Editor::default();
+        let images = vec![r"C:\Temp\clipboard-image.bmp".to_owned()];
+
+        let (rows, _, _) = input_lines(&editor, &images, 80, "", "", None, None);
+
+        assert_eq!(rows[1].text, "> [Image #1] ");
     }
 
     #[test]
@@ -5539,6 +5871,94 @@ mod tests {
         );
     }
 
+    #[test]
+    fn diff_display_modes_hide_summarize_or_expand_a_file_change() {
+        let block = Block::new(
+            BlockKind::FileChange,
+            "Update(a.rs)",
+            "Added 2 lines, removed 1 line\n@@ -1 +1 @@\n-old\n+new\n+extra",
+        );
+
+        assert!(
+            block_lines_with_mode(
+                &block,
+                80,
+                ShellDisplayMode::Collapse,
+                DiffDisplayMode::Hide,
+                false,
+            )
+            .is_empty()
+        );
+
+        let collapsed = block_lines_with_mode(
+            &block,
+            80,
+            ShellDisplayMode::Collapse,
+            DiffDisplayMode::Collapse,
+            false,
+        );
+        assert_eq!(collapsed.len(), 2);
+        assert_eq!(painted(&collapsed[1]), "  ⎿ Added 2 · Removed 1");
+
+        let expanded = block_lines_with_mode(
+            &block,
+            80,
+            ShellDisplayMode::Collapse,
+            DiffDisplayMode::Expand,
+            false,
+        );
+        assert!(expanded.iter().any(|line| painted(line).contains("old")));
+        assert!(expanded.iter().any(|line| painted(line).contains("new")));
+    }
+
+    #[test]
+    fn clicking_a_file_change_heading_toggles_its_patch_and_hover() {
+        let block = Block::new(
+            BlockKind::FileChange,
+            "Update(a.rs)",
+            "Added 1 line, removed 1 line\n@@ -1 +1 @@\n-old\n+new",
+        );
+        let id = block.id();
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.diff_display_mode = DiffDisplayMode::Collapse;
+        renderer.history.push(block);
+        renderer.rewrap(80);
+        renderer.previous_lines = renderer.wrapped.clone();
+
+        assert!(renderer.hover_at(3, 0));
+        assert_eq!(renderer.hovered_tool, Some(id));
+        assert!(renderer.toggle_tool_at(0));
+        assert!(renderer.expanded_tools.contains(&id));
+        assert!(
+            renderer
+                .wrapped
+                .iter()
+                .any(|line| painted(line).contains("old"))
+        );
+
+        assert!(renderer.toggle_tool_at(0));
+        assert!(!renderer.expanded_tools.contains(&id));
+        assert!(
+            renderer
+                .wrapped
+                .iter()
+                .all(|line| !painted(line).contains("old"))
+        );
+
+        renderer.diff_display_mode = DiffDisplayMode::Expand;
+        renderer.rewrap(80);
+        renderer.previous_lines = renderer.wrapped.clone();
+        assert!(renderer.toggle_tool_at(0));
+        assert!(renderer.expanded_tools.contains(&id));
+        assert!(
+            renderer
+                .wrapped
+                .iter()
+                .all(|line| !painted(line).contains("old")),
+            "the per-file toggle collapses an otherwise expanded diff"
+        );
+    }
+
     /// Summaries end with `[file](path:line)` links; the raw markdown used to wrap
     /// mid-path across two rows, so the label — plus the line number — is all we keep.
     #[test]
@@ -5575,11 +5995,10 @@ mod tests {
         assert_eq!(line_suffix("src/main.rs:83:12").as_deref(), Some(":83:12"));
     }
 
-    /// The notice used to share the composer rule with the permission badge; it now
-    /// owns the row directly above it so neither has to be squeezed, and it sits
-    /// flush against the rule so it reads as a label on it.
+    /// The transient notice belongs to the composer bottom rule, leaving the spacer
+    /// row above the input untouched.
     #[test]
-    fn transient_notice_sits_flush_on_the_composer_rule() {
+    fn transient_notice_sits_on_the_composer_bottom_rule() {
         let editor = Editor::default();
         let frame = normal_frame(
             &[],
@@ -5599,22 +6018,30 @@ mod tests {
         let notice = frame
             .lines
             .iter()
-            .position(|line| line.text.contains("Copied 12 chars to clipboard"))
+            .position(|line| {
+                line.tail
+                    .iter()
+                    .any(|span| span.text == "Copied 12 chars to clipboard")
+            })
             .expect("notice row");
         assert_eq!(
             frame.lines[notice].tone,
+            Tone::Border,
+            "the composer rule should keep its border tone"
+        );
+        assert!(
+            frame.lines[notice].text.chars().all(|ch| ch == '─'),
+            "the notice should sit on the rule, not replace it"
+        );
+        assert_eq!(
+            frame.lines[notice].tail[1].tone,
             Tone::Accent,
             "notice is off-theme"
-        );
-        let rule = &frame.lines[notice + 1];
-        assert!(
-            !rule.text.is_empty() && rule.text.chars().all(|ch| ch == '─'),
-            "the composer rule should follow with no blank between"
         );
     }
 
     #[test]
-    fn transient_notice_is_right_aligned_above_the_composer_rule() {
+    fn transient_notice_is_right_aligned_on_the_composer_bottom_rule() {
         let editor = Editor::default();
         let frame = normal_frame(
             &[],
@@ -5634,11 +6061,15 @@ mod tests {
         let notice = frame
             .lines
             .iter()
-            .find(|line| line.text.contains("Copied 12 chars to clipboard"))
+            .find(|line| {
+                line.tail
+                    .iter()
+                    .any(|span| span.text == "Copied 12 chars to clipboard")
+            })
             .expect("notice row");
         assert_eq!(
-            notice.text,
-            format!("{}Copied 12 chars to clipboard", " ".repeat(52))
+            painted(notice),
+            format!("{}  Copied 12 chars to clipboard ──", "─".repeat(46))
         );
     }
 
@@ -5918,20 +6349,21 @@ mod tests {
             fast_mode,
             cost: None,
             shell_display_mode: "Collapse".to_owned(),
+            diff_display_mode: "Collapse".to_owned(),
         }
     }
 
     #[test]
     fn composer_controls_sit_inside_the_composer_rule() {
         let mode = test_mode("Full Access", ModeAccent::Danger, true);
-        let line = input_top_line(50, "", Some(&mode));
+        let line = input_top_line(80, "", Some(&mode));
         let texts = line
             .tail
             .iter()
             .map(|span| span.text.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(rule_width(&line), 50);
+        assert_eq!(rule_width(&line), 80);
         assert!(line.text.chars().all(|ch| ch == '─'));
         // Two blanks off the rule, the badge, then the rule resumes for two columns.
         assert_eq!(
@@ -5942,13 +6374,15 @@ mod tests {
                 " · ",
                 "Shell: Collapse",
                 " · ",
+                "Diff: Collapse",
+                " · ",
                 "Fast On",
                 " ",
                 "──"
             ]
         );
         assert_eq!(line.tail[1].tone, Tone::Warning);
-        assert_eq!(line.tail[5].tone, Tone::FastOn);
+        assert_eq!(line.tail[7].tone, Tone::FastOn);
     }
 
     /// What the row answers with at the first column of `label`.
@@ -5973,10 +6407,18 @@ mod tests {
     #[test]
     fn the_two_composer_badges_answer_to_their_own_columns() {
         let mode = test_mode("Full Access", ModeAccent::Danger, true);
-        let line = input_top_line(50, "", Some(&mode));
+        let line = input_top_line(80, "", Some(&mode));
         let text = painted(&line);
 
         assert_eq!(pick_on(&line, "Full Access"), Some(Pick::PermissionMode));
+        assert_eq!(
+            pick_on(&line, "Shell: Collapse"),
+            Some(Pick::ShellDisplayMode)
+        );
+        assert_eq!(
+            pick_on(&line, "Diff: Collapse"),
+            Some(Pick::DiffDisplayMode)
+        );
         assert_eq!(pick_on(&line, "Fast On"), Some(Pick::FastMode));
         // The last column of the mode label still counts as the mode.
         let mode_end = UnicodeWidthStr::width(&text[..text.find("Full Access").unwrap()]) + 10;
@@ -5997,7 +6439,7 @@ mod tests {
     fn the_cost_and_a_rule_label_do_not_move_the_badges_out_from_under_the_click() {
         let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
         mode.cost = Some("$0.95".to_owned());
-        let line = input_top_line(70, "3/12", Some(&mode));
+        let line = input_top_line(90, "3/12", Some(&mode));
 
         assert_eq!(pick_on(&line, "Full Access"), Some(Pick::PermissionMode));
         assert_eq!(pick_on(&line, "Fast On"), Some(Pick::FastMode));
@@ -6024,14 +6466,14 @@ mod tests {
     #[test]
     fn fast_off_is_toned_down_beside_the_permission_mode() {
         let mode = test_mode("Default", ModeAccent::Safe, false);
-        let line = input_top_line(50, "", Some(&mode));
+        let line = input_top_line(80, "", Some(&mode));
         let texts = line
             .tail
             .iter()
             .map(|span| span.text.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(rule_width(&line), 50);
+        assert_eq!(rule_width(&line), 80);
         assert_eq!(
             texts,
             [
@@ -6040,26 +6482,28 @@ mod tests {
                 " · ",
                 "Shell: Collapse",
                 " · ",
+                "Diff: Collapse",
+                " · ",
                 "Fast Off",
                 " ",
                 "──"
             ]
         );
-        assert_eq!(line.tail[5].tone, Tone::FastOff);
+        assert_eq!(line.tail[7].tone, Tone::FastOff);
     }
 
     #[test]
     fn estimated_cost_leads_the_badge() {
         let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
         mode.cost = Some("$0.95".to_owned());
-        let line = input_top_line(60, "", Some(&mode));
+        let line = input_top_line(80, "", Some(&mode));
         let texts = line
             .tail
             .iter()
             .map(|span| span.text.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(rule_width(&line), 60);
+        assert_eq!(rule_width(&line), 80);
         assert_eq!(
             texts,
             [
@@ -6070,6 +6514,8 @@ mod tests {
                 " · ",
                 "Shell: Collapse",
                 " · ",
+                "Diff: Collapse",
+                " · ",
                 "Fast On",
                 " ",
                 "──"
@@ -6078,7 +6524,8 @@ mod tests {
         assert_eq!(line.tail[1].tone, Tone::Plain);
         assert_eq!(line.tail[3].tone, Tone::Warning);
         assert_eq!(line.tail[5].tone, Tone::Muted);
-        assert_eq!(line.tail[7].tone, Tone::FastOn);
+        assert_eq!(line.tail[7].tone, Tone::Muted);
+        assert_eq!(line.tail[9].tone, Tone::FastOn);
     }
 
     #[test]
@@ -6100,6 +6547,8 @@ mod tests {
                 " · ",
                 "Shell: Collapse",
                 " · ",
+                "Diff: Collapse",
+                " · ",
                 "Fast On",
                 " ",
                 "──"
@@ -6109,6 +6558,10 @@ mod tests {
             pick_on(&line, "Shell: Collapse"),
             Some(Pick::ShellDisplayMode)
         );
+        assert_eq!(
+            pick_on(&line, "Diff: Collapse"),
+            Some(Pick::DiffDisplayMode)
+        );
     }
 
     /// The cost is the first thing to go: it is the least load-bearing segment.
@@ -6116,14 +6569,14 @@ mod tests {
     fn the_cost_is_dropped_before_the_fast_flag() {
         let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
         mode.cost = Some("$0.95".to_owned());
-        let line = input_top_line(48, "", Some(&mode));
+        let line = input_top_line(66, "", Some(&mode));
         let texts = line
             .tail
             .iter()
             .map(|span| span.text.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(rule_width(&line), 48);
+        assert_eq!(rule_width(&line), 66);
         assert_eq!(
             texts,
             [
@@ -6131,6 +6584,8 @@ mod tests {
                 "Full Access",
                 " · ",
                 "Shell: Collapse",
+                " · ",
+                "Diff: Collapse",
                 " · ",
                 "Fast On",
                 " ",
@@ -6358,6 +6813,54 @@ mod tests {
     }
 
     #[test]
+    fn sticky_prompt_uses_the_latest_prompt_wholly_above_the_viewport() {
+        let anchors = vec![
+            PromptAnchor::new(1..3, "first"),
+            PromptAnchor::new(5..7, "second"),
+        ];
+
+        assert_eq!(
+            sticky_prompt_for_viewport(&anchors, 7, 80).map(|line| painted(&line)),
+            Some("❯ second".to_owned())
+        );
+    }
+
+    #[test]
+    fn sticky_prompt_is_hidden_while_its_source_rows_are_visible() {
+        let anchors = vec![PromptAnchor::new(1..3, "first")];
+
+        assert!(sticky_prompt_for_viewport(&anchors, 2, 80).is_none());
+    }
+
+    #[test]
+    fn composed_screen_reserves_a_transcript_row_for_a_sticky_prompt() {
+        let sticky = PaintLine {
+            prefix: "❯ ".to_owned(),
+            prefix_tone: Tone::Plain,
+            text: "first".to_owned(),
+            tone: Tone::UserPrompt,
+            bold: true,
+            tool_heading: None,
+            pick: None,
+            tail: Vec::new(),
+        };
+        let (screen, cursor) = compose_screen(
+            &text_rows(4, "row"),
+            text_rows(1, "composer"),
+            3,
+            1,
+            0,
+            Some(sticky),
+        );
+
+        assert_eq!(
+            screen.iter().map(painted).collect::<Vec<_>>(),
+            ["❯ first", "row1", "row2", "composer0"]
+        );
+        assert_eq!(cursor, 3);
+    }
+
+    #[test]
     fn the_composer_holds_the_bottom_rows_at_every_scroll_position() {
         let transcript = text_rows(100, "t");
         let live = text_rows(3, "live");
@@ -6368,7 +6871,7 @@ mod tests {
         // three rows of the screen in all of them, which is the whole point.
         for start in [0, 40, transcript.len() - view_rows] {
             let (screen, cursor_line) =
-                compose_screen(&transcript, live.clone(), view_rows, start, 1);
+                compose_screen(&transcript, live.clone(), view_rows, start, 1, None);
 
             assert_eq!(screen.len(), rows);
             let painted = screen[view_rows..]
@@ -6412,7 +6915,7 @@ mod tests {
         let (view_rows, live_rows) = split_rows(10, frame.lines.len(), 0);
         fit_frame(&mut frame, live_rows);
         let (screen, cursor_line) =
-            compose_screen(&[], frame.lines, view_rows, 0, frame.cursor_line);
+            compose_screen(&[], frame.lines, view_rows, 0, frame.cursor_line, None);
 
         assert_eq!(screen.len(), 10);
         assert_eq!(screen[0].text, "welcome0");
@@ -6593,15 +7096,19 @@ mod tests {
             ],
         );
 
-        assert!(shell_group_lines(&group, 80, crate::state::ShellDisplayMode::Hide, false)
-            .is_empty());
+        assert!(
+            shell_group_lines(&group, 80, crate::state::ShellDisplayMode::Hide, false).is_empty()
+        );
     }
 
     #[test]
     fn hide_omits_the_running_shell_anchor() {
         let anchor = Block::new(BlockKind::Tool, "Running 1 shell command", "");
 
-        assert!(visible_transcript_blocks(&[anchor], ShellDisplayMode::Hide).is_empty());
+        assert!(
+            visible_transcript_blocks(&[anchor], ShellDisplayMode::Hide, DiffDisplayMode::Collapse)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -6612,10 +7119,27 @@ mod tests {
             Block::new(BlockKind::Reasoning, THINKING_TITLE, "latest thought"),
         ];
 
-        let visible = visible_transcript_blocks(&blocks, ShellDisplayMode::Hide);
+        let visible =
+            visible_transcript_blocks(&blocks, ShellDisplayMode::Hide, DiffDisplayMode::Collapse);
 
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].body, "latest thought");
+    }
+
+    #[test]
+    fn hide_drops_stale_thinking_across_context_compaction() {
+        let blocks = vec![
+            Block::new(BlockKind::Reasoning, THINKING_TITLE, "before"),
+            Block::new(BlockKind::System, "Context compacted", ""),
+            Block::new(BlockKind::Reasoning, THINKING_TITLE, "after"),
+        ];
+
+        let visible =
+            visible_transcript_blocks(&blocks, ShellDisplayMode::Hide, DiffDisplayMode::Collapse);
+
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].title, "Context compacted");
+        assert_eq!(visible[1].body, "after");
     }
 
     #[test]
@@ -6633,7 +7157,25 @@ mod tests {
         assert!(hidden_thinking_merge_at_history_boundary(
             &history,
             &committed,
-            ShellDisplayMode::Hide
+            ShellDisplayMode::Hide,
+            DiffDisplayMode::Collapse
+        ));
+    }
+
+    #[test]
+    fn hide_relayouts_when_compaction_separates_duplicate_thinking() {
+        let history = vec![
+            Block::new(BlockKind::Reasoning, THINKING_TITLE, "stale"),
+            Block::new(BlockKind::Tool, "Shell · command · completed", ""),
+            Block::new(BlockKind::System, "Context compacted", ""),
+        ];
+        let committed = vec![Block::new(BlockKind::Reasoning, THINKING_TITLE, "latest")];
+
+        assert!(hidden_thinking_merge_at_history_boundary(
+            &history,
+            &committed,
+            ShellDisplayMode::Hide,
+            DiffDisplayMode::Collapse
         ));
     }
 
@@ -6643,11 +7185,7 @@ mod tests {
             BlockKind::Tool,
             "Shell · 2 commands · all passed",
             vec![
-                Block::new(
-                    BlockKind::Tool,
-                    "Shell · first · exit 0",
-                    "one\ntwo\nthree",
-                ),
+                Block::new(BlockKind::Tool, "Shell · first · exit 0", "one\ntwo\nthree"),
                 Block::new(
                     BlockKind::Tool,
                     "Shell · second · exit 0",
@@ -6893,11 +7431,7 @@ mod tests {
     #[test]
     fn fullscreen_replaces_an_anchored_shell_instead_of_appending_it() {
         let anchor = Block::new(BlockKind::Tool, "Running 1 shell command", "");
-        let mut completed = Block::new(
-            BlockKind::Tool,
-            "Shell · 1 command · completed",
-            "done",
-        );
+        let mut completed = Block::new(BlockKind::Tool, "Shell · 1 command · completed", "done");
         completed.adopt_id(&anchor);
         let mut history = vec![
             Block::new(BlockKind::Assistant, "Before", ""),
@@ -6914,11 +7448,7 @@ mod tests {
     #[test]
     fn inline_shell_completion_deduplicates_history_before_mode_relayout() {
         let anchor = Block::new(BlockKind::Tool, "Running 1 shell command", "");
-        let mut completed = Block::new(
-            BlockKind::Tool,
-            "Shell · 1 command · completed",
-            "done",
-        );
+        let mut completed = Block::new(BlockKind::Tool, "Shell · 1 command · completed", "done");
         completed.adopt_id(&anchor);
         let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Inline);
 
@@ -6936,6 +7466,7 @@ mod tests {
                         block,
                         80,
                         renderer.shell_display_mode,
+                        renderer.diff_display_mode,
                         renderer.expanded_tools.contains(&block.id()),
                     )
                 })
@@ -7055,6 +7586,7 @@ mod tests {
                     block,
                     80,
                     renderer.shell_display_mode,
+                    renderer.diff_display_mode,
                     renderer.expanded_tools.contains(&block.id()),
                 )
             })
