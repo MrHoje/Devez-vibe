@@ -22,8 +22,8 @@ use crate::{
     },
     pricing::{self, TokenTotals},
     renderer::{
-        Block, BlockKind, ComposerMode, EffortSlider, ModeAccent, OverlayLine, OverlayStyle,
-        OverlayView, PICKER_ROWS, StatusLineView, SuggestionView, View, WelcomeView,
+        Block, BlockKind, ComposerMode, EffortSlider, HIDDEN_STATUS_LINE, ModeAccent, OverlayLine,
+        OverlayStyle, OverlayView, PICKER_ROWS, StatusLineView, SuggestionView, View, WelcomeView,
         visible_window,
     },
     rollout::{Rollout, RolloutEvent, RolloutKind},
@@ -57,6 +57,81 @@ pub enum DiffDisplayMode {
     #[default]
     Collapse,
     Expand,
+}
+
+#[derive(Clone, Copy)]
+enum StatusLineField {
+    Branch,
+    Model,
+    Effort,
+    Context,
+    FiveHour,
+    Weekly,
+}
+
+impl StatusLineField {
+    const ALL: [Self; 6] = [
+        Self::Branch,
+        Self::Model,
+        Self::Effort,
+        Self::Context,
+        Self::FiveHour,
+        Self::Weekly,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Branch => "Branch",
+            Self::Model => "Model",
+            Self::Effort => "Effort",
+            Self::Context => "Context",
+            Self::FiveHour => "5h limit",
+            Self::Weekly => "Weekly limit",
+        }
+    }
+
+    const fn config_key(self) -> &'static str {
+        match self {
+            Self::Branch => "status_line_branch",
+            Self::Model => "status_line_model",
+            Self::Effort => "status_line_effort",
+            Self::Context => "status_line_context",
+            Self::FiveHour => "status_line_five_hour",
+            Self::Weekly => "status_line_weekly",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Branch => 0,
+            Self::Model => 1,
+            Self::Effort => 2,
+            Self::Context => 3,
+            Self::FiveHour => 4,
+            Self::Weekly => 5,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StatusLineSettings([bool; 6]);
+
+impl Default for StatusLineSettings {
+    fn default() -> Self {
+        Self([true; 6])
+    }
+}
+
+impl StatusLineSettings {
+    const fn enabled(self, field: StatusLineField) -> bool {
+        self.0[field.index()]
+    }
+
+    fn toggle(&mut self, field: StatusLineField) -> bool {
+        let enabled = &mut self.0[field.index()];
+        *enabled = !*enabled;
+        *enabled
+    }
 }
 
 impl DiffDisplayMode {
@@ -182,7 +257,7 @@ struct SlashCommand {
     takes_argument: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 25] = [
+const SLASH_COMMANDS: [SlashCommand; 26] = [
     SlashCommand {
         name: "/model",
         description: "Switch model and reasoning",
@@ -289,6 +364,11 @@ const SLASH_COMMANDS: [SlashCommand; 25] = [
         takes_argument: false,
     },
     SlashCommand {
+        name: "/statusline",
+        description: "Show or hide the status line",
+        takes_argument: false,
+    },
+    SlashCommand {
         name: "/clear",
         description: "Clear the terminal",
         takes_argument: false,
@@ -384,6 +464,30 @@ impl AccountPlan {
         self.plan.clone().unwrap_or_else(|| "—".to_owned())
     }
 
+    /// Compact reset-credit reading for the status line. It only appears when
+    /// both the available tally and the next expiry are known.
+    fn status_line_reset(&self) -> Option<String> {
+        self.status_line_reset_at(unix_now())
+    }
+
+    /// Split out so the countdown wording can be tested without relying on the
+    /// wall clock.
+    fn status_line_reset_at(&self, now: u64) -> Option<String> {
+        let expiry = self
+            .credits
+            .iter()
+            .filter_map(|credit| credit.expires_at)
+            .filter(|expiry| *expiry > now)
+            .min()?;
+        (self.available_credits > 0).then(|| {
+            format!(
+                "reset: {} · {}",
+                self.available_credits,
+                reset_credit_duration(expiry - now)
+            )
+        })
+    }
+
     /// Welcome-panel rows: a summary followed by one line per credit.
     pub fn credit_lines(&self) -> Vec<String> {
         self.credit_lines_at(unix_now())
@@ -469,6 +573,25 @@ fn short_duration(seconds: u64) -> String {
         0..=59 => "<1m".to_owned(),
         60..=3_599 => format!("{}m", seconds / 60),
         3_600..=86_399 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
+    }
+}
+
+/// Compact countdown for a reset credit. Unlike the welcome card's coarse
+/// duration, sub-day spans keep their remaining minutes visible.
+fn reset_credit_duration(seconds: u64) -> String {
+    match seconds {
+        0..=59 => "<1m".to_owned(),
+        60..=3_599 => format!("{}m", seconds / 60),
+        3_600..=86_399 => {
+            let hours = seconds / 3_600;
+            let minutes = (seconds % 3_600) / 60;
+            if minutes == 0 {
+                format!("{hours}h")
+            } else {
+                format!("{hours}h {minutes}m")
+            }
+        }
         _ => format!("{}d", seconds / 86_400),
     }
 }
@@ -642,6 +765,10 @@ pub enum Action {
     /// Save the transcript's Shell display preference for future sessions.
     PersistShellDisplayMode(ShellDisplayMode),
     PersistDiffDisplayMode(DiffDisplayMode),
+    PersistStatusLine {
+        key_path: &'static str,
+        enabled: bool,
+    },
     Quit,
     ClearScreen,
     Tick(bool),
@@ -784,6 +911,9 @@ enum PendingInteraction {
     },
     SettingPicker {
         setting: DisplaySetting,
+        selected: usize,
+    },
+    StatusLinePicker {
         selected: usize,
     },
     /// Second step of `/model`: how long the pick should last. Asked after the
@@ -1976,6 +2106,7 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
             | PendingInteraction::ModelScope { .. }
             | PendingInteraction::EffortPicker { .. }
             | PendingInteraction::SettingPicker { .. }
+            | PendingInteraction::StatusLinePicker { .. }
             | PendingInteraction::SessionPicker(_)
     )
 }
@@ -2221,6 +2352,12 @@ pub struct AppState {
     active_order: Vec<String>,
     active: HashMap<String, ActiveItem>,
     shell_batches: HashMap<String, ShellBatch>,
+    /// App-server lifecycle notifications can be replayed. An item id belongs
+    /// to one logical operation, so only its first completion may reach history.
+    completed_item_ids: HashSet<String>,
+    /// Exact operation cards already emitted in the current turn. This keeps
+    /// repeated searches/tool results from producing identical transcript rows.
+    seen_operation_signatures: HashSet<String>,
     pending: Option<PendingInteraction>,
     /// Tokens the *current* prompt occupies, not the thread's running tally.
     /// The tally climbs past the window on every turn and is not a context gauge.
@@ -2245,6 +2382,7 @@ pub struct AppState {
     permission_mode: PermissionMode,
     shell_display_mode: ShellDisplayMode,
     diff_display_mode: DiffDisplayMode,
+    status_line_settings: StatusLineSettings,
     account_plan: AccountPlan,
     /// Set when a login lands, so the event loop re-reads the account over RPC.
     account_refresh_due: bool,
@@ -2320,6 +2458,8 @@ impl AppState {
             active_order: Vec::new(),
             active: HashMap::new(),
             shell_batches: HashMap::new(),
+            completed_item_ids: HashSet::new(),
+            seen_operation_signatures: HashSet::new(),
             pending: None,
             context_tokens: 0,
             token_totals: TokenTotals::default(),
@@ -2341,6 +2481,7 @@ impl AppState {
             permission_mode: read_permission_mode(),
             shell_display_mode: read_shell_display_mode(),
             diff_display_mode: read_diff_display_mode(),
+            status_line_settings: read_status_line_settings(),
             account_plan: AccountPlan::default(),
             account_refresh_due: false,
             skills: Vec::new(),
@@ -2565,7 +2706,13 @@ impl AppState {
     }
 
     pub fn attach_local_image(&mut self, path: String) {
-        self.composer_images.push(path);
+        if !self
+            .composer_images
+            .iter()
+            .any(|attached| attached.eq_ignore_ascii_case(&path))
+        {
+            self.composer_images.push(path);
+        }
     }
 
     pub fn composer_image_count(&self) -> usize {
@@ -2737,6 +2884,7 @@ impl AppState {
             label: self.permission_mode().label().to_owned(),
             accent: self.permission_mode().accent(),
             fast_mode: self.effective_fast_mode(),
+            effort: self.selected_effort.clone(),
             shell_display_mode: self.shell_display_mode().label().to_owned(),
             diff_display_mode: self.diff_display_mode().label().to_owned(),
             cost: self.estimated_cost(),
@@ -2874,6 +3022,7 @@ impl AppState {
         self.show_welcome = false;
         self.committed
             .push(Block::new(BlockKind::User, "You", text));
+        self.reset_turn_item_tracking();
         self.busy = true;
     }
 
@@ -2898,6 +3047,7 @@ impl AppState {
         self.active.clear();
         self.active_order.clear();
         self.shell_batches.clear();
+        self.reset_turn_item_tracking();
         self.show_welcome = true;
         self.select_model_and_effort(model, effort);
     }
@@ -2957,12 +3107,29 @@ impl AppState {
     }
 
     pub fn set_turn_started(&mut self, turn_id: String) {
+        if self.turn_id.as_deref() != Some(turn_id.as_str()) {
+            self.reset_turn_item_tracking();
+        }
         self.turn_id = Some(turn_id);
         self.busy = true;
         self.last_completed_duration = None;
         // A prompt held back while the session was still starting has been counting
         // since the user pressed Enter, so keep that clock rather than restarting it.
         self.turn_started_at.get_or_insert_with(Instant::now);
+    }
+
+    fn reset_turn_item_tracking(&mut self) {
+        self.completed_item_ids.clear();
+        self.seen_operation_signatures.clear();
+    }
+
+    fn push_unique_operation(&mut self, block: Block) {
+        if let Some(signature) = operation_signature(&block)
+            && !self.seen_operation_signatures.insert(signature)
+        {
+            return;
+        }
+        push_latest_thinking(&mut self.committed, block);
     }
 
     /// Returns an interrupt the user requested while `turn/start` was still
@@ -3103,6 +3270,7 @@ impl AppState {
         self.active.clear();
         self.active_order.clear();
         self.shell_batches.clear();
+        self.reset_turn_item_tracking();
         self.pending = None;
         self.context_tokens = 0;
         self.token_totals = TokenTotals::default();
@@ -3155,10 +3323,18 @@ impl AppState {
             self.commit_welcome_card();
             self.committed.extend(pending);
         }
-        std::mem::take(&mut self.committed)
+        let mut committed = std::mem::take(&mut self.committed);
+        if self.shell_display_mode == ShellDisplayMode::Hide {
+            // Inline transcript rows become permanent as soon as they are
+            // handed to the renderer. Drop Shell blocks here so a transient
+            // running anchor cannot flash for one frame and disappear later.
+            committed.retain(|block| !is_shell_block(block));
+        }
+        committed
     }
 
     pub fn view(&self) -> View<'_> {
+        let mut operation_signatures = self.seen_operation_signatures.clone();
         let live_blocks = self
             .active_order
             .iter()
@@ -3166,7 +3342,21 @@ impl AppState {
             // A Shell item can briefly carry the app-server's running title
             // instead of its eventual Shell title. Its batch membership is the
             // stable discriminator, and keeps Hide from flashing it.
-            .filter_map(|item| item.shell_batch.is_none().then(|| item.block.clone()))
+            .filter_map(|item| {
+                if item.shell_batch.is_some()
+                    || (self.shell_display_mode == ShellDisplayMode::Hide
+                        && is_running_shell_block(&item.block))
+                    || is_empty_thinking(&item.block)
+                {
+                    return None;
+                }
+                if let Some(signature) = operation_signature(&item.block)
+                    && !operation_signatures.insert(signature)
+                {
+                    return None;
+                }
+                Some(item.block.clone())
+            })
             .collect::<Vec<_>>();
         View {
             live_blocks,
@@ -3182,8 +3372,11 @@ impl AppState {
             },
             activity: self.activity(),
             activity_phase: self.activity_phase(),
-            footer: String::new(),
-            status_line: Some(self.status_line()),
+            footer: self
+                .status_line_has_content()
+                .then(String::new)
+                .unwrap_or_else(|| HIDDEN_STATUS_LINE.to_owned()),
+            status_line: self.status_line_has_content().then(|| self.status_line()),
             composer_notice: self
                 .composer_notice
                 .as_ref()
@@ -3269,6 +3462,28 @@ impl AppState {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+        if key.modifiers == KeyModifiers::SHIFT {
+            match key.code {
+                KeyCode::Up => {
+                    self.move_selected_model(-1);
+                    return Action::None;
+                }
+                KeyCode::Down => {
+                    self.move_selected_model(1);
+                    return Action::None;
+                }
+                KeyCode::Left => {
+                    self.move_selected_effort(-1);
+                    return Action::None;
+                }
+                KeyCode::Right => {
+                    self.move_selected_effort(1);
+                    return Action::None;
+                }
+                _ => {}
+            }
+        }
 
         let completion_matches = self.matching_completions();
         if let Some((target, matches)) = completion_matches.as_ref() {
@@ -3450,7 +3665,9 @@ impl AppState {
             KeyCode::Enter => self.submit_editor(),
             KeyCode::Esc if self.busy => self.request_interrupt(),
             KeyCode::Backspace if ctrl => {
-                self.editor.delete_word_left();
+                if self.editor.cursor() != 0 || self.composer_images.pop().is_none() {
+                    self.editor.delete_word_left();
+                }
                 self.command_selection = 0;
                 Action::None
             }
@@ -3823,8 +4040,11 @@ impl AppState {
                     .map(|line| format!("└ {line}"))
                     .collect::<Vec<_>>();
                 rows.extend(steps);
-                self.committed
-                    .push(Block::new(BlockKind::Plan, "Updated Plan", rows.join("\n")));
+                self.push_unique_operation(Block::new(
+                    BlockKind::Plan,
+                    "Updated Plan",
+                    rows.join("\n"),
+                ));
             }
             "item/started" => {
                 if let Some(item) = params.get("item") {
@@ -3985,7 +4205,7 @@ impl AppState {
                     self.note_mcp_failure(name, Some(detail));
                 }
             }
-            "thread/compacted" => self.committed.push(Block::new(
+            "thread/compacted" => self.push_unique_operation(Block::new(
                 BlockKind::System,
                 "Context compacted",
                 "대화 컨텍스트가 압축되었습니다.",
@@ -4016,6 +4236,7 @@ impl AppState {
         if self.busy {
             Action::Steer(text)
         } else {
+            self.reset_turn_item_tracking();
             self.busy = true;
             // Time the turn from Enter, not from the server's acknowledgement: a
             // prompt held back by a starting session would otherwise read 0s.
@@ -4031,7 +4252,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    "/model [MODEL] [EFFORT]  모델과 effort 선택\n/fast [on|off]  Fast 서비스 티어 선택\n/effort [LEVEL]  추론 수준\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/login  ChatGPT 계정 로그인\n/logout  계정 연결 해제\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nShift+Tab  권한 모드 전환 (Read Only / Default / Full Access)\nCtrl+Enter / Shift+Enter  줄바꿈",
+                    "/model [MODEL] [EFFORT]  모델과 effort 선택\n/fast [on|off]  Fast 서비스 티어 선택\n/effort [LEVEL]  추론 수준\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/login  ChatGPT 계정 로그인\n/logout  계정 연결 해제\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nShift+Tab  권한 모드 전환 (Read Only / Default / Full Access)\nCtrl+Enter / Shift+Enter  줄바꿈",
                 ));
                 Action::None
             }
@@ -4313,6 +4534,15 @@ impl AppState {
                 Action::None
             }
             "/diff" if parts.len() == 2 => self.set_display_setting(DisplaySetting::Diff, parts[1]),
+            "/statusline" if parts.len() == 1 => {
+                self.pending = Some(PendingInteraction::StatusLinePicker { selected: 0 });
+                Action::None
+            }
+            "/statusline" => {
+                self.committed
+                    .push(Block::new(BlockKind::Error, "Usage", "/statusline"));
+                Action::None
+            }
             "/new" if self.busy => {
                 self.committed.push(Block::new(
                     BlockKind::Warning,
@@ -4532,6 +4762,28 @@ impl AppState {
                 self.pending = Some(PendingInteraction::SettingPicker { setting, selected });
                 Action::None
             }
+            PendingInteraction::StatusLinePicker { mut selected } => match key.code {
+                KeyCode::Esc => Action::None,
+                KeyCode::Enter => Action::None,
+                KeyCode::Up | KeyCode::Char('k') if !ctrl && !alt => {
+                    selected = selected.saturating_sub(1);
+                    self.pending = Some(PendingInteraction::StatusLinePicker { selected });
+                    Action::None
+                }
+                KeyCode::Down | KeyCode::Char('j') if !ctrl && !alt => {
+                    selected = (selected + 1).min(StatusLineField::ALL.len() - 1);
+                    self.pending = Some(PendingInteraction::StatusLinePicker { selected });
+                    Action::None
+                }
+                KeyCode::Char(' ') => {
+                    self.pending = Some(PendingInteraction::StatusLinePicker { selected });
+                    self.toggle_status_line_field(StatusLineField::ALL[selected])
+                }
+                _ => {
+                    self.pending = Some(PendingInteraction::StatusLinePicker { selected });
+                    Action::None
+                }
+            },
             PendingInteraction::ThemePicker { mut theme_index } => {
                 match key.code {
                     KeyCode::Esc => return Action::None,
@@ -4962,6 +5214,33 @@ impl AppState {
                     selected: *selected,
                 }),
                 hint: "←→ to adjust  ·  Enter to confirm  ·  Esc to cancel".to_owned(),
+                style: OverlayStyle::Picker,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            }),
+            PendingInteraction::StatusLinePicker { selected } => Some(OverlayView {
+                closable: true,
+                title: "Status line".to_owned(),
+                lines: StatusLineField::ALL
+                    .iter()
+                    .enumerate()
+                    .map(|(index, field)| OverlayLine {
+                        text: format!(
+                            "{} {}",
+                            if self.status_line_settings.enabled(*field) {
+                                '☑'
+                            } else {
+                                '☐'
+                            },
+                            field.label()
+                        ),
+                        selected: index == *selected,
+                        muted: false,
+                    })
+                    .collect(),
+                slider: None,
+                hint: "↑↓ navigate  ·  Space toggle  ·  Enter/Esc close".to_owned(),
                 style: OverlayStyle::Picker,
                 input: None,
                 input_label: "",
@@ -5628,14 +5907,48 @@ impl AppState {
             })
         });
         StatusLineView {
-            branch: self.branch.clone(),
-            model: self.selected_model_display_name().to_owned(),
-            effort: self.selected_effort.clone(),
-            context,
-            five_hour_percent: self.five_hour_percent,
-            weekly_percent: self.weekly_percent,
+            branch: self
+                .status_line_settings
+                .enabled(StatusLineField::Branch)
+                .then_some(self.branch.clone())
+                .flatten(),
+            model: self
+                .status_line_settings
+                .enabled(StatusLineField::Model)
+                .then(|| self.selected_model_display_name().to_owned()),
+            effort: self
+                .status_line_settings
+                .enabled(StatusLineField::Effort)
+                .then(|| self.selected_effort.clone()),
+            context: self
+                .status_line_settings
+                .enabled(StatusLineField::Context)
+                .then_some(context)
+                .flatten(),
+            five_hour_percent: self
+                .status_line_settings
+                .enabled(StatusLineField::FiveHour)
+                .then_some(self.five_hour_percent)
+                .flatten(),
+            weekly_percent: self
+                .status_line_settings
+                .enabled(StatusLineField::Weekly)
+                .then_some(self.weekly_percent)
+                .flatten(),
+            reset_credits: self
+                .status_line_settings
+                .enabled(StatusLineField::Weekly)
+                .then(|| self.account_plan.status_line_reset())
+                .flatten(),
             notice: self.transient_status.clone(),
         }
+    }
+
+    fn status_line_has_content(&self) -> bool {
+        StatusLineField::ALL
+            .iter()
+            .any(|field| self.status_line_settings.enabled(*field))
+            || self.transient_status.is_some()
     }
 
     /// Second step of `/model`: ask how long the pick lasts. A model with no
@@ -5692,6 +6005,51 @@ impl AppState {
             "✓ Model changed",
             format!("↳ {model_name} · {selected_effort}"),
         ));
+    }
+
+    fn move_selected_model(&mut self, direction: i8) {
+        let next_index = match direction {
+            -1 => self.selected_model.saturating_sub(1),
+            1 => (self.selected_model + 1).min(self.models.len().saturating_sub(1)),
+            _ => return,
+        };
+        if next_index == self.selected_model {
+            return;
+        }
+        let model = self.models.get(next_index).map(|model| model.model.clone());
+        let effort = self
+            .models
+            .get(next_index)
+            .and_then(|model| model.efforts.get(self.effort_index_for_model(next_index)))
+            .map(|effort| effort.id.clone());
+        if let Some(model) = model {
+            self.select_model_and_effort(&model, effort.as_deref());
+        }
+    }
+
+    fn move_selected_effort(&mut self, direction: i8) {
+        let Some(model) = self.selected_model() else {
+            return;
+        };
+        let current_index = model
+            .efforts
+            .iter()
+            .position(|effort| effort.id == self.selected_effort)
+            .unwrap_or(0);
+        let next_index = match direction {
+            -1 => current_index.saturating_sub(1),
+            1 => (current_index + 1).min(model.efforts.len().saturating_sub(1)),
+            _ => return,
+        };
+        let effort = model
+            .efforts
+            .get(next_index)
+            .map(|effort| effort.id.clone());
+        if next_index != current_index {
+            if let Some(effort) = effort {
+                self.selected_effort = effort;
+            }
+        }
     }
 
     /// Shift+Tab reaches this only with nothing pending, since a prompt takes
@@ -5795,6 +6153,12 @@ impl AppState {
                     }
                 }
             }
+            Some(PendingInteraction::StatusLinePicker { .. })
+                if row < StatusLineField::ALL.len() =>
+            {
+                self.pending = Some(PendingInteraction::StatusLinePicker { selected: row });
+                self.toggle_status_line_field(StatusLineField::ALL[row])
+            }
             Some(PendingInteraction::SessionPicker(mut picker)) => match picker.click_row(row) {
                 SessionPickerResult::Select(thread_id) => Action::ResumeThread(thread_id),
                 SessionPickerResult::Cancel => Action::None,
@@ -5877,6 +6241,14 @@ impl AppState {
             setting,
             selected: selected.min(setting.choices().len().saturating_sub(1)),
         });
+    }
+
+    fn toggle_status_line_field(&mut self, field: StatusLineField) -> Action {
+        let enabled = self.status_line_settings.toggle(field);
+        Action::PersistStatusLine {
+            key_path: field.config_key(),
+            enabled,
+        }
     }
 
     fn set_display_setting(&mut self, setting: DisplaySetting, value: &str) -> Action {
@@ -5996,6 +6368,9 @@ impl AppState {
         let Some(id) = item.get("id").and_then(Value::as_str) else {
             return;
         };
+        if self.completed_item_ids.contains(id) {
+            return;
+        }
         let Some(mut block) = active_item_block(&self.cwd, item) else {
             return;
         };
@@ -6048,6 +6423,11 @@ impl AppState {
 
     fn complete_item(&mut self, item: &Value) {
         let id = item.get("id").and_then(Value::as_str);
+        if let Some(id) = id
+            && !self.completed_item_ids.insert(id.to_owned())
+        {
+            return;
+        }
         let active = id.and_then(|id| {
             let active = self.active.remove(id);
             self.active_order.retain(|candidate| candidate != id);
@@ -6084,7 +6464,7 @@ impl AppState {
             if matches!(block.kind, BlockKind::Assistant) {
                 self.last_assistant_markdown = Some(block.body.clone());
             }
-            push_latest_thinking(&mut self.committed, block);
+            self.push_unique_operation(block);
         }
     }
 
@@ -6241,7 +6621,7 @@ impl AppState {
                 if matches!(item.block.kind, BlockKind::Assistant) {
                     self.last_assistant_markdown = Some(item.block.body.clone());
                 }
-                push_latest_thinking(&mut self.committed, item.block);
+                self.push_unique_operation(item.block);
             }
         }
     }
@@ -6386,7 +6766,23 @@ fn active_item_block(cwd: &str, item: &Value) -> Option<Block> {
             ),
             pretty_json(item.get("arguments")),
         )),
-        "webSearch" => Some(Block::new(BlockKind::Tool, "Web search", "")),
+        "webSearch" => {
+            let query = compact_command(
+                item.get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                88,
+            );
+            Some(Block::new(
+                BlockKind::Tool,
+                if query.is_empty() {
+                    "Web search".to_owned()
+                } else {
+                    format!("Web search · {query}")
+                },
+                "",
+            ))
+        }
         "collabAgentToolCall" => Some(Block::new(
             BlockKind::Tool,
             "Agent",
@@ -6400,17 +6796,68 @@ fn is_thinking(block: &Block) -> bool {
     matches!(block.kind, BlockKind::Reasoning) && block.title == "Thinking…"
 }
 
+fn is_empty_thinking(block: &Block) -> bool {
+    is_thinking(block) && block.body.trim().is_empty()
+}
+
+fn is_running_shell_block(block: &Block) -> bool {
+    let text = format!("{}\n{}", block.title, block.body).to_ascii_lowercase();
+    text.contains("running") && text.contains("shell") && text.contains("command")
+}
+
+fn is_shell_block(block: &Block) -> bool {
+    block.title.starts_with("Shell ·") || is_running_shell_block(block)
+}
+
+/// Operations whose repeated cards add no information. The body participates
+/// in the signature, so two calls to the same tool with different results stay
+/// visible; Web Search includes its query in the title for the same reason.
+fn operation_signature(block: &Block) -> Option<String> {
+    if matches!(block.kind, BlockKind::System) && block.title == "Context compacted" {
+        return Some("context-compaction".to_owned());
+    }
+    let (family, include_title) = match block.kind {
+        BlockKind::Tool
+            if block.title == "Web search"
+                || block.title.starts_with("Web search ·")
+                || block.title.starts_with("MCP ·")
+                || block.title.starts_with("Tool ·")
+                || block.title == "Agent" =>
+        {
+            ("tool", true)
+        }
+        BlockKind::FileChange => ("file-change", true),
+        BlockKind::Plan => ("plan", false),
+        BlockKind::Reasoning if block.title == "Plan" => ("plan", false),
+        _ => return None,
+    };
+    Some(if include_title {
+        format!("{family}\0{}\0{}", block.title, block.body)
+    } else {
+        format!("{family}\0{}", block.body)
+    })
+}
+
 fn push_latest_thinking(blocks: &mut Vec<Block>, block: Block) {
+    if is_empty_thinking(&block) {
+        return;
+    }
     if is_thinking(&block) && blocks.last().is_some_and(is_thinking) {
         blocks.pop();
     }
     blocks.push(block);
 }
 
-fn latest_thinking_only(blocks: Vec<Block>) -> Vec<Block> {
+fn normalized_turn_blocks(blocks: Vec<Block>) -> Vec<Block> {
+    let mut seen_operations = HashSet::new();
     blocks
         .into_iter()
         .fold(Vec::new(), |mut normalized, block| {
+            if let Some(signature) = operation_signature(&block)
+                && !seen_operations.insert(signature)
+            {
+                return normalized;
+            }
             push_latest_thinking(&mut normalized, block);
             normalized
         })
@@ -6566,7 +7013,7 @@ fn merged_turn_blocks(
     }
     // The timestamps are a fixed-width UTC format, so string order is time order.
     rows.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
-    latest_thinking_only(rows.into_iter().map(|(_, _, block)| block).collect())
+    normalized_turn_blocks(rows.into_iter().map(|(_, _, block)| block).collect())
 }
 
 /// The turn's `startedAt` (unix seconds), formatted the same way the rollout's
@@ -7190,6 +7637,21 @@ fn read_diff_display_mode() -> DiffDisplayMode {
         .unwrap_or_default()
 }
 
+fn read_status_line_settings() -> StatusLineSettings {
+    codex_home()
+        .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
+        .map(|config| {
+            let mut settings = StatusLineSettings::default();
+            for field in StatusLineField::ALL {
+                if let Some(enabled) = parse_status_line_field(&config, field) {
+                    settings.0[field.index()] = enabled;
+                }
+            }
+            settings
+        })
+        .unwrap_or_default()
+}
+
 fn parse_shell_display_mode(config: &str) -> Option<ShellDisplayMode> {
     config
         .lines()
@@ -7210,6 +7672,29 @@ fn parse_diff_display_mode(config: &str) -> Option<DiffDisplayMode> {
         .filter_map(|line| line.split_once('='))
         .find_map(|(key, value)| {
             (key.trim() == "diff_display_mode").then(|| DiffDisplayMode::from_config_value(value))
+        })
+        .flatten()
+}
+
+fn parse_status_line_field(config: &str, field: StatusLineField) -> Option<bool> {
+    config
+        .lines()
+        .take_while(|line| !line.trim_start().starts_with('['))
+        .filter_map(|line| line.split('#').next())
+        .filter_map(|line| line.split_once('='))
+        .find_map(|(key, value)| {
+            (key.trim() == field.config_key()).then(|| {
+                match value
+                    .trim()
+                    .trim_matches(['\"', '\''])
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                }
+            })
         })
         .flatten()
 }
@@ -7338,6 +7823,40 @@ mod tests {
     }
 
     #[test]
+    fn shifted_arrows_change_model_and_effort_without_wrapping() {
+        let mut state = test_state();
+        state
+            .models
+            .push(test_model("gpt-5.6-terra", "GPT-5.6 Terra", false));
+        let shift = KeyModifiers::SHIFT;
+
+        state.handle_key(KeyEvent::new(KeyCode::Up, shift));
+        assert_eq!(state.selected_model_name(), "gpt-5.6-sol");
+
+        state.handle_key(KeyEvent::new(KeyCode::Down, shift));
+        assert_eq!(state.selected_model_name(), "gpt-5.6-terra");
+        assert_eq!(state.selected_effort(), "high");
+        assert!(state.committed.is_empty());
+
+        state.handle_key(KeyEvent::new(KeyCode::Down, shift));
+        assert_eq!(state.selected_model_name(), "gpt-5.6-terra");
+
+        state.handle_key(KeyEvent::new(KeyCode::Left, shift));
+        assert_eq!(state.selected_effort(), "medium");
+
+        state.handle_key(KeyEvent::new(KeyCode::Right, shift));
+        assert_eq!(state.selected_effort(), "high");
+        for _ in 0..8 {
+            state.handle_key(KeyEvent::new(KeyCode::Right, shift));
+        }
+        assert_eq!(state.selected_effort(), "ultra");
+
+        state.handle_key(KeyEvent::new(KeyCode::Right, shift));
+        assert_eq!(state.selected_effort(), "ultra");
+        assert!(state.committed.is_empty());
+    }
+
+    #[test]
     fn esc_while_turn_is_starting_defers_one_interrupt_until_started() {
         let mut state = test_state();
         state.busy = true;
@@ -7417,6 +7936,7 @@ mod tests {
     fn shell_output_before_started_never_enters_the_live_transcript() {
         let mut state = test_state();
         state.show_welcome = false;
+        state.shell_display_mode = ShellDisplayMode::Collapse;
 
         state.handle_notification(
             "item/commandExecution/outputDelta",
@@ -7461,9 +7981,51 @@ mod tests {
     }
 
     #[test]
+    fn hide_filters_an_unbatched_running_shell_status_before_rendering() {
+        let mut state = test_state();
+        state.shell_display_mode = ShellDisplayMode::Hide;
+        state.ensure_active("transient", BlockKind::System, "Running Shell Command");
+
+        assert!(state.view().live_blocks.is_empty());
+
+        let mut state = test_state();
+        state.shell_display_mode = ShellDisplayMode::Hide;
+        state
+            .ensure_active("tool-output", BlockKind::Tool, "Command")
+            .block
+            .body = "Running Shell Command".to_owned();
+        assert!(state.view().live_blocks.is_empty());
+    }
+
+    #[test]
+    fn hide_never_hands_shell_rows_to_the_renderer() {
+        let mut state = test_state();
+        state.show_welcome = false;
+        state.shell_display_mode = ShellDisplayMode::Hide;
+        state.start_item(&json!({
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "command": "rg TODO"
+        }));
+
+        assert!(state.drain_committed().is_empty());
+
+        state.complete_item(&json!({
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "command": "rg TODO",
+            "status": "completed",
+            "exitCode": 0
+        }));
+
+        assert!(state.drain_committed().is_empty());
+    }
+
+    #[test]
     fn completed_shell_group_reuses_its_running_anchor_id() {
         let mut state = test_state();
         state.show_welcome = false;
+        state.shell_display_mode = ShellDisplayMode::Collapse;
         state.start_item(&json!({
             "id": "cmd-1",
             "type": "commandExecution",
@@ -7507,6 +8069,20 @@ mod tests {
     }
 
     #[test]
+    fn empty_thinking_never_enters_the_live_or_committed_transcript() {
+        let mut state = test_state();
+        state.ensure_active("reasoning", BlockKind::Reasoning, "Thinking…");
+        assert!(state.view().live_blocks.is_empty());
+
+        state.complete_item(&json!({
+            "id": "reasoning",
+            "type": "reasoning",
+            "summary": []
+        }));
+        assert!(state.committed.is_empty());
+    }
+
+    #[test]
     fn shell_between_thinking_blocks_preserves_both() {
         let mut state = test_state();
         state.complete_item(&json!({
@@ -7537,7 +8113,7 @@ mod tests {
 
     #[test]
     fn resumed_turn_keeps_latest_consecutive_thinking_per_run() {
-        let blocks = latest_thinking_only(vec![
+        let blocks = normalized_turn_blocks(vec![
             Block::new(BlockKind::Reasoning, "Thinking…", "first"),
             Block::new(BlockKind::Reasoning, "Thinking…", "latest"),
             Block::new(BlockKind::Tool, "Shell · pwd", ""),
@@ -7553,9 +8129,130 @@ mod tests {
     }
 
     #[test]
+    fn web_search_replays_and_repeated_queries_are_deduplicated() {
+        let mut state = test_state();
+        state.show_welcome = false;
+        state.set_turn_started("turn-1".to_owned());
+
+        for id in ["search-1", "search-2"] {
+            state.start_item(&json!({
+                "id": id,
+                "type": "webSearch",
+                "query": "rust async"
+            }));
+        }
+        let live = state.view().live_blocks;
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].title, "Web search · rust async");
+
+        let first = json!({
+            "id": "search-1",
+            "type": "webSearch",
+            "query": "rust async"
+        });
+        state.complete_item(&first);
+        state.complete_item(&first);
+        state.complete_item(&json!({
+            "id": "search-2",
+            "type": "webSearch",
+            "query": "rust async"
+        }));
+        state.complete_item(&json!({
+            "id": "search-3",
+            "type": "webSearch",
+            "query": "rust channels"
+        }));
+
+        let titles = state
+            .drain_committed()
+            .into_iter()
+            .map(|block| block.title)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            titles,
+            ["Web search · rust async", "Web search · rust channels"]
+        );
+    }
+
+    #[test]
+    fn operation_deduplication_resets_for_each_turn() {
+        let mut state = test_state();
+        state.show_welcome = false;
+        for (turn, id) in [("turn-1", "search-1"), ("turn-2", "search-2")] {
+            state.set_turn_started(turn.to_owned());
+            state.complete_item(&json!({
+                "id": id,
+                "type": "webSearch",
+                "query": "same query"
+            }));
+        }
+
+        assert_eq!(state.drain_committed().len(), 2);
+    }
+
+    #[test]
+    fn resumed_turn_deduplicates_identical_operation_cards() {
+        let blocks = normalized_turn_blocks(vec![
+            Block::new(BlockKind::Tool, "Web search · rust", ""),
+            Block::new(BlockKind::Tool, "Web search · rust", ""),
+            Block::new(BlockKind::Tool, "MCP · docs › search", "same result"),
+            Block::new(BlockKind::Tool, "MCP · docs › search", "same result"),
+            Block::new(BlockKind::Tool, "MCP · docs › search", "different result"),
+            Block::new(BlockKind::FileChange, "Update(src/a.rs)", "+one"),
+            Block::new(BlockKind::FileChange, "Update(src/a.rs)", "+one"),
+        ]);
+
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|block| block.title.starts_with("Web search"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn duplicate_plan_and_context_notifications_become_one_card_each() {
+        let mut state = test_state();
+        state.show_welcome = false;
+        state.set_turn_started("turn-1".to_owned());
+        let plan = json!({
+            "explanation": "same",
+            "plan": [{ "step": "check", "status": "inProgress" }]
+        });
+
+        state.handle_notification("turn/plan/updated", &plan);
+        state.handle_notification("turn/plan/updated", &plan);
+        state.complete_item(&json!({
+            "id": "compact-1",
+            "type": "contextCompaction"
+        }));
+        state.handle_notification("thread/compacted", &json!({}));
+
+        assert_eq!(
+            state
+                .committed
+                .iter()
+                .filter(|block| matches!(block.kind, BlockKind::Plan))
+                .count(),
+            1
+        );
+        assert_eq!(
+            state
+                .committed
+                .iter()
+                .filter(|block| block.title == "Context compacted")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn live_overlapping_shells_commit_as_one_group() {
         let mut state = test_state();
         state.show_welcome = false;
+        state.shell_display_mode = ShellDisplayMode::Collapse;
         state.start_item(&json!({
             "id": "cmd-1",
             "type": "commandExecution",
@@ -7633,6 +8330,7 @@ mod tests {
     fn sequential_shells_are_separate() {
         let mut state = test_state();
         state.show_welcome = false;
+        state.shell_display_mode = ShellDisplayMode::Collapse;
         let mut completed = Vec::new();
         for (id, command) in [("cmd-1", "rg TODO"), ("cmd-2", "git status --short")] {
             state.start_item(&json!({
@@ -7963,6 +8661,17 @@ mod tests {
             "unexpected credit row: {}",
             lines[1]
         );
+        assert_eq!(
+            plan.status_line_reset_at(1_785_092_634),
+            Some("reset: 3 · 5d".to_owned())
+        );
+    }
+
+    #[test]
+    fn reset_credit_countdown_uses_day_hour_and_minute_units() {
+        assert_eq!(reset_credit_duration(5 * 86_400), "5d");
+        assert_eq!(reset_credit_duration(23 * 3_600 + 59 * 60), "23h 59m");
+        assert_eq!(reset_credit_duration(55 * 60), "55m");
     }
 
     #[test]
@@ -8366,6 +9075,28 @@ mod tests {
     }
 
     #[test]
+    fn status_line_fields_use_the_configured_booleans() {
+        assert_eq!(
+            parse_status_line_field("status_line_branch = false\n", StatusLineField::Branch),
+            Some(false)
+        );
+        assert_eq!(
+            parse_status_line_field(
+                "status_line_five_hour = \"true\" # keep it visible\n",
+                StatusLineField::FiveHour,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            parse_status_line_field(
+                "[ui]\nstatus_line_weekly = false\n",
+                StatusLineField::Weekly,
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn status_command_reports_the_active_permission_profile() {
         let mut state = test_state();
         state.permission_mode = PermissionMode::FullAccess;
@@ -8374,6 +9105,66 @@ mod tests {
 
         let body = &state.committed.last().expect("status block").body;
         assert!(body.contains("permissions: Full Access (:danger-full-access)"));
+    }
+
+    #[test]
+    fn statusline_command_toggles_individual_status_fields_with_space() {
+        let mut state = test_state();
+
+        state.run_slash_command("/statusline");
+
+        let overlay = state.overlay_view().expect("status line picker");
+        assert_eq!(overlay.title, "Status line");
+        assert_eq!(
+            overlay
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "☑ Branch",
+                "☑ Model",
+                "☑ Effort",
+                "☑ Context",
+                "☑ 5h limit",
+                "☑ Weekly limit",
+            ]
+        );
+        assert!(overlay.lines[0].selected);
+
+        state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+
+        let overlay = state.overlay_view().expect("status line picker stays open");
+        assert_eq!(overlay.lines[0].text, "☐ Branch");
+        assert_eq!(state.status_line().branch, None);
+
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        let overlay = state.overlay_view().expect("status line picker stays open");
+        assert_eq!(overlay.lines[1].text, "☐ Model");
+        assert_eq!(state.status_line().model, None);
+
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(state.overlay_view().is_none());
+    }
+
+    #[test]
+    fn clicking_a_statusline_checkbox_toggles_its_field() {
+        let mut state = test_state();
+        state.run_slash_command("/statusline");
+
+        let action = state.click_overlay_row(2);
+
+        assert!(matches!(
+            action,
+            Action::PersistStatusLine {
+                key_path: "status_line_effort",
+                enabled: false,
+            }
+        ));
+        let overlay = state.overlay_view().expect("status line picker stays open");
+        assert_eq!(overlay.lines[2].text, "☐ Effort");
+        assert!(overlay.lines[2].selected);
     }
 
     #[test]
@@ -9398,6 +10189,16 @@ mod tests {
         state.attach_local_image(r"C:\Temp\clipboard-image.bmp".to_owned());
 
         state.handle_key(KeyEvent::from(KeyCode::Backspace));
+
+        assert_eq!(state.composer_image_count(), 0);
+    }
+
+    #[test]
+    fn composer_ctrl_backspace_removes_an_explicit_image_attachment() {
+        let mut state = test_state();
+        state.attach_local_image(r"C:\Temp\clipboard-image.bmp".to_owned());
+
+        state.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
 
         assert_eq!(state.composer_image_count(), 0);
     }

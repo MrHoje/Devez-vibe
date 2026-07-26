@@ -51,6 +51,105 @@ const FAST_GAP: Duration = Duration::from_millis(25);
 /// caught.
 const MIN_RUN: usize = 2;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BufferedText {
+    pub text: String,
+    pub pasted: bool,
+}
+
+#[derive(Debug)]
+pub enum ComposerInput {
+    Key(KeyEvent),
+    Text(BufferedText),
+}
+
+/// Holds a short run of characters before it reaches the composer. On Windows
+/// that is the only way to turn a paste-produced image path into an attachment
+/// before the raw path is ever rendered.
+#[derive(Debug, Default)]
+pub struct ComposerPasteBuffer {
+    last: Option<Instant>,
+    text: String,
+    pasted: bool,
+    disabled: bool,
+}
+
+impl ComposerPasteBuffer {
+    pub fn new() -> Self {
+        Self {
+            disabled: std::env::var_os("DVZ_DISABLE_PASTE_BURST").is_some(),
+            ..Self::default()
+        }
+    }
+
+    pub fn observe(&mut self, key: KeyEvent, now: Instant) -> Vec<ComposerInput> {
+        if self.disabled {
+            return vec![ComposerInput::Key(key)];
+        }
+        if !matches!(key.kind, KeyEventKind::Press) {
+            return Vec::new();
+        }
+        let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+        let fast = self
+            .last
+            .is_some_and(|last| now.duration_since(last) < FAST_GAP);
+
+        match key.code {
+            KeyCode::Char(ch) if plain => self.push_char(ch, now, fast),
+            KeyCode::Enter if plain && self.pasted && fast => {
+                self.text.push('\n');
+                self.pasted = true;
+                self.last = Some(now);
+                Vec::new()
+            }
+            KeyCode::Tab if plain && !self.text.is_empty() && fast => {
+                self.text.push('\t');
+                self.pasted = true;
+                self.last = Some(now);
+                Vec::new()
+            }
+            _ => self
+                .flush()
+                .into_iter()
+                .map(ComposerInput::Text)
+                .chain(std::iter::once(ComposerInput::Key(key)))
+                .collect(),
+        }
+    }
+
+    pub fn flush_if_idle(&mut self, now: Instant) -> Option<BufferedText> {
+        self.last
+            .is_some_and(|last| now.duration_since(last) >= FAST_GAP)
+            .then(|| self.flush())
+            .flatten()
+    }
+
+    fn push_char(&mut self, ch: char, now: Instant, fast: bool) -> Vec<ComposerInput> {
+        if self.text.is_empty() {
+            self.text.push(ch);
+            self.last = Some(now);
+            return Vec::new();
+        }
+        if fast {
+            self.text.push(ch);
+            self.pasted = true;
+            self.last = Some(now);
+            return Vec::new();
+        }
+        let prior = self.flush().expect("non-empty text flushes");
+        self.text.push(ch);
+        self.last = Some(now);
+        vec![ComposerInput::Text(prior)]
+    }
+
+    fn flush(&mut self) -> Option<BufferedText> {
+        (!self.text.is_empty()).then(|| BufferedText {
+            text: std::mem::take(&mut self.text),
+            pasted: std::mem::take(&mut self.pasted),
+        })
+    }
+}
+
 /// Counts how many characters in a row arrived faster than a person types.
 #[derive(Debug, Default)]
 pub struct PasteBurst {
@@ -101,7 +200,7 @@ impl PasteBurst {
 
         match key.code {
             KeyCode::Char(_) if plain => {
-                self.run = if fast { self.run + 1 } else { 0 };
+                self.run = if fast { self.run + 1 } else { 1 };
                 self.last = Some(now);
                 key
             }
@@ -199,6 +298,20 @@ mod tests {
     }
 
     #[test]
+    fn a_two_character_first_line_of_a_paste_does_not_submit() {
+        let keys = replay(&[
+            (5000, KeyCode::Char('첫')),
+            (0, KeyCode::Char('줄')),
+            (0, KeyCode::Enter),
+        ]);
+
+        assert!(
+            !submits(keys.last().unwrap()),
+            "a two-character first line is still a pasted newline"
+        );
+    }
+
+    #[test]
     fn fast_character_run_is_reported_as_a_paste() {
         let base = Instant::now();
         let mut burst = PasteBurst::new();
@@ -207,6 +320,77 @@ mod tests {
         burst.observe(press(KeyCode::Char('c')), base + Duration::from_millis(2));
 
         assert!(burst.is_active());
+    }
+
+    #[test]
+    fn composer_buffer_releases_a_fast_path_as_one_paste() {
+        let base = Instant::now();
+        let mut buffer = ComposerPasteBuffer::new();
+        let mut at = base;
+        for ch in r"C:\Temp\clipboard.png".chars() {
+            buffer.observe(press(KeyCode::Char(ch)), at);
+            at += Duration::from_millis(1);
+        }
+
+        assert_eq!(
+            buffer.flush_if_idle(at + Duration::from_millis(FAST_GAP.as_millis() as u64)),
+            Some(BufferedText {
+                text: r"C:\Temp\clipboard.png".to_owned(),
+                pasted: true,
+            })
+        );
+    }
+
+    #[test]
+    fn composer_buffer_does_not_mark_a_slowly_typed_path_as_paste() {
+        let base = Instant::now();
+        let mut buffer = ComposerPasteBuffer::new();
+        buffer.observe(press(KeyCode::Char('C')), base);
+
+        assert_eq!(
+            buffer.flush_if_idle(base + FAST_GAP),
+            Some(BufferedText {
+                text: "C".to_owned(),
+                pasted: false,
+            })
+        );
+    }
+
+    #[test]
+    fn composer_buffer_sends_enter_after_one_fast_character() {
+        let base = Instant::now();
+        let mut buffer = ComposerPasteBuffer::new();
+        buffer.observe(press(KeyCode::Char('가')), base);
+
+        let inputs = buffer.observe(press(KeyCode::Enter), base);
+
+        assert!(matches!(
+            &inputs[0],
+            ComposerInput::Text(BufferedText { text, pasted: false }) if text == "가"
+        ));
+        assert!(matches!(
+            &inputs[1],
+            ComposerInput::Key(key) if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE
+        ));
+    }
+
+    #[test]
+    fn composer_buffer_keeps_enter_in_a_confirmed_paste_burst() {
+        let base = Instant::now();
+        let mut buffer = ComposerPasteBuffer::new();
+        buffer.observe(press(KeyCode::Char('첫')), base);
+        buffer.observe(press(KeyCode::Char('줄')), base + Duration::from_millis(1));
+
+        assert!(buffer
+            .observe(press(KeyCode::Enter), base + Duration::from_millis(2))
+            .is_empty());
+        assert_eq!(
+            buffer.flush_if_idle(base + FAST_GAP + Duration::from_millis(2)),
+            Some(BufferedText {
+                text: "첫줄\n".to_owned(),
+                pasted: true,
+            })
+        );
     }
 
     #[test]
@@ -223,14 +407,10 @@ mod tests {
     }
 
     #[test]
-    fn one_fast_character_is_not_a_paste() {
-        // The IME case generalized: a single fast character before Enter is
-        // what committing a composition looks like, not what a paste looks like.
-        let keys = replay(&[
-            (200, KeyCode::Char('a')),
-            (0, KeyCode::Char('b')),
-            (0, KeyCode::Enter),
-        ]);
+    fn a_single_character_before_enter_is_not_a_paste() {
+        // A single character before Enter is what committing a composition can
+        // look like, not enough evidence that text was pasted.
+        let keys = replay(&[(200, KeyCode::Char('a')), (0, KeyCode::Enter)]);
         assert!(
             submits(keys.last().unwrap()),
             "the run is one character short of MIN_RUN"

@@ -212,13 +212,17 @@ pub struct SuggestionView {
 
 pub struct StatusLineView {
     pub branch: Option<String>,
-    pub model: String,
-    pub effort: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
     pub context: Option<String>,
     pub five_hour_percent: Option<u8>,
     pub weekly_percent: Option<u8>,
+    pub reset_credits: Option<String>,
     pub notice: Option<String>,
 }
+
+/// Internal footer marker used when the user disables the status line entirely.
+pub(crate) const HIDDEN_STATUS_LINE: &str = "\0";
 
 /// How prominently a composer mode badge is painted on the composer top rule.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -232,6 +236,7 @@ pub struct ComposerMode {
     pub label: String,
     pub accent: ModeAccent,
     pub fast_mode: bool,
+    pub effort: String,
     pub shell_display_mode: String,
     pub diff_display_mode: String,
     /// What the thread is estimated to have cost so far. Absent before the first
@@ -621,7 +626,7 @@ impl Renderer {
                     0
                 },
                 prefix_width: UnicodeWidthStr::width(line.prefix.as_str()),
-                content_columns: composer_content_columns(line),
+                content_columns: selectable_content_columns(line),
             })
             .collect()
     }
@@ -1317,11 +1322,10 @@ enum Tone {
     ModelLuna,
     Model55,
     Border,
-    /// Composer padding and side rules: visible chrome, never selectable text.
-    ComposerChrome,
     Branch,
     LimitFiveHour,
     LimitWeekly,
+    ResetCredit,
     FastOn,
     FastOff,
     ModelChange,
@@ -1360,7 +1364,7 @@ pub enum Pick {
     ShellDisplayMode,
     /// The file-diff badge: cycles between hidden, summary, and full patch output.
     DiffDisplayMode,
-    /// The `Fast On`/`Fast Off` badge: toggles the fast service tier.
+    /// The `Fast: On`/`Fast: Off` badge: toggles the fast service tier.
     FastMode,
     /// The status line's model name: opens `/model`.
     Model,
@@ -1581,15 +1585,28 @@ fn painted_line_width(line: &PaintLine) -> usize {
 }
 
 /// The composer frame is printable so it stays stable across terminal themes,
-/// but its side rules and right-hand fill are not prompt text.
+/// but its side rules, prompt gutter, and right-hand fill are not prompt text.
 fn composer_content_columns(line: &PaintLine) -> Option<Range<usize>> {
-    (line
-        .tail
-        .last()
-        .is_some_and(|span| span.tone == Tone::ComposerChrome && span.text == "│"))
-    .then(|| {
-        let start = UnicodeWidthStr::width(line.prefix.as_str());
-        start..start + UnicodeWidthStr::width(line.text.as_str())
+    (line.prefix == "│ " && line.tail.last().is_some_and(|span| span.text == "│")).then(|| {
+        let prefix_width = UnicodeWidthStr::width(line.prefix.as_str());
+        let start = prefix_width + 2;
+        let content_width = line
+            .tail
+            .first()
+            .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+            .unwrap_or(0);
+        start..start + content_width
+    })
+}
+
+/// Decorative conversation gutters identify a row's kind but are never part of
+/// its text. They share the same range in selection paint and clipboard output.
+fn selectable_content_columns(line: &PaintLine) -> Option<Range<usize>> {
+    composer_content_columns(line).or_else(|| {
+        let conversation_continuation = line.prefix == "  "
+            && matches!(line.tone, Tone::Plain | Tone::UserPrompt);
+        (is_copy_marker(&line.prefix) || conversation_continuation)
+            .then(|| UnicodeWidthStr::width(line.prefix.as_str())..painted_line_width(line))
     })
 }
 
@@ -1599,7 +1616,7 @@ fn selection_columns_for_line(
     row: usize,
 ) -> Option<Range<usize>> {
     let mut selected = range.columns_for_row(row, painted_line_width(line))?;
-    if let Some(content) = composer_content_columns(line) {
+    if let Some(content) = selectable_content_columns(line) {
         selected.start = selected.start.max(content.start);
         selected.end = selected.end.min(content.end);
     }
@@ -1729,7 +1746,9 @@ fn normal_frame_with_expansion(
     );
     let cursor_line = lines.len() + input_cursor_line;
     lines.extend(input_lines);
-    lines.push(status_line_row(status.line, &status.fallback, width));
+    if status.fallback != HIDDEN_STATUS_LINE {
+        lines.push(status_line_row(status.line, &status.fallback, width));
+    }
 
     Frame {
         lines,
@@ -2669,8 +2688,10 @@ fn overlay_frame_with_expansion(
     } else {
         false
     };
-    lines.push(PaintLine::blank());
-    lines.push(status_line_row(status.line, &status.fallback, width));
+    if status.fallback != HIDDEN_STATUS_LINE {
+        lines.push(PaintLine::blank());
+        lines.push(status_line_row(status.line, &status.fallback, width));
+    }
 
     Frame {
         cursor_line,
@@ -2716,19 +2737,27 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         };
     };
 
-    let effort_tone = effort_tone(&status.effort).unwrap_or(Tone::StatusText);
     let mut spans = Vec::new();
-    let branch = status
-        .branch
-        .filter(|branch| !branch.is_empty())
-        .unwrap_or_else(|| "--".to_owned());
-    push_status_span(&mut spans, compact_right(&branch, 24), Tone::Branch);
-    push_status_span(
-        &mut spans,
-        compact_right(&status.model, 28),
-        model_tone(&status.model).unwrap_or(Tone::StatusText),
-    );
-    push_status_span(&mut spans, format!("eff: {}", status.effort), effort_tone);
+    let mut picks = Vec::new();
+    if let Some(branch) = status.branch.filter(|branch| !branch.is_empty()) {
+        push_status_span(&mut spans, compact_right(&branch, 24), Tone::Branch);
+    }
+    if let Some(model) = status.model.filter(|model| !model.is_empty()) {
+        let span = push_status_span(
+            &mut spans,
+            compact_right(&model, 28),
+            model_tone(&model).unwrap_or(Tone::StatusText),
+        );
+        picks.push((span, Pick::Model));
+    }
+    if let Some(effort) = status.effort.filter(|effort| !effort.is_empty()) {
+        let span = push_status_span(
+            &mut spans,
+            format!("eff: {effort}"),
+            effort_tone(&effort).unwrap_or(Tone::StatusText),
+        );
+        picks.push((span, Pick::EffortSetting));
+    }
     if let Some(context) = status.context.filter(|context| !context.is_empty()) {
         push_status_span(&mut spans, context, Tone::Context);
     }
@@ -2736,19 +2765,36 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
     if let Some(percent) = status.five_hour_percent {
         push_status_span(&mut spans, format!("5h: {percent}%"), Tone::LimitFiveHour);
     }
-    push_status_span(
-        &mut spans,
-        status.weekly_percent.map_or_else(
-            || "week: --".to_owned(),
-            |percent| format!("week: {percent}%"),
-        ),
-        Tone::LimitWeekly,
-    );
-    // Fast On/Off lives on the composer top rule beside the permission mode.
+    if let Some(percent) = status.weekly_percent {
+        push_status_span(&mut spans, format!("week: {percent}%"), Tone::LimitWeekly);
+    }
+    if let Some(reset) = status.reset_credits.filter(|reset| !reset.is_empty()) {
+        push_status_span(&mut spans, reset, Tone::ResetCredit);
+    }
+    // Fast: On/Off lives on the composer top rule beside the permission mode.
     if let Some(notice) = status.notice.filter(|notice| !notice.is_empty()) {
         push_status_span(&mut spans, notice, Tone::Muted);
     }
-    trim_spans(&mut spans, width.max(1) as usize);
+    let max_width = width.saturating_sub(2) as usize;
+    let shortcut_hint = "Shift + ↑↓ model · ←→ effort";
+    let content_width = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+        .sum::<usize>();
+    let hint_width = UnicodeWidthStr::width(shortcut_hint);
+    if content_width + hint_width <= max_width {
+        spans.push(PaintSpan {
+            text: " ".repeat(max_width - content_width - hint_width),
+            tone: Tone::Muted,
+            bold: false,
+        });
+        spans.push(PaintSpan {
+            text: shortcut_hint.to_owned(),
+            tone: Tone::Muted,
+            bold: false,
+        });
+    }
+    trim_spans(&mut spans, max_width);
 
     let first = spans.first().cloned().unwrap_or(PaintSpan {
         text: String::new(),
@@ -2756,7 +2802,7 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         bold: false,
     });
     PaintLine {
-        prefix: String::new(),
+        prefix: " ".to_owned(),
         prefix_tone: Tone::Border,
         text: first.text,
         tone: first.tone,
@@ -2765,28 +2811,17 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         pick: None,
         tail: spans.into_iter().skip(1).collect(),
     }
-    // Branch, model and effort are pushed unconditionally and in that order, so
-    // the model reading is always the second span and the effort the third —
-    // each separated from the last by the ` | ` push_status_span inserts.
-    .with_picks(&[
-        (STATUS_MODEL_SPAN, Pick::Model),
-        (STATUS_EFFORT_SPAN, Pick::EffortSetting),
-    ])
+    .with_picks(&picks)
 }
 
-/// Paint-order position of the model reading on the status line, and of the
-/// effort beside it. Clicking either opens the command that changes it.
-const STATUS_MODEL_SPAN: usize = 2;
-const STATUS_EFFORT_SPAN: usize = 4;
-
-fn push_status_span(spans: &mut Vec<PaintSpan>, text: impl Into<String>, tone: Tone) {
+fn push_status_span(spans: &mut Vec<PaintSpan>, text: impl Into<String>, tone: Tone) -> usize {
     if spans.is_empty() {
         spans.push(PaintSpan {
             text: text.into(),
             tone,
             bold: false,
         });
-        return;
+        return 0;
     }
     spans.push(PaintSpan {
         text: " | ".to_owned(),
@@ -2798,6 +2833,7 @@ fn push_status_span(spans: &mut Vec<PaintSpan>, text: impl Into<String>, tone: T
         tone,
         bold: false,
     });
+    spans.len() - 1
 }
 
 fn trim_spans(spans: &mut Vec<PaintSpan>, max_width: usize) {
@@ -2880,13 +2916,16 @@ fn is_bash_block(block: &Block) -> bool {
 }
 
 fn is_running_shell_anchor(block: &Block) -> bool {
-    matches!(block.kind, BlockKind::Tool)
-        && block.title.starts_with("Running ")
-        && block.title.contains(" shell command")
+    let text = format!("{}\n{}", block.title, block.body).to_ascii_lowercase();
+    text.contains("running") && text.contains("shell") && text.contains("command")
 }
 
 fn is_thinking_block(block: &Block) -> bool {
     matches!(block.kind, BlockKind::Reasoning) && block.title == THINKING_TITLE
+}
+
+fn is_empty_thinking_block(block: &Block) -> bool {
+    is_thinking_block(block) && block.body.trim().is_empty()
 }
 
 fn is_file_change_block(block: &Block) -> bool {
@@ -2910,6 +2949,9 @@ fn visible_transcript_blocks<'a>(
 ) -> Vec<&'a Block> {
     let mut visible: Vec<&Block> = Vec::with_capacity(blocks.len());
     for block in blocks {
+        if is_empty_thinking_block(block) {
+            continue;
+        }
         if shell_display_mode == ShellDisplayMode::Hide
             && (is_bash_block(block) || is_running_shell_anchor(block))
         {
@@ -4410,7 +4452,7 @@ fn copy_joins_next(line: &PaintLine) -> bool {
 /// should start past them. Card corners (`╭─ `) are deliberately absent: they
 /// frame a block rather than mark one, and trimming them would leave the copied
 /// card missing only its top-left edge.
-const COPY_MARKERS: [&str; 5] = ["● ", "✻ ", "▲ ", "✕ ", "◆ "];
+const COPY_MARKERS: [&str; 7] = ["● ", "✻ ", "∴ ", "▲ ", "✕ ", "◆ ", "❯ "];
 
 fn is_copy_marker(prefix: &str) -> bool {
     COPY_MARKERS.contains(&prefix)
@@ -4508,6 +4550,7 @@ fn input_lines(
 
     let mut rows = Vec::with_capacity(raw_rows.len() + 2);
     rows.push(input_top_line(panel_width, label, mode));
+    let chrome_tone = composer_chrome_tone(mode);
     for (index, raw) in raw_rows.into_iter().enumerate() {
         let is_placeholder = editor.is_empty() && composer_images.is_empty() && index == 0;
         let content = if is_placeholder {
@@ -4521,19 +4564,25 @@ fn input_lines(
             continuation_prefix
         };
         let content_width = UnicodeWidthStr::width(content.as_str());
+        let content_tone = if is_placeholder {
+            Tone::Muted
+        } else {
+            Tone::Plain
+        };
         rows.push(PaintLine {
             prefix: side_prefix.to_owned(),
-            prefix_tone: Tone::Border,
-            text: format!("{prompt_prefix}{content}"),
-            tone: if is_placeholder {
-                Tone::Muted
-            } else {
-                Tone::Plain
-            },
+            prefix_tone: chrome_tone,
+            text: prompt_prefix.to_owned(),
+            tone: Tone::Plain,
             bold: false,
             tool_heading: None,
             pick: None,
             tail: vec![
+                PaintSpan {
+                    text: content,
+                    tone: content_tone,
+                    bold: false,
+                },
                 PaintSpan {
                     text: " ".repeat(panel_width.saturating_sub(
                         UnicodeWidthStr::width(side_prefix)
@@ -4541,12 +4590,12 @@ fn input_lines(
                             + content_width
                             + 1,
                     )),
-                    tone: Tone::ComposerChrome,
+                    tone: chrome_tone,
                     bold: false,
                 },
                 PaintSpan {
                     text: "│".to_owned(),
-                    tone: Tone::ComposerChrome,
+                    tone: chrome_tone,
                     bold: false,
                 },
             ],
@@ -4554,7 +4603,7 @@ fn input_lines(
     }
     // Both composer rules share the welcome card's border colour, so the frame
     // around the prompt reads as the same furniture the panels are drawn from.
-    rows.push(input_bottom_line(panel_width, notice));
+    rows.push(input_bottom_line(panel_width, notice, mode));
 
     (rows, cursor_row + 1, cursor_column)
 }
@@ -4576,6 +4625,7 @@ const COMPOSER_BADGE_SEPARATOR: &str = " · ";
 const OPENING_RULE: &str = "── ";
 
 fn input_top_line(panel_width: usize, label: &str, mode: Option<&ComposerMode>) -> PaintLine {
+    let chrome_tone = composer_chrome_tone(mode);
     let left = if label.is_empty() {
         String::new()
     } else {
@@ -4624,7 +4674,7 @@ fn input_top_line(panel_width: usize, label: &str, mode: Option<&ComposerMode>) 
         tail.push(rule_gap(1));
         tail.push(PaintSpan {
             text: "─".repeat(COMPOSER_MODE_TAIL_RULE),
-            tone: Tone::Border,
+            tone: chrome_tone,
             bold: false,
         });
     }
@@ -4634,17 +4684,21 @@ fn input_top_line(panel_width: usize, label: &str, mode: Option<&ComposerMode>) 
     // side of it keeps the border colour while the label itself stays muted —
     // the same split `panel_rule_row` uses for a card title.
     if left.is_empty() {
-        return PaintLine {
-            prefix: String::new(),
-            prefix_tone: Tone::Border,
-            text: fill,
-            tone: Tone::Border,
-            bold: false,
-            tool_heading: None,
-            pick: None,
-            tail,
-        }
-        .with_picks(&picks);
+        return corner_composer_rule(
+            PaintLine {
+                prefix: String::new(),
+                prefix_tone: chrome_tone,
+                text: fill,
+                tone: chrome_tone,
+                bold: false,
+                tool_heading: None,
+                pick: None,
+                tail,
+            }
+            .with_picks(&picks),
+            '╭',
+            '╮',
+        );
     }
     let spans = [
         PaintSpan {
@@ -4654,64 +4708,106 @@ fn input_top_line(panel_width: usize, label: &str, mode: Option<&ComposerMode>) 
         },
         PaintSpan {
             text: fill,
-            tone: Tone::Border,
+            tone: chrome_tone,
             bold: false,
         },
     ];
-    PaintLine {
-        prefix: String::new(),
-        prefix_tone: Tone::Border,
-        text: OPENING_RULE.to_owned(),
-        tone: Tone::Border,
-        bold: false,
-        tool_heading: None,
-        pick: None,
-        tail: spans.into_iter().chain(tail).collect(),
-    }
-    .with_picks(&picks)
-}
-
-fn input_bottom_line(panel_width: usize, notice: Option<&str>) -> PaintLine {
-    let Some(notice) = notice else {
-        return PaintLine {
+    corner_composer_rule(
+        PaintLine {
             prefix: String::new(),
-            prefix_tone: Tone::Border,
-            text: "─".repeat(panel_width),
-            tone: Tone::Border,
+            prefix_tone: chrome_tone,
+            text: OPENING_RULE.to_owned(),
+            tone: chrome_tone,
             bold: false,
             tool_heading: None,
             pick: None,
-            tail: Vec::new(),
-        };
+            tail: spans.into_iter().chain(tail).collect(),
+        }
+        .with_picks(&picks),
+        '╭',
+        '╮',
+    )
+}
+
+fn input_bottom_line(
+    panel_width: usize,
+    notice: Option<&str>,
+    mode: Option<&ComposerMode>,
+) -> PaintLine {
+    let chrome_tone = composer_chrome_tone(mode);
+    let Some(notice) = notice else {
+        return corner_composer_rule(
+            PaintLine {
+                prefix: String::new(),
+                prefix_tone: chrome_tone,
+                text: "─".repeat(panel_width),
+                tone: chrome_tone,
+                bold: false,
+                tool_heading: None,
+                pick: None,
+                tail: Vec::new(),
+            },
+            '╰',
+            '╯',
+        );
     };
 
     let reserved = COMPOSER_NOTICE_GAP + 1 + COMPOSER_NOTICE_TAIL_RULE;
     let notice = compact_right(notice, panel_width.saturating_sub(reserved));
     let fill =
         "─".repeat(panel_width.saturating_sub(UnicodeWidthStr::width(notice.as_str()) + reserved));
-    PaintLine {
-        prefix: String::new(),
-        prefix_tone: Tone::Border,
-        text: fill,
-        tone: Tone::Border,
-        bold: false,
-        tool_heading: None,
-        pick: None,
-        tail: vec![
-            rule_gap(COMPOSER_NOTICE_GAP),
-            PaintSpan {
-                text: notice,
-                tone: Tone::Accent,
-                bold: false,
-            },
-            rule_gap(1),
-            PaintSpan {
-                text: "─".repeat(COMPOSER_NOTICE_TAIL_RULE),
-                tone: Tone::Border,
-                bold: false,
-            },
-        ],
+    corner_composer_rule(
+        PaintLine {
+            prefix: String::new(),
+            prefix_tone: chrome_tone,
+            text: fill,
+            tone: chrome_tone,
+            bold: false,
+            tool_heading: None,
+            pick: None,
+            tail: vec![
+                rule_gap(COMPOSER_NOTICE_GAP),
+                PaintSpan {
+                    text: notice,
+                    tone: Tone::Accent,
+                    bold: false,
+                },
+                rule_gap(1),
+                PaintSpan {
+                    text: "─".repeat(COMPOSER_NOTICE_TAIL_RULE),
+                    tone: chrome_tone,
+                    bold: false,
+                },
+            ],
+        },
+        '╰',
+        '╯',
+    )
+}
+
+fn composer_chrome_tone(mode: Option<&ComposerMode>) -> Tone {
+    mode.and_then(|mode| effort_tone(&mode.effort))
+        .unwrap_or(Tone::Border)
+}
+
+/// Turns the outermost rule cells into the same closed corners the welcome card
+/// uses, without changing the width or shifting clickable composer badges.
+fn corner_composer_rule(mut line: PaintLine, left: char, right: char) -> PaintLine {
+    if line.text.starts_with('─') {
+        line.text
+            .replace_range(0..'─'.len_utf8(), &left.to_string());
     }
+    let last = line
+        .tail
+        .iter_mut()
+        .rev()
+        .find(|span| !span.text.is_empty())
+        .map(|span| &mut span.text)
+        .unwrap_or(&mut line.text);
+    if let Some((index, _)) = last.char_indices().last() {
+        last.replace_range(index.., &right.to_string());
+    }
+    line
 }
 
 /// Widest badge that fits in `budget`: estimated cost · permission mode ·
@@ -4727,9 +4823,9 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
     };
 
     let fast_label = if mode.fast_mode {
-        "Fast On"
+        "Fast: On"
     } else {
-        "Fast Off"
+        "Fast: Off"
     };
     let fast_span = PaintSpan {
         text: fast_label.to_owned(),
@@ -5189,10 +5285,11 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::ModelTerra => palette.pink,
         Tone::ModelLuna => palette.purple,
         Tone::Model55 => palette.blue,
-        Tone::Border | Tone::ComposerChrome => palette.border,
+        Tone::Border => palette.border,
         Tone::Branch => palette.status.branch,
         Tone::LimitFiveHour => palette.status.five_hour,
         Tone::LimitWeekly => palette.status.weekly,
+        Tone::ResetCredit => palette.orange,
         Tone::FastOn => palette.success,
         Tone::FastOff => palette.muted,
         Tone::ModelChange => palette.foreground,
@@ -5447,16 +5544,15 @@ mod tests {
 
         assert!(prompt_rows.len() > 1);
         assert!(!rows[0].text.contains("Message"));
-        assert!(rows[0].text.chars().all(|ch| ch == '─'));
+        assert_eq!(painted(&rows[0]), "╭───────────────╮");
         // Both rules are drawn in the same border colour the welcome card uses.
         assert!(rows[0].tone == Tone::Border);
         assert!(rows.last().is_some_and(|row| row.tone == Tone::Border));
         assert_eq!(painted(&prompt_rows[0]), "│ > wrapped-prom│");
         assert_eq!(painted(&prompt_rows[1]), "│   pt-text     │");
-        assert!(!rows[0].text.contains(['╭', '╮', '╰', '╯']));
-        assert!(
-            rows.last()
-                .is_some_and(|row| row.text.chars().all(|ch| ch == '─'))
+        assert_eq!(
+            painted(rows.last().expect("bottom rule")),
+            "╰───────────────╯"
         );
     }
 
@@ -5472,7 +5568,7 @@ mod tests {
         assert!(renderer.update_selection(16, 1));
         assert_eq!(
             renderer.finish_selection(16, 1),
-            SelectionResult::Copy("> copy".to_owned())
+            SelectionResult::Copy("copy".to_owned())
         );
     }
 
@@ -5486,7 +5582,96 @@ mod tests {
             end: CellPosition { column: 16, row: 1 },
         };
 
-        assert_eq!(selection_columns_for_line(&rows[1], range, 1), Some(2..8));
+        assert_eq!(selection_columns_for_line(&rows[1], range, 1), Some(4..8));
+    }
+
+    #[test]
+    fn fullscreen_selection_excludes_response_and_thinking_gutters() {
+        let assistant =
+            block_lines(&Block::new(BlockKind::Assistant, "Codex", "answer"), 80).remove(0);
+        let thinking = block_lines(
+            &Block::new(BlockKind::Reasoning, THINKING_TITLE, "thought"),
+            80,
+        )
+        .remove(0);
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = vec![assistant.clone(), thinking.clone()];
+
+        let full_row = |line: &PaintLine, row| CellRange {
+            start: CellPosition { column: 0, row },
+            end: CellPosition {
+                column: painted_line_width(line).saturating_sub(1) as u16,
+                row,
+            },
+        };
+        assert_eq!(
+            selection_columns_for_line(&assistant, full_row(&assistant, 0), 0),
+            Some(2..8)
+        );
+        assert_eq!(
+            selection_columns_for_line(&thinking, full_row(&thinking, 1), 1),
+            Some(2..9)
+        );
+
+        assert!(renderer.begin_selection(0, 0));
+        assert!(renderer.update_selection(7, 0));
+        assert_eq!(
+            renderer.finish_selection(7, 0),
+            SelectionResult::Copy("answer".to_owned())
+        );
+        assert!(renderer.begin_selection(0, 1));
+        assert!(renderer.update_selection(8, 1));
+        assert_eq!(
+            renderer.finish_selection(8, 1),
+            SelectionResult::Copy("thought".to_owned())
+        );
+    }
+
+    #[test]
+    fn fullscreen_selection_excludes_the_blank_response_gutter_after_a_bullet() {
+        let lines = block_lines(
+            &Block::new(BlockKind::Assistant, "Codex", "first\nsecond"),
+            80,
+        );
+        let second_row = CellRange {
+            start: CellPosition { column: 0, row: 1 },
+            end: CellPosition { column: 7, row: 1 },
+        };
+        assert_eq!(selection_columns_for_line(&lines[1], second_row, 1), Some(2..8));
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = lines;
+
+        assert!(renderer.begin_selection(0, 0));
+        assert!(renderer.update_selection(7, 1));
+        assert_eq!(
+            renderer.finish_selection(7, 1),
+            SelectionResult::Copy("first\nsecond".to_owned())
+        );
+    }
+
+    #[test]
+    fn fullscreen_selection_excludes_the_blank_user_prompt_gutter() {
+        let lines = block_lines(&Block::new(BlockKind::User, "You", "first\nsecond"), 80);
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = lines;
+
+        assert!(renderer.begin_selection(0, 0));
+        assert!(renderer.update_selection(7, 1));
+        assert_eq!(
+            renderer.finish_selection(7, 1),
+            SelectionResult::Copy("first\nsecond".to_owned())
+        );
+    }
+
+    #[test]
+    fn selection_keeps_the_status_line_leading_space() {
+        let line = status_line_row(None, "status", 20);
+        let range = CellRange {
+            start: CellPosition { column: 0, row: 0 },
+            end: CellPosition { column: 6, row: 0 },
+        };
+
+        assert_eq!(selection_columns_for_line(&line, range, 0), Some(0..7));
     }
 
     #[test]
@@ -5534,7 +5719,7 @@ mod tests {
 
         let (rows, _, _) = input_lines(&editor, &images, 80, "", "", None, None);
 
-        assert_eq!(rows[1].text, "> [Image #1] ");
+        assert!(painted(&rows[1]).contains("> [Image #1] "));
     }
 
     #[test]
@@ -6030,7 +6215,7 @@ mod tests {
             "the composer rule should keep its border tone"
         );
         assert!(
-            frame.lines[notice].text.chars().all(|ch| ch == '─'),
+            painted(&frame.lines[notice]).starts_with('╰'),
             "the notice should sit on the rule, not replace it"
         );
         assert_eq!(
@@ -6069,7 +6254,7 @@ mod tests {
             .expect("notice row");
         assert_eq!(
             painted(notice),
-            format!("{}  Copied 12 chars to clipboard ──", "─".repeat(46))
+            format!("╰{}  Copied 12 chars to clipboard ─╯", "─".repeat(45))
         );
     }
 
@@ -6204,7 +6389,7 @@ mod tests {
         assert!(
             bare.lines
                 .iter()
-                .all(|line| !painted(line).starts_with("── ")),
+                .all(|line| !painted(line).starts_with("╭─ ")),
             "an unrecalled composer should carry no label"
         );
 
@@ -6216,7 +6401,7 @@ mod tests {
             recalled
                 .lines
                 .iter()
-                .any(|line| painted(line).starts_with("── 2/2 ─")),
+                .any(|line| painted(line).starts_with("╭─ 2/2 ─")),
             "the composer rule should show the history position"
         );
     }
@@ -6249,7 +6434,7 @@ mod tests {
         // One blank row separates the activity line from the composer rule.
         assert!(frame.lines[activity + 1] == PaintLine::blank());
         assert!(!frame.lines[activity + 2].text.is_empty());
-        assert!(frame.lines[activity + 2].text.chars().all(|ch| ch == '─'));
+        assert!(painted(&frame.lines[activity + 2]).starts_with('╭'));
     }
 
     /// The label shimmers like Codex's: a bright band that lights part of the word
@@ -6347,10 +6532,28 @@ mod tests {
             label: label.to_owned(),
             accent,
             fast_mode,
+            effort: "high".to_owned(),
             cost: None,
             shell_display_mode: "Collapse".to_owned(),
             diff_display_mode: "Collapse".to_owned(),
         }
+    }
+
+    #[test]
+    fn composer_chrome_uses_effort_while_the_prompt_stays_plain() {
+        let editor = Editor::default();
+        let mode = test_mode("Default", ModeAccent::Calm, false);
+
+        let (rows, _, _) = input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
+
+        assert_eq!(rows[0].tone, Tone::EffortHigh);
+        assert_eq!(rows[1].prefix_tone, Tone::EffortHigh);
+        assert_eq!(rows[1].tone, Tone::Plain);
+        assert_eq!(
+            rows[1].tail.last().map(|span| span.tone),
+            Some(Tone::EffortHigh)
+        );
+        assert_eq!(rows.last().map(|line| line.tone), Some(Tone::EffortHigh));
     }
 
     #[test]
@@ -6364,7 +6567,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(rule_width(&line), 80);
-        assert!(line.text.chars().all(|ch| ch == '─'));
+        assert!(painted(&line).starts_with('╭'));
         // Two blanks off the rule, the badge, then the rule resumes for two columns.
         assert_eq!(
             texts,
@@ -6376,9 +6579,9 @@ mod tests {
                 " · ",
                 "Diff: Collapse",
                 " · ",
-                "Fast On",
+                "Fast: On",
                 " ",
-                "──"
+                "─╮"
             ]
         );
         assert_eq!(line.tail[1].tone, Tone::Warning);
@@ -6419,7 +6622,7 @@ mod tests {
             pick_on(&line, "Diff: Collapse"),
             Some(Pick::DiffDisplayMode)
         );
-        assert_eq!(pick_on(&line, "Fast On"), Some(Pick::FastMode));
+        assert_eq!(pick_on(&line, "Fast: On"), Some(Pick::FastMode));
         // The last column of the mode label still counts as the mode.
         let mode_end = UnicodeWidthStr::width(&text[..text.find("Full Access").unwrap()]) + 10;
         assert_eq!(
@@ -6442,7 +6645,7 @@ mod tests {
         let line = input_top_line(90, "3/12", Some(&mode));
 
         assert_eq!(pick_on(&line, "Full Access"), Some(Pick::PermissionMode));
-        assert_eq!(pick_on(&line, "Fast On"), Some(Pick::FastMode));
+        assert_eq!(pick_on(&line, "Fast: On"), Some(Pick::FastMode));
         assert_eq!(pick_on(&line, "[$0.95]"), None);
         assert_eq!(pick_on(&line, "3/12"), None);
     }
@@ -6484,9 +6687,9 @@ mod tests {
                 " · ",
                 "Diff: Collapse",
                 " · ",
-                "Fast Off",
+                "Fast: Off",
                 " ",
-                "──"
+                "─╮"
             ]
         );
         assert_eq!(line.tail[7].tone, Tone::FastOff);
@@ -6516,9 +6719,9 @@ mod tests {
                 " · ",
                 "Diff: Collapse",
                 " · ",
-                "Fast On",
+                "Fast: On",
                 " ",
-                "──"
+                "─╮"
             ]
         );
         assert_eq!(line.tail[1].tone, Tone::Plain);
@@ -6549,9 +6752,9 @@ mod tests {
                 " · ",
                 "Diff: Collapse",
                 " · ",
-                "Fast On",
+                "Fast: On",
                 " ",
-                "──"
+                "─╮"
             ]
         );
         assert_eq!(
@@ -6587,9 +6790,9 @@ mod tests {
                 " · ",
                 "Diff: Collapse",
                 " · ",
-                "Fast On",
+                "Fast: On",
                 " ",
-                "──"
+                "─╮"
             ]
         );
     }
@@ -6605,7 +6808,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(rule_width(&line), 24);
-        assert_eq!(texts, ["  ", "Full Access", " ", "──"]);
+        assert_eq!(texts, ["  ", "Full Access", " ", "─╮"]);
     }
 
     #[test]
@@ -6654,7 +6857,7 @@ mod tests {
         // come between them.
         assert!(frame.lines[suggestion_end + 1] == PaintLine::blank());
         let rule = &frame.lines[suggestion_end + 2];
-        assert!(!rule.text.is_empty() && rule.text.chars().all(|ch| ch == '─'));
+        assert!(painted(rule).starts_with('╭'));
     }
 
     /// Whatever the composer is docked under, the row directly above its rule is
@@ -6681,7 +6884,7 @@ mod tests {
         let rule = frame
             .lines
             .iter()
-            .position(|line| !line.text.is_empty() && line.text.chars().all(|ch| ch == '─'))
+            .position(|line| painted(line).starts_with('╭'))
             .expect("composer rule");
         assert!(rule > 0);
         assert!(frame.lines[rule - 1] == PaintLine::blank());
@@ -7103,12 +7306,39 @@ mod tests {
 
     #[test]
     fn hide_omits_the_running_shell_anchor() {
-        let anchor = Block::new(BlockKind::Tool, "Running 1 shell command", "");
-
-        assert!(
-            visible_transcript_blocks(&[anchor], ShellDisplayMode::Hide, DiffDisplayMode::Collapse)
+        for anchor in [
+            Block::new(BlockKind::Tool, "Running 1 shell command", ""),
+            Block::new(BlockKind::Tool, "Running Shell Command", ""),
+            Block::new(BlockKind::Warning, "Running 2 Shell Commands", ""),
+            Block::new(BlockKind::System, "Running Shell Command", ""),
+            Block::new(BlockKind::Tool, "Command", "Running Shell Command"),
+        ] {
+            assert!(
+                visible_transcript_blocks(
+                    &[anchor],
+                    ShellDisplayMode::Hide,
+                    DiffDisplayMode::Collapse
+                )
                 .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn empty_thinking_placeholders_are_not_visible_transcript_blocks() {
+        let blocks = vec![
+            Block::new(BlockKind::Reasoning, THINKING_TITLE, ""),
+            Block::new(BlockKind::Reasoning, THINKING_TITLE, "actual summary"),
+        ];
+
+        let visible = visible_transcript_blocks(
+            &blocks,
+            ShellDisplayMode::Collapse,
+            DiffDisplayMode::Collapse,
         );
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].body, "actual summary");
     }
 
     #[test]
@@ -7718,44 +7948,61 @@ mod tests {
         let line = status_line_row(
             Some(StatusLineView {
                 branch: Some("main".to_owned()),
-                model: "GPT-5.6 Codex".to_owned(),
-                effort: "xhigh".to_owned(),
+                model: Some("GPT-5.6 Codex".to_owned()),
+                effort: Some("xhigh".to_owned()),
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
                 five_hour_percent: Some(12),
                 weekly_percent: Some(34),
+                reset_credits: None,
                 notice: Some("connected".to_owned()),
             }),
             "",
             32,
         );
-        let width = UnicodeWidthStr::width(line.text.as_str())
-            + line
-                .tail
-                .iter()
-                .map(|span| UnicodeWidthStr::width(span.text.as_str()))
-                .sum::<usize>();
-
-        assert!(width <= 32);
+        assert!(painted_width(&line) <= 32);
         assert!(line.text.starts_with("main"));
     }
 
     #[test]
-    fn status_line_keeps_an_empty_branch_slot_at_the_far_left() {
+    fn status_line_places_the_model_and_effort_shortcuts_at_the_far_right() {
+        let line = status_line_row(
+            Some(StatusLineView {
+                branch: Some("main".to_owned()),
+                model: Some("GPT-5.6 Codex".to_owned()),
+                effort: Some("xhigh".to_owned()),
+                context: Some("ctx: 45k/256k (18%)".to_owned()),
+                five_hour_percent: Some(12),
+                weekly_percent: Some(34),
+                reset_credits: None,
+                notice: None,
+            }),
+            "",
+            120,
+        );
+
+        assert!(painted(&line).ends_with("Shift + ↑↓ model · ←→ effort"));
+        assert_eq!(painted_width(&line), 119);
+    }
+
+    #[test]
+    fn status_line_omits_a_disabled_branch_slot() {
         let line = status_line_row(
             Some(StatusLineView {
                 branch: None,
-                model: "GPT-5.6 Sol".to_owned(),
-                effort: "high".to_owned(),
+                model: Some("GPT-5.6 Sol".to_owned()),
+                effort: Some("high".to_owned()),
                 context: None,
                 five_hour_percent: None,
                 weekly_percent: None,
+                reset_credits: None,
                 notice: None,
             }),
             "",
             80,
         );
 
-        assert_eq!(line.text, "--");
+        assert_eq!(line.prefix, " ");
+        assert_eq!(line.text, "GPT-5.6 Sol");
     }
 
     /// The two readings the status line lets you change answer to a click; the
@@ -7765,11 +8012,12 @@ mod tests {
         let line = status_line_row(
             Some(StatusLineView {
                 branch: Some("main".to_owned()),
-                model: "GPT-5.6 Sol".to_owned(),
-                effort: "high".to_owned(),
+                model: Some("GPT-5.6 Sol".to_owned()),
+                effort: Some("high".to_owned()),
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
                 five_hour_percent: Some(12),
                 weekly_percent: Some(34),
+                reset_credits: Some("reset: 3 · 5d".to_owned()),
                 notice: None,
             }),
             "",
@@ -7782,6 +8030,14 @@ mod tests {
         assert_eq!(pick_on(&line, "ctx:"), None);
         assert_eq!(pick_on(&line, "5h: 12%"), None);
         assert_eq!(pick_on(&line, "week: 34%"), None);
+        assert!(painted(&line).contains("reset: 3 · 5d"));
+        assert_eq!(
+            line.tail
+                .iter()
+                .find(|span| span.text == "reset: 3 · 5d")
+                .map(|span| span.tone),
+            Some(Tone::ResetCredit)
+        );
     }
 
     /// Before the first status arrives the row is a plain fallback string, with no
@@ -7789,6 +8045,27 @@ mod tests {
     #[test]
     fn the_status_fallback_row_has_nothing_to_click() {
         assert!(status_line_row(None, "starting…", 40).pick.is_none());
+    }
+
+    #[test]
+    fn a_hidden_status_area_does_not_paint_a_status_line_row() {
+        let editor = Editor::default();
+        let frame = normal_frame(
+            &[],
+            &editor,
+            None,
+            &[],
+            None,
+            StatusArea {
+                fallback: HIDDEN_STATUS_LINE.to_owned(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+
+        assert!(painted(frame.lines.last().expect("composer bottom rule")).starts_with('╰'));
     }
 
     fn painted(line: &PaintLine) -> String {
@@ -8677,11 +8954,12 @@ mod tests {
         let line = status_line_row(
             Some(StatusLineView {
                 branch: Some("main".to_owned()),
-                model: "GPT-5.6 Sol".to_owned(),
-                effort: "high".to_owned(),
+                model: Some("GPT-5.6 Sol".to_owned()),
+                effort: Some("high".to_owned()),
                 context: None,
                 five_hour_percent: None,
                 weekly_percent: Some(34),
+                reset_credits: None,
                 notice: None,
             }),
             "",
@@ -8922,6 +9200,16 @@ mod tests {
             }
         }
         assert!(model_tone("GPT-5.4").is_none());
+    }
+
+    #[test]
+    fn terra_uses_the_model_family_pink() {
+        assert_eq!(tone_rgb(Tone::ModelTerra), Some(theme::palette().pink));
+    }
+
+    #[test]
+    fn reset_credit_uses_the_theme_orange() {
+        assert_eq!(tone_rgb(Tone::ResetCredit), Some(theme::palette().orange));
     }
 
     #[test]

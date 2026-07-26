@@ -31,7 +31,7 @@ use crossterm::event::{
 use editor::Editor;
 use futures_util::StreamExt;
 use integrations::{McpServerInfo, PluginCatalog, PluginDetail, PluginInfo, PluginScope};
-use paste::PasteBurst;
+use paste::{BufferedText, ComposerInput, ComposerPasteBuffer, PasteBurst};
 use renderer::{BlockKind, Pick, RenderMode, Renderer, SelectionResult, TerminalSession, View};
 use serde_json::{Value, json};
 use state::{
@@ -289,7 +289,9 @@ async fn await_thread(
     plan: impl Future<Output = AccountPlan>,
 ) -> Result<Startup> {
     let mut events = EventStream::new();
-    let mut paste_burst = PasteBurst::new();
+    let mut composer_paste = ComposerPasteBuffer::new();
+    let mut paste_tick = tokio::time::interval(Duration::from_millis(25));
+    paste_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut spinner_tick = tokio::time::interval(Duration::from_millis(120));
     spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut queued = None;
@@ -319,18 +321,17 @@ async fn await_thread(
                 match event {
                     Some(Ok(Event::Key(key))) => {
                         renderer.clear_selection();
-                        let action = state.handle_key(paste_burst.observe(key, Instant::now()));
-                        if attach_pasted_editor_image(state, &paste_burst) {
-                            Action::None
-                        } else {
-                            action
-                        }
+                        apply_composer_inputs(state, composer_paste.observe(key, Instant::now()))
                     }
                     Some(Ok(Event::Mouse(mouse))) => renderer_mouse_action(renderer, &mouse, |pick| pick_action(state, pick)),
                     Some(Ok(Event::Paste(text))) => {
                         renderer.clear_selection();
-                        if !attach_clipboard_image(state) && !attach_pasted_local_image(state, &text) {
-                            state.handle_paste(&text);
+                        flush_composer_paste(state, &mut composer_paste, Instant::now());
+                        if !attach_clipboard_image(state) {
+                            apply_composer_text(
+                                state,
+                                BufferedText { text, pasted: true },
+                            );
                         }
                         Action::None
                     }
@@ -343,6 +344,9 @@ async fn await_thread(
                     Some(Err(error)) => return Err(error.into()),
                     None => return Ok(Startup::Quit),
                 }
+            }
+            _ = paste_tick.tick() => {
+                Action::Tick(flush_composer_paste(state, &mut composer_paste, Instant::now()))
             }
             _ = spinner_tick.tick() => Action::Tick(state.tick()),
         };
@@ -578,7 +582,9 @@ async fn event_loop(
 ) -> Result<()> {
     let mut update_rx = Some(update_rx);
     let mut terminal_events = EventStream::new();
-    let mut paste_burst = PasteBurst::new();
+    let mut composer_paste = ComposerPasteBuffer::new();
+    let mut paste_tick = tokio::time::interval(Duration::from_millis(25));
+    paste_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut activity_tick = tokio::time::interval(Duration::from_millis(120));
     activity_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut resize = ResizeTracker::new();
@@ -639,28 +645,25 @@ async fn event_loop(
                         // Typing means the drag is over and its highlight is
                         // stale, so it goes before the key is acted on.
                         let cleared = renderer.clear_selection();
-                        let key = paste_burst.observe(key, Instant::now());
-                        let action = match scroll_request(renderer, &key) {
-                            // A scroll moves the renderer's view, not the session, so
-                            // it never reaches `handle_key` and cannot disturb a
-                            // picker that wants the same key unshifted.
-                            Some(delta) => Action::Tick(renderer.scroll(delta)),
-                            None => state.handle_key(key),
-                        };
-                        if attach_pasted_editor_image(state, &paste_burst) {
-                            Action::None
-                        } else {
+                        let action = apply_composer_inputs_with_scroll(
+                            state,
+                            renderer,
+                            composer_paste.observe(key, Instant::now()),
+                        );
                         match action {
                             Action::Tick(false) if cleared => Action::Tick(true),
                             action => action,
-                        }
                         }
                     }
                     Some(Ok(Event::Mouse(mouse))) => renderer_mouse_action(renderer, &mouse, |pick| pick_action(state, pick)),
                     Some(Ok(Event::Paste(text))) => {
                         renderer.clear_selection();
-                        if !attach_clipboard_image(state) && !attach_pasted_local_image(state, &text) {
-                            state.handle_paste(&text);
+                        flush_composer_paste(state, &mut composer_paste, Instant::now());
+                        if !attach_clipboard_image(state) {
+                            apply_composer_text(
+                                state,
+                                BufferedText { text, pasted: true },
+                            );
                         }
                         Action::None
                     }
@@ -728,6 +731,9 @@ async fn event_loop(
                     state.update_workspace_entries(entries);
                 }
                 Action::None
+            }
+            _ = paste_tick.tick() => {
+                Action::Tick(flush_composer_paste(state, &mut composer_paste, Instant::now()))
             }
             _ = activity_tick.tick() => {
                 let mut redraw = state.tick();
@@ -857,7 +863,7 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
         }
         Pick::ShellDisplayMode => Action::PersistShellDisplayMode(state.cycle_shell_display_mode()),
         Pick::DiffDisplayMode => Action::PersistDiffDisplayMode(state.cycle_diff_display_mode()),
-        Pick::FastMode => state.run_command("/fast"),
+        Pick::FastMode => Action::SetFast(!state.effective_fast_mode()),
         Pick::Model => state.run_command("/model"),
         Pick::EffortSetting => state.run_command("/effort"),
         Pick::Close => state.close_overlay(),
@@ -876,8 +882,6 @@ fn scroll_request(renderer: &Renderer, key: &KeyEvent) -> Option<isize> {
     match key.code {
         KeyCode::PageUp => Some(renderer.page_rows()),
         KeyCode::PageDown => Some(-renderer.page_rows()),
-        KeyCode::Up => Some(1),
-        KeyCode::Down => Some(-1),
         _ => None,
     }
 }
@@ -1067,6 +1071,21 @@ async fn execute_action(
                 state.push_notice(
                     BlockKind::Warning,
                     "Diff 표시 설정 저장 실패",
+                    error.to_string(),
+                );
+            }
+        }
+        Action::PersistStatusLine { key_path, enabled } => {
+            if let Err(error) = server
+                .request(
+                    "config/value/write",
+                    config_value_write_params(key_path, &enabled.to_string()),
+                )
+                .await
+            {
+                state.push_notice(
+                    BlockKind::Warning,
+                    "상태줄 표시 설정 저장 실패",
                     error.to_string(),
                 );
             }
@@ -2568,16 +2587,58 @@ fn attach_pasted_local_image(state: &mut AppState, text: &str) -> bool {
     true
 }
 
-fn attach_pasted_editor_image(state: &mut AppState, burst: &PasteBurst) -> bool {
-    if !burst.is_active() {
-        return false;
+fn apply_composer_text(state: &mut AppState, text: BufferedText) {
+    if !text.pasted || !attach_pasted_local_image(state, &text.text) {
+        state.handle_paste(&text.text);
     }
-    let text = state.editor.text();
-    if !attach_pasted_local_image(state, &text) {
-        return false;
+}
+
+fn apply_composer_inputs(state: &mut AppState, inputs: Vec<ComposerInput>) -> Action {
+    let mut action = Action::None;
+    for input in inputs {
+        action = match input {
+            ComposerInput::Key(key) => state.handle_key(key),
+            ComposerInput::Text(text) => {
+                apply_composer_text(state, text);
+                Action::None
+            }
+        };
     }
-    state.editor.clear();
-    true
+    action
+}
+
+fn apply_composer_inputs_with_scroll(
+    state: &mut AppState,
+    renderer: &mut Renderer,
+    inputs: Vec<ComposerInput>,
+) -> Action {
+    let mut action = Action::None;
+    for input in inputs {
+        action = match input {
+            ComposerInput::Key(key) => match scroll_request(renderer, &key) {
+                Some(delta) => Action::Tick(renderer.scroll(delta)),
+                None => state.handle_key(key),
+            },
+            ComposerInput::Text(text) => {
+                apply_composer_text(state, text);
+                Action::None
+            }
+        };
+    }
+    action
+}
+
+fn flush_composer_paste(
+    state: &mut AppState,
+    buffer: &mut ComposerPasteBuffer,
+    now: Instant,
+) -> bool {
+    if let Some(text) = buffer.flush_if_idle(now) {
+        apply_composer_text(state, text);
+        true
+    } else {
+        false
+    }
 }
 
 fn local_image_path_from_paste(text: &str) -> Option<PathBuf> {
@@ -2949,6 +3010,7 @@ fn resolve_cwd(requested: Option<&Path>) -> Result<PathBuf> {
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use state::EffortInfo;
+    use theme::ThemeKind;
 
     use super::*;
 
@@ -3037,6 +3099,34 @@ mod tests {
             context_window: None,
             fast_service_tier: None,
         }
+    }
+
+    #[test]
+    fn shifted_arrows_change_models_before_fullscreen_scrolling() {
+        let mut state = AppState::new(
+            String::new(),
+            ".".to_owned(),
+            "tester".to_owned(),
+            vec![
+                model("gpt-5.6-sol", "high", true, &["low", "high"]),
+                model("gpt-5.6-terra", "high", false, &["low", "high"]),
+            ],
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+
+        let action = apply_composer_inputs_with_scroll(
+            &mut state,
+            &mut renderer,
+            vec![ComposerInput::Key(press(
+                KeyCode::Down,
+                KeyModifiers::SHIFT,
+            ))],
+        );
+
+        assert!(matches!(action, Action::None));
+        assert_eq!(state.selected_model_name(), "gpt-5.6-terra");
     }
 
     #[test]
@@ -3194,29 +3284,44 @@ mod tests {
     }
 
     #[test]
-    fn pasted_key_burst_replaces_an_image_path_in_the_editor() {
+    fn pasted_image_text_attaches_without_entering_the_editor() {
         let path = std::env::temp_dir().join(format!(
             "devez-paste-burst-image-{}.png",
             std::process::id()
         ));
         std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
         let mut state = starting_state();
-        state.editor.set_text(path.to_string_lossy());
-        let base = Instant::now();
-        let mut burst = PasteBurst::new();
-        burst.observe(KeyEvent::from(KeyCode::Char('a')), base);
-        burst.observe(
-            KeyEvent::from(KeyCode::Char('b')),
-            base + Duration::from_millis(1),
-        );
-        burst.observe(
-            KeyEvent::from(KeyCode::Char('c')),
-            base + Duration::from_millis(2),
+        apply_composer_text(
+            &mut state,
+            BufferedText {
+                text: path.to_string_lossy().into_owned(),
+                pasted: true,
+            },
         );
 
-        assert!(attach_pasted_editor_image(&mut state, &burst));
         assert!(state.editor.is_empty());
         assert_eq!(state.composer_image_count(), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn typed_image_path_stays_text_even_when_the_file_exists() {
+        let path =
+            std::env::temp_dir().join(format!("devez-typed-image-{}.png", std::process::id()));
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+        let mut state = starting_state();
+        let text = path.to_string_lossy().into_owned();
+
+        apply_composer_text(
+            &mut state,
+            BufferedText {
+                text: text.clone(),
+                pasted: false,
+            },
+        );
+
+        assert_eq!(state.editor.text(), text);
+        assert_eq!(state.composer_image_count(), 0);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -3234,20 +3339,15 @@ mod tests {
         assert!(state.view().overlay.is_some(), "the effort picker is open");
     }
 
-    /// Fast opens the same On/Off picker as `/fast`, so a click never changes a
-    /// service tier without showing the choice first.
+    /// The Fast badge is a direct toggle; `/fast` remains the explicit chooser.
     #[test]
-    fn clicking_the_fast_badge_opens_the_service_tier_picker() {
+    fn clicking_the_fast_badge_toggles_the_service_tier() {
         let mut state = state_with_a_model();
 
         assert!(matches!(
             pick_action(&mut state, Pick::FastMode),
-            Action::None
+            Action::SetFast(true)
         ));
-        assert_eq!(
-            state.view().overlay.map(|overlay| overlay.title),
-            Some("Fast".to_owned())
-        );
     }
 
     /// An open picker is no reason to make the other reading dead: clicking it
@@ -3338,7 +3438,7 @@ mod tests {
             state
                 .view()
                 .status_line
-                .is_some_and(|status| status.effort == "low")
+                .is_some_and(|status| status.effort.as_deref() == Some("low"))
         );
     }
 
