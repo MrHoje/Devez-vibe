@@ -28,6 +28,7 @@ use crate::{
         CellPosition, CellRange, CopyLine, Selection, SelectionFinish, extract_text,
         selected_char_count, selection_chunks,
     },
+    state::ShellDisplayMode,
     theme::{self, Rgb, ThemeKind},
 };
 
@@ -251,6 +252,7 @@ pub struct View<'a> {
     pub status_line: Option<StatusLineView>,
     pub composer_notice: Option<String>,
     pub composer_mode: Option<ComposerMode>,
+    pub shell_display_mode: ShellDisplayMode,
 }
 
 pub struct TerminalSession {
@@ -322,6 +324,7 @@ pub struct Renderer {
     /// time would make typing cost O(transcript).
     wrapped: Vec<PaintLine>,
     wrapped_width: u16,
+    shell_display_mode: ShellDisplayMode,
     expanded_tools: HashSet<u64>,
     hovered_tool: Option<u64>,
     painted_hovered_tool: Option<u64>,
@@ -357,6 +360,7 @@ impl Renderer {
             scroll_back: 0,
             wrapped: Vec::new(),
             wrapped_width: 0,
+            shell_display_mode: ShellDisplayMode::Collapse,
             expanded_tools: HashSet::new(),
             hovered_tool: None,
             painted_hovered_tool: None,
@@ -598,7 +602,12 @@ impl Renderer {
         let history = std::mem::take(&mut self.history);
         let mut outcome = Ok(());
         for block in &history {
-            let lines = block_group_lines_with_expansion(block, width, false);
+            let lines = block_group_lines(
+                block,
+                width,
+                self.shell_display_mode,
+                self.expanded_tools.contains(&block.id()),
+            );
             if let Err(error) = self.print_permanent(block, &lines) {
                 outcome = Err(error);
                 break;
@@ -644,6 +653,14 @@ impl Renderer {
     }
 
     pub fn render(&mut self, committed: &[Block], view: View<'_>) -> Result<()> {
+        let mode_changed = self.shell_display_mode != view.shell_display_mode;
+        if mode_changed {
+            self.shell_display_mode = view.shell_display_mode;
+            self.wrapped_width = 0;
+            if self.mode == RenderMode::Inline {
+                self.relayout()?;
+            }
+        }
         let (width, height) = terminal_size().unwrap_or((100, 30));
         let status = StatusArea {
             fallback: view.footer,
@@ -659,6 +676,7 @@ impl Renderer {
                 status,
                 width.max(20),
                 &self.expanded_tools,
+                self.shell_display_mode,
             )
         } else {
             normal_frame_with_expansion(
@@ -672,6 +690,7 @@ impl Renderer {
                 status,
                 width.max(20),
                 &self.expanded_tools,
+                self.shell_display_mode,
             )
         };
 
@@ -684,11 +703,17 @@ impl Renderer {
         let needs_full_repaint = self.previous_lines.is_empty()
             || self.last_width != width
             || self.last_height != height
-            || !committed.is_empty();
+            || !committed.is_empty()
+            || mode_changed;
         if needs_full_repaint {
             self.erase_live()?;
             for block in committed {
-                let lines = block_group_lines_with_expansion(block, width.max(20), false);
+                let lines = block_group_lines(
+                    block,
+                    width.max(20),
+                    self.shell_display_mode,
+                    false,
+                );
                 self.print_permanent(block, &lines)?;
             }
             self.history.extend(committed.iter().cloned());
@@ -729,9 +754,10 @@ impl Renderer {
         let grew_by = if self.wrapped_width == width {
             let before = self.wrapped.len();
             for block in committed {
-                self.wrapped.extend(block_group_lines_with_expansion(
+                self.wrapped.extend(block_group_lines(
                     block,
                     width,
+                    self.shell_display_mode,
                     self.expanded_tools.contains(&block.id()),
                 ));
             }
@@ -778,9 +804,10 @@ impl Renderer {
             .history
             .iter()
             .flat_map(|block| {
-                block_group_lines_with_expansion(
+                block_group_lines(
                     block,
                     width,
+                    self.shell_display_mode,
                     self.expanded_tools.contains(&block.id()),
                 )
             })
@@ -1387,6 +1414,7 @@ fn normal_frame(
         status,
         width,
         &HashSet::new(),
+        ShellDisplayMode::Collapse,
     )
 }
 
@@ -1402,6 +1430,7 @@ fn normal_frame_with_expansion(
     status: StatusArea,
     width: u16,
     expanded_tools: &HashSet<u64>,
+    shell_display_mode: ShellDisplayMode,
 ) -> Frame {
     let mut lines = Vec::new();
     if let Some(welcome) = welcome {
@@ -1410,9 +1439,10 @@ fn normal_frame_with_expansion(
     }
 
     for block in live {
-        lines.extend(block_group_lines_with_expansion(
+        lines.extend(block_group_lines(
             block,
             width,
+            shell_display_mode,
             expanded_tools.contains(&block.id()),
         ));
     }
@@ -2186,7 +2216,15 @@ fn overlay_frame(
     status: StatusArea,
     width: u16,
 ) -> Frame {
-    overlay_frame_with_expansion(live, overlay, welcome, status, width, &HashSet::new())
+    overlay_frame_with_expansion(
+        live,
+        overlay,
+        welcome,
+        status,
+        width,
+        &HashSet::new(),
+        ShellDisplayMode::Collapse,
+    )
 }
 
 fn overlay_frame_with_expansion(
@@ -2196,6 +2234,7 @@ fn overlay_frame_with_expansion(
     status: StatusArea,
     width: u16,
     expanded_tools: &HashSet<u64>,
+    shell_display_mode: ShellDisplayMode,
 ) -> Frame {
     let mut lines = Vec::new();
     // A picker docks over the transcript rather than replacing the screen, so the
@@ -2207,9 +2246,10 @@ fn overlay_frame_with_expansion(
         lines.push(PaintLine::blank());
     }
     for block in live {
-        lines.extend(block_group_lines_with_expansion(
+        lines.extend(block_group_lines(
             block,
             width,
+            shell_display_mode,
             expanded_tools.contains(&block.id()),
         ));
     }
@@ -2677,6 +2717,80 @@ fn bash_lines(block: &Block, width: u16, expanded: bool) -> Vec<PaintLine> {
     lines
 }
 
+/// Rows for a Shell block under the global display setting. A direct click on a
+/// visible heading always wins over the setting and reveals that block in full.
+fn shell_group_lines(
+    block: &Block,
+    width: u16,
+    shell_display_mode: ShellDisplayMode,
+    expanded: bool,
+) -> Vec<PaintLine> {
+    match shell_display_mode {
+        ShellDisplayMode::Hide => Vec::new(),
+        ShellDisplayMode::Collapse => bash_lines(block, width, expanded),
+        ShellDisplayMode::Expand if expanded => bash_lines(block, width, true),
+        ShellDisplayMode::Expand => bash_preview_lines(block, width),
+    }
+}
+
+/// The automatic Expand view is deliberately a preview: output spends one
+/// five-row budget across every child command, while command headings remain
+/// visible in their original order.
+fn bash_preview_lines(block: &Block, width: u16) -> Vec<PaintLine> {
+    const OUTPUT_ROWS: usize = 5;
+
+    let title_tone = if matches!(block.kind, BlockKind::Warning) {
+        Tone::Warning
+    } else {
+        Tone::Plain
+    };
+    let mut lines = wrapped_line("▾ ", Tone::User, &block.title, title_tone, true, width);
+    for line in &mut lines {
+        line.tool_heading = Some(block.id());
+    }
+
+    let mut remaining = OUTPUT_ROWS;
+
+    if block.children().is_empty() {
+        append_bash_preview_output(&mut lines, "  ", &block.body, width, &mut remaining);
+    } else {
+        for child in block.children() {
+            let child_tone = if matches!(child.kind, BlockKind::Warning) {
+                Tone::Warning
+            } else {
+                Tone::Plain
+            };
+            lines.extend(wrapped_line(
+                "  • ",
+                Tone::Muted,
+                &child.title,
+                child_tone,
+                true,
+                width,
+            ));
+            append_bash_preview_output(&mut lines, "    ", &child.body, width, &mut remaining);
+        }
+    }
+    lines
+}
+
+fn append_bash_preview_output(
+    lines: &mut Vec<PaintLine>,
+    prefix: &str,
+    body: &str,
+    width: u16,
+    remaining: &mut usize,
+) {
+    for row in body.lines().filter(|row| !row.trim().is_empty()) {
+        if *remaining == 0 {
+            break;
+        }
+        let wrapped = wrapped_line(prefix, Tone::Muted, row, Tone::Muted, false, width);
+        let shown = wrapped.len().min(*remaining);
+        lines.extend(wrapped.into_iter().take(shown));
+        *remaining -= shown;
+    }
+}
 /// Diff rows a single `fileChange` block prints before it starts counting. Well
 /// above what an ordinary edit produces, so the patch is normally shown whole,
 /// but low enough that a sweeping refactor can't push the turn off screen.
@@ -3051,8 +3165,13 @@ fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     block_lines_with_expansion(block, width, false)
 }
 
-fn block_group_lines_with_expansion(block: &Block, width: u16, expanded: bool) -> Vec<PaintLine> {
-    let mut lines = block_lines_with_expansion(block, width, expanded);
+fn block_group_lines(
+    block: &Block,
+    width: u16,
+    shell_display_mode: ShellDisplayMode,
+    expanded: bool,
+) -> Vec<PaintLine> {
+    let mut lines = block_lines_with_mode(block, width, shell_display_mode, expanded);
     while matches!(lines.last(), Some(line) if line == &PaintLine::blank()) {
         lines.pop();
     }
@@ -3062,9 +3181,14 @@ fn block_group_lines_with_expansion(block: &Block, width: u16, expanded: bool) -
     lines
 }
 
-fn block_lines_with_expansion(block: &Block, width: u16, expanded: bool) -> Vec<PaintLine> {
+fn block_lines_with_mode(
+    block: &Block,
+    width: u16,
+    shell_display_mode: ShellDisplayMode,
+    expanded: bool,
+) -> Vec<PaintLine> {
     if is_bash_block(block) {
-        return bash_lines(block, width, expanded);
+        return shell_group_lines(block, width, shell_display_mode, expanded);
     }
     if matches!(block.kind, BlockKind::Welcome) {
         let mut values = block.body.lines();
@@ -3270,6 +3394,11 @@ fn block_lines_with_expansion(block: &Block, width: u16, expanded: bool) -> Vec<
     }
     lines.push(PaintLine::blank());
     lines
+}
+
+#[cfg(test)]
+fn block_lines_with_expansion(block: &Block, width: u16, expanded: bool) -> Vec<PaintLine> {
+    block_lines_with_mode(block, width, ShellDisplayMode::Collapse, expanded)
 }
 
 fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
@@ -6268,6 +6397,54 @@ mod tests {
         );
         assert_eq!(lines[0].tool_heading, Some(group.id()));
     }
+
+#[test]
+    fn hidden_shell_group_paints_no_rows() {
+        let group = Block::shell_group(
+            BlockKind::Tool,
+            "Shell · 2 commands · all passed",
+            vec![
+                Block::new(BlockKind::Tool, "Shell · first · exit 0", "one"),
+                Block::new(BlockKind::Tool, "Shell · second · exit 0", "two"),
+            ],
+        );
+
+        assert!(shell_group_lines(&group, 80, crate::state::ShellDisplayMode::Hide, false)
+            .is_empty());
+    }
+
+    #[test]
+    fn expanded_shell_group_caps_output_at_five_painted_rows_across_children() {
+        let group = Block::shell_group(
+            BlockKind::Tool,
+            "Shell · 2 commands · all passed",
+            vec![
+                Block::new(
+                    BlockKind::Tool,
+                    "Shell · first · exit 0",
+                    "one\ntwo\nthree",
+                ),
+                Block::new(
+                    BlockKind::Tool,
+                    "Shell · second · exit 0",
+                    "four\nfive\nsix",
+                ),
+            ],
+        );
+
+        let lines = shell_group_lines(&group, 80, crate::state::ShellDisplayMode::Expand, false);
+
+        assert_eq!(lines.iter().filter(|line| line.prefix == "    ").count(), 5);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.prefix == "    ")
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two", "three", "four", "five"]
+        );
+    }
+
 
     #[test]
     fn collapsed_shell_heading_ellipsizes_instead_of_wrapping() {

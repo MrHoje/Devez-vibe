@@ -535,6 +535,7 @@ async fn choose_startup_session(
                 status_line: None,
                 composer_notice: composer_notice.clone(),
                 composer_mode: None,
+                shell_display_mode: ShellDisplayMode::Collapse,
             },
         )?;
         match events.next().await {

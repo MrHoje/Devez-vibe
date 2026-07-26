@@ -3047,6 +3047,7 @@ impl AppState {
                 .as_ref()
                 .map(|(notice, _)| notice.clone()),
             composer_mode: Some(self.composer_mode()),
+            shell_display_mode: self.shell_display_mode(),
         }
     }
 
