@@ -16,6 +16,8 @@
 - The renderer remains unchanged.
 - A completed single Shell result renders `Shell · 1 command · <status>`.
 - Collapsed Shell headings never contain an executable path or command text.
+- Successful and status-unknown results both use `completed`.
+- Collapsed Shell headings always occupy one physical row and ellipsize.
 - Expanded Shell headings reveal the original command and output.
 - Add no dependency.
 
@@ -279,3 +281,98 @@ git diff --check
 ```
 
 Expected: all tests pass and the diff check exits successfully.
+
+---
+
+### Task 3: Unify completion status and keep collapsed headings on one row
+
+**Files:**
+- Modify: `src/state.rs`
+- Modify: `src/renderer.rs`
+- Test: existing test modules in both files
+
+**Interfaces:**
+- Consumes: `shell_results_block`, `bash_lines`, `compact_right`, and
+  `PaintLine::tool_heading`.
+- Produces: one `completed` label for successful/unknown results and a
+  single-row collapsed Shell heading.
+
+- [ ] **Step 1: Write failing status tests**
+
+Update successful live and resumed Shell expectations from `all passed` to
+`completed`. Keep failed expectations as `N failed`. Add an unknown-exit test
+and assert it produces the same `completed` title as a successful result.
+
+- [ ] **Step 2: Run status tests and verify RED**
+
+Run:
+
+```powershell
+cargo test live_single_shell
+cargo test resumed_shell
+```
+
+Expected: successful titles still contain `all passed`.
+
+- [ ] **Step 3: Unify non-failure status**
+
+In `shell_results_block`, replace the known-success/unknown branch with:
+
+```rust
+let status = if failed > 0 {
+    format!("{failed} failed")
+} else {
+    "completed".to_owned()
+};
+```
+
+Remove the now-unused `known` calculation.
+
+- [ ] **Step 4: Write a failing one-row renderer test**
+
+Add:
+
+```rust
+#[test]
+fn collapsed_shell_heading_ellipsizes_instead_of_wrapping() {
+    let block = Block::shell_group(
+        BlockKind::Tool,
+        "Shell · 123 commands · completed · 123.4s",
+        vec![Block::new(BlockKind::Tool, "Shell · detail", "")],
+    );
+    let lines = block_lines(&block, 20);
+
+    assert_eq!(lines.len(), 1);
+    assert!(painted_line_width(&lines[0]) <= 20);
+    assert!(lines[0].text.ends_with('…'));
+    assert_eq!(lines[0].tool_heading, Some(block.id()));
+}
+```
+
+- [ ] **Step 5: Run renderer test and verify RED**
+
+Run:
+
+```powershell
+cargo test collapsed_shell_heading_ellipsizes
+```
+
+Expected: the heading wraps to multiple rows.
+
+- [ ] **Step 6: Render the collapsed heading as one compact row**
+
+In `bash_lines`, when `expanded` is false, reserve the marker width and apply
+`compact_right` to the title. Return one `PaintLine` carrying the block ID as
+its click target. Keep the existing expanded child rendering unchanged.
+
+- [ ] **Step 7: Run focused and full verification**
+
+Run:
+
+```powershell
+cargo test shell
+cargo test --quiet
+git diff --check
+```
+
+Expected: all tests pass and every collapsed Shell heading remains one row.
