@@ -1,0 +1,38 @@
+name: Codex CLI compatibility
+
+on:
+  pull_request:
+  schedule:
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Compatibility check target
+        required: true
+        default: baseline
+        type: choice
+        options:
+          - baseline
+          - latest
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check approved baseline
+        if: github.event_name == 'pull_request' || inputs.mode == 'baseline'
+        run: node scripts/check-codex-compatibility.mjs --mode baseline
+      - name: Check latest Codex CLI
+        if: github.event_name == 'schedule' || inputs.mode == 'latest'
+        run: node scripts/check-codex-compatibility.mjs --mode latest
+      - name: Upload compatibility artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-compatibility
+          path: artifacts/codex-compatibility
+          retention-days: 30

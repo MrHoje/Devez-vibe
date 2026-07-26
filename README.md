@@ -61,4 +61,5 @@ dvz update
 
 `app-server` 프로토콜은 Codex 버전에 따라 변할 수 있습니다. 렌더러 변경은 독립적으로
 관리하고, 업스트림에서는 app-server 메서드/스키마/인증/모델 카탈로그 변경만 호환성
-대상으로 봅니다.
+대상으로 봅니다. [Codex CLI 호환성 점검 절차](docs/codex-cli-compatibility.md)를 통해
+기준 버전과 최신 버전의 스키마 차이를 CI에서 확인합니다.
