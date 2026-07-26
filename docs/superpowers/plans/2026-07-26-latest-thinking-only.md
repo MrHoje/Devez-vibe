@@ -1,10 +1,10 @@
-# Latest Thinking Only Implementation Plan
+# Compact Thinking and Shell Display Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Keep only the latest block in each uninterrupted run of `Thinking…` updates.
+**Goal:** Keep only the latest uninterrupted `Thinking…` update and hide completed Shell command paths behind count summaries.
 
-**Architecture:** Add a state-layer block insertion helper that replaces the immediately preceding block only when both are exact `Thinking…` reasoning blocks. Use it for live completed/orphaned items and normalize each resumed turn after timestamp sorting.
+**Architecture:** Add a state-layer block insertion helper that replaces the immediately preceding block only when both are exact `Thinking…` reasoning blocks. Normalize completed Shell results through the existing group block for every result count, including one command, so the renderer shows details only after expansion.
 
 **Tech Stack:** Rust, serde_json, existing unit tests in `src/state.rs`.
 
@@ -14,6 +14,9 @@
 - Shell, file change, assistant, plan, and all other blocks are boundaries.
 - Different turns never replace each other's Thinking block.
 - The renderer remains unchanged.
+- A completed single Shell result renders `Shell · 1 command · <status>`.
+- Collapsed Shell headings never contain an executable path or command text.
+- Expanded Shell headings reveal the original command and output.
 - Add no dependency.
 
 ---
@@ -173,3 +176,106 @@ Expected: all tests pass and the diff check exits successfully.
 
 Do not stage unrelated concurrent edits. If `src/state.rs` contains inseparable
 user changes, leave the implementation uncommitted and report that explicitly.
+
+---
+
+### Task 2: Summarize completed single Shell commands
+
+**Files:**
+- Modify: `src/state.rs`
+- Test: `src/state.rs` test module
+
+**Interfaces:**
+- Consumes: existing `ShellResult`, `shell_results_block`, and
+  `Block::shell_group`.
+- Produces: the same grouped Shell block shape for one or more results.
+
+- [ ] **Step 1: Write a failing live single-command test**
+
+Add:
+
+```rust
+#[test]
+fn live_single_shell_hides_its_command_in_the_summary() {
+    let mut state = test_state();
+    state.start_item(&json!({
+        "id":"cmd-1","type":"commandExecution",
+        "command":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -Command Get-Content"
+    }));
+    state.complete_item(&json!({
+        "id":"cmd-1","type":"commandExecution",
+        "command":"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -Command Get-Content",
+        "status":"completed","exitCode":0,"durationMs":670,
+        "aggregatedOutput":"contents"
+    }));
+
+    let shell = state.committed.last().expect("completed shell");
+    assert_eq!(shell.title, "Shell · 1 command · all passed · 670ms");
+    assert_eq!(shell.children().len(), 1);
+    assert!(shell.children()[0].title.contains("powershell.exe"));
+    assert_eq!(shell.children()[0].body, "contents");
+}
+```
+
+- [ ] **Step 2: Run the test and verify RED**
+
+Run:
+
+```powershell
+cargo test live_single_shell_hides_its_command_in_the_summary
+```
+
+Expected: the title still contains the executable path and the block has no
+children.
+
+- [ ] **Step 3: Always construct a Shell group**
+
+Remove the one-result early return from `shell_results_block`. Use singular and
+plural nouns in the common title:
+
+```rust
+let count = results.len();
+let noun = if count == 1 { "command" } else { "commands" };
+// Keep the existing status and duration calculations.
+Block::shell_group(
+    kind,
+    format!("Shell · {count} {noun} · {status}{duration}"),
+    children,
+)
+```
+
+The single child retains the existing detailed command title and output, which
+the renderer reveals only when the parent is expanded.
+
+- [ ] **Step 4: Update resumed single-command expectations**
+
+Change resumed Shell assertions from detailed collapsed titles such as
+`Shell · cargo test · exit 0 · 1.6s` to
+`Shell · 1 command · all passed · 1.6s`. Assert that the original detailed
+title is present in `children()[0]`.
+
+For a failed result expect
+`Shell · 1 command · 1 failed · <duration>` and retain warning styling.
+
+- [ ] **Step 5: Run focused tests and verify GREEN**
+
+Run:
+
+```powershell
+cargo test live_single_shell
+cargo test resumed_shell
+cargo test failed_shell
+```
+
+Expected: all focused tests pass.
+
+- [ ] **Step 6: Run full verification**
+
+Run:
+
+```powershell
+cargo test --quiet
+git diff --check
+```
+
+Expected: all tests pass and the diff check exits successfully.
