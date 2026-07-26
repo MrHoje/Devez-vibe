@@ -646,6 +646,12 @@ impl Renderer {
         outcome
     }
 
+    fn record_inline_history(&mut self, committed: &[Block]) {
+        for block in committed.iter().cloned() {
+            replace_history_block(&mut self.history, block);
+        }
+    }
+
     fn reset_screen(&mut self) -> Result<()> {
         self.previous_lines.clear();
         self.hovered_tool = None;
@@ -745,7 +751,7 @@ impl Renderer {
                 );
                 self.print_permanent(block, &lines)?;
             }
-            self.history.extend(committed.iter().cloned());
+            self.record_inline_history(committed);
             self.out.flush()?;
             let available_rows = cursor_position()
                 .map(|(_, row)| height.saturating_sub(row).max(1) as usize)
@@ -4362,9 +4368,10 @@ fn input_top_line(panel_width: usize, label: &str, mode: Option<&ComposerMode>) 
     .with_picks(&picks)
 }
 
-/// Widest badge that fits in `budget`: estimated cost · mode · fast flag, shed
-/// from the left as the budget tightens. The parts are never ellipsized — a
-/// half-written mode name or a clipped price is worse than none.
+/// Widest badge that fits in `budget`: estimated cost · Shell display mode ·
+/// permission mode · fast flag. Tightening drops cost, then fast, then Shell;
+/// permission mode remains. Parts are never ellipsized — a half-written mode
+/// name or a clipped price is worse than none.
 fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans> {
     let mode_span = PaintSpan {
         text: mode.label.clone(),
@@ -6765,6 +6772,53 @@ mod tests {
         assert_eq!(history.len(), 3);
         assert_eq!(history[1].title, "Shell · 1 command · completed");
         assert_eq!(history[2].title, "After");
+    }
+
+    #[test]
+    fn inline_shell_completion_deduplicates_history_before_mode_relayout() {
+        let anchor = Block::new(BlockKind::Tool, "Running 1 shell command", "");
+        let mut completed = Block::new(
+            BlockKind::Tool,
+            "Shell · 1 command · completed",
+            "done",
+        );
+        completed.adopt_id(&anchor);
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Inline);
+
+        renderer.record_inline_history(&[anchor]);
+        renderer.record_inline_history(&[completed]);
+
+        assert_eq!(renderer.history.len(), 1);
+        for mode in [ShellDisplayMode::Hide, ShellDisplayMode::Collapse] {
+            renderer.shell_display_mode = mode;
+            let reprinted = renderer
+                .history
+                .iter()
+                .flat_map(|block| {
+                    block_group_lines(
+                        block,
+                        80,
+                        renderer.shell_display_mode,
+                        renderer.expanded_tools.contains(&block.id()),
+                    )
+                })
+                .map(|line| painted(&line))
+                .collect::<Vec<_>>();
+            assert!(reprinted.iter().all(|line| !line.contains("Running")));
+            match mode {
+                ShellDisplayMode::Hide => assert!(reprinted.is_empty()),
+                ShellDisplayMode::Collapse => {
+                    assert_eq!(
+                        reprinted
+                            .iter()
+                            .filter(|line| !line.is_empty())
+                            .collect::<Vec<_>>(),
+                        ["▸ Shell · 1 command · completed"]
+                    );
+                }
+                ShellDisplayMode::Expand => unreachable!("not exercised"),
+            }
+        }
     }
 
     fn expanding_shell_replacement() -> (Block, Block) {
