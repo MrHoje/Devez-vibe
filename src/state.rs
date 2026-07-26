@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     ops::Range,
     path::{Path, PathBuf},
@@ -630,6 +630,19 @@ struct ParentTurn {
 
 struct ActiveItem {
     block: Block,
+    shell_batch: Option<String>,
+}
+
+#[derive(Default)]
+struct ShellBatch {
+    members: Vec<String>,
+    completed: HashMap<String, ShellResult>,
+}
+
+struct ShellResult {
+    block: Block,
+    exit_code: Option<i64>,
+    duration_ms: Option<u64>,
 }
 
 /// How long a model pick should last.
@@ -1818,6 +1831,22 @@ const RESUME_PICKER_ROWS: usize = 10;
 /// and the blank under it.
 const MODEL_SCOPE_HEADER_ROWS: usize = 2;
 
+/// Whether a panel wears the `✕` that shuts it. The user opened these three and
+/// the session list themselves, so they may drop them; everything else on this
+/// enum is a question owed an answer — an approval, a login, a server prompt —
+/// and shutting it would leave the session waiting on nothing. The panels that
+/// paint the mark set `OverlayView::closable`, and this is what a click on it
+/// checks, so a mark that appears is a mark that works.
+fn closable_overlay(pending: &PendingInteraction) -> bool {
+    matches!(
+        pending,
+        PendingInteraction::ModelPicker { .. }
+            | PendingInteraction::ModelScope { .. }
+            | PendingInteraction::EffortPicker { .. }
+            | PendingInteraction::SessionPicker(_)
+    )
+}
+
 pub struct SessionPicker {
     sessions: Vec<SessionInfo>,
     cwd: String,
@@ -2000,6 +2029,7 @@ impl SessionPicker {
             });
         }
         OverlayView {
+            closable: true,
             title: format!(
                 "Resume session · {} · {}",
                 filtered.len(),
@@ -2042,6 +2072,7 @@ impl SessionPicker {
 
 pub struct AppState {
     pub editor: Editor,
+    composer_images: Vec<String>,
     pub thread_id: String,
     pub turn_id: Option<String>,
     pub busy: bool,
@@ -2053,6 +2084,7 @@ pub struct AppState {
     committed: Vec<Block>,
     active_order: Vec<String>,
     active: HashMap<String, ActiveItem>,
+    shell_batches: HashMap<String, ShellBatch>,
     pending: Option<PendingInteraction>,
     /// Tokens the *current* prompt occupies, not the thread's running tally.
     /// The tally climbs past the window on every turn and is not a context gauge.
@@ -2136,6 +2168,7 @@ impl AppState {
 
         Self {
             editor: Editor::default(),
+            composer_images: Vec::new(),
             thread_id,
             turn_id: None,
             busy: false,
@@ -2147,6 +2180,7 @@ impl AppState {
             committed: Vec::new(),
             active_order: Vec::new(),
             active: HashMap::new(),
+            shell_batches: HashMap::new(),
             pending: None,
             context_tokens: 0,
             token_totals: TokenTotals::default(),
@@ -2318,6 +2352,9 @@ impl AppState {
             "text": text,
             "text_elements": []
         })];
+        for path in std::mem::take(&mut self.composer_images) {
+            input.push(json!({ "type": "localImage", "path": path }));
+        }
         let mut added_paths = Vec::new();
         let mut resolved_tokens = Vec::new();
         for binding in std::mem::take(&mut self.selected_completion_bindings) {
@@ -2383,6 +2420,14 @@ impl AppState {
             }
         }
         input
+    }
+
+    pub fn attach_local_image(&mut self, path: String) {
+        self.composer_images.push(path);
+    }
+
+    pub fn composer_image_count(&self) -> usize {
+        self.composer_images.len()
     }
 
     pub fn confirm_plugin_install(&mut self, plugin: &PluginInfo) {
@@ -2699,6 +2744,7 @@ impl AppState {
         self.turn_started_at = None;
         self.active.clear();
         self.active_order.clear();
+        self.shell_batches.clear();
         self.show_welcome = true;
         self.select_model_and_effort(model, effort);
     }
@@ -2864,6 +2910,7 @@ impl AppState {
         self.committed.clear();
         self.active.clear();
         self.active_order.clear();
+        self.shell_batches.clear();
         self.pending = None;
         self.context_tokens = 0;
         self.token_totals = TokenTotals::default();
@@ -2950,6 +2997,7 @@ impl AppState {
             live_blocks,
             overlay: self.overlay_view(),
             editor: &self.editor,
+            composer_images: &self.composer_images,
             welcome: self.show_welcome.then(|| self.welcome_view()),
             suggestions: if self.pending.is_none() {
                 self.completion_suggestion_views()
@@ -3230,7 +3278,11 @@ impl AppState {
                 Action::None
             }
             KeyCode::Backspace => {
-                self.editor.backspace();
+                if self.editor.cursor() == 0 && self.composer_images.pop().is_some() {
+                    // Attachments occupy the composer position immediately before text.
+                } else {
+                    self.editor.backspace();
+                }
                 self.command_selection = 0;
                 Action::None
             }
@@ -3767,15 +3819,23 @@ impl AppState {
     }
 
     fn submit_editor(&mut self) -> Action {
-        let Some(text) = self.editor.take_for_submit() else {
+        let text = self.editor.take_for_submit().unwrap_or_default();
+        if text.is_empty() && self.composer_images.is_empty() {
             return Action::None;
-        };
+        }
         if text.starts_with('/') && !text.contains('\n') {
             return self.run_slash_command(&text);
         }
         self.commit_welcome_card();
-        self.committed
-            .push(Block::new(BlockKind::User, "You", text.clone()));
+        let display = if text.is_empty() {
+            (1..=self.composer_images.len())
+                .map(|index| format!("[Image #{index}]"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        } else {
+            text.clone()
+        };
+        self.committed.push(Block::new(BlockKind::User, "You", display));
         if self.busy {
             Action::Steer(text)
         } else {
@@ -4577,6 +4637,7 @@ impl AppState {
                     effort_slider(model, *effort_index)
                 });
                 Some(OverlayView {
+                    closable: true,
                     title: "Model".to_owned(),
                     lines,
                     slider,
@@ -4632,6 +4693,7 @@ impl AppState {
                         }),
                 );
                 Some(OverlayView {
+                    closable: true,
                     title: "Apply to".to_owned(),
                     lines,
                     slider: None,
@@ -4646,6 +4708,7 @@ impl AppState {
             PendingInteraction::EffortPicker { effort_index } => {
                 let model = self.selected_model()?;
                 Some(OverlayView {
+                    closable: true,
                     title: "Effort".to_owned(),
                     lines: Vec::new(),
                     slider: Some(effort_slider(model, *effort_index)),
@@ -4657,6 +4720,7 @@ impl AppState {
                 })
             }
             PendingInteraction::ThemePicker { theme_index } => Some(OverlayView {
+                closable: false,
                 title: "Theme".to_owned(),
                 lines: ThemeKind::ALL
                     .iter()
@@ -4715,6 +4779,7 @@ impl AppState {
                     muted: false,
                 });
                 Some(OverlayView {
+                    closable: false,
                     title: title.clone(),
                     lines,
                     slider: None,
@@ -4751,6 +4816,7 @@ impl AppState {
                     }
                 }));
                 Some(OverlayView {
+                    closable: false,
                     title: "MCP approval".to_owned(),
                     lines,
                     slider: None,
@@ -4859,6 +4925,7 @@ impl AppState {
                     });
                 }
                 Some(OverlayView {
+                    closable: false,
                     title: field.title.clone(),
                     lines,
                     slider: None,
@@ -4882,6 +4949,7 @@ impl AppState {
                 url,
                 ..
             } => Some(OverlayView {
+                closable: false,
                 title: format!("{server_name} · Continue in browser"),
                 lines: vec![
                     OverlayLine {
@@ -4918,6 +4986,7 @@ impl AppState {
                 input_placeholder: "",
             }),
             PendingInteraction::LoginMethodPicker { selected } => Some(OverlayView {
+                closable: false,
                 title: "Select login method".to_owned(),
                 lines: LoginMethod::CHOICES
                     .iter()
@@ -4936,6 +5005,7 @@ impl AppState {
                 input_placeholder: "",
             }),
             PendingInteraction::Login { waiting_on, .. } => Some(OverlayView {
+                closable: false,
                 title: "Signing in".to_owned(),
                 lines: waiting_on
                     .iter()
@@ -4978,6 +5048,7 @@ impl AppState {
                     muted: false,
                 });
                 Some(OverlayView {
+                    closable: false,
                     title: title.clone(),
                     lines,
                     slider: None,
@@ -5019,6 +5090,7 @@ impl AppState {
                     }
                 }
                 Some(OverlayView {
+                    closable: false,
                     title: if question.header.is_empty() {
                         format!("Question {}/{}", current + 1, questions.len())
                     } else {
@@ -5481,6 +5553,19 @@ impl AppState {
         }
     }
 
+    /// The `✕` on a panel the user opened themselves: closes it, exactly as Esc
+    /// does. Only the panels that paint the mark can be shut this way, so a prompt
+    /// the server is waiting on stays put whatever is clicked.
+    pub fn close_overlay(&mut self) -> Action {
+        match self.pending.take() {
+            Some(pending) if closable_overlay(&pending) => Action::None,
+            other => {
+                self.pending = other;
+                Action::Tick(false)
+            }
+        }
+    }
+
     /// A click on one step of an effort track. In the model picker the track is a
     /// control beside the list, so the click only moves it; the effort picker has
     /// nothing else to answer for, so a click there settles it.
@@ -5596,12 +5681,42 @@ impl AppState {
         let Some(mut block) = active_item_block(&self.cwd, item) else {
             return;
         };
+        let existing_batch = self
+            .active
+            .get(id)
+            .and_then(|existing| existing.shell_batch.clone());
+        let was_active = self.active.contains_key(id);
         if let Some(existing) = self.active.get(id) {
             block.adopt_id(&existing.block);
-        } else {
-            self.active_order.push(id.to_owned());
         }
-        self.active.insert(id.to_owned(), ActiveItem { block });
+        let shell_batch = if existing_batch.is_some() {
+            existing_batch
+        } else if block.title.starts_with("Shell ·") {
+            self.active_order
+                .iter()
+                .filter_map(|active_id| self.active.get(active_id))
+                .find_map(|active| active.shell_batch.clone())
+                .or_else(|| Some(id.to_owned()))
+        } else {
+            None
+        };
+        if !was_active {
+            self.active_order.push(id.to_owned());
+            if let Some(batch_id) = shell_batch.as_ref() {
+                self.shell_batches
+                    .entry(batch_id.clone())
+                    .or_default()
+                    .members
+                    .push(id.to_owned());
+            }
+        }
+        self.active.insert(
+            id.to_owned(),
+            ActiveItem {
+                block,
+                shell_batch,
+            },
+        );
     }
 
     fn complete_item(&mut self, item: &Value) {
@@ -5618,10 +5733,28 @@ impl AppState {
             if let Some(active) = active.as_ref() {
                 block.adopt_id(&active.block);
             }
+            if let (Some(id), Some(batch_id)) = (
+                id,
+                active
+                    .as_ref()
+                    .and_then(|active| active.shell_batch.as_deref()),
+            ) && block.title.starts_with("Shell ·")
+            {
+                self.complete_shell_batch_member(
+                    batch_id.to_owned(),
+                    id.to_owned(),
+                    ShellResult {
+                        block,
+                        exit_code: item.get("exitCode").and_then(Value::as_i64),
+                        duration_ms: item.get("durationMs").and_then(Value::as_u64),
+                    },
+                );
+                return;
+            }
             if matches!(block.kind, BlockKind::Assistant) {
                 self.last_assistant_markdown = Some(block.body.clone());
             }
-            self.committed.push(block);
+            push_latest_thinking(&mut self.committed, block);
         }
     }
 
@@ -5645,19 +5778,67 @@ impl AppState {
                 item_id.to_owned(),
                 ActiveItem {
                     block: Block::new(kind, title, ""),
+                    shell_batch: None,
                 },
             );
         }
         self.active.get_mut(item_id).expect("inserted")
     }
 
+    fn complete_shell_batch_member(
+        &mut self,
+        batch_id: String,
+        item_id: String,
+        result: ShellResult,
+    ) {
+        let Some(batch) = self.shell_batches.get_mut(&batch_id) else {
+            self.committed.push(result.block);
+            return;
+        };
+        batch.completed.insert(item_id, result);
+        if batch.completed.len() != batch.members.len() {
+            return;
+        }
+
+        let mut batch = self
+            .shell_batches
+            .remove(&batch_id)
+            .expect("completed batch exists");
+        let results = batch
+            .members
+            .iter()
+            .filter_map(|id| batch.completed.remove(id))
+            .collect::<Vec<_>>();
+        self.committed.push(shell_results_block(results));
+    }
+
     fn flush_orphaned_active(&mut self) {
+        for (_, mut batch) in std::mem::take(&mut self.shell_batches) {
+            let mut results = Vec::new();
+            for id in &batch.members {
+                if let Some(result) = batch.completed.remove(id) {
+                    results.push(result);
+                    continue;
+                }
+                if let Some(item) = self.active.remove(id) {
+                    self.active_order.retain(|candidate| candidate != id);
+                    results.push(ShellResult {
+                        block: item.block,
+                        exit_code: None,
+                        duration_ms: None,
+                    });
+                }
+            }
+            if !results.is_empty() {
+                self.committed.push(shell_results_block(results));
+            }
+        }
         for id in std::mem::take(&mut self.active_order) {
             if let Some(item) = self.active.remove(&id) {
                 if matches!(item.block.kind, BlockKind::Assistant) {
                     self.last_assistant_markdown = Some(item.block.body.clone());
                 }
-                self.committed.push(item.block);
+                push_latest_thinking(&mut self.committed, item.block);
             }
         }
     }
@@ -5812,6 +5993,24 @@ fn active_item_block(cwd: &str, item: &Value) -> Option<Block> {
     }
 }
 
+fn is_thinking(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::Reasoning) && block.title == "Thinking…"
+}
+
+fn push_latest_thinking(blocks: &mut Vec<Block>, block: Block) {
+    if is_thinking(&block) && blocks.last().is_some_and(is_thinking) {
+        blocks.pop();
+    }
+    blocks.push(block);
+}
+
+fn latest_thinking_only(blocks: Vec<Block>) -> Vec<Block> {
+    blocks.into_iter().fold(Vec::new(), |mut normalized, block| {
+        push_latest_thinking(&mut normalized, block);
+        normalized
+    })
+}
+
 fn completed_item_block(cwd: &str, item: &Value) -> Option<Block> {
     match item.get("type")?.as_str()? {
         "userMessage" => {
@@ -5931,15 +6130,38 @@ fn merged_turn_blocks(
             order += 1;
         }
     }
+    let mut seen_exec_groups = HashSet::new();
     for event in &events {
-        if let Some(block) = event_block(event) {
+        let block = match &event.kind {
+            RolloutKind::Exec { group_id, .. } => {
+                if !seen_exec_groups.insert(group_id.as_str()) {
+                    continue;
+                }
+                let group = events
+                    .iter()
+                    .copied()
+                    .filter(|candidate| {
+                        matches!(
+                            &candidate.kind,
+                            RolloutKind::Exec {
+                                group_id: candidate_group,
+                                ..
+                            } if candidate_group == group_id
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                shell_events_block(&group)
+            }
+            _ => event_block(event),
+        };
+        if let Some(block) = block {
             rows.push((event.ts.clone(), order, block));
             order += 1;
         }
     }
     // The timestamps are a fixed-width UTC format, so string order is time order.
     rows.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
-    rows.into_iter().map(|(_, _, block)| block).collect()
+    latest_thinking_only(rows.into_iter().map(|(_, _, block)| block).collect())
 }
 
 /// The turn's `startedAt` (unix seconds), formatted the same way the rollout's
@@ -6031,6 +6253,7 @@ fn event_block(event: &RolloutEvent) -> Option<Block> {
             output,
             exit_code,
             duration_ms,
+            ..
         } => {
             let suffix = exit_code
                 .map(|code| format!(" · exit {code}"))
@@ -6061,6 +6284,69 @@ fn event_block(event: &RolloutEvent) -> Option<Block> {
         }
         RolloutKind::PatchApplied { .. } | RolloutKind::AssistantMessage { .. } => None,
     }
+}
+
+fn shell_events_block(events: &[&RolloutEvent]) -> Option<Block> {
+    if events.is_empty() {
+        return None;
+    }
+
+    let results = events
+        .iter()
+        .filter_map(|event| {
+            let RolloutKind::Exec {
+                exit_code,
+                duration_ms: event_duration,
+                ..
+            } = &event.kind
+            else {
+                return None;
+            };
+            Some(ShellResult {
+                block: event_block(event)?,
+                exit_code: *exit_code,
+                duration_ms: *event_duration,
+            })
+        })
+        .collect::<Vec<_>>();
+    (results.len() == events.len()).then(|| shell_results_block(results))
+}
+
+fn shell_results_block(results: Vec<ShellResult>) -> Block {
+    assert!(!results.is_empty(), "shell group needs at least one result");
+
+    let failed = results
+        .iter()
+        .filter(|result| result.exit_code.is_some_and(|code| code != 0))
+        .count();
+    let duration_ms = results
+        .iter()
+        .filter_map(|result| result.duration_ms)
+        .max();
+    let status = if failed > 0 {
+        format!("{failed} failed")
+    } else {
+        "completed".to_owned()
+    };
+    let duration = duration_ms
+        .map(|duration| format!(" · {}", format_duration(duration)))
+        .unwrap_or_default();
+    let count = results.len();
+    let noun = if count == 1 { "command" } else { "commands" };
+    let children = results
+        .into_iter()
+        .map(|result| result.block)
+        .collect::<Vec<_>>();
+
+    Block::shell_group(
+        if failed > 0 {
+            BlockKind::Warning
+        } else {
+            BlockKind::Tool
+        },
+        format!("Shell · {count} {noun} · {status}{duration}"),
+        children,
+    )
 }
 
 fn permission_detail(value: &Value) -> Vec<String> {
@@ -6659,6 +6945,180 @@ mod tests {
         assert_eq!(titles, ["Running 2 shell commands"]);
     }
 
+    #[test]
+    fn consecutive_live_thinking_keeps_only_the_latest() {
+        let mut state = test_state();
+        for (id, summary) in [("r1", "first"), ("r2", "latest")] {
+            state.complete_item(&json!({
+                "id": id,
+                "type": "reasoning",
+                "summary": [summary]
+            }));
+        }
+
+        assert_eq!(state.committed.len(), 1);
+        assert_eq!(state.committed[0].title, "Thinking…");
+        assert_eq!(state.committed[0].body, "latest");
+    }
+
+    #[test]
+    fn shell_between_thinking_blocks_preserves_both() {
+        let mut state = test_state();
+        state.complete_item(&json!({
+            "id": "r1",
+            "type": "reasoning",
+            "summary": ["first"]
+        }));
+        state.complete_item(&json!({
+            "id": "cmd",
+            "type": "commandExecution",
+            "command": "pwd",
+            "status": "completed",
+            "exitCode": 0
+        }));
+        state.complete_item(&json!({
+            "id": "r2",
+            "type": "reasoning",
+            "summary": ["second"]
+        }));
+
+        let thinking = state
+            .committed
+            .iter()
+            .filter(|block| block.title == "Thinking…")
+            .count();
+        assert_eq!(thinking, 2);
+    }
+
+    #[test]
+    fn resumed_turn_keeps_latest_consecutive_thinking_per_run() {
+        let blocks = latest_thinking_only(vec![
+            Block::new(BlockKind::Reasoning, "Thinking…", "first"),
+            Block::new(BlockKind::Reasoning, "Thinking…", "latest"),
+            Block::new(BlockKind::Tool, "Shell · pwd", ""),
+            Block::new(BlockKind::Reasoning, "Thinking…", "after shell"),
+        ]);
+
+        let bodies = blocks
+            .iter()
+            .filter(|block| block.title == "Thinking…")
+            .map(|block| block.body.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(bodies, ["latest", "after shell"]);
+    }
+
+    #[test]
+    fn live_overlapping_shells_commit_as_one_group() {
+        let mut state = test_state();
+        state.start_item(&json!({
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "command": "rg TODO"
+        }));
+        state.start_item(&json!({
+            "id": "cmd-2",
+            "type": "commandExecution",
+            "command": "git status --short"
+        }));
+
+        state.complete_item(&json!({
+            "id": "cmd-2",
+            "type": "commandExecution",
+            "command": "git status --short",
+            "status": "completed",
+            "exitCode": 1,
+            "durationMs": 12,
+            "aggregatedOutput": "failed"
+        }));
+        state.complete_item(&json!({
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "command": "rg TODO",
+            "status": "completed",
+            "exitCode": 0,
+            "durationMs": 18,
+            "aggregatedOutput": "match"
+        }));
+
+        assert_eq!(state.committed.len(), 1);
+        let group = &state.committed[0];
+        assert_eq!(group.title, "Shell · 2 commands · 1 failed · 18ms");
+        assert!(matches!(group.kind, BlockKind::Warning));
+        assert_eq!(group.children().len(), 2);
+        assert!(group.children()[0].title.starts_with("Shell · rg TODO"));
+        assert!(
+            group.children()[1]
+                .title
+                .starts_with("Shell · git status --short")
+        );
+    }
+
+    #[test]
+    fn live_single_shell_hides_its_command_in_the_summary() {
+        let mut state = test_state();
+        let command =
+            r#"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -Command Get-Content"#;
+        state.start_item(&json!({
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "command": command
+        }));
+        state.complete_item(&json!({
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "command": command,
+            "status": "completed",
+            "exitCode": 0,
+            "durationMs": 670,
+            "aggregatedOutput": "contents"
+        }));
+
+        let shell = state.committed.last().expect("completed shell");
+        assert_eq!(shell.title, "Shell · 1 command · completed · 670ms");
+        assert_eq!(shell.children().len(), 1);
+        assert!(shell.children()[0].title.contains("powershell.exe"));
+        assert_eq!(shell.children()[0].body, "contents");
+    }
+
+    #[test]
+    fn sequential_shells_are_separate() {
+        let mut state = test_state();
+        for (id, command) in [("cmd-1", "rg TODO"), ("cmd-2", "git status --short")] {
+            state.start_item(&json!({
+                "id": id,
+                "type": "commandExecution",
+                "command": command
+            }));
+            state.complete_item(&json!({
+                "id": id,
+                "type": "commandExecution",
+                "command": command,
+                "status": "completed",
+                "exitCode": 0
+            }));
+        }
+
+        assert_eq!(state.committed.len(), 2);
+        assert!(
+            state
+                .committed
+                .iter()
+                .all(|block| block.title == "Shell · 1 command · completed")
+        );
+        assert!(
+            state
+                .committed
+                .iter()
+                .all(|block| block.children().len() == 1)
+        );
+        assert!(state.committed[0].children()[0].title.contains("rg TODO"));
+        assert!(
+            state.committed[1].children()[0]
+                .title
+                .contains("git status --short")
+        );
+    }
+
     /// A turn covering 15:08:28–15:12:59 UTC on 2026-07-25, matching the
     /// timestamps the rollout literals below use.
     fn history_thread() -> Value {
@@ -6696,13 +7156,46 @@ mod tests {
             .map(|block| block.title.as_str())
             .collect::<Vec<_>>();
         assert_eq!(titles[0], "Codex");
-        assert_eq!(titles[1], "Shell · cargo test · exit 0 · 1.6s");
+        assert_eq!(titles[1], "Shell · 1 command · completed · 1.6s");
         assert_eq!(titles[3], "Codex");
         assert!(matches!(state.committed[1].kind, BlockKind::Tool));
-        assert_eq!(state.committed[1].body, "ok");
+        assert_eq!(state.committed[1].children().len(), 1);
+        assert_eq!(
+            state.committed[1].children()[0].title,
+            "Shell · cargo test · exit 0 · 1.6s"
+        );
+        assert_eq!(state.committed[1].children()[0].body, "ok");
         // The file change sorts by its `patch_apply_end` time: after the shell run
         // at 15:08:36, before the message at 15:09:58.
         assert!(matches!(state.committed[2].kind, BlockKind::FileChange));
+    }
+
+    #[test]
+    fn resumed_multi_command_exec_becomes_one_shell_group() {
+        let mut state = test_state();
+        let rollout = crate::rollout::parse(
+            r#"{"timestamp":"2026-07-25T15:08:36.373Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_pair","input":"const r = await Promise.all([tools.shell_command({command:\"rg TODO\"}),tools.shell_command({command:\"git status --short\"})]);","internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"}}}
+{"timestamp":"2026-07-25T15:08:38.010Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_pair","output":[{"type":"input_text","text":"Script completed\nWall time 4.1 seconds\nOutput:\n"},{"type":"input_text","text":"---0---Exit code: 0\nOutput:\nmatch\n---1---Exit code: 1\nOutput:\nfailed\n"}]}}"#,
+        );
+
+        state.load_history(&history_thread(), Some(&rollout));
+
+        let shell = state
+            .committed
+            .iter()
+            .find(|block| block.title.starts_with("Shell · 2 commands"))
+            .expect("grouped shell block");
+        assert_eq!(shell.title, "Shell · 2 commands · 1 failed · 4.1s");
+        assert!(matches!(shell.kind, BlockKind::Warning));
+        assert_eq!(shell.children().len(), 2);
+        assert_eq!(
+            shell.children()[0].title,
+            "Shell · rg TODO · exit 0 · 4.1s"
+        );
+        assert_eq!(
+            shell.children()[1].title,
+            "Shell · git status --short · exit 1 · 4.1s"
+        );
     }
 
     #[test]
@@ -6722,8 +7215,13 @@ mod tests {
         // finding the block by title) is what catches an order regression.
         assert_eq!(state.committed.len(), 4);
         let bash = &state.committed[3];
-        assert_eq!(bash.title, "Shell · cargo test · exit 101 · 2.0s");
+        assert_eq!(bash.title, "Shell · 1 command · 1 failed · 2.0s");
         assert!(matches!(bash.kind, BlockKind::Warning));
+        assert_eq!(bash.children().len(), 1);
+        assert_eq!(
+            bash.children()[0].title,
+            "Shell · cargo test · exit 101 · 2.0s"
+        );
     }
 
     #[test]
@@ -8257,6 +8755,46 @@ mod tests {
             input[3].get("path").and_then(Value::as_str),
             Some("app://calendar")
         );
+    }
+
+    #[test]
+    fn turn_input_preserves_an_image_path_as_raw_text() {
+        let mut state = test_state();
+        let path = r"C:\Users\me\AppData\Local\Temp\clipboard.png";
+
+        let input = state.turn_input(format!("inspect {path}"));
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(
+            input[0].get("text").and_then(Value::as_str),
+            Some("inspect C:\\Users\\me\\AppData\\Local\\Temp\\clipboard.png")
+        );
+    }
+
+    #[test]
+    fn turn_input_sends_explicitly_attached_images_as_local_image_items() {
+        let mut state = test_state();
+        state.attach_local_image(r"C:\Temp\clipboard-image.bmp".to_owned());
+
+        let input = state.turn_input("describe this".to_owned());
+
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0].get("text").and_then(Value::as_str), Some("describe this"));
+        assert_eq!(input[1].get("type").and_then(Value::as_str), Some("localImage"));
+        assert_eq!(
+            input[1].get("path").and_then(Value::as_str),
+            Some(r"C:\Temp\clipboard-image.bmp")
+        );
+    }
+
+    #[test]
+    fn composer_backspace_removes_an_explicit_image_attachment() {
+        let mut state = test_state();
+        state.attach_local_image(r"C:\Temp\clipboard-image.bmp".to_owned());
+
+        state.handle_key(KeyEvent::from(KeyCode::Backspace));
+
+        assert_eq!(state.composer_image_count(), 0);
     }
 
     fn composer_completion_state() -> AppState {

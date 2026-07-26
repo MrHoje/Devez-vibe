@@ -3,6 +3,7 @@ mod completion;
 mod devezcode;
 mod editor;
 mod integrations;
+mod paste;
 mod pricing;
 mod renderer;
 mod rollout;
@@ -13,6 +14,7 @@ mod update;
 
 use std::{
     env,
+    fs,
     future::Future,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -20,7 +22,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use app_server::{AppServer, ServerEvent};
-use arboard::Clipboard;
+use arboard::{Clipboard, ImageData};
 use clap::Parser;
 use completion::collect_workspace_entries;
 use crossterm::event::{
@@ -29,6 +31,7 @@ use crossterm::event::{
 use editor::Editor;
 use futures_util::StreamExt;
 use integrations::{McpServerInfo, PluginCatalog, PluginDetail, PluginInfo, PluginScope};
+use paste::PasteBurst;
 use renderer::{BlockKind, Pick, RenderMode, Renderer, SelectionResult, TerminalSession, View};
 use rollout::Rollout;
 use serde_json::{Value, json};
@@ -298,6 +301,7 @@ async fn await_thread(
     plan: impl Future<Output = AccountPlan>,
 ) -> Result<Startup> {
     let mut events = EventStream::new();
+    let mut paste_burst = PasteBurst::new();
     let mut spinner_tick = tokio::time::interval(Duration::from_millis(120));
     spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut queued = None;
@@ -327,12 +331,14 @@ async fn await_thread(
                 match event {
                     Some(Ok(Event::Key(key))) => {
                         renderer.clear_selection();
-                        state.handle_key(key)
+                        state.handle_key(paste_burst.observe(key, Instant::now()))
                     }
                     Some(Ok(Event::Mouse(mouse))) => renderer_mouse_action(renderer, &mouse, |pick| pick_action(state, pick)),
                     Some(Ok(Event::Paste(text))) => {
                         renderer.clear_selection();
-                        state.handle_paste(&text);
+                        if !attach_clipboard_image(state) {
+                            state.handle_paste(&text);
+                        }
                         Action::None
                     }
                     Some(Ok(Event::Resize(_, _))) => {
@@ -510,6 +516,7 @@ async fn choose_startup_session(
     let mut picker = SessionPicker::new(sessions, cwd.to_string_lossy().into_owned(), None);
     let editor = Editor::default();
     let mut events = EventStream::new();
+    let mut paste_burst = PasteBurst::new();
     let mut composer_notice = None;
 
     let result = loop {
@@ -519,6 +526,7 @@ async fn choose_startup_session(
                 live_blocks: Vec::new(),
                 overlay: Some(picker.overlay_view()),
                 editor: &editor,
+                composer_images: &[],
                 welcome: None,
                 suggestions: Vec::new(),
                 activity: None,
@@ -533,7 +541,7 @@ async fn choose_startup_session(
             Some(Ok(Event::Key(key))) => {
                 renderer.clear_selection();
                 composer_notice = None;
-                match picker.handle_key(key) {
+                match picker.handle_key(paste_burst.observe(key, Instant::now())) {
                     SessionPickerResult::None => {}
                     SessionPickerResult::Cancel => break Ok(None),
                     SessionPickerResult::Select(thread_id) => break Ok(Some(thread_id)),
@@ -556,13 +564,20 @@ async fn choose_startup_session(
                         },
                     );
                 }
-                if let Some(Pick::Row(row)) = clicked {
-                    composer_notice = None;
-                    match picker.click_row(row) {
-                        SessionPickerResult::None => {}
-                        SessionPickerResult::Cancel => break Ok(None),
-                        SessionPickerResult::Select(thread_id) => break Ok(Some(thread_id)),
+                match clicked {
+                    Some(Pick::Row(row)) => {
+                        composer_notice = None;
+                        match picker.click_row(row) {
+                            SessionPickerResult::None => {}
+                            SessionPickerResult::Cancel => break Ok(None),
+                            SessionPickerResult::Select(thread_id) => break Ok(Some(thread_id)),
+                        }
                     }
+                    // The mark on the panel's corner leaves the list the way Esc
+                    // does: no session picked, and the session that would have
+                    // started without `--resume` starts instead.
+                    Some(Pick::Close) => break Ok(None),
+                    _ => {}
                 }
             }
             Some(Ok(Event::Paste(text))) => {
@@ -593,6 +608,7 @@ async fn event_loop(
 ) -> Result<()> {
     let mut update_rx = Some(update_rx);
     let mut terminal_events = EventStream::new();
+    let mut paste_burst = PasteBurst::new();
     let mut activity_tick = tokio::time::interval(Duration::from_millis(120));
     activity_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut resize = ResizeTracker::new();
@@ -646,6 +662,7 @@ async fn event_loop(
                         // Typing means the drag is over and its highlight is
                         // stale, so it goes before the key is acted on.
                         let cleared = renderer.clear_selection();
+                        let key = paste_burst.observe(key, Instant::now());
                         let action = match scroll_request(renderer, &key) {
                             // A scroll moves the renderer's view, not the session, so
                             // it never reaches `handle_key` and cannot disturb a
@@ -661,7 +678,9 @@ async fn event_loop(
                     Some(Ok(Event::Mouse(mouse))) => renderer_mouse_action(renderer, &mouse, |pick| pick_action(state, pick)),
                     Some(Ok(Event::Paste(text))) => {
                         renderer.clear_selection();
-                        state.handle_paste(&text);
+                        if !attach_clipboard_image(state) {
+                            state.handle_paste(&text);
+                        }
                         Action::None
                     }
                     Some(Ok(Event::Resize(columns, rows))) => {
@@ -848,6 +867,7 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
         Pick::FastMode => state.run_command("/fast"),
         Pick::Model => state.run_command("/model"),
         Pick::EffortSetting => state.run_command("/effort"),
+        Pick::Close => state.close_overlay(),
         Pick::Row(index) => state.click_overlay_row(index),
         Pick::Effort(step) => state.click_effort_step(step),
     }
@@ -2433,6 +2453,50 @@ async fn start_turn(server: &AppServer, state: &mut AppState, text: String) {
     }
 }
 
+fn attach_clipboard_image(state: &mut AppState) -> bool {
+    let Ok(mut clipboard) = Clipboard::new() else {
+        return false;
+    };
+    let Ok(image) = clipboard.get_image() else {
+        return false;
+    };
+    let Ok(path) = write_clipboard_bmp(&image) else {
+        return false;
+    };
+    state.attach_local_image(path.to_string_lossy().into_owned());
+    true
+}
+
+fn write_clipboard_bmp(image: &ImageData<'_>) -> std::io::Result<PathBuf> {
+    let directory = env::temp_dir().join("devez-cli-images");
+    fs::create_dir_all(&directory)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = directory.join(format!("clipboard-{stamp}.bmp"));
+    let pixel_bytes = image.width.saturating_mul(image.height).saturating_mul(4);
+    let file_size = 54usize.saturating_add(pixel_bytes).min(u32::MAX as usize) as u32;
+    let mut bmp = Vec::with_capacity(file_size as usize);
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&file_size.to_le_bytes());
+    bmp.extend_from_slice(&[0; 4]);
+    bmp.extend_from_slice(&54u32.to_le_bytes());
+    bmp.extend_from_slice(&40u32.to_le_bytes());
+    bmp.extend_from_slice(&(image.width as u32).to_le_bytes());
+    bmp.extend_from_slice(&(image.height as u32).to_le_bytes());
+    bmp.extend_from_slice(&1u16.to_le_bytes());
+    bmp.extend_from_slice(&32u16.to_le_bytes());
+    bmp.extend_from_slice(&[0; 24]);
+    for row in (0..image.height).rev() {
+        for rgba in image.bytes[row * image.width * 4..(row + 1) * image.width * 4].chunks_exact(4) {
+            bmp.extend_from_slice(&[rgba[2], rgba[1], rgba[0], rgba[3]]);
+        }
+    }
+    fs::write(&path, bmp)?;
+    Ok(path)
+}
+
 fn draw(state: &mut AppState, renderer: &mut Renderer) -> Result<()> {
     // Every state change the user can see reaches a frame, so the host's copy of
     // the session state is refreshed from the same place rather than from each
@@ -2866,6 +2930,41 @@ mod tests {
 
         assert!(state.view().overlay.is_none(), "the effort picker closed");
         assert!(state.view().status_line.is_some_and(|status| status.effort == "low"));
+    }
+
+    /// Every panel that paints the mark answers for it, and nothing else does.
+    #[test]
+    fn the_mark_closes_the_pickers_that_paint_it() {
+        for pick in [Pick::Model, Pick::EffortSetting] {
+            let mut state = state_with_a_model();
+            pick_action(&mut state, pick);
+            let overlay = state.view().overlay.expect("a picker is open");
+            assert!(overlay.closable, "it paints the mark");
+
+            pick_action(&mut state, Pick::Close);
+
+            assert!(state.view().overlay.is_none(), "the mark closed it");
+        }
+
+        // The `Apply to` step is the same flow, so it closes the same way.
+        let mut state = state_with_a_model();
+        pick_action(&mut state, Pick::Model);
+        pick_action(&mut state, Pick::Row(0));
+        assert!(state.view().overlay.is_some_and(|overlay| overlay.closable));
+        pick_action(&mut state, Pick::Close);
+        assert!(state.view().overlay.is_none());
+    }
+
+    /// With nothing open the mark is not painted anywhere, so a click that claims
+    /// to be on it changes nothing.
+    #[test]
+    fn closing_with_nothing_open_does_nothing() {
+        let mut state = starting_state();
+
+        assert!(matches!(
+            pick_action(&mut state, Pick::Close),
+            Action::Tick(false)
+        ));
     }
 
     /// With nothing open there is no overlay to answer for a row click.

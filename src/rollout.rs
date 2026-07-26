@@ -24,6 +24,7 @@ pub struct RolloutEvent {
 pub enum RolloutKind {
     /// A shell run. `thread/resume` drops these entirely.
     Exec {
+        group_id: String,
         command: String,
         output: String,
         exit_code: Option<i64>,
@@ -124,6 +125,7 @@ pub fn parse(text: &str) -> Rollout {
                             ts: ts.clone(),
                             turn_id: turn_id.clone(),
                             kind: RolloutKind::Exec {
+                                group_id: call_id.clone(),
                                 command,
                                 output: String::new(),
                                 exit_code: None,
@@ -686,6 +688,7 @@ mod tests {
                     output,
                     exit_code,
                     duration_ms,
+                    ..
                 } => Some((command.as_str(), output.as_str(), *exit_code, *duration_ms)),
                 _ => None,
             })
@@ -807,6 +810,15 @@ mod tests {
 
         let events = exec_events(&rollout);
         assert_eq!(events.len(), 2);
+        let groups = rollout
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                RolloutKind::Exec { group_id, .. } => Some(group_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(groups, ["call_pair", "call_pair"]);
         assert_eq!(events[0], ("rg TODO", "src/main.rs:12: TODO fix this\n", Some(0), Some(4100)));
         assert_eq!(
             events[1],

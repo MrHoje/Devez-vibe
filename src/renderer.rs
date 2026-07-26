@@ -106,6 +106,7 @@ pub struct Block {
     pub kind: BlockKind,
     pub title: String,
     pub body: String,
+    children: Vec<Block>,
 }
 
 static NEXT_BLOCK_ID: AtomicU64 = AtomicU64::new(1);
@@ -117,6 +118,7 @@ impl Block {
             kind,
             title: title.into(),
             body: body.into(),
+            children: Vec::new(),
         }
     }
 
@@ -126,6 +128,20 @@ impl Block {
 
     pub fn adopt_id(&mut self, source: &Self) {
         self.id = source.id;
+    }
+
+    pub fn shell_group(kind: BlockKind, title: impl Into<String>, children: Vec<Block>) -> Self {
+        let child_id = children.first().map(Block::id);
+        let mut block = Self::new(kind, title, "");
+        if let Some(child_id) = child_id {
+            block.id = child_id;
+        }
+        block.children = children;
+        block
+    }
+
+    pub fn children(&self) -> &[Block] {
+        &self.children
     }
 
     /// Credits come last so the variable-length list survives the round trip
@@ -147,6 +163,9 @@ pub struct OverlayView<'a> {
     /// rather than pre-formatted because each tier carries its own tone.
     pub slider: Option<EffortSlider>,
     pub hint: String,
+    /// Whether the panel carries a `✕` just inside its top-right corner. What the
+    /// user opened, they may close; what the server is waiting on, they may not.
+    pub closable: bool,
     pub style: OverlayStyle,
     pub input: Option<&'a Editor>,
     pub input_label: &'static str,
@@ -221,6 +240,7 @@ pub struct View<'a> {
     pub live_blocks: Vec<Block>,
     pub overlay: Option<OverlayView<'a>>,
     pub editor: &'a Editor,
+    pub composer_images: &'a [String],
     pub welcome: Option<WelcomeView>,
     pub suggestions: Vec<SuggestionView>,
     pub activity: Option<String>,
@@ -643,6 +663,7 @@ impl Renderer {
             normal_frame_with_expansion(
                 &view.live_blocks,
                 view.editor,
+                view.composer_images,
                 view.welcome,
                 &view.suggestions,
                 view.activity.as_deref(),
@@ -1102,6 +1123,8 @@ pub enum Pick {
     Model,
     /// The status line's `eff:` reading: opens `/effort`.
     EffortSetting,
+    /// The `✕` on a panel's top rule: closes what Esc closes.
+    Close,
 }
 
 /// Columns a clickable span reaches past its own text, either side. A word is a
@@ -1112,7 +1135,7 @@ pub enum Pick {
 const PICK_BLEED: usize = 1;
 
 /// The clickable column spans of one painted row.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PickRegions(Vec<(usize, usize, Pick)>);
 
 impl PickRegions {
@@ -1353,6 +1376,7 @@ fn normal_frame(
     normal_frame_with_expansion(
         live,
         editor,
+        &[],
         welcome,
         suggestions,
         activity,
@@ -1367,6 +1391,7 @@ fn normal_frame(
 fn normal_frame_with_expansion(
     live: &[Block],
     editor: &Editor,
+    composer_images: &[String],
     welcome: Option<WelcomeView>,
     suggestions: &[SuggestionView],
     activity: Option<&str>,
@@ -1426,7 +1451,7 @@ fn normal_frame_with_expansion(
         .map(|(position, total)| format!("{position}/{total}"))
         .unwrap_or_default();
     let (input_lines, input_cursor_line, input_cursor_col) =
-        input_lines(editor, width, &recalled, "", status.composer_mode.as_ref());
+        input_lines(editor, composer_images, width, &recalled, "", status.composer_mode.as_ref());
     let cursor_line = lines.len() + input_cursor_line;
     lines.extend(input_lines);
     lines.push(status_line_row(status.line, &status.fallback, width));
@@ -1653,7 +1678,50 @@ fn panel_span(width: u16) -> usize {
 }
 
 /// A titled rule such as `╭─ Sign in ────╮`, closed with `corner`.
+/// The mark a closable panel wears on its top rule, and the columns it spends:
+/// a blank either side of the mark plus the stroke of rule left between it and the
+/// corner, so the `X` reads as sitting inside the box rather than replacing its
+/// edge. The blanks are the mark's own target, being what the click region reaches
+/// into either side.
+const CLOSE_MARK: &str = "X";
+const CLOSE_RESERVED: usize = 4;
+/// Paint-order position of the mark once a rule row has been split around it.
+const CLOSE_SPAN: usize = 2;
+
+/// The rule that runs from a panel's label to its corner, split around the close
+/// mark when the panel carries one. A rule with no room for the mark keeps it off
+/// rather than shrinking the label.
+fn rule_tail_spans(rule_width: usize, corner: char, closable: bool) -> Vec<PaintSpan> {
+    let border = |text: String| PaintSpan {
+        text,
+        tone: Tone::Border,
+        bold: false,
+    };
+    if !closable || rule_width <= CLOSE_RESERVED {
+        return vec![border(format!("{}{corner}", "─".repeat(rule_width)))];
+    }
+    vec![
+        border(format!("{} ", "─".repeat(rule_width - CLOSE_RESERVED))),
+        PaintSpan {
+            text: CLOSE_MARK.to_owned(),
+            tone: Tone::Muted,
+            bold: false,
+        },
+        border(format!(" ─{corner}")),
+    ]
+}
+
 fn panel_rule_row(opening: &str, label: &str, corner: char, panel_width: usize) -> PaintLine {
+    panel_rule_row_closable(opening, label, corner, panel_width, false)
+}
+
+fn panel_rule_row_closable(
+    opening: &str,
+    label: &str,
+    corner: char,
+    panel_width: usize,
+    closable: bool,
+) -> PaintLine {
     let label = compact_right(label, panel_width.saturating_sub(6));
     let used = UnicodeWidthStr::width(opening)
         + UnicodeWidthStr::width(label.as_str())
@@ -1671,15 +1739,12 @@ fn panel_rule_row(opening: &str, label: &str, corner: char, panel_width: usize) 
         bold: corner == '╮',
         tool_heading: None,
         pick: None,
-        tail: vec![PaintSpan {
-            text: format!("{}{corner}", "─".repeat(panel_width.saturating_sub(used))),
-            tone: Tone::Border,
-            bold: false,
-        }],
+        tail: rule_tail_spans(panel_width.saturating_sub(used), corner, closable),
     }
+    .with_picks(&[(CLOSE_SPAN, Pick::Close)])
 }
 
-fn panel_title_row(title: &str, panel_width: usize) -> PaintLine {
+fn panel_title_row(title: &str, panel_width: usize, closable: bool) -> PaintLine {
     let header = format!("{title} ");
     let header_rule = panel_width
         .saturating_sub(3 + UnicodeWidthStr::width(header.as_str()) + 1)
@@ -1692,12 +1757,9 @@ fn panel_title_row(title: &str, panel_width: usize) -> PaintLine {
         bold: false,
         tool_heading: None,
         pick: None,
-        tail: vec![PaintSpan {
-            text: format!("{}╮", "─".repeat(header_rule)),
-            tone: Tone::Border,
-            bold: false,
-        }],
+        tail: rule_tail_spans(header_rule, '╮', closable),
     }
+    .with_picks(&[(CLOSE_SPAN, Pick::Close)])
 }
 
 /// Pads a wrapped panel row out to `panel_width` and caps it with `│`.
@@ -1801,7 +1863,7 @@ fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine
         .first()
         .map(|suggestion| suggestion.panel_title)
         .unwrap_or("Commands");
-    let mut lines = vec![panel_title_row(title, panel_width)];
+    let mut lines = vec![panel_title_row(title, panel_width, false)];
     lines.push(panel_padding_row(panel_width));
     for suggestion in &suggestions[visible_window(
         suggestions.iter().position(|item| item.selected),
@@ -2154,7 +2216,7 @@ fn overlay_frame_with_expansion(
         OverlayStyle::Picker => {
             let panel_width = panel_span(width);
             let inner_width = panel_width.saturating_sub(2);
-            lines.push(panel_title_row(&overlay.title, panel_width));
+            lines.push(panel_title_row(&overlay.title, panel_width, overlay.closable));
             lines.push(panel_padding_row(panel_width));
 
             for (row_index, row) in overlay.lines.iter().enumerate() {
@@ -2218,7 +2280,13 @@ fn overlay_frame_with_expansion(
             const COMPACT_ROW_RIGHT_INSET: usize = 3;
 
             let panel_width = panel_span(width);
-            lines.push(panel_rule_row("╭─ ", &overlay.title, '╮', panel_width));
+            lines.push(panel_rule_row_closable(
+                "╭─ ",
+                &overlay.title,
+                '╮',
+                panel_width,
+                overlay.closable,
+            ));
             lines.push(panel_padding_row(panel_width));
             for (row_index, row) in overlay.lines.iter().enumerate() {
                 let marker = if row.selected { "❯" } else { " " };
@@ -2256,7 +2324,13 @@ fn overlay_frame_with_expansion(
         OverlayStyle::Panel => {
             // A closed box: every row lands on exactly `panel_width` columns.
             let panel_width = panel_span(width);
-            lines.push(panel_rule_row("╭─ ", &overlay.title, '╮', panel_width));
+            lines.push(panel_rule_row_closable(
+                "╭─ ",
+                &overlay.title,
+                '╮',
+                panel_width,
+                overlay.closable,
+            ));
             lines.push(panel_padding_row(panel_width));
             for (row_index, row) in overlay.lines.iter().enumerate() {
                 // An empty row is padding of the caller's own. It still needs
@@ -2309,6 +2383,7 @@ fn overlay_frame_with_expansion(
         lines.push(PaintLine::blank());
         let (input, input_cursor_line, input_cursor_col) = input_lines(
             editor,
+            &[],
             width,
             overlay.input_label,
             overlay.input_placeholder,
@@ -2532,22 +2607,69 @@ fn is_bash_block(block: &Block) -> bool {
 }
 
 fn bash_lines(block: &Block, width: u16, expanded: bool) -> Vec<PaintLine> {
-    let marker = if expanded { "▾ " } else { "▸ " };
-    let mut lines = wrapped_line(marker, Tone::User, &block.title, Tone::Plain, true, width);
+    let title_tone = if matches!(block.kind, BlockKind::Warning) {
+        Tone::Warning
+    } else {
+        Tone::Plain
+    };
+    if !expanded {
+        let marker = "▸ ";
+        let available = usize::from(width)
+            .saturating_sub(UnicodeWidthStr::width(marker))
+            .max(1);
+        return vec![PaintLine {
+            prefix: marker.to_owned(),
+            prefix_tone: Tone::User,
+            text: compact_right(&block.title, available),
+            tone: title_tone,
+            bold: true,
+            tool_heading: Some(block.id()),
+            pick: None,
+            tail: Vec::new(),
+        }];
+    }
+
+    let mut lines = wrapped_line("▾ ", Tone::User, &block.title, title_tone, true, width);
     for line in &mut lines {
         line.tool_heading = Some(block.id());
     }
-    if expanded {
-        for row in block.body.lines().filter(|row| !row.trim().is_empty()) {
+    if !block.children().is_empty() {
+        for child in block.children() {
+            let child_tone = if matches!(child.kind, BlockKind::Warning) {
+                Tone::Warning
+            } else {
+                Tone::Plain
+            };
             lines.extend(wrapped_line(
-                "  ",
+                "  • ",
                 Tone::Muted,
-                row,
-                Tone::Muted,
-                false,
+                &child.title,
+                child_tone,
+                true,
                 width,
             ));
+            for row in child.body.lines().filter(|row| !row.trim().is_empty()) {
+                lines.extend(wrapped_line(
+                    "    ",
+                    Tone::Muted,
+                    row,
+                    Tone::Muted,
+                    false,
+                    width,
+                ));
+            }
         }
+        return lines;
+    }
+    for row in block.body.lines().filter(|row| !row.trim().is_empty()) {
+        lines.extend(wrapped_line(
+            "  ",
+            Tone::Muted,
+            row,
+            Tone::Muted,
+            false,
+            width,
+        ));
     }
     lines
 }
@@ -3790,6 +3912,19 @@ fn is_copy_marker(prefix: &str) -> bool {
     COPY_MARKERS.contains(&prefix)
 }
 
+fn composer_display(editor: &Editor, composer_images: &[String]) -> (String, usize) {
+    let labels = (1..=composer_images.len())
+        .map(|index| format!("[Image #{index}]"))
+        .collect::<Vec<_>>();
+    let prefix = if labels.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", labels.join(" "))
+    };
+    let cursor = prefix.chars().count() + editor.cursor();
+    (format!("{prefix}{}", editor.text()), cursor)
+}
+
 /// Blocks whose lines carry `devez-copy-v1` metadata. Excludes the ones drawn as
 /// cards, whose box art is content the reader asked to see.
 fn copy_metadata_applies(kind: BlockKind) -> bool {
@@ -3808,11 +3943,14 @@ fn copy_metadata_applies(kind: BlockKind) -> bool {
 
 fn input_lines(
     editor: &Editor,
+    composer_images: &[String],
     width: u16,
     label: &str,
     placeholder: &str,
     mode: Option<&ComposerMode>,
 ) -> (Vec<PaintLine>, usize, usize) {
+    let (display, editor_cursor) = composer_display(editor, composer_images);
+    let display_chars = display.chars().collect::<Vec<_>>();
     let panel_width = (width as usize).saturating_sub(1).max(16);
     let first_prefix = "> ";
     let continuation_prefix = "  ";
@@ -3825,8 +3963,8 @@ fn input_lines(
     let mut cursor_row = 0;
     let mut cursor_column = column;
 
-    for (index, ch) in editor.chars().iter().copied().enumerate() {
-        if index == editor.cursor() {
+    for (index, ch) in display_chars.iter().copied().enumerate() {
+        if index == editor_cursor {
             cursor_row = row;
             cursor_column = column;
         }
@@ -3857,7 +3995,7 @@ fn input_lines(
         column += ch_width;
     }
 
-    if editor.cursor() == editor.chars().len() {
+    if editor_cursor == display_chars.len() {
         cursor_row = row;
         cursor_column = column;
     }
@@ -4690,7 +4828,7 @@ mod tests {
         let mut editor = Editor::default();
         editor.set_text("wrapped-prompt-text");
 
-        let (rows, _, _) = input_lines(&editor, 18, "", "placeholder", None);
+        let (rows, _, _) = input_lines(&editor, &[], 18, "", "placeholder", None);
         let prompt_rows = &rows[1..rows.len() - 1];
 
         assert!(prompt_rows.len() > 1);
@@ -4709,6 +4847,63 @@ mod tests {
         assert!(prompt_rows.iter().all(|row| !row.prefix.contains('│')));
         assert!(prompt_rows.iter().all(|row| !row.text.ends_with(' ')));
         assert!(prompt_rows.iter().all(|row| !row.text.contains('│')));
+    }
+
+    #[test]
+    fn composer_display_keeps_image_paths_as_plain_text() {
+        let mut editor = Editor::default();
+        editor.set_text(r"look C:\tmp\first.PNG then /tmp/second.webp");
+
+        let (display, cursor) = composer_display(&editor, &[]);
+
+        assert_eq!(display, r"look C:\tmp\first.PNG then /tmp/second.webp");
+        assert_eq!(cursor, display.chars().count());
+    }
+
+    #[test]
+    fn composer_display_preserves_cursor_for_all_paths() {
+        let mut editor = Editor::default();
+        editor.set_text("open /tmp/report.txt and /tmp/photo.jpeg");
+        editor.move_home();
+        for _ in 0..31 {
+            editor.move_right();
+        }
+
+        let (display, cursor) = composer_display(&editor, &[]);
+
+        assert_eq!(display, "open /tmp/report.txt and /tmp/photo.jpeg");
+        assert_eq!(cursor, 31);
+    }
+
+    #[test]
+    fn composer_display_shows_labels_only_for_explicit_image_attachments() {
+        let mut editor = Editor::default();
+        editor.set_text(r"inspect C:\tmp\ordinary.png");
+        let images = vec![r"C:\Temp\clipboard-image.bmp".to_owned()];
+
+        let (display, cursor) = composer_display(&editor, &images);
+
+        assert_eq!(display, r"[Image #1] inspect C:\tmp\ordinary.png");
+        assert_eq!(cursor, display.chars().count());
+    }
+
+    #[test]
+    fn composer_display_keeps_an_incomplete_absolute_path_at_the_cursor() {
+        let mut editor = Editor::default();
+        editor.set_text(r"C:\Users\me\AppData\Local\Temp\clipboard");
+
+        let (display, cursor) = composer_display(&editor, &[]);
+
+        assert_eq!(display, r"C:\Users\me\AppData\Local\Temp\clipboard");
+        assert_eq!(cursor, display.chars().count());
+    }
+
+    #[test]
+    fn composer_display_keeps_a_slash_command_as_text() {
+        let mut editor = Editor::default();
+        editor.set_text("/");
+
+        assert_eq!(composer_display(&editor, &[]).0, "/");
     }
 
     #[test]
@@ -5947,16 +6142,97 @@ mod tests {
     }
 
     #[test]
-    fn every_wrapped_bash_heading_row_is_clickable() {
+    fn collapsed_shell_group_is_one_clickable_row() {
+        let group = Block::shell_group(
+            BlockKind::Tool,
+            "Shell · 2 commands · all passed · 1.2s",
+            vec![
+                Block::new(BlockKind::Tool, "Shell · first · exit 0", "one"),
+                Block::new(BlockKind::Tool, "Shell · second · exit 0", "two"),
+            ],
+        );
+
+        let lines = block_lines(&group, 80);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].text,
+            "Shell · 2 commands · all passed · 1.2s"
+        );
+        assert_eq!(lines[0].tool_heading, Some(group.id()));
+    }
+
+    #[test]
+    fn collapsed_shell_heading_ellipsizes_instead_of_wrapping() {
+        let block = Block::shell_group(
+            BlockKind::Tool,
+            "Shell · 123 commands · completed · 123.4s",
+            vec![Block::new(BlockKind::Tool, "Shell · detail", "")],
+        );
+
+        let lines = block_lines(&block, 20);
+
+        assert_eq!(lines.len(), 1);
+        assert!(painted_line_width(&lines[0]) <= 20);
+        assert!(lines[0].text.ends_with('…'));
+        assert_eq!(lines[0].tool_heading, Some(block.id()));
+    }
+
+    #[test]
+    fn expanded_shell_group_shows_ordered_children_without_nested_click_targets() {
+        let group = Block::shell_group(
+            BlockKind::Tool,
+            "Shell · 2 commands · all passed",
+            vec![
+                Block::new(BlockKind::Tool, "Shell · first · exit 0", "one"),
+                Block::new(BlockKind::Tool, "Shell · second · exit 0", "two"),
+            ],
+        );
+
+        let lines = block_lines_with_expansion(&group, 80, true);
+        let texts = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            texts,
+            [
+                "Shell · 2 commands · all passed",
+                "Shell · first · exit 0",
+                "one",
+                "Shell · second · exit 0",
+                "two",
+            ]
+        );
+        assert_eq!(lines[0].tool_heading, Some(group.id()));
+        assert!(lines[1..].iter().all(|line| line.tool_heading.is_none()));
+    }
+
+    #[test]
+    fn failed_shell_group_uses_warning_tone() {
+        let group = Block::shell_group(
+            BlockKind::Warning,
+            "Shell · 2 commands · 1 failed",
+            vec![
+                Block::new(BlockKind::Tool, "Shell · first · exit 0", ""),
+                Block::new(BlockKind::Warning, "Shell · second · exit 1", ""),
+            ],
+        );
+
+        let lines = block_lines(&group, 80);
+
+        assert_eq!(lines[0].tone, Tone::Warning);
+    }
+
+    #[test]
+    fn long_bash_heading_stays_one_clickable_row() {
         let block = Block::new(BlockKind::Tool, format!("Shell · {}", "x".repeat(100)), "");
         let lines = block_lines(&block, 20);
 
-        assert!(lines.len() > 1);
-        assert!(
-            lines
-                .iter()
-                .all(|line| line.tool_heading == Some(block.id()))
-        );
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].tool_heading, Some(block.id()));
+        assert!(lines[0].text.ends_with('…'));
     }
 
     #[test]
@@ -6507,6 +6783,7 @@ mod tests {
         let frame = overlay_frame(
             &[],
             OverlayView {
+                closable: false,
                 title: "Sign in to ChatGPT".to_owned(),
                 lines: vec![OverlayLine {
                     text: long,
@@ -6576,6 +6853,7 @@ mod tests {
         let frame = overlay_frame(
             &live,
             OverlayView {
+                closable: false,
                 title: "Resume session".to_owned(),
                 lines: vec![OverlayLine {
                     text: "4s ago    a very long session title\nC:\\work\\other".repeat(8),
@@ -6625,6 +6903,7 @@ mod tests {
         let frame = overlay_frame(
             &[],
             OverlayView {
+                closable: false,
                 title: "Resume session".to_owned(),
                 lines: vec![OverlayLine {
                     text: "yesterday's session".to_owned(),
@@ -6676,6 +6955,7 @@ mod tests {
         let frame = overlay_frame(
             &[],
             OverlayView {
+                closable: false,
                 title: "Resume session · 1 · this folder".to_owned(),
                 lines: vec![OverlayLine {
                     text: "yesterday's session  ·  2h ago".to_owned(),
@@ -6736,6 +7016,7 @@ mod tests {
         let frame = overlay_frame(
             &[],
             OverlayView {
+                closable: false,
                 title: "Select model".to_owned(),
                 lines: vec![OverlayLine {
                     text: "GPT-5.6-Sol".to_owned(),
@@ -6778,6 +7059,7 @@ mod tests {
         let frame = overlay_frame(
             &[],
             OverlayView {
+                closable: false,
                 title: "Model".to_owned(),
                 lines: vec![
                     OverlayLine {
@@ -6838,6 +7120,7 @@ mod tests {
             let frame = overlay_frame(
                 &[],
                 OverlayView {
+                    closable: false,
                     title: "Effort".to_owned(),
                     lines: Vec::new(),
                     slider: Some(EffortSlider {
@@ -6886,6 +7169,7 @@ mod tests {
             let frame = overlay_frame(
                 &[],
                 OverlayView {
+                    closable: false,
                     title: "Overlay".to_owned(),
                     lines: vec![OverlayLine {
                         text: "choice".to_owned(),
@@ -6992,6 +7276,111 @@ mod tests {
         }
     }
 
+    /// The top row of a picker, closable or not, at 80 columns.
+    fn picker_top_row(closable: bool) -> PaintLine {
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                closable,
+                title: "Model".to_owned(),
+                lines: vec![OverlayLine {
+                    text: "1. GPT-5.6 Sol".to_owned(),
+                    selected: true,
+                    muted: false,
+                }],
+                slider: None,
+                hint: "Enter select".to_owned(),
+                style: OverlayStyle::Picker,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            },
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+        frame.lines.into_iter().next().expect("the top row")
+    }
+
+    /// The mark sits inside the corner with a stroke of rule between, and answers
+    /// for the close — including the column either side of it.
+    #[test]
+    fn a_closable_picker_wears_the_mark_just_inside_its_corner() {
+        let row = picker_top_row(true);
+        let painted = painted(&row);
+
+        assert!(painted.ends_with(" X ─╮"), "{painted}");
+        assert_eq!(pick_on(&row, "X"), Some(Pick::Close));
+        // The mark and one blank either side of it, and nothing more.
+        assert_eq!(
+            Renderer::hover_columns(&row, None, Some(&Pick::Close)).map(|columns| columns.len()),
+            Some(3)
+        );
+        // The box keeps its width: the mark is painted into the rule, not added to
+        // it, so the corner stays where every other row's border is.
+        assert_eq!(
+            painted_line_width(&row),
+            painted_line_width(&picker_top_row(false))
+        );
+    }
+
+    /// A panel the user cannot close carries no mark to click.
+    #[test]
+    fn a_plain_picker_has_no_mark_and_nothing_to_close() {
+        let row = picker_top_row(false);
+
+        assert!(!painted(&row).contains(" X "));
+        assert_eq!(row.pick, None);
+    }
+
+    /// The resume list is drawn as a compact panel rather than a picker, and wears
+    /// the same mark on the same corner.
+    #[test]
+    fn the_compact_panel_carries_the_mark_too() {
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                closable: true,
+                title: "Resume session · 3 · this folder".to_owned(),
+                lines: vec![OverlayLine {
+                    text: "3m ago    Fixing the picker".to_owned(),
+                    selected: true,
+                    muted: false,
+                }],
+                slider: None,
+                hint: "Enter resume".to_owned(),
+                style: OverlayStyle::CompactPanel,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            },
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+        let row = &frame.lines[0];
+
+        assert!(painted(row).ends_with(" X ─╮"), "{}", painted(row));
+        assert_eq!(pick_on(row, "X"), Some(Pick::Close));
+        // The rule below the list keeps its own corner: one mark, on top.
+        assert!(
+            !frame.lines.iter().skip(1).any(|line| line
+                .pick
+                .as_ref()
+                .is_some_and(|regions| regions.columns_of(&Pick::Close).is_some()))
+        );
+    }
+
     /// The cells a painted row actually carries the hover tint on, read back off
     /// the escapes it printed.
     fn hovered_cells(painted: &str) -> String {
@@ -7080,6 +7469,7 @@ mod tests {
         let frame = overlay_frame(
             &[],
             OverlayView {
+                closable: false,
                 title: "Model".to_owned(),
                 lines: vec![OverlayLine {
                     text: "1. GPT-5.6 Sol".to_owned(),
@@ -7128,6 +7518,7 @@ mod tests {
         let frame = overlay_frame(
             &[],
             OverlayView {
+                closable: false,
                 title: "Resume session".to_owned(),
                 lines: vec![OverlayLine {
                     text: "2h ago    Fix the picker".to_owned(),
@@ -7177,6 +7568,7 @@ mod tests {
         let frame = overlay_frame(
             &[],
             OverlayView {
+                closable: false,
                 title: "Effort".to_owned(),
                 lines: Vec::new(),
                 slider: Some(EffortSlider {

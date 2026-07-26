@@ -383,6 +383,7 @@ impl McpPicker {
             });
         }
         OverlayView {
+            closable: false,
             title: format!("MCP servers · {}", self.servers.len()),
             lines,
             slider: None,
@@ -400,6 +401,7 @@ impl McpPicker {
     fn detail_view(&self) -> OverlayView<'_> {
         let Some(server) = self.selected_server() else {
             return OverlayView {
+                closable: false,
                 title: "MCP server".to_owned(),
                 lines: vec![OverlayLine {
                     text: "서버를 찾을 수 없습니다.".to_owned(),
@@ -495,6 +497,7 @@ impl McpPicker {
             }
         });
         OverlayView {
+            closable: false,
             title: format!("MCP · {}", server.label()),
             lines,
             slider: None,
@@ -1294,6 +1297,7 @@ impl PluginPicker {
             });
         }
         OverlayView {
+            closable: false,
             title: "Plugins".to_owned(),
             lines,
             slider: None,
@@ -1357,6 +1361,7 @@ impl PluginPicker {
             }
         };
         OverlayView {
+            closable: false,
             title,
             lines,
             slider: None,
@@ -1487,6 +1492,7 @@ impl PluginPicker {
     fn detail_view(&self, offset: usize) -> OverlayView<'_> {
         let Some(plugin) = self.detail_plugin() else {
             return OverlayView {
+                closable: false,
                 title: "Plugin".to_owned(),
                 lines: vec![OverlayLine {
                     text: "플러그인을 찾을 수 없습니다.".to_owned(),
@@ -1532,6 +1538,7 @@ impl PluginPicker {
         }
         actions.push("Esc 뒤로");
         OverlayView {
+            closable: false,
             title: format!("Plugin · {}", plugin.display_name),
             lines,
             slider: None,
@@ -1703,6 +1710,7 @@ impl MarketplacePicker {
     pub fn overlay_view(&self) -> OverlayView<'_> {
         if let Some(source) = self.source.as_ref() {
             return OverlayView {
+                closable: false,
                 title: "Add marketplace".to_owned(),
                 lines: vec![
                     OverlayLine {
@@ -1760,6 +1768,7 @@ impl MarketplacePicker {
             });
         }
         OverlayView {
+            closable: false,
             title: format!("Marketplaces · {}", self.marketplaces.len()),
             lines,
             slider: None,
