@@ -95,9 +95,6 @@ impl CostLedger {
         })
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.by_model.is_empty()
-    }
 }
 
 /// Cache rates as a multiple of the model's input rate — current for both

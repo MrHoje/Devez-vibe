@@ -20,7 +20,7 @@ use crate::{
         PluginCatalog, PluginDetail, PluginInfo, PluginPicker, PluginPickerResult, PluginScope,
         PluginTarget,
     },
-    pricing::{self, TokenTotals},
+    pricing::{self, CostLedger, TokenTotals},
     renderer::{
         Block, BlockKind, ComposerMode, EffortSlider, HIDDEN_STATUS_LINE, ModeAccent, OverlayLine,
         OverlayStyle, OverlayView, PICKER_ROWS, StatusLineView, SuggestionView, View, WelcomeView,
@@ -2364,6 +2364,11 @@ pub struct AppState {
     context_tokens: u64,
     /// The running tally, which is what billing counts.
     token_totals: TokenTotals,
+    cost_ledger: Option<CostLedger>,
+    pending_turn_model: Option<String>,
+    active_turn_model: Option<String>,
+    cost_restore_due: bool,
+    cost_restore_pending: bool,
     context_window: Option<u64>,
     transient_status: Option<String>,
     show_welcome: bool,
@@ -2463,6 +2468,11 @@ impl AppState {
             pending: None,
             context_tokens: 0,
             token_totals: TokenTotals::default(),
+            cost_ledger: Some(CostLedger::default()),
+            pending_turn_model: None,
+            active_turn_model: None,
+            cost_restore_due: false,
+            cost_restore_pending: false,
             context_window,
             transient_status: None,
             show_welcome: true,
@@ -2572,6 +2582,38 @@ impl AppState {
             self.rebuild_completion_catalog();
         }
         self.select_model_and_effort(model, effort);
+    }
+
+    pub fn note_pending_turn_model(&mut self, model: &str) {
+        self.pending_turn_model = Some(model.to_owned());
+    }
+
+    /// Resumed history cannot be priced until its local rollout is restored.
+    /// Keeping the ledger absent avoids charging all historical usage at the
+    /// model currently selected in the picker.
+    pub fn begin_cost_restore(&mut self) {
+        self.cost_ledger = None;
+        self.cost_restore_due = true;
+        self.cost_restore_pending = true;
+    }
+
+    pub fn take_cost_restore(&mut self) -> Option<String> {
+        self.cost_restore_due.then(|| {
+            self.cost_restore_due = false;
+            self.thread_id.clone()
+        })
+    }
+
+    pub fn apply_restored_cost(&mut self, thread_id: &str, ledger: Option<CostLedger>) {
+        if self.thread_id != thread_id {
+            return;
+        }
+        self.cost_restore_pending = false;
+        self.cost_ledger = ledger;
+        let model = self.active_cost_model().to_owned();
+        if let Some(ledger) = self.cost_ledger.as_mut() {
+            ledger.record_cumulative(&model, self.token_totals);
+        }
     }
 
     /// Puts the session back into its pending state so a switch can wipe the screen
@@ -2894,11 +2936,17 @@ impl AppState {
     /// Estimated spend for the thread so far. `None` before the first turn
     /// reports usage, or when the model has no published rate.
     fn estimated_cost(&self) -> Option<String> {
-        if self.token_totals.is_empty() {
-            return None;
-        }
-        pricing::estimate_usd(self.selected_model_name(), self.token_totals)
+        self.cost_ledger
+            .as_ref()?
+            .estimate_usd()
+            .filter(|cost| *cost > 0.0)
             .map(pricing::format_usd)
+    }
+
+    fn active_cost_model(&self) -> &str {
+        self.active_turn_model
+            .as_deref()
+            .unwrap_or_else(|| self.selected_model_name())
     }
 
     pub fn selected_model_name(&self) -> &str {
@@ -3274,6 +3322,11 @@ impl AppState {
         self.pending = None;
         self.context_tokens = 0;
         self.token_totals = TokenTotals::default();
+        self.cost_ledger = Some(CostLedger::default());
+        self.pending_turn_model = None;
+        self.active_turn_model = None;
+        self.cost_restore_due = false;
+        self.cost_restore_pending = false;
         self.context_window = None;
         self.transient_status = None;
         self.side_parent = None;
@@ -3984,6 +4037,10 @@ impl AppState {
                     .and_then(|turn| turn.get("id"))
                     .and_then(Value::as_str)
                 {
+                    self.active_turn_model = self
+                        .pending_turn_model
+                        .take()
+                        .or_else(|| Some(self.selected_model_name().to_owned()));
                     self.set_turn_started(turn_id.to_owned());
                 }
             }
@@ -4109,6 +4166,12 @@ impl AppState {
                     // for the traffic and cost figures on the composer rule.
                     if let Some(total) = usage.get("total") {
                         self.token_totals = TokenTotals::from_breakdown(total);
+                        let model = self.active_cost_model().to_owned();
+                        if !self.cost_restore_pending {
+                            if let Some(ledger) = self.cost_ledger.as_mut() {
+                                ledger.record_cumulative(&model, self.token_totals);
+                            }
+                        }
                     }
                     self.context_window = usage
                         .get("modelContextWindow")
@@ -10702,6 +10765,34 @@ mod tests {
         // write ×1.25 (0.25) + 500k cache read ×0.1 (0.25) + 10k output (0.30).
         assert_eq!(state.composer_mode().cost.as_deref(), Some("$0.95"));
         assert_eq!(state.token_totals.input_new, 30_000);
+    }
+
+    #[test]
+    fn cost_keeps_completed_sol_usage_when_the_next_turn_uses_terra() {
+        let mut state = test_state();
+        state
+            .models
+            .push(test_model("gpt-5.6-terra", "GPT-5.6 Terra", false));
+        state.note_pending_turn_model("gpt-5.6-sol");
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "one" } }));
+        state.handle_notification(
+            "thread/tokenUsage/updated",
+            &json!({
+                "tokenUsage": { "total": { "inputTokens": 1_000_000 } }
+            }),
+        );
+
+        state.apply_model(1, None);
+        state.note_pending_turn_model("gpt-5.6-terra");
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "two" } }));
+        state.handle_notification(
+            "thread/tokenUsage/updated",
+            &json!({
+                "tokenUsage": { "total": { "inputTokens": 2_000_000 } }
+            }),
+        );
+
+        assert_eq!(state.composer_mode().cost.as_deref(), Some("$7.50"));
     }
 
     #[test]

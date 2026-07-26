@@ -261,6 +261,7 @@ async fn start_session(
     state.attach_thread(thread_id, actual_cwd, &actual_model, Some(&actual_effort));
     if is_resuming {
         state.load_history(thread, None);
+        state.begin_cost_restore();
     }
     draw(state, renderer)?;
 
@@ -589,12 +590,16 @@ async fn event_loop(
     activity_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut resize = ResizeTracker::new();
     let (workspace_tx, mut workspace_rx) = mpsc::channel(1);
+    let mut cost_restore_rx = None;
     let mut indexed_cwd = None;
     let mut integration_key = None;
     let mut integration_rx = None;
     draw(state, renderer)?;
 
     loop {
+        if let Some(thread_id) = state.take_cost_restore() {
+            cost_restore_rx = Some(start_cost_restore(thread_id));
+        }
         // A session picked while the previous one was still starting is switched to
         // here. The event loop is the only place that can drive it: the wait it was
         // requested from cannot resume out of itself without recursing into another
@@ -718,6 +723,10 @@ async fn event_loop(
             }
             Some(latest) = recv_update(&mut update_rx) => {
                 state.push_update_available(&latest);
+                Action::None
+            }
+            Some(restored) = recv_cost_restore(&mut cost_restore_rx) => {
+                state.apply_restored_cost(&restored.thread_id, restored.ledger);
                 Action::None
             }
             Some(catalog) = recv_integrations(&mut integration_rx) => {
@@ -1897,6 +1906,7 @@ async fn resume_into_state(
         resumed.effort.as_deref(),
     );
     state.load_history(&resumed.thread, None);
+    state.begin_cost_restore();
     Ok(Switched::Done(queued))
 }
 
@@ -2350,6 +2360,47 @@ fn start_background_catalogue(
     receiver
 }
 
+struct CostRestore {
+    thread_id: String,
+    ledger: Option<pricing::CostLedger>,
+}
+
+fn start_cost_restore(thread_id: String) -> mpsc::Receiver<CostRestore> {
+    let lookup_thread_id = thread_id.clone();
+    start_background_cost_restore(thread_id, move || {
+        state::codex_home()
+            .and_then(|home| rollout::load_cost_ledger(&home, &lookup_thread_id))
+    })
+}
+
+fn start_background_cost_restore(
+    thread_id: String,
+    restore: impl FnOnce() -> Option<pricing::CostLedger> + Send + 'static,
+) -> mpsc::Receiver<CostRestore> {
+    let (sender, receiver) = mpsc::channel(1);
+    tokio::spawn(async move {
+        let ledger = tokio::task::spawn_blocking(restore)
+            .await
+            .ok()
+            .flatten();
+        let _ = sender.send(CostRestore { thread_id, ledger }).await;
+    });
+    receiver
+}
+
+async fn recv_cost_restore(
+    receiver: &mut Option<mpsc::Receiver<CostRestore>>,
+) -> Option<CostRestore> {
+    let Some(channel) = receiver.as_mut() else {
+        return std::future::pending().await;
+    };
+    let restored = channel.recv().await;
+    if restored.is_none() {
+        *receiver = None;
+    }
+    restored
+}
+
 fn start_integration_refresh(
     server: &AppServer,
     state: &AppState,
@@ -2548,11 +2599,13 @@ fn open_url(url: &str) -> Result<()> {
 
 async fn start_turn(server: &AppServer, state: &mut AppState, text: String) {
     devezcode::note_prompt(&text);
+    let model = state.selected_model_name().to_owned();
+    state.note_pending_turn_model(&model);
     let input = state.turn_input(text);
     let params = json!({
         "threadId": state.thread_id,
         "input": input,
-        "model": state.selected_model_name(),
+        "model": model,
         "effort": state.selected_effort(),
         "serviceTier": state.service_tier(),
         "permissions": state.permission_profile()
@@ -3268,6 +3321,21 @@ mod tests {
                 .await
                 .is_err(),
             "a pending catalogue fetch must not make the caller wait"
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_restore_does_not_block_event_loop() {
+        let mut receiver = Some(start_background_cost_restore("thread".to_owned(), || {
+            std::thread::sleep(Duration::from_millis(50));
+            None::<pricing::CostLedger>
+        }));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), recv_cost_restore(&mut receiver))
+                .await
+                .is_err(),
+            "cost reconstruction must not make the caller wait"
         );
     }
 
