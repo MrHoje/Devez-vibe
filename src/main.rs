@@ -36,8 +36,8 @@ use renderer::{BlockKind, Pick, RenderMode, Renderer, SelectionResult, TerminalS
 use rollout::Rollout;
 use serde_json::{Value, json};
 use state::{
-    AccountPlan, Action, AppState, LoginMethod, ModelInfo, SessionInfo,
-    SessionPicker, SessionPickerResult, load_model_context_windows,
+    AccountPlan, Action, AppState, LoginMethod, ModelInfo, SessionInfo, SessionPicker,
+    SessionPickerResult, ShellDisplayMode, load_model_context_windows,
 };
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 
@@ -862,6 +862,10 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
     match pick {
         Pick::PermissionMode => {
             state.cycle_permission_mode();
+            Action::Tick(true)
+        }
+        Pick::ShellDisplayMode => {
+            state.cycle_shell_display_mode();
             Action::Tick(true)
         }
         Pick::FastMode => state.run_command("/fast"),
@@ -2801,6 +2805,15 @@ mod tests {
         let by_key = state.permission_mode();
         pick_action(&mut state, Pick::PermissionMode);
         assert_ne!(state.permission_mode(), by_key);
+    }
+
+    #[test]
+    fn clicking_shell_badge_cycles_the_global_mode() {
+        let mut state = starting_state();
+
+        pick_action(&mut state, Pick::ShellDisplayMode);
+
+        assert_eq!(state.shell_display_mode(), ShellDisplayMode::Expand);
     }
 
     /// The effort picker only has rows once a model has published its tiers, so

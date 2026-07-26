@@ -43,6 +43,32 @@ pub enum PermissionMode {
     FullAccess,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShellDisplayMode {
+    Hide,
+    #[default]
+    Collapse,
+    Expand,
+}
+
+impl ShellDisplayMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hide => "Hide",
+            Self::Collapse => "Collapse",
+            Self::Expand => "Expand",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Hide => Self::Collapse,
+            Self::Collapse => Self::Expand,
+            Self::Expand => Self::Hide,
+        }
+    }
+}
+
 impl PermissionMode {
     const CYCLE: [Self; 3] = [Self::ReadOnly, Self::Default, Self::FullAccess];
 
@@ -2107,6 +2133,7 @@ pub struct AppState {
     composer_notice: Option<(String, Instant)>,
     status_metadata_refreshed_at: Instant,
     permission_mode: PermissionMode,
+    shell_display_mode: ShellDisplayMode,
     account_plan: AccountPlan,
     /// Set when a login lands, so the event loop re-reads the account over RPC.
     account_refresh_due: bool,
@@ -2200,6 +2227,7 @@ impl AppState {
             composer_notice: None,
             status_metadata_refreshed_at: Instant::now(),
             permission_mode: read_permission_mode(),
+            shell_display_mode: ShellDisplayMode::default(),
             account_plan: AccountPlan::default(),
             account_refresh_due: false,
             skills: Vec::new(),
@@ -2577,6 +2605,10 @@ impl AppState {
         self.permission_mode
     }
 
+    pub fn shell_display_mode(&self) -> ShellDisplayMode {
+        self.shell_display_mode
+    }
+
     /// Permission profile id to send with `turn/start`.
     pub fn permission_profile(&self) -> &'static str {
         self.permission_mode().profile()
@@ -2587,6 +2619,7 @@ impl AppState {
             label: self.permission_mode().label().to_owned(),
             accent: self.permission_mode().accent(),
             fast_mode: self.effective_fast_mode(),
+            shell_display_mode: self.shell_display_mode().label().to_owned(),
             cost: self.estimated_cost(),
         }
     }
@@ -5455,6 +5488,10 @@ impl AppState {
             return;
         }
         self.permission_mode = self.permission_mode.next();
+    }
+
+    pub fn cycle_shell_display_mode(&mut self) {
+        self.shell_display_mode = self.shell_display_mode.next();
     }
 
     /// Runs a slash command the composer never typed — what a click on the

@@ -231,6 +231,7 @@ pub struct ComposerMode {
     pub label: String,
     pub accent: ModeAccent,
     pub fast_mode: bool,
+    pub shell_display_mode: String,
     /// What the thread is estimated to have cost so far. Absent before the first
     /// turn reports usage, and whenever the model has no published rate.
     pub cost: Option<String>,
@@ -1117,6 +1118,8 @@ pub enum Pick {
     Effort(usize),
     /// The permission-mode badge: cycles the mode, exactly as Shift+Tab does.
     PermissionMode,
+    /// The shell-display badge: cycles between hidden, collapsed, and expanded output.
+    ShellDisplayMode,
     /// The `Fast On`/`Fast Off` badge: toggles the fast service tier.
     FastMode,
     /// The status line's model name: opens `/model`.
@@ -4085,6 +4088,11 @@ fn input_top_line(panel_width: usize, label: &str, mode: Option<&ComposerMode>) 
     let mut picks = Vec::new();
     if let Some(badge) = badge {
         let badge_start = tail_offset + 1;
+        picks.extend(
+            badge
+                .shell_display_mode_index
+                .map(|index| (badge_start + index, Pick::ShellDisplayMode)),
+        );
         picks.push((badge_start + badge.mode_index, Pick::PermissionMode));
         picks.extend(
             badge
@@ -4171,6 +4179,15 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
         },
     ];
 
+    let shell_display_mode_spans = [
+        PaintSpan {
+            text: format!("Shell: {}", mode.shell_display_mode),
+            tone: Tone::Muted,
+            bold: false,
+        },
+        separator_span(),
+    ];
+
     // Brackets mark the cost as an aside rather than a setting like the two
     // badges beside it. The cost leads, so its separator trails it instead.
     let cost_spans = mode
@@ -4188,23 +4205,42 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
         })
         .unwrap_or_default();
 
-    // Widest first. Reading order and drop order run opposite ways: the cost sits
-    // leftmost but goes first, because the mode is persistent state while the
-    // cost is only a running estimate.
+    // Widest first. The cost is the least important reading and goes first;
+    // then the fast flag, leaving the two persistent mode controls last.
     let cost_width = cost_spans.len();
     let ladder = [
         BadgeSpans {
-            spans: [cost_spans, vec![mode_span.clone()], fast_spans.to_vec()].concat(),
-            mode_index: cost_width,
-            fast_index: Some(cost_width + 2),
+            spans: [
+                cost_spans,
+                shell_display_mode_spans.to_vec(),
+                vec![mode_span.clone()],
+                fast_spans.to_vec(),
+            ]
+            .concat(),
+            shell_display_mode_index: Some(cost_width),
+            mode_index: cost_width + 2,
+            fast_index: Some(cost_width + 4),
         },
         BadgeSpans {
-            spans: [vec![mode_span.clone()], fast_spans.to_vec()].concat(),
-            mode_index: 0,
-            fast_index: Some(2),
+            spans: [
+                shell_display_mode_spans.to_vec(),
+                vec![mode_span.clone()],
+                fast_spans.to_vec(),
+            ]
+            .concat(),
+            shell_display_mode_index: Some(0),
+            mode_index: 2,
+            fast_index: Some(4),
+        },
+        BadgeSpans {
+            spans: [shell_display_mode_spans.to_vec(), vec![mode_span.clone()]].concat(),
+            shell_display_mode_index: Some(0),
+            mode_index: 2,
+            fast_index: None,
         },
         BadgeSpans {
             spans: vec![mode_span],
+            shell_display_mode_index: None,
             mode_index: 0,
             fast_index: None,
         },
@@ -4219,6 +4255,7 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
 /// that picked the candidate knows which rung it settled on.
 struct BadgeSpans {
     spans: Vec<PaintSpan>,
+    shell_display_mode_index: Option<usize>,
     mode_index: usize,
     fast_index: Option<usize>,
 }
@@ -5564,11 +5601,12 @@ mod tests {
             accent,
             fast_mode,
             cost: None,
+            shell_display_mode: "Collapse".to_owned(),
         }
     }
 
     #[test]
-    fn permission_mode_and_fast_flag_sit_inside_the_composer_rule() {
+    fn composer_controls_sit_inside_the_composer_rule() {
         let mode = test_mode("Full Access", ModeAccent::Danger, true);
         let line = input_top_line(50, "", Some(&mode));
         let texts = line
@@ -5580,9 +5618,21 @@ mod tests {
         assert_eq!(rule_width(&line), 50);
         assert!(line.text.chars().all(|ch| ch == '─'));
         // Two blanks off the rule, the badge, then the rule resumes for two columns.
-        assert_eq!(texts, ["  ", "Full Access", " · ", "Fast On", " ", "──"]);
-        assert_eq!(line.tail[1].tone, Tone::Warning);
-        assert_eq!(line.tail[3].tone, Tone::FastOn);
+        assert_eq!(
+            texts,
+            [
+                "  ",
+                "Shell: Collapse",
+                " · ",
+                "Full Access",
+                " · ",
+                "Fast On",
+                " ",
+                "──"
+            ]
+        );
+        assert_eq!(line.tail[3].tone, Tone::Warning);
+        assert_eq!(line.tail[5].tone, Tone::FastOn);
     }
 
     /// What the row answers with at the first column of `label`.
@@ -5666,8 +5716,20 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(rule_width(&line), 50);
-        assert_eq!(texts, ["  ", "Default", " · ", "Fast Off", " ", "──"]);
-        assert_eq!(line.tail[3].tone, Tone::FastOff);
+        assert_eq!(
+            texts,
+            [
+                "  ",
+                "Shell: Collapse",
+                " · ",
+                "Default",
+                " · ",
+                "Fast Off",
+                " ",
+                "──"
+            ]
+        );
+        assert_eq!(line.tail[5].tone, Tone::FastOff);
     }
 
     #[test]
@@ -5688,6 +5750,8 @@ mod tests {
                 "  ",
                 "[$0.95]",
                 " · ",
+                "Shell: Collapse",
+                " · ",
                 "Full Access",
                 " · ",
                 "Fast On",
@@ -5696,8 +5760,39 @@ mod tests {
             ]
         );
         assert_eq!(line.tail[1].tone, Tone::Plain);
-        assert_eq!(line.tail[3].tone, Tone::Warning);
-        assert_eq!(line.tail[5].tone, Tone::FastOn);
+        assert_eq!(line.tail[3].tone, Tone::Muted);
+        assert_eq!(line.tail[5].tone, Tone::Warning);
+        assert_eq!(line.tail[7].tone, Tone::FastOn);
+    }
+
+    #[test]
+    fn shell_badge_sits_between_cost_and_permission_mode() {
+        let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
+        mode.cost = Some("$0.95".to_owned());
+        let line = input_top_line(80, "", Some(&mode));
+
+        assert_eq!(
+            line.tail
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "  ",
+                "[$0.95]",
+                " · ",
+                "Shell: Collapse",
+                " · ",
+                "Full Access",
+                " · ",
+                "Fast On",
+                " ",
+                "──"
+            ]
+        );
+        assert_eq!(
+            pick_on(&line, "Shell: Collapse"),
+            Some(Pick::ShellDisplayMode)
+        );
     }
 
     /// The cost is the first thing to go: it is the least load-bearing segment.
@@ -5705,15 +5800,27 @@ mod tests {
     fn the_cost_is_dropped_before_the_fast_flag() {
         let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
         mode.cost = Some("$0.95".to_owned());
-        let line = input_top_line(32, "", Some(&mode));
+        let line = input_top_line(48, "", Some(&mode));
         let texts = line
             .tail
             .iter()
             .map(|span| span.text.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(rule_width(&line), 32);
-        assert_eq!(texts, ["  ", "Full Access", " · ", "Fast On", " ", "──"]);
+        assert_eq!(rule_width(&line), 48);
+        assert_eq!(
+            texts,
+            [
+                "  ",
+                "Shell: Collapse",
+                " · ",
+                "Full Access",
+                " · ",
+                "Fast On",
+                " ",
+                "──"
+            ]
+        );
     }
 
     #[test]
