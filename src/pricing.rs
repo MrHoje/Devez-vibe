@@ -7,11 +7,14 @@
 //!
 //! Updating the table: `.knowledge/토큰사용량-단가-갱신.md`.
 
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Cumulative token counts for a thread, split the way billing is: fresh input,
 /// cache writes, cache reads and output each carry their own rate.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Deserialize, Serialize)]
 pub struct TokenTotals {
     pub input_new: u64,
     pub cache_write: u64,
@@ -40,6 +43,54 @@ impl TokenTotals {
 
     pub fn is_empty(self) -> bool {
         self.input_new == 0 && self.cache_write == 0 && self.cache_read == 0 && self.output == 0
+    }
+
+    pub fn delta_from(self, previous: Self) -> Self {
+        Self {
+            input_new: self.input_new.saturating_sub(previous.input_new),
+            cache_write: self.cache_write.saturating_sub(previous.cache_write),
+            cache_read: self.cache_read.saturating_sub(previous.cache_read),
+            output: self.output.saturating_sub(previous.output),
+        }
+    }
+
+    fn add_assign(&mut self, other: Self) {
+        self.input_new = self.input_new.saturating_add(other.input_new);
+        self.cache_write = self.cache_write.saturating_add(other.cache_write);
+        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+        self.output = self.output.saturating_add(other.output);
+    }
+}
+
+/// Cumulative thread usage attributed to the model active when each increment
+/// arrived. A whole-thread figure is only meaningful when every used model has
+/// a published rate, so an unknown segment suppresses the aggregate.
+#[derive(Clone, Default, PartialEq, Eq, Debug, Deserialize, Serialize)]
+pub struct CostLedger {
+    last_total: TokenTotals,
+    by_model: BTreeMap<String, TokenTotals>,
+}
+
+impl CostLedger {
+    pub fn record_cumulative(&mut self, model: &str, total: TokenTotals) {
+        let delta = total.delta_from(self.last_total);
+        self.last_total = total;
+        if !delta.is_empty() {
+            self.by_model
+                .entry(model.to_owned())
+                .or_default()
+                .add_assign(delta);
+        }
+    }
+
+    pub fn estimate_usd(&self) -> Option<f64> {
+        self.by_model.iter().try_fold(0.0, |total, (model, tokens)| {
+            estimate_usd(model, *tokens).map(|cost| total + cost)
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_model.is_empty()
     }
 }
 
@@ -150,5 +201,26 @@ mod tests {
         assert_eq!(format_usd(0.004), "<$0.01");
         assert_eq!(format_usd(0.42), "$0.42");
         assert_eq!(format_usd(12.5), "$12.50");
+    }
+
+    #[test]
+    fn ledger_charges_each_cumulative_delta_at_its_own_model_rate() {
+        let mut ledger = CostLedger::default();
+        ledger.record_cumulative(
+            "gpt-5.6-sol",
+            TokenTotals {
+                input_new: 1_000_000,
+                ..Default::default()
+            },
+        );
+        ledger.record_cumulative(
+            "gpt-5.6-terra",
+            TokenTotals {
+                input_new: 2_000_000,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(ledger.estimate_usd(), Some(7.5));
     }
 }
