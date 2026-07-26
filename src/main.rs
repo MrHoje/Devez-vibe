@@ -220,6 +220,7 @@ async fn start_session(
             model_override,
             cli.cwd.as_ref().map(|_| cwd),
             cwd,
+            state.model_verbosity(),
         ),
         read_account_plan(server),
     )
@@ -322,7 +323,7 @@ async fn await_thread(
                 match event {
                     Some(Ok(Event::Key(key))) => {
                         renderer.clear_selection();
-                        apply_composer_inputs(state, composer_paste.observe(key, Instant::now()))
+                        observe_composer_key(state, &mut composer_paste, key, Instant::now())
                     }
                     Some(Ok(Event::Mouse(mouse))) => renderer_mouse_action(renderer, &mouse, |pick| pick_action(state, pick)),
                     Some(Ok(Event::Paste(text))) => {
@@ -389,6 +390,7 @@ fn hold_until_thread(
         | Action::SetTheme(_)
         | Action::Copy(_)
         | Action::OpenUrl(_)) => Some(action),
+        Action::ScrollToBottom => Some(Action::ScrollToBottom),
         // Once a switch is owed, the prompt belongs to the session being resumed. The
         // session being started is about to be walked away from, and `prepare_resume`
         // forgets a turn id rather than interrupting it, so a turn begun here would
@@ -498,11 +500,13 @@ async fn choose_startup_session(
             View {
                 live_blocks: Vec::new(),
                 overlay: Some(picker.overlay_view()),
+                info_panel_open: false,
                 editor: &editor,
                 composer_images: &[],
                 welcome: None,
                 suggestions: Vec::new(),
                 activity: None,
+                activity_model: None,
                 activity_phase: 0.0,
                 footer: "Resume a Codex session".to_owned(),
                 status_line: None,
@@ -534,7 +538,7 @@ async fn choose_startup_session(
                 if let Action::Copy(text) = action {
                     composer_notice = Some(
                         match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(&text)) {
-                            Ok(()) => format!("Copied {} chars to clipboard", text.chars().count()),
+                            Ok(()) => "Copied to clipboard".to_owned(),
                             Err(error) => format!("복사 실패: {error}"),
                         },
                     );
@@ -650,10 +654,12 @@ async fn event_loop(
                         // Typing means the drag is over and its highlight is
                         // stale, so it goes before the key is acted on.
                         let cleared = renderer.clear_selection();
-                        let action = apply_composer_inputs_with_scroll(
+                        let action = observe_composer_key_with_scroll(
                             state,
                             renderer,
-                            composer_paste.observe(key, Instant::now()),
+                            &mut composer_paste,
+                            key,
+                            Instant::now(),
                         );
                         match action {
                             Action::Tick(false) if cleared => Action::Tick(true),
@@ -866,15 +872,20 @@ fn renderer_mouse_action(
 /// never drift apart. Overlay picks belong to whoever painted the overlay.
 fn pick_action(state: &mut AppState, pick: Pick) -> Action {
     match pick {
-        Pick::PermissionMode => {
-            state.cycle_permission_mode();
+        Pick::ResponseLength => {
+            state.cycle_response_length();
             Action::Tick(true)
         }
         Pick::ShellDisplayMode => Action::PersistShellDisplayMode(state.cycle_shell_display_mode()),
         Pick::DiffDisplayMode => Action::PersistDiffDisplayMode(state.cycle_diff_display_mode()),
+        Pick::InfoPanel => {
+            state.toggle_info_panel();
+            Action::Tick(true)
+        }
         Pick::FastMode => Action::SetFast(!state.effective_fast_mode()),
         Pick::Model => state.run_command("/model"),
         Pick::EffortSetting => state.run_command("/effort"),
+        Pick::ScrollToBottom => Action::ScrollToBottom,
         Pick::Close => state.close_overlay(),
         Pick::Row(index) => state.click_overlay_row(index),
         Pick::Effort(step) => state.click_effort_step(step),
@@ -885,7 +896,13 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
 /// Shift is what keeps these out of the way: plain PageUp/PageDown already move
 /// the cursor in the composer and the selection in every picker.
 fn scroll_request(renderer: &Renderer, key: &KeyEvent) -> Option<isize> {
-    if renderer.mode() != RenderMode::Fullscreen || !key.modifiers.contains(KeyModifiers::SHIFT) {
+    if renderer.mode() != RenderMode::Fullscreen {
+        return None;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Down {
+        return Some(isize::MIN);
+    }
+    if !key.modifiers.contains(KeyModifiers::SHIFT) {
         return None;
     }
     match key.code {
@@ -975,9 +992,14 @@ async fn execute_action(
         | Action::OpenUrl(_)
         | Action::SetTheme(_)
         | Action::ClearScreen
+        | Action::ScrollToBottom
         | Action::Quit) => return execute_local_action(state, renderer, action),
-        Action::Submit(text) => start_turn(server, state, text).await,
+        Action::Submit(text) => {
+            renderer.scroll_to_bottom();
+            start_turn(server, state, text).await
+        }
         Action::Steer(text) => {
+            renderer.scroll_to_bottom();
             let Some(turn_id) = state.turn_id.clone() else {
                 state.set_request_failed("활성 turn ID가 없어 추가 입력을 보낼 수 없습니다.");
                 return Ok(false);
@@ -1776,7 +1798,13 @@ async fn start_new_thread(
     renderer: &mut Renderer,
 ) -> Result<bool> {
     // Read the request out of the old session before it is torn down.
-    let params = new_thread_params(&state.cwd, None, Some(state.service_tier()), "clear");
+    let params = new_thread_params(
+        &state.cwd,
+        None,
+        Some(state.service_tier()),
+        "clear",
+        state.model_verbosity(),
+    );
     let previous_thread = state.thread_id.clone();
 
     renderer.clear_screen()?;
@@ -2050,7 +2078,7 @@ fn execute_local_action(
         Action::Quit => return Ok(true),
         Action::Copy(text) => {
             match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(&text)) {
-                Ok(()) => state.set_copy_notice(text.chars().count()),
+                Ok(()) => state.set_copy_notice(),
                 Err(error) => state.push_notice(BlockKind::Error, "복사 실패", error.to_string()),
             }
         }
@@ -2068,6 +2096,9 @@ fn execute_local_action(
         Action::ClearScreen => {
             state.reset_welcome();
             renderer.clear_screen()?;
+        }
+        Action::ScrollToBottom => {
+            renderer.scroll_to_bottom();
         }
         // `Action::None`, `Action::Tick`, and anything routed here by mistake: the
         // callers only ever pass the variants above, so silently doing nothing is
@@ -2090,9 +2121,12 @@ fn new_thread_params(
     model: Option<&str>,
     service_tier: Option<&str>,
     session_start_source: &str,
+    model_verbosity: &str,
 ) -> Value {
     let mut params = json!({
         "cwd": cwd,
+        "permissions": ":danger-full-access",
+        "config": { "model_verbosity": model_verbosity },
         "sessionStartSource": session_start_source,
         "threadSource": "devez-cli"
     });
@@ -2600,13 +2634,15 @@ fn open_url(url: &str) -> Result<()> {
 async fn start_turn(server: &AppServer, state: &mut AppState, text: String) {
     devezcode::note_prompt(&text);
     let model = state.selected_model_name().to_owned();
+    let effort = state.selected_effort().to_owned();
     state.note_pending_turn_model(&model);
+    state.note_pending_turn_effort(&effort);
     let input = state.turn_input(text);
     let params = json!({
         "threadId": state.thread_id,
         "input": input,
         "model": model,
-        "effort": state.selected_effort(),
+        "effort": effort,
         "serviceTier": state.service_tier(),
         "permissions": state.permission_profile()
     });
@@ -2660,6 +2696,19 @@ fn apply_composer_inputs(state: &mut AppState, inputs: Vec<ComposerInput>) -> Ac
     action
 }
 
+fn observe_composer_key(
+    state: &mut AppState,
+    buffer: &mut ComposerPasteBuffer,
+    key: KeyEvent,
+    now: Instant,
+) -> Action {
+    if state.has_pending_interaction() {
+        state.handle_key(key)
+    } else {
+        apply_composer_inputs(state, buffer.observe(key, now))
+    }
+}
+
 fn apply_composer_inputs_with_scroll(
     state: &mut AppState,
     renderer: &mut Renderer,
@@ -2679,6 +2728,20 @@ fn apply_composer_inputs_with_scroll(
         };
     }
     action
+}
+
+fn observe_composer_key_with_scroll(
+    state: &mut AppState,
+    renderer: &mut Renderer,
+    buffer: &mut ComposerPasteBuffer,
+    key: KeyEvent,
+    now: Instant,
+) -> Action {
+    if state.has_pending_interaction() {
+        state.handle_key(key)
+    } else {
+        apply_composer_inputs_with_scroll(state, renderer, buffer.observe(key, now))
+    }
 }
 
 fn flush_composer_paste(
@@ -2850,6 +2913,7 @@ async fn start_or_resume_thread(
     model: Option<&str>,
     resume_cwd: Option<&Path>,
     new_cwd: &Path,
+    model_verbosity: &str,
 ) -> Result<Value> {
     if let Some(thread_id) = resume {
         let mut params = json!({ "threadId": thread_id });
@@ -2864,7 +2928,13 @@ async fn start_or_resume_thread(
         server
             .request(
                 "thread/start",
-                new_thread_params(new_cwd.to_string_lossy().as_ref(), model, None, "startup"),
+                new_thread_params(
+                    new_cwd.to_string_lossy().as_ref(),
+                    model,
+                    None,
+                    "startup",
+                    model_verbosity,
+                ),
             )
             .await
     }
@@ -3082,22 +3152,26 @@ mod tests {
         KeyEvent::new(code, modifiers)
     }
 
-    /// Clicking the badge has to land on the same code path Shift+Tab does, or
-    /// the two ways of switching mode would drift apart.
     #[test]
-    fn clicking_the_permission_mode_badge_cycles_the_mode() {
+    fn clicking_the_response_badge_cycles_response_length() {
         let mut state = starting_state();
-        let first = state.permission_mode();
 
-        let action = pick_action(&mut state, Pick::PermissionMode);
+        let action = pick_action(&mut state, Pick::ResponseLength);
 
         assert!(matches!(action, Action::Tick(true)));
-        assert_ne!(state.permission_mode(), first);
-        // The same cycle the key walks: one click moves exactly one step.
+        assert_eq!(state.response_length_label(), "Normal");
         state.handle_key(press(KeyCode::BackTab, KeyModifiers::SHIFT));
-        let by_key = state.permission_mode();
-        pick_action(&mut state, Pick::PermissionMode);
-        assert_ne!(state.permission_mode(), by_key);
+        assert_eq!(state.response_length_label(), "Normal");
+    }
+
+    #[test]
+    fn clicking_scroll_to_bottom_requests_the_local_scroll_action() {
+        let mut state = starting_state();
+
+        assert!(matches!(
+            pick_action(&mut state, Pick::ScrollToBottom),
+            Action::ScrollToBottom
+        ));
     }
 
     #[test]
@@ -3109,6 +3183,20 @@ mod tests {
 
         assert!(matches!(action, Action::PersistShellDisplayMode(_)));
         assert_ne!(state.shell_display_mode(), before);
+    }
+
+    #[test]
+    fn clicking_the_panel_badge_toggles_the_info_panel() {
+        let mut state = starting_state();
+
+        assert!(matches!(
+            pick_action(&mut state, Pick::InfoPanel),
+            Action::Tick(true)
+        ));
+        assert!(state.view().info_panel_open);
+
+        pick_action(&mut state, Pick::InfoPanel);
+        assert!(!state.view().info_panel_open);
     }
 
     /// The effort picker only has rows once a model has published its tiers, so
@@ -3180,6 +3268,16 @@ mod tests {
 
         assert!(matches!(action, Action::None));
         assert_eq!(state.selected_model_name(), "gpt-5.6-terra");
+    }
+
+    #[test]
+    fn control_down_returns_a_scrolled_fullscreen_transcript_to_the_latest_row() {
+        let renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+
+        assert_eq!(
+            scroll_request(&renderer, &press(KeyCode::Down, KeyModifiers::CONTROL)),
+            Some(isize::MIN)
+        );
     }
 
     #[test]
@@ -3281,13 +3379,25 @@ mod tests {
     #[test]
     fn fresh_threads_include_the_model_selected_for_the_first_frame() {
         assert_eq!(
-            new_thread_params("C:\\repo", Some("gpt-5.6-terra"), None, "startup"),
+            new_thread_params("C:\\repo", Some("gpt-5.6-terra"), None, "startup", "low"),
             json!({
                 "cwd": "C:\\repo",
                 "model": "gpt-5.6-terra",
+                "permissions": ":danger-full-access",
+                "config": { "model_verbosity": "low" },
                 "sessionStartSource": "startup",
                 "threadSource": "devez-cli"
             })
+        );
+    }
+
+    #[test]
+    fn new_thread_params_include_selected_response_length() {
+        let params = new_thread_params("C:\\repo", None, None, "startup", "low");
+
+        assert_eq!(
+            params.pointer("/config/model_verbosity").and_then(Value::as_str),
+            Some("low")
         );
     }
 
@@ -3407,6 +3517,33 @@ mod tests {
         assert!(state.view().overlay.is_some(), "the effort picker is open");
     }
 
+    #[test]
+    fn buffered_space_toggles_the_selected_statusline_field() {
+        let mut state = state_with_a_model();
+        state.editor.set_text("/statusline");
+        state.handle_key(press(KeyCode::Enter, KeyModifiers::NONE));
+
+        let action = observe_composer_key(
+            &mut state,
+            &mut ComposerPasteBuffer::new(),
+            press(KeyCode::Char(' '), KeyModifiers::NONE),
+            Instant::now(),
+        );
+
+        assert!(matches!(
+            action,
+            Action::PersistStatusLine {
+                key_path: "status_line_branch",
+                enabled: false,
+            }
+        ));
+
+        assert_eq!(
+            state.view().overlay.expect("status line picker").lines[0].text,
+            "☐ Branch"
+        );
+    }
+
     /// The Fast badge is a direct toggle; `/fast` remains the explicit chooser.
     #[test]
     fn clicking_the_fast_badge_toggles_the_service_tier() {
@@ -3444,17 +3581,14 @@ mod tests {
         );
     }
 
-    /// The permission mode is not what either picker is asking about, so the badge
-    /// stays inert until the question on screen is answered — as it is for keys.
     #[test]
-    fn an_open_picker_still_swallows_the_mode_badge() {
+    fn an_open_picker_still_swallows_the_response_badge() {
         let mut state = state_with_a_model();
         pick_action(&mut state, Pick::Model);
-        let mode = state.permission_mode();
 
-        pick_action(&mut state, Pick::PermissionMode);
+        pick_action(&mut state, Pick::ResponseLength);
 
-        assert_eq!(state.permission_mode(), mode);
+        assert_eq!(state.response_length_label(), "Short");
     }
 
     /// Clicking a model row does what typing its number does: takes the model and

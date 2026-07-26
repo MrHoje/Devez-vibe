@@ -38,23 +38,57 @@ const SHIMMER_PERIOD: Duration = Duration::from_millis(1_100);
 /// The permission presets Codex exposes through `/permissions`, cycled with Shift+Tab.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PermissionMode {
-    ReadOnly,
-    Default,
     FullAccess,
+}
+
+/// Controls the desired response length. Codex names the underlying setting
+/// `model_verbosity`, so the mapping is intentionally inverted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResponseLength {
+    #[default]
+    Short,
+    Normal,
+    Detailed,
+}
+
+impl ResponseLength {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Short => "Short",
+            Self::Normal => "Normal",
+            Self::Detailed => "Detailed",
+        }
+    }
+
+    pub fn model_verbosity(self) -> &'static str {
+        match self {
+            Self::Short => "low",
+            Self::Normal => "medium",
+            Self::Detailed => "high",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Short => Self::Normal,
+            Self::Normal => Self::Detailed,
+            Self::Detailed => Self::Short,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ShellDisplayMode {
-    Hide,
     #[default]
+    Hide,
     Collapse,
     Expand,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DiffDisplayMode {
-    Hide,
     #[default]
+    Hide,
     Collapse,
     Expand,
 }
@@ -67,16 +101,18 @@ enum StatusLineField {
     Context,
     FiveHour,
     Weekly,
+    Reset,
 }
 
 impl StatusLineField {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Branch,
         Self::Model,
         Self::Effort,
         Self::Context,
         Self::FiveHour,
         Self::Weekly,
+        Self::Reset,
     ];
 
     const fn label(self) -> &'static str {
@@ -87,6 +123,7 @@ impl StatusLineField {
             Self::Context => "Context",
             Self::FiveHour => "5h limit",
             Self::Weekly => "Weekly limit",
+            Self::Reset => "Reset credits",
         }
     }
 
@@ -98,6 +135,7 @@ impl StatusLineField {
             Self::Context => "status_line_context",
             Self::FiveHour => "status_line_five_hour",
             Self::Weekly => "status_line_weekly",
+            Self::Reset => "status_line_reset",
         }
     }
 
@@ -109,16 +147,17 @@ impl StatusLineField {
             Self::Context => 3,
             Self::FiveHour => 4,
             Self::Weekly => 5,
+            Self::Reset => 6,
         }
     }
 }
 
 #[derive(Clone, Copy)]
-struct StatusLineSettings([bool; 6]);
+struct StatusLineSettings([bool; 7]);
 
 impl Default for StatusLineSettings {
     fn default() -> Self {
-        Self([true; 6])
+        Self([true; 7])
     }
 }
 
@@ -215,12 +254,8 @@ impl ShellDisplayMode {
 }
 
 impl PermissionMode {
-    const CYCLE: [Self; 3] = [Self::ReadOnly, Self::Default, Self::FullAccess];
-
     pub fn label(self) -> &'static str {
         match self {
-            Self::ReadOnly => "Read Only",
-            Self::Default => "Default",
             Self::FullAccess => "Full Access",
         }
     }
@@ -228,27 +263,16 @@ impl PermissionMode {
     /// Built-in permission profile id understood by the app-server.
     pub fn profile(self) -> &'static str {
         match self {
-            Self::ReadOnly => ":read-only",
-            Self::Default => ":workspace",
             Self::FullAccess => ":danger-full-access",
         }
     }
 
     fn accent(self) -> ModeAccent {
         match self {
-            Self::ReadOnly => ModeAccent::Calm,
-            Self::Default => ModeAccent::Safe,
             Self::FullAccess => ModeAccent::Danger,
         }
     }
 
-    fn next(self) -> Self {
-        let index = Self::CYCLE
-            .iter()
-            .position(|candidate| *candidate == self)
-            .unwrap_or(0);
-        Self::CYCLE[(index + 1) % Self::CYCLE.len()]
-    }
 }
 
 struct SlashCommand {
@@ -703,6 +727,7 @@ pub enum Action {
     StartSide(Option<String>),
     ReturnFromSide,
     Compact,
+    ScrollToBottom,
     Copy(String),
     ShowDiff,
     /// Fetch MCP server status and open the picker. Any notice is carried over
@@ -870,6 +895,7 @@ struct ShellBatch {
     completed: HashMap<String, ShellResult>,
 }
 
+#[derive(Clone)]
 struct ShellResult {
     block: Block,
     exit_code: Option<i64>,
@@ -2352,6 +2378,11 @@ pub struct AppState {
     active_order: Vec<String>,
     active: HashMap<String, ActiveItem>,
     shell_batches: HashMap<String, ShellBatch>,
+    /// Completed Shell calls in the current turn. Sequential batches keep
+    /// updating one transcript row instead of leaving one row per command.
+    turn_shell_results: Vec<ShellResult>,
+    turn_shell_anchor: Option<Block>,
+    turn_shell_duration_ms: Option<u64>,
     /// App-server lifecycle notifications can be replayed. An item id belongs
     /// to one logical operation, so only its first completion may reach history.
     completed_item_ids: HashSet<String>,
@@ -2366,12 +2397,15 @@ pub struct AppState {
     token_totals: TokenTotals,
     cost_ledger: Option<CostLedger>,
     pending_turn_model: Option<String>,
+    pending_turn_effort: Option<String>,
     active_turn_model: Option<String>,
+    active_turn_effort: Option<String>,
     cost_restore_due: bool,
     cost_restore_pending: bool,
     context_window: Option<u64>,
     transient_status: Option<String>,
     show_welcome: bool,
+    info_panel_open: bool,
     command_selection: usize,
     spinner_frame: usize,
     turn_started_at: Option<Instant>,
@@ -2383,8 +2417,9 @@ pub struct AppState {
     side_parent: Option<SideParent>,
     last_assistant_markdown: Option<String>,
     composer_notice: Option<(String, Instant)>,
+    activity_notice: Option<(String, Instant)>,
     status_metadata_refreshed_at: Instant,
-    permission_mode: PermissionMode,
+    response_length: ResponseLength,
     shell_display_mode: ShellDisplayMode,
     diff_display_mode: DiffDisplayMode,
     status_line_settings: StatusLineSettings,
@@ -2463,6 +2498,9 @@ impl AppState {
             active_order: Vec::new(),
             active: HashMap::new(),
             shell_batches: HashMap::new(),
+            turn_shell_results: Vec::new(),
+            turn_shell_anchor: None,
+            turn_shell_duration_ms: None,
             completed_item_ids: HashSet::new(),
             seen_operation_signatures: HashSet::new(),
             pending: None,
@@ -2470,12 +2508,15 @@ impl AppState {
             token_totals: TokenTotals::default(),
             cost_ledger: Some(CostLedger::default()),
             pending_turn_model: None,
+            pending_turn_effort: None,
             active_turn_model: None,
+            active_turn_effort: None,
             cost_restore_due: false,
             cost_restore_pending: false,
             context_window,
             transient_status: None,
             show_welcome: true,
+            info_panel_open: false,
             command_selection: 0,
             spinner_frame: 0,
             turn_started_at: None,
@@ -2487,8 +2528,9 @@ impl AppState {
             side_parent: None,
             last_assistant_markdown: None,
             composer_notice: None,
+            activity_notice: None,
             status_metadata_refreshed_at: Instant::now(),
-            permission_mode: read_permission_mode(),
+            response_length: ResponseLength::default(),
             shell_display_mode: read_shell_display_mode(),
             diff_display_mode: read_diff_display_mode(),
             status_line_settings: read_status_line_settings(),
@@ -2588,6 +2630,10 @@ impl AppState {
         self.pending_turn_model = Some(model.to_owned());
     }
 
+    pub fn note_pending_turn_effort(&mut self, effort: &str) {
+        self.pending_turn_effort = Some(effort.to_owned());
+    }
+
     /// Resumed history cannot be priced until its local rollout is restored.
     /// Keeping the ledger absent avoids charging all historical usage at the
     /// model currently selected in the picker.
@@ -2647,6 +2693,12 @@ impl AppState {
 
     pub fn set_account_plan(&mut self, plan: AccountPlan) {
         self.account_plan = plan;
+    }
+
+    /// Picker keys must bypass the composer paste buffer so controls such as
+    /// Space reach their pending interaction immediately.
+    pub fn has_pending_interaction(&self) -> bool {
+        self.pending.is_some()
     }
 
     pub fn update_skills(&mut self, response: &Value) {
@@ -2905,7 +2957,7 @@ impl AppState {
     }
 
     pub fn permission_mode(&self) -> PermissionMode {
-        self.permission_mode
+        PermissionMode::FullAccess
     }
 
     pub fn shell_display_mode(&self) -> ShellDisplayMode {
@@ -2918,17 +2970,27 @@ impl AppState {
 
     /// Permission profile id to send with `turn/start`.
     pub fn permission_profile(&self) -> &'static str {
-        self.permission_mode().profile()
+        PermissionMode::FullAccess.profile()
+    }
+
+    pub fn response_length_label(&self) -> &'static str {
+        self.response_length.label()
+    }
+
+    pub fn model_verbosity(&self) -> &'static str {
+        self.response_length.model_verbosity()
     }
 
     fn composer_mode(&self) -> ComposerMode {
         ComposerMode {
             label: self.permission_mode().label().to_owned(),
             accent: self.permission_mode().accent(),
+            response_length: self.response_length_label().to_owned(),
             fast_mode: self.effective_fast_mode(),
             effort: self.selected_effort.clone(),
             shell_display_mode: self.shell_display_mode().label().to_owned(),
             diff_display_mode: self.diff_display_mode().label().to_owned(),
+            info_panel_open: self.info_panel_open,
             cost: self.estimated_cost(),
         }
     }
@@ -2998,8 +3060,8 @@ impl AppState {
         ));
     }
 
-    pub fn set_copy_notice(&mut self, count: usize) {
-        self.set_composer_notice(format!("Copied {count} chars to clipboard"));
+    pub fn set_copy_notice(&mut self) {
+        self.activity_notice = Some(("Copied to clipboard".to_owned(), Instant::now()));
     }
 
     /// One-off events (skills reloaded, model rerouted, …) share the composer
@@ -3169,6 +3231,9 @@ impl AppState {
     fn reset_turn_item_tracking(&mut self) {
         self.completed_item_ids.clear();
         self.seen_operation_signatures.clear();
+        self.turn_shell_results.clear();
+        self.turn_shell_anchor = None;
+        self.turn_shell_duration_ms = None;
     }
 
     fn push_unique_operation(&mut self, block: Block) {
@@ -3324,7 +3389,9 @@ impl AppState {
         self.token_totals = TokenTotals::default();
         self.cost_ledger = Some(CostLedger::default());
         self.pending_turn_model = None;
+        self.pending_turn_effort = None;
         self.active_turn_model = None;
+        self.active_turn_effort = None;
         self.cost_restore_due = false;
         self.cost_restore_pending = false;
         self.context_window = None;
@@ -3332,6 +3399,7 @@ impl AppState {
         self.side_parent = None;
         self.last_assistant_markdown = None;
         self.composer_notice = None;
+        self.activity_notice = None;
         self.show_welcome = false;
         self.busy = false;
         self.turn_id = None;
@@ -3379,9 +3447,9 @@ impl AppState {
         let mut committed = std::mem::take(&mut self.committed);
         if self.shell_display_mode == ShellDisplayMode::Hide {
             // Inline transcript rows become permanent as soon as they are
-            // handed to the renderer. Drop Shell blocks here so a transient
-            // running anchor cannot flash for one frame and disappear later.
-            committed.retain(|block| !is_shell_block(block));
+            // handed to the renderer. Drop Shell and Web Search blocks here
+            // so they cannot flash for one frame and disappear later.
+            committed.retain(|block| !is_shell_hidden_block(block));
         }
         committed
     }
@@ -3398,7 +3466,7 @@ impl AppState {
             .filter_map(|item| {
                 if item.shell_batch.is_some()
                     || (self.shell_display_mode == ShellDisplayMode::Hide
-                        && is_running_shell_block(&item.block))
+                        && is_shell_hidden_block(&item.block))
                     || is_empty_thinking(&item.block)
                 {
                     return None;
@@ -3414,6 +3482,7 @@ impl AppState {
         View {
             live_blocks,
             overlay: self.overlay_view(),
+            info_panel_open: self.info_panel_open,
             editor: &self.editor,
             composer_images: &self.composer_images,
             welcome: self.show_welcome.then(|| self.welcome_view()),
@@ -3424,6 +3493,7 @@ impl AppState {
                 Vec::new()
             },
             activity: self.activity(),
+            activity_model: self.activity_model(),
             activity_phase: self.activity_phase(),
             footer: self
                 .status_line_has_content()
@@ -3457,6 +3527,14 @@ impl AppState {
             .is_some_and(|(_, shown_at)| shown_at.elapsed().as_millis() >= 1_400)
         {
             self.composer_notice = None;
+            redraw = true;
+        }
+        if self
+            .activity_notice
+            .as_ref()
+            .is_some_and(|(_, shown_at)| shown_at.elapsed().as_millis() >= 1_400)
+        {
+            self.activity_notice = None;
             redraw = true;
         }
         redraw
@@ -3518,6 +3596,10 @@ impl AppState {
 
         if key.modifiers == KeyModifiers::SHIFT {
             match key.code {
+                KeyCode::Char('P') | KeyCode::Char('p') => {
+                    self.toggle_info_panel();
+                    return Action::Tick(true);
+                }
                 KeyCode::Up => {
                     self.move_selected_model(-1);
                     return Action::None;
@@ -3653,10 +3735,7 @@ impl AppState {
 
         match key.code {
             // Shift+Tab arrives as BackTab on terminals without the Kitty keyboard protocol.
-            KeyCode::BackTab => {
-                self.cycle_permission_mode();
-                Action::None
-            }
+            KeyCode::BackTab => Action::None,
             KeyCode::Char('c') if ctrl => {
                 if self.busy {
                     self.request_interrupt()
@@ -4041,6 +4120,10 @@ impl AppState {
                         .pending_turn_model
                         .take()
                         .or_else(|| Some(self.selected_model_name().to_owned()));
+                    self.active_turn_effort = self
+                        .pending_turn_effort
+                        .take()
+                        .or_else(|| Some(self.selected_effort.clone()));
                     self.set_turn_started(turn_id.to_owned());
                 }
             }
@@ -4308,14 +4391,14 @@ impl AppState {
         }
     }
 
-    fn run_slash_command(&mut self, command: &str) -> Action {
+    pub(crate) fn run_slash_command(&mut self, command: &str) -> Action {
         let parts = command.split_whitespace().collect::<Vec<_>>();
         match parts.first().copied().unwrap_or_default() {
             "/help" => {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    "/model [MODEL] [EFFORT]  모델과 effort 선택\n/fast [on|off]  Fast 서비스 티어 선택\n/effort [LEVEL]  추론 수준\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/login  ChatGPT 계정 로그인\n/logout  계정 연결 해제\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nShift+Tab  권한 모드 전환 (Read Only / Default / Full Access)\nCtrl+Enter / Shift+Enter  줄바꿈",
+                    "/model [MODEL] [EFFORT]  모델과 effort 선택\n/fast [on|off]  Fast 서비스 티어 선택\n/effort [LEVEL]  추론 수준\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/login  ChatGPT 계정 로그인\n/logout  계정 연결 해제\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈",
                 ));
                 Action::None
             }
@@ -4625,8 +4708,8 @@ impl AppState {
                         self.thread_id,
                         self.selected_effort,
                         theme::current().display_name(),
-                        self.permission_mode.label(),
-                        self.permission_mode.profile(),
+                        self.permission_mode().label(),
+                        self.permission_mode().profile(),
                         self.cwd
                     ),
                 ));
@@ -5930,19 +6013,31 @@ impl AppState {
     /// draw attention to a delay the user is about to spend typing through anyway.
     /// A prompt sent into that window still reports as `Working`, because it is.
     fn activity(&self) -> Option<String> {
+        if let Some((notice, _)) = &self.activity_notice {
+            return Some(notice.clone());
+        }
         if self.busy {
             let elapsed = self
                 .turn_started_at
                 .map(|started| started.elapsed().as_secs())
                 .unwrap_or(0);
-            return Some(format!(
-                "{} Working ({} • esc to interrupt)",
-                SPINNER[self.spinner_frame],
-                format_elapsed(elapsed)
-            ));
+            return Some(format!("Working.. ({})", format_elapsed(elapsed)));
         }
         self.last_completed_duration
-            .map(|duration| format!("✓ Completed ({})", format_elapsed(duration.as_secs())))
+            .map(|duration| format!("Completed ({})", format_elapsed(duration.as_secs())))
+    }
+
+    fn activity_model(&self) -> Option<String> {
+        if self.activity_notice.is_some() || (!self.busy && self.last_completed_duration.is_none()) {
+            return None;
+        }
+        Some(
+            self.active_turn_model
+                .as_deref()
+                .or(self.pending_turn_model.as_deref())
+                .unwrap_or_else(|| self.selected_model_name())
+                .to_owned(),
+        )
     }
 
     /// The shimmer sweeps the `Working` label once per `SHIMMER_PERIOD`, read off
@@ -6000,7 +6095,7 @@ impl AppState {
                 .flatten(),
             reset_credits: self
                 .status_line_settings
-                .enabled(StatusLineField::Weekly)
+                .enabled(StatusLineField::Reset)
                 .then(|| self.account_plan.status_line_reset())
                 .flatten(),
             notice: self.transient_status.clone(),
@@ -6087,6 +6182,7 @@ impl AppState {
             .map(|effort| effort.id.clone());
         if let Some(model) = model {
             self.select_model_and_effort(&model, effort.as_deref());
+            self.notice_setting_applies_to_next_request();
         }
     }
 
@@ -6111,18 +6207,22 @@ impl AppState {
         if next_index != current_index {
             if let Some(effort) = effort {
                 self.selected_effort = effort;
+                self.notice_setting_applies_to_next_request();
             }
         }
     }
 
-    /// Shift+Tab reaches this only with nothing pending, since a prompt takes
-    /// every key first. A click on the badge has no such gate of its own, so the
-    /// gate lives here and both entry points read the same.
-    pub fn cycle_permission_mode(&mut self) {
-        if self.pending.is_some() {
-            return;
+    fn notice_setting_applies_to_next_request(&mut self) {
+        if self.busy {
+            self.set_composer_notice("Applies to the next request".to_owned());
         }
-        self.permission_mode = self.permission_mode.next();
+    }
+
+    pub fn cycle_response_length(&mut self) {
+        if self.pending.is_none() {
+            self.response_length = self.response_length.next();
+            self.notice_setting_applies_to_next_request();
+        }
     }
 
     pub fn cycle_shell_display_mode(&mut self) -> ShellDisplayMode {
@@ -6133,6 +6233,10 @@ impl AppState {
     pub fn cycle_diff_display_mode(&mut self) -> DiffDisplayMode {
         self.diff_display_mode = self.diff_display_mode.next();
         self.diff_display_mode
+    }
+
+    pub fn toggle_info_panel(&mut self) {
+        self.info_panel_open = !self.info_panel_open;
     }
 
     /// Runs a slash command the composer never typed — what a click on the
@@ -6460,24 +6564,7 @@ impl AppState {
         if !was_active {
             self.active_order.push(id.to_owned());
             if let Some(batch_id) = shell_batch.as_ref() {
-                if !self.shell_batches.contains_key(batch_id) {
-                    let mut anchor = Block::new(BlockKind::Tool, "Running 1 shell command", "");
-                    anchor.adopt_id(&block);
-                    self.committed.push(anchor.clone());
-                    self.shell_batches.insert(
-                        batch_id.clone(),
-                        ShellBatch {
-                            anchor,
-                            members: Vec::new(),
-                            completed: HashMap::new(),
-                        },
-                    );
-                }
-                self.shell_batches
-                    .get_mut(batch_id)
-                    .expect("shell batch inserted")
-                    .members
-                    .push(id.to_owned());
+                self.register_shell_member(batch_id, id, &block);
             }
         }
         self.active
@@ -6593,12 +6680,21 @@ impl AppState {
         active.shell_batch = Some(batch_id.clone());
         active.block.title = "Shell · command".to_owned();
 
-        if !self.shell_batches.contains_key(&batch_id) {
-            let mut anchor = Block::new(BlockKind::Tool, "Running 1 shell command", "");
-            anchor.adopt_id(&active.block);
-            self.committed.push(anchor.clone());
+        let block = active.block.clone();
+        self.register_shell_member(&batch_id, item_id, &block);
+    }
+
+    fn register_shell_member(&mut self, batch_id: &str, item_id: &str, source: &Block) {
+        if !self.shell_batches.contains_key(batch_id) {
+            let mut anchor = self.turn_shell_anchor.clone().unwrap_or_else(|| {
+                let mut anchor = Block::new(BlockKind::Tool, "", "");
+                anchor.adopt_id(source);
+                anchor
+            });
+            anchor.kind = BlockKind::Tool;
+            self.turn_shell_anchor = Some(anchor.clone());
             self.shell_batches.insert(
-                batch_id.clone(),
+                batch_id.to_owned(),
                 ShellBatch {
                     anchor,
                     members: Vec::new(),
@@ -6606,11 +6702,33 @@ impl AppState {
                 },
             );
         }
-        self.shell_batches
-            .get_mut(&batch_id)
-            .expect("shell batch inserted")
-            .members
-            .push(item_id.to_owned());
+
+        let batch = self
+            .shell_batches
+            .get_mut(batch_id)
+            .expect("shell batch inserted");
+        if !batch.members.iter().any(|member| member == item_id) {
+            batch.members.push(item_id.to_owned());
+        }
+        let count = self.turn_shell_results.len() + batch.members.len();
+        let noun = if count == 1 { "command" } else { "commands" };
+        batch.anchor.title = format!("Running {count} shell {noun}");
+        batch.anchor.kind = BlockKind::Tool;
+        let anchor = batch.anchor.clone();
+        self.turn_shell_anchor = Some(anchor.clone());
+        self.commit_replacing(anchor);
+    }
+
+    fn commit_replacing(&mut self, block: Block) {
+        if let Some(existing) = self
+            .committed
+            .iter_mut()
+            .find(|existing| existing.id() == block.id())
+        {
+            *existing = block;
+        } else {
+            self.committed.push(block);
+        }
     }
 
     fn ensure_active(&mut self, item_id: &str, kind: BlockKind, title: &str) -> &mut ActiveItem {
@@ -6651,12 +6769,32 @@ impl AppState {
             .iter()
             .filter_map(|id| batch.completed.remove(id))
             .collect::<Vec<_>>();
-        let mut completed = shell_results_block(results);
-        completed.adopt_id(&batch.anchor);
-        self.committed.push(completed);
+        self.commit_turn_shell_results(results, &batch.anchor);
+    }
+
+    fn commit_turn_shell_results(&mut self, results: Vec<ShellResult>, anchor: &Block) {
+        if results.is_empty() {
+            return;
+        }
+        if let Some(batch_duration) = results.iter().filter_map(|result| result.duration_ms).max() {
+            self.turn_shell_duration_ms = Some(
+                self.turn_shell_duration_ms
+                    .unwrap_or(0)
+                    .saturating_add(batch_duration),
+            );
+        }
+        self.turn_shell_results.extend(results);
+        let mut completed = shell_results_block_with_duration(
+            self.turn_shell_results.clone(),
+            self.turn_shell_duration_ms,
+        );
+        completed.adopt_id(self.turn_shell_anchor.as_ref().unwrap_or(anchor));
+        self.turn_shell_anchor = Some(completed.clone());
+        self.commit_replacing(completed);
     }
 
     fn flush_orphaned_active(&mut self) {
+        let mut shell_updates = Vec::new();
         for (_, mut batch) in std::mem::take(&mut self.shell_batches) {
             let mut results = Vec::new();
             for id in &batch.members {
@@ -6674,10 +6812,11 @@ impl AppState {
                 }
             }
             if !results.is_empty() {
-                let mut completed = shell_results_block(results);
-                completed.adopt_id(&batch.anchor);
-                self.committed.push(completed);
+                shell_updates.push((results, batch.anchor));
             }
+        }
+        for (results, anchor) in shell_updates {
+            self.commit_turn_shell_results(results, &anchor);
         }
         for id in std::mem::take(&mut self.active_order) {
             if let Some(item) = self.active.remove(&id) {
@@ -6872,6 +7011,15 @@ fn is_shell_block(block: &Block) -> bool {
     block.title.starts_with("Shell ·") || is_running_shell_block(block)
 }
 
+fn is_web_search_block(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::Tool)
+        && (block.title == "Web search" || block.title.starts_with("Web search ·"))
+}
+
+fn is_shell_hidden_block(block: &Block) -> bool {
+    is_shell_block(block) || is_web_search_block(block)
+}
+
 /// Operations whose repeated cards add no information. The body participates
 /// in the signature, so two calls to the same tool with different results stay
 /// visible; Web Search includes its query in the title for the same reason.
@@ -7045,27 +7193,20 @@ fn merged_turn_blocks(
             order += 1;
         }
     }
-    let mut seen_exec_groups = HashSet::new();
+    let mut emitted_shell_group = false;
     for event in &events {
         let block = match &event.kind {
-            RolloutKind::Exec { group_id, .. } => {
-                if !seen_exec_groups.insert(group_id.as_str()) {
+            RolloutKind::Exec { .. } => {
+                if emitted_shell_group {
                     continue;
                 }
+                emitted_shell_group = true;
                 let group = events
                     .iter()
                     .copied()
-                    .filter(|candidate| {
-                        matches!(
-                            &candidate.kind,
-                            RolloutKind::Exec {
-                                group_id: candidate_group,
-                                ..
-                            } if candidate_group == group_id
-                        )
-                    })
+                    .filter(|candidate| matches!(candidate.kind, RolloutKind::Exec { .. }))
                     .collect::<Vec<_>>();
-                shell_events_block(&group)
+                turn_shell_events_block(&group)
             }
             _ => event_block(event),
         };
@@ -7224,14 +7365,60 @@ fn shell_events_block(events: &[&RolloutEvent]) -> Option<Block> {
     (results.len() == events.len()).then(|| shell_results_block(results))
 }
 
+fn turn_shell_events_block(events: &[&RolloutEvent]) -> Option<Block> {
+    let mut group_durations = HashMap::<&str, u64>::new();
+    for event in events {
+        if let RolloutKind::Exec {
+            group_id,
+            duration_ms: Some(duration_ms),
+            ..
+        } = &event.kind
+        {
+            group_durations
+                .entry(group_id.as_str())
+                .and_modify(|duration| *duration = (*duration).max(*duration_ms))
+                .or_insert(*duration_ms);
+        }
+    }
+    let duration_ms =
+        (!group_durations.is_empty()).then(|| group_durations.values().copied().sum());
+    let mut block = shell_events_block(events)?;
+    if events.len() > 1 {
+        let results = events
+            .iter()
+            .filter_map(|event| {
+                let RolloutKind::Exec {
+                    exit_code,
+                    duration_ms,
+                    ..
+                } = &event.kind
+                else {
+                    return None;
+                };
+                Some(ShellResult {
+                    block: event_block(event)?,
+                    exit_code: *exit_code,
+                    duration_ms: *duration_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+        block = shell_results_block_with_duration(results, duration_ms);
+    }
+    Some(block)
+}
+
 fn shell_results_block(results: Vec<ShellResult>) -> Block {
+    let duration_ms = results.iter().filter_map(|result| result.duration_ms).max();
+    shell_results_block_with_duration(results, duration_ms)
+}
+
+fn shell_results_block_with_duration(results: Vec<ShellResult>, duration_ms: Option<u64>) -> Block {
     assert!(!results.is_empty(), "shell group needs at least one result");
 
     let failed = results
         .iter()
         .filter(|result| result.exit_code.is_some_and(|code| code != 0))
         .count();
-    let duration_ms = results.iter().filter_map(|result| result.duration_ms).max();
     let status = if failed > 0 {
         format!("{failed} failed")
     } else {
@@ -7679,13 +7866,6 @@ fn read_fast_mode() -> bool {
         .is_some_and(|config| parse_fast_mode(&config))
 }
 
-fn read_permission_mode() -> PermissionMode {
-    codex_home()
-        .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
-        .and_then(|config| parse_permission_mode(&config))
-        .unwrap_or(PermissionMode::Default)
-}
-
 fn read_shell_display_mode() -> ShellDisplayMode {
     codex_home()
         .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
@@ -7755,30 +7935,6 @@ fn parse_status_line_field(config: &str, field: StatusLineField) -> Option<bool>
                 {
                     "true" => Some(true),
                     "false" => Some(false),
-                    _ => None,
-                }
-            })
-        })
-        .flatten()
-}
-
-fn parse_permission_mode(config: &str) -> Option<PermissionMode> {
-    config
-        .lines()
-        .take_while(|line| !line.trim_start().starts_with('['))
-        .filter_map(|line| line.split('#').next())
-        .filter_map(|line| line.split_once('='))
-        .find_map(|(key, value)| {
-            (key.trim() == "sandbox_mode").then(|| {
-                match value
-                    .trim()
-                    .trim_matches(['"', '\''])
-                    .to_ascii_lowercase()
-                    .as_str()
-                {
-                    "read-only" => Some(PermissionMode::ReadOnly),
-                    "workspace-write" => Some(PermissionMode::Default),
-                    "danger-full-access" => Some(PermissionMode::FullAccess),
                     _ => None,
                 }
             })
@@ -7886,6 +8042,36 @@ mod tests {
     }
 
     #[test]
+    fn permission_profile_is_fixed_to_full_access() {
+        let mut state = test_state();
+
+        state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+
+        assert_eq!(state.permission_mode(), PermissionMode::FullAccess);
+        assert_eq!(state.permission_profile(), ":danger-full-access");
+    }
+
+    #[test]
+    fn response_length_cycles_from_short_to_normal_to_detailed() {
+        let mut state = test_state();
+
+        assert_eq!(state.response_length_label(), "Short");
+        assert_eq!(state.model_verbosity(), "low");
+        state.cycle_response_length();
+        assert_eq!(state.response_length_label(), "Normal");
+        assert_eq!(state.model_verbosity(), "medium");
+        state.cycle_response_length();
+        assert_eq!(state.response_length_label(), "Detailed");
+        assert_eq!(state.model_verbosity(), "high");
+    }
+
+    #[test]
+    fn transcript_display_defaults_to_hidden_shell_and_diff() {
+        assert_eq!(ShellDisplayMode::default(), ShellDisplayMode::Hide);
+        assert_eq!(DiffDisplayMode::default(), DiffDisplayMode::Hide);
+    }
+
+    #[test]
     fn shifted_arrows_change_model_and_effort_without_wrapping() {
         let mut state = test_state();
         state
@@ -7917,6 +8103,42 @@ mod tests {
         state.handle_key(KeyEvent::new(KeyCode::Right, shift));
         assert_eq!(state.selected_effort(), "ultra");
         assert!(state.committed.is_empty());
+    }
+
+    #[test]
+    fn shift_p_toggles_the_info_panel_without_editing_the_composer() {
+        let mut state = test_state();
+
+        let action = state.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
+
+        assert!(matches!(action, Action::Tick(true)));
+        assert!(state.editor.is_empty());
+    }
+
+    #[test]
+    fn shifted_model_and_effort_changes_announce_the_next_request_while_busy() {
+        let mut state = test_state();
+        state
+            .models
+            .push(test_model("gpt-5.6-terra", "GPT-5.6 Terra", false));
+        state.busy = true;
+
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_eq!(
+            state.view().composer_notice.as_deref(),
+            Some("Applies to the next request")
+        );
+
+        state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        assert_eq!(
+            state.view().composer_notice.as_deref(),
+            Some("Applies to the next request")
+        );
+
+        state.busy = false;
+        state.composer_notice = None;
+        state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        assert_eq!(state.view().composer_notice, None);
     }
 
     #[test]
@@ -7992,7 +8214,7 @@ mod tests {
 
         assert!(titles.is_empty());
         assert_eq!(state.committed.len(), 1);
-        assert_eq!(state.committed[0].title, "Running 1 shell command");
+        assert_eq!(state.committed[0].title, "Running 2 shell commands");
     }
 
     #[test]
@@ -8061,7 +8283,7 @@ mod tests {
     }
 
     #[test]
-    fn hide_never_hands_shell_rows_to_the_renderer() {
+    fn hide_never_hands_shell_or_web_search_rows_to_the_renderer() {
         let mut state = test_state();
         state.show_welcome = false;
         state.shell_display_mode = ShellDisplayMode::Hide;
@@ -8079,6 +8301,22 @@ mod tests {
             "command": "rg TODO",
             "status": "completed",
             "exitCode": 0
+        }));
+
+        assert!(state.drain_committed().is_empty());
+
+        state.start_item(&json!({
+            "id": "search-1",
+            "type": "webSearch",
+            "query": "rust ownership"
+        }));
+
+        assert!(state.view().live_blocks.is_empty());
+
+        state.complete_item(&json!({
+            "id": "search-1",
+            "type": "webSearch",
+            "query": "rust ownership"
         }));
 
         assert!(state.drain_committed().is_empty());
@@ -8195,6 +8433,7 @@ mod tests {
     fn web_search_replays_and_repeated_queries_are_deduplicated() {
         let mut state = test_state();
         state.show_welcome = false;
+        state.shell_display_mode = ShellDisplayMode::Collapse;
         state.set_turn_started("turn-1".to_owned());
 
         for id in ["search-1", "search-2"] {
@@ -8241,6 +8480,7 @@ mod tests {
     fn operation_deduplication_resets_for_each_turn() {
         let mut state = test_state();
         state.show_welcome = false;
+        state.shell_display_mode = ShellDisplayMode::Collapse;
         for (turn, id) in [("turn-1", "search-1"), ("turn-2", "search-2")] {
             state.set_turn_started(turn.to_owned());
             state.complete_item(&json!({
@@ -8390,12 +8630,16 @@ mod tests {
     }
 
     #[test]
-    fn sequential_shells_are_separate() {
+    fn sequential_shells_update_one_turn_group() {
         let mut state = test_state();
         state.show_welcome = false;
         state.shell_display_mode = ShellDisplayMode::Collapse;
-        let mut completed = Vec::new();
-        for (id, command) in [("cmd-1", "rg TODO"), ("cmd-2", "git status --short")] {
+        state.set_turn_started("turn-1".to_owned());
+        let mut group_id = None;
+        for (id, command, duration_ms) in [
+            ("cmd-1", "rg TODO", 700),
+            ("cmd-2", "git status --short", 800),
+        ] {
             state.start_item(&json!({
                 "id": id,
                 "type": "commandExecution",
@@ -8403,29 +8647,31 @@ mod tests {
             }));
             let anchors = state.drain_committed();
             assert_eq!(anchors.len(), 1);
+            if let Some(group_id) = group_id {
+                assert_eq!(anchors[0].id(), group_id);
+            }
+            group_id = Some(anchors[0].id());
             state.complete_item(&json!({
                 "id": id,
                 "type": "commandExecution",
                 "command": command,
                 "status": "completed",
-                "exitCode": 0
+                "exitCode": if id == "cmd-2" { 1 } else { 0 },
+                "durationMs": duration_ms
             }));
-            completed.extend(state.drain_committed());
+            let completed = state.drain_committed();
+            assert_eq!(completed.len(), 1);
+            assert_eq!(completed[0].id(), group_id.expect("group id"));
         }
 
-        assert_eq!(completed.len(), 2);
-        assert!(
-            completed
-                .iter()
-                .all(|block| block.title == "Shell · 1 command · completed")
-        );
-        assert!(completed.iter().all(|block| block.children().len() == 1));
-        assert!(completed[0].children()[0].title.contains("rg TODO"));
-        assert!(
-            completed[1].children()[0]
-                .title
-                .contains("git status --short")
-        );
+        let completed = state
+            .turn_shell_anchor
+            .as_ref()
+            .expect("completed turn shell group");
+        assert_eq!(completed.title, "Shell · 2 commands · 1 failed · 1.5s");
+        assert_eq!(completed.children().len(), 2);
+        assert!(completed.children()[0].title.contains("rg TODO"));
+        assert!(completed.children()[1].title.contains("git status --short"));
     }
 
     /// A turn covering 15:08:28–15:12:59 UTC on 2026-07-25, matching the
@@ -8502,6 +8748,28 @@ mod tests {
             shell.children()[1].title,
             "Shell · git status --short · exit 1 · 4.1s"
         );
+    }
+
+    #[test]
+    fn resumed_sequential_execs_become_one_turn_shell_group() {
+        let mut state = test_state();
+        let rollout = crate::rollout::parse(
+            r#"{"timestamp":"2026-07-25T15:08:36.373Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_one","input":"await tools.shell_command({\"command\":\"rg TODO\"});","internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"}}}
+{"timestamp":"2026-07-25T15:08:37.010Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_one","output":[{"type":"input_text","text":"Wall time 0.7 seconds\n"},{"type":"input_text","text":"Exit code: 0\nOutput:\nmatch\n"}]}}
+{"timestamp":"2026-07-25T15:08:38.373Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_two","input":"await tools.shell_command({\"command\":\"git status --short\"});","internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"}}}
+{"timestamp":"2026-07-25T15:08:39.010Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_two","output":[{"type":"input_text","text":"Wall time 0.8 seconds\n"},{"type":"input_text","text":"Exit code: 1\nOutput:\nfailed\n"}]}}"#,
+        );
+
+        state.load_history(&history_thread(), Some(&rollout));
+
+        let shells = state
+            .committed
+            .iter()
+            .filter(|block| block.title.starts_with("Shell ·"))
+            .collect::<Vec<_>>();
+        assert_eq!(shells.len(), 1);
+        assert_eq!(shells[0].title, "Shell · 2 commands · 1 failed · 1.5s");
+        assert_eq!(shells[0].children().len(), 2);
     }
 
     #[test]
@@ -8644,28 +8912,18 @@ mod tests {
     }
 
     #[test]
-    fn shift_tab_cycles_permission_modes_and_wraps() {
+    fn shift_tab_leaves_fixed_full_access_unchanged() {
         let mut state = test_state();
-        state.permission_mode = PermissionMode::ReadOnly;
+        let action = state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
 
-        let expected = [
-            PermissionMode::Default,
-            PermissionMode::FullAccess,
-            PermissionMode::ReadOnly,
-        ];
-        for mode in expected {
-            let action = state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-
-            assert!(matches!(action, Action::None));
-            assert_eq!(state.permission_mode(), mode);
-        }
-        assert_eq!(state.permission_profile(), ":read-only");
+        assert!(matches!(action, Action::None));
+        assert_eq!(state.permission_mode(), PermissionMode::FullAccess);
+        assert_eq!(state.permission_profile(), ":danger-full-access");
     }
 
     #[test]
     fn shift_tab_still_cycles_while_a_slash_command_is_being_typed() {
         let mut state = test_state();
-        state.permission_mode = PermissionMode::Default;
         state.editor.insert_str("/mo");
 
         state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
@@ -9096,28 +9354,6 @@ mod tests {
     }
 
     #[test]
-    fn permission_mode_starts_from_the_configured_sandbox_mode() {
-        assert_eq!(
-            parse_permission_mode("sandbox_mode = \"danger-full-access\"\n"),
-            Some(PermissionMode::FullAccess)
-        );
-        assert_eq!(
-            parse_permission_mode("approval_policy = \"never\"\nsandbox_mode = \"read-only\"\n"),
-            Some(PermissionMode::ReadOnly)
-        );
-        assert_eq!(
-            parse_permission_mode("sandbox_mode = \"workspace-write\"\n"),
-            Some(PermissionMode::Default)
-        );
-        // Values under a table header belong to that table, not the root config.
-        assert_eq!(
-            parse_permission_mode("[windows]\nsandbox_mode = \"read-only\"\n"),
-            None
-        );
-        assert_eq!(parse_permission_mode("model = \"gpt-5.6\"\n"), None);
-    }
-
-    #[test]
     fn shell_display_mode_starts_from_the_configured_default() {
         assert_eq!(
             parse_shell_display_mode("shell_display_mode = \"expand\"\n"),
@@ -9162,8 +9398,6 @@ mod tests {
     #[test]
     fn status_command_reports_the_active_permission_profile() {
         let mut state = test_state();
-        state.permission_mode = PermissionMode::FullAccess;
-
         state.run_slash_command("/status");
 
         let body = &state.committed.last().expect("status block").body;
@@ -9191,6 +9425,7 @@ mod tests {
                 "☑ Context",
                 "☑ 5h limit",
                 "☑ Weekly limit",
+                "☑ Reset credits",
             ]
         );
         assert!(overlay.lines[0].selected);
@@ -9228,6 +9463,26 @@ mod tests {
         let overlay = state.overlay_view().expect("status line picker stays open");
         assert_eq!(overlay.lines[2].text, "☐ Effort");
         assert!(overlay.lines[2].selected);
+    }
+
+    #[test]
+    fn statusline_reset_checkbox_persists_its_own_setting() {
+        let mut state = test_state();
+        state.run_slash_command("/statusline");
+
+        let action = state.click_overlay_row(6);
+
+        assert!(matches!(
+            action,
+            Action::PersistStatusLine {
+                key_path: "status_line_reset",
+                enabled: false,
+            }
+        ));
+        assert_eq!(
+            state.overlay_view().expect("status line picker").lines[6].text,
+            "☐ Reset credits"
+        );
     }
 
     #[test]
@@ -9321,19 +9576,18 @@ mod tests {
     }
 
     #[test]
-    fn composer_badge_carries_both_permission_mode_and_fast_tier() {
+    fn composer_badge_carries_fixed_access_and_fast_tier() {
         let mut state = test_state();
-        state.permission_mode = PermissionMode::ReadOnly;
         state.set_fast_mode(false);
 
         let badge = state.composer_mode();
 
-        assert_eq!(badge.label, "Read Only");
+        assert_eq!(badge.label, "Full Access");
+        assert_eq!(badge.response_length, "Short");
         assert!(!badge.fast_mode);
 
         state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-
-        assert_eq!(state.composer_mode().label, "Default");
+        assert_eq!(state.composer_mode().label, "Full Access");
     }
 
     #[test]
@@ -9826,7 +10080,45 @@ mod tests {
             None,
         );
 
-        assert_eq!(state.activity().as_deref(), Some("✓ Completed (1m 5s)"));
+        assert_eq!(
+            state.activity().as_deref(),
+            Some("Completed (1m 5s)")
+        );
+    }
+
+    #[test]
+    fn activity_shows_only_the_elapsed_turn_time() {
+        let mut state = test_state();
+        state
+            .models
+            .push(test_model("gpt-5.6-terra", "GPT-5.6-Terra", false));
+        state.note_pending_turn_model("gpt-5.6-terra");
+        state.note_pending_turn_effort("high");
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
+        state.turn_started_at = Some(Instant::now() - Duration::from_secs(10));
+
+        assert!(state
+            .activity()
+            .is_some_and(|activity| activity.starts_with("Working.. (10s)")));
+
+        state.select_model_and_effort("gpt-5.6-sol", Some("medium"));
+        state.handle_notification("turn/completed", &json!({}));
+        assert_eq!(
+            state.activity().as_deref(),
+            Some("Completed (10s)")
+        );
+    }
+
+    #[test]
+    fn copy_notice_replaces_the_activity_without_using_the_composer_notice() {
+        let mut state = test_state();
+        state.busy = true;
+        state.turn_started_at = Some(Instant::now() - Duration::from_secs(10));
+
+        state.set_copy_notice();
+
+        assert_eq!(state.activity().as_deref(), Some("Copied to clipboard"));
+        assert_eq!(state.view().composer_notice, None);
     }
 
     fn busy_state_with_live_turn() -> AppState {
