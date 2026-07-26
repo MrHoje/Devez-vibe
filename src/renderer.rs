@@ -809,10 +809,15 @@ impl Renderer {
 
     fn commit_fullscreen_blocks(&mut self, committed: &[Block], width: u16, view_rows: usize) {
         if self.wrapped_width != width {
+            let before = self.wrapped.len();
             for block in committed.iter().cloned() {
                 replace_history_block(&mut self.history, block);
             }
             self.rewrap(width);
+            if self.scroll_back > 0 {
+                let row_delta = self.wrapped.len() as isize - before as isize;
+                self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
+            }
             return;
         }
 
@@ -6876,6 +6881,33 @@ mod tests {
         assert_eq!(
             transcript_view(&renderer, view_rows).last(),
             Some(&downstream)
+        );
+    }
+
+    #[test]
+    fn fullscreen_rewrap_adjusts_a_scrolled_reader_by_the_total_row_delta() {
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.history = (0..12)
+            .map(|index| {
+                Block::new(
+                    BlockKind::Assistant,
+                    "Codex",
+                    format!("long transcript row {index} that wraps when narrow"),
+                )
+            })
+            .collect();
+        renderer.rewrap(80);
+        renderer.scroll_back = 4;
+        let before_rows = renderer.wrapped.len();
+        let before_scroll = renderer.scroll_back;
+
+        renderer.commit_fullscreen_blocks(&[], 20, 4);
+
+        let row_delta = renderer.wrapped.len() as isize - before_rows as isize;
+        assert!(row_delta > 0);
+        assert_eq!(
+            renderer.scroll_back,
+            before_scroll.saturating_add_signed(row_delta)
         );
     }
 
