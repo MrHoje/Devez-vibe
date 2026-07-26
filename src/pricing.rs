@@ -27,17 +27,23 @@ impl TokenTotals {
     /// input side and already counts the cached and freshly written tokens, so
     /// those come back out to keep each bucket on its own rate.
     pub fn from_breakdown(breakdown: &Value) -> Self {
-        let field = |name: &str| breakdown.get(name).and_then(Value::as_u64).unwrap_or(0);
-        let cache_read = field("cachedInputTokens");
-        let cache_write = field("cacheWriteInputTokens");
+        let field = |camel: &str, snake: &str| {
+            breakdown
+                .get(camel)
+                .or_else(|| breakdown.get(snake))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        };
+        let cache_read = field("cachedInputTokens", "cached_input_tokens");
+        let cache_write = field("cacheWriteInputTokens", "cache_write_input_tokens");
         Self {
-            input_new: field("inputTokens")
+            input_new: field("inputTokens", "input_tokens")
                 .saturating_sub(cache_read)
                 .saturating_sub(cache_write),
             cache_write,
             cache_read,
             // `reasoningOutputTokens` is a slice of `outputTokens`, not an extra.
-            output: field("outputTokens"),
+            output: field("outputTokens", "output_tokens"),
         }
     }
 

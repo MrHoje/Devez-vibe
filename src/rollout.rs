@@ -5,9 +5,13 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    time::UNIX_EPOCH,
 };
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::pricing::{CostLedger, TokenTotals};
 
 /// One rollout entry worth showing, in file order.
 pub struct RolloutEvent {
@@ -44,12 +48,96 @@ pub struct Rollout {
     pub events: Vec<RolloutEvent>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct RolloutStamp {
+    path: PathBuf,
+    length: u64,
+    modified_nanos: u128,
+}
+
+#[derive(Deserialize, Serialize)]
+struct CostCache {
+    rollout: RolloutStamp,
+    ledger: CostLedger,
+}
+
 /// The rollout for `thread_id`, or `None` when there is none to read — a session
 /// created on another machine, or a schema this parser no longer recognises.
 pub fn load(codex_home: &Path, thread_id: &str) -> Option<Rollout> {
     let path = find_rollout(&codex_home.join("sessions"), thread_id)?;
     let text = fs::read_to_string(path).ok()?;
     Some(parse(&text))
+}
+
+/// Reads a compact cached cost ledger when it still describes the exact
+/// rollout on disk. A cache miss falls back to one local JSONL pass; callers
+/// put that work off the UI path.
+pub fn load_cost_ledger(codex_home: &Path, thread_id: &str) -> Option<CostLedger> {
+    load_matching_cost_cache(codex_home, thread_id).or_else(|| {
+        let path = find_rollout(&codex_home.join("sessions"), thread_id)?;
+        rebuild_cost_cache(codex_home, thread_id, path)
+    })
+}
+
+fn load_matching_cost_cache(codex_home: &Path, thread_id: &str) -> Option<CostLedger> {
+    let cache = fs::read(cost_cache_path(codex_home, thread_id))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<CostCache>(&bytes).ok())?;
+    (rollout_stamp(&cache.rollout.path).as_ref() == Some(&cache.rollout)).then_some(cache.ledger)
+}
+
+fn rebuild_cost_cache(codex_home: &Path, thread_id: &str, path: PathBuf) -> Option<CostLedger> {
+    let before = rollout_stamp(&path)?;
+    let text = fs::read_to_string(&path).ok()?;
+    let after = rollout_stamp(&path)?;
+    if before != after {
+        return None;
+    }
+    let ledger = cost_ledger_from_text(&text);
+    let cache = CostCache {
+        rollout: after,
+        ledger: ledger.clone(),
+    };
+    let path = cost_cache_path(codex_home, thread_id);
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec(&cache) {
+        let _ = fs::write(path, bytes);
+    }
+    Some(ledger)
+}
+
+fn rollout_stamp(path: &Path) -> Option<RolloutStamp> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(RolloutStamp {
+        path: path.to_path_buf(),
+        length: metadata.len(),
+        modified_nanos,
+    })
+}
+
+fn cost_cache_path(codex_home: &Path, thread_id: &str) -> PathBuf {
+    let file_name = thread_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    codex_home
+        .join("devez-cli")
+        .join("cost-cache")
+        .join(format!("{file_name}.json"))
 }
 
 /// Rollout file names end in the thread id, so the whole session tree is walked
@@ -217,6 +305,46 @@ pub fn parse(text: &str) -> Rollout {
         }
     }
     Rollout { events }
+}
+
+/// Replays the compact accounting records a rollout keeps alongside its
+/// transcript. Each token count is cumulative, so only its increase is added
+/// to the model named by the latest turn context.
+fn cost_ledger_from_text(text: &str) -> CostLedger {
+    let mut ledger = CostLedger::default();
+    let mut model = None;
+    for line in text.lines() {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(payload) = entry.get("payload") else {
+            continue;
+        };
+        match entry.get("type").and_then(Value::as_str) {
+            Some("turn_context") => {
+                model = payload
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+            }
+            Some("event_msg")
+                if payload.get("type").and_then(Value::as_str) == Some("token_count") =>
+            {
+                let Some(total) = payload
+                    .get("info")
+                    .and_then(|info| info.get("total_token_usage"))
+                else {
+                    continue;
+                };
+                ledger.record_cumulative(
+                    model.as_deref().unwrap_or("unknown"),
+                    TokenTotals::from_breakdown(total),
+                );
+            }
+            _ => {}
+        }
+    }
+    ledger
 }
 
 /// A `custom_tool_call`/`custom_tool_call_output` payload's turn id, tucked
@@ -702,6 +830,59 @@ mod tests {
             RolloutKind::AssistantMessage { text } if text == "wanted"
         ));
         assert!(missing.is_none());
+    }
+
+    #[test]
+    fn cost_ledger_assigns_token_deltas_to_the_latest_turn_model() {
+        let ledger = cost_ledger_from_text(
+            r#"{"timestamp":"1","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}
+{"timestamp":"2","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000000,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0}}}}
+{"timestamp":"3","type":"turn_context","payload":{"model":"gpt-5.6-terra"}}
+{"timestamp":"4","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2000000,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0}}}}"#,
+        );
+
+        assert_eq!(ledger.estimate_usd(), Some(7.5));
+    }
+
+    #[test]
+    fn cost_ledger_cache_is_rebuilt_when_the_rollout_changes() {
+        let home = std::env::temp_dir().join(format!(
+            "dvz-cost-cache-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos()
+        ));
+        let day = home.join("sessions").join("2026").join("07").join("26");
+        fs::create_dir_all(&day).expect("session directory");
+        let rollout = day.join("rollout-2026-07-26T00-08-28-thread-cost.jsonl");
+        fs::write(
+            &rollout,
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000000}}}}"#,
+        )
+        .expect("first rollout");
+
+        assert_eq!(
+            load_cost_ledger(&home, "thread-cost").and_then(|ledger| ledger.estimate_usd()),
+            Some(5.0)
+        );
+
+        fs::write(
+            &rollout,
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.6-sol"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000000}}}}
+{"type":"turn_context","payload":{"model":"gpt-5.6-terra"}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2000000}}}}"#,
+        )
+        .expect("changed rollout");
+
+        assert_eq!(
+            load_cost_ledger(&home, "thread-cost").and_then(|ledger| ledger.estimate_usd()),
+            Some(7.5)
+        );
+        fs::remove_dir_all(&home).ok();
     }
 
     /// Helper for the exec tests: every `Exec` event a rollout produced, in
