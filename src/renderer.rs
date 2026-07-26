@@ -1140,6 +1140,7 @@ impl Renderer {
         queue!(self.out, Hide)?;
         // A height change shifts every row's meaning, so the diff is void.
         let repaint_all = self.previous_lines.len() != lines.len() || self.painted_info_panel != info_panel;
+        let mut main_rows_repainted = false;
         let selection = self
             .selection
             .range()
@@ -1208,14 +1209,21 @@ impl Renderer {
                 print_line_columns(&mut self.out, line, selected_columns, hovered, columns)?;
                 continue;
             }
-            queue!(
-                self.out,
-                MoveTo(0, row.min(u16::MAX as usize) as u16),
-                Clear(ClearType::UntilNewLine)
-            )?;
+            if let Some(layout) = info_panel {
+                clear_main_row(&mut self.out, row, layout.main_width)?;
+            } else {
+                queue!(
+                    self.out,
+                    MoveTo(0, row.min(u16::MAX as usize) as u16),
+                    Clear(ClearType::UntilNewLine)
+                )?;
+            }
+            main_rows_repainted = true;
             print_line_with_selection(&mut self.out, line, selected_columns, hovered)?;
         }
-        if let Some(layout) = info_panel {
+        if let Some(layout) = info_panel
+            && (repaint_all || main_rows_repainted)
+        {
             paint_info_panel(&mut self.out, layout, lines.len())?;
         }
         if let Some((row, control)) = scroll_to_bottom_overlay {
@@ -1379,6 +1387,17 @@ fn split_rows(rows: usize, live_natural: usize, transcript_len: usize) -> (usize
     (view_rows, rows - view_rows)
 }
 
+fn clear_main_row(out: &mut impl Write, row: usize, width: usize) -> Result<()> {
+    queue!(
+        out,
+        MoveTo(0, row.min(u16::MAX as usize) as u16),
+        ResetColor,
+        Print(" ".repeat(width)),
+        MoveTo(0, row.min(u16::MAX as usize) as u16),
+    )?;
+    Ok(())
+}
+
 const INFO_PANEL_WIDTH: usize = 24;
 const INFO_PANEL_GAP: usize = 3;
 const INFO_PANEL_MIN_MAIN_WIDTH: usize = 44;
@@ -1418,39 +1437,42 @@ fn info_panel_row(row: usize, rows: usize, content_width: usize) -> String {
     format!("{text:<content_width$}")
 }
 
-fn info_panel_paint_positions(layout: InfoPanelLayout, rows: usize) -> Vec<(usize, usize, usize)> {
-    let divider = layout.panel_left;
+fn info_panel_paint_positions(
+    layout: InfoPanelLayout,
+    rows: usize,
+) -> Vec<(usize, usize, usize, usize)> {
+    let panel_left = layout.panel_left;
+    let panel_width = layout.panel_width;
     let content = layout.content_left();
-    (0..rows).map(|row| (row, divider, content)).collect()
+    (0..rows)
+        .map(|row| (row, panel_left, panel_width, content))
+        .collect()
 }
 
-/// Draw the panel only after all conversation rows settle, so its fixed rail
+/// Draw the panel only after conversation rows settle, so its fixed surface
 /// never inherits a line's width, colour, or partial-repaint state.
 fn paint_info_panel(out: &mut Stdout, layout: InfoPanelLayout, rows: usize) -> Result<()> {
-    for (row, divider, content) in info_panel_paint_positions(layout, rows) {
+    let background = blend(theme::palette().background, theme::palette().border, 72);
+    for (row, panel_left, panel_width, content) in info_panel_paint_positions(layout, rows) {
         queue!(
             out,
             MoveTo(
-                divider.min(u16::MAX as usize) as u16,
+                panel_left.min(u16::MAX as usize) as u16,
                 row.min(u16::MAX as usize) as u16
             ),
-            ResetColor
-        )?;
-        queue!(
-            out,
-            SetBackgroundColor(rgb_color(theme::palette().accent)),
-            Print(" "),
-            ResetColor
-        )?;
-        queue!(
-            out,
+            SetBackgroundColor(rgb_color(background)),
+            Print(" ".repeat(panel_width)),
             MoveTo(
                 content.min(u16::MAX as usize) as u16,
                 row.min(u16::MAX as usize) as u16
             )
         )?;
         set_tone(out, Tone::Muted)?;
-        queue!(out, Print(info_panel_row(row, rows, layout.content_width())))?;
+        queue!(
+            out,
+            Print(info_panel_row(row, rows, layout.content_width())),
+            ResetColor
+        )?;
     }
     Ok(())
 }
@@ -6151,13 +6173,22 @@ mod tests {
     }
 
     #[test]
-    fn info_panel_paints_its_rail_and_content_at_fixed_columns() {
-        let layout = info_panel_layout(72).expect("72 columns fit the panel");
+    fn info_panel_paints_a_full_surface_with_inset_content() {
+        let layout = info_panel_layout(72).unwrap();
 
         assert_eq!(
             info_panel_paint_positions(layout, 3),
-            [(0, 47, 49), (1, 47, 49), (2, 47, 49)]
+            [(0, 47, 24, 49), (1, 47, 24, 49), (2, 47, 24, 49)]
         );
+    }
+
+    #[test]
+    fn info_panel_text_has_no_box_drawing_vertical_rule() {
+        let layout = info_panel_layout(72).unwrap();
+        let row = info_panel_row(0, 3, layout.content_width());
+
+        assert_eq!(UnicodeWidthStr::width(row.as_str()), 20);
+        assert!(!row.contains('│'));
     }
 
     #[test]
