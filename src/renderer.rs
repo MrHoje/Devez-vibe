@@ -369,6 +369,20 @@ pub struct Renderer {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct InfoPanelLayout {
     main_width: usize,
+    panel_left: usize,
+    panel_width: usize,
+}
+
+impl InfoPanelLayout {
+    const HORIZONTAL_PADDING: usize = 2;
+
+    fn content_left(self) -> usize {
+        self.panel_left + Self::HORIZONTAL_PADDING
+    }
+
+    fn content_width(self) -> usize {
+        self.panel_width - 2 * Self::HORIZONTAL_PADDING
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -803,9 +817,11 @@ impl Renderer {
         let (width, height) = terminal_size().unwrap_or((100, 30));
         let width = width.max(20);
         let info_panel = (self.mode == RenderMode::Fullscreen && view.info_panel_open)
-            .then(|| info_panel_content_width(width))
+            .then(|| info_panel_layout(width))
             .flatten();
-        let frame_width = info_panel.unwrap_or(width);
+        let frame_width = info_panel
+            .map(|layout| layout.main_width as u16)
+            .unwrap_or(width);
         let status = StatusArea {
             fallback: view.footer,
             line: view.status_line,
@@ -846,8 +862,9 @@ impl Renderer {
                 committed,
                 frame,
                 frame_width,
+                width,
                 height.max(3),
-                info_panel.is_some().then_some(width),
+                info_panel,
             );
         }
 
@@ -921,8 +938,9 @@ impl Renderer {
         committed: &[Block],
         mut frame: Frame,
         width: u16,
+        total_width: u16,
         height: u16,
-        info_panel_width: Option<u16>,
+        info_panel: Option<InfoPanelLayout>,
     ) -> Result<()> {
         let rows = height as usize;
         let old_view_rows = split_rows(rows, frame.lines.len(), self.wrapped.len()).0;
@@ -968,19 +986,15 @@ impl Renderer {
             }
             Some((row, control))
         });
-        let info_panel = info_panel_width.map(|total_width| {
-            let layout = InfoPanelLayout {
-                main_width: usize::from(width),
-            };
+        if let Some(layout) = info_panel {
             debug_assert_eq!(
                 usize::from(total_width),
                 layout.main_width
                     + INFO_PANEL_GAP
-                    + INFO_PANEL_WIDTH
+                    + layout.panel_width
                     + INFO_PANEL_AUTOWRAP_GUARD
             );
-            layout
-        });
+        }
 
         self.reconcile_selection(&screen);
         self.paint_screen(
@@ -1386,33 +1400,34 @@ fn info_panel_content_width(width: u16) -> Option<u16> {
         })
 }
 
-fn info_panel_row(row: usize, rows: usize) -> String {
-    let text = if row == 0 {
-        "Info panel"
-    } else if row == 1 && rows > 1 {
-        "No information yet"
-    } else {
-        ""
+fn info_panel_layout(total_width: u16) -> Option<InfoPanelLayout> {
+    let main_width = usize::from(info_panel_content_width(total_width)?);
+    Some(InfoPanelLayout {
+        main_width,
+        panel_left: main_width + INFO_PANEL_GAP,
+        panel_width: INFO_PANEL_WIDTH,
+    })
+}
+
+fn info_panel_row(row: usize, rows: usize, content_width: usize) -> String {
+    let text = match row {
+        0 => "Info panel",
+        1 if rows > 1 => "No information yet",
+        _ => "",
     };
-    format!("{text:<INFO_PANEL_WIDTH$}")
+    format!("{text:<content_width$}")
 }
 
-/// A right-panel row, independent from the conversation line it sits beside.
-#[cfg(test)]
-fn info_panel_fragment(row: usize, rows: usize) -> String {
-    format!("   {}", info_panel_row(row, rows))
-}
-
-fn info_panel_paint_positions(main_width: usize, rows: usize) -> Vec<(usize, usize, usize)> {
-    let divider = main_width.saturating_add(1);
-    let content = divider.saturating_add(2);
+fn info_panel_paint_positions(layout: InfoPanelLayout, rows: usize) -> Vec<(usize, usize, usize)> {
+    let divider = layout.panel_left;
+    let content = layout.content_left();
     (0..rows).map(|row| (row, divider, content)).collect()
 }
 
 /// Draw the panel only after all conversation rows settle, so its fixed rail
 /// never inherits a line's width, colour, or partial-repaint state.
 fn paint_info_panel(out: &mut Stdout, layout: InfoPanelLayout, rows: usize) -> Result<()> {
-    for (row, divider, content) in info_panel_paint_positions(layout.main_width, rows) {
+    for (row, divider, content) in info_panel_paint_positions(layout, rows) {
         queue!(
             out,
             MoveTo(
@@ -1435,7 +1450,7 @@ fn paint_info_panel(out: &mut Stdout, layout: InfoPanelLayout, rows: usize) -> R
             )
         )?;
         set_tone(out, Tone::Muted)?;
-        queue!(out, Print(info_panel_row(row, rows)))?;
+        queue!(out, Print(info_panel_row(row, rows, layout.content_width())))?;
     }
     Ok(())
 }
@@ -6118,22 +6133,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn info_panel_fragment_reserves_a_background_rail_without_a_box_drawing_glyph() {
-        let top = info_panel_fragment(0, 3);
-        let body = info_panel_fragment(1, 3);
+    fn info_panel_layout_keeps_a_gap_and_the_last_column_unpainted() {
+        let layout = info_panel_layout(72).expect("72 columns fit the panel");
 
-        assert_eq!(UnicodeWidthStr::width(top.as_str()), INFO_PANEL_GAP + INFO_PANEL_WIDTH);
-        assert_eq!(top.matches('│').count(), 0);
-        assert!(top.starts_with("   "));
-        assert!(top.ends_with("Info panel              "));
-        assert!(body.ends_with("No information yet      "));
+        assert_eq!(layout.main_width, 44);
+        assert_eq!(layout.panel_left, 47);
+        assert_eq!(layout.panel_width, 24);
+        assert_eq!(layout.panel_left + layout.panel_width, 71);
+    }
+
+    #[test]
+    fn info_panel_content_is_inset_inside_the_panel_surface() {
+        let layout = info_panel_layout(72).unwrap();
+
+        assert_eq!(layout.content_left(), 49);
+        assert_eq!(layout.content_width(), 20);
     }
 
     #[test]
     fn info_panel_paints_its_rail_and_content_at_fixed_columns() {
+        let layout = info_panel_layout(72).expect("72 columns fit the panel");
+
         assert_eq!(
-            info_panel_paint_positions(20, 3),
-            [(0, 21, 23), (1, 21, 23), (2, 21, 23)]
+            info_panel_paint_positions(layout, 3),
+            [(0, 47, 49), (1, 47, 49), (2, 47, 49)]
         );
     }
 
