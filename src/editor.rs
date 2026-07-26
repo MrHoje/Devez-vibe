@@ -51,7 +51,6 @@ impl Editor {
         }
     }
 
-
     pub fn delete(&mut self) {
         if self.cursor < self.buffer.len() {
             self.leave_history();
@@ -334,5 +333,4 @@ mod tests {
         assert_eq!(editor.text(), "open src/main.rs\nthen continue");
         assert_eq!(editor.cursor(), 16);
     }
-
 }

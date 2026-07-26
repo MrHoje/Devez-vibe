@@ -630,7 +630,7 @@ impl Renderer {
         // put back whether or not a write fails partway.
         let history = std::mem::take(&mut self.history);
         let mut outcome = Ok(());
-        for block in &history {
+        for block in visible_transcript_blocks(&history, self.shell_display_mode) {
             let lines = block_group_lines(
                 block,
                 width,
@@ -735,23 +735,35 @@ impl Renderer {
 
         let max_live = height.max(3) as usize;
         let natural_rows = frame.lines.len().min(max_live);
+        let hidden_thinking_merge = self.mode == RenderMode::Inline
+            && hidden_thinking_merge_at_history_boundary(
+                &self.history,
+                committed,
+                self.shell_display_mode,
+            );
         let needs_full_repaint = self.previous_lines.is_empty()
             || self.last_width != width
             || self.last_height != height
             || !committed.is_empty()
-            || mode_changed;
+            || mode_changed
+            || hidden_thinking_merge;
         if needs_full_repaint {
             self.erase_live()?;
-            for block in committed {
-                let lines = block_group_lines(
-                    block,
-                    width.max(20),
-                    self.shell_display_mode,
-                    false,
-                );
-                self.print_permanent(block, &lines)?;
+            if hidden_thinking_merge {
+                self.record_inline_history(committed);
+                self.relayout()?;
+            } else {
+                for block in visible_transcript_blocks(committed, self.shell_display_mode) {
+                    let lines = block_group_lines(
+                        block,
+                        width.max(20),
+                        self.shell_display_mode,
+                        false,
+                    );
+                    self.print_permanent(block, &lines)?;
+                }
+                self.record_inline_history(committed);
             }
-            self.record_inline_history(committed);
             self.out.flush()?;
             let available_rows = cursor_position()
                 .map(|(_, row)| height.saturating_sub(row).max(1) as usize)
@@ -888,9 +900,8 @@ impl Renderer {
     }
 
     fn rewrap(&mut self, width: u16) {
-        self.wrapped = self
-            .history
-            .iter()
+        self.wrapped = visible_transcript_blocks(&self.history, self.shell_display_mode)
+            .into_iter()
             .flat_map(|block| {
                 block_group_lines(
                     block,
@@ -922,8 +933,7 @@ impl Renderer {
             .range()
             .filter(|range| selection_is_worth_painting(*range, lines));
         for (row, line) in lines.iter().enumerate() {
-            let hovered =
-                Self::hover_columns(line, self.hovered_tool, self.hovered_pick.as_ref());
+            let hovered = Self::hover_columns(line, self.hovered_tool, self.hovered_pick.as_ref());
             let previously_hovered = self.previous_lines.get(row).and_then(|previous| {
                 Self::hover_columns(
                     previous,
@@ -1469,7 +1479,8 @@ fn selection_is_worth_painting(range: CellRange, lines: &[PaintLine]) -> bool {
             break;
         };
         let text = painted_line_text(line);
-        let Some(columns) = range.columns_for_row(row, UnicodeWidthStr::width(text.as_str())) else {
+        let Some(columns) = range.columns_for_row(row, UnicodeWidthStr::width(text.as_str()))
+        else {
             continue;
         };
         count += selected_char_count(&text, &columns, MINIMUM - count);
@@ -1526,7 +1537,7 @@ fn normal_frame_with_expansion(
         lines.push(PaintLine::blank());
     }
 
-    for block in live {
+    for block in visible_transcript_blocks(live, shell_display_mode) {
         lines.extend(block_group_lines(
             block,
             width,
@@ -1571,8 +1582,14 @@ fn normal_frame_with_expansion(
         .history_position()
         .map(|(position, total)| format!("{position}/{total}"))
         .unwrap_or_default();
-    let (input_lines, input_cursor_line, input_cursor_col) =
-        input_lines(editor, composer_images, width, &recalled, "", status.composer_mode.as_ref());
+    let (input_lines, input_cursor_line, input_cursor_col) = input_lines(
+        editor,
+        composer_images,
+        width,
+        &recalled,
+        "",
+        status.composer_mode.as_ref(),
+    );
     let cursor_line = lines.len() + input_cursor_line;
     lines.extend(input_lines);
     lines.push(status_line_row(status.line, &status.fallback, width));
@@ -1590,10 +1607,12 @@ fn normal_frame_with_expansion(
 /// single row: it lives in the frame's reserved spacer row, so it must never
 /// wrap.
 fn notice_row(notice: &str, width: u16) -> PaintLine {
+    let text = compact_right(notice, width as usize);
+    let padding = (width as usize).saturating_sub(UnicodeWidthStr::width(text.as_str()));
     PaintLine {
         prefix: String::new(),
         prefix_tone: Tone::Accent,
-        text: compact_right(notice, width as usize),
+        text: format!("{}{}", " ".repeat(padding), text),
         tone: Tone::Accent,
         bold: false,
         tool_heading: None,
@@ -2230,11 +2249,7 @@ fn steps_width(steps: &[EffortStepSpan]) -> usize {
         .sum()
 }
 
-fn effort_step_spans(
-    slider: &EffortSlider,
-    selected: usize,
-    compact: bool,
-) -> Vec<EffortStepSpan> {
+fn effort_step_spans(slider: &EffortSlider, selected: usize, compact: bool) -> Vec<EffortStepSpan> {
     let selected_tone = slider
         .efforts
         .get(selected)
@@ -2333,7 +2348,7 @@ fn overlay_frame_with_expansion(
         lines.extend(welcome_lines(welcome, width));
         lines.push(PaintLine::blank());
     }
-    for block in live {
+    for block in visible_transcript_blocks(live, shell_display_mode) {
         lines.extend(block_group_lines(
             block,
             width,
@@ -2347,7 +2362,11 @@ fn overlay_frame_with_expansion(
         OverlayStyle::Picker => {
             let panel_width = panel_span(width);
             let inner_width = panel_width.saturating_sub(2);
-            lines.push(panel_title_row(&overlay.title, panel_width, overlay.closable));
+            lines.push(panel_title_row(
+                &overlay.title,
+                panel_width,
+                overlay.closable,
+            ));
             lines.push(panel_padding_row(panel_width));
 
             for (row_index, row) in overlay.lines.iter().enumerate() {
@@ -2737,6 +2756,57 @@ fn is_bash_block(block: &Block) -> bool {
     matches!(block.kind, BlockKind::Tool | BlockKind::Warning) && block.title.starts_with("Shell ·")
 }
 
+fn is_running_shell_anchor(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::Tool)
+        && block.title.starts_with("Running ")
+        && block.title.contains(" shell command")
+}
+
+fn is_thinking_block(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::Reasoning) && block.title == THINKING_TITLE
+}
+
+/// Shell anchors are deliberately ordinary tool blocks while they run, so
+/// Collapse can still show their progress. Hide filters them alongside completed
+/// Shell groups before rendering; that also lets two thoughts separated only by
+/// a hidden Shell collapse into their latest summary.
+fn visible_transcript_blocks<'a>(
+    blocks: &'a [Block],
+    shell_display_mode: ShellDisplayMode,
+) -> Vec<&'a Block> {
+    let mut visible: Vec<&Block> = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        if shell_display_mode == ShellDisplayMode::Hide
+            && (is_bash_block(block) || is_running_shell_anchor(block))
+        {
+            continue;
+        }
+        if is_thinking_block(block)
+            && visible
+                .last()
+                .is_some_and(|previous| is_thinking_block(previous))
+        {
+            visible.pop();
+        }
+        visible.push(block);
+    }
+    visible
+}
+
+fn hidden_thinking_merge_at_history_boundary(
+    history: &[Block],
+    committed: &[Block],
+    shell_display_mode: ShellDisplayMode,
+) -> bool {
+    if shell_display_mode != ShellDisplayMode::Hide {
+        return false;
+    }
+    let history = visible_transcript_blocks(history, shell_display_mode);
+    let committed = visible_transcript_blocks(committed, shell_display_mode);
+    history.last().is_some_and(|block| is_thinking_block(block))
+        && committed.first().is_some_and(|block| is_thinking_block(block))
+}
+
 fn bash_lines(block: &Block, width: u16, expanded: bool) -> Vec<PaintLine> {
     let title_tone = if matches!(block.kind, BlockKind::Warning) {
         Tone::Warning
@@ -2879,6 +2949,7 @@ fn append_bash_preview_output(
         *remaining -= shown;
     }
 }
+
 /// Diff rows a single `fileChange` block prints before it starts counting. Well
 /// above what an ordinary edit produces, so the patch is normally shown whole,
 /// but low enough that a sweeping refactor can't push the turn off screen.
@@ -3000,9 +3071,7 @@ fn intraline_highlights(rows: &[&str]) -> Vec<Option<Vec<PaintSpan>>> {
         }
         for offset in 0..(added - removed).min(index - added) {
             let (old, new) = (removed + offset, added + offset);
-            if let Some((old_spans, new_spans)) =
-                word_diff(&rows[old][1..], &rows[new][1..])
-            {
+            if let Some((old_spans, new_spans)) = word_diff(&rows[old][1..], &rows[new][1..]) {
                 spans[old] = Some(old_spans);
                 spans[new] = Some(new_spans);
             }
@@ -4368,8 +4437,8 @@ fn input_top_line(panel_width: usize, label: &str, mode: Option<&ComposerMode>) 
     .with_picks(&picks)
 }
 
-/// Widest badge that fits in `budget`: estimated cost · Shell display mode ·
-/// permission mode · fast flag. Tightening drops cost, then fast, then Shell;
+/// Widest badge that fits in `budget`: estimated cost · permission mode ·
+/// Shell display mode · fast flag. Tightening drops cost, then fast, then Shell;
 /// permission mode remains. Parts are never ellipsized — a half-written mode
 /// name or a clipped price is worse than none.
 fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans> {
@@ -4384,27 +4453,21 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
     } else {
         "Fast Off"
     };
-    let fast_spans = [
-        separator_span(),
-        PaintSpan {
-            text: fast_label.to_owned(),
-            tone: if mode.fast_mode {
-                Tone::FastOn
-            } else {
-                Tone::FastOff
-            },
-            bold: false,
+    let fast_span = PaintSpan {
+        text: fast_label.to_owned(),
+        tone: if mode.fast_mode {
+            Tone::FastOn
+        } else {
+            Tone::FastOff
         },
-    ];
+        bold: false,
+    };
 
-    let shell_display_mode_spans = [
-        PaintSpan {
-            text: format!("Shell: {}", mode.shell_display_mode),
-            tone: Tone::Muted,
-            bold: false,
-        },
-        separator_span(),
-    ];
+    let shell_display_mode_span = PaintSpan {
+        text: format!("Shell: {}", mode.shell_display_mode),
+        tone: Tone::Muted,
+        bold: false,
+    };
 
     // Brackets mark the cost as an aside rather than a setting like the two
     // badges beside it. The cost leads, so its separator trails it instead.
@@ -4430,30 +4493,30 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
         BadgeSpans {
             spans: [
                 cost_spans,
-                shell_display_mode_spans.to_vec(),
-                vec![mode_span.clone()],
-                fast_spans.to_vec(),
+                vec![mode_span.clone(), separator_span()],
+                vec![shell_display_mode_span.clone(), separator_span()],
+                vec![fast_span.clone()],
             ]
             .concat(),
-            shell_display_mode_index: Some(cost_width),
-            mode_index: cost_width + 2,
+            shell_display_mode_index: Some(cost_width + 2),
+            mode_index: cost_width,
             fast_index: Some(cost_width + 4),
         },
         BadgeSpans {
             spans: [
-                shell_display_mode_spans.to_vec(),
-                vec![mode_span.clone()],
-                fast_spans.to_vec(),
+                vec![mode_span.clone(), separator_span()],
+                vec![shell_display_mode_span.clone(), separator_span()],
+                vec![fast_span],
             ]
             .concat(),
-            shell_display_mode_index: Some(0),
-            mode_index: 2,
+            shell_display_mode_index: Some(2),
+            mode_index: 0,
             fast_index: Some(4),
         },
         BadgeSpans {
-            spans: [shell_display_mode_spans.to_vec(), vec![mode_span.clone()]].concat(),
-            shell_display_mode_index: Some(0),
-            mode_index: 2,
+            spans: vec![mode_span.clone(), separator_span(), shell_display_mode_span],
+            shell_display_mode_index: Some(2),
+            mode_index: 0,
             fast_index: None,
         },
         BadgeSpans {
@@ -5440,7 +5503,10 @@ mod tests {
         );
         // The row still paints its full-width band, and only the changed words
         // deepen it.
-        assert_eq!(row_background(Tone::DiffRemovedWord), row_background(Tone::DiffRemoved));
+        assert_eq!(
+            row_background(Tone::DiffRemovedWord),
+            row_background(Tone::DiffRemoved)
+        );
         assert!(word_background(Tone::DiffRemovedWord).is_some());
         assert!(word_background(Tone::DiffRemoved).is_none());
     }
@@ -5533,7 +5599,7 @@ mod tests {
         let notice = frame
             .lines
             .iter()
-            .position(|line| line.text == "Copied 12 chars to clipboard")
+            .position(|line| line.text.contains("Copied 12 chars to clipboard"))
             .expect("notice row");
         assert_eq!(
             frame.lines[notice].tone,
@@ -5544,6 +5610,35 @@ mod tests {
         assert!(
             !rule.text.is_empty() && rule.text.chars().all(|ch| ch == '─'),
             "the composer rule should follow with no blank between"
+        );
+    }
+
+    #[test]
+    fn transient_notice_is_right_aligned_above_the_composer_rule() {
+        let editor = Editor::default();
+        let frame = normal_frame(
+            &[],
+            &editor,
+            None,
+            &[],
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: Some("Copied 12 chars to clipboard".to_owned()),
+                composer_mode: None,
+            },
+            80,
+        );
+
+        let notice = frame
+            .lines
+            .iter()
+            .find(|line| line.text.contains("Copied 12 chars to clipboard"))
+            .expect("notice row");
+        assert_eq!(
+            notice.text,
+            format!("{}Copied 12 chars to clipboard", " ".repeat(52))
         );
     }
 
@@ -5736,8 +5831,9 @@ mod tests {
                 .expect("activity row");
             assert_eq!(line.text, "✶ ", "the glyph keeps its own accent");
             assert!(
-                line.tail.iter().any(|span| span.text == " (2s • esc to interrupt)"
-                    && span.tone == Tone::Accent),
+                line.tail.iter().any(
+                    |span| span.text == " (2s • esc to interrupt)" && span.tone == Tone::Accent
+                ),
                 "the bracketed tail is not animated"
             );
             line.tail
@@ -5784,7 +5880,9 @@ mod tests {
             .expect("completion row");
 
         assert!(
-            line.tail.iter().all(|span| !matches!(span.tone, Tone::Shimmer(_))),
+            line.tail
+                .iter()
+                .all(|span| !matches!(span.tone, Tone::Shimmer(_))),
             "a completed turn must not look like it is still working"
         );
     }
@@ -5840,16 +5938,16 @@ mod tests {
             texts,
             [
                 "  ",
-                "Shell: Collapse",
-                " · ",
                 "Full Access",
+                " · ",
+                "Shell: Collapse",
                 " · ",
                 "Fast On",
                 " ",
                 "──"
             ]
         );
-        assert_eq!(line.tail[3].tone, Tone::Warning);
+        assert_eq!(line.tail[1].tone, Tone::Warning);
         assert_eq!(line.tail[5].tone, Tone::FastOn);
     }
 
@@ -5938,9 +6036,9 @@ mod tests {
             texts,
             [
                 "  ",
-                "Shell: Collapse",
-                " · ",
                 "Default",
+                " · ",
+                "Shell: Collapse",
                 " · ",
                 "Fast Off",
                 " ",
@@ -5968,9 +6066,9 @@ mod tests {
                 "  ",
                 "[$0.95]",
                 " · ",
-                "Shell: Collapse",
-                " · ",
                 "Full Access",
+                " · ",
+                "Shell: Collapse",
                 " · ",
                 "Fast On",
                 " ",
@@ -5978,13 +6076,13 @@ mod tests {
             ]
         );
         assert_eq!(line.tail[1].tone, Tone::Plain);
-        assert_eq!(line.tail[3].tone, Tone::Muted);
-        assert_eq!(line.tail[5].tone, Tone::Warning);
+        assert_eq!(line.tail[3].tone, Tone::Warning);
+        assert_eq!(line.tail[5].tone, Tone::Muted);
         assert_eq!(line.tail[7].tone, Tone::FastOn);
     }
 
     #[test]
-    fn shell_badge_sits_between_cost_and_permission_mode() {
+    fn shell_badge_follows_the_permission_mode() {
         let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
         mode.cost = Some("$0.95".to_owned());
         let line = input_top_line(80, "", Some(&mode));
@@ -5998,9 +6096,9 @@ mod tests {
                 "  ",
                 "[$0.95]",
                 " · ",
-                "Shell: Collapse",
-                " · ",
                 "Full Access",
+                " · ",
+                "Shell: Collapse",
                 " · ",
                 "Fast On",
                 " ",
@@ -6030,9 +6128,9 @@ mod tests {
             texts,
             [
                 "  ",
-                "Shell: Collapse",
-                " · ",
                 "Full Access",
+                " · ",
+                "Shell: Collapse",
                 " · ",
                 "Fast On",
                 " ",
@@ -6480,14 +6578,11 @@ mod tests {
         let lines = block_lines(&group, 80);
 
         assert_eq!(lines.len(), 1);
-        assert_eq!(
-            lines[0].text,
-            "Shell · 2 commands · all passed · 1.2s"
-        );
+        assert_eq!(lines[0].text, "Shell · 2 commands · all passed · 1.2s");
         assert_eq!(lines[0].tool_heading, Some(group.id()));
     }
 
-#[test]
+    #[test]
     fn hidden_shell_group_paints_no_rows() {
         let group = Block::shell_group(
             BlockKind::Tool,
@@ -6500,6 +6595,46 @@ mod tests {
 
         assert!(shell_group_lines(&group, 80, crate::state::ShellDisplayMode::Hide, false)
             .is_empty());
+    }
+
+    #[test]
+    fn hide_omits_the_running_shell_anchor() {
+        let anchor = Block::new(BlockKind::Tool, "Running 1 shell command", "");
+
+        assert!(visible_transcript_blocks(&[anchor], ShellDisplayMode::Hide).is_empty());
+    }
+
+    #[test]
+    fn hide_merges_thinking_blocks_separated_only_by_a_shell() {
+        let blocks = vec![
+            Block::new(BlockKind::Reasoning, THINKING_TITLE, "first thought"),
+            Block::new(BlockKind::Tool, "Running 1 shell command", ""),
+            Block::new(BlockKind::Reasoning, THINKING_TITLE, "latest thought"),
+        ];
+
+        let visible = visible_transcript_blocks(&blocks, ShellDisplayMode::Hide);
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].body, "latest thought");
+    }
+
+    #[test]
+    fn hide_merges_thinking_across_inline_history_and_new_output() {
+        let history = vec![
+            Block::new(BlockKind::Reasoning, THINKING_TITLE, "first thought"),
+            Block::new(BlockKind::Tool, "Running 1 shell command", ""),
+        ];
+        let committed = vec![Block::new(
+            BlockKind::Reasoning,
+            THINKING_TITLE,
+            "latest thought",
+        )];
+
+        assert!(hidden_thinking_merge_at_history_boundary(
+            &history,
+            &committed,
+            ShellDisplayMode::Hide
+        ));
     }
 
     #[test]
@@ -6533,7 +6668,6 @@ mod tests {
             ["one", "two", "three", "four", "five"]
         );
     }
-
 
     #[test]
     fn collapsed_shell_heading_ellipsizes_instead_of_wrapping() {
@@ -6662,7 +6796,10 @@ mod tests {
         );
 
         assert!(renderer.begin_selection(3, 0));
-        assert_eq!(renderer.finish_selection(3, 0), SelectionResult::Click(3, 0));
+        assert_eq!(
+            renderer.finish_selection(3, 0),
+            SelectionResult::Click(3, 0)
+        );
     }
 
     #[test]
@@ -7958,12 +8095,11 @@ mod tests {
         assert!(painted(row).ends_with(" X ─╮"), "{}", painted(row));
         assert_eq!(pick_on(row, "X"), Some(Pick::Close));
         // The rule below the list keeps its own corner: one mark, on top.
-        assert!(
-            !frame.lines.iter().skip(1).any(|line| line
-                .pick
+        assert!(!frame.lines.iter().skip(1).any(|line| {
+            line.pick
                 .as_ref()
-                .is_some_and(|regions| regions.columns_of(&Pick::Close).is_some()))
-        );
+                .is_some_and(|regions| regions.columns_of(&Pick::Close).is_some())
+        }));
     }
 
     /// The cells a painted row actually carries the hover tint on, read back off
@@ -8043,7 +8179,10 @@ mod tests {
             Some(start - 1..start + 12)
         );
         // Nothing on the rule answers for a pick it does not carry.
-        assert_eq!(Renderer::hover_columns(&line, None, Some(&Pick::Model)), None);
+        assert_eq!(
+            Renderer::hover_columns(&line, None, Some(&Pick::Model)),
+            None
+        );
         assert_eq!(Renderer::hover_columns(&line, None, None), None);
     }
 
@@ -8093,7 +8232,10 @@ mod tests {
         // Both borders stay outside the highlight even with the column of bleed.
         assert!(start > 1);
         assert!(end < painted_line_width(row));
-        assert_eq!(Renderer::hover_columns(row, None, Some(&Pick::Row(1))), None);
+        assert_eq!(
+            Renderer::hover_columns(row, None, Some(&Pick::Row(1))),
+            None
+        );
     }
 
     /// A compact row offers the same span a taller picker's row does: its own

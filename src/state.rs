@@ -52,6 +52,15 @@ pub enum ShellDisplayMode {
 }
 
 impl ShellDisplayMode {
+    fn from_config_value(value: &str) -> Option<Self> {
+        match value.trim().trim_matches(['"', '\'']).to_ascii_lowercase().as_str() {
+            "hide" => Some(Self::Hide),
+            "collapse" => Some(Self::Collapse),
+            "expand" => Some(Self::Expand),
+            _ => None,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Hide => "Hide",
@@ -65,6 +74,14 @@ impl ShellDisplayMode {
             Self::Hide => Self::Collapse,
             Self::Collapse => Self::Expand,
             Self::Expand => Self::Hide,
+        }
+    }
+
+    pub const fn config_value(self) -> &'static str {
+        match self {
+            Self::Hide => "hide",
+            Self::Collapse => "collapse",
+            Self::Expand => "expand",
         }
     }
 }
@@ -564,6 +581,8 @@ pub enum Action {
         model: String,
         effort: String,
     },
+    /// Save the transcript's Shell display preference for future sessions.
+    PersistShellDisplayMode(ShellDisplayMode),
     Quit,
     ClearScreen,
     Tick(bool),
@@ -2227,7 +2246,7 @@ impl AppState {
             composer_notice: None,
             status_metadata_refreshed_at: Instant::now(),
             permission_mode: read_permission_mode(),
-            shell_display_mode: ShellDisplayMode::default(),
+            shell_display_mode: read_shell_display_mode(),
             account_plan: AccountPlan::default(),
             account_refresh_due: false,
             skills: Vec::new(),
@@ -2815,7 +2834,9 @@ impl AppState {
         self.last_completed_duration = turns.iter().rev().find_map(|turn| {
             let started = turn.get("startedAt")?.as_i64()?;
             let completed = turn.get("completedAt")?.as_i64()?;
-            u64::try_from(completed.checked_sub(started)?).ok().map(Duration::from_secs)
+            u64::try_from(completed.checked_sub(started)?)
+                .ok()
+                .map(Duration::from_secs)
         });
         for turn in turns {
             let Some(items) = turn.get("items").and_then(Value::as_array) else {
@@ -3611,7 +3632,8 @@ impl AppState {
             "turn/completed" => {
                 self.busy = false;
                 self.turn_id = None;
-                self.last_completed_duration = self.turn_started_at.map(|started| started.elapsed());
+                self.last_completed_duration =
+                    self.turn_started_at.map(|started| started.elapsed());
                 self.turn_started_at = None;
                 if let Some(error) = params
                     .get("turn")
@@ -3659,11 +3681,8 @@ impl AppState {
                     .map(|line| format!("└ {line}"))
                     .collect::<Vec<_>>();
                 rows.extend(steps);
-                self.committed.push(Block::new(
-                    BlockKind::Plan,
-                    "Updated Plan",
-                    rows.join("\n"),
-                ));
+                self.committed
+                    .push(Block::new(BlockKind::Plan, "Updated Plan", rows.join("\n")));
             }
             "item/started" => {
                 if let Some(item) = params.get("item") {
@@ -3850,7 +3869,8 @@ impl AppState {
         } else {
             text.clone()
         };
-        self.committed.push(Block::new(BlockKind::User, "You", display));
+        self.committed
+            .push(Block::new(BlockKind::User, "You", display));
         if self.busy {
             Action::Steer(text)
         } else {
@@ -5366,9 +5386,8 @@ impl AppState {
                 format_elapsed(elapsed)
             ));
         }
-        self.last_completed_duration.map(|duration| {
-            format!("✓ Completed ({})", format_elapsed(duration.as_secs()))
-        })
+        self.last_completed_duration
+            .map(|duration| format!("✓ Completed ({})", format_elapsed(duration.as_secs())))
     }
 
     /// The shimmer sweeps the `Working` label once per `SHIMMER_PERIOD`, read off
@@ -5472,8 +5491,9 @@ impl AppState {
         self.permission_mode = self.permission_mode.next();
     }
 
-    pub fn cycle_shell_display_mode(&mut self) {
+    pub fn cycle_shell_display_mode(&mut self) -> ShellDisplayMode {
         self.shell_display_mode = self.shell_display_mode.next();
+        self.shell_display_mode
     }
 
     /// Runs a slash command the composer never typed — what a click on the
@@ -5743,13 +5763,8 @@ impl AppState {
                     .push(id.to_owned());
             }
         }
-        self.active.insert(
-            id.to_owned(),
-            ActiveItem {
-                block,
-                shell_batch,
-            },
-        );
+        self.active
+            .insert(id.to_owned(), ActiveItem { block, shell_batch });
     }
 
     fn complete_item(&mut self, item: &Value) {
@@ -6042,10 +6057,12 @@ fn push_latest_thinking(blocks: &mut Vec<Block>, block: Block) {
 }
 
 fn latest_thinking_only(blocks: Vec<Block>) -> Vec<Block> {
-    blocks.into_iter().fold(Vec::new(), |mut normalized, block| {
-        push_latest_thinking(&mut normalized, block);
-        normalized
-    })
+    blocks
+        .into_iter()
+        .fold(Vec::new(), |mut normalized, block| {
+            push_latest_thinking(&mut normalized, block);
+            normalized
+        })
 }
 
 fn completed_item_block(cwd: &str, item: &Value) -> Option<Block> {
@@ -6304,10 +6321,7 @@ fn event_block(event: &RolloutEvent) -> Option<Block> {
                 } else {
                     BlockKind::Warning
                 },
-                format!(
-                    "Shell · {}{suffix}{duration}",
-                    compact_command(command, 88)
-                ),
+                format!("Shell · {}{suffix}{duration}", compact_command(command, 88)),
                 // The rollout parser already strips the code-mode wrapper's
                 // preamble (`rollout::command_result`) — that is the one place
                 // that can see the `---N---` framing a multi-command script
@@ -6356,10 +6370,7 @@ fn shell_results_block(results: Vec<ShellResult>) -> Block {
         .iter()
         .filter(|result| result.exit_code.is_some_and(|code| code != 0))
         .count();
-    let duration_ms = results
-        .iter()
-        .filter_map(|result| result.duration_ms)
-        .max();
+    let duration_ms = results.iter().filter_map(|result| result.duration_ms).max();
     let status = if failed > 0 {
         format!("{failed} failed")
     } else {
@@ -6814,6 +6825,26 @@ fn read_permission_mode() -> PermissionMode {
         .unwrap_or(PermissionMode::Default)
 }
 
+fn read_shell_display_mode() -> ShellDisplayMode {
+    codex_home()
+        .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
+        .and_then(|config| parse_shell_display_mode(&config))
+        .unwrap_or_default()
+}
+
+fn parse_shell_display_mode(config: &str) -> Option<ShellDisplayMode> {
+    config
+        .lines()
+        .take_while(|line| !line.trim_start().starts_with('['))
+        .filter_map(|line| line.split('#').next())
+        .filter_map(|line| line.split_once('='))
+        .find_map(|(key, value)| {
+            (key.trim() == "shell_display_mode")
+                .then(|| ShellDisplayMode::from_config_value(value))
+        })
+        .flatten()
+}
+
 fn parse_permission_mode(config: &str) -> Option<PermissionMode> {
     config
         .lines()
@@ -7264,10 +7295,7 @@ mod tests {
         assert_eq!(shell.title, "Shell · 2 commands · 1 failed · 4.1s");
         assert!(matches!(shell.kind, BlockKind::Warning));
         assert_eq!(shell.children().len(), 2);
-        assert_eq!(
-            shell.children()[0].title,
-            "Shell · rg TODO · exit 0 · 4.1s"
-        );
+        assert_eq!(shell.children()[0].title, "Shell · rg TODO · exit 0 · 4.1s");
         assert_eq!(
             shell.children()[1].title,
             "Shell · git status --short · exit 1 · 4.1s"
@@ -7874,6 +7902,23 @@ mod tests {
             None
         );
         assert_eq!(parse_permission_mode("model = \"gpt-5.6\"\n"), None);
+    }
+
+    #[test]
+    fn shell_display_mode_starts_from_the_configured_default() {
+        assert_eq!(
+            parse_shell_display_mode("shell_display_mode = \"expand\"\n"),
+            Some(ShellDisplayMode::Expand)
+        );
+        assert_eq!(
+            parse_shell_display_mode("shell_display_mode = \"hide\" # compact transcript\n"),
+            Some(ShellDisplayMode::Hide)
+        );
+        assert_eq!(
+            parse_shell_display_mode("[ui]\nshell_display_mode = \"hide\"\n"),
+            None
+        );
+        assert_eq!(parse_shell_display_mode("shell_display_mode = \"other\"\n"), None);
     }
 
     #[test]
@@ -8855,8 +8900,14 @@ mod tests {
         let input = state.turn_input("describe this".to_owned());
 
         assert_eq!(input.len(), 2);
-        assert_eq!(input[0].get("text").and_then(Value::as_str), Some("describe this"));
-        assert_eq!(input[1].get("type").and_then(Value::as_str), Some("localImage"));
+        assert_eq!(
+            input[0].get("text").and_then(Value::as_str),
+            Some("describe this")
+        );
+        assert_eq!(
+            input[1].get("type").and_then(Value::as_str),
+            Some("localImage")
+        );
         assert_eq!(
             input[1].get("path").and_then(Value::as_str),
             Some(r"C:\Temp\clipboard-image.bmp")

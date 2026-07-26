@@ -188,8 +188,7 @@ mod tests {
         );
         assert_eq!(
             keys.iter()
-                .filter(|key| key.code == KeyCode::Enter
-                    && key.modifiers == KeyModifiers::SHIFT)
+                .filter(|key| key.code == KeyCode::Enter && key.modifiers == KeyModifiers::SHIFT)
                 .count(),
             2
         );
@@ -261,7 +260,10 @@ mod tests {
         let base = Instant::now();
         let mut burst = PasteBurst::new();
         for (offset, code) in [(0, 'a'), (1, 'b'), (2, 'c')] {
-            burst.observe(press(KeyCode::Char(code)), base + Duration::from_millis(offset));
+            burst.observe(
+                press(KeyCode::Char(code)),
+                base + Duration::from_millis(offset),
+            );
         }
         burst.observe(
             KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
@@ -276,7 +278,10 @@ mod tests {
         let base = Instant::now();
         let mut burst = PasteBurst::new();
         for (offset, code) in [(0, 'a'), (1, 'b'), (2, 'c')] {
-            burst.observe(press(KeyCode::Char(code)), base + Duration::from_millis(offset));
+            burst.observe(
+                press(KeyCode::Char(code)),
+                base + Duration::from_millis(offset),
+            );
         }
         burst.observe(press(KeyCode::Left), base + Duration::from_millis(3));
         let enter = burst.observe(press(KeyCode::Enter), base + Duration::from_millis(4));
@@ -288,7 +293,10 @@ mod tests {
         let base = Instant::now();
         let mut burst = PasteBurst::new();
         for (offset, code) in [(0, 'a'), (1, 'b'), (2, 'c')] {
-            burst.observe(press(KeyCode::Char(code)), base + Duration::from_millis(offset));
+            burst.observe(
+                press(KeyCode::Char(code)),
+                base + Duration::from_millis(offset),
+            );
         }
         let mut release = press(KeyCode::Char('c'));
         release.kind = KeyEventKind::Release;

@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     process::Stdio,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -24,6 +24,76 @@ use tokio::{
 type PendingResponse = oneshot::Sender<Result<Value, String>>;
 type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
 
+/// The cloneable half of the app-server connection. Background work may issue
+/// requests through it while [`AppServer`] remains the sole reader of events.
+#[derive(Clone)]
+pub struct AppServerClient {
+    outbound: Arc<StdMutex<Option<mpsc::UnboundedSender<Value>>>>,
+    pending: PendingMap,
+    next_id: Arc<AtomicU64>,
+}
+
+impl AppServerClient {
+    pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (response_tx, response_rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, response_tx);
+
+        let message = json!({
+            "id": id,
+            "method": method,
+            "params": params
+        });
+
+        if let Err(error) = self.send(message) {
+            self.pending.lock().await.remove(&id);
+            return Err(error);
+        }
+
+        match response_rx.await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(error)) => bail!("{method}: {error}"),
+            Err(_) => bail!("{method}: app-server 응답 채널이 종료되었습니다."),
+        }
+    }
+
+    pub fn notify(&self, method: &str, params: Option<Value>) -> Result<()> {
+        let message = match params {
+            Some(params) => json!({ "method": method, "params": params }),
+            None => json!({ "method": method }),
+        };
+        self.send(message)
+    }
+
+    pub fn respond(&self, id: Value, result: Value) -> Result<()> {
+        self.send(json!({ "id": id, "result": result }))
+    }
+
+    pub fn respond_error(&self, id: Value, code: i64, message: &str) -> Result<()> {
+        self.send(json!({
+            "id": id,
+            "error": {
+                "code": code,
+                "message": message
+            }
+        }))
+    }
+
+    fn close(&self) {
+        self.outbound.lock().expect("outbound mutex").take();
+    }
+
+    fn send(&self, message: Value) -> Result<()> {
+        self.outbound
+            .lock()
+            .expect("outbound mutex")
+            .as_ref()
+            .ok_or_else(|| anyhow!("app-server 연결이 이미 종료되었습니다."))?
+            .send(message)
+            .map_err(|_| anyhow!("app-server에 메시지를 보낼 수 없습니다."))
+    }
+}
+
 #[derive(Debug)]
 pub enum ServerEvent {
     Notification {
@@ -41,10 +111,8 @@ pub enum ServerEvent {
 
 pub struct AppServer {
     child: Child,
-    outbound: Option<mpsc::UnboundedSender<Value>>,
+    client: AppServerClient,
     events: mpsc::UnboundedReceiver<ServerEvent>,
-    pending: PendingMap,
-    next_id: AtomicU64,
     writer_task: JoinHandle<()>,
     reader_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
@@ -156,12 +224,16 @@ impl AppServer {
             }
         });
 
+        let client = AppServerClient {
+            outbound: Arc::new(StdMutex::new(Some(outbound_tx))),
+            pending,
+            next_id: Arc::new(AtomicU64::new(1)),
+        };
+
         Ok(Self {
             child,
-            outbound: Some(outbound_tx),
+            client,
             events,
-            pending,
-            next_id: AtomicU64::new(1),
             writer_task,
             reader_task,
             stderr_task,
@@ -175,48 +247,23 @@ impl AppServer {
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (response_tx, response_rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, response_tx);
-
-        let message = json!({
-            "id": id,
-            "method": method,
-            "params": params
-        });
-
-        if let Err(error) = self.send(message) {
-            self.pending.lock().await.remove(&id);
-            return Err(error);
-        }
-
-        match response_rx.await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(error)) => bail!("{method}: {error}"),
-            Err(_) => bail!("{method}: app-server 응답 채널이 종료되었습니다."),
-        }
+        self.client.request(method, params).await
     }
 
     pub fn notify(&self, method: &str, params: Option<Value>) -> Result<()> {
-        let message = match params {
-            Some(params) => json!({ "method": method, "params": params }),
-            None => json!({ "method": method }),
-        };
-        self.send(message)
+        self.client.notify(method, params)
     }
 
     pub fn respond(&self, id: Value, result: Value) -> Result<()> {
-        self.send(json!({ "id": id, "result": result }))
+        self.client.respond(id, result)
+    }
+
+    pub fn client(&self) -> AppServerClient {
+        self.client.clone()
     }
 
     pub fn respond_error(&self, id: Value, code: i64, message: &str) -> Result<()> {
-        self.send(json!({
-            "id": id,
-            "error": {
-                "code": code,
-                "message": message
-            }
-        }))
+        self.client.respond_error(id, code, message)
     }
 
     pub async fn next_event(&mut self) -> Option<ServerEvent> {
@@ -224,7 +271,7 @@ impl AppServer {
     }
 
     pub async fn shutdown(mut self) {
-        self.outbound.take();
+        self.client.close();
         let _ = timeout(Duration::from_secs(2), &mut self.writer_task).await;
 
         if timeout(Duration::from_secs(3), self.child.wait())
@@ -237,14 +284,6 @@ impl AppServer {
 
         self.reader_task.abort();
         self.stderr_task.abort();
-    }
-
-    fn send(&self, message: Value) -> Result<()> {
-        self.outbound
-            .as_ref()
-            .ok_or_else(|| anyhow!("app-server 연결이 이미 종료되었습니다."))?
-            .send(message)
-            .map_err(|_| anyhow!("app-server에 메시지를 보낼 수 없습니다."))
     }
 }
 
@@ -466,7 +505,10 @@ fn condense_error_message(message: &str) -> String {
     let line = head.lines().next().unwrap_or_default().trim();
     let line = line.trim_end_matches([':', '-', '·']).trim_end();
     if line.chars().count() > LIMIT {
-        format!("{}…", line.chars().take(LIMIT).collect::<String>().trim_end())
+        format!(
+            "{}…",
+            line.chars().take(LIMIT).collect::<String>().trim_end()
+        )
     } else {
         line.to_owned()
     }
@@ -534,5 +576,40 @@ mod tests {
         let condensed = condense_error_message(&long);
         assert_eq!(condensed.chars().count(), 201, "{condensed}");
         assert!(condensed.ends_with('…'), "{condensed}");
+    }
+
+    #[tokio::test]
+    async fn cloned_clients_share_request_ids() {
+        let (outbound, mut messages) = mpsc::unbounded_channel();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let client = AppServerClient {
+            outbound: Arc::new(std::sync::Mutex::new(Some(outbound))),
+            pending: pending.clone(),
+            next_id: Arc::new(AtomicU64::new(1)),
+        };
+
+        let first = tokio::spawn({
+            let client = client.clone();
+            async move { client.request("first", Value::Null).await }
+        });
+        let second = tokio::spawn(async move { client.request("second", Value::Null).await });
+
+        let first_message = messages.recv().await.expect("first request");
+        let second_message = messages.recv().await.expect("second request");
+        let mut ids = [first_message["id"].as_u64(), second_message["id"].as_u64()];
+        ids.sort_unstable();
+        assert_eq!(ids, [Some(1), Some(2)]);
+
+        let (events, _) = mpsc::unbounded_channel();
+        for id in ids.into_iter().flatten() {
+            route_message(
+                json!({ "id": id, "result": { "id": id } }),
+                &pending,
+                &events,
+            )
+            .await;
+        }
+        assert_eq!(first.await.expect("first task").unwrap()["id"], 1);
+        assert_eq!(second.await.expect("second task").unwrap()["id"], 2);
     }
 }

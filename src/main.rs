@@ -13,9 +13,9 @@ mod theme;
 mod update;
 
 use std::{
-    env,
-    fs,
+    env, fs,
     future::Future,
+    io::Read,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -33,7 +33,6 @@ use futures_util::StreamExt;
 use integrations::{McpServerInfo, PluginCatalog, PluginDetail, PluginInfo, PluginScope};
 use paste::PasteBurst;
 use renderer::{BlockKind, Pick, RenderMode, Renderer, SelectionResult, TerminalSession, View};
-use rollout::Rollout;
 use serde_json::{Value, json};
 use state::{
     AccountPlan, Action, AppState, LoginMethod, ModelInfo, SessionInfo, SessionPicker,
@@ -208,11 +207,6 @@ async fn start_session(
     model_override: Option<&str>,
     requested_model_name: &str,
 ) -> Result<()> {
-    // Kicked off now, alongside the `thread/start` request itself, so the 14
-    // MB-worst-case parse runs under the spinner `await_thread` draws rather
-    // than after it — starting it only once the request has already
-    // returned would leave nothing left for it to run under.
-    let rollout_handle = is_resuming.then(|| spawn_rollout_load(resume_id));
     let startup = await_thread(
         server,
         state,
@@ -268,8 +262,7 @@ async fn start_session(
         actual_effort.as_deref(),
     );
     if is_resuming {
-        let rollout = join_rollout_load(rollout_handle).await;
-        state.load_history(thread, rollout.as_ref());
+        state.load_history(thread, None);
     }
     draw(state, renderer)?;
 
@@ -280,9 +273,6 @@ async fn start_session(
         }
     });
 
-    // Tool mentions resolve against the integration catalogues before a queued
-    // prompt is sent. Filesystem results arrive independently in the event loop.
-    let _ = refresh_integrations(server, state, false).await;
     if let Some(text) = queued {
         draw(state, renderer)?;
         start_turn(server, state, text).await;
@@ -336,7 +326,7 @@ async fn await_thread(
                     Some(Ok(Event::Mouse(mouse))) => renderer_mouse_action(renderer, &mouse, |pick| pick_action(state, pick)),
                     Some(Ok(Event::Paste(text))) => {
                         renderer.clear_selection();
-                        if !attach_clipboard_image(state) {
+                        if !attach_clipboard_image(state) && !attach_pasted_local_image(state, &text) {
                             state.handle_paste(&text);
                         }
                         Action::None
@@ -442,31 +432,6 @@ fn hold_until_thread(
             );
             None
         }
-    }
-}
-
-/// Kicks off the rollout parse right away — in parallel with whatever request
-/// is about to ask the server for the thread — rather than after that request
-/// resolves. The file runs to 14 MB, and the resume spinner has to keep
-/// repainting while it is parsed; starting the parse only once the wait is
-/// already over leaves nothing left for it to run under.
-fn spawn_rollout_load(thread_id: &str) -> tokio::task::JoinHandle<Option<Rollout>> {
-    let thread_id = thread_id.to_owned();
-    tokio::spawn(async move {
-        tokio::task::spawn_blocking(move || rollout::load(&state::codex_home()?, &thread_id))
-            .await
-            .ok()
-            .flatten()
-    })
-}
-
-/// Joins a rollout load kicked off by [`spawn_rollout_load`]. A panic in the
-/// blocking read is treated the same as no rollout at all rather than
-/// propagated — resuming with a plain transcript beats crashing over it.
-async fn join_rollout_load(handle: Option<tokio::task::JoinHandle<Option<Rollout>>>) -> Option<Rollout> {
-    match handle {
-        Some(handle) => handle.await.unwrap_or(None),
-        None => None,
     }
 }
 
@@ -615,6 +580,8 @@ async fn event_loop(
     let mut resize = ResizeTracker::new();
     let (workspace_tx, mut workspace_rx) = mpsc::channel(1);
     let mut indexed_cwd = None;
+    let mut integration_key = None;
+    let mut integration_rx = None;
     draw(state, renderer)?;
 
     loop {
@@ -642,6 +609,11 @@ async fn event_loop(
             }
             draw(state, renderer)?;
             continue;
+        }
+        let current_integration_key = (state.thread_id.clone(), state.cwd.clone());
+        if integration_key.as_ref() != Some(&current_integration_key) {
+            integration_key = Some(current_integration_key);
+            integration_rx = Some(start_integration_refresh(server, state));
         }
         if indexed_cwd.as_deref() != Some(state.cwd.as_str()) {
             let cwd = state.cwd.clone();
@@ -679,7 +651,7 @@ async fn event_loop(
                     Some(Ok(Event::Mouse(mouse))) => renderer_mouse_action(renderer, &mouse, |pick| pick_action(state, pick)),
                     Some(Ok(Event::Paste(text))) => {
                         renderer.clear_selection();
-                        if !attach_clipboard_image(state) {
+                        if !attach_clipboard_image(state) && !attach_pasted_local_image(state, &text) {
                             state.handle_paste(&text);
                         }
                         Action::None
@@ -731,6 +703,12 @@ async fn event_loop(
             }
             Some(latest) = recv_update(&mut update_rx) => {
                 state.push_update_available(&latest);
+                Action::None
+            }
+            Some(catalog) = recv_integrations(&mut integration_rx) => {
+                if let Err(error) = apply_integrations(state, catalog) {
+                    state.push_notice(BlockKind::Warning, "통합 기능 조회 실패", error.to_string());
+                }
                 Action::None
             }
             Some((cwd, entries)) = workspace_rx.recv() => {
@@ -866,8 +844,7 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
             Action::Tick(true)
         }
         Pick::ShellDisplayMode => {
-            state.cycle_shell_display_mode();
-            Action::Tick(true)
+            Action::PersistShellDisplayMode(state.cycle_shell_display_mode())
         }
         Pick::FastMode => state.run_command("/fast"),
         Pick::Model => state.run_command("/model"),
@@ -1051,6 +1028,21 @@ async fn execute_action(
                 Err(error) => {
                     state.push_notice(BlockKind::Error, "Fast 전환 실패", error.to_string())
                 }
+            }
+        }
+        Action::PersistShellDisplayMode(mode) => {
+            if let Err(error) = server
+                .request(
+                    "config/value/write",
+                    config_value_write_params("shell_display_mode", mode.config_value()),
+                )
+                .await
+            {
+                state.push_notice(
+                    BlockKind::Warning,
+                    "Shell 표시 설정 저장 실패",
+                    error.to_string(),
+                );
             }
         }
         Action::StartSide(prompt) => {
@@ -1696,7 +1688,7 @@ async fn execute_action(
                 if let Err(error) = server
                     .request(
                         "config/value/write",
-                        json!({ "keyPath": key, "value": value }),
+                        config_value_write_params(key, &value),
                     )
                     .await
                 {
@@ -1841,11 +1833,6 @@ async fn resume_into_state(
     state.prepare_resume();
     state.begin_thread_switch();
 
-    // Started alongside the `thread/resume` request, not after it: `thread_id`
-    // is already known, and the spinner `await_switch` draws is the only
-    // thing left on screen for a 14 MB rollout parse to run under.
-    let rollout_handle = spawn_rollout_load(thread_id);
-
     let (response, queued) = match await_switch(
         server,
         state,
@@ -1873,8 +1860,7 @@ async fn resume_into_state(
         &resumed.model,
         resumed.effort.as_deref(),
     );
-    let rollout = rollout_handle.await.unwrap_or(None);
-    state.load_history(&resumed.thread, rollout.as_ref());
+    state.load_history(&resumed.thread, None);
     Ok(Switched::Done(queued))
 }
 
@@ -1937,9 +1923,6 @@ async fn finish_thread_switch(
     queued: Option<String>,
 ) -> Result<bool> {
     draw(state, renderer)?;
-    // Tool mentions resolve before a queued prompt is sent. The event loop
-    // notices cwd changes and refreshes filesystem results independently.
-    let _ = refresh_integrations(server, state, true).await;
     if let Some(text) = queued {
         draw(state, renderer)?;
         send_queued_prompt(server, state, text).await;
@@ -2046,6 +2029,14 @@ fn execute_local_action(
         _ => {}
     }
     Ok(false)
+}
+
+fn config_value_write_params(key_path: &str, value: &str) -> Value {
+    json!({
+        "keyPath": key_path,
+        "value": value,
+        "mergeStrategy": "upsert"
+    })
 }
 
 async fn list_skills(server: &AppServer, cwd: &str, force_reload: bool) -> Result<Value> {
@@ -2227,46 +2218,62 @@ fn format_upgrade_result(response: &Value) -> String {
     format!("{scope} · {upgraded}개를 갱신했습니다.")
 }
 
-async fn list_apps(server: &AppServer, thread_id: &str, force_refetch: bool) -> Result<Value> {
-    server
-        .request(
+struct IntegrationCatalog {
+    skills: std::result::Result<Value, String>,
+    plugins: std::result::Result<Value, String>,
+    apps: std::result::Result<Value, String>,
+}
+
+async fn fetch_integrations(
+    client: app_server::AppServerClient,
+    cwd: String,
+    thread_id: String,
+    force_reload: bool,
+) -> IntegrationCatalog {
+    let skills_client = client.clone();
+    let plugins_client = client.clone();
+    let (skills, plugins, apps) = tokio::join!(
+        skills_client.request(
+            "skills/list",
+            json!({
+                "cwds": [cwd],
+                "forceReload": force_reload
+            }),
+        ),
+        plugins_client.request(
+            "plugin/installed",
+            json!({
+                "cwds": [cwd]
+            }),
+        ),
+        client.request(
             "app/list",
             json!({
                 "cursor": null,
                 "limit": 100,
                 "threadId": thread_id,
-                "forceRefetch": force_refetch
-            }),
-        )
-        .await
-}
-
-async fn refresh_integrations(
-    server: &AppServer,
-    state: &mut AppState,
-    force_reload: bool,
-) -> Result<()> {
-    // Independent lookups, so pay the slowest one instead of their sum.
-    let (skills, plugins, apps) = tokio::join!(
-        list_skills(server, &state.cwd, force_reload),
-        server.request(
-            "plugin/installed",
-            json!({
-                "cwds": [state.cwd]
+                "forceRefetch": force_reload
             }),
         ),
-        list_apps(server, &state.thread_id, force_reload),
     );
+    IntegrationCatalog {
+        skills: skills.map_err(|error| error.to_string()),
+        plugins: plugins.map_err(|error| error.to_string()),
+        apps: apps.map_err(|error| error.to_string()),
+    }
+}
+
+fn apply_integrations(state: &mut AppState, catalog: IntegrationCatalog) -> Result<()> {
     let mut errors = Vec::new();
-    match skills {
+    match catalog.skills {
         Ok(response) => state.update_skills(&response),
         Err(error) => errors.push(format!("Skill 조회 실패: {error}")),
     }
-    match plugins {
+    match catalog.plugins {
         Ok(response) => state.update_plugins(&response),
         Err(error) => errors.push(format!("플러그인 조회 실패: {error}")),
     }
-    match apps {
+    match catalog.apps {
         Ok(response) => state.update_apps(&response),
         Err(error) => errors.push(format!("App 조회 실패: {error}")),
     }
@@ -2275,6 +2282,56 @@ async fn refresh_integrations(
     } else {
         bail!(errors.join("; "))
     }
+}
+
+fn start_background_catalogue(
+    catalogue: impl Future<Output = IntegrationCatalog> + Send + 'static,
+) -> mpsc::Receiver<IntegrationCatalog> {
+    let (sender, receiver) = mpsc::channel(1);
+    tokio::spawn(async move {
+        let _ = sender.send(catalogue.await).await;
+    });
+    receiver
+}
+
+fn start_integration_refresh(
+    server: &AppServer,
+    state: &AppState,
+) -> mpsc::Receiver<IntegrationCatalog> {
+    start_background_catalogue(fetch_integrations(
+        server.client(),
+        state.cwd.clone(),
+        state.thread_id.clone(),
+        false,
+    ))
+}
+
+async fn recv_integrations(
+    receiver: &mut Option<mpsc::Receiver<IntegrationCatalog>>,
+) -> Option<IntegrationCatalog> {
+    let Some(channel) = receiver.as_mut() else {
+        return std::future::pending().await;
+    };
+    let catalogue = channel.recv().await;
+    if catalogue.is_none() {
+        *receiver = None;
+    }
+    catalogue
+}
+
+async fn refresh_integrations(
+    server: &AppServer,
+    state: &mut AppState,
+    force_reload: bool,
+) -> Result<()> {
+    let catalog = fetch_integrations(
+        server.client(),
+        state.cwd.clone(),
+        state.thread_id.clone(),
+        force_reload,
+    )
+    .await;
+    apply_integrations(state, catalog)
 }
 
 struct ResolvedSkill {
@@ -2472,6 +2529,30 @@ fn attach_clipboard_image(state: &mut AppState) -> bool {
     true
 }
 
+fn attach_pasted_local_image(state: &mut AppState, text: &str) -> bool {
+    let Some(path) = local_image_path_from_paste(text) else {
+        return false;
+    };
+    state.attach_local_image(path.to_string_lossy().into_owned());
+    true
+}
+
+fn local_image_path_from_paste(text: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(text.trim());
+    if !path.is_file() {
+        return None;
+    }
+    let mut header = [0; 12];
+    let bytes = fs::File::open(&path).ok()?.read(&mut header).ok()?;
+    let image = header[..bytes].starts_with(b"\x89PNG\r\n\x1a\n")
+        || header[..bytes].starts_with(&[0xff, 0xd8, 0xff])
+        || header[..bytes].starts_with(b"GIF87a")
+        || header[..bytes].starts_with(b"GIF89a")
+        || header[..bytes].starts_with(b"BM")
+        || (bytes >= 12 && &header[..4] == b"RIFF" && &header[8..12] == b"WEBP");
+    image.then_some(path)
+}
+
 fn write_clipboard_bmp(image: &ImageData<'_>) -> std::io::Result<PathBuf> {
     let directory = env::temp_dir().join("devez-cli-images");
     fs::create_dir_all(&directory)?;
@@ -2494,7 +2575,8 @@ fn write_clipboard_bmp(image: &ImageData<'_>) -> std::io::Result<PathBuf> {
     bmp.extend_from_slice(&32u16.to_le_bytes());
     bmp.extend_from_slice(&[0; 24]);
     for row in (0..image.height).rev() {
-        for rgba in image.bytes[row * image.width * 4..(row + 1) * image.width * 4].chunks_exact(4) {
+        for rgba in image.bytes[row * image.width * 4..(row + 1) * image.width * 4].chunks_exact(4)
+        {
             bmp.extend_from_slice(&[rgba[2], rgba[1], rgba[0], rgba[3]]);
         }
     }
@@ -2812,7 +2894,10 @@ mod tests {
     fn clicking_shell_badge_cycles_the_global_mode() {
         let mut state = starting_state();
 
-        pick_action(&mut state, Pick::ShellDisplayMode);
+        assert!(matches!(
+            pick_action(&mut state, Pick::ShellDisplayMode),
+            Action::PersistShellDisplayMode(ShellDisplayMode::Expand)
+        ));
 
         assert_eq!(state.shell_display_mode(), ShellDisplayMode::Expand);
     }
@@ -2840,6 +2925,73 @@ mod tests {
             "gpt-5.6-sol",
             None,
         )
+    }
+
+    #[test]
+    fn config_value_write_params_include_the_required_merge_strategy() {
+        assert_eq!(
+            config_value_write_params("model", "gpt-5.6-sol"),
+            json!({
+                "keyPath": "model",
+                "value": "gpt-5.6-sol",
+                "mergeStrategy": "upsert"
+            })
+        );
+        assert_eq!(
+            config_value_write_params("shell_display_mode", "expand"),
+            json!({
+                "keyPath": "shell_display_mode",
+                "value": "expand",
+                "mergeStrategy": "upsert"
+            })
+        );
+    }
+
+    #[test]
+    fn applying_a_failed_integration_catalogue_reports_every_failure() {
+        let mut state = starting_state();
+        let error = apply_integrations(
+            &mut state,
+            IntegrationCatalog {
+                skills: Err("skills offline".to_owned()),
+                plugins: Err("plugins offline".to_owned()),
+                apps: Err("apps offline".to_owned()),
+            },
+        )
+        .expect_err("all three catalogue requests failed");
+
+        assert_eq!(
+            error.to_string(),
+            "Skill 조회 실패: skills offline; 플러그인 조회 실패: plugins offline; App 조회 실패: apps offline"
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_integration_refresh_does_not_block_event_loop() {
+        let mut receiver = Some(start_background_catalogue(async {
+            std::future::pending::<IntegrationCatalog>().await
+        }));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), recv_integrations(&mut receiver))
+                .await
+                .is_err(),
+            "a pending catalogue fetch must not make the caller wait"
+        );
+    }
+
+    #[test]
+    fn pasted_local_image_path_accepts_a_real_image_file() {
+        let path = std::env::temp_dir().join(format!(
+            "devez-paste-image-{}.png",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+
+        let parsed = local_image_path_from_paste(&format!("{}\r\n", path.display()));
+
+        assert_eq!(parsed.as_deref(), Some(path.as_path()));
+        std::fs::remove_file(path).unwrap();
     }
 
     /// The model and effort readings stand for the commands that change them, so a
@@ -2876,13 +3028,22 @@ mod tests {
         let mut state = state_with_a_model();
 
         pick_action(&mut state, Pick::Model);
-        assert_eq!(state.view().overlay.map(|overlay| overlay.title), Some("Model".to_owned()));
+        assert_eq!(
+            state.view().overlay.map(|overlay| overlay.title),
+            Some("Model".to_owned())
+        );
 
         pick_action(&mut state, Pick::EffortSetting);
-        assert_eq!(state.view().overlay.map(|overlay| overlay.title), Some("Effort".to_owned()));
+        assert_eq!(
+            state.view().overlay.map(|overlay| overlay.title),
+            Some("Effort".to_owned())
+        );
 
         pick_action(&mut state, Pick::Model);
-        assert_eq!(state.view().overlay.map(|overlay| overlay.title), Some("Model".to_owned()));
+        assert_eq!(
+            state.view().overlay.map(|overlay| overlay.title),
+            Some("Model".to_owned())
+        );
     }
 
     /// The permission mode is not what either picker is asking about, so the badge
@@ -2943,7 +3104,12 @@ mod tests {
         pick_action(&mut state, Pick::Effort(0));
 
         assert!(state.view().overlay.is_none(), "the effort picker closed");
-        assert!(state.view().status_line.is_some_and(|status| status.effort == "low"));
+        assert!(
+            state
+                .view()
+                .status_line
+                .is_some_and(|status| status.effort == "low")
+        );
     }
 
     /// Every panel that paints the mark answers for it, and nothing else does.

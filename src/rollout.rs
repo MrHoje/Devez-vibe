@@ -97,7 +97,11 @@ pub fn parse(text: &str) -> Rollout {
         let Some(payload) = entry.get("payload") else {
             continue;
         };
-        match payload.get("type").and_then(Value::as_str).unwrap_or_default() {
+        match payload
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
             "custom_tool_call" => {
                 // `name` is the real discriminant between a shell run and a
                 // patch application — not where `tools.shell_command(` happens
@@ -106,7 +110,10 @@ pub fn parse(text: &str) -> Rollout {
                 if payload.get("name").and_then(Value::as_str) != Some("exec") {
                     continue;
                 }
-                let input = payload.get("input").and_then(Value::as_str).unwrap_or_default();
+                let input = payload
+                    .get("input")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 let commands = shell_commands(input);
                 if commands.is_empty() {
                     continue;
@@ -138,7 +145,10 @@ pub fn parse(text: &str) -> Rollout {
                 pending.push((call_id, indices));
             }
             "custom_tool_call_output" => {
-                let call_id = payload.get("call_id").and_then(Value::as_str).unwrap_or_default();
+                let call_id = payload
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 let Some(position) = pending.iter().position(|(id, _)| id == call_id) else {
                     continue;
                 };
@@ -330,7 +340,10 @@ fn command_field(body: &str) -> Option<String> {
 
 fn skip_whitespace(body: &str, mut i: usize) -> usize {
     while i < body.len() {
-        let ch = body[i..].chars().next().expect("i is a char boundary within bounds");
+        let ch = body[i..]
+            .chars()
+            .next()
+            .expect("i is a char boundary within bounds");
         if ch.is_whitespace() {
             i += ch.len_utf8();
         } else {
@@ -343,7 +356,10 @@ fn skip_whitespace(body: &str, mut i: usize) -> usize {
 /// One object key, quoted or bare, starting at `i`. Quotes are stripped;
 /// escapes are not decoded because key names never carry any that matter here.
 fn read_token(body: &str, i: usize) -> (String, usize) {
-    let ch = body[i..].chars().next().expect("i is a char boundary within bounds");
+    let ch = body[i..]
+        .chars()
+        .next()
+        .expect("i is a char boundary within bounds");
     if ch == '"' || ch == '\'' || ch == '`' {
         let end = skip_string(body, i);
         (body[i + ch.len_utf8()..end - ch.len_utf8()].to_owned(), end)
@@ -365,11 +381,17 @@ fn read_token(body: &str, i: usize) -> (String, usize) {
 /// character, including the quote itself, so an escaped quote never ends the
 /// string early.
 fn skip_string(body: &str, i: usize) -> usize {
-    let quote = body[i..].chars().next().expect("i is a char boundary within bounds");
+    let quote = body[i..]
+        .chars()
+        .next()
+        .expect("i is a char boundary within bounds");
     let mut j = i + quote.len_utf8();
     let mut escaped = false;
     while j < body.len() {
-        let ch = body[j..].chars().next().expect("j is a char boundary within bounds");
+        let ch = body[j..]
+            .chars()
+            .next()
+            .expect("j is a char boundary within bounds");
         if escaped {
             escaped = false;
         } else if ch == '\\' {
@@ -389,7 +411,10 @@ fn skip_string(body: &str, i: usize) -> usize {
 fn skip_value(body: &str, mut i: usize) -> usize {
     let mut depth = 0i32;
     while i < body.len() {
-        let ch = body[i..].chars().next().expect("i is a char boundary within bounds");
+        let ch = body[i..]
+            .chars()
+            .next()
+            .expect("i is a char boundary within bounds");
         match ch {
             '"' | '\'' | '`' => {
                 i = skip_string(body, i);
@@ -609,7 +634,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(summary, ["assistant:first", "patch:exec-abc", "assistant:second"]);
+        assert_eq!(
+            summary,
+            ["assistant:first", "patch:exec-abc", "assistant:second"]
+        );
         assert_eq!(rollout.events[1].ts, "2026-07-25T15:09:40.539Z");
     }
 
@@ -819,10 +847,23 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(groups, ["call_pair", "call_pair"]);
-        assert_eq!(events[0], ("rg TODO", "src/main.rs:12: TODO fix this\n", Some(0), Some(4100)));
+        assert_eq!(
+            events[0],
+            (
+                "rg TODO",
+                "src/main.rs:12: TODO fix this\n",
+                Some(0),
+                Some(4100)
+            )
+        );
         assert_eq!(
             events[1],
-            ("git status --short", "?? untracked.txt\n", Some(1), Some(4100))
+            (
+                "git status --short",
+                "?? untracked.txt\n",
+                Some(1),
+                Some(4100)
+            )
         );
     }
 
