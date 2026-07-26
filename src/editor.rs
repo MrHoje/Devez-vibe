@@ -109,6 +109,14 @@ impl Editor {
         self.replace(text.into());
     }
 
+    pub fn replace_range(&mut self, range: std::ops::Range<usize>, text: &str) {
+        self.leave_history();
+        let start = range.start.min(self.buffer.len());
+        let end = range.end.min(self.buffer.len()).max(start);
+        self.buffer.splice(start..end, text.chars());
+        self.cursor = start + text.chars().count();
+    }
+
     pub fn delete_word_left(&mut self) {
         if self.cursor == 0 {
             return;
@@ -168,7 +176,8 @@ impl Editor {
             return None;
         }
 
-        if self.history.last().is_none_or(|last| last != &text) {
+        let is_slash_command = text.starts_with('/') && !text.contains('\n');
+        if !is_slash_command && self.history.last().is_none_or(|last| last != &text) {
             self.history.push(text.clone());
             if self.history.len() > 100 {
                 self.history.remove(0);
@@ -176,6 +185,13 @@ impl Editor {
         }
         self.clear();
         Some(text)
+    }
+
+    /// Where the recalled entry sits, newest first, as `(position, total)`.
+    /// `None` unless the composer is currently showing history.
+    pub fn history_position(&self) -> Option<(usize, usize)> {
+        self.history_index
+            .map(|index| (index + 1, self.history.len()))
     }
 
     pub fn history_previous(&mut self) {
@@ -238,6 +254,56 @@ mod tests {
     }
 
     #[test]
+    fn history_recall_reports_its_position_newest_first() {
+        let mut editor = Editor::default();
+        for prompt in ["first", "second", "third"] {
+            editor.set_text(prompt);
+            editor.take_for_submit();
+        }
+        editor.set_text("a draft");
+
+        assert_eq!(editor.history_position(), None, "not browsing yet");
+
+        editor.history_previous();
+        assert_eq!(editor.text(), "third");
+        assert_eq!(editor.history_position(), Some((3, 3)));
+
+        editor.history_previous();
+        editor.history_previous();
+        assert_eq!(editor.text(), "first");
+        assert_eq!(editor.history_position(), Some((1, 3)));
+
+        // Walking back past the newest entry restores the draft, not a position.
+        for _ in 0..3 {
+            editor.history_next();
+        }
+        assert_eq!(editor.text(), "a draft");
+        assert_eq!(editor.history_position(), None);
+
+        editor.history_previous();
+        editor.insert('!');
+        assert_eq!(
+            editor.history_position(),
+            None,
+            "editing leaves history behind"
+        );
+    }
+
+    #[test]
+    fn slash_commands_are_not_added_to_prompt_history() {
+        let mut editor = Editor::default();
+        for text in ["/help", "a real prompt", "/status"] {
+            editor.set_text(text);
+            editor.take_for_submit();
+        }
+
+        editor.history_previous();
+
+        assert_eq!(editor.text(), "a real prompt");
+        assert_eq!(editor.history_position(), Some((1, 1)));
+    }
+
+    #[test]
     fn line_kill_commands_preserve_multiline_boundaries() {
         let mut editor = Editor::default();
         editor.set_text("alpha\nbeta");
@@ -255,5 +321,16 @@ mod tests {
 
         editor.yank();
         assert_eq!(editor.text(), "alpha\nbeta");
+    }
+
+    #[test]
+    fn replace_range_preserves_the_surrounding_multiline_draft() {
+        let mut editor = Editor::default();
+        editor.set_text("open @mai\nthen continue");
+
+        editor.replace_range(5..9, "src/main.rs");
+
+        assert_eq!(editor.text(), "open src/main.rs\nthen continue");
+        assert_eq!(editor.cursor(), 16);
     }
 }

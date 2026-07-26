@@ -1,24 +1,39 @@
 use std::{
     collections::{BTreeMap, HashMap},
     env, fs,
+    ops::Range,
     path::{Path, PathBuf},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::{Map, Value, json};
 
 use crate::{
+    completion::{
+        CompletionCandidate, CompletionKind, CompletionMode, CompletionTarget, completion_target,
+        completion_text, filter_candidates,
+    },
     editor::Editor,
+    integrations::{
+        MarketplacePicker, MarketplacePickerResult, McpPicker, McpPickerResult, McpServerInfo,
+        PluginCatalog, PluginDetail, PluginInfo, PluginPicker, PluginPickerResult, PluginScope,
+        PluginTarget,
+    },
     pricing::{self, TokenTotals},
     renderer::{
-        Block, BlockKind, ComposerMode, ModeAccent, OverlayLine, OverlayStyle, OverlayView,
-        StatusLineView, SuggestionView, View, WelcomeView,
+        Block, BlockKind, ComposerMode, EffortSlider, ModeAccent, OverlayLine, OverlayStyle,
+        OverlayView, PICKER_ROWS, StatusLineView, SuggestionView, View, WelcomeView,
+        visible_window,
     },
+    rollout::{Rollout, RolloutEvent, RolloutKind},
     theme::{self, ThemeKind},
 };
 
-pub const SPINNER: [&str; 8] = ["✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳"];
+const SPINNER: [&str; 8] = ["✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳"];
+
+/// How long one shimmer sweep across the `Working` label takes.
+const SHIMMER_PERIOD: Duration = Duration::from_millis(1_100);
 
 /// The permission presets Codex exposes through `/permissions`, cycled with Shift+Tab.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -104,12 +119,12 @@ const SLASH_COMMANDS: [SlashCommand; 24] = [
     },
     SlashCommand {
         name: "/mcp",
-        description: "Show MCP servers or start OAuth login",
+        description: "Browse MCP servers, reconnect, or sign in",
         takes_argument: true,
     },
     SlashCommand {
         name: "/plugins",
-        description: "List, install, enable, disable, or uninstall plugins",
+        description: "Browse plugins and manage marketplaces",
         takes_argument: true,
     },
     SlashCommand {
@@ -118,9 +133,9 @@ const SLASH_COMMANDS: [SlashCommand; 24] = [
         takes_argument: true,
     },
     SlashCommand {
-        name: "/apps",
-        description: "List, enable, or disable Codex apps",
-        takes_argument: true,
+        name: "/reload-plugins",
+        description: "Apply plugin changes to this session",
+        takes_argument: false,
     },
     SlashCommand {
         name: "/new",
@@ -466,29 +481,74 @@ pub enum Action {
     Compact,
     Copy(String),
     ShowDiff,
-    ShowMcp,
+    /// Fetch MCP server status and open the picker. Any notice is carried over
+    /// so the result of the action that reopened it stays on screen.
+    OpenMcp(Option<String>),
     McpLogin(String),
+    /// Re-read the MCP configuration and restart the servers.
+    ReconnectMcp,
     StartLogin(LoginMethod),
     CancelLogin(String),
     Logout,
-    ShowPlugins,
+    OpenPlugins {
+        scope: Option<PluginScope>,
+        notice: Option<String>,
+    },
+    /// Read one plugin's contents, then reopen the picker on its detail page.
+    OpenPluginDetail {
+        target: PluginTarget,
+        origin: Option<PluginScope>,
+    },
     PreparePluginInstall(String),
     PreparePluginUninstall(String),
-    SetPlugin { query: String, enabled: bool },
+    SetPlugin {
+        query: String,
+        enabled: bool,
+    },
+    /// Toggle a plugin the picker already resolved, so no re-lookup is needed.
+    SetPluginEnabled {
+        plugin: Box<PluginInfo>,
+        enabled: bool,
+    },
+    ConfirmPluginInstall(Box<PluginInfo>),
+    ConfirmPluginUninstall(Box<PluginInfo>),
     InstallPlugin(PluginInstallTarget),
     UninstallPlugin(PluginUninstallTarget),
+    OpenMarketplaces(Option<String>),
+    ConfirmMarketplaceAdd(String),
+    AddMarketplace(String),
+    ConfirmMarketplaceRemove(String),
+    RemoveMarketplace(String),
+    /// Refreshes every configured git marketplace; see
+    /// `MarketplacePickerResult::UpgradeAll` for why it is not per-marketplace.
+    UpgradeMarketplaces,
+    /// Re-reads skills, plugins and apps and restarts the MCP servers, so a
+    /// plugin installed this session takes effect without relaunching.
+    ReloadPlugins,
     ShowSkills,
-    SetSkill { name: String, enabled: bool },
-    ShowApps,
-    SetApp { query: String, enabled: bool },
+    SetSkill {
+        name: String,
+        enabled: bool,
+    },
     RefreshSkills,
     OpenUrl(String),
     SetTheme(ThemeKind),
+    /// Write the picked model and effort into `~/.codex/config.toml`.
+    PersistModelDefault {
+        model: String,
+        effort: String,
+    },
     Quit,
     ClearScreen,
     Tick(bool),
-    RpcResponse { id: Value, result: Value },
-    RpcError { id: Value, message: String },
+    RpcResponse {
+        id: Value,
+        result: Value,
+    },
+    RpcError {
+        id: Value,
+        message: String,
+    },
 }
 
 pub struct PluginInstallTarget {
@@ -539,6 +599,8 @@ impl LoginMethod {
 enum ConfirmedAction {
     InstallPlugin(PluginInstallTarget),
     UninstallPlugin(PluginUninstallTarget),
+    AddMarketplace(String),
+    RemoveMarketplace(String),
     Logout,
 }
 
@@ -547,6 +609,8 @@ impl ConfirmedAction {
         match self {
             Self::InstallPlugin(target) => Action::InstallPlugin(target),
             Self::UninstallPlugin(target) => Action::UninstallPlugin(target),
+            Self::AddMarketplace(source) => Action::AddMarketplace(source),
+            Self::RemoveMarketplace(name) => Action::RemoveMarketplace(name),
             Self::Logout => Action::Logout,
         }
     }
@@ -568,6 +632,31 @@ struct ActiveItem {
     block: Block,
 }
 
+/// How long a model pick should last.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ModelScope {
+    Session,
+    Default,
+}
+
+impl ModelScope {
+    const CHOICES: [Self; 2] = [Self::Session, Self::Default];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Session => "This session only",
+            Self::Default => "Set as default",
+        }
+    }
+
+    fn detail(self) -> &'static str {
+        match self {
+            Self::Session => "Returns to the original setting next time",
+            Self::Default => "Saves to ~/.codex/config.toml",
+        }
+    }
+}
+
 enum PendingInteraction {
     ModelPicker {
         model_index: usize,
@@ -576,10 +665,22 @@ enum PendingInteraction {
     EffortPicker {
         effort_index: usize,
     },
+    /// Second step of `/model`: how long the pick should last. Asked after the
+    /// model is chosen so the common case (this session) stays two keystrokes.
+    ModelScope {
+        model_index: usize,
+        effort_index: usize,
+        selected: usize,
+    },
     ThemePicker {
         theme_index: usize,
     },
     SessionPicker(SessionPicker),
+    McpPicker(McpPicker),
+    PluginPicker(PluginPicker),
+    /// Reached from the plugin picker, so cancelling it returns there instead of
+    /// closing the overlay outright.
+    MarketplacePicker(MarketplacePicker),
     Approval {
         id: Value,
         title: String,
@@ -610,7 +711,7 @@ enum PendingInteraction {
         detail: Vec<String>,
         action: ConfirmedAction,
     },
-    /// Claude-Code-style list that picks the sign-in flow before starting it.
+    /// Numbered list that picks the sign-in flow before starting it.
     LoginMethodPicker {
         selected: usize,
     },
@@ -626,6 +727,7 @@ enum PendingInteraction {
 struct SkillBinding {
     name: String,
     path: String,
+    description: String,
     enabled: bool,
 }
 
@@ -634,6 +736,51 @@ struct MentionBinding {
     trigger: String,
     name: String,
     path: String,
+    description: String,
+}
+
+struct SelectedCompletionBinding {
+    sigil: char,
+    trigger: String,
+    token: String,
+    range: Range<usize>,
+    kind: CompletionKind,
+    name: String,
+    path: String,
+}
+
+impl SelectedCompletionBinding {
+    fn matches_text(&self, chars: &[char]) -> bool {
+        chars
+            .get(self.range.clone())
+            .is_some_and(|value| value.iter().copied().eq(self.token.chars()))
+            && self.range.start.checked_sub(1).is_none_or(|index| {
+                chars
+                    .get(index)
+                    .is_none_or(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')))
+            })
+            && chars.get(self.range.end).is_none_or(|ch| {
+                !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.'))
+            })
+    }
+
+    fn typed_item(&self) -> Value {
+        match self.kind {
+            CompletionKind::Skill => json!({
+                "type": "skill",
+                "name": self.name,
+                "path": self.path
+            }),
+            CompletionKind::Plugin | CompletionKind::App => json!({
+                "type": "mention",
+                "name": self.name,
+                "path": self.path
+            }),
+            CompletionKind::File | CompletionKind::Directory => {
+                unreachable!("filesystem completions do not carry typed bindings")
+            }
+        }
+    }
 }
 
 struct McpApproval {
@@ -1456,6 +1603,12 @@ fn parse_skill_bindings(response: &Value) -> Vec<SkillBinding> {
             Some(SkillBinding {
                 name: skill.get("name")?.as_str()?.to_owned(),
                 path: skill.get("path")?.as_str()?.to_owned(),
+                description: skill
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .or_else(|| skill.get("shortDescription").and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .to_owned(),
                 enabled: skill
                     .get("enabled")
                     .and_then(Value::as_bool)
@@ -1504,10 +1657,17 @@ fn parse_plugin_mentions(response: &Value) -> Vec<MentionBinding> {
             if !triggers.contains(&display_trigger) {
                 triggers.push(display_trigger);
             }
-            mentions.extend(triggers.into_iter().map(|trigger| MentionBinding {
-                trigger,
-                name: display_name.to_owned(),
-                path: path.clone(),
+            mentions.extend(triggers.into_iter().map(|trigger| {
+                MentionBinding {
+                    trigger,
+                    name: display_name.to_owned(),
+                    path: path.clone(),
+                    description: plugin
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Plugin")
+                        .to_owned(),
+                }
             }));
         }
     }
@@ -1537,10 +1697,17 @@ fn parse_app_mentions(response: &Value) -> Vec<MentionBinding> {
         if !triggers.contains(&name_trigger) {
             triggers.push(name_trigger);
         }
-        mentions.extend(triggers.into_iter().map(|trigger| MentionBinding {
-            trigger,
-            name: name.to_owned(),
-            path: path.clone(),
+        mentions.extend(triggers.into_iter().map(|trigger| {
+            MentionBinding {
+                trigger,
+                name: name.to_owned(),
+                path: path.clone(),
+                description: app
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("App")
+                    .to_owned(),
+            }
         }));
     }
     mentions
@@ -1563,7 +1730,7 @@ fn slugify_mention(value: &str) -> String {
     result
 }
 
-fn mention_triggers(text: &str) -> Vec<String> {
+fn mention_triggers(text: &str) -> Vec<(char, String)> {
     let mut triggers = Vec::new();
     let chars = text.char_indices().collect::<Vec<_>>();
     for (position, (_, ch)) in chars.iter().enumerate() {
@@ -1591,7 +1758,7 @@ fn mention_triggers(text: &str) -> Vec<String> {
             .map(|(index, _)| *index)
             .unwrap_or(text.len());
         if end > start {
-            triggers.push(text[start..end].to_owned());
+            triggers.push((*ch, text[start..end].to_owned()));
         }
     }
     triggers
@@ -1644,6 +1811,12 @@ pub enum SessionPickerResult {
     Cancel,
     Select(String),
 }
+
+const RESUME_PICKER_ROWS: usize = 10;
+
+/// Rows the `Apply to` step prints before its choices: the pick it is confirming
+/// and the blank under it.
+const MODEL_SCOPE_HEADER_ROWS: usize = 2;
 
 pub struct SessionPicker {
     sessions: Vec<SessionInfo>,
@@ -1766,11 +1939,26 @@ impl SessionPicker {
         self.selected = 0;
     }
 
+    /// A click on one of the painted rows. `row` counts from the top of the
+    /// visible window, so it is resolved against the same window the rows were
+    /// painted from; one click resumes, exactly as Enter on that row would.
+    pub fn click_row(&mut self, row: usize) -> SessionPickerResult {
+        let filtered = self.filtered();
+        let start = visible_window(Some(self.selected), filtered.len(), RESUME_PICKER_ROWS).start;
+        let Some(session) = filtered.get(start + row) else {
+            // The "no sessions" placeholder, which stands for nothing to resume.
+            return SessionPickerResult::None;
+        };
+        let id = session.id.clone();
+        self.selected = start + row;
+        SessionPickerResult::Select(id)
+    }
+
     pub fn overlay_view(&self) -> OverlayView<'_> {
         let filtered = self.filtered();
-        let start = self.selected.saturating_sub(4);
-        let end = (start + 9).min(filtered.len());
-        let mut lines = filtered[start..end]
+        let window = visible_window(Some(self.selected), filtered.len(), RESUME_PICKER_ROWS);
+        let start = window.start;
+        let mut lines = filtered[window]
             .iter()
             .enumerate()
             .map(|(offset, session)| {
@@ -1779,18 +1967,18 @@ impl SessionPicker {
                     .current_thread_id
                     .as_deref()
                     .is_some_and(|id| id == session.id);
-                let path = if self.all_projects {
-                    format!("\n      {}", session.cwd)
+                let folder = if self.all_projects {
+                    format!("  {}", session.cwd)
                 } else {
                     String::new()
                 };
                 OverlayLine {
                     text: format!(
-                        "{}  ·  {}{}{}",
-                        session.title(),
+                        "{:<8}  {}{}{}",
                         relative_time(session.updated_at),
+                        session.title(),
                         if current { "  ·  current" } else { "" },
-                        path
+                        folder
                     ),
                     selected: index == self.selected,
                     muted: false,
@@ -1819,8 +2007,9 @@ impl SessionPicker {
                 }
             ),
             lines,
+            slider: None,
             hint: "↑↓ navigate  Enter resume  Ctrl+A all projects  Esc cancel".to_owned(),
-            style: OverlayStyle::Panel,
+            style: OverlayStyle::CompactPanel,
             input: Some(&self.query),
             // The placeholder already says what the field is for; labelling the
             // rule above it as well just says it twice.
@@ -1873,6 +2062,7 @@ pub struct AppState {
     command_selection: usize,
     spinner_frame: usize,
     turn_started_at: Option<Instant>,
+    last_completed_duration: Option<Duration>,
     branch: Option<String>,
     five_hour_percent: Option<u8>,
     weekly_percent: Option<u8>,
@@ -1888,6 +2078,27 @@ pub struct AppState {
     skills: Vec<SkillBinding>,
     mentions: Vec<MentionBinding>,
     app_mentions: Vec<MentionBinding>,
+    workspace_entries: Vec<CompletionCandidate>,
+    completion_catalog: Vec<CompletionCandidate>,
+    completion_mode: CompletionMode,
+    completion_dismissed_text: Option<String>,
+    selected_completion_bindings: Vec<SelectedCompletionBinding>,
+    /// MCP servers that failed to start, reported before any picker was open.
+    mcp_failures: Vec<(String, Option<String>)>,
+    /// A session chosen while `thread/start` was still in flight. `thread/resume`
+    /// needs a bound thread to switch away from, so the target waits here until the
+    /// event loop can run it.
+    deferred_resume: Option<DeferredResume>,
+}
+
+/// A session switch owed once the session being started exists, and whatever the
+/// user typed after asking for it.
+pub struct DeferredResume {
+    pub target: String,
+    /// Sending this before the switch would start a turn on the session being left,
+    /// and `prepare_resume` drops the turn id locally without interrupting it — the
+    /// turn would run on unwatched. So it travels with the switch instead.
+    pub prompt: Option<String>,
 }
 
 impl AppState {
@@ -1942,6 +2153,7 @@ impl AppState {
             command_selection: 0,
             spinner_frame: 0,
             turn_started_at: None,
+            last_completed_duration: None,
             branch,
             five_hour_percent,
             weekly_percent,
@@ -1956,11 +2168,119 @@ impl AppState {
             skills: Vec::new(),
             mentions: Vec::new(),
             app_mentions: Vec::new(),
+            workspace_entries: Vec::new(),
+            completion_catalog: Vec::new(),
+            completion_mode: CompletionMode::All,
+            completion_dismissed_text: None,
+            selected_completion_bindings: Vec::new(),
+            mcp_failures: Vec::new(),
+            deferred_resume: None,
         }
     }
 
     pub fn selected_model(&self) -> Option<&ModelInfo> {
         self.models.get(self.selected_model)
+    }
+
+    pub fn models(&self) -> &[ModelInfo] {
+        &self.models
+    }
+
+    /// True until `thread/start` answers. The UI is fully painted before that, so
+    /// anything that would talk to the thread has to wait for it.
+    pub fn thread_pending(&self) -> bool {
+        self.thread_id.is_empty()
+    }
+
+    /// Holds a session picked before the current one existed. The newest pick wins,
+    /// but a prompt already typed for the switch stays with it: the user still means
+    /// to send it, they only changed where.
+    pub fn defer_resume(&mut self, target: String) {
+        let prompt = self
+            .deferred_resume
+            .take()
+            .and_then(|deferred| deferred.prompt);
+        self.deferred_resume = Some(DeferredResume { target, prompt });
+    }
+
+    pub fn has_deferred_resume(&self) -> bool {
+        self.deferred_resume.is_some()
+    }
+
+    /// Holds a prompt typed after a session was picked, joining anything already
+    /// held the same way a second prompt joins the first during a wait.
+    pub fn defer_prompt(&mut self, text: &str) {
+        let Some(deferred) = self.deferred_resume.as_mut() else {
+            return;
+        };
+        match deferred.prompt.as_mut() {
+            Some(prompt) => {
+                prompt.push_str("\n\n");
+                prompt.push_str(text);
+            }
+            None => deferred.prompt = Some(text.to_owned()),
+        }
+    }
+
+    /// Drops a held prompt without cancelling the switch it was going to ride on.
+    pub fn cancel_deferred_prompt(&mut self) {
+        if let Some(deferred) = self.deferred_resume.as_mut() {
+            deferred.prompt = None;
+        }
+    }
+
+    /// Hands the held switch over to be run, leaving nothing behind so it cannot
+    /// happen twice.
+    pub fn take_deferred_resume(&mut self) -> Option<DeferredResume> {
+        self.deferred_resume.take()
+    }
+
+    /// Binds the session `thread/start` returned to a state that is already on
+    /// screen. Unlike [`Self::set_thread`] it preserves what the user typed,
+    /// submitted, or read while the request was in flight.
+    pub fn attach_thread(
+        &mut self,
+        thread_id: String,
+        cwd: String,
+        model: &str,
+        effort: Option<&str>,
+    ) {
+        self.thread_id = thread_id;
+        if self.cwd != cwd {
+            self.cwd = cwd;
+            self.branch = read_git_branch(&self.cwd);
+            self.workspace_entries.clear();
+            self.rebuild_completion_catalog();
+        }
+        self.select_model_and_effort(model, effort);
+    }
+
+    /// Puts the session back into its pending state so a switch can wipe the screen
+    /// and keep repainting while `thread/start` runs, instead of freezing on the
+    /// thread that is being replaced.
+    pub fn begin_thread_switch(&mut self) {
+        self.thread_id.clear();
+        self.spinner_frame = 0;
+    }
+
+    /// Puts a failed switch back on the thread it left. Without this the session
+    /// would stay pending forever, refusing every command that needs a thread.
+    pub fn cancel_thread_switch(&mut self, previous_thread_id: String) {
+        self.thread_id = previous_thread_id;
+        self.show_welcome = true;
+    }
+
+    /// Drops a prompt that was queued before the thread existed, so Ctrl+C reads
+    /// the same as interrupting a live turn.
+    pub fn cancel_queued_prompt(&mut self) {
+        self.busy = false;
+        self.turn_id = None;
+        self.turn_started_at = None;
+        self.push_notice(
+            BlockKind::Warning,
+            "전송 취소",
+            "세션이 준비되기 전에 입력이 취소되었습니다.",
+        );
     }
 
     pub fn set_account_plan(&mut self, plan: AccountPlan) {
@@ -1969,90 +2289,136 @@ impl AppState {
 
     pub fn update_skills(&mut self, response: &Value) {
         self.skills = parse_skill_bindings(response);
+        self.rebuild_completion_catalog();
     }
 
     pub fn update_plugins(&mut self, response: &Value) {
         self.mentions = parse_plugin_mentions(response);
+        self.rebuild_completion_catalog();
     }
 
     pub fn update_apps(&mut self, response: &Value) {
         self.app_mentions = parse_app_mentions(response);
+        self.rebuild_completion_catalog();
     }
 
-    pub fn turn_input(&self, text: String) -> Vec<Value> {
+    pub fn update_workspace_entries(&mut self, entries: Vec<CompletionCandidate>) {
+        self.workspace_entries = entries;
+        self.rebuild_completion_catalog();
+    }
+
+    pub fn turn_input(&mut self, text: String) -> Vec<Value> {
         let triggers = mention_triggers(&text);
+        let text_chars = text.chars().collect::<Vec<_>>();
         let mut input = vec![json!({
             "type": "text",
             "text": text,
             "text_elements": []
         })];
         let mut added_paths = Vec::new();
+        let mut resolved_tokens = Vec::new();
+        for binding in std::mem::take(&mut self.selected_completion_bindings) {
+            if !binding.matches_text(&text_chars) || added_paths.contains(&binding.path) {
+                continue;
+            }
+            input.push(binding.typed_item());
+            added_paths.push(binding.path);
+            resolved_tokens.push((binding.sigil, binding.trigger));
+        }
         for skill in &self.skills {
-            if skill.enabled
-                && triggers
-                    .iter()
-                    .any(|trigger| trigger.eq_ignore_ascii_case(&skill.name))
-                && !added_paths.contains(&skill.path)
-            {
+            let matched = triggers.iter().find(|(sigil, trigger)| {
+                *sigil == '$'
+                    && trigger.eq_ignore_ascii_case(&skill.name)
+                    && !resolved_tokens.iter().any(|resolved| {
+                        resolved.0 == *sigil && resolved.1.eq_ignore_ascii_case(trigger)
+                    })
+            });
+            if skill.enabled && matched.is_some() && !added_paths.contains(&skill.path) {
                 input.push(json!({
                     "type": "skill",
                     "name": skill.name,
                     "path": skill.path
                 }));
                 added_paths.push(skill.path.clone());
+                resolved_tokens.push(('$', skill.name.clone()));
             }
         }
         for mention in &self.mentions {
-            if triggers
-                .iter()
-                .any(|trigger| trigger.eq_ignore_ascii_case(&mention.trigger))
-                && !added_paths.contains(&mention.path)
-            {
+            let matched = triggers.iter().find(|(sigil, trigger)| {
+                *sigil == '@'
+                    && trigger.eq_ignore_ascii_case(&mention.trigger)
+                    && !resolved_tokens.iter().any(|resolved| {
+                        resolved.0 == *sigil && resolved.1.eq_ignore_ascii_case(trigger)
+                    })
+            });
+            if matched.is_some() && !added_paths.contains(&mention.path) {
                 input.push(json!({
                     "type": "mention",
                     "name": mention.name,
                     "path": mention.path
                 }));
                 added_paths.push(mention.path.clone());
+                resolved_tokens.push(('@', mention.trigger.clone()));
             }
         }
         for mention in &self.app_mentions {
-            if triggers
-                .iter()
-                .any(|trigger| trigger.eq_ignore_ascii_case(&mention.trigger))
-                && !added_paths.contains(&mention.path)
-            {
+            let matched = triggers.iter().find(|(sigil, trigger)| {
+                *sigil == '$'
+                    && trigger.eq_ignore_ascii_case(&mention.trigger)
+                    && !resolved_tokens.iter().any(|resolved| {
+                        resolved.0 == *sigil && resolved.1.eq_ignore_ascii_case(trigger)
+                    })
+            });
+            if matched.is_some() && !added_paths.contains(&mention.path) {
                 input.push(json!({
                     "type": "mention",
                     "name": mention.name,
                     "path": mention.path
                 }));
                 added_paths.push(mention.path.clone());
+                resolved_tokens.push(('$', mention.trigger.clone()));
             }
         }
         input
     }
 
-    pub fn confirm_plugin_install(
-        &mut self,
-        target: PluginInstallTarget,
-        marketplace: &str,
-        description: Option<&str>,
-        disclosure: Vec<String>,
-    ) {
+    pub fn confirm_plugin_install(&mut self, plugin: &PluginInfo) {
         let mut detail = vec![
-            format!("Plugin: {}", target.plugin_name),
-            format!("Marketplace: {marketplace}"),
+            format!("Plugin: {}", plugin.display_name),
+            format!("Marketplace: {}", plugin.marketplace_name),
         ];
-        if let Some(description) = description.filter(|text| !text.is_empty()) {
+        if let Some(description) = plugin
+            .description
+            .as_deref()
+            .filter(|text| !text.is_empty())
+        {
             detail.push(description.to_owned());
         }
-        detail.extend(disclosure);
+        detail.extend(plugin.install_disclosure());
         detail.push("설치하면 포함된 Skill, MCP 서버와 Hook이 Codex에 추가됩니다.".to_owned());
         self.pending = Some(PendingInteraction::Confirm {
             title: "플러그인을 설치할까요?".to_owned(),
             detail,
-            action: ConfirmedAction::InstallPlugin(target),
+            action: ConfirmedAction::InstallPlugin(PluginInstallTarget {
+                plugin_name: plugin.name.clone(),
+                marketplace_path: plugin.marketplace_path.clone(),
+                remote_marketplace_name: plugin.remote_marketplace_name.clone(),
+            }),
+        });
+    }
+
+    pub fn confirm_plugin_uninstall(&mut self, plugin: &PluginInfo) {
+        self.pending = Some(PendingInteraction::Confirm {
+            title: "플러그인을 제거할까요?".to_owned(),
+            detail: vec![
+                format!("Plugin: {}", plugin.display_name),
+                format!("Marketplace: {}", plugin.marketplace_name),
+                "포함된 Skill, MCP 서버와 Hook이 Codex에서 제거됩니다.".to_owned(),
+            ],
+            action: ConfirmedAction::UninstallPlugin(PluginUninstallTarget {
+                plugin_id: plugin.id.clone(),
+                display_name: plugin.display_name.clone(),
+            }),
         });
     }
 
@@ -2159,17 +2525,6 @@ impl AppState {
         std::mem::take(&mut self.account_refresh_due)
     }
 
-    pub fn confirm_plugin_uninstall(&mut self, target: PluginUninstallTarget) {
-        self.pending = Some(PendingInteraction::Confirm {
-            title: "플러그인을 제거할까요?".to_owned(),
-            detail: vec![
-                format!("Plugin: {}", target.display_name),
-                "포함된 Skill과 MCP 연결이 새 세션부터 제거됩니다.".to_owned(),
-            ],
-            action: ConfirmedAction::UninstallPlugin(target),
-        });
-    }
-
     pub fn permission_mode(&self) -> PermissionMode {
         self.permission_mode
     }
@@ -2231,8 +2586,20 @@ impl AppState {
                 .is_some_and(|model| model.fast_service_tier.is_some())
     }
 
+    /// Only the explicit toggle lands here, so it is the one place that owes the
+    /// user a line: the badge alone leaves a `/fast` with no visible answer.
     pub fn set_fast_mode(&mut self, enabled: bool) {
         self.fast_mode = enabled;
+        self.commit_welcome_card();
+        self.committed.push(Block::new(
+            BlockKind::ModelChange,
+            if enabled {
+                "✓ Fast mode On"
+            } else {
+                "✓ Fast mode Off"
+            },
+            "",
+        ));
     }
 
     pub fn set_copy_notice(&mut self, count: usize) {
@@ -2318,7 +2685,11 @@ impl AppState {
         effort: Option<&str>,
     ) {
         self.thread_id = thread_id;
-        self.cwd = cwd;
+        if self.cwd != cwd {
+            self.cwd = cwd;
+            self.workspace_entries.clear();
+            self.rebuild_completion_catalog();
+        }
         self.branch = read_git_branch(&self.cwd);
         self.turn_id = None;
         self.busy = false;
@@ -2326,6 +2697,12 @@ impl AppState {
         self.active.clear();
         self.active_order.clear();
         self.show_welcome = true;
+        self.select_model_and_effort(model, effort);
+    }
+
+    /// Points the status line at what the server actually picked, without the
+    /// confirmation card [`Self::apply_model`] posts for a user-driven change.
+    fn select_model_and_effort(&mut self, model: &str, effort: Option<&str>) {
         if let Some(index) = self
             .models
             .iter()
@@ -2346,21 +2723,30 @@ impl AppState {
             .unwrap_or_else(|| self.selected_effort.clone());
     }
 
-    pub fn load_history(&mut self, thread: &Value) {
+    /// Rebuilds the transcript from a resumed thread. `rollout` fills in what
+    /// `thread/resume` omits — shell runs above all — placing each one back where
+    /// it ran rather than at the end of its turn.
+    pub fn load_history(&mut self, thread: &Value, rollout: Option<&Rollout>) {
         let Some(turns) = thread.get("turns").and_then(Value::as_array) else {
             return;
         };
+        self.last_completed_duration = turns.iter().rev().find_map(|turn| {
+            let started = turn.get("startedAt")?.as_i64()?;
+            let completed = turn.get("completedAt")?.as_i64()?;
+            u64::try_from(completed.checked_sub(started)?).ok().map(Duration::from_secs)
+        });
         for turn in turns {
             let Some(items) = turn.get("items").and_then(Value::as_array) else {
                 continue;
             };
-            for item in items {
-                if let Some(block) = completed_item_block(item) {
-                    if matches!(block.kind, BlockKind::Assistant) {
-                        self.last_assistant_markdown = Some(block.body.clone());
-                    }
-                    self.committed.push(block);
-                }
+            for block in merged_turn_blocks(&self.cwd, turn, items, rollout) {
+                self.committed.push(block);
+            }
+            // Read straight off the server's own item order, not the
+            // merged/sorted block order: a rollout event dated oddly must
+            // never make an earlier message look like the last one shown.
+            if let Some(text) = last_agent_message_text(items) {
+                self.last_assistant_markdown = Some(text);
             }
         }
         self.show_welcome = false;
@@ -2369,7 +2755,10 @@ impl AppState {
     pub fn set_turn_started(&mut self, turn_id: String) {
         self.turn_id = Some(turn_id);
         self.busy = true;
-        self.turn_started_at = Some(Instant::now());
+        self.last_completed_duration = None;
+        // A prompt held back while the session was still starting has been counting
+        // since the user pressed Enter, so keep that clock rather than restarting it.
+        self.turn_started_at.get_or_insert_with(Instant::now);
     }
 
     pub fn set_request_failed(&mut self, message: impl Into<String>) {
@@ -2388,6 +2777,86 @@ impl AppState {
         )));
     }
 
+    pub fn open_mcp_picker(&mut self, servers: Vec<McpServerInfo>, notice: Option<String>) {
+        let mut picker = McpPicker::new(servers);
+        if let Some(notice) = notice {
+            picker = picker.with_notice(notice);
+        }
+        for (name, detail) in std::mem::take(&mut self.mcp_failures) {
+            picker.apply_failure(&name, detail);
+        }
+        self.pending = Some(PendingInteraction::McpPicker(picker));
+    }
+
+    pub fn open_plugin_picker(
+        &mut self,
+        catalog: PluginCatalog,
+        scope: Option<PluginScope>,
+        notice: Option<String>,
+    ) {
+        let mut picker = PluginPicker::new(catalog, scope);
+        if let Some(notice) = notice {
+            picker = picker.with_notice(notice);
+        }
+        self.pending = Some(PendingInteraction::PluginPicker(picker));
+    }
+
+    pub fn open_plugin_detail(
+        &mut self,
+        catalog: PluginCatalog,
+        target: PluginTarget,
+        detail: PluginDetail,
+        origin: Option<PluginScope>,
+    ) {
+        self.pending = Some(PendingInteraction::PluginPicker(
+            PluginPicker::new(catalog, None).into_detail(target, detail, origin),
+        ));
+    }
+
+    pub fn open_marketplace_picker(&mut self, catalog: &PluginCatalog, notice: Option<String>) {
+        let mut picker = MarketplacePicker::new(catalog.marketplaces.clone());
+        if let Some(notice) = notice {
+            picker = picker.with_notice(notice);
+        }
+        self.pending = Some(PendingInteraction::MarketplacePicker(picker));
+    }
+
+    /// Records a failed MCP startup so the next `/mcp` lists it. The event loop
+    /// sees these notifications while no picker is open, which is exactly when
+    /// servers come up.
+    pub fn note_mcp_failure(&mut self, name: String, detail: Option<String>) {
+        if let Some(PendingInteraction::McpPicker(picker)) = self.pending.as_mut() {
+            picker.apply_failure(&name, detail);
+            return;
+        }
+        self.mcp_failures.retain(|(known, _)| known != &name);
+        self.mcp_failures.push((name, detail));
+    }
+
+    pub fn confirm_marketplace_add(&mut self, source: &str) {
+        self.pending = Some(PendingInteraction::Confirm {
+            title: "마켓플레이스를 추가할까요?".to_owned(),
+            detail: vec![
+                format!("Source: {source}"),
+                "Codex가 이 소스를 체크아웃하고 플러그인 목록을 읽습니다.".to_owned(),
+                "신뢰할 수 있는 저장소만 추가하세요. 포함된 Hook과 MCP 서버는 설치 시 실행될 수 있습니다."
+                    .to_owned(),
+            ],
+            action: ConfirmedAction::AddMarketplace(source.to_owned()),
+        });
+    }
+
+    pub fn confirm_marketplace_remove(&mut self, name: &str) {
+        self.pending = Some(PendingInteraction::Confirm {
+            title: "마켓플레이스를 제거할까요?".to_owned(),
+            detail: vec![
+                format!("Marketplace: {name}"),
+                "설정에서 소스만 제거하며, 이미 설치된 플러그인은 남습니다.".to_owned(),
+            ],
+            action: ConfirmedAction::RemoveMarketplace(name.to_owned()),
+        });
+    }
+
     pub fn prepare_resume(&mut self) {
         self.committed.clear();
         self.active.clear();
@@ -2404,6 +2873,7 @@ impl AppState {
         self.busy = false;
         self.turn_id = None;
         self.turn_started_at = None;
+        self.last_completed_duration = None;
     }
 
     pub fn prepare_new_thread(&mut self) {
@@ -2430,12 +2900,6 @@ impl AppState {
         );
     }
 
-    /// Notice painted before a slow round-trip. The event loop cannot redraw
-    /// while an action awaits, so callers set this and draw once up front.
-    pub fn set_waiting_notice(&mut self, message: impl Into<String>) {
-        self.set_composer_notice(message.into());
-    }
-
     /// Brings the welcome panel back after the screen is wiped, so a cleared
     /// terminal looks like a fresh start instead of a bare composer.
     pub fn reset_welcome(&mut self) {
@@ -2452,11 +2916,32 @@ impl AppState {
     }
 
     pub fn view(&self) -> View<'_> {
+        let shell_count = self
+            .active_order
+            .iter()
+            .filter_map(|id| self.active.get(id))
+            .filter(|item| item.block.title.starts_with("Shell ·"))
+            .count();
+        let mut shell_status_added = false;
         let live_blocks = self
             .active_order
             .iter()
             .filter_map(|id| self.active.get(id))
-            .map(|item| item.block.clone())
+            .filter_map(|item| {
+                if !item.block.title.starts_with("Shell ·") {
+                    return Some(item.block.clone());
+                }
+                if shell_status_added {
+                    return None;
+                }
+                shell_status_added = true;
+                let noun = if shell_count == 1 { "command" } else { "commands" };
+                Some(Block::new(
+                    BlockKind::Tool,
+                    format!("Running {shell_count} shell {noun}"),
+                    "",
+                ))
+            })
             .collect::<Vec<_>>();
         View {
             live_blocks,
@@ -2464,11 +2949,13 @@ impl AppState {
             editor: &self.editor,
             welcome: self.show_welcome.then(|| self.welcome_view()),
             suggestions: if self.pending.is_none() {
-                self.slash_suggestion_views()
+                self.completion_suggestion_views()
+                    .unwrap_or_else(|| self.slash_suggestion_views())
             } else {
                 Vec::new()
             },
             activity: self.activity(),
+            activity_phase: self.activity_phase(),
             footer: String::new(),
             status_line: Some(self.status_line()),
             composer_notice: self
@@ -2502,6 +2989,8 @@ impl AppState {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
+        let old_text = self.editor.text();
+        let binding_count = self.selected_completion_bindings.len();
         match &mut self.pending {
             Some(PendingInteraction::UserInput {
                 text_mode: true,
@@ -2519,15 +3008,29 @@ impl AppState {
                 form.editor.insert_str(text);
             }
             Some(PendingInteraction::SessionPicker(picker)) => picker.handle_paste(text),
+            Some(PendingInteraction::McpPicker(picker)) => picker.handle_paste(text),
+            Some(PendingInteraction::PluginPicker(picker)) => picker.handle_paste(text),
+            Some(PendingInteraction::MarketplacePicker(picker)) => picker.handle_paste(text),
             Some(_) => {}
             None => {
                 self.editor.insert_str(text);
                 self.command_selection = 0;
             }
         }
+        self.sync_selected_completion_bindings(&old_text, binding_count);
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
+        let old_text = self.editor.text();
+        let binding_count = self.selected_completion_bindings.len();
+        let action = self.handle_key_inner(key);
+        if !matches!(action, Action::Submit(_) | Action::Steer(_)) {
+            self.sync_selected_completion_bindings(&old_text, binding_count);
+        }
+        action
+    }
+
+    fn handle_key_inner(&mut self, key: KeyEvent) -> Action {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return Action::None;
         }
@@ -2538,6 +3041,71 @@ impl AppState {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+
+        let completion_matches = self.matching_completions();
+        if let Some((target, matches)) = completion_matches.as_ref() {
+            if ctrl {
+                match key.code {
+                    KeyCode::Char('p') if !matches.is_empty() => {
+                        self.command_selection = if self.command_selection == 0 {
+                            matches.len() - 1
+                        } else {
+                            self.command_selection - 1
+                        };
+                        return Action::None;
+                    }
+                    KeyCode::Char('n') if !matches.is_empty() => {
+                        self.command_selection = (self.command_selection + 1) % matches.len();
+                        return Action::None;
+                    }
+                    _ => {}
+                }
+            }
+            if !ctrl && !alt && !shift {
+                match key.code {
+                    KeyCode::Up => {
+                        if !matches.is_empty() {
+                            self.command_selection = if self.command_selection == 0 {
+                                matches.len() - 1
+                            } else {
+                                self.command_selection - 1
+                            };
+                        }
+                        return Action::None;
+                    }
+                    KeyCode::Down => {
+                        if !matches.is_empty() {
+                            self.command_selection = (self.command_selection + 1) % matches.len();
+                        }
+                        return Action::None;
+                    }
+                    KeyCode::Left if target.sigil == '@' => {
+                        self.completion_mode = self.completion_mode.previous();
+                        self.command_selection = 0;
+                        return Action::None;
+                    }
+                    KeyCode::Right if target.sigil == '@' => {
+                        self.completion_mode = self.completion_mode.next();
+                        self.command_selection = 0;
+                        return Action::None;
+                    }
+                    KeyCode::Tab | KeyCode::Enter => {
+                        if let Some(selected) =
+                            matches.get(self.command_selection.min(matches.len().saturating_sub(1)))
+                        {
+                            self.insert_completion(target, selected);
+                        }
+                        return Action::None;
+                    }
+                    KeyCode::Esc => {
+                        self.completion_dismissed_text = Some(self.editor.text());
+                        self.command_selection = 0;
+                        return Action::None;
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         let slash_matches = self.matching_slash_commands();
         if !slash_matches.is_empty() && ctrl {
@@ -2703,6 +3271,9 @@ impl AppState {
             KeyCode::Char(ch) if !ctrl => {
                 self.editor.insert(ch);
                 self.command_selection = 0;
+                if matches!(ch, '$' | '@') {
+                    self.completion_mode = CompletionMode::All;
+                }
                 Action::None
             }
             _ => Action::None,
@@ -2885,6 +3456,23 @@ impl AppState {
         }
     }
 
+    /// Whether the server is blocked on an answer from the user: an approval, a
+    /// question, or an MCP prompt. The local overlays (`/model`, `/theme`, the
+    /// session list) are the user's own detour and deliberately do not count —
+    /// DevezCode raises its ❗ badge on this.
+    pub fn awaiting_input(&self) -> bool {
+        matches!(
+            self.pending,
+            Some(
+                PendingInteraction::Approval { .. }
+                    | PendingInteraction::UserInput { .. }
+                    | PendingInteraction::McpForm(_)
+                    | PendingInteraction::McpApproval(_)
+                    | PendingInteraction::McpUrl { .. }
+            )
+        )
+    }
+
     fn clear_resolved_server_request(&mut self, request_id: &Value) {
         let matches = match self.pending.as_ref() {
             Some(PendingInteraction::Approval { id, .. })
@@ -2953,6 +3541,7 @@ impl AppState {
             "turn/completed" => {
                 self.busy = false;
                 self.turn_id = None;
+                self.last_completed_duration = self.turn_started_at.map(|started| started.elapsed());
                 self.turn_started_at = None;
                 if let Some(error) = params
                     .get("turn")
@@ -2969,6 +3558,42 @@ impl AppState {
                     ));
                 }
                 self.flush_orphaned_active();
+            }
+            "turn/plan/updated" => {
+                let explanation = params
+                    .get("explanation")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty());
+                let steps = params
+                    .get("plan")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|step| {
+                        let text = step.get("step")?.as_str()?;
+                        // Codex checkboxes: done, current, still to do. The
+                        // renderer paints `▸` as a lit `□`.
+                        let marker = match step.get("status").and_then(Value::as_str) {
+                            Some("completed") => "✔",
+                            Some("inProgress") => "▸",
+                            _ => "□",
+                        };
+                        Some(format!("{marker} {text}"))
+                    })
+                    .collect::<Vec<_>>();
+                // The explanation hangs off a `└` the way Codex renders it.
+                let mut rows = explanation
+                    .into_iter()
+                    .flat_map(str::lines)
+                    .filter(|line| !line.trim().is_empty())
+                    .map(|line| format!("└ {line}"))
+                    .collect::<Vec<_>>();
+                rows.extend(steps);
+                self.committed.push(Block::new(
+                    BlockKind::Plan,
+                    "Updated Plan",
+                    rows.join("\n"),
+                ));
             }
             "item/started" => {
                 if let Some(item) = params.get("item") {
@@ -2994,16 +3619,16 @@ impl AppState {
             }
             "item/fileChange/patchUpdated" => {
                 if let Some(item_id) = params.get("itemId").and_then(Value::as_str) {
-                    let body = file_changes_body(
-                        params
-                            .get("changes")
-                            .and_then(Value::as_array)
-                            .map(Vec::as_slice)
-                            .unwrap_or(&[]),
-                    );
-                    self.ensure_active(item_id, BlockKind::Tool, "Files")
-                        .block
-                        .body = body;
+                    let changes = params
+                        .get("changes")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let title = file_changes_title(&self.cwd, changes);
+                    let body = file_changes_body(&self.cwd, changes);
+                    let active = self.ensure_active(item_id, BlockKind::FileChange, &title);
+                    active.block.title = title;
+                    active.block.body = body;
                 }
             }
             "item/mcpToolCall/progress" => {
@@ -3080,13 +3705,14 @@ impl AppState {
                     self.set_composer_notice(format!("{from} → {to}로 전환됨"));
                 }
             }
-            "skills/changed" => {
-                self.set_composer_notice("Skills refreshed".to_owned());
-            }
-            "app/list/updated" => {
-                self.update_apps(params);
-                self.set_composer_notice("Apps refreshed".to_owned());
-            }
+            // The server rescans on every skill-file touch, so announcing it
+            // would be constant noise. The catalogue still reloads; Codex says
+            // nothing here either.
+            "skills/changed" => {}
+            // Like `skills/changed`, the rescan fires on every app-file touch,
+            // so announcing it would be constant noise. The catalogue reloads
+            // silently.
+            "app/list/updated" => self.update_apps(params),
             "mcpServer/oauthLogin/completed" => {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("MCP");
                 let success = params
@@ -3116,28 +3742,16 @@ impl AppState {
                 ));
             }
             "mcpServer/startupStatus/updated" => {
-                let status = params
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if status == "failed" {
-                    let name = params.get("name").and_then(Value::as_str).unwrap_or("MCP");
-                    let reconnect = params.get("failureReason").and_then(Value::as_str)
-                        == Some("reauthenticationRequired");
-                    let detail = if reconnect {
-                        format!("인증이 만료되었습니다. /mcp login {name}")
-                    } else {
-                        params
-                            .get("error")
-                            .and_then(Value::as_str)
-                            .unwrap_or("MCP 서버를 시작하지 못했습니다.")
-                            .to_owned()
-                    };
+                if let Some((name, detail)) = crate::integrations::parse_startup_failure(params) {
                     self.committed.push(Block::new(
                         BlockKind::Warning,
                         format!("{name} unavailable"),
-                        detail,
+                        detail.clone(),
                     ));
+                    // A server that never came up is absent from
+                    // `mcpServerStatus/list`, so `/mcp` can only list it if the
+                    // failure is remembered here.
+                    self.note_mcp_failure(name, Some(detail));
                 }
             }
             "thread/compacted" => self.committed.push(Block::new(
@@ -3163,6 +3777,9 @@ impl AppState {
             Action::Steer(text)
         } else {
             self.busy = true;
+            // Time the turn from Enter, not from the server's acknowledgement: a
+            // prompt held back by a starting session would otherwise read 0s.
+            self.turn_started_at = Some(Instant::now());
             Action::Submit(text)
         }
     }
@@ -3174,7 +3791,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    "/model [MODEL] [EFFORT]  모델과 effort 선택\n/fast  빠른 서비스 티어 전환\n/effort [LEVEL]  추론 수준\n/theme [minimal|soft|dark]  화면 테마\n/mcp [login NAME]  MCP 서버와 OAuth\n/plugins [install|uninstall|enable|disable NAME]  플러그인 관리\n/skills [enable|disable NAME]  Skill 관리\n/apps [enable|disable NAME]  App 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/diff  git diff 표시\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/login  ChatGPT 계정 로그인\n/logout  계정 연결 해제\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$skill-name, $app-name 또는 @plugin-name  명시적으로 사용\nEsc 또는 Ctrl+C  실행 중단\nShift+Tab  권한 모드 전환 (Read Only / Default / Full Access)\nCtrl+Enter / Shift+Enter  줄바꿈",
+                    "/model [MODEL] [EFFORT]  모델과 effort 선택\n/fast  빠른 서비스 티어 전환\n/effort [LEVEL]  추론 수준\n/theme [minimal|soft|dark]  화면 테마\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/diff  git diff 표시\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/login  ChatGPT 계정 로그인\n/logout  계정 연결 해제\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nShift+Tab  권한 모드 전환 (Read Only / Default / Full Access)\nCtrl+Enter / Shift+Enter  줄바꿈",
                 ));
                 Action::None
             }
@@ -3289,15 +3906,18 @@ impl AppState {
                 };
                 self.apply_theme(selected)
             }
-            "/mcp" if parts.len() == 1 => Action::ShowMcp,
+            "/mcp" if parts.len() == 1 => Action::OpenMcp(None),
             "/mcp" if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("login") => {
                 Action::McpLogin(parts[2..].join(" "))
+            }
+            "/mcp" if parts.len() == 2 && parts[1].eq_ignore_ascii_case("reconnect") => {
+                Action::ReconnectMcp
             }
             "/mcp" => {
                 self.committed.push(Block::new(
                     BlockKind::Error,
                     "Usage",
-                    "/mcp 또는 /mcp login SERVER",
+                    "/mcp, /mcp reconnect 또는 /mcp login SERVER",
                 ));
                 Action::None
             }
@@ -3309,7 +3929,38 @@ impl AppState {
                 self.confirm_logout();
                 Action::None
             }
-            "/plugins" if parts.len() == 1 => Action::ShowPlugins,
+            "/plugins" if parts.len() == 1 => Action::OpenPlugins {
+                scope: None,
+                notice: None,
+            },
+            "/plugins"
+                if parts.len() == 2
+                    && (parts[1].eq_ignore_ascii_case("marketplace")
+                        || parts[1].eq_ignore_ascii_case("marketplaces")) =>
+            {
+                Action::OpenMarketplaces(None)
+            }
+            "/plugins"
+                if parts.len() >= 4
+                    && parts[1].eq_ignore_ascii_case("marketplace")
+                    && parts[2].eq_ignore_ascii_case("add") =>
+            {
+                Action::ConfirmMarketplaceAdd(parts[3..].join(" "))
+            }
+            "/plugins"
+                if parts.len() >= 4
+                    && parts[1].eq_ignore_ascii_case("marketplace")
+                    && parts[2].eq_ignore_ascii_case("remove") =>
+            {
+                Action::ConfirmMarketplaceRemove(parts[3..].join(" "))
+            }
+            "/plugins"
+                if parts.len() == 3
+                    && parts[1].eq_ignore_ascii_case("marketplace")
+                    && parts[2].eq_ignore_ascii_case("upgrade") =>
+            {
+                Action::UpgradeMarketplaces
+            }
             "/plugins" if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("install") => {
                 Action::PreparePluginInstall(parts[2..].join(" "))
             }
@@ -3332,10 +3983,12 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::Error,
                     "Usage",
-                    "/plugins 또는 /plugins install|uninstall|enable|disable NAME",
+                    "/plugins, /plugins install|uninstall|enable|disable NAME\n\
+                     /plugins marketplace [add SOURCE | remove NAME | upgrade]",
                 ));
                 Action::None
             }
+            "/reload-plugins" | "/reload-skills" => Action::ReloadPlugins,
             "/skills" if parts.len() == 1 => Action::ShowSkills,
             "/skills" if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("enable") => {
                 Action::SetSkill {
@@ -3354,27 +4007,6 @@ impl AppState {
                     BlockKind::Error,
                     "Usage",
                     "/skills 또는 /skills enable|disable NAME",
-                ));
-                Action::None
-            }
-            "/apps" if parts.len() == 1 => Action::ShowApps,
-            "/apps" if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("enable") => {
-                Action::SetApp {
-                    query: parts[2..].join(" "),
-                    enabled: true,
-                }
-            }
-            "/apps" if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("disable") => {
-                Action::SetApp {
-                    query: parts[2..].join(" "),
-                    enabled: false,
-                }
-            }
-            "/apps" => {
-                self.committed.push(Block::new(
-                    BlockKind::Error,
-                    "Usage",
-                    "/apps 또는 /apps enable|disable NAME",
                 ));
                 Action::None
             }
@@ -3506,13 +4138,7 @@ impl AppState {
                     KeyCode::Char(ch) if !ctrl && !alt && ('1'..='9').contains(&ch) => {
                         let index = ch.to_digit(10).unwrap_or_default() as usize - 1;
                         if index < self.models.len() {
-                            let effort_index = self.effort_index_for_model(index);
-                            let effort = self
-                                .models
-                                .get(index)
-                                .and_then(|model| model.efforts.get(effort_index))
-                                .map(|effort| effort.id.clone());
-                            self.apply_model(index, effort.as_deref());
+                            self.open_model_scope(index, self.effort_index_for_model(index));
                             return Action::None;
                         }
                     }
@@ -3529,12 +4155,7 @@ impl AppState {
                         effort_index = (effort_index + 1).min(count - 1);
                     }
                     KeyCode::Enter => {
-                        let effort = self
-                            .models
-                            .get(model_index)
-                            .and_then(|model| model.efforts.get(effort_index))
-                            .map(|effort| effort.id.clone());
-                        self.apply_model(model_index, effort.as_deref());
+                        self.open_model_scope(model_index, effort_index);
                         return Action::None;
                     }
                     _ => {}
@@ -3542,6 +4163,45 @@ impl AppState {
                 self.pending = Some(PendingInteraction::ModelPicker {
                     model_index,
                     effort_index,
+                });
+                Action::None
+            }
+            PendingInteraction::ModelScope {
+                model_index,
+                effort_index,
+                mut selected,
+            } => {
+                match key.code {
+                    KeyCode::Esc => return Action::None,
+                    KeyCode::Up | KeyCode::Left => selected = selected.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
+                        selected = (selected + 1).min(ModelScope::CHOICES.len() - 1);
+                    }
+                    KeyCode::Char('k') if !ctrl && !alt => selected = selected.saturating_sub(1),
+                    KeyCode::Char('j') if !ctrl && !alt => {
+                        selected = (selected + 1).min(ModelScope::CHOICES.len() - 1);
+                    }
+                    KeyCode::Char(ch) if !ctrl && !alt && ('1'..='2').contains(&ch) => {
+                        let index = ch.to_digit(10).unwrap_or(1) as usize - 1;
+                        return self.apply_model_scope(
+                            model_index,
+                            effort_index,
+                            ModelScope::CHOICES[index],
+                        );
+                    }
+                    KeyCode::Enter => {
+                        return self.apply_model_scope(
+                            model_index,
+                            effort_index,
+                            ModelScope::CHOICES[selected],
+                        );
+                    }
+                    _ => {}
+                }
+                self.pending = Some(PendingInteraction::ModelScope {
+                    model_index,
+                    effort_index,
+                    selected,
                 });
                 Action::None
             }
@@ -3607,6 +4267,56 @@ impl AppState {
                 }
                 SessionPickerResult::Cancel => Action::None,
                 SessionPickerResult::Select(thread_id) => Action::ResumeThread(thread_id),
+            },
+            PendingInteraction::McpPicker(mut picker) => match picker.handle_key(key) {
+                McpPickerResult::None => {
+                    self.pending = Some(PendingInteraction::McpPicker(picker));
+                    Action::None
+                }
+                McpPickerResult::Cancel => Action::None,
+                McpPickerResult::Login(name) => Action::McpLogin(name),
+                McpPickerResult::Reconnect => Action::ReconnectMcp,
+            },
+            PendingInteraction::PluginPicker(mut picker) => {
+                let result = picker.handle_key(key);
+                // Every branch that leaves the picker reopens it against fresh
+                // data, so the scope it was on has to survive the round trip.
+                let scope = picker.scope();
+                match result {
+                    PluginPickerResult::None => {
+                        self.pending = Some(PendingInteraction::PluginPicker(picker));
+                        Action::None
+                    }
+                    PluginPickerResult::Cancel => Action::None,
+                    PluginPickerResult::OpenDetail(target) => Action::OpenPluginDetail {
+                        target,
+                        origin: scope,
+                    },
+                    PluginPickerResult::Install(plugin) => Action::ConfirmPluginInstall(plugin),
+                    PluginPickerResult::Uninstall(plugin) => Action::ConfirmPluginUninstall(plugin),
+                    PluginPickerResult::SetEnabled { plugin, enabled } => {
+                        Action::SetPluginEnabled { plugin, enabled }
+                    }
+                    PluginPickerResult::OpenMarketplaces => Action::OpenMarketplaces(None),
+                    PluginPickerResult::OpenUrl(url) => {
+                        self.pending = Some(PendingInteraction::PluginPicker(picker));
+                        Action::OpenUrl(url)
+                    }
+                }
+            }
+            PendingInteraction::MarketplacePicker(mut picker) => match picker.handle_key(key) {
+                MarketplacePickerResult::None => {
+                    self.pending = Some(PendingInteraction::MarketplacePicker(picker));
+                    Action::None
+                }
+                MarketplacePickerResult::Cancel => Action::None,
+                MarketplacePickerResult::Back => Action::OpenPlugins {
+                    scope: None,
+                    notice: None,
+                },
+                MarketplacePickerResult::Add(source) => Action::ConfirmMarketplaceAdd(source),
+                MarketplacePickerResult::Remove(name) => Action::ConfirmMarketplaceRemove(name),
+                MarketplacePickerResult::UpgradeAll => Action::UpgradeMarketplaces,
             },
             PendingInteraction::Approval {
                 id,
@@ -3841,9 +4551,9 @@ impl AppState {
                 model_index,
                 effort_index,
             } => {
-                let start = model_index.saturating_sub(4);
-                let end = (start + 9).min(self.models.len());
-                let mut lines = self.models[start..end]
+                let window = visible_window(Some(*model_index), self.models.len(), PICKER_ROWS);
+                let start = window.start;
+                let mut lines = self.models[window]
                     .iter()
                     .enumerate()
                     .map(|(offset, model)| {
@@ -3855,32 +4565,19 @@ impl AppState {
                         }
                     })
                     .collect::<Vec<_>>();
-                if let Some(model) = self.models.get(*model_index) {
+                let slider = self.models.get(*model_index).map(|model| {
                     lines.push(OverlayLine {
                         text: String::new(),
                         selected: false,
                         muted: true,
                     });
-                    lines.push(OverlayLine {
-                        text: "Effort".to_owned(),
-                        selected: false,
-                        muted: false,
-                    });
-                    lines.extend(
-                        effort_slider_rows(model, *effort_index)
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, text)| OverlayLine {
-                                text,
-                                selected: false,
-                                muted: index != 1,
-                            }),
-                    );
-                }
+                    effort_slider(model, *effort_index)
+                });
                 Some(OverlayView {
-                    title: "Select model".to_owned(),
+                    title: "Model".to_owned(),
                     lines,
-                    hint: "1-9 select   ↑↓ model   ←→ effort   Enter select   Esc cancel"
+                    slider,
+                    hint: "↑↓ model  ·  ←→ effort  ·  Enter to continue  ·  Esc to cancel"
                         .to_owned(),
                     style: OverlayStyle::Picker,
                     input: None,
@@ -3888,11 +4585,25 @@ impl AppState {
                     input_placeholder: "",
                 })
             }
-            PendingInteraction::EffortPicker { effort_index } => {
-                let model = self.selected_model()?;
+            PendingInteraction::ModelScope {
+                model_index,
+                effort_index,
+                selected,
+            } => {
+                let model = self.models.get(*model_index)?;
+                let effort = model
+                    .efforts
+                    .get(*effort_index)
+                    .map(|effort| effort.id.as_str())
+                    .unwrap_or(&model.default_effort);
+                let label_width = ModelScope::CHOICES
+                    .iter()
+                    .map(|scope| scope.label().len())
+                    .max()
+                    .unwrap_or_default();
                 let mut lines = vec![
                     OverlayLine {
-                        text: model.display_name.clone(),
+                        text: format!("{}  ·  {effort}", model.display_name),
                         selected: false,
                         muted: true,
                     },
@@ -3903,19 +4614,39 @@ impl AppState {
                     },
                 ];
                 lines.extend(
-                    effort_slider_rows(model, *effort_index)
-                        .into_iter()
+                    ModelScope::CHOICES
+                        .iter()
                         .enumerate()
-                        .map(|(index, text)| OverlayLine {
-                            text,
-                            selected: false,
-                            muted: index != 1,
+                        .map(|(index, scope)| OverlayLine {
+                            text: format!(
+                                "{}. {:<label_width$}  ·  {}",
+                                index + 1,
+                                scope.label(),
+                                scope.detail()
+                            ),
+                            selected: index == *selected,
+                            muted: false,
                         }),
                 );
                 Some(OverlayView {
-                    title: "Set effort".to_owned(),
+                    title: "Apply to".to_owned(),
                     lines,
-                    hint: "←→ adjust   Enter apply   Esc cancel".to_owned(),
+                    slider: None,
+                    hint: "1-2 select  ·  ↑↓ navigate  ·  Enter to apply  ·  Esc to cancel"
+                        .to_owned(),
+                    style: OverlayStyle::Picker,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                })
+            }
+            PendingInteraction::EffortPicker { effort_index } => {
+                let model = self.selected_model()?;
+                Some(OverlayView {
+                    title: "Effort".to_owned(),
+                    lines: Vec::new(),
+                    slider: Some(effort_slider(model, *effort_index)),
+                    hint: "←→ to adjust  ·  Enter to confirm  ·  Esc to cancel".to_owned(),
                     style: OverlayStyle::Picker,
                     input: None,
                     input_label: "",
@@ -3923,7 +4654,7 @@ impl AppState {
                 })
             }
             PendingInteraction::ThemePicker { theme_index } => Some(OverlayView {
-                title: "Select theme".to_owned(),
+                title: "Theme".to_owned(),
                 lines: ThemeKind::ALL
                     .iter()
                     .enumerate()
@@ -3938,6 +4669,7 @@ impl AppState {
                         muted: false,
                     })
                     .collect(),
+                slider: None,
                 hint: "1-3 select   ↑↓ navigate   Enter apply   Esc cancel".to_owned(),
                 style: OverlayStyle::Picker,
                 input: None,
@@ -3945,6 +4677,9 @@ impl AppState {
                 input_placeholder: "",
             }),
             PendingInteraction::SessionPicker(picker) => Some(picker.overlay_view()),
+            PendingInteraction::McpPicker(picker) => Some(picker.overlay_view()),
+            PendingInteraction::PluginPicker(picker) => Some(picker.overlay_view()),
+            PendingInteraction::MarketplacePicker(picker) => Some(picker.overlay_view()),
             PendingInteraction::Approval {
                 title,
                 detail,
@@ -3979,6 +4714,7 @@ impl AppState {
                 Some(OverlayView {
                     title: title.clone(),
                     lines,
+                    slider: None,
                     hint: "y / a / n".to_owned(),
                     style: OverlayStyle::Panel,
                     input: None,
@@ -4014,6 +4750,7 @@ impl AppState {
                 Some(OverlayView {
                     title: "MCP approval".to_owned(),
                     lines,
+                    slider: None,
                     hint: "↑↓ select   Enter confirm   Esc cancel".to_owned(),
                     style: OverlayStyle::Panel,
                     input: None,
@@ -4075,14 +4812,22 @@ impl AppState {
                                 muted: true,
                             });
                         }
+                        // A server can offer far more options than fit, so the
+                        // list scrolls with the cursor like the other pickers.
                         let offset = usize::from(!field.required);
-                        lines.extend(options.iter().enumerate().map(|(index, option)| {
-                            OverlayLine {
+                        let window = visible_window(
+                            Some(form.selected.saturating_sub(offset)),
+                            options.len(),
+                            PICKER_ROWS,
+                        );
+                        let start = window.start;
+                        lines.extend(options[window].iter().enumerate().map(
+                            |(position, option)| OverlayLine {
                                 text: option.label.clone(),
-                                selected: index + offset == form.selected,
+                                selected: start + position + offset == form.selected,
                                 muted: false,
-                            }
-                        }));
+                            },
+                        ));
                     }
                     McpFieldKind::MultiSelect { options, .. } => {
                         lines.extend(options.iter().enumerate().map(|(index, option)| {
@@ -4113,6 +4858,7 @@ impl AppState {
                 Some(OverlayView {
                     title: field.title.clone(),
                     lines,
+                    slider: None,
                     hint: if text_input {
                         "Enter next   Alt+D decline   Esc cancel".to_owned()
                     } else if matches!(&field.kind, McpFieldKind::MultiSelect { .. }) {
@@ -4161,6 +4907,7 @@ impl AppState {
                         muted: false,
                     },
                 ],
+                slider: None,
                 hint: "o open   Enter continue   n decline   Esc cancel".to_owned(),
                 style: OverlayStyle::Panel,
                 input: None,
@@ -4178,6 +4925,7 @@ impl AppState {
                         muted: index != *selected,
                     })
                     .collect(),
+                slider: None,
                 hint: "↑↓ select   Enter confirm   Esc cancel".to_owned(),
                 style: OverlayStyle::Panel,
                 input: None,
@@ -4200,6 +4948,7 @@ impl AppState {
                         muted: true,
                     }))
                     .collect(),
+                slider: None,
                 hint: "Esc cancel".to_owned(),
                 style: OverlayStyle::Panel,
                 input: None,
@@ -4228,6 +4977,7 @@ impl AppState {
                 Some(OverlayView {
                     title: title.clone(),
                     lines,
+                    slider: None,
                     hint: "y / n".to_owned(),
                     style: OverlayStyle::Panel,
                     input: None,
@@ -4272,6 +5022,7 @@ impl AppState {
                         question.header.clone()
                     },
                     lines,
+                    slider: None,
                     hint: if *text_mode {
                         "답을 입력하고 Enter · Esc 취소".to_owned()
                     } else {
@@ -4305,23 +5056,240 @@ impl AppState {
                 command: command.name.to_owned(),
                 description: command.description.to_owned(),
                 selected: index == self.command_selection,
+                category: None,
+                panel_title: "Commands",
+                hint: None,
             })
             .collect()
     }
 
-    fn activity(&self) -> Option<String> {
-        if !self.busy {
+    fn rebuild_completion_catalog(&mut self) {
+        let mut candidates = Vec::new();
+        let mut paths = Vec::new();
+        for mention in &self.mentions {
+            if paths.contains(&mention.path) {
+                continue;
+            }
+            candidates.push(
+                CompletionCandidate::new(
+                    CompletionKind::Plugin,
+                    &mention.name,
+                    &mention.description,
+                    completion_text(
+                        CompletionKind::Plugin,
+                        &mention.trigger,
+                        Some(&mention.name),
+                    ),
+                )
+                .with_binding(&mention.name, &mention.path),
+            );
+            paths.push(mention.path.clone());
+        }
+        for skill in &self.skills {
+            if skill.enabled {
+                candidates.push(
+                    CompletionCandidate::new(
+                        CompletionKind::Skill,
+                        &skill.name,
+                        &skill.description,
+                        completion_text(CompletionKind::Skill, &skill.name, None),
+                    )
+                    .with_binding(&skill.name, &skill.path),
+                );
+            }
+        }
+        paths.clear();
+        for mention in &self.app_mentions {
+            if paths.contains(&mention.path) {
+                continue;
+            }
+            candidates.push(
+                CompletionCandidate::new(
+                    CompletionKind::App,
+                    &mention.name,
+                    &mention.description,
+                    completion_text(CompletionKind::App, &mention.trigger, None),
+                )
+                .with_binding(&mention.name, &mention.path),
+            );
+            paths.push(mention.path.clone());
+        }
+        candidates.extend(self.workspace_entries.iter().cloned());
+        self.completion_catalog = candidates;
+    }
+
+    fn matching_completions(&self) -> Option<(CompletionTarget, Vec<CompletionCandidate>)> {
+        let text = self.editor.text();
+        if self.completion_dismissed_text.as_deref() == Some(text.as_str()) {
             return None;
         }
-        let elapsed = self
-            .turn_started_at
-            .map(|started| started.elapsed().as_secs())
-            .unwrap_or(0);
-        Some(format!(
-            "{} Working… {} · Esc to interrupt",
-            SPINNER[self.spinner_frame],
-            format_elapsed(elapsed)
-        ))
+        let target = completion_target(&text, self.editor.cursor())?;
+        let matches = filter_candidates(
+            &self.completion_catalog,
+            target.sigil,
+            &target.query,
+            self.completion_mode,
+        )
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+        let shell_like = target.sigil == '$'
+            && target
+                .query
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_digit() || ch == '-');
+        if shell_like && matches.is_empty() {
+            return None;
+        }
+        Some((target, matches))
+    }
+
+    fn completion_suggestion_views(&self) -> Option<Vec<SuggestionView>> {
+        let (target, matches) = self.matching_completions()?;
+        let hint = (target.sigil == '@').then(|| {
+            format!(
+                "←/→ mode  ·  {}  ·  Enter/Tab insert  ·  Esc close",
+                self.completion_mode.label()
+            )
+        });
+        let panel_title = if target.sigil == '@' {
+            "Mentions"
+        } else {
+            "Tools"
+        };
+        if matches.is_empty() {
+            return Some(vec![SuggestionView {
+                command: "No matches".to_owned(),
+                description: String::new(),
+                selected: false,
+                category: None,
+                panel_title,
+                hint,
+            }]);
+        }
+        let selected = self.command_selection.min(matches.len() - 1);
+        Some(
+            matches
+                .into_iter()
+                .enumerate()
+                .map(|(index, candidate)| SuggestionView {
+                    command: candidate.label,
+                    description: candidate.description,
+                    selected: index == selected,
+                    category: Some(candidate.kind.label().to_owned()),
+                    panel_title,
+                    hint: hint.clone(),
+                })
+                .collect(),
+        )
+    }
+
+    fn sync_selected_completion_bindings(&mut self, old_text: &str, existing_count: usize) {
+        let new_text = self.editor.text();
+        if old_text == new_text {
+            return;
+        }
+
+        let old_chars = old_text.chars().collect::<Vec<_>>();
+        let new_chars = new_text.chars().collect::<Vec<_>>();
+        let prefix = old_chars
+            .iter()
+            .zip(&new_chars)
+            .take_while(|(old, new)| old == new)
+            .count();
+        let suffix = old_chars[prefix..]
+            .iter()
+            .rev()
+            .zip(new_chars[prefix..].iter().rev())
+            .take_while(|(old, new)| old == new)
+            .count();
+        let old_edit_end = old_chars.len() - suffix;
+        let new_edit_end = new_chars.len() - suffix;
+        let shift = new_edit_end as isize - old_edit_end as isize;
+
+        self.selected_completion_bindings = std::mem::take(&mut self.selected_completion_bindings)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, mut binding)| {
+                if index < existing_count {
+                    if old_edit_end <= binding.range.start {
+                        binding.range.start = binding.range.start.checked_add_signed(shift)?;
+                        binding.range.end = binding.range.end.checked_add_signed(shift)?;
+                    } else if prefix < binding.range.end {
+                        return None;
+                    }
+                }
+                binding.matches_text(&new_chars).then_some(binding)
+            })
+            .collect();
+    }
+
+    fn insert_completion(&mut self, target: &CompletionTarget, candidate: &CompletionCandidate) {
+        self.editor
+            .replace_range(target.range.clone(), &candidate.insert_text);
+        let cursor = self.editor.cursor();
+        let chars = self.editor.chars();
+        let horizontal_separator = chars.get(cursor).is_some_and(|ch| {
+            ch.is_whitespace() && !matches!(ch, '\n' | '\r' | '\u{000B}' | '\u{000C}')
+        });
+        if horizontal_separator {
+            let has_suffix = chars.get(cursor + 1).is_some_and(|ch| !ch.is_whitespace());
+            if has_suffix {
+                self.editor.insert(' ');
+            } else {
+                self.editor.move_right();
+            }
+        } else {
+            self.editor.insert(' ');
+        }
+        self.command_selection = 0;
+        self.completion_dismissed_text = None;
+        if let Some(binding) = candidate.binding.as_ref() {
+            self.selected_completion_bindings
+                .push(SelectedCompletionBinding {
+                    sigil: candidate.insert_text.chars().next().unwrap_or(target.sigil),
+                    trigger: candidate.insert_text.chars().skip(1).collect::<String>(),
+                    token: candidate.insert_text.clone(),
+                    range: target.range.start
+                        ..target.range.start + candidate.insert_text.chars().count(),
+                    kind: candidate.kind,
+                    name: binding.name.clone(),
+                    path: binding.path.clone(),
+                });
+        }
+    }
+
+    /// Nothing is shown while the session is still starting. The screen is already
+    /// complete and the composer already works, so announcing the wait would only
+    /// draw attention to a delay the user is about to spend typing through anyway.
+    /// A prompt sent into that window still reports as `Working`, because it is.
+    fn activity(&self) -> Option<String> {
+        if self.busy {
+            let elapsed = self
+                .turn_started_at
+                .map(|started| started.elapsed().as_secs())
+                .unwrap_or(0);
+            return Some(format!(
+                "{} Working ({} • esc to interrupt)",
+                SPINNER[self.spinner_frame],
+                format_elapsed(elapsed)
+            ));
+        }
+        self.last_completed_duration.map(|duration| {
+            format!("✓ Completed ({})", format_elapsed(duration.as_secs()))
+        })
+    }
+
+    /// The shimmer sweeps the `Working` label once per `SHIMMER_PERIOD`, read off
+    /// the wall clock rather than counted in ticks so the glide keeps its pace no
+    /// matter how often a frame happens to be painted.
+    fn activity_phase(&self) -> f32 {
+        let Some(started) = self.turn_started_at else {
+            return 0.0;
+        };
+        let position = started.elapsed().as_millis() % SHIMMER_PERIOD.as_millis();
+        position as f32 / SHIMMER_PERIOD.as_millis() as f32
     }
 
     fn status_line(&self) -> StatusLineView {
@@ -4348,6 +5316,41 @@ impl AppState {
         }
     }
 
+    /// Second step of `/model`: ask how long the pick lasts. A model with no
+    /// choice to make would only add a keystroke, so this is always asked —
+    /// persisting is destructive enough that it should never be the default.
+    fn open_model_scope(&mut self, model_index: usize, effort_index: usize) {
+        self.pending = Some(PendingInteraction::ModelScope {
+            model_index,
+            effort_index,
+            selected: 0,
+        });
+    }
+
+    fn apply_model_scope(
+        &mut self,
+        model_index: usize,
+        effort_index: usize,
+        scope: ModelScope,
+    ) -> Action {
+        let effort = self
+            .models
+            .get(model_index)
+            .and_then(|model| model.efforts.get(effort_index))
+            .map(|effort| effort.id.clone());
+        self.apply_model(model_index, effort.as_deref());
+        if scope == ModelScope::Session {
+            return Action::None;
+        }
+        let Some(model) = self.models.get(model_index) else {
+            return Action::None;
+        };
+        Action::PersistModelDefault {
+            model: model.model.clone(),
+            effort: self.selected_effort.clone(),
+        }
+    }
+
     fn apply_model(&mut self, index: usize, effort: Option<&str>) {
         self.commit_welcome_card();
         let Some(model) = self.models.get(index) else {
@@ -4369,8 +5372,151 @@ impl AppState {
         ));
     }
 
-    fn cycle_permission_mode(&mut self) {
+    /// Shift+Tab reaches this only with nothing pending, since a prompt takes
+    /// every key first. A click on the badge has no such gate of its own, so the
+    /// gate lives here and both entry points read the same.
+    pub fn cycle_permission_mode(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
         self.permission_mode = self.permission_mode.next();
+    }
+
+    /// Runs a slash command the composer never typed — what a click on the
+    /// chrome that owns the same setting resolves to. Ignored while the session
+    /// is blocked on an answer, so a stray click cannot swap the model out from
+    /// under an approval that is still waiting. One of these pickers standing
+    /// open is not such an answer: clicking the other reading switches straight
+    /// to it, which is the whole point of the readings being clickable.
+    pub fn run_command(&mut self, command: &str) -> Action {
+        if self.pending.is_some() && !self.pending_is_model_family() {
+            return Action::Tick(false);
+        }
+        self.run_slash_command(command)
+    }
+
+    /// Whether what is open is one of the model and effort pickers — the two a
+    /// click on the status line may replace outright, since between them they
+    /// only ever set the same two settings.
+    fn pending_is_model_family(&self) -> bool {
+        matches!(
+            self.pending,
+            Some(
+                PendingInteraction::ModelPicker { .. }
+                    | PendingInteraction::ModelScope { .. }
+                    | PendingInteraction::EffortPicker { .. }
+            )
+        )
+    }
+
+    /// A click on a row inside an open picker. `row` is the position in
+    /// `OverlayView::lines`, so each picker maps it back onto its own list — the
+    /// window it scrolled to, or the header rows it printed first.
+    pub fn click_overlay_row(&mut self, row: usize) -> Action {
+        match self.pending.take() {
+            Some(PendingInteraction::ModelPicker {
+                model_index,
+                effort_index,
+            }) => {
+                let start = visible_window(Some(model_index), self.models.len(), PICKER_ROWS).start;
+                let clicked = start + row;
+                if clicked < self.models.len() {
+                    // The digit keys do exactly this: take the model and move on
+                    // to the question of how long the pick lasts.
+                    self.open_model_scope(clicked, self.effort_index_for_model(clicked));
+                } else {
+                    // The blank row under the list, or the slider's own rows.
+                    self.pending = Some(PendingInteraction::ModelPicker {
+                        model_index,
+                        effort_index,
+                    });
+                }
+                Action::None
+            }
+            Some(PendingInteraction::ModelScope {
+                model_index,
+                effort_index,
+                selected,
+            }) => {
+                // The summary of the pick and the blank under it lead the rows.
+                match row
+                    .checked_sub(MODEL_SCOPE_HEADER_ROWS)
+                    .and_then(|choice| ModelScope::CHOICES.get(choice))
+                {
+                    Some(scope) => self.apply_model_scope(model_index, effort_index, *scope),
+                    None => {
+                        self.pending = Some(PendingInteraction::ModelScope {
+                            model_index,
+                            effort_index,
+                            selected,
+                        });
+                        Action::Tick(false)
+                    }
+                }
+            }
+            Some(PendingInteraction::ThemePicker { theme_index }) => {
+                match ThemeKind::ALL.get(row) {
+                    Some(theme) => self.apply_theme(*theme),
+                    None => {
+                        self.pending = Some(PendingInteraction::ThemePicker { theme_index });
+                        Action::Tick(false)
+                    }
+                }
+            }
+            Some(PendingInteraction::SessionPicker(mut picker)) => match picker.click_row(row) {
+                SessionPickerResult::Select(thread_id) => Action::ResumeThread(thread_id),
+                SessionPickerResult::Cancel => Action::None,
+                SessionPickerResult::None => {
+                    self.pending = Some(PendingInteraction::SessionPicker(picker));
+                    Action::Tick(false)
+                }
+            },
+            other => {
+                self.pending = other;
+                Action::Tick(false)
+            }
+        }
+    }
+
+    /// A click on one step of an effort track. In the model picker the track is a
+    /// control beside the list, so the click only moves it; the effort picker has
+    /// nothing else to answer for, so a click there settles it.
+    pub fn click_effort_step(&mut self, step: usize) -> Action {
+        match self.pending.take() {
+            Some(PendingInteraction::ModelPicker { model_index, .. }) => {
+                let count = self
+                    .models
+                    .get(model_index)
+                    .map(|model| model.efforts.len())
+                    .unwrap_or(1)
+                    .max(1);
+                self.pending = Some(PendingInteraction::ModelPicker {
+                    model_index,
+                    effort_index: step.min(count - 1),
+                });
+                Action::None
+            }
+            Some(PendingInteraction::EffortPicker { effort_index }) => {
+                let effort = self
+                    .selected_model()
+                    .and_then(|model| model.efforts.get(step))
+                    .map(|effort| effort.id.clone());
+                match effort {
+                    Some(effort) => {
+                        self.apply_effort(&effort);
+                        Action::None
+                    }
+                    None => {
+                        self.pending = Some(PendingInteraction::EffortPicker { effort_index });
+                        Action::Tick(false)
+                    }
+                }
+            }
+            other => {
+                self.pending = other;
+                Action::Tick(false)
+            }
+        }
     }
 
     fn apply_effort(&mut self, effort: &str) {
@@ -4444,10 +5590,12 @@ impl AppState {
         let Some(id) = item.get("id").and_then(Value::as_str) else {
             return;
         };
-        let Some(block) = active_item_block(item) else {
+        let Some(mut block) = active_item_block(&self.cwd, item) else {
             return;
         };
-        if !self.active.contains_key(id) {
+        if let Some(existing) = self.active.get(id) {
+            block.adopt_id(&existing.block);
+        } else {
             self.active_order.push(id.to_owned());
         }
         self.active.insert(id.to_owned(), ActiveItem { block });
@@ -4455,14 +5603,18 @@ impl AppState {
 
     fn complete_item(&mut self, item: &Value) {
         let id = item.get("id").and_then(Value::as_str);
-        if let Some(id) = id {
-            self.active.remove(id);
+        let active = id.and_then(|id| {
+            let active = self.active.remove(id);
             self.active_order.retain(|candidate| candidate != id);
-        }
+            active
+        });
         if item.get("type").and_then(Value::as_str) == Some("userMessage") {
             return;
         }
-        if let Some(block) = completed_item_block(item) {
+        if let Some(mut block) = completed_item_block(&self.cwd, item) {
+            if let Some(active) = active.as_ref() {
+                block.adopt_id(&active.block);
+            }
             if matches!(block.kind, BlockKind::Assistant) {
                 self.last_assistant_markdown = Some(block.body.clone());
             }
@@ -4584,7 +5736,7 @@ fn parse_questions(params: &Value) -> Vec<Question> {
         .collect()
 }
 
-fn active_item_block(item: &Value) -> Option<Block> {
+fn active_item_block(cwd: &str, item: &Value) -> Option<Block> {
     match item.get("type")?.as_str()? {
         "agentMessage" => Some(Block::new(
             BlockKind::Assistant,
@@ -4604,7 +5756,7 @@ fn active_item_block(item: &Value) -> Option<Block> {
         "commandExecution" => Some(Block::new(
             BlockKind::Tool,
             format!(
-                "Bash · {}",
+                "Shell · {}",
                 compact_command(
                     item.get("command")
                         .and_then(Value::as_str)
@@ -4616,16 +5768,18 @@ fn active_item_block(item: &Value) -> Option<Block> {
                 .and_then(Value::as_str)
                 .unwrap_or_default(),
         )),
-        "fileChange" => Some(Block::new(
-            BlockKind::Tool,
-            "Update files",
-            file_changes_body(
-                item.get("changes")
-                    .and_then(Value::as_array)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
-            ),
-        )),
+        "fileChange" => {
+            let changes = item
+                .get("changes")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            Some(Block::new(
+                BlockKind::FileChange,
+                file_changes_title(cwd, changes),
+                file_changes_body(cwd, changes),
+            ))
+        }
         "mcpToolCall" => Some(Block::new(
             BlockKind::Tool,
             format!(
@@ -4655,7 +5809,7 @@ fn active_item_block(item: &Value) -> Option<Block> {
     }
 }
 
-fn completed_item_block(item: &Value) -> Option<Block> {
+fn completed_item_block(cwd: &str, item: &Value) -> Option<Block> {
     match item.get("type")?.as_str()? {
         "userMessage" => {
             let body = item
@@ -4694,7 +5848,7 @@ fn completed_item_block(item: &Value) -> Option<Block> {
                     BlockKind::Warning
                 },
                 format!(
-                    "Bash · {}{suffix}{duration}",
+                    "Shell · {}{suffix}{duration}",
                     compact_command(
                         item.get("command")
                             .and_then(Value::as_str)
@@ -4702,29 +5856,33 @@ fn completed_item_block(item: &Value) -> Option<Block> {
                         88
                     )
                 ),
-                // The renderer shows only the first few rows and counts the rest,
+                // The renderer shows only the last few rows and counts the rest,
                 // so this cap is a memory guard: keep it high enough that the
                 // count it reports is the real one for any ordinary command.
                 collapse_output(
-                    item.get("aggregatedOutput")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
+                    &strip_ansi(
+                        item.get("aggregatedOutput")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    ),
                     400,
                 ),
             ))
         }
-        "fileChange" => Some(Block::new(
-            BlockKind::Tool,
-            "Updated files",
-            file_changes_body(
-                item.get("changes")
-                    .and_then(Value::as_array)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
-            ),
-        )),
+        "fileChange" => {
+            let changes = item
+                .get("changes")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            Some(Block::new(
+                BlockKind::FileChange,
+                file_changes_title(cwd, changes),
+                file_changes_body(cwd, changes),
+            ))
+        }
         "mcpToolCall" => {
-            let mut block = active_item_block(item)?;
+            let mut block = active_item_block(cwd, item)?;
             block.body = match item.get("error").filter(|value| !value.is_null()) {
                 Some(error) => pretty_json(Some(error)),
                 None => pretty_json(item.get("result")),
@@ -4732,12 +5890,173 @@ fn completed_item_block(item: &Value) -> Option<Block> {
             Some(block)
         }
         "dynamicToolCall" => {
-            let mut block = active_item_block(item)?;
+            let mut block = active_item_block(cwd, item)?;
             block.body = pretty_json(item.get("contentItems"));
             Some(block)
         }
         "contextCompaction" => Some(Block::new(BlockKind::System, "Context compacted", "")),
-        _ => active_item_block(item),
+        _ => active_item_block(cwd, item),
+    }
+}
+
+/// One turn's blocks, server items and rollout events interleaved by time.
+fn merged_turn_blocks(
+    cwd: &str,
+    turn: &Value,
+    items: &[Value],
+    rollout: Option<&Rollout>,
+) -> Vec<Block> {
+    let events = rollout
+        .map(|rollout| turn_events(turn, rollout))
+        .unwrap_or_default();
+    let mut rows: Vec<(String, usize, Block)> = Vec::new();
+    let mut order = 0usize;
+    // Items the rollout cannot date — user messages, MCP calls — inherit the
+    // last known time so they keep their place relative to what surrounds
+    // them. Seeding this with the turn's own start (rather than `""`) keeps a
+    // turn with no anchored items at all from sorting its server items ahead
+    // of every `Bash` block, which does carry a real timestamp — exactly the
+    // "all shells bunched at the end" shape the merge exists to avoid.
+    let mut last_ts = turn_started_ts(turn).unwrap_or_default();
+    let mut assistant_cursor = 0usize;
+    for item in items {
+        if let Some(ts) = item_timestamp(item, &events, &mut assistant_cursor) {
+            last_ts = ts;
+        }
+        if let Some(block) = completed_item_block(cwd, item) {
+            rows.push((last_ts.clone(), order, block));
+            order += 1;
+        }
+    }
+    for event in &events {
+        if let Some(block) = event_block(event) {
+            rows.push((event.ts.clone(), order, block));
+            order += 1;
+        }
+    }
+    // The timestamps are a fixed-width UTC format, so string order is time order.
+    rows.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
+    rows.into_iter().map(|(_, _, block)| block).collect()
+}
+
+/// The turn's `startedAt` (unix seconds), formatted the same way the rollout's
+/// own timestamps are so string-sorting the two together stays correct.
+fn turn_started_ts(turn: &Value) -> Option<String> {
+    let seconds = turn.get("startedAt").and_then(Value::as_i64)?;
+    let moment = chrono::DateTime::from_timestamp(seconds, 0)?;
+    Some(moment.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+}
+
+/// The rollout events belonging to one turn. An event whose payload names its
+/// own `turn_id` (every `Exec`, from `custom_tool_call`'s passthrough
+/// metadata; `PatchApplied`, from `patch_apply_end`'s own field) is matched
+/// directly against `turn.id` — the precise key the design called for.
+/// Anything without one (assistant messages, reasoning — neither rollout form
+/// carries a `turn_id` today) falls back to the turn's start/end window, and
+/// an event with no attribution at all — no id, no window — is left out
+/// rather than duplicated across every turn.
+fn turn_events<'a>(turn: &Value, rollout: &'a Rollout) -> Vec<&'a RolloutEvent> {
+    let turn_id = turn.get("id").and_then(Value::as_str);
+    let started = turn.get("startedAt").and_then(Value::as_i64);
+    let completed = turn.get("completedAt").and_then(Value::as_i64);
+    rollout
+        .events
+        .iter()
+        .filter(|event| match (event.turn_id.as_deref(), turn_id) {
+            (Some(event_turn_id), Some(turn_id)) => event_turn_id == turn_id,
+            _ => {
+                let (Some(started), Some(completed)) = (started, completed) else {
+                    return false;
+                };
+                unix_seconds(&event.ts)
+                    .is_some_and(|seconds| seconds >= started && seconds <= completed)
+            }
+        })
+        .collect()
+}
+
+fn unix_seconds(ts: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|moment| moment.timestamp())
+}
+
+/// The last `agentMessage` item's text, in the server's own item order — used
+/// instead of walking the merged/sorted blocks so a rollout-dated item never
+/// changes which message counts as "last".
+fn last_agent_message_text(items: &[Value]) -> Option<String> {
+    items.iter().rev().find_map(|item| {
+        (item.get("type").and_then(Value::as_str) == Some("agentMessage"))
+            .then(|| item.get("text").and_then(Value::as_str))
+            .flatten()
+            .map(ToOwned::to_owned)
+    })
+}
+
+/// When the rollout can date a server item. `cursor` walks the turn's assistant
+/// messages so a repeated message text still anchors to its own occurrence.
+fn item_timestamp(item: &Value, events: &[&RolloutEvent], cursor: &mut usize) -> Option<String> {
+    match item.get("type").and_then(Value::as_str)? {
+        "fileChange" => {
+            let id = item.get("id").and_then(Value::as_str)?;
+            events
+                .iter()
+                .find(|event| {
+                    matches!(&event.kind, RolloutKind::PatchApplied { call_id } if call_id == id)
+                })
+                .map(|event| event.ts.clone())
+        }
+        "agentMessage" => {
+            let text = item.get("text").and_then(Value::as_str)?;
+            let offset = events.iter().skip(*cursor).position(|event| {
+                matches!(&event.kind, RolloutKind::AssistantMessage { text: message } if message == text)
+            })?;
+            let index = *cursor + offset;
+            *cursor = index + 1;
+            Some(events[index].ts.clone())
+        }
+        _ => None,
+    }
+}
+
+/// The block a rollout-only event becomes. Anchors produce nothing: the server
+/// item they date is already in the transcript.
+fn event_block(event: &RolloutEvent) -> Option<Block> {
+    match &event.kind {
+        RolloutKind::Exec {
+            command,
+            output,
+            exit_code,
+            duration_ms,
+        } => {
+            let suffix = exit_code
+                .map(|code| format!(" · exit {code}"))
+                .unwrap_or_default();
+            let duration = duration_ms
+                .map(|duration| format!(" · {}", format_duration(duration)))
+                .unwrap_or_default();
+            Some(Block::new(
+                if exit_code.unwrap_or(0) == 0 {
+                    BlockKind::Tool
+                } else {
+                    BlockKind::Warning
+                },
+                format!(
+                    "Shell · {}{suffix}{duration}",
+                    compact_command(command, 88)
+                ),
+                // The rollout parser already strips the code-mode wrapper's
+                // preamble (`rollout::command_result`) — that is the one place
+                // that can see the `---N---` framing a multi-command script
+                // uses, so it is also the only place that can strip each
+                // command's own header without guessing at a `rfind`.
+                collapse_output(&strip_ansi(output), 400),
+            ))
+        }
+        RolloutKind::Reasoning { summary } => {
+            Some(Block::new(BlockKind::Reasoning, "Thinking…", summary))
+        }
+        RolloutKind::PatchApplied { .. } | RolloutKind::AssistantMessage { .. } => None,
     }
 }
 
@@ -4762,44 +6081,129 @@ fn permission_detail(value: &Value) -> Vec<String> {
     detail
 }
 
-fn file_changes_body(changes: &[Value]) -> String {
-    changes
+/// Heading for a `fileChange` item: the action and the file it touched. A batch
+/// is counted instead, and the body then
+/// names each file itself.
+fn file_changes_title(cwd: &str, changes: &[Value]) -> String {
+    match changes {
+        [single] => format!(
+            "{}({})",
+            change_verb(single),
+            display_path(cwd, change_path(single))
+        ),
+        _ => format!("Update({} files)", changes.len()),
+    }
+}
+
+/// The first row summarises the whole batch — the renderer hangs it off the
+/// heading under a `⎿`. After it come the patches, with the framing git wraps a
+/// diff in dropped: the renderer needs the `@@` headers for line numbers and
+/// nothing above them. A batch gets a heading row per file; a lone file is
+/// already named by [`file_changes_title`].
+fn file_changes_body(cwd: &str, changes: &[Value]) -> String {
+    let (additions, deletions) = changes
         .iter()
-        .map(|change| {
-            let path = change
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let kind = change
-                .get("kind")
-                .and_then(|kind| kind.get("type"))
-                .and_then(Value::as_str)
-                .unwrap_or("update");
-            let diff = change
-                .get("diff")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let additions = diff
-                .lines()
-                .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
-                .count();
-            let deletions = diff
-                .lines()
-                .filter(|line| line.starts_with('-') && !line.starts_with("---"))
-                .count();
-            let stats = match (additions, deletions) {
-                (0, 0) => String::new(),
-                _ => format!("  +{additions} -{deletions}"),
-            };
-            let marker = match kind {
-                "add" => "+",
-                "delete" => "-",
-                _ => "±",
-            };
-            format!("{marker}  {path}{stats}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .map(|change| diff_stats(change_diff(change)))
+        .fold((0, 0), |total, stats| {
+            (total.0 + stats.0, total.1 + stats.1)
+        });
+    let mut rows = vec![format!(
+        "Added {additions} {}, removed {deletions} {}",
+        plural(additions, "line"),
+        plural(deletions, "line")
+    )];
+    for change in changes {
+        if changes.len() > 1 {
+            rows.push(format!(
+                "{}({})",
+                change_verb(change),
+                display_path(cwd, change_path(change))
+            ));
+        }
+        rows.extend(
+            diff_rows(change_diff(change))
+                .into_iter()
+                .map(str::to_owned),
+        );
+    }
+    rows.join("\n")
+}
+
+fn change_path(change: &Value) -> &str {
+    change
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+}
+
+fn change_diff(change: &Value) -> &str {
+    change
+        .get("diff")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+fn change_verb(change: &Value) -> &'static str {
+    match change
+        .get("kind")
+        .and_then(|kind| kind.get("type"))
+        .and_then(Value::as_str)
+    {
+        Some("add") => "Add",
+        Some("delete") => "Delete",
+        _ => "Update",
+    }
+}
+
+/// A unified diff from its first hunk header on. Everything above that — `diff
+/// --git`, `index`, the `---`/`+++` pair — is framing, and cutting at the header
+/// rather than matching those prefixes keeps a removed `--- ` row of real content
+/// out of the crossfire. Patches without hunk headers are passed through whole.
+fn diff_rows(diff: &str) -> Vec<&str> {
+    let rows = diff.lines().collect::<Vec<_>>();
+    match rows.iter().position(|row| row.starts_with("@@")) {
+        Some(start) => rows[start..].to_vec(),
+        None => rows,
+    }
+}
+
+fn diff_stats(diff: &str) -> (usize, usize) {
+    let rows = diff_rows(diff);
+    (
+        rows.iter().filter(|row| row.starts_with('+')).count(),
+        rows.iter().filter(|row| row.starts_with('-')).count(),
+    )
+}
+
+/// Absolute paths are what the app-server reports, but the session's own
+/// directory is noise in front of every one of them. Whichever separator the path
+/// arrived with is kept, so a Windows path still reads as `src\file.rs`.
+fn display_path(cwd: &str, path: &str) -> String {
+    // Windows is case-insensitive and takes either separator, so both are folded
+    // for the comparison without touching what gets displayed.
+    let fold = |byte: u8| match byte {
+        b'\\' => b'/',
+        other => other.to_ascii_lowercase(),
+    };
+    let root = cwd.trim_end_matches(['/', '\\']).as_bytes();
+    let inside = !root.is_empty()
+        && path.len() > root.len()
+        && path.as_bytes()[..root.len()]
+            .iter()
+            .zip(root)
+            .all(|(left, right)| fold(*left) == fold(*right))
+        && matches!(path.as_bytes()[root.len()], b'/' | b'\\');
+    match inside {
+        true => path[root.len() + 1..].to_owned(),
+        false => path.to_owned(),
+    }
+}
+
+fn plural(count: usize, noun: &str) -> String {
+    match count {
+        1 => noun.to_owned(),
+        _ => format!("{noun}s"),
+    }
 }
 
 /// Wall-clock elapsed for the activity row: `42s`, `1m 10s`, `1h 3m 49s`. A long
@@ -4821,41 +6225,16 @@ fn format_duration(duration_ms: u64) -> String {
     }
 }
 
-fn effort_slider_rows(model: &ModelInfo, selected: usize) -> [String; 3] {
-    const SLOT_WIDTH: usize = 8;
-    let count = model.efforts.len().max(1);
-    let width = count * SLOT_WIDTH;
-    let endpoints = format!(
-        "Faster{}Smarter",
-        " ".repeat(width.saturating_sub("Faster".len() + "Smarter".len()))
-    );
-    let track = model
-        .efforts
-        .iter()
-        .enumerate()
-        .map(|(index, _)| {
-            if index == selected {
-                "───●────"
-            } else {
-                "───○────"
-            }
-        })
-        .collect::<String>();
-    let labels = model
-        .efforts
-        .iter()
-        .map(|effort| center_cell(&effort.id, SLOT_WIDTH))
-        .collect::<String>()
-        .trim_end()
-        .to_owned();
-    [endpoints, track, labels]
-}
-
-fn center_cell(text: &str, width: usize) -> String {
-    let text_width = text.chars().count().min(width);
-    let left = width.saturating_sub(text_width) / 2;
-    let right = width.saturating_sub(text_width + left);
-    format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
+/// The tiers a model supports, for the renderer to lay out and colour.
+fn effort_slider(model: &ModelInfo, selected: usize) -> EffortSlider {
+    EffortSlider {
+        efforts: model
+            .efforts
+            .iter()
+            .map(|effort| effort.id.clone())
+            .collect(),
+        selected: selected.min(model.efforts.len().saturating_sub(1)),
+    }
 }
 
 fn relative_time(timestamp: u64) -> String {
@@ -4899,6 +6278,46 @@ fn append_capped(target: &mut String, delta: &str) {
             .unwrap_or(keep_from);
         target.replace_range(..boundary, "…\n");
     }
+}
+
+/// Removes ANSI escape sequences from captured command output. Codex runs the
+/// shell on a pty, so colours, cursor moves and title sets arrive mixed into the
+/// text; left in, they break the renderer's column arithmetic — which decides
+/// where a row wraps, and so how much of the row budget it spends — and paint as
+/// garbage.
+fn strip_ansi(output: &str) -> String {
+    let mut clean = String::with_capacity(output.len());
+    let mut chars = output.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            clean.push(ch);
+            continue;
+        }
+        match chars.next() {
+            // CSI: parameters, then one byte in `@`..=`~` ends it.
+            Some('[') => {
+                for ch in chars.by_ref() {
+                    if matches!(ch, '\x40'..='\x7e') {
+                        break;
+                    }
+                }
+            }
+            // OSC: a string ending at BEL, or at ST (`ESC \`).
+            Some(']') => loop {
+                match chars.next() {
+                    None | Some('\x07') => break,
+                    Some('\x1b') => {
+                        chars.next();
+                        break;
+                    }
+                    Some(_) => {}
+                }
+            },
+            // Anything else is a two-character sequence; both are dropped.
+            _ => {}
+        }
+    }
+    clean
 }
 
 fn collapse_output(output: &str, max_lines: usize) -> String {
@@ -5093,7 +6512,7 @@ fn parse_permission_mode(config: &str) -> Option<PermissionMode> {
         .flatten()
 }
 
-fn codex_home() -> Option<PathBuf> {
+pub(crate) fn codex_home() -> Option<PathBuf> {
     env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".codex")))
@@ -5124,6 +6543,47 @@ fn parse_fast_mode(config: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// The old summary said only `± <absolute path>  +17 -8`; a reviewer needs the
+    /// patch itself, so the block now carries the hunks and drops git's framing.
+    #[test]
+    fn file_change_block_keeps_the_patch_and_relativizes_the_path() {
+        let changes = vec![json!({
+            "path": r"C:\Source\DevezCLI\src\main.rs",
+            "kind": { "type": "update" },
+            "diff": "diff --git a/src/main.rs b/src/main.rs\nindex 111..222 100644\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -83,3 +83,4 @@\n context\n-let old = 1;\n+let new = 2;\n+let extra = 3;\n"
+        })];
+        let cwd = r"C:\Source\DevezCLI";
+
+        assert_eq!(file_changes_title(cwd, &changes), r"Update(src\main.rs)");
+        assert_eq!(
+            file_changes_body(cwd, &changes),
+            "Added 2 lines, removed 1 line\n@@ -83,3 +83,4 @@\n context\n-let old = 1;\n+let new = 2;\n+let extra = 3;"
+        );
+    }
+
+    /// A patch that removes a line of content starting with `---` used to have that
+    /// row counted as git framing and dropped from the diff.
+    #[test]
+    fn diff_rows_cut_at_the_hunk_header_not_at_dashed_prefixes() {
+        let diff = "--- a/notes.md\n+++ b/notes.md\n@@ -1,2 +1,1 @@\n title\n---\n";
+        assert_eq!(diff_rows(diff), ["@@ -1,2 +1,1 @@", " title", "---"]);
+        assert_eq!(diff_stats(diff), (0, 1));
+    }
+
+    #[test]
+    fn display_path_leaves_paths_outside_the_session_alone() {
+        assert_eq!(
+            display_path(r"C:\Source\DevezCLI", r"C:\Other\file.rs"),
+            r"C:\Other\file.rs"
+        );
+        // Case and separator both fold for the comparison; the display keeps the
+        // separator the path arrived with.
+        assert_eq!(
+            display_path(r"C:\Source\DevezCLI", r"c:/source/devezcli\src\a.rs"),
+            r"src\a.rs"
+        );
+    }
+
     fn test_model(slug: &str, display_name: &str, is_default: bool) -> ModelInfo {
         ModelInfo {
             id: slug.to_owned(),
@@ -5149,6 +6609,231 @@ mod tests {
             "gpt-5.6-sol",
             Some("high"),
         )
+    }
+
+    #[test]
+    fn command_block_identity_survives_active_to_completed_transition() {
+        let mut state = test_state();
+        state.start_item(&json!({
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "command": "rg TODO",
+            "aggregatedOutput": "one"
+        }));
+        let active_id = state.active["cmd-1"].block.id();
+
+        state.complete_item(&json!({
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "command": "rg TODO",
+            "status": "completed",
+            "exitCode": 0,
+            "durationMs": 12,
+            "aggregatedOutput": "one"
+        }));
+
+        assert_eq!(state.committed.last().unwrap().id(), active_id);
+    }
+
+    #[test]
+    fn active_shell_commands_are_grouped_into_one_status_row() {
+        let mut state = test_state();
+        for id in ["cmd-1", "cmd-2"] {
+            state.start_item(&json!({
+                "id": id,
+                "type": "commandExecution",
+                "command": "rg TODO"
+            }));
+        }
+
+        let titles = state
+            .view()
+            .live_blocks
+            .into_iter()
+            .map(|block| block.title)
+            .collect::<Vec<_>>();
+
+        assert_eq!(titles, ["Running 2 shell commands"]);
+    }
+
+    /// A turn covering 15:08:28–15:12:59 UTC on 2026-07-25, matching the
+    /// timestamps the rollout literals below use.
+    fn history_thread() -> Value {
+        json!({
+            "turns": [{
+                "id": "turn-1",
+                "startedAt": 1_784_992_108_i64,
+                "completedAt": 1_784_992_379_i64,
+                "items": [
+                    { "type": "agentMessage", "id": "item-1", "text": "확인해봤습니다" },
+                    { "type": "fileChange", "id": "exec-abc", "changes": [] },
+                    { "type": "agentMessage", "id": "item-2", "text": "고쳤습니다" }
+                ]
+            }]
+        })
+    }
+
+    #[test]
+    fn resumed_shell_runs_land_between_the_messages_they_ran_under() {
+        let mut state = test_state();
+        // 15:08:33 message, 15:08:36 shell run, 15:09:40 patch, 15:09:58 message.
+        let rollout = crate::rollout::parse(
+            r#"{"timestamp":"2026-07-25T15:08:33.387Z","type":"event_msg","payload":{"type":"agent_message","message":"확인해봤습니다"}}
+{"timestamp":"2026-07-25T15:08:36.373Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_one","input":"await tools.shell_command({\"command\":\"cargo test\"});"}}
+{"timestamp":"2026-07-25T15:08:38.010Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_one","output":[{"type":"input_text","text":"Script completed\nWall time 1.6 seconds\nOutput:\n"},{"type":"input_text","text":"Exit code: 0\nWall time: 0.5 seconds\nOutput:\nok\n"}]}}
+{"timestamp":"2026-07-25T15:09:40.539Z","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"exec-abc"}}
+{"timestamp":"2026-07-25T15:09:58.000Z","type":"event_msg","payload":{"type":"agent_message","message":"고쳤습니다"}}"#,
+        );
+
+        state.load_history(&history_thread(), Some(&rollout));
+
+        let titles = state
+            .committed
+            .iter()
+            .map(|block| block.title.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(titles[0], "Codex");
+        assert_eq!(titles[1], "Shell · cargo test · exit 0 · 1.6s");
+        assert_eq!(titles[3], "Codex");
+        assert!(matches!(state.committed[1].kind, BlockKind::Tool));
+        assert_eq!(state.committed[1].body, "ok");
+        // The file change sorts by its `patch_apply_end` time: after the shell run
+        // at 15:08:36, before the message at 15:09:58.
+        assert!(matches!(state.committed[2].kind, BlockKind::FileChange));
+    }
+
+    #[test]
+    fn a_failed_shell_run_is_resumed_as_a_warning() {
+        let mut state = test_state();
+        let rollout = crate::rollout::parse(
+            r#"{"timestamp":"2026-07-25T15:08:36.373Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_one","input":"await tools.shell_command({\"command\":\"cargo test\"});"}}
+{"timestamp":"2026-07-25T15:08:38.010Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_one","output":[{"type":"input_text","text":"Wall time 2.0 seconds\n"},{"type":"input_text","text":"Exit code: 101\nOutput:\nfailed\n"}]}}"#,
+        );
+
+        state.load_history(&history_thread(), Some(&rollout));
+
+        // Nothing in this rollout anchors any server item (no matching
+        // `AssistantMessage`/`PatchApplied`), so all three items inherit the
+        // turn's start time and the shell run — the only thing with a real
+        // timestamp — sorts after them. Asserting the position (not just
+        // finding the block by title) is what catches an order regression.
+        assert_eq!(state.committed.len(), 4);
+        let bash = &state.committed[3];
+        assert_eq!(bash.title, "Shell · cargo test · exit 101 · 2.0s");
+        assert!(matches!(bash.kind, BlockKind::Warning));
+    }
+
+    #[test]
+    fn history_without_a_rollout_keeps_the_server_item_order() {
+        let mut state = test_state();
+
+        state.load_history(&history_thread(), None);
+
+        let titles = state
+            .committed
+            .iter()
+            .map(|block| block.title.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(titles.len(), 3);
+        assert_eq!(titles[0], "Codex");
+        assert_eq!(titles[1], "Update(0 files)");
+        assert_eq!(titles[2], "Codex");
+    }
+
+    #[test]
+    fn rollout_events_outside_the_turn_window_are_left_out() {
+        let mut state = test_state();
+        // 15:20:00 is past this turn's 15:12:59 end.
+        let rollout = crate::rollout::parse(
+            r#"{"timestamp":"2026-07-25T15:20:00.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_late","input":"await tools.shell_command({\"command\":\"git status\"});"}}"#,
+        );
+
+        state.load_history(&history_thread(), Some(&rollout));
+
+        assert!(
+            !state
+                .committed
+                .iter()
+                .any(|block| block.title.starts_with("Shell ·"))
+        );
+    }
+
+    #[test]
+    fn turn_id_attribution_overrides_an_overlapping_time_window() {
+        // Two turns with identical windows (a contrived worst case): the exec
+        // event's own `turn_id` must decide which turn it lands in, not the
+        // time-window fallback that used to be the only signal available.
+        let mut state = test_state();
+        let thread = json!({
+            "turns": [
+                {
+                    "id": "turn-1",
+                    "startedAt": 1_784_992_100_i64,
+                    "completedAt": 1_784_992_500_i64,
+                    "items": [{ "type": "agentMessage", "id": "item-1", "text": "first turn" }]
+                },
+                {
+                    "id": "turn-2",
+                    "startedAt": 1_784_992_100_i64,
+                    "completedAt": 1_784_992_500_i64,
+                    "items": [{ "type": "agentMessage", "id": "item-2", "text": "second turn" }]
+                }
+            ]
+        });
+        let rollout = crate::rollout::parse(
+            r#"{"timestamp":"2026-07-25T15:08:36.373Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_one","input":"await tools.shell_command({\"command\":\"cargo test\"});","internal_chat_message_metadata_passthrough":{"turn_id":"turn-2"}}}
+{"timestamp":"2026-07-25T15:08:38.010Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_one","output":[{"type":"input_text","text":"Exit code: 0\nWall time: 0.5 seconds\nOutput:\nok\n"}]}}"#,
+        );
+
+        state.load_history(&thread, Some(&rollout));
+
+        assert_eq!(state.committed.len(), 3);
+        assert_eq!(state.committed[0].body, "first turn");
+        assert_eq!(state.committed[1].body, "second turn");
+        assert!(state.committed[2].title.starts_with("Shell ·"));
+    }
+
+    #[test]
+    fn turn_plan_updates_are_added_to_the_transcript() {
+        let mut state = test_state();
+
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({
+                "threadId": "thread",
+                "turnId": "turn-1",
+                "explanation": "범위를 확인했습니다.",
+                "plan": [
+                    { "step": "현재 구현 확인", "status": "completed" },
+                    { "step": "표시 동작 구현", "status": "inProgress" },
+                    { "step": "회귀 테스트", "status": "pending" }
+                ]
+            }),
+        );
+
+        let block = state.committed.last().expect("updated plan block");
+        assert!(matches!(block.kind, BlockKind::Plan));
+        assert_eq!(block.title, "Updated Plan");
+        assert_eq!(
+            block.body,
+            "└ 범위를 확인했습니다.\n✔ 현재 구현 확인\n▸ 표시 동작 구현\n□ 회귀 테스트"
+        );
+    }
+
+    #[test]
+    fn command_output_arrives_without_its_escape_sequences() {
+        // A pty-backed shell colours its errors and sets the window title; both
+        // would otherwise be measured as visible columns.
+        let raw = "\x1b[31mfatal\x1b[0m: no\n\x1b]0;title\x07plain\n\x1b[1;32mok\x1b[m\n";
+
+        assert_eq!(strip_ansi(raw), "fatal: no\nplain\nok\n");
+    }
+
+    #[test]
+    fn stripping_escape_sequences_leaves_ordinary_text_alone() {
+        let plain = "C:\\Users\\x\\SKILL.md' because it does not exist.\n  ~~~~~\n";
+
+        assert_eq!(strip_ansi(plain), plain);
     }
 
     #[test]
@@ -5390,7 +7075,7 @@ mod tests {
         let mut state = test_state();
         state.run_slash_command("/login");
 
-        // Claude-Code-style list: numbered rows with the first one highlighted.
+        // Numbered rows open with the first choice highlighted.
         let overlay = state.overlay_view().expect("login method list");
         assert_eq!(overlay.title, "Select login method");
         assert_eq!(overlay.lines.len(), LoginMethod::CHOICES.len());
@@ -5486,15 +7171,11 @@ mod tests {
     /// not in the status line where they used to park until the next thread.
     #[test]
     fn one_off_events_land_in_the_composer_notice_and_expire() {
-        for (method, params, expected) in [
-            ("skills/changed", json!({}), "Skills refreshed"),
-            ("app/list/updated", json!({ "apps": [] }), "Apps refreshed"),
-            (
-                "model/rerouted",
-                json!({ "fromModel": "Sol", "toModel": "Luna" }),
-                "Sol → Luna로 전환됨",
-            ),
-        ] {
+        for (method, params, expected) in [(
+            "model/rerouted",
+            json!({ "fromModel": "Sol", "toModel": "Luna" }),
+            "Sol → Luna로 전환됨",
+        )] {
             let mut state = test_state();
 
             state.handle_notification(method, &params);
@@ -5514,6 +7195,22 @@ mod tests {
                 )
             });
             assert!(state.tick(), "{method} should redraw once it expires");
+            assert_eq!(state.view().composer_notice, None, "{method}");
+        }
+    }
+
+    /// The server rescans skills and apps on every file touch, so a notice there
+    /// would never stop flashing. The catalogues still reload in the event loop.
+    #[test]
+    fn a_skill_or_app_rescan_is_silent() {
+        for (method, params) in [
+            ("skills/changed", json!({})),
+            ("app/list/updated", json!({ "apps": [] })),
+        ] {
+            let mut state = test_state();
+
+            state.handle_notification(method, &params);
+
             assert_eq!(state.view().composer_notice, None, "{method}");
         }
     }
@@ -5641,15 +7338,32 @@ mod tests {
     }
 
     #[test]
-    fn fast_mode_is_shown_only_by_the_composer_badge() {
+    fn fast_mode_updates_the_badge_and_reports_the_switch() {
         let mut state = test_state();
 
         state.set_fast_mode(true);
 
         assert!(state.fast_mode);
         assert!(state.composer_mode().fast_mode);
-        assert!(state.committed.is_empty());
         assert!(state.transient_status.is_none());
+        let on = state
+            .committed
+            .iter()
+            .find(|block| block.title.starts_with("✓ Fast mode"))
+            .expect("fast mode notice");
+        assert_eq!(on.title, "✓ Fast mode On");
+
+        state.set_fast_mode(false);
+
+        assert_eq!(
+            state
+                .committed
+                .iter()
+                .filter(|block| block.title.starts_with("✓ Fast mode"))
+                .last()
+                .map(|block| block.title.as_str()),
+            Some("✓ Fast mode Off")
+        );
     }
 
     #[test]
@@ -5722,11 +7436,28 @@ mod tests {
     }
 
     #[test]
+    fn renderer_is_not_a_slash_command() {
+        let mut state = test_state();
+
+        state.editor.set_text("/rend");
+        assert!(state.matching_slash_commands().is_empty());
+
+        assert!(matches!(
+            state.run_slash_command("/renderer inline"),
+            Action::None
+        ));
+        let error = state.committed.last().expect("unknown-command error");
+        assert_eq!(error.title, "알 수 없는 명령");
+        assert!(error.body.contains("/renderer"));
+    }
+
+    #[test]
     fn theme_command_supports_picker_and_direct_selection() {
         let mut state = test_state();
 
         assert!(matches!(state.run_slash_command("/theme"), Action::None));
         let overlay = state.overlay_view().expect("theme picker");
+        assert_eq!(overlay.title, "Theme");
         assert_eq!(overlay.lines.len(), 3);
         assert!(overlay.lines[0].text.contains("Minimal"));
         state.pending = None;
@@ -5785,28 +7516,82 @@ mod tests {
     }
 
     #[test]
-    fn the_resume_picker_pads_inside_its_border_and_leaves_the_search_rule_bare() {
-        let picker = SessionPicker::new(
-            vec![SessionInfo {
-                id: "current".to_owned(),
-                name: Some("Current project".to_owned()),
+    fn resume_picker_uses_a_compact_time_first_ten_row_window() {
+        let sessions = (0..12)
+            .map(|index| SessionInfo {
+                id: format!("session-{index}"),
+                name: Some(format!("Session {index}")),
                 preview: String::new(),
                 cwd: r"C:\work\current".to_owned(),
-                updated_at: 2,
+                updated_at: 0,
+            })
+            .collect();
+        let picker = SessionPicker::new(sessions, r"C:\work\current".to_owned(), None);
+
+        let view = picker.overlay_view();
+
+        assert!(matches!(view.style, OverlayStyle::CompactPanel));
+        assert_eq!(view.lines.len(), 10);
+        assert!(view.lines[0].text.starts_with("unknown"));
+        assert!(view.lines[0].text.contains("Session 0"));
+        assert!(view.input_label.is_empty());
+    }
+
+    /// One click resumes, the same as Enter on that row. The row index counts
+    /// from the top of the window, so a scrolled list must still land on the
+    /// session that was painted there.
+    #[test]
+    fn clicking_a_resume_row_selects_the_session_painted_there() {
+        let sessions = (0..12)
+            .map(|index| SessionInfo {
+                id: format!("session-{index}"),
+                name: Some(format!("Session {index}")),
+                preview: String::new(),
+                cwd: r"C:\work\current".to_owned(),
+                updated_at: 0,
+            })
+            .collect();
+        let mut picker = SessionPicker::new(sessions, r"C:\work\current".to_owned(), None);
+
+        assert!(matches!(
+            picker.click_row(2),
+            SessionPickerResult::Select(id) if id == "session-2"
+        ));
+
+        // Walking past the tenth row scrolls the window, and the second row is
+        // then the second session of the window rather than of the list.
+        for _ in 0..11 {
+            picker.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let painted = picker.overlay_view().lines[1].text.clone();
+        let SessionPickerResult::Select(id) = picker.click_row(1) else {
+            panic!("a painted row resumes the session on it");
+        };
+        assert!(painted.contains(&format!("Session {}", id.trim_start_matches("session-"))));
+
+        // Past the end of the window there is nothing painted to resume.
+        assert!(matches!(picker.click_row(10), SessionPickerResult::None));
+    }
+
+    #[test]
+    fn resume_picker_keeps_all_project_folders_on_one_row() {
+        let mut picker = SessionPicker::new(
+            vec![SessionInfo {
+                id: "other".to_owned(),
+                name: Some("Other project".to_owned()),
+                preview: String::new(),
+                cwd: r"C:\work\other".to_owned(),
+                updated_at: 0,
             }],
             r"C:\work\current".to_owned(),
             None,
         );
+        picker.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
 
         let view = picker.overlay_view();
 
-        // The padding rows come from the panel renderer, so the picker itself
-        // contributes only the session.
-        assert_eq!(view.lines.len(), 1);
-        assert!(
-            view.input_label.is_empty(),
-            "the placeholder already names the field"
-        );
+        assert!(view.lines[0].text.contains(r"C:\work\other"));
+        assert!(!view.lines[0].text.contains('\n'));
     }
 
     #[test]
@@ -5845,6 +7630,29 @@ mod tests {
     }
 
     #[test]
+    fn model_and_effort_picker_copy_is_not_duplicated_in_the_body() {
+        let mut state = test_state();
+
+        let _ = state.run_slash_command("/model");
+        let model = state.overlay_view().expect("model picker");
+        assert_eq!(model.title, "Model");
+        assert!(model.slider.is_some());
+        assert!(
+            model.lines.iter().all(|line| line.text != "Effort"),
+            "Effort must not be a standalone model-picker row"
+        );
+
+        state.pending = None;
+        let _ = state.run_slash_command("/effort");
+        let effort = state.overlay_view().expect("effort picker");
+        assert_eq!(effort.title, "Effort");
+        assert!(
+            effort.lines.is_empty(),
+            "the effort picker must not repeat the selected model name"
+        );
+    }
+
+    #[test]
     fn model_aliases_and_number_keys_select_catalog_entries() {
         let models = vec![
             test_model("gpt-5.6-sol", "GPT-5.6-Sol", true),
@@ -5872,25 +7680,80 @@ mod tests {
         let overlay = state.overlay_view().expect("model picker");
         assert!(overlay.lines[0].text.starts_with("1. "));
         assert!(overlay.lines[1].text.starts_with("2. "));
+        // Picking a model now asks how long it should last before applying.
         state.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert_eq!(state.selected_model_display_name(), "GPT-5.6-Terra");
+        assert_eq!(
+            state.overlay_view().expect("scope picker").title,
+            "Apply to"
+        );
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(state.selected_model_display_name(), "GPT-5.6-Sol");
+        assert!(state.overlay_view().is_none());
     }
 
     #[test]
-    fn effort_slider_has_direction_track_and_aligned_labels() {
-        let model = test_model("gpt-5.6-sol", "GPT-5.6-Sol", true);
-        let [endpoints, track, labels] = effort_slider_rows(&model, 2);
+    fn choosing_the_default_scope_persists_the_model_and_effort() {
+        let mut state = test_state();
+        state.run_slash_command("/model");
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-        assert!(endpoints.starts_with("Faster"));
-        assert!(endpoints.ends_with("Smarter"));
-        assert_eq!(
-            track.chars().filter(|ch| matches!(ch, '○' | '●')).count(),
-            6
+        // Second choice in the scope list writes the config.
+        let action = state.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+
+        assert!(matches!(
+            action,
+            Action::PersistModelDefault { ref model, ref effort }
+                if model == "gpt-5.6-sol" && effort == "high"
+        ));
+        assert!(state.overlay_view().is_none());
+    }
+
+    #[test]
+    fn model_scope_options_are_fully_english() {
+        let mut state = test_state();
+        state.run_slash_command("/model");
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let overlay = state.overlay_view().expect("scope picker");
+        let options = &overlay.lines[2..];
+
+        assert!(options[0].text.contains("This session only"));
+        assert!(options[1].text.contains("Set as default"));
+        assert!(
+            options
+                .iter()
+                .all(|line| !line.text.chars().any(|ch| ('가'..='힣').contains(&ch)))
         );
-        assert_eq!(track.chars().filter(|ch| *ch == '●').count(), 1);
-        assert!(labels.contains("low"));
-        assert!(labels.contains("ultra"));
-        assert_eq!(endpoints.chars().count(), track.chars().count());
+    }
+
+    #[test]
+    fn model_scope_descriptions_share_a_column() {
+        let mut state = test_state();
+        state.run_slash_command("/model");
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let overlay = state.overlay_view().expect("scope picker");
+        let options = &overlay.lines[2..];
+
+        assert_eq!(
+            options[0].text.find("Returns to"),
+            options[1].text.find("Saves to")
+        );
+    }
+
+    #[test]
+    fn the_effort_slider_carries_every_tier_and_clamps_the_selection() {
+        let model = test_model("gpt-5.6-sol", "GPT-5.6-Sol", true);
+
+        let slider = effort_slider(&model, 2);
+        assert_eq!(
+            slider.efforts,
+            ["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
+        assert_eq!(slider.selected, 2);
+        // A stale index from a model with more tiers must not run off the end.
+        assert_eq!(effort_slider(&model, 99).selected, 5);
     }
 
     #[test]
@@ -5984,6 +7847,32 @@ mod tests {
 
         assert!(state.take_side_parent_turn().is_none());
         assert!(!state.busy);
+    }
+
+    #[test]
+    fn resuming_a_completed_turn_keeps_its_completion_label() {
+        let model = test_model("gpt-5.6-sol", "GPT-5.6-Sol", true);
+        let mut state = AppState::new(
+            "main-thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![model],
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+
+        state.load_history(
+            &json!({
+                "turns": [{
+                    "startedAt": 1_784_992_100_i64,
+                    "completedAt": 1_784_992_165_i64,
+                    "items": []
+                }]
+            }),
+            None,
+        );
+
+        assert_eq!(state.activity().as_deref(), Some("✓ Completed (1m 5s)"));
     }
 
     fn busy_state_with_live_turn() -> AppState {
@@ -6367,21 +8256,381 @@ mod tests {
         );
     }
 
+    fn composer_completion_state() -> AppState {
+        let mut state = test_state();
+        state.update_skills(&json!({
+            "data": [{
+                "cwd": "cwd",
+                "errors": [],
+                "skills": [{
+                    "name": "review",
+                    "path": "C:/skills/review/SKILL.md",
+                    "description": "Review a change",
+                    "enabled": true,
+                    "scope": "user"
+                }]
+            }]
+        }));
+        state.update_plugins(&json!({
+            "marketplaces": [{
+                "name": "openai-bundled",
+                "plugins": [{
+                    "id": "browser-use@openai-bundled",
+                    "name": "browser-use",
+                    "description": "Control a browser",
+                    "installed": true,
+                    "enabled": true,
+                    "interface": { "displayName": "Browser Use" }
+                }]
+            }]
+        }));
+        state.update_apps(&json!({
+            "data": [{
+                "id": "calendar",
+                "name": "Calendar",
+                "description": "Read calendar events",
+                "isAccessible": true,
+                "isEnabled": true
+            }]
+        }));
+        state.update_workspace_entries(vec![
+            crate::completion::CompletionCandidate::new(
+                crate::completion::CompletionKind::Directory,
+                "src",
+                "",
+                "src",
+            ),
+            crate::completion::CompletionCandidate::new(
+                crate::completion::CompletionKind::File,
+                "src/main.rs",
+                "",
+                "src/main.rs",
+            ),
+        ]);
+        state
+    }
+
+    #[test]
+    fn composer_completion_catalogs_match_current_codex() {
+        let mut state = composer_completion_state();
+        state.editor.set_text("$");
+        let dollar = state
+            .view()
+            .suggestions
+            .iter()
+            .map(|suggestion| suggestion.category.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            dollar,
+            [
+                Some("Plugin".to_owned()),
+                Some("Skill".to_owned()),
+                Some("App".to_owned())
+            ]
+        );
+
+        state.editor.set_text("@");
+        let at = state
+            .view()
+            .suggestions
+            .iter()
+            .map(|suggestion| suggestion.category.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(at, [Some("Plugin".to_owned()), Some("Skill".to_owned())]);
+
+        state.editor.set_text("@src");
+        let filesystem = state
+            .view()
+            .suggestions
+            .iter()
+            .map(|suggestion| suggestion.category.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            filesystem,
+            [Some("Dir".to_owned()), Some("File".to_owned())]
+        );
+    }
+
+    #[test]
+    fn composer_completion_enter_inserts_a_skill_without_submitting() {
+        let mut state = composer_completion_state();
+        state.editor.set_text("@rev");
+
+        let action = state.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        assert!(matches!(action, Action::None));
+        assert_eq!(state.editor.text(), "$review ");
+    }
+
+    #[test]
+    fn composer_completion_replaces_only_the_active_mid_draft_file_token() {
+        let mut state = composer_completion_state();
+        state.editor.set_text("open @mai later");
+        for _ in 0..6 {
+            state.editor.move_left();
+        }
+
+        let action = state.handle_key(KeyEvent::from(KeyCode::Tab));
+
+        assert!(matches!(action, Action::None));
+        assert_eq!(state.editor.text(), "open src/main.rs  later");
+    }
+
+    #[test]
+    fn composer_completion_escape_dismisses_until_the_token_changes() {
+        let mut state = composer_completion_state();
+        state.editor.set_text("$rev");
+        assert!(!state.view().suggestions.is_empty());
+
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Esc)),
+            Action::None
+        ));
+        assert!(state.view().suggestions.is_empty());
+
+        state.handle_key(KeyEvent::from(KeyCode::Char('i')));
+        assert!(!state.view().suggestions.is_empty());
+    }
+
+    #[test]
+    fn composer_completion_empty_mode_stays_open_for_mode_switching() {
+        let mut state = composer_completion_state();
+        state.editor.set_text("@rev");
+
+        state.handle_key(KeyEvent::from(KeyCode::Right));
+        let empty_mode = state.view().suggestions;
+        assert_eq!(empty_mode.len(), 1);
+        assert_eq!(empty_mode[0].command, "No matches");
+
+        state.handle_key(KeyEvent::from(KeyCode::Right));
+        assert!(
+            state
+                .view()
+                .suggestions
+                .iter()
+                .any(|suggestion| suggestion.command == "review")
+        );
+    }
+
+    #[test]
+    fn composer_completion_shell_like_query_requires_a_catalog_match() {
+        let mut state = composer_completion_state();
+        state.editor.set_text("$1missing");
+        assert!(state.view().suggestions.is_empty());
+
+        state.update_skills(&json!({
+            "data": [{
+                "cwd": "cwd",
+                "errors": [],
+                "skills": [{
+                    "name": "1password",
+                    "path": "C:/skills/1password/SKILL.md",
+                    "description": "Use 1Password",
+                    "enabled": true,
+                    "scope": "user"
+                }]
+            }]
+        }));
+        state.editor.set_text("$1p");
+        assert!(
+            state
+                .view()
+                .suggestions
+                .iter()
+                .any(|suggestion| suggestion.command == "1password")
+        );
+    }
+
     #[test]
     fn mention_tokens_do_not_treat_email_addresses_as_plugins() {
         assert_eq!(
             mention_triggers("mail foo@sample.com, then use @sample"),
-            vec!["sample".to_owned()]
+            vec![('@', "sample".to_owned())]
+        );
+    }
+
+    #[test]
+    fn mention_submission_keeps_sigil_categories_separate() {
+        let mut state = test_state();
+        state.update_skills(&json!({
+            "data": [{
+                "skills": [{
+                    "name": "calendar",
+                    "path": "C:/skills/calendar/SKILL.md",
+                    "enabled": true
+                }]
+            }]
+        }));
+        state.update_plugins(&json!({
+            "marketplaces": [{
+                "name": "market",
+                "plugins": [{
+                    "id": "calendar@market",
+                    "name": "calendar",
+                    "installed": true,
+                    "enabled": true
+                }]
+            }]
+        }));
+        state.update_apps(&json!({
+            "data": [{
+                "id": "calendar",
+                "name": "Calendar",
+                "isAccessible": true,
+                "isEnabled": true
+            }]
+        }));
+
+        let dollar = state.turn_input("$calendar".to_owned());
+        assert_eq!(dollar.len(), 2);
+        assert_eq!(dollar[1].get("type").and_then(Value::as_str), Some("skill"));
+
+        let at = state.turn_input("@calendar".to_owned());
+        assert_eq!(at.len(), 2);
+        assert_eq!(at[1].get("type").and_then(Value::as_str), Some("mention"));
+        assert_eq!(
+            at[1].get("path").and_then(Value::as_str),
+            Some("plugin://calendar@market")
+        );
+    }
+
+    #[test]
+    fn selected_app_binding_wins_over_a_same_named_skill() {
+        let mut state = test_state();
+        state.update_skills(&json!({
+            "data": [{
+                "skills": [{
+                    "name": "calendar",
+                    "path": "C:/skills/calendar/SKILL.md",
+                    "enabled": true
+                }]
+            }]
+        }));
+        state.update_apps(&json!({
+            "data": [{
+                "id": "calendar",
+                "name": "Calendar",
+                "isAccessible": true,
+                "isEnabled": true
+            }]
+        }));
+        state.editor.set_text("$cal");
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        let input = state.turn_input(state.editor.text());
+        assert_eq!(input.len(), 2);
+        assert_eq!(
+            input[1].get("path").and_then(Value::as_str),
+            Some("app://calendar")
+        );
+    }
+
+    #[test]
+    fn edited_completion_does_not_keep_its_selected_binding() {
+        let mut state = test_state();
+        state.update_apps(&json!({
+            "data": [{
+                "id": "calendar",
+                "name": "Calendar",
+                "isAccessible": true,
+                "isEnabled": true
+            }]
+        }));
+        state.editor.set_text("$cal");
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        state.handle_key(KeyEvent::from(KeyCode::Backspace));
+        state.handle_key(KeyEvent::from(KeyCode::Char('x')));
+
+        let input = state.turn_input(state.editor.text());
+
+        assert_eq!(input.len(), 1);
+    }
+
+    #[test]
+    fn identical_tokens_keep_their_individual_selected_bindings() {
+        let mut state = test_state();
+        state.update_skills(&json!({
+            "data": [{
+                "skills": [{
+                    "name": "calendar",
+                    "path": "C:/skills/calendar/SKILL.md",
+                    "enabled": true
+                }]
+            }]
+        }));
+        state.update_apps(&json!({
+            "data": [{
+                "id": "calendar",
+                "name": "Calendar",
+                "isAccessible": true,
+                "isEnabled": true
+            }]
+        }));
+        state.editor.set_text("$cal");
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        state.handle_paste("$cal");
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        let input = state.turn_input(state.editor.text());
+        let paths = input
+            .iter()
+            .filter_map(|item| item.get("path").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, ["C:/skills/calendar/SKILL.md", "app://calendar"]);
+    }
+
+    #[test]
+    fn changing_cwd_clears_old_workspace_completions_immediately() {
+        let mut state = composer_completion_state();
+        state.editor.set_text("@src");
+        assert!(
+            state
+                .view()
+                .suggestions
+                .iter()
+                .any(|suggestion| suggestion.category.as_deref() == Some("File"))
+        );
+
+        state.attach_thread(
+            "thread-2".to_owned(),
+            "C:/other-workspace".to_owned(),
+            "gpt-5",
+            None,
+        );
+
+        assert!(
+            state
+                .view()
+                .suggestions
+                .iter()
+                .all(|suggestion| !matches!(suggestion.category.as_deref(), Some("File" | "Dir")))
         );
     }
 
     #[test]
     fn integration_slash_commands_dispatch_app_server_actions() {
         let mut state = test_state();
-        assert!(matches!(state.run_slash_command("/mcp"), Action::ShowMcp));
+        assert!(matches!(
+            state.run_slash_command("/mcp"),
+            Action::OpenMcp(None)
+        ));
+        assert!(matches!(
+            state.run_slash_command("/mcp reconnect"),
+            Action::ReconnectMcp
+        ));
         assert!(matches!(
             state.run_slash_command("/mcp login github"),
             Action::McpLogin(ref name) if name == "github"
+        ));
+        assert!(matches!(
+            state.run_slash_command("/plugins"),
+            Action::OpenPlugins {
+                scope: None,
+                notice: None
+            }
         ));
         assert!(matches!(
             state.run_slash_command("/plugins install browser"),
@@ -6401,12 +8650,60 @@ mod tests {
                 enabled: false
             } if name == "imagegen"
         ));
+    }
+
+    #[test]
+    fn marketplace_subcommands_route_through_the_confirmation_step() {
+        let mut state = test_state();
+
         assert!(matches!(
-            state.run_slash_command("/apps enable calendar"),
-            Action::SetApp {
-                ref query,
-                enabled: true
-            } if query == "calendar"
+            state.run_slash_command("/plugins marketplace"),
+            Action::OpenMarketplaces(None)
+        ));
+        assert!(matches!(
+            state.run_slash_command("/plugins marketplace add owner/repo"),
+            Action::ConfirmMarketplaceAdd(ref source) if source == "owner/repo"
+        ));
+        assert!(matches!(
+            state.run_slash_command("/plugins marketplace remove openai-bundled"),
+            Action::ConfirmMarketplaceRemove(ref name) if name == "openai-bundled"
+        ));
+        assert!(matches!(
+            state.run_slash_command("/plugins marketplace upgrade"),
+            Action::UpgradeMarketplaces
+        ));
+        // A name is rejected rather than silently ignored, because the server
+        // upgrades every git marketplace regardless of what is named.
+        assert!(matches!(
+            state.run_slash_command("/plugins marketplace upgrade openai-bundled"),
+            Action::None
+        ));
+    }
+
+    /// Adding a marketplace checks out a repository whose hooks can run, so the
+    /// confirmation must be a real gate rather than a notice.
+    #[test]
+    fn adding_a_marketplace_waits_for_an_explicit_confirmation() {
+        let mut state = test_state();
+        state.confirm_marketplace_add("owner/repo");
+
+        let overlay = state.view().overlay.expect("confirmation overlay");
+        assert!(overlay.title.contains("마켓플레이스를 추가"));
+        assert!(
+            overlay
+                .lines
+                .iter()
+                .any(|line| line.text.contains("신뢰할 수 있는 저장소만")),
+            "the trust warning has to be on screen before the checkout"
+        );
+
+        let declined = state.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(matches!(declined, Action::None));
+
+        state.confirm_marketplace_add("owner/repo");
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Action::AddMarketplace(ref source) if source == "owner/repo"
         ));
     }
 

@@ -29,7 +29,7 @@
 - Consumes: existing `OverlayView`, `OverlayLine`, `panel_line_keep_left`, and `panel_rule_row`
 - Produces: `OverlayStyle::CompactPanel`, rendered as a bordered, right-truncated, one-row-per-option dock
 
-- [ ] **Step 1: Write the failing renderer test**
+- [x] **Step 1: Write the failing renderer test**
 
 Add this test beside the other overlay tests:
 
@@ -75,13 +75,13 @@ fn compact_panel_keeps_each_option_on_one_physical_row() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test renderer::tests::compact_panel_keeps_each_option_on_one_physical_row -- --nocapture`
 
 Expected: FAIL because `OverlayStyle::CompactPanel` does not exist.
 
-- [ ] **Step 3: Implement the compact overlay style**
+- [x] **Step 3: Implement the compact overlay style**
 
 Extend the enum:
 
@@ -125,7 +125,7 @@ OverlayStyle::CompactPanel => {
 `panel_line_keep_left` already replaces control characters and truncates the
 right side, so newline-containing or overlong input remains one physical row.
 
-- [ ] **Step 4: Run focused renderer tests**
+- [x] **Step 4: Run focused renderer tests**
 
 Run: `cargo test renderer::tests::compact_panel_keeps_each_option_on_one_physical_row -- --nocapture`
 
@@ -135,7 +135,7 @@ Run: `cargo test renderer::tests::panel_overlay_keeps_its_border_when_a_row_fold
 
 Expected: PASS, confirming the existing panel renderer is unchanged.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add -- src/renderer.rs
@@ -152,7 +152,7 @@ git commit -m "feat: add compact overlay panel"
 - Consumes: `OverlayStyle::CompactPanel` from Task 1 and existing `visible_window`
 - Produces: `const RESUME_PICKER_ROWS: usize = 10` and compact time-first session rows from `SessionPicker::overlay_view`
 
-- [ ] **Step 1: Write failing state tests**
+- [x] **Step 1: Write failing state tests**
 
 Replace the existing resume-picker layout test with:
 
@@ -183,13 +183,13 @@ fn resume_picker_shows_ten_time_first_single_line_rows() {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test state::tests::resume_picker_shows_ten_time_first_single_line_rows -- --nocapture`
 
 Expected: FAIL because the picker still uses nine rows, title-first formatting, and `OverlayStyle::Panel`.
 
-- [ ] **Step 3: Implement the resume row model**
+- [x] **Step 3: Implement the resume row model**
 
 Add a picker-local row limit near `SessionPicker`:
 
@@ -223,7 +223,7 @@ OverlayLine {
 Set `style: OverlayStyle::CompactPanel`. Keep the title, search editor,
 placeholder, hint, filtering, selection, and key handling unchanged.
 
-- [ ] **Step 4: Run focused state and renderer tests**
+- [x] **Step 4: Run focused state and renderer tests**
 
 Run: `cargo test resume_picker -- --nocapture`
 
@@ -233,7 +233,7 @@ Run: `cargo test renderer::tests::compact_panel -- --nocapture`
 
 Expected: compact overlay tests PASS.
 
-- [ ] **Step 5: Run full verification**
+- [x] **Step 5: Run full verification**
 
 Run: `cargo fmt --check`
 
@@ -243,7 +243,7 @@ Run: `cargo test`
 
 Expected: all tests PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```powershell
 git add -- src/state.rs
@@ -261,7 +261,7 @@ git commit -m "feat: compact resume session picker"
 - Consumes: existing `compact_right`, `panel_line`, and `OverlayStyle::CompactPanel`
 - Produces: `panel_line_keep_left_inset(text: &str, width: usize, right_inset: usize, tone: Tone, bold: bool) -> PaintLine`
 
-- [ ] **Step 1: Extend the compact panel test with the failing inset assertion**
+- [x] **Step 1: Extend the compact panel test with the failing inset assertion**
 
 After obtaining the selected option row in
 `compact_panel_keeps_each_option_on_one_physical_row`, add:
@@ -274,13 +274,13 @@ assert!(
 );
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test renderer::tests::compact_panel_keeps_each_option_on_one_physical_row -- --nocapture`
 
 Expected: FAIL because the current compact row ends with `…│`.
 
-- [ ] **Step 3: Add the inset-aware row helper**
+- [x] **Step 3: Add the inset-aware row helper**
 
 Add this helper beside `panel_line_keep_left`:
 
@@ -334,7 +334,7 @@ panel_line_keep_left_inset(
 
 Do not change command suggestions or the existing `Panel` renderer.
 
-- [ ] **Step 4: Run focused and full verification**
+- [x] **Step 4: Run focused and full verification**
 
 Run: `cargo test renderer::tests::compact_panel_keeps_each_option_on_one_physical_row -- --nocapture`
 
@@ -348,7 +348,7 @@ Run: `cargo test`
 
 Expected: all tests PASS unless an unrelated concurrent workspace change has introduced a separately identified failure.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Do not commit `src/renderer.rs` while it contains unrelated user changes.
 Leave the verified source edit in the working tree and report that state.

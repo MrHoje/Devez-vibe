@@ -13,6 +13,11 @@ use serde_json::Value;
 pub struct RolloutEvent {
     /// RFC 3339, always UTC — sorts correctly as a plain string.
     pub ts: String,
+    /// The app-server turn this event belongs to, when the payload says so
+    /// directly (`custom_tool_call*`'s `internal_chat_message_metadata_passthrough`,
+    /// `patch_apply_end`'s own `turn_id`). `None` means the caller has to fall
+    /// back to comparing timestamps against the turn's start/end window.
+    pub turn_id: Option<String>,
     pub kind: RolloutKind,
 }
 
@@ -75,8 +80,10 @@ fn find_rollout(root: &Path, thread_id: &str) -> Option<PathBuf> {
 /// build does not know — is dropped on its own; the rest of the file still reads.
 pub fn parse(text: &str) -> Rollout {
     let mut events = Vec::new();
-    // Exec calls whose output has not arrived yet: `call_id` → index in `events`.
-    let mut pending: Vec<(String, usize)> = Vec::new();
+    // Exec calls whose output has not arrived yet: `call_id` → the indices in
+    // `events` its output segments fill in, in the order the script's calls
+    // ran (a script can run more than one `shell_command` per turn).
+    let mut pending: Vec<(String, Vec<usize>)> = Vec::new();
     for line in text.lines() {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -91,43 +98,64 @@ pub fn parse(text: &str) -> Rollout {
         };
         match payload.get("type").and_then(Value::as_str).unwrap_or_default() {
             "custom_tool_call" => {
-                let input = payload.get("input").and_then(Value::as_str).unwrap_or_default();
-                let Some(command) = shell_command(input) else {
+                // `name` is the real discriminant between a shell run and a
+                // patch application — not where `tools.shell_command(` happens
+                // to show up in the script's text, which a quoted patch body
+                // can fake.
+                if payload.get("name").and_then(Value::as_str) != Some("exec") {
                     continue;
-                };
+                }
+                let input = payload.get("input").and_then(Value::as_str).unwrap_or_default();
+                let commands = shell_commands(input);
+                if commands.is_empty() {
+                    continue;
+                }
                 let call_id = payload
                     .get("call_id")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
-                pending.push((call_id, events.len()));
-                events.push(RolloutEvent {
-                    ts,
-                    kind: RolloutKind::Exec {
-                        command,
-                        output: String::new(),
-                        exit_code: None,
-                        duration_ms: None,
-                    },
-                });
+                let turn_id = call_turn_id(payload);
+                let indices = commands
+                    .into_iter()
+                    .map(|command| {
+                        let index = events.len();
+                        events.push(RolloutEvent {
+                            ts: ts.clone(),
+                            turn_id: turn_id.clone(),
+                            kind: RolloutKind::Exec {
+                                command,
+                                output: String::new(),
+                                exit_code: None,
+                                duration_ms: None,
+                            },
+                        });
+                        index
+                    })
+                    .collect::<Vec<_>>();
+                pending.push((call_id, indices));
             }
             "custom_tool_call_output" => {
                 let call_id = payload.get("call_id").and_then(Value::as_str).unwrap_or_default();
                 let Some(position) = pending.iter().position(|(id, _)| id == call_id) else {
                     continue;
                 };
-                let (_, index) = pending.remove(position);
+                let (_, indices) = pending.remove(position);
                 let text = output_text(payload.get("output"));
-                if let RolloutKind::Exec {
-                    output,
-                    exit_code,
-                    duration_ms,
-                    ..
-                } = &mut events[index].kind
-                {
-                    *exit_code = parse_exit_code(&text);
-                    *duration_ms = parse_wall_time_ms(&text);
-                    *output = text;
+                let duration_ms = parse_wall_time_ms(&text);
+                let results = command_results(&text, indices.len());
+                for (index, (exit_code, body)) in indices.into_iter().zip(results) {
+                    if let RolloutKind::Exec {
+                        output,
+                        exit_code: slot_exit,
+                        duration_ms: slot_duration,
+                        ..
+                    } = &mut events[index].kind
+                    {
+                        *slot_exit = exit_code;
+                        *slot_duration = duration_ms;
+                        *output = body;
+                    }
                 }
             }
             "reasoning" => {
@@ -137,6 +165,7 @@ pub fn parse(text: &str) -> Rollout {
                 }
                 events.push(RolloutEvent {
                     ts,
+                    turn_id: None,
                     kind: RolloutKind::Reasoning { summary },
                 });
             }
@@ -144,8 +173,13 @@ pub fn parse(text: &str) -> Rollout {
                 let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
                     continue;
                 };
+                let turn_id = payload
+                    .get("turn_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
                 events.push(RolloutEvent {
                     ts,
+                    turn_id,
                     kind: RolloutKind::PatchApplied {
                         call_id: call_id.to_owned(),
                     },
@@ -153,12 +187,15 @@ pub fn parse(text: &str) -> Rollout {
             }
             // The `event_msg` form carries `message`; the `response_item` twin has
             // no such field and is skipped, so each message anchors exactly once.
+            // Neither form carries a `turn_id` in practice, so this always falls
+            // back to the turn's time window.
             "agent_message" => {
                 let Some(text) = payload.get("message").and_then(Value::as_str) else {
                     continue;
                 };
                 events.push(RolloutEvent {
                     ts,
+                    turn_id: None,
                     kind: RolloutKind::AssistantMessage {
                         text: text.to_owned(),
                     },
@@ -168,6 +205,17 @@ pub fn parse(text: &str) -> Rollout {
         }
     }
     Rollout { events }
+}
+
+/// A `custom_tool_call`/`custom_tool_call_output` payload's turn id, tucked
+/// under `internal_chat_message_metadata_passthrough` rather than sitting on
+/// the payload itself the way `patch_apply_end`'s does.
+fn call_turn_id(payload: &Value) -> Option<String> {
+    payload
+        .get("internal_chat_message_metadata_passthrough")
+        .and_then(|passthrough| passthrough.get("turn_id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 fn summary_text(value: Option<&Value>) -> String {
@@ -180,30 +228,36 @@ fn summary_text(value: Option<&Value>) -> String {
         .join("\n")
 }
 
-/// The shell command inside an `exec` call's script, or `None` when the script
-/// is doing something else — applying a patch, above all.
-fn shell_command(input: &str) -> Option<String> {
-    let shell = input.find("tools.shell_command(")?;
-    // A patch body can quote anything, including this module's own markers, so the
-    // first tool call in the script decides what the call was for.
-    if input
-        .find("tools.apply_patch(")
-        .is_some_and(|patch| patch < shell)
-    {
+/// Every `shell_command` call's command in `input`, in the order the calls
+/// appear. A script may make more than one in a single `exec` turn —
+/// `Promise.all`, a loop over a list of commands — and each becomes its own
+/// entry here. A call this parser cannot read (see `call_command`) is simply
+/// left out rather than aborting the whole script.
+fn shell_commands(input: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut cursor = 0usize;
+    while let Some(offset) = input[cursor..].find("tools.shell_command(") {
+        let after_call = cursor + offset + "tools.shell_command(".len();
+        if let Some(command) = call_command(&input[after_call..]) {
+            commands.push(command);
+        }
+        cursor = after_call;
+    }
+    commands
+}
+
+/// The `command` value of one call's own argument object. The parser anchors
+/// on the call's own opening parenthesis — the next non-space character must
+/// itself be `{` — instead of searching forward for any `{…}` in the rest of
+/// the script, which would happily grab a later, unrelated call's arguments
+/// (exactly the failure a bare `find('{')` had).
+fn call_command(after_call: &str) -> Option<String> {
+    let trimmed = after_call.trim_start();
+    if !trimmed.starts_with('{') {
         return None;
     }
-    let arguments = balanced_object(&input[shell..])?;
-    match serde_json::from_str::<Value>(arguments).ok()?.get("command")? {
-        Value::String(command) => Some(command.clone()),
-        Value::Array(parts) => Some(
-            parts
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(" "),
-        ),
-        _ => None,
-    }
+    let object = balanced_object(trimmed)?;
+    command_field(&object[1..object.len() - 1])
 }
 
 /// The first `{…}` run in `text`, counting nesting and ignoring braces inside
@@ -235,6 +289,185 @@ fn balanced_object(text: &str) -> Option<&str> {
     None
 }
 
+/// Scans one object literal's top-level fields — skipping over quoted strings
+/// and nested brackets so a command's own text never derails it — for
+/// `command`, bare or quoted, and reads its value. Model-written scripts use
+/// both spellings about as often as each other (`{command: "…"}` and
+/// `{"command":"…"}`). A value that isn't a literal string or string array —
+/// a variable (`{command: c}`), a shorthand property with no value of its own
+/// (`{command}`) — cannot be read without evaluating the script, so it yields
+/// `None`.
+fn command_field(body: &str) -> Option<String> {
+    let mut i = 0usize;
+    while i < body.len() {
+        let ch = body[i..].chars().next()?;
+        if ch == '"' || ch == '\'' || ch == '`' || ch.is_alphabetic() || ch == '_' {
+            let (key, after_key) = read_token(body, i);
+            let after_gap = skip_whitespace(body, after_key);
+            if body[after_gap..].starts_with(':') {
+                let value_start = skip_whitespace(body, after_gap + 1);
+                if key == "command" {
+                    return command_value(body, value_start);
+                }
+                i = skip_value(body, value_start);
+            } else {
+                // A shorthand property: the token is both key and value, so
+                // there is nothing further to read even when it is the one
+                // named `command`.
+                if key == "command" {
+                    return None;
+                }
+                i = after_key;
+            }
+        } else {
+            i += ch.len_utf8();
+        }
+    }
+    None
+}
+
+fn skip_whitespace(body: &str, mut i: usize) -> usize {
+    while i < body.len() {
+        let ch = body[i..].chars().next().expect("i is a char boundary within bounds");
+        if ch.is_whitespace() {
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+/// One object key, quoted or bare, starting at `i`. Quotes are stripped;
+/// escapes are not decoded because key names never carry any that matter here.
+fn read_token(body: &str, i: usize) -> (String, usize) {
+    let ch = body[i..].chars().next().expect("i is a char boundary within bounds");
+    if ch == '"' || ch == '\'' || ch == '`' {
+        let end = skip_string(body, i);
+        (body[i + ch.len_utf8()..end - ch.len_utf8()].to_owned(), end)
+    } else {
+        let mut end = i;
+        for c in body[i..].chars() {
+            if c.is_alphanumeric() || c == '_' {
+                end += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        (body[i..end].to_owned(), end)
+    }
+}
+
+/// Advances past one quoted string (`"`, `'`, or a template literal) to the
+/// index just after its closing quote. A backslash escapes the next
+/// character, including the quote itself, so an escaped quote never ends the
+/// string early.
+fn skip_string(body: &str, i: usize) -> usize {
+    let quote = body[i..].chars().next().expect("i is a char boundary within bounds");
+    let mut j = i + quote.len_utf8();
+    let mut escaped = false;
+    while j < body.len() {
+        let ch = body[j..].chars().next().expect("j is a char boundary within bounds");
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            return j + ch.len_utf8();
+        }
+        j += ch.len_utf8();
+    }
+    j
+}
+
+/// Advances past one field's value — string, array, nested object, number,
+/// boolean — to the delimiter that ends it: a top-level comma or the
+/// enclosing `}`/`]`. Used to step over a field this parser does not care
+/// about without losing its place in the rest of the object.
+fn skip_value(body: &str, mut i: usize) -> usize {
+    let mut depth = 0i32;
+    while i < body.len() {
+        let ch = body[i..].chars().next().expect("i is a char boundary within bounds");
+        match ch {
+            '"' | '\'' | '`' => {
+                i = skip_string(body, i);
+                continue;
+            }
+            '{' | '[' | '(' => depth += 1,
+            '}' | ')' | ']' if depth > 0 => depth -= 1,
+            ',' if depth == 0 => return i,
+            '}' | ']' if depth == 0 => return i,
+            _ => {}
+        }
+        i += ch.len_utf8();
+    }
+    i
+}
+
+/// The `command` field's value once its `:` has been found: a plain string,
+/// or an array of strings joined with spaces (the code-mode wrapper's argv
+/// form). A number, object, or bare variable is not a literal command, so it
+/// yields `None`.
+fn command_value(body: &str, i: usize) -> Option<String> {
+    let ch = body[i..].chars().next()?;
+    match ch {
+        '"' | '\'' | '`' => Some(unescape(&read_token(body, i).0)),
+        '[' => array_command(body, i),
+        _ => None,
+    }
+}
+
+/// A `command` value written as `["bash", "-lc", "ls"]`, joined with spaces to
+/// match the plain-string case. A non-string element is dropped rather than
+/// failing the whole call.
+fn array_command(body: &str, start: usize) -> Option<String> {
+    let mut i = start + 1; // past '['
+    let mut parts = Vec::new();
+    loop {
+        i = skip_whitespace(body, i);
+        let ch = body[i..].chars().next()?;
+        if ch == ']' {
+            break;
+        }
+        if ch == '"' || ch == '\'' || ch == '`' {
+            let (raw, after) = read_token(body, i);
+            parts.push(unescape(&raw));
+            i = after;
+        } else {
+            i = skip_value(body, i);
+        }
+        i = skip_whitespace(body, i);
+        match body[i..].chars().next()? {
+            ',' => i += 1,
+            ']' => break,
+            _ => return None,
+        }
+    }
+    Some(parts.join(" "))
+}
+
+/// Decodes the backslash escapes a hand-written JS string literal uses (`\\`,
+/// `\"`, `\n`, …). An escape this does not recognise passes through as the
+/// character itself, which is good enough for a shell command's text.
+fn unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
+}
+
 fn output_text(value: Option<&Value>) -> String {
     match value {
         Some(Value::String(text)) => text.clone(),
@@ -245,6 +478,84 @@ fn output_text(value: Option<&Value>) -> String {
             .join(""),
         _ => String::new(),
     }
+}
+
+/// Splits one `custom_tool_call_output` payload's text into a result per
+/// `shell_command` call the script made, in the same order the calls appear
+/// in `commands`. A script with exactly one call has no `---label---`
+/// framing — the whole (wrapper-stripped) text is that command's own result.
+/// A script with several wraps each one as `---label---Exit code: … / Wall
+/// time: … / Output: …`, in call order, whether the calls ran through
+/// `Promise.all` or a plain loop.
+fn command_results(text: &str, calls: usize) -> Vec<(Option<i64>, String)> {
+    if calls <= 1 {
+        // The command's own header starts at `Exit code:` — found directly
+        // rather than by skipping past the wrapper's own `Output:` marker,
+        // because not every payload has one ahead of the header (a `Wall
+        // time` line with no preceding `Output:` is a real, if degenerate,
+        // shape) and guessing wrong would eat the header along with it.
+        let header_and_body = match text.find("Exit code:") {
+            Some(index) => &text[index..],
+            None => text,
+        };
+        return vec![command_result(header_and_body)];
+    }
+    let markers = marker_positions(text);
+    let mut results: Vec<(Option<i64>, String)> = markers
+        .iter()
+        .enumerate()
+        .map(|(position, &(_marker_start, header_start))| {
+            let end = markers
+                .get(position + 1)
+                .map(|&(next_start, _)| next_start)
+                .unwrap_or(text.len());
+            command_result(&text[header_start..end])
+        })
+        .collect();
+    while results.len() < calls {
+        results.push((None, String::new()));
+    }
+    results
+}
+
+/// One shell run's exit code and (wrapper-stripped) body, read starting
+/// exactly at its own `Exit code: N` header. Finding the *first* `Output:`
+/// from there — never the last — is what keeps a real body that happens to
+/// contain the literal text `Output:` intact instead of truncated.
+fn command_result(header_and_body: &str) -> (Option<i64>, String) {
+    let exit_code = parse_exit_code(header_and_body);
+    let body = match header_and_body.find("Output:") {
+        Some(index) => header_and_body[index + "Output:".len()..].trim_start_matches('\n'),
+        None => header_and_body,
+    };
+    (exit_code, body.to_owned())
+}
+
+/// Where a multi-call wrapper starts a new command's segment —
+/// `---label---Exit code:` — paired with the index right after that marker,
+/// where the segment's own header begins. A `---` that turns up inside a
+/// command's real output is not immediately followed by `Exit code:`, so it
+/// is never mistaken for one.
+fn marker_positions(text: &str) -> Vec<(usize, usize)> {
+    let mut positions = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(offset) = text[search_from..].find("---") {
+        let start = search_from + offset;
+        let after_open = start + 3;
+        match text[after_open..].find("---") {
+            Some(label_len) => {
+                let header_start = after_open + label_len + 3;
+                if text[header_start..].starts_with("Exit code:") {
+                    positions.push((start, header_start));
+                    search_from = header_start;
+                } else {
+                    search_from = start + 3;
+                }
+            }
+            None => break,
+        }
+    }
+    positions
 }
 
 /// The inner `Exit code: N` the code-mode wrapper prints for the command itself.
@@ -327,7 +638,18 @@ mod tests {
 
     #[test]
     fn load_picks_the_file_whose_name_ends_with_the_thread_id() {
-        let home = std::env::temp_dir().join("dvz-rollout-load-test");
+        // A unique directory per test run: this test used to share a fixed
+        // path (`dvz-rollout-load-test`) across the whole process, which was
+        // unsafe under `cargo test`'s parallel runner and left the directory
+        // behind whenever an assertion failed before the cleanup ran.
+        let home = std::env::temp_dir().join(format!(
+            "dvz-rollout-load-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock is after the epoch")
+                .as_nanos()
+        ));
         let day = home.join("sessions").join("2026").join("07").join("26");
         fs::create_dir_all(&day).expect("test directory");
         fs::write(
@@ -352,12 +674,13 @@ mod tests {
         assert!(missing.is_none());
     }
 
-    /// Helper for the exec tests: the single `Exec` event a rollout produced.
-    fn only_exec(rollout: &Rollout) -> (&str, &str, Option<i64>, Option<u64>) {
+    /// Helper for the exec tests: every `Exec` event a rollout produced, in
+    /// order.
+    fn exec_events(rollout: &Rollout) -> Vec<(&str, &str, Option<i64>, Option<u64>)> {
         rollout
             .events
             .iter()
-            .find_map(|event| match &event.kind {
+            .filter_map(|event| match &event.kind {
                 RolloutKind::Exec {
                     command,
                     output,
@@ -366,7 +689,14 @@ mod tests {
                 } => Some((command.as_str(), output.as_str(), *exit_code, *duration_ms)),
                 _ => None,
             })
-            .expect("one exec event")
+            .collect()
+    }
+
+    /// Helper for the exec tests: the single `Exec` event a rollout produced.
+    fn only_exec(rollout: &Rollout) -> (&str, &str, Option<i64>, Option<u64>) {
+        let mut events = exec_events(rollout);
+        assert_eq!(events.len(), 1, "expected exactly one exec event");
+        events.remove(0)
     }
 
     #[test]
@@ -399,6 +729,18 @@ mod tests {
     }
 
     #[test]
+    fn an_apply_patch_named_call_is_skipped_without_reading_its_input() {
+        // `name` is the real discriminant now (Minor finding #1): a patch body
+        // that happens to quote `tools.shell_command(` as literal text must
+        // not turn into a phantom exec event.
+        let rollout = parse(
+            r#"{"timestamp":"2026-07-25T15:09:40.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","call_id":"call_patch","input":"*** Begin Patch\n*** Add File: note.md\n+tools.shell_command({command: \"rm -rf /\"})\n*** End Patch"}}"#,
+        );
+
+        assert!(rollout.events.is_empty());
+    }
+
+    #[test]
     fn output_is_paired_by_call_id_with_its_exit_code_and_wall_time() {
         let rollout = parse(
             r#"{"timestamp":"2026-07-25T15:08:36.373Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_one","input":"await tools.shell_command({\"command\":\"rg TODO\"});"}}
@@ -422,5 +764,114 @@ mod tests {
         assert!(output.is_empty());
         assert_eq!(exit_code, None);
         assert_eq!(duration_ms, None);
+    }
+
+    // --- C1: a real bare-key `tools.shell_command({command: …})` call -----
+
+    #[test]
+    fn a_bare_key_shell_command_becomes_an_exec_event() {
+        // Real shape (session `019f996a`, one of the sessions the review found
+        // at 0/107 quoted-key calls): the model wrote a JS object literal, not
+        // JSON, so the key has no quotes around it at all.
+        let rollout = parse(
+            r#"{"timestamp":"2026-07-25T22:16:03.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_one","input":"const r = await tools.shell_command({command: \"Get-Content -Raw .gitignore\", workdir: \"C:\\\\Source\\\\DevezCLI\"});\ntext(r);"}}"#,
+        );
+
+        let (command, _, _, _) = only_exec(&rollout);
+        assert_eq!(command, "Get-Content -Raw .gitignore");
+    }
+
+    #[test]
+    fn a_variable_shell_command_argument_is_skipped_not_misread() {
+        // The other shape the review flagged as worse than a plain miss: the
+        // argument is a bare identifier (`.map()` over a command list), so
+        // there is no literal to read. The parser must not wander forward and
+        // grab some later, unrelated call's object instead.
+        let rollout = parse(
+            r#"{"timestamp":"2026-07-25T20:34:37.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_one","input":"const cmds=[[\"status\",{command:\"git status\"}]];\nconst out = await Promise.all(cmds.map(async ([k,a]) => { return [k, await tools.shell_command(a)]; }));\nconst decoy = {command:\"should not be picked up\"};"}}"#,
+        );
+
+        assert!(rollout.events.is_empty());
+    }
+
+    // --- I2: a `Promise.all` script running two `shell_command` calls -----
+
+    #[test]
+    fn a_promise_all_script_produces_one_exec_event_per_call() {
+        // Real shape (session `019f996a`): two commands issued together, their
+        // wrapped output framed as `---0---…` / `---1---…` in call order.
+        let rollout = parse(
+            r#"{"timestamp":"2026-07-25T22:15:16.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_pair","input":"const r = await Promise.all([\n  tools.shell_command({command: \"rg TODO\", workdir: \"C:\\\\Source\\\\DevezCLI\"}),\n  tools.shell_command({command: \"git status --short\", workdir: \"C:\\\\Source\\\\DevezCLI\"})\n]);\nr.forEach((x,i)=>{text(`---${i}---`); text(x)});\n"}}
+{"timestamp":"2026-07-25T22:15:20.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_pair","output":[{"type":"input_text","text":"Script completed\nWall time 4.1 seconds\nOutput:\n"},{"type":"input_text","text":"---0---Exit code: 0\nWall time: 0.7 seconds\nOutput:\nsrc/main.rs:12: TODO fix this\n---1---Exit code: 1\nWall time: 0.6 seconds\nOutput:\n?? untracked.txt\n"}]}}"#,
+        );
+
+        let events = exec_events(&rollout);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0], ("rg TODO", "src/main.rs:12: TODO fix this\n", Some(0), Some(4100)));
+        assert_eq!(
+            events[1],
+            ("git status --short", "?? untracked.txt\n", Some(1), Some(4100))
+        );
+    }
+
+    #[test]
+    fn a_labelled_multi_command_script_splits_by_its_own_labels() {
+        // Sessions also frame multi-command output with the script's own
+        // labels (`status`, `log`, …) rather than numeric indices — the
+        // framing rule is the same either way, so the split must not assume
+        // digits.
+        let rollout = parse(
+            r#"{"timestamp":"2026-07-10T20:34:37.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_labelled","input":"const v0 = await tools.shell_command({command:\"git status --short\"});\ntext('---status---'); text(v0);\nconst v1 = await tools.shell_command({command:\"git log -1\"});\ntext('---log---'); text(v1);"}}
+{"timestamp":"2026-07-10T20:34:39.000Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_labelled","output":[{"type":"input_text","text":"Script completed\nWall time 1.3 seconds\nOutput:\n"},{"type":"input_text","text":"---status---Exit code: 0\nWall time: 0.5 seconds\nOutput:\n## main\n---log---Exit code: 0\nWall time: 0.4 seconds\nOutput:\nabc123 latest commit\n"}]}}"#,
+        );
+
+        let events = exec_events(&rollout);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "git status --short");
+        assert!(events[0].1.contains("## main"));
+        assert_eq!(events[1].0, "git log -1");
+        assert!(events[1].1.contains("abc123 latest commit"));
+    }
+
+    // --- I3: a command whose own real output contains the literal `Output:` -
+
+    #[test]
+    fn a_body_containing_the_word_output_is_kept_in_full() {
+        // Real shape (session `019f4bce`): `rg`/`Select-String` results can
+        // legitimately contain the substring `Output:` as part of a matched
+        // line. `rfind` used to cut everything before the last such
+        // occurrence; the fix keeps the whole body by only skipping the
+        // wrapper's own first `Output:` header.
+        let rollout = parse(
+            r#"{"timestamp":"2026-07-25T15:08:36.373Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_one","input":"await tools.shell_command({\"command\":\"rg Output\"});"}}
+{"timestamp":"2026-07-25T15:08:38.010Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_one","output":[{"type":"input_text","text":"Script completed\nWall time 0.4 seconds\nOutput:\n"},{"type":"input_text","text":"Exit code: 0\nWall time: 0.4 seconds\nOutput:\nsrc/logger.rs:9:fn print(Output: &str) {\nsrc/logger.rs:10:    println!(\"Output: {}\", Output);\n"}]}}"#,
+        );
+
+        let (_, output, exit_code, _) = only_exec(&rollout);
+        assert_eq!(exit_code, Some(0));
+        assert_eq!(
+            output,
+            "src/logger.rs:9:fn print(Output: &str) {\nsrc/logger.rs:10:    println!(\"Output: {}\", Output);\n"
+        );
+    }
+
+    // --- I4: turn id attribution (parsing side only; state.rs uses it) -----
+
+    #[test]
+    fn exec_events_carry_the_turn_id_from_the_call_payload() {
+        let rollout = parse(
+            r#"{"timestamp":"2026-07-25T15:08:36.373Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_one","input":"await tools.shell_command({\"command\":\"rg TODO\"});","internal_chat_message_metadata_passthrough":{"turn_id":"turn-abc"}}}"#,
+        );
+
+        assert_eq!(rollout.events[0].turn_id.as_deref(), Some("turn-abc"));
+    }
+
+    #[test]
+    fn patch_applied_events_carry_their_own_turn_id() {
+        let rollout = parse(
+            r#"{"timestamp":"2026-07-25T15:09:40.539Z","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"exec-abc","turn_id":"turn-abc"}}"#,
+        );
+
+        assert_eq!(rollout.events[0].turn_id.as_deref(), Some("turn-abc"));
     }
 }

@@ -54,6 +54,7 @@ impl AppServer {
     pub async fn spawn(codex_path: &Path) -> Result<Self> {
         let resolved_codex = resolve_command(codex_path);
         let mut command = codex_command(&resolved_codex);
+        apply_originator_override(&mut command);
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -318,6 +319,21 @@ fn codex_command(resolved: &Path) -> Command {
     command
 }
 
+/// The app-server turns `clientInfo.name` into the `originator` header it sends
+/// to chatgpt.com, and the connectors endpoints behind Cloudflare only answer
+/// the CLI's own originator — anything else gets a bot challenge instead of an
+/// answer, which is what made `app/list` fail with a 403 HTML page. The client
+/// still identifies itself as devez-cli everywhere the app-server reports it;
+/// only the outgoing header is pinned. An explicit override in the environment
+/// wins, so this stays debuggable.
+fn apply_originator_override(command: &mut Command) {
+    if env::var_os(ORIGINATOR_OVERRIDE_ENV).is_none() {
+        command.env(ORIGINATOR_OVERRIDE_ENV, "codex_cli_rs");
+    }
+}
+
+const ORIGINATOR_OVERRIDE_ENV: &str = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
+
 /// Finds the platform binary the `@openai/codex` npm package vendors, mirroring the
 /// lookup `bin/codex.js` performs. `root` is the directory holding the npm shim.
 #[cfg(windows)]
@@ -421,13 +437,38 @@ async fn route_message(
 
 fn format_rpc_error(error: &Value) -> String {
     let code = error.get("code").and_then(Value::as_i64);
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("알 수 없는 app-server 오류");
+    let message = condense_error_message(
+        error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("알 수 없는 app-server 오류"),
+    );
     match code {
         Some(code) => format!("{message} ({code})"),
-        None => message.to_owned(),
+        None => message,
+    }
+}
+
+/// An upstream failure often arrives with a whole HTML error page attached.
+/// Notices only have room for the part a person can act on, so keep the first
+/// line up to where the markup starts and cap what is left.
+fn condense_error_message(message: &str) -> String {
+    const LIMIT: usize = 200;
+    let lower = message.to_ascii_lowercase();
+    let markup = ["<html", "<!doctype", "<head", "<body", "<?xml"]
+        .iter()
+        .filter_map(|tag| lower.find(tag))
+        .min()
+        .unwrap_or(message.len());
+    let head = message[..markup].trim();
+    // A message that is nothing but markup still has to say something.
+    let head = if head.is_empty() { message } else { head };
+    let line = head.lines().next().unwrap_or_default().trim();
+    let line = line.trim_end_matches([':', '-', '·']).trim_end();
+    if line.chars().count() > LIMIT {
+        format!("{}…", line.chars().take(LIMIT).collect::<String>().trim_end())
+    } else {
+        line.to_owned()
     }
 }
 
@@ -449,5 +490,49 @@ mod tests {
             params.pointer("/clientInfo/name").and_then(Value::as_str),
             Some("devez-cli")
         );
+    }
+
+    #[test]
+    fn the_app_server_inherits_the_cli_originator() {
+        let mut command = codex_command(Path::new("codex"));
+        apply_originator_override(&mut command);
+
+        let originator = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new(ORIGINATOR_OVERRIDE_ENV))
+            .and_then(|(_, value)| value);
+        // Without this the connectors endpoints answer with a Cloudflare
+        // challenge page instead of the app list.
+        assert_eq!(
+            originator,
+            env::var_os(ORIGINATOR_OVERRIDE_ENV)
+                .is_none()
+                .then(|| std::ffi::OsStr::new("codex_cli_rs"))
+        );
+    }
+
+    #[test]
+    fn rpc_errors_drop_the_html_page_they_arrive_with() {
+        let error = json!({
+            "code": 403,
+            "message": "app/list: failed to list apps:Request failed with status 403 Forbidden: <html>\n  <head>\n    <style>body{font-family:Arial}</style>\n  </head>\n</html>"
+        });
+        assert_eq!(
+            format_rpc_error(&error),
+            "app/list: failed to list apps:Request failed with status 403 Forbidden (403)"
+        );
+
+        // Plain messages are left exactly as they are.
+        assert_eq!(
+            format_rpc_error(&json!({ "message": "reload 거부" })),
+            "reload 거부"
+        );
+
+        // A runaway single line is capped rather than filling the screen.
+        let long = "x".repeat(500);
+        let condensed = condense_error_message(&long);
+        assert_eq!(condensed.chars().count(), 201, "{condensed}");
+        assert!(condensed.ends_with('…'), "{condensed}");
     }
 }

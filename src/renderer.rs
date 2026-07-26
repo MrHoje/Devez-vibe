@@ -1,21 +1,84 @@
-use std::io::{Stdout, Write, stdout};
+use std::{
+    collections::HashSet,
+    env, fs,
+    io::{Stdout, Write, stdout},
+    ops::Range,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::{
     cursor::{Hide, MoveDown, MoveTo, MoveToColumn, MoveUp, Show, position as cursor_position},
-    event::{DisableBracketedPaste, EnableBracketedPaste},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute, queue,
     style::{
         Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
     },
-    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size as terminal_size},
+    terminal::{
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode, size as terminal_size,
+    },
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     editor::Editor,
+    selection::{
+        CellPosition, CellRange, CopyLine, Selection, SelectionFinish, extract_text,
+        selected_char_count, selection_chunks,
+    },
     theme::{self, Rgb, ThemeKind},
 };
+
+/// Which of the two ways of putting the transcript on screen is in use.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RenderMode {
+    /// The alternate screen, with the transcript scrolled by us. Every frame is
+    /// a whole screen whose last rows are the composer and the status line, so
+    /// no amount of scrolling can push them out of view.
+    Fullscreen,
+    /// The main screen: the transcript is handed to the terminal's own
+    /// scrollback and the composer trails whatever was printed last. Scrolling
+    /// is the terminal's, so the composer scrolls away with everything else —
+    /// the cost of keeping the transcript selectable and copyable as real text.
+    Inline,
+}
+
+impl RenderMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fullscreen" | "full" | "alt" | "pinned" => Some(Self::Fullscreen),
+            "inline" | "classic" | "default" | "main" => Some(Self::Inline),
+            _ => None,
+        }
+    }
+}
+
+/// Resolves the renderer, most explicit source first: the command line, then the
+/// environment, then the saved choice, then pinned-composer as the default.
+pub fn load_render_mode(cli_override: Option<&str>) -> Result<RenderMode> {
+    if let Some(value) = cli_override {
+        return RenderMode::parse(value)
+            .with_context(|| format!("지원하지 않는 렌더러입니다: {value}"));
+    }
+    if let Some(value) = env::var("DEVEZ_RENDERER").ok().filter(|v| !v.is_empty()) {
+        return RenderMode::parse(&value)
+            .with_context(|| format!("DEVEZ_RENDERER 값을 알 수 없습니다: {value}"));
+    }
+    Ok(fs::read_to_string(render_mode_file())
+        .ok()
+        .and_then(|value| RenderMode::parse(&value))
+        .unwrap_or(RenderMode::Fullscreen))
+}
+
+fn render_mode_file() -> PathBuf {
+    env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("DevezCLI")
+        .join("renderer.txt")
+}
 
 #[derive(Clone, Copy)]
 pub enum BlockKind {
@@ -24,7 +87,12 @@ pub enum BlockKind {
     User,
     Assistant,
     Reasoning,
+    /// A `turn/plan/updated` snapshot. Its body is the encoded plan: `└ ` rows
+    /// are the explanation, `✔ `/`▸ `/`□ ` rows are done/in-progress/pending
+    /// steps. See [`plan_lines`].
+    Plan,
     Tool,
+    FileChange,
     Diff,
     ModelChange,
     Warning,
@@ -34,18 +102,30 @@ pub enum BlockKind {
 
 #[derive(Clone)]
 pub struct Block {
+    id: u64,
     pub kind: BlockKind,
     pub title: String,
     pub body: String,
 }
 
+static NEXT_BLOCK_ID: AtomicU64 = AtomicU64::new(1);
+
 impl Block {
     pub fn new(kind: BlockKind, title: impl Into<String>, body: impl Into<String>) -> Self {
         Self {
+            id: NEXT_BLOCK_ID.fetch_add(1, Ordering::Relaxed),
             kind,
             title: title.into(),
             body: body.into(),
         }
+    }
+
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn adopt_id(&mut self, source: &Self) {
+        self.id = source.id;
     }
 
     /// Credits come last so the variable-length list survives the round trip
@@ -63,6 +143,9 @@ impl Block {
 pub struct OverlayView<'a> {
     pub title: String,
     pub lines: Vec<OverlayLine>,
+    /// Painted after `lines`, centred and coloured by the renderer. Structured
+    /// rather than pre-formatted because each tier carries its own tone.
+    pub slider: Option<EffortSlider>,
     pub hint: String,
     pub style: OverlayStyle,
     pub input: Option<&'a Editor>,
@@ -70,12 +153,20 @@ pub struct OverlayView<'a> {
     pub input_placeholder: &'static str,
 }
 
+/// The `Faster ─── Smarter` track a reasoning effort is picked on.
+pub struct EffortSlider {
+    pub efforts: Vec<String>,
+    pub selected: usize,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum OverlayStyle {
     Panel,
+    CompactPanel,
     Picker,
 }
 
+#[derive(Clone)]
 pub struct OverlayLine {
     pub text: String,
     pub selected: bool,
@@ -94,6 +185,9 @@ pub struct SuggestionView {
     pub command: String,
     pub description: String,
     pub selected: bool,
+    pub category: Option<String>,
+    pub panel_title: &'static str,
+    pub hint: Option<String>,
 }
 
 pub struct StatusLineView {
@@ -130,24 +224,54 @@ pub struct View<'a> {
     pub welcome: Option<WelcomeView>,
     pub suggestions: Vec<SuggestionView>,
     pub activity: Option<String>,
+    /// Where the `Working` shimmer is in its sweep, `0.0..1.0`.
+    pub activity_phase: f32,
     pub footer: String,
     pub status_line: Option<StatusLineView>,
     pub composer_notice: Option<String>,
     pub composer_mode: Option<ComposerMode>,
 }
 
-pub struct TerminalSession;
+pub struct TerminalSession {
+    mode: RenderMode,
+}
+
+fn enter_fullscreen(out: &mut impl Write) -> std::io::Result<()> {
+    // Mode 1007 turns wheel movement into Up/Down key sequences on the alternate
+    // screen. Save the user's setting, then disable only that translation.
+    // Mouse capture is fullscreen-only: it takes drag selection away from the
+    // terminal, which is the point here but would be a loss inline, where the
+    // transcript is ordinary scrollback the terminal knows how to select.
+    execute!(out, EnterAlternateScreen, Print("\x1b[?1007s\x1b[?1007l"))
+}
+
+fn leave_fullscreen(out: &mut impl Write) -> std::io::Result<()> {
+    execute!(out, Print("\x1b[?1007r"), LeaveAlternateScreen)
+}
 
 impl TerminalSession {
-    pub fn enter() -> Result<Self> {
+    pub fn enter(mode: RenderMode) -> Result<Self> {
         enable_raw_mode()?;
         execute!(stdout(), EnableBracketedPaste, Show)?;
-        Ok(Self)
+        if mode == RenderMode::Fullscreen {
+            enter_fullscreen(&mut stdout())?;
+            // Crossterm uses WinAPI console input modes on Windows and ANSI
+            // mouse-reporting sequences elsewhere. Raw escape sequences alone
+            // do not enable Windows console mouse events.
+            execute!(stdout(), EnableMouseCapture)?;
+        }
+        Ok(Self { mode })
     }
 }
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
+        if self.mode == RenderMode::Fullscreen {
+            // Undone before the colour reset below, so the OSC restores land on
+            // the main screen where they are what the user keeps looking at.
+            let _ = execute!(stdout(), DisableMouseCapture);
+            let _ = leave_fullscreen(&mut stdout());
+        }
         let _ = execute!(
             stdout(),
             ResetColor,
@@ -162,32 +286,265 @@ impl Drop for TerminalSession {
 
 pub struct Renderer {
     out: Stdout,
+    mode: RenderMode,
     previous_lines: Vec<PaintLine>,
     cursor_line: usize,
     last_width: u16,
     last_height: u16,
     theme: ThemeKind,
     history: Vec<Block>,
+    /// Rows the transcript is held back from its newest end. Zero follows the
+    /// live output. Fullscreen only: inline scrolling belongs to the terminal.
+    scroll_back: usize,
+    /// The transcript already wrapped for `wrapped_width`. Fullscreen repaints
+    /// the whole screen every keystroke, and re-wrapping the transcript each
+    /// time would make typing cost O(transcript).
+    wrapped: Vec<PaintLine>,
+    wrapped_width: u16,
+    expanded_tools: HashSet<u64>,
+    hovered_tool: Option<u64>,
+    painted_hovered_tool: Option<u64>,
+    /// The clickable piece of chrome under the pointer, and the one the screen
+    /// was last painted with, so only the rows whose highlight moved repaint.
+    hovered_pick: Option<Pick>,
+    painted_hovered_pick: Option<Pick>,
+    selection: Selection,
+    painted_selection: Option<CellRange>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SelectionResult {
+    Copy(String),
+    /// The cell a click landed on, column first: a tool heading answers to the
+    /// row alone, but the clickable chrome is only ever part of a row.
+    Click(u16, u16),
+    None,
 }
 
 impl Renderer {
-    pub fn new(selected_theme: ThemeKind) -> Self {
+    pub fn new(selected_theme: ThemeKind, mode: RenderMode) -> Self {
         theme::set_current(selected_theme);
         Self {
             out: stdout(),
+            mode,
             previous_lines: Vec::new(),
             cursor_line: 0,
             last_width: 0,
             last_height: 0,
             theme: selected_theme,
             history: Vec::new(),
+            scroll_back: 0,
+            wrapped: Vec::new(),
+            wrapped_width: 0,
+            expanded_tools: HashSet::new(),
+            hovered_tool: None,
+            painted_hovered_tool: None,
+            hovered_pick: None,
+            painted_hovered_pick: None,
+            selection: Selection::default(),
+            painted_selection: None,
         }
+    }
+
+    pub const fn mode(&self) -> RenderMode {
+        self.mode
+    }
+
+    /// Moves the transcript view by `delta` rows, positive being back into
+    /// history. Reports whether the view actually moved, so a wheel spun at
+    /// either end costs no repaint. The clamp against the bottom happens here;
+    /// the clamp against the viewport height waits for `render`, which is the
+    /// first place the live frame's height is known.
+    pub fn scroll(&mut self, delta: isize) -> bool {
+        if self.mode != RenderMode::Fullscreen {
+            return false;
+        }
+        let target = self
+            .scroll_back
+            .saturating_add_signed(delta)
+            .min(self.wrapped.len());
+        let moved = target != self.scroll_back;
+        self.scroll_back = target;
+        if moved {
+            self.clear_selection();
+        }
+        moved
+    }
+
+    /// Rows a page key jumps. A row of overlap keeps a line of context in view.
+    pub fn page_rows(&self) -> isize {
+        // Floored at 3 above, so the overlap subtraction always leaves at least 1.
+        self.last_height.max(3) as isize - 2
     }
 
     pub fn clear_screen(&mut self) -> Result<()> {
         self.history.clear();
+        self.wrapped.clear();
+        self.wrapped_width = 0;
+        self.scroll_back = 0;
+        self.expanded_tools.clear();
+        self.hovered_tool = None;
+        self.painted_hovered_tool = None;
+        self.hovered_pick = None;
+        self.painted_hovered_pick = None;
+        self.selection.clear();
+        self.painted_selection = None;
         self.apply_terminal_theme()?;
         self.reset_screen()
+    }
+
+    pub fn toggle_tool_at(&mut self, row: u16) -> bool {
+        if self.mode != RenderMode::Fullscreen {
+            return false;
+        }
+        let Some(id) = self
+            .previous_lines
+            .get(row as usize)
+            .and_then(|line| line.tool_heading)
+        else {
+            return false;
+        };
+
+        if !self.expanded_tools.remove(&id) {
+            self.expanded_tools.insert(id);
+        }
+        let old_len = self.wrapped.len();
+        self.rewrap(self.last_width.max(20));
+        let delta = self.wrapped.len() as isize - old_len as isize;
+        if self.scroll_back > 0 {
+            self.scroll_back = self.scroll_back.saturating_add_signed(delta);
+        }
+        true
+    }
+
+    /// What the cell under a click stands for, if anything: the mode and fast
+    /// badges on the composer rule, or the model and effort readings on the
+    /// status line. Fullscreen only, which is the only mode that captures mouse
+    /// events at all.
+    pub fn pick_at(&self, column: u16, row: u16) -> Option<Pick> {
+        if self.mode != RenderMode::Fullscreen {
+            return None;
+        }
+        self.previous_lines
+            .get(row as usize)?
+            .pick
+            .as_ref()?
+            .at(usize::from(column))
+    }
+
+    /// Tracks what the pointer is over: a tool heading, or a clickable piece of
+    /// chrome. Everything that answers to a click lights up under the pointer, so
+    /// what is clickable is discoverable without a legend.
+    pub fn hover_at(&mut self, column: u16, row: u16) -> bool {
+        if self.mode != RenderMode::Fullscreen {
+            return false;
+        }
+        let hovered = self.previous_lines.get(row as usize).and_then(|line| {
+            let start = UnicodeWidthStr::width(line.prefix.as_str());
+            let end = start + UnicodeWidthStr::width(line.text.as_str());
+            (usize::from(column) >= start && usize::from(column) < end)
+                .then_some(line.tool_heading)
+                .flatten()
+        });
+        let pick = self.pick_at(column, row);
+        let changed = hovered != self.hovered_tool || pick != self.hovered_pick;
+        self.hovered_tool = hovered;
+        self.hovered_pick = pick;
+        changed
+    }
+
+    /// The columns a row lights up when the pointer is on it: the heading's own
+    /// text, or the span the hovered piece of chrome was painted across.
+    fn hover_columns(
+        line: &PaintLine,
+        hovered_tool: Option<u64>,
+        hovered_pick: Option<&Pick>,
+    ) -> Option<Range<usize>> {
+        if line.tool_heading.is_some() && line.tool_heading == hovered_tool {
+            let start = UnicodeWidthStr::width(line.prefix.as_str());
+            return Some(start..start + UnicodeWidthStr::width(line.text.as_str()));
+        }
+        let columns = line.pick.as_ref()?.columns_of(hovered_pick?)?;
+        // A whole-row region runs to the end of the painted row, not past it.
+        Some(columns.start..columns.end.min(painted_line_width(line)))
+    }
+
+    pub fn begin_selection(&mut self, column: u16, row: u16) -> bool {
+        let Some(point) = self.selection_point(column, row) else {
+            return false;
+        };
+        self.selection.begin(point);
+        true
+    }
+
+    pub fn update_selection(&mut self, column: u16, row: u16) -> bool {
+        let Some(point) = self.selection_point(column, row) else {
+            return false;
+        };
+        self.selection.update(point)
+    }
+
+    pub fn finish_selection(&mut self, column: u16, row: u16) -> SelectionResult {
+        let Some(point) = self.selection_point(column, row) else {
+            return SelectionResult::None;
+        };
+        match self.selection.finish(point) {
+            SelectionFinish::Copy(range) => {
+                let text = extract_text(&self.copy_lines(), range);
+                if text.trim().is_empty() {
+                    SelectionResult::None
+                } else {
+                    SelectionResult::Copy(text)
+                }
+            }
+            SelectionFinish::Click(cell) => SelectionResult::Click(cell.column, cell.row),
+            SelectionFinish::None => SelectionResult::None,
+        }
+    }
+
+    pub fn clear_selection(&mut self) -> bool {
+        self.selection.clear()
+    }
+
+    fn reconcile_selection(&mut self, lines: &[PaintLine]) {
+        let Some(range) = self.selection.range() else {
+            return;
+        };
+        let changed = (usize::from(range.start.row)..=usize::from(range.end.row))
+            .any(|row| self.previous_lines.get(row) != lines.get(row));
+        if changed {
+            self.selection.clear();
+        }
+    }
+
+    fn selection_point(&self, column: u16, row: u16) -> Option<CellPosition> {
+        if self.mode != RenderMode::Fullscreen || self.previous_lines.is_empty() {
+            return None;
+        }
+        let row = row.min(self.previous_lines.len().saturating_sub(1) as u16);
+        let width = painted_line_width(&self.previous_lines[usize::from(row)]);
+        let column = if width == 0 {
+            0
+        } else {
+            column.min(width.saturating_sub(1).min(u16::MAX as usize) as u16)
+        };
+        Some(CellPosition { column, row })
+    }
+
+    fn copy_lines(&self) -> Vec<CopyLine> {
+        self.previous_lines
+            .iter()
+            .map(|line| CopyLine {
+                text: painted_line_text(line),
+                join_next: copy_joins_next(line),
+                marker_width: if is_copy_marker(&line.prefix) {
+                    UnicodeWidthStr::width(line.prefix.as_str())
+                } else {
+                    0
+                },
+                prefix_width: UnicodeWidthStr::width(line.prefix.as_str()),
+            })
+            .collect()
     }
 
     pub fn set_theme(&mut self, selected_theme: ThemeKind) -> Result<()> {
@@ -207,6 +564,12 @@ impl Renderer {
     /// screen is rebuilt at the new width instead. `render` repaints the live
     /// frame straight after, since `reset_screen` drops the frame bookkeeping.
     pub fn relayout(&mut self) -> Result<()> {
+        if self.mode == RenderMode::Fullscreen {
+            // Nothing to reprint: the transcript is ours, and the next `render`
+            // rebuilds it at the new width. Dropping the cache is the whole job.
+            self.wrapped_width = 0;
+            return self.reset_screen();
+        }
         self.reset_screen()?;
         let width = terminal_size().unwrap_or((100, 30)).0.max(20);
         // Moved out so the blocks can be printed without cloning the transcript;
@@ -214,7 +577,7 @@ impl Renderer {
         let history = std::mem::take(&mut self.history);
         let mut outcome = Ok(());
         for block in &history {
-            let lines = block_lines(block, width);
+            let lines = block_group_lines_with_expansion(block, width, false);
             if let Err(error) = self.print_permanent(block, &lines) {
                 outcome = Err(error);
                 break;
@@ -226,6 +589,10 @@ impl Renderer {
 
     fn reset_screen(&mut self) -> Result<()> {
         self.previous_lines.clear();
+        self.hovered_tool = None;
+        self.painted_hovered_tool = None;
+        self.selection.clear();
+        self.painted_selection = None;
         self.cursor_line = 0;
         self.last_width = 0;
         self.last_height = 0;
@@ -264,18 +631,31 @@ impl Renderer {
             composer_mode: view.composer_mode,
         };
         let mut frame = if let Some(overlay) = view.overlay {
-            overlay_frame(&view.live_blocks, overlay, status, width.max(20))
+            overlay_frame_with_expansion(
+                &view.live_blocks,
+                overlay,
+                view.welcome,
+                status,
+                width.max(20),
+                &self.expanded_tools,
+            )
         } else {
-            normal_frame(
+            normal_frame_with_expansion(
                 &view.live_blocks,
                 view.editor,
                 view.welcome,
                 &view.suggestions,
                 view.activity.as_deref(),
+                view.activity_phase,
                 status,
                 width.max(20),
+                &self.expanded_tools,
             )
         };
+
+        if self.mode == RenderMode::Fullscreen {
+            return self.render_fullscreen(committed, frame, width.max(20), height.max(3));
+        }
 
         let max_live = height.max(3) as usize;
         let natural_rows = frame.lines.len().min(max_live);
@@ -286,7 +666,7 @@ impl Renderer {
         if needs_full_repaint {
             self.erase_live()?;
             for block in committed {
-                let lines = block_lines(block, width.max(20));
+                let lines = block_group_lines_with_expansion(block, width.max(20), false);
                 self.print_permanent(block, &lines)?;
             }
             self.history.extend(committed.iter().cloned());
@@ -312,7 +692,153 @@ impl Renderer {
         Ok(())
     }
 
+    /// One screen, bottom-anchored: the live frame takes the last rows and the
+    /// transcript fills what is left above it. The composer is placed by row
+    /// index rather than by trailing the last thing printed, which is the whole
+    /// reason scrolling cannot carry it off screen.
+    fn render_fullscreen(
+        &mut self,
+        committed: &[Block],
+        mut frame: Frame,
+        width: u16,
+        height: u16,
+    ) -> Result<()> {
+        self.history.extend(committed.iter().cloned());
+        let grew_by = if self.wrapped_width == width {
+            let before = self.wrapped.len();
+            for block in committed {
+                self.wrapped.extend(block_group_lines_with_expansion(
+                    block,
+                    width,
+                    self.expanded_tools.contains(&block.id()),
+                ));
+            }
+            self.wrapped.len() - before
+        } else {
+            self.rewrap(width);
+            0
+        };
+        // Someone who scrolled up is reading; holding their distance from the
+        // bottom would drag the text out from under them as output lands. The
+        // distance grows with the new rows instead, so the page stays still.
+        if self.scroll_back > 0 {
+            self.scroll_back += grew_by;
+        }
+
+        let rows = height as usize;
+        let (view_rows, live_rows) = split_rows(rows, frame.lines.len(), self.wrapped.len());
+        // Padding the live frame is what puts the composer on the bottom row
+        // *without* dragging the welcome card and the live blocks down with it:
+        // `fit_frame` inserts the blanks at the dock, above the composer.
+        fit_frame(&mut frame, live_rows);
+        let max_back = self.wrapped.len() - view_rows;
+        self.scroll_back = self.scroll_back.min(max_back);
+        let (screen, cursor_line) = compose_screen(
+            &self.wrapped,
+            frame.lines,
+            view_rows,
+            max_back - self.scroll_back,
+            frame.cursor_line,
+        );
+
+        self.reconcile_selection(&screen);
+        self.paint_screen(&screen, cursor_line, frame.cursor_col, frame.show_cursor)?;
+        self.previous_lines = screen;
+        self.cursor_line = cursor_line;
+        self.last_width = width;
+        self.last_height = height;
+        self.out.flush()?;
+        Ok(())
+    }
+
+    fn rewrap(&mut self, width: u16) {
+        self.wrapped = self
+            .history
+            .iter()
+            .flat_map(|block| {
+                block_group_lines_with_expansion(
+                    block,
+                    width,
+                    self.expanded_tools.contains(&block.id()),
+                )
+            })
+            .collect();
+        self.wrapped_width = width;
+    }
+
+    /// Repaints only the rows whose content changed. On the alternate screen
+    /// nothing scrolls under us, so a row index is a stable address and the diff
+    /// is a plain index-by-index comparison — this is what keeps typing from
+    /// flickering the whole screen.
+    fn paint_screen(
+        &mut self,
+        lines: &[PaintLine],
+        cursor_line: usize,
+        cursor_col: usize,
+        show_cursor: bool,
+    ) -> Result<()> {
+        queue!(self.out, Hide)?;
+        // A height change shifts every row's meaning, so the diff is void.
+        let repaint_all = self.previous_lines.len() != lines.len();
+        let selection = self
+            .selection
+            .range()
+            .filter(|range| selection_is_worth_painting(*range, lines));
+        for (row, line) in lines.iter().enumerate() {
+            let hovered =
+                Self::hover_columns(line, self.hovered_tool, self.hovered_pick.as_ref());
+            let previously_hovered = self.previous_lines.get(row).and_then(|previous| {
+                Self::hover_columns(
+                    previous,
+                    self.painted_hovered_tool,
+                    self.painted_hovered_pick.as_ref(),
+                )
+            });
+            let selected_columns =
+                selection.and_then(|range| range.columns_for_row(row, painted_line_width(line)));
+            let previously_selected_columns = self.painted_selection.and_then(|range| {
+                self.previous_lines
+                    .get(row)
+                    .and_then(|previous| range.columns_for_row(row, painted_line_width(previous)))
+            });
+            if !repaint_all
+                && self.previous_lines.get(row) == Some(line)
+                && previously_selected_columns == selected_columns
+                && previously_hovered == hovered
+            {
+                continue;
+            }
+            queue!(
+                self.out,
+                MoveTo(0, row.min(u16::MAX as usize) as u16),
+                Clear(ClearType::UntilNewLine)
+            )?;
+            print_line_with_selection(&mut self.out, line, selected_columns, hovered)?;
+        }
+        self.painted_selection = selection;
+        self.painted_hovered_tool = self.hovered_tool;
+        self.painted_hovered_pick = self.hovered_pick.clone();
+        queue!(
+            self.out,
+            MoveTo(
+                cursor_col.min(u16::MAX as usize) as u16,
+                cursor_line.min(u16::MAX as usize) as u16
+            )
+        )?;
+        if show_cursor {
+            queue!(self.out, Show)?;
+        }
+        Ok(())
+    }
+
     pub fn finish(&mut self) -> Result<()> {
+        if self.mode == RenderMode::Fullscreen {
+            // Leaving the alternate screen discards the frame wholesale, so
+            // there is nothing to erase and no room to leave behind.
+            queue!(self.out, Show, ResetColor)?;
+            self.out.flush()?;
+            return Ok(());
+        }
         self.erase_live()?;
         queue!(self.out, Show, ResetColor, Print("\r\n"))?;
         self.out.flush()?;
@@ -320,7 +846,7 @@ impl Renderer {
     }
 
     fn erase_live(&mut self) -> Result<()> {
-        if self.previous_lines.is_empty() {
+        if self.previous_lines.is_empty() || self.mode == RenderMode::Fullscreen {
             return Ok(());
         }
 
@@ -434,6 +960,40 @@ impl Renderer {
     }
 }
 
+/// Splits the screen between the transcript and the live frame, as
+/// `(transcript rows, live rows)`. The live frame gets everything the transcript
+/// cannot fill, and is padded to that height rather than floated, so the composer
+/// reaches the bottom row while the welcome card stays put at the top.
+fn split_rows(rows: usize, live_natural: usize, transcript_len: usize) -> (usize, usize) {
+    let rows = rows.max(1);
+    // A live frame taller than the screen leaves the transcript nothing, and
+    // `fit_frame` trims the frame's oldest rows to make it fit.
+    let view_rows = transcript_len.min(rows.saturating_sub(live_natural));
+    (view_rows, rows - view_rows)
+}
+
+/// Lays out one fullscreen frame: `view_rows` of transcript from `start`, then the
+/// live frame. Reports the cursor's row in the result. Pure, so the anchoring can
+/// be asserted without a terminal to paint into.
+fn compose_screen(
+    wrapped: &[PaintLine],
+    live: Vec<PaintLine>,
+    view_rows: usize,
+    start: usize,
+    live_cursor_line: usize,
+) -> (Vec<PaintLine>, usize) {
+    let start = start.min(wrapped.len());
+    let end = (start + view_rows).min(wrapped.len());
+    let mut screen = Vec::with_capacity(view_rows + live.len());
+    screen.extend(wrapped[start..end].iter().cloned());
+    // `split_rows` never asks for more transcript than there is, so this only
+    // guards the invariant rather than laying anything out.
+    screen.resize(view_rows, PaintLine::blank());
+    let cursor_line = screen.len() + live_cursor_line;
+    screen.extend(live);
+    (screen, cursor_line)
+}
+
 fn move_to_row(out: &mut Stdout, current_row: &mut usize, target_row: usize) -> Result<()> {
     match target_row.cmp(current_row) {
         std::cmp::Ordering::Greater => {
@@ -476,6 +1036,8 @@ enum Tone {
     Muted,
     /// Muted *and* italic: reserved for reasoning summaries.
     Thinking,
+    /// Muted *and* struck through: a plan step that is already done.
+    PlanDone,
     Accent,
     User,
     Success,
@@ -487,6 +1049,7 @@ enum Tone {
     EffortHigh,
     EffortXHigh,
     EffortMax,
+    EffortUltra,
     Context,
     StatusText,
     StatusSeparator,
@@ -511,8 +1074,74 @@ enum Tone {
     InlineCode,
     DiffAdded,
     DiffRemoved,
+    /// The words a `+`/`-` row actually changed against its counterpart. Same
+    /// text colour as the row, a stronger tint underneath.
+    DiffAddedWord,
+    DiffRemovedWord,
     DiffHeader,
+    /// One character of the shimmering `Working` label. The payload is how far
+    /// the sweep's bright band has reached that character, `0` for untouched.
+    Shimmer(u8),
     CopyJoin,
+}
+
+/// What a left click on a painted row means. The overlay row index is the
+/// position in `OverlayView::lines`, not an absolute item index: only the picker
+/// that built those rows knows how they map back. The rest are the session's own
+/// chrome — the badges on the composer rule and the readings on the status line,
+/// each standing for the command or key that changes the same setting.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Pick {
+    Row(usize),
+    Effort(usize),
+    /// The permission-mode badge: cycles the mode, exactly as Shift+Tab does.
+    PermissionMode,
+    /// The `Fast On`/`Fast Off` badge: toggles the fast service tier.
+    FastMode,
+    /// The status line's model name: opens `/model`.
+    Model,
+    /// The status line's `eff:` reading: opens `/effort`.
+    EffortSetting,
+}
+
+/// Columns a clickable span reaches past its own text, either side. A word is a
+/// small target to hit with a pointer, and the highlight reads as a button rather
+/// than as underlined text with the breathing room. Every separator this code
+/// paints between two clickable spans is wider than twice this, so the regions
+/// still cannot run into one another.
+const PICK_BLEED: usize = 1;
+
+/// The clickable column spans of one painted row.
+#[derive(Clone, PartialEq, Eq)]
+struct PickRegions(Vec<(usize, usize, Pick)>);
+
+impl PickRegions {
+    fn span(start: usize, end: usize, pick: Pick) -> Self {
+        Self(vec![(start, end, pick)])
+    }
+
+    fn at(&self, column: usize) -> Option<Pick> {
+        self.0
+            .iter()
+            .find(|(start, end, _)| column >= *start && column < *end)
+            .map(|(_, _, pick)| pick.clone())
+    }
+
+    /// Where a pick was painted on this row, if it was.
+    fn columns_of(&self, pick: &Pick) -> Option<Range<usize>> {
+        self.0
+            .iter()
+            .find(|(_, _, candidate)| candidate == pick)
+            .map(|(start, end, _)| *start..*end)
+    }
+
+    fn shifted(mut self, columns: usize) -> Self {
+        for (start, end, _) in &mut self.0 {
+            *start = start.saturating_add(columns);
+            *end = end.saturating_add(columns);
+        }
+        self
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -522,6 +1151,8 @@ struct PaintLine {
     text: String,
     tone: Tone,
     bold: bool,
+    tool_heading: Option<u64>,
+    pick: Option<PickRegions>,
     tail: Vec<PaintSpan>,
 }
 
@@ -540,6 +1171,8 @@ impl PaintLine {
             text: text.into(),
             tone: Tone::Plain,
             bold: false,
+            tool_heading: None,
+            pick: None,
             tail: Vec::new(),
         }
     }
@@ -547,8 +1180,167 @@ impl PaintLine {
     fn blank() -> Self {
         Self::plain("")
     }
+
+    /// Makes single spans of an already-built row clickable. `picks` addresses
+    /// spans in paint order — `0` is `text`, `1` onward is `tail` — so a caller
+    /// marks the badge it just placed without having to know what the row's
+    /// prefix or the spans ahead of it cost in columns.
+    fn with_picks(mut self, picks: &[(usize, Pick)]) -> Self {
+        let mut column = UnicodeWidthStr::width(self.prefix.as_str());
+        let mut regions = Vec::new();
+        for (index, text) in std::iter::once(self.text.as_str())
+            .chain(self.tail.iter().map(|span| span.text.as_str()))
+            .enumerate()
+        {
+            let width = UnicodeWidthStr::width(text);
+            if width > 0 {
+                if let Some((_, pick)) = picks.iter().find(|(at, _)| *at == index) {
+                    regions.push((
+                        column.saturating_sub(PICK_BLEED),
+                        column + width + PICK_BLEED,
+                        pick.clone(),
+                    ));
+                }
+            }
+            column += width;
+        }
+        if !regions.is_empty() {
+            self.pick = Some(PickRegions(regions));
+        }
+        self
+    }
 }
 
+/// How many characters the bright band of the shimmer covers at once. Wide
+/// enough that the sweep reads as a gliding highlight rather than a cursor
+/// running along the word, and narrow enough that a word as short as `Working`
+/// still has dim characters ahead of the band — otherwise the whole label just
+/// pulses in place.
+const SHIMMER_BAND: f32 = 3.0;
+
+/// One span per character, each lit by how close it is to the band's centre, so
+/// the label carries a soft gradient instead of a hard block. `phase` runs
+/// `0.0..1.0` across a single sweep: the band enters off the left edge and
+/// leaves past the right one, which is why the travel spans the label plus a
+/// band's width on either side.
+fn shimmer_spans(label: &str, phase: f32) -> Vec<PaintSpan> {
+    let chars: Vec<char> = label.chars().collect();
+    let travel = chars.len() as f32 + SHIMMER_BAND * 2.0;
+    let centre = phase.clamp(0.0, 1.0) * travel - SHIMMER_BAND;
+    chars
+        .into_iter()
+        .enumerate()
+        .map(|(index, ch)| {
+            let distance = (index as f32 - centre).abs() / SHIMMER_BAND;
+            // A raised cosine: full brightness under the centre, easing to
+            // nothing at the band's edge with no visible seam either side.
+            let level = if distance >= 1.0 {
+                0.0
+            } else {
+                0.5 * (1.0 + (distance * std::f32::consts::PI).cos())
+            };
+            PaintSpan {
+                text: ch.to_string(),
+                tone: Tone::Shimmer((level * 255.0).round() as u8),
+                bold: false,
+            }
+        })
+        .collect()
+}
+
+/// `✶ Working (12s • esc to interrupt)`: the glyph and the bracketed tail keep
+/// the accent they always had, and only the label ahead of the bracket shimmers,
+/// the same split Codex animates. A row too narrow to hold the line falls back to
+/// plain wrapping, because a shimmer broken across two rows reads as flicker.
+fn activity_lines(activity: &str, phase: f32, width: u16) -> Vec<PaintLine> {
+    if UnicodeWidthStr::width(activity) > width as usize {
+        return wrapped_line("", Tone::Accent, activity, Tone::Accent, false, width);
+    }
+    let (glyph, rest) = activity.split_once(' ').unwrap_or((activity, ""));
+    let (label, trailer) = match rest.find('(') {
+        // The space before the bracket belongs to the tail: a shimmer that sweeps
+        // through it would stall for a beat on nothing.
+        Some(index) => {
+            let label = rest[..index].trim_end();
+            (label, &rest[label.len()..])
+        }
+        None => (rest, ""),
+    };
+    let mut tail = if glyph == "✓" {
+        vec![PaintSpan {
+            text: label.to_owned(),
+            tone: Tone::Accent,
+            bold: false,
+        }]
+    } else {
+        shimmer_spans(label, phase)
+    };
+    if !trailer.is_empty() {
+        tail.push(PaintSpan {
+            text: trailer.to_owned(),
+            tone: Tone::Accent,
+            bold: false,
+        });
+    }
+    vec![PaintLine {
+        prefix: String::new(),
+        prefix_tone: Tone::Accent,
+        text: if rest.is_empty() {
+            glyph.to_owned()
+        } else {
+            format!("{glyph} ")
+        },
+        tone: Tone::Accent,
+        bold: false,
+        tool_heading: None,
+        pick: None,
+        tail,
+    }]
+}
+
+fn painted_line_text(line: &PaintLine) -> String {
+    std::iter::once(line.prefix.as_str())
+        .chain(std::iter::once(line.text.as_str()))
+        .chain(
+            line.tail
+                .iter()
+                .filter(|span| span.tone != Tone::CopyJoin)
+                .map(|span| span.text.as_str()),
+        )
+        .collect()
+}
+
+fn painted_line_width(line: &PaintLine) -> usize {
+    UnicodeWidthStr::width(painted_line_text(line).as_str())
+}
+
+/// A drag paints only once it covers two characters. A click that wobbles by a
+/// hair — or that lands inside a wide glyph and drifts to its other cell — is a
+/// click, and flashing a highlight under a single character reads as noise
+/// rather than feedback. Copying is untouched: `finish_selection` still hands
+/// back whatever the drag covered.
+fn selection_is_worth_painting(range: CellRange, lines: &[PaintLine]) -> bool {
+    const MINIMUM: usize = 2;
+    let mut count = 0;
+
+    for row in usize::from(range.start.row)..=usize::from(range.end.row) {
+        let Some(line) = lines.get(row) else {
+            break;
+        };
+        let text = painted_line_text(line);
+        let Some(columns) = range.columns_for_row(row, UnicodeWidthStr::width(text.as_str())) else {
+            continue;
+        };
+        count += selected_char_count(&text, &columns, MINIMUM - count);
+        if count >= MINIMUM {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(test)]
 fn normal_frame(
     live: &[Block],
     editor: &Editor,
@@ -558,6 +1350,31 @@ fn normal_frame(
     status: StatusArea,
     width: u16,
 ) -> Frame {
+    normal_frame_with_expansion(
+        live,
+        editor,
+        welcome,
+        suggestions,
+        activity,
+        0.5,
+        status,
+        width,
+        &HashSet::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn normal_frame_with_expansion(
+    live: &[Block],
+    editor: &Editor,
+    welcome: Option<WelcomeView>,
+    suggestions: &[SuggestionView],
+    activity: Option<&str>,
+    activity_phase: f32,
+    status: StatusArea,
+    width: u16,
+    expanded_tools: &HashSet<u64>,
+) -> Frame {
     let mut lines = Vec::new();
     if let Some(welcome) = welcome {
         lines.extend(welcome_lines(welcome, width));
@@ -565,47 +1382,51 @@ fn normal_frame(
     }
 
     for block in live {
-        lines.extend(block_lines(block, width));
-    }
-    if !live.is_empty() {
-        lines.push(PaintLine::blank());
+        lines.extend(block_group_lines_with_expansion(
+            block,
+            width,
+            expanded_tools.contains(&block.id()),
+        ));
     }
 
-    let dock_index = lines.len();
+    let mut dock_index = lines.len();
+    // Transient rows stay in the pinned dock instead of scrolling away with the
+    // conversation. Activity leads any command suggestions.
+    if let Some(activity) = activity {
+        if !matches!(lines.last(), Some(line) if line == &PaintLine::blank()) {
+            lines.push(PaintLine::blank());
+        }
+        lines.extend(activity_lines(activity, activity_phase, width));
+        if !suggestions.is_empty() {
+            lines.push(PaintLine::blank());
+        }
+    }
     if !suggestions.is_empty() {
         lines.extend(suggestion_lines(suggestions, width));
     }
+    // The row directly above the composer is always reserved — blank when there
+    // is nothing to say, and the notice when there is. Keeping it there
+    // unconditionally is what stops a notice appearing or expiring from
+    // resizing the frame and shoving the transcript up or down a row.
+    if lines.last() == Some(&PaintLine::blank()) {
+        lines.pop();
+        dock_index = dock_index.min(lines.len());
+    }
+    lines.push(match status.composer_notice.as_deref() {
+        // Folded onto one row for the same reason: a notice long enough to wrap
+        // would grow the frame.
+        Some(notice) => notice_row(notice, width),
+        None => PaintLine::blank(),
+    });
 
-    // Transient rows ride directly above the composer rule so they stay pinned to
-    // the prompt instead of scrolling away with the conversation.
-    if let Some(activity) = activity {
-        lines.extend(wrapped_line(
-            "",
-            Tone::Accent,
-            activity,
-            Tone::Accent,
-            false,
-            width,
-        ));
-    }
-    if let Some(notice) = status.composer_notice.as_deref() {
-        lines.extend(wrapped_line(
-            "",
-            Tone::Success,
-            notice,
-            Tone::Success,
-            false,
-            width,
-        ));
-    }
-    // One blank row keeps a transient message off the composer rule; without a
-    // transient row the composer stays flush against whatever is above it.
-    if activity.is_some() || status.composer_notice.is_some() {
-        lines.push(PaintLine::blank());
-    }
-
+    // Recalled history is labelled on the composer rule, so the position stays
+    // visible for as long as the entry does.
+    let recalled = editor
+        .history_position()
+        .map(|(position, total)| format!("{position}/{total}"))
+        .unwrap_or_default();
     let (input_lines, input_cursor_line, input_cursor_col) =
-        input_lines(editor, width, "", "", status.composer_mode.as_ref());
+        input_lines(editor, width, &recalled, "", status.composer_mode.as_ref());
     let cursor_line = lines.len() + input_cursor_line;
     lines.extend(input_lines);
     lines.push(status_line_row(status.line, &status.fallback, width));
@@ -619,6 +1440,22 @@ fn normal_frame(
     }
 }
 
+/// The transient notice that labels the composer rule. It is deliberately a
+/// single row: it lives in the frame's reserved spacer row, so it must never
+/// wrap.
+fn notice_row(notice: &str, width: u16) -> PaintLine {
+    PaintLine {
+        prefix: String::new(),
+        prefix_tone: Tone::Accent,
+        text: compact_right(notice, width as usize),
+        tone: Tone::Accent,
+        bold: false,
+        tool_heading: None,
+        pick: None,
+        tail: Vec::new(),
+    }
+}
+
 /// Narrowest inner width that still leaves both columns readable; below this the
 /// welcome panel collapses to a single column.
 const WELCOME_SPLIT_MIN: usize = 62;
@@ -629,12 +1466,11 @@ fn welcome_lines(welcome: WelcomeView, width: u16) -> Vec<PaintLine> {
     let left = welcome_info_rows(&welcome, inner_width);
 
     if inner_width < WELCOME_SPLIT_MIN {
-        let mut lines = vec![panel_top(inner_width), panel_padding_row(panel_width)];
+        let mut lines = vec![panel_top(inner_width)];
         lines.extend(
             left.into_iter()
                 .map(|(text, tone, bold)| panel_line(&text, panel_width, tone, bold)),
         );
-        lines.push(panel_padding_row(panel_width));
         lines.push(panel_bottom(inner_width));
         return lines;
     }
@@ -652,9 +1488,10 @@ fn welcome_lines(welcome: WelcomeView, width: u16) -> Vec<PaintLine> {
         text: format!("╭{}┬{}╮", "─".repeat(left_width), "─".repeat(right_width)),
         tone: Tone::Border,
         bold: false,
+        tool_heading: None,
+        pick: None,
         tail: Vec::new(),
     }];
-    lines.push(split_panel_line(None, left_width, None, right_width));
     for row in 0..left.len().max(right.len()) {
         lines.push(split_panel_line(
             left.get(row),
@@ -663,13 +1500,14 @@ fn welcome_lines(welcome: WelcomeView, width: u16) -> Vec<PaintLine> {
             right_width,
         ));
     }
-    lines.push(split_panel_line(None, left_width, None, right_width));
     lines.push(PaintLine {
         prefix: String::new(),
         prefix_tone: Tone::Border,
         text: format!("╰{}┴{}╯", "─".repeat(left_width), "─".repeat(right_width)),
         tone: Tone::Border,
         bold: false,
+        tool_heading: None,
+        pick: None,
         tail: Vec::new(),
     });
     lines
@@ -727,11 +1565,7 @@ fn welcome_info_rows(welcome: &WelcomeView, column_width: usize) -> Vec<PanelRow
             false,
         ),
         (String::new(), Tone::Plain, false),
-        (
-            "  /help commands  ·  /model switch model".to_owned(),
-            Tone::Muted,
-            false,
-        ),
+        ("  /help commands".to_owned(), Tone::Muted, false),
     ]);
     rows
 }
@@ -778,6 +1612,8 @@ fn split_panel_line(
         text: left_text,
         tone: left_tone,
         bold: left_bold,
+        tool_heading: None,
+        pick: None,
         tail: vec![
             PaintSpan {
                 text: "│".to_owned(),
@@ -833,8 +1669,31 @@ fn panel_rule_row(opening: &str, label: &str, corner: char, panel_width: usize) 
             Tone::Muted
         },
         bold: corner == '╮',
+        tool_heading: None,
+        pick: None,
         tail: vec![PaintSpan {
             text: format!("{}{corner}", "─".repeat(panel_width.saturating_sub(used))),
+            tone: Tone::Border,
+            bold: false,
+        }],
+    }
+}
+
+fn panel_title_row(title: &str, panel_width: usize) -> PaintLine {
+    let header = format!("{title} ");
+    let header_rule = panel_width
+        .saturating_sub(3 + UnicodeWidthStr::width(header.as_str()) + 1)
+        .max(1);
+    PaintLine {
+        prefix: "╭─ ".to_owned(),
+        prefix_tone: Tone::Border,
+        text: header,
+        tone: Tone::Muted,
+        bold: false,
+        tool_heading: None,
+        pick: None,
+        tail: vec![PaintSpan {
+            text: format!("{}╮", "─".repeat(header_rule)),
             tone: Tone::Border,
             bold: false,
         }],
@@ -859,6 +1718,15 @@ fn close_panel_row(mut line: PaintLine, panel_width: usize) -> PaintLine {
     line
 }
 
+fn panelize_content_line(mut line: PaintLine, panel_width: usize) -> PaintLine {
+    line.prefix.insert(0, '│');
+    line.prefix_tone = Tone::Border;
+    // The border pushes every column of the row along with it, and the clickable
+    // spans were measured before it went on.
+    line.pick = line.pick.map(|regions| regions.shifted(1));
+    close_panel_row(line, panel_width)
+}
+
 fn panel_top(inner_width: usize) -> PaintLine {
     PaintLine {
         prefix: String::new(),
@@ -866,6 +1734,8 @@ fn panel_top(inner_width: usize) -> PaintLine {
         text: format!("╭{}╮", "─".repeat(inner_width)),
         tone: Tone::Border,
         bold: false,
+        tool_heading: None,
+        pick: None,
         tail: Vec::new(),
     }
 }
@@ -877,6 +1747,8 @@ fn panel_bottom(inner_width: usize) -> PaintLine {
         text: format!("╰{}╯", "─".repeat(inner_width)),
         tone: Tone::Border,
         bold: false,
+        tool_heading: None,
+        pick: None,
         tail: Vec::new(),
     }
 }
@@ -891,6 +1763,8 @@ fn update_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         text: "─".repeat(rule_width),
         tone: Tone::Border,
         bold: false,
+        tool_heading: None,
+        pick: None,
         tail: Vec::new(),
     };
     vec![
@@ -901,6 +1775,8 @@ fn update_lines(block: &Block, width: u16) -> Vec<PaintLine> {
             text: compact_text(&block.title, text_width),
             tone: Tone::Accent,
             bold: true,
+            tool_heading: None,
+            pick: None,
             tail: Vec::new(),
         },
         PaintLine {
@@ -909,6 +1785,8 @@ fn update_lines(block: &Block, width: u16) -> Vec<PaintLine> {
             text: compact_text(&block.body, text_width),
             tone: Tone::Muted,
             bold: false,
+            tool_heading: None,
+            pick: None,
             tail: Vec::new(),
         },
         rule(),
@@ -919,31 +1797,32 @@ fn update_lines(block: &Block, width: u16) -> Vec<PaintLine> {
 fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine> {
     let panel_width = panel_span(width);
     let inner_width = panel_width.saturating_sub(2);
-    const HEADER: &str = "Commands ";
-    // "╭─ " + header + rule + "╮" has to land on exactly panel_width columns.
-    let header_rule = panel_width
-        .saturating_sub(3 + UnicodeWidthStr::width(HEADER) + 1)
-        .max(1);
-    let mut lines = vec![PaintLine {
-        prefix: "╭─ ".to_owned(),
-        prefix_tone: Tone::Border,
-        text: HEADER.to_owned(),
-        tone: Tone::Muted,
-        bold: false,
-        tail: vec![PaintSpan {
-            text: format!("{}╮", "─".repeat(header_rule)),
-            tone: Tone::Border,
-            bold: false,
-        }],
-    }];
+    let title = suggestions
+        .first()
+        .map(|suggestion| suggestion.panel_title)
+        .unwrap_or("Commands");
+    let mut lines = vec![panel_title_row(title, panel_width)];
     lines.push(panel_padding_row(panel_width));
-    for suggestion in suggestions.iter().take(6) {
+    for suggestion in &suggestions[visible_window(
+        suggestions.iter().position(|item| item.selected),
+        suggestions.len(),
+        SUGGESTION_ROWS,
+    )] {
         let marker = if suggestion.selected { "❯" } else { " " };
-        let content = format!(
-            " {marker} {:<10} {}",
-            suggestion.command, suggestion.description
-        );
-        lines.push(panel_line(
+        let content = match suggestion.category.as_deref() {
+            Some(category) if suggestion.description.is_empty() => {
+                format!(" {marker} [{category}] {}", suggestion.command)
+            }
+            Some(category) => format!(
+                " {marker} [{category}] {}  {}",
+                suggestion.command, suggestion.description
+            ),
+            None => format!(
+                " {marker} {:<COMMAND_COLUMN_WIDTH$} {}",
+                suggestion.command, suggestion.description
+            ),
+        };
+        lines.push(panel_line_keep_left(
             &content,
             panel_width,
             if suggestion.selected {
@@ -954,9 +1833,39 @@ fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine
             suggestion.selected,
         ));
     }
+    if let Some(hint) = suggestions
+        .iter()
+        .find_map(|suggestion| suggestion.hint.as_deref())
+    {
+        lines.push(panel_line_keep_left(
+            &format!("   {hint}"),
+            panel_width,
+            Tone::Muted,
+            false,
+        ));
+    }
     lines.push(panel_padding_row(panel_width));
     lines.push(panel_bottom(inner_width));
     lines
+}
+
+/// Rows the command dock shows at once. Longer lists scroll.
+const SUGGESTION_ROWS: usize = 6;
+const COMMAND_COLUMN_WIDTH: usize = 16;
+
+/// The slice of a list to draw so `selected` is always on screen, keeping a
+/// third of the rows above it as context and never leaving a short window at
+/// the end of a list that could fill one.
+/// Rows a full-screen picker lists at once. Longer catalogues scroll.
+pub const PICKER_ROWS: usize = 9;
+
+pub fn visible_window(selected: Option<usize>, len: usize, rows: usize) -> std::ops::Range<usize> {
+    let last_start = len.saturating_sub(rows);
+    let start = selected
+        .unwrap_or(0)
+        .saturating_sub(rows / 3)
+        .min(last_start);
+    start..(start + rows).min(len)
 }
 
 /// A bordered blank row. Every boxed list gets one under its top rule and one
@@ -966,8 +1875,55 @@ fn panel_padding_row(panel_width: usize) -> PaintLine {
 }
 
 fn panel_line(text: &str, width: usize, tone: Tone, bold: bool) -> PaintLine {
+    panel_line_with(text, width, tone, bold, compact_text)
+}
+
+fn panel_line_keep_left(text: &str, width: usize, tone: Tone, bold: bool) -> PaintLine {
+    panel_line_with(text, width, tone, bold, compact_right)
+}
+
+/// A left-anchored row that keeps `right_inset` blank columns before the right
+/// border, so a truncated row never crowds the box.
+fn panel_line_keep_left_inset(
+    text: &str,
+    width: usize,
+    right_inset: usize,
+    tone: Tone,
+    bold: bool,
+) -> PaintLine {
     let inner_width = width.saturating_sub(2);
-    let content = compact_text(text, inner_width);
+    let inset = right_inset.min(inner_width);
+    let content_width = inner_width.saturating_sub(inset);
+    let single_line = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    let content = if content_width == 0 {
+        String::new()
+    } else {
+        compact_right(&single_line, content_width)
+    };
+    panel_line(
+        &format!("{content}{}", " ".repeat(inset)),
+        width,
+        tone,
+        bold,
+    )
+}
+
+fn panel_line_with(
+    text: &str,
+    width: usize,
+    tone: Tone,
+    bold: bool,
+    compact: fn(&str, usize) -> String,
+) -> PaintLine {
+    let inner_width = width.saturating_sub(2);
+    let single_line = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    let content = compact(&single_line, inner_width);
     let padding = inner_width.saturating_sub(UnicodeWidthStr::width(content.as_str()));
     PaintLine {
         prefix: "│".to_owned(),
@@ -975,6 +1931,8 @@ fn panel_line(text: &str, width: usize, tone: Tone, bold: bool) -> PaintLine {
         text: format!("{content}{}", " ".repeat(padding)),
         tone,
         bold,
+        tool_heading: None,
+        pick: None,
         tail: vec![PaintSpan {
             text: "│".to_owned(),
             tone: Tone::Border,
@@ -983,79 +1941,324 @@ fn panel_line(text: &str, width: usize, tone: Tone, bold: bool) -> PaintLine {
     }
 }
 
+const EFFORT_SEPARATOR: &str = " › ";
+
+/// Effort reads as a sequence of compute steps rather than a speed-to-depth
+/// axis. The selected step stays fully named while the others compact on narrow
+/// terminals.
+fn effort_step_lines(slider: &EffortSlider, width: u16) -> Vec<PaintLine> {
+    effort_step_lines_in(slider, panel_span(width))
+}
+
+fn effort_step_lines_in(slider: &EffortSlider, inner: usize) -> Vec<PaintLine> {
+    if slider.efforts.is_empty() {
+        return Vec::new();
+    }
+
+    let selected = slider.selected.min(slider.efforts.len() - 1);
+    let full = effort_step_spans(slider, selected, false);
+    let full_width = steps_width(&full);
+    let mut spans = if full_width <= inner {
+        full
+    } else {
+        effort_step_spans(slider, selected, true)
+    };
+    while steps_width(&spans) > inner {
+        let Some(step) = spans
+            .iter()
+            .rposition(|step| !step.span.bold && step.effort.is_some())
+        else {
+            break;
+        };
+        if step + 1 < spans.len() {
+            spans.drain(step..step + 2);
+        } else {
+            spans.drain(step.saturating_sub(1)..=step);
+        }
+    }
+    let content_width = steps_width(&spans);
+    let indent = inner.saturating_sub(content_width) / 2;
+    let selected_span = spans
+        .iter()
+        .position(|step| step.span.bold)
+        .expect("non-empty effort list has a selection");
+    let selected_offset = steps_width(&spans[..selected_span]);
+    let selected_width = UnicodeWidthStr::width(spans[selected_span].span.text.as_str());
+    let selected_tone = spans[selected_span].span.tone;
+    let border_prefix = " ".repeat(indent + selected_offset);
+    let border_fill = "─".repeat(selected_width.saturating_sub(2));
+    // The step a click on this row lands on. The row opens with an empty `text`,
+    // so the steps start one span in.
+    let picks = spans
+        .iter()
+        .enumerate()
+        .filter_map(|(index, step)| step.effort.map(|effort| (index + 1, Pick::Effort(effort))))
+        .collect::<Vec<_>>();
+    let spans = spans.into_iter().map(|step| step.span).collect::<Vec<_>>();
+
+    vec![
+        PaintLine {
+            prefix: border_prefix.clone(),
+            prefix_tone: Tone::Muted,
+            text: format!("╭{border_fill}╮"),
+            tone: selected_tone,
+            bold: true,
+            tool_heading: None,
+            pick: None,
+            tail: Vec::new(),
+        },
+        PaintLine {
+            prefix: " ".repeat(indent),
+            prefix_tone: Tone::Muted,
+            text: String::new(),
+            tone: Tone::Muted,
+            bold: false,
+            tool_heading: None,
+            pick: None,
+            tail: spans,
+        }
+        .with_picks(&picks),
+        PaintLine {
+            prefix: border_prefix,
+            prefix_tone: Tone::Muted,
+            text: format!("╰{border_fill}╯"),
+            tone: selected_tone,
+            bold: true,
+            tool_heading: None,
+            pick: None,
+            tail: Vec::new(),
+        },
+    ]
+}
+
+/// A painted piece of the effort track and the step it stands for. The
+/// separators between the steps stand for nothing, and the shrinking that fits
+/// the track into a narrow panel drops steps, so which piece is which step is
+/// only knowable while the track is being built.
+struct EffortStepSpan {
+    span: PaintSpan,
+    effort: Option<usize>,
+}
+
+fn steps_width(steps: &[EffortStepSpan]) -> usize {
+    steps
+        .iter()
+        .map(|step| UnicodeWidthStr::width(step.span.text.as_str()))
+        .sum()
+}
+
+fn effort_step_spans(
+    slider: &EffortSlider,
+    selected: usize,
+    compact: bool,
+) -> Vec<EffortStepSpan> {
+    let selected_tone = slider
+        .efforts
+        .get(selected)
+        .and_then(|effort| effort_tone(effort))
+        .unwrap_or(Tone::Accent);
+    let mut spans = Vec::with_capacity(slider.efforts.len() * 2 - 1);
+
+    for (index, effort) in slider.efforts.iter().enumerate() {
+        if index > 0 {
+            spans.push(EffortStepSpan {
+                span: PaintSpan {
+                    text: EFFORT_SEPARATOR.to_owned(),
+                    tone: if index == selected + 1 {
+                        selected_tone
+                    } else {
+                        Tone::Muted
+                    },
+                    bold: false,
+                },
+                effort: None,
+            });
+        }
+
+        let is_selected = index == selected;
+        spans.push(EffortStepSpan {
+            span: PaintSpan {
+                text: effort_step_label(effort, is_selected, compact),
+                tone: if is_selected {
+                    selected_tone
+                } else {
+                    Tone::Muted
+                },
+                bold: is_selected,
+            },
+            effort: Some(index),
+        });
+    }
+
+    spans
+}
+
+fn effort_step_label(effort: &str, selected: bool, compact: bool) -> String {
+    if selected {
+        return format!("│ {} │", effort.to_ascii_uppercase());
+    }
+    if !compact {
+        return effort.to_owned();
+    }
+
+    match effort {
+        "low" => "L",
+        "medium" => "M",
+        "high" => "H",
+        "xhigh" => "XH",
+        "max" => "MAX",
+        "ultra" | "ultracode" => "U",
+        unknown => unknown,
+    }
+    .to_owned()
+}
+
+#[cfg(test)]
 fn overlay_frame(
     live: &[Block],
     overlay: OverlayView<'_>,
+    welcome: Option<WelcomeView>,
     status: StatusArea,
     width: u16,
 ) -> Frame {
+    overlay_frame_with_expansion(live, overlay, welcome, status, width, &HashSet::new())
+}
+
+fn overlay_frame_with_expansion(
+    live: &[Block],
+    overlay: OverlayView<'_>,
+    welcome: Option<WelcomeView>,
+    status: StatusArea,
+    width: u16,
+    expanded_tools: &HashSet<u64>,
+) -> Frame {
     let mut lines = Vec::new();
-    for block in live {
-        lines.extend(block_lines(block, width));
-    }
-    if !live.is_empty() {
+    // A picker docks over the transcript rather than replacing the screen, so the
+    // welcome card stays where it was instead of blinking out for as long as
+    // `/model`, `/effort` or `/resume` is open. On a short terminal `fit_frame`
+    // trims it from the top, the same way it does under the normal frame.
+    if let Some(welcome) = welcome {
+        lines.extend(welcome_lines(welcome, width));
         lines.push(PaintLine::blank());
+    }
+    for block in live {
+        lines.extend(block_group_lines_with_expansion(
+            block,
+            width,
+            expanded_tools.contains(&block.id()),
+        ));
     }
     let dock_index = lines.len();
 
     match overlay.style {
         OverlayStyle::Picker => {
-            lines.push(PaintLine {
-                prefix: "  ".to_owned(),
-                prefix_tone: Tone::Accent,
-                text: overlay.title,
-                tone: Tone::Accent,
-                bold: true,
-                tail: Vec::new(),
-            });
-            lines.push(PaintLine::blank());
-            for row in overlay.lines {
+            let panel_width = panel_span(width);
+            let inner_width = panel_width.saturating_sub(2);
+            lines.push(panel_title_row(&overlay.title, panel_width));
+            lines.push(panel_padding_row(panel_width));
+
+            for (row_index, row) in overlay.lines.iter().enumerate() {
                 if row.text.is_empty() {
-                    lines.push(PaintLine::blank());
+                    lines.push(panel_padding_row(panel_width));
                     continue;
                 }
                 for (part_index, part) in row.text.lines().enumerate() {
                     let prefix = if part_index == 0 {
-                        if row.selected { "  ❯ " } else { "    " }
+                        if row.selected { "│ ❯ " } else { "│   " }
                     } else {
-                        "    "
+                        "│     "
                     };
-                    lines.extend(wrapped_line(
+                    let tone = if row.muted {
+                        Tone::Muted
+                    } else if part.contains('●') && part.contains('○') {
+                        Tone::Accent
+                    } else {
+                        model_tone(part).unwrap_or(Tone::Plain)
+                    };
+                    let wrapped = wrapped_line_with_continuation(
                         prefix,
-                        if row.selected {
-                            Tone::Accent
-                        } else {
-                            Tone::Muted
-                        },
+                        "│   ",
+                        Tone::Border,
                         part,
-                        if row.muted {
-                            Tone::Muted
-                        } else if part.contains('●') && part.contains('○') {
-                            Tone::Accent
-                        } else {
-                            model_tone(part).unwrap_or(Tone::Plain)
-                        },
+                        tone,
                         row.selected && part_index == 0,
-                        width,
-                    ));
+                        (panel_width.saturating_sub(1)).min(u16::MAX as usize) as u16,
+                    );
+                    lines.extend(wrapped.into_iter().map(|line| {
+                        let line = close_panel_row(line, panel_width);
+                        // A muted row is the picker talking, not offering: a
+                        // summary or a heading answers to no click, so it must
+                        // not light up as though it did. What is on offer is the
+                        // row's own text — the panel borders and the padding out
+                        // to them are furniture, and highlighting them would read
+                        // as the box itself being pressed.
+                        if row.muted {
+                            line
+                        } else {
+                            line.with_picks(&[(0, Pick::Row(row_index))])
+                        }
+                    }));
                 }
             }
-            lines.push(PaintLine::blank());
-            lines.push(PaintLine {
-                prefix: "  ".to_owned(),
-                prefix_tone: Tone::Muted,
-                text: overlay.hint,
-                tone: Tone::Muted,
-                bold: false,
-                tail: Vec::new(),
-            });
+            if let Some(slider) = overlay.slider {
+                lines.extend(
+                    effort_step_lines_in(&slider, inner_width)
+                        .into_iter()
+                        .map(|line| panelize_content_line(line, panel_width)),
+                );
+            }
+            lines.push(panel_padding_row(panel_width));
+            lines.push(panel_rule_row("╰─ ", &overlay.hint, '╯', panel_width));
+        }
+        OverlayStyle::CompactPanel => {
+            /// `" ❯ "`: what a compact row spends before its own text starts.
+            const COMPACT_ROW_GUTTER_COLUMNS: usize = 3;
+            /// Blank columns kept before the right border so a truncated row
+            /// never crowds the box.
+            const COMPACT_ROW_RIGHT_INSET: usize = 3;
+
+            let panel_width = panel_span(width);
+            lines.push(panel_rule_row("╭─ ", &overlay.title, '╮', panel_width));
+            lines.push(panel_padding_row(panel_width));
+            for (row_index, row) in overlay.lines.iter().enumerate() {
+                let marker = if row.selected { "❯" } else { " " };
+                let mut line = panel_line_keep_left_inset(
+                    &format!(" {marker} {}", row.text),
+                    panel_width,
+                    COMPACT_ROW_RIGHT_INSET,
+                    if row.selected {
+                        Tone::Accent
+                    } else if row.muted {
+                        Tone::Muted
+                    } else {
+                        Tone::Plain
+                    },
+                    row.selected,
+                );
+                if !row.muted {
+                    // The same span the taller pickers offer: the row's own text,
+                    // never the marker gutter, the borders, or the padding out to
+                    // them. Those are furniture, and lighting them up would read
+                    // as the box itself being pressed.
+                    let start =
+                        UnicodeWidthStr::width(line.prefix.as_str()) + COMPACT_ROW_GUTTER_COLUMNS;
+                    let end = UnicodeWidthStr::width(line.prefix.as_str())
+                        + UnicodeWidthStr::width(line.text.trim_end());
+                    if end > start {
+                        line.pick = Some(PickRegions::span(start, end, Pick::Row(row_index)));
+                    }
+                }
+                lines.push(line);
+            }
+            lines.push(panel_padding_row(panel_width));
+            lines.push(panel_rule_row("╰─ ", &overlay.hint, '╯', panel_width));
         }
         OverlayStyle::Panel => {
             // A closed box: every row lands on exactly `panel_width` columns.
             let panel_width = panel_span(width);
             lines.push(panel_rule_row("╭─ ", &overlay.title, '╮', panel_width));
             lines.push(panel_padding_row(panel_width));
-            for row in overlay.lines {
+            for (row_index, row) in overlay.lines.iter().enumerate() {
                 // An empty row is padding of the caller's own. It still needs
                 // both borders, so it cannot go through the wrapping path,
                 // which yields no rows at all for empty text.
@@ -1079,11 +2282,20 @@ fn overlay_frame(
                         row.selected && part_index == 0,
                         (panel_width.saturating_sub(1)).min(u16::MAX as usize) as u16,
                     );
-                    lines.extend(
-                        wrapped
-                            .into_iter()
-                            .map(|line| close_panel_row(line, panel_width)),
-                    );
+                    lines.extend(wrapped.into_iter().map(|line| {
+                        let line = close_panel_row(line, panel_width);
+                        // A muted row is the picker talking, not offering: a
+                        // summary or a heading answers to no click, so it must
+                        // not light up as though it did. What is on offer is the
+                        // row's own text — the panel borders and the padding out
+                        // to them are furniture, and highlighting them would read
+                        // as the box itself being pressed.
+                        if row.muted {
+                            line
+                        } else {
+                            line.with_picks(&[(0, Pick::Row(row_index))])
+                        }
+                    }));
                 }
             }
             lines.push(panel_padding_row(panel_width));
@@ -1109,6 +2321,7 @@ fn overlay_frame(
     } else {
         false
     };
+    lines.push(PaintLine::blank());
     lines.push(status_line_row(status.line, &status.fallback, width));
 
     Frame {
@@ -1149,18 +2362,13 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
             text: compact_right(fallback, width.saturating_sub(1) as usize),
             tone: Tone::Muted,
             bold: false,
+            tool_heading: None,
+            pick: None,
             tail: Vec::new(),
         };
     };
 
-    let effort_tone = match status.effort.as_str() {
-        "low" => Tone::EffortLow,
-        "medium" => Tone::EffortMedium,
-        "high" => Tone::EffortHigh,
-        "xhigh" => Tone::EffortXHigh,
-        "max" => Tone::EffortMax,
-        _ => Tone::StatusText,
-    };
+    let effort_tone = effort_tone(&status.effort).unwrap_or(Tone::StatusText);
     let mut spans = Vec::new();
     let branch = status
         .branch
@@ -1205,9 +2413,23 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         text: first.text,
         tone: first.tone,
         bold: first.bold,
+        tool_heading: None,
+        pick: None,
         tail: spans.into_iter().skip(1).collect(),
     }
+    // Branch, model and effort are pushed unconditionally and in that order, so
+    // the model reading is always the second span and the effort the third —
+    // each separated from the last by the ` | ` push_status_span inserts.
+    .with_picks(&[
+        (STATUS_MODEL_SPAN, Pick::Model),
+        (STATUS_EFFORT_SPAN, Pick::EffortSetting),
+    ])
 }
+
+/// Paint-order position of the model reading on the status line, and of the
+/// effort beside it. Clicking either opens the command that changes it.
+const STATUS_MODEL_SPAN: usize = 2;
+const STATUS_EFFORT_SPAN: usize = 4;
 
 fn push_status_span(spans: &mut Vec<PaintSpan>, text: impl Into<String>, tone: Tone) {
     if spans.is_empty() {
@@ -1251,35 +2473,46 @@ fn trim_spans(spans: &mut Vec<PaintSpan>, max_width: usize) {
     }
 }
 
-/// Rows of tool output kept on screen, matching Claude Code's cap. Whatever is
-/// left over is reported as a count instead of being printed.
+/// Painted rows of tool output kept on screen. The renderer clips each output
+/// box to five rows and hides the overflow, so counting
+/// *painted* rows rather than lines of text is the point: one 900-character line
+/// wraps into a screenful, and a line cap would happily let it through.
 const TOOL_OUTPUT_ROWS: usize = 5;
 
-/// Command and tool results: the heading, then at most [`TOOL_OUTPUT_ROWS`] rows
-/// of raw output and a muted `… +N lines`. Output is printed verbatim rather
-/// than through the markdown pipeline — a shell writes text, not documents.
+/// Command and tool results: the heading, then at most [`TOOL_OUTPUT_ROWS`]
+/// painted rows taken from the *end* of the output, and a muted `… +N lines`.
+/// Output is printed verbatim rather than through the markdown pipeline — a
+/// shell writes text, not documents.
 fn tool_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     let mut lines = wrapped_line("● ", Tone::User, &block.title, Tone::Plain, true, width);
-    // Trailing blank rows are noise, and a shell almost always leaves one.
+    // Blank rows say nothing and would spend the row budget, so they go before
+    // anything is counted. A shell almost always leaves at least one.
     let rows = block
         .body
-        .trim_end_matches(['\n', '\r'])
         .lines()
+        .filter(|row| !row.trim().is_empty())
         .collect::<Vec<_>>();
-    if block.body.is_empty() || rows.is_empty() {
+    if rows.is_empty() {
         return lines;
     }
-    let shown = rows.len().min(TOOL_OUTPUT_ROWS);
-    for row in &rows[..shown] {
-        lines.extend(wrapped_line(
-            "  ",
-            Tone::Muted,
-            row,
-            Tone::Muted,
-            false,
-            width,
-        ));
+    // The tail, not the head: a command's verdict — its error, its summary, the
+    // last thing it touched — lands at the end of what it printed.
+    let tail = &rows[rows.len().saturating_sub(TOOL_OUTPUT_ROWS)..];
+    let mut shown = 0;
+    let mut painted = Vec::new();
+    for row in tail {
+        let wrapped = wrapped_line("  ", Tone::Muted, row, Tone::Muted, false, width);
+        let room = TOOL_OUTPUT_ROWS - painted.len();
+        if wrapped.len() > room {
+            // A row too tall to finish is still worth a glimpse, but it stays
+            // counted as hidden: most of it never reaches the screen.
+            painted.extend(wrapped.into_iter().take(room));
+            break;
+        }
+        painted.extend(wrapped);
+        shown += 1;
     }
+    lines.extend(painted);
     let hidden = rows.len() - shown;
     if hidden > 0 {
         lines.extend(wrapped_line(
@@ -1294,17 +2527,350 @@ fn tool_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     lines
 }
 
+fn is_bash_block(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::Tool | BlockKind::Warning) && block.title.starts_with("Shell ·")
+}
+
+fn bash_lines(block: &Block, width: u16, expanded: bool) -> Vec<PaintLine> {
+    let marker = if expanded { "▾ " } else { "▸ " };
+    let mut lines = wrapped_line(marker, Tone::User, &block.title, Tone::Plain, true, width);
+    for line in &mut lines {
+        line.tool_heading = Some(block.id());
+    }
+    if expanded {
+        for row in block.body.lines().filter(|row| !row.trim().is_empty()) {
+            lines.extend(wrapped_line(
+                "  ",
+                Tone::Muted,
+                row,
+                Tone::Muted,
+                false,
+                width,
+            ));
+        }
+    }
+    lines
+}
+
+/// Diff rows a single `fileChange` block prints before it starts counting. Well
+/// above what an ordinary edit produces, so the patch is normally shown whole,
+/// but low enough that a sweeping refactor can't push the turn off screen.
+const FILE_CHANGE_ROWS: usize = 40;
+
+/// File edits use an `Update(path)` heading, line counts hanging off it under a
+/// `⎿`, then the patch itself in a line-number
+/// gutter. `+`/`-` rows carry the diff tint the whole way to the right edge, which
+/// [`print_line`] paints from their tone. Hunk headers are consumed for their
+/// numbers rather than printed — the gutter says the same thing somewhere more
+/// useful.
+fn file_change_lines(block: &Block, width: u16) -> Vec<PaintLine> {
+    let mut lines = wrapped_line("● ", Tone::Plain, &block.title, Tone::Plain, true, width);
+    let mut rows = block.body.lines();
+    if let Some(summary) = rows.next() {
+        lines.extend(styled_lines(
+            "  ⎿ ",
+            Tone::Muted,
+            counted_summary(summary),
+            Tone::Muted,
+            false,
+            width,
+        ));
+    }
+
+    let rows: Vec<&str> = rows.collect();
+    let word_spans = intraline_highlights(&rows);
+
+    let mut old_row = 0;
+    let mut new_row = 0;
+    let mut shown = 0;
+    let mut hidden = 0;
+    for (index, row) in rows.iter().copied().enumerate() {
+        if let Some((old, new)) = hunk_start(row) {
+            old_row = old;
+            new_row = new;
+            continue;
+        }
+        if shown == FILE_CHANGE_ROWS {
+            hidden += 1;
+            continue;
+        }
+        shown += 1;
+
+        let (number, marker, tone, content) = match row.as_bytes().first() {
+            Some(b'+') => {
+                new_row += 1;
+                (Some(new_row - 1), '+', Tone::DiffAdded, &row[1..])
+            }
+            Some(b'-') => {
+                old_row += 1;
+                (Some(old_row - 1), '-', Tone::DiffRemoved, &row[1..])
+            }
+            // A row a producer left unpadded is still context, just empty.
+            Some(b' ') | None => {
+                old_row += 1;
+                new_row += 1;
+                (
+                    Some(new_row - 1),
+                    ' ',
+                    Tone::Plain,
+                    row.get(1..).unwrap_or_default(),
+                )
+            }
+            // Anything else is the per-file heading a multi-file batch adds.
+            _ => (None, ' ', Tone::Plain, row),
+        };
+
+        lines.extend(match number {
+            Some(number) => {
+                let gutter = format!("{number:>8} {marker} ");
+                // An unmarked row is context, so only its number dims.
+                let gutter_tone = if marker == ' ' { Tone::Muted } else { tone };
+                match word_spans[index].clone() {
+                    Some(spans) => styled_lines(&gutter, gutter_tone, spans, tone, false, width),
+                    None => wrapped_line(&gutter, gutter_tone, content, tone, false, width),
+                }
+            }
+            None => wrapped_line("  ", Tone::Muted, content, Tone::Plain, true, width),
+        });
+    }
+
+    if hidden > 0 {
+        lines.extend(wrapped_line(
+            "  ",
+            Tone::Muted,
+            &format!("… +{hidden} lines"),
+            Tone::Muted,
+            false,
+            width,
+        ));
+    }
+    lines
+}
+
+/// The word tints for every row of a patch, `None` for rows that only get their
+/// full-width band.
+///
+/// A `-` run followed by a `+` run is a rewrite, so its rows pair off in order
+/// and each pair is compared word by word — the same reading Claude Code shows.
+/// Where the runs are different lengths the extra rows are a plain deletion or
+/// insertion with nothing to compare against, and [`word_diff`] drops any pair
+/// that turns out not to resemble its counterpart after all.
+fn intraline_highlights(rows: &[&str]) -> Vec<Option<Vec<PaintSpan>>> {
+    let mut spans = vec![None; rows.len()];
+    let mut index = 0;
+    while index < rows.len() {
+        if !rows[index].starts_with('-') {
+            index += 1;
+            continue;
+        }
+        let removed = index;
+        while index < rows.len() && rows[index].starts_with('-') {
+            index += 1;
+        }
+        let added = index;
+        while index < rows.len() && rows[index].starts_with('+') {
+            index += 1;
+        }
+        for offset in 0..(added - removed).min(index - added) {
+            let (old, new) = (removed + offset, added + offset);
+            if let Some((old_spans, new_spans)) =
+                word_diff(&rows[old][1..], &rows[new][1..])
+            {
+                spans[old] = Some(old_spans);
+                spans[new] = Some(new_spans);
+            }
+        }
+    }
+    spans
+}
+
+/// Words a line kept, past which comparing costs more than it explains. A rewrite
+/// this long is read as a whole line anyway.
+const WORD_DIFF_TOKENS: usize = 256;
+
+/// Splits one changed line against its counterpart into the words they share and
+/// the words only one of them has, as `(removed, added)` spans.
+///
+/// `None` means word tints would not help: the two lines have too little in
+/// common to be a rewrite of each other, or nothing in common to leave untinted,
+/// and either way the row's own band already says everything.
+fn word_diff(old: &str, new: &str) -> Option<(Vec<PaintSpan>, Vec<PaintSpan>)> {
+    let old_words = split_words(old);
+    let new_words = split_words(new);
+    if old_words.is_empty()
+        || new_words.is_empty()
+        || old_words.len() > WORD_DIFF_TOKENS
+        || new_words.len() > WORD_DIFF_TOKENS
+    {
+        return None;
+    }
+
+    // `common[i][j]` is the longest run of shared words in `old[i..]`/`new[j..]`,
+    // the ordinary longest-common-subsequence table. Walking it forwards from
+    // `[0][0]` then reads off which words survived the edit.
+    let mut common = vec![vec![0usize; new_words.len() + 1]; old_words.len() + 1];
+    for i in (0..old_words.len()).rev() {
+        for j in (0..new_words.len()).rev() {
+            common[i][j] = if old_words[i] == new_words[j] {
+                common[i + 1][j + 1] + 1
+            } else {
+                common[i + 1][j].max(common[i][j + 1])
+            };
+        }
+    }
+
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+    let mut shared = 0;
+    let (mut i, mut j) = (0, 0);
+    while i < old_words.len() && j < new_words.len() {
+        if old_words[i] == new_words[j] {
+            push_highlight_span(&mut removed, old_words[i], Tone::DiffRemoved, false);
+            push_highlight_span(&mut added, new_words[j], Tone::DiffAdded, false);
+            if !old_words[i].trim().is_empty() {
+                shared += 1;
+            }
+            i += 1;
+            j += 1;
+        } else if common[i + 1][j] >= common[i][j + 1] {
+            push_highlight_span(&mut removed, old_words[i], Tone::DiffRemovedWord, false);
+            i += 1;
+        } else {
+            push_highlight_span(&mut added, new_words[j], Tone::DiffAddedWord, false);
+            j += 1;
+        }
+    }
+    for word in &old_words[i..] {
+        push_highlight_span(&mut removed, word, Tone::DiffRemovedWord, false);
+    }
+    for word in &new_words[j..] {
+        push_highlight_span(&mut added, word, Tone::DiffAddedWord, false);
+    }
+
+    // Shared whitespace is not a resemblance — two unrelated lines still both
+    // start indented. Below a quarter of the longer line the rows are read as
+    // separate lines, not as one edited line, so they keep their plain band.
+    let visible = |words: &[&str]| words.iter().filter(|word| !word.trim().is_empty()).count();
+    if shared == 0 || shared * 4 < visible(&old_words).max(visible(&new_words)) {
+        return None;
+    }
+    let tinted = |spans: &[PaintSpan]| {
+        spans
+            .iter()
+            .any(|span| word_background(span.tone).is_some())
+    };
+    (tinted(&removed) || tinted(&added)).then_some((removed, added))
+}
+
+/// Splits a line into the units a word diff compares: runs of identifier
+/// characters, runs of whitespace, and every other character on its own. Naming a
+/// whole identifier as one unit is what keeps `old_name` → `new_name` tinting the
+/// name rather than the letters it happens to share.
+fn split_words(text: &str) -> Vec<&str> {
+    let mut words = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let ch = text[start..]
+            .chars()
+            .next()
+            .expect("start is on a character boundary");
+        let end = if is_word_char(ch) {
+            take_while(text, start, is_word_char)
+        } else if ch.is_whitespace() {
+            take_while(text, start, char::is_whitespace)
+        } else {
+            start + ch.len_utf8()
+        };
+        words.push(&text[start..end]);
+        start = end;
+    }
+    words
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+/// The counts are the part of a summary a reader scans for, so they come out of
+/// its dim row brighter and bold while the words around them stay muted. Split on
+/// digit runs rather than on the phrasing, so rewording the summary can't quietly
+/// drop the emphasis.
+fn counted_summary(summary: &str) -> Vec<PaintSpan> {
+    let mut spans = Vec::new();
+    let mut rest = summary;
+    while !rest.is_empty() {
+        let counting = rest.as_bytes()[0].is_ascii_digit();
+        let end = rest
+            .find(|ch: char| ch.is_ascii_digit() != counting)
+            .unwrap_or(rest.len());
+        let (run, tail) = rest.split_at(end);
+        push_highlight_span(
+            &mut spans,
+            run,
+            if counting { Tone::Plain } else { Tone::Muted },
+            counting,
+        );
+        rest = tail;
+    }
+    spans
+}
+
+/// The starting old and new line numbers in a unified diff's `@@ -12,7 +12,9 @@`.
+fn hunk_start(row: &str) -> Option<(usize, usize)> {
+    let (ranges, _) = row.strip_prefix("@@ ")?.split_once(" @@")?;
+    let (old, new) = ranges.split_once(' ')?;
+    let start = |range: &str, sign: char| -> Option<usize> {
+        range.strip_prefix(sign)?.split(',').next()?.parse().ok()
+    };
+    Some((start(old, '-')?, start(new, '+')?))
+}
+
 /// Title the app-server's reasoning summaries stream under, and the only one
 /// that renders as a bare thought instead of a labelled section.
 const THINKING_TITLE: &str = "Thinking…";
 
-/// Reasoning summaries, shaped like Claude Code's: a narrow `∴` gutter and a
-/// single dim italic paragraph. The summary's own line breaks are folded away
-/// so a long thought stays a handful of wrapped rows rather than a document
-/// that pushes the rest of the turn off screen. Markdown is left as written —
-/// there are no headings or bullets to render inside one paragraph.
+/// Codex paints a plan update as `• Updated Plan`, the explanation hanging off
+/// a `└`, then one checkbox row per step indented four columns: `✔` for done,
+/// `□` for the rest, with the in-progress step lit instead of dimmed. The body
+/// carries `▸` for that step so the row keeps a status the text alone can't.
+fn plan_lines(block: &Block, width: u16) -> Vec<PaintLine> {
+    let mut lines = wrapped_line("• ", Tone::Plain, &block.title, Tone::Plain, true, width);
+    let mut steps = 0usize;
+    for row in block.body.lines().filter(|row| !row.trim().is_empty()) {
+        // The checkbox itself is never struck through, only the step behind it.
+        let (prefix, tone, bold, text) = if let Some(rest) = row.strip_prefix("└ ") {
+            ("  └ ", Tone::Muted, false, rest)
+        } else if let Some(rest) = row.strip_prefix("✔ ") {
+            steps += 1;
+            ("    ✔ ", Tone::PlanDone, false, rest)
+        } else if let Some(rest) = row.strip_prefix("▸ ") {
+            steps += 1;
+            ("    □ ", Tone::Accent, true, rest)
+        } else if let Some(rest) = row.strip_prefix("□ ") {
+            steps += 1;
+            ("    □ ", Tone::Muted, false, rest)
+        } else {
+            ("    ", Tone::Muted, false, row)
+        };
+        lines.extend(wrapped_line(prefix, Tone::Muted, text, tone, bold, width));
+    }
+    if steps == 0 {
+        lines.extend(wrapped_line(
+            "    ",
+            Tone::Muted,
+            "(no steps provided)",
+            Tone::Thinking,
+            false,
+            width,
+        ));
+    }
+    lines.push(PaintLine::blank());
+    lines
+}
+
+/// Reasoning summaries use a narrow `∴` gutter and a single dim italic
+/// paragraph. Plan blocks keep their heading and one physical row per step.
 fn reasoning_lines(block: &Block, width: u16) -> Vec<PaintLine> {
-    let body = block.body.split_whitespace().collect::<Vec<_>>().join(" ");
     // `/plan` output shares this block kind but keeps its heading.
     let titled = block.title != THINKING_TITLE;
     let mut lines = if titled {
@@ -1312,7 +2878,7 @@ fn reasoning_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     } else {
         Vec::new()
     };
-    if body.is_empty() {
+    if block.body.is_empty() {
         if !titled {
             // Nothing has streamed yet, so the label stands in for the thought.
             lines.extend(wrapped_line(
@@ -1326,23 +2892,55 @@ fn reasoning_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         }
         return lines;
     }
-    let (prefix, prefix_tone) = if titled {
-        ("  ", Tone::Muted)
+    if titled {
+        for row in block.body.lines() {
+            if row.is_empty() {
+                lines.push(PaintLine::blank());
+            } else {
+                lines.extend(wrapped_line(
+                    "  ",
+                    Tone::Muted,
+                    row,
+                    Tone::Thinking,
+                    false,
+                    width,
+                ));
+            }
+        }
     } else {
-        ("∴ ", Tone::Thinking)
-    };
-    lines.extend(wrapped_line(
-        prefix,
-        prefix_tone,
-        &body,
-        Tone::Thinking,
-        false,
-        width,
-    ));
+        let body = block.body.split_whitespace().collect::<Vec<_>>().join(" ");
+        lines.extend(wrapped_line(
+            "∴ ",
+            Tone::Thinking,
+            &body,
+            Tone::Thinking,
+            false,
+            width,
+        ));
+    }
     lines
 }
 
+#[cfg(test)]
 fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
+    block_lines_with_expansion(block, width, false)
+}
+
+fn block_group_lines_with_expansion(block: &Block, width: u16, expanded: bool) -> Vec<PaintLine> {
+    let mut lines = block_lines_with_expansion(block, width, expanded);
+    while matches!(lines.last(), Some(line) if line == &PaintLine::blank()) {
+        lines.pop();
+    }
+    if !lines.is_empty() {
+        lines.push(PaintLine::blank());
+    }
+    lines
+}
+
+fn block_lines_with_expansion(block: &Block, width: u16, expanded: bool) -> Vec<PaintLine> {
+    if is_bash_block(block) {
+        return bash_lines(block, width, expanded);
+    }
     if matches!(block.kind, BlockKind::Welcome) {
         let mut values = block.body.lines();
         let mut lines = welcome_lines(
@@ -1366,29 +2964,42 @@ fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     if matches!(block.kind, BlockKind::Reasoning) {
         return reasoning_lines(block, width);
     }
+    if matches!(block.kind, BlockKind::Plan) {
+        return plan_lines(block, width);
+    }
     if matches!(block.kind, BlockKind::Tool) {
         return tool_lines(block, width);
     }
+    if matches!(block.kind, BlockKind::FileChange) {
+        return file_change_lines(block, width);
+    }
     if matches!(block.kind, BlockKind::ModelChange) {
-        return vec![
-            PaintLine {
-                prefix: "  ".to_owned(),
-                prefix_tone: Tone::ModelChange,
-                text: block.title.clone(),
-                tone: Tone::ModelChange,
-                bold: true,
-                tail: Vec::new(),
-            },
-            PaintLine {
+        let mut lines = vec![PaintLine {
+            prefix: "  ".to_owned(),
+            prefix_tone: Tone::ModelChange,
+            text: block.title.clone(),
+            tone: Tone::ModelChange,
+            bold: true,
+            tool_heading: None,
+            pick: None,
+            tail: Vec::new(),
+        }];
+        // A title that says everything (Fast mode On) carries no detail line, so
+        // an empty body drops the row instead of painting a hole under it.
+        if !block.body.is_empty() {
+            lines.push(PaintLine {
                 prefix: "    ".to_owned(),
                 prefix_tone: Tone::ModelChange,
                 text: block.body.clone(),
                 tone: Tone::ModelChange,
                 bold: false,
+                tool_heading: None,
+                pick: None,
                 tail: Vec::new(),
-            },
-            PaintLine::blank(),
-        ];
+            });
+        }
+        lines.push(PaintLine::blank());
+        return lines;
     }
 
     let (marker, tone) = match block.kind {
@@ -1396,7 +3007,9 @@ fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
             unreachable!("handled above")
         }
         BlockKind::User => unreachable!("user blocks are rendered separately"),
-        BlockKind::Reasoning | BlockKind::Tool => unreachable!("handled above"),
+        BlockKind::Reasoning | BlockKind::Plan | BlockKind::Tool | BlockKind::FileChange => {
+            unreachable!("handled above")
+        }
         BlockKind::Assistant => ("● ", Tone::Plain),
         BlockKind::Diff => ("● ", Tone::Plain),
         BlockKind::Warning => ("▲ ", Tone::Warning),
@@ -1442,6 +3055,8 @@ fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
                 text,
                 tone: Tone::Muted,
                 bold: false,
+                tool_heading: None,
+                pick: None,
                 tail: Vec::new(),
             });
             if code {
@@ -1523,6 +3138,8 @@ fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
             text: "└────────────────".to_owned(),
             tone: Tone::Muted,
             bold: false,
+            tool_heading: None,
+            pick: None,
             tail: Vec::new(),
         });
     }
@@ -1547,11 +3164,7 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     for (index, raw_line) in block.body.lines().enumerate() {
         lines.extend(wrapped_line(
             if index == 0 { "❯ " } else { "  " },
-            if index == 0 {
-                Tone::Plain
-            } else {
-                Tone::Muted
-            },
+            if index == 0 { Tone::Plain } else { Tone::Muted },
             raw_line,
             Tone::UserPrompt,
             true,
@@ -1760,6 +3373,8 @@ fn styled_lines(
                 text: first.text,
                 tone: first.tone,
                 bold: first.bold,
+                tool_heading: None,
+                pick: None,
                 tail: row,
             }
         })
@@ -2126,6 +3741,8 @@ fn wrapped_line_with_continuation(
             text: String::new(),
             tone,
             bold,
+            tool_heading: None,
+            pick: None,
             tail: Vec::new(),
         }];
     }
@@ -2144,6 +3761,8 @@ fn wrapped_line_with_continuation(
             text: part.into_owned(),
             tone,
             bold,
+            tool_heading: None,
+            pick: None,
             tail: if index + 1 < part_count {
                 vec![PaintSpan {
                     text: String::new(),
@@ -2179,6 +3798,7 @@ fn copy_metadata_applies(kind: BlockKind) -> bool {
         BlockKind::Assistant
             | BlockKind::Reasoning
             | BlockKind::Tool
+            | BlockKind::FileChange
             | BlockKind::Diff
             | BlockKind::Warning
             | BlockKind::Error
@@ -2266,15 +3886,21 @@ fn input_lines(
                 Tone::Plain
             },
             bold: false,
+            tool_heading: None,
+            pick: None,
             tail: Vec::new(),
         });
     }
+    // Both composer rules share the welcome card's border colour, so the frame
+    // around the prompt reads as the same furniture the panels are drawn from.
     rows.push(PaintLine {
         prefix: String::new(),
-        prefix_tone: Tone::Muted,
+        prefix_tone: Tone::Border,
         text: "─".repeat(panel_width),
-        tone: Tone::Muted,
+        tone: Tone::Border,
         bold: false,
+        tool_heading: None,
+        pick: None,
         tail: Vec::new(),
     });
 
@@ -2290,56 +3916,99 @@ const COMPOSER_MODE_TAIL_RULE: usize = 2;
 /// Separator between the permission mode and the fast-tier flag.
 const COMPOSER_BADGE_SEPARATOR: &str = " · ";
 
+/// Rule the composer's top line opens with when it carries a label.
+const OPENING_RULE: &str = "── ";
+
 fn input_top_line(panel_width: usize, label: &str, mode: Option<&ComposerMode>) -> PaintLine {
     let left = if label.is_empty() {
         String::new()
     } else {
-        format!("── {label} ")
+        format!("{OPENING_RULE}{label} ")
     };
     let left_width = UnicodeWidthStr::width(left.as_str());
     // Right-hand badges eat into this budget; whatever survives stays as rule.
     let mut budget = panel_width.saturating_sub(left_width + COMPOSER_RULE_MIN);
+    // A bare rule paints as one span before the tail; a labelled one spends three
+    // — the opening stroke, the label, then the fill.
+    let tail_offset = if left.is_empty() { 1 } else { 3 };
 
     // The mode is persistent state, so it anchors the far right.
     let badge = mode.and_then(|mode| {
         // Blanks either side of the badge plus the rule stub that trails it.
         let reserved = COMPOSER_MODE_GAP + 1 + COMPOSER_MODE_TAIL_RULE;
-        let spans = fitting_badge_spans(mode, budget.saturating_sub(reserved))?;
-        let width = spans
-            .iter()
-            .map(|span| UnicodeWidthStr::width(span.text.as_str()))
-            .sum::<usize>();
-        budget -= width + reserved;
-        Some(spans)
+        let badge = fitting_badge_spans(mode, budget.saturating_sub(reserved))?;
+        budget -= spans_width(&badge.spans) + reserved;
+        Some(badge)
     });
 
     let mut tail = Vec::new();
-    if let Some(spans) = badge {
+    // Where the badge lands once the rule ahead of it is counted: the gap span
+    // sits between, and a labelled rule spends one more span on the label.
+    let mut picks = Vec::new();
+    if let Some(badge) = badge {
+        let badge_start = tail_offset + 1;
+        picks.push((badge_start + badge.mode_index, Pick::PermissionMode));
+        picks.extend(
+            badge
+                .fast_index
+                .map(|index| (badge_start + index, Pick::FastMode)),
+        );
         tail.push(rule_gap(COMPOSER_MODE_GAP));
-        tail.extend(spans);
+        tail.extend(badge.spans);
         tail.push(rule_gap(1));
         tail.push(PaintSpan {
             text: "─".repeat(COMPOSER_MODE_TAIL_RULE),
-            tone: Tone::Muted,
+            tone: Tone::Border,
             bold: false,
         });
     }
 
-    let fill = (COMPOSER_RULE_MIN + budget).min(panel_width.saturating_sub(left_width));
+    let fill = "─".repeat((COMPOSER_RULE_MIN + budget).min(panel_width.saturating_sub(left_width)));
+    // A label sits inside the stroke rather than replacing it, so the rule either
+    // side of it keeps the border colour while the label itself stays muted —
+    // the same split `panel_rule_row` uses for a card title.
+    if left.is_empty() {
+        return PaintLine {
+            prefix: String::new(),
+            prefix_tone: Tone::Border,
+            text: fill,
+            tone: Tone::Border,
+            bold: false,
+            tool_heading: None,
+            pick: None,
+            tail,
+        }
+        .with_picks(&picks);
+    }
+    let spans = [
+        PaintSpan {
+            text: left[OPENING_RULE.len()..].to_owned(),
+            tone: Tone::Muted,
+            bold: false,
+        },
+        PaintSpan {
+            text: fill,
+            tone: Tone::Border,
+            bold: false,
+        },
+    ];
     PaintLine {
         prefix: String::new(),
-        prefix_tone: Tone::Muted,
-        text: format!("{left}{}", "─".repeat(fill)),
-        tone: Tone::Muted,
+        prefix_tone: Tone::Border,
+        text: OPENING_RULE.to_owned(),
+        tone: Tone::Border,
         bold: false,
-        tail,
+        tool_heading: None,
+        pick: None,
+        tail: spans.into_iter().chain(tail).collect(),
     }
+    .with_picks(&picks)
 }
 
-/// Widest badge that fits in `budget`, dropping segments from the right until it
-/// does: mode · fast flag · estimated cost. The parts are never ellipsized — a
+/// Widest badge that fits in `budget`: estimated cost · mode · fast flag, shed
+/// from the left as the budget tightens. The parts are never ellipsized — a
 /// half-written mode name or a clipped price is worse than none.
-fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<Vec<PaintSpan>> {
+fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans> {
     let mode_span = PaintSpan {
         text: mode.label.clone(),
         tone: mode_accent_tone(mode.accent),
@@ -2364,32 +4033,56 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<Vec<PaintSp
         },
     ];
 
-    let cost_spans = mode.cost.as_deref().map(|cost| {
-        vec![
-            separator_span(),
-            PaintSpan {
-                text: cost.to_owned(),
-                tone: Tone::Plain,
-                bold: false,
-            },
-        ]
-    });
+    // Brackets mark the cost as an aside rather than a setting like the two
+    // badges beside it. The cost leads, so its separator trails it instead.
+    let cost_spans = mode
+        .cost
+        .as_deref()
+        .map(|cost| {
+            vec![
+                PaintSpan {
+                    text: format!("[{cost}]"),
+                    tone: Tone::Plain,
+                    bold: false,
+                },
+                separator_span(),
+            ]
+        })
+        .unwrap_or_default();
 
-    // Assemble every segment, then note where each rung of the ladder ends so
-    // the badge can be peeled back from the right until it fits.
-    let mut spans = vec![mode_span];
-    let through_mode = spans.len();
-    spans.extend(fast_spans);
-    let through_fast = spans.len();
-    spans.extend(cost_spans.into_iter().flatten());
+    // Widest first. Reading order and drop order run opposite ways: the cost sits
+    // leftmost but goes first, because the mode is persistent state while the
+    // cost is only a running estimate.
+    let cost_width = cost_spans.len();
+    let ladder = [
+        BadgeSpans {
+            spans: [cost_spans, vec![mode_span.clone()], fast_spans.to_vec()].concat(),
+            mode_index: cost_width,
+            fast_index: Some(cost_width + 2),
+        },
+        BadgeSpans {
+            spans: [vec![mode_span.clone()], fast_spans.to_vec()].concat(),
+            mode_index: 0,
+            fast_index: Some(2),
+        },
+        BadgeSpans {
+            spans: vec![mode_span],
+            mode_index: 0,
+            fast_index: None,
+        },
+    ];
+    ladder
+        .into_iter()
+        .find(|candidate| spans_width(&candidate.spans) <= budget)
+}
 
-    for keep in [spans.len(), through_fast, through_mode] {
-        if spans_width(&spans[..keep]) <= budget {
-            spans.truncate(keep);
-            return Some(spans);
-        }
-    }
-    None
+/// The badge as painted, plus where its two clickable parts sit inside it. The
+/// separators and the cost shift those positions around, and only the ladder
+/// that picked the candidate knows which rung it settled on.
+struct BadgeSpans {
+    spans: Vec<PaintSpan>,
+    mode_index: usize,
+    fast_index: Option<usize>,
 }
 
 fn separator_span() -> PaintSpan {
@@ -2405,6 +4098,21 @@ fn spans_width(spans: &[PaintSpan]) -> usize {
         .iter()
         .map(|span| UnicodeWidthStr::width(span.text.as_str()))
         .sum()
+}
+
+/// The status line's colour for a reasoning effort, shared with the effort
+/// slider so a tier reads the same wherever it appears. `None` for ids the
+/// palette has no ramp entry for.
+fn effort_tone(effort: &str) -> Option<Tone> {
+    Some(match effort {
+        "low" => Tone::EffortLow,
+        "medium" => Tone::EffortMedium,
+        "high" => Tone::EffortHigh,
+        "xhigh" => Tone::EffortXHigh,
+        "max" => Tone::EffortMax,
+        "ultra" => Tone::EffortUltra,
+        _ => return None,
+    })
 }
 
 fn rule_gap(width: usize) -> PaintSpan {
@@ -2466,44 +4174,144 @@ fn compact_right(text: &str, max_width: usize) -> String {
     output
 }
 
-fn print_line(out: &mut Stdout, line: &PaintLine) -> Result<()> {
+fn print_line(out: &mut impl Write, line: &PaintLine) -> Result<()> {
+    print_line_with_selection(out, line, None, None)
+}
+
+/// Whether a piece of the row painted across `start..end` falls under the
+/// hovered columns. Every clickable span was measured off the painted row, so a
+/// piece is either inside the highlight or outside it, never half-lit.
+fn set_piece_style(
+    out: &mut impl Write,
+    background: Option<Rgb>,
+    tone: Tone,
+    bold: bool,
+) -> Result<()> {
+    queue!(
+        out,
+        SetBackgroundColor(background.map_or(Color::Reset, rgb_color))
+    )?;
+    set_tone(out, tone)?;
+    if bold {
+        queue!(out, SetAttribute(Attribute::Bold))?;
+    }
+    Ok(())
+}
+
+/// Prints one run of a row, split where the hover highlight starts and stops. A
+/// run is not an all-or-nothing unit the way a selection block is: the highlight
+/// reaches a column past the text it belongs to, and the separator column it
+/// reaches into must light up by that one column and no further.
+fn print_hovered_chunks(
+    out: &mut impl Write,
+    text: &str,
+    column: &mut usize,
+    selected_columns: Option<&Range<usize>>,
+    hovered_columns: Option<&Range<usize>>,
+    tone: Tone,
+    bold: bool,
+    background: Option<Rgb>,
+) -> Result<()> {
+    if hovered_columns.is_none() {
+        set_piece_style(out, background, tone, bold)?;
+        return print_selected_chunks(out, text, column, selected_columns, tone, bold, background);
+    }
+
+    let hover_bg = theme::palette().hover_bg;
+    for chunk in selection_chunks(text, *column, hovered_columns.cloned()) {
+        let chunk_background = if chunk.selected {
+            Some(hover_bg)
+        } else {
+            background
+        };
+        set_piece_style(out, chunk_background, tone, bold)?;
+        print_selected_chunks(
+            out,
+            &chunk.text,
+            column,
+            selected_columns,
+            tone,
+            bold,
+            chunk_background,
+        )?;
+    }
+    Ok(())
+}
+
+/// The band a row carries all the way to the right edge. Word tones resolve to
+/// their row's band here: they mark a run *inside* an added/removed row, so the
+/// row they wrapped out of must still paint the same full-width tint.
+fn row_background(tone: Tone) -> Option<Rgb> {
     let palette = theme::palette();
-    let background = match line.tone {
-        Tone::UserPrompt => Some(palette.user_prompt_bg),
-        Tone::ModelChange => Some(palette.model_change_bg),
-        Tone::DiffAdded => Some(palette.diff_add_bg),
-        Tone::DiffRemoved => Some(palette.diff_remove_bg),
-        _ => None,
-    };
+    Some(match tone {
+        Tone::UserPrompt => palette.user_prompt_bg,
+        Tone::ModelChange => palette.model_change_bg,
+        Tone::DiffAdded | Tone::DiffAddedWord => palette.diff_add_bg,
+        Tone::DiffRemoved | Tone::DiffRemovedWord => palette.diff_remove_bg,
+        _ => return None,
+    })
+}
+
+/// The stronger tint a single run gets on top of its row's band, for the words a
+/// diff row actually changed.
+fn word_background(tone: Tone) -> Option<Rgb> {
+    let palette = theme::palette();
+    Some(match tone {
+        Tone::DiffAddedWord => palette.diff_add_word_bg,
+        Tone::DiffRemovedWord => palette.diff_remove_word_bg,
+        _ => return None,
+    })
+}
+
+fn print_line_with_selection(
+    out: &mut impl Write,
+    line: &PaintLine,
+    selected_columns: Option<Range<usize>>,
+    hovered_columns: Option<Range<usize>>,
+) -> Result<()> {
+    let background = row_background(line.tone);
     if let Some(background) = background {
         queue!(out, SetBackgroundColor(rgb_color(background)))?;
     }
-    set_tone(out, line.prefix_tone)?;
-    queue!(out, Print(&line.prefix))?;
-    set_tone(out, line.tone)?;
-    if line.bold {
-        queue!(out, SetAttribute(Attribute::Bold))?;
-    }
-    queue!(
+    let mut column = 0;
+    print_hovered_chunks(
         out,
-        Print(&line.text),
-        SetAttribute(Attribute::Reset),
-        ResetColor
+        &line.prefix,
+        &mut column,
+        selected_columns.as_ref(),
+        hovered_columns.as_ref(),
+        line.prefix_tone,
+        false,
+        word_background(line.prefix_tone).or(background),
     )?;
+    print_hovered_chunks(
+        out,
+        &line.text,
+        &mut column,
+        selected_columns.as_ref(),
+        hovered_columns.as_ref(),
+        line.tone,
+        line.bold,
+        word_background(line.tone).or(background),
+    )?;
+    queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
     for span in &line.tail {
         if span.tone == Tone::CopyJoin {
             continue;
         }
-        set_tone(out, span.tone)?;
-        if span.bold {
-            queue!(out, SetAttribute(Attribute::Bold))?;
-        }
-        queue!(
+        // A tail span inherits the row's band, so a wrapped diff row stays tinted
+        // to the right edge and its word tints keep landing on the right words.
+        print_hovered_chunks(
             out,
-            Print(&span.text),
-            SetAttribute(Attribute::Reset),
-            ResetColor
+            &span.text,
+            &mut column,
+            selected_columns.as_ref(),
+            hovered_columns.as_ref(),
+            span.tone,
+            span.bold,
+            word_background(span.tone).or(background),
         )?;
+        queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
     }
     if let Some(background) = background {
         queue!(
@@ -2512,6 +4320,76 @@ fn print_line(out: &mut Stdout, line: &PaintLine) -> Result<()> {
             Clear(ClearType::UntilNewLine),
             ResetColor
         )?;
+    }
+    Ok(())
+}
+
+/// Paints one run of a row, split where the drag selection starts and ends.
+///
+/// The highlight is one fixed block rather than reverse video. A reversed cell
+/// borrows whatever colours surround it, so the same drag came out charcoal on
+/// Dark, cream on Soft, and a different shade again over a user prompt or a
+/// diff row. Instead each theme names one selection tone — `selection_bg` —
+/// carried over from DevezCode's Claude Code themes, and the whole drag gets
+/// that block no matter what it sits on.
+fn print_selected_chunks(
+    out: &mut impl Write,
+    text: &str,
+    column: &mut usize,
+    selected_columns: Option<&Range<usize>>,
+    tone: Tone,
+    bold: bool,
+    background: Option<Rgb>,
+) -> Result<()> {
+    let Some(selected_columns) = selected_columns else {
+        queue!(out, Print(text))?;
+        *column += UnicodeWidthStr::width(text);
+        return Ok(());
+    };
+
+    let mut highlighted = false;
+    for chunk in selection_chunks(text, *column, Some(selected_columns.clone())) {
+        if chunk.selected != highlighted {
+            set_selection_style(out, chunk.selected, tone, bold, background)?;
+            highlighted = chunk.selected;
+        }
+        queue!(out, Print(chunk.text))?;
+    }
+    // The row's own colours have to be back in place before the caller prints
+    // its next run, or a selection that ends mid-row bleeds into the rest.
+    if highlighted {
+        set_selection_style(out, false, tone, bold, background)?;
+    }
+    *column += UnicodeWidthStr::width(text);
+    Ok(())
+}
+
+fn set_selection_style(
+    out: &mut impl Write,
+    selected: bool,
+    tone: Tone,
+    bold: bool,
+    background: Option<Rgb>,
+) -> Result<()> {
+    if selected {
+        // Text keeps its own colour inside the block, the way Codex paints it;
+        // `selection_text` only steps in for runs this theme's block would
+        // swallow.
+        let text = tone_rgb(tone).map_or_else(theme::selection_fg, theme::selection_text);
+        queue!(
+            out,
+            SetBackgroundColor(rgb_color(theme::selection_bg())),
+            SetForegroundColor(rgb_color(text))
+        )?;
+        return Ok(());
+    }
+    queue!(
+        out,
+        SetBackgroundColor(background.map_or(Color::Reset, rgb_color))
+    )?;
+    set_tone(out, tone)?;
+    if bold {
+        queue!(out, SetAttribute(Attribute::Bold))?;
     }
     Ok(())
 }
@@ -2531,52 +4409,80 @@ fn model_tone(model: &str) -> Option<Tone> {
     }
 }
 
-fn set_tone(out: &mut Stdout, tone: Tone) -> Result<()> {
+/// The colour a tone paints its text in, or `None` for the copy-join marker,
+/// which is never printed. Split out of `set_tone` so a selection can ask what
+/// a run would have looked like before deciding whether it survives the block.
+fn tone_rgb(tone: Tone) -> Option<Rgb> {
     let palette = theme::palette();
-    let color = match tone {
-        Tone::Plain => rgb_color(palette.foreground),
-        Tone::Muted | Tone::Thinking => rgb_color(palette.muted),
-        Tone::Accent => rgb_color(palette.accent),
-        Tone::User => rgb_color(palette.blue),
-        Tone::Success => rgb_color(palette.success),
-        Tone::Warning => rgb_color(palette.warning),
-        Tone::Error => rgb_color(palette.error),
-        Tone::Code => rgb_color(palette.code),
-        Tone::EffortLow => rgb_color(palette.status.effort_low),
-        Tone::EffortMedium => rgb_color(palette.status.effort_medium),
-        Tone::EffortHigh => rgb_color(palette.status.effort_high),
-        Tone::EffortXHigh => rgb_color(palette.status.effort_xhigh),
-        Tone::EffortMax => rgb_color(palette.status.effort_max),
-        Tone::Context => rgb_color(palette.status.context),
-        Tone::StatusText => rgb_color(palette.status.text),
-        Tone::StatusSeparator => rgb_color(palette.status.separator),
-        Tone::UserPrompt => rgb_color(palette.foreground),
-        Tone::ModelSol => rgb_color(palette.orange),
-        Tone::ModelTerra => rgb_color(palette.pink),
-        Tone::ModelLuna => rgb_color(palette.purple),
-        Tone::Model55 => rgb_color(palette.blue),
-        Tone::Border => rgb_color(palette.border),
-        Tone::Branch => rgb_color(palette.status.branch),
-        Tone::LimitFiveHour => rgb_color(palette.status.five_hour),
-        Tone::LimitWeekly => rgb_color(palette.status.weekly),
-        Tone::FastOn => rgb_color(palette.success),
-        Tone::FastOff => rgb_color(palette.muted),
-        Tone::ModelChange => rgb_color(palette.foreground),
-        Tone::SyntaxComment => rgb_color(palette.syntax_comment),
-        Tone::SyntaxString => rgb_color(palette.syntax_string),
-        Tone::SyntaxKeyword => rgb_color(palette.syntax_keyword),
-        Tone::SyntaxNumber => rgb_color(palette.syntax_number),
-        Tone::SyntaxType => rgb_color(palette.syntax_type),
-        Tone::SyntaxFunction => rgb_color(palette.syntax_function),
-        Tone::InlineCode => rgb_color(palette.accent),
-        Tone::DiffAdded => rgb_color(palette.diff_add),
-        Tone::DiffRemoved => rgb_color(palette.diff_remove),
-        Tone::DiffHeader => rgb_color(palette.diff_header),
-        Tone::CopyJoin => Color::Reset,
+    Some(match tone {
+        Tone::Plain => palette.foreground,
+        Tone::Muted | Tone::Thinking | Tone::PlanDone => palette.muted,
+        Tone::Accent => palette.accent,
+        Tone::User => palette.blue,
+        Tone::Success => palette.success,
+        Tone::Warning => palette.warning,
+        Tone::Error => palette.error,
+        Tone::Code => palette.code,
+        Tone::EffortLow => palette.status.effort_low,
+        Tone::EffortMedium => palette.status.effort_medium,
+        Tone::EffortHigh => palette.status.effort_high,
+        Tone::EffortXHigh => palette.status.effort_xhigh,
+        Tone::EffortMax => palette.status.effort_max,
+        Tone::EffortUltra => palette.status.effort_ultra,
+        Tone::Context => palette.status.context,
+        Tone::StatusText => palette.status.text,
+        Tone::StatusSeparator => palette.status.separator,
+        Tone::UserPrompt => palette.foreground,
+        Tone::ModelSol => palette.orange,
+        Tone::ModelTerra => palette.pink,
+        Tone::ModelLuna => palette.purple,
+        Tone::Model55 => palette.blue,
+        Tone::Border => palette.border,
+        Tone::Branch => palette.status.branch,
+        Tone::LimitFiveHour => palette.status.five_hour,
+        Tone::LimitWeekly => palette.status.weekly,
+        Tone::FastOn => palette.success,
+        Tone::FastOff => palette.muted,
+        Tone::ModelChange => palette.foreground,
+        Tone::SyntaxComment => palette.syntax_comment,
+        Tone::SyntaxString => palette.syntax_string,
+        Tone::SyntaxKeyword => palette.syntax_keyword,
+        Tone::SyntaxNumber => palette.syntax_number,
+        Tone::SyntaxType => palette.syntax_type,
+        Tone::SyntaxFunction => palette.syntax_function,
+        Tone::InlineCode => palette.accent,
+        // Claude Code paints diff rows with the default text colour and lets the
+        // green/red background carry the added/removed signal, so the text stays
+        // as readable as the rest of the transcript.
+        Tone::DiffAdded | Tone::DiffRemoved | Tone::DiffAddedWord | Tone::DiffRemovedWord => {
+            palette.foreground
+        }
+        Tone::DiffHeader => palette.diff_header,
+        Tone::Shimmer(level) => blend(palette.accent, palette.foreground, level),
+        Tone::CopyJoin => return None,
+    })
+}
+
+/// `level` of `0` is `from`, `255` is `to`, everything between is a straight
+/// per-channel mix — enough for a shimmer that reads as one smooth gradient.
+fn blend(from: Rgb, to: Rgb, level: u8) -> Rgb {
+    let mix = |from: u8, to: u8| {
+        let from = f32::from(from);
+        (from + (f32::from(to) - from) * f32::from(level) / 255.0).round() as u8
     };
-    queue!(out, SetForegroundColor(color))?;
+    Rgb(mix(from.0, to.0), mix(from.1, to.1), mix(from.2, to.2))
+}
+
+fn set_tone(out: &mut impl Write, tone: Tone) -> Result<()> {
+    queue!(
+        out,
+        SetForegroundColor(tone_rgb(tone).map_or(Color::Reset, rgb_color))
+    )?;
     if tone == Tone::Thinking {
         queue!(out, SetAttribute(Attribute::Italic))?;
+    }
+    if tone == Tone::PlanDone {
+        queue!(out, SetAttribute(Attribute::CrossedOut))?;
     }
     Ok(())
 }
@@ -2592,6 +4498,144 @@ fn rgb_color(color: Rgb) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fullscreen_entry_preserves_alternate_scroll_order() {
+        let mut output = Vec::new();
+
+        enter_fullscreen(&mut output).expect("fullscreen command");
+
+        assert_eq!(
+            output, b"\x1b[?1049h\x1b[?1007s\x1b[?1007l",
+            "enter alternate screen, save alternate-scroll mode, then disable it"
+        );
+    }
+
+    #[test]
+    fn fullscreen_exit_restores_alternate_scroll_before_leaving() {
+        let mut output = Vec::new();
+
+        leave_fullscreen(&mut output).expect("fullscreen exit command");
+
+        assert_eq!(output, b"\x1b[?1007r\x1b[?1049l");
+    }
+
+    #[test]
+    fn a_selection_paints_its_theme_block() {
+        // The block has to be read while this theme is still current: the theme
+        // is global and the test suite runs in parallel, so a sibling test can
+        // flip it out from under us between the paint and the assertion.
+        let selected_bytes = |kind| {
+            theme::set_current(kind);
+            let mut output = Vec::new();
+            print_line_with_selection(&mut output, &PaintLine::plain("abcdef"), Some(1..3), None)
+                .expect("selection paint");
+            let bg = theme::selection_bg();
+            (
+                String::from_utf8(output).expect("utf-8 escape sequences"),
+                bg,
+            )
+        };
+
+        for kind in ThemeKind::ALL {
+            let (painted, bg) = selected_bytes(kind);
+            let block = format!("\x1b[48;2;{};{};{}m", bg.0, bg.1, bg.2);
+            let selected = painted
+                .split_once(&block)
+                .map(|(_, rest)| rest)
+                .unwrap_or_else(|| panic!("{kind:?} must paint its own block: {painted:?}"));
+            assert!(
+                selected.contains("bc"),
+                "{kind:?} must highlight exactly the dragged cells: {painted:?}"
+            );
+            assert!(
+                !painted.contains("\x1b[7m"),
+                "{kind:?} must not fall back to reverse video: {painted:?}"
+            );
+        }
+        theme::set_current(ThemeKind::Dark);
+    }
+
+    #[test]
+    fn bash_hover_background_starts_after_the_disclosure_arrow() {
+        theme::set_current(ThemeKind::Dark);
+        let block = Block::new(BlockKind::Tool, "Shell · cargo test", "");
+        let line = block_lines(&block, 80).remove(0);
+        let mut output = Vec::new();
+
+        let hovered = Renderer::hover_columns(&line, line.tool_heading, None);
+        print_line_with_selection(&mut output, &line, None, hovered).expect("hover paint");
+        let painted = String::from_utf8(output).expect("utf-8 escapes");
+        let hover = theme::palette().hover_bg;
+        let hover_escape = format!("\x1b[48;2;{};{};{}m", hover.0, hover.1, hover.2);
+
+        let arrow = painted.find("▸ ").expect("arrow");
+        let background = painted.find(&hover_escape).expect("hover background");
+        let title = painted.find("Shell").expect("title");
+        assert!(arrow < background);
+        assert!(background < title);
+    }
+
+    #[test]
+    fn selected_text_stays_legible_on_every_theme_and_tone() {
+        for kind in ThemeKind::ALL {
+            theme::set_current(kind);
+            for tone in [
+                Tone::Plain,
+                Tone::Muted,
+                Tone::Accent,
+                Tone::Success,
+                Tone::Error,
+                Tone::SyntaxKeyword,
+                Tone::SyntaxComment,
+                Tone::DiffAdded,
+                Tone::DiffRemoved,
+            ] {
+                let color = tone_rgb(tone).expect("a printable tone has a colour");
+                let painted = theme::selection_text(color);
+                assert!(
+                    theme::contrast_ratio(painted, theme::selection_bg()) >= 4.5,
+                    "{kind:?}/{tone:?} is unreadable inside the selection block"
+                );
+            }
+        }
+        theme::set_current(ThemeKind::Dark);
+    }
+
+    #[test]
+    fn a_selection_keeps_colours_the_block_can_carry() {
+        theme::set_current(ThemeKind::Dark);
+        let palette = theme::palette();
+
+        // Dark's own foreground is bright enough to survive the blue wash,
+        // so the drag must not flatten it the way reverse video would.
+        assert_eq!(
+            theme::selection_text(palette.foreground),
+            palette.foreground
+        );
+        assert_eq!(
+            theme::selection_text(theme::MINIMAL.foreground),
+            theme::selection_fg(),
+            "near-black light-theme text has to step aside for the fallback"
+        );
+    }
+
+    #[test]
+    fn each_theme_tints_its_selection_differently() {
+        // Read straight off the palettes, not through the global current theme:
+        // sibling tests flip that while this one runs.
+        let blocks = [
+            theme::MINIMAL.selection_bg,
+            theme::SOFT.selection_bg,
+            theme::DARK.selection_bg,
+        ];
+
+        for (index, block) in blocks.iter().enumerate() {
+            for other in &blocks[index + 1..] {
+                assert_ne!(block, other, "two themes share one selection tone");
+            }
+        }
+    }
 
     #[test]
     fn docking_adds_space_before_the_composer() {
@@ -2652,8 +4696,9 @@ mod tests {
         assert!(prompt_rows.len() > 1);
         assert!(!rows[0].text.contains("Message"));
         assert!(rows[0].text.chars().all(|ch| ch == '─'));
-        assert!(rows[0].tone == Tone::Muted);
-        assert!(rows.last().is_some_and(|row| row.tone == Tone::Muted));
+        // Both rules are drawn in the same border colour the welcome card uses.
+        assert!(rows[0].tone == Tone::Border);
+        assert!(rows.last().is_some_and(|row| row.tone == Tone::Border));
         assert_eq!(prompt_rows[0].prefix, "> ");
         assert_eq!(prompt_rows[1].prefix, "  ");
         assert!(!rows[0].text.contains(['╭', '╮', '╰', '╯']));
@@ -2852,6 +4897,132 @@ mod tests {
         );
     }
 
+    /// The gutter is what makes a patch readable: `@@` headers are spent on line
+    /// numbers, and each row lands under the number it has in the file.
+    #[test]
+    fn file_change_lines_number_the_patch_from_its_hunk_headers() {
+        let lines = block_lines(
+            &Block::new(
+                BlockKind::FileChange,
+                r"Update(src\main.rs)",
+                "Added 2 lines, removed 1 line\n@@ -83,3 +90,4 @@\n context\n-let old = 1;\n+let new = 2;\n+let extra = 3;",
+            ),
+            80,
+        );
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                std::iter::once(line.prefix.as_str())
+                    .chain(std::iter::once(line.text.as_str()))
+                    .chain(line.tail.iter().map(|span| span.text.as_str()))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered,
+            [
+                r"● Update(src\main.rs)",
+                "  ⎿ Added 2 lines, removed 1 line",
+                "      90   context",
+                "      84 - let old = 1;",
+                "      91 + let new = 2;",
+                "      92 + let extra = 3;",
+            ]
+        );
+        // The counts stand out of the dim summary row.
+        assert!(
+            lines[1]
+                .tail
+                .iter()
+                .any(|span| span.text == "2" && span.tone == Tone::Plain && span.bold)
+        );
+        assert_eq!(lines[1].text, "Added ");
+        assert_eq!(lines[1].tone, Tone::Muted);
+        // `print_line` paints the row tint from the tone, so these carry the
+        // full-width red and green bands.
+        assert_eq!(lines[3].tone, Tone::DiffRemoved);
+        assert_eq!(lines[3].prefix_tone, Tone::DiffRemoved);
+        assert_eq!(lines[4].tone, Tone::DiffAdded);
+        assert_eq!(lines[2].tone, Tone::Plain);
+        assert_eq!(lines[2].prefix_tone, Tone::Muted);
+    }
+
+    /// A rewritten line says more than "this row changed": the words that
+    /// actually moved carry a stronger tint, and the words the two rows share are
+    /// left on the row's own band.
+    #[test]
+    fn file_change_lines_tint_the_words_a_row_rewrote() {
+        let lines = block_lines(
+            &Block::new(
+                BlockKind::FileChange,
+                r"Update(src\main.rs)",
+                "Added 1 line, removed 1 line\n@@ -1,1 +1,1 @@\n-let old = 1;\n+let new = 2;",
+            ),
+            80,
+        );
+        let spans = |line: &PaintLine| {
+            std::iter::once((line.text.clone(), line.tone))
+                .chain(line.tail.iter().map(|span| (span.text.clone(), span.tone)))
+                .filter(|(text, _)| !text.is_empty())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            spans(&lines[2]),
+            [
+                ("let ".to_owned(), Tone::DiffRemoved),
+                ("old".to_owned(), Tone::DiffRemovedWord),
+                (" = ".to_owned(), Tone::DiffRemoved),
+                ("1".to_owned(), Tone::DiffRemovedWord),
+                (";".to_owned(), Tone::DiffRemoved),
+            ]
+        );
+        assert_eq!(
+            spans(&lines[3]),
+            [
+                ("let ".to_owned(), Tone::DiffAdded),
+                ("new".to_owned(), Tone::DiffAddedWord),
+                (" = ".to_owned(), Tone::DiffAdded),
+                ("2".to_owned(), Tone::DiffAddedWord),
+                (";".to_owned(), Tone::DiffAdded),
+            ]
+        );
+        // The row still paints its full-width band, and only the changed words
+        // deepen it.
+        assert_eq!(row_background(Tone::DiffRemovedWord), row_background(Tone::DiffRemoved));
+        assert!(word_background(Tone::DiffRemovedWord).is_some());
+        assert!(word_background(Tone::DiffRemoved).is_none());
+    }
+
+    /// Two lines that merely sit next to each other in a hunk are not a rewrite of
+    /// each other, and tinting words they happen to share would invent an edit.
+    #[test]
+    fn word_diff_leaves_unrelated_rows_alone() {
+        assert!(word_diff("let total = sum(values);", "return None;").is_none());
+        // Nothing in common to leave untinted is the row band's job, not a word's.
+        assert!(word_diff("alpha", "beta").is_none());
+    }
+
+    /// A sweeping refactor must not push the rest of the turn off screen.
+    #[test]
+    fn file_change_lines_count_rows_past_the_cap() {
+        let body = ["Added 80 lines, removed 0 lines", "@@ -1,0 +1,80 @@"]
+            .into_iter()
+            .map(str::to_owned)
+            .chain((1..=80).map(|n| format!("+row {n}")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = block_lines(&Block::new(BlockKind::FileChange, "Update(a.rs)", body), 80);
+
+        // Heading, summary, the capped rows, then the count.
+        assert_eq!(lines.len(), FILE_CHANGE_ROWS + 3);
+        assert_eq!(
+            lines.last().expect("a count row").text,
+            format!("… +{} lines", 80 - FILE_CHANGE_ROWS)
+        );
+    }
+
     /// Summaries end with `[file](path:line)` links; the raw markdown used to wrap
     /// mid-path across two rows, so the label — plus the line number — is all we keep.
     #[test]
@@ -2889,9 +5060,10 @@ mod tests {
     }
 
     /// The notice used to share the composer rule with the permission badge; it now
-    /// owns the row directly above it so neither has to be squeezed.
+    /// owns the row directly above it so neither has to be squeezed, and it sits
+    /// flush against the rule so it reads as a label on it.
     #[test]
-    fn transient_notice_sits_on_its_own_row_above_the_composer_rule() {
+    fn transient_notice_sits_flush_on_the_composer_rule() {
         let editor = Editor::default();
         let frame = normal_frame(
             &[],
@@ -2902,7 +5074,7 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
-                composer_notice: Some("Apps refreshed".to_owned()),
+                composer_notice: Some("Copied 12 chars to clipboard".to_owned()),
                 composer_mode: None,
             },
             80,
@@ -2911,12 +5083,166 @@ mod tests {
         let notice = frame
             .lines
             .iter()
-            .position(|line| line.text == "Apps refreshed")
+            .position(|line| line.text == "Copied 12 chars to clipboard")
             .expect("notice row");
-        assert_eq!(frame.lines[notice].tone, Tone::Success);
-        assert!(frame.lines[notice + 1] == PaintLine::blank());
-        assert!(!frame.lines[notice + 2].text.is_empty());
-        assert!(frame.lines[notice + 2].text.chars().all(|ch| ch == '─'));
+        assert_eq!(
+            frame.lines[notice].tone,
+            Tone::Accent,
+            "notice is off-theme"
+        );
+        let rule = &frame.lines[notice + 1];
+        assert!(
+            !rule.text.is_empty() && rule.text.chars().all(|ch| ch == '─'),
+            "the composer rule should follow with no blank between"
+        );
+    }
+
+    #[test]
+    fn a_scrolling_window_always_contains_the_selection() {
+        // Shorter than the window: everything shows, wherever the selection is.
+        assert_eq!(visible_window(Some(0), 4, 6), 0..4);
+        assert_eq!(visible_window(Some(3), 4, 6), 0..4);
+        assert_eq!(visible_window(None, 4, 6), 0..4);
+        assert_eq!(visible_window(Some(0), 0, 6), 0..0);
+
+        // Longer: the window holds still until the selection would leave it,
+        // and it stays full at the end of the list instead of shrinking.
+        assert_eq!(visible_window(Some(0), 12, 6), 0..6);
+        assert_eq!(visible_window(Some(2), 12, 6), 0..6);
+        assert_eq!(visible_window(Some(3), 12, 6), 1..7);
+        assert_eq!(visible_window(Some(11), 12, 6), 6..12);
+
+        for len in [1usize, 5, 6, 7, 20, 100] {
+            for rows in [1usize, 6, 9] {
+                for selected in 0..len {
+                    let window = visible_window(Some(selected), len, rows);
+                    assert!(
+                        window.contains(&selected),
+                        "len {len} rows {rows}: {selected} outside {window:?}"
+                    );
+                    assert_eq!(window.len(), rows.min(len), "len {len} rows {rows}");
+                    assert!(window.end <= len);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_command_dock_scrolls_to_keep_the_selection_visible() {
+        let dock = |selected: usize| {
+            (0..12)
+                .map(|index| SuggestionView {
+                    command: format!("/cmd{index}"),
+                    description: "does a thing".to_owned(),
+                    selected: index == selected,
+                    category: None,
+                    panel_title: "Commands",
+                    hint: None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for selected in [0usize, 5, 9, 11] {
+            let suggestions = dock(selected);
+            let painted = suggestion_lines(&suggestions, 80)
+                .iter()
+                .map(painted)
+                .collect::<Vec<_>>();
+
+            let row = painted
+                .iter()
+                .find(|line| line.contains(&format!("/cmd{selected} ")))
+                .unwrap_or_else(|| panic!("selection {selected} fell off the dock"));
+            assert!(
+                row.contains('❯'),
+                "selection {selected} is on screen but unmarked"
+            );
+        }
+    }
+
+    /// A notice appearing must not change the frame height: it claims the spacer
+    /// row above the composer rather than stacking on top of it.
+    #[test]
+    fn transient_notice_does_not_push_the_transcript_up_a_row() {
+        let editor = Editor::default();
+        let frame = |live: &[Block], notice: Option<&str>| {
+            normal_frame(
+                live,
+                &editor,
+                None,
+                &[],
+                None,
+                StatusArea {
+                    fallback: String::new(),
+                    line: None,
+                    composer_notice: notice.map(str::to_owned),
+                    composer_mode: None,
+                },
+                80,
+            )
+        };
+
+        // Both the inline case (live blocks above the composer) and the
+        // fullscreen one, where the transcript has already been committed and
+        // the live frame is nothing but the composer.
+        let with_block = vec![Block::new(BlockKind::Assistant, "Codex", "done")];
+        for live in [&[][..], &with_block[..]] {
+            let bare = frame(live, None);
+            let noticed = frame(live, Some("Copied 12 chars to clipboard"));
+
+            assert_eq!(
+                noticed.lines.len(),
+                bare.lines.len(),
+                "the notice added a row instead of taking the reserved one"
+            );
+            assert_eq!(
+                noticed.cursor_line, bare.cursor_line,
+                "the composer moved when the notice appeared"
+            );
+        }
+
+        // A notice too long for the terminal folds rather than growing the frame.
+        let long = "Copied ".repeat(40);
+        assert_eq!(
+            frame(&[], Some(&long)).lines.len(),
+            frame(&[], None).lines.len(),
+            "a long notice wrapped onto a second row"
+        );
+    }
+
+    #[test]
+    fn recalled_history_labels_the_composer_rule_with_its_position() {
+        let mut editor = Editor::default();
+        for prompt in ["first", "second"] {
+            editor.set_text(prompt);
+            editor.take_for_submit();
+        }
+        let status = || StatusArea {
+            fallback: String::new(),
+            line: None,
+            composer_notice: None,
+            composer_mode: None,
+        };
+
+        let bare = normal_frame(&[], &editor, None, &[], None, status(), 80);
+        assert!(
+            bare.lines
+                .iter()
+                .all(|line| !painted(line).starts_with("── ")),
+            "an unrecalled composer should carry no label"
+        );
+
+        editor.history_previous();
+        let recalled = normal_frame(&[], &editor, None, &[], None, status(), 80);
+
+        assert_eq!(editor.text(), "second");
+        assert!(
+            recalled
+                .lines
+                .iter()
+                .any(|line| painted(line).starts_with("── 2/2 ─")),
+            "the composer rule should show the history position"
+        );
     }
 
     /// Activity is pinned to the composer, so it stays visible while the model works.
@@ -2928,7 +5254,7 @@ mod tests {
             &editor,
             None,
             &[],
-            Some("✶ Working… 2s · Esc to interrupt"),
+            Some("✶ Working (2s • esc to interrupt)"),
             StatusArea {
                 fallback: String::new(),
                 line: None,
@@ -2941,13 +5267,91 @@ mod tests {
         let activity = frame
             .lines
             .iter()
-            .position(|line| line.text.contains("Working…"))
+            .position(|line| painted_line_text(line).contains("Working"))
             .expect("activity row");
         assert_eq!(frame.lines[activity].tone, Tone::Accent);
         // One blank row separates the activity line from the composer rule.
         assert!(frame.lines[activity + 1] == PaintLine::blank());
         assert!(!frame.lines[activity + 2].text.is_empty());
         assert!(frame.lines[activity + 2].text.chars().all(|ch| ch == '─'));
+    }
+
+    /// The label shimmers like Codex's: a bright band that lights part of the word
+    /// at a time and slides along it, leaving the glyph and the elapsed tail alone.
+    #[test]
+    fn the_working_label_shimmers_along_its_characters() {
+        let lit = |phase: f32| {
+            let line = activity_lines("✶ Working (2s • esc to interrupt)", phase, 80)
+                .pop()
+                .expect("activity row");
+            assert_eq!(line.text, "✶ ", "the glyph keeps its own accent");
+            assert!(
+                line.tail.iter().any(|span| span.text == " (2s • esc to interrupt)"
+                    && span.tone == Tone::Accent),
+                "the bracketed tail is not animated"
+            );
+            line.tail
+                .iter()
+                .filter_map(|span| match span.tone {
+                    Tone::Shimmer(level) => Some((span.text.clone(), level)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let early = lit(0.35);
+        let late = lit(0.65);
+        assert_eq!(
+            early.iter().map(|(ch, _)| ch.as_str()).collect::<String>(),
+            "Working",
+            "every character of the label is animated, and only the label"
+        );
+        // Part of the word is lit at any moment, and the band has moved on later
+        // in the sweep — that movement is the animation.
+        assert!(early.iter().any(|(_, level)| *level > 0));
+        assert!(early.iter().any(|(_, level)| *level == 0));
+        assert_ne!(
+            early.iter().map(|(_, level)| *level).collect::<Vec<_>>(),
+            late.iter().map(|(_, level)| *level).collect::<Vec<_>>()
+        );
+        let brightest = |lit: &[(String, u8)]| {
+            lit.iter()
+                .enumerate()
+                .max_by_key(|(_, (_, level))| *level)
+                .map(|(index, _)| index)
+                .expect("a lit character")
+        };
+        assert!(
+            brightest(&early) < brightest(&late),
+            "the band travels left to right"
+        );
+    }
+
+    #[test]
+    fn completed_activity_label_is_static() {
+        let line = activity_lines("✓ Completed (1m 5s)", 0.5, 80)
+            .pop()
+            .expect("completion row");
+
+        assert!(
+            line.tail.iter().all(|span| !matches!(span.tone, Tone::Shimmer(_))),
+            "a completed turn must not look like it is still working"
+        );
+    }
+
+    /// A row too narrow for the whole line wraps plainly rather than shimmering
+    /// across two rows.
+    #[test]
+    fn a_cramped_activity_row_falls_back_to_plain_wrapping() {
+        let lines = activity_lines("✶ Working (2s • esc to interrupt)", 0.5, 12);
+
+        assert!(lines.len() > 1);
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| line.tail.iter())
+                .all(|span| !matches!(span.tone, Tone::Shimmer(_)))
+        );
     }
 
     fn rule_width(line: &PaintLine) -> usize {
@@ -2986,6 +5390,76 @@ mod tests {
         assert_eq!(line.tail[3].tone, Tone::FastOn);
     }
 
+    /// What the row answers with at the first column of `label`.
+    fn pick_on(line: &PaintLine, label: &str) -> Option<Pick> {
+        let text = painted(line);
+        let start = text.find(label)?;
+        line.pick
+            .as_ref()?
+            .at(UnicodeWidthStr::width(&text[..start]))
+    }
+
+    /// What the row answers with at the middle column of `label` — where a gap
+    /// between two clickable spans is genuinely nobody's, the columns either side
+    /// of it having been given away to the spans they touch.
+    fn pick_mid(line: &PaintLine, label: &str) -> Option<Pick> {
+        let text = painted(line);
+        let start = text.find(label)?;
+        let column = UnicodeWidthStr::width(&text[..start]) + UnicodeWidthStr::width(label) / 2;
+        line.pick.as_ref()?.at(column)
+    }
+
+    #[test]
+    fn the_two_composer_badges_answer_to_their_own_columns() {
+        let mode = test_mode("Full Access", ModeAccent::Danger, true);
+        let line = input_top_line(50, "", Some(&mode));
+        let text = painted(&line);
+
+        assert_eq!(pick_on(&line, "Full Access"), Some(Pick::PermissionMode));
+        assert_eq!(pick_on(&line, "Fast On"), Some(Pick::FastMode));
+        // The last column of the mode label still counts as the mode.
+        let mode_end = UnicodeWidthStr::width(&text[..text.find("Full Access").unwrap()]) + 10;
+        assert_eq!(
+            line.pick.as_ref().unwrap().at(mode_end),
+            Some(Pick::PermissionMode)
+        );
+        // The rule, and the middle of the separator between the badges, are not
+        // settings — the columns beside each badge belong to that badge.
+        assert_eq!(pick_mid(&line, " · "), None);
+        assert_eq!(line.pick.as_ref().unwrap().at(0), None);
+    }
+
+    /// The cost pushes both badges right and a recalled-history label pushes the
+    /// whole rule along with them, so the columns are only ever read off the
+    /// spans as painted.
+    #[test]
+    fn the_cost_and_a_rule_label_do_not_move_the_badges_out_from_under_the_click() {
+        let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
+        mode.cost = Some("$0.95".to_owned());
+        let line = input_top_line(70, "3/12", Some(&mode));
+
+        assert_eq!(pick_on(&line, "Full Access"), Some(Pick::PermissionMode));
+        assert_eq!(pick_on(&line, "Fast On"), Some(Pick::FastMode));
+        assert_eq!(pick_on(&line, "[$0.95]"), None);
+        assert_eq!(pick_on(&line, "3/12"), None);
+    }
+
+    /// A rule too narrow for the fast flag drops it; the mode that survives keeps
+    /// answering, and nothing claims the columns the flag would have taken.
+    #[test]
+    fn a_dropped_fast_flag_leaves_only_the_mode_clickable() {
+        let mode = test_mode("Full Access", ModeAccent::Danger, true);
+        let line = input_top_line(24, "", Some(&mode));
+
+        assert!(!painted(&line).contains("Fast"));
+        assert_eq!(pick_on(&line, "Full Access"), Some(Pick::PermissionMode));
+        assert_eq!(
+            line.pick.as_ref().unwrap().0.len(),
+            1,
+            "only the mode is clickable"
+        );
+    }
+
     #[test]
     fn fast_off_is_toned_down_beside_the_permission_mode() {
         let mode = test_mode("Default", ModeAccent::Safe, false);
@@ -3002,7 +5476,7 @@ mod tests {
     }
 
     #[test]
-    fn estimated_cost_rides_beside_the_permission_mode() {
+    fn estimated_cost_leads_the_badge() {
         let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
         mode.cost = Some("$0.95".to_owned());
         let line = input_top_line(60, "", Some(&mode));
@@ -3017,15 +5491,18 @@ mod tests {
             texts,
             [
                 "  ",
+                "[$0.95]",
+                " · ",
                 "Full Access",
                 " · ",
                 "Fast On",
-                " · ",
-                "$0.95",
                 " ",
                 "──"
             ]
         );
+        assert_eq!(line.tail[1].tone, Tone::Plain);
+        assert_eq!(line.tail[3].tone, Tone::Warning);
+        assert_eq!(line.tail[5].tone, Tone::FastOn);
     }
 
     /// The cost is the first thing to go: it is the least load-bearing segment.
@@ -3075,6 +5552,9 @@ mod tests {
             command: "/model".to_owned(),
             description: "Switch model".to_owned(),
             selected: true,
+            category: None,
+            panel_title: "Commands",
+            hint: None,
         }];
         let mut frame = normal_frame(
             &[],
@@ -3097,12 +5577,89 @@ mod tests {
             .iter()
             .position(|line| line.text.starts_with('╰'))
             .expect("suggestion panel bottom");
-        assert!(
-            frame.lines[suggestion_end + 1]
-                .text
-                .chars()
-                .all(|ch| ch == '─')
+        // One blank row keeps the panel off the composer rule; nothing else may
+        // come between them.
+        assert!(frame.lines[suggestion_end + 1] == PaintLine::blank());
+        let rule = &frame.lines[suggestion_end + 2];
+        assert!(!rule.text.is_empty() && rule.text.chars().all(|ch| ch == '─'));
+    }
+
+    /// Whatever the composer is docked under, the row directly above its rule is
+    /// blank — the transient notice is the only thing allowed to fill it.
+    #[test]
+    fn the_row_above_the_composer_stays_blank() {
+        let editor = Editor::default();
+        let live = vec![Block::new(BlockKind::Assistant, "Codex", "done")];
+        let frame = normal_frame(
+            &live,
+            &editor,
+            None,
+            &[],
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
         );
+
+        let rule = frame
+            .lines
+            .iter()
+            .position(|line| !line.text.is_empty() && line.text.chars().all(|ch| ch == '─'))
+            .expect("composer rule");
+        assert!(rule > 0);
+        assert!(frame.lines[rule - 1] == PaintLine::blank());
+        assert!(
+            frame.lines[rule - 2] != PaintLine::blank(),
+            "exactly one blank row, not a growing gap"
+        );
+    }
+
+    #[test]
+    fn activity_sits_above_slash_suggestions() {
+        let mut editor = Editor::default();
+        editor.set_text("/");
+        let suggestions = vec![SuggestionView {
+            command: "/model".to_owned(),
+            description: "Switch model".to_owned(),
+            selected: true,
+            category: None,
+            panel_title: "Commands",
+            hint: None,
+        }];
+        let frame = normal_frame(
+            &[],
+            &editor,
+            None,
+            &suggestions,
+            Some("✶ Working"),
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+
+        let activity = frame
+            .lines
+            .iter()
+            .position(|line| painted_line_text(line).contains("Working"))
+            .expect("activity row");
+        let suggestions = frame
+            .lines
+            .iter()
+            .position(|line| line.text == "Commands ")
+            .expect("suggestions header");
+
+        assert!(activity > 0);
+        assert!(frame.lines[activity - 1] == PaintLine::blank());
+        assert!(frame.lines[activity + 1] == PaintLine::blank());
+        assert!(activity < suggestions);
     }
 
     #[test]
@@ -3125,26 +5682,190 @@ mod tests {
     }
 
     #[test]
-    fn tool_output_keeps_five_rows_and_counts_the_rest() {
+    fn live_output_groups_have_exactly_one_blank_row_between_them() {
+        let editor = Editor::default();
+        let live = vec![
+            Block::new(BlockKind::Reasoning, "Thinking…", "working"),
+            Block::new(BlockKind::Tool, "Shell · first", ""),
+            Block::new(BlockKind::Tool, "Shell · second", ""),
+            Block::new(BlockKind::Assistant, "Codex", "done"),
+        ];
+        let frame = normal_frame(
+            &live,
+            &editor,
+            None,
+            &[],
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+
+        let rows = frame.lines[..8]
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                "working",
+                "",
+                "Shell · first",
+                "",
+                "Shell · second",
+                "",
+                "done",
+                ""
+            ]
+        );
+    }
+
+    fn text_rows(count: usize, label: &str) -> Vec<PaintLine> {
+        (0..count)
+            .map(|n| PaintLine {
+                prefix: String::new(),
+                prefix_tone: Tone::Plain,
+                text: format!("{label}{n}"),
+                tone: Tone::Plain,
+                bold: false,
+                tool_heading: None,
+                pick: None,
+                tail: Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_composer_holds_the_bottom_rows_at_every_scroll_position() {
+        let transcript = text_rows(100, "t");
+        let live = text_rows(3, "live");
+        let rows = 20;
+        let view_rows = rows - live.len();
+
+        // Newest end, mid-history and oldest end: the live frame is the last
+        // three rows of the screen in all of them, which is the whole point.
+        for start in [0, 40, transcript.len() - view_rows] {
+            let (screen, cursor_line) =
+                compose_screen(&transcript, live.clone(), view_rows, start, 1);
+
+            assert_eq!(screen.len(), rows);
+            let painted = screen[view_rows..]
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(painted, ["live0", "live1", "live2"]);
+            assert_eq!(cursor_line, view_rows + 1);
+            // ...and the transcript above it is the window we asked for.
+            assert_eq!(screen[0].text, format!("t{start}"));
+        }
+    }
+
+    #[test]
+    fn the_slack_goes_to_the_live_frame_not_above_it() {
+        // A short transcript must not hand its leftover rows to the top of the
+        // screen: that would float the whole live frame — welcome card included —
+        // down onto the composer. The live frame absorbs them instead.
+        assert_eq!(split_rows(30, 10, 2), (2, 28));
+        assert_eq!(split_rows(30, 10, 0), (0, 30));
+        // Once the transcript can fill its share, the split stops moving.
+        assert_eq!(split_rows(30, 10, 100), (20, 10));
+        // A live frame taller than the screen takes all of it and gets trimmed.
+        assert_eq!(split_rows(20, 40, 100), (0, 20));
+    }
+
+    #[test]
+    fn the_welcome_card_stays_at_the_top_while_the_composer_reaches_the_bottom() {
+        // `dock_index` is what `fit_frame` pads at, so the welcome row above it
+        // holds still while the composer below it is pushed to the last row.
+        let mut frame = Frame {
+            lines: text_rows(1, "welcome")
+                .into_iter()
+                .chain(text_rows(2, "composer"))
+                .collect(),
+            cursor_line: 1,
+            cursor_col: 0,
+            show_cursor: true,
+            dock_index: 1,
+        };
+        let (view_rows, live_rows) = split_rows(10, frame.lines.len(), 0);
+        fit_frame(&mut frame, live_rows);
+        let (screen, cursor_line) =
+            compose_screen(&[], frame.lines, view_rows, 0, frame.cursor_line);
+
+        assert_eq!(screen.len(), 10);
+        assert_eq!(screen[0].text, "welcome0");
+        assert!(screen[1..8].iter().all(|line| *line == PaintLine::blank()));
+        assert_eq!(screen[8].text, "composer0");
+        assert_eq!(screen[9].text, "composer1");
+        assert_eq!(cursor_line, 8);
+    }
+
+    #[test]
+    fn scrolling_reports_movement_and_stops_at_both_ends() {
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.wrapped = text_rows(30, "t");
+
+        assert!(renderer.scroll(10));
+        assert_eq!(renderer.scroll_back, 10);
+        // Past the oldest row it clamps, and a wheel spun at the end is a no-op
+        // so the caller can skip the repaint.
+        assert!(renderer.scroll(100));
+        assert_eq!(renderer.scroll_back, 30);
+        assert!(!renderer.scroll(5));
+        assert!(renderer.scroll(-100));
+        assert_eq!(renderer.scroll_back, 0);
+        assert!(!renderer.scroll(-1));
+    }
+
+    #[test]
+    fn the_inline_renderer_leaves_scrolling_to_the_terminal() {
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Inline);
+        renderer.wrapped = text_rows(30, "t");
+
+        assert!(!renderer.scroll(10));
+        assert_eq!(renderer.scroll_back, 0);
+    }
+
+    #[test]
+    fn render_mode_parses_its_aliases_and_rejects_the_rest() {
+        for value in ["fullscreen", "FULL", " alt ", "pinned"] {
+            assert_eq!(RenderMode::parse(value), Some(RenderMode::Fullscreen));
+        }
+        for value in ["inline", "classic", "default", "main"] {
+            assert_eq!(RenderMode::parse(value), Some(RenderMode::Inline));
+        }
+        assert_eq!(RenderMode::parse("windowed"), None);
+    }
+
+    #[test]
+    fn non_bash_tool_output_keeps_the_last_five_rows_and_counts_the_rest() {
         let body = (1..=12)
             .map(|n| format!("line {n}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let lines = block_lines(&Block::new(BlockKind::Tool, "Bash · ls", body), 200);
+        let lines = block_lines(
+            &Block::new(BlockKind::Tool, "MCP · server › tool", body),
+            200,
+        );
 
         let texts = lines
             .iter()
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>();
+        // The tail is what matters: an exit message is printed last, not first.
         assert_eq!(
             texts,
             [
-                "Bash · ls",
-                "line 1",
-                "line 2",
-                "line 3",
-                "line 4",
-                "line 5",
+                "MCP · server › tool",
+                "line 8",
+                "line 9",
+                "line 10",
+                "line 11",
+                "line 12",
                 "… +7 lines"
             ]
         );
@@ -3152,14 +5873,235 @@ mod tests {
     }
 
     #[test]
-    fn short_tool_output_is_shown_whole_without_a_count() {
-        let lines = block_lines(&Block::new(BlockKind::Tool, "Bash · pwd", "/src\n"), 200);
+    fn one_long_tool_output_row_cannot_outgrow_the_row_budget() {
+        let body = format!("first\nsecond\n{}", "x".repeat(400));
+        let lines = block_lines(
+            &Block::new(BlockKind::Tool, "MCP · server › tool", body),
+            40,
+        );
+
+        // Two short rows plus three rows of the wrapped one: five painted rows,
+        // never the nine-odd rows the long line would occupy on its own.
+        assert_eq!(lines.len(), 1 + TOOL_OUTPUT_ROWS + 1);
+        assert_eq!(lines[1].text, "first");
+        assert_eq!(lines[2].text, "second");
+        // The clipped row stays counted as hidden — most of it never showed up.
+        assert_eq!(lines[6].text, "… +1 lines");
+    }
+
+    #[test]
+    fn blank_tool_output_rows_do_not_spend_the_row_budget() {
+        let body = "one\n\n\ntwo\n\nthree\n\n";
+        let lines = block_lines(
+            &Block::new(BlockKind::Tool, "MCP · server › tool", body),
+            200,
+        );
 
         let texts = lines
             .iter()
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(texts, ["Bash · pwd", "/src"]);
+        assert_eq!(texts, ["MCP · server › tool", "one", "two", "three"]);
+    }
+
+    #[test]
+    fn short_tool_output_is_shown_whole_without_a_count() {
+        let lines = block_lines(
+            &Block::new(BlockKind::Tool, "MCP · server › tool", "/src\n"),
+            200,
+        );
+
+        let texts = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["MCP · server › tool", "/src"]);
+    }
+
+    #[test]
+    fn bash_output_is_collapsed_to_its_heading_by_default() {
+        let block = Block::new(
+            BlockKind::Tool,
+            "Shell · rg TODO · exit 0 · 12ms",
+            "one\ntwo",
+        );
+        let lines = block_lines(&block, 200);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].prefix, "▸ ");
+        assert_eq!(lines[0].text, "Shell · rg TODO · exit 0 · 12ms");
+        assert_eq!(lines[0].tool_heading, Some(block.id()));
+    }
+
+    #[test]
+    fn expanded_bash_output_shows_every_non_empty_row() {
+        let block = Block::new(BlockKind::Tool, "Shell · rg TODO", "one\n\n two\nthree");
+        let lines = block_lines_with_expansion(&block, 200, true);
+        let texts = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(texts, ["Shell · rg TODO", "one", " two", "three"]);
+        assert_eq!(lines[0].prefix, "▾ ");
+    }
+
+    #[test]
+    fn every_wrapped_bash_heading_row_is_clickable() {
+        let block = Block::new(BlockKind::Tool, format!("Shell · {}", "x".repeat(100)), "");
+        let lines = block_lines(&block, 20);
+
+        assert!(lines.len() > 1);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.tool_heading == Some(block.id()))
+        );
+    }
+
+    #[test]
+    fn clicking_a_bash_heading_toggles_only_that_block() {
+        let first = Block::new(BlockKind::Tool, "Shell · first", "one");
+        let second = Block::new(BlockKind::Tool, "Shell · second", "two");
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.previous_lines = vec![
+            block_lines(&first, 80).remove(0),
+            PaintLine::blank(),
+            block_lines(&second, 80).remove(0),
+        ];
+
+        assert!(renderer.toggle_tool_at(0));
+        assert!(renderer.expanded_tools.contains(&first.id()));
+        assert!(!renderer.expanded_tools.contains(&second.id()));
+        assert!(!renderer.toggle_tool_at(1));
+    }
+
+    #[test]
+    fn bash_hover_tracks_only_the_heading_text_cells() {
+        let block = Block::new(BlockKind::Tool, "Shell · cargo test", "");
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.previous_lines = block_lines(&block, 80);
+
+        assert!(!renderer.hover_at(0, 0));
+        assert!(renderer.hover_at(2, 0));
+        assert_eq!(renderer.hovered_tool, Some(block.id()));
+        assert!(!renderer.hover_at(3, 0));
+        assert!(renderer.hover_at(79, 0));
+        assert_eq!(renderer.hovered_tool, None);
+    }
+
+    #[test]
+    fn inline_renderer_ignores_tool_heading_clicks() {
+        let block = Block::new(BlockKind::Tool, "Shell · first", "one");
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Inline);
+        renderer.previous_lines = block_lines(&block, 80);
+
+        assert!(!renderer.toggle_tool_at(0));
+        assert!(renderer.expanded_tools.is_empty());
+    }
+
+    #[test]
+    fn fullscreen_selection_copies_the_current_screen_and_preserves_clicks() {
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = vec![PaintLine::plain("abcdef")];
+
+        assert!(renderer.begin_selection(2, 0));
+        assert!(renderer.update_selection(4, 0));
+        assert_eq!(
+            renderer.finish_selection(4, 0),
+            SelectionResult::Copy("cde".to_owned())
+        );
+
+        assert!(renderer.begin_selection(3, 0));
+        assert_eq!(renderer.finish_selection(3, 0), SelectionResult::Click(3, 0));
+    }
+
+    #[test]
+    fn a_one_character_drag_is_left_unpainted() {
+        let lines = vec![PaintLine::plain("a한b"), PaintLine::plain("cd")];
+        let range = |start: (u16, u16), end: (u16, u16)| CellRange {
+            start: CellPosition {
+                column: start.0,
+                row: start.1,
+            },
+            end: CellPosition {
+                column: end.0,
+                row: end.1,
+            },
+        };
+
+        // One cell, and both cells of the same wide glyph: still one character.
+        assert!(!selection_is_worth_painting(range((0, 0), (0, 0)), &lines));
+        assert!(!selection_is_worth_painting(range((1, 0), (2, 0)), &lines));
+        // A second character brings the block in, whichever side it comes from.
+        assert!(selection_is_worth_painting(range((0, 0), (1, 0)), &lines));
+        assert!(selection_is_worth_painting(range((1, 0), (3, 0)), &lines));
+        // Across rows the characters still add up rather than counting rows.
+        assert!(selection_is_worth_painting(range((2, 0), (0, 1)), &lines));
+        assert!(!selection_is_worth_painting(
+            range((0, 0), (0, 1)),
+            &[PaintLine::blank(), PaintLine::plain("c")]
+        ));
+    }
+
+    #[test]
+    fn fullscreen_selection_is_cancelled_when_the_transcript_scrolls() {
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = vec![PaintLine::plain("abcdef")];
+        renderer.wrapped = text_rows(10, "line");
+
+        assert!(renderer.begin_selection(1, 0));
+        assert!(renderer.update_selection(3, 0));
+        assert!(renderer.scroll(1));
+        assert_eq!(renderer.finish_selection(3, 0), SelectionResult::None);
+    }
+
+    #[test]
+    fn inline_renderer_never_owns_text_selection() {
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Inline);
+        renderer.previous_lines = vec![PaintLine::plain("abcdef")];
+
+        assert!(!renderer.begin_selection(1, 0));
+        assert!(!renderer.update_selection(3, 0));
+        assert_eq!(renderer.finish_selection(3, 0), SelectionResult::None);
+    }
+
+    #[test]
+    fn fullscreen_selection_survives_only_while_selected_rows_are_stable() {
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = vec![PaintLine::plain("selected"), PaintLine::plain("status")];
+
+        assert!(renderer.begin_selection(0, 0));
+        assert!(renderer.update_selection(2, 0));
+        renderer.reconcile_selection(&[
+            PaintLine::plain("selected"),
+            PaintLine::plain("changed status"),
+        ]);
+        assert_eq!(
+            renderer.finish_selection(2, 0),
+            SelectionResult::Copy("sel".to_owned())
+        );
+
+        assert!(renderer.begin_selection(0, 0));
+        assert!(renderer.update_selection(2, 0));
+        renderer.reconcile_selection(&[PaintLine::plain("replaced"), PaintLine::plain("status")]);
+        assert_eq!(renderer.finish_selection(2, 0), SelectionResult::None);
+    }
+
+    #[test]
+    fn rewrapping_preserves_expanded_bash_output() {
+        let block = Block::new(BlockKind::Tool, "Shell · first", "one\ntwo");
+        let id = block.id();
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.history.push(block);
+        renderer.expanded_tools.insert(id);
+
+        renderer.rewrap(80);
+        assert!(renderer.wrapped.iter().any(|line| line.text == "one"));
+        renderer.rewrap(20);
+
+        assert!(renderer.expanded_tools.contains(&id));
+        assert!(renderer.wrapped.iter().any(|line| line.text == "two"));
     }
 
     #[test]
@@ -3200,6 +6142,45 @@ mod tests {
         assert!(lines[0].bold);
         assert_eq!(lines[1].prefix, "  ");
         assert_eq!(lines[1].text, "step one");
+    }
+
+    #[test]
+    fn plan_blocks_use_the_codex_checkbox_layout() {
+        let lines = block_lines(
+            &Block::new(
+                BlockKind::Plan,
+                "Updated Plan",
+                "└ why\n✔ first\n▸ second\n□ third",
+            ),
+            80,
+        );
+
+        assert_eq!(lines[0].prefix, "• ");
+        assert_eq!(lines[0].text, "Updated Plan");
+        assert!(lines[0].bold);
+        assert_eq!(lines[1].prefix, "  └ ");
+        assert_eq!(lines[1].text, "why");
+        assert_eq!(lines[2].prefix, "    ✔ ");
+        assert_eq!(lines[2].text, "first");
+        // Done steps are struck through, and the ✔ in the gutter is not.
+        assert_eq!(lines[2].tone, Tone::PlanDone);
+        assert_eq!(lines[2].prefix_tone, Tone::Muted);
+        // The step being worked on is the one row that is lit, not dimmed.
+        assert_eq!(lines[3].prefix, "    □ ");
+        assert_eq!(lines[3].text, "second");
+        assert_eq!(lines[3].tone, Tone::Accent);
+        assert!(lines[3].bold);
+        assert_eq!(lines[4].prefix, "    □ ");
+        assert_eq!(lines[4].text, "third");
+        assert_eq!(lines[4].tone, Tone::Muted);
+    }
+
+    #[test]
+    fn plan_blocks_without_steps_say_so() {
+        let lines = block_lines(&Block::new(BlockKind::Plan, "Updated Plan", "└ why"), 80);
+
+        assert_eq!(lines[1].text, "why");
+        assert_eq!(lines[2].text, "(no steps provided)");
     }
 
     #[test]
@@ -3247,6 +6228,39 @@ mod tests {
         assert_eq!(line.text, "--");
     }
 
+    /// The two readings the status line lets you change answer to a click; the
+    /// ones that only report — branch, context, limits — do not.
+    #[test]
+    fn the_model_and_effort_readings_are_the_only_clickable_status_spans() {
+        let line = status_line_row(
+            Some(StatusLineView {
+                branch: Some("main".to_owned()),
+                model: "GPT-5.6 Sol".to_owned(),
+                effort: "high".to_owned(),
+                context: Some("ctx: 45k/256k (18%)".to_owned()),
+                five_hour_percent: Some(12),
+                weekly_percent: Some(34),
+                notice: None,
+            }),
+            "",
+            120,
+        );
+
+        assert_eq!(pick_on(&line, "GPT-5.6 Sol"), Some(Pick::Model));
+        assert_eq!(pick_on(&line, "eff: high"), Some(Pick::EffortSetting));
+        assert_eq!(pick_on(&line, "main"), None);
+        assert_eq!(pick_on(&line, "ctx:"), None);
+        assert_eq!(pick_on(&line, "5h: 12%"), None);
+        assert_eq!(pick_on(&line, "week: 34%"), None);
+    }
+
+    /// Before the first status arrives the row is a plain fallback string, with no
+    /// model or effort on it to click.
+    #[test]
+    fn the_status_fallback_row_has_nothing_to_click() {
+        assert!(status_line_row(None, "starting…", 40).pick.is_none());
+    }
+
     fn painted(line: &PaintLine) -> String {
         let mut out = line.prefix.clone();
         out.push_str(&line.text);
@@ -3286,8 +6300,10 @@ mod tests {
                 "width {width}: rows are not all {expected} columns"
             );
             assert!(
-                lines.iter().any(|line| painted(line)
-                    .contains(&format!("v{}", crate::update::CURRENT_VERSION))),
+                lines
+                    .iter()
+                    .any(|line| painted(line)
+                        .contains(&format!("v{}", crate::update::CURRENT_VERSION))),
                 "width {width}: version missing from the headline"
             );
         }
@@ -3339,11 +6355,17 @@ mod tests {
                 command: "/model".to_owned(),
                 description: "Switch model and reasoning".to_owned(),
                 selected: true,
+                category: None,
+                panel_title: "Commands",
+                hint: None,
             },
             SuggestionView {
                 command: "/effort".to_owned(),
                 description: "Set reasoning effort".to_owned(),
                 selected: false,
+                category: None,
+                panel_title: "Commands",
+                hint: None,
             },
         ];
 
@@ -3367,6 +6389,118 @@ mod tests {
     }
 
     #[test]
+    fn suggestion_options_stay_on_one_physical_row() {
+        let suggestions = vec![SuggestionView {
+            command: "/renderer".to_owned(),
+            description: "Pin the composer\n…or use terminal scrollback".to_owned(),
+            selected: true,
+            category: None,
+            panel_title: "Commands",
+            hint: None,
+        }];
+
+        let lines = suggestion_lines(&suggestions, 40);
+        let option = lines
+            .iter()
+            .find(|line| line.text.contains("/renderer") || line.text.contains("scrollback"))
+            .expect("option row");
+
+        assert!(!painted(option).contains(['\r', '\n']));
+        assert_eq!(painted_width(option), panel_span(40));
+    }
+
+    #[test]
+    fn command_dock_keeps_the_command_name_when_the_description_overflows() {
+        let suggestions = vec![SuggestionView {
+            command: "/renderer".to_owned(),
+            description: "Pin the composer (fullscreen) or use terminal scrollback (inline)"
+                .to_owned(),
+            selected: false,
+            category: None,
+            panel_title: "Commands",
+            hint: None,
+        }];
+
+        let lines = suggestion_lines(&suggestions, 72);
+        let option = &lines[2];
+
+        assert!(painted(option).contains("/renderer"));
+        assert!(!painted(option).contains("…nderer"));
+        assert_eq!(painted_width(option), panel_span(72));
+    }
+
+    #[test]
+    fn command_dock_aligns_descriptions_after_long_command_names() {
+        let suggestions = vec![
+            SuggestionView {
+                command: "/model".to_owned(),
+                description: "Switch model".to_owned(),
+                selected: true,
+                category: None,
+                panel_title: "Commands",
+                hint: None,
+            },
+            SuggestionView {
+                command: "/reload-plugins".to_owned(),
+                description: "Apply plugin changes".to_owned(),
+                selected: false,
+                category: None,
+                panel_title: "Commands",
+                hint: None,
+            },
+        ];
+
+        let lines = suggestion_lines(&suggestions, 80);
+        let short_name_row = painted(&lines[2]);
+        let long_name_row = painted(&lines[3]);
+        let short_description = short_name_row
+            .find("Switch model")
+            .expect("short description");
+        let long_description = long_name_row
+            .find("Apply plugin changes")
+            .expect("long description");
+
+        assert_eq!(
+            UnicodeWidthStr::width(&short_name_row[..short_description]),
+            UnicodeWidthStr::width(&long_name_row[..long_description])
+        );
+    }
+
+    #[test]
+    fn completion_panel_uses_dynamic_heading_categories_and_hint() {
+        let suggestions = vec![
+            SuggestionView {
+                command: "review".to_owned(),
+                description: "Review a change".to_owned(),
+                selected: true,
+                category: Some("Skill".to_owned()),
+                panel_title: "Mentions",
+                hint: Some(
+                    "←/→ mode  ·  All Results  ·  Enter/Tab insert  ·  Esc close".to_owned(),
+                ),
+            },
+            SuggestionView {
+                command: "src/main.rs".to_owned(),
+                description: String::new(),
+                selected: false,
+                category: Some("File".to_owned()),
+                panel_title: "Mentions",
+                hint: None,
+            },
+        ];
+
+        let lines = suggestion_lines(&suggestions, 80)
+            .iter()
+            .map(painted)
+            .collect::<Vec<_>>();
+
+        assert!(lines[0].starts_with("╭─ Mentions "));
+        assert!(lines.iter().any(|line| line.contains("[Skill] review")));
+        assert!(lines.iter().any(|line| line.contains("[File]")));
+        assert!(lines.iter().any(|line| line.contains("All Results")));
+    }
+
+    #[test]
     fn panel_overlay_keeps_its_border_when_a_row_folds() {
         // An unbreakable run far wider than the terminal, like an OAuth URL.
         let long = "a".repeat(400);
@@ -3379,12 +6513,14 @@ mod tests {
                     selected: false,
                     muted: true,
                 }],
+                slider: None,
                 hint: "Esc cancel".to_owned(),
                 style: OverlayStyle::Panel,
                 input: None,
                 input_label: "",
                 input_placeholder: "",
             },
+            None,
             StatusArea {
                 fallback: String::new(),
                 line: None,
@@ -3435,6 +6571,56 @@ mod tests {
     }
 
     #[test]
+    fn compact_panel_keeps_each_option_on_one_physical_row() {
+        let live = [Block::new(BlockKind::Assistant, "Codex", "existing reply")];
+        let frame = overlay_frame(
+            &live,
+            OverlayView {
+                title: "Resume session".to_owned(),
+                lines: vec![OverlayLine {
+                    text: "4s ago    a very long session title\nC:\\work\\other".repeat(8),
+                    selected: true,
+                    muted: false,
+                }],
+                slider: None,
+                hint: "↑↓ navigate  Enter resume  Esc cancel".to_owned(),
+                style: OverlayStyle::CompactPanel,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            },
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            40,
+        );
+
+        let option_rows = frame
+            .lines
+            .iter()
+            .filter(|line| painted(line).contains("4s ago"))
+            .collect::<Vec<_>>();
+        assert_eq!(option_rows.len(), 1);
+        assert_eq!(painted_width(option_rows[0]), panel_span(40));
+        assert!(painted(option_rows[0]).contains('…'));
+        let option = painted(option_rows[0]);
+        assert!(
+            option.ends_with("…   │"),
+            "truncated row lost its three-column right inset: {option}"
+        );
+        assert!(
+            frame
+                .lines
+                .iter()
+                .any(|line| painted(line).contains("existing reply"))
+        );
+    }
+
+    #[test]
     fn a_panel_pads_inside_its_borders() {
         let frame = overlay_frame(
             &[],
@@ -3445,12 +6631,14 @@ mod tests {
                     selected: true,
                     muted: false,
                 }],
+                slider: None,
                 hint: "Esc cancel".to_owned(),
                 style: OverlayStyle::Panel,
                 input: None,
                 input_label: "",
                 input_placeholder: "",
             },
+            None,
             StatusArea {
                 fallback: String::new(),
                 line: None,
@@ -3494,12 +6682,14 @@ mod tests {
                     selected: true,
                     muted: false,
                 }],
+                slider: None,
                 hint: "↑↓ navigate  Enter resume  Esc cancel".to_owned(),
-                style: OverlayStyle::Panel,
+                style: OverlayStyle::CompactPanel,
                 input: Some(&editor),
                 input_label: "Search",
                 input_placeholder: "Search by name…",
             },
+            None,
             StatusArea {
                 fallback: String::new(),
                 line: None,
@@ -3522,14 +6712,73 @@ mod tests {
             !painted(&frame.lines[bottom + 2]).trim().is_empty(),
             "the composer should start right after the gap"
         );
+        let status = frame.lines.len() - 1;
+        assert!(
+            painted(&frame.lines[status - 1]).trim().is_empty(),
+            "the overlay input runs straight into the statusline"
+        );
+        assert!(
+            !painted(&frame.lines[status - 2]).trim().is_empty(),
+            "there must be exactly one blank row before the statusline"
+        );
     }
 
+    /// A picker docks over the transcript, so opening `/model`, `/effort` or
+    /// `/resume` used to blank the welcome card for as long as it was up.
     #[test]
-    fn picker_overlay_uses_restrained_borderless_chrome() {
+    fn a_docked_picker_keeps_the_welcome_card_on_screen() {
+        let welcome = WelcomeView {
+            plan: "Pro".to_owned(),
+            cwd: r"C:\Source\DevezCLI".to_owned(),
+            account: "someone@example.com".to_owned(),
+            credits: vec!["in 3h".to_owned()],
+        };
         let frame = overlay_frame(
             &[],
             OverlayView {
                 title: "Select model".to_owned(),
+                lines: vec![OverlayLine {
+                    text: "GPT-5.6-Sol".to_owned(),
+                    selected: true,
+                    muted: false,
+                }],
+                slider: None,
+                hint: "↑↓ model   Enter select".to_owned(),
+                style: OverlayStyle::Picker,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            },
+            Some(welcome),
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+        let painted = frame
+            .lines
+            .iter()
+            .map(painted)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(painted.contains("DEVEZ CLI"), "{painted}");
+        assert!(painted.contains("someone@example.com"), "{painted}");
+        // The card sits above the picker rather than replacing it.
+        assert!(frame.lines[0].text.starts_with('╭'));
+        assert!(painted.contains("Select model"));
+        assert!(frame.dock_index > 0, "the picker docks below the card");
+    }
+
+    #[test]
+    fn picker_overlay_matches_the_commands_closed_panel() {
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                title: "Model".to_owned(),
                 lines: vec![
                     OverlayLine {
                         text: "GPT-5.6-Sol".to_owned(),
@@ -3537,17 +6786,19 @@ mod tests {
                         muted: false,
                     },
                     OverlayLine {
-                        text: "GPT-5.3-Codex-Spark".to_owned(),
+                        text: "GPT-5.6-Terra".to_owned(),
                         selected: false,
                         muted: false,
                     },
                 ],
-                hint: "↑↓ model   Enter select".to_owned(),
+                slider: None,
+                hint: "↑↓ model  ·  Enter select".to_owned(),
                 style: OverlayStyle::Picker,
                 input: None,
                 input_label: "",
                 input_placeholder: "",
             },
+            None,
             StatusArea {
                 fallback: String::new(),
                 line: None,
@@ -3557,13 +6808,451 @@ mod tests {
             80,
         );
 
-        assert_eq!(frame.lines[0].text, "Select model");
-        assert_eq!(frame.lines[2].prefix, "  ❯ ");
-        assert!(frame.lines[2].tone == Tone::ModelSol);
-        assert!(frame.lines.iter().all(|line| {
-            !line.text.contains(['╭', '╮', '╰', '╯', '│'])
-                && !line.prefix.contains(['╭', '╮', '╰', '╯', '│'])
-        }));
+        let panel = &frame.lines[..frame.lines.len() - 2];
+        assert!(painted(&panel[0]).starts_with("╭─ Model "));
+        assert!(painted(&panel[0]).ends_with('╮'));
+        assert!(painted(panel.last().expect("panel bottom")).ends_with('╯'));
+        assert!(
+            panel
+                .iter()
+                .all(|line| painted_width(line) == panel_span(80)),
+            "every panel row must match the Commands panel width"
+        );
+        assert!(
+            panel
+                .iter()
+                .filter(|line| painted(line).starts_with('│'))
+                .all(|line| painted(line).ends_with('│')),
+            "every picker body row must keep both side borders"
+        );
+        let selected = panel
+            .iter()
+            .find(|line| line.prefix.contains('❯'))
+            .expect("selected model row");
+        assert_eq!(selected.tone, Tone::ModelSol);
+    }
+
+    #[test]
+    fn narrow_effort_pickers_keep_every_row_inside_the_closed_panel() {
+        for width in 20..=33 {
+            let frame = overlay_frame(
+                &[],
+                OverlayView {
+                    title: "Effort".to_owned(),
+                    lines: Vec::new(),
+                    slider: Some(EffortSlider {
+                        efforts: ["low", "medium", "high", "xhigh", "max", "ultra"]
+                            .map(ToOwned::to_owned)
+                            .to_vec(),
+                        selected: 2,
+                    }),
+                    hint: "Enter select".to_owned(),
+                    style: OverlayStyle::Picker,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                },
+                None,
+                StatusArea {
+                    fallback: "status".to_owned(),
+                    line: None,
+                    composer_notice: None,
+                    composer_mode: None,
+                },
+                width,
+            );
+            let panel = &frame.lines[..frame.lines.len() - 2];
+
+            assert!(
+                panel
+                    .iter()
+                    .all(|line| painted_width(line) == panel_span(width)),
+                "width {width}: Picker row escapes its closed panel"
+            );
+            assert!(
+                panel.iter().any(|line| painted(line).contains("│ HIGH │")),
+                "width {width}: selected effort border disappeared"
+            );
+        }
+    }
+
+    #[test]
+    fn every_overlay_keeps_exactly_one_blank_row_before_the_statusline() {
+        for style in [
+            OverlayStyle::Picker,
+            OverlayStyle::Panel,
+            OverlayStyle::CompactPanel,
+        ] {
+            let frame = overlay_frame(
+                &[],
+                OverlayView {
+                    title: "Overlay".to_owned(),
+                    lines: vec![OverlayLine {
+                        text: "choice".to_owned(),
+                        selected: true,
+                        muted: false,
+                    }],
+                    slider: None,
+                    hint: "Enter confirm".to_owned(),
+                    style,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                },
+                None,
+                StatusArea {
+                    fallback: "status".to_owned(),
+                    line: None,
+                    composer_notice: None,
+                    composer_mode: None,
+                },
+                80,
+            );
+
+            let status = frame.lines.len() - 1;
+            assert!(painted(&frame.lines[status - 1]).trim().is_empty());
+            assert!(!painted(&frame.lines[status - 2]).trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn effort_steps_replace_the_axis_with_one_coloured_row() {
+        let slider = EffortSlider {
+            efforts: ["low", "medium", "high", "xhigh", "max", "ultra"]
+                .map(ToOwned::to_owned)
+                .to_vec(),
+            selected: 2,
+        };
+
+        let lines = effort_step_lines(&slider, 100);
+
+        // The track opens straight on its box: the blank above it belongs to
+        // whatever placed the track, not to the track itself.
+        assert_eq!(lines.len(), 3);
+        let top = &lines[0];
+        let steps = &lines[1];
+        let bottom = &lines[2];
+        assert_eq!(
+            painted(steps).trim(),
+            "low › medium › │ HIGH │ › xhigh › max › ultra"
+        );
+        assert_eq!(steps.prefix, " ".repeat(27));
+        assert_eq!(painted(top).trim(), "╭──────╮");
+        assert_eq!(painted(bottom).trim(), "╰──────╯");
+        assert_eq!(top.prefix, " ".repeat(42));
+        assert_eq!(bottom.prefix, top.prefix);
+        assert_eq!(top.tone, Tone::EffortHigh);
+        assert_eq!(bottom.tone, Tone::EffortHigh);
+        let text = painted(steps);
+        assert!(!text.contains("Faster"));
+        assert!(!text.contains("Smarter"));
+        assert!(!text.contains('▲'));
+        assert!(!text.contains('─'));
+
+        let selected = steps
+            .tail
+            .iter()
+            .position(|span| span.text == "│ HIGH │")
+            .expect("selected effort");
+        assert_eq!(steps.tail[selected].tone, Tone::EffortHigh);
+        assert!(steps.tail[selected].bold);
+        assert_eq!(steps.tail[selected + 1].text, " › ");
+        assert_eq!(steps.tail[selected + 1].tone, Tone::EffortHigh);
+    }
+
+    /// Each step of the track answers for its own effort, and the separators for
+    /// nothing — the shrinking that drops steps on a narrow panel must not shift
+    /// which step a click lands on.
+    #[test]
+    fn every_effort_step_answers_for_its_own_index() {
+        let slider = EffortSlider {
+            efforts: ["low", "medium", "high", "xhigh", "max", "ultra"]
+                .map(ToOwned::to_owned)
+                .to_vec(),
+            selected: 2,
+        };
+
+        for width in [100, 40] {
+            let steps = effort_step_lines(&slider, width).remove(1);
+            let labels = steps
+                .tail
+                .iter()
+                .filter(|span| span.text != EFFORT_SEPARATOR)
+                .map(|span| span.text.clone())
+                .collect::<Vec<_>>();
+
+            for (index, label) in labels.iter().enumerate() {
+                assert_eq!(
+                    pick_on(&steps, label),
+                    Some(Pick::Effort(index)),
+                    "step {label} at width {width}"
+                );
+            }
+            assert_eq!(pick_mid(&steps, EFFORT_SEPARATOR), None);
+        }
+    }
+
+    /// The cells a painted row actually carries the hover tint on, read back off
+    /// the escapes it printed.
+    fn hovered_cells(painted: &str) -> String {
+        let hover = theme::palette().hover_bg;
+        let hover_escape = format!("48;2;{};{};{}", hover.0, hover.1, hover.2);
+        let mut cells = String::new();
+        let mut hovered = false;
+        let mut chars = painted.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch != '\x1b' {
+                if hovered {
+                    cells.push(ch);
+                }
+                continue;
+            }
+            let mut sequence = String::new();
+            while let Some(ch) = chars.next() {
+                sequence.push(ch);
+                if ch.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            if sequence.contains(&hover_escape) {
+                hovered = true;
+            } else if sequence.starts_with("[48;2;")
+                || sequence == "[49m"
+                || sequence == "[0m"
+                || sequence.contains("[39m")
+            {
+                hovered = false;
+            }
+        }
+        cells
+    }
+
+    /// The highlight is the clickable span and its one column of bleed — not the
+    /// whole separator it reaches into, and not the border beside it.
+    #[test]
+    fn the_highlight_covers_exactly_the_clickable_columns() {
+        theme::set_current(ThemeKind::Dark);
+        let line = status_line_row(
+            Some(StatusLineView {
+                branch: Some("main".to_owned()),
+                model: "GPT-5.6 Sol".to_owned(),
+                effort: "high".to_owned(),
+                context: None,
+                five_hour_percent: None,
+                weekly_percent: Some(34),
+                notice: None,
+            }),
+            "",
+            120,
+        );
+        let hovered = Renderer::hover_columns(&line, None, Some(&Pick::Model)).expect("the model");
+        let mut output = Vec::new();
+
+        print_line_with_selection(&mut output, &line, None, Some(hovered)).expect("paint");
+
+        let painted = String::from_utf8(output).expect("utf-8 escapes");
+        assert_eq!(hovered_cells(&painted), " GPT-5.6 Sol ");
+    }
+
+    /// Only the piece under the pointer lights up, and it lights up wherever the
+    /// row happens to have placed it.
+    #[test]
+    fn hovering_a_badge_lights_only_that_badge() {
+        let mode = test_mode("Full Access", ModeAccent::Danger, true);
+        let line = input_top_line(50, "", Some(&mode));
+        let text = painted(&line);
+        let start = UnicodeWidthStr::width(&text[..text.find("Full Access").unwrap()]);
+
+        // A column either side of the label is part of the target.
+        assert_eq!(
+            Renderer::hover_columns(&line, None, Some(&Pick::PermissionMode)),
+            Some(start - 1..start + 12)
+        );
+        // Nothing on the rule answers for a pick it does not carry.
+        assert_eq!(Renderer::hover_columns(&line, None, Some(&Pick::Model)), None);
+        assert_eq!(Renderer::hover_columns(&line, None, None), None);
+    }
+
+    /// A row offers its own text, so the highlight runs from the number to the end
+    /// of the name and leaves both borders alone.
+    #[test]
+    fn hovering_a_picker_row_lights_its_text_and_not_the_borders() {
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                title: "Model".to_owned(),
+                lines: vec![OverlayLine {
+                    text: "1. GPT-5.6 Sol".to_owned(),
+                    selected: true,
+                    muted: false,
+                }],
+                slider: None,
+                hint: "Enter select".to_owned(),
+                style: OverlayStyle::Picker,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            },
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+        let row = frame
+            .lines
+            .iter()
+            .find(|line| painted(line).contains("GPT-5.6 Sol"))
+            .expect("the model row");
+
+        let painted_row = painted(row);
+        let start = UnicodeWidthStr::width(&painted_row[..painted_row.find('1').unwrap()]);
+        let end = start + UnicodeWidthStr::width("1. GPT-5.6 Sol") + 1;
+        assert_eq!(
+            Renderer::hover_columns(row, None, Some(&Pick::Row(0))),
+            Some(start - 1..end)
+        );
+        // Both borders stay outside the highlight even with the column of bleed.
+        assert!(start > 1);
+        assert!(end < painted_line_width(row));
+        assert_eq!(Renderer::hover_columns(row, None, Some(&Pick::Row(1))), None);
+    }
+
+    /// A compact row offers the same span a taller picker's row does: its own
+    /// text, with the marker gutter, the inset and both borders left out.
+    #[test]
+    fn hovering_a_compact_row_lights_its_text_and_not_the_furniture() {
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                title: "Resume session".to_owned(),
+                lines: vec![OverlayLine {
+                    text: "2h ago    Fix the picker".to_owned(),
+                    selected: true,
+                    muted: false,
+                }],
+                slider: None,
+                hint: "Enter resume".to_owned(),
+                style: OverlayStyle::CompactPanel,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            },
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+        let row = frame
+            .lines
+            .iter()
+            .find(|line| painted(line).contains("Fix the picker"))
+            .expect("the session row");
+
+        let painted_row = painted(row);
+        let start = UnicodeWidthStr::width(&painted_row[..painted_row.find('2').unwrap()]);
+        assert_eq!(
+            Renderer::hover_columns(row, None, Some(&Pick::Row(0))),
+            Some(start..start + UnicodeWidthStr::width("2h ago    Fix the picker"))
+        );
+        // The border and the `❯` gutter lead the row; the inset and the closing
+        // border trail it. None of them light up.
+        assert!(start > 1);
+        assert!(
+            start + UnicodeWidthStr::width("2h ago    Fix the picker") < painted_line_width(row)
+        );
+    }
+
+    /// The panel border shifts every column of the track along with it, so the
+    /// step a click lands on is only right if the regions moved too.
+    #[test]
+    fn effort_steps_stay_clickable_once_the_panel_border_goes_on() {
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                title: "Effort".to_owned(),
+                lines: Vec::new(),
+                slider: Some(EffortSlider {
+                    efforts: ["low", "medium", "high"].map(ToOwned::to_owned).to_vec(),
+                    selected: 1,
+                }),
+                hint: "←→ to adjust".to_owned(),
+                style: OverlayStyle::Picker,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            },
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+        let steps = frame
+            .lines
+            .iter()
+            .find(|line| painted(line).contains("MEDIUM"))
+            .expect("the track");
+
+        assert_eq!(pick_on(steps, "low"), Some(Pick::Effort(0)));
+        assert_eq!(pick_on(steps, "│ MEDIUM │"), Some(Pick::Effort(1)));
+        assert_eq!(pick_on(steps, "high"), Some(Pick::Effort(2)));
+        // The border the panel put on is not a step.
+        assert_eq!(steps.pick.as_ref().and_then(|regions| regions.at(0)), None);
+    }
+
+    #[test]
+    fn effort_steps_use_compact_unselected_labels_at_narrow_width() {
+        let slider = EffortSlider {
+            efforts: ["low", "medium", "high", "xhigh", "max", "ultra"]
+                .map(ToOwned::to_owned)
+                .to_vec(),
+            selected: 2,
+        };
+
+        let lines = effort_step_lines(&slider, 40);
+
+        assert_eq!(painted(&lines[1]).trim(), "L › M › │ HIGH │ › XH › MAX › U");
+    }
+
+    #[test]
+    fn effort_steps_handle_empty_efforts_and_a_stale_selection() {
+        assert!(
+            effort_step_lines(
+                &EffortSlider {
+                    efforts: Vec::new(),
+                    selected: 0,
+                },
+                80,
+            )
+            .is_empty()
+        );
+
+        let slider = EffortSlider {
+            efforts: ["low", "medium", "high", "xhigh", "max", "ultra"]
+                .map(ToOwned::to_owned)
+                .to_vec(),
+            selected: 99,
+        };
+        let lines = effort_step_lines(&slider, 80);
+        let selected = lines[1]
+            .tail
+            .iter()
+            .find(|span| span.bold)
+            .expect("clamped selected effort");
+
+        assert_eq!(selected.text, "│ ULTRA │");
+        assert_eq!(selected.tone, Tone::EffortUltra);
     }
 
     #[test]

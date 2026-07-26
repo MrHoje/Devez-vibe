@@ -1,3 +1,5 @@
 /target/
 /npm/bin/
 /npm/LICENSE
+/.claude/
+/.superpowers/

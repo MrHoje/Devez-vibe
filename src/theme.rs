@@ -1,8 +1,10 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU8, Ordering},
 };
+
+#[cfg(not(test))]
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use anyhow::{Context, Result};
 
@@ -66,6 +68,50 @@ impl Rgb {
     }
 }
 
+/// Drag-selection background for the active theme. Dark carries Claude Code's
+/// own dark-theme `selectionBg` (`rgb(38, 79, 120)`); the light themes take the
+/// `selectionBg` DevezCode overrides it with per theme
+/// (`Services/Terminal/ClaudeCustomThemes.cs`). So a drag here looks like a drag
+/// there — a tinted wash of each theme's accent instead of one charcoal block
+/// that only ever suited Dark.
+pub fn selection_bg() -> Rgb {
+    palette().selection_bg
+}
+
+/// Used only for text the theme's own block would swallow. Syntax colours keep
+/// themselves inside the selection wherever they stay readable; the runs that
+/// don't — and only those — fall back to this.
+pub fn selection_fg() -> Rgb {
+    palette().selection_fg
+}
+
+/// Foreground to paint `tone_color` in when it sits inside a selection block.
+pub fn selection_text(color: Rgb) -> Rgb {
+    if contrast_ratio(color, selection_bg()) >= 4.5 {
+        color
+    } else {
+        selection_fg()
+    }
+}
+
+pub fn contrast_ratio(left: Rgb, right: Rgb) -> f64 {
+    let light = relative_luminance(left).max(relative_luminance(right));
+    let dark = relative_luminance(left).min(relative_luminance(right));
+    (light + 0.05) / (dark + 0.05)
+}
+
+fn relative_luminance(color: Rgb) -> f64 {
+    let channel = |value: u8| {
+        let value = f64::from(value) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(color.0) + 0.7152 * channel(color.1) + 0.0722 * channel(color.2)
+}
+
 #[derive(Clone, Copy)]
 pub struct ThemePalette {
     pub background: Rgb,
@@ -88,13 +134,20 @@ pub struct ThemePalette {
     pub syntax_number: Rgb,
     pub syntax_type: Rgb,
     pub syntax_function: Rgb,
-    pub diff_add: Rgb,
-    pub diff_remove: Rgb,
     pub diff_header: Rgb,
     pub diff_add_bg: Rgb,
     pub diff_remove_bg: Rgb,
+    /// The stronger tint painted over just the words that changed inside an
+    /// added/removed row, the way Claude Code's `diffAddedWord` does.
+    pub diff_add_word_bg: Rgb,
+    pub diff_remove_word_bg: Rgb,
     pub user_prompt_bg: Rgb,
     pub model_change_bg: Rgb,
+    pub hover_bg: Rgb,
+    /// Drag-selection block. See `selection_bg`.
+    pub selection_bg: Rgb,
+    /// Fallback text colour inside that block. See `selection_fg`.
+    pub selection_fg: Rgb,
 }
 
 /// Status line colors, kept apart from the rest of the palette because they are
@@ -118,6 +171,9 @@ pub struct StatusLinePalette {
     pub effort_high: Rgb,
     pub effort_xhigh: Rgb,
     pub effort_max: Rgb,
+    /// The tier past `max`. Carries on the ramp's hue walk into magenta so it
+    /// reads as "beyond max" rather than as a second red.
+    pub effort_ultra: Rgb,
     /// The 5h window segment (`TIME`).
     pub five_hour: Rgb,
     /// The `week:` segment (`WEEK`).
@@ -147,6 +203,7 @@ pub const MINIMAL: ThemePalette = ThemePalette {
         effort_high: Rgb(0x43, 0x38, 0xCA),
         effort_xhigh: Rgb(0x7C, 0x00, 0xD1),
         effort_max: Rgb(0xD1, 0x00, 0x00),
+        effort_ultra: Rgb(0xC2, 0x00, 0x78),
         five_hour: Rgb(0x00, 0x5E, 0xD1),
         weekly: Rgb(0x35, 0x00, 0xD1),
     },
@@ -157,13 +214,16 @@ pub const MINIMAL: ThemePalette = ThemePalette {
     syntax_number: Rgb(0x05, 0x7A, 0x55),
     syntax_type: Rgb(0x1F, 0x71, 0x87),
     syntax_function: Rgb(0x79, 0x5E, 0x26),
-    diff_add: Rgb(0x11, 0x63, 0x29),
-    diff_remove: Rgb(0xA4, 0x0E, 0x26),
     diff_header: Rgb(0x05, 0x63, 0xC1),
     diff_add_bg: Rgb(0xDA, 0xF0, 0xDE),
     diff_remove_bg: Rgb(0xF1, 0xD7, 0xDA),
+    diff_add_word_bg: Rgb(0x9E, 0xDD, 0xAE),
+    diff_remove_word_bg: Rgb(0xF0, 0xAA, 0xB2),
     user_prompt_bg: Rgb(0xEE, 0xF4, 0xFF),
     model_change_bg: Rgb(0xDB, 0xEA, 0xFE),
+    hover_bg: Rgb(0xE8, 0xEE, 0xF7),
+    selection_bg: Rgb(0xC5, 0xD8, 0xF8),
+    selection_fg: Rgb(0x0F, 0x17, 0x2A),
 };
 
 pub const SOFT: ThemePalette = ThemePalette {
@@ -189,6 +249,7 @@ pub const SOFT: ThemePalette = ThemePalette {
         effort_high: Rgb(0x43, 0x38, 0xCA),
         effort_xhigh: Rgb(0x79, 0x00, 0xCC),
         effort_max: Rgb(0xCC, 0x00, 0x00),
+        effort_ultra: Rgb(0xBD, 0x00, 0x74),
         five_hour: Rgb(0x00, 0x5B, 0xCC),
         weekly: Rgb(0x33, 0x00, 0xCC),
     },
@@ -199,13 +260,16 @@ pub const SOFT: ThemePalette = ThemePalette {
     syntax_number: Rgb(0x2E, 0x6A, 0x4D),
     syntax_type: Rgb(0x42, 0x68, 0x34),
     syntax_function: Rgb(0x68, 0x4B, 0x8A),
-    diff_add: Rgb(0x1F, 0x6D, 0x32),
-    diff_remove: Rgb(0x96, 0x34, 0x3A),
     diff_header: Rgb(0x3A, 0x6F, 0xA5),
     diff_add_bg: Rgb(0xD9, 0xE5, 0xD8),
     diff_remove_bg: Rgb(0xEC, 0xD1, 0xD2),
+    diff_add_word_bg: Rgb(0x7B, 0xAA, 0x68),
+    diff_remove_word_bg: Rgb(0xE8, 0xA0, 0xA0),
     user_prompt_bg: Rgb(0xE6, 0xF0, 0xDE),
     model_change_bg: Rgb(0xDE, 0xEC, 0xD6),
+    hover_bg: Rgb(0xE7, 0xE0, 0xD7),
+    selection_bg: Rgb(0xC2, 0xD8, 0xB0),
+    selection_fg: Rgb(0x2A, 0x26, 0x20),
 };
 
 pub const DARK: ThemePalette = ThemePalette {
@@ -231,6 +295,7 @@ pub const DARK: ThemePalette = ThemePalette {
         effort_high: Rgb(0x9B, 0xA1, 0xD6),
         effort_xhigh: Rgb(0x9A, 0x77, 0xDB),
         effort_max: Rgb(0xD7, 0x65, 0x64),
+        effort_ultra: Rgb(0xDD, 0x7F, 0xB8),
         five_hour: Rgb(0x57, 0x91, 0xD7),
         weekly: Rgb(0x93, 0x7B, 0xD7),
     },
@@ -241,27 +306,56 @@ pub const DARK: ThemePalette = ThemePalette {
     syntax_number: Rgb(0xB5, 0xCE, 0xA8),
     syntax_type: Rgb(0x4E, 0xC9, 0xB0),
     syntax_function: Rgb(0xDC, 0xDC, 0xAA),
-    diff_add: Rgb(0x56, 0xD3, 0x64),
-    diff_remove: Rgb(0xFF, 0x7B, 0x72),
     diff_header: Rgb(0x4F, 0xA6, 0xFF),
     diff_add_bg: Rgb(0x26, 0x3D, 0x2A),
     diff_remove_bg: Rgb(0x47, 0x29, 0x28),
+    diff_add_word_bg: Rgb(0x2A, 0x6B, 0x3C),
+    diff_remove_word_bg: Rgb(0x8F, 0x3B, 0x38),
     user_prompt_bg: Rgb(0x36, 0x36, 0x36),
     model_change_bg: Rgb(0x43, 0x43, 0x43),
+    hover_bg: Rgb(0x32, 0x32, 0x31),
+    selection_bg: Rgb(0x26, 0x4F, 0x78),
+    selection_fg: Rgb(0xE6, 0xE6, 0xE6),
 };
 
+#[cfg(not(test))]
 static CURRENT_THEME: AtomicU8 = AtomicU8::new(2);
 
-pub fn current() -> ThemeKind {
-    match CURRENT_THEME.load(Ordering::Relaxed) {
+// The theme is process-wide in the app — one terminal, one palette. Under
+// `cfg(test)` it is per-thread instead: tests run in parallel, and anything that
+// builds a `Renderer` sets the theme, so a shared cell means one test's theme
+// decides what another test paints.
+#[cfg(test)]
+thread_local! {
+    static CURRENT_THEME: std::cell::Cell<u8> = const { std::cell::Cell::new(2) };
+}
+
+fn decode_theme(value: u8) -> ThemeKind {
+    match value {
         0 => ThemeKind::Minimal,
         1 => ThemeKind::Soft,
         _ => ThemeKind::Dark,
     }
 }
 
+#[cfg(not(test))]
+pub fn current() -> ThemeKind {
+    decode_theme(CURRENT_THEME.load(Ordering::Relaxed))
+}
+
+#[cfg(not(test))]
 pub fn set_current(theme: ThemeKind) {
     CURRENT_THEME.store(theme.index() as u8, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub fn current() -> ThemeKind {
+    CURRENT_THEME.with(|theme| decode_theme(theme.get()))
+}
+
+#[cfg(test)]
+pub fn set_current(theme: ThemeKind) {
+    CURRENT_THEME.with(|current| current.set(theme.index() as u8));
 }
 
 pub fn palette() -> &'static ThemePalette {
@@ -360,13 +454,23 @@ mod tests {
                 );
             }
             assert!(
-                contrast_ratio(palette.diff_add, palette.diff_add_bg) >= 4.5,
+                contrast_ratio(palette.foreground, palette.diff_add_bg) >= 4.5,
                 "{} added diff text is not readable",
                 theme.display_name()
             );
             assert!(
-                contrast_ratio(palette.diff_remove, palette.diff_remove_bg) >= 4.5,
+                contrast_ratio(palette.foreground, palette.diff_remove_bg) >= 4.5,
                 "{} removed diff text is not readable",
+                theme.display_name()
+            );
+            assert!(
+                contrast_ratio(palette.foreground, palette.diff_add_word_bg) >= 4.5,
+                "{} added diff words are not readable",
+                theme.display_name()
+            );
+            assert!(
+                contrast_ratio(palette.foreground, palette.diff_remove_word_bg) >= 4.5,
+                "{} removed diff words are not readable",
                 theme.display_name()
             );
             assert!(
@@ -377,6 +481,11 @@ mod tests {
             assert!(
                 contrast_ratio(palette.foreground, palette.model_change_bg) >= 4.5,
                 "{} change card text is not readable",
+                theme.display_name()
+            );
+            assert!(
+                contrast_ratio(palette.foreground, palette.hover_bg) >= 4.5,
+                "{} hover text is not readable",
                 theme.display_name()
             );
             assert_ne!(palette.syntax_keyword, palette.syntax_type);
@@ -414,6 +523,7 @@ mod tests {
                     ("eff: high", status.effort_high),
                     ("eff: xhigh", status.effort_xhigh),
                     ("eff: max", status.effort_max),
+                    ("eff: ultra", status.effort_ultra),
                 ],
             );
         }
@@ -444,6 +554,7 @@ mod tests {
                 ("eff: high", status.effort_high),
                 ("eff: xhigh", status.effort_xhigh),
                 ("eff: max", status.effort_max),
+                ("eff: ultra", status.effort_ultra),
                 ("5h", status.five_hour),
                 ("week", status.weekly),
             ];
@@ -469,23 +580,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    fn contrast_ratio(left: Rgb, right: Rgb) -> f64 {
-        let light = relative_luminance(left).max(relative_luminance(right));
-        let dark = relative_luminance(left).min(relative_luminance(right));
-        (light + 0.05) / (dark + 0.05)
-    }
-
-    fn relative_luminance(color: Rgb) -> f64 {
-        let channel = |value: u8| {
-            let value = f64::from(value) / 255.0;
-            if value <= 0.04045 {
-                value / 12.92
-            } else {
-                ((value + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * channel(color.0) + 0.7152 * channel(color.1) + 0.0722 * channel(color.2)
     }
 }

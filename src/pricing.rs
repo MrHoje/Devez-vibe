@@ -128,7 +128,7 @@ mod tests {
         assert_eq!(estimate_usd("gpt-5.6-terra", totals), Some(17.5));
         assert_eq!(estimate_usd("gpt-5.6-sol", totals), Some(35.0));
         assert_eq!(estimate_usd("gpt-5.3-codex", totals), Some(15.75));
-        assert_eq!(estimate_usd("claude-opus-5", totals), None);
+        assert_eq!(estimate_usd("unlisted-model", totals), None);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Devez CLI
 
-Claude Code의 차분한 터미널 흐름을 참고해 새로 만든 Codex `app-server` 클라이언트입니다.
+공식 Codex `app-server`를 위해 독립적으로 구현한 터미널 클라이언트입니다.
 Codex의 인증, 하네스 프롬프트, 도구, 스킬, `AGENTS.md`, 샌드박스는 공식
 `codex app-server`가 그대로 담당합니다. 이 프로젝트는 화면과 입력 계층만 소유합니다.
 
@@ -15,7 +15,7 @@ Codex의 인증, 하네스 프롬프트, 도구, 스킬, `AGENTS.md`, 샌드박�
 - 명령/파일 변경 승인
 - 실행 중 입력 steer 및 `Esc`/`Ctrl+C` 중단
 - 일반 터미널 스크롤백을 보존하는 증분 렌더링
-- 좌우 테두리와 복사용 공백이 없는 Claude Code형 하단 composer
+- 좌우 테두리와 복사용 공백이 없는 하단 composer
 - Git 브랜치, 모델, effort, context, 5h/주간 한도, Fast 상태를 표시하는 하단 상태줄
 - 모델별 실제 유효 context window를 첫 입력 전부터 표시
 - 시작과 `/new` 세션 전환 시 화면과 스크롤백을 비우고 새 화면으로 전환
@@ -24,10 +24,12 @@ Codex의 인증, 하네스 프롬프트, 도구, 스킬, `AGENTS.md`, 샌드박�
 - 모델 번호 표시 및 피커에서 `1`~`9` 숫자키 즉시 선택
 - 설명·Auto 없이 모델명과 지원 수준만 표시하는 `/effort` 슬라이더
 - `You`/`Codex` 헤더 없이 마커와 본문으로 이어지는 대화 출력
-- 보낸 프롬프트는 전체 행에 은은한 Claude형 배경색 적용
+- 보낸 프롬프트는 전체 행에 은은한 배경색 적용
 - Sol·Terra·Luna·GPT-5.5 모델 색상을 picker와 statusline에 공통 적용
 - `/` 명령 자동완성 및 키보드 모델 선택기
 - `/` 명령 자동완성 패널을 하단 입력 영역 바로 위에 고정
+- `$`로 Plugin·Skill·App을, `@`로 Plugin·Skill·파일·폴더를 검색하고
+  Codex와 같은 표기로 입력하는 composer 자동완성
 - `/exit`을 `/quit`과 같은 정상 종료 명령으로 지원
 - `Ctrl+Backspace`/`Ctrl+W` 단어 삭제, `Ctrl+K`/`Ctrl+U` 줄 삭제,
   `Ctrl+Y` 복원, `Alt+B`/`Alt+F` 단어 이동, `Ctrl+J` 줄바꿈
