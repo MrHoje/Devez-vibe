@@ -9407,6 +9407,7 @@ mod tests {
     #[test]
     fn statusline_command_toggles_individual_status_fields_with_space() {
         let mut state = test_state();
+        state.status_line_settings.0[StatusLineField::Reset.index()] = true;
 
         state.run_slash_command("/statusline");
 
@@ -9468,6 +9469,7 @@ mod tests {
     #[test]
     fn statusline_reset_checkbox_persists_its_own_setting() {
         let mut state = test_state();
+        state.status_line_settings.0[StatusLineField::Reset.index()] = true;
         state.run_slash_command("/statusline");
 
         let action = state.click_overlay_row(6);

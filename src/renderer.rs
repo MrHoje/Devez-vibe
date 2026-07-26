@@ -2046,7 +2046,11 @@ fn composer_content_columns(line: &PaintLine) -> Option<Range<usize>> {
 /// its text. They share the same range in selection paint and clipboard output.
 fn selectable_content_columns(line: &PaintLine) -> Option<Range<usize>> {
     composer_content_columns(line).or_else(|| {
-        let empty_gutter = !line.prefix.is_empty() && line.prefix.chars().all(|ch| ch == ' ');
+        let fallback_status_gutter =
+            line.prefix == " " && line.prefix_tone == Tone::Muted && line.tone == Tone::Muted;
+        let empty_gutter = !line.prefix.is_empty()
+            && line.prefix.chars().all(|ch| ch == ' ')
+            && !fallback_status_gutter;
         (is_copy_marker(&line.prefix) || empty_gutter)
             .then(|| UnicodeWidthStr::width(line.prefix.as_str())..painted_line_width(line))
     })
@@ -7387,7 +7391,7 @@ mod tests {
             .iter()
             .position(|line| painted_line_text(line).contains("Working"))
             .expect("activity row");
-        assert_eq!(frame.lines[activity].tone, Tone::Accent);
+        assert_eq!(frame.lines[activity].tone, Tone::Plain);
         assert!(activity >= 2);
         assert!(frame.lines[activity - 2] == PaintLine::blank());
         assert!(frame.lines[activity - 1] == PaintLine::blank());

@@ -3715,7 +3715,7 @@ mod tests {
                 .view()
                 .activity
                 .as_deref()
-                .is_some_and(|activity| activity.contains("Working (")),
+                .is_some_and(|activity| activity.contains("Working.. (")),
             "a queued prompt still reports as working"
         );
     }
