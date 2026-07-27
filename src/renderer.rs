@@ -9905,7 +9905,7 @@ mod tests {
         );
 
         assert_eq!(line.prefix, " ");
-        assert_eq!(line.text, "GPT-5.6 Sol");
+        assert_eq!(line.text, " GPT-5.6 Sol ");
     }
 
     /// The two readings the status line lets you change answer to a click; the
