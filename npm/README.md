@@ -10,7 +10,15 @@
 npm install -g devez-vibe
 ```
 
-현재 Windows x64 빌드만 배포합니다.
+설치하면 `dvz` 명령을 사용할 수 있습니다.
+
+| 요건 | 값 |
+| --- | --- |
+| OS | Windows x64 |
+| Node.js | 18 이상 (설치용. 실행 자체는 네이티브 바이너리) |
+| 전제 | Codex CLI 설치 및 로그인 완료 |
+
+현재 Windows x64 빌드만 배포합니다. 다른 플랫폼에서는 `EBADPLATFORM`으로 설치가 거부됩니다.
 
 ## 사용
 
@@ -45,4 +53,4 @@ dvz update
 
 ## 라이선스
 
-MIT. 자세한 내용은 [저장소](https://github.com/MrHoje/Devez-Vibe)를 참고하세요.
+MIT. 자세한 내용은 [저장소](https://github.com/MrHoje/Devez-vibe)를 참고하세요.
