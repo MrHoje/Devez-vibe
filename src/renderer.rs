@@ -1210,7 +1210,8 @@ impl Renderer {
                 continue;
             }
             if let Some(layout) = info_panel {
-                clear_main_row(&mut self.out, row, layout.main_width)?;
+                let clear_range = info_panel_main_clear_range(self.painted_info_panel, layout);
+                clear_main_row(&mut self.out, row, clear_range.end)?;
             } else {
                 queue!(
                     self.out,
@@ -1396,6 +1397,17 @@ fn clear_main_row(out: &mut impl Write, row: usize, width: usize) -> Result<()> 
         MoveTo(0, row.min(u16::MAX as usize) as u16),
     )?;
     Ok(())
+}
+
+fn info_panel_main_clear_range(
+    painted_info_panel: Option<InfoPanelLayout>,
+    layout: InfoPanelLayout,
+) -> Range<usize> {
+    0..if painted_info_panel.is_none() {
+        layout.panel_left
+    } else {
+        layout.main_width
+    }
 }
 
 const INFO_PANEL_WIDTH: usize = 24;
@@ -6166,6 +6178,14 @@ mod tests {
         assert_eq!(layout.panel_left, 47);
         assert_eq!(layout.panel_width, 24);
         assert_eq!(layout.panel_left + layout.panel_width, 71);
+    }
+
+    #[test]
+    fn info_panel_opening_clear_reaches_panel_but_steady_clear_stops_at_main_frame() {
+        let layout = info_panel_layout(72).unwrap();
+
+        assert_eq!(info_panel_main_clear_range(None, layout), 0..47);
+        assert_eq!(info_panel_main_clear_range(Some(layout), layout), 0..44);
     }
 
     #[test]
