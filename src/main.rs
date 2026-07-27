@@ -501,6 +501,7 @@ async fn choose_startup_session(
                 live_blocks: Vec::new(),
                 overlay: Some(picker.overlay_view()),
                 info_panel_open: false,
+                plan_summary: None,
                 editor: &editor,
                 composer_images: &[],
                 welcome: None,
@@ -880,6 +881,10 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
         Pick::DiffDisplayMode => Action::PersistDiffDisplayMode(state.cycle_diff_display_mode()),
         Pick::InfoPanel => {
             state.toggle_info_panel();
+            Action::Tick(true)
+        }
+        Pick::PlanSummary => {
+            state.toggle_plan_summary();
             Action::Tick(true)
         }
         Pick::FastMode => Action::SetFast(!state.effective_fast_mode()),

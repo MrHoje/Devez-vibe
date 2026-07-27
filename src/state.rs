@@ -23,7 +23,8 @@ use crate::{
     pricing::{self, CostLedger, TokenTotals},
     renderer::{
         Block, BlockKind, ComposerMode, EffortSlider, HIDDEN_STATUS_LINE, ModeAccent, OverlayLine,
-        OverlayStyle, OverlayView, PICKER_ROWS, StatusLineView, SuggestionView, View, WelcomeView,
+        OverlayStyle, OverlayView, PICKER_ROWS, PlanStep, PlanStepStatus, PlanSummary,
+        StatusLineView, SuggestionView, View, WelcomeView,
         visible_window,
     },
     rollout::{Rollout, RolloutEvent, RolloutKind},
@@ -2406,6 +2407,7 @@ pub struct AppState {
     transient_status: Option<String>,
     show_welcome: bool,
     info_panel_open: bool,
+    plan_summary: Option<PlanSummary>,
     command_selection: usize,
     spinner_frame: usize,
     turn_started_at: Option<Instant>,
@@ -2517,6 +2519,7 @@ impl AppState {
             transient_status: None,
             show_welcome: true,
             info_panel_open: false,
+            plan_summary: None,
             command_selection: 0,
             spinner_frame: 0,
             turn_started_at: None,
@@ -2985,6 +2988,7 @@ impl AppState {
         ComposerMode {
             label: self.permission_mode().label().to_owned(),
             accent: self.permission_mode().accent(),
+            model: self.selected_model_name().to_owned(),
             response_length: self.response_length_label().to_owned(),
             fast_mode: self.effective_fast_mode(),
             effort: self.selected_effort.clone(),
@@ -3400,6 +3404,7 @@ impl AppState {
         self.last_assistant_markdown = None;
         self.composer_notice = None;
         self.activity_notice = None;
+        self.plan_summary = None;
         self.show_welcome = false;
         self.busy = false;
         self.turn_id = None;
@@ -3483,6 +3488,7 @@ impl AppState {
             live_blocks,
             overlay: self.overlay_view(),
             info_panel_open: self.info_panel_open,
+            plan_summary: self.plan_summary.as_ref(),
             editor: &self.editor,
             composer_images: &self.composer_images,
             welcome: self.show_welcome.then(|| self.welcome_view()),
@@ -3565,7 +3571,7 @@ impl AppState {
             Some(PendingInteraction::MarketplacePicker(picker)) => picker.handle_paste(text),
             Some(_) => {}
             None => {
-                self.editor.insert_str(text);
+                self.editor.insert_paste_str(text);
                 self.command_selection = 0;
             }
         }
@@ -3618,6 +3624,15 @@ impl AppState {
                 }
                 _ => {}
             }
+        }
+
+        if key.code == KeyCode::Esc && !self.busy {
+            self.editor.clear();
+            self.composer_images.clear();
+            self.selected_completion_bindings.clear();
+            self.completion_dismissed_text = None;
+            self.command_selection = 0;
+            return Action::None;
         }
 
         let completion_matches = self.matching_completions();
@@ -3842,11 +3857,15 @@ impl AppState {
                 Action::None
             }
             KeyCode::Up => {
-                self.editor.history_previous();
+                if !self.editor.move_up() {
+                    self.editor.history_previous();
+                }
                 Action::None
             }
             KeyCode::Down => {
-                self.editor.history_next();
+                if !self.editor.move_down() {
+                    self.editor.history_next();
+                }
                 Action::None
             }
             KeyCode::Char(ch) if !ctrl => {
@@ -4162,29 +4181,19 @@ impl AppState {
                     .flatten()
                     .filter_map(|step| {
                         let text = step.get("step")?.as_str()?;
-                        // Codex checkboxes: done, current, still to do. The
-                        // renderer paints `▸` as a lit `□`.
-                        let marker = match step.get("status").and_then(Value::as_str) {
-                            Some("completed") => "✔",
-                            Some("inProgress") => "▸",
-                            _ => "□",
+                        let status = match step.get("status").and_then(Value::as_str) {
+                            Some("completed") => PlanStepStatus::Completed,
+                            Some("inProgress") => PlanStepStatus::InProgress,
+                            _ => PlanStepStatus::Pending,
                         };
-                        Some(format!("{marker} {text}"))
+                        Some(PlanStep { text: text.to_owned(), status })
                     })
                     .collect::<Vec<_>>();
-                // The explanation hangs off a `└` the way Codex renders it.
-                let mut rows = explanation
-                    .into_iter()
-                    .flat_map(str::lines)
-                    .filter(|line| !line.trim().is_empty())
-                    .map(|line| format!("└ {line}"))
-                    .collect::<Vec<_>>();
-                rows.extend(steps);
-                self.push_unique_operation(Block::new(
-                    BlockKind::Plan,
-                    "Updated Plan",
-                    rows.join("\n"),
-                ));
+                self.plan_summary = Some(PlanSummary {
+                    explanation: explanation.map(ToOwned::to_owned),
+                    steps,
+                    expanded: false,
+                });
             }
             "item/started" => {
                 if let Some(item) = params.get("item") {
@@ -6237,6 +6246,12 @@ impl AppState {
 
     pub fn toggle_info_panel(&mut self) {
         self.info_panel_open = !self.info_panel_open;
+    }
+
+    pub fn toggle_plan_summary(&mut self) {
+        if let Some(summary) = &mut self.plan_summary {
+            summary.expanded = !summary.expanded;
+        }
     }
 
     /// Runs a slash command the composer never typed — what a click on the
@@ -8516,7 +8531,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_plan_and_context_notifications_become_one_card_each() {
+    fn duplicate_plan_notifications_replace_the_fixed_summary() {
         let mut state = test_state();
         state.show_welcome = false;
         state.set_turn_started("turn-1".to_owned());
@@ -8539,8 +8554,9 @@ mod tests {
                 .iter()
                 .filter(|block| matches!(block.kind, BlockKind::Plan))
                 .count(),
-            1
+            0
         );
+        assert_eq!(state.plan_summary.as_ref().map(|summary| summary.steps.len()), Some(1));
         assert_eq!(
             state
                 .committed
@@ -8869,7 +8885,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_plan_updates_are_added_to_the_transcript() {
+    fn turn_plan_updates_do_not_add_transcript_cards() {
         let mut state = test_state();
 
         state.handle_notification(
@@ -8886,13 +8902,14 @@ mod tests {
             }),
         );
 
-        let block = state.committed.last().expect("updated plan block");
-        assert!(matches!(block.kind, BlockKind::Plan));
-        assert_eq!(block.title, "Updated Plan");
+        assert!(state.committed.is_empty());
+        assert_eq!(state.plan_summary.as_ref().map(|summary| summary.steps.len()), Some(3));
         assert_eq!(
-            block.body,
-            "└ 범위를 확인했습니다.\n✔ 현재 구현 확인\n▸ 표시 동작 구현\n□ 회귀 테스트"
+            state.plan_summary.as_ref().and_then(|summary| summary.explanation.as_deref()),
+            Some("범위를 확인했습니다.")
         );
+        state.prepare_resume();
+        assert!(state.plan_summary.is_none());
     }
 
     #[test]
@@ -10681,19 +10698,59 @@ mod tests {
     }
 
     #[test]
-    fn composer_completion_escape_dismisses_until_the_token_changes() {
+    fn composer_escape_clears_the_prompt_and_attachments() {
         let mut state = composer_completion_state();
         state.editor.set_text("$rev");
+        state.attach_local_image(r"C:\Temp\clipboard-image.bmp".to_owned());
         assert!(!state.view().suggestions.is_empty());
 
         assert!(matches!(
             state.handle_key(KeyEvent::from(KeyCode::Esc)),
             Action::None
         ));
+        assert!(state.editor.is_empty());
+        assert_eq!(state.composer_image_count(), 0);
         assert!(state.view().suggestions.is_empty());
+    }
 
-        state.handle_key(KeyEvent::from(KeyCode::Char('i')));
-        assert!(!state.view().suggestions.is_empty());
+    #[test]
+    fn a_large_paste_stays_intact_behind_its_composer_summary() {
+        let mut state = test_state();
+        state.handle_paste("one\ntwo\nthree\nfour\nfive\nsix");
+
+        assert_eq!(state.editor.paste_summary_lines(), Some(6));
+        assert_eq!(state.editor.text(), "one\ntwo\nthree\nfour\nfive\nsix");
+
+        state.handle_key(KeyEvent::from(KeyCode::Left));
+        assert_eq!(state.editor.paste_summary_lines(), Some(6));
+    }
+
+    #[test]
+    fn typing_after_a_large_paste_keeps_the_summary_and_preserves_submit_text() {
+        let mut state = test_state();
+        state.handle_paste("one\ntwo\nthree\nfour\nfive\nsix");
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        state.handle_key(KeyEvent::from(KeyCode::Char('!')));
+
+        assert_eq!(state.editor.paste_summary_lines(), Some(6));
+        assert_eq!(
+            state.editor.take_for_submit().as_deref(),
+            Some("one\ntwo\nthree\nfour\nfive\nsix\n!")
+        );
+    }
+
+    #[test]
+    fn deleting_tail_text_after_a_large_paste_keeps_the_summary() {
+        let mut state = test_state();
+        state.handle_paste("one\ntwo\nthree\nfour\nfive\nsix");
+        state.handle_key(KeyEvent::from(KeyCode::Char('!')));
+        state.handle_key(KeyEvent::from(KeyCode::Backspace));
+
+        assert_eq!(state.editor.paste_summary_lines(), Some(6));
+        assert_eq!(
+            state.editor.take_for_submit().as_deref(),
+            Some("one\ntwo\nthree\nfour\nfive\nsix")
+        );
     }
 
     #[test]

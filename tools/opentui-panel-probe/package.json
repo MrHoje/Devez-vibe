@@ -1,0 +1,11 @@
+{
+  "name": "devez-opentui-panel-probe",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/main.ts"
+  },
+  "dependencies": {
+    "@opentui/core": "^0.2.6"
+  }
+}
