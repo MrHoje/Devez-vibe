@@ -9,11 +9,11 @@
     "terminal",
     "app-server"
   ],
-  "homepage": "https://github.com/MrHoje/Devez-Vibe#readme",
-  "bugs": "https://github.com/MrHoje/Devez-Vibe/issues",
+  "homepage": "https://github.com/MrHoje/Devez-vibe#readme",
+  "bugs": "https://github.com/MrHoje/Devez-vibe/issues",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/MrHoje/Devez-Vibe.git"
+    "url": "git+https://github.com/MrHoje/Devez-vibe.git"
   },
   "license": "MIT",
   "bin": {
