@@ -96,69 +96,64 @@ pub enum DiffDisplayMode {
 
 #[derive(Clone, Copy)]
 enum StatusLineField {
-    Branch,
     Model,
     Effort,
     Context,
     FiveHour,
     Weekly,
-    Reset,
+    Branch,
 }
 
 impl StatusLineField {
-    const ALL: [Self; 7] = [
-        Self::Branch,
+    const ALL: [Self; 6] = [
         Self::Model,
         Self::Effort,
         Self::Context,
         Self::FiveHour,
         Self::Weekly,
-        Self::Reset,
+        Self::Branch,
     ];
 
     const fn label(self) -> &'static str {
         match self {
-            Self::Branch => "Branch",
             Self::Model => "Model",
             Self::Effort => "Effort",
             Self::Context => "Context",
             Self::FiveHour => "5h limit",
             Self::Weekly => "Weekly limit",
-            Self::Reset => "Reset credits",
+            Self::Branch => "Branch",
         }
     }
 
     const fn config_key(self) -> &'static str {
         match self {
-            Self::Branch => "status_line_branch",
             Self::Model => "status_line_model",
             Self::Effort => "status_line_effort",
             Self::Context => "status_line_context",
             Self::FiveHour => "status_line_five_hour",
             Self::Weekly => "status_line_weekly",
-            Self::Reset => "status_line_reset",
+            Self::Branch => "status_line_branch",
         }
     }
 
     const fn index(self) -> usize {
         match self {
-            Self::Branch => 0,
-            Self::Model => 1,
-            Self::Effort => 2,
-            Self::Context => 3,
-            Self::FiveHour => 4,
-            Self::Weekly => 5,
-            Self::Reset => 6,
+            Self::Model => 0,
+            Self::Effort => 1,
+            Self::Context => 2,
+            Self::FiveHour => 3,
+            Self::Weekly => 4,
+            Self::Branch => 5,
         }
     }
 }
 
 #[derive(Clone, Copy)]
-struct StatusLineSettings([bool; 7]);
+struct StatusLineSettings([bool; 6]);
 
 impl Default for StatusLineSettings {
     fn default() -> Self {
-        Self([true; 7])
+        Self([true; 6])
     }
 }
 
@@ -489,30 +484,6 @@ impl AccountPlan {
         self.plan.clone().unwrap_or_else(|| "—".to_owned())
     }
 
-    /// Compact reset-credit reading for the status line. It only appears when
-    /// both the available tally and the next expiry are known.
-    fn status_line_reset(&self) -> Option<String> {
-        self.status_line_reset_at(unix_now())
-    }
-
-    /// Split out so the countdown wording can be tested without relying on the
-    /// wall clock.
-    fn status_line_reset_at(&self, now: u64) -> Option<String> {
-        let expiry = self
-            .credits
-            .iter()
-            .filter_map(|credit| credit.expires_at)
-            .filter(|expiry| *expiry > now)
-            .min()?;
-        (self.available_credits > 0).then(|| {
-            format!(
-                "reset: {} · {}",
-                self.available_credits,
-                reset_credit_duration(expiry - now)
-            )
-        })
-    }
-
     /// Welcome-panel rows: a summary followed by one line per credit.
     pub fn credit_lines(&self) -> Vec<String> {
         self.credit_lines_at(unix_now())
@@ -598,25 +569,6 @@ fn short_duration(seconds: u64) -> String {
         0..=59 => "<1m".to_owned(),
         60..=3_599 => format!("{}m", seconds / 60),
         3_600..=86_399 => format!("{}h", seconds / 3_600),
-        _ => format!("{}d", seconds / 86_400),
-    }
-}
-
-/// Compact countdown for a reset credit. Unlike the welcome card's coarse
-/// duration, sub-day spans keep their remaining minutes visible.
-fn reset_credit_duration(seconds: u64) -> String {
-    match seconds {
-        0..=59 => "<1m".to_owned(),
-        60..=3_599 => format!("{}m", seconds / 60),
-        3_600..=86_399 => {
-            let hours = seconds / 3_600;
-            let minutes = (seconds % 3_600) / 60;
-            if minutes == 0 {
-                format!("{hours}h")
-            } else {
-                format!("{hours}h {minutes}m")
-            }
-        }
         _ => format!("{}d", seconds / 86_400),
     }
 }
@@ -2369,6 +2321,7 @@ pub struct AppState {
     /// Set when the user interrupts after `turn/start` answers but before the
     /// app-server has announced that the turn is active.
     pending_interrupt: bool,
+    turn_interrupted: bool,
     pub busy: bool,
     pub cwd: String,
     account: String,
@@ -2406,7 +2359,6 @@ pub struct AppState {
     context_window: Option<u64>,
     transient_status: Option<String>,
     show_welcome: bool,
-    info_panel_open: bool,
     plan_summary: Option<PlanSummary>,
     command_selection: usize,
     spinner_frame: usize,
@@ -2490,6 +2442,7 @@ impl AppState {
             thread_id,
             turn_id: None,
             pending_interrupt: false,
+            turn_interrupted: false,
             busy: false,
             cwd,
             account,
@@ -2518,7 +2471,6 @@ impl AppState {
             context_window,
             transient_status: None,
             show_welcome: true,
-            info_panel_open: false,
             plan_summary: None,
             command_selection: 0,
             spinner_frame: 0,
@@ -2683,15 +2635,12 @@ impl AppState {
     /// Drops a prompt that was queued before the thread existed, so Ctrl+C reads
     /// the same as interrupting a live turn.
     pub fn cancel_queued_prompt(&mut self) {
+        self.last_completed_duration = self.turn_started_at.map(|started| started.elapsed());
+        self.turn_interrupted = self.last_completed_duration.is_some();
         self.busy = false;
         self.turn_id = None;
         self.pending_interrupt = false;
         self.turn_started_at = None;
-        self.push_notice(
-            BlockKind::Warning,
-            "전송 취소",
-            "세션이 준비되기 전에 입력이 취소되었습니다.",
-        );
     }
 
     pub fn set_account_plan(&mut self, plan: AccountPlan) {
@@ -2994,7 +2943,6 @@ impl AppState {
             effort: self.selected_effort.clone(),
             shell_display_mode: self.shell_display_mode().label().to_owned(),
             diff_display_mode: self.diff_display_mode().label().to_owned(),
-            info_panel_open: self.info_panel_open,
             cost: self.estimated_cost(),
         }
     }
@@ -3196,6 +3144,7 @@ impl AppState {
         let Some(turns) = thread.get("turns").and_then(Value::as_array) else {
             return;
         };
+        self.turn_interrupted = false;
         self.last_completed_duration = turns.iter().rev().find_map(|turn| {
             let started = turn.get("startedAt")?.as_i64()?;
             let completed = turn.get("completedAt")?.as_i64()?;
@@ -3226,6 +3175,9 @@ impl AppState {
         }
         self.turn_id = Some(turn_id);
         self.busy = true;
+        if !self.pending_interrupt {
+            self.turn_interrupted = false;
+        }
         self.last_completed_duration = None;
         // A prompt held back while the session was still starting has been counting
         // since the user pressed Enter, so keep that clock rather than restarting it.
@@ -3266,6 +3218,7 @@ impl AppState {
         self.busy = false;
         self.turn_id = None;
         self.pending_interrupt = false;
+        self.turn_interrupted = false;
         self.turn_started_at = None;
         self.committed
             .push(Block::new(BlockKind::Error, "요청 실패", message));
@@ -3281,15 +3234,12 @@ impl AppState {
             return Action::Interrupt;
         }
         if self.turn_id.is_some() {
+            self.turn_interrupted = true;
             return Action::Interrupt;
         }
         if !self.pending_interrupt {
             self.pending_interrupt = true;
-            self.push_notice(
-                BlockKind::Warning,
-                "중단 요청됨",
-                "turn이 시작되는 즉시 중단합니다.",
-            );
+            self.turn_interrupted = true;
         }
         Action::Tick(true)
     }
@@ -3409,6 +3359,7 @@ impl AppState {
         self.busy = false;
         self.turn_id = None;
         self.pending_interrupt = false;
+        self.turn_interrupted = false;
         self.turn_started_at = None;
         self.last_completed_duration = None;
     }
@@ -3487,7 +3438,6 @@ impl AppState {
         View {
             live_blocks,
             overlay: self.overlay_view(),
-            info_panel_open: self.info_panel_open,
             plan_summary: self.plan_summary.as_ref(),
             editor: &self.editor,
             composer_images: &self.composer_images,
@@ -3602,10 +3552,6 @@ impl AppState {
 
         if key.modifiers == KeyModifiers::SHIFT {
             match key.code {
-                KeyCode::Char('P') | KeyCode::Char('p') => {
-                    self.toggle_info_panel();
-                    return Action::Tick(true);
-                }
                 KeyCode::Up => {
                     self.move_selected_model(-1);
                     return Action::None;
@@ -6030,10 +5976,19 @@ impl AppState {
                 .turn_started_at
                 .map(|started| started.elapsed().as_secs())
                 .unwrap_or(0);
+            if self.turn_interrupted {
+                return Some(format!("✕ Interrupted ({})", format_elapsed(elapsed)));
+            }
             return Some(format!("Working.. ({})", format_elapsed(elapsed)));
         }
-        self.last_completed_duration
-            .map(|duration| format!("Completed ({})", format_elapsed(duration.as_secs())))
+        self.last_completed_duration.map(|duration| {
+            let label = if self.turn_interrupted {
+                "✕ Interrupted"
+            } else {
+                "Completed"
+            };
+            format!("{label} ({})", format_elapsed(duration.as_secs()))
+        })
     }
 
     fn activity_model(&self) -> Option<String> {
@@ -6101,11 +6056,6 @@ impl AppState {
                 .status_line_settings
                 .enabled(StatusLineField::Weekly)
                 .then_some(self.weekly_percent)
-                .flatten(),
-            reset_credits: self
-                .status_line_settings
-                .enabled(StatusLineField::Reset)
-                .then(|| self.account_plan.status_line_reset())
                 .flatten(),
             notice: self.transient_status.clone(),
         }
@@ -6242,10 +6192,6 @@ impl AppState {
     pub fn cycle_diff_display_mode(&mut self) -> DiffDisplayMode {
         self.diff_display_mode = self.diff_display_mode.next();
         self.diff_display_mode
-    }
-
-    pub fn toggle_info_panel(&mut self) {
-        self.info_panel_open = !self.info_panel_open;
     }
 
     pub fn toggle_plan_summary(&mut self) {
@@ -8121,16 +8067,6 @@ mod tests {
     }
 
     #[test]
-    fn shift_p_toggles_the_info_panel_without_editing_the_composer() {
-        let mut state = test_state();
-
-        let action = state.handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT));
-
-        assert!(matches!(action, Action::Tick(true)));
-        assert!(state.editor.is_empty());
-    }
-
-    #[test]
     fn shifted_model_and_effort_changes_announce_the_next_request_while_busy() {
         let mut state = test_state();
         state
@@ -8166,6 +8102,11 @@ mod tests {
             state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             Action::Tick(true)
         ));
+        assert!(
+            state
+                .activity()
+                .is_some_and(|activity| activity.starts_with("✕ Interrupted ("))
+        );
         assert_eq!(state.take_pending_interrupt(), None);
 
         state.set_turn_started("turn-1".to_owned());
@@ -8999,17 +8940,6 @@ mod tests {
             "unexpected credit row: {}",
             lines[1]
         );
-        assert_eq!(
-            plan.status_line_reset_at(1_785_092_634),
-            Some("reset: 3 · 5d".to_owned())
-        );
-    }
-
-    #[test]
-    fn reset_credit_countdown_uses_day_hour_and_minute_units() {
-        assert_eq!(reset_credit_duration(5 * 86_400), "5d");
-        assert_eq!(reset_credit_duration(23 * 3_600 + 59 * 60), "23h 59m");
-        assert_eq!(reset_credit_duration(55 * 60), "55m");
     }
 
     #[test]
@@ -9437,13 +9367,12 @@ mod tests {
                 .map(|line| line.text.as_str())
                 .collect::<Vec<_>>(),
             [
-                "☑ Branch",
                 "☑ Model",
                 "☑ Effort",
                 "☑ Context",
                 "☑ 5h limit",
                 "☑ Weekly limit",
-                "☑ Reset credits",
+                "☑ Branch",
             ]
         );
         assert!(overlay.lines[0].selected);
@@ -9451,14 +9380,14 @@ mod tests {
         state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
 
         let overlay = state.overlay_view().expect("status line picker stays open");
-        assert_eq!(overlay.lines[0].text, "☐ Branch");
-        assert_eq!(state.status_line().branch, None);
+        assert_eq!(overlay.lines[0].text, "☐ Model");
+        assert_eq!(state.status_line().model, None);
 
         state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         let overlay = state.overlay_view().expect("status line picker stays open");
-        assert_eq!(overlay.lines[1].text, "☐ Model");
-        assert_eq!(state.status_line().model, None);
+        assert_eq!(overlay.lines[1].text, "☐ Effort");
+        assert_eq!(state.status_line().effort, None);
 
         state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(state.overlay_view().is_none());
@@ -9469,7 +9398,7 @@ mod tests {
         let mut state = test_state();
         state.run_slash_command("/statusline");
 
-        let action = state.click_overlay_row(2);
+        let action = state.click_overlay_row(1);
 
         assert!(matches!(
             action,
@@ -9479,29 +9408,8 @@ mod tests {
             }
         ));
         let overlay = state.overlay_view().expect("status line picker stays open");
-        assert_eq!(overlay.lines[2].text, "☐ Effort");
-        assert!(overlay.lines[2].selected);
-    }
-
-    #[test]
-    fn statusline_reset_checkbox_persists_its_own_setting() {
-        let mut state = test_state();
-        state.status_line_settings.0[StatusLineField::Reset.index()] = true;
-        state.run_slash_command("/statusline");
-
-        let action = state.click_overlay_row(6);
-
-        assert!(matches!(
-            action,
-            Action::PersistStatusLine {
-                key_path: "status_line_reset",
-                enabled: false,
-            }
-        ));
-        assert_eq!(
-            state.overlay_view().expect("status line picker").lines[6].text,
-            "☐ Reset credits"
-        );
+        assert_eq!(overlay.lines[1].text, "☐ Effort");
+        assert!(overlay.lines[1].selected);
     }
 
     #[test]
@@ -10125,6 +10033,24 @@ mod tests {
         assert_eq!(
             state.activity().as_deref(),
             Some("Completed (10s)")
+        );
+    }
+
+    #[test]
+    fn interrupted_turn_activity_is_not_labeled_completed() {
+        let mut state = test_state();
+        state.set_turn_started("turn-1".to_owned());
+
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Esc)),
+            Action::Interrupt
+        ));
+        state.handle_notification("turn/completed", &json!({}));
+
+        assert!(
+            state
+                .activity()
+                .is_some_and(|activity| activity.starts_with("✕ Interrupted ("))
         );
     }
 

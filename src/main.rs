@@ -500,7 +500,6 @@ async fn choose_startup_session(
             View {
                 live_blocks: Vec::new(),
                 overlay: Some(picker.overlay_view()),
-                info_panel_open: false,
                 plan_summary: None,
                 editor: &editor,
                 composer_images: &[],
@@ -879,10 +878,6 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
         }
         Pick::ShellDisplayMode => Action::PersistShellDisplayMode(state.cycle_shell_display_mode()),
         Pick::DiffDisplayMode => Action::PersistDiffDisplayMode(state.cycle_diff_display_mode()),
-        Pick::InfoPanel => {
-            state.toggle_info_panel();
-            Action::Tick(true)
-        }
         Pick::PlanSummary => {
             state.toggle_plan_summary();
             Action::Tick(true)
@@ -3190,20 +3185,6 @@ mod tests {
         assert_ne!(state.shell_display_mode(), before);
     }
 
-    #[test]
-    fn clicking_the_panel_badge_toggles_the_info_panel() {
-        let mut state = starting_state();
-
-        assert!(matches!(
-            pick_action(&mut state, Pick::InfoPanel),
-            Action::Tick(true)
-        ));
-        assert!(state.view().info_panel_open);
-
-        pick_action(&mut state, Pick::InfoPanel);
-        assert!(!state.view().info_panel_open);
-    }
-
     /// The effort picker only has rows once a model has published its tiers, so
     /// the state a reading is clicked on carries one.
     fn state_with_a_model() -> AppState {
@@ -3538,14 +3519,14 @@ mod tests {
         assert!(matches!(
             action,
             Action::PersistStatusLine {
-                key_path: "status_line_branch",
+                key_path: "status_line_model",
                 enabled: false,
             }
         ));
 
         assert_eq!(
             state.view().overlay.expect("status line picker").lines[0].text,
-            "☐ Branch"
+            "☐ Model"
         );
     }
 
@@ -3755,6 +3736,12 @@ mod tests {
 
         assert_eq!(queued, None);
         assert!(!state.busy);
+        assert!(
+            state
+                .view()
+                .activity
+                .is_some_and(|activity| activity.starts_with("✕ Interrupted ("))
+        );
     }
 
     /// Local UI work stays available during the wait; thread-bound work is not sent
