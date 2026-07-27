@@ -9407,7 +9407,7 @@ mod tests {
     #[test]
     fn statusline_command_toggles_individual_status_fields_with_space() {
         let mut state = test_state();
-        state.status_line_settings.0[StatusLineField::Reset.index()] = true;
+        state.status_line_settings = StatusLineSettings::default();
 
         state.run_slash_command("/statusline");
 
