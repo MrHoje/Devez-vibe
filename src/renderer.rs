@@ -1403,7 +1403,7 @@ fn info_panel_main_clear_range(
     painted_info_panel: Option<InfoPanelLayout>,
     layout: InfoPanelLayout,
 ) -> Range<usize> {
-    0..if painted_info_panel.is_none() {
+    0..if painted_info_panel != Some(layout) {
         layout.panel_left
     } else {
         layout.main_width
@@ -6183,9 +6183,11 @@ mod tests {
     #[test]
     fn info_panel_opening_clear_reaches_panel_but_steady_clear_stops_at_main_frame() {
         let layout = info_panel_layout(72).unwrap();
+        let resized_layout = info_panel_layout(73).unwrap();
 
         assert_eq!(info_panel_main_clear_range(None, layout), 0..47);
         assert_eq!(info_panel_main_clear_range(Some(layout), layout), 0..44);
+        assert_eq!(info_panel_main_clear_range(Some(layout), resized_layout), 0..48);
     }
 
     #[test]
