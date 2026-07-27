@@ -19,9 +19,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Notes shown in the welcome panel's right column. Rewrite these each release;
 /// a line starting with `·` renders as a bullet, anything else as a sub-heading.
 pub const RELEASE_NOTES: &[&str] = &[
-    "· Shift+Tab cycles the permission mode",
-    "· Fast tier moved onto the composer rule",
-    "· Panels now fill the terminal width",
+    "If you're a vibe coder, click Vibe: to try Super Vibe mode.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
