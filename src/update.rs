@@ -8,8 +8,8 @@ use std::{
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-/// npm package that publishes the `devez` binary.
-const PACKAGE: &str = "devez-cli";
+/// npm package that publishes the `dvz` binary.
+const PACKAGE: &str = "devez-vibe";
 /// Registry lookups are cached so startup stays offline-friendly.
 const CHECK_INTERVAL_SECS: u64 = 60 * 60 * 12;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
@@ -26,7 +26,7 @@ pub const RELEASE_NOTES: &[&str] = &[
 
 /// Latest published version, only when it is newer than the running build.
 pub async fn check_for_update() -> Option<String> {
-    if env::var_os("DEVEZ_NO_UPDATE_CHECK").is_some() {
+    if env::var_os("DEVEZ_VIBE_NO_UPDATE_CHECK").is_some() {
         return None;
     }
 
@@ -48,7 +48,7 @@ pub async fn check_for_update() -> Option<String> {
 /// Hands the upgrade to a detached console. Windows keeps a lock on the running
 /// executable, so npm can only replace it once this process has exited.
 pub fn run_self_update() -> Result<()> {
-    println!("Devez CLI v{CURRENT_VERSION} · 최신 버전 설치를 시작합니다.");
+    println!("Devez Vibe v{CURRENT_VERSION} · 최신 버전 설치를 시작합니다.");
     println!("새 창에서 `npm install -g {PACKAGE}@latest`가 실행됩니다.");
     println!("설치가 끝나면 `dvz`를 다시 실행하세요.");
 
@@ -56,7 +56,7 @@ pub fn run_self_update() -> Result<()> {
         .args([
             "/C",
             "start",
-            "Devez CLI update",
+            "Devez Vibe update",
             "cmd",
             "/C",
             &format!(
@@ -71,7 +71,7 @@ pub fn run_self_update() -> Result<()> {
 async fn fetch_latest() -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
-        .user_agent(format!("devez-cli/{CURRENT_VERSION}"))
+        .user_agent(format!("devez-vibe/{CURRENT_VERSION}"))
         .build()
         .ok()?;
     let body = client

@@ -374,8 +374,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "devez-cli"
-version = "0.4.9"
+name = "devez-vibe"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",

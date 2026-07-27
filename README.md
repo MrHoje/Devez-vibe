@@ -1,4 +1,4 @@
-# Devez CLI
+# Devez Vibe
 
 공식 Codex `app-server`를 위해 독립적으로 구현한 터미널 클라이언트입니다.
 Codex의 인증, 하네스 프롬프트, 도구, 스킬, `AGENTS.md`, 샌드박스는 공식

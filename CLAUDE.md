@@ -1,4 +1,4 @@
-# DevezCLI 작업 지침
+# Devez Vibe 작업 지침
 
 ## 목차
 

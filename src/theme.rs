@@ -400,13 +400,13 @@ pub fn load(cli_override: Option<&str>) -> Result<ThemeKind> {
         return ThemeKind::parse(value)
             .with_context(|| format!("지원하지 않는 테마입니다: {value}"));
     }
-    Ok(read_theme_file(&devez_cli_theme_file())
+    Ok(read_theme_file(&devez_vibe_theme_file())
         .or_else(|| read_theme_file(&devez_code_theme_file()))
         .unwrap_or(ThemeKind::Dark))
 }
 
 pub fn save(theme: ThemeKind) -> Result<()> {
-    let path = devez_cli_theme_file();
+    let path = devez_vibe_theme_file();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("테마 설정 폴더 생성 실패: {}", parent.display()))?;
@@ -426,8 +426,8 @@ fn app_data() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn devez_cli_theme_file() -> PathBuf {
-    app_data().join("DevezCLI").join("theme.txt")
+fn devez_vibe_theme_file() -> PathBuf {
+    app_data().join("DevezVibe").join("theme.txt")
 }
 
 fn devez_code_theme_file() -> PathBuf {

@@ -1,0 +1,10 @@
+{
+  "version": 3,
+  "sources": ["../src/runtime-plugin-support.ts"],
+  "sourcesContent": [
+    "import { ensureRuntimePluginSupport } from \"./runtime-plugin-support-configure.js\"\n\nexport { ensureRuntimePluginSupport }\nexport {\n  createRuntimePlugin,\n  runtimeModuleIdForSpecifier,\n  type CreateRuntimePluginOptions,\n  type RuntimeModuleEntry,\n  type RuntimeModuleExports,\n  type RuntimeModuleLoader,\n} from \"./runtime-plugin-support-configure.js\"\n\nensureRuntimePluginSupport()\n"
+  ],
+  "mappings": ";;;;;;;;;;;AAYA,2BAA2B;",
+  "debugId": "77F70D7DCCE5C8F764756E2164756E21",
+  "names": []
+}

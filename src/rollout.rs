@@ -135,7 +135,7 @@ fn cost_cache_path(codex_home: &Path, thread_id: &str) -> PathBuf {
         })
         .collect::<String>();
     codex_home
-        .join("devez-cli")
+        .join("devez-vibe")
         .join("cost-cache")
         .join(format!("{file_name}.json"))
 }

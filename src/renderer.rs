@@ -23,7 +23,7 @@ use crossterm::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    editor::Editor,
+    editor::{ATTACHMENT_PLACEHOLDER, Editor},
     selection::{
         CellPosition, CellRange, CopyLine, Selection, SelectionFinish, extract_text,
         selected_char_count, selection_chunks,
@@ -63,9 +63,9 @@ pub fn load_render_mode(cli_override: Option<&str>) -> Result<RenderMode> {
         return RenderMode::parse(value)
             .with_context(|| format!("지원하지 않는 렌더러입니다: {value}"));
     }
-    if let Some(value) = env::var("DEVEZ_RENDERER").ok().filter(|v| !v.is_empty()) {
+    if let Some(value) = env::var("DEVEZ_VIBE_RENDERER").ok().filter(|v| !v.is_empty()) {
         return RenderMode::parse(&value)
-            .with_context(|| format!("DEVEZ_RENDERER 값을 알 수 없습니다: {value}"));
+            .with_context(|| format!("DEVEZ_VIBE_RENDERER 값을 알 수 없습니다: {value}"));
     }
     Ok(fs::read_to_string(render_mode_file())
         .ok()
@@ -77,7 +77,7 @@ fn render_mode_file() -> PathBuf {
     env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("DevezCLI")
+        .join("DevezVibe")
         .join("renderer.txt")
 }
 
@@ -141,6 +141,16 @@ impl Block {
         block
     }
 
+    pub fn file_change_group(title: impl Into<String>, children: Vec<Block>) -> Self {
+        let child_id = children.first().map(Block::id);
+        let mut block = Self::new(BlockKind::FileChange, title, "");
+        if let Some(child_id) = child_id {
+            block.id = child_id;
+        }
+        block.children = children;
+        block
+    }
+
     pub fn children(&self) -> &[Block] {
         &self.children
     }
@@ -153,7 +163,7 @@ impl Block {
             body.push('\n');
             body.push_str(line);
         }
-        Self::new(BlockKind::Welcome, "DEVEZ CLI", body)
+        Self::new(BlockKind::Welcome, "DEVEZ VIBE", body)
     }
 }
 
@@ -211,7 +221,6 @@ pub struct SuggestionView {
 }
 
 pub struct StatusLineView {
-    pub branch: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub context: Option<String>,
@@ -231,7 +240,18 @@ pub enum ModeAccent {
     Danger,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum VibeTone {
+    Off,
+    On,
+    Super,
+}
+
 pub struct ComposerMode {
+    /// Current Git branch, shown as a display-only composer badge.
+    pub branch: Option<String>,
+    pub vibe_mode: String,
+    pub vibe_tone: VibeTone,
     pub label: String,
     pub accent: ModeAccent,
     pub model: String,
@@ -270,6 +290,8 @@ pub struct View<'a> {
     pub overlay: Option<OverlayView<'a>>,
     /// A persistent right-hand panel, available only to the fullscreen renderer.
     pub plan_summary: Option<&'a PlanSummary>,
+    /// Whether the current turn is still active, so an in-progress plan row may animate.
+    pub plan_active: bool,
     pub editor: &'a Editor,
     pub composer_images: &'a [String],
     pub welcome: Option<WelcomeView>,
@@ -356,6 +378,7 @@ pub struct Renderer {
     mode: RenderMode,
     previous_lines: Vec<PaintLine>,
     cursor_line: usize,
+    cursor_shown: bool,
     last_width: u16,
     last_height: u16,
     theme: ThemeKind,
@@ -456,13 +479,7 @@ fn display_units(text: &str) -> Vec<&str> {
 }
 
 fn terminal_unit_width(unit: &str) -> usize {
-    // Windows Terminal renders the lightning status icon in one cell. Its emoji
-    // presentation selector otherwise makes `unicode-width` reserve two.
-    if unit == "⚡️" {
-        1
-    } else {
-        UnicodeWidthStr::width(unit)
-    }
+    UnicodeWidthStr::width(unit)
 }
 
 impl CellFrame {
@@ -586,6 +603,7 @@ impl Renderer {
             mode,
             previous_lines: Vec::new(),
             cursor_line: 0,
+            cursor_shown: true,
             last_width: 0,
             last_height: 0,
             theme: selected_theme,
@@ -764,7 +782,24 @@ impl Renderer {
             let start = UnicodeWidthStr::width(line.prefix.as_str());
             return Some(start..start + UnicodeWidthStr::width(line.text.as_str()));
         }
-        let columns = line.pick.as_ref()?.columns_of(hovered_pick?)?;
+        let hovered_pick = hovered_pick?;
+        let columns = line.pick.as_ref()?.columns_of(hovered_pick)?;
+        if matches!(hovered_pick, Pick::Effort(_)) {
+            let mut start = UnicodeWidthStr::width(line.prefix.as_str())
+                + UnicodeWidthStr::width(line.text.as_str());
+            for span in &line.tail {
+                let end = start + UnicodeWidthStr::width(span.text.as_str());
+                if span.bold
+                    && start >= columns.start
+                    && end <= columns.end
+                    && span.text.starts_with("│ ")
+                    && span.text.ends_with(" │")
+                {
+                    return Some(start + 2..end.saturating_sub(2));
+                }
+                start = end;
+            }
+        }
         // A whole-row region runs to the end of the painted row, not past it.
         Some(columns.start..columns.end.min(painted_line_width(line)))
     }
@@ -916,6 +951,7 @@ impl Renderer {
         self.selection.clear();
         self.painted_selection = None;
         self.cursor_line = 0;
+        self.cursor_shown = true;
         self.last_width = 0;
         self.last_height = 0;
         execute!(
@@ -1001,6 +1037,7 @@ impl Renderer {
                 height.max(3),
                 view.plan_summary,
                 view.activity_phase,
+                view.plan_active,
             );
         }
 
@@ -1077,9 +1114,10 @@ impl Renderer {
         height: u16,
         plan_summary: Option<&PlanSummary>,
         activity_phase: f32,
+        plan_active: bool,
     ) -> Result<()> {
         let rows = height as usize;
-        let plan_lines = plan_summary.map(|summary| fixed_plan_summary_lines(summary, width, activity_phase)).unwrap_or_default();
+        let plan_lines = plan_summary.map(|summary| fixed_plan_summary_lines(summary, width, activity_phase, plan_active)).unwrap_or_default();
         let plan_rows = plan_lines.len().min(rows.saturating_sub(1));
         let content_rows = rows.saturating_sub(plan_rows).max(1);
         let old_view_rows = split_rows(content_rows, frame.lines.len(), self.wrapped.len()).0;
@@ -1289,7 +1327,13 @@ impl Renderer {
         if let Some((row, control)) = scroll_to_bottom_overlay {
             paint_scroll_to_bottom_into_frame(&mut frame, row, control);
         }
-        queue!(self.out, Hide)?;
+        // Frame diffs move the terminal cursor across changed rows. Hide it
+        // while painting so shortcuts that only change chrome do not make the
+        // composer caret visibly jump before it returns to its final position.
+        if self.cursor_shown {
+            queue!(self.out, Hide)?;
+            self.cursor_shown = false;
+        }
         emit_synchronized_frame_diff(&mut self.out, self.painted_frame.as_ref(), &frame)?;
         self.painted_frame = Some(frame);
         self.painted_selection = selection;
@@ -1304,8 +1348,9 @@ impl Renderer {
                 cursor_line.min(u16::MAX as usize) as u16
             )
         )?;
-        if show_cursor {
+        if show_cursor && !self.cursor_shown {
             queue!(self.out, Show)?;
+            self.cursor_shown = true;
         }
         Ok(())
     }
@@ -1389,6 +1434,17 @@ impl Renderer {
     }
 
     fn patch_frame(&mut self, frame: &Frame) -> Result<()> {
+        queue!(self.out, Hide, Print("\x1b[?2026h"))?;
+        let result = self.patch_frame_inner(frame);
+        let end = queue!(self.out, Print("\x1b[?2026l"));
+        match (result, end) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(error.into()),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    fn patch_frame_inner(&mut self, frame: &Frame) -> Result<()> {
         let old_len = self.previous_lines.len();
         let new_len = frame.lines.len();
         if old_len == 0 || new_len == 0 {
@@ -1396,7 +1452,6 @@ impl Renderer {
             return self.print_frame_full(frame);
         }
 
-        queue!(self.out, Hide)?;
         let mut current_row = self.cursor_line.min(old_len - 1);
 
         if new_len > old_len {
@@ -1411,8 +1466,9 @@ impl Renderer {
             let changed = self.previous_lines.get(row) != frame.lines.get(row);
             if changed {
                 move_to_row(&mut self.out, &mut current_row, row)?;
-                queue!(self.out, Clear(ClearType::CurrentLine))?;
+                queue!(self.out, MoveToColumn(0))?;
                 print_line(&mut self.out, &frame.lines[row])?;
+                queue!(self.out, Clear(ClearType::UntilNewLine))?;
             }
         }
 
@@ -1523,10 +1579,23 @@ fn paint_line_into_frame(
 ) {
     let background = row_background(line.tone);
     if let Some(background) = background {
-        frame.fill(0, row, background_width.unwrap_or(frame.width), row + 1, CellStyle {
-            background: Some(background),
-            ..CellStyle::plain()
+        let width = background_width.unwrap_or_else(|| {
+            if line.tone == Tone::UserPrompt {
+                frame.width.saturating_sub(1)
+            } else {
+                frame.width
+            }
         });
+        frame.fill(
+            0,
+            row,
+            width,
+            row + 1,
+            CellStyle {
+                background: Some(background),
+                ..CellStyle::plain()
+            },
+        );
     }
     let mut column = 0;
     paint_text_into_frame(
@@ -1596,8 +1665,16 @@ fn emit_frame_diff(
 ) -> Result<()> {
     let previous = previous.filter(|frame| frame.width == current.width && frame.height == current.height);
     for row in 0..current.height {
+        let wide_damage = previous.and_then(|previous| wide_damage_range(previous, current, row));
+        if let Some(columns) = wide_damage.clone() {
+            emit_frame_columns(out, current, row, columns)?;
+        }
         let mut column = 0;
         while column < current.width {
+            if wide_damage.as_ref().is_some_and(|columns| columns.contains(&column)) {
+                column += 1;
+                continue;
+            }
             let cell = current.cell(column, row);
             let changed = previous.is_none_or(|previous| cell != previous.cell(column, row));
             if !changed || cell.continuation {
@@ -1624,6 +1701,9 @@ fn emit_frame_diff(
             let style = cell.style;
             let mut text = String::new();
             while column + 1 < current.width {
+                if wide_damage.as_ref().is_some_and(|columns| columns.contains(&column)) {
+                    break;
+                }
                 let cell = current.cell(column, row);
                 let changed = previous.is_none_or(|previous| cell != previous.cell(column, row));
                 if !changed || (!cell.continuation && cell.style != style) {
@@ -1646,6 +1726,92 @@ fn emit_frame_diff(
         }
     }
     queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
+    Ok(())
+}
+
+/// Returns the smallest safe repaint range around changed double-width glyphs.
+/// The range starts before any old/current continuation cell and ends after it,
+/// so a terminal is never asked to paint into the trailing half of a glyph.
+/// Keeping this local avoids clearing and flashing the entire composer row for
+/// every Korean character typed.
+fn wide_damage_range(previous: &CellFrame, current: &CellFrame, row: usize) -> Option<Range<usize>> {
+    let mut changed = (0..current.width).filter(|&column| {
+        let before = previous.cell(column, row);
+        let after = current.cell(column, row);
+        before != after
+            && (before.continuation
+                || after.continuation
+                || UnicodeWidthStr::width(before.glyph.as_str()) > 1
+                || UnicodeWidthStr::width(after.glyph.as_str()) > 1)
+    });
+    let mut start = changed.next()?;
+    let mut end = changed.last().unwrap_or(start) + 1;
+
+    while start > 0
+        && (previous.cell(start, row).continuation || current.cell(start, row).continuation)
+    {
+        start -= 1;
+    }
+    while end < current.width
+        && (previous.cell(end, row).continuation || current.cell(end, row).continuation)
+    {
+        end += 1;
+    }
+    Some(start..end)
+}
+
+fn emit_frame_columns(
+    out: &mut impl Write,
+    frame: &CellFrame,
+    row: usize,
+    columns: Range<usize>,
+) -> Result<()> {
+    let mut column = columns.start.min(frame.width);
+    let end = columns.end.min(frame.width);
+    while column < end {
+        let cell = frame.cell(column, row);
+        if cell.continuation {
+            column += 1;
+            continue;
+        }
+        if column + 1 == frame.width {
+            queue!(
+                out,
+                MoveTo(
+                    column.min(u16::MAX as usize) as u16,
+                    row.min(u16::MAX as usize) as u16
+                )
+            )?;
+            set_cell_style(out, cell.style)?;
+            queue!(out, Clear(ClearType::UntilNewLine))?;
+            column += 1;
+            continue;
+        }
+        let style = cell.style;
+        let start = column;
+        let mut text = String::new();
+        while column < end && column + 1 < frame.width {
+            let cell = frame.cell(column, row);
+            if !cell.continuation && cell.style != style {
+                break;
+            }
+            if cell.continuation {
+                column += 1;
+            } else {
+                text.push_str(&cell.glyph);
+                column += terminal_unit_width(&cell.glyph).max(1);
+            }
+        }
+        queue!(
+            out,
+            MoveTo(
+                start.min(u16::MAX as usize) as u16,
+                row.min(u16::MAX as usize) as u16
+            )
+        )?;
+        set_cell_style(out, style)?;
+        queue!(out, Print(text))?;
+    }
     Ok(())
 }
 
@@ -1724,7 +1890,8 @@ fn sticky_prompt_for_viewport(
         prefix_tone: Tone::Plain,
         text: compact_right(
             &anchor.text,
-            usize::from(width).saturating_sub(UnicodeWidthStr::width(prefix)),
+            usize::from(width)
+                .saturating_sub(UnicodeWidthStr::width(prefix) + 1),
         ),
         tone: Tone::UserPrompt,
         bold: true,
@@ -1821,6 +1988,7 @@ enum Tone {
     LimitWeekly,
     FastOn,
     FastOff,
+    VibeSuper,
     ModelChange,
     SyntaxComment,
     SyntaxString,
@@ -1851,11 +2019,11 @@ enum Tone {
 pub enum Pick {
     Row(usize),
     Effort(usize),
-    /// The response-length badge cycles the desired response length.
+    /// The Vibe preset applies its response and transcript display settings.
+    VibeMode,
+    /// Legacy internal picks retained for command and regression-test routing.
     ResponseLength,
-    /// The shell-display badge: cycles between hidden, collapsed, and expanded output.
     ShellDisplayMode,
-    /// The file-diff badge: cycles between hidden, summary, and full patch output.
     DiffDisplayMode,
     PlanSummary,
     /// The `Fast: On`/`Fast: Off` badge: toggles the fast service tier.
@@ -2029,7 +2197,8 @@ fn shimmer_spans(label: &str, phase: f32, base: Rgb) -> Vec<PaintSpan> {
         .collect()
 }
 
-const WORKING_SPINNER: [&str; 8] = ["✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳"];
+/// Gajae-Code's Unicode activity loader frames.
+const WORKING_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 fn activity_lines(
     activity: &str,
@@ -2038,7 +2207,7 @@ fn activity_lines(
     width: u16,
 ) -> Vec<PaintLine> {
     let tone = activity_model.and_then(model_tone).unwrap_or(Tone::Plain);
-    if UnicodeWidthStr::width(activity) > width as usize {
+    if UnicodeWidthStr::width(activity) > width.saturating_sub(2) as usize {
         return wrapped_line(" ", tone, activity, tone, false, width);
     }
     if let Some(trailer) = activity.strip_prefix("Working..") {
@@ -2156,7 +2325,7 @@ fn activity_line_with_composer_controls(
     picks.extend(
         badge
             .response_length_index
-            .map(|index| (badge_start + index, Pick::ResponseLength)),
+            .map(|index| (badge_start + index, Pick::VibeMode)),
     );
     picks.extend(
         badge
@@ -2518,7 +2687,7 @@ fn welcome_info_rows(welcome: &WelcomeView, column_width: usize) -> Vec<PanelRow
     let mut rows = vec![
         (
             format!(
-                "  ✦  DEVEZ CLI  v{}  with Codex",
+                "  ✦  DEVEZ VIBE  v{}  with Codex",
                 crate::update::CURRENT_VERSION
             ),
             Tone::Accent,
@@ -2645,7 +2814,7 @@ fn column_cell(row: Option<&PanelRow>, width: usize) -> PanelRow {
 
 /// Panels share the composer's span so their borders line up with the rule.
 fn panel_span(width: u16) -> usize {
-    (width as usize).saturating_sub(1).max(20)
+    (width as usize).saturating_sub(1).max(19)
 }
 
 /// A titled rule such as `╭─ Sign in ────╮`, closed with `corner`.
@@ -2788,7 +2957,7 @@ fn panel_bottom(inner_width: usize) -> PaintLine {
 
 /// Full-width update banner: a rule, the headline, the hint, and a closing rule.
 fn update_lines(block: &Block, width: u16) -> Vec<PaintLine> {
-    let rule_width = (width as usize).max(1);
+    let rule_width = (width as usize).saturating_sub(1).max(1);
     let text_width = rule_width.saturating_sub(2);
     let rule = || PaintLine {
         prefix: String::new(),
@@ -3435,7 +3604,7 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         return PaintLine {
             prefix: " ".to_owned(),
             prefix_tone: Tone::Muted,
-            text: compact_right(fallback, width.saturating_sub(1) as usize),
+            text: compact_right(fallback, width.saturating_sub(2) as usize),
             tone: Tone::Muted,
             bold: false,
             tool_heading: None,
@@ -3455,10 +3624,11 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         picks.push((span, Pick::Model));
     }
     if let Some(effort) = status.effort.filter(|effort| !effort.is_empty()) {
+        let tone = status_effort_tone(&effort).unwrap_or(Tone::StatusText);
         let span = push_status_span(
             &mut spans,
-            format!("⚡️{effort}"),
-            status_effort_tone(&effort).unwrap_or(Tone::StatusText),
+            format!("◆ {effort}"),
+            tone,
         );
         picks.push((span, Pick::EffortSetting));
     }
@@ -3475,9 +3645,6 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
     }
     if let Some(percent) = status.weekly_percent {
         push_status_span(&mut spans, format!("week: {percent}%"), Tone::StatusText);
-    }
-    if let Some(branch) = status.branch.filter(|branch| !branch.is_empty()) {
-        push_status_span(&mut spans, compact_right(&branch, 24), Tone::StatusText);
     }
     // Fast: On/Off lives on the composer top rule beside the permission mode.
     if let Some(notice) = status.notice.filter(|notice| !notice.is_empty()) {
@@ -3659,6 +3826,13 @@ fn is_web_search_block(block: &Block) -> bool {
         && (block.title == "Web search" || block.title.starts_with("Web search ·"))
 }
 
+fn is_auxiliary_tool_block(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::Tool)
+        && (block.title.starts_with("MCP ·")
+            || block.title.starts_with("Tool ·")
+            || block.title == "Agent")
+}
+
 fn is_thinking_block(block: &Block) -> bool {
     matches!(block.kind, BlockKind::Reasoning) && block.title == THINKING_TITLE
 }
@@ -3694,7 +3868,8 @@ fn visible_transcript_blocks<'a>(
         if shell_display_mode == ShellDisplayMode::Hide
             && (is_bash_block(block)
                 || is_running_shell_anchor(block)
-                || is_web_search_block(block))
+                || is_web_search_block(block)
+                || is_auxiliary_tool_block(block))
         {
             continue;
         }
@@ -3764,7 +3939,7 @@ fn bash_lines(block: &Block, width: u16, expanded: bool) -> Vec<PaintLine> {
     if !expanded {
         let marker = "▸ ";
         let available = usize::from(width)
-            .saturating_sub(UnicodeWidthStr::width(marker))
+            .saturating_sub(UnicodeWidthStr::width(marker) + 1)
             .max(1);
         return vec![PaintLine {
             prefix: marker.to_owned(),
@@ -3926,6 +4101,15 @@ fn file_change_heading_lines(block: &Block, width: u16) -> Vec<PaintLine> {
 }
 
 fn file_change_counts(block: &Block) -> (usize, usize) {
+    if !block.children().is_empty() {
+        return block
+            .children()
+            .iter()
+            .map(file_change_counts)
+            .fold((0, 0), |total, counts| {
+                (total.0 + counts.0, total.1 + counts.1)
+            });
+    }
     block
         .body
         .lines()
@@ -3939,6 +4123,23 @@ fn file_change_counts(block: &Block) -> (usize, usize) {
                 (added, removed)
             }
         })
+}
+
+fn file_change_expanded_lines(block: &Block, width: u16) -> Vec<PaintLine> {
+    if block.children().is_empty() {
+        return file_change_lines(block, width);
+    }
+    block
+        .children()
+        .iter()
+        .flat_map(|child| file_change_expanded_lines(child, width))
+        .map(|mut line| {
+            if line.tool_heading.is_some() {
+                line.tool_heading = Some(block.id());
+            }
+            line
+        })
+        .collect()
 }
 
 /// File edits use an `Update(path)` heading, line counts hanging off it under a
@@ -4211,7 +4412,7 @@ fn hunk_start(row: &str) -> Option<(usize, usize)> {
 /// that renders as a bare thought instead of a labelled section.
 const THINKING_TITLE: &str = "Thinking…";
 
-/// Codex paints a plan update as `• Updated Plan`, the explanation hanging off
+/// Codex paints a plan update as `• 작업 단계`, the explanation hanging off
 /// a `└`, then one checkbox row per step indented four columns: `✔` for done,
 /// `□` for the rest, with the in-progress step lit instead of dimmed. The body
 /// carries `▸` for that step so the row keeps a status the text alone can't.
@@ -4252,31 +4453,31 @@ fn plan_lines(block: &Block, width: u16) -> Vec<PaintLine> {
 
 /// Reasoning summaries use a narrow `∴` gutter and a single dim italic
 /// paragraph. Plan blocks keep their heading and one physical row per step.
-fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32) -> Vec<PaintLine> {
+fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_active: bool) -> Vec<PaintLine> {
+    let line_width = panel_span(width);
     let completed = summary.steps.iter().filter(|step| step.status == PlanStepStatus::Completed).count();
     let mut lines = Vec::new();
-    let steps = if summary.expanded {
-        summary.steps.iter().collect::<Vec<_>>()
-    } else {
-        let mut steps = summary.steps.iter().filter(|step| step.status != PlanStepStatus::Completed).collect::<Vec<_>>();
-        steps.extend(summary.steps.iter().rev().filter(|step| step.status == PlanStepStatus::Completed));
-        steps
-    };
+    let steps = summary.steps.iter().collect::<Vec<_>>();
     let hidden = steps.len().saturating_sub(4);
     let visible = if summary.expanded { steps.len() } else { 4 };
     for step in steps.into_iter().take(visible) {
         let (prefix, bold) = match step.status {
             PlanStepStatus::Completed => ("  ✔ ".to_owned(), false),
-            PlanStepStatus::InProgress => (format!("  {} ", WORKING_SPINNER[(phase.clamp(0.0, 0.999) * WORKING_SPINNER.len() as f32) as usize]), true),
+            PlanStepStatus::InProgress if plan_active => (format!("  {} ", WORKING_SPINNER[(phase.clamp(0.0, 0.999) * WORKING_SPINNER.len() as f32) as usize]), true),
+            PlanStepStatus::InProgress => ("  ▸ ".to_owned(), false),
             PlanStepStatus::Pending => ("  □ ".to_owned(), false),
         };
-        let task_text = compact_right(&step.text, usize::from(width).saturating_sub(UnicodeWidthStr::width(prefix.as_str())));
+        let task_text = compact_right(
+            &step.text,
+            line_width.saturating_sub(UnicodeWidthStr::width(prefix.as_str())),
+        );
         let in_progress = step.status == PlanStepStatus::InProgress;
         lines.push(PaintLine {
-            prefix, prefix_tone: if step.status == PlanStepStatus::InProgress { Tone::Accent } else { Tone::Muted },
-            text: if in_progress { String::new() } else { task_text.clone() },
-            tone: Tone::Plain, bold, tool_heading: None, pick: None,
-            tail: in_progress.then(|| shimmer_spans(&task_text, phase, theme::palette().accent)).unwrap_or_default(),
+            prefix,
+            prefix_tone: if step.status == PlanStepStatus::Completed || in_progress { Tone::Accent } else { Tone::Muted },
+            text: task_text,
+            tone: if in_progress { Tone::Accent } else { Tone::Plain }, bold, tool_heading: None, pick: None,
+            tail: Vec::new(),
         });
     }
     if hidden > 0 {
@@ -4285,18 +4486,45 @@ fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32) -> Ve
         } else {
             format!("+{hidden}개 항목 숨김")
         };
+        let padded_text = format!("  {text}");
         lines.push(PaintLine {
-            prefix: String::new(), prefix_tone: Tone::Muted, text: text.clone(),
+            prefix: String::new(), prefix_tone: Tone::Muted, text: padded_text,
             tone: Tone::Thinking, bold: false, tool_heading: None,
-            pick: Some(PickRegions::span(0, UnicodeWidthStr::width(text.as_str()), Pick::PlanSummary)), tail: Vec::new(),
+            pick: Some(PickRegions::span(2, UnicodeWidthStr::width(text.as_str()), Pick::PlanSummary)), tail: Vec::new(),
         });
     }
-    let title = format!("Updated Plan · {completed} / {} 완료", summary.steps.len());
-    lines.insert(0, PaintLine::plain(format!(
-        "━━━━ {title} {}",
-        "━".repeat(usize::from(width).saturating_sub(UnicodeWidthStr::width(title.as_str()) + 5))
+    let title = format!("작업 단계 · {completed} / {} 완료", summary.steps.len());
+    let all_completed = !summary.steps.is_empty() && completed == summary.steps.len();
+    let header_tail = if all_completed { " X ━┓" } else { "┓" };
+    let header_rule = "━".repeat(
+        line_width
+            .saturating_sub(5 + UnicodeWidthStr::width(title.as_str()) + UnicodeWidthStr::width(header_tail)),
+    );
+    let header = PaintLine {
+        prefix: String::new(),
+        prefix_tone: Tone::Border,
+        text: format!("┏━━ {title} {header_rule}"),
+        tone: Tone::Plain,
+        bold: false,
+        tool_heading: None,
+        pick: None,
+        tail: if all_completed {
+            vec![
+                PaintSpan { text: " X ".to_owned(), tone: Tone::Plain, bold: false },
+                PaintSpan { text: "━┓".to_owned(), tone: Tone::Plain, bold: false },
+            ]
+        } else {
+            vec![PaintSpan { text: "┓".to_owned(), tone: Tone::Plain, bold: false }]
+        },
+    };
+    let header = if all_completed { header.with_picks(&[(1, Pick::Close)]) } else { header };
+    lines.insert(0, header);
+    lines.insert(1, PaintLine::blank());
+    lines.push(PaintLine::blank());
+    lines.push(PaintLine::plain(format!(
+        "┗{}┛",
+        "━".repeat(line_width.saturating_sub(2))
     )));
-    lines.push(PaintLine::plain("━".repeat(usize::from(width))));
     lines.push(PaintLine::blank());
     lines
 }
@@ -4422,10 +4650,10 @@ fn block_lines_with_mode(
     if matches!(block.kind, BlockKind::FileChange) {
         return match diff_display_mode {
             DiffDisplayMode::Hide => Vec::new(),
-            DiffDisplayMode::Collapse if expanded => file_change_lines(block, width),
+            DiffDisplayMode::Collapse if expanded => file_change_expanded_lines(block, width),
             DiffDisplayMode::Collapse => file_change_summary_lines(block, width),
             DiffDisplayMode::Expand if expanded => file_change_summary_lines(block, width),
-            DiffDisplayMode::Expand => file_change_lines(block, width),
+            DiffDisplayMode::Expand => file_change_expanded_lines(block, width),
         };
     }
     if matches!(block.kind, BlockKind::ModelChange) {
@@ -4781,7 +5009,7 @@ fn code_box_width(prefix: &str, label: &str, rows: &[&str], terminal_width: u16)
         .unwrap_or(0);
     let inner_width = (UnicodeWidthStr::width(label) + 5).max(widest_code + 4);
     (UnicodeWidthStr::width(prefix) + inner_width)
-        .min(usize::from(terminal_width))
+        .min(usize::from(terminal_width).saturating_sub(1))
         .min(usize::from(u16::MAX)) as u16
 }
 
@@ -4855,7 +5083,9 @@ fn styled_lines(
     width: u16,
 ) -> Vec<PaintLine> {
     let prefix_width = UnicodeWidthStr::width(prefix);
-    let available = (width as usize).saturating_sub(prefix_width).max(1);
+    let available = (width as usize)
+        .saturating_sub(prefix_width + 1)
+        .max(1);
     let mut rows: Vec<Vec<PaintSpan>> = vec![Vec::new()];
     let mut used = 0;
 
@@ -5331,16 +5561,46 @@ fn composer_display(editor: &Editor, composer_images: &[String]) -> (String, usi
     let labels = (1..=composer_images.len())
         .map(|index| format!("[Image #{index}]"))
         .collect::<Vec<_>>();
-    let prefix = if labels.is_empty() {
-        String::new()
-    } else {
-        format!("{} ", labels.join(" "))
-    };
-    let (text, editor_cursor) = editor
+    let (source, source_cursor) = editor
         .collapsed_paste_display()
-        .unwrap_or_else(|| (editor.text(), editor.cursor()));
-    let cursor = prefix.chars().count() + editor_cursor;
-    (format!("{prefix}{text}"), cursor)
+        .unwrap_or_else(|| (editor.display_text(), editor.display_cursor()));
+    let chars = source.chars().collect::<Vec<_>>();
+    let mut display = String::new();
+    let mut display_cursor = 0;
+    let mut image_index = 0;
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if index == source_cursor {
+            display_cursor = display.chars().count();
+        }
+        if ch != ATTACHMENT_PLACEHOLDER {
+            display.push(ch);
+            continue;
+        }
+        let Some(label) = labels.get(image_index) else {
+            continue;
+        };
+        if display.chars().last().is_some_and(|ch| !ch.is_whitespace()) {
+            display.push(' ');
+        }
+        display.push_str(label);
+        if chars
+            .get(index + 1)
+            .is_some_and(|&next| next != ATTACHMENT_PLACEHOLDER && !next.is_whitespace())
+        {
+            display.push(' ');
+        }
+        image_index += 1;
+    }
+    if source_cursor == chars.len() {
+        display_cursor = display.chars().count();
+    }
+    if image_index < labels.len() {
+        if !display.is_empty() {
+            display.push(' ');
+        }
+        display.push_str(&labels[image_index..].join(" "));
+    }
+    (display, display_cursor)
 }
 
 /// Blocks whose lines carry `devez-copy-v1` metadata. Excludes the ones drawn as
@@ -5428,7 +5688,7 @@ fn input_lines_with_controls(
             raw_rows.push(String::new());
             row += 1;
             column = input_prefix_width;
-            if index == editor.cursor() {
+            if index == editor_cursor {
                 cursor_row = row;
                 cursor_column = column;
             }
@@ -5535,11 +5795,9 @@ fn input_top_line_with_controls(
     controls_mode: Option<&ComposerMode>,
 ) -> PaintLine {
     let chrome_tone = composer_chrome_tone(mode);
-    let left = if label.is_empty() {
-        String::new()
-    } else {
-        format!("{OPENING_RULE}{label} ")
-    };
+    let left = (!label.is_empty())
+        .then(|| format!("{OPENING_RULE}{label} "))
+        .unwrap_or_default();
     let left_width = UnicodeWidthStr::width(left.as_str());
     // Right-hand badges eat into this budget; whatever survives stays as rule.
     let mut budget = panel_width.saturating_sub(left_width + COMPOSER_RULE_MIN);
@@ -5575,7 +5833,7 @@ fn input_top_line_with_controls(
         picks.extend(
             badge
                 .response_length_index
-                .map(|index| (badge_start + index, Pick::ResponseLength)),
+                .map(|index| (badge_start + index, Pick::VibeMode)),
         );
         picks.extend(
             badge
@@ -5723,14 +5981,28 @@ fn corner_composer_rule(mut line: PaintLine, left: char, right: char) -> PaintLi
     line
 }
 
-/// Widest badge that fits in `budget`: estimated cost · response length · Shell
-/// display mode · Diff display mode · fast flag. Tightening
-/// drops cost, then optional trailing controls; response length remains. Parts
+/// Widest badge that fits in `budget`: response length · Shell display mode ·
+/// Diff display mode · fast flag. Tightening drops optional trailing controls;
+/// response length remains. Parts
 /// are never ellipsized — a half-written label or clipped price is worse than none.
 fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans> {
-    let response_length_span = PaintSpan {
-        text: format!("Response: {}", mode.response_length),
-        tone: Tone::Muted,
+    let mut display_spans = Vec::new();
+    if let Some(branch) = mode.branch.as_deref().filter(|branch| !branch.is_empty()) {
+        display_spans.push(PaintSpan {
+            text: format!("* {branch}"),
+            tone: Tone::Branch,
+            bold: false,
+        });
+        display_spans.push(display_separator_span());
+    }
+    let display_width = display_spans.len();
+    let vibe_mode_span = PaintSpan {
+        text: mode.vibe_mode.clone(),
+        tone: match mode.vibe_tone {
+            VibeTone::Off => Tone::Muted,
+            VibeTone::On => Tone::FastOn,
+            VibeTone::Super => Tone::VibeSuper,
+        },
         bold: false,
     };
 
@@ -5749,80 +6021,33 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
         bold: false,
     };
 
-    let shell_display_mode_span = PaintSpan {
-        text: format!("Shell: {}", mode.shell_display_mode),
-        tone: Tone::Muted,
-        bold: false,
-    };
-    let diff_display_mode_span = PaintSpan {
-        text: format!("Diff: {}", mode.diff_display_mode),
-        tone: Tone::Muted,
-        bold: false,
-    };
-    // Brackets mark the cost as an aside rather than a setting like the two
-    // badges beside it. The cost leads, so its separator trails it instead.
-    let cost_spans = mode
-        .cost
-        .as_deref()
-        .map(|cost| {
-            vec![
-                PaintSpan {
-                    text: format!("[{cost}]"),
-                    tone: Tone::Plain,
-                    bold: false,
-                },
-                separator_span(),
-            ]
-        })
-        .unwrap_or_default();
-
-    // Widest first. The cost is the least important reading and goes first;
-    // Fast is the final optional control in every retained layout.
-    let cost_width = cost_spans.len();
+    let custom_spans = false.then(|| {
+        vec![
+            PaintSpan { text: format!("Response: {}", mode.response_length), tone: Tone::Muted, bold: false },
+            separator_span(),
+            PaintSpan { text: format!("Shell: {}", mode.shell_display_mode), tone: Tone::Muted, bold: false },
+            separator_span(),
+            PaintSpan { text: format!("Diff: {}", mode.diff_display_mode), tone: Tone::Muted, bold: false },
+        ]
+    });
+    let primary_spans = custom_spans.unwrap_or_else(|| vec![vibe_mode_span.clone()]);
+    // Fast is the only optional trailing control.
     let ladder = [
         BadgeSpans {
             spans: [
-                cost_spans,
-                vec![response_length_span.clone(), separator_span()],
-                vec![shell_display_mode_span.clone(), separator_span()],
-                vec![diff_display_mode_span.clone(), separator_span()],
+                display_spans.clone(),
+                [primary_spans.clone(), vec![separator_span()]].concat(),
                 vec![fast_span.clone()],
             ]
             .concat(),
-            response_length_index: Some(cost_width),
-            shell_display_mode_index: Some(cost_width + 2),
-            diff_display_mode_index: Some(cost_width + 4),
-            fast_index: Some(cost_width + 6),
+            response_length_index: Some(display_width),
+            shell_display_mode_index: None,
+            diff_display_mode_index: None,
+            fast_index: Some(display_width + primary_spans.len() + 1),
         },
         BadgeSpans {
-            spans: [
-                vec![response_length_span.clone(), separator_span()],
-                vec![shell_display_mode_span.clone(), separator_span()],
-                vec![diff_display_mode_span.clone(), separator_span()],
-                vec![fast_span],
-            ]
-            .concat(),
-            response_length_index: Some(0),
-            shell_display_mode_index: Some(2),
-            diff_display_mode_index: Some(4),
-            fast_index: Some(6),
-        },
-        BadgeSpans {
-            spans: vec![
-                response_length_span.clone(),
-                separator_span(),
-                shell_display_mode_span,
-                separator_span(),
-                diff_display_mode_span,
-            ],
-            response_length_index: Some(0),
-            shell_display_mode_index: Some(2),
-            diff_display_mode_index: Some(4),
-            fast_index: None,
-        },
-        BadgeSpans {
-            spans: vec![response_length_span],
-            response_length_index: Some(0),
+            spans: [display_spans, primary_spans.clone()].concat(),
+            response_length_index: Some(display_width),
             shell_display_mode_index: None,
             diff_display_mode_index: None,
             fast_index: None,
@@ -5847,6 +6072,14 @@ struct BadgeSpans {
 fn separator_span() -> PaintSpan {
     PaintSpan {
         text: COMPOSER_BADGE_SEPARATOR.to_owned(),
+        tone: Tone::Muted,
+        bold: false,
+    }
+}
+
+fn display_separator_span() -> PaintSpan {
+    PaintSpan {
+        text: " | ".to_owned(),
         tone: Tone::Muted,
         bold: false,
     }
@@ -6413,8 +6646,9 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::Branch => palette.status.branch,
         Tone::LimitFiveHour => palette.status.five_hour,
         Tone::LimitWeekly => palette.status.weekly,
-        Tone::FastOn => palette.success,
+        Tone::FastOn => palette.blue,
         Tone::FastOff => palette.muted,
+        Tone::VibeSuper => palette.warning,
         Tone::ModelChange => palette.foreground,
         Tone::SyntaxComment => palette.syntax_comment,
         Tone::SyntaxString => palette.syntax_string,
@@ -6482,28 +6716,20 @@ mod tests {
     }
 
     #[test]
-    fn frame_keeps_the_emoji_lightning_in_one_cell() {
-        let mut frame = CellFrame::new(12, 1);
-        frame.write(0, 0, "⚡️high", CellStyle::plain());
+    fn user_prompt_background_leaves_the_rightmost_cell_unpainted() {
+        let mut frame = CellFrame::new(8, 1);
 
-        assert_eq!(frame.cell(0, 0).glyph, "⚡️");
-        assert!(!frame.cell(0, 0).continuation);
-        assert_eq!(frame.cell(1, 0).glyph, "h");
-    }
+        paint_line_into_frame(
+            &mut frame,
+            0,
+            &PaintLine::user_prompt_padding(),
+            None,
+            None,
+            None,
+        );
 
-    #[test]
-    fn lightning_status_rows_are_coalesced_into_one_run() {
-        let mut frame = CellFrame::new(16, 1);
-        frame.write(0, 0, " ⚡️high | 126k", CellStyle::plain());
-        let mut output = Vec::new();
-
-        emit_frame_diff(&mut output, None, &frame).expect("frame diff emits");
-
-        let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
-        assert_eq!(output.matches("\x1b[1;1H").count(), 1);
-        assert!(output.contains("⚡️"));
-        assert!(output.contains('h'));
-        assert!(output.contains('k'));
+        assert_eq!(frame.cell(6, 0).style.background, row_background(Tone::UserPrompt));
+        assert_eq!(frame.cell(7, 0).style.background, None);
     }
 
     #[test]
@@ -6561,6 +6787,65 @@ mod tests {
         assert!(output.starts_with("\x1b[?2026h"));
         assert!(output.contains('x'));
         assert!(output.ends_with("\x1b[?2026l"));
+    }
+
+    #[test]
+    fn changed_korean_text_uses_a_local_safe_repaint_range() {
+        let mut before = CellFrame::new(16, 1);
+        before.write(0, 0, "한글 단어", CellStyle::plain());
+        let mut after = CellFrame::new(16, 1);
+        after.write(0, 0, "한글 ", CellStyle::plain());
+
+        let damage = wide_damage_range(&before, &after, 0).expect("wide text changed");
+        assert_eq!(damage, 5..9);
+    }
+
+    #[test]
+    fn changed_korean_text_does_not_clear_or_repaint_the_whole_row() {
+        let background = Rgb(1, 2, 3);
+        let style = CellStyle {
+            background: Some(background),
+            ..CellStyle::plain()
+        };
+        let mut before = CellFrame::new(16, 1);
+        before.fill(
+            0,
+            0,
+            16,
+            1,
+            style,
+        );
+        before.write(4, 0, "한글 단어", style);
+        let mut after = CellFrame::new(16, 1);
+        after.fill(0, 0, 16, 1, style);
+        after.write(4, 0, "한글 새", style);
+
+        let mut output = Vec::new();
+        emit_frame_diff(&mut output, Some(&before), &after).expect("frame diff emits");
+
+        let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
+        assert!(!output.contains("\x1b[2K"));
+        assert!(!output.contains("\x1b[1;1H"));
+        assert!(output.contains("새"));
+    }
+
+    #[test]
+    fn korean_text_shift_repaints_from_a_leading_cell_not_a_continuation() {
+        let mut before = CellFrame::new(12, 1);
+        before.write(4, 0, "한", CellStyle::plain());
+        let mut after = CellFrame::new(12, 1);
+        after.write(4, 0, "x한", CellStyle::plain());
+
+        assert_eq!(wide_damage_range(&before, &after, 0), Some(4..7));
+
+        let mut output = Vec::new();
+        emit_frame_diff(&mut output, Some(&before), &after).expect("frame diff emits");
+        let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
+
+        assert!(output.contains("\x1b[1;5H"));
+        assert!(output.contains("x한"));
+        assert!(!output.contains("\x1b[1;6H"));
+        assert!(!output.contains("\x1b[2K"));
     }
 
     #[test]
@@ -6846,6 +7131,45 @@ mod tests {
     }
 
     #[test]
+    fn korean_composer_text_uses_the_rightmost_safe_cells_without_clipping() {
+        let mut editor = Editor::default();
+        editor.set_text("가가가가가가");
+
+        let (rows, cursor_row, cursor_col) =
+            input_lines(&editor, &[], 18, "", "placeholder", None, None);
+
+        assert_eq!((cursor_row, cursor_col), (1, 16));
+        assert!(painted(&rows[1]).contains("가가가가가가"));
+        assert!(rows.iter().all(|row| painted_width(row) == 17));
+
+        editor.set_text("가가가가가가나");
+        let (rows, cursor_row, cursor_col) =
+            input_lines(&editor, &[], 18, "", "placeholder", None, None);
+
+        assert_eq!((cursor_row, cursor_col), (2, 6));
+        assert!(painted(&rows[1]).contains("가가가가가가"));
+        assert!(painted(&rows[2]).contains('나'));
+        assert!(rows.iter().all(|row| painted_width(row) == 17));
+    }
+
+    #[test]
+    fn collapsed_paste_cursor_moves_to_the_new_row_at_the_right_edge() {
+        let mut editor = Editor::default();
+        editor.insert_paste_str("1\n2\n3\n4\n5\n6");
+        editor.insert_str("abc");
+        editor.move_home();
+        editor.move_right();
+
+        let (_, display_cursor) = composer_display(&editor, &[]);
+        assert_eq!(display_cursor, 24);
+
+        let (_, cursor_row, cursor_col) =
+            input_lines(&editor, &[], 18, "", "placeholder", None, None);
+
+        assert_eq!((cursor_row, cursor_col), (3, 4));
+    }
+
+    #[test]
     fn fullscreen_composer_copy_excludes_the_box_chrome() {
         let mut editor = Editor::default();
         editor.set_text("copy");
@@ -7073,22 +7397,44 @@ mod tests {
     fn composer_display_shows_labels_only_for_explicit_image_attachments() {
         let mut editor = Editor::default();
         editor.set_text(r"inspect C:\tmp\ordinary.png");
+        editor.insert_attachment();
         let images = vec![r"C:\Temp\clipboard-image.bmp".to_owned()];
 
         let (display, cursor) = composer_display(&editor, &images);
 
-        assert_eq!(display, r"[Image #1] inspect C:\tmp\ordinary.png");
+        assert_eq!(display, r"inspect C:\tmp\ordinary.png [Image #1]");
         assert_eq!(cursor, display.chars().count());
     }
 
     #[test]
     fn input_lines_show_image_labels_when_the_text_editor_is_empty() {
-        let editor = Editor::default();
+        let mut editor = Editor::default();
+        editor.insert_attachment();
         let images = vec![r"C:\Temp\clipboard-image.bmp".to_owned()];
 
-        let (rows, _, _) = input_lines(&editor, &images, 80, "", "", None, None);
+        let (rows, cursor_row, cursor_col) =
+            input_lines(&editor, &images, 80, "", "", None, None);
 
-        assert!(painted(&rows[1]).contains("> [Image #1] "));
+        assert!(painted(&rows[1]).contains("> [Image #1]"));
+        assert_eq!(cursor_row, 1);
+        assert_eq!(cursor_col, UnicodeWidthStr::width("│ > [Image #1]"));
+    }
+
+    #[test]
+    fn image_attachment_cursor_moves_across_the_whole_label() {
+        let mut editor = Editor::default();
+        editor.insert_attachment();
+        let images = vec![r"C:\Temp\clipboard-image.bmp".to_owned()];
+
+        let (display, after) = composer_display(&editor, &images);
+        editor.move_left();
+        let (_, before) = composer_display(&editor, &images);
+        editor.move_right();
+        let (_, after_again) = composer_display(&editor, &images);
+
+        assert_eq!(before, 0);
+        assert_eq!(after, display.chars().count());
+        assert_eq!(after_again, after);
     }
 
     #[test]
@@ -7148,7 +7494,7 @@ mod tests {
     }
 
     #[test]
-    fn update_banner_spans_the_full_width_between_two_rules() {
+    fn update_banner_reserves_the_terminal_autowrap_column() {
         let block = Block::new(
             BlockKind::Update,
             "Update Available",
@@ -7158,7 +7504,7 @@ mod tests {
 
         assert_eq!(lines.len(), 5);
         assert!(lines[0].text.chars().all(|ch| ch == '─'));
-        assert_eq!(UnicodeWidthStr::width(lines[0].text.as_str()), 80);
+        assert_eq!(UnicodeWidthStr::width(lines[0].text.as_str()), 79);
         assert_eq!(lines[0].text, lines[3].text);
         assert_eq!(lines[1].prefix, "● ");
         assert_eq!(lines[1].prefix_tone, Tone::Accent);
@@ -7529,6 +7875,50 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_file_change_group_shows_one_card_with_combined_counts() {
+        let group = Block::file_change_group(
+            "Update(src/state.rs)",
+            vec![
+                Block::new(
+                    BlockKind::FileChange,
+                    "Update(src/state.rs)",
+                    "Added 2 lines, removed 1 line\n@@ -1 +1,2 @@\n-old\n+new\n+extra",
+                ),
+                Block::new(
+                    BlockKind::FileChange,
+                    "Update(src/state.rs)",
+                    "Added 1 line, removed 1 line\n@@ -3 +3 @@\n-before\n+after",
+                ),
+            ],
+        );
+
+        let collapsed = block_lines_with_mode(
+            &group,
+            80,
+            ShellDisplayMode::Collapse,
+            DiffDisplayMode::Collapse,
+            false,
+        );
+        assert_eq!(collapsed.len(), 2);
+        assert_eq!(painted(&collapsed[0]), "● Update(src/state.rs)");
+        assert_eq!(painted(&collapsed[1]), "  ⎿ Added 3 · Removed 2");
+
+        let expanded = block_lines_with_mode(
+            &group,
+            80,
+            ShellDisplayMode::Collapse,
+            DiffDisplayMode::Expand,
+            false,
+        );
+        assert!(expanded.iter().any(|line| painted(line).contains("old")));
+        assert!(expanded.iter().any(|line| painted(line).contains("after")));
+        assert!(expanded
+            .iter()
+            .filter(|line| line.tool_heading.is_some())
+            .all(|line| line.tool_heading == Some(group.id())));
+    }
+
+    #[test]
     fn clicking_a_file_change_heading_toggles_its_patch_and_hover() {
         let block = Block::new(
             BlockKind::FileChange,
@@ -7583,7 +7973,7 @@ mod tests {
         let lines = markdown_line(
             "",
             Tone::Plain,
-            "변경: [src/main.rs](C:/Source/DevezCLI/src/main.rs:83), [Cargo.toml](C:/Source/DevezCLI/Cargo.toml:29)",
+            "변경: [src/main.rs](C:/Source/DevezVibe/src/main.rs:83), [Cargo.toml](C:/Source/DevezVibe/Cargo.toml:29)",
             Tone::Plain,
             false,
             200,
@@ -7966,7 +8356,7 @@ mod tests {
 
         assert_eq!(line.prefix, " ");
         assert_eq!(line.text, "");
-        assert_eq!(line.tail.first().map(|span| span.text.as_str()), Some("✽ "));
+        assert_eq!(line.tail.first().map(|span| span.text.as_str()), Some("⠴ "));
         assert_eq!(line.tail.first().map(|span| span.tone), Some(Tone::ModelTerra));
         assert_eq!(line.tone, Tone::ModelTerra);
         assert!(line.tail.iter().any(
@@ -8035,6 +8425,9 @@ mod tests {
 
     fn test_mode(label: &str, accent: ModeAccent, fast_mode: bool) -> ComposerMode {
         ComposerMode {
+            branch: None,
+            vibe_mode: "Vibe: On".to_owned(),
+            vibe_tone: VibeTone::On,
             label: label.to_owned(),
             accent,
             model: "GPT-5.6-Terra".to_owned(),
@@ -8224,37 +8617,65 @@ mod tests {
     }
 
     #[test]
-    fn estimated_cost_leads_the_badge() {
+    fn estimated_cost_is_not_shown_above_the_composer() {
         let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
         mode.cost = Some("$0.95".to_owned());
         let line = input_top_line(80, "", Some(&mode));
-        let texts = line
-            .tail
-            .iter()
-            .map(|span| span.text.as_str())
-            .collect::<Vec<_>>();
-
         assert_eq!(rule_width(&line), 80);
-        assert_eq!(
-            texts,
-            [
-                "  ",
-                "[$0.95]",
-                " · ",
-                "Response: Short",
-                " · ",
-                "Shell: Collapse",
-                " · ",
-                "Diff: Collapse",
-                " · ",
-                "Fast: On",
-                " ",
-                "─╮"
-            ]
-        );
-        assert_eq!(line.tail[1].tone, Tone::Plain);
-        assert_eq!(line.tail[3].tone, Tone::Muted);
-        assert_eq!(line.tail[5].tone, Tone::Muted);
+        assert!(!painted(&line).contains("$0.95"));
+        assert_eq!(pick_on(&line, "Vibe: On"), Some(Pick::VibeMode));
+    }
+
+    #[test]
+    fn estimated_cost_is_excluded_from_composer_badges() {
+        let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
+        mode.cost = Some("$0.95".to_owned());
+
+        let line = input_top_line(80, "", Some(&mode));
+
+        assert!(!painted(&line).contains("$0.95"));
+    }
+
+    #[test]
+    fn composer_rule_places_branch_before_response_without_cost() {
+        let mut mode = test_mode("Full Access", ModeAccent::Danger, false);
+        mode.branch = Some("main".to_owned());
+        mode.cost = Some("$0.95".to_owned());
+
+        let line = input_top_line(120, "", Some(&mode));
+
+        assert!(painted(&line).contains("* main | Vibe: On"));
+        assert!(!painted(&line).contains("$0.95"));
+    }
+
+    #[test]
+    fn vibe_badge_is_clickable_outside_custom_mode() {
+        let line = input_top_line(120, "", Some(&test_mode("Full Access", ModeAccent::Danger, false)));
+
+        assert_eq!(pick_on(&line, "Vibe: On"), Some(Pick::VibeMode));
+    }
+
+    #[test]
+    fn vibe_and_fast_badges_use_their_role_tones() {
+        let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
+        let tones = |mode: &ComposerMode| {
+            fitting_badge_spans(mode, 120)
+                .unwrap()
+                .spans
+                .into_iter()
+                .map(|span| (span.text, span.tone))
+                .collect::<Vec<_>>()
+        };
+
+        let on = tones(&mode);
+        assert!(on.contains(&("Vibe: On".to_owned(), Tone::FastOn)));
+        assert!(on.contains(&("Fast: On".to_owned(), Tone::FastOn)));
+
+        mode.vibe_tone = VibeTone::Off;
+        assert!(tones(&mode).contains(&("Vibe: On".to_owned(), Tone::Muted)));
+
+        mode.vibe_tone = VibeTone::Super;
+        assert!(tones(&mode).contains(&("Vibe: On".to_owned(), Tone::VibeSuper)));
     }
 
     #[test]
@@ -8263,26 +8684,6 @@ mod tests {
         mode.cost = Some("$0.95".to_owned());
         let line = input_top_line(80, "", Some(&mode));
 
-        assert_eq!(
-            line.tail
-                .iter()
-                .map(|span| span.text.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "  ",
-                "[$0.95]",
-                " · ",
-                "Response: Short",
-                " · ",
-                "Shell: Collapse",
-                " · ",
-                "Diff: Collapse",
-                " · ",
-                "Fast: On",
-                " ",
-                "─╮"
-            ]
-        );
         assert_eq!(
             pick_on(&line, "Shell: Collapse"),
             Some(Pick::ShellDisplayMode)
@@ -8293,32 +8694,15 @@ mod tests {
         );
     }
 
-    /// The cost is the first thing to go: it is the least load-bearing segment.
     #[test]
-    fn the_cost_is_dropped_before_the_fast_flag() {
+    fn hidden_cost_leaves_room_for_fast_control() {
         let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
         mode.cost = Some("$0.95".to_owned());
         let line = input_top_line(66, "", Some(&mode));
-        let texts = line
-            .tail
-            .iter()
-            .map(|span| span.text.as_str())
-            .collect::<Vec<_>>();
-
         assert_eq!(rule_width(&line), 66);
-        assert_eq!(
-            texts,
-            [
-                "  ",
-                "Response: Short",
-                " · ",
-                "Shell: Collapse",
-                " · ",
-                "Diff: Collapse",
-                " ",
-                "─╮"
-            ]
-        );
+        assert!(!painted(&line).contains("$0.95"));
+        assert!(painted(&line).contains("Vibe: On"));
+        assert!(painted(&line).contains("Fast: On"));
     }
 
     #[test]
@@ -8923,7 +9307,7 @@ mod tests {
     }
 
     #[test]
-    fn hide_omits_shell_and_web_search_blocks() {
+    fn hide_omits_shell_web_search_and_auxiliary_tool_blocks() {
         for hidden in [
             Block::new(BlockKind::Tool, "Running 1 shell command", ""),
             Block::new(BlockKind::Tool, "Running Shell Command", ""),
@@ -8932,6 +9316,10 @@ mod tests {
             Block::new(BlockKind::Tool, "Command", "Running Shell Command"),
             Block::new(BlockKind::Tool, "Web search", ""),
             Block::new(BlockKind::Tool, "Web search · rust ownership", ""),
+            Block::new(BlockKind::Tool, "MCP · node_repl › js", "2"),
+            Block::new(BlockKind::Tool, "MCP · docs › search", "result"),
+            Block::new(BlockKind::Tool, "Tool · lookup", "result"),
+            Block::new(BlockKind::Tool, "Agent", "result"),
         ] {
             assert!(
                 visible_transcript_blocks(
@@ -9538,14 +9926,14 @@ mod tests {
         let lines = block_lines(
             &Block::new(
                 BlockKind::Plan,
-                "Updated Plan",
+                "작업 단계",
                 "└ why\n✔ first\n▸ second\n□ third",
             ),
             80,
         );
 
         assert_eq!(lines[0].prefix, "• ");
-        assert_eq!(lines[0].text, "Updated Plan");
+        assert_eq!(lines[0].text, "작업 단계");
         assert!(lines[0].bold);
         assert_eq!(lines[1].prefix, "  └ ");
         assert_eq!(lines[1].text, "why");
@@ -9566,7 +9954,7 @@ mod tests {
 
     #[test]
     fn plan_blocks_without_steps_say_so() {
-        let lines = block_lines(&Block::new(BlockKind::Plan, "Updated Plan", "└ why"), 80);
+        let lines = block_lines(&Block::new(BlockKind::Plan, "작업 단계", "└ why"), 80);
 
         assert_eq!(lines[1].text, "why");
         assert_eq!(lines[2].text, "(no steps provided)");
@@ -9576,7 +9964,6 @@ mod tests {
     fn status_line_is_trimmed_to_terminal_width() {
         let line = status_line_row(
             Some(StatusLineView {
-                branch: Some("main".to_owned()),
                 model: Some("GPT-5.6 Codex".to_owned()),
                 effort: Some("xhigh".to_owned()),
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
@@ -9593,10 +9980,9 @@ mod tests {
     }
 
     #[test]
-    fn status_line_marks_an_omitted_model_effort_hint_with_dots() {
+    fn status_line_keeps_model_and_effort_when_branch_is_removed() {
         let line = status_line_row(
             Some(StatusLineView {
-                branch: Some("main".to_owned()),
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 context: None,
@@ -9608,14 +9994,14 @@ mod tests {
             30,
         );
 
-        assert!(painted(&line).ends_with("..."));
+        assert!(painted(&line).contains("GPT-5.6 Sol"));
+        assert!(painted(&line).contains("◆ high"));
     }
 
     #[test]
     fn status_line_places_the_model_and_effort_shortcuts_at_the_far_right() {
         let line = status_line_row(
             Some(StatusLineView {
-                branch: Some("main".to_owned()),
                 model: Some("GPT-5.6 Codex".to_owned()),
                 effort: Some("xhigh".to_owned()),
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
@@ -9635,7 +10021,6 @@ mod tests {
     fn status_line_omits_a_disabled_branch_slot() {
         let line = status_line_row(
             Some(StatusLineView {
-                branch: None,
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 context: None,
@@ -9652,12 +10037,11 @@ mod tests {
     }
 
     /// The two readings the status line lets you change answer to a click; the
-    /// ones that only report — branch, context, limits — do not.
+    /// ones that only report — context and limits — do not.
     #[test]
     fn the_model_and_effort_readings_are_the_only_clickable_status_spans() {
         let line = status_line_row(
             Some(StatusLineView {
-                branch: Some("main".to_owned()),
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
@@ -9681,17 +10065,16 @@ mod tests {
         assert_eq!(
             line.tail
                 .iter()
-                .find(|span| span.text == "⚡️high")
+                .find(|span| span.text == "◆ high")
                 .map(|span| span.tone),
             Some(Tone::StatusEffortHigh)
         );
     }
 
     #[test]
-    fn effort_status_icon_uses_single_terminal_cell_width() {
+    fn effort_status_reading_has_no_unicode_width_override() {
         let line = status_line_row(
             Some(StatusLineView {
-                branch: None,
                 model: None,
                 effort: Some("high".to_owned()),
                 context: None,
@@ -9703,7 +10086,7 @@ mod tests {
             80,
         );
 
-        assert!(painted(&line).contains("⚡️high"));
+        assert!(painted(&line).contains("◆ high"));
     }
 
     /// Before the first status arrives the row is a plain fallback string, with no
@@ -9757,7 +10140,7 @@ mod tests {
         WelcomeView {
             plan: "Pro Lite".to_owned(),
             credits: vec!["3 available".to_owned(), "· 2026-08-01  6d left".to_owned()],
-            cwd: "C:/Source/DevezCLI".to_owned(),
+            cwd: "C:/Source/DevezVibe".to_owned(),
             account: "dev@example.com".to_owned(),
         }
     }
@@ -10219,7 +10602,7 @@ mod tests {
     fn a_docked_picker_keeps_the_welcome_card_on_screen() {
         let welcome = WelcomeView {
             plan: "Pro".to_owned(),
-            cwd: r"C:\Source\DevezCLI".to_owned(),
+            cwd: r"C:\Source\DevezVibe".to_owned(),
             account: "someone@example.com".to_owned(),
             credits: vec!["in 3h".to_owned()],
         };
@@ -10256,7 +10639,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(painted.contains("DEVEZ CLI"), "{painted}");
+        assert!(painted.contains("DEVEZ VIBE"), "{painted}");
         assert!(painted.contains("someone@example.com"), "{painted}");
         // The card sits above the picker rather than replacing it.
         assert!(frame.lines[0].text.starts_with('╭'));
@@ -10486,6 +10869,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn hovering_a_selected_effort_lights_its_label_not_its_box_edges() {
+        let slider = EffortSlider {
+            efforts: ["low", "medium", "high"].map(ToOwned::to_owned).to_vec(),
+            selected: 1,
+        };
+        let steps = effort_step_lines(&slider, 80).remove(1);
+        let selected = "│ MEDIUM │";
+        let painted_steps = painted(&steps);
+        let selected_start = UnicodeWidthStr::width(&painted_steps[..painted_steps.find(selected).unwrap()]);
+
+        assert_eq!(
+            Renderer::hover_columns(&steps, None, Some(&Pick::Effort(1))),
+            Some(selected_start + 2..selected_start + 8)
+        );
+    }
+
     /// The top row of a picker, closable or not, at 80 columns.
     fn picker_top_row(closable: bool) -> PaintLine {
         let frame = overlay_frame(
@@ -10632,7 +11032,6 @@ mod tests {
         theme::set_current(ThemeKind::Dark);
         let line = status_line_row(
             Some(StatusLineView {
-                branch: Some("main".to_owned()),
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 context: None,
@@ -10958,27 +11357,87 @@ mod tests {
             expanded: false,
         };
 
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.0);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, true);
 
-        assert_eq!(lines.len(), 8);
-        assert!(lines[0].text.contains("Updated Plan · 0 / 7 완료"));
-        assert_eq!(lines[5].text.trim_end(), "+3개 항목 숨김");
-        assert_eq!(pick_on(&lines[5], "+3개 항목 숨김"), Some(Pick::PlanSummary));
-        assert!(lines[6].text.starts_with('━'));
+        assert_eq!(lines.len(), 10);
+        assert!(lines[0].text.starts_with("┏━━ 작업 단계 · 0 / 7 완료"));
+        assert!(painted(&lines[0]).ends_with('┓'));
+        assert!(lines[0].tail.iter().all(|span| span.tone == Tone::Plain));
+        assert!(lines[1].text.is_empty());
+        assert_eq!(lines[6].text.trim_end(), "  +3개 항목 숨김");
+        assert_eq!(pick_on(&lines[6], "+3개 항목 숨김"), Some(Pick::PlanSummary));
         assert!(lines[7].text.is_empty());
+        assert!(lines[8].text.starts_with('┗'));
+        assert!(lines[8].text.ends_with('┛'));
+        assert!(lines[9].text.is_empty());
     }
 
     #[test]
-    fn in_progress_plan_step_uses_the_working_spinner_and_shimmer() {
+    fn completed_plan_summary_header_has_a_close_mark() {
+        let summary = PlanSummary {
+            explanation: None,
+            steps: vec![PlanStep { text: "Done".to_owned(), status: PlanStepStatus::Completed }],
+            expanded: false,
+        };
+
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
+
+        assert!(painted(&lines[0]).ends_with(" X ━┓"));
+        assert_eq!(UnicodeWidthStr::width(painted(&lines[0]).as_str()), 79);
+        assert!(lines[0].tail.iter().all(|span| span.tone == Tone::Plain));
+        assert_eq!(pick_on(&lines[0], "X"), Some(Pick::Close));
+    }
+
+    #[test]
+    fn compact_plan_keeps_the_original_task_order() {
+        let summary = PlanSummary {
+            explanation: None,
+            steps: vec![
+                PlanStep { text: "Task 1".to_owned(), status: PlanStepStatus::Completed },
+                PlanStep { text: "Task 2".to_owned(), status: PlanStepStatus::Pending },
+                PlanStep { text: "Task 3".to_owned(), status: PlanStepStatus::Completed },
+                PlanStep { text: "Task 4".to_owned(), status: PlanStepStatus::Pending },
+                PlanStep { text: "Task 5".to_owned(), status: PlanStepStatus::Pending },
+            ],
+            expanded: false,
+        };
+
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
+
+        assert_eq!(painted(&lines[2]), "  ✔ Task 1");
+        assert_eq!(painted(&lines[3]), "  □ Task 2");
+        assert_eq!(painted(&lines[4]), "  ✔ Task 3");
+        assert_eq!(lines[2].prefix_tone, Tone::Accent);
+        assert_eq!(lines[2].tone, Tone::Plain);
+    }
+
+    #[test]
+    fn in_progress_plan_step_uses_the_working_spinner_without_shimmer() {
         let summary = PlanSummary {
             explanation: None,
             steps: vec![PlanStep { text: "Working task".to_owned(), status: PlanStepStatus::InProgress }],
             expanded: false,
         };
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.5);
-        assert!(lines[1].prefix.contains('✽'));
-        assert!(!lines[1].tail.is_empty());
-        assert!(matches!(lines[1].tail[0].tone, Tone::Shimmer(_, _)));
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.5, true);
+        assert!(lines[2].prefix.contains('⠴'));
+        assert_eq!(lines[2].text, "Working task");
+        assert_eq!(lines[2].tone, Tone::Accent);
+        assert!(lines[2].tail.is_empty());
+    }
+
+    #[test]
+    fn inactive_in_progress_plan_step_uses_a_static_triangle() {
+        let summary = PlanSummary {
+            explanation: None,
+            steps: vec![PlanStep { text: "Paused task".to_owned(), status: PlanStepStatus::InProgress }],
+            expanded: false,
+        };
+
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.5, false);
+
+        assert_eq!(lines[2].prefix, "  ▸ ");
+        assert_eq!(lines[2].prefix_tone, Tone::Accent);
+        assert!(lines[2].tail.is_empty());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# Devez CLI
+# Devez Vibe
 
 공식 `codex app-server`를 위한 차분한 터미널 클라이언트입니다. 인증, 하네스 프롬프트,
 도구, 스킬, `AGENTS.md`, 샌드박스는 Codex가 그대로 담당하고, 이 프로젝트는 화면과 입력
@@ -7,7 +7,7 @@
 ## 설치
 
 ```powershell
-npm install -g devez-cli
+npm install -g devez-vibe
 ```
 
 현재 Windows x64 빌드만 배포합니다.
@@ -38,11 +38,11 @@ dvz [--resume [SESSION] | --continue] [--model MODEL] [--effort EFFORT]
 dvz update
 ```
 
-`npm install -g devez-cli@latest`와 동일하며, 실행 중인 바이너리를 교체할 수 있도록
+`npm install -g devez-vibe@latest`와 동일하며, 실행 중인 바이너리를 교체할 수 있도록
 별도 창에서 설치가 진행됩니다.
 
-업데이트 확인을 끄려면 `DEVEZ_NO_UPDATE_CHECK` 환경변수를 설정합니다.
+업데이트 확인을 끄려면 `DEVEZ_VIBE_NO_UPDATE_CHECK` 환경변수를 설정합니다.
 
 ## 라이선스
 
-MIT. 자세한 내용은 [저장소](https://github.com/MrHoje/Devez-cli)를 참고하세요.
+MIT. 자세한 내용은 [저장소](https://github.com/MrHoje/Devez-Vibe)를 참고하세요.

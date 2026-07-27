@@ -290,8 +290,8 @@ impl AppServer {
 fn initialize_params() -> Value {
     json!({
         "clientInfo": {
-            "name": "devez-cli",
-            "title": "Devez CLI",
+            "name": "devez-vibe",
+            "title": "Devez Vibe",
             "version": env!("CARGO_PKG_VERSION")
         },
         "capabilities": {
@@ -362,7 +362,7 @@ fn codex_command(resolved: &Path) -> Command {
 /// to chatgpt.com, and the connectors endpoints behind Cloudflare only answer
 /// the CLI's own originator — anything else gets a bot challenge instead of an
 /// answer, which is what made `app/list` fail with a 403 HTML page. The client
-/// still identifies itself as devez-cli everywhere the app-server reports it;
+/// still identifies itself as devez-vibe everywhere the app-server reports it;
 /// only the outgoing header is pinned. An explicit override in the environment
 /// wins, so this stays debuggable.
 fn apply_originator_override(command: &mut Command) {
@@ -530,7 +530,7 @@ mod tests {
         );
         assert_eq!(
             params.pointer("/clientInfo/name").and_then(Value::as_str),
-            Some("devez-cli")
+            Some("devez-vibe")
         );
     }
 

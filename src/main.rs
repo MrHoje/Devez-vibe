@@ -87,8 +87,8 @@ struct Cli {
 
     /// Renderer: fullscreen pins the composer and status line to the bottom and
     /// scrolls the transcript itself; inline hands the transcript to the
-    /// terminal's own scrollback. Saved in %APPDATA%\DevezCLI\renderer.txt, or
-    /// set DEVEZ_RENDERER.
+    /// terminal's own scrollback. Saved in %APPDATA%\DevezVibe\renderer.txt, or
+    /// set DEVEZ_VIBE_RENDERER.
     #[arg(long, value_name = "RENDERER")]
     renderer: Option<String>,
 }
@@ -97,13 +97,21 @@ struct Cli {
 enum Command {
     /// Install the latest published release from npm.
     Update,
+    /// Print the Devez Vibe version.
+    Version,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    if matches!(cli.command, Some(Command::Update)) {
-        return update::run_self_update();
+    if let Some(command) = cli.command.as_ref() {
+        match command {
+            Command::Update => return update::run_self_update(),
+            Command::Version => {
+                println!("Devez Vibe v{}", update::CURRENT_VERSION);
+                return Ok(());
+            }
+        }
     }
     let selected_theme = theme::load(cli.theme.as_deref())?;
     theme::set_current(selected_theme);
@@ -292,17 +300,20 @@ async fn await_thread(
 ) -> Result<Startup> {
     let mut events = EventStream::new();
     let mut composer_paste = ComposerPasteBuffer::new();
-    let mut paste_tick = tokio::time::interval(Duration::from_millis(25));
+    let mut paste_tick = tokio::time::interval(Duration::from_millis(5));
     paste_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut spinner_tick = tokio::time::interval(Duration::from_millis(120));
     spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut queued = None;
     let mut plan_pending = true;
+    let mut redraw = true;
     tokio::pin!(thread);
     tokio::pin!(plan);
 
     loop {
-        draw(state, renderer)?;
+        if redraw {
+            draw(state, renderer)?;
+        }
         let action = tokio::select! {
             thread_response = &mut thread => {
                 // In practice the plan lands first, but never drop it on the floor.
@@ -353,6 +364,7 @@ async fn await_thread(
             _ = spinner_tick.tick() => Action::Tick(state.tick()),
         };
 
+        redraw = !matches!(&action, Action::Tick(false)) && !composer_paste.is_buffering();
         match hold_until_thread(state, action, &mut queued) {
             // Listing sessions is the one server call the wait makes itself. It goes
             // straight to the RPC rather than through `execute_action`, which would
@@ -501,6 +513,7 @@ async fn choose_startup_session(
                 live_blocks: Vec::new(),
                 overlay: Some(picker.overlay_view()),
                 plan_summary: None,
+                plan_active: false,
                 editor: &editor,
                 composer_images: &[],
                 welcome: None,
@@ -588,9 +601,9 @@ async fn event_loop(
     let mut update_rx = Some(update_rx);
     let mut terminal_events = EventStream::new();
     let mut composer_paste = ComposerPasteBuffer::new();
-    let mut paste_tick = tokio::time::interval(Duration::from_millis(25));
+    let mut paste_tick = tokio::time::interval(Duration::from_millis(5));
     paste_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut activity_tick = tokio::time::interval(Duration::from_millis(120));
+    let mut activity_tick = tokio::time::interval(Duration::from_millis(16));
     activity_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut resize = ResizeTracker::new();
     let (workspace_tx, mut workspace_rx) = mpsc::channel(1);
@@ -766,7 +779,10 @@ async fn event_loop(
             }
         };
 
-        let redraw = !matches!(&action, Action::Tick(false));
+        // Windows exposes a paste as many key events. Do not render between
+        // those events while the composer is collecting them; rendering is
+        // much slower than parsing and used to make long pastes crawl.
+        let redraw = !matches!(&action, Action::Tick(false)) && !composer_paste.is_buffering();
         let should_quit = execute_action(server, state, renderer, action).await?;
         if redraw {
             draw(state, renderer)?;
@@ -872,12 +888,25 @@ fn renderer_mouse_action(
 /// never drift apart. Overlay picks belong to whoever painted the overlay.
 fn pick_action(state: &mut AppState, pick: Pick) -> Action {
     match pick {
+        Pick::VibeMode => {
+            let (shell, diff) = state.cycle_vibe_mode();
+            Action::PersistVibeDisplayModes { vibe: state.vibe_mode(), response: state.response_length(), shell, diff }
+        }
         Pick::ResponseLength => {
             state.cycle_response_length();
-            Action::Tick(true)
+            Action::PersistVibeDisplayModes {
+                vibe: state.vibe_mode(), response: state.response_length(),
+                shell: state.shell_display_mode(), diff: state.diff_display_mode(),
+            }
         }
-        Pick::ShellDisplayMode => Action::PersistShellDisplayMode(state.cycle_shell_display_mode()),
-        Pick::DiffDisplayMode => Action::PersistDiffDisplayMode(state.cycle_diff_display_mode()),
+        Pick::ShellDisplayMode => {
+            state.cycle_shell_display_mode();
+            Action::PersistVibeDisplayModes { vibe: state.vibe_mode(), response: state.response_length(), shell: state.shell_display_mode(), diff: state.diff_display_mode() }
+        }
+        Pick::DiffDisplayMode => {
+            state.cycle_diff_display_mode();
+            Action::PersistVibeDisplayModes { vibe: state.vibe_mode(), response: state.response_length(), shell: state.shell_display_mode(), diff: state.diff_display_mode() }
+        }
         Pick::PlanSummary => {
             state.toggle_plan_summary();
             Action::Tick(true)
@@ -886,7 +915,13 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
         Pick::Model => state.run_command("/model"),
         Pick::EffortSetting => state.run_command("/effort"),
         Pick::ScrollToBottom => Action::ScrollToBottom,
-        Pick::Close => state.close_overlay(),
+        Pick::Close => {
+            if state.close_completed_plan_summary() {
+                Action::Tick(true)
+            } else {
+                state.close_overlay()
+            }
+        }
         Pick::Row(index) => state.click_overlay_row(index),
         Pick::Effort(step) => state.click_effort_step(step),
     }
@@ -1106,6 +1141,22 @@ async fn execute_action(
                 );
             }
         }
+        Action::PersistVibeDisplayModes { vibe, response, shell, diff } => {
+            for (key, value) in [
+                ("vibe_mode", vibe.config_value()),
+                ("model_verbosity", response.model_verbosity()),
+                ("shell_display_mode", shell.config_value()),
+                ("diff_display_mode", diff.config_value()),
+            ] {
+                if let Err(error) = server
+                    .request("config/value/write", config_value_write_params(key, value))
+                    .await
+                {
+                    state.push_notice(BlockKind::Warning, "Vibe 표시 설정 저장 실패", error.to_string());
+                    break;
+                }
+            }
+        }
         Action::PersistStatusLine { key_path, enabled } => {
             if let Err(error) = server
                 .request(
@@ -1130,7 +1181,7 @@ async fn execute_action(
                         "model": state.selected_model_name(),
                         "serviceTier": state.service_tier(),
                         "ephemeral": true,
-                        "threadSource": "devez-cli"
+                        "threadSource": "devez-vibe"
                     }),
                 )
                 .await;
@@ -1911,7 +1962,7 @@ async fn resume_into_state(
         state,
         renderer,
         previous_thread.clone(),
-        server.request("thread/resume", json!({ "threadId": thread_id })),
+        server.request("thread/resume", resume_thread_params(thread_id)),
     )
     .await?
     {
@@ -2116,6 +2167,46 @@ fn config_value_write_params(key_path: &str, value: &str) -> Value {
     })
 }
 
+/// Sent as `developerInstructions` on every thread Devez Vibe starts, so these
+/// rules hold for every user without any per-machine configuration.
+const DEVEZ_INSTRUCTIONS: &str = concat!(
+    "Updated Plan의 설명과 모든 Task 제목은 반드시 자연스러운 한국어로 작성한다. ",
+    "코드, 명령어, 경로, 제품명 등 기술 식별자는 원문을 유지한다.\n",
+    "답변 형식 규칙:\n",
+    "- 서론, 인사, 맺음말 요약을 쓰지 않고 결론부터 쓴다.\n",
+    "- 기본 분량은 세 줄 전후이며, 사용자가 자세한 설명을 요청할 때만 늘린다.\n",
+    "- 산문 문단 대신 불릿과 코드 블록을 쓴다.\n",
+    "- 코드 변경은 파일 경로와 핵심 코드만 보여주고, 요청받지 않은 해설을 덧붙이지 않는다.\n",
+    "- 하지 않기로 한 선택지나 이미 정해진 결정을 다시 나열하지 않는다.\n",
+    "계획 규칙:\n",
+    "- 파일을 수정하는 작업은 분량과 무관하게 항상 `update_plan`으로 계획을 먼저 세우고 진행한다. ",
+    "한 줄 수정처럼 사소해 보여도 생략하지 않는다.\n",
+    "- 작은 작업의 계획은 짧게 쓴다. Task 한두 개면 충분하다.\n",
+    "- 각 Task는 착수할 때 in_progress, 끝나면 completed로 즉시 갱신한다.\n",
+    "- 질문에만 답하거나 코드를 읽기만 하는 턴에는 계획을 만들지 않는다.",
+);
+
+/// A resumed thread replays the `developer` message its rollout was recorded
+/// with, so the rules have to be re-sent or an old session keeps running on an
+/// older wording.
+fn resume_thread_params(thread_id: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "developerInstructions": DEVEZ_INSTRUCTIONS
+    })
+}
+
+/// One `developer` message at the head of the thread loses its grip as turns
+/// pile up, so the same rules ride along with every turn.
+fn turn_additional_context() -> Value {
+    json!({
+        "devez-vibe-rules": {
+            "value": DEVEZ_INSTRUCTIONS,
+            "kind": "application"
+        }
+    })
+}
+
 fn new_thread_params(
     cwd: &str,
     model: Option<&str>,
@@ -2127,8 +2218,9 @@ fn new_thread_params(
         "cwd": cwd,
         "permissions": ":danger-full-access",
         "config": { "model_verbosity": model_verbosity },
+        "developerInstructions": DEVEZ_INSTRUCTIONS,
         "sessionStartSource": session_start_source,
-        "threadSource": "devez-cli"
+        "threadSource": "devez-vibe"
     });
     if let Some(model) = model {
         params["model"] = json!(model);
@@ -2644,7 +2736,8 @@ async fn start_turn(server: &AppServer, state: &mut AppState, text: String) {
         "model": model,
         "effort": effort,
         "serviceTier": state.service_tier(),
-        "permissions": state.permission_profile()
+        "permissions": state.permission_profile(),
+        "additionalContext": turn_additional_context()
     });
     match server.request("turn/start", params).await {
         // The response reserves an id, but the app-server makes it
@@ -2677,7 +2770,9 @@ fn attach_pasted_local_image(state: &mut AppState, text: &str) -> bool {
 }
 
 fn apply_composer_text(state: &mut AppState, text: BufferedText) {
-    if !text.pasted || !attach_pasted_local_image(state, &text.text) {
+    if !text.pasted {
+        state.handle_buffered_text(&text.text);
+    } else if !attach_pasted_local_image(state, &text.text) {
         state.handle_paste(&text.text);
     }
 }
@@ -2774,7 +2869,7 @@ fn local_image_path_from_paste(text: &str) -> Option<PathBuf> {
 }
 
 fn write_clipboard_bmp(image: &ImageData<'_>) -> std::io::Result<PathBuf> {
-    let directory = env::temp_dir().join("devez-cli-images");
+    let directory = env::temp_dir().join("devez-vibe-images");
     fs::create_dir_all(&directory)?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2916,7 +3011,7 @@ async fn start_or_resume_thread(
     model_verbosity: &str,
 ) -> Result<Value> {
     if let Some(thread_id) = resume {
-        let mut params = json!({ "threadId": thread_id });
+        let mut params = resume_thread_params(thread_id);
         if let Some(model) = model {
             params["model"] = json!(model);
         }
@@ -3364,16 +3459,34 @@ mod tests {
 
     #[test]
     fn fresh_threads_include_the_model_selected_for_the_first_frame() {
+        let params = new_thread_params("C:\\repo", Some("gpt-5.6-terra"), None, "startup", "low");
+
+        assert_eq!(params.pointer("/developerInstructions").and_then(Value::as_str), Some(DEVEZ_INSTRUCTIONS));
+        assert_eq!(params.pointer("/model").and_then(Value::as_str), Some("gpt-5.6-terra"));
+    }
+
+    #[test]
+    fn resumed_threads_carry_the_current_rules() {
+        let params = resume_thread_params("thread-1");
+
+        assert_eq!(params.pointer("/threadId").and_then(Value::as_str), Some("thread-1"));
         assert_eq!(
-            new_thread_params("C:\\repo", Some("gpt-5.6-terra"), None, "startup", "low"),
-            json!({
-                "cwd": "C:\\repo",
-                "model": "gpt-5.6-terra",
-                "permissions": ":danger-full-access",
-                "config": { "model_verbosity": "low" },
-                "sessionStartSource": "startup",
-                "threadSource": "devez-cli"
-            })
+            params.pointer("/developerInstructions").and_then(Value::as_str),
+            Some(DEVEZ_INSTRUCTIONS)
+        );
+    }
+
+    #[test]
+    fn every_turn_restates_the_rules() {
+        let context = turn_additional_context();
+
+        assert_eq!(
+            context.pointer("/devez-vibe-rules/value").and_then(Value::as_str),
+            Some(DEVEZ_INSTRUCTIONS)
+        );
+        assert_eq!(
+            context.pointer("/devez-vibe-rules/kind").and_then(Value::as_str),
+            Some("application")
         );
     }
 
@@ -3487,6 +3600,38 @@ mod tests {
         assert_eq!(state.editor.text(), text);
         assert_eq!(state.composer_image_count(), 0);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn buffered_typing_keeps_a_paste_block_collapsed_until_the_same_text_is_pasted_again() {
+        let pasted = "one\ntwo\nthree\nfour\nfive\nsix";
+        let mut state = starting_state();
+        apply_composer_text(
+            &mut state,
+            BufferedText {
+                text: pasted.to_owned(),
+                pasted: true,
+            },
+        );
+
+        apply_composer_text(
+            &mut state,
+            BufferedText {
+                text: " ".to_owned(),
+                pasted: false,
+            },
+        );
+        assert_eq!(state.editor.paste_summary_lines(), Some(6));
+
+        apply_composer_text(
+            &mut state,
+            BufferedText {
+                text: pasted.to_owned(),
+                pasted: true,
+            },
+        );
+        assert_eq!(state.editor.paste_summary_lines(), None);
+        assert_eq!(state.editor.text(), format!("{pasted} "));
     }
 
     /// The model and effort readings stand for the commands that change them, so a

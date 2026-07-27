@@ -24,7 +24,7 @@ use crate::{
     renderer::{
         Block, BlockKind, ComposerMode, EffortSlider, HIDDEN_STATUS_LINE, ModeAccent, OverlayLine,
         OverlayStyle, OverlayView, PICKER_ROWS, PlanStep, PlanStepStatus, PlanSummary,
-        StatusLineView, SuggestionView, View, WelcomeView,
+        StatusLineView, SuggestionView, VibeTone, View, WelcomeView,
         visible_window,
     },
     rollout::{Rollout, RolloutEvent, RolloutKind},
@@ -101,17 +101,42 @@ enum StatusLineField {
     Context,
     FiveHour,
     Weekly,
-    Branch,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VibeMode {
+    #[default]
+    Vibe,
+    SuperVibe,
+    Normal,
+}
+
+impl VibeMode {
+    pub const fn config_value(self) -> &'static str { match self { Self::Vibe => "vibe", Self::SuperVibe => "super_vibe", Self::Normal => "normal" } }
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Vibe => "Vibe: On",
+            Self::SuperVibe => "Vibe: Super Vibe",
+            Self::Normal => "Vibe: Off",
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::Vibe => Self::SuperVibe,
+            Self::SuperVibe => Self::Normal,
+            Self::Normal => Self::Vibe,
+        }
+    }
 }
 
 impl StatusLineField {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 5] = [
         Self::Model,
         Self::Effort,
         Self::Context,
         Self::FiveHour,
         Self::Weekly,
-        Self::Branch,
     ];
 
     const fn label(self) -> &'static str {
@@ -121,7 +146,6 @@ impl StatusLineField {
             Self::Context => "Context",
             Self::FiveHour => "5h limit",
             Self::Weekly => "Weekly limit",
-            Self::Branch => "Branch",
         }
     }
 
@@ -132,7 +156,6 @@ impl StatusLineField {
             Self::Context => "status_line_context",
             Self::FiveHour => "status_line_five_hour",
             Self::Weekly => "status_line_weekly",
-            Self::Branch => "status_line_branch",
         }
     }
 
@@ -143,17 +166,16 @@ impl StatusLineField {
             Self::Context => 2,
             Self::FiveHour => 3,
             Self::Weekly => 4,
-            Self::Branch => 5,
         }
     }
 }
 
 #[derive(Clone, Copy)]
-struct StatusLineSettings([bool; 6]);
+struct StatusLineSettings([bool; 5]);
 
 impl Default for StatusLineSettings {
     fn default() -> Self {
-        Self([true; 6])
+        Self([true; 5])
     }
 }
 
@@ -277,7 +299,7 @@ struct SlashCommand {
     takes_argument: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 26] = [
+const SLASH_COMMANDS: [SlashCommand; 27] = [
     SlashCommand {
         name: "/model",
         description: "Switch model and reasoning",
@@ -374,6 +396,11 @@ const SLASH_COMMANDS: [SlashCommand; 26] = [
         takes_argument: true,
     },
     SlashCommand {
+        name: "/vibemode",
+        description: "Customize response, shell, and diff display",
+        takes_argument: false,
+    },
+    SlashCommand {
         name: "/usage",
         description: "Show account usage limits",
         takes_argument: false,
@@ -400,7 +427,7 @@ const SLASH_COMMANDS: [SlashCommand; 26] = [
     },
     SlashCommand {
         name: "/quit",
-        description: "Exit Devez CLI",
+        description: "Exit Devez Vibe",
         takes_argument: false,
     },
     SlashCommand {
@@ -743,6 +770,12 @@ pub enum Action {
     /// Save the transcript's Shell display preference for future sessions.
     PersistShellDisplayMode(ShellDisplayMode),
     PersistDiffDisplayMode(DiffDisplayMode),
+    PersistVibeDisplayModes {
+        vibe: VibeMode,
+        response: ResponseLength,
+        shell: ShellDisplayMode,
+        diff: DiffDisplayMode,
+    },
     PersistStatusLine {
         key_path: &'static str,
         enabled: bool,
@@ -891,6 +924,13 @@ enum PendingInteraction {
     SettingPicker {
         setting: DisplaySetting,
         selected: usize,
+    },
+    VibeModePicker {
+        row: usize,
+        vibe: VibeMode,
+        response: ResponseLength,
+        shell: ShellDisplayMode,
+        diff: DiffDisplayMode,
     },
     StatusLinePicker {
         selected: usize,
@@ -2085,6 +2125,7 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
             | PendingInteraction::ModelScope { .. }
             | PendingInteraction::EffortPicker { .. }
             | PendingInteraction::SettingPicker { .. }
+            | PendingInteraction::VibeModePicker { .. }
             | PendingInteraction::StatusLinePicker { .. }
             | PendingInteraction::SessionPicker(_)
     )
@@ -2337,6 +2378,10 @@ pub struct AppState {
     turn_shell_results: Vec<ShellResult>,
     turn_shell_anchor: Option<Block>,
     turn_shell_duration_ms: Option<u64>,
+    /// Completed file changes in the current turn. Later changes replace the
+    /// first transcript row instead of appending another collapsed card.
+    turn_file_changes: Vec<Block>,
+    turn_file_change_anchor: Option<Block>,
     /// App-server lifecycle notifications can be replayed. An item id belongs
     /// to one logical operation, so only its first completion may reach history.
     completed_item_ids: HashSet<String>,
@@ -2374,6 +2419,7 @@ pub struct AppState {
     activity_notice: Option<(String, Instant)>,
     status_metadata_refreshed_at: Instant,
     response_length: ResponseLength,
+    vibe_mode: VibeMode,
     shell_display_mode: ShellDisplayMode,
     diff_display_mode: DiffDisplayMode,
     status_line_settings: StatusLineSettings,
@@ -2431,6 +2477,12 @@ impl AppState {
             .or_else(|| effort.map(ToOwned::to_owned))
             .unwrap_or_else(|| "high".to_owned());
         let branch = read_git_branch(&cwd);
+        let vibe_mode = read_vibe_mode();
+        let (response_length, shell_display_mode, diff_display_mode) = match vibe_mode {
+            VibeMode::Vibe => (ResponseLength::Short, ShellDisplayMode::Collapse, DiffDisplayMode::Collapse),
+            VibeMode::SuperVibe => (ResponseLength::Short, ShellDisplayMode::Hide, DiffDisplayMode::Hide),
+            VibeMode::Normal => (ResponseLength::Short, ShellDisplayMode::Expand, DiffDisplayMode::Expand),
+        };
         let (five_hour_percent, weekly_percent) = read_codex_usage();
         let context_window = models
             .get(selected_model)
@@ -2456,6 +2508,8 @@ impl AppState {
             turn_shell_results: Vec::new(),
             turn_shell_anchor: None,
             turn_shell_duration_ms: None,
+            turn_file_changes: Vec::new(),
+            turn_file_change_anchor: None,
             completed_item_ids: HashSet::new(),
             seen_operation_signatures: HashSet::new(),
             pending: None,
@@ -2485,9 +2539,10 @@ impl AppState {
             composer_notice: None,
             activity_notice: None,
             status_metadata_refreshed_at: Instant::now(),
-            response_length: ResponseLength::default(),
-            shell_display_mode: read_shell_display_mode(),
-            diff_display_mode: read_diff_display_mode(),
+            vibe_mode,
+            response_length,
+            shell_display_mode,
+            diff_display_mode,
             status_line_settings: read_status_line_settings(),
             account_plan: AccountPlan::default(),
             account_refresh_due: false,
@@ -2674,6 +2729,7 @@ impl AppState {
     }
 
     pub fn turn_input(&mut self, text: String) -> Vec<Value> {
+        self.close_completed_plan_summary();
         let triggers = mention_triggers(&text);
         let text_chars = text.chars().collect::<Vec<_>>();
         let mut input = vec![json!({
@@ -2757,7 +2813,8 @@ impl AppState {
             .iter()
             .any(|attached| attached.eq_ignore_ascii_case(&path))
         {
-            self.composer_images.push(path);
+            let index = self.editor.insert_attachment();
+            self.composer_images.insert(index, path);
         }
     }
 
@@ -2935,6 +2992,13 @@ impl AppState {
 
     fn composer_mode(&self) -> ComposerMode {
         ComposerMode {
+            branch: self.branch.clone(),
+            vibe_mode: self.vibe_mode.label().to_owned(),
+            vibe_tone: match self.vibe_mode {
+                VibeMode::Normal => VibeTone::Off,
+                VibeMode::Vibe => VibeTone::On,
+                VibeMode::SuperVibe => VibeTone::Super,
+            },
             label: self.permission_mode().label().to_owned(),
             accent: self.permission_mode().accent(),
             model: self.selected_model_name().to_owned(),
@@ -3101,7 +3165,6 @@ impl AppState {
             self.workspace_entries.clear();
             self.rebuild_completion_catalog();
         }
-        self.branch = read_git_branch(&self.cwd);
         self.turn_id = None;
         self.pending_interrupt = false;
         self.busy = false;
@@ -3190,6 +3253,8 @@ impl AppState {
         self.turn_shell_results.clear();
         self.turn_shell_anchor = None;
         self.turn_shell_duration_ms = None;
+        self.turn_file_changes.clear();
+        self.turn_file_change_anchor = None;
     }
 
     fn push_unique_operation(&mut self, block: Block) {
@@ -3235,11 +3300,16 @@ impl AppState {
         }
         if self.turn_id.is_some() {
             self.turn_interrupted = true;
+            if self.last_completed_duration.is_none() {
+                self.last_completed_duration =
+                    self.turn_started_at.map(|started| started.elapsed());
+            }
             return Action::Interrupt;
         }
         if !self.pending_interrupt {
             self.pending_interrupt = true;
             self.turn_interrupted = true;
+            self.last_completed_duration = self.turn_started_at.map(|started| started.elapsed());
         }
         Action::Tick(true)
     }
@@ -3439,6 +3509,7 @@ impl AppState {
             live_blocks,
             overlay: self.overlay_view(),
             plan_summary: self.plan_summary.as_ref(),
+            plan_active: self.busy,
             editor: &self.editor,
             composer_images: &self.composer_images,
             welcome: self.show_welcome.then(|| self.welcome_view()),
@@ -3497,6 +3568,14 @@ impl AppState {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
+        self.handle_inserted_text(text, true);
+    }
+
+    pub fn handle_buffered_text(&mut self, text: &str) {
+        self.handle_inserted_text(text, false);
+    }
+
+    fn handle_inserted_text(&mut self, text: &str, pasted: bool) {
         let old_text = self.editor.text();
         let binding_count = self.selected_completion_bindings.len();
         match &mut self.pending {
@@ -3521,7 +3600,11 @@ impl AppState {
             Some(PendingInteraction::MarketplacePicker(picker)) => picker.handle_paste(text),
             Some(_) => {}
             None => {
-                self.editor.insert_paste_str(text);
+                if pasted {
+                    self.editor.insert_paste_str(text);
+                } else {
+                    self.editor.insert_str(text);
+                }
                 self.command_selection = 0;
             }
         }
@@ -3540,6 +3623,16 @@ impl AppState {
 
     fn handle_key_inner(&mut self, key: KeyEvent) -> Action {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return Action::None;
+        }
+        // Windows Korean IMEs may turn one Ctrl+Backspace chord into a stream
+        // of repeat records while dismantling a composed syllable. A word
+        // delete must stay one atomic editor operation.
+        if matches!(key.kind, KeyEventKind::Repeat)
+            && ((key.code == KeyCode::Backspace
+                && key.modifiers.contains(KeyModifiers::CONTROL))
+                || key.code == KeyCode::Char('\u{8}'))
+        {
             return Action::None;
         }
         if self.pending.is_some() {
@@ -3700,16 +3793,27 @@ impl AppState {
             KeyCode::Char('c') if ctrl => {
                 if self.busy {
                     self.request_interrupt()
-                } else if self.editor.is_empty() && self.side_parent.is_some() {
+                } else if self.editor.is_empty()
+                    && self.composer_images.is_empty()
+                    && self.side_parent.is_some()
+                {
                     Action::ReturnFromSide
-                } else if self.editor.is_empty() {
+                } else if self.editor.is_empty() && self.composer_images.is_empty() {
                     Action::Quit
                 } else {
                     self.editor.clear();
+                    self.composer_images.clear();
                     Action::None
                 }
             }
-            KeyCode::Char('d') if ctrl && self.editor.is_empty() && !self.busy => Action::Quit,
+            KeyCode::Char('d')
+                if ctrl
+                    && self.editor.is_empty()
+                    && self.composer_images.is_empty()
+                    && !self.busy =>
+            {
+                Action::Quit
+            }
             KeyCode::Char('d') if ctrl => {
                 self.editor.delete();
                 Action::None
@@ -3757,16 +3861,20 @@ impl AppState {
             }
             KeyCode::Enter => self.submit_editor(),
             KeyCode::Esc if self.busy => self.request_interrupt(),
-            KeyCode::Backspace if ctrl => {
-                if self.editor.cursor() != 0 || self.composer_images.pop().is_none() {
+            code if (code == KeyCode::Backspace && ctrl) || code == KeyCode::Char('\u{8}') => {
+                if let Some(index) = self.editor.attachment_before_cursor() {
+                    self.editor.delete_word_left();
+                    self.composer_images.remove(index);
+                } else {
                     self.editor.delete_word_left();
                 }
                 self.command_selection = 0;
                 Action::None
             }
             KeyCode::Backspace => {
-                if self.editor.cursor() == 0 && self.composer_images.pop().is_some() {
-                    // Attachments occupy the composer position immediately before text.
+                if let Some(index) = self.editor.attachment_before_cursor() {
+                    self.editor.backspace();
+                    self.composer_images.remove(index);
                 } else {
                     self.editor.backspace();
                 }
@@ -3774,7 +3882,12 @@ impl AppState {
                 Action::None
             }
             KeyCode::Delete => {
-                self.editor.delete();
+                if let Some(index) = self.editor.attachment_at_cursor() {
+                    self.editor.delete();
+                    self.composer_images.remove(index);
+                } else {
+                    self.editor.delete();
+                }
                 self.command_selection = 0;
                 Action::None
             }
@@ -4096,8 +4209,10 @@ impl AppState {
                 self.busy = false;
                 self.turn_id = None;
                 self.pending_interrupt = false;
-                self.last_completed_duration =
-                    self.turn_started_at.map(|started| started.elapsed());
+                if !self.turn_interrupted || self.last_completed_duration.is_none() {
+                    self.last_completed_duration =
+                        self.turn_started_at.map(|started| started.elapsed());
+                }
                 self.turn_started_at = None;
                 if let Some(error) = params
                     .get("turn")
@@ -4466,6 +4581,20 @@ impl AppState {
                         effort,
                     ));
                 }
+                Action::None
+            }
+            "/vibemode" if parts.len() == 1 => {
+                self.pending = Some(PendingInteraction::VibeModePicker {
+                    row: 0,
+                    vibe: self.vibe_mode,
+                    response: self.response_length,
+                    shell: self.shell_display_mode,
+                    diff: self.diff_display_mode,
+                });
+                Action::None
+            }
+            "/vibemode" => {
+                self.committed.push(Block::new(BlockKind::Error, "Usage", "/vibemode"));
                 Action::None
             }
             "/theme" if parts.len() == 1 => {
@@ -4861,6 +4990,55 @@ impl AppState {
                     _ => {}
                 }
                 self.pending = Some(PendingInteraction::SettingPicker { setting, selected });
+                Action::None
+            }
+            PendingInteraction::VibeModePicker {
+                mut row,
+                vibe,
+                response,
+                shell,
+                diff,
+            } => {
+                match key.code {
+                    KeyCode::Esc => {
+                        self.response_length = response;
+                        self.shell_display_mode = shell;
+                        self.diff_display_mode = diff;
+                        self.vibe_mode = vibe;
+                        return Action::None;
+                    }
+                    KeyCode::Enter => {
+                        return Action::PersistVibeDisplayModes {
+                            vibe: self.vibe_mode,
+                            response: self.response_length,
+                            shell: self.shell_display_mode,
+                            diff: self.diff_display_mode,
+                        };
+                    }
+                    KeyCode::Up => row = row.saturating_sub(1),
+                    KeyCode::Down => row = (row + 1).min(2),
+                    KeyCode::Left => match row {
+                        0 => self.response_length = self.response_length.next().next(),
+                        1 => self.shell_display_mode = self.shell_display_mode.next().next(),
+                        _ => self.diff_display_mode = self.diff_display_mode.next().next(),
+                    },
+                    KeyCode::Right => match row {
+                        0 => self.response_length = self.response_length.next(),
+                        1 => self.shell_display_mode = self.shell_display_mode.next(),
+                        _ => self.diff_display_mode = self.diff_display_mode.next(),
+                    },
+                    _ => {}
+                }
+                if matches!(key.code, KeyCode::Left | KeyCode::Right) {
+                    self.vibe_mode = VibeMode::Vibe;
+                }
+                self.pending = Some(PendingInteraction::VibeModePicker {
+                    row,
+                    vibe,
+                    response,
+                    shell,
+                    diff,
+                });
                 Action::None
             }
             PendingInteraction::StatusLinePicker { mut selected } => match key.code {
@@ -5315,6 +5493,29 @@ impl AppState {
                     selected: *selected,
                 }),
                 hint: "←→ to adjust  ·  Enter to confirm  ·  Esc to cancel".to_owned(),
+                style: OverlayStyle::Picker,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            }),
+            PendingInteraction::VibeModePicker { row, .. } => Some(OverlayView {
+                closable: true,
+                title: "Vibe".to_owned(),
+                lines: [
+                    format!("Response: {}", self.response_length_label()),
+                    format!("Shell: {}", self.shell_display_mode.label()),
+                    format!("Diff: {}", self.diff_display_mode.label()),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| OverlayLine {
+                    text,
+                    selected: index == *row,
+                    muted: false,
+                })
+                .collect(),
+                slider: None,
+                hint: "↑↓ row  ·  ←→ adjust  ·  Enter to confirm  ·  Esc to cancel".to_owned(),
                 style: OverlayStyle::Picker,
                 input: None,
                 input_label: "",
@@ -5977,7 +6178,14 @@ impl AppState {
                 .map(|started| started.elapsed().as_secs())
                 .unwrap_or(0);
             if self.turn_interrupted {
-                return Some(format!("✕ Interrupted ({})", format_elapsed(elapsed)));
+                let interrupted_elapsed = self
+                    .last_completed_duration
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or(elapsed);
+                return Some(format!(
+                    "✕ Interrupted ({})",
+                    format_elapsed(interrupted_elapsed)
+                ));
             }
             return Some(format!("Working.. ({})", format_elapsed(elapsed)));
         }
@@ -5995,13 +6203,10 @@ impl AppState {
         if self.activity_notice.is_some() || (!self.busy && self.last_completed_duration.is_none()) {
             return None;
         }
-        Some(
-            self.active_turn_model
-                .as_deref()
-                .or(self.pending_turn_model.as_deref())
-                .unwrap_or_else(|| self.selected_model_name())
-                .to_owned(),
-        )
+        // The activity label is UI chrome, so it tracks the model currently
+        // selected in the composer immediately. Billing keeps using the active
+        // turn model separately in `active_cost_model`.
+        Some(self.selected_model_name().to_owned())
     }
 
     /// The shimmer sweeps the `Working` label once per `SHIMMER_PERIOD`, read off
@@ -6029,11 +6234,6 @@ impl AppState {
             })
         });
         StatusLineView {
-            branch: self
-                .status_line_settings
-                .enabled(StatusLineField::Branch)
-                .then_some(self.branch.clone())
-                .flatten(),
             model: self
                 .status_line_settings
                 .enabled(StatusLineField::Model)
@@ -6180,17 +6380,55 @@ impl AppState {
     pub fn cycle_response_length(&mut self) {
         if self.pending.is_none() {
             self.response_length = self.response_length.next();
+            self.vibe_mode = VibeMode::Vibe;
             self.notice_setting_applies_to_next_request();
         }
     }
 
+    pub fn vibe_mode_label(&self) -> &'static str {
+        self.vibe_mode.label()
+    }
+
+    pub const fn vibe_mode(&self) -> VibeMode {
+        self.vibe_mode
+    }
+
+    pub const fn response_length(&self) -> ResponseLength {
+        self.response_length
+    }
+
+    pub fn cycle_vibe_mode(&mut self) -> (ShellDisplayMode, DiffDisplayMode) {
+        self.vibe_mode = self.vibe_mode.next();
+        match self.vibe_mode {
+            VibeMode::Vibe => {
+                self.response_length = ResponseLength::Short;
+                self.shell_display_mode = ShellDisplayMode::Collapse;
+                self.diff_display_mode = DiffDisplayMode::Collapse;
+            }
+            VibeMode::SuperVibe => {
+                self.response_length = ResponseLength::Short;
+                self.shell_display_mode = ShellDisplayMode::Hide;
+                self.diff_display_mode = DiffDisplayMode::Hide;
+            }
+            VibeMode::Normal => {
+                self.response_length = ResponseLength::Short;
+                self.shell_display_mode = ShellDisplayMode::Expand;
+                self.diff_display_mode = DiffDisplayMode::Expand;
+            }
+        }
+        self.notice_setting_applies_to_next_request();
+        (self.shell_display_mode, self.diff_display_mode)
+    }
+
     pub fn cycle_shell_display_mode(&mut self) -> ShellDisplayMode {
         self.shell_display_mode = self.shell_display_mode.next();
+        self.vibe_mode = VibeMode::Vibe;
         self.shell_display_mode
     }
 
     pub fn cycle_diff_display_mode(&mut self) -> DiffDisplayMode {
         self.diff_display_mode = self.diff_display_mode.next();
+        self.vibe_mode = VibeMode::Vibe;
         self.diff_display_mode
     }
 
@@ -6198,6 +6436,17 @@ impl AppState {
         if let Some(summary) = &mut self.plan_summary {
             summary.expanded = !summary.expanded;
         }
+    }
+
+    pub fn close_completed_plan_summary(&mut self) -> bool {
+        let completed = self.plan_summary.as_ref().is_some_and(|summary| {
+            !summary.steps.is_empty()
+                && summary.steps.iter().all(|step| step.status == PlanStepStatus::Completed)
+        });
+        if completed {
+            self.plan_summary = None;
+        }
+        completed
     }
 
     /// Runs a slash command the composer never typed — what a click on the
@@ -6409,6 +6658,7 @@ impl AppState {
                     _ => self.shell_display_mode,
                 };
                 self.shell_display_mode = mode;
+                self.vibe_mode = VibeMode::Vibe;
                 Action::PersistShellDisplayMode(mode)
             }
             DisplaySetting::Diff => {
@@ -6419,6 +6669,7 @@ impl AppState {
                     _ => self.diff_display_mode,
                 };
                 self.diff_display_mode = mode;
+                self.vibe_mode = VibeMode::Vibe;
                 Action::PersistDiffDisplayMode(mode)
             }
             DisplaySetting::Fast => Action::SetFast(selected == 0),
@@ -6575,6 +6826,15 @@ impl AppState {
             if matches!(block.kind, BlockKind::Assistant) {
                 self.last_assistant_markdown = Some(block.body.clone());
             }
+            if matches!(block.kind, BlockKind::FileChange) {
+                if let Some(signature) = operation_signature(&block)
+                    && !self.seen_operation_signatures.insert(signature)
+                {
+                    return;
+                }
+                self.commit_turn_file_change(block);
+                return;
+            }
             self.push_unique_operation(block);
         }
     }
@@ -6692,6 +6952,16 @@ impl AppState {
         }
     }
 
+    fn commit_turn_file_change(&mut self, block: Block) {
+        self.turn_file_changes.push(block);
+        let mut grouped = file_change_group_block(self.turn_file_changes.clone());
+        if let Some(anchor) = self.turn_file_change_anchor.as_ref() {
+            grouped.adopt_id(anchor);
+        }
+        self.turn_file_change_anchor = Some(grouped.clone());
+        self.commit_replacing(grouped);
+    }
+
     fn ensure_active(&mut self, item_id: &str, kind: BlockKind, title: &str) -> &mut ActiveItem {
         if !self.active.contains_key(item_id) {
             self.active_order.push(item_id.to_owned());
@@ -6784,7 +7054,15 @@ impl AppState {
                 if matches!(item.block.kind, BlockKind::Assistant) {
                     self.last_assistant_markdown = Some(item.block.body.clone());
                 }
-                self.push_unique_operation(item.block);
+                if matches!(item.block.kind, BlockKind::FileChange) {
+                    if operation_signature(&item.block)
+                        .is_none_or(|signature| self.seen_operation_signatures.insert(signature))
+                    {
+                        self.commit_turn_file_change(item.block);
+                    }
+                } else {
+                    self.push_unique_operation(item.block);
+                }
             }
         }
     }
@@ -6977,8 +7255,15 @@ fn is_web_search_block(block: &Block) -> bool {
         && (block.title == "Web search" || block.title.starts_with("Web search ·"))
 }
 
+fn is_auxiliary_tool_block(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::Tool)
+        && (block.title.starts_with("MCP ·")
+            || block.title.starts_with("Tool ·")
+            || block.title == "Agent")
+}
+
 fn is_shell_hidden_block(block: &Block) -> bool {
-    is_shell_block(block) || is_web_search_block(block)
+    is_shell_block(block) || is_web_search_block(block) || is_auxiliary_tool_block(block)
 }
 
 /// Operations whose repeated cards add no information. The body participates
@@ -7022,7 +7307,7 @@ fn push_latest_thinking(blocks: &mut Vec<Block>, block: Block) {
 
 fn normalized_turn_blocks(blocks: Vec<Block>) -> Vec<Block> {
     let mut seen_operations = HashSet::new();
-    blocks
+    let normalized = blocks
         .into_iter()
         .fold(Vec::new(), |mut normalized, block| {
             if let Some(signature) = operation_signature(&block)
@@ -7032,7 +7317,38 @@ fn normalized_turn_blocks(blocks: Vec<Block>) -> Vec<Block> {
             }
             push_latest_thinking(&mut normalized, block);
             normalized
-        })
+        });
+    group_turn_file_changes(normalized)
+}
+
+fn file_change_group_block(children: Vec<Block>) -> Block {
+    let title = children
+        .first()
+        .filter(|first| children.iter().all(|block| block.title == first.title))
+        .map(|block| block.title.clone())
+        .unwrap_or_else(|| format!("Update({} changes)", children.len()));
+    Block::file_change_group(title, children)
+}
+
+fn group_turn_file_changes(blocks: Vec<Block>) -> Vec<Block> {
+    let mut grouped: Vec<Block> = Vec::with_capacity(blocks.len());
+    let mut file_changes = Vec::new();
+    let mut group_index = None;
+    for block in blocks {
+        if matches!(block.kind, BlockKind::FileChange) {
+            file_changes.push(block);
+            let group = file_change_group_block(file_changes.clone());
+            if let Some(index) = group_index {
+                grouped[index] = group;
+            } else {
+                group_index = Some(grouped.len());
+                grouped.push(group);
+            }
+        } else {
+            grouped.push(block);
+        }
+    }
+    grouped
 }
 
 fn completed_item_block(cwd: &str, item: &Value) -> Option<Block> {
@@ -7827,6 +8143,35 @@ fn read_fast_mode() -> bool {
         .is_some_and(|config| parse_fast_mode(&config))
 }
 
+fn read_vibe_mode() -> VibeMode {
+    read_vibe_config_value("vibe_mode")
+        .map(|value| match value.as_str() {
+            "super_vibe" => VibeMode::SuperVibe,
+            "normal" => VibeMode::Normal,
+            _ => VibeMode::Vibe,
+        })
+        .unwrap_or_default()
+}
+
+fn read_response_length() -> ResponseLength {
+    read_vibe_config_value("model_verbosity")
+        .map(|value| match value.as_str() {
+            "medium" => ResponseLength::Normal,
+            "high" => ResponseLength::Detailed,
+            _ => ResponseLength::Short,
+        })
+        .unwrap_or_default()
+}
+
+fn read_vibe_config_value(key: &str) -> Option<String> {
+    codex_home()
+        .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
+        .and_then(|config| config.lines().find_map(|line| {
+            let (found, value) = line.split('#').next()?.split_once('=')?;
+            (found.trim() == key).then(|| value.trim().trim_matches(['\"', '\'']).to_ascii_lowercase())
+        }))
+}
+
 fn read_shell_display_mode() -> ShellDisplayMode {
     codex_home()
         .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
@@ -7939,11 +8284,11 @@ mod tests {
     #[test]
     fn file_change_block_keeps_the_patch_and_relativizes_the_path() {
         let changes = vec![json!({
-            "path": r"C:\Source\DevezCLI\src\main.rs",
+            "path": r"C:\Source\DevezVibe\src\main.rs",
             "kind": { "type": "update" },
             "diff": "diff --git a/src/main.rs b/src/main.rs\nindex 111..222 100644\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -83,3 +83,4 @@\n context\n-let old = 1;\n+let new = 2;\n+let extra = 3;\n"
         })];
-        let cwd = r"C:\Source\DevezCLI";
+        let cwd = r"C:\Source\DevezVibe";
 
         assert_eq!(file_changes_title(cwd, &changes), r"Update(src\main.rs)");
         assert_eq!(
@@ -7964,13 +8309,13 @@ mod tests {
     #[test]
     fn display_path_leaves_paths_outside_the_session_alone() {
         assert_eq!(
-            display_path(r"C:\Source\DevezCLI", r"C:\Other\file.rs"),
+            display_path(r"C:\Source\DevezVibe", r"C:\Other\file.rs"),
             r"C:\Other\file.rs"
         );
         // Case and separator both fold for the comparison; the display keeps the
         // separator the path arrived with.
         assert_eq!(
-            display_path(r"C:\Source\DevezCLI", r"c:/source/devezcli\src\a.rs"),
+            display_path(r"C:\Source\DevezVibe", r"c:/source/devezvibe\src\a.rs"),
             r"src\a.rs"
         );
     }
@@ -8030,6 +8375,40 @@ mod tests {
     fn transcript_display_defaults_to_hidden_shell_and_diff() {
         assert_eq!(ShellDisplayMode::default(), ShellDisplayMode::Hide);
         assert_eq!(DiffDisplayMode::default(), DiffDisplayMode::Hide);
+    }
+
+    #[test]
+    fn vibe_mode_defaults_to_short_collapsed_output() {
+        let state = test_state();
+
+        assert_eq!(state.vibe_mode_label(), "Vibe");
+        assert_eq!(state.response_length_label(), "Short");
+        assert_eq!(state.shell_display_mode(), ShellDisplayMode::Collapse);
+        assert_eq!(state.diff_display_mode(), DiffDisplayMode::Collapse);
+    }
+
+    #[test]
+    fn slash_display_setting_switches_vibe_mode_to_custom() {
+        let mut state = test_state();
+
+        state.run_slash_command("/shell hide");
+
+        assert_eq!(state.vibe_mode_label(), "Custom");
+        assert_eq!(state.shell_display_mode(), ShellDisplayMode::Hide);
+    }
+
+    #[test]
+    fn vibe_mode_picker_previews_changes_and_escape_restores_them() {
+        let mut state = test_state();
+        state.run_slash_command("/vibemode");
+
+        state.handle_key(KeyEvent::from(KeyCode::Right));
+        assert_eq!(state.response_length_label(), "Normal");
+        assert_eq!(state.vibe_mode_label(), "Custom");
+
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(state.response_length_label(), "Short");
+        assert_eq!(state.vibe_mode_label(), "Vibe");
     }
 
     #[test]
@@ -8239,7 +8618,7 @@ mod tests {
     }
 
     #[test]
-    fn hide_never_hands_shell_or_web_search_rows_to_the_renderer() {
+    fn hide_never_hands_tool_rows_to_the_renderer() {
         let mut state = test_state();
         state.show_welcome = false;
         state.shell_display_mode = ShellDisplayMode::Hide;
@@ -8273,6 +8652,32 @@ mod tests {
             "id": "search-1",
             "type": "webSearch",
             "query": "rust ownership"
+        }));
+
+        assert!(state.drain_committed().is_empty());
+
+        state
+            .ensure_active("dynamic-tool", BlockKind::Tool, "Tool · lookup");
+        state.ensure_active("agent-tool", BlockKind::Tool, "Agent");
+        assert!(state.view().live_blocks.is_empty());
+
+        state.start_item(&json!({
+            "id": "node-repl-1",
+            "type": "mcpToolCall",
+            "server": "node_repl",
+            "tool": "js",
+            "arguments": { "code": "1 + 1" }
+        }));
+
+        assert!(state.view().live_blocks.is_empty());
+
+        state.complete_item(&json!({
+            "id": "node-repl-1",
+            "type": "mcpToolCall",
+            "server": "node_repl",
+            "tool": "js",
+            "arguments": { "code": "1 + 1" },
+            "result": { "content": [{ "type": "text", "text": "2" }] }
         }));
 
         assert!(state.drain_committed().is_empty());
@@ -8447,6 +8852,65 @@ mod tests {
         }
 
         assert_eq!(state.drain_committed().len(), 2);
+    }
+
+    #[test]
+    fn sequential_file_changes_replace_one_turn_group() {
+        let mut state = test_state();
+        state.show_welcome = false;
+        state.cwd = r"C:\Source\DevezVibe".to_owned();
+        state.set_turn_started("turn-1".to_owned());
+
+        let change = |id: &str, old: &str, new: &str| {
+            json!({
+                "id": id,
+                "type": "fileChange",
+                "changes": [{
+                    "path": r"C:\Source\DevezVibe\src\state.rs",
+                    "kind": { "type": "update" },
+                    "diff": format!("@@ -1 +1 @@\n-{old}\n+{new}")
+                }]
+            })
+        };
+
+        state.complete_item(&change("patch-1", "one", "two"));
+        let first = state.drain_committed();
+        assert_eq!(first.len(), 1);
+        let group_id = first[0].id();
+        assert_eq!(first[0].title, r"Update(src\state.rs)");
+        assert_eq!(first[0].children().len(), 1);
+
+        state.complete_item(&change("patch-2", "two", "three"));
+        let second = state.drain_committed();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].id(), group_id);
+        assert_eq!(second[0].title, r"Update(src\state.rs)");
+        assert_eq!(second[0].children().len(), 2);
+    }
+
+    #[test]
+    fn resumed_file_changes_become_one_turn_group() {
+        let blocks = normalized_turn_blocks(vec![
+            Block::new(
+                BlockKind::FileChange,
+                "Update(src/state.rs)",
+                "Added 1 line, removed 0 lines\n@@ -1,0 +1 @@\n+one",
+            ),
+            Block::new(BlockKind::Reasoning, "Thinking…", "continuing"),
+            Block::new(
+                BlockKind::FileChange,
+                "Update(src/state.rs)",
+                "Added 1 line, removed 1 line\n@@ -1 +1 @@\n-one\n+two",
+            ),
+        ]);
+
+        let changes = blocks
+            .iter()
+            .filter(|block| matches!(block.kind, BlockKind::FileChange))
+            .collect::<Vec<_>>();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].children().len(), 2);
+        assert_eq!(changes[0].title, "Update(src/state.rs)");
     }
 
     #[test]
@@ -8943,6 +9407,33 @@ mod tests {
     }
 
     #[test]
+    fn completed_plan_summary_can_be_dismissed() {
+        let mut state = test_state();
+        state.plan_summary = Some(PlanSummary {
+            explanation: None,
+            steps: vec![PlanStep { text: "완료".to_owned(), status: PlanStepStatus::Completed }],
+            expanded: false,
+        });
+
+        assert!(state.close_completed_plan_summary());
+        assert!(state.plan_summary.is_none());
+    }
+
+    #[test]
+    fn next_prompt_dismisses_a_completed_plan_summary() {
+        let mut state = test_state();
+        state.plan_summary = Some(PlanSummary {
+            explanation: None,
+            steps: vec![PlanStep { text: "완료".to_owned(), status: PlanStepStatus::Completed }],
+            expanded: false,
+        });
+
+        state.turn_input("다음 작업".to_owned());
+
+        assert!(state.plan_summary.is_none());
+    }
+
+    #[test]
     fn credit_rows_list_each_expiry_and_cap_long_lists() {
         let credits = (0..6)
             .map(|index| json!({ "status": "available", "expiresAt": 1_000 + index * 86_400 }))
@@ -9323,10 +9814,6 @@ mod tests {
     #[test]
     fn status_line_fields_use_the_configured_booleans() {
         assert_eq!(
-            parse_status_line_field("status_line_branch = false\n", StatusLineField::Branch),
-            Some(false)
-        );
-        assert_eq!(
             parse_status_line_field(
                 "status_line_five_hour = \"true\" # keep it visible\n",
                 StatusLineField::FiveHour,
@@ -9372,7 +9859,6 @@ mod tests {
                 "☑ Context",
                 "☑ 5h limit",
                 "☑ Weekly limit",
-                "☑ Branch",
             ]
         );
         assert!(overlay.lines[0].selected);
@@ -10037,6 +10523,22 @@ mod tests {
     }
 
     #[test]
+    fn activity_color_model_tracks_a_model_change_immediately() {
+        let mut state = test_state();
+        state
+            .models
+            .push(test_model("gpt-5.6-terra", "GPT-5.6-Terra", false));
+        state.note_pending_turn_model("gpt-5.6-sol");
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
+
+        state.apply_model(1, Some("high"));
+        assert_eq!(state.activity_model().as_deref(), Some("gpt-5.6-terra"));
+
+        state.handle_notification("turn/completed", &json!({}));
+        assert_eq!(state.activity_model().as_deref(), Some("gpt-5.6-terra"));
+    }
+
+    #[test]
     fn interrupted_turn_activity_is_not_labeled_completed() {
         let mut state = test_state();
         state.set_turn_started("turn-1".to_owned());
@@ -10051,6 +10553,27 @@ mod tests {
             state
                 .activity()
                 .is_some_and(|activity| activity.starts_with("✕ Interrupted ("))
+        );
+    }
+
+    #[test]
+    fn interrupted_turn_activity_freezes_at_the_interrupt_time() {
+        let mut state = test_state();
+        state.set_turn_started("turn-1".to_owned());
+        state.turn_started_at = Some(Instant::now() - Duration::from_secs(10));
+
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        state.turn_started_at = Some(Instant::now() - Duration::from_secs(20));
+
+        assert_eq!(
+            state.activity().as_deref(),
+            Some("✕ Interrupted (10s)")
+        );
+
+        state.handle_notification("turn/completed", &json!({}));
+        assert_eq!(
+            state.activity().as_deref(),
+            Some("✕ Interrupted (10s)")
         );
     }
 
@@ -10083,7 +10606,7 @@ mod tests {
     }
 
     #[test]
-    fn status_metadata_parses_usage_fast_mode_and_branch() {
+    fn status_metadata_parses_usage_and_fast_mode() {
         let usage = json!({
             "five_hour": { "used_percent": 12.4 },
             "weekly": { "used_percent": 70 }
@@ -10094,10 +10617,6 @@ mod tests {
             "service_tier = \"fast\"\n[features]\nexample = true"
         ));
         assert!(!parse_fast_mode("service_tier = \"default\""));
-        assert_eq!(
-            parse_git_branch("ref: refs/heads/feature/status-line\n"),
-            Some("feature/status-line".to_owned())
-        );
     }
 
     #[test]
@@ -10501,6 +11020,46 @@ mod tests {
         state.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
 
         assert_eq!(state.composer_image_count(), 0);
+    }
+
+    #[test]
+    fn composer_arrows_cross_an_image_attachment_as_one_block() {
+        let mut state = test_state();
+        state.editor.set_text("before");
+        state.attach_local_image(r"C:\Temp\clipboard-image.bmp".to_owned());
+        assert_eq!(state.editor.attachment_before_cursor(), Some(0));
+
+        state.handle_key(KeyEvent::from(KeyCode::Left));
+        assert_eq!(state.editor.attachment_at_cursor(), Some(0));
+
+        state.handle_key(KeyEvent::from(KeyCode::Right));
+        assert_eq!(state.editor.attachment_before_cursor(), Some(0));
+        assert_eq!(state.editor.text(), "before");
+    }
+
+    #[test]
+    fn composer_ctrl_backspace_control_character_deletes_a_word() {
+        let mut state = test_state();
+        state.handle_paste("first second");
+
+        state.handle_key(KeyEvent::from(KeyCode::Char('\u{8}')));
+
+        assert_eq!(state.editor.text(), "first ");
+    }
+
+    #[test]
+    fn composer_ctrl_backspace_repeat_does_not_delete_another_korean_word() {
+        let mut state = test_state();
+        state.handle_paste("첫째 둘째");
+        let mut first = KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL);
+        first.kind = KeyEventKind::Press;
+        state.handle_key(first);
+
+        let mut repeat = KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL);
+        repeat.kind = KeyEventKind::Repeat;
+        state.handle_key(repeat);
+
+        assert_eq!(state.editor.text(), "첫째 ");
     }
 
     fn composer_completion_state() -> AppState {

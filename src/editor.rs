@@ -1,3 +1,5 @@
+pub const ATTACHMENT_PLACEHOLDER: char = '\u{fffc}';
+
 #[derive(Default)]
 pub struct Editor {
     buffer: Vec<char>,
@@ -13,14 +15,30 @@ pub struct Editor {
 
 impl Editor {
     pub fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
+        self.buffer
+            .iter()
+            .all(|&ch| ch == ATTACHMENT_PLACEHOLDER)
     }
 
     pub fn text(&self) -> String {
+        self.buffer
+            .iter()
+            .filter(|&&ch| ch != ATTACHMENT_PLACEHOLDER)
+            .collect()
+    }
+
+    pub fn display_text(&self) -> String {
         self.buffer.iter().collect()
     }
 
     pub fn cursor(&self) -> usize {
+        self.buffer[..self.cursor]
+            .iter()
+            .filter(|&&ch| ch != ATTACHMENT_PLACEHOLDER)
+            .count()
+    }
+
+    pub fn display_cursor(&self) -> usize {
         self.cursor
     }
 
@@ -31,8 +49,44 @@ impl Editor {
     pub fn insert(&mut self, ch: char) {
         self.move_to_collapsed_paste_end();
         self.leave_history();
+        if self
+            .collapsed_paste_start
+            .is_some_and(|start| self.cursor <= start)
+        {
+            self.collapsed_paste_start = self.collapsed_paste_start.map(|start| start + 1);
+            self.collapsed_paste_end = self.collapsed_paste_end.map(|end| end + 1);
+        }
         self.buffer.insert(self.cursor, ch);
         self.cursor += 1;
+    }
+
+    pub fn insert_attachment(&mut self) -> usize {
+        self.move_to_collapsed_paste_end();
+        let index = self.buffer[..self.cursor]
+            .iter()
+            .filter(|&&ch| ch == ATTACHMENT_PLACEHOLDER)
+            .count();
+        self.insert(ATTACHMENT_PLACEHOLDER);
+        index
+    }
+
+    pub fn attachment_before_cursor(&self) -> Option<usize> {
+        (self.cursor > 0 && self.buffer[self.cursor - 1] == ATTACHMENT_PLACEHOLDER).then(|| {
+            self.buffer[..self.cursor - 1]
+                .iter()
+                .filter(|&&ch| ch == ATTACHMENT_PLACEHOLDER)
+                .count()
+        })
+    }
+
+    pub fn attachment_at_cursor(&self) -> Option<usize> {
+        (self.cursor < self.buffer.len() && self.buffer[self.cursor] == ATTACHMENT_PLACEHOLDER)
+            .then(|| {
+                self.buffer[..self.cursor]
+                    .iter()
+                    .filter(|&&ch| ch == ATTACHMENT_PLACEHOLDER)
+                    .count()
+            })
     }
 
     pub fn insert_str(&mut self, text: &str) {
@@ -45,6 +99,9 @@ impl Editor {
     }
 
     pub fn insert_paste_str(&mut self, text: &str) {
+        if self.expand_collapsed_paste_if_same(text) {
+            return;
+        }
         self.move_to_collapsed_paste_end();
         let start = self.cursor;
         self.insert_str(text);
@@ -65,9 +122,13 @@ impl Editor {
         let prefix = self.buffer[..start].iter().collect::<String>();
         let summary = format!("[Pasted text · {lines} lines]");
         let tail = self.buffer[end..].iter().collect::<String>();
-        let cursor = prefix.chars().count()
-            + summary.chars().count()
-            + self.cursor.saturating_sub(end);
+        let cursor = if self.cursor <= start {
+            self.cursor
+        } else {
+            prefix.chars().count()
+                + summary.chars().count()
+                + self.cursor.saturating_sub(end)
+        };
         Some((format!("{prefix}{summary}{tail}"), cursor))
     }
 
@@ -83,26 +144,54 @@ impl Editor {
             self.leave_history();
             self.cursor -= 1;
             self.buffer.remove(self.cursor);
+            if self
+                .collapsed_paste_start
+                .is_some_and(|start| self.cursor < start)
+            {
+                self.collapsed_paste_start = self.collapsed_paste_start.map(|start| start - 1);
+                self.collapsed_paste_end = self.collapsed_paste_end.map(|end| end - 1);
+            }
         }
     }
 
     pub fn delete(&mut self) {
+        if self.remove_collapsed_paste_after_cursor() {
+            return;
+        }
         self.move_to_collapsed_paste_end();
         if self.cursor < self.buffer.len() {
             self.leave_history();
             self.buffer.remove(self.cursor);
+            if self
+                .collapsed_paste_start
+                .is_some_and(|start| self.cursor < start)
+            {
+                self.collapsed_paste_start = self.collapsed_paste_start.map(|start| start - 1);
+                self.collapsed_paste_end = self.collapsed_paste_end.map(|end| end - 1);
+            }
         }
     }
 
     pub fn move_left(&mut self) {
-        self.cursor = self
-            .cursor
-            .saturating_sub(1)
-            .max(self.collapsed_paste_end.unwrap_or(0));
+        if self
+            .collapsed_paste_end
+            .is_some_and(|end| self.cursor == end)
+        {
+            self.cursor = self.collapsed_paste_start.unwrap_or(self.cursor);
+        } else {
+            self.cursor = self.cursor.saturating_sub(1);
+        }
     }
 
     pub fn move_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.buffer.len());
+        if self
+            .collapsed_paste_start
+            .is_some_and(|start| self.cursor == start)
+        {
+            self.cursor = self.collapsed_paste_end.unwrap_or(self.cursor);
+        } else {
+            self.cursor = (self.cursor + 1).min(self.buffer.len());
+        }
     }
 
     pub fn move_home(&mut self) {
@@ -209,13 +298,27 @@ impl Editor {
 
     pub fn replace_range(&mut self, range: std::ops::Range<usize>, text: &str) {
         self.leave_history();
-        let start = range.start.min(self.buffer.len());
-        let end = range.end.min(self.buffer.len()).max(start);
+        let start = self.raw_index_for_text_index(range.start);
+        let end = self.raw_index_for_text_index(range.end).max(start);
         self.buffer.splice(start..end, text.chars());
         self.cursor = start + text.chars().count();
     }
 
     pub fn delete_word_left(&mut self) {
+        if self.remove_collapsed_paste_at_cursor() {
+            return;
+        }
+        if self.cursor > 0
+            && self
+            .buffer
+            .get(self.cursor - 1)
+            .is_some_and(|&ch| ch == ATTACHMENT_PLACEHOLDER)
+        {
+            self.leave_history();
+            self.cursor -= 1;
+            self.buffer.remove(self.cursor);
+            return;
+        }
         if self.cursor == 0
             || self
                 .collapsed_paste_end
@@ -346,10 +449,42 @@ impl Editor {
         }
     }
 
-    fn move_to_collapsed_paste_end(&mut self) {
-        if let Some(end) = self.collapsed_paste_end {
-            self.cursor = self.cursor.max(end);
+    fn raw_index_for_text_index(&self, text_index: usize) -> usize {
+        let mut visible = 0;
+        for (index, &ch) in self.buffer.iter().enumerate() {
+            if ch == ATTACHMENT_PLACEHOLDER {
+                continue;
+            }
+            if visible == text_index {
+                return index;
+            }
+            visible += 1;
         }
+        self.buffer.len()
+    }
+
+    fn move_to_collapsed_paste_end(&mut self) {
+        if let (Some(start), Some(end)) =
+            (self.collapsed_paste_start, self.collapsed_paste_end)
+        {
+            if self.cursor > start && self.cursor < end {
+                self.cursor = end;
+            }
+        }
+    }
+
+    fn expand_collapsed_paste_if_same(&mut self, text: &str) -> bool {
+        let (Some(start), Some(end)) = (self.collapsed_paste_start, self.collapsed_paste_end)
+        else {
+            return false;
+        };
+        if self.buffer[start..end].iter().copied().eq(text.chars()) {
+            self.collapsed_paste_lines = None;
+            self.collapsed_paste_start = None;
+            self.collapsed_paste_end = None;
+            return true;
+        }
+        false
     }
 
     fn remove_collapsed_paste_at_cursor(&mut self) -> bool {
@@ -357,7 +492,24 @@ impl Editor {
         else {
             return false;
         };
-        if self.cursor > end {
+        if self.cursor != end {
+            return false;
+        }
+        self.leave_history();
+        self.buffer.drain(start..end);
+        self.cursor = start;
+        self.collapsed_paste_lines = None;
+        self.collapsed_paste_start = None;
+        self.collapsed_paste_end = None;
+        true
+    }
+
+    fn remove_collapsed_paste_after_cursor(&mut self) -> bool {
+        let (Some(start), Some(end)) = (self.collapsed_paste_start, self.collapsed_paste_end)
+        else {
+            return false;
+        };
+        if self.cursor != start {
             return false;
         }
         self.leave_history();
@@ -500,6 +652,27 @@ mod tests {
     }
 
     #[test]
+    fn only_pasting_the_same_block_again_expands_it() {
+        let text = "one\ntwo\nthree\nfour\nfive\nsix";
+        let mut editor = Editor::default();
+        editor.insert_paste_str(text);
+
+        editor.insert(' ');
+        editor.move_left();
+        editor.move_right();
+        assert_eq!(editor.paste_summary_lines(), Some(6));
+        assert_eq!(editor.text(), format!("{text} "));
+
+        editor.insert_paste_str(text);
+        assert_eq!(editor.paste_summary_lines(), None);
+        assert_eq!(
+            editor.text(),
+            format!("{text} "),
+            "the second paste only expands"
+        );
+    }
+
+    #[test]
     fn backspace_at_a_collapsed_paste_removes_the_whole_paste_once() {
         let mut editor = Editor::default();
         editor.set_text("before ");
@@ -510,5 +683,17 @@ mod tests {
         assert_eq!(editor.text(), "before ");
         assert_eq!(editor.paste_summary_lines(), None);
         assert_eq!(editor.cursor(), "before ".chars().count());
+    }
+
+    #[test]
+    fn word_delete_removes_a_collapsed_paste_as_one_item() {
+        let mut editor = Editor::default();
+        editor.set_text("before ");
+        editor.insert_paste_str("one\ntwo\nthree\nfour\nfive\nsix");
+
+        editor.delete_word_left();
+
+        assert_eq!(editor.text(), "before ");
+        assert_eq!(editor.paste_summary_lines(), None);
     }
 }

@@ -42,7 +42,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 /// space between them — high enough to absorb the redraw that happens between
 /// two key events in the real application, low enough that reaching it by
 /// typing would take about 2,400 characters per minute.
-const FAST_GAP: Duration = Duration::from_millis(25);
+const FAST_GAP: Duration = Duration::from_millis(16);
 
 /// How many fast characters have to pile up before `Enter` stops meaning send.
 /// Typing scores zero, because the one 0ms gap an IME produces belongs to the
@@ -122,6 +122,12 @@ impl ComposerPasteBuffer {
             .is_some_and(|last| now.duration_since(last) >= FAST_GAP)
             .then(|| self.flush())
             .flatten()
+    }
+
+    /// While text is waiting to be classified, repainting for every key would
+    /// turn a large Windows paste into one expensive frame per character.
+    pub fn is_buffering(&self) -> bool {
+        !self.text.is_empty()
     }
 
     fn push_char(&mut self, ch: char, now: Instant, fast: bool) -> Vec<ComposerInput> {
@@ -372,6 +378,31 @@ mod tests {
             &inputs[1],
             ComposerInput::Key(key) if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE
         ));
+    }
+
+    #[test]
+    fn composer_buffer_batches_a_hangul_commit_with_ctrl_backspace() {
+        let base = Instant::now();
+        let mut buffer = ComposerPasteBuffer::new();
+        assert!(buffer
+            .observe(press(KeyCode::Char('라')), base)
+            .is_empty());
+
+        let inputs = buffer.observe(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+            base + Duration::from_millis(1),
+        );
+        assert!(matches!(
+            &inputs[0],
+            ComposerInput::Text(BufferedText { text, pasted: false }) if text == "라"
+        ));
+        assert!(matches!(
+            &inputs[1],
+            ComposerInput::Key(key)
+                if key.code == KeyCode::Backspace
+                    && key.modifiers == KeyModifiers::CONTROL
+        ));
+        assert!(!buffer.is_buffering());
     }
 
     #[test]

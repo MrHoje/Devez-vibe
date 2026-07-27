@@ -4,7 +4,7 @@
 //! `DEVEZCODE_ROOM_ID`. Everything it shows around the terminal — the busy
 //! spinner, the ❗ waiting badge, the header's last prompt, and which session to
 //! resume next time — is read from
-//! `%APPDATA%\DevezCode\devezcli\{sessions,busy,waiting,lastmsg}\<room>.txt`, so
+//! `%APPDATA%\DevezCode\devezvibe\{sessions,busy,waiting,lastmsg}\<room>.txt`, so
 //! this module keeps those four files in step with the session.
 //!
 //! Outside DevezCode the variable is absent and every function here is a no-op:
@@ -47,9 +47,10 @@ struct Reporter {
 /// Binds this process to its DevezCode room, if it has one. Call once at
 /// startup: the room is fixed for the life of the process.
 pub fn init() {
-    if !tracking_agent_matches(env::var("DEVEZCODE_TRACKING_AGENT").ok().as_deref()) {
+    let Some(folder) = tracking_agent_folder(env::var("DEVEZCODE_TRACKING_AGENT").ok().as_deref())
+    else {
         return;
-    }
+    };
     let Some(room) = env::var("DEVEZCODE_ROOM_ID")
         .ok()
         .map(|room| sanitize(&room))
@@ -58,7 +59,7 @@ pub fn init() {
         return;
     };
     let Some(base) = env::var_os("APPDATA")
-        .map(|app_data| PathBuf::from(app_data).join("DevezCode").join("devezcli"))
+        .map(|app_data| PathBuf::from(app_data).join("DevezCode").join(folder))
     else {
         return;
     };
@@ -202,11 +203,14 @@ mod tests {
     }
 
     #[test]
-    fn tracking_agent_must_be_devezcli() {
-        assert!(tracking_agent_matches(Some("devezcli")));
-        assert!(tracking_agent_matches(Some("DevezCLI")));
-        assert!(!tracking_agent_matches(Some("claude")));
-        assert!(!tracking_agent_matches(None));
+    fn tracking_agent_picks_the_host_state_folder() {
+        assert_eq!(tracking_agent_folder(Some("devezvibe")), Some("devezvibe"));
+        assert_eq!(tracking_agent_folder(Some("DevezVibe")), Some("devezvibe"));
+        // Hosts from before the rename keep their own folder name.
+        assert_eq!(tracking_agent_folder(Some("devezcli")), Some("devezcli"));
+        assert_eq!(tracking_agent_folder(Some("DevezCLI")), Some("devezcli"));
+        assert_eq!(tracking_agent_folder(Some("claude")), None);
+        assert_eq!(tracking_agent_folder(None), None);
     }
 
     #[test]
@@ -232,8 +236,17 @@ mod tests {
     }
 }
 
-fn tracking_agent_matches(agent: Option<&str>) -> bool {
-    agent.is_some_and(|value| value.eq_ignore_ascii_case("devezcli"))
+/// The agent ids DevezCode may announce us under. `devezvibe` is the current
+/// one; `devezcli` is what hosts released before the rename still send, and it
+/// also names the state folder they watch — so the folder is derived from the
+/// value instead of hard-coded, and either host version lines up.
+const TRACKING_AGENTS: [&str; 2] = ["devezvibe", "devezcli"];
+
+fn tracking_agent_folder(agent: Option<&str>) -> Option<&'static str> {
+    let agent = agent?;
+    TRACKING_AGENTS
+        .into_iter()
+        .find(|known| agent.eq_ignore_ascii_case(known))
 }
 
 fn owner_path(base: &std::path::Path, room: &str) -> PathBuf {
