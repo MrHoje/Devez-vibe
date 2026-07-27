@@ -1330,7 +1330,7 @@ impl Renderer {
         if let Some((row, control)) = scroll_to_bottom_overlay {
             paint_scroll_to_bottom_into_frame(&mut frame, row, control);
         }
-        emit_frame_diff(&mut self.out, self.painted_frame.as_ref(), &frame)?;
+        emit_synchronized_frame_diff(&mut self.out, self.painted_frame.as_ref(), &frame)?;
         self.painted_frame = Some(frame);
         self.painted_selection = selection;
         self.painted_hovered_tool = self.hovered_tool;
@@ -1758,31 +1758,75 @@ fn emit_frame_diff(
 ) -> Result<()> {
     let previous = previous.filter(|frame| frame.width == current.width && frame.height == current.height);
     for row in 0..current.height {
-        for column in 0..current.width {
+        let mut column = 0;
+        while column < current.width {
             let cell = current.cell(column, row);
             let changed = previous.is_none_or(|previous| cell != previous.cell(column, row));
             if !changed || cell.continuation {
+                column += 1;
                 continue;
+            }
+            if column + 1 == current.width {
+                // The terminal erase fills its final visual cell with this
+                // background without printing into the autowrap column.
+                queue!(
+                    out,
+                    MoveTo(
+                        column.min(u16::MAX as usize) as u16,
+                        row.min(u16::MAX as usize) as u16
+                    )
+                )?;
+                set_cell_style(out, cell.style)?;
+                queue!(out, Clear(ClearType::UntilNewLine))?;
+                column += 1;
+                continue;
+            }
+
+            let start = column;
+            let style = cell.style;
+            let mut text = String::new();
+            while column + 1 < current.width {
+                let cell = current.cell(column, row);
+                let changed = previous.is_none_or(|previous| cell != previous.cell(column, row));
+                if !changed || (!cell.continuation && cell.style != style) {
+                    break;
+                }
+                if !cell.continuation {
+                    text.push_str(&cell.glyph);
+                }
+                column += 1;
             }
             queue!(
                 out,
                 MoveTo(
-                    column.min(u16::MAX as usize) as u16,
+                    start.min(u16::MAX as usize) as u16,
                     row.min(u16::MAX as usize) as u16
                 )
             )?;
-            set_cell_style(out, cell.style)?;
-            if column + 1 == current.width {
-                // The terminal erase fills its final visual cell with this
-                // background without printing into the autowrap column.
-                queue!(out, Clear(ClearType::UntilNewLine))?;
-            } else {
-                queue!(out, Print(&cell.glyph))?;
-            }
+            set_cell_style(out, style)?;
+            queue!(out, Print(text))?;
         }
     }
     queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
     Ok(())
+}
+
+/// Let terminals that implement synchronized updates show a complete frame at
+/// once. Unknown terminals ignore these private-mode escapes and still receive
+/// the ordinary, coalesced diff.
+fn emit_synchronized_frame_diff(
+    out: &mut impl Write,
+    previous: Option<&CellFrame>,
+    current: &CellFrame,
+) -> Result<()> {
+    queue!(out, Print("\x1b[?2026h"))?;
+    let result = emit_frame_diff(out, previous, current);
+    let end = queue!(out, Print("\x1b[?2026l"));
+    match (result, end) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 /// Lays out one fullscreen frame: `view_rows` of transcript from `start`, then the
@@ -6702,6 +6746,101 @@ mod tests {
         let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
         assert!(output.contains('x'));
         assert!(!output.contains("Panel: Opened"));
+    }
+
+    #[test]
+    fn terminal_diff_coalesces_adjacent_changed_cells_with_the_same_style() {
+        let previous = CellFrame::new(8, 1);
+        let mut current = previous.clone();
+        current.write(0, 0, "abc", CellStyle::plain());
+
+        let mut output = Vec::new();
+        emit_frame_diff(&mut output, Some(&previous), &current).expect("frame diff emits");
+
+        let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
+        assert_eq!(output.matches("\x1b[1;1H").count(), 1);
+        assert!(output.contains("abc"));
+    }
+
+    #[test]
+    fn terminal_diff_starts_a_new_run_when_the_style_changes() {
+        let previous = CellFrame::new(8, 1);
+        let mut current = previous.clone();
+        current.write(0, 0, "a", CellStyle::plain());
+        current.write(
+            1,
+            0,
+            "b",
+            CellStyle {
+                bold: true,
+                ..CellStyle::plain()
+            },
+        );
+
+        let mut output = Vec::new();
+        emit_frame_diff(&mut output, Some(&previous), &current).expect("frame diff emits");
+
+        assert_eq!(
+            String::from_utf8(output)
+                .expect("terminal bytes are UTF-8")
+                .matches("\x1b[1;")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn synchronized_frame_diff_brackets_the_complete_diff() {
+        let previous = CellFrame::new(8, 1);
+        let mut current = previous.clone();
+        current.write(0, 0, "x", CellStyle::plain());
+
+        let mut output = Vec::new();
+        emit_synchronized_frame_diff(&mut output, Some(&previous), &current)
+            .expect("synchronized frame diff emits");
+
+        let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
+        assert!(output.starts_with("\x1b[?2026h"));
+        assert!(output.contains('x'));
+        assert!(output.ends_with("\x1b[?2026l"));
+    }
+
+    #[test]
+    fn synchronized_frame_diff_ends_the_bracket_after_a_paint_error() {
+        struct FailsOnGlyph {
+            bytes: Vec<u8>,
+            failed: bool,
+        }
+
+        impl Write for FailsOnGlyph {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if !self.failed && bytes == b"x" {
+                    self.failed = true;
+                    return Err(std::io::Error::other("test write failure"));
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let previous = CellFrame::new(8, 1);
+        let mut current = previous.clone();
+        current.write(0, 0, "x", CellStyle::plain());
+        let mut output = FailsOnGlyph {
+            bytes: Vec::new(),
+            failed: false,
+        };
+
+        assert!(emit_synchronized_frame_diff(&mut output, Some(&previous), &current).is_err());
+        assert!(
+            String::from_utf8(output.bytes)
+                .expect("terminal bytes are UTF-8")
+                .ends_with("\x1b[?2026l")
+        );
     }
 
     #[test]
