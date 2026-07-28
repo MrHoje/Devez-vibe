@@ -17,7 +17,7 @@ use crate::{
         CompletionCandidate, CompletionKind, CompletionMode, CompletionTarget, completion_target,
         completion_text, filter_candidates,
     },
-    editor::Editor,
+    editor::{ATTACHMENT_PLACEHOLDER, Editor},
     integrations::{
         MarketplacePicker, MarketplacePickerResult, McpPicker, McpPickerResult, McpServerInfo,
         PluginCatalog, PluginDetail, PluginInfo, PluginPicker, PluginPickerResult, PluginScope,
@@ -25,9 +25,9 @@ use crate::{
     },
     pricing::{self, CostLedger, TokenTotals},
     renderer::{
-        Block, BlockKind, ComposerMode, EffortSlider, HIDDEN_STATUS_LINE, ModeAccent, OverlayLine,
-        OverlayStyle, OverlayView, PICKER_ROWS, PlanStep, PlanStepStatus, PlanSummary,
-        StatusLineView, SuggestionView, VibeTone, View, WelcomeView,
+        AnimationView, Block, BlockKind, ComposerMode, EffortSlider, HIDDEN_STATUS_LINE,
+        LiveBlockView, ModeAccent, OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS, PlanStep,
+        PlanStepStatus, PlanSummary, StatusLineView, SuggestionView, VibeTone, View, WelcomeView,
         visible_window,
     },
     rollout::{PlanSnapshot, Rollout, RolloutEvent, RolloutKind},
@@ -880,6 +880,7 @@ struct ParentTurn {
 struct ActiveItem {
     block: Block,
     shell_batch: Option<String>,
+    revision: u64,
 }
 
 struct ShellBatch {
@@ -2393,6 +2394,38 @@ impl SessionPicker {
     }
 }
 
+fn submission_display(source: &str, image_count: usize) -> String {
+    let mut display = String::new();
+    let mut image_index = 0;
+    let chars = source.chars().collect::<Vec<_>>();
+    for (index, ch) in chars.iter().copied().enumerate() {
+        if ch != ATTACHMENT_PLACEHOLDER {
+            display.push(ch);
+            continue;
+        }
+        image_index += 1;
+        if image_index > image_count {
+            continue;
+        }
+        if display.chars().last().is_some_and(|ch| !ch.is_whitespace()) {
+            display.push(' ');
+        }
+        display.push_str(&format!("[Image #{image_index}]"));
+        if chars
+            .get(index + 1)
+            .is_some_and(|&next| next != ATTACHMENT_PLACEHOLDER && !next.is_whitespace())
+        {
+            display.push(' ');
+        }
+    }
+    display
+}
+
+pub struct TickResult {
+    pub redraw: bool,
+    pub animation_only: bool,
+}
+
 pub struct AppState {
     pub editor: Editor,
     composer_images: Vec<String>,
@@ -3586,7 +3619,10 @@ impl AppState {
                 {
                     return None;
                 }
-                Some(item.block.clone())
+                Some(LiveBlockView {
+                    block: &item.block,
+                    revision: item.revision,
+                })
             })
             .collect::<Vec<_>>();
         View {
@@ -3629,14 +3665,26 @@ impl AppState {
     }
 
     pub fn tick(&mut self) -> bool {
-        let mut redraw = self.busy;
+        self.render_tick().redraw
+    }
+
+    pub fn render_tick(&mut self) -> TickResult {
+        let mut full_redraw = false;
         if self.busy {
             self.spinner_frame = (self.spinner_frame + 1) % SPINNER.len();
         }
         if self.status_metadata_refreshed_at.elapsed().as_secs() >= 3 {
-            self.branch = read_git_branch(&self.cwd);
-            (self.five_hour_percent, self.weekly_percent) = read_codex_usage();
-            self.fast_mode = read_fast_mode();
+            let branch = read_git_branch(&self.cwd);
+            let (five_hour_percent, weekly_percent) = read_codex_usage();
+            let fast_mode = read_fast_mode();
+            full_redraw = self.branch != branch
+                || self.five_hour_percent != five_hour_percent
+                || self.weekly_percent != weekly_percent
+                || self.fast_mode != fast_mode;
+            self.branch = branch;
+            self.five_hour_percent = five_hour_percent;
+            self.weekly_percent = weekly_percent;
+            self.fast_mode = fast_mode;
             self.status_metadata_refreshed_at = Instant::now();
         }
         if self
@@ -3645,7 +3693,7 @@ impl AppState {
             .is_some_and(|(_, shown_at)| shown_at.elapsed().as_millis() >= 1_400)
         {
             self.composer_notice = None;
-            redraw = true;
+            full_redraw = true;
         }
         if self
             .activity_notice
@@ -3653,9 +3701,23 @@ impl AppState {
             .is_some_and(|(_, shown_at)| shown_at.elapsed().as_millis() >= 1_400)
         {
             self.activity_notice = None;
-            redraw = true;
+            full_redraw = true;
         }
-        redraw
+        TickResult {
+            redraw: self.busy || full_redraw,
+            animation_only: self.busy && !full_redraw,
+        }
+    }
+
+    pub fn animation_view(&self) -> AnimationView<'_> {
+        AnimationView {
+            activity: self.activity(),
+            activity_model: self.activity_model(),
+            activity_phase: self.activity_phase(),
+            plan_summary: self.plan_summary.as_ref(),
+            plan_active: self.busy,
+            composer_mode: Some(self.composer_mode()),
+        }
     }
 
     pub fn handle_paste(&mut self, text: &str) {
@@ -3885,7 +3947,10 @@ impl AppState {
 
         match key.code {
             // Shift+Tab arrives as BackTab on terminals without the Kitty keyboard protocol.
-            KeyCode::BackTab => Action::None,
+            KeyCode::BackTab => {
+                self.toggle_plan_summary();
+                Action::Tick(true)
+            }
             KeyCode::Char('c') if ctrl => {
                 if self.busy {
                     if self.quit_armed {
@@ -4449,19 +4514,16 @@ impl AppState {
                     let active = self.ensure_active(item_id, BlockKind::FileChange, &title);
                     active.block.title = title;
                     active.block.body = body;
+                    active.revision = active.revision.wrapping_add(1);
                 }
             }
             "item/mcpToolCall/progress" => {
                 if let Some(item_id) = params.get("itemId").and_then(Value::as_str)
                     && let Some(message) = params.get("message").and_then(Value::as_str)
                 {
-                    append_capped(
-                        &mut self
-                            .ensure_active(item_id, BlockKind::Tool, "MCP")
-                            .block
-                            .body,
-                        message,
-                    );
+                    let active = self.ensure_active(item_id, BlockKind::Tool, "MCP");
+                    append_capped(&mut active.block.body, message);
+                    active.revision = active.revision.wrapping_add(1);
                 }
             }
             "thread/tokenUsage/updated" => {
@@ -4590,12 +4652,13 @@ impl AppState {
     }
 
     fn submit_editor(&mut self) -> Action {
+        let display = submission_display(&self.editor.display_text(), self.composer_images.len());
         let text = self.editor.take_for_submit().unwrap_or_default();
-        self.submit_text(text)
+        self.submit_text(text, display)
     }
 
     pub fn start_queued_prompt(&mut self, text: String) -> Action {
-        self.submit_text(text)
+        self.submit_text(text.clone(), text)
     }
 
     pub fn take_queued_prompt(&mut self) -> Option<String> {
@@ -4619,7 +4682,7 @@ impl AppState {
         Action::None
     }
 
-    fn submit_text(&mut self, text: String) -> Action {
+    fn submit_text(&mut self, text: String, display: String) -> Action {
         if text.is_empty() && self.composer_images.is_empty() {
             return Action::None;
         }
@@ -4627,14 +4690,6 @@ impl AppState {
             return self.run_slash_command(&text);
         }
         self.commit_welcome_card();
-        let display = if text.is_empty() {
-            (1..=self.composer_images.len())
-                .map(|index| format!("[Image #{index}]"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        } else {
-            text.clone()
-        };
         self.committed
             .push(Block::new(BlockKind::User, "You", display));
         if self.busy {
@@ -6931,6 +6986,11 @@ impl AppState {
             .active
             .get(id)
             .and_then(|existing| existing.shell_batch.clone());
+        let revision = self
+            .active
+            .get(id)
+            .map(|existing| existing.revision.wrapping_add(1))
+            .unwrap_or(0);
         let was_active = self.active.contains_key(id);
         if let Some(existing) = self.active.get(id) {
             block.adopt_id(&existing.block);
@@ -6953,8 +7013,14 @@ impl AppState {
                 self.register_shell_member(batch_id, id, &block);
             }
         }
-        self.active
-            .insert(id.to_owned(), ActiveItem { block, shell_batch });
+        self.active.insert(
+            id.to_owned(),
+            ActiveItem {
+                block,
+                shell_batch,
+                revision,
+            },
+        );
     }
 
     fn complete_item(&mut self, item: &Value) {
@@ -7020,10 +7086,9 @@ impl AppState {
         let Some(delta) = params.get("delta").and_then(Value::as_str) else {
             return;
         };
-        append_capped(
-            &mut self.ensure_active(item_id, kind, title).block.body,
-            delta,
-        );
+        let active = self.ensure_active(item_id, kind, title);
+        append_capped(&mut active.block.body, delta);
+        active.revision = active.revision.wrapping_add(1);
     }
 
     /// Command output can arrive before `item/started`. Mark it as Shell at the
@@ -7036,15 +7101,12 @@ impl AppState {
             return;
         };
         self.mark_active_shell(item_id);
-        append_capped(
-            &mut self
-                .active
-                .get_mut(item_id)
-                .expect("shell output is active")
-                .block
-                .body,
-            delta,
-        );
+        let active = self
+            .active
+            .get_mut(item_id)
+            .expect("shell output is active");
+        append_capped(&mut active.block.body, delta);
+        active.revision = active.revision.wrapping_add(1);
     }
 
     fn mark_active_shell(&mut self, item_id: &str) {
@@ -7068,12 +7130,14 @@ impl AppState {
                 ActiveItem {
                     block: Block::new(BlockKind::Tool, "Shell · command", ""),
                     shell_batch: None,
+                    revision: 0,
                 },
             );
         }
         let active = self.active.get_mut(item_id).expect("active shell exists");
         active.shell_batch = Some(batch_id.clone());
         active.block.title = "Shell · command".to_owned();
+        active.revision = active.revision.wrapping_add(1);
 
         let block = active.block.clone();
         self.register_shell_member(&batch_id, item_id, &block);
@@ -7144,6 +7208,7 @@ impl AppState {
                 ActiveItem {
                     block: Block::new(kind, title, ""),
                     shell_batch: None,
+                    revision: 0,
                 },
             );
         }
@@ -8564,37 +8629,44 @@ mod tests {
     }
 
     #[test]
-    fn vibe_mode_defaults_to_short_collapsed_output() {
-        let state = test_state();
+    /// The starting mode comes from the config on disk, so the preset is cycled
+    /// to rather than assumed.
+    fn vibe_mode_preset_collapses_shell_and_diff_output() {
+        let mut state = test_state();
+        while state.vibe_mode() != VibeMode::Vibe {
+            state.cycle_vibe_mode();
+        }
 
-        assert_eq!(state.vibe_mode_label(), "Vibe");
+        assert_eq!(state.vibe_mode_label(), "Vibe: On");
         assert_eq!(state.response_length_label(), "Short");
         assert_eq!(state.shell_display_mode(), ShellDisplayMode::Collapse);
         assert_eq!(state.diff_display_mode(), DiffDisplayMode::Collapse);
     }
 
     #[test]
-    fn slash_display_setting_switches_vibe_mode_to_custom() {
+    fn slash_display_setting_returns_vibe_mode_to_its_plain_preset() {
         let mut state = test_state();
 
         state.run_slash_command("/shell hide");
 
-        assert_eq!(state.vibe_mode_label(), "Custom");
+        assert_eq!(state.vibe_mode_label(), "Vibe: On");
         assert_eq!(state.shell_display_mode(), ShellDisplayMode::Hide);
     }
 
     #[test]
     fn vibe_mode_picker_previews_changes_and_escape_restores_them() {
         let mut state = test_state();
+        while state.vibe_mode() != VibeMode::Vibe {
+            state.cycle_vibe_mode();
+        }
         state.run_slash_command("/vibemode");
 
         state.handle_key(KeyEvent::from(KeyCode::Right));
         assert_eq!(state.response_length_label(), "Normal");
-        assert_eq!(state.vibe_mode_label(), "Custom");
 
         state.handle_key(KeyEvent::from(KeyCode::Esc));
         assert_eq!(state.response_length_label(), "Short");
-        assert_eq!(state.vibe_mode_label(), "Vibe");
+        assert_eq!(state.vibe_mode_label(), "Vibe: On");
     }
 
     #[test]
@@ -8730,7 +8802,7 @@ mod tests {
             .view()
             .live_blocks
             .into_iter()
-            .map(|block| block.title)
+            .map(|live| live.block.title.as_str())
             .collect::<Vec<_>>();
 
         assert!(titles.is_empty());
@@ -8992,7 +9064,7 @@ mod tests {
         }
         let live = state.view().live_blocks;
         assert_eq!(live.len(), 1);
-        assert_eq!(live[0].title, "Web search · rust async");
+        assert_eq!(live[0].block.title, "Web search · rust async");
 
         let first = json!({
             "id": "search-1",
@@ -9577,24 +9649,33 @@ mod tests {
     }
 
     #[test]
-    fn shift_tab_leaves_fixed_full_access_unchanged() {
+    fn shift_tab_requests_a_refresh_without_a_plan() {
         let mut state = test_state();
         let action = state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
 
-        assert!(matches!(action, Action::None));
+        assert!(matches!(action, Action::Tick(true)));
         assert_eq!(state.permission_mode(), PermissionMode::FullAccess);
         assert_eq!(state.permission_profile(), ":danger-full-access");
     }
 
     #[test]
-    fn shift_tab_still_cycles_while_a_slash_command_is_being_typed() {
+    fn shift_tab_toggles_the_plan_while_a_slash_command_is_being_typed() {
         let mut state = test_state();
         state.editor.insert_str("/mo");
+        state.plan_summary = Some(PlanSummary {
+            explanation: None,
+            steps: vec![],
+            expanded: true,
+            started_at: Instant::now(),
+            elapsed: None,
+        });
 
-        state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        let action = state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
 
+        assert!(matches!(action, Action::Tick(true)));
         assert_eq!(state.permission_mode(), PermissionMode::FullAccess);
         assert_eq!(state.editor.text(), "/mo");
+        assert!(state.plan_summary.is_some_and(|summary| !summary.expanded));
     }
 
     /// Shape captured from a real `account/rateLimits/read` response.
@@ -9924,7 +10005,12 @@ mod tests {
                     Instant::now() - std::time::Duration::from_millis(1_500),
                 )
             });
-            assert!(state.tick(), "{method} should redraw once it expires");
+            let tick = state.render_tick();
+            assert!(tick.redraw, "{method} should redraw once it expires");
+            assert!(
+                !tick.animation_only,
+                "{method} expiry changes the full composer frame"
+            );
             assert_eq!(state.view().composer_notice, None, "{method}");
         }
     }
@@ -10258,6 +10344,19 @@ mod tests {
         assert!(matches!(state.committed[0].kind, BlockKind::Welcome));
         assert!(matches!(state.committed[1].kind, BlockKind::User));
         assert!(!state.show_welcome);
+    }
+
+    #[test]
+    fn submitted_prompt_keeps_image_label_with_text() {
+        let mut state = test_state();
+        state.editor.insert_str("before");
+        state.attach_local_image(r"C:\Temp\clipboard-image.bmp".to_owned());
+        state.editor.insert_str("after");
+
+        let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(action, Action::Submit(text) if text == "beforeafter"));
+        assert_eq!(state.committed.last().map(|block| block.body.as_str()), Some("before [Image #1] after"));
     }
 
     #[test]
@@ -10851,6 +10950,16 @@ mod tests {
             state.view().composer_placeholder,
             "Enter: steer · Tab: queue"
         );
+    }
+
+    #[test]
+    fn an_unchanged_busy_tick_only_animates_the_activity_rows() {
+        let mut state = busy_state_with_live_turn();
+
+        let tick = state.render_tick();
+
+        assert!(tick.redraw);
+        assert!(tick.animation_only);
     }
 
     #[test]

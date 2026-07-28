@@ -4,6 +4,7 @@ mod devezcode;
 mod editor;
 mod integrations;
 mod paste;
+mod perf;
 mod pricing;
 mod renderer;
 mod rollout;
@@ -301,8 +302,6 @@ async fn await_thread(
 ) -> Result<Startup> {
     let mut events = EventStream::new();
     let mut composer_paste = ComposerPasteBuffer::new();
-    let mut paste_tick = tokio::time::interval(Duration::from_millis(5));
-    paste_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut spinner_tick = tokio::time::interval(Duration::from_millis(120));
     spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut queued = None;
@@ -315,6 +314,7 @@ async fn await_thread(
         if redraw {
             draw(state, renderer)?;
         }
+        let paste_deadline = composer_paste.flush_deadline();
         let action = tokio::select! {
             thread_response = &mut thread => {
                 // In practice the plan lands first, but never drop it on the floor.
@@ -335,7 +335,11 @@ async fn await_thread(
                 match event {
                     Some(Ok(Event::Key(key))) => {
                         renderer.clear_selection();
-                        observe_composer_key(state, &mut composer_paste, key, Instant::now())
+                        if is_clipboard_image_shortcut(&key) && attach_clipboard_image(state) {
+                            Action::None
+                        } else {
+                            observe_composer_key(state, &mut composer_paste, key, Instant::now())
+                        }
                     }
                     Some(Ok(Event::Mouse(mouse))) => renderer_mouse_action(renderer, &mouse, |pick| pick_action(state, pick)),
                     Some(Ok(Event::Paste(text))) => {
@@ -359,7 +363,7 @@ async fn await_thread(
                     None => return Ok(Startup::Quit),
                 }
             }
-            _ = paste_tick.tick() => {
+            _ = wait_for_paste_flush(paste_deadline), if paste_deadline.is_some() => {
                 Action::Tick(flush_composer_paste(state, &mut composer_paste, Instant::now()))
             }
             _ = spinner_tick.tick() => Action::Tick(state.tick()),
@@ -605,8 +609,6 @@ async fn event_loop(
     let mut update_rx = Some(update_rx);
     let mut terminal_events = EventStream::new();
     let mut composer_paste = ComposerPasteBuffer::new();
-    let mut paste_tick = tokio::time::interval(Duration::from_millis(5));
-    paste_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut activity_tick = tokio::time::interval(Duration::from_millis(80));
     activity_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut resize = ResizeTracker::new();
@@ -664,11 +666,16 @@ async fn event_loop(
             });
         }
         let mut connection_closed = false;
+        let mut animation_tick = false;
+        let paste_deadline = composer_paste.flush_deadline();
         let action = tokio::select! {
             terminal_event = terminal_events.next() => {
                 match terminal_event {
                     Some(Ok(Event::Key(key))) => {
-                        if key.code == KeyCode::Char('c')
+                        if is_clipboard_image_shortcut(&key) && attach_clipboard_image(state) {
+                            renderer.clear_selection();
+                            Action::None
+                        } else if key.code == KeyCode::Char('c')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                         {
                             if let Some(text) = renderer.selected_text() {
@@ -793,17 +800,20 @@ async fn event_loop(
                 }
                 Action::None
             }
-            _ = paste_tick.tick() => {
+            _ = wait_for_paste_flush(paste_deadline), if paste_deadline.is_some() => {
                 Action::Tick(flush_composer_paste(state, &mut composer_paste, Instant::now()))
             }
             _ = activity_tick.tick() => {
-                let mut redraw = state.tick();
+                let tick = state.render_tick();
+                let mut redraw = tick.redraw;
+                animation_tick = tick.animation_only;
                 // Ctrl+wheel font zoom changes the cell grid without always
                 // sending a `Resize`, so the size is polled here as well.
                 resize.observe(terminal_size());
                 if resize.settled() {
                     renderer.relayout()?;
                     redraw = true;
+                    animation_tick = false;
                 } else if resize.pending() {
                     // Nothing painted onto a grid that is still moving survives.
                     redraw = false;
@@ -818,7 +828,15 @@ async fn event_loop(
         let redraw = !matches!(&action, Action::Tick(false)) && !composer_paste.is_buffering();
         let should_quit = execute_action(server, state, renderer, action).await?;
         if redraw {
-            draw(state, renderer)?;
+            let animation_started = Instant::now();
+            let animated =
+                animation_tick && renderer.render_animation(state.animation_view())?;
+            if animated {
+                perf::record_animation(animation_started.elapsed());
+            }
+            if !animated {
+                draw(state, renderer)?;
+            }
         }
         if should_quit || connection_closed {
             break;
@@ -2898,6 +2916,13 @@ fn attach_clipboard_image(state: &mut AppState) -> bool {
     true
 }
 
+fn is_clipboard_image_shortcut(key: &KeyEvent) -> bool {
+    matches!(key.kind, crossterm::event::KeyEventKind::Press)
+        && matches!(key.code, KeyCode::Char('v' | 'V'))
+        && (key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::ALT))
+}
+
 fn attach_pasted_local_image(state: &mut AppState, text: &str) -> bool {
     let Some(path) = local_image_path_from_paste(text) else {
         return false;
@@ -3037,13 +3062,36 @@ fn write_clipboard_bmp(image: &ImageData<'_>) -> std::io::Result<PathBuf> {
 }
 
 fn draw(state: &mut AppState, renderer: &mut Renderer) -> Result<()> {
+    let draw_started = Instant::now();
     // Every state change the user can see reaches a frame, so the host's copy of
     // the session state is refreshed from the same place rather than from each
     // of the call sites that can move it.
     devezcode::sync(&state.thread_id, state.busy, state.awaiting_input());
     let committed = state.drain_committed();
     let view = state.view();
-    renderer.render(&committed, view)
+    let view_elapsed = draw_started.elapsed();
+    let live_blocks = view.live_blocks.len();
+    let live_bytes = view
+        .live_blocks
+        .iter()
+        .map(|live| live.block.title.len() + live.block.body.len())
+        .sum();
+    let render_started = Instant::now();
+    let result = renderer.render(&committed, view);
+    perf::record_draw(
+        view_elapsed,
+        render_started.elapsed(),
+        live_blocks,
+        live_bytes,
+    );
+    result
+}
+
+async fn wait_for_paste_flush(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Moves `/login` into its waiting state from an `account/login/start` response.
@@ -3385,12 +3433,30 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_image_shortcuts_accept_control_v_and_alt_v() {
+        assert!(is_clipboard_image_shortcut(&press(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(is_clipboard_image_shortcut(&press(
+            KeyCode::Char('V'),
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        )));
+        assert!(!is_clipboard_image_shortcut(&press(
+            KeyCode::Char('v'),
+            KeyModifiers::NONE,
+        )));
+    }
+
+    #[test]
     fn clicking_the_response_badge_cycles_response_length() {
         let mut state = starting_state();
 
         let action = pick_action(&mut state, Pick::ResponseLength);
 
-        assert!(matches!(action, Action::Tick(true)));
+        // Every display badge persists the whole vibe group, so one reading can
+        // never be saved without the preset it belongs to.
+        assert!(matches!(action, Action::PersistVibeDisplayModes { .. }));
         assert_eq!(state.response_length_label(), "Normal");
         state.handle_key(press(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(state.response_length_label(), "Normal");
@@ -3413,7 +3479,7 @@ mod tests {
 
         let action = pick_action(&mut state, Pick::ShellDisplayMode);
 
-        assert!(matches!(action, Action::PersistShellDisplayMode(_)));
+        assert!(matches!(action, Action::PersistVibeDisplayModes { .. }));
         assert_ne!(state.shell_display_mode(), before);
     }
 

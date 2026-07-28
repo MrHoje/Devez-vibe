@@ -90,7 +90,7 @@ pub enum BlockKind {
     Assistant,
     Reasoning,
     /// A `turn/plan/updated` snapshot. Its body is the encoded plan: `└ ` rows
-    /// are the explanation, `✔ `/`▸ `/`□ ` rows are done/in-progress/pending
+    /// are the explanation, `✓ `/`▸ `/`□ ` rows are done/in-progress/pending
     /// steps. See [`plan_lines`].
     #[allow(dead_code)]
     Plan,
@@ -112,8 +112,16 @@ pub struct Block {
     children: Vec<Block>,
 }
 
+#[derive(Clone, Copy)]
+pub struct LiveBlockView<'a> {
+    pub block: &'a Block,
+    pub revision: u64,
+}
+
 static NEXT_BLOCK_ID: AtomicU64 = AtomicU64::new(1);
 static CHAT_LAYOUT: AtomicBool = AtomicBool::new(true);
+/// Cells a chat bubble keeps between its edge and its text, per side.
+const CHAT_BUBBLE_PADDING: usize = 1;
 
 impl Block {
     pub fn new(kind: BlockKind, title: impl Into<String>, body: impl Into<String>) -> Self {
@@ -301,7 +309,7 @@ pub struct PlanSummary {
 }
 
 pub struct View<'a> {
-    pub live_blocks: Vec<Block>,
+    pub live_blocks: Vec<LiveBlockView<'a>>,
     pub overlay: Option<OverlayView<'a>>,
     /// A persistent right-hand panel, available only to the fullscreen renderer.
     pub plan_summary: Option<&'a PlanSummary>,
@@ -326,6 +334,15 @@ pub struct View<'a> {
     pub chat_layout: bool,
     pub shell_display_mode: ShellDisplayMode,
     pub diff_display_mode: DiffDisplayMode,
+}
+
+pub struct AnimationView<'a> {
+    pub activity: Option<String>,
+    pub activity_model: Option<String>,
+    pub activity_phase: f32,
+    pub plan_summary: Option<&'a PlanSummary>,
+    pub plan_active: bool,
+    pub composer_mode: Option<ComposerMode>,
 }
 
 pub struct TerminalSession {
@@ -396,6 +413,7 @@ pub struct Renderer {
     mode: RenderMode,
     previous_lines: Vec<PaintLine>,
     cursor_line: usize,
+    cursor_col: usize,
     cursor_shown: bool,
     last_width: u16,
     last_height: u16,
@@ -425,6 +443,11 @@ pub struct Renderer {
     selection: Selection,
     painted_selection: Option<CellRange>,
     painted_frame: Option<CellFrame>,
+    live_frame_cache: Option<LiveFrameCache>,
+    animation_activity_row: Option<usize>,
+    animation_plan_rows: usize,
+    #[cfg(test)]
+    live_cache_rebuilds: usize,
 }
 
 /// One resolved terminal cell. The last terminal column may carry a style, but
@@ -473,6 +496,16 @@ struct CellFrame {
     width: usize,
     height: usize,
     cells: Vec<Cell>,
+}
+
+struct LiveFrameCache {
+    blocks: Vec<(u64, u64)>,
+    width: u16,
+    shell_display_mode: ShellDisplayMode,
+    diff_display_mode: DiffDisplayMode,
+    chat_layout: bool,
+    expanded_tools: HashSet<u64>,
+    lines: Vec<PaintLine>,
 }
 
 /// A terminal cell may be one visible character plus following zero-width
@@ -622,6 +655,7 @@ impl Renderer {
             mode,
             previous_lines: Vec::new(),
             cursor_line: 0,
+            cursor_col: 0,
             cursor_shown: true,
             last_width: 0,
             last_height: 0,
@@ -642,6 +676,11 @@ impl Renderer {
             selection: Selection::default(),
             painted_selection: None,
             painted_frame: None,
+            live_frame_cache: None,
+            animation_activity_row: None,
+            animation_plan_rows: 0,
+            #[cfg(test)]
+            live_cache_rebuilds: 0,
         }
     }
 
@@ -727,6 +766,9 @@ impl Renderer {
         self.selection.clear();
         self.painted_selection = None;
         self.painted_frame = None;
+        self.live_frame_cache = None;
+        self.animation_activity_row = None;
+        self.animation_plan_rows = 0;
         self.apply_terminal_theme()?;
         self.reset_screen()
     }
@@ -886,7 +928,7 @@ impl Renderer {
         }
         let row = row.min(self.previous_lines.len().saturating_sub(1) as u16);
         let line = &self.previous_lines[usize::from(row)];
-        if line.tone == Tone::UserPromptHalf {
+        if matches!(line.tone, Tone::UserPromptHalf | Tone::AssistantBubbleHalf) {
             return None;
         }
         let width = painted_line_width(line).max(
@@ -983,6 +1025,7 @@ impl Renderer {
         self.selection.clear();
         self.painted_selection = None;
         self.cursor_line = 0;
+        self.cursor_col = 0;
         self.cursor_shown = true;
         self.last_width = 0;
         self.last_height = 0;
@@ -1029,6 +1072,8 @@ impl Renderer {
         let (width, height) = terminal_size().unwrap_or((100, 30));
         let width = width.max(20);
         let frame_width = width;
+        let live_lines =
+            self.live_frame_lines(&view.live_blocks, frame_width, height.max(3) as usize);
         let status = StatusArea {
             fallback: view.footer,
             line: view.status_line,
@@ -1037,18 +1082,15 @@ impl Renderer {
         };
         let mut frame = if let Some(overlay) = view.overlay {
             overlay_frame_with_expansion(
-                &view.live_blocks,
+                live_lines,
                 overlay,
                 view.welcome,
                 status,
                 frame_width,
-                &self.expanded_tools,
-                self.shell_display_mode,
-                self.diff_display_mode,
             )
         } else {
             normal_frame_with_expansion(
-                &view.live_blocks,
+                live_lines,
                 view.editor,
                 view.composer_images,
                 &view.queued_prompts,
@@ -1060,9 +1102,6 @@ impl Renderer {
                 view.activity_phase,
                 status,
                 frame_width,
-                &self.expanded_tools,
-                self.shell_display_mode,
-                self.diff_display_mode,
             )
         };
 
@@ -1133,8 +1172,205 @@ impl Renderer {
 
         self.previous_lines = frame.lines.clone();
         self.cursor_line = frame.cursor_line;
+        self.cursor_col = frame.cursor_col;
+        self.animation_activity_row = None;
+        self.animation_plan_rows = 0;
         self.last_width = width;
         self.last_height = height;
+        self.out.flush()?;
+        Ok(())
+    }
+
+    fn live_frame_lines(
+        &mut self,
+        live: &[LiveBlockView<'_>],
+        width: u16,
+        max_rows: usize,
+    ) -> Vec<PaintLine> {
+        let blocks = live
+            .iter()
+            .map(|live| (live.block.id(), live.revision))
+            .collect::<Vec<_>>();
+        let reusable = self.live_frame_cache.as_ref().is_some_and(|cache| {
+            cache.blocks == blocks
+                && cache.width == width
+                && cache.shell_display_mode == self.shell_display_mode
+                && cache.diff_display_mode == self.diff_display_mode
+                && cache.chat_layout == self.chat_layout
+                && cache.expanded_tools == self.expanded_tools
+        });
+        if !reusable {
+            #[cfg(test)]
+            {
+                self.live_cache_rebuilds += 1;
+            }
+            self.live_frame_cache = Some(LiveFrameCache {
+                blocks,
+                width,
+                shell_display_mode: self.shell_display_mode,
+                diff_display_mode: self.diff_display_mode,
+                chat_layout: self.chat_layout,
+                expanded_tools: self.expanded_tools.clone(),
+                lines: render_live_block_lines(
+                    live,
+                    width,
+                    &self.expanded_tools,
+                    self.shell_display_mode,
+                    self.diff_display_mode,
+                ),
+            });
+        }
+        let lines = &self
+            .live_frame_cache
+            .as_ref()
+            .expect("live frame cache initialized")
+            .lines;
+        let start = lines.len().saturating_sub(max_rows);
+        lines[start..].to_vec()
+    }
+
+    pub fn render_animation(&mut self, view: AnimationView<'_>) -> Result<bool> {
+        if self.mode != RenderMode::Fullscreen
+            || self.last_width == 0
+            || self.previous_lines.is_empty()
+            || self.painted_frame.is_none()
+            || self.selection.range().is_some()
+        {
+            return Ok(false);
+        }
+
+        let mut updates = Vec::new();
+        if let Some(activity) = view.activity.as_deref() {
+            let Some(row) = self.animation_activity_row else {
+                return Ok(false);
+            };
+            let mut activity_rows = activity_lines(
+                activity,
+                view.activity_model.as_deref(),
+                view.activity_phase,
+                self.last_width,
+            );
+            if activity_rows.len() != 1 {
+                return Ok(false);
+            }
+            let mut line = activity_rows.pop().expect("one activity row");
+            if let Some(mode) = view.composer_mode.as_ref()
+                && let Some(with_controls) =
+                    activity_line_with_composer_controls(line.clone(), mode, self.last_width)
+            {
+                line = with_controls;
+            }
+            updates.push((row, line));
+        } else if self.animation_activity_row.is_some() {
+            return Ok(false);
+        }
+
+        let plan_lines = view
+            .plan_summary
+            .map(|summary| {
+                fixed_plan_summary_lines(
+                    summary,
+                    self.last_width,
+                    view.activity_phase,
+                    view.plan_active,
+                )
+            })
+            .unwrap_or_default();
+        if plan_lines.len() != self.animation_plan_rows {
+            return Ok(false);
+        }
+        updates.extend(plan_lines.into_iter().enumerate());
+        let painted_height = self
+            .painted_frame
+            .as_ref()
+            .map(|frame| frame.height)
+            .unwrap_or(0);
+        let mut rows = HashSet::new();
+        if updates.is_empty()
+            || updates
+                .iter()
+                .any(|(row, _)| {
+                    *row >= self.previous_lines.len()
+                        || *row >= painted_height
+                        || !rows.insert(*row)
+                })
+        {
+            return Ok(false);
+        }
+        self.paint_animation_rows(&updates)?;
+        for (row, line) in updates {
+            self.previous_lines[row] = line;
+        }
+        Ok(true)
+    }
+
+    fn paint_animation_rows(&mut self, updates: &[(usize, PaintLine)]) -> Result<()> {
+        let width = usize::from(self.last_width);
+        let Some(painted) = self.painted_frame.as_ref() else {
+            return Ok(());
+        };
+        if updates
+            .iter()
+            .any(|(row, _)| *row >= painted.height || *row >= self.previous_lines.len())
+        {
+            return Ok(());
+        }
+
+        let mut rows = Vec::with_capacity(updates.len());
+        for (screen_row, line) in updates {
+            let mut current = CellFrame::new(width, 1);
+            let hovered =
+                Self::hover_columns(line, self.hovered_tool, self.hovered_pick.as_ref());
+            paint_line_into_frame(&mut current, 0, line, None, hovered, None);
+            let start = screen_row * width;
+            let previous = CellFrame {
+                width,
+                height: 1,
+                cells: painted.cells[start..start + width].to_vec(),
+            };
+            rows.push((*screen_row, previous, current));
+        }
+
+        if self.cursor_shown {
+            queue!(self.out, Hide)?;
+            self.cursor_shown = false;
+        }
+        queue!(self.out, Print("\x1b[?2026h"))?;
+        let mut result = Ok(());
+        for (screen_row, previous, current) in &rows {
+            if let Err(error) =
+                emit_frame_diff_at(&mut self.out, Some(previous), current, *screen_row)
+            {
+                result = Err(error);
+                break;
+            }
+        }
+        let end = queue!(self.out, Print("\x1b[?2026l"));
+        match (result, end) {
+            (Err(error), _) => return Err(error),
+            (Ok(()), Err(error)) => return Err(error.into()),
+            (Ok(()), Ok(())) => {}
+        }
+
+        if let Some(painted) = self.painted_frame.as_mut() {
+            for (screen_row, _, current) in rows {
+                let start = screen_row * width;
+                painted.cells[start..start + width].clone_from_slice(&current.cells);
+            }
+        }
+        queue!(
+            self.out,
+            MoveTo(
+                self.cursor_col
+                    .min(width.saturating_sub(2))
+                    .min(u16::MAX as usize) as u16,
+                self.cursor_line.min(u16::MAX as usize) as u16
+            ),
+            Show
+        )?;
+        self.cursor_shown = true;
+        self.painted_hovered_tool = self.hovered_tool;
+        self.painted_hovered_pick = self.hovered_pick.clone();
         self.out.flush()?;
         Ok(())
     }
@@ -1157,7 +1393,9 @@ impl Renderer {
             self.remove_welcome_history(width);
         }
         let rows = height as usize;
-        let plan_lines = plan_summary.map(|summary| fixed_plan_summary_lines(summary, width, activity_phase, plan_active)).unwrap_or_default();
+        let plan_lines = plan_summary
+            .map(|summary| fixed_plan_summary_lines(summary, width, activity_phase, plan_active))
+            .unwrap_or_default();
         let plan_rows = plan_lines.len().min(rows.saturating_sub(1));
         let content_rows = rows.saturating_sub(plan_rows).max(1);
         let old_view_rows = split_rows(content_rows, frame.lines.len(), self.wrapped.len()).0;
@@ -1184,6 +1422,9 @@ impl Renderer {
         if sticky.is_some() {
             sticky = sticky_prompt_for_viewport(&self.prompt_anchors, start, width);
         }
+        let animation_activity_row = frame
+            .activity_index
+            .map(|index| plan_rows + view_rows + index);
         let (mut screen, cursor_line) = compose_screen(
             &self.wrapped,
             frame.lines,
@@ -1216,6 +1457,9 @@ impl Renderer {
         )?;
         self.previous_lines = screen;
         self.cursor_line = cursor_line;
+        self.cursor_col = frame.cursor_col;
+        self.animation_activity_row = animation_activity_row;
+        self.animation_plan_rows = plan_rows;
         self.last_width = width;
         self.last_height = height;
         self.out.flush()?;
@@ -1442,6 +1686,7 @@ impl Renderer {
         queue!(self.out, Clear(ClearType::FromCursorDown))?;
         self.previous_lines.clear();
         self.cursor_line = 0;
+        self.cursor_col = 0;
         Ok(())
     }
 
@@ -1635,6 +1880,7 @@ fn paint_line_into_frame(
     background_width: Option<usize>,
 ) {
     let background = row_background(line.tone);
+    let bubble_background = bubble_background(line);
     if let Some(background) = background {
         let (start, right) = if line.tone == Tone::UserPrompt {
             let start = UnicodeWidthStr::width(line.prefix.as_str()).saturating_sub(1);
@@ -1658,6 +1904,7 @@ fn paint_line_into_frame(
         );
     }
     let mut column = 0;
+    let prefix_background = word_background(line.prefix_tone).or(bubble_background).or(background);
     paint_text_into_frame(
         frame,
         row,
@@ -1665,7 +1912,7 @@ fn paint_line_into_frame(
         &mut column,
         line.prefix_tone,
         false,
-        word_background(line.prefix_tone).or(background),
+        prefix_background,
         selected_columns.as_ref(),
         hovered_columns.as_ref(),
     );
@@ -1676,7 +1923,7 @@ fn paint_line_into_frame(
         &mut column,
         line.tone,
         line.bold,
-        word_background(line.tone).or(background),
+        word_background(line.tone).or(bubble_background).or(background),
         selected_columns.as_ref(),
         hovered_columns.as_ref(),
     );
@@ -1691,7 +1938,7 @@ fn paint_line_into_frame(
             &mut column,
             span.tone,
             span.bold,
-            word_background(span.tone).or(background),
+            word_background(span.tone).or(bubble_background).or(background),
             selected_columns.as_ref(),
             hovered_columns.as_ref(),
         );
@@ -1723,11 +1970,21 @@ fn emit_frame_diff(
     previous: Option<&CellFrame>,
     current: &CellFrame,
 ) -> Result<()> {
+    emit_frame_diff_at(out, previous, current, 0)
+}
+
+fn emit_frame_diff_at(
+    out: &mut impl Write,
+    previous: Option<&CellFrame>,
+    current: &CellFrame,
+    row_offset: usize,
+) -> Result<()> {
     let previous = previous.filter(|frame| frame.width == current.width && frame.height == current.height);
     for row in 0..current.height {
+        let screen_row = row.saturating_add(row_offset);
         let wide_damage = previous.and_then(|previous| wide_damage_range(previous, current, row));
         if let Some(columns) = wide_damage.clone() {
-            emit_frame_columns(out, current, row, columns)?;
+            emit_frame_columns(out, current, row, screen_row, columns)?;
         }
         let mut column = 0;
         while column < current.width {
@@ -1748,7 +2005,7 @@ fn emit_frame_diff(
                     out,
                     MoveTo(
                         column.min(u16::MAX as usize) as u16,
-                        row.min(u16::MAX as usize) as u16
+                        screen_row.min(u16::MAX as usize) as u16
                     )
                 )?;
                 set_cell_style(out, cell.style)?;
@@ -1778,7 +2035,7 @@ fn emit_frame_diff(
                 out,
                 MoveTo(
                     start.min(u16::MAX as usize) as u16,
-                    row.min(u16::MAX as usize) as u16
+                    screen_row.min(u16::MAX as usize) as u16
                 )
             )?;
             set_cell_style(out, style)?;
@@ -1824,6 +2081,7 @@ fn emit_frame_columns(
     out: &mut impl Write,
     frame: &CellFrame,
     row: usize,
+    screen_row: usize,
     columns: Range<usize>,
 ) -> Result<()> {
     let mut column = columns.start.min(frame.width);
@@ -1839,7 +2097,7 @@ fn emit_frame_columns(
                 out,
                 MoveTo(
                     column.min(u16::MAX as usize) as u16,
-                    row.min(u16::MAX as usize) as u16
+                    screen_row.min(u16::MAX as usize) as u16
                 )
             )?;
             set_cell_style(out, cell.style)?;
@@ -1866,7 +2124,7 @@ fn emit_frame_columns(
             out,
             MoveTo(
                 start.min(u16::MAX as usize) as u16,
-                row.min(u16::MAX as usize) as u16
+                screen_row.min(u16::MAX as usize) as u16
             )
         )?;
         set_cell_style(out, style)?;
@@ -1920,10 +2178,10 @@ fn compose_screen(
     (screen, cursor_line)
 }
 
-/// The overlay floats three rows above the composer, covering only the button's
+/// The overlay floats two rows above the composer, covering only the button's
 /// cells rather than claiming a transcript row of its own.
 fn scroll_to_bottom_overlay_row(view_rows: usize, composer_index: Option<usize>) -> Option<usize> {
-    composer_index.map(|index| view_rows + index.saturating_sub(4))
+    composer_index.map(|index| view_rows + index.saturating_sub(3))
 }
 
 fn prompt_anchor_text(block: &Block) -> String {
@@ -1989,6 +2247,7 @@ struct Frame {
     show_cursor: bool,
     dock_index: usize,
     composer_index: Option<usize>,
+    activity_index: Option<usize>,
 }
 
 struct StatusArea {
@@ -2135,8 +2394,13 @@ impl PickRegions {
     fn columns_of(&self, pick: &Pick) -> Option<Range<usize>> {
         self.0
             .iter()
-            .find(|(_, _, candidate)| candidate == pick)
-            .map(|(start, end, _)| *start..*end)
+            .filter(|(_, _, candidate)| candidate == pick)
+            .fold(None, |range: Option<Range<usize>>, (start, end, _)| {
+                Some(match range {
+                    Some(range) => range.start.min(*start)..range.end.max(*end),
+                    None => *start..*end,
+                })
+            })
     }
 
     fn shifted(mut self, columns: usize) -> Self {
@@ -2538,12 +2802,13 @@ fn composer_content_columns(line: &PaintLine) -> Option<Range<usize>> {
 /// text. Visible conversation markers are text and remain selectable so copy
 /// and paste matches Claude Code.
 fn selectable_content_columns(line: &PaintLine) -> Option<Range<usize>> {
-    composer_content_columns(line).or_else(|| {
+    let content = bubble_content_columns(line);
+    let columns = composer_content_columns(line).or_else(|| {
         let boxed_code = line.prefix.ends_with("│ ")
             && line.tail.last().is_some_and(|span| span.text == "│");
         if boxed_code {
             let start = UnicodeWidthStr::width(line.prefix.as_str());
-            let end = painted_line_width(line).saturating_sub(1);
+            let end = content.end.saturating_sub(1);
             return (start < end).then_some(start..end);
         }
         if let Some(indentation) = line
@@ -2553,16 +2818,47 @@ fn selectable_content_columns(line: &PaintLine) -> Option<Range<usize>> {
             && !indentation.is_empty()
             && indentation.chars().all(|ch| ch == ' ')
         {
-            return Some(UnicodeWidthStr::width(indentation)..painted_line_width(line));
+            return Some(UnicodeWidthStr::width(indentation)..content.end);
         }
         let fallback_status_gutter =
             line.prefix == " " && line.prefix_tone == Tone::Muted && line.tone == Tone::Muted;
         let empty_gutter = !line.prefix.is_empty()
             && line.prefix.chars().all(|ch| ch == ' ')
             && !fallback_status_gutter;
-        empty_gutter
-            .then(|| UnicodeWidthStr::width(line.prefix.as_str())..painted_line_width(line))
-    })
+        empty_gutter.then(|| UnicodeWidthStr::width(line.prefix.as_str())..content.end)
+    });
+    match columns {
+        Some(columns) => {
+            let start = columns.start.max(content.start);
+            let end = columns.end.min(content.end);
+            (start < end).then_some(start..end)
+        }
+        // A bubble row with no gutter of its own is still narrower than the band
+        // it is painted on, so the padding has to be trimmed off here too.
+        None => (content != (0..painted_line_width(line))).then_some(content),
+    }
+}
+
+/// Columns a chat bubble row actually holds text in. Both bubbles are filled out
+/// to a common width so their background paints as one band, and that filler is
+/// chrome: a drag across it must not land in the clipboard.
+fn bubble_content_columns(line: &PaintLine) -> Range<usize> {
+    let width = painted_line_width(line);
+    if line.tone == Tone::UserPrompt && CHAT_LAYOUT.load(Ordering::Relaxed) {
+        let prefix = UnicodeWidthStr::width(line.prefix.as_str());
+        let end = prefix + UnicodeWidthStr::width(line.text.trim_end());
+        return (prefix + CHAT_BUBBLE_PADDING).min(end)..end;
+    }
+    let filler = line
+        .tail
+        .iter()
+        .rev()
+        .take_while(|span| {
+            span.tone == Tone::AssistantBubble && span.text.chars().all(|ch| ch == ' ')
+        })
+        .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+        .sum();
+    0..width.saturating_sub(filler)
 }
 
 fn selection_columns_for_line(
@@ -2570,7 +2866,8 @@ fn selection_columns_for_line(
     range: CellRange,
     row: usize,
 ) -> Option<Range<usize>> {
-    if line.tone == Tone::UserPromptHalf {
+    // A bubble's rounded edge rows are chrome, not text.
+    if matches!(line.tone, Tone::UserPromptHalf | Tone::AssistantBubbleHalf) {
         return None;
     }
     let mut selected = range.columns_for_row(row, painted_line_width(line))?;
@@ -2607,6 +2904,31 @@ fn selection_is_worth_painting(range: CellRange, lines: &[PaintLine]) -> bool {
     false
 }
 
+fn render_live_block_lines(
+    live: &[LiveBlockView<'_>],
+    width: u16,
+    expanded_tools: &HashSet<u64>,
+    shell_display_mode: ShellDisplayMode,
+    diff_display_mode: DiffDisplayMode,
+) -> Vec<PaintLine> {
+    visible_transcript_blocks(
+        live.iter().map(|live| live.block),
+        shell_display_mode,
+        diff_display_mode,
+    )
+    .into_iter()
+    .flat_map(|block| {
+        block_group_lines(
+            block,
+            width,
+            shell_display_mode,
+            diff_display_mode,
+            expanded_tools.contains(&block.id()),
+        )
+    })
+    .collect()
+}
+
 #[cfg(test)]
 fn normal_frame(
     live: &[Block],
@@ -2617,8 +2939,19 @@ fn normal_frame(
     status: StatusArea,
     width: u16,
 ) -> Frame {
+    let live = live
+        .iter()
+        .map(|block| LiveBlockView { block, revision: 0 })
+        .collect::<Vec<_>>();
+    let live_lines = render_live_block_lines(
+        &live,
+        width,
+        &HashSet::new(),
+        ShellDisplayMode::Collapse,
+        DiffDisplayMode::Collapse,
+    );
     normal_frame_with_expansion(
-        live,
+        live_lines,
         editor,
         &[],
         &[],
@@ -2630,15 +2963,12 @@ fn normal_frame(
         0.5,
         status,
         width,
-        &HashSet::new(),
-        ShellDisplayMode::Collapse,
-        DiffDisplayMode::Collapse,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn normal_frame_with_expansion(
-    live: &[Block],
+    live_lines: Vec<PaintLine>,
     editor: &Editor,
     composer_images: &[String],
     queued_prompts: &[String],
@@ -2650,25 +2980,13 @@ fn normal_frame_with_expansion(
     activity_phase: f32,
     status: StatusArea,
     width: u16,
-    expanded_tools: &HashSet<u64>,
-    shell_display_mode: ShellDisplayMode,
-    diff_display_mode: DiffDisplayMode,
 ) -> Frame {
     let mut lines = Vec::new();
     if let Some(welcome) = welcome {
         lines.extend(welcome_lines(welcome, width));
         lines.push(PaintLine::blank());
     }
-
-    for block in visible_transcript_blocks(live, shell_display_mode, diff_display_mode) {
-        lines.extend(block_group_lines(
-            block,
-            width,
-            shell_display_mode,
-            diff_display_mode,
-            expanded_tools.contains(&block.id()),
-        ));
-    }
+    lines.extend(live_lines);
 
     let mut dock_index = lines.len();
     let composer_mode = status.composer_mode.as_ref();
@@ -2676,13 +2994,13 @@ fn normal_frame_with_expansion(
     let activity_uses_composer_spacer = activity.is_some() && suggestions.is_empty();
     let idle_controls_can_use_composer_spacer =
         activity.is_none() && suggestions.is_empty() && composer_mode.is_some();
+    let mut activity_index = None;
     // Transient rows stay in the pinned dock instead of scrolling away with the
     // conversation. Activity leads any command suggestions.
     if let Some(activity) = activity {
         if !matches!(lines.last(), Some(line) if line == &PaintLine::blank()) {
             lines.push(PaintLine::blank());
         }
-        lines.push(PaintLine::blank());
         let mut activity_rows = activity_lines(activity, activity_model, activity_phase, width);
         if let Some(mode) = composer_controls_mode
             && let Some(row) = activity_line_with_composer_controls(
@@ -2696,6 +3014,7 @@ fn normal_frame_with_expansion(
         // Controls never return to the composer rule while activity is shown;
         // the active row keeps only the settings that fit beside its label.
         composer_controls_mode = None;
+        activity_index = Some(lines.len());
         lines.extend(activity_rows);
         if !suggestions.is_empty() {
             lines.push(PaintLine::blank());
@@ -2753,6 +3072,7 @@ fn normal_frame_with_expansion(
         show_cursor: true,
         dock_index,
         composer_index: Some(composer_index),
+        activity_index,
     }
 }
 
@@ -2835,7 +3155,7 @@ fn welcome_info_rows(welcome: &WelcomeView, column_width: usize) -> Vec<PanelRow
     // First credit row sits beside the label; the rest hang under the value column.
     let mut credits = welcome.credits.iter();
     let summary = credits.next().map_or("—", String::as_str);
-    let icon = if welcome.credits_expanded { "∧" } else { "∨" };
+    let icon = if welcome.credits_expanded { "▲" } else { "▼" };
     let summary = compact_right(
         summary,
         column_width.saturating_sub(WELCOME_LABEL_WIDTH + UnicodeWidthStr::width(icon) + 2),
@@ -2879,7 +3199,7 @@ fn welcome_info_rows(welcome: &WelcomeView, column_width: usize) -> Vec<PanelRow
 
 fn welcome_reset_pick(mut line: PaintLine) -> PaintLine {
     if line.text.contains("Resets") {
-        if let Some(icon_start) = line.text.find(['∨', '∧']) {
+        if let Some(icon_start) = line.text.find(['▼', '▲']) {
             let value_start = line
                 .text
                 .find("Resets   ")
@@ -2888,7 +3208,7 @@ fn welcome_reset_pick(mut line: PaintLine) -> PaintLine {
             let start = UnicodeWidthStr::width(line.prefix.as_str())
                 + UnicodeWidthStr::width(&line.text[..value_start]);
             let end = UnicodeWidthStr::width(line.prefix.as_str())
-                + UnicodeWidthStr::width(&line.text[..icon_start + '∨'.len_utf8()]);
+                + UnicodeWidthStr::width(&line.text[..icon_start + '▼'.len_utf8()]);
             line.pick = Some(PickRegions::span(
                 start.saturating_sub(PICK_BLEED),
                 end + PICK_BLEED,
@@ -3482,27 +3802,32 @@ fn overlay_frame(
     status: StatusArea,
     width: u16,
 ) -> Frame {
-    overlay_frame_with_expansion(
-        live,
-        overlay,
-        welcome,
-        status,
+    let live = live
+        .iter()
+        .map(|block| LiveBlockView { block, revision: 0 })
+        .collect::<Vec<_>>();
+    let live_lines = render_live_block_lines(
+        &live,
         width,
         &HashSet::new(),
         ShellDisplayMode::Collapse,
         DiffDisplayMode::Collapse,
+    );
+    overlay_frame_with_expansion(
+        live_lines,
+        overlay,
+        welcome,
+        status,
+        width,
     )
 }
 
 fn overlay_frame_with_expansion(
-    live: &[Block],
+    live_lines: Vec<PaintLine>,
     overlay: OverlayView<'_>,
     welcome: Option<WelcomeView>,
     status: StatusArea,
     width: u16,
-    expanded_tools: &HashSet<u64>,
-    shell_display_mode: ShellDisplayMode,
-    diff_display_mode: DiffDisplayMode,
 ) -> Frame {
     let mut lines = Vec::new();
     // A picker docks over the transcript rather than replacing the screen, so the
@@ -3513,15 +3838,7 @@ fn overlay_frame_with_expansion(
         lines.extend(welcome_lines(welcome, width));
         lines.push(PaintLine::blank());
     }
-    for block in visible_transcript_blocks(live, shell_display_mode, diff_display_mode) {
-        lines.extend(block_group_lines(
-            block,
-            width,
-            shell_display_mode,
-            diff_display_mode,
-            expanded_tools.contains(&block.id()),
-        ));
-    }
+    lines.extend(live_lines);
     let dock_index = lines.len();
 
     match overlay.style {
@@ -3729,6 +4046,7 @@ fn overlay_frame_with_expansion(
         show_cursor,
         dock_index,
         composer_index,
+        activity_index: None,
     }
 }
 
@@ -3742,6 +4060,9 @@ fn fit_frame(frame: &mut Frame, target_rows: usize) {
         frame.composer_index = frame
             .composer_index
             .map(|index| index.saturating_sub(dropped));
+        frame.activity_index = frame
+            .activity_index
+            .and_then(|index| index.checked_sub(dropped));
     } else if frame.lines.len() < target_rows {
         let padding = target_rows - frame.lines.len();
         let dock_index = frame.dock_index.min(frame.lines.len());
@@ -3757,6 +4078,12 @@ fn fit_frame(frame: &mut Frame, target_rows: usize) {
             .is_some_and(|index| index >= dock_index)
         {
             frame.composer_index = frame.composer_index.map(|index| index + padding);
+        }
+        if frame
+            .activity_index
+            .is_some_and(|index| index >= dock_index)
+        {
+            frame.activity_index = frame.activity_index.map(|index| index + padding);
         }
     }
     frame.cursor_line = frame.cursor_line.min(frame.lines.len().saturating_sub(1));
@@ -4019,11 +4346,11 @@ fn is_context_compaction_block(block: &Block) -> bool {
 /// Shell groups before rendering; that also lets two thoughts separated only by
 /// a hidden Shell collapse into their latest summary.
 fn visible_transcript_blocks<'a>(
-    blocks: &'a [Block],
+    blocks: impl IntoIterator<Item = &'a Block>,
     shell_display_mode: ShellDisplayMode,
     diff_display_mode: DiffDisplayMode,
 ) -> Vec<&'a Block> {
-    let mut visible: Vec<&Block> = Vec::with_capacity(blocks.len());
+    let mut visible: Vec<&Block> = Vec::new();
     for block in blocks {
         if is_empty_thinking_block(block) {
             continue;
@@ -4576,7 +4903,7 @@ fn hunk_start(row: &str) -> Option<(usize, usize)> {
 const THINKING_TITLE: &str = "Thinking…";
 
 /// Codex paints a plan update as `- 작업 단계`, the explanation hanging off
-/// a `└`, then one checkbox row per step indented four columns: `✔` for done,
+/// a `└`, then one checkbox row per step indented four columns: `✓` for done,
 /// `□` for the rest, with the in-progress step lit instead of dimmed. The body
 /// carries `▸` for that step so the row keeps a status the text alone can't.
 fn plan_lines(block: &Block, width: u16) -> Vec<PaintLine> {
@@ -4586,9 +4913,9 @@ fn plan_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         // The checkbox itself is never struck through, only the step behind it.
         let (prefix, tone, bold, text) = if let Some(rest) = row.strip_prefix("└ ") {
             ("  └ ", Tone::Muted, false, rest)
-        } else if let Some(rest) = row.strip_prefix("✔ ") {
+        } else if let Some(rest) = row.strip_prefix("✓ ") {
             steps += 1;
-            ("    ✔ ", Tone::PlanDone, false, rest)
+            ("    ✓ ", Tone::PlanDone, false, rest)
         } else if let Some(rest) = row.strip_prefix("▸ ") {
             steps += 1;
             ("    □ ", Tone::Accent, true, rest)
@@ -4621,32 +4948,31 @@ fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_
     let completed = summary.steps.iter().filter(|step| step.status == PlanStepStatus::Completed).count();
     let title = format!("작업 단계 · {completed} / {} 완료", summary.steps.len());
     if !summary.expanded {
-        let tail = " ∨ ━";
+        let tail = " Shift + Tab ▼ ━━";
         let rule = "━".repeat(
-            line_width.saturating_sub(4 + UnicodeWidthStr::width(title.as_str()) + UnicodeWidthStr::width(tail)),
+            line_width.saturating_sub(5 + UnicodeWidthStr::width(title.as_str()) + UnicodeWidthStr::width(tail)),
         );
         let header = PaintLine {
             prefix: String::new(),
             prefix_tone: Tone::Border,
-            text: format!("━━ {title} {rule}"),
+            text: format!("━━━ {title} {rule}"),
             tone: Tone::Plain,
             bold: false,
             tool_heading: None,
             pick: None,
             tail: vec![
-                PaintSpan { text: " ∨ ".to_owned(), tone: Tone::Plain, bold: false },
-                PaintSpan { text: "━".to_owned(), tone: Tone::Plain, bold: false },
+                PaintSpan { text: " Shift + Tab ".to_owned(), tone: Tone::FastOff, bold: false },
+                PaintSpan { text: "▼ ".to_owned(), tone: Tone::Plain, bold: false },
+                PaintSpan { text: "━━".to_owned(), tone: Tone::Plain, bold: false },
             ],
         };
-        return vec![header.with_picks(&[(1, Pick::PlanSummary)])];
+        return vec![header.with_picks(&[(1, Pick::PlanSummary), (2, Pick::PlanSummary)]), PaintLine::blank()];
     }
     let mut lines = Vec::new();
     let steps = summary.steps.iter().collect::<Vec<_>>();
-    let hidden = steps.len().saturating_sub(4);
-    let visible = if summary.expanded { steps.len() } else { 4 };
-    for step in steps.into_iter().take(visible) {
+    for step in steps {
         let (prefix, bold) = match step.status {
-            PlanStepStatus::Completed => ("  ✔  ".to_owned(), false),
+            PlanStepStatus::Completed => ("  ✓  ".to_owned(), false),
             PlanStepStatus::InProgress if plan_active => (format!("  {}  ", WORKING_SPINNER[(phase.clamp(0.0, 0.999) * WORKING_SPINNER.len() as f32) as usize]), true),
             PlanStepStatus::InProgress => ("  ▸  ".to_owned(), false),
             PlanStepStatus::Pending => ("      ".to_owned(), false),
@@ -4679,21 +5005,8 @@ fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_
                 .unwrap_or_default(),
         });
     }
-    if hidden > 0 {
-        let text = if summary.expanded {
-            "접기".to_owned()
-        } else {
-            format!("+{hidden}개 항목 숨김")
-        };
-        let padded_text = format!("  {text}");
-        lines.push(PaintLine {
-            prefix: String::new(), prefix_tone: Tone::Muted, text: padded_text,
-            tone: Tone::Thinking, bold: false, tool_heading: None,
-            pick: Some(PickRegions::span(2, UnicodeWidthStr::width(text.as_str()), Pick::PlanSummary)), tail: Vec::new(),
-        });
-    }
     let all_completed = !summary.steps.is_empty() && completed == summary.steps.len();
-    let header_tail = " ∧ ━┓";
+    let header_tail = " Shift + Tab ▲ ━┓";
     let header_rule = "━".repeat(
         line_width
             .saturating_sub(5 + UnicodeWidthStr::width(title.as_str()) + UnicodeWidthStr::width(header_tail)),
@@ -4707,11 +5020,12 @@ fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_
         tool_heading: None,
         pick: None,
         tail: vec![
-            PaintSpan { text: " ∧ ".to_owned(), tone: Tone::Plain, bold: false },
+            PaintSpan { text: " Shift + Tab ".to_owned(), tone: Tone::FastOff, bold: false },
+            PaintSpan { text: "▲ ".to_owned(), tone: Tone::Plain, bold: false },
             PaintSpan { text: "━┓".to_owned(), tone: Tone::Plain, bold: false },
         ],
     };
-    let header = header.with_picks(&[(1, Pick::PlanSummary)]);
+    let header = header.with_picks(&[(1, Pick::PlanSummary), (2, Pick::PlanSummary)]);
     lines.insert(0, header);
     lines.insert(1, PaintLine::blank());
     if all_completed {
@@ -4934,11 +5248,12 @@ fn block_lines_with_mode(
         if conversational {
             lines.extend(wrapped_line(marker, tone, "", content_tone, false, conversational_width));
         }
-        return if conversational && CHAT_LAYOUT.load(Ordering::Relaxed) {
+        let lines = if conversational && CHAT_LAYOUT.load(Ordering::Relaxed) {
             assistant_chat_bubble_lines(lines)
         } else {
             lines
         };
+        return lines;
     }
 
     let force_diff = matches!(block.kind, BlockKind::Diff);
@@ -5020,21 +5335,31 @@ fn block_lines_with_mode(
             ));
         }
     }
-    if conversational && CHAT_LAYOUT.load(Ordering::Relaxed) {
+    let lines = if conversational && CHAT_LAYOUT.load(Ordering::Relaxed) {
         assistant_chat_bubble_lines(lines)
     } else {
         lines.push(PaintLine::blank());
         lines
-    }
+    };
+    lines
 }
 
 fn assistant_chat_bubble_lines(mut lines: Vec<PaintLine>) -> Vec<PaintLine> {
-    let width = lines.iter().map(painted_line_width).max().unwrap_or(1);
+    const BUBBLE_RIGHT_PADDING: usize = 1;
+    let width = lines
+        .iter()
+        .map(painted_line_width)
+        .max()
+        .unwrap_or(1)
+        .saturating_add(BUBBLE_RIGHT_PADDING);
     for line in &mut lines {
         let padding = width.saturating_sub(painted_line_width(line));
         if padding > 0 {
             line.tail.push(PaintSpan { text: " ".repeat(padding), tone: Tone::AssistantBubble, bold: false });
         }
+        // Keep the bubble band on syntax and inline-highlight spans too. The
+        // empty span is only a row marker; it emits no terminal cells.
+        line.tail.push(PaintSpan { text: String::new(), tone: Tone::AssistantBubble, bold: false });
     }
     let half = |glyph: char| PaintLine {
         prefix: String::new(),
@@ -5076,12 +5401,11 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         lines.push(PaintLine::user_prompt_half_padding(half_width, '▀'));
         return lines;
     }
-    const BUBBLE_PADDING: usize = 1;
     const RIGHT_GAP: usize = 2;
 
     let region_width = conversation_region_width(width);
     let left_margin = usize::from(width).saturating_sub(1).saturating_sub(region_width);
-    let content_width = region_width.saturating_sub(RIGHT_GAP + BUBBLE_PADDING * 2);
+    let content_width = region_width.saturating_sub(RIGHT_GAP + CHAT_BUBBLE_PADDING * 2);
     let raw_lines = if block.body.is_empty() {
         vec![""]
     } else {
@@ -5101,20 +5425,23 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         })
         .collect::<Vec<_>>();
     for line in &mut lines {
-        line.text = format!("{}{}{}", " ".repeat(BUBBLE_PADDING), line.text, " ".repeat(BUBBLE_PADDING));
-        let bubble_width = UnicodeWidthStr::width(line.text.as_str());
-        line.prefix = " ".repeat(
-            left_margin + region_width.saturating_sub(RIGHT_GAP + bubble_width),
-        );
+        line.text = format!("{}{}{}", " ".repeat(CHAT_BUBBLE_PADDING), line.text, " ".repeat(CHAT_BUBBLE_PADDING));
     }
     let bubble_width = lines
         .iter()
         .map(|line| UnicodeWidthStr::width(line.text.as_str()))
         .max()
-        .unwrap_or(BUBBLE_PADDING * 2);
+        .unwrap_or(CHAT_BUBBLE_PADDING * 2);
     let half_prefix = " ".repeat(
         left_margin + region_width.saturating_sub(RIGHT_GAP + bubble_width),
     );
+    for line in &mut lines {
+        let padding = bubble_width.saturating_sub(UnicodeWidthStr::width(line.text.as_str()));
+        if padding > 0 {
+            line.text.push_str(&" ".repeat(padding));
+        }
+        line.prefix = half_prefix.clone();
+    }
     let mut top = PaintLine::user_prompt_half_padding(bubble_width, '▄');
     top.prefix = half_prefix.clone();
     let mut bottom = PaintLine::user_prompt_half_padding(bubble_width, '▀');
@@ -5125,7 +5452,7 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
 }
 
 fn conversation_region_width(width: u16) -> usize {
-    usize::from(width).saturating_sub(1).saturating_mul(65) / 100
+    usize::from(width).saturating_sub(1).saturating_mul(80) / 100
 }
 
 fn body_prefix(
@@ -5988,6 +6315,11 @@ fn input_top_line_with_controls(
         let badge_start = tail_offset + 1;
         picks.extend(
             badge
+                .conversation_view_index
+                .map(|index| (badge_start + index, Pick::ConversationView)),
+        );
+        picks.extend(
+            badge
                 .shell_display_mode_index
                 .map(|index| (badge_start + index, Pick::ShellDisplayMode)),
         );
@@ -6487,13 +6819,27 @@ fn row_background(tone: Tone) -> Option<Rgb> {
     })
 }
 
+fn assistant_bubble_background() -> Rgb {
+    let palette = theme::palette();
+    blend(palette.background, palette.foreground, 20)
+}
+
+/// Assistant rows carry a zero-width sentinel so every colored span keeps the
+/// same bubble band without changing its foreground theme color.
+fn bubble_background(line: &PaintLine) -> Option<Rgb> {
+    line.tail
+        .iter()
+        .any(|span| span.tone == Tone::AssistantBubble && span.text.is_empty())
+        .then(assistant_bubble_background)
+}
+
 /// The stronger tint a single run gets on top of its row's band, for the words a
 /// diff row actually changed.
 fn word_background(tone: Tone) -> Option<Rgb> {
     let palette = theme::palette();
     Some(match tone {
         Tone::UserPrompt if CHAT_LAYOUT.load(Ordering::Relaxed) => palette.user_prompt_bg,
-        Tone::AssistantBubble => blend(palette.background, palette.foreground, 20),
+        Tone::AssistantBubble | Tone::AssistantBubbleHalf => assistant_bubble_background(),
         Tone::DiffAddedWord => palette.diff_add_word_bg,
         Tone::DiffRemovedWord => palette.diff_remove_word_bg,
         Tone::ScrollToBottom => palette.hover_bg,
@@ -6527,6 +6873,7 @@ fn print_line_with_selection_bounded(
     background_width: Option<usize>,
 ) -> Result<()> {
     let background = row_background(line.tone);
+    let bubble_background = bubble_background(line);
     if let Some(background) = background {
         queue!(out, SetBackgroundColor(rgb_color(background)))?;
     }
@@ -6539,7 +6886,7 @@ fn print_line_with_selection_bounded(
         hovered_columns.as_ref(),
         line.prefix_tone,
         false,
-        word_background(line.prefix_tone).or(background),
+        word_background(line.prefix_tone).or(bubble_background).or(background),
     )?;
     print_hovered_chunks(
         out,
@@ -6549,7 +6896,7 @@ fn print_line_with_selection_bounded(
         hovered_columns.as_ref(),
         line.tone,
         line.bold,
-        word_background(line.tone).or(background),
+        word_background(line.tone).or(bubble_background).or(background),
     )?;
     queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
     for span in &line.tail {
@@ -6566,7 +6913,7 @@ fn print_line_with_selection_bounded(
             hovered_columns.as_ref(),
             span.tone,
             span.bold,
-            word_background(span.tone).or(background),
+            word_background(span.tone).or(bubble_background).or(background),
         )?;
         queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
     }
@@ -6594,6 +6941,7 @@ fn print_line_columns(
     columns: Range<usize>,
 ) -> Result<()> {
     let background = row_background(line.tone);
+    let bubble_background = bubble_background(line);
     let mut column = 0;
     print_line_columns_piece(
         out,
@@ -6604,7 +6952,7 @@ fn print_line_columns(
         hovered_columns.as_ref(),
         line.prefix_tone,
         false,
-        word_background(line.prefix_tone).or(background),
+        word_background(line.prefix_tone).or(bubble_background).or(background),
     )?;
     print_line_columns_piece(
         out,
@@ -6615,7 +6963,7 @@ fn print_line_columns(
         hovered_columns.as_ref(),
         line.tone,
         line.bold,
-        word_background(line.tone).or(background),
+        word_background(line.tone).or(bubble_background).or(background),
     )?;
     for span in &line.tail {
         if span.tone == Tone::CopyJoin {
@@ -6630,7 +6978,7 @@ fn print_line_columns(
             hovered_columns.as_ref(),
             span.tone,
             span.bold,
-            word_background(span.tone).or(background),
+            word_background(span.tone).or(bubble_background).or(background),
         )?;
     }
     Ok(())
@@ -7011,6 +7359,21 @@ mod tests {
     }
 
     #[test]
+    fn animation_row_diff_targets_its_screen_row() {
+        let previous = CellFrame::new(8, 1);
+        let mut current = previous.clone();
+        current.write(0, 0, "x", CellStyle::plain());
+        let mut output = Vec::new();
+
+        emit_frame_diff_at(&mut output, Some(&previous), &current, 7)
+            .expect("row diff emits");
+
+        let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
+        assert!(output.contains("\x1b[8;1H"));
+        assert!(output.contains('x'));
+    }
+
+    #[test]
     fn changed_korean_text_uses_a_local_safe_repaint_range() {
         let mut before = CellFrame::new(16, 1);
         before.write(0, 0, "한글 단어", CellStyle::plain());
@@ -7292,6 +7655,7 @@ mod tests {
             show_cursor: true,
             dock_index: 1,
             composer_index: Some(1),
+            activity_index: None,
         };
 
         fit_frame(&mut frame, 6);
@@ -7301,6 +7665,28 @@ mod tests {
         assert_eq!(frame.lines[0].text, "response");
         assert_eq!(frame.lines[4].text, "input");
         assert_eq!(frame.lines[5].text, "footer");
+    }
+
+    #[test]
+    fn docking_keeps_the_activity_row_address_in_sync() {
+        let mut frame = Frame {
+            lines: vec![
+                PaintLine::plain("response"),
+                PaintLine::plain("working"),
+                PaintLine::plain("input"),
+            ],
+            cursor_line: 2,
+            cursor_col: 0,
+            show_cursor: true,
+            dock_index: 1,
+            composer_index: Some(2),
+            activity_index: Some(1),
+        };
+
+        fit_frame(&mut frame, 6);
+
+        assert_eq!(frame.activity_index, Some(4));
+        assert_eq!(frame.lines[4].text, "working");
     }
 
     #[test]
@@ -7314,6 +7700,7 @@ mod tests {
             show_cursor: true,
             dock_index: 3,
             composer_index: Some(3),
+            activity_index: None,
         };
 
         fit_frame(&mut frame, 3);
@@ -7343,8 +7730,10 @@ mod tests {
         // Both rules are drawn in the same border colour the welcome card uses.
         assert!(rows[0].tone == Tone::Border);
         assert!(rows.last().is_some_and(|row| row.tone == Tone::Border));
-        assert_eq!(painted(&prompt_rows[0]), "│ > wrapped-prom│");
-        assert_eq!(painted(&prompt_rows[1]), "│   pt-text     │");
+        // The IME gutter keeps three columns clear before the right border, so
+        // the text wraps that much earlier.
+        assert_eq!(painted(&prompt_rows[0]), "│ > wrapped-p   │");
+        assert_eq!(painted(&prompt_rows[1]), "│   rompt-tex   │");
         assert_eq!(
             painted(rows.last().expect("bottom rule")),
             "╰───────────────╯"
@@ -7388,7 +7777,7 @@ mod tests {
         let (_, cursor_row, cursor_col) =
             input_lines(&editor, &[], 18, "", "placeholder", None, None);
 
-        assert_eq!((cursor_row, cursor_col), (3, 4));
+        assert_eq!((cursor_row, cursor_col), (3, 10));
     }
 
     #[test]
@@ -7422,8 +7811,12 @@ mod tests {
 
     #[test]
     fn fullscreen_selection_preserves_response_and_thinking_icons() {
-        let assistant =
-            block_lines(&Block::new(BlockKind::Assistant, "Codex", "answer"), 80).remove(0);
+        // The bubble's own edge rows come first, so the marker row is found by
+        // its prefix rather than by position.
+        let assistant = block_lines(&Block::new(BlockKind::Assistant, "Codex", "answer"), 80)
+            .into_iter()
+            .find(|line| line.prefix == "• ")
+            .expect("response marker row");
         let thinking = block_lines(
             &Block::new(BlockKind::Reasoning, THINKING_TITLE, "thought"),
             80,
@@ -7522,13 +7915,15 @@ mod tests {
             },
         };
 
+        // The bubble pads every row out to a common width; that filler is not
+        // part of the row's text.
         assert_eq!(
             selection_columns_for_line(code, full_row(code, 0), 0),
-            Some(0..painted_line_width(code))
+            Some(0..bubble_content_columns(code).end)
         );
         assert_eq!(
             selection_columns_for_line(bullet, full_row(bullet, 0), 0),
-            Some(2..painted_line_width(bullet))
+            Some(2..bubble_content_columns(bullet).end)
         );
 
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
@@ -7572,18 +7967,20 @@ mod tests {
             &Block::new(BlockKind::Assistant, "Codex", "first\nsecond"),
             80,
         );
+        // Row 0 is the bubble's top edge, so the marker and its continuation are
+        // the two rows under it.
         let second_row = CellRange {
-            start: CellPosition { column: 0, row: 1 },
-            end: CellPosition { column: 7, row: 1 },
+            start: CellPosition { column: 0, row: 2 },
+            end: CellPosition { column: 7, row: 2 },
         };
-        assert_eq!(selection_columns_for_line(&lines[1], second_row, 1), Some(2..8));
+        assert_eq!(selection_columns_for_line(&lines[2], second_row, 2), Some(2..8));
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
         renderer.previous_lines = lines;
 
-        assert!(renderer.begin_selection(0, 0));
-        assert!(renderer.update_selection(7, 1));
+        assert!(renderer.begin_selection(0, 1));
+        assert!(renderer.update_selection(7, 2));
         assert_eq!(
-            renderer.finish_selection(7, 1),
+            renderer.finish_selection(7, 2),
             SelectionResult::Copy("• first\nsecond".to_owned())
         );
     }
@@ -7594,12 +7991,29 @@ mod tests {
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
         renderer.previous_lines = lines;
 
-        assert!(renderer.begin_selection(71, 1));
-        assert!(renderer.update_selection(77, 2));
+        // The bubble sits at the right edge with a cell of padding inside it, so
+        // its text starts one column in from the band.
+        assert!(renderer.begin_selection(70, 1));
+        assert!(renderer.update_selection(76, 2));
         assert_eq!(
-            renderer.finish_selection(77, 2),
+            renderer.finish_selection(76, 2),
             SelectionResult::Copy("first\nsecond".to_owned())
         );
+    }
+
+    #[test]
+    fn chat_bubbles_keep_their_single_cell_text_padding() {
+        CHAT_LAYOUT.store(true, Ordering::Relaxed);
+        let user = block_lines(&Block::new(BlockKind::User, "You", "input"), 80);
+        let assistant = block_lines(&Block::new(BlockKind::Assistant, "Codex", "output"), 80);
+        let user_text = user
+            .iter()
+            .find(|line| line.tone == Tone::UserPrompt)
+            .expect("user text row");
+
+        assert!(user_text.text.starts_with(" input"));
+        assert!(user_text.text.ends_with(' '));
+        assert!(assistant.iter().any(|line| line.text.contains("output")));
     }
 
     #[test]
@@ -7624,7 +8038,8 @@ mod tests {
         );
 
         assert_eq!(lines.len(), 5);
-        assert_eq!(lines[1].text, " first ");
+        // Every row is filled out to the longest one so the bubble paints square.
+        assert_eq!(lines[1].text, " first  ");
         assert_eq!(lines[2].text, " second ");
         assert!(lines[4] == PaintLine::blank());
 
@@ -7634,6 +8049,17 @@ mod tests {
         };
         assert_eq!(selection_columns_for_line(&lines[0], selection, 0), None);
         assert_ne!(selection_columns_for_line(&lines[1], selection, 1), None);
+    }
+
+    #[test]
+    fn multiline_user_prompt_uses_the_longest_line_as_one_right_bubble() {
+        CHAT_LAYOUT.store(true, Ordering::Relaxed);
+        let lines = user_prompt_lines(&Block::new(BlockKind::User, "You", "longest line\nshort"), 80);
+
+        assert_eq!(lines[1].prefix, lines[2].prefix);
+        assert_eq!(painted_line_width(&lines[1]), painted_line_width(&lines[2]));
+        assert_eq!(lines[2].text.trim(), "short");
+        assert!(lines[2].text.starts_with(" short"));
     }
 
     #[test]
@@ -7648,21 +8074,22 @@ mod tests {
     }
 
     #[test]
-    fn chat_messages_use_opposite_65_percent_anchors() {
+    fn chat_messages_use_opposite_80_percent_anchors() {
         let user = block_lines(&Block::new(BlockKind::User, "You", "x".repeat(120)), 80);
         let assistant = block_lines(&Block::new(BlockKind::Assistant, "Codex", "x".repeat(120)), 80);
 
-        assert_eq!(UnicodeWidthStr::width(user[0].prefix.as_str()), 28);
-        assert_eq!(UnicodeWidthStr::width(user[0].text.as_str()), 49);
+        assert_eq!(conversation_region_width(80), 63);
+        assert_eq!(UnicodeWidthStr::width(user[0].prefix.as_str()), 16);
+        assert_eq!(UnicodeWidthStr::width(user[0].text.as_str()), 61);
         assert!(user
             .iter()
             .filter(|line| line.tone == Tone::UserPrompt)
-            .all(|line| UnicodeWidthStr::width(line.prefix.as_str()) >= 28
+            .all(|line| UnicodeWidthStr::width(line.prefix.as_str()) >= 16
                 && painted_width(line) == 77));
         assert!(assistant
             .iter()
             .filter(|line| !line.text.is_empty())
-            .all(|line| painted_width(line) <= 51));
+            .all(|line| painted_width(line) <= 64));
     }
 
     #[test]
@@ -8018,7 +8445,13 @@ mod tests {
         );
         let rendered = lines.iter().map(painted).collect::<Vec<_>>();
 
-        assert_eq!(rendered[0], "• cargo run --release");
+        // The bubble's edge row comes first and pads every row out to its width,
+        // so the code row is matched by its text rather than by position.
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.trim_end() == "• cargo run --release")
+        );
         assert!(rendered.iter().all(|line| !line.contains(['┌', '┐', '└', '┘', '│'])));
     }
 
@@ -8570,8 +9003,7 @@ mod tests {
             .position(|line| painted_line_text(line).contains("Working"))
             .expect("activity row");
         assert_eq!(frame.lines[activity].tone, Tone::Plain);
-        assert!(activity >= 2);
-        assert!(frame.lines[activity - 2] == PaintLine::blank());
+        assert!(activity >= 1);
         assert!(frame.lines[activity - 1] == PaintLine::blank());
         assert!(painted(&frame.lines[activity + 1]).starts_with('╭'));
     }
@@ -8599,8 +9031,7 @@ mod tests {
             .iter()
             .position(|line| painted_line_text(line).contains("Completed"))
             .expect("completion row");
-        assert!(activity >= 2);
-        assert!(frame.lines[activity - 2] == PaintLine::blank());
+        assert!(activity >= 1);
         assert!(frame.lines[activity - 1] == PaintLine::blank());
         assert!(painted(&frame.lines[activity + 1]).starts_with('╭'));
     }
@@ -8629,9 +9060,9 @@ mod tests {
             .iter()
             .position(|line| painted_line_text(line).contains("Completed"))
             .expect("activity row");
-        assert!(painted(&frame.lines[activity]).contains("Response: Short"));
+        assert!(painted(&frame.lines[activity]).contains("View: Chat"));
         assert!(painted(&frame.lines[activity]).contains("Fast: Off"));
-        assert!(!painted(&frame.lines[activity + 1]).contains("Response: Short"));
+        assert!(!painted(&frame.lines[activity + 1]).contains("View: Chat"));
         assert_eq!(painted_width(&frame.lines[activity]), 158);
         assert_eq!(frame.lines[activity + 1].tone, Tone::ModelTerra);
     }
@@ -8660,9 +9091,9 @@ mod tests {
             .iter()
             .position(|line| painted_line_text(line).contains("Completed"))
             .expect("activity row");
-        assert!(painted(&frame.lines[activity]).contains("Response: Short"));
+        assert!(painted(&frame.lines[activity]).contains("View: Chat"));
         assert!(!painted(&frame.lines[activity]).contains("Shell: Collapse"));
-        assert!(!painted(&frame.lines[activity + 1]).contains("Response: Short"));
+        assert!(!painted(&frame.lines[activity + 1]).contains("View: Chat"));
     }
 
     #[test]
@@ -8814,21 +9245,10 @@ mod tests {
         // Two blanks off the rule, the badge, then the rule resumes for two columns.
         assert_eq!(
             texts,
-            [
-                "  ",
-                "Response: Short",
-                " · ",
-                "Shell: Collapse",
-                " · ",
-                "Diff: Collapse",
-                " · ",
-                "Fast: On",
-                " ",
-                "─╮"
-            ]
+            ["  ", "View: Chat", " · ", "Vibe: On", " · ", "Fast: On", " ", "─╮"]
         );
-        assert_eq!(line.tail[1].tone, Tone::Muted);
-        assert_eq!(line.tail[7].tone, Tone::FastOn);
+        assert_eq!(line.tail[1].tone, Tone::Error);
+        assert_eq!(line.tail[5].tone, Tone::FastOn);
     }
 
     #[test]
@@ -8850,9 +9270,9 @@ mod tests {
         );
         let composer = frame.composer_index.expect("composer index");
 
-        assert!(painted(&frame.lines[composer - 1]).contains("Response: Short"));
+        assert!(painted(&frame.lines[composer - 1]).contains("View: Chat"));
         assert!(painted(&frame.lines[composer - 1]).contains("Fast: Off"));
-        assert!(!painted(&frame.lines[composer]).contains("Response: Short"));
+        assert!(!painted(&frame.lines[composer]).contains("View: Chat"));
     }
 
     /// What the row answers with at the first column of `label`.
@@ -8878,15 +9298,8 @@ mod tests {
     fn composer_badges_answer_to_their_own_columns() {
         let mode = test_mode("Full Access", ModeAccent::Danger, true);
         let line = input_top_line(120, "", Some(&mode));
-        assert_eq!(pick_on(&line, "Response: Short"), Some(Pick::ResponseLength));
-        assert_eq!(
-            pick_on(&line, "Shell: Collapse"),
-            Some(Pick::ShellDisplayMode)
-        );
-        assert_eq!(
-            pick_on(&line, "Diff: Collapse"),
-            Some(Pick::DiffDisplayMode)
-        );
+        assert_eq!(pick_on(&line, "View: Chat"), Some(Pick::ConversationView));
+        assert_eq!(pick_on(&line, "Vibe: On"), Some(Pick::VibeMode));
         assert_eq!(pick_on(&line, "Fast: On"), Some(Pick::FastMode));
         // The rule, and the middle of the separator between the badges, are not
         // settings — the columns beside each badge belong to that badge.
@@ -8895,12 +9308,12 @@ mod tests {
     }
 
     #[test]
-    fn response_length_is_clickable_without_an_access_badge() {
+    fn the_view_badge_is_clickable_without_an_access_badge() {
         let mode = test_mode("Full Access", ModeAccent::Danger, true);
         let line = input_top_line(80, "", Some(&mode));
 
         assert!(!painted(&line).contains("Full Access"));
-        assert_eq!(pick_on(&line, "Response: Short"), Some(Pick::ResponseLength));
+        assert_eq!(pick_on(&line, "View: Chat"), Some(Pick::ConversationView));
     }
 
     /// The cost pushes both badges right and a recalled-history label pushes the
@@ -8912,7 +9325,7 @@ mod tests {
         mode.cost = Some("$0.95".to_owned());
         let line = input_top_line(120, "3/12", Some(&mode));
 
-        assert_eq!(pick_on(&line, "Response: Short"), Some(Pick::ResponseLength));
+        assert_eq!(pick_on(&line, "Vibe: On"), Some(Pick::VibeMode));
         assert_eq!(pick_on(&line, "Fast: On"), Some(Pick::FastMode));
         assert_eq!(pick_on(&line, "[$0.95]"), None);
         assert_eq!(pick_on(&line, "3/12"), None);
@@ -8923,10 +9336,10 @@ mod tests {
     #[test]
     fn a_dropped_fast_flag_leaves_only_the_mode_clickable() {
         let mode = test_mode("Full Access", ModeAccent::Danger, true);
-        let line = input_top_line(24, "", Some(&mode));
+        let line = input_top_line(40, "", Some(&mode));
 
         assert!(!painted(&line).contains("Fast"));
-        assert_eq!(pick_on(&line, "Response: Short"), Some(Pick::ResponseLength));
+        assert_eq!(pick_on(&line, "Vibe: On"), Some(Pick::VibeMode));
     }
 
     #[test]
@@ -8942,20 +9355,9 @@ mod tests {
         assert_eq!(rule_width(&line), 80);
         assert_eq!(
             texts,
-            [
-                "  ",
-                "Response: Short",
-                " · ",
-                "Shell: Collapse",
-                " · ",
-                "Diff: Collapse",
-                " · ",
-                "Fast: Off",
-                " ",
-                "─╮"
-            ]
+            ["  ", "View: Chat", " · ", "Vibe: On", " · ", "Fast: Off", " ", "─╮"]
         );
-        assert_eq!(line.tail[3].tone, Tone::Muted);
+        assert_eq!(line.tail[5].tone, Tone::FastOff);
     }
 
     #[test]
@@ -8979,14 +9381,14 @@ mod tests {
     }
 
     #[test]
-    fn composer_rule_places_branch_before_response_without_cost() {
+    fn composer_rule_places_branch_before_the_display_badges_without_cost() {
         let mut mode = test_mode("Full Access", ModeAccent::Danger, false);
         mode.branch = Some("main".to_owned());
         mode.cost = Some("$0.95".to_owned());
 
         let line = input_top_line(120, "", Some(&mode));
 
-        assert!(painted(&line).contains("* main | Vibe: On"));
+        assert!(painted(&line).contains("* main | View: Chat"));
         assert!(!painted(&line).contains("$0.95"));
     }
 
@@ -9020,20 +9422,17 @@ mod tests {
         assert!(tones(&mode).contains(&("Vibe: On".to_owned(), Tone::VibeSuper)));
     }
 
+    /// Shell and diff readings live behind the vibe preset now, so the rule
+    /// carries the view and the preset instead of one badge per reading.
     #[test]
-    fn shell_badge_follows_the_permission_mode() {
+    fn display_badges_answer_to_the_view_and_the_vibe_preset() {
         let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
         mode.cost = Some("$0.95".to_owned());
         let line = input_top_line(80, "", Some(&mode));
 
-        assert_eq!(
-            pick_on(&line, "Shell: Collapse"),
-            Some(Pick::ShellDisplayMode)
-        );
-        assert_eq!(
-            pick_on(&line, "Diff: Collapse"),
-            Some(Pick::DiffDisplayMode)
-        );
+        assert_eq!(pick_on(&line, "View: Chat"), Some(Pick::ConversationView));
+        assert_eq!(pick_on(&line, "Vibe: On"), Some(Pick::VibeMode));
+        assert_eq!(pick_on(&line, "Shell: Collapse"), None);
     }
 
     #[test]
@@ -9050,15 +9449,15 @@ mod tests {
     #[test]
     fn tight_composer_rule_keeps_the_mode_and_drops_the_fast_flag() {
         let mode = test_mode("Full Access", ModeAccent::Danger, true);
-        let line = input_top_line(24, "", Some(&mode));
+        let line = input_top_line(40, "", Some(&mode));
         let texts = line
             .tail
             .iter()
             .map(|span| span.text.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(rule_width(&line), 24);
-        assert_eq!(texts, ["  ", "Response: Short", " ", "─╮"]);
+        assert_eq!(rule_width(&line), 40);
+        assert_eq!(texts, ["  ", "View: Chat", " · ", "Vibe: On", " ", "─╮"]);
     }
 
     #[test]
@@ -9210,6 +9609,23 @@ mod tests {
     }
 
     #[test]
+    fn chat_assistant_bubble_covers_marker_and_highlight_spans() {
+        CHAT_LAYOUT.store(true, Ordering::Relaxed);
+        let assistant = Block::new(BlockKind::Assistant, "Codex", "`highlight`");
+        let line = block_lines(&assistant, 80)
+            .into_iter()
+            .find(|line| line.text.contains("highlight"))
+            .expect("assistant content row");
+        let mut frame = CellFrame::new(80, 1);
+
+        paint_line_into_frame(&mut frame, 0, &line, None, None, None);
+
+        let background = Some(assistant_bubble_background());
+        assert_eq!(frame.cell(0, 0).style.background, background);
+        assert_eq!(frame.cell(2, 0).style.background, background);
+    }
+
+    #[test]
     fn transcript_gutters_use_the_theme_accent() {
         // The assistant gutter uses the same circular mark as a response's first row.
         for (block, tone) in [
@@ -9276,8 +9692,9 @@ mod tests {
                 "",
                 "Shell · second",
                 "",
-                "done",
-                ""
+                // The response opens its chat bubble before its first text row.
+                "▄▄▄▄▄▄▄",
+                "done"
             ]
         );
     }
@@ -9397,6 +9814,7 @@ mod tests {
             show_cursor: true,
             dock_index: 1,
             composer_index: Some(1),
+            activity_index: None,
         };
         let (view_rows, live_rows) = split_rows(10, frame.lines.len(), 0);
         fit_frame(&mut frame, live_rows);
@@ -9438,6 +9856,48 @@ mod tests {
     }
 
     #[test]
+    fn live_frame_cache_reuses_wrapping_and_caps_the_copied_tail() {
+        let block = Block::new(BlockKind::System, "stream", "line\n".repeat(10_000));
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        let live = [LiveBlockView {
+            block: &block,
+            revision: 1,
+        }];
+
+        let first = renderer.live_frame_lines(&live, 80, 20);
+        let cached_rows = renderer
+            .live_frame_cache
+            .as_ref()
+            .expect("cache")
+            .lines
+            .len();
+        let second = renderer.live_frame_lines(&live, 80, 20);
+
+        assert!(cached_rows > first.len());
+        assert_eq!(first.len(), 20);
+        assert!(second == first);
+        for _ in 0..10_000 {
+            renderer.live_frame_lines(&live, 80, 20);
+        }
+        assert_eq!(renderer.live_cache_rebuilds, 1);
+        assert_eq!(
+            renderer.live_frame_cache.as_ref().expect("cache").blocks,
+            vec![(block.id(), 1)]
+        );
+
+        let revised = [LiveBlockView {
+            block: &block,
+            revision: 2,
+        }];
+        renderer.live_frame_lines(&revised, 80, 20);
+        assert_eq!(renderer.live_cache_rebuilds, 2);
+        assert_eq!(
+            renderer.live_frame_cache.as_ref().expect("cache").blocks,
+            vec![(block.id(), 2)]
+        );
+    }
+
+    #[test]
     fn inline_scroll_to_bottom_leaves_terminal_scrollback_alone() {
         let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Inline);
         renderer.scroll_back = 8;
@@ -9476,7 +9936,7 @@ mod tests {
                         + UnicodeWidthStr::width(control.text.as_str())
             )
         );
-        assert_eq!(scroll_to_bottom_overlay_row(12, Some(7)), Some(15));
+        assert_eq!(scroll_to_bottom_overlay_row(12, Some(7)), Some(16));
 
         renderer.scroll_to_bottom();
         assert!(renderer.scroll_to_bottom_control(80).is_none());
@@ -9600,6 +10060,7 @@ mod tests {
         );
         let lines = block_lines(&block, 200);
 
+        // Only the heading; the blank that separates groups is added by the frame.
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].prefix, "▸ ");
         assert_eq!(lines[0].text, "Shell · rg TODO · exit 0 · 12ms");
@@ -10292,7 +10753,7 @@ mod tests {
             &Block::new(
                 BlockKind::Plan,
                 "작업 단계",
-                "└ why\n✔ first\n▸ second\n□ third",
+                "└ why\n✓ first\n▸ second\n□ third",
             ),
             80,
         );
@@ -10302,9 +10763,9 @@ mod tests {
         assert!(lines[0].bold);
         assert_eq!(lines[1].prefix, "  └ ");
         assert_eq!(lines[1].text, "why");
-        assert_eq!(lines[2].prefix, "    ✔ ");
+        assert_eq!(lines[2].prefix, "    ✓ ");
         assert_eq!(lines[2].text, "first");
-        // Done steps are struck through, and the ✔ in the gutter is not.
+        // Done steps are struck through, and the ✓ in the gutter is not.
         assert_eq!(lines[2].tone, Tone::PlanDone);
         assert_eq!(lines[2].prefix_tone, Tone::Muted);
         // The step being worked on is the one row that is lit, not dimmed.
@@ -10519,10 +10980,10 @@ mod tests {
             .iter()
             .find(|line| painted(line).contains("Resets"))
             .expect("reset summary");
-        assert!(painted(reset).contains('∨'));
+        assert!(painted(reset).contains('▼'));
         assert_eq!(pick_on(reset, "Resets"), None);
         assert_eq!(pick_on(reset, "3 available"), Some(Pick::ToggleWelcomeCredits));
-        assert_eq!(pick_on(reset, "∨"), Some(Pick::ToggleWelcomeCredits));
+        assert_eq!(pick_on(reset, "▼"), Some(Pick::ToggleWelcomeCredits));
         assert_eq!(
             Renderer::hover_columns(reset, None, Some(&Pick::ToggleWelcomeCredits))
                 .map(|columns| columns.len()),
@@ -10539,7 +11000,7 @@ mod tests {
             .iter()
             .find(|line| painted(line).contains("Resets"))
             .expect("narrow reset summary");
-        assert!(painted(reset).contains('∨'), "{}", painted(reset));
+        assert!(painted(reset).contains('▼'), "{}", painted(reset));
     }
 
     #[test]
@@ -11456,12 +11917,12 @@ mod tests {
         let mode = test_mode("Full Access", ModeAccent::Danger, true);
         let line = input_top_line(80, "", Some(&mode));
         let text = painted(&line);
-        let start = UnicodeWidthStr::width(&text[..text.find("Response: Short").unwrap()]);
+        let start = UnicodeWidthStr::width(&text[..text.find("Vibe: On").unwrap()]);
 
-        // A column either side of the response label is part of the target.
+        // A column either side of the vibe label is part of the target.
         assert_eq!(
-            Renderer::hover_columns(&line, None, Some(&Pick::ResponseLength)),
-            Some(start - 1..start + 16)
+            Renderer::hover_columns(&line, None, Some(&Pick::VibeMode)),
+            Some(start - 1..start + 9)
         );
         // Nothing on the rule answers for a pick it does not carry.
         assert_eq!(
@@ -11506,21 +11967,20 @@ mod tests {
             "",
             Some(&test_mode("Full Access", ModeAccent::Danger, true)),
         );
-        let response = Renderer::hover_columns(&line, None, Some(&Pick::ResponseLength))
-            .expect("response badge");
+        let vibe =
+            Renderer::hover_columns(&line, None, Some(&Pick::VibeMode)).expect("vibe badge");
         let fast = Renderer::hover_columns(&line, None, Some(&Pick::FastMode)).expect("fast badge");
         let mut output = Vec::new();
 
-        for columns in hover_repaint_columns(Some(response), Some(fast.clone())) {
+        for columns in hover_repaint_columns(Some(vibe), Some(fast.clone())) {
             print_line_columns(&mut output, &line, None, Some(fast.clone()), columns)
                 .expect("partial repaint");
         }
 
         let painted = String::from_utf8(output).expect("utf-8 paint");
-        assert!(painted.contains("Response: Short"));
+        assert!(painted.contains("Vibe: On"));
         assert!(painted.contains("Fast: On"));
-        assert!(!painted.contains("Shell: Collapse"));
-        assert!(!painted.contains("Diff: Collapse"));
+        assert!(!painted.contains("View: Chat"));
     }
 
     /// A row offers its own text, so the highlight runs from the number to the end
@@ -11743,7 +12203,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_plan_summary_shows_four_steps_and_overflow() {
+    fn expanded_plan_summary_shows_all_steps_without_internal_toggle() {
         let summary = PlanSummary {
             explanation: None,
             steps: (1..=7)
@@ -11761,17 +12221,17 @@ mod tests {
 
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, true);
 
-        assert_eq!(lines.len(), 10);
+        assert_eq!(lines.len(), 12);
         assert!(lines[0].text.starts_with("┏━━ 작업 단계 · 0 / 7 완료"));
         assert!(painted(&lines[0]).ends_with('┓'));
-        assert!(lines[0].tail.iter().all(|span| span.tone == Tone::Plain));
+        assert_eq!(lines[0].tail[0].text, " Shift + Tab ");
+        assert_eq!(lines[0].tail[0].tone, Tone::FastOff);
         assert!(lines[1].text.is_empty());
-        assert_eq!(lines[6].text.trim_end(), "  +3개 항목 숨김");
-        assert_eq!(pick_on(&lines[6], "+3개 항목 숨김"), Some(Pick::PlanSummary));
-        assert!(lines[7].text.is_empty());
-        assert!(lines[8].text.starts_with('┗'));
-        assert!(lines[8].text.ends_with('┛'));
+        assert_eq!(painted(&lines[8]), "      Task 7");
         assert!(lines[9].text.is_empty());
+        assert!(lines[10].text.starts_with('┗'));
+        assert!(lines[10].text.ends_with('┛'));
+        assert!(lines[11].text.is_empty());
     }
 
     #[test]
@@ -11786,10 +12246,10 @@ mod tests {
 
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
 
-        assert!(painted(&lines[0]).ends_with(" ∧ ━┓"));
+        assert!(painted(&lines[0]).ends_with(" Shift + Tab ▲ ━┓"));
         assert_eq!(UnicodeWidthStr::width(painted(&lines[0]).as_str()), 79);
-        assert!(lines[0].tail.iter().all(|span| span.tone == Tone::Plain));
-        assert_eq!(pick_on(&lines[0], "∧"), Some(Pick::PlanSummary));
+        assert_eq!(lines[0].tail[0].tone, Tone::FastOff);
+        assert_eq!(pick_on(&lines[0], "▲"), Some(Pick::PlanSummary));
     }
 
     #[test]
@@ -11804,16 +12264,18 @@ mod tests {
 
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
 
-        assert_eq!(lines.len(), 1);
-        assert!(painted(&lines[0]).starts_with("━━ 작업 단계"));
-        assert!(painted(&lines[0]).trim_end().ends_with("∨ ━"));
+        assert_eq!(lines.len(), 2);
+        assert!(painted(&lines[0]).starts_with("━━━ 작업 단계"));
+        assert!(painted(&lines[0]).trim_end().ends_with("Shift + Tab ▼ ━━"));
+        assert_eq!(lines[0].tail[0].tone, Tone::FastOff);
         assert!(!painted(&lines[0]).contains(['┏', '┓']));
         assert_eq!(pick_on(&lines[0], "작업 단계"), None);
-        assert_eq!(pick_on(&lines[0], "∨"), Some(Pick::PlanSummary));
+        assert_eq!(pick_on(&lines[0], "▼"), Some(Pick::PlanSummary));
+        assert!(lines[1] == PaintLine::blank());
         assert_eq!(
             Renderer::hover_columns(&lines[0], None, Some(&Pick::PlanSummary))
                 .map(|columns| columns.len()),
-            Some(5)
+            Some(17)
         );
     }
 
@@ -11835,9 +12297,9 @@ mod tests {
 
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
 
-        assert_eq!(painted(&lines[2]), "  ✔  Task 1");
+        assert_eq!(painted(&lines[2]), "  ✓  Task 1");
         assert_eq!(painted(&lines[3]), "      Task 2");
-        assert_eq!(painted(&lines[4]), "  ✔  Task 3");
+        assert_eq!(painted(&lines[4]), "  ✓  Task 3");
         assert_eq!(lines[2].prefix_tone, Tone::Accent);
         assert_eq!(lines[2].tone, Tone::Plain);
     }
@@ -11860,7 +12322,7 @@ mod tests {
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
 
         assert!(painted(&lines[2]).ends_with("Done (1m 34s)"));
-        assert_eq!(painted(&lines[2]), "  ✔  Done (1m 34s)");
+        assert_eq!(painted(&lines[2]), "  ✓  Done (1m 34s)");
         assert!(painted(&lines[3]).ends_with("⏱  1m 34s  "));
     }
 
@@ -11926,3 +12388,4 @@ mod tests {
         );
     }
 }
+

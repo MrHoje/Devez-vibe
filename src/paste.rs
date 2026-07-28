@@ -44,6 +44,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 /// typing would take about 2,400 characters per minute.
 const FAST_GAP: Duration = Duration::from_millis(16);
 
+/// `Ctrl+V` is an explicit paste signal even when Windows delivers the payload
+/// as ordinary key records. Keep that transaction open across short scheduler
+/// gaps so a payload newline can never escape as a submit key.
+const SHORTCUT_PASTE_GAP: Duration = Duration::from_millis(250);
+
 /// How many fast characters have to pile up before `Enter` stops meaning send.
 /// Typing scores zero, because the one 0ms gap an IME produces belongs to the
 /// Enter itself and never to a character. Two is therefore already decisive,
@@ -71,6 +76,7 @@ pub struct ComposerPasteBuffer {
     last: Option<Instant>,
     text: String,
     pasted: bool,
+    shortcut_paste: bool,
     disabled: bool,
 }
 
@@ -89,20 +95,28 @@ impl ComposerPasteBuffer {
         if !matches!(key.kind, KeyEventKind::Press) {
             return Vec::new();
         }
+        if matches!(key.code, KeyCode::Char('v' | 'V'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            let pending = self.flush();
+            self.shortcut_paste = true;
+            self.last = Some(now);
+            return pending.into_iter().map(ComposerInput::Text).collect();
+        }
         let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
         let fast = self
             .last
-            .is_some_and(|last| now.duration_since(last) < FAST_GAP);
+            .is_some_and(|last| now.duration_since(last) < self.idle_gap());
 
         match key.code {
             KeyCode::Char(ch) if plain => self.push_char(ch, now, fast),
-            KeyCode::Enter if plain && self.pasted && fast => {
+            KeyCode::Enter if plain && (self.shortcut_paste || self.pasted && fast) => {
                 self.text.push('\n');
                 self.pasted = true;
                 self.last = Some(now);
                 Vec::new()
             }
-            KeyCode::Tab if plain && !self.text.is_empty() && fast => {
+            KeyCode::Tab if plain && (self.shortcut_paste || !self.text.is_empty() && fast) => {
                 self.text.push('\t');
                 self.pasted = true;
                 self.last = Some(now);
@@ -118,19 +132,37 @@ impl ComposerPasteBuffer {
     }
 
     pub fn flush_if_idle(&mut self, now: Instant) -> Option<BufferedText> {
-        self.last
-            .is_some_and(|last| now.duration_since(last) >= FAST_GAP)
-            .then(|| self.flush())
-            .flatten()
+        if !self
+            .last
+            .is_some_and(|last| now.duration_since(last) >= self.idle_gap())
+        {
+            return None;
+        }
+        self.flush()
     }
 
     /// While text is waiting to be classified, repainting for every key would
     /// turn a large Windows paste into one expensive frame per character.
     pub fn is_buffering(&self) -> bool {
-        !self.text.is_empty()
+        self.shortcut_paste || !self.text.is_empty()
+    }
+
+    /// The event loop sleeps until this instant instead of waking every 5ms
+    /// while no paste is being classified.
+    pub fn flush_deadline(&self) -> Option<Instant> {
+        (self.shortcut_paste || !self.text.is_empty())
+            .then_some(self.last)
+            .flatten()
+            .map(|last| last + self.idle_gap())
     }
 
     fn push_char(&mut self, ch: char, now: Instant, fast: bool) -> Vec<ComposerInput> {
+        if self.shortcut_paste {
+            self.text.push(ch);
+            self.pasted = true;
+            self.last = Some(now);
+            return Vec::new();
+        }
         if self.text.is_empty() {
             self.text.push(ch);
             self.last = Some(now);
@@ -149,10 +181,21 @@ impl ComposerPasteBuffer {
     }
 
     fn flush(&mut self) -> Option<BufferedText> {
-        (!self.text.is_empty()).then(|| BufferedText {
+        let buffered = (!self.text.is_empty()).then(|| BufferedText {
             text: std::mem::take(&mut self.text),
             pasted: std::mem::take(&mut self.pasted),
-        })
+        });
+        self.last = None;
+        self.shortcut_paste = false;
+        buffered
+    }
+
+    fn idle_gap(&self) -> Duration {
+        if self.shortcut_paste {
+            SHORTCUT_PASTE_GAP
+        } else {
+            FAST_GAP
+        }
     }
 }
 
@@ -385,9 +428,7 @@ mod tests {
     fn composer_buffer_batches_a_hangul_commit_with_ctrl_backspace() {
         let base = Instant::now();
         let mut buffer = ComposerPasteBuffer::new();
-        assert!(buffer
-            .observe(press(KeyCode::Char('라')), base)
-            .is_empty());
+        assert!(buffer.observe(press(KeyCode::Char('라')), base).is_empty());
 
         let inputs = buffer.observe(
             KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
@@ -413,9 +454,11 @@ mod tests {
         buffer.observe(press(KeyCode::Char('첫')), base);
         buffer.observe(press(KeyCode::Char('줄')), base + Duration::from_millis(1));
 
-        assert!(buffer
-            .observe(press(KeyCode::Enter), base + Duration::from_millis(2))
-            .is_empty());
+        assert!(
+            buffer
+                .observe(press(KeyCode::Enter), base + Duration::from_millis(2))
+                .is_empty()
+        );
         assert_eq!(
             buffer.flush_if_idle(base + FAST_GAP + Duration::from_millis(2)),
             Some(BufferedText {
@@ -423,6 +466,59 @@ mod tests {
                 pasted: true,
             })
         );
+    }
+
+    #[test]
+    fn ctrl_v_keeps_a_slow_short_line_and_newline_in_one_paste() {
+        let base = Instant::now();
+        let mut buffer = ComposerPasteBuffer::new();
+        assert!(
+            buffer
+                .observe(
+                    KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+                    base,
+                )
+                .is_empty()
+        );
+        assert!(
+            buffer
+                .observe(press(KeyCode::Char('가')), base + Duration::from_millis(40),)
+                .is_empty()
+        );
+        assert!(
+            buffer
+                .observe(press(KeyCode::Enter), base + Duration::from_millis(80))
+                .is_empty()
+        );
+        assert!(
+            buffer
+                .observe(
+                    press(KeyCode::Char('나')),
+                    base + Duration::from_millis(120),
+                )
+                .is_empty()
+        );
+
+        assert_eq!(
+            buffer.flush_if_idle(base + Duration::from_millis(370)),
+            Some(BufferedText {
+                text: "가\n나".to_owned(),
+                pasted: true,
+            })
+        );
+    }
+
+    #[test]
+    fn composer_buffer_only_arms_a_flush_deadline_while_text_waits() {
+        let base = Instant::now();
+        let mut buffer = ComposerPasteBuffer::new();
+        assert_eq!(buffer.flush_deadline(), None);
+
+        buffer.observe(press(KeyCode::Char('a')), base);
+        assert_eq!(buffer.flush_deadline(), Some(base + FAST_GAP));
+
+        assert!(buffer.flush_if_idle(base + FAST_GAP).is_some());
+        assert_eq!(buffer.flush_deadline(), None);
     }
 
     #[test]
