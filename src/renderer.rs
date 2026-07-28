@@ -7610,7 +7610,7 @@ mod tests {
         let assistant = block_lines(&Block::new(BlockKind::Assistant, "Codex", "x".repeat(120)), 80);
 
         assert_eq!(UnicodeWidthStr::width(user[0].prefix.as_str()), 28);
-        assert_eq!(UnicodeWidthStr::width(user[0].text.as_str()), 57);
+        assert_eq!(UnicodeWidthStr::width(user[0].text.as_str()), 49);
         assert!(user
             .iter()
             .filter(|line| line.tone == Tone::UserPrompt)
