@@ -241,9 +241,7 @@ async fn start_session(
         return Ok(());
     };
 
-    let thread = thread_response
-        .get("thread")
-        .context("thread 응답에 thread가 없습니다.")?;
+    let thread = hydrate_thread_history(server, &thread_response).await?;
     let thread_id = thread
         .get("id")
         .and_then(Value::as_str)
@@ -269,7 +267,7 @@ async fn start_session(
 
     state.attach_thread(thread_id, actual_cwd, &actual_model, Some(&actual_effort));
     if is_resuming {
-        state.load_history(thread, None);
+        state.load_history(&thread, None);
         state.begin_cost_restore();
     }
     draw(state, renderer)?;
@@ -2021,7 +2019,14 @@ async fn resume_into_state(
         &resumed.model,
         resumed.effort.as_deref(),
     );
-    state.load_history(&resumed.thread, None);
+    let history = match hydrate_thread_history(server, &response).await {
+        Ok(history) => history,
+        Err(error) => {
+            abandon_thread_switch(state, previous_thread, error.to_string());
+            return Ok(Switched::Failed);
+        }
+    };
+    state.load_history(&history, None);
     state.begin_cost_restore();
     Ok(Switched::Done(queued))
 }
@@ -2114,7 +2119,6 @@ async fn send_queued_prompt(server: &AppServer, state: &mut AppState, text: Stri
 
 /// The fields `/resume` needs out of a `thread/resume` response.
 struct ResumedThread {
-    thread: Value,
     id: String,
     cwd: String,
     model: String,
@@ -2122,10 +2126,7 @@ struct ResumedThread {
 }
 
 fn parse_resumed_thread(response: &Value) -> Result<ResumedThread> {
-    let thread = response
-        .get("thread")
-        .context("thread/resume 응답에 thread가 없습니다.")?
-        .clone();
+    let thread = thread_with_initial_turns(response)?;
     let id = thread
         .get("id")
         .and_then(Value::as_str)
@@ -2146,11 +2147,88 @@ fn parse_resumed_thread(response: &Value) -> Result<ResumedThread> {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     Ok(ResumedThread {
-        thread,
         id,
         cwd,
         model,
         effort,
+    })
+}
+
+/// `thread/resume` returns requested turns in a top-level page. Normalize that
+/// page back into the `thread.turns` shape consumed by `AppState::load_history`.
+fn thread_with_initial_turns(response: &Value) -> Result<Value> {
+    let mut thread = response
+        .get("thread")
+        .context("thread/resume 응답에 thread가 없습니다.")?
+        .clone();
+    if let Some(turns) = response.pointer("/initialTurnsPage/data").cloned() {
+        thread
+            .as_object_mut()
+            .context("thread/resume 응답의 thread 형식이 올바르지 않습니다.")?
+            .insert("turns".to_owned(), turns);
+    } else if !thread.get("turns").is_some_and(Value::is_array) {
+        thread
+            .as_object_mut()
+            .context("thread/resume 응답의 thread 형식이 올바르지 않습니다.")?
+            .insert("turns".to_owned(), json!([]));
+    }
+    Ok(thread)
+}
+
+/// Hydrates every turn page before rendering. `thread/resume` only bootstraps
+/// one page; Codex follows `nextCursor` until the complete transcript is local.
+async fn hydrate_thread_history(server: &AppServer, response: &Value) -> Result<Value> {
+    let mut thread = thread_with_initial_turns(response)?;
+    let Some(mut cursor) = response
+        .pointer("/initialTurnsPage/nextCursor")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+    else {
+        return Ok(thread);
+    };
+    let thread_id = thread
+        .get("id")
+        .and_then(Value::as_str)
+        .context("thread/resume 응답에 thread.id가 없습니다.")?
+        .to_owned();
+    let mut turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    loop {
+        let page = server
+            .request("thread/turns/list", turns_list_params(&thread_id, &cursor))
+            .await?;
+        let data = page
+            .get("data")
+            .and_then(Value::as_array)
+            .context("thread/turns/list 응답에 data가 없습니다.")?;
+        turns.extend(data.iter().cloned());
+        let Some(next) = page
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+        else {
+            break;
+        };
+        cursor = next;
+    }
+    thread
+        .as_object_mut()
+        .expect("thread was validated as an object")
+        .insert("turns".to_owned(), Value::Array(turns));
+    Ok(thread)
+}
+
+fn turns_list_params(thread_id: &str, cursor: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "cursor": cursor,
+        "limit": 100,
+        "sortDirection": "asc",
+        "itemsView": "full"
     })
 }
 
@@ -2232,7 +2310,12 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
 fn resume_thread_params(thread_id: &str) -> Value {
     json!({
         "threadId": thread_id,
-        "developerInstructions": DEVEZ_INSTRUCTIONS
+        "developerInstructions": DEVEZ_INSTRUCTIONS,
+        "initialTurnsPage": {
+            "limit": 100,
+            "sortDirection": "asc",
+            "itemsView": "full"
+        }
     })
 }
 
@@ -3524,6 +3607,10 @@ mod tests {
             params.pointer("/developerInstructions").and_then(Value::as_str),
             Some(DEVEZ_INSTRUCTIONS)
         );
+        assert_eq!(
+            params.pointer("/initialTurnsPage/itemsView").and_then(Value::as_str),
+            Some("full")
+        );
     }
 
     #[test]
@@ -4168,6 +4255,27 @@ mod tests {
         assert_eq!(resumed.cwd, "/repo");
         assert_eq!(resumed.model, "gpt-5.6-sol");
         assert_eq!(resumed.effort.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn resume_initial_turns_page_is_loaded_as_thread_history() {
+        let thread = thread_with_initial_turns(&json!({
+            "thread": { "id": "thread-9" },
+            "initialTurnsPage": { "data": [{ "id": "turn-1", "items": [] }] }
+        }))
+        .expect("resume response");
+
+        assert_eq!(thread.pointer("/turns/0/id").and_then(Value::as_str), Some("turn-1"));
+    }
+
+    #[test]
+    fn resume_history_pages_request_full_items_in_chronological_order() {
+        let params = turns_list_params("thread-9", "cursor-100");
+
+        assert_eq!(params.pointer("/threadId").and_then(Value::as_str), Some("thread-9"));
+        assert_eq!(params.pointer("/cursor").and_then(Value::as_str), Some("cursor-100"));
+        assert_eq!(params.pointer("/sortDirection").and_then(Value::as_str), Some("asc"));
+        assert_eq!(params.pointer("/itemsView").and_then(Value::as_str), Some("full"));
     }
 
     /// Once the new session lands the loading state has to clear itself, or the
