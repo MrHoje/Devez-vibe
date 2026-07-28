@@ -4975,7 +4975,7 @@ fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_
             PlanStepStatus::Completed => ("  ✓  ".to_owned(), false),
             PlanStepStatus::InProgress if plan_active => (format!("  {}  ", WORKING_SPINNER[(phase.clamp(0.0, 0.999) * WORKING_SPINNER.len() as f32) as usize]), true),
             PlanStepStatus::InProgress => ("  ▸  ".to_owned(), false),
-            PlanStepStatus::Pending => ("      ".to_owned(), false),
+            PlanStepStatus::Pending => ("  □  ".to_owned(), false),
         };
         let elapsed_text = step.elapsed.map(format_plan_elapsed);
         let elapsed = elapsed_text.as_deref();
@@ -12227,7 +12227,7 @@ mod tests {
         assert_eq!(lines[0].tail[0].text, " Shift + Tab ");
         assert_eq!(lines[0].tail[0].tone, Tone::FastOff);
         assert!(lines[1].text.is_empty());
-        assert_eq!(painted(&lines[8]), "      Task 7");
+        assert_eq!(painted(&lines[8]), "  □  Task 7");
         assert!(lines[9].text.is_empty());
         assert!(lines[10].text.starts_with('┗'));
         assert!(lines[10].text.ends_with('┛'));
@@ -12298,7 +12298,7 @@ mod tests {
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
 
         assert_eq!(painted(&lines[2]), "  ✓  Task 1");
-        assert_eq!(painted(&lines[3]), "      Task 2");
+        assert_eq!(painted(&lines[3]), "  □  Task 2");
         assert_eq!(painted(&lines[4]), "  ✓  Task 3");
         assert_eq!(lines[2].prefix_tone, Tone::Accent);
         assert_eq!(lines[2].tone, Tone::Plain);
