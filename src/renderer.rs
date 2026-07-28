@@ -5033,7 +5033,18 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
 
     let margin = " ".repeat(left_margin);
     for line in &mut lines {
-        line.prefix = format!("{margin}{}", line.prefix);
+        if line.tone == Tone::UserPrompt {
+            let text_width = UnicodeWidthStr::width(line.text.as_str())
+                + line
+                    .tail
+                    .iter()
+                    .filter(|span| span.tone != Tone::CopyJoin)
+                    .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+                    .sum::<usize>();
+            line.prefix = " ".repeat(left_margin + region_width.saturating_sub(text_width));
+        } else {
+            line.prefix = format!("{margin}{}", line.prefix);
+        }
     }
     lines
 }
@@ -7460,10 +7471,10 @@ mod tests {
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
         renderer.previous_lines = lines;
 
-        assert!(renderer.begin_selection(20, 1));
-        assert!(renderer.update_selection(27, 2));
+        assert!(renderer.begin_selection(74, 1));
+        assert!(renderer.update_selection(78, 2));
         assert_eq!(
-            renderer.finish_selection(27, 2),
+            renderer.finish_selection(78, 2),
             SelectionResult::Copy("first\nsecond".to_owned())
         );
     }
@@ -7476,7 +7487,7 @@ mod tests {
 
         assert!(!renderer.begin_selection(0, 0));
         assert!(!renderer.begin_selection(0, 2));
-        assert!(renderer.begin_selection(0, 1));
+        assert!(renderer.begin_selection(73, 1));
     }
 
     #[test]
@@ -7530,7 +7541,7 @@ mod tests {
             .iter()
             .filter(|line| line.tone == Tone::UserPrompt)
             .all(|line| UnicodeWidthStr::width(line.prefix.as_str()) >= 21
-                && painted_width(line) <= 79));
+                && painted_width(line) == 79));
         assert!(assistant
             .iter()
             .filter(|line| !line.text.is_empty())
@@ -9067,7 +9078,7 @@ mod tests {
         let user_lines = block_lines(&user, 80);
         let assistant_lines = block_lines(&assistant, 80);
 
-        assert_eq!(user_lines[1].prefix, " ".repeat(21));
+        assert_eq!(user_lines[1].prefix, " ".repeat(74));
         assert_eq!(user_lines[1].text, "hello");
         assert!(user_lines[1].prefix_tone == Tone::Plain);
         assert!(user_lines[1].tone == Tone::UserPrompt);
