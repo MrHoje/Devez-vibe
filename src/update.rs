@@ -19,9 +19,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Notes shown in the welcome panel's right column. Rewrite these each release;
 /// a line starting with `·` renders as a bullet, anything else as a sub-heading.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Tab queues your next prompt while a turn is running; it sends itself once the turn ends.",
-    "Click a queued prompt to drop it.",
-    "Ctrl+C copies the selection when there is one, interrupts otherwise. Press it twice to quit.",
+    "Plan steps now carry a timer, and a finished step keeps the time it took.",
+    "PageDown snaps a scrolled transcript back to the newest row.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
