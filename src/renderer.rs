@@ -2027,6 +2027,7 @@ enum Tone {
     UserPrompt,
     UserPromptHalf,
     AssistantBubble,
+    AssistantBubbleHalf,
     Model56,
     ModelSol,
     ModelTerra,
@@ -4933,7 +4934,11 @@ fn block_lines_with_mode(
         if conversational {
             lines.extend(wrapped_line(marker, tone, "", content_tone, false, conversational_width));
         }
-        return lines;
+        return if conversational && CHAT_LAYOUT.load(Ordering::Relaxed) {
+            assistant_chat_bubble_lines(lines)
+        } else {
+            lines
+        };
     }
 
     let force_diff = matches!(block.kind, BlockKind::Diff);
@@ -5015,8 +5020,37 @@ fn block_lines_with_mode(
             ));
         }
     }
-    lines.push(PaintLine::blank());
-    lines
+    if conversational && CHAT_LAYOUT.load(Ordering::Relaxed) {
+        assistant_chat_bubble_lines(lines)
+    } else {
+        lines.push(PaintLine::blank());
+        lines
+    }
+}
+
+fn assistant_chat_bubble_lines(mut lines: Vec<PaintLine>) -> Vec<PaintLine> {
+    let width = lines.iter().map(painted_line_width).max().unwrap_or(1);
+    for line in &mut lines {
+        let padding = width.saturating_sub(painted_line_width(line));
+        if padding > 0 {
+            line.tail.push(PaintSpan { text: " ".repeat(padding), tone: Tone::AssistantBubble, bold: false });
+        }
+    }
+    let half = |glyph: char| PaintLine {
+        prefix: String::new(),
+        prefix_tone: Tone::Plain,
+        text: glyph.to_string().repeat(width),
+        tone: Tone::AssistantBubbleHalf,
+        bold: false,
+        tool_heading: None,
+        pick: None,
+        tail: Vec::new(),
+    };
+    let mut bubble = vec![half('▄')];
+    bubble.append(&mut lines);
+    bubble.push(half('▀'));
+    bubble.push(PaintLine::blank());
+    bubble
 }
 
 #[cfg(test)]
@@ -6775,6 +6809,7 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::UserPrompt => palette.foreground,
         Tone::UserPromptHalf => palette.user_prompt_bg,
         Tone::AssistantBubble => palette.foreground,
+        Tone::AssistantBubbleHalf => blend(palette.background, palette.foreground, 20),
         Tone::Model56 => palette.model_gpt56,
         Tone::ModelSol => palette.model_sol,
         Tone::ModelTerra => palette.model_terra,
@@ -9166,10 +9201,10 @@ mod tests {
         assert!(user_lines[1].prefix_tone == Tone::Plain);
         assert!(user_lines[1].tone == Tone::UserPrompt);
         assert!(!user_lines[1].bold);
-        assert_eq!(assistant_lines[0].prefix, "• ");
-        assert_eq!(assistant_lines[0].prefix_tone, Tone::FastOff);
-        assert_eq!(assistant_lines[0].text, "hi");
-        assert_eq!(assistant_lines[0].tone, Tone::AssistantBubble);
+        assert_eq!(assistant_lines[1].prefix, "• ");
+        assert_eq!(assistant_lines[1].prefix_tone, Tone::FastOff);
+        assert_eq!(assistant_lines[1].text, "hi");
+        assert_eq!(assistant_lines[1].tone, Tone::AssistantBubble);
         assert!(user_lines.iter().all(|line| line.text != "You"));
         assert!(assistant_lines.iter().all(|line| line.text != "Codex"));
     }
