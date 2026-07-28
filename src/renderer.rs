@@ -1636,16 +1636,20 @@ fn paint_line_into_frame(
 ) {
     let background = row_background(line.tone);
     if let Some(background) = background {
-        let (start, width) = if line.tone == Tone::UserPrompt {
+        let (start, right) = if line.tone == Tone::UserPrompt {
             let start = UnicodeWidthStr::width(line.prefix.as_str()).saturating_sub(1);
             (start, frame.width.saturating_sub(start + 1))
+        } else if line.tone == Tone::ModelChange {
+            // Setting-change cards share the user's terminal-safe trailing cell.
+            // Fast, Model, and Effort notices therefore end on the same column.
+            (0, frame.width.saturating_sub(1))
         } else {
             (0, background_width.unwrap_or(frame.width))
         };
         frame.fill(
             start,
             row,
-            width,
+            right,
             row + 1,
             CellStyle {
                 background: Some(background),
@@ -2177,6 +2181,19 @@ impl PaintLine {
 
     fn blank() -> Self {
         Self::plain("")
+    }
+
+    fn user_prompt_half_padding(width: usize, glyph: char) -> Self {
+        Self {
+            prefix: String::new(),
+            prefix_tone: Tone::Plain,
+            text: glyph.to_string().repeat(width),
+            tone: Tone::UserPromptHalf,
+            bold: false,
+            tool_heading: None,
+            pick: None,
+            tail: Vec::new(),
+        }
     }
 
     /// Makes single spans of an already-built row clickable. `picks` addresses
@@ -4771,6 +4788,7 @@ fn reasoning_lines(block: &Block, width: u16) -> Vec<PaintLine> {
 
 #[cfg(test)]
 fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
+    CHAT_LAYOUT.store(true, Ordering::Relaxed);
     block_lines_with_expansion(block, width, false)
 }
 
@@ -5008,11 +5026,15 @@ fn block_lines_with_expansion(block: &Block, width: u16, expanded: bool) -> Vec<
 
 fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     if !CHAT_LAYOUT.load(Ordering::Relaxed) {
-        return block
+        let mut lines = block
             .body
             .lines()
             .flat_map(|line| wrapped_line(" ", Tone::Plain, line, Tone::UserPrompt, false, width))
-            .collect();
+            .collect::<Vec<_>>();
+        let half_width = usize::from(width).saturating_sub(1);
+        lines.insert(0, PaintLine::user_prompt_half_padding(half_width, '▄'));
+        lines.push(PaintLine::user_prompt_half_padding(half_width, '▀'));
+        return lines;
     }
     const BUBBLE_PADDING: usize = 1;
     const RIGHT_GAP: usize = 2;
@@ -5045,6 +5067,20 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
             left_margin + region_width.saturating_sub(RIGHT_GAP + bubble_width),
         );
     }
+    let bubble_width = lines
+        .iter()
+        .map(|line| UnicodeWidthStr::width(line.text.as_str()))
+        .max()
+        .unwrap_or(BUBBLE_PADDING * 2);
+    let half_prefix = " ".repeat(
+        left_margin + region_width.saturating_sub(RIGHT_GAP + bubble_width),
+    );
+    let mut top = PaintLine::user_prompt_half_padding(bubble_width, '▄');
+    top.prefix = half_prefix.clone();
+    let mut bottom = PaintLine::user_prompt_half_padding(bubble_width, '▀');
+    bottom.prefix = half_prefix;
+    lines.insert(0, top);
+    lines.push(bottom);
     lines
 }
 
@@ -5733,6 +5769,10 @@ fn input_lines_with_controls(
     mode: Option<&ComposerMode>,
     controls_mode: Option<&ComposerMode>,
 ) -> (Vec<PaintLine>, usize, usize) {
+    // Windows IME composes Hangul in the terminal before the committed character
+    // reaches us. Leave a full wide-character cell clear before the closing border
+    // so that transient composition cannot paint over it or trigger autowrap.
+    const COMPOSER_IME_RIGHT_GUTTER: usize = 3;
     let (display, editor_cursor) = composer_display(editor, composer_images);
     let display_chars = display.chars().collect::<Vec<_>>();
     let panel_width = (width as usize).saturating_sub(1).max(16);
@@ -5741,7 +5781,10 @@ fn input_lines_with_controls(
     let continuation_prefix = "  ";
     let content_width = panel_width
         .saturating_sub(
-            UnicodeWidthStr::width(side_prefix) + UnicodeWidthStr::width(first_prefix) + 1,
+            UnicodeWidthStr::width(side_prefix)
+                + UnicodeWidthStr::width(first_prefix)
+                + 1
+                + COMPOSER_IME_RIGHT_GUTTER,
         )
         .max(4);
     let mut raw_rows = vec![String::new()];
@@ -6842,6 +6885,32 @@ mod tests {
     }
 
     #[test]
+    fn model_change_background_leaves_the_same_rightmost_cell_as_user_prompt() {
+        let mut frame = CellFrame::new(8, 1);
+
+        paint_line_into_frame(
+            &mut frame,
+            0,
+            &PaintLine {
+                prefix: "  ".to_owned(),
+                prefix_tone: Tone::ModelChange,
+                text: "Fast mode On".to_owned(),
+                tone: Tone::ModelChange,
+                bold: true,
+                tool_heading: None,
+                pick: None,
+                tail: Vec::new(),
+            },
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(frame.cell(6, 0).style.background, row_background(Tone::ModelChange));
+        assert_eq!(frame.cell(7, 0).style.background, None);
+    }
+
+    #[test]
     fn terminal_diff_coalesces_adjacent_changed_cells_with_the_same_style() {
         let previous = CellFrame::new(8, 1);
         let mut current = previous.clone();
@@ -7240,24 +7309,25 @@ mod tests {
     }
 
     #[test]
-    fn korean_composer_text_uses_the_rightmost_safe_cells_without_clipping() {
+    fn korean_composer_text_keeps_an_ime_gutter_before_the_right_border() {
         let mut editor = Editor::default();
         editor.set_text("가가가가가가");
 
         let (rows, cursor_row, cursor_col) =
             input_lines(&editor, &[], 18, "", "placeholder", None, None);
 
-        assert_eq!((cursor_row, cursor_col), (1, 16));
-        assert!(painted(&rows[1]).contains("가가가가가가"));
+        assert_eq!((cursor_row, cursor_col), (2, 8));
+        assert!(painted(&rows[1]).contains("가가가가"));
+        assert!(painted(&rows[2]).contains("가가"));
         assert!(rows.iter().all(|row| painted_width(row) == 17));
 
         editor.set_text("가가가가가가나");
         let (rows, cursor_row, cursor_col) =
             input_lines(&editor, &[], 18, "", "placeholder", None, None);
 
-        assert_eq!((cursor_row, cursor_col), (2, 6));
-        assert!(painted(&rows[1]).contains("가가가가가가"));
-        assert!(painted(&rows[2]).contains('나'));
+        assert_eq!((cursor_row, cursor_col), (2, 10));
+        assert!(painted(&rows[1]).contains("가가가가"));
+        assert!(painted(&rows[2]).contains("가가나"));
         assert!(rows.iter().all(|row| painted_width(row) == 17));
     }
 
@@ -7481,10 +7551,10 @@ mod tests {
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
         renderer.previous_lines = lines;
 
-        assert!(renderer.begin_selection(71, 0));
-        assert!(renderer.update_selection(77, 1));
+        assert!(renderer.begin_selection(71, 1));
+        assert!(renderer.update_selection(77, 2));
         assert_eq!(
-            renderer.finish_selection(77, 1),
+            renderer.finish_selection(77, 2),
             SelectionResult::Copy("first\nsecond".to_owned())
         );
     }
@@ -7496,11 +7566,12 @@ mod tests {
         renderer.previous_lines = lines;
 
         assert!(!renderer.begin_selection(0, 0));
-        assert!(renderer.begin_selection(70, 0));
+        assert!(renderer.begin_selection(70, 1));
     }
 
     #[test]
     fn user_prompt_group_keeps_each_bubble_inside_the_right_column() {
+        CHAT_LAYOUT.store(true, Ordering::Relaxed);
         let lines = block_group_lines(
             &Block::new(BlockKind::User, "You", "first\nsecond"),
             80,
@@ -7509,16 +7580,16 @@ mod tests {
             false,
         );
 
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0].text, " first ");
-        assert_eq!(lines[1].text, " second ");
-        assert!(lines[2] == PaintLine::blank());
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[1].text, " first ");
+        assert_eq!(lines[2].text, " second ");
+        assert!(lines[4] == PaintLine::blank());
 
         let selection = CellRange {
-            start: CellPosition { column: 71, row: 0 },
-            end: CellPosition { column: 77, row: 1 },
+            start: CellPosition { column: 71, row: 1 },
+            end: CellPosition { column: 77, row: 2 },
         };
-        assert_ne!(selection_columns_for_line(&lines[0], selection, 0), None);
+        assert_eq!(selection_columns_for_line(&lines[0], selection, 0), None);
         assert_ne!(selection_columns_for_line(&lines[1], selection, 1), None);
     }
 
