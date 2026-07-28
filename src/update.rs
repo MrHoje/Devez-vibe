@@ -19,8 +19,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Notes shown in the welcome panel's right column. Rewrite these each release;
 /// a line starting with `·` renders as a bullet, anything else as a sub-heading.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Plan steps now carry a timer, and a finished step keeps the time it took.",
-    "PageDown snaps a scrolled transcript back to the newest row.",
+    "The welcome card clears itself once a plan starts, so nothing stale sits behind the panel.",
+    "A finished plan step reads its time inline, and the plan closes with a total.",
+    "The resume picker now fits short terminals instead of clipping its header.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
