@@ -48,6 +48,13 @@ pub enum RolloutKind {
 
 pub struct Rollout {
     pub events: Vec<RolloutEvent>,
+    pub last_plan: Option<PlanSnapshot>,
+}
+
+/// Most recent `update_plan` payload recorded for a session.
+pub struct PlanSnapshot {
+    pub explanation: Option<String>,
+    pub steps: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -171,6 +178,7 @@ fn find_rollout(root: &Path, thread_id: &str) -> Option<PathBuf> {
 /// build does not know — is dropped on its own; the rest of the file still reads.
 pub fn parse(text: &str) -> Rollout {
     let mut events = Vec::new();
+    let mut last_plan = None;
     // Exec calls whose output has not arrived yet: `call_id` → the indices in
     // `events` its output segments fill in, in the order the script's calls
     // ran (a script can run more than one `shell_command` per turn).
@@ -204,6 +212,10 @@ pub fn parse(text: &str) -> Rollout {
                     .get("input")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
+                if let Some(plan) = plan_snapshot(input) {
+                    last_plan = Some(plan);
+                    continue;
+                }
                 let commands = shell_commands(input);
                 if commands.is_empty() {
                     continue;
@@ -306,7 +318,44 @@ pub fn parse(text: &str) -> Rollout {
             _ => {}
         }
     }
-    Rollout { events }
+    Rollout { events, last_plan }
+}
+
+fn plan_snapshot(input: &str) -> Option<PlanSnapshot> {
+    let call = input.find("tools.update_plan(")?;
+    let input = &input[call..];
+    let plan = input.find("plan:[")? + "plan:[".len();
+    let mut depth = 1usize;
+    let mut end = plan;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (offset, ch) in input[plan..].char_indices() {
+        if quoted {
+            escaped = ch == '\\' && !escaped;
+            if ch == '"' && !escaped { quoted = false; }
+            continue;
+        }
+        if ch == '"' { quoted = true; continue; }
+        if ch == '[' { depth += 1; }
+        if ch == ']' { depth -= 1; if depth == 0 { end = plan + offset; break; } }
+    }
+    (depth == 0).then_some(())?;
+    let body = &input[plan..end];
+    let mut steps = Vec::new();
+    for item in body.split("step:").skip(1) {
+        let step = js_string(item)?;
+        let status_at = item.find("status:")? + "status:".len();
+        let status = js_string(&item[status_at..])?;
+        steps.push((step, status));
+    }
+    (!steps.is_empty()).then_some(PlanSnapshot { explanation: None, steps })
+}
+
+fn js_string(input: &str) -> Option<String> {
+    let input = input.trim_start();
+    let rest = input.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].replace("\\\"", "\""))
 }
 
 /// Replays the compact accounting records a rollout keeps alongside its
@@ -745,6 +794,18 @@ fn parse_wall_time_ms(output: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_plan_call_keeps_the_latest_plan_snapshot() {
+        let rollout = parse(
+            r#"{"timestamp":"2026-07-28T02:09:06.167Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const r = await tools.update_plan({plan:[{step:\"확인\",status:\"completed\"},{step:\"수정\",status:\"in_progress\"}]});"}}"#,
+        );
+
+        assert_eq!(
+            rollout.last_plan.as_ref().map(|plan| plan.steps.as_slice()),
+            Some(&[("확인".to_owned(), "completed".to_owned()), ("수정".to_owned(), "in_progress".to_owned())][..])
+        );
+    }
 
     #[test]
     fn assistant_and_patch_events_keep_their_file_order() {

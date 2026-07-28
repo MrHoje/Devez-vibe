@@ -30,7 +30,7 @@ use crate::{
         StatusLineView, SuggestionView, VibeTone, View, WelcomeView,
         visible_window,
     },
-    rollout::{Rollout, RolloutEvent, RolloutKind},
+    rollout::{PlanSnapshot, Rollout, RolloutEvent, RolloutKind},
     theme::{self, ThemeKind},
 };
 
@@ -3266,7 +3266,33 @@ impl AppState {
                 self.last_assistant_markdown = Some(text);
             }
         }
+        if let Some(plan) = rollout.and_then(|rollout| rollout.last_plan.as_ref()) {
+            self.restore_plan_snapshot(plan);
+        }
         self.show_welcome = false;
+    }
+
+    fn restore_plan_snapshot(&mut self, plan: &PlanSnapshot) {
+        self.plan_summary = Some(PlanSummary {
+            explanation: plan.explanation.clone(),
+            steps: plan
+                .steps
+                .iter()
+                .map(|(text, status)| PlanStep {
+                    text: text.clone(),
+                    status: if status == "completed" {
+                        PlanStepStatus::Completed
+                    } else {
+                        PlanStepStatus::Pending
+                    },
+                    started_at: None,
+                    elapsed: None,
+                })
+                .collect(),
+            expanded: false,
+            started_at: Instant::now(),
+            elapsed: None,
+        });
     }
 
     pub fn set_turn_started(&mut self, turn_id: String) {
@@ -6319,7 +6345,7 @@ impl AppState {
                     .map(|duration| duration.as_secs())
                     .unwrap_or(elapsed);
                 return Some(format!(
-                    "✕ Interrupted ({})",
+                    "X Interrupted ({})",
                     format_elapsed(interrupted_elapsed)
                 ));
             }
@@ -6327,7 +6353,7 @@ impl AppState {
         }
         self.last_completed_duration.map(|duration| {
             let label = if self.turn_interrupted {
-                "✕ Interrupted"
+                "X Interrupted"
             } else {
                 "Completed"
             };
@@ -8626,7 +8652,7 @@ mod tests {
         assert!(
             state
                 .activity()
-                .is_some_and(|activity| activity.starts_with("✕ Interrupted ("))
+                .is_some_and(|activity| activity.starts_with("X Interrupted ("))
         );
         assert_eq!(state.take_pending_interrupt(), None);
 
@@ -9479,6 +9505,22 @@ mod tests {
 
         assert_eq!(state.plan_summary.as_ref().unwrap().steps[0].elapsed, elapsed);
         assert!(elapsed.is_some());
+    }
+
+    #[test]
+    fn resumed_plan_turns_in_progress_steps_into_pending() {
+        let mut state = test_state();
+        state.restore_plan_snapshot(&PlanSnapshot {
+            explanation: None,
+            steps: vec![
+                ("완료 작업".to_owned(), "completed".to_owned()),
+                ("진행 중이던 작업".to_owned(), "in_progress".to_owned()),
+            ],
+        });
+
+        let steps = &state.plan_summary.expect("restored plan").steps;
+        assert_eq!(steps[0].status, PlanStepStatus::Completed);
+        assert_eq!(steps[1].status, PlanStepStatus::Pending);
     }
 
     #[test]
@@ -10727,7 +10769,7 @@ mod tests {
         assert!(
             state
                 .activity()
-                .is_some_and(|activity| activity.starts_with("✕ Interrupted ("))
+                .is_some_and(|activity| activity.starts_with("X Interrupted ("))
         );
     }
 
@@ -10742,13 +10784,13 @@ mod tests {
 
         assert_eq!(
             state.activity().as_deref(),
-            Some("✕ Interrupted (10s)")
+            Some("X Interrupted (10s)")
         );
 
         state.handle_notification("turn/completed", &json!({}));
         assert_eq!(
             state.activity().as_deref(),
-            Some("✕ Interrupted (10s)")
+            Some("X Interrupted (10s)")
         );
     }
 

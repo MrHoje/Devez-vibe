@@ -880,6 +880,9 @@ impl Renderer {
         }
         let row = row.min(self.previous_lines.len().saturating_sub(1) as u16);
         let line = &self.previous_lines[usize::from(row)];
+        if line.tone == Tone::UserPromptHalf {
+            return None;
+        }
         let width = painted_line_width(line).max(
             line.pick
                 .as_ref()
@@ -2010,6 +2013,7 @@ enum Tone {
     StatusText,
     StatusSeparator,
     UserPrompt,
+    UserPromptHalf,
     Model56,
     ModelSol,
     ModelTerra,
@@ -2165,10 +2169,18 @@ impl PaintLine {
         Self::plain("")
     }
 
-    fn user_prompt_padding() -> Self {
+    fn user_prompt_half_padding(width: u16, glyph: char) -> Self {
         Self {
-            tone: Tone::UserPrompt,
-            ..Self::blank()
+            prefix: String::new(),
+            prefix_tone: Tone::Plain,
+            text: glyph
+                .to_string()
+                .repeat(usize::from(width).saturating_sub(1)),
+            tone: Tone::UserPromptHalf,
+            bold: false,
+            tool_heading: None,
+            pick: None,
+            tail: Vec::new(),
         }
     }
 
@@ -4561,11 +4573,15 @@ fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_
     let hidden = steps.len().saturating_sub(4);
     let visible = if summary.expanded { steps.len() } else { 4 };
     for step in steps.into_iter().take(visible) {
+        if step.status == PlanStepStatus::Pending {
+            lines.push(PaintLine::blank());
+            continue;
+        }
         let (prefix, bold) = match step.status {
             PlanStepStatus::Completed => ("  ✔  ".to_owned(), false),
             PlanStepStatus::InProgress if plan_active => (format!("  {}  ", WORKING_SPINNER[(phase.clamp(0.0, 0.999) * WORKING_SPINNER.len() as f32) as usize]), true),
             PlanStepStatus::InProgress => ("  ▸  ".to_owned(), false),
-            PlanStepStatus::Pending => ("  □  ".to_owned(), false),
+            PlanStepStatus::Pending => unreachable!("pending rows return above"),
         };
         let elapsed_text = step.elapsed.map(format_plan_elapsed);
         let elapsed = elapsed_text
@@ -4638,7 +4654,7 @@ fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_
     lines.insert(0, header);
     lines.insert(1, PaintLine::blank());
     if all_completed {
-        let total = format!("⏱ {}", format_plan_elapsed(summary.elapsed.unwrap_or_default()));
+        let total = format!("⏱  {}", format_plan_elapsed(summary.elapsed.unwrap_or_default()));
         lines.push(PaintLine::plain(format!(
             "{}{}  ",
             " ".repeat(line_width.saturating_sub(UnicodeWidthStr::width(total.as_str()) + 2)),
@@ -4943,18 +4959,20 @@ fn block_lines_with_expansion(block: &Block, width: u16, expanded: bool) -> Vec<
 }
 
 fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
+    let mut lines = vec![PaintLine::user_prompt_half_padding(width, '▄')];
     if block.body.is_empty() {
-        return wrapped_line(
+        lines.extend(wrapped_line(
             " ",
             Tone::Plain,
             "",
             Tone::UserPrompt,
             true,
             width,
-        );
+        ));
+        lines.push(PaintLine::user_prompt_half_padding(width, '▀'));
+        return lines;
     }
 
-    let mut lines = Vec::new();
     for raw_line in block.body.lines() {
         lines.extend(wrapped_line(
             " ",
@@ -4965,6 +4983,7 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
             width,
         ));
     }
+    lines.push(PaintLine::user_prompt_half_padding(width, '▀'));
     lines
 }
 
@@ -6640,6 +6659,7 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::StatusText => palette.status.text,
         Tone::StatusSeparator => palette.status.separator,
         Tone::UserPrompt => palette.foreground,
+        Tone::UserPromptHalf => palette.user_prompt_bg,
         Tone::Model56 => palette.model_gpt56,
         Tone::ModelSol => palette.model_sol,
         Tone::ModelTerra => palette.model_terra,
@@ -6738,7 +6758,16 @@ mod tests {
         paint_line_into_frame(
             &mut frame,
             0,
-            &PaintLine::user_prompt_padding(),
+            &PaintLine {
+                prefix: " ".to_owned(),
+                prefix_tone: Tone::Plain,
+                text: "prompt".to_owned(),
+                tone: Tone::UserPrompt,
+                bold: true,
+                tool_heading: None,
+                pick: None,
+                tail: Vec::new(),
+            },
             None,
             None,
             None,
@@ -7383,21 +7412,32 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_selection_copies_user_prompt_without_padding_rows() {
+    fn fullscreen_selection_excludes_user_prompt_half_padding() {
         let lines = block_lines(&Block::new(BlockKind::User, "You", "first\nsecond"), 80);
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
         renderer.previous_lines = lines;
 
-        assert!(renderer.begin_selection(0, 0));
-        assert!(renderer.update_selection(7, 1));
+        assert!(renderer.begin_selection(0, 1));
+        assert!(renderer.update_selection(7, 2));
         assert_eq!(
-            renderer.finish_selection(7, 1),
+            renderer.finish_selection(7, 2),
             SelectionResult::Copy("first\nsecond".to_owned())
         );
     }
 
     #[test]
-    fn user_prompt_group_has_no_inner_padding() {
+    fn user_prompt_half_padding_cannot_start_a_selection() {
+        let lines = block_lines(&Block::new(BlockKind::User, "You", "prompt"), 80);
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = lines;
+
+        assert!(!renderer.begin_selection(0, 0));
+        assert!(!renderer.begin_selection(0, 2));
+        assert!(renderer.begin_selection(0, 1));
+    }
+
+    #[test]
+    fn user_prompt_group_has_half_height_padding_above_and_below_the_prompt() {
         let lines = block_group_lines(
             &Block::new(BlockKind::User, "You", "first\nsecond"),
             80,
@@ -7406,17 +7446,21 @@ mod tests {
             false,
         );
 
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0].text, "first");
-        assert_eq!(lines[1].text, "second");
-        assert!(lines[2] == PaintLine::blank());
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[0].tone, Tone::UserPromptHalf);
+        assert!(lines[0].text.chars().all(|glyph| glyph == '▄'));
+        assert_eq!(lines[1].text, "first");
+        assert_eq!(lines[2].text, "second");
+        assert_eq!(lines[3].tone, Tone::UserPromptHalf);
+        assert!(lines[3].text.chars().all(|glyph| glyph == '▀'));
+        assert!(lines[4] == PaintLine::blank());
 
         let selection = CellRange {
-            start: CellPosition { column: 0, row: 0 },
-            end: CellPosition { column: 8, row: 1 },
+            start: CellPosition { column: 0, row: 1 },
+            end: CellPosition { column: 8, row: 2 },
         };
-        assert_ne!(selection_columns_for_line(&lines[0], selection, 0), None);
-        assert_ne!(selection_columns_for_line(&lines[1], selection, 1), None);
+        assert_eq!(selection_columns_for_line(&lines[0], selection, 0), None);
+        assert_eq!(selection_columns_for_line(&lines[3], selection, 3), None);
     }
 
     #[test]
@@ -8931,11 +8975,11 @@ mod tests {
         let user_lines = block_lines(&user, 80);
         let assistant_lines = block_lines(&assistant, 80);
 
-        assert_eq!(user_lines[0].prefix, " ");
-        assert_eq!(user_lines[0].text, "hello");
-        assert!(user_lines[0].prefix_tone == Tone::Plain);
-        assert!(user_lines[0].tone == Tone::UserPrompt);
-        assert!(user_lines[0].bold);
+        assert_eq!(user_lines[1].prefix, " ");
+        assert_eq!(user_lines[1].text, "hello");
+        assert!(user_lines[1].prefix_tone == Tone::Plain);
+        assert!(user_lines[1].tone == Tone::UserPrompt);
+        assert!(user_lines[1].bold);
         assert_eq!(assistant_lines[0].prefix, "• ");
         assert_eq!(assistant_lines[0].prefix_tone, Tone::FastOff);
         assert_eq!(assistant_lines[0].text, "hi");
@@ -11512,7 +11556,7 @@ mod tests {
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
 
         assert_eq!(painted(&lines[2]), "  ✔  Task 1");
-        assert_eq!(painted(&lines[3]), "  □  Task 2");
+        assert_eq!(painted(&lines[3]), "");
         assert_eq!(painted(&lines[4]), "  ✔  Task 3");
         assert_eq!(lines[2].prefix_tone, Tone::Accent);
         assert_eq!(lines[2].tone, Tone::Plain);
@@ -11537,7 +11581,7 @@ mod tests {
 
         assert!(painted(&lines[2]).ends_with("Done (1m 34s)"));
         assert_eq!(painted(&lines[2]), "  ✔  Done (1m 34s)");
-        assert!(painted(&lines[3]).ends_with("⏱ 1m 34s  "));
+        assert!(painted(&lines[3]).ends_with("⏱  1m 34s  "));
     }
 
     #[test]

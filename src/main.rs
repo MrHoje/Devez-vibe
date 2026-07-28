@@ -265,9 +265,12 @@ async fn start_session(
         .unwrap_or_else(|| cwd.to_str().unwrap_or("."))
         .to_owned();
 
+    let rollout = is_resuming
+        .then(|| state::codex_home().and_then(|home| rollout::load(&home, &thread_id)))
+        .flatten();
     state.attach_thread(thread_id, actual_cwd, &actual_model, Some(&actual_effort));
     if is_resuming {
-        state.load_history(&thread, None);
+        state.load_history(&thread, rollout.as_ref());
         state.begin_cost_restore();
     }
     draw(state, renderer)?;
@@ -2013,6 +2016,7 @@ async fn resume_into_state(
             return Ok(Switched::Failed);
         }
     };
+    let rollout = state::codex_home().and_then(|home| rollout::load(&home, &resumed.id));
     state.attach_thread(
         resumed.id,
         resumed.cwd,
@@ -2026,7 +2030,7 @@ async fn resume_into_state(
             return Ok(Switched::Failed);
         }
     };
-    state.load_history(&history, None);
+    state.load_history(&history, rollout.as_ref());
     state.begin_cost_restore();
     Ok(Switched::Done(queued))
 }
