@@ -318,6 +318,8 @@ pub struct View<'a> {
     pub plan_summary: Option<&'a PlanSummary>,
     /// Whether the current turn is still active, so an in-progress plan row may animate.
     pub plan_active: bool,
+    /// A one-shot frame shimmer started by a plan creation or update.
+    pub plan_shimmer_phase: Option<f32>,
     pub editor: &'a Editor,
     pub composer_images: &'a [String],
     pub queued_prompts: Vec<String>,
@@ -345,6 +347,7 @@ pub struct AnimationView<'a> {
     pub activity_phase: f32,
     pub plan_summary: Option<&'a PlanSummary>,
     pub plan_active: bool,
+    pub plan_shimmer_phase: Option<f32>,
     pub composer_mode: Option<ComposerMode>,
 }
 
@@ -1155,6 +1158,7 @@ impl Renderer {
                 view.plan_summary,
                 view.activity_phase,
                 view.plan_active,
+                view.plan_shimmer_phase,
             );
         }
 
@@ -1314,6 +1318,7 @@ impl Renderer {
                     self.last_width,
                     view.activity_phase,
                     view.plan_active,
+                    view.plan_shimmer_phase,
                 )
             })
             .unwrap_or_default();
@@ -1429,10 +1434,19 @@ impl Renderer {
         plan_summary: Option<&PlanSummary>,
         activity_phase: f32,
         plan_active: bool,
+        plan_shimmer_phase: Option<f32>,
     ) -> Result<()> {
         let rows = height as usize;
         let plan_lines = plan_summary
-            .map(|summary| fixed_plan_summary_lines(summary, width, activity_phase, plan_active))
+            .map(|summary| {
+                fixed_plan_summary_lines(
+                    summary,
+                    width,
+                    activity_phase,
+                    plan_active,
+                    plan_shimmer_phase,
+                )
+            })
             .unwrap_or_default();
         let plan_rows = plan_lines.len().min(rows.saturating_sub(1));
         let content_rows = rows.saturating_sub(plan_rows).max(1);
@@ -1909,7 +1923,10 @@ fn paint_line_into_frame(
     let bubble_background = bubble_background(line);
     if let Some(background) = background {
         let (start, right) = if line.tone == Tone::UserPrompt {
-            let start = UnicodeWidthStr::width(line.prefix.as_str()).saturating_sub(1);
+            let marker_width = usize::from(CHAT_LAYOUT.load(Ordering::Relaxed) && line.prefix.ends_with("> "))
+                * (CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP + 2);
+            let start = UnicodeWidthStr::width(line.prefix.as_str())
+                .saturating_sub(marker_width + 1);
             (start, frame.width.saturating_sub(start + 1))
         } else if line.tone == Tone::ModelChange {
             // Setting-change cards share the user's terminal-safe trailing cell.
@@ -2358,6 +2375,8 @@ enum Tone {
     SyntaxNumber,
     SyntaxType,
     SyntaxFunction,
+    MarkdownHeading,
+    MarkdownLink,
     InlineCode,
     DiffAdded,
     DiffRemoved,
@@ -2369,6 +2388,9 @@ enum Tone {
     /// One character of the shimmering `Working` label. The payload is how far
     /// the sweep's bright band has reached that character, `0` for untouched.
     Shimmer(Rgb, u8),
+    /// One character of a plan border shimmer, blended from the normal border
+    /// colour toward the current effort colour.
+    PlanShimmer(Rgb, u8),
     CopyJoin,
 }
 
@@ -2530,6 +2552,8 @@ impl PaintLine {
 /// still has dim characters ahead of the band — otherwise the whole label just
 /// pulses in place.
 const SHIMMER_BAND: f32 = 3.0;
+const PLAN_SHIMMER_BAND: f32 = SHIMMER_BAND * 2.5;
+const PLAN_SHIMMER_LOOPS: f32 = 5.0;
 
 /// One span per character, each lit by how close it is to the band's centre, so
 /// the label carries a soft gradient instead of a hard block. `phase` runs
@@ -2537,14 +2561,18 @@ const SHIMMER_BAND: f32 = 3.0;
 /// leaves past the right one, which is why the travel spans the label plus a
 /// band's width on either side.
 fn shimmer_spans(label: &str, phase: f32, base: Rgb) -> Vec<PaintSpan> {
+    shimmer_spans_with_band(label, phase, base, SHIMMER_BAND)
+}
+
+fn shimmer_spans_with_band(label: &str, phase: f32, base: Rgb, band: f32) -> Vec<PaintSpan> {
     let chars: Vec<char> = label.chars().collect();
-    let travel = chars.len() as f32 + SHIMMER_BAND * 2.0;
-    let centre = phase.clamp(0.0, 1.0) * travel - SHIMMER_BAND;
+    let travel = chars.len() as f32 + band * 2.0;
+    let centre = phase.clamp(0.0, 1.0) * travel - band;
     chars
         .into_iter()
         .enumerate()
         .map(|(index, ch)| {
-            let distance = (index as f32 - centre).abs() / SHIMMER_BAND;
+            let distance = (index as f32 - centre).abs() / band;
             // A raised cosine: full brightness under the centre, easing to
             // nothing at the band's edge with no visible seam either side.
             let level = if distance >= 1.0 {
@@ -2871,6 +2899,9 @@ fn bubble_content_columns(line: &PaintLine) -> Range<usize> {
     if line.tone == Tone::UserPrompt && CHAT_LAYOUT.load(Ordering::Relaxed) {
         let prefix = UnicodeWidthStr::width(line.prefix.as_str());
         let end = prefix + UnicodeWidthStr::width(line.text.trim_end());
+        if line.prefix.ends_with("> ") {
+            return prefix..end;
+        }
         return (prefix + CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP).min(end)..end;
     }
     let filler = line
@@ -4999,9 +5030,16 @@ fn plan_lines(block: &Block, width: u16) -> Vec<PaintLine> {
 
 /// Reasoning summaries use a narrow `∴` gutter and a single dim italic
 /// paragraph. Plan blocks keep their heading and one physical row per step.
-fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_active: bool) -> Vec<PaintLine> {
+fn fixed_plan_summary_lines(
+    summary: &PlanSummary,
+    width: u16,
+    phase: f32,
+    plan_active: bool,
+    plan_shimmer_phase: Option<f32>,
+) -> Vec<PaintLine> {
     let line_width = panel_span(width);
     let completed = summary.steps.iter().filter(|step| step.status == PlanStepStatus::Completed).count();
+    let effort_tone = plan_effort_tone(summary.steps.len());
     let title = format!("작업 단계 · {completed} / {} 완료", summary.steps.len());
     if !summary.expanded {
         let tail = " Shift + Tab ▼ ━━";
@@ -5068,25 +5106,30 @@ fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_
         line_width
             .saturating_sub(5 + UnicodeWidthStr::width(title.as_str()) + UnicodeWidthStr::width(header_tail)),
     );
+    let mut header_tail = vec![PaintSpan { text: "┏━━ ".to_owned(), tone: Tone::Plain, bold: false }];
+    header_tail.extend(plan_title_shimmer_spans(&title, plan_shimmer_phase, effort_tone));
+    header_tail.extend([
+        PaintSpan { text: format!(" {header_rule}"), tone: Tone::Plain, bold: false },
+        PaintSpan { text: " Shift + Tab ".to_owned(), tone: Tone::FastOff, bold: false },
+        PaintSpan { text: "▲ ".to_owned(), tone: Tone::Plain, bold: false },
+        PaintSpan { text: "━┓".to_owned(), tone: Tone::Plain, bold: false },
+    ]);
     let header = PaintLine {
         prefix: String::new(),
         prefix_tone: Tone::Border,
-        text: format!("┏━━ {title} {header_rule}"),
+        text: String::new(),
         tone: Tone::Plain,
         bold: false,
         tool_heading: None,
         pick: None,
-        tail: vec![
-            PaintSpan { text: " Shift + Tab ".to_owned(), tone: Tone::FastOff, bold: false },
-            PaintSpan { text: "▲ ".to_owned(), tone: Tone::Plain, bold: false },
-            PaintSpan { text: "━┓".to_owned(), tone: Tone::Plain, bold: false },
-        ],
+        tail: header_tail,
     };
-    let header = header.with_picks(&[(1, Pick::PlanSummary), (2, Pick::PlanSummary)]);
+    let header = header.with_picks(&[(4, Pick::PlanSummary), (5, Pick::PlanSummary)]);
     lines.insert(0, header);
     lines.insert(1, PaintLine::blank());
     if all_completed {
-        let total = format!("⏱  {}", format_plan_elapsed(summary.elapsed.unwrap_or_default()));
+        let elapsed = summary.steps.iter().filter_map(|step| step.elapsed).sum();
+        let total = format!("⏱  {}", format_plan_elapsed(elapsed));
         lines.push(PaintLine::plain(format!(
             "{}{}  ",
             " ".repeat(line_width.saturating_sub(UnicodeWidthStr::width(total.as_str()) + 2)),
@@ -5101,6 +5144,42 @@ fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_
     )));
     lines.push(PaintLine::blank());
     lines
+}
+
+/// A new plan starts at low twice, then advances one effort colour per added step.
+fn plan_effort_tone(step_count: usize) -> Tone {
+    match step_count.saturating_sub(2) {
+        0 => Tone::EffortLow,
+        1 => Tone::EffortMedium,
+        2 => Tone::EffortHigh,
+        3 => Tone::EffortXHigh,
+        4 => Tone::EffortMax,
+        _ => Tone::EffortUltra,
+    }
+}
+
+fn plan_title_shimmer_spans(
+    text: &str,
+    phase: Option<f32>,
+    effort_tone: Tone,
+) -> Vec<PaintSpan> {
+    let Some(phase) = phase else {
+        return vec![PaintSpan { text: text.to_owned(), tone: Tone::Plain, bold: false }];
+    };
+    let loop_phase = (phase.clamp(0.0, 0.999) * PLAN_SHIMMER_LOOPS) % 1.0;
+    shimmer_spans_with_band(text, loop_phase, theme::palette().foreground, PLAN_SHIMMER_BAND)
+        .into_iter()
+        .map(|span| PaintSpan {
+            tone: match span.tone {
+                Tone::Shimmer(_, level) => Tone::PlanShimmer(
+                    tone_rgb(effort_tone).unwrap_or(theme::palette().foreground),
+                    level,
+                ),
+                tone => tone,
+            },
+            ..span
+        })
+        .collect()
 }
 
 fn format_plan_elapsed(elapsed: Duration) -> String {
@@ -5354,7 +5433,7 @@ fn block_lines_with_mode(
                 &prefix,
                 prefix_tone,
                 trimmed.trim_start_matches('#').trim_start(),
-                content_tone,
+                Tone::MarkdownHeading,
                 true,
                 conversational_width,
             ));
@@ -5450,19 +5529,22 @@ fn block_lines_with_expansion(block: &Block, width: u16, expanded: bool) -> Vec<
 }
 
 fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
+    let marker_tone = model_tone(&block.title).unwrap_or(Tone::User);
     if !CHAT_LAYOUT.load(Ordering::Relaxed) {
         return block
             .body
             .lines()
-            .flat_map(|line| wrapped_line(" ", Tone::Plain, line, Tone::UserPrompt, false, width))
+            .flat_map(|line| wrapped_line("> ", marker_tone, line, Tone::UserPrompt, false, width))
             .collect::<Vec<_>>();
     }
     const RIGHT_GAP: usize = 0;
 
     let region_width = conversation_region_width(width);
     let left_margin = usize::from(width).saturating_sub(1).saturating_sub(region_width);
+    // The `> ` marker sits inside the region too, so its two columns come off
+    // the content along with the padding on both sides of the bubble.
     let content_width = region_width.saturating_sub(
-        RIGHT_GAP + (CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP) * 2,
+        RIGHT_GAP + (CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP) * 2 + 2,
     );
     let raw_lines = if block.body.is_empty() {
         vec![""]
@@ -5484,26 +5566,34 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         .collect::<Vec<_>>();
     for line in &mut lines {
         line.text = format!(
-            "{}{}{}",
-            " ".repeat(CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP),
+            "{}{}",
             line.text,
             " ".repeat(CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP)
         );
     }
-    let bubble_width = lines
+    let text_width = lines
         .iter()
         .map(|line| UnicodeWidthStr::width(line.text.as_str()))
         .max()
         .unwrap_or(CHAT_BUBBLE_PADDING * 2);
+    let bubble_width = text_width
+        + CHAT_BUBBLE_PADDING
+        + CHAT_BUBBLE_RIGHT_GAP
+        + 2;
     let half_prefix = " ".repeat(
         left_margin + region_width.saturating_sub(RIGHT_GAP + bubble_width),
     );
     for line in &mut lines {
-        let padding = bubble_width.saturating_sub(UnicodeWidthStr::width(line.text.as_str()));
+        let padding = text_width.saturating_sub(UnicodeWidthStr::width(line.text.as_str()));
         if padding > 0 {
             line.text.push_str(&" ".repeat(padding));
         }
-        line.prefix = half_prefix.clone();
+        line.prefix = format!(
+            "{}{}> ",
+            half_prefix,
+            " ".repeat(CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP)
+        );
+        line.prefix_tone = marker_tone;
     }
     lines
 }
@@ -5557,7 +5647,7 @@ fn markdown_line(
             continue;
         }
         if let Some((label, consumed)) = inline_link(rest) {
-            push_highlight_span(&mut spans, &label, Tone::Accent, strong);
+            push_highlight_span(&mut spans, &label, Tone::MarkdownLink, strong);
             index += consumed;
             continue;
         }
@@ -7296,7 +7386,9 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::SyntaxNumber => palette.syntax_number,
         Tone::SyntaxType => palette.syntax_type,
         Tone::SyntaxFunction => palette.syntax_function,
-        Tone::InlineCode => palette.accent,
+        Tone::MarkdownHeading => palette.response.heading,
+        Tone::MarkdownLink => palette.response.link,
+        Tone::InlineCode => palette.response.inline_code,
         // Claude Code paints diff rows with the default text colour and lets the
         // green/red background carry the added/removed signal, so the text stays
         // as readable as the rest of the transcript.
@@ -7305,6 +7397,7 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         }
         Tone::DiffHeader => palette.diff_header,
         Tone::Shimmer(base, level) => blend(base, palette.foreground, level),
+        Tone::PlanShimmer(effort, level) => blend(palette.foreground, effort, level),
         Tone::CopyJoin => return None,
     })
 }
@@ -8142,7 +8235,8 @@ mod tests {
             .map(|span| UnicodeWidthStr::width(span.text.as_str()))
             .sum::<usize>();
 
-        assert!(user_text.text.starts_with("  input"));
+        assert_eq!(user_text.text, "input  ");
+        assert!(user_text.prefix.ends_with("> "));
         assert!(user_text.text.ends_with("  "));
         assert_eq!(assistant_right_padding, 2);
 
@@ -8170,7 +8264,7 @@ mod tests {
         renderer.previous_lines = lines;
 
         assert!(!renderer.begin_selection(0, 0));
-        assert!(renderer.begin_selection(70, 0));
+        assert!(renderer.begin_selection(72, 0));
     }
 
     #[test]
@@ -8186,8 +8280,9 @@ mod tests {
 
         assert_eq!(lines.len(), 3);
         // Every row is filled out to the longest one so the bubble paints square.
-        assert_eq!(lines[0].text, "  first   ");
-        assert_eq!(lines[1].text, "  second  ");
+        assert_eq!(lines[0].text, "first   ");
+        assert_eq!(lines[1].text, "second  ");
+        assert!(lines[0].prefix.ends_with("> "));
         assert!(lines[2] == PaintLine::blank());
 
         let selection = CellRange {
@@ -8205,7 +8300,7 @@ mod tests {
         assert_eq!(lines[0].prefix, lines[1].prefix);
         assert_eq!(painted_line_width(&lines[0]), painted_line_width(&lines[1]));
         assert_eq!(lines[1].text.trim(), "short");
-        assert!(lines[1].text.starts_with("  short"));
+        assert!(lines[1].prefix.ends_with("> "));
     }
 
     #[test]
@@ -8225,8 +8320,8 @@ mod tests {
         let assistant = block_lines(&Block::new(BlockKind::Assistant, "Codex", "x".repeat(120)), 80);
 
         assert_eq!(conversation_region_width(80), 63);
-        assert_eq!(UnicodeWidthStr::width(user[0].prefix.as_str()), 16);
-        assert_eq!(UnicodeWidthStr::width(user[0].text.as_str()), 63);
+        assert_eq!(UnicodeWidthStr::width(user[0].prefix.as_str()), 20);
+        assert_eq!(UnicodeWidthStr::width(user[0].text.as_str()), 59);
         assert!(user
             .iter()
             .filter(|line| line.tone == Tone::UserPrompt)
@@ -8604,6 +8699,31 @@ mod tests {
             line.tail
                 .iter()
                 .any(|span| span.text == "DevezClient" && span.bold)
+        );
+    }
+
+    #[test]
+    fn markdown_uses_distinct_tones_for_heading_link_and_inline_code() {
+        let lines = markdown_line(
+            "",
+            Tone::Plain,
+            "제목 [문서](https://example.com)와 `Config`",
+            Tone::MarkdownHeading,
+            true,
+            100,
+        );
+        let line = &lines[0];
+
+        assert_eq!(line.tone, Tone::MarkdownHeading);
+        assert!(
+            line.tail
+                .iter()
+                .any(|span| span.text == "문서" && span.tone == Tone::MarkdownLink)
+        );
+        assert!(
+            line.tail
+                .iter()
+                .any(|span| span.text == "Config" && span.tone == Tone::InlineCode)
         );
     }
 
@@ -9770,9 +9890,10 @@ mod tests {
         let user_lines = block_lines(&user, 80);
         let assistant_lines = block_lines(&assistant, 80);
 
-        assert_eq!(user_lines[0].prefix, " ".repeat(70));
-        assert_eq!(user_lines[0].text, "  hello  ");
-        assert!(user_lines[0].prefix_tone == Tone::Plain);
+        // The prompt keeps its `> ` marker; only the speaker label is dropped.
+        assert_eq!(user_lines[0].prefix, format!("{}> ", " ".repeat(70)));
+        assert_eq!(user_lines[0].text, "hello  ");
+        assert!(user_lines[0].prefix_tone == Tone::User);
         assert!(user_lines[0].tone == Tone::UserPrompt);
         assert!(!user_lines[0].bold);
         assert_eq!(assistant_lines[1].prefix, "  ");
@@ -12401,18 +12522,19 @@ mod tests {
             elapsed: None,
         };
 
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, true);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, true, None);
 
         assert_eq!(lines.len(), 12);
-        assert!(lines[0].text.starts_with("┏━━ 작업 단계 · 0 / 7 완료"));
+        assert!(painted(&lines[0]).starts_with("┏━━ 작업 단계 · 0 / 7 완료"));
         assert!(painted(&lines[0]).ends_with('┓'));
-        assert_eq!(lines[0].tail[0].text, " Shift + Tab ");
-        assert_eq!(lines[0].tail[0].tone, Tone::FastOff);
+        assert!(lines[0].tail.iter().any(|span| span.text == " Shift + Tab "));
+        assert!(lines[0].tail.iter().any(|span| span.tone == Tone::FastOff));
         assert!(lines[1].text.is_empty());
-        assert_eq!(painted(&lines[8]), "     Task 7");
+        assert!(painted(&lines[8]).contains("     Task 7"));
+        assert!(!painted(&lines[8]).ends_with('┃'));
         assert!(lines[9].text.is_empty());
-        assert!(lines[10].text.starts_with('┗'));
-        assert!(lines[10].text.ends_with('┛'));
+        assert!(painted(&lines[10]).starts_with('┗'));
+        assert!(painted(&lines[10]).ends_with('┛'));
         assert!(lines[11].text.is_empty());
     }
 
@@ -12426,11 +12548,11 @@ mod tests {
             elapsed: None,
         };
 
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None);
 
         assert!(painted(&lines[0]).ends_with(" Shift + Tab ▲ ━┓"));
         assert_eq!(UnicodeWidthStr::width(painted(&lines[0]).as_str()), 79);
-        assert_eq!(lines[0].tail[0].tone, Tone::FastOff);
+        assert!(lines[0].tail.iter().any(|span| span.tone == Tone::FastOff));
         assert_eq!(pick_on(&lines[0], "▲"), Some(Pick::PlanSummary));
     }
 
@@ -12444,7 +12566,7 @@ mod tests {
             elapsed: None,
         };
 
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None);
 
         assert_eq!(lines.len(), 2);
         assert!(painted(&lines[0]).starts_with("━━━ 작업 단계"));
@@ -12477,11 +12599,11 @@ mod tests {
             elapsed: None,
         };
 
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None);
 
-        assert_eq!(painted(&lines[2]), "  ✔  Task 1");
-        assert_eq!(painted(&lines[3]), "     Task 2");
-        assert_eq!(painted(&lines[4]), "  ✔  Task 3");
+        assert!(painted(&lines[2]).contains("  ✔  Task 1"));
+        assert!(painted(&lines[3]).contains("     Task 2"));
+        assert!(painted(&lines[4]).contains("  ✔  Task 3"));
         assert_eq!(lines[2].prefix_tone, Tone::FastOff);
         assert_eq!(lines[2].tone, Tone::PlanDone);
     }
@@ -12501,11 +12623,10 @@ mod tests {
             elapsed: Some(Duration::from_secs(94)),
         };
 
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None);
 
-        assert!(painted(&lines[2]).ends_with("Done (1m 34s)"));
-        assert_eq!(painted(&lines[2]), "  ✔  Done (1m 34s)");
-        assert!(painted(&lines[3]).ends_with("⏱  1m 34s  "));
+        assert!(painted(&lines[2]).contains("Done (1m 34s)"));
+        assert!(painted(&lines[3]).contains("⏱  1m 34s"));
     }
 
     #[test]
@@ -12517,11 +12638,36 @@ mod tests {
             started_at: Instant::now(),
             elapsed: None,
         };
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.5, true);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.5, true, None);
         assert!(lines[2].prefix.contains('⠴'));
         assert_eq!(lines[2].text, "Working task");
         assert_eq!(lines[2].tone, Tone::Accent);
+        assert_eq!(lines[2].prefix.chars().next(), Some(' '));
         assert!(lines[2].tail.is_empty());
+    }
+
+    #[test]
+    fn active_plan_border_advances_effort_after_two_low_steps() {
+        assert_eq!(plan_effort_tone(1), Tone::EffortLow);
+        assert_eq!(plan_effort_tone(2), Tone::EffortLow);
+        assert_eq!(plan_effort_tone(3), Tone::EffortMedium);
+        assert_eq!(plan_effort_tone(4), Tone::EffortHigh);
+        assert_eq!(plan_effort_tone(5), Tone::EffortXHigh);
+        assert_eq!(plan_effort_tone(6), Tone::EffortMax);
+        assert_eq!(plan_effort_tone(7), Tone::EffortUltra);
+    }
+
+    #[test]
+    fn plan_title_shimmer_moves_five_times_over_the_default_text() {
+        assert_eq!(PLAN_SHIMMER_BAND, SHIMMER_BAND * 2.5);
+        assert_eq!(PLAN_SHIMMER_LOOPS, 5.0);
+        let title = plan_title_shimmer_spans("작업 단계 · 1 / 3 완료", Some(0.125), Tone::EffortMedium);
+
+        assert!(title.iter().any(|span| matches!(span.tone, Tone::PlanShimmer(_, _))));
+        assert_eq!(
+            plan_title_shimmer_spans("작업 단계 · 1 / 3 완료", None, Tone::EffortMedium)[0].tone,
+            Tone::Plain
+        );
     }
 
     #[test]
@@ -12534,7 +12680,7 @@ mod tests {
             elapsed: None,
         };
 
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.5, false);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.5, false, None);
 
         assert_eq!(lines[2].prefix, "  ▸  ");
         assert_eq!(lines[2].prefix_tone, Tone::Accent);

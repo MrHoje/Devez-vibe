@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Devez Vibe · Response Theme Preview</title>
+  <style>
+    :root { font-family: "Pretendard", "Noto Sans KR", system-ui, sans-serif; color: #172033; background: #e7ecf3; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 40px; }
+    header { max-width: 1280px; margin: 0 auto 28px; }
+    h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: -.04em; }
+    header p { margin: 0; color: #5d6b7e; }
+    .themes { max-width: 1280px; margin: 0 auto; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
+    .theme { --background: #fff; --foreground: #172033; --muted: #5d6b7e; --heading: #2563eb; --link: #34769e; --code: #7c3aed; background: var(--background); color: var(--foreground); border: 1px solid color-mix(in srgb, var(--foreground) 14%, transparent); border-radius: 18px; overflow: hidden; box-shadow: 0 18px 42px rgba(39, 52, 73, .11); }
+    .soft { --background: #f2ede6; --foreground: #2a2620; --muted: #5a5448; --heading: #42638f; --link: #3d6e8e; --code: #684b8a; }
+    .dark { --background: #1f1f1e; --foreground: #e8e8e8; --muted: #aaa; --heading: #78b2d2; --link: #60a5fa; --code: #fb923c; box-shadow: 0 18px 42px rgba(0, 0, 0, .28); }
+    .theme-head { padding: 18px 20px; border-bottom: 1px solid color-mix(in srgb, var(--foreground) 13%, transparent); display: flex; align-items: center; justify-content: space-between; }
+    .theme-head h2 { margin: 0; font-size: 17px; letter-spacing: -.02em; }
+    .theme-head span { font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--muted); }
+    .terminal { min-height: 438px; padding: 25px 22px 28px; font: 14px/1.68 ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .marker { color: var(--muted); margin-right: 7px; }
+    .heading { color: var(--heading); font-weight: 800; margin: 0 0 16px; font-family: "Pretendard", "Noto Sans KR", system-ui, sans-serif; font-size: 19px; letter-spacing: -.03em; }
+    .body { margin: 0 0 14px; }
+    .code { color: var(--code); font-weight: 700; }
+    .link { color: var(--link); text-decoration: underline; text-underline-offset: 3px; font-weight: 650; }
+    .muted { color: var(--muted); }
+    .rule { height: 1px; margin: 18px 0; background: color-mix(in srgb, var(--foreground) 14%, transparent); }
+    .roles { display: grid; gap: 8px; font-family: "Pretendard", "Noto Sans KR", system-ui, sans-serif; font-size: 13px; }
+    .role { display: flex; align-items: center; justify-content: space-between; }
+    .chip { padding: 4px 8px; border-radius: 7px; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--background); }
+    .heading-chip { background: var(--heading); }.link-chip { background: var(--link); }.code-chip { background: var(--code); }
+    @media (max-width: 940px) { body { padding: 22px; }.themes { grid-template-columns: 1fr; max-width: 560px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>응답 색상 템플릿</h1>
+    <p>본문은 읽기 편하게 유지하고, 제목·링크·기술 식별자만 서로 다른 역할 색상으로 구분합니다.</p>
+  </header>
+  <main class="themes">
+    <section class="theme minimal">
+      <div class="theme-head"><h2>Minimal</h2><span>cool white</span></div>
+      <div class="terminal">
+        <p class="heading">설정 반영 완료</p>
+        <p class="body"><span class="marker">-</span>응답 색상 템플릿을 추가했습니다.</p>
+        <p class="body"><span class="marker">-</span><span class="code">ResponsePalette</span>가 제목·링크·식별자 색상을 분리합니다.</p>
+        <p class="body"><span class="marker">-</span><span class="link">변경 파일 열기</span></p>
+        <div class="rule"></div>
+        <div class="roles"><div class="role"><span>제목 · 구조</span><span class="chip heading-chip">#2563EB</span></div><div class="role"><span>링크 · 탐색</span><span class="chip link-chip">#34769E</span></div><div class="role"><span>인라인 코드 · 식별자</span><span class="chip code-chip">#7C3AED</span></div></div>
+      </div>
+    </section>
+    <section class="theme soft">
+      <div class="theme-head"><h2>Soft</h2><span>warm cream</span></div>
+      <div class="terminal">
+        <p class="heading">설정 반영 완료</p>
+        <p class="body"><span class="marker">-</span>응답 색상 템플릿을 추가했습니다.</p>
+        <p class="body"><span class="marker">-</span><span class="code">ResponsePalette</span>가 제목·링크·식별자 색상을 분리합니다.</p>
+        <p class="body"><span class="marker">-</span><span class="link">변경 파일 열기</span></p>
+        <div class="rule"></div>
+        <div class="roles"><div class="role"><span>제목 · 구조</span><span class="chip heading-chip">#42638F</span></div><div class="role"><span>링크 · 탐색</span><span class="chip link-chip">#3D6E8E</span></div><div class="role"><span>인라인 코드 · 식별자</span><span class="chip code-chip">#684B8A</span></div></div>
+      </div>
+    </section>
+    <section class="theme dark">
+      <div class="theme-head"><h2>Dark</h2><span>charcoal</span></div>
+      <div class="terminal">
+        <p class="heading">설정 반영 완료</p>
+        <p class="body"><span class="marker">-</span>응답 색상 템플릿을 추가했습니다.</p>
+        <p class="body"><span class="marker">-</span><span class="code">ResponsePalette</span>가 제목·링크·식별자 색상을 분리합니다.</p>
+        <p class="body"><span class="marker">-</span><span class="link">변경 파일 열기</span></p>
+        <div class="rule"></div>
+        <div class="roles"><div class="role"><span>제목 · 구조</span><span class="chip heading-chip">#78B2D2</span></div><div class="role"><span>링크 · 탐색</span><span class="chip link-chip">#60A5FA</span></div><div class="role"><span>인라인 코드 · 식별자</span><span class="chip code-chip">#FB923C</span></div></div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

@@ -38,6 +38,7 @@ const SPINNER: [&str; 8] = ["✢", "✳", "✶", "✻", "✽", "✻", "✶", "�
 
 /// How long one shimmer sweep across the `Working` label takes.
 const SHIMMER_PERIOD: Duration = Duration::from_millis(1_100);
+const PLAN_SHIMMER_DURATION: Duration = SHIMMER_PERIOD.saturating_mul(5);
 
 /// The permission presets Codex exposes through `/permissions`, cycled with Shift+Tab.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2486,6 +2487,7 @@ pub struct AppState {
     show_welcome: bool,
     welcome_credits_expanded: bool,
     plan_summary: Option<PlanSummary>,
+    plan_shimmer_started_at: Option<Instant>,
     command_selection: usize,
     spinner_frame: usize,
     turn_started_at: Option<Instant>,
@@ -2571,7 +2573,7 @@ impl AppState {
             .get(selected_model)
             .and_then(|model| model.context_window);
 
-        Self {
+        let mut state = Self {
             editor: Editor::default(),
             composer_images: Vec::new(),
             queued_prompts: VecDeque::new(),
@@ -2612,6 +2614,7 @@ impl AppState {
             show_welcome: true,
             welcome_credits_expanded: false,
             plan_summary: None,
+            plan_shimmer_started_at: None,
             command_selection: 0,
             spinner_frame: 0,
             turn_started_at: None,
@@ -2643,7 +2646,29 @@ impl AppState {
             selected_completion_bindings: Vec::new(),
             mcp_failures: Vec::new(),
             deferred_resume: None,
+        };
+        if let Some(count) = env::var("DEVEZ_VIBE_TEST_PLAN_STEPS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&count| count > 0)
+        {
+            state.plan_summary = Some(PlanSummary {
+                explanation: Some("Shimmer 테스트".to_owned()),
+                steps: (1..=count)
+                    .map(|index| PlanStep {
+                        text: format!("테스트 작업 {index}"),
+                        status: PlanStepStatus::Pending,
+                        started_at: None,
+                        elapsed: None,
+                    })
+                    .collect(),
+                expanded: true,
+                started_at: Instant::now(),
+                elapsed: None,
+            });
+            state.plan_shimmer_started_at = Some(Instant::now());
         }
+        state
     }
 
     pub fn selected_model(&self) -> Option<&ModelInfo> {
@@ -3239,7 +3264,7 @@ impl AppState {
     pub fn begin_side_prompt(&mut self, text: String) {
         self.commit_welcome_card();
         self.committed
-            .push(Block::new(BlockKind::User, "You", text));
+            .push(Block::new(BlockKind::User, self.selected_model_name(), text));
         self.reset_turn_item_tracking();
         self.busy = true;
     }
@@ -3336,10 +3361,10 @@ impl AppState {
                 .iter()
                 .map(|step| PlanStep {
                     text: step.text.clone(),
-                    status: if step.status == "completed" {
-                        PlanStepStatus::Completed
-                    } else {
-                        PlanStepStatus::Pending
+                    status: match step.status.as_str() {
+                        "completed" => PlanStepStatus::Completed,
+                        "in_progress" => PlanStepStatus::InProgress,
+                        _ => PlanStepStatus::Pending,
                     },
                     started_at: None,
                     elapsed: step.elapsed_ms.map(Duration::from_millis),
@@ -3636,6 +3661,7 @@ impl AppState {
             overlay: self.overlay_view(),
             plan_summary: self.plan_summary.as_ref(),
             plan_active: self.busy,
+            plan_shimmer_phase: self.plan_shimmer_phase(),
             editor: &self.editor,
             composer_images: &self.composer_images,
             queued_prompts: self.queued_prompts.iter().cloned().collect(),
@@ -3676,6 +3702,11 @@ impl AppState {
 
     pub fn render_tick(&mut self) -> TickResult {
         let mut full_redraw = false;
+        let plan_shimmer_active = self.plan_shimmer_phase().is_some();
+        if self.plan_shimmer_started_at.is_some() && !plan_shimmer_active {
+            self.plan_shimmer_started_at = None;
+            full_redraw = true;
+        }
         if self.busy {
             self.spinner_frame = (self.spinner_frame + 1) % SPINNER.len();
         }
@@ -3710,8 +3741,8 @@ impl AppState {
             full_redraw = true;
         }
         TickResult {
-            redraw: self.busy || full_redraw,
-            animation_only: self.busy && !full_redraw,
+            redraw: self.busy || plan_shimmer_active || full_redraw,
+            animation_only: (self.busy || plan_shimmer_active) && !full_redraw,
         }
     }
 
@@ -3722,6 +3753,7 @@ impl AppState {
             activity_phase: self.activity_phase(),
             plan_summary: self.plan_summary.as_ref(),
             plan_active: self.busy,
+            plan_shimmer_phase: self.plan_shimmer_phase(),
             composer_mode: Some(self.composer_mode()),
         }
     }
@@ -4494,6 +4526,7 @@ impl AppState {
                     started_at,
                     elapsed,
                 });
+                self.plan_shimmer_started_at = Some(Instant::now());
                 self.commit_welcome_card();
             }
             "item/started" => {
@@ -4707,7 +4740,7 @@ impl AppState {
         }
         self.commit_welcome_card();
         self.committed
-            .push(Block::new(BlockKind::User, "You", display));
+            .push(Block::new(BlockKind::User, self.selected_model_name(), display));
         if self.busy {
             Action::Steer(text)
         } else {
@@ -6470,6 +6503,13 @@ impl AppState {
         position as f32 / SHIMMER_PERIOD.as_millis() as f32
     }
 
+    fn plan_shimmer_phase(&self) -> Option<f32> {
+        let started = self.plan_shimmer_started_at?;
+        let elapsed = started.elapsed();
+        (elapsed < PLAN_SHIMMER_DURATION)
+            .then(|| elapsed.as_secs_f32() / PLAN_SHIMMER_DURATION.as_secs_f32())
+    }
+
     fn status_line(&self) -> StatusLineView {
         let context = self.context_window.and_then(|window| {
             (window > 0).then(|| {
@@ -7704,6 +7744,11 @@ fn merged_turn_blocks(
     items: &[Value],
     rollout: Option<&Rollout>,
 ) -> Vec<Block> {
+    let prompt_model = rollout.and_then(|rollout| {
+        turn.get("startedAt")
+            .and_then(Value::as_i64)
+            .and_then(|started_at| rollout.model_for_turn(started_at))
+    });
     let events = rollout
         .map(|rollout| turn_events(turn, rollout))
         .unwrap_or_default();
@@ -7721,7 +7766,12 @@ fn merged_turn_blocks(
         if let Some(ts) = item_timestamp(item, &events, &mut assistant_cursor) {
             last_ts = ts;
         }
-        if let Some(block) = completed_item_block(cwd, item) {
+        if let Some(mut block) = completed_item_block(cwd, item) {
+            if matches!(block.kind, BlockKind::User) {
+                if let Some(model) = prompt_model {
+                    block.title = model.to_owned();
+                }
+            }
             rows.push((last_ts.clone(), order, block));
             order += 1;
         }
@@ -9701,7 +9751,7 @@ mod tests {
     }
 
     #[test]
-    fn resumed_plan_turns_in_progress_steps_into_pending() {
+    fn resumed_plan_keeps_in_progress_steps() {
         let mut state = test_state();
         state.restore_plan_snapshot(&PlanSnapshot {
             explanation: None,
@@ -9713,7 +9763,7 @@ mod tests {
 
         let steps = &state.plan_summary.expect("restored plan").steps;
         assert_eq!(steps[0].status, PlanStepStatus::Completed);
-        assert_eq!(steps[1].status, PlanStepStatus::Pending);
+        assert_eq!(steps[1].status, PlanStepStatus::InProgress);
         assert_eq!(steps[1].elapsed, Some(Duration::from_secs(2)));
     }
 
@@ -9735,7 +9785,7 @@ mod tests {
         assert!(summary.expanded);
         assert_eq!(summary.steps.len(), 3);
         assert_eq!(summary.steps[0].status, PlanStepStatus::Completed);
-        assert_eq!(summary.steps[1].status, PlanStepStatus::Pending);
+        assert_eq!(summary.steps[1].status, PlanStepStatus::InProgress);
         assert_eq!(summary.steps[2].status, PlanStepStatus::Pending);
     }
 
@@ -11562,6 +11612,45 @@ mod tests {
         state.handle_key(KeyEvent::from(KeyCode::Char('\u{8}')));
 
         assert_eq!(state.editor.text(), "first ");
+    }
+
+    #[test]
+    fn resumed_user_prompt_keeps_its_turn_model() {
+        let mut state = test_state();
+        let thread = json!({
+            "turns": [{
+                "id": "turn-1",
+                "startedAt": 2_i64,
+                "completedAt": 3_i64,
+                "items": [{
+                    "type": "userMessage",
+                    "content": [{ "type": "text", "text": "이전 프롬프트" }]
+                }]
+            }]
+        });
+        let rollout = crate::rollout::parse(
+            r#"{"timestamp":"1970-01-01T00:00:02.000Z","type":"turn_context","payload":{"model":"gpt-5.6-terra"}}"#,
+        );
+
+        state.load_history(&thread, Some(&rollout));
+
+        assert_eq!(state.committed[0].title, "gpt-5.6-terra");
+    }
+
+    #[test]
+    fn plan_shimmer_runs_once_after_an_update_then_clears() {
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [{ "step": "check", "status": "inProgress" }] }),
+        );
+
+        assert!(state.plan_shimmer_phase().is_some());
+        state.plan_shimmer_started_at = Some(Instant::now() - PLAN_SHIMMER_DURATION);
+        let tick = state.render_tick();
+        assert!(tick.redraw);
+        assert!(!tick.animation_only);
+        assert!(state.plan_shimmer_phase().is_none());
     }
 
     #[test]

@@ -132,6 +132,10 @@ pub struct ThemePalette {
     pub pink: Rgb,
     #[allow(dead_code)]
     pub orange: Rgb,
+    /// Semantic colors for Markdown responses. Keep structure, navigation, and
+    /// inline code visually distinct instead of tinting every emphasized token
+    /// with the theme accent.
+    pub response: ResponsePalette,
     pub model_gpt56: Rgb,
     pub model_gpt55: Rgb,
     pub model_sol: Rgb,
@@ -160,6 +164,16 @@ pub struct ThemePalette {
     pub selection_bg: Rgb,
     /// Fallback text colour inside that block. See `selection_fg`.
     pub selection_fg: Rgb,
+}
+
+#[derive(Clone, Copy)]
+pub struct ResponsePalette {
+    /// Section titles and primary structure.
+    pub heading: Rgb,
+    /// Clickable Markdown links.
+    pub link: Rgb,
+    /// Short technical identifiers surrounded by backticks.
+    pub inline_code: Rgb,
 }
 
 /// Status line colors, kept apart from the rest of the palette because they are
@@ -207,6 +221,11 @@ pub const MINIMAL: ThemePalette = ThemePalette {
     purple: Rgb(0x7C, 0x3A, 0xED),
     pink: Rgb(0xBE, 0x18, 0x5D),
     orange: Rgb(0xBC, 0x4C, 0x00),
+    response: ResponsePalette {
+        heading: Rgb(0x25, 0x63, 0xEB),
+        link: Rgb(0x34, 0x76, 0x9E),
+        inline_code: Rgb(0x7C, 0x3A, 0xED),
+    },
     model_gpt56: Rgb(0x25, 0x63, 0xEB),
     model_gpt55: Rgb(0x25, 0x63, 0xEB),
     model_sol: Rgb(0xFF, 0x6B, 0x00),
@@ -260,6 +279,11 @@ pub const SOFT: ThemePalette = ThemePalette {
     purple: Rgb(0x68, 0x4B, 0x8A),
     pink: Rgb(0x8F, 0x3D, 0x5A),
     orange: Rgb(0x9A, 0x4D, 0x12),
+    response: ResponsePalette {
+        heading: Rgb(0x42, 0x63, 0x8F),
+        link: Rgb(0x3D, 0x6E, 0x8E),
+        inline_code: Rgb(0x68, 0x4B, 0x8A),
+    },
     model_gpt56: Rgb(0x25, 0x63, 0xEB),
     model_gpt55: Rgb(0x4A, 0x69, 0x84),
     model_sol: Rgb(0xD9, 0x77, 0x06),
@@ -313,6 +337,11 @@ pub const DARK: ThemePalette = ThemePalette {
     purple: Rgb(0xA7, 0x8B, 0xFA),
     pink: Rgb(0xF4, 0x72, 0xB6),
     orange: Rgb(0xFB, 0x92, 0x3C),
+    response: ResponsePalette {
+        heading: Rgb(0x78, 0xB2, 0xD2),
+        link: Rgb(0x60, 0xA5, 0xFA),
+        inline_code: Rgb(0xFB, 0x92, 0x3C),
+    },
     model_gpt56: Rgb(0x00, 0xF0, 0xFF),
     model_gpt55: Rgb(0x60, 0xA5, 0xFA),
     model_sol: Rgb(0xFF, 0x9E, 0x59),
@@ -471,6 +500,9 @@ mod tests {
                 ("purple", palette.purple),
                 ("pink", palette.pink),
                 ("orange", palette.orange),
+                ("response.heading", palette.response.heading),
+                ("response.link", palette.response.link),
+                ("response.inline_code", palette.response.inline_code),
                 ("code", palette.code),
                 ("syntax_comment", palette.syntax_comment),
                 ("syntax_string", palette.syntax_string),

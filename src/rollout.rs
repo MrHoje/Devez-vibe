@@ -50,6 +50,23 @@ pub enum RolloutKind {
 pub struct Rollout {
     pub events: Vec<RolloutEvent>,
     pub last_plan: Option<PlanSnapshot>,
+    turn_contexts: Vec<(String, String)>,
+}
+
+impl Rollout {
+    /// The model effective when a turn started, reconstructed from the latest
+    /// local `turn_context` record at or before that timestamp.
+    pub fn model_for_turn(&self, started_at: i64) -> Option<&str> {
+        self.turn_contexts
+            .iter()
+            .filter(|(timestamp, _)| {
+                chrono::DateTime::parse_from_rfc3339(timestamp)
+                    .ok()
+                    .is_some_and(|time| time.timestamp() <= started_at)
+            })
+            .last()
+            .map(|(_, model)| model.as_str())
+    }
 }
 
 /// Most recent `update_plan` payload recorded for a session.
@@ -185,6 +202,7 @@ fn find_rollout(root: &Path, thread_id: &str) -> Option<PathBuf> {
 /// build does not know — is dropped on its own; the rest of the file still reads.
 pub fn parse(text: &str) -> Rollout {
     let mut events = Vec::new();
+    let mut turn_contexts = Vec::new();
     let mut last_plan = None;
     let mut plan_started_at = HashMap::new();
     let mut plan_elapsed = HashMap::new();
@@ -204,6 +222,12 @@ pub fn parse(text: &str) -> Rollout {
         let Some(payload) = entry.get("payload") else {
             continue;
         };
+        if entry.get("type").and_then(Value::as_str) == Some("turn_context") {
+            if let Some(model) = payload.get("model").and_then(Value::as_str) {
+                turn_contexts.push((ts, model.to_owned()));
+            }
+            continue;
+        }
         match payload
             .get("type")
             .and_then(Value::as_str)
@@ -335,13 +359,22 @@ pub fn parse(text: &str) -> Rollout {
             _ => {}
         }
     }
-    Rollout { events, last_plan }
+    Rollout {
+        events,
+        last_plan,
+        turn_contexts,
+    }
 }
 
 fn plan_snapshot(input: &str) -> Option<PlanSnapshot> {
     let call = input.find("tools.update_plan(")?;
     let input = &input[call..];
-    let plan = input.find("plan:[")? + "plan:[".len();
+    let plan_key = input.find("plan:")? + "plan:".len();
+    let after_key = &input[plan_key..];
+    let whitespace = after_key.len().saturating_sub(after_key.trim_start().len());
+    let plan = plan_key + whitespace;
+    input[plan..].strip_prefix('[')?;
+    let plan = plan + 1;
     let mut depth = 1usize;
     let mut end = plan;
     let mut quoted = false;
@@ -839,8 +872,8 @@ mod tests {
     #[test]
     fn update_plan_call_keeps_the_latest_plan_snapshot() {
         let rollout = parse(
-            r#"{"timestamp":"2026-07-28T02:09:00.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const r = await tools.update_plan({plan:[{step:\"확인\",status:\"in_progress\"},{step:\"수정\",status:\"pending\"}]});"}}
-{"timestamp":"2026-07-28T02:09:06.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const r = await tools.update_plan({plan:[{step:\"확인\",status:\"completed\"},{step:\"수정\",status:\"in_progress\"}]});"}}"#,
+            r#"{"timestamp":"2026-07-28T02:09:00.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const r = await tools.update_plan({ plan: [{step:\"확인\",status:\"in_progress\"},{step:\"수정\",status:\"pending\"}]});"}}
+{"timestamp":"2026-07-28T02:09:06.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const r = await tools.update_plan({ plan: [{step:\"확인\",status:\"completed\"},{step:\"수정\",status:\"in_progress\"}]});"}}"#,
         );
 
         let plan = rollout.last_plan.expect("plan snapshot");
@@ -949,6 +982,17 @@ mod tests {
         );
 
         assert_eq!(ledger.estimate_usd(), Some(7.5));
+    }
+
+    #[test]
+    fn rollout_restores_the_model_active_when_a_turn_started() {
+        let rollout = parse(
+            r#"{"timestamp":"1970-01-01T00:00:01.000Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}
+{"timestamp":"1970-01-01T00:00:02.000Z","type":"turn_context","payload":{"model":"gpt-5.6-terra"}}"#,
+        );
+
+        assert_eq!(rollout.model_for_turn(1), Some("gpt-5.6-sol"));
+        assert_eq!(rollout.model_for_turn(2), Some("gpt-5.6-terra"));
     }
 
     #[test]
