@@ -271,7 +271,11 @@ async fn start_session(
         .flatten();
     state.attach_thread(thread_id, actual_cwd, &actual_model, Some(&actual_effort));
     if is_resuming {
-        state.load_history(&thread, rollout.as_ref());
+        // Startup resume used to render only the first page, unlike `/resume`.
+        // Fetch every page before rebuilding the transcript so its latest plan
+        // item is available even when the local rollout is absent.
+        let history = hydrate_thread_history(server, &thread_response).await?;
+        state.load_history(&history, rollout.as_ref());
         state.begin_cost_restore();
     }
     draw(state, renderer)?;

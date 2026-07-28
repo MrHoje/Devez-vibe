@@ -3317,6 +3317,8 @@ impl AppState {
         }
         if let Some(plan) = rollout.and_then(|rollout| rollout.last_plan.as_ref()) {
             self.restore_plan_snapshot(plan);
+        } else if let Some(plan) = plan_snapshot_from_history(turns) {
+            self.restore_plan_snapshot(&plan);
         }
         self.show_welcome = false;
     }
@@ -7790,6 +7792,68 @@ fn last_agent_message_text(items: &[Value]) -> Option<String> {
     })
 }
 
+/// `thread/resume` returns durable `plan` items with the turn history. Use the
+/// newest one only when the local rollout is unavailable, because sessions
+/// resumed on another machine do not have a rollout to parse.
+fn plan_snapshot_from_history(turns: &[Value]) -> Option<PlanSnapshot> {
+    turns
+        .iter()
+        .rev()
+        .filter_map(|turn| turn.get("items").and_then(Value::as_array))
+        .flat_map(|items| items.iter().rev())
+        .find_map(|item| {
+            (item.get("type").and_then(Value::as_str) == Some("plan"))
+                .then(|| item.get("text").and_then(Value::as_str))
+                .flatten()
+                .and_then(plan_snapshot_from_text)
+        })
+}
+
+fn plan_snapshot_from_text(text: &str) -> Option<PlanSnapshot> {
+    let steps = text
+        .lines()
+        .filter_map(plan_step_from_text)
+        .collect::<Vec<_>>();
+    (!steps.is_empty()).then_some(PlanSnapshot {
+        explanation: None,
+        steps,
+    })
+}
+
+fn plan_step_from_text(line: &str) -> Option<crate::rollout::PlanStepSnapshot> {
+    let line = line.trim();
+    let (status, text) =
+        if let Some(text) = line.strip_prefix("✓ ").or_else(|| line.strip_prefix("✔ ")) {
+            ("completed", text)
+        } else if let Some(text) = line.strip_prefix("▸ ") {
+            ("in_progress", text)
+        } else if let Some(text) = line.strip_prefix("□ ") {
+            ("pending", text)
+        } else if let Some(text) = line
+            .strip_prefix("- [x] ")
+            .or_else(|| line.strip_prefix("* [x] "))
+        {
+            ("completed", text)
+        } else if let Some(text) = line
+            .strip_prefix("- [~] ")
+            .or_else(|| line.strip_prefix("* [~] "))
+        {
+            ("in_progress", text)
+        } else if let Some(text) = line
+            .strip_prefix("- [ ] ")
+            .or_else(|| line.strip_prefix("* [ ] "))
+        {
+            ("pending", text)
+        } else {
+            return None;
+        };
+    (!text.trim().is_empty()).then_some(crate::rollout::PlanStepSnapshot {
+        text: text.trim().to_owned(),
+        status: status.to_owned(),
+        elapsed_ms: None,
+    })
+}
+
 /// When the rollout can date a server item. `cursor` walks the turn's assistant
 /// messages so a repeated message text still anchors to its own occurrence.
 fn item_timestamp(item: &Value, events: &[&RolloutEvent], cursor: &mut usize) -> Option<String> {
@@ -9631,6 +9695,28 @@ mod tests {
         assert_eq!(steps[0].status, PlanStepStatus::Completed);
         assert_eq!(steps[1].status, PlanStepStatus::Pending);
         assert_eq!(steps[1].elapsed, Some(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn resumed_plan_item_restores_expanded_summary_without_local_rollout() {
+        let mut state = test_state();
+        let thread = json!({
+            "turns": [{
+                "items": [{
+                    "type": "plan",
+                    "text": "✓ 확인 완료\n▸ 수정 진행\n□ 검증 대기"
+                }]
+            }]
+        });
+
+        state.load_history(&thread, None);
+
+        let summary = state.plan_summary.expect("restored plan summary");
+        assert!(summary.expanded);
+        assert_eq!(summary.steps.len(), 3);
+        assert_eq!(summary.steps[0].status, PlanStepStatus::Completed);
+        assert_eq!(summary.steps[1].status, PlanStepStatus::Pending);
+        assert_eq!(summary.steps[2].status, PlanStepStatus::Pending);
     }
 
     #[test]
