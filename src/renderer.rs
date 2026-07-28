@@ -91,6 +91,7 @@ pub enum BlockKind {
     /// A `turn/plan/updated` snapshot. Its body is the encoded plan: `└ ` rows
     /// are the explanation, `✔ `/`▸ `/`□ ` rows are done/in-progress/pending
     /// steps. See [`plan_lines`].
+    #[allow(dead_code)]
     Plan,
     Tool,
     FileChange,
@@ -235,7 +236,9 @@ pub(crate) const HIDDEN_STATUS_LINE: &str = "\0";
 /// How prominently a composer mode badge is painted on the composer top rule.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ModeAccent {
+    #[allow(dead_code)]
     Calm,
+    #[allow(dead_code)]
     Safe,
     Danger,
 }
@@ -252,16 +255,20 @@ pub struct ComposerMode {
     pub branch: Option<String>,
     pub vibe_mode: String,
     pub vibe_tone: VibeTone,
+    #[allow(dead_code)]
     pub label: String,
+    #[allow(dead_code)]
     pub accent: ModeAccent,
     pub model: String,
     pub response_length: String,
     pub fast_mode: bool,
+    #[allow(dead_code)]
     pub effort: String,
     pub shell_display_mode: String,
     pub diff_display_mode: String,
     /// What the thread is estimated to have cost so far. Absent before the first
     /// turn reports usage, and whenever the model has no published rate.
+    #[allow(dead_code)]
     pub cost: Option<String>,
 }
 
@@ -294,6 +301,8 @@ pub struct View<'a> {
     pub plan_active: bool,
     pub editor: &'a Editor,
     pub composer_images: &'a [String],
+    pub queued_prompts: Vec<String>,
+    pub composer_placeholder: &'a str,
     pub welcome: Option<WelcomeView>,
     pub suggestions: Vec<SuggestionView>,
     pub activity: Option<String>,
@@ -841,6 +850,14 @@ impl Renderer {
         self.selection.clear()
     }
 
+    /// Returns the active transcript selection without changing it. Keyboard
+    /// copy uses this before clearing the highlight for the next key event.
+    pub fn selected_text(&self) -> Option<String> {
+        let range = self.selection.range()?;
+        let text = extract_text(&self.copy_lines(), range);
+        (!text.is_empty()).then_some(text)
+    }
+
     fn reconcile_selection(&mut self, lines: &[PaintLine]) {
         let Some(range) = self.selection.range() else {
             return;
@@ -1016,6 +1033,8 @@ impl Renderer {
                 &view.live_blocks,
                 view.editor,
                 view.composer_images,
+                &view.queued_prompts,
+                view.composer_placeholder,
                 view.welcome,
                 &view.suggestions,
                 view.activity.as_deref(),
@@ -1507,6 +1526,7 @@ fn split_rows(rows: usize, live_natural: usize, transcript_len: usize) -> (usize
     (view_rows, rows - view_rows)
 }
 
+#[allow(dead_code)]
 fn clear_main_row(out: &mut impl Write, row: usize, width: usize) -> Result<()> {
     queue!(
         out,
@@ -1950,6 +1970,7 @@ enum Tone {
     User,
     /// A centred transcript control: default text on a compact button band.
     ScrollToBottom,
+    #[allow(dead_code)]
     Success,
     Warning,
     Error,
@@ -1984,7 +2005,9 @@ enum Tone {
     StatusEffortUltra,
     Border,
     Branch,
+    #[allow(dead_code)]
     LimitFiveHour,
+    #[allow(dead_code)]
     LimitWeekly,
     FastOn,
     FastOff,
@@ -2019,9 +2042,11 @@ enum Tone {
 pub enum Pick {
     Row(usize),
     Effort(usize),
+    RemoveQueuedPrompt(usize),
     /// The Vibe preset applies its response and transcript display settings.
     VibeMode,
     /// Legacy internal picks retained for command and regression-test routing.
+    #[allow(dead_code)]
     ResponseLength,
     ShellDisplayMode,
     DiffDisplayMode,
@@ -2292,6 +2317,35 @@ fn activity_lines(
     }]
 }
 
+fn queue_preview_line(prompt: &str, index: usize, width: u16) -> PaintLine {
+    PaintLine {
+        prefix: " ".to_owned(),
+        prefix_tone: Tone::Muted,
+        text: "X".to_owned(),
+        tone: Tone::Muted,
+        bold: false,
+        tool_heading: None,
+        pick: None,
+        tail: vec![PaintSpan {
+            text: format!(
+                " Queue: {}",
+                compact_right(prompt, usize::from(width).saturating_sub(11))
+            ),
+            tone: Tone::Muted,
+            bold: false,
+        }],
+    }
+    .with_picks(&[(0, Pick::RemoveQueuedPrompt(index))])
+}
+
+fn queue_preview_lines(prompts: &[String], width: u16) -> Vec<PaintLine> {
+    prompts
+        .iter()
+        .enumerate()
+        .map(|(index, prompt)| queue_preview_line(prompt, index, width))
+        .collect()
+}
+
 /// Places the full composer control strip at the right edge of a one-line
 /// activity row. A narrow terminal keeps the controls on the composer rule,
 /// where they can use their existing progressive compression.
@@ -2356,6 +2410,7 @@ fn painted_line_width(line: &PaintLine) -> usize {
 
 /// An animated activity row changes only the shimmer tones. Repaint that leading
 /// label in place so clearing the line does not make its elapsed tail blink.
+#[allow(dead_code)]
 fn shimmer_repaint_columns(previous: &PaintLine, current: &PaintLine) -> Option<Range<usize>> {
     if previous.prefix != current.prefix
         || previous.prefix_tone != current.prefix_tone
@@ -2427,6 +2482,19 @@ fn composer_content_columns(line: &PaintLine) -> Option<Range<usize>> {
 /// its text. They share the same range in selection paint and clipboard output.
 fn selectable_content_columns(line: &PaintLine) -> Option<Range<usize>> {
     composer_content_columns(line).or_else(|| {
+        let boxed_code = line.prefix.ends_with("│ ")
+            && line.tail.last().is_some_and(|span| span.text == "│");
+        if boxed_code {
+            let start = UnicodeWidthStr::width(line.prefix.as_str());
+            let end = painted_line_width(line).saturating_sub(1);
+            return (start < end).then_some(start..end);
+        }
+        if let Some(indentation) = line.prefix.strip_suffix("• ")
+            && !indentation.is_empty()
+            && indentation.chars().all(|ch| ch == ' ')
+        {
+            return Some(UnicodeWidthStr::width(indentation)..painted_line_width(line));
+        }
         let fallback_status_gutter =
             line.prefix == " " && line.prefix_tone == Tone::Muted && line.tone == Tone::Muted;
         let empty_gutter = !line.prefix.is_empty()
@@ -2490,6 +2558,8 @@ fn normal_frame(
         live,
         editor,
         &[],
+        &[],
+        "",
         welcome,
         suggestions,
         activity,
@@ -2508,6 +2578,8 @@ fn normal_frame_with_expansion(
     live: &[Block],
     editor: &Editor,
     composer_images: &[String],
+    queued_prompts: &[String],
+    composer_placeholder: &str,
     welcome: Option<WelcomeView>,
     suggestions: &[SuggestionView],
     activity: Option<&str>,
@@ -2586,6 +2658,7 @@ fn normal_frame_with_expansion(
             lines.push(PaintLine::blank());
         }
     }
+    lines.extend(queue_preview_lines(queued_prompts, width));
 
     // Recalled history is labelled on the composer rule, so the position stays
     // visible for as long as the entry does.
@@ -2598,7 +2671,7 @@ fn normal_frame_with_expansion(
         composer_images,
         width,
         &recalled,
-        "",
+        composer_placeholder,
         status.composer_notice.as_deref(),
         composer_mode,
         composer_controls_mode,
@@ -3148,6 +3221,7 @@ const EFFORT_SEPARATOR: &str = " › ";
 /// Effort reads as a sequence of compute steps rather than a speed-to-depth
 /// axis. The selected step stays fully named while the others compact on narrow
 /// terminals.
+#[allow(dead_code)]
 fn effort_step_lines(slider: &EffortSlider, width: u16) -> Vec<PaintLine> {
     effort_step_lines_in(slider, panel_span(width))
 }
@@ -4696,7 +4770,7 @@ fn block_lines_with_mode(
         BlockKind::Reasoning | BlockKind::Plan | BlockKind::Tool | BlockKind::FileChange => {
             unreachable!("handled above")
         }
-        BlockKind::Assistant => ("● ", Tone::Accent),
+        BlockKind::Assistant => ("> ", Tone::FastOff),
         BlockKind::Diff => ("● ", Tone::Accent),
         BlockKind::Warning => ("▲ ", Tone::Warning),
         BlockKind::Error => ("✕ ", Tone::Error),
@@ -4720,43 +4794,13 @@ fn block_lines_with_mode(
     let force_diff = matches!(block.kind, BlockKind::Diff);
     let mut code = false;
     let mut code_language = String::new();
-    let mut code_frame_indent = String::new();
-    let mut code_frame_width = width;
-    let body_lines = block.body.lines().collect::<Vec<_>>();
-    for (line_index, raw_line) in body_lines.iter().enumerate() {
+    for raw_line in block.body.lines() {
         let trimmed = raw_line.trim_start();
         if let Some(language) = trimmed.strip_prefix("```") {
-            let (prefix, prefix_tone) = if code {
-                (code_frame_indent.clone(), Tone::Muted)
-            } else {
-                body_prefix(&mut first_content, marker, tone, "  ", Tone::Muted)
-            };
-            let text = if code {
-                code_box_bottom(&prefix, code_frame_width)
-            } else {
-                let label = if language.trim().is_empty() {
-                    "code"
-                } else {
-                    language.trim()
-                };
-                code_frame_width = code_box_width(&prefix, label, &body_lines[line_index + 1..], width);
-                code_box_top(&prefix, label, code_frame_width)
-            };
-            lines.push(PaintLine {
-                prefix: prefix.clone(),
-                prefix_tone,
-                text,
-                tone: Tone::Muted,
-                bold: false,
-                tool_heading: None,
-                pick: None,
-                tail: Vec::new(),
-            });
             if code {
                 code_language.clear();
             } else {
                 code_language = language.trim().to_ascii_lowercase();
-                code_frame_indent = " ".repeat(UnicodeWidthStr::width(prefix.as_str()));
             }
             code = !code;
             continue;
@@ -4764,13 +4808,14 @@ fn block_lines_with_mode(
 
         if code {
             let (prefix, prefix_tone) =
-                body_prefix(&mut first_content, marker, tone, "  │ ", Tone::Muted);
-            lines.extend(boxed_code_lines(
+                body_prefix(&mut first_content, marker, tone, "  ", Tone::Muted);
+            lines.extend(styled_lines(
                 &prefix,
                 prefix_tone,
-                raw_line,
-                &code_language,
-                code_frame_width,
+                highlight_code(raw_line, &code_language),
+                Tone::Code,
+                false,
+                width,
             ));
         } else if force_diff {
             let (prefix, prefix_tone) =
@@ -4792,7 +4837,7 @@ fn block_lines_with_mode(
             .or_else(|| trimmed.strip_prefix("* "))
         {
             let (prefix, prefix_tone) =
-                body_prefix(&mut first_content, marker, tone, "  • ", Tone::Accent);
+                body_prefix(&mut first_content, marker, tone, "  • ", Tone::Plain);
             lines.extend(markdown_line(
                 &prefix,
                 prefix_tone,
@@ -4824,18 +4869,6 @@ fn block_lines_with_mode(
                 width,
             ));
         }
-    }
-    if code {
-        lines.push(PaintLine {
-            prefix: code_frame_indent.clone(),
-            prefix_tone: Tone::Muted,
-            text: code_box_bottom(&code_frame_indent, code_frame_width),
-            tone: Tone::Muted,
-            bold: false,
-            tool_heading: None,
-            pick: None,
-            tail: Vec::new(),
-        });
     }
     lines.push(PaintLine::blank());
     lines
@@ -4996,82 +5029,6 @@ fn line_suffix(target: &str) -> Option<String> {
         Some((_, middle)) if is_number(middle) => Some(format!(":{middle}:{tail}")),
         _ => Some(format!(":{tail}")),
     }
-}
-
-/// A fenced block closes around its label or widest code row, without growing
-/// past the terminal's available width.
-fn code_box_width(prefix: &str, label: &str, rows: &[&str], terminal_width: u16) -> u16 {
-    let widest_code = rows
-        .iter()
-        .take_while(|row| !row.trim_start().starts_with("```"))
-        .map(|row| UnicodeWidthStr::width(*row))
-        .max()
-        .unwrap_or(0);
-    let inner_width = (UnicodeWidthStr::width(label) + 5).max(widest_code + 4);
-    (UnicodeWidthStr::width(prefix) + inner_width)
-        .min(usize::from(terminal_width).saturating_sub(1))
-        .min(usize::from(u16::MAX)) as u16
-}
-
-fn code_box_top(prefix: &str, label: &str, width: u16) -> String {
-    let inner_width = usize::from(width).saturating_sub(UnicodeWidthStr::width(prefix));
-    let label = compact_right(label, inner_width.saturating_sub(5));
-    let used = 5 + UnicodeWidthStr::width(label.as_str());
-    format!("┌─ {label} {}┐", "─".repeat(inner_width.saturating_sub(used)))
-}
-
-fn code_box_bottom(prefix: &str, width: u16) -> String {
-    let inner_width = usize::from(width).saturating_sub(UnicodeWidthStr::width(prefix));
-    format!("└{}┘", "─".repeat(inner_width.saturating_sub(2)))
-}
-
-/// Code rows reserve their last cell for the closing rule, then pad their
-/// highlighted contents to it. Continuations keep the left rule instead of
-/// drifting into the assistant gutter.
-fn boxed_code_lines(
-    prefix: &str,
-    prefix_tone: Tone,
-    text: &str,
-    language: &str,
-    width: u16,
-) -> Vec<PaintLine> {
-    let content_width = width.saturating_sub(1);
-    let mut lines = if matches!(language, "diff" | "patch") {
-        diff_line(prefix, prefix_tone, text, content_width)
-    } else {
-        styled_lines(
-            prefix,
-            prefix_tone,
-            highlight_code(text, language),
-            Tone::Code,
-            false,
-            content_width,
-        )
-    };
-    let continuation = format!(
-        "{}│ ",
-        " ".repeat(UnicodeWidthStr::width(prefix).saturating_sub(2))
-    );
-    for (index, line) in lines.iter_mut().enumerate() {
-        if index > 0 {
-            line.prefix = continuation.clone();
-            line.prefix_tone = Tone::Muted;
-        }
-        let padding = usize::from(width).saturating_sub(painted_line_width(line) + 1);
-        if padding > 0 {
-            line.tail.push(PaintSpan {
-                text: " ".repeat(padding),
-                tone: Tone::Code,
-                bold: false,
-            });
-        }
-        line.tail.push(PaintSpan {
-            text: "│".to_owned(),
-            tone: Tone::Muted,
-            bold: false,
-        });
-    }
-    lines
 }
 
 fn styled_lines(
@@ -5550,7 +5507,7 @@ fn copy_joins_next(line: &PaintLine) -> bool {
 /// frame a block rather than mark one, and trimming them would leave the copied
 /// card missing only its top-left edge.
 const COPY_MARKERS: [&str; 9] = [
-    "● ", "• ", "  • ", "✻ ", "∴ ", "▲ ", "✕ ", "◆ ", "❯ ",
+    "> ", "● ", "• ", "✻ ", "∴ ", "▲ ", "✕ ", "◆ ", "❯ ",
 ];
 
 fn is_copy_marker(prefix: &str) -> bool {
@@ -6115,6 +6072,7 @@ fn rule_gap(width: usize) -> PaintSpan {
     }
 }
 
+#[allow(dead_code)]
 fn mode_accent_tone(accent: ModeAccent) -> Tone {
     match accent {
         ModeAccent::Calm => Tone::Muted,
@@ -6172,6 +6130,7 @@ fn print_line(out: &mut impl Write, line: &PaintLine) -> Result<()> {
 
 /// Paints over a transcript row after it was drawn, preserving the surrounding
 /// text while the control occupies only its own centred button cells.
+#[allow(dead_code)]
 fn paint_scroll_to_bottom_overlay(
     out: &mut impl Write,
     row: usize,
@@ -6271,6 +6230,7 @@ fn print_hovered_chunks(
 /// The cells that have to be redrawn when a hover moves. Keeping disjoint
 /// badges separate avoids clearing the controls between them, which was visible
 /// as a blink while crossing the composer rule.
+#[allow(dead_code)]
 fn hover_repaint_columns(
     previously_hovered: Option<Range<usize>>,
     hovered: Option<Range<usize>>,
@@ -6404,6 +6364,7 @@ fn print_line_with_selection_bounded(
 /// Repaints just `columns` of an otherwise unchanged row. This is used for a
 /// hover transition, where clearing and rewriting the entire composer rule
 /// makes every neighbouring badge visibly blink.
+#[allow(dead_code)]
 fn print_line_columns(
     out: &mut impl Write,
     line: &PaintLine,
@@ -6455,6 +6416,7 @@ fn print_line_columns(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn print_line_columns_piece(
     out: &mut impl Write,
     text: &str,
@@ -7241,7 +7203,7 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_selection_excludes_every_bullet_gutter() {
+    fn fullscreen_selection_keeps_indented_bullet_markers() {
         let plan = block_lines(&Block::new(BlockKind::Plan, "Plan", "- first"), 80)
             .into_iter()
             .find(|line| line.prefix == "• ")
@@ -7264,7 +7226,58 @@ mod tests {
         );
         assert_eq!(
             selection_columns_for_line(&list, full_row(&list, 0), 0),
-            Some(4..painted_line_width(&list))
+            Some(2..painted_line_width(&list))
+        );
+        let deeper = wrapped_line("    • ", Tone::Accent, "second", Tone::Plain, false, 80)
+            .remove(0);
+        assert_eq!(
+            selection_columns_for_line(&deeper, full_row(&deeper, 0), 0),
+            Some(4..painted_line_width(&deeper))
+        );
+    }
+
+    #[test]
+    fn fullscreen_selection_copies_unframed_code_and_indented_bullets() {
+        let lines = block_lines(
+            &Block::new(
+                BlockKind::Assistant,
+                "Codex",
+                "```powershell\ndvz-debug\n```\n  - 실행 대상",
+            ),
+            80,
+        );
+        let code = lines
+            .iter()
+            .find(|line| line.text == "dvz-debug")
+            .expect("unframed code row");
+        let bullet = lines
+            .iter()
+            .find(|line| line.prefix == "  • ")
+            .expect("indented bullet");
+        let full_row = |line: &PaintLine, row| CellRange {
+            start: CellPosition { column: 0, row },
+            end: CellPosition {
+                column: painted_line_width(line).saturating_sub(1) as u16,
+                row,
+            },
+        };
+
+        assert_eq!(
+            selection_columns_for_line(code, full_row(code, 0), 0),
+            Some(UnicodeWidthStr::width(code.prefix.as_str())..painted_line_width(code))
+        );
+        assert_eq!(
+            selection_columns_for_line(bullet, full_row(bullet, 0), 0),
+            Some(2..painted_line_width(bullet))
+        );
+
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = vec![bullet.clone()];
+        assert!(renderer.begin_selection(0, 0));
+        assert!(renderer.update_selection(painted_line_width(bullet).saturating_sub(1) as u16, 0));
+        assert_eq!(
+            renderer.finish_selection(painted_line_width(bullet).saturating_sub(1) as u16, 0),
+            SelectionResult::Copy("• 실행 대상".to_owned())
         );
     }
 
@@ -7680,7 +7693,7 @@ mod tests {
     }
 
     #[test]
-    fn powershell_code_block_closes_at_its_longest_line() {
+    fn powershell_code_block_renders_without_a_frame() {
         let lines = block_lines(
             &Block::new(
                 BlockKind::Assistant,
@@ -7691,18 +7704,8 @@ mod tests {
         );
         let rendered = lines.iter().map(painted).collect::<Vec<_>>();
 
-        assert_eq!(
-            rendered[0],
-            format!("● ┌─ powershell {}┐", "─".repeat(8))
-        );
-        assert_eq!(
-            rendered[1],
-            "  │ cargo run --release │"
-        );
-        assert_eq!(rendered[2], format!("  └{}┘", "─".repeat(21)));
-        assert!(rendered[..3]
-            .iter()
-                .all(|line| UnicodeWidthStr::width(line.as_str()) == 25));
+        assert_eq!(rendered[0], "> cargo run --release");
+        assert!(rendered.iter().all(|line| !line.contains(['┌', '┐', '└', '┘', '│'])));
     }
 
     /// The gutter is what makes a patch readable: `@@` headers are spent on line
@@ -8016,7 +8019,7 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
-                composer_notice: Some("Copied to clipboard".to_owned()),
+                composer_notice: Some("• Copied to clipboard".to_owned()),
                 composer_mode: None,
             },
             80,
@@ -8028,7 +8031,7 @@ mod tests {
             .position(|line| {
                 line.tail
                     .iter()
-                    .any(|span| span.text == "Copied to clipboard")
+                    .any(|span| span.text == "• Copied to clipboard")
             })
             .expect("notice row");
         assert_eq!(
@@ -8059,7 +8062,7 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
-                composer_notice: Some("Copied to clipboard".to_owned()),
+                composer_notice: Some("• Copied to clipboard".to_owned()),
                 composer_mode: None,
             },
             80,
@@ -8071,12 +8074,12 @@ mod tests {
             .find(|line| {
                 line.tail
                     .iter()
-                    .any(|span| span.text == "Copied to clipboard")
+                    .any(|span| span.text == "• Copied to clipboard")
             })
             .expect("notice row");
         assert_eq!(
             painted(notice),
-            format!("╰{}  Copied to clipboard ─╯", "─".repeat(54))
+            format!("╰{}  • Copied to clipboard ─╯", "─".repeat(52))
         );
     }
 
@@ -8171,7 +8174,7 @@ mod tests {
         let with_block = vec![Block::new(BlockKind::Assistant, "Codex", "done")];
         for live in [&[][..], &with_block[..]] {
             let bare = frame(live, None);
-            let noticed = frame(live, Some("Copied to clipboard"));
+            let noticed = frame(live, Some("• Copied to clipboard"));
 
             assert_eq!(
                 noticed.lines.len(),
@@ -8392,11 +8395,12 @@ mod tests {
 
     #[test]
     fn copy_notice_activity_uses_plain_text() {
-        let line = activity_lines("Copied to clipboard", None, 0.5, 80)
+        let line = activity_lines("• Copied to clipboard", None, 0.5, 80)
             .pop()
             .expect("copy notice row");
 
         assert_eq!(line.tone, Tone::Plain);
+        assert_eq!(line.text, "• ");
     }
 
     /// A row too narrow for the whole line wraps plainly rather than shimmering
@@ -8455,6 +8459,29 @@ mod tests {
             Some(Tone::ModelTerra)
         );
         assert_eq!(rows.last().map(|line| line.tone), Some(Tone::ModelTerra));
+    }
+
+    #[test]
+    fn queue_preview_is_one_line_and_truncates_the_prompt() {
+        let line = queue_preview_line("a very long queued prompt", 0, 18);
+
+        assert_eq!(painted(&line), " X Queue: a very…");
+        assert_eq!(pick_on(&line, "X"), Some(Pick::RemoveQueuedPrompt(0)));
+    }
+
+    #[test]
+    fn queue_preview_shows_every_prompt_in_fifo_order() {
+        let prompts = ["first", "second", "third", "fourth"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let lines = queue_preview_lines(&prompts, 80);
+
+        assert_eq!(
+            lines.iter().map(painted).collect::<Vec<_>>(),
+            [" X Queue: first", " X Queue: second", " X Queue: third", " X Queue: fourth"]
+        );
+        assert_eq!(pick_on(&lines[3], "X"), Some(Pick::RemoveQueuedPrompt(3)));
     }
 
     #[test]
@@ -8859,26 +8886,31 @@ mod tests {
         assert!(user_lines[1].prefix_tone == Tone::Plain);
         assert!(user_lines[1].tone == Tone::UserPrompt);
         assert!(user_lines[1].bold);
-        assert_eq!(assistant_lines[0].prefix, "● ");
-        assert_eq!(assistant_lines[0].prefix_tone, Tone::Accent);
+        assert_eq!(assistant_lines[0].prefix, "> ");
+        assert_eq!(assistant_lines[0].prefix_tone, Tone::FastOff);
         assert_eq!(assistant_lines[0].text, "hi");
         assert!(user_lines.iter().all(|line| line.text != "You"));
         assert!(assistant_lines.iter().all(|line| line.text != "Codex"));
     }
 
     #[test]
-    fn every_circular_transcript_gutter_uses_the_theme_accent() {
-        for block in [
-            Block::new(BlockKind::Assistant, "Codex", "answer"),
-            Block::new(BlockKind::Tool, "Shell", "output"),
-            Block::new(BlockKind::FileChange, "Update(src/main.rs)", "Added 1 · Removed 0"),
-            Block::new(BlockKind::Diff, "Diff", "changed"),
+    fn transcript_gutters_use_the_theme_accent() {
+        // The assistant gutter is the one exception: it reads as chevron chrome
+        // rather than an accent bullet.
+        for (block, tone) in [
+            (Block::new(BlockKind::Assistant, "Codex", "answer"), Tone::FastOff),
+            (Block::new(BlockKind::Tool, "Shell", "output"), Tone::Accent),
+            (
+                Block::new(BlockKind::FileChange, "Update(src/main.rs)", "Added 1 · Removed 0"),
+                Tone::Accent,
+            ),
+            (Block::new(BlockKind::Diff, "Diff", "changed"), Tone::Accent),
         ] {
             let line = block_lines(&block, 80)
                 .into_iter()
-                .find(|line| line.prefix == "● ")
-                .expect("circular gutter");
-            assert_eq!(line.prefix_tone, Tone::Accent);
+                .find(|line| matches!(line.prefix.as_str(), "> " | "● "))
+                .expect("transcript gutter");
+            assert_eq!(line.prefix_tone, tone);
         }
     }
 

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Session rollout files hold what `thread/resume` leaves out — shell runs above
 //! all. This module reads one rollout into timestamped events so the transcript
 //! can be rebuilt with those runs back in place.

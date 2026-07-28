@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env, fs,
     ops::Range,
     path::{Path, PathBuf},
@@ -192,6 +192,7 @@ impl StatusLineSettings {
 }
 
 impl DiffDisplayMode {
+    #[allow(dead_code)]
     fn from_config_value(value: &str) -> Option<Self> {
         match value
             .trim()
@@ -232,6 +233,7 @@ impl DiffDisplayMode {
 }
 
 impl ShellDisplayMode {
+    #[allow(dead_code)]
     fn from_config_value(value: &str) -> Option<Self> {
         match value
             .trim()
@@ -709,6 +711,7 @@ pub enum Action {
     Compact,
     ScrollToBottom,
     Copy(String),
+    #[allow(dead_code)]
     ShowDiff,
     /// Fetch MCP server status and open the picker. Any notice is carried over
     /// so the result of the action that reopened it stays on screen.
@@ -2357,12 +2360,14 @@ impl SessionPicker {
 pub struct AppState {
     pub editor: Editor,
     composer_images: Vec<String>,
+    queued_prompts: VecDeque<String>,
     pub thread_id: String,
     pub turn_id: Option<String>,
     /// Set when the user interrupts after `turn/start` answers but before the
     /// app-server has announced that the turn is active.
     pending_interrupt: bool,
     turn_interrupted: bool,
+    quit_armed: bool,
     pub busy: bool,
     pub cwd: String,
     account: String,
@@ -2491,10 +2496,12 @@ impl AppState {
         Self {
             editor: Editor::default(),
             composer_images: Vec::new(),
+            queued_prompts: VecDeque::new(),
             thread_id,
             turn_id: None,
             pending_interrupt: false,
             turn_interrupted: false,
+            quit_armed: false,
             busy: false,
             cwd,
             account,
@@ -2818,6 +2825,7 @@ impl AppState {
         }
     }
 
+    #[allow(dead_code)]
     pub fn composer_image_count(&self) -> usize {
         self.composer_images.len()
     }
@@ -3077,7 +3085,11 @@ impl AppState {
     }
 
     pub fn set_copy_notice(&mut self) {
-        self.activity_notice = Some(("Copied to clipboard".to_owned(), Instant::now()));
+        self.activity_notice = Some(("• Copied to clipboard".to_owned(), Instant::now()));
+    }
+
+    fn set_quit_notice(&mut self) {
+        self.activity_notice = Some(("• Ctrl+C 한 번 더 누르면 종료합니다.".to_owned(), Instant::now()));
     }
 
     /// One-off events (skills reloaded, model rerouted, …) share the composer
@@ -3512,6 +3524,12 @@ impl AppState {
             plan_active: self.busy,
             editor: &self.editor,
             composer_images: &self.composer_images,
+            queued_prompts: self.queued_prompts.iter().cloned().collect(),
+            composer_placeholder: if self.busy {
+                "Enter: steer current prompt · Tab: queue next prompt"
+            } else {
+                ""
+            },
             welcome: self.show_welcome.then(|| self.welcome_view()),
             suggestions: if self.pending.is_none() {
                 self.completion_suggestion_views()
@@ -3612,6 +3630,11 @@ impl AppState {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
+        if !(key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            self.quit_armed = false;
+        }
         let old_text = self.editor.text();
         let binding_count = self.selected_completion_bindings.len();
         let action = self.handle_key_inner(key);
@@ -3792,14 +3815,26 @@ impl AppState {
             KeyCode::BackTab => Action::None,
             KeyCode::Char('c') if ctrl => {
                 if self.busy {
-                    self.request_interrupt()
+                    if self.quit_armed {
+                        Action::Quit
+                    } else {
+                        self.quit_armed = true;
+                        self.set_quit_notice();
+                        self.request_interrupt()
+                    }
                 } else if self.editor.is_empty()
                     && self.composer_images.is_empty()
                     && self.side_parent.is_some()
                 {
                     Action::ReturnFromSide
                 } else if self.editor.is_empty() && self.composer_images.is_empty() {
-                    Action::Quit
+                    if self.quit_armed {
+                        Action::Quit
+                    } else {
+                        self.quit_armed = true;
+                        self.set_quit_notice();
+                        Action::None
+                    }
                 } else {
                     self.editor.clear();
                     self.composer_images.clear();
@@ -3859,6 +3894,7 @@ impl AppState {
                 self.editor.newline();
                 Action::None
             }
+            KeyCode::Tab if self.busy => self.queue_editor(),
             KeyCode::Enter => self.submit_editor(),
             KeyCode::Esc if self.busy => self.request_interrupt(),
             code if (code == KeyCode::Backspace && ctrl) || code == KeyCode::Char('\u{8}') => {
@@ -4432,6 +4468,35 @@ impl AppState {
 
     fn submit_editor(&mut self) -> Action {
         let text = self.editor.take_for_submit().unwrap_or_default();
+        self.submit_text(text)
+    }
+
+    pub fn start_queued_prompt(&mut self, text: String) -> Action {
+        self.submit_text(text)
+    }
+
+    pub fn take_queued_prompt(&mut self) -> Option<String> {
+        self.queued_prompts.pop_front()
+    }
+
+    pub fn remove_queued_prompt(&mut self, index: usize) -> bool {
+        self.queued_prompts.remove(index).is_some()
+    }
+
+    fn queue_editor(&mut self) -> Action {
+        if !self.composer_images.is_empty() {
+            self.set_composer_notice("이미지 첨부 메시지는 Enter로 전송해주세요.".to_owned());
+            return Action::None;
+        }
+        let text = self.editor.take_for_submit().unwrap_or_default();
+        if text.is_empty() {
+            return Action::None;
+        }
+        self.queued_prompts.push_back(text);
+        Action::None
+    }
+
+    fn submit_text(&mut self, text: String) -> Action {
         if text.is_empty() && self.composer_images.is_empty() {
             return Action::None;
         }
@@ -6385,6 +6450,7 @@ impl AppState {
         }
     }
 
+    #[allow(dead_code)]
     pub fn vibe_mode_label(&self) -> &'static str {
         self.vibe_mode.label()
     }
@@ -8153,6 +8219,7 @@ fn read_vibe_mode() -> VibeMode {
         .unwrap_or_default()
 }
 
+#[allow(dead_code)]
 fn read_response_length() -> ResponseLength {
     read_vibe_config_value("model_verbosity")
         .map(|value| match value.as_str() {
@@ -8172,6 +8239,7 @@ fn read_vibe_config_value(key: &str) -> Option<String> {
         }))
 }
 
+#[allow(dead_code)]
 fn read_shell_display_mode() -> ShellDisplayMode {
     codex_home()
         .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
@@ -8179,6 +8247,7 @@ fn read_shell_display_mode() -> ShellDisplayMode {
         .unwrap_or_default()
 }
 
+#[allow(dead_code)]
 fn read_diff_display_mode() -> DiffDisplayMode {
     codex_home()
         .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
@@ -8201,6 +8270,7 @@ fn read_status_line_settings() -> StatusLineSettings {
         .unwrap_or_default()
 }
 
+#[allow(dead_code)]
 fn parse_shell_display_mode(config: &str) -> Option<ShellDisplayMode> {
     config
         .lines()
@@ -8213,6 +8283,7 @@ fn parse_shell_display_mode(config: &str) -> Option<ShellDisplayMode> {
         .flatten()
 }
 
+#[allow(dead_code)]
 fn parse_diff_display_mode(config: &str) -> Option<DiffDisplayMode> {
     config
         .lines()
@@ -10585,7 +10656,7 @@ mod tests {
 
         state.set_copy_notice();
 
-        assert_eq!(state.activity().as_deref(), Some("Copied to clipboard"));
+        assert_eq!(state.activity().as_deref(), Some("• Copied to clipboard"));
         assert_eq!(state.view().composer_notice, None);
     }
 
@@ -10603,6 +10674,69 @@ mod tests {
         state.turn_id = Some("live-turn".to_owned());
         state.turn_started_at = Some(Instant::now());
         state
+    }
+
+    #[test]
+    fn busy_empty_composer_shows_steer_and_queue_hint() {
+        let state = busy_state_with_live_turn();
+
+        assert_eq!(
+            state.view().composer_placeholder,
+            "Enter: steer current prompt · Tab: queue next prompt"
+        );
+    }
+
+    #[test]
+    fn tab_during_a_turn_queues_the_composer_text() {
+        let mut state = busy_state_with_live_turn();
+        state.editor.set_text("next prompt");
+
+        let action = state.handle_key(KeyEvent::from(KeyCode::Tab));
+
+        assert!(matches!(action, Action::None));
+        assert!(state.editor.is_empty());
+        assert_eq!(state.queued_prompts.front().map(String::as_str), Some("next prompt"));
+    }
+
+    #[test]
+    fn queued_prompt_starts_after_the_active_turn_completes() {
+        let mut state = busy_state_with_live_turn();
+        state.busy = false;
+        state.turn_id = None;
+
+        let action = state.start_queued_prompt("next prompt".to_owned());
+
+        assert!(matches!(action, Action::Submit(text) if text == "next prompt"));
+        assert!(state.busy);
+    }
+
+    #[test]
+    fn queued_prompt_can_be_removed_by_its_display_index() {
+        let mut state = busy_state_with_live_turn();
+        state.queued_prompts = ["first", "second", "third"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+
+        assert!(state.remove_queued_prompt(1));
+        assert_eq!(
+            state.queued_prompts.into_iter().collect::<Vec<_>>(),
+            ["first", "third"]
+        );
+    }
+
+    #[test]
+    fn ctrl_c_interrupts_then_quits_an_active_turn() {
+        let mut state = test_state();
+        state.set_turn_started("turn-1".to_owned());
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        assert!(matches!(state.handle_key(ctrl_c), Action::Interrupt));
+        assert_eq!(
+            state.activity().as_deref(),
+            Some("• Ctrl+C 한 번 더 누르면 종료합니다.")
+        );
+        assert!(matches!(state.handle_key(ctrl_c), Action::Quit));
     }
 
     #[test]

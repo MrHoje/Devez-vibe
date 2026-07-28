@@ -121,12 +121,16 @@ pub struct ThemePalette {
     pub accent: Rgb,
     pub blue: Rgb,
     /// Desaturated sky blue reserved for the GPT-5.5 model family.
+    #[allow(dead_code)]
     pub sky_blue: Rgb,
     pub success: Rgb,
     pub warning: Rgb,
     pub error: Rgb,
+    #[allow(dead_code)]
     pub purple: Rgb,
+    #[allow(dead_code)]
     pub pink: Rgb,
+    #[allow(dead_code)]
     pub orange: Rgb,
     pub model_gpt56: Rgb,
     pub model_gpt55: Rgb,
@@ -173,6 +177,7 @@ pub struct StatusLinePalette {
     pub separator: Rgb,
     pub branch: Rgb,
     /// The `ctx:` segment (`CTX`).
+    #[allow(dead_code)]
     pub context: Rgb,
     pub effort_low: Rgb,
     pub effort_medium: Rgb,

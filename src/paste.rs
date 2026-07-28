@@ -176,6 +176,7 @@ impl PasteBurst {
         }
     }
 
+    #[cfg(test)]
     pub fn is_active(&self) -> bool {
         !self.disabled && self.run >= MIN_RUN
     }

@@ -516,6 +516,8 @@ async fn choose_startup_session(
                 plan_active: false,
                 editor: &editor,
                 composer_images: &[],
+                queued_prompts: Vec::new(),
+                composer_placeholder: "",
                 welcome: None,
                 suggestions: Vec::new(),
                 activity: None,
@@ -551,7 +553,7 @@ async fn choose_startup_session(
                 if let Action::Copy(text) = action {
                     composer_notice = Some(
                         match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(&text)) {
-                            Ok(()) => "Copied to clipboard".to_owned(),
+                            Ok(()) => "• Copied to clipboard".to_owned(),
                             Err(error) => format!("복사 실패: {error}"),
                         },
                     );
@@ -603,7 +605,7 @@ async fn event_loop(
     let mut composer_paste = ComposerPasteBuffer::new();
     let mut paste_tick = tokio::time::interval(Duration::from_millis(5));
     paste_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut activity_tick = tokio::time::interval(Duration::from_millis(16));
+    let mut activity_tick = tokio::time::interval(Duration::from_millis(80));
     activity_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut resize = ResizeTracker::new();
     let (workspace_tx, mut workspace_rx) = mpsc::channel(1);
@@ -664,6 +666,29 @@ async fn event_loop(
             terminal_event = terminal_events.next() => {
                 match terminal_event {
                     Some(Ok(Event::Key(key))) => {
+                        if key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            if let Some(text) = renderer.selected_text() {
+                                renderer.clear_selection();
+                                Action::Copy(text)
+                            } else {
+                                // Typing means the drag is over and its highlight is
+                                // stale, so it goes before the key is acted on.
+                                let cleared = renderer.clear_selection();
+                                let action = observe_composer_key_with_scroll(
+                                    state,
+                                    renderer,
+                                    &mut composer_paste,
+                                    key,
+                                    Instant::now(),
+                                );
+                                match action {
+                                    Action::Tick(false) if cleared => Action::Tick(true),
+                                    action => action,
+                                }
+                            }
+                        } else {
                         // Typing means the drag is over and its highlight is
                         // stale, so it goes before the key is acted on.
                         let cleared = renderer.clear_selection();
@@ -677,6 +702,7 @@ async fn event_loop(
                         match action {
                             Action::Tick(false) if cleared => Action::Tick(true),
                             action => action,
+                        }
                         }
                     }
                     Some(Ok(Event::Mouse(mouse))) => renderer_mouse_action(renderer, &mouse, |pick| pick_action(state, pick)),
@@ -716,6 +742,11 @@ async fn event_loop(
                         }
                         if interrupt_after_start {
                             Action::Interrupt
+                        } else if method == "turn/completed" {
+                            state
+                                .take_queued_prompt()
+                                .map(|text| state.start_queued_prompt(text))
+                                .unwrap_or(Action::None)
                         } else if method == "skills/changed" {
                             Action::RefreshSkills
                         } else {
@@ -909,6 +940,10 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
         }
         Pick::PlanSummary => {
             state.toggle_plan_summary();
+            Action::Tick(true)
+        }
+        Pick::RemoveQueuedPrompt(index) => {
+            state.remove_queued_prompt(index);
             Action::Tick(true)
         }
         Pick::FastMode => Action::SetFast(!state.effective_fast_mode()),
@@ -3881,11 +3916,13 @@ mod tests {
 
         assert_eq!(queued, None);
         assert!(!state.busy);
+        // The first Ctrl+C interrupts and arms the quit, so its notice takes the
+        // activity slot ahead of the interrupted label.
         assert!(
             state
                 .view()
                 .activity
-                .is_some_and(|activity| activity.starts_with("✕ Interrupted ("))
+                .is_some_and(|activity| activity.contains("Ctrl+C"))
         );
     }
 
