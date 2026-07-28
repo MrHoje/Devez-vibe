@@ -306,7 +306,7 @@ struct SlashCommand {
     takes_argument: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 27] = [
+const SLASH_COMMANDS: [SlashCommand; 28] = [
     SlashCommand {
         name: "/model",
         description: "Switch model and reasoning",
@@ -341,6 +341,11 @@ const SLASH_COMMANDS: [SlashCommand; 27] = [
         name: "/mcp",
         description: "Browse MCP servers, reconnect, or sign in",
         takes_argument: true,
+    },
+    SlashCommand {
+        name: "/connect",
+        description: "Connect an OpenCode provider",
+        takes_argument: false,
     },
     SlashCommand {
         name: "/plugins",
@@ -12399,6 +12404,19 @@ mod tests {
                 .suggestions
                 .iter()
                 .all(|suggestion| !matches!(suggestion.category.as_deref(), Some("File" | "Dir")))
+        );
+    }
+
+    #[test]
+    fn connect_is_visible_in_slash_command_suggestions() {
+        let mut state = test_state();
+        state.editor.insert_str("/con");
+
+        assert!(
+            state
+                .matching_slash_commands()
+                .iter()
+                .any(|command| command.name == "/connect")
         );
     }
 
