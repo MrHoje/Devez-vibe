@@ -943,6 +943,10 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
             state.toggle_plan_summary();
             Action::Tick(true)
         }
+        Pick::ToggleWelcomeCredits => {
+            state.toggle_welcome_credits();
+            Action::Tick(true)
+        }
         Pick::RemoveQueuedPrompt(index) => {
             state.remove_queued_prompt(index);
             Action::Tick(true)

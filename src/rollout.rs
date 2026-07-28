@@ -5,6 +5,7 @@
 //! can be rebuilt with those runs back in place.
 
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
@@ -54,7 +55,13 @@ pub struct Rollout {
 /// Most recent `update_plan` payload recorded for a session.
 pub struct PlanSnapshot {
     pub explanation: Option<String>,
-    pub steps: Vec<(String, String)>,
+    pub steps: Vec<PlanStepSnapshot>,
+}
+
+pub struct PlanStepSnapshot {
+    pub text: String,
+    pub status: String,
+    pub elapsed_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -179,6 +186,8 @@ fn find_rollout(root: &Path, thread_id: &str) -> Option<PathBuf> {
 pub fn parse(text: &str) -> Rollout {
     let mut events = Vec::new();
     let mut last_plan = None;
+    let mut plan_started_at = HashMap::new();
+    let mut plan_elapsed = HashMap::new();
     // Exec calls whose output has not arrived yet: `call_id` → the indices in
     // `events` its output segments fill in, in the order the script's calls
     // ran (a script can run more than one `shell_command` per turn).
@@ -213,7 +222,15 @@ pub fn parse(text: &str) -> Rollout {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if let Some(plan) = plan_snapshot(input) {
-                    last_plan = Some(plan);
+                    let timestamp = chrono::DateTime::parse_from_rfc3339(&ts)
+                        .ok()
+                        .and_then(|time| u64::try_from(time.timestamp_millis()).ok());
+                    last_plan = Some(with_plan_elapsed(
+                        plan,
+                        timestamp,
+                        &mut plan_started_at,
+                        &mut plan_elapsed,
+                    ));
                     continue;
                 }
                 let commands = shell_commands(input);
@@ -346,9 +363,33 @@ fn plan_snapshot(input: &str) -> Option<PlanSnapshot> {
         let step = js_string(item)?;
         let status_at = item.find("status:")? + "status:".len();
         let status = js_string(&item[status_at..])?;
-        steps.push((step, status));
+        steps.push(PlanStepSnapshot { text: step, status, elapsed_ms: None });
     }
     (!steps.is_empty()).then_some(PlanSnapshot { explanation: None, steps })
+}
+
+fn with_plan_elapsed(
+    mut plan: PlanSnapshot,
+    timestamp: Option<u64>,
+    started_at: &mut HashMap<String, u64>,
+    elapsed: &mut HashMap<String, u64>,
+) -> PlanSnapshot {
+    for step in &mut plan.steps {
+        match (step.status.as_str(), timestamp) {
+            ("in_progress", Some(now)) => {
+                started_at.entry(step.text.clone()).or_insert(now);
+            }
+            ("completed", Some(now)) => {
+                let duration = started_at.remove(&step.text).map(|started| now.saturating_sub(started)).unwrap_or(0);
+                elapsed.insert(step.text.clone(), duration);
+            }
+            _ => {}
+        }
+        step.elapsed_ms = elapsed.get(&step.text).copied().or_else(|| {
+            timestamp.and_then(|now| started_at.get(&step.text).map(|started| now.saturating_sub(*started)))
+        });
+    }
+    plan
 }
 
 fn js_string(input: &str) -> Option<String> {
@@ -798,13 +839,16 @@ mod tests {
     #[test]
     fn update_plan_call_keeps_the_latest_plan_snapshot() {
         let rollout = parse(
-            r#"{"timestamp":"2026-07-28T02:09:06.167Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const r = await tools.update_plan({plan:[{step:\"확인\",status:\"completed\"},{step:\"수정\",status:\"in_progress\"}]});"}}"#,
+            r#"{"timestamp":"2026-07-28T02:09:00.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const r = await tools.update_plan({plan:[{step:\"확인\",status:\"in_progress\"},{step:\"수정\",status:\"pending\"}]});"}}
+{"timestamp":"2026-07-28T02:09:06.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const r = await tools.update_plan({plan:[{step:\"확인\",status:\"completed\"},{step:\"수정\",status:\"in_progress\"}]});"}}"#,
         );
 
-        assert_eq!(
-            rollout.last_plan.as_ref().map(|plan| plan.steps.as_slice()),
-            Some(&[("확인".to_owned(), "completed".to_owned()), ("수정".to_owned(), "in_progress".to_owned())][..])
-        );
+        let plan = rollout.last_plan.expect("plan snapshot");
+        assert_eq!(plan.steps[0].text, "확인");
+        assert_eq!(plan.steps[0].status, "completed");
+        assert_eq!(plan.steps[0].elapsed_ms, Some(6_000));
+        assert_eq!(plan.steps[1].text, "수정");
+        assert_eq!(plan.steps[1].status, "in_progress");
     }
 
     #[test]

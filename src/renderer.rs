@@ -209,6 +209,7 @@ pub struct WelcomeView {
     pub plan: String,
     /// Reset-credit rows: a summary first, then one line per credit.
     pub credits: Vec<String>,
+    pub credits_expanded: bool,
     pub cwd: String,
     pub account: String,
 }
@@ -2080,6 +2081,7 @@ pub enum Pick {
     ShellDisplayMode,
     DiffDisplayMode,
     PlanSummary,
+    ToggleWelcomeCredits,
     /// The `Fast: On`/`Fast: Off` badge: toggles the fast service tier.
     FastMode,
     /// The status line's model name: opens `/model`.
@@ -2550,6 +2552,9 @@ fn selection_columns_for_line(
     range: CellRange,
     row: usize,
 ) -> Option<Range<usize>> {
+    if line.tone == Tone::UserPromptHalf {
+        return None;
+    }
     let mut selected = range.columns_for_row(row, painted_line_width(line))?;
     if let Some(content) = selectable_content_columns(line) {
         selected.start = selected.start.max(content.start);
@@ -2745,10 +2750,9 @@ fn welcome_lines(welcome: WelcomeView, width: u16) -> Vec<PaintLine> {
 
     if inner_width < WELCOME_SPLIT_MIN {
         let mut lines = vec![panel_top(inner_width)];
-        lines.extend(
-            left.into_iter()
-                .map(|(text, tone, bold)| panel_line(&text, panel_width, tone, bold)),
-        );
+        lines.extend(left.into_iter().map(|(text, tone, bold)| {
+            welcome_reset_pick(panel_line(&text, panel_width, tone, bold))
+        }));
         lines.push(panel_bottom(inner_width));
         return lines;
     }
@@ -2771,12 +2775,12 @@ fn welcome_lines(welcome: WelcomeView, width: u16) -> Vec<PaintLine> {
         tail: Vec::new(),
     }];
     for row in 0..left.len().max(right.len()) {
-        lines.push(split_panel_line(
+        lines.push(welcome_reset_pick(split_panel_line(
             left.get(row),
             left_width,
             right.get(row),
             right_width,
-        ));
+        )));
     }
     lines.push(PaintLine {
         prefix: String::new(),
@@ -2812,12 +2816,15 @@ fn welcome_info_rows(welcome: &WelcomeView, column_width: usize) -> Vec<PanelRow
 
     // First credit row sits beside the label; the rest hang under the value column.
     let mut credits = welcome.credits.iter();
+    let summary = credits.next().map_or("—", String::as_str);
+    let icon = if welcome.credits_expanded { "⌃" } else { "⌄" };
+    let reset = format!("  Resets   {summary}  {icon}");
     rows.push((
-        format!("  Resets   {}", credits.next().map_or("—", String::as_str)),
+        reset,
         Tone::Plain,
         false,
     ));
-    rows.extend(credits.map(|line| {
+    rows.extend(welcome.credits_expanded.then_some(credits).into_iter().flatten().map(|line| {
         (
             format!("{}{line}", " ".repeat(WELCOME_LABEL_WIDTH)),
             Tone::Muted,
@@ -2846,6 +2853,14 @@ fn welcome_info_rows(welcome: &WelcomeView, column_width: usize) -> Vec<PanelRow
         ("  /help commands".to_owned(), Tone::Muted, false),
     ]);
     rows
+}
+
+fn welcome_reset_pick(mut line: PaintLine) -> PaintLine {
+    if line.text.contains("Resets") {
+        let width = painted_line_width(&line);
+        line.pick = Some(PickRegions::span(0, width, Pick::ToggleWelcomeCredits));
+    }
+    line
 }
 
 /// Release notes, wrapped to the column so long lines fold instead of truncating.
@@ -4573,20 +4588,14 @@ fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_
     let hidden = steps.len().saturating_sub(4);
     let visible = if summary.expanded { steps.len() } else { 4 };
     for step in steps.into_iter().take(visible) {
-        if step.status == PlanStepStatus::Pending {
-            lines.push(PaintLine::blank());
-            continue;
-        }
         let (prefix, bold) = match step.status {
             PlanStepStatus::Completed => ("  ✔  ".to_owned(), false),
             PlanStepStatus::InProgress if plan_active => (format!("  {}  ", WORKING_SPINNER[(phase.clamp(0.0, 0.999) * WORKING_SPINNER.len() as f32) as usize]), true),
             PlanStepStatus::InProgress => ("  ▸  ".to_owned(), false),
-            PlanStepStatus::Pending => unreachable!("pending rows return above"),
+            PlanStepStatus::Pending => ("  □  ".to_owned(), false),
         };
         let elapsed_text = step.elapsed.map(format_plan_elapsed);
-        let elapsed = elapsed_text
-            .as_deref()
-            .filter(|_| step.status == PlanStepStatus::Completed);
+        let elapsed = elapsed_text.as_deref();
         let time_width = elapsed
             .map(|time| UnicodeWidthStr::width(time) + 3)
             .unwrap_or_default();
@@ -4770,6 +4779,7 @@ fn block_lines_with_mode(
         let mut lines = welcome_lines(
             WelcomeView {
                 plan: values.next().unwrap_or_default().to_owned(),
+                credits_expanded: false,
                 cwd: values.next().unwrap_or_default().to_owned(),
                 account: values.next().unwrap_or_default().to_owned(),
                 credits: values.map(ToOwned::to_owned).collect(),
@@ -4966,7 +4976,7 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
             Tone::Plain,
             "",
             Tone::UserPrompt,
-            true,
+            false,
             width,
         ));
         lines.push(PaintLine::user_prompt_half_padding(width, '▀'));
@@ -4979,7 +4989,7 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
             Tone::Plain,
             raw_line,
             Tone::UserPrompt,
-            true,
+            false,
             width,
         ));
     }
@@ -7456,11 +7466,13 @@ mod tests {
         assert!(lines[4] == PaintLine::blank());
 
         let selection = CellRange {
-            start: CellPosition { column: 0, row: 1 },
-            end: CellPosition { column: 8, row: 2 },
+            start: CellPosition { column: 0, row: 0 },
+            end: CellPosition { column: 8, row: 3 },
         };
         assert_eq!(selection_columns_for_line(&lines[0], selection, 0), None);
         assert_eq!(selection_columns_for_line(&lines[3], selection, 3), None);
+        assert_ne!(selection_columns_for_line(&lines[1], selection, 1), None);
+        assert_ne!(selection_columns_for_line(&lines[2], selection, 2), None);
     }
 
     #[test]
@@ -8979,7 +8991,7 @@ mod tests {
         assert_eq!(user_lines[1].text, "hello");
         assert!(user_lines[1].prefix_tone == Tone::Plain);
         assert!(user_lines[1].tone == Tone::UserPrompt);
-        assert!(user_lines[1].bold);
+        assert!(!user_lines[1].bold);
         assert_eq!(assistant_lines[0].prefix, "• ");
         assert_eq!(assistant_lines[0].prefix_tone, Tone::FastOff);
         assert_eq!(assistant_lines[0].text, "hi");
@@ -10283,9 +10295,27 @@ mod tests {
         WelcomeView {
             plan: "Pro Lite".to_owned(),
             credits: vec!["3 available".to_owned(), "· 2026-08-01  6d left".to_owned()],
+            credits_expanded: false,
             cwd: "C:/Source/DevezVibe".to_owned(),
             account: "dev@example.com".to_owned(),
         }
+    }
+
+    #[test]
+    fn welcome_reset_credits_expand_from_a_clickable_summary_row() {
+        let collapsed = welcome_lines(test_welcome(), 80);
+        assert!(collapsed.iter().all(|line| !painted(line).contains("2026-08-01")));
+        let reset = collapsed
+            .iter()
+            .find(|line| painted(line).contains("Resets"))
+            .expect("reset summary");
+        assert!(painted(reset).contains('⌄'));
+        assert_eq!(pick_on(reset, "Resets"), Some(Pick::ToggleWelcomeCredits));
+
+        let mut expanded = test_welcome();
+        expanded.credits_expanded = true;
+        let lines = welcome_lines(expanded, 80);
+        assert!(lines.iter().any(|line| painted(line).contains("2026-08-01")));
     }
 
     #[test]
@@ -10745,6 +10775,7 @@ mod tests {
     fn a_docked_picker_keeps_the_welcome_card_on_screen() {
         let welcome = WelcomeView {
             plan: "Pro".to_owned(),
+            credits_expanded: false,
             cwd: r"C:\Source\DevezVibe".to_owned(),
             account: "someone@example.com".to_owned(),
             credits: vec!["in 3h".to_owned()],
@@ -11556,7 +11587,7 @@ mod tests {
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
 
         assert_eq!(painted(&lines[2]), "  ✔  Task 1");
-        assert_eq!(painted(&lines[3]), "");
+        assert_eq!(painted(&lines[3]), "  □  Task 2");
         assert_eq!(painted(&lines[4]), "  ✔  Task 3");
         assert_eq!(lines[2].prefix_tone, Tone::Accent);
         assert_eq!(lines[2].tone, Tone::Plain);
@@ -11628,6 +11659,7 @@ mod tests {
             WelcomeView {
                 plan: "Pro".to_owned(),
                 credits: vec!["none available".to_owned()],
+                credits_expanded: false,
                 cwd: "C:\\work".to_owned(),
                 account: "ChatGPT".to_owned(),
             },

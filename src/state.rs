@@ -2434,6 +2434,7 @@ pub struct AppState {
     context_window: Option<u64>,
     transient_status: Option<String>,
     show_welcome: bool,
+    welcome_credits_expanded: bool,
     plan_summary: Option<PlanSummary>,
     command_selection: usize,
     spinner_frame: usize,
@@ -2557,6 +2558,7 @@ impl AppState {
             context_window,
             transient_status: None,
             show_welcome: true,
+            welcome_credits_expanded: false,
             plan_summary: None,
             command_selection: 0,
             spinner_frame: 0,
@@ -3278,15 +3280,15 @@ impl AppState {
             steps: plan
                 .steps
                 .iter()
-                .map(|(text, status)| PlanStep {
-                    text: text.clone(),
-                    status: if status == "completed" {
+                .map(|step| PlanStep {
+                    text: step.text.clone(),
+                    status: if step.status == "completed" {
                         PlanStepStatus::Completed
                     } else {
                         PlanStepStatus::Pending
                     },
                     started_at: None,
-                    elapsed: None,
+                    elapsed: step.elapsed_ms.map(Duration::from_millis),
                 })
                 .collect(),
             expanded: false,
@@ -3525,6 +3527,11 @@ impl AppState {
     /// terminal looks like a fresh start instead of a bare composer.
     pub fn reset_welcome(&mut self) {
         self.show_welcome = true;
+        self.welcome_credits_expanded = false;
+    }
+
+    pub fn toggle_welcome_credits(&mut self) {
+        self.welcome_credits_expanded = !self.welcome_credits_expanded;
     }
 
     pub fn drain_committed(&mut self) -> Vec<Block> {
@@ -6884,6 +6891,7 @@ impl AppState {
         WelcomeView {
             plan: self.account_plan.plan_display(),
             credits: self.account_plan.credit_lines(),
+            credits_expanded: self.welcome_credits_expanded,
             cwd: self.cwd.clone(),
             account: self.account.clone(),
         }
@@ -9513,14 +9521,15 @@ mod tests {
         state.restore_plan_snapshot(&PlanSnapshot {
             explanation: None,
             steps: vec![
-                ("완료 작업".to_owned(), "completed".to_owned()),
-                ("진행 중이던 작업".to_owned(), "in_progress".to_owned()),
+                crate::rollout::PlanStepSnapshot { text: "완료 작업".to_owned(), status: "completed".to_owned(), elapsed_ms: Some(1_000) },
+                crate::rollout::PlanStepSnapshot { text: "진행 중이던 작업".to_owned(), status: "in_progress".to_owned(), elapsed_ms: Some(2_000) },
             ],
         });
 
         let steps = &state.plan_summary.expect("restored plan").steps;
         assert_eq!(steps[0].status, PlanStepStatus::Completed);
         assert_eq!(steps[1].status, PlanStepStatus::Pending);
+        assert_eq!(steps[1].elapsed, Some(Duration::from_secs(2)));
     }
 
     #[test]
