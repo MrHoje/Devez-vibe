@@ -2866,7 +2866,7 @@ fn bubble_content_columns(line: &PaintLine) -> Range<usize> {
     if line.tone == Tone::UserPrompt && CHAT_LAYOUT.load(Ordering::Relaxed) {
         let prefix = UnicodeWidthStr::width(line.prefix.as_str());
         let end = prefix + UnicodeWidthStr::width(line.text.trim_end());
-        return (prefix + CHAT_BUBBLE_PADDING).min(end)..end;
+        return (prefix + CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP).min(end)..end;
     }
     let filler = line
         .tail
@@ -5247,7 +5247,9 @@ fn block_lines_with_mode(
     };
 
     let conversational = matches!(block.kind, BlockKind::Assistant);
-    let conversational_width = if conversational && CHAT_LAYOUT.load(Ordering::Relaxed) {
+    let chat_layout = conversational && CHAT_LAYOUT.load(Ordering::Relaxed);
+    let marker = if chat_layout { "  " } else { marker };
+    let conversational_width = if chat_layout {
         conversation_region_width(width)
             .saturating_add(1)
             .saturating_sub(CHAT_BUBBLE_RIGHT_GAP) as u16
@@ -5255,7 +5257,7 @@ fn block_lines_with_mode(
         width
     };
     let mut first_content = conversational;
-    let content_tone = if conversational && CHAT_LAYOUT.load(Ordering::Relaxed) {
+    let content_tone = if chat_layout {
         Tone::AssistantBubble
     } else {
         Tone::Plain
@@ -5269,7 +5271,7 @@ fn block_lines_with_mode(
         if conversational {
             lines.extend(wrapped_line(marker, tone, "", content_tone, false, conversational_width));
         }
-        let lines = if conversational && CHAT_LAYOUT.load(Ordering::Relaxed) {
+        let lines = if chat_layout {
             assistant_chat_bubble_lines(lines)
         } else {
             lines
@@ -5356,7 +5358,7 @@ fn block_lines_with_mode(
             ));
         }
     }
-    let lines = if conversational && CHAT_LAYOUT.load(Ordering::Relaxed) {
+    let lines = if chat_layout {
         assistant_chat_bubble_lines(lines)
     } else {
         lines.push(PaintLine::blank());
@@ -5421,12 +5423,12 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         lines.push(PaintLine::user_prompt_half_padding(half_width, '▀'));
         return lines;
     }
-    const RIGHT_GAP: usize = 2;
+    const RIGHT_GAP: usize = 0;
 
     let region_width = conversation_region_width(width);
     let left_margin = usize::from(width).saturating_sub(1).saturating_sub(region_width);
     let content_width = region_width.saturating_sub(
-        RIGHT_GAP + CHAT_BUBBLE_PADDING * 2 + CHAT_BUBBLE_RIGHT_GAP,
+        RIGHT_GAP + (CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP) * 2,
     );
     let raw_lines = if block.body.is_empty() {
         vec![""]
@@ -5449,7 +5451,7 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     for line in &mut lines {
         line.text = format!(
             "{}{}{}",
-            " ".repeat(CHAT_BUBBLE_PADDING),
+            " ".repeat(CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP),
             line.text,
             " ".repeat(CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP)
         );
@@ -6532,7 +6534,7 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
     };
     let conversation_view_span = PaintSpan {
         text: format!("View: {}", mode.conversation_view),
-        tone: Tone::Error,
+        tone: Tone::FastOff,
         bold: false,
     };
 
@@ -6561,7 +6563,7 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
         ]
     });
     let primary_spans = custom_spans.unwrap_or_else(|| {
-        vec![conversation_view_span, separator_span(), vibe_mode_span.clone()]
+        vec![vibe_mode_span.clone(), separator_span(), conversation_view_span]
     });
     // Fast is the only optional trailing control.
     let ladder = [
@@ -6572,16 +6574,16 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
                 vec![fast_span.clone()],
             ]
             .concat(),
-            conversation_view_index: Some(display_width),
-            response_length_index: Some(display_width + 2),
+            conversation_view_index: Some(display_width + 2),
+            response_length_index: Some(display_width),
             shell_display_mode_index: None,
             diff_display_mode_index: None,
             fast_index: Some(display_width + primary_spans.len() + 1),
         },
         BadgeSpans {
             spans: [display_spans, primary_spans.clone()].concat(),
-            conversation_view_index: Some(display_width),
-            response_length_index: Some(display_width + 2),
+            conversation_view_index: Some(display_width + 2),
+            response_length_index: Some(display_width),
             shell_display_mode_index: None,
             diff_display_mode_index: None,
             fast_index: None,
@@ -7842,7 +7844,7 @@ mod tests {
         // its prefix rather than by position.
         let assistant = block_lines(&Block::new(BlockKind::Assistant, "Codex", "answer"), 80)
             .into_iter()
-            .find(|line| line.prefix == "• ")
+            .find(|line| line.prefix == "  ")
             .expect("response marker row");
         let thinking = block_lines(
             &Block::new(BlockKind::Reasoning, THINKING_TITLE, "thought"),
@@ -7861,7 +7863,7 @@ mod tests {
         };
         assert_eq!(
             selection_columns_for_line(&assistant, full_row(&assistant, 0), 0),
-            Some(0..8)
+            Some(2..8)
         );
         assert_eq!(
             selection_columns_for_line(&thinking, full_row(&thinking, 1), 1),
@@ -7872,7 +7874,7 @@ mod tests {
         assert!(renderer.update_selection(7, 0));
         assert_eq!(
             renderer.finish_selection(7, 0),
-            SelectionResult::Copy("• answer".to_owned())
+            SelectionResult::Copy("answer".to_owned())
         );
         assert!(renderer.begin_selection(0, 1));
         assert!(renderer.update_selection(8, 1));
@@ -7946,7 +7948,7 @@ mod tests {
         // part of the row's text.
         assert_eq!(
             selection_columns_for_line(code, full_row(code, 0), 0),
-            Some(0..bubble_content_columns(code).end)
+            Some(2..bubble_content_columns(code).end)
         );
         assert_eq!(
             selection_columns_for_line(bullet, full_row(bullet, 0), 0),
@@ -8008,7 +8010,7 @@ mod tests {
         assert!(renderer.update_selection(7, 2));
         assert_eq!(
             renderer.finish_selection(7, 2),
-            SelectionResult::Copy("• first\nsecond".to_owned())
+            SelectionResult::Copy("first\nsecond".to_owned())
         );
     }
 
@@ -8020,7 +8022,7 @@ mod tests {
 
         // The bubble sits at the right edge with a cell of padding inside it, so
         // its text starts one column in from the band.
-        assert!(renderer.begin_selection(69, 1));
+        assert!(renderer.begin_selection(71, 1));
         assert!(renderer.update_selection(76, 2));
         assert_eq!(
             renderer.finish_selection(76, 2),
@@ -8048,7 +8050,7 @@ mod tests {
             .map(|span| UnicodeWidthStr::width(span.text.as_str()))
             .sum::<usize>();
 
-        assert!(user_text.text.starts_with(" input"));
+        assert!(user_text.text.starts_with("  input"));
         assert!(user_text.text.ends_with("  "));
         assert_eq!(assistant_right_padding, 2);
 
@@ -8092,8 +8094,8 @@ mod tests {
 
         assert_eq!(lines.len(), 5);
         // Every row is filled out to the longest one so the bubble paints square.
-        assert_eq!(lines[1].text, " first   ");
-        assert_eq!(lines[2].text, " second  ");
+        assert_eq!(lines[1].text, "  first   ");
+        assert_eq!(lines[2].text, "  second  ");
         assert!(lines[4] == PaintLine::blank());
 
         let selection = CellRange {
@@ -8112,7 +8114,7 @@ mod tests {
         assert_eq!(lines[1].prefix, lines[2].prefix);
         assert_eq!(painted_line_width(&lines[1]), painted_line_width(&lines[2]));
         assert_eq!(lines[2].text.trim(), "short");
-        assert!(lines[2].text.starts_with(" short"));
+        assert!(lines[2].text.starts_with("  short"));
     }
 
     #[test]
@@ -8133,12 +8135,12 @@ mod tests {
 
         assert_eq!(conversation_region_width(80), 63);
         assert_eq!(UnicodeWidthStr::width(user[0].prefix.as_str()), 16);
-        assert_eq!(UnicodeWidthStr::width(user[0].text.as_str()), 61);
+        assert_eq!(UnicodeWidthStr::width(user[0].text.as_str()), 63);
         assert!(user
             .iter()
             .filter(|line| line.tone == Tone::UserPrompt)
             .all(|line| UnicodeWidthStr::width(line.prefix.as_str()) >= 16
-                && painted_width(line) == 77));
+                && painted_width(line) == 79));
         assert!(assistant
             .iter()
             .filter(|line| !line.text.is_empty())
@@ -8503,7 +8505,7 @@ mod tests {
         assert!(
             rendered
                 .iter()
-                .any(|line| line.trim_end() == "• cargo run --release")
+                .any(|line| line.trim_end() == "  cargo run --release")
         );
         assert!(rendered.iter().all(|line| !line.contains(['┌', '┐', '└', '┘', '│'])));
     }
@@ -9298,9 +9300,9 @@ mod tests {
         // Two blanks off the rule, the badge, then the rule resumes for two columns.
         assert_eq!(
             texts,
-            ["  ", "View: Chat", " · ", "Vibe: On", " · ", "Fast: On", " ", "─╮"]
+            ["  ", "Vibe: On", " · ", "View: Chat", " · ", "Fast: On", " ", "─╮"]
         );
-        assert_eq!(line.tail[1].tone, Tone::Error);
+        assert_eq!(line.tail[1].tone, Tone::FastOn);
         assert_eq!(line.tail[5].tone, Tone::FastOn);
     }
 
@@ -9408,7 +9410,7 @@ mod tests {
         assert_eq!(rule_width(&line), 80);
         assert_eq!(
             texts,
-            ["  ", "View: Chat", " · ", "Vibe: On", " · ", "Fast: Off", " ", "─╮"]
+            ["  ", "Vibe: On", " · ", "View: Chat", " · ", "Fast: Off", " ", "─╮"]
         );
         assert_eq!(line.tail[5].tone, Tone::FastOff);
     }
@@ -9441,7 +9443,7 @@ mod tests {
 
         let line = input_top_line(120, "", Some(&mode));
 
-        assert!(painted(&line).contains("* main | View: Chat"));
+        assert!(painted(&line).contains("* main | Vibe: On"));
         assert!(!painted(&line).contains("$0.95"));
     }
 
@@ -9466,6 +9468,7 @@ mod tests {
 
         let on = tones(&mode);
         assert!(on.contains(&("Vibe: On".to_owned(), Tone::FastOn)));
+        assert!(on.contains(&("View: Chat".to_owned(), Tone::FastOff)));
         assert!(on.contains(&("Fast: On".to_owned(), Tone::FastOn)));
 
         mode.vibe_tone = VibeTone::Off;
@@ -9510,7 +9513,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(rule_width(&line), 40);
-        assert_eq!(texts, ["  ", "View: Chat", " · ", "Vibe: On", " ", "─╮"]);
+        assert_eq!(texts, ["  ", "Vibe: On", " · ", "View: Chat", " ", "─╮"]);
     }
 
     #[test]
@@ -9648,12 +9651,12 @@ mod tests {
         let user_lines = block_lines(&user, 80);
         let assistant_lines = block_lines(&assistant, 80);
 
-        assert_eq!(user_lines[1].prefix, " ".repeat(69));
-        assert_eq!(user_lines[1].text, " hello  ");
+        assert_eq!(user_lines[1].prefix, " ".repeat(70));
+        assert_eq!(user_lines[1].text, "  hello  ");
         assert!(user_lines[1].prefix_tone == Tone::Plain);
         assert!(user_lines[1].tone == Tone::UserPrompt);
         assert!(!user_lines[1].bold);
-        assert_eq!(assistant_lines[1].prefix, "• ");
+        assert_eq!(assistant_lines[1].prefix, "  ");
         assert_eq!(assistant_lines[1].prefix_tone, Tone::FastOff);
         assert_eq!(assistant_lines[1].text, "hi");
         assert_eq!(assistant_lines[1].tone, Tone::AssistantBubble);
@@ -9692,7 +9695,7 @@ mod tests {
         ] {
             let line = block_lines(&block, 80)
                 .into_iter()
-                .find(|line| matches!(line.prefix.as_str(), "• " | "● "))
+                .find(|line| matches!(line.prefix.as_str(), "  " | "● "))
                 .expect("transcript gutter");
             assert_eq!(line.prefix_tone, tone);
         }
