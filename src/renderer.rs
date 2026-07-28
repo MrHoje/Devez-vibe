@@ -1140,6 +1140,9 @@ impl Renderer {
         activity_phase: f32,
         plan_active: bool,
     ) -> Result<()> {
+        if plan_summary.is_some() {
+            self.remove_welcome_history(width);
+        }
         let rows = height as usize;
         let plan_lines = plan_summary.map(|summary| fixed_plan_summary_lines(summary, width, activity_phase, plan_active)).unwrap_or_default();
         let plan_rows = plan_lines.len().min(rows.saturating_sub(1));
@@ -1204,6 +1207,23 @@ impl Renderer {
         self.last_height = height;
         self.out.flush()?;
         Ok(())
+    }
+
+    /// The welcome card becomes obsolete once the fixed plan panel is visible.
+    /// It may already have been committed with the first user prompt, so hiding
+    /// only the live card would leave a stale copy in the transcript.
+    fn remove_welcome_history(&mut self, width: u16) {
+        if !self.history.iter().any(|block| matches!(block.kind, BlockKind::Welcome)) {
+            return;
+        }
+        let before = self.wrapped.len();
+        self.history
+            .retain(|block| !matches!(block.kind, BlockKind::Welcome));
+        self.rewrap(width);
+        if self.scroll_back > 0 {
+            let row_delta = self.wrapped.len() as isize - before as isize;
+            self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
+        }
     }
 
     fn commit_fullscreen_blocks(&mut self, committed: &[Block], width: u16, view_rows: usize) {
@@ -4552,16 +4572,12 @@ fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_
             .as_deref()
             .filter(|_| step.status == PlanStepStatus::Completed);
         let time_width = elapsed
-            .map(|time| UnicodeWidthStr::width(time) + 1)
+            .map(|time| UnicodeWidthStr::width(time) + 3)
             .unwrap_or_default();
         let task_width = line_width
             .saturating_sub(UnicodeWidthStr::width(prefix.as_str()))
             .saturating_sub(time_width);
         let task_text = compact_right(&step.text, task_width);
-        let task_padding = line_width
-            .saturating_sub(UnicodeWidthStr::width(prefix.as_str()))
-            .saturating_sub(UnicodeWidthStr::width(task_text.as_str()))
-            .saturating_sub(time_width);
         let in_progress = step.status == PlanStepStatus::InProgress;
         lines.push(PaintLine {
             prefix,
@@ -4572,11 +4588,10 @@ fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_
                 .map(|time| {
                     vec![
                         PaintSpan {
-                            text: " ".repeat(task_padding + 1),
+                            text: format!(" ({time})"),
                             tone: Tone::Muted,
                             bold: false,
                         },
-                        PaintSpan { text: time.to_owned(), tone: Tone::Muted, bold: false },
                     ]
                 })
                 .unwrap_or_default(),
@@ -4623,10 +4638,10 @@ fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_
     lines.insert(0, header);
     lines.insert(1, PaintLine::blank());
     if all_completed {
-        let total = format!("총 {}", format_plan_elapsed(summary.elapsed.unwrap_or_default()));
+        let total = format!("End {}", format_plan_elapsed(summary.elapsed.unwrap_or_default()));
         lines.push(PaintLine::plain(format!(
-            "{}{}",
-            " ".repeat(line_width.saturating_sub(UnicodeWidthStr::width(total.as_str()))),
+            "{}{} ",
+            " ".repeat(line_width.saturating_sub(UnicodeWidthStr::width(total.as_str()) + 1)),
             total
         )));
     } else {
@@ -9837,6 +9852,24 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn plan_panel_removes_a_previously_committed_welcome_card() {
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.history.push(Block::welcome("Pro", "C:\\work", "user@example.com", &[]));
+        renderer
+            .history
+            .push(Block::new(BlockKind::User, "You", "작업 시작"));
+        renderer.rewrap(80);
+
+        renderer.remove_welcome_history(80);
+
+        assert!(renderer
+            .history
+            .iter()
+            .all(|block| !matches!(block.kind, BlockKind::Welcome)));
+        assert!(renderer.wrapped.iter().any(|line| painted(line).contains("작업 시작")));
+    }
+
     fn transcript_rows(count: usize, prefix: &str) -> Vec<Block> {
         (0..count)
             .map(|index| Block::new(BlockKind::Assistant, "Codex", format!("{prefix}{index}")))
@@ -11493,7 +11526,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_plan_step_shows_elapsed_time_on_the_right() {
+    fn completed_plan_step_appends_elapsed_time_to_the_task() {
         let summary = PlanSummary {
             explanation: None,
             steps: vec![PlanStep {
@@ -11509,9 +11542,9 @@ mod tests {
 
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
 
-        assert!(painted(&lines[2]).ends_with("1m 34s"));
-        assert_eq!(painted_width(&lines[2]), 79);
-        assert!(painted(&lines[3]).ends_with("총 1m 34s"));
+        assert!(painted(&lines[2]).ends_with("Done (1m 34s)"));
+        assert_eq!(painted(&lines[2]), "  ✔ Done (1m 34s)");
+        assert!(painted(&lines[3]).ends_with("End 1m 34s "));
     }
 
     #[test]

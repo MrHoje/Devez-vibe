@@ -6,7 +6,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::{
+    event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    terminal,
+};
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -2110,6 +2113,23 @@ pub enum SessionPickerResult {
 }
 
 const RESUME_PICKER_ROWS: usize = 10;
+/// Compact resume picker chrome: panel, search input, and status rows.
+const RESUME_PICKER_CHROME_ROWS: u16 = 11;
+
+/// Session rows that fit beneath the resume picker's fixed chrome. Keeping this
+/// dynamic prevents `fit_frame` from dropping the panel header on short grids.
+fn resume_picker_rows(height: u16) -> usize {
+    usize::from(
+        height
+            .saturating_sub(RESUME_PICKER_CHROME_ROWS)
+            .clamp(1, RESUME_PICKER_ROWS as u16),
+    )
+}
+
+fn visible_resume_picker_rows() -> usize {
+    let height = terminal::size().map(|(_, height)| height).unwrap_or(30);
+    resume_picker_rows(height)
+}
 
 /// Rows the `Apply to` step prints before its choices: the pick it is confirming
 /// and the blank under it.
@@ -2259,11 +2279,12 @@ impl SessionPicker {
     /// visible window, so it is resolved against the same window the rows were
     /// painted from; one click resumes, exactly as Enter on that row would.
     pub fn click_row(&mut self, row: usize) -> SessionPickerResult {
-        if row >= RESUME_PICKER_ROWS {
+        let rows = visible_resume_picker_rows();
+        if row >= rows {
             return SessionPickerResult::None;
         }
         let filtered = self.filtered();
-        let start = visible_window(Some(self.selected), filtered.len(), RESUME_PICKER_ROWS).start;
+        let start = visible_window(Some(self.selected), filtered.len(), rows).start;
         let Some(session) = filtered.get(start + row) else {
             // The "no sessions" placeholder, which stands for nothing to resume.
             return SessionPickerResult::None;
@@ -2275,7 +2296,11 @@ impl SessionPicker {
 
     pub fn overlay_view(&self) -> OverlayView<'_> {
         let filtered = self.filtered();
-        let window = visible_window(Some(self.selected), filtered.len(), RESUME_PICKER_ROWS);
+        let window = visible_window(
+            Some(self.selected),
+            filtered.len(),
+            visible_resume_picker_rows(),
+        );
         let start = window.start;
         let mut lines = filtered[window]
             .iter()
@@ -10299,6 +10324,13 @@ mod tests {
         assert!(view.lines[0].text.starts_with("unknown"));
         assert!(view.lines[0].text.contains("Session 0"));
         assert!(view.input_label.is_empty());
+    }
+
+    #[test]
+    fn resume_picker_reduces_rows_before_short_terminal_frame_is_clipped() {
+        assert_eq!(resume_picker_rows(11), 1);
+        assert_eq!(resume_picker_rows(15), 4);
+        assert_eq!(resume_picker_rows(40), RESUME_PICKER_ROWS);
     }
 
     /// One click resumes, the same as Enter on that row. The row index counts
