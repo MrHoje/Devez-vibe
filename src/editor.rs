@@ -341,6 +341,57 @@ impl Editor {
         self.buffer.drain(self.cursor..end);
     }
 
+    pub fn delete_word_right(&mut self) {
+        if self.remove_collapsed_paste_after_cursor() {
+            return;
+        }
+        if self
+            .buffer
+            .get(self.cursor)
+            .is_some_and(|&ch| ch == ATTACHMENT_PLACEHOLDER)
+        {
+            self.leave_history();
+            self.buffer.remove(self.cursor);
+            if self
+                .collapsed_paste_start
+                .is_some_and(|start| self.cursor < start)
+            {
+                self.collapsed_paste_start = self.collapsed_paste_start.map(|start| start - 1);
+                self.collapsed_paste_end = self.collapsed_paste_end.map(|end| end - 1);
+            }
+            return;
+        }
+        self.move_to_collapsed_paste_end();
+        if self.cursor == self.buffer.len() {
+            return;
+        }
+
+        self.leave_history();
+        let start = self.cursor;
+        let limit = self.collapsed_paste_start.unwrap_or(self.buffer.len());
+        while self.cursor < limit && self.buffer[self.cursor].is_whitespace() {
+            self.cursor += 1;
+        }
+        while self.cursor < limit && !self.buffer[self.cursor].is_whitespace() {
+            self.cursor += 1;
+        }
+        while self.cursor < limit && self.buffer[self.cursor].is_whitespace() {
+            self.cursor += 1;
+        }
+        let end = self.cursor;
+        if start == end {
+            return;
+        }
+        self.kill_buffer = self.buffer[start..end].iter().collect();
+        self.buffer.drain(start..end);
+        if self.collapsed_paste_start.is_some_and(|paste_start| start < paste_start) {
+            let removed = end - start;
+            self.collapsed_paste_start = self.collapsed_paste_start.map(|value| value - removed);
+            self.collapsed_paste_end = self.collapsed_paste_end.map(|value| value - removed);
+        }
+        self.cursor = start;
+    }
+
     pub fn delete_to_line_end(&mut self) {
         self.move_to_collapsed_paste_end();
         self.leave_history();
@@ -544,6 +595,24 @@ mod tests {
 
         editor.yank();
         assert_eq!(editor.text(), "alpha beta");
+    }
+
+    #[test]
+    fn delete_word_right_removes_the_next_word_and_spacing() {
+        let mut editor = Editor::default();
+        editor.set_text("alpha beta gamma");
+        editor.move_home();
+        editor.move_right();
+        editor.move_right();
+        editor.move_right();
+        editor.move_right();
+        editor.move_right();
+
+        editor.delete_word_right();
+
+        assert_eq!(editor.text(), "alphagamma");
+        editor.yank();
+        assert_eq!(editor.text(), "alpha beta gamma");
     }
 
     #[test]

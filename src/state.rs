@@ -1489,6 +1489,7 @@ impl McpForm {
                 KeyCode::Enter => return self.commit_current(),
                 KeyCode::Backspace if ctrl => self.editor.delete_word_left(),
                 KeyCode::Backspace => self.editor.backspace(),
+                KeyCode::Delete if ctrl => self.editor.delete_word_right(),
                 KeyCode::Delete => self.editor.delete(),
                 KeyCode::Left if ctrl || alt => self.editor.move_word_left(),
                 KeyCode::Right if ctrl || alt => self.editor.move_word_right(),
@@ -2241,6 +2242,11 @@ impl SessionPicker {
             }
             KeyCode::Backspace => {
                 self.query.backspace();
+                self.selected = 0;
+                SessionPickerResult::None
+            }
+            KeyCode::Delete if ctrl => {
+                self.query.delete_word_right();
                 self.selected = 0;
                 SessionPickerResult::None
             }
@@ -4055,6 +4061,16 @@ impl AppState {
                 self.command_selection = 0;
                 Action::None
             }
+            KeyCode::Delete if ctrl => {
+                if let Some(index) = self.editor.attachment_at_cursor() {
+                    self.editor.delete_word_right();
+                    self.composer_images.remove(index);
+                } else {
+                    self.editor.delete_word_right();
+                }
+                self.command_selection = 0;
+                Action::None
+            }
             KeyCode::Delete => {
                 if let Some(index) = self.editor.attachment_at_cursor() {
                     self.editor.delete();
@@ -5440,6 +5456,7 @@ impl AppState {
                         }
                         KeyCode::Backspace if ctrl => editor.delete_word_left(),
                         KeyCode::Backspace => editor.backspace(),
+                        KeyCode::Delete if ctrl => editor.delete_word_right(),
                         KeyCode::Delete => editor.delete(),
                         KeyCode::Left if ctrl || alt => editor.move_word_left(),
                         KeyCode::Right if ctrl || alt => editor.move_word_right(),
@@ -9707,7 +9724,7 @@ mod tests {
             "turns": [{
                 "items": [{
                     "type": "plan",
-                    "text": "✓ 확인 완료\n▸ 수정 진행\n□ 검증 대기"
+                    "text": "✔ 확인 완료\n▸ 수정 진행\n□ 검증 대기"
                 }]
             }]
         });
@@ -11545,6 +11562,17 @@ mod tests {
         state.handle_key(KeyEvent::from(KeyCode::Char('\u{8}')));
 
         assert_eq!(state.editor.text(), "first ");
+    }
+
+    #[test]
+    fn composer_ctrl_delete_deletes_the_next_word() {
+        let mut state = test_state();
+        state.handle_paste("first second third");
+        state.editor.move_home();
+
+        state.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL));
+
+        assert_eq!(state.editor.text(), "second third");
     }
 
     #[test]

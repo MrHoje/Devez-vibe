@@ -90,7 +90,7 @@ pub enum BlockKind {
     Assistant,
     Reasoning,
     /// A `turn/plan/updated` snapshot. Its body is the encoded plan: `└ ` rows
-    /// are the explanation, `✓ `/`▸ `/`□ ` rows are done/in-progress/pending
+    /// are the explanation, `✔ `/`▸ `/`□ ` rows are done/in-progress/pending
     /// steps. See [`plan_lines`].
     #[allow(dead_code)]
     Plan,
@@ -444,6 +444,7 @@ pub struct Renderer {
     hovered_pick: Option<Pick>,
     painted_hovered_pick: Option<Pick>,
     selection: Selection,
+    last_click: Option<(CellPosition, Instant)>,
     painted_selection: Option<CellRange>,
     painted_frame: Option<CellFrame>,
     live_frame_cache: Option<LiveFrameCache>,
@@ -677,6 +678,7 @@ impl Renderer {
             hovered_pick: None,
             painted_hovered_pick: None,
             selection: Selection::default(),
+            last_click: None,
             painted_selection: None,
             painted_frame: None,
             live_frame_cache: None,
@@ -902,6 +904,42 @@ impl Renderer {
         }
     }
 
+    /// Selects and returns the word under a second click on the same cell.
+    pub fn double_click_word(&mut self, column: u16, row: u16) -> Option<String> {
+        const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
+
+        let point = self.selection_point(column, row)?;
+        let now = Instant::now();
+        let is_double_click =
+            self.last_click
+                .replace((point, now))
+                .is_some_and(|(previous, clicked_at)| {
+                previous.row == point.row
+                    && previous.column.abs_diff(point.column) <= 1
+                    && now.duration_since(clicked_at) <= DOUBLE_CLICK_WINDOW
+                });
+        if !is_double_click {
+            return None;
+        }
+        self.last_click = None;
+
+        let lines = self.copy_lines();
+        let line = lines.get(usize::from(point.row))?;
+        let range = word_range_at(line, usize::from(point.column))?;
+        self.selection.set_range(CellRange {
+            start: CellPosition {
+                row: point.row,
+                column: u16::try_from(range.start).ok()?,
+            },
+            end: CellPosition {
+                row: point.row,
+                column: u16::try_from(range.end.saturating_sub(1)).ok()?,
+            },
+        });
+        let text = extract_text(&lines, self.selection.range()?);
+        (!text.is_empty()).then_some(text)
+    }
+
     pub fn clear_selection(&mut self) -> bool {
         self.selection.clear()
     }
@@ -931,7 +969,7 @@ impl Renderer {
         }
         let row = row.min(self.previous_lines.len().saturating_sub(1) as u16);
         let line = &self.previous_lines[usize::from(row)];
-        if matches!(line.tone, Tone::UserPromptHalf | Tone::AssistantBubbleHalf) {
+        if line.tone == Tone::AssistantBubbleHalf {
             return None;
         }
         let width = painted_line_width(line).max(
@@ -2284,7 +2322,6 @@ enum Tone {
     StatusText,
     StatusSeparator,
     UserPrompt,
-    UserPromptHalf,
     AssistantBubble,
     AssistantBubbleHalf,
     Model56,
@@ -2447,19 +2484,6 @@ impl PaintLine {
 
     fn blank() -> Self {
         Self::plain("")
-    }
-
-    fn user_prompt_half_padding(width: usize, glyph: char) -> Self {
-        Self {
-            prefix: String::new(),
-            prefix_tone: Tone::Plain,
-            text: glyph.to_string().repeat(width),
-            tone: Tone::UserPromptHalf,
-            bold: false,
-            tool_heading: None,
-            pick: None,
-            tail: Vec::new(),
-        }
     }
 
     /// Makes single spans of an already-built row clickable. `picks` addresses
@@ -2861,13 +2885,45 @@ fn bubble_content_columns(line: &PaintLine) -> Range<usize> {
     0..width.saturating_sub(filler)
 }
 
+fn word_range_at(line: &CopyLine, column: usize) -> Option<Range<usize>> {
+    let content = line
+        .content_columns
+        .clone()
+        .unwrap_or(0..UnicodeWidthStr::width(line.text.as_str()));
+    let mut cells = Vec::new();
+    let mut start = 0;
+    for ch in line.text.chars() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width > 0 && start >= content.start && start + width <= content.end {
+            cells.push((ch, start, start + width));
+        }
+        start += width;
+    }
+
+    let selected = cells
+        .iter()
+        .position(|(_, start, end)| *start <= column && column < *end)?;
+    if !is_word_char(cells[selected].0) {
+        return None;
+    }
+    let mut first = selected;
+    while first > 0 && is_word_char(cells[first - 1].0) {
+        first -= 1;
+    }
+    let mut last = selected + 1;
+    while last < cells.len() && is_word_char(cells[last].0) {
+        last += 1;
+    }
+    Some(cells[first].1..cells[last - 1].2)
+}
+
 fn selection_columns_for_line(
     line: &PaintLine,
     range: CellRange,
     row: usize,
 ) -> Option<Range<usize>> {
     // A bubble's rounded edge rows are chrome, not text.
-    if matches!(line.tone, Tone::UserPromptHalf | Tone::AssistantBubbleHalf) {
+    if line.tone == Tone::AssistantBubbleHalf {
         return None;
     }
     let mut selected = range.columns_for_row(row, painted_line_width(line))?;
@@ -4903,7 +4959,7 @@ fn hunk_start(row: &str) -> Option<(usize, usize)> {
 const THINKING_TITLE: &str = "Thinking…";
 
 /// Codex paints a plan update as `- 작업 단계`, the explanation hanging off
-/// a `└`, then one checkbox row per step indented four columns: `✓` for done,
+/// a `└`, then one checkbox row per step indented four columns: `✔` for done,
 /// `□` for the rest, with the in-progress step lit instead of dimmed. The body
 /// carries `▸` for that step so the row keeps a status the text alone can't.
 fn plan_lines(block: &Block, width: u16) -> Vec<PaintLine> {
@@ -4913,9 +4969,9 @@ fn plan_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         // The checkbox itself is never struck through, only the step behind it.
         let (prefix, tone, bold, text) = if let Some(rest) = row.strip_prefix("└ ") {
             ("  └ ", Tone::Muted, false, rest)
-        } else if let Some(rest) = row.strip_prefix("✓ ") {
+        } else if let Some(rest) = row.strip_prefix("✔ ").or_else(|| row.strip_prefix("✓ ")) {
             steps += 1;
-            ("    ✓ ", Tone::PlanDone, false, rest)
+            ("    ✔ ", Tone::PlanDone, false, rest)
         } else if let Some(rest) = row.strip_prefix("▸ ") {
             steps += 1;
             ("    □ ", Tone::Accent, true, rest)
@@ -4972,7 +5028,7 @@ fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_
     let steps = summary.steps.iter().collect::<Vec<_>>();
     for step in steps {
         let (prefix, bold) = match step.status {
-            PlanStepStatus::Completed => ("  ✓  ".to_owned(), false),
+            PlanStepStatus::Completed => ("  ✔  ".to_owned(), false),
             PlanStepStatus::InProgress if plan_active => (format!("  {}  ", WORKING_SPINNER[(phase.clamp(0.0, 0.999) * WORKING_SPINNER.len() as f32) as usize]), true),
             PlanStepStatus::InProgress => ("  ▸  ".to_owned(), false),
             PlanStepStatus::Pending => ("     ".to_owned(), false),
@@ -4986,12 +5042,13 @@ fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_
             .saturating_sub(UnicodeWidthStr::width(prefix.as_str()))
             .saturating_sub(time_width);
         let task_text = compact_right(&step.text, task_width);
+        let is_completed = step.status == PlanStepStatus::Completed;
         let in_progress = step.status == PlanStepStatus::InProgress;
         lines.push(PaintLine {
             prefix,
-            prefix_tone: if step.status == PlanStepStatus::Completed || in_progress { Tone::Accent } else { Tone::Muted },
+            prefix_tone: if is_completed { Tone::FastOff } else if in_progress { Tone::Accent } else { Tone::Muted },
             text: task_text,
-            tone: if in_progress { Tone::Accent } else { Tone::Plain }, bold, tool_heading: None, pick: None,
+            tone: if is_completed { Tone::PlanDone } else if in_progress { Tone::Accent } else { Tone::Plain }, bold, tool_heading: None, pick: None,
             tail: elapsed
                 .map(|time| {
                     vec![
@@ -5394,15 +5451,11 @@ fn block_lines_with_expansion(block: &Block, width: u16, expanded: bool) -> Vec<
 
 fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     if !CHAT_LAYOUT.load(Ordering::Relaxed) {
-        let mut lines = block
+        return block
             .body
             .lines()
             .flat_map(|line| wrapped_line(" ", Tone::Plain, line, Tone::UserPrompt, false, width))
             .collect::<Vec<_>>();
-        let half_width = usize::from(width).saturating_sub(1);
-        lines.insert(0, PaintLine::user_prompt_half_padding(half_width, '▄'));
-        lines.push(PaintLine::user_prompt_half_padding(half_width, '▀'));
-        return lines;
     }
     const RIGHT_GAP: usize = 0;
 
@@ -5452,12 +5505,6 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         }
         line.prefix = half_prefix.clone();
     }
-    let mut top = PaintLine::user_prompt_half_padding(bubble_width, '▄');
-    top.prefix = half_prefix.clone();
-    let mut bottom = PaintLine::user_prompt_half_padding(bubble_width, '▀');
-    bottom.prefix = half_prefix;
-    lines.insert(0, top);
-    lines.push(bottom);
     lines
 }
 
@@ -7215,7 +7262,6 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::StatusText => palette.status.text,
         Tone::StatusSeparator => palette.status.separator,
         Tone::UserPrompt => palette.foreground,
-        Tone::UserPromptHalf => palette.user_prompt_bg,
         Tone::AssistantBubble => palette.foreground,
         Tone::AssistantBubbleHalf => blend(palette.background, palette.foreground, 20),
         Tone::Model56 => palette.model_gpt56,
@@ -7298,6 +7344,21 @@ fn rgb_color(color: Rgb) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_selection_uses_word_boundaries_and_content_columns() {
+        let line = CopyLine {
+            text: "│ hello_world!".to_owned(),
+            join_next: false,
+            marker_width: 0,
+            prefix_width: 0,
+            content_columns: Some(2..14),
+        };
+
+        assert_eq!(word_range_at(&line, 7), Some(2..13));
+        assert_eq!(word_range_at(&line, 13), None);
+        assert_eq!(word_range_at(&line, 0), None);
+    }
 
     #[test]
     fn frame_clips_glyphs_before_the_autowrap_column() {
@@ -8053,10 +8114,10 @@ mod tests {
 
         // The bubble sits at the right edge with a cell of padding inside it, so
         // its text starts one column in from the band.
-        assert!(renderer.begin_selection(71, 1));
-        assert!(renderer.update_selection(76, 2));
+        assert!(renderer.begin_selection(71, 0));
+        assert!(renderer.update_selection(76, 1));
         assert_eq!(
-            renderer.finish_selection(76, 2),
+            renderer.finish_selection(76, 1),
             SelectionResult::Copy("first\nsecond".to_owned())
         );
     }
@@ -8109,7 +8170,7 @@ mod tests {
         renderer.previous_lines = lines;
 
         assert!(!renderer.begin_selection(0, 0));
-        assert!(renderer.begin_selection(70, 1));
+        assert!(renderer.begin_selection(70, 0));
     }
 
     #[test]
@@ -8123,18 +8184,17 @@ mod tests {
             false,
         );
 
-        assert_eq!(lines.len(), 5);
+        assert_eq!(lines.len(), 3);
         // Every row is filled out to the longest one so the bubble paints square.
-        assert_eq!(lines[1].text, "  first   ");
-        assert_eq!(lines[2].text, "  second  ");
-        assert!(lines[4] == PaintLine::blank());
+        assert_eq!(lines[0].text, "  first   ");
+        assert_eq!(lines[1].text, "  second  ");
+        assert!(lines[2] == PaintLine::blank());
 
         let selection = CellRange {
-            start: CellPosition { column: 71, row: 1 },
-            end: CellPosition { column: 77, row: 2 },
+            start: CellPosition { column: 71, row: 0 },
+            end: CellPosition { column: 77, row: 1 },
         };
-        assert_eq!(selection_columns_for_line(&lines[0], selection, 0), None);
-        assert_ne!(selection_columns_for_line(&lines[1], selection, 1), None);
+        assert_ne!(selection_columns_for_line(&lines[0], selection, 0), None);
     }
 
     #[test]
@@ -8142,10 +8202,10 @@ mod tests {
         CHAT_LAYOUT.store(true, Ordering::Relaxed);
         let lines = user_prompt_lines(&Block::new(BlockKind::User, "You", "longest line\nshort"), 80);
 
-        assert_eq!(lines[1].prefix, lines[2].prefix);
-        assert_eq!(painted_line_width(&lines[1]), painted_line_width(&lines[2]));
-        assert_eq!(lines[2].text.trim(), "short");
-        assert!(lines[2].text.starts_with("  short"));
+        assert_eq!(lines[0].prefix, lines[1].prefix);
+        assert_eq!(painted_line_width(&lines[0]), painted_line_width(&lines[1]));
+        assert_eq!(lines[1].text.trim(), "short");
+        assert!(lines[1].text.starts_with("  short"));
     }
 
     #[test]
@@ -9710,11 +9770,11 @@ mod tests {
         let user_lines = block_lines(&user, 80);
         let assistant_lines = block_lines(&assistant, 80);
 
-        assert_eq!(user_lines[1].prefix, " ".repeat(70));
-        assert_eq!(user_lines[1].text, "  hello  ");
-        assert!(user_lines[1].prefix_tone == Tone::Plain);
-        assert!(user_lines[1].tone == Tone::UserPrompt);
-        assert!(!user_lines[1].bold);
+        assert_eq!(user_lines[0].prefix, " ".repeat(70));
+        assert_eq!(user_lines[0].text, "  hello  ");
+        assert!(user_lines[0].prefix_tone == Tone::Plain);
+        assert!(user_lines[0].tone == Tone::UserPrompt);
+        assert!(!user_lines[0].bold);
         assert_eq!(assistant_lines[1].prefix, "  ");
         assert_eq!(assistant_lines[1].prefix_tone, Tone::FastOff);
         assert_eq!(assistant_lines[1].text, "hi");
@@ -10875,7 +10935,7 @@ mod tests {
             &Block::new(
                 BlockKind::Plan,
                 "작업 단계",
-                "└ why\n✓ first\n▸ second\n□ third",
+                "└ why\n✔ first\n▸ second\n□ third",
             ),
             80,
         );
@@ -10885,9 +10945,9 @@ mod tests {
         assert!(lines[0].bold);
         assert_eq!(lines[1].prefix, "  └ ");
         assert_eq!(lines[1].text, "why");
-        assert_eq!(lines[2].prefix, "    ✓ ");
+        assert_eq!(lines[2].prefix, "    ✔ ");
         assert_eq!(lines[2].text, "first");
-        // Done steps are struck through, and the ✓ in the gutter is not.
+        // Done steps are struck through, and the ✔ in the gutter is not.
         assert_eq!(lines[2].tone, Tone::PlanDone);
         assert_eq!(lines[2].prefix_tone, Tone::Muted);
         // The step being worked on is the one row that is lit, not dimmed.
@@ -12419,11 +12479,11 @@ mod tests {
 
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
 
-        assert_eq!(painted(&lines[2]), "  ✓  Task 1");
+        assert_eq!(painted(&lines[2]), "  ✔  Task 1");
         assert_eq!(painted(&lines[3]), "     Task 2");
-        assert_eq!(painted(&lines[4]), "  ✓  Task 3");
-        assert_eq!(lines[2].prefix_tone, Tone::Accent);
-        assert_eq!(lines[2].tone, Tone::Plain);
+        assert_eq!(painted(&lines[4]), "  ✔  Task 3");
+        assert_eq!(lines[2].prefix_tone, Tone::FastOff);
+        assert_eq!(lines[2].tone, Tone::PlanDone);
     }
 
     #[test]
@@ -12444,7 +12504,7 @@ mod tests {
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
 
         assert!(painted(&lines[2]).ends_with("Done (1m 34s)"));
-        assert_eq!(painted(&lines[2]), "  ✓  Done (1m 34s)");
+        assert_eq!(painted(&lines[2]), "  ✔  Done (1m 34s)");
         assert!(painted(&lines[3]).ends_with("⏱  1m 34s  "));
     }
 

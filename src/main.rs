@@ -917,6 +917,9 @@ fn renderer_mouse_action(
             // A press and release on the same cell never was a drag; tool
             // headings and the session's own chrome still want that click.
             SelectionResult::Click(column, row) => {
+                if let Some(text) = renderer.double_click_word(column, row) {
+                    return Action::Copy(text);
+                }
                 // The down event painted a one-cell selection, so whatever the
                 // click turns out to mean, the row has to be repainted.
                 match renderer.pick_at(column, row) {
@@ -2328,6 +2331,7 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 기본 분량은 세 줄 전후이며, 사용자가 자세한 설명을 요청할 때만 늘린다.\n",
     "- 산문 문단 대신 불릿과 코드 블록을 쓴다.\n",
     "- 코드 변경은 파일 경로와 핵심 코드만 보여주고, 요청받지 않은 해설을 덧붙이지 않는다.\n",
+    "- 작업을 완료하면 사용자의 요청을 기준으로 정확히 무엇을 완료했는지 `~ 내용을 완료했습니다.` 형식으로 분명하게 알린다.\n",
     "- 하지 않기로 한 선택지나 이미 정해진 결정을 다시 나열하지 않는다.\n",
     "- Skill 적용, 지침 확인, 내부 도구 호출 같은 내부 절차를 사용자에게 commentary로 알리지 않는다. ",
     "사용자 판단에 필요한 진행 상황이나 결과만 알린다.\n",
@@ -2337,7 +2341,7 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 작은 작업의 계획은 짧게 쓴다. Task 한두 개면 충분하다.\n",
     "- 모든 Task 제목은 순서대로 `1. `, `2. `, `3. `처럼 번호로 시작한다.\n",
     "- 각 Task는 착수할 때 in_progress, 끝나면 completed로 즉시 갱신한다.\n",
-    "- 질문에만 답하거나 코드를 읽기만 하는 턴에는 계획을 만들지 않는다.",
+    "- 질문에만 답하는 턴을 제외하고, 원인 분석·코드리뷰 등 코드를 읽는 작업에도 `update_plan`으로 계획을 먼저 표시한다.",
 );
 
 /// A resumed thread replays the `developer` message its rollout was recorded

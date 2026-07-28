@@ -86,6 +86,13 @@ impl Selection {
         true
     }
 
+    pub fn set_range(&mut self, range: CellRange) {
+        self.anchor = Some(range.start);
+        self.focus = Some(range.end);
+        self.dragging = false;
+        self.moved = true;
+    }
+
     pub fn finish(&mut self, point: CellPosition) -> SelectionFinish {
         let Some(anchor) = self.anchor else {
             return SelectionFinish::None;
