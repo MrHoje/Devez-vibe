@@ -19,8 +19,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Notes shown in the welcome panel's right column. Rewrite these each release;
 /// a line starting with `·` renders as a bullet, anything else as a sub-heading.
 pub const RELEASE_NOTES: &[&str] = &[
-    "A restored plan keeps the time each step took, not just its status.",
-    "Click the Resets row to fold the credit lines open or shut.",
+    "Copying a chat message picks up its text only — no bubble padding, no edges.",
+    "The View badge on the composer rule answers to a click now.",
+    "Idle redraws got cheaper: animation ticks repaint on their own path.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
