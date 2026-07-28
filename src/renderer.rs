@@ -1422,6 +1422,11 @@ impl Renderer {
         if sticky.is_some() {
             sticky = sticky_prompt_for_viewport(&self.prompt_anchors, start, width);
         }
+        let start = if plan_summary.is_some() && sticky.is_none() {
+            transcript_start_below_plan(&self.wrapped, start)
+        } else {
+            start
+        };
         let animation_activity_row = frame
             .activity_index
             .map(|index| plan_rows + view_rows + index);
@@ -2176,6 +2181,18 @@ fn compose_screen(
     let cursor_line = screen.len() + live_cursor_line;
     screen.extend(live);
     (screen, cursor_line)
+}
+
+/// The plan already owns one blank row below its bottom border. If a scrolled
+/// transcript window lands on block-separator blanks, start at its next visible
+/// row so those separators do not stack below the fixed plan.
+fn transcript_start_below_plan(wrapped: &[PaintLine], start: usize) -> usize {
+    let start = start.min(wrapped.len());
+    start
+        + wrapped[start..]
+            .iter()
+            .take_while(|line| **line == PaintLine::blank())
+            .count()
 }
 
 /// The overlay floats two rows above the composer, covering only the button's

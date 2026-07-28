@@ -3338,7 +3338,7 @@ impl AppState {
                     elapsed: step.elapsed_ms.map(Duration::from_millis),
                 })
                 .collect(),
-            expanded: false,
+            expanded: true,
             started_at: Instant::now(),
             elapsed: None,
         });
@@ -4460,7 +4460,7 @@ impl AppState {
                 let expanded = self
                     .plan_summary
                     .as_ref()
-                    .is_some_and(|summary| summary.expanded);
+                    .map_or(true, |summary| summary.expanded);
                 let elapsed = if !steps.is_empty()
                     && steps.iter().all(|step| step.status == PlanStepStatus::Completed)
                 {
@@ -9571,6 +9571,7 @@ mod tests {
             state.plan_summary.as_ref().and_then(|summary| summary.explanation.as_deref()),
             Some("범위를 확인했습니다.")
         );
+        assert!(state.plan_summary.as_ref().is_some_and(|summary| summary.expanded));
         state.prepare_resume();
         assert!(state.plan_summary.is_none());
     }
@@ -9598,7 +9599,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_expansion_survives_next_prompt_and_plan_update() {
+    fn plan_collapse_survives_next_prompt_and_plan_update() {
         let mut state = test_state();
         state.handle_notification(
             "turn/plan/updated",
@@ -9612,7 +9613,7 @@ mod tests {
             &json!({ "plan": [{ "step": "check", "status": "completed" }] }),
         );
 
-        assert!(state.plan_summary.as_ref().is_some_and(|summary| summary.expanded));
+        assert!(state.plan_summary.as_ref().is_some_and(|summary| !summary.expanded));
     }
 
     #[test]
