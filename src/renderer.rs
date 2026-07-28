@@ -9780,6 +9780,31 @@ mod tests {
     }
 
     #[test]
+    fn plan_gap_skips_viewport_separator_rows() {
+        let transcript = vec![
+            PaintLine::blank(),
+            PaintLine::blank(),
+            PaintLine::plain("first visible row"),
+            PaintLine::plain("second visible row"),
+        ];
+        let start = transcript_start_below_plan(&transcript, 0);
+        let (screen, _) = compose_screen(
+            &transcript,
+            text_rows(1, "composer"),
+            2,
+            start,
+            0,
+            None,
+        );
+
+        assert_eq!(start, 2);
+        assert_eq!(
+            screen.iter().map(painted).collect::<Vec<_>>(),
+            ["first visible row", "second visible row", "composer0"]
+        );
+    }
+
+    #[test]
     fn the_composer_holds_the_bottom_rows_at_every_scroll_position() {
         let transcript = text_rows(100, "t");
         let live = text_rows(3, "live");
