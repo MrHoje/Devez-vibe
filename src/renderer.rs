@@ -5085,7 +5085,7 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
 }
 
 fn conversation_region_width(width: u16) -> usize {
-    usize::from(width).saturating_sub(1).saturating_mul(3) / 4
+    usize::from(width).saturating_sub(1).saturating_mul(65) / 100
 }
 
 fn body_prefix(
@@ -7605,21 +7605,21 @@ mod tests {
     }
 
     #[test]
-    fn conversation_messages_use_opposite_75_percent_anchors() {
+    fn chat_messages_use_opposite_65_percent_anchors() {
         let user = block_lines(&Block::new(BlockKind::User, "You", "x".repeat(120)), 80);
         let assistant = block_lines(&Block::new(BlockKind::Assistant, "Codex", "x".repeat(120)), 80);
 
-        assert_eq!(UnicodeWidthStr::width(user[0].prefix.as_str()), 20);
+        assert_eq!(UnicodeWidthStr::width(user[0].prefix.as_str()), 28);
         assert_eq!(UnicodeWidthStr::width(user[0].text.as_str()), 57);
         assert!(user
             .iter()
             .filter(|line| line.tone == Tone::UserPrompt)
-            .all(|line| UnicodeWidthStr::width(line.prefix.as_str()) >= 20
+            .all(|line| UnicodeWidthStr::width(line.prefix.as_str()) >= 28
                 && painted_width(line) == 77));
         assert!(assistant
             .iter()
             .filter(|line| !line.text.is_empty())
-            .all(|line| painted_width(line) <= 59));
+            .all(|line| painted_width(line) <= 51));
     }
 
     #[test]
