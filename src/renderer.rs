@@ -178,6 +178,7 @@ impl Block {
         }
         Self::new(BlockKind::Welcome, "DEVEZ VIBE", body)
     }
+
 }
 
 pub struct OverlayView<'a> {
@@ -1391,9 +1392,6 @@ impl Renderer {
         activity_phase: f32,
         plan_active: bool,
     ) -> Result<()> {
-        if plan_summary.is_some() {
-            self.remove_welcome_history(width);
-        }
         let rows = height as usize;
         let plan_lines = plan_summary
             .map(|summary| fixed_plan_summary_lines(summary, width, activity_phase, plan_active))
@@ -1471,23 +1469,6 @@ impl Renderer {
         self.last_height = height;
         self.out.flush()?;
         Ok(())
-    }
-
-    /// The welcome card becomes obsolete once the fixed plan panel is visible.
-    /// It may already have been committed with the first user prompt, so hiding
-    /// only the live card would leave a stale copy in the transcript.
-    fn remove_welcome_history(&mut self, width: u16) {
-        if !self.history.iter().any(|block| matches!(block.kind, BlockKind::Welcome)) {
-            return;
-        }
-        let before = self.wrapped.len();
-        self.history
-            .retain(|block| !matches!(block.kind, BlockKind::Welcome));
-        self.rewrap(width);
-        if self.scroll_back > 0 {
-            let row_delta = self.wrapped.len() as isize - before as isize;
-            self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
-        }
     }
 
     fn commit_fullscreen_blocks(&mut self, committed: &[Block], width: u16, view_rows: usize) {
@@ -3252,10 +3233,10 @@ fn welcome_notes_rows(column_width: usize) -> Vec<PanelRow> {
         let prefix = format!("  {}. ", index + 1);
         let continuation_indent = " ".repeat(prefix.len());
         let options = textwrap::Options::new(column_width.max(8))
-            .break_words(false)
+            .break_words(true)
             .initial_indent(&prefix)
             .subsequent_indent(&continuation_indent)
-            .word_separator(textwrap::WordSeparator::UnicodeBreakProperties);
+            .word_separator(textwrap::WordSeparator::AsciiSpace);
         rows.extend(textwrap::wrap(note, &options).into_iter().map(|folded| {
             (folded.into_owned(), Tone::Muted, false)
         }));
@@ -5615,21 +5596,69 @@ fn styled_lines(
         .max(1);
     let mut rows: Vec<Vec<PaintSpan>> = vec![Vec::new()];
     let mut used = 0;
+    let mut tokens: Vec<(bool, Vec<PaintSpan>, usize)> = Vec::new();
 
     for span in spans {
         for ch in span.text.chars() {
+            let whitespace = ch.is_whitespace();
             let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if used + char_width > available && used > 0 {
-                rows.push(Vec::new());
-                used = 0;
+            if let Some((last_whitespace, parts, token_width)) = tokens.last_mut()
+                && *last_whitespace == whitespace
+            {
+                push_highlight_span(parts, &ch.to_string(), span.tone, span.bold);
+                *token_width += char_width;
+            } else {
+                tokens.push((
+                    whitespace,
+                    vec![PaintSpan {
+                        text: ch.to_string(),
+                        tone: span.tone,
+                        bold: span.bold,
+                    }],
+                    char_width,
+                ));
             }
-            push_highlight_span(
-                rows.last_mut().expect("at least one styled row"),
-                &ch.to_string(),
-                span.tone,
-                span.bold,
-            );
-            used += char_width;
+        }
+    }
+
+    let mut pending_space = Vec::new();
+    let mut pending_space_width = 0;
+    for (whitespace, parts, token_width) in tokens {
+        if whitespace {
+            pending_space.extend(parts);
+            pending_space_width += token_width;
+            continue;
+        }
+
+        if used > 0 && used + pending_space_width + token_width > available {
+            rows.push(Vec::new());
+            used = 0;
+            pending_space.clear();
+            pending_space_width = 0;
+        }
+        if used > 0 {
+            for span in pending_space.drain(..) {
+                push_highlight_span(rows.last_mut().expect("at least one styled row"), &span.text, span.tone, span.bold);
+            }
+            used += pending_space_width;
+        }
+        pending_space_width = 0;
+
+        for span in parts {
+            for ch in span.text.chars() {
+                let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if used + char_width > available && used > 0 {
+                    rows.push(Vec::new());
+                    used = 0;
+                }
+                push_highlight_span(
+                    rows.last_mut().expect("at least one styled row"),
+                    &ch.to_string(),
+                    span.tone,
+                    span.bold,
+                );
+                used += char_width;
+            }
         }
     }
 
@@ -6022,9 +6051,11 @@ fn wrapped_line_with_continuation(
     // `CellFrame` leaves the physical final column blank to avoid terminal
     // autowrap, so text wrapping must reserve that same column as well.
     let available = width.saturating_sub(prefix_width + 1).max(4);
+    // `AsciiSpace` keeps links and paths intact so they fold to the next row as
+    // one word; `break_words` is the last resort for a word wider than the row.
     let options = textwrap::Options::new(available)
         .break_words(true)
-        .word_separator(textwrap::WordSeparator::UnicodeBreakProperties);
+        .word_separator(textwrap::WordSeparator::AsciiSpace);
     let wrapped = textwrap::wrap(text, options);
     if wrapped.is_empty() {
         return vec![PaintLine {
@@ -8366,6 +8397,34 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_lines_keep_korean_words_together() {
+        let lines = wrapped_line("● ", Tone::Accent, "가나다 라마바", Tone::Plain, false, 10);
+
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["가나다", "라마바"]
+        );
+    }
+
+    #[test]
+    fn markdown_lines_move_links_to_the_next_row_as_a_word() {
+        let lines = markdown_line(
+            "● ",
+            Tone::Accent,
+            "가나다 [state.rs](src/state.rs:4694)",
+            Tone::Plain,
+            false,
+            22,
+        );
+
+        assert_eq!(painted(&lines[0]), "● 가나다");
+        assert_eq!(painted(&lines[1]), "  state.rs:4694");
+    }
+
+    #[test]
     fn code_highlighter_distinguishes_keywords_types_functions_and_literals() {
         let spans = highlight_code(
             "pub struct DevezClient { retries: 3, name: \"cli\", run: build() } // ready",
@@ -10651,24 +10710,6 @@ mod tests {
             .iter()
             .map(painted)
             .collect()
-    }
-
-    #[test]
-    fn plan_panel_removes_a_previously_committed_welcome_card() {
-        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
-        renderer.history.push(Block::welcome("Pro", "C:\\work", "user@example.com", &[]));
-        renderer
-            .history
-            .push(Block::new(BlockKind::User, "You", "작업 시작"));
-        renderer.rewrap(80);
-
-        renderer.remove_welcome_history(80);
-
-        assert!(renderer
-            .history
-            .iter()
-            .all(|block| !matches!(block.kind, BlockKind::Welcome)));
-        assert!(renderer.wrapped.iter().any(|line| painted(line).contains("작업 시작")));
     }
 
     fn transcript_rows(count: usize, prefix: &str) -> Vec<Block> {

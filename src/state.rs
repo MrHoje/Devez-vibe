@@ -3221,7 +3221,7 @@ impl AppState {
         self.prepare_resume();
         self.side_parent = Some(parent);
         self.set_thread(thread_id, cwd, model, effort);
-        self.show_welcome = false;
+        self.commit_welcome_card();
         self.transient_status = Some("Side · Ctrl+C to return".to_owned());
         self.committed.push(Block::new(
             BlockKind::System,
@@ -3231,7 +3231,7 @@ impl AppState {
     }
 
     pub fn begin_side_prompt(&mut self, text: String) {
-        self.show_welcome = false;
+        self.commit_welcome_card();
         self.committed
             .push(Block::new(BlockKind::User, "You", text));
         self.reset_turn_item_tracking();
@@ -3320,7 +3320,6 @@ impl AppState {
         } else if let Some(plan) = plan_snapshot_from_history(turns) {
             self.restore_plan_snapshot(&plan);
         }
-        self.show_welcome = false;
     }
 
     fn restore_plan_snapshot(&mut self, plan: &PlanSnapshot) {
@@ -3539,7 +3538,6 @@ impl AppState {
         self.composer_notice = None;
         self.activity_notice = None;
         self.plan_summary = None;
-        self.show_welcome = false;
         self.busy = false;
         self.turn_id = None;
         self.pending_interrupt = false;
@@ -4480,7 +4478,7 @@ impl AppState {
                     started_at,
                     elapsed,
                 });
-                self.show_welcome = false;
+                self.commit_welcome_card();
             }
             "item/started" => {
                 if let Some(item) = params.get("item") {
@@ -9629,7 +9627,12 @@ mod tests {
             }),
         );
 
-        assert!(state.committed.is_empty());
+        // The welcome card is committed on the first plan update; the plan itself
+        // stays in the fixed panel instead of becoming a transcript card.
+        assert!(state
+            .committed
+            .iter()
+            .all(|block| matches!(block.kind, BlockKind::Welcome)));
         assert_eq!(state.plan_summary.as_ref().map(|summary| summary.steps.len()), Some(3));
         assert_eq!(
             state.plan_summary.as_ref().and_then(|summary| summary.explanation.as_deref()),
@@ -9923,7 +9926,6 @@ mod tests {
     #[test]
     fn clearing_the_screen_brings_the_welcome_panel_back() {
         let mut state = test_state();
-        // A first submit commits the welcome card and hides the live panel.
         state.editor.insert_str("hello");
         state.submit_editor();
         assert!(state.view().welcome.is_none());
@@ -11015,7 +11017,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_notification_hides_the_welcome_panel() {
+    fn plan_notification_commits_the_welcome_card() {
         let mut state = test_state();
         assert!(state.view().welcome.is_some());
 
@@ -11027,6 +11029,7 @@ mod tests {
         );
 
         assert!(state.view().welcome.is_none());
+        assert!(matches!(state.committed[0].kind, BlockKind::Welcome));
     }
 
     #[test]
