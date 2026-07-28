@@ -115,6 +115,14 @@ impl Editor {
         self.collapsed_paste_lines
     }
 
+    pub fn collapsed_paste_text(&self) -> Option<String> {
+        let (Some(start), Some(end)) = (self.collapsed_paste_start, self.collapsed_paste_end)
+        else {
+            return None;
+        };
+        Some(self.buffer[start..end].iter().collect())
+    }
+
     pub fn collapsed_paste_display(&self) -> Option<(String, usize)> {
         let lines = self.paste_summary_lines()?;
         let start = self.collapsed_paste_start.unwrap_or(0);

@@ -49,6 +49,10 @@ const FAST_GAP: Duration = Duration::from_millis(16);
 /// gaps so a payload newline can never escape as a submit key.
 const SHORTCUT_PASTE_GAP: Duration = Duration::from_millis(250);
 
+/// Once incoming keys match the collapsed block already in the editor, they
+/// are a second paste even when Windows Terminal never forwards `Ctrl+V`.
+const MATCHED_PASTE_GAP: Duration = Duration::from_millis(250);
+
 /// How many fast characters have to pile up before `Enter` stops meaning send.
 /// Typing scores zero, because the one 0ms gap an IME produces belongs to the
 /// Enter itself and never to a character. Two is therefore already decisive,
@@ -77,6 +81,8 @@ pub struct ComposerPasteBuffer {
     text: String,
     pasted: bool,
     shortcut_paste: bool,
+    expected_paste: Option<Vec<char>>,
+    expected_index: usize,
     disabled: bool,
 }
 
@@ -89,6 +95,15 @@ impl ComposerPasteBuffer {
     }
 
     pub fn observe(&mut self, key: KeyEvent, now: Instant) -> Vec<ComposerInput> {
+        self.observe_expected(key, now, None)
+    }
+
+    pub fn observe_expected(
+        &mut self,
+        key: KeyEvent,
+        now: Instant,
+        expected_paste: Option<&str>,
+    ) -> Vec<ComposerInput> {
         if self.disabled {
             return vec![ComposerInput::Key(key)];
         }
@@ -104,6 +119,37 @@ impl ComposerPasteBuffer {
             return pending.into_iter().map(ComposerInput::Text).collect();
         }
         let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+
+        if let Some(expected) = &self.expected_paste {
+            let key_char = paste_key_char(&key, true);
+            if key_char.is_some_and(|ch| expected.get(self.expected_index) == Some(&ch)) {
+                let ch = key_char.expect("matched paste key has text");
+                self.text.push(ch);
+                self.expected_index += 1;
+                self.pasted = true;
+                self.last = Some(now);
+                if self.expected_index == expected.len() {
+                    return self.flush().into_iter().map(ComposerInput::Text).collect();
+                }
+                return Vec::new();
+            }
+            self.expected_paste = None;
+            self.expected_index = 0;
+        }
+
+        if self.text.is_empty()
+            && let (Some(expected), Some(ch)) = (expected_paste, paste_key_char(&key, plain))
+        {
+            let expected = expected.chars().collect::<Vec<_>>();
+            if expected.first() == Some(&ch) {
+                self.text.push(ch);
+                self.last = Some(now);
+                self.expected_index = 1;
+                self.expected_paste = Some(expected);
+                return Vec::new();
+            }
+        }
+
         let fast = self
             .last
             .is_some_and(|last| now.duration_since(last) < self.idle_gap());
@@ -187,15 +233,31 @@ impl ComposerPasteBuffer {
         });
         self.last = None;
         self.shortcut_paste = false;
+        self.expected_paste = None;
+        self.expected_index = 0;
         buffered
     }
 
     fn idle_gap(&self) -> Duration {
-        if self.shortcut_paste {
+        if self.expected_paste.is_some() {
+            MATCHED_PASTE_GAP
+        } else if self.shortcut_paste {
             SHORTCUT_PASTE_GAP
         } else {
             FAST_GAP
         }
+    }
+}
+
+fn paste_key_char(key: &KeyEvent, plain: bool) -> Option<char> {
+    if !plain {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(ch) => Some(ch),
+        KeyCode::Enter => Some('\n'),
+        KeyCode::Tab => Some('\t'),
+        _ => None,
     }
 }
 
@@ -506,6 +568,51 @@ mod tests {
                 pasted: true,
             })
         );
+    }
+
+    #[test]
+    fn matched_second_paste_keeps_modified_symbols_and_newlines_together() {
+        let base = Instant::now();
+        let mut buffer = ComposerPasteBuffer::new();
+        let expected = "a@\nb";
+
+        assert!(
+            buffer
+                .observe_expected(press(KeyCode::Char('a')), base, Some(expected))
+                .is_empty()
+        );
+        assert!(
+            buffer
+                .observe_expected(
+                    KeyEvent::new(
+                        KeyCode::Char('@'),
+                        KeyModifiers::CONTROL | KeyModifiers::ALT,
+                    ),
+                    base + Duration::from_millis(40),
+                    Some(expected),
+                )
+                .is_empty()
+        );
+        assert!(
+            buffer
+                .observe_expected(
+                    press(KeyCode::Enter),
+                    base + Duration::from_millis(80),
+                    Some(expected),
+                )
+                .is_empty()
+        );
+
+        let inputs = buffer.observe_expected(
+            press(KeyCode::Char('b')),
+            base + Duration::from_millis(120),
+            Some(expected),
+        );
+        assert!(matches!(
+            &inputs[..],
+            [ComposerInput::Text(BufferedText { text, pasted: true })]
+                if text == expected
+        ));
     }
 
     #[test]

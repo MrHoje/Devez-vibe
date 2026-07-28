@@ -2962,7 +2962,11 @@ fn observe_composer_key(
     if state.has_pending_interaction() {
         state.handle_key(key)
     } else {
-        apply_composer_inputs(state, buffer.observe(key, now))
+        let expected_paste = state.editor.collapsed_paste_text();
+        apply_composer_inputs(
+            state,
+            buffer.observe_expected(key, now, expected_paste.as_deref()),
+        )
     }
 }
 
@@ -2997,7 +3001,12 @@ fn observe_composer_key_with_scroll(
     if state.has_pending_interaction() {
         state.handle_key(key)
     } else {
-        apply_composer_inputs_with_scroll(state, renderer, buffer.observe(key, now))
+        let expected_paste = state.editor.collapsed_paste_text();
+        apply_composer_inputs_with_scroll(
+            state,
+            renderer,
+            buffer.observe_expected(key, now, expected_paste.as_deref()),
+        )
     }
 }
 
@@ -3849,6 +3858,41 @@ mod tests {
         );
         assert_eq!(state.editor.paste_summary_lines(), None);
         assert_eq!(state.editor.text(), format!("{pasted} "));
+    }
+
+    #[test]
+    fn raw_second_paste_expands_without_submitting_when_ctrl_v_is_not_forwarded() {
+        let pasted = "a\nb\nc\nd\ne\nf";
+        let mut state = starting_state();
+        state.handle_paste(pasted);
+        let mut buffer = ComposerPasteBuffer::new();
+        let base = Instant::now();
+
+        for (index, ch) in pasted.chars().enumerate() {
+            let at = base + Duration::from_millis(index as u64 * 40);
+            if index > 0 {
+                assert!(!flush_composer_paste(
+                    &mut state,
+                    &mut buffer,
+                    at - Duration::from_millis(20),
+                ));
+            }
+            let code = if ch == '\n' {
+                KeyCode::Enter
+            } else {
+                KeyCode::Char(ch)
+            };
+            let action = observe_composer_key(
+                &mut state,
+                &mut buffer,
+                press(code, KeyModifiers::NONE),
+                at,
+            );
+            assert!(!matches!(action, Action::Submit(_)));
+        }
+
+        assert_eq!(state.editor.paste_summary_lines(), None);
+        assert_eq!(state.editor.text(), pasted);
     }
 
     /// The model and effort readings stand for the commands that change them, so a
