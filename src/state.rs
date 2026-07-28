@@ -782,6 +782,7 @@ pub enum Action {
         shell: ShellDisplayMode,
         diff: DiffDisplayMode,
     },
+    PersistConversationView(ConversationView),
     PersistStatusLine {
         key_path: &'static str,
         enabled: bool,
@@ -2126,6 +2127,16 @@ fn resume_picker_rows(height: u16) -> usize {
     )
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConversationView { #[default] List, Chat }
+
+impl ConversationView {
+    pub const fn label(self) -> &'static str { match self { Self::List => "List", Self::Chat => "Chat" } }
+    pub const fn config_value(self) -> &'static str { match self { Self::List => "list", Self::Chat => "chat" } }
+    pub const fn next(self) -> Self { match self { Self::List => Self::Chat, Self::Chat => Self::List } }
+    pub const fn is_chat(self) -> bool { matches!(self, Self::Chat) }
+}
+
 fn visible_resume_picker_rows() -> usize {
     let height = terminal::size().map(|(_, height)| height).unwrap_or(30);
     resume_picker_rows(height)
@@ -2451,6 +2462,7 @@ pub struct AppState {
     status_metadata_refreshed_at: Instant,
     response_length: ResponseLength,
     vibe_mode: VibeMode,
+    conversation_view: ConversationView,
     shell_display_mode: ShellDisplayMode,
     diff_display_mode: DiffDisplayMode,
     status_line_settings: StatusLineSettings,
@@ -2509,6 +2521,7 @@ impl AppState {
             .unwrap_or_else(|| "high".to_owned());
         let branch = read_git_branch(&cwd);
         let vibe_mode = read_vibe_mode();
+        let conversation_view = read_conversation_view();
         let (response_length, shell_display_mode, diff_display_mode) = match vibe_mode {
             VibeMode::Vibe => (ResponseLength::Short, ShellDisplayMode::Collapse, DiffDisplayMode::Collapse),
             VibeMode::SuperVibe => (ResponseLength::Short, ShellDisplayMode::Hide, DiffDisplayMode::Hide),
@@ -2574,6 +2587,7 @@ impl AppState {
             activity_notice: None,
             status_metadata_refreshed_at: Instant::now(),
             vibe_mode,
+            conversation_view,
             response_length,
             shell_display_mode,
             diff_display_mode,
@@ -3033,6 +3047,7 @@ impl AppState {
                 VibeMode::Vibe => VibeTone::On,
                 VibeMode::SuperVibe => VibeTone::Super,
             },
+            conversation_view: self.conversation_view.label().to_owned(),
             label: self.permission_mode().label().to_owned(),
             accent: self.permission_mode().accent(),
             model: self.selected_model_name().to_owned(),
@@ -3607,6 +3622,7 @@ impl AppState {
                 .as_ref()
                 .map(|(notice, _)| notice.clone()),
             composer_mode: Some(self.composer_mode()),
+            chat_layout: self.conversation_view.is_chat(),
             shell_display_mode: self.shell_display_mode(),
             diff_display_mode: self.diff_display_mode(),
         }
@@ -6560,6 +6576,11 @@ impl AppState {
         self.response_length
     }
 
+    pub fn cycle_conversation_view(&mut self) -> ConversationView {
+        self.conversation_view = self.conversation_view.next();
+        self.conversation_view
+    }
+
     pub fn cycle_vibe_mode(&mut self) -> (ShellDisplayMode, DiffDisplayMode) {
         self.vibe_mode = self.vibe_mode.next();
         match self.vibe_mode {
@@ -8304,6 +8325,13 @@ fn read_vibe_mode() -> VibeMode {
             _ => VibeMode::Vibe,
         })
         .unwrap_or_default()
+}
+
+fn read_conversation_view() -> ConversationView {
+    match read_vibe_config_value("conversation_view").as_deref() {
+        Some("chat") => ConversationView::Chat,
+        _ => ConversationView::List,
+    }
 }
 
 #[allow(dead_code)]

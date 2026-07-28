@@ -4,7 +4,7 @@ use std::{
     io::{Stdout, Write, stdout},
     ops::Range,
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
@@ -113,6 +113,7 @@ pub struct Block {
 }
 
 static NEXT_BLOCK_ID: AtomicU64 = AtomicU64::new(1);
+static CHAT_LAYOUT: AtomicBool = AtomicBool::new(true);
 
 impl Block {
     pub fn new(kind: BlockKind, title: impl Into<String>, body: impl Into<String>) -> Self {
@@ -257,6 +258,7 @@ pub struct ComposerMode {
     pub branch: Option<String>,
     pub vibe_mode: String,
     pub vibe_tone: VibeTone,
+    pub conversation_view: String,
     #[allow(dead_code)]
     pub label: String,
     #[allow(dead_code)]
@@ -321,6 +323,7 @@ pub struct View<'a> {
     pub status_line: Option<StatusLineView>,
     pub composer_notice: Option<String>,
     pub composer_mode: Option<ComposerMode>,
+    pub chat_layout: bool,
     pub shell_display_mode: ShellDisplayMode,
     pub diff_display_mode: DiffDisplayMode,
 }
@@ -411,6 +414,7 @@ pub struct Renderer {
     wrapped_width: u16,
     shell_display_mode: ShellDisplayMode,
     diff_display_mode: DiffDisplayMode,
+    chat_layout: bool,
     expanded_tools: HashSet<u64>,
     hovered_tool: Option<u64>,
     painted_hovered_tool: Option<u64>,
@@ -629,6 +633,7 @@ impl Renderer {
             wrapped_width: 0,
             shell_display_mode: ShellDisplayMode::Collapse,
             diff_display_mode: DiffDisplayMode::Collapse,
+            chat_layout: false,
             expanded_tools: HashSet::new(),
             hovered_tool: None,
             painted_hovered_tool: None,
@@ -1008,11 +1013,14 @@ impl Renderer {
     }
 
     pub fn render(&mut self, committed: &[Block], view: View<'_>) -> Result<()> {
+        CHAT_LAYOUT.store(view.chat_layout, Ordering::Relaxed);
         let mode_changed = self.shell_display_mode != view.shell_display_mode
-            || self.diff_display_mode != view.diff_display_mode;
+            || self.diff_display_mode != view.diff_display_mode
+            || self.chat_layout != view.chat_layout;
         if mode_changed {
             self.shell_display_mode = view.shell_display_mode;
             self.diff_display_mode = view.diff_display_mode;
+            self.chat_layout = view.chat_layout;
             self.wrapped_width = 0;
             if self.mode == RenderMode::Inline {
                 self.relayout()?;
@@ -2074,6 +2082,7 @@ pub enum Pick {
     RemoveQueuedPrompt(usize),
     /// The Vibe preset applies its response and transcript display settings.
     VibeMode,
+    ConversationView,
     /// Legacy internal picks retained for command and regression-test routing.
     #[allow(dead_code)]
     ResponseLength,
@@ -2389,6 +2398,11 @@ fn activity_line_with_composer_controls(
 
     let badge_start = line.tail.len() + 2;
     let mut picks = Vec::new();
+    picks.extend(
+        badge
+            .conversation_view_index
+            .map(|index| (badge_start + index, Pick::ConversationView)),
+    );
     picks.extend(
         badge
             .shell_display_mode_index
@@ -4880,7 +4894,7 @@ fn block_lines_with_mode(
     };
 
     let conversational = matches!(block.kind, BlockKind::Assistant);
-    let conversational_width = if conversational {
+    let conversational_width = if conversational && CHAT_LAYOUT.load(Ordering::Relaxed) {
         conversation_region_width(width).saturating_add(1) as u16
     } else {
         width
@@ -4993,6 +5007,13 @@ fn block_lines_with_expansion(block: &Block, width: u16, expanded: bool) -> Vec<
 }
 
 fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
+    if !CHAT_LAYOUT.load(Ordering::Relaxed) {
+        return block
+            .body
+            .lines()
+            .flat_map(|line| wrapped_line(" ", Tone::Plain, line, Tone::UserPrompt, false, width))
+            .collect();
+    }
     const BUBBLE_PADDING: usize = 1;
     const RIGHT_GAP: usize = 2;
 
@@ -6067,6 +6088,11 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
         },
         bold: false,
     };
+    let conversation_view_span = PaintSpan {
+        text: format!("View: {}", mode.conversation_view),
+        tone: Tone::Error,
+        bold: false,
+    };
 
     let fast_label = if mode.fast_mode {
         "Fast: On"
@@ -6092,7 +6118,9 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
             PaintSpan { text: format!("Diff: {}", mode.diff_display_mode), tone: Tone::Muted, bold: false },
         ]
     });
-    let primary_spans = custom_spans.unwrap_or_else(|| vec![vibe_mode_span.clone()]);
+    let primary_spans = custom_spans.unwrap_or_else(|| {
+        vec![conversation_view_span, separator_span(), vibe_mode_span.clone()]
+    });
     // Fast is the only optional trailing control.
     let ladder = [
         BadgeSpans {
@@ -6102,14 +6130,16 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
                 vec![fast_span.clone()],
             ]
             .concat(),
-            response_length_index: Some(display_width),
+            conversation_view_index: Some(display_width),
+            response_length_index: Some(display_width + 2),
             shell_display_mode_index: None,
             diff_display_mode_index: None,
             fast_index: Some(display_width + primary_spans.len() + 1),
         },
         BadgeSpans {
             spans: [display_spans, primary_spans.clone()].concat(),
-            response_length_index: Some(display_width),
+            conversation_view_index: Some(display_width),
+            response_length_index: Some(display_width + 2),
             shell_display_mode_index: None,
             diff_display_mode_index: None,
             fast_index: None,
@@ -6125,6 +6155,7 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
 /// that picked the candidate knows which rung it settled on.
 struct BadgeSpans {
     spans: Vec<PaintSpan>,
+    conversation_view_index: Option<usize>,
     response_length_index: Option<usize>,
     shell_display_mode_index: Option<usize>,
     diff_display_mode_index: Option<usize>,
@@ -6365,6 +6396,7 @@ fn hover_repaint_columns(
 fn row_background(tone: Tone) -> Option<Rgb> {
     let palette = theme::palette();
     Some(match tone {
+        Tone::UserPrompt if !CHAT_LAYOUT.load(Ordering::Relaxed) => palette.user_prompt_bg,
         Tone::ModelChange => palette.model_change_bg,
         Tone::DiffAdded | Tone::DiffAddedWord => palette.diff_add_bg,
         Tone::DiffRemoved | Tone::DiffRemovedWord => palette.diff_remove_bg,
@@ -6377,7 +6409,7 @@ fn row_background(tone: Tone) -> Option<Rgb> {
 fn word_background(tone: Tone) -> Option<Rgb> {
     let palette = theme::palette();
     Some(match tone {
-        Tone::UserPrompt => palette.user_prompt_bg,
+        Tone::UserPrompt if CHAT_LAYOUT.load(Ordering::Relaxed) => palette.user_prompt_bg,
         Tone::DiffAddedWord => palette.diff_add_word_bg,
         Tone::DiffRemovedWord => palette.diff_remove_word_bg,
         Tone::ScrollToBottom => palette.hover_bg,
@@ -8600,6 +8632,7 @@ mod tests {
             branch: None,
             vibe_mode: "Vibe: On".to_owned(),
             vibe_tone: VibeTone::On,
+            conversation_view: "Chat".to_owned(),
             label: label.to_owned(),
             accent,
             model: "GPT-5.6-Terra".to_owned(),
