@@ -895,6 +895,11 @@ impl Renderer {
         } else {
             column.min(width.saturating_sub(1).min(u16::MAX as usize) as u16)
         };
+        if line.tone == Tone::UserPrompt
+            && usize::from(column) < UnicodeWidthStr::width(line.prefix.as_str())
+        {
+            return None;
+        }
         Some(CellPosition { column, row })
     }
 
@@ -2163,21 +2168,6 @@ impl PaintLine {
 
     fn blank() -> Self {
         Self::plain("")
-    }
-
-    fn user_prompt_half_padding(width: u16, glyph: char) -> Self {
-        Self {
-            prefix: String::new(),
-            prefix_tone: Tone::Plain,
-            text: glyph
-                .to_string()
-                .repeat(usize::from(width).saturating_sub(1)),
-            tone: Tone::UserPromptHalf,
-            bold: false,
-            tool_heading: None,
-            pick: None,
-            tail: Vec::new(),
-        }
     }
 
     /// Makes single spans of an already-built row clickable. `picks` addresses
@@ -5003,48 +4993,36 @@ fn block_lines_with_expansion(block: &Block, width: u16, expanded: bool) -> Vec<
 }
 
 fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
+    const BUBBLE_PADDING: usize = 1;
+    const RIGHT_GAP: usize = 2;
+
     let region_width = conversation_region_width(width);
-    let prompt_width = region_width.saturating_add(1) as u16;
     let left_margin = usize::from(width).saturating_sub(1).saturating_sub(region_width);
-    let mut lines = vec![PaintLine::user_prompt_half_padding(prompt_width, '▄')];
-    if block.body.is_empty() {
-        lines.extend(wrapped_line(
-            " ",
-            Tone::Plain,
-            "",
-            Tone::UserPrompt,
-            false,
-            prompt_width,
-        ));
-        lines.push(PaintLine::user_prompt_half_padding(prompt_width, '▀'));
+    let content_width = region_width.saturating_sub(RIGHT_GAP + BUBBLE_PADDING * 2);
+    let raw_lines = if block.body.is_empty() {
+        vec![""]
     } else {
-        for raw_line in block.body.lines() {
-            lines.extend(wrapped_line(
-                " ",
+        block.body.lines().collect()
+    };
+    let mut lines = raw_lines
+        .into_iter()
+        .flat_map(|raw_line| {
+            wrapped_line(
+                "",
                 Tone::Plain,
                 raw_line,
                 Tone::UserPrompt,
                 false,
-                prompt_width,
-            ));
-        }
-        lines.push(PaintLine::user_prompt_half_padding(prompt_width, '▀'));
-    }
-
-    let margin = " ".repeat(left_margin);
+                content_width.saturating_add(1) as u16,
+            )
+        })
+        .collect::<Vec<_>>();
     for line in &mut lines {
-        if line.tone == Tone::UserPrompt {
-            let text_width = UnicodeWidthStr::width(line.text.as_str())
-                + line
-                    .tail
-                    .iter()
-                    .filter(|span| span.tone != Tone::CopyJoin)
-                    .map(|span| UnicodeWidthStr::width(span.text.as_str()))
-                    .sum::<usize>();
-            line.prefix = " ".repeat(left_margin + region_width.saturating_sub(text_width));
-        } else {
-            line.prefix = format!("{margin}{}", line.prefix);
-        }
+        line.text = format!("{}{}{}", " ".repeat(BUBBLE_PADDING), line.text, " ".repeat(BUBBLE_PADDING));
+        let bubble_width = UnicodeWidthStr::width(line.text.as_str());
+        line.prefix = " ".repeat(
+            left_margin + region_width.saturating_sub(RIGHT_GAP + bubble_width),
+        );
     }
     lines
 }
@@ -6387,7 +6365,6 @@ fn hover_repaint_columns(
 fn row_background(tone: Tone) -> Option<Rgb> {
     let palette = theme::palette();
     Some(match tone {
-        Tone::UserPrompt => palette.user_prompt_bg,
         Tone::ModelChange => palette.model_change_bg,
         Tone::DiffAdded | Tone::DiffAddedWord => palette.diff_add_bg,
         Tone::DiffRemoved | Tone::DiffRemovedWord => palette.diff_remove_bg,
@@ -6400,6 +6377,7 @@ fn row_background(tone: Tone) -> Option<Rgb> {
 fn word_background(tone: Tone) -> Option<Rgb> {
     let palette = theme::palette();
     Some(match tone {
+        Tone::UserPrompt => palette.user_prompt_bg,
         Tone::DiffAddedWord => palette.diff_add_word_bg,
         Tone::DiffRemovedWord => palette.diff_remove_word_bg,
         Tone::ScrollToBottom => palette.hover_bg,
@@ -6827,7 +6805,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(frame.cell(6, 0).style.background, row_background(Tone::UserPrompt));
+        assert_eq!(frame.cell(6, 0).style.background, word_background(Tone::UserPrompt));
         assert_eq!(frame.cell(7, 0).style.background, None);
     }
 
@@ -7466,32 +7444,31 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_selection_excludes_user_prompt_half_padding() {
+    fn fullscreen_selection_copies_right_aligned_user_bubbles() {
         let lines = block_lines(&Block::new(BlockKind::User, "You", "first\nsecond"), 80);
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
         renderer.previous_lines = lines;
 
-        assert!(renderer.begin_selection(74, 1));
-        assert!(renderer.update_selection(78, 2));
+        assert!(renderer.begin_selection(71, 0));
+        assert!(renderer.update_selection(77, 1));
         assert_eq!(
-            renderer.finish_selection(78, 2),
+            renderer.finish_selection(77, 1),
             SelectionResult::Copy("first\nsecond".to_owned())
         );
     }
 
     #[test]
-    fn user_prompt_half_padding_cannot_start_a_selection() {
+    fn user_prompt_bubble_cannot_start_selection_outside_its_text() {
         let lines = block_lines(&Block::new(BlockKind::User, "You", "prompt"), 80);
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
         renderer.previous_lines = lines;
 
         assert!(!renderer.begin_selection(0, 0));
-        assert!(!renderer.begin_selection(0, 2));
-        assert!(renderer.begin_selection(73, 1));
+        assert!(renderer.begin_selection(70, 0));
     }
 
     #[test]
-    fn user_prompt_group_has_half_height_padding_above_and_below_the_prompt() {
+    fn user_prompt_group_keeps_each_bubble_inside_the_right_column() {
         let lines = block_group_lines(
             &Block::new(BlockKind::User, "You", "first\nsecond"),
             80,
@@ -7500,23 +7477,17 @@ mod tests {
             false,
         );
 
-        assert_eq!(lines.len(), 5);
-        assert_eq!(lines[0].tone, Tone::UserPromptHalf);
-        assert!(lines[0].text.chars().all(|glyph| glyph == '▄'));
-        assert_eq!(lines[1].text, "first");
-        assert_eq!(lines[2].text, "second");
-        assert_eq!(lines[3].tone, Tone::UserPromptHalf);
-        assert!(lines[3].text.chars().all(|glyph| glyph == '▀'));
-        assert!(lines[4] == PaintLine::blank());
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].text, " first ");
+        assert_eq!(lines[1].text, " second ");
+        assert!(lines[2] == PaintLine::blank());
 
         let selection = CellRange {
-            start: CellPosition { column: 0, row: 0 },
-            end: CellPosition { column: 8, row: 3 },
+            start: CellPosition { column: 71, row: 0 },
+            end: CellPosition { column: 77, row: 1 },
         };
-        assert_eq!(selection_columns_for_line(&lines[0], selection, 0), None);
-        assert_eq!(selection_columns_for_line(&lines[3], selection, 3), None);
+        assert_ne!(selection_columns_for_line(&lines[0], selection, 0), None);
         assert_ne!(selection_columns_for_line(&lines[1], selection, 1), None);
-        assert_ne!(selection_columns_for_line(&lines[2], selection, 2), None);
     }
 
     #[test]
@@ -7536,12 +7507,12 @@ mod tests {
         let assistant = block_lines(&Block::new(BlockKind::Assistant, "Codex", "x".repeat(120)), 80);
 
         assert_eq!(UnicodeWidthStr::width(user[0].prefix.as_str()), 20);
-        assert_eq!(UnicodeWidthStr::width(user[0].text.as_str()), 59);
+        assert_eq!(UnicodeWidthStr::width(user[0].text.as_str()), 57);
         assert!(user
             .iter()
             .filter(|line| line.tone == Tone::UserPrompt)
-            .all(|line| UnicodeWidthStr::width(line.prefix.as_str()) >= 21
-                && painted_width(line) == 79));
+            .all(|line| UnicodeWidthStr::width(line.prefix.as_str()) >= 20
+                && painted_width(line) == 77));
         assert!(assistant
             .iter()
             .filter(|line| !line.text.is_empty())
@@ -9078,11 +9049,11 @@ mod tests {
         let user_lines = block_lines(&user, 80);
         let assistant_lines = block_lines(&assistant, 80);
 
-        assert_eq!(user_lines[1].prefix, " ".repeat(74));
-        assert_eq!(user_lines[1].text, "hello");
-        assert!(user_lines[1].prefix_tone == Tone::Plain);
-        assert!(user_lines[1].tone == Tone::UserPrompt);
-        assert!(!user_lines[1].bold);
+        assert_eq!(user_lines[0].prefix, " ".repeat(70));
+        assert_eq!(user_lines[0].text, " hello ");
+        assert!(user_lines[0].prefix_tone == Tone::Plain);
+        assert!(user_lines[0].tone == Tone::UserPrompt);
+        assert!(!user_lines[0].bold);
         assert_eq!(assistant_lines[0].prefix, "• ");
         assert_eq!(assistant_lines[0].prefix_tone, Tone::FastOff);
         assert_eq!(assistant_lines[0].text, "hi");
