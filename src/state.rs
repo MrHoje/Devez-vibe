@@ -2763,7 +2763,6 @@ impl AppState {
     }
 
     pub fn turn_input(&mut self, text: String) -> Vec<Value> {
-        self.close_completed_plan_summary();
         let triggers = mention_triggers(&text);
         let text_chars = text.chars().collect::<Vec<_>>();
         let mut input = vec![json!({
@@ -3584,7 +3583,7 @@ impl AppState {
             composer_images: &self.composer_images,
             queued_prompts: self.queued_prompts.iter().cloned().collect(),
             composer_placeholder: if self.busy {
-                "Enter: steer current prompt · Tab: queue next prompt"
+                "Enter: steer · Tab: queue"
             } else {
                 ""
             },
@@ -4377,6 +4376,10 @@ impl AppState {
                     .as_ref()
                     .map(|summary| summary.started_at)
                     .unwrap_or_else(Instant::now);
+                let expanded = self
+                    .plan_summary
+                    .as_ref()
+                    .is_some_and(|summary| summary.expanded);
                 let elapsed = if !steps.is_empty()
                     && steps.iter().all(|step| step.status == PlanStepStatus::Completed)
                 {
@@ -4390,7 +4393,7 @@ impl AppState {
                 self.plan_summary = Some(PlanSummary {
                     explanation: explanation.map(ToOwned::to_owned),
                     steps,
-                    expanded: false,
+                    expanded,
                     started_at,
                     elapsed,
                 });
@@ -6347,25 +6350,15 @@ impl AppState {
                 .map(|started| started.elapsed().as_secs())
                 .unwrap_or(0);
             if self.turn_interrupted {
-                let interrupted_elapsed = self
-                    .last_completed_duration
-                    .map(|duration| duration.as_secs())
-                    .unwrap_or(elapsed);
-                return Some(format!(
-                    "X Interrupted ({})",
-                    format_elapsed(interrupted_elapsed)
-                ));
+                return Some("X Interrupted".to_owned());
             }
             return Some(format!("Working.. ({})", format_elapsed(elapsed)));
         }
-        self.last_completed_duration.map(|duration| {
-            let label = if self.turn_interrupted {
-                "X Interrupted"
-            } else {
-                "Completed"
-            };
-            format!("{label} ({})", format_elapsed(duration.as_secs()))
-        })
+        if self.turn_interrupted && self.last_completed_duration.is_some() {
+            return Some("X Interrupted".to_owned());
+        }
+        self.last_completed_duration
+            .map(|duration| format!("Completed ({})", format_elapsed(duration.as_secs())))
     }
 
     fn activity_model(&self) -> Option<String> {
@@ -6606,17 +6599,6 @@ impl AppState {
         if let Some(summary) = &mut self.plan_summary {
             summary.expanded = !summary.expanded;
         }
-    }
-
-    pub fn close_completed_plan_summary(&mut self) -> bool {
-        let completed = self.plan_summary.as_ref().is_some_and(|summary| {
-            !summary.steps.is_empty()
-                && summary.steps.iter().all(|step| step.status == PlanStepStatus::Completed)
-        });
-        if completed {
-            self.plan_summary = None;
-        }
-        completed
     }
 
     /// Runs a slash command the composer never typed — what a click on the
@@ -8660,7 +8642,7 @@ mod tests {
         assert!(
             state
                 .activity()
-                .is_some_and(|activity| activity.starts_with("X Interrupted ("))
+                .is_some_and(|activity| activity == "X Interrupted")
         );
         assert_eq!(state.take_pending_interrupt(), None);
 
@@ -9516,6 +9498,24 @@ mod tests {
     }
 
     #[test]
+    fn plan_expansion_survives_next_prompt_and_plan_update() {
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [{ "step": "check", "status": "inProgress" }] }),
+        );
+        state.toggle_plan_summary();
+
+        state.turn_input("next prompt".to_owned());
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [{ "step": "check", "status": "completed" }] }),
+        );
+
+        assert!(state.plan_summary.as_ref().is_some_and(|summary| summary.expanded));
+    }
+
+    #[test]
     fn resumed_plan_turns_in_progress_steps_into_pending() {
         let mut state = test_state();
         state.restore_plan_snapshot(&PlanSnapshot {
@@ -9619,37 +9619,6 @@ mod tests {
             "unexpected credit row: {}",
             lines[1]
         );
-    }
-
-    #[test]
-    fn completed_plan_summary_can_be_dismissed() {
-        let mut state = test_state();
-        state.plan_summary = Some(PlanSummary {
-            explanation: None,
-            steps: vec![PlanStep { text: "완료".to_owned(), status: PlanStepStatus::Completed, started_at: None, elapsed: None }],
-            expanded: false,
-            started_at: Instant::now(),
-            elapsed: None,
-        });
-
-        assert!(state.close_completed_plan_summary());
-        assert!(state.plan_summary.is_none());
-    }
-
-    #[test]
-    fn next_prompt_dismisses_a_completed_plan_summary() {
-        let mut state = test_state();
-        state.plan_summary = Some(PlanSummary {
-            explanation: None,
-            steps: vec![PlanStep { text: "완료".to_owned(), status: PlanStepStatus::Completed, started_at: None, elapsed: None }],
-            expanded: false,
-            started_at: Instant::now(),
-            elapsed: None,
-        });
-
-        state.turn_input("다음 작업".to_owned());
-
-        assert!(state.plan_summary.is_none());
     }
 
     #[test]
@@ -10778,7 +10747,7 @@ mod tests {
         assert!(
             state
                 .activity()
-                .is_some_and(|activity| activity.starts_with("X Interrupted ("))
+                .is_some_and(|activity| activity == "X Interrupted")
         );
     }
 
@@ -10793,13 +10762,13 @@ mod tests {
 
         assert_eq!(
             state.activity().as_deref(),
-            Some("X Interrupted (10s)")
+            Some("X Interrupted")
         );
 
         state.handle_notification("turn/completed", &json!({}));
         assert_eq!(
             state.activity().as_deref(),
-            Some("X Interrupted (10s)")
+            Some("X Interrupted")
         );
     }
 
@@ -10852,7 +10821,7 @@ mod tests {
 
         assert_eq!(
             state.view().composer_placeholder,
-            "Enter: steer current prompt · Tab: queue next prompt"
+            "Enter: steer · Tab: queue"
         );
     }
 

@@ -956,11 +956,7 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
         Pick::EffortSetting => state.run_command("/effort"),
         Pick::ScrollToBottom => Action::ScrollToBottom,
         Pick::Close => {
-            if state.close_completed_plan_summary() {
-                Action::Tick(true)
-            } else {
-                state.close_overlay()
-            }
+            state.close_overlay()
         }
         Pick::Row(index) => state.click_overlay_row(index),
         Pick::Effort(step) => state.click_effort_step(step),

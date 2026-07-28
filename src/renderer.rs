@@ -904,11 +904,7 @@ impl Renderer {
             .map(|line| CopyLine {
                 text: painted_line_text(line),
                 join_next: copy_joins_next(line),
-                marker_width: if is_copy_marker(&line.prefix) {
-                    UnicodeWidthStr::width(line.prefix.as_str())
-                } else {
-                    0
-                },
+                marker_width: 0,
                 prefix_width: UnicodeWidthStr::width(line.prefix.as_str()),
                 content_columns: selectable_content_columns(line),
             })
@@ -1440,8 +1436,7 @@ impl Renderer {
         let tagged = copy_metadata_applies(block.kind);
         for line in lines {
             if tagged {
-                let marker_skip = usize::from(is_copy_marker(&line.prefix))
-                    * UnicodeWidthStr::width(line.prefix.as_str());
+                let marker_skip = 0;
                 let join_next = usize::from(copy_joins_next(line));
                 let prefix_width = UnicodeWidthStr::width(line.prefix.as_str());
                 queue!(
@@ -2517,8 +2512,9 @@ fn composer_content_columns(line: &PaintLine) -> Option<Range<usize>> {
     })
 }
 
-/// Decorative conversation gutters identify a row's kind but are never part of
-/// its text. They share the same range in selection paint and clipboard output.
+/// Composer chrome, code-box borders, and blank continuation gutters are not
+/// text. Visible conversation markers are text and remain selectable so copy
+/// and paste matches Claude Code.
 fn selectable_content_columns(line: &PaintLine) -> Option<Range<usize>> {
     composer_content_columns(line).or_else(|| {
         let boxed_code = line.prefix.ends_with("│ ")
@@ -2542,7 +2538,7 @@ fn selectable_content_columns(line: &PaintLine) -> Option<Range<usize>> {
         let empty_gutter = !line.prefix.is_empty()
             && line.prefix.chars().all(|ch| ch == ' ')
             && !fallback_status_gutter;
-        (is_copy_marker(&line.prefix) || empty_gutter)
+        empty_gutter
             .then(|| UnicodeWidthStr::width(line.prefix.as_str())..painted_line_width(line))
     })
 }
@@ -2817,8 +2813,12 @@ fn welcome_info_rows(welcome: &WelcomeView, column_width: usize) -> Vec<PanelRow
     // First credit row sits beside the label; the rest hang under the value column.
     let mut credits = welcome.credits.iter();
     let summary = credits.next().map_or("—", String::as_str);
-    let icon = if welcome.credits_expanded { "⌃" } else { "⌄" };
-    let reset = format!("  Resets   {summary}  {icon}");
+    let icon = if welcome.credits_expanded { "∧" } else { "∨" };
+    let summary = compact_right(
+        summary,
+        column_width.saturating_sub(WELCOME_LABEL_WIDTH + UnicodeWidthStr::width(icon) + 2),
+    );
+    let reset = format!("  Resets   {summary} {icon} ");
     rows.push((
         reset,
         Tone::Plain,
@@ -2857,8 +2857,22 @@ fn welcome_info_rows(welcome: &WelcomeView, column_width: usize) -> Vec<PanelRow
 
 fn welcome_reset_pick(mut line: PaintLine) -> PaintLine {
     if line.text.contains("Resets") {
-        let width = painted_line_width(&line);
-        line.pick = Some(PickRegions::span(0, width, Pick::ToggleWelcomeCredits));
+        if let Some(icon_start) = line.text.find(['∨', '∧']) {
+            let value_start = line
+                .text
+                .find("Resets   ")
+                .map(|start| start + "Resets   ".len())
+                .unwrap_or(icon_start);
+            let start = UnicodeWidthStr::width(line.prefix.as_str())
+                + UnicodeWidthStr::width(&line.text[..value_start]);
+            let end = UnicodeWidthStr::width(line.prefix.as_str())
+                + UnicodeWidthStr::width(&line.text[..icon_start + '∨'.len_utf8()]);
+            line.pick = Some(PickRegions::span(
+                start.saturating_sub(PICK_BLEED),
+                end + PICK_BLEED,
+                Pick::ToggleWelcomeCredits,
+            ));
+        }
     }
     line
 }
@@ -4583,6 +4597,27 @@ fn plan_lines(block: &Block, width: u16) -> Vec<PaintLine> {
 fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_active: bool) -> Vec<PaintLine> {
     let line_width = panel_span(width);
     let completed = summary.steps.iter().filter(|step| step.status == PlanStepStatus::Completed).count();
+    let title = format!("작업 단계 · {completed} / {} 완료", summary.steps.len());
+    if !summary.expanded {
+        let tail = " ∨ ━";
+        let rule = "━".repeat(
+            line_width.saturating_sub(4 + UnicodeWidthStr::width(title.as_str()) + UnicodeWidthStr::width(tail)),
+        );
+        let header = PaintLine {
+            prefix: String::new(),
+            prefix_tone: Tone::Border,
+            text: format!("━━ {title} {rule}"),
+            tone: Tone::Plain,
+            bold: false,
+            tool_heading: None,
+            pick: None,
+            tail: vec![
+                PaintSpan { text: " ∨ ".to_owned(), tone: Tone::Plain, bold: false },
+                PaintSpan { text: "━".to_owned(), tone: Tone::Plain, bold: false },
+            ],
+        };
+        return vec![header.with_picks(&[(1, Pick::PlanSummary)])];
+    }
     let mut lines = Vec::new();
     let steps = summary.steps.iter().collect::<Vec<_>>();
     let hidden = steps.len().saturating_sub(4);
@@ -4592,7 +4627,7 @@ fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_
             PlanStepStatus::Completed => ("  ✔  ".to_owned(), false),
             PlanStepStatus::InProgress if plan_active => (format!("  {}  ", WORKING_SPINNER[(phase.clamp(0.0, 0.999) * WORKING_SPINNER.len() as f32) as usize]), true),
             PlanStepStatus::InProgress => ("  ▸  ".to_owned(), false),
-            PlanStepStatus::Pending => ("  □  ".to_owned(), false),
+            PlanStepStatus::Pending => ("      ".to_owned(), false),
         };
         let elapsed_text = step.elapsed.map(format_plan_elapsed);
         let elapsed = elapsed_text.as_deref();
@@ -4635,9 +4670,8 @@ fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_
             pick: Some(PickRegions::span(2, UnicodeWidthStr::width(text.as_str()), Pick::PlanSummary)), tail: Vec::new(),
         });
     }
-    let title = format!("작업 단계 · {completed} / {} 완료", summary.steps.len());
     let all_completed = !summary.steps.is_empty() && completed == summary.steps.len();
-    let header_tail = if all_completed { " X ━┓" } else { "┓" };
+    let header_tail = " ∧ ━┓";
     let header_rule = "━".repeat(
         line_width
             .saturating_sub(5 + UnicodeWidthStr::width(title.as_str()) + UnicodeWidthStr::width(header_tail)),
@@ -4650,16 +4684,12 @@ fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_
         bold: false,
         tool_heading: None,
         pick: None,
-        tail: if all_completed {
-            vec![
-                PaintSpan { text: " X ".to_owned(), tone: Tone::Plain, bold: false },
-                PaintSpan { text: "━┓".to_owned(), tone: Tone::Plain, bold: false },
-            ]
-        } else {
-            vec![PaintSpan { text: "┓".to_owned(), tone: Tone::Plain, bold: false }]
-        },
+        tail: vec![
+            PaintSpan { text: " ∧ ".to_owned(), tone: Tone::Plain, bold: false },
+            PaintSpan { text: "━┓".to_owned(), tone: Tone::Plain, bold: false },
+        ],
     };
-    let header = if all_completed { header.with_picks(&[(1, Pick::Close)]) } else { header };
+    let header = header.with_picks(&[(1, Pick::PlanSummary)]);
     lines.insert(0, header);
     lines.insert(1, PaintLine::blank());
     if all_completed {
@@ -5583,18 +5613,6 @@ fn wrapped_line_with_continuation(
 
 fn copy_joins_next(line: &PaintLine) -> bool {
     line.tail.iter().any(|span| span.tone == Tone::CopyJoin)
-}
-
-/// Gutter glyphs that label a block instead of belonging to its text, so a copy
-/// should start past them. Card corners (`╭─ `) are deliberately absent: they
-/// frame a block rather than mark one, and trimming them would leave the copied
-/// card missing only its top-left edge.
-const COPY_MARKERS: [&str; 9] = [
-    "- ", "● ", "• ", "✻ ", "∴ ", "▲ ", "✕ ", "◆ ", "❯ ",
-];
-
-fn is_copy_marker(prefix: &str) -> bool {
-    COPY_MARKERS.contains(&prefix)
 }
 
 fn composer_display(editor: &Editor, composer_images: &[String]) -> (String, usize) {
@@ -7254,7 +7272,7 @@ mod tests {
     }
 
     #[test]
-    fn fullscreen_selection_excludes_response_and_thinking_gutters() {
+    fn fullscreen_selection_preserves_response_and_thinking_icons() {
         let assistant =
             block_lines(&Block::new(BlockKind::Assistant, "Codex", "answer"), 80).remove(0);
         let thinking = block_lines(
@@ -7274,24 +7292,24 @@ mod tests {
         };
         assert_eq!(
             selection_columns_for_line(&assistant, full_row(&assistant, 0), 0),
-            Some(2..8)
+            Some(0..8)
         );
         assert_eq!(
             selection_columns_for_line(&thinking, full_row(&thinking, 1), 1),
-            Some(2..9)
+            Some(0..9)
         );
 
         assert!(renderer.begin_selection(0, 0));
         assert!(renderer.update_selection(7, 0));
         assert_eq!(
             renderer.finish_selection(7, 0),
-            SelectionResult::Copy("answer".to_owned())
+            SelectionResult::Copy("• answer".to_owned())
         );
         assert!(renderer.begin_selection(0, 1));
         assert!(renderer.update_selection(8, 1));
         assert_eq!(
             renderer.finish_selection(8, 1),
-            SelectionResult::Copy("thought".to_owned())
+            SelectionResult::Copy("∴ thought".to_owned())
         );
     }
 
@@ -7315,7 +7333,7 @@ mod tests {
 
         assert_eq!(
             selection_columns_for_line(&plan, full_row(&plan, 0), 0),
-            Some(2..painted_line_width(&plan))
+            Some(0..painted_line_width(&plan))
         );
         assert_eq!(
             selection_columns_for_line(&list, full_row(&list, 0), 0),
@@ -7357,7 +7375,7 @@ mod tests {
 
         assert_eq!(
             selection_columns_for_line(code, full_row(code, 0), 0),
-            Some(UnicodeWidthStr::width(code.prefix.as_str())..painted_line_width(code))
+            Some(0..painted_line_width(code))
         );
         assert_eq!(
             selection_columns_for_line(bullet, full_row(bullet, 0), 0),
@@ -7417,7 +7435,7 @@ mod tests {
         assert!(renderer.update_selection(7, 1));
         assert_eq!(
             renderer.finish_selection(7, 1),
-            SelectionResult::Copy("first\nsecond".to_owned())
+            SelectionResult::Copy("• first\nsecond".to_owned())
         );
     }
 
@@ -7484,6 +7502,35 @@ mod tests {
         };
 
         assert_eq!(selection_columns_for_line(&line, range, 0), Some(0..7));
+    }
+
+    #[test]
+    fn status_line_effort_icon_survives_copy_for_composer_paste() {
+        let line = status_line_row(
+            Some(StatusLineView {
+                model: None,
+                effort: Some("high".to_owned()),
+                context: None,
+                five_hour_percent: None,
+                weekly_percent: None,
+                notice: None,
+            }),
+            "",
+            80,
+        );
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = vec![line];
+
+        assert!(renderer.begin_selection(0, 0));
+        assert!(renderer.update_selection(6, 0));
+        let SelectionResult::Copy(copied) = renderer.finish_selection(6, 0) else {
+            panic!("status line selection should copy");
+        };
+        assert_eq!(copied, "◆ high");
+
+        let mut editor = Editor::default();
+        editor.insert_paste_str(&copied);
+        assert_eq!(composer_display(&editor, &[]).0, "◆ high");
     }
 
     #[test]
@@ -10309,13 +10356,27 @@ mod tests {
             .iter()
             .find(|line| painted(line).contains("Resets"))
             .expect("reset summary");
-        assert!(painted(reset).contains('⌄'));
-        assert_eq!(pick_on(reset, "Resets"), Some(Pick::ToggleWelcomeCredits));
+        assert!(painted(reset).contains('∨'));
+        assert_eq!(pick_on(reset, "Resets"), None);
+        assert_eq!(pick_on(reset, "3 available"), Some(Pick::ToggleWelcomeCredits));
+        assert_eq!(pick_on(reset, "∨"), Some(Pick::ToggleWelcomeCredits));
+        assert_eq!(
+            Renderer::hover_columns(reset, None, Some(&Pick::ToggleWelcomeCredits))
+                .map(|columns| columns.len()),
+            Some(15)
+        );
 
         let mut expanded = test_welcome();
         expanded.credits_expanded = true;
         let lines = welcome_lines(expanded, 80);
         assert!(lines.iter().any(|line| painted(line).contains("2026-08-01")));
+
+        let narrow = welcome_lines(test_welcome(), 28);
+        let reset = narrow
+            .iter()
+            .find(|line| painted(line).contains("Resets"))
+            .expect("narrow reset summary");
+        assert!(painted(reset).contains('∨'), "{}", painted(reset));
     }
 
     #[test]
@@ -11530,7 +11591,7 @@ mod tests {
                     elapsed: None,
                 })
                 .collect(),
-            expanded: false,
+            expanded: true,
             started_at: Instant::now(),
             elapsed: None,
         };
@@ -11551,10 +11612,28 @@ mod tests {
     }
 
     #[test]
-    fn completed_plan_summary_header_has_a_close_mark() {
+    fn expanded_plan_summary_header_has_a_collapse_mark() {
         let summary = PlanSummary {
             explanation: None,
             steps: vec![PlanStep { text: "Done".to_owned(), status: PlanStepStatus::Completed, started_at: None, elapsed: None }],
+            expanded: true,
+            started_at: Instant::now(),
+            elapsed: None,
+        };
+
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
+
+        assert!(painted(&lines[0]).ends_with(" ∧ ━┓"));
+        assert_eq!(UnicodeWidthStr::width(painted(&lines[0]).as_str()), 79);
+        assert!(lines[0].tail.iter().all(|span| span.tone == Tone::Plain));
+        assert_eq!(pick_on(&lines[0], "∧"), Some(Pick::PlanSummary));
+    }
+
+    #[test]
+    fn collapsed_plan_summary_shows_only_a_straight_header_with_expand_mark() {
+        let summary = PlanSummary {
+            explanation: None,
+            steps: vec![PlanStep { text: "Task".to_owned(), status: PlanStepStatus::Pending, started_at: None, elapsed: None }],
             expanded: false,
             started_at: Instant::now(),
             elapsed: None,
@@ -11562,10 +11641,17 @@ mod tests {
 
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
 
-        assert!(painted(&lines[0]).ends_with(" X ━┓"));
-        assert_eq!(UnicodeWidthStr::width(painted(&lines[0]).as_str()), 79);
-        assert!(lines[0].tail.iter().all(|span| span.tone == Tone::Plain));
-        assert_eq!(pick_on(&lines[0], "X"), Some(Pick::Close));
+        assert_eq!(lines.len(), 1);
+        assert!(painted(&lines[0]).starts_with("━━ 작업 단계"));
+        assert!(painted(&lines[0]).trim_end().ends_with("∨ ━"));
+        assert!(!painted(&lines[0]).contains(['┏', '┓']));
+        assert_eq!(pick_on(&lines[0], "작업 단계"), None);
+        assert_eq!(pick_on(&lines[0], "∨"), Some(Pick::PlanSummary));
+        assert_eq!(
+            Renderer::hover_columns(&lines[0], None, Some(&Pick::PlanSummary))
+                .map(|columns| columns.len()),
+            Some(5)
+        );
     }
 
     #[test]
@@ -11579,7 +11665,7 @@ mod tests {
                 PlanStep { text: "Task 4".to_owned(), status: PlanStepStatus::Pending, started_at: None, elapsed: None },
                 PlanStep { text: "Task 5".to_owned(), status: PlanStepStatus::Pending, started_at: None, elapsed: None },
             ],
-            expanded: false,
+            expanded: true,
             started_at: Instant::now(),
             elapsed: None,
         };
@@ -11587,7 +11673,7 @@ mod tests {
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
 
         assert_eq!(painted(&lines[2]), "  ✔  Task 1");
-        assert_eq!(painted(&lines[3]), "  □  Task 2");
+        assert_eq!(painted(&lines[3]), "      Task 2");
         assert_eq!(painted(&lines[4]), "  ✔  Task 3");
         assert_eq!(lines[2].prefix_tone, Tone::Accent);
         assert_eq!(lines[2].tone, Tone::Plain);
@@ -11603,7 +11689,7 @@ mod tests {
                 started_at: None,
                 elapsed: Some(Duration::from_secs(94)),
             }],
-            expanded: false,
+            expanded: true,
             started_at: Instant::now(),
             elapsed: Some(Duration::from_secs(94)),
         };
@@ -11620,7 +11706,7 @@ mod tests {
         let summary = PlanSummary {
             explanation: None,
             steps: vec![PlanStep { text: "Working task".to_owned(), status: PlanStepStatus::InProgress, started_at: None, elapsed: None }],
-            expanded: false,
+            expanded: true,
             started_at: Instant::now(),
             elapsed: None,
         };
@@ -11636,7 +11722,7 @@ mod tests {
         let summary = PlanSummary {
             explanation: None,
             steps: vec![PlanStep { text: "Paused task".to_owned(), status: PlanStepStatus::InProgress, started_at: None, elapsed: None }],
-            expanded: false,
+            expanded: true,
             started_at: Instant::now(),
             elapsed: None,
         };
