@@ -4283,14 +4283,60 @@ impl AppState {
                             Some("inProgress") => PlanStepStatus::InProgress,
                             _ => PlanStepStatus::Pending,
                         };
-                        Some(PlanStep { text: text.to_owned(), status })
+                        let previous = self
+                            .plan_summary
+                            .as_ref()
+                            .and_then(|summary| {
+                                summary.steps.iter().find(|previous| {
+                                    previous.text == text
+                                })
+                            });
+                        let started_at = match status {
+                            PlanStepStatus::InProgress => previous
+                                .and_then(|previous| previous.started_at)
+                                .or_else(|| Some(Instant::now())),
+                            PlanStepStatus::Completed => previous.and_then(|previous| previous.started_at),
+                            PlanStepStatus::Pending => None,
+                        };
+                        let elapsed = if status == PlanStepStatus::Completed {
+                            previous
+                                .and_then(|previous| previous.elapsed)
+                                .or_else(|| started_at.map(|started| started.elapsed()))
+                                .or(Some(Duration::ZERO))
+                        } else {
+                            None
+                        };
+                        Some(PlanStep {
+                            text: text.to_owned(),
+                            status,
+                            started_at,
+                            elapsed,
+                        })
                     })
                     .collect::<Vec<_>>();
+                let started_at = self
+                    .plan_summary
+                    .as_ref()
+                    .map(|summary| summary.started_at)
+                    .unwrap_or_else(Instant::now);
+                let elapsed = if !steps.is_empty()
+                    && steps.iter().all(|step| step.status == PlanStepStatus::Completed)
+                {
+                    self.plan_summary
+                        .as_ref()
+                        .and_then(|summary| summary.elapsed)
+                        .or_else(|| Some(started_at.elapsed()))
+                } else {
+                    None
+                };
                 self.plan_summary = Some(PlanSummary {
                     explanation: explanation.map(ToOwned::to_owned),
                     steps,
                     expanded: false,
+                    started_at,
+                    elapsed,
                 });
+                self.show_welcome = false;
             }
             "item/started" => {
                 if let Some(item) = params.get("item") {
@@ -9389,6 +9435,28 @@ mod tests {
     }
 
     #[test]
+    fn completed_plan_step_keeps_its_elapsed_time() {
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [{ "step": "check", "status": "inProgress" }] }),
+        );
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [{ "step": "check", "status": "completed" }] }),
+        );
+        let elapsed = state.plan_summary.as_ref().unwrap().steps[0].elapsed;
+
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [{ "step": "check", "status": "completed" }] }),
+        );
+
+        assert_eq!(state.plan_summary.as_ref().unwrap().steps[0].elapsed, elapsed);
+        assert!(elapsed.is_some());
+    }
+
+    #[test]
     fn command_output_arrives_without_its_escape_sequences() {
         // A pty-backed shell colours its errors and sets the window title; both
         // would otherwise be measured as visible columns.
@@ -9482,8 +9550,10 @@ mod tests {
         let mut state = test_state();
         state.plan_summary = Some(PlanSummary {
             explanation: None,
-            steps: vec![PlanStep { text: "완료".to_owned(), status: PlanStepStatus::Completed }],
+            steps: vec![PlanStep { text: "완료".to_owned(), status: PlanStepStatus::Completed, started_at: None, elapsed: None }],
             expanded: false,
+            started_at: Instant::now(),
+            elapsed: None,
         });
 
         assert!(state.close_completed_plan_summary());
@@ -9495,8 +9565,10 @@ mod tests {
         let mut state = test_state();
         state.plan_summary = Some(PlanSummary {
             explanation: None,
-            steps: vec![PlanStep { text: "완료".to_owned(), status: PlanStepStatus::Completed }],
+            steps: vec![PlanStep { text: "완료".to_owned(), status: PlanStepStatus::Completed, started_at: None, elapsed: None }],
             expanded: false,
+            started_at: Instant::now(),
+            elapsed: None,
         });
 
         state.turn_input("다음 작업".to_owned());
@@ -10674,6 +10746,21 @@ mod tests {
         state.turn_id = Some("live-turn".to_owned());
         state.turn_started_at = Some(Instant::now());
         state
+    }
+
+    #[test]
+    fn plan_notification_hides_the_welcome_panel() {
+        let mut state = test_state();
+        assert!(state.view().welcome.is_some());
+
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({
+                "plan": [{ "step": "check", "status": "inProgress" }]
+            }),
+        );
+
+        assert!(state.view().welcome.is_none());
     }
 
     #[test]

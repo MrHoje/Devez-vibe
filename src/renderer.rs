@@ -5,6 +5,7 @@ use std::{
     ops::Range,
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -283,6 +284,8 @@ pub enum PlanStepStatus {
 pub struct PlanStep {
     pub text: String,
     pub status: PlanStepStatus,
+    pub started_at: Option<Instant>,
+    pub elapsed: Option<Duration>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -290,6 +293,8 @@ pub struct PlanSummary {
     pub explanation: Option<String>,
     pub steps: Vec<PlanStep>,
     pub expanded: bool,
+    pub started_at: Instant,
+    pub elapsed: Option<Duration>,
 }
 
 pub struct View<'a> {
@@ -2489,7 +2494,10 @@ fn selectable_content_columns(line: &PaintLine) -> Option<Range<usize>> {
             let end = painted_line_width(line).saturating_sub(1);
             return (start < end).then_some(start..end);
         }
-        if let Some(indentation) = line.prefix.strip_suffix("• ")
+        if let Some(indentation) = line
+            .prefix
+            .strip_suffix("• ")
+            .or_else(|| line.prefix.strip_suffix("- "))
             && !indentation.is_empty()
             && indentation.chars().all(|ch| ch == ' ')
         {
@@ -2818,18 +2826,16 @@ fn welcome_notes_rows(column_width: usize) -> Vec<PanelRow> {
         rows.push(("  —".to_owned(), Tone::Muted, false));
         return rows;
     }
-    let indent = 2;
-    let options = textwrap::Options::new(column_width.saturating_sub(indent + 1).max(8))
-        .break_words(false)
-        .subsequent_indent("  ")
-        .word_separator(textwrap::WordSeparator::UnicodeBreakProperties);
-    for note in crate::update::RELEASE_NOTES {
+    for (index, note) in crate::update::RELEASE_NOTES.iter().enumerate() {
+        let prefix = format!("  {}. ", index + 1);
+        let continuation_indent = " ".repeat(prefix.len());
+        let options = textwrap::Options::new(column_width.max(8))
+            .break_words(false)
+            .initial_indent(&prefix)
+            .subsequent_indent(&continuation_indent)
+            .word_separator(textwrap::WordSeparator::UnicodeBreakProperties);
         rows.extend(textwrap::wrap(note, &options).into_iter().map(|folded| {
-            (
-                format!("{}{folded}", " ".repeat(indent)),
-                Tone::Muted,
-                false,
-            )
+            (folded.into_owned(), Tone::Muted, false)
         }));
     }
     rows
@@ -4486,12 +4492,12 @@ fn hunk_start(row: &str) -> Option<(usize, usize)> {
 /// that renders as a bare thought instead of a labelled section.
 const THINKING_TITLE: &str = "Thinking…";
 
-/// Codex paints a plan update as `• 작업 단계`, the explanation hanging off
+/// Codex paints a plan update as `- 작업 단계`, the explanation hanging off
 /// a `└`, then one checkbox row per step indented four columns: `✔` for done,
 /// `□` for the rest, with the in-progress step lit instead of dimmed. The body
 /// carries `▸` for that step so the row keeps a status the text alone can't.
 fn plan_lines(block: &Block, width: u16) -> Vec<PaintLine> {
-    let mut lines = wrapped_line("• ", Tone::Plain, &block.title, Tone::Plain, true, width);
+    let mut lines = wrapped_line("- ", Tone::Plain, &block.title, Tone::Plain, true, width);
     let mut steps = 0usize;
     for row in block.body.lines().filter(|row| !row.trim().is_empty()) {
         // The checkbox itself is never struck through, only the step behind it.
@@ -4541,17 +4547,39 @@ fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_
             PlanStepStatus::InProgress => ("  ▸ ".to_owned(), false),
             PlanStepStatus::Pending => ("  □ ".to_owned(), false),
         };
-        let task_text = compact_right(
-            &step.text,
-            line_width.saturating_sub(UnicodeWidthStr::width(prefix.as_str())),
-        );
+        let elapsed_text = step.elapsed.map(format_plan_elapsed);
+        let elapsed = elapsed_text
+            .as_deref()
+            .filter(|_| step.status == PlanStepStatus::Completed);
+        let time_width = elapsed
+            .map(|time| UnicodeWidthStr::width(time) + 1)
+            .unwrap_or_default();
+        let task_width = line_width
+            .saturating_sub(UnicodeWidthStr::width(prefix.as_str()))
+            .saturating_sub(time_width);
+        let task_text = compact_right(&step.text, task_width);
+        let task_padding = line_width
+            .saturating_sub(UnicodeWidthStr::width(prefix.as_str()))
+            .saturating_sub(UnicodeWidthStr::width(task_text.as_str()))
+            .saturating_sub(time_width);
         let in_progress = step.status == PlanStepStatus::InProgress;
         lines.push(PaintLine {
             prefix,
             prefix_tone: if step.status == PlanStepStatus::Completed || in_progress { Tone::Accent } else { Tone::Muted },
             text: task_text,
             tone: if in_progress { Tone::Accent } else { Tone::Plain }, bold, tool_heading: None, pick: None,
-            tail: Vec::new(),
+            tail: elapsed
+                .map(|time| {
+                    vec![
+                        PaintSpan {
+                            text: " ".repeat(task_padding + 1),
+                            tone: Tone::Muted,
+                            bold: false,
+                        },
+                        PaintSpan { text: time.to_owned(), tone: Tone::Muted, bold: false },
+                    ]
+                })
+                .unwrap_or_default(),
         });
     }
     if hidden > 0 {
@@ -4594,13 +4622,27 @@ fn fixed_plan_summary_lines(summary: &PlanSummary, width: u16, phase: f32, plan_
     let header = if all_completed { header.with_picks(&[(1, Pick::Close)]) } else { header };
     lines.insert(0, header);
     lines.insert(1, PaintLine::blank());
-    lines.push(PaintLine::blank());
+    if all_completed {
+        let total = format!("총 {}", format_plan_elapsed(summary.elapsed.unwrap_or_default()));
+        lines.push(PaintLine::plain(format!(
+            "{}{}",
+            " ".repeat(line_width.saturating_sub(UnicodeWidthStr::width(total.as_str()))),
+            total
+        )));
+    } else {
+        lines.push(PaintLine::blank());
+    }
     lines.push(PaintLine::plain(format!(
         "┗{}┛",
         "━".repeat(line_width.saturating_sub(2))
     )));
     lines.push(PaintLine::blank());
     lines
+}
+
+fn format_plan_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    format!("{}m {}s", seconds / 60, seconds % 60)
 }
 
 fn reasoning_lines(block: &Block, width: u16) -> Vec<PaintLine> {
@@ -4770,7 +4812,7 @@ fn block_lines_with_mode(
         BlockKind::Reasoning | BlockKind::Plan | BlockKind::Tool | BlockKind::FileChange => {
             unreachable!("handled above")
         }
-        BlockKind::Assistant => ("> ", Tone::FastOff),
+        BlockKind::Assistant => ("• ", Tone::FastOff),
         BlockKind::Diff => ("● ", Tone::Accent),
         BlockKind::Warning => ("▲ ", Tone::Warning),
         BlockKind::Error => ("✕ ", Tone::Error),
@@ -4837,7 +4879,7 @@ fn block_lines_with_mode(
             .or_else(|| trimmed.strip_prefix("* "))
         {
             let (prefix, prefix_tone) =
-                body_prefix(&mut first_content, marker, tone, "  • ", Tone::Plain);
+                body_prefix(&mut first_content, marker, tone, "  - ", Tone::Plain);
             lines.extend(markdown_line(
                 &prefix,
                 prefix_tone,
@@ -5507,7 +5549,7 @@ fn copy_joins_next(line: &PaintLine) -> bool {
 /// frame a block rather than mark one, and trimming them would leave the copied
 /// card missing only its top-left edge.
 const COPY_MARKERS: [&str; 9] = [
-    "> ", "● ", "• ", "✻ ", "∴ ", "▲ ", "✕ ", "◆ ", "❯ ",
+    "- ", "● ", "• ", "✻ ", "∴ ", "▲ ", "✕ ", "◆ ", "❯ ",
 ];
 
 fn is_copy_marker(prefix: &str) -> bool {
@@ -7206,11 +7248,11 @@ mod tests {
     fn fullscreen_selection_keeps_indented_bullet_markers() {
         let plan = block_lines(&Block::new(BlockKind::Plan, "Plan", "- first"), 80)
             .into_iter()
-            .find(|line| line.prefix == "• ")
+            .find(|line| line.prefix == "- ")
             .expect("plan bullet");
         let list = block_lines(&Block::new(BlockKind::System, "Notice", "- first"), 80)
             .into_iter()
-            .find(|line| line.prefix == "  • ")
+            .find(|line| line.prefix == "  - ")
             .expect("list bullet");
         let full_row = |line: &PaintLine, row| CellRange {
             start: CellPosition { column: 0, row },
@@ -7228,7 +7270,7 @@ mod tests {
             selection_columns_for_line(&list, full_row(&list, 0), 0),
             Some(2..painted_line_width(&list))
         );
-        let deeper = wrapped_line("    • ", Tone::Accent, "second", Tone::Plain, false, 80)
+        let deeper = wrapped_line("    - ", Tone::Accent, "second", Tone::Plain, false, 80)
             .remove(0);
         assert_eq!(
             selection_columns_for_line(&deeper, full_row(&deeper, 0), 0),
@@ -7252,7 +7294,7 @@ mod tests {
             .expect("unframed code row");
         let bullet = lines
             .iter()
-            .find(|line| line.prefix == "  • ")
+            .find(|line| line.prefix == "  - ")
             .expect("indented bullet");
         let full_row = |line: &PaintLine, row| CellRange {
             start: CellPosition { column: 0, row },
@@ -7277,14 +7319,14 @@ mod tests {
         assert!(renderer.update_selection(painted_line_width(bullet).saturating_sub(1) as u16, 0));
         assert_eq!(
             renderer.finish_selection(painted_line_width(bullet).saturating_sub(1) as u16, 0),
-            SelectionResult::Copy("• 실행 대상".to_owned())
+            SelectionResult::Copy("- 실행 대상".to_owned())
         );
     }
 
     #[test]
     fn fullscreen_selection_excludes_blank_continuation_gutter_under_a_bullet() {
         let lines = wrapped_line(
-            "  • ",
+            "  - ",
             Tone::Accent,
             "first second third",
             Tone::Plain,
@@ -7704,7 +7746,7 @@ mod tests {
         );
         let rendered = lines.iter().map(painted).collect::<Vec<_>>();
 
-        assert_eq!(rendered[0], "> cargo run --release");
+        assert_eq!(rendered[0], "• cargo run --release");
         assert!(rendered.iter().all(|line| !line.contains(['┌', '┐', '└', '┘', '│'])));
     }
 
@@ -8886,7 +8928,7 @@ mod tests {
         assert!(user_lines[1].prefix_tone == Tone::Plain);
         assert!(user_lines[1].tone == Tone::UserPrompt);
         assert!(user_lines[1].bold);
-        assert_eq!(assistant_lines[0].prefix, "> ");
+        assert_eq!(assistant_lines[0].prefix, "• ");
         assert_eq!(assistant_lines[0].prefix_tone, Tone::FastOff);
         assert_eq!(assistant_lines[0].text, "hi");
         assert!(user_lines.iter().all(|line| line.text != "You"));
@@ -8895,8 +8937,7 @@ mod tests {
 
     #[test]
     fn transcript_gutters_use_the_theme_accent() {
-        // The assistant gutter is the one exception: it reads as chevron chrome
-        // rather than an accent bullet.
+        // The assistant gutter uses the same circular mark as a response's first row.
         for (block, tone) in [
             (Block::new(BlockKind::Assistant, "Codex", "answer"), Tone::FastOff),
             (Block::new(BlockKind::Tool, "Shell", "output"), Tone::Accent),
@@ -8908,7 +8949,7 @@ mod tests {
         ] {
             let line = block_lines(&block, 80)
                 .into_iter()
-                .find(|line| matches!(line.prefix.as_str(), "> " | "● "))
+                .find(|line| matches!(line.prefix.as_str(), "• " | "● "))
                 .expect("transcript gutter");
             assert_eq!(line.prefix_tone, tone);
         }
@@ -9964,7 +10005,7 @@ mod tests {
             80,
         );
 
-        assert_eq!(lines[0].prefix, "• ");
+        assert_eq!(lines[0].prefix, "- ");
         assert_eq!(lines[0].text, "작업 단계");
         assert!(lines[0].bold);
         assert_eq!(lines[1].prefix, "  └ ");
@@ -11384,9 +11425,13 @@ mod tests {
                 .map(|index| PlanStep {
                     text: format!("Task {index}"),
                     status: PlanStepStatus::Pending,
+                    started_at: None,
+                    elapsed: None,
                 })
                 .collect(),
             expanded: false,
+            started_at: Instant::now(),
+            elapsed: None,
         };
 
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, true);
@@ -11408,8 +11453,10 @@ mod tests {
     fn completed_plan_summary_header_has_a_close_mark() {
         let summary = PlanSummary {
             explanation: None,
-            steps: vec![PlanStep { text: "Done".to_owned(), status: PlanStepStatus::Completed }],
+            steps: vec![PlanStep { text: "Done".to_owned(), status: PlanStepStatus::Completed, started_at: None, elapsed: None }],
             expanded: false,
+            started_at: Instant::now(),
+            elapsed: None,
         };
 
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
@@ -11425,13 +11472,15 @@ mod tests {
         let summary = PlanSummary {
             explanation: None,
             steps: vec![
-                PlanStep { text: "Task 1".to_owned(), status: PlanStepStatus::Completed },
-                PlanStep { text: "Task 2".to_owned(), status: PlanStepStatus::Pending },
-                PlanStep { text: "Task 3".to_owned(), status: PlanStepStatus::Completed },
-                PlanStep { text: "Task 4".to_owned(), status: PlanStepStatus::Pending },
-                PlanStep { text: "Task 5".to_owned(), status: PlanStepStatus::Pending },
+                PlanStep { text: "Task 1".to_owned(), status: PlanStepStatus::Completed, started_at: None, elapsed: None },
+                PlanStep { text: "Task 2".to_owned(), status: PlanStepStatus::Pending, started_at: None, elapsed: None },
+                PlanStep { text: "Task 3".to_owned(), status: PlanStepStatus::Completed, started_at: None, elapsed: None },
+                PlanStep { text: "Task 4".to_owned(), status: PlanStepStatus::Pending, started_at: None, elapsed: None },
+                PlanStep { text: "Task 5".to_owned(), status: PlanStepStatus::Pending, started_at: None, elapsed: None },
             ],
             expanded: false,
+            started_at: Instant::now(),
+            elapsed: None,
         };
 
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
@@ -11444,11 +11493,35 @@ mod tests {
     }
 
     #[test]
+    fn completed_plan_step_shows_elapsed_time_on_the_right() {
+        let summary = PlanSummary {
+            explanation: None,
+            steps: vec![PlanStep {
+                text: "Done".to_owned(),
+                status: PlanStepStatus::Completed,
+                started_at: None,
+                elapsed: Some(Duration::from_secs(94)),
+            }],
+            expanded: false,
+            started_at: Instant::now(),
+            elapsed: Some(Duration::from_secs(94)),
+        };
+
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false);
+
+        assert!(painted(&lines[2]).ends_with("1m 34s"));
+        assert_eq!(painted_width(&lines[2]), 79);
+        assert!(painted(&lines[3]).ends_with("총 1m 34s"));
+    }
+
+    #[test]
     fn in_progress_plan_step_uses_the_working_spinner_without_shimmer() {
         let summary = PlanSummary {
             explanation: None,
-            steps: vec![PlanStep { text: "Working task".to_owned(), status: PlanStepStatus::InProgress }],
+            steps: vec![PlanStep { text: "Working task".to_owned(), status: PlanStepStatus::InProgress, started_at: None, elapsed: None }],
             expanded: false,
+            started_at: Instant::now(),
+            elapsed: None,
         };
         let lines = fixed_plan_summary_lines(&summary, 80, 0.5, true);
         assert!(lines[2].prefix.contains('⠴'));
@@ -11461,8 +11534,10 @@ mod tests {
     fn inactive_in_progress_plan_step_uses_a_static_triangle() {
         let summary = PlanSummary {
             explanation: None,
-            steps: vec![PlanStep { text: "Paused task".to_owned(), status: PlanStepStatus::InProgress }],
+            steps: vec![PlanStep { text: "Paused task".to_owned(), status: PlanStepStatus::InProgress, started_at: None, elapsed: None }],
             expanded: false,
+            started_at: Instant::now(),
+            elapsed: None,
         };
 
         let lines = fixed_plan_summary_lines(&summary, 80, 0.5, false);

@@ -963,8 +963,8 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
 }
 
 /// Maps a key to a transcript scroll, or `None` to let the session have it.
-/// Shift is what keeps these out of the way: plain PageUp/PageDown already move
-/// the cursor in the composer and the selection in every picker.
+/// PageDown always returns a fullscreen transcript to its latest row. Shift
+/// keeps PageUp out of the way of composer and picker cursor navigation.
 fn scroll_request(renderer: &Renderer, key: &KeyEvent) -> Option<isize> {
     if renderer.mode() != RenderMode::Fullscreen {
         return None;
@@ -972,12 +972,14 @@ fn scroll_request(renderer: &Renderer, key: &KeyEvent) -> Option<isize> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Down {
         return Some(isize::MIN);
     }
+    if key.code == KeyCode::PageDown {
+        return Some(isize::MIN);
+    }
     if !key.modifiers.contains(KeyModifiers::SHIFT) {
         return None;
     }
     match key.code {
         KeyCode::PageUp => Some(renderer.page_rows()),
-        KeyCode::PageDown => Some(-renderer.page_rows()),
         _ => None,
     }
 }
@@ -2213,6 +2215,8 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 산문 문단 대신 불릿과 코드 블록을 쓴다.\n",
     "- 코드 변경은 파일 경로와 핵심 코드만 보여주고, 요청받지 않은 해설을 덧붙이지 않는다.\n",
     "- 하지 않기로 한 선택지나 이미 정해진 결정을 다시 나열하지 않는다.\n",
+    "- Skill 적용, 지침 확인, 내부 도구 호출 같은 내부 절차를 사용자에게 commentary로 알리지 않는다. ",
+    "사용자 판단에 필요한 진행 상황이나 결과만 알린다.\n",
     "계획 규칙:\n",
     "- 파일을 수정하는 작업은 분량과 무관하게 항상 `update_plan`으로 계획을 먼저 세우고 진행한다. ",
     "한 줄 수정처럼 사소해 보여도 생략하지 않는다.\n",
@@ -3392,6 +3396,16 @@ mod tests {
 
         assert_eq!(
             scroll_request(&renderer, &press(KeyCode::Down, KeyModifiers::CONTROL)),
+            Some(isize::MIN)
+        );
+    }
+
+    #[test]
+    fn page_down_returns_a_scrolled_fullscreen_transcript_to_the_latest_row() {
+        let renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+
+        assert_eq!(
+            scroll_request(&renderer, &press(KeyCode::PageDown, KeyModifiers::NONE)),
             Some(isize::MIN)
         );
     }
