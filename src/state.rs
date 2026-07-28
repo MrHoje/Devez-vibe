@@ -723,6 +723,7 @@ pub enum Action {
     McpLogin(String),
     /// Re-read the MCP configuration and restart the servers.
     ReconnectMcp,
+    ConnectProvider,
     StartLogin(LoginMethod),
     CancelLogin(String),
     Logout,
@@ -2679,6 +2680,24 @@ impl AppState {
         &self.models
     }
 
+    pub fn replace_models(&mut self, models: Vec<ModelInfo>) {
+        if models.is_empty() {
+            return;
+        }
+        let selected = self.selected_model_name().to_owned();
+        self.models = models;
+        self.selected_model = self
+            .models
+            .iter()
+            .position(|model| model.model == selected)
+            .or_else(|| self.models.iter().position(|model| model.is_default))
+            .unwrap_or(0);
+        let model = &self.models[self.selected_model];
+        if !model.supports_effort(&self.selected_effort) {
+            self.selected_effort = model.default_effort.clone();
+        }
+    }
+
     /// True until `thread/start` answers. The UI is fully painted before that, so
     /// anything that would talk to the thread has to wait for it.
     pub fn thread_pending(&self) -> bool {
@@ -4540,7 +4559,11 @@ impl AppState {
                 }
             }
             "item/agentMessage/delta" => {
-                self.append_delta(params, BlockKind::Assistant, "Codex");
+                let title = params
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex");
+                self.append_delta(params, BlockKind::Assistant, title);
             }
             "item/reasoning/summaryTextDelta" => {
                 self.append_delta(params, BlockKind::Reasoning, "Thinking…");
@@ -4612,6 +4635,10 @@ impl AppState {
                     .get("willRetry")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                let provider = params
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex");
                 self.committed.push(Block::new(
                     if retry {
                         BlockKind::Warning
@@ -4621,7 +4648,11 @@ impl AppState {
                     if retry {
                         "재시도 중"
                     } else {
-                        "Codex 오류"
+                        if provider == "Codex" {
+                            "Codex 오류"
+                        } else {
+                            "OpenCode 오류"
+                        }
                     },
                     message,
                 ));
@@ -4760,7 +4791,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    "/model [MODEL] [EFFORT]  모델과 effort 선택\n/fast [on|off]  Fast 서비스 티어 선택\n/effort [LEVEL]  추론 수준\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/login  ChatGPT 계정 로그인\n/logout  계정 연결 해제\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈",
+                    "/model [MODEL] [EFFORT]  모델과 effort 선택\n/connect  OpenCode provider 연결\n/fast [on|off]  Fast 서비스 티어 선택\n/effort [LEVEL]  추론 수준\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/login  ChatGPT 계정 로그인\n/logout  계정 연결 해제\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈",
                 ));
                 Action::None
             }
@@ -4919,6 +4950,12 @@ impl AppState {
                     "Usage",
                     "/mcp, /mcp reconnect 또는 /mcp login SERVER",
                 ));
+                Action::None
+            }
+            "/connect" if parts.len() == 1 => Action::ConnectProvider,
+            "/connect" => {
+                self.committed
+                    .push(Block::new(BlockKind::Error, "Usage", "/connect"));
                 Action::None
             }
             "/login" => {
@@ -12087,6 +12124,10 @@ mod tests {
         assert!(matches!(
             state.run_slash_command("/mcp login github"),
             Action::McpLogin(ref name) if name == "github"
+        ));
+        assert!(matches!(
+            state.run_slash_command("/connect"),
+            Action::ConnectProvider
         ));
         assert!(matches!(
             state.run_slash_command("/plugins"),

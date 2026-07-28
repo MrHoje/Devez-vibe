@@ -1,8 +1,10 @@
 mod app_server;
+mod backend;
 mod completion;
 mod devezcode;
 mod editor;
 mod integrations;
+mod open_code;
 mod paste;
 mod perf;
 mod pricing;
@@ -22,7 +24,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use app_server::{AppServer, ServerEvent};
+use app_server::ServerEvent;
+use backend::BackendServer;
 use arboard::{Clipboard, ImageData};
 use clap::Parser;
 use completion::collect_workspace_entries;
@@ -82,6 +85,10 @@ struct Cli {
     #[arg(long, default_value = "codex")]
     codex: PathBuf,
 
+    /// OpenCode executable used to launch `opencode acp`.
+    #[arg(long, default_value = "opencode")]
+    open_code: PathBuf,
+
     /// UI theme: minimal, soft, or dark.
     #[arg(long, value_name = "THEME")]
     theme: Option<String>,
@@ -117,7 +124,8 @@ async fn main() -> Result<()> {
     let selected_theme = theme::load(cli.theme.as_deref())?;
     theme::set_current(selected_theme);
     devezcode::init();
-    let mut server = AppServer::spawn(&cli.codex).await?;
+    let cwd = resolve_cwd(cli.cwd.as_deref())?;
+    let mut server = BackendServer::spawn(&cli.codex, &cli.open_code, &cwd).await?;
 
     let result = run(&cli, &mut server).await;
     server.shutdown().await;
@@ -125,9 +133,22 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn run(cli: &Cli, server: &mut AppServer) -> Result<()> {
+async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
     server.initialize().await?;
-    let account = ensure_account(server).await?;
+    let startup_config = read_startup_config();
+    let requested_model = cli
+        .model
+        .as_deref()
+        .or_else(|| root_config_value(&startup_config, "model"));
+    let (account, prefer_open_code) = if requested_model.is_some_and(open_code::is_open_code_model) {
+        ("OpenCode".to_owned(), false)
+    } else {
+        match ensure_account(server).await {
+            Ok(account) => (account, false),
+            Err(_) if server.has_open_code() => ("OpenCode · /connect".to_owned(), true),
+            Err(error) => return Err(error),
+        }
+    };
 
     let models_response = server
         .request(
@@ -139,12 +160,21 @@ async fn run(cli: &Cli, server: &mut AppServer) -> Result<()> {
     if models.is_empty() {
         bail!("app-server가 사용 가능한 모델을 반환하지 않았습니다.");
     }
+    let fallback_open_code = prefer_open_code
+        .then(|| {
+            models
+                .iter()
+                .find(|model| open_code::is_open_code_model(&model.model))
+                .map(|model| model.model.as_str())
+        })
+        .flatten();
+    let startup_model_request = cli.model.as_deref().or(fallback_open_code);
 
     let startup_model = resolve_startup_model(
         &models,
-        cli.model.as_deref(),
+        startup_model_request,
         cli.effort.as_deref(),
-        &read_startup_config(),
+        &startup_config,
     )?;
     let cwd = resolve_cwd(cli.cwd.as_deref())?;
     let resume_id = resolve_startup_session(cli, server, &cwd).await?;
@@ -208,7 +238,7 @@ enum Startup {
 /// a failed handshake — still restores the terminal.
 #[allow(clippy::too_many_arguments)]
 async fn start_session(
-    server: &mut AppServer,
+    server: &mut BackendServer,
     state: &mut AppState,
     renderer: &mut Renderer,
     cli: &Cli,
@@ -298,7 +328,7 @@ async fn start_session(
 /// the composer accepts typing, and the account plan drops in as soon as it lands.
 /// Used both at launch and by `/new`, so the wait always looks the same.
 async fn await_thread(
-    server: &AppServer,
+    server: &BackendServer,
     state: &mut AppState,
     renderer: &mut Renderer,
     thread: impl Future<Output = Result<Value>>,
@@ -468,7 +498,7 @@ fn hold_until_thread(
 
 /// Fills the resume picker from `thread/list`. Shared so the picker looks the same
 /// whether it is opened from a live session or from a session still starting up.
-async fn open_resume_picker(server: &AppServer, state: &mut AppState) {
+async fn open_resume_picker(server: &BackendServer, state: &mut AppState) {
     match list_sessions(server, None, None, 100).await {
         Ok(sessions) => state.open_session_picker(sessions),
         Err(error) => state.push_notice(BlockKind::Error, "세션 목록 실패", error.to_string()),
@@ -477,7 +507,7 @@ async fn open_resume_picker(server: &AppServer, state: &mut AppState) {
 
 async fn resolve_startup_session(
     cli: &Cli,
-    server: &AppServer,
+    server: &BackendServer,
     cwd: &Path,
 ) -> Result<Option<String>> {
     if cli.continue_session {
@@ -606,7 +636,7 @@ async fn choose_startup_session(
 }
 
 async fn event_loop(
-    server: &mut AppServer,
+    server: &mut BackendServer,
     state: &mut AppState,
     renderer: &mut Renderer,
     update_rx: mpsc::Receiver<String>,
@@ -1081,7 +1111,7 @@ async fn recv_update(receiver: &mut Option<mpsc::Receiver<String>>) -> Option<St
 }
 
 async fn execute_action(
-    server: &AppServer,
+    server: &BackendServer,
     state: &mut AppState,
     renderer: &mut Renderer,
     action: Action,
@@ -1401,6 +1431,41 @@ async fn execute_action(
                 Err(error) => {
                     state.push_notice(BlockKind::Error, "MCP 재연결 실패", error.to_string())
                 }
+            }
+        }
+        Action::ConnectProvider => {
+            renderer.suspend_terminal()?;
+            let connected = server.connect_provider().await;
+            let resumed = renderer.resume_terminal();
+            resumed?;
+            match connected {
+                Ok(()) => match server
+                    .request(
+                        "model/list",
+                        json!({ "includeHidden": false, "limit": 100 }),
+                    )
+                    .await
+                {
+                    Ok(response) => {
+                        let models = parse_models(&response);
+                        state.replace_models(models);
+                        state.push_notice(
+                            BlockKind::System,
+                            "Provider connected",
+                            "OpenCode provider 연결과 모델 목록 새로고침이 완료되었습니다.",
+                        );
+                    }
+                    Err(error) => state.push_notice(
+                        BlockKind::Warning,
+                        "모델 새로고침 실패",
+                        error.to_string(),
+                    ),
+                },
+                Err(error) => state.push_notice(
+                    BlockKind::Error,
+                    "Provider connection failed",
+                    error.to_string(),
+                ),
             }
         }
         Action::McpLogin(name) => {
@@ -1918,7 +1983,7 @@ async fn execute_action(
 /// live screen exactly the way launch does it. Returns `true` when the user quits
 /// during the wait.
 async fn start_new_thread(
-    server: &AppServer,
+    server: &BackendServer,
     state: &mut AppState,
     renderer: &mut Renderer,
 ) -> Result<bool> {
@@ -1984,7 +2049,7 @@ async fn start_new_thread(
 /// to a loading state straight away and the restored transcript arrives when
 /// `thread/resume` answers. Returns `true` when the user quits during the wait.
 async fn resume_thread(
-    server: &AppServer,
+    server: &BackendServer,
     state: &mut AppState,
     renderer: &mut Renderer,
     target: &str,
@@ -2021,7 +2086,7 @@ enum Switched {
 /// Wipes the screen, resumes `thread_id` behind the loading spinner, and restores
 /// its history. Shared by `/resume` and the return from a side conversation.
 async fn resume_into_state(
-    server: &AppServer,
+    server: &BackendServer,
     state: &mut AppState,
     renderer: &mut Renderer,
     thread_id: &str,
@@ -2088,7 +2153,7 @@ enum Switch {
 /// switch — it is far quicker, so the credits land on the new screen long before
 /// the session does.
 async fn await_switch(
-    server: &AppServer,
+    server: &BackendServer,
     state: &mut AppState,
     renderer: &mut Renderer,
     previous_thread: String,
@@ -2124,7 +2189,7 @@ fn abandon_thread_switch(
 /// Tail shared by `/new` and `/resume`: paint the bound session, reload the
 /// catalogues, then send whatever was typed during the wait.
 async fn finish_thread_switch(
-    server: &AppServer,
+    server: &BackendServer,
     state: &mut AppState,
     renderer: &mut Renderer,
     queued: Option<String>,
@@ -2140,7 +2205,7 @@ async fn finish_thread_switch(
 /// Sends a prompt typed during a switch. Returning from a side conversation can
 /// bring a turn back with it, so the prompt joins that turn rather than starting a
 /// competing one.
-async fn send_queued_prompt(server: &AppServer, state: &mut AppState, text: String) {
+async fn send_queued_prompt(server: &BackendServer, state: &mut AppState, text: String) {
     let Some(turn_id) = state.turn_id.clone() else {
         start_turn(server, state, text).await;
         return;
@@ -2217,7 +2282,7 @@ fn thread_with_initial_turns(response: &Value) -> Result<Value> {
 
 /// Hydrates every turn page before rendering. `thread/resume` only bootstraps
 /// one page; Codex follows `nextCursor` until the complete transcript is local.
-async fn hydrate_thread_history(server: &AppServer, response: &Value) -> Result<Value> {
+async fn hydrate_thread_history(server: &BackendServer, response: &Value) -> Result<Value> {
     let mut thread = thread_with_initial_turns(response)?;
     let Some(mut cursor) = response
         .pointer("/initialTurnsPage/nextCursor")
@@ -2396,7 +2461,7 @@ fn new_thread_params(
     params
 }
 
-async fn list_skills(server: &AppServer, cwd: &str, force_reload: bool) -> Result<Value> {
+async fn list_skills(server: &BackendServer, cwd: &str, force_reload: bool) -> Result<Value> {
     server
         .request(
             "skills/list",
@@ -2408,7 +2473,7 @@ async fn list_skills(server: &AppServer, cwd: &str, force_reload: bool) -> Resul
         .await
 }
 
-async fn list_plugins(server: &AppServer, cwd: &str) -> Result<Value> {
+async fn list_plugins(server: &BackendServer, cwd: &str) -> Result<Value> {
     server
         .request(
             "plugin/list",
@@ -2419,7 +2484,7 @@ async fn list_plugins(server: &AppServer, cwd: &str) -> Result<Value> {
         .await
 }
 
-async fn list_mcp_servers(server: &AppServer, thread_id: &str) -> Result<Value> {
+async fn list_mcp_servers(server: &BackendServer, thread_id: &str) -> Result<Value> {
     server
         .request(
             "mcpServerStatus/list",
@@ -2432,7 +2497,7 @@ async fn list_mcp_servers(server: &AppServer, thread_id: &str) -> Result<Value> 
         .await
 }
 
-async fn write_plugin_enabled(server: &AppServer, plugin_id: &str, enabled: bool) -> Result<Value> {
+async fn write_plugin_enabled(server: &BackendServer, plugin_id: &str, enabled: bool) -> Result<Value> {
     server
         .request(
             "config/value/write",
@@ -2453,7 +2518,7 @@ fn scope_of(plugin: &PluginInfo) -> Option<PluginScope> {
 /// Refetches the catalogue and reopens the plugin picker where it was, so an
 /// action's result is visible in the list it was taken from.
 async fn reopen_plugins(
-    server: &AppServer,
+    server: &BackendServer,
     state: &mut AppState,
     scope: Option<PluginScope>,
     notice: String,
@@ -2472,7 +2537,7 @@ async fn reopen_plugins(
     }
 }
 
-async fn reopen_marketplaces(server: &AppServer, state: &mut AppState, notice: String) {
+async fn reopen_marketplaces(server: &BackendServer, state: &mut AppState, notice: String) {
     match list_plugins(server, &state.cwd).await {
         Ok(response) => {
             state.open_marketplace_picker(&PluginCatalog::from_value(&response), Some(notice));
@@ -2693,7 +2758,7 @@ async fn recv_cost_restore(
 }
 
 fn start_integration_refresh(
-    server: &AppServer,
+    server: &BackendServer,
     state: &AppState,
 ) -> mpsc::Receiver<IntegrationCatalog> {
     start_background_catalogue(fetch_integrations(
@@ -2718,7 +2783,7 @@ async fn recv_integrations(
 }
 
 async fn refresh_integrations(
-    server: &AppServer,
+    server: &BackendServer,
     state: &mut AppState,
     force_reload: bool,
 ) -> Result<()> {
@@ -2888,7 +2953,7 @@ fn open_url(url: &str) -> Result<()> {
     Ok(())
 }
 
-async fn start_turn(server: &AppServer, state: &mut AppState, text: String) {
+async fn start_turn(server: &BackendServer, state: &mut AppState, text: String) {
     devezcode::note_prompt(&text);
     let model = state.selected_model_name().to_owned();
     let effort = state.selected_effort().to_owned();
@@ -3159,7 +3224,7 @@ fn start_login_flow(state: &mut AppState, method: LoginMethod, response: &Value)
 
 /// Re-reads the identity and entitlements after a login or an `account/updated`
 /// notification. Best-effort: a failure leaves the previous values in place.
-async fn refresh_account(server: &AppServer, state: &mut AppState) {
+async fn refresh_account(server: &BackendServer, state: &mut AppState) {
     if let Ok(label) = ensure_account(server).await {
         state.set_account(label);
     }
@@ -3168,7 +3233,7 @@ async fn refresh_account(server: &AppServer, state: &mut AppState) {
 
 /// Plan and reset-credit entitlements for the welcome card. Fails soft: the panel
 /// just shows placeholders when the server has nothing to report.
-async fn read_account_plan(server: &AppServer) -> AccountPlan {
+async fn read_account_plan(server: &BackendServer) -> AccountPlan {
     server
         .request("account/rateLimits/read", json!({}))
         .await
@@ -3176,7 +3241,7 @@ async fn read_account_plan(server: &AppServer) -> AccountPlan {
         .unwrap_or_default()
 }
 
-async fn ensure_account(server: &AppServer) -> Result<String> {
+async fn ensure_account(server: &BackendServer) -> Result<String> {
     let response = server
         .request("account/read", json!({ "refreshToken": false }))
         .await?;
@@ -3207,7 +3272,7 @@ async fn ensure_account(server: &AppServer) -> Result<String> {
 }
 
 async fn start_or_resume_thread(
-    server: &AppServer,
+    server: &BackendServer,
     resume: Option<&str>,
     model: Option<&str>,
     resume_cwd: Option<&Path>,
@@ -3240,7 +3305,7 @@ async fn start_or_resume_thread(
 }
 
 async fn list_sessions(
-    server: &AppServer,
+    server: &BackendServer,
     cwd: Option<&Path>,
     search: Option<&str>,
     limit: u64,
@@ -3267,7 +3332,7 @@ async fn list_sessions(
 }
 
 async fn resolve_session_target(
-    server: &AppServer,
+    server: &BackendServer,
     target: &str,
     cwd: Option<&Path>,
 ) -> Result<String> {
@@ -3297,7 +3362,8 @@ async fn resolve_session_target(
 }
 
 fn looks_like_thread_id(value: &str) -> bool {
-    value.len() >= 32 && value.chars().filter(|ch| *ch == '-').count() >= 4
+    value.starts_with("ses_")
+        || (value.len() >= 32 && value.chars().filter(|ch| *ch == '-').count() >= 4)
 }
 
 fn path_matches(value: &str, path: &Path) -> bool {
@@ -3378,9 +3444,11 @@ fn resolve_startup_model(
 }
 
 fn read_startup_config() -> String {
-    state::codex_home()
+    let provider = backend::read_provider_config();
+    let codex = state::codex_home()
         .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    format!("{provider}\n{codex}")
 }
 
 fn root_config_value<'a>(config: &'a str, name: &str) -> Option<&'a str> {

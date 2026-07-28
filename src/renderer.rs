@@ -781,6 +781,28 @@ impl Renderer {
         self.reset_screen()
     }
 
+    pub fn suspend_terminal(&mut self) -> Result<()> {
+        self.finish()?;
+        if self.mode == RenderMode::Fullscreen {
+            execute!(self.out, DisableMouseCapture)?;
+            leave_fullscreen(&mut self.out)?;
+        }
+        execute!(self.out, Show, DisableBracketedPaste)?;
+        disable_raw_mode()?;
+        Ok(())
+    }
+
+    pub fn resume_terminal(&mut self) -> Result<()> {
+        enable_raw_mode()?;
+        execute!(self.out, EnableBracketedPaste, Show)?;
+        if self.mode == RenderMode::Fullscreen {
+            enter_fullscreen(&mut self.out)?;
+            execute!(self.out, EnableMouseCapture)?;
+            disable_alternate_scroll(&mut self.out)?;
+        }
+        self.clear_screen()
+    }
+
     pub fn toggle_tool_at(&mut self, row: u16) -> bool {
         if self.mode != RenderMode::Fullscreen {
             return false;
