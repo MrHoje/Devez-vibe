@@ -1623,15 +1623,14 @@ fn paint_line_into_frame(
 ) {
     let background = row_background(line.tone);
     if let Some(background) = background {
-        let width = background_width.unwrap_or_else(|| {
-            if line.tone == Tone::UserPrompt {
-                frame.width.saturating_sub(1)
-            } else {
-                frame.width
-            }
-        });
+        let (start, width) = if line.tone == Tone::UserPrompt {
+            let start = UnicodeWidthStr::width(line.prefix.as_str()).saturating_sub(1);
+            (start, frame.width.saturating_sub(start + 1))
+        } else {
+            (0, background_width.unwrap_or(frame.width))
+        };
         frame.fill(
-            0,
+            start,
             row,
             width,
             row + 1,
@@ -4891,15 +4890,20 @@ fn block_lines_with_mode(
     };
 
     let conversational = matches!(block.kind, BlockKind::Assistant);
+    let conversational_width = if conversational {
+        conversation_region_width(width).saturating_add(1) as u16
+    } else {
+        width
+    };
     let mut first_content = conversational;
     let mut lines = if conversational {
         Vec::new()
     } else {
-        wrapped_line(marker, tone, &block.title, Tone::Plain, true, width)
+        wrapped_line(marker, tone, &block.title, Tone::Plain, true, conversational_width)
     };
     if block.body.is_empty() {
         if conversational {
-            lines.extend(wrapped_line(marker, tone, "", Tone::Plain, false, width));
+            lines.extend(wrapped_line(marker, tone, "", Tone::Plain, false, conversational_width));
         }
         return lines;
     }
@@ -4928,12 +4932,12 @@ fn block_lines_with_mode(
                 highlight_code(raw_line, &code_language),
                 Tone::Code,
                 false,
-                width,
+                conversational_width,
             ));
         } else if force_diff {
             let (prefix, prefix_tone) =
                 body_prefix(&mut first_content, marker, tone, "  ", Tone::Muted);
-            lines.extend(diff_line(&prefix, prefix_tone, raw_line, width));
+            lines.extend(diff_line(&prefix, prefix_tone, raw_line, conversational_width));
         } else if trimmed.starts_with('#') {
             let (prefix, prefix_tone) =
                 body_prefix(&mut first_content, marker, tone, "  ", Tone::Muted);
@@ -4943,7 +4947,7 @@ fn block_lines_with_mode(
                 trimmed.trim_start_matches('#').trim_start(),
                 Tone::Plain,
                 true,
-                width,
+                conversational_width,
             ));
         } else if let Some(item) = trimmed
             .strip_prefix("- ")
@@ -4957,7 +4961,7 @@ fn block_lines_with_mode(
                 item,
                 Tone::Plain,
                 false,
-                width,
+                conversational_width,
             ));
         } else if let Some(quote) = trimmed.strip_prefix("> ") {
             let (prefix, prefix_tone) =
@@ -4968,7 +4972,7 @@ fn block_lines_with_mode(
                 quote,
                 Tone::Muted,
                 false,
-                width,
+                conversational_width,
             ));
         } else {
             let (prefix, prefix_tone) =
@@ -4979,7 +4983,7 @@ fn block_lines_with_mode(
                 raw_line,
                 Tone::Plain,
                 false,
-                width,
+                conversational_width,
             ));
         }
     }
@@ -4999,7 +5003,10 @@ fn block_lines_with_expansion(block: &Block, width: u16, expanded: bool) -> Vec<
 }
 
 fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
-    let mut lines = vec![PaintLine::user_prompt_half_padding(width, '▄')];
+    let region_width = conversation_region_width(width);
+    let prompt_width = region_width.saturating_add(1) as u16;
+    let left_margin = usize::from(width).saturating_sub(1).saturating_sub(region_width);
+    let mut lines = vec![PaintLine::user_prompt_half_padding(prompt_width, '▄')];
     if block.body.is_empty() {
         lines.extend(wrapped_line(
             " ",
@@ -5007,24 +5014,32 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
             "",
             Tone::UserPrompt,
             false,
-            width,
+            prompt_width,
         ));
-        lines.push(PaintLine::user_prompt_half_padding(width, '▀'));
-        return lines;
+        lines.push(PaintLine::user_prompt_half_padding(prompt_width, '▀'));
+    } else {
+        for raw_line in block.body.lines() {
+            lines.extend(wrapped_line(
+                " ",
+                Tone::Plain,
+                raw_line,
+                Tone::UserPrompt,
+                false,
+                prompt_width,
+            ));
+        }
+        lines.push(PaintLine::user_prompt_half_padding(prompt_width, '▀'));
     }
 
-    for raw_line in block.body.lines() {
-        lines.extend(wrapped_line(
-            " ",
-            Tone::Plain,
-            raw_line,
-            Tone::UserPrompt,
-            false,
-            width,
-        ));
+    let margin = " ".repeat(left_margin);
+    for line in &mut lines {
+        line.prefix = format!("{margin}{}", line.prefix);
     }
-    lines.push(PaintLine::user_prompt_half_padding(width, '▀'));
     lines
+}
+
+fn conversation_region_width(width: u16) -> usize {
+    usize::from(width).saturating_sub(1).saturating_mul(3) / 4
 }
 
 fn body_prefix(
@@ -7445,10 +7460,10 @@ mod tests {
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
         renderer.previous_lines = lines;
 
-        assert!(renderer.begin_selection(0, 1));
-        assert!(renderer.update_selection(7, 2));
+        assert!(renderer.begin_selection(20, 1));
+        assert!(renderer.update_selection(27, 2));
         assert_eq!(
-            renderer.finish_selection(7, 2),
+            renderer.finish_selection(27, 2),
             SelectionResult::Copy("first\nsecond".to_owned())
         );
     }
@@ -7502,6 +7517,24 @@ mod tests {
         };
 
         assert_eq!(selection_columns_for_line(&line, range, 0), Some(0..7));
+    }
+
+    #[test]
+    fn conversation_messages_use_opposite_75_percent_anchors() {
+        let user = block_lines(&Block::new(BlockKind::User, "You", "x".repeat(120)), 80);
+        let assistant = block_lines(&Block::new(BlockKind::Assistant, "Codex", "x".repeat(120)), 80);
+
+        assert_eq!(UnicodeWidthStr::width(user[0].prefix.as_str()), 20);
+        assert_eq!(UnicodeWidthStr::width(user[0].text.as_str()), 59);
+        assert!(user
+            .iter()
+            .filter(|line| line.tone == Tone::UserPrompt)
+            .all(|line| UnicodeWidthStr::width(line.prefix.as_str()) >= 21
+                && painted_width(line) <= 79));
+        assert!(assistant
+            .iter()
+            .filter(|line| !line.text.is_empty())
+            .all(|line| painted_width(line) <= 59));
     }
 
     #[test]
@@ -9034,7 +9067,7 @@ mod tests {
         let user_lines = block_lines(&user, 80);
         let assistant_lines = block_lines(&assistant, 80);
 
-        assert_eq!(user_lines[1].prefix, " ");
+        assert_eq!(user_lines[1].prefix, " ".repeat(21));
         assert_eq!(user_lines[1].text, "hello");
         assert!(user_lines[1].prefix_tone == Tone::Plain);
         assert!(user_lines[1].tone == Tone::UserPrompt);
