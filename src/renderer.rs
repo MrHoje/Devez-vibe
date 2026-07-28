@@ -122,6 +122,8 @@ static NEXT_BLOCK_ID: AtomicU64 = AtomicU64::new(1);
 static CHAT_LAYOUT: AtomicBool = AtomicBool::new(true);
 /// Cells a chat bubble keeps between its edge and its text, per side.
 const CHAT_BUBBLE_PADDING: usize = 1;
+/// Extra cell that keeps the right edge visibly clear after terminal painting.
+const CHAT_BUBBLE_RIGHT_GAP: usize = 1;
 
 impl Block {
     pub fn new(kind: BlockKind, title: impl Into<String>, body: impl Into<String>) -> Self {
@@ -5246,7 +5248,9 @@ fn block_lines_with_mode(
 
     let conversational = matches!(block.kind, BlockKind::Assistant);
     let conversational_width = if conversational && CHAT_LAYOUT.load(Ordering::Relaxed) {
-        conversation_region_width(width).saturating_add(1) as u16
+        conversation_region_width(width)
+            .saturating_add(1)
+            .saturating_sub(CHAT_BUBBLE_RIGHT_GAP) as u16
     } else {
         width
     };
@@ -5362,13 +5366,12 @@ fn block_lines_with_mode(
 }
 
 fn assistant_chat_bubble_lines(mut lines: Vec<PaintLine>) -> Vec<PaintLine> {
-    const BUBBLE_RIGHT_PADDING: usize = 1;
     let width = lines
         .iter()
         .map(painted_line_width)
         .max()
         .unwrap_or(1)
-        .saturating_add(BUBBLE_RIGHT_PADDING);
+        .saturating_add(CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP);
     for line in &mut lines {
         let padding = width.saturating_sub(painted_line_width(line));
         if padding > 0 {
@@ -5422,7 +5425,9 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
 
     let region_width = conversation_region_width(width);
     let left_margin = usize::from(width).saturating_sub(1).saturating_sub(region_width);
-    let content_width = region_width.saturating_sub(RIGHT_GAP + CHAT_BUBBLE_PADDING * 2);
+    let content_width = region_width.saturating_sub(
+        RIGHT_GAP + CHAT_BUBBLE_PADDING * 2 + CHAT_BUBBLE_RIGHT_GAP,
+    );
     let raw_lines = if block.body.is_empty() {
         vec![""]
     } else {
@@ -5442,7 +5447,12 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         })
         .collect::<Vec<_>>();
     for line in &mut lines {
-        line.text = format!("{}{}{}", " ".repeat(CHAT_BUBBLE_PADDING), line.text, " ".repeat(CHAT_BUBBLE_PADDING));
+        line.text = format!(
+            "{}{}{}",
+            " ".repeat(CHAT_BUBBLE_PADDING),
+            line.text,
+            " ".repeat(CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP)
+        );
     }
     let bubble_width = lines
         .iter()
@@ -8010,7 +8020,7 @@ mod tests {
 
         // The bubble sits at the right edge with a cell of padding inside it, so
         // its text starts one column in from the band.
-        assert!(renderer.begin_selection(70, 1));
+        assert!(renderer.begin_selection(69, 1));
         assert!(renderer.update_selection(76, 2));
         assert_eq!(
             renderer.finish_selection(76, 2),
@@ -8019,7 +8029,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_bubbles_keep_their_single_cell_text_padding() {
+    fn chat_bubbles_keep_left_padding_and_a_visible_right_gap() {
         CHAT_LAYOUT.store(true, Ordering::Relaxed);
         let user = block_lines(&Block::new(BlockKind::User, "You", "input"), 80);
         let assistant = block_lines(&Block::new(BlockKind::Assistant, "Codex", "output"), 80);
@@ -8027,10 +8037,36 @@ mod tests {
             .iter()
             .find(|line| line.tone == Tone::UserPrompt)
             .expect("user text row");
+        let assistant_text = assistant
+            .iter()
+            .find(|line| line.text.contains("output"))
+            .expect("assistant text row");
+        let assistant_right_padding = assistant_text
+            .tail
+            .iter()
+            .filter(|span| span.tone == Tone::AssistantBubble)
+            .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+            .sum::<usize>();
 
         assert!(user_text.text.starts_with(" input"));
-        assert!(user_text.text.ends_with(' '));
-        assert!(assistant.iter().any(|line| line.text.contains("output")));
+        assert!(user_text.text.ends_with("  "));
+        assert_eq!(assistant_right_padding, 2);
+
+        let mut frame = CellFrame::new(80, 2);
+        paint_line_into_frame(&mut frame, 0, user_text, None, None, None);
+        paint_line_into_frame(&mut frame, 1, assistant_text, None, None, None);
+        let user_right = painted_line_width(user_text) - 1;
+        let assistant_right = painted_line_width(assistant_text) - 1;
+        assert_eq!(frame.cell(user_right, 0).glyph, " ");
+        assert_eq!(
+            frame.cell(user_right, 0).style.background,
+            word_background(Tone::UserPrompt)
+        );
+        assert_eq!(frame.cell(assistant_right, 1).glyph, " ");
+        assert_eq!(
+            frame.cell(assistant_right, 1).style.background,
+            Some(assistant_bubble_background())
+        );
     }
 
     #[test]
@@ -8056,8 +8092,8 @@ mod tests {
 
         assert_eq!(lines.len(), 5);
         // Every row is filled out to the longest one so the bubble paints square.
-        assert_eq!(lines[1].text, " first  ");
-        assert_eq!(lines[2].text, " second ");
+        assert_eq!(lines[1].text, " first   ");
+        assert_eq!(lines[2].text, " second  ");
         assert!(lines[4] == PaintLine::blank());
 
         let selection = CellRange {
@@ -9612,8 +9648,8 @@ mod tests {
         let user_lines = block_lines(&user, 80);
         let assistant_lines = block_lines(&assistant, 80);
 
-        assert_eq!(user_lines[1].prefix, " ".repeat(70));
-        assert_eq!(user_lines[1].text, " hello ");
+        assert_eq!(user_lines[1].prefix, " ".repeat(69));
+        assert_eq!(user_lines[1].text, " hello  ");
         assert!(user_lines[1].prefix_tone == Tone::Plain);
         assert!(user_lines[1].tone == Tone::UserPrompt);
         assert!(!user_lines[1].bold);
@@ -9710,7 +9746,7 @@ mod tests {
                 "Shell · second",
                 "",
                 // The response opens its chat bubble before its first text row.
-                "▄▄▄▄▄▄▄",
+                "▄▄▄▄▄▄▄▄",
                 "done"
             ]
         );
