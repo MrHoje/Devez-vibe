@@ -8,6 +8,7 @@ mod open_code;
 mod paste;
 mod perf;
 mod pricing;
+mod provider;
 mod renderer;
 mod rollout;
 mod selection;
@@ -36,6 +37,7 @@ use editor::Editor;
 use futures_util::StreamExt;
 use integrations::{McpServerInfo, PluginCatalog, PluginDetail, PluginInfo, PluginScope};
 use paste::{BufferedText, ComposerInput, ComposerPasteBuffer, PasteBurst};
+use provider::{ProviderAuthKind, ProviderAuthRequest};
 use renderer::{BlockKind, Pick, RenderMode, Renderer, SelectionResult, TerminalSession, View};
 use serde_json::{Value, json};
 use state::{
@@ -1434,38 +1436,131 @@ async fn execute_action(
             }
         }
         Action::ConnectProvider => {
-            renderer.suspend_terminal()?;
-            let connected = server.connect_provider().await;
-            let resumed = renderer.resume_terminal();
-            resumed?;
-            match connected {
-                Ok(()) => match server
-                    .request(
-                        "model/list",
-                        json!({ "includeHidden": false, "limit": 100 }),
-                    )
-                    .await
-                {
-                    Ok(response) => {
-                        let models = parse_models(&response);
-                        state.replace_models(models);
+            state.open_provider_loading();
+            draw(state, renderer)?;
+            match server.provider_catalog().await {
+                Ok(catalog) => state.open_provider_picker(&catalog),
+                Err(error) => state.provider_connection_failed(error.to_string()),
+            }
+        }
+        Action::SubmitProviderAuth(request) => {
+            let ProviderAuthRequest {
+                provider_id,
+                provider_name,
+                method_index,
+                kind,
+                inputs,
+                api_key,
+            } = *request;
+            match kind {
+                ProviderAuthKind::Api => {
+                    let Some(api_key) = api_key else {
                         state.push_notice(
-                            BlockKind::System,
-                            "Provider connected",
-                            "OpenCode provider 연결과 모델 목록 새로고침이 완료되었습니다.",
+                            BlockKind::Error,
+                            "Provider 연결 실패",
+                            "API key가 없습니다.",
                         );
+                        return Ok(false);
+                    };
+                    match server
+                        .set_provider_api_key(&provider_id, &api_key, &inputs)
+                        .await
+                    {
+                        Ok(()) => {
+                            refresh_provider_models(server, state, &provider_name).await;
+                        }
+                        Err(error) => state.push_notice(
+                            BlockKind::Error,
+                            "Provider 연결 실패",
+                            error.to_string(),
+                        ),
                     }
-                    Err(error) => state.push_notice(
-                        BlockKind::Warning,
-                        "모델 새로고침 실패",
-                        error.to_string(),
-                    ),
-                },
-                Err(error) => state.push_notice(
-                    BlockKind::Error,
-                    "Provider connection failed",
-                    error.to_string(),
-                ),
+                }
+                ProviderAuthKind::OAuth => {
+                    match server
+                        .authorize_provider_oauth(&provider_id, method_index, &inputs)
+                        .await
+                    {
+                        Ok(authorization) => {
+                            let url = authorization
+                                .get("url")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned();
+                            let callback_method = authorization
+                                .get("method")
+                                .and_then(Value::as_str)
+                                .unwrap_or("auto")
+                                .to_owned();
+                            let instructions = authorization
+                                .get("instructions")
+                                .and_then(Value::as_str)
+                                .unwrap_or("브라우저에서 인증을 완료하세요.")
+                                .to_owned();
+                            state.open_provider_oauth(
+                                provider_id.clone(),
+                                provider_name.clone(),
+                                method_index,
+                                url.clone(),
+                                instructions,
+                                &callback_method,
+                            );
+                            if !url.is_empty()
+                                && let Err(error) = open_url(&url)
+                            {
+                                state.push_notice(
+                                    BlockKind::Warning,
+                                    "브라우저 열기 실패",
+                                    error.to_string(),
+                                );
+                            }
+                            draw(state, renderer)?;
+                            if callback_method == "auto" {
+                                match server
+                                    .complete_provider_oauth(
+                                        &provider_id,
+                                        method_index,
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        refresh_provider_models(
+                                            server,
+                                            state,
+                                            &provider_name,
+                                        )
+                                        .await;
+                                    }
+                                    Err(error) => {
+                                        state.provider_connection_failed(error.to_string())
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => state.push_notice(
+                            BlockKind::Error,
+                            "OAuth 시작 실패",
+                            error.to_string(),
+                        ),
+                    }
+                }
+            }
+        }
+        Action::CompleteProviderOAuth {
+            provider_id,
+            provider_name,
+            method,
+            code,
+        } => {
+            match server
+                .complete_provider_oauth(&provider_id, method, Some(&code))
+                .await
+            {
+                Ok(()) => refresh_provider_models(server, state, &provider_name).await,
+                Err(error) => {
+                    state.push_notice(BlockKind::Error, "OAuth 연결 실패", error.to_string())
+                }
             }
         }
         Action::McpLogin(name) => {
@@ -2495,6 +2590,33 @@ async fn list_mcp_servers(server: &BackendServer, thread_id: &str) -> Result<Val
             }),
         )
         .await
+}
+
+async fn refresh_provider_models(
+    server: &BackendServer,
+    state: &mut AppState,
+    provider_name: &str,
+) {
+    match server
+        .request(
+            "model/list",
+            json!({ "includeHidden": false, "limit": 100 }),
+        )
+        .await
+    {
+        Ok(response) => {
+            state.replace_models(parse_models(&response));
+            state.provider_connected(provider_name);
+        }
+        Err(error) => {
+            state.provider_connected(provider_name);
+            state.push_notice(
+                BlockKind::Warning,
+                "모델 새로고침 실패",
+                error.to_string(),
+            );
+        }
+    }
 }
 
 async fn write_plugin_enabled(server: &BackendServer, plugin_id: &str, enabled: bool) -> Result<Value> {

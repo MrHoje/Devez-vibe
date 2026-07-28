@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     env, fs,
+    net::TcpListener,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -18,7 +19,7 @@ use tokio::{
     process::{Child, Command},
     sync::{Mutex, mpsc, oneshot},
     task::JoinHandle,
-    time::timeout,
+    time::{sleep, timeout},
 };
 
 use crate::app_server::ServerEvent;
@@ -144,18 +145,175 @@ impl OpenCodeClient {
 pub struct OpenCodeServer {
     child: Child,
     client: OpenCodeClient,
+    provider_auth: ProviderAuthServer,
     events: mpsc::UnboundedReceiver<ServerEvent>,
     writer_task: JoinHandle<()>,
     reader_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
 }
 
+pub struct ProviderAuthServer {
+    client: reqwest::Client,
+    base_url: reqwest::Url,
+}
+
+impl ProviderAuthServer {
+    fn new(port: u16) -> Result<Self> {
+        Ok(Self {
+            client: reqwest::Client::new(),
+            base_url: reqwest::Url::parse(&format!("http://127.0.0.1:{port}/"))?,
+        })
+    }
+
+    async fn wait_until_ready(&self) -> Result<()> {
+        for _ in 0..60 {
+            if self
+                .client
+                .get(self.url(&["global", "health"])?)
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        bail!("OpenCode provider API가 제한 시간 안에 준비되지 않았습니다.")
+    }
+
+    pub async fn catalog(&self) -> Result<Value> {
+        self.wait_until_ready().await?;
+        let (providers, auth) =
+            tokio::try_join!(self.get(&["provider"]), self.get(&["provider", "auth"]))?;
+        Ok(json!({
+            "all": providers.get("all").cloned().unwrap_or_else(|| json!([])),
+            "connected": providers
+                .get("connected")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+            "auth": auth
+        }))
+    }
+
+    pub async fn set_api_key(
+        &self,
+        provider_id: &str,
+        key: &str,
+        inputs: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        let mut body = json!({ "type": "api", "key": key });
+        if !inputs.is_empty() {
+            body["metadata"] = serde_json::to_value(inputs)?;
+        }
+        self.send_json(
+            self.client
+                .put(self.url(&["auth", provider_id])?)
+                .timeout(Duration::from_secs(30))
+                .json(&body),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn oauth_authorize(
+        &self,
+        provider_id: &str,
+        method: usize,
+        inputs: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Value> {
+        self.send_json(
+            self.client
+                .post(self.url(&["provider", provider_id, "oauth", "authorize"])?)
+                .timeout(Duration::from_secs(60))
+                .json(&json!({
+                    "method": method,
+                    "inputs": inputs
+                })),
+        )
+        .await
+    }
+
+    pub async fn oauth_callback(
+        &self,
+        provider_id: &str,
+        method: usize,
+        code: Option<&str>,
+    ) -> Result<()> {
+        self.send_json(
+            self.client
+                .post(self.url(&["provider", provider_id, "oauth", "callback"])?)
+                .timeout(Duration::from_secs(600))
+                .json(&json!({
+                    "method": method,
+                    "code": code
+                })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn get(&self, path: &[&str]) -> Result<Value> {
+        self.send_json(
+            self.client
+                .get(self.url(path)?)
+                .timeout(Duration::from_secs(30)),
+        )
+        .await
+    }
+
+    async fn send_json(&self, request: reqwest::RequestBuilder) -> Result<Value> {
+        let response = request
+            .send()
+            .await
+            .context("OpenCode provider API 요청 실패")?;
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let detail = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .pointer("/data/message")
+                        .or_else(|| value.get("message"))
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .unwrap_or(body);
+            bail!("OpenCode provider API {status}: {detail}");
+        }
+        if body.trim().is_empty() {
+            Ok(Value::Null)
+        } else {
+            serde_json::from_str(&body).context("OpenCode provider API 응답 해석 실패")
+        }
+    }
+
+    fn url(&self, segments: &[&str]) -> Result<reqwest::Url> {
+        let mut url = self.base_url.clone();
+        url.path_segments_mut()
+            .map_err(|_| anyhow!("OpenCode provider API URL을 만들 수 없습니다."))?
+            .extend(segments);
+        Ok(url)
+    }
+}
+
 impl OpenCodeServer {
     pub async fn spawn(open_code_path: &Path, cwd: &Path) -> Result<Self> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .context("OpenCode provider API 포트를 확보하지 못했습니다.")?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
         let resolved = resolve_command(open_code_path);
         let mut command = command_for(&resolved);
         command
-            .args(["acp", "--cwd"])
+            .args([
+                "acp",
+                "--hostname",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--cwd",
+            ])
             .arg(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -261,6 +419,7 @@ impl OpenCodeServer {
         Ok(Self {
             child,
             client,
+            provider_auth: ProviderAuthServer::new(port)?,
             events,
             writer_task,
             reader_task,
@@ -313,6 +472,43 @@ impl OpenCodeServer {
             .request("session/close", json!({ "sessionId": session_id }))
             .await;
         Ok(json!({ "data": models }))
+    }
+
+    pub async fn provider_catalog(&self) -> Result<Value> {
+        self.provider_auth.catalog().await
+    }
+
+    pub async fn set_provider_api_key(
+        &self,
+        provider_id: &str,
+        key: &str,
+        inputs: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        self.provider_auth
+            .set_api_key(provider_id, key, inputs)
+            .await
+    }
+
+    pub async fn authorize_provider_oauth(
+        &self,
+        provider_id: &str,
+        method: usize,
+        inputs: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Value> {
+        self.provider_auth
+            .oauth_authorize(provider_id, method, inputs)
+            .await
+    }
+
+    pub async fn complete_provider_oauth(
+        &self,
+        provider_id: &str,
+        method: usize,
+        code: Option<&str>,
+    ) -> Result<()> {
+        self.provider_auth
+            .oauth_callback(provider_id, method, code)
+            .await
     }
 
     pub async fn start_session(&self, cwd: &Path, model: &str) -> Result<Value> {
@@ -516,28 +712,6 @@ impl OpenCodeServer {
         self.reader_task.abort();
         self.stderr_task.abort();
     }
-}
-
-pub async fn provider_login(open_code_path: &Path) -> Result<()> {
-    let resolved = resolve_command(open_code_path);
-    let mut command = command_for(&resolved);
-    let status = command
-        .args(["providers", "login"])
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await
-        .with_context(|| {
-            format!(
-                "OpenCode provider 연결 화면을 시작하지 못했습니다: {}",
-                resolved.display()
-            )
-        })?;
-    if !status.success() {
-        bail!("OpenCode provider 연결이 완료되지 않았습니다.");
-    }
-    Ok(())
 }
 
 async fn route_message(

@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::{
     app_server::{AppServer, AppServerClient, ServerEvent},
-    open_code::{OpenCodeServer, is_open_code_model, is_open_code_request_id, provider_login},
+    open_code::{OpenCodeServer, is_open_code_model, is_open_code_request_id},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -33,7 +33,6 @@ pub struct BackendServer {
     routes: Arc<StdMutex<HashMap<String, Route>>>,
     aliases: Arc<StdMutex<HashMap<String, String>>>,
     cwd: PathBuf,
-    open_code_path: PathBuf,
 }
 
 impl BackendServer {
@@ -46,7 +45,6 @@ impl BackendServer {
             routes: Arc::new(StdMutex::new(HashMap::new())),
             aliases: Arc::new(StdMutex::new(HashMap::new())),
             cwd: cwd.to_path_buf(),
-            open_code_path: open_code_path.to_path_buf(),
         })
     }
 
@@ -246,8 +244,41 @@ impl BackendServer {
         self.codex.client()
     }
 
-    pub async fn connect_provider(&self) -> Result<()> {
-        provider_login(&self.open_code_path).await
+    pub async fn provider_catalog(&self) -> Result<Value> {
+        self.open_code()?.provider_catalog().await
+    }
+
+    pub async fn set_provider_api_key(
+        &self,
+        provider_id: &str,
+        key: &str,
+        inputs: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        self.open_code()?
+            .set_provider_api_key(provider_id, key, inputs)
+            .await
+    }
+
+    pub async fn authorize_provider_oauth(
+        &self,
+        provider_id: &str,
+        method: usize,
+        inputs: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Value> {
+        self.open_code()?
+            .authorize_provider_oauth(provider_id, method, inputs)
+            .await
+    }
+
+    pub async fn complete_provider_oauth(
+        &self,
+        provider_id: &str,
+        method: usize,
+        code: Option<&str>,
+    ) -> Result<()> {
+        self.open_code()?
+            .complete_provider_oauth(provider_id, method, code)
+            .await
     }
 
     pub fn has_open_code(&self) -> bool {
@@ -298,11 +329,11 @@ impl BackendServer {
         let Self {
             codex, open_code, ..
         } = self;
-        if let Some(open_code) = open_code {
-            tokio::join!(codex.shutdown(), open_code.shutdown());
-        } else {
-            codex.shutdown().await;
-        }
+        tokio::join!(codex.shutdown(), async move {
+            if let Some(open_code) = open_code {
+                open_code.shutdown().await;
+            }
+        });
     }
 
     fn open_code(&self) -> Result<&OpenCodeServer> {

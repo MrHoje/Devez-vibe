@@ -24,6 +24,7 @@ use crate::{
         PluginTarget,
     },
     pricing::{self, CostLedger, TokenTotals},
+    provider::{ProviderAuthRequest, ProviderPicker, ProviderPickerResult},
     renderer::{
         AnimationView, Block, BlockKind, ComposerMode, EffortSlider, HIDDEN_STATUS_LINE,
         LiveBlockView, ModeAccent, OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS, PlanStep,
@@ -724,6 +725,13 @@ pub enum Action {
     /// Re-read the MCP configuration and restart the servers.
     ReconnectMcp,
     ConnectProvider,
+    SubmitProviderAuth(Box<ProviderAuthRequest>),
+    CompleteProviderOAuth {
+        provider_id: String,
+        provider_name: String,
+        method: usize,
+        code: String,
+    },
     StartLogin(LoginMethod),
     CancelLogin(String),
     Logout,
@@ -961,6 +969,22 @@ enum PendingInteraction {
     /// Reached from the plugin picker, so cancelling it returns there instead of
     /// closing the overlay outright.
     MarketplacePicker(MarketplacePicker),
+    ProviderLoading,
+    ProviderPicker(ProviderPicker),
+    ProviderOAuthCode {
+        provider_id: String,
+        provider_name: String,
+        method: usize,
+        url: String,
+        instructions: String,
+        editor: Editor,
+        validation: Option<String>,
+    },
+    ProviderOAuthWaiting {
+        provider_name: String,
+        url: String,
+        instructions: String,
+    },
     Approval {
         id: Value,
         title: String,
@@ -2166,6 +2190,7 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
             | PendingInteraction::VibeModePicker { .. }
             | PendingInteraction::StatusLinePicker { .. }
             | PendingInteraction::SessionPicker(_)
+            | PendingInteraction::ProviderPicker(_)
     )
 }
 
@@ -3496,6 +3521,58 @@ impl AppState {
         self.pending = Some(PendingInteraction::McpPicker(picker));
     }
 
+    pub fn open_provider_picker(&mut self, catalog: &Value) {
+        self.pending = Some(PendingInteraction::ProviderPicker(
+            ProviderPicker::from_value(catalog),
+        ));
+    }
+
+    pub fn open_provider_loading(&mut self) {
+        self.pending = Some(PendingInteraction::ProviderLoading);
+    }
+
+    pub fn open_provider_oauth(
+        &mut self,
+        provider_id: String,
+        provider_name: String,
+        method: usize,
+        url: String,
+        instructions: String,
+        callback_method: &str,
+    ) {
+        self.pending = if callback_method == "code" {
+            Some(PendingInteraction::ProviderOAuthCode {
+                provider_id,
+                provider_name,
+                method,
+                url,
+                instructions,
+                editor: Editor::default(),
+                validation: None,
+            })
+        } else {
+            Some(PendingInteraction::ProviderOAuthWaiting {
+                provider_name,
+                url,
+                instructions,
+            })
+        };
+    }
+
+    pub fn provider_connected(&mut self, provider_name: &str) {
+        self.pending = None;
+        self.push_notice(
+            BlockKind::System,
+            "Provider connected",
+            format!("{provider_name} 연결이 완료되었습니다."),
+        );
+    }
+
+    pub fn provider_connection_failed(&mut self, message: impl Into<String>) {
+        self.pending = None;
+        self.push_notice(BlockKind::Error, "Provider 연결 실패", message.into());
+    }
+
     pub fn open_plugin_picker(
         &mut self,
         catalog: PluginCatalog,
@@ -3808,6 +3885,8 @@ impl AppState {
             Some(PendingInteraction::McpPicker(picker)) => picker.handle_paste(text),
             Some(PendingInteraction::PluginPicker(picker)) => picker.handle_paste(text),
             Some(PendingInteraction::MarketplacePicker(picker)) => picker.handle_paste(text),
+            Some(PendingInteraction::ProviderPicker(picker)) => picker.handle_paste(text),
+            Some(PendingInteraction::ProviderOAuthCode { editor, .. }) => editor.insert_str(text),
             Some(_) => {}
             None => {
                 if pasted {
@@ -5471,6 +5550,133 @@ impl AppState {
                 MarketplacePickerResult::Remove(name) => Action::ConfirmMarketplaceRemove(name),
                 MarketplacePickerResult::UpgradeAll => Action::UpgradeMarketplaces,
             },
+            PendingInteraction::ProviderLoading => {
+                self.pending = Some(PendingInteraction::ProviderLoading);
+                Action::None
+            },
+            PendingInteraction::ProviderPicker(mut picker) => match picker.handle_key(key) {
+                ProviderPickerResult::None => {
+                    self.pending = Some(PendingInteraction::ProviderPicker(picker));
+                    Action::None
+                }
+                ProviderPickerResult::Cancel => Action::None,
+                ProviderPickerResult::Submit(request) => Action::SubmitProviderAuth(request),
+            },
+            PendingInteraction::ProviderOAuthCode {
+                provider_id,
+                provider_name,
+                method,
+                url,
+                instructions,
+                mut editor,
+                mut validation,
+            } => match key.code {
+                KeyCode::Char('o') if !ctrl && !alt => {
+                    let target = url.clone();
+                    self.pending = Some(PendingInteraction::ProviderOAuthCode {
+                        provider_id,
+                        provider_name,
+                        method,
+                        url,
+                        instructions,
+                        editor,
+                        validation,
+                    });
+                    Action::OpenUrl(target)
+                }
+                KeyCode::Enter => {
+                    let code = editor.take_for_submit().unwrap_or_default();
+                    if code.trim().is_empty() {
+                        validation = Some("인증 코드를 입력하세요.".to_owned());
+                        self.pending = Some(PendingInteraction::ProviderOAuthCode {
+                            provider_id,
+                            provider_name,
+                            method,
+                            url,
+                            instructions,
+                            editor,
+                            validation,
+                        });
+                        Action::None
+                    } else {
+                        Action::CompleteProviderOAuth {
+                            provider_id,
+                            provider_name,
+                            method,
+                            code,
+                        }
+                    }
+                }
+                KeyCode::Esc => Action::None,
+                KeyCode::Backspace if ctrl => {
+                    editor.delete_word_left();
+                    self.pending = Some(PendingInteraction::ProviderOAuthCode {
+                        provider_id,
+                        provider_name,
+                        method,
+                        url,
+                        instructions,
+                        editor,
+                        validation: None,
+                    });
+                    Action::None
+                }
+                KeyCode::Backspace => {
+                    editor.backspace();
+                    self.pending = Some(PendingInteraction::ProviderOAuthCode {
+                        provider_id,
+                        provider_name,
+                        method,
+                        url,
+                        instructions,
+                        editor,
+                        validation: None,
+                    });
+                    Action::None
+                }
+                KeyCode::Char(ch) if !ctrl => {
+                    editor.insert(ch);
+                    self.pending = Some(PendingInteraction::ProviderOAuthCode {
+                        provider_id,
+                        provider_name,
+                        method,
+                        url,
+                        instructions,
+                        editor,
+                        validation: None,
+                    });
+                    Action::None
+                }
+                _ => {
+                    self.pending = Some(PendingInteraction::ProviderOAuthCode {
+                        provider_id,
+                        provider_name,
+                        method,
+                        url,
+                        instructions,
+                        editor,
+                        validation,
+                    });
+                    Action::None
+                }
+            },
+            PendingInteraction::ProviderOAuthWaiting {
+                provider_name,
+                url,
+                instructions,
+            } => {
+                let action = if key.code == KeyCode::Char('o') && !ctrl && !alt {
+                    Action::OpenUrl(url.clone())
+                } else {
+                    Action::None
+                };
+                self.pending = Some(PendingInteraction::ProviderOAuthWaiting {
+                    provider_name,
+                    url,
+                    instructions,
+                });
+                action
+            },
             PendingInteraction::Approval {
                 id,
                 title,
@@ -5906,6 +6112,92 @@ impl AppState {
             PendingInteraction::McpPicker(picker) => Some(picker.overlay_view()),
             PendingInteraction::PluginPicker(picker) => Some(picker.overlay_view()),
             PendingInteraction::MarketplacePicker(picker) => Some(picker.overlay_view()),
+            PendingInteraction::ProviderLoading => Some(OverlayView {
+                title: "Connect OpenCode provider".to_owned(),
+                lines: vec![OverlayLine {
+                    text: "Provider 목록과 인증 방식을 불러오는 중…".to_owned(),
+                    selected: true,
+                    muted: false,
+                }],
+                slider: None,
+                hint: "잠시 기다려 주세요.".to_owned(),
+                closable: false,
+                style: OverlayStyle::Panel,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            }),
+            PendingInteraction::ProviderPicker(picker) => Some(picker.overlay_view()),
+            PendingInteraction::ProviderOAuthCode {
+                provider_name,
+                url,
+                instructions,
+                editor,
+                validation,
+                ..
+            } => {
+                let mut lines = vec![
+                    OverlayLine {
+                        text: instructions.clone(),
+                        selected: false,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: url.clone(),
+                        selected: false,
+                        muted: true,
+                    },
+                ];
+                if let Some(validation) = validation {
+                    lines.push(OverlayLine {
+                        text: validation.clone(),
+                        selected: false,
+                        muted: false,
+                    });
+                }
+                Some(OverlayView {
+                    title: format!("{provider_name} · OAuth"),
+                    lines,
+                    slider: None,
+                    hint: "O 브라우저 열기  Enter 코드 전송  Esc 취소".to_owned(),
+                    closable: false,
+                    style: OverlayStyle::Panel,
+                    input: Some(editor),
+                    input_label: "인증 코드",
+                    input_placeholder: "브라우저에 표시된 코드를 입력…",
+                })
+            }
+            PendingInteraction::ProviderOAuthWaiting {
+                provider_name,
+                url,
+                instructions,
+            } => Some(OverlayView {
+                title: format!("{provider_name} · OAuth 연결 중"),
+                lines: vec![
+                    OverlayLine {
+                        text: instructions.clone(),
+                        selected: false,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: url.clone(),
+                        selected: false,
+                        muted: true,
+                    },
+                    OverlayLine {
+                        text: "브라우저 인증이 끝나면 자동으로 연결됩니다.".to_owned(),
+                        selected: true,
+                        muted: false,
+                    },
+                ],
+                slider: None,
+                hint: "O 브라우저 다시 열기".to_owned(),
+                closable: false,
+                style: OverlayStyle::Panel,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            }),
             PendingInteraction::Approval {
                 title,
                 detail,

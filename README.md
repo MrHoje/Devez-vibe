@@ -52,8 +52,9 @@ dvz update
 가장 최근 세션을 바로 이어갑니다. 실행 중에는 `/resume [SESSION]` 또는 별칭
 `/continue`로 세션을 전환할 수 있습니다. 입력창의 전체 명령은 `/help`에서 확인합니다.
 
-OpenCode CLI가 설치되어 있으면 `/connect`에서 OpenCode의 provider 연결 화면을 그대로
-열 수 있습니다. 연결된 provider 모델은 `/model`에 `OpenCode ·` 표기로 합쳐집니다.
+OpenCode CLI가 설치되어 있으면 `/connect`에서 Devez Vibe 내부 provider 검색·인증 화면을
+열 수 있습니다. API key와 추가 설정은 내부 오버레이에서 입력하고, OAuth는 같은 화면에서
+브라우저 인증 완료를 기다립니다. 연결된 모델은 `/model`에 `OpenCode ·` 표기로 합쳐지며,
 OpenAI 모델은 OpenCode를 거치지 않고 기존 공식 Codex 런타임을 계속 사용합니다.
 
 ### 업데이트
