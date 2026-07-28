@@ -2026,6 +2026,7 @@ enum Tone {
     StatusSeparator,
     UserPrompt,
     UserPromptHalf,
+    AssistantBubble,
     Model56,
     ModelSol,
     ModelTerra,
@@ -4918,6 +4919,11 @@ fn block_lines_with_mode(
         width
     };
     let mut first_content = conversational;
+    let content_tone = if conversational && CHAT_LAYOUT.load(Ordering::Relaxed) {
+        Tone::AssistantBubble
+    } else {
+        Tone::Plain
+    };
     let mut lines = if conversational {
         Vec::new()
     } else {
@@ -4925,7 +4931,7 @@ fn block_lines_with_mode(
     };
     if block.body.is_empty() {
         if conversational {
-            lines.extend(wrapped_line(marker, tone, "", Tone::Plain, false, conversational_width));
+            lines.extend(wrapped_line(marker, tone, "", content_tone, false, conversational_width));
         }
         return lines;
     }
@@ -4967,7 +4973,7 @@ fn block_lines_with_mode(
                 &prefix,
                 prefix_tone,
                 trimmed.trim_start_matches('#').trim_start(),
-                Tone::Plain,
+                content_tone,
                 true,
                 conversational_width,
             ));
@@ -4981,7 +4987,7 @@ fn block_lines_with_mode(
                 &prefix,
                 prefix_tone,
                 item,
-                Tone::Plain,
+                content_tone,
                 false,
                 conversational_width,
             ));
@@ -5003,7 +5009,7 @@ fn block_lines_with_mode(
                 &prefix,
                 prefix_tone,
                 raw_line,
-                Tone::Plain,
+                content_tone,
                 false,
                 conversational_width,
             ));
@@ -6453,6 +6459,7 @@ fn word_background(tone: Tone) -> Option<Rgb> {
     let palette = theme::palette();
     Some(match tone {
         Tone::UserPrompt if CHAT_LAYOUT.load(Ordering::Relaxed) => palette.user_prompt_bg,
+        Tone::AssistantBubble => blend(palette.background, palette.foreground, 20),
         Tone::DiffAddedWord => palette.diff_add_word_bg,
         Tone::DiffRemovedWord => palette.diff_remove_word_bg,
         Tone::ScrollToBottom => palette.hover_bg,
@@ -6767,6 +6774,7 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::StatusSeparator => palette.status.separator,
         Tone::UserPrompt => palette.foreground,
         Tone::UserPromptHalf => palette.user_prompt_bg,
+        Tone::AssistantBubble => palette.foreground,
         Tone::Model56 => palette.model_gpt56,
         Tone::ModelSol => palette.model_sol,
         Tone::ModelTerra => palette.model_terra,
@@ -9153,14 +9161,15 @@ mod tests {
         let user_lines = block_lines(&user, 80);
         let assistant_lines = block_lines(&assistant, 80);
 
-        assert_eq!(user_lines[0].prefix, " ".repeat(70));
-        assert_eq!(user_lines[0].text, " hello ");
-        assert!(user_lines[0].prefix_tone == Tone::Plain);
-        assert!(user_lines[0].tone == Tone::UserPrompt);
-        assert!(!user_lines[0].bold);
+        assert_eq!(user_lines[1].prefix, " ".repeat(70));
+        assert_eq!(user_lines[1].text, " hello ");
+        assert!(user_lines[1].prefix_tone == Tone::Plain);
+        assert!(user_lines[1].tone == Tone::UserPrompt);
+        assert!(!user_lines[1].bold);
         assert_eq!(assistant_lines[0].prefix, "• ");
         assert_eq!(assistant_lines[0].prefix_tone, Tone::FastOff);
         assert_eq!(assistant_lines[0].text, "hi");
+        assert_eq!(assistant_lines[0].tone, Tone::AssistantBubble);
         assert!(user_lines.iter().all(|line| line.text != "You"));
         assert!(assistant_lines.iter().all(|line| line.text != "Codex"));
     }
