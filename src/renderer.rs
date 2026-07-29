@@ -1344,6 +1344,8 @@ impl Renderer {
 
         let mut rows = Vec::with_capacity(updates.len());
         for (screen_row, line) in updates {
+            let repaint_plan_row = *screen_row < self.animation_plan_rows
+                && plan_row_requires_full_repaint(&self.previous_lines[*screen_row], line);
             let mut current = CellFrame::new(width, 1);
             let hovered =
                 Self::hover_columns(line, self.hovered_tool, self.hovered_pick.as_ref());
@@ -1354,7 +1356,7 @@ impl Renderer {
                 height: 1,
                 cells: painted.cells[start..start + width].to_vec(),
             };
-            rows.push((*screen_row, previous, current));
+            rows.push((*screen_row, previous, current, repaint_plan_row));
         }
 
         if self.cursor_shown {
@@ -1363,11 +1365,10 @@ impl Renderer {
         }
         queue!(self.out, Print("\x1b[?2026h"))?;
         let mut result = Ok(());
-        for (screen_row, previous, current) in &rows {
-            // A fixed plan row can change both wide Korean glyphs and strikeout
-            // state while it is animated. Repaint the whole row so no stale
-            // terminal cells survive a shortened or restyled step.
-            let previous = (*screen_row >= self.animation_plan_rows).then_some(previous);
+        for (screen_row, previous, current, repaint_plan_row) in &rows {
+            // A changed plan step can shorten or restyle wide Korean text. Clear
+            // just that row once; spinner frames keep the inexpensive diff path.
+            let previous = (!*repaint_plan_row).then_some(previous);
             if let Err(error) =
                 emit_frame_diff_at(&mut self.out, previous, current, *screen_row)
             {
@@ -1383,7 +1384,7 @@ impl Renderer {
         }
 
         if let Some(painted) = self.painted_frame.as_mut() {
-            for (screen_row, _, current) in rows {
+            for (screen_row, _, current, _) in rows {
                 let start = screen_row * width;
                 painted.cells[start..start + width].clone_from_slice(&current.cells);
             }
@@ -1794,6 +1795,18 @@ impl Renderer {
         }
         Ok(())
     }
+}
+
+fn plan_row_requires_full_repaint(previous: &PaintLine, current: &PaintLine) -> bool {
+    previous.prefix_tone != current.prefix_tone
+        || previous.text != current.text
+        || previous.tone != current.tone
+        || previous.bold != current.bold
+        || !previous
+            .tail
+            .iter()
+            .map(|span| span.text.as_str())
+            .eq(current.tail.iter().map(|span| span.text.as_str()))
 }
 
 /// Splits the screen between the transcript and the live frame, as
@@ -12599,6 +12612,28 @@ mod tests {
 
         assert!(painted(&lines[2]).contains("Done (1m 34s)"));
         assert!(painted(&lines[3]).contains("⏱  1m 34s"));
+    }
+
+    #[test]
+    fn plan_row_full_repaint_skips_spinner_only_changes() {
+        let mut previous = PaintLine::plain("작업");
+        previous.prefix = "  ⠋  ".to_owned();
+        previous.prefix_tone = Tone::Accent;
+        previous.tone = Tone::Accent;
+        let mut spinner = previous.clone();
+        spinner.prefix = "  ⠙  ".to_owned();
+
+        assert!(!plan_row_requires_full_repaint(&previous, &spinner));
+
+        let mut completed = spinner.clone();
+        completed.prefix_tone = Tone::FastOff;
+        completed.tone = Tone::PlanDone;
+        completed.tail.push(PaintSpan {
+            text: " (5s)".to_owned(),
+            tone: Tone::Muted,
+            bold: false,
+        });
+        assert!(plan_row_requires_full_repaint(&spinner, &completed));
     }
 
     #[test]
