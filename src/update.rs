@@ -19,7 +19,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Notes shown in the welcome panel's right column. Rewrite these each release;
 /// a line starting with `·` renders as a bullet, anything else as a sub-heading.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Resumed sessions reload every history page, even when the bootstrap cursor is missing.",
+    "New sessions start without requesting history; resumed sessions reload every page.",
     "Ctrl+C stays in Devez Vibe without triggering a child-process Y/N prompt.",
     "Scrolled history no longer pins an old prompt above the viewport.",
 ];
