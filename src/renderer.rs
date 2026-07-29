@@ -5462,7 +5462,15 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
             .body
             .lines()
             .flat_map(|line| {
-                wrapped_line("▌ ", Tone::Accent, line, Tone::UserPrompt, false, width)
+                wrapped_line_with_continuation(
+                    "▌ ",
+                    "▌ ",
+                    Tone::Accent,
+                    line,
+                    Tone::UserPrompt,
+                    false,
+                    width,
+                )
             })
             .collect::<Vec<_>>();
         let padding_width = usize::from(width).saturating_sub(2);
@@ -7474,6 +7482,22 @@ mod tests {
         assert_eq!(frame.cell(2, 0).style.background, row_background(Tone::UserPrompt));
         assert_eq!(frame.cell(6, 0).style.background, row_background(Tone::UserPrompt));
         assert_eq!(frame.cell(7, 0).style.background, None);
+    }
+
+    #[test]
+    fn wrapped_user_prompt_repeats_its_border_on_every_row() {
+        CHAT_LAYOUT.store(false, Ordering::Relaxed);
+        let lines = user_prompt_lines(
+            &Block::new(BlockKind::User, "You", "a prompt long enough to wrap across several rows"),
+            18,
+        );
+
+        let prompt_rows = lines
+            .iter()
+            .filter(|line| line.tone == Tone::UserPrompt)
+            .collect::<Vec<_>>();
+        assert!(prompt_rows.len() > 1);
+        assert!(prompt_rows.iter().all(|line| line.prefix == "▌ "));
     }
 
     #[test]
