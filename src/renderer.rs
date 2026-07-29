@@ -1364,8 +1364,12 @@ impl Renderer {
         queue!(self.out, Print("\x1b[?2026h"))?;
         let mut result = Ok(());
         for (screen_row, previous, current) in &rows {
+            // A fixed plan row can change both wide Korean glyphs and strikeout
+            // state while it is animated. Repaint the whole row so no stale
+            // terminal cells survive a shortened or restyled step.
+            let previous = (*screen_row >= self.animation_plan_rows).then_some(previous);
             if let Err(error) =
-                emit_frame_diff_at(&mut self.out, Some(previous), current, *screen_row)
+                emit_frame_diff_at(&mut self.out, previous, current, *screen_row)
             {
                 result = Err(error);
                 break;
