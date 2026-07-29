@@ -19,9 +19,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Notes shown in the welcome panel's right column. Rewrite these each release;
 /// a line starting with `·` renders as a bullet, anything else as a sub-heading.
 pub const RELEASE_NOTES: &[&str] = &[
+    "Resuming keeps the DevezCode spinner visible until the full history is ready.",
     "New sessions start without requesting history; resumed sessions reload every page.",
     "Ctrl+C stays in Devez Vibe without triggering a child-process Y/N prompt.",
-    "Scrolled history no longer pins an old prompt above the viewport.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

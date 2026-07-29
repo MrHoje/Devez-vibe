@@ -251,6 +251,7 @@ async fn start_session(
     requested_model_name: &str,
     requested_effort: &str,
 ) -> Result<()> {
+    state.set_host_loading(is_resuming);
     let startup = await_thread(
         server,
         state,
@@ -310,6 +311,7 @@ async fn start_session(
         state.load_history(&thread, rollout.as_ref());
         state.begin_cost_restore();
     }
+    state.set_host_loading(false);
     draw(state, renderer)?;
 
     let (update_tx, update_rx) = mpsc::channel(1);
@@ -2190,6 +2192,7 @@ async fn resume_into_state(
     renderer.clear_screen()?;
     state.prepare_resume();
     state.begin_thread_switch();
+    state.set_host_loading(true);
 
     let (response, queued) = match await_switch(
         server,
@@ -2228,6 +2231,7 @@ async fn resume_into_state(
     };
     state.load_history(&history, rollout.as_ref());
     state.begin_cost_restore();
+    state.set_host_loading(false);
     Ok(Switched::Done(queued))
 }
 
@@ -2277,6 +2281,7 @@ fn abandon_thread_switch(
     previous_thread_id: String,
     message: impl Into<String>,
 ) {
+    state.set_host_loading(false);
     state.cancel_thread_switch(previous_thread_id);
     state.set_request_failed(message);
 }
@@ -3265,7 +3270,7 @@ fn draw(state: &mut AppState, renderer: &mut Renderer) -> Result<()> {
     // Every state change the user can see reaches a frame, so the host's copy of
     // the session state is refreshed from the same place rather than from each
     // of the call sites that can move it.
-    devezcode::sync(&state.thread_id, state.busy, state.awaiting_input());
+    devezcode::sync(&state.thread_id, state.host_busy(), state.awaiting_input());
     let committed = state.drain_committed();
     let view = state.view();
     let view_elapsed = draw_started.elapsed();

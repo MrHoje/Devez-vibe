@@ -2476,6 +2476,7 @@ pub struct AppState {
     turn_interrupted: bool,
     quit_armed: bool,
     pub busy: bool,
+    host_loading: bool,
     pub cwd: String,
     account: String,
     models: Vec<ModelInfo>,
@@ -2614,6 +2615,7 @@ impl AppState {
             turn_interrupted: false,
             quit_armed: false,
             busy: false,
+            host_loading: false,
             cwd,
             account,
             models,
@@ -2732,6 +2734,16 @@ impl AppState {
     /// anything that would talk to the thread has to wait for it.
     pub fn thread_pending(&self) -> bool {
         self.thread_id.is_empty()
+    }
+
+    /// Keeps DevezCode's tab spinner visible while a resumed transcript is
+    /// being rebuilt, without treating the composer as an active turn.
+    pub fn set_host_loading(&mut self, loading: bool) {
+        self.host_loading = loading;
+    }
+
+    pub fn host_busy(&self) -> bool {
+        self.busy || self.host_loading
     }
 
     /// Holds a session picked before the current one existed. The newest pick wins,
@@ -9053,6 +9065,19 @@ mod tests {
             "gpt-5.6-sol",
             Some("high"),
         )
+    }
+
+    #[test]
+    fn host_loading_marks_the_devezcode_spinner_busy_without_a_turn() {
+        let mut state = test_state();
+
+        assert!(!state.host_busy());
+        state.set_host_loading(true);
+        assert!(state.host_busy());
+        assert!(!state.busy);
+
+        state.set_host_loading(false);
+        assert!(!state.host_busy());
     }
 
     #[test]
