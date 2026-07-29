@@ -19,9 +19,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Notes shown in the welcome panel's right column. Rewrite these each release;
 /// a line starting with `·` renders as a bullet, anything else as a sub-heading.
 pub const RELEASE_NOTES: &[&str] = &[
+    "Code blocks now use language-aware syntax highlighting.",
+    "The composer no longer shows the View toggle, and prompts use a bordered card.",
     "Resuming keeps the DevezCode spinner visible until the full history is ready.",
-    "New sessions start without requesting history; resumed sessions reload every page.",
-    "Ctrl+C stays in Devez Vibe without triggering a child-process Y/N prompt.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

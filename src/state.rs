@@ -797,7 +797,6 @@ pub enum Action {
         shell: ShellDisplayMode,
         diff: DiffDisplayMode,
     },
-    PersistConversationView(ConversationView),
     PersistStatusLine {
         key_path: &'static str,
         enabled: bool,
@@ -2164,9 +2163,6 @@ fn resume_picker_rows(height: u16) -> usize {
 pub enum ConversationView { #[default] List, Chat }
 
 impl ConversationView {
-    pub const fn label(self) -> &'static str { match self { Self::List => "List", Self::Chat => "Chat" } }
-    pub const fn config_value(self) -> &'static str { match self { Self::List => "list", Self::Chat => "chat" } }
-    pub const fn next(self) -> Self { match self { Self::List => Self::Chat, Self::Chat => Self::List } }
     pub const fn is_chat(self) -> bool { matches!(self, Self::Chat) }
 }
 
@@ -3172,7 +3168,6 @@ impl AppState {
                 VibeMode::Vibe => VibeTone::On,
                 VibeMode::SuperVibe => VibeTone::Super,
             },
-            conversation_view: self.conversation_view.label().to_owned(),
             label: self.permission_mode().label().to_owned(),
             accent: self.permission_mode().accent(),
             model: self.selected_model_name().to_owned(),
@@ -7030,11 +7025,6 @@ impl AppState {
 
     pub const fn response_length(&self) -> ResponseLength {
         self.response_length
-    }
-
-    pub fn cycle_conversation_view(&mut self) -> ConversationView {
-        self.conversation_view = self.conversation_view.next();
-        self.conversation_view
     }
 
     pub fn cycle_vibe_mode(&mut self) -> (ShellDisplayMode, DiffDisplayMode) {

@@ -13,6 +13,7 @@ mod renderer;
 mod rollout;
 mod selection;
 mod state;
+mod syntax;
 mod theme;
 mod update;
 
@@ -1004,7 +1005,6 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
             state.toggle_plan_summary();
             Action::Tick(true)
         }
-        Pick::ConversationView => Action::PersistConversationView(state.cycle_conversation_view()),
         Pick::ToggleWelcomeCredits => {
             state.toggle_welcome_credits();
             Action::Tick(true)
@@ -1255,14 +1255,6 @@ async fn execute_action(
                     state.push_notice(BlockKind::Warning, "Vibe 표시 설정 저장 실패", error.to_string());
                     break;
                 }
-            }
-        }
-        Action::PersistConversationView(view) => {
-            if let Err(error) = server
-                .request("config/value/write", config_value_write_params("conversation_view", view.config_value()))
-                .await
-            {
-                state.push_notice(BlockKind::Warning, "View 설정 저장 실패", error.to_string());
             }
         }
         Action::PersistStatusLine { key_path, enabled } => {

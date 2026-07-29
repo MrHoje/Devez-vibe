@@ -1,6 +1,6 @@
 [package]
 name = "devez-vibe"
-version = "0.1.18"
+version = "0.1.19"
 edition = "2024"
 license = "MIT"
 description = "A stable, clean-room terminal client for the official Codex app-server"
@@ -27,4 +27,13 @@ serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 textwrap = "0.16"
 tokio = { version = "1.48", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tree-sitter = "0.26"
+tree-sitter-bash = "0.25"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-highlight = "0.26"
+tree-sitter-javascript = "0.25"
+tree-sitter-json = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"
 unicode-width = "0.2"

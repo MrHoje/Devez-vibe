@@ -30,6 +30,7 @@ use crate::{
         selected_char_count, selection_chunks,
     },
     state::{DiffDisplayMode, ShellDisplayMode},
+    syntax::{self, SyntaxKind},
     theme::{self, Rgb, ThemeKind},
 };
 
@@ -269,7 +270,6 @@ pub struct ComposerMode {
     pub branch: Option<String>,
     pub vibe_mode: String,
     pub vibe_tone: VibeTone,
-    pub conversation_view: String,
     #[allow(dead_code)]
     pub label: String,
     #[allow(dead_code)]
@@ -1879,10 +1879,14 @@ fn paint_line_into_frame(
     let bubble_background = bubble_background(line);
     if let Some(background) = background {
         let (start, right) = if matches!(line.tone, Tone::UserPrompt | Tone::UserPromptPadding) {
-            let marker_width = usize::from(CHAT_LAYOUT.load(Ordering::Relaxed) && line.prefix.ends_with("› "))
-                * (CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP + 2);
-            let start = UnicodeWidthStr::width(line.prefix.as_str())
-                .saturating_sub(marker_width + 1);
+            let prefix_width = UnicodeWidthStr::width(line.prefix.as_str());
+            let start = if CHAT_LAYOUT.load(Ordering::Relaxed) {
+                let marker_width = usize::from(line.prefix.ends_with("› "))
+                    * (CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP + 2);
+                prefix_width.saturating_sub(marker_width + 1)
+            } else {
+                prefix_width
+            };
             (start, frame.width.saturating_sub(1))
         } else if line.tone == Tone::ModelChange {
             // Setting-change cards share the user's terminal-safe trailing cell.
@@ -2292,6 +2296,8 @@ enum Tone {
     SyntaxNumber,
     SyntaxType,
     SyntaxFunction,
+    SyntaxAttribute,
+    SyntaxProperty,
     MarkdownHeading,
     MarkdownLink,
     InlineCode,
@@ -2323,7 +2329,6 @@ pub enum Pick {
     RemoveQueuedPrompt(usize),
     /// The Vibe preset applies its response and transcript display settings.
     VibeMode,
-    ConversationView,
     /// Legacy internal picks retained for command and regression-test routing.
     #[allow(dead_code)]
     ResponseLength,
@@ -2663,11 +2668,6 @@ fn activity_line_with_composer_controls(
 
     let badge_start = line.tail.len() + 2;
     let mut picks = Vec::new();
-    picks.extend(
-        badge
-            .conversation_view_index
-            .map(|index| (badge_start + index, Pick::ConversationView)),
-    );
     picks.extend(
         badge
             .shell_display_mode_index
@@ -5458,23 +5458,20 @@ fn block_lines_with_expansion(block: &Block, width: u16, expanded: bool) -> Vec<
 fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     let marker_tone = model_tone(&block.title).unwrap_or(Tone::User);
     if !CHAT_LAYOUT.load(Ordering::Relaxed) {
-        let mut first_line = true;
         let mut lines = block
             .body
             .lines()
             .flat_map(|line| {
-                let prefix = if first_line {
-                    first_line = false;
-                    "› "
-                } else {
-                    "  "
-                };
-                wrapped_line(prefix, marker_tone, line, Tone::UserPrompt, false, width)
+                wrapped_line("▌ ", Tone::Accent, line, Tone::UserPrompt, false, width)
             })
             .collect::<Vec<_>>();
-        let half_width = usize::from(width).saturating_sub(1);
-        lines.insert(0, PaintLine::user_prompt_padding(half_width));
-        lines.push(PaintLine::user_prompt_padding(half_width));
+        let padding_width = usize::from(width).saturating_sub(2);
+        let mut top = PaintLine::user_prompt_padding(padding_width);
+        top.prefix = "▌ ".to_owned();
+        top.prefix_tone = Tone::Accent;
+        let bottom = top.clone();
+        lines.insert(0, top);
+        lines.push(bottom);
         return lines;
     }
     const RIGHT_GAP: usize = 0;
@@ -5806,6 +5803,27 @@ fn diff_line(prefix: &str, prefix_tone: Tone, text: &str, width: u16) -> Vec<Pai
 }
 
 fn highlight_code(text: &str, language: &str) -> Vec<PaintSpan> {
+    if let Some(spans) = syntax::highlight(text, language) {
+        return spans
+            .into_iter()
+            .map(|span| PaintSpan {
+                text: span.text,
+                tone: match span.kind {
+                    SyntaxKind::Plain => Tone::Code,
+                    SyntaxKind::Comment => Tone::SyntaxComment,
+                    SyntaxKind::String => Tone::SyntaxString,
+                    SyntaxKind::Keyword => Tone::SyntaxKeyword,
+                    SyntaxKind::Number => Tone::SyntaxNumber,
+                    SyntaxKind::Type => Tone::SyntaxType,
+                    SyntaxKind::Function => Tone::SyntaxFunction,
+                    SyntaxKind::Attribute => Tone::SyntaxAttribute,
+                    SyntaxKind::Property => Tone::SyntaxProperty,
+                },
+                bold: matches!(span.kind, SyntaxKind::Keyword | SyntaxKind::Type),
+            })
+            .collect();
+    }
+
     let mut spans = Vec::new();
     let mut index = 0;
     let hash_comment = matches!(
@@ -6459,11 +6477,6 @@ fn input_top_line_with_controls(
         let badge_start = tail_offset + 1;
         picks.extend(
             badge
-                .conversation_view_index
-                .map(|index| (badge_start + index, Pick::ConversationView)),
-        );
-        picks.extend(
-            badge
                 .shell_display_mode_index
                 .map(|index| (badge_start + index, Pick::ShellDisplayMode)),
         );
@@ -6647,12 +6660,6 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
         },
         bold: false,
     };
-    let conversation_view_span = PaintSpan {
-        text: format!("View: {}", mode.conversation_view),
-        tone: Tone::FastOff,
-        bold: false,
-    };
-
     let fast_label = if mode.fast_mode {
         "Fast: On"
     } else {
@@ -6677,9 +6684,7 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
             PaintSpan { text: format!("Diff: {}", mode.diff_display_mode), tone: Tone::Muted, bold: false },
         ]
     });
-    let primary_spans = custom_spans.unwrap_or_else(|| {
-        vec![vibe_mode_span.clone(), separator_span(), conversation_view_span]
-    });
+    let primary_spans = custom_spans.unwrap_or_else(|| vec![vibe_mode_span.clone()]);
     // Fast is the only optional trailing control.
     let ladder = [
         BadgeSpans {
@@ -6689,7 +6694,6 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
                 vec![fast_span.clone()],
             ]
             .concat(),
-            conversation_view_index: Some(display_width + 2),
             response_length_index: Some(display_width),
             shell_display_mode_index: None,
             diff_display_mode_index: None,
@@ -6697,7 +6701,6 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
         },
         BadgeSpans {
             spans: [display_spans, primary_spans.clone()].concat(),
-            conversation_view_index: Some(display_width + 2),
             response_length_index: Some(display_width),
             shell_display_mode_index: None,
             diff_display_mode_index: None,
@@ -6714,7 +6717,6 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
 /// that picked the candidate knows which rung it settled on.
 struct BadgeSpans {
     spans: Vec<PaintSpan>,
-    conversation_view_index: Option<usize>,
     response_length_index: Option<usize>,
     shell_display_mode_index: Option<usize>,
     diff_display_mode_index: Option<usize>,
@@ -7338,6 +7340,8 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::SyntaxNumber => palette.syntax_number,
         Tone::SyntaxType => palette.syntax_type,
         Tone::SyntaxFunction => palette.syntax_function,
+        Tone::SyntaxAttribute => palette.syntax_attribute,
+        Tone::SyntaxProperty => palette.syntax_property,
         Tone::MarkdownHeading => palette.response.heading,
         Tone::MarkdownLink => palette.response.link,
         Tone::InlineCode => palette.response.inline_code,
@@ -7443,7 +7447,7 @@ mod tests {
     }
 
     #[test]
-    fn user_prompt_background_reaches_the_same_right_edge_after_its_marker() {
+    fn user_prompt_border_uses_the_prompt_background() {
         CHAT_LAYOUT.store(false, Ordering::Relaxed);
         let mut frame = CellFrame::new(8, 1);
 
@@ -7451,8 +7455,8 @@ mod tests {
             &mut frame,
             0,
             &PaintLine {
-                prefix: "› ".to_owned(),
-                prefix_tone: Tone::User,
+                prefix: "▌ ".to_owned(),
+                prefix_tone: Tone::Accent,
                 text: "x".to_owned(),
                 tone: Tone::UserPrompt,
                 bold: false,
@@ -7465,6 +7469,9 @@ mod tests {
             None,
         );
 
+        assert_eq!(frame.cell(0, 0).style.background, row_background(Tone::UserPrompt));
+        assert_eq!(frame.cell(1, 0).style.background, row_background(Tone::UserPrompt));
+        assert_eq!(frame.cell(2, 0).style.background, row_background(Tone::UserPrompt));
         assert_eq!(frame.cell(6, 0).style.background, row_background(Tone::UserPrompt));
         assert_eq!(frame.cell(7, 0).style.background, None);
     }
@@ -9341,7 +9348,7 @@ mod tests {
             .iter()
             .position(|line| painted_line_text(line).contains("Completed"))
             .expect("activity row");
-        assert!(painted(&frame.lines[activity]).contains("View: Chat"));
+        assert!(!painted(&frame.lines[activity]).contains("View: Chat"));
         assert!(painted(&frame.lines[activity]).contains("Fast: Off"));
         assert!(!painted(&frame.lines[activity + 1]).contains("View: Chat"));
         assert_eq!(painted_width(&frame.lines[activity]), 158);
@@ -9372,7 +9379,7 @@ mod tests {
             .iter()
             .position(|line| painted_line_text(line).contains("Completed"))
             .expect("activity row");
-        assert!(painted(&frame.lines[activity]).contains("View: Chat"));
+        assert!(!painted(&frame.lines[activity]).contains("View: Chat"));
         assert!(!painted(&frame.lines[activity]).contains("Shell: Collapse"));
         assert!(!painted(&frame.lines[activity + 1]).contains("View: Chat"));
     }
@@ -9458,7 +9465,6 @@ mod tests {
             branch: None,
             vibe_mode: "Vibe: On".to_owned(),
             vibe_tone: VibeTone::On,
-            conversation_view: "Chat".to_owned(),
             label: label.to_owned(),
             accent,
             model: "GPT-5.6-Terra".to_owned(),
@@ -9526,10 +9532,10 @@ mod tests {
         // Two blanks off the rule, the badge, then the rule resumes for two columns.
         assert_eq!(
             texts,
-            ["  ", "Vibe: On", " · ", "View: Chat", " · ", "Fast: On", " ", "─╮"]
+            ["  ", "Vibe: On", " · ", "Fast: On", " ", "─╮"]
         );
         assert_eq!(line.tail[1].tone, Tone::FastOn);
-        assert_eq!(line.tail[5].tone, Tone::FastOn);
+        assert_eq!(line.tail[3].tone, Tone::FastOn);
     }
 
     #[test]
@@ -9551,7 +9557,7 @@ mod tests {
         );
         let composer = frame.composer_index.expect("composer index");
 
-        assert!(painted(&frame.lines[composer - 1]).contains("View: Chat"));
+        assert!(!painted(&frame.lines[composer - 1]).contains("View: Chat"));
         assert!(painted(&frame.lines[composer - 1]).contains("Fast: Off"));
         assert!(!painted(&frame.lines[composer]).contains("View: Chat"));
     }
@@ -9579,7 +9585,7 @@ mod tests {
     fn composer_badges_answer_to_their_own_columns() {
         let mode = test_mode("Full Access", ModeAccent::Danger, true);
         let line = input_top_line(120, "", Some(&mode));
-        assert_eq!(pick_on(&line, "View: Chat"), Some(Pick::ConversationView));
+        assert_eq!(pick_on(&line, "View: Chat"), None);
         assert_eq!(pick_on(&line, "Vibe: On"), Some(Pick::VibeMode));
         assert_eq!(pick_on(&line, "Fast: On"), Some(Pick::FastMode));
         // The rule, and the middle of the separator between the badges, are not
@@ -9594,7 +9600,7 @@ mod tests {
         let line = input_top_line(80, "", Some(&mode));
 
         assert!(!painted(&line).contains("Full Access"));
-        assert_eq!(pick_on(&line, "View: Chat"), Some(Pick::ConversationView));
+        assert_eq!(pick_on(&line, "View: Chat"), None);
     }
 
     /// The cost pushes both badges right and a recalled-history label pushes the
@@ -9612,15 +9618,15 @@ mod tests {
         assert_eq!(pick_on(&line, "3/12"), None);
     }
 
-    /// A rule too narrow for the fast flag drops it; fixed access survives but
-    /// never claims click columns.
+    /// Removing View leaves enough room for Fast beside the Vibe control.
     #[test]
-    fn a_dropped_fast_flag_leaves_only_the_mode_clickable() {
+    fn removed_view_keeps_the_fast_flag_clickable() {
         let mode = test_mode("Full Access", ModeAccent::Danger, true);
         let line = input_top_line(40, "", Some(&mode));
 
-        assert!(!painted(&line).contains("Fast"));
+        assert!(painted(&line).contains("Fast: On"));
         assert_eq!(pick_on(&line, "Vibe: On"), Some(Pick::VibeMode));
+        assert_eq!(pick_on(&line, "Fast: On"), Some(Pick::FastMode));
     }
 
     #[test]
@@ -9636,9 +9642,9 @@ mod tests {
         assert_eq!(rule_width(&line), 80);
         assert_eq!(
             texts,
-            ["  ", "Vibe: On", " · ", "View: Chat", " · ", "Fast: Off", " ", "─╮"]
+            ["  ", "Vibe: On", " · ", "Fast: Off", " ", "─╮"]
         );
-        assert_eq!(line.tail[5].tone, Tone::FastOff);
+        assert_eq!(line.tail[3].tone, Tone::FastOff);
     }
 
     #[test]
@@ -9694,7 +9700,7 @@ mod tests {
 
         let on = tones(&mode);
         assert!(on.contains(&("Vibe: On".to_owned(), Tone::FastOn)));
-        assert!(on.contains(&("View: Chat".to_owned(), Tone::FastOff)));
+        assert!(!on.iter().any(|(text, _)| text == "View: Chat"));
         assert!(on.contains(&("Fast: On".to_owned(), Tone::FastOn)));
 
         mode.vibe_tone = VibeTone::Off;
@@ -9712,7 +9718,7 @@ mod tests {
         mode.cost = Some("$0.95".to_owned());
         let line = input_top_line(80, "", Some(&mode));
 
-        assert_eq!(pick_on(&line, "View: Chat"), Some(Pick::ConversationView));
+        assert_eq!(pick_on(&line, "View: Chat"), None);
         assert_eq!(pick_on(&line, "Vibe: On"), Some(Pick::VibeMode));
         assert_eq!(pick_on(&line, "Shell: Collapse"), None);
     }
@@ -9729,7 +9735,7 @@ mod tests {
     }
 
     #[test]
-    fn tight_composer_rule_keeps_the_mode_and_drops_the_fast_flag() {
+    fn tight_composer_rule_keeps_the_mode_and_fast_flag_after_view_removal() {
         let mode = test_mode("Full Access", ModeAccent::Danger, true);
         let line = input_top_line(40, "", Some(&mode));
         let texts = line
@@ -9739,7 +9745,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(rule_width(&line), 40);
-        assert_eq!(texts, ["  ", "Vibe: On", " · ", "View: Chat", " ", "─╮"]);
+        assert_eq!(texts, ["  ", "Vibe: On", " · ", "Fast: On", " ", "─╮"]);
     }
 
     #[test]
