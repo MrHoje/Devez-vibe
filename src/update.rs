@@ -19,6 +19,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Notes shown in the welcome panel's right column. Rewrite these each release;
 /// a line starting with `·` renders as a bullet, anything else as a sub-heading.
 pub const RELEASE_NOTES: &[&str] = &[
+    "Plan step changes now repaint safely without continuous cursor flashing.",
     "Wrapped prompt selections now exclude the left gutter.",
     "Plan changes clear only the changed row, keeping response animations smooth.",
 ];

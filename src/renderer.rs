@@ -1478,6 +1478,12 @@ impl Renderer {
             Some((row, control))
         });
         self.reconcile_selection(&screen);
+        let full_repaint_rows = plan_rows_requiring_full_repaint(
+            &self.previous_lines,
+            self.animation_plan_rows,
+            &screen,
+            plan_rows,
+        );
         self.paint_screen(
             &screen,
             cursor_line,
@@ -1485,6 +1491,7 @@ impl Renderer {
             frame.show_cursor,
             width,
             scroll_to_bottom_overlay.as_ref().map(|(row, control)| (*row, control)),
+            &full_repaint_rows,
         )?;
         self.previous_lines = screen;
         self.cursor_line = cursor_line;
@@ -1607,6 +1614,7 @@ impl Renderer {
         show_cursor: bool,
         total_width: u16,
         scroll_to_bottom_overlay: Option<(usize, &PaintLine)>,
+        full_repaint_rows: &[usize],
     ) -> Result<()> {
         let selection = self
             .selection
@@ -1636,7 +1644,12 @@ impl Renderer {
             queue!(self.out, Hide)?;
             self.cursor_shown = false;
         }
-        emit_synchronized_frame_diff(&mut self.out, self.painted_frame.as_ref(), &frame)?;
+        emit_synchronized_frame_diff_with_full_rows(
+            &mut self.out,
+            self.painted_frame.as_ref(),
+            &frame,
+            full_repaint_rows,
+        )?;
         self.painted_frame = Some(frame);
         self.painted_selection = selection;
         self.painted_hovered_tool = self.hovered_tool;
@@ -1807,6 +1820,29 @@ fn plan_row_requires_full_repaint(previous: &PaintLine, current: &PaintLine) -> 
             .iter()
             .map(|span| span.text.as_str())
             .eq(current.tail.iter().map(|span| span.text.as_str()))
+}
+
+/// A plan state change first reaches the normal render path, before the next
+/// animation tick can compare its rows. Mark changed step rows here so they get
+/// one safe full repaint in that first synchronized frame. Spinner-only prefix
+/// changes keep using the inexpensive cell diff.
+fn plan_rows_requiring_full_repaint(
+    previous: &[PaintLine],
+    previous_plan_rows: usize,
+    current: &[PaintLine],
+    current_plan_rows: usize,
+) -> Vec<usize> {
+    if previous_plan_rows != current_plan_rows {
+        return (0..current_plan_rows).collect();
+    }
+    (0..current_plan_rows)
+        .filter(|&row| {
+            previous
+                .get(row)
+                .zip(current.get(row))
+                .is_some_and(|(before, after)| plan_row_requires_full_repaint(before, after))
+        })
+        .collect()
 }
 
 /// Splits the screen between the transcript and the live frame, as
@@ -2163,6 +2199,46 @@ fn emit_synchronized_frame_diff(
 ) -> Result<()> {
     queue!(out, Print("\x1b[?2026h"))?;
     let result = emit_frame_diff(out, previous, current);
+    let end = queue!(out, Print("\x1b[?2026l"));
+    match (result, end) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+/// Emits selected rows from a blank frame before the normal diff, all inside one
+/// synchronized update. This clears stale wide glyphs or attributes only where
+/// a fixed plan changed, without repainting every spinner frame.
+fn emit_synchronized_frame_diff_with_full_rows(
+    out: &mut impl Write,
+    previous: Option<&CellFrame>,
+    current: &CellFrame,
+    full_rows: &[usize],
+) -> Result<()> {
+    if full_rows.is_empty() {
+        return emit_synchronized_frame_diff(out, previous, current);
+    }
+
+    queue!(out, Print("\x1b[?2026h"))?;
+    let mut result = Ok(());
+    for &row in full_rows {
+        if row >= current.height {
+            continue;
+        }
+        let row_frame = CellFrame {
+            width: current.width,
+            height: 1,
+            cells: current.cells[row * current.width..(row + 1) * current.width].to_vec(),
+        };
+        if let Err(error) = emit_frame_diff_at(out, None, &row_frame, row) {
+            result = Err(error);
+            break;
+        }
+    }
+    if result.is_ok() {
+        result = emit_frame_diff(out, previous, current);
+    }
     let end = queue!(out, Print("\x1b[?2026l"));
     match (result, end) {
         (Err(error), _) => Err(error),
@@ -12653,6 +12729,43 @@ mod tests {
             bold: false,
         });
         assert!(plan_row_requires_full_repaint(&spinner, &completed));
+    }
+
+    #[test]
+    fn initial_plan_change_repaints_only_the_changed_step_row() {
+        let mut before = PaintLine::plain("작업");
+        before.prefix = "  ⠋  ".to_owned();
+        before.prefix_tone = Tone::Accent;
+        before.tone = Tone::Accent;
+        let mut spinner = before.clone();
+        spinner.prefix = "  ⠙  ".to_owned();
+        let mut completed = spinner.clone();
+        completed.prefix_tone = Tone::FastOff;
+        completed.tone = Tone::PlanDone;
+        completed.tail.push(PaintSpan {
+            text: " (5s)".to_owned(),
+            tone: Tone::Muted,
+            bold: false,
+        });
+
+        assert_eq!(
+            plan_rows_requiring_full_repaint(
+                &[PaintLine::plain("header"), before],
+                2,
+                &[PaintLine::plain("header"), spinner.clone()],
+                2,
+            ),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            plan_rows_requiring_full_repaint(
+                &[PaintLine::plain("header"), spinner],
+                2,
+                &[PaintLine::plain("header"), completed],
+                2,
+            ),
+            vec![1]
+        );
     }
 
     #[test]
