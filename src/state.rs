@@ -2544,7 +2544,7 @@ pub struct AppState {
     workspace_entries: Vec<CompletionCandidate>,
     completion_catalog: Vec<CompletionCandidate>,
     completion_mode: CompletionMode,
-    completion_dismissed_text: Option<String>,
+    suggestions_dismissed_text: Option<String>,
     selected_completion_bindings: Vec<SelectedCompletionBinding>,
     /// MCP servers that failed to start, reported before any picker was open.
     mcp_failures: Vec<(String, Option<String>)>,
@@ -2671,7 +2671,7 @@ impl AppState {
             workspace_entries: Vec::new(),
             completion_catalog: Vec::new(),
             completion_mode: CompletionMode::All,
-            completion_dismissed_text: None,
+            suggestions_dismissed_text: None,
             selected_completion_bindings: Vec::new(),
             mcp_failures: Vec::new(),
             deferred_resume: None,
@@ -3975,7 +3975,7 @@ impl AppState {
             self.editor.clear();
             self.composer_images.clear();
             self.selected_completion_bindings.clear();
-            self.completion_dismissed_text = None;
+            self.suggestions_dismissed_text = None;
             self.command_selection = 0;
             return Action::None;
         }
@@ -4036,7 +4036,7 @@ impl AppState {
                         return Action::None;
                     }
                     KeyCode::Esc => {
-                        self.completion_dismissed_text = Some(self.editor.text());
+                        self.suggestions_dismissed_text = Some(self.editor.text());
                         self.command_selection = 0;
                         return Action::None;
                     }
@@ -4088,6 +4088,11 @@ impl AppState {
                     self.editor.set_text(selected.name);
                     self.command_selection = 0;
                     return self.submit_editor();
+                }
+                KeyCode::Esc => {
+                    self.suggestions_dismissed_text = Some(self.editor.text());
+                    self.command_selection = 0;
+                    return Action::None;
                 }
                 _ => {}
             }
@@ -6587,6 +6592,9 @@ impl AppState {
     }
 
     fn slash_suggestion_views(&self) -> Vec<SuggestionView> {
+        if self.suggestions_dismissed_text.as_deref() == Some(self.editor.text().as_str()) {
+            return Vec::new();
+        }
         self.matching_slash_commands()
             .into_iter()
             .enumerate()
@@ -6658,7 +6666,7 @@ impl AppState {
 
     fn matching_completions(&self) -> Option<(CompletionTarget, Vec<CompletionCandidate>)> {
         let text = self.editor.text();
-        if self.completion_dismissed_text.as_deref() == Some(text.as_str()) {
+        if self.suggestions_dismissed_text.as_deref() == Some(text.as_str()) {
             return None;
         }
         let target = completion_target(&text, self.editor.cursor())?;
@@ -6782,7 +6790,7 @@ impl AppState {
             self.editor.insert(' ');
         }
         self.command_selection = 0;
-        self.completion_dismissed_text = None;
+        self.suggestions_dismissed_text = None;
         if let Some(binding) = candidate.binding.as_ref() {
             self.selected_completion_bindings
                 .push(SelectedCompletionBinding {
@@ -9221,6 +9229,23 @@ mod tests {
         state.set_turn_started("turn-1".to_owned());
         assert_eq!(state.take_pending_interrupt().as_deref(), Some("turn-1"));
         assert_eq!(state.take_pending_interrupt(), None);
+    }
+
+    #[test]
+    fn esc_closes_slash_suggestions_before_interrupting_an_active_turn() {
+        let mut state = test_state();
+        state.busy = true;
+        state.turn_started_at = Some(Instant::now());
+        state.editor.set_text("/model");
+
+        assert!(!state.view().suggestions.is_empty());
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::None
+        ));
+        assert!(state.view().suggestions.is_empty());
+        assert!(!state.pending_interrupt);
+        assert!(!state.turn_interrupted);
     }
 
     #[test]
