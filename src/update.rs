@@ -19,9 +19,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Notes shown in the welcome panel's right column. Rewrite these each release;
 /// a line starting with `·` renders as a bullet, anything else as a sub-heading.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Plans open with every step showing, and a resumed session keeps them open.",
-    "A second paste lands in the composer instead of submitting the first one.",
-    "Chat bubbles keep their right edge clear, and pending steps line up with the rest.",
+    "OpenCode starts only when a provider is connected, or when you use /connect.",
+    "User prompts now have clean top and bottom spacing with aligned right edges.",
+    "Context status is simpler, and /connect appears in command suggestions.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

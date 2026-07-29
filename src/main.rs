@@ -1113,7 +1113,7 @@ async fn recv_update(receiver: &mut Option<mpsc::Receiver<String>>) -> Option<St
 }
 
 async fn execute_action(
-    server: &BackendServer,
+    server: &mut BackendServer,
     state: &mut AppState,
     renderer: &mut Renderer,
     action: Action,

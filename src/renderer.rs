@@ -972,7 +972,7 @@ impl Renderer {
         }
         let row = row.min(self.previous_lines.len().saturating_sub(1) as u16);
         let line = &self.previous_lines[usize::from(row)];
-        if line.tone == Tone::AssistantBubbleHalf {
+        if matches!(line.tone, Tone::AssistantBubbleHalf | Tone::UserPromptPadding) {
             return None;
         }
         let width = painted_line_width(line).max(
@@ -1922,12 +1922,12 @@ fn paint_line_into_frame(
     let background = row_background(line.tone);
     let bubble_background = bubble_background(line);
     if let Some(background) = background {
-        let (start, right) = if line.tone == Tone::UserPrompt {
-            let marker_width = usize::from(CHAT_LAYOUT.load(Ordering::Relaxed) && line.prefix.ends_with("> "))
+        let (start, right) = if matches!(line.tone, Tone::UserPrompt | Tone::UserPromptPadding) {
+            let marker_width = usize::from(CHAT_LAYOUT.load(Ordering::Relaxed) && line.prefix.ends_with("› "))
                 * (CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP + 2);
             let start = UnicodeWidthStr::width(line.prefix.as_str())
                 .saturating_sub(marker_width + 1);
-            (start, frame.width.saturating_sub(start + 1))
+            (start, frame.width.saturating_sub(1))
         } else if line.tone == Tone::ModelChange {
             // Setting-change cards share the user's terminal-safe trailing cell.
             // Fast, Model, and Effort notices therefore end on the same column.
@@ -2339,6 +2339,7 @@ enum Tone {
     StatusText,
     StatusSeparator,
     UserPrompt,
+    UserPromptPadding,
     AssistantBubble,
     AssistantBubbleHalf,
     Model56,
@@ -2506,6 +2507,19 @@ impl PaintLine {
 
     fn blank() -> Self {
         Self::plain("")
+    }
+
+    fn user_prompt_padding(width: usize) -> Self {
+        Self {
+            prefix: String::new(),
+            prefix_tone: Tone::Plain,
+            text: " ".repeat(width),
+            tone: Tone::UserPromptPadding,
+            bold: false,
+            tool_heading: None,
+            pick: None,
+            tail: Vec::new(),
+        }
     }
 
     /// Makes single spans of an already-built row clickable. `picks` addresses
@@ -2899,10 +2913,7 @@ fn bubble_content_columns(line: &PaintLine) -> Range<usize> {
     if line.tone == Tone::UserPrompt && CHAT_LAYOUT.load(Ordering::Relaxed) {
         let prefix = UnicodeWidthStr::width(line.prefix.as_str());
         let end = prefix + UnicodeWidthStr::width(line.text.trim_end());
-        if line.prefix.ends_with("> ") {
-            return prefix..end;
-        }
-        return (prefix + CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP).min(end)..end;
+        return prefix..end;
     }
     let filler = line
         .tail
@@ -2954,7 +2965,7 @@ fn selection_columns_for_line(
     row: usize,
 ) -> Option<Range<usize>> {
     // A bubble's rounded edge rows are chrome, not text.
-    if line.tone == Tone::AssistantBubbleHalf {
+    if matches!(line.tone, Tone::AssistantBubbleHalf | Tone::UserPromptPadding) {
         return None;
     }
     let mut selected = range.columns_for_row(row, painted_line_width(line))?;
@@ -5531,11 +5542,24 @@ fn block_lines_with_expansion(block: &Block, width: u16, expanded: bool) -> Vec<
 fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     let marker_tone = model_tone(&block.title).unwrap_or(Tone::User);
     if !CHAT_LAYOUT.load(Ordering::Relaxed) {
-        return block
+        let mut first_line = true;
+        let mut lines = block
             .body
             .lines()
-            .flat_map(|line| wrapped_line("> ", marker_tone, line, Tone::UserPrompt, false, width))
+            .flat_map(|line| {
+                let prefix = if first_line {
+                    first_line = false;
+                    "› "
+                } else {
+                    "  "
+                };
+                wrapped_line(prefix, marker_tone, line, Tone::UserPrompt, false, width)
+            })
             .collect::<Vec<_>>();
+        let half_width = usize::from(width).saturating_sub(1);
+        lines.insert(0, PaintLine::user_prompt_padding(half_width));
+        lines.push(PaintLine::user_prompt_padding(half_width));
+        return lines;
     }
     const RIGHT_GAP: usize = 0;
 
@@ -5583,18 +5607,25 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     let half_prefix = " ".repeat(
         left_margin + region_width.saturating_sub(RIGHT_GAP + bubble_width),
     );
-    for line in &mut lines {
+    for (index, line) in lines.iter_mut().enumerate() {
         let padding = text_width.saturating_sub(UnicodeWidthStr::width(line.text.as_str()));
         if padding > 0 {
             line.text.push_str(&" ".repeat(padding));
         }
         line.prefix = format!(
-            "{}{}> ",
+            "{}{}{}",
             half_prefix,
-            " ".repeat(CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP)
+            " ".repeat(CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP),
+            if index == 0 { "› " } else { "  " },
         );
         line.prefix_tone = marker_tone;
     }
+    let mut top = PaintLine::user_prompt_padding(bubble_width);
+    top.prefix = half_prefix.clone();
+    let mut bottom = PaintLine::user_prompt_padding(bubble_width);
+    bottom.prefix = half_prefix;
+    lines.insert(0, top);
+    lines.push(bottom);
     lines
 }
 
@@ -7008,7 +7039,9 @@ fn hover_repaint_columns(
 fn row_background(tone: Tone) -> Option<Rgb> {
     let palette = theme::palette();
     Some(match tone {
-        Tone::UserPrompt if !CHAT_LAYOUT.load(Ordering::Relaxed) => palette.user_prompt_bg,
+        Tone::UserPrompt | Tone::UserPromptPadding if !CHAT_LAYOUT.load(Ordering::Relaxed) => {
+            palette.user_prompt_bg
+        }
         Tone::ModelChange => palette.model_change_bg,
         Tone::DiffAdded | Tone::DiffAddedWord => palette.diff_add_bg,
         Tone::DiffRemoved | Tone::DiffRemovedWord => palette.diff_remove_bg,
@@ -7035,7 +7068,9 @@ fn bubble_background(line: &PaintLine) -> Option<Rgb> {
 fn word_background(tone: Tone) -> Option<Rgb> {
     let palette = theme::palette();
     Some(match tone {
-        Tone::UserPrompt if CHAT_LAYOUT.load(Ordering::Relaxed) => palette.user_prompt_bg,
+        Tone::UserPrompt | Tone::UserPromptPadding if CHAT_LAYOUT.load(Ordering::Relaxed) => {
+            palette.user_prompt_bg
+        }
         Tone::AssistantBubble | Tone::AssistantBubbleHalf => assistant_bubble_background(),
         Tone::DiffAddedWord => palette.diff_add_word_bg,
         Tone::DiffRemovedWord => palette.diff_remove_word_bg,
@@ -7352,6 +7387,7 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::StatusText => palette.status.text,
         Tone::StatusSeparator => palette.status.separator,
         Tone::UserPrompt => palette.foreground,
+        Tone::UserPromptPadding => palette.user_prompt_bg,
         Tone::AssistantBubble => palette.foreground,
         Tone::AssistantBubbleHalf => blend(palette.background, palette.foreground, 20),
         Tone::Model56 => palette.model_gpt56,
@@ -7465,6 +7501,7 @@ mod tests {
 
     #[test]
     fn user_prompt_background_leaves_the_rightmost_cell_unpainted() {
+        CHAT_LAYOUT.store(false, Ordering::Relaxed);
         let mut frame = CellFrame::new(8, 1);
 
         paint_line_into_frame(
@@ -7485,7 +7522,34 @@ mod tests {
             None,
         );
 
-        assert_eq!(frame.cell(6, 0).style.background, word_background(Tone::UserPrompt));
+        assert_eq!(frame.cell(6, 0).style.background, row_background(Tone::UserPrompt));
+        assert_eq!(frame.cell(7, 0).style.background, None);
+    }
+
+    #[test]
+    fn user_prompt_background_reaches_the_same_right_edge_after_its_marker() {
+        CHAT_LAYOUT.store(false, Ordering::Relaxed);
+        let mut frame = CellFrame::new(8, 1);
+
+        paint_line_into_frame(
+            &mut frame,
+            0,
+            &PaintLine {
+                prefix: "› ".to_owned(),
+                prefix_tone: Tone::User,
+                text: "x".to_owned(),
+                tone: Tone::UserPrompt,
+                bold: false,
+                tool_heading: None,
+                pick: None,
+                tail: Vec::new(),
+            },
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(frame.cell(6, 0).style.background, row_background(Tone::UserPrompt));
         assert_eq!(frame.cell(7, 0).style.background, None);
     }
 
@@ -8207,10 +8271,10 @@ mod tests {
 
         // The bubble sits at the right edge with a cell of padding inside it, so
         // its text starts one column in from the band.
-        assert!(renderer.begin_selection(71, 0));
-        assert!(renderer.update_selection(76, 1));
+        assert!(renderer.begin_selection(71, 1));
+        assert!(renderer.update_selection(78, 2));
         assert_eq!(
-            renderer.finish_selection(76, 1),
+            renderer.finish_selection(78, 2),
             SelectionResult::Copy("first\nsecond".to_owned())
         );
     }
@@ -8236,7 +8300,7 @@ mod tests {
             .sum::<usize>();
 
         assert_eq!(user_text.text, "input  ");
-        assert!(user_text.prefix.ends_with("> "));
+        assert!(user_text.prefix.ends_with("› "));
         assert!(user_text.text.ends_with("  "));
         assert_eq!(assistant_right_padding, 2);
 
@@ -8264,7 +8328,8 @@ mod tests {
         renderer.previous_lines = lines;
 
         assert!(!renderer.begin_selection(0, 0));
-        assert!(renderer.begin_selection(72, 0));
+        assert!(!renderer.begin_selection(72, 0));
+        assert!(renderer.begin_selection(72, 1));
     }
 
     #[test]
@@ -8278,18 +8343,21 @@ mod tests {
             false,
         );
 
-        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.len(), 5);
         // Every row is filled out to the longest one so the bubble paints square.
-        assert_eq!(lines[0].text, "first   ");
-        assert_eq!(lines[1].text, "second  ");
-        assert!(lines[0].prefix.ends_with("> "));
-        assert!(lines[2] == PaintLine::blank());
+        assert_eq!(lines[0].tone, Tone::UserPromptPadding);
+        assert_eq!(lines[1].text, "first   ");
+        assert_eq!(lines[2].text, "second  ");
+        assert!(lines[1].prefix.ends_with("› "));
+        assert_eq!(lines[3].tone, Tone::UserPromptPadding);
+        assert!(lines[4] == PaintLine::blank());
 
         let selection = CellRange {
-            start: CellPosition { column: 71, row: 0 },
-            end: CellPosition { column: 77, row: 1 },
+            start: CellPosition { column: 71, row: 1 },
+            end: CellPosition { column: 77, row: 2 },
         };
-        assert_ne!(selection_columns_for_line(&lines[0], selection, 0), None);
+        assert_eq!(selection_columns_for_line(&lines[0], selection, 0), None);
+        assert_ne!(selection_columns_for_line(&lines[1], selection, 1), None);
     }
 
     #[test]
@@ -8297,10 +8365,13 @@ mod tests {
         CHAT_LAYOUT.store(true, Ordering::Relaxed);
         let lines = user_prompt_lines(&Block::new(BlockKind::User, "You", "longest line\nshort"), 80);
 
-        assert_eq!(lines[0].prefix, lines[1].prefix);
-        assert_eq!(painted_line_width(&lines[0]), painted_line_width(&lines[1]));
-        assert_eq!(lines[1].text.trim(), "short");
-        assert!(lines[1].prefix.ends_with("> "));
+        assert_eq!(lines[0].tone, Tone::UserPromptPadding);
+        assert_eq!(UnicodeWidthStr::width(lines[1].prefix.as_str()), UnicodeWidthStr::width(lines[2].prefix.as_str()));
+        assert_eq!(painted_line_width(&lines[1]), painted_line_width(&lines[2]));
+        assert_eq!(lines[2].text.trim(), "short");
+        assert!(lines[1].prefix.ends_with("› "));
+        assert!(lines[2].prefix.ends_with("  "));
+        assert_eq!(lines[3].tone, Tone::UserPromptPadding);
     }
 
     #[test]
@@ -8320,8 +8391,8 @@ mod tests {
         let assistant = block_lines(&Block::new(BlockKind::Assistant, "Codex", "x".repeat(120)), 80);
 
         assert_eq!(conversation_region_width(80), 63);
-        assert_eq!(UnicodeWidthStr::width(user[0].prefix.as_str()), 20);
-        assert_eq!(UnicodeWidthStr::width(user[0].text.as_str()), 59);
+        assert_eq!(UnicodeWidthStr::width(user[1].prefix.as_str()), 20);
+        assert_eq!(UnicodeWidthStr::width(user[1].text.as_str()), 59);
         assert!(user
             .iter()
             .filter(|line| line.tone == Tone::UserPrompt)
@@ -9890,12 +9961,12 @@ mod tests {
         let user_lines = block_lines(&user, 80);
         let assistant_lines = block_lines(&assistant, 80);
 
-        // The prompt keeps its `> ` marker; only the speaker label is dropped.
-        assert_eq!(user_lines[0].prefix, format!("{}> ", " ".repeat(70)));
-        assert_eq!(user_lines[0].text, "hello  ");
-        assert!(user_lines[0].prefix_tone == Tone::User);
-        assert!(user_lines[0].tone == Tone::UserPrompt);
-        assert!(!user_lines[0].bold);
+        // The prompt keeps its `› ` marker; only the speaker label is dropped.
+        assert_eq!(user_lines[1].prefix, format!("{}› ", " ".repeat(70)));
+        assert_eq!(user_lines[1].text, "hello  ");
+        assert!(user_lines[1].prefix_tone == Tone::User);
+        assert!(user_lines[1].tone == Tone::UserPrompt);
+        assert!(!user_lines[1].bold);
         assert_eq!(assistant_lines[1].prefix, "  ");
         assert_eq!(assistant_lines[1].prefix_tone, Tone::FastOff);
         assert_eq!(assistant_lines[1].text, "hi");

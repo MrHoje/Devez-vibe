@@ -6848,9 +6848,7 @@ impl AppState {
         let context = self.context_window.and_then(|window| {
             (window > 0).then(|| {
                 format!(
-                    "ctx: {}/{} ({}%)",
-                    format_token_count(self.context_tokens),
-                    format_token_count(window),
+                    "Context: {}%",
                     // A prompt cannot really outgrow its window, but a stale
                     // reading should not print an impossible percentage.
                     (self.context_tokens.saturating_mul(100) / window).min(100)
@@ -8728,10 +8726,6 @@ fn compact_command(command: &str, max_chars: usize) -> String {
             .take(max_chars.saturating_sub(1))
             .collect::<String>()
     )
-}
-
-fn format_token_count(tokens: u64) -> String {
-    format!("{}k", tokens.saturating_add(500) / 1_000)
 }
 
 fn read_git_branch(cwd: &str) -> Option<String> {
@@ -11545,7 +11539,7 @@ mod tests {
         );
         assert_eq!(
             state.view().status_line.and_then(|status| status.context),
-            Some("ctx: 0k/258k (0%)".to_owned())
+            Some("Context: 0%".to_owned())
         );
     }
 
@@ -12541,7 +12535,7 @@ mod tests {
         assert_eq!(state.context_window, Some(258_000));
         assert_eq!(
             state.status_line().context.as_deref(),
-            Some("ctx: 96k/258k (37%)")
+            Some("Context: 37%")
         );
     }
 

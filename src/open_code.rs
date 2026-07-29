@@ -1238,6 +1238,10 @@ pub fn is_open_code_model(model: &str) -> bool {
     model.starts_with("opencode:")
 }
 
+pub fn has_connected_provider() -> bool {
+    !connected_provider_ids().is_empty()
+}
+
 fn connected_provider_ids() -> Vec<String> {
     let Some(path) = auth_file() else {
         return Vec::new();

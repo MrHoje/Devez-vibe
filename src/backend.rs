@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::{
     app_server::{AppServer, AppServerClient, ServerEvent},
-    open_code::{OpenCodeServer, is_open_code_model, is_open_code_request_id},
+    open_code::{OpenCodeServer, has_connected_provider, is_open_code_model, is_open_code_request_id},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -30,6 +30,7 @@ struct Route {
 pub struct BackendServer {
     codex: AppServer,
     open_code: Option<OpenCodeServer>,
+    open_code_path: PathBuf,
     routes: Arc<StdMutex<HashMap<String, Route>>>,
     aliases: Arc<StdMutex<HashMap<String, String>>>,
     cwd: PathBuf,
@@ -38,10 +39,15 @@ pub struct BackendServer {
 impl BackendServer {
     pub async fn spawn(codex_path: &Path, open_code_path: &Path, cwd: &Path) -> Result<Self> {
         let codex = AppServer::spawn(codex_path).await?;
-        let open_code = OpenCodeServer::spawn(open_code_path, cwd).await.ok();
+        let open_code = if has_connected_provider() || open_code_is_startup_default() {
+            OpenCodeServer::spawn(open_code_path, cwd).await.ok()
+        } else {
+            None
+        };
         Ok(Self {
             codex,
             open_code,
+            open_code_path: open_code_path.to_path_buf(),
             routes: Arc::new(StdMutex::new(HashMap::new())),
             aliases: Arc::new(StdMutex::new(HashMap::new())),
             cwd: cwd.to_path_buf(),
@@ -244,39 +250,42 @@ impl BackendServer {
         self.codex.client()
     }
 
-    pub async fn provider_catalog(&self) -> Result<Value> {
-        self.open_code()?.provider_catalog().await
+    pub async fn provider_catalog(&mut self) -> Result<Value> {
+        self.ensure_open_code().await?.provider_catalog().await
     }
 
     pub async fn set_provider_api_key(
-        &self,
+        &mut self,
         provider_id: &str,
         key: &str,
         inputs: &std::collections::BTreeMap<String, String>,
     ) -> Result<()> {
-        self.open_code()?
+        self.ensure_open_code()
+            .await?
             .set_provider_api_key(provider_id, key, inputs)
             .await
     }
 
     pub async fn authorize_provider_oauth(
-        &self,
+        &mut self,
         provider_id: &str,
         method: usize,
         inputs: &std::collections::BTreeMap<String, String>,
     ) -> Result<Value> {
-        self.open_code()?
+        self.ensure_open_code()
+            .await?
             .authorize_provider_oauth(provider_id, method, inputs)
             .await
     }
 
     pub async fn complete_provider_oauth(
-        &self,
+        &mut self,
         provider_id: &str,
         method: usize,
         code: Option<&str>,
     ) -> Result<()> {
-        self.open_code()?
+        self.ensure_open_code()
+            .await?
             .complete_provider_oauth(provider_id, method, code)
             .await
     }
@@ -340,6 +349,18 @@ impl BackendServer {
         self.open_code
             .as_ref()
             .context("OpenCode가 설치되어 있지 않거나 ACP를 시작할 수 없습니다.")
+    }
+
+    async fn ensure_open_code(&mut self) -> Result<&OpenCodeServer> {
+        if self.open_code.is_none() {
+            self.open_code = Some(OpenCodeServer::spawn(&self.open_code_path, &self.cwd).await?);
+            self.open_code
+                .as_ref()
+                .expect("OpenCode 서버를 방금 시작했습니다.")
+                .initialize()
+                .await?;
+        }
+        self.open_code()
     }
 
     fn register_codex_response(&self, response: &Value) {
@@ -546,6 +567,10 @@ pub fn read_provider_config() -> String {
     provider_config_path()
         .and_then(|path| fs::read_to_string(path).ok())
         .unwrap_or_default()
+}
+
+fn open_code_is_startup_default() -> bool {
+    root_config_value(&read_provider_config(), "model").is_some_and(is_open_code_model)
 }
 
 fn provider_default_write(params: &Value) -> Result<bool> {
