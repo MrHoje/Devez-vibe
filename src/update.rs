@@ -19,9 +19,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Notes shown in the welcome panel's right column. Rewrite these each release;
 /// a line starting with `·` renders as a bullet, anything else as a sub-heading.
 pub const RELEASE_NOTES: &[&str] = &[
+    "Wrapped prompt selections now exclude the left gutter.",
     "Plan changes clear only the changed row, keeping response animations smooth.",
-    "Plan updates repaint their whole row to prevent stale text artifacts.",
-    "Prompt card borders now stay continuous when a prompt wraps across lines.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

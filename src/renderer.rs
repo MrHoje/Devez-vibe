@@ -2810,6 +2810,10 @@ fn selectable_content_columns(line: &PaintLine) -> Option<Range<usize>> {
             let end = content.end.saturating_sub(1);
             return (start < end).then_some(start..end);
         }
+        if line.tone == Tone::UserPrompt {
+            let start = UnicodeWidthStr::width(line.prefix.as_str());
+            return (start < content.end).then_some(start..content.end);
+        }
         if let Some(indentation) = line
             .prefix
             .strip_suffix("• ")
@@ -8294,6 +8298,21 @@ mod tests {
         assert!(!renderer.begin_selection(0, 0));
         assert!(!renderer.begin_selection(72, 0));
         assert!(renderer.begin_selection(72, 1));
+    }
+
+    #[test]
+    fn multiline_user_prompt_selection_excludes_the_left_gutter() {
+        CHAT_LAYOUT.store(false, Ordering::Relaxed);
+        let lines = user_prompt_lines(&Block::new(BlockKind::User, "You", "first\nsecond"), 80);
+        let range = CellRange {
+            start: CellPosition { column: 2, row: 1 },
+            end: CellPosition {
+                column: painted_line_width(&lines[2]).saturating_sub(1) as u16,
+                row: 2,
+            },
+        };
+
+        assert_eq!(selection_columns_for_line(&lines[2], range, 2), Some(2..8));
     }
 
     #[test]
