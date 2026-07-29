@@ -305,6 +305,7 @@ impl OpenCodeServer {
         drop(listener);
         let resolved = resolve_command(open_code_path);
         let mut command = command_for(&resolved);
+        isolate_ctrl_c(&mut command);
         command
             .args([
                 "acp",
@@ -1296,6 +1297,14 @@ fn command_for(path: &Path) -> Command {
     }
     Command::new(path)
 }
+
+#[cfg(windows)]
+fn isolate_ctrl_c(command: &mut Command) {
+    command.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP
+}
+
+#[cfg(not(windows))]
+fn isolate_ctrl_c(_: &mut Command) {}
 
 fn resolve_command(command: &Path) -> PathBuf {
     if command.components().count() > 1 || command.exists() {

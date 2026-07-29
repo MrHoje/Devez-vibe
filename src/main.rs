@@ -2375,31 +2375,21 @@ fn thread_with_initial_turns(response: &Value) -> Result<Value> {
     Ok(thread)
 }
 
-/// Hydrates every turn page before rendering. `thread/resume` only bootstraps
-/// one page; Codex follows `nextCursor` until the complete transcript is local.
+/// Hydrates every turn page before rendering. The resume response is only a
+/// bootstrap: list from the first page again because it may omit `nextCursor`.
 async fn hydrate_thread_history(server: &BackendServer, response: &Value) -> Result<Value> {
     let mut thread = thread_with_initial_turns(response)?;
-    let Some(mut cursor) = response
-        .pointer("/initialTurnsPage/nextCursor")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-    else {
-        return Ok(thread);
-    };
     let thread_id = thread
         .get("id")
         .and_then(Value::as_str)
         .context("thread/resume 응답에 thread.id가 없습니다.")?
         .to_owned();
-    let mut turns = thread
-        .get("turns")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let mut cursor = None;
+    let mut turns = Vec::new();
 
     loop {
         let page = server
-            .request("thread/turns/list", turns_list_params(&thread_id, &cursor))
+            .request("thread/turns/list", turns_list_params(&thread_id, cursor.as_deref()))
             .await?;
         let data = page
             .get("data")
@@ -2413,7 +2403,7 @@ async fn hydrate_thread_history(server: &BackendServer, response: &Value) -> Res
         else {
             break;
         };
-        cursor = next;
+        cursor = Some(next);
     }
     thread
         .as_object_mut()
@@ -2422,14 +2412,17 @@ async fn hydrate_thread_history(server: &BackendServer, response: &Value) -> Res
     Ok(thread)
 }
 
-fn turns_list_params(thread_id: &str, cursor: &str) -> Value {
-    json!({
+fn turns_list_params(thread_id: &str, cursor: Option<&str>) -> Value {
+    let mut params = json!({
         "threadId": thread_id,
-        "cursor": cursor,
         "limit": 100,
         "sortDirection": "asc",
         "itemsView": "full"
-    })
+    });
+    if let Some(cursor) = cursor {
+        params["cursor"] = json!(cursor);
+    }
+    params
 }
 
 /// Actions that touch nothing but the terminal and in-memory state. Shared so a
@@ -4594,12 +4587,15 @@ mod tests {
 
     #[test]
     fn resume_history_pages_request_full_items_in_chronological_order() {
-        let params = turns_list_params("thread-9", "cursor-100");
+        let params = turns_list_params("thread-9", Some("cursor-100"));
 
         assert_eq!(params.pointer("/threadId").and_then(Value::as_str), Some("thread-9"));
         assert_eq!(params.pointer("/cursor").and_then(Value::as_str), Some("cursor-100"));
         assert_eq!(params.pointer("/sortDirection").and_then(Value::as_str), Some("asc"));
         assert_eq!(params.pointer("/itemsView").and_then(Value::as_str), Some("full"));
+
+        let first_page = turns_list_params("thread-9", None);
+        assert!(first_page.get("cursor").is_none());
     }
 
     /// Once the new session lands the loading state has to clear itself, or the

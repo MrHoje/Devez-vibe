@@ -19,9 +19,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Notes shown in the welcome panel's right column. Rewrite these each release;
 /// a line starting with `·` renders as a bullet, anything else as a sub-heading.
 pub const RELEASE_NOTES: &[&str] = &[
-    "OpenCode starts only when a provider is connected, or when you use /connect.",
-    "User prompts now have clean top and bottom spacing with aligned right edges.",
-    "Context status is simpler, and /connect appears in command suggestions.",
+    "Resumed sessions reload every history page, even when the bootstrap cursor is missing.",
+    "Ctrl+C stays in Devez Vibe without triggering a child-process Y/N prompt.",
+    "Scrolled history no longer pins an old prompt above the viewport.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

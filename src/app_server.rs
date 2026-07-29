@@ -123,6 +123,7 @@ impl AppServer {
         let resolved_codex = resolve_command(codex_path);
         let mut command = codex_command(&resolved_codex);
         apply_originator_override(&mut command);
+        isolate_ctrl_c(&mut command);
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -372,6 +373,16 @@ fn apply_originator_override(command: &mut Command) {
 }
 
 const ORIGINATOR_OVERRIDE_ENV: &str = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
+
+#[cfg(windows)]
+fn isolate_ctrl_c(command: &mut Command) {
+    // Keep Ctrl+C in the terminal UI. Without a separate process group, a
+    // fallback `cmd.exe /c codex.cmd` receives it and prints its Y/N prompt.
+    command.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP
+}
+
+#[cfg(not(windows))]
+fn isolate_ctrl_c(_: &mut Command) {}
 
 /// Finds the platform binary the `@openai/codex` npm package vendors, mirroring the
 /// lookup `bin/codex.js` performs. `root` is the directory holding the npm shim.

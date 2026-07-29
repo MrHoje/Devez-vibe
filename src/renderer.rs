@@ -432,9 +432,6 @@ pub struct Renderer {
     /// the whole screen every keystroke, and re-wrapping the transcript each
     /// time would make typing cost O(transcript).
     wrapped: Vec<PaintLine>,
-    /// User prompt rows in `wrapped`, used to keep the current scroll context
-    /// visible after its original block has moved above the viewport.
-    prompt_anchors: Vec<PromptAnchor>,
     wrapped_width: u16,
     shell_display_mode: ShellDisplayMode,
     diff_display_mode: DiffDisplayMode,
@@ -601,21 +598,6 @@ impl CellFrame {
 
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PromptAnchor {
-    rows: Range<usize>,
-    text: String,
-}
-
-impl PromptAnchor {
-    fn new(rows: Range<usize>, text: impl Into<String>) -> Self {
-        Self {
-            rows,
-            text: text.into(),
-        }
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SelectionResult {
     Copy(String),
@@ -670,7 +652,6 @@ impl Renderer {
             history: Vec::new(),
             scroll_back: 0,
             wrapped: Vec::new(),
-            prompt_anchors: Vec::new(),
             wrapped_width: 0,
             shell_display_mode: ShellDisplayMode::Collapse,
             diff_display_mode: DiffDisplayMode::Collapse,
@@ -763,7 +744,6 @@ impl Renderer {
     pub fn clear_screen(&mut self) -> Result<()> {
         self.history.clear();
         self.wrapped.clear();
-        self.prompt_anchors.clear();
         self.wrapped_width = 0;
         self.scroll_back = 0;
         self.expanded_tools.clear();
@@ -1463,18 +1443,8 @@ impl Renderer {
         fit_frame(&mut frame, live_rows);
         let max_back = self.wrapped.len() - view_rows;
         self.scroll_back = self.scroll_back.min(max_back);
-        let normal_start = max_back - self.scroll_back;
-        let mut sticky = (self.scroll_back > 0)
-            .then(|| sticky_prompt_for_viewport(&self.prompt_anchors, normal_start, width))
-            .flatten();
-        let transcript_rows = view_rows.saturating_sub(usize::from(sticky.is_some()));
-        let max_back = self.wrapped.len() - transcript_rows;
-        self.scroll_back = self.scroll_back.min(max_back);
         let start = max_back - self.scroll_back;
-        if sticky.is_some() {
-            sticky = sticky_prompt_for_viewport(&self.prompt_anchors, start, width);
-        }
-        let start = if plan_summary.is_some() && sticky.is_none() {
+        let start = if plan_summary.is_some() {
             transcript_start_below_plan(&self.wrapped, start)
         } else {
             start
@@ -1488,7 +1458,6 @@ impl Renderer {
             view_rows,
             start,
             frame.cursor_line,
-            sticky,
         );
         screen.splice(0..0, plan_lines);
         let cursor_line = cursor_line + plan_rows;
@@ -1585,7 +1554,6 @@ impl Renderer {
                     self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
                 }
             } else {
-                let start = self.wrapped.len();
                 let lines = block_group_lines(
                     block,
                     width,
@@ -1593,12 +1561,7 @@ impl Renderer {
                     self.diff_display_mode,
                     self.expanded_tools.contains(&block.id()),
                 );
-                let end = start + lines.len().saturating_sub(1);
                 self.wrapped.extend(lines);
-                if matches!(block.kind, BlockKind::User) && start < end {
-                    self.prompt_anchors
-                        .push(PromptAnchor::new(start..end, prompt_anchor_text(block)));
-                }
                 if self.scroll_back > 0 {
                     let row_delta = self.wrapped.len() as isize - before as isize;
                     self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
@@ -1609,13 +1572,11 @@ impl Renderer {
 
     fn rewrap(&mut self, width: u16) {
         let mut wrapped = Vec::new();
-        let mut prompt_anchors = Vec::new();
         for block in visible_transcript_blocks(
             &self.history,
             self.shell_display_mode,
             self.diff_display_mode,
         ) {
-            let start = wrapped.len();
             let lines = block_group_lines(
                 block,
                 width,
@@ -1623,14 +1584,9 @@ impl Renderer {
                 self.diff_display_mode,
                 self.expanded_tools.contains(&block.id()),
             );
-            let end = start + lines.len().saturating_sub(1);
             wrapped.extend(lines);
-            if matches!(block.kind, BlockKind::User) && start < end {
-                prompt_anchors.push(PromptAnchor::new(start..end, prompt_anchor_text(block)));
-            }
         }
         self.wrapped = wrapped;
-        self.prompt_anchors = prompt_anchors;
         self.wrapped_width = width;
     }
 
@@ -2203,15 +2159,10 @@ fn compose_screen(
     view_rows: usize,
     start: usize,
     live_cursor_line: usize,
-    sticky: Option<PaintLine>,
 ) -> (Vec<PaintLine>, usize) {
     let start = start.min(wrapped.len());
-    let transcript_rows = view_rows.saturating_sub(usize::from(sticky.is_some()));
-    let end = (start + transcript_rows).min(wrapped.len());
+    let end = (start + view_rows).min(wrapped.len());
     let mut screen = Vec::with_capacity(view_rows + live.len());
-    if let Some(sticky) = sticky {
-        screen.push(sticky);
-    }
     screen.extend(wrapped[start..end].iter().cloned());
     // `split_rows` never asks for more transcript than there is, so this only
     // guards the invariant rather than laying anything out.
@@ -2237,41 +2188,6 @@ fn transcript_start_below_plan(wrapped: &[PaintLine], start: usize) -> usize {
 /// cells rather than claiming a transcript row of its own.
 fn scroll_to_bottom_overlay_row(view_rows: usize, composer_index: Option<usize>) -> Option<usize> {
     composer_index.map(|index| view_rows + index.saturating_sub(3))
-}
-
-fn prompt_anchor_text(block: &Block) -> String {
-    block
-        .body
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or_default()
-        .to_owned()
-}
-
-fn sticky_prompt_for_viewport(
-    anchors: &[PromptAnchor],
-    viewport_start: usize,
-    width: u16,
-) -> Option<PaintLine> {
-    let anchor = anchors
-        .iter()
-        .rev()
-        .find(|anchor| anchor.rows.end <= viewport_start)?;
-    let prefix = " ";
-    Some(PaintLine {
-        prefix: prefix.to_owned(),
-        prefix_tone: Tone::Plain,
-        text: compact_right(
-            &anchor.text,
-            usize::from(width)
-                .saturating_sub(UnicodeWidthStr::width(prefix) + 1),
-        ),
-        tone: Tone::UserPrompt,
-        bold: true,
-        tool_heading: None,
-        pick: None,
-        tail: Vec::new(),
-    })
 }
 
 fn move_to_row(out: &mut Stdout, current_row: &mut usize, target_row: usize) -> Result<()> {
@@ -10082,54 +9998,6 @@ mod tests {
     }
 
     #[test]
-    fn sticky_prompt_uses_the_latest_prompt_wholly_above_the_viewport() {
-        let anchors = vec![
-            PromptAnchor::new(1..3, "first"),
-            PromptAnchor::new(5..7, "second"),
-        ];
-
-        assert_eq!(
-            sticky_prompt_for_viewport(&anchors, 7, 80).map(|line| painted(&line)),
-            Some(" second".to_owned())
-        );
-    }
-
-    #[test]
-    fn sticky_prompt_is_hidden_while_its_source_rows_are_visible() {
-        let anchors = vec![PromptAnchor::new(1..3, "first")];
-
-        assert!(sticky_prompt_for_viewport(&anchors, 2, 80).is_none());
-    }
-
-    #[test]
-    fn composed_screen_reserves_a_transcript_row_for_a_sticky_prompt() {
-        let sticky = PaintLine {
-            prefix: " ".to_owned(),
-            prefix_tone: Tone::Plain,
-            text: "first".to_owned(),
-            tone: Tone::UserPrompt,
-            bold: true,
-            tool_heading: None,
-            pick: None,
-            tail: Vec::new(),
-        };
-        let (screen, cursor) = compose_screen(
-            &text_rows(4, "row"),
-            text_rows(1, "composer"),
-            3,
-            1,
-            0,
-            Some(sticky),
-        );
-
-        assert_eq!(
-            screen.iter().map(painted).collect::<Vec<_>>(),
-            [" first", "row1", "row2", "composer0"]
-        );
-        assert_eq!(cursor, 3);
-    }
-
-    #[test]
     fn plan_gap_skips_viewport_separator_rows() {
         let transcript = vec![
             PaintLine::blank(),
@@ -10144,7 +10012,6 @@ mod tests {
             2,
             start,
             0,
-            None,
         );
 
         assert_eq!(start, 2);
@@ -10165,7 +10032,7 @@ mod tests {
         // three rows of the screen in all of them, which is the whole point.
         for start in [0, 40, transcript.len() - view_rows] {
             let (screen, cursor_line) =
-                compose_screen(&transcript, live.clone(), view_rows, start, 1, None);
+                compose_screen(&transcript, live.clone(), view_rows, start, 1);
 
             assert_eq!(screen.len(), rows);
             let painted = screen[view_rows..]
@@ -10211,7 +10078,7 @@ mod tests {
         let (view_rows, live_rows) = split_rows(10, frame.lines.len(), 0);
         fit_frame(&mut frame, live_rows);
         let (screen, cursor_line) =
-            compose_screen(&[], frame.lines, view_rows, 0, frame.cursor_line, None);
+            compose_screen(&[], frame.lines, view_rows, 0, frame.cursor_line);
 
         assert_eq!(screen.len(), 10);
         assert_eq!(screen[0].text, "welcome0");
