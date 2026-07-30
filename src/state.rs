@@ -1297,11 +1297,12 @@ impl McpApproval {
                 self.selected = index;
                 self.response()
             }
-            KeyCode::Char('y') => {
+            // 'ㅛ'/'ㅜ': 한글 IME가 켜진 채 누른 y/n.
+            KeyCode::Char('y') | KeyCode::Char('ㅛ') => {
                 self.selected = 0;
                 self.response()
             }
-            KeyCode::Char('n') => {
+            KeyCode::Char('n') | KeyCode::Char('ㅜ') => {
                 self.selected = self
                     .options
                     .iter()
@@ -3912,6 +3913,28 @@ impl AppState {
         self.sync_selected_completion_bindings(&old_text, binding_count);
     }
 
+    /// 호스트(DevezCode 등)가 입력창 텍스트를 bracketed paste로 pty에 쓰면
+    /// 승인 프롬프트의 답이 Key 이벤트 대신 Paste로 도착해 그대로 버려졌다.
+    /// 답을 기다리는 프롬프트에서 한 글자짜리 paste는 그 키로 재해석한다.
+    pub fn paste_as_prompt_answer(&mut self, text: &str) -> Option<Action> {
+        if !matches!(
+            self.pending,
+            Some(
+                PendingInteraction::Approval { .. }
+                    | PendingInteraction::Confirm { .. }
+                    | PendingInteraction::McpApproval(_)
+                    | PendingInteraction::McpUrl { .. }
+            )
+        ) {
+            return None;
+        }
+        let mut chars = text.trim().chars();
+        let (Some(ch), None) = (chars.next(), chars.next()) else {
+            return None;
+        };
+        Some(self.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)))
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
         if !(key.code == KeyCode::Char('c')
             && key.modifiers.contains(KeyModifiers::CONTROL))
@@ -5257,6 +5280,15 @@ impl AppState {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let pending = self.pending.take().expect("pending checked");
+        // 한글 IME가 켜진 채 승인 프롬프트에 답하면 y/a/n이 두벌식 자모로
+        // 도착한다. 자유 입력이 없는 프롬프트에서만 같은 키로 취급한다.
+        let hotkey = match key.code {
+            KeyCode::Char('ㅛ') => KeyCode::Char('y'),
+            KeyCode::Char('ㅁ') => KeyCode::Char('a'),
+            KeyCode::Char('ㅜ') => KeyCode::Char('n'),
+            KeyCode::Char('ㅐ') => KeyCode::Char('o'),
+            code => code,
+        };
         match pending {
             PendingInteraction::ModelPicker {
                 mut model_index,
@@ -5701,7 +5733,7 @@ impl AppState {
                 once,
                 session,
                 decline,
-            } => match key.code {
+            } => match hotkey {
                 KeyCode::Char('y') | KeyCode::Enter => Action::RpcResponse { id, result: once },
                 KeyCode::Char('a') if session.is_some() => Action::RpcResponse {
                     id,
@@ -5822,7 +5854,7 @@ impl AppState {
                 server_name,
                 message,
                 url,
-            } => match key.code {
+            } => match hotkey {
                 KeyCode::Char('o') => {
                     let target = url.clone();
                     self.pending = Some(PendingInteraction::McpUrl {
@@ -5859,7 +5891,7 @@ impl AppState {
                 title,
                 detail,
                 action,
-            } => match key.code {
+            } => match hotkey {
                 KeyCode::Char('y') | KeyCode::Enter => action.into_action(),
                 KeyCode::Char('n') | KeyCode::Esc => Action::None,
                 _ => {
@@ -7171,6 +7203,60 @@ impl AppState {
                     Action::Tick(false)
                 }
             },
+            // 승인 프롬프트의 [y]/[a]/[n] 행은 키와 같은 응답을 보낸다. 상세
+            // 행(옵션 앞의 detail)은 클릭해도 답이 되지 않는다.
+            Some(PendingInteraction::Approval {
+                id,
+                title,
+                detail,
+                once,
+                session,
+                decline,
+            }) => {
+                let first = detail.len();
+                let decline_row = first + 1 + usize::from(session.is_some());
+                if row == first {
+                    Action::RpcResponse { id, result: once }
+                } else if session.is_some() && row == first + 1 {
+                    Action::RpcResponse {
+                        id,
+                        result: session.expect("checked"),
+                    }
+                } else if row == decline_row {
+                    Action::RpcResponse {
+                        id,
+                        result: decline,
+                    }
+                } else {
+                    self.pending = Some(PendingInteraction::Approval {
+                        id,
+                        title,
+                        detail,
+                        once,
+                        session,
+                        decline,
+                    });
+                    Action::Tick(false)
+                }
+            }
+            Some(PendingInteraction::Confirm {
+                title,
+                detail,
+                action,
+            }) => {
+                if row == detail.len() {
+                    action.into_action()
+                } else if row == detail.len() + 1 {
+                    Action::None
+                } else {
+                    self.pending = Some(PendingInteraction::Confirm {
+                        title,
+                        detail,
+                        action,
+                    });
+                    Action::Tick(false)
+                }
+            }
             other => {
                 self.pending = other;
                 Action::Tick(false)
@@ -11757,6 +11843,108 @@ mod tests {
                 assert_eq!(result.get("action").and_then(Value::as_str), Some("accept"));
             }
             _ => panic!("URL prompt should accept after browser flow"),
+        }
+    }
+
+    fn command_approval_state() -> AppState {
+        let mut state = test_state();
+        let action = state.begin_server_request(
+            json!(21),
+            "item/commandExecution/requestApproval",
+            &json!({ "command": "cargo test", "cwd": "D:\\repo" }),
+        );
+        assert!(matches!(action, Action::None));
+        state
+    }
+
+    #[test]
+    fn command_approval_answers_to_hangul_jamo_keys() {
+        // 한글 IME가 켜진 채 y를 누르면 'ㅛ'가 도착한다.
+        let mut state = command_approval_state();
+        match state.handle_key(KeyEvent::from(KeyCode::Char('ㅛ'))) {
+            Action::RpcResponse { result, .. } => {
+                assert_eq!(
+                    result.get("decision").and_then(Value::as_str),
+                    Some("accept")
+                );
+            }
+            _ => panic!("'ㅛ' should accept like 'y'"),
+        }
+
+        let mut state = command_approval_state();
+        match state.handle_key(KeyEvent::from(KeyCode::Char('ㅜ'))) {
+            Action::RpcResponse { result, .. } => {
+                assert_eq!(
+                    result.get("decision").and_then(Value::as_str),
+                    Some("decline")
+                );
+            }
+            _ => panic!("'ㅜ' should decline like 'n'"),
+        }
+    }
+
+    #[test]
+    fn command_approval_answers_to_pasted_single_chars() {
+        // 호스트 입력창이 bracketed paste로 흘려보낸 "y".
+        let mut state = command_approval_state();
+        match state.paste_as_prompt_answer("y") {
+            Some(Action::RpcResponse { result, .. }) => {
+                assert_eq!(
+                    result.get("decision").and_then(Value::as_str),
+                    Some("accept")
+                );
+            }
+            _ => panic!("pasted 'y' should accept"),
+        }
+
+        // 여러 글자는 답이 아니다 — 기존 paste 경로로 돌려보낸다.
+        let mut state = command_approval_state();
+        assert!(state.paste_as_prompt_answer("yes please").is_none());
+        assert!(state.pending.is_some());
+
+        // 프롬프트가 없으면 관여하지 않는다.
+        let mut state = test_state();
+        assert!(state.paste_as_prompt_answer("y").is_none());
+    }
+
+    #[test]
+    fn command_approval_rows_answer_to_clicks() {
+        // detail 두 줄(명령, 위치) 뒤에 [y]/[a]/[n] 행이 온다.
+        let mut state = command_approval_state();
+        let clicked = state.click_overlay_row(0);
+        assert!(matches!(clicked, Action::Tick(false)));
+        assert!(state.pending.is_some(), "detail rows are not answers");
+
+        match state.click_overlay_row(2) {
+            Action::RpcResponse { result, .. } => {
+                assert_eq!(
+                    result.get("decision").and_then(Value::as_str),
+                    Some("accept")
+                );
+            }
+            _ => panic!("the [y] row should accept"),
+        }
+
+        let mut state = command_approval_state();
+        match state.click_overlay_row(3) {
+            Action::RpcResponse { result, .. } => {
+                assert_eq!(
+                    result.get("decision").and_then(Value::as_str),
+                    Some("acceptForSession")
+                );
+            }
+            _ => panic!("the [a] row should accept for the session"),
+        }
+
+        let mut state = command_approval_state();
+        match state.click_overlay_row(4) {
+            Action::RpcResponse { result, .. } => {
+                assert_eq!(
+                    result.get("decision").and_then(Value::as_str),
+                    Some("decline")
+                );
+            }
+            _ => panic!("the [n] row should decline"),
         }
     }
 

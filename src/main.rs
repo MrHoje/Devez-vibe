@@ -384,13 +384,17 @@ async fn await_thread(
                     Some(Ok(Event::Paste(text))) => {
                         renderer.clear_selection();
                         flush_composer_paste(state, &mut composer_paste, Instant::now());
-                        if !attach_clipboard_image(state) {
-                            apply_composer_text(
-                                state,
-                                BufferedText { text, pasted: true },
-                            );
+                        if let Some(action) = state.paste_as_prompt_answer(&text) {
+                            action
+                        } else {
+                            if !attach_clipboard_image(state) {
+                                apply_composer_text(
+                                    state,
+                                    BufferedText { text, pasted: true },
+                                );
+                            }
+                            Action::None
                         }
-                        Action::None
                     }
                     Some(Ok(Event::Resize(_, _))) => {
                         renderer.clear_selection();
@@ -758,13 +762,17 @@ async fn event_loop(
                     Some(Ok(Event::Paste(text))) => {
                         renderer.clear_selection();
                         flush_composer_paste(state, &mut composer_paste, Instant::now());
-                        if !attach_clipboard_image(state) {
-                            apply_composer_text(
-                                state,
-                                BufferedText { text, pasted: true },
-                            );
+                        if let Some(action) = state.paste_as_prompt_answer(&text) {
+                            action
+                        } else {
+                            if !attach_clipboard_image(state) {
+                                apply_composer_text(
+                                    state,
+                                    BufferedText { text, pasted: true },
+                                );
+                            }
+                            Action::None
                         }
-                        Action::None
                     }
                     Some(Ok(Event::Resize(columns, rows))) => {
                         renderer.clear_selection();
