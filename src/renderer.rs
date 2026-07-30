@@ -2420,6 +2420,8 @@ pub enum Pick {
     Row(usize),
     Effort(usize),
     RemoveQueuedPrompt(usize),
+    /// A Markdown link in the transcript opens through the platform handler.
+    OpenLink(String),
     /// The Vibe preset applies its response and transcript display settings.
     VibeMode,
     /// Legacy internal picks retained for command and regression-test routing.
@@ -5679,6 +5681,7 @@ fn markdown_line(
     }
 
     let mut spans = Vec::new();
+    let mut links = Vec::new();
     let mut index = 0;
     let mut strong = bold;
     while index < text.len() {
@@ -5695,8 +5698,9 @@ fn markdown_line(
             index += end + 2;
             continue;
         }
-        if let Some((label, consumed)) = inline_link(rest) {
+        if let Some((label, target, consumed)) = inline_link(rest) {
             push_highlight_span(&mut spans, &label, Tone::MarkdownLink, strong);
+            links.push((label, target));
             index += consumed;
             continue;
         }
@@ -5718,7 +5722,9 @@ fn markdown_line(
         index += take;
     }
 
-    styled_lines(prefix, prefix_tone, spans, tone, bold, width)
+    let mut lines = styled_lines(prefix, prefix_tone, spans, tone, bold, width);
+    attach_markdown_link_picks(&mut lines, &links);
+    lines
 }
 
 /// Collapses `[label](url)` — and the `![alt](url)` image form — down to the
@@ -5726,7 +5732,7 @@ fn markdown_line(
 /// A `:line` (or `:line:column`) tail on the target is worth reading, so it gets
 /// grafted onto the label; the rest of the path is noise the label already says.
 /// Returns the text to paint plus how many bytes of `rest` it consumed.
-fn inline_link(rest: &str) -> Option<(String, usize)> {
+fn inline_link(rest: &str) -> Option<(String, String, usize)> {
     let image = rest.starts_with("![");
     let body = if image { &rest[1..] } else { rest };
     let after_bracket = body.strip_prefix('[')?;
@@ -5748,7 +5754,49 @@ fn inline_link(rest: &str) -> Option<(String, usize)> {
     {
         text.push_str(&suffix);
     }
-    Some((text, consumed))
+    Some((text, target.to_owned(), consumed))
+}
+
+/// Restores the link targets after styled wrapping. Markdown rendering keeps only
+/// visible spans, so clickable regions are rebuilt from their display text in
+/// parse order and attached to every wrapped fragment of the label.
+fn attach_markdown_link_picks(lines: &mut [PaintLine], links: &[(String, String)]) {
+    let mut links = links.iter();
+    let Some((first_label, first_target)) = links.next() else {
+        return;
+    };
+    let mut label = first_label.as_str();
+    let mut target = first_target.as_str();
+    let mut remaining = label.chars().count();
+
+    for line in lines {
+        let mut column = UnicodeWidthStr::width(line.prefix.as_str());
+        let mut regions = Vec::new();
+        for span in std::iter::once((&line.text, line.tone))
+            .chain(line.tail.iter().map(|span| (&span.text, span.tone)))
+        {
+            for ch in span.0.chars() {
+                let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if span.1 == Tone::MarkdownLink && remaining > 0 {
+                    regions.push((column, column + width, Pick::OpenLink(target.to_owned())));
+                    remaining -= 1;
+                    if remaining == 0 {
+                        let Some((next_label, next_target)) = links.next() else {
+                            column += width;
+                            continue;
+                        };
+                        label = next_label.as_str();
+                        target = next_target.as_str();
+                        remaining = label.chars().count();
+                    }
+                }
+                column += width;
+            }
+        }
+        if !regions.is_empty() {
+            line.pick = Some(PickRegions(regions));
+        }
+    }
 }
 
 /// The `:83` / `:83:12` tail of a file target, or `None` when the trailing
@@ -9159,6 +9207,29 @@ mod tests {
 
         assert_eq!(lines.len(), 1);
         assert_eq!(rendered, "변경: src/main.rs:83, Cargo.toml:29");
+    }
+
+    #[test]
+    fn markdown_link_label_keeps_its_click_target() {
+        let lines = markdown_line(
+            "  ",
+            Tone::Plain,
+            "열기: [미리보기](file:///C:/Temp/preview.html)",
+            Tone::Plain,
+            false,
+            80,
+        );
+        let line = &lines[0];
+        let start = UnicodeWidthStr::width("  열기: ");
+
+        assert_eq!(
+            line.pick.as_ref().and_then(|picks| picks.at(start)),
+            Some(Pick::OpenLink("file:///C:/Temp/preview.html".to_owned()))
+        );
+        assert_eq!(
+            line.pick.as_ref().and_then(|picks| picks.at(start - 1)),
+            None
+        );
     }
 
     #[test]

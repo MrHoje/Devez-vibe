@@ -1013,6 +1013,7 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
             state.remove_queued_prompt(index);
             Action::Tick(true)
         }
+        Pick::OpenLink(target) => Action::OpenUrl(target),
         Pick::FastMode => Action::SetFast(!state.effective_fast_mode()),
         Pick::Model => state.run_command("/model"),
         Pick::EffortSetting => state.run_command("/effort"),
@@ -3668,6 +3669,19 @@ mod tests {
         assert!(matches!(
             pick_action(&mut state, Pick::ScrollToBottom),
             Action::ScrollToBottom
+        ));
+    }
+
+    #[test]
+    fn clicking_a_markdown_link_requests_the_platform_handler() {
+        let mut state = starting_state();
+
+        assert!(matches!(
+            pick_action(
+                &mut state,
+                Pick::OpenLink("file:///C:/Temp/preview.html".to_owned())
+            ),
+            Action::OpenUrl(ref target) if target == "file:///C:/Temp/preview.html"
         ));
     }
 
