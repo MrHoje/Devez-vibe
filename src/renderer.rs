@@ -469,6 +469,7 @@ struct CellStyle {
     background: Option<Rgb>,
     bold: bool,
     italic: bool,
+    underlined: bool,
     crossed_out: bool,
 }
 
@@ -479,6 +480,7 @@ impl CellStyle {
             background: None,
             bold: false,
             italic: false,
+            underlined: false,
             crossed_out: false,
         }
     }
@@ -1876,6 +1878,7 @@ fn cell_style(tone: Tone, bold: bool, background: Option<Rgb>, selected: bool) -
             background: Some(theme::selection_bg()),
             bold,
             italic: false,
+            underlined: false,
             crossed_out: false,
         };
     }
@@ -1884,6 +1887,7 @@ fn cell_style(tone: Tone, bold: bool, background: Option<Rgb>, selected: bool) -
         background,
         bold,
         italic: tone == Tone::Thinking,
+        underlined: tone == Tone::MarkdownLink,
         crossed_out: tone == Tone::PlanDone,
     }
 }
@@ -2014,6 +2018,9 @@ fn set_cell_style(out: &mut impl Write, style: CellStyle) -> Result<()> {
     }
     if style.italic {
         queue!(out, SetAttribute(Attribute::Italic))?;
+    }
+    if style.underlined {
+        queue!(out, SetAttribute(Attribute::Underlined))?;
     }
     if style.crossed_out {
         queue!(out, SetAttribute(Attribute::CrossedOut))?;
@@ -7529,6 +7536,9 @@ fn set_tone(out: &mut impl Write, tone: Tone) -> Result<()> {
     if tone == Tone::Thinking {
         queue!(out, SetAttribute(Attribute::Italic))?;
     }
+    if tone == Tone::MarkdownLink {
+        queue!(out, SetAttribute(Attribute::Underlined))?;
+    }
     if tone == Tone::PlanDone {
         queue!(out, SetAttribute(Attribute::CrossedOut))?;
     }
@@ -9229,6 +9239,19 @@ mod tests {
         assert_eq!(
             line.pick.as_ref().and_then(|picks| picks.at(start - 1)),
             None
+        );
+    }
+
+    #[test]
+    fn markdown_links_are_underlined_in_both_render_modes() {
+        assert!(cell_style(Tone::MarkdownLink, false, None, false).underlined);
+
+        let mut output = Vec::new();
+        set_tone(&mut output, Tone::MarkdownLink).expect("link tone renders");
+        assert!(
+            String::from_utf8(output)
+                .expect("terminal bytes are UTF-8")
+                .contains("\x1b[4m")
         );
     }
 
