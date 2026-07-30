@@ -5497,7 +5497,7 @@ impl AppState {
                     KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
                         theme_index = (theme_index + 1).min(ThemeKind::ALL.len() - 1);
                     }
-                    KeyCode::Char(ch) if ('1'..='3').contains(&ch) => {
+                    KeyCode::Char(ch) if ('1'..='6').contains(&ch) => {
                         let selected = ThemeKind::ALL[ch.to_digit(10).unwrap_or(1) as usize - 1];
                         return self.apply_theme(selected);
                     }
@@ -6119,7 +6119,7 @@ impl AppState {
                     })
                     .collect(),
                 slider: None,
-                hint: "1-3 select   ↑↓ navigate   Enter apply   Esc cancel".to_owned(),
+                hint: "1-6 select   ↑↓ navigate   Enter apply   Esc cancel".to_owned(),
                 style: OverlayStyle::Picker,
                 input: None,
                 input_label: "",
@@ -10918,8 +10918,9 @@ mod tests {
         assert!(matches!(state.run_slash_command("/theme"), Action::None));
         let overlay = state.overlay_view().expect("theme picker");
         assert_eq!(overlay.title, "Theme");
-        assert_eq!(overlay.lines.len(), 3);
+        assert_eq!(overlay.lines.len(), ThemeKind::ALL.len());
         assert!(overlay.lines[0].text.contains("Minimal"));
+        assert!(overlay.lines[5].text.contains("Midnight Blue"));
         state.pending = None;
 
         assert!(matches!(
@@ -10929,6 +10930,11 @@ mod tests {
         let card = state.committed.last().expect("theme card");
         assert_eq!(card.title, "✓ Theme changed");
         assert_eq!(card.body, "↳ Soft");
+
+        assert!(matches!(
+            state.run_slash_command("/theme softpink"),
+            Action::SetTheme(ThemeKind::SoftPink)
+        ));
     }
 
     #[test]

@@ -13,16 +13,31 @@ pub enum ThemeKind {
     Minimal,
     Soft,
     Dark,
+    Gray,
+    SoftPink,
+    Midnight,
 }
 
 impl ThemeKind {
-    pub const ALL: [Self; 3] = [Self::Minimal, Self::Soft, Self::Dark];
+    // Order is the picker order *and* the on-disk index, so the original three
+    // keep their positions and the DevezCode-parity themes append after them.
+    pub const ALL: [Self; 6] = [
+        Self::Minimal,
+        Self::Soft,
+        Self::Dark,
+        Self::Gray,
+        Self::SoftPink,
+        Self::Midnight,
+    ];
 
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "minimal" | "min" | "light" => Some(Self::Minimal),
             "soft" | "warm" => Some(Self::Soft),
             "dark" => Some(Self::Dark),
+            "gray" | "grey" => Some(Self::Gray),
+            "softpink" | "soft-pink" | "pink" => Some(Self::SoftPink),
+            "midnight" | "midnightblue" | "midnight-blue" => Some(Self::Midnight),
             _ => None,
         }
     }
@@ -32,6 +47,9 @@ impl ThemeKind {
             Self::Minimal => "minimal",
             Self::Soft => "soft",
             Self::Dark => "dark",
+            Self::Gray => "gray",
+            Self::SoftPink => "softpink",
+            Self::Midnight => "midnight",
         }
     }
 
@@ -40,6 +58,9 @@ impl ThemeKind {
             Self::Minimal => "Minimal",
             Self::Soft => "Soft",
             Self::Dark => "Dark",
+            Self::Gray => "Gray",
+            Self::SoftPink => "Soft Pink",
+            Self::Midnight => "Midnight Blue",
         }
     }
 
@@ -48,6 +69,9 @@ impl ThemeKind {
             Self::Minimal => "cool white · blue accent",
             Self::Soft => "warm cream · green accent",
             Self::Dark => "charcoal · orange accent",
+            Self::Gray => "neutral gray · slate accent",
+            Self::SoftPink => "warm blush · rose accent",
+            Self::Midnight => "deep navy · azure accent",
         }
     }
 
@@ -389,6 +413,193 @@ pub const DARK: ThemePalette = ThemePalette {
     selection_fg: Rgb(0xE6, 0xE6, 0xE6),
 };
 
+/// DevezCode's `gray` theme (`App.xaml.cs` + `devez-gray.json`): neutral page,
+/// slate accent, no hue of its own. Syntax keeps Minimal's light VS Code set —
+/// the gray identity lives in the chrome, not in the code colors.
+pub const GRAY: ThemePalette = ThemePalette {
+    background: Rgb(0xF3, 0xF4, 0xF6),
+    foreground: Rgb(0x1F, 0x29, 0x37),
+    border: Rgb(0x9C, 0xA3, 0xAF),
+    muted: Rgb(0x5F, 0x67, 0x74),
+    accent: Rgb(0x4B, 0x55, 0x63),
+    blue: Rgb(0x32, 0x6A, 0xA5),
+    sky_blue: Rgb(0x2F, 0x6C, 0x90),
+    success: Rgb(0x15, 0x80, 0x3D),
+    warning: Rgb(0x92, 0x61, 0x16),
+    error: Rgb(0xC2, 0x41, 0x3E),
+    purple: Rgb(0x76, 0x55, 0x8F),
+    pink: Rgb(0xA8, 0x45, 0x68),
+    orange: Rgb(0xB4, 0x53, 0x09),
+    response: ResponsePalette {
+        heading: Rgb(0x37, 0x41, 0x51),
+        link: Rgb(0x32, 0x6A, 0xA5),
+        inline_code: Rgb(0x76, 0x55, 0x8F),
+    },
+    model_gpt56: Rgb(0x32, 0x6A, 0xA5),
+    model_gpt55: Rgb(0x4B, 0x55, 0x63),
+    model_sol: Rgb(0xC2, 0x41, 0x0C),
+    model_terra: Rgb(0x15, 0x80, 0x3D),
+    model_luna: Rgb(0x76, 0x55, 0x8F),
+    model_spark: Rgb(0x92, 0x61, 0x16),
+    status: StatusLinePalette {
+        text: Rgb(0x1F, 0x29, 0x37),
+        separator: Rgb(0x5F, 0x67, 0x74),
+        branch: Rgb(0x00, 0x91, 0xD1),
+        context: Rgb(0x00, 0x8E, 0x5A),
+        effort_low: Rgb(0xD1, 0x9F, 0x00),
+        effort_medium: Rgb(0x15, 0x80, 0x3D),
+        effort_high: Rgb(0x43, 0x38, 0xCA),
+        effort_xhigh: Rgb(0x7C, 0x00, 0xD1),
+        effort_max: Rgb(0xD1, 0x00, 0x00),
+        effort_ultra: Rgb(0xC2, 0x00, 0x78),
+        five_hour: Rgb(0x00, 0x5E, 0xD1),
+        weekly: Rgb(0x35, 0x00, 0xD1),
+    },
+    code: Rgb(0x1F, 0x29, 0x37),
+    syntax_comment: Rgb(0x00, 0x80, 0x00),
+    syntax_string: Rgb(0xA3, 0x15, 0x15),
+    syntax_keyword: Rgb(0x1D, 0x4E, 0xD8),
+    syntax_number: Rgb(0x05, 0x7A, 0x55),
+    syntax_type: Rgb(0x0F, 0x76, 0x70),
+    syntax_function: Rgb(0x79, 0x5E, 0x26),
+    syntax_attribute: Rgb(0xB4, 0x53, 0x09),
+    syntax_property: Rgb(0x32, 0x6A, 0xA5),
+    diff_header: Rgb(0x37, 0x41, 0x51),
+    diff_add_bg: Rgb(0xE7, 0xF6, 0xEB),
+    diff_remove_bg: Rgb(0xFC, 0xE8, 0xE8),
+    diff_add_word_bg: Rgb(0x9E, 0xDD, 0xAE),
+    diff_remove_word_bg: Rgb(0xF0, 0xAA, 0xB2),
+    user_prompt_bg: Rgb(0xE2, 0xE5, 0xE9),
+    model_change_bg: Rgb(0xE5, 0xE7, 0xEB),
+    hover_bg: Rgb(0xE9, 0xEB, 0xEF),
+    selection_bg: Rgb(0xD9, 0xDD, 0xE3),
+    selection_fg: Rgb(0x1F, 0x29, 0x37),
+};
+
+/// DevezCode's `softpink` theme (`App.xaml.cs` + `devez-softpink.json`): blush
+/// page, rose accent. Warm-leaning syntax so code does not read cold against it.
+pub const SOFT_PINK: ThemePalette = ThemePalette {
+    background: Rgb(0xFF, 0xF7, 0xFA),
+    foreground: Rgb(0x3B, 0x29, 0x31),
+    border: Rgb(0xD2, 0xA8, 0xBA),
+    muted: Rgb(0x73, 0x57, 0x63),
+    accent: Rgb(0xB5, 0x4A, 0x6B),
+    blue: Rgb(0x32, 0x6A, 0x9F),
+    sky_blue: Rgb(0x2F, 0x6B, 0x8C),
+    success: Rgb(0x25, 0x72, 0x3C),
+    warning: Rgb(0x9A, 0x65, 0x0B),
+    error: Rgb(0xC2, 0x41, 0x3E),
+    purple: Rgb(0x84, 0x58, 0x8F),
+    pink: Rgb(0xB5, 0x4A, 0x6B),
+    orange: Rgb(0xA1, 0x62, 0x07),
+    response: ResponsePalette {
+        heading: Rgb(0xB5, 0x4A, 0x6B),
+        link: Rgb(0x32, 0x6A, 0x9F),
+        inline_code: Rgb(0x84, 0x58, 0x8F),
+    },
+    model_gpt56: Rgb(0x32, 0x6A, 0x9F),
+    model_gpt55: Rgb(0x2F, 0x6B, 0x8C),
+    model_sol: Rgb(0xC2, 0x41, 0x0C),
+    model_terra: Rgb(0x25, 0x72, 0x3C),
+    model_luna: Rgb(0x84, 0x58, 0x8F),
+    model_spark: Rgb(0x9A, 0x65, 0x0B),
+    status: StatusLinePalette {
+        text: Rgb(0x3B, 0x29, 0x31),
+        separator: Rgb(0x73, 0x57, 0x63),
+        branch: Rgb(0x00, 0x8D, 0xCC),
+        context: Rgb(0x00, 0x8B, 0x58),
+        effort_low: Rgb(0xCC, 0x9C, 0x00),
+        effort_medium: Rgb(0x25, 0x72, 0x3C),
+        effort_high: Rgb(0x43, 0x38, 0xCA),
+        effort_xhigh: Rgb(0x79, 0x00, 0xCC),
+        effort_max: Rgb(0xCC, 0x00, 0x00),
+        effort_ultra: Rgb(0xBD, 0x00, 0x74),
+        five_hour: Rgb(0x00, 0x5B, 0xCC),
+        weekly: Rgb(0x33, 0x00, 0xCC),
+    },
+    code: Rgb(0x3B, 0x29, 0x31),
+    syntax_comment: Rgb(0x3F, 0x76, 0x48),
+    syntax_string: Rgb(0xA3, 0x2B, 0x3F),
+    syntax_keyword: Rgb(0x33, 0x55, 0xCC),
+    syntax_number: Rgb(0x2E, 0x6A, 0x4D),
+    syntax_type: Rgb(0x16, 0x75, 0x8A),
+    syntax_function: Rgb(0x84, 0x58, 0x8F),
+    syntax_attribute: Rgb(0xA1, 0x62, 0x07),
+    syntax_property: Rgb(0x32, 0x6A, 0x9F),
+    diff_header: Rgb(0xB5, 0x4A, 0x6B),
+    diff_add_bg: Rgb(0xE9, 0xF5, 0xEC),
+    diff_remove_bg: Rgb(0xFD, 0xE7, 0xE7),
+    diff_add_word_bg: Rgb(0x9E, 0xD8, 0xAE),
+    diff_remove_word_bg: Rgb(0xF2, 0xAF, 0xB6),
+    user_prompt_bg: Rgb(0xF8, 0xDC, 0xE6),
+    model_change_bg: Rgb(0xFC, 0xEF, 0xF4),
+    hover_bg: Rgb(0xFA, 0xE8, 0xEF),
+    selection_bg: Rgb(0xF2, 0xC9, 0xD7),
+    selection_fg: Rgb(0x3B, 0x29, 0x31),
+};
+
+/// DevezCode's `midnight` theme (`App.xaml.cs` + `devez-midnight.json`): navy
+/// page, azure accent. Dark's VS Code syntax set carries over unchanged.
+pub const MIDNIGHT: ThemePalette = ThemePalette {
+    background: Rgb(0x11, 0x18, 0x27),
+    foreground: Rgb(0xE5, 0xE7, 0xEB),
+    border: Rgb(0x4B, 0x5D, 0x75),
+    muted: Rgb(0x9C, 0xA3, 0xAF),
+    accent: Rgb(0x60, 0xA5, 0xFA),
+    blue: Rgb(0x60, 0xA5, 0xFA),
+    sky_blue: Rgb(0x93, 0xC5, 0xFD),
+    success: Rgb(0x34, 0xD3, 0x99),
+    warning: Rgb(0xFB, 0xBF, 0x24),
+    error: Rgb(0xF8, 0x71, 0x71),
+    purple: Rgb(0xA7, 0x8B, 0xFA),
+    pink: Rgb(0xF4, 0x72, 0xB6),
+    orange: Rgb(0xFB, 0x92, 0x3C),
+    response: ResponsePalette {
+        heading: Rgb(0x93, 0xC5, 0xFD),
+        link: Rgb(0x60, 0xA5, 0xFA),
+        inline_code: Rgb(0xA7, 0x8B, 0xFA),
+    },
+    model_gpt56: Rgb(0x00, 0xF0, 0xFF),
+    model_gpt55: Rgb(0x60, 0xA5, 0xFA),
+    model_sol: Rgb(0xFF, 0x9E, 0x59),
+    model_terra: Rgb(0x34, 0xD3, 0x99),
+    model_luna: Rgb(0xC4, 0xB5, 0xFD),
+    model_spark: Rgb(0xFD, 0xE0, 0x47),
+    status: StatusLinePalette {
+        text: Rgb(0xCB, 0xD5, 0xE1),
+        separator: Rgb(0x82, 0x90, 0xA0),
+        branch: Rgb(0x82, 0xAC, 0xDA),
+        context: Rgb(0x32, 0xB7, 0x86),
+        effort_low: Rgb(0xC0, 0x97, 0x14),
+        effort_medium: Rgb(0x81, 0xC7, 0x84),
+        effort_high: Rgb(0x9B, 0xA1, 0xD6),
+        effort_xhigh: Rgb(0x9A, 0x77, 0xDB),
+        effort_max: Rgb(0xD7, 0x65, 0x64),
+        effort_ultra: Rgb(0xDD, 0x7F, 0xB8),
+        five_hour: Rgb(0x57, 0x91, 0xD7),
+        weekly: Rgb(0x93, 0x7B, 0xD7),
+    },
+    code: Rgb(0xE5, 0xE7, 0xEB),
+    syntax_comment: Rgb(0x6A, 0x99, 0x55),
+    syntax_string: Rgb(0xCE, 0x91, 0x78),
+    syntax_keyword: Rgb(0x56, 0x9C, 0xD6),
+    syntax_number: Rgb(0xB5, 0xCE, 0xA8),
+    syntax_type: Rgb(0x4E, 0xC9, 0xB0),
+    syntax_function: Rgb(0xDC, 0xDC, 0xAA),
+    syntax_attribute: Rgb(0xC5, 0x86, 0xC0),
+    syntax_property: Rgb(0x9C, 0xDC, 0xFE),
+    diff_header: Rgb(0x4F, 0xA6, 0xFF),
+    diff_add_bg: Rgb(0x16, 0x36, 0x2F),
+    diff_remove_bg: Rgb(0x3B, 0x1F, 0x2B),
+    diff_add_word_bg: Rgb(0x1E, 0x5E, 0x4C),
+    diff_remove_word_bg: Rgb(0x7E, 0x33, 0x45),
+    user_prompt_bg: Rgb(0x1E, 0x3A, 0x5F),
+    model_change_bg: Rgb(0x1F, 0x29, 0x37),
+    hover_bg: Rgb(0x1B, 0x24, 0x34),
+    selection_bg: Rgb(0x2D, 0x4A, 0x6B),
+    selection_fg: Rgb(0xE5, 0xE7, 0xEB),
+};
+
 #[cfg(not(test))]
 static CURRENT_THEME: AtomicU8 = AtomicU8::new(2);
 
@@ -405,6 +616,9 @@ fn decode_theme(value: u8) -> ThemeKind {
     match value {
         0 => ThemeKind::Minimal,
         1 => ThemeKind::Soft,
+        3 => ThemeKind::Gray,
+        4 => ThemeKind::SoftPink,
+        5 => ThemeKind::Midnight,
         _ => ThemeKind::Dark,
     }
 }
@@ -430,10 +644,17 @@ pub fn set_current(theme: ThemeKind) {
 }
 
 pub fn palette() -> &'static ThemePalette {
-    match current() {
+    palette_of(current())
+}
+
+pub fn palette_of(theme: ThemeKind) -> &'static ThemePalette {
+    match theme {
         ThemeKind::Minimal => &MINIMAL,
         ThemeKind::Soft => &SOFT,
         ThemeKind::Dark => &DARK,
+        ThemeKind::Gray => &GRAY,
+        ThemeKind::SoftPink => &SOFT_PINK,
+        ThemeKind::Midnight => &MIDNIGHT,
     }
 }
 
@@ -481,21 +702,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn aliases_parse_to_the_three_devez_code_themes() {
+    fn aliases_parse_to_the_devez_code_themes() {
         assert_eq!(ThemeKind::parse("minimal"), Some(ThemeKind::Minimal));
         assert_eq!(ThemeKind::parse("warm"), Some(ThemeKind::Soft));
         assert_eq!(ThemeKind::parse("dark"), Some(ThemeKind::Dark));
+        assert_eq!(ThemeKind::parse("grey"), Some(ThemeKind::Gray));
+        assert_eq!(ThemeKind::parse("softpink"), Some(ThemeKind::SoftPink));
+        assert_eq!(ThemeKind::parse("midnight"), Some(ThemeKind::Midnight));
         assert_eq!(ThemeKind::parse("unknown"), None);
+    }
+
+    /// The on-disk value is the `ALL` index, so a saved theme must decode back
+    /// to itself — appending themes must not shuffle the existing three.
+    #[test]
+    fn every_theme_round_trips_through_its_stored_index() {
+        for theme in ThemeKind::ALL {
+            assert_eq!(decode_theme(theme.index() as u8), theme);
+            assert_eq!(ThemeKind::parse(theme.id()), Some(theme));
+        }
     }
 
     #[test]
     fn every_theme_has_readable_core_contrast() {
         for theme in ThemeKind::ALL {
-            let palette = match theme {
-                ThemeKind::Minimal => MINIMAL,
-                ThemeKind::Soft => SOFT,
-                ThemeKind::Dark => DARK,
-            };
+            let palette = palette_of(theme);
             let text_colors = [
                 ("foreground", palette.foreground),
                 ("muted", palette.muted),
@@ -576,11 +806,7 @@ mod tests {
     #[test]
     fn status_line_segments_never_share_a_color() {
         for theme in ThemeKind::ALL {
-            let palette = match theme {
-                ThemeKind::Minimal => MINIMAL,
-                ThemeKind::Soft => SOFT,
-                ThemeKind::Dark => DARK,
-            };
+            let palette = palette_of(theme);
             let status = palette.status;
             assert_all_distinct(
                 theme,
@@ -615,11 +841,7 @@ mod tests {
     #[test]
     fn status_line_colors_stay_visible() {
         for theme in ThemeKind::ALL {
-            let palette = match theme {
-                ThemeKind::Minimal => MINIMAL,
-                ThemeKind::Soft => SOFT,
-                ThemeKind::Dark => DARK,
-            };
+            let palette = palette_of(theme);
             let status = palette.status;
             let segments = [
                 ("text", status.text),

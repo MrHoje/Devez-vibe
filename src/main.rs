@@ -92,7 +92,7 @@ struct Cli {
     #[arg(long, default_value = "opencode")]
     open_code: PathBuf,
 
-    /// UI theme: minimal, soft, or dark.
+    /// UI theme: minimal, soft, dark, gray, softpink, or midnight.
     #[arg(long, value_name = "THEME")]
     theme: Option<String>,
 
