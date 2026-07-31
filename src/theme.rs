@@ -186,9 +186,6 @@ pub struct ThemePalette {
     pub user_prompt_bg: Rgb,
     pub model_change_bg: Rgb,
     pub hover_bg: Rgb,
-    /// Selected model/effort buttons in the footer. `None` keeps the model tint
-    /// and leaves effort text unfilled.
-    pub footer_selected_bg: Option<Rgb>,
     /// Drag-selection block. See `selection_bg`.
     pub selection_bg: Rgb,
     /// Fallback text colour inside that block. See `selection_fg`.
@@ -292,7 +289,6 @@ pub const MINIMAL: ThemePalette = ThemePalette {
     user_prompt_bg: Rgb(0xEE, 0xF4, 0xFF),
     model_change_bg: Rgb(0xDB, 0xEA, 0xFE),
     hover_bg: Rgb(0xE8, 0xEE, 0xF7),
-    footer_selected_bg: None,
     selection_bg: Rgb(0xC5, 0xD8, 0xF8),
     selection_fg: Rgb(0x0F, 0x17, 0x2A),
 };
@@ -353,7 +349,6 @@ pub const SOFT: ThemePalette = ThemePalette {
     user_prompt_bg: Rgb(0xE6, 0xF0, 0xDE),
     model_change_bg: Rgb(0xDE, 0xEC, 0xD6),
     hover_bg: Rgb(0xE7, 0xE0, 0xD7),
-    footer_selected_bg: None,
     selection_bg: Rgb(0xC2, 0xD8, 0xB0),
     selection_fg: Rgb(0x2A, 0x26, 0x20),
 };
@@ -414,7 +409,6 @@ pub const DARK: ThemePalette = ThemePalette {
     user_prompt_bg: Rgb(0x36, 0x36, 0x36),
     model_change_bg: Rgb(0x43, 0x43, 0x43),
     hover_bg: Rgb(0x32, 0x32, 0x31),
-    footer_selected_bg: None,
     selection_bg: Rgb(0x26, 0x4F, 0x78),
     selection_fg: Rgb(0xE6, 0xE6, 0xE6),
 };
@@ -478,7 +472,6 @@ pub const GRAY: ThemePalette = ThemePalette {
     user_prompt_bg: Rgb(0xE2, 0xE5, 0xE9),
     model_change_bg: Rgb(0xE5, 0xE7, 0xEB),
     hover_bg: Rgb(0xE9, 0xEB, 0xEF),
-    footer_selected_bg: Some(Rgb(0xE2, 0xE5, 0xE9)),
     selection_bg: Rgb(0xD9, 0xDD, 0xE3),
     selection_fg: Rgb(0x1F, 0x29, 0x37),
 };
@@ -541,7 +534,6 @@ pub const SOFT_PINK: ThemePalette = ThemePalette {
     user_prompt_bg: Rgb(0xF8, 0xDC, 0xE6),
     model_change_bg: Rgb(0xFC, 0xEF, 0xF4),
     hover_bg: Rgb(0xFA, 0xE8, 0xEF),
-    footer_selected_bg: None,
     selection_bg: Rgb(0xF2, 0xC9, 0xD7),
     selection_fg: Rgb(0x3B, 0x29, 0x31),
 };
@@ -604,7 +596,6 @@ pub const MIDNIGHT: ThemePalette = ThemePalette {
     user_prompt_bg: Rgb(0x1E, 0x3A, 0x5F),
     model_change_bg: Rgb(0x1F, 0x29, 0x37),
     hover_bg: Rgb(0x1B, 0x24, 0x34),
-    footer_selected_bg: None,
     selection_bg: Rgb(0x2D, 0x4A, 0x6B),
     selection_fg: Rgb(0xE5, 0xE7, 0xEB),
 };
