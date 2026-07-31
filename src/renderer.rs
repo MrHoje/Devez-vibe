@@ -7104,12 +7104,30 @@ fn word_background(tone: Tone) -> Option<Rgb> {
         Tone::DiffAddedWord => palette.diff_add_word_bg,
         Tone::DiffRemovedWord => palette.diff_remove_word_bg,
         Tone::ScrollToBottom => palette.hover_bg,
-        Tone::StatusModel56 => blend(palette.background, palette.model_gpt56, 46),
-        Tone::StatusModelSol => blend(palette.background, palette.model_sol, 46),
-        Tone::StatusModelTerra => blend(palette.background, palette.model_terra, 46),
-        Tone::StatusModelLuna => blend(palette.background, palette.model_luna, 46),
-        Tone::StatusModelSpark => blend(palette.background, palette.model_spark, 46),
-        Tone::StatusModel55 => blend(palette.background, palette.model_gpt55, 46),
+        Tone::StatusModel56 => palette
+            .footer_selected_bg
+            .unwrap_or_else(|| blend(palette.background, palette.model_gpt56, 46)),
+        Tone::StatusModelSol => palette
+            .footer_selected_bg
+            .unwrap_or_else(|| blend(palette.background, palette.model_sol, 46)),
+        Tone::StatusModelTerra => palette
+            .footer_selected_bg
+            .unwrap_or_else(|| blend(palette.background, palette.model_terra, 46)),
+        Tone::StatusModelLuna => palette
+            .footer_selected_bg
+            .unwrap_or_else(|| blend(palette.background, palette.model_luna, 46)),
+        Tone::StatusModelSpark => palette
+            .footer_selected_bg
+            .unwrap_or_else(|| blend(palette.background, palette.model_spark, 46)),
+        Tone::StatusModel55 => palette
+            .footer_selected_bg
+            .unwrap_or_else(|| blend(palette.background, palette.model_gpt55, 46)),
+        Tone::StatusEffortLow
+        | Tone::StatusEffortMedium
+        | Tone::StatusEffortHigh
+        | Tone::StatusEffortXHigh
+        | Tone::StatusEffortMax
+        | Tone::StatusEffortUltra => palette.footer_selected_bg?,
         _ => return None,
     })
 }
@@ -11596,6 +11614,22 @@ mod tests {
         );
 
         assert!(painted(&line).contains("◆ high"));
+    }
+
+    #[test]
+    fn gray_footer_controls_share_devez_code_selected_background() {
+        theme::set_current(ThemeKind::Gray);
+
+        assert_eq!(
+            word_background(Tone::StatusModelSol),
+            Some(Rgb(0xE2, 0xE5, 0xE9))
+        );
+        assert_eq!(
+            word_background(Tone::StatusEffortHigh),
+            Some(Rgb(0xE2, 0xE5, 0xE9))
+        );
+
+        theme::set_current(ThemeKind::Dark);
     }
 
     /// Before the first status arrives the row is a plain fallback string, with no
