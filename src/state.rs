@@ -2739,8 +2739,12 @@ impl AppState {
         self.host_loading = loading;
     }
 
-    pub fn host_busy(&self) -> bool {
-        self.busy || self.host_loading
+    pub fn host_turn_busy(&self) -> bool {
+        self.busy
+    }
+
+    pub fn host_loading(&self) -> bool {
+        self.host_loading
     }
 
     /// Holds a session picked before the current one existed. The newest pick wins,
@@ -9169,13 +9173,14 @@ mod tests {
     fn host_loading_marks_the_devezcode_spinner_busy_without_a_turn() {
         let mut state = test_state();
 
-        assert!(!state.host_busy());
+        assert!(!state.host_turn_busy());
+        assert!(!state.host_loading());
         state.set_host_loading(true);
-        assert!(state.host_busy());
-        assert!(!state.busy);
+        assert!(!state.host_turn_busy());
+        assert!(state.host_loading());
 
         state.set_host_loading(false);
-        assert!(!state.host_busy());
+        assert!(!state.host_loading());
     }
 
     #[test]

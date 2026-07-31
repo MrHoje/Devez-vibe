@@ -3271,7 +3271,12 @@ fn draw(state: &mut AppState, renderer: &mut Renderer) -> Result<()> {
     // Every state change the user can see reaches a frame, so the host's copy of
     // the session state is refreshed from the same place rather than from each
     // of the call sites that can move it.
-    devezcode::sync(&state.thread_id, state.host_busy(), state.awaiting_input());
+    devezcode::sync(
+        &state.thread_id,
+        state.host_turn_busy(),
+        state.host_loading(),
+        state.awaiting_input(),
+    );
     let committed = state.drain_committed();
     let view = state.view();
     let view_elapsed = draw_started.elapsed();
@@ -4152,6 +4157,7 @@ mod tests {
     #[test]
     fn clicking_the_fast_badge_toggles_the_service_tier() {
         let mut state = state_with_a_model();
+        state.set_fast_mode(false);
 
         assert!(matches!(
             pick_action(&mut state, Pick::FastMode),

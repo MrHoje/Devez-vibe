@@ -22,6 +22,7 @@ use std::{
 /// The vocabulary DevezCode's watchers expect. `busy` is read as "running or
 /// not", `waiting` as "waiting or not"; the idle words only have to differ.
 const BUSY: &str = "running";
+const LOADING: &str = "loading";
 const IDLE: &str = "idle";
 const WAITING: &str = "waiting";
 const READY: &str = "ready";
@@ -40,8 +41,35 @@ struct Reporter {
     /// and almost none of those ticks change anything, so the files are only
     /// rewritten when a value actually moves.
     session: String,
-    busy: bool,
+    activity: Activity,
     waiting: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Activity {
+    Idle,
+    Running,
+    Loading,
+}
+
+impl Activity {
+    fn from_host(busy: bool, loading: bool) -> Self {
+        if busy {
+            Self::Running
+        } else if loading {
+            Self::Loading
+        } else {
+            Self::Idle
+        }
+    }
+
+    fn status(self) -> &'static str {
+        match self {
+            Self::Idle => IDLE,
+            Self::Running => BUSY,
+            Self::Loading => LOADING,
+        }
+    }
 }
 
 /// Binds this process to its DevezCode room, if it has one. Call once at
@@ -73,7 +101,7 @@ pub fn init() {
         room,
         owner_token,
         session: String::new(),
-        busy: false,
+        activity: Activity::Idle,
         waiting: false,
     };
     // A previous run that was killed mid-turn leaves `running` behind, and the
@@ -86,15 +114,16 @@ pub fn init() {
 
 /// Publishes the session state DevezCode paints around the terminal. Called
 /// from every frame; cheap when nothing changed.
-pub fn sync(thread_id: &str, busy: bool, waiting: bool) {
+pub fn sync(thread_id: &str, busy: bool, loading: bool, waiting: bool) {
     with(|reporter| {
         if !thread_id.is_empty() && reporter.session != thread_id {
             reporter.session = thread_id.to_owned();
             reporter.write("sessions", thread_id);
         }
-        if reporter.busy != busy {
-            reporter.busy = busy;
-            reporter.write("busy", if busy { BUSY } else { IDLE });
+        let activity = Activity::from_host(busy, loading);
+        if reporter.activity != activity {
+            reporter.activity = activity;
+            reporter.write("busy", activity.status());
         }
         if reporter.waiting != waiting {
             reporter.waiting = waiting;
@@ -118,7 +147,7 @@ pub fn note_prompt(text: &str) {
 pub fn finish() {
     let mut slot = REPORTER.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(mut reporter) = slot.take() {
-        reporter.busy = false;
+        reporter.activity = Activity::Idle;
         reporter.waiting = false;
         reporter.write("busy", IDLE);
         reporter.write("waiting", READY);
@@ -200,6 +229,14 @@ mod tests {
     fn summary_cuts_on_character_boundaries() {
         let long = "가".repeat(SUMMARY_CHARS + 50);
         assert_eq!(summarize(&long).chars().count(), SUMMARY_CHARS);
+    }
+
+    #[test]
+    fn host_activity_keeps_resume_loading_distinct_from_a_turn() {
+        assert_eq!(Activity::from_host(false, false).status(), "idle");
+        assert_eq!(Activity::from_host(true, false).status(), "running");
+        assert_eq!(Activity::from_host(false, true).status(), "loading");
+        assert_eq!(Activity::from_host(true, true).status(), "running");
     }
 
     #[test]
