@@ -89,7 +89,7 @@ struct Cli {
     codex: PathBuf,
 
     /// OpenCode executable used to launch `opencode acp`.
-    #[arg(long, default_value = "opencode")]
+    #[arg(long, default_value = "opencode", hide = true)]
     open_code: PathBuf,
 
     /// UI theme: minimal, soft, dark, gray, softpink, or midnight.

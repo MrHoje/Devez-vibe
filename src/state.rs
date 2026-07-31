@@ -4907,10 +4907,13 @@ impl AppState {
         let parts = command.split_whitespace().collect::<Vec<_>>();
         match parts.first().copied().unwrap_or_default() {
             "/help" => {
+                let provider_help = crate::open_code::PROVIDER_ENABLED
+                    .then_some("/connect  OpenCode provider 연결\n")
+                    .unwrap_or_default();
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    "/model [MODEL] [EFFORT]  모델과 effort 선택\n/connect  OpenCode provider 연결\n/fast [on|off]  Fast 서비스 티어 선택\n/effort [LEVEL]  추론 수준\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/login  ChatGPT 계정 로그인\n/logout  계정 연결 해제\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈",
+                    format!("/model [MODEL] [EFFORT]  모델과 effort 선택\n{provider_help}/fast [on|off]  Fast 서비스 티어 선택\n/effort [LEVEL]  추론 수준\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/login  ChatGPT 계정 로그인\n/logout  계정 연결 해제\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈"),
                 ));
                 Action::None
             }
@@ -5068,6 +5071,14 @@ impl AppState {
                     BlockKind::Error,
                     "Usage",
                     "/mcp, /mcp reconnect 또는 /mcp login SERVER",
+                ));
+                Action::None
+            }
+            "/connect" if !crate::open_code::PROVIDER_ENABLED => {
+                self.committed.push(Block::new(
+                    BlockKind::Warning,
+                    "OpenCode provider 비활성화",
+                    "후속 개선 전까지 OpenCode provider는 사용할 수 없습니다.",
                 ));
                 Action::None
             }
@@ -6619,6 +6630,9 @@ impl AppState {
         }
         SLASH_COMMANDS
             .iter()
+            .filter(|command| {
+                crate::open_code::PROVIDER_ENABLED || command.name != "/connect"
+            })
             .filter(|command| command.name.starts_with(&text))
             .collect()
     }
@@ -12636,7 +12650,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_is_visible_in_slash_command_suggestions() {
+    fn disabled_connect_is_hidden_from_slash_command_suggestions() {
         let mut state = test_state();
         state.editor.insert_str("/con");
 
@@ -12644,7 +12658,7 @@ mod tests {
             state
                 .matching_slash_commands()
                 .iter()
-                .any(|command| command.name == "/connect")
+                .all(|command| command.name != "/connect")
         );
     }
 
@@ -12663,10 +12677,7 @@ mod tests {
             state.run_slash_command("/mcp login github"),
             Action::McpLogin(ref name) if name == "github"
         ));
-        assert!(matches!(
-            state.run_slash_command("/connect"),
-            Action::ConnectProvider
-        ));
+        assert!(matches!(state.run_slash_command("/connect"), Action::None));
         assert!(matches!(
             state.run_slash_command("/plugins"),
             Action::OpenPlugins {

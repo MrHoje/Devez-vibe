@@ -375,7 +375,7 @@ dependencies = [
 
 [[package]]
 name = "devez-vibe"
-version = "0.1.32"
+version = "0.1.33"
 dependencies = [
  "anyhow",
  "arboard",

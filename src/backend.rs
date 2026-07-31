@@ -39,7 +39,9 @@ pub struct BackendServer {
 impl BackendServer {
     pub async fn spawn(codex_path: &Path, open_code_path: &Path, cwd: &Path) -> Result<Self> {
         let codex = AppServer::spawn(codex_path).await?;
-        let open_code = if has_connected_provider() || open_code_is_startup_default() {
+        let open_code = if crate::open_code::PROVIDER_ENABLED
+            && (has_connected_provider() || open_code_is_startup_default())
+        {
             OpenCodeServer::spawn(open_code_path, cwd).await.ok()
         } else {
             None
@@ -352,6 +354,9 @@ impl BackendServer {
     }
 
     async fn ensure_open_code(&mut self) -> Result<&OpenCodeServer> {
+        if !crate::open_code::PROVIDER_ENABLED {
+            anyhow::bail!("OpenCode provider는 현재 비활성화되어 있습니다.");
+        }
         if self.open_code.is_none() {
             self.open_code = Some(OpenCodeServer::spawn(&self.open_code_path, &self.cwd).await?);
             self.open_code

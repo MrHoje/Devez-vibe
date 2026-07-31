@@ -24,6 +24,9 @@ use tokio::{
 
 use crate::app_server::ServerEvent;
 
+/// OpenCode 연동 코드는 후속 개선을 위해 유지하되 현재 배포에서는 비활성화한다.
+pub const PROVIDER_ENABLED: bool = false;
+
 type PendingResponse = oneshot::Sender<Result<Value, String>>;
 type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
 type DetachedMap = Arc<Mutex<HashMap<u64, DetachedTurn>>>;

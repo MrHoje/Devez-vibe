@@ -3,11 +3,10 @@
 [![npm](https://img.shields.io/npm/v/devez-vibe)](https://www.npmjs.com/package/devez-vibe)
 [![license](https://img.shields.io/npm/l/devez-vibe)](LICENSE)
 
-공식 Codex `app-server`와 OpenCode ACP를 함께 사용하는 터미널 클라이언트입니다.
+공식 Codex `app-server`를 사용하는 터미널 클라이언트입니다.
 
 인증, 하네스 프롬프트, 도구, 스킬, `AGENTS.md`, 샌드박스는 공식 `codex app-server`가
-그대로 담당합니다. 이 프로젝트는 **화면과 입력 계층만** 소유합니다. 덕분에 Codex의 동작을
-바꾸지 않으면서 OpenCode provider 모델도 같은 터미널 경험으로 사용할 수 있습니다.
+그대로 담당합니다. 이 프로젝트는 **화면과 입력 계층만** 소유합니다.
 
 ## 설치
 
@@ -22,7 +21,6 @@ npm install -g devez-vibe
 | OS | Windows x64 |
 | Node.js | 18 이상 (설치용. 실행 자체는 네이티브 바이너리) |
 | 전제 | Codex CLI 설치 및 로그인 완료 |
-| 선택 | OpenCode CLI (`/connect`와 외부 provider 모델 사용 시) |
 
 현재 Windows x64 빌드만 배포합니다. 다른 플랫폼에서는 `EBADPLATFORM`으로 설치가 거부됩니다.
 
@@ -44,7 +42,7 @@ dvz
 
 ```text
 dvz [--resume [SESSION] | --continue] [--model MODEL] [--effort EFFORT]
-    [--cwd PATH] [--codex PATH] [--open-code PATH] [--theme THEME]
+    [--cwd PATH] [--codex PATH] [--theme THEME]
 dvz update
 ```
 
@@ -52,10 +50,7 @@ dvz update
 가장 최근 세션을 바로 이어갑니다. 실행 중에는 `/resume [SESSION]` 또는 별칭
 `/continue`로 세션을 전환할 수 있습니다. 입력창의 전체 명령은 `/help`에서 확인합니다.
 
-OpenCode CLI가 설치되어 있으면 `/connect`에서 Devez Vibe 내부 provider 검색·인증 화면을
-열 수 있습니다. API key와 추가 설정은 내부 오버레이에서 입력하고, OAuth는 같은 화면에서
-브라우저 인증 완료를 기다립니다. 연결된 모델은 `/model`에 `OpenCode ·` 표기로 합쳐지며,
-OpenAI 모델은 OpenCode를 거치지 않고 기존 공식 Codex 런타임을 계속 사용합니다.
+OpenCode provider 연동은 후속 개선 전까지 비활성화되어 있습니다.
 
 ### 업데이트
 
@@ -92,7 +87,6 @@ dvz update
 
 - 응답, reasoning summary, 명령, 파일 변경, MCP 호출 스트리밍
 - 명령/파일 변경 승인
-- OpenCode 응답·도구·사용량·todo 계획을 기존 UI 이벤트로 변환
 - 실행 중 입력 steer 및 `Esc`/`Ctrl+C` 중단
 - 실행 시간, 파일 diff 통계, 진행 상태 표시
 
@@ -140,7 +134,7 @@ node scripts/release-npm.mjs --publish    # 실제 배포
 
 ## 경계
 
-`app-server`와 OpenCode ACP 프로토콜은 각 CLI 버전에 따라 변할 수 있습니다. 렌더러 변경은
+`app-server` 프로토콜은 CLI 버전에 따라 변할 수 있습니다. 렌더러 변경은
 독립적으로 관리하고, 업스트림에서는 프로토콜/인증/모델 카탈로그 변경만 호환성
 대상으로 봅니다. 업데이트가 필요할 때는 [Codex CLI 호환성 업데이트 절차](.knowledge/Codex-CLI-호환성-업데이트.md)를
 따라 최신 버전을 확인하고 필요한 변경만 반영합니다.
