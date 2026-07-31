@@ -2214,9 +2214,10 @@ fn emit_synchronized_frame_diff(
     }
 }
 
-/// Emits selected rows from a blank frame before the normal diff, all inside one
-/// synchronized update. This clears stale wide glyphs or attributes only where
-/// a fixed plan changed, without repainting every spinner frame.
+/// A semantic plan change can alter the fixed panel height, which also moves
+/// transcript and composer rows. Repaint the complete frame once so no old row
+/// remains at its former terminal position. Spinner-only frames still use the
+/// ordinary incremental diff.
 fn emit_synchronized_frame_diff_with_full_rows(
     out: &mut impl Write,
     previous: Option<&CellFrame>,
@@ -2228,24 +2229,7 @@ fn emit_synchronized_frame_diff_with_full_rows(
     }
 
     queue!(out, Print("\x1b[?2026h"))?;
-    let mut result = Ok(());
-    for &row in full_rows {
-        if row >= current.height {
-            continue;
-        }
-        let row_frame = CellFrame {
-            width: current.width,
-            height: 1,
-            cells: current.cells[row * current.width..(row + 1) * current.width].to_vec(),
-        };
-        if let Err(error) = emit_frame_diff_at(out, None, &row_frame, row) {
-            result = Err(error);
-            break;
-        }
-    }
-    if result.is_ok() {
-        result = emit_frame_diff(out, previous, current);
-    }
+    let result = emit_frame_diff(out, None, current);
     let end = queue!(out, Print("\x1b[?2026l"));
     match (result, end) {
         (Err(error), _) => Err(error),
@@ -8432,6 +8416,23 @@ mod tests {
         assert!(!renderer.begin_selection(0, 0));
         assert!(!renderer.begin_selection(72, 0));
         assert!(renderer.begin_selection(72, 1));
+    }
+
+    #[test]
+    fn plan_update_repaints_all_rows_when_panel_geometry_changes() {
+        let previous = CellFrame::new(8, 2);
+        let mut current = previous.clone();
+        current.write(0, 0, "새 작업", CellStyle::plain());
+
+        let mut output = Vec::new();
+        emit_synchronized_frame_diff_with_full_rows(&mut output, Some(&previous), &current, &[0])
+            .expect("plan update emits");
+
+        let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
+        assert!(output.starts_with("\x1b[?2026h"));
+        assert!(output.contains("새 작업"));
+        assert!(output.contains("\x1b[2;1H"));
+        assert!(output.ends_with("\x1b[?2026l"));
     }
 
     #[test]
