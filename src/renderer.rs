@@ -2045,16 +2045,12 @@ fn emit_frame_diff_at(
     let previous = previous.filter(|frame| frame.width == current.width && frame.height == current.height);
     for row in 0..current.height {
         let screen_row = row.saturating_add(row_offset);
-        let wide_damage = previous.and_then(|previous| wide_damage_range(previous, current, row));
-        if let Some(columns) = wide_damage.clone() {
-            emit_frame_columns(out, current, row, screen_row, columns)?;
+        if row_repaints_sequentially(previous, current, row) {
+            emit_row_sequential(out, current, row, screen_row)?;
+            continue;
         }
         let mut column = 0;
         while column < current.width {
-            if wide_damage.as_ref().is_some_and(|columns| columns.contains(&column)) {
-                column += 1;
-                continue;
-            }
             let cell = current.cell(column, row);
             let changed = previous.is_none_or(|previous| cell != previous.cell(column, row));
             if !changed || cell.continuation {
@@ -2081,9 +2077,6 @@ fn emit_frame_diff_at(
             let style = cell.style;
             let mut text = String::new();
             while column + 1 < current.width {
-                if wide_damage.as_ref().is_some_and(|columns| columns.contains(&column)) {
-                    break;
-                }
                 let cell = current.cell(column, row);
                 let changed = previous.is_none_or(|previous| cell != previous.cell(column, row));
                 if !changed || (!cell.continuation && cell.style != style) {
@@ -2109,90 +2102,64 @@ fn emit_frame_diff_at(
     Ok(())
 }
 
-/// Returns the smallest safe repaint range around changed double-width glyphs.
-/// The range starts before any old/current continuation cell and ends after it,
-/// so a terminal is never asked to paint into the trailing half of a glyph.
-/// Keeping this local avoids clearing and flashing the entire composer row for
-/// every Korean character typed.
-fn wide_damage_range(previous: &CellFrame, current: &CellFrame, row: usize) -> Option<Range<usize>> {
-    let mut changed = (0..current.width).filter(|&column| {
-        let before = previous.cell(column, row);
+/// ConPTY hosts (Windows Terminal, WebView2 + xterm.js) re-synthesize the
+/// application's escape stream from their own buffer, and a cursor jump into
+/// the middle of a row holding double-width glyphs can come back out with each
+/// glyph duplicated and the columns drifted. So any change that touches a wide
+/// cell — in the old row or the new one — repaints its whole row in a single
+/// left-to-right pass, the one output shape that survives every host. Rows of
+/// narrow cells keep the cheap local diff.
+fn row_repaints_sequentially(
+    previous: Option<&CellFrame>,
+    current: &CellFrame,
+    row: usize,
+) -> bool {
+    let wide = |cell: &Cell| cell.continuation || UnicodeWidthStr::width(cell.glyph.as_str()) > 1;
+    (0..current.width).any(|column| {
         let after = current.cell(column, row);
-        before != after
-            && (before.continuation
-                || after.continuation
-                || UnicodeWidthStr::width(before.glyph.as_str()) > 1
-                || UnicodeWidthStr::width(after.glyph.as_str()) > 1)
-    });
-    let mut start = changed.next()?;
-    let mut end = changed.last().unwrap_or(start) + 1;
-
-    while start > 0
-        && (previous.cell(start, row).continuation || current.cell(start, row).continuation)
-    {
-        start -= 1;
-    }
-    while end < current.width
-        && (previous.cell(end, row).continuation || current.cell(end, row).continuation)
-    {
-        end += 1;
-    }
-    Some(start..end)
+        match previous {
+            None => wide(after),
+            Some(previous) => {
+                let before = previous.cell(column, row);
+                before != after && (wide(before) || wide(after))
+            }
+        }
+    })
 }
 
-fn emit_frame_columns(
+/// Paints one whole row from column zero without any mid-row cursor motion:
+/// style runs are printed back to back, so the terminal's own cursor advance
+/// walks the wide glyphs, and the final cell is filled by an erase instead of
+/// a printed glyph so autowrap can never spill into the next row.
+fn emit_row_sequential(
     out: &mut impl Write,
     frame: &CellFrame,
     row: usize,
     screen_row: usize,
-    columns: Range<usize>,
 ) -> Result<()> {
-    let mut column = columns.start.min(frame.width);
-    let end = columns.end.min(frame.width);
-    while column < end {
-        let cell = frame.cell(column, row);
-        if cell.continuation {
-            column += 1;
-            continue;
-        }
-        if column + 1 == frame.width {
-            queue!(
-                out,
-                MoveTo(
-                    column.min(u16::MAX as usize) as u16,
-                    screen_row.min(u16::MAX as usize) as u16
-                )
-            )?;
-            set_cell_style(out, cell.style)?;
-            queue!(out, Clear(ClearType::UntilNewLine))?;
-            column += 1;
-            continue;
-        }
-        let style = cell.style;
-        let start = column;
+    if frame.width == 0 {
+        return Ok(());
+    }
+    queue!(out, MoveTo(0, screen_row.min(u16::MAX as usize) as u16))?;
+    let mut column = 0;
+    while column + 1 < frame.width {
+        let style = frame.cell(column, row).style;
         let mut text = String::new();
-        while column < end && column + 1 < frame.width {
+        while column + 1 < frame.width {
             let cell = frame.cell(column, row);
             if !cell.continuation && cell.style != style {
                 break;
             }
-            if cell.continuation {
-                column += 1;
-            } else {
+            if !cell.continuation {
                 text.push_str(&cell.glyph);
-                column += terminal_unit_width(&cell.glyph).max(1);
             }
+            column += 1;
         }
-        queue!(
-            out,
-            MoveTo(
-                start.min(u16::MAX as usize) as u16,
-                screen_row.min(u16::MAX as usize) as u16
-            )
-        )?;
         set_cell_style(out, style)?;
         queue!(out, Print(text))?;
     }
+    set_cell_style(out, frame.cell(frame.width - 1, row).style)?;
+    queue!(out, Clear(ClearType::UntilNewLine))?;
     Ok(())
 }
 
@@ -7738,31 +7705,14 @@ mod tests {
     }
 
     #[test]
-    fn changed_korean_text_uses_a_local_safe_repaint_range() {
-        let mut before = CellFrame::new(16, 1);
-        before.write(0, 0, "한글 단어", CellStyle::plain());
-        let mut after = CellFrame::new(16, 1);
-        after.write(0, 0, "한글 ", CellStyle::plain());
-
-        let damage = wide_damage_range(&before, &after, 0).expect("wide text changed");
-        assert_eq!(damage, 5..9);
-    }
-
-    #[test]
-    fn changed_korean_text_does_not_clear_or_repaint_the_whole_row() {
+    fn changed_korean_text_repaints_its_whole_row_in_one_pass() {
         let background = Rgb(1, 2, 3);
         let style = CellStyle {
             background: Some(background),
             ..CellStyle::plain()
         };
         let mut before = CellFrame::new(16, 1);
-        before.fill(
-            0,
-            0,
-            16,
-            1,
-            style,
-        );
+        before.fill(0, 0, 16, 1, style);
         before.write(4, 0, "한글 단어", style);
         let mut after = CellFrame::new(16, 1);
         after.fill(0, 0, 16, 1, style);
@@ -7772,28 +7722,43 @@ mod tests {
         emit_frame_diff(&mut output, Some(&before), &after).expect("frame diff emits");
 
         let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
-        assert!(!output.contains("\x1b[2K"));
-        assert!(!output.contains("\x1b[1;1H"));
-        assert!(output.contains("새"));
+        assert!(output.contains("\x1b[1;1H"));
+        assert_eq!(output.matches('H').count(), 1, "no mid-row cursor jumps");
+        assert!(output.contains("한글 새"));
+        assert!(output.contains("\x1b[K"));
     }
 
     #[test]
-    fn korean_text_shift_repaints_from_a_leading_cell_not_a_continuation() {
+    fn korean_text_shift_repaints_from_the_row_start_not_a_continuation() {
         let mut before = CellFrame::new(12, 1);
         before.write(4, 0, "한", CellStyle::plain());
         let mut after = CellFrame::new(12, 1);
         after.write(4, 0, "x한", CellStyle::plain());
 
-        assert_eq!(wide_damage_range(&before, &after, 0), Some(4..7));
+        let mut output = Vec::new();
+        emit_frame_diff(&mut output, Some(&before), &after).expect("frame diff emits");
+        let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
+
+        assert!(output.contains("\x1b[1;1H"));
+        assert!(output.contains("x한"));
+        assert!(!output.contains("\x1b[1;5H"));
+        assert!(!output.contains("\x1b[1;6H"));
+    }
+
+    #[test]
+    fn narrow_spinner_change_in_a_wide_row_keeps_the_local_diff() {
+        let mut before = CellFrame::new(24, 1);
+        before.write(2, 0, "▸", CellStyle::plain());
+        before.write(6, 0, "한글 단계", CellStyle::plain());
+        let mut after = before.clone();
+        after.write(2, 0, "✔", CellStyle::plain());
 
         let mut output = Vec::new();
         emit_frame_diff(&mut output, Some(&before), &after).expect("frame diff emits");
         let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
 
-        assert!(output.contains("\x1b[1;5H"));
-        assert!(output.contains("x한"));
-        assert!(!output.contains("\x1b[1;6H"));
-        assert!(!output.contains("\x1b[2K"));
+        assert!(output.contains("\x1b[1;3H"));
+        assert!(!output.contains("한글"), "unchanged wide text is not resent");
     }
 
     #[test]
@@ -8433,6 +8398,246 @@ mod tests {
         assert!(output.contains("새 작업"));
         assert!(output.contains("\x1b[2;1H"));
         assert!(output.ends_with("\x1b[?2026l"));
+    }
+
+    /// Replays emitted escape bytes onto a cell grid the way a VT terminal
+    /// would, tracking double-width glyphs, so a test can assert the screen a
+    /// stream produces rather than the stream's shape.
+    struct TerminalEmulator {
+        width: usize,
+        height: usize,
+        cells: Vec<Option<String>>,
+        row: usize,
+        column: usize,
+    }
+
+    impl TerminalEmulator {
+        fn new(width: usize, height: usize) -> Self {
+            Self {
+                width,
+                height,
+                cells: vec![Some(" ".to_owned()); width * height],
+                row: 0,
+                column: 0,
+            }
+        }
+
+        fn feed(&mut self, bytes: &[u8]) {
+            let text = std::str::from_utf8(bytes).expect("terminal bytes are UTF-8");
+            let mut chars = text.chars().peekable();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '\x1b' => match chars.peek() {
+                        Some('[') => {
+                            chars.next();
+                            let mut params = String::new();
+                            let action = loop {
+                                let ch = chars.next().expect("complete CSI sequence");
+                                if ch.is_ascii_alphabetic() {
+                                    break ch;
+                                }
+                                params.push(ch);
+                            };
+                            self.apply_csi(&params, action);
+                        }
+                        Some(']') => {
+                            for ch in chars.by_ref() {
+                                if ch == '\x07' {
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    '\r' => self.column = 0,
+                    '\n' => self.row = (self.row + 1).min(self.height - 1),
+                    _ => self.put(ch),
+                }
+            }
+        }
+
+        fn apply_csi(&mut self, params: &str, action: char) {
+            match action {
+                'H' => {
+                    let mut split = params.split(';');
+                    let row: usize = split.next().unwrap_or("").parse().unwrap_or(1);
+                    let column: usize = split.next().unwrap_or("").parse().unwrap_or(1);
+                    self.row = row.saturating_sub(1).min(self.height - 1);
+                    self.column = column.saturating_sub(1).min(self.width);
+                }
+                'K' => {
+                    let (start, end) = match params {
+                        "" | "0" => (self.column, self.width),
+                        "1" => (0, (self.column + 1).min(self.width)),
+                        _ => (0, self.width),
+                    };
+                    for column in start..end {
+                        self.set(column, Some(" ".to_owned()));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn put(&mut self, ch: char) {
+            let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if width == 0 {
+                if self.column > 0 {
+                    if let Some(glyph) = &mut self.cells[self.row * self.width + self.column - 1] {
+                        glyph.push(ch);
+                    }
+                }
+                return;
+            }
+            if self.column + width > self.width {
+                return;
+            }
+            for offset in 0..width {
+                self.set(
+                    self.column + offset,
+                    (offset == 0).then(|| ch.to_string()),
+                );
+            }
+            self.column += width;
+        }
+
+        /// Writing into either half of a wide glyph erases the whole glyph, as
+        /// real terminals do.
+        fn set(&mut self, column: usize, cell: Option<String>) {
+            let index = self.row * self.width + column;
+            if self.cells[index].is_none() && column > 0 {
+                self.cells[index - 1] = Some(" ".to_owned());
+            }
+            if self.cells[index].as_deref().is_some_and(|glyph| UnicodeWidthStr::width(glyph) > 1)
+                && column + 1 < self.width
+                && self.cells[index + 1].is_none()
+            {
+                self.cells[index + 1] = Some(" ".to_owned());
+            }
+            self.cells[index] = cell;
+        }
+
+        fn row_text(&self, row: usize) -> String {
+            let mut text = String::new();
+            for column in 0..self.width {
+                if let Some(glyph) = &self.cells[row * self.width + column] {
+                    text.push_str(glyph);
+                }
+            }
+            text.trim_end().to_owned()
+        }
+    }
+
+    fn frame_row_text(frame: &CellFrame, row: usize) -> String {
+        let mut text = String::new();
+        for column in 0..frame.width {
+            let cell = frame.cell(column, row);
+            if !cell.continuation {
+                text.push_str(&cell.glyph);
+            }
+        }
+        text.trim_end().to_owned()
+    }
+
+    fn korean_plan_summary(second_done: bool) -> PlanSummary {
+        let status = |done: bool, active: bool| {
+            if done {
+                PlanStepStatus::Completed
+            } else if active {
+                PlanStepStatus::InProgress
+            } else {
+                PlanStepStatus::Pending
+            }
+        };
+        PlanSummary {
+            explanation: None,
+            steps: vec![
+                PlanStep {
+                    text: "1. 우측 콘텐츠 상단 레이아웃 확인".to_owned(),
+                    status: PlanStepStatus::Completed,
+                    started_at: None,
+                    elapsed: Some(Duration::from_secs(15)),
+                },
+                PlanStep {
+                    text: "2. 상단 경계와 여백 조정".to_owned(),
+                    status: status(second_done, !second_done),
+                    started_at: None,
+                    elapsed: second_done.then(|| Duration::from_secs(15)),
+                },
+                PlanStep {
+                    text: "3. 실행 화면 확인".to_owned(),
+                    status: status(false, second_done),
+                    started_at: None,
+                    elapsed: None,
+                },
+            ],
+            expanded: true,
+            started_at: Instant::now(),
+            elapsed: None,
+        }
+    }
+
+    fn paint_plan_frame(lines: &[PaintLine], width: usize) -> CellFrame {
+        let mut frame = CellFrame::new(width, lines.len());
+        for (row, line) in lines.iter().enumerate() {
+            paint_line_into_frame(&mut frame, row, line, None, None, None);
+        }
+        frame
+    }
+
+    /// The exact screenshot scenario: a Korean plan is on screen, a spinner
+    /// tick repaints rows through the cell diff, then a step completes and the
+    /// changed rows repaint. The emulator must end up showing the new plan
+    /// verbatim — no doubled glyphs, no drifted columns.
+    #[test]
+    fn korean_plan_step_transition_replays_cleanly_on_a_wide_glyph_terminal() {
+        let width = 100usize;
+        let before = korean_plan_summary(false);
+        let after = korean_plan_summary(true);
+        let lines_initial = fixed_plan_summary_lines(&before, width as u16, 0.10, true, Some(0.2));
+        let lines_tick = fixed_plan_summary_lines(&before, width as u16, 0.60, true, Some(0.7));
+        let lines_after = fixed_plan_summary_lines(&after, width as u16, 0.85, true, Some(0.9));
+        assert_eq!(lines_initial.len(), lines_tick.len());
+        assert_eq!(lines_tick.len(), lines_after.len());
+
+        let frame_initial = paint_plan_frame(&lines_initial, width);
+        let mut emulator = TerminalEmulator::new(width, lines_initial.len());
+        let mut output = Vec::new();
+        emit_synchronized_frame_diff(&mut output, None, &frame_initial).expect("initial paint");
+        emulator.feed(&output);
+
+        // Spinner tick, then the semantic update, both through the animation
+        // row path with its per-row previous frames.
+        let mut painted = frame_initial;
+        for (previous_lines, current_lines) in [
+            (&lines_initial, &lines_tick),
+            (&lines_tick, &lines_after),
+        ] {
+            for (row, line) in current_lines.iter().enumerate() {
+                let mut current = CellFrame::new(width, 1);
+                paint_line_into_frame(&mut current, 0, line, None, None, None);
+                let previous = CellFrame {
+                    width,
+                    height: 1,
+                    cells: painted.cells[row * width..(row + 1) * width].to_vec(),
+                };
+                let full = plan_row_requires_full_repaint(&previous_lines[row], line);
+                let mut output = Vec::new();
+                emit_frame_diff_at(&mut output, (!full).then_some(&previous), &current, row)
+                    .expect("row repaint");
+                emulator.feed(&output);
+                painted.cells[row * width..(row + 1) * width].clone_from_slice(&current.cells);
+            }
+        }
+
+        let expected = paint_plan_frame(&lines_after, width);
+        for row in 0..lines_after.len() {
+            assert_eq!(
+                emulator.row_text(row),
+                frame_row_text(&expected, row),
+                "row {row} must replay verbatim"
+            );
+        }
     }
 
     #[test]
