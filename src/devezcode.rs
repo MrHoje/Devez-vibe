@@ -79,11 +79,7 @@ pub fn init() {
     else {
         return;
     };
-    let Some(room) = env::var("DEVEZCODE_ROOM_ID")
-        .ok()
-        .map(|room| sanitize(&room))
-        .filter(|room| !room.is_empty())
-    else {
+    let Some(room) = room_id() else {
         return;
     };
     let Some(base) = env::var_os("APPDATA")
@@ -110,6 +106,15 @@ pub fn init() {
     reporter.write("waiting", READY);
     let mut slot = REPORTER.lock().unwrap_or_else(PoisonError::into_inner);
     *slot = Some(reporter);
+}
+
+/// Returns the DevezCode room this process belongs to, when launched by the host.
+/// The same sanitized identifier is used for host state files and browser MCP calls.
+pub fn room_id() -> Option<String> {
+    env::var("DEVEZCODE_ROOM_ID")
+        .ok()
+        .map(|room| sanitize(&room))
+        .filter(|room| !room.is_empty())
 }
 
 /// Publishes the session state DevezCode paints around the terminal. Called

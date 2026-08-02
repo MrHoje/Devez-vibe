@@ -38,7 +38,8 @@ pub struct BackendServer {
 
 impl BackendServer {
     pub async fn spawn(codex_path: &Path, open_code_path: &Path, cwd: &Path) -> Result<Self> {
-        let codex = AppServer::spawn(codex_path).await?;
+        let devezcode_room = crate::devezcode::room_id();
+        let codex = AppServer::spawn(codex_path, devezcode_room.as_deref()).await?;
         let open_code = if crate::open_code::PROVIDER_ENABLED
             && (has_connected_provider() || open_code_is_startup_default())
         {

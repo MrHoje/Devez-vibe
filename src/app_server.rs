@@ -119,10 +119,11 @@ pub struct AppServer {
 }
 
 impl AppServer {
-    pub async fn spawn(codex_path: &Path) -> Result<Self> {
+    pub async fn spawn(codex_path: &Path, devezcode_room: Option<&str>) -> Result<Self> {
         let resolved_codex = resolve_command(codex_path);
         let mut command = codex_command(&resolved_codex);
         apply_originator_override(&mut command);
+        apply_devezcode_room_override(&mut command, devezcode_room);
         isolate_ctrl_c(&mut command);
         let mut child = command
             .stdin(Stdio::piped())
@@ -372,6 +373,36 @@ fn apply_originator_override(command: &mut Command) {
     }
 }
 
+/// Codex app-server starts stdio MCP children with an isolated environment.
+/// Put the DevezCode room in this invocation's MCP override so every browser
+/// call is bound to the tab that started Devez Vibe, without mutating global config.
+fn apply_devezcode_room_override(command: &mut Command, room: Option<&str>) {
+    if let Some(override_value) = devezcode_room_override(room) {
+        command.arg("-c").arg(override_value);
+    }
+}
+
+fn devezcode_room_override(room: Option<&str>) -> Option<String> {
+    room.filter(|room| !room.is_empty()).map(|room| {
+        format!(
+            "mcp_servers.devez-browser.env.DEVEZCODE_ROOM_ID={}",
+            toml_string(room)
+        )
+    })
+}
+
+fn toml_string(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('\"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t")
+    )
+}
+
 const ORIGINATOR_OVERRIDE_ENV: &str = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
 
 #[cfg(windows)]
@@ -563,6 +594,15 @@ mod tests {
                 .is_none()
                 .then(|| std::ffi::OsStr::new("codex_cli_rs"))
         );
+    }
+
+    #[test]
+    fn app_server_passes_the_devezcode_room_to_browser_mcp_only() {
+        assert_eq!(
+            devezcode_room_override(Some("room-1")),
+            Some("mcp_servers.devez-browser.env.DEVEZCODE_ROOM_ID=\"room-1\"".to_string())
+        );
+        assert_eq!(devezcode_room_override(None), None);
     }
 
     #[test]
