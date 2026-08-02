@@ -2502,7 +2502,11 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 작은 작업의 계획은 짧게 쓴다. Task 한두 개면 충분하다.\n",
     "- 모든 Task 제목은 순서대로 `1. `, `2. `, `3. `처럼 번호로 시작한다.\n",
     "- 각 Task는 착수할 때 in_progress, 끝나면 completed로 즉시 갱신한다.\n",
-    "- 질문에만 답하는 턴을 제외하고, 원인 분석·코드리뷰 등 코드를 읽는 작업에도 `update_plan`으로 계획을 먼저 표시한다.",
+    "- 질문에만 답하는 턴을 제외하고, 원인 분석·코드리뷰 등 코드를 읽는 작업에도 `update_plan`으로 계획을 먼저 표시한다.\n",
+    "내장 브라우저 규칙:\n",
+    "- 사용자가 내장 브라우저를 열거나 페이지를 탐색·입력·읽어 달라고 요청하면, 제공된 browser MCP 도구를 사용한다.\n",
+    "- 도구가 없다고 추측하지 말고 현재 제공된 도구를 먼저 확인한다.\n",
+    "- 기존 브라우저 탭이 있으면 임의로 선택하지 말고 사용자에게 선택을 받은 뒤 사용한다.\n",
 );
 
 /// A resumed thread replays the `developer` message its rollout was recorded
@@ -3902,6 +3906,12 @@ mod tests {
 
         assert_eq!(params.pointer("/developerInstructions").and_then(Value::as_str), Some(DEVEZ_INSTRUCTIONS));
         assert_eq!(params.pointer("/model").and_then(Value::as_str), Some("gpt-5.6-terra"));
+    }
+
+    #[test]
+    fn developer_instructions_use_the_available_embedded_browser_tools() {
+        assert!(DEVEZ_INSTRUCTIONS.contains("제공된 browser MCP 도구를 사용한다"));
+        assert!(DEVEZ_INSTRUCTIONS.contains("임의로 선택하지 말고"));
     }
 
     #[test]
