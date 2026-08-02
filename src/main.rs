@@ -2505,7 +2505,8 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 질문에만 답하는 턴을 제외하고, 원인 분석·코드리뷰 등 코드를 읽는 작업에도 `update_plan`으로 계획을 먼저 표시한다.\n",
     "내장 브라우저 규칙:\n",
     "- DevezCode 브라우저는 ChatGPT의 Browser plugin(`iab`)이 아니라 `mcp__devez_browser__browser_*` MCP 도구다. ",
-    "사용자가 DevezCode 브라우저·내장 브라우저를 열거나 페이지를 탐색·입력·읽어 달라고 요청하면 이 MCP 도구만 사용하고 Browser plugin을 초기화하거나 사용할 수 없다고 답하지 않는다.\n",
+    "사용자가 DevezCode 브라우저·Devez 브라우저·내장 브라우저·내장브라우저·인앱 브라우저·인앱브라우저를 요청하면 이 MCP 도구만 사용하고 Browser plugin을 초기화하거나 사용할 수 없다고 답하지 않는다. ",
+    "사용자가 크롬 브라우저를 명시한 경우에만 Chrome을 사용한다.\n",
     "- 도구가 없다고 추측하지 말고 현재 제공된 도구를 먼저 확인한다.\n",
     "- 기존 브라우저 탭이 있으면 임의로 선택하지 말고 사용자에게 선택을 받은 뒤 사용한다.\n",
 );
@@ -3913,6 +3914,8 @@ mod tests {
     fn developer_instructions_use_the_available_embedded_browser_tools() {
         assert!(DEVEZ_INSTRUCTIONS.contains("mcp__devez_browser__browser_*"));
         assert!(DEVEZ_INSTRUCTIONS.contains("Browser plugin을 초기화하거나"));
+        assert!(DEVEZ_INSTRUCTIONS.contains("인앱브라우저"));
+        assert!(DEVEZ_INSTRUCTIONS.contains("크롬 브라우저"));
         assert!(DEVEZ_INSTRUCTIONS.contains("임의로 선택하지 말고"));
     }
 
