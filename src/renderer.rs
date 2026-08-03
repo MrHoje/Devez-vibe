@@ -954,7 +954,7 @@ impl Renderer {
         }
         let row = row.min(self.previous_lines.len().saturating_sub(1) as u16);
         let line = &self.previous_lines[usize::from(row)];
-        if matches!(line.tone, Tone::AssistantBubbleHalf | Tone::UserPromptPadding) {
+        if matches!(line.tone, Tone::AssistantBubbleHalf) {
             return None;
         }
         let width = painted_line_width(line).max(
@@ -1935,7 +1935,7 @@ fn paint_line_into_frame(
     let background = row_background(line.tone);
     let bubble_background = bubble_background(line);
     if let Some(background) = background {
-        let (start, right) = if matches!(line.tone, Tone::UserPrompt | Tone::UserPromptPadding) {
+        let (start, right) = if matches!(line.tone, Tone::UserPrompt) {
             let prefix_width = UnicodeWidthStr::width(line.prefix.as_str());
             let start = if CHAT_LAYOUT.load(Ordering::Relaxed) {
                 let marker_width = usize::from(line.prefix.ends_with("› "))
@@ -2310,7 +2310,6 @@ enum Tone {
     StatusText,
     StatusSeparator,
     UserPrompt,
-    UserPromptPadding,
     AssistantBubble,
     AssistantBubbleHalf,
     Model56,
@@ -2481,19 +2480,6 @@ impl PaintLine {
 
     fn blank() -> Self {
         Self::plain("")
-    }
-
-    fn user_prompt_padding(width: usize) -> Self {
-        Self {
-            prefix: String::new(),
-            prefix_tone: Tone::Plain,
-            text: " ".repeat(width),
-            tone: Tone::UserPromptPadding,
-            bold: false,
-            tool_heading: None,
-            pick: None,
-            tail: Vec::new(),
-        }
     }
 
     /// Makes single spans of an already-built row clickable. `picks` addresses
@@ -2938,7 +2924,7 @@ fn selection_columns_for_line(
     row: usize,
 ) -> Option<Range<usize>> {
     // A bubble's rounded edge rows are chrome, not text.
-    if matches!(line.tone, Tone::AssistantBubbleHalf | Tone::UserPromptPadding) {
+    if matches!(line.tone, Tone::AssistantBubbleHalf) {
         return None;
     }
     let mut selected = range.columns_for_row(row, painted_line_width(line))?;
@@ -3271,13 +3257,9 @@ fn welcome_info_rows(welcome: &WelcomeView, column_width: usize) -> Vec<PanelRow
 fn welcome_reset_pick(mut line: PaintLine) -> PaintLine {
     if line.text.contains("Resets") {
         if let Some(icon_start) = line.text.find(['▼', '▲']) {
-            let value_start = line
-                .text
-                .find("Resets   ")
-                .map(|start| start + "Resets   ".len())
-                .unwrap_or(icon_start);
+            let label_start = line.text.find("Resets").unwrap_or(0);
             let start = UnicodeWidthStr::width(line.prefix.as_str())
-                + UnicodeWidthStr::width(&line.text[..value_start]);
+                + UnicodeWidthStr::width(&line.text[..label_start]);
             let end = UnicodeWidthStr::width(line.prefix.as_str())
                 + UnicodeWidthStr::width(&line.text[..icon_start + '▼'.len_utf8()]);
             line.pick = Some(PickRegions::span(
@@ -5026,14 +5008,14 @@ fn fixed_plan_summary_lines(
     let effort_tone = plan_effort_tone(summary.steps.len());
     let title = format!("작업 단계 · {completed} / {} 완료", summary.steps.len());
     if !summary.expanded {
-        let tail = " Shift + Tab ▼ ━━";
-        let rule = "━".repeat(
+        let tail = " Shift + Tab ▼ ──";
+        let rule = "─".repeat(
             line_width.saturating_sub(5 + UnicodeWidthStr::width(title.as_str()) + UnicodeWidthStr::width(tail)),
         );
         let header = PaintLine {
             prefix: String::new(),
             prefix_tone: Tone::Border,
-            text: format!("━━━ {title} {rule}"),
+            text: format!("─── {title} {rule}"),
             tone: Tone::Plain,
             bold: false,
             tool_heading: None,
@@ -5041,7 +5023,7 @@ fn fixed_plan_summary_lines(
             tail: vec![
                 PaintSpan { text: " Shift + Tab ".to_owned(), tone: Tone::FastOff, bold: false },
                 PaintSpan { text: "▼ ".to_owned(), tone: Tone::Plain, bold: false },
-                PaintSpan { text: "━━".to_owned(), tone: Tone::Plain, bold: false },
+                PaintSpan { text: "──".to_owned(), tone: Tone::Plain, bold: false },
             ],
         };
         return vec![header.with_picks(&[(1, Pick::PlanSummary), (2, Pick::PlanSummary)]), PaintLine::blank()];
@@ -5085,18 +5067,18 @@ fn fixed_plan_summary_lines(
         });
     }
     let all_completed = !summary.steps.is_empty() && completed == summary.steps.len();
-    let header_tail = " Shift + Tab ▲ ━┓";
-    let header_rule = "━".repeat(
+    let header_tail = " Shift + Tab ▲ ─┐";
+    let header_rule = "─".repeat(
         line_width
             .saturating_sub(5 + UnicodeWidthStr::width(title.as_str()) + UnicodeWidthStr::width(header_tail)),
     );
-    let mut header_tail = vec![PaintSpan { text: "┏━━ ".to_owned(), tone: Tone::Plain, bold: false }];
+    let mut header_tail = vec![PaintSpan { text: "┌── ".to_owned(), tone: Tone::Plain, bold: false }];
     header_tail.extend(plan_title_shimmer_spans(&title, plan_shimmer_phase, effort_tone));
     header_tail.extend([
         PaintSpan { text: format!(" {header_rule}"), tone: Tone::Plain, bold: false },
         PaintSpan { text: " Shift + Tab ".to_owned(), tone: Tone::FastOff, bold: false },
         PaintSpan { text: "▲ ".to_owned(), tone: Tone::Plain, bold: false },
-        PaintSpan { text: "━┓".to_owned(), tone: Tone::Plain, bold: false },
+        PaintSpan { text: "─┐".to_owned(), tone: Tone::Plain, bold: false },
     ]);
     let header = PaintLine {
         prefix: String::new(),
@@ -5123,8 +5105,8 @@ fn fixed_plan_summary_lines(
         lines.push(PaintLine::blank());
     }
     lines.push(PaintLine::plain(format!(
-        "┗{}┛",
-        "━".repeat(line_width.saturating_sub(2))
+        "└{}┘",
+        "─".repeat(line_width.saturating_sub(2))
     )));
     lines.push(PaintLine::blank());
     lines
@@ -5383,7 +5365,9 @@ fn block_lines_with_mode(
     let force_diff = matches!(block.kind, BlockKind::Diff);
     let mut code = false;
     let mut code_language = String::new();
-    for raw_line in block.body.lines() {
+    let raw_lines = block.body.lines().collect::<Vec<_>>();
+    let mut line_index = 0;
+    while let Some(raw_line) = raw_lines.get(line_index).copied() {
         let trimmed = raw_line.trim_start();
         if let Some(language) = trimmed.strip_prefix("```") {
             if code {
@@ -5392,6 +5376,7 @@ fn block_lines_with_mode(
                 code_language = language.trim().to_ascii_lowercase();
             }
             code = !code;
+            line_index += 1;
             continue;
         }
 
@@ -5410,6 +5395,42 @@ fn block_lines_with_mode(
             let (prefix, prefix_tone) =
                 body_prefix(&mut first_content, marker, tone, "  ", Tone::Muted);
             lines.extend(diff_line(&prefix, prefix_tone, raw_line, conversational_width));
+        } else if let Some(separator) = raw_lines.get(line_index + 1)
+            && let Some(header) = markdown_table_cells(raw_line)
+            && let Some(alignments) = markdown_table_alignments(separator, header.len())
+        {
+            let table_start = line_index;
+            let mut rows = vec![header];
+            line_index += 2;
+            while let Some(row) = raw_lines.get(line_index).and_then(|line| markdown_table_cells(line)) {
+                if row.len() != rows[0].len() {
+                    break;
+                }
+                rows.push(row);
+                line_index += 1;
+            }
+            let (prefix, prefix_tone) =
+                body_prefix(&mut first_content, marker, tone, "  ", Tone::Muted);
+            if let Some(table) = markdown_table_lines(
+                &prefix,
+                prefix_tone,
+                &rows,
+                &alignments,
+                content_tone,
+                conversational_width,
+            ) {
+                lines.extend(table);
+                continue;
+            }
+            lines.extend(markdown_line(
+                &prefix,
+                prefix_tone,
+                raw_line,
+                content_tone,
+                false,
+                conversational_width,
+            ));
+            line_index = table_start;
         } else if trimmed.starts_with('#') {
             let (prefix, prefix_tone) =
                 body_prefix(&mut first_content, marker, tone, "  ", Tone::Muted);
@@ -5425,8 +5446,19 @@ fn block_lines_with_mode(
             .strip_prefix("- ")
             .or_else(|| trimmed.strip_prefix("* "))
         {
-            let (prefix, prefix_tone) =
-                body_prefix(&mut first_content, marker, tone, "  - ", Tone::Plain);
+            let continuation_prefix = if conversational { "- " } else { "  - " };
+            let (prefix, prefix_tone) = if conversational {
+                first_content = false;
+                ("- ".to_owned(), Tone::Plain)
+            } else {
+                body_prefix(
+                    &mut first_content,
+                    marker,
+                    tone,
+                    continuation_prefix,
+                    Tone::Plain,
+                )
+            };
             lines.extend(markdown_line(
                 &prefix,
                 prefix_tone,
@@ -5458,6 +5490,7 @@ fn block_lines_with_mode(
                 conversational_width,
             ));
         }
+        line_index += 1;
     }
     let lines = if chat_layout {
         assistant_chat_bubble_lines(lines)
@@ -5466,6 +5499,209 @@ fn block_lines_with_mode(
         lines
     };
     lines
+}
+
+fn markdown_table_cells(line: &str) -> Option<Vec<String>> {
+    let line = line.trim();
+    if !line.contains('|') {
+        return None;
+    }
+    let line = line.strip_prefix('|').unwrap_or(line);
+    let line = line.strip_suffix('|').unwrap_or(line);
+    let cells = line
+        .split('|')
+        .map(|cell| cell.trim().to_owned())
+        .collect::<Vec<_>>();
+    (cells.len() >= 2 && cells.iter().all(|cell| !cell.is_empty())).then_some(cells)
+}
+
+#[derive(Clone, Copy)]
+enum TableAlignment {
+    Left,
+    Center,
+    Right,
+}
+
+fn markdown_table_alignments(line: &str, columns: usize) -> Option<Vec<TableAlignment>> {
+    let cells = markdown_table_cells(line)?;
+    (cells.len() == columns).then_some(())?;
+    cells
+        .into_iter()
+        .map(|cell| {
+            let rule = cell.trim();
+            let body = rule.trim_matches(':');
+            (body.len() >= 3 && body.bytes().all(|byte| byte == b'-')).then(|| {
+                match (rule.starts_with(':'), rule.ends_with(':')) {
+                    (true, true) => TableAlignment::Center,
+                    (false, true) => TableAlignment::Right,
+                    _ => TableAlignment::Left,
+                }
+            })
+        })
+        .collect()
+}
+
+fn markdown_table_lines(
+    prefix: &str,
+    prefix_tone: Tone,
+    rows: &[Vec<String>],
+    alignments: &[TableAlignment],
+    tone: Tone,
+    width: u16,
+) -> Option<Vec<PaintLine>> {
+    let columns = rows.first()?.len();
+    if alignments.len() != columns {
+        return None;
+    }
+    let available = usize::from(width)
+        .saturating_sub(UnicodeWidthStr::width(prefix) + 1);
+    const COLUMN_GAP: usize = 2;
+    const MIN_CELL_WIDTH: usize = 4;
+    let gap_width = columns.saturating_sub(1).saturating_mul(COLUMN_GAP);
+    if available < gap_width.saturating_add(columns.saturating_mul(MIN_CELL_WIDTH)) {
+        return None;
+    }
+
+    let mut widths = (0..columns)
+        .map(|column| {
+            rows.iter()
+                .map(|row| UnicodeWidthStr::width(row[column].as_str()))
+                .max()
+                .unwrap_or(0)
+                .max(MIN_CELL_WIDTH)
+        })
+        .collect::<Vec<_>>();
+    let content_width = available.saturating_sub(gap_width);
+    while widths.iter().sum::<usize>() > content_width {
+        let Some((index, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| **value > MIN_CELL_WIDTH)
+            .max_by_key(|(_, value)| **value)
+        else {
+            return None;
+        };
+        widths[index] -= 1;
+    }
+
+    let mut output = Vec::new();
+    let continuation_prefix = " ".repeat(UnicodeWidthStr::width(prefix));
+    for (row_index, row) in rows.iter().enumerate() {
+        let cell_lines = row
+            .iter()
+            .zip(&widths)
+            .map(|(cell, width)| table_cell_lines(cell, *width))
+            .collect::<Vec<_>>();
+        let height = cell_lines.iter().map(Vec::len).max().unwrap_or(1);
+        for cell_line in 0..height {
+            let cells = cell_lines
+                .iter()
+                .zip(&widths)
+                .zip(alignments)
+                .map(|((lines, width), alignment)| {
+                    align_table_cell(
+                        lines.get(cell_line).map(String::as_str).unwrap_or(""),
+                        *width,
+                        *alignment,
+                    )
+                })
+                .collect::<Vec<_>>()
+                ;
+            let row_prefix = if output.is_empty() {
+                prefix
+            } else {
+                &continuation_prefix
+            };
+            output.push(table_content_line(
+                row_prefix,
+                prefix_tone,
+                &cells,
+                if row_index == 0 { Tone::MarkdownHeading } else { tone },
+                false,
+                COLUMN_GAP,
+            ));
+        }
+        if row_index + 1 < rows.len() {
+            output.push(table_rule_line(
+                &continuation_prefix,
+                prefix_tone,
+                &widths,
+                COLUMN_GAP,
+            ));
+        }
+    }
+    Some(output)
+}
+
+fn table_content_line(
+    prefix: &str,
+    prefix_tone: Tone,
+    cells: &[String],
+    tone: Tone,
+    bold: bool,
+    column_gap: usize,
+) -> PaintLine {
+    let mut cells = cells.iter();
+    let first = cells.next().cloned().unwrap_or_default();
+    let mut tail = Vec::new();
+    for cell in cells {
+        tail.push(PaintSpan {
+            text: " ".repeat(column_gap),
+            tone,
+            bold: false,
+        });
+        tail.push(PaintSpan {
+            text: cell.clone(),
+            tone,
+            bold,
+        });
+    }
+    PaintLine {
+        prefix: prefix.to_owned(),
+        prefix_tone,
+        text: first,
+        tone,
+        bold,
+        tool_heading: None,
+        pick: None,
+        tail,
+    }
+}
+
+fn table_rule_line(
+    prefix: &str,
+    prefix_tone: Tone,
+    widths: &[usize],
+    column_gap: usize,
+) -> PaintLine {
+    let cells = widths
+        .iter()
+        .map(|width| "─".repeat(*width))
+        .collect::<Vec<_>>();
+    table_content_line(prefix, prefix_tone, &cells, Tone::Muted, false, column_gap)
+}
+
+fn table_cell_lines(cell: &str, width: usize) -> Vec<String> {
+    textwrap::wrap(
+        cell,
+        textwrap::Options::new(width)
+            .break_words(true)
+            .word_separator(textwrap::WordSeparator::AsciiSpace),
+    )
+    .into_iter()
+    .map(|line| line.into_owned())
+    .collect::<Vec<_>>()
+}
+
+fn align_table_cell(cell: &str, width: usize, alignment: TableAlignment) -> String {
+    let content_width = UnicodeWidthStr::width(cell);
+    let padding = width.saturating_sub(content_width);
+    let (left, right) = match alignment {
+        TableAlignment::Left => (0, padding),
+        TableAlignment::Center => (padding / 2, padding.saturating_sub(padding / 2)),
+        TableAlignment::Right => (padding, 0),
+    };
+    format!("{}{}{}", " ".repeat(left), cell, " ".repeat(right))
 }
 
 fn assistant_chat_bubble_lines(mut lines: Vec<PaintLine>) -> Vec<PaintLine> {
@@ -5515,7 +5751,7 @@ fn block_lines_with_expansion(block: &Block, width: u16, expanded: bool) -> Vec<
 fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     let marker_tone = model_tone(&block.title).unwrap_or(Tone::User);
     if !CHAT_LAYOUT.load(Ordering::Relaxed) {
-        let mut lines = block
+        let lines = block
             .body
             .lines()
             .flat_map(|line| {
@@ -5530,13 +5766,6 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
                 )
             })
             .collect::<Vec<_>>();
-        let padding_width = usize::from(width).saturating_sub(2);
-        let mut top = PaintLine::user_prompt_padding(padding_width);
-        top.prefix = "▌ ".to_owned();
-        top.prefix_tone = Tone::Accent;
-        let bottom = top.clone();
-        lines.insert(0, top);
-        lines.push(bottom);
         return lines;
     }
     const RIGHT_GAP: usize = 0;
@@ -5598,12 +5827,6 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         );
         line.prefix_tone = marker_tone;
     }
-    let mut top = PaintLine::user_prompt_padding(bubble_width);
-    top.prefix = half_prefix.clone();
-    let mut bottom = PaintLine::user_prompt_padding(bubble_width);
-    bottom.prefix = half_prefix;
-    lines.insert(0, top);
-    lines.push(bottom);
     lines
 }
 
@@ -7068,7 +7291,7 @@ fn hover_repaint_columns(
 fn row_background(tone: Tone) -> Option<Rgb> {
     let palette = theme::palette();
     Some(match tone {
-        Tone::UserPrompt | Tone::UserPromptPadding if !CHAT_LAYOUT.load(Ordering::Relaxed) => {
+        Tone::UserPrompt if !CHAT_LAYOUT.load(Ordering::Relaxed) => {
             palette.user_prompt_bg
         }
         Tone::ModelChange => palette.model_change_bg,
@@ -7097,7 +7320,7 @@ fn bubble_background(line: &PaintLine) -> Option<Rgb> {
 fn word_background(tone: Tone) -> Option<Rgb> {
     let palette = theme::palette();
     Some(match tone {
-        Tone::UserPrompt | Tone::UserPromptPadding if CHAT_LAYOUT.load(Ordering::Relaxed) => {
+        Tone::UserPrompt if CHAT_LAYOUT.load(Ordering::Relaxed) => {
             palette.user_prompt_bg
         }
         Tone::AssistantBubble | Tone::AssistantBubbleHalf => assistant_bubble_background(),
@@ -7416,7 +7639,6 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::StatusText => palette.status.text,
         Tone::StatusSeparator => palette.status.separator,
         Tone::UserPrompt => palette.foreground,
-        Tone::UserPromptPadding => palette.user_prompt_bg,
         Tone::AssistantBubble => palette.foreground,
         Tone::AssistantBubbleHalf => blend(palette.background, palette.foreground, 20),
         Tone::Model56 => palette.model_gpt56,
@@ -8373,14 +8595,13 @@ mod tests {
     }
 
     #[test]
-    fn user_prompt_bubble_cannot_start_selection_outside_its_text() {
+    fn user_prompt_bubble_starts_selection_on_its_first_text_row() {
         let lines = block_lines(&Block::new(BlockKind::User, "You", "prompt"), 80);
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
         renderer.previous_lines = lines;
 
         assert!(!renderer.begin_selection(0, 0));
-        assert!(!renderer.begin_selection(72, 0));
-        assert!(renderer.begin_selection(72, 1));
+        assert!(renderer.begin_selection(72, 0));
     }
 
     #[test]
@@ -8645,14 +8866,14 @@ mod tests {
         CHAT_LAYOUT.store(false, Ordering::Relaxed);
         let lines = user_prompt_lines(&Block::new(BlockKind::User, "You", "first\nsecond"), 80);
         let range = CellRange {
-            start: CellPosition { column: 2, row: 1 },
+            start: CellPosition { column: 2, row: 0 },
             end: CellPosition {
-                column: painted_line_width(&lines[2]).saturating_sub(1) as u16,
-                row: 2,
+                column: painted_line_width(&lines[1]).saturating_sub(1) as u16,
+                row: 1,
             },
         };
 
-        assert_eq!(selection_columns_for_line(&lines[2], range, 2), Some(2..8));
+        assert_eq!(selection_columns_for_line(&lines[1], range, 1), Some(2..8));
     }
 
     #[test]
@@ -8666,20 +8887,18 @@ mod tests {
             false,
         );
 
-        assert_eq!(lines.len(), 5);
+        assert_eq!(lines.len(), 3);
         // Every row is filled out to the longest one so the bubble paints square.
-        assert_eq!(lines[0].tone, Tone::UserPromptPadding);
-        assert_eq!(lines[1].text, "first   ");
-        assert_eq!(lines[2].text, "second  ");
-        assert!(lines[1].prefix.ends_with("› "));
-        assert_eq!(lines[3].tone, Tone::UserPromptPadding);
-        assert!(lines[4] == PaintLine::blank());
+        assert_eq!(lines[0].text, "first   ");
+        assert_eq!(lines[1].text, "second  ");
+        assert!(lines[0].prefix.ends_with("› "));
+        assert!(lines[2] == PaintLine::blank());
 
         let selection = CellRange {
-            start: CellPosition { column: 71, row: 1 },
-            end: CellPosition { column: 77, row: 2 },
+            start: CellPosition { column: 71, row: 0 },
+            end: CellPosition { column: 77, row: 1 },
         };
-        assert_eq!(selection_columns_for_line(&lines[0], selection, 0), None);
+        assert_ne!(selection_columns_for_line(&lines[0], selection, 0), None);
         assert_ne!(selection_columns_for_line(&lines[1], selection, 1), None);
     }
 
@@ -8688,13 +8907,11 @@ mod tests {
         CHAT_LAYOUT.store(true, Ordering::Relaxed);
         let lines = user_prompt_lines(&Block::new(BlockKind::User, "You", "longest line\nshort"), 80);
 
-        assert_eq!(lines[0].tone, Tone::UserPromptPadding);
-        assert_eq!(UnicodeWidthStr::width(lines[1].prefix.as_str()), UnicodeWidthStr::width(lines[2].prefix.as_str()));
-        assert_eq!(painted_line_width(&lines[1]), painted_line_width(&lines[2]));
-        assert_eq!(lines[2].text.trim(), "short");
-        assert!(lines[1].prefix.ends_with("› "));
-        assert!(lines[2].prefix.ends_with("  "));
-        assert_eq!(lines[3].tone, Tone::UserPromptPadding);
+        assert_eq!(UnicodeWidthStr::width(lines[0].prefix.as_str()), UnicodeWidthStr::width(lines[1].prefix.as_str()));
+        assert_eq!(painted_line_width(&lines[0]), painted_line_width(&lines[1]));
+        assert_eq!(lines[1].text.trim(), "short");
+        assert!(lines[0].prefix.ends_with("› "));
+        assert!(lines[1].prefix.ends_with("  "));
     }
 
     #[test]
@@ -9066,6 +9283,82 @@ mod tests {
             diff_line("", Tone::Plain, "+++ b/src/main.rs", 80)[0].tone,
             Tone::DiffHeader
         );
+    }
+
+    #[test]
+    fn markdown_table_renderer_draws_a_bordered_table() {
+        let rows = vec![
+            vec!["항목".to_owned(), "상태".to_owned()],
+            vec!["릴리즈 빌드".to_owned(), "성공".to_owned()],
+        ];
+        let alignments = vec![TableAlignment::Left, TableAlignment::Center];
+
+        let lines = markdown_table_lines("  ", Tone::Muted, &rows, &alignments, Tone::Plain, 80)
+            .expect("table fits the available width");
+
+        assert_eq!(lines[0].prefix, "  ");
+        assert!(lines[0].text.starts_with("항목"));
+        assert_eq!(lines[0].tone, Tone::MarkdownHeading);
+        assert!(!lines[0].bold);
+        assert!(lines[0]
+            .tail
+            .iter()
+            .all(|span| span.tone != Tone::AssistantBubble));
+        assert!(lines[1].text.chars().all(|ch| ch == '─'));
+        assert!(lines.last().expect("data row").text.contains("릴리즈 빌드"));
+    }
+
+    #[test]
+    fn assistant_list_uses_flush_hyphens_without_a_response_marker() {
+        CHAT_LAYOUT.store(false, Ordering::Relaxed);
+        let lines = block_lines_with_expansion(
+            &Block::new(BlockKind::Assistant, "Codex", "- first\n- second"),
+            80,
+            false,
+        );
+
+        let second_item = lines
+            .iter()
+            .find(|line| line.text.trim() == "second")
+            .expect("second list item");
+        let first_item = lines
+            .iter()
+            .find(|line| line.text.trim() == "first")
+            .expect("first list item");
+        assert_eq!(first_item.prefix, "- ");
+        assert_eq!(second_item.prefix, "- ");
+        CHAT_LAYOUT.store(true, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn markdown_table_wraps_long_cells_and_honors_alignment() {
+        let rows = vec![
+            vec!["설명".to_owned(), "값".to_owned()],
+            vec!["긴 설명도 열 안에서 여러 줄로 자연스럽게 표시됩니다".to_owned(), "42".to_owned()],
+        ];
+        let alignments = vec![TableAlignment::Left, TableAlignment::Right];
+
+        let lines = markdown_table_lines("", Tone::Plain, &rows, &alignments, Tone::Plain, 30)
+            .expect("table fits the available width");
+
+        assert!(lines.len() > 3);
+        assert!(lines.iter().all(|line| UnicodeWidthStr::width(painted(line).as_str()) <= 29));
+        assert!(lines.iter().any(|line| painted(line).ends_with("42")));
+    }
+
+    #[test]
+    fn markdown_table_in_a_response_is_rendered_as_a_table() {
+        let block = Block::new(
+            BlockKind::Warning,
+            "상태",
+            "| 항목 | 상태 |\n|---|---|\n| 릴리즈 빌드 | 성공 |",
+        );
+
+        let lines = block_lines(&block, 80);
+
+        assert!(lines.iter().any(|line| line.tone == Tone::MarkdownHeading));
+        assert!(!lines.iter().any(|line| line.text.contains("| 항목 |")));
+        assert!(lines.iter().any(|line| line.text.contains("릴리즈 빌드")));
     }
 
     #[test]
@@ -11664,13 +11957,13 @@ mod tests {
             .find(|line| painted(line).contains("Resets"))
             .expect("reset summary");
         assert!(painted(reset).contains('▼'));
-        assert_eq!(pick_on(reset, "Resets"), None);
+        assert_eq!(pick_on(reset, "Resets"), Some(Pick::ToggleWelcomeCredits));
         assert_eq!(pick_on(reset, "3 available"), Some(Pick::ToggleWelcomeCredits));
         assert_eq!(pick_on(reset, "▼"), Some(Pick::ToggleWelcomeCredits));
         assert_eq!(
             Renderer::hover_columns(reset, None, Some(&Pick::ToggleWelcomeCredits))
                 .map(|columns| columns.len()),
-            Some(15)
+            Some(24)
         );
 
         let mut expanded = test_welcome();
@@ -12905,16 +13198,16 @@ mod tests {
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, true, None);
 
         assert_eq!(lines.len(), 12);
-        assert!(painted(&lines[0]).starts_with("┏━━ 작업 단계 · 0 / 7 완료"));
-        assert!(painted(&lines[0]).ends_with('┓'));
+        assert!(painted(&lines[0]).starts_with("┌── 작업 단계 · 0 / 7 완료"));
+        assert!(painted(&lines[0]).ends_with('┐'));
         assert!(lines[0].tail.iter().any(|span| span.text == " Shift + Tab "));
         assert!(lines[0].tail.iter().any(|span| span.tone == Tone::FastOff));
         assert!(lines[1].text.is_empty());
         assert!(painted(&lines[8]).contains("     Task 7"));
         assert!(!painted(&lines[8]).ends_with('┃'));
         assert!(lines[9].text.is_empty());
-        assert!(painted(&lines[10]).starts_with('┗'));
-        assert!(painted(&lines[10]).ends_with('┛'));
+        assert!(painted(&lines[10]).starts_with('└'));
+        assert!(painted(&lines[10]).ends_with('┘'));
         assert!(lines[11].text.is_empty());
     }
 
@@ -12930,7 +13223,7 @@ mod tests {
 
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None);
 
-        assert!(painted(&lines[0]).ends_with(" Shift + Tab ▲ ━┓"));
+        assert!(painted(&lines[0]).ends_with(" Shift + Tab ▲ ─┐"));
         assert_eq!(UnicodeWidthStr::width(painted(&lines[0]).as_str()), 79);
         assert!(lines[0].tail.iter().any(|span| span.tone == Tone::FastOff));
         assert_eq!(pick_on(&lines[0], "▲"), Some(Pick::PlanSummary));
@@ -12949,10 +13242,10 @@ mod tests {
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None);
 
         assert_eq!(lines.len(), 2);
-        assert!(painted(&lines[0]).starts_with("━━━ 작업 단계"));
-        assert!(painted(&lines[0]).trim_end().ends_with("Shift + Tab ▼ ━━"));
+        assert!(painted(&lines[0]).starts_with("─── 작업 단계"));
+        assert!(painted(&lines[0]).trim_end().ends_with("Shift + Tab ▼ ──"));
         assert_eq!(lines[0].tail[0].tone, Tone::FastOff);
-        assert!(!painted(&lines[0]).contains(['┏', '┓']));
+        assert!(!painted(&lines[0]).contains(['┌', '┐']));
         assert_eq!(pick_on(&lines[0], "작업 단계"), None);
         assert_eq!(pick_on(&lines[0], "▼"), Some(Pick::PlanSummary));
         assert!(lines[1] == PaintLine::blank());

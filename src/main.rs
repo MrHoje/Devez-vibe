@@ -266,6 +266,7 @@ async fn start_session(
             state.model_verbosity(),
         ),
         read_account_plan(server),
+        None,
     )
     .await?;
     let Startup::Ready {
@@ -338,6 +339,7 @@ async fn await_thread(
     renderer: &mut Renderer,
     thread: impl Future<Output = Result<Value>>,
     plan: impl Future<Output = AccountPlan>,
+    mut side_exit_key_guard: Option<Instant>,
 ) -> Result<Startup> {
     let mut events = EventStream::new();
     let mut composer_paste = ComposerPasteBuffer::new();
@@ -374,7 +376,14 @@ async fn await_thread(
                 match event {
                     Some(Ok(Event::Key(key))) => {
                         renderer.clear_selection();
-                        if is_clipboard_image_shortcut(&key) && attach_clipboard_image(state) {
+                        if suppress_side_exit_key(
+                            &mut side_exit_key_guard,
+                            &key,
+                            Instant::now(),
+                        ) {
+                            state.disarm_quit();
+                            Action::None
+                        } else if is_clipboard_image_shortcut(&key) && attach_clipboard_image(state) {
                             Action::None
                         } else {
                             observe_composer_key(state, &mut composer_paste, key, Instant::now())
@@ -661,6 +670,7 @@ async fn event_loop(
     let mut indexed_cwd = None;
     let mut integration_key = None;
     let mut integration_rx = None;
+    let mut side_exit_key_guard = None;
     draw(state, renderer)?;
 
     loop {
@@ -716,7 +726,15 @@ async fn event_loop(
             terminal_event = terminal_events.next() => {
                 match terminal_event {
                     Some(Ok(Event::Key(key))) => {
-                        if is_clipboard_image_shortcut(&key) && attach_clipboard_image(state) {
+                        if suppress_side_exit_key(
+                            &mut side_exit_key_guard,
+                            &key,
+                            Instant::now(),
+                        ) {
+                            state.disarm_quit();
+                            renderer.clear_selection();
+                            Action::None
+                        } else if is_clipboard_image_shortcut(&key) && attach_clipboard_image(state) {
                             renderer.clear_selection();
                             Action::None
                         } else if key.code == KeyCode::Char('c')
@@ -882,7 +900,11 @@ async fn event_loop(
         // those events while the composer is collecting them; rendering is
         // much slower than parsing and used to make long pastes crawl.
         let redraw = !matches!(&action, Action::Tick(false)) && !composer_paste.is_buffering();
+        let returning_from_side = matches!(&action, Action::ReturnFromSide);
         let should_quit = execute_action(server, state, renderer, action).await?;
+        if returning_from_side {
+            side_exit_key_guard = Some(Instant::now() + SIDE_EXIT_KEY_SETTLE);
+        }
         if redraw {
             let animation_started = Instant::now();
             let animated =
@@ -902,6 +924,34 @@ async fn event_loop(
 }
 
 const WHEEL_ROWS: isize = 3;
+const SIDE_EXIT_KEY_SETTLE: Duration = Duration::from_millis(250);
+
+fn is_side_exit_key(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Esc
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
+/// Key-repeat records can remain queued while the parent thread is being
+/// resumed. Keep extending the guard while they arrive so a held close key can
+/// never become an interrupt or quit on the parent screen.
+fn suppress_side_exit_key(
+    guard: &mut Option<Instant>,
+    key: &KeyEvent,
+    now: Instant,
+) -> bool {
+    let Some(until) = *guard else {
+        return false;
+    };
+    if now >= until {
+        *guard = None;
+        return false;
+    }
+    if !is_side_exit_key(key) {
+        return false;
+    }
+    *guard = Some(now + SIDE_EXIT_KEY_SETTLE);
+    true
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum MouseRequest {
@@ -1347,12 +1397,23 @@ async fn execute_action(
         }
         Action::ReturnFromSide => {
             let child_thread = state.thread_id.clone();
+            let child_turn = state.turn_id.clone();
             let parent_thread = state.side_parent_thread_id().map(ToOwned::to_owned);
             // `thread/resume` rebuilds the view from stored history, which knows
             // nothing about a turn still in flight. Carry it across by hand.
             let parent_turn = state.take_side_parent_turn();
             if let Some(parent_thread) = parent_thread {
-                match resume_into_state(server, state, renderer, &parent_thread).await? {
+                // Only the ephemeral child IDs are used here; the parent turn
+                // remains untouched while its screen is restored.
+                if let Some(turn_id) = child_turn {
+                    let _ = server
+                        .request(
+                            "turn/interrupt",
+                            json!({ "threadId": child_thread, "turnId": turn_id }),
+                        )
+                        .await;
+                }
+                match resume_into_state(server, state, renderer, &parent_thread, true).await? {
                     Switched::Done(queued) => {
                         state.restore_turn(parent_turn);
                         if let Err(error) = server
@@ -1368,8 +1429,11 @@ async fn execute_action(
                         return finish_thread_switch(server, state, renderer, queued).await;
                     }
                     Switched::Quit => return Ok(true),
-                    // `resume_into_state` already posted the failure.
-                    Switched::Failed => {}
+                    // `resume_into_state` already posted the failure. Preserve
+                    // the marker so retrying Esc/Ctrl+C stays on this safe path.
+                    Switched::Failed => {
+                        state.restore_side_parent(parent_thread, parent_turn);
+                    }
                 }
             }
         }
@@ -2113,6 +2177,7 @@ async fn start_new_thread(
         renderer,
         previous_thread.clone(),
         server.request("thread/start", params),
+        None,
     )
     .await?
     {
@@ -2172,7 +2237,7 @@ async fn resume_thread(
             }
         };
 
-    match resume_into_state(server, state, renderer, &thread_id).await? {
+    match resume_into_state(server, state, renderer, &thread_id, false).await? {
         Switched::Done(queued) => finish_thread_switch(server, state, renderer, queued).await,
         Switched::Quit => Ok(true),
         Switched::Failed => Ok(false),
@@ -2196,6 +2261,7 @@ async fn resume_into_state(
     state: &mut AppState,
     renderer: &mut Renderer,
     thread_id: &str,
+    protect_side_exit_keys: bool,
 ) -> Result<Switched> {
     let previous_thread = state.thread_id.clone();
     renderer.clear_screen()?;
@@ -2209,6 +2275,7 @@ async fn resume_into_state(
         renderer,
         previous_thread.clone(),
         server.request("thread/resume", resume_thread_params(thread_id)),
+        protect_side_exit_keys.then(|| Instant::now() + SIDE_EXIT_KEY_SETTLE),
     )
     .await?
     {
@@ -2266,8 +2333,18 @@ async fn await_switch(
     renderer: &mut Renderer,
     previous_thread: String,
     request: impl Future<Output = Result<Value>>,
+    side_exit_key_guard: Option<Instant>,
 ) -> Result<Switch> {
-    match await_thread(server, state, renderer, request, read_account_plan(server)).await {
+    match await_thread(
+        server,
+        state,
+        renderer,
+        request,
+        read_account_plan(server),
+        side_exit_key_guard,
+    )
+    .await
+    {
         Ok(Startup::Ready {
             thread_response,
             queued,
@@ -4325,6 +4402,36 @@ mod tests {
             pick_action(&mut state, Pick::Effort(1)),
             Action::Tick(false)
         ));
+    }
+
+    #[test]
+    fn side_exit_key_guard_absorbs_repeats_until_the_key_settles() {
+        let base = Instant::now();
+        let mut guard = Some(base + SIDE_EXIT_KEY_SETTLE);
+        let ctrl_c = press(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let ordinary = press(KeyCode::Char('x'), KeyModifiers::NONE);
+
+        assert!(suppress_side_exit_key(
+            &mut guard,
+            &ctrl_c,
+            base + Duration::from_millis(200)
+        ));
+        assert!(suppress_side_exit_key(
+            &mut guard,
+            &ctrl_c,
+            base + Duration::from_millis(400)
+        ));
+        assert!(!suppress_side_exit_key(
+            &mut guard,
+            &ordinary,
+            base + Duration::from_millis(410)
+        ));
+        assert!(!suppress_side_exit_key(
+            &mut guard,
+            &ctrl_c,
+            base + Duration::from_millis(700)
+        ));
+        assert_eq!(guard, None);
     }
 
     /// A prompt sent before `thread/start` answers must not be dropped: it is held

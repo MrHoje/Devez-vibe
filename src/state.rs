@@ -3321,6 +3321,20 @@ impl AppState {
         self.busy = true;
     }
 
+    /// Restores the safe-return marker when resuming the parent fails. The side
+    /// thread stays current, and Esc/Ctrl+C must remain unable to reach the
+    /// ordinary interrupt/quit branches on the retry.
+    pub fn restore_side_parent(
+        &mut self,
+        thread_id: String,
+        turn: Option<(String, Instant)>,
+    ) {
+        self.side_parent = Some(SideParent {
+            thread_id,
+            turn: turn.map(|(id, started_at)| ParentTurn { id, started_at }),
+        });
+    }
+
     pub fn enter_side_thread(
         &mut self,
         thread_id: String,
@@ -3993,6 +4007,16 @@ impl AppState {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return Action::None;
         }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // In a full-screen `/btw` fork these are navigation keys, never process
+        // controls. Resolve them before pending prompts and the ordinary
+        // interrupt/quit branches so neither can consume the parent's turn.
+        if self.side_parent.is_some()
+            && (key.code == KeyCode::Esc || (key.code == KeyCode::Char('c') && ctrl))
+        {
+            self.disarm_quit();
+            return Action::ReturnFromSide;
+        }
         // Windows Korean IMEs may turn one Ctrl+Backspace chord into a stream
         // of repeat records while dismantling a composed syllable. A word
         // delete must stay one atomic editor operation.
@@ -4007,7 +4031,6 @@ impl AppState {
             return self.handle_pending_key(key);
         }
 
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
@@ -11456,6 +11479,54 @@ mod tests {
         assert!(state.busy);
         assert_eq!(state.turn_id.as_deref(), Some("live-turn"));
         assert!(state.turn_started_at.is_some());
+    }
+
+    #[test]
+    fn side_exit_keys_never_interrupt_or_quit_either_turn() {
+        let mut state = busy_state_with_live_turn();
+        state.enter_side_thread(
+            "fork-thread".to_owned(),
+            "cwd".to_owned(),
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+        state.set_turn_started("side-turn".to_owned());
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Esc)),
+            Action::ReturnFromSide
+        ));
+        assert!(matches!(state.handle_key(ctrl_c), Action::ReturnFromSide));
+        assert!(matches!(state.handle_key(ctrl_c), Action::ReturnFromSide));
+        assert_eq!(state.turn_id.as_deref(), Some("side-turn"));
+        assert!(!state.quit_armed());
+        assert_eq!(
+            state.take_side_parent_turn().map(|turn| turn.0),
+            Some("live-turn".to_owned())
+        );
+    }
+
+    #[test]
+    fn side_escape_closes_before_a_pending_approval_can_consume_it() {
+        let mut state = busy_state_with_live_turn();
+        state.enter_side_thread(
+            "fork-thread".to_owned(),
+            "cwd".to_owned(),
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+        state.begin_server_request(
+            json!(41),
+            "item/commandExecution/requestApproval",
+            &json!({ "command": "cargo test" }),
+        );
+
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Esc)),
+            Action::ReturnFromSide
+        ));
+        assert!(state.has_pending_interaction());
     }
 
     #[test]
