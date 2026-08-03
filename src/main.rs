@@ -723,6 +723,9 @@ async fn event_loop(
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                         {
                             if let Some(text) = renderer.selected_text() {
+                                // This Ctrl+C is a copy, so it neither arms nor
+                                // spends the quit.
+                                state.disarm_quit();
                                 renderer.clear_selection();
                                 Action::Copy(text)
                             } else {
@@ -758,7 +761,12 @@ async fn event_loop(
                         }
                         }
                     }
-                    Some(Ok(Event::Mouse(mouse))) => renderer_mouse_action(renderer, &mouse, |pick| pick_action(state, pick)),
+                    Some(Ok(Event::Mouse(mouse))) => {
+                        // Clicking or scrolling is input as well, so a Ctrl+C armed
+                        // before it must not be spent by the Ctrl+C after it.
+                        state.disarm_quit();
+                        renderer_mouse_action(renderer, &mouse, |pick| pick_action(state, pick))
+                    }
                     Some(Ok(Event::Paste(text))) => {
                         renderer.clear_selection();
                         flush_composer_paste(state, &mut composer_paste, Instant::now());

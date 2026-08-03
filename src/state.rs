@@ -41,6 +41,12 @@ const SPINNER: [&str; 8] = ["✢", "✳", "✶", "✻", "✽", "✻", "✶", "�
 const SHIMMER_PERIOD: Duration = Duration::from_millis(1_100);
 const PLAN_SHIMMER_DURATION: Duration = SHIMMER_PERIOD.saturating_mul(5);
 
+/// One-off notices (copy, reroute, …) sit in the status line this long.
+const NOTICE_TTL: Duration = Duration::from_millis(1_400);
+/// A second Ctrl+C only quits while its warning is still on screen, so the
+/// armed state and the notice share one window.
+const QUIT_ARM_WINDOW: Duration = Duration::from_secs(3);
+
 /// The permission presets Codex exposes through `/permissions`, cycled with Shift+Tab.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PermissionMode {
@@ -2471,7 +2477,9 @@ pub struct AppState {
     /// app-server has announced that the turn is active.
     pending_interrupt: bool,
     turn_interrupted: bool,
-    quit_armed: bool,
+    /// When the last Ctrl+C armed the quit. Stale arms expire with `QUIT_ARM_WINDOW`
+    /// so a Ctrl+C pressed long after the warning faded never quits on its own.
+    quit_armed_at: Option<Instant>,
     pub busy: bool,
     host_loading: bool,
     pub cwd: String,
@@ -2528,7 +2536,9 @@ pub struct AppState {
     side_parent: Option<SideParent>,
     last_assistant_markdown: Option<String>,
     composer_notice: Option<(String, Instant)>,
-    activity_notice: Option<(String, Instant)>,
+    /// Text, when it went up, and how long it stays. The quit warning needs a
+    /// longer window than the rest, so the lifetime rides along with the notice.
+    activity_notice: Option<(String, Instant, Duration)>,
     status_metadata_refreshed_at: Instant,
     response_length: ResponseLength,
     vibe_mode: VibeMode,
@@ -2610,7 +2620,7 @@ impl AppState {
             turn_id: None,
             pending_interrupt: false,
             turn_interrupted: false,
-            quit_armed: false,
+            quit_armed_at: None,
             busy: false,
             host_loading: false,
             cwd,
@@ -3251,11 +3261,30 @@ impl AppState {
     }
 
     pub fn set_copy_notice(&mut self) {
-        self.activity_notice = Some(("• Copied to clipboard".to_owned(), Instant::now()));
+        // Ctrl+C spent on a copy is not a quit attempt, so it cannot leave the
+        // quit armed behind for the next Ctrl+C to trip over.
+        self.disarm_quit();
+        self.activity_notice = Some(("• Copied to clipboard".to_owned(), Instant::now(), NOTICE_TTL));
     }
 
-    fn set_quit_notice(&mut self) {
-        self.activity_notice = Some(("• Ctrl+C 한 번 더 누르면 종료합니다.".to_owned(), Instant::now()));
+    /// Arms the quit and puts up the warning that spends the same window.
+    fn arm_quit(&mut self) {
+        self.quit_armed_at = Some(Instant::now());
+        self.activity_notice = Some((
+            "• Ctrl+C 한 번 더 누르면 종료합니다.".to_owned(),
+            Instant::now(),
+            QUIT_ARM_WINDOW,
+        ));
+    }
+
+    /// Any deliberate input other than a second Ctrl+C cancels the pending quit.
+    pub fn disarm_quit(&mut self) {
+        self.quit_armed_at = None;
+    }
+
+    fn quit_armed(&self) -> bool {
+        self.quit_armed_at
+            .is_some_and(|armed_at| armed_at.elapsed() < QUIT_ARM_WINDOW)
     }
 
     /// One-off events (skills reloaded, model rerouted, …) share the composer
@@ -3681,6 +3710,7 @@ impl AppState {
         self.last_assistant_markdown = None;
         self.composer_notice = None;
         self.activity_notice = None;
+        self.quit_armed_at = None;
         self.plan_summary = None;
         self.busy = false;
         self.turn_id = None;
@@ -3840,7 +3870,7 @@ impl AppState {
         if self
             .composer_notice
             .as_ref()
-            .is_some_and(|(_, shown_at)| shown_at.elapsed().as_millis() >= 1_400)
+            .is_some_and(|(_, shown_at)| shown_at.elapsed() >= NOTICE_TTL)
         {
             self.composer_notice = None;
             full_redraw = true;
@@ -3848,10 +3878,13 @@ impl AppState {
         if self
             .activity_notice
             .as_ref()
-            .is_some_and(|(_, shown_at)| shown_at.elapsed().as_millis() >= 1_400)
+            .is_some_and(|(_, shown_at, ttl)| shown_at.elapsed() >= *ttl)
         {
             self.activity_notice = None;
             full_redraw = true;
+        }
+        if !self.quit_armed() {
+            self.quit_armed_at = None;
         }
         TickResult {
             redraw: self.busy || plan_shimmer_active || full_redraw,
@@ -3880,6 +3913,8 @@ impl AppState {
     }
 
     fn handle_inserted_text(&mut self, text: &str, pasted: bool) {
+        // Pasted or buffered text is input, not a quit, so it disarms like a keypress.
+        self.disarm_quit();
         let old_text = self.editor.text();
         let binding_count = self.selected_completion_bindings.len();
         match &mut self.pending {
@@ -3943,7 +3978,7 @@ impl AppState {
         if !(key.code == KeyCode::Char('c')
             && key.modifiers.contains(KeyModifiers::CONTROL))
         {
-            self.quit_armed = false;
+            self.disarm_quit();
         }
         let old_text = self.editor.text();
         let binding_count = self.selected_completion_bindings.len();
@@ -4133,11 +4168,10 @@ impl AppState {
             }
             KeyCode::Char('c') if ctrl => {
                 if self.busy {
-                    if self.quit_armed {
+                    if self.quit_armed() {
                         Action::Quit
                     } else {
-                        self.quit_armed = true;
-                        self.set_quit_notice();
+                        self.arm_quit();
                         self.request_interrupt()
                     }
                 } else if self.editor.is_empty()
@@ -4146,14 +4180,16 @@ impl AppState {
                 {
                     Action::ReturnFromSide
                 } else if self.editor.is_empty() && self.composer_images.is_empty() {
-                    if self.quit_armed {
+                    if self.quit_armed() {
                         Action::Quit
                     } else {
-                        self.quit_armed = true;
-                        self.set_quit_notice();
+                        self.arm_quit();
                         Action::None
                     }
                 } else {
+                    // Clearing the composer is the action the user asked for, so the
+                    // quit does not stay armed behind it.
+                    self.disarm_quit();
                     self.editor.clear();
                     self.composer_images.clear();
                     Action::None
@@ -6861,8 +6897,10 @@ impl AppState {
     /// draw attention to a delay the user is about to spend typing through anyway.
     /// A prompt sent into that window still reports as `Working`, because it is.
     fn activity(&self) -> Option<String> {
-        if let Some((notice, _)) = &self.activity_notice {
-            return Some(notice.clone());
+        // An idle screen can go a long time between ticks, so the lifetime is
+        // enforced on read as well: a faded warning must not outlive its arm.
+        if let Some(notice) = self.live_activity_notice() {
+            return Some(notice.to_owned());
         }
         if self.busy {
             let elapsed = self
@@ -6881,8 +6919,17 @@ impl AppState {
             .map(|duration| format!("Completed ({})", format_elapsed(duration.as_secs())))
     }
 
+    fn live_activity_notice(&self) -> Option<&str> {
+        self.activity_notice
+            .as_ref()
+            .filter(|(_, shown_at, ttl)| shown_at.elapsed() < *ttl)
+            .map(|(notice, _, _)| notice.as_str())
+    }
+
     fn activity_model(&self) -> Option<String> {
-        if self.activity_notice.is_some() || (!self.busy && self.last_completed_duration.is_none()) {
+        if self.live_activity_notice().is_some()
+            || (!self.busy && self.last_completed_duration.is_none())
+        {
             return None;
         }
         // The activity label is UI chrome, so it tracks the model currently
@@ -11648,6 +11695,90 @@ mod tests {
             state.activity().as_deref(),
             Some("• Ctrl+C 한 번 더 누르면 종료합니다.")
         );
+        assert!(matches!(state.handle_key(ctrl_c), Action::Quit));
+    }
+
+    #[test]
+    fn a_stale_quit_arm_expires_instead_of_quitting() {
+        let mut state = test_state();
+        state.set_turn_started("turn-1".to_owned());
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        assert!(matches!(state.handle_key(ctrl_c), Action::Interrupt));
+        // The warning has long faded by the time the next Ctrl+C arrives.
+        state.quit_armed_at = Some(Instant::now() - QUIT_ARM_WINDOW - Duration::from_secs(1));
+
+        assert!(matches!(state.handle_key(ctrl_c), Action::Interrupt));
+        assert_eq!(
+            state.activity().as_deref(),
+            Some("• Ctrl+C 한 번 더 누르면 종료합니다.")
+        );
+    }
+
+    #[test]
+    fn the_quit_warning_stays_up_as_long_as_the_arm() {
+        let mut state = test_state();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        assert!(matches!(state.handle_key(ctrl_c), Action::None));
+        let (_, shown_at, ttl) = state.activity_notice.clone().expect("quit notice");
+        assert_eq!(ttl, QUIT_ARM_WINDOW);
+
+        // Past the ordinary notice window the warning is still there, because the
+        // quit is still armed.
+        state.activity_notice = Some((
+            "• Ctrl+C 한 번 더 누르면 종료합니다.".to_owned(),
+            shown_at - NOTICE_TTL - Duration::from_millis(100),
+            ttl,
+        ));
+        assert_eq!(
+            state.activity().as_deref(),
+            Some("• Ctrl+C 한 번 더 누르면 종료합니다.")
+        );
+        assert!(state.quit_armed());
+    }
+
+    #[test]
+    fn a_faded_quit_warning_is_not_shown_between_ticks() {
+        let mut state = test_state();
+        state.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        let (notice, shown_at, ttl) = state.activity_notice.clone().expect("quit notice");
+        state.activity_notice = Some((notice, shown_at - ttl - Duration::from_millis(1), ttl));
+
+        assert_eq!(state.activity(), None);
+    }
+
+    #[test]
+    fn copying_and_typing_both_disarm_the_quit() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        let mut copied = test_state();
+        assert!(matches!(copied.handle_key(ctrl_c), Action::None));
+        copied.set_copy_notice();
+        assert!(!copied.quit_armed());
+        assert!(matches!(copied.handle_key(ctrl_c), Action::None));
+
+        let mut pasted = test_state();
+        assert!(matches!(pasted.handle_key(ctrl_c), Action::None));
+        pasted.handle_paste("hello");
+        assert!(!pasted.quit_armed());
+        // The composer now has text, so Ctrl+C clears it rather than quitting.
+        assert!(matches!(pasted.handle_key(ctrl_c), Action::None));
+        assert!(pasted.editor.is_empty());
+        assert!(!pasted.quit_armed());
+    }
+
+    #[test]
+    fn clearing_the_composer_with_ctrl_c_does_not_leave_the_quit_armed() {
+        let mut state = test_state();
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        state.handle_paste("draft");
+
+        assert!(matches!(state.handle_key(ctrl_c), Action::None));
+        assert!(state.editor.is_empty());
+        assert!(!state.quit_armed());
+        // The first Ctrl+C on the now-empty composer only arms the quit.
+        assert!(matches!(state.handle_key(ctrl_c), Action::None));
         assert!(matches!(state.handle_key(ctrl_c), Action::Quit));
     }
 
