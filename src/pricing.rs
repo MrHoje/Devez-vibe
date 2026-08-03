@@ -106,13 +106,27 @@ const CACHE_READ_MULTIPLIER: f64 = 0.1;
 /// model slug. Ordered most specific first: `gpt-5.6-luna` has to be tested
 /// before `gpt-5.6`, or the tier would fall through to the generic rate.
 const PRICES: &[(&str, f64, f64)] = &[
-    ("gpt-5.6-terra", 2.5, 15.0),
-    ("gpt-5.6-luna", 1.0, 6.0),
+    // GPT (Codex) — terra and luna were cut on 2026-07-30.
+    ("gpt-5.6-terra", 2.0, 12.0),
+    ("gpt-5.6-luna", 0.2, 1.2),
     ("gpt-5.6", 5.0, 30.0),
     ("gpt-5.5", 5.0, 30.0),
     ("gpt-5.3-codex", 1.75, 14.0),
     ("codex", 1.25, 10.0),
     ("gpt-5", 1.25, 10.0),
+    // Claude — list prices; Sonnet 5 carries an intro rate, see the knowledge doc.
+    ("claude-fable-5", 10.0, 50.0),
+    ("claude-mythos", 10.0, 50.0),
+    ("claude-opus-5", 5.0, 25.0),
+    ("claude-opus-4-8", 5.0, 25.0),
+    ("claude-opus-4-7", 5.0, 25.0),
+    ("claude-opus-4-6", 5.0, 25.0),
+    ("claude-opus-4-5", 5.0, 25.0),
+    ("claude-opus-4-1", 15.0, 75.0),
+    ("claude-sonnet-5", 3.0, 15.0),
+    ("claude-sonnet-4-6", 3.0, 15.0),
+    ("claude-sonnet-4-5", 3.0, 15.0),
+    ("claude-haiku-4-5", 1.0, 5.0),
 ];
 
 /// Estimated dollars for `totals` at `model`'s rates, or `None` when the model
@@ -178,10 +192,13 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(estimate_usd("gpt-5.6-luna", totals), Some(7.0));
-        assert_eq!(estimate_usd("gpt-5.6-terra", totals), Some(17.5));
+        assert_eq!(estimate_usd("gpt-5.6-luna", totals), Some(1.4));
+        assert_eq!(estimate_usd("gpt-5.6-terra", totals), Some(14.0));
         assert_eq!(estimate_usd("gpt-5.6-sol", totals), Some(35.0));
         assert_eq!(estimate_usd("gpt-5.3-codex", totals), Some(15.75));
+        assert_eq!(estimate_usd("claude-opus-5", totals), Some(30.0));
+        assert_eq!(estimate_usd("claude-sonnet-5", totals), Some(18.0));
+        assert_eq!(estimate_usd("claude-opus-4-1", totals), Some(90.0));
         assert_eq!(estimate_usd("unlisted-model", totals), None);
     }
 
@@ -224,6 +241,7 @@ mod tests {
             },
         );
 
-        assert_eq!(ledger.estimate_usd(), Some(7.5));
+        // 1M input on sol ($5) + the 1M delta on terra ($2).
+        assert_eq!(ledger.estimate_usd(), Some(7.0));
     }
 }

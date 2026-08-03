@@ -981,7 +981,8 @@ mod tests {
 {"timestamp":"4","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2000000,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0}}}}"#,
         );
 
-        assert_eq!(ledger.estimate_usd(), Some(7.5));
+        // 1M input on sol ($5) + the 1M delta on terra ($2).
+        assert_eq!(ledger.estimate_usd(), Some(7.0));
     }
 
     #[test]
@@ -1031,7 +1032,7 @@ mod tests {
 
         assert_eq!(
             load_cost_ledger(&home, "thread-cost").and_then(|ledger| ledger.estimate_usd()),
-            Some(7.5)
+            Some(7.0)
         );
         fs::remove_dir_all(&home).ok();
     }

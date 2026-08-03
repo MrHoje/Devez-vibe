@@ -12971,7 +12971,8 @@ mod tests {
             }),
         );
 
-        assert_eq!(state.composer_mode().cost.as_deref(), Some("$7.50"));
+        // 1M input on sol ($5) + the 1M delta on terra ($2).
+        assert_eq!(state.composer_mode().cost.as_deref(), Some("$7.00"));
     }
 
     #[test]
