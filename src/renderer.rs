@@ -5460,19 +5460,14 @@ fn block_lines_with_mode(
             .strip_prefix("- ")
             .or_else(|| trimmed.strip_prefix("* "))
         {
-            let continuation_prefix = if conversational { "- " } else { "  - " };
-            let (prefix, prefix_tone) = if conversational {
-                first_content = false;
-                ("- ".to_owned(), Tone::Plain)
-            } else {
-                body_prefix(
-                    &mut first_content,
-                    marker,
-                    tone,
-                    continuation_prefix,
-                    Tone::Plain,
-                )
-            };
+            let continuation_prefix = if conversational { "  " } else { "  - " };
+            let (prefix, prefix_tone) = body_prefix(
+                &mut first_content,
+                marker,
+                tone,
+                continuation_prefix,
+                Tone::Plain,
+            );
             lines.extend(markdown_line(
                 &prefix,
                 prefix_tone,
@@ -9343,7 +9338,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_list_uses_flush_hyphens_without_a_response_marker() {
+    fn assistant_list_keeps_the_response_marker_without_hyphens() {
         CHAT_LAYOUT.store(false, Ordering::Relaxed);
         let lines = block_lines_with_expansion(
             &Block::new(BlockKind::Assistant, "Codex", "- first\n- second"),
@@ -9359,8 +9354,8 @@ mod tests {
             .iter()
             .find(|line| line.text.trim() == "first")
             .expect("first list item");
-        assert_eq!(first_item.prefix, "- ");
-        assert_eq!(second_item.prefix, "- ");
+        assert_eq!(first_item.prefix, "• ");
+        assert_eq!(second_item.prefix, "  ");
         CHAT_LAYOUT.store(true, Ordering::Relaxed);
     }
 
