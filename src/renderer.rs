@@ -954,7 +954,7 @@ impl Renderer {
         }
         let row = row.min(self.previous_lines.len().saturating_sub(1) as u16);
         let line = &self.previous_lines[usize::from(row)];
-        if matches!(line.tone, Tone::AssistantBubbleHalf) {
+        if matches!(line.tone, Tone::AssistantBubbleHalf | Tone::UserPromptPadding) {
             return None;
         }
         let width = painted_line_width(line).max(
@@ -1935,7 +1935,7 @@ fn paint_line_into_frame(
     let background = row_background(line.tone);
     let bubble_background = bubble_background(line);
     if let Some(background) = background {
-        let (start, right) = if matches!(line.tone, Tone::UserPrompt) {
+        let (start, right) = if matches!(line.tone, Tone::UserPrompt | Tone::UserPromptPadding) {
             let prefix_width = UnicodeWidthStr::width(line.prefix.as_str());
             let start = if CHAT_LAYOUT.load(Ordering::Relaxed) {
                 let marker_width = usize::from(line.prefix.ends_with("› "))
@@ -2310,6 +2310,7 @@ enum Tone {
     StatusText,
     StatusSeparator,
     UserPrompt,
+    UserPromptPadding,
     AssistantBubble,
     AssistantBubbleHalf,
     Model56,
@@ -2480,6 +2481,19 @@ impl PaintLine {
 
     fn blank() -> Self {
         Self::plain("")
+    }
+
+    fn user_prompt_padding(width: usize) -> Self {
+        Self {
+            prefix: String::new(),
+            prefix_tone: Tone::Plain,
+            text: " ".repeat(width),
+            tone: Tone::UserPromptPadding,
+            bold: false,
+            tool_heading: None,
+            pick: None,
+            tail: Vec::new(),
+        }
     }
 
     /// Makes single spans of an already-built row clickable. `picks` addresses
@@ -2924,7 +2938,7 @@ fn selection_columns_for_line(
     row: usize,
 ) -> Option<Range<usize>> {
     // A bubble's rounded edge rows are chrome, not text.
-    if matches!(line.tone, Tone::AssistantBubbleHalf) {
+    if matches!(line.tone, Tone::AssistantBubbleHalf | Tone::UserPromptPadding) {
         return None;
     }
     let mut selected = range.columns_for_row(row, painted_line_width(line))?;
@@ -5766,6 +5780,14 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
                 )
             })
             .collect::<Vec<_>>();
+        let padding_width = usize::from(width).saturating_sub(2);
+        let mut top = PaintLine::user_prompt_padding(padding_width);
+        top.prefix = "▌ ".to_owned();
+        top.prefix_tone = Tone::Accent;
+        let bottom = top.clone();
+        let mut lines = lines;
+        lines.insert(0, top);
+        lines.push(bottom);
         return lines;
     }
     const RIGHT_GAP: usize = 0;
@@ -5827,6 +5849,12 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         );
         line.prefix_tone = marker_tone;
     }
+    let mut top = PaintLine::user_prompt_padding(bubble_width);
+    top.prefix = half_prefix.clone();
+    let mut bottom = PaintLine::user_prompt_padding(bubble_width);
+    bottom.prefix = half_prefix;
+    lines.insert(0, top);
+    lines.push(bottom);
     lines
 }
 
@@ -7291,7 +7319,7 @@ fn hover_repaint_columns(
 fn row_background(tone: Tone) -> Option<Rgb> {
     let palette = theme::palette();
     Some(match tone {
-        Tone::UserPrompt if !CHAT_LAYOUT.load(Ordering::Relaxed) => {
+        Tone::UserPrompt | Tone::UserPromptPadding if !CHAT_LAYOUT.load(Ordering::Relaxed) => {
             palette.user_prompt_bg
         }
         Tone::ModelChange => palette.model_change_bg,
@@ -7320,7 +7348,7 @@ fn bubble_background(line: &PaintLine) -> Option<Rgb> {
 fn word_background(tone: Tone) -> Option<Rgb> {
     let palette = theme::palette();
     Some(match tone {
-        Tone::UserPrompt if CHAT_LAYOUT.load(Ordering::Relaxed) => {
+        Tone::UserPrompt | Tone::UserPromptPadding if CHAT_LAYOUT.load(Ordering::Relaxed) => {
             palette.user_prompt_bg
         }
         Tone::AssistantBubble | Tone::AssistantBubbleHalf => assistant_bubble_background(),
@@ -7639,6 +7667,7 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::StatusText => palette.status.text,
         Tone::StatusSeparator => palette.status.separator,
         Tone::UserPrompt => palette.foreground,
+        Tone::UserPromptPadding => palette.user_prompt_bg,
         Tone::AssistantBubble => palette.foreground,
         Tone::AssistantBubbleHalf => blend(palette.background, palette.foreground, 20),
         Tone::Model56 => palette.model_gpt56,
@@ -8595,13 +8624,14 @@ mod tests {
     }
 
     #[test]
-    fn user_prompt_bubble_starts_selection_on_its_first_text_row() {
+    fn user_prompt_bubble_cannot_start_selection_outside_its_text() {
         let lines = block_lines(&Block::new(BlockKind::User, "You", "prompt"), 80);
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
         renderer.previous_lines = lines;
 
         assert!(!renderer.begin_selection(0, 0));
-        assert!(renderer.begin_selection(72, 0));
+        assert!(!renderer.begin_selection(72, 0));
+        assert!(renderer.begin_selection(72, 1));
     }
 
     #[test]
@@ -8866,14 +8896,14 @@ mod tests {
         CHAT_LAYOUT.store(false, Ordering::Relaxed);
         let lines = user_prompt_lines(&Block::new(BlockKind::User, "You", "first\nsecond"), 80);
         let range = CellRange {
-            start: CellPosition { column: 2, row: 0 },
+            start: CellPosition { column: 2, row: 1 },
             end: CellPosition {
-                column: painted_line_width(&lines[1]).saturating_sub(1) as u16,
-                row: 1,
+                column: painted_line_width(&lines[2]).saturating_sub(1) as u16,
+                row: 2,
             },
         };
 
-        assert_eq!(selection_columns_for_line(&lines[1], range, 1), Some(2..8));
+        assert_eq!(selection_columns_for_line(&lines[2], range, 2), Some(2..8));
     }
 
     #[test]
@@ -8887,18 +8917,20 @@ mod tests {
             false,
         );
 
-        assert_eq!(lines.len(), 3);
+        assert_eq!(lines.len(), 5);
         // Every row is filled out to the longest one so the bubble paints square.
-        assert_eq!(lines[0].text, "first   ");
-        assert_eq!(lines[1].text, "second  ");
-        assert!(lines[0].prefix.ends_with("› "));
-        assert!(lines[2] == PaintLine::blank());
+        assert_eq!(lines[0].tone, Tone::UserPromptPadding);
+        assert_eq!(lines[1].text, "first   ");
+        assert_eq!(lines[2].text, "second  ");
+        assert!(lines[1].prefix.ends_with("› "));
+        assert_eq!(lines[3].tone, Tone::UserPromptPadding);
+        assert!(lines[4] == PaintLine::blank());
 
         let selection = CellRange {
-            start: CellPosition { column: 71, row: 0 },
-            end: CellPosition { column: 77, row: 1 },
+            start: CellPosition { column: 71, row: 1 },
+            end: CellPosition { column: 77, row: 2 },
         };
-        assert_ne!(selection_columns_for_line(&lines[0], selection, 0), None);
+        assert_eq!(selection_columns_for_line(&lines[0], selection, 0), None);
         assert_ne!(selection_columns_for_line(&lines[1], selection, 1), None);
     }
 
@@ -8907,11 +8939,13 @@ mod tests {
         CHAT_LAYOUT.store(true, Ordering::Relaxed);
         let lines = user_prompt_lines(&Block::new(BlockKind::User, "You", "longest line\nshort"), 80);
 
-        assert_eq!(UnicodeWidthStr::width(lines[0].prefix.as_str()), UnicodeWidthStr::width(lines[1].prefix.as_str()));
-        assert_eq!(painted_line_width(&lines[0]), painted_line_width(&lines[1]));
-        assert_eq!(lines[1].text.trim(), "short");
-        assert!(lines[0].prefix.ends_with("› "));
-        assert!(lines[1].prefix.ends_with("  "));
+        assert_eq!(lines[0].tone, Tone::UserPromptPadding);
+        assert_eq!(UnicodeWidthStr::width(lines[1].prefix.as_str()), UnicodeWidthStr::width(lines[2].prefix.as_str()));
+        assert_eq!(painted_line_width(&lines[1]), painted_line_width(&lines[2]));
+        assert_eq!(lines[2].text.trim(), "short");
+        assert!(lines[1].prefix.ends_with("› "));
+        assert!(lines[2].prefix.ends_with("  "));
+        assert_eq!(lines[3].tone, Tone::UserPromptPadding);
     }
 
     #[test]
