@@ -762,11 +762,48 @@ function prepareTaskPlanForCreate(tasks, subject) {
   if (numberedTaskIndex(subject) === 1) tasks.clear();
 }
 
-function applyTaskUpdate(tasks, input, turnId) {
+function applyTaskUpdate(tasks, input, turnId, onIntermediate) {
   const task = tasks.get(String(input.taskId));
   if (!task) return false;
   if (input.subject) task.subject = input.subject;
-  if (input.status) task.status = input.status;
+  const status = input.status;
+  if (status === "in_progress" || status === "completed") {
+    const entries = [...tasks.values()];
+    const targetIndex = entries.indexOf(task);
+
+    // Claude occasionally closes a later pending task at the end of a turn
+    // without ever starting it. Keep the visible plan truthful and sequential:
+    // every skipped predecessor and the target itself pass through in_progress.
+    for (let index = 0; index < targetIndex; index++) {
+      const previous = entries[index];
+      if (previous.status === "completed") continue;
+      if (previous.status !== "in_progress") {
+        previous.status = "in_progress";
+        previous.turnId = turnId;
+        onIntermediate?.();
+      }
+      previous.status = "completed";
+      previous.turnId = turnId;
+      onIntermediate?.();
+    }
+
+    for (let index = 0; index < entries.length; index++) {
+      const other = entries[index];
+      if (other === task || other.status !== "in_progress") continue;
+      other.status = index < targetIndex ? "completed" : "pending";
+      other.turnId = turnId;
+      onIntermediate?.();
+    }
+
+    if (status === "completed" && task.status !== "in_progress" && task.status !== "completed") {
+      task.status = "in_progress";
+      task.turnId = turnId;
+      onIntermediate?.();
+    }
+    task.status = status;
+  } else if (status) {
+    task.status = status;
+  }
   task.turnId = turnId;
   return true;
 }
@@ -793,7 +830,7 @@ function updatePlanFromToolUse(session, name, toolUseId, input) {
       turnId,
     });
   } else if (name === "TaskUpdate") {
-    applyTaskUpdate(session.tasks, input, turnId);
+    applyTaskUpdate(session.tasks, input, turnId, () => emitPlan(session));
   }
   emitPlan(session);
 }
@@ -1686,6 +1723,25 @@ async function runSelfTest() {
     || restoredTasks.get("27")?.status !== "in_progress"
     || [...restoredTasks.values()].filter((task) => task.status === "in_progress").length !== 1) {
     throw new Error(`Claude sequential task update self-test failed: ${JSON.stringify([...restoredTasks])}`);
+  }
+  const skippedTasks = new Map([
+    ["1", { id: "1", subject: "1. 조사", status: "pending" }],
+    ["2", { id: "2", subject: "2. 분석", status: "pending" }],
+    ["3", { id: "3", subject: "3. 검증", status: "pending" }],
+  ]);
+  const transitions = [];
+  const snapshot = () => transitions.push([...skippedTasks.values()].map((task) => task.status).join(","));
+  applyTaskUpdate(skippedTasks, { taskId: "3", status: "completed" }, "turn", snapshot);
+  snapshot();
+  if (transitions.join("|") !== [
+    "in_progress,pending,pending",
+    "completed,pending,pending",
+    "completed,in_progress,pending",
+    "completed,completed,pending",
+    "completed,completed,in_progress",
+    "completed,completed,completed",
+  ].join("|")) {
+    throw new Error(`Claude skipped task transition self-test failed: ${transitions.join("|")}`);
   }
   const mixedPlans = new Map([
     ["old-1", { subject: "1. 이전 작업", status: "completed" }],
