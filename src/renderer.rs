@@ -2856,15 +2856,10 @@ fn shimmer_repaint_columns(previous: &PaintLine, current: &PaintLine) -> Option<
     Some(start..end)
 }
 
-/// The composer frame keeps blank side columns, so a prompt row is recognised by
-/// its gutter, prompt marker, and the three spans it always paints: content,
-/// right-hand fill, then the reserved edge column. None of that chrome is text.
+/// The composer frame is printable so it stays stable across terminal themes,
+/// but its side rules, prompt gutter, and right-hand fill are not prompt text.
 fn composer_content_columns(line: &PaintLine) -> Option<Range<usize>> {
-    let framed = line.prefix == COMPOSER_SIDE_PREFIX
-        && (line.text == COMPOSER_FIRST_PREFIX || line.text == COMPOSER_CONTINUATION_PREFIX)
-        && line.tail.len() == 3
-        && line.tail.last().is_some_and(|span| span.text == " ");
-    framed.then(|| {
+    (line.prefix == "│ " && line.tail.last().is_some_and(|span| span.text == "│")).then(|| {
         let prefix_width = UnicodeWidthStr::width(line.prefix.as_str());
         let start = prefix_width + 2;
         let content_width = line
@@ -3980,6 +3975,9 @@ fn overlay_frame_with_expansion(
                     } else {
                         "│     "
                     };
+                    // A detail line folds back under itself, not under the label
+                    // above it, so its own indent is the continuation indent.
+                    let continuation = if part_index == 0 { "│   " } else { "│     " };
                     let tone = if row.muted {
                         Tone::Muted
                     } else if part.contains('●') && part.contains('○') {
@@ -3989,7 +3987,7 @@ fn overlay_frame_with_expansion(
                     };
                     let wrapped = wrapped_line_with_continuation(
                         prefix,
-                        "│   ",
+                        continuation,
                         Tone::Border,
                         part,
                         tone,
@@ -4096,13 +4094,23 @@ fn overlay_frame_with_expansion(
                     } else {
                         "│     "
                     };
+                    // A detail line folds back under itself, not under the label
+                    // above it, so its own indent is the continuation indent.
+                    let continuation = if part_index == 0 { "│   " } else { "│     " };
+                    // The line under a label is that label's detail, not a claim
+                    // of its own: it reads as the quieter half of one row.
+                    let tone = if row.muted || part_index > 0 {
+                        Tone::Muted
+                    } else {
+                        Tone::Plain
+                    };
                     // Reserve the closing border before wrapping, not after.
                     let wrapped = wrapped_line_with_continuation(
                         prefix,
-                        "│   ",
+                        continuation,
                         Tone::Border,
                         part,
-                        if row.muted { Tone::Muted } else { Tone::Plain },
+                        tone,
                         row.selected && part_index == 0,
                         (panel_width.saturating_sub(1)).min(u16::MAX as usize) as u16,
                     );
@@ -6471,9 +6479,9 @@ fn input_lines_with_controls(
     let (display, editor_cursor) = composer_display(editor, composer_images);
     let display_chars = display.chars().collect::<Vec<_>>();
     let panel_width = (width as usize).saturating_sub(1).max(16);
-    let side_prefix = COMPOSER_SIDE_PREFIX;
-    let first_prefix = COMPOSER_FIRST_PREFIX;
-    let continuation_prefix = COMPOSER_CONTINUATION_PREFIX;
+    let side_prefix = "│ ";
+    let first_prefix = "> ";
+    let continuation_prefix = "  ";
     let content_width = panel_width
         .saturating_sub(
             UnicodeWidthStr::width(side_prefix)
@@ -6574,7 +6582,7 @@ fn input_lines_with_controls(
                     bold: false,
                 },
                 PaintSpan {
-                    text: " ".to_owned(),
+                    text: "│".to_owned(),
                     tone: chrome_tone,
                     bold: false,
                 },
@@ -6587,14 +6595,6 @@ fn input_lines_with_controls(
 
     (rows, cursor_row + 1, cursor_column)
 }
-
-/// No vertical rules: the composer is framed by the top and bottom rules only, so
-/// the prompt marker starts at the left edge with no gutter ahead of it.
-const COMPOSER_SIDE_PREFIX: &str = "";
-/// Prompt marker on the composer's first row.
-const COMPOSER_FIRST_PREFIX: &str = "> ";
-/// Indentation wrapped composer rows keep under the prompt marker.
-const COMPOSER_CONTINUATION_PREFIX: &str = "  ";
 
 /// Shortest rule stub kept on the composer top line so the frame never collapses.
 const COMPOSER_RULE_MIN: usize = 4;
@@ -6684,17 +6684,21 @@ fn input_top_line_with_controls(
     // side of it keeps the border colour while the label itself stays muted —
     // the same split `panel_rule_row` uses for a card title.
     if left.is_empty() {
-        return PaintLine {
-            prefix: String::new(),
-            prefix_tone: chrome_tone,
-            text: fill,
-            tone: chrome_tone,
-            bold: false,
-            tool_heading: None,
-            pick: None,
-            tail,
-        }
-        .with_picks(&picks);
+        return corner_composer_rule(
+            PaintLine {
+                prefix: String::new(),
+                prefix_tone: chrome_tone,
+                text: fill,
+                tone: chrome_tone,
+                bold: false,
+                tool_heading: None,
+                pick: None,
+                tail,
+            }
+            .with_picks(&picks),
+            '╭',
+            '╮',
+        );
     }
     let spans = [
         PaintSpan {
@@ -6708,17 +6712,21 @@ fn input_top_line_with_controls(
             bold: false,
         },
     ];
-    PaintLine {
-        prefix: String::new(),
-        prefix_tone: chrome_tone,
-        text: OPENING_RULE.to_owned(),
-        tone: chrome_tone,
-        bold: false,
-        tool_heading: None,
-        pick: None,
-        tail: spans.into_iter().chain(tail).collect(),
-    }
-    .with_picks(&picks)
+    corner_composer_rule(
+        PaintLine {
+            prefix: String::new(),
+            prefix_tone: chrome_tone,
+            text: OPENING_RULE.to_owned(),
+            tone: chrome_tone,
+            bold: false,
+            tool_heading: None,
+            pick: None,
+            tail: spans.into_iter().chain(tail).collect(),
+        }
+        .with_picks(&picks),
+        '╭',
+        '╮',
+    )
 }
 
 fn input_bottom_line(
@@ -6728,50 +6736,78 @@ fn input_bottom_line(
 ) -> PaintLine {
     let chrome_tone = composer_chrome_tone(mode);
     let Some(notice) = notice else {
-        return PaintLine {
-            prefix: String::new(),
-            prefix_tone: chrome_tone,
-            text: "─".repeat(panel_width),
-            tone: chrome_tone,
-            bold: false,
-            tool_heading: None,
-            pick: None,
-            tail: Vec::new(),
-        };
+        return corner_composer_rule(
+            PaintLine {
+                prefix: String::new(),
+                prefix_tone: chrome_tone,
+                text: "─".repeat(panel_width),
+                tone: chrome_tone,
+                bold: false,
+                tool_heading: None,
+                pick: None,
+                tail: Vec::new(),
+            },
+            '╰',
+            '╯',
+        );
     };
 
     let reserved = COMPOSER_NOTICE_GAP + 1 + COMPOSER_NOTICE_TAIL_RULE;
     let notice = compact_right(notice, panel_width.saturating_sub(reserved));
     let fill =
         "─".repeat(panel_width.saturating_sub(UnicodeWidthStr::width(notice.as_str()) + reserved));
-    PaintLine {
-        prefix: String::new(),
-        prefix_tone: chrome_tone,
-        text: fill,
-        tone: chrome_tone,
-        bold: false,
-        tool_heading: None,
-        pick: None,
-        tail: vec![
-            rule_gap(COMPOSER_NOTICE_GAP),
-            PaintSpan {
-                text: notice,
-                tone: Tone::Accent,
-                bold: false,
-            },
-            rule_gap(1),
-            PaintSpan {
-                text: "─".repeat(COMPOSER_NOTICE_TAIL_RULE),
-                tone: chrome_tone,
-                bold: false,
-            },
-        ],
-    }
+    corner_composer_rule(
+        PaintLine {
+            prefix: String::new(),
+            prefix_tone: chrome_tone,
+            text: fill,
+            tone: chrome_tone,
+            bold: false,
+            tool_heading: None,
+            pick: None,
+            tail: vec![
+                rule_gap(COMPOSER_NOTICE_GAP),
+                PaintSpan {
+                    text: notice,
+                    tone: Tone::Accent,
+                    bold: false,
+                },
+                rule_gap(1),
+                PaintSpan {
+                    text: "─".repeat(COMPOSER_NOTICE_TAIL_RULE),
+                    tone: chrome_tone,
+                    bold: false,
+                },
+            ],
+        },
+        '╰',
+        '╯',
+    )
 }
 
 fn composer_chrome_tone(mode: Option<&ComposerMode>) -> Tone {
     mode.and_then(|mode| model_tone(&mode.model))
         .unwrap_or(Tone::Border)
+}
+
+/// Turns the outermost rule cells into the same closed corners the welcome card
+/// uses, without changing the width or shifting clickable composer badges.
+fn corner_composer_rule(mut line: PaintLine, left: char, right: char) -> PaintLine {
+    if line.text.starts_with('─') {
+        line.text
+            .replace_range(0..'─'.len_utf8(), &left.to_string());
+    }
+    let last = line
+        .tail
+        .iter_mut()
+        .rev()
+        .find(|span| !span.text.is_empty())
+        .map(|span| &mut span.text)
+        .unwrap_or(&mut line.text);
+    if let Some((index, _)) = last.char_indices().last() {
+        last.replace_range(index.., &right.to_string());
+    }
+    line
 }
 
 /// Widest badge that fits in `budget`: response length · Shell display mode ·
@@ -8119,7 +8155,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_rows_render_between_two_open_rules() {
+    fn composer_rows_render_as_a_closed_box() {
         let mut editor = Editor::default();
         editor.set_text("wrapped-prompt-text");
 
@@ -8128,17 +8164,17 @@ mod tests {
 
         assert!(prompt_rows.len() > 1);
         assert!(!rows[0].text.contains("Message"));
-        assert_eq!(painted(&rows[0]), "─────────────────");
+        assert_eq!(painted(&rows[0]), "╭───────────────╮");
         // Both rules are drawn in the same border colour the welcome card uses.
         assert!(rows[0].tone == Tone::Border);
         assert!(rows.last().is_some_and(|row| row.tone == Tone::Border));
-        // The IME gutter keeps three columns clear at the right edge, so the text
-        // wraps that much earlier even without a side rule.
-        assert_eq!(painted(&prompt_rows[0]), "> wrapped-pro    ");
-        assert_eq!(painted(&prompt_rows[1]), "  mpt-text       ");
+        // The IME gutter keeps three columns clear before the right border, so
+        // the text wraps that much earlier.
+        assert_eq!(painted(&prompt_rows[0]), "│ > wrapped-p   │");
+        assert_eq!(painted(&prompt_rows[1]), "│   rompt-tex   │");
         assert_eq!(
             painted(rows.last().expect("bottom rule")),
-            "─────────────────"
+            "╰───────────────╯"
         );
     }
 
@@ -8150,18 +8186,18 @@ mod tests {
         let (rows, cursor_row, cursor_col) =
             input_lines(&editor, &[], 18, "", "placeholder", None, None);
 
-        assert_eq!((cursor_row, cursor_col), (2, 4));
+        assert_eq!((cursor_row, cursor_col), (2, 8));
         assert!(painted(&rows[1]).contains("가가가가"));
-        assert!(painted(&rows[2]).contains("가"));
+        assert!(painted(&rows[2]).contains("가가"));
         assert!(rows.iter().all(|row| painted_width(row) == 17));
 
         editor.set_text("가가가가가가나");
         let (rows, cursor_row, cursor_col) =
             input_lines(&editor, &[], 18, "", "placeholder", None, None);
 
-        assert_eq!((cursor_row, cursor_col), (2, 6));
+        assert_eq!((cursor_row, cursor_col), (2, 10));
         assert!(painted(&rows[1]).contains("가가가가"));
-        assert!(painted(&rows[2]).contains("가나"));
+        assert!(painted(&rows[2]).contains("가가나"));
         assert!(rows.iter().all(|row| painted_width(row) == 17));
     }
 
@@ -8179,7 +8215,7 @@ mod tests {
         let (_, cursor_row, cursor_col) =
             input_lines(&editor, &[], 18, "", "placeholder", None, None);
 
-        assert_eq!((cursor_row, cursor_col), (3, 4));
+        assert_eq!((cursor_row, cursor_col), (3, 10));
     }
 
     #[test]
@@ -8208,7 +8244,7 @@ mod tests {
             end: CellPosition { column: 16, row: 1 },
         };
 
-        assert_eq!(selection_columns_for_line(&rows[1], range, 1), Some(2..6));
+        assert_eq!(selection_columns_for_line(&rows[1], range, 1), Some(4..8));
     }
 
     #[test]
@@ -8923,7 +8959,7 @@ mod tests {
 
         assert!(painted(&rows[1]).contains("> [Image #1]"));
         assert_eq!(cursor_row, 1);
-        assert_eq!(cursor_col, UnicodeWidthStr::width("> [Image #1]"));
+        assert_eq!(cursor_col, UnicodeWidthStr::width("│ > [Image #1]"));
     }
 
     #[test]
@@ -9628,7 +9664,7 @@ mod tests {
             "the composer rule should keep its border tone"
         );
         assert!(
-            painted(&frame.lines[notice]).starts_with('─'),
+            painted(&frame.lines[notice]).starts_with('╰'),
             "the notice should sit on the rule, not replace it"
         );
         assert_eq!(
@@ -9667,7 +9703,7 @@ mod tests {
             .expect("notice row");
         assert_eq!(
             painted(notice),
-            format!("{}  • Copied to clipboard ──", "─".repeat(53))
+            format!("╰{}  • Copied to clipboard ─╯", "─".repeat(52))
         );
     }
 
@@ -9802,7 +9838,7 @@ mod tests {
         assert!(
             bare.lines
                 .iter()
-                .all(|line| !painted(line).starts_with("── ")),
+                .all(|line| !painted(line).starts_with("╭─ ")),
             "an unrecalled composer should carry no label"
         );
 
@@ -9814,7 +9850,7 @@ mod tests {
             recalled
                 .lines
                 .iter()
-                .any(|line| painted(line).starts_with("── 2/2 ─")),
+                .any(|line| painted(line).starts_with("╭─ 2/2 ─")),
             "the composer rule should show the history position"
         );
     }
@@ -9846,7 +9882,7 @@ mod tests {
         assert_eq!(frame.lines[activity].tone, Tone::Plain);
         assert!(activity >= 1);
         assert!(frame.lines[activity - 1] == PaintLine::blank());
-        assert!(painted(&frame.lines[activity + 1]).starts_with('─'));
+        assert!(painted(&frame.lines[activity + 1]).starts_with('╭'));
     }
 
     #[test]
@@ -9874,7 +9910,7 @@ mod tests {
             .expect("completion row");
         assert!(activity >= 1);
         assert!(frame.lines[activity - 1] == PaintLine::blank());
-        assert!(painted(&frame.lines[activity + 1]).starts_with('─'));
+        assert!(painted(&frame.lines[activity + 1]).starts_with('╭'));
     }
 
     #[test]
@@ -10094,11 +10130,11 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(rule_width(&line), 120);
-        assert!(painted(&line).starts_with('─'));
+        assert!(painted(&line).starts_with('╭'));
         // Two blanks off the rule, the badge, then the rule resumes for two columns.
         assert_eq!(
             texts,
-            ["  ", "Vibe: On", " · ", "Fast: On", " ", "──"]
+            ["  ", "Vibe: On", " · ", "Fast: On", " ", "─╮"]
         );
         assert_eq!(line.tail[1].tone, Tone::FastOn);
         assert_eq!(line.tail[3].tone, Tone::FastOn);
@@ -10221,7 +10257,7 @@ mod tests {
         assert_eq!(rule_width(&line), 80);
         assert_eq!(
             texts,
-            ["  ", "Vibe: On", " · ", "Fast: Off", " ", "──"]
+            ["  ", "Vibe: On", " · ", "Fast: Off", " ", "─╮"]
         );
         assert_eq!(line.tail[3].tone, Tone::FastOff);
     }
@@ -10324,7 +10360,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(rule_width(&line), 40);
-        assert_eq!(texts, ["  ", "Vibe: On", " · ", "Fast: On", " ", "──"]);
+        assert_eq!(texts, ["  ", "Vibe: On", " · ", "Fast: On", " ", "─╮"]);
     }
 
     #[test]
@@ -10373,7 +10409,7 @@ mod tests {
         // come between them.
         assert!(frame.lines[suggestion_end + 1] == PaintLine::blank());
         let rule = &frame.lines[suggestion_end + 2];
-        assert!(painted(rule).starts_with('─'));
+        assert!(painted(rule).starts_with('╭'));
     }
 
     /// Whatever the composer is docked under, the row directly above its rule is
@@ -10400,9 +10436,8 @@ mod tests {
         let rule = frame
             .lines
             .iter()
-            .position(|line| line.text == COMPOSER_FIRST_PREFIX)
-            .expect("composer prompt row")
-            - 1;
+            .position(|line| painted(line).starts_with('╭'))
+            .expect("composer rule");
         assert!(rule > 0);
         assert!(frame.lines[rule - 1] == PaintLine::blank());
         assert!(
@@ -11767,8 +11802,7 @@ mod tests {
             80,
         );
 
-        let bottom = painted(frame.lines.last().expect("composer bottom rule"));
-        assert_eq!(bottom, "─".repeat(79));
+        assert!(painted(frame.lines.last().expect("composer bottom rule")).starts_with('╰'));
     }
 
     fn painted(line: &PaintLine) -> String {
@@ -12120,6 +12154,78 @@ mod tests {
         assert!(
             painted(panel.last().expect("bottom rule")).ends_with('╯'),
             "bottom-right corner missing"
+        );
+        assert!(
+            body.iter().all(|line| painted(line).ends_with('│')),
+            "a body row lost its right border"
+        );
+    }
+
+    #[test]
+    fn panel_option_detail_sits_two_columns_under_its_label() {
+        // A question row, a selected option, and an option whose detail folds.
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                closable: false,
+                title: "증상".to_owned(),
+                lines: vec![
+                    OverlayLine {
+                        text: "Claude resume 시 어떤 증상인가?".to_owned(),
+                        selected: false,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: format!("화면에 이전 대화 안 보임\n{}", "상세 ".repeat(30)),
+                        selected: true,
+                        muted: false,
+                    },
+                ],
+                slider: None,
+                hint: "↑↓ 선택  Enter 확인  Esc 취소".to_owned(),
+                style: OverlayStyle::Panel,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            },
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+
+        let body = frame
+            .lines
+            .iter()
+            .filter(|line| line.prefix.starts_with('│') && !line.text.trim().is_empty())
+            .collect::<Vec<_>>();
+        let indent = |line: &PaintLine| UnicodeWidthStr::width(line.prefix.as_str());
+
+        let label = body
+            .iter()
+            .find(|line| line.text.starts_with("화면에"))
+            .expect("option label");
+        let details = body
+            .iter()
+            .filter(|line| line.text.starts_with("상세"))
+            .collect::<Vec<_>>();
+
+        assert!(details.len() > 1, "the detail should have folded");
+        // The detail is the label's quieter half: two columns in, dimmed, and
+        // every folded row of it stays on that same indent.
+        assert!(
+            details.iter().all(|line| indent(line) == indent(label) + 2),
+            "detail indents {:?} do not sit two columns under the label at {}",
+            details.iter().map(|line| indent(line)).collect::<Vec<_>>(),
+            indent(label)
+        );
+        assert!(
+            details.iter().all(|line| line.tone == Tone::Muted),
+            "a detail row is not dimmed"
         );
         assert!(
             body.iter().all(|line| painted(line).ends_with('│')),
@@ -13388,3 +13494,4 @@ mod tests {
         );
     }
 }
+

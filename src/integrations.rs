@@ -1328,7 +1328,7 @@ impl PluginPicker {
                     plugin
                         .description
                         .as_deref()
-                        .map(|text| format!("\n      {text}"))
+                        .map(|text| format!("\n{text}"))
                         .unwrap_or_default()
                 ),
                 selected: start + offset == self.selected,
@@ -1743,7 +1743,7 @@ impl MarketplacePicker {
             .enumerate()
             .map(|(offset, marketplace)| OverlayLine {
                 text: format!(
-                    "{} {}  ·  {} plugins\n      {}",
+                    "{} {}  ·  {} plugins\n{}",
                     if marketplace.is_configurable() {
                         "•"
                     } else {

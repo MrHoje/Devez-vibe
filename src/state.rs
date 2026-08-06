@@ -7019,7 +7019,7 @@ impl AppState {
                 if !text_mode {
                     lines.extend(question.options.iter().enumerate().map(|(index, option)| {
                         OverlayLine {
-                            text: format!("{}\n      {}", option.label, option.description),
+                            text: format!("{}\n{}", option.label, option.description),
                             selected: index == *selected,
                             muted: false,
                         }

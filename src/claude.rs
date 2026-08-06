@@ -516,4 +516,16 @@ mod tests {
         assert!(bridge.contains("message.message?.model === \"<synthetic>\""));
         assert!(bridge.contains("prompt.model = turn.model"));
     }
+
+    #[test]
+    fn bridge_drops_finished_tasks_from_earlier_turns_when_a_new_plan_starts() {
+        let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
+
+        assert!(bridge.contains("function pruneFinishedTasks(tasks, turnId)"));
+        assert!(
+            bridge.contains("if (task.status === \"completed\" && task.turnId !== turnId) tasks.delete(key);")
+        );
+        assert!(bridge.contains("pruneFinishedTasks(session.tasks, turnId)"));
+        assert!(bridge.contains("pruneFinishedTasks(tasks, turn.id)"));
+    }
 }

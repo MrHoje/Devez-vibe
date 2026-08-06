@@ -334,6 +334,8 @@ async function createSession(params, resumeId) {
     queue,
     query: null,
     turn: null,
+    // Prompts that arrived while a turn was running, run in order afterwards.
+    pendingPrompts: [],
     turnSequence: 1,
     itemSequence: 1,
     streamBlocks: new Map(),
@@ -555,18 +557,30 @@ function fileChanges(name, input) {
   return [{ path, kind: { type: name === "Write" ? "add" : "update" }, diff: `@@ -0,0 +1 @@\n${additions}` }];
 }
 
+// Claude는 Codex의 update_plan처럼 계획 전체를 다시 보내지 않으므로, 새 계획이 시작될 때
+// 이전 턴에서 이미 끝난 작업을 직접 걷어내야 목록이 턴마다 쌓이지 않는다.
+function pruneFinishedTasks(tasks, turnId) {
+  for (const [key, task] of tasks) {
+    if (task.status === "completed" && task.turnId !== turnId) tasks.delete(key);
+  }
+}
+
 function updatePlanFromToolUse(session, name, toolUseId, input) {
+  const turnId = session.turn?.id;
   if (name === "TaskCreate") {
+    pruneFinishedTasks(session.tasks, turnId);
     session.tasks.set(`pending:${toolUseId}`, {
       id: `pending:${toolUseId}`,
       subject: input.subject || input.description || "작업",
       status: "pending",
+      turnId,
     });
   } else if (name === "TaskUpdate") {
     const task = session.tasks.get(String(input.taskId));
     if (task) {
       if (input.subject) task.subject = input.subject;
       if (input.status) task.status = input.status;
+      task.turnId = turnId;
     }
   }
   emitPlan(session);
@@ -591,6 +605,7 @@ function updatePlanFromToolResult(session, pending, message) {
         id: String(task.id),
         subject: task.subject || task.description || "작업",
         status: task.status || "pending",
+        turnId: session.turn?.id,
       });
     }
     emitPlan(session);
@@ -697,6 +712,25 @@ async function processResult(session, message) {
     account: await safeAccount(session.query),
     usage: await safeUsage(session.query),
   });
+  await runPendingPrompt(session);
+}
+
+// The turn that was waiting starts on its own, so the host sees it exactly like a
+// prompt sent the moment the previous turn ended.
+async function runPendingPrompt(session) {
+  const next = session.pendingPrompts.shift();
+  if (!next) return;
+  try {
+    await runPrompt(session, next);
+  } catch (error) {
+    notify("error", {
+      threadId: session.id,
+      provider: "Claude",
+      error: { message: error instanceof Error ? error.message : String(error) },
+      willRetry: false,
+    });
+    await runPendingPrompt(session);
+  }
 }
 
 function finishTurn(session, error, durationMs) {
@@ -776,7 +810,17 @@ async function startPrompt(params) {
   const id = rawSession(params.sessionId);
   const session = sessions.get(id);
   if (!session) throw new Error(`Claude 세션을 찾을 수 없습니다: ${id}`);
-  if (session.turn) throw new Error("Claude가 이전 작업을 아직 실행 중입니다.");
+  // Claude runs one turn at a time, so extra input waits its turn instead of
+  // failing — the same queueing the CLI does for a prompt typed while it works.
+  if (session.turn) {
+    session.pendingPrompts.push(params);
+    return { turn: { id: session.turn.id }, queued: true };
+  }
+  return runPrompt(session, params);
+}
+
+async function runPrompt(session, params) {
+  const id = session.id;
   if (params.model) {
     const model = stripClaudeModel(params.model);
     await session.query.setModel(model);
@@ -862,10 +906,12 @@ function historyTurns(messages) {
         else if (block.type === "tool_use") {
           const pending = { name: block.name, input: block.input || {}, item: toolItem({}, block.id, block.name, block.input || {}) };
           tools.set(block.id, pending);
-          if (block.name === "TaskCreate") tasks.set(`pending:${block.id}`, { id: `pending:${block.id}`, subject: block.input?.subject || "작업", status: "pending" });
-          else if (block.name === "TaskUpdate") {
+          if (block.name === "TaskCreate") {
+            pruneFinishedTasks(tasks, turn.id);
+            tasks.set(`pending:${block.id}`, { id: `pending:${block.id}`, subject: block.input?.subject || "작업", status: "pending", turnId: turn.id });
+          } else if (block.name === "TaskUpdate") {
             const task = tasks.get(String(block.input?.taskId));
-            if (task) Object.assign(task, block.input?.subject ? { subject: block.input.subject } : {}, block.input?.status ? { status: block.input.status } : {});
+            if (task) Object.assign(task, block.input?.subject ? { subject: block.input.subject } : {}, block.input?.status ? { status: block.input.status } : {}, { turnId: turn.id });
           } else if (!["TaskList", "AskUserQuestion"].includes(block.name)) turn.items.push(pending.item);
         }
       }
@@ -884,7 +930,7 @@ function historyTurns(messages) {
           }
         } else if (pending.name === "TaskList" && Array.isArray(message.tool_use_result?.tasks)) {
           tasks.clear();
-          for (const task of message.tool_use_result.tasks) tasks.set(String(task.id), { id: String(task.id), subject: task.subject || "작업", status: task.status || "pending" });
+          for (const task of message.tool_use_result.tasks) tasks.set(String(task.id), { id: String(task.id), subject: task.subject || "작업", status: task.status || "pending", turnId: turn.id });
         } else if (pending.item) {
           const output = toolOutput(block.content, message.tool_use_result);
           Object.assign(pending.item, pending.item.type === "commandExecution"
@@ -983,6 +1029,9 @@ async function dispatch(method, params = {}) {
   if (method === "session/prompt") return startPrompt(params);
   if (method === "session/interrupt") {
     const session = sessions.get(rawSession(params.sessionId));
+    // Stopping the run drops what was waiting behind it too, so nothing the user
+    // just cancelled starts on its own afterwards.
+    if (session) session.pendingPrompts.length = 0;
     if (session?.turn) {
       const turn = session.turn;
       turn.interruptRequested = true;
