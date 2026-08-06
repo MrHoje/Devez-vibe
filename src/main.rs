@@ -297,6 +297,9 @@ async fn start_session(
     requested_effort: &str,
 ) -> Result<()> {
     state.set_host_loading(is_resuming);
+    if is_resuming {
+        server.prepare_resume_runtime(resume_id).await?;
+    }
     let startup = await_thread(
         server,
         state,
@@ -356,6 +359,7 @@ async fn start_session(
     if is_resuming {
         state.load_history(&thread, rollout.as_ref());
         state.begin_cost_restore();
+        apply_resumed_token_usage(state, &thread_response);
     }
     state.set_host_loading(false);
     draw(state, renderer)?;
@@ -2244,7 +2248,7 @@ async fn start_new_thread(
 /// to a loading state straight away and the restored transcript arrives when
 /// `thread/resume` answers. Returns `true` when the user quits during the wait.
 async fn resume_thread(
-    server: &BackendServer,
+    server: &mut BackendServer,
     state: &mut AppState,
     renderer: &mut Renderer,
     target: &str,
@@ -2260,6 +2264,11 @@ async fn resume_thread(
                 return Ok(false);
             }
         };
+
+    if let Err(error) = server.prepare_resume_runtime(&thread_id).await {
+        state.push_notice(BlockKind::Error, "세션 재개 실패", error.to_string());
+        return Ok(false);
+    }
 
     match resume_into_state(server, state, renderer, &thread_id).await? {
         Switched::Done(queued) => finish_thread_switch(server, state, renderer, queued).await,
@@ -2314,7 +2323,10 @@ async fn resume_into_state(
             return Ok(Switched::Failed);
         }
     };
-    let rollout = state::codex_home().and_then(|home| rollout::load(&home, &resumed.id));
+    let rollout_id = server
+        .active_codex_thread_id(&resumed.id)
+        .unwrap_or_else(|| resumed.id.clone());
+    let rollout = state::codex_home().and_then(|home| rollout::load(&home, &rollout_id));
     state.attach_thread(
         resumed.id,
         resumed.cwd,
@@ -2330,6 +2342,7 @@ async fn resume_into_state(
     };
     state.load_history(&history, rollout.as_ref());
     state.begin_cost_restore();
+    apply_resumed_token_usage(state, &response);
     state.set_host_loading(false);
     Ok(Switched::Done(queued))
 }
@@ -2631,6 +2644,13 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- Super Vibe 모드에서 반드시 필요한 상황이 아닌 단순 안내에는 클래스명, 코드명 등 기술 식별자를 출력하지 않는다.\n",
     "- 작업을 완료하면 사용자의 요청을 기준으로 정확히 무엇을 완료했는지 `~ 내용을 완료했습니다.` 형식으로 분명하게 알린다.\n",
     "- 하지 않기로 한 선택지나 이미 정해진 결정을 다시 나열하지 않는다.\n",
+    "- 사용자에게 보이는 진행 안내와 답변은 사용자가 요청한 언어로 작성한다. ",
+    "한국어 요청에는 `Now ...` 같은 독립된 영어 진행 문장을 출력하지 않는다.\n",
+    "중간 진행 보고 규칙:\n",
+    "- 단순 질문이 아닌 작업은 첫 도구 호출 전에 현재 확인하거나 처리할 내용을 한국어 한두 줄로 알린다.\n",
+    "- 작업 중 원인이나 중요한 사실을 확인했을 때, 실제 변경을 마쳤을 때, 검증을 시작할 때 진행 상황을 한국어 한두 줄로 알린다.\n",
+    "- 도구 작업이 계속되는 동안 사용자에게 보이는 진행 안내 없이 60초 이상 지나지 않게 한다. ",
+    "같은 내용을 반복하거나 도구 이름과 내부 절차만 나열하지 않는다.\n",
     "- Skill 적용, 지침 확인, 내부 도구 호출 같은 내부 절차를 사용자에게 진행 상황으로 알리지 않는다. ",
     "사용자 판단에 필요한 진행 상황이나 결과만 알린다.\n",
     "작업 단계 규칙:\n",
@@ -2919,7 +2939,7 @@ struct IntegrationCatalog {
 async fn fetch_integrations(
     client: Option<app_server::AppServerClient>,
     cwd: String,
-    thread_id: String,
+    app_thread_id: Option<String>,
     force_reload: bool,
 ) -> IntegrationCatalog {
     let Some(client) = client else {
@@ -2931,6 +2951,22 @@ async fn fetch_integrations(
     };
     let skills_client = client.clone();
     let plugins_client = client.clone();
+    let apps = async {
+        let Some(thread_id) = app_thread_id else {
+            return Ok(json!({ "data": [] }));
+        };
+        client
+            .request(
+                "app/list",
+                json!({
+                    "cursor": null,
+                    "limit": 100,
+                    "threadId": thread_id,
+                    "forceRefetch": force_reload
+                }),
+            )
+            .await
+    };
     let (skills, plugins, apps) = tokio::join!(
         skills_client.request(
             "skills/list",
@@ -2945,15 +2981,7 @@ async fn fetch_integrations(
                 "cwds": [cwd]
             }),
         ),
-        client.request(
-            "app/list",
-            json!({
-                "cursor": null,
-                "limit": 100,
-                "threadId": thread_id,
-                "forceRefetch": force_reload
-            }),
-        ),
+        apps,
     );
     IntegrationCatalog {
         skills: skills.map_err(|error| error.to_string()),
@@ -3038,10 +3066,11 @@ fn start_integration_refresh(
     server: &BackendServer,
     state: &AppState,
 ) -> mpsc::Receiver<IntegrationCatalog> {
+    let app_thread_id = integration_app_thread_id(server, state);
     start_background_catalogue(fetch_integrations(
         server.client(),
         state.cwd.clone(),
-        state.thread_id.clone(),
+        app_thread_id,
         false,
     ))
 }
@@ -3064,14 +3093,28 @@ async fn refresh_integrations(
     state: &mut AppState,
     force_reload: bool,
 ) -> Result<()> {
+    let app_thread_id = integration_app_thread_id(server, state);
     let catalog = fetch_integrations(
         server.client(),
         state.cwd.clone(),
-        state.thread_id.clone(),
+        app_thread_id,
         force_reload,
     )
     .await;
     apply_integrations(state, catalog)
+}
+
+fn integration_app_thread_id(server: &BackendServer, state: &AppState) -> Option<String> {
+    app_thread_id_for_model(
+        state.selected_model_name(),
+        server.codex_thread_id(&state.thread_id),
+    )
+}
+
+fn app_thread_id_for_model(model: &str, codex_thread_id: Option<String>) -> Option<String> {
+    (!claude::is_claude_model(model) && !open_code::is_open_code_model(model))
+        .then_some(codex_thread_id)
+        .flatten()
 }
 
 struct ResolvedSkill {
@@ -3569,6 +3612,20 @@ async fn read_runtime_account_plan(server: &BackendServer, model: &str) -> Accou
     } else {
         read_account_plan(server).await
     }
+}
+
+/// Claude only reports usage when a turn ends, so a resumed session would show an
+/// empty context on the status line. The bridge replays the stored totals instead.
+fn apply_resumed_token_usage(state: &mut AppState, response: &Value) {
+    let Some(usage) = response
+        .get("tokenUsage")
+        .filter(|value| !value.is_null())
+        .cloned()
+    else {
+        return;
+    };
+    let params = json!({ "threadId": state.thread_id, "tokenUsage": usage });
+    state.handle_notification("thread/tokenUsage/updated", &params);
 }
 
 fn apply_claude_account_metadata(state: &mut AppState, response: &Value) {
@@ -4247,6 +4304,9 @@ mod tests {
         );
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskCreate"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskUpdate"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`Now ...` 같은 독립된 영어 진행 문장"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("첫 도구 호출 전에"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("60초 이상 지나지 않게"));
     }
 
     #[test]
@@ -4275,6 +4335,24 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Skill 조회 실패: skills offline; 플러그인 조회 실패: plugins offline; App 조회 실패: apps offline"
+        );
+    }
+
+    #[test]
+    fn app_catalogue_uses_only_a_codex_backing_thread() {
+        let backing = Some("018f3f2a-7298-7b55-9ec0-0d9bf34ac123".to_owned());
+
+        assert_eq!(
+            app_thread_id_for_model("gpt-5.6-sol", backing.clone()),
+            backing
+        );
+        assert_eq!(
+            app_thread_id_for_model("claude:sonnet", Some("codex-id".to_owned())),
+            None
+        );
+        assert_eq!(
+            app_thread_id_for_model("opencode:anthropic/claude", Some("codex-id".to_owned())),
+            None
         );
     }
 

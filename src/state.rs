@@ -8675,11 +8675,23 @@ fn merged_turn_blocks(
     items: &[Value],
     rollout: Option<&Rollout>,
 ) -> Vec<Block> {
-    let prompt_model = rollout.and_then(|rollout| {
-        turn.get("startedAt")
-            .and_then(Value::as_i64)
-            .and_then(|started_at| rollout.model_for_turn(started_at))
-    });
+    let prompt_model = turn
+        .get("model")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            items.iter().find_map(|item| {
+                (item.get("type").and_then(Value::as_str) == Some("userMessage"))
+                    .then(|| item.get("model").and_then(Value::as_str))
+                    .flatten()
+            })
+        })
+        .or_else(|| {
+            rollout.and_then(|rollout| {
+                turn.get("startedAt")
+                    .and_then(Value::as_i64)
+                    .and_then(|started_at| rollout.model_for_turn(started_at))
+            })
+        });
     let events = rollout
         .map(|rollout| turn_events(turn, rollout))
         .unwrap_or_default();
@@ -12997,6 +13009,26 @@ mod tests {
         state.load_history(&thread, Some(&rollout));
 
         assert_eq!(state.committed[0].title, "gpt-5.6-terra");
+    }
+
+    #[test]
+    fn resumed_claude_prompt_uses_the_model_stored_by_the_bridge() {
+        let mut state = test_state();
+        let thread = json!({
+            "turns": [{
+                "id": "claude-turn-1",
+                "model": "claude:claude-haiku-4-5-20251001",
+                "items": [{
+                    "type": "userMessage",
+                    "model": "claude:claude-haiku-4-5-20251001",
+                    "content": [{ "type": "text", "text": "hay zzz" }]
+                }]
+            }]
+        });
+
+        state.load_history(&thread, None);
+
+        assert_eq!(state.committed[0].title, "claude:claude-haiku-4-5-20251001");
     }
 
     #[test]

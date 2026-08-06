@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
@@ -17,7 +18,7 @@ use crate::{
     open_code::{OpenCodeServer, has_connected_provider, is_open_code_model, is_open_code_request_id},
 };
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum RuntimeKind {
     Codex,
     OpenCode,
@@ -34,7 +35,7 @@ impl RuntimeKind {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Route {
     active: RuntimeKind,
     codex_id: Option<String>,
@@ -47,6 +48,17 @@ struct Route {
 }
 
 impl Route {
+    fn backing_count(&self) -> usize {
+        [
+            self.codex_id.is_some(),
+            self.open_code_id.is_some(),
+            self.claude_id.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count()
+    }
+
     fn seen_through(&self, kind: RuntimeKind) -> u64 {
         match kind {
             RuntimeKind::Codex => self.codex_seen_through,
@@ -74,6 +86,7 @@ pub struct BackendServer {
     open_code_path: PathBuf,
     routes: Arc<StdMutex<HashMap<String, Route>>>,
     aliases: Arc<StdMutex<HashMap<String, String>>>,
+    route_store_path: Option<PathBuf>,
     cwd: PathBuf,
 }
 
@@ -93,6 +106,12 @@ impl BackendServer {
             None
         };
         let claude = ClaudeServer::new(node_path, claude_path, cwd)?;
+        let route_store_path = route_store_path();
+        let routes = route_store_path
+            .as_deref()
+            .map(load_routes)
+            .unwrap_or_default();
+        let aliases = route_aliases(&routes);
         Ok(Self {
             codex: None,
             codex_unavailable_reason: None,
@@ -100,8 +119,9 @@ impl BackendServer {
             claude,
             codex_path: codex_path.to_path_buf(),
             open_code_path: open_code_path.to_path_buf(),
-            routes: Arc::new(StdMutex::new(HashMap::new())),
-            aliases: Arc::new(StdMutex::new(HashMap::new())),
+            routes: Arc::new(StdMutex::new(routes)),
+            aliases: Arc::new(StdMutex::new(aliases)),
+            route_store_path,
             cwd: cwd.to_path_buf(),
         })
     }
@@ -190,6 +210,26 @@ impl BackendServer {
                 } else {
                     empty_list_response()
                 };
+                if let Some(sessions) = response.get_mut("data").and_then(Value::as_array_mut) {
+                    let source = std::mem::take(sessions);
+                    for mut session in source {
+                        if let Some(backing) = session
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                        {
+                            let visible = self.visible_id(&backing, &backing);
+                            session["id"] = json!(visible);
+                            self.register_discovered_route(
+                                &visible,
+                                RuntimeKind::Codex,
+                                &backing,
+                                session_cwd(&session, &self.cwd),
+                            );
+                        }
+                        merge_session(sessions, session);
+                    }
+                }
                 if let Some(open_code) = &self.open_code {
                     let cwd = params.get("cwd").and_then(Value::as_str).map(Path::new);
                     if let Ok(extra) = open_code.list_sessions(cwd).await
@@ -200,20 +240,19 @@ impl BackendServer {
                     {
                         for session in sessions {
                             if let Some(id) = session.get("id").and_then(Value::as_str) {
-                                self.register_route(
-                                    id,
+                                let visible = self.visible_id(id, id);
+                                let mut session = session.clone();
+                                session["id"] = json!(visible);
+                                self.register_discovered_route(
+                                    &visible,
                                     RuntimeKind::OpenCode,
-                                    None,
-                                    Some(id.to_owned()),
-                                    None,
-                                    session
-                                        .get("cwd")
-                                        .and_then(Value::as_str)
-                                        .map(PathBuf::from)
-                                        .unwrap_or_else(|| self.cwd.clone()),
+                                    id,
+                                    session_cwd(&session, &self.cwd),
                                 );
+                                merge_session(target, session);
+                            } else {
+                                merge_session(target, session.clone());
                             }
-                            target.push(session.clone());
                         }
                     }
                 }
@@ -237,30 +276,26 @@ impl BackendServer {
                         let mut session = source.clone();
                         if let Some(namespaced) = source.get("id").and_then(Value::as_str) {
                             let backing = raw_thread_id(namespaced).to_owned();
-                            let visible = self
-                                .aliases
-                                .lock()
-                                .expect("aliases mutex")
-                                .get(&backing)
-                                .cloned()
-                                .unwrap_or_else(|| namespaced.to_owned());
+                            let visible = self.visible_id(&backing, namespaced);
                             session["id"] = json!(visible);
-                            let route = self.route(&visible);
-                            self.register_route(
+                            self.register_discovered_route(
                                 &visible,
                                 RuntimeKind::Claude,
-                                route.as_ref().and_then(|route| route.codex_id.clone()),
-                                route.as_ref().and_then(|route| route.open_code_id.clone()),
-                                Some(backing),
-                                source
-                                    .get("cwd")
-                                    .and_then(Value::as_str)
-                                    .map(PathBuf::from)
-                                    .unwrap_or_else(|| self.cwd.clone()),
+                                &backing,
+                                session_cwd(source, &self.cwd),
                             );
                         }
-                        target.push(session);
+                        merge_session(target, session);
                     }
+                }
+                if let Some(target) = response.get_mut("data").and_then(Value::as_array_mut) {
+                    target.sort_by_key(|session| std::cmp::Reverse(session_updated_at(session)));
+                    target.truncate(
+                        params
+                            .get("limit")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(100) as usize,
+                    );
                 }
                 Ok(response)
             }
@@ -293,9 +328,8 @@ impl BackendServer {
                 }
             }
             "thread/resume" => {
-                let visible = thread_id(&params)?;
-                if self.route_kind(visible) == RuntimeKind::Claude || is_claude_thread(visible) {
-                    let visible = visible.to_owned();
+                let visible = thread_id(&params)?.to_owned();
+                if self.route_kind(&visible) == RuntimeKind::Claude {
                     let backing = self
                         .backing_id(&visible, RuntimeKind::Claude)
                         .unwrap_or_else(|_| raw_thread_id(&visible).to_owned());
@@ -309,25 +343,28 @@ impl BackendServer {
                             claude_session_params(&params, &cwd, Some(&backing)),
                         )
                         .await?;
-                    self.register_claude_response(&mut response, cwd)?;
+                    self.register_claude_response_as(&mut response, cwd, Some(&visible))?;
                     Ok(response)
-                } else if self.is_open_code_thread(visible) {
+                } else if self.is_open_code_thread(&visible) {
                     let open_code = self.open_code()?;
                     let cwd = request_cwd(&params).unwrap_or_else(|| self.cwd.clone());
-                    let response = open_code.resume_session(&cwd, visible).await?;
+                    let backing = self.backing_id(&visible, RuntimeKind::OpenCode)?;
+                    let mut response = open_code.resume_session(&cwd, &backing).await?;
+                    response["id"] = json!(visible);
                     self.register_route(
-                        visible,
+                        &visible,
                         RuntimeKind::OpenCode,
-                        None,
-                        Some(visible.to_owned()),
-                        None,
+                        self.route(&visible).and_then(|route| route.codex_id),
+                        Some(backing),
+                        self.route(&visible).and_then(|route| route.claude_id),
                         cwd,
                     );
                     Ok(response)
                 } else {
+                    let backing = self.backing_id(&visible, RuntimeKind::Codex)?;
+                    params["threadId"] = json!(backing);
                     let response = self.codex()?.request(method, params).await?;
-                    self.register_codex_response(&response);
-                    Ok(response)
+                    Ok(self.register_codex_response_as(response, &visible))
                 }
             }
             "thread/turns/list"
@@ -350,6 +387,11 @@ impl BackendServer {
                         }),
                     )
                     .await
+            }
+            "thread/turns/list" => {
+                let visible = thread_id(&params)?.to_owned();
+                params["threadId"] = json!(self.backing_id(&visible, RuntimeKind::Codex)?);
+                self.codex()?.request(method, params).await
             }
             "turn/start" | "turn/steer" => {
                 let visible = thread_id(&params)?.to_owned();
@@ -536,6 +578,29 @@ impl BackendServer {
 
     pub fn client(&self) -> Option<AppServerClient> {
         self.codex.as_ref().map(AppServer::client)
+    }
+
+    pub fn codex_thread_id(&self, visible: &str) -> Option<String> {
+        self.route(visible)
+            .and_then(|route| route.codex_id)
+            .or_else(|| {
+                (!is_claude_thread(visible) && !visible.starts_with("ses_"))
+                    .then(|| visible.to_owned())
+            })
+    }
+
+    pub fn active_codex_thread_id(&self, visible: &str) -> Option<String> {
+        (self.route_kind(visible) == RuntimeKind::Codex)
+            .then(|| self.codex_thread_id(visible))
+            .flatten()
+    }
+
+    pub async fn prepare_resume_runtime(&mut self, visible: &str) -> Result<()> {
+        match self.route_kind(visible) {
+            RuntimeKind::Codex => self.start_codex().await,
+            RuntimeKind::OpenCode => self.ensure_open_code().await.map(|_| ()),
+            RuntimeKind::Claude => Ok(()),
+        }
     }
 
     pub async fn provider_catalog(&mut self) -> Result<Value> {
@@ -729,23 +794,67 @@ impl BackendServer {
         );
     }
 
+    fn register_codex_response_as(&self, mut response: Value, visible: &str) -> Value {
+        let Some(backing) = response
+            .get("id")
+            .or_else(|| response.pointer("/thread/id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+        else {
+            return response;
+        };
+        let cwd = response
+            .get("cwd")
+            .or_else(|| response.pointer("/thread/cwd"))
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .or_else(|| self.route(visible).map(|route| route.cwd))
+            .unwrap_or_else(|| self.cwd.clone());
+        response["id"] = json!(visible);
+        if response.get("thread").is_some_and(Value::is_object) {
+            response["thread"]["id"] = json!(visible);
+        }
+        let route = self.route(visible);
+        self.register_route(
+            visible,
+            RuntimeKind::Codex,
+            Some(backing),
+            route.as_ref().and_then(|route| route.open_code_id.clone()),
+            route.as_ref().and_then(|route| route.claude_id.clone()),
+            cwd,
+        );
+        response
+    }
+
     fn register_claude_response(&self, response: &mut Value, cwd: PathBuf) -> Result<()> {
+        self.register_claude_response_as(response, cwd, None)
+    }
+
+    fn register_claude_response_as(
+        &self,
+        response: &mut Value,
+        cwd: PathBuf,
+        visible: Option<&str>,
+    ) -> Result<()> {
         let backing = response
             .get("id")
             .or_else(|| response.pointer("/thread/id"))
             .and_then(Value::as_str)
             .context("Claude 세션 응답에 id가 없습니다.")?
             .to_owned();
-        let visible = visible_thread_id(&backing);
+        let visible = visible
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| visible_thread_id(&backing));
         response["id"] = json!(visible);
         if response.get("thread").is_some_and(Value::is_object) {
             response["thread"]["id"] = json!(visible);
         }
+        let route = self.route(&visible);
         self.register_route(
             &visible,
             RuntimeKind::Claude,
-            None,
-            None,
+            route.as_ref().and_then(|route| route.codex_id.clone()),
+            route.as_ref().and_then(|route| route.open_code_id.clone()),
             Some(backing),
             cwd,
         );
@@ -761,40 +870,89 @@ impl BackendServer {
         claude_id: Option<String>,
         cwd: PathBuf,
     ) {
-        let mut routes = self.routes.lock().expect("routes mutex");
-        let route = routes.entry(visible.to_owned()).or_insert(Route {
+        {
+            let mut routes = self.routes.lock().expect("routes mutex");
+            let route = routes.entry(visible.to_owned()).or_insert(Route {
+                active,
+                codex_id: None,
+                open_code_id: None,
+                claude_id: None,
+                cwd: cwd.clone(),
+                codex_seen_through: 0,
+                open_code_seen_through: 0,
+                claude_seen_through: 0,
+            });
+            route.active = active;
+            route.cwd = cwd;
+            if let Some(id) = codex_id {
+                self.aliases
+                    .lock()
+                    .expect("aliases mutex")
+                    .insert(id.clone(), visible.to_owned());
+                route.codex_id = Some(id);
+            }
+            if let Some(id) = open_code_id {
+                self.aliases
+                    .lock()
+                    .expect("aliases mutex")
+                    .insert(id.clone(), visible.to_owned());
+                route.open_code_id = Some(id);
+            }
+            if let Some(id) = claude_id {
+                self.aliases
+                    .lock()
+                    .expect("aliases mutex")
+                    .insert(id.clone(), visible.to_owned());
+                route.claude_id = Some(id);
+            }
+        }
+        self.persist_routes();
+    }
+
+    fn register_discovered_route(
+        &self,
+        visible: &str,
+        kind: RuntimeKind,
+        backing: &str,
+        cwd: PathBuf,
+    ) {
+        let existing = self.route(visible);
+        let active = existing.as_ref().map(|route| route.active).unwrap_or(kind);
+        let mut codex_id = existing.as_ref().and_then(|route| route.codex_id.clone());
+        let mut open_code_id = existing
+            .as_ref()
+            .and_then(|route| route.open_code_id.clone());
+        let mut claude_id = existing.as_ref().and_then(|route| route.claude_id.clone());
+        match kind {
+            RuntimeKind::Codex => codex_id = Some(backing.to_owned()),
+            RuntimeKind::OpenCode => open_code_id = Some(backing.to_owned()),
+            RuntimeKind::Claude => claude_id = Some(backing.to_owned()),
+        }
+        self.register_route(
+            visible,
             active,
-            codex_id: None,
-            open_code_id: None,
-            claude_id: None,
-            cwd: cwd.clone(),
-            codex_seen_through: 0,
-            open_code_seen_through: 0,
-            claude_seen_through: 0,
-        });
-        route.active = active;
-        route.cwd = cwd;
-        if let Some(id) = codex_id {
-            self.aliases
-                .lock()
-                .expect("aliases mutex")
-                .insert(id.clone(), visible.to_owned());
-            route.codex_id = Some(id);
-        }
-        if let Some(id) = open_code_id {
-            self.aliases
-                .lock()
-                .expect("aliases mutex")
-                .insert(id.clone(), visible.to_owned());
-            route.open_code_id = Some(id);
-        }
-        if let Some(id) = claude_id {
-            self.aliases
-                .lock()
-                .expect("aliases mutex")
-                .insert(id.clone(), visible.to_owned());
-            route.claude_id = Some(id);
-        }
+            codex_id,
+            open_code_id,
+            claude_id,
+            cwd,
+        );
+    }
+
+    fn visible_id(&self, backing: &str, fallback: &str) -> String {
+        self.aliases
+            .lock()
+            .expect("aliases mutex")
+            .get(backing)
+            .cloned()
+            .unwrap_or_else(|| fallback.to_owned())
+    }
+
+    fn persist_routes(&self) {
+        let Some(path) = self.route_store_path.as_deref() else {
+            return;
+        };
+        let routes = self.routes.lock().expect("routes mutex");
+        let _ = save_routes(path, &routes);
     }
 
     fn route(&self, visible: &str) -> Option<Route> {
@@ -820,25 +978,31 @@ impl BackendServer {
     }
 
     fn note_seen_through(&self, visible: &str, kind: RuntimeKind, block_id: u64) {
-        if let Some(route) = self
-            .routes
-            .lock()
-            .expect("routes mutex")
-            .get_mut(visible)
         {
-            route.note_seen_through(kind, block_id);
+            if let Some(route) = self
+                .routes
+                .lock()
+                .expect("routes mutex")
+                .get_mut(visible)
+            {
+                route.note_seen_through(kind, block_id);
+            }
         }
+        self.persist_routes();
     }
 
     fn restore_active_route(&self, visible: &str, active: RuntimeKind) {
-        if let Some(route) = self
-            .routes
-            .lock()
-            .expect("routes mutex")
-            .get_mut(visible)
         {
-            route.active = active;
+            if let Some(route) = self
+                .routes
+                .lock()
+                .expect("routes mutex")
+                .get_mut(visible)
+            {
+                route.active = active;
+            }
         }
+        self.persist_routes();
     }
 
     fn is_open_code_thread(&self, visible: &str) -> bool {
@@ -1021,6 +1185,90 @@ impl BackendServer {
 
 fn empty_list_response() -> Value {
     json!({ "data": [], "nextCursor": null })
+}
+
+fn route_store_path() -> Option<PathBuf> {
+    if let Some(app_data) = env::var_os("APPDATA") {
+        return Some(
+            PathBuf::from(app_data)
+                .join("DevezVibe")
+                .join("session-routes.json"),
+        );
+    }
+    env::var_os("HOME").map(PathBuf::from).map(|home| {
+        home.join(".config")
+            .join("devez-vibe")
+            .join("session-routes.json")
+    })
+}
+
+fn load_routes(path: &Path) -> HashMap<String, Route> {
+    fs::read(path)
+        .ok()
+        .and_then(|data| serde_json::from_slice(&data).ok())
+        .unwrap_or_default()
+}
+
+fn save_routes(path: &Path, routes: &HashMap<String, Route>) -> Result<()> {
+    let mixed = routes
+        .iter()
+        .filter(|(_, route)| route.backing_count() > 1)
+        .map(|(visible, route)| (visible.clone(), route.clone()))
+        .collect::<HashMap<_, _>>();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(&mixed)?)?;
+    Ok(())
+}
+
+fn route_aliases(routes: &HashMap<String, Route>) -> HashMap<String, String> {
+    routes
+        .iter()
+        .flat_map(|(visible, route)| {
+            [
+                route.codex_id.as_ref(),
+                route.open_code_id.as_ref(),
+                route.claude_id.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|backing| (backing.clone(), visible.clone()))
+            .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn session_cwd(session: &Value, fallback: &Path) -> PathBuf {
+    session
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fallback.to_path_buf())
+}
+
+fn session_updated_at(session: &Value) -> u64 {
+    session
+        .get("updatedAt")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+}
+
+fn merge_session(sessions: &mut Vec<Value>, session: Value) {
+    let Some(id) = session.get("id").and_then(Value::as_str) else {
+        sessions.push(session);
+        return;
+    };
+    if let Some(existing) = sessions
+        .iter_mut()
+        .find(|existing| existing.get("id").and_then(Value::as_str) == Some(id))
+    {
+        if session_updated_at(&session) >= session_updated_at(existing) {
+            *existing = session;
+        }
+    } else {
+        sessions.push(session);
+    }
 }
 
 pub fn read_provider_config() -> String {
@@ -1378,6 +1626,23 @@ fn thread_id(params: &Value) -> Result<&str> {
 mod tests {
     use super::*;
 
+    fn route(
+        active: RuntimeKind,
+        codex_id: Option<&str>,
+        claude_id: Option<&str>,
+    ) -> Route {
+        Route {
+            active,
+            codex_id: codex_id.map(ToOwned::to_owned),
+            open_code_id: None,
+            claude_id: claude_id.map(ToOwned::to_owned),
+            cwd: PathBuf::from("C:/repo"),
+            codex_seen_through: 12,
+            open_code_seen_through: 0,
+            claude_seen_through: 7,
+        }
+    }
+
     #[tokio::test]
     async fn missing_codex_runtime_keeps_the_backend_available_for_claude() {
         let mut server = BackendServer::spawn(
@@ -1537,5 +1802,63 @@ mod tests {
             combined_turn_instructions(&params).as_deref(),
             Some("rules\n\nhistory")
         );
+    }
+
+    #[test]
+    fn mixed_provider_routes_survive_a_process_restart() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("devez-vibe-route-{suffix}"));
+        let path = root.join("session-routes.json");
+        let visible = "claude:11111111-1111-1111-1111-111111111111";
+        let codex = "22222222-2222-2222-2222-222222222222";
+        let claude = "11111111-1111-1111-1111-111111111111";
+        let routes = HashMap::from([
+            (
+                visible.to_owned(),
+                route(RuntimeKind::Codex, Some(codex), Some(claude)),
+            ),
+            (
+                "33333333-3333-3333-3333-333333333333".to_owned(),
+                route(
+                    RuntimeKind::Codex,
+                    Some("33333333-3333-3333-3333-333333333333"),
+                    None,
+                ),
+            ),
+        ]);
+
+        save_routes(&path, &routes).unwrap();
+        let restored = load_routes(&path);
+        let aliases = route_aliases(&restored);
+
+        assert_eq!(restored.len(), 1);
+        assert!(matches!(restored[visible].active, RuntimeKind::Codex));
+        assert_eq!(aliases.get(codex).map(String::as_str), Some(visible));
+        assert_eq!(aliases.get(claude).map(String::as_str), Some(visible));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mixed_session_list_keeps_one_row_with_the_latest_preview() {
+        let mut sessions = vec![json!({
+            "id": "claude:session",
+            "preview": "Claude 시작",
+            "updatedAt": 10
+        })];
+
+        merge_session(
+            &mut sessions,
+            json!({
+                "id": "claude:session",
+                "preview": "Codex 후속 대화",
+                "updatedAt": 20
+            }),
+        );
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["preview"], "Codex 후속 대화");
     }
 }

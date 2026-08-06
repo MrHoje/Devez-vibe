@@ -494,4 +494,26 @@ mod tests {
             .unwrap();
         assert_eq!(haiku.pointer("/supportedReasoningEfforts/0"), None);
     }
+
+    #[test]
+    fn bridge_uses_the_latest_assistant_request_for_context_usage() {
+        let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
+
+        assert!(bridge.contains("session.lastContextUsage = tokenBreakdown(message.message?.usage)"));
+        assert!(bridge.contains("last: session.lastContextUsage"));
+        assert!(!bridge.contains("last: totals"));
+    }
+
+    #[test]
+    fn bridge_filters_local_commands_and_restores_each_turn_model() {
+        let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
+
+        assert!(bridge.contains("isInternalHistoryText(message, userText)"));
+        assert!(bridge.contains("\"command-name\""));
+        assert!(bridge.contains("\"local-command-caveat\""));
+        assert!(bridge.contains("\"bash-input\""));
+        assert!(bridge.contains("\"task-notification\""));
+        assert!(bridge.contains("message.message?.model === \"<synthetic>\""));
+        assert!(bridge.contains("prompt.model = turn.model"));
+    }
 }

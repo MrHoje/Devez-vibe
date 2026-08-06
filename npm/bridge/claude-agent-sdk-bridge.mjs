@@ -339,6 +339,8 @@ async function createSession(params, resumeId) {
     streamBlocks: new Map(),
     tools: new Map(),
     tasks: new Map(),
+    lastContextUsage: null,
+    lastContextWindow: 0,
   };
   const agentQuery = await startAgentQuery(queue, makeOptions(params, id, resumeId));
   session.query = agentQuery;
@@ -391,6 +393,52 @@ function emitDelta(session, method, itemId, delta) {
   notify(method, { threadId: session.id, turnId: session.turn?.id, itemId, delta, provider: "Claude" });
 }
 
+function tokenBreakdown(usage) {
+  if (!usage) return null;
+  const input = Number(usage.input_tokens ?? usage.inputTokens ?? 0);
+  const cached = Number(usage.cache_read_input_tokens ?? usage.cacheReadInputTokens ?? 0);
+  const cacheWrite = Number(usage.cache_creation_input_tokens ?? usage.cacheCreationInputTokens ?? 0);
+  const output = Number(usage.output_tokens ?? usage.outputTokens ?? 0);
+  return {
+    inputTokens: input + cached + cacheWrite,
+    cachedInputTokens: cached,
+    cacheWriteInputTokens: cacheWrite,
+    outputTokens: output,
+    totalTokens: input + cached + cacheWrite + output,
+  };
+}
+
+// A resumed session has no turn yet, so the status line would show no context
+// until the next result. Rebuild both figures from the stored transcript.
+function historyTokenUsage(messages, models, model) {
+  const total = {
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    cacheWriteInputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+  };
+  let last = null;
+  let counted = false;
+  for (const message of messages) {
+    if (message.type !== "assistant" || message.message?.model === "<synthetic>") continue;
+    const breakdown = tokenBreakdown(message.message?.usage);
+    if (!breakdown) continue;
+    counted = true;
+    for (const key of Object.keys(total)) total[key] += breakdown[key];
+    // Only the main thread occupies the context window; subagents run their own.
+    if (!message.parent_tool_use_id) last = breakdown;
+  }
+  if (!counted) return null;
+  const capabilities = modelCapabilities(models, model);
+  const contextWindow = Number(capabilities?.contextWindow || capabilities?.contextWindowSize || 0);
+  return {
+    total,
+    ...(last ? { last } : {}),
+    ...(contextWindow > 0 ? { modelContextWindow: contextWindow } : {}),
+  };
+}
+
 function processStreamEvent(session, message) {
   if (!session.turn || message.parent_tool_use_id) return;
   const event = message.event || {};
@@ -433,6 +481,14 @@ function processStreamEvent(session, message) {
 
 function processAssistant(session, message) {
   if (!session.turn || message.parent_tool_use_id) return;
+  session.lastContextUsage = tokenBreakdown(message.message?.usage);
+  const capabilities = modelCapabilities(
+    session.models,
+    message.message?.model || session.model,
+  );
+  session.lastContextWindow = Number(
+    capabilities?.contextWindow || capabilities?.contextWindowSize || 0,
+  );
   const content = Array.isArray(message.message?.content) ? message.message.content : [];
   for (const block of content) {
     if (block.type === "tool_use") processToolUse(session, block);
@@ -628,8 +684,8 @@ async function processResult(session, message) {
     threadId: session.id,
     tokenUsage: {
       total: totals,
-      last: totals,
-      modelContextWindow: totals.contextWindow || undefined,
+      ...(session.lastContextUsage ? { last: session.lastContextUsage } : {}),
+      modelContextWindow: session.lastContextWindow || totals.contextWindow || undefined,
     },
   });
   const error = message.is_error && !interrupted
@@ -733,6 +789,7 @@ async function startPrompt(params) {
   session.effort = effort;
   const turnId = `claude-turn-${session.turnSequence++}-${randomUUID()}`;
   session.turn = { id: turnId, sawStreamText: false };
+  session.lastContextUsage = null;
   notify("turn/started", { threadId: id, turn: { id: turnId } });
   session.queue.push({
     type: "user",
@@ -750,6 +807,23 @@ function contentBlocks(message) {
   return Array.isArray(content) ? content : [];
 }
 
+function isInternalHistoryText(message, text) {
+  if (message.isMeta || message.subtype === "local_command") return true;
+  const trimmed = text.trim();
+  const tag = trimmed.match(/^<([a-z0-9-]+)>/i)?.[1]?.toLowerCase();
+  return trimmed === "[Request interrupted by user]"
+    || [
+      "bash-input",
+      "bash-stdout",
+      "bash-stderr",
+      "command-name",
+      "local-command-caveat",
+      "local-command-stdout",
+      "local-command-stderr",
+      "task-notification",
+    ].includes(tag);
+}
+
 function historyTurns(messages) {
   const turns = [];
   let turn = null;
@@ -760,7 +834,9 @@ function historyTurns(messages) {
     const userText = message.type === "user"
       ? stripHandoff(blocks.filter((block) => block.type === "text").map((block) => block.text || "").join("\n"))
       : "";
-    if (userText && !blocks.some((block) => block.type === "tool_result")) {
+    if (userText
+      && !blocks.some((block) => block.type === "tool_result")
+      && !isInternalHistoryText(message, userText)) {
       turn = {
         id: `claude-turn-${message.uuid}`,
         status: "completed",
@@ -770,6 +846,16 @@ function historyTurns(messages) {
     }
     if (!turn) continue;
     if (message.type === "assistant") {
+      if (message.message?.model === "<synthetic>") {
+        turn.synthetic = true;
+        continue;
+      }
+      turn.synthetic = false;
+      if (!turn.model && message.message?.model) {
+        turn.model = visibleModel(message.message.model);
+        const prompt = turn.items.find((item) => item.type === "userMessage");
+        if (prompt) prompt.model = turn.model;
+      }
       for (const block of blocks) {
         if (block.type === "text") turn.items.push({ id: `${message.uuid}-text`, type: "agentMessage", text: block.text || "", provider: "Claude" });
         else if (block.type === "thinking") turn.items.push({ id: `${message.uuid}-thinking`, type: "reasoning", summary: [block.thinking || ""] });
@@ -814,7 +900,9 @@ function historyTurns(messages) {
     const text = [...tasks.values()].map((task, index) => `${task.status === "completed" ? "✓" : task.status === "in_progress" ? "▸" : "□"} ${numberedTaskSubject(task.subject, index)}`).join("\n");
     turn.items.push({ id: "claude-plan-latest", type: "plan", text });
   }
-  return turns;
+  return turns
+    .filter((candidate) => !candidate.synthetic)
+    .map(({ synthetic: _, ...candidate }) => candidate);
 }
 
 async function dispatch(method, params = {}) {
@@ -835,6 +923,7 @@ async function dispatch(method, params = {}) {
     const id = rawSession(params.sessionId);
     const existing = sessions.get(id);
     if (existing) {
+      const messages = await getSessionMessages(id, { dir: existing.cwd, includeSystemMessages: true });
       return {
         id,
         thread: { id, turns: [] },
@@ -844,6 +933,7 @@ async function dispatch(method, params = {}) {
         reasoningEffort: existing.effort,
         account: await safeAccount(existing.query),
         usage: await safeUsage(existing.query),
+        tokenUsage: historyTokenUsage(messages, existing.models, existing.model),
       };
     }
     const info = await getSessionInfo(id, { dir: params.cwd });
@@ -851,6 +941,10 @@ async function dispatch(method, params = {}) {
     const messages = await getSessionMessages(id, { dir: params.cwd, includeSystemMessages: true });
     const lastModel = [...messages].reverse().find((message) => message.type === "assistant")?.message?.model;
     const { session, account, usage } = await createSession({ ...params, cwd: info.cwd || params.cwd, model: params.model || lastModel }, id);
+    const tokenUsage = historyTokenUsage(messages, session.models, session.model);
+    // Seed the live session so the next turn keeps reporting a full context.
+    session.lastContextUsage = tokenUsage?.last || null;
+    session.lastContextWindow = tokenUsage?.modelContextWindow || 0;
     return {
       id,
       thread: { id, turns: [] },
@@ -860,6 +954,7 @@ async function dispatch(method, params = {}) {
       reasoningEffort: session.effort,
       account,
       usage,
+      tokenUsage,
     };
   }
   if (method === "session/list") {
@@ -942,6 +1037,59 @@ async function dispatch(method, params = {}) {
     return {};
   }
   throw new Error(`지원하지 않는 Claude 브리지 메서드: ${method}`);
+}
+
+function runSelfTest() {
+  const user = (uuid, text) => ({
+    type: "user",
+    uuid,
+    message: { role: "user", content: [{ type: "text", text }] },
+    origin: { kind: "human" },
+  });
+  const assistant = (uuid, model, text) => ({
+    type: "assistant",
+    uuid,
+    message: { role: "assistant", model, content: [{ type: "text", text }] },
+  });
+  const turns = historyTurns([
+    user("u1", "say hi"),
+    assistant("a1", "claude-opus-5", "hi."),
+    user("command", "<command-name>/model</command-name>"),
+    user("stdout", "<local-command-stdout>Set model to sonnet</local-command-stdout>"),
+    user("u2", "say hello"),
+    assistant("a2", "claude-sonnet-5", "Hello."),
+    user("bash", "<bash-stdout>hidden</bash-stdout>"),
+    user("u3", "hay zzz"),
+    assistant("a3", "claude-haiku-4-5-20251001", "hey."),
+    user("synthetic-user", "duplicate"),
+    assistant("synthetic", "<synthetic>", "No response requested."),
+  ]);
+  const prompts = turns.map((turn) => turn.items.find((item) => item.type === "userMessage"));
+  const expected = [
+    ["say hi", "claude:claude-opus-5"],
+    ["say hello", "claude:claude-sonnet-5"],
+    ["hay zzz", "claude:claude-haiku-4-5-20251001"],
+  ];
+  if (turns.length !== expected.length
+    || prompts.some((prompt, index) => prompt?.content?.[0]?.text !== expected[index][0]
+      || prompt.model !== expected[index][1])) {
+    throw new Error(`Claude history self-test failed: ${JSON.stringify(turns)}`);
+  }
+  const usage = tokenBreakdown({
+    input_tokens: 2,
+    cache_read_input_tokens: 68_000,
+    cache_creation_input_tokens: 500,
+    output_tokens: 300,
+  });
+  if (usage.totalTokens !== 68_802 || usage.inputTokens !== 68_502) {
+    throw new Error(`Claude usage self-test failed: ${JSON.stringify(usage)}`);
+  }
+  process.stdout.write("Claude bridge self-test passed\n");
+}
+
+if (process.argv.includes("--self-test")) {
+  runSelfTest();
+  process.exit(0);
 }
 
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
