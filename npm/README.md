@@ -1,8 +1,8 @@
 # Devez Vibe
 
-공식 `codex app-server`를 위한 차분한 터미널 클라이언트입니다. 인증, 하네스 프롬프트,
-도구, 스킬, `AGENTS.md`, 샌드박스는 Codex가 그대로 담당하고, 이 프로젝트는 화면과 입력
-계층만 소유합니다.
+공식 `codex app-server`와 Claude Agent SDK를 위한 차분한 터미널 클라이언트입니다.
+각 공식 런타임이 인증·도구·스킬·프로젝트 지침을 담당하고, 이 프로젝트는 공통 화면과
+입력 계층을 소유합니다.
 
 ## 설치
 
@@ -15,8 +15,9 @@ npm install -g devez-vibe
 | 요건 | 값 |
 | --- | --- |
 | OS | Windows x64 |
-| Node.js | 18 이상 (설치용. 실행 자체는 네이티브 바이너리) |
-| 전제 | Codex CLI 설치 및 로그인 완료 |
+| Node.js | 18 이상 (Claude Agent SDK 런타임 포함) |
+| Codex 전제 | Codex CLI 설치 및 로그인 완료 |
+| Claude 전제 | Claude Code 설치 후 `claude` 구독 로그인 완료 |
 
 현재 Windows x64 빌드만 배포합니다. 다른 플랫폼에서는 `EBADPLATFORM`으로 설치가 거부됩니다.
 
@@ -28,11 +29,21 @@ Codex CLI가 설치되고 로그인된 환경에서:
 dvz
 ```
 
+개인 Claude 구독 로그인 재사용:
+
+```powershell
+dvz --model claude
+dvz --model sonnet --effort high
+```
+
+Claude SDK 자식 프로세스는 API 키 환경변수를 제거하고 설치된 Claude Code 로그인만 사용합니다.
+본인 계정의 로컬 개인 사용만 대상으로 하며 로그인 공유나 제3자 인증은 제공하지 않습니다.
+
 주요 옵션:
 
 ```text
 dvz [--resume [SESSION] | --continue] [--model MODEL] [--effort EFFORT]
-    [--cwd PATH] [--codex PATH] [--theme THEME]
+    [--cwd PATH] [--codex PATH] [--claude PATH] [--theme THEME]
 ```
 
 `--resume`만 입력하면 검색 가능한 세션 피커를 열고, `--continue`는 현재 폴더의 가장 최근

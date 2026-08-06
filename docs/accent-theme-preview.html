@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Devez Vibe · Accent Theme Preview</title>
+  <style>
+    :root { color: #1b2430; background: #e8edf3; font-family: "Pretendard", "Noto Sans KR", system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 38px; }
+    header, main { max-width: 1320px; margin: auto; }
+    h1 { margin: 0 0 7px; font-size: 28px; letter-spacing: -.045em; }
+    header p { margin: 0 0 28px; color: #586577; }
+    main { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
+    .theme { --bg: #fff; --fg: #172033; --muted: #667487; --accent: #287783; --prompt: #e8f3f4; background: var(--bg); color: var(--fg); overflow: hidden; border: 1px solid color-mix(in srgb, var(--fg) 14%, transparent); border-radius: 18px; box-shadow: 0 16px 38px rgba(38, 51, 70, .1); }
+    .soft { --bg: #f2ede6; --fg: #2a2620; --muted: #766d60; --accent: #4f7d78; --prompt: #e0ebe5; }
+    .dark { --bg: #1f1f1e; --fg: #e8e8e8; --muted: #a9aaa8; --accent: #45c4c8; --prompt: #243437; box-shadow: 0 16px 38px rgba(0,0,0,.28); }
+    .head { display: flex; justify-content: space-between; align-items: center; padding: 18px 20px; border-bottom: 1px solid color-mix(in srgb, var(--fg) 13%, transparent); }
+    h2 { margin: 0; font-size: 17px; letter-spacing: -.02em; }
+    .swatch { color: var(--accent); font: 700 12px ui-monospace, Consolas, monospace; }
+    .terminal { min-height: 500px; padding: 22px 20px 25px; font: 13px/1.7 ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .status { color: var(--muted); margin-bottom: 18px; }
+    .prompt { margin: 0 0 17px; padding: 13px 14px; background: var(--prompt); border-left: 3px solid var(--accent); border-radius: 0 8px 8px 0; }
+    .prompt b { color: var(--accent); }
+    .assistant { margin: 0; }
+    .assistant .mark, .plan b { color: var(--accent); font-weight: 800; }
+    .assistant h3 { margin: 0 0 9px; color: var(--accent); font: 700 16px/1.4 "Pretendard", "Noto Sans KR", system-ui, sans-serif; letter-spacing: -.025em; }
+    .assistant p { margin: 0 0 10px; }
+    code { color: var(--accent); font: inherit; font-weight: 700; }
+    .plan { margin: 18px 0 0; padding: 12px 13px; border: 1px solid color-mix(in srgb, var(--accent) 42%, transparent); border-radius: 9px; }
+    .plan div { margin-top: 5px; color: var(--muted); }
+    .plan div:first-of-type { color: var(--fg); }
+    .foot { margin-top: 20px; padding-top: 14px; border-top: 1px solid color-mix(in srgb, var(--fg) 13%, transparent); color: var(--muted); }
+    .foot span { color: var(--accent); font-weight: 800; }
+    @media (max-width: 980px) { body { padding: 22px; } main { grid-template-columns: 1fr; max-width: 520px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>테마별 강조색 후보</h1>
+    <p>다크의 실제 청록 기준을 유지하면서, 밝은 화면에서는 읽기 편한 농도로만 낮췄습니다.</p>
+  </header>
+  <main>
+    <section class="theme minimal">
+      <div class="head"><h2>Minimal · cool white</h2><span class="swatch">#287783 · deep teal</span></div>
+      <div class="terminal">
+        <div class="status">Devez Vibe · Ready</div>
+        <div class="prompt"><b>›</b> resume 이력 복원 로딩을 추가해줘</div>
+        <article class="assistant"><h3><span class="mark">•</span> 적용 완료</h3><p>재개 세션은 전체 이력을 복원하는 동안 로딩 상태를 유지합니다.</p><p><code>busy</code> 신호는 복원이 끝난 뒤에만 해제됩니다.</p></article>
+        <div class="plan"><b>✢ 작업 단계</b><div>▸ resume 이력 복원 확인</div><div>□ DevezCode 로딩 표시 연동</div></div>
+        <div class="foot"><span>●</span> Completed (5s)</div>
+      </div>
+    </section>
+    <section class="theme soft">
+      <div class="head"><h2>Soft · warm cream</h2><span class="swatch">#4F7D78 · muted teal</span></div>
+      <div class="terminal">
+        <div class="status">Devez Vibe · Ready</div>
+        <div class="prompt"><b>›</b> resume 이력 복원 로딩을 추가해줘</div>
+        <article class="assistant"><h3><span class="mark">•</span> 적용 완료</h3><p>재개 세션은 전체 이력을 복원하는 동안 로딩 상태를 유지합니다.</p><p><code>busy</code> 신호는 복원이 끝난 뒤에만 해제됩니다.</p></article>
+        <div class="plan"><b>✢ 작업 단계</b><div>▸ resume 이력 복원 확인</div><div>□ DevezCode 로딩 표시 연동</div></div>
+        <div class="foot"><span>●</span> Completed (5s)</div>
+      </div>
+    </section>
+    <section class="theme dark">
+      <div class="head"><h2>Dark · charcoal</h2><span class="swatch">#45C4C8 · Codex teal</span></div>
+      <div class="terminal">
+        <div class="status">Devez Vibe · Ready</div>
+        <div class="prompt"><b>›</b> resume 이력 복원 로딩을 추가해줘</div>
+        <article class="assistant"><h3><span class="mark">•</span> 적용 완료</h3><p>재개 세션은 전체 이력을 복원하는 동안 로딩 상태를 유지합니다.</p><p><code>busy</code> 신호는 복원이 끝난 뒤에만 해제됩니다.</p></article>
+        <div class="plan"><b>✢ 작업 단계</b><div>▸ resume 이력 복원 확인</div><div>□ DevezCode 로딩 표시 연동</div></div>
+        <div class="foot"><span>●</span> Completed (5s)</div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

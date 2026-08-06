@@ -1,9 +1,9 @@
 [package]
 name = "devez-vibe"
-version = "0.1.42"
+version = "0.1.48"
 edition = "2024"
 license = "MIT"
-description = "A stable, clean-room terminal client for the official Codex app-server"
+description = "A stable terminal client for Codex and Claude Agent SDK"
 
 [[bin]]
 name = "dvz"

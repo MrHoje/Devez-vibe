@@ -2,6 +2,7 @@
 /target-*/
 /.gjc/
 /npm/bin/
+/npm/node_modules/
 /npm/LICENSE
 /.claude/
 /.superpowers/

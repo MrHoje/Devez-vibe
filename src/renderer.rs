@@ -113,6 +113,39 @@ pub struct Block {
     children: Vec<Block>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderHandoffBlock {
+    pub id: u64,
+    pub kind: &'static str,
+    pub title: String,
+    pub body: String,
+}
+
+impl ProviderHandoffBlock {
+    pub fn from_block(block: &Block) -> Option<Self> {
+        let kind = match block.kind {
+            BlockKind::User => "user",
+            BlockKind::Assistant => "assistant",
+            BlockKind::Reasoning => "reasoning",
+            BlockKind::Plan => "plan",
+            BlockKind::Tool => "tool",
+            BlockKind::FileChange | BlockKind::Diff => "file_change",
+            BlockKind::Welcome
+            | BlockKind::Update
+            | BlockKind::ModelChange
+            | BlockKind::Warning
+            | BlockKind::Error
+            | BlockKind::System => return None,
+        };
+        Some(Self {
+            id: block.id,
+            kind,
+            title: block.title.clone(),
+            body: block.body.clone(),
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct LiveBlockView<'a> {
     pub block: &'a Block,
@@ -171,8 +204,8 @@ impl Block {
 
     /// Credits come last so the variable-length list survives the round trip
     /// through [`BlockKind::Welcome`]'s newline-delimited body.
-    pub fn welcome(plan: &str, cwd: &str, account: &str, credits: &[String]) -> Self {
-        let mut body = format!("{plan}\n{cwd}\n{account}");
+    pub fn welcome(provider: &str, plan: &str, cwd: &str, account: &str, credits: &[String]) -> Self {
+        let mut body = format!("{provider}\n{plan}\n{cwd}\n{account}");
         for line in credits {
             body.push('\n');
             body.push_str(line);
@@ -209,6 +242,11 @@ pub enum OverlayStyle {
     Panel,
     CompactPanel,
     Picker,
+    /// A question the server is waiting on: no box, a badge for the header, a
+    /// bold prompt, and numbered options. The first row is the prompt and the
+    /// last is the row that hands the turn back to the composer, which is why
+    /// the rule above it is the renderer's to draw.
+    Question,
 }
 
 #[derive(Clone)]
@@ -219,6 +257,7 @@ pub struct OverlayLine {
 }
 
 pub struct WelcomeView {
+    pub provider: String,
     pub plan: String,
     /// Reset-credit rows: a summary first, then one line per credit.
     pub credits: Vec<String>,
@@ -677,6 +716,20 @@ impl Renderer {
 
     pub const fn mode(&self) -> RenderMode {
         self.mode
+    }
+
+    /// Provider runtimes cannot resume each other's native session IDs. This
+    /// keeps the portable, user-visible part of the transcript available for a
+    /// handoff while leaving welcome cards and local UI notices behind.
+    pub fn provider_handoff_blocks(&self) -> Vec<ProviderHandoffBlock> {
+        self.history
+            .iter()
+            .filter_map(ProviderHandoffBlock::from_block)
+            .collect()
+    }
+
+    pub fn last_history_block_id(&self) -> u64 {
+        self.history.iter().map(Block::id).max().unwrap_or_default()
     }
 
     /// Moves the transcript view by `delta` rows, positive being back into
@@ -1361,11 +1414,10 @@ impl Renderer {
             rows.push((*screen_row, previous, current, repaint_plan_row));
         }
 
-        if self.cursor_shown {
-            queue!(self.out, Hide)?;
-            self.cursor_shown = false;
-        }
         queue!(self.out, Print("\x1b[?2026h"))?;
+        // 시머·스피너 프레임은 커서 행을 건드리지 않는다. 여기서 Hide/Show를
+        // 반복하면 80ms마다 커서 깜빡임이 초기화돼 컴포저 커서가 떨리므로,
+        // 동기 업데이트로 중간 그리기를 감추고 커서 표시 상태는 그대로 둔다.
         let mut result = Ok(());
         for (screen_row, previous, current, repaint_plan_row) in &rows {
             // A changed plan step can shorten or restyle wide Korean text. Clear
@@ -1378,11 +1430,9 @@ impl Renderer {
                 break;
             }
         }
-        let end = queue!(self.out, Print("\x1b[?2026l"));
-        match (result, end) {
-            (Err(error), _) => return Err(error),
-            (Ok(()), Err(error)) => return Err(error.into()),
-            (Ok(()), Ok(())) => {}
+        if let Err(error) = result {
+            queue!(self.out, Print("\x1b[?2026l"))?;
+            return Err(error);
         }
 
         if let Some(painted) = self.painted_frame.as_mut() {
@@ -1398,10 +1448,13 @@ impl Renderer {
                     .min(width.saturating_sub(2))
                     .min(u16::MAX as usize) as u16,
                 self.cursor_line.min(u16::MAX as usize) as u16
-            ),
-            Show
+            )
         )?;
-        self.cursor_shown = true;
+        if !self.cursor_shown {
+            queue!(self.out, Show)?;
+            self.cursor_shown = true;
+        }
+        queue!(self.out, Print("\x1b[?2026l"))?;
         self.painted_hovered_tool = self.hovered_tool;
         self.painted_hovered_pick = self.hovered_pick.clone();
         self.out.flush()?;
@@ -1639,36 +1692,25 @@ impl Renderer {
         if let Some((row, control)) = scroll_to_bottom_overlay {
             paint_scroll_to_bottom_into_frame(&mut frame, row, control);
         }
-        // Frame diffs move the terminal cursor across changed rows. Hide it
-        // while painting so shortcuts that only change chrome do not make the
-        // composer caret visibly jump before it returns to its final position.
-        if self.cursor_shown {
-            queue!(self.out, Hide)?;
-            self.cursor_shown = false;
-        }
         emit_synchronized_frame_diff_with_full_rows(
             &mut self.out,
             self.painted_frame.as_ref(),
             &frame,
             full_repaint_rows,
+            Some((
+                cursor_col
+                    .min(usize::from(total_width).saturating_sub(2))
+                    .min(u16::MAX as usize) as u16,
+                cursor_line.min(u16::MAX as usize) as u16,
+                show_cursor,
+            )),
+            self.cursor_shown,
         )?;
         self.painted_frame = Some(frame);
         self.painted_selection = selection;
         self.painted_hovered_tool = self.hovered_tool;
         self.painted_hovered_pick = self.hovered_pick.clone();
-        queue!(
-            self.out,
-            MoveTo(
-                cursor_col
-                    .min(usize::from(total_width).saturating_sub(2))
-                    .min(u16::MAX as usize) as u16,
-                cursor_line.min(u16::MAX as usize) as u16
-            )
-        )?;
-        if show_cursor && !self.cursor_shown {
-            queue!(self.out, Show)?;
-            self.cursor_shown = true;
-        }
+        self.cursor_shown = show_cursor;
         Ok(())
     }
 
@@ -2045,12 +2087,16 @@ fn emit_frame_diff_at(
     let previous = previous.filter(|frame| frame.width == current.width && frame.height == current.height);
     for row in 0..current.height {
         let screen_row = row.saturating_add(row_offset);
-        if row_repaints_sequentially(previous, current, row) {
-            emit_row_sequential(out, current, row, screen_row)?;
-            continue;
+        let wide_damage = previous.and_then(|previous| wide_damage_range(previous, current, row));
+        if let Some(columns) = wide_damage.clone() {
+            emit_frame_columns(out, current, row, screen_row, columns)?;
         }
         let mut column = 0;
         while column < current.width {
+            if wide_damage.as_ref().is_some_and(|columns| columns.contains(&column)) {
+                column += 1;
+                continue;
+            }
             let cell = current.cell(column, row);
             let changed = previous.is_none_or(|previous| cell != previous.cell(column, row));
             if !changed || cell.continuation {
@@ -2077,6 +2123,9 @@ fn emit_frame_diff_at(
             let style = cell.style;
             let mut text = String::new();
             while column + 1 < current.width {
+                if wide_damage.as_ref().is_some_and(|columns| columns.contains(&column)) {
+                    break;
+                }
                 let cell = current.cell(column, row);
                 let changed = previous.is_none_or(|previous| cell != previous.cell(column, row));
                 if !changed || (!cell.continuation && cell.style != style) {
@@ -2102,83 +2151,91 @@ fn emit_frame_diff_at(
     Ok(())
 }
 
-/// ConPTY hosts (Windows Terminal, WebView2 + xterm.js) re-synthesize the
-/// application's escape stream from their own buffer, and a cursor jump into
-/// the middle of a row holding double-width glyphs can come back out with each
-/// glyph duplicated and the columns drifted. So any change that touches a wide
-/// cell — in the old row or the new one — repaints its whole row in a single
-/// left-to-right pass, the one output shape that survives every host. Rows of
-/// narrow cells keep the cheap local diff.
-fn row_repaints_sequentially(
-    previous: Option<&CellFrame>,
-    current: &CellFrame,
-    row: usize,
-) -> bool {
-    let wide = |cell: &Cell| cell.continuation || UnicodeWidthStr::width(cell.glyph.as_str()) > 1;
-    (0..current.width).any(|column| {
+/// Returns the smallest safe repaint range around changed double-width glyphs.
+/// The range starts before any old/current continuation cell and ends after it,
+/// so a terminal is never asked to paint into the trailing half of a glyph.
+/// Keeping this local avoids clearing and flashing the entire composer row for
+/// every Korean character typed.
+fn wide_damage_range(previous: &CellFrame, current: &CellFrame, row: usize) -> Option<Range<usize>> {
+    let mut changed = (0..current.width).filter(|&column| {
+        let before = previous.cell(column, row);
         let after = current.cell(column, row);
-        match previous {
-            None => wide(after),
-            Some(previous) => {
-                let before = previous.cell(column, row);
-                before != after && (wide(before) || wide(after))
-            }
-        }
-    })
+        before != after
+            && (before.continuation
+                || after.continuation
+                || UnicodeWidthStr::width(before.glyph.as_str()) > 1
+                || UnicodeWidthStr::width(after.glyph.as_str()) > 1)
+    });
+    let mut start = changed.next()?;
+    let mut end = changed.last().unwrap_or(start) + 1;
+
+    while start > 0
+        && (previous.cell(start, row).continuation || current.cell(start, row).continuation)
+    {
+        start -= 1;
+    }
+    while end < current.width
+        && (previous.cell(end, row).continuation || current.cell(end, row).continuation)
+    {
+        end += 1;
+    }
+    Some(start..end)
 }
 
-/// Paints one whole row from column zero without any mid-row cursor motion:
-/// style runs are printed back to back, so the terminal's own cursor advance
-/// walks the wide glyphs, and the final cell is filled by an erase instead of
-/// a printed glyph so autowrap can never spill into the next row.
-fn emit_row_sequential(
+fn emit_frame_columns(
     out: &mut impl Write,
     frame: &CellFrame,
     row: usize,
     screen_row: usize,
+    columns: Range<usize>,
 ) -> Result<()> {
-    if frame.width == 0 {
-        return Ok(());
-    }
-    queue!(out, MoveTo(0, screen_row.min(u16::MAX as usize) as u16))?;
-    let mut column = 0;
-    while column + 1 < frame.width {
-        let style = frame.cell(column, row).style;
+    let mut column = columns.start.min(frame.width);
+    let end = columns.end.min(frame.width);
+    while column < end {
+        let cell = frame.cell(column, row);
+        if cell.continuation {
+            column += 1;
+            continue;
+        }
+        if column + 1 == frame.width {
+            queue!(
+                out,
+                MoveTo(
+                    column.min(u16::MAX as usize) as u16,
+                    screen_row.min(u16::MAX as usize) as u16
+                )
+            )?;
+            set_cell_style(out, cell.style)?;
+            queue!(out, Clear(ClearType::UntilNewLine))?;
+            column += 1;
+            continue;
+        }
+        let style = cell.style;
+        let start = column;
         let mut text = String::new();
-        while column + 1 < frame.width {
+        while column < end && column + 1 < frame.width {
             let cell = frame.cell(column, row);
             if !cell.continuation && cell.style != style {
                 break;
             }
-            if !cell.continuation {
+            if cell.continuation {
+                column += 1;
+            } else {
                 text.push_str(&cell.glyph);
+                column += terminal_unit_width(&cell.glyph).max(1);
             }
-            column += 1;
         }
+        queue!(
+            out,
+            MoveTo(
+                start.min(u16::MAX as usize) as u16,
+                screen_row.min(u16::MAX as usize) as u16
+            )
+        )?;
         set_cell_style(out, style)?;
         queue!(out, Print(text))?;
     }
-    set_cell_style(out, frame.cell(frame.width - 1, row).style)?;
-    queue!(out, Clear(ClearType::UntilNewLine))?;
     Ok(())
-}
-
-/// Let terminals that implement synchronized updates show a complete frame at
-/// once. Unknown terminals ignore these private-mode escapes and still receive
-/// the ordinary, coalesced diff.
-fn emit_synchronized_frame_diff(
-    out: &mut impl Write,
-    previous: Option<&CellFrame>,
-    current: &CellFrame,
-) -> Result<()> {
-    queue!(out, Print("\x1b[?2026h"))?;
-    let result = emit_frame_diff(out, previous, current);
-    let end = queue!(out, Print("\x1b[?2026l"));
-    match (result, end) {
-        (Err(error), _) => Err(error),
-        (Ok(()), Err(error)) => Err(error.into()),
-        (Ok(()), Ok(())) => Ok(()),
-    }
 }
 
 /// A semantic plan change can alter the fixed panel height, which also moves
@@ -2190,13 +2247,24 @@ fn emit_synchronized_frame_diff_with_full_rows(
     previous: Option<&CellFrame>,
     current: &CellFrame,
     full_rows: &[usize],
+    cursor: Option<(u16, u16, bool)>,
+    cursor_shown: bool,
 ) -> Result<()> {
-    if full_rows.is_empty() {
-        return emit_synchronized_frame_diff(out, previous, current);
-    }
-
     queue!(out, Print("\x1b[?2026h"))?;
-    let result = emit_frame_diff(out, None, current);
+    // 커서를 매 프레임 껐다 켜면 터미널이 깜빡임 위상을 그때마다 초기화해 컴포저
+    // 커서가 떨린다. 동기 업데이트가 중간 상태를 감추므로 표시 여부가 실제로
+    // 바뀔 때만 Hide/Show를 보낸다.
+    if cursor.is_some_and(|(_, _, show)| !show) && cursor_shown {
+        queue!(out, Hide)?;
+    }
+    let previous = if full_rows.is_empty() { previous } else { None };
+    let result = emit_frame_diff(out, previous, current);
+    if let Some((column, row, show)) = cursor {
+        queue!(out, MoveTo(column, row))?;
+        if show && !cursor_shown {
+            queue!(out, Show)?;
+        }
+    }
     let end = queue!(out, Print("\x1b[?2026l"));
     match (result, end) {
         (Err(error), _) => Err(error),
@@ -2293,6 +2361,8 @@ enum Tone {
     PlanDone,
     Accent,
     User,
+    /// A question's header, worn as a filled badge rather than a box rule.
+    QuestionBadge,
     /// A centred transcript control: default text on a compact button band.
     ScrollToBottom,
     #[allow(dead_code)]
@@ -2319,12 +2389,20 @@ enum Tone {
     ModelLuna,
     ModelSpark,
     Model55,
+    ModelHaiku,
+    ModelSonnet,
+    ModelOpus,
+    ModelFable,
     StatusModel56,
     StatusModelSol,
     StatusModelTerra,
     StatusModelLuna,
     StatusModelSpark,
     StatusModel55,
+    StatusModelHaiku,
+    StatusModelSonnet,
+    StatusModelOpus,
+    StatusModelFable,
     StatusEffortLow,
     StatusEffortMedium,
     StatusEffortHigh,
@@ -3213,8 +3291,9 @@ fn welcome_info_rows(welcome: &WelcomeView, column_width: usize) -> Vec<PanelRow
     let mut rows = vec![
         (
             format!(
-                "  ✦  DEVEZ VIBE  v{}  with Codex",
-                crate::update::CURRENT_VERSION
+                "  ✦  DEVEZ VIBE  v{}  with {}",
+                crate::update::CURRENT_VERSION,
+                welcome.provider
             ),
             Tone::Accent,
             true,
@@ -3359,6 +3438,39 @@ fn column_cell(row: Option<&PanelRow>, width: usize) -> PanelRow {
     };
     let padding = width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
     (format!("{text}{}", " ".repeat(padding)), tone, bold)
+}
+
+/// The margin a boxless question keeps, so its rows sit where a panel's own
+/// text would have sat rather than hard against the terminal edge.
+const QUESTION_INDENT: &str = " ";
+
+/// The header of a question, worn as a filled badge. The padding is inside the
+/// span so the colour runs a cell past the label on either side.
+fn question_badge_row(title: &str) -> PaintLine {
+    PaintLine {
+        prefix: QUESTION_INDENT.to_owned(),
+        prefix_tone: Tone::Plain,
+        text: format!(" □ {title} "),
+        tone: Tone::QuestionBadge,
+        bold: true,
+        tool_heading: None,
+        pick: None,
+        tail: Vec::new(),
+    }
+}
+
+/// The rule that separates the answers from the row that walks away from them.
+fn question_rule_row(span: usize) -> PaintLine {
+    PaintLine {
+        prefix: QUESTION_INDENT.to_owned(),
+        prefix_tone: Tone::Border,
+        text: "─".repeat(span.saturating_sub(QUESTION_INDENT.len())),
+        tone: Tone::Border,
+        bold: false,
+        tool_heading: None,
+        pick: None,
+        tail: Vec::new(),
+    }
 }
 
 /// Panels share the composer's span so their borders line up with the rule.
@@ -3932,6 +4044,9 @@ fn overlay_frame_with_expansion(
                     } else {
                         "│     "
                     };
+                    // A detail line folds back under itself, not under the label
+                    // above it, so its own indent is the continuation indent.
+                    let continuation = if part_index == 0 { "│   " } else { "│     " };
                     let tone = if row.muted {
                         Tone::Muted
                     } else if part.contains('●') && part.contains('○') {
@@ -3941,7 +4056,7 @@ fn overlay_frame_with_expansion(
                     };
                     let wrapped = wrapped_line_with_continuation(
                         prefix,
-                        "│   ",
+                        continuation,
                         Tone::Border,
                         part,
                         tone,
@@ -4048,13 +4163,23 @@ fn overlay_frame_with_expansion(
                     } else {
                         "│     "
                     };
+                    // A detail line folds back under itself, not under the label
+                    // above it, so its own indent is the continuation indent.
+                    let continuation = if part_index == 0 { "│   " } else { "│     " };
+                    // The line under a label is that label's detail, not a claim
+                    // of its own: it reads as the quieter half of one row.
+                    let tone = if row.muted || part_index > 0 {
+                        Tone::Muted
+                    } else {
+                        Tone::Plain
+                    };
                     // Reserve the closing border before wrapping, not after.
                     let wrapped = wrapped_line_with_continuation(
                         prefix,
-                        "│   ",
+                        continuation,
                         Tone::Border,
                         part,
-                        if row.muted { Tone::Muted } else { Tone::Plain },
+                        tone,
                         row.selected && part_index == 0,
                         (panel_width.saturating_sub(1)).min(u16::MAX as usize) as u16,
                     );
@@ -4076,6 +4201,88 @@ fn overlay_frame_with_expansion(
             }
             lines.push(panel_padding_row(panel_width));
             lines.push(panel_rule_row("╰─ ", &overlay.hint, '╯', panel_width));
+        }
+        OverlayStyle::Question => {
+            let span = panel_span(width);
+            lines.push(question_badge_row(&overlay.title));
+            lines.push(PaintLine::blank());
+
+            let mut rows = overlay.lines.iter().enumerate();
+            if let Some((_, prompt)) = rows.next() {
+                lines.extend(
+                    wrapped_line_with_continuation(
+                        QUESTION_INDENT,
+                        QUESTION_INDENT,
+                        Tone::Plain,
+                        &prompt.text,
+                        Tone::Plain,
+                        true,
+                        span.min(u16::MAX as usize) as u16,
+                    )
+                    .into_iter()
+                    .map(|mut line| {
+                        line.bold = true;
+                        line
+                    }),
+                );
+                lines.push(PaintLine::blank());
+            }
+
+            // Options are numbered from one, and the number column is as wide as
+            // the last number so every label starts on the same column.
+            let option_count = overlay.lines.len().saturating_sub(1);
+            let number_width = option_count.max(1).to_string().len();
+            let label_column = QUESTION_INDENT.len() + 2 + number_width + 2;
+            let last = overlay.lines.len().saturating_sub(1);
+            for (row_index, row) in rows {
+                // The final row leaves the question rather than answering it, so
+                // a rule sets it apart from the answers above.
+                if row_index == last && option_count > 1 {
+                    lines.push(question_rule_row(span));
+                }
+                let number = row_index;
+                for (part_index, part) in row.text.lines().enumerate() {
+                    let prefix = if part_index == 0 {
+                        format!(
+                            "{QUESTION_INDENT}{} {number:>number_width$}. ",
+                            if row.selected { "❯" } else { " " }
+                        )
+                    } else {
+                        " ".repeat(label_column)
+                    };
+                    let tone = if part_index > 0 || row.muted {
+                        Tone::Muted
+                    } else if row.selected {
+                        Tone::Accent
+                    } else {
+                        Tone::Plain
+                    };
+                    lines.extend(
+                        wrapped_line_with_continuation(
+                            &prefix,
+                            &" ".repeat(label_column),
+                            if row.selected { Tone::Accent } else { Tone::Muted },
+                            part,
+                            tone,
+                            part_index == 0 && !row.muted,
+                            span.min(u16::MAX as usize) as u16,
+                        )
+                        .into_iter()
+                        .map(|line| line.with_picks(&[(0, Pick::Row(row_index))])),
+                    );
+                }
+            }
+            lines.push(PaintLine::blank());
+            lines.push(PaintLine {
+                prefix: QUESTION_INDENT.to_owned(),
+                prefix_tone: Tone::Muted,
+                text: compact_right(&overlay.hint, span.saturating_sub(QUESTION_INDENT.len())),
+                tone: Tone::Muted,
+                bold: false,
+                tool_heading: None,
+                pick: None,
+                tail: Vec::new(),
+            });
         }
     }
     let mut cursor_line = lines.len() - 1;
@@ -4170,6 +4377,10 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         };
     };
 
+    let has_effort = status
+        .effort
+        .as_deref()
+        .is_some_and(|effort| !effort.is_empty());
     let mut spans = Vec::new();
     let mut picks = Vec::new();
     if let Some(model) = status.model.filter(|model| !model.is_empty()) {
@@ -4210,7 +4421,11 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
     // Align with the activity controls above by keeping two blank terminal
     // columns to the right of the status line.
     let max_width = width.saturating_sub(3) as usize;
-    let shortcut_hint = "Shift + ↑↓ model · ←→ effort";
+    let shortcut_hint = if has_effort {
+        "Shift + ↑↓ model · ←→ effort"
+    } else {
+        "Shift + ↑↓ model"
+    };
     let content_width = spans
         .iter()
         .map(|span| UnicodeWidthStr::width(span.text.as_str()))
@@ -5261,6 +5476,7 @@ fn block_lines_with_mode(
         let mut values = block.body.lines();
         let mut lines = welcome_lines(
             WelcomeView {
+                provider: values.next().unwrap_or("Codex").to_owned(),
                 plan: values.next().unwrap_or_default().to_owned(),
                 credits_expanded: false,
                 cwd: values.next().unwrap_or_default().to_owned(),
@@ -5760,6 +5976,8 @@ fn block_lines_with_expansion(block: &Block, width: u16, expanded: bool) -> Vec<
 fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     let marker_tone = model_tone(&block.title).unwrap_or(Tone::User);
     if !CHAT_LAYOUT.load(Ordering::Relaxed) {
+        // 세로선은 블록에 기록된 전송 시점 모델 색을 쓰고, 모델을 못 알아보면 기존 강조색으로 돌아간다.
+        let border_tone = model_tone(&block.title).unwrap_or(Tone::Accent);
         let lines = block
             .body
             .lines()
@@ -5767,7 +5985,7 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
                 wrapped_line_with_continuation(
                     "▌ ",
                     "▌ ",
-                    Tone::Accent,
+                    border_tone,
                     line,
                     Tone::UserPrompt,
                     false,
@@ -5778,7 +5996,7 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         let padding_width = usize::from(width).saturating_sub(2);
         let mut top = PaintLine::user_prompt_padding(padding_width);
         top.prefix = "▌ ".to_owned();
-        top.prefix_tone = Tone::Accent;
+        top.prefix_tone = border_tone;
         let bottom = top.clone();
         let mut lines = lines;
         lines.insert(0, top);
@@ -7042,7 +7260,18 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
         ]
     });
     let primary_spans = custom_spans.unwrap_or_else(|| vec![vibe_mode_span.clone()]);
-    // Fast is the only optional trailing control.
+    let without_fast = BadgeSpans {
+        spans: [display_spans.clone(), primary_spans.clone()].concat(),
+        response_length_index: Some(display_width),
+        shell_display_mode_index: None,
+        diff_display_mode_index: None,
+        fast_index: None,
+    };
+    if mode.model.starts_with("claude:") {
+        return (spans_width(&without_fast.spans) <= budget).then_some(without_fast);
+    }
+
+    // Fast is the only optional trailing control for models that expose it.
     let ladder = [
         BadgeSpans {
             spans: [
@@ -7056,13 +7285,7 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
             diff_display_mode_index: None,
             fast_index: Some(display_width + primary_spans.len() + 1),
         },
-        BadgeSpans {
-            spans: [display_spans, primary_spans.clone()].concat(),
-            response_length_index: Some(display_width),
-            shell_display_mode_index: None,
-            diff_display_mode_index: None,
-            fast_index: None,
-        },
+        without_fast,
     ];
     ladder
         .into_iter()
@@ -7350,12 +7573,17 @@ fn word_background(tone: Tone) -> Option<Rgb> {
         Tone::DiffAddedWord => palette.diff_add_word_bg,
         Tone::DiffRemovedWord => palette.diff_remove_word_bg,
         Tone::ScrollToBottom => palette.hover_bg,
+        Tone::QuestionBadge => palette.accent,
         Tone::StatusModel56 => blend(palette.background, palette.model_gpt56, 46),
         Tone::StatusModelSol => blend(palette.background, palette.model_sol, 46),
         Tone::StatusModelTerra => blend(palette.background, palette.model_terra, 46),
         Tone::StatusModelLuna => blend(palette.background, palette.model_luna, 46),
         Tone::StatusModelSpark => blend(palette.background, palette.model_spark, 46),
         Tone::StatusModel55 => blend(palette.background, palette.model_gpt55, 46),
+        Tone::StatusModelHaiku => blend(palette.background, palette.status.model_haiku, 46),
+        Tone::StatusModelSonnet => blend(palette.background, palette.status.model_sonnet, 46),
+        Tone::StatusModelOpus => blend(palette.background, palette.status.model_opus, 46),
+        Tone::StatusModelFable => blend(palette.background, palette.status.model_fable, 46),
         _ => return None,
     })
 }
@@ -7596,7 +7824,15 @@ fn set_selection_style(
 
 fn model_tone(model: &str) -> Option<Tone> {
     let model = model.to_ascii_lowercase();
-    if model.contains("spark") {
+    if model.contains("haiku") {
+        Some(Tone::ModelHaiku)
+    } else if model.contains("sonnet") {
+        Some(Tone::ModelSonnet)
+    } else if model.contains("opus") {
+        Some(Tone::ModelOpus)
+    } else if model.contains("fable") {
+        Some(Tone::ModelFable)
+    } else if model.contains("spark") {
         Some(Tone::ModelSpark)
     } else if model.contains("5.6") && model.contains("sol") {
         Some(Tone::ModelSol)
@@ -7621,6 +7857,10 @@ fn status_model_tone(model: &str) -> Option<Tone> {
         Tone::ModelLuna => Some(Tone::StatusModelLuna),
         Tone::ModelSpark => Some(Tone::StatusModelSpark),
         Tone::Model55 => Some(Tone::StatusModel55),
+        Tone::ModelHaiku => Some(Tone::StatusModelHaiku),
+        Tone::ModelSonnet => Some(Tone::StatusModelSonnet),
+        Tone::ModelOpus => Some(Tone::StatusModelOpus),
+        Tone::ModelFable => Some(Tone::StatusModelFable),
         _ => None,
     }
 }
@@ -7648,6 +7888,8 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::Accent => palette.accent,
         Tone::User => palette.blue,
         Tone::ScrollToBottom => palette.foreground,
+        // The badge paints its own field, so the label reads as the hole in it.
+        Tone::QuestionBadge => palette.background,
         Tone::Success => palette.success,
         Tone::Warning => palette.warning,
         Tone::Error => palette.error,
@@ -7671,12 +7913,20 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::ModelLuna => palette.model_luna,
         Tone::ModelSpark => palette.model_spark,
         Tone::Model55 => palette.model_gpt55,
+        Tone::ModelHaiku => palette.status.model_haiku,
+        Tone::ModelSonnet => palette.status.model_sonnet,
+        Tone::ModelOpus => palette.status.model_opus,
+        Tone::ModelFable => palette.status.model_fable,
         Tone::StatusModel56 => palette.model_gpt56,
         Tone::StatusModelSol => palette.model_sol,
         Tone::StatusModelTerra => palette.model_terra,
         Tone::StatusModelLuna => palette.model_luna,
         Tone::StatusModelSpark => palette.model_spark,
         Tone::StatusModel55 => palette.model_gpt55,
+        Tone::StatusModelHaiku => palette.status.model_haiku,
+        Tone::StatusModelSonnet => palette.status.model_sonnet,
+        Tone::StatusModelOpus => palette.status.model_opus,
+        Tone::StatusModelFable => palette.status.model_fable,
         Tone::StatusEffortLow => palette.status.effort_low,
         Tone::StatusEffortMedium => palette.status.effort_medium,
         Tone::StatusEffortHigh => palette.status.effort_high,
@@ -7926,8 +8176,15 @@ mod tests {
         current.write(0, 0, "x", CellStyle::plain());
 
         let mut output = Vec::new();
-        emit_synchronized_frame_diff(&mut output, Some(&previous), &current)
-            .expect("synchronized frame diff emits");
+        emit_synchronized_frame_diff_with_full_rows(
+            &mut output,
+            Some(&previous),
+            &current,
+            &[],
+            None,
+            true,
+        )
+        .expect("synchronized frame diff emits");
 
         let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
         assert!(output.starts_with("\x1b[?2026h"));
@@ -7951,14 +8208,31 @@ mod tests {
     }
 
     #[test]
-    fn changed_korean_text_repaints_its_whole_row_in_one_pass() {
+    fn changed_korean_text_uses_a_local_safe_repaint_range() {
+        let mut before = CellFrame::new(16, 1);
+        before.write(0, 0, "한글 단어", CellStyle::plain());
+        let mut after = CellFrame::new(16, 1);
+        after.write(0, 0, "한글 ", CellStyle::plain());
+
+        let damage = wide_damage_range(&before, &after, 0).expect("wide text changed");
+        assert_eq!(damage, 5..9);
+    }
+
+    #[test]
+    fn changed_korean_text_does_not_clear_or_repaint_the_whole_row() {
         let background = Rgb(1, 2, 3);
         let style = CellStyle {
             background: Some(background),
             ..CellStyle::plain()
         };
         let mut before = CellFrame::new(16, 1);
-        before.fill(0, 0, 16, 1, style);
+        before.fill(
+            0,
+            0,
+            16,
+            1,
+            style,
+        );
         before.write(4, 0, "한글 단어", style);
         let mut after = CellFrame::new(16, 1);
         after.fill(0, 0, 16, 1, style);
@@ -7968,43 +8242,28 @@ mod tests {
         emit_frame_diff(&mut output, Some(&before), &after).expect("frame diff emits");
 
         let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
-        assert!(output.contains("\x1b[1;1H"));
-        assert_eq!(output.matches('H').count(), 1, "no mid-row cursor jumps");
-        assert!(output.contains("한글 새"));
-        assert!(output.contains("\x1b[K"));
+        assert!(!output.contains("\x1b[2K"));
+        assert!(!output.contains("\x1b[1;1H"));
+        assert!(output.contains("새"));
     }
 
     #[test]
-    fn korean_text_shift_repaints_from_the_row_start_not_a_continuation() {
+    fn korean_text_shift_repaints_from_a_leading_cell_not_a_continuation() {
         let mut before = CellFrame::new(12, 1);
         before.write(4, 0, "한", CellStyle::plain());
         let mut after = CellFrame::new(12, 1);
         after.write(4, 0, "x한", CellStyle::plain());
 
+        assert_eq!(wide_damage_range(&before, &after, 0), Some(4..7));
+
         let mut output = Vec::new();
         emit_frame_diff(&mut output, Some(&before), &after).expect("frame diff emits");
         let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
 
-        assert!(output.contains("\x1b[1;1H"));
+        assert!(output.contains("\x1b[1;5H"));
         assert!(output.contains("x한"));
-        assert!(!output.contains("\x1b[1;5H"));
         assert!(!output.contains("\x1b[1;6H"));
-    }
-
-    #[test]
-    fn narrow_spinner_change_in_a_wide_row_keeps_the_local_diff() {
-        let mut before = CellFrame::new(24, 1);
-        before.write(2, 0, "▸", CellStyle::plain());
-        before.write(6, 0, "한글 단계", CellStyle::plain());
-        let mut after = before.clone();
-        after.write(2, 0, "✔", CellStyle::plain());
-
-        let mut output = Vec::new();
-        emit_frame_diff(&mut output, Some(&before), &after).expect("frame diff emits");
-        let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
-
-        assert!(output.contains("\x1b[1;3H"));
-        assert!(!output.contains("한글"), "unchanged wide text is not resent");
+        assert!(!output.contains("\x1b[2K"));
     }
 
     #[test]
@@ -8037,7 +8296,17 @@ mod tests {
             failed: false,
         };
 
-        assert!(emit_synchronized_frame_diff(&mut output, Some(&previous), &current).is_err());
+        assert!(
+            emit_synchronized_frame_diff_with_full_rows(
+                &mut output,
+                Some(&previous),
+                &current,
+                &[],
+                None,
+                false,
+            )
+            .is_err()
+        );
         assert!(
             String::from_utf8(output.bytes)
                 .expect("terminal bytes are UTF-8")
@@ -8478,10 +8747,13 @@ mod tests {
             .iter()
             .find(|line| line.text == "dvz-debug")
             .expect("unframed code row");
+        // A response list keeps the reply marker instead of repeating "- " on
+        // every row, so the continuation rows carry a plain indent.
         let bullet = lines
             .iter()
-            .find(|line| line.prefix == "  - ")
+            .find(|line| line.text == "실행 대상")
             .expect("indented bullet");
+        assert_eq!(bullet.prefix, "  ");
         let full_row = |line: &PaintLine, row| CellRange {
             start: CellPosition { column: 0, row },
             end: CellPosition {
@@ -8507,7 +8779,7 @@ mod tests {
         assert!(renderer.update_selection(painted_line_width(bullet).saturating_sub(1) as u16, 0));
         assert_eq!(
             renderer.finish_selection(painted_line_width(bullet).saturating_sub(1) as u16, 0),
-            SelectionResult::Copy("- 실행 대상".to_owned())
+            SelectionResult::Copy("실행 대상".to_owned())
         );
     }
 
@@ -8636,254 +8908,50 @@ mod tests {
         current.write(0, 0, "새 작업", CellStyle::plain());
 
         let mut output = Vec::new();
-        emit_synchronized_frame_diff_with_full_rows(&mut output, Some(&previous), &current, &[0])
-            .expect("plan update emits");
+        emit_synchronized_frame_diff_with_full_rows(
+            &mut output,
+            Some(&previous),
+            &current,
+            &[0],
+            Some((0, 1, true)),
+            false,
+        )
+        .expect("plan update emits");
 
         let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
         assert!(output.starts_with("\x1b[?2026h"));
         assert!(output.contains("새 작업"));
         assert!(output.contains("\x1b[2;1H"));
         assert!(output.ends_with("\x1b[?2026l"));
+        assert!(
+            output.rfind("\x1b[?25h").unwrap() < output.rfind("\x1b[?2026l").unwrap(),
+            "a hidden cursor is shown again inside the synchronized frame"
+        );
     }
 
-    /// Replays emitted escape bytes onto a cell grid the way a VT terminal
-    /// would, tracking double-width glyphs, so a test can assert the screen a
-    /// stream produces rather than the stream's shape.
-    struct TerminalEmulator {
-        width: usize,
-        height: usize,
-        cells: Vec<Option<String>>,
-        row: usize,
-        column: usize,
-    }
-
-    impl TerminalEmulator {
-        fn new(width: usize, height: usize) -> Self {
-            Self {
-                width,
-                height,
-                cells: vec![Some(" ".to_owned()); width * height],
-                row: 0,
-                column: 0,
-            }
-        }
-
-        fn feed(&mut self, bytes: &[u8]) {
-            let text = std::str::from_utf8(bytes).expect("terminal bytes are UTF-8");
-            let mut chars = text.chars().peekable();
-            while let Some(ch) = chars.next() {
-                match ch {
-                    '\x1b' => match chars.peek() {
-                        Some('[') => {
-                            chars.next();
-                            let mut params = String::new();
-                            let action = loop {
-                                let ch = chars.next().expect("complete CSI sequence");
-                                if ch.is_ascii_alphabetic() {
-                                    break ch;
-                                }
-                                params.push(ch);
-                            };
-                            self.apply_csi(&params, action);
-                        }
-                        Some(']') => {
-                            for ch in chars.by_ref() {
-                                if ch == '\x07' {
-                                    break;
-                                }
-                            }
-                        }
-                        _ => {}
-                    },
-                    '\r' => self.column = 0,
-                    '\n' => self.row = (self.row + 1).min(self.height - 1),
-                    _ => self.put(ch),
-                }
-            }
-        }
-
-        fn apply_csi(&mut self, params: &str, action: char) {
-            match action {
-                'H' => {
-                    let mut split = params.split(';');
-                    let row: usize = split.next().unwrap_or("").parse().unwrap_or(1);
-                    let column: usize = split.next().unwrap_or("").parse().unwrap_or(1);
-                    self.row = row.saturating_sub(1).min(self.height - 1);
-                    self.column = column.saturating_sub(1).min(self.width);
-                }
-                'K' => {
-                    let (start, end) = match params {
-                        "" | "0" => (self.column, self.width),
-                        "1" => (0, (self.column + 1).min(self.width)),
-                        _ => (0, self.width),
-                    };
-                    for column in start..end {
-                        self.set(column, Some(" ".to_owned()));
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        fn put(&mut self, ch: char) {
-            let width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if width == 0 {
-                if self.column > 0 {
-                    if let Some(glyph) = &mut self.cells[self.row * self.width + self.column - 1] {
-                        glyph.push(ch);
-                    }
-                }
-                return;
-            }
-            if self.column + width > self.width {
-                return;
-            }
-            for offset in 0..width {
-                self.set(
-                    self.column + offset,
-                    (offset == 0).then(|| ch.to_string()),
-                );
-            }
-            self.column += width;
-        }
-
-        /// Writing into either half of a wide glyph erases the whole glyph, as
-        /// real terminals do.
-        fn set(&mut self, column: usize, cell: Option<String>) {
-            let index = self.row * self.width + column;
-            if self.cells[index].is_none() && column > 0 {
-                self.cells[index - 1] = Some(" ".to_owned());
-            }
-            if self.cells[index].as_deref().is_some_and(|glyph| UnicodeWidthStr::width(glyph) > 1)
-                && column + 1 < self.width
-                && self.cells[index + 1].is_none()
-            {
-                self.cells[index + 1] = Some(" ".to_owned());
-            }
-            self.cells[index] = cell;
-        }
-
-        fn row_text(&self, row: usize) -> String {
-            let mut text = String::new();
-            for column in 0..self.width {
-                if let Some(glyph) = &self.cells[row * self.width + column] {
-                    text.push_str(glyph);
-                }
-            }
-            text.trim_end().to_owned()
-        }
-    }
-
-    fn frame_row_text(frame: &CellFrame, row: usize) -> String {
-        let mut text = String::new();
-        for column in 0..frame.width {
-            let cell = frame.cell(column, row);
-            if !cell.continuation {
-                text.push_str(&cell.glyph);
-            }
-        }
-        text.trim_end().to_owned()
-    }
-
-    fn korean_plan_summary(second_done: bool) -> PlanSummary {
-        let status = |done: bool, active: bool| {
-            if done {
-                PlanStepStatus::Completed
-            } else if active {
-                PlanStepStatus::InProgress
-            } else {
-                PlanStepStatus::Pending
-            }
-        };
-        PlanSummary {
-            explanation: None,
-            steps: vec![
-                PlanStep {
-                    text: "1. 우측 콘텐츠 상단 레이아웃 확인".to_owned(),
-                    status: PlanStepStatus::Completed,
-                    started_at: None,
-                    elapsed: Some(Duration::from_secs(15)),
-                },
-                PlanStep {
-                    text: "2. 상단 경계와 여백 조정".to_owned(),
-                    status: status(second_done, !second_done),
-                    started_at: None,
-                    elapsed: second_done.then(|| Duration::from_secs(15)),
-                },
-                PlanStep {
-                    text: "3. 실행 화면 확인".to_owned(),
-                    status: status(false, second_done),
-                    started_at: None,
-                    elapsed: None,
-                },
-            ],
-            expanded: true,
-            started_at: Instant::now(),
-            elapsed: None,
-        }
-    }
-
-    fn paint_plan_frame(lines: &[PaintLine], width: usize) -> CellFrame {
-        let mut frame = CellFrame::new(width, lines.len());
-        for (row, line) in lines.iter().enumerate() {
-            paint_line_into_frame(&mut frame, row, line, None, None, None);
-        }
-        frame
-    }
-
-    /// The exact screenshot scenario: a Korean plan is on screen, a spinner
-    /// tick repaints rows through the cell diff, then a step completes and the
-    /// changed rows repaint. The emulator must end up showing the new plan
-    /// verbatim — no doubled glyphs, no drifted columns.
     #[test]
-    fn korean_plan_step_transition_replays_cleanly_on_a_wide_glyph_terminal() {
-        let width = 100usize;
-        let before = korean_plan_summary(false);
-        let after = korean_plan_summary(true);
-        let lines_initial = fixed_plan_summary_lines(&before, width as u16, 0.10, true, Some(0.2));
-        let lines_tick = fixed_plan_summary_lines(&before, width as u16, 0.60, true, Some(0.7));
-        let lines_after = fixed_plan_summary_lines(&after, width as u16, 0.85, true, Some(0.9));
-        assert_eq!(lines_initial.len(), lines_tick.len());
-        assert_eq!(lines_tick.len(), lines_after.len());
+    fn a_visible_cursor_is_not_toggled_between_frames() {
+        let previous = CellFrame::new(8, 2);
+        let mut current = previous.clone();
+        current.write(0, 0, "x", CellStyle::plain());
 
-        let frame_initial = paint_plan_frame(&lines_initial, width);
-        let mut emulator = TerminalEmulator::new(width, lines_initial.len());
         let mut output = Vec::new();
-        emit_synchronized_frame_diff(&mut output, None, &frame_initial).expect("initial paint");
-        emulator.feed(&output);
+        emit_synchronized_frame_diff_with_full_rows(
+            &mut output,
+            Some(&previous),
+            &current,
+            &[],
+            Some((0, 1, true)),
+            true,
+        )
+        .expect("frame emits");
 
-        // Spinner tick, then the semantic update, both through the animation
-        // row path with its per-row previous frames.
-        let mut painted = frame_initial;
-        for (previous_lines, current_lines) in [
-            (&lines_initial, &lines_tick),
-            (&lines_tick, &lines_after),
-        ] {
-            for (row, line) in current_lines.iter().enumerate() {
-                let mut current = CellFrame::new(width, 1);
-                paint_line_into_frame(&mut current, 0, line, None, None, None);
-                let previous = CellFrame {
-                    width,
-                    height: 1,
-                    cells: painted.cells[row * width..(row + 1) * width].to_vec(),
-                };
-                let full = plan_row_requires_full_repaint(&previous_lines[row], line);
-                let mut output = Vec::new();
-                emit_frame_diff_at(&mut output, (!full).then_some(&previous), &current, row)
-                    .expect("row repaint");
-                emulator.feed(&output);
-                painted.cells[row * width..(row + 1) * width].clone_from_slice(&current.cells);
-            }
-        }
-
-        let expected = paint_plan_frame(&lines_after, width);
-        for row in 0..lines_after.len() {
-            assert_eq!(
-                emulator.row_text(row),
-                frame_row_text(&expected, row),
-                "row {row} must replay verbatim"
-            );
-        }
+        let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
+        // 표시 상태가 그대로면 커서 escape 없이 위치만 되돌린다. Hide/Show를 반복하면
+        // 깜빡임 위상이 초기화돼 커서가 떨린다.
+        assert!(!output.contains("\x1b[?25l"));
+        assert!(!output.contains("\x1b[?25h"));
+        assert!(output.contains("\x1b[2;1H"));
     }
 
     #[test]
@@ -10253,6 +10321,19 @@ mod tests {
     }
 
     #[test]
+    fn claude_composer_chrome_uses_the_selected_model_tone() {
+        let editor = Editor::default();
+        let mut mode = test_mode("Default", ModeAccent::Calm, false);
+        mode.model = "claude:opus[1m]".to_owned();
+
+        let (rows, _, _) = input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
+
+        assert_eq!(rows[0].tone, Tone::ModelOpus);
+        assert_eq!(rows[1].prefix_tone, Tone::ModelOpus);
+        assert_eq!(rows.last().map(|line| line.tone), Some(Tone::ModelOpus));
+    }
+
+    #[test]
     fn queue_preview_is_one_line_and_truncates_the_prompt() {
         let line = queue_preview_line("a very long queued prompt", 0, 18);
 
@@ -10294,6 +10375,19 @@ mod tests {
         );
         assert_eq!(line.tail[1].tone, Tone::FastOn);
         assert_eq!(line.tail[3].tone, Tone::FastOn);
+    }
+
+    #[test]
+    fn claude_composer_hides_the_fast_control() {
+        let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
+        mode.model = "claude:sonnet".to_owned();
+
+        let line = input_top_line(120, "", Some(&mode));
+
+        assert!(!painted(&line).contains("Fast:"));
+        assert!(line.pick.as_ref().is_none_or(|picks| {
+            picks.0.iter().all(|(_, _, pick)| *pick != Pick::FastMode)
+        }));
     }
 
     #[test]
@@ -11969,6 +12063,7 @@ mod tests {
 
     fn test_welcome() -> WelcomeView {
         WelcomeView {
+            provider: "Codex".to_owned(),
             plan: "Pro Lite".to_owned(),
             credits: vec!["3 available".to_owned(), "· 2026-08-01  6d left".to_owned()],
             credits_expanded: false,
@@ -12304,6 +12399,167 @@ mod tests {
     }
 
     #[test]
+    fn panel_option_detail_sits_two_columns_under_its_label() {
+        // A question row, a selected option, and an option whose detail folds.
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                closable: false,
+                title: "증상".to_owned(),
+                lines: vec![
+                    OverlayLine {
+                        text: "Claude resume 시 어떤 증상인가?".to_owned(),
+                        selected: false,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: format!("화면에 이전 대화 안 보임\n{}", "상세 ".repeat(30)),
+                        selected: true,
+                        muted: false,
+                    },
+                ],
+                slider: None,
+                hint: "↑↓ 선택  Enter 확인  Esc 취소".to_owned(),
+                style: OverlayStyle::Panel,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            },
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+
+        let body = frame
+            .lines
+            .iter()
+            .filter(|line| line.prefix.starts_with('│') && !line.text.trim().is_empty())
+            .collect::<Vec<_>>();
+        let indent = |line: &PaintLine| UnicodeWidthStr::width(line.prefix.as_str());
+
+        let label = body
+            .iter()
+            .find(|line| line.text.starts_with("화면에"))
+            .expect("option label");
+        let details = body
+            .iter()
+            .filter(|line| line.text.starts_with("상세"))
+            .collect::<Vec<_>>();
+
+        assert!(details.len() > 1, "the detail should have folded");
+        // The detail is the label's quieter half: two columns in, dimmed, and
+        // every folded row of it stays on that same indent.
+        assert!(
+            details.iter().all(|line| indent(line) == indent(label) + 2),
+            "detail indents {:?} do not sit two columns under the label at {}",
+            details.iter().map(|line| indent(line)).collect::<Vec<_>>(),
+            indent(label)
+        );
+        assert!(
+            details.iter().all(|line| line.tone == Tone::Muted),
+            "a detail row is not dimmed"
+        );
+        assert!(
+            body.iter().all(|line| painted(line).ends_with('│')),
+            "a body row lost its right border"
+        );
+    }
+
+    #[test]
+    fn question_overlay_numbers_its_options_and_rules_off_the_way_out() {
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                closable: false,
+                title: "테스트".to_owned(),
+                lines: vec![
+                    OverlayLine {
+                        text: "테스트 선택지 중 어느 것 고를래?".to_owned(),
+                        selected: false,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: "선택지 A\n첫 번째 테스트 옵션".to_owned(),
+                        selected: true,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: "선택지 B\n두 번째 테스트 옵션".to_owned(),
+                        selected: false,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: "직접 입력".to_owned(),
+                        selected: false,
+                        muted: true,
+                    },
+                    OverlayLine {
+                        text: "이 내용으로 대화하기".to_owned(),
+                        selected: false,
+                        muted: false,
+                    },
+                ],
+                slider: None,
+                hint: "Enter 선택 · ↑/↓ 이동 · Esc 취소".to_owned(),
+                style: OverlayStyle::Question,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            },
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+        let painted = frame.lines.iter().map(painted).collect::<Vec<_>>();
+        let row = |needle: &str| {
+            painted
+                .iter()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("row {needle} missing"))
+                .clone()
+        };
+
+        // No box: the question stands in the transcript, badge first.
+        assert!(
+            painted.iter().all(|line| !line.contains('│')),
+            "the question drew a panel border"
+        );
+        assert_eq!(painted[0], "  □ 테스트 ");
+        assert_eq!(row("선택지 A"), " ❯ 1. 선택지 A");
+        assert_eq!(row("선택지 B"), "   2. 선택지 B");
+        assert!(row("직접 입력").starts_with("   3. "));
+        assert!(row("이 내용으로 대화하기").starts_with("   4. "));
+        // A detail line starts where its label does, not where the number does.
+        let column = |line: &str, needle: &str| {
+            UnicodeWidthStr::width(&line[..line.find(needle).expect("needle")])
+        };
+        assert_eq!(
+            column(&row("선택지 A"), "선택지"),
+            column(&row("첫 번째"), "첫")
+        );
+        // The way out is ruled off from the answers above it.
+        let rule = painted
+            .iter()
+            .position(|line| line.trim_start().starts_with('─'))
+            .expect("rule row");
+        let chat = painted
+            .iter()
+            .position(|line| line.contains("이 내용으로 대화하기"))
+            .expect("chat row");
+        assert_eq!(rule + 1, chat);
+    }
+
+    #[test]
     fn compact_panel_keeps_each_option_on_one_physical_row() {
         let live = [Block::new(BlockKind::Assistant, "Codex", "existing reply")];
         let frame = overlay_frame(
@@ -12464,6 +12720,7 @@ mod tests {
     #[test]
     fn a_docked_picker_keeps_the_welcome_card_on_screen() {
         let welcome = WelcomeView {
+            provider: "Codex".to_owned(),
             plan: "Pro".to_owned(),
             credits_expanded: false,
             cwd: r"C:\Source\DevezVibe".to_owned(),
@@ -12569,6 +12826,55 @@ mod tests {
             .find(|line| line.prefix.contains('❯'))
             .expect("selected model row");
         assert_eq!(selected.tone, Tone::ModelSol);
+    }
+
+    #[test]
+    fn claude_model_picker_uses_each_model_family_tone() {
+        let models = [
+            ("1. Opus 5", Tone::ModelOpus),
+            ("2. Fable 5", Tone::ModelFable),
+            ("3. Sonnet 5", Tone::ModelSonnet),
+            ("4. Haiku 4.5", Tone::ModelHaiku),
+        ];
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                closable: true,
+                title: "Model".to_owned(),
+                lines: models
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (text, _))| OverlayLine {
+                        text: (*text).to_owned(),
+                        selected: index == 0,
+                        muted: false,
+                    })
+                    .collect(),
+                slider: None,
+                hint: "Enter select".to_owned(),
+                style: OverlayStyle::Picker,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            },
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+
+        for (text, tone) in models {
+            let line = frame
+                .lines
+                .iter()
+                .find(|line| painted(line).contains(text))
+                .expect("Claude model row");
+            assert_eq!(line.tone, tone);
+        }
     }
 
     #[test]
@@ -13195,6 +13501,22 @@ mod tests {
     }
 
     #[test]
+    fn claude_models_use_the_devez_code_colors_everywhere() {
+        let palette = theme::palette();
+        for (model, model_tone, status_tone, color) in [
+            ("Claude Haiku", Tone::ModelHaiku, Tone::StatusModelHaiku, palette.status.model_haiku),
+            ("Claude Sonnet", Tone::ModelSonnet, Tone::StatusModelSonnet, palette.status.model_sonnet),
+            ("Claude Opus", Tone::ModelOpus, Tone::StatusModelOpus, palette.status.model_opus),
+            ("Claude Fable", Tone::ModelFable, Tone::StatusModelFable, palette.status.model_fable),
+        ] {
+            assert_eq!(super::model_tone(model), Some(model_tone));
+            assert_eq!(status_model_tone(model), Some(status_tone));
+            assert_eq!(tone_rgb(model_tone), Some(color));
+            assert_eq!(tone_rgb(status_tone), Some(color));
+        }
+    }
+
+    #[test]
     fn terra_uses_the_reference_green_model_colour() {
         assert_eq!(tone_rgb(Tone::ModelTerra), Some(theme::palette().model_terra));
     }
@@ -13454,9 +13776,30 @@ mod tests {
     }
 
     #[test]
+    fn provider_handoff_keeps_conversation_and_work_but_drops_local_chrome() {
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.history = vec![
+            Block::new(BlockKind::Welcome, "Welcome", "local"),
+            Block::new(BlockKind::User, "Claude", "질문"),
+            Block::new(BlockKind::Assistant, "Claude", "답변"),
+            Block::new(BlockKind::Tool, "Shell", "cargo test"),
+            Block::new(BlockKind::ModelChange, "Provider", "Codex"),
+        ];
+
+        let blocks = renderer.provider_handoff_blocks();
+
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].kind, "user");
+        assert_eq!(blocks[1].kind, "assistant");
+        assert_eq!(blocks[2].kind, "tool");
+        assert_eq!(renderer.last_history_block_id(), renderer.history[4].id());
+    }
+
+    #[test]
     fn panel_borders_use_the_theme_border_tone() {
         let lines = welcome_lines(
             WelcomeView {
+                provider: "Codex".to_owned(),
                 plan: "Pro".to_owned(),
                 credits: vec!["none available".to_owned()],
                 credits_expanded: false,
