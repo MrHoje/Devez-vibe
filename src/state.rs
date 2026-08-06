@@ -135,6 +135,18 @@ pub enum VibeMode {
     Normal,
 }
 
+/// Repeated at the end of every preset notice. The rules say this too, but a
+/// rule in the system prompt loses to the model's own habit of labelling its
+/// next tool call in English — `Now the arming API, gap, and reset:` — so the
+/// turn restates it where it is hardest to miss. `concat!` takes literals only,
+/// so the sentence is spelled out in each arm rather than shared as a constant.
+macro_rules! language_notice {
+    () => {
+        "진행 안내와 답변은 모두 한국어로 쓴다. \
+         `Now ...`, `Let me ...`처럼 영어로 시작하는 진행 문장이나 도구 호출 앞 라벨은 쓰지 않는다."
+    };
+}
+
 impl VibeMode {
     pub const fn config_value(self) -> &'static str { match self { Self::Vibe => "vibe", Self::SuperVibe => "super_vibe", Self::Normal => "normal" } }
     pub const fn label(self) -> &'static str {
@@ -150,6 +162,31 @@ impl VibeMode {
             Self::Vibe => Self::SuperVibe,
             Self::SuperVibe => Self::Normal,
             Self::Normal => Self::Vibe,
+        }
+    }
+
+    /// What the turn tells the model about the preset it is answering under. The
+    /// rules name Super Vibe by condition, and a condition the model cannot
+    /// evaluate is no rule at all — nothing else in a request says which preset
+    /// is active, so the answer came back full of paths and code either way.
+    pub const fn turn_notice(self) -> &'static str {
+        match self {
+            Self::Vibe => concat!(
+                "현재 응답 모드: Vibe. 최종 답변은 불릿 세 개 이내로 쓴다. ",
+                "결론부터 쓰고, 코드 변경은 파일 경로와 핵심 코드만 보여준다. ",
+                language_notice!(),
+            ),
+            Self::SuperVibe => concat!(
+                "현재 응답 모드: Super Vibe. 최종 답변은 불릿 두 개 또는 세 줄 이내로 쓴다. ",
+                "파일 경로, 코드 블록, 함수·클래스·변수·설정 키 이름, 빌드나 테스트 명령을 넣지 않는다. ",
+                "무엇을 어떻게 바꿨는지 일상 언어로만 설명하고, 배경 설명과 원인 해설은 사용자가 물을 때만 덧붙인다. ",
+                "사용자가 코드나 경로를 직접 요청한 경우에만 예외로 보여준다. ",
+                language_notice!(),
+            ),
+            Self::Normal => concat!(
+                "현재 응답 모드: Off. 필요한 만큼 자세히 설명하고 파일 경로와 코드를 그대로 보여준다. ",
+                language_notice!(),
+            ),
         }
     }
 }
@@ -2678,7 +2715,7 @@ pub struct TickResult {
     pub animation_only: bool,
 }
 
-/// One subagent the provider is currently running under the turn. The bridge
+/// One subagent the provider is currently running for this session. The bridge
 /// reports elapsed time per update, but the row ticks between updates, so the
 /// start instant is kept locally and reused while the same id stays running.
 #[derive(Clone, Debug)]
@@ -2688,6 +2725,7 @@ struct RunningSubagent {
     description: String,
     tool: String,
     started_at: Instant,
+    painted_elapsed_secs: u64,
 }
 
 /// One recorded line of a subagent's work, as shown in its transcript panel.
@@ -2698,7 +2736,7 @@ struct SubagentLogLine {
 }
 
 /// A long-running subagent can emit far more than a panel will ever show, so the
-/// oldest lines are dropped rather than held for the rest of the turn.
+/// oldest lines are dropped rather than held for the rest of the session.
 const SUBAGENT_LOG_LIMIT: usize = 400;
 
 pub struct AppState {
@@ -3795,17 +3833,6 @@ impl AppState {
         &self.selected_effort
     }
 
-    /// Super Vibe drops the plan panel from the frame. The host already lists the
-    /// same steps in its own task view, so repeating them under the transcript is
-    /// the kind of detail that setting exists to keep out of sight. The plan
-    /// itself is untouched — a handoff and the other presets still read it.
-    fn visible_plan_summary(&self) -> Option<&PlanSummary> {
-        if self.vibe_mode == VibeMode::SuperVibe {
-            return None;
-        }
-        self.plan_summary.as_ref()
-    }
-
     pub fn provider_handoff_plan(&self) -> Option<String> {
         let plan = self.plan_summary.as_ref()?;
         if plan.explanation.is_none() && plan.steps.is_empty() {
@@ -4385,6 +4412,8 @@ impl AppState {
         self.activity_notice = None;
         self.quit_armed_at = None;
         self.plan_summary = None;
+        self.subagents.clear();
+        self.subagent_logs.clear();
         self.busy = false;
         self.turn_id = None;
         self.pending_interrupt = false;
@@ -4436,6 +4465,9 @@ impl AppState {
             // so they cannot flash for one frame and disappear later.
             committed.retain(|block| !is_shell_hidden_block(block));
         }
+        if self.vibe_mode == VibeMode::SuperVibe {
+            committed.retain(|block| !is_plan_block(block));
+        }
         committed
     }
 
@@ -4452,6 +4484,7 @@ impl AppState {
                 if item.shell_batch.is_some()
                     || (self.shell_display_mode == ShellDisplayMode::Hide
                         && is_shell_hidden_block(&item.block))
+                    || (self.vibe_mode == VibeMode::SuperVibe && is_plan_block(&item.block))
                     || is_empty_thinking(&item.block)
                 {
                     return None;
@@ -4470,7 +4503,7 @@ impl AppState {
         View {
             live_blocks,
             overlay: self.overlay_view(),
-            plan_summary: self.visible_plan_summary(),
+            plan_summary: self.plan_summary.as_ref(),
             plan_active: self.busy,
             plan_shimmer_phase: self.plan_shimmer_phase(),
             editor: &self.editor,
@@ -4533,6 +4566,17 @@ impl AppState {
         // Compaction animates the same row a turn does, so it keeps the frame
         // loop alive even on a runtime that reports no turn while it runs.
         let animating = self.busy || self.compacting();
+        // A background Claude agent outlives its parent turn. Its elapsed label
+        // changes once a second, and the narrow animation path does not repaint
+        // these rows, so only that boundary asks for a full frame.
+        let mut subagent_elapsed_changed = false;
+        for running in &mut self.subagents {
+            let elapsed = running.started_at.elapsed().as_secs();
+            if running.painted_elapsed_secs != elapsed {
+                running.painted_elapsed_secs = elapsed;
+                subagent_elapsed_changed = true;
+            }
+        }
         let plan_shimmer_active = self.plan_shimmer_phase().is_some();
         if self.plan_shimmer_started_at.is_some() && !plan_shimmer_active {
             self.plan_shimmer_started_at = None;
@@ -4582,8 +4626,10 @@ impl AppState {
             self.quit_armed_at = None;
         }
         TickResult {
-            redraw: animating || plan_shimmer_active || full_redraw,
-            animation_only: (animating || plan_shimmer_active) && !full_redraw,
+            redraw: animating || subagent_elapsed_changed || plan_shimmer_active || full_redraw,
+            animation_only: (animating || plan_shimmer_active)
+                && !subagent_elapsed_changed
+                && !full_redraw,
         }
     }
 
@@ -4592,7 +4638,7 @@ impl AppState {
             activity: self.activity(),
             activity_model: self.activity_model(),
             activity_phase: self.activity_phase(),
-            plan_summary: self.visible_plan_summary(),
+            plan_summary: self.plan_summary.as_ref(),
             plan_active: self.busy,
             plan_shimmer_phase: self.plan_shimmer_phase(),
             composer_mode: Some(self.composer_mode()),
@@ -5407,11 +5453,16 @@ impl AppState {
                 self.end_compaction();
                 self.turn_id = None;
                 self.pending_interrupt = false;
-                self.subagents.clear();
-                self.subagent_logs.clear();
-                if matches!(self.pending, Some(PendingInteraction::SubagentTranscript { .. })) {
-                    self.pending = None;
+                let mut retained_logs = self
+                    .subagents
+                    .iter()
+                    .map(|running| running.id.clone())
+                    .collect::<HashSet<_>>();
+                if let Some(PendingInteraction::SubagentTranscript { id, .. }) = &self.pending {
+                    retained_logs.insert(id.clone());
                 }
+                self.subagent_logs
+                    .retain(|id, _| retained_logs.contains(id));
                 if !self.turn_interrupted || self.last_completed_duration.is_none() {
                     self.last_completed_duration =
                         self.turn_started_at.map(|started| started.elapsed());
@@ -5518,12 +5569,16 @@ impl AppState {
                     .flatten()
                     .filter_map(|entry| {
                         let id = entry.get("id").and_then(Value::as_str)?;
-                        let started_at = self
+                        let previous = self
                             .subagents
                             .iter()
-                            .find(|running| running.id == id)
+                            .find(|running| running.id == id);
+                        let started_at = previous
                             .map(|running| running.started_at)
                             .unwrap_or_else(Instant::now);
+                        let painted_elapsed_secs = previous
+                            .map(|running| running.painted_elapsed_secs)
+                            .unwrap_or_else(|| started_at.elapsed().as_secs());
                         Some(RunningSubagent {
                             id: id.to_owned(),
                             name: entry
@@ -5543,6 +5598,7 @@ impl AppState {
                                 .unwrap_or_default()
                                 .to_owned(),
                             started_at,
+                            painted_elapsed_secs,
                         })
                     })
                     .collect();
@@ -9333,6 +9389,16 @@ fn is_shell_hidden_block(block: &Block) -> bool {
     is_shell_block(block) || is_web_search_block(block) || is_auxiliary_tool_block(block)
 }
 
+/// The plan as it reaches the transcript, in either shape it arrives in: its own
+/// kind from a runtime that reports plans directly, or a reasoning block titled
+/// `Plan` from one that streams them as thinking. A resume replays whichever the
+/// session recorded, which is how the steps came back after Super Vibe had
+/// already taken the dock panel off the frame.
+fn is_plan_block(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::Plan)
+        || (matches!(block.kind, BlockKind::Reasoning) && block.title == "Plan")
+}
+
 /// Operations whose repeated cards add no information. The body participates
 /// in the signature, so two calls to the same tool with different results stay
 /// visible; Web Search includes its query in the title for the same reason.
@@ -10649,11 +10715,11 @@ mod tests {
         assert_eq!(state.model_verbosity(), "high");
     }
 
-    /// The host lists the same steps in its own task view, so the panel is the
-    /// kind of duplicate Super Vibe keeps off the frame. Only the frame changes:
-    /// the plan is still there for a provider handoff and for the other presets.
+    /// The panel is the session's task view — the steps a turn is working
+    /// through, live. Super Vibe keeps it: what that preset drops is the plan
+    /// replayed into the transcript as a block, not the panel itself.
     #[test]
-    fn super_vibe_keeps_the_plan_panel_off_the_frame() {
+    fn super_vibe_keeps_the_plan_panel_on_the_frame() {
         let mut state = test_state();
         state.plan_summary = Some(PlanSummary {
             explanation: None,
@@ -10671,12 +10737,46 @@ mod tests {
             state.cycle_vibe_mode();
         }
 
-        assert!(state.view().plan_summary.is_none());
-        assert!(state.animation_view().plan_summary.is_none());
+        assert!(state.view().plan_summary.is_some());
+        assert!(state.animation_view().plan_summary.is_some());
         assert!(state.provider_handoff_plan().is_some());
 
         state.cycle_vibe_mode();
         assert!(state.view().plan_summary.is_some());
+    }
+
+    /// A resume replays the recorded plan as a transcript block, so hiding the
+    /// dock panel alone left the steps coming back on every `/resume`. Both
+    /// shapes the plan arrives in are dropped, and only under Super Vibe.
+    #[test]
+    fn super_vibe_drops_a_replayed_plan_block_from_the_transcript() {
+        let mut state = test_state();
+        // The welcome card would otherwise ride along at the head of the drain.
+        state.show_welcome = false;
+        let replayed = vec![
+            Block::new(BlockKind::Reasoning, "Plan", "1. 빌드 복구 후 테스트 재실행"),
+            Block::new(BlockKind::Plan, "작업 단계", "2. 지침 검증"),
+            Block::new(BlockKind::Assistant, "Codex", "본문은 남는다"),
+        ];
+        // A drain empties the queue, so each check starts from the same replay.
+        let titles = |state: &mut AppState| {
+            state.committed = replayed.clone();
+            state
+                .drain_committed()
+                .iter()
+                .map(|block| block.title.clone())
+                .collect::<Vec<_>>()
+        };
+        while state.vibe_mode() != VibeMode::SuperVibe {
+            state.cycle_vibe_mode();
+        }
+
+        assert_eq!(titles(&mut state), ["Codex"]);
+
+        while state.vibe_mode() != VibeMode::Vibe {
+            state.cycle_vibe_mode();
+        }
+        assert_eq!(titles(&mut state), ["Plan", "작업 단계", "Codex"]);
     }
 
     #[test]
@@ -11552,7 +11652,7 @@ mod tests {
     }
 
     #[test]
-    fn running_subagents_reach_the_view_and_clear_when_the_turn_ends() {
+    fn a_background_subagent_survives_its_parent_turn_until_the_bridge_removes_it() {
         let mut state = test_state();
 
         state.handle_notification(
@@ -11573,6 +11673,13 @@ mod tests {
         assert_eq!(running[0].tool, "Grep(fn login)");
 
         state.handle_notification("turn/completed", &json!({}));
+
+        assert_eq!(state.view().subagents.len(), 1);
+
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({ "subagents": [] }),
+        );
 
         assert!(state.view().subagents.is_empty());
     }
@@ -11665,13 +11772,50 @@ mod tests {
     }
 
     #[test]
-    fn a_subagent_panel_closes_itself_when_the_turn_ends() {
+    fn a_background_subagent_panel_survives_the_parent_turn() {
         let mut state = state_with_a_running_subagent();
+        state.handle_notification("turn/subagent/line", &subagent_line_notification("text", "찾는 중"));
         state.open_subagent(0);
 
         state.handle_notification("turn/completed", &json!({}));
 
-        assert!(state.overlay_view().is_none());
+        assert!(state.overlay_view().is_some());
+        assert_eq!(state.subagent_logs["toolu_1"].len(), 1);
+
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({ "subagents": [] }),
+        );
+
+        assert_eq!(
+            state.overlay_view().map(|overlay| overlay.title),
+            Some("Subagent · 완료됨".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_idle_background_subagent_keeps_its_elapsed_row_redrawing() {
+        let mut state = state_with_a_running_subagent();
+        state.busy = false;
+        state.subagents[0].started_at = Instant::now() - Duration::from_secs(1);
+
+        let tick = state.render_tick();
+
+        assert!(tick.redraw);
+        assert!(!tick.animation_only);
+
+        let same_second = state.render_tick();
+        assert!(!same_second.redraw);
+    }
+
+    #[test]
+    fn switching_sessions_clears_background_subagents_and_their_logs() {
+        let mut state = state_with_a_running_subagent();
+        state.handle_notification("turn/subagent/line", &subagent_line_notification("text", "찾는 중"));
+
+        state.prepare_resume();
+
+        assert!(state.subagents.is_empty());
         assert!(state.subagent_logs.is_empty());
     }
 
@@ -11934,6 +12078,9 @@ mod tests {
             started_at: Instant::now(),
             elapsed: None,
         });
+        // A new session reads its starting mode from the settings on disk, so the
+        // baseline is pinned here rather than left to whatever the machine saved.
+        state.claude_permission_mode = ClaudePermissionMode::Default;
 
         state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         assert_eq!(state.editor.text(), " ");

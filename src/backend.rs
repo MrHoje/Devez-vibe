@@ -452,6 +452,7 @@ impl BackendServer {
                 if let Some(context) = handoff_context.as_deref() {
                     insert_handoff_context(&mut params, context);
                 }
+                let turn_context = combined_turn_instructions(&params, selected);
 
                 // Read before the request: the Codex branch consumes `params`.
                 let turn_model = params
@@ -477,7 +478,7 @@ impl BackendServer {
                                         .get("claudePermissionMode")
                                         .cloned()
                                         .unwrap_or(Value::Null),
-                                    "handoffContext": handoff_context
+                                    "handoffContext": turn_context
                                 }),
                             )
                             .await
@@ -497,10 +498,9 @@ impl BackendServer {
                             .and_then(Value::as_array)
                             .map(Vec::as_slice)
                             .unwrap_or_default();
-                        let instructions = combined_turn_instructions(&params);
                         let turn = self
                             .open_code()?
-                            .start_prompt_content(&backing, input, instructions.as_deref())
+                            .start_prompt_content(&backing, input, turn_context.as_deref())
                             .await?;
                         Ok(json!({ "turn": { "id": turn } }))
                     } else {
@@ -1760,19 +1760,27 @@ fn insert_handoff_context(params: &mut Value, context: &str) {
     });
 }
 
-fn combined_turn_instructions(params: &Value) -> Option<String> {
-    let rules = params
-        .pointer("/additionalContext/devez-vibe-rules/value")
-        .and_then(Value::as_str);
-    let handoff = params
-        .pointer("/additionalContext/provider-handoff/value")
-        .and_then(Value::as_str);
-    match (rules, handoff) {
-        (Some(rules), Some(handoff)) => Some(format!("{rules}\n\n{handoff}")),
-        (Some(rules), None) => Some(rules.to_owned()),
-        (None, Some(handoff)) => Some(handoff.to_owned()),
-        (None, None) => None,
-    }
+fn combined_turn_instructions(params: &Value, runtime: RuntimeKind) -> Option<String> {
+    let rules_path = match runtime {
+        RuntimeKind::Claude => "/additionalContext/claude-devez-vibe-rules/value",
+        RuntimeKind::Codex | RuntimeKind::OpenCode => {
+            "/additionalContext/devez-vibe-rules/value"
+        }
+    };
+    let parts = [
+        params.pointer(rules_path).and_then(Value::as_str),
+        params
+            .pointer("/additionalContext/devez-vibe-mode/value")
+            .and_then(Value::as_str),
+        params
+            .pointer("/additionalContext/provider-handoff/value")
+            .and_then(Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|part| !part.trim().is_empty())
+    .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 fn newest_sections_within(sections: &[String], budget: usize) -> (Vec<String>, usize) {
@@ -2191,14 +2199,20 @@ mod tests {
     fn handoff_context_joins_existing_turn_instructions() {
         let mut params = json!({
             "additionalContext": {
-                "devez-vibe-rules": { "value": "rules", "kind": "application" }
+                "devez-vibe-rules": { "value": "codex rules", "kind": "application" },
+                "claude-devez-vibe-rules": { "value": "claude rules", "kind": "application" },
+                "devez-vibe-mode": { "value": "super vibe", "kind": "application" }
             }
         });
         insert_handoff_context(&mut params, "history");
 
         assert_eq!(
-            combined_turn_instructions(&params).as_deref(),
-            Some("rules\n\nhistory")
+            combined_turn_instructions(&params, RuntimeKind::Claude).as_deref(),
+            Some("claude rules\n\nsuper vibe\n\nhistory")
+        );
+        assert_eq!(
+            combined_turn_instructions(&params, RuntimeKind::OpenCode).as_deref(),
+            Some("codex rules\n\nsuper vibe\n\nhistory")
         );
     }
 
