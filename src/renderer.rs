@@ -242,6 +242,11 @@ pub enum OverlayStyle {
     Panel,
     CompactPanel,
     Picker,
+    /// A question the server is waiting on: no box, a badge for the header, a
+    /// bold prompt, and numbered options. The first row is the prompt and the
+    /// last is the row that hands the turn back to the composer, which is why
+    /// the rule above it is the renderer's to draw.
+    Question,
 }
 
 #[derive(Clone)]
@@ -2323,6 +2328,8 @@ enum Tone {
     PlanDone,
     Accent,
     User,
+    /// A question's header, worn as a filled badge rather than a box rule.
+    QuestionBadge,
     /// A centred transcript control: default text on a compact button band.
     ScrollToBottom,
     #[allow(dead_code)]
@@ -3404,6 +3411,39 @@ fn column_cell(row: Option<&PanelRow>, width: usize) -> PanelRow {
     (format!("{text}{}", " ".repeat(padding)), tone, bold)
 }
 
+/// The margin a boxless question keeps, so its rows sit where a panel's own
+/// text would have sat rather than hard against the terminal edge.
+const QUESTION_INDENT: &str = " ";
+
+/// The header of a question, worn as a filled badge. The padding is inside the
+/// span so the colour runs a cell past the label on either side.
+fn question_badge_row(title: &str) -> PaintLine {
+    PaintLine {
+        prefix: QUESTION_INDENT.to_owned(),
+        prefix_tone: Tone::Plain,
+        text: format!(" □ {title} "),
+        tone: Tone::QuestionBadge,
+        bold: true,
+        tool_heading: None,
+        pick: None,
+        tail: Vec::new(),
+    }
+}
+
+/// The rule that separates the answers from the row that walks away from them.
+fn question_rule_row(span: usize) -> PaintLine {
+    PaintLine {
+        prefix: QUESTION_INDENT.to_owned(),
+        prefix_tone: Tone::Border,
+        text: "─".repeat(span.saturating_sub(QUESTION_INDENT.len())),
+        tone: Tone::Border,
+        bold: false,
+        tool_heading: None,
+        pick: None,
+        tail: Vec::new(),
+    }
+}
+
 /// Panels share the composer's span so their borders line up with the rule.
 fn panel_span(width: u16) -> usize {
     (width as usize).saturating_sub(1).max(19)
@@ -4132,6 +4172,88 @@ fn overlay_frame_with_expansion(
             }
             lines.push(panel_padding_row(panel_width));
             lines.push(panel_rule_row("╰─ ", &overlay.hint, '╯', panel_width));
+        }
+        OverlayStyle::Question => {
+            let span = panel_span(width);
+            lines.push(question_badge_row(&overlay.title));
+            lines.push(PaintLine::blank());
+
+            let mut rows = overlay.lines.iter().enumerate();
+            if let Some((_, prompt)) = rows.next() {
+                lines.extend(
+                    wrapped_line_with_continuation(
+                        QUESTION_INDENT,
+                        QUESTION_INDENT,
+                        Tone::Plain,
+                        &prompt.text,
+                        Tone::Plain,
+                        true,
+                        span.min(u16::MAX as usize) as u16,
+                    )
+                    .into_iter()
+                    .map(|mut line| {
+                        line.bold = true;
+                        line
+                    }),
+                );
+                lines.push(PaintLine::blank());
+            }
+
+            // Options are numbered from one, and the number column is as wide as
+            // the last number so every label starts on the same column.
+            let option_count = overlay.lines.len().saturating_sub(1);
+            let number_width = option_count.max(1).to_string().len();
+            let label_column = QUESTION_INDENT.len() + 2 + number_width + 2;
+            let last = overlay.lines.len().saturating_sub(1);
+            for (row_index, row) in rows {
+                // The final row leaves the question rather than answering it, so
+                // a rule sets it apart from the answers above.
+                if row_index == last && option_count > 1 {
+                    lines.push(question_rule_row(span));
+                }
+                let number = row_index;
+                for (part_index, part) in row.text.lines().enumerate() {
+                    let prefix = if part_index == 0 {
+                        format!(
+                            "{QUESTION_INDENT}{} {number:>number_width$}. ",
+                            if row.selected { "❯" } else { " " }
+                        )
+                    } else {
+                        " ".repeat(label_column)
+                    };
+                    let tone = if part_index > 0 || row.muted {
+                        Tone::Muted
+                    } else if row.selected {
+                        Tone::Accent
+                    } else {
+                        Tone::Plain
+                    };
+                    lines.extend(
+                        wrapped_line_with_continuation(
+                            &prefix,
+                            &" ".repeat(label_column),
+                            if row.selected { Tone::Accent } else { Tone::Muted },
+                            part,
+                            tone,
+                            part_index == 0 && !row.muted,
+                            span.min(u16::MAX as usize) as u16,
+                        )
+                        .into_iter()
+                        .map(|line| line.with_picks(&[(0, Pick::Row(row_index))])),
+                    );
+                }
+            }
+            lines.push(PaintLine::blank());
+            lines.push(PaintLine {
+                prefix: QUESTION_INDENT.to_owned(),
+                prefix_tone: Tone::Muted,
+                text: compact_right(&overlay.hint, span.saturating_sub(QUESTION_INDENT.len())),
+                tone: Tone::Muted,
+                bold: false,
+                tool_heading: None,
+                pick: None,
+                tail: Vec::new(),
+            });
         }
     }
     let mut cursor_line = lines.len() - 1;
@@ -7172,6 +7294,7 @@ fn word_background(tone: Tone) -> Option<Rgb> {
         Tone::DiffAddedWord => palette.diff_add_word_bg,
         Tone::DiffRemovedWord => palette.diff_remove_word_bg,
         Tone::ScrollToBottom => palette.hover_bg,
+        Tone::QuestionBadge => palette.accent,
         Tone::StatusModel56 => blend(palette.background, palette.model_gpt56, 46),
         Tone::StatusModelSol => blend(palette.background, palette.model_sol, 46),
         Tone::StatusModelTerra => blend(palette.background, palette.model_terra, 46),
@@ -7486,6 +7609,8 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::Accent => palette.accent,
         Tone::User => palette.blue,
         Tone::ScrollToBottom => palette.foreground,
+        // The badge paints its own field, so the label reads as the hole in it.
+        Tone::QuestionBadge => palette.background,
         Tone::Success => palette.success,
         Tone::Warning => palette.warning,
         Tone::Error => palette.error,
@@ -12231,6 +12356,95 @@ mod tests {
             body.iter().all(|line| painted(line).ends_with('│')),
             "a body row lost its right border"
         );
+    }
+
+    #[test]
+    fn question_overlay_numbers_its_options_and_rules_off_the_way_out() {
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                closable: false,
+                title: "테스트".to_owned(),
+                lines: vec![
+                    OverlayLine {
+                        text: "테스트 선택지 중 어느 것 고를래?".to_owned(),
+                        selected: false,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: "선택지 A\n첫 번째 테스트 옵션".to_owned(),
+                        selected: true,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: "선택지 B\n두 번째 테스트 옵션".to_owned(),
+                        selected: false,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: "직접 입력".to_owned(),
+                        selected: false,
+                        muted: true,
+                    },
+                    OverlayLine {
+                        text: "이 내용으로 대화하기".to_owned(),
+                        selected: false,
+                        muted: false,
+                    },
+                ],
+                slider: None,
+                hint: "Enter 선택 · ↑/↓ 이동 · Esc 취소".to_owned(),
+                style: OverlayStyle::Question,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            },
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+        let painted = frame.lines.iter().map(painted).collect::<Vec<_>>();
+        let row = |needle: &str| {
+            painted
+                .iter()
+                .find(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("row {needle} missing"))
+                .clone()
+        };
+
+        // No box: the question stands in the transcript, badge first.
+        assert!(
+            painted.iter().all(|line| !line.contains('│')),
+            "the question drew a panel border"
+        );
+        assert_eq!(painted[0], "  □ 테스트 ");
+        assert_eq!(row("선택지 A"), " ❯ 1. 선택지 A");
+        assert_eq!(row("선택지 B"), "   2. 선택지 B");
+        assert!(row("직접 입력").starts_with("   3. "));
+        assert!(row("이 내용으로 대화하기").starts_with("   4. "));
+        // A detail line starts where its label does, not where the number does.
+        let column = |line: &str, needle: &str| {
+            UnicodeWidthStr::width(&line[..line.find(needle).expect("needle")])
+        };
+        assert_eq!(
+            column(&row("선택지 A"), "선택지"),
+            column(&row("첫 번째"), "첫")
+        );
+        // The way out is ruled off from the answers above it.
+        let rule = painted
+            .iter()
+            .position(|line| line.trim_start().starts_with('─'))
+            .expect("rule row");
+        let chat = painted
+            .iter()
+            .position(|line| line.contains("이 내용으로 대화하기"))
+            .expect("chat row");
+        assert_eq!(rule + 1, chat);
     }
 
     #[test]

@@ -2852,6 +2852,12 @@ impl AppState {
         ModelProvider::from_model(self.selected_model_name())
     }
 
+    /// Claude 브리지는 실행 중 들어온 프롬프트를 스스로 대기시켜 다음 턴으로 보내므로
+    /// 호스트 큐(Tab)가 겹칠 자리가 없다. Tab을 무동작으로 두고 힌트도 감춘다.
+    fn queueing_supported(&self) -> bool {
+        self.selected_provider() != ModelProvider::Claude
+    }
+
     fn provider_switch_pending(&self) -> bool {
         self.busy
             && self
@@ -4087,8 +4093,12 @@ impl AppState {
             composer_images: &self.composer_images,
             queued_prompts: self.queued_prompts.iter().cloned().collect(),
             composer_placeholder: if self.provider_switch_pending() {
-                "Enter: queue for switched provider · Tab: queue"
-            } else if self.busy {
+                if self.queueing_supported() {
+                    "Enter: queue for switched provider · Tab: queue"
+                } else {
+                    "Enter: queue for switched provider"
+                }
+            } else if self.busy && self.queueing_supported() {
                 "Enter: steer · Tab: queue"
             } else {
                 ""
@@ -4535,7 +4545,13 @@ impl AppState {
                 self.editor.newline();
                 Action::None
             }
-            KeyCode::Tab if self.busy => self.queue_editor(),
+            KeyCode::Tab if self.busy => {
+                if self.queueing_supported() {
+                    self.queue_editor()
+                } else {
+                    Action::None
+                }
+            }
             KeyCode::Enter => self.submit_editor(),
             KeyCode::Esc if self.busy => self.request_interrupt(),
             code if (code == KeyCode::Backspace && ctrl) || code == KeyCode::Char('\u{8}') => {
@@ -6220,12 +6236,10 @@ impl AppState {
                         _ => {}
                     }
                 } else {
-                    let option_count = question.options.len() + usize::from(question.allow_other);
+                    let chat_instead = chat_instead_index(question);
                     match key.code {
                         KeyCode::Up => selected = selected.saturating_sub(1),
-                        KeyCode::Down => {
-                            selected = (selected + 1).min(option_count.saturating_sub(1))
-                        }
+                        KeyCode::Down => selected = (selected + 1).min(chat_instead),
                         KeyCode::Enter => {
                             if selected < question.options.len() {
                                 answers.insert(
@@ -6235,6 +6249,14 @@ impl AppState {
                                 return next_question_or_reply(
                                     id, questions, current, answers, self,
                                 );
+                            }
+                            // Chatting instead answers nothing: the tool gets
+                            // what has been answered so far, exactly as Esc.
+                            if selected == chat_instead {
+                                return Action::RpcResponse {
+                                    id,
+                                    result: answers_response(&answers),
+                                };
                             }
                             text_mode = true;
                         }
@@ -7026,11 +7048,18 @@ impl AppState {
                     }));
                     if question.allow_other {
                         lines.push(OverlayLine {
-                            text: "직접 입력".to_owned(),
+                            text: OTHER_ANSWER_LABEL.to_owned(),
                             selected: *selected == question.options.len(),
-                            muted: false,
+                            muted: true,
                         });
                     }
+                    // The way out of the question, kept last so the renderer's
+                    // rule lands between it and the answers.
+                    lines.push(OverlayLine {
+                        text: CHAT_INSTEAD_LABEL.to_owned(),
+                        selected: *selected == chat_instead_index(question),
+                        muted: false,
+                    });
                 }
                 Some(OverlayView {
                     closable: false,
@@ -7042,11 +7071,11 @@ impl AppState {
                     lines,
                     slider: None,
                     hint: if *text_mode {
-                        "답을 입력하고 Enter · Esc 취소".to_owned()
+                        "Enter 전송 · Esc 취소".to_owned()
                     } else {
-                        "↑↓ 선택  Enter 확인  Esc 취소".to_owned()
+                        "Enter 선택 · ↑/↓ 이동 · Esc 취소".to_owned()
                     },
-                    style: OverlayStyle::Panel,
+                    style: OverlayStyle::Question,
                     input: text_mode.then_some(editor),
                     input_label: "Answer",
                     input_placeholder: "Type your answer…",
@@ -7750,6 +7779,57 @@ impl AppState {
                     Action::Tick(false)
                 }
             }
+            Some(PendingInteraction::UserInput {
+                id,
+                questions,
+                current,
+                selected,
+                text_mode,
+                editor,
+                mut answers,
+            }) => {
+                // Row zero is the prompt itself; the answers start under it.
+                let question = &questions[current];
+                let clicked = row.checked_sub(1);
+                let chat_instead = chat_instead_index(question);
+                match clicked {
+                    Some(clicked) if clicked < question.options.len() && !text_mode => {
+                        let label = question.options[clicked].label.clone();
+                        answers.insert(question.id.clone(), label);
+                        next_question_or_reply(id, questions, current, answers, self)
+                    }
+                    Some(clicked) if clicked == chat_instead && !text_mode => {
+                        Action::RpcResponse {
+                            id,
+                            result: answers_response(&answers),
+                        }
+                    }
+                    Some(clicked) if clicked < chat_instead && !text_mode => {
+                        self.pending = Some(PendingInteraction::UserInput {
+                            id,
+                            questions,
+                            current,
+                            selected: clicked,
+                            text_mode: true,
+                            editor,
+                            answers,
+                        });
+                        Action::None
+                    }
+                    _ => {
+                        self.pending = Some(PendingInteraction::UserInput {
+                            id,
+                            questions,
+                            current,
+                            selected,
+                            text_mode,
+                            editor,
+                            answers,
+                        });
+                        Action::Tick(false)
+                    }
+                }
+            }
             other => {
                 self.pending = other;
                 Action::Tick(false)
@@ -8318,6 +8398,16 @@ fn next_question_or_reply(
         answers,
     });
     Action::None
+}
+
+/// The two rows a question carries beyond its own options.
+const OTHER_ANSWER_LABEL: &str = "직접 입력";
+const CHAT_INSTEAD_LABEL: &str = "이 내용으로 대화하기";
+
+/// Where the row that leaves the question sits: after the options and after the
+/// free-text row when the question offers one.
+fn chat_instead_index(question: &Question) -> usize {
+    question.options.len() + usize::from(question.allow_other)
 }
 
 fn answers_response(answers: &BTreeMap<String, String>) -> Value {
@@ -12240,6 +12330,30 @@ mod tests {
             state.view().composer_placeholder,
             "Enter: steer · Tab: queue"
         );
+    }
+
+    #[test]
+    fn a_busy_claude_turn_hides_the_hint_and_ignores_tab() {
+        let mut state = AppState::new(
+            "main-thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![test_model("claude:sonnet", "Claude Sonnet", true)],
+            "claude:sonnet",
+            Some("high"),
+        );
+        state.busy = true;
+        state.turn_id = Some("live-turn".to_owned());
+        state.editor.set_text("next prompt");
+
+        let action = state.handle_key(KeyEvent::from(KeyCode::Tab));
+
+        assert!(matches!(action, Action::None));
+        assert_eq!(state.view().composer_placeholder, "");
+        // Claude 브리지가 직접 대기시키므로 호스트 큐에는 아무것도 들어가지 않고,
+        // 사용자가 입력한 글도 컴포저에 그대로 남는다.
+        assert!(state.queued_prompts.is_empty());
+        assert_eq!(state.editor.display_text(), "next prompt");
     }
 
     #[test]
