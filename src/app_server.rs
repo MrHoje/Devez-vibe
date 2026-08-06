@@ -106,6 +106,10 @@ pub enum ServerEvent {
         params: Value,
     },
     ProtocolWarning(String),
+    ProviderUnavailable {
+        provider: String,
+        message: String,
+    },
     Closed(String),
 }
 

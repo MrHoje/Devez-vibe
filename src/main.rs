@@ -154,14 +154,23 @@ async fn main() -> Result<()> {
 
 async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
     server.initialize().await?;
+    let codex_unavailable_reason = server.codex_unavailable_reason().map(ToOwned::to_owned);
+    let provider_config = backend::read_provider_config();
     let startup_config = read_startup_config();
     let requested_model = cli
         .model
         .as_deref()
-        .or_else(|| root_config_value(&startup_config, "model"));
-    let (account, prefer_open_code) = if requested_model.is_some_and(claude::is_claude_model) {
+        .or_else(|| root_config_value(&provider_config, "model"));
+    let default_to_claude = requested_model.is_none();
+    let requested_claude = requested_model.is_some_and(claude::is_claude_model);
+    let requested_open_code = requested_model.is_some_and(open_code::is_open_code_model);
+    let fallback_to_claude = should_fallback_to_claude(server.has_codex(), requested_model);
+    let (account, prefer_open_code) = if requested_claude
+        || default_to_claude
+        || fallback_to_claude
+    {
         ("Claude subscription".to_owned(), false)
-    } else if requested_model.is_some_and(open_code::is_open_code_model) {
+    } else if requested_open_code {
         ("OpenCode".to_owned(), false)
     } else {
         match ensure_account(server).await {
@@ -189,7 +198,11 @@ async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
                 .map(|model| model.model.as_str())
         })
         .flatten();
-    let startup_model_request = cli.model.as_deref().or(fallback_open_code);
+    let preferred_claude = (default_to_claude || fallback_to_claude)
+        .then(|| preferred_claude_model(&models))
+        .flatten();
+    let startup_model_request =
+        preferred_claude.or_else(|| cli.model.as_deref().or(fallback_open_code));
 
     let startup_model = resolve_startup_model(
         &models,
@@ -220,6 +233,18 @@ async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
         &startup_model.model,
         Some(&startup_model.effort),
     );
+    if fallback_to_claude {
+        state.push_notice(
+            BlockKind::Warning,
+            "Codex 사용 불가",
+            format!(
+                "{}\nClaude provider로 자동 전환했습니다.",
+                codex_unavailable_reason
+                    .as_deref()
+                    .unwrap_or("Codex app-server가 종료되었습니다.")
+            ),
+        );
+    }
 
     let render_mode = renderer::load_render_mode(cli.renderer.as_deref())?;
     let terminal = TerminalSession::enter(render_mode)?;
@@ -842,6 +867,18 @@ async fn event_loop(
                     }
                     Some(ServerEvent::ProtocolWarning(message)) => {
                         state.push_notice(BlockKind::Warning, "프로토콜 경고", message);
+                        Action::None
+                    }
+                    Some(ServerEvent::ProviderUnavailable { provider, message }) => {
+                        if provider == "Codex" {
+                            state.fallback_from_codex(message);
+                        } else {
+                            state.push_notice(
+                                BlockKind::Warning,
+                                format!("{provider} 사용 불가"),
+                                message,
+                            );
+                        }
                         Action::None
                     }
                     Some(ServerEvent::Closed(message)) => {
@@ -2859,11 +2896,18 @@ struct IntegrationCatalog {
 }
 
 async fn fetch_integrations(
-    client: app_server::AppServerClient,
+    client: Option<app_server::AppServerClient>,
     cwd: String,
     thread_id: String,
     force_reload: bool,
 ) -> IntegrationCatalog {
+    let Some(client) = client else {
+        return IntegrationCatalog {
+            skills: Ok(json!({ "data": [] })),
+            plugins: Ok(json!({ "data": [] })),
+            apps: Ok(json!({ "data": [] })),
+        };
+    };
     let skills_client = client.clone();
     let plugins_client = client.clone();
     let (skills, plugins, apps) = tokio::join!(
@@ -3727,6 +3771,25 @@ fn resolve_startup_model(
     })
 }
 
+fn should_fallback_to_claude(codex_available: bool, requested_model: Option<&str>) -> bool {
+    !codex_available
+        && !requested_model.is_some_and(claude::is_claude_model)
+        && !requested_model.is_some_and(open_code::is_open_code_model)
+}
+
+fn preferred_claude_model(models: &[ModelInfo]) -> Option<&str> {
+    models
+        .iter()
+        .filter(|model| claude::is_claude_model(&model.model))
+        .find(|model| model.is_default)
+        .or_else(|| {
+            models
+                .iter()
+                .find(|model| claude::is_claude_model(&model.model))
+        })
+        .map(|model| model.model.as_str())
+}
+
 fn read_startup_config() -> String {
     let provider = backend::read_provider_config();
     let codex = state::codex_home()
@@ -3913,6 +3976,26 @@ mod tests {
             context_window: None,
             fast_service_tier: None,
         }
+    }
+
+    #[test]
+    fn unavailable_codex_falls_back_unless_an_available_provider_was_requested() {
+        assert!(should_fallback_to_claude(false, None));
+        assert!(should_fallback_to_claude(false, Some("gpt-5.6-sol")));
+        assert!(!should_fallback_to_claude(false, Some("claude:sonnet")));
+        assert!(!should_fallback_to_claude(false, Some("opencode:provider/model")));
+        assert!(!should_fallback_to_claude(true, None));
+    }
+
+    #[test]
+    fn claude_is_the_default_provider_and_uses_its_catalog_default() {
+        let models = vec![
+            model("gpt-5.6-sol", "high", true, &["high"]),
+            model("claude:opus", "high", false, &["high"]),
+            model("claude:sonnet", "high", true, &["high"]),
+        ];
+
+        assert_eq!(preferred_claude_model(&models), Some("claude:sonnet"));
     }
 
     #[test]

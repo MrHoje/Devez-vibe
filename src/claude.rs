@@ -318,15 +318,15 @@ pub fn model_catalog() -> Value {
     };
     json!({
         "data": [
-            claude_model("claude:sonnet", "Sonnet", efforts()),
-            claude_model("claude:opus", "Opus", efforts()),
-            claude_model("claude:fable", "Fable", efforts()),
-            claude_model("claude:haiku", "Haiku", json!([]))
+            claude_model("claude:sonnet", "Sonnet", efforts(), true),
+            claude_model("claude:opus", "Opus", efforts(), false),
+            claude_model("claude:fable", "Fable", efforts(), false),
+            claude_model("claude:haiku", "Haiku", json!([]), false)
         ]
     })
 }
 
-fn claude_model(id: &str, display_name: &str, efforts: Value) -> Value {
+fn claude_model(id: &str, display_name: &str, efforts: Value, is_default: bool) -> Value {
     let default_effort = efforts
         .as_array()
         .filter(|efforts| !efforts.is_empty())
@@ -338,7 +338,7 @@ fn claude_model(id: &str, display_name: &str, efforts: Value) -> Value {
         "displayName": display_name,
         "defaultReasoningEffort": default_effort,
         "supportedReasoningEfforts": efforts,
-        "isDefault": false,
+        "isDefault": is_default,
         "contextWindow": 200_000
     })
 }
@@ -480,6 +480,14 @@ mod tests {
                 .and_then(Value::as_str)
                 .is_some_and(|name| !name.starts_with("Claude"))
         }));
+        assert_eq!(
+            models
+                .iter()
+                .find(|model| model.get("isDefault").and_then(Value::as_bool) == Some(true))
+                .and_then(|model| model.get("model"))
+                .and_then(Value::as_str),
+            Some("claude:sonnet")
+        );
         let haiku = models
             .iter()
             .find(|model| model.get("model").and_then(Value::as_str) == Some("claude:haiku"))

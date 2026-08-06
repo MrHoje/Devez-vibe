@@ -2890,6 +2890,32 @@ impl AppState {
         ));
     }
 
+    pub fn fallback_from_codex(&mut self, message: impl Into<String>) -> bool {
+        if self.selected_provider() != ModelProvider::Codex {
+            return false;
+        }
+        if self.provider_model_indices(ModelProvider::Claude).is_empty() {
+            self.push_notice(
+                BlockKind::Error,
+                "Codex 사용 불가",
+                format!("{}\nClaude 모델도 찾을 수 없습니다.", message.into()),
+            );
+            return false;
+        }
+
+        let message = message.into();
+        if self.busy {
+            self.set_request_failed(message.clone());
+        }
+        self.push_notice(
+            BlockKind::Warning,
+            "Codex 사용 불가",
+            format!("{message}\nClaude provider로 자동 전환했습니다."),
+        );
+        self.switch_provider(ModelProvider::Claude);
+        true
+    }
+
     pub fn replace_models(&mut self, models: Vec<ModelInfo>) {
         if models.is_empty() {
             return;
@@ -13397,6 +13423,32 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(model_lines.len(), 2);
         assert!(model_lines.iter().all(|line| line.text.contains("GPT")));
+    }
+
+    #[test]
+    fn codex_disconnect_falls_back_to_claude_without_closing_the_ui() {
+        let models = vec![
+            test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
+            test_model("claude:sonnet", "Claude Sonnet", false),
+        ];
+        let mut state = AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            models,
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+        state.busy = true;
+        state.turn_id = Some("turn".to_owned());
+
+        assert!(state.fallback_from_codex("app-server 연결이 종료되었습니다."));
+        assert_eq!(state.selected_model_name(), "claude:sonnet");
+        assert!(!state.busy);
+        assert!(state.turn_id.is_none());
+        assert!(state.committed.iter().any(|block| {
+            block.title == "Codex 사용 불가" && block.body.contains("자동 전환했습니다")
+        }));
     }
 
     #[test]

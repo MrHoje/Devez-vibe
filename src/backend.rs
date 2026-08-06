@@ -66,7 +66,8 @@ impl Route {
 }
 
 pub struct BackendServer {
-    codex: AppServer,
+    codex: Option<AppServer>,
+    codex_unavailable_reason: Option<String>,
     open_code: Option<OpenCodeServer>,
     claude: ClaudeServer,
     open_code_path: PathBuf,
@@ -84,7 +85,11 @@ impl BackendServer {
         cwd: &Path,
     ) -> Result<Self> {
         let devezcode_room = crate::devezcode::room_id();
-        let codex = AppServer::spawn(codex_path, devezcode_room.as_deref()).await?;
+        let (codex, codex_unavailable_reason) =
+            match AppServer::spawn(codex_path, devezcode_room.as_deref()).await {
+                Ok(codex) => (Some(codex), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
         let open_code = if crate::open_code::PROVIDER_ENABLED
             && (has_connected_provider() || open_code_is_startup_default())
         {
@@ -95,6 +100,7 @@ impl BackendServer {
         let claude = ClaudeServer::new(node_path, claude_path, cwd)?;
         Ok(Self {
             codex,
+            codex_unavailable_reason,
             open_code,
             claude,
             open_code_path: open_code_path.to_path_buf(),
@@ -104,18 +110,37 @@ impl BackendServer {
         })
     }
 
-    pub async fn initialize(&self) -> Result<Value> {
-        let codex = self.codex.initialize().await?;
+    pub async fn initialize(&mut self) -> Result<()> {
+        if let Some(codex) = self.codex.as_ref()
+            && let Err(error) = codex.initialize().await
+        {
+            self.codex_unavailable_reason = Some(error.to_string());
+            if let Some(codex) = self.codex.take() {
+                codex.shutdown().await;
+            }
+        }
         if let Some(open_code) = &self.open_code {
             let _ = open_code.initialize().await;
         }
-        Ok(codex)
+        Ok(())
+    }
+
+    pub fn has_codex(&self) -> bool {
+        self.codex.is_some()
+    }
+
+    pub fn codex_unavailable_reason(&self) -> Option<&str> {
+        self.codex_unavailable_reason.as_deref()
     }
 
     pub async fn request(&self, method: &str, mut params: Value) -> Result<Value> {
         match method {
             "model/list" => {
-                let mut response = self.codex.request(method, params).await?;
+                let mut response = if let Some(codex) = self.codex.as_ref() {
+                    codex.request(method, params).await?
+                } else {
+                    empty_list_response()
+                };
                 if let Some(open_code) = &self.open_code
                     && let Ok(catalog) = open_code.model_catalog(&self.cwd).await
                     && let (Some(target), Some(extra)) = (
@@ -142,7 +167,11 @@ impl BackendServer {
                 Ok(response)
             }
             "thread/list" => {
-                let mut response = self.codex.request(method, params.clone()).await?;
+                let mut response = if let Some(codex) = self.codex.as_ref() {
+                    codex.request(method, params.clone()).await?
+                } else {
+                    empty_list_response()
+                };
                 if let Some(open_code) = &self.open_code {
                     let cwd = params.get("cwd").and_then(Value::as_str).map(Path::new);
                     if let Ok(extra) = open_code.list_sessions(cwd).await
@@ -240,7 +269,7 @@ impl BackendServer {
                     self.register_route(id, RuntimeKind::OpenCode, None, Some(id.to_owned()), None, cwd);
                     Ok(response)
                 } else {
-                    let response = self.codex.request(method, params).await?;
+                    let response = self.codex()?.request(method, params).await?;
                     self.register_codex_response(&response);
                     Ok(response)
                 }
@@ -278,7 +307,7 @@ impl BackendServer {
                     );
                     Ok(response)
                 } else {
-                    let response = self.codex.request(method, params).await?;
+                    let response = self.codex()?.request(method, params).await?;
                     self.register_codex_response(&response);
                     Ok(response)
                 }
@@ -368,7 +397,7 @@ impl BackendServer {
                     } else {
                         let backing = self.ensure_codex_route(&visible, &params).await?;
                         params["threadId"] = json!(backing);
-                        self.codex.request(method, params).await
+                        self.codex()?.request(method, params).await
                     }
                 }
                 .await;
@@ -398,7 +427,7 @@ impl BackendServer {
                     Ok(json!({}))
                 } else {
                     params["threadId"] = json!(self.backing_id(visible, RuntimeKind::Codex)?);
-                    self.codex.request(method, params).await
+                    self.codex()?.request(method, params).await
                 }
             }
             "thread/fork" => {
@@ -442,7 +471,7 @@ impl BackendServer {
                     Ok(response)
                 } else {
                     params["threadId"] = json!(self.backing_id(visible, RuntimeKind::Codex)?);
-                    let response = self.codex.request(method, params).await?;
+                    let response = self.codex()?.request(method, params).await?;
                     self.register_codex_response(&response);
                     Ok(response)
                 }
@@ -460,7 +489,7 @@ impl BackendServer {
                     Ok(json!({ "turn": { "id": turn } }))
                 } else {
                     params["threadId"] = json!(self.backing_id(visible, RuntimeKind::Codex)?);
-                    self.codex.request(method, params).await
+                    self.codex()?.request(method, params).await
                 }
             }
             "thread/unsubscribe" if self.route_kind(thread_id(&params)?) == RuntimeKind::Claude => {
@@ -482,12 +511,12 @@ impl BackendServer {
                 Ok(json!({}))
             }
             "config/value/write" if provider_default_write(&params)? => Ok(json!({})),
-            _ => self.codex.request(method, params).await,
+            _ => self.codex()?.request(method, params).await,
         }
     }
 
-    pub fn client(&self) -> AppServerClient {
-        self.codex.client()
+    pub fn client(&self) -> Option<AppServerClient> {
+        self.codex.as_ref().map(AppServer::client)
     }
 
     pub async fn provider_catalog(&mut self) -> Result<Value> {
@@ -540,7 +569,7 @@ impl BackendServer {
         } else if is_open_code_request_id(&id) {
             self.open_code()?.respond(id, result)
         } else {
-            self.codex.respond(id, result)
+            self.codex()?.respond(id, result)
         }
     }
 
@@ -550,23 +579,43 @@ impl BackendServer {
         } else if is_open_code_request_id(&id) {
             self.open_code()?.respond_error(id, code, message)
         } else {
-            self.codex.respond_error(id, code, message)
+            self.codex()?.respond_error(id, code, message)
         }
     }
 
     pub async fn next_event(&mut self) -> Option<ServerEvent> {
-        let (source, event) = if let Some(open_code) = self.open_code.as_mut() {
-            tokio::select! {
-                event = self.codex.next_event() => (RuntimeKind::Codex, event),
+        let (source, event) = match (self.codex.as_mut(), self.open_code.as_mut()) {
+            (Some(codex), Some(open_code)) => tokio::select! {
+                event = codex.next_event() => (RuntimeKind::Codex, event),
                 event = open_code.next_event() => (RuntimeKind::OpenCode, event),
                 event = self.claude.next_event() => (RuntimeKind::Claude, event),
-            }
-        } else {
-            tokio::select! {
-                event = self.codex.next_event() => (RuntimeKind::Codex, event),
+            },
+            (Some(codex), None) => tokio::select! {
+                event = codex.next_event() => (RuntimeKind::Codex, event),
                 event = self.claude.next_event() => (RuntimeKind::Claude, event),
-            }
+            },
+            (None, Some(open_code)) => tokio::select! {
+                event = open_code.next_event() => (RuntimeKind::OpenCode, event),
+                event = self.claude.next_event() => (RuntimeKind::Claude, event),
+            },
+            (None, None) => (RuntimeKind::Claude, self.claude.next_event().await),
         };
+        if source == RuntimeKind::Codex
+            && (event.is_none() || matches!(event, Some(ServerEvent::Closed(_))))
+        {
+            let detail = match event {
+                Some(ServerEvent::Closed(detail)) => detail,
+                _ => "Codex app-server 이벤트 채널이 종료되었습니다.".to_owned(),
+            };
+            self.codex_unavailable_reason = Some(detail.clone());
+            if let Some(codex) = self.codex.take() {
+                tokio::spawn(codex.shutdown());
+            }
+            return Some(ServerEvent::ProviderUnavailable {
+                provider: "Codex".to_owned(),
+                message: detail,
+            });
+        }
         if source == RuntimeKind::OpenCode
             && (event.is_none() || matches!(event, Some(ServerEvent::Closed(_))))
         {
@@ -596,7 +645,11 @@ impl BackendServer {
             codex, open_code, claude, ..
         } = self;
         tokio::join!(
-            codex.shutdown(),
+            async move {
+                if let Some(codex) = codex {
+                    codex.shutdown().await;
+                }
+            },
             async move {
                 if let Some(open_code) = open_code {
                     open_code.shutdown().await;
@@ -610,6 +663,12 @@ impl BackendServer {
         self.open_code
             .as_ref()
             .context("OpenCode가 설치되어 있지 않거나 ACP를 시작할 수 없습니다.")
+    }
+
+    fn codex(&self) -> Result<&AppServer> {
+        self.codex.as_ref().context(
+            "Codex app-server를 사용할 수 없습니다. Claude provider를 사용하세요.",
+        )
     }
 
     async fn ensure_open_code(&mut self) -> Result<&OpenCodeServer> {
@@ -846,7 +905,7 @@ impl BackendServer {
             .unwrap_or_else(|| self.cwd.clone());
         let model = params.get("model").and_then(Value::as_str);
         let response = self
-            .codex
+            .codex()?
             .request(
                 "thread/start",
                 json!({
@@ -941,6 +1000,10 @@ impl BackendServer {
     }
 }
 
+fn empty_list_response() -> Value {
+    json!({ "data": [], "nextCursor": null })
+}
+
 pub fn read_provider_config() -> String {
     provider_config_path()
         .and_then(|path| fs::read_to_string(path).ok())
@@ -963,20 +1026,14 @@ fn provider_default_write(params: &Value) -> Result<bool> {
             write_provider_config(value, "default")?;
             return Ok(true);
         }
-        if let Some(path) = provider_config_path()
-            && path.is_file()
-        {
-            fs::remove_file(path)?;
-        }
+        write_provider_config(value, "default")?;
         return Ok(false);
     }
     if key == "model_reasoning_effort" {
         let config = read_provider_config();
-        if let Some(model) = root_config_value(&config, "model")
-            && (is_open_code_model(model) || is_claude_model(model))
-        {
+        if let Some(model) = root_config_value(&config, "model") {
             write_provider_config(model, value)?;
-            return Ok(true);
+            return Ok(is_open_code_model(model) || is_claude_model(model));
         }
     }
     Ok(false)
@@ -1265,6 +1322,43 @@ fn thread_id(params: &Value) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn missing_codex_runtime_keeps_the_backend_available_for_claude() {
+        let mut server = BackendServer::spawn(
+            Path::new("devez-vibe-codex-does-not-exist-7f96e2"),
+            Path::new("opencode"),
+            Path::new("node"),
+            Path::new("claude"),
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+        .await
+        .expect("Claude backend should survive a missing Codex executable");
+
+        server.initialize().await.expect("fallback initialization");
+        assert!(!server.has_codex());
+        assert!(server.codex_unavailable_reason().is_some());
+        server.shutdown().await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn codex_initialization_exit_keeps_the_backend_available_for_claude() {
+        let mut server = BackendServer::spawn(
+            Path::new("where.exe"),
+            Path::new("opencode"),
+            Path::new("node"),
+            Path::new("claude"),
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+        )
+        .await
+        .expect("Codex process should start before the simulated initialization exit");
+
+        server.initialize().await.expect("fallback initialization");
+        assert!(!server.has_codex());
+        assert!(server.codex_unavailable_reason().is_some());
+        server.shutdown().await;
+    }
 
     #[test]
     fn explicit_model_switches_between_runtimes() {

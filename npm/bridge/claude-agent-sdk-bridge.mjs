@@ -9,7 +9,7 @@ import {
   getSessionInfo,
   getSessionMessages,
   listSessions,
-  query,
+  startup,
 } from "@anthropic-ai/claude-agent-sdk";
 
 const VERSION = process.env.DEVEZ_VIBE_VERSION || "dev";
@@ -90,6 +90,16 @@ function sanitizedEnvironment() {
   return env;
 }
 
+function applyClaudeExecutable(options, params) {
+  const executable = String(params.claudePath || "").trim();
+  if (!executable) return;
+  // On Windows use the SDK's matching native CLI bundle. It reads the same
+  // ~/.claude credentials, settings, hooks, skills, and plugins, while avoiding
+  // EINVAL from command shims and incompatible separately-installed CLI builds.
+  if (process.platform === "win32") return;
+  options.pathToClaudeCodeExecutable = executable;
+}
+
 function modelCapabilities(models, model) {
   const value = stripClaudeModel(model);
   return models.find((candidate) => candidate.value === value || candidate.resolvedModel === value)
@@ -125,7 +135,7 @@ function compactClaudeModelName(model) {
   return fallback || clean(model.displayName || model.resolvedModel || model.value);
 }
 
-function catalogEntry(model) {
+function catalogEntry(model, defaultResolvedModel) {
   const value = String(model.value || "");
   const resolved = String(model.resolvedModel || value);
   const efforts = model.supportsEffort && Array.isArray(model.supportedEffortLevels)
@@ -138,7 +148,7 @@ function catalogEntry(model) {
     displayName: compactClaudeModelName(model),
     defaultReasoningEffort: efforts.includes("high") ? "high" : efforts.at(-1) || "",
     supportedReasoningEfforts: efforts.map((reasoningEffort) => ({ reasoningEffort })),
-    isDefault: false,
+    isDefault: Boolean(defaultResolvedModel) && resolved === defaultResolvedModel,
     ...(contextWindow > 0 ? { contextWindow } : {}),
   };
 }
@@ -156,18 +166,21 @@ async function loadModelCatalog(params) {
       env: sanitizedEnvironment(),
       stderr: (data) => process.stderr.write(data),
     };
-    if (params.claudePath) options.pathToClaudeCodeExecutable = params.claudePath;
-    const agentQuery = query({ prompt: input, options });
+    applyClaudeExecutable(options, params);
+    const agentQuery = await startAgentQuery(input, options);
     const consumer = (async () => {
       try { for await (const _message of agentQuery) { /* initialization only */ } }
       catch { /* the caller receives the supportedModels error */ }
     })();
     try {
       const models = await agentQuery.supportedModels();
+      const defaultResolvedModel = String(
+        models.find((model) => model.value === "default")?.resolvedModel || "",
+      );
       return {
         data: models
           .filter((model) => model.value && model.value !== "default")
-          .map(catalogEntry),
+          .map((model) => catalogEntry(model, defaultResolvedModel)),
       };
     } finally {
       input.close();
@@ -223,12 +236,22 @@ function makeOptions(params, sessionId, resume) {
   const model = stripClaudeModel(params.model);
   if (model) options.model = model;
   if (params.effort) options.effort = params.effort;
-  if (params.claudePath) options.pathToClaudeCodeExecutable = params.claudePath;
+  applyClaudeExecutable(options, params);
   if (resume) options.resume = resume;
   else options.sessionId = sessionId;
   options.canUseTool = (toolName, input, permission) =>
     requestToolPermission(toolName, input, permission);
   return options;
+}
+
+async function startAgentQuery(prompt, options) {
+  const warm = await startup({ options });
+  try {
+    return warm.query(prompt);
+  } catch (error) {
+    warm.close();
+    throw error;
+  }
 }
 
 async function requestToolPermission(toolName, input, permission) {
@@ -317,10 +340,7 @@ async function createSession(params, resumeId) {
     tools: new Map(),
     tasks: new Map(),
   };
-  const agentQuery = query({
-    prompt: queue,
-    options: makeOptions(params, id, resumeId),
-  });
+  const agentQuery = await startAgentQuery(queue, makeOptions(params, id, resumeId));
   session.query = agentQuery;
   sessions.set(id, session);
   const consumer = consume(session).catch((error) => {
@@ -333,7 +353,16 @@ async function createSession(params, resumeId) {
     if (session.turn) finishTurn(session, error);
   });
   session.consumer = consumer;
-  const initialization = await agentQuery.initializationResult();
+  let initialization;
+  try {
+    initialization = await agentQuery.initializationResult();
+  } catch (error) {
+    sessions.delete(id);
+    queue.close();
+    agentQuery.close();
+    await Promise.race([consumer, new Promise((resolve) => setTimeout(resolve, 1000))]);
+    throw error;
+  }
   session.models = Array.isArray(initialization.models) ? initialization.models : [];
   session.effort = supportedEffort(modelCapabilities(session.models, params.model), params.effort);
   const account = initialization.account || await safeAccount(agentQuery);
