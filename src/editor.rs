@@ -336,9 +336,25 @@ impl Editor {
         }
         self.leave_history();
         let end = self.cursor;
-        self.move_word_left();
+        self.move_word_left_for_delete();
         self.kill_buffer = self.buffer[self.cursor..end].iter().collect();
         self.buffer.drain(self.cursor..end);
+    }
+
+    fn move_word_left_for_delete(&mut self) {
+        while self.cursor > 0 && self.buffer[self.cursor - 1].is_whitespace() {
+            self.cursor -= 1;
+        }
+        if self.cursor > 0 && matches!(self.buffer[self.cursor - 1], '/' | '\\') {
+            self.cursor -= 1;
+        }
+        while self.cursor > 0
+            && !self.buffer[self.cursor - 1].is_whitespace()
+            && !matches!(self.buffer[self.cursor - 1], '/' | '\\')
+        {
+            self.cursor -= 1;
+        }
+        self.cursor = self.cursor.max(self.collapsed_paste_end.unwrap_or(0));
     }
 
     pub fn delete_word_right(&mut self) {
@@ -595,6 +611,21 @@ mod tests {
 
         editor.yank();
         assert_eq!(editor.text(), "alpha beta");
+    }
+
+    #[test]
+    fn delete_word_left_removes_path_segments_one_at_a_time() {
+        let mut editor = Editor::default();
+        editor.set_text("C:/Source/devezcode");
+
+        editor.delete_word_left();
+        assert_eq!(editor.text(), "C:/Source/");
+
+        editor.delete_word_left();
+        assert_eq!(editor.text(), "C:/");
+
+        editor.delete_word_left();
+        assert_eq!(editor.text(), "");
     }
 
     #[test]
