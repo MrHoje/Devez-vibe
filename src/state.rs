@@ -312,7 +312,17 @@ struct SlashCommand {
     takes_argument: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 28] = [
+const SLASH_COMMANDS: [SlashCommand; 30] = [
+    SlashCommand {
+        name: "/claude",
+        description: "Switch to the Claude provider",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/codex",
+        description: "Switch to the Codex provider",
+        takes_argument: false,
+    },
     SlashCommand {
         name: "/model",
         description: "Switch model and reasoning",
@@ -335,7 +345,7 @@ const SLASH_COMMANDS: [SlashCommand; 28] = [
     },
     SlashCommand {
         name: "/login",
-        description: "Sign in to a ChatGPT account",
+        description: "Sign in to the current provider account",
         takes_argument: false,
     },
     SlashCommand {
@@ -476,6 +486,10 @@ pub struct AccountPlan {
     pub credits: Vec<ResetCredit>,
     /// The server's own tally, which can exceed the listed credits.
     pub available_credits: usize,
+    /// Provider-native usage rows, used by Claude subscriptions instead of reset credits.
+    pub usage_lines: Vec<String>,
+    pub five_hour_percent: Option<u8>,
+    pub weekly_percent: Option<u8>,
 }
 
 impl AccountPlan {
@@ -522,6 +536,45 @@ impl AccountPlan {
             plan,
             credits,
             available_credits,
+            usage_lines: Vec::new(),
+            five_hour_percent: None,
+            weekly_percent: None,
+        }
+    }
+
+    pub fn from_claude(account: Option<&Value>, usage: Option<&Value>) -> Self {
+        let subscription = usage
+            .and_then(|usage| usage.get("subscription_type"))
+            .or_else(|| account.and_then(|account| account.get("subscriptionType")))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        let window = |name: &str| usage.and_then(|usage| usage.pointer(&format!("/rate_limits/{name}")));
+        let percent = |value: Option<&Value>| {
+            value
+                .and_then(|value| value.get("utilization"))
+                .and_then(Value::as_f64)
+                .map(|value| value.clamp(0.0, 100.0).round() as u8)
+        };
+        let five_hour = window("five_hour");
+        let seven_day = window("seven_day");
+        let mut usage_lines = Vec::new();
+        for (label, value) in [("5h", five_hour), ("7d", seven_day)] {
+            let Some(percent) = percent(value) else { continue };
+            let reset = value
+                .and_then(|value| value.get("resets_at"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!(" · reset {}", compact_reset_time(value)))
+                .unwrap_or_default();
+            usage_lines.push(format!("{label} {percent}% used{reset}"));
+        }
+        Self {
+            plan: subscription.map(|value| format!("Claude {}", title_case(value))),
+            credits: Vec::new(),
+            available_credits: 0,
+            usage_lines,
+            five_hour_percent: percent(five_hour),
+            weekly_percent: percent(seven_day),
         }
     }
 
@@ -536,6 +589,9 @@ impl AccountPlan {
 
     /// Split out from [`Self::credit_lines`] so the wording is testable.
     fn credit_lines_at(&self, now: u64) -> Vec<String> {
+        if !self.usage_lines.is_empty() {
+            return self.usage_lines.clone();
+        }
         if self.available_credits == 0 && self.credits.is_empty() {
             return vec!["none available".to_owned()];
         }
@@ -561,6 +617,12 @@ impl AccountPlan {
         }
         lines
     }
+}
+
+fn compact_reset_time(value: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|instant| instant.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
+        .unwrap_or_else(|_| value.to_owned())
 }
 
 /// Maps the server's `planType` onto the wording OpenAI uses for the plan.
@@ -625,6 +687,10 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+fn context_token_label(tokens: u64) -> String {
+    format!("{}k", tokens / 1_000)
+}
+
 #[derive(Clone)]
 pub struct ModelInfo {
     pub id: String,
@@ -640,6 +706,37 @@ pub struct ModelInfo {
 #[derive(Clone)]
 pub struct EffortInfo {
     pub id: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelProvider {
+    Codex,
+    Claude,
+    OpenCode,
+}
+
+impl ModelProvider {
+    fn from_model(model: &str) -> Self {
+        if model.starts_with("claude:") {
+            Self::Claude
+        } else if model.starts_with("opencode:") {
+            Self::OpenCode
+        } else {
+            Self::Codex
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude",
+            Self::OpenCode => "OpenCode",
+        }
+    }
+
+    fn matches(self, model: &ModelInfo) -> bool {
+        Self::from_model(&model.model) == self
+    }
 }
 
 impl ModelInfo {
@@ -701,6 +798,11 @@ impl ModelInfo {
         let query = query.trim().to_ascii_lowercase();
         let identity = format!("{} {}", self.model, self.display_name).to_ascii_lowercase();
         match query.as_str() {
+            "claude" | "claude:default" => identity.contains("claude"),
+            "haiku" => identity.contains("claude") && identity.contains("haiku"),
+            "sonnet" => identity.contains("claude") && identity.contains("sonnet"),
+            "opus" => identity.contains("claude") && identity.contains("opus"),
+            "fable" => identity.contains("claude") && identity.contains("fable"),
             "sol" => identity.contains("5.6") && identity.contains("sol"),
             "terra" => identity.contains("5.6") && identity.contains("terra"),
             "luna" => identity.contains("5.6") && identity.contains("luna"),
@@ -2719,6 +2821,66 @@ impl AppState {
         &self.models
     }
 
+    fn selected_provider(&self) -> ModelProvider {
+        ModelProvider::from_model(self.selected_model_name())
+    }
+
+    fn provider_model_indices(&self, provider: ModelProvider) -> Vec<usize> {
+        self.models
+            .iter()
+            .enumerate()
+            .filter_map(|(index, model)| provider.matches(model).then_some(index))
+            .collect()
+    }
+
+    fn current_provider_model_indices(&self) -> Vec<usize> {
+        self.provider_model_indices(self.selected_provider())
+    }
+
+    fn switch_provider(&mut self, provider: ModelProvider) {
+        self.commit_welcome_card();
+        if self.selected_provider() == provider {
+            self.committed.push(Block::new(
+                BlockKind::System,
+                "Provider",
+                format!("현재 {} provider를 사용 중입니다.", provider.label()),
+            ));
+            return;
+        }
+
+        let candidates = self.provider_model_indices(provider);
+        let selected = candidates
+            .iter()
+            .copied()
+            .find(|index| self.models[*index].is_default)
+            .or_else(|| candidates.first().copied());
+        let Some(index) = selected else {
+            self.committed.push(Block::new(
+                BlockKind::Error,
+                "Provider unavailable",
+                format!("{} 모델을 찾을 수 없습니다.", provider.label()),
+            ));
+            return;
+        };
+
+        let model = &self.models[index];
+        let model_name = model.display_name.clone();
+        let effort = model.default_effort.clone();
+        self.selected_model = index;
+        self.selected_effort = effort.clone();
+        self.context_window = model.context_window;
+        let detail = if effort.is_empty() {
+            format!("↳ {} · {model_name}", provider.label())
+        } else {
+            format!("↳ {} · {model_name} · {effort}", provider.label())
+        };
+        self.committed.push(Block::new(
+            BlockKind::ModelChange,
+            "✓ Provider changed",
+            detail,
+        ));
+    }
+
     pub fn replace_models(&mut self, models: Vec<ModelInfo>) {
         if models.is_empty() {
             return;
@@ -2883,6 +3045,12 @@ impl AppState {
     }
 
     pub fn set_account_plan(&mut self, plan: AccountPlan) {
+        if plan.five_hour_percent.is_some() {
+            self.five_hour_percent = plan.five_hour_percent;
+        }
+        if plan.weekly_percent.is_some() {
+            self.weekly_percent = plan.weekly_percent;
+        }
         self.account_plan = plan;
     }
 
@@ -3855,7 +4023,14 @@ impl AppState {
         }
         if self.status_metadata_refreshed_at.elapsed().as_secs() >= 3 {
             let branch = read_git_branch(&self.cwd);
-            let (five_hour_percent, weekly_percent) = read_codex_usage();
+            let (five_hour_percent, weekly_percent) = if self
+                .selected_model()
+                .is_some_and(|model| model.model.starts_with("claude:"))
+            {
+                (self.five_hour_percent, self.weekly_percent)
+            } else {
+                read_codex_usage()
+            };
             let fast_mode = read_fast_mode();
             full_redraw = self.branch != branch
                 || self.five_hour_percent != five_hour_percent
@@ -4588,6 +4763,18 @@ impl AppState {
             }
             // Plan or auth mode changed underneath us; pull the fresh values.
             "account/updated" => self.account_refresh_due = true,
+            "claude/account/updated" => {
+                let account = params.get("account").filter(|value| !value.is_null());
+                let usage = params.get("usage").filter(|value| !value.is_null());
+                if let Some(label) = account
+                    .and_then(|account| account.get("email"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                {
+                    self.account = label.to_owned();
+                }
+                self.set_account_plan(AccountPlan::from_claude(account, usage));
+            }
             "turn/started" => {
                 if let Some(turn_id) = params
                     .get("turn")
@@ -4807,10 +4994,10 @@ impl AppState {
                     if retry {
                         "재시도 중"
                     } else {
-                        if provider == "Codex" {
-                            "Codex 오류"
-                        } else {
-                            "OpenCode 오류"
+                        match provider {
+                            "Codex" => "Codex 오류",
+                            "Claude" => "Claude 오류",
+                            _ => "OpenCode 오류",
                         }
                     },
                     message,
@@ -4945,15 +5132,47 @@ impl AppState {
 
     pub(crate) fn run_slash_command(&mut self, command: &str) -> Action {
         let parts = command.split_whitespace().collect::<Vec<_>>();
+        let using_claude = self.selected_model_name().starts_with("claude:");
         match parts.first().copied().unwrap_or_default() {
             "/help" => {
                 let provider_help = crate::open_code::PROVIDER_ENABLED
                     .then_some("/connect  OpenCode provider 연결\n")
                     .unwrap_or_default();
+                let login_help = if using_claude {
+                    "/login  Claude 로그인 방법\n/logout  Claude 로그아웃 방법"
+                } else {
+                    "/login  ChatGPT 계정 로그인\n/logout  계정 연결 해제"
+                };
+                let fast_help = if using_claude {
+                    ""
+                } else {
+                    "/fast [on|off]  Fast 서비스 티어 선택\n"
+                };
+                let effort_help = self
+                    .selected_model()
+                    .is_some_and(|model| !model.efforts.is_empty())
+                    .then_some("/effort [LEVEL]  추론 수준\n")
+                    .unwrap_or_default();
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/model [MODEL] [EFFORT]  모델과 effort 선택\n{provider_help}/fast [on|off]  Fast 서비스 티어 선택\n/effort [LEVEL]  추론 수준\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/login  ChatGPT 계정 로그인\n/logout  계정 연결 해제\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈"),
+                    format!("/claude  Claude provider로 전환\n/codex  Codex provider로 전환\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n{login_help}\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈"),
+                ));
+                Action::None
+            }
+            "/claude" if parts.len() == 1 => {
+                self.switch_provider(ModelProvider::Claude);
+                Action::None
+            }
+            "/codex" if parts.len() == 1 => {
+                self.switch_provider(ModelProvider::Codex);
+                Action::None
+            }
+            "/claude" | "/codex" => {
+                self.committed.push(Block::new(
+                    BlockKind::Error,
+                    "Usage",
+                    parts[0],
                 ));
                 Action::None
             }
@@ -5020,15 +5239,17 @@ impl AppState {
             }
             "/model" => {
                 let query = parts[1];
+                let provider_models = self.current_provider_model_indices();
                 let index = query
                     .parse::<usize>()
                     .ok()
                     .and_then(|number| number.checked_sub(1))
-                    .filter(|index| *index < self.models.len())
+                    .and_then(|index| provider_models.get(index).copied())
                     .or_else(|| {
-                        self.models
+                        provider_models
                             .iter()
-                            .position(|candidate| candidate.matches_query(query))
+                            .copied()
+                            .find(|index| self.models[*index].matches_query(query))
                     });
                 let Some(index) = index else {
                     self.committed
@@ -5040,6 +5261,17 @@ impl AppState {
                 Action::None
             }
             "/effort" if parts.len() == 1 => {
+                if self
+                    .selected_model()
+                    .is_none_or(|model| model.efforts.is_empty())
+                {
+                    self.committed.push(Block::new(
+                        BlockKind::Error,
+                        "Effort unavailable",
+                        "현재 모델은 reasoning effort를 지원하지 않습니다.",
+                    ));
+                    return Action::None;
+                }
                 let effort_index = self
                     .selected_model()
                     .and_then(|model| {
@@ -5128,8 +5360,24 @@ impl AppState {
                     .push(Block::new(BlockKind::Error, "Usage", "/connect"));
                 Action::None
             }
+            "/login" if using_claude => {
+                self.push_notice(
+                    BlockKind::System,
+                    "Claude 로그인",
+                    "터미널에서 `claude auth login`을 실행한 뒤 Devez Vibe를 다시 시작하세요.",
+                );
+                Action::None
+            }
             "/login" => {
                 self.open_login_picker();
+                Action::None
+            }
+            "/logout" if using_claude => {
+                self.push_notice(
+                    BlockKind::Warning,
+                    "Claude 로그아웃",
+                    "터미널에서 `claude auth logout`을 실행한 뒤 Devez Vibe를 다시 시작하세요.",
+                );
                 Action::None
             }
             "/logout" => {
@@ -5283,11 +5531,12 @@ impl AppState {
             "/new" => Action::NewThread,
             "/status" => {
                 let model = self.selected_model_display_name();
+                let provider = self.selected_provider().label();
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Status",
                     format!(
-                        "thread: {}\nmodel: {model}\neffort: {}\ntheme: {}\npermissions: {} ({})\ncwd: {}",
+                        "thread: {}\nprovider: {provider}\nmodel: {model}\neffort: {}\ntheme: {}\npermissions: {} ({})\ncwd: {}",
                         self.thread_id,
                         self.selected_effort,
                         theme::current().display_name(),
@@ -5348,33 +5597,38 @@ impl AppState {
                 match key.code {
                     KeyCode::Esc => return Action::None,
                     KeyCode::Up => {
-                        model_index = model_index.saturating_sub(1);
+                        model_index = self.move_model_index(model_index, -1);
                         effort_index = self.effort_index_for_model(model_index);
                     }
                     KeyCode::Char('k') if !ctrl && !alt => {
-                        model_index = model_index.saturating_sub(1);
+                        model_index = self.move_model_index(model_index, -1);
                         effort_index = self.effort_index_for_model(model_index);
                     }
                     KeyCode::Char('p') if ctrl => {
-                        model_index = model_index.saturating_sub(1);
+                        model_index = self.move_model_index(model_index, -1);
                         effort_index = self.effort_index_for_model(model_index);
                     }
                     KeyCode::Down => {
-                        model_index = (model_index + 1).min(self.models.len().saturating_sub(1));
+                        model_index = self.move_model_index(model_index, 1);
                         effort_index = self.effort_index_for_model(model_index);
                     }
                     KeyCode::Char('j') if !ctrl && !alt => {
-                        model_index = (model_index + 1).min(self.models.len().saturating_sub(1));
+                        model_index = self.move_model_index(model_index, 1);
                         effort_index = self.effort_index_for_model(model_index);
                     }
                     KeyCode::Char('n') if ctrl => {
-                        model_index = (model_index + 1).min(self.models.len().saturating_sub(1));
+                        model_index = self.move_model_index(model_index, 1);
                         effort_index = self.effort_index_for_model(model_index);
                     }
                     KeyCode::Char(ch) if !ctrl && !alt && ('1'..='9').contains(&ch) => {
                         let index = ch.to_digit(10).unwrap_or_default() as usize - 1;
-                        if index < self.models.len() {
-                            self.open_model_scope(index, self.effort_index_for_model(index));
+                        if let Some(model_index) =
+                            self.current_provider_model_indices().get(index).copied()
+                        {
+                            self.open_model_scope(
+                                model_index,
+                                self.effort_index_for_model(model_index),
+                            );
                             return Action::None;
                         }
                     }
@@ -5445,7 +5699,8 @@ impl AppState {
                 let count = self
                     .selected_model()
                     .map(|model| model.efforts.len())
-                    .unwrap_or(1);
+                    .unwrap_or(1)
+                    .max(1);
                 match key.code {
                     KeyCode::Esc => return Action::None,
                     KeyCode::Left | KeyCode::Up => {
@@ -6011,21 +6266,34 @@ impl AppState {
                 model_index,
                 effort_index,
             } => {
-                let window = visible_window(Some(*model_index), self.models.len(), PICKER_ROWS);
+                let provider_models = self.current_provider_model_indices();
+                let selected_position = provider_models
+                    .iter()
+                    .position(|index| index == model_index)
+                    .unwrap_or(0);
+                let window = visible_window(
+                    Some(selected_position),
+                    provider_models.len(),
+                    PICKER_ROWS,
+                );
                 let start = window.start;
-                let mut lines = self.models[window]
+                let mut lines = provider_models[window]
                     .iter()
                     .enumerate()
-                    .map(|(offset, model)| {
-                        let index = start + offset;
+                    .map(|(offset, index)| {
+                        let model = &self.models[*index];
                         OverlayLine {
-                            text: format!("{}. {}", index + 1, model.display_name),
-                            selected: index == *model_index,
+                            text: format!("{}. {}", start + offset + 1, model.display_name),
+                            selected: *index == *model_index,
                             muted: false,
                         }
                     })
                     .collect::<Vec<_>>();
-                let slider = self.models.get(*model_index).map(|model| {
+                let slider = self
+                    .models
+                    .get(*model_index)
+                    .filter(|model| !model.efforts.is_empty())
+                    .map(|model| {
                     lines.push(OverlayLine {
                         text: String::new(),
                         selected: false,
@@ -6033,13 +6301,17 @@ impl AppState {
                     });
                     effort_slider(model, *effort_index)
                 });
+                let hint = if slider.is_some() {
+                    "↑↓ model  ·  ←→ effort  ·  Enter to continue  ·  Esc to cancel"
+                } else {
+                    "↑↓ model  ·  Enter to continue  ·  Esc to cancel"
+                };
                 Some(OverlayView {
                     closable: true,
                     title: "Model".to_owned(),
                     lines,
                     slider,
-                    hint: "↑↓ model  ·  ←→ effort  ·  Enter to continue  ·  Esc to cancel"
-                        .to_owned(),
+                    hint: hint.to_owned(),
                     style: OverlayStyle::Picker,
                     input: None,
                     input_label: "",
@@ -6057,6 +6329,11 @@ impl AppState {
                     .get(*effort_index)
                     .map(|effort| effort.id.as_str())
                     .unwrap_or(&model.default_effort);
+                let summary = if effort.is_empty() {
+                    model.display_name.clone()
+                } else {
+                    format!("{}  ·  {effort}", model.display_name)
+                };
                 let label_width = ModelScope::CHOICES
                     .iter()
                     .map(|scope| scope.label().len())
@@ -6064,7 +6341,7 @@ impl AppState {
                     .unwrap_or_default();
                 let mut lines = vec![
                     OverlayLine {
-                        text: format!("{}  ·  {effort}", model.display_name),
+                        text: summary,
                         selected: false,
                         muted: true,
                     },
@@ -6673,6 +6950,15 @@ impl AppState {
             .filter(|command| {
                 crate::open_code::PROVIDER_ENABLED || command.name != "/connect"
             })
+            .filter(|command| {
+                !self.selected_model_name().starts_with("claude:") || command.name != "/fast"
+            })
+            .filter(|command| {
+                command.name != "/effort"
+                    || self
+                        .selected_model()
+                        .is_some_and(|model| !model.efforts.is_empty())
+            })
             .filter(|command| command.name.starts_with(&text))
             .collect()
     }
@@ -6960,7 +7246,9 @@ impl AppState {
         let context = self.context_window.and_then(|window| {
             (window > 0).then(|| {
                 format!(
-                    "Context: {}%",
+                    "Context: {}/{} ({}%)",
+                    context_token_label(self.context_tokens),
+                    context_token_label(window),
                     // A prompt cannot really outgrow its window, but a stale
                     // reading should not print an impossible percentage.
                     (self.context_tokens.saturating_mul(100) / window).min(100)
@@ -6972,10 +7260,11 @@ impl AppState {
                 .status_line_settings
                 .enabled(StatusLineField::Model)
                 .then(|| self.selected_model_display_name().to_owned()),
-            effort: self
-                .status_line_settings
-                .enabled(StatusLineField::Effort)
-                .then(|| self.selected_effort.clone()),
+            effort: (self.status_line_settings.enabled(StatusLineField::Effort)
+                && self
+                    .selected_model()
+                    .is_some_and(|model| !model.efforts.is_empty()))
+            .then(|| self.selected_effort.clone()),
             context: self
                 .status_line_settings
                 .enabled(StatusLineField::Context)
@@ -7054,16 +7343,30 @@ impl AppState {
         self.committed.push(Block::new(
             BlockKind::ModelChange,
             "✓ Model changed",
-            format!("↳ {model_name} · {selected_effort}"),
+            if selected_effort.is_empty() {
+                format!("↳ {model_name}")
+            } else {
+                format!("↳ {model_name} · {selected_effort}")
+            },
         ));
     }
 
-    fn move_selected_model(&mut self, direction: i8) {
-        let next_index = match direction {
-            -1 => self.selected_model.saturating_sub(1),
-            1 => (self.selected_model + 1).min(self.models.len().saturating_sub(1)),
-            _ => return,
+    fn move_model_index(&self, model_index: usize, direction: i8) -> usize {
+        let candidates = self.current_provider_model_indices();
+        let position = candidates
+            .iter()
+            .position(|candidate| *candidate == model_index)
+            .unwrap_or(0);
+        let next = match direction {
+            -1 => position.saturating_sub(1),
+            1 => (position + 1).min(candidates.len().saturating_sub(1)),
+            _ => position,
         };
+        candidates.get(next).copied().unwrap_or(model_index)
+    }
+
+    fn move_selected_model(&mut self, direction: i8) {
+        let next_index = self.move_model_index(self.selected_model, direction);
         if next_index == self.selected_model {
             return;
         }
@@ -7209,9 +7512,19 @@ impl AppState {
                 model_index,
                 effort_index,
             }) => {
-                let start = visible_window(Some(model_index), self.models.len(), PICKER_ROWS).start;
+                let provider_models = self.current_provider_model_indices();
+                let selected_position = provider_models
+                    .iter()
+                    .position(|index| *index == model_index)
+                    .unwrap_or(0);
+                let start = visible_window(
+                    Some(selected_position),
+                    provider_models.len(),
+                    PICKER_ROWS,
+                )
+                .start;
                 let clicked = start + row;
-                if clicked < self.models.len() {
+                if let Some(clicked) = provider_models.get(clicked).copied() {
                     // The digit keys do exactly this: take the model and move on
                     // to the question of how long the pick lasts.
                     self.open_model_scope(clicked, self.effort_index_for_model(clicked));
@@ -7487,6 +7800,7 @@ impl AppState {
         }
         let welcome = self.welcome_view();
         self.committed.push(Block::welcome(
+            &welcome.provider,
             &welcome.plan,
             &welcome.cwd,
             &welcome.account,
@@ -7497,6 +7811,13 @@ impl AppState {
 
     fn welcome_view(&self) -> WelcomeView {
         WelcomeView {
+            provider: if self.selected_model_name().starts_with("claude:") {
+                "Claude".to_owned()
+            } else if self.selected_model_name().starts_with("opencode:") {
+                "OpenCode".to_owned()
+            } else {
+                "Codex".to_owned()
+            },
             plan: self.account_plan.plan_display(),
             credits: self.account_plan.credit_lines(),
             credits_expanded: self.welcome_credits_expanded,
@@ -7937,7 +8258,9 @@ fn active_item_block(cwd: &str, item: &Value) -> Option<Block> {
     match item.get("type")?.as_str()? {
         "agentMessage" => Some(Block::new(
             BlockKind::Assistant,
-            "Codex",
+            item.get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or("Codex"),
             item.get("text").and_then(Value::as_str).unwrap_or_default(),
         )),
         "reasoning" => Some(Block::new(
@@ -10476,6 +10799,26 @@ mod tests {
     }
 
     #[test]
+    fn claude_account_plan_uses_subscription_windows() {
+        let account = json!({ "subscriptionType": "team" });
+        let usage = json!({
+            "subscription_type": "team",
+            "rate_limits": {
+                "five_hour": { "utilization": 37.4, "resets_at": "2026-08-06T05:00:00Z" },
+                "seven_day": { "utilization": 61.0, "resets_at": "2026-08-10T05:00:00Z" }
+            }
+        });
+
+        let plan = AccountPlan::from_claude(Some(&account), Some(&usage));
+
+        assert_eq!(plan.plan_display(), "Claude Team");
+        assert_eq!(plan.five_hour_percent, Some(37));
+        assert_eq!(plan.weekly_percent, Some(61));
+        assert!(plan.credit_lines()[0].starts_with("5h 37% used · reset "));
+        assert!(plan.credit_lines()[1].starts_with("7d 61% used · reset "));
+    }
+
+    #[test]
     fn account_plan_ignores_spent_credits_and_flags_expiry() {
         let plan = AccountPlan::from_rate_limits(&json!({
             "rateLimitResetCredits": {
@@ -10727,6 +11070,72 @@ mod tests {
                 .iter()
                 .any(|block| block.body.contains("browser closed"))
         );
+    }
+
+    #[test]
+    fn claude_login_commands_use_claude_cli_instead_of_chatgpt_overlays() {
+        let mut state = test_state();
+        state.models = vec![test_model("claude:sonnet", "Claude Sonnet", true)];
+        state.selected_model = 0;
+
+        assert!(matches!(state.run_slash_command("/login"), Action::None));
+        assert!(state.overlay_view().is_none());
+        assert!(
+            state
+                .committed
+                .iter()
+                .any(|block| block.body.contains("claude auth login"))
+        );
+
+        assert!(matches!(state.run_slash_command("/logout"), Action::None));
+        assert!(state.overlay_view().is_none());
+        assert!(
+            state
+                .committed
+                .iter()
+                .any(|block| block.body.contains("claude auth logout"))
+        );
+    }
+
+    #[test]
+    fn claude_haiku_hides_unsupported_effort_controls() {
+        let mut state = test_state();
+        let mut haiku = test_model("claude:haiku", "Claude Haiku", true);
+        haiku.id = "claude:claude-haiku-4-5-20251001".to_owned();
+        haiku.efforts.clear();
+        haiku.default_effort.clear();
+        state.models = vec![haiku];
+        state.selected_model = 0;
+        state.selected_effort.clear();
+
+        assert!(state.status_line().effort.is_none());
+        assert!(matches!(state.run_slash_command("/model"), Action::None));
+        let model_picker = state.overlay_view().expect("model picker");
+        assert!(model_picker.slider.is_none());
+        assert!(!model_picker.hint.contains("effort"));
+
+        state.pending = None;
+        assert!(matches!(state.run_slash_command("/effort"), Action::None));
+        assert!(state.overlay_view().is_none());
+        assert!(
+            state
+                .committed
+                .last()
+                .is_some_and(|block| block.title == "Effort unavailable")
+        );
+    }
+
+    #[test]
+    fn canonical_claude_model_id_selects_its_sdk_alias_row() {
+        let mut state = test_state();
+        let mut sonnet = test_model("claude:sonnet", "Claude Sonnet", false);
+        sonnet.id = "claude:claude-sonnet-5".to_owned();
+        state.models = vec![test_model("gpt-5.6-sol", "GPT-5.6 Sol", true), sonnet];
+
+        state.select_model_and_effort("claude:claude-sonnet-5", Some("max"));
+
+        assert_eq!(state.selected_model_name(), "claude:sonnet");
+        assert_eq!(state.selected_effort(), "max");
     }
 
     #[test]
@@ -11821,7 +12230,7 @@ mod tests {
         );
         assert_eq!(
             state.view().status_line.and_then(|status| status.context),
-            Some("Context: 0%".to_owned())
+            Some("Context: 0k/258k (0%)".to_owned())
         );
     }
 
@@ -12799,6 +13208,106 @@ mod tests {
     }
 
     #[test]
+    fn claude_hides_fast_from_help_and_slash_suggestions() {
+        let mut state = test_state();
+        state.models = vec![test_model("claude:sonnet", "Claude Sonnet", true)];
+        state.selected_model = 0;
+        state.editor.insert_str("/f");
+
+        assert!(
+            state
+                .matching_slash_commands()
+                .iter()
+                .all(|command| command.name != "/fast")
+        );
+
+        state.editor.clear();
+        assert!(matches!(state.run_slash_command("/help"), Action::None));
+        assert!(
+            state
+                .committed
+                .last()
+                .is_some_and(|block| !block.body.contains("/fast"))
+        );
+    }
+
+    #[test]
+    fn provider_commands_filter_model_picker_and_direct_selection() {
+        let models = vec![
+            test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
+            test_model("claude:sonnet", "Claude Sonnet", false),
+            test_model("gpt-5.6-terra", "GPT-5.6 Terra", false),
+            test_model("claude:haiku", "Claude Haiku", false),
+        ];
+        let mut state = AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            models,
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+
+        state.run_slash_command("/model sonnet");
+        assert_eq!(state.selected_model_name(), "gpt-5.6-sol");
+
+        state.run_slash_command("/claude");
+        assert_eq!(state.selected_model_name(), "claude:sonnet");
+        assert_eq!(
+            state.committed.last().map(|block| block.title.as_str()),
+            Some("✓ Provider changed")
+        );
+
+        state.run_slash_command("/model");
+        let overlay = state.overlay_view().expect("Claude model picker");
+        let model_lines = overlay
+            .lines
+            .iter()
+            .filter(|line| !line.text.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(model_lines.len(), 2);
+        assert!(model_lines.iter().all(|line| line.text.contains("Claude")));
+        state.pending = None;
+
+        state.run_slash_command("/model 2");
+        assert_eq!(state.selected_model_name(), "claude:haiku");
+
+        state.run_slash_command("/codex");
+        assert_eq!(state.selected_model_name(), "gpt-5.6-sol");
+        state.run_slash_command("/model");
+        let overlay = state.overlay_view().expect("Codex model picker");
+        let model_lines = overlay
+            .lines
+            .iter()
+            .filter(|line| !line.text.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(model_lines.len(), 2);
+        assert!(model_lines.iter().all(|line| line.text.contains("GPT")));
+    }
+
+    #[test]
+    fn shifted_model_navigation_stays_with_the_current_provider() {
+        let models = vec![
+            test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
+            test_model("claude:sonnet", "Claude Sonnet", false),
+            test_model("gpt-5.6-terra", "GPT-5.6 Terra", false),
+        ];
+        let mut state = AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            models,
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+
+        state.move_selected_model(1);
+        assert_eq!(state.selected_model_name(), "gpt-5.6-terra");
+        state.move_selected_model(-1);
+        assert_eq!(state.selected_model_name(), "gpt-5.6-sol");
+    }
+
+    #[test]
     fn integration_slash_commands_dispatch_app_server_actions() {
         let mut state = test_state();
         assert!(matches!(
@@ -12916,7 +13425,19 @@ mod tests {
         assert_eq!(state.context_window, Some(258_000));
         assert_eq!(
             state.status_line().context.as_deref(),
-            Some("Context: 37%")
+            Some("Context: 96k/258k (37%)")
+        );
+    }
+
+    #[test]
+    fn context_status_line_shows_used_window_and_percent_in_k() {
+        let mut state = test_state();
+        state.context_tokens = 100_000;
+        state.context_window = Some(1_000_000);
+
+        assert_eq!(
+            state.status_line().context.as_deref(),
+            Some("Context: 100k/1000k (10%)")
         );
     }
 

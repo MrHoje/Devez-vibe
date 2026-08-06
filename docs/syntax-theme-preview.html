@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Devez Vibe · Syntax Theme Preview</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 36px; color: #172033; background: #e8edf3; font-family: Pretendard, "Noto Sans KR", system-ui, sans-serif; }
+    header, main { max-width: 1460px; margin: auto; }
+    h1 { margin: 0; font-size: 28px; letter-spacing: -.05em; }
+    header p { margin: 8px 0 26px; color: #5b6878; }
+    main { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+    .theme { --bg:#f8fafc; --fg:#0f172a; --muted:#475569; --border:#94a3b8; --prompt:#eef4ff; --keyword:#0000ff; --type:#1f7187; --function:#795e26; --property:#001080; --attribute:#a31515; --string:#a31515; --number:#057a55; --comment:#008000; color:var(--fg); background:var(--bg); border:1px solid var(--border); border-radius:16px; overflow:hidden; box-shadow:0 12px 32px #33415518; }
+    .soft { --bg:#f2ede6; --fg:#2a2620; --muted:#5a5448; --border:#9a917f; --prompt:#e6f0de; --keyword:#3355cc; --type:#426834; --function:#684b8a; --property:#3d6e8e; --attribute:#9a4d12; --string:#983b34; --number:#2e6a4d; --comment:#326a32; }
+    .dark { --bg:#1f1f1e; --fg:#e8e8e8; --muted:#aaa; --border:#777; --prompt:#363636; --keyword:#569cd6; --type:#4ec9b0; --function:#dcdcaa; --property:#9cdcfe; --attribute:#c586c0; --string:#ce9178; --number:#b5cea8; --comment:#6a9955; box-shadow:0 12px 32px #0007; }
+    .head { display:flex; align-items:center; justify-content:space-between; padding:17px 19px; border-bottom:1px solid color-mix(in srgb, var(--border) 72%, transparent); }
+    h2 { margin:0; font-size:17px; letter-spacing:-.02em; }
+    .head span { color:var(--muted); font:12px ui-monospace, Consolas, monospace; }
+    .terminal { padding:18px; font:13px/1.7 ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .status { color:var(--muted); margin-bottom:13px; }
+    .prompt { margin-bottom:17px; padding:11px 12px; border-left:3px solid var(--keyword); border-radius:0 7px 7px 0; background:var(--prompt); font-family:Pretendard, "Noto Sans KR", system-ui, sans-serif; }
+    .prompt b { color:var(--keyword); }
+    .answer { margin-bottom:15px; font-family:Pretendard, "Noto Sans KR", system-ui, sans-serif; font-size:14px; }
+    .answer b { color:var(--type); }
+    pre { margin:0; padding:14px; overflow:auto; border:1px solid color-mix(in srgb, var(--border) 68%, transparent); border-radius:8px; background:color-mix(in srgb, var(--bg) 82%, #000 18%); }
+    .label { display:block; margin:14px 0 6px; color:var(--muted); font-size:11px; }
+    .k { color:var(--keyword); font-weight:700; }.t { color:var(--type); font-weight:700; }.f { color:var(--function); }.p { color:var(--property); }.a { color:var(--attribute); }.s { color:var(--string); }.n { color:var(--number); }.c { color:var(--comment); }
+    .legend { margin-top:15px; padding-top:13px; border-top:1px solid color-mix(in srgb, var(--border) 70%, transparent); display:flex; flex-wrap:wrap; gap:5px 10px; color:var(--muted); font-size:11px; }
+    @media (max-width:1050px) { main { grid-template-columns:1fr; max-width:620px; } body { padding:22px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>언어별 문법 테마 미리보기</h1>
+    <p>동일한 샘플 응답을 Minimal · Soft · Dark 팔레트로 비교합니다.</p>
+  </header>
+  <main>
+    <section class="theme">
+      <div class="head"><h2>Minimal</h2><span>cool white</span></div>
+      <div class="terminal"><div class="status">Devez Vibe · Ready</div><div class="prompt"><b>›</b> C# 모델 저장 코드와 Rust 검증 코드를 보여줘</div><div class="answer"><b>• 적용 예시</b><br>언어별 문법 의미에 맞춰 강조됩니다.</div><code-sample></code-sample><div class="legend"><span class="k">예약어</span><span class="t">타입</span><span class="f">함수</span><span class="p">프로퍼티</span><span class="a">속성</span><span class="s">문자열</span><span class="n">숫자</span><span class="c">주석</span></div></div>
+    </section>
+    <section class="theme soft">
+      <div class="head"><h2>Soft</h2><span>warm cream</span></div>
+      <div class="terminal"><div class="status">Devez Vibe · Ready</div><div class="prompt"><b>›</b> C# 모델 저장 코드와 Rust 검증 코드를 보여줘</div><div class="answer"><b>• 적용 예시</b><br>언어별 문법 의미에 맞춰 강조됩니다.</div><code-sample></code-sample><div class="legend"><span class="k">예약어</span><span class="t">타입</span><span class="f">함수</span><span class="p">프로퍼티</span><span class="a">속성</span><span class="s">문자열</span><span class="n">숫자</span><span class="c">주석</span></div></div>
+    </section>
+    <section class="theme dark">
+      <div class="head"><h2>Dark</h2><span>charcoal</span></div>
+      <div class="terminal"><div class="status">Devez Vibe · Ready</div><div class="prompt"><b>›</b> C# 모델 저장 코드와 Rust 검증 코드를 보여줘</div><div class="answer"><b>• 적용 예시</b><br>언어별 문법 의미에 맞춰 강조됩니다.</div><code-sample></code-sample><div class="legend"><span class="k">예약어</span><span class="t">타입</span><span class="f">함수</span><span class="p">프로퍼티</span><span class="a">속성</span><span class="s">문자열</span><span class="n">숫자</span><span class="c">주석</span></div></div>
+    </section>
+  </main>
+  <template id="sample"><span class="label">C#</span><pre><span class="a">[Obsolete]</span>
+<span class="k">public sealed class</span> <span class="t">Job</span>
+{
+  <span class="k">public string</span> <span class="p">Name</span> { <span class="k">get</span>; <span class="k">set</span>; } = <span class="s">"Devez"</span>;
+  <span class="k">public void</span> <span class="f">Save</span>() { <span class="c">// persist</span> }
+}</pre><span class="label">Rust</span><pre><span class="k">pub struct</span> <span class="t">Job</span> { <span class="p">retries</span>: <span class="t">u8</span> }
+<span class="k">fn</span> <span class="f">validate</span>(job: &amp;<span class="t">Job</span>) -&gt; <span class="t">bool</span> { job.<span class="p">retries</span> &lt; <span class="n">3</span> }</pre></template>
+  <script>document.querySelectorAll('code-sample').forEach(node => node.append(document.querySelector('#sample').content.cloneNode(true)));</script>
+</body>
+</html>

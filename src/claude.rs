@@ -1,0 +1,489 @@
+use std::{
+    collections::{HashMap, VecDeque},
+    env,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::{Value, json};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::{Child, Command},
+    sync::{Mutex, mpsc, oneshot},
+    task::JoinHandle,
+    time::timeout,
+};
+
+use crate::app_server::ServerEvent;
+
+type PendingResponse = oneshot::Sender<Result<Value, String>>;
+type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
+
+#[derive(Clone)]
+pub struct ClaudeClient {
+    outbound: Arc<StdMutex<Option<mpsc::UnboundedSender<Value>>>>,
+    pending: PendingMap,
+    next_id: Arc<AtomicU64>,
+    process: Arc<Mutex<Option<ClaudeProcess>>>,
+    start_lock: Arc<Mutex<()>>,
+    events: mpsc::UnboundedSender<ServerEvent>,
+    node_path: PathBuf,
+    claude_path: PathBuf,
+    bridge_path: PathBuf,
+    cwd: PathBuf,
+}
+
+struct ClaudeProcess {
+    child: Child,
+    writer_task: JoinHandle<()>,
+    reader_task: JoinHandle<()>,
+    stderr_task: JoinHandle<()>,
+}
+
+impl ClaudeClient {
+    pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        self.ensure_started().await?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (response_tx, response_rx) = oneshot::channel();
+        self.pending.lock().await.insert(id, response_tx);
+        if let Err(error) = self.send(json!({ "id": id, "method": method, "params": params })) {
+            self.pending.lock().await.remove(&id);
+            return Err(error);
+        }
+        match response_rx.await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(error)) => bail!("{method}: {error}"),
+            Err(_) => bail!("{method}: Claude SDK 응답 채널이 종료되었습니다."),
+        }
+    }
+
+    pub fn respond(&self, id: Value, result: Value) -> Result<()> {
+        let id = claude_request_id(&id)?;
+        self.send(json!({ "id": id, "result": result }))
+    }
+
+    pub fn respond_error(&self, id: Value, code: i64, message: &str) -> Result<()> {
+        let id = claude_request_id(&id)?;
+        self.send(json!({
+            "id": id,
+            "error": { "code": code, "message": message }
+        }))
+    }
+
+    async fn ensure_started(&self) -> Result<()> {
+        if self.outbound.lock().expect("Claude outbound mutex").is_some() {
+            return Ok(());
+        }
+        let _guard = self.start_lock.lock().await;
+        if self.outbound.lock().expect("Claude outbound mutex").is_some() {
+            return Ok(());
+        }
+        if self.process.lock().await.is_some() {
+            bail!("Claude SDK 브리지 연결이 종료되었습니다. Devez Vibe를 다시 시작하세요.");
+        }
+
+        let mut command = Command::new(&self.node_path);
+        command
+            .arg(&self.bridge_path)
+            .current_dir(&self.cwd)
+            .env("DEVEZ_VIBE_VERSION", env!("CARGO_PKG_VERSION"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        isolate_ctrl_c(&mut command);
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "Claude Agent SDK 브리지를 시작하지 못했습니다: {}",
+                self.bridge_path.display()
+            )
+        })?;
+        let stdin = child.stdin.take().context("Claude SDK stdin 연결 실패")?;
+        let stdout = child.stdout.take().context("Claude SDK stdout 연결 실패")?;
+        let stderr = child.stderr.take().context("Claude SDK stderr 연결 실패")?;
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Value>();
+        *self.outbound.lock().expect("Claude outbound mutex") = Some(outbound_tx);
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(20)));
+
+        let writer_task = tokio::spawn(async move {
+            let mut stdin = stdin;
+            while let Some(message) = outbound_rx.recv().await {
+                let Ok(mut encoded) = serde_json::to_vec(&message) else {
+                    continue;
+                };
+                encoded.push(b'\n');
+                if stdin.write_all(&encoded).await.is_err() || stdin.flush().await.is_err() {
+                    break;
+                }
+            }
+            let _ = stdin.shutdown().await;
+        });
+
+        let reader_pending = Arc::clone(&self.pending);
+        let reader_events = self.events.clone();
+        let reader_tail = Arc::clone(&stderr_tail);
+        let reader_outbound = Arc::clone(&self.outbound);
+        let reader_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) if line.trim().is_empty() => continue,
+                    Ok(Some(line)) => match serde_json::from_str::<Value>(&line) {
+                        Ok(message) => route_message(message, &reader_pending, &reader_events).await,
+                        Err(error) => {
+                            let _ = reader_events.send(ServerEvent::ProtocolWarning(format!(
+                                "Claude SDK JSON 해석 실패: {error}"
+                            )));
+                        }
+                    },
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = reader_events.send(ServerEvent::ProtocolWarning(format!(
+                            "Claude SDK 출력 읽기 실패: {error}"
+                        )));
+                        break;
+                    }
+                }
+            }
+            reader_outbound
+                .lock()
+                .expect("Claude outbound mutex")
+                .take();
+            let tail = reader_tail.lock().await;
+            let detail = if tail.is_empty() {
+                "Claude Agent SDK 브리지 연결이 종료되었습니다.".to_owned()
+            } else {
+                format!(
+                    "Claude Agent SDK 브리지 연결이 종료되었습니다.\n{}",
+                    tail.iter().cloned().collect::<Vec<_>>().join("\n")
+                )
+            };
+            drop(tail);
+            for (_, sender) in reader_pending.lock().await.drain() {
+                let _ = sender.send(Err(detail.clone()));
+            }
+            let _ = reader_events.send(ServerEvent::Closed(detail));
+        });
+
+        let stderr_buffer = Arc::clone(&stderr_tail);
+        let stderr_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let mut tail = stderr_buffer.lock().await;
+                if tail.len() == 20 {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
+            }
+        });
+
+        *self.process.lock().await = Some(ClaudeProcess {
+            child,
+            writer_task,
+            reader_task,
+            stderr_task,
+        });
+        Ok(())
+    }
+
+    fn send(&self, message: Value) -> Result<()> {
+        self.outbound
+            .lock()
+            .expect("Claude outbound mutex")
+            .as_ref()
+            .ok_or_else(|| anyhow!("Claude SDK 브리지가 시작되지 않았거나 종료되었습니다."))?
+            .send(message)
+            .map_err(|_| anyhow!("Claude SDK 브리지에 메시지를 보낼 수 없습니다."))
+    }
+}
+
+pub struct ClaudeServer {
+    client: ClaudeClient,
+    events: mpsc::UnboundedReceiver<ServerEvent>,
+}
+
+impl ClaudeServer {
+    pub fn new(node_path: &Path, claude_path: &Path, cwd: &Path) -> Result<Self> {
+        let bridge_path = resolve_bridge_path(cwd)?;
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let client = ClaudeClient {
+            outbound: Arc::new(StdMutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+            process: Arc::new(Mutex::new(None)),
+            start_lock: Arc::new(Mutex::new(())),
+            events: event_tx,
+            node_path: resolve_command(node_path),
+            claude_path: resolve_command(claude_path),
+            bridge_path,
+            cwd: cwd.to_path_buf(),
+        };
+        Ok(Self { client, events })
+    }
+
+    pub async fn request(&self, method: &str, mut params: Value) -> Result<Value> {
+        if let Some(object) = params.as_object_mut() {
+            object.insert(
+                "claudePath".to_owned(),
+                json!(self.client.claude_path.to_string_lossy()),
+            );
+        }
+        self.client.request(method, params).await
+    }
+
+    pub fn respond(&self, id: Value, result: Value) -> Result<()> {
+        self.client.respond(id, result)
+    }
+
+    pub fn respond_error(&self, id: Value, code: i64, message: &str) -> Result<()> {
+        self.client.respond_error(id, code, message)
+    }
+
+    pub async fn next_event(&mut self) -> Option<ServerEvent> {
+        self.events.recv().await
+    }
+
+    pub async fn shutdown(self) {
+        if self.client.outbound.lock().expect("Claude outbound mutex").is_none() {
+            return;
+        }
+        let _ = self.client.send(json!({
+            "id": self.client.next_id.fetch_add(1, Ordering::Relaxed),
+            "method": "shutdown",
+            "params": {}
+        }));
+        self.client
+            .outbound
+            .lock()
+            .expect("Claude outbound mutex")
+            .take();
+        let Some(mut process) = self.client.process.lock().await.take() else {
+            return;
+        };
+        let _ = timeout(Duration::from_secs(2), &mut process.writer_task).await;
+        if timeout(Duration::from_secs(3), process.child.wait())
+            .await
+            .is_err()
+        {
+            let _ = process.child.kill().await;
+            let _ = process.child.wait().await;
+        }
+        process.reader_task.abort();
+        process.stderr_task.abort();
+    }
+}
+
+pub fn is_claude_model(model: &str) -> bool {
+    model.starts_with("claude:")
+        || matches!(
+            model.to_ascii_lowercase().as_str(),
+            "claude" | "sonnet" | "opus" | "fable" | "haiku"
+        )
+}
+
+pub fn is_claude_thread(id: &str) -> bool {
+    id.starts_with("claude:")
+}
+
+pub fn raw_thread_id(id: &str) -> &str {
+    id.strip_prefix("claude:").unwrap_or(id)
+}
+
+pub fn visible_thread_id(id: &str) -> String {
+    if is_claude_thread(id) {
+        id.to_owned()
+    } else {
+        format!("claude:{id}")
+    }
+}
+
+pub fn is_claude_request_id(id: &Value) -> bool {
+    id.get("backend").and_then(Value::as_str) == Some("claude")
+}
+
+pub fn model_catalog() -> Value {
+    let efforts = || {
+        json!([
+            { "reasoningEffort": "low" },
+            { "reasoningEffort": "medium" },
+            { "reasoningEffort": "high" },
+            { "reasoningEffort": "xhigh" },
+            { "reasoningEffort": "max" }
+        ])
+    };
+    json!({
+        "data": [
+            claude_model("claude:sonnet", "Sonnet", efforts()),
+            claude_model("claude:opus", "Opus", efforts()),
+            claude_model("claude:fable", "Fable", efforts()),
+            claude_model("claude:haiku", "Haiku", json!([]))
+        ]
+    })
+}
+
+fn claude_model(id: &str, display_name: &str, efforts: Value) -> Value {
+    let default_effort = efforts
+        .as_array()
+        .filter(|efforts| !efforts.is_empty())
+        .map(|_| "high")
+        .unwrap_or("");
+    json!({
+        "id": id,
+        "model": id,
+        "displayName": display_name,
+        "defaultReasoningEffort": default_effort,
+        "supportedReasoningEfforts": efforts,
+        "isDefault": false,
+        "contextWindow": 200_000
+    })
+}
+
+fn claude_request_id(id: &Value) -> Result<&Value> {
+    id.get("id")
+        .filter(|_| is_claude_request_id(id))
+        .context("Claude 사용자 입력 요청 id가 올바르지 않습니다.")
+}
+
+async fn route_message(
+    message: Value,
+    pending: &PendingMap,
+    events: &mpsc::UnboundedSender<ServerEvent>,
+) {
+    if let Some(id) = message.get("id").and_then(Value::as_u64)
+        && (message.get("result").is_some() || message.get("error").is_some())
+    {
+        if let Some(sender) = pending.lock().await.remove(&id) {
+            let response = match message.get("error") {
+                Some(error) => Err(format_rpc_error(error)),
+                None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
+            };
+            let _ = sender.send(response);
+        }
+        return;
+    }
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        let _ = events.send(ServerEvent::ProtocolWarning(
+            "method 없는 Claude SDK 메시지를 무시했습니다.".to_owned(),
+        ));
+        return;
+    };
+    let params = message.get("params").cloned().unwrap_or(Value::Null);
+    match message.get("id") {
+        Some(id) => {
+            let _ = events.send(ServerEvent::Request {
+                id: json!({ "backend": "claude", "id": id }),
+                method: method.to_owned(),
+                params,
+            });
+        }
+        None => {
+            let _ = events.send(ServerEvent::Notification {
+                method: method.to_owned(),
+                params,
+            });
+        }
+    }
+}
+
+fn format_rpc_error(error: &Value) -> String {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("알 수 없는 Claude SDK 오류");
+    match error.get("code").and_then(Value::as_i64) {
+        Some(code) => format!("{message} ({code})"),
+        None => message.to_owned(),
+    }
+}
+
+fn resolve_bridge_path(cwd: &Path) -> Result<PathBuf> {
+    if let Some(path) = env::var_os("DEVEZ_VIBE_CLAUDE_BRIDGE").map(PathBuf::from)
+        && path.is_file()
+    {
+        return Ok(path);
+    }
+    let mut candidates = Vec::new();
+    if let Ok(executable) = env::current_exe()
+        && let Some(package_root) = executable.parent().and_then(Path::parent)
+    {
+        candidates.push(package_root.join("bridge").join("claude-agent-sdk-bridge.mjs"));
+    }
+    candidates.push(cwd.join("npm").join("bridge").join("claude-agent-sdk-bridge.mjs"));
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("npm")
+            .join("bridge")
+            .join("claude-agent-sdk-bridge.mjs"),
+    );
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .context("Claude Agent SDK 브리지 파일을 찾을 수 없습니다.")
+}
+
+fn resolve_command(command: &Path) -> PathBuf {
+    if command.components().count() > 1 || command.exists() {
+        return command.to_path_buf();
+    }
+    let Some(path) = env::var_os("PATH") else {
+        return command.to_path_buf();
+    };
+    #[cfg(windows)]
+    let extensions = [".exe", ".cmd", ".bat", ".com"];
+    #[cfg(not(windows))]
+    let extensions = [""];
+    for directory in env::split_paths(&path) {
+        for extension in extensions {
+            let candidate = directory.join(format!("{}{extension}", command.to_string_lossy()));
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    command.to_path_buf()
+}
+
+#[cfg(windows)]
+fn isolate_ctrl_c(command: &mut Command) {
+    command.creation_flags(0x0000_0200);
+}
+
+#[cfg(not(windows))]
+fn isolate_ctrl_c(_: &mut Command) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_identifiers_are_namespaced() {
+        assert!(is_claude_model("claude:sonnet"));
+        assert!(is_claude_model("sonnet"));
+        assert_eq!(visible_thread_id("123"), "claude:123");
+        assert_eq!(raw_thread_id("claude:123"), "123");
+    }
+
+    #[test]
+    fn model_catalog_uses_existing_model_shape() {
+        let catalog = model_catalog();
+        let models = catalog.get("data").and_then(Value::as_array).unwrap();
+        assert_eq!(models.len(), 4);
+        assert!(models.iter().all(|model| model.get("model").and_then(Value::as_str) != Some("claude:default")));
+        assert!(models.iter().all(|model| {
+            model
+                .get("displayName")
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.starts_with("Claude"))
+        }));
+        let haiku = models
+            .iter()
+            .find(|model| model.get("model").and_then(Value::as_str) == Some("claude:haiku"))
+            .unwrap();
+        assert_eq!(haiku.pointer("/supportedReasoningEfforts/0"), None);
+    }
+}

@@ -10,6 +10,10 @@ use serde_json::{Value, json};
 
 use crate::{
     app_server::{AppServer, AppServerClient, ServerEvent},
+    claude::{
+        ClaudeServer, is_claude_model, is_claude_request_id, is_claude_thread, raw_thread_id,
+        visible_thread_id,
+    },
     open_code::{OpenCodeServer, has_connected_provider, is_open_code_model, is_open_code_request_id},
 };
 
@@ -17,6 +21,7 @@ use crate::{
 enum RuntimeKind {
     Codex,
     OpenCode,
+    Claude,
 }
 
 #[derive(Clone)]
@@ -24,12 +29,14 @@ struct Route {
     active: RuntimeKind,
     codex_id: Option<String>,
     open_code_id: Option<String>,
+    claude_id: Option<String>,
     cwd: PathBuf,
 }
 
 pub struct BackendServer {
     codex: AppServer,
     open_code: Option<OpenCodeServer>,
+    claude: ClaudeServer,
     open_code_path: PathBuf,
     routes: Arc<StdMutex<HashMap<String, Route>>>,
     aliases: Arc<StdMutex<HashMap<String, String>>>,
@@ -37,7 +44,13 @@ pub struct BackendServer {
 }
 
 impl BackendServer {
-    pub async fn spawn(codex_path: &Path, open_code_path: &Path, cwd: &Path) -> Result<Self> {
+    pub async fn spawn(
+        codex_path: &Path,
+        open_code_path: &Path,
+        node_path: &Path,
+        claude_path: &Path,
+        cwd: &Path,
+    ) -> Result<Self> {
         let devezcode_room = crate::devezcode::room_id();
         let codex = AppServer::spawn(codex_path, devezcode_room.as_deref()).await?;
         let open_code = if crate::open_code::PROVIDER_ENABLED
@@ -47,9 +60,11 @@ impl BackendServer {
         } else {
             None
         };
+        let claude = ClaudeServer::new(node_path, claude_path, cwd)?;
         Ok(Self {
             codex,
             open_code,
+            claude,
             open_code_path: open_code_path.to_path_buf(),
             routes: Arc::new(StdMutex::new(HashMap::new())),
             aliases: Arc::new(StdMutex::new(HashMap::new())),
@@ -78,6 +93,20 @@ impl BackendServer {
                 {
                     target.extend(extra.iter().cloned());
                 }
+                let claude_catalog = self
+                    .claude
+                    .request(
+                        "model/list",
+                        json!({ "cwd": self.cwd.to_string_lossy() }),
+                    )
+                    .await
+                    .unwrap_or_else(|_| crate::claude::model_catalog());
+                if let (Some(target), Some(extra)) = (
+                    response.get_mut("data").and_then(Value::as_array_mut),
+                    claude_catalog.get("data").and_then(Value::as_array),
+                ) {
+                    target.extend(extra.iter().cloned());
+                }
                 Ok(response)
             }
             "thread/list" => {
@@ -97,6 +126,7 @@ impl BackendServer {
                                     RuntimeKind::OpenCode,
                                     None,
                                     Some(id.to_owned()),
+                                    None,
                                     session
                                         .get("cwd")
                                         .and_then(Value::as_str)
@@ -108,11 +138,64 @@ impl BackendServer {
                         }
                     }
                 }
+                let cwd = params.get("cwd").and_then(Value::as_str).map(Path::new);
+                if let Ok(extra) = self
+                    .claude
+                    .request(
+                        "session/list",
+                        json!({
+                            "cwd": cwd,
+                            "limit": params.get("limit").and_then(Value::as_u64).unwrap_or(100)
+                        }),
+                    )
+                    .await
+                    && let (Some(target), Some(sessions)) = (
+                        response.get_mut("data").and_then(Value::as_array_mut),
+                        extra.get("data").and_then(Value::as_array),
+                    )
+                {
+                    for source in sessions {
+                        let mut session = source.clone();
+                        if let Some(namespaced) = source.get("id").and_then(Value::as_str) {
+                            let backing = raw_thread_id(namespaced).to_owned();
+                            let visible = self
+                                .aliases
+                                .lock()
+                                .expect("aliases mutex")
+                                .get(&backing)
+                                .cloned()
+                                .unwrap_or_else(|| namespaced.to_owned());
+                            session["id"] = json!(visible);
+                            let route = self.route(&visible);
+                            self.register_route(
+                                &visible,
+                                RuntimeKind::Claude,
+                                route.as_ref().and_then(|route| route.codex_id.clone()),
+                                route.as_ref().and_then(|route| route.open_code_id.clone()),
+                                Some(backing),
+                                source
+                                    .get("cwd")
+                                    .and_then(Value::as_str)
+                                    .map(PathBuf::from)
+                                    .unwrap_or_else(|| self.cwd.clone()),
+                            );
+                        }
+                        target.push(session);
+                    }
+                }
                 Ok(response)
             }
             "thread/start" => {
                 let model = params.get("model").and_then(Value::as_str);
-                if model.is_some_and(is_open_code_model) {
+                if model.is_some_and(is_claude_model) {
+                    let cwd = request_cwd(&params).unwrap_or_else(|| self.cwd.clone());
+                    let mut response = self
+                        .claude
+                        .request("session/start", claude_session_params(&params, &cwd, None))
+                        .await?;
+                    self.register_claude_response(&mut response, cwd)?;
+                    Ok(response)
+                } else if model.is_some_and(is_open_code_model) {
                     let open_code = self.open_code()?;
                     let cwd = request_cwd(&params).unwrap_or_else(|| self.cwd.clone());
                     let response = open_code
@@ -122,7 +205,7 @@ impl BackendServer {
                         .get("id")
                         .and_then(Value::as_str)
                         .context("OpenCode thread/start 응답에 id가 없습니다.")?;
-                    self.register_route(id, RuntimeKind::OpenCode, None, Some(id.to_owned()), cwd);
+                    self.register_route(id, RuntimeKind::OpenCode, None, Some(id.to_owned()), None, cwd);
                     Ok(response)
                 } else {
                     let response = self.codex.request(method, params).await?;
@@ -132,7 +215,24 @@ impl BackendServer {
             }
             "thread/resume" => {
                 let visible = thread_id(&params)?;
-                if self.is_open_code_thread(visible) {
+                if self.route_kind(visible) == RuntimeKind::Claude || is_claude_thread(visible) {
+                    let visible = visible.to_owned();
+                    let backing = self
+                        .backing_id(&visible, RuntimeKind::Claude)
+                        .unwrap_or_else(|_| raw_thread_id(&visible).to_owned());
+                    let cwd = request_cwd(&params)
+                        .or_else(|| self.route(&visible).map(|route| route.cwd))
+                        .unwrap_or_else(|| self.cwd.clone());
+                    let mut response = self
+                        .claude
+                        .request(
+                            "session/resume",
+                            claude_session_params(&params, &cwd, Some(&backing)),
+                        )
+                        .await?;
+                    self.register_claude_response(&mut response, cwd)?;
+                    Ok(response)
+                } else if self.is_open_code_thread(visible) {
                     let open_code = self.open_code()?;
                     let cwd = request_cwd(&params).unwrap_or_else(|| self.cwd.clone());
                     let response = open_code.resume_session(&cwd, visible).await?;
@@ -141,6 +241,7 @@ impl BackendServer {
                         RuntimeKind::OpenCode,
                         None,
                         Some(visible.to_owned()),
+                        None,
                         cwd,
                     );
                     Ok(response)
@@ -155,13 +256,44 @@ impl BackendServer {
             {
                 Ok(json!({ "data": [], "nextCursor": null }))
             }
+            "thread/turns/list"
+                if self.route_kind(thread_id(&params)?) == RuntimeKind::Claude =>
+            {
+                let visible = thread_id(&params)?;
+                let route = self.route(visible);
+                let backing = self.backing_id(visible, RuntimeKind::Claude)?;
+                self.claude
+                    .request(
+                        "session/history",
+                        json!({
+                            "sessionId": backing,
+                            "cwd": route.map(|route| route.cwd).unwrap_or_else(|| self.cwd.clone())
+                        }),
+                    )
+                    .await
+            }
             "turn/start" | "turn/steer" => {
                 let visible = thread_id(&params)?.to_owned();
-                let selected_open_code = selected_runtime(
+                let selected = selected_runtime(
                     params.get("model").and_then(Value::as_str),
                     self.route_kind(&visible),
-                ) == RuntimeKind::OpenCode;
-                if selected_open_code {
+                );
+                if selected == RuntimeKind::Claude {
+                    let backing = self.ensure_claude_route(&visible, &params).await?;
+                    let response = self
+                        .claude
+                        .request(
+                            "session/prompt",
+                            json!({
+                                "sessionId": backing,
+                                "input": params.get("input").cloned().unwrap_or_else(|| json!([])),
+                                "model": params.get("model").cloned().unwrap_or(Value::Null),
+                                "effort": params.get("effort").cloned().unwrap_or(Value::Null)
+                            }),
+                        )
+                        .await?;
+                    Ok(response)
+                } else if selected == RuntimeKind::OpenCode {
                     let (backing, model) = self.ensure_open_code_route(&visible, &params).await?;
                     if let Some(model) = model {
                         self.open_code()?
@@ -193,7 +325,12 @@ impl BackendServer {
             }
             "turn/interrupt" => {
                 let visible = thread_id(&params)?;
-                if self.route_kind(visible) == RuntimeKind::OpenCode {
+                if self.route_kind(visible) == RuntimeKind::Claude {
+                    let backing = self.backing_id(visible, RuntimeKind::Claude)?;
+                    self.claude
+                        .request("session/interrupt", json!({ "sessionId": backing }))
+                        .await
+                } else if self.route_kind(visible) == RuntimeKind::OpenCode {
                     let backing = self.backing_id(visible, RuntimeKind::OpenCode)?;
                     self.open_code()?.cancel(&backing)?;
                     Ok(json!({}))
@@ -204,7 +341,27 @@ impl BackendServer {
             }
             "thread/fork" => {
                 let visible = thread_id(&params)?;
-                if self.route_kind(visible) == RuntimeKind::OpenCode {
+                if self.route_kind(visible) == RuntimeKind::Claude {
+                    let route = self.route(visible);
+                    let backing = self.backing_id(visible, RuntimeKind::Claude)?;
+                    let cwd = route
+                        .as_ref()
+                        .map(|route| route.cwd.clone())
+                        .unwrap_or_else(|| self.cwd.clone());
+                    let mut response = self
+                        .claude
+                        .request(
+                            "session/fork",
+                            {
+                                let mut request = claude_session_params(&params, &cwd, None);
+                                request["sessionId"] = json!(backing);
+                                request
+                            },
+                        )
+                        .await?;
+                    self.register_claude_response(&mut response, cwd)?;
+                    Ok(response)
+                } else if self.route_kind(visible) == RuntimeKind::OpenCode {
                     let route = self.route(visible);
                     let backing = route
                         .as_ref()
@@ -219,7 +376,7 @@ impl BackendServer {
                         .get("id")
                         .and_then(Value::as_str)
                         .context("OpenCode thread/fork 응답에 id가 없습니다.")?;
-                    self.register_route(id, RuntimeKind::OpenCode, None, Some(id.to_owned()), cwd);
+                    self.register_route(id, RuntimeKind::OpenCode, None, Some(id.to_owned()), None, cwd);
                     Ok(response)
                 } else {
                     params["threadId"] = json!(self.backing_id(visible, RuntimeKind::Codex)?);
@@ -230,7 +387,12 @@ impl BackendServer {
             }
             "thread/compact/start" => {
                 let visible = thread_id(&params)?;
-                if self.route_kind(visible) == RuntimeKind::OpenCode {
+                if self.route_kind(visible) == RuntimeKind::Claude {
+                    let backing = self.backing_id(visible, RuntimeKind::Claude)?;
+                    self.claude
+                        .request("session/compact", json!({ "sessionId": backing }))
+                        .await
+                } else if self.route_kind(visible) == RuntimeKind::OpenCode {
                     let backing = self.backing_id(visible, RuntimeKind::OpenCode)?;
                     let turn = self.open_code()?.start_prompt(&backing, "/compact").await?;
                     Ok(json!({ "turn": { "id": turn } }))
@@ -239,8 +401,21 @@ impl BackendServer {
                     self.codex.request(method, params).await
                 }
             }
+            "thread/unsubscribe" if self.route_kind(thread_id(&params)?) == RuntimeKind::Claude => {
+                let visible = thread_id(&params)?;
+                let backing = self.backing_id(visible, RuntimeKind::Claude)?;
+                self.claude
+                    .request(
+                        "session/close",
+                        json!({ "sessionId": backing, "delete": true }),
+                    )
+                    .await
+            }
             "thread/settings/update" | "thread/unsubscribe"
-                if self.route_kind(thread_id(&params)?) == RuntimeKind::OpenCode =>
+                if matches!(
+                    self.route_kind(thread_id(&params)?),
+                    RuntimeKind::OpenCode | RuntimeKind::Claude
+                ) =>
             {
                 Ok(json!({}))
             }
@@ -298,7 +473,9 @@ impl BackendServer {
     }
 
     pub fn respond(&self, id: Value, result: Value) -> Result<()> {
-        if is_open_code_request_id(&id) {
+        if is_claude_request_id(&id) {
+            self.claude.respond(id, result)
+        } else if is_open_code_request_id(&id) {
             self.open_code()?.respond(id, result)
         } else {
             self.codex.respond(id, result)
@@ -306,7 +483,9 @@ impl BackendServer {
     }
 
     pub fn respond_error(&self, id: Value, code: i64, message: &str) -> Result<()> {
-        if is_open_code_request_id(&id) {
+        if is_claude_request_id(&id) {
+            self.claude.respond_error(id, code, message)
+        } else if is_open_code_request_id(&id) {
             self.open_code()?.respond_error(id, code, message)
         } else {
             self.codex.respond_error(id, code, message)
@@ -318,9 +497,13 @@ impl BackendServer {
             tokio::select! {
                 event = self.codex.next_event() => (RuntimeKind::Codex, event),
                 event = open_code.next_event() => (RuntimeKind::OpenCode, event),
+                event = self.claude.next_event() => (RuntimeKind::Claude, event),
             }
         } else {
-            (RuntimeKind::Codex, self.codex.next_event().await)
+            tokio::select! {
+                event = self.codex.next_event() => (RuntimeKind::Codex, event),
+                event = self.claude.next_event() => (RuntimeKind::Claude, event),
+            }
         };
         if source == RuntimeKind::OpenCode
             && (event.is_none() || matches!(event, Some(ServerEvent::Closed(_))))
@@ -334,18 +517,31 @@ impl BackendServer {
             }
             return Some(ServerEvent::ProtocolWarning(detail));
         }
+        if source == RuntimeKind::Claude
+            && (event.is_none() || matches!(event, Some(ServerEvent::Closed(_))))
+        {
+            let detail = match event {
+                Some(ServerEvent::Closed(detail)) => detail,
+                _ => "Claude SDK 이벤트 채널이 종료되었습니다.".to_owned(),
+            };
+            return Some(ServerEvent::ProtocolWarning(detail));
+        }
         event.map(|event| self.rewrite_event(event))
     }
 
     pub async fn shutdown(self) {
         let Self {
-            codex, open_code, ..
+            codex, open_code, claude, ..
         } = self;
-        tokio::join!(codex.shutdown(), async move {
-            if let Some(open_code) = open_code {
-                open_code.shutdown().await;
-            }
-        });
+        tokio::join!(
+            codex.shutdown(),
+            async move {
+                if let Some(open_code) = open_code {
+                    open_code.shutdown().await;
+                }
+            },
+            claude.shutdown()
+        );
     }
 
     fn open_code(&self) -> Result<&OpenCodeServer> {
@@ -383,7 +579,37 @@ impl BackendServer {
             .and_then(Value::as_str)
             .map(PathBuf::from)
             .unwrap_or_else(|| self.cwd.clone());
-        self.register_route(id, RuntimeKind::Codex, Some(id.to_owned()), None, cwd);
+        self.register_route(
+            id,
+            RuntimeKind::Codex,
+            Some(id.to_owned()),
+            None,
+            None,
+            cwd,
+        );
+    }
+
+    fn register_claude_response(&self, response: &mut Value, cwd: PathBuf) -> Result<()> {
+        let backing = response
+            .get("id")
+            .or_else(|| response.pointer("/thread/id"))
+            .and_then(Value::as_str)
+            .context("Claude 세션 응답에 id가 없습니다.")?
+            .to_owned();
+        let visible = visible_thread_id(&backing);
+        response["id"] = json!(visible);
+        if response.get("thread").is_some_and(Value::is_object) {
+            response["thread"]["id"] = json!(visible);
+        }
+        self.register_route(
+            &visible,
+            RuntimeKind::Claude,
+            None,
+            None,
+            Some(backing),
+            cwd,
+        );
+        Ok(())
     }
 
     fn register_route(
@@ -392,6 +618,7 @@ impl BackendServer {
         active: RuntimeKind,
         codex_id: Option<String>,
         open_code_id: Option<String>,
+        claude_id: Option<String>,
         cwd: PathBuf,
     ) {
         let mut routes = self.routes.lock().expect("routes mutex");
@@ -399,6 +626,7 @@ impl BackendServer {
             active,
             codex_id: None,
             open_code_id: None,
+            claude_id: None,
             cwd: cwd.clone(),
         });
         route.active = active;
@@ -417,6 +645,13 @@ impl BackendServer {
                 .insert(id.clone(), visible.to_owned());
             route.open_code_id = Some(id);
         }
+        if let Some(id) = claude_id {
+            self.aliases
+                .lock()
+                .expect("aliases mutex")
+                .insert(id.clone(), visible.to_owned());
+            route.claude_id = Some(id);
+        }
     }
 
     fn route(&self, visible: &str) -> Option<Route> {
@@ -431,7 +666,9 @@ impl BackendServer {
         self.route(visible)
             .map(|route| route.active)
             .unwrap_or_else(|| {
-                if visible.starts_with("ses_") {
+                if is_claude_thread(visible) {
+                    RuntimeKind::Claude
+                } else if visible.starts_with("ses_") {
                     RuntimeKind::OpenCode
                 } else {
                     RuntimeKind::Codex
@@ -448,6 +685,7 @@ impl BackendServer {
         let backing = match kind {
             RuntimeKind::Codex => route.and_then(|route| route.codex_id),
             RuntimeKind::OpenCode => route.and_then(|route| route.open_code_id),
+            RuntimeKind::Claude => route.and_then(|route| route.claude_id),
         };
         backing
             .or_else(|| (self.route_kind(visible) == kind).then(|| visible.to_owned()))
@@ -472,6 +710,7 @@ impl BackendServer {
                 RuntimeKind::OpenCode,
                 route.codex_id,
                 Some(backing.clone()),
+                route.claude_id,
                 route.cwd,
             );
             return Ok((backing, model));
@@ -494,6 +733,7 @@ impl BackendServer {
             RuntimeKind::OpenCode,
             codex_id,
             Some(backing.clone()),
+            self.route(visible).and_then(|route| route.claude_id),
             cwd,
         );
         Ok((backing, Some(model)))
@@ -508,6 +748,7 @@ impl BackendServer {
                 RuntimeKind::Codex,
                 Some(backing.clone()),
                 route.open_code_id,
+                route.claude_id,
                 route.cwd,
             );
             return Ok(backing);
@@ -536,13 +777,57 @@ impl BackendServer {
             .context("Codex 전환 세션에 id가 없습니다.")?
             .to_owned();
         let open_code_id = self.route(visible).and_then(|route| route.open_code_id);
+        let claude_id = self.route(visible).and_then(|route| route.claude_id);
         self.register_route(
             visible,
             RuntimeKind::Codex,
             Some(backing.clone()),
             open_code_id,
+            claude_id,
             cwd,
         );
+        Ok(backing)
+    }
+
+    async fn ensure_claude_route(&self, visible: &str, params: &Value) -> Result<String> {
+        if let Some(route) = self.route(visible)
+            && let Some(backing) = route.claude_id
+        {
+            self.register_route(
+                visible,
+                RuntimeKind::Claude,
+                route.codex_id,
+                route.open_code_id,
+                Some(backing.clone()),
+                route.cwd,
+            );
+            return Ok(backing);
+        }
+        let cwd = self
+            .route(visible)
+            .map(|route| route.cwd)
+            .unwrap_or_else(|| self.cwd.clone());
+        let mut response = self
+            .claude
+            .request("session/start", claude_session_params(params, &cwd, None))
+            .await?;
+        let backing = response
+            .get("id")
+            .and_then(Value::as_str)
+            .context("Claude 전환 세션에 id가 없습니다.")?
+            .to_owned();
+        let route = self.route(visible);
+        self.register_route(
+            visible,
+            RuntimeKind::Claude,
+            route.as_ref().and_then(|route| route.codex_id.clone()),
+            route.as_ref().and_then(|route| route.open_code_id.clone()),
+            Some(backing.clone()),
+            cwd,
+        );
+        // The visible id intentionally remains the current UI thread when a model
+        // switch creates this backing session. Only direct starts/resumes namespace it.
+        response["id"] = json!(visible);
         Ok(backing)
     }
 
@@ -587,7 +872,7 @@ fn provider_default_write(params: &Value) -> Result<bool> {
         return Ok(false);
     };
     if key == "model" {
-        if is_open_code_model(value) {
+        if is_open_code_model(value) || is_claude_model(value) {
             write_provider_config(value, "default")?;
             return Ok(true);
         }
@@ -601,7 +886,7 @@ fn provider_default_write(params: &Value) -> Result<bool> {
     if key == "model_reasoning_effort" {
         let config = read_provider_config();
         if let Some(model) = root_config_value(&config, "model")
-            && is_open_code_model(model)
+            && (is_open_code_model(model) || is_claude_model(model))
         {
             write_provider_config(model, value)?;
             return Ok(true);
@@ -660,12 +945,39 @@ fn request_cwd(params: &Value) -> Option<PathBuf> {
 
 fn selected_runtime(model: Option<&str>, current: RuntimeKind) -> RuntimeKind {
     model.map_or(current, |model| {
-        if is_open_code_model(model) {
+        if is_claude_model(model) {
+            RuntimeKind::Claude
+        } else if is_open_code_model(model) {
             RuntimeKind::OpenCode
         } else {
             RuntimeKind::Codex
         }
     })
+}
+
+fn claude_session_params(params: &Value, cwd: &Path, session_id: Option<&str>) -> Value {
+    let mut request = json!({
+        "cwd": cwd,
+        "model": params.get("model").cloned().unwrap_or_else(|| json!("claude:default")),
+        "systemPrompt": params
+            .get("claudeDeveloperInstructions")
+            .or_else(|| params.pointer("/additionalContext/claude-devez-vibe-rules/value"))
+            .or_else(|| params.get("developerInstructions"))
+            .cloned()
+            .unwrap_or_else(|| json!(""))
+    });
+    if let Some(effort) = params
+        .get("effort")
+        .or_else(|| params.get("reasoningEffort"))
+        .and_then(Value::as_str)
+        .filter(|effort| !effort.is_empty())
+    {
+        request["effort"] = json!(effort);
+    }
+    if let Some(session_id) = session_id {
+        request["sessionId"] = json!(session_id);
+    }
+    request
 }
 
 fn thread_id(params: &Value) -> Result<&str> {
@@ -686,5 +998,26 @@ mod tests {
                 == RuntimeKind::OpenCode
         );
         assert!(selected_runtime(Some("gpt-5.6-sol"), RuntimeKind::OpenCode) == RuntimeKind::Codex);
+        assert!(
+            selected_runtime(Some("claude:sonnet"), RuntimeKind::Codex)
+                == RuntimeKind::Claude
+        );
+    }
+
+    #[test]
+    fn claude_session_omits_an_unsupported_empty_effort() {
+        let without_effort = claude_session_params(
+            &json!({ "model": "claude:haiku", "effort": "" }),
+            Path::new("C:/repo"),
+            None,
+        );
+        assert!(without_effort.get("effort").is_none());
+
+        let with_effort = claude_session_params(
+            &json!({ "model": "claude:sonnet", "effort": "max" }),
+            Path::new("C:/repo"),
+            None,
+        );
+        assert_eq!(with_effort.get("effort").and_then(Value::as_str), Some("max"));
     }
 }

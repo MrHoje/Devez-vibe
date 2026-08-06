@@ -3,10 +3,10 @@
 [![npm](https://img.shields.io/npm/v/devez-vibe)](https://www.npmjs.com/package/devez-vibe)
 [![license](https://img.shields.io/npm/l/devez-vibe)](LICENSE)
 
-공식 Codex `app-server`를 사용하는 터미널 클라이언트입니다.
+공식 Codex `app-server`와 Claude Agent SDK를 사용하는 터미널 클라이언트입니다.
 
-인증, 하네스 프롬프트, 도구, 스킬, `AGENTS.md`, 샌드박스는 공식 `codex app-server`가
-그대로 담당합니다. 이 프로젝트는 **화면과 입력 계층만** 소유합니다.
+Codex는 공식 `app-server`, Claude는 설치된 Claude Code와 Agent SDK가 인증·도구·스킬·
+프로젝트 지침을 담당합니다. 이 프로젝트는 공통 화면과 입력 계층을 소유합니다.
 
 ## 설치
 
@@ -19,8 +19,9 @@ npm install -g devez-vibe
 | 요건 | 값 |
 | --- | --- |
 | OS | Windows x64 |
-| Node.js | 18 이상 (설치용. 실행 자체는 네이티브 바이너리) |
-| 전제 | Codex CLI 설치 및 로그인 완료 |
+| Node.js | 18 이상 (Claude Agent SDK 런타임 포함) |
+| Codex 전제 | Codex CLI 설치 및 로그인 완료 |
+| Claude 전제 | Claude Code 설치 후 `claude` 구독 로그인 완료 |
 
 현재 Windows x64 빌드만 배포합니다. 다른 플랫폼에서는 `EBADPLATFORM`으로 설치가 거부됩니다.
 
@@ -38,11 +39,22 @@ Codex CLI가 설치되고 로그인된 환경에서:
 dvz
 ```
 
+현재 Claude Code 구독 로그인을 그대로 사용하는 개인용 Claude 세션:
+
+```powershell
+dvz --model claude
+dvz --model sonnet --effort high
+```
+
+별도 API 키는 사용하지 않습니다. `ANTHROPIC_API_KEY`와 `ANTHROPIC_AUTH_TOKEN`은 Claude
+SDK 자식 프로세스에서 제거되며, 기존 `claude` 로그인 저장소만 사용합니다.
+이 경로는 본인 계정의 로컬 개인 사용용입니다. 로그인 공유나 제3자용 인증 화면으로 제공하지 않습니다.
+
 주요 옵션:
 
 ```text
 dvz [--resume [SESSION] | --continue] [--model MODEL] [--effort EFFORT]
-    [--cwd PATH] [--codex PATH] [--theme THEME]
+    [--cwd PATH] [--codex PATH] [--claude PATH] [--theme THEME]
 dvz update
 ```
 
@@ -86,6 +98,8 @@ dvz update
 ### 스트리밍과 승인
 
 - 응답, reasoning summary, 명령, 파일 변경, MCP 호출 스트리밍
+- Claude `TaskCreate`/`TaskUpdate`를 공통 작업 단계 패널로 실시간 표시
+- Claude Code 세션 검색·resume, 구독 usage, `AskUserQuestion` 입력 왕복
 - 명령/파일 변경 승인
 - 실행 중 입력 steer 및 `Esc`/`Ctrl+C` 중단
 - 실행 시간, 파일 diff 통계, 진행 상태 표시
@@ -134,7 +148,7 @@ node scripts/release-npm.mjs --publish    # 실제 배포
 
 ## 경계
 
-`app-server` 프로토콜은 CLI 버전에 따라 변할 수 있습니다. 렌더러 변경은
+`app-server`와 Claude Agent SDK 프로토콜은 CLI/SDK 버전에 따라 변할 수 있습니다. 렌더러 변경은
 독립적으로 관리하고, 업스트림에서는 프로토콜/인증/모델 카탈로그 변경만 호환성
 대상으로 봅니다. 업데이트가 필요할 때는 [Codex CLI 호환성 업데이트 절차](.knowledge/Codex-CLI-호환성-업데이트.md)를
 따라 최신 버전을 확인하고 필요한 변경만 반영합니다.

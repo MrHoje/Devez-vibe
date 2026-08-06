@@ -171,8 +171,8 @@ impl Block {
 
     /// Credits come last so the variable-length list survives the round trip
     /// through [`BlockKind::Welcome`]'s newline-delimited body.
-    pub fn welcome(plan: &str, cwd: &str, account: &str, credits: &[String]) -> Self {
-        let mut body = format!("{plan}\n{cwd}\n{account}");
+    pub fn welcome(provider: &str, plan: &str, cwd: &str, account: &str, credits: &[String]) -> Self {
+        let mut body = format!("{provider}\n{plan}\n{cwd}\n{account}");
         for line in credits {
             body.push('\n');
             body.push_str(line);
@@ -219,6 +219,7 @@ pub struct OverlayLine {
 }
 
 pub struct WelcomeView {
+    pub provider: String,
     pub plan: String,
     /// Reset-credit rows: a summary first, then one line per credit.
     pub credits: Vec<String>,
@@ -1361,11 +1362,11 @@ impl Renderer {
             rows.push((*screen_row, previous, current, repaint_plan_row));
         }
 
+        queue!(self.out, Print("\x1b[?2026h"))?;
         if self.cursor_shown {
             queue!(self.out, Hide)?;
             self.cursor_shown = false;
         }
-        queue!(self.out, Print("\x1b[?2026h"))?;
         let mut result = Ok(());
         for (screen_row, previous, current, repaint_plan_row) in &rows {
             // A changed plan step can shorten or restyle wide Korean text. Clear
@@ -1378,11 +1379,9 @@ impl Renderer {
                 break;
             }
         }
-        let end = queue!(self.out, Print("\x1b[?2026l"));
-        match (result, end) {
-            (Err(error), _) => return Err(error),
-            (Ok(()), Err(error)) => return Err(error.into()),
-            (Ok(()), Ok(())) => {}
+        if let Err(error) = result {
+            queue!(self.out, Print("\x1b[?2026l"))?;
+            return Err(error);
         }
 
         if let Some(painted) = self.painted_frame.as_mut() {
@@ -1399,7 +1398,8 @@ impl Renderer {
                     .min(u16::MAX as usize) as u16,
                 self.cursor_line.min(u16::MAX as usize) as u16
             ),
-            Show
+            Show,
+            Print("\x1b[?2026l")
         )?;
         self.cursor_shown = true;
         self.painted_hovered_tool = self.hovered_tool;
@@ -1639,36 +1639,24 @@ impl Renderer {
         if let Some((row, control)) = scroll_to_bottom_overlay {
             paint_scroll_to_bottom_into_frame(&mut frame, row, control);
         }
-        // Frame diffs move the terminal cursor across changed rows. Hide it
-        // while painting so shortcuts that only change chrome do not make the
-        // composer caret visibly jump before it returns to its final position.
-        if self.cursor_shown {
-            queue!(self.out, Hide)?;
-            self.cursor_shown = false;
-        }
         emit_synchronized_frame_diff_with_full_rows(
             &mut self.out,
             self.painted_frame.as_ref(),
             &frame,
             full_repaint_rows,
+            Some((
+                cursor_col
+                    .min(usize::from(total_width).saturating_sub(2))
+                    .min(u16::MAX as usize) as u16,
+                cursor_line.min(u16::MAX as usize) as u16,
+                show_cursor,
+            )),
         )?;
         self.painted_frame = Some(frame);
         self.painted_selection = selection;
         self.painted_hovered_tool = self.hovered_tool;
         self.painted_hovered_pick = self.hovered_pick.clone();
-        queue!(
-            self.out,
-            MoveTo(
-                cursor_col
-                    .min(usize::from(total_width).saturating_sub(2))
-                    .min(u16::MAX as usize) as u16,
-                cursor_line.min(u16::MAX as usize) as u16
-            )
-        )?;
-        if show_cursor && !self.cursor_shown {
-            queue!(self.out, Show)?;
-            self.cursor_shown = true;
-        }
+        self.cursor_shown = show_cursor;
         Ok(())
     }
 
@@ -2163,24 +2151,6 @@ fn emit_row_sequential(
     Ok(())
 }
 
-/// Let terminals that implement synchronized updates show a complete frame at
-/// once. Unknown terminals ignore these private-mode escapes and still receive
-/// the ordinary, coalesced diff.
-fn emit_synchronized_frame_diff(
-    out: &mut impl Write,
-    previous: Option<&CellFrame>,
-    current: &CellFrame,
-) -> Result<()> {
-    queue!(out, Print("\x1b[?2026h"))?;
-    let result = emit_frame_diff(out, previous, current);
-    let end = queue!(out, Print("\x1b[?2026l"));
-    match (result, end) {
-        (Err(error), _) => Err(error),
-        (Ok(()), Err(error)) => Err(error.into()),
-        (Ok(()), Ok(())) => Ok(()),
-    }
-}
-
 /// A semantic plan change can alter the fixed panel height, which also moves
 /// transcript and composer rows. Repaint the complete frame once so no old row
 /// remains at its former terminal position. Spinner-only frames still use the
@@ -2190,13 +2160,20 @@ fn emit_synchronized_frame_diff_with_full_rows(
     previous: Option<&CellFrame>,
     current: &CellFrame,
     full_rows: &[usize],
+    cursor: Option<(u16, u16, bool)>,
 ) -> Result<()> {
-    if full_rows.is_empty() {
-        return emit_synchronized_frame_diff(out, previous, current);
-    }
-
     queue!(out, Print("\x1b[?2026h"))?;
-    let result = emit_frame_diff(out, None, current);
+    if cursor.is_some() {
+        queue!(out, Hide)?;
+    }
+    let previous = if full_rows.is_empty() { previous } else { None };
+    let result = emit_frame_diff(out, previous, current);
+    if let Some((column, row, show)) = cursor {
+        queue!(out, MoveTo(column, row))?;
+        if show {
+            queue!(out, Show)?;
+        }
+    }
     let end = queue!(out, Print("\x1b[?2026l"));
     match (result, end) {
         (Err(error), _) => Err(error),
@@ -2325,6 +2302,10 @@ enum Tone {
     StatusModelLuna,
     StatusModelSpark,
     StatusModel55,
+    StatusModelHaiku,
+    StatusModelSonnet,
+    StatusModelOpus,
+    StatusModelFable,
     StatusEffortLow,
     StatusEffortMedium,
     StatusEffortHigh,
@@ -3213,8 +3194,9 @@ fn welcome_info_rows(welcome: &WelcomeView, column_width: usize) -> Vec<PanelRow
     let mut rows = vec![
         (
             format!(
-                "  ✦  DEVEZ VIBE  v{}  with Codex",
-                crate::update::CURRENT_VERSION
+                "  ✦  DEVEZ VIBE  v{}  with {}",
+                crate::update::CURRENT_VERSION,
+                welcome.provider
             ),
             Tone::Accent,
             true,
@@ -4174,6 +4156,10 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         };
     };
 
+    let has_effort = status
+        .effort
+        .as_deref()
+        .is_some_and(|effort| !effort.is_empty());
     let mut spans = Vec::new();
     let mut picks = Vec::new();
     if let Some(model) = status.model.filter(|model| !model.is_empty()) {
@@ -4214,7 +4200,11 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
     // Align with the activity controls above by keeping two blank terminal
     // columns to the right of the status line.
     let max_width = width.saturating_sub(3) as usize;
-    let shortcut_hint = "Shift + ↑↓ model · ←→ effort";
+    let shortcut_hint = if has_effort {
+        "Shift + ↑↓ model · ←→ effort"
+    } else {
+        "Shift + ↑↓ model"
+    };
     let content_width = spans
         .iter()
         .map(|span| UnicodeWidthStr::width(span.text.as_str()))
@@ -5265,6 +5255,7 @@ fn block_lines_with_mode(
         let mut values = block.body.lines();
         let mut lines = welcome_lines(
             WelcomeView {
+                provider: values.next().unwrap_or("Codex").to_owned(),
                 plan: values.next().unwrap_or_default().to_owned(),
                 credits_expanded: false,
                 cwd: values.next().unwrap_or_default().to_owned(),
@@ -6796,7 +6787,18 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
         ]
     });
     let primary_spans = custom_spans.unwrap_or_else(|| vec![vibe_mode_span.clone()]);
-    // Fast is the only optional trailing control.
+    let without_fast = BadgeSpans {
+        spans: [display_spans.clone(), primary_spans.clone()].concat(),
+        response_length_index: Some(display_width),
+        shell_display_mode_index: None,
+        diff_display_mode_index: None,
+        fast_index: None,
+    };
+    if mode.model.starts_with("claude:") {
+        return (spans_width(&without_fast.spans) <= budget).then_some(without_fast);
+    }
+
+    // Fast is the only optional trailing control for models that expose it.
     let ladder = [
         BadgeSpans {
             spans: [
@@ -6810,13 +6812,7 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
             diff_display_mode_index: None,
             fast_index: Some(display_width + primary_spans.len() + 1),
         },
-        BadgeSpans {
-            spans: [display_spans, primary_spans.clone()].concat(),
-            response_length_index: Some(display_width),
-            shell_display_mode_index: None,
-            diff_display_mode_index: None,
-            fast_index: None,
-        },
+        without_fast,
     ];
     ladder
         .into_iter()
@@ -7110,6 +7106,10 @@ fn word_background(tone: Tone) -> Option<Rgb> {
         Tone::StatusModelLuna => blend(palette.background, palette.model_luna, 46),
         Tone::StatusModelSpark => blend(palette.background, palette.model_spark, 46),
         Tone::StatusModel55 => blend(palette.background, palette.model_gpt55, 46),
+        Tone::StatusModelHaiku => blend(palette.background, palette.status.model_haiku, 46),
+        Tone::StatusModelSonnet => blend(palette.background, palette.status.model_sonnet, 46),
+        Tone::StatusModelOpus => blend(palette.background, palette.status.model_opus, 46),
+        Tone::StatusModelFable => blend(palette.background, palette.status.model_fable, 46),
         _ => return None,
     })
 }
@@ -7368,6 +7368,19 @@ fn model_tone(model: &str) -> Option<Tone> {
 }
 
 fn status_model_tone(model: &str) -> Option<Tone> {
+    let normalized = model.to_ascii_lowercase();
+    if normalized.contains("haiku") {
+        return Some(Tone::StatusModelHaiku);
+    }
+    if normalized.contains("sonnet") {
+        return Some(Tone::StatusModelSonnet);
+    }
+    if normalized.contains("opus") {
+        return Some(Tone::StatusModelOpus);
+    }
+    if normalized.contains("fable") {
+        return Some(Tone::StatusModelFable);
+    }
     match model_tone(model)? {
         Tone::Model56 => Some(Tone::StatusModel56),
         Tone::ModelSol => Some(Tone::StatusModelSol),
@@ -7431,6 +7444,10 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::StatusModelLuna => palette.model_luna,
         Tone::StatusModelSpark => palette.model_spark,
         Tone::StatusModel55 => palette.model_gpt55,
+        Tone::StatusModelHaiku => palette.status.model_haiku,
+        Tone::StatusModelSonnet => palette.status.model_sonnet,
+        Tone::StatusModelOpus => palette.status.model_opus,
+        Tone::StatusModelFable => palette.status.model_fable,
         Tone::StatusEffortLow => palette.status.effort_low,
         Tone::StatusEffortMedium => palette.status.effort_medium,
         Tone::StatusEffortHigh => palette.status.effort_high,
@@ -7680,8 +7697,14 @@ mod tests {
         current.write(0, 0, "x", CellStyle::plain());
 
         let mut output = Vec::new();
-        emit_synchronized_frame_diff(&mut output, Some(&previous), &current)
-            .expect("synchronized frame diff emits");
+        emit_synchronized_frame_diff_with_full_rows(
+            &mut output,
+            Some(&previous),
+            &current,
+            &[],
+            None,
+        )
+        .expect("synchronized frame diff emits");
 
         let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
         assert!(output.starts_with("\x1b[?2026h"));
@@ -7791,7 +7814,16 @@ mod tests {
             failed: false,
         };
 
-        assert!(emit_synchronized_frame_diff(&mut output, Some(&previous), &current).is_err());
+        assert!(
+            emit_synchronized_frame_diff_with_full_rows(
+                &mut output,
+                Some(&previous),
+                &current,
+                &[],
+                None,
+            )
+            .is_err()
+        );
         assert!(
             String::from_utf8(output.bytes)
                 .expect("terminal bytes are UTF-8")
@@ -8390,14 +8422,26 @@ mod tests {
         current.write(0, 0, "새 작업", CellStyle::plain());
 
         let mut output = Vec::new();
-        emit_synchronized_frame_diff_with_full_rows(&mut output, Some(&previous), &current, &[0])
-            .expect("plan update emits");
+        emit_synchronized_frame_diff_with_full_rows(
+            &mut output,
+            Some(&previous),
+            &current,
+            &[0],
+            Some((0, 1, true)),
+        )
+        .expect("plan update emits");
 
         let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
         assert!(output.starts_with("\x1b[?2026h"));
         assert!(output.contains("새 작업"));
         assert!(output.contains("\x1b[2;1H"));
         assert!(output.ends_with("\x1b[?2026l"));
+        assert!(
+            output.find("\x1b[?2026h").unwrap()
+                < output.find("\x1b[?25l").unwrap()
+                && output.find("\x1b[?25l").unwrap() < output.rfind("\x1b[?25h").unwrap()
+                && output.rfind("\x1b[?25h").unwrap() < output.rfind("\x1b[?2026l").unwrap()
+        );
     }
 
     /// Replays emitted escape bytes onto a cell grid the way a VT terminal
@@ -8603,7 +8647,14 @@ mod tests {
         let frame_initial = paint_plan_frame(&lines_initial, width);
         let mut emulator = TerminalEmulator::new(width, lines_initial.len());
         let mut output = Vec::new();
-        emit_synchronized_frame_diff(&mut output, None, &frame_initial).expect("initial paint");
+        emit_synchronized_frame_diff_with_full_rows(
+            &mut output,
+            None,
+            &frame_initial,
+            &[],
+            None,
+        )
+        .expect("initial paint");
         emulator.feed(&output);
 
         // Spinner tick, then the semantic update, both through the animation
@@ -9972,6 +10023,19 @@ mod tests {
         );
         assert_eq!(line.tail[1].tone, Tone::FastOn);
         assert_eq!(line.tail[3].tone, Tone::FastOn);
+    }
+
+    #[test]
+    fn claude_composer_hides_the_fast_control() {
+        let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
+        mode.model = "claude:sonnet".to_owned();
+
+        let line = input_top_line(120, "", Some(&mode));
+
+        assert!(!painted(&line).contains("Fast:"));
+        assert!(line.pick.as_ref().is_none_or(|picks| {
+            picks.0.iter().all(|(_, _, pick)| *pick != Pick::FastMode)
+        }));
     }
 
     #[test]
@@ -11647,6 +11711,7 @@ mod tests {
 
     fn test_welcome() -> WelcomeView {
         WelcomeView {
+            provider: "Codex".to_owned(),
             plan: "Pro Lite".to_owned(),
             credits: vec!["3 available".to_owned(), "· 2026-08-01  6d left".to_owned()],
             credits_expanded: false,
@@ -12142,6 +12207,7 @@ mod tests {
     #[test]
     fn a_docked_picker_keeps_the_welcome_card_on_screen() {
         let welcome = WelcomeView {
+            provider: "Codex".to_owned(),
             plan: "Pro".to_owned(),
             credits_expanded: false,
             cwd: r"C:\Source\DevezVibe".to_owned(),
@@ -12873,6 +12939,20 @@ mod tests {
     }
 
     #[test]
+    fn claude_status_models_use_the_devez_code_colors() {
+        let palette = theme::palette();
+        for (model, tone, color) in [
+            ("Claude Haiku", Tone::StatusModelHaiku, palette.status.model_haiku),
+            ("Claude Sonnet", Tone::StatusModelSonnet, palette.status.model_sonnet),
+            ("Claude Opus", Tone::StatusModelOpus, palette.status.model_opus),
+            ("Claude Fable", Tone::StatusModelFable, palette.status.model_fable),
+        ] {
+            assert_eq!(status_model_tone(model), Some(tone));
+            assert_eq!(tone_rgb(tone), Some(color));
+        }
+    }
+
+    #[test]
     fn terra_uses_the_reference_green_model_colour() {
         assert_eq!(tone_rgb(Tone::ModelTerra), Some(theme::palette().model_terra));
     }
@@ -13135,6 +13215,7 @@ mod tests {
     fn panel_borders_use_the_theme_border_tone() {
         let lines = welcome_lines(
             WelcomeView {
+                provider: "Codex".to_owned(),
                 plan: "Pro".to_owned(),
                 credits: vec!["none available".to_owned()],
                 credits_expanded: false,

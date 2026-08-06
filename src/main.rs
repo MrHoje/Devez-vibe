@@ -1,5 +1,6 @@
 mod app_server;
 mod backend;
+mod claude;
 mod completion;
 mod devezcode;
 mod editor;
@@ -51,7 +52,7 @@ use tokio::{sync::mpsc, time::MissedTickBehavior};
 #[command(
     name = "dvz",
     version,
-    about = "Stable terminal UI for the official Codex app-server"
+    about = "Stable terminal UI for Codex and Claude Agent SDK"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -92,6 +93,14 @@ struct Cli {
     #[arg(long, default_value = "opencode", hide = true)]
     open_code: PathBuf,
 
+    /// Claude Code executable whose existing subscription login is reused.
+    #[arg(long, default_value = "claude")]
+    claude: PathBuf,
+
+    /// Node.js executable used by the Claude Agent SDK bridge.
+    #[arg(long, default_value = "node", hide = true)]
+    node: PathBuf,
+
     /// UI theme: minimal, soft, dark, gray, softpink, or midnight.
     #[arg(long, value_name = "THEME")]
     theme: Option<String>,
@@ -128,7 +137,14 @@ async fn main() -> Result<()> {
     theme::set_current(selected_theme);
     devezcode::init();
     let cwd = resolve_cwd(cli.cwd.as_deref())?;
-    let mut server = BackendServer::spawn(&cli.codex, &cli.open_code, &cwd).await?;
+    let mut server = BackendServer::spawn(
+        &cli.codex,
+        &cli.open_code,
+        &cli.node,
+        &cli.claude,
+        &cwd,
+    )
+    .await?;
 
     let result = run(&cli, &mut server).await;
     server.shutdown().await;
@@ -143,7 +159,9 @@ async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
         .model
         .as_deref()
         .or_else(|| root_config_value(&startup_config, "model"));
-    let (account, prefer_open_code) = if requested_model.is_some_and(open_code::is_open_code_model) {
+    let (account, prefer_open_code) = if requested_model.is_some_and(claude::is_claude_model) {
+        ("Claude subscription".to_owned(), false)
+    } else if requested_model.is_some_and(open_code::is_open_code_model) {
         ("OpenCode".to_owned(), false)
     } else {
         match ensure_account(server).await {
@@ -265,7 +283,7 @@ async fn start_session(
             cwd,
             state.model_verbosity(),
         ),
-        read_account_plan(server),
+        read_runtime_account_plan(server, requested_model_name),
     )
     .await?;
     let Startup::Ready {
@@ -275,6 +293,7 @@ async fn start_session(
     else {
         return Ok(());
     };
+    apply_claude_account_metadata(state, &thread_response);
 
     let thread = if is_resuming {
         hydrate_thread_history(server, &thread_response).await?
@@ -1296,6 +1315,8 @@ async fn execute_action(
                     json!({
                         "threadId": state.thread_id,
                         "model": state.selected_model_name(),
+                        "effort": state.selected_effort(),
+                        "claudeDeveloperInstructions": CLAUDE_DEVEZ_INSTRUCTIONS,
                         "serviceTier": state.service_tier(),
                         "ephemeral": true,
                         "threadSource": "devez-vibe"
@@ -1381,11 +1402,18 @@ async fn execute_action(
                 )
                 .await
             {
-                Ok(_) => state.push_notice(
-                    BlockKind::System,
-                    "Compacting context",
-                    "Codex가 대화 컨텍스트를 압축하고 있습니다.",
-                ),
+                Ok(_) => {
+                    let provider = if state.selected_model_name().starts_with("claude:") {
+                        "Claude"
+                    } else {
+                        "Codex"
+                    };
+                    state.push_notice(
+                        BlockKind::System,
+                        "Compacting context",
+                        format!("{provider}가 대화 컨텍스트를 압축하고 있습니다."),
+                    );
+                }
                 Err(error) => state.push_notice(BlockKind::Error, "압축 실패", error.to_string()),
             }
         }
@@ -2094,9 +2122,10 @@ async fn start_new_thread(
     renderer: &mut Renderer,
 ) -> Result<bool> {
     // Read the request out of the old session before it is torn down.
+    let selected_model = state.selected_model_name().to_owned();
     let params = new_thread_params(
         &state.cwd,
-        None,
+        Some(&selected_model),
         Some(state.service_tier()),
         "clear",
         state.model_verbosity(),
@@ -2120,6 +2149,7 @@ async fn start_new_thread(
         Switch::Quit => return Ok(true),
         Switch::Failed => return Ok(false),
     };
+    apply_claude_account_metadata(state, &response);
 
     let thread_id = response
         .get("thread")
@@ -2216,6 +2246,7 @@ async fn resume_into_state(
         Switch::Quit => return Ok(Switched::Quit),
         Switch::Failed => return Ok(Switched::Failed),
     };
+    apply_claude_account_metadata(state, &response);
 
     let resumed = match parse_resumed_thread(&response) {
         Ok(resumed) => resumed,
@@ -2267,7 +2298,16 @@ async fn await_switch(
     previous_thread: String,
     request: impl Future<Output = Result<Value>>,
 ) -> Result<Switch> {
-    match await_thread(server, state, renderer, request, read_account_plan(server)).await {
+    let model = state.selected_model_name().to_owned();
+    match await_thread(
+        server,
+        state,
+        renderer,
+        request,
+        read_runtime_account_plan(server, &model),
+    )
+    .await
+    {
         Ok(Startup::Ready {
             thread_response,
             queued,
@@ -2519,6 +2559,36 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 기존 브라우저 탭이 있으면 임의로 선택하지 말고 사용자에게 선택을 받은 뒤 사용한다.\n",
 );
 
+/// Claude Code already owns its native task system. These rules preserve the
+/// same visible workflow while naming the Claude tools it can actually call.
+const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
+    "Devez Vibe에서 작업한다. Task 목록의 설명과 모든 Task 제목은 반드시 자연스러운 한국어로 작성한다. ",
+    "코드, 명령어, 경로, 제품명 등 기술 식별자는 원문을 유지한다.\n",
+    "답변 형식 규칙:\n",
+    "- 서론, 인사, 맺음말 요약을 쓰지 않고 결론부터 쓴다.\n",
+    "- 기본 분량은 세 줄 전후이며, 사용자가 자세한 설명을 요청할 때만 늘린다.\n",
+    "- 산문 문단 대신 불릿과 코드 블록을 쓴다.\n",
+    "- 코드 변경은 파일 경로와 핵심 코드만 보여주고, 요청받지 않은 해설을 덧붙이지 않는다.\n",
+    "- Super Vibe 모드에서 반드시 필요한 상황이 아닌 단순 안내에는 클래스명, 코드명 등 기술 식별자를 출력하지 않는다.\n",
+    "- 작업을 완료하면 사용자의 요청을 기준으로 정확히 무엇을 완료했는지 `~ 내용을 완료했습니다.` 형식으로 분명하게 알린다.\n",
+    "- 하지 않기로 한 선택지나 이미 정해진 결정을 다시 나열하지 않는다.\n",
+    "- Skill 적용, 지침 확인, 내부 도구 호출 같은 내부 절차를 사용자에게 진행 상황으로 알리지 않는다. ",
+    "사용자 판단에 필요한 진행 상황이나 결과만 알린다.\n",
+    "작업 단계 규칙:\n",
+    "- 파일 수정, 원인 분석, 코드 리뷰처럼 단순 질문이 아닌 작업은 시작 전에 Claude Code의 TaskCreate로 짧은 작업 목록을 만든다.\n",
+    "- 작은 작업은 Task 한두 개면 충분하다.\n",
+    "- 모든 Task의 subject는 순서대로 `1. `, `2. `, `3.`처럼 번호로 시작한다.\n",
+    "- 각 Task는 착수 즉시 TaskUpdate로 `in_progress`, 끝나면 즉시 `completed`로 바꾼다.\n",
+    "- TaskList로 현재 단계를 확인하고, 동시에 `in_progress`인 Task는 하나만 둔다.\n",
+    "- 질문에만 답하는 턴에는 Task를 만들지 않는다.\n",
+    "내장 브라우저 규칙:\n",
+    "- DevezCode 브라우저는 ChatGPT의 Browser plugin(`iab`)이 아니라 `mcp__devez_browser__browser_*` MCP 도구다. ",
+    "사용자가 DevezCode 브라우저·Devez 브라우저·내장 브라우저·내장브라우저·인앱 브라우저·인앱브라우저를 요청하면 이 MCP 도구만 사용한다. ",
+    "사용자가 크롬 브라우저를 명시한 경우에만 Chrome을 사용한다.\n",
+    "- 도구가 없다고 추측하지 말고 현재 제공된 도구를 먼저 확인한다.\n",
+    "- 기존 브라우저 탭이 있으면 임의로 선택하지 말고 사용자에게 선택을 받은 뒤 사용한다.\n",
+);
+
 /// A resumed thread replays the `developer` message its rollout was recorded
 /// with, so the rules have to be re-sent or an old session keeps running on an
 /// older wording.
@@ -2526,6 +2596,7 @@ fn resume_thread_params(thread_id: &str) -> Value {
     json!({
         "threadId": thread_id,
         "developerInstructions": DEVEZ_INSTRUCTIONS,
+        "claudeDeveloperInstructions": CLAUDE_DEVEZ_INSTRUCTIONS,
         "initialTurnsPage": {
             "limit": 100,
             "sortDirection": "asc",
@@ -2540,6 +2611,10 @@ fn turn_additional_context() -> Value {
     json!({
         "devez-vibe-rules": {
             "value": DEVEZ_INSTRUCTIONS,
+            "kind": "application"
+        },
+        "claude-devez-vibe-rules": {
+            "value": CLAUDE_DEVEZ_INSTRUCTIONS,
             "kind": "application"
         }
     })
@@ -2557,6 +2632,7 @@ fn new_thread_params(
         "permissions": ":danger-full-access",
         "config": { "model_verbosity": model_verbosity },
         "developerInstructions": DEVEZ_INSTRUCTIONS,
+        "claudeDeveloperInstructions": CLAUDE_DEVEZ_INSTRUCTIONS,
         "sessionStartSource": session_start_source,
         "threadSource": "devez-vibe"
     });
@@ -3095,15 +3171,17 @@ async fn start_turn(server: &BackendServer, state: &mut AppState, text: String) 
     state.note_pending_turn_model(&model);
     state.note_pending_turn_effort(&effort);
     let input = state.turn_input(text);
-    let params = json!({
+    let mut params = json!({
         "threadId": state.thread_id,
         "input": input,
         "model": model,
-        "effort": effort,
         "serviceTier": state.service_tier(),
         "permissions": state.permission_profile(),
         "additionalContext": turn_additional_context()
     });
+    if !effort.is_empty() {
+        params["effort"] = json!(effort);
+    }
     match server.request("turn/start", params).await {
         // The response reserves an id, but the app-server makes it
         // interruptible only after the subsequent `turn/started` notification.
@@ -3381,6 +3459,33 @@ async fn read_account_plan(server: &BackendServer) -> AccountPlan {
         .unwrap_or_default()
 }
 
+async fn read_runtime_account_plan(server: &BackendServer, model: &str) -> AccountPlan {
+    if claude::is_claude_model(model) {
+        AccountPlan::default()
+    } else {
+        read_account_plan(server).await
+    }
+}
+
+fn apply_claude_account_metadata(state: &mut AppState, response: &Value) {
+    if !response
+        .get("model")
+        .and_then(Value::as_str)
+        .is_some_and(claude::is_claude_model)
+    {
+        return;
+    }
+    let account = response.get("account").filter(|value| !value.is_null());
+    let usage = response.get("usage").filter(|value| !value.is_null());
+    let label = account
+        .and_then(|account| account.get("email"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Claude subscription");
+    state.set_account(label.to_owned());
+    state.set_account_plan(AccountPlan::from_claude(account, usage));
+}
+
 async fn ensure_account(server: &BackendServer) -> Result<String> {
     let response = server
         .request("account/read", json!({ "refreshToken": false }))
@@ -3604,7 +3709,7 @@ fn root_config_value<'a>(config: &'a str, name: &str) -> Option<&'a str> {
 }
 
 fn validate_effort(models: &[ModelInfo], model_name: &str, effort: Option<&str>) -> Result<()> {
-    let Some(effort) = effort else {
+    let Some(effort) = effort.filter(|effort| !effort.is_empty()) else {
         return Ok(());
     };
     let Some(model) = models
@@ -3620,6 +3725,11 @@ fn validate_effort(models: &[ModelInfo], model_name: &str, effort: Option<&str>)
             .map(|effort| effort.id.as_str())
             .collect::<Vec<_>>()
             .join(", ");
+        let supported = if supported.is_empty() {
+            "없음"
+        } else {
+            &supported
+        };
         bail!(
             "`{}` 모델은 `{effort}` reasoning을 지원하지 않습니다. 지원값: {supported}",
             model.display_name
@@ -3915,6 +4025,12 @@ mod tests {
         let params = new_thread_params("C:\\repo", Some("gpt-5.6-terra"), None, "startup", "low");
 
         assert_eq!(params.pointer("/developerInstructions").and_then(Value::as_str), Some(DEVEZ_INSTRUCTIONS));
+        assert_eq!(
+            params
+                .pointer("/claudeDeveloperInstructions")
+                .and_then(Value::as_str),
+            Some(CLAUDE_DEVEZ_INSTRUCTIONS)
+        );
         assert_eq!(params.pointer("/model").and_then(Value::as_str), Some("gpt-5.6-terra"));
     }
 
@@ -3937,6 +4053,12 @@ mod tests {
             Some(DEVEZ_INSTRUCTIONS)
         );
         assert_eq!(
+            params
+                .pointer("/claudeDeveloperInstructions")
+                .and_then(Value::as_str),
+            Some(CLAUDE_DEVEZ_INSTRUCTIONS)
+        );
+        assert_eq!(
             params.pointer("/initialTurnsPage/itemsView").and_then(Value::as_str),
             Some("full")
         );
@@ -3954,6 +4076,14 @@ mod tests {
             context.pointer("/devez-vibe-rules/kind").and_then(Value::as_str),
             Some("application")
         );
+        assert_eq!(
+            context
+                .pointer("/claude-devez-vibe-rules/value")
+                .and_then(Value::as_str),
+            Some(CLAUDE_DEVEZ_INSTRUCTIONS)
+        );
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskCreate"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskUpdate"));
     }
 
     #[test]
