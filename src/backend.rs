@@ -153,6 +153,15 @@ impl BackendServer {
         if self.codex.is_some() {
             return Ok(());
         }
+        // A PC that cannot reach the app-server turns the connection off in
+        // `/provider`; every path into Codex — launch, resume, switch — stops
+        // here rather than waiting out a spawn that will never answer.
+        if !crate::state::codex_provider_enabled() {
+            let reason =
+                "Codex provider 연결이 꺼져 있습니다. /provider에서 Codex를 켜세요.".to_owned();
+            self.codex_unavailable_reason = Some(reason.clone());
+            anyhow::bail!(reason);
+        }
         let devezcode_room = crate::devezcode::room_id();
         let codex = match AppServer::spawn(&self.codex_path, devezcode_room.as_deref()).await {
             Ok(codex) => codex,
@@ -728,7 +737,74 @@ impl BackendServer {
             };
             return Some(ServerEvent::ProtocolWarning(detail));
         }
-        event.map(|event| self.rewrite_event(event))
+        event.map(|event| {
+            let event = self.absorb_claude_rebind(event);
+            self.rewrite_event(event)
+        })
+    }
+
+    /// The Claude bridge renames a session when the CLI persists it under an id other
+    /// than the one the bridge proposed. The route has to follow, or every later
+    /// `session/history`, `session/resume`, and DevezCode `-r` would key off an id
+    /// with no transcript behind it. When the visible thread *is* that Claude session,
+    /// the rename is passed up so the UI (and DevezCode's session file) adopt it;
+    /// when the visible thread belongs to another runtime — a mid-session provider
+    /// switch — only the backing id moves and the UI keeps its id.
+    fn absorb_claude_rebind(&self, event: ServerEvent) -> ServerEvent {
+        let ServerEvent::Notification { method, params } = &event else {
+            return event;
+        };
+        if method != "thread/rebound" {
+            return event;
+        }
+        let Some(previous) = params.get("threadId").and_then(Value::as_str) else {
+            return event;
+        };
+        let Some(next) = params.get("newThreadId").and_then(Value::as_str) else {
+            return event;
+        };
+        let previous_backing = raw_thread_id(previous).to_owned();
+        let next_backing = raw_thread_id(next).to_owned();
+        if previous_backing == next_backing {
+            return event;
+        }
+        let visible = self.visible_id(&previous_backing, previous);
+        let route = self.route(&visible);
+        let cwd = route
+            .as_ref()
+            .map(|route| route.cwd.clone())
+            .unwrap_or_else(|| self.cwd.clone());
+        let namespaced = visible == visible_thread_id(&previous_backing);
+        let target = if namespaced {
+            visible_thread_id(&next_backing)
+        } else {
+            visible.clone()
+        };
+        if namespaced {
+            let mut routes = self.routes.lock().expect("routes mutex");
+            if let Some(existing) = routes.remove(&visible) {
+                routes.insert(target.clone(), existing);
+            }
+            drop(routes);
+            let mut aliases = self.aliases.lock().expect("aliases mutex");
+            for stored in aliases.values_mut() {
+                if *stored == visible {
+                    *stored = target.clone();
+                }
+            }
+        }
+        self.register_route(
+            &target,
+            RuntimeKind::Claude,
+            route.as_ref().and_then(|route| route.codex_id.clone()),
+            route.as_ref().and_then(|route| route.open_code_id.clone()),
+            Some(next_backing),
+            cwd,
+        );
+        ServerEvent::Notification {
+            method: method.clone(),
+            params: json!({ "threadId": visible, "newThreadId": target }),
+        }
     }
 
     pub async fn shutdown(self) {
@@ -1351,6 +1427,8 @@ fn is_vibe_setting_key(key: &str) -> bool {
             | "status_line_context"
             | "status_line_five_hour"
             | "status_line_weekly"
+            | crate::state::CODEX_PROVIDER_KEY
+            | crate::state::CLAUDE_PROVIDER_KEY
     )
 }
 

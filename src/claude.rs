@@ -528,4 +528,18 @@ mod tests {
         assert!(bridge.contains("pruneFinishedTasks(session.tasks, turnId)"));
         assert!(bridge.contains("pruneFinishedTasks(tasks, turn.id)"));
     }
+
+    #[test]
+    fn bridge_tracks_running_subagents_by_parent_tool_use_id() {
+        let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
+
+        assert!(bridge.contains("if (SUBAGENT_TOOLS.includes(name)) startSubagent(session, block);"));
+        assert!(bridge.contains("recordSubagentMessage(session, message)"));
+        assert!(bridge.contains("recordSubagentResult(session, message)"));
+        assert!(bridge.contains("notify(\"turn/subagent/line\""));
+        assert!(bridge.contains("session.subagents.get(message.parent_tool_use_id)"));
+        assert!(bridge.contains("finishSubagent(session, block.tool_use_id)"));
+        assert!(bridge.contains("clearSubagents(session)"));
+        assert!(bridge.contains("notify(\"turn/subagents/updated\""));
+    }
 }

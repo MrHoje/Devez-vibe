@@ -19,9 +19,10 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Notes shown in the welcome panel's right column. Rewrite these each release;
 /// a line starting with `·` renders as a bullet, anything else as a sub-heading.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Plan step changes now repaint safely without continuous cursor flashing.",
-    "Wrapped prompt selections now exclude the left gutter.",
-    "Plan changes clear only the changed row, keeping response animations smooth.",
+    "/provider replaces /claude and /codex: pick the runtime, and connect or disconnect it with Space.",
+    "No provider is connected until you choose one, so a PC that cannot reach the Codex app-server never calls it.",
+    "Running subagents are listed under the composer, and each row opens its recorded work.",
+    "Claude rate limits are published to the DevezCode usage card as soon as a turn ends.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

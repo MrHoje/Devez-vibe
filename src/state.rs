@@ -28,8 +28,8 @@ use crate::{
     renderer::{
         AnimationView, Block, BlockKind, ComposerMode, EffortSlider, HIDDEN_STATUS_LINE,
         LiveBlockView, ModeAccent, OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS, PlanStep,
-        PlanStepStatus, PlanSummary, ProviderHandoffBlock, StatusLineView, SuggestionView, VibeTone,
-        View, WelcomeView, visible_window,
+        PlanStepStatus, PlanSummary, ProviderHandoffBlock, StatusLineView, SubagentView,
+        SuggestionView, VibeTone, View, WelcomeView, visible_window,
     },
     rollout::{PlanSnapshot, Rollout, RolloutEvent, RolloutKind},
     theme::{self, ThemeKind},
@@ -306,22 +306,26 @@ impl PermissionMode {
 
 }
 
+/// Rows of the `/provider` picker, in the order they are drawn.
+const RUNTIME_CHOICES: [&str; 2] = ["Claude", "Codex"];
+
+/// Vibe settings keys holding which runtimes dvz may connect to. Absent means
+/// not connected: the first launch on a machine connects nothing until the user
+/// picks in `/provider`.
+pub(crate) const CLAUDE_PROVIDER_KEY: &str = "claude_provider_enabled";
+pub(crate) const CODEX_PROVIDER_KEY: &str = "codex_provider_enabled";
+
 struct SlashCommand {
     name: &'static str,
     description: &'static str,
     takes_argument: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 30] = [
+const SLASH_COMMANDS: [SlashCommand; 29] = [
     SlashCommand {
-        name: "/claude",
-        description: "Switch to the Claude provider",
-        takes_argument: false,
-    },
-    SlashCommand {
-        name: "/codex",
-        description: "Switch to the Codex provider",
-        takes_argument: false,
+        name: "/provider",
+        description: "Switch between the Claude and Codex providers",
+        takes_argument: true,
     },
     SlashCommand {
         name: "/model",
@@ -910,6 +914,14 @@ pub enum Action {
         key_path: &'static str,
         enabled: bool,
     },
+    /// Save which runtimes this machine may connect to. `activate_codex` rides
+    /// along when the same keystroke also moved the session to Codex, so the
+    /// app-server starts only after the connection is on disk.
+    PersistProviderConnection {
+        key_path: &'static str,
+        connected: bool,
+        activate_codex: bool,
+    },
     Quit,
     ClearScreen,
     Tick(bool),
@@ -1051,6 +1063,19 @@ enum PendingInteraction {
     },
     EffortPicker {
         effort_index: usize,
+    },
+    /// `/provider`: which runtime the next prompt goes to, and which runtimes
+    /// dvz may dial at all. A machine that cannot reach the Codex app-server
+    /// switches Codex off here, and nothing calls it again until it is back on.
+    RuntimePicker {
+        selected: usize,
+    },
+    /// A subagent's recorded work, opened from its row under the composer. Read
+    /// only: closing it hands the main thread straight back.
+    SubagentTranscript {
+        id: String,
+        /// First visible line, so a long record can be walked with Up/Down.
+        offset: usize,
     },
     SettingPicker {
         setting: DisplaySetting,
@@ -2297,9 +2322,11 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
         PendingInteraction::ModelPicker { .. }
             | PendingInteraction::ModelScope { .. }
             | PendingInteraction::EffortPicker { .. }
+            | PendingInteraction::RuntimePicker { .. }
             | PendingInteraction::SettingPicker { .. }
             | PendingInteraction::VibeModePicker { .. }
             | PendingInteraction::StatusLinePicker { .. }
+            | PendingInteraction::SubagentTranscript { .. }
             | PendingInteraction::SessionPicker(_)
             | PendingInteraction::ProviderPicker(_)
     )
@@ -2570,6 +2597,29 @@ pub struct TickResult {
     pub animation_only: bool,
 }
 
+/// One subagent the provider is currently running under the turn. The bridge
+/// reports elapsed time per update, but the row ticks between updates, so the
+/// start instant is kept locally and reused while the same id stays running.
+#[derive(Clone, Debug)]
+struct RunningSubagent {
+    id: String,
+    name: String,
+    description: String,
+    tool: String,
+    started_at: Instant,
+}
+
+/// One recorded line of a subagent's work, as shown in its transcript panel.
+#[derive(Clone, Debug)]
+struct SubagentLogLine {
+    text: String,
+    muted: bool,
+}
+
+/// A long-running subagent can emit far more than a panel will ever show, so the
+/// oldest lines are dropped rather than held for the rest of the turn.
+const SUBAGENT_LOG_LIMIT: usize = 400;
+
 pub struct AppState {
     pub editor: Editor,
     composer_images: Vec<String>,
@@ -2628,9 +2678,17 @@ pub struct AppState {
     welcome_credits_expanded: bool,
     plan_summary: Option<PlanSummary>,
     plan_shimmer_started_at: Option<Instant>,
+    subagents: Vec<RunningSubagent>,
+    /// Recorded subagent work, keyed by the parent tool-use id. Kept for the rest
+    /// of the turn so a panel opened on a finished subagent still has something
+    /// to show.
+    subagent_logs: HashMap<String, Vec<SubagentLogLine>>,
     command_selection: usize,
     spinner_frame: usize,
     turn_started_at: Option<Instant>,
+    /// When `/compact` was sent. Compaction produces no assistant text, so the
+    /// activity row runs its own clock until the runtime reports the boundary.
+    compacting_started_at: Option<Instant>,
     last_completed_duration: Option<Duration>,
     branch: Option<String>,
     five_hour_percent: Option<u8>,
@@ -2649,6 +2707,13 @@ pub struct AppState {
     shell_display_mode: ShellDisplayMode,
     diff_display_mode: DiffDisplayMode,
     status_line_settings: StatusLineSettings,
+    /// Which runtimes this machine may connect to. Both start off — a fresh
+    /// install picks in `/provider` — and nothing dials a runtime that is off.
+    claude_provider_enabled: bool,
+    codex_provider_enabled: bool,
+    /// Set at launch when this machine has never picked a runtime. While it is
+    /// up the composer holds prompts back and points at the picker.
+    provider_choice_pending: bool,
     account_plan: AccountPlan,
     /// Set when a login lands, so the event loop re-reads the account over RPC.
     account_refresh_due: bool,
@@ -2784,8 +2849,11 @@ impl AppState {
             welcome_credits_expanded: false,
             plan_summary: None,
             plan_shimmer_started_at: None,
+            subagents: Vec::new(),
+            subagent_logs: HashMap::new(),
             command_selection: 0,
             spinner_frame: 0,
+            compacting_started_at: None,
             turn_started_at: None,
             last_completed_duration: None,
             branch,
@@ -2803,6 +2871,9 @@ impl AppState {
             shell_display_mode,
             diff_display_mode,
             status_line_settings: read_status_line_settings(),
+            claude_provider_enabled: claude_provider_enabled(),
+            codex_provider_enabled: codex_provider_enabled(),
+            provider_choice_pending: false,
             account_plan: AccountPlan::default(),
             account_refresh_due: false,
             skills: Vec::new(),
@@ -2877,6 +2948,145 @@ impl AppState {
 
     fn current_provider_model_indices(&self) -> Vec<usize> {
         self.provider_model_indices(self.selected_provider())
+    }
+
+    /// Where the current provider sits in `RUNTIME_CHOICES`. OpenCode has no
+    /// row of its own, so it reads as Claude — the runtime it runs under.
+    fn runtime_choice_index(&self) -> usize {
+        match self.selected_provider() {
+            ModelProvider::Codex => 1,
+            _ => 0,
+        }
+    }
+
+    /// Whether the runtime on a `/provider` row may be dialled at all. Nothing is
+    /// connected until the user says so, on this machine, in this picker.
+    fn runtime_connected(&self, index: usize) -> bool {
+        if index == 1 {
+            self.codex_provider_enabled
+        } else {
+            self.claude_provider_enabled
+        }
+    }
+
+    pub fn any_provider_connected(&self) -> bool {
+        self.claude_provider_enabled || self.codex_provider_enabled
+    }
+
+    pub fn open_runtime_picker(&mut self) {
+        self.pending = Some(PendingInteraction::RuntimePicker {
+            selected: self.runtime_choice_index(),
+        });
+    }
+
+    /// Called once before the first frame. A machine with no runtime chosen yet
+    /// opens the picker instead of assuming one, which is the whole point of
+    /// having no default: the PC that cannot reach Codex never calls it.
+    pub fn prompt_for_provider_if_unconnected(&mut self) {
+        if self.any_provider_connected() {
+            return;
+        }
+        self.provider_choice_pending = true;
+        self.push_notice(
+            BlockKind::System,
+            "Provider 선택",
+            "사용할 provider를 선택하세요. Enter로 연결하고 전환합니다. (나중에 /provider)",
+        );
+        self.open_runtime_picker();
+    }
+
+    /// Enter on a `/provider` row: use that runtime. A row that is not connected
+    /// yet connects first — choosing it *is* the connection — and the choice is
+    /// saved, so the next launch starts where this one left off.
+    fn apply_runtime_choice(&mut self, index: usize) -> Action {
+        let connecting = !self.runtime_connected(index);
+        let key_path = self.set_runtime_connection(index, true);
+        let activate_codex = index == 1 && self.selected_provider() != ModelProvider::Codex;
+        match index {
+            1 if !activate_codex => self.switch_provider(ModelProvider::Codex),
+            1 => {}
+            _ => self.switch_provider(ModelProvider::Claude),
+        }
+        if connecting {
+            Action::PersistProviderConnection {
+                key_path,
+                connected: true,
+                activate_codex,
+            }
+        } else if activate_codex {
+            Action::ActivateCodex
+        } else {
+            Action::None
+        }
+    }
+
+    /// Space on a `/provider` row: connect or disconnect that runtime and record
+    /// it for later launches. Dropping the runtime in use hands the session to
+    /// whatever is still connected; if nothing is, the composer waits for a pick.
+    fn toggle_runtime_connection(&mut self, index: usize) -> Action {
+        let connected = !self.runtime_connected(index);
+        let key_path = self.set_runtime_connection(index, connected);
+        let mut activate_codex = false;
+        if !connected && index == self.runtime_choice_index() {
+            if index == 1 && self.claude_provider_enabled {
+                self.switch_provider(ModelProvider::Claude);
+            } else if index == 0 && self.codex_provider_enabled {
+                activate_codex = true;
+            }
+        }
+        // Dropping the last connection puts the session back where a fresh
+        // install starts: nothing runs until something is picked.
+        self.provider_choice_pending = !self.any_provider_connected();
+        Action::PersistProviderConnection {
+            key_path,
+            connected,
+            activate_codex,
+        }
+    }
+
+    /// Flips one runtime's connection and answers with the settings key that
+    /// records it, so the caller can hand the write to the event loop.
+    fn set_runtime_connection(&mut self, index: usize, connected: bool) -> &'static str {
+        self.provider_choice_pending = false;
+        if index == 1 {
+            self.codex_provider_enabled = connected;
+            CODEX_PROVIDER_KEY
+        } else {
+            self.claude_provider_enabled = connected;
+            CLAUDE_PROVIDER_KEY
+        }
+    }
+
+    /// Put a connection back the way it was when the write that should have
+    /// recorded it failed, so the picker never shows a state disk disagrees with.
+    pub fn restore_provider_connection(&mut self, key_path: &str, connected: bool) {
+        if key_path == CODEX_PROVIDER_KEY {
+            self.codex_provider_enabled = connected;
+        } else {
+            self.claude_provider_enabled = connected;
+        }
+    }
+
+    /// One `/provider` row: the connection mark, the name, and what the runtime
+    /// is doing right now.
+    fn runtime_row(&self, index: usize) -> OverlayLine {
+        let enabled = self.runtime_connected(index);
+        let state = if !enabled {
+            "연결 안 함"
+        } else if index == self.runtime_choice_index() {
+            "사용 중"
+        } else {
+            "연결됨"
+        };
+        OverlayLine {
+            text: format!(
+                "{} {}  ·  {state}",
+                if enabled { '☑' } else { '☐' },
+                RUNTIME_CHOICES[index]
+            ),
+            selected: false,
+            muted: !enabled,
+        }
     }
 
     fn switch_provider(&mut self, provider: ModelProvider) {
@@ -2983,8 +3193,10 @@ impl AppState {
         self.host_loading = loading;
     }
 
+    /// Compaction counts as work for the host tab too: the session is unavailable
+    /// for a prompt until it finishes, exactly like a turn.
     pub fn host_turn_busy(&self) -> bool {
-        self.busy
+        self.busy || self.compacting()
     }
 
     pub fn host_loading(&self) -> bool {
@@ -3673,6 +3885,7 @@ impl AppState {
         self.turn_id = None;
         self.pending_interrupt = false;
         self.busy = false;
+        self.end_compaction();
         self.turn_started_at = None;
         self.active.clear();
         self.active_order.clear();
@@ -3813,6 +4026,7 @@ impl AppState {
 
     pub fn set_request_failed(&mut self, message: impl Into<String>) {
         self.busy = false;
+        self.end_compaction();
         self.turn_id = None;
         self.pending_interrupt = false;
         self.turn_interrupted = false;
@@ -4106,6 +4320,17 @@ impl AppState {
             editor: &self.editor,
             composer_images: &self.composer_images,
             queued_prompts: self.queued_prompts.iter().cloned().collect(),
+            subagents: self
+                .subagents
+                .iter()
+                .map(|running| SubagentView {
+                    id: running.id.clone(),
+                    name: running.name.clone(),
+                    description: running.description.clone(),
+                    tool: running.tool.clone(),
+                    elapsed: running.started_at.elapsed(),
+                })
+                .collect(),
             composer_placeholder: if self.provider_switch_pending() {
                 if self.queueing_supported() {
                     "Enter: queue for switched provider · Tab: queue"
@@ -4149,12 +4374,15 @@ impl AppState {
 
     pub fn render_tick(&mut self) -> TickResult {
         let mut full_redraw = false;
+        // Compaction animates the same row a turn does, so it keeps the frame
+        // loop alive even on a runtime that reports no turn while it runs.
+        let animating = self.busy || self.compacting();
         let plan_shimmer_active = self.plan_shimmer_phase().is_some();
         if self.plan_shimmer_started_at.is_some() && !plan_shimmer_active {
             self.plan_shimmer_started_at = None;
             full_redraw = true;
         }
-        if self.busy {
+        if animating {
             self.spinner_frame = (self.spinner_frame + 1) % SPINNER.len();
         }
         if self.status_metadata_refreshed_at.elapsed().as_secs() >= 3 {
@@ -4198,8 +4426,8 @@ impl AppState {
             self.quit_armed_at = None;
         }
         TickResult {
-            redraw: self.busy || plan_shimmer_active || full_redraw,
-            animation_only: (self.busy || plan_shimmer_active) && !full_redraw,
+            redraw: animating || plan_shimmer_active || full_redraw,
+            animation_only: (animating || plan_shimmer_active) && !full_redraw,
         }
     }
 
@@ -4945,8 +5173,16 @@ impl AppState {
             }
             "turn/completed" => {
                 self.busy = false;
+                // A runtime that compacts inside a turn ends the spinner here even
+                // if it never announced the boundary.
+                self.end_compaction();
                 self.turn_id = None;
                 self.pending_interrupt = false;
+                self.subagents.clear();
+                self.subagent_logs.clear();
+                if matches!(self.pending, Some(PendingInteraction::SubagentTranscript { .. })) {
+                    self.pending = None;
+                }
                 if !self.turn_interrupted || self.last_completed_duration.is_none() {
                     self.last_completed_duration =
                         self.turn_started_at.map(|started| started.elapsed());
@@ -5044,6 +5280,69 @@ impl AppState {
                 });
                 self.plan_shimmer_started_at = Some(Instant::now());
                 self.commit_welcome_card();
+            }
+            "turn/subagents/updated" => {
+                self.subagents = params
+                    .get("subagents")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|entry| {
+                        let id = entry.get("id").and_then(Value::as_str)?;
+                        let started_at = self
+                            .subagents
+                            .iter()
+                            .find(|running| running.id == id)
+                            .map(|running| running.started_at)
+                            .unwrap_or_else(Instant::now);
+                        Some(RunningSubagent {
+                            id: id.to_owned(),
+                            name: entry
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .filter(|name| !name.trim().is_empty())
+                                .unwrap_or("agent")
+                                .to_owned(),
+                            description: entry
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                            tool: entry
+                                .get("tool")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
+                            started_at,
+                        })
+                    })
+                    .collect();
+            }
+            "turn/subagent/line" => {
+                if let Some(parent) = params.get("parentToolUseId").and_then(Value::as_str)
+                    && let Some(line) = params.get("line")
+                    && let Some(text) = line
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                {
+                    let kind = line.get("kind").and_then(Value::as_str).unwrap_or("text");
+                    let text = match kind {
+                        "tool" => format!("⏺ {text}"),
+                        "result" => format!("  ⎿ {text}"),
+                        "error" => format!("  ⎿ 오류: {text}"),
+                        _ => text.to_owned(),
+                    };
+                    let log = self.subagent_logs.entry(parent.to_owned()).or_default();
+                    log.push(SubagentLogLine {
+                        text,
+                        muted: kind != "text",
+                    });
+                    if log.len() > SUBAGENT_LOG_LIMIT {
+                        log.drain(..log.len() - SUBAGENT_LOG_LIMIT);
+                    }
+                }
             }
             "item/started" => {
                 if let Some(item) = params.get("item") {
@@ -5219,16 +5518,28 @@ impl AppState {
                     self.note_mcp_failure(name, Some(detail));
                 }
             }
-            "thread/compacted" => self.push_unique_operation(Block::new(
-                BlockKind::System,
-                "Context compacted",
-                "대화 컨텍스트가 압축되었습니다.",
-            )),
+            "thread/compacted" => {
+                self.end_compaction();
+                self.push_unique_operation(Block::new(
+                    BlockKind::System,
+                    "Context compacted",
+                    "대화 컨텍스트가 압축되었습니다.",
+                ));
+            }
             _ => {}
         }
     }
 
     fn submit_editor(&mut self) -> Action {
+        // A fresh install has picked no runtime yet, so the first prompt opens
+        // the picker instead of guessing one. Nothing leaves the composer, and
+        // slash commands still run — `/provider` among them.
+        let text = self.editor.text();
+        let command = text.starts_with('/') && !text.contains('\n');
+        if self.provider_choice_pending && !self.any_provider_connected() && !command {
+            self.open_runtime_picker();
+            return Action::None;
+        }
         let display = submission_display(&self.editor.display_text(), self.composer_images.len());
         let text = self.editor.take_for_submit().unwrap_or_default();
         self.submit_text(text, display)
@@ -5267,6 +5578,12 @@ impl AppState {
             return self.run_slash_command(&text);
         }
         if self.provider_switch_pending() {
+            self.queued_prompts.push_back(text);
+            return Action::None;
+        }
+        // A prompt sent mid-compaction would race the summary the runtime is
+        // still writing, so it waits in the queue like one sent during a turn.
+        if self.compacting() && !self.busy {
             self.queued_prompts.push_back(text);
             return Action::None;
         }
@@ -5311,22 +5628,33 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/claude  Claude provider로 전환\n/codex  Codex provider로 전환\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n{login_help}\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈"),
+                    format!("/provider [claude|codex]  Claude·Codex provider 전환과 연결 사용/미사용\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n{login_help}\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈"),
                 ));
                 Action::None
             }
-            "/claude" if parts.len() == 1 => {
-                self.switch_provider(ModelProvider::Claude);
+            "/provider" if parts.len() == 1 => {
+                self.open_runtime_picker();
                 Action::None
             }
-            "/codex" if parts.len() == 1 => {
-                Action::ActivateCodex
+            "/provider" if parts.len() == 2 => {
+                match parts[1].to_ascii_lowercase().as_str() {
+                    "claude" => self.apply_runtime_choice(0),
+                    "codex" => self.apply_runtime_choice(1),
+                    _ => {
+                        self.committed.push(Block::new(
+                            BlockKind::Error,
+                            "Usage",
+                            "/provider [claude|codex]",
+                        ));
+                        Action::None
+                    }
+                }
             }
-            "/claude" | "/codex" => {
+            "/provider" => {
                 self.committed.push(Block::new(
                     BlockKind::Error,
                     "Usage",
-                    parts[0],
+                    "/provider [claude|codex]",
                 ));
                 Action::None
             }
@@ -5633,6 +5961,14 @@ impl AppState {
             // `/btw` is for asking something *while* the main turn runs, so it
             // never waits for the turn to finish.
             "/btw" | "/side" => Action::StartSide((parts.len() > 1).then(|| parts[1..].join(" "))),
+            "/compact" if self.compacting() => {
+                self.committed.push(Block::new(
+                    BlockKind::Warning,
+                    "압축 중",
+                    "이미 컨텍스트를 압축하고 있습니다.",
+                ));
+                Action::None
+            }
             "/compact" if self.busy => {
                 self.committed.push(Block::new(
                     BlockKind::Warning,
@@ -5686,11 +6022,24 @@ impl AppState {
             "/status" => {
                 let model = self.selected_model_display_name();
                 let provider = self.selected_provider().label();
+                let connections = format!(
+                    "Claude {} · Codex {}",
+                    if self.claude_provider_enabled {
+                        "연결됨"
+                    } else {
+                        "연결 안 함"
+                    },
+                    if self.codex_provider_enabled {
+                        "연결됨"
+                    } else {
+                        "연결 안 함"
+                    }
+                );
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Status",
                     format!(
-                        "thread: {}\nprovider: {provider}\nmodel: {model}\neffort: {}\ntheme: {}\npermissions: {} ({})\ncwd: {}",
+                        "thread: {}\nprovider: {provider}\nconnections: {connections}\nmodel: {model}\neffort: {}\ntheme: {}\npermissions: {} ({})\ncwd: {}",
                         self.thread_id,
                         self.selected_effort,
                         theme::current().display_name(),
@@ -5884,6 +6233,31 @@ impl AppState {
                 self.pending = Some(PendingInteraction::EffortPicker { effort_index });
                 Action::None
             }
+            PendingInteraction::RuntimePicker { mut selected } => {
+                match key.code {
+                    KeyCode::Esc => return Action::None,
+                    KeyCode::Up | KeyCode::Left => selected = selected.saturating_sub(1),
+                    KeyCode::Char('p') if ctrl => selected = selected.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
+                        selected = (selected + 1).min(RUNTIME_CHOICES.len() - 1);
+                    }
+                    KeyCode::Char('n') if ctrl => {
+                        selected = (selected + 1).min(RUNTIME_CHOICES.len() - 1);
+                    }
+                    KeyCode::Char(' ') => {
+                        self.pending = Some(PendingInteraction::RuntimePicker { selected });
+                        return self.toggle_runtime_connection(selected);
+                    }
+                    KeyCode::Char(ch @ '1'..='2') => {
+                        let row = ch.to_digit(10).unwrap_or(1) as usize - 1;
+                        return self.apply_runtime_choice(row);
+                    }
+                    KeyCode::Enter => return self.apply_runtime_choice(selected),
+                    _ => {}
+                }
+                self.pending = Some(PendingInteraction::RuntimePicker { selected });
+                Action::None
+            }
             PendingInteraction::SettingPicker {
                 setting,
                 mut selected,
@@ -5958,6 +6332,25 @@ impl AppState {
                 });
                 Action::None
             }
+            PendingInteraction::SubagentTranscript { id, offset } => match key.code {
+                KeyCode::Esc | KeyCode::Enter => Action::None,
+                KeyCode::Up | KeyCode::Char('k') if !ctrl && !alt => {
+                    self.pending = Some(PendingInteraction::SubagentTranscript {
+                        id,
+                        offset: offset.saturating_sub(1),
+                    });
+                    Action::None
+                }
+                KeyCode::Down | KeyCode::Char('j') if !ctrl && !alt => {
+                    let offset = (offset + 1).min(self.subagent_log_max_offset(&id));
+                    self.pending = Some(PendingInteraction::SubagentTranscript { id, offset });
+                    Action::None
+                }
+                _ => {
+                    self.pending = Some(PendingInteraction::SubagentTranscript { id, offset });
+                    Action::None
+                }
+            },
             PendingInteraction::StatusLinePicker { mut selected } => match key.code {
                 KeyCode::Esc => Action::None,
                 KeyCode::Enter => Action::None,
@@ -6553,6 +6946,23 @@ impl AppState {
                     input_placeholder: "",
                 })
             }
+            PendingInteraction::RuntimePicker { selected } => Some(OverlayView {
+                closable: true,
+                title: "Provider".to_owned(),
+                lines: (0..RUNTIME_CHOICES.len())
+                    .map(|index| OverlayLine {
+                        selected: index == *selected,
+                        ..self.runtime_row(index)
+                    })
+                    .collect(),
+                slider: None,
+                hint: "↑↓ navigate  ·  Enter switch  ·  Space connect/disconnect  ·  Esc close"
+                    .to_owned(),
+                style: OverlayStyle::Picker,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            }),
             PendingInteraction::SettingPicker { setting, selected } => Some(OverlayView {
                 closable: true,
                 title: setting.title().to_owned(),
@@ -6571,6 +6981,45 @@ impl AppState {
                 input_label: "",
                 input_placeholder: "",
             }),
+            PendingInteraction::SubagentTranscript { id, offset } => {
+                let log = self.subagent_logs.get(id);
+                let running = self.subagents.iter().find(|running| &running.id == id);
+                let mut lines = log
+                    .into_iter()
+                    .flatten()
+                    .skip(*offset)
+                    .take(PICKER_ROWS)
+                    .map(|line| OverlayLine {
+                        text: line.text.clone(),
+                        selected: false,
+                        muted: line.muted,
+                    })
+                    .collect::<Vec<_>>();
+                if lines.is_empty() {
+                    lines.push(OverlayLine {
+                        text: "아직 기록된 작업이 없습니다.".to_owned(),
+                        selected: false,
+                        muted: true,
+                    });
+                }
+                Some(OverlayView {
+                    closable: true,
+                    title: match running {
+                        Some(running) if running.description.is_empty() => running.name.clone(),
+                        Some(running) => format!("{} · {}", running.name, running.description),
+                        // The row is gone once the subagent finishes, but the
+                        // record it left behind stays readable.
+                        None => "Subagent · 완료됨".to_owned(),
+                    },
+                    lines,
+                    slider: None,
+                    hint: "↑↓ scroll  ·  Esc to return".to_owned(),
+                    style: OverlayStyle::Panel,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                })
+            }
             PendingInteraction::VibeModePicker { row, .. } => Some(OverlayView {
                 closable: true,
                 title: "Vibe".to_owned(),
@@ -7355,6 +7804,19 @@ impl AppState {
         if let Some(notice) = self.live_activity_notice() {
             return Some(notice.to_owned());
         }
+        // Compaction outranks the ordinary turn label: the runtime that runs it as
+        // a turn would otherwise report a `Working` response the user never asked for.
+        if let Some(started) = self.compacting_started_at {
+            if self.turn_interrupted {
+                return Some("X Interrupted".to_owned());
+            }
+            let elapsed = started.elapsed();
+            return Some(format!(
+                "Compacting.. {}% ({})",
+                compaction_percent(elapsed),
+                format_elapsed(elapsed.as_secs())
+            ));
+        }
         if self.busy {
             let elapsed = self
                 .turn_started_at
@@ -7372,6 +7834,20 @@ impl AppState {
             .map(|duration| format!("Completed ({})", format_elapsed(duration.as_secs())))
     }
 
+    /// `/compact` was accepted by the runtime: run the activity spinner until the
+    /// compacted boundary arrives (or the turn that carries it ends).
+    pub fn begin_compaction(&mut self) {
+        self.compacting_started_at = Some(Instant::now());
+    }
+
+    pub fn end_compaction(&mut self) {
+        self.compacting_started_at = None;
+    }
+
+    pub fn compacting(&self) -> bool {
+        self.compacting_started_at.is_some()
+    }
+
     fn live_activity_notice(&self) -> Option<&str> {
         self.activity_notice
             .as_ref()
@@ -7381,7 +7857,7 @@ impl AppState {
 
     fn activity_model(&self) -> Option<String> {
         if self.live_activity_notice().is_some()
-            || (!self.busy && self.last_completed_duration.is_none())
+            || (!self.busy && !self.compacting() && self.last_completed_duration.is_none())
         {
             return None;
         }
@@ -7395,7 +7871,7 @@ impl AppState {
     /// the wall clock rather than counted in ticks so the glide keeps its pace no
     /// matter how often a frame happens to be painted.
     fn activity_phase(&self) -> f32 {
-        let Some(started) = self.turn_started_at else {
+        let Some(started) = self.compacting_started_at.or(self.turn_started_at) else {
             return 0.0;
         };
         let position = started.elapsed().as_millis() % SHIMMER_PERIOD.as_millis();
@@ -7734,6 +8210,11 @@ impl AppState {
                     }
                 }
             }
+            // A click picks the runtime; the connection switch stays on Space, so
+            // a mis-aimed click never drops a provider.
+            Some(PendingInteraction::RuntimePicker { .. }) if row < RUNTIME_CHOICES.len() => {
+                self.apply_runtime_choice(row)
+            }
             Some(PendingInteraction::StatusLinePicker { .. })
                 if row < StatusLineField::ALL.len() =>
             {
@@ -7863,6 +8344,24 @@ impl AppState {
     /// The `✕` on a panel the user opened themselves: closes it, exactly as Esc
     /// does. Only the panels that paint the mark can be shut this way, so a prompt
     /// the server is waiting on stays put whatever is clicked.
+    /// Opens the transcript panel for the subagent shown on the clicked row. The
+    /// panel starts at the newest lines, which is where the work is.
+    pub fn open_subagent(&mut self, index: usize) -> Action {
+        let Some(id) = self.subagents.get(index).map(|running| running.id.clone()) else {
+            return Action::None;
+        };
+        let offset = self.subagent_log_max_offset(&id);
+        self.pending = Some(PendingInteraction::SubagentTranscript { id, offset });
+        Action::Tick(true)
+    }
+
+    fn subagent_log_max_offset(&self, id: &str) -> usize {
+        self.subagent_logs
+            .get(id)
+            .map(|log| log.len().saturating_sub(PICKER_ROWS))
+            .unwrap_or(0)
+    }
+
     pub fn close_overlay(&mut self) -> Action {
         match self.pending.take() {
             Some(pending) if closable_overlay(&pending) => Action::None,
@@ -9303,6 +9802,16 @@ fn format_elapsed(seconds: u64) -> String {
     }
 }
 
+/// How quickly the compaction bar fills, in seconds. Compaction reports no
+/// progress of its own, so the reading eases off the clock: fast at first, then
+/// slower, and it stops short of full because only the boundary means done.
+const COMPACTION_PACE_SECONDS: f32 = 8.5;
+
+fn compaction_percent(elapsed: Duration) -> u8 {
+    let progress = 1.0 - (-elapsed.as_secs_f32() / COMPACTION_PACE_SECONDS).exp();
+    (progress * 100.0).round().clamp(0.0, 99.0) as u8
+}
+
 fn format_duration(duration_ms: u64) -> String {
     if duration_ms < 1_000 {
         format!("{duration_ms}ms")
@@ -9614,6 +10123,22 @@ fn read_diff_display_mode() -> DiffDisplayMode {
     read_vibe_config_value("diff_display_mode")
         .and_then(|value| DiffDisplayMode::from_config_value(&value))
         .unwrap_or_default()
+}
+
+/// Whether dvz may dial the Codex app-server. Unset means no: a runtime is
+/// connected only once the user has chosen it in `/provider`.
+pub(crate) fn codex_provider_enabled() -> bool {
+    provider_connected(CODEX_PROVIDER_KEY)
+}
+
+pub(crate) fn claude_provider_enabled() -> bool {
+    provider_connected(CLAUDE_PROVIDER_KEY)
+}
+
+fn provider_connected(key: &str) -> bool {
+    read_vibe_config_value(key)
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(false)
 }
 
 fn read_status_line_settings() -> StatusLineSettings {
@@ -10745,6 +11270,139 @@ mod tests {
             bash.children()[0].title,
             "Shell · cargo test · exit 101 · 2.0s"
         );
+    }
+
+    #[test]
+    fn running_subagents_reach_the_view_and_clear_when_the_turn_ends() {
+        let mut state = test_state();
+
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({
+                "subagents": [{
+                    "id": "toolu_1",
+                    "name": "Explore",
+                    "description": "Find auth code",
+                    "tool": "Grep(fn login)",
+                }],
+            }),
+        );
+        let running = state.view().subagents;
+
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].name, "Explore");
+        assert_eq!(running[0].tool, "Grep(fn login)");
+
+        state.handle_notification("turn/completed", &json!({}));
+
+        assert!(state.view().subagents.is_empty());
+    }
+
+    #[test]
+    fn a_subagent_that_keeps_running_keeps_its_start_instant() {
+        let mut state = test_state();
+        let update = |tool: &str| {
+            json!({
+                "subagents": [{ "id": "toolu_1", "name": "Explore", "description": "", "tool": tool }],
+            })
+        };
+
+        state.handle_notification("turn/subagents/updated", &update("Grep"));
+        let started = state.subagents[0].started_at;
+        state.handle_notification("turn/subagents/updated", &update("Read"));
+
+        assert_eq!(state.subagents[0].started_at, started);
+        assert_eq!(state.subagents[0].tool, "Read");
+    }
+
+    fn state_with_a_running_subagent() -> AppState {
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({
+                "subagents": [{
+                    "id": "toolu_1",
+                    "name": "Explore",
+                    "description": "Find auth code",
+                    "tool": "Grep(fn login)",
+                }],
+            }),
+        );
+        state
+    }
+
+    fn subagent_line_notification(kind: &str, text: &str) -> Value {
+        json!({
+            "parentToolUseId": "toolu_1",
+            "line": { "kind": kind, "text": text },
+        })
+    }
+
+    #[test]
+    fn subagent_lines_are_recorded_with_a_marker_for_each_kind() {
+        let mut state = state_with_a_running_subagent();
+
+        state.handle_notification(
+            "turn/subagent/line",
+            &subagent_line_notification("text", "auth 코드를 찾는 중"),
+        );
+        state.handle_notification(
+            "turn/subagent/line",
+            &subagent_line_notification("tool", "Grep(fn login)"),
+        );
+        state.handle_notification("turn/subagent/line", &subagent_line_notification("result", "3 matches"));
+        state.handle_notification("turn/subagent/line", &subagent_line_notification("text", "   "));
+
+        let log = &state.subagent_logs["toolu_1"];
+        assert_eq!(
+            log.iter().map(|line| line.text.as_str()).collect::<Vec<_>>(),
+            ["auth 코드를 찾는 중", "⏺ Grep(fn login)", "  ⎿ 3 matches"],
+            "a blank line carries nothing and is left out"
+        );
+        assert_eq!(
+            log.iter().map(|line| line.muted).collect::<Vec<_>>(),
+            [false, true, true]
+        );
+    }
+
+    #[test]
+    fn clicking_a_subagent_row_opens_its_transcript_and_esc_returns_to_main() {
+        let mut state = state_with_a_running_subagent();
+        state.handle_notification("turn/subagent/line", &subagent_line_notification("text", "찾는 중"));
+
+        state.open_subagent(0);
+        let overlay = state.overlay_view().expect("subagent panel");
+
+        assert_eq!(overlay.title, "Explore · Find auth code");
+        assert_eq!(
+            overlay.lines.iter().map(|line| line.text.as_str()).collect::<Vec<_>>(),
+            ["찾는 중"]
+        );
+        assert!(overlay.closable);
+
+        state.close_overlay();
+
+        assert!(state.overlay_view().is_none());
+    }
+
+    #[test]
+    fn a_subagent_panel_closes_itself_when_the_turn_ends() {
+        let mut state = state_with_a_running_subagent();
+        state.open_subagent(0);
+
+        state.handle_notification("turn/completed", &json!({}));
+
+        assert!(state.overlay_view().is_none());
+        assert!(state.subagent_logs.is_empty());
+    }
+
+    #[test]
+    fn clicking_a_row_that_is_already_gone_opens_nothing() {
+        let mut state = test_state();
+
+        state.open_subagent(0);
+
+        assert!(state.overlay_view().is_none());
     }
 
     #[test]
@@ -12271,6 +12929,42 @@ mod tests {
         );
     }
 
+    /// `/compact` has no assistant output of its own, so the activity row is the
+    /// only place the wait is visible: it spins until the boundary arrives.
+    #[test]
+    fn compaction_runs_the_activity_spinner_until_the_boundary() {
+        let mut state = test_state();
+
+        state.begin_compaction();
+        state.compacting_started_at = Some(Instant::now() - Duration::from_secs(4));
+
+        assert_eq!(state.activity().as_deref(), Some("Compacting.. 38% (4s)"));
+        assert!(state.render_tick().redraw, "the spinner keeps animating");
+        assert!(state.host_turn_busy(), "the host tab spins too");
+
+        state.handle_notification("thread/compacted", &json!({}));
+
+        assert!(!state.compacting());
+        assert_eq!(state.activity(), None);
+    }
+
+    /// A compaction that runs as a turn must not fall back to the `Working` label
+    /// when the boundary never arrives — the turn ending still clears it.
+    #[test]
+    fn a_completed_turn_clears_a_compaction_that_never_reported_its_boundary() {
+        let mut state = test_state();
+        state.begin_compaction();
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
+
+        assert!(state
+            .activity()
+            .is_some_and(|activity| activity.starts_with("Compacting..")));
+
+        state.handle_notification("turn/completed", &json!({}));
+
+        assert!(!state.compacting());
+    }
+
     #[test]
     fn activity_shows_only_the_elapsed_turn_time() {
         let mut state = test_state();
@@ -12478,7 +13172,7 @@ mod tests {
         state.busy = true;
         state.turn_id = Some("codex-turn".to_owned());
         state.active_turn_model = Some("gpt-5.6-sol".to_owned());
-        state.run_slash_command("/claude");
+        state.run_slash_command("/provider claude");
         state.editor.set_text("Claude로 이어서 처리해");
 
         let action = state.handle_key(KeyEvent::from(KeyCode::Enter));
@@ -13705,11 +14399,15 @@ mod tests {
             "gpt-5.6-sol",
             Some("high"),
         );
+        // Both runtimes already picked on this machine, so the commands are plain
+        // switches rather than first-time connections.
+        state.claude_provider_enabled = true;
+        state.codex_provider_enabled = true;
 
         state.run_slash_command("/model sonnet");
         assert_eq!(state.selected_model_name(), "gpt-5.6-sol");
 
-        state.run_slash_command("/claude");
+        state.run_slash_command("/provider claude");
         assert_eq!(state.selected_model_name(), "claude:sonnet");
         assert_eq!(
             state.committed.last().map(|block| block.title.as_str()),
@@ -13731,7 +14429,7 @@ mod tests {
         assert_eq!(state.selected_model_name(), "claude:haiku");
 
         assert!(matches!(
-            state.run_slash_command("/codex"),
+            state.run_slash_command("/provider codex"),
             Action::ActivateCodex
         ));
         assert_eq!(state.selected_model_name(), "claude:haiku");
@@ -13746,6 +14444,196 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(model_lines.len(), 2);
         assert!(model_lines.iter().all(|line| line.text.contains("GPT")));
+    }
+
+    #[test]
+    fn provider_picker_switches_between_claude_and_codex() {
+        let mut state = provider_picker_state();
+
+        state.run_slash_command("/provider");
+        let overlay = state.overlay_view().expect("provider picker");
+        let rows = overlay
+            .lines
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(rows, ["☑ Claude  ·  사용 중", "☑ Codex  ·  연결됨"]);
+        assert!(overlay.lines[0].selected);
+
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        assert!(state.overlay_view().expect("picker").lines[1].selected);
+
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::ActivateCodex
+        ));
+        assert!(state.pending.is_none());
+        assert_eq!(state.selected_model_name(), "claude:sonnet");
+
+        // Esc leaves the provider untouched, and a click on a row picks the
+        // runtime the same way Enter does.
+        state.run_slash_command("/provider");
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(state.pending.is_none());
+
+        state.switch_to_codex();
+        state.run_slash_command("/provider");
+        assert!(state.overlay_view().expect("picker").lines[1].selected);
+        assert!(matches!(state.click_overlay_row(0), Action::None));
+        assert_eq!(state.selected_model_name(), "claude:sonnet");
+    }
+
+    /// The company-PC case: Codex is switched off, so nothing in the picker,
+    /// the command, or a later launch dials the app-server.
+    #[test]
+    fn switching_the_codex_connection_off_blocks_every_route_into_it() {
+        let mut state = provider_picker_state();
+        state.run_slash_command("/provider");
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Char(' '))),
+            Action::PersistProviderConnection {
+                key_path: CODEX_PROVIDER_KEY,
+                connected: false,
+                activate_codex: false,
+            }
+        ));
+        let overlay = state.overlay_view().expect("picker stays open");
+        assert_eq!(overlay.lines[1].text, "☐ Codex  ·  연결 안 함");
+        assert!(overlay.lines[1].muted);
+        state.pending = None;
+
+        // The command reconnects rather than failing: choosing Codex is what
+        // connects it, and only then does the app-server get started.
+        assert!(matches!(
+            state.run_slash_command("/provider codex"),
+            Action::PersistProviderConnection {
+                key_path: CODEX_PROVIDER_KEY,
+                connected: true,
+                activate_codex: true,
+            }
+        ));
+        assert_eq!(state.selected_model_name(), "claude:sonnet");
+
+        // Already connected, so the next pick is a plain switch.
+        state.run_slash_command("/provider");
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::ActivateCodex
+        ));
+    }
+
+    /// A fresh install has no default: both rows are off, the first prompt opens
+    /// the picker instead of guessing, and the typed text survives the detour.
+    #[test]
+    fn a_machine_with_no_connection_asks_before_it_sends_anything() {
+        let mut state = provider_picker_state();
+        state.claude_provider_enabled = false;
+        state.codex_provider_enabled = false;
+
+        state.prompt_for_provider_if_unconnected();
+        assert!(state.provider_choice_pending);
+        let overlay = state.overlay_view().expect("provider picker");
+        let rows = overlay
+            .lines
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(rows, ["☐ Claude  ·  연결 안 함", "☐ Codex  ·  연결 안 함"]);
+        state.pending = None;
+
+        state.editor.set_text("첫 질문");
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::None
+        ));
+        assert_eq!(state.editor.text(), "첫 질문");
+        assert!(state.overlay_view().is_some());
+
+        // Enter on the Claude row connects it and switches in one keystroke.
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::PersistProviderConnection {
+                key_path: CLAUDE_PROVIDER_KEY,
+                connected: true,
+                activate_codex: false,
+            }
+        ));
+        assert!(state.any_provider_connected());
+        assert_eq!(state.selected_model_name(), "claude:sonnet");
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::Submit(text) if text == "첫 질문"
+        ));
+    }
+
+    /// Dropping the runtime in use hands the session to whatever is still
+    /// connected, in either direction.
+    #[test]
+    fn disconnecting_the_live_runtime_hands_the_session_to_the_other_one() {
+        let mut state = provider_picker_state();
+        state.switch_to_codex();
+        assert_eq!(state.selected_model_name(), "gpt-5.6-sol");
+
+        state.run_slash_command("/provider");
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Char(' '))),
+            Action::PersistProviderConnection {
+                key_path: CODEX_PROVIDER_KEY,
+                connected: false,
+                activate_codex: false,
+            }
+        ));
+        assert_eq!(state.selected_model_name(), "claude:sonnet");
+        assert!(!state.provider_choice_pending);
+        state.pending = None;
+
+        // The other direction: Claude is live, Codex is back, so dropping Claude
+        // starts Codex rather than leaving the session with nothing.
+        state.codex_provider_enabled = true;
+        state.run_slash_command("/provider");
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Char(' '))),
+            Action::PersistProviderConnection {
+                key_path: CLAUDE_PROVIDER_KEY,
+                connected: false,
+                activate_codex: true,
+            }
+        ));
+
+        // Dropping the last one leaves the session waiting for a pick again.
+        state.pending = None;
+        state.claude_provider_enabled = true;
+        state.run_slash_command("/provider");
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        state.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        state.handle_key(KeyEvent::from(KeyCode::Up));
+        state.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(!state.any_provider_connected());
+        assert!(state.provider_choice_pending);
+    }
+
+    /// Built on the real constructor, then pinned to both runtimes connected so
+    /// the developer's own saved settings cannot decide the test.
+    fn provider_picker_state() -> AppState {
+        let models = vec![
+            test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
+            test_model("claude:sonnet", "Claude Sonnet", false),
+        ];
+        let mut state = AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            models,
+            "claude:sonnet",
+            Some("high"),
+        );
+        state.claude_provider_enabled = true;
+        state.codex_provider_enabled = true;
+        state
     }
 
     #[test]

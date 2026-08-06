@@ -242,10 +242,10 @@ pub enum OverlayStyle {
     Panel,
     CompactPanel,
     Picker,
-    /// A question the server is waiting on: no box, a badge for the header, a
-    /// bold prompt, and numbered options. The first row is the prompt and the
-    /// last is the row that hands the turn back to the composer, which is why
-    /// the rule above it is the renderer's to draw.
+    /// A question the server is waiting on: a picker-style box with a bold
+    /// prompt and numbered options. The first row is the prompt and the last is
+    /// the row that hands the turn back to the composer, which is why the rule
+    /// above it is the renderer's to draw.
     Question,
 }
 
@@ -350,6 +350,17 @@ pub struct PlanSummary {
     pub elapsed: Option<Duration>,
 }
 
+/// One provider subagent that is still running under the active turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubagentView {
+    /// The parent `Task` tool-use id: what the transcript panel is keyed on.
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub tool: String,
+    pub elapsed: Duration,
+}
+
 pub struct View<'a> {
     pub live_blocks: Vec<LiveBlockView<'a>>,
     pub overlay: Option<OverlayView<'a>>,
@@ -362,6 +373,8 @@ pub struct View<'a> {
     pub editor: &'a Editor,
     pub composer_images: &'a [String],
     pub queued_prompts: Vec<String>,
+    /// Subagents shown under the composer while the turn runs them.
+    pub subagents: Vec<SubagentView>,
     pub composer_placeholder: &'a str,
     pub welcome: Option<WelcomeView>,
     pub suggestions: Vec<SuggestionView>,
@@ -1173,6 +1186,7 @@ impl Renderer {
                 view.editor,
                 view.composer_images,
                 &view.queued_prompts,
+                &view.subagents,
                 view.composer_placeholder,
                 view.welcome,
                 &view.suggestions,
@@ -2361,8 +2375,6 @@ enum Tone {
     PlanDone,
     Accent,
     User,
-    /// A question's header, worn as a filled badge rather than a box rule.
-    QuestionBadge,
     /// A centred transcript control: default text on a compact button band.
     ScrollToBottom,
     #[allow(dead_code)]
@@ -2473,6 +2485,8 @@ pub enum Pick {
     Model,
     /// The status line's effort reading: opens `/effort`.
     EffortSetting,
+    /// A running-subagent row under the composer: opens its transcript panel.
+    Subagent(usize),
     /// The fullscreen transcript control that returns to its newest row.
     ScrollToBottom,
     /// The `✕` on a panel's top rule: closes what Esc closes.
@@ -2658,6 +2672,48 @@ fn shimmer_spans_with_band(label: &str, phase: f32, base: Rgb, band: f32) -> Vec
 /// Gajae-Code's Unicode activity loader frames.
 const WORKING_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Activity labels that carry the loader glyph and the shimmer sweep.
+const SPINNING_ACTIVITY_LABELS: [&str; 2] = ["Working..", "Compacting.."];
+
+/// The loader glyph plus the space after it.
+const WORKING_SPINNER_COLUMNS: usize = 2;
+/// The label whose activity row also carries a progress bar.
+const COMPACTING_LABEL: &str = "Compacting..";
+/// How wide the bar is drawn when the terminal has the room for it.
+const PROGRESS_TRACK_COLUMNS: usize = 20;
+/// Below this the bar reads as a handful of blocks rather than a track, so the
+/// row keeps the percentage alone instead.
+const PROGRESS_TRACK_MINIMUM: usize = 8;
+
+/// `Compacting.. 38% (4s)` splits into the bar's reading and the tail that
+/// follows it. The percentage is produced by the session, which owns the clock.
+fn split_progress_reading(trailer: &str) -> Option<(u8, &str)> {
+    let trailer = trailer.strip_prefix(' ')?;
+    let (reading, rest) = trailer.split_once('%')?;
+    Some((reading.parse().ok()?, rest))
+}
+
+/// A filled track: solid blocks up to the reading, light blocks after it.
+fn progress_bar_spans(percent: u8, track: usize, tone: Tone) -> Vec<PaintSpan> {
+    let filled = (track * usize::from(percent.min(100)) + 50) / 100;
+    let mut spans = Vec::new();
+    if filled > 0 {
+        spans.push(PaintSpan {
+            text: "█".repeat(filled),
+            tone,
+            bold: false,
+        });
+    }
+    if filled < track {
+        spans.push(PaintSpan {
+            text: "░".repeat(track - filled),
+            tone: Tone::Muted,
+            bold: false,
+        });
+    }
+    spans
+}
+
 fn activity_lines(
     activity: &str,
     activity_model: Option<&str>,
@@ -2668,7 +2724,12 @@ fn activity_lines(
     if UnicodeWidthStr::width(activity) > width.saturating_sub(2) as usize {
         return wrapped_line(" ", tone, activity, tone, false, width);
     }
-    if let Some(trailer) = activity.strip_prefix("Working..") {
+    // `/compact` wears the same loader as a turn: it is a wait the user started
+    // and cannot see progress on any other way.
+    if let Some((label, trailer)) = SPINNING_ACTIVITY_LABELS
+        .iter()
+        .find_map(|label| activity.strip_prefix(label).map(|trailer| (*label, trailer)))
+    {
         let shimmer_base = tone_rgb(tone).unwrap_or(theme::palette().foreground);
         let mut tail = vec![PaintSpan {
             text: format!(
@@ -2678,12 +2739,38 @@ fn activity_lines(
             tone,
             bold: false,
         }];
-        tail.extend(shimmer_spans("Working..", phase, shimmer_base));
-        tail.push(PaintSpan {
-            text: trailer.to_owned(),
-            tone,
-            bold: false,
-        });
+        tail.extend(shimmer_spans(label, phase, shimmer_base));
+        // Compaction is the one wait with a reading to show, so its row spends the
+        // spare columns on a bar. A narrow terminal keeps the reading alone.
+        match split_progress_reading(trailer).filter(|_| label == COMPACTING_LABEL) {
+            Some((percent, rest)) => {
+                let reading = format!("  {percent}%{rest}");
+                let spent = 1 + WORKING_SPINNER_COLUMNS
+                    + UnicodeWidthStr::width(label)
+                    + UnicodeWidthStr::width(reading.as_str());
+                let track = usize::from(width)
+                    .saturating_sub(spent + 2)
+                    .min(PROGRESS_TRACK_COLUMNS);
+                if track >= PROGRESS_TRACK_MINIMUM {
+                    tail.push(PaintSpan {
+                        text: " ".to_owned(),
+                        tone,
+                        bold: false,
+                    });
+                    tail.extend(progress_bar_spans(percent, track, tone));
+                }
+                tail.push(PaintSpan {
+                    text: reading,
+                    tone,
+                    bold: false,
+                });
+            }
+            None => tail.push(PaintSpan {
+                text: trailer.to_owned(),
+                tone,
+                bold: false,
+            }),
+        }
         return vec![PaintLine {
             prefix: " ".to_owned(),
             prefix_tone: tone,
@@ -2770,6 +2857,82 @@ fn queue_preview_line(prompt: &str, index: usize, width: u16) -> PaintLine {
     }
     .with_picks(&[(0, Pick::RemoveQueuedPrompt(index))])
 }
+
+/// Running subagents are listed under the composer, one row each, so a fan-out
+/// stays visible without pushing the transcript around. Rows disappear as each
+/// subagent finishes, and the turn's completion clears whatever is left.
+fn subagent_lines(subagents: &[SubagentView], width: u16) -> Vec<PaintLine> {
+    subagents
+        .iter()
+        .enumerate()
+        .map(|(index, subagent)| subagent_line(subagent, index, width))
+        .collect()
+}
+
+fn subagent_line(subagent: &SubagentView, index: usize, width: u16) -> PaintLine {
+    let mut detail = String::new();
+    if !subagent.description.is_empty() {
+        detail.push_str(&subagent.description);
+    }
+    if !subagent.tool.is_empty() {
+        if !detail.is_empty() {
+            detail.push_str(" · ");
+        }
+        detail.push_str(&subagent.tool);
+    }
+    let elapsed = format!(" · {}s", subagent.elapsed.as_secs());
+    // The gutter, glyph, name, and elapsed reading are fixed, so only the middle
+    // detail is compacted when the terminal cannot hold the whole row.
+    let reserved = 1
+        + UnicodeWidthStr::width(SUBAGENT_GLYPH)
+        + 1
+        + UnicodeWidthStr::width(subagent.name.as_str())
+        + UnicodeWidthStr::width(elapsed.as_str());
+    let available = usize::from(width).saturating_sub(reserved + 1);
+    let text = if detail.is_empty() || available == 0 {
+        String::new()
+    } else {
+        format!(" {}", compact_right(&detail, available))
+    };
+
+    PaintLine {
+        prefix: " ".to_owned(),
+        prefix_tone: Tone::Muted,
+        text: SUBAGENT_GLYPH.to_owned(),
+        tone: Tone::Accent,
+        bold: false,
+        tool_heading: None,
+        pick: None,
+        tail: vec![
+            PaintSpan {
+                text: format!(" {}", subagent.name),
+                tone: Tone::Plain,
+                bold: false,
+            },
+            PaintSpan {
+                text,
+                tone: Tone::Muted,
+                bold: false,
+            },
+            PaintSpan {
+                text: elapsed,
+                tone: Tone::Muted,
+                bold: false,
+            },
+        ],
+    }
+    // The bullet, the agent name, and its detail all open the same panel; the
+    // elapsed reading is left alone so the row's right edge stays quiet.
+    .with_picks(&[
+        (0, Pick::Subagent(index)),
+        (1, Pick::Subagent(index)),
+        (2, Pick::Subagent(index)),
+    ])
+}
+
+/// Matches the transcript's running-tool bullet so the composer rows read as the
+/// same kind of activity.
+const SUBAGENT_GLYPH: &str = "⏺";
 
 fn queue_preview_lines(prompts: &[String], width: u16) -> Vec<PaintLine> {
     prompts
@@ -3104,6 +3267,7 @@ fn normal_frame(
         editor,
         &[],
         &[],
+        &[],
         "",
         welcome,
         suggestions,
@@ -3121,6 +3285,7 @@ fn normal_frame_with_expansion(
     editor: &Editor,
     composer_images: &[String],
     queued_prompts: &[String],
+    subagents: &[SubagentView],
     composer_placeholder: &str,
     welcome: Option<WelcomeView>,
     suggestions: &[SuggestionView],
@@ -3210,6 +3375,7 @@ fn normal_frame_with_expansion(
     let composer_index = lines.len();
     let cursor_line = composer_index + input_cursor_line;
     lines.extend(input_lines);
+    lines.extend(subagent_lines(subagents, width));
     if status.fallback != HIDDEN_STATUS_LINE {
         lines.push(status_line_row(status.line, &status.fallback, width));
     }
@@ -3440,36 +3606,21 @@ fn column_cell(row: Option<&PanelRow>, width: usize) -> PanelRow {
     (format!("{text}{}", " ".repeat(padding)), tone, bold)
 }
 
-/// The margin a boxless question keeps, so its rows sit where a panel's own
-/// text would have sat rather than hard against the terminal edge.
-const QUESTION_INDENT: &str = " ";
-
-/// The header of a question, worn as a filled badge. The padding is inside the
-/// span so the colour runs a cell past the label on either side.
-fn question_badge_row(title: &str) -> PaintLine {
-    PaintLine {
-        prefix: QUESTION_INDENT.to_owned(),
-        prefix_tone: Tone::Plain,
-        text: format!(" □ {title} "),
-        tone: Tone::QuestionBadge,
-        bold: true,
-        tool_heading: None,
-        pick: None,
-        tail: Vec::new(),
-    }
-}
-
 /// The rule that separates the answers from the row that walks away from them.
-fn question_rule_row(span: usize) -> PaintLine {
+fn question_rule_row(panel_width: usize) -> PaintLine {
     PaintLine {
-        prefix: QUESTION_INDENT.to_owned(),
+        prefix: "├".to_owned(),
         prefix_tone: Tone::Border,
-        text: "─".repeat(span.saturating_sub(QUESTION_INDENT.len())),
+        text: "─".repeat(panel_width.saturating_sub(2)),
         tone: Tone::Border,
         bold: false,
         tool_heading: None,
         pick: None,
-        tail: Vec::new(),
+        tail: vec![PaintSpan {
+            text: "┤".to_owned(),
+            tone: Tone::Border,
+            bold: false,
+        }],
     }
 }
 
@@ -4203,52 +4354,58 @@ fn overlay_frame_with_expansion(
             lines.push(panel_rule_row("╰─ ", &overlay.hint, '╯', panel_width));
         }
         OverlayStyle::Question => {
-            let span = panel_span(width);
-            lines.push(question_badge_row(&overlay.title));
-            lines.push(PaintLine::blank());
+            let panel_width = panel_span(width);
+            let wrap_width = panel_width.saturating_sub(1).min(u16::MAX as usize) as u16;
+            lines.push(panel_title_row(
+                &overlay.title,
+                panel_width,
+                overlay.closable,
+            ));
+            lines.push(panel_padding_row(panel_width));
 
             let mut rows = overlay.lines.iter().enumerate();
             if let Some((_, prompt)) = rows.next() {
                 lines.extend(
                     wrapped_line_with_continuation(
-                        QUESTION_INDENT,
-                        QUESTION_INDENT,
-                        Tone::Plain,
+                        "│   ",
+                        "│   ",
+                        Tone::Border,
                         &prompt.text,
                         Tone::Plain,
                         true,
-                        span.min(u16::MAX as usize) as u16,
+                        wrap_width,
                     )
                     .into_iter()
                     .map(|mut line| {
                         line.bold = true;
-                        line
+                        close_panel_row(line, panel_width)
                     }),
                 );
-                lines.push(PaintLine::blank());
+                lines.push(panel_padding_row(panel_width));
             }
 
             // Options are numbered from one, and the number column is as wide as
             // the last number so every label starts on the same column.
             let option_count = overlay.lines.len().saturating_sub(1);
             let number_width = option_count.max(1).to_string().len();
-            let label_column = QUESTION_INDENT.len() + 2 + number_width + 2;
+            let label_column = 6 + number_width;
+            let continuation = format!("│{}", " ".repeat(label_column.saturating_sub(1)));
             let last = overlay.lines.len().saturating_sub(1);
             for (row_index, row) in rows {
                 // The final row leaves the question rather than answering it, so
                 // a rule sets it apart from the answers above.
                 if row_index == last && option_count > 1 {
-                    lines.push(question_rule_row(span));
+                    lines.push(question_rule_row(panel_width));
                 }
                 let number = row_index;
                 for (part_index, part) in row.text.lines().enumerate() {
                     let prefix = if part_index == 0 {
                         format!(
-                            "{QUESTION_INDENT}{} {number:>number_width$}. ",
+                            "│ {} {number:>number_width$}. ",
                             if row.selected { "❯" } else { " " }
                         )
                     } else {
-                        " ".repeat(label_column)
+                        continuation.clone()
                     };
                     let tone = if part_index > 0 || row.muted {
                         Tone::Muted
@@ -4260,29 +4417,23 @@ fn overlay_frame_with_expansion(
                     lines.extend(
                         wrapped_line_with_continuation(
                             &prefix,
-                            &" ".repeat(label_column),
+                            &continuation,
                             if row.selected { Tone::Accent } else { Tone::Muted },
                             part,
                             tone,
                             part_index == 0 && !row.muted,
-                            span.min(u16::MAX as usize) as u16,
+                            wrap_width,
                         )
                         .into_iter()
-                        .map(|line| line.with_picks(&[(0, Pick::Row(row_index))])),
+                        .map(|line| {
+                            close_panel_row(line, panel_width)
+                                .with_picks(&[(0, Pick::Row(row_index))])
+                        }),
                     );
                 }
             }
-            lines.push(PaintLine::blank());
-            lines.push(PaintLine {
-                prefix: QUESTION_INDENT.to_owned(),
-                prefix_tone: Tone::Muted,
-                text: compact_right(&overlay.hint, span.saturating_sub(QUESTION_INDENT.len())),
-                tone: Tone::Muted,
-                bold: false,
-                tool_heading: None,
-                pick: None,
-                tail: Vec::new(),
-            });
+            lines.push(panel_padding_row(panel_width));
+            lines.push(panel_rule_row("╰─ ", &overlay.hint, '╯', panel_width));
         }
     }
     let mut cursor_line = lines.len() - 1;
@@ -7573,7 +7724,6 @@ fn word_background(tone: Tone) -> Option<Rgb> {
         Tone::DiffAddedWord => palette.diff_add_word_bg,
         Tone::DiffRemovedWord => palette.diff_remove_word_bg,
         Tone::ScrollToBottom => palette.hover_bg,
-        Tone::QuestionBadge => palette.accent,
         Tone::StatusModel56 => blend(palette.background, palette.model_gpt56, 46),
         Tone::StatusModelSol => blend(palette.background, palette.model_sol, 46),
         Tone::StatusModelTerra => blend(palette.background, palette.model_terra, 46),
@@ -7888,8 +8038,6 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::Accent => palette.accent,
         Tone::User => palette.blue,
         Tone::ScrollToBottom => palette.foreground,
-        // The badge paints its own field, so the label reads as the hole in it.
-        Tone::QuestionBadge => palette.background,
         Tone::Success => palette.success,
         Tone::Warning => palette.warning,
         Tone::Error => palette.error,
@@ -10356,6 +10504,95 @@ mod tests {
         assert_eq!(pick_on(&lines[3], "X"), Some(Pick::RemoveQueuedPrompt(3)));
     }
 
+    fn test_subagent(name: &str, description: &str, tool: &str, secs: u64) -> SubagentView {
+        SubagentView {
+            id: format!("toolu_{name}"),
+            name: name.to_owned(),
+            description: description.to_owned(),
+            tool: tool.to_owned(),
+            elapsed: Duration::from_secs(secs),
+        }
+    }
+
+    #[test]
+    fn running_subagents_are_one_row_each_with_the_current_tool() {
+        let subagents = [
+            test_subagent("Explore", "Find auth code", "Grep(fn login)", 12),
+            test_subagent("developer", "Fix the parser", "", 3),
+        ];
+
+        assert_eq!(
+            subagent_lines(&subagents, 80)
+                .iter()
+                .map(painted)
+                .collect::<Vec<_>>(),
+            [
+                " ⏺ Explore Find auth code · Grep(fn login) · 12s",
+                " ⏺ developer Fix the parser · 3s",
+            ]
+        );
+    }
+
+    #[test]
+    fn subagent_row_truncates_only_the_middle_detail() {
+        let subagent = test_subagent("Explore", "a very long subagent description", "", 7);
+
+        let line = subagent_line(&subagent, 0, 30);
+
+        assert_eq!(painted(&line), " ⏺ Explore a very long s… · 7s");
+        assert!(painted_line_width(&line) <= 30);
+    }
+
+    #[test]
+    fn a_subagent_row_opens_its_own_panel_but_its_elapsed_reading_does_not() {
+        let lines = subagent_lines(
+            &[
+                test_subagent("Explore", "Find auth code", "", 4),
+                test_subagent("developer", "Fix the parser", "", 1),
+            ],
+            80,
+        );
+
+        assert_eq!(pick_on(&lines[0], "⏺"), Some(Pick::Subagent(0)));
+        assert_eq!(pick_on(&lines[0], "Explore"), Some(Pick::Subagent(0)));
+        assert_eq!(pick_on(&lines[1], "developer"), Some(Pick::Subagent(1)));
+        assert_eq!(pick_on(&lines[0], "4s"), None);
+    }
+
+    #[test]
+    fn running_subagents_sit_between_the_composer_and_the_status_line() {
+        let editor = Editor::default();
+        let frame = normal_frame_with_expansion(
+            Vec::new(),
+            &editor,
+            &[],
+            &[],
+            &[test_subagent("Explore", "Find auth code", "", 4)],
+            "",
+            None,
+            &[],
+            None,
+            None,
+            0.5,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+        let composer_index = frame.composer_index.expect("composer index");
+        let subagent_index = frame
+            .lines
+            .iter()
+            .position(|line| painted(line).contains("Explore"))
+            .expect("subagent row");
+
+        assert!(subagent_index > composer_index);
+        assert_eq!(subagent_index, frame.lines.len() - 2);
+    }
+
     #[test]
     fn composer_controls_sit_inside_the_composer_rule() {
         let mode = test_mode("Full Access", ModeAccent::Danger, true);
@@ -12042,6 +12279,30 @@ mod tests {
         assert!(painted(frame.lines.last().expect("composer bottom rule")).starts_with('╰'));
     }
 
+    /// The compaction row spends its spare columns on a bar, and gives them back
+    /// to the reading when the terminal has none to spare.
+    #[test]
+    fn the_compacting_row_draws_a_progress_bar_that_fits() {
+        let wide = activity_lines("Compacting.. 40% (4s)", None, 0.0, 80);
+        let wide = painted(&wide[0]);
+
+        assert_eq!(wide, " ⠋ Compacting.. ████████░░░░░░░░░░░░  40% (4s)");
+
+        let narrow = activity_lines("Compacting.. 40% (4s)", None, 0.0, 30);
+        let narrow = painted(&narrow[0]);
+
+        assert_eq!(narrow, " ⠋ Compacting..  40% (4s)");
+    }
+
+    /// The reading belongs to compaction alone: an ordinary turn keeps its plain
+    /// elapsed tail even though both rows share the loader.
+    #[test]
+    fn a_working_row_carries_no_progress_bar() {
+        let line = activity_lines("Working.. (4s)", None, 0.0, 80);
+
+        assert_eq!(painted(&line[0]), " ⠋ Working.. (4s)");
+    }
+
     fn painted(line: &PaintLine) -> String {
         let mut out = line.prefix.clone();
         out.push_str(&line.text);
@@ -12529,16 +12790,19 @@ mod tests {
                 .clone()
         };
 
-        // No box: the question stands in the transcript, badge first.
+        assert!(painted[0].starts_with("╭─ 테스트 "));
+        assert!(painted[0].ends_with('╮'));
+        assert!(row("선택지 A").starts_with("│ ❯ 1. 선택지 A"));
+        assert!(row("선택지 B").starts_with("│   2. 선택지 B"));
+        assert!(row("직접 입력").starts_with("│   3. "));
+        assert!(row("이 내용으로 대화하기").starts_with("│   4. "));
         assert!(
-            painted.iter().all(|line| !line.contains('│')),
-            "the question drew a panel border"
+            painted
+                .iter()
+                .filter(|line| line.starts_with(['╭', '│', '├', '╰']))
+                .all(|line| UnicodeWidthStr::width(line.as_str()) == panel_span(80)),
+            "question panel rows must keep the picker width"
         );
-        assert_eq!(painted[0], "  □ 테스트 ");
-        assert_eq!(row("선택지 A"), " ❯ 1. 선택지 A");
-        assert_eq!(row("선택지 B"), "   2. 선택지 B");
-        assert!(row("직접 입력").starts_with("   3. "));
-        assert!(row("이 내용으로 대화하기").starts_with("   4. "));
         // A detail line starts where its label does, not where the number does.
         let column = |line: &str, needle: &str| {
             UnicodeWidthStr::width(&line[..line.find(needle).expect("needle")])
@@ -12550,7 +12814,7 @@ mod tests {
         // The way out is ruled off from the answers above it.
         let rule = painted
             .iter()
-            .position(|line| line.trim_start().starts_with('─'))
+            .position(|line| line.starts_with('├'))
             .expect("rule row");
         let chat = painted
             .iter()
@@ -12928,6 +13192,7 @@ mod tests {
             OverlayStyle::Picker,
             OverlayStyle::Panel,
             OverlayStyle::CompactPanel,
+            OverlayStyle::Question,
         ] {
             let frame = overlay_frame(
                 &[],

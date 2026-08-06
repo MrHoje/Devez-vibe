@@ -14,6 +14,10 @@ import {
 
 const VERSION = process.env.DEVEZ_VIBE_VERSION || "dev";
 const sessions = new Map();
+// The id this bridge proposes is not always the id the CLI persists the
+// transcript under, so a session can be renamed mid-flight. Old id → live id,
+// which keeps ids the host already handed out (or wrote to disk) resolvable.
+const sessionAliases = new Map();
 const pendingHostRequests = new Map();
 const modelCatalogs = new Map();
 let nextHostRequest = 1;
@@ -215,6 +219,44 @@ function rawSession(id) {
   return id.startsWith("claude:") ? id.slice("claude:".length) : id;
 }
 
+/** Follows the rename chain from an id the host still remembers to the live one. */
+function liveSessionId(id) {
+  let current = rawSession(String(id ?? ""));
+  const seen = new Set();
+  while (sessionAliases.has(current) && !seen.has(current)) {
+    seen.add(current);
+    current = sessionAliases.get(current);
+  }
+  return current;
+}
+
+function lookupSession(id) {
+  return sessions.get(liveSessionId(id));
+}
+
+/**
+ * Binds the session to the id the CLI actually persists under. `options.sessionId`
+ * is a request, not a guarantee: a session that gets rotated (a pre-warmed process
+ * the first turn does not reuse, a resume the CLI declines) writes its transcript
+ * under a different uuid, and everything downstream — `session/resume`,
+ * `session/history`, DevezCode's `-r` on the next launch — keys off the persisted
+ * id. Adopting it here and telling the host is what keeps a Claude-backed session
+ * resumable at all.
+ */
+function adoptSessionId(session, incoming) {
+  const real = rawSession(String(incoming ?? ""));
+  if (!real || real === session.id) return;
+  const previous = session.id;
+  sessions.delete(previous);
+  sessionAliases.set(previous, real);
+  session.id = real;
+  sessions.set(real, session);
+  notify("thread/rebound", {
+    threadId: visibleSession(previous),
+    newThreadId: visibleSession(real),
+  });
+}
+
 function makeOptions(params, sessionId, resume) {
   const options = {
     cwd: params.cwd || process.cwd(),
@@ -341,6 +383,7 @@ async function createSession(params, resumeId) {
     streamBlocks: new Map(),
     tools: new Map(),
     tasks: new Map(),
+    subagents: new Map(),
     lastContextUsage: null,
     lastContextWindow: 0,
   };
@@ -482,7 +525,11 @@ function processStreamEvent(session, message) {
 }
 
 function processAssistant(session, message) {
-  if (!session.turn || message.parent_tool_use_id) return;
+  if (!session.turn) return;
+  if (message.parent_tool_use_id) {
+    recordSubagentMessage(session, message);
+    return;
+  }
   session.lastContextUsage = tokenBreakdown(message.message?.usage);
   const capabilities = modelCapabilities(
     session.models,
@@ -523,6 +570,7 @@ function processToolUse(session, block) {
   const item = toolItem(session, block.id, name, input);
   session.tools.set(block.id, { name, input, item });
   emitItem(session, "started", item);
+  if (SUBAGENT_TOOLS.includes(name)) startSubagent(session, block);
 }
 
 function toolItem(session, id, name, input) {
@@ -643,10 +691,123 @@ function numberedTaskSubject(subject, index) {
   return /^\d+\.\s/.test(text) ? text : `${index + 1}. ${text}`;
 }
 
-function processUser(session, message) {
+// 서브에이전트는 자기 메시지를 부모 Task 툴콜의 `parent_tool_use_id`와 함께 흘려보낸다.
+// 그 ID로 묶어 두면 지금 어떤 에이전트가 무슨 도구를 돌리는지 그대로 복원할 수 있다.
+const SUBAGENT_TOOLS = ["Agent", "Task"];
+
+function startSubagent(session, block) {
+  const input = block.input || {};
+  session.subagents.set(block.id, {
+    id: block.id,
+    name: firstLine(input.subagent_type || input.agentType || "agent", 40),
+    description: firstLine(input.description || input.prompt || "", 120),
+    tool: "",
+    startedAt: Date.now(),
+  });
+  emitSubagents(session);
+}
+
+// 서브에이전트가 실제로 무엇을 했는지는 자식 메시지에만 남는다. 열람용 기록은 여기서
+// 한 줄씩 흘려보내고, 목록 행에 쓸 현재 도구만 따로 갱신한다.
+function recordSubagentMessage(session, message) {
+  const running = session.subagents.get(message.parent_tool_use_id);
+  if (!running) return;
+  const content = Array.isArray(message.message?.content) ? message.message.content : [];
+  let toolChanged = false;
+  for (const block of content) {
+    if (block.type === "text") {
+      const text = String(block.text || "").trim();
+      if (text) emitSubagentLine(session, running.id, { kind: "text", text });
+    } else if (block.type === "tool_use") {
+      running.tool = subagentToolLabel(block);
+      toolChanged = true;
+      emitSubagentLine(session, running.id, {
+        kind: "tool",
+        text: running.tool,
+        toolUseId: block.id,
+      });
+    }
+  }
+  if (toolChanged) emitSubagents(session);
+}
+
+function recordSubagentResult(session, message) {
+  const running = session.subagents.get(message.parent_tool_use_id);
+  if (!running) return;
   const content = Array.isArray(message.message?.content) ? message.message.content : [];
   for (const block of content) {
     if (block.type !== "tool_result") continue;
+    emitSubagentLine(session, running.id, {
+      kind: block.is_error ? "error" : "result",
+      text: firstLine(toolOutput(block.content, message.tool_use_result), 200),
+      toolUseId: block.tool_use_id,
+    });
+  }
+}
+
+function emitSubagentLine(session, parentToolUseId, line) {
+  notify("turn/subagent/line", {
+    threadId: session.id,
+    turnId: session.turn?.id,
+    parentToolUseId,
+    line,
+  });
+}
+
+function subagentToolLabel(block) {
+  const name = block.name || "Tool";
+  const input = block.input || {};
+  const detail = input.command
+    ?? input.pattern
+    ?? input.file_path
+    ?? input.description
+    ?? input.query
+    ?? input.url
+    ?? "";
+  const text = firstLine(detail, 60);
+  return text ? `${name}(${text})` : name;
+}
+
+function finishSubagent(session, toolUseId) {
+  if (!session.subagents.delete(toolUseId)) return;
+  emitSubagents(session);
+}
+
+function clearSubagents(session) {
+  if (!session.subagents.size) return;
+  session.subagents.clear();
+  emitSubagents(session);
+}
+
+function firstLine(value, limit) {
+  return String(value ?? "").split("\n")[0].trim().slice(0, limit);
+}
+
+function emitSubagents(session) {
+  notify("turn/subagents/updated", {
+    threadId: session.id,
+    turnId: session.turn?.id,
+    subagents: [...session.subagents.values()].map((agent) => ({
+      id: agent.id,
+      name: agent.name,
+      description: agent.description,
+      tool: agent.tool,
+      elapsedMs: Date.now() - agent.startedAt,
+    })),
+  });
+}
+
+function processUser(session, message) {
+  // 자식 tool_result의 tool_use_id는 부모 세션의 것과 다른 공간이므로, 부모 흐름에
+  // 섞이기 전에 서브에이전트 기록으로 보낸다.
+  if (message.parent_tool_use_id) {
+    recordSubagentResult(session, message);
+    return;
+  }
+  const content = Array.isArray(message.message?.content) ? message.message.content : [];
+  for (const block of content) {
+    if (block.type !== "tool_result") continue;
+    finishSubagent(session, block.tool_use_id);
     const pending = session.tools.get(block.tool_use_id);
     if (!pending) continue;
     pending.toolUseId = block.tool_use_id;
@@ -735,6 +896,7 @@ async function runPendingPrompt(session) {
 
 function finishTurn(session, error, durationMs) {
   if (!session.turn) return;
+  clearSubagents(session);
   const turn = { id: session.turn.id, status: error ? "failed" : "completed" };
   if (error) turn.error = { message: error instanceof Error ? error.message : error.message || String(error) };
   if (durationMs != null) turn.durationMs = durationMs;
@@ -745,6 +907,7 @@ function finishTurn(session, error, durationMs) {
 
 async function consume(session) {
   for await (const message of session.query) {
+    adoptSessionId(session, message.session_id);
     if (message.type === "stream_event") {
       if (message.event?.type === "content_block_delta" && (message.event?.delta?.text || message.event?.delta?.thinking)) {
         if (session.turn) session.turn.sawStreamText = true;
@@ -807,7 +970,7 @@ async function inputContent(input, handoffContext) {
 }
 
 async function startPrompt(params) {
-  const id = rawSession(params.sessionId);
+  const id = liveSessionId(params.sessionId);
   const session = sessions.get(id);
   if (!session) throw new Error(`Claude 세션을 찾을 수 없습니다: ${id}`);
   // Claude runs one turn at a time, so extra input waits its turn instead of
@@ -966,7 +1129,7 @@ async function dispatch(method, params = {}) {
     };
   }
   if (method === "session/resume") {
-    const id = rawSession(params.sessionId);
+    const id = liveSessionId(params.sessionId);
     const existing = sessions.get(id);
     if (existing) {
       const messages = await getSessionMessages(id, { dir: existing.cwd, includeSystemMessages: true });
@@ -1022,13 +1185,13 @@ async function dispatch(method, params = {}) {
     };
   }
   if (method === "session/history") {
-    const id = rawSession(params.sessionId);
+    const id = liveSessionId(params.sessionId);
     const messages = await getSessionMessages(id, { dir: params.cwd, includeSystemMessages: true });
     return { data: historyTurns(messages), nextCursor: null };
   }
   if (method === "session/prompt") return startPrompt(params);
   if (method === "session/interrupt") {
-    const session = sessions.get(rawSession(params.sessionId));
+    const session = lookupSession(params.sessionId);
     // Stopping the run drops what was waiting behind it too, so nothing the user
     // just cancelled starts on its own afterwards.
     if (session) session.pendingPrompts.length = 0;
@@ -1048,7 +1211,7 @@ async function dispatch(method, params = {}) {
     return startPrompt({ ...params, input: [{ type: "text", text: "/compact" }] });
   }
   if (method === "session/fork") {
-    const source = rawSession(params.sessionId);
+    const source = liveSessionId(params.sessionId);
     const forked = await forkSession(source, { dir: params.cwd });
     const id = forked.sessionId || forked;
     const { session, account, usage } = await createSession(params, id);
@@ -1063,17 +1226,20 @@ async function dispatch(method, params = {}) {
     };
   }
   if (method === "session/close") {
-    const session = sessions.get(rawSession(params.sessionId));
+    const session = lookupSession(params.sessionId);
     if (session) {
       session.queue.close();
       session.query.close();
       sessions.delete(session.id);
+      for (const [from, to] of sessionAliases) {
+        if (to === session.id) sessionAliases.delete(from);
+      }
       if (params.delete) await deleteSession(session.id, { dir: session.cwd });
     }
     return {};
   }
   if (method === "account/usage") {
-    const session = sessions.get(rawSession(params.sessionId)) || [...sessions.values()][0];
+    const session = lookupSession(params.sessionId) || [...sessions.values()][0];
     if (!session) return { account: null, usage: null };
     return { account: await safeAccount(session.query), usage: await safeUsage(session.query) };
   }
@@ -1083,6 +1249,7 @@ async function dispatch(method, params = {}) {
       session.query.close();
     }
     sessions.clear();
+    sessionAliases.clear();
     return {};
   }
   throw new Error(`지원하지 않는 Claude 브리지 메서드: ${method}`);

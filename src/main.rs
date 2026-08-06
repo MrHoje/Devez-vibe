@@ -263,6 +263,9 @@ async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
             ),
         );
     }
+    // No runtime is connected until this machine has picked one, so a fresh
+    // install opens the picker on the first frame rather than assuming.
+    state.prompt_for_provider_if_unconnected();
 
     let render_mode = renderer::load_render_mode(cli.renderer.as_deref())?;
     let terminal = TerminalSession::enter(render_mode)?;
@@ -641,6 +644,7 @@ async fn choose_startup_session(
                 editor: &editor,
                 composer_images: &[],
                 queued_prompts: Vec::new(),
+                subagents: Vec::new(),
                 composer_placeholder: "",
                 welcome: None,
                 suggestions: Vec::new(),
@@ -884,6 +888,16 @@ async fn event_loop(
                 match server_event {
                     Some(ServerEvent::Notification { method, params }) => {
                         state.handle_notification(&method, &params);
+                        // Claude-only hand-off: this notification carries the SDK's
+                        // fresh account usage at the end of every turn, and the host
+                        // has no statusLine hook for us to ride on. Codex limits
+                        // arrive through `account/rateLimits/read` on another schema
+                        // and never reach here.
+                        if method == "claude/account/updated" {
+                            devezcode::publish_claude_rate_limits(
+                                params.get("usage").filter(|value| !value.is_null()),
+                            );
+                        }
                         let interrupt_after_start = method == "turn/started"
                             && state.take_pending_interrupt().is_some();
                         if state.take_account_refresh() {
@@ -891,7 +905,11 @@ async fn event_loop(
                         }
                         if interrupt_after_start {
                             Action::Interrupt
-                        } else if method == "turn/completed" {
+                        } else if method == "turn/completed"
+                            // A runtime that compacts without running a turn ends
+                            // the wait here, so the queue drains from here too.
+                            || (method == "thread/compacted" && !state.host_turn_busy())
+                        {
                             state
                                 .take_queued_prompt()
                                 .map(|text| state.start_queued_prompt(text))
@@ -1161,6 +1179,7 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
         Pick::FastMode => Action::SetFast(!state.effective_fast_mode()),
         Pick::Model => state.run_command("/model"),
         Pick::EffortSetting => state.run_command("/effort"),
+        Pick::Subagent(index) => state.open_subagent(index),
         Pick::ScrollToBottom => Action::ScrollToBottom,
         Pick::Close => {
             state.close_overlay()
@@ -1312,26 +1331,36 @@ async fn execute_action(
         Action::ResumeThread(target) => {
             return resume_thread(server, state, renderer, &target).await;
         }
-        Action::ActivateCodex => match server.start_codex().await {
-            Ok(()) => match server
+        Action::ActivateCodex => activate_codex(server, state).await,
+        Action::PersistProviderConnection {
+            key_path,
+            connected,
+            activate_codex,
+        } => {
+            match server
                 .request(
-                    "model/list",
-                    json!({ "includeHidden": false, "limit": 100 }),
+                    "config/value/write",
+                    config_value_write_params(key_path, &connected.to_string()),
                 )
                 .await
             {
-                Ok(response) => {
-                    state.replace_models(parse_models(&response));
-                    state.switch_to_codex();
+                Ok(_) => {
+                    if activate_codex {
+                        crate::activate_codex(server, state).await;
+                    }
                 }
                 Err(error) => {
-                    state.push_notice(BlockKind::Error, "Codex 모델 조회 실패", error.to_string())
+                    // The switch never reached disk, so the row goes back to what
+                    // the next launch will actually read.
+                    state.restore_provider_connection(key_path, !connected);
+                    state.push_notice(
+                        BlockKind::Warning,
+                        "Provider 연결 저장 실패",
+                        error.to_string(),
+                    );
                 }
-            },
-            Err(error) => {
-                state.push_notice(BlockKind::Error, "Codex 사용 불가", error.to_string())
             }
-        },
+        }
         Action::SetFast(enabled) => {
             let service_tier = if enabled {
                 state
@@ -1539,26 +1568,20 @@ async fn execute_action(
             }
         }
         Action::Compact => {
-            match server
+            // The runtime reports no assistant output while it compacts, so the
+            // activity row owns the wait: spinner in, `Context compacted` out. The
+            // clock starts before the request, since a runtime that only answers
+            // once compaction finished would otherwise show no progress at all.
+            state.begin_compaction();
+            if let Err(error) = server
                 .request(
                     "thread/compact/start",
                     json!({ "threadId": state.thread_id }),
                 )
                 .await
             {
-                Ok(_) => {
-                    let provider = if state.selected_model_name().starts_with("claude:") {
-                        "Claude"
-                    } else {
-                        "Codex"
-                    };
-                    state.push_notice(
-                        BlockKind::System,
-                        "Compacting context",
-                        format!("{provider}가 대화 컨텍스트를 압축하고 있습니다."),
-                    );
-                }
-                Err(error) => state.push_notice(BlockKind::Error, "압축 실패", error.to_string()),
+                state.end_compaction();
+                state.push_notice(BlockKind::Error, "압축 실패", error.to_string());
             }
         }
         Action::ShowDiff => {
@@ -2257,6 +2280,27 @@ async fn execute_action(
 }
 
 /// `/new`, wiped first and loaded after: the transcript clears and the fresh
+/// Brings the Codex app-server up and moves the session onto it. Reached from
+/// `/provider`, both when Codex is already connected and right after the pick
+/// that connected it.
+async fn activate_codex(server: &mut BackendServer, state: &mut AppState) {
+    match server.start_codex().await {
+        Ok(()) => match server
+            .request("model/list", json!({ "includeHidden": false, "limit": 100 }))
+            .await
+        {
+            Ok(response) => {
+                state.replace_models(parse_models(&response));
+                state.switch_to_codex();
+            }
+            Err(error) => {
+                state.push_notice(BlockKind::Error, "Codex 모델 조회 실패", error.to_string())
+            }
+        },
+        Err(error) => state.push_notice(BlockKind::Error, "Codex 사용 불가", error.to_string()),
+    }
+}
+
 /// welcome panel goes up immediately, then `thread/start` is waited out behind a
 /// live screen exactly the way launch does it. Returns `true` when the user quits
 /// during the wait.

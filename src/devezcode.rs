@@ -10,6 +10,7 @@
 //! Outside DevezCode the variable is absent and every function here is a no-op:
 //! a plain `dvz` in a plain terminal writes nothing.
 
+use serde_json::{Value, json};
 use std::{
     env, fs,
     fs::OpenOptions,
@@ -147,6 +148,109 @@ pub fn note_prompt(text: &str) {
     with(|reporter| reporter.write("lastmsg", &summary));
 }
 
+/// Mirror of the last payload handed to the host, so a turn that ends with the
+/// same numbers does not touch the file (the host re-reads on every write).
+static LAST_RATE_LIMITS: Mutex<Option<String>> = Mutex::new(None);
+
+/// Publishes Claude account rate limits into the file DevezCode's usage card
+/// already watches (`%APPDATA%\DevezCode\claude\ratelimit.json`), the same file
+/// the `claude` CLI's statusLine hook writes.
+///
+/// **Claude runtime only.** The Claude Agent SDK reports fresh limits when a turn
+/// ends, while the host has no hook for us and would otherwise sit on its own
+/// 3-minute API poll. Codex reports its limits through `account/rateLimits/read`
+/// on a different schema and a different account, and never reaches here — the
+/// only caller is the `claude/account/updated` notification.
+pub fn publish_claude_rate_limits(usage: Option<&Value>) {
+    // Outside DevezCode there is no card to feed, and the real `claude` sessions
+    // own that file.
+    if room_id().is_none() {
+        return;
+    }
+    let Some(usage) = usage else {
+        return;
+    };
+    // A turn whose usage never arrived (SDK error, interrupted turn) must leave
+    // the last good numbers alone rather than publish an empty window as 0%.
+    let Some(payload) = claude_rate_limit_payload(usage) else {
+        return;
+    };
+    let mut last = LAST_RATE_LIMITS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if last.as_deref() == Some(payload.as_str()) {
+        return;
+    }
+    let Some(dir) = env::var_os("APPDATA")
+        .map(|app_data| PathBuf::from(app_data).join("DevezCode").join("claude"))
+    else {
+        return;
+    };
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    // Written whole and renamed into place: the host parses this file from a
+    // watcher, and a torn read would drop the window it was reading.
+    // The temp name carries the pid so a concurrent `claude` hook writing the
+    // same folder cannot collide with us.
+    let temp = dir.join(format!("ratelimit.{}.tmp", process::id()));
+    let path = dir.join("ratelimit.json");
+    if fs::write(&temp, &payload).is_err() {
+        let _ = fs::remove_file(&temp);
+        return;
+    }
+    if fs::rename(&temp, &path).is_err() {
+        let _ = fs::remove_file(&temp);
+        return;
+    }
+    *last = Some(payload);
+}
+
+/// Translates the SDK's usage shape into the host's: `utilization` (0-100 float)
+/// becomes `used_percentage`, and the RFC 3339 `resets_at` becomes unix seconds.
+/// Returns `None` when no window carries a usable number, which keeps a partial
+/// or unrelated payload from reaching the card.
+fn claude_rate_limit_payload(usage: &Value) -> Option<String> {
+    let mut limits = serde_json::Map::new();
+    for window_name in ["five_hour", "seven_day"] {
+        let Some(window) = usage.pointer(&format!("/rate_limits/{window_name}")) else {
+            continue;
+        };
+        // Never rounded: the host compares consecutive samples to tell a real
+        // early reset from the provider's occasional bogus dip.
+        let Some(used) = window
+            .get("utilization")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite())
+        else {
+            continue;
+        };
+        let mut entry = json!({ "used_percentage": used.clamp(0.0, 100.0) });
+        if let Some(resets_at) = window.get("resets_at").and_then(reset_epoch_seconds) {
+            entry["resets_at"] = json!(resets_at);
+        }
+        limits.insert(window_name.to_owned(), entry);
+    }
+    if limits.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&json!({ "rate_limits": Value::Object(limits) })).ok()
+}
+
+/// `resets_at` is an RFC 3339 string today; a raw epoch is accepted too so a
+/// server-side shape change degrades to the number instead of dropping the window.
+fn reset_epoch_seconds(value: &Value) -> Option<i64> {
+    if let Some(text) = value.as_str() {
+        return chrono::DateTime::parse_from_rfc3339(text)
+            .ok()
+            .map(|instant| instant.timestamp());
+    }
+    value
+        .as_f64()
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .map(|seconds| seconds as i64)
+}
+
 /// Clears the transient state on the way out, so a closed session does not sit
 /// there spinning in the host.
 pub fn finish() {
@@ -242,6 +346,82 @@ mod tests {
         assert_eq!(Activity::from_host(true, false).status(), "running");
         assert_eq!(Activity::from_host(false, true).status(), "loading");
         assert_eq!(Activity::from_host(true, true).status(), "running");
+    }
+
+    #[test]
+    fn claude_rate_limits_reach_the_host_in_its_own_shape() {
+        let payload = claude_rate_limit_payload(&json!({
+            "rate_limits": {
+                "five_hour": { "utilization": 37.25, "resets_at": "2026-08-06T12:00:00Z" },
+                "seven_day": { "utilization": 12.0, "resets_at": "2026-08-10T00:00:00Z" },
+            }
+        }))
+        .expect("both windows are usable");
+        let parsed: Value = serde_json::from_str(&payload).unwrap();
+        // Not rounded: the host's drop guard compares consecutive samples.
+        assert_eq!(
+            parsed["rate_limits"]["five_hour"]["used_percentage"],
+            json!(37.25)
+        );
+        assert_eq!(
+            parsed["rate_limits"]["five_hour"]["resets_at"],
+            json!(1_786_017_600_i64)
+        );
+        assert_eq!(
+            parsed["rate_limits"]["seven_day"]["used_percentage"],
+            json!(12.0)
+        );
+    }
+
+    #[test]
+    fn windows_without_a_number_are_left_out_rather_than_published_as_zero() {
+        let payload = claude_rate_limit_payload(&json!({
+            "rate_limits": {
+                "five_hour": { "utilization": 5.0 },
+                "seven_day": { "resets_at": "2026-08-10T00:00:00Z" },
+            }
+        }))
+        .expect("the five hour window is usable");
+        let parsed: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            parsed["rate_limits"]["five_hour"]["used_percentage"],
+            json!(5.0)
+        );
+        // No reset is better than a made-up one, and an empty window is dropped.
+        assert!(
+            parsed["rate_limits"]["five_hour"]
+                .get("resets_at")
+                .is_none()
+        );
+        assert!(parsed["rate_limits"].get("seven_day").is_none());
+    }
+
+    #[test]
+    fn a_payload_without_usable_windows_is_not_published() {
+        assert!(claude_rate_limit_payload(&json!({})).is_none());
+        assert!(claude_rate_limit_payload(&json!({ "rate_limits": {} })).is_none());
+        // Codex's own shape (`account/rateLimits/read`) must never be mistaken
+        // for Claude usage if it ever reached this path.
+        assert!(
+            claude_rate_limit_payload(&json!({
+                "rate_limits": { "primary": { "used_percent": 40 } }
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_numeric_reset_is_accepted_as_epoch_seconds() {
+        assert_eq!(
+            reset_epoch_seconds(&json!("2026-08-06T12:00:00Z")),
+            Some(1_786_017_600)
+        );
+        assert_eq!(
+            reset_epoch_seconds(&json!(1_786_017_600_i64)),
+            Some(1_786_017_600)
+        );
+        assert_eq!(reset_epoch_seconds(&json!("not a time")), None);
+        assert_eq!(reset_epoch_seconds(&json!(0)), None);
     }
 
     #[test]
