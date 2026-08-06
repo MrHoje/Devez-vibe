@@ -577,8 +577,17 @@ mod tests {
         assert!(bridge.contains("function historyState(messages)"));
         assert!(bridge.contains("session.tasks = historyState(messages).tasks;"));
         assert!(bridge.contains("if (numberedTaskIndex(subject) === 1) tasks.clear();"));
-        assert!(bridge.contains("applyTaskUpdate(session.tasks, input, turnId);"));
+        assert!(
+            bridge.contains(
+                "applyTaskUpdate(session.tasks, input, turnId, () => emitPlan(session));"
+            )
+        );
         assert!(bridge.contains("session.tasks = latestTaskPlan(session.tasks);"));
+        assert!(
+            bridge.contains(
+                "every skipped predecessor and the target itself pass through in_progress"
+            )
+        );
     }
 
     #[test]
