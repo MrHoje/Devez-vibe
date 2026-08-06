@@ -1519,6 +1519,7 @@ fn is_vibe_setting_key(key: &str) -> bool {
             | "status_line_weekly"
             | crate::state::CODEX_PROVIDER_KEY
             | crate::state::CLAUDE_PROVIDER_KEY
+            | crate::state::CLAUDE_PERMISSION_MODE_KEY
     )
 }
 

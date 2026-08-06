@@ -320,6 +320,7 @@ async fn start_session(
     if is_resuming {
         server.prepare_resume_runtime(resume_id).await?;
     }
+    let claude = claude_session_settings(state);
     let startup = await_thread(
         server,
         state,
@@ -331,6 +332,7 @@ async fn start_session(
             cli.cwd.as_ref().map(|_| cwd),
             cwd,
             state.model_verbosity(),
+            &claude,
         ),
         read_runtime_account_plan(server, requested_model_name),
         None,
@@ -1429,6 +1431,21 @@ async fn execute_action(
             {
                 state.push_notice(BlockKind::Warning, "권한 모드 전환 실패", error.to_string());
             }
+            // Shift+Tab and a badge click both land here, and both are meant to
+            // stick: the mode becomes the default the next session opens under.
+            if let Err(error) = server
+                .request(
+                    "config/value/write",
+                    config_value_write_params(state::CLAUDE_PERMISSION_MODE_KEY, mode.wire()),
+                )
+                .await
+            {
+                state.push_notice(
+                    BlockKind::Warning,
+                    "권한 모드 기본값 저장 실패",
+                    error.to_string(),
+                );
+            }
         }
         Action::PersistShellDisplayMode(mode) => {
             if let Err(error) = server
@@ -2341,6 +2358,7 @@ async fn start_new_thread(
         Some(state.service_tier()),
         "clear",
         state.model_verbosity(),
+        state.claude_permission_mode_setting().wire(),
     );
     let previous_thread = state.thread_id.clone();
 
@@ -2448,6 +2466,9 @@ async fn resume_into_state(
     protect_side_exit_keys: bool,
 ) -> Result<Switched> {
     let previous_thread = state.thread_id.clone();
+    // Read before the screen resets: the resumed session has to reopen on the
+    // model, effort and permission mode the picker currently holds.
+    let claude = claude_session_settings(state);
     renderer.clear_screen()?;
     state.prepare_resume();
     state.begin_thread_switch();
@@ -2458,7 +2479,7 @@ async fn resume_into_state(
         state,
         renderer,
         previous_thread.clone(),
-        server.request("thread/resume", resume_thread_params(thread_id)),
+        server.request("thread/resume", resume_thread_params(thread_id, &claude)),
         protect_side_exit_keys.then(|| Instant::now() + SIDE_EXIT_KEY_SETTLE),
     )
     .await?
@@ -2824,20 +2845,61 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 기존 브라우저 탭이 있으면 임의로 선택하지 말고 사용자에게 선택을 받은 뒤 사용한다.\n",
 );
 
+/// The Claude selections a session has to be told, because the bridge opens a
+/// fresh SDK session for every start and resume. Anything left out here comes
+/// back as the SDK's own default, which is what used to reset the model, the
+/// effort and the permission badge on each `/resume`.
+struct ClaudeSessionSettings {
+    /// Empty while a Codex model is selected: the resumed transcript then picks
+    /// the model itself rather than being forced onto a non-Claude id.
+    model: String,
+    effort: String,
+    permission_mode: String,
+}
+
+fn claude_session_settings(state: &AppState) -> ClaudeSessionSettings {
+    let claude_model = claude::is_claude_model(state.selected_model_name());
+    ClaudeSessionSettings {
+        model: claude_model
+            .then(|| state.selected_model_name().to_owned())
+            .unwrap_or_default(),
+        effort: claude_model
+            .then(|| state.selected_effort().to_owned())
+            .unwrap_or_default(),
+        permission_mode: state
+            .claude_permission_mode_setting()
+            .wire()
+            .to_owned(),
+    }
+}
+
 /// A resumed thread replays the `developer` message its rollout was recorded
 /// with, so the rules have to be re-sent or an old session keeps running on an
-/// older wording.
-fn resume_thread_params(thread_id: &str) -> Value {
-    json!({
+/// older wording. The Claude selections ride along for the same reason: a
+/// resumed session would otherwise reopen on the SDK defaults.
+fn resume_thread_params(thread_id: &str, claude: &ClaudeSessionSettings) -> Value {
+    let mut params = json!({
         "threadId": thread_id,
         "developerInstructions": DEVEZ_INSTRUCTIONS,
         "claudeDeveloperInstructions": CLAUDE_DEVEZ_INSTRUCTIONS,
+        "claudePermissionMode": claude.permission_mode,
         "initialTurnsPage": {
             "limit": 100,
             "sortDirection": "asc",
             "itemsView": "full"
         }
-    })
+    });
+    // Only a Claude thread takes the model and effort from the picker; a Codex
+    // resume keeps whatever its own thread was recorded with.
+    if claude::is_claude_thread(thread_id) {
+        if !claude.model.is_empty() {
+            params["model"] = json!(claude.model);
+        }
+        if !claude.effort.is_empty() {
+            params["effort"] = json!(claude.effort);
+        }
+    }
+    params
 }
 
 /// One `developer` message at the head of the thread loses its grip as turns
@@ -2861,6 +2923,7 @@ fn new_thread_params(
     service_tier: Option<&str>,
     session_start_source: &str,
     model_verbosity: &str,
+    claude_permission_mode: &str,
 ) -> Value {
     let mut params = json!({
         "cwd": cwd,
@@ -2876,6 +2939,9 @@ fn new_thread_params(
     }
     if let Some(service_tier) = service_tier {
         params["serviceTier"] = json!(service_tier);
+    }
+    if !claude_permission_mode.is_empty() {
+        params["claudePermissionMode"] = json!(claude_permission_mode);
     }
     params
 }
@@ -3849,6 +3915,7 @@ async fn ensure_account(server: &BackendServer) -> Result<String> {
     Ok(label)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_or_resume_thread(
     server: &BackendServer,
     resume: Option<&str>,
@@ -3856,9 +3923,10 @@ async fn start_or_resume_thread(
     resume_cwd: Option<&Path>,
     new_cwd: &Path,
     model_verbosity: &str,
+    claude: &ClaudeSessionSettings,
 ) -> Result<Value> {
     if let Some(thread_id) = resume {
-        let mut params = resume_thread_params(thread_id);
+        let mut params = resume_thread_params(thread_id, claude);
         if let Some(model) = model {
             params["model"] = json!(model);
         }
@@ -3876,6 +3944,7 @@ async fn start_or_resume_thread(
                     None,
                     "startup",
                     model_verbosity,
+                    &claude.permission_mode,
                 ),
             )
             .await
@@ -4103,8 +4172,35 @@ fn resolve_cwd(requested: Option<&Path>) -> Result<PathBuf> {
     let path = requested
         .map(Path::to_path_buf)
         .unwrap_or(env::current_dir().context("현재 작업 폴더를 확인할 수 없습니다.")?);
-    path.canonicalize()
-        .with_context(|| format!("작업 폴더를 열 수 없습니다: {}", path.display()))
+    let resolved = path
+        .canonicalize()
+        .with_context(|| format!("작업 폴더를 열 수 없습니다: {}", path.display()))?;
+    Ok(plain_windows_path(resolved))
+}
+
+/// Longest path that still works without the verbatim prefix on a machine that
+/// never enabled long paths.
+const MAX_PLAIN_PATH: usize = 255;
+
+/// `canonicalize` hands back a Windows verbatim path (`\\?\C:\Source\DevezCode`),
+/// and that prefix follows the folder everywhere: the welcome card, and every `cwd`
+/// the runtimes echo back. Only paths short enough to survive without it lose it.
+fn plain_windows_path(path: PathBuf) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path;
+    };
+    let plain = match text.strip_prefix(r"\\?\UNC\") {
+        // `\\?\UNC\server\share` is `\\server\share` once the prefix comes off.
+        Some(share) => format!(r"\\{share}"),
+        None => match text.strip_prefix(r"\\?\") {
+            Some(rest) => rest.to_owned(),
+            None => return path,
+        },
+    };
+    if plain.len() > MAX_PLAIN_PATH {
+        return path;
+    }
+    PathBuf::from(plain)
 }
 
 #[cfg(test)]
@@ -4114,6 +4210,25 @@ mod tests {
     use theme::ThemeKind;
 
     use super::*;
+
+    #[test]
+    fn the_resolved_folder_drops_the_windows_verbatim_prefix() {
+        assert_eq!(
+            plain_windows_path(PathBuf::from(r"\\?\C:\Source\DevezCode")),
+            PathBuf::from(r"C:\Source\DevezCode")
+        );
+        assert_eq!(
+            plain_windows_path(PathBuf::from(r"\\?\UNC\server\share\work")),
+            PathBuf::from(r"\\server\share\work")
+        );
+        // Plain paths pass through, and a path that needs the prefix keeps it.
+        assert_eq!(
+            plain_windows_path(PathBuf::from(r"C:\Source\DevezCode")),
+            PathBuf::from(r"C:\Source\DevezCode")
+        );
+        let long = format!(r"\\?\C:\{}", "segment\\".repeat(40));
+        assert_eq!(plain_windows_path(PathBuf::from(&long)), PathBuf::from(long));
+    }
 
     fn starting_state() -> AppState {
         AppState::new(
@@ -4414,7 +4529,14 @@ mod tests {
 
     #[test]
     fn fresh_threads_include_the_model_selected_for_the_first_frame() {
-        let params = new_thread_params("C:\\repo", Some("gpt-5.6-terra"), None, "startup", "low");
+        let params = new_thread_params(
+            "C:\\repo",
+            Some("gpt-5.6-terra"),
+            None,
+            "startup",
+            "low",
+            "default",
+        );
 
         assert_eq!(params.pointer("/developerInstructions").and_then(Value::as_str), Some(DEVEZ_INSTRUCTIONS));
         assert_eq!(
@@ -4437,7 +4559,7 @@ mod tests {
 
     #[test]
     fn resumed_threads_carry_the_current_rules() {
-        let params = resume_thread_params("thread-1");
+        let params = resume_thread_params("thread-1", &test_claude_settings());
 
         assert_eq!(params.pointer("/threadId").and_then(Value::as_str), Some("thread-1"));
         assert_eq!(
@@ -4454,6 +4576,40 @@ mod tests {
             params.pointer("/initialTurnsPage/itemsView").and_then(Value::as_str),
             Some("full")
         );
+    }
+
+    fn test_claude_settings() -> ClaudeSessionSettings {
+        ClaudeSessionSettings {
+            model: "claude:opus".to_owned(),
+            effort: "xhigh".to_owned(),
+            permission_mode: "acceptEdits".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_resumed_claude_thread_reopens_on_the_selected_model_effort_and_mode() {
+        let params = resume_thread_params("claude:session-1", &test_claude_settings());
+
+        assert_eq!(
+            params.pointer("/model").and_then(Value::as_str),
+            Some("claude:opus")
+        );
+        assert_eq!(
+            params.pointer("/effort").and_then(Value::as_str),
+            Some("xhigh")
+        );
+        assert_eq!(
+            params.pointer("/claudePermissionMode").and_then(Value::as_str),
+            Some("acceptEdits")
+        );
+    }
+
+    #[test]
+    fn a_resumed_codex_thread_keeps_its_own_model_and_effort() {
+        let params = resume_thread_params("thread-1", &test_claude_settings());
+
+        assert!(params.get("model").is_none());
+        assert!(params.get("effort").is_none());
     }
 
     #[test]
@@ -4483,7 +4639,7 @@ mod tests {
 
     #[test]
     fn new_thread_params_include_selected_response_length() {
-        let params = new_thread_params("C:\\repo", None, None, "startup", "low");
+        let params = new_thread_params("C:\\repo", None, None, "startup", "low", "default");
 
         assert_eq!(
             params.pointer("/config/model_verbosity").and_then(Value::as_str),

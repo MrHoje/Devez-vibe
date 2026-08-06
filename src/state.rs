@@ -353,6 +353,20 @@ impl ClaudePermissionMode {
         }
     }
 
+    /// The saved default read back out of the Vibe settings. The reader
+    /// lowercases every value it returns, so the match ignores case.
+    fn from_wire(value: &str) -> Option<Self> {
+        [
+            Self::Default,
+            Self::AcceptEdits,
+            Self::Plan,
+            Self::Auto,
+            Self::BypassPermissions,
+        ]
+        .into_iter()
+        .find(|mode| mode.wire().eq_ignore_ascii_case(value))
+    }
+
     /// The CLI's cycle order, with bypass reached only where the settings allow
     /// it — Claude Code rejects the mode outright when policy disables it.
     fn next(self, bypass_allowed: bool) -> Self {
@@ -374,6 +388,11 @@ const RUNTIME_CHOICES: [&str; 2] = ["Claude", "Codex"];
 /// picks in `/provider`.
 pub(crate) const CLAUDE_PROVIDER_KEY: &str = "claude_provider_enabled";
 pub(crate) const CODEX_PROVIDER_KEY: &str = "codex_provider_enabled";
+
+/// Vibe settings key holding the permission mode the badge was last cycled to.
+/// Shift+Tab and a badge click both write it, so the next session — new or
+/// resumed — opens under the mode the user left behind.
+pub(crate) const CLAUDE_PERMISSION_MODE_KEY: &str = "claude_permission_mode";
 
 struct SlashCommand {
     name: &'static str,
@@ -489,7 +508,7 @@ const SLASH_COMMANDS: [SlashCommand; 29] = [
     },
     SlashCommand {
         name: "/vibemode",
-        description: "Customize response, shell, and diff display",
+        description: "Customize response, shell, and diff display (Alt+V cycles the preset)",
         takes_argument: false,
     },
     SlashCommand {
@@ -2930,7 +2949,7 @@ impl AppState {
             five_hour_percent,
             weekly_percent,
             fast_mode: read_fast_mode(),
-            claude_permission_mode: ClaudePermissionMode::default(),
+            claude_permission_mode: read_claude_permission_mode(bypass_permissions_allowed),
             bypass_permissions_allowed,
             side_parent: None,
             last_assistant_markdown: None,
@@ -3352,6 +3371,7 @@ impl AppState {
     ) {
         self.thread_id = thread_id;
         self.resume_id = String::new();
+        let cwd = plain_folder(cwd);
         if self.cwd != cwd {
             self.cwd = cwd;
             self.branch = read_git_branch(&self.cwd);
@@ -3837,6 +3857,13 @@ impl AppState {
             .then_some(self.claude_permission_mode)
     }
 
+    /// The mode a Claude session should open under, badge or no badge. Resuming a
+    /// Claude thread from a Codex session still has to send it, and that is the
+    /// case [`Self::claude_permission_mode`] deliberately hides.
+    pub fn claude_permission_mode_setting(&self) -> ClaudePermissionMode {
+        self.claude_permission_mode
+    }
+
     fn claude_permission_badge(&self) -> Option<PermissionBadge> {
         self.claude_permission_mode().map(|mode| PermissionBadge {
             label: mode.label().to_owned(),
@@ -3845,11 +3872,12 @@ impl AppState {
     }
 
     /// Steps to the next mode and reports it, so the caller can tell the runtime.
+    /// The badge itself is the feedback — a notice under the composer would only
+    /// flash away while the reading it duplicates stays on screen.
     pub fn cycle_claude_permission_mode(&mut self) -> ClaudePermissionMode {
         self.claude_permission_mode = self
             .claude_permission_mode
             .next(self.bypass_permissions_allowed);
-        self.set_composer_notice(self.claude_permission_mode.label().to_owned());
         self.claude_permission_mode
     }
 
@@ -3998,6 +4026,7 @@ impl AppState {
     ) {
         self.thread_id = thread_id;
         self.resume_id = String::new();
+        let cwd = plain_folder(cwd);
         if self.cwd != cwd {
             self.cwd = cwd;
             self.workspace_entries.clear();
@@ -4862,8 +4891,31 @@ impl AppState {
         }
 
         match key.code {
-            // Shift+Tab arrives as BackTab on terminals without the Kitty keyboard protocol.
-            KeyCode::BackTab => {
+            // Shift+Tab arrives as BackTab on terminals without the Kitty keyboard
+            // protocol, and as a shifted Tab with it. Either way it cycles Claude's
+            // permission mode, as it does in the CLI — so the shifted Tab is claimed
+            // here, ahead of the plain Tab that queues a prompt during a turn.
+            KeyCode::BackTab | KeyCode::Tab if key.code == KeyCode::BackTab || shift => {
+                if self.claude_permission_mode().is_some() {
+                    return Action::SetClaudePermissionMode(self.cycle_claude_permission_mode());
+                }
+                Action::Tick(true)
+            }
+            // Alt+V cycles the vibe preset from the keyboard, the badge's own
+            // shortcut. It works mid-turn too; the response settings it carries
+            // then apply to the next request.
+            KeyCode::Char('v') | KeyCode::Char('V') if alt && !ctrl => {
+                let (shell, diff) = self.cycle_vibe_mode();
+                Action::PersistVibeDisplayModes {
+                    vibe: self.vibe_mode,
+                    response: self.response_length,
+                    shell,
+                    diff,
+                }
+            }
+            // Shift+Space folds the plan panel on every runtime. The terminal still
+            // reports a space, so the composer must not also type one.
+            KeyCode::Char(' ') if shift && !ctrl && !alt => {
                 self.toggle_plan_summary();
                 Action::Tick(true)
             }
@@ -5794,7 +5846,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/provider [claude|codex]  Claude·Codex provider 전환과 연결 사용/미사용\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n{login_help}\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈"),
+                    format!("/provider [claude|codex]  Claude·Codex provider 전환과 연결 사용/미사용\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n{login_help}\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nShift+Space  작업 단계 접기/펴기\nShift+Tab  Claude 권한 모드 전환"),
                 ));
                 Action::None
             }
@@ -10126,6 +10178,14 @@ fn compact_command(command: &str, max_chars: usize) -> String {
     )
 }
 
+/// Threads started before the verbatim prefix was stripped still echo back
+/// `\\?\C:\...`, so every folder the server reports is normalised on the way in.
+fn plain_folder(cwd: String) -> String {
+    crate::plain_windows_path(PathBuf::from(cwd))
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn read_git_branch(cwd: &str) -> Option<String> {
     let mut directory = PathBuf::from(cwd);
     for _ in 0..10 {
@@ -10235,6 +10295,19 @@ fn read_fast_mode() -> bool {
     codex_home()
         .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
         .is_some_and(|config| parse_fast_mode(&config))
+}
+
+/// The permission mode the badge was last left on. A saved `bypassPermissions`
+/// that policy has since disabled falls back to `default` rather than opening a
+/// session in a mode Claude Code would reject.
+fn read_claude_permission_mode(bypass_allowed: bool) -> ClaudePermissionMode {
+    let mode = read_vibe_config_value(CLAUDE_PERMISSION_MODE_KEY)
+        .and_then(|value| ClaudePermissionMode::from_wire(&value))
+        .unwrap_or_default();
+    if mode == ClaudePermissionMode::BypassPermissions && !bypass_allowed {
+        return ClaudePermissionMode::Default;
+    }
+    mode
 }
 
 fn read_vibe_mode() -> VibeMode {
@@ -11779,8 +11852,10 @@ mod tests {
         assert_eq!(state.permission_profile(), ":danger-full-access");
     }
 
+    /// Shift+Space folds the plan panel wherever the session runs, and the space
+    /// it is made of never reaches the composer — not even mid slash command.
     #[test]
-    fn shift_tab_toggles_the_plan_while_a_slash_command_is_being_typed() {
+    fn shift_space_toggles_the_plan_while_a_slash_command_is_being_typed() {
         let mut state = test_state();
         state.editor.insert_str("/mo");
         state.plan_summary = Some(PlanSummary {
@@ -11791,12 +11866,57 @@ mod tests {
             elapsed: None,
         });
 
-        let action = state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        let action = state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::SHIFT));
 
         assert!(matches!(action, Action::Tick(true)));
         assert_eq!(state.permission_mode(), PermissionMode::FullAccess);
         assert_eq!(state.editor.text(), "/mo");
         assert!(state.plan_summary.is_some_and(|summary| !summary.expanded));
+    }
+
+    /// An unshifted space is still a space, and Shift+Space folds a Claude
+    /// session's plan too — Shift+Tab is spoken for there.
+    #[test]
+    fn shift_space_folds_the_plan_on_every_runtime() {
+        let mut state = AppState::new(
+            "claude:thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![test_model("claude:sonnet", "Sonnet", true)],
+            "claude:sonnet",
+            Some("high"),
+        );
+        state.plan_summary = Some(PlanSummary {
+            explanation: None,
+            steps: vec![],
+            expanded: true,
+            started_at: Instant::now(),
+            elapsed: None,
+        });
+
+        state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(state.editor.text(), " ");
+        assert!(
+            state
+                .plan_summary
+                .as_ref()
+                .is_some_and(|summary| summary.expanded)
+        );
+
+        state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::SHIFT));
+
+        assert_eq!(state.editor.text(), " ");
+        assert!(
+            state
+                .plan_summary
+                .as_ref()
+                .is_some_and(|summary| !summary.expanded)
+        );
+        assert_eq!(
+            state.claude_permission_mode(),
+            Some(ClaudePermissionMode::Default),
+            "folding the plan is not a permission change"
+        );
     }
 
     /// Shape captured from a real `account/rateLimits/read` response.
@@ -15007,6 +15127,9 @@ mod tests {
             Some("high"),
         );
         state.bypass_permissions_allowed = false;
+        // The mode now opens on the saved default, so the walk starts from a
+        // known point rather than from whatever this machine last picked.
+        state.claude_permission_mode = ClaudePermissionMode::Default;
 
         assert_eq!(
             state.claude_permission_mode(),
@@ -15032,11 +15155,100 @@ mod tests {
         assert_eq!(walked[3], ClaudePermissionMode::BypassPermissions);
     }
 
+    /// Shift+Tab is how the CLI cycles these, so it cycles them here too — and
+    /// the badge is the only feedback, with no notice flashing under the composer.
+    #[test]
+    fn shift_tab_cycles_the_claude_permission_mode() {
+        let mut state = AppState::new(
+            "claude:thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![test_model("claude:sonnet", "Sonnet", true)],
+            "claude:sonnet",
+            Some("high"),
+        );
+        state.claude_permission_mode = ClaudePermissionMode::Default;
+
+        let action = state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+
+        assert!(matches!(
+            action,
+            Action::SetClaudePermissionMode(ClaudePermissionMode::AcceptEdits)
+        ));
+        assert_eq!(
+            state.claude_permission_mode(),
+            Some(ClaudePermissionMode::AcceptEdits)
+        );
+        assert!(state.composer_notice.is_none());
+    }
+
+    /// With the Kitty keyboard protocol the same chord arrives as a shifted Tab.
+    /// A turn is running, so the plain-Tab queue branch would otherwise eat it.
+    #[test]
+    fn a_shifted_tab_cycles_the_permission_mode_during_a_turn() {
+        let mut state = AppState::new(
+            "claude:thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![test_model("claude:sonnet", "Sonnet", true)],
+            "claude:sonnet",
+            Some("high"),
+        );
+        state.claude_permission_mode = ClaudePermissionMode::Default;
+        state.busy = true;
+        state.editor.set_text("queued prompt");
+
+        let action = state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+
+        assert!(matches!(
+            action,
+            Action::SetClaudePermissionMode(ClaudePermissionMode::AcceptEdits)
+        ));
+        assert!(state.queued_prompts.is_empty());
+    }
+
+    /// The vibe badge answers to Alt+V as well as to a click, mid-turn included.
+    #[test]
+    fn alt_v_cycles_the_vibe_preset_during_a_turn() {
+        let mut state = busy_state_with_live_turn();
+        while state.vibe_mode() != VibeMode::Vibe {
+            state.cycle_vibe_mode();
+        }
+
+        let action = state.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+
+        assert_eq!(state.vibe_mode(), VibeMode::SuperVibe);
+        assert!(matches!(
+            action,
+            Action::PersistVibeDisplayModes {
+                vibe: VibeMode::SuperVibe,
+                ..
+            }
+        ));
+    }
+
     /// Codex has no such modes, so the badge stays off its composer rule and the
     /// turn carries nothing.
     #[test]
     fn a_codex_thread_has_no_permission_mode() {
         assert_eq!(test_state().claude_permission_mode(), None);
+    }
+
+    /// The saved default is read back through a settings reader that lowercases
+    /// every value, so `acceptEdits` has to survive the round trip.
+    #[test]
+    fn a_saved_permission_mode_is_read_back_case_insensitively() {
+        assert_eq!(
+            ClaudePermissionMode::from_wire("acceptedits"),
+            Some(ClaudePermissionMode::AcceptEdits)
+        );
+        assert_eq!(
+            ClaudePermissionMode::from_wire("bypasspermissions"),
+            Some(ClaudePermissionMode::BypassPermissions)
+        );
+        assert_eq!(ClaudePermissionMode::from_wire("plan"), Some(ClaudePermissionMode::Plan));
+        assert_eq!(ClaudePermissionMode::from_wire("auto"), Some(ClaudePermissionMode::Auto));
+        assert_eq!(ClaudePermissionMode::from_wire("nonsense"), None);
     }
 
     /// A new session has no turn to report usage yet, so the gauge has to come

@@ -3434,10 +3434,13 @@ fn normal_frame_with_expansion(
             )
         {
             activity_rows[0] = row;
+            // The active row now carries the controls, so the composer rule
+            // leaves them alone rather than painting a second copy.
+            composer_controls_mode = None;
         }
-        // Controls never return to the composer rule while activity is shown;
-        // the active row keeps only the settings that fit beside its label.
-        composer_controls_mode = None;
+        // A long activity label leaves no room beside it. The controls stay on
+        // the composer rule in that case instead of vanishing for the whole
+        // turn — they are clickable settings, not decoration.
         activity_index = Some(lines.len());
         lines.extend(activity_rows);
         if !suggestions.is_empty() {
@@ -3505,9 +3508,11 @@ fn normal_frame_with_expansion(
 
 /// The welcome card is deliberately two rows: the product headline and the
 /// working folder. Everything else lives behind `/help` and the status line.
+/// One blank row leads it so the headline never sits on the terminal's top edge.
 fn welcome_lines(welcome: WelcomeView, width: u16) -> Vec<PaintLine> {
     let column_width = panel_span(width);
     vec![
+        PaintLine::blank(),
         plain_line(
             &format!("DEVEZ VIBE  v{}", crate::update::CURRENT_VERSION),
             Tone::Accent,
@@ -5292,6 +5297,10 @@ fn plan_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     lines
 }
 
+/// The key that folds the plan panel, on every runtime. Shift+Tab belongs to
+/// Claude's permission modes, so the panel names the one key that always works.
+const PLAN_TOGGLE_HINT: &str = " Shift + Space ";
+
 /// Reasoning summaries use a narrow `∴` gutter and a single dim italic
 /// paragraph. Plan blocks keep their heading and one physical row per step.
 fn fixed_plan_summary_lines(
@@ -5306,9 +5315,9 @@ fn fixed_plan_summary_lines(
     let effort_tone = plan_effort_tone(summary.steps.len());
     let title = format!("작업 단계 · {completed} / {} 완료", summary.steps.len());
     if !summary.expanded {
-        let tail = " Shift + Tab ▼ ──";
+        let tail = format!("{PLAN_TOGGLE_HINT}▼ ──");
         let rule = "─".repeat(
-            line_width.saturating_sub(5 + UnicodeWidthStr::width(title.as_str()) + UnicodeWidthStr::width(tail)),
+            line_width.saturating_sub(5 + UnicodeWidthStr::width(title.as_str()) + UnicodeWidthStr::width(tail.as_str())),
         );
         let header = PaintLine {
             prefix: String::new(),
@@ -5319,7 +5328,7 @@ fn fixed_plan_summary_lines(
             tool_heading: None,
             pick: None,
             tail: vec![
-                PaintSpan { text: " Shift + Tab ".to_owned(), tone: Tone::FastOff, bold: false },
+                PaintSpan { text: PLAN_TOGGLE_HINT.to_owned(), tone: Tone::FastOff, bold: false },
                 PaintSpan { text: "▼ ".to_owned(), tone: Tone::Plain, bold: false },
                 PaintSpan { text: "──".to_owned(), tone: Tone::Plain, bold: false },
             ],
@@ -5365,16 +5374,16 @@ fn fixed_plan_summary_lines(
         });
     }
     let all_completed = !summary.steps.is_empty() && completed == summary.steps.len();
-    let header_tail = " Shift + Tab ▲ ─┐";
+    let header_tail = format!("{PLAN_TOGGLE_HINT}▲ ─┐");
     let header_rule = "─".repeat(
         line_width
-            .saturating_sub(5 + UnicodeWidthStr::width(title.as_str()) + UnicodeWidthStr::width(header_tail)),
+            .saturating_sub(5 + UnicodeWidthStr::width(title.as_str()) + UnicodeWidthStr::width(header_tail.as_str())),
     );
     let mut header_tail = vec![PaintSpan { text: "┌── ".to_owned(), tone: Tone::Plain, bold: false }];
     header_tail.extend(plan_title_shimmer_spans(&title, plan_shimmer_phase, effort_tone));
     header_tail.extend([
         PaintSpan { text: format!(" {header_rule}"), tone: Tone::Plain, bold: false },
-        PaintSpan { text: " Shift + Tab ".to_owned(), tone: Tone::FastOff, bold: false },
+        PaintSpan { text: PLAN_TOGGLE_HINT.to_owned(), tone: Tone::FastOff, bold: false },
         PaintSpan { text: "▲ ".to_owned(), tone: Tone::Plain, bold: false },
         PaintSpan { text: "─┐".to_owned(), tone: Tone::Plain, bold: false },
     ]);
@@ -12471,20 +12480,28 @@ mod tests {
     }
 
     #[test]
-    fn the_welcome_card_is_two_borderless_rows_with_version_and_folder() {
+    fn the_welcome_card_is_two_borderless_rows_under_one_blank_row() {
         for width in [28u16, 70, 140] {
             let lines = welcome_lines(test_welcome(), width);
 
-            assert_eq!(lines.len(), 2, "width {width}: expected exactly two rows");
             assert_eq!(
-                painted(&lines[0]),
+                lines.len(),
+                3,
+                "width {width}: expected one blank row and two content rows"
+            );
+            assert!(
+                lines[0] == PaintLine::blank(),
+                "width {width}: the leading blank row is missing"
+            );
+            assert_eq!(
+                painted(&lines[1]),
                 format!("DEVEZ VIBE  v{}", crate::update::CURRENT_VERSION),
                 "width {width}: headline changed"
             );
             assert!(
-                painted(&lines[1]).contains("DevezVibe"),
+                painted(&lines[2]).contains("DevezVibe"),
                 "width {width}: folder missing — {}",
-                painted(&lines[1])
+                painted(&lines[2])
             );
             assert!(
                 lines
@@ -13104,8 +13121,9 @@ mod tests {
 
         assert!(painted.contains("DEVEZ VIBE"), "{painted}");
         assert!(painted.contains(r"C:\Source\DevezVibe"), "{painted}");
-        // The card sits above the picker rather than replacing it.
-        assert!(frame.lines[0].text.starts_with("DEVEZ VIBE"));
+        // The card sits above the picker rather than replacing it, one blank row down.
+        assert!(frame.lines[0] == PaintLine::blank());
+        assert!(frame.lines[1].text.starts_with("DEVEZ VIBE"));
         assert!(painted.contains("Select model"));
         assert!(frame.dock_index > 0, "the picker docks below the card");
     }
@@ -13604,6 +13622,22 @@ mod tests {
         assert_eq!(hovered.end, fast_end + 1);
     }
 
+    /// A long activity label crowds the controls off the active row. They belong
+    /// on the composer rule then — dropping them for the whole turn would leave
+    /// the vibe and permission badges with nothing to click.
+    #[test]
+    fn a_crowded_activity_row_leaves_the_controls_on_the_composer_rule() {
+        theme::set_current(ThemeKind::Dark);
+        let mode = test_mode("Full Access", ModeAccent::Danger, true);
+        let mut crowded = PaintLine::blank();
+        crowded.text = "x".repeat(110);
+
+        assert!(activity_line_with_composer_controls(crowded, &mode, 120).is_none());
+
+        let rule = input_top_line(120, "", Some(&mode));
+        assert_eq!(pick_on(&rule, "Vibe: On"), Some(Pick::VibeMode));
+    }
+
     #[test]
     fn moving_between_badges_repaints_only_the_old_and_new_badge_cells() {
         // If this instead repaints 10..47, Shell/Diff/Panel would visibly flash
@@ -13894,7 +13928,7 @@ mod tests {
         assert_eq!(lines.len(), 12);
         assert!(painted(&lines[0]).starts_with("┌── 작업 단계 · 0 / 7 완료"));
         assert!(painted(&lines[0]).ends_with('┐'));
-        assert!(lines[0].tail.iter().any(|span| span.text == " Shift + Tab "));
+        assert!(lines[0].tail.iter().any(|span| span.text == " Shift + Space "));
         assert!(lines[0].tail.iter().any(|span| span.tone == Tone::FastOff));
         assert!(lines[1].text.is_empty());
         assert!(painted(&lines[8]).contains("     Task 7"));
@@ -13917,7 +13951,7 @@ mod tests {
 
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None);
 
-        assert!(painted(&lines[0]).ends_with(" Shift + Tab ▲ ─┐"));
+        assert!(painted(&lines[0]).ends_with(" Shift + Space ▲ ─┐"));
         assert_eq!(UnicodeWidthStr::width(painted(&lines[0]).as_str()), 79);
         assert!(lines[0].tail.iter().any(|span| span.tone == Tone::FastOff));
         assert_eq!(pick_on(&lines[0], "▲"), Some(Pick::PlanSummary));
@@ -13937,7 +13971,7 @@ mod tests {
 
         assert_eq!(lines.len(), 2);
         assert!(painted(&lines[0]).starts_with("─── 작업 단계"));
-        assert!(painted(&lines[0]).trim_end().ends_with("Shift + Tab ▼ ──"));
+        assert!(painted(&lines[0]).trim_end().ends_with("Shift + Space ▼ ──"));
         assert_eq!(lines[0].tail[0].tone, Tone::FastOff);
         assert!(!painted(&lines[0]).contains(['┌', '┐']));
         assert_eq!(pick_on(&lines[0], "작업 단계"), None);
@@ -13946,7 +13980,7 @@ mod tests {
         assert_eq!(
             Renderer::hover_columns(&lines[0], None, Some(&Pick::PlanSummary))
                 .map(|columns| columns.len()),
-            Some(17)
+            Some(19)
         );
     }
 
