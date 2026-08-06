@@ -465,7 +465,14 @@ async function createSession(params, resumeId) {
     throw error;
   }
   session.models = Array.isArray(initialization.models) ? initialization.models : [];
-  session.effort = supportedEffort(modelCapabilities(session.models, params.model), params.effort);
+  const capabilities = modelCapabilities(session.models, params.model);
+  // A resumed session can only name its model as the resolved id the transcript
+  // recorded (`claude-opus-4-5-...`), which matches nothing in the host's model
+  // list. Report the catalog value instead so the picker lands on that model.
+  if (capabilities?.value && capabilities.value !== "default") {
+    session.model = visibleModel(capabilities.value);
+  }
+  session.effort = supportedEffort(capabilities, params.effort);
   const account = initialization.account || await safeAccount(agentQuery);
   const usage = await safeUsage(agentQuery);
   return { session, initialization, account, usage };
@@ -703,15 +710,21 @@ function updatePlanFromToolResult(session, pending, message) {
       session.tasks.set(temporary.id, temporary);
     }
   } else if (pending.name === "TaskList" && Array.isArray(value?.tasks || value)) {
-    session.tasks.clear();
+    const turnId = session.turn?.id;
+    const previous = session.tasks;
+    session.tasks = new Map();
     for (const task of value.tasks || value) {
-      session.tasks.set(String(task.id), {
-        id: String(task.id),
+      const id = String(task.id);
+      session.tasks.set(id, {
+        id,
         subject: task.subject || task.description || "작업",
         status: task.status || "pending",
-        turnId: session.turn?.id,
+        // 이 턴에서 다룬 적 없는 작업은 이전 턴의 것이므로 원래 turnId를 지켜 준다.
+        turnId: previous.get(id)?.turnId ?? turnId,
       });
     }
+    // TaskList는 세션 전체 목록을 돌려주므로, 지난 턴에 끝난 작업까지 되살아나지 않게 걷어낸다.
+    pruneFinishedTasks(session.tasks, turnId);
     emitPlan(session);
   }
 }
@@ -742,9 +755,11 @@ function emitPlan(session) {
   });
 }
 
+// Claude의 Task 번호는 세션 전체에서 누적되므로 모델이 붙인 `4. `를 그대로 쓰면
+// 다음 계획이 4번부터 시작한다. 지금 보여줄 목록 기준으로 항상 1번부터 다시 매긴다.
 function numberedTaskSubject(subject, index) {
-  const text = String(subject || "작업").trim();
-  return /^\d+\.\s/.test(text) ? text : `${index + 1}. ${text}`;
+  const text = String(subject || "작업").trim().replace(/^\d+[.)]\s*/, "").trim();
+  return `${index + 1}. ${text || "작업"}`;
 }
 
 // 서브에이전트는 자기 메시지를 부모 Task 툴콜의 `parent_tool_use_id`와 함께 흘려보낸다.
@@ -1151,8 +1166,10 @@ function historyTurns(messages) {
             tasks.set(temporary.id, temporary);
           }
         } else if (pending.name === "TaskList" && Array.isArray(message.tool_use_result?.tasks)) {
+          const known = new Map(tasks);
           tasks.clear();
-          for (const task of message.tool_use_result.tasks) tasks.set(String(task.id), { id: String(task.id), subject: task.subject || "작업", status: task.status || "pending", turnId: turn.id });
+          for (const task of message.tool_use_result.tasks) tasks.set(String(task.id), { id: String(task.id), subject: task.subject || "작업", status: task.status || "pending", turnId: known.get(String(task.id))?.turnId ?? turn.id });
+          pruneFinishedTasks(tasks, turn.id);
         } else if (pending.item) {
           const output = toolOutput(block.content, message.tool_use_result);
           Object.assign(pending.item, pending.item.type === "commandExecution"
@@ -1215,7 +1232,14 @@ async function dispatch(method, params = {}) {
     if (!info) throw new Error(`Claude 세션을 찾을 수 없습니다: ${id}`);
     const messages = await getSessionMessages(id, { dir: params.cwd, includeSystemMessages: true });
     const lastModel = [...messages].reverse().find((message) => message.type === "assistant")?.message?.model;
-    const { session, account, usage } = await createSession({ ...params, cwd: info.cwd || params.cwd, model: params.model || lastModel }, id);
+    // The transcript's own model outranks the host's fallback, which is only what
+    // a new session would have opened on.
+    const { session, account, usage } = await createSession({
+      ...params,
+      cwd: info.cwd || params.cwd,
+      model: params.model || lastModel || params.fallbackModel,
+      effort: params.effort || params.fallbackEffort,
+    }, id);
     const tokenUsage = historyTokenUsage(messages, session.models, session.model);
     // Seed the live session so the next turn keeps reporting a full context.
     session.lastContextUsage = tokenUsage?.last || null;

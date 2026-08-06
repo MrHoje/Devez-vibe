@@ -45,6 +45,14 @@ struct Route {
     codex_seen_through: u64,
     open_code_seen_through: u64,
     claude_seen_through: u64,
+    /// The model and effort this thread's Claude turns last ran on. The SDK
+    /// transcript records neither — it names the resolved model, not the id the
+    /// picker uses, and never the effort — so a resumed session would otherwise
+    /// reopen on the launch defaults no matter what it was running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude_effort: Option<String>,
 }
 
 impl Route {
@@ -359,9 +367,11 @@ impl BackendServer {
                     let backing = self
                         .backing_id(&visible, RuntimeKind::Claude)
                         .unwrap_or_else(|_| raw_thread_id(&visible).to_owned());
+                    let route = self.route(&visible);
                     let cwd = request_cwd(&params)
-                        .or_else(|| self.route(&visible).map(|route| route.cwd))
+                        .or_else(|| route.as_ref().map(|route| route.cwd.clone()))
                         .unwrap_or_else(|| self.cwd.clone());
+                    apply_remembered_claude_selection(&mut params, route.as_ref());
                     let mut response = self
                         .claude
                         .request(
@@ -443,6 +453,15 @@ impl BackendServer {
                     insert_handoff_context(&mut params, context);
                 }
 
+                // Read before the request: the Codex branch consumes `params`.
+                let turn_model = params
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                let turn_effort = params
+                    .get("effort")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
                 let response: Result<Value> = async {
                     if selected == RuntimeKind::Claude {
                         let backing = self.ensure_claude_route(&visible, &params).await?;
@@ -493,6 +512,13 @@ impl BackendServer {
                 .await;
 
                 if response.is_ok() {
+                    if selected == RuntimeKind::Claude {
+                        self.note_claude_selection(
+                            &visible,
+                            turn_model.as_deref(),
+                            turn_effort.as_deref(),
+                        );
+                    }
                     if let Some(snapshot) = snapshot {
                         if switching {
                             self.note_seen_through(&visible, previous, snapshot.last_block_id);
@@ -993,6 +1019,8 @@ impl BackendServer {
                 codex_seen_through: 0,
                 open_code_seen_through: 0,
                 claude_seen_through: 0,
+                claude_model: None,
+                claude_effort: None,
             });
             route.active = active;
             route.cwd = cwd;
@@ -1117,6 +1145,30 @@ impl BackendServer {
         self.route(visible)
             .map(|route| route.active)
             .unwrap_or_else(|| id_runtime(visible))
+    }
+
+    /// Remembers what a Claude turn ran on. Written on every turn and persisted
+    /// with the route, so the next resume — this session or a later launch —
+    /// reopens the thread on the model and effort it was actually using.
+    fn note_claude_selection(&self, visible: &str, model: Option<&str>, effort: Option<&str>) {
+        let model = model.filter(|model| is_claude_model(model));
+        let effort = effort.filter(|effort| !effort.is_empty());
+        if model.is_none() && effort.is_none() {
+            return;
+        }
+        {
+            let mut routes = self.routes.lock().expect("routes mutex");
+            let Some(route) = routes.get_mut(visible) else {
+                return;
+            };
+            if let Some(model) = model {
+                route.claude_model = Some(model.to_owned());
+            }
+            if let Some(effort) = effort {
+                route.claude_effort = Some(effort.to_owned());
+            }
+        }
+        self.persist_routes();
     }
 
     fn note_seen_through(&self, visible: &str, kind: RuntimeKind, block_id: u64) {
@@ -1771,6 +1823,28 @@ fn selected_runtime(model: Option<&str>, current: RuntimeKind) -> RuntimeKind {
     })
 }
 
+/// Reopens a resumed Claude session on what the thread's own turns ran on. An
+/// explicit `--model`/`--effort` outranks the record; the host's saved default
+/// stays behind in `claudeFallbackModel`/`claudeFallbackEffort`, where the bridge
+/// reaches it only after the transcript's own model.
+fn apply_remembered_claude_selection(params: &mut Value, route: Option<&Route>) {
+    for (key, remembered) in [
+        ("model", route.and_then(|route| route.claude_model.clone())),
+        ("effort", route.and_then(|route| route.claude_effort.clone())),
+    ] {
+        let requested = params
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty());
+        if requested {
+            continue;
+        }
+        if let Some(value) = remembered {
+            params[key] = json!(value);
+        }
+    }
+}
+
 fn claude_session_params(params: &Value, cwd: &Path, session_id: Option<&str>) -> Value {
     let mut request = json!({
         "cwd": cwd,
@@ -1796,6 +1870,20 @@ fn claude_session_params(params: &Value, cwd: &Path, session_id: Option<&str>) -
         .filter(|mode| !mode.is_empty())
     {
         request["permissionMode"] = json!(mode);
+    }
+    // Last resort, below the transcript's own model: what the host would open a
+    // new session on. The bridge applies these only when nothing better exists.
+    for (from, to) in [
+        ("claudeFallbackModel", "fallbackModel"),
+        ("claudeFallbackEffort", "fallbackEffort"),
+    ] {
+        if let Some(value) = params
+            .get(from)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            request[to] = json!(value);
+        }
     }
     if let Some(session_id) = session_id {
         request["sessionId"] = json!(session_id);
@@ -1828,7 +1916,67 @@ mod tests {
             codex_seen_through: 12,
             open_code_seen_through: 0,
             claude_seen_through: 7,
+            claude_model: None,
+            claude_effort: None,
         }
+    }
+
+    /// The whole point of the record: a resumed thread reopens on what it ran on,
+    /// not on the launch default the host offers as a fallback.
+    #[test]
+    fn a_resumed_claude_thread_prefers_what_its_own_turns_ran_on() {
+        let mut remembered = route(RuntimeKind::Claude, None, Some("claude-uuid"));
+        remembered.claude_model = Some("claude:opus".to_owned());
+        remembered.claude_effort = Some("max".to_owned());
+        let mut params = json!({
+            "claudeFallbackModel": "claude:sonnet",
+            "claudeFallbackEffort": "high"
+        });
+
+        apply_remembered_claude_selection(&mut params, Some(&remembered));
+
+        assert_eq!(params["model"], json!("claude:opus"));
+        assert_eq!(params["effort"], json!("max"));
+    }
+
+    /// A thread with no record leaves `model`/`effort` empty so the bridge can put
+    /// the transcript's own model first; the saved default rides on as a fallback.
+    #[test]
+    fn a_claude_thread_with_no_record_leaves_the_choice_to_the_transcript() {
+        let forgotten = route(RuntimeKind::Claude, None, Some("claude-uuid"));
+        let mut params = json!({
+            "claudeFallbackModel": "claude:sonnet",
+            "claudeFallbackEffort": "high"
+        });
+
+        apply_remembered_claude_selection(&mut params, Some(&forgotten));
+
+        assert!(params.get("model").is_none());
+        assert!(params.get("effort").is_none());
+
+        let request = claude_session_params(&params, Path::new("C:/repo"), Some("claude-uuid"));
+
+        assert_eq!(request["fallbackModel"], json!("claude:sonnet"));
+        assert_eq!(request["fallbackEffort"], json!("high"));
+    }
+
+    /// `--model`/`--effort` are the explicit ask, so neither the record nor the
+    /// saved default may overwrite them.
+    #[test]
+    fn an_explicit_model_and_effort_outrank_the_remembered_selection() {
+        let mut remembered = route(RuntimeKind::Claude, None, Some("claude-uuid"));
+        remembered.claude_model = Some("claude:opus".to_owned());
+        remembered.claude_effort = Some("max".to_owned());
+        let mut params = json!({
+            "model": "claude:fable",
+            "effort": "low",
+            "claudeFallbackModel": "claude:sonnet"
+        });
+
+        apply_remembered_claude_selection(&mut params, Some(&remembered));
+
+        assert_eq!(params["model"], json!("claude:fable"));
+        assert_eq!(params["effort"], json!("low"));
     }
 
     #[test]

@@ -7081,7 +7081,16 @@ fn input_lines_with_controls(
         cursor_column = column;
     }
 
-    let mut rows = Vec::with_capacity(raw_rows.len() + 2);
+    // Past this the composer stops growing and scrolls inside itself, the way
+    // Claude Code's does, so a long draft cannot push the transcript off screen.
+    // The window follows the cursor row.
+    let visible_start = raw_rows
+        .len()
+        .saturating_sub(COMPOSER_MAX_PROMPT_ROWS)
+        .min(cursor_row.saturating_sub(COMPOSER_MAX_PROMPT_ROWS - 1));
+    let visible_end = (visible_start + COMPOSER_MAX_PROMPT_ROWS).min(raw_rows.len());
+
+    let mut rows = Vec::with_capacity(visible_end - visible_start + 2);
     rows.push(input_top_line_with_controls(
         panel_width,
         label,
@@ -7089,7 +7098,12 @@ fn input_lines_with_controls(
         controls_mode,
     ));
     let chrome_tone = composer_chrome_tone(mode);
-    for (index, raw) in raw_rows.into_iter().enumerate() {
+    for (index, raw) in raw_rows
+        .into_iter()
+        .enumerate()
+        .skip(visible_start)
+        .take(visible_end - visible_start)
+    {
         let is_placeholder = editor.is_empty() && composer_images.is_empty() && index == 0;
         let content = if is_placeholder {
             placeholder.to_owned()
@@ -7146,14 +7160,24 @@ fn input_lines_with_controls(
     let layout = ComposerLayout {
         rows: row_glyphs
             .into_iter()
+            .skip(visible_start)
+            .take(visible_end - visible_start)
             .map(|glyphs| ComposerRowLayout {
                 start_column: input_prefix_width,
                 glyphs,
             })
             .collect(),
     };
-    (rows, cursor_row + 1, cursor_column, layout)
+    (
+        rows,
+        cursor_row - visible_start + 1,
+        cursor_column,
+        layout,
+    )
 }
+
+/// Prompt rows the composer paints before it starts scrolling instead of growing.
+const COMPOSER_MAX_PROMPT_ROWS: usize = 10;
 
 /// Shortest rule stub kept on the composer top line so the frame never collapses.
 const COMPOSER_RULE_MIN: usize = 4;
@@ -8787,6 +8811,35 @@ mod tests {
             painted(rows.last().expect("bottom rule")),
             "╰───────────────╯"
         );
+    }
+
+    #[test]
+    fn a_tall_draft_stops_growing_and_scrolls_with_the_cursor() {
+        let mut editor = Editor::default();
+        editor.set_text(
+            (1..=20)
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+
+        let (rows, cursor_row, _, layout) =
+            input_lines(&editor, &[], 40, "", "placeholder", None, None);
+
+        assert_eq!(rows.len(), COMPOSER_MAX_PROMPT_ROWS + 2, "the two rules stay");
+        assert_eq!(layout.rows.len(), COMPOSER_MAX_PROMPT_ROWS);
+        assert_eq!(cursor_row, COMPOSER_MAX_PROMPT_ROWS, "the last row is in view");
+        assert!(painted(&rows[1]).contains("11"), "the window follows the cursor");
+        assert!(painted(&rows[COMPOSER_MAX_PROMPT_ROWS]).contains("20"));
+
+        // Back at the top, the window shows the first rows and the prompt mark.
+        for _ in 0..19 {
+            editor.move_up();
+        }
+        let (rows, cursor_row, _, _) = input_lines(&editor, &[], 40, "", "placeholder", None, None);
+        assert_eq!(cursor_row, 1);
+        assert!(painted(&rows[1]).starts_with("│ > 1"));
+        assert!(painted(&rows[COMPOSER_MAX_PROMPT_ROWS]).contains("10"));
     }
 
     #[test]

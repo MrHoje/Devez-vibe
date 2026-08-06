@@ -1,5 +1,8 @@
 pub const ATTACHMENT_PLACEHOLDER: char = '\u{fffc}';
 
+/// How many lines a paste needs before the composer shows it as one summary.
+const COLLAPSE_MIN_LINES: usize = 6;
+
 #[derive(Default)]
 pub struct Editor {
     buffer: Vec<char>,
@@ -104,11 +107,27 @@ impl Editor {
         }
         self.move_to_collapsed_paste_end();
         let start = self.cursor;
-        self.insert_str(text);
         let lines = text.chars().filter(|&ch| ch == '\n').count() + 1;
-        self.collapsed_paste_lines = (lines >= 6).then_some(lines);
-        self.collapsed_paste_start = self.collapsed_paste_lines.map(|_| start);
-        self.collapsed_paste_end = self.collapsed_paste_lines.map(|_| self.cursor);
+        if lines < COLLAPSE_MIN_LINES {
+            // Text too short to collapse is ordinary input — on Windows a fast
+            // typing run reaches here as a "paste". It must leave the block
+            // already collapsed alone, only shifting it when it lands ahead.
+            let inserted = text.chars().count();
+            self.insert_str(text);
+            if self
+                .collapsed_paste_start
+                .is_some_and(|paste_start| start <= paste_start)
+            {
+                self.collapsed_paste_start =
+                    self.collapsed_paste_start.map(|value| value + inserted);
+                self.collapsed_paste_end = self.collapsed_paste_end.map(|value| value + inserted);
+            }
+            return;
+        }
+        self.insert_str(text);
+        self.collapsed_paste_lines = Some(lines);
+        self.collapsed_paste_start = Some(start);
+        self.collapsed_paste_end = Some(self.cursor);
     }
 
     pub fn paste_summary_lines(&self) -> Option<usize> {
@@ -795,6 +814,36 @@ mod tests {
         editor.insert('!');
         assert_eq!(editor.paste_summary_lines(), Some(6));
         assert_eq!(editor.text(), "one\ntwo\nthree\nfour\nfive\nsix!");
+    }
+
+    #[test]
+    fn a_short_burst_after_a_paste_keeps_the_block_collapsed() {
+        let text = "one\ntwo\nthree\nfour\nfive\nsix";
+        let mut editor = Editor::default();
+        editor.insert_paste_str(text);
+        let range = editor.collapsed_paste_range().expect("collapsed");
+
+        // Windows reports a fast typing run as a paste; it is not the block.
+        editor.insert_paste_str(" more");
+
+        assert_eq!(editor.paste_summary_lines(), Some(6));
+        assert_eq!(editor.collapsed_paste_range(), Some(range));
+        assert_eq!(editor.text(), format!("{text} more"));
+    }
+
+    #[test]
+    fn a_short_burst_before_a_paste_shifts_the_collapsed_block() {
+        let text = "one\ntwo\nthree\nfour\nfive\nsix";
+        let mut editor = Editor::default();
+        editor.insert_paste_str(text);
+        editor.move_home();
+        editor.move_left();
+
+        editor.insert_paste_str("ab");
+
+        assert_eq!(editor.paste_summary_lines(), Some(6));
+        assert_eq!(editor.collapsed_paste_range(), Some(2..2 + text.chars().count()));
+        assert_eq!(editor.text(), format!("ab{text}"));
     }
 
     #[test]

@@ -3795,6 +3795,17 @@ impl AppState {
         &self.selected_effort
     }
 
+    /// Super Vibe drops the plan panel from the frame. The host already lists the
+    /// same steps in its own task view, so repeating them under the transcript is
+    /// the kind of detail that setting exists to keep out of sight. The plan
+    /// itself is untouched — a handoff and the other presets still read it.
+    fn visible_plan_summary(&self) -> Option<&PlanSummary> {
+        if self.vibe_mode == VibeMode::SuperVibe {
+            return None;
+        }
+        self.plan_summary.as_ref()
+    }
+
     pub fn provider_handoff_plan(&self) -> Option<String> {
         let plan = self.plan_summary.as_ref()?;
         if plan.explanation.is_none() && plan.steps.is_empty() {
@@ -4459,7 +4470,7 @@ impl AppState {
         View {
             live_blocks,
             overlay: self.overlay_view(),
-            plan_summary: self.plan_summary.as_ref(),
+            plan_summary: self.visible_plan_summary(),
             plan_active: self.busy,
             plan_shimmer_phase: self.plan_shimmer_phase(),
             editor: &self.editor,
@@ -4581,7 +4592,7 @@ impl AppState {
             activity: self.activity(),
             activity_model: self.activity_model(),
             activity_phase: self.activity_phase(),
-            plan_summary: self.plan_summary.as_ref(),
+            plan_summary: self.visible_plan_summary(),
             plan_active: self.busy,
             plan_shimmer_phase: self.plan_shimmer_phase(),
             composer_mode: Some(self.composer_mode()),
@@ -10636,6 +10647,36 @@ mod tests {
         state.cycle_response_length();
         assert_eq!(state.response_length_label(), "Detailed");
         assert_eq!(state.model_verbosity(), "high");
+    }
+
+    /// The host lists the same steps in its own task view, so the panel is the
+    /// kind of duplicate Super Vibe keeps off the frame. Only the frame changes:
+    /// the plan is still there for a provider handoff and for the other presets.
+    #[test]
+    fn super_vibe_keeps_the_plan_panel_off_the_frame() {
+        let mut state = test_state();
+        state.plan_summary = Some(PlanSummary {
+            explanation: None,
+            steps: vec![PlanStep {
+                text: "1. 원인 확인".to_owned(),
+                status: PlanStepStatus::InProgress,
+                started_at: None,
+                elapsed: None,
+            }],
+            expanded: true,
+            started_at: Instant::now(),
+            elapsed: None,
+        });
+        while state.vibe_mode() != VibeMode::SuperVibe {
+            state.cycle_vibe_mode();
+        }
+
+        assert!(state.view().plan_summary.is_none());
+        assert!(state.animation_view().plan_summary.is_none());
+        assert!(state.provider_handoff_plan().is_some());
+
+        state.cycle_vibe_mode();
+        assert!(state.view().plan_summary.is_some());
     }
 
     #[test]

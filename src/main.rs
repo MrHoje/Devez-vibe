@@ -333,6 +333,7 @@ async fn start_session(
             cwd,
             state.model_verbosity(),
             &claude,
+            cli.effort.as_deref(),
         ),
         read_runtime_account_plan(server, requested_model_name),
         None,
@@ -2788,7 +2789,9 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 기본 분량은 세 줄 전후이며, 사용자가 자세한 설명을 요청할 때만 늘린다.\n",
     "- 산문 문단 대신 불릿과 코드 블록을 쓴다.\n",
     "- 코드 변경은 파일 경로와 핵심 코드만 보여주고, 요청받지 않은 해설을 덧붙이지 않는다.\n",
-    "- Super Vibe 모드에서 반드시 필요한 상황이 아닌 단순 안내에는 클래스명, 코드명 등 기술 식별자를 출력하지 않는다.\n",
+    "- Super Vibe 모드에서는 파일 경로, 코드 블록, 함수·클래스·변수·설정 키 이름을 답변에 넣지 않는다. ",
+    "무엇을 어떻게 바꿨는지 일상 언어로만 설명하고, 계획이나 작업 단계를 답변 본문에 다시 나열하지 않는다. ",
+    "사용자가 코드나 경로를 직접 요청했거나, 그것 없이는 사용자가 판단할 수 없는 경우에만 보여준다.\n",
     "- 작업을 완료하면 사용자의 요청을 기준으로 정확히 무엇을 완료했는지 `~ 내용을 완료했습니다.` 형식으로 분명하게 알린다.\n",
     "- 하지 않기로 한 선택지나 이미 정해진 결정을 다시 나열하지 않는다.\n",
     "- Skill 적용, 지침 확인, 내부 도구 호출 같은 내부 절차를 사용자에게 commentary로 알리지 않는다. ",
@@ -2818,22 +2821,32 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 기본 분량은 세 줄 전후이며, 사용자가 자세한 설명을 요청할 때만 늘린다.\n",
     "- 산문 문단 대신 불릿과 코드 블록을 쓴다.\n",
     "- 코드 변경은 파일 경로와 핵심 코드만 보여주고, 요청받지 않은 해설을 덧붙이지 않는다.\n",
-    "- Super Vibe 모드에서 반드시 필요한 상황이 아닌 단순 안내에는 클래스명, 코드명 등 기술 식별자를 출력하지 않는다.\n",
+    "- Super Vibe 모드에서는 파일 경로, 코드 블록, 함수·클래스·변수·설정 키 이름을 답변에 넣지 않는다. ",
+    "무엇을 어떻게 바꿨는지 일상 언어로만 설명하고, 계획이나 작업 단계를 답변 본문에 다시 나열하지 않는다. ",
+    "사용자가 코드나 경로를 직접 요청했거나, 그것 없이는 사용자가 판단할 수 없는 경우에만 보여준다.\n",
     "- 작업을 완료하면 사용자의 요청을 기준으로 정확히 무엇을 완료했는지 `~ 내용을 완료했습니다.` 형식으로 분명하게 알린다.\n",
     "- 하지 않기로 한 선택지나 이미 정해진 결정을 다시 나열하지 않는다.\n",
     "- 사용자에게 보이는 진행 안내와 답변은 사용자가 요청한 언어로 작성한다. ",
     "한국어 요청에는 `Now ...` 같은 독립된 영어 진행 문장을 출력하지 않는다.\n",
     "중간 진행 보고 규칙:\n",
-    "- 단순 질문이 아닌 작업은 첫 도구 호출 전에 현재 확인하거나 처리할 내용을 한국어 한두 줄로 알린다.\n",
-    "- 작업 중 원인이나 중요한 사실을 확인했을 때, 실제 변경을 마쳤을 때, 검증을 시작할 때 진행 상황을 한국어 한두 줄로 알린다.\n",
-    "- 도구 작업이 계속되는 동안 사용자에게 보이는 진행 안내 없이 60초 이상 지나지 않게 한다. ",
-    "같은 내용을 반복하거나 도구 이름과 내부 절차만 나열하지 않는다.\n",
-    "- Skill 적용, 지침 확인, 내부 도구 호출 같은 내부 절차를 사용자에게 진행 상황으로 알리지 않는다. ",
-    "사용자 판단에 필요한 진행 상황이나 결과만 알린다.\n",
+    "- 단순 질문이 아닌 작업은 첫 도구 호출 전에 착수 안내를 먼저 출력한다. ",
+    "무엇을 어떤 순서로 확인하고 어떻게 이어갈지 완결된 한국어 문장 두세 개로 쓰고 `~하겠습니다.` 형태로 끝낸다. ",
+    "서론을 쓰지 않는다는 규칙의 예외다.\n",
+    "- 진행 안내는 확인한 사실을 한 문장으로 먼저 적고, 그에 따라 무엇을 하겠는지 한 문장으로 잇는다. ",
+    "무엇이 어떤 조건에서 잘못되는지 밝히고 어디를 어떻게 보완하겠다고 예고한 뒤 곧바로 실행한다. ",
+    "`확인 중`처럼 토막 난 표현이나 도구 이름 나열로 대신하지 않는다.\n",
+    "- 새로 알게 된 사실, 변경 완료, 검증 시작, 점검 범위 변경은 그 자리에서 알린다. ",
+    "여러 단계를 조용히 처리한 뒤 마지막에 한꺼번에 설명하지 않으며, 진행 안내 없이 60초 이상 지나지 않게 한다.\n",
+    "- 완료 보고에는 무엇을 고쳤는지, 어떤 검증을 통과했는지, 남은 제약이나 사용자가 이어서 해야 할 일까지 적는다. ",
+    "검증하지 못한 부분이 있으면 숨기지 않고 그대로 밝힌다.\n",
+    "- Skill 적용, 지침 확인 같은 내부 절차는 알리지 않는다. ",
+    "다른 규칙이나 훅이 서두 생략과 극단적 압축을 요구해도 착수 안내와 진행 안내는 생략하지 않는다.\n",
     "작업 단계 규칙:\n",
     "- 파일 수정, 원인 분석, 코드 리뷰처럼 단순 질문이 아닌 작업은 시작 전에 Claude Code의 TaskCreate로 짧은 작업 목록을 만든다.\n",
     "- 작은 작업은 Task 한두 개면 충분하다.\n",
-    "- 모든 Task의 subject는 순서대로 `1. `, `2. `, `3.`처럼 번호로 시작한다.\n",
+    "- 모든 Task의 subject는 순서대로 `1. `, `2. `, `3. `처럼 번호로 시작한다. ",
+    "번호는 새 작업 목록마다 항상 `1. `부터 다시 시작하고, 이전 작업 목록에서 쓴 번호에 이어 붙이지 않는다. ",
+    "TaskList에 이미 끝난 Task가 남아 있어도 그 번호를 이어받지 않는다.\n",
     "- 각 Task는 착수 즉시 TaskUpdate로 `in_progress`, 끝나면 즉시 `completed`로 바꾼다.\n",
     "- TaskList로 현재 단계를 확인하고, 동시에 `in_progress`인 Task는 하나만 둔다.\n",
     "- 질문에만 답하는 턴에는 Task를 만들지 않는다.\n",
@@ -2850,8 +2863,10 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
 /// back as the SDK's own default, which is what used to reset the model, the
 /// effort and the permission badge on each `/resume`.
 struct ClaudeSessionSettings {
-    /// Empty while a Codex model is selected: the resumed transcript then picks
-    /// the model itself rather than being forced onto a non-Claude id.
+    /// Only a fallback: a resumed thread reopens on the model its own turns ran
+    /// on, and this saved default is what a thread with no such record gets.
+    /// Empty while a Codex model is selected, since forcing a non-Claude id on a
+    /// Claude session would leave it with no model at all.
     model: String,
     effort: String,
     permission_mode: String,
@@ -2889,15 +2904,14 @@ fn resume_thread_params(thread_id: &str, claude: &ClaudeSessionSettings) -> Valu
             "itemsView": "full"
         }
     });
-    // Only a Claude thread takes the model and effort from the picker; a Codex
-    // resume keeps whatever its own thread was recorded with.
-    if claude::is_claude_thread(thread_id) {
-        if !claude.model.is_empty() {
-            params["model"] = json!(claude.model);
-        }
-        if !claude.effort.is_empty() {
-            params["effort"] = json!(claude.effort);
-        }
+    // Sent as fallbacks, not as the choice: the backend prefers what this
+    // thread's own turns ran on, and only reaches for these when it has no
+    // record. `model`/`effort` stay free for an explicit `--model`/`--effort`.
+    if !claude.model.is_empty() {
+        params["claudeFallbackModel"] = json!(claude.model);
+    }
+    if !claude.effort.is_empty() {
+        params["claudeFallbackEffort"] = json!(claude.effort);
     }
     params
 }
@@ -3924,11 +3938,16 @@ async fn start_or_resume_thread(
     new_cwd: &Path,
     model_verbosity: &str,
     claude: &ClaudeSessionSettings,
+    effort: Option<&str>,
 ) -> Result<Value> {
     if let Some(thread_id) = resume {
         let mut params = resume_thread_params(thread_id, claude);
         if let Some(model) = model {
             params["model"] = json!(model);
+        }
+        // `--effort` is the one effort that outranks the thread's own record.
+        if let Some(effort) = effort.filter(|effort| !effort.is_empty()) {
+            params["effort"] = json!(effort);
         }
         if let Some(cwd) = resume_cwd {
             params["cwd"] = json!(cwd.to_string_lossy());
@@ -4586,28 +4605,24 @@ mod tests {
         }
     }
 
+    /// The saved default rides along as a fallback only: forcing it into `model`
+    /// would outrank what the resumed thread's own turns ran on.
     #[test]
-    fn a_resumed_claude_thread_reopens_on_the_selected_model_effort_and_mode() {
+    fn a_resumed_thread_carries_the_saved_defaults_as_fallbacks() {
         let params = resume_thread_params("claude:session-1", &test_claude_settings());
 
         assert_eq!(
-            params.pointer("/model").and_then(Value::as_str),
+            params.pointer("/claudeFallbackModel").and_then(Value::as_str),
             Some("claude:opus")
         );
         assert_eq!(
-            params.pointer("/effort").and_then(Value::as_str),
+            params.pointer("/claudeFallbackEffort").and_then(Value::as_str),
             Some("xhigh")
         );
         assert_eq!(
             params.pointer("/claudePermissionMode").and_then(Value::as_str),
             Some("acceptEdits")
         );
-    }
-
-    #[test]
-    fn a_resumed_codex_thread_keeps_its_own_model_and_effort() {
-        let params = resume_thread_params("thread-1", &test_claude_settings());
-
         assert!(params.get("model").is_none());
         assert!(params.get("effort").is_none());
     }
@@ -4635,6 +4650,18 @@ mod tests {
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`Now ...` 같은 독립된 영어 진행 문장"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("첫 도구 호출 전에"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("60초 이상 지나지 않게"));
+        // The opening notice is the one thing a compression rule elsewhere must not
+        // be able to talk the model out of, so both halves of it are pinned here.
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`~하겠습니다.` 형태로 끝낸다"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("서론을 쓰지 않는다는 규칙의 예외"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("60초 이상 지나지 않게"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("착수 안내와 진행 안내는 생략하지 않는다"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("파일 경로, 코드 블록"));
+        // Progress lines are the pairing of a finding and the next move; a rule that
+        // only asks for "a line or two" drifts back into terse fragments.
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("확인한 사실을 한 문장으로 먼저 적고"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("마지막에 한꺼번에 설명하지 않으며"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("검증하지 못한 부분이 있으면 숨기지 않고"));
     }
 
     #[test]
