@@ -28,8 +28,8 @@ use crate::{
     renderer::{
         AnimationView, Block, BlockKind, ComposerMode, EffortSlider, HIDDEN_STATUS_LINE,
         LiveBlockView, ModeAccent, OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS, PlanStep,
-        PlanStepStatus, PlanSummary, StatusLineView, SuggestionView, VibeTone, View, WelcomeView,
-        visible_window,
+        PlanStepStatus, PlanSummary, ProviderHandoffBlock, StatusLineView, SuggestionView, VibeTone,
+        View, WelcomeView, visible_window,
     },
     rollout::{PlanSnapshot, Rollout, RolloutEvent, RolloutKind},
     theme::{self, ThemeKind},
@@ -2825,6 +2825,15 @@ impl AppState {
         ModelProvider::from_model(self.selected_model_name())
     }
 
+    fn provider_switch_pending(&self) -> bool {
+        self.busy
+            && self
+                .active_turn_model
+                .as_deref()
+                .or(self.pending_turn_model.as_deref())
+                .is_some_and(|model| ModelProvider::from_model(model) != self.selected_provider())
+    }
+
     fn provider_model_indices(&self, provider: ModelProvider) -> Vec<usize> {
         self.models
             .iter()
@@ -3393,6 +3402,50 @@ impl AppState {
 
     pub fn selected_effort(&self) -> &str {
         &self.selected_effort
+    }
+
+    pub fn provider_handoff_plan(&self) -> Option<String> {
+        let plan = self.plan_summary.as_ref()?;
+        if plan.explanation.is_none() && plan.steps.is_empty() {
+            return None;
+        }
+        let mut lines = Vec::new();
+        if let Some(explanation) = plan.explanation.as_deref() {
+            lines.push(explanation.to_owned());
+        }
+        lines.extend(plan.steps.iter().map(|step| {
+            let status = match step.status {
+                PlanStepStatus::Completed => "완료",
+                PlanStepStatus::InProgress => "진행 중",
+                PlanStepStatus::Pending => "대기",
+            };
+            format!("- [{status}] {}", step.text)
+        }));
+        Some(lines.join("\n"))
+    }
+
+    pub fn pending_provider_handoff_blocks(&self) -> Vec<ProviderHandoffBlock> {
+        self.committed_before_current_prompt()
+            .iter()
+            .filter_map(ProviderHandoffBlock::from_block)
+            .collect()
+    }
+
+    pub fn last_pending_handoff_block_id(&self) -> u64 {
+        self.committed_before_current_prompt()
+            .iter()
+            .map(Block::id)
+            .max()
+            .unwrap_or_default()
+    }
+
+    fn committed_before_current_prompt(&self) -> &[Block] {
+        let end = self.committed.len().saturating_sub(usize::from(
+            self.committed
+                .last()
+                .is_some_and(|block| matches!(block.kind, BlockKind::User)),
+        ));
+        &self.committed[..end]
     }
 
     pub fn service_tier(&self) -> &str {
@@ -3976,7 +4029,9 @@ impl AppState {
             editor: &self.editor,
             composer_images: &self.composer_images,
             queued_prompts: self.queued_prompts.iter().cloned().collect(),
-            composer_placeholder: if self.busy {
+            composer_placeholder: if self.provider_switch_pending() {
+                "Enter: queue for switched provider · Tab: queue"
+            } else if self.busy {
                 "Enter: steer · Tab: queue"
             } else {
                 ""
@@ -5114,6 +5169,10 @@ impl AppState {
         }
         if text.starts_with('/') && !text.contains('\n') {
             return self.run_slash_command(&text);
+        }
+        if self.provider_switch_pending() {
+            self.queued_prompts.push_back(text);
+            return Action::None;
         }
         self.commit_welcome_card();
         self.committed
@@ -12076,6 +12135,61 @@ mod tests {
 
         assert!(matches!(action, Action::Submit(text) if text == "next prompt"));
         assert!(state.busy);
+    }
+
+    #[test]
+    fn prompt_after_a_busy_provider_switch_waits_for_the_new_provider() {
+        let models = vec![
+            test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
+            test_model("claude:sonnet", "Claude Sonnet", false),
+        ];
+        let mut state = AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            models,
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+        state.busy = true;
+        state.turn_id = Some("codex-turn".to_owned());
+        state.active_turn_model = Some("gpt-5.6-sol".to_owned());
+        state.run_slash_command("/claude");
+        state.editor.set_text("Claude로 이어서 처리해");
+
+        let action = state.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        assert!(matches!(action, Action::None));
+        assert_eq!(
+            state.queued_prompts.front().map(String::as_str),
+            Some("Claude로 이어서 처리해")
+        );
+        assert!(state
+            .view()
+            .composer_placeholder
+            .contains("switched provider"));
+
+        state.handle_notification("turn/completed", &json!({}));
+        let queued = state.take_queued_prompt().unwrap();
+        assert!(matches!(state.start_queued_prompt(queued), Action::Submit(_)));
+        assert_eq!(state.selected_model_name(), "claude:sonnet");
+    }
+
+    #[test]
+    fn handoff_pending_blocks_include_completion_but_not_the_new_target_prompt() {
+        let mut state = test_state();
+        let completed = Block::new(BlockKind::Assistant, "Codex", "방금 완료한 답변");
+        let completed_id = completed.id();
+        state.committed.push(completed);
+        state
+            .committed
+            .push(Block::new(BlockKind::User, "Claude", "새 Provider 요청"));
+
+        let blocks = state.pending_provider_handoff_blocks();
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].body, "방금 완료한 답변");
+        assert_eq!(state.last_pending_handoff_block_id(), completed_id);
     }
 
     #[test]

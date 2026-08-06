@@ -644,7 +644,33 @@ async function consume(session) {
   }
 }
 
-async function inputContent(input) {
+const HANDOFF_HEADER = '<devez_provider_handoff chars="';
+const HANDOFF_SEPARATOR = '">\n';
+const HANDOFF_FOOTER = "\n</devez_provider_handoff>\n\n";
+
+function prependHandoff(content, handoffContext) {
+  if (!handoffContext) return content;
+  const handoff = String(handoffContext);
+  const prefix = `${HANDOFF_HEADER}${handoff.length}${HANDOFF_SEPARATOR}${handoff}${HANDOFF_FOOTER}`;
+  const firstText = content.find((item) => item.type === "text");
+  if (firstText) firstText.text = `${prefix}${firstText.text || ""}`;
+  else content.unshift({ type: "text", text: prefix });
+  return content;
+}
+
+function stripHandoff(text) {
+  if (!text.startsWith(HANDOFF_HEADER)) return text;
+  const separator = text.indexOf(HANDOFF_SEPARATOR, HANDOFF_HEADER.length);
+  if (separator < 0) return text;
+  const length = Number(text.slice(HANDOFF_HEADER.length, separator));
+  if (!Number.isSafeInteger(length) || length < 0) return text;
+  const contextStart = separator + HANDOFF_SEPARATOR.length;
+  const contextEnd = contextStart + length;
+  if (text.slice(contextEnd, contextEnd + HANDOFF_FOOTER.length) !== HANDOFF_FOOTER) return text;
+  return text.slice(contextEnd + HANDOFF_FOOTER.length);
+}
+
+async function inputContent(input, handoffContext) {
   const content = [];
   for (const item of Array.isArray(input) ? input : []) {
     if (item.type === "text") content.push({ type: "text", text: item.text || "" });
@@ -658,7 +684,7 @@ async function inputContent(input) {
       content.push({ type: "image", source: { type: "base64", media_type: mediaType, data: bytes.toString("base64") } });
     }
   }
-  return content.length ? content : [{ type: "text", text: "" }];
+  return prependHandoff(content.length ? content : [{ type: "text", text: "" }], handoffContext);
 }
 
 async function startPrompt(params) {
@@ -681,7 +707,7 @@ async function startPrompt(params) {
   notify("turn/started", { threadId: id, turn: { id: turnId } });
   session.queue.push({
     type: "user",
-    message: { role: "user", content: await inputContent(params.input) },
+    message: { role: "user", content: await inputContent(params.input, params.handoffContext) },
     parent_tool_use_id: null,
     session_id: id,
     origin: { kind: "human" },
@@ -703,7 +729,7 @@ function historyTurns(messages) {
   for (const message of messages) {
     const blocks = contentBlocks(message.message);
     const userText = message.type === "user"
-      ? blocks.filter((block) => block.type === "text").map((block) => block.text || "").join("\n")
+      ? stripHandoff(blocks.filter((block) => block.type === "text").map((block) => block.text || "").join("\n"))
       : "";
     if (userText && !blocks.some((block) => block.type === "tool_result")) {
       turn = {

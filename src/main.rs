@@ -343,7 +343,7 @@ async fn start_session(
 
     if let Some(text) = queued {
         draw(state, renderer)?;
-        start_turn(server, state, text).await;
+        start_turn(server, state, text, None).await;
     }
     event_loop(server, state, renderer, update_rx).await
 }
@@ -1167,7 +1167,8 @@ async fn execute_action(
         | Action::Quit) => return execute_local_action(state, renderer, action),
         Action::Submit(text) => {
             renderer.scroll_to_bottom();
-            start_turn(server, state, text).await
+            let handoff = provider_handoff_snapshot(state, renderer);
+            start_turn(server, state, text, Some(handoff)).await
         }
         Action::Steer(text) => {
             renderer.scroll_to_bottom();
@@ -1349,7 +1350,7 @@ async fn execute_action(
                         state.enter_side_thread(thread_id, cwd, &model, effort.as_deref());
                         if let Some(prompt) = prompt {
                             state.begin_side_prompt(prompt.clone());
-                            start_turn(server, state, prompt).await;
+                            start_turn(server, state, prompt, None).await;
                         }
                     } else {
                         state.push_notice(
@@ -2356,7 +2357,7 @@ async fn finish_thread_switch(
 /// competing one.
 async fn send_queued_prompt(server: &BackendServer, state: &mut AppState, text: String) {
     let Some(turn_id) = state.turn_id.clone() else {
-        start_turn(server, state, text).await;
+        start_turn(server, state, text, None).await;
         return;
     };
     devezcode::note_prompt(&text);
@@ -3164,7 +3165,42 @@ fn open_url(url: &str) -> Result<()> {
     Ok(())
 }
 
-async fn start_turn(server: &BackendServer, state: &mut AppState, text: String) {
+fn provider_handoff_snapshot(state: &AppState, renderer: &Renderer) -> Value {
+    let mut blocks = renderer.provider_handoff_blocks();
+    for pending in state.pending_provider_handoff_blocks() {
+        if let Some(existing) = blocks.iter_mut().find(|block| block.id == pending.id) {
+            *existing = pending;
+        } else {
+            blocks.push(pending);
+        }
+    }
+    let entries = blocks
+        .into_iter()
+        .map(|block| {
+            json!({
+                "id": block.id,
+                "kind": block.kind,
+                "title": block.title,
+                "body": block.body
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "lastBlockId": renderer
+            .last_history_block_id()
+            .max(state.last_pending_handoff_block_id()),
+        "cwd": state.cwd,
+        "plan": state.provider_handoff_plan(),
+        "entries": entries
+    })
+}
+
+async fn start_turn(
+    server: &BackendServer,
+    state: &mut AppState,
+    text: String,
+    provider_handoff: Option<Value>,
+) {
     devezcode::note_prompt(&text);
     let model = state.selected_model_name().to_owned();
     let effort = state.selected_effort().to_owned();
@@ -3181,6 +3217,9 @@ async fn start_turn(server: &BackendServer, state: &mut AppState, text: String) 
     });
     if !effort.is_empty() {
         params["effort"] = json!(effort);
+    }
+    if let Some(provider_handoff) = provider_handoff {
+        params["providerHandoff"] = provider_handoff;
     }
     match server.request("turn/start", params).await {
         // The response reserves an id, but the app-server makes it

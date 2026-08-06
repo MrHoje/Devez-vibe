@@ -24,6 +24,16 @@ enum RuntimeKind {
     Claude,
 }
 
+impl RuntimeKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::OpenCode => "OpenCode",
+            Self::Claude => "Claude",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Route {
     active: RuntimeKind,
@@ -31,6 +41,28 @@ struct Route {
     open_code_id: Option<String>,
     claude_id: Option<String>,
     cwd: PathBuf,
+    codex_seen_through: u64,
+    open_code_seen_through: u64,
+    claude_seen_through: u64,
+}
+
+impl Route {
+    fn seen_through(&self, kind: RuntimeKind) -> u64 {
+        match kind {
+            RuntimeKind::Codex => self.codex_seen_through,
+            RuntimeKind::OpenCode => self.open_code_seen_through,
+            RuntimeKind::Claude => self.claude_seen_through,
+        }
+    }
+
+    fn note_seen_through(&mut self, kind: RuntimeKind, block_id: u64) {
+        let seen = match kind {
+            RuntimeKind::Codex => &mut self.codex_seen_through,
+            RuntimeKind::OpenCode => &mut self.open_code_seen_through,
+            RuntimeKind::Claude => &mut self.claude_seen_through,
+        };
+        *seen = (*seen).max(block_id);
+    }
 }
 
 pub struct BackendServer {
@@ -274,54 +306,84 @@ impl BackendServer {
             }
             "turn/start" | "turn/steer" => {
                 let visible = thread_id(&params)?.to_owned();
+                let previous = self.route_kind(&visible);
                 let selected = selected_runtime(
                     params.get("model").and_then(Value::as_str),
-                    self.route_kind(&visible),
+                    previous,
                 );
-                if selected == RuntimeKind::Claude {
-                    let backing = self.ensure_claude_route(&visible, &params).await?;
-                    let response = self
-                        .claude
-                        .request(
-                            "session/prompt",
-                            json!({
-                                "sessionId": backing,
-                                "input": params.get("input").cloned().unwrap_or_else(|| json!([])),
-                                "model": params.get("model").cloned().unwrap_or(Value::Null),
-                                "effort": params.get("effort").cloned().unwrap_or(Value::Null)
-                            }),
-                        )
-                        .await?;
-                    Ok(response)
-                } else if selected == RuntimeKind::OpenCode {
-                    let (backing, model) = self.ensure_open_code_route(&visible, &params).await?;
-                    if let Some(model) = model {
-                        self.open_code()?
-                            .set_model(
-                                &backing,
-                                &model,
-                                params.get("effort").and_then(Value::as_str),
-                            )
-                            .await?;
-                    }
-                    let input = params
-                        .get("input")
-                        .and_then(Value::as_array)
-                        .map(Vec::as_slice)
-                        .unwrap_or_default();
-                    let instructions = params
-                        .pointer("/additionalContext/devez-vibe-rules/value")
-                        .and_then(Value::as_str);
-                    let turn = self
-                        .open_code()?
-                        .start_prompt_content(&backing, input, instructions)
-                        .await?;
-                    Ok(json!({ "turn": { "id": turn } }))
-                } else {
-                    let backing = self.ensure_codex_route(&visible, &params).await?;
-                    params["threadId"] = json!(backing);
-                    self.codex.request(method, params).await
+                let snapshot = take_provider_handoff(&mut params);
+                let switching = method == "turn/start" && selected != previous;
+                let seen_through = self
+                    .route(&visible)
+                    .map(|route| route.seen_through(selected))
+                    .unwrap_or_default();
+                let handoff_context = switching
+                    .then(|| {
+                        snapshot.as_ref().and_then(|snapshot| {
+                            snapshot.context_since(seen_through, previous, selected)
+                        })
+                    })
+                    .flatten();
+                if let Some(context) = handoff_context.as_deref() {
+                    insert_handoff_context(&mut params, context);
                 }
+
+                let response: Result<Value> = async {
+                    if selected == RuntimeKind::Claude {
+                        let backing = self.ensure_claude_route(&visible, &params).await?;
+                        self.claude
+                            .request(
+                                "session/prompt",
+                                json!({
+                                    "sessionId": backing,
+                                    "input": params.get("input").cloned().unwrap_or_else(|| json!([])),
+                                    "model": params.get("model").cloned().unwrap_or(Value::Null),
+                                    "effort": params.get("effort").cloned().unwrap_or(Value::Null),
+                                    "handoffContext": handoff_context
+                                }),
+                            )
+                            .await
+                    } else if selected == RuntimeKind::OpenCode {
+                        let (backing, model) = self.ensure_open_code_route(&visible, &params).await?;
+                        if let Some(model) = model {
+                            self.open_code()?
+                                .set_model(
+                                    &backing,
+                                    &model,
+                                    params.get("effort").and_then(Value::as_str),
+                                )
+                                .await?;
+                        }
+                        let input = params
+                            .get("input")
+                            .and_then(Value::as_array)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default();
+                        let instructions = combined_turn_instructions(&params);
+                        let turn = self
+                            .open_code()?
+                            .start_prompt_content(&backing, input, instructions.as_deref())
+                            .await?;
+                        Ok(json!({ "turn": { "id": turn } }))
+                    } else {
+                        let backing = self.ensure_codex_route(&visible, &params).await?;
+                        params["threadId"] = json!(backing);
+                        self.codex.request(method, params).await
+                    }
+                }
+                .await;
+
+                if response.is_ok() {
+                    if let Some(snapshot) = snapshot {
+                        if switching {
+                            self.note_seen_through(&visible, previous, snapshot.last_block_id);
+                        }
+                        self.note_seen_through(&visible, selected, snapshot.last_block_id);
+                    }
+                } else if switching {
+                    self.restore_active_route(&visible, previous);
+                }
+                response
             }
             "turn/interrupt" => {
                 let visible = thread_id(&params)?;
@@ -628,6 +690,9 @@ impl BackendServer {
             open_code_id: None,
             claude_id: None,
             cwd: cwd.clone(),
+            codex_seen_through: 0,
+            open_code_seen_through: 0,
+            claude_seen_through: 0,
         });
         route.active = active;
         route.cwd = cwd;
@@ -674,6 +739,28 @@ impl BackendServer {
                     RuntimeKind::Codex
                 }
             })
+    }
+
+    fn note_seen_through(&self, visible: &str, kind: RuntimeKind, block_id: u64) {
+        if let Some(route) = self
+            .routes
+            .lock()
+            .expect("routes mutex")
+            .get_mut(visible)
+        {
+            route.note_seen_through(kind, block_id);
+        }
+    }
+
+    fn restore_active_route(&self, visible: &str, active: RuntimeKind) {
+        if let Some(route) = self
+            .routes
+            .lock()
+            .expect("routes mutex")
+            .get_mut(visible)
+        {
+            route.active = active;
+        }
     }
 
     fn is_open_code_thread(&self, visible: &str) -> bool {
@@ -939,6 +1026,194 @@ fn toml_string(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+const PROVIDER_HANDOFF_MAX_CHARS: usize = 120_000;
+
+struct ProviderHandoffEntry {
+    id: u64,
+    kind: String,
+    title: String,
+    body: String,
+}
+
+struct ProviderHandoff {
+    last_block_id: u64,
+    cwd: String,
+    plan: Option<String>,
+    entries: Vec<ProviderHandoffEntry>,
+}
+
+impl ProviderHandoff {
+    fn from_value(value: Value) -> Option<Self> {
+        let last_block_id = value.get("lastBlockId")?.as_u64()?;
+        let entries = value
+            .get("entries")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                Some(ProviderHandoffEntry {
+                    id: entry.get("id")?.as_u64()?,
+                    kind: entry.get("kind")?.as_str()?.to_owned(),
+                    title: entry
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    body: entry
+                        .get("body")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                })
+            })
+            .collect();
+        Some(Self {
+            last_block_id,
+            cwd: value
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            plan: value
+                .get("plan")
+                .and_then(Value::as_str)
+                .filter(|plan| !plan.trim().is_empty())
+                .map(ToOwned::to_owned),
+            entries,
+        })
+    }
+
+    fn context_since(
+        &self,
+        seen_through: u64,
+        source: RuntimeKind,
+        target: RuntimeKind,
+    ) -> Option<String> {
+        let unseen = self
+            .entries
+            .iter()
+            .filter(|entry| entry.id > seen_through)
+            .collect::<Vec<_>>();
+        if unseen.is_empty() {
+            return None;
+        }
+        let mut header = format!(
+            "Devez Vibe가 {source}에서 {target}로 대화를 인계했습니다.\n\
+             아래 내용은 같은 대화의 이전 기록입니다. 이미 완료된 작업을 반복하지 말고, \
+             현재 사용자 요청에 바로 이어서 응답하세요. 인계 자체를 사용자에게 언급하지 마세요.\n\
+             작업 경로: {}\n",
+            self.cwd,
+            source = source.label(),
+            target = target.label(),
+        );
+        if let Some(plan) = self.plan.as_deref() {
+            header.push_str("\n현재 작업 단계:\n");
+            header.push_str(&tail_chars(plan, 20_000));
+            header.push('\n');
+        }
+        header.push_str("\n이전 대화:\n");
+
+        let sections = unseen
+            .iter()
+            .map(|entry| {
+                let label = match entry.kind.as_str() {
+                    "user" => "사용자",
+                    "assistant" => "도우미",
+                    "reasoning" => "작업 메모",
+                    "plan" => "계획",
+                    "tool" => "도구 실행",
+                    "file_change" => "파일 변경",
+                    _ => "기록",
+                };
+                let title = entry.title.trim();
+                if title.is_empty() {
+                    format!("[{label}]\n{}", entry.body.trim())
+                } else {
+                    format!("[{label} | {title}]\n{}", entry.body.trim())
+                }
+            })
+            .collect::<Vec<_>>();
+        let available = PROVIDER_HANDOFF_MAX_CHARS
+            .saturating_sub(header.chars().count())
+            .saturating_sub(160);
+        let (sections, omitted) = newest_sections_within(&sections, available);
+        if omitted > 0 {
+            header.push_str(&format!(
+                "[오래된 기록 {omitted}개는 대상 모델의 컨텍스트 보호를 위해 생략됨]\n\n"
+            ));
+        }
+        header.push_str(&sections.join("\n\n"));
+        Some(header)
+    }
+}
+
+fn take_provider_handoff(params: &mut Value) -> Option<ProviderHandoff> {
+    params
+        .as_object_mut()?
+        .remove("providerHandoff")
+        .and_then(ProviderHandoff::from_value)
+}
+
+fn insert_handoff_context(params: &mut Value, context: &str) {
+    if !params
+        .get("additionalContext")
+        .is_some_and(Value::is_object)
+    {
+        params["additionalContext"] = json!({});
+    }
+    params["additionalContext"]["provider-handoff"] = json!({
+        "value": context,
+        "kind": "application"
+    });
+}
+
+fn combined_turn_instructions(params: &Value) -> Option<String> {
+    let rules = params
+        .pointer("/additionalContext/devez-vibe-rules/value")
+        .and_then(Value::as_str);
+    let handoff = params
+        .pointer("/additionalContext/provider-handoff/value")
+        .and_then(Value::as_str);
+    match (rules, handoff) {
+        (Some(rules), Some(handoff)) => Some(format!("{rules}\n\n{handoff}")),
+        (Some(rules), None) => Some(rules.to_owned()),
+        (None, Some(handoff)) => Some(handoff.to_owned()),
+        (None, None) => None,
+    }
+}
+
+fn newest_sections_within(sections: &[String], budget: usize) -> (Vec<String>, usize) {
+    if sections.is_empty() || budget == 0 {
+        return (Vec::new(), sections.len());
+    }
+    let mut selected = Vec::new();
+    let mut used = 0usize;
+    for section in sections.iter().rev() {
+        let separator = usize::from(!selected.is_empty()) * 2;
+        let section_chars = section.chars().count();
+        if used + separator + section_chars <= budget {
+            selected.push(section.clone());
+            used += separator + section_chars;
+            continue;
+        }
+        if selected.is_empty() {
+            selected.push(tail_chars(section, budget));
+        }
+        break;
+    }
+    selected.reverse();
+    let omitted = sections.len().saturating_sub(selected.len());
+    (selected, omitted)
+}
+
+fn tail_chars(value: &str, limit: usize) -> String {
+    let count = value.chars().count();
+    if count <= limit {
+        return value.to_owned();
+    }
+    value.chars().skip(count - limit).collect()
+}
+
 fn request_cwd(params: &Value) -> Option<PathBuf> {
     params.get("cwd").and_then(Value::as_str).map(PathBuf::from)
 }
@@ -1019,5 +1294,85 @@ mod tests {
             None,
         );
         assert_eq!(with_effort.get("effort").and_then(Value::as_str), Some("max"));
+    }
+
+    #[test]
+    fn provider_handoff_only_carries_context_the_target_has_not_seen() {
+        let snapshot = ProviderHandoff::from_value(json!({
+            "lastBlockId": 12,
+            "cwd": "C:/repo",
+            "plan": "- [진행 중] 전환 검증",
+            "entries": [
+                { "id": 4, "kind": "user", "title": "Claude", "body": "이미 전달됨" },
+                { "id": 9, "kind": "assistant", "title": "Claude", "body": "새 답변" },
+                { "id": 12, "kind": "tool", "title": "Shell", "body": "cargo test" }
+            ]
+        }))
+        .unwrap();
+
+        let context = snapshot
+            .context_since(4, RuntimeKind::Claude, RuntimeKind::Codex)
+            .unwrap();
+
+        assert!(!context.contains("이미 전달됨"));
+        assert!(context.contains("새 답변"));
+        assert!(context.contains("cargo test"));
+        assert!(context.contains("Claude에서 Codex로"));
+        assert!(context.contains("전환 검증"));
+    }
+
+    #[test]
+    fn provider_handoff_is_private_to_the_router() {
+        let mut params = json!({
+            "threadId": "thread-1",
+            "providerHandoff": {
+                "lastBlockId": 1,
+                "entries": []
+            }
+        });
+
+        let snapshot = take_provider_handoff(&mut params).unwrap();
+
+        assert_eq!(snapshot.last_block_id, 1);
+        assert!(params.get("providerHandoff").is_none());
+    }
+
+    #[test]
+    fn provider_handoff_keeps_the_newest_context_within_its_budget() {
+        let old = "old".repeat(30_000);
+        let latest = "latest".repeat(20_000);
+        let snapshot = ProviderHandoff::from_value(json!({
+            "lastBlockId": 2,
+            "cwd": "C:/repo",
+            "entries": [
+                { "id": 1, "kind": "assistant", "body": old },
+                { "id": 2, "kind": "assistant", "body": latest }
+            ]
+        }))
+        .unwrap();
+
+        let context = snapshot
+            .context_since(0, RuntimeKind::Claude, RuntimeKind::Codex)
+            .unwrap();
+
+        assert!(context.contains("latestlatest"));
+        assert!(!context.contains("oldold"));
+        assert!(context.contains("오래된 기록 1개"));
+        assert!(context.chars().count() <= PROVIDER_HANDOFF_MAX_CHARS);
+    }
+
+    #[test]
+    fn handoff_context_joins_existing_turn_instructions() {
+        let mut params = json!({
+            "additionalContext": {
+                "devez-vibe-rules": { "value": "rules", "kind": "application" }
+            }
+        });
+        insert_handoff_context(&mut params, "history");
+
+        assert_eq!(
+            combined_turn_instructions(&params).as_deref(),
+            Some("rules\n\nhistory")
+        );
     }
 }

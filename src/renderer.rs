@@ -113,6 +113,39 @@ pub struct Block {
     children: Vec<Block>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderHandoffBlock {
+    pub id: u64,
+    pub kind: &'static str,
+    pub title: String,
+    pub body: String,
+}
+
+impl ProviderHandoffBlock {
+    pub fn from_block(block: &Block) -> Option<Self> {
+        let kind = match block.kind {
+            BlockKind::User => "user",
+            BlockKind::Assistant => "assistant",
+            BlockKind::Reasoning => "reasoning",
+            BlockKind::Plan => "plan",
+            BlockKind::Tool => "tool",
+            BlockKind::FileChange | BlockKind::Diff => "file_change",
+            BlockKind::Welcome
+            | BlockKind::Update
+            | BlockKind::ModelChange
+            | BlockKind::Warning
+            | BlockKind::Error
+            | BlockKind::System => return None,
+        };
+        Some(Self {
+            id: block.id,
+            kind,
+            title: block.title.clone(),
+            body: block.body.clone(),
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct LiveBlockView<'a> {
     pub block: &'a Block,
@@ -678,6 +711,20 @@ impl Renderer {
 
     pub const fn mode(&self) -> RenderMode {
         self.mode
+    }
+
+    /// Provider runtimes cannot resume each other's native session IDs. This
+    /// keeps the portable, user-visible part of the transcript available for a
+    /// handoff while leaving welcome cards and local UI notices behind.
+    pub fn provider_handoff_blocks(&self) -> Vec<ProviderHandoffBlock> {
+        self.history
+            .iter()
+            .filter_map(ProviderHandoffBlock::from_block)
+            .collect()
+    }
+
+    pub fn last_history_block_id(&self) -> u64 {
+        self.history.iter().map(Block::id).max().unwrap_or_default()
     }
 
     /// Moves the transcript view by `delta` rows, positive being back into
@@ -2296,6 +2343,10 @@ enum Tone {
     ModelLuna,
     ModelSpark,
     Model55,
+    ModelHaiku,
+    ModelSonnet,
+    ModelOpus,
+    ModelFable,
     StatusModel56,
     StatusModelSol,
     StatusModelTerra,
@@ -7350,7 +7401,15 @@ fn set_selection_style(
 
 fn model_tone(model: &str) -> Option<Tone> {
     let model = model.to_ascii_lowercase();
-    if model.contains("spark") {
+    if model.contains("haiku") {
+        Some(Tone::ModelHaiku)
+    } else if model.contains("sonnet") {
+        Some(Tone::ModelSonnet)
+    } else if model.contains("opus") {
+        Some(Tone::ModelOpus)
+    } else if model.contains("fable") {
+        Some(Tone::ModelFable)
+    } else if model.contains("spark") {
         Some(Tone::ModelSpark)
     } else if model.contains("5.6") && model.contains("sol") {
         Some(Tone::ModelSol)
@@ -7368,19 +7427,6 @@ fn model_tone(model: &str) -> Option<Tone> {
 }
 
 fn status_model_tone(model: &str) -> Option<Tone> {
-    let normalized = model.to_ascii_lowercase();
-    if normalized.contains("haiku") {
-        return Some(Tone::StatusModelHaiku);
-    }
-    if normalized.contains("sonnet") {
-        return Some(Tone::StatusModelSonnet);
-    }
-    if normalized.contains("opus") {
-        return Some(Tone::StatusModelOpus);
-    }
-    if normalized.contains("fable") {
-        return Some(Tone::StatusModelFable);
-    }
     match model_tone(model)? {
         Tone::Model56 => Some(Tone::StatusModel56),
         Tone::ModelSol => Some(Tone::StatusModelSol),
@@ -7388,6 +7434,10 @@ fn status_model_tone(model: &str) -> Option<Tone> {
         Tone::ModelLuna => Some(Tone::StatusModelLuna),
         Tone::ModelSpark => Some(Tone::StatusModelSpark),
         Tone::Model55 => Some(Tone::StatusModel55),
+        Tone::ModelHaiku => Some(Tone::StatusModelHaiku),
+        Tone::ModelSonnet => Some(Tone::StatusModelSonnet),
+        Tone::ModelOpus => Some(Tone::StatusModelOpus),
+        Tone::ModelFable => Some(Tone::StatusModelFable),
         _ => None,
     }
 }
@@ -7438,6 +7488,10 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::ModelLuna => palette.model_luna,
         Tone::ModelSpark => palette.model_spark,
         Tone::Model55 => palette.model_gpt55,
+        Tone::ModelHaiku => palette.status.model_haiku,
+        Tone::ModelSonnet => palette.status.model_sonnet,
+        Tone::ModelOpus => palette.status.model_opus,
+        Tone::ModelFable => palette.status.model_fable,
         Tone::StatusModel56 => palette.model_gpt56,
         Tone::StatusModelSol => palette.model_sol,
         Tone::StatusModelTerra => palette.model_terra,
@@ -9982,6 +10036,19 @@ mod tests {
     }
 
     #[test]
+    fn claude_composer_chrome_uses_the_selected_model_tone() {
+        let editor = Editor::default();
+        let mut mode = test_mode("Default", ModeAccent::Calm, false);
+        mode.model = "claude:opus[1m]".to_owned();
+
+        let (rows, _, _) = input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
+
+        assert_eq!(rows[0].tone, Tone::ModelOpus);
+        assert_eq!(rows[1].prefix_tone, Tone::ModelOpus);
+        assert_eq!(rows.last().map(|line| line.tone), Some(Tone::ModelOpus));
+    }
+
+    #[test]
     fn queue_preview_is_one_line_and_truncates_the_prompt() {
         let line = queue_preview_line("a very long queued prompt", 0, 18);
 
@@ -12316,6 +12383,55 @@ mod tests {
     }
 
     #[test]
+    fn claude_model_picker_uses_each_model_family_tone() {
+        let models = [
+            ("1. Opus 5", Tone::ModelOpus),
+            ("2. Fable 5", Tone::ModelFable),
+            ("3. Sonnet 5", Tone::ModelSonnet),
+            ("4. Haiku 4.5", Tone::ModelHaiku),
+        ];
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                closable: true,
+                title: "Model".to_owned(),
+                lines: models
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (text, _))| OverlayLine {
+                        text: (*text).to_owned(),
+                        selected: index == 0,
+                        muted: false,
+                    })
+                    .collect(),
+                slider: None,
+                hint: "Enter select".to_owned(),
+                style: OverlayStyle::Picker,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            },
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+
+        for (text, tone) in models {
+            let line = frame
+                .lines
+                .iter()
+                .find(|line| painted(line).contains(text))
+                .expect("Claude model row");
+            assert_eq!(line.tone, tone);
+        }
+    }
+
+    #[test]
     fn narrow_effort_pickers_keep_every_row_inside_the_closed_panel() {
         for width in 20..=33 {
             let frame = overlay_frame(
@@ -12939,16 +13055,18 @@ mod tests {
     }
 
     #[test]
-    fn claude_status_models_use_the_devez_code_colors() {
+    fn claude_models_use_the_devez_code_colors_everywhere() {
         let palette = theme::palette();
-        for (model, tone, color) in [
-            ("Claude Haiku", Tone::StatusModelHaiku, palette.status.model_haiku),
-            ("Claude Sonnet", Tone::StatusModelSonnet, palette.status.model_sonnet),
-            ("Claude Opus", Tone::StatusModelOpus, palette.status.model_opus),
-            ("Claude Fable", Tone::StatusModelFable, palette.status.model_fable),
+        for (model, model_tone, status_tone, color) in [
+            ("Claude Haiku", Tone::ModelHaiku, Tone::StatusModelHaiku, palette.status.model_haiku),
+            ("Claude Sonnet", Tone::ModelSonnet, Tone::StatusModelSonnet, palette.status.model_sonnet),
+            ("Claude Opus", Tone::ModelOpus, Tone::StatusModelOpus, palette.status.model_opus),
+            ("Claude Fable", Tone::ModelFable, Tone::StatusModelFable, palette.status.model_fable),
         ] {
-            assert_eq!(status_model_tone(model), Some(tone));
-            assert_eq!(tone_rgb(tone), Some(color));
+            assert_eq!(super::model_tone(model), Some(model_tone));
+            assert_eq!(status_model_tone(model), Some(status_tone));
+            assert_eq!(tone_rgb(model_tone), Some(color));
+            assert_eq!(tone_rgb(status_tone), Some(color));
         }
     }
 
@@ -13209,6 +13327,26 @@ mod tests {
     #[test]
     fn gpt55_uses_its_theme_specific_model_colour() {
         assert_eq!(tone_rgb(Tone::Model55), Some(theme::palette().model_gpt55));
+    }
+
+    #[test]
+    fn provider_handoff_keeps_conversation_and_work_but_drops_local_chrome() {
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.history = vec![
+            Block::new(BlockKind::Welcome, "Welcome", "local"),
+            Block::new(BlockKind::User, "Claude", "질문"),
+            Block::new(BlockKind::Assistant, "Claude", "답변"),
+            Block::new(BlockKind::Tool, "Shell", "cargo test"),
+            Block::new(BlockKind::ModelChange, "Provider", "Codex"),
+        ];
+
+        let blocks = renderer.provider_handoff_blocks();
+
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].kind, "user");
+        assert_eq!(blocks[1].kind, "assistant");
+        assert_eq!(blocks[2].kind, "tool");
+        assert_eq!(renderer.last_history_block_id(), renderer.history[4].id());
     }
 
     #[test]
