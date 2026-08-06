@@ -595,6 +595,13 @@ impl BackendServer {
             .flatten()
     }
 
+    /// Whether a thread would resume into Codex. A relaunch knows nothing about the
+    /// session it is about to restore beyond its id, and the answer decides whether
+    /// the Codex app-server has to be up before the model and session lists are read.
+    pub fn thread_is_codex(&self, visible: &str) -> bool {
+        self.route_kind(visible) == RuntimeKind::Codex
+    }
+
     pub async fn prepare_resume_runtime(&mut self, visible: &str) -> Result<()> {
         match self.route_kind(visible) {
             RuntimeKind::Codex => self.start_codex().await,
@@ -966,15 +973,7 @@ impl BackendServer {
     fn route_kind(&self, visible: &str) -> RuntimeKind {
         self.route(visible)
             .map(|route| route.active)
-            .unwrap_or_else(|| {
-                if is_claude_thread(visible) {
-                    RuntimeKind::Claude
-                } else if visible.starts_with("ses_") {
-                    RuntimeKind::OpenCode
-                } else {
-                    RuntimeKind::Codex
-                }
-            })
+            .unwrap_or_else(|| id_runtime(visible))
     }
 
     fn note_seen_through(&self, visible: &str, kind: RuntimeKind, block_id: u64) {
@@ -1200,6 +1199,19 @@ fn route_store_path() -> Option<PathBuf> {
             .join("devez-vibe")
             .join("session-routes.json")
     })
+}
+
+/// The runtime a thread id names on its own: Claude namespaces its sessions,
+/// OpenCode prefixes `ses_`, and everything else is a Codex thread. Only used when
+/// the route store has nothing on the id — a session that never mixed runtimes.
+fn id_runtime(visible: &str) -> RuntimeKind {
+    if is_claude_thread(visible) {
+        RuntimeKind::Claude
+    } else if visible.starts_with("ses_") {
+        RuntimeKind::OpenCode
+    } else {
+        RuntimeKind::Codex
+    }
 }
 
 fn load_routes(path: &Path) -> HashMap<String, Route> {
@@ -1695,6 +1707,15 @@ mod tests {
             selected_runtime(Some("claude:sonnet"), RuntimeKind::Codex)
                 == RuntimeKind::Claude
         );
+    }
+
+    /// DevezCode relaunches a room with `dvz -r <thread>`, so an unrouted id is the
+    /// only thing that says which backend the restored conversation belongs to.
+    #[test]
+    fn an_unrouted_thread_id_names_its_own_runtime() {
+        assert!(id_runtime("019fcaac-0c2a-7cd3-97ae-f7513ba2f056") == RuntimeKind::Codex);
+        assert!(id_runtime("claude:f1965f1e-8603-43b2-bfd5-628bacd21e5e") == RuntimeKind::Claude);
+        assert!(id_runtime("ses_8fe37f877f8c") == RuntimeKind::OpenCode);
     }
 
     #[test]
