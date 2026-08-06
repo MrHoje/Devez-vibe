@@ -261,7 +261,6 @@ pub struct WelcomeView {
     pub plan: String,
     /// Reset-credit rows: a summary first, then one line per credit.
     pub credits: Vec<String>,
-    pub credits_expanded: bool,
     pub cwd: String,
     pub account: String,
 }
@@ -497,6 +496,9 @@ pub struct Renderer {
     painted_hovered_pick: Option<Pick>,
     selection: Selection,
     last_click: Option<(CellPosition, Instant)>,
+    /// Where the composer's prompt text was last painted, so a drag over it can
+    /// be turned back into the characters it covered.
+    composer_selection: Option<ComposerSelection>,
     painted_selection: Option<CellRange>,
     painted_frame: Option<CellFrame>,
     live_frame_cache: Option<LiveFrameCache>,
@@ -504,6 +506,37 @@ pub struct Renderer {
     animation_plan_rows: usize,
     #[cfg(test)]
     live_cache_rebuilds: usize,
+}
+
+/// Where the composer's prompt text sits on screen, one entry per painted row in
+/// paint order. This is what lets a drag over the composer be answered in
+/// characters rather than cells.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ComposerLayout {
+    rows: Vec<ComposerRowLayout>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ComposerRowLayout {
+    /// Column the row's first glyph is painted at.
+    start_column: usize,
+    glyphs: Vec<ComposerGlyph>,
+}
+
+/// One painted glyph of the prompt: the cells it fills, and the composer
+/// characters behind it. An image label and a collapsed-paste summary both stand
+/// for more than they show, so the span is a range rather than one index, and
+/// padding that stands for nothing carries an empty span.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ComposerGlyph {
+    width: usize,
+    span: Range<usize>,
+}
+
+struct ComposerSelection {
+    /// Screen row the composer's first prompt row was painted on.
+    first_row: usize,
+    layout: ComposerLayout,
 }
 
 /// One resolved terminal cell. The last terminal column may carry a style, but
@@ -717,6 +750,7 @@ impl Renderer {
             painted_hovered_pick: None,
             selection: Selection::default(),
             last_click: None,
+            composer_selection: None,
             painted_selection: None,
             painted_frame: None,
             live_frame_cache: None,
@@ -2478,7 +2512,6 @@ pub enum Pick {
     ShellDisplayMode,
     DiffDisplayMode,
     PlanSummary,
-    ToggleWelcomeCredits,
     /// The `Fast: On`/`Fast: Off` badge: toggles the fast service tier.
     FastMode,
     /// The status line's model name: opens `/model`.
@@ -3391,219 +3424,35 @@ fn normal_frame_with_expansion(
     }
 }
 
-/// Narrowest inner width that still leaves both columns readable; below this the
-/// welcome panel collapses to a single column.
-const WELCOME_SPLIT_MIN: usize = 62;
-const WELCOME_INFO_WIDTH: usize = 48;
-
+/// The welcome card is deliberately two rows: the product headline and the
+/// working folder. Everything else lives behind `/help` and the status line.
 fn welcome_lines(welcome: WelcomeView, width: u16) -> Vec<PaintLine> {
-    let panel_width = panel_span(width);
-    let inner_width = panel_width.saturating_sub(2);
-    let left = welcome_info_rows(&welcome, inner_width);
-
-    if inner_width < WELCOME_SPLIT_MIN {
-        let mut lines = vec![panel_top(inner_width)];
-        lines.extend(left.into_iter().map(|(text, tone, bold)| {
-            welcome_reset_pick(panel_line(&text, panel_width, tone, bold))
-        }));
-        lines.push(panel_bottom(inner_width));
-        return lines;
-    }
-
-    // Account and workspace information stays compact while release notes use
-    // every additional cell available in a wide terminal.
-    let left_width = WELCOME_INFO_WIDTH;
-    let right_width = inner_width - left_width - 1;
-    let left = welcome_info_rows(&welcome, left_width);
-    let right = welcome_notes_rows(right_width);
-
-    let mut lines = vec![PaintLine {
-        prefix: String::new(),
-        prefix_tone: Tone::Border,
-        text: format!("╭{}┬{}╮", "─".repeat(left_width), "─".repeat(right_width)),
-        tone: Tone::Border,
-        bold: false,
-        tool_heading: None,
-        pick: None,
-        tail: Vec::new(),
-    }];
-    for row in 0..left.len().max(right.len()) {
-        lines.push(welcome_reset_pick(split_panel_line(
-            left.get(row),
-            left_width,
-            right.get(row),
-            right_width,
-        )));
-    }
-    lines.push(PaintLine {
-        prefix: String::new(),
-        prefix_tone: Tone::Border,
-        text: format!("╰{}┴{}╯", "─".repeat(left_width), "─".repeat(right_width)),
-        tone: Tone::Border,
-        bold: false,
-        tool_heading: None,
-        pick: None,
-        tail: Vec::new(),
-    });
-    lines
-}
-
-type PanelRow = (String, Tone, bool);
-
-/// Columns taken by the two-space margin plus the widest row label.
-const WELCOME_LABEL_WIDTH: usize = 11;
-
-fn welcome_info_rows(welcome: &WelcomeView, column_width: usize) -> Vec<PanelRow> {
-    let mut rows = vec![
-        (
-            format!(
-                "  ✦  DEVEZ VIBE  v{}  with {}",
-                crate::update::CURRENT_VERSION,
-                welcome.provider
-            ),
+    let column_width = panel_span(width);
+    vec![
+        plain_line(
+            &format!("DEVEZ VIBE  v{}", crate::update::CURRENT_VERSION),
             Tone::Accent,
             true,
         ),
-        (String::new(), Tone::Plain, false),
-        (format!("  Plan     {}", welcome.plan), Tone::Plain, false),
-    ];
-
-    // First credit row sits beside the label; the rest hang under the value column.
-    let mut credits = welcome.credits.iter();
-    let summary = credits.next().map_or("—", String::as_str);
-    let icon = if welcome.credits_expanded { "▲" } else { "▼" };
-    let summary = compact_right(
-        summary,
-        column_width.saturating_sub(WELCOME_LABEL_WIDTH + UnicodeWidthStr::width(icon) + 2),
-    );
-    let reset = format!("  Resets   {summary} {icon} ");
-    rows.push((
-        reset,
-        Tone::Plain,
-        false,
-    ));
-    rows.extend(welcome.credits_expanded.then_some(credits).into_iter().flatten().map(|line| {
-        (
-            format!("{}{line}", " ".repeat(WELCOME_LABEL_WIDTH)),
+        plain_line(
+            &compact_text(&welcome.cwd, column_width),
             Tone::Muted,
             false,
-        )
-    }));
-
-    rows.extend([
-        (
-            format!("  Account  {}", welcome.account),
-            Tone::Plain,
-            false,
         ),
-        (
-            format!(
-                "  Folder   {}",
-                compact_text(
-                    &welcome.cwd,
-                    column_width.saturating_sub(WELCOME_LABEL_WIDTH)
-                )
-            ),
-            Tone::Plain,
-            false,
-        ),
-        (String::new(), Tone::Plain, false),
-        ("  /help commands".to_owned(), Tone::Muted, false),
-    ]);
-    rows
+    ]
 }
 
-fn welcome_reset_pick(mut line: PaintLine) -> PaintLine {
-    if line.text.contains("Resets") {
-        if let Some(icon_start) = line.text.find(['▼', '▲']) {
-            let label_start = line.text.find("Resets").unwrap_or(0);
-            let start = UnicodeWidthStr::width(line.prefix.as_str())
-                + UnicodeWidthStr::width(&line.text[..label_start]);
-            let end = UnicodeWidthStr::width(line.prefix.as_str())
-                + UnicodeWidthStr::width(&line.text[..icon_start + '▼'.len_utf8()]);
-            line.pick = Some(PickRegions::span(
-                start.saturating_sub(PICK_BLEED),
-                end + PICK_BLEED,
-                Pick::ToggleWelcomeCredits,
-            ));
-        }
-    }
-    line
-}
-
-/// Release notes, wrapped to the column so long lines fold instead of truncating.
-fn welcome_notes_rows(column_width: usize) -> Vec<PanelRow> {
-    let mut rows = vec![
-        ("  What's new".to_owned(), Tone::Accent, true),
-        (String::new(), Tone::Plain, false),
-    ];
-    if crate::update::RELEASE_NOTES.is_empty() {
-        rows.push(("  —".to_owned(), Tone::Muted, false));
-        return rows;
-    }
-    for (index, note) in crate::update::RELEASE_NOTES.iter().enumerate() {
-        let prefix = format!("  {}. ", index + 1);
-        let continuation_indent = " ".repeat(prefix.len());
-        let options = textwrap::Options::new(column_width.max(8))
-            .break_words(true)
-            .initial_indent(&prefix)
-            .subsequent_indent(&continuation_indent)
-            .word_separator(textwrap::WordSeparator::AsciiSpace);
-        rows.extend(textwrap::wrap(note, &options).into_iter().map(|folded| {
-            (folded.into_owned(), Tone::Muted, false)
-        }));
-    }
-    rows
-}
-
-/// One body row of the split welcome panel: `│ left │ right │`.
-fn split_panel_line(
-    left: Option<&PanelRow>,
-    left_width: usize,
-    right: Option<&PanelRow>,
-    right_width: usize,
-) -> PaintLine {
-    let (left_text, left_tone, left_bold) = column_cell(left, left_width);
-    let (right_text, right_tone, right_bold) = column_cell(right, right_width);
+fn plain_line(text: &str, tone: Tone, bold: bool) -> PaintLine {
     PaintLine {
-        prefix: "│".to_owned(),
-        prefix_tone: Tone::Border,
-        text: left_text,
-        tone: left_tone,
-        bold: left_bold,
+        prefix: String::new(),
+        prefix_tone: tone,
+        text: text.to_owned(),
+        tone,
+        bold,
         tool_heading: None,
         pick: None,
-        tail: vec![
-            PaintSpan {
-                text: "│".to_owned(),
-                tone: Tone::Border,
-                bold: false,
-            },
-            PaintSpan {
-                text: right_text,
-                tone: right_tone,
-                bold: right_bold,
-            },
-            PaintSpan {
-                text: "│".to_owned(),
-                tone: Tone::Border,
-                bold: false,
-            },
-        ],
+        tail: Vec::new(),
     }
-}
-
-/// Pads a row to exactly `width` columns so the panel borders stay aligned.
-fn column_cell(row: Option<&PanelRow>, width: usize) -> PanelRow {
-    // One column is held back so content never kisses the divider.
-    let content_width = width.saturating_sub(1);
-    let (text, tone, bold) = match row {
-        // Head-first truncation: rows that need their tail (paths) arrive pre-compacted.
-        Some((text, tone, bold)) => (compact_right(text, content_width), *tone, *bold),
-        None => (String::new(), Tone::Plain, false),
-    };
-    let padding = width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
-    (format!("{text}{}", " ".repeat(padding)), tone, bold)
 }
 
 /// The rule that separates the answers from the row that walks away from them.
@@ -3739,19 +3588,6 @@ fn panelize_content_line(mut line: PaintLine, panel_width: usize) -> PaintLine {
     // spans were measured before it went on.
     line.pick = line.pick.map(|regions| regions.shifted(1));
     close_panel_row(line, panel_width)
-}
-
-fn panel_top(inner_width: usize) -> PaintLine {
-    PaintLine {
-        prefix: String::new(),
-        prefix_tone: Tone::Border,
-        text: format!("╭{}╮", "─".repeat(inner_width)),
-        tone: Tone::Border,
-        bold: false,
-        tool_heading: None,
-        pick: None,
-        tail: Vec::new(),
-    }
 }
 
 fn panel_bottom(inner_width: usize) -> PaintLine {
@@ -5629,7 +5465,6 @@ fn block_lines_with_mode(
             WelcomeView {
                 provider: values.next().unwrap_or("Codex").to_owned(),
                 plan: values.next().unwrap_or_default().to_owned(),
-                credits_expanded: false,
                 cwd: values.next().unwrap_or_default().to_owned(),
                 account: values.next().unwrap_or_default().to_owned(),
                 credits: values.map(ToOwned::to_owned).collect(),
@@ -6932,22 +6767,39 @@ fn copy_joins_next(line: &PaintLine) -> bool {
 }
 
 fn composer_display(editor: &Editor, composer_images: &[String]) -> (String, usize) {
+    let (display, cursor, _) = composer_display_with_spans(editor, composer_images);
+    (display, cursor)
+}
+
+/// The composer text as painted, its cursor, and the composer characters each
+/// painted character stands for. An image label and a collapsed-paste summary are
+/// each one unit: every character of them answers to the whole span behind them,
+/// so a drag that touches any part deletes the attachment or the paste whole.
+/// Padding around the labels stands for nothing and carries an empty span.
+fn composer_display_with_spans(
+    editor: &Editor,
+    composer_images: &[String],
+) -> (String, usize, Vec<Range<usize>>) {
     let labels = (1..=composer_images.len())
         .map(|index| format!("[Image #{index}]"))
         .collect::<Vec<_>>();
-    let (source, source_cursor) = editor
-        .collapsed_paste_display()
-        .unwrap_or_else(|| (editor.display_text(), editor.display_cursor()));
+    let (source, source_cursor, source_spans) = composer_source_spans(editor);
     let chars = source.chars().collect::<Vec<_>>();
     let mut display = String::new();
+    let mut spans: Vec<Range<usize>> = Vec::new();
     let mut display_cursor = 0;
     let mut image_index = 0;
     for (index, ch) in chars.iter().copied().enumerate() {
         if index == source_cursor {
             display_cursor = display.chars().count();
         }
+        let span = source_spans
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| index..index + 1);
         if ch != ATTACHMENT_PLACEHOLDER {
             display.push(ch);
+            spans.push(span);
             continue;
         }
         let Some(label) = labels.get(image_index) else {
@@ -6955,13 +6807,16 @@ fn composer_display(editor: &Editor, composer_images: &[String]) -> (String, usi
         };
         if display.chars().last().is_some_and(|ch| !ch.is_whitespace()) {
             display.push(' ');
+            spans.push(span.start..span.start);
         }
         display.push_str(label);
+        spans.extend(label.chars().map(|_| span.clone()));
         if chars
             .get(index + 1)
             .is_some_and(|&next| next != ATTACHMENT_PLACEHOLDER && !next.is_whitespace())
         {
             display.push(' ');
+            spans.push(span.end..span.end);
         }
         image_index += 1;
     }
@@ -6969,12 +6824,43 @@ fn composer_display(editor: &Editor, composer_images: &[String]) -> (String, usi
         display_cursor = display.chars().count();
     }
     if image_index < labels.len() {
+        // Attachments with no placeholder of their own: nothing in the composer
+        // stands behind these labels, so nothing can be deleted through them.
+        let end = editor.chars().len();
         if !display.is_empty() {
             display.push(' ');
+            spans.push(end..end);
         }
-        display.push_str(&labels[image_index..].join(" "));
+        let trailing = labels[image_index..].join(" ");
+        spans.extend(trailing.chars().map(|_| end..end));
+        display.push_str(&trailing);
     }
-    (display, display_cursor)
+    (display, display_cursor, spans)
+}
+
+/// The composer's own text before image labels, with the characters behind each
+/// of its characters. A collapsed paste shows as one summary, so every character
+/// of that summary answers to the whole pasted block.
+fn composer_source_spans(editor: &Editor) -> (String, usize, Vec<Range<usize>>) {
+    let buffer_len = editor.chars().len();
+    let Some(((source, cursor), paste)) = editor
+        .collapsed_paste_display()
+        .zip(editor.collapsed_paste_range())
+    else {
+        let text = editor.display_text();
+        let spans = (0..text.chars().count())
+            .map(|index| index..index + 1)
+            .collect();
+        return (text, editor.display_cursor(), spans);
+    };
+    let source_len = source.chars().count();
+    let tail_len = buffer_len.saturating_sub(paste.end);
+    let summary_len = source_len.saturating_sub(paste.start + tail_len);
+    let mut spans = Vec::with_capacity(source_len);
+    spans.extend((0..paste.start).map(|index| index..index + 1));
+    spans.extend((0..summary_len).map(|_| paste.clone()));
+    spans.extend((paste.end..paste.end + tail_len).map(|index| index..index + 1));
+    (source, cursor, spans)
 }
 
 /// Blocks whose lines carry `devez-copy-v1` metadata. Excludes the ones drawn as
@@ -7001,7 +6887,7 @@ fn input_lines(
     placeholder: &str,
     notice: Option<&str>,
     mode: Option<&ComposerMode>,
-) -> (Vec<PaintLine>, usize, usize) {
+) -> (Vec<PaintLine>, usize, usize, ComposerLayout) {
     input_lines_with_controls(
         editor,
         composer_images,
@@ -12327,113 +12213,54 @@ mod tests {
             provider: "Codex".to_owned(),
             plan: "Pro Lite".to_owned(),
             credits: vec!["3 available".to_owned(), "· 2026-08-01  6d left".to_owned()],
-            credits_expanded: false,
             cwd: "C:/Source/DevezVibe".to_owned(),
             account: "dev@example.com".to_owned(),
         }
     }
 
     #[test]
-    fn welcome_reset_credits_expand_from_a_clickable_summary_row() {
-        let collapsed = welcome_lines(test_welcome(), 80);
-        assert!(collapsed.iter().all(|line| !painted(line).contains("2026-08-01")));
-        let reset = collapsed
-            .iter()
-            .find(|line| painted(line).contains("Resets"))
-            .expect("reset summary");
-        assert!(painted(reset).contains('▼'));
-        assert_eq!(pick_on(reset, "Resets"), Some(Pick::ToggleWelcomeCredits));
-        assert_eq!(pick_on(reset, "3 available"), Some(Pick::ToggleWelcomeCredits));
-        assert_eq!(pick_on(reset, "▼"), Some(Pick::ToggleWelcomeCredits));
-        assert_eq!(
-            Renderer::hover_columns(reset, None, Some(&Pick::ToggleWelcomeCredits))
-                .map(|columns| columns.len()),
-            Some(24)
-        );
-
-        let mut expanded = test_welcome();
-        expanded.credits_expanded = true;
-        let lines = welcome_lines(expanded, 80);
-        assert!(lines.iter().any(|line| painted(line).contains("2026-08-01")));
-
-        let narrow = welcome_lines(test_welcome(), 28);
-        let reset = narrow
-            .iter()
-            .find(|line| painted(line).contains("Resets"))
-            .expect("narrow reset summary");
-        assert!(painted(reset).contains('▼'), "{}", painted(reset));
-    }
-
-    #[test]
-    fn welcome_panel_fills_the_terminal_and_shows_the_version() {
-        for width in [70u16, 90, 140] {
+    fn the_welcome_card_is_two_borderless_rows_with_version_and_folder() {
+        for width in [28u16, 70, 140] {
             let lines = welcome_lines(test_welcome(), width);
-            let expected = panel_span(width);
 
+            assert_eq!(lines.len(), 2, "width {width}: expected exactly two rows");
+            assert_eq!(
+                painted(&lines[0]),
+                format!("DEVEZ VIBE  v{}", crate::update::CURRENT_VERSION),
+                "width {width}: headline changed"
+            );
             assert!(
-                lines.iter().all(|line| painted_width(line) == expected),
-                "width {width}: rows are not all {expected} columns"
+                painted(&lines[1]).contains("DevezVibe"),
+                "width {width}: folder missing — {}",
+                painted(&lines[1])
             );
             assert!(
                 lines
                     .iter()
-                    .any(|line| painted(line)
-                        .contains(&format!("v{}", crate::update::CURRENT_VERSION))),
-                "width {width}: version missing from the headline"
+                    .all(|line| !painted(line).contains(['╭', '│', '╰'])),
+                "width {width}: card still draws a border"
+            );
+            assert!(
+                lines.iter().all(|line| painted_width(line) <= width as usize),
+                "width {width}: a row overflows the terminal"
             );
         }
     }
 
     #[test]
-    fn wide_welcome_panel_reserves_a_notes_column() {
-        let lines = welcome_lines(test_welcome(), 110);
+    fn the_welcome_card_drops_plan_credits_and_release_notes() {
+        let painted_card = welcome_lines(test_welcome(), 110)
+            .iter()
+            .map(painted)
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        assert!(painted(&lines[0]).contains('┬'));
-        assert!(painted(lines.last().expect("bottom border")).contains('┴'));
-        assert!(
-            lines
-                .iter()
-                .any(|line| painted(line).contains("What's new"))
-        );
-        // Every body row carries the divider, so the column never collapses.
-        assert!(
-            lines[1..lines.len() - 1].iter().all(|line| line
-                .tail
-                .iter()
-                .filter(|span| span.text == "│")
-                .count()
-                == 2)
-        );
-    }
-
-    #[test]
-    fn wide_welcome_panel_keeps_info_column_at_48_cells() {
-        let lines = welcome_lines(test_welcome(), 110);
-        let top = painted(&lines[0]);
-        let (left, right) = top
-            .trim_matches(['╭', '╮'])
-            .split_once('┬')
-            .expect("split border");
-
-        assert_eq!(left.chars().count(), 48);
-        assert_eq!(right.chars().count(), panel_span(110) - 2 - 48 - 1);
-    }
-
-    #[test]
-    fn narrow_welcome_panel_collapses_to_one_column() {
-        let lines = welcome_lines(test_welcome(), 50);
-
-        assert!(!painted(&lines[0]).contains('┬'));
-        assert!(
-            lines
-                .iter()
-                .all(|line| !painted(line).contains("What's new"))
-        );
-        assert!(
-            lines
-                .iter()
-                .all(|line| painted_width(line) == panel_span(50))
-        );
+        for gone in ["Plan", "Resets", "Account", "What's new", "2026-08-01"] {
+            assert!(
+                !painted_card.contains(gone),
+                "{gone} still on the welcome card: {painted_card}"
+            );
+        }
     }
 
     #[test]
@@ -12986,7 +12813,6 @@ mod tests {
         let welcome = WelcomeView {
             provider: "Codex".to_owned(),
             plan: "Pro".to_owned(),
-            credits_expanded: false,
             cwd: r"C:\Source\DevezVibe".to_owned(),
             account: "someone@example.com".to_owned(),
             credits: vec!["in 3h".to_owned()],
@@ -13025,9 +12851,9 @@ mod tests {
             .join("\n");
 
         assert!(painted.contains("DEVEZ VIBE"), "{painted}");
-        assert!(painted.contains("someone@example.com"), "{painted}");
+        assert!(painted.contains(r"C:\Source\DevezVibe"), "{painted}");
         // The card sits above the picker rather than replacing it.
-        assert!(frame.lines[0].text.starts_with('╭'));
+        assert!(frame.lines[0].text.starts_with("DEVEZ VIBE"));
         assert!(painted.contains("Select model"));
         assert!(frame.dock_index > 0, "the picker docks below the card");
     }
@@ -14062,24 +13888,14 @@ mod tests {
 
     #[test]
     fn panel_borders_use_the_theme_border_tone() {
-        let lines = welcome_lines(
-            WelcomeView {
-                provider: "Codex".to_owned(),
-                plan: "Pro".to_owned(),
-                credits: vec!["none available".to_owned()],
-                credits_expanded: false,
-                cwd: "C:\\work".to_owned(),
-                account: "ChatGPT".to_owned(),
-            },
-            80,
-        );
+        let panel_width = panel_span(80);
+        let body = panel_line("row", panel_width, Tone::Plain, false);
+        let bottom = panel_bottom(panel_width - 2);
 
-        assert!(lines.first().is_some_and(|line| line.tone == Tone::Border));
-        assert!(lines.last().is_some_and(|line| line.tone == Tone::Border));
-        assert!(lines[1].prefix_tone == Tone::Border);
+        assert!(bottom.tone == Tone::Border);
+        assert!(body.prefix_tone == Tone::Border);
         assert!(
-            lines[1]
-                .tail
+            body.tail
                 .first()
                 .is_some_and(|span| span.tone == Tone::Border)
         );

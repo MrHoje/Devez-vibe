@@ -2625,6 +2625,10 @@ pub struct AppState {
     composer_images: Vec<String>,
     queued_prompts: VecDeque<String>,
     pub thread_id: String,
+    /// The id a later `-r` has to use for this thread, when that is no longer the
+    /// thread's own id. A Claude-named room whose turns moved to Codex keeps its
+    /// visible id on screen, but only the rollout id resumes the conversation.
+    resume_id: String,
     pub turn_id: Option<String>,
     /// Set when the user interrupts after `turn/start` answers but before the
     /// app-server has announced that the turn is active.
@@ -2675,7 +2679,6 @@ pub struct AppState {
     context_window: Option<u64>,
     transient_status: Option<String>,
     show_welcome: bool,
-    welcome_credits_expanded: bool,
     plan_summary: Option<PlanSummary>,
     plan_shimmer_started_at: Option<Instant>,
     subagents: Vec<RunningSubagent>,
@@ -2811,6 +2814,7 @@ impl AppState {
             composer_images: Vec::new(),
             queued_prompts: VecDeque::new(),
             thread_id,
+            resume_id: String::new(),
             turn_id: None,
             pending_interrupt: false,
             turn_interrupted: false,
@@ -2846,7 +2850,6 @@ impl AppState {
             context_window,
             transient_status: None,
             show_welcome: true,
-            welcome_credits_expanded: false,
             plan_summary: None,
             plan_shimmer_started_at: None,
             subagents: Vec::new(),
@@ -3163,6 +3166,28 @@ impl AppState {
         true
     }
 
+    /// Binds the id the host has to resume from when it differs from the thread's own
+    /// id. Called after a thread is attached, since the routing that knows about a
+    /// past provider switch lives in the backend, not in the thread id.
+    pub fn note_resume_id(&mut self, resume_id: &str) {
+        self.resume_id = if resume_id == self.thread_id {
+            String::new()
+        } else {
+            resume_id.to_owned()
+        };
+    }
+
+    /// The session id the host records so its next launch can `-r` back into this
+    /// conversation. It is the thread's own id until a rebind moves the conversation
+    /// into another runtime's session.
+    pub fn host_session_id(&self) -> &str {
+        if self.resume_id.is_empty() {
+            &self.thread_id
+        } else {
+            &self.resume_id
+        }
+    }
+
     pub fn replace_models(&mut self, models: Vec<ModelInfo>) {
         if models.is_empty() {
             return;
@@ -3257,6 +3282,7 @@ impl AppState {
         effort: Option<&str>,
     ) {
         self.thread_id = thread_id;
+        self.resume_id = String::new();
         if self.cwd != cwd {
             self.cwd = cwd;
             self.branch = read_git_branch(&self.cwd);
@@ -3877,6 +3903,7 @@ impl AppState {
         effort: Option<&str>,
     ) {
         self.thread_id = thread_id;
+        self.resume_id = String::new();
         if self.cwd != cwd {
             self.cwd = cwd;
             self.workspace_entries.clear();
@@ -4260,11 +4287,6 @@ impl AppState {
     /// terminal looks like a fresh start instead of a bare composer.
     pub fn reset_welcome(&mut self) {
         self.show_welcome = true;
-        self.welcome_credits_expanded = false;
-    }
-
-    pub fn toggle_welcome_credits(&mut self) {
-        self.welcome_credits_expanded = !self.welcome_credits_expanded;
     }
 
     pub fn drain_committed(&mut self) -> Vec<Block> {
@@ -5139,6 +5161,19 @@ impl AppState {
                 let error = params.get("error").and_then(Value::as_str);
                 self.finish_login(success, error);
                 self.account_refresh_due |= success;
+            }
+            // This thread's conversation now lives in a session other than the one it
+            // is named after — a provider switch, or a Claude session the CLI persisted
+            // under a rotated uuid. The screen keeps the thread's id; what the host
+            // records for the next launch has to follow the conversation.
+            "thread/rebound" => {
+                if let Some(next) = params
+                    .get("newThreadId")
+                    .and_then(Value::as_str)
+                    .filter(|next| !next.is_empty())
+                {
+                    self.resume_id = next.to_owned();
+                }
             }
             // Plan or auth mode changed underneath us; pull the fresh values.
             "account/updated" => self.account_refresh_due = true,
@@ -8537,7 +8572,6 @@ impl AppState {
             },
             plan: self.account_plan.plan_display(),
             credits: self.account_plan.credit_lines(),
-            credits_expanded: self.welcome_credits_expanded,
             cwd: self.cwd.clone(),
             account: self.account.clone(),
         }
@@ -14803,6 +14837,28 @@ mod tests {
         assert_eq!(
             state.status_line().context.as_deref(),
             Some("Context: 96k/258k (37%)")
+        );
+    }
+
+    /// A new session has no turn to report usage yet, so the gauge has to come
+    /// from the catalog window alone. Claude models used to publish no window at
+    /// all, which left the status line blank until — and after — the first reply.
+    #[test]
+    fn a_fresh_session_shows_the_window_before_the_first_turn() {
+        let mut model = test_model("claude:opus[1m]", "Opus 5", true);
+        model.context_window = Some(1_000_000);
+        let state = AppState::new(
+            "claude:thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![model],
+            "claude:opus[1m]",
+            Some("high"),
+        );
+
+        assert_eq!(
+            state.status_line().context.as_deref(),
+            Some("Context: 0k/1000k (0%)")
         );
     }
 

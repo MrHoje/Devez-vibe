@@ -16,8 +16,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Notes shown in the welcome panel's right column. Rewrite these each release;
-/// a line starting with `·` renders as a bullet, anything else as a sub-heading.
+/// Release notes kept with the build. The welcome card no longer prints them, so
+/// nothing reads this today; rewrite it each release for the changelog.
+#[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
     "/provider replaces /claude and /codex: pick the runtime, and connect or disconnect it with Space.",
     "No provider is connected until you choose one, so a PC that cannot reach the Codex app-server never calls it.",

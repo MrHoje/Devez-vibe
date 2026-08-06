@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env, fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
@@ -59,6 +59,13 @@ impl Route {
         .count()
     }
 
+    /// Worth keeping across launches when the thread's own id may not name the session
+    /// that resumes it: a thread that mixed runtimes, or a Claude-backed one, whose id
+    /// the CLI can rotate while the thread keeps the id it was announced under.
+    fn is_worth_storing(&self) -> bool {
+        self.backing_count() > 1 || self.claude_id.is_some()
+    }
+
     fn seen_through(&self, kind: RuntimeKind) -> u64 {
         match kind {
             RuntimeKind::Codex => self.codex_seen_through,
@@ -86,6 +93,13 @@ pub struct BackendServer {
     open_code_path: PathBuf,
     routes: Arc<StdMutex<HashMap<String, Route>>>,
     aliases: Arc<StdMutex<HashMap<String, String>>>,
+    /// visible thread → the id that names the session a later `-r` has to resume.
+    /// It equals the visible id until a thread outlives the runtime it was named
+    /// after (a Claude-named room whose turns now run on Codex, a Claude session the
+    /// CLI persisted under a rotated uuid).
+    resume_ids: Arc<StdMutex<HashMap<String, String>>>,
+    /// Rebind notices raised while answering a request, drained by `next_event`.
+    pending_events: Arc<StdMutex<VecDeque<ServerEvent>>>,
     route_store_path: Option<PathBuf>,
     cwd: PathBuf,
 }
@@ -112,6 +126,7 @@ impl BackendServer {
             .map(load_routes)
             .unwrap_or_default();
         let aliases = route_aliases(&routes);
+        let resume_ids = route_resume_ids(&routes);
         Ok(Self {
             codex: None,
             codex_unavailable_reason: None,
@@ -121,6 +136,8 @@ impl BackendServer {
             open_code_path: open_code_path.to_path_buf(),
             routes: Arc::new(StdMutex::new(routes)),
             aliases: Arc::new(StdMutex::new(aliases)),
+            resume_ids: Arc::new(StdMutex::new(resume_ids)),
+            pending_events: Arc::new(StdMutex::new(VecDeque::new())),
             route_store_path,
             cwd: cwd.to_path_buf(),
         })
@@ -684,6 +701,14 @@ impl BackendServer {
     }
 
     pub async fn next_event(&mut self) -> Option<ServerEvent> {
+        if let Some(pending) = self
+            .pending_events
+            .lock()
+            .expect("pending events mutex")
+            .pop_front()
+        {
+            return Some(pending);
+        }
         let (source, event) = match (self.codex.as_mut(), self.open_code.as_mut()) {
             (Some(codex), Some(open_code)) => tokio::select! {
                 event = codex.next_event() => (RuntimeKind::Codex, event),
@@ -746,15 +771,14 @@ impl BackendServer {
     /// The Claude bridge renames a session when the CLI persists it under an id other
     /// than the one the bridge proposed. The route has to follow, or every later
     /// `session/history`, `session/resume`, and DevezCode `-r` would key off an id
-    /// with no transcript behind it. When the visible thread *is* that Claude session,
-    /// the rename is passed up so the UI (and DevezCode's session file) adopt it;
-    /// when the visible thread belongs to another runtime — a mid-session provider
-    /// switch — only the backing id moves and the UI keeps its id.
+    /// with no transcript behind it. Only the backing id moves here — whether that
+    /// changes the id the thread resumes from is `note_resume_id`'s call, since a room
+    /// whose turns have moved to Codex resumes from its rollout either way.
     fn absorb_claude_rebind(&self, event: ServerEvent) -> ServerEvent {
         let ServerEvent::Notification { method, params } = &event else {
             return event;
         };
-        if method != "thread/rebound" {
+        if method != "claude/session/rebound" {
             return event;
         }
         let Some(previous) = params.get("threadId").and_then(Value::as_str) else {
@@ -774,37 +798,18 @@ impl BackendServer {
             .as_ref()
             .map(|route| route.cwd.clone())
             .unwrap_or_else(|| self.cwd.clone());
-        let namespaced = visible == visible_thread_id(&previous_backing);
-        let target = if namespaced {
-            visible_thread_id(&next_backing)
-        } else {
-            visible.clone()
-        };
-        if namespaced {
-            let mut routes = self.routes.lock().expect("routes mutex");
-            if let Some(existing) = routes.remove(&visible) {
-                routes.insert(target.clone(), existing);
-            }
-            drop(routes);
-            let mut aliases = self.aliases.lock().expect("aliases mutex");
-            for stored in aliases.values_mut() {
-                if *stored == visible {
-                    *stored = target.clone();
-                }
-            }
-        }
         self.register_route(
-            &target,
-            RuntimeKind::Claude,
+            &visible,
+            route
+                .as_ref()
+                .map(|route| route.active)
+                .unwrap_or(RuntimeKind::Claude),
             route.as_ref().and_then(|route| route.codex_id.clone()),
             route.as_ref().and_then(|route| route.open_code_id.clone()),
             Some(next_backing),
             cwd,
         );
-        ServerEvent::Notification {
-            method: method.clone(),
-            params: json!({ "threadId": visible, "newThreadId": target }),
-        }
+        event
     }
 
     pub async fn shutdown(self) {
@@ -990,6 +995,44 @@ impl BackendServer {
             }
         }
         self.persist_routes();
+        self.note_resume_id(visible);
+    }
+
+    /// Raises a rebind notice when the id that resumes this thread stops being the
+    /// thread's own id — a Claude-named room whose turns moved to Codex keeps its
+    /// visible id, but the conversation now lives in a Codex rollout, and that is the
+    /// id `/resume` and the DevezCode session file have to carry.
+    fn note_resume_id(&self, visible: &str) {
+        let Some(resume) = self.route(visible).as_ref().and_then(resume_id_for) else {
+            return;
+        };
+        {
+            let mut published = self.resume_ids.lock().expect("resume ids mutex");
+            let previous = published
+                .get(visible)
+                .map(String::as_str)
+                .unwrap_or(visible);
+            if previous == resume {
+                published.insert(visible.to_owned(), resume);
+                return;
+            }
+            published.insert(visible.to_owned(), resume.clone());
+        }
+        self.pending_events
+            .lock()
+            .expect("pending events mutex")
+            .push_back(ServerEvent::Notification {
+                method: "thread/rebound".to_owned(),
+                params: json!({ "threadId": visible, "newThreadId": resume }),
+            });
+    }
+
+    /// The id a later launch has to pass to `-r` for this thread.
+    pub fn resume_id(&self, visible: &str) -> String {
+        self.route(visible)
+            .as_ref()
+            .and_then(resume_id_for)
+            .unwrap_or_else(|| visible.to_owned())
     }
 
     fn register_discovered_route(
@@ -1298,15 +1341,19 @@ fn load_routes(path: &Path) -> HashMap<String, Route> {
 }
 
 fn save_routes(path: &Path, routes: &HashMap<String, Route>) -> Result<()> {
-    let mixed = routes
-        .iter()
-        .filter(|(_, route)| route.backing_count() > 1)
-        .map(|(visible, route)| (visible.clone(), route.clone()))
-        .collect::<HashMap<_, _>>();
+    // Every room DevezCode opens runs its own dvz, and each one only knows its own
+    // threads. Writing just this process's map would drop the sibling rooms' routes,
+    // and a dropped route is a room that resumes into the wrong runtime's session.
+    let mut stored = load_routes(path);
+    for (visible, route) in routes.iter().filter(|(_, route)| route.is_worth_storing()) {
+        stored.insert(visible.clone(), route.clone());
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_vec_pretty(&mixed)?)?;
+    let temp = path.with_extension("json.tmp");
+    fs::write(&temp, serde_json::to_vec_pretty(&stored)?)?;
+    fs::rename(&temp, path)?;
     Ok(())
 }
 
@@ -1325,6 +1372,25 @@ fn route_aliases(routes: &HashMap<String, Route>) -> HashMap<String, String> {
             .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// The id that resumes each stored thread — the backing session of the runtime the
+/// thread was last active on, in the form `-r` accepts.
+fn route_resume_ids(routes: &HashMap<String, Route>) -> HashMap<String, String> {
+    routes
+        .iter()
+        .filter_map(|(visible, route)| {
+            resume_id_for(route).map(|resume| (visible.clone(), resume))
+        })
+        .collect()
+}
+
+fn resume_id_for(route: &Route) -> Option<String> {
+    match route.active {
+        RuntimeKind::Claude => route.claude_id.as_deref().map(visible_thread_id),
+        RuntimeKind::Codex => route.codex_id.clone(),
+        RuntimeKind::OpenCode => route.open_code_id.clone(),
+    }
 }
 
 fn session_cwd(session: &Value, fallback: &Path) -> PathBuf {
@@ -1731,6 +1797,59 @@ mod tests {
             open_code_seen_through: 0,
             claude_seen_through: 7,
         }
+    }
+
+    #[test]
+    fn a_claude_named_thread_running_on_codex_resumes_from_its_rollout() {
+        let switched = route(RuntimeKind::Codex, Some("019f-rollout"), Some("claude-uuid"));
+        assert_eq!(
+            resume_id_for(&switched).as_deref(),
+            Some("019f-rollout"),
+            "the conversation lives in the rollout, so that is what -r has to name"
+        );
+        assert!(switched.is_worth_storing());
+
+        let claude = route(RuntimeKind::Claude, None, Some("claude-uuid"));
+        assert_eq!(
+            resume_id_for(&claude).as_deref(),
+            Some("claude:claude-uuid")
+        );
+
+        let codex = route(RuntimeKind::Codex, Some("019f-rollout"), None);
+        assert_eq!(resume_id_for(&codex).as_deref(), Some("019f-rollout"));
+        assert!(
+            !codex.is_worth_storing(),
+            "a codex-only thread is named after its own session"
+        );
+    }
+
+    #[test]
+    fn saving_routes_keeps_the_entries_other_rooms_wrote() {
+        let dir = std::env::temp_dir().join("dvz-route-merge-test");
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("session-routes.json");
+
+        let mut first = HashMap::new();
+        first.insert(
+            "claude:room-one".to_owned(),
+            route(RuntimeKind::Codex, Some("rollout-one"), Some("room-one")),
+        );
+        save_routes(&path, &first).expect("first room persists its route");
+
+        let mut second = HashMap::new();
+        second.insert(
+            "claude:room-two".to_owned(),
+            route(RuntimeKind::Codex, Some("rollout-two"), Some("room-two")),
+        );
+        save_routes(&path, &second).expect("second room persists its route");
+
+        let stored = load_routes(&path);
+        assert!(
+            stored.contains_key("claude:room-one"),
+            "a sibling room's dvz must not drop routes it never knew about"
+        );
+        assert!(stored.contains_key("claude:room-two"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

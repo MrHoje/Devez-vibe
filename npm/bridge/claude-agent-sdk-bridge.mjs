@@ -104,6 +104,21 @@ function applyClaudeExecutable(options, params) {
   options.pathToClaudeCodeExecutable = executable;
 }
 
+// The SDK model list carries no window size, so the status line would stay
+// blank until a turn reports one — and a fresh session has no turn yet. Claude
+// ships a 200k window, and the `[1m]` variants a 1M one.
+function claudeContextWindow(...names) {
+  const oneMillion = names.some((name) => String(name || "").includes("[1m]"));
+  return oneMillion ? 1_000_000 : 200_000;
+}
+
+function capabilityContextWindow(capabilities, ...names) {
+  const reported = Number(capabilities?.contextWindow || capabilities?.contextWindowSize || 0);
+  return reported > 0
+    ? reported
+    : claudeContextWindow(...names, capabilities?.value, capabilities?.resolvedModel);
+}
+
 function modelCapabilities(models, model) {
   const value = stripClaudeModel(model);
   return models.find((candidate) => candidate.value === value || candidate.resolvedModel === value)
@@ -145,7 +160,7 @@ function catalogEntry(model, defaultResolvedModel) {
   const efforts = model.supportsEffort && Array.isArray(model.supportedEffortLevels)
     ? model.supportedEffortLevels
     : [];
-  const contextWindow = Number(model.contextWindow || model.contextWindowSize || 0);
+  const contextWindow = capabilityContextWindow(model, value, resolved);
   return {
     id: visibleModel(resolved),
     model: visibleModel(value),
@@ -251,7 +266,7 @@ function adoptSessionId(session, incoming) {
   sessionAliases.set(previous, real);
   session.id = real;
   sessions.set(real, session);
-  notify("thread/rebound", {
+  notify("claude/session/rebound", {
     threadId: visibleSession(previous),
     newThreadId: visibleSession(real),
   });
@@ -476,7 +491,7 @@ function historyTokenUsage(messages, models, model) {
   }
   if (!counted) return null;
   const capabilities = modelCapabilities(models, model);
-  const contextWindow = Number(capabilities?.contextWindow || capabilities?.contextWindowSize || 0);
+  const contextWindow = capabilityContextWindow(capabilities, model);
   return {
     total,
     ...(last ? { last } : {}),
@@ -535,8 +550,10 @@ function processAssistant(session, message) {
     session.models,
     message.message?.model || session.model,
   );
-  session.lastContextWindow = Number(
-    capabilities?.contextWindow || capabilities?.contextWindowSize || 0,
+  session.lastContextWindow = capabilityContextWindow(
+    capabilities,
+    message.message?.model,
+    session.model,
   );
   const content = Array.isArray(message.message?.content) ? message.message.content : [];
   for (const block of content) {
@@ -861,7 +878,9 @@ async function processResult(session, message) {
     tokenUsage: {
       total: totals,
       ...(session.lastContextUsage ? { last: session.lastContextUsage } : {}),
-      modelContextWindow: session.lastContextWindow || totals.contextWindow || undefined,
+      // `modelUsage` reports the window the turn actually ran under, so it wins
+      // over the size guessed from the model name.
+      modelContextWindow: totals.contextWindow || session.lastContextWindow || undefined,
     },
   });
   const error = message.is_error && !interrupted
@@ -1299,6 +1318,14 @@ function runSelfTest() {
   });
   if (usage.totalTokens !== 68_802 || usage.inputTokens !== 68_502) {
     throw new Error(`Claude usage self-test failed: ${JSON.stringify(usage)}`);
+  }
+  const windows = [
+    catalogEntry({ value: "opus[1m]", resolvedModel: "claude-opus-5[1m]" }, "").contextWindow,
+    catalogEntry({ value: "sonnet", resolvedModel: "claude-sonnet-5" }, "").contextWindow,
+    catalogEntry({ value: "haiku", resolvedModel: "x", contextWindow: 300_000 }, "").contextWindow,
+  ];
+  if (windows.join(",") !== "1000000,200000,300000") {
+    throw new Error(`Claude context window self-test failed: ${windows.join(",")}`);
   }
   process.stdout.write("Claude bridge self-test passed\n");
 }

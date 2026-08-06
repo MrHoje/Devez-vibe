@@ -123,6 +123,15 @@ impl Editor {
         Some(self.buffer[start..end].iter().collect())
     }
 
+    /// Where a collapsed paste sits in the buffer, so a caller working in
+    /// display characters can tell which of them stand for the whole block.
+    pub fn collapsed_paste_range(&self) -> Option<std::ops::Range<usize>> {
+        self.collapsed_paste_lines?;
+        let start = self.collapsed_paste_start?;
+        let end = self.collapsed_paste_end?;
+        Some(start..end)
+    }
+
     pub fn collapsed_paste_display(&self) -> Option<(String, usize)> {
         let lines = self.paste_summary_lines()?;
         let start = self.collapsed_paste_start.unwrap_or(0);
@@ -310,6 +319,35 @@ impl Editor {
         let end = self.raw_index_for_text_index(range.end).max(start);
         self.buffer.splice(start..end, text.chars());
         self.cursor = start + text.chars().count();
+    }
+
+    /// Removes a span of display characters — what a drag over the composer
+    /// highlighted. Reports whether anything was removed. A span that cuts into
+    /// a collapsed paste leaves the rest of it expanded: what is left is no
+    /// longer the block that was pasted.
+    pub fn delete_display_range(&mut self, range: std::ops::Range<usize>) -> bool {
+        let start = range.start.min(self.buffer.len());
+        let end = range.end.min(self.buffer.len());
+        if start >= end {
+            return false;
+        }
+        self.leave_history();
+        self.buffer.drain(start..end);
+        self.cursor = start;
+        if let (Some(paste_start), Some(paste_end)) =
+            (self.collapsed_paste_start, self.collapsed_paste_end)
+        {
+            if start < paste_end && end > paste_start {
+                self.collapsed_paste_lines = None;
+                self.collapsed_paste_start = None;
+                self.collapsed_paste_end = None;
+            } else if end <= paste_start {
+                let removed = end - start;
+                self.collapsed_paste_start = Some(paste_start - removed);
+                self.collapsed_paste_end = Some(paste_end - removed);
+            }
+        }
+        true
     }
 
     pub fn delete_word_left(&mut self) {

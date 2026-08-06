@@ -377,6 +377,10 @@ async fn start_session(
         .then(|| state::codex_home().and_then(|home| rollout::load(&home, &thread_id)))
         .flatten();
     state.attach_thread(thread_id, actual_cwd, &actual_model, Some(&actual_effort));
+    // A thread whose turns already moved to another runtime resumes from that
+    // runtime's session, not from the id it is named after. The routing knows; the
+    // thread id does not.
+    state.note_resume_id(&server.resume_id(&state.thread_id));
     if is_resuming {
         state.load_history(&thread, rollout.as_ref());
         state.begin_cost_restore();
@@ -1165,10 +1169,6 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
         }
         Pick::PlanSummary => {
             state.toggle_plan_summary();
-            Action::Tick(true)
-        }
-        Pick::ToggleWelcomeCredits => {
-            state.toggle_welcome_credits();
             Action::Tick(true)
         }
         Pick::RemoveQueuedPrompt(index) => {
@@ -2367,6 +2367,7 @@ async fn start_new_thread(
     };
 
     state.attach_thread(thread_id, cwd, &model, effort.as_deref());
+    state.note_resume_id(&server.resume_id(&state.thread_id));
     finish_thread_switch(server, state, renderer, queued).await
 }
 
@@ -2461,6 +2462,7 @@ async fn resume_into_state(
         &resumed.model,
         resumed.effort.as_deref(),
     );
+    state.note_resume_id(&server.resume_id(&state.thread_id));
     let history = match hydrate_thread_history(server, &response).await {
         Ok(history) => history,
         Err(error) => {
@@ -3641,7 +3643,7 @@ fn draw(state: &mut AppState, renderer: &mut Renderer) -> Result<()> {
     // the session state is refreshed from the same place rather than from each
     // of the call sites that can move it.
     devezcode::sync(
-        &state.thread_id,
+        state.host_session_id(),
         state.host_turn_busy(),
         state.host_loading(),
         state.awaiting_input(),
