@@ -158,12 +158,32 @@ async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
     let startup_config = read_startup_config();
     let requested_model = requested_startup_model(cli.model.as_deref(), &provider_config);
     let requested_codex = requested_model.is_some_and(is_codex_model);
-    if requested_codex {
+    // Codex has to be up before the session and model lists are read: both skip their
+    // Codex half while the app-server is down, so `dvz -r <gpt thread>` would resolve
+    // against a Claude-only world — no GPT models to show, no GPT sessions to pick.
+    let resumes_codex = cli.continue_session
+        || cli
+            .resume
+            .as_deref()
+            // An empty `--resume` opens the startup picker, which has to offer both
+            // halves of the session list.
+            .is_some_and(|target| target.is_empty() || server.thread_is_codex(target));
+    if requested_codex || resumes_codex {
         let _ = server.start_codex().await;
     }
     let codex_unavailable_reason = server.codex_unavailable_reason().map(ToOwned::to_owned);
-    let default_to_claude = requested_model.is_none();
-    let requested_claude = requested_model.is_some_and(claude::is_claude_model);
+    let cwd = resolve_cwd(cli.cwd.as_deref())?;
+    let resume_id = resolve_startup_session(cli, server, &cwd).await?;
+    let Some(resume_id) = resume_id else {
+        return Ok(());
+    };
+    let is_resuming = !resume_id.is_empty();
+    // The thread being resumed owns the runtime it was recorded under. Only a launch
+    // that starts a new session falls back to the Claude-first default.
+    let resumed_codex = is_resuming && server.thread_is_codex(&resume_id) && server.has_codex();
+    let default_to_claude = requested_model.is_none() && !resumed_codex;
+    let requested_claude = requested_model.is_some_and(claude::is_claude_model)
+        || (is_resuming && claude::is_claude_thread(&resume_id));
     let requested_open_code = requested_model.is_some_and(open_code::is_open_code_model);
     let fallback_to_claude = should_fallback_to_claude(server.has_codex(), requested_model);
     let (account, prefer_open_code) = if requested_claude
@@ -177,6 +197,9 @@ async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
         match ensure_account(server).await {
             Ok(account) => (account, false),
             Err(_) if server.has_open_code() => ("OpenCode · /connect".to_owned(), true),
+            // A thread that already exists still has to open; only the header label
+            // is unknown when the account probe fails.
+            Err(_) if is_resuming => ("Codex".to_owned(), false),
             Err(error) => return Err(error),
         }
     };
@@ -211,12 +234,6 @@ async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
         cli.effort.as_deref(),
         &startup_config,
     )?;
-    let cwd = resolve_cwd(cli.cwd.as_deref())?;
-    let resume_id = resolve_startup_session(cli, server, &cwd).await?;
-    let Some(resume_id) = resume_id else {
-        return Ok(());
-    };
-    let is_resuming = !resume_id.is_empty();
     let model_override = if is_resuming {
         cli.model.clone()
     } else {
