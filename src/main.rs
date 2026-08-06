@@ -154,13 +154,14 @@ async fn main() -> Result<()> {
 
 async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
     server.initialize().await?;
-    let codex_unavailable_reason = server.codex_unavailable_reason().map(ToOwned::to_owned);
     let provider_config = backend::read_provider_config();
     let startup_config = read_startup_config();
-    let requested_model = cli
-        .model
-        .as_deref()
-        .or_else(|| root_config_value(&provider_config, "model"));
+    let requested_model = requested_startup_model(cli.model.as_deref(), &provider_config);
+    let requested_codex = requested_model.is_some_and(is_codex_model);
+    if requested_codex {
+        let _ = server.start_codex().await;
+    }
+    let codex_unavailable_reason = server.codex_unavailable_reason().map(ToOwned::to_owned);
     let default_to_claude = requested_model.is_none();
     let requested_claude = requested_model.is_some_and(claude::is_claude_model);
     let requested_open_code = requested_model.is_some_and(open_code::is_open_code_model);
@@ -1240,6 +1241,26 @@ async fn execute_action(
         Action::ResumeThread(target) => {
             return resume_thread(server, state, renderer, &target).await;
         }
+        Action::ActivateCodex => match server.start_codex().await {
+            Ok(()) => match server
+                .request(
+                    "model/list",
+                    json!({ "includeHidden": false, "limit": 100 }),
+                )
+                .await
+            {
+                Ok(response) => {
+                    state.replace_models(parse_models(&response));
+                    state.switch_to_codex();
+                }
+                Err(error) => {
+                    state.push_notice(BlockKind::Error, "Codex 모델 조회 실패", error.to_string())
+                }
+            },
+            Err(error) => {
+                state.push_notice(BlockKind::Error, "Codex 사용 불가", error.to_string())
+            }
+        },
         Action::SetFast(enabled) => {
             let service_tier = if enabled {
                 state
@@ -3772,9 +3793,18 @@ fn resolve_startup_model(
 }
 
 fn should_fallback_to_claude(codex_available: bool, requested_model: Option<&str>) -> bool {
-    !codex_available
-        && !requested_model.is_some_and(claude::is_claude_model)
-        && !requested_model.is_some_and(open_code::is_open_code_model)
+    !codex_available && requested_model.is_some_and(is_codex_model)
+}
+
+fn requested_startup_model<'a>(
+    cli_model: Option<&'a str>,
+    provider_config: &'a str,
+) -> Option<&'a str> {
+    cli_model.or_else(|| root_config_value(provider_config, "model"))
+}
+
+fn is_codex_model(model: &str) -> bool {
+    !claude::is_claude_model(model) && !open_code::is_open_code_model(model)
 }
 
 fn preferred_claude_model(models: &[ModelInfo]) -> Option<&str> {
@@ -3980,7 +4010,7 @@ mod tests {
 
     #[test]
     fn unavailable_codex_falls_back_unless_an_available_provider_was_requested() {
-        assert!(should_fallback_to_claude(false, None));
+        assert!(!should_fallback_to_claude(false, None));
         assert!(should_fallback_to_claude(false, Some("gpt-5.6-sol")));
         assert!(!should_fallback_to_claude(false, Some("claude:sonnet")));
         assert!(!should_fallback_to_claude(false, Some("opencode:provider/model")));
@@ -3996,6 +4026,17 @@ mod tests {
         ];
 
         assert_eq!(preferred_claude_model(&models), Some("claude:sonnet"));
+    }
+
+    #[test]
+    fn configured_codex_model_enables_codex_startup_but_claude_does_not() {
+        let codex = requested_startup_model(None, "model = \"gpt-5.6-sol\"\n");
+        let claude = requested_startup_model(None, "model = \"claude:sonnet\"\n");
+        let fresh = requested_startup_model(None, "");
+
+        assert!(codex.is_some_and(is_codex_model));
+        assert!(!claude.is_some_and(is_codex_model));
+        assert!(fresh.is_none());
     }
 
     #[test]

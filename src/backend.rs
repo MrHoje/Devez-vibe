@@ -70,6 +70,7 @@ pub struct BackendServer {
     codex_unavailable_reason: Option<String>,
     open_code: Option<OpenCodeServer>,
     claude: ClaudeServer,
+    codex_path: PathBuf,
     open_code_path: PathBuf,
     routes: Arc<StdMutex<HashMap<String, Route>>>,
     aliases: Arc<StdMutex<HashMap<String, String>>>,
@@ -84,12 +85,6 @@ impl BackendServer {
         claude_path: &Path,
         cwd: &Path,
     ) -> Result<Self> {
-        let devezcode_room = crate::devezcode::room_id();
-        let (codex, codex_unavailable_reason) =
-            match AppServer::spawn(codex_path, devezcode_room.as_deref()).await {
-                Ok(codex) => (Some(codex), None),
-                Err(error) => (None, Some(error.to_string())),
-            };
         let open_code = if crate::open_code::PROVIDER_ENABLED
             && (has_connected_provider() || open_code_is_startup_default())
         {
@@ -99,10 +94,11 @@ impl BackendServer {
         };
         let claude = ClaudeServer::new(node_path, claude_path, cwd)?;
         Ok(Self {
-            codex,
-            codex_unavailable_reason,
+            codex: None,
+            codex_unavailable_reason: None,
             open_code,
             claude,
+            codex_path: codex_path.to_path_buf(),
             open_code_path: open_code_path.to_path_buf(),
             routes: Arc::new(StdMutex::new(HashMap::new())),
             aliases: Arc::new(StdMutex::new(HashMap::new())),
@@ -131,6 +127,28 @@ impl BackendServer {
 
     pub fn codex_unavailable_reason(&self) -> Option<&str> {
         self.codex_unavailable_reason.as_deref()
+    }
+
+    pub async fn start_codex(&mut self) -> Result<()> {
+        if self.codex.is_some() {
+            return Ok(());
+        }
+        let devezcode_room = crate::devezcode::room_id();
+        let codex = match AppServer::spawn(&self.codex_path, devezcode_room.as_deref()).await {
+            Ok(codex) => codex,
+            Err(error) => {
+                self.codex_unavailable_reason = Some(error.to_string());
+                return Err(error);
+            }
+        };
+        if let Err(error) = codex.initialize().await {
+            self.codex_unavailable_reason = Some(error.to_string());
+            codex.shutdown().await;
+            return Err(error);
+        }
+        self.codex_unavailable_reason = None;
+        self.codex = Some(codex);
+        Ok(())
     }
 
     pub async fn request(&self, method: &str, mut params: Value) -> Result<Value> {
@@ -510,6 +528,7 @@ impl BackendServer {
             {
                 Ok(json!({}))
             }
+            "config/value/write" if vibe_setting_write(&params)? => Ok(json!({})),
             "config/value/write" if provider_default_write(&params)? => Ok(json!({})),
             _ => self.codex()?.request(method, params).await,
         }
@@ -1039,6 +1058,42 @@ fn provider_default_write(params: &Value) -> Result<bool> {
     Ok(false)
 }
 
+fn vibe_setting_write(params: &Value) -> Result<bool> {
+    let Some(key) = params.get("keyPath").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    if !is_vibe_setting_key(key) {
+        return Ok(false);
+    }
+    let value = params
+        .get("value")
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .or_else(|| value.as_bool().map(|value| value.to_string()))
+        })
+        .context("Vibe 설정 값이 문자열 또는 boolean이 아닙니다.")?;
+    crate::state::write_vibe_config_value(key, &value)?;
+    Ok(true)
+}
+
+fn is_vibe_setting_key(key: &str) -> bool {
+    matches!(
+        key,
+        "vibe_mode"
+            | "conversation_view"
+            | "model_verbosity"
+            | "shell_display_mode"
+            | "diff_display_mode"
+            | "status_line_model"
+            | "status_line_effort"
+            | "status_line_context"
+            | "status_line_five_hour"
+            | "status_line_weekly"
+    )
+}
+
 fn write_provider_config(model: &str, effort: &str) -> Result<()> {
     let path = provider_config_path().context("Devez Vibe 설정 경로를 찾을 수 없습니다.")?;
     if let Some(parent) = path.parent() {
@@ -1337,6 +1392,8 @@ mod tests {
 
         server.initialize().await.expect("fallback initialization");
         assert!(!server.has_codex());
+        assert!(server.codex_unavailable_reason().is_none());
+        assert!(server.start_codex().await.is_err());
         assert!(server.codex_unavailable_reason().is_some());
         server.shutdown().await;
     }
@@ -1352,10 +1409,12 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")),
         )
         .await
-        .expect("Codex process should start before the simulated initialization exit");
+        .expect("Claude backend should start without touching Codex");
 
         server.initialize().await.expect("fallback initialization");
         assert!(!server.has_codex());
+        assert!(server.codex_unavailable_reason().is_none());
+        assert!(server.start_codex().await.is_err());
         assert!(server.codex_unavailable_reason().is_some());
         server.shutdown().await;
     }
@@ -1371,6 +1430,16 @@ mod tests {
             selected_runtime(Some("claude:sonnet"), RuntimeKind::Codex)
                 == RuntimeKind::Claude
         );
+    }
+
+    #[test]
+    fn vibe_display_settings_are_local_but_provider_settings_are_not() {
+        assert!(is_vibe_setting_key("vibe_mode"));
+        assert!(is_vibe_setting_key("shell_display_mode"));
+        assert!(is_vibe_setting_key("diff_display_mode"));
+        assert!(is_vibe_setting_key("status_line_context"));
+        assert!(!is_vibe_setting_key("model"));
+        assert!(!is_vibe_setting_key("plugins.example"));
     }
 
     #[test]

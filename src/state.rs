@@ -823,6 +823,7 @@ pub enum Action {
     NewThread,
     OpenResume,
     ResumeThread(String),
+    ActivateCodex,
     SetFast(bool),
     StartSide(Option<String>),
     ReturnFromSide,
@@ -2704,11 +2705,37 @@ impl AppState {
         let branch = read_git_branch(&cwd);
         let vibe_mode = read_vibe_mode();
         let conversation_view = read_conversation_view();
-        let (response_length, shell_display_mode, diff_display_mode) = match vibe_mode {
-            VibeMode::Vibe => (ResponseLength::Short, ShellDisplayMode::Collapse, DiffDisplayMode::Collapse),
-            VibeMode::SuperVibe => (ResponseLength::Short, ShellDisplayMode::Hide, DiffDisplayMode::Hide),
-            VibeMode::Normal => (ResponseLength::Short, ShellDisplayMode::Expand, DiffDisplayMode::Expand),
-        };
+        let (default_response_length, default_shell_display_mode, default_diff_display_mode) =
+            match vibe_mode {
+                VibeMode::Vibe => (
+                    ResponseLength::Short,
+                    ShellDisplayMode::Collapse,
+                    DiffDisplayMode::Collapse,
+                ),
+                VibeMode::SuperVibe => (
+                    ResponseLength::Short,
+                    ShellDisplayMode::Hide,
+                    DiffDisplayMode::Hide,
+                ),
+                VibeMode::Normal => (
+                    ResponseLength::Short,
+                    ShellDisplayMode::Expand,
+                    DiffDisplayMode::Expand,
+                ),
+            };
+        let response_length = read_vibe_config_value("model_verbosity")
+            .map(|value| match value.as_str() {
+                "medium" => ResponseLength::Normal,
+                "high" => ResponseLength::Detailed,
+                _ => ResponseLength::Short,
+            })
+            .unwrap_or(default_response_length);
+        let shell_display_mode = read_vibe_config_value("shell_display_mode")
+            .and_then(|value| ShellDisplayMode::from_config_value(&value))
+            .unwrap_or(default_shell_display_mode);
+        let diff_display_mode = read_vibe_config_value("diff_display_mode")
+            .and_then(|value| DiffDisplayMode::from_config_value(&value))
+            .unwrap_or(default_diff_display_mode);
         let (five_hour_percent, weekly_percent) = read_codex_usage();
         let context_window = models
             .get(selected_model)
@@ -2888,6 +2915,10 @@ impl AppState {
             "✓ Provider changed",
             detail,
         ));
+    }
+
+    pub fn switch_to_codex(&mut self) {
+        self.switch_provider(ModelProvider::Codex);
     }
 
     pub fn fallback_from_codex(&mut self, message: impl Into<String>) -> bool {
@@ -5250,8 +5281,7 @@ impl AppState {
                 Action::None
             }
             "/codex" if parts.len() == 1 => {
-                self.switch_provider(ModelProvider::Codex);
-                Action::None
+                Action::ActivateCodex
             }
             "/claude" | "/codex" => {
                 self.committed.push(Block::new(
@@ -9437,43 +9467,100 @@ fn read_response_length() -> ResponseLength {
 }
 
 fn read_vibe_config_value(key: &str) -> Option<String> {
-    codex_home()
-        .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
-        .and_then(|config| config.lines().find_map(|line| {
-            let (found, value) = line.split('#').next()?.split_once('=')?;
-            (found.trim() == key).then(|| value.trim().trim_matches(['\"', '\'']).to_ascii_lowercase())
-        }))
+    vibe_settings_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|config| config_value(&config, key))
+        .or_else(|| {
+            codex_home()
+                .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
+                .and_then(|config| config_value(&config, key))
+        })
 }
 
 #[allow(dead_code)]
 fn read_shell_display_mode() -> ShellDisplayMode {
-    codex_home()
-        .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
-        .and_then(|config| parse_shell_display_mode(&config))
+    read_vibe_config_value("shell_display_mode")
+        .and_then(|value| ShellDisplayMode::from_config_value(&value))
         .unwrap_or_default()
 }
 
 #[allow(dead_code)]
 fn read_diff_display_mode() -> DiffDisplayMode {
-    codex_home()
-        .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
-        .and_then(|config| parse_diff_display_mode(&config))
+    read_vibe_config_value("diff_display_mode")
+        .and_then(|value| DiffDisplayMode::from_config_value(&value))
         .unwrap_or_default()
 }
 
 fn read_status_line_settings() -> StatusLineSettings {
-    codex_home()
-        .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
-        .map(|config| {
-            let mut settings = StatusLineSettings::default();
-            for field in StatusLineField::ALL {
-                if let Some(enabled) = parse_status_line_field(&config, field) {
-                    settings.0[field.index()] = enabled;
-                }
-            }
-            settings
+    let mut settings = StatusLineSettings::default();
+    for field in StatusLineField::ALL {
+        if let Some(enabled) = read_vibe_config_value(field.config_key())
+            .and_then(|value| value.parse::<bool>().ok())
+        {
+            settings.0[field.index()] = enabled;
+        }
+    }
+    settings
+}
+
+fn config_value(config: &str, key: &str) -> Option<String> {
+    config.lines().find_map(|line| {
+        let (found, value) = line.split('#').next()?.split_once('=')?;
+        (found.trim() == key)
+            .then(|| value.trim().trim_matches(['\"', '\'']).to_ascii_lowercase())
+    })
+}
+
+fn vibe_settings_path() -> Option<PathBuf> {
+    env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .map(|root| root.join("DevezVibe").join("settings.toml"))
+        .or_else(|| {
+            env::var_os("HOME").map(PathBuf::from).map(|home| {
+                home.join(".config")
+                    .join("devez-vibe")
+                    .join("settings.toml")
+            })
         })
-        .unwrap_or_default()
+}
+
+pub(crate) fn write_vibe_config_value(key: &str, value: &str) -> std::io::Result<()> {
+    let path = vibe_settings_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Devez Vibe 설정 경로를 찾을 수 없습니다.",
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    fs::write(path, upsert_vibe_config_value(&existing, key, value))
+}
+
+fn upsert_vibe_config_value(existing: &str, key: &str, value: &str) -> String {
+    let replacement = format!("{key} = {}", serde_json::to_string(value).unwrap_or_default());
+    let mut found = false;
+    let mut lines = existing
+        .lines()
+        .map(|line| {
+            let matches = line
+                .split('#')
+                .next()
+                .and_then(|line| line.split_once('='))
+                .is_some_and(|(found, _)| found.trim() == key);
+            if matches {
+                found = true;
+                replacement.clone()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>();
+    if !found {
+        lines.push(replacement);
+    }
+    format!("{}\n", lines.join("\n"))
 }
 
 #[allow(dead_code)]
@@ -9502,6 +9589,7 @@ fn parse_diff_display_mode(config: &str) -> Option<DiffDisplayMode> {
         .flatten()
 }
 
+#[cfg(test)]
 fn parse_status_line_field(config: &str, field: StatusLineField) -> Option<bool> {
     config
         .lines()
@@ -11281,6 +11369,19 @@ mod tests {
             parse_shell_display_mode("shell_display_mode = \"other\"\n"),
             None
         );
+    }
+
+    #[test]
+    fn global_vibe_settings_replace_one_value_and_preserve_the_others() {
+        let config = upsert_vibe_config_value(
+            "vibe_mode = \"vibe\"\nshell_display_mode = \"collapse\"\n",
+            "shell_display_mode",
+            "hide",
+        );
+
+        assert!(config.contains("vibe_mode = \"vibe\""));
+        assert!(config.contains("shell_display_mode = \"hide\""));
+        assert!(!config.contains("shell_display_mode = \"collapse\""));
     }
 
     #[test]
@@ -13412,7 +13513,12 @@ mod tests {
         state.run_slash_command("/model 2");
         assert_eq!(state.selected_model_name(), "claude:haiku");
 
-        state.run_slash_command("/codex");
+        assert!(matches!(
+            state.run_slash_command("/codex"),
+            Action::ActivateCodex
+        ));
+        assert_eq!(state.selected_model_name(), "claude:haiku");
+        state.switch_to_codex();
         assert_eq!(state.selected_model_name(), "gpt-5.6-sol");
         state.run_slash_command("/model");
         let overlay = state.overlay_view().expect("Codex model picker");
