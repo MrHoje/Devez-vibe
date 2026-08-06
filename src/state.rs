@@ -27,9 +27,10 @@ use crate::{
     provider::{ProviderAuthRequest, ProviderPicker, ProviderPickerResult},
     renderer::{
         AnimationView, Block, BlockKind, ComposerMode, EffortSlider, HIDDEN_STATUS_LINE,
-        LiveBlockView, ModeAccent, OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS, PlanStep,
-        PlanStepStatus, PlanSummary, ProviderHandoffBlock, StatusLineView, SubagentView,
-        SuggestionView, VibeTone, View, WelcomeView, visible_window,
+        LiveBlockView, ModeAccent, OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS,
+        PermissionBadge, PermissionTone, PlanStep, PlanStepStatus, PlanSummary,
+        ProviderHandoffBlock, StatusLineView, SubagentView, SuggestionView, VibeTone, View,
+        WelcomeView, visible_window,
     },
     rollout::{PlanSnapshot, Rollout, RolloutEvent, RolloutKind},
     theme::{self, ThemeKind},
@@ -51,6 +52,18 @@ const QUIT_ARM_WINDOW: Duration = Duration::from_secs(3);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PermissionMode {
     FullAccess,
+}
+
+/// Claude Code's own permission modes. The composer badge cycles them the way
+/// Shift+Tab does in the CLI, and every turn carries the choice to the bridge.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum ClaudePermissionMode {
+    #[default]
+    Default,
+    AcceptEdits,
+    Plan,
+    Auto,
+    BypassPermissions,
 }
 
 /// Controls the desired response length. Codex names the underlying setting
@@ -304,6 +317,53 @@ impl PermissionMode {
         }
     }
 
+}
+
+impl ClaudePermissionMode {
+    /// Indicator text, wording and symbols taken from the CLI's own mode line so
+    /// the badge is recognisable to anyone who has used Claude Code.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::AcceptEdits => "⏵⏵ accept edits",
+            Self::Plan => "⏸ plan mode",
+            Self::Auto => "⏵⏵ auto mode",
+            Self::BypassPermissions => "⏵⏵ bypass permissions",
+        }
+    }
+
+    /// The value the Claude Agent SDK takes for `permissionMode`.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::AcceptEdits => "acceptEdits",
+            Self::Plan => "plan",
+            Self::Auto => "auto",
+            Self::BypassPermissions => "bypassPermissions",
+        }
+    }
+
+    fn tone(self) -> PermissionTone {
+        match self {
+            Self::Default => PermissionTone::Neutral,
+            Self::AcceptEdits => PermissionTone::AcceptEdits,
+            Self::Plan => PermissionTone::Plan,
+            Self::Auto => PermissionTone::Auto,
+            Self::BypassPermissions => PermissionTone::Bypass,
+        }
+    }
+
+    /// The CLI's cycle order, with bypass reached only where the settings allow
+    /// it — Claude Code rejects the mode outright when policy disables it.
+    fn next(self, bypass_allowed: bool) -> Self {
+        match self {
+            Self::Default => Self::AcceptEdits,
+            Self::AcceptEdits => Self::Plan,
+            Self::Plan => Self::Auto,
+            Self::Auto if bypass_allowed => Self::BypassPermissions,
+            Self::Auto | Self::BypassPermissions => Self::Default,
+        }
+    }
 }
 
 /// Rows of the `/provider` picker, in the order they are drawn.
@@ -829,6 +889,8 @@ pub enum Action {
     ResumeThread(String),
     ActivateCodex,
     SetFast(bool),
+    /// Hand Claude the permission mode the badge just cycled to.
+    SetClaudePermissionMode(ClaudePermissionMode),
     StartSide(Option<String>),
     ReturnFromSide,
     Compact,
@@ -2697,6 +2759,10 @@ pub struct AppState {
     five_hour_percent: Option<u8>,
     weekly_percent: Option<u8>,
     fast_mode: bool,
+    /// Claude's permission mode for this thread, and whether the settings let it
+    /// reach `bypassPermissions` at all.
+    claude_permission_mode: ClaudePermissionMode,
+    bypass_permissions_allowed: bool,
     side_parent: Option<SideParent>,
     last_assistant_markdown: Option<String>,
     composer_notice: Option<(String, Instant)>,
@@ -2808,6 +2874,7 @@ impl AppState {
         let context_window = models
             .get(selected_model)
             .and_then(|model| model.context_window);
+        let bypass_permissions_allowed = crate::claude::bypass_permissions_allowed(Path::new(&cwd));
 
         let mut state = Self {
             editor: Editor::default(),
@@ -2863,6 +2930,8 @@ impl AppState {
             five_hour_percent,
             weekly_percent,
             fast_mode: read_fast_mode(),
+            claude_permission_mode: ClaudePermissionMode::default(),
+            bypass_permissions_allowed,
             side_parent: None,
             last_assistant_markdown: None,
             composer_notice: None,
@@ -3666,6 +3735,7 @@ impl AppState {
             model: self.selected_model_name().to_owned(),
             response_length: self.response_length_label().to_owned(),
             fast_mode: self.effective_fast_mode(),
+            claude_permission: self.claude_permission_badge(),
             effort: self.selected_effort.clone(),
             shell_display_mode: self.shell_display_mode().label().to_owned(),
             diff_display_mode: self.diff_display_mode().label().to_owned(),
@@ -3757,6 +3827,30 @@ impl AppState {
         } else {
             "default"
         }
+    }
+
+    /// The permission mode Claude runs the next turn under. Only Claude sessions
+    /// have one; a Codex thread keeps its Fast badge in the same slot.
+    pub fn claude_permission_mode(&self) -> Option<ClaudePermissionMode> {
+        self.selected_model_name()
+            .starts_with("claude:")
+            .then_some(self.claude_permission_mode)
+    }
+
+    fn claude_permission_badge(&self) -> Option<PermissionBadge> {
+        self.claude_permission_mode().map(|mode| PermissionBadge {
+            label: mode.label().to_owned(),
+            tone: mode.tone(),
+        })
+    }
+
+    /// Steps to the next mode and reports it, so the caller can tell the runtime.
+    pub fn cycle_claude_permission_mode(&mut self) -> ClaudePermissionMode {
+        self.claude_permission_mode = self
+            .claude_permission_mode
+            .next(self.bypass_permissions_allowed);
+        self.set_composer_notice(self.claude_permission_mode.label().to_owned());
+        self.claude_permission_mode
     }
 
     pub fn effective_fast_mode(&self) -> bool {
@@ -4533,6 +4627,43 @@ impl AppState {
             return None;
         };
         Some(self.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)))
+    }
+
+    /// Deletes the composer characters a drag selected, along with any attachment
+    /// whose placeholder the drag covered. Reports whether the range was
+    /// consumed, so a Backspace that finds nothing selected still falls through
+    /// to the one before the cursor.
+    pub fn delete_composer_selection(&mut self, range: std::ops::Range<usize>) -> bool {
+        if self.pending.is_some() {
+            return false;
+        }
+        let mut first_image = None;
+        let mut images = 0;
+        let mut seen = 0;
+        for (index, &ch) in self.editor.chars().iter().enumerate() {
+            if ch != ATTACHMENT_PLACEHOLDER {
+                continue;
+            }
+            if range.contains(&index) {
+                first_image = first_image.or(Some(seen));
+                images += 1;
+            }
+            seen += 1;
+        }
+        let old_text = self.editor.text();
+        let binding_count = self.selected_completion_bindings.len();
+        if !self.editor.delete_display_range(range) {
+            return false;
+        }
+        self.sync_selected_completion_bindings(&old_text, binding_count);
+        if let Some(first) = first_image {
+            let start = first.min(self.composer_images.len());
+            let end = (first + images).min(self.composer_images.len());
+            self.composer_images.drain(start..end);
+        }
+        self.command_selection = 0;
+        self.disarm_quit();
+        true
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
@@ -13877,6 +14008,29 @@ mod tests {
     }
 
     #[test]
+    fn a_drag_selected_range_leaves_with_the_attachment_it_covered() {
+        let mut state = test_state();
+        state.editor.set_text("before ");
+        state.attach_local_image(r"C:\Temp\clipboard-image.bmp".to_owned());
+        state.editor.insert_str(" after");
+
+        // "before " is seven characters, so the attachment is the eighth.
+        assert!(state.delete_composer_selection(7..8));
+
+        assert_eq!(state.editor.text(), "before  after");
+        assert_eq!(state.composer_image_count(), 0);
+    }
+
+    #[test]
+    fn a_drag_selected_range_outside_the_text_deletes_nothing() {
+        let mut state = test_state();
+        state.editor.set_text("keep");
+
+        assert!(!state.delete_composer_selection(9..9));
+        assert_eq!(state.editor.text(), "keep");
+    }
+
+    #[test]
     fn composer_arrows_cross_an_image_attachment_as_one_block() {
         let mut state = test_state();
         state.editor.set_text("before");
@@ -14838,6 +14992,51 @@ mod tests {
             state.status_line().context.as_deref(),
             Some("Context: 96k/258k (37%)")
         );
+    }
+
+    /// The badge walks Claude's modes in the CLI's own order, and stops short of
+    /// a bypass the settings forbid — the CLI would reject that mode outright.
+    #[test]
+    fn the_permission_badge_cycles_the_claude_modes() {
+        let mut state = AppState::new(
+            "claude:thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![test_model("claude:sonnet", "Sonnet", true)],
+            "claude:sonnet",
+            Some("high"),
+        );
+        state.bypass_permissions_allowed = false;
+
+        assert_eq!(
+            state.claude_permission_mode(),
+            Some(ClaudePermissionMode::Default)
+        );
+        let walked = std::iter::repeat_with(|| state.cycle_claude_permission_mode())
+            .take(4)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            walked,
+            [
+                ClaudePermissionMode::AcceptEdits,
+                ClaudePermissionMode::Plan,
+                ClaudePermissionMode::Auto,
+                ClaudePermissionMode::Default,
+            ]
+        );
+
+        state.bypass_permissions_allowed = true;
+        let walked = std::iter::repeat_with(|| state.cycle_claude_permission_mode())
+            .take(4)
+            .collect::<Vec<_>>();
+        assert_eq!(walked[3], ClaudePermissionMode::BypassPermissions);
+    }
+
+    /// Codex has no such modes, so the badge stays off its composer rule and the
+    /// turn carries nothing.
+    #[test]
+    fn a_codex_thread_has_no_permission_mode() {
+        assert_eq!(test_state().claude_permission_mode(), None);
     }
 
     /// A new session has no turn to report usage yet, so the gauge has to come

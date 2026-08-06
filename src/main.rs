@@ -811,6 +811,14 @@ async fn event_loop(
                         } else if is_clipboard_image_shortcut(&key) && attach_clipboard_image(state) {
                             renderer.clear_selection();
                             Action::None
+                        } else if is_selection_delete_key(&key)
+                            && let Some(range) = renderer.composer_selection_range()
+                            && state.delete_composer_selection(range)
+                        {
+                            // The drag selected composer text, so the key takes the
+                            // selection rather than the character at the cursor.
+                            renderer.clear_selection();
+                            Action::Tick(true)
                         } else if key.code == KeyCode::Char('c')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
                         {
@@ -1177,6 +1185,9 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
         }
         Pick::OpenLink(target) => Action::OpenUrl(target),
         Pick::FastMode => Action::SetFast(!state.effective_fast_mode()),
+        Pick::ClaudePermissionMode => {
+            Action::SetClaudePermissionMode(state.cycle_claude_permission_mode())
+        }
         Pick::Model => state.run_command("/model"),
         Pick::EffortSetting => state.run_command("/effort"),
         Pick::Subagent(index) => state.open_subagent(index),
@@ -1404,6 +1415,19 @@ async fn execute_action(
                 Err(error) => {
                     state.push_notice(BlockKind::Error, "Fast 전환 실패", error.to_string())
                 }
+            }
+        }
+        // The mode also rides along with every turn, so a session that has not
+        // started yet still opens under it. This call is what moves a live one.
+        Action::SetClaudePermissionMode(mode) => {
+            if let Err(error) = server
+                .request(
+                    "thread/permissionMode/set",
+                    json!({ "threadId": state.thread_id, "permissionMode": mode.wire() }),
+                )
+                .await
+            {
+                state.push_notice(BlockKind::Warning, "권한 모드 전환 실패", error.to_string());
             }
         }
         Action::PersistShellDisplayMode(mode) => {
@@ -3458,6 +3482,9 @@ async fn start_turn(
     if !effort.is_empty() {
         params["effort"] = json!(effort);
     }
+    if let Some(mode) = state.claude_permission_mode() {
+        params["claudePermissionMode"] = json!(mode.wire());
+    }
     if let Some(provider_handoff) = provider_handoff {
         params["providerHandoff"] = provider_handoff;
     }
@@ -3488,6 +3515,19 @@ fn is_clipboard_image_shortcut(key: &KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char('v' | 'V'))
         && (key.modifiers.contains(KeyModifiers::CONTROL)
             || key.modifiers.contains(KeyModifiers::ALT))
+}
+
+/// Backspace and Delete on their own: with composer text drag-selected, they take
+/// the selection. Modified chords keep the meanings they already have, so
+/// Ctrl+Backspace stays a word delete.
+fn is_selection_delete_key(key: &KeyEvent) -> bool {
+    matches!(
+        key.kind,
+        crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
+    ) && matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
+        && !key.modifiers.intersects(
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+        )
 }
 
 fn attach_pasted_local_image(state: &mut AppState, text: &str) -> bool {

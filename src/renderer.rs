@@ -303,6 +303,24 @@ pub enum VibeTone {
     Super,
 }
 
+/// The Claude permission mode badge, as the composer should paint it. Claude
+/// Code gives each mode its own colour, so the badge carries one rather than
+/// deriving it from a label the renderer would have to parse.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PermissionBadge {
+    pub label: String,
+    pub tone: PermissionTone,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PermissionTone {
+    Neutral,
+    AcceptEdits,
+    Plan,
+    Auto,
+    Bypass,
+}
+
 pub struct ComposerMode {
     /// Current Git branch, shown as a display-only composer badge.
     pub branch: Option<String>,
@@ -315,6 +333,9 @@ pub struct ComposerMode {
     pub model: String,
     pub response_length: String,
     pub fast_mode: bool,
+    /// Claude's permission mode, painted where a Codex thread shows Fast. `None`
+    /// for the runtimes that have no such mode.
+    pub claude_permission: Option<PermissionBadge>,
     #[allow(dead_code)]
     pub effort: String,
     pub shell_display_mode: String,
@@ -1037,6 +1058,34 @@ impl Renderer {
         (!text.is_empty()).then_some(text)
     }
 
+    /// The composer characters the active drag covers, as a range into the text
+    /// the composer is showing. Backspace and Delete answer to this before they
+    /// answer to the cursor, the way a selection does in any other editor. `None`
+    /// unless the drag actually landed on prompt text.
+    pub fn composer_selection_range(&self) -> Option<Range<usize>> {
+        let range = self.selection.range()?;
+        let composer = self.composer_selection.as_ref()?;
+        let mut start = usize::MAX;
+        let mut end = 0;
+        for (offset, row) in composer.layout.rows.iter().enumerate() {
+            let width =
+                row.start_column + row.glyphs.iter().map(|glyph| glyph.width).sum::<usize>();
+            let Some(columns) = range.columns_for_row(composer.first_row + offset, width) else {
+                continue;
+            };
+            let mut column = row.start_column;
+            for glyph in &row.glyphs {
+                let selected = column < columns.end && column + glyph.width > columns.start;
+                if selected && glyph.span.start < glyph.span.end {
+                    start = start.min(glyph.span.start);
+                    end = end.max(glyph.span.end);
+                }
+                column += glyph.width;
+            }
+        }
+        (start < end).then_some(start..end)
+    }
+
     fn reconcile_selection(&mut self, lines: &[PaintLine]) {
         let Some(range) = self.selection.range() else {
             return;
@@ -1301,6 +1350,9 @@ impl Renderer {
         self.previous_lines = frame.lines.clone();
         self.cursor_line = frame.cursor_line;
         self.cursor_col = frame.cursor_col;
+        // Inline mode hands selection to the terminal, so nothing here maps a
+        // drag back to the composer.
+        self.composer_selection = None;
         self.animation_activity_row = None;
         self.animation_plan_rows = 0;
         self.last_width = width;
@@ -1560,6 +1612,15 @@ impl Renderer {
         let animation_activity_row = frame
             .activity_index
             .map(|index| plan_rows + view_rows + index);
+        // The prompt rows follow the composer's top rule, and the live frame is
+        // painted below the transcript window, so this is where they land.
+        let composer_selection = frame
+            .composer_index
+            .zip(frame.composer_layout.take())
+            .map(|(index, layout)| ComposerSelection {
+                first_row: plan_rows + view_rows + index + 1,
+                layout,
+            });
         let (mut screen, cursor_line) = compose_screen(
             &self.wrapped,
             frame.lines,
@@ -1599,6 +1660,7 @@ impl Renderer {
         self.previous_lines = screen;
         self.cursor_line = cursor_line;
         self.cursor_col = frame.cursor_col;
+        self.composer_selection = composer_selection;
         self.animation_activity_row = animation_activity_row;
         self.animation_plan_rows = plan_rows;
         self.last_width = width;
@@ -2389,6 +2451,9 @@ struct Frame {
     show_cursor: bool,
     dock_index: usize,
     composer_index: Option<usize>,
+    /// The prompt rows of the composer this frame carries, if it has one, so a
+    /// drag over them can be mapped back to composer characters.
+    composer_layout: Option<ComposerLayout>,
     activity_index: Option<usize>,
 }
 
@@ -2464,6 +2529,10 @@ enum Tone {
     FastOn,
     FastOff,
     VibeSuper,
+    ClaudeAcceptEdits,
+    ClaudePlan,
+    ClaudeAuto,
+    ClaudeBypass,
     ModelChange,
     SyntaxComment,
     SyntaxString,
@@ -2514,6 +2583,9 @@ pub enum Pick {
     PlanSummary,
     /// The `Fast: On`/`Fast: Off` badge: toggles the fast service tier.
     FastMode,
+    /// Claude's permission mode badge: cycles the mode the way Shift+Tab does
+    /// in the Claude Code CLI.
+    ClaudePermissionMode,
     /// The status line's model name: opens `/model`.
     Model,
     /// The status line's effort reading: opens `/effort`.
@@ -3015,6 +3087,11 @@ fn activity_line_with_composer_controls(
             .fast_index
             .map(|index| (badge_start + index, Pick::FastMode)),
     );
+    picks.extend(
+        badge
+            .permission_index
+            .map(|index| (badge_start + index, Pick::ClaudePermissionMode)),
+    );
     line.tail.push(rule_gap(gap));
     line.tail.extend(badge.spans);
     line.tail.push(rule_gap(1));
@@ -3395,16 +3472,17 @@ fn normal_frame_with_expansion(
         .history_position()
         .map(|(position, total)| format!("{position}/{total}"))
         .unwrap_or_default();
-    let (input_lines, input_cursor_line, input_cursor_col) = input_lines_with_controls(
-        editor,
-        composer_images,
-        width,
-        &recalled,
-        composer_placeholder,
-        status.composer_notice.as_deref(),
-        composer_mode,
-        composer_controls_mode,
-    );
+    let (input_lines, input_cursor_line, input_cursor_col, composer_layout) =
+        input_lines_with_controls(
+            editor,
+            composer_images,
+            width,
+            &recalled,
+            composer_placeholder,
+            status.composer_notice.as_deref(),
+            composer_mode,
+            composer_controls_mode,
+        );
     let composer_index = lines.len();
     let cursor_line = composer_index + input_cursor_line;
     lines.extend(input_lines);
@@ -3420,6 +3498,7 @@ fn normal_frame_with_expansion(
         show_cursor: true,
         dock_index,
         composer_index: Some(composer_index),
+        composer_layout: Some(composer_layout),
         activity_index,
     }
 }
@@ -4278,7 +4357,9 @@ fn overlay_frame_with_expansion(
     let show_cursor = if let Some(editor) = overlay.input {
         // The composer rule reads as part of the picker without this gap.
         lines.push(PaintLine::blank());
-        let (input, input_cursor_line, input_cursor_col) = input_lines(
+        // A picker's own input is not the composer, so a drag over it stays a
+        // copy: there is no prompt buffer behind it for a delete to reach.
+        let (input, input_cursor_line, input_cursor_col, _) = input_lines(
             editor,
             &[],
             width,
@@ -4307,6 +4388,7 @@ fn overlay_frame_with_expansion(
         show_cursor,
         dock_index,
         composer_index,
+        composer_layout: None,
         activity_index: None,
     }
 }
@@ -6766,6 +6848,7 @@ fn copy_joins_next(line: &PaintLine) -> bool {
     line.tail.iter().any(|span| span.tone == Tone::CopyJoin)
 }
 
+#[cfg(test)]
 fn composer_display(editor: &Editor, composer_images: &[String]) -> (String, usize) {
     let (display, cursor, _) = composer_display_with_spans(editor, composer_images);
     (display, cursor)
@@ -6909,12 +6992,13 @@ fn input_lines_with_controls(
     notice: Option<&str>,
     mode: Option<&ComposerMode>,
     controls_mode: Option<&ComposerMode>,
-) -> (Vec<PaintLine>, usize, usize) {
+) -> (Vec<PaintLine>, usize, usize, ComposerLayout) {
     // Windows IME composes Hangul in the terminal before the committed character
     // reaches us. Leave a full wide-character cell clear before the closing border
     // so that transient composition cannot paint over it or trigger autowrap.
     const COMPOSER_IME_RIGHT_GUTTER: usize = 3;
-    let (display, editor_cursor) = composer_display(editor, composer_images);
+    let (display, editor_cursor, display_spans) =
+        composer_display_with_spans(editor, composer_images);
     let display_chars = display.chars().collect::<Vec<_>>();
     let panel_width = (width as usize).saturating_sub(1).max(16);
     let side_prefix = "│ ";
@@ -6929,6 +7013,7 @@ fn input_lines_with_controls(
         )
         .max(4);
     let mut raw_rows = vec![String::new()];
+    let mut row_glyphs: Vec<Vec<ComposerGlyph>> = vec![Vec::new()];
     let mut row = 0;
     let input_prefix_width =
         UnicodeWidthStr::width(side_prefix) + UnicodeWidthStr::width(first_prefix);
@@ -6941,9 +7026,14 @@ fn input_lines_with_controls(
             cursor_row = row;
             cursor_column = column;
         }
+        let span = display_spans
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| index..index + 1);
 
         if ch == '\n' {
             raw_rows.push(String::new());
+            row_glyphs.push(Vec::new());
             row += 1;
             column = input_prefix_width;
             continue;
@@ -6953,6 +7043,7 @@ fn input_lines_with_controls(
         let content_column = column.saturating_sub(input_prefix_width);
         if content_column + ch_width > content_width && !raw_rows[row].is_empty() {
             raw_rows.push(String::new());
+            row_glyphs.push(Vec::new());
             row += 1;
             column = input_prefix_width;
             if index == editor_cursor {
@@ -6961,6 +7052,18 @@ fn input_lines_with_controls(
             }
         }
         raw_rows[row].push(ch);
+        // A combining mark rides along with the glyph it attaches to, so it is
+        // deleted with it rather than being left behind on its own.
+        match row_glyphs[row].last_mut() {
+            Some(last) if ch_width == 0 && span.start < span.end => {
+                last.span.start = last.span.start.min(span.start);
+                last.span.end = last.span.end.max(span.end);
+            }
+            _ => row_glyphs[row].push(ComposerGlyph {
+                width: ch_width,
+                span,
+            }),
+        }
         column += ch_width;
     }
 
@@ -7031,7 +7134,16 @@ fn input_lines_with_controls(
     // around the prompt reads as the same furniture the panels are drawn from.
     rows.push(input_bottom_line(panel_width, notice, mode));
 
-    (rows, cursor_row + 1, cursor_column)
+    let layout = ComposerLayout {
+        rows: row_glyphs
+            .into_iter()
+            .map(|glyphs| ComposerRowLayout {
+                start_column: input_prefix_width,
+                glyphs,
+            })
+            .collect(),
+    };
+    (rows, cursor_row + 1, cursor_column, layout)
 }
 
 /// Shortest rule stub kept on the composer top line so the frame never collapses.
@@ -7106,6 +7218,11 @@ fn input_top_line_with_controls(
             badge
                 .fast_index
                 .map(|index| (badge_start + index, Pick::FastMode)),
+        );
+        picks.extend(
+            badge
+                .permission_index
+                .map(|index| (badge_start + index, Pick::ClaudePermissionMode)),
         );
         tail.push(rule_gap(COMPOSER_MODE_GAP));
         tail.extend(badge.spans);
@@ -7303,9 +7420,35 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
         shell_display_mode_index: None,
         diff_display_mode_index: None,
         fast_index: None,
+        permission_index: None,
     };
     if mode.model.starts_with("claude:") {
-        return (spans_width(&without_fast.spans) <= budget).then_some(without_fast);
+        // Claude has no service tier to flip; the permission mode takes the slot
+        // Fast holds on a Codex thread, and drops first when the rule tightens.
+        let ladder = mode
+            .claude_permission
+            .iter()
+            .map(|permission| BadgeSpans {
+                spans: [
+                    display_spans.clone(),
+                    [primary_spans.clone(), vec![separator_span()]].concat(),
+                    vec![PaintSpan {
+                        text: permission.label.clone(),
+                        tone: permission_tone(permission.tone),
+                        bold: false,
+                    }],
+                ]
+                .concat(),
+                response_length_index: Some(display_width),
+                shell_display_mode_index: None,
+                diff_display_mode_index: None,
+                fast_index: None,
+                permission_index: Some(display_width + primary_spans.len() + 1),
+            })
+            .chain(std::iter::once(without_fast));
+        return ladder
+            .into_iter()
+            .find(|candidate| spans_width(&candidate.spans) <= budget);
     }
 
     // Fast is the only optional trailing control for models that expose it.
@@ -7321,6 +7464,7 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
             shell_display_mode_index: None,
             diff_display_mode_index: None,
             fast_index: Some(display_width + primary_spans.len() + 1),
+            permission_index: None,
         },
         without_fast,
     ];
@@ -7338,6 +7482,17 @@ struct BadgeSpans {
     shell_display_mode_index: Option<usize>,
     diff_display_mode_index: Option<usize>,
     fast_index: Option<usize>,
+    permission_index: Option<usize>,
+}
+
+fn permission_tone(tone: PermissionTone) -> Tone {
+    match tone {
+        PermissionTone::Neutral => Tone::FastOff,
+        PermissionTone::AcceptEdits => Tone::ClaudeAcceptEdits,
+        PermissionTone::Plan => Tone::ClaudePlan,
+        PermissionTone::Auto => Tone::ClaudeAuto,
+        PermissionTone::Bypass => Tone::ClaudeBypass,
+    }
 }
 
 fn separator_span() -> PaintSpan {
@@ -7974,6 +8129,10 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::FastOn => palette.blue,
         Tone::FastOff => palette.muted,
         Tone::VibeSuper => palette.warning,
+        Tone::ClaudeAcceptEdits => theme::claude_mode_colors().accept_edits,
+        Tone::ClaudePlan => theme::claude_mode_colors().plan,
+        Tone::ClaudeAuto => theme::claude_mode_colors().auto,
+        Tone::ClaudeBypass => theme::claude_mode_colors().bypass,
         Tone::ModelChange => palette.foreground,
         Tone::SyntaxComment => palette.syntax_comment,
         Tone::SyntaxString => palette.syntax_string,
@@ -8533,6 +8692,7 @@ mod tests {
             show_cursor: true,
             dock_index: 1,
             composer_index: Some(1),
+            composer_layout: None,
             activity_index: None,
         };
 
@@ -8558,6 +8718,7 @@ mod tests {
             show_cursor: true,
             dock_index: 1,
             composer_index: Some(2),
+            composer_layout: None,
             activity_index: Some(1),
         };
 
@@ -8578,6 +8739,7 @@ mod tests {
             show_cursor: true,
             dock_index: 3,
             composer_index: Some(3),
+            composer_layout: None,
             activity_index: None,
         };
 
@@ -8599,7 +8761,7 @@ mod tests {
         let mut editor = Editor::default();
         editor.set_text("wrapped-prompt-text");
 
-        let (rows, _, _) = input_lines(&editor, &[], 18, "", "placeholder", None, None);
+        let (rows, _, _, _) = input_lines(&editor, &[], 18, "", "placeholder", None, None);
         let prompt_rows = &rows[1..rows.len() - 1];
 
         assert!(prompt_rows.len() > 1);
@@ -8623,7 +8785,7 @@ mod tests {
         let mut editor = Editor::default();
         editor.set_text("가가가가가가");
 
-        let (rows, cursor_row, cursor_col) =
+        let (rows, cursor_row, cursor_col, _) =
             input_lines(&editor, &[], 18, "", "placeholder", None, None);
 
         assert_eq!((cursor_row, cursor_col), (2, 8));
@@ -8632,7 +8794,7 @@ mod tests {
         assert!(rows.iter().all(|row| painted_width(row) == 17));
 
         editor.set_text("가가가가가가나");
-        let (rows, cursor_row, cursor_col) =
+        let (rows, cursor_row, cursor_col, _) =
             input_lines(&editor, &[], 18, "", "placeholder", None, None);
 
         assert_eq!((cursor_row, cursor_col), (2, 10));
@@ -8652,7 +8814,7 @@ mod tests {
         let (_, display_cursor) = composer_display(&editor, &[]);
         assert_eq!(display_cursor, 24);
 
-        let (_, cursor_row, cursor_col) =
+        let (_, cursor_row, cursor_col, _) =
             input_lines(&editor, &[], 18, "", "placeholder", None, None);
 
         assert_eq!((cursor_row, cursor_col), (3, 10));
@@ -8662,7 +8824,7 @@ mod tests {
     fn fullscreen_composer_copy_excludes_the_box_chrome() {
         let mut editor = Editor::default();
         editor.set_text("copy");
-        let (rows, _, _) = input_lines(&editor, &[], 18, "", "placeholder", None, None);
+        let (rows, _, _, _) = input_lines(&editor, &[], 18, "", "placeholder", None, None);
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
         renderer.previous_lines = rows;
 
@@ -8675,10 +8837,73 @@ mod tests {
     }
 
     #[test]
+    fn a_drag_over_the_composer_answers_in_characters() {
+        let mut editor = Editor::default();
+        editor.set_text("alpha beta");
+        let (rows, _, _, layout) = input_lines(&editor, &[], 40, "", "placeholder", None, None);
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = rows;
+        renderer.composer_selection = Some(ComposerSelection {
+            first_row: 1,
+            layout,
+        });
+
+        // The prompt text starts at column 4, so this drag covers "beta".
+        assert!(renderer.begin_selection(10, 1));
+        assert!(renderer.update_selection(13, 1));
+
+        assert_eq!(renderer.composer_selection_range(), Some(6..10));
+
+        // Chrome on its own selects nothing to delete.
+        assert!(renderer.begin_selection(0, 1));
+        assert_eq!(renderer.composer_selection_range(), None);
+    }
+
+    #[test]
+    fn a_drag_across_composer_rows_takes_the_line_break_with_it() {
+        let mut editor = Editor::default();
+        editor.set_text("one\ntwo");
+        let (rows, _, _, layout) = input_lines(&editor, &[], 40, "", "placeholder", None, None);
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = rows;
+        renderer.composer_selection = Some(ComposerSelection {
+            first_row: 1,
+            layout,
+        });
+
+        assert!(renderer.begin_selection(5, 1));
+        assert!(renderer.update_selection(4, 2));
+
+        // "ne" plus the break plus "t": the newline sits between the two rows.
+        assert_eq!(renderer.composer_selection_range(), Some(1..5));
+    }
+
+    #[test]
+    fn a_drag_over_a_collapsed_paste_answers_for_the_whole_block() {
+        let mut editor = Editor::default();
+        editor.insert_paste_str("one\ntwo\nthree\nfour\nfive\nsix");
+        let paste = editor
+            .collapsed_paste_range()
+            .expect("the paste stays collapsed");
+        let (rows, _, _, layout) = input_lines(&editor, &[], 40, "", "placeholder", None, None);
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = rows;
+        renderer.composer_selection = Some(ComposerSelection {
+            first_row: 1,
+            layout,
+        });
+
+        // One cell of the summary is enough: it stands for the pasted block.
+        assert!(renderer.begin_selection(6, 1));
+
+        assert_eq!(renderer.composer_selection_range(), Some(paste));
+    }
+
+    #[test]
     fn fullscreen_composer_highlight_excludes_the_box_chrome() {
         let mut editor = Editor::default();
         editor.set_text("copy");
-        let (rows, _, _) = input_lines(&editor, &[], 18, "", "placeholder", None, None);
+        let (rows, _, _, _) = input_lines(&editor, &[], 18, "", "placeholder", None, None);
         let range = CellRange {
             start: CellPosition { column: 0, row: 1 },
             end: CellPosition { column: 16, row: 1 },
@@ -9149,7 +9374,7 @@ mod tests {
         editor.insert_attachment();
         let images = vec![r"C:\Temp\clipboard-image.bmp".to_owned()];
 
-        let (rows, cursor_row, cursor_col) =
+        let (rows, cursor_row, cursor_col, _) =
             input_lines(&editor, &images, 80, "", "", None, None);
 
         assert!(painted(&rows[1]).contains("> [Image #1]"));
@@ -10330,6 +10555,7 @@ mod tests {
             model: "GPT-5.6-Terra".to_owned(),
             response_length: "Short".to_owned(),
             fast_mode,
+            claude_permission: None,
             effort: "high".to_owned(),
             cost: None,
             shell_display_mode: "Collapse".to_owned(),
@@ -10342,7 +10568,7 @@ mod tests {
         let editor = Editor::default();
         let mode = test_mode("Default", ModeAccent::Calm, false);
 
-        let (rows, _, _) = input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
+        let (rows, _, _, _) = input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
 
         assert_eq!(rows[0].tone, Tone::ModelTerra);
         assert_eq!(rows[1].prefix_tone, Tone::ModelTerra);
@@ -10360,7 +10586,7 @@ mod tests {
         let mut mode = test_mode("Default", ModeAccent::Calm, false);
         mode.model = "claude:opus[1m]".to_owned();
 
-        let (rows, _, _) = input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
+        let (rows, _, _, _) = input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
 
         assert_eq!(rows[0].tone, Tone::ModelOpus);
         assert_eq!(rows[1].prefix_tone, Tone::ModelOpus);
@@ -10511,6 +10737,31 @@ mod tests {
         assert!(line.pick.as_ref().is_none_or(|picks| {
             picks.0.iter().all(|(_, _, pick)| *pick != Pick::FastMode)
         }));
+    }
+
+    /// The slot Fast holds on a Codex thread carries Claude's permission mode,
+    /// painted in that mode's own colour and clickable like the other badges.
+    #[test]
+    fn claude_composer_shows_the_permission_mode_in_the_fast_slot() {
+        let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
+        mode.model = "claude:sonnet".to_owned();
+        mode.claude_permission = Some(PermissionBadge {
+            label: "⏸ plan mode".to_owned(),
+            tone: PermissionTone::Plan,
+        });
+
+        let line = input_top_line(120, "", Some(&mode));
+
+        assert!(painted(&line).contains("⏸ plan mode"));
+        assert_eq!(
+            pick_on(&line, "⏸ plan mode"),
+            Some(Pick::ClaudePermissionMode)
+        );
+        assert!(
+            line.tail
+                .iter()
+                .any(|span| span.tone == Tone::ClaudePlan && span.text.contains("plan mode"))
+        );
     }
 
     #[test]
@@ -11054,6 +11305,7 @@ mod tests {
             show_cursor: true,
             dock_index: 1,
             composer_index: Some(1),
+            composer_layout: None,
             activity_index: None,
         };
         let (view_rows, live_rows) = split_rows(10, frame.lines.len(), 0);

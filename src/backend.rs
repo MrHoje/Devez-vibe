@@ -454,6 +454,10 @@ impl BackendServer {
                                     "input": params.get("input").cloned().unwrap_or_else(|| json!([])),
                                     "model": params.get("model").cloned().unwrap_or(Value::Null),
                                     "effort": params.get("effort").cloned().unwrap_or(Value::Null),
+                                    "permissionMode": params
+                                        .get("claudePermissionMode")
+                                        .cloned()
+                                        .unwrap_or(Value::Null),
                                     "handoffContext": handoff_context
                                 }),
                             )
@@ -577,6 +581,26 @@ impl BackendServer {
                     params["threadId"] = json!(self.backing_id(visible, RuntimeKind::Codex)?);
                     self.codex()?.request(method, params).await
                 }
+            }
+            // Only Claude has permission modes. A thread on another runtime — or
+            // one Claude has not started yet — keeps the mode the next turn carries.
+            "thread/permissionMode/set" => {
+                let visible = thread_id(&params)?;
+                if self.route_kind(visible) != RuntimeKind::Claude {
+                    return Ok(json!({}));
+                }
+                let Ok(backing) = self.backing_id(visible, RuntimeKind::Claude) else {
+                    return Ok(json!({}));
+                };
+                self.claude
+                    .request(
+                        "session/permissionMode",
+                        json!({
+                            "sessionId": backing,
+                            "permissionMode": params.get("permissionMode").cloned().unwrap_or(Value::Null)
+                        }),
+                    )
+                    .await
             }
             "thread/unsubscribe" if self.route_kind(thread_id(&params)?) == RuntimeKind::Claude => {
                 let visible = thread_id(&params)?;
@@ -1764,6 +1788,13 @@ fn claude_session_params(params: &Value, cwd: &Path, session_id: Option<&str>) -
         .filter(|effort| !effort.is_empty())
     {
         request["effort"] = json!(effort);
+    }
+    if let Some(mode) = params
+        .get("claudePermissionMode")
+        .and_then(Value::as_str)
+        .filter(|mode| !mode.is_empty())
+    {
+        request["permissionMode"] = json!(mode);
     }
     if let Some(session_id) = session_id {
         request["sessionId"] = json!(session_id);

@@ -832,6 +832,44 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_display_range_leaves_the_cursor_where_it_started() {
+        let mut editor = Editor::default();
+        editor.set_text("alpha beta gamma");
+
+        assert!(editor.delete_display_range(6..11));
+
+        assert_eq!(editor.text(), "alpha gamma");
+        assert_eq!(editor.cursor(), 6);
+        assert!(!editor.delete_display_range(4..4), "an empty range is a no-op");
+    }
+
+    #[test]
+    fn deleting_a_display_range_over_a_collapsed_paste_expands_what_is_left() {
+        let mut editor = Editor::default();
+        editor.set_text("before ");
+        editor.insert_paste_str("one\ntwo\nthree\nfour\nfive\nsix");
+        let paste = editor.collapsed_paste_range().expect("collapsed");
+
+        // Half the block: what remains is no longer the paste that arrived.
+        assert!(editor.delete_display_range(paste.start..paste.start + 4));
+
+        assert_eq!(editor.text(), "before two\nthree\nfour\nfive\nsix");
+        assert_eq!(editor.paste_summary_lines(), None);
+    }
+
+    #[test]
+    fn deleting_a_display_range_before_a_collapsed_paste_keeps_it_collapsed() {
+        let mut editor = Editor::default();
+        editor.set_text("before ");
+        editor.insert_paste_str("one\ntwo\nthree\nfour\nfive\nsix");
+
+        assert!(editor.delete_display_range(0..7));
+
+        assert_eq!(editor.paste_summary_lines(), Some(6));
+        assert_eq!(editor.collapsed_paste_range(), Some(0..27));
+    }
+
+    #[test]
     fn word_delete_removes_a_collapsed_paste_as_one_item() {
         let mut editor = Editor::default();
         editor.set_text("before ");

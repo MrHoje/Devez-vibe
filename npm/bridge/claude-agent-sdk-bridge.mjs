@@ -272,11 +272,40 @@ function adoptSessionId(session, incoming) {
   });
 }
 
+const PERMISSION_MODES = ["default", "acceptEdits", "plan", "auto", "bypassPermissions"];
+
+function permissionMode(requested, fallback = "default") {
+  const mode = String(requested || "");
+  return PERMISSION_MODES.includes(mode) ? mode : fallback;
+}
+
+// Moves a live session onto a mode the badge picked. A rejected mode — policy
+// disables bypass, say — leaves the session on the one it already had.
+async function applyPermissionMode(session, requested) {
+  const mode = permissionMode(requested, session.permissionMode || "default");
+  if (mode === session.permissionMode) return;
+  try {
+    await session.query.setPermissionMode(mode);
+    session.permissionMode = mode;
+  } catch (error) {
+    notify("claude/permissionMode/rejected", {
+      threadId: visibleSession(session.id),
+      permissionMode: mode,
+      message: error?.message || String(error),
+    });
+  }
+}
+
 function makeOptions(params, sessionId, resume) {
   const options = {
     cwd: params.cwd || process.cwd(),
     includePartialMessages: true,
-    permissionMode: "default",
+    permissionMode: permissionMode(params.permissionMode),
+    // Not a mode, a capability: the SDK refuses `bypassPermissions` outright
+    // unless the session was started with this. Devez Vibe already auto-allows
+    // tools through `canUseTool`, so allowing the mode to be *reachable* grants
+    // nothing the session did not already have.
+    allowDangerouslySkipPermissions: true,
     enableFileCheckpointing: true,
     persistSession: true,
     settingSources: ["user", "project", "local"],
@@ -341,9 +370,13 @@ async function requestToolPermission(toolName, input, permission) {
     return { behavior: "allow", updatedInput: { ...input, answers } };
   }
 
+  // Plan mode only means anything if leaving it is the user's call — the CLI
+  // shows the plan and waits. The blanket allow below would answer for them.
+  const planApproval = toolName === "ExitPlanMode";
+
   // Devez Vibe runs in its existing full-access profile. Claude's callback is
   // still kept so AskUserQuestion and explicit user-authored ask rules reach UI.
-  if (!permission.matchedAskRule) {
+  if (!permission.matchedAskRule && !planApproval) {
     return { behavior: "allow", updatedInput: input };
   }
 
@@ -352,7 +385,12 @@ async function requestToolPermission(toolName, input, permission) {
     reason: permission.decisionReason || permission.description || permission.title,
     permissions: { tool: toolName, blockedPath: permission.blockedPath },
   };
-  if (toolName === "Bash") {
+  if (planApproval) {
+    params = {
+      reason: input.plan || permission.description || "계획대로 진행할까요?",
+      permissions: { tool: toolName },
+    };
+  } else if (toolName === "Bash") {
     method = "item/commandExecution/requestApproval";
     params = {
       command: input.command || "command",
@@ -387,6 +425,7 @@ async function createSession(params, resumeId) {
     cwd: params.cwd || process.cwd(),
     model: visibleModel(params.model),
     effort: params.effort || "",
+    permissionMode: permissionMode(params.permissionMode),
     models: [],
     queue,
     query: null,
@@ -1013,6 +1052,7 @@ async function runPrompt(session, params) {
     await session.query.applyFlagSettings({ effortLevel: effort });
   }
   session.effort = effort;
+  await applyPermissionMode(session, params.permissionMode);
   const turnId = `claude-turn-${session.turnSequence++}-${randomUUID()}`;
   session.turn = { id: turnId, sawStreamText: false };
   session.lastContextUsage = null;
@@ -1135,6 +1175,13 @@ function historyTurns(messages) {
 
 async function dispatch(method, params = {}) {
   if (method === "model/list") return loadModelCatalog(params);
+  if (method === "session/permissionMode") {
+    const session = lookupSession(params.sessionId);
+    // A session that has not started yet picks the mode up from its first turn.
+    if (!session) return { permissionMode: permissionMode(params.permissionMode) };
+    await applyPermissionMode(session, params.permissionMode);
+    return { permissionMode: session.permissionMode };
+  }
   if (method === "session/start") {
     const { session, account, usage } = await createSession(params);
     return {
