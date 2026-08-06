@@ -130,6 +130,16 @@ impl Editor {
         self.collapsed_paste_end = Some(self.cursor);
     }
 
+    /// Shows a collapsed paste as its full text again. Reports whether one was
+    /// collapsed to begin with.
+    pub fn expand_collapsed_paste(&mut self) -> bool {
+        let collapsed = self.collapsed_paste_lines.is_some();
+        self.collapsed_paste_lines = None;
+        self.collapsed_paste_start = None;
+        self.collapsed_paste_end = None;
+        collapsed
+    }
+
     pub fn paste_summary_lines(&self) -> Option<usize> {
         self.collapsed_paste_lines
     }
@@ -610,7 +620,15 @@ impl Editor {
         else {
             return false;
         };
-        if self.buffer[start..end].iter().copied().eq(text.chars()) {
+        // A block pasted with CRLF comes back from the terminal as bare
+        // newlines, so the carriage returns cannot decide whether this is the
+        // same paste arriving a second time.
+        if self.buffer[start..end]
+            .iter()
+            .copied()
+            .filter(|&ch| ch != '\r')
+            .eq(text.chars().filter(|&ch| ch != '\r'))
+        {
             self.collapsed_paste_lines = None;
             self.collapsed_paste_start = None;
             self.collapsed_paste_end = None;
@@ -814,6 +832,20 @@ mod tests {
         editor.insert('!');
         assert_eq!(editor.paste_summary_lines(), Some(6));
         assert_eq!(editor.text(), "one\ntwo\nthree\nfour\nfive\nsix!");
+    }
+
+    #[test]
+    fn expanding_a_collapsed_paste_keeps_the_text_and_drops_the_summary() {
+        let text = "one\ntwo\nthree\nfour\nfive\nsix";
+        let mut editor = Editor::default();
+        editor.insert_paste_str(text);
+
+        assert!(editor.expand_collapsed_paste());
+
+        assert_eq!(editor.paste_summary_lines(), None);
+        assert_eq!(editor.collapsed_paste_display(), None);
+        assert_eq!(editor.text(), text);
+        assert!(!editor.expand_collapsed_paste(), "nothing left to expand");
     }
 
     #[test]

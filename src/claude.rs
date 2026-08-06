@@ -571,28 +571,43 @@ mod tests {
     }
 
     #[test]
-    fn bridge_drops_finished_tasks_from_earlier_turns_when_a_new_plan_starts() {
+    fn bridge_restores_tasks_and_only_resets_an_explicit_new_plan() {
         let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
 
-        assert!(bridge.contains("function pruneFinishedTasks(tasks, turnId)"));
-        assert!(
-            bridge.contains("if (task.status === \"completed\" && task.turnId !== turnId) tasks.delete(key);")
-        );
-        assert!(bridge.contains("pruneFinishedTasks(session.tasks, turnId)"));
-        assert!(bridge.contains("pruneFinishedTasks(tasks, turn.id)"));
+        assert!(bridge.contains("function historyState(messages)"));
+        assert!(bridge.contains("session.tasks = historyState(messages).tasks;"));
+        assert!(bridge.contains("if (numberedTaskIndex(subject) === 1) tasks.clear();"));
+        assert!(bridge.contains("applyTaskUpdate(session.tasks, input, turnId);"));
+        assert!(bridge.contains("session.tasks = latestTaskPlan(session.tasks);"));
     }
 
     #[test]
-    fn bridge_tracks_running_subagents_by_parent_tool_use_id() {
+    fn bridge_renumbers_tasks_from_one_and_never_sends_an_empty_plan() {
+        let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
+
+        // 모델이 붙인 누적 번호를 떼고 지금 보여줄 목록 기준으로 다시 매긴다.
+        assert!(bridge.contains(".replace(/^\\d+[.)]\\s*/, \"\")"));
+        assert!(bridge.contains("return `${index + 1}. ${text || \"작업\"}`;"));
+        // 계획 카드가 이유 없이 사라지지 않도록 빈 목록은 알리지 않고 직전 목록을 지킨다.
+        assert!(bridge.contains("if (session.tasks.size === 0) return;"));
+    }
+
+    #[test]
+    fn bridge_tracks_foreground_and_background_subagent_lifecycles() {
         let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
 
         assert!(bridge.contains("if (SUBAGENT_TOOLS.includes(name)) startSubagent(session, block);"));
         assert!(bridge.contains("recordSubagentMessage(session, message)"));
         assert!(bridge.contains("recordSubagentResult(session, message)"));
         assert!(bridge.contains("notify(\"turn/subagent/line\""));
-        assert!(bridge.contains("session.subagents.get(message.parent_tool_use_id)"));
-        assert!(bridge.contains("finishSubagent(session, block.tool_use_id)"));
-        assert!(bridge.contains("clearSubagents(session)"));
+        assert!(bridge.contains("findSubagent(session, message.parent_tool_use_id)"));
+        assert!(bridge.contains("keepBackgroundSubagent(session, block.tool_use_id"));
+        assert!(bridge.contains("result?.status === \"async_launched\""));
+        assert!(bridge.contains("message.origin?.kind !== \"task-notification\""));
+        assert!(bridge.contains("finishNotifiedSubagents(session, notifications)"));
+        assert!(bridge.contains("resumeBackgroundSubagent(session, block.tool_use_id"));
+        assert!(bridge.contains("clearForegroundSubagents(session)"));
+        assert!(bridge.contains("if (!session.turn) beginTurn(session);"));
         assert!(bridge.contains("notify(\"turn/subagents/updated\""));
     }
 }

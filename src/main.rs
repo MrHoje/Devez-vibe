@@ -44,7 +44,7 @@ use renderer::{BlockKind, Pick, RenderMode, Renderer, SelectionResult, TerminalS
 use serde_json::{Value, json};
 use state::{
     AccountPlan, Action, AppState, DiffDisplayMode, LoginMethod, ModelInfo, SessionInfo,
-    SessionPicker, SessionPickerResult, ShellDisplayMode, load_model_context_windows,
+    SessionPicker, SessionPickerResult, ShellDisplayMode, VibeMode, load_model_context_windows,
 };
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 
@@ -461,6 +461,13 @@ async fn await_thread(
                             Action::None
                         } else if is_clipboard_image_shortcut(&key) && attach_clipboard_image(state) {
                             Action::None
+                        } else if expand_collapsed_paste_shortcut(
+                            state,
+                            &mut composer_paste,
+                            &key,
+                            Instant::now(),
+                        ) {
+                            Action::Tick(true)
                         } else {
                             observe_composer_key(state, &mut composer_paste, key, Instant::now())
                         }
@@ -468,6 +475,11 @@ async fn await_thread(
                     Some(Ok(Event::Mouse(mouse))) => renderer_mouse_action(renderer, &mouse, |pick| pick_action(state, pick)),
                     Some(Ok(Event::Paste(text))) => {
                         renderer.clear_selection();
+                        if composer_paste.take_discarded_paste(&text) {
+                            // The shortcut already expanded the block this
+                            // payload stands for.
+                            Action::Tick(true)
+                        } else {
                         flush_composer_paste(state, &mut composer_paste, Instant::now());
                         if let Some(action) = state.paste_as_prompt_answer(&text) {
                             action
@@ -479,6 +491,7 @@ async fn await_thread(
                                 );
                             }
                             Action::None
+                        }
                         }
                     }
                     Some(Ok(Event::Resize(_, _))) => {
@@ -814,6 +827,14 @@ async fn event_loop(
                         } else if is_clipboard_image_shortcut(&key) && attach_clipboard_image(state) {
                             renderer.clear_selection();
                             Action::None
+                        } else if expand_collapsed_paste_shortcut(
+                            state,
+                            &mut composer_paste,
+                            &key,
+                            Instant::now(),
+                        ) {
+                            renderer.clear_selection();
+                            Action::Tick(true)
                         } else if is_selection_delete_key(&key)
                             && let Some(range) = renderer.composer_selection_range()
                             && state.delete_composer_selection(range)
@@ -872,6 +893,11 @@ async fn event_loop(
                     }
                     Some(Ok(Event::Paste(text))) => {
                         renderer.clear_selection();
+                        if composer_paste.take_discarded_paste(&text) {
+                            // The shortcut already expanded the block this
+                            // payload stands for.
+                            Action::Tick(true)
+                        } else {
                         flush_composer_paste(state, &mut composer_paste, Instant::now());
                         if let Some(action) = state.paste_as_prompt_answer(&text) {
                             action
@@ -883,6 +909,7 @@ async fn event_loop(
                                 );
                             }
                             Action::None
+                        }
                         }
                     }
                     Some(Ok(Event::Resize(columns, rows))) => {
@@ -2796,13 +2823,15 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 하지 않기로 한 선택지나 이미 정해진 결정을 다시 나열하지 않는다.\n",
     "- Skill 적용, 지침 확인, 내부 도구 호출 같은 내부 절차를 사용자에게 commentary로 알리지 않는다. ",
     "사용자 판단에 필요한 진행 상황이나 결과만 알린다.\n",
+    "진행 보고 규칙:\n",
+    "- 단순 질문이 아닌 작업은 첫 도구 호출 전에 무엇을 확인하고 이어서 무엇을 할지 한두 문장으로 알린다. ",
+    "이후에는 새 사실이 사용자 판단을 바꾸거나 작업 범위가 달라질 때만 짧게 알리고, 같은 내용을 반복하지 않는다.\n",
     "계획 규칙:\n",
-    "- 파일을 수정하는 작업은 분량과 무관하게 항상 `update_plan`으로 계획을 먼저 세우고 진행한다. ",
-    "한 줄 수정처럼 사소해 보여도 생략하지 않는다.\n",
-    "- 작은 작업의 계획은 짧게 쓴다. Task 한두 개면 충분하다.\n",
+    "- 실행 단계가 두 개 이상이거나 도구를 두 번 이상 호출할 작업, 설계 판단이 필요한 작업에서는 반드시 `update_plan`으로 짧은 계획을 먼저 세운다.\n",
+    "- 단순 질문, 도구 한 번의 조회, 한 줄 수정처럼 바로 끝나는 요청에는 계획을 만들지 않는다.\n",
     "- 모든 Task 제목은 순서대로 `1. `, `2. `, `3. `처럼 번호로 시작한다.\n",
     "- 각 Task는 착수할 때 in_progress, 끝나면 completed로 즉시 갱신한다.\n",
-    "- 질문에만 답하는 턴을 제외하고, 원인 분석·코드리뷰 등 코드를 읽는 작업에도 `update_plan`으로 계획을 먼저 표시한다.\n",
+    "- 계획을 만들었다면 동시에 in_progress인 Task는 하나만 두고, 현재 Task를 completed로 바꾼 뒤 다음 Task를 in_progress로 바꾼다.\n",
     "내장 브라우저 규칙:\n",
     "- DevezCode 브라우저는 ChatGPT의 Browser plugin(`iab`)이 아니라 `mcp__devez_browser__browser_*` MCP 도구다. ",
     "사용자가 DevezCode 브라우저·Devez 브라우저·내장 브라우저·내장브라우저·인앱 브라우저·인앱브라우저를 요청하면 이 MCP 도구만 사용하고 Browser plugin을 초기화하거나 사용할 수 없다고 답하지 않는다. ",
@@ -2816,6 +2845,10 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
 const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "Devez Vibe에서 작업한다. Task 목록의 설명과 모든 Task 제목은 반드시 자연스러운 한국어로 작성한다. ",
     "코드, 명령어, 경로, 제품명 등 기술 식별자는 원문을 유지한다.\n",
+    "최우선 작업 단계 규칙: Read, Grep, Glob, Bash 등 작업 도구를 두 번 이상 호출할 가능성이 있으면 다른 도구보다 먼저 TaskCreate를 호출한다. ",
+    "TaskCreate 없이 두 번째 작업 도구를 호출하면 지침 위반이다. 모든 TaskCreate가 끝나면 다른 작업 도구보다 먼저 첫 Task를 TaskUpdate로 `in_progress`로 바꾼다. ",
+    "모든 Task는 예외 없이 `pending` → `in_progress` → `completed` 순서로 바꾸며 `pending`에서 `completed`로 바로 바꾸지 않는다. ",
+    "현재 Task를 `completed`로 바꾼 뒤 다음 Task를 `in_progress`로 바꾸고 해당 작업을 시작한다.\n",
     "답변 형식 규칙:\n",
     "- 서론, 인사, 맺음말 요약을 쓰지 않고 결론부터 쓴다.\n",
     "- 기본 분량은 세 줄 전후이며, 사용자가 자세한 설명을 요청할 때만 늘린다.\n",
@@ -2824,32 +2857,25 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- Super Vibe 모드에서는 파일 경로, 코드 블록, 함수·클래스·변수·설정 키 이름을 답변에 넣지 않는다. ",
     "무엇을 어떻게 바꿨는지 일상 언어로만 설명하고, 계획이나 작업 단계를 답변 본문에 다시 나열하지 않는다. ",
     "사용자가 코드나 경로를 직접 요청했거나, 그것 없이는 사용자가 판단할 수 없는 경우에만 보여준다.\n",
+    "- Vibe와 Super Vibe 모드의 최종 답변은 반드시 불릿 두 개 이하, 전체 200자 이내, 불릿마다 한 문장으로 쓴다. ",
+    "사용자가 자세한 설명을 명시적으로 요청한 경우에만 늘리고, 마지막 불릿은 `~ 내용을 완료했습니다.`로 끝낸다.\n",
     "- 작업을 완료하면 사용자의 요청을 기준으로 정확히 무엇을 완료했는지 `~ 내용을 완료했습니다.` 형식으로 분명하게 알린다.\n",
     "- 하지 않기로 한 선택지나 이미 정해진 결정을 다시 나열하지 않는다.\n",
     "- 사용자에게 보이는 진행 안내와 답변은 사용자가 요청한 언어로 작성한다. ",
-    "한국어 요청에는 `Now ...` 같은 독립된 영어 진행 문장을 출력하지 않는다.\n",
-    "중간 진행 보고 규칙:\n",
-    "- 단순 질문이 아닌 작업은 첫 도구 호출 전에 착수 안내를 먼저 출력한다. ",
-    "무엇을 어떤 순서로 확인하고 어떻게 이어갈지 완결된 한국어 문장 두세 개로 쓰고 `~하겠습니다.` 형태로 끝낸다. ",
-    "서론을 쓰지 않는다는 규칙의 예외다.\n",
-    "- 진행 안내는 확인한 사실을 한 문장으로 먼저 적고, 그에 따라 무엇을 하겠는지 한 문장으로 잇는다. ",
-    "무엇이 어떤 조건에서 잘못되는지 밝히고 어디를 어떻게 보완하겠다고 예고한 뒤 곧바로 실행한다. ",
-    "`확인 중`처럼 토막 난 표현이나 도구 이름 나열로 대신하지 않는다.\n",
-    "- 새로 알게 된 사실, 변경 완료, 검증 시작, 점검 범위 변경은 그 자리에서 알린다. ",
-    "여러 단계를 조용히 처리한 뒤 마지막에 한꺼번에 설명하지 않으며, 진행 안내 없이 60초 이상 지나지 않게 한다.\n",
-    "- 완료 보고에는 무엇을 고쳤는지, 어떤 검증을 통과했는지, 남은 제약이나 사용자가 이어서 해야 할 일까지 적는다. ",
-    "검증하지 못한 부분이 있으면 숨기지 않고 그대로 밝힌다.\n",
-    "- Skill 적용, 지침 확인 같은 내부 절차는 알리지 않는다. ",
-    "다른 규칙이나 훅이 서두 생략과 극단적 압축을 요구해도 착수 안내와 진행 안내는 생략하지 않는다.\n",
+    "한국어 요청에는 `Now ...` 같은 독립된 영어 진행 문장을 도구 호출 사이에도 출력하지 않는다.\n",
+    "진행 보고 규칙:\n",
+    "- 단순 질문이 아닌 작업은 첫 도구 호출 전에 무엇을 확인하고 이어서 무엇을 할지 한두 문장으로 알린다. ",
+    "이후에는 새 사실이 사용자 판단을 바꾸거나 작업 범위가 달라질 때만 짧게 알리고, 같은 내용을 반복하지 않는다.\n",
+    "- 완료 보고는 세 줄 이내로 쓰며, 검증하지 못한 내용은 짧게 밝힌다.\n",
+    "- Skill 적용, 지침 확인, 내부 도구 호출 같은 내부 절차는 알리지 않는다.\n",
     "작업 단계 규칙:\n",
-    "- 파일 수정, 원인 분석, 코드 리뷰처럼 단순 질문이 아닌 작업은 시작 전에 Claude Code의 TaskCreate로 짧은 작업 목록을 만든다.\n",
-    "- 작은 작업은 Task 한두 개면 충분하다.\n",
+    "- 실행 단계가 두 개 이상이거나 도구를 두 번 이상 호출할 작업, 설계 판단이 필요한 작업에서는 반드시 첫 도구 호출 전에 Claude Code의 TaskCreate로 짧은 작업 목록을 만든다.\n",
+    "- 단순 질문, 도구 한 번의 조회, 한 줄 수정처럼 바로 끝나는 요청에는 Task를 만들지 않는다.\n",
     "- 모든 Task의 subject는 순서대로 `1. `, `2. `, `3. `처럼 번호로 시작한다. ",
     "번호는 새 작업 목록마다 항상 `1. `부터 다시 시작하고, 이전 작업 목록에서 쓴 번호에 이어 붙이지 않는다. ",
     "TaskList에 이미 끝난 Task가 남아 있어도 그 번호를 이어받지 않는다.\n",
     "- 각 Task는 착수 즉시 TaskUpdate로 `in_progress`, 끝나면 즉시 `completed`로 바꾼다.\n",
-    "- TaskList로 현재 단계를 확인하고, 동시에 `in_progress`인 Task는 하나만 둔다.\n",
-    "- 질문에만 답하는 턴에는 Task를 만들지 않는다.\n",
+    "- 동시에 `in_progress`인 Task는 하나만 두고, 현재 Task를 `completed`로 바꾼 뒤 다음 Task를 `in_progress`로 바꾼다.\n",
     "내장 브라우저 규칙:\n",
     "- DevezCode 브라우저는 ChatGPT의 Browser plugin(`iab`)이 아니라 `mcp__devez_browser__browser_*` MCP 도구다. ",
     "사용자가 DevezCode 브라우저·Devez 브라우저·내장 브라우저·내장브라우저·인앱 브라우저·인앱브라우저를 요청하면 이 MCP 도구만 사용한다. ",
@@ -2917,8 +2943,10 @@ fn resume_thread_params(thread_id: &str, claude: &ClaudeSessionSettings) -> Valu
 }
 
 /// One `developer` message at the head of the thread loses its grip as turns
-/// pile up, so the same rules ride along with every turn.
-fn turn_additional_context() -> Value {
+/// pile up, so the same rules ride along with every turn. The active preset
+/// rides along too: the rules that depend on it are written as conditions, and
+/// the preset is a local display setting the provider is told nothing else about.
+fn turn_additional_context(vibe: VibeMode) -> Value {
     json!({
         "devez-vibe-rules": {
             "value": DEVEZ_INSTRUCTIONS,
@@ -2926,6 +2954,10 @@ fn turn_additional_context() -> Value {
         },
         "claude-devez-vibe-rules": {
             "value": CLAUDE_DEVEZ_INSTRUCTIONS,
+            "kind": "application"
+        },
+        "devez-vibe-mode": {
+            "value": vibe.turn_notice(),
             "kind": "application"
         }
     })
@@ -3557,7 +3589,7 @@ async fn start_turn(
         "model": model,
         "serviceTier": state.service_tier(),
         "permissions": state.permission_profile(),
-        "additionalContext": turn_additional_context()
+        "additionalContext": turn_additional_context(state.vibe_mode())
     });
     if !effort.is_empty() {
         params["effort"] = json!(effort);
@@ -3588,6 +3620,44 @@ fn attach_clipboard_image(state: &mut AppState) -> bool {
     };
     state.attach_local_image(path.to_string_lossy().into_owned());
     true
+}
+
+/// `Ctrl+V` on a composer already showing a collapsed paste expands it instead
+/// of pasting the same block again, the way Claude Code's composer does. The
+/// clipboard is read here so the decision never depends on whether the terminal
+/// forwards the payload as key records, as bracketed paste, or as both.
+fn expand_collapsed_paste_shortcut(
+    state: &mut AppState,
+    buffer: &mut ComposerPasteBuffer,
+    key: &KeyEvent,
+    now: Instant,
+) -> bool {
+    if !is_paste_shortcut(key) || state.has_pending_interaction() {
+        return false;
+    }
+    let Some(block) = state.editor.collapsed_paste_text() else {
+        return false;
+    };
+    if !clipboard_text().is_some_and(|text| {
+        paste::paste_payload_chars(&text) == paste::paste_payload_chars(&block)
+    }) {
+        return false;
+    }
+    state.editor.expand_collapsed_paste();
+    // The keys the terminal is about to synthesize are that same block; they
+    // would otherwise land as a second paste, and its newlines as submits.
+    buffer.discard_expected(&block, now);
+    true
+}
+
+fn clipboard_text() -> Option<String> {
+    Clipboard::new().ok()?.get_text().ok()
+}
+
+fn is_paste_shortcut(key: &KeyEvent) -> bool {
+    matches!(key.kind, crossterm::event::KeyEventKind::Press)
+        && matches!(key.code, KeyCode::Char('v' | 'V'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 fn is_clipboard_image_shortcut(key: &KeyEvent) -> bool {
@@ -3640,6 +3710,34 @@ fn apply_composer_inputs(state: &mut AppState, inputs: Vec<ComposerInput>) -> Ac
     action
 }
 
+/// Windows Terminal pastes by synthesizing key records and keeps the `Ctrl+V`
+/// to itself, so the only announcement a second paste gets is its first
+/// character. When that character opens the block the composer is showing
+/// collapsed, the clipboard is read and compared: a match makes the run a paste
+/// by evidence rather than by how fast its keys arrive, which is what stops one
+/// of its newlines from reaching the composer as a submit key.
+fn arm_verified_collapsed_paste(
+    state: &mut AppState,
+    buffer: &mut ComposerPasteBuffer,
+    key: &KeyEvent,
+    now: Instant,
+) {
+    if buffer.is_buffering() {
+        return;
+    }
+    let Some(block) = state.editor.collapsed_paste_text() else {
+        return;
+    };
+    let payload = paste::paste_payload_chars(&block);
+    if payload.is_empty() || payload.first().copied() != paste::payload_char(key) {
+        return;
+    }
+    if clipboard_text().is_none_or(|text| paste::paste_payload_chars(&text) != payload) {
+        return;
+    }
+    buffer.expect_verified_paste(&block, now);
+}
+
 fn observe_composer_key(
     state: &mut AppState,
     buffer: &mut ComposerPasteBuffer,
@@ -3649,6 +3747,7 @@ fn observe_composer_key(
     if state.has_pending_interaction() {
         state.handle_key(key)
     } else {
+        arm_verified_collapsed_paste(state, buffer, &key, now);
         let expected_paste = state.editor.collapsed_paste_text();
         apply_composer_inputs(
             state,
@@ -3688,6 +3787,7 @@ fn observe_composer_key_with_scroll(
     if state.has_pending_interaction() {
         state.handle_key(key)
     } else {
+        arm_verified_collapsed_paste(state, buffer, &key, now);
         let expected_paste = state.editor.collapsed_paste_text();
         apply_composer_inputs_with_scroll(
             state,
@@ -3762,9 +3862,12 @@ fn draw(state: &mut AppState, renderer: &mut Renderer) -> Result<()> {
     // Every state change the user can see reaches a frame, so the host's copy of
     // the session state is refreshed from the same place rather than from each
     // of the call sites that can move it.
+    // The turn flag and compaction are handed over separately: the host spins its
+    // tab for both, but only a finished turn is a finished response.
     devezcode::sync(
         state.host_session_id(),
-        state.host_turn_busy(),
+        state.busy,
+        state.compacting(),
         state.host_loading(),
         state.awaiting_input(),
     );
@@ -4627,9 +4730,37 @@ mod tests {
         assert!(params.get("effort").is_none());
     }
 
+    /// A rule written as "under Super Vibe, …" needs the preset in the request to
+    /// mean anything, and nothing else in a turn carries it.
+    #[test]
+    fn every_turn_names_the_active_preset() {
+        let notice = |vibe| {
+            turn_additional_context(vibe)
+                .pointer("/devez-vibe-mode/value")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .expect("the turn names its preset")
+        };
+
+        let super_vibe = notice(VibeMode::SuperVibe);
+        assert!(super_vibe.contains("Super Vibe"));
+        assert!(super_vibe.contains("파일 경로, 코드 블록"));
+        assert!(super_vibe.contains("빌드나 테스트 명령을 넣지 않는다"));
+        // Without a stated ceiling the completion report grows into five bullets.
+        assert!(super_vibe.contains("세 줄 이내"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("완료 보고는 세 줄 이내로"));
+        assert!(notice(VibeMode::Vibe).contains("현재 응답 모드: Vibe"));
+        assert!(notice(VibeMode::Normal).contains("현재 응답 모드: Off"));
+        // The English tool-call label leaks through the system prompt, so every
+        // preset repeats the language rule where the turn cannot miss it.
+        for vibe in [VibeMode::Vibe, VibeMode::SuperVibe, VibeMode::Normal] {
+            assert!(notice(vibe).contains("영어로 시작하는 진행 문장"));
+        }
+    }
+
     #[test]
     fn every_turn_restates_the_rules() {
-        let context = turn_additional_context();
+        let context = turn_additional_context(VibeMode::Vibe);
 
         assert_eq!(
             context.pointer("/devez-vibe-rules/value").and_then(Value::as_str),
@@ -4647,21 +4778,19 @@ mod tests {
         );
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskCreate"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskUpdate"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("두 번째 작업 도구를 호출하면 지침 위반"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`pending`에서 `completed`로 바로 바꾸지 않는다"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("전체 200자 이내"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("마지막 불릿은 `~ 내용을 완료했습니다.`로 끝낸다"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`Now ...` 같은 독립된 영어 진행 문장"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("첫 도구 호출 전에"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("60초 이상 지나지 않게"));
-        // The opening notice is the one thing a compression rule elsewhere must not
-        // be able to talk the model out of, so both halves of it are pinned here.
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`~하겠습니다.` 형태로 끝낸다"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("서론을 쓰지 않는다는 규칙의 예외"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("60초 이상 지나지 않게"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("착수 안내와 진행 안내는 생략하지 않는다"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("파일 경로, 코드 블록"));
-        // Progress lines are the pairing of a finding and the next move; a rule that
-        // only asks for "a line or two" drifts back into terse fragments.
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("확인한 사실을 한 문장으로 먼저 적고"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("마지막에 한꺼번에 설명하지 않으며"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("검증하지 못한 부분이 있으면 숨기지 않고"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("도구를 두 번 이상 호출할 작업"));
+        assert!(DEVEZ_INSTRUCTIONS.contains("도구를 두 번 이상 호출할 작업"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("동시에 `in_progress`인 Task는 하나만"));
+        assert!(DEVEZ_INSTRUCTIONS.contains("동시에 in_progress인 Task는 하나만"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("같은 내용을 반복하지 않는다"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("검증하지 못한 내용은 짧게 밝힌다"));
     }
 
     #[test]
@@ -4859,6 +4988,36 @@ mod tests {
 
         assert_eq!(state.editor.paste_summary_lines(), None);
         assert_eq!(state.editor.text(), pasted);
+    }
+
+    /// A Windows clipboard holds CRLF, while the keys the terminal synthesizes
+    /// for the same payload carry one Enter per line. The second paste still has
+    /// to read as the block already collapsed — and its trailing line ending
+    /// must not reach the composer as a submit key.
+    #[test]
+    fn a_crlf_second_paste_expands_the_block_instead_of_submitting() {
+        let pasted = "a\r\nb\r\nc\r\nd\r\ne\r\nf";
+        let mut state = starting_state();
+        state.handle_paste(pasted);
+        assert_eq!(state.editor.paste_summary_lines(), Some(6));
+        let mut buffer = ComposerPasteBuffer::new();
+        let base = Instant::now();
+
+        let mut at = base;
+        for ch in pasted.chars().filter(|&ch| ch != '\r').chain(['\n']) {
+            at += Duration::from_millis(1);
+            let code = if ch == '\n' {
+                KeyCode::Enter
+            } else {
+                KeyCode::Char(ch)
+            };
+            let action =
+                observe_composer_key(&mut state, &mut buffer, press(code, KeyModifiers::NONE), at);
+            assert!(!matches!(action, Action::Submit(_)), "no key may submit");
+        }
+
+        assert_eq!(state.editor.paste_summary_lines(), None, "the block expanded");
+        assert!(state.editor.text().starts_with(pasted));
     }
 
     /// The model and effort readings stand for the commands that change them, so a

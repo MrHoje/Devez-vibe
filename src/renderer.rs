@@ -370,7 +370,7 @@ pub struct PlanSummary {
     pub elapsed: Option<Duration>,
 }
 
-/// One provider subagent that is still running under the active turn.
+/// One provider subagent that is still running, including in the background.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubagentView {
     /// The parent `Task` tool-use id: what the transcript panel is keyed on.
@@ -393,7 +393,7 @@ pub struct View<'a> {
     pub editor: &'a Editor,
     pub composer_images: &'a [String],
     pub queued_prompts: Vec<String>,
-    /// Subagents shown under the composer while the turn runs them.
+    /// Running subagents shown under the composer.
     pub subagents: Vec<SubagentView>,
     pub composer_placeholder: &'a str,
     pub welcome: Option<WelcomeView>,
@@ -2965,7 +2965,7 @@ fn queue_preview_line(prompt: &str, index: usize, width: u16) -> PaintLine {
 
 /// Running subagents are listed under the composer, one row each, so a fan-out
 /// stays visible without pushing the transcript around. Rows disappear as each
-/// subagent finishes, and the turn's completion clears whatever is left.
+/// subagent finishes; background rows may outlive the parent turn.
 fn subagent_lines(subagents: &[SubagentView], width: u16) -> Vec<PaintLine> {
     subagents
         .iter()

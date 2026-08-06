@@ -24,6 +24,11 @@ use std::{
 /// not", `waiting` as "waiting or not"; the idle words only have to differ.
 const BUSY: &str = "running";
 const LOADING: &str = "loading";
+/// Compaction spins the host tab like a turn, but it is not an answer to a
+/// prompt: the host files a completion record for every `running` → `idle`, so
+/// a compaction reported as `running` would post a card the user never asked
+/// for. Its own word lets the host spin without counting it as a response.
+const COMPACTING: &str = "compacting";
 const IDLE: &str = "idle";
 const WAITING: &str = "waiting";
 const READY: &str = "ready";
@@ -50,12 +55,18 @@ struct Reporter {
 enum Activity {
     Idle,
     Running,
+    Compacting,
     Loading,
 }
 
 impl Activity {
-    fn from_host(busy: bool, loading: bool) -> Self {
-        if busy {
+    /// Compaction outranks the turn flag, exactly as it does in the activity row:
+    /// a runtime that compacts *as* a turn is still compacting, and reporting
+    /// that as an ordinary turn is what puts a stray completion card in the host.
+    fn from_host(busy: bool, compacting: bool, loading: bool) -> Self {
+        if compacting {
+            Self::Compacting
+        } else if busy {
             Self::Running
         } else if loading {
             Self::Loading
@@ -68,6 +79,7 @@ impl Activity {
         match self {
             Self::Idle => IDLE,
             Self::Running => BUSY,
+            Self::Compacting => COMPACTING,
             Self::Loading => LOADING,
         }
     }
@@ -120,13 +132,13 @@ pub fn room_id() -> Option<String> {
 
 /// Publishes the session state DevezCode paints around the terminal. Called
 /// from every frame; cheap when nothing changed.
-pub fn sync(thread_id: &str, busy: bool, loading: bool, waiting: bool) {
+pub fn sync(thread_id: &str, busy: bool, compacting: bool, loading: bool, waiting: bool) {
     with(|reporter| {
         if !thread_id.is_empty() && reporter.session != thread_id {
             reporter.session = thread_id.to_owned();
             reporter.write("sessions", thread_id);
         }
-        let activity = Activity::from_host(busy, loading);
+        let activity = Activity::from_host(busy, compacting, loading);
         if reporter.activity != activity {
             reporter.activity = activity;
             reporter.write("busy", activity.status());
@@ -342,10 +354,19 @@ mod tests {
 
     #[test]
     fn host_activity_keeps_resume_loading_distinct_from_a_turn() {
-        assert_eq!(Activity::from_host(false, false).status(), "idle");
-        assert_eq!(Activity::from_host(true, false).status(), "running");
-        assert_eq!(Activity::from_host(false, true).status(), "loading");
-        assert_eq!(Activity::from_host(true, true).status(), "running");
+        assert_eq!(Activity::from_host(false, false, false).status(), "idle");
+        assert_eq!(Activity::from_host(true, false, false).status(), "running");
+        assert_eq!(Activity::from_host(false, false, true).status(), "loading");
+        assert_eq!(Activity::from_host(true, false, true).status(), "running");
+    }
+
+    /// Compaction is reported as itself whether or not the runtime wraps it in a
+    /// turn, so the host never files a completion record for it.
+    #[test]
+    fn host_activity_reports_compaction_apart_from_a_turn() {
+        assert_eq!(Activity::from_host(false, true, false).status(), "compacting");
+        assert_eq!(Activity::from_host(true, true, false).status(), "compacting");
+        assert_eq!(Activity::from_host(false, true, true).status(), "compacting");
     }
 
     #[test]

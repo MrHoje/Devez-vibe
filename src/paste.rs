@@ -53,6 +53,11 @@ const SHORTCUT_PASTE_GAP: Duration = Duration::from_millis(250);
 /// are a second paste even when Windows Terminal never forwards `Ctrl+V`.
 const MATCHED_PASTE_GAP: Duration = Duration::from_millis(250);
 
+/// A run the clipboard itself vouched for is a paste no matter how slowly the
+/// terminal feeds it, so this gap only has to be short enough that a person who
+/// typed the same prefix and then stopped still sees their characters appear.
+const VERIFIED_PASTE_GAP: Duration = Duration::from_millis(2_000);
+
 /// How many fast characters have to pile up before `Enter` stops meaning send.
 /// Typing scores zero, because the one 0ms gap an IME produces belongs to the
 /// Enter itself and never to a character. Two is therefore already decisive,
@@ -83,6 +88,11 @@ pub struct ComposerPasteBuffer {
     shortcut_paste: bool,
     expected_paste: Option<Vec<char>>,
     expected_index: usize,
+    /// Set when the clipboard was read and matched, so the run in progress is a
+    /// paste by evidence rather than by timing.
+    verified_paste: bool,
+    discard: Option<Vec<char>>,
+    discard_index: usize,
     disabled: bool,
 }
 
@@ -118,6 +128,27 @@ impl ComposerPasteBuffer {
             self.last = Some(now);
             return pending.into_iter().map(ComposerInput::Text).collect();
         }
+        if let Some(expected) = &self.discard {
+            let key_char = paste_key_char(&key, true);
+            if key_char.is_some_and(|ch| expected.get(self.discard_index) == Some(&ch)) {
+                self.discard_index += 1;
+                self.last = Some(now);
+                if self.discard_index == expected.len() {
+                    self.discard = None;
+                    self.discard_index = 0;
+                    // Whatever the terminal still appends belongs to the same
+                    // paste, so it must not reach the composer as a submit key.
+                    self.shortcut_paste = true;
+                }
+                return Vec::new();
+            }
+            // Not the payload after all. It is input, but it arrives inside the
+            // open paste transaction so a stray newline cannot send the prompt.
+            self.discard = None;
+            self.discard_index = 0;
+            self.shortcut_paste = true;
+        }
+
         let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
 
         if let Some(expected) = &self.expected_paste {
@@ -126,21 +157,45 @@ impl ComposerPasteBuffer {
                 let ch = key_char.expect("matched paste key has text");
                 self.text.push(ch);
                 self.expected_index += 1;
-                self.pasted = true;
+                // A verified run is only a paste once it completes; until then
+                // it could still be someone typing the same characters, and
+                // that must reach the composer as typing.
+                self.pasted |= !self.verified_paste;
                 self.last = Some(now);
                 if self.expected_index == expected.len() {
-                    return self.flush().into_iter().map(ComposerInput::Text).collect();
+                    self.pasted = true;
+                    let matched = self.flush();
+                    // The block is complete, but a terminal that appends the
+                    // clipboard's trailing line ending is still inside this
+                    // paste. Keeping the transaction open is what stops that
+                    // last Enter from sending the prompt.
+                    self.shortcut_paste = true;
+                    self.last = Some(now);
+                    return matched.into_iter().map(ComposerInput::Text).collect();
                 }
                 return Vec::new();
             }
             self.expected_paste = None;
             self.expected_index = 0;
+            if self.verified_paste {
+                // The run stopped reproducing the clipboard, so it was typing
+                // after all. Release what was held as typed text and let this
+                // key act normally — an Enter here still sends.
+                return self
+                    .flush()
+                    .into_iter()
+                    .map(ComposerInput::Text)
+                    .chain(std::iter::once(ComposerInput::Key(key)))
+                    .collect();
+            }
         }
 
         if self.text.is_empty()
             && let (Some(expected), Some(ch)) = (expected_paste, paste_key_char(&key, plain))
         {
-            let expected = expected.chars().collect::<Vec<_>>();
+            // Line endings reach us as `Enter`, never as a carriage return, so a
+            // block pasted with CRLF still has to match the keys behind it.
+            let expected = paste_payload_chars(expected);
             if expected.first() == Some(&ch) {
                 self.text.push(ch);
                 self.last = Some(now);
@@ -177,6 +232,44 @@ impl ComposerPasteBuffer {
         }
     }
 
+    /// Announces a paste the clipboard has already vouched for: the keys that
+    /// follow reproduce `text`. Nothing about the run is then a guess, so no
+    /// gap between its keys can let a payload newline out as a submit key.
+    pub fn expect_verified_paste(&mut self, text: &str, now: Instant) {
+        self.flush();
+        self.expected_paste = Some(paste_payload_chars(text));
+        self.expected_index = 0;
+        self.verified_paste = true;
+        self.last = Some(now);
+    }
+
+    /// Swallows the payload a paste shortcut is about to deliver. The composer
+    /// already acted on the clipboard itself, so the keys Windows synthesizes
+    /// behind `Ctrl+V` must not reach it a second time.
+    pub fn discard_expected(&mut self, text: &str, now: Instant) {
+        self.flush();
+        self.discard = Some(paste_payload_chars(text));
+        self.discard_index = 0;
+        self.last = Some(now);
+    }
+
+    /// Answers for an `Event::Paste` carrying the payload already being
+    /// swallowed, so a terminal that sends both the shortcut and the bracketed
+    /// paste never applies it twice.
+    pub fn take_discarded_paste(&mut self, text: &str) -> bool {
+        if self
+            .discard
+            .as_ref()
+            .is_none_or(|expected| paste_payload_chars(text) != *expected)
+        {
+            return false;
+        }
+        self.discard = None;
+        self.discard_index = 0;
+        self.last = None;
+        true
+    }
+
     pub fn flush_if_idle(&mut self, now: Instant) -> Option<BufferedText> {
         if !self
             .last
@@ -190,13 +283,13 @@ impl ComposerPasteBuffer {
     /// While text is waiting to be classified, repainting for every key would
     /// turn a large Windows paste into one expensive frame per character.
     pub fn is_buffering(&self) -> bool {
-        self.shortcut_paste || !self.text.is_empty()
+        self.shortcut_paste || !self.text.is_empty() || self.discard.is_some()
     }
 
     /// The event loop sleeps until this instant instead of waking every 5ms
     /// while no paste is being classified.
     pub fn flush_deadline(&self) -> Option<Instant> {
-        (self.shortcut_paste || !self.text.is_empty())
+        self.is_buffering()
             .then_some(self.last)
             .flatten()
             .map(|last| last + self.idle_gap())
@@ -235,11 +328,16 @@ impl ComposerPasteBuffer {
         self.shortcut_paste = false;
         self.expected_paste = None;
         self.expected_index = 0;
+        self.verified_paste = false;
+        self.discard = None;
+        self.discard_index = 0;
         buffered
     }
 
     fn idle_gap(&self) -> Duration {
-        if self.expected_paste.is_some() {
+        if self.verified_paste {
+            VERIFIED_PASTE_GAP
+        } else if self.discard.is_some() || self.expected_paste.is_some() {
             MATCHED_PASTE_GAP
         } else if self.shortcut_paste {
             SHORTCUT_PASTE_GAP
@@ -247,6 +345,21 @@ impl ComposerPasteBuffer {
             FAST_GAP
         }
     }
+}
+
+/// The payload as key records carry it: a terminal turns every line ending into
+/// one `Enter`, so the carriage returns a clipboard holds have no key of their own.
+pub fn paste_payload_chars(text: &str) -> Vec<char> {
+    text.chars().filter(|&ch| ch != '\r').collect()
+}
+
+/// The character a key would contribute to a paste payload, if any. Shift is
+/// what a capital letter arrives with, so it does not disqualify the key.
+pub fn payload_char(key: &KeyEvent) -> Option<char> {
+    if !matches!(key.kind, KeyEventKind::Press) {
+        return None;
+    }
+    paste_key_char(key, key.modifiers.difference(KeyModifiers::SHIFT).is_empty())
 }
 
 fn paste_key_char(key: &KeyEvent, plain: bool) -> Option<char> {
@@ -613,6 +726,129 @@ mod tests {
             [ComposerInput::Text(BufferedText { text, pasted: true })]
                 if text == expected
         ));
+    }
+
+    #[test]
+    fn a_verified_paste_survives_a_slow_terminal_and_never_submits() {
+        let base = Instant::now();
+        let mut buffer = ComposerPasteBuffer::new();
+        // Half a second between keys: far outside every burst gap, and exactly
+        // what a host that feeds the payload a record at a time produces.
+        buffer.expect_verified_paste("a\r\nb\r\nc", base);
+
+        let mut at = base;
+        let mut inputs = Vec::new();
+        for code in [
+            KeyCode::Char('a'),
+            KeyCode::Enter,
+            KeyCode::Char('b'),
+            KeyCode::Enter,
+            KeyCode::Char('c'),
+        ] {
+            at += Duration::from_millis(500);
+            assert!(
+                buffer.flush_if_idle(at - Duration::from_millis(1)).is_none(),
+                "the run is not released while the clipboard still explains it"
+            );
+            inputs.extend(buffer.observe(press(code), at));
+        }
+
+        assert!(matches!(
+            &inputs[..],
+            [ComposerInput::Text(BufferedText { text, pasted: true })] if text == "a\nb\nc"
+        ));
+    }
+
+    #[test]
+    fn typing_that_leaves_a_verified_paste_behind_still_submits() {
+        let base = Instant::now();
+        let mut buffer = ComposerPasteBuffer::new();
+        buffer.expect_verified_paste("abc", base);
+        assert!(
+            buffer
+                .observe(press(KeyCode::Char('a')), base + Duration::from_millis(200))
+                .is_empty()
+        );
+
+        let inputs = buffer.observe(press(KeyCode::Enter), base + Duration::from_millis(400));
+
+        assert!(matches!(
+            &inputs[0],
+            ComposerInput::Text(BufferedText { text, pasted: false }) if text == "a"
+        ));
+        assert!(matches!(
+            &inputs[1],
+            ComposerInput::Key(key)
+                if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE
+        ));
+    }
+
+    #[test]
+    fn a_verified_prefix_that_stops_is_released_as_typing() {
+        let base = Instant::now();
+        let mut buffer = ComposerPasteBuffer::new();
+        buffer.expect_verified_paste("abc", base);
+        buffer.observe(press(KeyCode::Char('a')), base);
+
+        assert_eq!(
+            buffer.flush_if_idle(base + VERIFIED_PASTE_GAP),
+            Some(BufferedText {
+                text: "a".to_owned(),
+                pasted: false,
+            })
+        );
+    }
+
+    #[test]
+    fn a_discarded_payload_never_reaches_the_composer_or_submits() {
+        let base = Instant::now();
+        let mut buffer = ComposerPasteBuffer::new();
+        // The clipboard holds CRLF; the terminal delivers one Enter per line.
+        buffer.discard_expected("a\r\nb", base);
+
+        let mut at = base;
+        for code in [KeyCode::Char('a'), KeyCode::Enter, KeyCode::Char('b')] {
+            at += Duration::from_millis(1);
+            assert!(buffer.observe(press(code), at).is_empty());
+        }
+
+        // A terminal that appends the line ending must not send the prompt.
+        at += Duration::from_millis(1);
+        assert!(buffer.observe(press(KeyCode::Enter), at).is_empty());
+    }
+
+    #[test]
+    fn a_bracketed_paste_of_the_discarded_payload_is_taken_once() {
+        let base = Instant::now();
+        let mut buffer = ComposerPasteBuffer::new();
+        buffer.discard_expected("a\r\nb", base);
+
+        assert!(buffer.take_discarded_paste("a\r\nb"));
+        assert!(!buffer.take_discarded_paste("a\r\nb"), "only the first one");
+        assert!(!buffer.is_buffering());
+    }
+
+    #[test]
+    fn typing_through_a_discarded_payload_is_kept_as_input() {
+        let base = Instant::now();
+        let mut buffer = ComposerPasteBuffer::new();
+        buffer.discard_expected("abc", base);
+        buffer.observe(press(KeyCode::Char('a')), base + Duration::from_millis(1));
+
+        // 'x' is not the payload, so the discard ends and the key becomes input.
+        assert!(
+            buffer
+                .observe(press(KeyCode::Char('x')), base + Duration::from_millis(2))
+                .is_empty()
+        );
+
+        assert_eq!(
+            buffer.flush_if_idle(base + Duration::from_millis(2) + MATCHED_PASTE_GAP),
+            Some(BufferedText {
+                text: "x".to_owned(),
+                pasted: true,
+            })
+        );
     }
 
     #[test]

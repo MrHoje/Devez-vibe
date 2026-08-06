@@ -438,6 +438,7 @@ async function createSession(params, resumeId) {
     tools: new Map(),
     tasks: new Map(),
     subagents: new Map(),
+    knownSubagents: new Map(),
     lastContextUsage: null,
     lastContextWindow: 0,
   };
@@ -451,6 +452,7 @@ async function createSession(params, resumeId) {
       error: { message: error instanceof Error ? error.message : String(error) },
       willRetry: false,
     });
+    clearSubagents(session);
     if (session.turn) finishTurn(session, error);
   });
   session.consumer = consumer;
@@ -499,6 +501,84 @@ function emitDelta(session, method, itemId, delta) {
   notify(method, { threadId: session.id, turnId: session.turn?.id, itemId, delta, provider: "Claude" });
 }
 
+// Windows rounds larger timer delays up to the next scheduler slice. Ten
+// milliseconds lands near one terminal frame instead of visibly stepping at ~30ms.
+const SMOOTH_TEXT_INTERVAL_MS = 10;
+const SMOOTH_TEXT_TARGET_FRAMES = 8;
+const SMOOTH_TEXT_MAX_GRAPHEMES = 24;
+const graphemeSegmenter = typeof Intl.Segmenter === "function"
+  ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+  : null;
+
+function splitGraphemes(text) {
+  return graphemeSegmenter
+    ? Array.from(graphemeSegmenter.segment(text), ({ segment }) => segment)
+    : Array.from(text);
+}
+
+// Claude can deliver a whole phrase in one SDK event. Drain roughly one visual
+// frame's share at a time, catching up quickly when a large backlog arrives.
+function takeSmoothTextChunk(text) {
+  const graphemes = splitGraphemes(text);
+  const size = Math.min(
+    SMOOTH_TEXT_MAX_GRAPHEMES,
+    Math.max(1, Math.ceil(graphemes.length / SMOOTH_TEXT_TARGET_FRAMES)),
+  );
+  return {
+    chunk: graphemes.slice(0, size).join(""),
+    rest: graphemes.slice(size).join(""),
+  };
+}
+
+class SmoothTextStream {
+  constructor(emit, intervalMs = SMOOTH_TEXT_INTERVAL_MS) {
+    this.emit = emit;
+    this.intervalMs = intervalMs;
+    this.pending = "";
+    this.timer = null;
+    this.waiters = [];
+  }
+
+  push(text) {
+    this.pending += text;
+    if (this.timer == null) this.drain();
+  }
+
+  drain() {
+    if (!this.pending) {
+      this.timer = null;
+      for (const resolve of this.waiters.splice(0)) resolve();
+      return;
+    }
+    const { chunk, rest } = takeSmoothTextChunk(this.pending);
+    this.pending = rest;
+    this.emit(chunk);
+    if (this.pending) {
+      this.timer = setTimeout(() => this.drain(), this.intervalMs);
+    } else {
+      this.timer = null;
+      for (const resolve of this.waiters.splice(0)) resolve();
+    }
+  }
+
+  finish() {
+    if (!this.pending && this.timer == null) return Promise.resolve();
+    return new Promise((resolve) => this.waiters.push(resolve));
+  }
+
+  flush() {
+    if (this.timer != null) clearTimeout(this.timer);
+    this.timer = null;
+    if (this.pending) this.emit(this.pending);
+    this.pending = "";
+    for (const resolve of this.waiters.splice(0)) resolve();
+  }
+}
+
+function flushSmoothStreams(session) {
+  for (const block of session.streamBlocks.values()) block.smooth?.flush();
+}
+
 function tokenBreakdown(usage) {
   if (!usage) return null;
   const input = Number(usage.input_tokens ?? usage.inputTokens ?? 0);
@@ -545,10 +625,13 @@ function historyTokenUsage(messages, models, model) {
   };
 }
 
-function processStreamEvent(session, message) {
+async function processStreamEvent(session, message) {
   if (!session.turn || message.parent_tool_use_id) return;
   const event = message.event || {};
-  if (event.type === "message_start") session.streamBlocks.clear();
+  if (event.type === "message_start") {
+    flushSmoothStreams(session);
+    session.streamBlocks.clear();
+  }
   if (event.type === "content_block_start") {
     const block = event.content_block || {};
     if (block.type !== "text" && block.type !== "thinking") return;
@@ -556,7 +639,10 @@ function processStreamEvent(session, message) {
     const item = block.type === "text"
       ? { id, type: "agentMessage", text: "", provider: "Claude" }
       : { id, type: "reasoning", summary: [] };
-    session.streamBlocks.set(event.index, { id, type: block.type, text: "" });
+    const smooth = block.type === "text"
+      ? new SmoothTextStream((delta) => emitDelta(session, "item/agentMessage/delta", id, delta))
+      : null;
+    session.streamBlocks.set(event.index, { id, type: block.type, text: "", smooth });
     emitItem(session, "started", item);
     return;
   }
@@ -566,17 +652,14 @@ function processStreamEvent(session, message) {
     const delta = event.delta?.text || event.delta?.thinking || "";
     if (!delta) return;
     current.text += delta;
-    emitDelta(
-      session,
-      current.type === "text" ? "item/agentMessage/delta" : "item/reasoning/summaryTextDelta",
-      current.id,
-      delta,
-    );
+    if (current.smooth) current.smooth.push(delta);
+    else emitDelta(session, "item/reasoning/summaryTextDelta", current.id, delta);
     return;
   }
   if (event.type === "content_block_stop") {
     const current = session.streamBlocks.get(event.index);
     if (!current) return;
+    await current.smooth?.finish();
     const item = current.type === "text"
       ? { id: current.id, type: "agentMessage", text: current.text, provider: "Claude" }
       : { id: current.id, type: "reasoning", summary: [current.text] };
@@ -668,18 +751,41 @@ function fileChanges(name, input) {
   return [{ path, kind: { type: name === "Write" ? "add" : "update" }, diff: `@@ -0,0 +1 @@\n${additions}` }];
 }
 
-// Claude는 Codex의 update_plan처럼 계획 전체를 다시 보내지 않으므로, 새 계획이 시작될 때
-// 이전 턴에서 이미 끝난 작업을 직접 걷어내야 목록이 턴마다 쌓이지 않는다.
-function pruneFinishedTasks(tasks, turnId) {
-  for (const [key, task] of tasks) {
-    if (task.status === "completed" && task.turnId !== turnId) tasks.delete(key);
+function numberedTaskIndex(subject) {
+  const match = String(subject || "").trim().match(/^(\d+)[.)]\s+/);
+  return match ? Number(match[1]) : null;
+}
+
+// Claude의 Task id는 세션 전체에서 누적된다. 제목 번호가 다시 1부터
+// 시작할 때만 새 계획이며, 3·4번만 갱신되는 턴은 기존 1~6번을 지킨다.
+function prepareTaskPlanForCreate(tasks, subject) {
+  if (numberedTaskIndex(subject) === 1) tasks.clear();
+}
+
+function applyTaskUpdate(tasks, input, turnId) {
+  const task = tasks.get(String(input.taskId));
+  if (!task) return false;
+  if (input.subject) task.subject = input.subject;
+  if (input.status) task.status = input.status;
+  task.turnId = turnId;
+  return true;
+}
+
+// TaskList에는 예전 계획까지 함께 들어올 수 있다. 마지막으로 번호가 1부터
+// 시작한 묶음만 현재 계획으로 삼되, 번호가 없는 목록은 손실 없이 그대로 둔다.
+function latestTaskPlan(tasks) {
+  const entries = [...tasks.entries()];
+  let start = 0;
+  for (let index = 0; index < entries.length; index++) {
+    if (numberedTaskIndex(entries[index][1].subject) === 1) start = index;
   }
+  return new Map(entries.slice(start));
 }
 
 function updatePlanFromToolUse(session, name, toolUseId, input) {
   const turnId = session.turn?.id;
   if (name === "TaskCreate") {
-    pruneFinishedTasks(session.tasks, turnId);
+    prepareTaskPlanForCreate(session.tasks, input.subject);
     session.tasks.set(`pending:${toolUseId}`, {
       id: `pending:${toolUseId}`,
       subject: input.subject || input.description || "작업",
@@ -687,12 +793,7 @@ function updatePlanFromToolUse(session, name, toolUseId, input) {
       turnId,
     });
   } else if (name === "TaskUpdate") {
-    const task = session.tasks.get(String(input.taskId));
-    if (task) {
-      if (input.subject) task.subject = input.subject;
-      if (input.status) task.status = input.status;
-      task.turnId = turnId;
-    }
+    applyTaskUpdate(session.tasks, input, turnId);
   }
   emitPlan(session);
 }
@@ -723,8 +824,7 @@ function updatePlanFromToolResult(session, pending, message) {
         turnId: previous.get(id)?.turnId ?? turnId,
       });
     }
-    // TaskList는 세션 전체 목록을 돌려주므로, 지난 턴에 끝난 작업까지 되살아나지 않게 걷어낸다.
-    pruneFinishedTasks(session.tasks, turnId);
+    session.tasks = latestTaskPlan(session.tasks);
     emitPlan(session);
   }
 }
@@ -745,6 +845,8 @@ function planStatus(status) {
 }
 
 function emitPlan(session) {
+  // 빈 계획을 보내면 화면의 계획 카드가 사라진다. 보여줄 작업이 없을 때는 마지막 계획을 그대로 둔다.
+  if (session.tasks.size === 0) return;
   notify("turn/plan/updated", {
     threadId: session.id,
     turnId: session.turn?.id,
@@ -770,6 +872,8 @@ function startSubagent(session, block) {
   const input = block.input || {};
   session.subagents.set(block.id, {
     id: block.id,
+    taskId: "",
+    background: false,
     name: firstLine(input.subagent_type || input.agentType || "agent", 40),
     description: firstLine(input.description || input.prompt || "", 120),
     tool: "",
@@ -778,10 +882,64 @@ function startSubagent(session, block) {
   emitSubagents(session);
 }
 
+function isBackgroundSubagentResult(result) {
+  return result?.isAsync === true || result?.status === "async_launched";
+}
+
+// Claude Code treats an async Agent result as a launch receipt. The agent remains
+// live until its later task-notification names the same task or tool-use id.
+function keepBackgroundSubagent(session, toolUseId, result) {
+  if (!isBackgroundSubagentResult(result)) return false;
+  const running = session.subagents.get(toolUseId);
+  if (!running) return false;
+  running.background = true;
+  running.taskId = firstLine(result?.agentId || result?.taskId || "", 80);
+  if (running.taskId) {
+    session.knownSubagents.set(running.taskId, {
+      name: running.name,
+      description: running.description,
+    });
+  }
+  return true;
+}
+
+// SendMessage can wake a completed agent from its transcript. Its new parent
+// tool-use id owns this run, while the stable agent id lets later notifications
+// and further resumes recover the original label.
+function resumeBackgroundSubagent(session, toolUseId, pending, result) {
+  const taskId = firstLine(result?.resumedAgentId || "", 80);
+  if (!taskId) return false;
+  const existing = [...session.subagents.values()].find((agent) => agent.taskId === taskId);
+  if (existing) return true;
+  const known = session.knownSubagents.get(taskId);
+  const input = pending?.input || {};
+  const running = {
+    id: toolUseId,
+    taskId,
+    background: true,
+    name: known?.name || "agent",
+    description: known?.description || firstLine(input.summary || input.message || "", 120),
+    tool: "",
+    startedAt: Date.now(),
+  };
+  session.subagents.set(toolUseId, running);
+  session.knownSubagents.set(taskId, {
+    name: running.name,
+    description: running.description,
+  });
+  emitSubagents(session);
+  return true;
+}
+
+function findSubagent(session, id) {
+  return session.subagents.get(id)
+    || [...session.subagents.values()].find((agent) => agent.taskId === id);
+}
+
 // 서브에이전트가 실제로 무엇을 했는지는 자식 메시지에만 남는다. 열람용 기록은 여기서
 // 한 줄씩 흘려보내고, 목록 행에 쓸 현재 도구만 따로 갱신한다.
 function recordSubagentMessage(session, message) {
-  const running = session.subagents.get(message.parent_tool_use_id);
+  const running = findSubagent(session, message.parent_tool_use_id);
   if (!running) return;
   const content = Array.isArray(message.message?.content) ? message.message.content : [];
   let toolChanged = false;
@@ -803,7 +961,7 @@ function recordSubagentMessage(session, message) {
 }
 
 function recordSubagentResult(session, message) {
-  const running = session.subagents.get(message.parent_tool_use_id);
+  const running = findSubagent(session, message.parent_tool_use_id);
   if (!running) return;
   const content = Array.isArray(message.message?.content) ? message.message.content : [];
   for (const block of content) {
@@ -844,6 +1002,25 @@ function finishSubagent(session, toolUseId) {
   emitSubagents(session);
 }
 
+function finishSubagentTask(session, taskId) {
+  if (!taskId) return false;
+  const entry = [...session.subagents.entries()].find(([, agent]) => agent.taskId === taskId);
+  if (!entry) return false;
+  session.subagents.delete(entry[0]);
+  emitSubagents(session);
+  return true;
+}
+
+function clearForegroundSubagents(session) {
+  let changed = false;
+  for (const [id, agent] of session.subagents) {
+    if (agent.background) continue;
+    session.subagents.delete(id);
+    changed = true;
+  }
+  if (changed) emitSubagents(session);
+}
+
 function clearSubagents(session) {
   if (!session.subagents.size) return;
   session.subagents.clear();
@@ -868,6 +1045,58 @@ function emitSubagents(session) {
   });
 }
 
+function messageTextParts(message) {
+  const content = message.message?.content;
+  if (typeof content === "string") return [content];
+  if (!Array.isArray(content)) return [];
+  return content
+    .filter((block) => block?.type === "text" && typeof block.text === "string")
+    .map((block) => block.text);
+}
+
+function notificationTag(body, name) {
+  const match = body.match(new RegExp(`<${name}>([\\s\\S]*?)</${name}>`));
+  return match?.[1]?.trim() || "";
+}
+
+function taskNotifications(message) {
+  if (message.origin?.kind !== "task-notification"
+    && !messageTextParts(message).some((text) => text.includes("<task-notification>"))) {
+    return [];
+  }
+  const notifications = [];
+  for (const text of messageTextParts(message)) {
+    for (const match of text.matchAll(/<task-notification>([\s\S]*?)<\/task-notification>/g)) {
+      const body = match[1];
+      notifications.push({
+        taskId: notificationTag(body, "task-id"),
+        toolUseId: notificationTag(body, "tool-use-id"),
+        status: notificationTag(body, "status"),
+        summary: notificationTag(body, "summary"),
+      });
+    }
+  }
+  return notifications;
+}
+
+function finishNotifiedSubagents(session, notifications) {
+  for (const notification of notifications) {
+    const byToolUse = notification.toolUseId
+      ? session.subagents.get(notification.toolUseId)
+      : null;
+    const running = byToolUse || (notification.taskId
+      ? [...session.subagents.values()].find((agent) => agent.taskId === notification.taskId)
+      : null);
+    if (!running) continue;
+    emitSubagentLine(session, running.id, {
+      kind: notification.status === "completed" ? "result" : "error",
+      text: notification.summary || notification.status || "완료됨",
+    });
+    session.subagents.delete(running.id);
+    emitSubagents(session);
+  }
+}
+
 function processUser(session, message) {
   // 자식 tool_result의 tool_use_id는 부모 세션의 것과 다른 공간이므로, 부모 흐름에
   // 섞이기 전에 서브에이전트 기록으로 보낸다.
@@ -875,11 +1104,24 @@ function processUser(session, message) {
     recordSubagentResult(session, message);
     return;
   }
+  const notifications = taskNotifications(message);
+  if (notifications.length) {
+    if (!session.turn) beginTurn(session);
+    finishNotifiedSubagents(session, notifications);
+    return;
+  }
   const content = Array.isArray(message.message?.content) ? message.message.content : [];
   for (const block of content) {
     if (block.type !== "tool_result") continue;
-    finishSubagent(session, block.tool_use_id);
     const pending = session.tools.get(block.tool_use_id);
+    const staysInBackground = SUBAGENT_TOOLS.includes(pending?.name)
+      && keepBackgroundSubagent(session, block.tool_use_id, message.tool_use_result);
+    if (!staysInBackground) finishSubagent(session, block.tool_use_id);
+    if (pending?.name === "SendMessage") {
+      resumeBackgroundSubagent(session, block.tool_use_id, pending, message.tool_use_result);
+    } else if (pending?.name === "TaskStop" && message.tool_use_result?.success !== false) {
+      finishSubagentTask(session, firstLine(pending.input?.task_id || "", 80));
+    }
     if (!pending) continue;
     pending.toolUseId = block.tool_use_id;
     if (pending.suppressed) {
@@ -969,7 +1211,8 @@ async function runPendingPrompt(session) {
 
 function finishTurn(session, error, durationMs) {
   if (!session.turn) return;
-  clearSubagents(session);
+  flushSmoothStreams(session);
+  clearForegroundSubagents(session);
   const turn = { id: session.turn.id, status: error ? "failed" : "completed" };
   if (error) turn.error = { message: error instanceof Error ? error.message : error.message || String(error) };
   if (durationMs != null) turn.durationMs = durationMs;
@@ -985,7 +1228,7 @@ async function consume(session) {
       if (message.event?.type === "content_block_delta" && (message.event?.delta?.text || message.event?.delta?.thinking)) {
         if (session.turn) session.turn.sawStreamText = true;
       }
-      processStreamEvent(session, message);
+      await processStreamEvent(session, message);
     } else if (message.type === "assistant") processAssistant(session, message);
     else if (message.type === "user") processUser(session, message);
     else if (message.type === "result") await processResult(session, message);
@@ -1068,10 +1311,7 @@ async function runPrompt(session, params) {
   }
   session.effort = effort;
   await applyPermissionMode(session, params.permissionMode);
-  const turnId = `claude-turn-${session.turnSequence++}-${randomUUID()}`;
-  session.turn = { id: turnId, sawStreamText: false };
-  session.lastContextUsage = null;
-  notify("turn/started", { threadId: id, turn: { id: turnId } });
+  const turnId = beginTurn(session);
   session.queue.push({
     type: "user",
     message: { role: "user", content: await inputContent(params.input, params.handoffContext) },
@@ -1080,6 +1320,16 @@ async function runPrompt(session, params) {
     origin: { kind: "human" },
   });
   return { turn: { id: turnId } };
+}
+
+// A background task notification is an internal user message that starts its
+// own Claude response even though the host did not submit a new prompt.
+function beginTurn(session) {
+  const turnId = `claude-turn-${session.turnSequence++}-${randomUUID()}`;
+  session.turn = { id: turnId, sawStreamText: false };
+  session.lastContextUsage = null;
+  notify("turn/started", { threadId: session.id, turn: { id: turnId } });
+  return turnId;
 }
 
 function contentBlocks(message) {
@@ -1105,7 +1355,7 @@ function isInternalHistoryText(message, text) {
     ].includes(tag);
 }
 
-function historyTurns(messages) {
+function historyState(messages) {
   const turns = [];
   let turn = null;
   const tools = new Map();
@@ -1144,11 +1394,10 @@ function historyTurns(messages) {
           const pending = { name: block.name, input: block.input || {}, item: toolItem({}, block.id, block.name, block.input || {}) };
           tools.set(block.id, pending);
           if (block.name === "TaskCreate") {
-            pruneFinishedTasks(tasks, turn.id);
+            prepareTaskPlanForCreate(tasks, block.input?.subject);
             tasks.set(`pending:${block.id}`, { id: `pending:${block.id}`, subject: block.input?.subject || "작업", status: "pending", turnId: turn.id });
           } else if (block.name === "TaskUpdate") {
-            const task = tasks.get(String(block.input?.taskId));
-            if (task) Object.assign(task, block.input?.subject ? { subject: block.input.subject } : {}, block.input?.status ? { status: block.input.status } : {}, { turnId: turn.id });
+            applyTaskUpdate(tasks, block.input || {}, turn.id);
           } else if (!["TaskList", "AskUserQuestion"].includes(block.name)) turn.items.push(pending.item);
         }
       }
@@ -1169,7 +1418,9 @@ function historyTurns(messages) {
           const known = new Map(tasks);
           tasks.clear();
           for (const task of message.tool_use_result.tasks) tasks.set(String(task.id), { id: String(task.id), subject: task.subject || "작업", status: task.status || "pending", turnId: known.get(String(task.id))?.turnId ?? turn.id });
-          pruneFinishedTasks(tasks, turn.id);
+          const current = latestTaskPlan(tasks);
+          tasks.clear();
+          for (const [id, task] of current) tasks.set(id, task);
         } else if (pending.item) {
           const output = toolOutput(block.content, message.tool_use_result);
           Object.assign(pending.item, pending.item.type === "commandExecution"
@@ -1185,9 +1436,16 @@ function historyTurns(messages) {
     const text = [...tasks.values()].map((task, index) => `${task.status === "completed" ? "✓" : task.status === "in_progress" ? "▸" : "□"} ${numberedTaskSubject(task.subject, index)}`).join("\n");
     turn.items.push({ id: "claude-plan-latest", type: "plan", text });
   }
-  return turns
+  return {
+    tasks,
+    turns: turns
     .filter((candidate) => !candidate.synthetic)
-    .map(({ synthetic: _, ...candidate }) => candidate);
+    .map(({ synthetic: _, ...candidate }) => candidate),
+  };
+}
+
+function historyTurns(messages) {
+  return historyState(messages).turns;
 }
 
 async function dispatch(method, params = {}) {
@@ -1216,6 +1474,7 @@ async function dispatch(method, params = {}) {
     const existing = sessions.get(id);
     if (existing) {
       const messages = await getSessionMessages(id, { dir: existing.cwd, includeSystemMessages: true });
+      if (!existing.tasks.size) existing.tasks = historyState(messages).tasks;
       return {
         id,
         thread: { id, turns: [] },
@@ -1244,6 +1503,7 @@ async function dispatch(method, params = {}) {
     // Seed the live session so the next turn keeps reporting a full context.
     session.lastContextUsage = tokenUsage?.last || null;
     session.lastContextWindow = tokenUsage?.modelContextWindow || 0;
+    session.tasks = historyState(messages).tasks;
     return {
       id,
       thread: { id, turns: [] },
@@ -1345,7 +1605,7 @@ async function dispatch(method, params = {}) {
   throw new Error(`지원하지 않는 Claude 브리지 메서드: ${method}`);
 }
 
-function runSelfTest() {
+async function runSelfTest() {
   const user = (uuid, text) => ({
     type: "user",
     uuid,
@@ -1381,6 +1641,64 @@ function runSelfTest() {
       || prompt.model !== expected[index][1])) {
     throw new Error(`Claude history self-test failed: ${JSON.stringify(turns)}`);
   }
+  const taskUse = (uuid, id, name, input) => ({
+    type: "assistant",
+    uuid,
+    message: {
+      role: "assistant",
+      model: "claude-opus-5",
+      content: [{ type: "tool_use", id, name, input }],
+    },
+  });
+  const taskResult = (uuid, id, toolUseResult, content) => ({
+    type: "user",
+    uuid,
+    message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content }] },
+    tool_use_result: toolUseResult,
+  });
+  const taskMessages = [user("plan", "작업을 진행해")];
+  for (let index = 1; index <= 6; index++) {
+    const id = String(24 + index);
+    const toolId = `create-${id}`;
+    const subject = `${index}. 작업 ${index}`;
+    taskMessages.push(
+      taskUse(`create-use-${id}`, toolId, "TaskCreate", { subject }),
+      taskResult(`create-result-${id}`, toolId, { task: { id, subject } }, `Task #${id} created successfully: ${subject}`),
+    );
+  }
+  taskMessages.push(
+    taskUse("update-25-start", "update-25-start", "TaskUpdate", { taskId: "25", status: "in_progress" }),
+    taskUse("update-25-done", "update-25-done", "TaskUpdate", { taskId: "25", status: "completed" }),
+    taskUse("update-26-start", "update-26-start", "TaskUpdate", { taskId: "26", status: "in_progress" }),
+  );
+  const restoredTasks = historyState(taskMessages).tasks;
+  if ([...restoredTasks.keys()].join(",") !== "25,26,27,28,29,30"
+    || restoredTasks.get("25")?.status !== "completed"
+    || restoredTasks.get("26")?.status !== "in_progress"
+    || [...restoredTasks.values()].filter((task) => task.status === "in_progress").length !== 1) {
+    throw new Error(`Claude task resume self-test failed: ${JSON.stringify([...restoredTasks])}`);
+  }
+  applyTaskUpdate(restoredTasks, { taskId: "26", status: "completed" }, "resumed-turn");
+  applyTaskUpdate(restoredTasks, { taskId: "27", status: "in_progress" }, "resumed-turn");
+  if (restoredTasks.size !== 6
+    || restoredTasks.get("25")?.status !== "completed"
+    || restoredTasks.get("26")?.status !== "completed"
+    || restoredTasks.get("27")?.status !== "in_progress"
+    || [...restoredTasks.values()].filter((task) => task.status === "in_progress").length !== 1) {
+    throw new Error(`Claude sequential task update self-test failed: ${JSON.stringify([...restoredTasks])}`);
+  }
+  const mixedPlans = new Map([
+    ["old-1", { subject: "1. 이전 작업", status: "completed" }],
+    ["old-2", { subject: "2. 이전 검증", status: "completed" }],
+    ...[...restoredTasks],
+  ]);
+  if ([...latestTaskPlan(mixedPlans).keys()].join(",") !== "25,26,27,28,29,30") {
+    throw new Error(`Claude latest task plan self-test failed: ${JSON.stringify([...mixedPlans])}`);
+  }
+  prepareTaskPlanForCreate(restoredTasks, "7. 추가 작업");
+  if (restoredTasks.size !== 6) throw new Error("Claude appended task unexpectedly reset the plan");
+  prepareTaskPlanForCreate(restoredTasks, "1. 새 작업");
+  if (restoredTasks.size !== 0) throw new Error("Claude new task plan did not reset the previous plan");
   const usage = tokenBreakdown({
     input_tokens: 2,
     cache_read_input_tokens: 68_000,
@@ -1398,11 +1716,143 @@ function runSelfTest() {
   if (windows.join(",") !== "1000000,200000,300000") {
     throw new Error(`Claude context window self-test failed: ${windows.join(",")}`);
   }
+  const notification = taskNotifications({
+    origin: { kind: "task-notification" },
+    message: {
+      content: `<task-notification>
+<task-id>agent-1</task-id>
+<tool-use-id>toolu_1</tool-use-id>
+<status>completed</status>
+<summary>Agent "Explore" finished</summary>
+<result>done</result>
+</task-notification>`,
+    },
+  });
+  if (notification.length !== 1
+    || notification[0].taskId !== "agent-1"
+    || notification[0].toolUseId !== "toolu_1"
+    || notification[0].status !== "completed"
+    || notification[0].summary !== 'Agent "Explore" finished') {
+    throw new Error(`Claude task notification self-test failed: ${JSON.stringify(notification)}`);
+  }
+  const lifecycleSession = {
+    id: "self-test-session",
+    turn: { id: "parent-turn", sawStreamText: false },
+    turnSequence: 1,
+    streamBlocks: new Map(),
+    tools: new Map([[
+      "toolu_1",
+      {
+        name: "Agent",
+        input: { subagent_type: "Explore", description: "Inspect files" },
+        item: { id: "toolu_1", type: "collabAgentToolCall", tool: { name: "Agent", arguments: {} } },
+      },
+    ]]),
+    subagents: new Map([[
+      "toolu_1",
+      {
+        id: "toolu_1",
+        taskId: "",
+        background: false,
+        name: "Explore",
+        description: "Inspect files",
+        tool: "",
+        startedAt: Date.now(),
+      },
+    ]]),
+    knownSubagents: new Map(),
+    lastContextUsage: null,
+  };
+  const captured = [];
+  const stdoutWrite = process.stdout.write;
+  process.stdout.write = (chunk) => {
+    captured.push(String(chunk));
+    return true;
+  };
+  try {
+    processUser(lifecycleSession, {
+      message: { content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "launched" }] },
+      tool_use_result: { isAsync: true, status: "async_launched", agentId: "agent-1" },
+    });
+    finishTurn(lifecycleSession, null, 1);
+    if (!lifecycleSession.subagents.has("toolu_1") || lifecycleSession.turn !== null) {
+      throw new Error("Claude background subagent did not survive its parent turn");
+    }
+    processUser(lifecycleSession, {
+      origin: { kind: "task-notification" },
+      message: { content: notification[0] && `<task-notification>
+<task-id>agent-1</task-id><tool-use-id>toolu_1</tool-use-id>
+<status>completed</status><summary>Agent finished</summary>
+</task-notification>` },
+    });
+    if (lifecycleSession.subagents.size !== 0 || lifecycleSession.turn === null) {
+      throw new Error("Claude task notification did not finish the agent in an automatic turn");
+    }
+    finishTurn(lifecycleSession, null, 1);
+
+    beginTurn(lifecycleSession);
+    lifecycleSession.tools.set("toolu_2", {
+      name: "SendMessage",
+      input: { to: "agent-1", summary: "Continue inspection" },
+      item: { id: "toolu_2", type: "dynamicToolCall", tool: "SendMessage", arguments: {} },
+    });
+    processUser(lifecycleSession, {
+      message: { content: [{ type: "tool_result", tool_use_id: "toolu_2", content: "resumed" }] },
+      tool_use_result: { success: true, resumedAgentId: "agent-1" },
+    });
+    const resumed = lifecycleSession.subagents.get("toolu_2");
+    if (!resumed?.background || resumed.taskId !== "agent-1" || resumed.name !== "Explore") {
+      throw new Error(`Claude resumed subagent self-test failed: ${JSON.stringify(resumed)}`);
+    }
+    finishTurn(lifecycleSession, null, 1);
+    processUser(lifecycleSession, {
+      origin: { kind: "task-notification" },
+      message: { content: `<task-notification>
+<task-id>agent-1</task-id><tool-use-id>toolu_2</tool-use-id>
+<status>failed</status><summary>Agent failed</summary>
+</task-notification>` },
+    });
+    if (lifecycleSession.subagents.size !== 0 || lifecycleSession.turn === null) {
+      throw new Error("Claude failed task notification did not finish the resumed agent");
+    }
+    finishTurn(lifecycleSession, null, 1);
+  } finally {
+    process.stdout.write = stdoutWrite;
+  }
+  const lifecycleEvents = captured
+    .join("")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  const lifecycleMethods = lifecycleEvents.map((event) => event.method);
+  if (!lifecycleMethods.includes("turn/subagents/updated")
+    || lifecycleMethods.filter((method) => method === "turn/started").length < 3
+    || !lifecycleEvents.some((event) => event.method === "turn/subagent/line"
+      && event.params?.line?.kind === "error")) {
+    throw new Error(`Claude subagent lifecycle events self-test failed: ${lifecycleMethods}`);
+  }
+  const smoothText = "Claude가 👨‍👩‍👧‍👦 한 문장을 한꺼번에 보내도 부드럽게 표시합니다.";
+  const emitted = [];
+  const smooth = new SmoothTextStream((chunk) => emitted.push(chunk), 0);
+  smooth.push(smoothText);
+  await smooth.finish();
+  if (emitted.length < 2 || emitted.join("") !== smoothText) {
+    throw new Error(`Claude smooth stream self-test failed: ${JSON.stringify(emitted)}`);
+  }
+  const flushed = [];
+  const interrupted = new SmoothTextStream((chunk) => flushed.push(chunk), 1000);
+  interrupted.push(smoothText);
+  interrupted.flush();
+  await interrupted.finish();
+  if (flushed.join("") !== smoothText) {
+    throw new Error(`Claude smooth stream flush self-test failed: ${JSON.stringify(flushed)}`);
+  }
   process.stdout.write("Claude bridge self-test passed\n");
 }
 
 if (process.argv.includes("--self-test")) {
-  runSelfTest();
+  await runSelfTest();
   process.exit(0);
 }
 
