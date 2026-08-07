@@ -2909,6 +2909,9 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "진행 보고 규칙:\n",
     "- 단순 질문이 아닌 작업은 첫 도구 호출 전에 무엇을 확인하고 이어서 무엇을 할지 한두 문장으로 알린다. ",
     "이후에는 새 사실이 사용자 판단을 바꾸거나 작업 범위가 달라질 때만 짧게 알리고, 같은 내용을 반복하지 않는다.\n",
+    "- 무엇을 알아냈는지 담기지 않은 진행 문장은 쓰지 않는다. ",
+    "`다음 부분을 이어서 확인하겠습니다.`, `이어서 진행하겠습니다.`, `계속 확인하겠습니다.`처럼 ",
+    "다음에 무엇을 왜 보는지 없는 문장은 같은 응답에서 한 번도 쓰지 않는다.\n",
     "계획 규칙:\n",
     "- 실행 단계가 두 개 이상이거나 도구를 두 번 이상 호출할 작업, 설계 판단이 필요한 작업에서는 반드시 `update_plan`으로 짧은 계획을 먼저 세운다.\n",
     "- 단순 질문, 도구 한 번의 조회, 한 줄 수정처럼 바로 끝나는 요청에는 계획을 만들지 않는다.\n",
@@ -2932,7 +2935,9 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "코드, 명령어, 경로, 제품명 등 기술 식별자는 원문을 유지한다.\n",
     "최우선 시작 응답 규칙: 단순 질문이 아닌 작업에서는 첫 응답 content block을 반드시 사용자에게 보이는 짧은 진행 안내 text로 출력한다. ",
     "TaskCreate를 포함한 어떤 tool_use도 이 text보다 먼저 출력하지 않는다. 같은 assistant message에 text와 tool_use를 함께 출력할 때도 text를 앞에 둔다. ",
-    "진행 안내에는 요청에서 무엇을 먼저 확인하고 이어서 무엇을 할지 사용자의 언어로 한두 문장만 적는다.\n",
+    "진행 안내에는 요청에서 무엇을 먼저 확인하고 이어서 무엇을 할지 사용자의 언어로 한두 문장만 적는다. ",
+    "이 규칙은 사용자 메시지에 대한 첫 assistant message에만 적용한다. ",
+    "그다음부터는 알릴 새 사실이 없으면 tool_use 앞에 text를 붙이지 않고 도구를 바로 호출한다.\n",
     "최우선 작업 단계 규칙: Read, Grep, Glob, Bash 등 작업 도구를 두 번 이상 호출할 가능성이 있으면 다른 도구보다 먼저 TaskCreate를 호출한다. ",
     "TaskCreate 없이 두 번째 작업 도구를 호출하면 지침 위반이다. 모든 TaskCreate가 끝나면 다른 작업 도구보다 먼저 첫 Task를 TaskUpdate로 `in_progress`로 바꾼다. ",
     "모든 Task는 예외 없이 `pending` → `in_progress` → `completed` 순서로 바꾸며 `pending`에서 `completed`로 바로 바꾸지 않는다. ",
@@ -2947,10 +2952,13 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "사용자가 코드나 경로를 직접 요청했거나, 그것 없이는 사용자가 판단할 수 없는 경우에만 보여준다.\n",
     "- Vibe와 Super Vibe 모드의 최종 답변은 반드시 불릿 두 개 이하, 전체 200자 이내, 불릿마다 한 문장으로 쓴다. ",
     "사용자가 자세한 설명을 명시적으로 요청한 경우에만 늘린다.\n",
-    "- 다만 사용자에게 선택이나 승인을 요청하는 답변에는 이 분량 제한을 적용하지 않는다. ",
-    "고를 수 있는 선택지, 각 선택지의 결과, 판단에 필요한 사실을 하나도 빠뜨리지 않고 적고, ",
-    "글자 수를 맞추려고 선택지를 줄이거나 문장을 도중에 끊지 않는다. ",
-    "선택지를 다 적은 뒤에는 마지막 줄에서 무엇을 선택하면 되는지 한 문장으로 묻는다.\n",
+    "- 사용자에게 선택이나 승인을 요청할 때는 본문에 선택지를 나열하지 말고 반드시 AskUserQuestion 도구로 묻는다. ",
+    "각 선택지의 label에는 고를 대상을, description에는 그 선택의 결과와 판단에 필요한 사실을 적는다. ",
+    "서로 배타적이지 않은 선택에는 multiSelect를 켜고, 한 번에 정해야 할 것이 여러 가지면 질문을 나눠 함께 묻는다. ",
+    "`기타` 선택지는 자동으로 제공되므로 직접 만들지 않는다.\n",
+    "- 선택지가 다섯 개 이상이라 AskUserQuestion에 담기지 않을 때만 본문에 글로 나열한다. ",
+    "이때는 분량 제한을 적용하지 않고, 선택지와 각각의 결과를 하나도 빠뜨리지 않고 적은 뒤 ",
+    "마지막 줄에서 무엇을 선택하면 되는지 한 문장으로 묻는다.\n",
     "- 파일 수정, 명령 실행처럼 실제로 무언가를 바꾼 작업을 마쳤을 때만 마지막 불릿을 완료 보고로 쓴다. ",
     "질문에 답하거나 조사·설명만 한 응답, 사용자의 제안을 거절하거나 확인만 한 응답에는 완료 문구를 붙이지 않는다.\n",
     "- 완료 보고는 수행한 동작을 그대로 목적어로 삼아 `~했습니다.`로 끝낸다. 예: `임시 파일 정리 주기를 변경했습니다.` ",
@@ -2967,6 +2975,9 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "진행 보고 규칙:\n",
     "- 단순 질문이 아닌 작업은 첫 도구 호출 전에 무엇을 확인하고 이어서 무엇을 할지 한두 문장으로 알린다. ",
     "이후에는 새 사실이 사용자 판단을 바꾸거나 작업 범위가 달라질 때만 짧게 알리고, 같은 내용을 반복하지 않는다.\n",
+    "- 무엇을 알아냈는지 담기지 않은 진행 문장은 쓰지 않는다. ",
+    "`다음 부분을 이어서 확인하겠습니다.`, `이어서 진행하겠습니다.`, `계속 확인하겠습니다.`처럼 ",
+    "다음에 무엇을 왜 보는지 없는 문장은 같은 응답에서 한 번도 쓰지 않는다.\n",
     "- 완료 보고는 세 줄 이내로 쓰며, 검증하지 못한 내용은 짧게 밝힌다.\n",
     "- Skill 적용, 지침 확인, 내부 도구 호출 같은 내부 절차는 알리지 않는다.\n",
     "작업 단계 규칙:\n",
@@ -4871,8 +4882,8 @@ mod tests {
         // The caps truncated the one answer that has to stay whole, so both
         // capped presets carry the exception next to the cap that broke it.
         for vibe in [VibeMode::Vibe, VibeMode::SuperVibe] {
-            assert!(notice(vibe).contains("선택이나 승인을 요청하는 답변에는 이 분량 제한을 적용하지 않는다"));
-            assert!(notice(vibe).contains("선택지를 줄이거나 문장을 도중에 끊지 않는다"));
+            assert!(notice(vibe).contains("선택이나 승인을 요청할 때는 이 분량 제한을 적용하지 않는다"));
+            assert!(notice(vibe).contains("AskUserQuestion 도구를 쓸 수 있으면"));
         }
     }
 
@@ -4905,8 +4916,18 @@ mod tests {
             assert!(rules.contains("완료 문구를 붙이지 않는다"));
             assert!(rules.contains("`~한 내용을 완료했습니다.`처럼 명사절을 겹쳐 쓰거나"));
             assert!(!rules.contains("`~ 내용을 완료했습니다.` 형식으로"));
-            assert!(rules.contains("선택이나 승인을 요청하는 답변에는 이 분량 제한을 적용하지 않는다"));
-            assert!(rules.contains("선택지를 줄이거나 문장을 도중에 끊지 않는다"));
+        }
+        // The preset caps cut the choices out of the very answer that exists to
+        // present them, so each provider gets the asking form it can actually use.
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("반드시 AskUserQuestion 도구로 묻는다"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("선택지가 다섯 개 이상이라"));
+        assert!(DEVEZ_INSTRUCTIONS.contains("선택이나 승인을 요청하는 답변에는 이 분량 제한을 적용하지 않는다"));
+        assert!(DEVEZ_INSTRUCTIONS.contains("선택지를 줄이거나 문장을 도중에 끊지 않는다"));
+        // Read as a per-call duty, the opening notice turned into the same
+        // contentless line before every tool call.
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("첫 assistant message에만 적용한다"));
+        for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS] {
+            assert!(rules.contains("`다음 부분을 이어서 확인하겠습니다.`"));
         }
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`Now ...` 같은 독립된 영어 진행 문장"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("첫 도구 호출 전에"));
