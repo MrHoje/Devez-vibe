@@ -306,47 +306,6 @@ pub fn is_claude_request_id(id: &Value) -> bool {
     id.get("backend").and_then(Value::as_str) == Some("claude")
 }
 
-/// Whether `bypassPermissions` may be offered at all. Claude Code refuses the
-/// mode when a settings file — policy, user, project, or local — carries
-/// `permissions.disableBypassPermissionsMode: "disable"`, so the badge must not
-/// cycle into a mode the CLI would reject. The Windows policy *registry* key is
-/// not read here; the documented `managed-settings.json` path is.
-pub fn bypass_permissions_allowed(cwd: &Path) -> bool {
-    !permission_settings_files(cwd)
-        .iter()
-        .filter_map(|path| std::fs::read_to_string(path).ok())
-        .filter_map(|json| serde_json::from_str::<Value>(&json).ok())
-        .any(|settings| settings_disable_bypass(&settings))
-}
-
-fn settings_disable_bypass(settings: &Value) -> bool {
-    settings
-        .pointer("/permissions/disableBypassPermissionsMode")
-        .and_then(Value::as_str)
-        == Some("disable")
-}
-
-fn permission_settings_files(cwd: &Path) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    #[cfg(windows)]
-    paths.push(PathBuf::from("C:/Program Files/ClaudeCode/managed-settings.json"));
-    #[cfg(target_os = "macos")]
-    paths.push(PathBuf::from(
-        "/Library/Application Support/ClaudeCode/managed-settings.json",
-    ));
-    #[cfg(all(unix, not(target_os = "macos")))]
-    paths.push(PathBuf::from("/etc/claude-code/managed-settings.json"));
-    if let Some(home) = env::var_os("USERPROFILE")
-        .or_else(|| env::var_os("HOME"))
-        .map(PathBuf::from)
-    {
-        paths.push(home.join(".claude").join("settings.json"));
-    }
-    paths.push(cwd.join(".claude").join("settings.json"));
-    paths.push(cwd.join(".claude").join("settings.local.json"));
-    paths
-}
-
 pub fn model_catalog() -> Value {
     let efforts = || {
         json!([
@@ -507,18 +466,6 @@ mod tests {
         assert!(is_claude_model("sonnet"));
         assert_eq!(visible_thread_id("123"), "claude:123");
         assert_eq!(raw_thread_id("claude:123"), "123");
-    }
-
-    /// The CLI answers `setPermissionMode("bypassPermissions")` with "disabled by
-    /// settings or configuration" when this key is set, so the badge has to read
-    /// the same key rather than offer a mode that will be refused.
-    #[test]
-    fn settings_can_disable_the_bypass_mode() {
-        assert!(settings_disable_bypass(&json!({
-            "permissions": { "disableBypassPermissionsMode": "disable" }
-        })));
-        assert!(!settings_disable_bypass(&json!({ "permissions": {} })));
-        assert!(!settings_disable_bypass(&json!({})));
     }
 
     #[test]

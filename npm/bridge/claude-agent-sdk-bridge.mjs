@@ -440,6 +440,7 @@ async function createSession(params, resumeId) {
     streamBlocks: new Map(),
     tools: new Map(),
     tasks: new Map(),
+    planCreatePending: false,
     subagents: new Map(),
     knownSubagents: new Map(),
     lastContextUsage: null,
@@ -546,7 +547,7 @@ function emitOpeningNotice(session) {
 // Windows rounds larger timer delays up to the next scheduler slice. Ten
 // milliseconds lands near one terminal frame instead of visibly stepping at ~30ms.
 const SMOOTH_TEXT_INTERVAL_MS = 10;
-const SMOOTH_TEXT_TARGET_FRAMES = 8;
+const SMOOTH_TEXT_TARGET_FRAMES = 10;
 const SMOOTH_TEXT_MAX_GRAPHEMES = 24;
 const graphemeSegmenter = typeof Intl.Segmenter === "function"
   ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
@@ -583,7 +584,18 @@ class SmoothTextStream {
 
   push(text) {
     this.pending += text;
-    if (this.timer == null) this.drain();
+    this.schedule();
+  }
+
+  schedule() {
+    if (this.timer != null) return;
+    // Wait one visual frame before the first drain. Claude often sends several
+    // tiny deltas back-to-back; batching them removes the uneven one-character
+    // jumps while keeping added latency below one frame.
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.drain();
+    }, this.intervalMs);
   }
 
   drain() {
@@ -596,9 +608,8 @@ class SmoothTextStream {
     this.pending = rest;
     this.emit(chunk);
     if (this.pending) {
-      this.timer = setTimeout(() => this.drain(), this.intervalMs);
+      this.schedule();
     } else {
-      this.timer = null;
       for (const resolve of this.waiters.splice(0)) resolve();
     }
   }
@@ -789,9 +800,11 @@ function processToolUse(session, block) {
     return;
   }
   if (name === "AskUserQuestion") {
+    flushPendingPlan(session);
     session.tools.set(block.id, { name, input, suppressed: true });
     return;
   }
+  flushPendingPlan(session);
   const item = toolItem(session, block.id, name, input);
   session.tools.set(block.id, { name, input, item });
   emitItem(session, "started", item);
@@ -908,9 +921,18 @@ function updatePlanFromToolUse(session, name, toolUseId, input) {
       status: "pending",
       turnId,
     });
+    session.planCreatePending = true;
+    return;
   } else if (name === "TaskUpdate") {
+    session.planCreatePending = false;
     applyTaskUpdate(session.tasks, input, turnId, () => emitPlan(session));
   }
+  if (name === "TaskUpdate") emitPlan(session);
+}
+
+function flushPendingPlan(session) {
+  if (!session.planCreatePending) return;
+  session.planCreatePending = false;
   emitPlan(session);
 }
 
@@ -1327,6 +1349,7 @@ async function runPendingPrompt(session) {
 
 function finishTurn(session, error, durationMs) {
   if (!session.turn) return;
+  flushPendingPlan(session);
   flushSmoothStreams(session);
   clearForegroundSubagents(session);
   const turn = { id: session.turn.id, status: error ? "failed" : "completed" };
@@ -1915,6 +1938,50 @@ async function runSelfTest() {
   if (restoredTasks.size !== 6) throw new Error("Claude appended task unexpectedly reset the plan");
   prepareTaskPlanForCreate(restoredTasks, "1. 새 작업");
   if (restoredTasks.size !== 0) throw new Error("Claude new task plan did not reset the previous plan");
+  const batchedPlanSession = {
+    id: "batched-plan-self-test",
+    turn: { id: "batched-plan-turn" },
+    tasks: new Map(),
+    planCreatePending: false,
+  };
+  const batchedPlanCaptured = [];
+  const batchedPlanWrite = process.stdout.write;
+  process.stdout.write = (chunk) => {
+    batchedPlanCaptured.push(String(chunk));
+    return true;
+  };
+  try {
+    for (let index = 1; index <= 3; index++) {
+      const toolUseId = `batched-create-${index}`;
+      const subject = `${index}. 작업 ${index}`;
+      updatePlanFromToolUse(batchedPlanSession, "TaskCreate", toolUseId, { subject });
+      updatePlanFromToolResult(
+        batchedPlanSession,
+        { name: "TaskCreate", toolUseId },
+        { tool_use_result: { task: { id: String(index), subject } } },
+      );
+    }
+    updatePlanFromToolUse(
+      batchedPlanSession,
+      "TaskUpdate",
+      "batched-update-1",
+      { taskId: "1", status: "in_progress" },
+    );
+  } finally {
+    process.stdout.write = batchedPlanWrite;
+  }
+  const batchedPlanEvents = batchedPlanCaptured
+    .join("")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .filter((event) => event.method === "turn/plan/updated");
+  if (batchedPlanEvents.length !== 1
+    || batchedPlanEvents[0].params?.plan?.length !== 3
+    || batchedPlanEvents[0].params.plan[0]?.status !== "inProgress") {
+    throw new Error(`Claude batched plan self-test failed: ${JSON.stringify(batchedPlanEvents)}`);
+  }
   const usage = tokenBreakdown({
     input_tokens: 2,
     cache_read_input_tokens: 68_000,
@@ -2130,6 +2197,9 @@ async function runSelfTest() {
   const emitted = [];
   const smooth = new SmoothTextStream((chunk) => emitted.push(chunk), 0);
   smooth.push(smoothText);
+  if (emitted.length !== 0) {
+    throw new Error(`Claude smooth stream did not batch its first frame: ${JSON.stringify(emitted)}`);
+  }
   await smooth.finish();
   if (emitted.length < 2 || emitted.join("") !== smoothText) {
     throw new Error(`Claude smooth stream self-test failed: ${JSON.stringify(emitted)}`);

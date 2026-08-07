@@ -20,9 +20,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// nothing reads this today; rewrite it each release for the changelog.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "1.2.9 정기 배포: 최근 안정화 개선을 포함한 최신 실행 파일을 제공합니다.",
-    "새 대화 시작과 Provider 전환 중에도 선택한 설정을 안정적으로 유지합니다.",
-    "Claude 진행 안내는 요청 언어에 맞춰 자연스럽게 표시됩니다.",
+    "새 대화가 선택한 reasoning effort로 즉시 시작되어 첫 응답에서 설정이 바뀌지 않습니다.",
+    "전체 화면 커서와 클릭 가능한 제어 영역을 안정적으로 표시합니다.",
+    "Claude 작업 단계와 응답 스트리밍이 더 자연스럽고 매끄럽게 갱신됩니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

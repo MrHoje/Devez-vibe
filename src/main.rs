@@ -334,6 +334,7 @@ async fn start_session(
             state.model_verbosity(),
             &claude,
             cli.effort.as_deref(),
+            requested_effort,
         ),
         read_runtime_account_plan(server, requested_model_name),
         None,
@@ -1155,7 +1156,22 @@ fn renderer_mouse_action(
     mouse: &MouseEvent,
     on_pick: impl FnOnce(Pick) -> Action,
 ) -> Action {
-    match mouse_request(mouse) {
+    let request = mouse_request(mouse);
+    // Some embedded terminals deliver the press but swallow the matching
+    // release.  Chrome controls must not depend on that release: activate a
+    // known pick as soon as it is pressed, while plain text keeps the normal
+    // drag-to-select path below.
+    if let MouseRequest::SelectionStart(column, row) = request {
+        if let Some(pick) = renderer.pick_at(column, row) {
+            let cleared = renderer.clear_selection();
+            return match on_pick(pick) {
+                Action::Tick(changed) => Action::Tick(changed || cleared),
+                action => action,
+            };
+        }
+    }
+
+    match request {
         MouseRequest::Scroll(delta) => {
             let cleared = renderer.clear_selection();
             Action::Tick(renderer.scroll(delta) || cleared)
@@ -2323,6 +2339,7 @@ async fn start_new_thread(
         "clear",
         state.model_verbosity(),
         state.claude_permission_mode_setting().wire(),
+        state.selected_effort(),
     );
     let previous_thread = state.thread_id.clone();
 
@@ -3042,6 +3059,7 @@ fn new_thread_params(
     session_start_source: &str,
     model_verbosity: &str,
     claude_permission_mode: &str,
+    effort: &str,
 ) -> Value {
     let mut params = json!({
         "cwd": cwd,
@@ -3060,6 +3078,11 @@ fn new_thread_params(
     }
     if !claude_permission_mode.is_empty() {
         params["claudePermissionMode"] = json!(claude_permission_mode);
+    }
+    // Without this the runtime starts on its own default effort and the reply
+    // overwrites the effort the first frame already showed.
+    if !effort.is_empty() {
+        params["effort"] = json!(effort);
     }
     params
 }
@@ -4114,6 +4137,7 @@ async fn start_or_resume_thread(
     model_verbosity: &str,
     claude: &ClaudeSessionSettings,
     effort: Option<&str>,
+    start_effort: &str,
 ) -> Result<Value> {
     if let Some(thread_id) = resume {
         let mut params = resume_thread_params(thread_id, claude);
@@ -4139,6 +4163,7 @@ async fn start_or_resume_thread(
                     "startup",
                     model_verbosity,
                     &claude.permission_mode,
+                    effort.unwrap_or(start_effort),
                 ),
             )
             .await
@@ -4730,6 +4755,7 @@ mod tests {
             "startup",
             "low",
             "default",
+            "high",
         );
 
         assert_eq!(params.pointer("/developerInstructions").and_then(Value::as_str), Some(DEVEZ_INSTRUCTIONS));
@@ -4877,12 +4903,13 @@ mod tests {
 
     #[test]
     fn new_thread_params_include_selected_response_length() {
-        let params = new_thread_params("C:\\repo", None, None, "startup", "low", "default");
+        let params = new_thread_params("C:\\repo", None, None, "startup", "low", "default", "max");
 
         assert_eq!(
             params.pointer("/config/model_verbosity").and_then(Value::as_str),
             Some("low")
         );
+        assert_eq!(params.get("effort").and_then(Value::as_str), Some("max"));
     }
 
     #[test]

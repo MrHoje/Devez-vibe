@@ -54,14 +54,16 @@ pub enum PermissionMode {
     FullAccess,
 }
 
-/// Claude Code's own permission modes. The composer badge cycles them the way
-/// Shift+Tab does in the CLI, and every turn carries the choice to the bridge.
+/// Claude Code's own permission modes, and every turn carries the choice to the
+/// bridge. Only `Auto` and `Plan` are selectable here — the badge toggles
+/// between the two — but the remaining variants stay so a value saved by an
+/// older build, or one the bridge reports back, still parses.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub enum ClaudePermissionMode {
-    #[default]
     Default,
     AcceptEdits,
     Plan,
+    #[default]
     Auto,
     BypassPermissions,
 }
@@ -404,15 +406,12 @@ impl ClaudePermissionMode {
         .find(|mode| mode.wire().eq_ignore_ascii_case(value))
     }
 
-    /// The CLI's cycle order, with bypass reached only where the settings allow
-    /// it — Claude Code rejects the mode outright when policy disables it.
-    fn next(self, bypass_allowed: bool) -> Self {
+    /// Only auto and plan are offered, so the badge toggles between them. A mode
+    /// left over from an older build lands on plan on its first press.
+    fn next(self) -> Self {
         match self {
-            Self::Default => Self::AcceptEdits,
-            Self::AcceptEdits => Self::Plan,
             Self::Plan => Self::Auto,
-            Self::Auto if bypass_allowed => Self::BypassPermissions,
-            Self::Auto | Self::BypassPermissions => Self::Default,
+            _ => Self::Plan,
         }
     }
 }
@@ -2816,10 +2815,8 @@ pub struct AppState {
     five_hour_percent: Option<u8>,
     weekly_percent: Option<u8>,
     fast_mode: bool,
-    /// Claude's permission mode for this thread, and whether the settings let it
-    /// reach `bypassPermissions` at all.
+    /// Claude's permission mode for this thread.
     claude_permission_mode: ClaudePermissionMode,
-    bypass_permissions_allowed: bool,
     side_parent: Option<SideParent>,
     last_assistant_markdown: Option<String>,
     composer_notice: Option<(String, Instant)>,
@@ -2935,7 +2932,6 @@ impl AppState {
         let context_window = models
             .get(selected_model)
             .and_then(|model| model.context_window);
-        let bypass_permissions_allowed = crate::claude::bypass_permissions_allowed(Path::new(&cwd));
 
         let mut state = Self {
             editor: Editor::default(),
@@ -2991,8 +2987,7 @@ impl AppState {
             five_hour_percent,
             weekly_percent,
             fast_mode: read_fast_mode(),
-            claude_permission_mode: read_claude_permission_mode(bypass_permissions_allowed),
-            bypass_permissions_allowed,
+            claude_permission_mode: read_claude_permission_mode(),
             side_parent: None,
             last_assistant_markdown: None,
             composer_notice: None,
@@ -3934,9 +3929,7 @@ impl AppState {
     /// The badge itself is the feedback — a notice under the composer would only
     /// flash away while the reading it duplicates stays on screen.
     pub fn cycle_claude_permission_mode(&mut self) -> ClaudePermissionMode {
-        self.claude_permission_mode = self
-            .claude_permission_mode
-            .next(self.bypass_permissions_allowed);
+        self.claude_permission_mode = self.claude_permission_mode.next();
         self.claude_permission_mode
     }
 
@@ -10408,17 +10401,15 @@ fn read_fast_mode() -> bool {
         .is_some_and(|config| parse_fast_mode(&config))
 }
 
-/// The permission mode the badge was last left on. A saved `bypassPermissions`
-/// that policy has since disabled falls back to `default` rather than opening a
-/// session in a mode Claude Code would reject.
-fn read_claude_permission_mode(bypass_allowed: bool) -> ClaudePermissionMode {
-    let mode = read_vibe_config_value(CLAUDE_PERMISSION_MODE_KEY)
+/// The permission mode the badge was last left on. Only auto and plan can be
+/// picked now, so anything else an older build saved opens on auto.
+fn read_claude_permission_mode() -> ClaudePermissionMode {
+    match read_vibe_config_value(CLAUDE_PERMISSION_MODE_KEY)
         .and_then(|value| ClaudePermissionMode::from_wire(&value))
-        .unwrap_or_default();
-    if mode == ClaudePermissionMode::BypassPermissions && !bypass_allowed {
-        return ClaudePermissionMode::Default;
+    {
+        Some(mode @ (ClaudePermissionMode::Auto | ClaudePermissionMode::Plan)) => mode,
+        _ => ClaudePermissionMode::Auto,
     }
-    mode
 }
 
 fn read_vibe_mode() -> VibeMode {
@@ -12114,7 +12105,7 @@ mod tests {
         });
         // A new session reads its starting mode from the settings on disk, so the
         // baseline is pinned here rather than left to whatever the machine saved.
-        state.claude_permission_mode = ClaudePermissionMode::Default;
+        state.claude_permission_mode = ClaudePermissionMode::Auto;
 
         state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         assert_eq!(state.editor.text(), " ");
@@ -12136,7 +12127,7 @@ mod tests {
         );
         assert_eq!(
             state.claude_permission_mode(),
-            Some(ClaudePermissionMode::Default),
+            Some(ClaudePermissionMode::Auto),
             "folding the plan is not a permission change"
         );
     }
@@ -15357,8 +15348,10 @@ mod tests {
 
     /// The badge walks Claude's modes in the CLI's own order, and stops short of
     /// a bypass the settings forbid — the CLI would reject that mode outright.
+    /// Only auto and plan are on offer, so the badge has to toggle between the
+    /// two and never reach the modes an older build could cycle into.
     #[test]
-    fn the_permission_badge_cycles_the_claude_modes() {
+    fn the_permission_badge_toggles_auto_and_plan() {
         let mut state = AppState::new(
             "claude:thread".to_owned(),
             "cwd".to_owned(),
@@ -15367,14 +15360,11 @@ mod tests {
             "claude:sonnet",
             Some("high"),
         );
-        state.bypass_permissions_allowed = false;
-        // The mode now opens on the saved default, so the walk starts from a
-        // known point rather than from whatever this machine last picked.
-        state.claude_permission_mode = ClaudePermissionMode::Default;
+        state.claude_permission_mode = ClaudePermissionMode::Auto;
 
         assert_eq!(
             state.claude_permission_mode(),
-            Some(ClaudePermissionMode::Default)
+            Some(ClaudePermissionMode::Auto)
         );
         let walked = std::iter::repeat_with(|| state.cycle_claude_permission_mode())
             .take(4)
@@ -15382,18 +15372,12 @@ mod tests {
         assert_eq!(
             walked,
             [
-                ClaudePermissionMode::AcceptEdits,
                 ClaudePermissionMode::Plan,
                 ClaudePermissionMode::Auto,
-                ClaudePermissionMode::Default,
+                ClaudePermissionMode::Plan,
+                ClaudePermissionMode::Auto,
             ]
         );
-
-        state.bypass_permissions_allowed = true;
-        let walked = std::iter::repeat_with(|| state.cycle_claude_permission_mode())
-            .take(4)
-            .collect::<Vec<_>>();
-        assert_eq!(walked[3], ClaudePermissionMode::BypassPermissions);
     }
 
     /// Shift+Tab is how the CLI cycles these, so it cycles them here too — and
@@ -15408,17 +15392,17 @@ mod tests {
             "claude:sonnet",
             Some("high"),
         );
-        state.claude_permission_mode = ClaudePermissionMode::Default;
+        state.claude_permission_mode = ClaudePermissionMode::Auto;
 
         let action = state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
 
         assert!(matches!(
             action,
-            Action::SetClaudePermissionMode(ClaudePermissionMode::AcceptEdits)
+            Action::SetClaudePermissionMode(ClaudePermissionMode::Plan)
         ));
         assert_eq!(
             state.claude_permission_mode(),
-            Some(ClaudePermissionMode::AcceptEdits)
+            Some(ClaudePermissionMode::Plan)
         );
         assert!(state.composer_notice.is_none());
     }
@@ -15435,7 +15419,7 @@ mod tests {
             "claude:sonnet",
             Some("high"),
         );
-        state.claude_permission_mode = ClaudePermissionMode::Default;
+        state.claude_permission_mode = ClaudePermissionMode::Auto;
         state.busy = true;
         state.editor.set_text("queued prompt");
 
@@ -15443,7 +15427,7 @@ mod tests {
 
         assert!(matches!(
             action,
-            Action::SetClaudePermissionMode(ClaudePermissionMode::AcceptEdits)
+            Action::SetClaudePermissionMode(ClaudePermissionMode::Plan)
         ));
         assert!(state.queued_prompts.is_empty());
     }
