@@ -19,11 +19,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build. The welcome card no longer prints them, so
 /// nothing reads this today; rewrite it each release for the changelog.
 #[allow(dead_code)]
-pub const RELEASE_NOTES: &[&str] = &[
-    "내용 없는 짧은 진행 문구를 숨겨 대화 흐름을 더 자연스럽게 만들었습니다.",
-    "사용자 입력 선택에서 테두리와 본문을 정확히 구분해 표시합니다.",
-    "선택 화면의 강조 표시가 패널 테두리를 침범하지 않도록 개선했습니다.",
-];
+pub const RELEASE_NOTES: &[&str] =
+    &["Claude 압축 진행률을 실제 동작과 맞추고 Codex의 가짜 퍼센트 표시를 제거했습니다."];
 
 /// Latest published version, only when it is newer than the running build.
 pub async fn check_for_update() -> Option<String> {

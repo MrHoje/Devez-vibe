@@ -8127,11 +8127,17 @@ impl AppState {
                 return Some("X Interrupted".to_owned());
             }
             let elapsed = started.elapsed();
-            return Some(format!(
-                "Compacting.. {}% ({})",
-                compaction_percent(elapsed),
-                format_elapsed(elapsed.as_secs())
-            ));
+            let elapsed_label = format_elapsed(elapsed.as_secs());
+            return if self.selected_model_name().starts_with("claude:") {
+                Some(format!(
+                    "Compacting.. {}% ({elapsed_label})",
+                    claude_compaction_percent(elapsed)
+                ))
+            } else {
+                // Codex only reports the contextCompaction item's lifecycle. It
+                // exposes no numeric progress, so do not invent one for its wait.
+                Some(format!("Compacting.. ({elapsed_label})"))
+            };
         }
         if self.busy {
             let elapsed = self
@@ -10139,14 +10145,13 @@ fn format_elapsed(seconds: u64) -> String {
     }
 }
 
-/// How quickly the compaction bar fills, in seconds. Compaction reports no
-/// progress of its own, so the reading eases off the clock: fast at first, then
-/// slower, and it stops short of full because only the boundary means done.
-const COMPACTION_PACE_SECONDS: f32 = 8.5;
+/// Claude Code's own bar is an elapsed-time estimate, not provider progress. Keep
+/// the same 90-second curve and 95% ceiling; only the compact boundary means done.
+const CLAUDE_COMPACTION_PACE_SECONDS: f32 = 90.0;
 
-fn compaction_percent(elapsed: Duration) -> u8 {
-    let progress = 1.0 - (-elapsed.as_secs_f32() / COMPACTION_PACE_SECONDS).exp();
-    (progress * 100.0).round().clamp(0.0, 99.0) as u8
+fn claude_compaction_percent(elapsed: Duration) -> u8 {
+    let progress = 1.0 - (-elapsed.as_secs_f32() / CLAUDE_COMPACTION_PACE_SECONDS).exp();
+    (progress * 100.0).round().clamp(0.0, 95.0) as u8
 }
 
 fn format_duration(duration_ms: u64) -> String {
@@ -13446,13 +13451,13 @@ mod tests {
     /// `/compact` has no assistant output of its own, so the activity row is the
     /// only place the wait is visible: it spins until the boundary arrives.
     #[test]
-    fn compaction_runs_the_activity_spinner_until_the_boundary() {
+    fn codex_compaction_uses_elapsed_time_until_the_boundary() {
         let mut state = test_state();
 
         state.begin_compaction();
         state.compacting_started_at = Some(Instant::now() - Duration::from_secs(4));
 
-        assert_eq!(state.activity().as_deref(), Some("Compacting.. 38% (4s)"));
+        assert_eq!(state.activity().as_deref(), Some("Compacting.. (4s)"));
         assert!(state.render_tick().redraw, "the spinner keeps animating");
         assert!(state.host_turn_busy(), "the host tab spins too");
 
@@ -13460,6 +13465,26 @@ mod tests {
 
         assert!(!state.compacting());
         assert_eq!(state.activity(), None);
+    }
+
+    #[test]
+    fn claude_compaction_matches_claude_codes_slow_capped_estimate() {
+        let mut state = test_state();
+        state.models = vec![test_model("claude:sonnet", "Claude Sonnet", true)];
+        state.selected_model = 0;
+        state.begin_compaction();
+
+        state.compacting_started_at = Some(Instant::now() - Duration::from_secs(90));
+        assert_eq!(
+            state.activity().as_deref(),
+            Some("Compacting.. 63% (1m 30s)")
+        );
+
+        state.compacting_started_at = Some(Instant::now() - Duration::from_secs(600));
+        assert_eq!(
+            state.activity().as_deref(),
+            Some("Compacting.. 95% (10m 0s)")
+        );
     }
 
     /// A compaction that runs as a turn must not fall back to the `Working` label
