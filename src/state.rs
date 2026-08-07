@@ -9379,7 +9379,7 @@ fn commit_user_input_answers(
     }
     let body = answered
         .into_iter()
-        .map(|(question, answer)| format!("{}\n  → {answer}", question.question.trim()))
+        .map(|(question, answer)| format!("{}\n↳ {answer}", question.question.trim()))
         .collect::<Vec<_>>()
         .join("\n");
     state.commit_welcome_card();
@@ -11044,7 +11044,7 @@ mod tests {
         );
         let sent = state.committed.last().expect("sent answer history");
         assert!(matches!(sent.kind, BlockKind::User));
-        assert_eq!(sent.body, "어느 것인가요?\n  → 직접 보낸 답");
+        assert_eq!(sent.body, "어느 것인가요?\n↳ 직접 보낸 답");
     }
 
     #[test]
@@ -11084,7 +11084,7 @@ mod tests {
         let sent = state.committed.last().expect("sent answer history");
         assert_eq!(
             sent.body,
-            "첫 질문인가요?\n  → 첫 답\n둘째 질문인가요?\n  → 둘째 답"
+            "첫 질문인가요?\n↳ 첫 답\n둘째 질문인가요?\n↳ 둘째 답"
         );
     }
 
