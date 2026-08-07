@@ -1,6 +1,6 @@
 [package]
 name = "devez-vibe"
-version = "1.2.21"
+version = "1.2.22"
 edition = "2024"
 license = "MIT"
 description = "A stable terminal client for Codex and Claude Agent SDK"

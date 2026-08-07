@@ -3530,6 +3530,20 @@ impl AppState {
         self.pending.is_some()
     }
 
+    /// Free-text question answers need the same short input delay as the main
+    /// composer. Windows Terminal clears its IME preedit just after delivering
+    /// the committed Hangul character; repainting before that clear erases the
+    /// character from the screen even though it reached the editor.
+    pub fn buffers_pending_text_input(&self) -> bool {
+        matches!(
+            self.pending,
+            Some(PendingInteraction::UserInput {
+                text_mode: true,
+                ..
+            })
+        )
+    }
+
     pub fn update_skills(&mut self, response: &Value) {
         self.skills = parse_skill_bindings(response);
         self.rebuild_completion_catalog();
@@ -7925,7 +7939,7 @@ impl AppState {
                     style: OverlayStyle::Question,
                     input: text_mode.then_some(editor),
                     input_label: "Answer",
-                    input_placeholder: "여기에 직접 입력…",
+                    input_placeholder: "",
                 })
             }
         }
@@ -10874,6 +10888,7 @@ mod tests {
 
         let overlay = state.overlay_view().expect("overlay");
         assert_eq!(overlay.input.map(Editor::text).as_deref(), Some("가"));
+        assert_eq!(overlay.input_placeholder, "");
         // The answer is typed among the options, so they stay on screen and the
         // row being typed on is the one marked.
         assert!(

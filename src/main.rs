@@ -3810,7 +3810,13 @@ fn attach_pasted_local_image(state: &mut AppState, text: &str) -> bool {
 }
 
 fn apply_composer_text(state: &mut AppState, text: BufferedText) {
-    if !text.pasted {
+    if state.buffers_pending_text_input() {
+        if text.pasted {
+            state.handle_paste(&text.text);
+        } else {
+            state.handle_buffered_text(&text.text);
+        }
+    } else if !text.pasted {
         state.handle_buffered_text(&text.text);
     } else if !attach_pasted_local_image(state, &text.text) {
         state.handle_paste(&text.text);
@@ -3871,7 +3877,9 @@ fn observe_composer_key(
     if key.kind == KeyEventKind::Release {
         return Action::Tick(false);
     }
-    if state.has_pending_interaction() {
+    if state.buffers_pending_text_input() {
+        apply_composer_inputs(state, buffer.observe(key, now))
+    } else if state.has_pending_interaction() {
         state.handle_key(key)
     } else {
         arm_verified_collapsed_paste(state, buffer, &key, now);
@@ -3914,7 +3922,9 @@ fn observe_composer_key_with_scroll(
     if key.kind == KeyEventKind::Release {
         return Action::Tick(false);
     }
-    if state.has_pending_interaction() {
+    if state.buffers_pending_text_input() {
+        apply_composer_inputs_with_scroll(state, renderer, buffer.observe(key, now))
+    } else if state.has_pending_interaction() {
         state.handle_key(key)
     } else {
         arm_verified_collapsed_paste(state, buffer, &key, now);
@@ -5157,7 +5167,7 @@ mod tests {
     }
 
     #[test]
-    fn an_ime_key_release_does_not_repaint_over_an_inline_answer() {
+    fn an_ime_commit_waits_until_terminal_cleanup_before_repainting_an_inline_answer() {
         let mut state = starting_state();
         state.begin_server_request(
             json!(1),
@@ -5196,12 +5206,13 @@ mod tests {
             Some("")
         );
 
+        let committed_at = Instant::now();
         assert!(matches!(
             observe_composer_key(
                 &mut state,
                 &mut buffer,
                 press(KeyCode::Char('테'), KeyModifiers::NONE),
-                Instant::now(),
+                committed_at,
             ),
             Action::None
         ));
@@ -5212,8 +5223,74 @@ mod tests {
                 .and_then(|overlay| overlay.input)
                 .map(Editor::text)
                 .as_deref(),
+            Some("")
+        );
+        assert!(buffer.is_buffering());
+        assert!(!flush_composer_paste(
+            &mut state,
+            &mut buffer,
+            committed_at + Duration::from_millis(1),
+        ));
+        assert!(flush_composer_paste(
+            &mut state,
+            &mut buffer,
+            committed_at + Duration::from_millis(30),
+        ));
+        assert_eq!(
+            state
+                .view()
+                .overlay
+                .and_then(|overlay| overlay.input)
+                .map(Editor::text)
+                .as_deref(),
             Some("테")
         );
+    }
+
+    #[test]
+    fn enter_submits_a_hangul_answer_committed_in_the_same_terminal_batch() {
+        let mut state = starting_state();
+        state.begin_server_request(
+            json!(1),
+            "item/tool/requestUserInput",
+            &json!({
+                "questions": [{
+                    "id": "q1",
+                    "question": "어느 것인가요?",
+                    "options": [
+                        { "label": "첫째", "description": "설명" },
+                        { "label": "둘째", "description": "설명" },
+                        { "label": "셋째", "description": "설명" }
+                    ]
+                }]
+            }),
+        );
+        state.handle_key(press(KeyCode::Char('4'), KeyModifiers::NONE));
+        let mut buffer = ComposerPasteBuffer::new();
+        let committed_at = Instant::now();
+
+        assert!(matches!(
+            observe_composer_key(
+                &mut state,
+                &mut buffer,
+                press(KeyCode::Char('답'), KeyModifiers::NONE),
+                committed_at,
+            ),
+            Action::None
+        ));
+        let action = observe_composer_key(
+            &mut state,
+            &mut buffer,
+            press(KeyCode::Enter, KeyModifiers::NONE),
+            committed_at,
+        );
+
+        assert!(matches!(
+            action,
+            Action::RpcResponse { ref result, .. } if result.to_string().contains("답")
+        ));
+        let committed = state.drain_committed();
+        assert_eq!(committed.last().map(|block| block.body.as_str()), Some("답"));
     }
 
     /// A Windows clipboard holds CRLF, while the keys the terminal synthesizes
