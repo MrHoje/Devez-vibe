@@ -33,7 +33,8 @@ use arboard::{Clipboard, ImageData};
 use clap::Parser;
 use completion::collect_workspace_entries;
 use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use editor::Editor;
 use futures_util::StreamExt;
@@ -3864,6 +3865,12 @@ fn observe_composer_key(
     key: KeyEvent,
     now: Instant,
 ) -> Action {
+    // Windows reports key-up records while its IME still owns the visible
+    // preedit. They change no editor state, and repainting for one replaces the
+    // preedit with our placeholder before the composed syllable can commit.
+    if key.kind == KeyEventKind::Release {
+        return Action::Tick(false);
+    }
     if state.has_pending_interaction() {
         state.handle_key(key)
     } else {
@@ -3904,6 +3911,9 @@ fn observe_composer_key_with_scroll(
     key: KeyEvent,
     now: Instant,
 ) -> Action {
+    if key.kind == KeyEventKind::Release {
+        return Action::Tick(false);
+    }
     if state.has_pending_interaction() {
         state.handle_key(key)
     } else {
@@ -5144,6 +5154,66 @@ mod tests {
 
         assert_eq!(state.editor.paste_summary_lines(), None);
         assert_eq!(state.editor.text(), pasted);
+    }
+
+    #[test]
+    fn an_ime_key_release_does_not_repaint_over_an_inline_answer() {
+        let mut state = starting_state();
+        state.begin_server_request(
+            json!(1),
+            "item/tool/requestUserInput",
+            &json!({
+                "questions": [{
+                    "id": "q1",
+                    "question": "어느 것인가요?",
+                    "options": [
+                        { "label": "첫째", "description": "설명" },
+                        { "label": "둘째", "description": "설명" },
+                        { "label": "셋째", "description": "설명" }
+                    ]
+                }]
+            }),
+        );
+        state.handle_key(press(KeyCode::Char('4'), KeyModifiers::NONE));
+        let mut buffer = ComposerPasteBuffer::new();
+
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('ㅌ'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        assert!(matches!(
+            observe_composer_key(&mut state, &mut buffer, release, Instant::now()),
+            Action::Tick(false)
+        ));
+        assert_eq!(
+            state
+                .view()
+                .overlay
+                .and_then(|overlay| overlay.input)
+                .map(Editor::text)
+                .as_deref(),
+            Some("")
+        );
+
+        assert!(matches!(
+            observe_composer_key(
+                &mut state,
+                &mut buffer,
+                press(KeyCode::Char('테'), KeyModifiers::NONE),
+                Instant::now(),
+            ),
+            Action::None
+        ));
+        assert_eq!(
+            state
+                .view()
+                .overlay
+                .and_then(|overlay| overlay.input)
+                .map(Editor::text)
+                .as_deref(),
+            Some("테")
+        );
     }
 
     /// A Windows clipboard holds CRLF, while the keys the terminal synthesizes
