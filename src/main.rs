@@ -5353,7 +5353,7 @@ mod tests {
         let committed = state.drain_committed();
         assert_eq!(
             committed.last().map(|block| block.body.as_str()),
-            Some("어느 것인가요?\n↳ 답")
+            Some("어느 것인가요:\n↳ 답")
         );
     }
 

@@ -9379,7 +9379,13 @@ fn commit_user_input_answers(
     }
     let body = answered
         .into_iter()
-        .map(|(question, answer)| format!("{}\n↳ {answer}", question.question.trim()))
+        .map(|(question, answer)| {
+            let question = question
+                .question
+                .trim()
+                .trim_end_matches(|ch: char| matches!(ch, ':' | '：' | '?' | '？'));
+            format!("{question}:\n↳ {answer}")
+        })
         .collect::<Vec<_>>()
         .join("\n");
     state.commit_welcome_card();
@@ -11044,7 +11050,7 @@ mod tests {
         );
         let sent = state.committed.last().expect("sent answer history");
         assert!(matches!(sent.kind, BlockKind::User));
-        assert_eq!(sent.body, "어느 것인가요?\n↳ 직접 보낸 답");
+        assert_eq!(sent.body, "어느 것인가요:\n↳ 직접 보낸 답");
     }
 
     #[test]
@@ -11062,7 +11068,7 @@ mod tests {
                     },
                     {
                         "id": "q2",
-                        "question": "둘째 질문인가요?",
+                        "question": "둘째 질문:",
                         "options": [
                             { "label": "아니오", "description": "설명" },
                             { "label": "둘째 답", "description": "설명" }
@@ -11084,7 +11090,7 @@ mod tests {
         let sent = state.committed.last().expect("sent answer history");
         assert_eq!(
             sent.body,
-            "첫 질문인가요?\n↳ 첫 답\n둘째 질문인가요?\n↳ 둘째 답"
+            "첫 질문인가요:\n↳ 첫 답\n둘째 질문:\n↳ 둘째 답"
         );
     }
 
