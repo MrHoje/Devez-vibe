@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { readdir, readFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import {
   deleteSession,
@@ -1569,6 +1572,75 @@ function historyTurns(messages) {
   return historyState(messages).turns;
 }
 
+// A transcript lives in a folder encoded from the cwd string, so two spellings of
+// the same path (Windows differs only in case) resolve to different folders and a
+// session recorded under one spelling is invisible to the other. Remember the
+// spelling the transcript was written with, keyed by session id.
+const transcriptCwds = new Map();
+
+function claudeProjectsDir() {
+  return join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "projects");
+}
+
+/** Read the cwd a transcript records. Only the head is scanned: the opening
+ * records carry no cwd, but a real turn shows up long before the limit. */
+async function readTranscriptCwd(path, limit = 200) {
+  const stream = createReadStream(path, { encoding: "utf8" });
+  try {
+    const reader = createInterface({ input: stream, crlfDelay: Infinity });
+    try {
+      let seen = 0;
+      for await (const line of reader) {
+        if (++seen > limit) break;
+        let cwd;
+        try {
+          cwd = JSON.parse(line)?.cwd;
+        } catch {
+          continue;
+        }
+        if (typeof cwd === "string" && cwd) return cwd;
+      }
+      return null;
+    } finally {
+      reader.close();
+    }
+  } finally {
+    stream.destroy();
+  }
+}
+
+/** Locate the transcript of `id` under any project folder and report the cwd it
+ * records, which is the spelling the SDK needs to find it again. */
+async function transcriptCwd(id) {
+  if (transcriptCwds.has(id)) return transcriptCwds.get(id);
+  let entries;
+  try {
+    entries = await readdir(claudeProjectsDir(), { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    let cwd;
+    try {
+      cwd = await readTranscriptCwd(join(claudeProjectsDir(), entry.name, `${id}.jsonl`));
+    } catch {
+      continue;
+    }
+    if (cwd) {
+      transcriptCwds.set(id, cwd);
+      return cwd;
+    }
+  }
+  return null;
+}
+
+/** The cwd to read `id`'s transcript with: the one the transcript itself records,
+ * falling back to the host's when no transcript is on disk. */
+async function readableCwd(id, cwd) {
+  return await transcriptCwd(id) || cwd;
+}
+
 async function dispatch(method, params = {}) {
   if (method === "model/list") return loadModelCatalog(params);
   if (method === "session/permissionMode") {
@@ -1608,15 +1680,19 @@ async function dispatch(method, params = {}) {
         tokenUsage: historyTokenUsage(messages, existing.models, existing.model),
       };
     }
-    const info = await getSessionInfo(id, { dir: params.cwd });
-    if (!info) throw new Error(`Claude 세션을 찾을 수 없습니다: ${id}`);
-    const messages = await getSessionMessages(id, { dir: params.cwd, includeSystemMessages: true });
+    const dir = await readableCwd(id, params.cwd);
+    // The transcript itself decides whether there is anything to resume:
+    // getSessionInfo only sees sessions the CLI indexed, and a bridge-run session
+    // whose transcript is intact can be missing from that index.
+    const messages = await getSessionMessages(id, { dir, includeSystemMessages: true });
+    if (!messages.length) throw new Error(`Claude 세션을 찾을 수 없습니다: ${id}`);
+    const info = await getSessionInfo(id, { dir });
     const lastModel = [...messages].reverse().find((message) => message.type === "assistant")?.message?.model;
     // The transcript's own model outranks the host's fallback, which is only what
     // a new session would have opened on.
     const { session, account, usage } = await createSession({
       ...params,
-      cwd: info.cwd || params.cwd,
+      cwd: info?.cwd || dir,
       model: params.model || lastModel || params.fallbackModel,
       effort: params.effort || params.fallbackEffort,
     }, id);
@@ -1657,7 +1733,7 @@ async function dispatch(method, params = {}) {
   }
   if (method === "session/history") {
     const id = liveSessionId(params.sessionId);
-    const messages = await getSessionMessages(id, { dir: params.cwd, includeSystemMessages: true });
+    const messages = await getSessionMessages(id, { dir: await readableCwd(id, params.cwd), includeSystemMessages: true });
     return { data: historyTurns(messages), nextCursor: null };
   }
   if (method === "session/prompt") return startPrompt(params);
@@ -1683,7 +1759,7 @@ async function dispatch(method, params = {}) {
   }
   if (method === "session/fork") {
     const source = liveSessionId(params.sessionId);
-    const forked = await forkSession(source, { dir: params.cwd });
+    const forked = await forkSession(source, { dir: await readableCwd(source, params.cwd) });
     const id = forked.sessionId || forked;
     const { session, account, usage } = await createSession(params, id);
     return {
