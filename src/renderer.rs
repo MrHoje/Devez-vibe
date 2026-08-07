@@ -1410,15 +1410,6 @@ impl Renderer {
     }
 
     pub fn render_animation(&mut self, view: AnimationView<'_>) -> Result<bool> {
-        // Terminals that ignore synchronized updates expose every MoveTo while
-        // the hardware cursor is visible. Hold the current frame on pure
-        // animation ticks; semantic updates still redraw normally.
-        if self.mode == RenderMode::Fullscreen
-            && self.cursor_shown
-            && self.painted_frame.is_some()
-        {
-            return Ok(true);
-        }
         if self.mode != RenderMode::Fullscreen
             || self.last_width == 0
             || self.previous_lines.is_empty()
@@ -1524,6 +1515,10 @@ impl Renderer {
         }
 
         queue!(self.out, Print("\x1b[?2026h"))?;
+        let restore_cursor = self.cursor_shown;
+        if restore_cursor {
+            queue!(self.out, Hide)?;
+        }
         let mut result = Ok(());
         for (screen_row, previous, current, repaint_plan_row) in &rows {
             // A changed plan step can shorten or restyle wide Korean text. Clear
@@ -1536,18 +1531,28 @@ impl Renderer {
                 break;
             }
         }
-        if let Err(error) = result {
-            queue!(self.out, Print("\x1b[?2026l"))?;
-            return Err(error);
-        }
-
-        if let Some(painted) = self.painted_frame.as_mut() {
+        if result.is_ok()
+            && let Some(painted) = self.painted_frame.as_mut()
+        {
             for (screen_row, _, current, _) in rows {
                 let start = screen_row * width;
                 painted.cells[start..start + width].clone_from_slice(&current.cells);
             }
         }
+        queue!(
+            self.out,
+            MoveTo(
+                self.cursor_col
+                    .min(width.saturating_sub(2))
+                    .min(u16::MAX as usize) as u16,
+                self.cursor_line.min(u16::MAX as usize) as u16
+            )
+        )?;
+        if restore_cursor {
+            queue!(self.out, Show)?;
+        }
         queue!(self.out, Print("\x1b[?2026l"))?;
+        result?;
         self.painted_hovered_tool = self.hovered_tool;
         self.painted_hovered_pick = self.hovered_pick.clone();
         self.out.flush()?;
@@ -1641,6 +1646,7 @@ impl Renderer {
             &screen,
             plan_rows,
         );
+        let plan_geometry_changed = self.animation_plan_rows != plan_rows;
         self.paint_screen(
             &screen,
             cursor_line,
@@ -1649,6 +1655,7 @@ impl Renderer {
             width,
             scroll_to_bottom_overlay.as_ref().map(|(row, control)| (*row, control)),
             &full_repaint_rows,
+            plan_geometry_changed,
         )?;
         self.previous_lines = screen;
         self.cursor_line = cursor_line;
@@ -1773,6 +1780,7 @@ impl Renderer {
         total_width: u16,
         scroll_to_bottom_overlay: Option<(usize, &PaintLine)>,
         full_repaint_rows: &[usize],
+        repaint_full_frame: bool,
     ) -> Result<()> {
         let selection = self
             .selection
@@ -1800,6 +1808,7 @@ impl Renderer {
             self.painted_frame.as_ref(),
             &frame,
             full_repaint_rows,
+            repaint_full_frame,
             Some((
                 cursor_col
                     .min(usize::from(total_width).saturating_sub(2))
@@ -2350,26 +2359,58 @@ fn emit_synchronized_frame_diff_with_full_rows(
     previous: Option<&CellFrame>,
     current: &CellFrame,
     full_rows: &[usize],
+    repaint_full_frame: bool,
     cursor: Option<(u16, u16, bool)>,
     cursor_shown: bool,
 ) -> Result<()> {
     queue!(out, Print("\x1b[?2026h"))?;
-    let cursor_leaves_its_row = cursor.is_some_and(|(_, row, show)| {
+    // Hide only for a semantic plan repaint. Spinner frames never reach this
+    // path, so the cursor is restored once rather than toggled every 80ms.
+    let repainting_plan = repaint_full_frame || !full_rows.is_empty();
+    let cursor_moves_outside_composer = cursor.is_some_and(|(_, row, show)| {
         show
             && cursor_shown
-            && (!full_rows.is_empty()
-                || frame_changed_outside_row(previous, current, usize::from(row)))
+            && frame_changed_outside_row(previous, current, usize::from(row))
     });
-    // Composer-only edits naturally advance the cursor and need no toggle. A
-    // semantic update elsewhere hides it for that single synchronized write so
-    // terminals without mode 2026 support cannot expose intermediate positions.
     let hide_cursor = cursor_shown
-        && cursor.is_some_and(|(_, _, show)| !show || cursor_leaves_its_row);
+        && cursor.is_some_and(|(_, _, show)| {
+            !show || repainting_plan || cursor_moves_outside_composer
+        });
     if hide_cursor {
         queue!(out, Hide)?;
     }
-    let previous = if full_rows.is_empty() { previous } else { None };
-    let result = emit_frame_diff(out, previous, current);
+    let mut result = Ok(());
+    if repaint_full_frame {
+        result = emit_frame_diff(out, None, current);
+    } else {
+        let mut diff_previous = previous.cloned();
+        for &row in full_rows {
+            if row >= current.height {
+                continue;
+            }
+            let row_frame = CellFrame {
+                width: current.width,
+                height: 1,
+                cells: current.cells[row * current.width..(row + 1) * current.width].to_vec(),
+            };
+            if let Err(error) = emit_frame_diff_at(out, None, &row_frame, row) {
+                result = Err(error);
+                break;
+            }
+            if let Some(previous) = diff_previous
+                .as_mut()
+                .filter(|previous| {
+                    previous.width == current.width && previous.height == current.height
+                })
+            {
+                previous.cells[row * current.width..(row + 1) * current.width]
+                    .clone_from_slice(&row_frame.cells);
+            }
+        }
+        if result.is_ok() {
+            result = emit_frame_diff(out, diff_previous.as_ref().or(previous), current);
+        }
+    }
     if let Some((column, row, show)) = cursor {
         queue!(out, MoveTo(column, row))?;
         if show && (!cursor_shown || hide_cursor) {
@@ -8429,6 +8470,7 @@ mod tests {
             Some(&previous),
             &current,
             &[],
+            false,
             None,
             true,
         )
@@ -8550,6 +8592,7 @@ mod tests {
                 Some(&previous),
                 &current,
                 &[],
+                false,
                 None,
                 false,
             )
@@ -9256,6 +9299,7 @@ mod tests {
             Some(&previous),
             &current,
             &[0],
+            true,
             Some((0, 1, true)),
             false,
         )
@@ -9273,6 +9317,34 @@ mod tests {
     }
 
     #[test]
+    fn plan_state_update_repaints_only_its_changed_row() {
+        let mut previous = CellFrame::new(16, 3);
+        previous.write(0, 0, "이전 작업", CellStyle::plain());
+        previous.write(0, 2, "composer", CellStyle::plain());
+        let mut current = previous.clone();
+        current.write(0, 0, "새 작업", CellStyle::plain());
+
+        let mut output = Vec::new();
+        emit_synchronized_frame_diff_with_full_rows(
+            &mut output,
+            Some(&previous),
+            &current,
+            &[0],
+            false,
+            Some((0, 2, true)),
+            true,
+        )
+        .expect("plan state update emits");
+
+        let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
+        assert!(output.contains("새 작업"));
+        assert_eq!(output.matches("새 작업").count(), 1);
+        assert!(!output.contains("composer"));
+        assert_eq!(output.matches("\x1b[?25l").count(), 1);
+        assert_eq!(output.matches("\x1b[?25h").count(), 1);
+    }
+
+    #[test]
     fn a_visible_cursor_is_not_toggled_between_frames() {
         let previous = CellFrame::new(8, 2);
         let mut current = previous.clone();
@@ -9284,6 +9356,7 @@ mod tests {
             Some(&previous),
             &current,
             &[],
+            false,
             Some((0, 1, true)),
             true,
         )
@@ -9298,7 +9371,7 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_row_update_hides_and_restores_the_visible_cursor_once() {
+    fn a_remote_row_update_protects_and_restores_the_visible_cursor() {
         let previous = CellFrame::new(8, 2);
         let mut current = previous.clone();
         current.write(0, 0, "x", CellStyle::plain());
@@ -9309,10 +9382,11 @@ mod tests {
             Some(&previous),
             &current,
             &[],
+            false,
             Some((0, 1, true)),
             true,
         )
-        .expect("remote row update emits");
+        .expect("remote frame emits");
 
         let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
         assert_eq!(output.matches("\x1b[?25l").count(), 1);
@@ -9321,23 +9395,13 @@ mod tests {
     }
 
     #[test]
-    fn a_visible_fullscreen_cursor_holds_pure_animation_frames() {
-        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
-        renderer.painted_frame = Some(CellFrame::new(8, 2));
+    fn a_remote_row_change_is_detected_outside_the_cursor_row() {
+        let previous = CellFrame::new(8, 2);
+        let mut current = previous.clone();
+        current.write(0, 0, "x", CellStyle::plain());
 
-        assert!(
-            renderer
-                .render_animation(AnimationView {
-                    activity: Some("Working..".to_owned()),
-                    activity_model: None,
-                    activity_phase: 0.5,
-                    plan_summary: None,
-                    plan_active: true,
-                    plan_shimmer_phase: None,
-                    composer_mode: None,
-                })
-                .expect("animation tick is held")
-        );
+        assert!(frame_changed_outside_row(Some(&previous), &current, 1));
+        assert!(!frame_changed_outside_row(Some(&previous), &current, 0));
     }
 
     #[test]

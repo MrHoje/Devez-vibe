@@ -20,9 +20,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// nothing reads this today; rewrite it each release for the changelog.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "전체 화면의 입력 커서를 안정적으로 유지하면서 불필요한 애니메이션 갱신을 줄였습니다.",
-    "원격 화면 변경 때만 커서를 잠시 숨겨 중간 위치 노출을 막습니다.",
-    "표시 방식 전환 시 불필요한 안내 메시지를 표시하지 않습니다.",
+    "선택이나 승인 요청에서는 필요한 선택지와 판단 정보를 생략하지 않고 안내합니다.",
+    "작업 완료 보고는 실제 수행한 동작을 자연스럽게 표시합니다.",
+    "작업 단계 갱신과 애니메이션 중에도 전체 화면 커서를 안정적으로 유지합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

@@ -149,6 +149,19 @@ macro_rules! language_notice {
     };
 }
 
+/// The length caps are what make the presets useful, and they are also what
+/// truncated the one answer that must stay whole — the one asking the user to
+/// pick. A cap the turn repeats beats a rule it does not, so the exception is
+/// restated beside the cap instead of only in the system prompt.
+macro_rules! choice_notice {
+    () => {
+        "사용자에게 선택이나 승인을 요청하는 답변에는 이 분량 제한을 적용하지 않는다. \
+         선택지와 각각의 결과, 판단에 필요한 사실을 빠뜨리지 않고 적고, \
+         분량을 맞추려고 선택지를 줄이거나 문장을 도중에 끊지 않는다. \
+         마지막 줄에서 무엇을 선택하면 되는지 한 문장으로 묻는다."
+    };
+}
+
 impl VibeMode {
     pub const fn config_value(self) -> &'static str { match self { Self::Vibe => "vibe", Self::SuperVibe => "super_vibe", Self::Normal => "normal" } }
     pub const fn label(self) -> &'static str {
@@ -176,6 +189,8 @@ impl VibeMode {
             Self::Vibe => concat!(
                 "현재 응답 모드: Vibe. 최종 답변은 불릿 세 개 이내로 쓴다. ",
                 "결론부터 쓰고, 코드 변경은 파일 경로와 핵심 코드만 보여준다. ",
+                choice_notice!(),
+                " ",
                 language_notice!(),
             ),
             Self::SuperVibe => concat!(
@@ -183,6 +198,8 @@ impl VibeMode {
                 "파일 경로, 코드 블록, 함수·클래스·변수·설정 키 이름, 빌드나 테스트 명령을 넣지 않는다. ",
                 "무엇을 어떻게 바꿨는지 일상 언어로만 설명하고, 배경 설명과 원인 해설은 사용자가 물을 때만 덧붙인다. ",
                 "사용자가 코드나 경로를 직접 요청한 경우에만 예외로 보여준다. ",
+                choice_notice!(),
+                " ",
                 language_notice!(),
             ),
             Self::Normal => concat!(
