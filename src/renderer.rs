@@ -433,10 +433,7 @@ fn enter_fullscreen(out: &mut impl Write) -> std::io::Result<()> {
     // Mouse capture is fullscreen-only: it takes drag selection away from the
     // terminal, which is the point here but would be a loss inline, where the
     // transcript is ordinary scrollback the terminal knows how to select.
-    // Fullscreen paints its own stable composer cursor. Hide the terminal cursor
-    // as the alternate screen opens so later row diffs cannot expose their
-    // intermediate MoveTo positions around the Working or plan rows.
-    execute!(out, EnterAlternateScreen, Print("\x1b[?1007s"), Hide)?;
+    execute!(out, EnterAlternateScreen, Print("\x1b[?1007s"))?;
     disable_alternate_scroll(out)
 }
 
@@ -453,7 +450,7 @@ fn leave_fullscreen(out: &mut impl Write) -> std::io::Result<()> {
 impl TerminalSession {
     pub fn enter(mode: RenderMode) -> Result<Self> {
         enable_raw_mode()?;
-        execute!(stdout(), EnableBracketedPaste)?;
+        execute!(stdout(), EnableBracketedPaste, Show)?;
         if mode == RenderMode::Fullscreen {
             enter_fullscreen(&mut stdout())?;
             // Crossterm uses WinAPI console input modes on Windows and ANSI
@@ -464,8 +461,6 @@ impl TerminalSession {
             // private mouse modes together, which otherwise lets a wheel tick
             // reach the composer as an Up/Down history key.
             disable_alternate_scroll(&mut stdout())?;
-        } else {
-            execute!(stdout(), Show)?;
         }
         Ok(Self { mode })
     }
@@ -711,24 +706,6 @@ impl CellFrame {
 
 }
 
-/// Draws the fullscreen composer's visible cursor into the frame itself. The
-/// terminal cursor stays hidden, so animation row updates cannot make it appear
-/// briefly at their MoveTo destination.
-fn paint_software_cursor(frame: &mut CellFrame, mut column: usize, row: usize) {
-    if column >= frame.width || row >= frame.height {
-        return;
-    }
-    while column > 0 && frame.cell(column, row).continuation {
-        column -= 1;
-    }
-    let palette = theme::palette();
-    let cell = frame.cell_mut(column, row);
-    let foreground = cell.style.foreground.unwrap_or(palette.foreground);
-    let background = cell.style.background.unwrap_or(palette.background);
-    cell.style.foreground = Some(background);
-    cell.style.background = Some(foreground);
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SelectionResult {
     Copy(String),
@@ -776,7 +753,7 @@ impl Renderer {
             previous_lines: Vec::new(),
             cursor_line: 0,
             cursor_col: 0,
-            cursor_shown: mode == RenderMode::Inline,
+            cursor_shown: true,
             last_width: 0,
             last_height: 0,
             theme: selected_theme,
@@ -1224,7 +1201,7 @@ impl Renderer {
         self.painted_selection = None;
         self.cursor_line = 0;
         self.cursor_col = 0;
-        self.cursor_shown = self.mode == RenderMode::Inline;
+        self.cursor_shown = true;
         self.last_width = 0;
         self.last_height = 0;
         execute!(
@@ -1232,13 +1209,9 @@ impl Renderer {
             Print("\x1b]777;devez-copy-clear\x07"),
             Clear(ClearType::All),
             Clear(ClearType::Purge),
-            MoveTo(0, 0)
+            MoveTo(0, 0),
+            Show
         )?;
-        if self.cursor_shown {
-            execute!(self.out, Show)?;
-        } else {
-            execute!(self.out, Hide)?;
-        }
         Ok(())
     }
 
@@ -1437,6 +1410,15 @@ impl Renderer {
     }
 
     pub fn render_animation(&mut self, view: AnimationView<'_>) -> Result<bool> {
+        // Terminals that ignore synchronized updates expose every MoveTo while
+        // the hardware cursor is visible. Hold the current frame on pure
+        // animation ticks; semantic updates still redraw normally.
+        if self.mode == RenderMode::Fullscreen
+            && self.cursor_shown
+            && self.painted_frame.is_some()
+        {
+            return Ok(true);
+        }
         if self.mode != RenderMode::Fullscreen
             || self.last_width == 0
             || self.previous_lines.is_empty()
@@ -1813,26 +1795,25 @@ impl Renderer {
         if let Some((row, control)) = scroll_to_bottom_overlay {
             paint_scroll_to_bottom_into_frame(&mut frame, row, control);
         }
-        let cursor_col = cursor_col
-            .min(usize::from(total_width).saturating_sub(2))
-            .min(u16::MAX as usize);
-        let cursor_line = cursor_line.min(u16::MAX as usize);
-        if show_cursor {
-            paint_software_cursor(&mut frame, cursor_col, cursor_line);
-        }
         emit_synchronized_frame_diff_with_full_rows(
             &mut self.out,
             self.painted_frame.as_ref(),
             &frame,
             full_repaint_rows,
-            Some((cursor_col as u16, cursor_line as u16, false)),
+            Some((
+                cursor_col
+                    .min(usize::from(total_width).saturating_sub(2))
+                    .min(u16::MAX as usize) as u16,
+                cursor_line.min(u16::MAX as usize) as u16,
+                show_cursor,
+            )),
             self.cursor_shown,
         )?;
         self.painted_frame = Some(frame);
         self.painted_selection = selection;
         self.painted_hovered_tool = self.hovered_tool;
         self.painted_hovered_pick = self.hovered_pick.clone();
-        self.cursor_shown = false;
+        self.cursor_shown = show_cursor;
         Ok(())
     }
 
@@ -2373,17 +2354,25 @@ fn emit_synchronized_frame_diff_with_full_rows(
     cursor_shown: bool,
 ) -> Result<()> {
     queue!(out, Print("\x1b[?2026h"))?;
-    // 커서를 매 프레임 껐다 켜면 터미널이 깜빡임 위상을 그때마다 초기화해 컴포저
-    // 커서가 떨린다. 동기 업데이트가 중간 상태를 감추므로 표시 여부가 실제로
-    // 바뀔 때만 Hide/Show를 보낸다.
-    if cursor.is_some_and(|(_, _, show)| !show) && cursor_shown {
+    let cursor_leaves_its_row = cursor.is_some_and(|(_, row, show)| {
+        show
+            && cursor_shown
+            && (!full_rows.is_empty()
+                || frame_changed_outside_row(previous, current, usize::from(row)))
+    });
+    // Composer-only edits naturally advance the cursor and need no toggle. A
+    // semantic update elsewhere hides it for that single synchronized write so
+    // terminals without mode 2026 support cannot expose intermediate positions.
+    let hide_cursor = cursor_shown
+        && cursor.is_some_and(|(_, _, show)| !show || cursor_leaves_its_row);
+    if hide_cursor {
         queue!(out, Hide)?;
     }
     let previous = if full_rows.is_empty() { previous } else { None };
     let result = emit_frame_diff(out, previous, current);
     if let Some((column, row, show)) = cursor {
         queue!(out, MoveTo(column, row))?;
-        if show && !cursor_shown {
+        if show && (!cursor_shown || hide_cursor) {
             queue!(out, Show)?;
         }
     }
@@ -2393,6 +2382,27 @@ fn emit_synchronized_frame_diff_with_full_rows(
         (Ok(()), Err(error)) => Err(error.into()),
         (Ok(()), Ok(())) => Ok(()),
     }
+}
+
+fn frame_changed_outside_row(
+    previous: Option<&CellFrame>,
+    current: &CellFrame,
+    cursor_row: usize,
+) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    if previous.width != current.width || previous.height != current.height {
+        return true;
+    }
+    (0..current.height).any(|row| {
+        if row == cursor_row {
+            return false;
+        }
+        let start = row * current.width;
+        let end = start + current.width;
+        previous.cells[start..end] != current.cells[start..end]
+    })
 }
 
 /// Lays out one fullscreen frame: `view_rows` of transcript from `start`, then the
@@ -8584,8 +8594,8 @@ mod tests {
         enter_fullscreen(&mut output).expect("fullscreen command");
 
         assert_eq!(
-            output, b"\x1b[?1049h\x1b[?1007s\x1b[?25l\x1b[?1007l",
-            "enter alternate screen, save alternate-scroll mode, hide the hardware cursor, then disable alternate scrolling"
+            output, b"\x1b[?1049h\x1b[?1007s\x1b[?1007l",
+            "enter alternate screen, save alternate-scroll mode, then disable it"
         );
     }
 
@@ -9266,7 +9276,7 @@ mod tests {
     fn a_visible_cursor_is_not_toggled_between_frames() {
         let previous = CellFrame::new(8, 2);
         let mut current = previous.clone();
-        current.write(0, 0, "x", CellStyle::plain());
+        current.write(1, 1, "x", CellStyle::plain());
 
         let mut output = Vec::new();
         emit_synchronized_frame_diff_with_full_rows(
@@ -9288,33 +9298,10 @@ mod tests {
     }
 
     #[test]
-    fn software_cursor_inverts_the_cell_without_replacing_its_glyph() {
-        let mut frame = CellFrame::new(8, 1);
-        let foreground = Rgb(10, 20, 30);
-        let background = Rgb(40, 50, 60);
-        frame.write(
-            2,
-            0,
-            "x",
-            CellStyle {
-                foreground: Some(foreground),
-                background: Some(background),
-                ..CellStyle::plain()
-            },
-        );
-
-        paint_software_cursor(&mut frame, 2, 0);
-
-        assert_eq!(frame.cell(2, 0).glyph, "x");
-        assert_eq!(frame.cell(2, 0).style.foreground, Some(background));
-        assert_eq!(frame.cell(2, 0).style.background, Some(foreground));
-    }
-
-    #[test]
-    fn hidden_hardware_cursor_is_not_shown_by_fullscreen_frame_updates() {
+    fn a_remote_row_update_hides_and_restores_the_visible_cursor_once() {
         let previous = CellFrame::new(8, 2);
         let mut current = previous.clone();
-        paint_software_cursor(&mut current, 0, 1);
+        current.write(0, 0, "x", CellStyle::plain());
 
         let mut output = Vec::new();
         emit_synchronized_frame_diff_with_full_rows(
@@ -9322,15 +9309,35 @@ mod tests {
             Some(&previous),
             &current,
             &[],
-            Some((0, 1, false)),
-            false,
+            Some((0, 1, true)),
+            true,
         )
-        .expect("fullscreen frame emits");
+        .expect("remote row update emits");
 
         let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
-        assert!(!output.contains("\x1b[?25h"));
-        assert!(!output.contains("\x1b[?25l"));
-        assert!(output.contains("\x1b[2;1H"));
+        assert_eq!(output.matches("\x1b[?25l").count(), 1);
+        assert_eq!(output.matches("\x1b[?25h").count(), 1);
+        assert!(output.rfind("\x1b[?25h").unwrap() < output.rfind("\x1b[?2026l").unwrap());
+    }
+
+    #[test]
+    fn a_visible_fullscreen_cursor_holds_pure_animation_frames() {
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.painted_frame = Some(CellFrame::new(8, 2));
+
+        assert!(
+            renderer
+                .render_animation(AnimationView {
+                    activity: Some("Working..".to_owned()),
+                    activity_model: None,
+                    activity_phase: 0.5,
+                    plan_summary: None,
+                    plan_active: true,
+                    plan_shimmer_phase: None,
+                    composer_mode: None,
+                })
+                .expect("animation tick is held")
+        );
     }
 
     #[test]

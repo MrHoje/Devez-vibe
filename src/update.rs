@@ -20,9 +20,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// nothing reads this today; rewrite it each release for the changelog.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "새 대화가 선택한 reasoning effort로 즉시 시작되어 첫 응답에서 설정이 바뀌지 않습니다.",
-    "전체 화면 커서와 클릭 가능한 제어 영역을 안정적으로 표시합니다.",
-    "Claude 작업 단계와 응답 스트리밍이 더 자연스럽고 매끄럽게 갱신됩니다.",
+    "전체 화면의 입력 커서를 안정적으로 유지하면서 불필요한 애니메이션 갱신을 줄였습니다.",
+    "원격 화면 변경 때만 커서를 잠시 숨겨 중간 위치 노출을 막습니다.",
+    "표시 방식 전환 시 불필요한 안내 메시지를 표시하지 않습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

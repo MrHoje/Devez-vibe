@@ -8396,7 +8396,6 @@ impl AppState {
                 self.diff_display_mode = DiffDisplayMode::Expand;
             }
         }
-        self.notice_setting_applies_to_next_request();
         (self.shell_display_mode, self.diff_display_mode)
     }
 
