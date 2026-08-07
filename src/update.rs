@@ -20,7 +20,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// nothing reads this today; rewrite it each release for the changelog.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] =
-    &["Claude 압축 진행률을 실제 동작과 맞추고 Codex의 가짜 퍼센트 표시를 제거했습니다."];
+    &["Claude와 Codex 압축 중 좌우로 왕복하는 진행 바를 표시합니다."];
 
 /// Latest published version, only when it is newer than the running build.
 pub async fn check_for_update() -> Option<String> {

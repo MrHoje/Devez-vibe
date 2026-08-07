@@ -8126,18 +8126,10 @@ impl AppState {
             if self.turn_interrupted {
                 return Some("X Interrupted".to_owned());
             }
-            let elapsed = started.elapsed();
-            let elapsed_label = format_elapsed(elapsed.as_secs());
-            return if self.selected_model_name().starts_with("claude:") {
-                Some(format!(
-                    "Compacting.. {}% ({elapsed_label})",
-                    claude_compaction_percent(elapsed)
-                ))
-            } else {
-                // Codex only reports the contextCompaction item's lifecycle. It
-                // exposes no numeric progress, so do not invent one for its wait.
-                Some(format!("Compacting.. ({elapsed_label})"))
-            };
+            let elapsed_label = format_elapsed(started.elapsed().as_secs());
+            // Providers expose the boundary, not numeric progress. The renderer
+            // supplies an indeterminate bar while this elapsed clock is running.
+            return Some(format!("Compacting.. ({elapsed_label})"));
         }
         if self.busy {
             let elapsed = self
@@ -10143,15 +10135,6 @@ fn format_elapsed(seconds: u64) -> String {
         (0, _) => format!("{minutes}m {seconds}s"),
         _ => format!("{hours}h {minutes}m {seconds}s"),
     }
-}
-
-/// Claude Code's own bar is an elapsed-time estimate, not provider progress. Keep
-/// the same 90-second curve and 95% ceiling; only the compact boundary means done.
-const CLAUDE_COMPACTION_PACE_SECONDS: f32 = 90.0;
-
-fn claude_compaction_percent(elapsed: Duration) -> u8 {
-    let progress = 1.0 - (-elapsed.as_secs_f32() / CLAUDE_COMPACTION_PACE_SECONDS).exp();
-    (progress * 100.0).round().clamp(0.0, 95.0) as u8
 }
 
 fn format_duration(duration_ms: u64) -> String {
@@ -13468,23 +13451,14 @@ mod tests {
     }
 
     #[test]
-    fn claude_compaction_matches_claude_codes_slow_capped_estimate() {
+    fn claude_compaction_uses_the_same_indeterminate_elapsed_reading() {
         let mut state = test_state();
         state.models = vec![test_model("claude:sonnet", "Claude Sonnet", true)];
         state.selected_model = 0;
         state.begin_compaction();
 
         state.compacting_started_at = Some(Instant::now() - Duration::from_secs(90));
-        assert_eq!(
-            state.activity().as_deref(),
-            Some("Compacting.. 63% (1m 30s)")
-        );
-
-        state.compacting_started_at = Some(Instant::now() - Duration::from_secs(600));
-        assert_eq!(
-            state.activity().as_deref(),
-            Some("Compacting.. 95% (10m 0s)")
-        );
+        assert_eq!(state.activity().as_deref(), Some("Compacting.. (1m 30s)"));
     }
 
     /// A compaction that runs as a turn must not fall back to the `Working` label

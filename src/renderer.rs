@@ -2888,35 +2888,48 @@ const COMPACTING_LABEL: &str = "Compacting..";
 /// How wide the bar is drawn when the terminal has the room for it.
 const PROGRESS_TRACK_COLUMNS: usize = 20;
 /// Below this the bar reads as a handful of blocks rather than a track, so the
-/// row keeps the percentage alone instead.
+/// row keeps the elapsed time alone instead.
 const PROGRESS_TRACK_MINIMUM: usize = 8;
 
-/// `Compacting.. 38% (4s)` splits into the bar's reading and the tail that
-/// follows it. The percentage is produced by the session, which owns the clock.
-fn split_progress_reading(trailer: &str) -> Option<(u8, &str)> {
-    let trailer = trailer.strip_prefix(' ')?;
-    let (reading, rest) = trailer.split_once('%')?;
-    Some((reading.parse().ok()?, rest))
-}
+/// An indeterminate block glides to the right and back. Providers expose only
+/// compaction start/end, so movement says "still running" without a fake value.
+fn progress_bar_spans(phase: f32, track: usize, tone: Tone) -> Vec<PaintSpan> {
+    const BLOCK_COLUMNS: usize = 4;
 
-/// A filled track: solid blocks up to the reading, light blocks after it.
-fn progress_bar_spans(percent: u8, track: usize, tone: Tone) -> Vec<PaintSpan> {
-    let filled = (track * usize::from(percent.min(100)) + 50) / 100;
-    let mut spans = Vec::new();
-    if filled > 0 {
+    let block = track.min(BLOCK_COLUMNS);
+    let travel = track.saturating_sub(block);
+    let ping_pong = 0.5 - 0.5 * (phase.clamp(0.0, 1.0) * std::f32::consts::TAU).cos();
+    let offset = (travel as f32 * ping_pong).round() as usize;
+    let mut spans = vec![PaintSpan {
+        text: "[".to_owned(),
+        tone: Tone::Muted,
+        bold: false,
+    }];
+    if offset > 0 {
         spans.push(PaintSpan {
-            text: "█".repeat(filled),
-            tone,
-            bold: false,
-        });
-    }
-    if filled < track {
-        spans.push(PaintSpan {
-            text: "░".repeat(track - filled),
+            text: "░".repeat(offset),
             tone: Tone::Muted,
             bold: false,
         });
     }
+    spans.push(PaintSpan {
+        text: "█".repeat(block),
+        tone,
+        bold: false,
+    });
+    let remaining = track.saturating_sub(offset + block);
+    if remaining > 0 {
+        spans.push(PaintSpan {
+            text: "░".repeat(remaining),
+            tone: Tone::Muted,
+            bold: false,
+        });
+    }
+    spans.push(PaintSpan {
+        text: "]".to_owned(),
+        tone: Tone::Muted,
+        bold: false,
+    });
     spans
 }
 
@@ -2946,36 +2959,34 @@ fn activity_lines(
             bold: false,
         }];
         tail.extend(shimmer_spans(label, phase, shimmer_base));
-        // Compaction is the one wait with a reading to show, so its row spends the
-        // spare columns on a bar. A narrow terminal keeps the reading alone.
-        match split_progress_reading(trailer).filter(|_| label == COMPACTING_LABEL) {
-            Some((percent, rest)) => {
-                let reading = format!("  {percent}%{rest}");
-                let spent = 1 + WORKING_SPINNER_COLUMNS
-                    + UnicodeWidthStr::width(label)
-                    + UnicodeWidthStr::width(reading.as_str());
-                let track = usize::from(width)
-                    .saturating_sub(spent + 2)
-                    .min(PROGRESS_TRACK_COLUMNS);
-                if track >= PROGRESS_TRACK_MINIMUM {
-                    tail.push(PaintSpan {
-                        text: " ".to_owned(),
-                        tone,
-                        bold: false,
-                    });
-                    tail.extend(progress_bar_spans(percent, track, tone));
-                }
+        if label == COMPACTING_LABEL {
+            let spent = 1
+                + WORKING_SPINNER_COLUMNS
+                + UnicodeWidthStr::width(label)
+                + UnicodeWidthStr::width(trailer)
+                + 3;
+            let track = usize::from(width)
+                .saturating_sub(spent)
+                .min(PROGRESS_TRACK_COLUMNS);
+            if track >= PROGRESS_TRACK_MINIMUM {
                 tail.push(PaintSpan {
-                    text: reading,
+                    text: " ".to_owned(),
                     tone,
                     bold: false,
                 });
+                tail.extend(progress_bar_spans(phase, track, tone));
             }
-            None => tail.push(PaintSpan {
+            tail.push(PaintSpan {
                 text: trailer.to_owned(),
                 tone,
                 bold: false,
-            }),
+            });
+        } else {
+            tail.push(PaintSpan {
+                text: trailer.to_owned(),
+                tone,
+                bold: false,
+            });
         }
         return vec![PaintLine {
             prefix: " ".to_owned(),
@@ -12751,18 +12762,25 @@ mod tests {
     }
 
     /// The compaction row spends its spare columns on a bar, and gives them back
-    /// to the reading when the terminal has none to spare.
+    /// to elapsed time when the terminal has none to spare.
     #[test]
-    fn the_compacting_row_draws_a_progress_bar_that_fits() {
-        let wide = activity_lines("Compacting.. 40% (4s)", None, 0.0, 80);
-        let wide = painted(&wide[0]);
+    fn the_compacting_row_draws_a_bouncing_progress_bar_that_fits() {
+        let left = activity_lines("Compacting.. (4s)", None, 0.0, 80);
+        let right = activity_lines("Compacting.. (4s)", None, 0.5, 80);
 
-        assert_eq!(wide, " ⠋ Compacting.. ████████░░░░░░░░░░░░  40% (4s)");
+        assert_eq!(
+            painted(&left[0]),
+            " ⠋ Compacting.. [████░░░░░░░░░░░░░░░░] (4s)"
+        );
+        assert_eq!(
+            painted(&right[0]),
+            " ⠴ Compacting.. [░░░░░░░░░░░░░░░░████] (4s)"
+        );
 
-        let narrow = activity_lines("Compacting.. 40% (4s)", None, 0.0, 30);
+        let narrow = activity_lines("Compacting.. (4s)", None, 0.0, 30);
         let narrow = painted(&narrow[0]);
 
-        assert_eq!(narrow, " ⠋ Compacting..  40% (4s)");
+        assert_eq!(narrow, " ⠋ Compacting.. (4s)");
     }
 
     /// The reading belongs to compaction alone: an ordinary turn keeps its plain
