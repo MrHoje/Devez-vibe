@@ -19,8 +19,10 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build. The welcome card no longer prints them, so
 /// nothing reads this today; rewrite it each release for the changelog.
 #[allow(dead_code)]
-pub const RELEASE_NOTES: &[&str] =
-    &["Claude와 Codex 압축 중 좌우로 왕복하는 진행 바를 표시합니다."];
+pub const RELEASE_NOTES: &[&str] = &[
+    "질문 직접 입력을 선택지 안에서 작성하고 번호로 선택할 수 있습니다.",
+    "작업 단계 시간과 Resume 기록을 정확히 복원하고 중복 카드를 제거했습니다.",
+];
 
 /// Latest published version, only when it is newer than the running build.
 pub async fn check_for_update() -> Option<String> {

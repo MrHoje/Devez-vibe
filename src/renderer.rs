@@ -4227,6 +4227,9 @@ fn overlay_frame_with_expansion(
     }
     lines.extend(live_lines);
     let dock_index = lines.len();
+    // Set when a free-text answer is typed on the option row it was picked on,
+    // which is where the cursor then belongs.
+    let mut inline_cursor = None;
 
     match overlay.style {
         OverlayStyle::Picker => {
@@ -4448,6 +4451,10 @@ fn overlay_frame_with_expansion(
             let label_column = 6 + number_width;
             let continuation = format!("│{}", " ".repeat(label_column.saturating_sub(1)));
             let last = overlay.lines.len().saturating_sub(1);
+            // A question that still lists its options types the free-text answer on
+            // the row it was picked on. Only a question with nothing to pick from
+            // falls back to the box under the panel.
+            let inline_input = overlay.input.filter(|_| overlay.lines.len() > 1);
             for (row_index, row) in rows {
                 // The final row leaves the question rather than answering it, so
                 // a rule sets it apart from the answers above.
@@ -4455,6 +4462,47 @@ fn overlay_frame_with_expansion(
                     lines.push(question_rule_row(panel_width));
                 }
                 let number = row_index;
+                if let Some(editor) = inline_input.filter(|_| row.selected) {
+                    let prefix = format!("│ ❯ {number:>number_width$}. ");
+                    let (rows_text, cursor_row, cursor_column) = inline_answer_rows(
+                        editor,
+                        UnicodeWidthStr::width(prefix.as_str()),
+                        wrap_width,
+                    );
+                    let empty = rows_text.len() == 1 && rows_text[0].is_empty();
+                    inline_cursor = Some((lines.len() + cursor_row, cursor_column));
+                    for (part_index, part) in rows_text.iter().enumerate() {
+                        let line_prefix = if part_index == 0 {
+                            prefix.clone()
+                        } else {
+                            continuation.clone()
+                        };
+                        // An empty answer shows what the row is for, dimmed so it
+                        // never reads as text already typed.
+                        let (text, tone) = if empty {
+                            (overlay.input_placeholder, Tone::Muted)
+                        } else {
+                            (part.as_str(), Tone::Plain)
+                        };
+                        lines.extend(
+                            wrapped_line_with_continuation(
+                                &line_prefix,
+                                &continuation,
+                                Tone::Border,
+                                text,
+                                tone,
+                                false,
+                                wrap_width,
+                            )
+                            .into_iter()
+                            .map(|line| {
+                                close_panel_row(split_panel_border(line, Tone::Accent), panel_width)
+                                    .with_picks(&[(0, Pick::Row(row_index))])
+                            }),
+                        );
+                    }
+                    continue;
+                }
                 for (part_index, part) in row.text.lines().enumerate() {
                     let prefix = if part_index == 0 {
                         format!(
@@ -4497,7 +4545,11 @@ fn overlay_frame_with_expansion(
     let mut cursor_line = lines.len() - 1;
     let mut cursor_col = 0;
     let mut composer_index = None;
-    let show_cursor = if let Some(editor) = overlay.input {
+    let show_cursor = if let Some((line, column)) = inline_cursor {
+        cursor_line = line;
+        cursor_col = column;
+        true
+    } else if let Some(editor) = overlay.input {
         // The composer rule reads as part of the picker without this gap.
         lines.push(PaintLine::blank());
         // A picker's own input is not the composer, so a drag over it stays a
@@ -7108,6 +7160,48 @@ fn copy_metadata_applies(kind: BlockKind) -> bool {
             | BlockKind::Error
             | BlockKind::System
     )
+}
+
+/// Lays a free-text answer out on the option row it is typed on: the rows it
+/// takes, and where the cursor sits in them. A newline has nowhere to go on a
+/// numbered row, so it reads as the space it separates words with.
+fn inline_answer_rows(
+    editor: &Editor,
+    prefix_width: usize,
+    wrap_width: u16,
+) -> (Vec<String>, usize, usize) {
+    let text = editor.text().replace('\n', " ");
+    let content_width = (wrap_width as usize)
+        .saturating_sub(prefix_width + 1)
+        .max(4);
+    let cursor_index = editor.cursor();
+    let mut rows = vec![String::new()];
+    let mut cursor_row = 0;
+    let mut cursor_column = prefix_width;
+    let mut column = prefix_width;
+    for (index, ch) in text.chars().enumerate() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if column + width > prefix_width + content_width && !rows[cursor_last(&rows)].is_empty() {
+            rows.push(String::new());
+            column = prefix_width;
+        }
+        if index == cursor_index {
+            cursor_row = rows.len() - 1;
+            cursor_column = column;
+        }
+        let row = cursor_last(&rows);
+        rows[row].push(ch);
+        column += width;
+    }
+    if cursor_index >= text.chars().count() {
+        cursor_row = rows.len() - 1;
+        cursor_column = column;
+    }
+    (rows, cursor_row, cursor_column)
+}
+
+fn cursor_last(rows: &[String]) -> usize {
+    rows.len() - 1
 }
 
 fn input_lines(
@@ -13166,6 +13260,184 @@ mod tests {
         assert!(
             body.iter().all(|line| painted(line).ends_with('│')),
             "a body row lost its right border"
+        );
+    }
+
+    #[test]
+    fn question_overlay_free_text_shows_the_typed_answer() {
+        let mut editor = Editor::default();
+        editor.insert_str("답변");
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                closable: false,
+                title: "테스트".to_owned(),
+                lines: vec![OverlayLine {
+                    text: "테스트 선택지 중 어느 것 고를래?".to_owned(),
+                    selected: false,
+                    muted: false,
+                }],
+                slider: None,
+                hint: "Enter 전송 · Esc 취소".to_owned(),
+                style: OverlayStyle::Question,
+                input: Some(&editor),
+                input_label: "Answer",
+                input_placeholder: "Type your answer…",
+            },
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+        let painted = frame.lines.iter().map(painted).collect::<Vec<_>>();
+
+        assert!(
+            painted.iter().any(|line| line.contains("답변")),
+            "typed answer missing from {painted:?}"
+        );
+        assert!(
+            !painted.iter().any(|line| line.contains("Type your answer")),
+            "placeholder still shown alongside typed text"
+        );
+    }
+
+    /// End to end: what the keys did has to be what the panel paints, so the
+    /// answer is followed from the question arriving to the row it lands on.
+    #[test]
+    fn a_typed_question_answer_reaches_the_painted_panel() {
+        let mut state = crate::state::AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            Vec::new(),
+            "gpt-5.6-sol",
+            None,
+        );
+        state.begin_server_request(
+            serde_json::json!(1),
+            "item/tool/requestUserInput",
+            &serde_json::json!({
+                "questions": [{
+                    "id": "q1",
+                    "question": "어느 것인가요?",
+                    "options": [{ "label": "첫째", "description": "설명" }]
+                }]
+            }),
+        );
+        // Row 2 is the free-text row: one option, then 직접 입력.
+        for key in ["2", "답", "변"] {
+            let ch = key.chars().next().expect("key");
+            state.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char(ch),
+                crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+
+        let view = state.view();
+        let frame = overlay_frame(
+            &[],
+            view.overlay.expect("the question panel is open"),
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+        let painted = frame.lines.iter().map(painted).collect::<Vec<_>>();
+
+        assert!(
+            painted.iter().any(|line| line.contains("답변")),
+            "the typed answer never reached the panel: {painted:?}"
+        );
+    }
+
+    /// The answer is written on the row it was picked on, with the options still
+    /// around it, rather than in a box that replaced the question.
+    #[test]
+    fn question_overlay_types_a_free_text_answer_on_its_own_row() {
+        let mut editor = Editor::default();
+        editor.insert_str("직접 쓴 답");
+        fn overlay(editor: Option<&Editor>) -> OverlayView<'_> {
+            OverlayView {
+            closable: false,
+            title: "테스트".to_owned(),
+            lines: vec![
+                OverlayLine {
+                    text: "어느 것 고를래?".to_owned(),
+                    selected: false,
+                    muted: false,
+                },
+                OverlayLine {
+                    text: "선택지 A\n첫 번째".to_owned(),
+                    selected: false,
+                    muted: false,
+                },
+                OverlayLine {
+                    text: "직접 입력".to_owned(),
+                    selected: true,
+                    muted: false,
+                },
+                OverlayLine {
+                    text: "이 내용으로 대화하기".to_owned(),
+                    selected: false,
+                    muted: false,
+                },
+            ],
+            slider: None,
+            hint: "Enter 전송 · Esc 취소".to_owned(),
+            style: OverlayStyle::Question,
+            input: editor,
+            input_label: "Answer",
+            input_placeholder: "여기에 직접 입력…",
+            }
+        }
+        let status = || StatusArea {
+            fallback: String::new(),
+            line: None,
+            composer_notice: None,
+            composer_mode: None,
+        };
+
+        let frame = overlay_frame(&[], overlay(Some(&editor)), None, status(), 80);
+        let typed = frame.lines.iter().map(painted).collect::<Vec<_>>();
+        let answer_row = typed
+            .iter()
+            .position(|line| line.contains("직접 쓴 답"))
+            .expect("the typed answer is missing");
+
+        assert!(typed[answer_row].starts_with("│ ❯ 2. 직접 쓴 답"));
+        assert!(
+            typed.iter().any(|line| line.contains("선택지 A")),
+            "the options left the screen while the answer was typed"
+        );
+        assert!(
+            !typed.iter().any(|line| line.contains("여기에 직접 입력")),
+            "the placeholder stayed next to the typed answer"
+        );
+        // The cursor belongs at the end of what was typed, on that same row.
+        assert!(frame.show_cursor);
+        assert_eq!(frame.cursor_line, answer_row);
+        assert_eq!(
+            frame.cursor_col,
+            UnicodeWidthStr::width("│ ❯ 2. 직접 쓴 답")
+        );
+
+        // Empty, the row says what it is for instead of standing blank.
+        let empty = Editor::default();
+        let empty_frame = overlay_frame(&[], overlay(Some(&empty)), None, status(), 80);
+        let empty_painted = empty_frame.lines.iter().map(painted).collect::<Vec<_>>();
+        assert!(
+            empty_painted
+                .iter()
+                .any(|line| line.starts_with("│ ❯ 2. 여기에 직접 입력…")),
+            "the empty answer row lost its prompt: {empty_painted:?}"
         );
     }
 

@@ -884,7 +884,25 @@ function prepareTaskPlanForCreate(tasks, subject) {
   if (numberedTaskIndex(subject) === 1) tasks.clear();
 }
 
-function applyTaskUpdate(tasks, input, turnId, onIntermediate) {
+// 한 단계에 걸린 시간은 진행 중으로 바뀐 순간과 완료된 순간의 차이다. 기록에는
+// 항목마다 시각이 남으므로, 다시 읽을 때도 같은 방식으로 되살릴 수 있다.
+function markTaskStatus(task, status, at) {
+  if (task.status !== status && at != null) {
+    if (status === "in_progress") {
+      task.startedAt = task.startedAt ?? at;
+    } else if (status === "completed" && task.startedAt != null) {
+      task.elapsedMs = Math.max(0, at - task.startedAt);
+    }
+  }
+  task.status = status;
+}
+
+function messageTime(message) {
+  const parsed = Date.parse(message?.timestamp || "");
+  return Number.isNaN(parsed) ? null : parsed;
+}
+
+function applyTaskUpdate(tasks, input, turnId, onIntermediate, at) {
   const task = tasks.get(String(input.taskId));
   if (!task) return false;
   if (input.subject) task.subject = input.subject;
@@ -900,11 +918,11 @@ function applyTaskUpdate(tasks, input, turnId, onIntermediate) {
       const previous = entries[index];
       if (previous.status === "completed") continue;
       if (previous.status !== "in_progress") {
-        previous.status = "in_progress";
+        markTaskStatus(previous, "in_progress", at);
         previous.turnId = turnId;
         onIntermediate?.();
       }
-      previous.status = "completed";
+      markTaskStatus(previous, "completed", at);
       previous.turnId = turnId;
       onIntermediate?.();
     }
@@ -912,19 +930,19 @@ function applyTaskUpdate(tasks, input, turnId, onIntermediate) {
     for (let index = 0; index < entries.length; index++) {
       const other = entries[index];
       if (other === task || other.status !== "in_progress") continue;
-      other.status = index < targetIndex ? "completed" : "pending";
+      markTaskStatus(other, index < targetIndex ? "completed" : "pending", at);
       other.turnId = turnId;
       onIntermediate?.();
     }
 
     if (status === "completed" && task.status !== "in_progress" && task.status !== "completed") {
-      task.status = "in_progress";
+      markTaskStatus(task, "in_progress", at);
       task.turnId = turnId;
       onIntermediate?.();
     }
-    task.status = status;
+    markTaskStatus(task, status, at);
   } else if (status) {
-    task.status = status;
+    markTaskStatus(task, status, at);
   }
   task.turnId = turnId;
   return true;
@@ -955,7 +973,7 @@ function updatePlanFromToolUse(session, name, toolUseId, input) {
     return;
   } else if (name === "TaskUpdate") {
     session.planCreatePending = false;
-    applyTaskUpdate(session.tasks, input, turnId, () => emitPlan(session));
+    applyTaskUpdate(session.tasks, input, turnId, () => emitPlan(session), Date.now());
   }
   if (name === "TaskUpdate") emitPlan(session);
 }
@@ -1574,7 +1592,7 @@ function historyState(messages) {
             prepareTaskPlanForCreate(tasks, block.input?.subject);
             tasks.set(`pending:${block.id}`, { id: `pending:${block.id}`, subject: block.input?.subject || "작업", status: "pending", turnId: turn.id });
           } else if (block.name === "TaskUpdate") {
-            applyTaskUpdate(tasks, block.input || {}, turn.id);
+            applyTaskUpdate(tasks, block.input || {}, turn.id, undefined, messageTime(message));
           } else if (!["TaskList", "AskUserQuestion"].includes(block.name)) turn.items.push(pending.item);
         }
       }
@@ -1594,7 +1612,19 @@ function historyState(messages) {
         } else if (pending.name === "TaskList" && Array.isArray(message.tool_use_result?.tasks)) {
           const known = new Map(tasks);
           tasks.clear();
-          for (const task of message.tool_use_result.tasks) tasks.set(String(task.id), { id: String(task.id), subject: task.subject || "작업", status: task.status || "pending", turnId: known.get(String(task.id))?.turnId ?? turn.id });
+          for (const task of message.tool_use_result.tasks) {
+            const previous = known.get(String(task.id));
+            tasks.set(String(task.id), {
+              id: String(task.id),
+              subject: task.subject || "작업",
+              status: task.status || "pending",
+              turnId: previous?.turnId ?? turn.id,
+              // A listing restates the plan; it does not re-run it, so the
+              // timings already measured for these steps have to survive it.
+              startedAt: previous?.startedAt,
+              elapsedMs: previous?.elapsedMs,
+            });
+          }
           const current = latestTaskPlan(tasks);
           tasks.clear();
           for (const [id, task] of current) tasks.set(id, task);
@@ -1611,7 +1641,14 @@ function historyState(messages) {
   }
   if (turn && tasks.size) {
     const text = [...tasks.values()].map((task, index) => `${task.status === "completed" ? "✓" : task.status === "in_progress" ? "▸" : "□"} ${numberedTaskSubject(task.subject, index)}`).join("\n");
-    turn.items.push({ id: "claude-plan-latest", type: "plan", text });
+    // The text alone cannot say how long a step took, so the measured times ride
+    // alongside it and the restored plan shows its total instead of zero.
+    const steps = [...tasks.values()].map((task, index) => ({
+      step: numberedTaskSubject(task.subject, index),
+      status: task.status || "pending",
+      elapsedMs: task.elapsedMs ?? null,
+    }));
+    turn.items.push({ id: "claude-plan-latest", type: "plan", text, steps });
   }
   return {
     tasks,
@@ -1936,6 +1973,20 @@ async function runSelfTest() {
     || restoredTasks.get("27")?.status !== "in_progress"
     || [...restoredTasks.values()].filter((task) => task.status === "in_progress").length !== 1) {
     throw new Error(`Claude sequential task update self-test failed: ${JSON.stringify([...restoredTasks])}`);
+  }
+  // Each transcript record is stamped, so a step's own run is the span between
+  // the update that started it and the one that closed it.
+  const at = (message, timestamp) => ({ ...message, timestamp });
+  const timedMessages = [
+    at(user("timed", "작업을 진행해"), "2026-08-07T01:00:00.000Z"),
+    at(taskUse("timed-create-use", "timed-create", "TaskCreate", { subject: "1. 확인" }), "2026-08-07T01:00:01.000Z"),
+    at(taskResult("timed-create-result", "timed-create", { task: { id: "t1", subject: "1. 확인" } }, "Task #t1 created successfully: 1. 확인"), "2026-08-07T01:00:02.000Z"),
+    at(taskUse("timed-start", "timed-start", "TaskUpdate", { taskId: "t1", status: "in_progress" }), "2026-08-07T01:00:03.000Z"),
+    at(taskUse("timed-done", "timed-done", "TaskUpdate", { taskId: "t1", status: "completed" }), "2026-08-07T01:00:09.000Z"),
+  ];
+  const timedPlan = historyState(timedMessages).turns.at(-1)?.items.find((item) => item.type === "plan");
+  if (timedPlan?.steps?.[0]?.elapsedMs !== 6000 || timedPlan.steps[0].status !== "completed") {
+    throw new Error(`Claude plan step timing self-test failed: ${JSON.stringify(timedPlan)}`);
   }
   const skippedTasks = new Map([
     ["1", { id: "1", subject: "1. 조사", status: "pending" }],

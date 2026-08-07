@@ -6948,6 +6948,17 @@ impl AppState {
                             answers.insert(question.id.clone(), answer);
                             return next_question_or_reply(id, questions, current, answers, self);
                         }
+                        // The answer is typed among the options, so the arrows that
+                        // walk them still do: leaving the row keeps what was typed
+                        // for the next visit to it.
+                        KeyCode::Up if !question.options.is_empty() => {
+                            text_mode = false;
+                            selected = question.options.len() - 1;
+                        }
+                        KeyCode::Down if !question.options.is_empty() => {
+                            text_mode = false;
+                            selected = chat_instead_index(question);
+                        }
                         KeyCode::Backspace if ctrl => editor.delete_word_left(),
                         KeyCode::Backspace => editor.backspace(),
                         KeyCode::Delete if ctrl => editor.delete_word_right(),
@@ -6969,7 +6980,22 @@ impl AppState {
                     }
                 } else {
                     let chat_instead = chat_instead_index(question);
-                    match key.code {
+                    // The rows are numbered on screen, so their numbers answer the
+                    // question: typing one moves to that row and takes it, rather
+                    // than being swallowed as a character the picker has no use for.
+                    let pressed = match key.code {
+                        KeyCode::Char(ch) if !ctrl && !alt => match ch.to_digit(10) {
+                            Some(digit)
+                                if digit >= 1 && digit as usize - 1 <= chat_instead =>
+                            {
+                                selected = digit as usize - 1;
+                                KeyCode::Enter
+                            }
+                            _ => key.code,
+                        },
+                        code => code,
+                    };
+                    match pressed {
                         KeyCode::Up => selected = selected.saturating_sub(1),
                         KeyCode::Down => selected = (selected + 1).min(chat_instead),
                         KeyCode::Enter => {
@@ -7826,26 +7852,31 @@ impl AppState {
                     selected: false,
                     muted: false,
                 }];
-                if !text_mode {
+                // A free-text answer is typed on its own row, so the options stay
+                // on screen around it: the answer is written where it was picked,
+                // not in a box that replaced the question.
+                let free_text_row = question.options.len();
+                let selected_row = if *text_mode { free_text_row } else { *selected };
+                if !question.options.is_empty() {
                     lines.extend(question.options.iter().enumerate().map(|(index, option)| {
                         OverlayLine {
                             text: format!("{}\n{}", option.label, option.description),
-                            selected: index == *selected,
+                            selected: index == selected_row,
                             muted: false,
                         }
                     }));
                     if question.allow_other {
                         lines.push(OverlayLine {
                             text: OTHER_ANSWER_LABEL.to_owned(),
-                            selected: *selected == question.options.len(),
-                            muted: true,
+                            selected: selected_row == free_text_row,
+                            muted: !*text_mode,
                         });
                     }
                     // The way out of the question, kept last so the renderer's
                     // rule lands between it and the answers.
                     lines.push(OverlayLine {
                         text: CHAT_INSTEAD_LABEL.to_owned(),
-                        selected: *selected == chat_instead_index(question),
+                        selected: selected_row == chat_instead_index(question),
                         muted: false,
                     });
                 }
@@ -7866,7 +7897,7 @@ impl AppState {
                     style: OverlayStyle::Question,
                     input: text_mode.then_some(editor),
                     input_label: "Answer",
-                    input_placeholder: "Type your answer…",
+                    input_placeholder: "여기에 직접 입력…",
                 })
             }
         }
@@ -9666,9 +9697,21 @@ fn merged_turn_blocks(
             order += 1;
         }
     }
+    // The rollout is a fallback, not a second source: when the turn's own items
+    // already carry the shell runs or the thinking, replaying the rollout copy
+    // put a card on screen that the live turn never showed. Only a turn whose
+    // items are missing that kind still needs the rollout to supply it.
+    let item_kinds = items
+        .iter()
+        .filter_map(|item| item.get("type").and_then(Value::as_str))
+        .collect::<HashSet<_>>();
+    let items_carry_shell = item_kinds.contains("commandExecution");
+    let items_carry_reasoning = item_kinds.contains("reasoning");
     let mut emitted_shell_group = false;
     for event in &events {
         let block = match &event.kind {
+            RolloutKind::Reasoning { .. } if items_carry_reasoning => continue,
+            RolloutKind::Exec { .. } if items_carry_shell => continue,
             RolloutKind::Exec { .. } => {
                 if emitted_shell_group {
                     continue;
@@ -9757,11 +9800,40 @@ fn plan_snapshot_from_history(turns: &[Value]) -> Option<PlanSnapshot> {
         .filter_map(|turn| turn.get("items").and_then(Value::as_array))
         .flat_map(|items| items.iter().rev())
         .find_map(|item| {
-            (item.get("type").and_then(Value::as_str) == Some("plan"))
-                .then(|| item.get("text").and_then(Value::as_str))
-                .flatten()
-                .and_then(plan_snapshot_from_text)
+            (item.get("type").and_then(Value::as_str) == Some("plan")).then_some(item)?;
+            plan_snapshot_from_steps(item).or_else(|| {
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .and_then(plan_snapshot_from_text)
+            })
         })
+}
+
+/// A plan item that carries its own measured step times. The text form cannot
+/// say how long a step took, so a plan restored from it alone totals to zero;
+/// this reads the times the provider recorded beside the text.
+fn plan_snapshot_from_steps(item: &Value) -> Option<PlanSnapshot> {
+    let steps = item
+        .get("steps")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|step| {
+            let text = step.get("step").and_then(Value::as_str)?.trim();
+            (!text.is_empty()).then_some(crate::rollout::PlanStepSnapshot {
+                text: text.to_owned(),
+                status: step
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("pending")
+                    .to_owned(),
+                elapsed_ms: step.get("elapsedMs").and_then(Value::as_u64),
+            })
+        })
+        .collect::<Vec<_>>();
+    (!steps.is_empty()).then_some(PlanSnapshot {
+        explanation: None,
+        steps,
+    })
 }
 
 fn plan_snapshot_from_text(text: &str) -> Option<PlanSnapshot> {
@@ -10707,6 +10779,97 @@ mod tests {
     }
 
     #[test]
+    fn free_text_answer_shows_what_was_typed() {
+        let mut state = test_state();
+        state.begin_server_request(
+            json!(1),
+            "item/tool/requestUserInput",
+            &json!({
+                "questions": [{
+                    "id": "q1",
+                    "question": "어느 것인가요?",
+                    "header": "대상 아이콘",
+                    "options": [
+                        { "label": "첫째", "description": "설명" },
+                        { "label": "둘째", "description": "설명" }
+                    ]
+                }]
+            }),
+        );
+
+        // Walk down to the free-text row and open it.
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Char('가'), KeyModifiers::NONE));
+
+        let overlay = state.overlay_view().expect("overlay");
+        assert_eq!(overlay.input.map(Editor::text).as_deref(), Some("가"));
+        // The answer is typed among the options, so they stay on screen and the
+        // row being typed on is the one marked.
+        assert!(
+            overlay.lines.iter().any(|line| line.text.starts_with("첫째")),
+            "the options left the screen while the answer was typed"
+        );
+        assert_eq!(
+            overlay
+                .lines
+                .iter()
+                .position(|line| line.selected)
+                .map(|row| overlay.lines[row].text.clone()),
+            Some(OTHER_ANSWER_LABEL.to_owned())
+        );
+
+        // An arrow walks back out to the options it was typed among.
+        state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        let overlay = state.overlay_view().expect("overlay");
+        assert!(overlay.input.is_none());
+        assert!(
+            overlay
+                .lines
+                .iter()
+                .any(|line| line.selected && line.text.starts_with("둘째"))
+        );
+    }
+
+    /// The rows are numbered on screen, so the number is what a reader reaches
+    /// for. Before, the digit fell through and the question sat unanswered while
+    /// everything typed after it went nowhere.
+    #[test]
+    fn a_question_row_number_takes_that_row() {
+        let question = json!({
+            "questions": [{
+                "id": "q1",
+                "question": "어느 것인가요?",
+                "options": [
+                    { "label": "첫째", "description": "설명" },
+                    { "label": "둘째", "description": "설명" }
+                ]
+            }]
+        });
+
+        let mut state = test_state();
+        state.begin_server_request(json!(1), "item/tool/requestUserInput", &question);
+        // Row 3 is the free-text row: two options, then 직접 입력.
+        state.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Char('가'), KeyModifiers::NONE));
+        let overlay = state.overlay_view().expect("overlay");
+        assert_eq!(overlay.input.map(Editor::text).as_deref(), Some("가"));
+
+        let mut state = test_state();
+        state.begin_server_request(json!(1), "item/tool/requestUserInput", &question);
+        let answered = state.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert!(
+            matches!(
+                answered,
+                Action::RpcResponse { ref result, .. }
+                    if result.to_string().contains("둘째")
+            ),
+            "row 2 did not answer with its own option"
+        );
+    }
+
+    #[test]
     fn host_loading_marks_the_devezcode_spinner_busy_without_a_turn() {
         let mut state = test_state();
 
@@ -11607,6 +11770,47 @@ mod tests {
         assert!(matches!(state.committed[2].kind, BlockKind::FileChange));
     }
 
+    /// The turn's own items already hold the shell run and the thinking, so the
+    /// rollout's copies would be a second card for work shown once while live.
+    #[test]
+    fn resumed_turn_skips_rollout_copies_of_items_it_already_has() {
+        let mut state = test_state();
+        let thread = json!({
+            "turns": [{
+                "id": "turn-1",
+                "startedAt": 1_784_992_108_i64,
+                "completedAt": 1_784_992_379_i64,
+                "items": [
+                    { "type": "reasoning", "id": "think-1", "summary": ["살펴보는 중"] },
+                    {
+                        "type": "commandExecution",
+                        "id": "exec-1",
+                        "command": "cargo test",
+                        "aggregatedOutput": "ok"
+                    },
+                    { "type": "agentMessage", "id": "item-1", "text": "고쳤습니다" }
+                ]
+            }]
+        });
+        let rollout = crate::rollout::parse(
+            r#"{"timestamp":"2026-07-25T15:08:30.000Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"살펴보는 중"}]}}
+{"timestamp":"2026-07-25T15:08:36.373Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_one","input":"await tools.shell_command({\"command\":\"cargo test\"});","internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"}}}
+{"timestamp":"2026-07-25T15:08:38.010Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_one","output":[{"type":"input_text","text":"Wall time 1.6 seconds\n"},{"type":"input_text","text":"Exit code: 0\nOutput:\nok\n"}]}}
+{"timestamp":"2026-07-25T15:09:58.000Z","type":"event_msg","payload":{"type":"agent_message","message":"고쳤습니다"}}"#,
+        );
+
+        state.load_history(&thread, Some(&rollout));
+
+        let shells = state
+            .committed
+            .iter()
+            .filter(|block| block.title.starts_with("Shell ·"))
+            .count();
+        let thinking = state.committed.iter().filter(|block| is_thinking(block)).count();
+        assert_eq!(shells, 1);
+        assert_eq!(thinking, 1);
+    }
+
     #[test]
     fn resumed_multi_command_exec_becomes_one_shell_group() {
         let mut state = test_state();
@@ -12038,6 +12242,39 @@ mod tests {
         assert_eq!(summary.steps[0].status, PlanStepStatus::Completed);
         assert_eq!(summary.steps[1].status, PlanStepStatus::InProgress);
         assert_eq!(summary.steps[2].status, PlanStepStatus::Pending);
+    }
+
+    /// Without a local rollout the plan text is the only thing left, and it
+    /// cannot say how long a step took — so the total under the card read zero.
+    #[test]
+    fn resumed_plan_steps_keep_the_times_the_provider_measured() {
+        let mut state = test_state();
+        let thread = json!({
+            "turns": [{
+                "items": [{
+                    "type": "plan",
+                    "text": "✔ 1. 확인\n✔ 2. 수정",
+                    "steps": [
+                        { "step": "1. 확인", "status": "completed", "elapsedMs": 6_000 },
+                        { "step": "2. 수정", "status": "completed", "elapsedMs": 4_000 }
+                    ]
+                }]
+            }]
+        });
+
+        state.load_history(&thread, None);
+
+        let summary = state.plan_summary.expect("restored plan summary");
+        assert_eq!(summary.steps.len(), 2);
+        assert_eq!(summary.steps[0].text, "1. 확인");
+        assert_eq!(summary.steps[0].elapsed, Some(Duration::from_secs(6)));
+        assert_eq!(summary.steps[1].elapsed, Some(Duration::from_secs(4)));
+        assert!(
+            summary
+                .steps
+                .iter()
+                .all(|step| step.status == PlanStepStatus::Completed)
+        );
     }
 
     #[test]

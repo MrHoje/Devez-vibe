@@ -526,9 +526,12 @@ mod tests {
         assert!(bridge.contains("if (numberedTaskIndex(subject) === 1) tasks.clear();"));
         assert!(
             bridge.contains(
-                "applyTaskUpdate(session.tasks, input, turnId, () => emitPlan(session));"
+                "applyTaskUpdate(session.tasks, input, turnId, () => emitPlan(session), Date.now());"
             )
         );
+        // A restored plan totals to zero unless the step times ride with it.
+        assert!(bridge.contains("elapsedMs: task.elapsedMs ?? null,"));
+        assert!(bridge.contains("function messageTime(message)"));
         assert!(bridge.contains("session.tasks = latestTaskPlan(session.tasks);"));
         assert!(
             bridge.contains(
