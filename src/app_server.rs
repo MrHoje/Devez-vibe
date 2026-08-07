@@ -380,10 +380,38 @@ fn apply_originator_override(command: &mut Command) {
 /// Codex app-server starts stdio MCP children with an isolated environment.
 /// Put the DevezCode room in this invocation's MCP override so every browser
 /// call is bound to the tab that started Devez Vibe, without mutating global config.
+///
+/// The override only carries `env`, so on a Codex home that never declared the
+/// browser server it would create an entry with neither `command` nor `url` and
+/// Codex would refuse the whole config with `invalid transport`, taking the
+/// app-server down with it. Skip the override there: the browser MCP does not
+/// exist in that install anyway, so there is no room to bind.
 fn apply_devezcode_room_override(command: &mut Command, room: Option<&str>) {
+    if !codex_config_declares_devez_browser() {
+        return;
+    }
     if let Some(override_value) = devezcode_room_override(room) {
         command.arg("-c").arg(override_value);
     }
+}
+
+fn codex_config_declares_devez_browser() -> bool {
+    crate::state::codex_home()
+        .map(|home| home.join("config.toml"))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|config| config_declares_devez_browser(&config))
+}
+
+fn config_declares_devez_browser(config: &str) -> bool {
+    config.lines().any(|line| {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        matches!(
+            line,
+            "[mcp_servers.devez-browser]"
+                | "[mcp_servers.\"devez-browser\"]"
+                | "[mcp_servers.'devez-browser']"
+        )
+    })
 }
 
 fn devezcode_room_override(room: Option<&str>) -> Option<String> {
@@ -607,6 +635,23 @@ mod tests {
             Some("mcp_servers.devez-browser.env.DEVEZCODE_ROOM_ID=\"room-1\"".to_string())
         );
         assert_eq!(devezcode_room_override(None), None);
+    }
+
+    #[test]
+    fn the_room_override_only_applies_where_the_browser_mcp_is_declared() {
+        assert!(config_declares_devez_browser(
+            "model = \"x\"\n[mcp_servers.devez-browser]\ncommand = \"node\"\n"
+        ));
+        assert!(config_declares_devez_browser(
+            "  [mcp_servers.\"devez-browser\"]  # bridge\n"
+        ));
+        assert!(config_declares_devez_browser("[mcp_servers.'devez-browser']"));
+        assert!(!config_declares_devez_browser(
+            "[mcp_servers.chrome-devtools]\ncommand = \"npx\"\n"
+        ));
+        assert!(!config_declares_devez_browser(
+            "[mcp_servers.devez-browser.env]\nDEVEZCODE_ROOM_ID = \"room-1\"\n"
+        ));
     }
 
     #[test]
