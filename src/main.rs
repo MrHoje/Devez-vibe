@@ -5351,7 +5351,10 @@ mod tests {
             Action::RpcResponse { ref result, .. } if result.to_string().contains("답")
         ));
         let committed = state.drain_committed();
-        assert_eq!(committed.last().map(|block| block.body.as_str()), Some("답"));
+        assert_eq!(
+            committed.last().map(|block| block.body.as_str()),
+            Some("어느 것인가요?\n  → 답")
+        );
     }
 
     #[test]

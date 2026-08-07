@@ -9377,22 +9377,11 @@ fn commit_user_input_answers(
     if answered.is_empty() {
         return;
     }
-    let body = if answered.len() == 1 {
-        answered[0].1.to_owned()
-    } else {
-        answered
-            .into_iter()
-            .map(|(question, answer)| {
-                let label = if question.header.is_empty() {
-                    question.question.as_str()
-                } else {
-                    question.header.as_str()
-                };
-                format!("{label}: {answer}")
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    let body = answered
+        .into_iter()
+        .map(|(question, answer)| format!("{}\n  → {answer}", question.question.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
     state.commit_welcome_card();
     state
         .committed
@@ -11055,7 +11044,48 @@ mod tests {
         );
         let sent = state.committed.last().expect("sent answer history");
         assert!(matches!(sent.kind, BlockKind::User));
-        assert_eq!(sent.body, "직접 보낸 답");
+        assert_eq!(sent.body, "어느 것인가요?\n  → 직접 보낸 답");
+    }
+
+    #[test]
+    fn multiple_question_answers_keep_each_answer_under_its_question() {
+        let mut state = test_state();
+        state.begin_server_request(
+            json!(1),
+            "item/tool/requestUserInput",
+            &json!({
+                "questions": [
+                    {
+                        "id": "q1",
+                        "question": "첫 질문인가요?",
+                        "options": [{ "label": "첫 답", "description": "설명" }]
+                    },
+                    {
+                        "id": "q2",
+                        "question": "둘째 질문인가요?",
+                        "options": [
+                            { "label": "아니오", "description": "설명" },
+                            { "label": "둘째 답", "description": "설명" }
+                        ]
+                    }
+                ]
+            }),
+        );
+
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+            Action::None
+        ));
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)),
+            Action::RpcResponse { .. }
+        ));
+
+        let sent = state.committed.last().expect("sent answer history");
+        assert_eq!(
+            sent.body,
+            "첫 질문인가요?\n  → 첫 답\n둘째 질문인가요?\n  → 둘째 답"
+        );
     }
 
     #[test]
