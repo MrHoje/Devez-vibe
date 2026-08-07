@@ -4594,6 +4594,18 @@ impl AppState {
 
     pub fn render_tick(&mut self) -> TickResult {
         let mut full_redraw = false;
+        // Windows Terminal owns the visible IME preedit until composition is
+        // committed as a key event. Any spinner repaint hides and restores the
+        // cursor, erasing that preedit and exposing our placeholder again. Keep
+        // periodic paints still while an inline answer owns the cursor; the
+        // committed character event will paint the new text normally.
+        let inline_answer_active = matches!(
+            self.pending,
+            Some(PendingInteraction::UserInput {
+                text_mode: true,
+                ..
+            })
+        );
         // Compaction animates the same row a turn does, so it keeps the frame
         // loop alive even on a runtime that reports no turn while it runs.
         let animating = self.busy || self.compacting();
@@ -4657,8 +4669,10 @@ impl AppState {
             self.quit_armed_at = None;
         }
         TickResult {
-            redraw: animating || subagent_elapsed_changed || plan_shimmer_active || full_redraw,
-            animation_only: (animating || plan_shimmer_active)
+            redraw: !inline_answer_active
+                && (animating || subagent_elapsed_changed || plan_shimmer_active || full_redraw),
+            animation_only: !inline_answer_active
+                && (animating || plan_shimmer_active)
                 && !subagent_elapsed_changed
                 && !full_redraw,
         }
@@ -10866,6 +10880,36 @@ mod tests {
                     if result.to_string().contains("둘째")
             ),
             "row 2 did not answer with its own option"
+        );
+    }
+
+    #[test]
+    fn an_inline_question_answer_pauses_repaints_that_erase_ime_preedit() {
+        let question = json!({
+            "questions": [{
+                "id": "q1",
+                "question": "어느 것인가요?",
+                "options": [
+                    { "label": "첫째", "description": "설명" },
+                    { "label": "둘째", "description": "설명" },
+                    { "label": "셋째", "description": "설명" }
+                ]
+            }]
+        });
+        let mut state = test_state();
+        state.busy = true;
+        state.begin_server_request(json!(1), "item/tool/requestUserInput", &question);
+
+        assert!(state.render_tick().redraw, "the running turn normally animates");
+        state.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        let composing = state.render_tick();
+        assert!(!composing.redraw, "a tick would erase the terminal's IME preedit");
+        assert!(!composing.animation_only);
+
+        state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(
+            state.render_tick().redraw,
+            "animation resumes after leaving the inline answer"
         );
     }
 

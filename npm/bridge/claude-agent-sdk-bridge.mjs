@@ -1582,8 +1582,14 @@ function historyState(messages) {
         const prompt = turn.items.find((item) => item.type === "userMessage");
         if (prompt) prompt.model = turn.model;
       }
+      const prompt = turn.items.find((item) => item.type === "userMessage");
+      const historyTurn = { koreanRequest: isKoreanPrompt(prompt?.content) };
       for (const block of blocks) {
-        if (block.type === "text") turn.items.push({ id: `${message.uuid}-text`, type: "agentMessage", text: block.text || "", provider: "Claude" });
+        if (block.type === "text") {
+          const visible = normalizeProgressText(historyTurn, block.text);
+          if (!visible.trim() && String(block.text || "").trim()) continue;
+          turn.items.push({ id: `${message.uuid}-text`, type: "agentMessage", text: visible, provider: "Claude" });
+        }
         else if (block.type === "thinking") turn.items.push({ id: `${message.uuid}-thinking`, type: "reasoning", summary: [block.thinking || ""] });
         else if (block.type === "tool_use") {
           const pending = { name: block.name, input: block.input || {}, item: toolItem({}, block.id, block.name, block.input || {}) };
@@ -1943,6 +1949,47 @@ async function runSelfTest() {
     message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content }] },
     tool_use_result: toolUseResult,
   });
+  const resumedProgress = historyTurns([
+    user("progress-user", "환자 변경 동기화를 수정해"),
+    {
+      type: "assistant",
+      uuid: "progress-assistant",
+      message: {
+        role: "assistant",
+        model: "claude-opus-5",
+        content: [
+          { type: "text", text: "Now hook the patient-change event in CvForm." },
+          { type: "tool_use", id: "progress-read", name: "Read", input: { file_path: "CvForm.cs" } },
+        ],
+      },
+    },
+    taskResult("progress-result", "progress-read", { content: "ok" }, "ok"),
+    {
+      type: "assistant",
+      uuid: "progress-assistant-2",
+      message: {
+        role: "assistant",
+        model: "claude-opus-5",
+        content: [
+          { type: "text", text: "Now the Lab-side receiver." },
+          { type: "tool_use", id: "progress-read-2", name: "Read", input: { file_path: "LabReceiver.cs" } },
+        ],
+      },
+    },
+    taskResult("progress-result-2", "progress-read-2", { content: "ok" }, "ok"),
+    assistant("progress-final", "claude-opus-5", "환자 변경 동기화를 수정했습니다."),
+  ]);
+  const resumedProgressText = resumedProgress[0]?.items
+    .filter((item) => item.type === "agentMessage")
+    .map((item) => item.text);
+  const englishNowText = historyTurns([
+    user("english-user", "Start the answer with Now"),
+    assistant("english-assistant", "claude-opus-5", "Now the answer starts."),
+  ])[0]?.items.find((item) => item.type === "agentMessage")?.text;
+  if (JSON.stringify(resumedProgressText) !== JSON.stringify(["환자 변경 동기화를 수정했습니다."])
+    || englishNowText !== "Now the answer starts.") {
+    throw new Error(`Claude resumed progress normalization self-test failed: ${JSON.stringify({ resumedProgressText, englishNowText })}`);
+  }
   const taskMessages = [user("plan", "작업을 진행해")];
   for (let index = 1; index <= 6; index++) {
     const id = String(24 + index);
