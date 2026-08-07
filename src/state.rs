@@ -2857,6 +2857,10 @@ pub struct AppState {
     /// needs a bound thread to switch away from, so the target waits here until the
     /// event loop can run it.
     deferred_resume: Option<DeferredResume>,
+    /// Mode changes made while the first session is still being created. Their
+    /// visible state changes immediately; the thread/config RPCs run as soon as
+    /// that session has an id.
+    deferred_startup_actions: Vec<Action>,
 }
 
 /// A session switch owed once the session being started exists, and whatever the
@@ -3015,6 +3019,7 @@ impl AppState {
             selected_completion_bindings: Vec::new(),
             mcp_failures: Vec::new(),
             deferred_resume: None,
+            deferred_startup_actions: Vec::new(),
         };
         if let Some(count) = env::var("DEVEZ_VIBE_TEST_PLAN_STEPS")
             .ok()
@@ -3196,26 +3201,20 @@ impl AppState {
         }
     }
 
-    /// One `/provider` row: the connection mark, the name, and what the runtime
-    /// is doing right now.
-    fn runtime_row(&self, index: usize) -> OverlayLine {
-        let enabled = self.runtime_connected(index);
-        let state = if !enabled {
-            "연결 안 함"
-        } else if index == self.runtime_choice_index() {
+    /// One `/provider` step states both facts independently: whether this
+    /// runtime may connect and whether this session currently uses it.
+    fn runtime_step_label(&self, index: usize) -> String {
+        let connection = if self.runtime_connected(index) {
+            "연결됨"
+        } else {
+            "연결 안 됨"
+        };
+        let usage = if index == self.runtime_choice_index() {
             "사용 중"
         } else {
-            "연결됨"
+            "미사용"
         };
-        OverlayLine {
-            text: format!(
-                "{} {}  ·  {state}",
-                if enabled { '☑' } else { '☐' },
-                RUNTIME_CHOICES[index]
-            ),
-            selected: false,
-            muted: !enabled,
-        }
+        format!("{} · {connection} · {usage}", RUNTIME_CHOICES[index])
     }
 
     fn switch_provider(&mut self, provider: ModelProvider) {
@@ -3395,6 +3394,28 @@ impl AppState {
     /// happen twice.
     pub fn take_deferred_resume(&mut self) -> Option<DeferredResume> {
         self.deferred_resume.take()
+    }
+
+    /// Keeps only the latest value of each startup-safe setting. Replaying every
+    /// intermediate click after the thread appears would briefly apply stale modes.
+    pub fn defer_startup_action(&mut self, action: Action) {
+        let same_setting = |pending: &Action| {
+            matches!(
+                (pending, &action),
+                (Action::SetFast(_), Action::SetFast(_))
+                    | (Action::SetClaudePermissionMode(_), Action::SetClaudePermissionMode(_))
+                    | (
+                        Action::PersistVibeDisplayModes { .. },
+                        Action::PersistVibeDisplayModes { .. }
+                    )
+            )
+        };
+        self.deferred_startup_actions.retain(|pending| !same_setting(pending));
+        self.deferred_startup_actions.push(action);
+    }
+
+    pub fn take_deferred_startup_actions(&mut self) -> Vec<Action> {
+        std::mem::take(&mut self.deferred_startup_actions)
     }
 
     /// Binds the session `thread/start` returned to a state that is already on
@@ -7234,14 +7255,14 @@ impl AppState {
             PendingInteraction::RuntimePicker { selected } => Some(OverlayView {
                 closable: true,
                 title: "Provider".to_owned(),
-                lines: (0..RUNTIME_CHOICES.len())
-                    .map(|index| OverlayLine {
-                        selected: index == *selected,
-                        ..self.runtime_row(index)
-                    })
-                    .collect(),
-                slider: None,
-                hint: "↑↓ navigate  ·  Enter switch  ·  Space connect/disconnect  ·  Esc close"
+                lines: Vec::new(),
+                slider: Some(EffortSlider {
+                    efforts: (0..RUNTIME_CHOICES.len())
+                        .map(|index| self.runtime_step_label(index))
+                        .collect(),
+                    selected: *selected,
+                }),
+                hint: "←→ 이동  ·  Enter 사용  ·  Space 연결 전환  ·  Esc 닫기"
                     .to_owned(),
                 style: OverlayStyle::Picker,
                 input: None,
@@ -8697,6 +8718,19 @@ impl AppState {
                 } else {
                     self.pending = Some(PendingInteraction::SettingPicker { setting, selected });
                     Action::Tick(false)
+                }
+            }
+            Some(PendingInteraction::RuntimePicker { .. }) if step < RUNTIME_CHOICES.len() => {
+                self.apply_runtime_choice(step)
+            }
+            Some(PendingInteraction::ProviderPicker(mut picker)) => {
+                match picker.select_step(step) {
+                    ProviderPickerResult::None => {
+                        self.pending = Some(PendingInteraction::ProviderPicker(picker));
+                        Action::None
+                    }
+                    ProviderPickerResult::Cancel => Action::None,
+                    ProviderPickerResult::Submit(request) => Action::SubmitProviderAuth(request),
                 }
             }
             other => {
@@ -14948,16 +14982,24 @@ mod tests {
 
         state.run_slash_command("/provider");
         let overlay = state.overlay_view().expect("provider picker");
-        let rows = overlay
-            .lines
-            .iter()
-            .map(|line| line.text.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(rows, ["☑ Claude  ·  사용 중", "☑ Codex  ·  연결됨"]);
-        assert!(overlay.lines[0].selected);
+        assert!(overlay.lines.is_empty());
+        let slider = overlay.slider.expect("provider steps");
+        assert_eq!(
+            slider.efforts,
+            ["Claude · 연결됨 · 사용 중", "Codex · 연결됨 · 미사용"]
+        );
+        assert_eq!(slider.selected, 0);
 
         state.handle_key(KeyEvent::from(KeyCode::Down));
-        assert!(state.overlay_view().expect("picker").lines[1].selected);
+        assert_eq!(
+            state
+                .overlay_view()
+                .expect("picker")
+                .slider
+                .expect("provider steps")
+                .selected,
+            1
+        );
 
         assert!(matches!(
             state.handle_key(KeyEvent::from(KeyCode::Enter)),
@@ -14974,8 +15016,16 @@ mod tests {
 
         state.switch_to_codex();
         state.run_slash_command("/provider");
-        assert!(state.overlay_view().expect("picker").lines[1].selected);
-        assert!(matches!(state.click_overlay_row(0), Action::None));
+        assert_eq!(
+            state
+                .overlay_view()
+                .expect("picker")
+                .slider
+                .expect("provider steps")
+                .selected,
+            1
+        );
+        assert!(matches!(state.click_effort_step(0), Action::None));
         assert_eq!(state.selected_model_name(), "claude:sonnet");
     }
 
@@ -14996,8 +15046,10 @@ mod tests {
             }
         ));
         let overlay = state.overlay_view().expect("picker stays open");
-        assert_eq!(overlay.lines[1].text, "☐ Codex  ·  연결 안 함");
-        assert!(overlay.lines[1].muted);
+        assert_eq!(
+            overlay.slider.expect("provider steps").efforts[1],
+            "Codex · 연결 안 됨 · 미사용"
+        );
         state.pending = None;
 
         // The command reconnects rather than failing: choosing Codex is what
@@ -15032,12 +15084,13 @@ mod tests {
         state.prompt_for_provider_if_unconnected();
         assert!(state.provider_choice_pending);
         let overlay = state.overlay_view().expect("provider picker");
-        let rows = overlay
-            .lines
-            .iter()
-            .map(|line| line.text.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(rows, ["☐ Claude  ·  연결 안 함", "☐ Codex  ·  연결 안 함"]);
+        assert_eq!(
+            overlay.slider.expect("provider steps").efforts,
+            [
+                "Claude · 연결 안 됨 · 사용 중",
+                "Codex · 연결 안 됨 · 미사용"
+            ]
+        );
         state.pending = None;
 
         state.editor.set_text("첫 질문");

@@ -501,6 +501,45 @@ function emitDelta(session, method, itemId, delta) {
   notify(method, { threadId: session.id, turnId: session.turn?.id, itemId, delta, provider: "Claude" });
 }
 
+function isKoreanPrompt(input) {
+  const prompt = (Array.isArray(input) ? input : [])
+    .filter((item) => item?.type === "text")
+    .map((item) => String(item.text || ""))
+    .join("\n");
+  return /[\uac00-\ud7a3]/.test(prompt);
+}
+
+function openingNotice(input) {
+  return isKoreanPrompt(input)
+    ? "요청 내용을 확인하고 필요한 작업을 진행하겠습니다."
+    : "I’ll review the request and proceed with the necessary work.";
+}
+
+function normalizeProgressText(turn, text) {
+  const value = String(text || "");
+  const trimmed = value.trim();
+  if (turn?.koreanRequest
+    && trimmed.length <= 160
+    && !/[\uac00-\ud7a3]/.test(trimmed)
+    && /^Now\b[^\r\n]*[.!?]?$/i.test(trimmed)) {
+    return "다음 부분을 이어서 확인하겠습니다.";
+  }
+  return value;
+}
+
+// Claude can answer with a tool_use as its first and only content block even
+// when the prompt asks for an opening update. Keep the visible contract stable
+// without duplicating a real model-written update.
+function emitOpeningNotice(session) {
+  if (!session.turn || session.turn.openingNoticeEmitted) return;
+  const text = session.turn.openingNotice;
+  const id = nextItemId(session, "opening");
+  const item = { id, type: "agentMessage", text, provider: "Claude" };
+  emitItem(session, "started", item);
+  emitItem(session, "completed", item);
+  session.turn.openingNoticeEmitted = true;
+}
+
 // Windows rounds larger timer delays up to the next scheduler slice. Ten
 // milliseconds lands near one terminal frame instead of visibly stepping at ~30ms.
 const SMOOTH_TEXT_INTERVAL_MS = 10;
@@ -642,7 +681,14 @@ async function processStreamEvent(session, message) {
     const smooth = block.type === "text"
       ? new SmoothTextStream((delta) => emitDelta(session, "item/agentMessage/delta", id, delta))
       : null;
-    session.streamBlocks.set(event.index, { id, type: block.type, text: "", smooth });
+    session.streamBlocks.set(event.index, {
+      id,
+      type: block.type,
+      text: "",
+      smooth,
+      languagePending: block.type === "text" && session.turn.koreanRequest ? "" : null,
+      holdEnglishProgress: false,
+    });
     emitItem(session, "started", item);
     return;
   }
@@ -652,13 +698,36 @@ async function processStreamEvent(session, message) {
     const delta = event.delta?.text || event.delta?.thinking || "";
     if (!delta) return;
     current.text += delta;
-    if (current.smooth) current.smooth.push(delta);
-    else emitDelta(session, "item/reasoning/summaryTextDelta", current.id, delta);
+    if (current.type === "text") session.turn.sawVisibleText = true;
+    if (!current.smooth) {
+      emitDelta(session, "item/reasoning/summaryTextDelta", current.id, delta);
+      return;
+    }
+    if (current.languagePending != null) {
+      current.languagePending += delta;
+      const probe = current.languagePending.trimStart();
+      const lower = probe.toLowerCase();
+      if (!current.holdEnglishProgress && "now".startsWith(lower)) return;
+      if (/^now(?:\s|$)/i.test(probe)) {
+        current.holdEnglishProgress = true;
+        return;
+      }
+      current.smooth.push(current.languagePending);
+      current.languagePending = null;
+      return;
+    }
+    current.smooth.push(delta);
     return;
   }
   if (event.type === "content_block_stop") {
     const current = session.streamBlocks.get(event.index);
     if (!current) return;
+    if (current.languagePending != null) {
+      const visible = normalizeProgressText(session.turn, current.languagePending);
+      current.text = visible;
+      current.smooth?.push(visible);
+      current.languagePending = null;
+    }
     await current.smooth?.finish();
     const item = current.type === "text"
       ? { id: current.id, type: "agentMessage", text: current.text, provider: "Claude" }
@@ -685,19 +754,26 @@ function processAssistant(session, message) {
     session.model,
   );
   const content = Array.isArray(message.message?.content) ? message.message.content : [];
-  for (const block of content) {
-    if (block.type === "tool_use") processToolUse(session, block);
-  }
+  const hasToolUse = content.some((block) => block.type === "tool_use");
+  const hasVisibleText = session.turn.sawVisibleText || content.some(
+    (block) => block.type === "text" && String(block.text || "").trim(),
+  );
+  // Without partial SDK events, replay completed text before tool items so the
+  // visible order still matches the assistant content order.
   if (!session.streamBlocks.size && !session.turn.sawStreamText) {
     for (const block of content) {
       if (block.type !== "text" && block.type !== "thinking") continue;
       const id = nextItemId(session, block.type);
       const item = block.type === "text"
-        ? { id, type: "agentMessage", text: block.text || "", provider: "Claude" }
+        ? { id, type: "agentMessage", text: normalizeProgressText(session.turn, block.text), provider: "Claude" }
         : { id, type: "reasoning", summary: [block.thinking || ""] };
       emitItem(session, "started", item);
       emitItem(session, "completed", item);
     }
+  }
+  if (hasToolUse && !hasVisibleText) emitOpeningNotice(session);
+  for (const block of content) {
+    if (block.type === "tool_use") processToolUse(session, block);
   }
 }
 
@@ -1348,10 +1424,11 @@ async function runPrompt(session, params) {
   }
   session.effort = effort;
   await applyPermissionMode(session, params.permissionMode);
-  const turnId = beginTurn(session);
+  const content = await inputContent(params.input, params.handoffContext);
+  const turnId = beginTurn(session, params.input);
   session.queue.push({
     type: "user",
-    message: { role: "user", content: await inputContent(params.input, params.handoffContext) },
+    message: { role: "user", content },
     parent_tool_use_id: null,
     session_id: id,
     origin: { kind: "human" },
@@ -1361,9 +1438,16 @@ async function runPrompt(session, params) {
 
 // A background task notification is an internal user message that starts its
 // own Claude response even though the host did not submit a new prompt.
-function beginTurn(session) {
+function beginTurn(session, input = []) {
   const turnId = `claude-turn-${session.turnSequence++}-${randomUUID()}`;
-  session.turn = { id: turnId, sawStreamText: false };
+  session.turn = {
+    id: turnId,
+    sawStreamText: false,
+    sawVisibleText: false,
+    koreanRequest: isKoreanPrompt(input),
+    openingNotice: openingNotice(input),
+    openingNoticeEmitted: false,
+  };
   session.lastContextUsage = null;
   notify("turn/started", { threadId: session.id, turn: { id: turnId } });
   return turnId;
@@ -1887,6 +1971,84 @@ async function runSelfTest() {
     || !lifecycleEvents.some((event) => event.method === "turn/subagent/line"
       && event.params?.line?.kind === "error")) {
     throw new Error(`Claude subagent lifecycle events self-test failed: ${lifecycleMethods}`);
+  }
+  const openingSession = {
+    id: "opening-self-test",
+    model: "claude:default",
+    models: [],
+    turn: null,
+    turnSequence: 1,
+    itemSequence: 1,
+    streamBlocks: new Map(),
+    tools: new Map(),
+    tasks: new Map(),
+    subagents: new Map(),
+    knownSubagents: new Map(),
+    lastContextUsage: null,
+    lastContextWindow: 0,
+  };
+  const openingCaptured = [];
+  process.stdout.write = (chunk) => {
+    openingCaptured.push(String(chunk));
+    return true;
+  };
+  try {
+    beginTurn(openingSession, [{ type: "text", text: "provider 메뉴를 수정해" }]);
+    processAssistant(openingSession, {
+      message: {
+        content: [{ type: "tool_use", id: "read-1", name: "Read", input: { file_path: "src/main.rs" } }],
+      },
+    });
+  } finally {
+    process.stdout.write = stdoutWrite;
+  }
+  const openingEvents = openingCaptured
+    .join("")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  const openingMessageIndex = openingEvents.findIndex((event) =>
+    event.method === "item/completed"
+      && event.params?.item?.type === "agentMessage"
+      && event.params.item.text === "요청 내용을 확인하고 필요한 작업을 진행하겠습니다.");
+  const openingToolIndex = openingEvents.findIndex((event) =>
+    event.method === "item/started" && event.params?.item?.type === "dynamicToolCall");
+  if (openingMessageIndex < 0 || openingToolIndex < 0 || openingMessageIndex > openingToolIndex) {
+    throw new Error(`Claude opening notice order self-test failed: ${JSON.stringify(openingEvents)}`);
+  }
+  const languageCaptured = [];
+  process.stdout.write = (chunk) => {
+    languageCaptured.push(String(chunk));
+    return true;
+  };
+  try {
+    openingSession.streamBlocks.clear();
+    await processStreamEvent(openingSession, {
+      event: { type: "content_block_start", index: 0, content_block: { type: "text" } },
+    });
+    await processStreamEvent(openingSession, {
+      event: { type: "content_block_delta", index: 0, delta: { text: "Now the tile view logic." } },
+    });
+    await processStreamEvent(openingSession, {
+      event: { type: "content_block_stop", index: 0 },
+    });
+  } finally {
+    process.stdout.write = stdoutWrite;
+  }
+  const languageEvents = languageCaptured
+    .join("")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  const visibleLanguage = languageEvents
+    .filter((event) => event.method === "item/agentMessage/delta")
+    .map((event) => event.params?.delta || "")
+    .join("");
+  if (visibleLanguage !== "다음 부분을 이어서 확인하겠습니다."
+    || languageEvents.some((event) => JSON.stringify(event).includes("Now the tile view logic."))) {
+    throw new Error(`Claude Korean progress normalization self-test failed: ${JSON.stringify(languageEvents)}`);
   }
   const smoothText = "Claude가 👨‍👩‍👧‍👦 한 문장을 한꺼번에 보내도 부드럽게 표시합니다.";
   const emitted = [];

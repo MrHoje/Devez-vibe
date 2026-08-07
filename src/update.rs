@@ -20,10 +20,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// nothing reads this today; rewrite it each release for the changelog.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "/provider replaces /claude and /codex: pick the runtime, and connect or disconnect it with Space.",
-    "No provider is connected until you choose one, so a PC that cannot reach the Codex app-server never calls it.",
-    "Running subagents are listed under the composer, and each row opens its recorded work.",
-    "Claude rate limits are published to the DevezCode usage card as soon as a turn ends.",
+    "Claude 작업은 첫 안내와 진행 메시지를 요청 언어에 맞춰 자연스럽게 표시합니다.",
+    "새 대화가 열리기 전 변경한 Fast, 권한, 표시 설정도 세션 시작 후 안전하게 저장됩니다.",
+    "Provider 전환과 새 세션 시작 중에도 선택한 설정이 유지됩니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

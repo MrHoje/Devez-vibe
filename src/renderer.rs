@@ -1514,10 +1514,17 @@ impl Renderer {
             rows.push((*screen_row, previous, current, repaint_plan_row));
         }
 
+        let repainting_plan = rows.iter().any(|(screen_row, _, _, _)| {
+            *screen_row < self.animation_plan_rows
+        });
         queue!(self.out, Print("\x1b[?2026h"))?;
-        // 시머·스피너 프레임은 커서 행을 건드리지 않는다. 여기서 Hide/Show를
-        // 반복하면 80ms마다 커서 깜빡임이 초기화돼 컴포저 커서가 떨리므로,
-        // 동기 업데이트로 중간 그리기를 감추고 커서 표시 상태는 그대로 둔다.
+        // 일부 터미널은 동기 업데이트 중에도 MoveTo의 중간 위치에 커서를 잠깐
+        // 그린다. 시머가 작업 단계 행을 다시 칠할 때만 한 번 숨기고, 시머가
+        // 끝난 뒤 일반 프레임이 컴포저 위치에서 다시 표시한다.
+        if Self::should_hide_cursor_for_plan_animation(repainting_plan, self.cursor_shown) {
+            queue!(self.out, Hide)?;
+            self.cursor_shown = false;
+        }
         let mut result = Ok(());
         for (screen_row, previous, current, repaint_plan_row) in &rows {
             // A changed plan step can shorten or restyle wide Korean text. Clear
@@ -1550,10 +1557,6 @@ impl Renderer {
                 self.cursor_line.min(u16::MAX as usize) as u16
             )
         )?;
-        if !self.cursor_shown {
-            queue!(self.out, Show)?;
-            self.cursor_shown = true;
-        }
         queue!(self.out, Print("\x1b[?2026l"))?;
         self.painted_hovered_tool = self.hovered_tool;
         self.painted_hovered_pick = self.hovered_pick.clone();
@@ -1561,7 +1564,11 @@ impl Renderer {
         Ok(())
     }
 
-    /// One screen, bottom-anchored: the live frame takes the last rows and the
+    fn should_hide_cursor_for_plan_animation(repainting_plan: bool, cursor_shown: bool) -> bool {
+    repainting_plan && cursor_shown
+}
+
+/// One screen, bottom-anchored: the live frame takes the last rows and the
     /// transcript fills what is left above it. The composer is placed by row
     /// index rather than by trailing the last thing printed, which is the whole
     /// reason scrolling cannot carry it off screen.
@@ -9273,6 +9280,13 @@ mod tests {
         assert!(!output.contains("\x1b[?25l"));
         assert!(!output.contains("\x1b[?25h"));
         assert!(output.contains("\x1b[2;1H"));
+    }
+
+    #[test]
+    fn plan_animation_hides_a_visible_cursor_only_on_its_first_frame() {
+        assert!(Renderer::should_hide_cursor_for_plan_animation(true, true));
+        assert!(!Renderer::should_hide_cursor_for_plan_animation(true, false));
+        assert!(!Renderer::should_hide_cursor_for_plan_animation(false, true));
     }
 
     #[test]

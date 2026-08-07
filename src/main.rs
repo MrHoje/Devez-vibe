@@ -384,6 +384,7 @@ async fn start_session(
     // runtime's session, not from the id it is named after. The routing knows; the
     // thread id does not.
     state.note_resume_id(&server.resume_id(&state.thread_id));
+    apply_deferred_startup_actions(server, state).await;
     if is_resuming {
         state.load_history(&thread, rollout.as_ref());
         state.begin_cost_restore();
@@ -586,6 +587,19 @@ fn hold_until_thread(
         // The picker is built from `thread/list`; it never reads the thread being
         // started, so there is nothing to wait for before showing it.
         Action::OpenResume => Some(Action::OpenResume),
+        // These controls already update their in-memory value when clicked, and
+        // the queued first prompt reads that value. Delay only the RPC persistence
+        // until the thread id arrives instead of discarding the click.
+        Action::SetFast(enabled) => {
+            state.set_fast_mode(enabled);
+            state.defer_startup_action(Action::SetFast(enabled));
+            None
+        }
+        action @ (Action::SetClaudePermissionMode(_)
+        | Action::PersistVibeDisplayModes { .. }) => {
+            state.defer_startup_action(action);
+            None
+        }
         // Switching away does need a bound thread, so the pick is held and replayed
         // once the session lands rather than refused.
         Action::ResumeThread(target) => {
@@ -1403,77 +1417,12 @@ async fn execute_action(
             }
         }
         Action::SetFast(enabled) => {
-            let service_tier = if enabled {
-                state
-                    .selected_model()
-                    .and_then(|model| model.fast_service_tier.as_deref())
-                    .unwrap_or("priority")
-                    .to_owned()
-            } else {
-                "default".to_owned()
-            };
-            let update = server
-                .request(
-                    "thread/settings/update",
-                    json!({
-                        "threadId": state.thread_id,
-                        "serviceTier": service_tier
-                    }),
-                )
-                .await;
-            match update {
-                Ok(_) => {
-                    state.set_fast_mode(enabled);
-                    if let Err(error) = server
-                        .request(
-                            "config/value/write",
-                            json!({
-                                "keyPath": "service_tier",
-                                "value": service_tier,
-                                "mergeStrategy": "upsert"
-                            }),
-                        )
-                        .await
-                    {
-                        state.push_notice(
-                            BlockKind::Warning,
-                            "Fast 설정 저장 실패",
-                            error.to_string(),
-                        );
-                    }
-                }
-                Err(error) => {
-                    state.push_notice(BlockKind::Error, "Fast 전환 실패", error.to_string())
-                }
-            }
+            set_fast_mode(server, state, enabled).await;
         }
         // The mode also rides along with every turn, so a session that has not
         // started yet still opens under it. This call is what moves a live one.
         Action::SetClaudePermissionMode(mode) => {
-            if let Err(error) = server
-                .request(
-                    "thread/permissionMode/set",
-                    json!({ "threadId": state.thread_id, "permissionMode": mode.wire() }),
-                )
-                .await
-            {
-                state.push_notice(BlockKind::Warning, "권한 모드 전환 실패", error.to_string());
-            }
-            // Shift+Tab and a badge click both land here, and both are meant to
-            // stick: the mode becomes the default the next session opens under.
-            if let Err(error) = server
-                .request(
-                    "config/value/write",
-                    config_value_write_params(state::CLAUDE_PERMISSION_MODE_KEY, mode.wire()),
-                )
-                .await
-            {
-                state.push_notice(
-                    BlockKind::Warning,
-                    "권한 모드 기본값 저장 실패",
-                    error.to_string(),
-                );
-            }
+            set_claude_permission_mode(server, state, mode).await;
         }
         Action::PersistShellDisplayMode(mode) => {
             if let Err(error) = server
@@ -1506,20 +1455,7 @@ async fn execute_action(
             }
         }
         Action::PersistVibeDisplayModes { vibe, response, shell, diff } => {
-            for (key, value) in [
-                ("vibe_mode", vibe.config_value()),
-                ("model_verbosity", response.model_verbosity()),
-                ("shell_display_mode", shell.config_value()),
-                ("diff_display_mode", diff.config_value()),
-            ] {
-                if let Err(error) = server
-                    .request("config/value/write", config_value_write_params(key, value))
-                    .await
-                {
-                    state.push_notice(BlockKind::Warning, "Vibe 표시 설정 저장 실패", error.to_string());
-                    break;
-                }
-            }
+            persist_vibe_display_modes(server, state, vibe, response, shell, diff).await;
         }
         Action::PersistStatusLine { key_path, enabled } => {
             if let Err(error) = server
@@ -2620,12 +2556,31 @@ async fn finish_thread_switch(
     renderer: &mut Renderer,
     queued: Option<String>,
 ) -> Result<bool> {
+    apply_deferred_startup_actions(server, state).await;
     draw(state, renderer)?;
     if let Some(text) = queued {
         draw(state, renderer)?;
         send_queued_prompt(server, state, text).await;
     }
     Ok(false)
+}
+
+/// Commits mode clicks made while a new session had no id yet. Their local value
+/// was already visible and will be used by any queued first prompt; this only
+/// synchronizes the new thread and the saved default once both are addressable.
+async fn apply_deferred_startup_actions(server: &BackendServer, state: &mut AppState) {
+    for action in state.take_deferred_startup_actions() {
+        match action {
+            Action::SetFast(enabled) => set_fast_mode(server, state, enabled).await,
+            Action::SetClaudePermissionMode(mode) => {
+                set_claude_permission_mode(server, state, mode).await
+            }
+            Action::PersistVibeDisplayModes { vibe, response, shell, diff } => {
+                persist_vibe_display_modes(server, state, vibe, response, shell, diff).await
+            }
+            _ => unreachable!("only startup-safe mode actions are deferred"),
+        }
+    }
 }
 
 /// Sends a prompt typed during a switch. Returning from a side conversation can
@@ -2798,6 +2753,105 @@ fn execute_local_action(
     Ok(false)
 }
 
+async fn set_fast_mode(server: &BackendServer, state: &mut AppState, enabled: bool) {
+    let service_tier = if enabled {
+        state
+            .selected_model()
+            .and_then(|model| model.fast_service_tier.as_deref())
+            .unwrap_or("priority")
+            .to_owned()
+    } else {
+        "default".to_owned()
+    };
+    let update = server
+        .request(
+            "thread/settings/update",
+            json!({
+                "threadId": state.thread_id,
+                "serviceTier": service_tier
+            }),
+        )
+        .await;
+    match update {
+        Ok(_) => {
+            if state.effective_fast_mode() != enabled {
+                state.set_fast_mode(enabled);
+            }
+            if let Err(error) = server
+                .request(
+                    "config/value/write",
+                    json!({
+                        "keyPath": "service_tier",
+                        "value": service_tier,
+                        "mergeStrategy": "upsert"
+                    }),
+                )
+                .await
+            {
+                state.push_notice(
+                    BlockKind::Warning,
+                    "Fast 설정 저장 실패",
+                    error.to_string(),
+                );
+            }
+        }
+        Err(error) => state.push_notice(BlockKind::Error, "Fast 전환 실패", error.to_string()),
+    }
+}
+
+async fn set_claude_permission_mode(
+    server: &BackendServer,
+    state: &mut AppState,
+    mode: state::ClaudePermissionMode,
+) {
+    if let Err(error) = server
+        .request(
+            "thread/permissionMode/set",
+            json!({ "threadId": state.thread_id, "permissionMode": mode.wire() }),
+        )
+        .await
+    {
+        state.push_notice(BlockKind::Warning, "권한 모드 전환 실패", error.to_string());
+    }
+    if let Err(error) = server
+        .request(
+            "config/value/write",
+            config_value_write_params(state::CLAUDE_PERMISSION_MODE_KEY, mode.wire()),
+        )
+        .await
+    {
+        state.push_notice(
+            BlockKind::Warning,
+            "권한 모드 기본값 저장 실패",
+            error.to_string(),
+        );
+    }
+}
+
+async fn persist_vibe_display_modes(
+    server: &BackendServer,
+    state: &mut AppState,
+    vibe: VibeMode,
+    response: state::ResponseLength,
+    shell: ShellDisplayMode,
+    diff: DiffDisplayMode,
+) {
+    for (key, value) in [
+        ("vibe_mode", vibe.config_value()),
+        ("model_verbosity", response.model_verbosity()),
+        ("shell_display_mode", shell.config_value()),
+        ("diff_display_mode", diff.config_value()),
+    ] {
+        if let Err(error) = server
+            .request("config/value/write", config_value_write_params(key, value))
+            .await
+        {
+            state.push_notice(BlockKind::Warning, "Vibe 표시 설정 저장 실패", error.to_string());
+            break;
+        }
+    }
+}
+
 fn config_value_write_params(key_path: &str, value: &str) -> Value {
     json!({
         "keyPath": key_path,
@@ -2852,6 +2906,9 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
 const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "Devez Vibe에서 작업한다. Task 목록의 설명과 모든 Task 제목은 반드시 자연스러운 한국어로 작성한다. ",
     "코드, 명령어, 경로, 제품명 등 기술 식별자는 원문을 유지한다.\n",
+    "최우선 시작 응답 규칙: 단순 질문이 아닌 작업에서는 첫 응답 content block을 반드시 사용자에게 보이는 짧은 진행 안내 text로 출력한다. ",
+    "TaskCreate를 포함한 어떤 tool_use도 이 text보다 먼저 출력하지 않는다. 같은 assistant message에 text와 tool_use를 함께 출력할 때도 text를 앞에 둔다. ",
+    "진행 안내에는 요청에서 무엇을 먼저 확인하고 이어서 무엇을 할지 사용자의 언어로 한두 문장만 적는다.\n",
     "최우선 작업 단계 규칙: Read, Grep, Glob, Bash 등 작업 도구를 두 번 이상 호출할 가능성이 있으면 다른 도구보다 먼저 TaskCreate를 호출한다. ",
     "TaskCreate 없이 두 번째 작업 도구를 호출하면 지침 위반이다. 모든 TaskCreate가 끝나면 다른 작업 도구보다 먼저 첫 Task를 TaskUpdate로 `in_progress`로 바꾼다. ",
     "모든 Task는 예외 없이 `pending` → `in_progress` → `completed` 순서로 바꾸며 `pending`에서 `completed`로 바로 바꾸지 않는다. ",
@@ -2874,7 +2931,8 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 검색에서 찾지 못했다는 이유만으로 기능이나 코드가 없다고 단정하지 않는다. 현재 구현, 과거 문제의 원인, 추측을 구분하고 근거가 부족하면 미확인이라고 밝힌다.\n",
     "- 최종 답변에는 직접적인 결론, 이를 뒷받침하는 핵심 근거, 확인 범위나 한계만 우선해서 담는다. 읽기 전용 수행 여부나 내부 절차는 결과 판단에 필요할 때만 언급한다.\n",
     "- 사용자에게 보이는 진행 안내와 답변은 사용자가 요청한 언어로 작성한다. ",
-    "한국어 요청에는 `Now ...` 같은 독립된 영어 진행 문장을 도구 호출 사이에도 출력하지 않는다.\n",
+    "한국어 요청에는 `Now ...` 같은 독립된 영어 진행 문장을 도구 호출 사이에도 출력하지 않는다. ",
+    "`Now the tile view logic.` 또는 `Now the filter builder.`도 금지한다.\n",
     "진행 보고 규칙:\n",
     "- 단순 질문이 아닌 작업은 첫 도구 호출 전에 무엇을 확인하고 이어서 무엇을 할지 한두 문장으로 알린다. ",
     "이후에는 새 사실이 사용자 판단을 바꾸거나 작업 범위가 달라질 때만 짧게 알리고, 같은 내용을 반복하지 않는다.\n",
@@ -4792,6 +4850,8 @@ mod tests {
         );
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskCreate"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskUpdate"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("첫 응답 content block"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("어떤 tool_use도 이 text보다 먼저 출력하지 않는다"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("두 번째 작업 도구를 호출하면 지침 위반"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`pending`에서 `completed`로 바로 바꾸지 않는다"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("전체 200자 이내"));
@@ -5341,6 +5401,36 @@ mod tests {
         assert!(hold_until_thread(&mut state, Action::Quit, &mut queued).is_some());
         assert!(hold_until_thread(&mut state, Action::Compact, &mut queued).is_none());
         assert!(hold_until_thread(&mut state, Action::ShowDiff, &mut queued).is_none());
+    }
+
+    #[test]
+    fn startup_keeps_mode_clicks_until_the_thread_is_bound() {
+        let mut state = starting_state();
+        let mut queued = None;
+
+        let vibe = pick_action(&mut state, Pick::VibeMode);
+        assert!(hold_until_thread(&mut state, vibe, &mut queued).is_none());
+        assert!(hold_until_thread(&mut state, Action::SetFast(true), &mut queued).is_none());
+        assert!(hold_until_thread(
+            &mut state,
+            Action::SetClaudePermissionMode(state::ClaudePermissionMode::AcceptEdits),
+            &mut queued,
+        )
+        .is_none());
+
+        let deferred = state.take_deferred_startup_actions();
+        assert_eq!(deferred.len(), 3);
+        assert!(deferred.iter().any(|action| matches!(
+            action,
+            Action::PersistVibeDisplayModes { .. }
+        )));
+        assert!(deferred
+            .iter()
+            .any(|action| matches!(action, Action::SetFast(true))));
+        assert!(deferred.iter().any(|action| matches!(
+            action,
+            Action::SetClaudePermissionMode(state::ClaudePermissionMode::AcceptEdits)
+        )));
     }
 
     /// The resume picker reads `thread/list`, not the thread being started, so

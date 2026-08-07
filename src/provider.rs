@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::{
     editor::Editor,
-    renderer::{OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS, visible_window},
+    renderer::{EffortSlider, OverlayLine, OverlayStyle, OverlayView},
 };
 
 const API_KEY_FIELD: &str = "__api_key";
@@ -106,7 +106,6 @@ enum Transition {
 pub struct ProviderPicker {
     providers: Vec<Provider>,
     selected: usize,
-    query: Editor,
     phase: Phase,
 }
 
@@ -176,7 +175,6 @@ impl ProviderPicker {
         Self {
             providers,
             selected: 0,
-            query: Editor::default(),
             phase: Phase::Providers,
         }
     }
@@ -190,7 +188,7 @@ impl ProviderPicker {
         match &mut self.phase {
             Phase::Providers => match key.code {
                 KeyCode::Esc => ProviderPickerResult::Cancel,
-                KeyCode::Up => {
+                KeyCode::Left | KeyCode::Up => {
                     self.selected = self.selected.saturating_sub(1);
                     ProviderPickerResult::None
                 }
@@ -198,48 +196,22 @@ impl ProviderPicker {
                     self.selected = self.selected.saturating_sub(1);
                     ProviderPickerResult::None
                 }
-                KeyCode::Down => {
-                    self.selected =
-                        (self.selected + 1).min(self.filtered_indices().len().saturating_sub(1));
+                KeyCode::Right | KeyCode::Down => {
+                    self.selected = (self.selected + 1).min(self.providers.len().saturating_sub(1));
                     ProviderPickerResult::None
                 }
                 KeyCode::Char('n') if ctrl => {
-                    self.selected =
-                        (self.selected + 1).min(self.filtered_indices().len().saturating_sub(1));
-                    ProviderPickerResult::None
-                }
-                KeyCode::PageUp => {
-                    self.selected = self.selected.saturating_sub(8);
-                    ProviderPickerResult::None
-                }
-                KeyCode::PageDown => {
-                    self.selected =
-                        (self.selected + 8).min(self.filtered_indices().len().saturating_sub(1));
+                    self.selected = (self.selected + 1).min(self.providers.len().saturating_sub(1));
                     ProviderPickerResult::None
                 }
                 KeyCode::Enter => {
-                    let Some(provider) = self.filtered_indices().get(self.selected).copied() else {
+                    if self.providers.is_empty() {
                         return ProviderPickerResult::None;
-                    };
+                    }
                     self.phase = Phase::Methods {
-                        provider,
+                        provider: self.selected,
                         selected: 0,
                     };
-                    ProviderPickerResult::None
-                }
-                KeyCode::Backspace if ctrl => {
-                    self.query.delete_word_left();
-                    self.selected = 0;
-                    ProviderPickerResult::None
-                }
-                KeyCode::Backspace => {
-                    self.query.backspace();
-                    self.selected = 0;
-                    ProviderPickerResult::None
-                }
-                KeyCode::Char(ch) if !ctrl && !alt => {
-                    self.query.insert(ch);
-                    self.selected = 0;
                     ProviderPickerResult::None
                 }
                 _ => ProviderPickerResult::None,
@@ -388,13 +360,18 @@ impl ProviderPicker {
 
     pub fn handle_paste(&mut self, text: &str) {
         match &mut self.phase {
-            Phase::Providers => {
-                self.query.insert_str(text);
-                self.selected = 0;
-            }
+            Phase::Providers => {}
             Phase::Input { editor, .. } => editor.insert_str(text),
             Phase::Methods { .. } => {}
         }
+    }
+
+    pub fn select_step(&mut self, step: usize) -> ProviderPickerResult {
+        if matches!(self.phase, Phase::Providers) {
+            self.selected = step.min(self.providers.len().saturating_sub(1));
+            return self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        ProviderPickerResult::None
     }
 
     pub fn overlay_view(&self) -> OverlayView<'_> {
@@ -471,58 +448,30 @@ impl ProviderPicker {
         }
     }
 
-    fn filtered_indices(&self) -> Vec<usize> {
-        let query = self.query.text().to_lowercase();
-        self.providers
-            .iter()
-            .enumerate()
-            .filter(|(_, provider)| {
-                query.is_empty()
-                    || provider.name.to_lowercase().contains(&query)
-                    || provider.id.to_lowercase().contains(&query)
-            })
-            .map(|(index, _)| index)
-            .collect()
-    }
-
     fn provider_view(&self) -> OverlayView<'_> {
-        let filtered = self.filtered_indices();
-        let window = visible_window(Some(self.selected), filtered.len(), PICKER_ROWS);
-        let start = window.start;
-        let mut lines = filtered[window]
-            .iter()
-            .enumerate()
-            .map(|(offset, index)| {
-                let provider = &self.providers[*index];
-                OverlayLine {
-                    text: format!(
-                        "{} {}  ·  {}",
-                        if provider.connected { "✓" } else { "○" },
-                        provider.name,
-                        provider.id
-                    ),
-                    selected: start + offset == self.selected,
-                    muted: false,
-                }
-            })
-            .collect::<Vec<_>>();
-        if lines.is_empty() {
-            lines.push(OverlayLine {
-                text: "검색 결과가 없습니다.".to_owned(),
-                selected: false,
-                muted: true,
-            });
-        }
         OverlayView {
             title: format!("Connect OpenCode provider · {}", self.providers.len()),
-            lines,
-            slider: None,
-            hint: "↑↓ 이동  Enter 선택  Esc 닫기".to_owned(),
+            lines: Vec::new(),
+            slider: Some(EffortSlider {
+                efforts: self
+                    .providers
+                    .iter()
+                    .map(|provider| {
+                        format!(
+                            "{} {}",
+                            if provider.connected { "✓" } else { "○" },
+                            provider.name
+                        )
+                    })
+                    .collect(),
+                selected: self.selected,
+            }),
+            hint: "←→ 이동  Enter 선택  Esc 닫기".to_owned(),
             closable: true,
-            style: OverlayStyle::Panel,
-            input: Some(&self.query),
+            style: OverlayStyle::Picker,
+            input: None,
             input_label: "",
-            input_placeholder: "provider 이름으로 검색…",
+            input_placeholder: "",
         }
     }
 
@@ -844,6 +793,29 @@ mod tests {
         assert_eq!(picker.providers[0].id, "xai");
         assert!(picker.providers[0].connected);
         assert_eq!(picker.providers[0].methods.len(), 2);
+    }
+
+    #[test]
+    fn provider_picker_uses_a_connected_step_slider() {
+        let mut picker = ProviderPicker::from_value(&json!({
+            "all": [
+                { "id": "xai", "name": "xAI" },
+                { "id": "anthropic", "name": "Anthropic" }
+            ],
+            "connected": ["xai"]
+        }));
+
+        let view = picker.overlay_view();
+        assert!(view.lines.is_empty());
+        let slider = view.slider.expect("provider steps");
+        assert_eq!(slider.efforts, ["✓ xAI", "○ Anthropic", "○ Other"]);
+        assert_eq!(slider.selected, 0);
+        assert!(matches!(
+            picker.handle_key(press(KeyCode::Right)),
+            ProviderPickerResult::None
+        ));
+        let view = picker.overlay_view();
+        assert_eq!(view.slider.expect("provider steps").selected, 1);
     }
 
     #[test]
