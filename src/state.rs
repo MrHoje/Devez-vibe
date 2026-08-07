@@ -6958,7 +6958,21 @@ impl AppState {
                 if text_mode {
                     match key.code {
                         KeyCode::Enter => {
-                            let answer = editor.take_for_submit().unwrap_or_default();
+                            let Some(answer) = editor.take_for_submit() else {
+                                // Enter can reach the app while Windows Terminal
+                                // is still committing an IME preedit. Never turn
+                                // that transient empty editor into a sent answer.
+                                self.pending = Some(PendingInteraction::UserInput {
+                                    id,
+                                    questions,
+                                    current,
+                                    selected,
+                                    text_mode,
+                                    editor,
+                                    answers,
+                                });
+                                return Action::None;
+                            };
                             answers.insert(question.id.clone(), answer);
                             return next_question_or_reply(id, questions, current, answers, self);
                         }
@@ -9273,6 +9287,7 @@ fn next_question_or_reply(
     state: &mut AppState,
 ) -> Action {
     if current + 1 == questions.len() {
+        commit_user_input_answers(state, &questions, &answers);
         return Action::RpcResponse {
             id,
             result: answers_response(&answers),
@@ -9290,6 +9305,46 @@ fn next_question_or_reply(
         answers,
     });
     Action::None
+}
+
+/// Leave the answer in conversation history when the blocking question closes.
+/// The RPC response alone reaches the model but otherwise leaves no visible proof
+/// that Enter sent the text the user just typed.
+fn commit_user_input_answers(
+    state: &mut AppState,
+    questions: &[Question],
+    answers: &BTreeMap<String, String>,
+) {
+    let answered = questions
+        .iter()
+        .filter_map(|question| {
+            let answer = answers.get(&question.id)?.trim();
+            (!answer.is_empty()).then(|| (question, answer))
+        })
+        .collect::<Vec<_>>();
+    if answered.is_empty() {
+        return;
+    }
+    let body = if answered.len() == 1 {
+        answered[0].1.to_owned()
+    } else {
+        answered
+            .into_iter()
+            .map(|(question, answer)| {
+                let label = if question.header.is_empty() {
+                    question.question.as_str()
+                } else {
+                    question.header.as_str()
+                };
+                format!("{label}: {answer}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    state.commit_welcome_card();
+    state
+        .committed
+        .push(Block::new(BlockKind::User, "You", body));
 }
 
 /// The two rows a question carries beyond its own options.
@@ -10843,6 +10898,74 @@ mod tests {
                 .lines
                 .iter()
                 .any(|line| line.selected && line.text.starts_with("둘째"))
+        );
+    }
+
+    #[test]
+    fn a_sent_free_text_answer_stays_visible_as_the_user_message() {
+        let mut state = test_state();
+        state.begin_server_request(
+            json!(1),
+            "item/tool/requestUserInput",
+            &json!({
+                "questions": [{
+                    "id": "q1",
+                    "question": "어느 것인가요?",
+                    "options": [
+                        { "label": "첫째", "description": "설명" },
+                        { "label": "둘째", "description": "설명" }
+                    ]
+                }]
+            }),
+        );
+
+        state.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        for ch in "직접 보낸 답".chars() {
+            state.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(
+            matches!(
+                action,
+                Action::RpcResponse { ref result, .. }
+                    if result.to_string().contains("직접 보낸 답")
+            ),
+            "the typed answer did not reach the server response"
+        );
+        let sent = state.committed.last().expect("sent answer history");
+        assert!(matches!(sent.kind, BlockKind::User));
+        assert_eq!(sent.body, "직접 보낸 답");
+    }
+
+    #[test]
+    fn enter_does_not_send_an_empty_inline_answer_during_ime_commit() {
+        let mut state = test_state();
+        state.begin_server_request(
+            json!(1),
+            "item/tool/requestUserInput",
+            &json!({
+                "questions": [{
+                    "id": "q1",
+                    "question": "어느 것인가요?",
+                    "options": [{ "label": "첫째", "description": "설명" }]
+                }]
+            }),
+        );
+        state.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        ));
+        let overlay = state.overlay_view().expect("the question should stay open");
+        assert_eq!(overlay.input.map(Editor::text).as_deref(), Some(""));
+        assert!(
+            !state
+                .committed
+                .iter()
+                .any(|block| matches!(block.kind, BlockKind::User)),
+            "an empty answer was shown as sent"
         );
     }
 

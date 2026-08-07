@@ -4463,13 +4463,17 @@ fn overlay_frame_with_expansion(
                 }
                 let number = row_index;
                 if let Some(editor) = inline_input.filter(|_| row.selected) {
-                    let prefix = format!("│ ❯ {number:>number_width$}. ");
+                    // Keep the row's name beside the editable answer instead of
+                    // painting a placeholder underneath the terminal-owned IME
+                    // preedit. The fixed label explains the field while leaving
+                    // the cursor cells empty for Hangul composition.
+                    let answer_label = row.text.lines().next().unwrap_or(overlay.input_label);
+                    let prefix = format!("│ ❯ {number:>number_width$}. {answer_label}: ");
                     let (rows_text, cursor_row, cursor_column) = inline_answer_rows(
                         editor,
                         UnicodeWidthStr::width(prefix.as_str()),
                         wrap_width,
                     );
-                    let empty = rows_text.len() == 1 && rows_text[0].is_empty();
                     inline_cursor = Some((lines.len() + cursor_row, cursor_column));
                     for (part_index, part) in rows_text.iter().enumerate() {
                         let line_prefix = if part_index == 0 {
@@ -4477,20 +4481,13 @@ fn overlay_frame_with_expansion(
                         } else {
                             continuation.clone()
                         };
-                        // An empty answer shows what the row is for, dimmed so it
-                        // never reads as text already typed.
-                        let (text, tone) = if empty {
-                            (overlay.input_placeholder, Tone::Muted)
-                        } else {
-                            (part.as_str(), Tone::Plain)
-                        };
                         lines.extend(
                             wrapped_line_with_continuation(
                                 &line_prefix,
                                 &continuation,
                                 Tone::Border,
-                                text,
-                                tone,
+                                part,
+                                Tone::Plain,
                                 false,
                                 wrap_width,
                             )
@@ -13412,7 +13409,7 @@ mod tests {
             .position(|line| line.contains("직접 쓴 답"))
             .expect("the typed answer is missing");
 
-        assert!(typed[answer_row].starts_with("│ ❯ 2. 직접 쓴 답"));
+        assert!(typed[answer_row].starts_with("│ ❯ 2. 직접 입력: 직접 쓴 답"));
         assert!(
             typed.iter().any(|line| line.contains("선택지 A")),
             "the options left the screen while the answer was typed"
@@ -13426,18 +13423,25 @@ mod tests {
         assert_eq!(frame.cursor_line, answer_row);
         assert_eq!(
             frame.cursor_col,
-            UnicodeWidthStr::width("│ ❯ 2. 직접 쓴 답")
+            UnicodeWidthStr::width("│ ❯ 2. 직접 입력: 직접 쓴 답")
         );
 
-        // Empty, the row says what it is for instead of standing blank.
+        // Empty, the fixed label remains but no placeholder occupies the cells
+        // where Windows Terminal paints an active IME composition.
         let empty = Editor::default();
         let empty_frame = overlay_frame(&[], overlay(Some(&empty)), None, status(), 80);
         let empty_painted = empty_frame.lines.iter().map(painted).collect::<Vec<_>>();
         assert!(
             empty_painted
                 .iter()
-                .any(|line| line.starts_with("│ ❯ 2. 여기에 직접 입력…")),
-            "the empty answer row lost its prompt: {empty_painted:?}"
+                .any(|line| line.starts_with("│ ❯ 2. 직접 입력: ")),
+            "the empty answer row lost its fixed label: {empty_painted:?}"
+        );
+        assert!(
+            !empty_painted
+                .iter()
+                .any(|line| line.contains("여기에 직접 입력")),
+            "the placeholder still occupies the IME cells: {empty_painted:?}"
         );
     }
 
