@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashSet,
     env, fs,
     io::{Stdout, Write, stdout},
@@ -646,6 +647,41 @@ fn terminal_unit_width(unit: &str) -> usize {
     UnicodeWidthStr::width(unit)
 }
 
+/// 터미널 기본 탭 정지 간격.
+const TAB_STOP: usize = 8;
+
+/// 탭은 폭 0이라 셀 격자에서는 자리를 차지하지 않지만, 그대로 터미널에 나가면
+/// 커서만 다음 탭 정지까지 건너뛴다. 그 구간은 배경이 칠해지지 않아 검은 띠로
+/// 남고 뒤따르는 셀이 통째로 밀려 선택 하이라이트까지 어긋나므로, 폭을 재기
+/// 전에 공백으로 펼쳐 둔다.
+fn expand_tabs(text: &str) -> Cow<'_, str> {
+    if !text.contains('\t') {
+        return Cow::Borrowed(text);
+    }
+    let mut expanded = String::with_capacity(text.len());
+    let mut column = 0;
+    for ch in text.chars() {
+        if ch == '\t' {
+            let advance = TAB_STOP - column % TAB_STOP;
+            expanded.extend(std::iter::repeat_n(' ', advance));
+            column += advance;
+        } else {
+            expanded.push(ch);
+            column += UnicodeWidthChar::width(ch).unwrap_or(0);
+        }
+    }
+    Cow::Owned(expanded)
+}
+
+/// 셀에 남은 제어문자는 터미널 커서를 움직여 격자를 깨뜨린다.
+fn without_control_characters(unit: &str) -> Cow<'_, str> {
+    if unit.chars().any(char::is_control) {
+        Cow::Owned(unit.chars().filter(|ch| !ch.is_control()).collect())
+    } else {
+        Cow::Borrowed(unit)
+    }
+}
+
 impl CellFrame {
     fn new(width: usize, height: usize) -> Self {
         Self {
@@ -677,8 +713,10 @@ impl CellFrame {
         }
         for unit in display_units(text) {
             let glyph_width = terminal_unit_width(unit);
+            let unit = without_control_characters(unit);
+            let unit = unit.as_ref();
             if glyph_width == 0 {
-                if column > 0 && column - 1 < self.width {
+                if !unit.is_empty() && column > 0 && column - 1 < self.width {
                     self.cell_mut(column - 1, row).glyph.push_str(unit);
                 }
                 continue;
@@ -6873,7 +6911,8 @@ fn wrapped_line_with_continuation(
     let options = textwrap::Options::new(available)
         .break_words(true)
         .word_separator(textwrap::WordSeparator::AsciiSpace);
-    let wrapped = textwrap::wrap(text, options);
+    let expanded = expand_tabs(text);
+    let wrapped = textwrap::wrap(expanded.as_ref(), options);
     if wrapped.is_empty() {
         return vec![PaintLine {
             prefix: prefix.to_owned(),
@@ -9707,6 +9746,53 @@ mod tests {
         assert_eq!(lines.iter().map(painted_width).collect::<Vec<_>>(), vec![7, 3]);
         assert_eq!(painted(&lines[0]), "● abcde");
         assert_eq!(painted(&lines[1]), "  f");
+    }
+
+    #[test]
+    fn tab_separated_prompt_rows_lose_no_characters_when_painted() {
+        CHAT_LAYOUT.store(false, Ordering::Relaxed);
+        let body = "eGhis.Chart.Support\teGhis.Chart.Support.Views.검안실.H3EyeClinicImageView\tlab_cv\tuse_cv4\t1\t100\t4.010\t영상관연계여부\tart.SuComboBox\t사용,미사용\t미사용\t지스랩에서 영상관리4.0을 열 수 있도록\tUSER";
+        let block = Block::new(BlockKind::User, "You", body);
+        let width = 100u16;
+        let lines = user_prompt_lines(&block, width);
+
+        let mut frame = CellFrame::new(usize::from(width), lines.len());
+        for (row, line) in lines.iter().enumerate() {
+            paint_line_into_frame(&mut frame, row, line, None, None, None);
+        }
+
+        let painted = (0..lines.len())
+            .flat_map(|row| (0..usize::from(width)).map(move |column| (column, row)))
+            .map(|(column, row)| frame.cell(column, row).glyph.clone())
+            .collect::<String>();
+        let strip = |text: &str| {
+            text.chars()
+                .filter(|ch| !ch.is_whitespace() && *ch != '▌')
+                .collect::<String>()
+        };
+
+        assert_eq!(strip(&painted), strip(body));
+    }
+
+    #[test]
+    fn wrapped_lines_expand_tabs_to_the_next_tab_stop() {
+        let lines = wrapped_line("▌ ", Tone::Accent, "ab\tcd", Tone::Plain, false, 40);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text, "ab      cd");
+    }
+
+    #[test]
+    fn painted_cells_never_carry_a_control_character() {
+        let mut frame = CellFrame::new(12, 1);
+        frame.write(0, 0, "a\tb", CellStyle::plain());
+
+        let glyphs = (0..3)
+            .map(|column| frame.cell(column, 0).glyph.clone())
+            .collect::<Vec<_>>();
+        // 탭이 차지하던 칸은 빈 칸으로 남아 배경이 그대로 칠해지고, 뒤따르는
+        // 글자는 폭 계산과 같은 열에 그려진다.
+        assert_eq!(glyphs, vec!["a".to_owned(), String::new(), "b".to_owned()]);
     }
 
     #[test]

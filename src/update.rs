@@ -20,9 +20,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// nothing reads this today; rewrite it each release for the changelog.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "선택이나 승인 요청에서는 필요한 선택지와 판단 정보를 생략하지 않고 안내합니다.",
-    "작업 완료 보고는 실제 수행한 동작을 자연스럽게 표시합니다.",
-    "작업 단계 갱신과 애니메이션 중에도 전체 화면 커서를 안정적으로 유지합니다.",
+    "탭으로 구분된 긴 입력도 줄바꿈과 선택 표시가 어긋나지 않게 표시합니다.",
+    "화면에 남는 제어 문자를 제거해 입력 배경과 커서 위치를 안정화했습니다.",
+    "긴 표 형식 요청을 전체 화면에서 자연스럽게 확인할 수 있습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
