@@ -3290,6 +3290,13 @@ fn composer_content_columns(line: &PaintLine) -> Option<Range<usize>> {
 /// and paste matches Claude Code.
 fn selectable_content_columns(line: &PaintLine) -> Option<Range<usize>> {
     let content = bubble_content_columns(line);
+    // 프롬프트의 세로선과 그 뒤 여백은 텍스트가 아니다. 본문이 빈 줄이라도 빈
+    // 범위를 돌려주어야 하며, `None`으로 돌려보내면 제한이 없다는 뜻이 되어 그
+    // 줄에서는 세로선까지 선택된다.
+    if line.tone == Tone::UserPrompt {
+        let start = UnicodeWidthStr::width(line.prefix.as_str());
+        return Some(start..content.end.max(start));
+    }
     let columns = composer_content_columns(line).or_else(|| {
         let boxed_code = line.prefix.ends_with("│ ")
             && line.tail.last().is_some_and(|span| span.text == "│");
@@ -3297,10 +3304,6 @@ fn selectable_content_columns(line: &PaintLine) -> Option<Range<usize>> {
             let start = UnicodeWidthStr::width(line.prefix.as_str());
             let end = content.end.saturating_sub(1);
             return (start < end).then_some(start..end);
-        }
-        if line.tone == Tone::UserPrompt {
-            let start = UnicodeWidthStr::width(line.prefix.as_str());
-            return (start < content.end).then_some(start..content.end);
         }
         if let Some(indentation) = line
             .prefix
@@ -3763,6 +3766,28 @@ fn close_panel_row(mut line: PaintLine, panel_width: usize) -> PaintLine {
         tone: Tone::Border,
         bold: false,
     });
+    line
+}
+
+/// The row's leading `│` belongs to the panel, not to the row. Toning the whole
+/// prefix with the selection painted that border in the accent as well, so the
+/// box read as though its own edge were the thing being picked. Keep the border
+/// on the panel's tone and let only the marker follow the selection.
+fn split_panel_border(mut line: PaintLine, marker_tone: Tone) -> PaintLine {
+    let Some(marker) = line.prefix.strip_prefix('│').map(ToOwned::to_owned) else {
+        return line;
+    };
+    let label = PaintSpan {
+        text: std::mem::take(&mut line.text),
+        tone: line.tone,
+        bold: line.bold,
+    };
+    line.prefix = "│".to_owned();
+    line.prefix_tone = Tone::Border;
+    line.text = marker;
+    line.tone = marker_tone;
+    line.bold = false;
+    line.tail.insert(0, label);
     line
 }
 
@@ -4439,7 +4464,7 @@ fn overlay_frame_with_expansion(
                         wrapped_line_with_continuation(
                             &prefix,
                             &continuation,
-                            if row.selected { Tone::Accent } else { Tone::Muted },
+                            Tone::Border,
                             part,
                             tone,
                             part_index == 0 && !row.muted,
@@ -4447,7 +4472,8 @@ fn overlay_frame_with_expansion(
                         )
                         .into_iter()
                         .map(|line| {
-                            close_panel_row(line, panel_width)
+                            let marker = if row.selected { Tone::Accent } else { Tone::Muted };
+                            close_panel_row(split_panel_border(line, marker), panel_width)
                                 .with_picks(&[(0, Pick::Row(row_index))])
                         }),
                     );
@@ -9749,6 +9775,36 @@ mod tests {
     }
 
     #[test]
+    fn prompt_border_is_never_painted_as_selected() {
+        CHAT_LAYOUT.store(false, Ordering::Relaxed);
+        let width = 80u16;
+        let body = "eGhis.Chart.Support\teGhis.Chart.Support.Views.검안실\neGhis.Chart.Support\teGhis.Chart.Support.Views.검안실\n\n이렇게보낸건데";
+        let lines = user_prompt_lines(&Block::new(BlockKind::User, "You", body), width);
+        assert!(lines.iter().any(|line| line.prefix.starts_with('▌')));
+
+        let range = CellRange {
+            start: CellPosition { column: 2, row: 1 },
+            end: CellPosition {
+                column: width - 2,
+                row: (lines.len() - 1) as u16,
+            },
+        };
+        let mut frame = CellFrame::new(usize::from(width), lines.len());
+        for (row, line) in lines.iter().enumerate() {
+            let selected = selection_columns_for_line(line, range, row);
+            paint_line_into_frame(&mut frame, row, line, selected, None, None);
+        }
+
+        for row in 0..lines.len() {
+            assert_ne!(
+                frame.cell(0, row).style.background,
+                Some(theme::selection_bg()),
+                "row {row} border was painted as selected"
+            );
+        }
+    }
+
+    #[test]
     fn tab_separated_prompt_rows_lose_no_characters_when_painted() {
         CHAT_LAYOUT.store(false, Ordering::Relaxed);
         let body = "eGhis.Chart.Support\teGhis.Chart.Support.Views.검안실.H3EyeClinicImageView\tlab_cv\tuse_cv4\t1\t100\t4.010\t영상관연계여부\tart.SuComboBox\t사용,미사용\t미사용\t지스랩에서 영상관리4.0을 열 수 있도록\tUSER";
@@ -13167,6 +13223,15 @@ mod tests {
                 .all(|line| UnicodeWidthStr::width(line.as_str()) == panel_span(80)),
             "question panel rows must keep the picker width"
         );
+        // The selection moves the marker, not the panel's own edge.
+        let selected = frame
+            .lines
+            .iter()
+            .find(|line| line.tail.iter().any(|span| span.text.contains("선택지 A")))
+            .expect("selected row");
+        assert_eq!(selected.prefix, "│");
+        assert_eq!(selected.prefix_tone, Tone::Border);
+        assert_eq!(selected.tone, Tone::Accent);
         // A detail line starts where its label does, not where the number does.
         let column = |line: &str, needle: &str| {
             UnicodeWidthStr::width(&line[..line.find(needle).expect("needle")])

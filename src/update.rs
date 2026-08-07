@@ -20,9 +20,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// nothing reads this today; rewrite it each release for the changelog.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "선택이나 승인 요청을 일관된 선택 화면으로 안내합니다.",
-    "작업 시작 뒤에는 새로운 사실이 있을 때만 구체적인 진행 상황을 표시합니다.",
-    "반복되는 일반 진행 문구를 줄여 대화 흐름을 더 자연스럽게 만들었습니다.",
+    "내용 없는 짧은 진행 문구를 숨겨 대화 흐름을 더 자연스럽게 만들었습니다.",
+    "사용자 입력 선택에서 테두리와 본문을 정확히 구분해 표시합니다.",
+    "선택 화면의 강조 표시가 패널 테두리를 침범하지 않도록 개선했습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

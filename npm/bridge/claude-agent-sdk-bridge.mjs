@@ -519,6 +519,10 @@ function openingNotice(input) {
     : "I’ll review the request and proceed with the necessary work.";
 }
 
+// `Now the tile view logic.` carries nothing a Korean reader needs, and the
+// stand-in that used to replace it carried even less — the same sentence before
+// every tool call, however many calls the turn made. Drop the line instead; the
+// tool item that follows already names what is being read.
 function normalizeProgressText(turn, text) {
   const value = String(text || "");
   const trimmed = value.trim();
@@ -526,7 +530,7 @@ function normalizeProgressText(turn, text) {
     && trimmed.length <= 160
     && !/[\uac00-\ud7a3]/.test(trimmed)
     && /^Now\b[^\r\n]*[.!?]?$/i.test(trimmed)) {
-    return "다음 부분을 이어서 확인하겠습니다.";
+    return "";
   }
   return value;
 }
@@ -678,6 +682,12 @@ function historyTokenUsage(messages, models, model) {
   };
 }
 
+function emitHeldStart(session, current) {
+  if (!current?.pendingStart) return;
+  emitItem(session, "started", current.pendingStart);
+  current.pendingStart = null;
+}
+
 async function processStreamEvent(session, message) {
   if (!session.turn || message.parent_tool_use_id) return;
   const event = message.event || {};
@@ -695,15 +705,20 @@ async function processStreamEvent(session, message) {
     const smooth = block.type === "text"
       ? new SmoothTextStream((delta) => emitDelta(session, "item/agentMessage/delta", id, delta))
       : null;
+    // A held English line can end up dropped entirely, and an item announced
+    // before that decision would stay on screen as an empty bubble. Hold the
+    // start too, and emit it with the first text that survives.
+    const held = block.type === "text" && session.turn.koreanRequest;
     session.streamBlocks.set(event.index, {
       id,
       type: block.type,
       text: "",
       smooth,
-      languagePending: block.type === "text" && session.turn.koreanRequest ? "" : null,
+      languagePending: held ? "" : null,
       holdEnglishProgress: false,
+      pendingStart: held ? item : null,
     });
-    emitItem(session, "started", item);
+    if (!held) emitItem(session, "started", item);
     return;
   }
   if (event.type === "content_block_delta") {
@@ -712,7 +727,9 @@ async function processStreamEvent(session, message) {
     const delta = event.delta?.text || event.delta?.thinking || "";
     if (!delta) return;
     current.text += delta;
-    if (current.type === "text") session.turn.sawVisibleText = true;
+    // Held text may still be dropped, and counting it as visible would suppress
+    // the opening notice in its place — leaving the turn with nothing to show.
+    if (current.type === "text" && current.languagePending == null) session.turn.sawVisibleText = true;
     if (!current.smooth) {
       emitDelta(session, "item/reasoning/summaryTextDelta", current.id, delta);
       return;
@@ -726,6 +743,8 @@ async function processStreamEvent(session, message) {
         current.holdEnglishProgress = true;
         return;
       }
+      emitHeldStart(session, current);
+      session.turn.sawVisibleText = true;
       current.smooth.push(current.languagePending);
       current.languagePending = null;
       return;
@@ -739,9 +758,16 @@ async function processStreamEvent(session, message) {
     if (current.languagePending != null) {
       const visible = normalizeProgressText(session.turn, current.languagePending);
       current.text = visible;
-      current.smooth?.push(visible);
       current.languagePending = null;
+      if (!visible.trim() && current.pendingStart) {
+        session.streamBlocks.delete(event.index);
+        return;
+      }
+      emitHeldStart(session, current);
+      if (visible.trim()) session.turn.sawVisibleText = true;
+      current.smooth?.push(visible);
     }
+    emitHeldStart(session, current);
     await current.smooth?.finish();
     const item = current.type === "text"
       ? { id: current.id, type: "agentMessage", text: current.text, provider: "Claude" }
@@ -777,9 +803,13 @@ function processAssistant(session, message) {
   if (!session.streamBlocks.size && !session.turn.sawStreamText) {
     for (const block of content) {
       if (block.type !== "text" && block.type !== "thinking") continue;
+      const visible = block.type === "text"
+        ? normalizeProgressText(session.turn, block.text)
+        : "";
+      if (block.type === "text" && !visible.trim() && String(block.text || "").trim()) continue;
       const id = nextItemId(session, block.type);
       const item = block.type === "text"
-        ? { id, type: "agentMessage", text: normalizeProgressText(session.turn, block.text), provider: "Claude" }
+        ? { id, type: "agentMessage", text: visible, provider: "Claude" }
         : { id, type: "reasoning", summary: [block.thinking || ""] };
       emitItem(session, "started", item);
       emitItem(session, "completed", item);
@@ -2189,9 +2219,42 @@ async function runSelfTest() {
     .filter((event) => event.method === "item/agentMessage/delta")
     .map((event) => event.params?.delta || "")
     .join("");
-  if (visibleLanguage !== "다음 부분을 이어서 확인하겠습니다."
+  if (visibleLanguage !== ""
+    || languageEvents.length
     || languageEvents.some((event) => JSON.stringify(event).includes("Now the tile view logic."))) {
     throw new Error(`Claude Korean progress normalization self-test failed: ${JSON.stringify(languageEvents)}`);
+  }
+  const keptCaptured = [];
+  process.stdout.write = (chunk) => {
+    keptCaptured.push(String(chunk));
+    return true;
+  };
+  try {
+    openingSession.streamBlocks.clear();
+    await processStreamEvent(openingSession, {
+      event: { type: "content_block_start", index: 0, content_block: { type: "text" } },
+    });
+    await processStreamEvent(openingSession, {
+      event: { type: "content_block_delta", index: 0, delta: { text: "타일 보기 로직을 고쳤습니다." } },
+    });
+    await processStreamEvent(openingSession, {
+      event: { type: "content_block_stop", index: 0 },
+    });
+  } finally {
+    process.stdout.write = stdoutWrite;
+  }
+  const keptEvents = keptCaptured
+    .join("")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  const keptStarted = keptEvents.findIndex((event) =>
+    event.method === "item/started" && event.params?.item?.type === "agentMessage");
+  const keptCompleted = keptEvents.find((event) =>
+    event.method === "item/completed" && event.params?.item?.type === "agentMessage");
+  if (keptStarted !== 0 || keptCompleted?.params?.item?.text !== "타일 보기 로직을 고쳤습니다.") {
+    throw new Error(`Claude held Korean text self-test failed: ${JSON.stringify(keptEvents)}`);
   }
   const smoothText = "Claude가 👨‍👩‍👧‍👦 한 문장을 한꺼번에 보내도 부드럽게 표시합니다.";
   const emitted = [];
