@@ -39,7 +39,9 @@ use crossterm::event::{
 use editor::Editor;
 use futures_util::StreamExt;
 use integrations::{McpServerInfo, PluginCatalog, PluginDetail, PluginInfo, PluginScope};
-use paste::{BufferedText, ComposerInput, ComposerPasteBuffer, PasteBurst};
+use paste::{
+    BufferedText, BufferedTextTarget, ComposerInput, ComposerPasteBuffer, PasteBurst,
+};
 use provider::{ProviderAuthKind, ProviderAuthRequest};
 use renderer::{BlockKind, Pick, RenderMode, Renderer, SelectionResult, TerminalSession, View};
 use serde_json::{Value, json};
@@ -488,10 +490,7 @@ async fn await_thread(
                             action
                         } else {
                             if !attach_clipboard_image(state) {
-                                apply_composer_text(
-                                    state,
-                                    BufferedText { text, pasted: true },
-                                );
+                                apply_direct_paste(state, &text);
                             }
                             Action::None
                         }
@@ -919,10 +918,7 @@ async fn event_loop(
                             action
                         } else {
                             if !attach_clipboard_image(state) {
-                                apply_composer_text(
-                                    state,
-                                    BufferedText { text, pasted: true },
-                                );
+                                apply_direct_paste(state, &text);
                             }
                             Action::None
                         }
@@ -3810,16 +3806,26 @@ fn attach_pasted_local_image(state: &mut AppState, text: &str) -> bool {
 }
 
 fn apply_composer_text(state: &mut AppState, text: BufferedText) {
-    if state.buffers_pending_text_input() {
-        if text.pasted {
-            state.handle_paste(&text.text);
-        } else {
-            state.handle_buffered_text(&text.text);
+    match text.target {
+        BufferedTextTarget::PendingUserInput(target) => {
+            state.handle_buffered_prompt_text(&target, &text.text);
         }
-    } else if !text.pasted {
-        state.handle_buffered_text(&text.text);
-    } else if !attach_pasted_local_image(state, &text.text) {
-        state.handle_paste(&text.text);
+        BufferedTextTarget::Composer if !text.pasted => {
+            state.handle_buffered_composer_text(&text.text, false);
+        }
+        BufferedTextTarget::Composer if !attach_pasted_local_image(state, &text.text) => {
+            state.handle_buffered_composer_text(&text.text, true);
+        }
+        BufferedTextTarget::Composer => {}
+    }
+}
+
+/// A real bracketed-paste event has no classification delay, so it belongs to
+/// whichever control is focused now. Only synthesized key runs need a captured
+/// target carried through the buffer.
+fn apply_direct_paste(state: &mut AppState, text: &str) {
+    if state.has_pending_interaction() || !attach_pasted_local_image(state, text) {
+        state.handle_paste(text);
     }
 }
 
@@ -3877,8 +3883,15 @@ fn observe_composer_key(
     if key.kind == KeyEventKind::Release {
         return Action::Tick(false);
     }
-    if state.buffers_pending_text_input() {
-        apply_composer_inputs(state, buffer.observe(key, now))
+    if let Some(target) = state.pending_text_input_target() {
+        apply_composer_inputs(
+            state,
+            buffer.observe_targeted(
+                key,
+                now,
+                BufferedTextTarget::PendingUserInput(target),
+            ),
+        )
     } else if state.has_pending_interaction() {
         state.handle_key(key)
     } else {
@@ -3922,8 +3935,16 @@ fn observe_composer_key_with_scroll(
     if key.kind == KeyEventKind::Release {
         return Action::Tick(false);
     }
-    if state.buffers_pending_text_input() {
-        apply_composer_inputs_with_scroll(state, renderer, buffer.observe(key, now))
+    if let Some(target) = state.pending_text_input_target() {
+        apply_composer_inputs_with_scroll(
+            state,
+            renderer,
+            buffer.observe_targeted(
+                key,
+                now,
+                BufferedTextTarget::PendingUserInput(target),
+            ),
+        )
     } else if state.has_pending_interaction() {
         state.handle_key(key)
     } else {
@@ -5070,11 +5091,47 @@ mod tests {
             BufferedText {
                 text: path.to_string_lossy().into_owned(),
                 pasted: true,
+                target: BufferedTextTarget::Composer,
             },
         );
 
         assert!(state.editor.is_empty());
         assert_eq!(state.composer_image_count(), 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn pasted_image_path_stays_in_the_focused_question_editor() {
+        let path = std::env::temp_dir().join(format!(
+            "devez-question-paste-image-{}.png",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+        let mut state = starting_state();
+        state.begin_server_request(
+            json!(1),
+            "item/tool/requestUserInput",
+            &json!({
+                "questions": [{
+                    "id": "q1",
+                    "question": "어느 것인가요?",
+                    "options": [{ "label": "첫째", "description": "설명" }]
+                }]
+            }),
+        );
+        state.handle_key(press(KeyCode::Char('2'), KeyModifiers::NONE));
+
+        apply_direct_paste(&mut state, &path.to_string_lossy());
+
+        assert_eq!(
+            state
+                .view()
+                .overlay
+                .and_then(|overlay| overlay.input)
+                .map(Editor::text),
+            Some(path.to_string_lossy().into_owned())
+        );
+        assert_eq!(state.composer_image_count(), 0);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -5091,6 +5148,7 @@ mod tests {
             BufferedText {
                 text: text.clone(),
                 pasted: false,
+                target: BufferedTextTarget::Composer,
             },
         );
 
@@ -5108,6 +5166,7 @@ mod tests {
             BufferedText {
                 text: pasted.to_owned(),
                 pasted: true,
+                target: BufferedTextTarget::Composer,
             },
         );
 
@@ -5116,6 +5175,7 @@ mod tests {
             BufferedText {
                 text: " ".to_owned(),
                 pasted: false,
+                target: BufferedTextTarget::Composer,
             },
         );
         assert_eq!(state.editor.paste_summary_lines(), Some(6));
@@ -5125,6 +5185,7 @@ mod tests {
             BufferedText {
                 text: pasted.to_owned(),
                 pasted: true,
+                target: BufferedTextTarget::Composer,
             },
         );
         assert_eq!(state.editor.paste_summary_lines(), None);
@@ -5291,6 +5352,186 @@ mod tests {
         ));
         let committed = state.drain_committed();
         assert_eq!(committed.last().map(|block| block.body.as_str()), Some("답"));
+    }
+
+    #[test]
+    fn reaching_other_by_arrow_accepts_text_without_an_activation_enter() {
+        let mut state = starting_state();
+        state.begin_server_request(
+            json!(1),
+            "item/tool/requestUserInput",
+            &json!({
+                "questions": [{
+                    "id": "q1",
+                    "question": "어느 것인가요?",
+                    "options": [
+                        { "label": "첫째", "description": "설명" },
+                        { "label": "둘째", "description": "설명" },
+                        { "label": "셋째", "description": "설명" }
+                    ]
+                }]
+            }),
+        );
+        for _ in 0..3 {
+            state.handle_key(press(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let mut buffer = ComposerPasteBuffer::new();
+        let committed_at = Instant::now();
+
+        observe_composer_key(
+            &mut state,
+            &mut buffer,
+            press(KeyCode::Char('답'), KeyModifiers::NONE),
+            committed_at,
+        );
+        assert!(flush_composer_paste(
+            &mut state,
+            &mut buffer,
+            committed_at + Duration::from_millis(30),
+        ));
+
+        assert_eq!(
+            state
+                .view()
+                .overlay
+                .and_then(|overlay| overlay.input)
+                .map(Editor::text)
+                .as_deref(),
+            Some("답")
+        );
+    }
+
+    #[test]
+    fn choosing_number_four_focuses_only_its_inline_editor_and_enter_submits_it() {
+        let mut state = starting_state();
+        state.begin_server_request(
+            json!(1),
+            "item/tool/requestUserInput",
+            &json!({
+                "questions": [{
+                    "id": "q1",
+                    "question": "어느 것인가요?",
+                    "options": [
+                        { "label": "첫째", "description": "설명" },
+                        { "label": "둘째", "description": "설명" },
+                        { "label": "셋째", "description": "설명" }
+                    ]
+                }]
+            }),
+        );
+        let mut buffer = ComposerPasteBuffer::new();
+        let selected_at = Instant::now();
+
+        assert!(matches!(
+            observe_composer_key(
+                &mut state,
+                &mut buffer,
+                press(KeyCode::Char('4'), KeyModifiers::NONE),
+                selected_at,
+            ),
+            Action::None
+        ));
+        observe_composer_key(
+            &mut state,
+            &mut buffer,
+            press(KeyCode::Char('답'), KeyModifiers::NONE),
+            selected_at + Duration::from_millis(1),
+        );
+        assert!(flush_composer_paste(
+            &mut state,
+            &mut buffer,
+            selected_at + Duration::from_millis(30),
+        ));
+        let overlay = state.view().overlay.expect("question overlay");
+        assert_eq!(overlay.input.map(Editor::text).as_deref(), Some("답"));
+        assert_eq!(overlay.lines[4].text, "답");
+        assert!(overlay.lines[4].selected);
+
+        assert!(matches!(
+            observe_composer_key(
+                &mut state,
+                &mut buffer,
+                press(KeyCode::Enter, KeyModifiers::NONE),
+                selected_at + Duration::from_millis(31),
+            ),
+            Action::RpcResponse { .. }
+        ));
+        assert!(state.editor.is_empty());
+    }
+
+    #[test]
+    fn buffered_question_text_never_leaks_into_the_main_composer() {
+        let mut state = starting_state();
+        state.begin_server_request(
+            json!(1),
+            "item/tool/requestUserInput",
+            &json!({
+                "questions": [{
+                    "id": "q1",
+                    "question": "어느 것인가요?",
+                    "options": [{ "label": "첫째", "description": "설명" }]
+                }]
+            }),
+        );
+        state.handle_key(press(KeyCode::Char('2'), KeyModifiers::NONE));
+        let mut buffer = ComposerPasteBuffer::new();
+        let committed_at = Instant::now();
+        observe_composer_key(
+            &mut state,
+            &mut buffer,
+            press(KeyCode::Char('직'), KeyModifiers::NONE),
+            committed_at,
+        );
+
+        let action = state.click_overlay_row(1);
+        assert!(matches!(action, Action::RpcResponse { .. }));
+        assert!(flush_composer_paste(
+            &mut state,
+            &mut buffer,
+            committed_at + Duration::from_millis(30),
+        ));
+        assert!(state.editor.is_empty());
+    }
+
+    #[test]
+    fn buffered_composer_text_keeps_its_owner_when_a_question_opens() {
+        let mut state = starting_state();
+        let mut buffer = ComposerPasteBuffer::new();
+        let typed_at = Instant::now();
+        observe_composer_key(
+            &mut state,
+            &mut buffer,
+            press(KeyCode::Char('초'), KeyModifiers::NONE),
+            typed_at,
+        );
+        state.begin_server_request(
+            json!(1),
+            "item/tool/requestUserInput",
+            &json!({
+                "questions": [{
+                    "id": "q1",
+                    "question": "어느 것인가요?",
+                    "options": []
+                }]
+            }),
+        );
+
+        assert!(flush_composer_paste(
+            &mut state,
+            &mut buffer,
+            typed_at + Duration::from_millis(30),
+        ));
+
+        assert_eq!(state.editor.text(), "초");
+        assert_eq!(
+            state
+                .view()
+                .overlay
+                .and_then(|overlay| overlay.input)
+                .map(Editor::text)
+                .as_deref(),
+            Some("")
+        );
     }
 
     /// A Windows clipboard holds CRLF, while the keys the terminal synthesizes

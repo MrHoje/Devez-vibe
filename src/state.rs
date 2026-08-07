@@ -1270,7 +1270,6 @@ enum PendingInteraction {
         questions: Vec<Question>,
         current: usize,
         selected: usize,
-        text_mode: bool,
         editor: Editor,
         answers: BTreeMap<String, String>,
     },
@@ -3530,18 +3529,32 @@ impl AppState {
         self.pending.is_some()
     }
 
+    /// The free-text row is an editor as soon as it owns focus, matching Claude
+    /// Code's `Other` option. Its buffered keys carry this identity so they can
+    /// never be redirected into the main composer or a later question.
+    pub fn pending_text_input_target(&self) -> Option<String> {
+        let PendingInteraction::UserInput {
+            id,
+            questions,
+            current,
+            selected,
+            ..
+        } = self.pending.as_ref()?
+        else {
+            return None;
+        };
+        let question = questions.get(*current)?;
+        user_input_text_focused(question, *selected).then(|| {
+            format!("{}\u{1f}{current}\u{1f}{}", id, question.id)
+        })
+    }
+
     /// Free-text question answers need the same short input delay as the main
     /// composer. Windows Terminal clears its IME preedit just after delivering
     /// the committed Hangul character; repainting before that clear erases the
     /// character from the screen even though it reached the editor.
     pub fn buffers_pending_text_input(&self) -> bool {
-        matches!(
-            self.pending,
-            Some(PendingInteraction::UserInput {
-                text_mode: true,
-                ..
-            })
-        )
+        self.pending_text_input_target().is_some()
     }
 
     pub fn update_skills(&mut self, response: &Value) {
@@ -4613,13 +4626,7 @@ impl AppState {
         // cursor, erasing that preedit and exposing our placeholder again. Keep
         // periodic paints still while an inline answer owns the cursor; the
         // committed character event will paint the new text normally.
-        let inline_answer_active = matches!(
-            self.pending,
-            Some(PendingInteraction::UserInput {
-                text_mode: true,
-                ..
-            })
-        );
+        let inline_answer_active = self.buffers_pending_text_input();
         // Compaction animates the same row a turn does, so it keeps the frame
         // loop alive even on a runtime that reports no turn while it runs.
         let animating = self.busy || self.compacting();
@@ -4708,8 +4715,33 @@ impl AppState {
         self.handle_inserted_text(text, true);
     }
 
-    pub fn handle_buffered_text(&mut self, text: &str) {
-        self.handle_inserted_text(text, false);
+    /// Applies text to the exact pending question that owned the key when it
+    /// entered the short IME/paste buffer. A selection change or a later prompt
+    /// makes the token stale, so the text is dropped instead of appearing on a
+    /// different line.
+    pub fn handle_buffered_prompt_text(&mut self, target: &str, text: &str) {
+        if self.pending_text_input_target().as_deref() != Some(target) {
+            return;
+        }
+        self.disarm_quit();
+        if let Some(PendingInteraction::UserInput { editor, .. }) = &mut self.pending {
+            editor.insert_str(text);
+        }
+    }
+
+    /// Buffered composer text belongs to the draft that owned its key even if a
+    /// server prompt opened before the short classification delay expired.
+    pub fn handle_buffered_composer_text(&mut self, text: &str, pasted: bool) {
+        self.disarm_quit();
+        let old_text = self.editor.text();
+        let binding_count = self.selected_completion_bindings.len();
+        if pasted {
+            self.editor.insert_paste_str(text);
+        } else {
+            self.editor.insert_str(text);
+        }
+        self.command_selection = 0;
+        self.sync_selected_completion_bindings(&old_text, binding_count);
     }
 
     fn handle_inserted_text(&mut self, text: &str, pasted: bool) {
@@ -4719,10 +4751,17 @@ impl AppState {
         let binding_count = self.selected_completion_bindings.len();
         match &mut self.pending {
             Some(PendingInteraction::UserInput {
-                text_mode: true,
+                questions,
+                current,
+                selected,
                 editor,
                 ..
-            }) => editor.insert_str(text),
+            }) if questions
+                .get(*current)
+                .is_some_and(|question| user_input_text_focused(question, *selected)) =>
+            {
+                editor.insert_str(text);
+            }
             Some(PendingInteraction::McpForm(form))
                 if form.fields.get(form.current).is_some_and(|field| {
                     matches!(
@@ -5296,13 +5335,11 @@ impl AppState {
                         result: json!({ "answers": {} }),
                     };
                 }
-                let text_mode = questions[0].options.is_empty();
                 self.pending = Some(PendingInteraction::UserInput {
                     id,
                     questions,
                     current: 0,
                     selected: 0,
-                    text_mode,
                     editor: Editor::default(),
                     answers: BTreeMap::new(),
                 });
@@ -6957,7 +6994,6 @@ impl AppState {
                 questions,
                 current,
                 mut selected,
-                mut text_mode,
                 mut editor,
                 mut answers,
             } => {
@@ -6969,7 +7005,7 @@ impl AppState {
                 }
 
                 let question = &questions[current];
-                if text_mode {
+                if user_input_text_focused(question, selected) {
                     match key.code {
                         KeyCode::Enter => {
                             let Some(answer) = editor.take_for_submit() else {
@@ -6981,7 +7017,6 @@ impl AppState {
                                     questions,
                                     current,
                                     selected,
-                                    text_mode,
                                     editor,
                                     answers,
                                 });
@@ -6990,15 +7025,19 @@ impl AppState {
                             answers.insert(question.id.clone(), answer);
                             return next_question_or_reply(id, questions, current, answers, self);
                         }
-                        // The answer is typed among the options, so the arrows that
-                        // walk them still do: leaving the row keeps what was typed
-                        // for the next visit to it.
+                        // Claude Code makes `Other` an input option rather than a
+                        // second mode. The arrows simply move focus away while the
+                        // row keeps the text for the next visit.
                         KeyCode::Up if !question.options.is_empty() => {
-                            text_mode = false;
                             selected = question.options.len() - 1;
                         }
                         KeyCode::Down if !question.options.is_empty() => {
-                            text_mode = false;
+                            selected = chat_instead_index(question);
+                        }
+                        KeyCode::Char('p') if ctrl && !question.options.is_empty() => {
+                            selected = question.options.len() - 1;
+                        }
+                        KeyCode::Char('n') if ctrl && !question.options.is_empty() => {
                             selected = chat_instead_index(question);
                         }
                         KeyCode::Backspace if ctrl => editor.delete_word_left(),
@@ -7058,7 +7097,8 @@ impl AppState {
                                     result: answers_response(&answers),
                                 };
                             }
-                            text_mode = true;
+                            // Focusing the free-text row is enough. The next key is
+                            // input immediately; no hidden Enter-only mode exists.
                         }
                         _ => {}
                     }
@@ -7068,7 +7108,6 @@ impl AppState {
                     questions,
                     current,
                     selected,
-                    text_mode,
                     editor,
                     answers,
                 });
@@ -7884,7 +7923,6 @@ impl AppState {
                 questions,
                 current,
                 selected,
-                text_mode,
                 editor,
                 ..
             } => {
@@ -7894,31 +7932,36 @@ impl AppState {
                     selected: false,
                     muted: false,
                 }];
-                // A free-text answer is typed on its own row, so the options stay
-                // on screen around it: the answer is written where it was picked,
-                // not in a box that replaced the question.
+                // `Other` is an input option, as in Claude Code: reaching the row
+                // focuses its editor immediately, and leaving it keeps the typed
+                // value visible instead of restoring the placeholder.
                 let free_text_row = question.options.len();
-                let selected_row = if *text_mode { free_text_row } else { *selected };
+                let text_focused = user_input_text_focused(question, *selected);
                 if !question.options.is_empty() {
                     lines.extend(question.options.iter().enumerate().map(|(index, option)| {
                         OverlayLine {
                             text: format!("{}\n{}", option.label, option.description),
-                            selected: index == selected_row,
+                            selected: index == *selected,
                             muted: false,
                         }
                     }));
                     if question.allow_other {
+                        let typed = editor.text();
                         lines.push(OverlayLine {
-                            text: OTHER_ANSWER_LABEL.to_owned(),
-                            selected: selected_row == free_text_row,
-                            muted: !*text_mode,
+                            text: if typed.is_empty() {
+                                OTHER_ANSWER_LABEL.to_owned()
+                            } else {
+                                typed
+                            },
+                            selected: *selected == free_text_row,
+                            muted: !text_focused && editor.is_empty(),
                         });
                     }
                     // The way out of the question, kept last so the renderer's
                     // rule lands between it and the answers.
                     lines.push(OverlayLine {
                         text: CHAT_INSTEAD_LABEL.to_owned(),
-                        selected: selected_row == chat_instead_index(question),
+                        selected: *selected == chat_instead_index(question),
                         muted: false,
                     });
                 }
@@ -7931,13 +7974,13 @@ impl AppState {
                     },
                     lines,
                     slider: None,
-                    hint: if *text_mode {
+                    hint: if text_focused {
                         "Enter 전송 · Esc 취소".to_owned()
                     } else {
                         "Enter 선택 · ↑/↓ 이동 · Esc 취소".to_owned()
                     },
                     style: OverlayStyle::Question,
-                    input: text_mode.then_some(editor),
+                    input: text_focused.then_some(editor),
                     input_label: "Answer",
                     input_placeholder: "",
                 })
@@ -8674,7 +8717,6 @@ impl AppState {
                 questions,
                 current,
                 selected,
-                text_mode,
                 editor,
                 mut answers,
             }) => {
@@ -8683,24 +8725,23 @@ impl AppState {
                 let clicked = row.checked_sub(1);
                 let chat_instead = chat_instead_index(question);
                 match clicked {
-                    Some(clicked) if clicked < question.options.len() && !text_mode => {
+                    Some(clicked) if clicked < question.options.len() => {
                         let label = question.options[clicked].label.clone();
                         answers.insert(question.id.clone(), label);
                         next_question_or_reply(id, questions, current, answers, self)
                     }
-                    Some(clicked) if clicked == chat_instead && !text_mode => {
+                    Some(clicked) if clicked == chat_instead => {
                         Action::RpcResponse {
                             id,
                             result: answers_response(&answers),
                         }
                     }
-                    Some(clicked) if clicked < chat_instead && !text_mode => {
+                    Some(clicked) if clicked == question.options.len() && question.allow_other => {
                         self.pending = Some(PendingInteraction::UserInput {
                             id,
                             questions,
                             current,
                             selected: clicked,
-                            text_mode: true,
                             editor,
                             answers,
                         });
@@ -8712,7 +8753,6 @@ impl AppState {
                             questions,
                             current,
                             selected,
-                            text_mode,
                             editor,
                             answers,
                         });
@@ -9308,13 +9348,11 @@ fn next_question_or_reply(
         };
     }
     let next = current + 1;
-    let text_mode = questions[next].options.is_empty();
     state.pending = Some(PendingInteraction::UserInput {
         id,
         questions,
         current: next,
         selected: 0,
-        text_mode,
         editor: Editor::default(),
         answers,
     });
@@ -9364,6 +9402,13 @@ fn commit_user_input_answers(
 /// The two rows a question carries beyond its own options.
 const OTHER_ANSWER_LABEL: &str = "직접 입력";
 const CHAT_INSTEAD_LABEL: &str = "이 내용으로 대화하기";
+
+/// Claude Code treats its automatic `Other` row as the editor itself: focus is
+/// the input mode. A question with no choices remains a plain text prompt.
+fn user_input_text_focused(question: &Question, selected: usize) -> bool {
+    question.options.is_empty()
+        || question.allow_other && selected == question.options.len()
+}
 
 /// Where the row that leaves the question sits: after the options and after the
 /// free-text row when the question offers one.
@@ -10880,10 +10925,9 @@ mod tests {
             }),
         );
 
-        // Walk down to the free-text row and open it.
+        // Claude Code's `Other` row becomes the editor as soon as focus reaches it.
         state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         state.handle_key(KeyEvent::new(KeyCode::Char('가'), KeyModifiers::NONE));
 
         let overlay = state.overlay_view().expect("overlay");
@@ -10901,7 +10945,7 @@ mod tests {
                 .iter()
                 .position(|line| line.selected)
                 .map(|row| overlay.lines[row].text.clone()),
-            Some(OTHER_ANSWER_LABEL.to_owned())
+            Some("가".to_owned())
         );
 
         // An arrow walks back out to the options it was typed among.
@@ -10914,6 +10958,67 @@ mod tests {
                 .iter()
                 .any(|line| line.selected && line.text.starts_with("둘째"))
         );
+        assert!(
+            overlay.lines.iter().any(|line| line.text == "가"),
+            "leaving Other restored its placeholder over the typed value"
+        );
+    }
+
+    #[test]
+    fn typing_only_reaches_the_focused_other_row() {
+        let mut state = test_state();
+        state.begin_server_request(
+            json!(1),
+            "item/tool/requestUserInput",
+            &json!({
+                "questions": [{
+                    "id": "q1",
+                    "question": "어느 것인가요?",
+                    "options": [
+                        { "label": "첫째", "description": "설명" },
+                        { "label": "둘째", "description": "설명" }
+                    ]
+                }]
+            }),
+        );
+
+        state.handle_key(KeyEvent::new(KeyCode::Char('가'), KeyModifiers::NONE));
+        let overlay = state.overlay_view().expect("overlay");
+        assert!(overlay.input.is_none(), "a normal option became an editor");
+        assert!(overlay.lines.iter().any(|line| line.text == OTHER_ANSWER_LABEL));
+
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let overlay = state.overlay_view().expect("overlay");
+        assert_eq!(overlay.input.map(Editor::text).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn clicking_an_option_leaves_the_other_editor_and_answers_that_option() {
+        let mut state = test_state();
+        state.begin_server_request(
+            json!(1),
+            "item/tool/requestUserInput",
+            &json!({
+                "questions": [{
+                    "id": "q1",
+                    "question": "어느 것인가요?",
+                    "options": [
+                        { "label": "첫째", "description": "설명" },
+                        { "label": "둘째", "description": "설명" }
+                    ]
+                }]
+            }),
+        );
+        state.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Char('직'), KeyModifiers::NONE));
+
+        let action = state.click_overlay_row(1);
+
+        assert!(matches!(
+            action,
+            Action::RpcResponse { ref result, .. } if result.to_string().contains("첫째")
+        ));
     }
 
     #[test]

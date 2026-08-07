@@ -65,10 +65,18 @@ const VERIFIED_PASTE_GAP: Duration = Duration::from_millis(2_000);
 /// caught.
 const MIN_RUN: usize = 2;
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum BufferedTextTarget {
+    #[default]
+    Composer,
+    PendingUserInput(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BufferedText {
     pub text: String,
     pub pasted: bool,
+    pub target: BufferedTextTarget,
 }
 
 #[derive(Debug)]
@@ -85,6 +93,7 @@ pub struct ComposerPasteBuffer {
     last: Option<Instant>,
     text: String,
     pasted: bool,
+    target: BufferedTextTarget,
     shortcut_paste: bool,
     expected_paste: Option<Vec<char>>,
     expected_index: usize,
@@ -104,11 +113,57 @@ impl ComposerPasteBuffer {
         }
     }
 
+    #[cfg(test)]
     pub fn observe(&mut self, key: KeyEvent, now: Instant) -> Vec<ComposerInput> {
         self.observe_expected(key, now, None)
     }
 
+    /// Keeps the short buffered run bound to the input that owned its first key.
+    /// If focus changes before another key arrives, the prior run is released
+    /// with its original target before the new target starts receiving input.
+    pub fn observe_targeted(
+        &mut self,
+        key: KeyEvent,
+        now: Instant,
+        target: BufferedTextTarget,
+    ) -> Vec<ComposerInput> {
+        self.observe_expected_targeted(key, now, None, target)
+    }
+
     pub fn observe_expected(
+        &mut self,
+        key: KeyEvent,
+        now: Instant,
+        expected_paste: Option<&str>,
+    ) -> Vec<ComposerInput> {
+        self.observe_expected_targeted(
+            key,
+            now,
+            expected_paste,
+            BufferedTextTarget::Composer,
+        )
+    }
+
+    fn observe_expected_targeted(
+        &mut self,
+        key: KeyEvent,
+        now: Instant,
+        expected_paste: Option<&str>,
+        target: BufferedTextTarget,
+    ) -> Vec<ComposerInput> {
+        let mut prior = if !self.text.is_empty() && self.target != target {
+            self.flush().into_iter().map(ComposerInput::Text).collect()
+        } else {
+            Vec::new()
+        };
+        if self.text.is_empty() {
+            self.target = target;
+        }
+        prior.extend(self.observe_expected_same_target(key, now, expected_paste));
+        prior
+    }
+
+    fn observe_expected_same_target(
         &mut self,
         key: KeyEvent,
         now: Instant,
@@ -237,6 +292,7 @@ impl ComposerPasteBuffer {
     /// gap between its keys can let a payload newline out as a submit key.
     pub fn expect_verified_paste(&mut self, text: &str, now: Instant) {
         self.flush();
+        self.target = BufferedTextTarget::Composer;
         self.expected_paste = Some(paste_payload_chars(text));
         self.expected_index = 0;
         self.verified_paste = true;
@@ -323,6 +379,7 @@ impl ComposerPasteBuffer {
         let buffered = (!self.text.is_empty()).then(|| BufferedText {
             text: std::mem::take(&mut self.text),
             pasted: std::mem::take(&mut self.pasted),
+            target: self.target.clone(),
         });
         self.last = None;
         self.shortcut_paste = false;
@@ -562,6 +619,7 @@ mod tests {
             Some(BufferedText {
                 text: r"C:\Temp\clipboard.png".to_owned(),
                 pasted: true,
+                target: BufferedTextTarget::Composer,
             })
         );
     }
@@ -577,6 +635,7 @@ mod tests {
             Some(BufferedText {
                 text: "C".to_owned(),
                 pasted: false,
+                target: BufferedTextTarget::Composer,
             })
         );
     }
@@ -591,7 +650,7 @@ mod tests {
 
         assert!(matches!(
             &inputs[0],
-            ComposerInput::Text(BufferedText { text, pasted: false }) if text == "가"
+            ComposerInput::Text(BufferedText { text, pasted: false, .. }) if text == "가"
         ));
         assert!(matches!(
             &inputs[1],
@@ -611,7 +670,7 @@ mod tests {
         );
         assert!(matches!(
             &inputs[0],
-            ComposerInput::Text(BufferedText { text, pasted: false }) if text == "라"
+            ComposerInput::Text(BufferedText { text, pasted: false, .. }) if text == "라"
         ));
         assert!(matches!(
             &inputs[1],
@@ -639,6 +698,7 @@ mod tests {
             Some(BufferedText {
                 text: "첫줄\n".to_owned(),
                 pasted: true,
+                target: BufferedTextTarget::Composer,
             })
         );
     }
@@ -679,6 +739,7 @@ mod tests {
             Some(BufferedText {
                 text: "가\n나".to_owned(),
                 pasted: true,
+                target: BufferedTextTarget::Composer,
             })
         );
     }
@@ -723,7 +784,7 @@ mod tests {
         );
         assert!(matches!(
             &inputs[..],
-            [ComposerInput::Text(BufferedText { text, pasted: true })]
+            [ComposerInput::Text(BufferedText { text, pasted: true, .. })]
                 if text == expected
         ));
     }
@@ -755,7 +816,7 @@ mod tests {
 
         assert!(matches!(
             &inputs[..],
-            [ComposerInput::Text(BufferedText { text, pasted: true })] if text == "a\nb\nc"
+            [ComposerInput::Text(BufferedText { text, pasted: true, .. })] if text == "a\nb\nc"
         ));
     }
 
@@ -774,7 +835,7 @@ mod tests {
 
         assert!(matches!(
             &inputs[0],
-            ComposerInput::Text(BufferedText { text, pasted: false }) if text == "a"
+            ComposerInput::Text(BufferedText { text, pasted: false, .. }) if text == "a"
         ));
         assert!(matches!(
             &inputs[1],
@@ -795,6 +856,7 @@ mod tests {
             Some(BufferedText {
                 text: "a".to_owned(),
                 pasted: false,
+                target: BufferedTextTarget::Composer,
             })
         );
     }
@@ -847,6 +909,7 @@ mod tests {
             Some(BufferedText {
                 text: "x".to_owned(),
                 pasted: true,
+                target: BufferedTextTarget::Composer,
             })
         );
     }
