@@ -3590,6 +3590,7 @@ impl AppState {
             self.workspace_entries.clear();
             self.rebuild_completion_catalog();
         }
+        self.restore_session_side_panel();
         self.select_model_and_effort(model, effort);
     }
 
@@ -4286,6 +4287,7 @@ impl AppState {
         self.shell_batches.clear();
         self.reset_turn_item_tracking();
         self.show_welcome = true;
+        self.restore_session_side_panel();
         self.select_model_and_effort(model, effort);
     }
 
@@ -8724,10 +8726,24 @@ impl AppState {
         self.diff_display_mode
     }
 
-    /// Steps the panel to its next width, wrapping closed after the widest.
+    /// Steps the panel to its next width, wrapping closed after the widest. The
+    /// new stage is written against this session right away, so a resume reopens
+    /// on the width this session was left on rather than another session's.
     pub fn cycle_side_panel(&mut self) -> SidePanelStage {
         self.side_panel_stage = self.side_panel_stage.next();
+        let _ = write_session_side_panel_stage(&self.thread_id, self.side_panel_stage);
         self.side_panel_stage
+    }
+
+    /// Restores the panel this session was last left showing. Called whenever a
+    /// thread is bound, which is what makes `/resume` reopen at the same width.
+    fn restore_session_side_panel(&mut self) {
+        if self.thread_id.is_empty() {
+            return;
+        }
+        // A session nobody opened the panel in starts closed instead of
+        // inheriting whatever width the previous session was left on.
+        self.side_panel_stage = read_session_side_panel_stage(&self.thread_id).unwrap_or_default();
     }
 
     #[cfg(test)]
@@ -10875,6 +10891,73 @@ fn read_side_panel_stage() -> SidePanelStage {
         .unwrap_or_default()
 }
 
+/// Where each session's own panel stage is kept. The stage is a per-session
+/// preference, so it rides beside the settings file rather than inside it.
+fn side_panel_stages_path() -> Option<PathBuf> {
+    vibe_settings_path().and_then(|path| Some(path.parent()?.join("side-panel-stages.json")))
+}
+
+/// How many sessions the file remembers. Old entries are dropped oldest-first so
+/// the file cannot grow without bound as sessions accumulate.
+const SIDE_PANEL_STAGE_HISTORY: usize = 200;
+
+fn read_side_panel_stages() -> Vec<(String, String)> {
+    let Some(path) = side_panel_stages_path() else {
+        return Vec::new();
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<(String, String)>>(&text).unwrap_or_default()
+}
+
+/// The stage `thread_id` was last left on. A session nobody has opened the panel
+/// in starts closed rather than inheriting another session's width.
+fn read_session_side_panel_stage(thread_id: &str) -> Option<SidePanelStage> {
+    if thread_id.is_empty() {
+        return None;
+    }
+    read_side_panel_stages()
+        .into_iter()
+        .find(|(id, _)| id == thread_id)
+        .map(|(_, stage)| SidePanelStage::from_config_value(&stage))
+}
+
+/// Moves `thread_id` to the newest end of the list with its current stage, then
+/// trims the oldest entries past the history limit.
+fn upsert_side_panel_stage(
+    mut stages: Vec<(String, String)>,
+    thread_id: &str,
+    stage: SidePanelStage,
+) -> Vec<(String, String)> {
+    stages.retain(|(id, _)| id != thread_id);
+    stages.push((thread_id.to_owned(), stage.config_value().to_owned()));
+    if stages.len() > SIDE_PANEL_STAGE_HISTORY {
+        let excess = stages.len() - SIDE_PANEL_STAGE_HISTORY;
+        stages.drain(0..excess);
+    }
+    stages
+}
+
+fn write_session_side_panel_stage(thread_id: &str, stage: SidePanelStage) -> std::io::Result<()> {
+    if thread_id.is_empty() {
+        return Ok(());
+    }
+    let path = side_panel_stages_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Devez Vibe 설정 경로를 찾을 수 없습니다.",
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let stages = upsert_side_panel_stage(read_side_panel_stages(), thread_id, stage);
+    let text = serde_json::to_string(&stages)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    fs::write(path, text)
+}
+
 #[allow(dead_code)]
 fn read_diff_display_mode() -> DiffDisplayMode {
     read_vibe_config_value("diff_display_mode")
@@ -11143,6 +11226,32 @@ mod tests {
             SidePanelStage::from_config_value("garbage"),
             SidePanelStage::Closed
         );
+    }
+
+    /// Each session keeps its own stage, so reopening one restores that session's
+    /// width without another session's stage leaking into it.
+    #[test]
+    fn side_panel_stages_are_kept_per_session_and_bounded() {
+        let stages = upsert_side_panel_stage(Vec::new(), "session-a", SidePanelStage::Large);
+        let stages = upsert_side_panel_stage(stages, "session-b", SidePanelStage::Small);
+        // Re-saving a session moves it to the newest end rather than duplicating.
+        let stages = upsert_side_panel_stage(stages, "session-a", SidePanelStage::Medium);
+
+        assert_eq!(
+            stages,
+            vec![
+                ("session-b".to_owned(), "small".to_owned()),
+                ("session-a".to_owned(), "medium".to_owned()),
+            ]
+        );
+
+        let mut many = Vec::new();
+        for index in 0..SIDE_PANEL_STAGE_HISTORY + 5 {
+            many =
+                upsert_side_panel_stage(many, &format!("session-{index}"), SidePanelStage::Small);
+        }
+        assert_eq!(many.len(), SIDE_PANEL_STAGE_HISTORY);
+        assert_eq!(many[0].0, "session-5");
     }
 
     #[test]

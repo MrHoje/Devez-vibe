@@ -856,9 +856,12 @@ fn paint_panel_content_row(
     }
 }
 
+/// The plan card draws its own box in the plain foreground tone, and the panel
+/// takes that box over while it is open, so both read as the same frame in every
+/// theme rather than the panel sitting a shade apart.
 fn side_panel_border_style() -> CellStyle {
     CellStyle {
-        foreground: tone_rgb(Tone::Border),
+        foreground: tone_rgb(PLAN_BORDER_TONE),
         ..CellStyle::plain()
     }
 }
@@ -5889,6 +5892,10 @@ fn plan_lines(block: &Block, width: u16) -> Vec<PaintLine> {
 /// names the one key that always works. Alt+P is reserved for the side panel.
 const PLAN_TOGGLE_HINT: &str = " Alt + W ";
 
+/// The tone the plan card's own box is drawn in. The docked side panel shares it
+/// so the frame around the plan looks the same wherever the plan is shown.
+const PLAN_BORDER_TONE: Tone = Tone::Plain;
+
 /// Reasoning summaries use a narrow `∴` gutter and a single dim italic
 /// paragraph. Plan blocks keep their heading and one physical row per step.
 fn fixed_plan_summary_lines(
@@ -5915,7 +5922,7 @@ fn fixed_plan_summary_lines(
             prefix: String::new(),
             prefix_tone: Tone::Border,
             text: format!("─── {title} {rule}"),
-            tone: Tone::Plain,
+            tone: PLAN_BORDER_TONE,
             bold: false,
             tool_heading: None,
             pick: None,
@@ -5927,12 +5934,12 @@ fn fixed_plan_summary_lines(
                 },
                 PaintSpan {
                     text: "▼ ".to_owned(),
-                    tone: Tone::Plain,
+                    tone: PLAN_BORDER_TONE,
                     bold: false,
                 },
                 PaintSpan {
                     text: "──".to_owned(),
-                    tone: Tone::Plain,
+                    tone: PLAN_BORDER_TONE,
                     bold: false,
                 },
             ],
@@ -6007,7 +6014,7 @@ fn fixed_plan_summary_lines(
     ));
     let mut header_tail = vec![PaintSpan {
         text: "┌── ".to_owned(),
-        tone: Tone::Plain,
+        tone: PLAN_BORDER_TONE,
         bold: false,
     }];
     header_tail.extend(plan_title_shimmer_spans(
@@ -6018,7 +6025,7 @@ fn fixed_plan_summary_lines(
     header_tail.extend([
         PaintSpan {
             text: format!(" {header_rule}"),
-            tone: Tone::Plain,
+            tone: PLAN_BORDER_TONE,
             bold: false,
         },
         PaintSpan {
@@ -6028,12 +6035,12 @@ fn fixed_plan_summary_lines(
         },
         PaintSpan {
             text: "▲ ".to_owned(),
-            tone: Tone::Plain,
+            tone: PLAN_BORDER_TONE,
             bold: false,
         },
         PaintSpan {
             text: "─┐".to_owned(),
-            tone: Tone::Plain,
+            tone: PLAN_BORDER_TONE,
             bold: false,
         },
     ]);
@@ -6061,10 +6068,10 @@ fn fixed_plan_summary_lines(
     } else {
         lines.push(PaintLine::blank());
     }
-    lines.push(PaintLine::plain(format!(
-        "└{}┘",
-        "─".repeat(line_width.saturating_sub(2))
-    )));
+    lines.push(PaintLine {
+        tone: PLAN_BORDER_TONE,
+        ..PaintLine::plain(format!("└{}┘", "─".repeat(line_width.saturating_sub(2))))
+    });
     lines.push(PaintLine::blank());
     lines
 }
@@ -6110,6 +6117,22 @@ fn plan_title_shimmer_spans(text: &str, phase: Option<f32>, effort_tone: Tone) -
     .collect()
 }
 
+/// Columns the leading `1. ` style number of a step occupies, so folded rows can
+/// hang under the text rather than under the number. Zero when a step opens with
+/// something else.
+fn step_number_width(text: &str) -> usize {
+    let digits = text.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 {
+        return 0;
+    }
+    let rest = &text[digits..];
+    if rest.starts_with(". ") {
+        digits + 2
+    } else {
+        0
+    }
+}
+
 /// The plan summary as the docked panel shows it: a heading, a blank row, then
 /// one row per step. The panel already draws a border of its own, so this drops
 /// the card chrome, the status gutter, and the toggle hint.
@@ -6133,7 +6156,7 @@ fn side_panel_plan_lines(
     let all_completed = !summary.steps.is_empty() && completed == summary.steps.len();
     if all_completed {
         let elapsed: Duration = summary.steps.iter().filter_map(|step| step.elapsed).sum();
-        title.push_str(&format!("  ( ⏱  {} )", format_plan_elapsed(elapsed)));
+        title.push_str(&format!("  (  {}  )", format_plan_elapsed(elapsed)));
     }
     let mut lines = vec![
         PaintLine {
@@ -6167,38 +6190,46 @@ fn side_panel_plan_lines(
             PlanStepStatus::Pending => ("  ".to_owned(), false),
         };
         let mark_width = UnicodeWidthStr::width(mark.as_str());
-        lines.push(PaintLine {
-            prefix: mark,
-            prefix_tone: if is_completed {
-                Tone::FastOff
-            } else if in_progress {
-                Tone::Accent
-            } else {
-                Tone::Muted
-            },
+        let prefix_tone = if is_completed {
+            Tone::FastOff
+        } else if in_progress {
+            Tone::Accent
+        } else {
+            Tone::Muted
+        };
+        let tone = if is_completed {
+            Tone::PlanDone
+        } else if in_progress {
+            Tone::Accent
+        } else {
+            Tone::Plain
+        };
+        // A step too wide for the panel folds instead of ending in an ellipsis,
+        // and its folded rows line up under the step's own text, not under the
+        // number that opens it.
+        let continuation = " ".repeat(mark_width + step_number_width(&step.text));
+        // The elapsed time sits at the end of the last row, so every row leaves
+        // that much room rather than only the row the time lands on.
+        let wrap_width = content_width.saturating_sub(time_width) + 1;
+        let mut wrapped = wrapped_line_with_continuation(
+            &mark,
+            &continuation,
+            prefix_tone,
+            &step.text,
+            tone,
             bold,
-            text: compact_right(
-                &step.text,
-                content_width.saturating_sub(time_width + mark_width),
-            ),
-            tone: if is_completed {
-                Tone::PlanDone
-            } else if in_progress {
-                Tone::Accent
-            } else {
-                Tone::Plain
-            },
-            tail: elapsed
-                .map(|time| {
-                    vec![PaintSpan {
-                        text: format!(" ({time})"),
-                        tone: Tone::Muted,
-                        bold: false,
-                    }]
-                })
-                .unwrap_or_default(),
-            ..PaintLine::plain("")
-        });
+            u16::try_from(wrap_width).unwrap_or(u16::MAX),
+        );
+        if let Some(time) = elapsed
+            && let Some(last) = wrapped.last_mut()
+        {
+            last.tail.push(PaintSpan {
+                text: format!(" ({time})"),
+                tone: Tone::Muted,
+                bold: false,
+            });
+        }
+        lines.append(&mut wrapped);
     }
     lines
 }
@@ -9141,6 +9172,51 @@ mod tests {
         assert_eq!(frame.cell(hint_start, 0).style.background, None);
         assert_eq!(frame.cell(hint_start - 1, 0).glyph, "─");
         assert_eq!(frame.cell(right - 1, 0).glyph, "─");
+    }
+
+    /// The plan is framed by the card when the panel is shut and by the panel
+    /// when it is open, so both boxes must be drawn in the same colour — in every
+    /// theme, not just the one that happens to be selected.
+    #[test]
+    fn the_side_panel_border_matches_the_plan_card_border_in_every_theme() {
+        let summary = PlanSummary {
+            explanation: None,
+            steps: vec![PlanStep {
+                text: "step".to_owned(),
+                status: PlanStepStatus::Completed,
+                started_at: None,
+                elapsed: None,
+            }],
+            expanded: true,
+            started_at: Instant::now(),
+            elapsed: None,
+        };
+        let layout =
+            side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
+
+        for theme in ThemeKind::ALL {
+            theme::set_current(theme);
+            let card = fixed_plan_summary_lines(&summary, 80, 0.0, false, None);
+            let card_border = card
+                .iter()
+                .find_map(|line| line.text.starts_with('└').then_some(line.tone))
+                .expect("the card closes with its own bottom rule");
+            let mut frame = CellFrame::new(100, 3);
+            paint_side_panel_into_frame(&mut frame, layout, 3, &[], None);
+
+            let corner = frame.cell(layout.panel_left, 0);
+            assert_eq!(corner.glyph, "╭");
+            assert_eq!(
+                corner.style.foreground,
+                tone_rgb(card_border),
+                "{theme:?} paints the two borders differently"
+            );
+            assert!(
+                corner.style.foreground.is_some(),
+                "{theme:?} leaves the panel border without a colour"
+            );
+        }
+        theme::set_current(ThemeKind::Dark);
     }
 
     /// The panel is closed by its own toggle key, so its rule carries no close
@@ -15559,7 +15635,47 @@ mod tests {
             ..summary
         };
         let done = side_panel_plan_lines(&finished, layout.content_width(), 0.0, false);
-        assert_eq!(painted(&done[0]), "작업 단계  3 / 3 완료  ( ⏱  1m 25s )");
+        assert_eq!(painted(&done[0]), "작업 단계  3 / 3 완료  (  1m 25s  )");
+    }
+
+    /// A step wider than the panel folds onto more rows instead of ending in an
+    /// ellipsis, and the folded rows hang under the step's text so the numbers
+    /// keep a column of their own.
+    #[test]
+    fn a_long_side_panel_step_folds_under_its_own_text() {
+        let summary = PlanSummary {
+            explanation: None,
+            steps: vec![PlanStep {
+                text: "1. 사이드패널 폭보다 훨씬 긴 작업 단계 제목을 넣어서 줄바꿈을 확인한다"
+                    .to_owned(),
+                status: PlanStepStatus::Pending,
+                started_at: None,
+                elapsed: None,
+            }],
+            expanded: true,
+            started_at: Instant::now(),
+            elapsed: None,
+        };
+        let layout =
+            side_panel_layout(140, SIDE_PANEL_WIDTHS[0]).expect("140 columns carry the panel");
+        let content = side_panel_plan_lines(&summary, layout.content_width(), 0.0, false);
+
+        let rows = &content[2..];
+        assert!(rows.len() > 1, "the step folds onto more than one row");
+        assert!(
+            rows.iter().all(|row| !painted(row).contains('…')),
+            "folding replaces the ellipsis"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| painted_line_width(row) <= layout.content_width()),
+            "no folded row runs past the panel's inner width"
+        );
+        // `"  "` is the pending mark's own gutter, `"1. "` the step's number.
+        assert_eq!(rows[0].prefix, "  ");
+        for row in &rows[1..] {
+            assert_eq!(row.prefix, "     ");
+        }
     }
 
     #[test]
