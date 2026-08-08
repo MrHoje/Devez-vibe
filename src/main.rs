@@ -2923,6 +2923,8 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 저장소의 사실이나 원인을 조사할 때는 첫 검색 결과나 단일 키워드에 의존하지 않는다. 관련 상태·표시·입력 흐름을 추적하고, 적절한 테스트 또는 변경 이력과 교차 확인한다.\n",
     "- 검색에서 찾지 못했다는 이유만으로 기능이나 코드가 없다고 단정하지 않는다. 현재 구현, 과거 문제의 원인, 추측을 구분하고 근거가 부족하면 미확인이라고 밝힌다.\n",
     "- 최종 답변에는 직접적인 결론, 이를 뒷받침하는 핵심 근거, 확인 범위나 한계만 우선해서 담는다. 읽기 전용 수행 여부나 내부 절차는 결과 판단에 필요할 때만 언급한다.\n",
+    "- 조사나 수정 결과를 보고할 때는 확인된 원인, 사용자에게 미치는 영향, 실제 조치, 확인 결과를 짧게 함께 적는다. 원인을 확인하지 못했으면 추측으로 메우지 말고 미확인이라고 밝힌다. `수정했습니다`, `확인했습니다`만으로 결과를 끝내지 않는다.\n",
+    "- 재개 기록, 사용자 질문, 권한 응답처럼 외부 상태를 기다리는 경우에는 실제 응답이나 오류를 받기 전 취소·거절·완료·원인을 단정하지 않는다. 질문 도구가 전달되지 않거나 응답을 받지 못했다는 오류가 오면 필요한 질문을 일반 text로 다시 보여 주고, 답이 필요한 작업은 사용자가 답하기 전 파일을 바꾸지 않는다.\n",
     "- Skill 적용, 지침 확인, 내부 도구 호출 같은 내부 절차를 사용자에게 commentary로 알리지 않는다. ",
     "사용자 판단에 필요한 진행 상황이나 결과만 알린다.\n",
     "진행 보고 규칙:\n",
@@ -2934,7 +2936,7 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "계획 규칙:\n",
     "- 실행 단계가 두 개 이상이거나 도구를 두 번 이상 호출할 작업, 설계 판단이 필요한 작업에서는 첫 작업 도구 호출 전에 반드시 `update_plan`을 호출해 짧은 계획을 먼저 세운다. 진행 안내 문장, 조사 항목 나열, 답변 본문의 불릿은 `update_plan`을 대신하지 않는다.\n",
     "- 단순 질문, 단 한 번의 고립된 조회, 한 줄 수정처럼 도구 한 번으로 끝난다고 확신할 수 있는 요청에만 계획을 만들지 않는다. 한 번으로 끝날지 확신할 수 없으면 반드시 계획부터 만든다. 첫 작업 도구를 호출한 뒤 두 번째 도구 앞에서 계획을 만드는 것은 지침 위반이다.\n",
-    "- 모든 Task 제목은 순서대로 `1. `, `2. `, `3. `처럼 번호로 시작한다.\n",
+    "- `update_plan`의 각 step에는 반드시 제목 자체의 맨 앞에 순서대로 `1. `, `2. `, `3. ` 번호를 넣는다. 화면의 상태 기호나 목록 서식에 번호 표시를 맡기지 않으며, 새 계획은 항상 `1. `부터 시작한다.\n",
     "- Task에는 실제 조사·수정·검증 작업만 넣고, 결론 정리나 완료 보고만을 별도 Task로 만들지 않는다.\n",
     "- 각 Task는 착수할 때 in_progress, 끝나면 completed로 즉시 갱신한다.\n",
     "- 계획을 만들었다면 동시에 in_progress인 Task는 하나만 두고, 현재 Task를 completed로 바꾼 뒤 다음 Task를 in_progress로 바꾼다.\n",
@@ -2972,7 +2974,7 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "첫 작업 도구 호출 전에 Claude Code의 TaskCreate로 짧은 작업 목록을 만든다. 진행 안내 text, 조사 항목 나열, 답변 본문의 불릿은 TaskCreate를 대신하지 않는다. ",
     "단 한 번의 고립된 조회나 한 줄 수정처럼 도구 한 번으로 끝난다고 확신할 수 있는 요청에만 Task를 만들지 않는다. 한 번으로 끝날지 확신할 수 없으면 반드시 TaskCreate부터 호출한다. ",
     "TaskCreate 없이 첫 작업 도구를 호출한 뒤 두 번째 작업 도구를 호출하거나, 두 번째 도구 앞에서 뒤늦게 TaskCreate를 호출하면 지침 위반이다. ",
-    "모든 Task의 subject는 순서대로 `1. `, `2. `, `3. `처럼 번호로 시작하고, 번호는 새 작업 목록마다 항상 `1. `부터 다시 시작한다. ",
+    "모든 TaskCreate의 subject에는 반드시 제목 자체의 맨 앞에 순서대로 `1. `, `2. `, `3. ` 번호를 넣고, 화면의 상태 기호나 목록 서식에 번호 표시를 맡기지 않는다. 번호는 새 작업 목록마다 항상 `1. `부터 다시 시작한다. ",
     "TaskList에 이미 끝난 Task가 남아 있어도 그 번호를 이어받지 않는다. ",
     "Task에는 실제 조사·수정·검증 작업만 넣고, `결론 정리`, `결과 보고`, `완료 보고`만을 별도 Task로 만들지 않는다. ",
     "모든 TaskCreate가 끝나면 다른 작업 도구보다 먼저 첫 Task를 TaskUpdate로 `in_progress`로 바꾼다. ",
@@ -3002,6 +3004,8 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 저장소의 사실이나 원인을 조사할 때는 첫 검색 결과나 단일 키워드에 의존하지 않는다. 관련 상태·표시·입력 흐름을 추적하고, 적절한 테스트 또는 변경 이력과 교차 확인한다.\n",
     "- 검색에서 찾지 못했다는 이유만으로 기능이나 코드가 없다고 단정하지 않는다. 현재 구현, 과거 문제의 원인, 추측을 구분하고 근거가 부족하면 미확인이라고 밝힌다.\n",
     "- 최종 답변에는 직접적인 결론, 이를 뒷받침하는 핵심 근거, 확인 범위나 한계만 우선해서 담는다. 읽기 전용 수행 여부나 내부 절차는 결과 판단에 필요할 때만 언급한다.\n",
+    "- 조사나 수정 결과를 보고할 때는 확인된 원인, 사용자에게 미치는 영향, 실제 조치, 확인 결과를 짧게 함께 적는다. 원인을 확인하지 못했으면 추측으로 메우지 말고 미확인이라고 밝힌다. `수정했습니다`, `확인했습니다`만으로 결과를 끝내지 않는다.\n",
+    "- 재개 기록, 사용자 질문, 권한 응답처럼 외부 상태를 기다리는 경우에는 실제 응답이나 오류를 받기 전 취소·거절·완료·원인을 단정하지 않는다. 질문 도구가 전달되지 않거나 응답을 받지 못했다는 오류가 오면 필요한 질문을 일반 text로 다시 보여 주고, 답이 필요한 작업은 사용자가 답하기 전 파일을 바꾸지 않는다.\n",
     "진행 보고 규칙:\n",
     "- 첫 진행 안내를 낸 뒤에는 새 사실이 사용자 판단을 바꾸거나 작업 범위가 달라질 때만 짧게 알리고, 같은 내용을 반복하지 않는다.\n",
     "- 무엇을 알아냈는지 담기지 않은 진행 문장은 쓰지 않는다. ",
@@ -3071,7 +3075,7 @@ fn resume_thread_params(thread_id: &str, claude: &ClaudeSessionSettings) -> Valu
 const CODEX_TURN_REMINDER: &str = concat!(
     "Devez Vibe 핵심 규칙 요약. 전체 규칙은 스레드 지침에 있고, 이번 턴에 특히 지킬 것만 다시 적는다.\n",
     "- 사용자에게 보이는 일반 문장은 한국어로 쓰고, 작업이면 첫 응답에서 무엇을 확인·수정할지 짧게 알린다.\n",
-    "- 도구 한 번으로 끝난다고 확신할 수 없는 작업은 첫 작업 도구 전에 반드시 `update_plan`을 호출해 한국어 제목의 짧은 계획을 만든다. 진행 안내나 조사 목록은 계획을 대신하지 않으며, 첫 도구 뒤나 두 번째 도구 앞에 계획을 만들면 안 된다. 계획의 한 단계만 in_progress로 두고, 그 단계의 도구 호출 전후에 즉시 상태를 갱신한다.\n",
+    "- 도구 한 번으로 끝난다고 확신할 수 없는 작업은 첫 작업 도구 전에 반드시 `update_plan`을 호출해 한국어 제목의 짧은 계획을 만든다. 각 step 제목 자체는 반드시 `1. `, `2. `, `3. `처럼 번호로 시작하며, 화면 목록의 기호는 번호를 대신하지 않는다. 진행 안내나 조사 목록은 계획을 대신하지 않으며, 첫 도구 뒤나 두 번째 도구 앞에 계획을 만들면 안 된다. 계획의 한 단계만 in_progress로 두고, 그 단계의 도구 호출 전후에 즉시 상태를 갱신한다.\n",
     "- 답변은 결론부터 간결하게 쓰며, 확인한 근거와 검증하지 못한 한계를 구분한다.\n",
     "- 선택이나 승인이 필요하면 제공된 질문 기능을 우선 사용하고, 선택지·결과·판단에 필요한 사실을 빠뜨리지 않는다.\n",
 );
@@ -3088,7 +3092,7 @@ const CLAUDE_TURN_REMINDER: &str = concat!(
     "Devez Vibe 규칙 요약. 전체 규칙은 시스템 프롬프트에 있고, 이번 턴에 특히 지킬 것만 다시 적는다.\n",
     "- 단순 질문이 아닌 작업은 첫 응답 content block을 짧은 한국어 진행 안내 text로 시작하고, ",
     "TaskCreate를 포함한 어떤 tool_use도 그보다 먼저 내지 않는다.\n",
-    "- 도구 한 번으로 끝난다고 확신할 수 없는 작업은 첫 작업 도구 전에 반드시 TaskCreate로 작업 목록을 만든다. 진행 안내나 조사 목록은 TaskCreate를 대신하지 않으며, 첫 도구 뒤나 두 번째 도구 앞에 TaskCreate를 호출하면 안 된다. 각 Task를 `pending` → `in_progress` → `completed` 순서로 하나씩 옮긴다.\n",
+    "- 도구 한 번으로 끝난다고 확신할 수 없는 작업은 첫 작업 도구 전에 반드시 TaskCreate로 작업 목록을 만든다. 각 TaskCreate의 subject 자체는 반드시 `1. `, `2. `, `3. `처럼 번호로 시작하며, 화면 목록의 기호는 번호를 대신하지 않는다. 진행 안내나 조사 목록은 TaskCreate를 대신하지 않으며, 첫 도구 뒤나 두 번째 도구 앞에 TaskCreate를 호출하면 안 된다. 각 Task를 `pending` → `in_progress` → `completed` 순서로 하나씩 옮긴다.\n",
     "- 답변은 서론 없이 결론부터 쓰고, 분량과 노출 범위는 함께 오는 응답 모드 안내를 따른다.\n",
     "- 선택이나 승인을 요청할 때는 본문에 나열하지 말고 AskUserQuestion 도구로 묻는다.\n",
 );
@@ -5096,6 +5100,8 @@ mod tests {
         assert!(CODEX_TURN_REMINDER.contains("`update_plan`"));
         assert!(CODEX_TURN_REMINDER.contains("대신하지 않으며"));
         assert!(CODEX_TURN_REMINDER.contains("확신할 수 없는"));
+        assert!(CODEX_TURN_REMINDER.contains("각 step 제목 자체"));
+        assert!(CODEX_TURN_REMINDER.contains("`1. `, `2. `, `3. `"));
         // The full rules open the session; the turn repeats only the reminder,
         // which stays short enough to read as an instruction.
         assert_eq!(
@@ -5111,6 +5117,8 @@ mod tests {
         assert!(CLAUDE_TURN_REMINDER.contains("TaskCreate"));
         assert!(CLAUDE_TURN_REMINDER.contains("대신하지 않으며"));
         assert!(CLAUDE_TURN_REMINDER.contains("확신할 수 없는"));
+        assert!(CLAUDE_TURN_REMINDER.contains("각 TaskCreate의 subject 자체"));
+        assert!(CLAUDE_TURN_REMINDER.contains("`1. `, `2. `, `3. `"));
         assert!(CLAUDE_TURN_REMINDER.contains("AskUserQuestion"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskCreate"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskUpdate"));
@@ -5123,6 +5131,8 @@ mod tests {
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("두 번째 작업 도구를 호출하거나"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskCreate를 대신하지 않는다"));
         assert!(DEVEZ_INSTRUCTIONS.contains("`update_plan`을 대신하지 않는다"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("모든 TaskCreate의 subject에는 반드시 제목 자체"));
+        assert!(DEVEZ_INSTRUCTIONS.contains("`update_plan`의 각 step에는 반드시 제목 자체"));
         assert!(
             CLAUDE_DEVEZ_INSTRUCTIONS.contains("`pending`에서 `completed`로 바로 바꾸지 않는다")
         );
@@ -5180,6 +5190,10 @@ mod tests {
             );
             assert!(rules.contains("현재 구현, 과거 문제의 원인, 추측을 구분"));
             assert!(rules.contains("직접적인 결론, 이를 뒷받침하는 핵심 근거"));
+            assert!(rules.contains("확인된 원인, 사용자에게 미치는 영향, 실제 조치, 확인 결과"));
+            assert!(rules.contains("`수정했습니다`, `확인했습니다`만으로 결과를 끝내지 않는다"));
+            assert!(rules.contains("실제 응답이나 오류를 받기 전 취소·거절·완료·원인을 단정하지 않는다"));
+            assert!(rules.contains("필요한 질문을 일반 text로 다시 보여 주고"));
             assert!(rules.contains("결론 정리"));
             assert!(rules.contains("종료 직전에 여러 Task를 한꺼번에"));
         }
