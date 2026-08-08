@@ -4337,6 +4337,13 @@ impl AppState {
         let Some(turns) = thread.get("turns").and_then(Value::as_array) else {
             return;
         };
+        let prompt_history = turns
+            .iter()
+            .filter_map(|turn| turn.get("items").and_then(Value::as_array))
+            .flatten()
+            .filter_map(user_message_text)
+            .collect::<Vec<_>>();
+        self.editor.replace_history(prompt_history);
         self.turn_interrupted = false;
         self.last_completed_duration = turns.iter().rev().find_map(|turn| {
             let started = turn.get("startedAt")?.as_i64()?;
@@ -5034,6 +5041,16 @@ impl AppState {
         self.command_selection = 0;
         self.disarm_quit();
         true
+    }
+
+    /// Applies a cursor position resolved from a click on the main composer.
+    /// Blocking prompts own keyboard focus, so the composer beneath one ignores
+    /// stray clicks just as selection deletion does.
+    pub fn move_composer_cursor(&mut self, index: usize) -> bool {
+        if self.pending.is_some() {
+            return false;
+        }
+        self.editor.move_to_display_index(index)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
@@ -9920,11 +9937,10 @@ fn group_turn_file_changes(blocks: Vec<Block>) -> Vec<Block> {
 /// would lose the model colour it had while it was sent.
 const UNKNOWN_PROMPT_MODEL: &str = "You";
 
-fn completed_item_block(cwd: &str, item: &Value) -> Option<Block> {
-    match item.get("type")?.as_str()? {
-        "userMessage" => {
-            let body = item
-                .get("content")
+fn user_message_text(item: &Value) -> Option<String> {
+    (item.get("type")?.as_str()? == "userMessage")
+        .then(|| {
+            item.get("content")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
@@ -9934,9 +9950,15 @@ fn completed_item_block(cwd: &str, item: &Value) -> Option<Block> {
                         .flatten()
                 })
                 .collect::<Vec<_>>()
-                .join("\n");
-            (!body.is_empty()).then(|| Block::new(BlockKind::User, UNKNOWN_PROMPT_MODEL, body))
-        }
+                .join("\n")
+        })
+        .filter(|body| !body.is_empty())
+}
+
+fn completed_item_block(cwd: &str, item: &Value) -> Option<Block> {
+    match item.get("type")?.as_str()? {
+        "userMessage" => user_message_text(item)
+            .map(|body| Block::new(BlockKind::User, UNKNOWN_PROMPT_MODEL, body)),
         "commandExecution" => {
             let status = item
                 .get("status")
@@ -12519,6 +12541,56 @@ mod tests {
             .find(|block| matches!(block.kind, BlockKind::User))
             .expect("replayed prompt");
         assert_eq!(prompt.title, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn resumed_codex_and_claude_prompts_replace_composer_history() {
+        for model in ["gpt-5.6-sol", "claude:claude-sonnet-5"] {
+            let mut state = test_state();
+            state.editor.set_text("prompt from another session");
+            state.editor.take_for_submit();
+            state.editor.set_text("draft while resuming");
+            let thread = json!({
+                "turns": [
+                    {
+                        "id": "turn-1",
+                        "model": model,
+                        "items": [{
+                            "type": "userMessage",
+                            "id": "user-1",
+                            "content": [{ "type": "text", "text": "first resumed prompt" }]
+                        }]
+                    },
+                    {
+                        "id": "turn-2",
+                        "model": model,
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "id": "user-2",
+                                "content": [
+                                    { "type": "text", "text": "second" },
+                                    { "type": "image", "url": "ignored" },
+                                    { "type": "text", "text": "resumed prompt" }
+                                ]
+                            },
+                            { "type": "agentMessage", "id": "agent-2", "text": "done" }
+                        ]
+                    }
+                ]
+            });
+
+            state.load_history(&thread, None);
+
+            state.editor.history_previous();
+            assert_eq!(state.editor.text(), "second\nresumed prompt", "{model}");
+            assert_eq!(state.editor.history_position(), Some((2, 2)), "{model}");
+            state.editor.history_previous();
+            assert_eq!(state.editor.text(), "first resumed prompt", "{model}");
+            state.editor.history_next();
+            state.editor.history_next();
+            assert_eq!(state.editor.text(), "draft while resuming", "{model}");
+        }
     }
 
     /// A resumed session writes its first `turn_context` when the next turn

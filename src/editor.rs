@@ -338,6 +338,27 @@ impl Editor {
         self.replace(text.into());
     }
 
+    /// Moves the cursor to a character boundary resolved from the painted
+    /// composer. A collapsed paste remains one unit even if a caller hands us
+    /// an index from inside it.
+    pub fn move_to_display_index(&mut self, index: usize) -> bool {
+        let mut next = index.min(self.buffer.len());
+        if let (Some(start), Some(end)) = (self.collapsed_paste_start, self.collapsed_paste_end)
+            && next > start
+            && next < end
+        {
+            next = if next - start < end - next {
+                start
+            } else {
+                end
+            };
+        }
+        let changed = self.cursor != next || self.history_index.is_some();
+        self.leave_history();
+        self.cursor = next;
+        changed
+    }
+
     pub fn replace_range(&mut self, range: std::ops::Range<usize>, text: &str) {
         self.leave_history();
         let start = self.raw_index_for_text_index(range.start);
@@ -527,15 +548,35 @@ impl Editor {
             return None;
         }
 
-        let is_slash_command = text.starts_with('/') && !text.contains('\n');
-        if !is_slash_command && self.history.last().is_none_or(|last| last != &text) {
-            self.history.push(text.clone());
-            if self.history.len() > 100 {
-                self.history.remove(0);
-            }
-        }
+        self.push_history(text.clone());
         self.clear();
         Some(text)
+    }
+
+    /// Replaces prompt recall with the user messages belonging to a resumed thread.
+    /// The current composer buffer is intentionally left alone: a prompt typed while
+    /// the session is switching must still be waiting when the history arrives.
+    pub fn replace_history(&mut self, prompts: impl IntoIterator<Item = String>) {
+        self.history.clear();
+        for prompt in prompts {
+            self.push_history(prompt);
+        }
+        self.history_index = None;
+        self.draft.clear();
+    }
+
+    fn push_history(&mut self, text: String) {
+        let is_slash_command = text.starts_with('/') && !text.contains('\n');
+        if text.trim().is_empty()
+            || is_slash_command
+            || self.history.last().is_some_and(|last| last == &text)
+        {
+            return;
+        }
+        self.history.push(text);
+        if self.history.len() > 100 {
+            self.history.remove(0);
+        }
     }
 
     /// Where the recalled entry sits, newest first, as `(position, total)`.
@@ -766,6 +807,72 @@ mod tests {
 
         assert_eq!(editor.text(), "a real prompt");
         assert_eq!(editor.history_position(), Some((1, 1)));
+    }
+
+    #[test]
+    fn replacing_history_keeps_the_current_draft_and_filters_non_prompts() {
+        let mut editor = Editor::default();
+        editor.set_text("old session prompt");
+        editor.take_for_submit();
+        editor.set_text("draft for resumed session");
+
+        editor.replace_history([
+            "first prompt".to_owned(),
+            "/compact".to_owned(),
+            "first prompt".to_owned(),
+            "second prompt".to_owned(),
+            "   ".to_owned(),
+            "second prompt".to_owned(),
+        ]);
+
+        editor.history_previous();
+        assert_eq!(editor.text(), "second prompt");
+        assert_eq!(editor.history_position(), Some((2, 2)));
+        editor.history_previous();
+        assert_eq!(editor.text(), "first prompt");
+        assert_eq!(editor.history_position(), Some((1, 2)));
+        editor.history_next();
+        editor.history_next();
+        assert_eq!(editor.text(), "draft for resumed session");
+        assert_eq!(editor.history_position(), None);
+    }
+
+    #[test]
+    fn replacing_history_keeps_only_the_latest_hundred_prompts() {
+        let mut editor = Editor::default();
+
+        editor.replace_history((0..105).map(|index| format!("prompt {index}")));
+
+        assert_eq!(editor.history.len(), 100);
+        assert_eq!(editor.history.first().map(String::as_str), Some("prompt 5"));
+        assert_eq!(
+            editor.history.last().map(String::as_str),
+            Some("prompt 104")
+        );
+    }
+
+    #[test]
+    fn click_positions_do_not_enter_a_collapsed_paste() {
+        let mut editor = Editor::default();
+        editor.insert_paste_str("one\ntwo\nthree\nfour\nfive\nsix");
+        let paste = editor.collapsed_paste_range().expect("collapsed paste");
+
+        assert!(editor.move_to_display_index(paste.start + 1));
+        assert_eq!(editor.display_cursor(), paste.start);
+        assert!(editor.move_to_display_index(paste.end - 1));
+        assert_eq!(editor.display_cursor(), paste.end);
+    }
+
+    #[test]
+    fn clicking_a_recalled_prompt_leaves_history_navigation() {
+        let mut editor = Editor::default();
+        editor.set_text("remembered");
+        editor.take_for_submit();
+        editor.history_previous();
+        let cursor = editor.display_cursor();
+
+        assert!(editor.move_to_display_index(cursor));
+        assert_eq!(editor.history_position(), None);
     }
 
     #[test]

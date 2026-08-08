@@ -474,7 +474,14 @@ async fn await_thread(
                             observe_composer_key(state, &mut composer_paste, key, Instant::now())
                         }
                     }
-                    Some(Ok(Event::Mouse(mouse))) => renderer_mouse_action(renderer, &mouse, |pick| pick_action(state, pick)),
+                    Some(Ok(Event::Mouse(mouse))) => {
+                        renderer_mouse_action(renderer, &mouse, |click| match click {
+                            MouseClick::Pick(pick) => pick_action(state, pick),
+                            MouseClick::Composer(index) => {
+                                Action::Tick(state.move_composer_cursor(index))
+                            }
+                        })
+                    }
                     Some(Ok(Event::Paste(text))) => {
                         renderer.clear_selection();
                         if composer_paste.take_discarded_paste(&text) {
@@ -708,9 +715,13 @@ async fn choose_startup_session(
                 // gets to end on it, so the click is read back out rather than
                 // acted on inside the closure.
                 let mut clicked = None;
-                let action = renderer_mouse_action(&mut renderer, &mouse, |pick| {
-                    clicked = Some(pick);
-                    Action::Tick(true)
+                let action = renderer_mouse_action(&mut renderer, &mouse, |click| {
+                    if let MouseClick::Pick(pick) = click {
+                        clicked = Some(pick);
+                        Action::Tick(true)
+                    } else {
+                        Action::Tick(false)
+                    }
                 });
                 if let Action::Copy(text) = action {
                     composer_notice = Some(
@@ -910,7 +921,12 @@ async fn event_loop(
                         // Clicking or scrolling is input as well, so a Ctrl+C armed
                         // before it must not be spent by the Ctrl+C after it.
                         state.disarm_quit();
-                        renderer_mouse_action(renderer, &mouse, |pick| pick_action(state, pick))
+                        renderer_mouse_action(renderer, &mouse, |click| match click {
+                            MouseClick::Pick(pick) => pick_action(state, pick),
+                            MouseClick::Composer(index) => {
+                                Action::Tick(state.move_composer_cursor(index))
+                            }
+                        })
                     }
                     Some(Ok(Event::Paste(text))) => {
                         renderer.clear_selection();
@@ -1115,6 +1131,11 @@ enum MouseRequest {
     None,
 }
 
+enum MouseClick {
+    Pick(Pick),
+    Composer(usize),
+}
+
 /// Shift is the terminal's own escape hatch: holding it while dragging bypasses
 /// mouse reporting in every terminal worth naming, so those events are left
 /// alone and the user still gets native selection when they want it.
@@ -1146,13 +1167,12 @@ fn mouse_request(mouse: &MouseEvent) -> MouseRequest {
     }
 }
 
-/// `on_pick` says what a click on a clickable cell means to the caller: the
-/// session's own chrome and overlays for the event loop, the picker's own rows
-/// for the standalone session picker, which runs before a session exists.
+/// `on_click` says what a click means to the caller: chrome and overlay picks,
+/// or a character boundary in the main composer.
 fn renderer_mouse_action(
     renderer: &mut Renderer,
     mouse: &MouseEvent,
-    on_pick: impl FnOnce(Pick) -> Action,
+    on_click: impl FnOnce(MouseClick) -> Action,
 ) -> Action {
     let request = mouse_request(mouse);
     // Some embedded terminals deliver the press but swallow the matching
@@ -1162,7 +1182,7 @@ fn renderer_mouse_action(
     if let MouseRequest::SelectionStart(column, row) = request {
         if let Some(pick) = renderer.pick_at(column, row) {
             let cleared = renderer.clear_selection();
-            return match on_pick(pick) {
+            return match on_click(MouseClick::Pick(pick)) {
                 Action::Tick(changed) => Action::Tick(changed || cleared),
                 action => action,
             };
@@ -1191,11 +1211,18 @@ fn renderer_mouse_action(
                 // The down event painted a one-cell selection, so whatever the
                 // click turns out to mean, the row has to be repainted.
                 match renderer.pick_at(column, row) {
-                    Some(pick) => match on_pick(pick) {
+                    Some(pick) => match on_click(MouseClick::Pick(pick)) {
                         Action::Tick(_) => Action::Tick(true),
                         action => action,
                     },
                     None => {
+                        if let Some(index) = renderer.composer_cursor_position(column, row) {
+                            renderer.clear_selection();
+                            return match on_click(MouseClick::Composer(index)) {
+                                Action::Tick(_) => Action::Tick(true),
+                                action => action,
+                            };
+                        }
                         renderer.toggle_tool_at(row);
                         Action::Tick(true)
                     }
