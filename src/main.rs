@@ -3067,6 +3067,16 @@ fn resume_thread_params(thread_id: &str, claude: &ClaudeSessionSettings) -> Valu
     params
 }
 
+/// Codex keeps the full rules in the thread's developer instructions. Each turn
+/// only needs the rules that prevent the costly, visible failures.
+const CODEX_TURN_REMINDER: &str = concat!(
+    "Devez Vibe 핵심 규칙 요약. 전체 규칙은 스레드 지침에 있고, 이번 턴에 특히 지킬 것만 다시 적는다.\n",
+    "- 사용자에게 보이는 일반 문장은 한국어로 쓰고, 작업이면 첫 응답에서 무엇을 확인·수정할지 짧게 알린다.\n",
+    "- 두 단계 이상이거나 도구를 두 번 이상 쓰는 작업은 첫 도구 호출 전에 한국어 제목의 짧은 계획을 만들고, 한 단계씩 진행 상태를 갱신한다.\n",
+    "- 답변은 결론부터 간결하게 쓰며, 확인한 근거와 검증하지 못한 한계를 구분한다.\n",
+    "- 선택이나 승인이 필요하면 제공된 질문 기능을 우선 사용하고, 선택지·결과·판단에 필요한 사실을 빠뜨리지 않는다.\n",
+);
+
 /// Claude reads the full rules once, as the system prompt the bridge appends to
 /// its preset. Repeating all of them in front of every user message bought no
 /// extra obedience — the English labels leaked through anyway — while burying
@@ -3086,14 +3096,17 @@ const CLAUDE_TURN_REMINDER: &str = concat!(
 );
 
 /// One `developer` message at the head of the thread loses its grip as turns
-/// pile up, so the rules ride along with every turn — in full for Codex, as
-/// [`CLAUDE_TURN_REMINDER`] for Claude. The active preset rides along too: the
+/// pile up, so the core rules ride along with every turn. The active preset rides along too: the
 /// rules that depend on it are written as conditions, and the preset is a local
 /// display setting the provider is told nothing else about.
 fn turn_additional_context(vibe: VibeMode) -> Value {
     json!({
         "devez-vibe-rules": {
             "value": DEVEZ_INSTRUCTIONS,
+            "kind": "application"
+        },
+        "codex-devez-vibe-reminder": {
+            "value": CODEX_TURN_REMINDER,
             "kind": "application"
         },
         "claude-devez-vibe-rules": {
@@ -5078,7 +5091,9 @@ mod tests {
                 .and_then(Value::as_str),
             Some(CLAUDE_TURN_REMINDER)
         );
-        assert!(CLAUDE_TURN_REMINDER.chars().count() < CLAUDE_DEVEZ_INSTRUCTIONS.chars().count() / 4);
+        assert!(
+            CLAUDE_TURN_REMINDER.chars().count() < CLAUDE_DEVEZ_INSTRUCTIONS.chars().count() / 4
+        );
         assert!(CLAUDE_TURN_REMINDER.contains("첫 응답 content block"));
         assert!(CLAUDE_TURN_REMINDER.contains("TaskCreate"));
         assert!(CLAUDE_TURN_REMINDER.contains("AskUserQuestion"));
