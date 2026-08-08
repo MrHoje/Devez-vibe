@@ -40,6 +40,9 @@ const SPINNER: [&str; 8] = ["✢", "✳", "✶", "✻", "✽", "✻", "✶", "�
 
 /// How long one shimmer sweep across the `Working` label takes.
 const SHIMMER_PERIOD: Duration = Duration::from_millis(1_100);
+/// Compaction is a separate wait state, so its activity animation advances at a
+/// calmer pace than the ordinary response shimmer.
+const COMPACTION_ACTIVITY_PERIOD: Duration = Duration::from_secs(6);
 const PLAN_SHIMMER_DURATION: Duration = SHIMMER_PERIOD.saturating_mul(5);
 
 /// One-off notices (copy, reroute, …) sit in the status line this long.
@@ -8312,15 +8315,18 @@ impl AppState {
         Some(self.selected_model_name().to_owned())
     }
 
-    /// The shimmer sweeps the `Working` label once per `SHIMMER_PERIOD`, read off
-    /// the wall clock rather than counted in ticks so the glide keeps its pace no
-    /// matter how often a frame happens to be painted.
+    /// Activity animation runs from the wall clock rather than counted ticks, so
+    /// its pace stays stable even when frames are delayed.
     fn activity_phase(&self) -> f32 {
-        let Some(started) = self.compacting_started_at.or(self.turn_started_at) else {
+        let (started, period) = if let Some(started) = self.compacting_started_at {
+            (started, COMPACTION_ACTIVITY_PERIOD)
+        } else if let Some(started) = self.turn_started_at {
+            (started, SHIMMER_PERIOD)
+        } else {
             return 0.0;
         };
-        let position = started.elapsed().as_millis() % SHIMMER_PERIOD.as_millis();
-        position as f32 / SHIMMER_PERIOD.as_millis() as f32
+        let position = started.elapsed().as_millis() % period.as_millis();
+        position as f32 / period.as_millis() as f32
     }
 
     fn plan_shimmer_phase(&self) -> Option<f32> {
@@ -8334,7 +8340,7 @@ impl AppState {
         let context = self.context_window.and_then(|window| {
             (window > 0).then(|| {
                 format!(
-                    "ctx: {}/{} ({}%)",
+                    "context: {}/{} ({}%)",
                     context_token_label(self.context_tokens),
                     context_token_label(window),
                     // A prompt cannot really outgrow its window, but a stale
@@ -11073,7 +11079,7 @@ mod tests {
         );
         let sent = state.committed.last().expect("sent answer history");
         assert!(matches!(sent.kind, BlockKind::User));
-        assert_eq!(sent.body, "어느 것인가요:\n↳ 직접 보낸 답");
+        assert_eq!(sent.body, "어느 것인가요:\n  ↳ 직접 보낸 답");
     }
 
     #[test]
@@ -14498,7 +14504,7 @@ mod tests {
         );
         assert_eq!(
             state.view().status_line.and_then(|status| status.context),
-            Some("ctx: 0k/258k (0%)".to_owned())
+            Some("context: 0k/258k (0%)".to_owned())
         );
     }
 
@@ -15980,7 +15986,7 @@ mod tests {
         assert_eq!(state.context_window, Some(258_000));
         assert_eq!(
             state.status_line().context.as_deref(),
-            Some("ctx: 96k/258k (37%)")
+            Some("context: 96k/258k (37%)")
         );
     }
 
@@ -16132,7 +16138,7 @@ mod tests {
 
         assert_eq!(
             state.status_line().context.as_deref(),
-            Some("ctx: 0k/1000k (0%)")
+            Some("context: 0k/1000k (0%)")
         );
     }
 
@@ -16144,7 +16150,7 @@ mod tests {
 
         assert_eq!(
             state.status_line().context.as_deref(),
-            Some("ctx: 100k/1000k (10%)")
+            Some("context: 100k/1000k (10%)")
         );
     }
 

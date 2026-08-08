@@ -1546,7 +1546,9 @@ function isInternalHistoryText(message, text) {
   if (isCompactSummary(message, text)) return true;
   const trimmed = text.trim();
   const tag = trimmed.match(/^<([a-z0-9-]+)>/i)?.[1]?.toLowerCase();
-  return trimmed === "[Request interrupted by user]"
+  // The interruption marker carries a reason ("… for tool use"), so it has to be
+  // matched by prefix rather than by the bare sentence.
+  return trimmed.startsWith("[Request interrupted by user")
     || [
       "bash-input",
       "bash-stdout",
