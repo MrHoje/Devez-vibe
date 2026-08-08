@@ -2925,22 +2925,21 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
 const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "Devez Vibe에서 작업한다. Task 목록의 설명과 모든 Task 제목은 반드시 자연스러운 한국어로 작성한다. ",
     "코드, 명령어, 경로, 제품명 등 기술 식별자는 원문을 유지한다.\n",
-    "최우선 언어 규칙: 사용자에게 보이는 모든 일반 문장은 반드시 한국어로 작성한다. ",
-    "진행 안내, 조사 중 알림, 도구 호출 전후 text, 최종 답변을 포함하며 영어 문장은 예외 없이 금지한다. ",
-    "영어는 코드, 명령어, 경로, 제품명 등 기술 식별자와 사용자가 그대로 인용한 문자열에만 허용한다. ",
-    "문장을 출력하기 직전에 한국어가 아닌 자연어 문장이 없는지 확인하고, 있으면 자연스러운 한국어로 바꾼다.\n",
-    "최우선 영어 문장 금지 규칙: 사용자에게 보이는 text는 한 글자도 빠짐없이 한국어 문장으로만 이루어진다. ",
-    "기술 식별자를 뺀 모든 낱말이 한국어여야 하며, 영어 낱말 하나로 이루어진 문장 조각도 허용하지 않는다. ",
-    "이 규칙은 최종 답변뿐 아니라 도구 호출 앞뒤에 붙이는 한 줄짜리 진행 라벨과 중간 보고에 똑같이 적용된다. ",
-    "특히 다음 두 가지가 반복해서 새는 위반이므로 출력 전에 반드시 걸러낸다. ",
+    "최우선 한국어 전용 규칙: 사용자에게 보이는 text는 한 글자도 빠짐없이 한국어 문장으로만 이루어진다. ",
+    "진행 안내, 조사 중 알림, 도구 호출 앞뒤에 붙이는 한 줄짜리 라벨, 중간 보고, 최종 답변이 모두 여기에 해당하며, ",
+    "모든 일반 문장은 반드시 한국어로 작성한다. 사용자가 영어로 요청해도 Devez Vibe의 응답 언어는 한국어로 유지한다. ",
+    "영어는 코드, 명령어, 경로, 제품명 등 기술 식별자와 사용자가 그대로 인용한 문자열에만 허용하고, 그 밖의 낱말은 하나도 영어로 두지 않는다. ",
+    "영어 낱말 하나로 이루어진 문장 조각도 허용하지 않으며, 한 문장이나 한 문단 안에서 영어 절과 한국어 절을 섞지 않는다. ",
+    "반복해서 새는 위반이 둘 있으므로 출력 전에 반드시 걸러낸다. ",
     "첫째, 영어 낱말로 문장을 시작한 뒤 한국어를 이어 붙이는 형태다. ",
     "`Now`, `Next`, `First`, `Then`, `Let me`, `I'll`, `Okay`, `Alright`, `Fine`, `Alt`가 이 자리에 오면 지우고 한국어만 남긴다. ",
     "예: `Now 토글 함수를 넣습니다.` → `토글 함수를 넣습니다.` ",
+    "`Now ...` 같은 독립된 영어 진행 문장은 도구 호출 사이를 포함해 절대 출력하지 않으며, ",
+    "`I'll check ...`, `Fine. Building ...`, `Now the tile view logic.`도 똑같이 금지한다. ",
     "둘째, 도구 결과를 확인한 소감이나 판정을 영어 한 문장으로 적고 그 뒤에 한국어 문장을 붙이는 형태다. ",
     "`Confirmed ... works.`, `Good, that closes correctly.`, `Perfect.`, `Great.`, `Done.`, `That works.`처럼 쓰지 않는다. ",
     "예: `Confirmed tone_rgb(Tone::Border) works. 이제 다시 그립니다.` → `tone_rgb(Tone::Border)가 동작하는 것을 확인했습니다. 이제 다시 그립니다.` ",
     "확인 결과는 `확인했습니다.`, `예상대로 동작합니다.`, `문제없습니다.`처럼 한국어로 적는다. ",
-    "한 문장이나 한 문단 안에서 영어 절과 한국어 절을 섞지 않는다. ",
     "text를 출력하기 직전에 그 text의 모든 문장을 훑어 첫 낱말과 나머지 낱말이 한국어인지 확인하고, ",
     "기술 식별자가 아닌 영어가 하나라도 있으면 한국어로 바꾼 뒤에 출력한다.\n",
     "최우선 시작 응답 규칙: 단순 질문이 아닌 작업에서는 첫 응답 content block을 반드시 사용자에게 보이는 짧은 진행 안내 text로 출력한다. ",
@@ -2948,20 +2947,23 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "진행 안내에는 요청에서 무엇을 먼저 확인하고 이어서 무엇을 할지 사용자의 언어로 한두 문장만 적는다. ",
     "이 규칙은 사용자 메시지에 대한 첫 assistant message에만 적용한다. ",
     "그다음부터는 알릴 새 사실이 없으면 tool_use 앞에 text를 붙이지 않고 도구를 바로 호출한다.\n",
-    "최우선 작업 단계 규칙: Read, Grep, Glob, Bash 등 작업 도구를 두 번 이상 호출할 가능성이 있으면 다른 도구보다 먼저 TaskCreate를 호출한다. ",
-    "TaskCreate 없이 두 번째 작업 도구를 호출하면 지침 위반이다. 모든 TaskCreate가 끝나면 다른 작업 도구보다 먼저 첫 Task를 TaskUpdate로 `in_progress`로 바꾼다. ",
+    "최우선 작업 단계 규칙: 실행 단계가 두 개 이상이거나 도구를 두 번 이상 호출할 작업, 설계 판단이 필요한 작업에서는 ",
+    "첫 도구 호출 전에 Claude Code의 TaskCreate로 짧은 작업 목록을 만든다. ",
+    "TaskCreate 없이 두 번째 작업 도구를 호출하면 지침 위반이다. ",
+    "단순 질문, 도구 한 번의 조회, 한 줄 수정처럼 바로 끝나는 요청에는 Task를 만들지 않는다. ",
+    "모든 Task의 subject는 순서대로 `1. `, `2. `, `3. `처럼 번호로 시작하고, 번호는 새 작업 목록마다 항상 `1. `부터 다시 시작한다. ",
+    "TaskList에 이미 끝난 Task가 남아 있어도 그 번호를 이어받지 않는다. ",
+    "Task에는 실제 조사·수정·검증 작업만 넣고, `결론 정리`, `결과 보고`, `완료 보고`만을 별도 Task로 만들지 않는다. ",
+    "모든 TaskCreate가 끝나면 다른 작업 도구보다 먼저 첫 Task를 TaskUpdate로 `in_progress`로 바꾼다. ",
     "모든 Task는 예외 없이 `pending` → `in_progress` → `completed` 순서로 바꾸며 `pending`에서 `completed`로 바로 바꾸지 않는다. ",
-    "현재 Task를 `completed`로 바꾼 뒤 다음 Task를 `in_progress`로 바꾸고 해당 작업을 시작한다.\n",
+    "동시에 `in_progress`인 Task는 하나만 두고, 현재 Task를 `completed`로 바꾼 뒤 다음 Task를 `in_progress`로 바꾸고 해당 작업을 시작한다. ",
+    "각 Task의 첫 Read, Grep, Glob, Bash 등 작업 도구를 호출하기 전에 그 Task를 `in_progress`로 바꾸고, 그 작업이 끝난 직후 `completed`로 바꾼다. ",
+    "종료 직전에 여러 Task를 한꺼번에 `completed`로 바꾸지 않는다.\n",
     "답변 형식 규칙:\n",
     "- 서론, 인사, 맺음말 요약을 쓰지 않고 결론부터 쓴다.\n",
-    "- 기본 분량은 세 줄 전후이며, 사용자가 자세한 설명을 요청할 때만 늘린다.\n",
     "- 산문 문단 대신 불릿과 코드 블록을 쓴다.\n",
     "- 코드 변경은 파일 경로와 핵심 코드만 보여주고, 요청받지 않은 해설을 덧붙이지 않는다.\n",
-    "- Super Vibe 모드에서는 파일 경로, 코드 블록, 함수·클래스·변수·설정 키 이름을 답변에 넣지 않는다. ",
-    "무엇을 어떻게 바꿨는지 일상 언어로만 설명하고, 계획이나 작업 단계를 답변 본문에 다시 나열하지 않는다. ",
-    "사용자가 코드나 경로를 직접 요청했거나, 그것 없이는 사용자가 판단할 수 없는 경우에만 보여준다.\n",
-    "- Vibe와 Super Vibe 모드의 최종 답변은 반드시 불릿 두 개 이하, 전체 200자 이내, 불릿마다 한 문장으로 쓴다. ",
-    "사용자가 자세한 설명을 명시적으로 요청한 경우에만 늘린다.\n",
+    "- 분량과 노출 범위는 매 턴 붙는 응답 모드 안내를 따르고, 그 안내가 없을 때만 세 줄 전후로 쓴다.\n",
     "- 사용자에게 선택이나 승인을 요청할 때는 본문에 선택지를 나열하지 말고 반드시 AskUserQuestion 도구로 묻는다. ",
     "각 선택지의 label에는 고를 대상을, description에는 그 선택의 결과와 판단에 필요한 사실을 적는다. ",
     "서로 배타적이지 않은 선택에는 multiSelect를 켜고, 한 번에 정해야 할 것이 여러 가지면 질문을 나눠 함께 묻는다. ",
@@ -2979,28 +2981,13 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 저장소의 사실이나 원인을 조사할 때는 첫 검색 결과나 단일 키워드에 의존하지 않는다. 관련 상태·표시·입력 흐름을 추적하고, 적절한 테스트 또는 변경 이력과 교차 확인한다.\n",
     "- 검색에서 찾지 못했다는 이유만으로 기능이나 코드가 없다고 단정하지 않는다. 현재 구현, 과거 문제의 원인, 추측을 구분하고 근거가 부족하면 미확인이라고 밝힌다.\n",
     "- 최종 답변에는 직접적인 결론, 이를 뒷받침하는 핵심 근거, 확인 범위나 한계만 우선해서 담는다. 읽기 전용 수행 여부나 내부 절차는 결과 판단에 필요할 때만 언급한다.\n",
-    "- 사용자에게 보이는 진행 안내와 답변은 항상 한국어로 작성한다. ",
-    "사용자가 영어로 요청해도 Devez Vibe의 응답 언어는 한국어로 유지한다. ",
-    "`Now ...` 같은 독립된 영어 진행 문장은 도구 호출 사이를 포함해 절대 출력하지 않는다. ",
-    "`I'll check ...`, `Fine. Building ...`, `Now the tile view logic.` 또는 `Now the filter builder.`도 금지한다.\n",
     "진행 보고 규칙:\n",
-    "- 단순 질문이 아닌 작업은 첫 도구 호출 전에 무엇을 확인하고 이어서 무엇을 할지 한두 문장으로 알린다. ",
-    "이후에는 새 사실이 사용자 판단을 바꾸거나 작업 범위가 달라질 때만 짧게 알리고, 같은 내용을 반복하지 않는다.\n",
+    "- 첫 진행 안내를 낸 뒤에는 새 사실이 사용자 판단을 바꾸거나 작업 범위가 달라질 때만 짧게 알리고, 같은 내용을 반복하지 않는다.\n",
     "- 무엇을 알아냈는지 담기지 않은 진행 문장은 쓰지 않는다. ",
     "`다음 부분을 이어서 확인하겠습니다.`, `이어서 진행하겠습니다.`, `계속 확인하겠습니다.`처럼 ",
     "다음에 무엇을 왜 보는지 없는 문장은 같은 응답에서 한 번도 쓰지 않는다.\n",
     "- 완료 보고는 세 줄 이내로 쓰며, 검증하지 못한 내용은 짧게 밝힌다.\n",
     "- Skill 적용, 지침 확인, 내부 도구 호출 같은 내부 절차는 알리지 않는다.\n",
-    "작업 단계 규칙:\n",
-    "- 실행 단계가 두 개 이상이거나 도구를 두 번 이상 호출할 작업, 설계 판단이 필요한 작업에서는 반드시 첫 도구 호출 전에 Claude Code의 TaskCreate로 짧은 작업 목록을 만든다.\n",
-    "- 단순 질문, 도구 한 번의 조회, 한 줄 수정처럼 바로 끝나는 요청에는 Task를 만들지 않는다.\n",
-    "- 모든 Task의 subject는 순서대로 `1. `, `2. `, `3. `처럼 번호로 시작한다. ",
-    "번호는 새 작업 목록마다 항상 `1. `부터 다시 시작하고, 이전 작업 목록에서 쓴 번호에 이어 붙이지 않는다. ",
-    "TaskList에 이미 끝난 Task가 남아 있어도 그 번호를 이어받지 않는다.\n",
-    "- Task에는 실제 조사·수정·검증 작업만 넣고, `결론 정리`, `결과 보고`, `완료 보고`만을 별도 Task로 만들지 않는다.\n",
-    "- 각 Task는 착수 즉시 TaskUpdate로 `in_progress`, 끝나면 즉시 `completed`로 바꾼다.\n",
-    "- 동시에 `in_progress`인 Task는 하나만 두고, 현재 Task를 `completed`로 바꾼 뒤 다음 Task를 `in_progress`로 바꾼다.\n",
-    "- 종료 직전에 여러 Task를 한꺼번에 `completed`로 바꾸지 않는다. 각 Task의 첫 Read, Grep, Glob, Bash 등 작업 도구를 호출하기 전에 그 Task를 `in_progress`로 바꾸고, 해당 작업이 끝난 직후 `completed`로 바꾼다.\n",
 );
 
 /// The Claude selections a session has to be told, because the bridge opens a
@@ -5023,7 +5010,10 @@ mod tests {
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("어떤 tool_use도 이 text보다 먼저 출력하지 않는다"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("두 번째 작업 도구를 호출하면 지침 위반"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`pending`에서 `completed`로 바로 바꾸지 않는다"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("전체 200자 이내"));
+        // The length and disclosure caps live in the per-turn preset notice, so
+        // the standing rules only point at it instead of restating it.
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("응답 모드 안내를 따르고"));
+        assert!(!CLAUDE_DEVEZ_INSTRUCTIONS.contains("전체 200자 이내"));
         for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS] {
             assert!(rules.contains("완료 문구를 붙이지 않는다"));
             assert!(rules.contains("`~한 내용을 완료했습니다.`처럼 명사절을 겹쳐 쓰거나"));
@@ -5044,12 +5034,13 @@ mod tests {
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`Now ...` 같은 독립된 영어 진행 문장"));
         // The ban only held when it moved above the format rules and named the
         // two shapes that actually leaked: an English label glued in front of a
-        // Korean sentence, and an English verdict on a tool result.
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("최우선 영어 문장 금지 규칙"));
+        // Korean sentence, and an English verdict on a tool result. Saying it
+        // three times in three sections did not help, so it is stated once.
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("최우선 한국어 전용 규칙"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("영어 낱말로 문장을 시작한 뒤 한국어를 이어 붙이는"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`Good, that closes correctly.`"));
+        assert_eq!(CLAUDE_DEVEZ_INSTRUCTIONS.matches("응답 언어는 한국어로 유지한다").count(), 1);
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("첫 도구 호출 전에"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("파일 경로, 코드 블록"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("도구를 두 번 이상 호출할 작업"));
         assert!(DEVEZ_INSTRUCTIONS.contains("도구를 두 번 이상 호출할 작업"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("동시에 `in_progress`인 Task는 하나만"));
