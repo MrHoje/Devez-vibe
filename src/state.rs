@@ -43,7 +43,7 @@ const SPINNER: [&str; 8] = ["✢", "✳", "✶", "✻", "✽", "✻", "✶", "�
 const SHIMMER_PERIOD: Duration = Duration::from_millis(1_100);
 /// Compaction is a separate wait state, so its activity animation advances at a
 /// calmer pace than the ordinary response shimmer.
-const COMPACTION_ACTIVITY_PERIOD: Duration = Duration::from_secs(6);
+const COMPACTION_ACTIVITY_PERIOD: Duration = Duration::from_secs(3);
 const PLAN_SHIMMER_DURATION: Duration = SHIMMER_PERIOD.saturating_mul(5);
 
 /// One-off notices (copy, reroute, …) sit in the status line this long.
@@ -8727,13 +8727,6 @@ impl AppState {
     /// Steps the panel to its next width, wrapping closed after the widest.
     pub fn cycle_side_panel(&mut self) -> SidePanelStage {
         self.side_panel_stage = self.side_panel_stage.next();
-        self.side_panel_stage
-    }
-
-    /// What the panel's own close mark and Esc-adjacent affordances use: shuts
-    /// the panel outright instead of stepping through it.
-    pub fn close_side_panel(&mut self) -> SidePanelStage {
-        self.side_panel_stage = SidePanelStage::Closed;
         self.side_panel_stage
     }
 
