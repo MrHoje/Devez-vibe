@@ -2891,33 +2891,32 @@ const PROGRESS_TRACK_COLUMNS: usize = 20;
 /// row keeps the elapsed time alone instead.
 const PROGRESS_TRACK_MINIMUM: usize = 8;
 
-/// An indeterminate block glides to the right and back. Providers expose only
-/// compaction start/end, so movement says "still running" without a fake value.
+/// An indeterminate bar fills from left to right in ten steps, then lets its
+/// rightmost blocks leave one at a time. Providers expose only start/end, so
+/// this still communicates activity without pretending to know real progress.
 fn progress_bar_spans(phase: f32, track: usize, tone: Tone) -> Vec<PaintSpan> {
-    const BLOCK_COLUMNS: usize = 4;
+    const STEPS: usize = 10;
 
-    let block = track.min(BLOCK_COLUMNS);
-    let travel = track.saturating_sub(block);
-    let ping_pong = 0.5 - 0.5 * (phase.clamp(0.0, 1.0) * std::f32::consts::TAU).cos();
-    let offset = (travel as f32 * ping_pong).round() as usize;
+    let frame = (phase.clamp(0.0, 0.999) * (STEPS * 2) as f32) as usize;
+    let filled_steps = if frame <= STEPS {
+        frame
+    } else {
+        STEPS * 2 - frame
+    };
+    let filled = (track * filled_steps).div_ceil(STEPS);
     let mut spans = vec![PaintSpan {
         text: "[".to_owned(),
         tone: Tone::Muted,
         bold: false,
     }];
-    if offset > 0 {
+    if filled > 0 {
         spans.push(PaintSpan {
-            text: "░".repeat(offset),
-            tone: Tone::Muted,
+            text: "█".repeat(filled),
+            tone,
             bold: false,
         });
     }
-    spans.push(PaintSpan {
-        text: "█".repeat(block),
-        tone,
-        bold: false,
-    });
-    let remaining = track.saturating_sub(offset + block);
+    let remaining = track.saturating_sub(filled);
     if remaining > 0 {
         spans.push(PaintSpan {
             text: "░".repeat(remaining),
@@ -4663,7 +4662,6 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         // Keep the context marker so a narrow status row can preferentially
         // remove it before the compact reset reading. It still renders as the
         // ordinary status text colour.
-        let context = context.strip_prefix("ctx: ").unwrap_or(&context);
         push_status_span(&mut spans, context, Tone::Context);
     }
     // The 5h window is dropped entirely when unknown rather than shown as a stub.
@@ -8027,16 +8025,8 @@ fn word_background(tone: Tone) -> Option<Rgb> {
         Tone::DiffAddedWord => palette.diff_add_word_bg,
         Tone::DiffRemovedWord => palette.diff_remove_word_bg,
         Tone::ScrollToBottom => palette.hover_bg,
-        Tone::StatusModel56 => blend(palette.background, palette.model_gpt56, 46),
-        Tone::StatusModelSol => blend(palette.background, palette.model_sol, 46),
-        Tone::StatusModelTerra => blend(palette.background, palette.model_terra, 46),
-        Tone::StatusModelLuna => blend(palette.background, palette.model_luna, 46),
-        Tone::StatusModelSpark => blend(palette.background, palette.model_spark, 46),
-        Tone::StatusModel55 => blend(palette.background, palette.model_gpt55, 46),
-        Tone::StatusModelHaiku => blend(palette.background, palette.status.model_haiku, 46),
-        Tone::StatusModelSonnet => blend(palette.background, palette.status.model_sonnet, 46),
-        Tone::StatusModelOpus => blend(palette.background, palette.status.model_opus, 46),
-        Tone::StatusModelFable => blend(palette.background, palette.status.model_fable, 46),
+        // The status-line model reading stays flat at rest; only the hover pass
+        // paints a band behind it.
         _ => return None,
     })
 }
@@ -12794,7 +12784,7 @@ mod tests {
         assert_eq!(pick_on(&line, "5h: 12%"), None);
         assert_eq!(pick_on(&line, "week: 34%"), None);
         assert_eq!(line.tone, Tone::StatusModelSol);
-        assert!(word_background(Tone::StatusModelSol).is_some());
+        assert!(word_background(Tone::StatusModelSol).is_none());
         assert!(word_background(Tone::StatusEffortHigh).is_none());
         assert_eq!(
             line.tail
@@ -12854,23 +12844,28 @@ mod tests {
     /// The compaction row spends its spare columns on a bar, and gives them back
     /// to elapsed time when the terminal has none to spare.
     #[test]
-    fn the_compacting_row_draws_a_bouncing_progress_bar_that_fits() {
-        let left = activity_lines("Compacting.. (4s)", None, 0.0, 80);
-        let right = activity_lines("Compacting.. (4s)", None, 0.5, 80);
+    fn the_compacting_row_fills_then_drains_its_progress_bar_that_fits() {
+        let empty = activity_lines("Compacting.. (4s)", None, 0.0, 80);
+        let full = activity_lines("Compacting.. (4s)", None, 0.5, 80);
+        let draining = activity_lines("Compacting.. (4s)", None, 0.75, 80);
 
         assert_eq!(
-            painted(&left[0]),
-            " ⠋ Compacting.. [████░░░░░░░░░░░░░░░░] (4s)"
+            painted(&empty[0]),
+            " ⠋ Compacting.. [░░░░░░░░░░░░░░░░░░░░] (4s)"
         );
         assert_eq!(
-            painted(&right[0]),
-            " ⠴ Compacting.. [░░░░░░░░░░░░░░░░████] (4s)"
+            painted(&full[0]),
+            " ⠴ Compacting.. [████████████████████] (4s)"
+        );
+        assert_eq!(
+            painted(&draining[0]),
+            " ⠧ Compacting.. [██████████░░░░░░░░░░] (4s)"
         );
 
-        let narrow = activity_lines("Compacting.. (4s)", None, 0.0, 30);
+        let narrow = activity_lines("Compacting.. (4s)", None, 0.5, 30);
         let narrow = painted(&narrow[0]);
 
-        assert_eq!(narrow, " ⠋ Compacting.. (4s)");
+        assert_eq!(narrow, " ⠴ Compacting.. (4s)");
     }
 
     /// The reading belongs to compaction alone: an ordinary turn keeps its plain

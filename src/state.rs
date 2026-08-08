@@ -4179,11 +4179,19 @@ impl AppState {
                 .ok()
                 .map(Duration::from_secs)
         });
+        // Neither the turn nor the rollout names a model for every prompt — a
+        // Codex thread carries no per-turn model at all. The thread reopened on
+        // one model, so use it rather than dropping the prompt's marker back to
+        // the plain accent.
+        let resumed_model = self.selected_model_name().to_owned();
         for turn in turns {
             let Some(items) = turn.get("items").and_then(Value::as_array) else {
                 continue;
             };
-            for block in merged_turn_blocks(&self.cwd, turn, items, rollout) {
+            for mut block in merged_turn_blocks(&self.cwd, turn, items, rollout) {
+                if matches!(block.kind, BlockKind::User) && block.title == UNKNOWN_PROMPT_MODEL {
+                    block.title = resumed_model.clone();
+                }
                 self.committed.push(block);
             }
             // Read straight off the server's own item order, not the
@@ -8326,7 +8334,7 @@ impl AppState {
         let context = self.context_window.and_then(|window| {
             (window > 0).then(|| {
                 format!(
-                    "Context: {}/{} ({}%)",
+                    "ctx: {}/{} ({}%)",
                     context_token_label(self.context_tokens),
                     context_token_label(window),
                     // A prompt cannot really outgrow its window, but a stale
@@ -9690,6 +9698,11 @@ fn group_turn_file_changes(blocks: Vec<Block>) -> Vec<Block> {
     grouped
 }
 
+/// The title a replayed prompt carries until a model is found for its turn.
+/// The marker colour is read off that title, so a prompt left with this one
+/// would lose the model colour it had while it was sent.
+const UNKNOWN_PROMPT_MODEL: &str = "You";
+
 fn completed_item_block(cwd: &str, item: &Value) -> Option<Block> {
     match item.get("type")?.as_str()? {
         "userMessage" => {
@@ -9705,7 +9718,7 @@ fn completed_item_block(cwd: &str, item: &Value) -> Option<Block> {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            (!body.is_empty()).then(|| Block::new(BlockKind::User, "You", body))
+            (!body.is_empty()).then(|| Block::new(BlockKind::User, UNKNOWN_PROMPT_MODEL, body))
         }
         "commandExecution" => {
             let status = item
@@ -12067,6 +12080,46 @@ mod tests {
                 ]
             }]
         })
+    }
+
+    /// The prompt marker is coloured from the model named on the block, so a
+    /// replayed prompt that carries no model of its own has to inherit the one
+    /// the thread reopened on rather than staying on the neutral placeholder.
+    #[test]
+    fn a_replayed_prompt_without_a_model_takes_the_resumed_one() {
+        let mut state = test_state();
+        let thread = json!({
+            "turns": [{
+                "id": "turn-1",
+                "startedAt": 1_784_992_108_i64,
+                "items": [{
+                    "type": "userMessage",
+                    "id": "item-1",
+                    "content": [{ "type": "text", "text": "질문" }]
+                }]
+            }]
+        });
+
+        state.load_history(&thread, None);
+
+        let prompt = state
+            .committed
+            .iter()
+            .find(|block| matches!(block.kind, BlockKind::User))
+            .expect("replayed prompt");
+        assert_eq!(prompt.title, "gpt-5.6-sol");
+    }
+
+    /// A resumed session writes its first `turn_context` when the next turn
+    /// runs, so every replayed turn predates it. Falling back to the earliest
+    /// record keeps those prompts on a model colour.
+    #[test]
+    fn a_turn_older_than_every_context_takes_the_earliest_model() {
+        let rollout = crate::rollout::parse(
+            r#"{"timestamp":"2026-07-25T15:08:33.387Z","type":"turn_context","payload":{"model":"gpt-5.6-terra"}}"#,
+        );
+
+        assert_eq!(rollout.model_for_turn(0), Some("gpt-5.6-terra"));
     }
 
     #[test]
@@ -14445,7 +14498,7 @@ mod tests {
         );
         assert_eq!(
             state.view().status_line.and_then(|status| status.context),
-            Some("Context: 0k/258k (0%)".to_owned())
+            Some("ctx: 0k/258k (0%)".to_owned())
         );
     }
 
@@ -15927,7 +15980,7 @@ mod tests {
         assert_eq!(state.context_window, Some(258_000));
         assert_eq!(
             state.status_line().context.as_deref(),
-            Some("Context: 96k/258k (37%)")
+            Some("ctx: 96k/258k (37%)")
         );
     }
 
@@ -16079,7 +16132,7 @@ mod tests {
 
         assert_eq!(
             state.status_line().context.as_deref(),
-            Some("Context: 0k/1000k (0%)")
+            Some("ctx: 0k/1000k (0%)")
         );
     }
 
@@ -16091,7 +16144,7 @@ mod tests {
 
         assert_eq!(
             state.status_line().context.as_deref(),
-            Some("Context: 100k/1000k (10%)")
+            Some("ctx: 100k/1000k (10%)")
         );
     }
 
