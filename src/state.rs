@@ -2887,6 +2887,8 @@ pub struct AppState {
     conversation_view: ConversationView,
     shell_display_mode: ShellDisplayMode,
     diff_display_mode: DiffDisplayMode,
+    /// Whether the docked right-hand side panel is showing. Session-only.
+    side_panel_open: bool,
     status_line_settings: StatusLineSettings,
     /// Which runtimes this machine may connect to. Both start off — a fresh
     /// install picks in `/provider` — and nothing dials a runtime that is off.
@@ -3058,6 +3060,7 @@ impl AppState {
             response_length,
             shell_display_mode,
             diff_display_mode,
+            side_panel_open: false,
             status_line_settings: read_status_line_settings(),
             claude_provider_enabled: claude_provider_enabled(),
             codex_provider_enabled: codex_provider_enabled(),
@@ -4668,6 +4671,7 @@ impl AppState {
             chat_layout: self.conversation_view.is_chat(),
             shell_display_mode: self.shell_display_mode(),
             diff_display_mode: self.diff_display_mode(),
+            side_panel_open: self.side_panel_open,
         }
     }
 
@@ -4962,6 +4966,12 @@ impl AppState {
 
         if key.modifiers == KeyModifiers::SHIFT {
             match key.code {
+                // Shift carries the capital, so the composer never sees this as
+                // typed text and the panel toggles from anywhere.
+                KeyCode::Char('P') | KeyCode::Char('p') => {
+                    self.toggle_side_panel();
+                    return Action::Tick(true);
+                }
                 KeyCode::Up => {
                     self.move_selected_model(-1);
                     return Action::None;
@@ -8619,6 +8629,15 @@ impl AppState {
         self.diff_display_mode = self.diff_display_mode.next();
         self.vibe_mode = VibeMode::Vibe;
         self.diff_display_mode
+    }
+
+    pub fn toggle_side_panel(&mut self) {
+        self.side_panel_open = !self.side_panel_open;
+    }
+
+    #[cfg(test)]
+    pub fn side_panel_open(&self) -> bool {
+        self.side_panel_open
     }
 
     pub fn toggle_plan_summary(&mut self) {

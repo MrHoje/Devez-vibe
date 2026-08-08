@@ -693,6 +693,7 @@ async fn choose_startup_session(
                 chat_layout: false,
                 shell_display_mode: ShellDisplayMode::Collapse,
                 diff_display_mode: DiffDisplayMode::Collapse,
+                side_panel_open: false,
             },
         )?;
         match events.next().await {
@@ -4692,6 +4693,44 @@ mod tests {
 
         assert!(matches!(action, Action::None));
         assert_eq!(state.selected_model_name(), "gpt-5.6-terra");
+    }
+
+    /// Shift+P is a view toggle, so it must open and close the panel without
+    /// leaving a stray capital in the composer.
+    #[test]
+    fn shift_p_toggles_the_side_panel_without_editing_the_composer() {
+        let mut state = AppState::new(
+            String::new(),
+            ".".to_owned(),
+            "tester".to_owned(),
+            vec![model("gpt-5.6-sol", "high", true, &["low", "high"])],
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+
+        apply_composer_inputs_with_scroll(
+            &mut state,
+            &mut renderer,
+            vec![ComposerInput::Key(press(
+                KeyCode::Char('P'),
+                KeyModifiers::SHIFT,
+            ))],
+        );
+
+        assert!(state.side_panel_open());
+        assert!(state.view().editor.text().is_empty());
+
+        apply_composer_inputs_with_scroll(
+            &mut state,
+            &mut renderer,
+            vec![ComposerInput::Key(press(
+                KeyCode::Char('P'),
+                KeyModifiers::SHIFT,
+            ))],
+        );
+
+        assert!(!state.side_panel_open());
     }
 
     #[test]

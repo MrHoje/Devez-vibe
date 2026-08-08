@@ -415,6 +415,8 @@ pub struct View<'a> {
     pub chat_layout: bool,
     pub shell_display_mode: ShellDisplayMode,
     pub diff_display_mode: DiffDisplayMode,
+    /// Whether the docked right-hand side panel is open.
+    pub side_panel_open: bool,
 }
 
 pub struct AnimationView<'a> {
@@ -497,7 +499,11 @@ pub struct Renderer {
     cursor_line: usize,
     cursor_col: usize,
     cursor_shown: bool,
+    /// The width conversation rows are laid out against. With the panel open
+    /// this is narrower than the terminal.
     last_width: u16,
+    /// The terminal's own width, which is what a painted frame spans.
+    last_total_width: u16,
     last_height: u16,
     theme: ThemeKind,
     history: Vec<Block>,
@@ -526,6 +532,9 @@ pub struct Renderer {
     composer_selection: Option<ComposerSelection>,
     painted_selection: Option<CellRange>,
     painted_frame: Option<CellFrame>,
+    /// The docked panel's geometry for the frame now on screen, so animation
+    /// repaints can restore the panel cells they would otherwise blank.
+    side_panel: Option<SidePanelLayout>,
     live_frame_cache: Option<LiveFrameCache>,
     animation_activity_row: Option<usize>,
     animation_plan_rows: usize,
@@ -595,6 +604,12 @@ impl CellStyle {
         }
     }
 
+    fn panel() -> Self {
+        Self {
+            background: Some(blend(theme::palette().background, theme::palette().border, 72)),
+            ..Self::plain()
+        }
+    }
 }
 
 impl Cell {
@@ -747,6 +762,95 @@ impl CellFrame {
 
 }
 
+const SIDE_PANEL_WIDTH: usize = 24;
+const SIDE_PANEL_GAP: usize = 3;
+const SIDE_PANEL_MIN_MAIN_WIDTH: usize = 44;
+/// Writing into a terminal's final cell can trigger an implicit wrap and move
+/// the cursor before the next absolute paint command arrives.
+const SIDE_PANEL_AUTOWRAP_GUARD: usize = 1;
+
+/// Where the docked panel sits once the terminal is wide enough to carry it
+/// without squeezing the conversation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SidePanelLayout {
+    main_width: usize,
+    panel_left: usize,
+    panel_width: usize,
+}
+
+impl SidePanelLayout {
+    const HORIZONTAL_PADDING: usize = 2;
+
+    fn content_left(self) -> usize {
+        self.panel_left + Self::HORIZONTAL_PADDING
+    }
+
+    fn content_width(self) -> usize {
+        self.panel_width.saturating_sub(2 * Self::HORIZONTAL_PADDING)
+    }
+}
+
+/// Leaves the conversation enough room to stay readable before docking the
+/// fixed-width panel at the right edge; a narrow terminal keeps the panel shut.
+fn side_panel_layout(total_width: u16) -> Option<SidePanelLayout> {
+    let total = usize::from(total_width);
+    let reserved = SIDE_PANEL_GAP + SIDE_PANEL_WIDTH + SIDE_PANEL_AUTOWRAP_GUARD;
+    (total >= SIDE_PANEL_MIN_MAIN_WIDTH + reserved).then(|| {
+        let main_width = total - reserved;
+        SidePanelLayout {
+            main_width,
+            panel_left: main_width + SIDE_PANEL_GAP,
+            panel_width: SIDE_PANEL_WIDTH,
+        }
+    })
+}
+
+fn side_panel_row(row: usize, rows: usize, content_width: usize) -> String {
+    let text = match row {
+        0 => "Side panel",
+        1 if rows > 1 => "Shift+P to close",
+        _ => "",
+    };
+    format!("{text:<content_width$}")
+}
+
+/// Fills one row of the panel surface. The fill runs to the frame edge so the
+/// autowrap guard cell carries the panel background instead of a bare gap.
+fn paint_side_panel_row_into_frame(
+    frame: &mut CellFrame,
+    layout: SidePanelLayout,
+    frame_row: usize,
+    content_row: usize,
+    rows: usize,
+) {
+    if frame_row >= frame.height {
+        return;
+    }
+    let panel_style = CellStyle::panel();
+    frame.fill(
+        layout.panel_left,
+        frame_row,
+        frame.width,
+        frame_row + 1,
+        panel_style,
+    );
+    frame.write(
+        layout.content_left(),
+        frame_row,
+        &side_panel_row(content_row, rows, layout.content_width()),
+        CellStyle {
+            foreground: tone_rgb(Tone::Muted),
+            ..panel_style
+        },
+    );
+}
+
+fn paint_side_panel_into_frame(frame: &mut CellFrame, layout: SidePanelLayout, rows: usize) {
+    for row in 0..rows.min(frame.height) {
+        paint_side_panel_row_into_frame(frame, layout, row, row, rows);
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SelectionResult {
     Copy(String),
@@ -796,6 +900,7 @@ impl Renderer {
             cursor_col: 0,
             cursor_shown: true,
             last_width: 0,
+            last_total_width: 0,
             last_height: 0,
             theme: selected_theme,
             history: Vec::new(),
@@ -815,6 +920,7 @@ impl Renderer {
             composer_selection: None,
             painted_selection: None,
             painted_frame: None,
+            side_panel: None,
             live_frame_cache: None,
             animation_activity_row: None,
             animation_plan_rows: 0,
@@ -1285,8 +1391,20 @@ impl Renderer {
                 self.relayout()?;
             }
         }
-        let (width, height) = terminal_size().unwrap_or((100, 30));
-        let width = width.max(20);
+        let (total_width, height) = terminal_size().unwrap_or((100, 30));
+        let total_width = total_width.max(20);
+        // The panel is docked, not overlaid: every conversation row is laid out
+        // against the narrowed main width so nothing runs under the panel.
+        let side_panel = (self.mode == RenderMode::Fullscreen && view.side_panel_open)
+            .then(|| side_panel_layout(total_width))
+            .flatten();
+        if side_panel != self.side_panel {
+            // Opening or closing moves every row's right edge, so the diff has
+            // nothing reusable and the whole surface must be repainted.
+            self.painted_frame = None;
+            self.side_panel = side_panel;
+        }
+        let width = side_panel.map_or(total_width, |layout| layout.main_width as u16);
         let frame_width = width;
         let live_lines =
             self.live_frame_lines(&view.live_blocks, frame_width, height.max(3) as usize);
@@ -1327,6 +1445,7 @@ impl Renderer {
                 committed,
                 frame,
                 width,
+                total_width,
                 height.max(3),
                 view.plan_summary,
                 view.activity_phase,
@@ -1397,6 +1516,7 @@ impl Renderer {
         self.animation_activity_row = None;
         self.animation_plan_rows = 0;
         self.last_width = width;
+        self.last_total_width = total_width;
         self.last_height = height;
         self.out.flush()?;
         Ok(())
@@ -1527,7 +1647,7 @@ impl Renderer {
     }
 
     fn paint_animation_rows(&mut self, updates: &[(usize, PaintLine)]) -> Result<()> {
-        let width = usize::from(self.last_width);
+        let width = usize::from(self.last_total_width);
         let Some(painted) = self.painted_frame.as_ref() else {
             return Ok(());
         };
@@ -1545,7 +1665,25 @@ impl Renderer {
             let mut current = CellFrame::new(width, 1);
             let hovered =
                 Self::hover_columns(line, self.hovered_tool, self.hovered_pick.as_ref());
-            paint_line_into_frame(&mut current, 0, line, None, hovered, None);
+            paint_line_into_frame(
+                &mut current,
+                0,
+                line,
+                None,
+                hovered,
+                self.side_panel.map(|layout| layout.main_width),
+            );
+            // A single-row repaint would otherwise blank the panel's cells on
+            // that row, so redraw its slice of the panel alongside the line.
+            if let Some(layout) = self.side_panel {
+                paint_side_panel_row_into_frame(
+                    &mut current,
+                    layout,
+                    0,
+                    *screen_row,
+                    self.previous_lines.len(),
+                );
+            }
             let start = screen_row * width;
             let previous = CellFrame {
                 width,
@@ -1609,6 +1747,7 @@ impl Renderer {
         committed: &[Block],
         mut frame: Frame,
         width: u16,
+        total_width: u16,
         height: u16,
         plan_summary: Option<&PlanSummary>,
         activity_phase: f32,
@@ -1693,7 +1832,7 @@ impl Renderer {
             cursor_line,
             frame.cursor_col,
             frame.show_cursor,
-            width,
+            total_width,
             scroll_to_bottom_overlay.as_ref().map(|(row, control)| (*row, control)),
             &full_repaint_rows,
             plan_geometry_changed,
@@ -1705,6 +1844,7 @@ impl Renderer {
         self.animation_activity_row = animation_activity_row;
         self.animation_plan_rows = plan_rows;
         self.last_width = width;
+        self.last_total_width = total_width;
         self.last_height = height;
         self.out.flush()?;
         Ok(())
@@ -1838,11 +1978,14 @@ impl Renderer {
                 line,
                 selected_columns,
                 hovered,
-                None,
+                self.side_panel.map(|layout| layout.main_width),
             );
         }
         if let Some((row, control)) = scroll_to_bottom_overlay {
             paint_scroll_to_bottom_into_frame(&mut frame, row, control);
+        }
+        if let Some(layout) = self.side_panel {
+            paint_side_panel_into_frame(&mut frame, layout, lines.len());
         }
         emit_synchronized_frame_diff_with_full_rows(
             &mut self.out,
@@ -8452,6 +8595,84 @@ fn rgb_color(color: Rgb) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The panel takes a fixed slice of the right edge, leaves a gap in front of
+    /// it, and stops short of the terminal's autowrap cell.
+    #[test]
+    fn side_panel_layout_keeps_a_gap_and_the_autowrap_guard() {
+        let layout = side_panel_layout(100).expect("100 columns carry the panel");
+
+        assert_eq!(layout.panel_width, SIDE_PANEL_WIDTH);
+        assert_eq!(layout.panel_left, layout.main_width + SIDE_PANEL_GAP);
+        assert_eq!(layout.panel_left + layout.panel_width, 99);
+        assert_eq!(layout.content_left(), layout.panel_left + 2);
+        assert_eq!(layout.content_width(), SIDE_PANEL_WIDTH - 4);
+    }
+
+    /// A terminal that cannot spare the room keeps the conversation full width
+    /// rather than squeezing it behind the panel.
+    #[test]
+    fn a_narrow_terminal_refuses_to_open_the_side_panel() {
+        let smallest = (SIDE_PANEL_MIN_MAIN_WIDTH
+            + SIDE_PANEL_GAP
+            + SIDE_PANEL_WIDTH
+            + SIDE_PANEL_AUTOWRAP_GUARD) as u16;
+
+        assert!(side_panel_layout(smallest - 1).is_none());
+        assert_eq!(
+            side_panel_layout(smallest).map(|layout| layout.main_width),
+            Some(SIDE_PANEL_MIN_MAIN_WIDTH)
+        );
+    }
+
+    /// A full-width row background must stop at the main width, and the panel
+    /// surface must carry through to the frame's last cell.
+    #[test]
+    fn a_bounded_row_leaves_the_side_panel_surface_intact() {
+        let layout = side_panel_layout(100).expect("100 columns carry the panel");
+        let mut frame = CellFrame::new(100, 2);
+        let line = PaintLine {
+            tone: Tone::UserPromptPadding,
+            ..PaintLine::plain("hello")
+        };
+
+        paint_line_into_frame(&mut frame, 0, &line, None, None, Some(layout.main_width));
+        paint_side_panel_into_frame(&mut frame, layout, 2);
+
+        assert_eq!(frame.cell(layout.main_width, 0).style, CellStyle::plain());
+        assert_eq!(
+            frame.cell(layout.panel_left, 0).style.background,
+            CellStyle::panel().background
+        );
+        assert_eq!(
+            frame.cell(99, 1).style.background,
+            CellStyle::panel().background
+        );
+    }
+
+    /// Repainting a single animated row must restore that row's panel cells, or
+    /// the spinner would punch a hole through the panel.
+    #[test]
+    fn a_single_row_repaint_redraws_that_row_of_the_side_panel() {
+        let layout = side_panel_layout(100).expect("100 columns carry the panel");
+        let mut row = CellFrame::new(100, 1);
+
+        paint_line_into_frame(
+            &mut row,
+            0,
+            &PaintLine::plain("working"),
+            None,
+            None,
+            Some(layout.main_width),
+        );
+        paint_side_panel_row_into_frame(&mut row, layout, 0, 1, 30);
+
+        assert_eq!(
+            row.cell(layout.panel_left, 0).style.background,
+            CellStyle::panel().background
+        );
+        assert_eq!(row.cell(layout.content_left(), 0).glyph, "S");
+    }
 
     #[test]
     fn word_selection_uses_word_boundaries_and_content_columns() {
