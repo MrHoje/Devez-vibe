@@ -629,6 +629,9 @@ pub struct AccountPlan {
     pub usage_lines: Vec<String>,
     pub five_hour_percent: Option<u8>,
     pub weekly_percent: Option<u8>,
+    /// When the 5h window rolls over, as a Unix timestamp; `None` when the
+    /// provider reported no reset time.
+    pub five_hour_reset_at: Option<u64>,
 }
 
 impl AccountPlan {
@@ -678,6 +681,7 @@ impl AccountPlan {
             usage_lines: Vec::new(),
             five_hour_percent: None,
             weekly_percent: None,
+            five_hour_reset_at: None,
         }
     }
 
@@ -714,6 +718,9 @@ impl AccountPlan {
             usage_lines,
             five_hour_percent: percent(five_hour),
             weekly_percent: percent(seven_day),
+            five_hour_reset_at: five_hour
+                .and_then(|value| value.get("resets_at"))
+                .and_then(reset_timestamp),
         }
     }
 
@@ -756,6 +763,31 @@ impl AccountPlan {
         }
         lines
     }
+}
+
+/// Reset times arrive either as an RFC 3339 string (Claude) or as a Unix
+/// timestamp (Codex), so both shapes are accepted here.
+fn reset_timestamp(value: &Value) -> Option<u64> {
+    if let Some(seconds) = value.as_u64() {
+        return Some(seconds);
+    }
+    let raw = value.as_str().filter(|raw| !raw.is_empty())?;
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .and_then(|instant| u64::try_from(instant.timestamp()).ok())
+}
+
+/// `3h 33m` style countdown to `reset_at`, or `None` once the window has
+/// already rolled over or was never reported.
+fn remaining_label(reset_at: Option<u64>, now: u64) -> Option<String> {
+    let remaining = reset_at?.checked_sub(now).filter(|left| *left > 0)?;
+    let minutes = remaining.div_ceil(60);
+    let (hours, minutes) = (minutes / 60, minutes % 60);
+    Some(if hours > 0 {
+        format!("{hours}h {minutes:02}m")
+    } else {
+        format!("{minutes}m")
+    })
 }
 
 fn compact_reset_time(value: &str) -> String {
@@ -2833,6 +2865,11 @@ pub struct AppState {
     branch: Option<String>,
     five_hour_percent: Option<u8>,
     weekly_percent: Option<u8>,
+    /// Unix timestamp the 5h window resets at, so the status row can count down.
+    five_hour_reset_at: Option<u64>,
+    /// The countdown as last painted (`3h 33m`), kept so the minute tick can
+    /// trigger a redraw on its own.
+    five_hour_remaining: Option<String>,
     fast_mode: bool,
     /// Claude's permission mode for this thread.
     claude_permission_mode: ClaudePermissionMode,
@@ -2947,7 +2984,7 @@ impl AppState {
         let diff_display_mode = read_vibe_config_value("diff_display_mode")
             .and_then(|value| DiffDisplayMode::from_config_value(&value))
             .unwrap_or(default_diff_display_mode);
-        let (five_hour_percent, weekly_percent) = read_codex_usage();
+        let (five_hour_percent, weekly_percent, five_hour_reset_at) = read_codex_usage();
         let context_window = models
             .get(selected_model)
             .and_then(|model| model.context_window);
@@ -3005,6 +3042,8 @@ impl AppState {
             branch,
             five_hour_percent,
             weekly_percent,
+            five_hour_reset_at,
+            five_hour_remaining: remaining_label(five_hour_reset_at, unix_now()),
             fast_mode: read_fast_mode(),
             claude_permission_mode: read_claude_permission_mode(),
             side_parent: None,
@@ -3522,6 +3561,10 @@ impl AppState {
         }
         if plan.weekly_percent.is_some() {
             self.weekly_percent = plan.weekly_percent;
+        }
+        if plan.five_hour_reset_at.is_some() {
+            self.five_hour_reset_at = plan.five_hour_reset_at;
+            self.five_hour_remaining = remaining_label(self.five_hour_reset_at, unix_now());
         }
         self.account_plan = plan;
     }
@@ -4662,22 +4705,30 @@ impl AppState {
         }
         if self.status_metadata_refreshed_at.elapsed().as_secs() >= 3 {
             let branch = read_git_branch(&self.cwd);
-            let (five_hour_percent, weekly_percent) = if self
+            let (five_hour_percent, weekly_percent, five_hour_reset_at) = if self
                 .selected_model()
                 .is_some_and(|model| model.model.starts_with("claude:"))
             {
-                (self.five_hour_percent, self.weekly_percent)
+                (
+                    self.five_hour_percent,
+                    self.weekly_percent,
+                    self.five_hour_reset_at,
+                )
             } else {
                 read_codex_usage()
             };
+            let five_hour_remaining = remaining_label(five_hour_reset_at, unix_now());
             let fast_mode = read_fast_mode();
             full_redraw = self.branch != branch
                 || self.five_hour_percent != five_hour_percent
                 || self.weekly_percent != weekly_percent
+                || self.five_hour_remaining != five_hour_remaining
                 || self.fast_mode != fast_mode;
             self.branch = branch;
             self.five_hour_percent = five_hour_percent;
             self.weekly_percent = weekly_percent;
+            self.five_hour_reset_at = five_hour_reset_at;
+            self.five_hour_remaining = five_hour_remaining;
             self.fast_mode = fast_mode;
             self.status_metadata_refreshed_at = Instant::now();
         }
@@ -8369,6 +8420,11 @@ impl AppState {
                 .enabled(StatusLineField::FiveHour)
                 .then_some(self.five_hour_percent)
                 .flatten(),
+            five_hour_remaining: self
+                .status_line_settings
+                .enabled(StatusLineField::FiveHour)
+                .then(|| self.five_hour_remaining.clone())
+                .flatten(),
             weekly_percent: self
                 .status_line_settings
                 .enabled(StatusLineField::Weekly)
@@ -10556,19 +10612,19 @@ fn parse_git_branch(head: &str) -> Option<String> {
         .or_else(|| (head.chars().count() >= 7).then(|| head.chars().take(7).collect::<String>()))
 }
 
-fn read_codex_usage() -> (Option<u8>, Option<u8>) {
+fn read_codex_usage() -> (Option<u8>, Option<u8>, Option<u64>) {
     let Some(path) = env::var_os("APPDATA").map(|app_data| {
         PathBuf::from(app_data)
             .join("DevezCode")
             .join("codex-usage.json")
     }) else {
-        return (None, None);
+        return (None, None, None);
     };
     let Some(root) = fs::read_to_string(path)
         .ok()
         .and_then(|json| serde_json::from_str::<Value>(&json).ok())
     else {
-        return (None, None);
+        return (None, None, None);
     };
     parse_codex_usage(&root)
 }
@@ -10610,10 +10666,13 @@ fn apply_model_context_cache(models: &mut [ModelInfo], root: &Value) {
     }
 }
 
-fn parse_codex_usage(root: &Value) -> (Option<u8>, Option<u8>) {
+fn parse_codex_usage(root: &Value) -> (Option<u8>, Option<u8>, Option<u64>) {
     (
         usage_percent(root, "five_hour"),
         usage_percent(root, "weekly"),
+        root.get("five_hour")
+            .and_then(|window| window.get("resets_at"))
+            .and_then(reset_timestamp),
     )
 }
 
@@ -14468,11 +14527,26 @@ mod tests {
     #[test]
     fn status_metadata_parses_usage_and_fast_mode() {
         let usage = json!({
-            "five_hour": { "used_percent": 12.4 },
+            "five_hour": { "used_percent": 12.4, "resets_at": 1_786_585_603u64 },
             "weekly": { "used_percent": 70 }
         });
 
-        assert_eq!(parse_codex_usage(&usage), (Some(12), Some(70)));
+        assert_eq!(
+            parse_codex_usage(&usage),
+            (Some(12), Some(70), Some(1_786_585_603))
+        );
+        // Codex accounts without a 5h window report nothing to count down.
+        assert_eq!(
+            parse_codex_usage(&json!({ "weekly": { "used_percent": 58 } })),
+            (None, Some(58), None)
+        );
+        assert_eq!(
+            remaining_label(Some(1_000 + 3 * 3_600 + 33 * 60), 1_000).as_deref(),
+            Some("3h 33m")
+        );
+        assert_eq!(remaining_label(Some(1_000 + 420), 1_000).as_deref(), Some("7m"));
+        assert!(remaining_label(Some(900), 1_000).is_none());
+        assert!(remaining_label(None, 1_000).is_none());
         assert!(parse_fast_mode(
             "service_tier = \"fast\"\n[features]\nexample = true"
         ));

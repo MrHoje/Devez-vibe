@@ -280,6 +280,9 @@ pub struct StatusLineView {
     pub effort: Option<String>,
     pub context: Option<String>,
     pub five_hour_percent: Option<u8>,
+    /// Countdown to the 5h window reset (`3h 33m`); absent when the provider
+    /// reports no 5h window at all.
+    pub five_hour_remaining: Option<String>,
     pub weekly_percent: Option<u8>,
     pub notice: Option<String>,
 }
@@ -4659,8 +4662,15 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         push_status_span(&mut spans, context, Tone::Context);
     }
     // The 5h window is dropped entirely when unknown rather than shown as a stub.
-    if let Some(percent) = status.five_hour_percent {
-        push_status_span(&mut spans, format!("5h: {percent}%"), Tone::StatusText);
+    let five_hour_remaining = status.five_hour_remaining.filter(|left| !left.is_empty());
+    let five_hour = match (status.five_hour_percent, five_hour_remaining) {
+        (Some(percent), Some(left)) => Some(format!("5h: {percent}% · {left}")),
+        (Some(percent), None) => Some(format!("5h: {percent}%")),
+        (None, Some(left)) => Some(format!("5h: {left}")),
+        (None, None) => None,
+    };
+    if let Some(five_hour) = five_hour {
+        push_status_span(&mut spans, five_hour, Tone::StatusText);
     }
     if let Some(percent) = status.weekly_percent {
         push_status_span(&mut spans, format!("week: {percent}%"), Tone::StatusText);
@@ -9649,6 +9659,7 @@ mod tests {
                 effort: Some("high".to_owned()),
                 context: None,
                 five_hour_percent: None,
+                five_hour_remaining: None,
                 weekly_percent: None,
                 notice: None,
             }),
@@ -12686,6 +12697,7 @@ mod tests {
                 effort: Some("xhigh".to_owned()),
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
                 five_hour_percent: Some(12),
+                five_hour_remaining: None,
                 weekly_percent: Some(34),
                 notice: Some("connected".to_owned()),
             }),
@@ -12705,6 +12717,7 @@ mod tests {
                 effort: Some("high".to_owned()),
                 context: None,
                 five_hour_percent: None,
+                five_hour_remaining: None,
                 weekly_percent: None,
                 notice: None,
             }),
@@ -12724,6 +12737,7 @@ mod tests {
                 effort: Some("xhigh".to_owned()),
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
                 five_hour_percent: Some(12),
+                five_hour_remaining: None,
                 weekly_percent: Some(34),
                 notice: None,
             }),
@@ -12743,6 +12757,7 @@ mod tests {
                 effort: Some("high".to_owned()),
                 context: None,
                 five_hour_percent: None,
+                five_hour_remaining: None,
                 weekly_percent: None,
                 notice: None,
             }),
@@ -12764,6 +12779,7 @@ mod tests {
                 effort: Some("high".to_owned()),
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
                 five_hour_percent: Some(12),
+                five_hour_remaining: None,
                 weekly_percent: Some(34),
                 notice: None,
             }),
@@ -12797,6 +12813,7 @@ mod tests {
                 effort: Some("high".to_owned()),
                 context: None,
                 five_hour_percent: None,
+                five_hour_remaining: None,
                 weekly_percent: None,
                 notice: None,
             }),
@@ -14182,6 +14199,7 @@ mod tests {
                 effort: Some("high".to_owned()),
                 context: None,
                 five_hour_percent: None,
+                five_hour_remaining: None,
                 weekly_percent: Some(34),
                 notice: None,
             }),
