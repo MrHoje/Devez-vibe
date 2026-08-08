@@ -8535,7 +8535,7 @@ impl AppState {
         let context = self.context_window.and_then(|window| {
             (window > 0).then(|| {
                 format!(
-                    "context: {}/{} ({}%)",
+                    "ctx: {}/{} ({}%)",
                     context_token_label(self.context_tokens),
                     context_token_label(window),
                     // A prompt cannot really outgrow its window, but a stale
@@ -15060,7 +15060,7 @@ mod tests {
         );
         assert_eq!(
             state.view().status_line.and_then(|status| status.context),
-            Some("context: 0k/258k (0%)".to_owned())
+            Some("ctx: 0k/258k (0%)".to_owned())
         );
     }
 
@@ -16542,7 +16542,7 @@ mod tests {
         assert_eq!(state.context_window, Some(258_000));
         assert_eq!(
             state.status_line().context.as_deref(),
-            Some("context: 96k/258k (37%)")
+            Some("ctx: 96k/258k (37%)")
         );
     }
 
@@ -16700,7 +16700,7 @@ mod tests {
 
         assert_eq!(
             state.status_line().context.as_deref(),
-            Some("context: 0k/1000k (0%)")
+            Some("ctx: 0k/1000k (0%)")
         );
     }
 
@@ -16712,7 +16712,7 @@ mod tests {
 
         assert_eq!(
             state.status_line().context.as_deref(),
-            Some("context: 100k/1000k (10%)")
+            Some("ctx: 100k/1000k (10%)")
         );
     }
 
