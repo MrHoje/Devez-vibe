@@ -43,7 +43,7 @@ const SPINNER: [&str; 8] = ["✢", "✳", "✶", "✻", "✽", "✻", "✶", "�
 const SHIMMER_PERIOD: Duration = Duration::from_millis(1_100);
 /// Compaction is a separate wait state, so its activity animation advances at a
 /// calmer pace than the ordinary response shimmer.
-const COMPACTION_ACTIVITY_PERIOD: Duration = Duration::from_secs(3);
+const COMPACTION_ACTIVITY_PERIOD: Duration = Duration::from_secs(2);
 const PLAN_SHIMMER_DURATION: Duration = SHIMMER_PERIOD.saturating_mul(5);
 
 /// One-off notices (copy, reroute, …) sit in the status line this long.
@@ -3018,6 +3018,22 @@ pub struct DeferredResume {
     pub prompt: Option<String>,
 }
 
+/// Every provider's plan reaches the same state layer. Keep the visible step
+/// titles sequential even when a provider omitted, reused, or styled its own
+/// number differently.
+fn numbered_plan_step(title: &str, index: usize) -> String {
+    let title = title.trim();
+    let digits = title.chars().take_while(char::is_ascii_digit).count();
+    let body = title
+        .get(digits..)
+        .and_then(|rest| rest.strip_prefix('.').or_else(|| rest.strip_prefix(')')))
+        .map(str::trim_start)
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(title);
+    let body = if body.is_empty() { "작업" } else { body };
+    format!("{}. {body}", index + 1)
+}
+
 impl AppState {
     pub fn new(
         thread_id: String,
@@ -4364,8 +4380,9 @@ impl AppState {
             steps: plan
                 .steps
                 .iter()
-                .map(|step| PlanStep {
-                    text: step.text.clone(),
+                .enumerate()
+                .map(|(index, step)| PlanStep {
+                    text: numbered_plan_step(&step.text, index),
                     status: match step.status.as_str() {
                         "completed" => PlanStepStatus::Completed,
                         "in_progress" => PlanStepStatus::InProgress,
@@ -5770,8 +5787,9 @@ impl AppState {
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten()
-                    .filter_map(|step| {
-                        let text = step.get("step")?.as_str()?;
+                    .enumerate()
+                    .filter_map(|(index, step)| {
+                        let text = numbered_plan_step(step.get("step")?.as_str()?, index);
                         let status = match step.get("status").and_then(Value::as_str) {
                             Some("completed") => PlanStepStatus::Completed,
                             Some("inProgress") => PlanStepStatus::InProgress,
@@ -5798,7 +5816,7 @@ impl AppState {
                             None
                         };
                         Some(PlanStep {
-                            text: text.to_owned(),
+                            text,
                             status,
                             started_at,
                             elapsed,
@@ -12975,6 +12993,17 @@ mod tests {
                 .as_ref()
                 .is_some_and(|summary| summary.expanded)
         );
+        assert_eq!(
+            state
+                .plan_summary
+                .as_ref()
+                .expect("received plan")
+                .steps
+                .iter()
+                .map(|step| step.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1. 현재 구현 확인", "2. 표시 동작 구현", "3. 회귀 테스트"]
+        );
         state.prepare_resume();
         assert!(state.plan_summary.is_none());
     }
@@ -13047,6 +13076,8 @@ mod tests {
         });
 
         let steps = &state.plan_summary.expect("restored plan").steps;
+        assert_eq!(steps[0].text, "1. 완료 작업");
+        assert_eq!(steps[1].text, "2. 진행 중이던 작업");
         assert_eq!(steps[0].status, PlanStepStatus::Completed);
         assert_eq!(steps[1].status, PlanStepStatus::InProgress);
         assert_eq!(steps[1].elapsed, Some(Duration::from_secs(2)));
