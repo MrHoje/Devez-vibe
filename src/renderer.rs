@@ -784,6 +784,10 @@ const SIDE_PANEL_MIN_MAIN_WIDTH: usize = 44;
 /// the cursor before the next absolute paint command arrives.
 const SIDE_PANEL_AUTOWRAP_GUARD: usize = 1;
 
+fn devez_layout_signal(main_width: u16) -> String {
+    format!("\x1b]777;devez-layout-v1;{main_width}\x07")
+}
+
 /// Where the docked panel sits once the terminal is wide enough to carry it
 /// without squeezing the conversation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1623,6 +1627,9 @@ impl Renderer {
             self.side_panel = side_panel;
         }
         let width = side_panel.map_or(total_width, |layout| layout.main_width as u16);
+        if width != self.last_width {
+            queue!(self.out, Print(devez_layout_signal(width)))?;
+        }
         let frame_width = width;
         let live_lines =
             self.live_frame_lines(&view.live_blocks, frame_width, height.max(3) as usize);
@@ -5094,9 +5101,9 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
     }
     if let Some(context) = status.context.filter(|context| !context.is_empty()) {
         // Keep the context marker so a narrow status row can preferentially
-        // remove it before the compact reset reading. It still renders as the
+        // remove it before the compact reset reading. It stays aligned with the
         // ordinary status text colour.
-        push_status_span(&mut spans, context, Tone::Context);
+        push_status_span(&mut spans, context, Tone::StatusText);
     }
     // The 5h window is dropped entirely when unknown rather than shown as a stub.
     let five_hour_remaining = status.five_hour_remaining.filter(|left| !left.is_empty());
@@ -5107,10 +5114,10 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         (None, None) => None,
     };
     if let Some(five_hour) = five_hour {
-        push_status_span(&mut spans, five_hour, Tone::LimitFiveHour);
+        push_status_span(&mut spans, five_hour, Tone::StatusText);
     }
     if let Some(percent) = status.weekly_percent {
-        push_status_span(&mut spans, format!("week: {percent}%"), Tone::LimitWeekly);
+        push_status_span(&mut spans, format!("week: {percent}%"), Tone::StatusText);
     }
     // Fast: On/Off lives on the composer top rule beside the permission mode.
     if let Some(notice) = status.notice.filter(|notice| !notice.is_empty()) {
@@ -9009,7 +9016,7 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::EffortXHigh => palette.status.effort_xhigh,
         Tone::EffortMax => palette.status.effort_max,
         Tone::EffortUltra => palette.status.effort_ultra,
-        Tone::Context => palette.status.text,
+        Tone::Context => palette.status.context,
         Tone::StatusText => palette.status.text,
         Tone::StatusSeparator => palette.status.separator,
         Tone::UserPrompt => palette.foreground,
@@ -15622,6 +15629,41 @@ mod tests {
             assert_eq!(tone_rgb(model_tone), Some(color));
             assert_eq!(tone_rgb(status_tone), Some(color));
         }
+    }
+
+    #[test]
+    fn context_status_line_uses_its_theme_specific_colour() {
+        for theme_kind in ThemeKind::ALL {
+            theme::set_current(theme_kind);
+            assert_eq!(
+                tone_rgb(Tone::Context),
+                Some(theme::palette().status.context),
+                "{theme_kind:?} context status colour"
+            );
+        }
+    }
+
+    #[test]
+    fn side_panel_cycles_report_each_real_main_width() {
+        let total = 141;
+        let stages = [None, Some(48), Some(60), Some(72), None];
+        let signals = stages.map(|panel_width| {
+            let main_width = panel_width
+                .and_then(|width| side_panel_layout(total, width))
+                .map_or(total, |layout| layout.main_width as u16);
+            devez_layout_signal(main_width)
+        });
+
+        assert_eq!(
+            signals,
+            [
+                "\x1b]777;devez-layout-v1;141\x07",
+                "\x1b]777;devez-layout-v1;91\x07",
+                "\x1b]777;devez-layout-v1;79\x07",
+                "\x1b]777;devez-layout-v1;67\x07",
+                "\x1b]777;devez-layout-v1;141\x07",
+            ]
+        );
     }
 
     #[test]

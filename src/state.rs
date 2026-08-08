@@ -16425,6 +16425,31 @@ mod tests {
     }
 
     #[test]
+    fn shifted_claude_model_navigation_follows_the_catalog_order() {
+        let models = vec![
+            test_model("claude:fable", "Fable", false),
+            test_model("claude:opus", "Opus", false),
+            test_model("claude:sonnet", "Sonnet", true),
+            test_model("claude:haiku", "Haiku", false),
+        ];
+        let mut state = AppState::new(
+            "claude:thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            models,
+            "claude:fable",
+            Some("high"),
+        );
+
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_eq!(state.selected_model_name(), "claude:opus");
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_eq!(state.selected_model_name(), "claude:sonnet");
+        state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+        assert_eq!(state.selected_model_name(), "claude:opus");
+    }
+
+    #[test]
     fn integration_slash_commands_dispatch_app_server_actions() {
         let mut state = test_state();
         assert!(matches!(

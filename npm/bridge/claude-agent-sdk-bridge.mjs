@@ -23,6 +23,7 @@ const sessions = new Map();
 const sessionAliases = new Map();
 const pendingHostRequests = new Map();
 const modelCatalogs = new Map();
+const CLAUDE_MODEL_ORDER = ["fable", "opus", "sonnet", "haiku"];
 let nextHostRequest = 1;
 
 class AsyncQueue {
@@ -209,6 +210,14 @@ async function loadModelCatalog(params) {
       const defaultResolvedModel = String(
         models.find((model) => model.value === "default")?.resolvedModel || "",
       );
+      models.sort((left, right) => {
+        const leftFamily = String(left.value || "").match(/(fable|opus|sonnet|haiku)/i)?.[1]?.toLowerCase();
+        const rightFamily = String(right.value || "").match(/(fable|opus|sonnet|haiku)/i)?.[1]?.toLowerCase();
+        const leftOrder = CLAUDE_MODEL_ORDER.indexOf(leftFamily);
+        const rightOrder = CLAUDE_MODEL_ORDER.indexOf(rightFamily);
+        return (leftOrder < 0 ? CLAUDE_MODEL_ORDER.length : leftOrder)
+          - (rightOrder < 0 ? CLAUDE_MODEL_ORDER.length : rightOrder);
+      });
       return {
         data: models
           .filter((model) => model.value && model.value !== "default")

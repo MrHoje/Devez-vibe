@@ -355,9 +355,9 @@ pub fn model_catalog() -> Value {
     };
     json!({
         "data": [
-            claude_model("claude:sonnet", "Sonnet", efforts(), true),
-            claude_model("claude:opus", "Opus", efforts(), false),
             claude_model("claude:fable", "Fable", efforts(), false),
+            claude_model("claude:opus", "Opus", efforts(), false),
+            claude_model("claude:sonnet", "Sonnet", efforts(), true),
             claude_model("claude:haiku", "Haiku", json!([]), false)
         ]
     })
@@ -550,6 +550,13 @@ mod tests {
         let catalog = model_catalog();
         let models = catalog.get("data").and_then(Value::as_array).unwrap();
         assert_eq!(models.len(), 4);
+        assert_eq!(
+            models
+                .iter()
+                .filter_map(|model| model.get("model").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            ["claude:fable", "claude:opus", "claude:sonnet", "claude:haiku"]
+        );
         assert!(
             models
                 .iter()
