@@ -2891,58 +2891,32 @@ const PROGRESS_TRACK_COLUMNS: usize = 20;
 /// row keeps the elapsed time alone instead.
 const PROGRESS_TRACK_MINIMUM: usize = 8;
 
-/// An indeterminate bar sends one block across from the left to the accumulated
-/// blocks on the right. Once full, the rightmost block travels out to the right.
-/// Providers expose only start/end, so this communicates activity without
-/// pretending to know real progress.
+/// An indeterminate block enters from the left, crosses the track, and leaves
+/// through the right edge. Providers expose only start/end, so this communicates
+/// activity without pretending to know real progress.
 fn progress_bar_spans(phase: f32, track: usize, tone: Tone) -> Vec<PaintSpan> {
-    const STEPS: usize = 5;
+    const BLOCK_COLUMNS: usize = 4;
 
-    let position = phase.clamp(0.0, 0.999) * (STEPS * 2) as f32;
-    let frame = position as usize;
-    let frame_progress = position.fract();
+    let block = track.min(BLOCK_COLUMNS);
+    let travel = track + block;
+    let offset = (phase.clamp(0.0, 0.999) * travel as f32).round() as isize - block as isize;
+    let visible_start = offset.max(0) as usize;
+    let visible_end = (offset + block as isize).clamp(0, track as isize) as usize;
+    let visible = visible_end.saturating_sub(visible_start);
+    let remaining = track.saturating_sub(visible_start + visible);
     let mut spans = vec![PaintSpan {
         text: "[".to_owned(),
         tone: Tone::Muted,
         bold: false,
     }];
-    if frame < STEPS {
-        let stacked = track * frame / STEPS;
-        let next_stacked = track * (frame + 1) / STEPS;
-        let moving = next_stacked.saturating_sub(stacked);
-        let travel = track.saturating_sub(stacked + moving);
-        let offset = (travel as f32 * frame_progress).round() as usize;
-        let gap = travel.saturating_sub(offset);
-        if offset > 0 {
-            spans.push(PaintSpan { text: "░".repeat(offset), tone: Tone::Muted, bold: false });
-        }
-        if moving > 0 {
-            spans.push(PaintSpan { text: "█".repeat(moving), tone, bold: false });
-        }
-        if gap > 0 {
-            spans.push(PaintSpan { text: "░".repeat(gap), tone: Tone::Muted, bold: false });
-        }
-        if stacked > 0 {
-            spans.push(PaintSpan { text: "█".repeat(stacked), tone, bold: false });
-        }
-    } else {
-        let departed = frame - STEPS;
-        let stacked = track * (STEPS - departed - 1) / STEPS;
-        let previous_stacked = track * (STEPS - departed) / STEPS;
-        let moving = previous_stacked.saturating_sub(stacked);
-        let travel = track.saturating_sub(stacked);
-        let offset = (travel as f32 * frame_progress).round() as usize;
-        let visible_moving = moving.saturating_sub(offset);
-        let gap = track.saturating_sub(stacked + visible_moving);
-        if stacked > 0 {
-            spans.push(PaintSpan { text: "█".repeat(stacked), tone, bold: false });
-        }
-        if gap > 0 {
-            spans.push(PaintSpan { text: "░".repeat(gap), tone: Tone::Muted, bold: false });
-        }
-        if visible_moving > 0 {
-            spans.push(PaintSpan { text: "█".repeat(visible_moving), tone, bold: false });
-        }
+    if visible_start > 0 {
+        spans.push(PaintSpan { text: "░".repeat(visible_start), tone: Tone::Muted, bold: false });
+    }
+    if visible > 0 {
+        spans.push(PaintSpan { text: "█".repeat(visible), tone, bold: false });
+    }
+    if remaining > 0 {
+        spans.push(PaintSpan { text: "░".repeat(remaining), tone: Tone::Muted, bold: false });
     }
     spans.push(PaintSpan {
         text: "]".to_owned(),
@@ -4664,9 +4638,7 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
     if let Some(model) = status.model.filter(|model| !model.is_empty()) {
         let span = push_status_span(
             &mut spans,
-            // The row prefix reads as part of the terminal edge, so the model
-            // reading carries its own left pad to match the " | " gap on its right.
-            format!("  {} ", compact_right(&model, 28)),
+            format!(" {} ", compact_right(&model, 28)),
             status_model_tone(&model).unwrap_or(Tone::StatusText),
         );
         picks.push((span, Pick::Model));
@@ -12779,7 +12751,7 @@ mod tests {
         );
 
         assert_eq!(line.prefix, " ");
-        assert_eq!(line.text, "  GPT-5.6 Sol ");
+        assert_eq!(line.text, " GPT-5.6 Sol ");
     }
 
     /// The two readings the status line lets you change answer to a click; the
@@ -12866,27 +12838,22 @@ mod tests {
     /// The compaction row spends its spare columns on a bar, and gives them back
     /// to elapsed time when the terminal has none to spare.
     #[test]
-    fn the_compacting_row_moves_blocks_into_and_out_of_the_right_stack() {
-        let entering = activity_lines("Compacting.. (4s)", None, 0.05, 80);
-        let stacked = activity_lines("Compacting.. (4s)", None, 0.1, 80);
-        let full = activity_lines("Compacting.. (4s)", None, 0.5, 80);
-        let leaving = activity_lines("Compacting.. (4s)", None, 0.55, 80);
+    fn the_compacting_row_moves_one_block_left_to_right() {
+        let entering = activity_lines("Compacting.. (4s)", None, 0.25, 80);
+        let passing = activity_lines("Compacting.. (4s)", None, 0.5, 80);
+        let leaving = activity_lines("Compacting.. (4s)", None, 0.9, 80);
 
         assert_eq!(
             painted(&entering[0]),
-            " ⠋ Compacting.. [░░░░░░░░████░░░░░░░░] (4s)"
+            " ⠹ Compacting.. [░░████░░░░░░░░░░░░░░] (4s)"
         );
         assert_eq!(
-            painted(&stacked[0]),
-            " ⠙ Compacting.. [████░░░░░░░░░░░░████] (4s)"
-        );
-        assert_eq!(
-            painted(&full[0]),
-            " ⠴ Compacting.. [████████████████████] (4s)"
+            painted(&passing[0]),
+            " ⠴ Compacting.. [░░░░░░░░████░░░░░░░░] (4s)"
         );
         assert_eq!(
             painted(&leaving[0]),
-            " ⠴ Compacting.. [████████████████░░██] (4s)"
+            " ⠏ Compacting.. [░░░░░░░░░░░░░░░░░░██] (4s)"
         );
 
         let narrow = activity_lines("Compacting.. (4s)", None, 0.5, 30);
@@ -14227,7 +14194,7 @@ mod tests {
         print_line_with_selection(&mut output, &line, None, Some(hovered)).expect("paint");
 
         let painted = String::from_utf8(output).expect("utf-8 escapes");
-        assert_eq!(hovered_cells(&painted), "  GPT-5.6 Sol ");
+        assert_eq!(hovered_cells(&painted), " GPT-5.6 Sol ");
     }
 
     /// Only the piece under the pointer lights up, and it lights up wherever the
