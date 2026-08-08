@@ -546,6 +546,9 @@ pub struct Renderer {
     /// The docked panel's geometry for the frame now on screen, so animation
     /// repaints can restore the panel cells they would otherwise blank.
     side_panel: Option<SidePanelLayout>,
+    /// What the docked panel shows inside its own border on the frame now on
+    /// screen: today the plan summary, moved out of the transcript.
+    side_panel_content: Vec<PaintLine>,
     live_frame_cache: Option<LiveFrameCache>,
     animation_activity_row: Option<usize>,
     animation_plan_rows: usize,
@@ -766,7 +769,7 @@ impl CellFrame {
 }
 
 /// The three widths Alt+P cycles the panel through before it closes again.
-pub(crate) const SIDE_PANEL_WIDTHS: [usize; 3] = [24, 36, 48];
+pub(crate) const SIDE_PANEL_WIDTHS: [usize; 3] = [48, 60, 72];
 const SIDE_PANEL_GAP: usize = 1;
 const SIDE_PANEL_MIN_MAIN_WIDTH: usize = 44;
 /// Writing into a terminal's final cell can trigger an implicit wrap and move
@@ -812,10 +815,33 @@ fn side_panel_layout(total_width: u16, panel_width: usize) -> Option<SidePanelLa
     })
 }
 
-/// The panel's interior is blank: it is a frame waiting for its own content,
-/// not a card with a caption of its own.
+/// The panel's interior is blank wherever its content does not reach, so the
+/// frame reads as one surface rather than a ragged column of writes.
 fn side_panel_row(content_width: usize) -> String {
     " ".repeat(content_width)
+}
+
+/// Paints one already-laid-out row of panel content at the panel's own left
+/// inset. The row is drawn through a scratch frame of the content width so the
+/// ordinary line painter can be reused without teaching it a column offset.
+fn paint_panel_content_row(
+    frame: &mut CellFrame,
+    layout: SidePanelLayout,
+    frame_row: usize,
+    line: &PaintLine,
+) {
+    let content_width = layout.content_width();
+    if content_width == 0 {
+        return;
+    }
+    // `CellFrame::write` keeps the final column clear for autowrap safety, so the
+    // scratch frame carries one spare column the panel never copies back.
+    let mut scratch = CellFrame::new(content_width + 1, 1);
+    paint_line_into_frame(&mut scratch, 0, line, None, None, Some(content_width + 1));
+    for column in 0..content_width {
+        let cell = scratch.cell(column, 0).clone();
+        *frame.cell_mut(layout.content_left() + column, frame_row) = cell;
+    }
 }
 
 fn side_panel_border_style() -> CellStyle {
@@ -848,6 +874,7 @@ fn paint_side_panel_row_into_frame(
     frame_row: usize,
     global_row: usize,
     rows: usize,
+    content: &[PaintLine],
 ) {
     if frame_row >= frame.height || rows == 0 {
         return;
@@ -859,22 +886,29 @@ fn paint_side_panel_row_into_frame(
         let usable = layout.panel_width.saturating_sub(2);
         let hint_width = UnicodeWidthStr::width(SIDE_PANEL_TOGGLE_HINT);
         if usable >= hint_width + 1 {
-            let after = usable - hint_width - 1;
-            frame.write(layout.panel_left + 1, frame_row, "─", border_style);
+            // 작업 단계 카드의 머리글처럼 안내를 오른쪽 모서리 가까이 붙이고,
+            // 모서리와의 사이에는 테두리 한 칸만 남긴다.
+            let before = usable - hint_width - 1;
+            if before > 0 {
+                frame.write(
+                    layout.panel_left + 1,
+                    frame_row,
+                    &"─".repeat(before),
+                    border_style,
+                );
+            }
             frame.write(
-                layout.panel_left + 2,
+                layout.panel_left + 1 + before,
                 frame_row,
                 SIDE_PANEL_TOGGLE_HINT,
                 side_panel_hint_style(),
             );
-            if after > 0 {
-                frame.write(
-                    layout.panel_left + 2 + hint_width,
-                    frame_row,
-                    &"─".repeat(after),
-                    border_style,
-                );
-            }
+            frame.write(
+                layout.panel_left + 1 + before + hint_width,
+                frame_row,
+                "─",
+                border_style,
+            );
         } else if usable > 0 {
             frame.write(
                 layout.panel_left + 1,
@@ -905,11 +939,21 @@ fn paint_side_panel_row_into_frame(
         &side_panel_row(layout.content_width()),
         side_panel_hint_style(),
     );
+    // The rule above the first content row is the panel's own top border, so the
+    // content starts one row below it.
+    if let Some(line) = content.get(global_row - 1) {
+        paint_panel_content_row(frame, layout, frame_row, line);
+    }
 }
 
-fn paint_side_panel_into_frame(frame: &mut CellFrame, layout: SidePanelLayout, rows: usize) {
+fn paint_side_panel_into_frame(
+    frame: &mut CellFrame,
+    layout: SidePanelLayout,
+    rows: usize,
+    content: &[PaintLine],
+) {
     for row in 0..rows.min(frame.height) {
-        paint_side_panel_row_into_frame(frame, layout, row, row, rows);
+        paint_side_panel_row_into_frame(frame, layout, row, row, rows, content);
     }
 }
 
@@ -983,6 +1027,7 @@ impl Renderer {
             painted_selection: None,
             painted_frame: None,
             side_panel: None,
+            side_panel_content: Vec::new(),
             live_frame_cache: None,
             animation_activity_row: None,
             animation_plan_rows: 0,
@@ -1735,6 +1780,7 @@ impl Renderer {
                     0,
                     *screen_row,
                     self.previous_lines.len(),
+                    &self.side_panel_content,
                 );
             }
             let start = screen_row * width;
@@ -1806,7 +1852,15 @@ impl Renderer {
         plan_shimmer_phase: Option<f32>,
     ) -> Result<()> {
         let rows = height as usize;
+        // The docked panel is where the plan lives while it is open, so the
+        // transcript keeps its own full height and draws no card of its own.
+        let plan_in_panel = self.side_panel.is_some();
+        self.side_panel_content = match (self.side_panel, plan_summary) {
+            (Some(layout), Some(summary)) => side_panel_plan_lines(summary, layout.content_width()),
+            _ => Vec::new(),
+        };
         let plan_lines = plan_summary
+            .filter(|_| !plan_in_panel)
             .map(|summary| {
                 fixed_plan_summary_lines(
                     summary,
@@ -1835,7 +1889,7 @@ impl Renderer {
         let max_back = self.wrapped.len() - view_rows;
         self.scroll_back = self.scroll_back.min(max_back);
         let start = max_back - self.scroll_back;
-        let start = if plan_summary.is_some() {
+        let start = if plan_summary.is_some() && !plan_in_panel {
             transcript_start_below_plan(&self.wrapped, start)
         } else {
             start
@@ -2041,7 +2095,7 @@ impl Renderer {
             paint_scroll_to_bottom_into_frame(&mut frame, row, control);
         }
         if let Some(layout) = self.side_panel {
-            paint_side_panel_into_frame(&mut frame, layout, lines.len());
+            paint_side_panel_into_frame(&mut frame, layout, lines.len(), &self.side_panel_content);
         }
         emit_synchronized_frame_diff_with_full_rows(
             &mut self.out,
@@ -5962,6 +6016,63 @@ fn plan_title_shimmer_spans(text: &str, phase: Option<f32>, effort_tone: Tone) -
     .collect()
 }
 
+/// The plan summary as the docked panel shows it: a heading, a blank row, then
+/// one row per step. The panel already draws a border of its own, so this drops
+/// the card chrome, the status gutter, and the toggle hint.
+fn side_panel_plan_lines(summary: &PlanSummary, content_width: usize) -> Vec<PaintLine> {
+    if content_width == 0 {
+        return Vec::new();
+    }
+    let completed = summary
+        .steps
+        .iter()
+        .filter(|step| step.status == PlanStepStatus::Completed)
+        .count();
+    let elapsed: Duration = summary.steps.iter().filter_map(|step| step.elapsed).sum();
+    let mut title = format!("작업 단계  {completed} / {} 완료", summary.steps.len());
+    if !elapsed.is_zero() {
+        title.push_str(&format!("  (  {}  )", format_plan_elapsed(elapsed)));
+    }
+    let mut lines = vec![
+        PaintLine {
+            tone: Tone::Plain,
+            bold: true,
+            ..PaintLine::plain(compact_right(&title, content_width))
+        },
+        PaintLine::blank(),
+    ];
+    for step in &summary.steps {
+        let elapsed_text = step.elapsed.map(format_plan_elapsed);
+        let elapsed = elapsed_text.as_deref();
+        let time_width = elapsed
+            .map(|time| UnicodeWidthStr::width(time) + 3)
+            .unwrap_or_default();
+        let is_completed = step.status == PlanStepStatus::Completed;
+        let in_progress = step.status == PlanStepStatus::InProgress;
+        lines.push(PaintLine {
+            text: compact_right(&step.text, content_width.saturating_sub(time_width)),
+            tone: if is_completed {
+                Tone::PlanDone
+            } else if in_progress {
+                Tone::Accent
+            } else {
+                Tone::Plain
+            },
+            tail: elapsed
+                .map(|time| {
+                    vec![PaintSpan {
+                        text: format!(" ({time})"),
+                        tone: Tone::Muted,
+                        bold: false,
+                    }]
+                })
+                .unwrap_or_default(),
+            ..PaintLine::plain("")
+        });
+    }
+    lines
+}
+
 fn format_plan_elapsed(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
     format!("{}m {}s", seconds / 60, seconds % 60)
@@ -6609,7 +6720,9 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
                 )
             })
             .collect::<Vec<_>>();
-        let padding_width = usize::from(width).saturating_sub(2);
+        // 본문 줄의 배경은 마지막 한 칸을 비워 두고 칠해진다. 여백 줄의 공백도
+        // 같은 칸에서 끝나야 프롬프트의 오른쪽 끝이 한 줄로 맞는다.
+        let padding_width = usize::from(width).saturating_sub(3);
         let mut top = PaintLine::user_prompt_padding(padding_width);
         top.prefix = "▌ ".to_owned();
         top.prefix_tone = border_tone;
@@ -7585,9 +7698,11 @@ fn input_lines_with_controls(
     controls_mode: Option<&ComposerMode>,
 ) -> (Vec<PaintLine>, usize, usize, ComposerLayout) {
     // Windows IME composes Hangul in the terminal before the committed character
-    // reaches us. Leave a full wide-character cell clear before the closing border
-    // so that transient composition cannot paint over it or trigger autowrap.
-    const COMPOSER_IME_RIGHT_GUTTER: usize = 3;
+    // reaches us. A wide preedit also keeps a cursor cell while it moves to the
+    // next visual row, so leave one additional blank cell before the closing
+    // border. This prevents the transient glyph from flashing at the new row's
+    // right edge before the committed syllable is painted.
+    const COMPOSER_IME_RIGHT_GUTTER: usize = 4;
     let (display, editor_cursor, display_spans) =
         composer_display_with_spans(editor, composer_images);
     let display_chars = display.chars().collect::<Vec<_>>();
@@ -8862,7 +8977,7 @@ mod tests {
         };
 
         paint_line_into_frame(&mut frame, 0, &line, None, None, Some(layout.main_width));
-        paint_side_panel_into_frame(&mut frame, layout, 3);
+        paint_side_panel_into_frame(&mut frame, layout, 3, &[]);
 
         assert_eq!(frame.cell(layout.main_width, 0).style, CellStyle::plain());
         assert_eq!(frame.cell(layout.panel_left, 0).style.background, None);
@@ -8876,22 +8991,26 @@ mod tests {
         assert_eq!(frame.cell(right, 2).glyph, "╯");
     }
 
-    /// The panel names its own close key on the top rule, the same way the plan
-    /// panel names its toggle key on its own header.
+    /// The panel names its own toggle key on the top rule, tucked against the
+    /// right corner the same way the plan card's header names its own key.
     #[test]
-    fn the_side_panel_top_rule_names_its_own_close_key() {
+    fn the_side_panel_top_rule_names_its_own_toggle_key_on_the_right() {
         let layout =
             side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
         let mut frame = CellFrame::new(100, 3);
 
-        paint_side_panel_into_frame(&mut frame, layout, 3);
+        paint_side_panel_into_frame(&mut frame, layout, 3, &[]);
 
-        let hint_start = layout.panel_left + 2;
-        let hint: String = (0..UnicodeWidthStr::width(SIDE_PANEL_TOGGLE_HINT))
+        let hint_width = UnicodeWidthStr::width(SIDE_PANEL_TOGGLE_HINT);
+        let right = layout.panel_left + layout.panel_width - 1;
+        let hint_start = right - 1 - hint_width;
+        let hint: String = (0..hint_width)
             .map(|offset| frame.cell(hint_start + offset, 0).glyph.clone())
             .collect();
         assert_eq!(hint, SIDE_PANEL_TOGGLE_HINT);
         assert_eq!(frame.cell(hint_start, 0).style.background, None);
+        assert_eq!(frame.cell(hint_start - 1, 0).glyph, "─");
+        assert_eq!(frame.cell(right - 1, 0).glyph, "─");
     }
 
     /// The panel is closed by its own toggle key, so its rule carries no close
@@ -8902,11 +9021,11 @@ mod tests {
             side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
         let mut frame = CellFrame::new(100, 4);
 
-        paint_side_panel_into_frame(&mut frame, layout, 4);
+        paint_side_panel_into_frame(&mut frame, layout, 4, &[]);
 
         let right = layout.panel_left + layout.panel_width - 1;
-        let hint_end = layout.panel_left + 2 + UnicodeWidthStr::width(SIDE_PANEL_TOGGLE_HINT);
-        for column in hint_end..right {
+        let hint_start = right - 1 - UnicodeWidthStr::width(SIDE_PANEL_TOGGLE_HINT);
+        for column in layout.panel_left + 1..hint_start {
             assert_eq!(
                 frame.cell(column, 0).glyph,
                 "─",
@@ -8940,7 +9059,7 @@ mod tests {
             None,
             Some(layout.main_width),
         );
-        paint_side_panel_row_into_frame(&mut row, layout, 0, 1, 30);
+        paint_side_panel_row_into_frame(&mut row, layout, 0, 1, 30, &[]);
 
         assert_eq!(row.cell(layout.panel_left, 0).style.background, None);
         assert_eq!(row.cell(layout.panel_left, 0).glyph, "│");
@@ -9539,10 +9658,10 @@ mod tests {
         // Both rules are drawn in the same border colour the welcome card uses.
         assert!(rows[0].tone == Tone::Border);
         assert!(rows.last().is_some_and(|row| row.tone == Tone::Border));
-        // The IME gutter keeps three columns clear before the right border, so
+        // The IME gutter keeps four columns clear before the right border, so
         // the text wraps that much earlier.
-        assert_eq!(painted(&prompt_rows[0]), "│ > wrapped-p   │");
-        assert_eq!(painted(&prompt_rows[1]), "│   rompt-tex   │");
+        assert_eq!(painted(&prompt_rows[0]), "│ > wrapped-    │");
+        assert_eq!(painted(&prompt_rows[1]), "│   prompt-t    │");
         assert_eq!(
             painted(rows.last().expect("bottom rule")),
             "╰───────────────╯"
@@ -9612,7 +9731,7 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_paste_cursor_moves_to_the_new_row_at_the_right_edge() {
+    fn collapsed_paste_cursor_wraps_before_the_right_edge() {
         let mut editor = Editor::default();
         editor.insert_paste_str("1\n2\n3\n4\n5\n6");
         editor.insert_str("abc");
@@ -9625,7 +9744,7 @@ mod tests {
         let (_, cursor_row, cursor_col, _) =
             input_lines(&editor, &[], 18, "", "placeholder", None, None);
 
-        assert_eq!((cursor_row, cursor_col), (3, 10));
+        assert_eq!((cursor_row, cursor_col), (4, 4));
     }
 
     #[test]
@@ -15197,6 +15316,58 @@ mod tests {
         assert!(painted(&lines[10]).starts_with('└'));
         assert!(painted(&lines[10]).ends_with('┘'));
         assert!(lines[11].text.is_empty());
+    }
+
+    /// Inside the docked panel the plan drops its card chrome: a heading, one
+    /// blank row, then the steps, all painted at the panel's own left inset.
+    #[test]
+    fn the_side_panel_carries_the_plan_without_a_card_border() {
+        let summary = PlanSummary {
+            explanation: None,
+            steps: vec![
+                PlanStep {
+                    text: "1. 첫 단계".to_owned(),
+                    status: PlanStepStatus::Completed,
+                    started_at: None,
+                    elapsed: Some(Duration::from_secs(18)),
+                },
+                PlanStep {
+                    text: "2. 두 번째 단계".to_owned(),
+                    status: PlanStepStatus::Completed,
+                    started_at: None,
+                    elapsed: Some(Duration::from_secs(7)),
+                },
+            ],
+            expanded: true,
+            started_at: Instant::now(),
+            elapsed: None,
+        };
+        let layout =
+            side_panel_layout(140, SIDE_PANEL_WIDTHS[0]).expect("140 columns carry the panel");
+        let content = side_panel_plan_lines(&summary, layout.content_width());
+
+        assert_eq!(painted(&content[0]), "작업 단계  2 / 2 완료  (  0m 25s  )");
+        assert!(content[1].text.is_empty());
+        assert!(painted(&content[2]).starts_with("1. 첫 단계"));
+        assert!(painted(&content[2]).ends_with("(0m 18s)"));
+        assert!(painted(&content[3]).starts_with("2. 두 번째 단계"));
+        assert!(
+            content
+                .iter()
+                .all(|line| !painted(line).contains('┌') && !painted(line).contains('└')),
+            "the panel draws the only border"
+        );
+
+        let mut frame = CellFrame::new(140, 8);
+        paint_side_panel_into_frame(&mut frame, layout, 8, &content);
+
+        let heading: String = (0..UnicodeWidthStr::width("작업 단계"))
+            .map(|offset| frame.cell(layout.content_left() + offset, 1).glyph.clone())
+            .collect();
+        assert_eq!(heading, "작업 단계");
+        let right = layout.panel_left + layout.panel_width - 1;
+        assert_eq!(frame.cell(layout.panel_left, 1).glyph, "│");
+        assert_eq!(frame.cell(right, 1).glyph, "│");
     }
 
     #[test]

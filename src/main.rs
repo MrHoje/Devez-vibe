@@ -454,6 +454,13 @@ async fn await_thread(
                         ) {
                             state.disarm_quit();
                             Action::None
+                        } else if paste_clipboard_text_shortcut(
+                            state,
+                            &mut composer_paste,
+                            &key,
+                            Instant::now(),
+                        ) {
+                            Action::None
                         } else if is_clipboard_image_shortcut(&key) && attach_clipboard_image(state) {
                             Action::None
                         } else if expand_collapsed_paste_shortcut(
@@ -828,6 +835,14 @@ async fn event_loop(
                             Instant::now(),
                         ) {
                             state.disarm_quit();
+                            renderer.clear_selection();
+                            Action::None
+                        } else if paste_clipboard_text_shortcut(
+                            state,
+                            &mut composer_paste,
+                            &key,
+                            Instant::now(),
+                        ) {
                             renderer.clear_selection();
                             Action::None
                         } else if is_clipboard_image_shortcut(&key) && attach_clipboard_image(state) {
@@ -3825,6 +3840,39 @@ fn is_paste_shortcut(key: &KeyEvent) -> bool {
         && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+/// Reads ordinary clipboard text directly instead of waiting for Windows
+/// Terminal to re-create it as key records. That input path can lose emoji
+/// sequences made of surrogate pairs, variation selectors, or ZWJ joins.
+/// The expected payload is then swallowed when the terminal also forwards it.
+fn paste_clipboard_text_shortcut(
+    state: &mut AppState,
+    buffer: &mut ComposerPasteBuffer,
+    key: &KeyEvent,
+    now: Instant,
+) -> bool {
+    if !is_paste_shortcut(key) || state.has_pending_interaction() {
+        return false;
+    }
+    let Some(text) = clipboard_text().filter(|text| !text.is_empty()) else {
+        return false;
+    };
+    apply_clipboard_text_paste(state, buffer, &text, now)
+}
+
+fn apply_clipboard_text_paste(
+    state: &mut AppState,
+    buffer: &mut ComposerPasteBuffer,
+    text: &str,
+    now: Instant,
+) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    apply_direct_paste(state, text);
+    buffer.discard_expected(text, now);
+    true
+}
+
 fn is_clipboard_image_shortcut(key: &KeyEvent) -> bool {
     matches!(key.kind, crossterm::event::KeyEventKind::Press)
         && matches!(key.code, KeyCode::Char('v' | 'V'))
@@ -4587,6 +4635,37 @@ mod tests {
             KeyCode::Char('v'),
             KeyModifiers::NONE,
         )));
+    }
+
+    #[test]
+    fn clipboard_text_paste_keeps_joined_emoji_and_discards_duplicate_events() {
+        let mut state = starting_state();
+        let mut buffer = ComposerPasteBuffer::new();
+        let text = "확인 👨‍👩‍👧‍👦 ✈️";
+
+        assert!(apply_clipboard_text_paste(
+            &mut state,
+            &mut buffer,
+            text,
+            Instant::now(),
+        ));
+        assert_eq!(state.editor.text(), text);
+        assert!(buffer.take_discarded_paste(text));
+        assert!(!buffer.take_discarded_paste(text));
+    }
+
+    #[test]
+    fn empty_clipboard_text_is_not_applied() {
+        let mut state = starting_state();
+        let mut buffer = ComposerPasteBuffer::new();
+
+        assert!(!apply_clipboard_text_paste(
+            &mut state,
+            &mut buffer,
+            "",
+            Instant::now(),
+        ));
+        assert!(state.editor.text().is_empty());
     }
 
     #[test]
