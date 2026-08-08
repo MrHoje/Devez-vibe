@@ -4695,10 +4695,10 @@ mod tests {
         assert_eq!(state.selected_model_name(), "gpt-5.6-terra");
     }
 
-    /// Shift+P is a view toggle, so it must open and close the panel without
-    /// leaving a stray capital in the composer.
+    /// Alt+S is a view toggle, so it must open and close the panel without
+    /// leaving a stray letter in the composer.
     #[test]
-    fn shift_p_toggles_the_side_panel_without_editing_the_composer() {
+    fn alt_s_toggles_the_side_panel_without_editing_the_composer() {
         let mut state = AppState::new(
             String::new(),
             ".".to_owned(),
@@ -4708,28 +4708,51 @@ mod tests {
             Some("high"),
         );
         let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        // Goes through the paste burst buffer, which is what swallows a bare
+        // printable key before the shortcut branches ever run.
+        let mut paste = ComposerPasteBuffer::new();
+        let now = Instant::now();
 
-        apply_composer_inputs_with_scroll(
+        observe_composer_key_with_scroll(
             &mut state,
             &mut renderer,
-            vec![ComposerInput::Key(press(
-                KeyCode::Char('P'),
-                KeyModifiers::SHIFT,
-            ))],
+            &mut paste,
+            press(KeyCode::Char('s'), KeyModifiers::ALT),
+            now,
         );
 
         assert!(state.side_panel_open());
-        assert!(state.view().editor.text().is_empty());
+        assert!(state.editor.text().is_empty());
 
-        apply_composer_inputs_with_scroll(
+        observe_composer_key_with_scroll(
             &mut state,
             &mut renderer,
-            vec![ComposerInput::Key(press(
-                KeyCode::Char('P'),
-                KeyModifiers::SHIFT,
-            ))],
+            &mut paste,
+            press(KeyCode::Char('s'), KeyModifiers::ALT),
+            now,
         );
 
+        assert!(!state.side_panel_open());
+        assert!(state.editor.text().is_empty());
+    }
+
+    /// The slash command is the discoverable way in, so it must toggle the same
+    /// panel state the chord does.
+    #[test]
+    fn the_side_panel_slash_command_toggles_the_panel() {
+        let mut state = AppState::new(
+            String::new(),
+            ".".to_owned(),
+            "tester".to_owned(),
+            vec![model("gpt-5.6-sol", "high", true, &["low", "high"])],
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+
+        state.run_slash_command("/side-panel");
+        assert!(state.side_panel_open());
+
+        state.run_slash_command("/side-panel");
         assert!(!state.side_panel_open());
     }
 

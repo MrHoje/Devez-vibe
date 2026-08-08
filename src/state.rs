@@ -458,7 +458,7 @@ struct SlashCommand {
     takes_argument: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 29] = [
+const SLASH_COMMANDS: [SlashCommand; 30] = [
     SlashCommand {
         name: "/provider",
         description: "Switch between the Claude and Codex providers",
@@ -582,6 +582,11 @@ const SLASH_COMMANDS: [SlashCommand; 29] = [
     SlashCommand {
         name: "/statusline",
         description: "Show or hide the status line",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/side-panel",
+        description: "Show or hide the docked side panel",
         takes_argument: false,
     },
     SlashCommand {
@@ -4966,12 +4971,6 @@ impl AppState {
 
         if key.modifiers == KeyModifiers::SHIFT {
             match key.code {
-                // Shift carries the capital, so the composer never sees this as
-                // typed text and the panel toggles from anywhere.
-                KeyCode::Char('P') | KeyCode::Char('p') => {
-                    self.toggle_side_panel();
-                    return Action::Tick(true);
-                }
                 KeyCode::Up => {
                     self.move_selected_model(-1);
                     return Action::None;
@@ -5147,6 +5146,13 @@ impl AppState {
             // never reaches us on those systems — Alt+P is the one that always does.
             KeyCode::Char('p') | KeyCode::Char('P') if alt && !ctrl => {
                 self.toggle_plan_summary();
+                Action::Tick(true)
+            }
+            // Alt+S opens and closes the docked side panel. A bare capital would
+            // be swallowed by the composer's typed-text buffer, so the chord
+            // carries Alt to reach this branch at all.
+            KeyCode::Char('s') | KeyCode::Char('S') if alt && !ctrl => {
+                self.toggle_side_panel();
                 Action::Tick(true)
             }
             // The terminal still reports a space for Shift+Space, so the composer
@@ -6090,7 +6096,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/provider [claude|codex]  Claude·Codex provider 전환과 연결 사용/미사용\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n{login_help}\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nShift+Space  작업 단계 접기/펴기\nShift+Tab  Claude 권한 모드 전환"),
+                    format!("/provider [claude|codex]  Claude·Codex provider 전환과 연결 사용/미사용\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 열기/닫기\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n{login_help}\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nShift+Space  작업 단계 접기/펴기\nAlt+S  우측 사이드패널 열기/닫기\nShift+Tab  Claude 권한 모드 전환"),
                 ));
                 Action::None
             }
@@ -6471,6 +6477,10 @@ impl AppState {
                 self.committed
                     .push(Block::new(BlockKind::Error, "Usage", "/statusline"));
                 Action::None
+            }
+            "/side-panel" => {
+                self.toggle_side_panel();
+                Action::Tick(true)
             }
             "/new" if self.busy => {
                 self.committed.push(Block::new(

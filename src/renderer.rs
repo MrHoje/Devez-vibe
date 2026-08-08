@@ -808,7 +808,7 @@ fn side_panel_layout(total_width: u16) -> Option<SidePanelLayout> {
 fn side_panel_row(row: usize, rows: usize, content_width: usize) -> String {
     let text = match row {
         0 => "Side panel",
-        1 if rows > 1 => "Shift+P to close",
+        1 if rows > 1 => "Alt+S to close",
         _ => "",
     };
     format!("{text:<content_width$}")
@@ -8671,7 +8671,7 @@ mod tests {
             row.cell(layout.panel_left, 0).style.background,
             CellStyle::panel().background
         );
-        assert_eq!(row.cell(layout.content_left(), 0).glyph, "S");
+        assert_eq!(row.cell(layout.content_left(), 0).glyph, "A");
     }
 
     #[test]
