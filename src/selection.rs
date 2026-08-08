@@ -65,7 +65,6 @@ impl Selection {
         Some(CellRange { start, end })
     }
 
-    #[cfg(test)]
     pub const fn is_dragging(&self) -> bool {
         self.dragging
     }

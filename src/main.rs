@@ -2974,6 +2974,7 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "예: `Now 토글 함수를 넣습니다.` → `토글 함수를 넣습니다.` ",
     "`Now ...` 같은 독립된 영어 진행 문장은 도구 호출 사이를 포함해 절대 출력하지 않으며, ",
     "`I'll check ...`, `Fine. Building ...`, `Now the tile view logic.`도 똑같이 금지한다. ",
+    "특히 사용자에게 보이는 일반 text의 첫 낱말은 절대로 `Now`가 아니어야 한다. 진행 안내나 도구 결과 앞에 습관적으로 붙인 `Now`는 출력 직전에 지우고 한국어 문장으로 바로 시작한다. ",
     "둘째, 도구 결과를 확인한 소감이나 판정을 영어 한 문장으로 적고 그 뒤에 한국어 문장을 붙이는 형태다. ",
     "`Confirmed ... works.`, `Good, that closes correctly.`, `Perfect.`, `Great.`, `Done.`, `That works.`처럼 쓰지 않는다. ",
     "예: `Confirmed tone_rgb(Tone::Border) works. 이제 다시 그립니다.` → `tone_rgb(Tone::Border)가 동작하는 것을 확인했습니다. 이제 다시 그립니다.` ",
@@ -3107,6 +3108,7 @@ const CLAUDE_TURN_REMINDER: &str = concat!(
     "Devez Vibe 규칙 요약. 전체 규칙은 시스템 프롬프트에 있고, 이번 턴에 특히 지킬 것만 다시 적는다.\n",
     "- 단순 질문이 아닌 작업은 첫 응답 content block을 짧은 한국어 진행 안내 text로 시작하고, ",
     "TaskCreate를 포함한 어떤 tool_use도 그보다 먼저 내지 않는다.\n",
+    "- 사용자에게 보이는 일반 text의 첫 낱말로 `Now`를 절대 출력하지 않는다. 진행 안내나 도구 결과 앞의 `Now`는 지우고 한국어 문장으로 바로 시작한다.\n",
     "- 도구 한 번으로 끝난다고 확신할 수 없는 작업은 첫 작업 도구 전에 반드시 TaskCreate로 작업 목록을 만든다. 각 TaskCreate의 subject 자체는 반드시 `1. `, `2. `, `3. `처럼 번호로 시작하며, 화면 목록의 기호는 번호를 대신하지 않는다. 진행 안내나 조사 목록은 TaskCreate를 대신하지 않으며, 첫 도구 뒤나 두 번째 도구 앞에 TaskCreate를 호출하면 안 된다. 각 Task를 `pending` → `in_progress` → `completed` 순서로 하나씩 옮긴다.\n",
     "- 답변은 서론 없이 결론부터 쓰고, 분량과 노출 범위는 함께 오는 응답 모드 안내를 따른다.\n",
     "- 선택이나 승인을 요청할 때는 본문에 나열하지 말고 AskUserQuestion 도구로 묻는다.\n",
@@ -3873,6 +3875,50 @@ fn apply_clipboard_text_paste(
     true
 }
 
+/// Some Windows terminals do not expose the Ctrl+V key at all. For emoji that
+/// depend on surrogate pairs or joiners, use the clipboard as soon as the first
+/// synthesized character proves that it is the payload, then consume that key
+/// and the rest of the duplicate stream.
+fn apply_fragile_clipboard_paste(
+    state: &mut AppState,
+    buffer: &mut ComposerPasteBuffer,
+    key: &KeyEvent,
+    text: Option<&str>,
+    now: Instant,
+) -> bool {
+    if state.has_pending_interaction() || buffer.is_buffering() {
+        return false;
+    }
+    let Some(text) = text.filter(|text| fragile_clipboard_text(text)) else {
+        return false;
+    };
+    if paste::paste_payload_chars(text).first().copied() != paste::payload_char(&key) {
+        return false;
+    }
+    apply_clipboard_text_paste(state, buffer, text, now);
+    let _ = buffer.observe_expected(key.clone(), now, None);
+    true
+}
+
+fn fragile_clipboard_text(text: &str) -> bool {
+    text.chars().any(|ch| {
+        matches!(ch, '\u{200d}' | '\u{fe0e}' | '\u{fe0f}') || u32::from(ch) > 0xffff
+    })
+}
+
+fn apply_fragile_clipboard_paste_from_key(
+    state: &mut AppState,
+    buffer: &mut ComposerPasteBuffer,
+    key: &KeyEvent,
+    now: Instant,
+) -> bool {
+    if !paste::payload_char(key).is_some_and(|ch| u32::from(ch) > 0xffff) {
+        return false;
+    }
+    let text = clipboard_text();
+    apply_fragile_clipboard_paste(state, buffer, key, text.as_deref(), now)
+}
+
 fn is_clipboard_image_shortcut(key: &KeyEvent) -> bool {
     matches!(key.kind, crossterm::event::KeyEventKind::Press)
         && matches!(key.code, KeyCode::Char('v' | 'V'))
@@ -3988,6 +4034,9 @@ fn observe_composer_key(
         state.handle_key(key)
     } else {
         arm_verified_collapsed_paste(state, buffer, &key, now);
+        if apply_fragile_clipboard_paste_from_key(state, buffer, &key, now) {
+            return Action::None;
+        }
         let expected_paste = state.editor.collapsed_paste_text();
         apply_composer_inputs(
             state,
@@ -4037,6 +4086,9 @@ fn observe_composer_key_with_scroll(
         state.handle_key(key)
     } else {
         arm_verified_collapsed_paste(state, buffer, &key, now);
+        if apply_fragile_clipboard_paste_from_key(state, buffer, &key, now) {
+            return Action::None;
+        }
         let expected_paste = state.editor.collapsed_paste_text();
         apply_composer_inputs_with_scroll(
             state,
@@ -4669,6 +4721,30 @@ mod tests {
     }
 
     #[test]
+    fn first_surrogate_pair_key_applies_the_full_clipboard_emoji() {
+        let mut state = starting_state();
+        let mut buffer = ComposerPasteBuffer::new();
+        let text = "👨‍👩‍👧‍👦";
+        let key = press(KeyCode::Char('👨'), KeyModifiers::NONE);
+
+        assert!(apply_fragile_clipboard_paste(
+            &mut state,
+            &mut buffer,
+            &key,
+            Some(text),
+            Instant::now(),
+        ));
+        assert_eq!(state.editor.text(), text);
+        assert!(buffer.take_discarded_paste(text));
+    }
+
+    #[test]
+    fn ordinary_clipboard_text_does_not_take_the_emoji_fallback() {
+        assert!(!fragile_clipboard_text("ordinary text"));
+        assert!(fragile_clipboard_text("✈️"));
+    }
+
+    #[test]
     fn clicking_the_response_badge_cycles_response_length() {
         let mut state = starting_state();
 
@@ -5193,6 +5269,7 @@ mod tests {
             CLAUDE_TURN_REMINDER.chars().count() < CLAUDE_DEVEZ_INSTRUCTIONS.chars().count() / 4
         );
         assert!(CLAUDE_TURN_REMINDER.contains("첫 응답 content block"));
+        assert!(CLAUDE_TURN_REMINDER.contains("첫 낱말로 `Now`를 절대 출력하지 않는다"));
         assert!(CLAUDE_TURN_REMINDER.contains("TaskCreate"));
         assert!(CLAUDE_TURN_REMINDER.contains("대신하지 않으며"));
         assert!(CLAUDE_TURN_REMINDER.contains("확신할 수 없는"));
@@ -5240,6 +5317,7 @@ mod tests {
             assert!(rules.contains("`다음 부분을 이어서 확인하겠습니다.`"));
         }
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`Now ...` 같은 독립된 영어 진행 문장"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("일반 text의 첫 낱말은 절대로 `Now`가 아니어야 한다"));
         // The ban only held when it moved above the format rules and named the
         // two shapes that actually leaked: an English label glued in front of a
         // Korean sentence, and an English verdict on a tool result. Saying it

@@ -549,6 +549,10 @@ pub struct Renderer {
     /// What the docked panel shows inside its own border on the frame now on
     /// screen: today the plan summary, moved out of the transcript.
     side_panel_content: Vec<PaintLine>,
+    /// Which surface the live drag belongs to. The transcript and the panel are
+    /// two separate columns of text, so a drag stays inside the one it started
+    /// on instead of running across the border between them.
+    selection_in_panel: bool,
     live_frame_cache: Option<LiveFrameCache>,
     animation_activity_row: Option<usize>,
     animation_plan_rows: usize,
@@ -829,6 +833,7 @@ fn paint_panel_content_row(
     layout: SidePanelLayout,
     frame_row: usize,
     line: &PaintLine,
+    selected_columns: Option<Range<usize>>,
 ) {
     let content_width = layout.content_width();
     if content_width == 0 {
@@ -837,7 +842,14 @@ fn paint_panel_content_row(
     // `CellFrame::write` keeps the final column clear for autowrap safety, so the
     // scratch frame carries one spare column the panel never copies back.
     let mut scratch = CellFrame::new(content_width + 1, 1);
-    paint_line_into_frame(&mut scratch, 0, line, None, None, Some(content_width + 1));
+    paint_line_into_frame(
+        &mut scratch,
+        0,
+        line,
+        selected_columns,
+        None,
+        Some(content_width + 1),
+    );
     for column in 0..content_width {
         let cell = scratch.cell(column, 0).clone();
         *frame.cell_mut(layout.content_left() + column, frame_row) = cell;
@@ -875,6 +887,7 @@ fn paint_side_panel_row_into_frame(
     global_row: usize,
     rows: usize,
     content: &[PaintLine],
+    selection: Option<CellRange>,
 ) {
     if frame_row >= frame.height || rows == 0 {
         return;
@@ -942,7 +955,9 @@ fn paint_side_panel_row_into_frame(
     // The rule above the first content row is the panel's own top border, so the
     // content starts one row below it.
     if let Some(line) = content.get(global_row - 1) {
-        paint_panel_content_row(frame, layout, frame_row, line);
+        let selected_columns =
+            selection.and_then(|range| selection_columns_for_line(line, range, global_row - 1));
+        paint_panel_content_row(frame, layout, frame_row, line, selected_columns);
     }
 }
 
@@ -951,9 +966,10 @@ fn paint_side_panel_into_frame(
     layout: SidePanelLayout,
     rows: usize,
     content: &[PaintLine],
+    selection: Option<CellRange>,
 ) {
     for row in 0..rows.min(frame.height) {
-        paint_side_panel_row_into_frame(frame, layout, row, row, rows, content);
+        paint_side_panel_row_into_frame(frame, layout, row, row, rows, content, selection);
     }
 }
 
@@ -1028,6 +1044,7 @@ impl Renderer {
             painted_frame: None,
             side_panel: None,
             side_panel_content: Vec::new(),
+            selection_in_panel: false,
             live_frame_cache: None,
             animation_activity_row: None,
             animation_plan_rows: 0,
@@ -1227,7 +1244,17 @@ impl Renderer {
         Some(columns.start..columns.end.min(painted_line_width(line)))
     }
 
+    /// A live drag keeps the surface it began on, so leaving the transcript for
+    /// the panel mid-drag extends the original selection instead of jumping.
+    fn selection_target_is_panel(&self, column: u16) -> bool {
+        if self.selection.is_dragging() {
+            return self.selection_in_panel;
+        }
+        self.column_is_in_panel(column)
+    }
+
     pub fn begin_selection(&mut self, column: u16, row: u16) -> bool {
+        self.selection_in_panel = self.column_is_in_panel(column);
         let Some(point) = self.selection_point(column, row) else {
             return false;
         };
@@ -1246,6 +1273,7 @@ impl Renderer {
         let Some(point) = self.selection_point(column, row) else {
             return SelectionResult::None;
         };
+        let in_panel = self.selection_target_is_panel(column);
         match self.selection.finish(point) {
             SelectionFinish::Copy(range) => {
                 let text = extract_text(&self.copy_lines(), range);
@@ -1255,6 +1283,9 @@ impl Renderer {
                     SelectionResult::Copy(text)
                 }
             }
+            // The panel carries no clickable chrome, and its cells are not the
+            // transcript's, so a bare click there must not resolve to a pick.
+            SelectionFinish::Click(_) if in_panel => SelectionResult::None,
             SelectionFinish::Click(cell) => SelectionResult::Click(cell.column, cell.row),
             SelectionFinish::None => SelectionResult::None,
         }
@@ -1340,6 +1371,11 @@ impl Renderer {
         let Some(range) = self.selection.range() else {
             return;
         };
+        // A panel selection indexes the panel's own content, which this frame's
+        // transcript rows say nothing about.
+        if self.selection_in_panel {
+            return;
+        }
         let changed = (usize::from(range.start.row)..=usize::from(range.end.row))
             .any(|row| self.previous_lines.get(row) != lines.get(row));
         if changed {
@@ -1347,9 +1383,42 @@ impl Renderer {
         }
     }
 
+    /// True when the column belongs to the docked panel rather than the
+    /// transcript. The gap between them counts as the panel's, so a drag that
+    /// starts a hair left of the border still reads as a panel drag.
+    fn column_is_in_panel(&self, column: u16) -> bool {
+        self.side_panel
+            .is_some_and(|layout| usize::from(column) >= layout.main_width)
+    }
+
+    /// Maps a screen cell onto the panel's own content grid: one row per content
+    /// line below the top rule, and columns measured from the panel's left inset.
+    fn panel_selection_point(&self, column: u16, row: u16) -> Option<CellPosition> {
+        let layout = self.side_panel?;
+        if self.side_panel_content.is_empty() || row == 0 {
+            return None;
+        }
+        let content_row = usize::from(row) - 1;
+        let content_row = content_row.min(self.side_panel_content.len().saturating_sub(1));
+        let line = self.side_panel_content.get(content_row)?;
+        let width = painted_line_width(line).min(layout.content_width());
+        if width == 0 {
+            return None;
+        }
+        let column = usize::from(column).saturating_sub(layout.content_left());
+        let column = column.min(width - 1);
+        Some(CellPosition {
+            column: u16::try_from(column).ok()?,
+            row: u16::try_from(content_row).ok()?,
+        })
+    }
+
     fn selection_point(&self, column: u16, row: u16) -> Option<CellPosition> {
         if self.mode != RenderMode::Fullscreen || self.previous_lines.is_empty() {
             return None;
+        }
+        if self.selection_target_is_panel(column) {
+            return self.panel_selection_point(column, row);
         }
         let row = row.min(self.previous_lines.len().saturating_sub(1) as u16);
         let line = &self.previous_lines[usize::from(row)];
@@ -1379,7 +1448,12 @@ impl Renderer {
     }
 
     fn copy_lines(&self) -> Vec<CopyLine> {
-        self.previous_lines
+        let source = if self.selection_in_panel {
+            &self.side_panel_content
+        } else {
+            &self.previous_lines
+        };
+        source
             .iter()
             .map(|line| CopyLine {
                 text: painted_line_text(line),
@@ -1781,6 +1855,7 @@ impl Renderer {
                     *screen_row,
                     self.previous_lines.len(),
                     &self.side_panel_content,
+                    None,
                 );
             }
             let start = screen_row * width;
@@ -1855,10 +1930,18 @@ impl Renderer {
         // The docked panel is where the plan lives while it is open, so the
         // transcript keeps its own full height and draws no card of its own.
         let plan_in_panel = self.side_panel.is_some();
-        self.side_panel_content = match (self.side_panel, plan_summary) {
-            (Some(layout), Some(summary)) => side_panel_plan_lines(summary, layout.content_width()),
+        let panel_content = match (self.side_panel, plan_summary) {
+            (Some(layout), Some(summary)) => {
+                side_panel_plan_lines(summary, layout.content_width(), activity_phase, plan_active)
+            }
             _ => Vec::new(),
         };
+        // A panel selection points at rows of this content, so a plan that gains
+        // or loses a step leaves the highlight describing something else.
+        if self.selection_in_panel && panel_content.len() != self.side_panel_content.len() {
+            self.selection.clear();
+        }
+        self.side_panel_content = panel_content;
         let plan_lines = plan_summary
             .filter(|_| !plan_in_panel)
             .map(|summary| {
@@ -2073,15 +2156,20 @@ impl Renderer {
         full_repaint_rows: &[usize],
         repaint_full_frame: bool,
     ) -> Result<()> {
-        let selection = self
-            .selection
-            .range()
-            .filter(|range| selection_is_worth_painting(*range, lines));
+        let selection = self.selection.range().filter(|range| {
+            if self.selection_in_panel {
+                selection_is_worth_painting(*range, &self.side_panel_content)
+            } else {
+                selection_is_worth_painting(*range, lines)
+            }
+        });
+        let transcript_selection = selection.filter(|_| !self.selection_in_panel);
+        let panel_selection = selection.filter(|_| self.selection_in_panel);
         let mut frame = CellFrame::new(usize::from(total_width), lines.len());
         for (row, line) in lines.iter().enumerate() {
             let hovered = Self::hover_columns(line, self.hovered_tool, self.hovered_pick.as_ref());
             let selected_columns =
-                selection.and_then(|range| selection_columns_for_line(line, range, row));
+                transcript_selection.and_then(|range| selection_columns_for_line(line, range, row));
             paint_line_into_frame(
                 &mut frame,
                 row,
@@ -2095,7 +2183,13 @@ impl Renderer {
             paint_scroll_to_bottom_into_frame(&mut frame, row, control);
         }
         if let Some(layout) = self.side_panel {
-            paint_side_panel_into_frame(&mut frame, layout, lines.len(), &self.side_panel_content);
+            paint_side_panel_into_frame(
+                &mut frame,
+                layout,
+                lines.len(),
+                &self.side_panel_content,
+                panel_selection,
+            );
         }
         emit_synchronized_frame_diff_with_full_rows(
             &mut self.out,
@@ -6019,7 +6113,12 @@ fn plan_title_shimmer_spans(text: &str, phase: Option<f32>, effort_tone: Tone) -
 /// The plan summary as the docked panel shows it: a heading, a blank row, then
 /// one row per step. The panel already draws a border of its own, so this drops
 /// the card chrome, the status gutter, and the toggle hint.
-fn side_panel_plan_lines(summary: &PlanSummary, content_width: usize) -> Vec<PaintLine> {
+fn side_panel_plan_lines(
+    summary: &PlanSummary,
+    content_width: usize,
+    phase: f32,
+    plan_active: bool,
+) -> Vec<PaintLine> {
     if content_width == 0 {
         return Vec::new();
     }
@@ -6028,10 +6127,13 @@ fn side_panel_plan_lines(summary: &PlanSummary, content_width: usize) -> Vec<Pai
         .iter()
         .filter(|step| step.status == PlanStepStatus::Completed)
         .count();
-    let elapsed: Duration = summary.steps.iter().filter_map(|step| step.elapsed).sum();
     let mut title = format!("작업 단계  {completed} / {} 완료", summary.steps.len());
-    if !elapsed.is_zero() {
-        title.push_str(&format!("  (  {}  )", format_plan_elapsed(elapsed)));
+    // The card prints its own total once every step is done. The panel has no
+    // room for a line of its own, so the same total rides on the heading.
+    let all_completed = !summary.steps.is_empty() && completed == summary.steps.len();
+    if all_completed {
+        let elapsed: Duration = summary.steps.iter().filter_map(|step| step.elapsed).sum();
+        title.push_str(&format!("  ( ⏱  {} )", format_plan_elapsed(elapsed)));
     }
     let mut lines = vec![
         PaintLine {
@@ -6049,8 +6151,36 @@ fn side_panel_plan_lines(summary: &PlanSummary, content_width: usize) -> Vec<Pai
             .unwrap_or_default();
         let is_completed = step.status == PlanStepStatus::Completed;
         let in_progress = step.status == PlanStepStatus::InProgress;
+        // The status mark keeps its own gutter so every step's text starts on the
+        // same column, whether or not the step carries a mark.
+        let (mark, bold) = match step.status {
+            PlanStepStatus::Completed => ("✔ ".to_owned(), false),
+            PlanStepStatus::InProgress if plan_active => (
+                format!(
+                    "{} ",
+                    WORKING_SPINNER
+                        [(phase.clamp(0.0, 0.999) * WORKING_SPINNER.len() as f32) as usize]
+                ),
+                true,
+            ),
+            PlanStepStatus::InProgress => ("▸ ".to_owned(), false),
+            PlanStepStatus::Pending => ("  ".to_owned(), false),
+        };
+        let mark_width = UnicodeWidthStr::width(mark.as_str());
         lines.push(PaintLine {
-            text: compact_right(&step.text, content_width.saturating_sub(time_width)),
+            prefix: mark,
+            prefix_tone: if is_completed {
+                Tone::FastOff
+            } else if in_progress {
+                Tone::Accent
+            } else {
+                Tone::Muted
+            },
+            bold,
+            text: compact_right(
+                &step.text,
+                content_width.saturating_sub(time_width + mark_width),
+            ),
             tone: if is_completed {
                 Tone::PlanDone
             } else if in_progress {
@@ -8977,7 +9107,7 @@ mod tests {
         };
 
         paint_line_into_frame(&mut frame, 0, &line, None, None, Some(layout.main_width));
-        paint_side_panel_into_frame(&mut frame, layout, 3, &[]);
+        paint_side_panel_into_frame(&mut frame, layout, 3, &[], None);
 
         assert_eq!(frame.cell(layout.main_width, 0).style, CellStyle::plain());
         assert_eq!(frame.cell(layout.panel_left, 0).style.background, None);
@@ -8999,7 +9129,7 @@ mod tests {
             side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
         let mut frame = CellFrame::new(100, 3);
 
-        paint_side_panel_into_frame(&mut frame, layout, 3, &[]);
+        paint_side_panel_into_frame(&mut frame, layout, 3, &[], None);
 
         let hint_width = UnicodeWidthStr::width(SIDE_PANEL_TOGGLE_HINT);
         let right = layout.panel_left + layout.panel_width - 1;
@@ -9021,7 +9151,7 @@ mod tests {
             side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
         let mut frame = CellFrame::new(100, 4);
 
-        paint_side_panel_into_frame(&mut frame, layout, 4, &[]);
+        paint_side_panel_into_frame(&mut frame, layout, 4, &[], None);
 
         let right = layout.panel_left + layout.panel_width - 1;
         let hint_start = right - 1 - UnicodeWidthStr::width(SIDE_PANEL_TOGGLE_HINT);
@@ -9059,7 +9189,7 @@ mod tests {
             None,
             Some(layout.main_width),
         );
-        paint_side_panel_row_into_frame(&mut row, layout, 0, 1, 30, &[]);
+        paint_side_panel_row_into_frame(&mut row, layout, 0, 1, 30, &[], None);
 
         assert_eq!(row.cell(layout.panel_left, 0).style.background, None);
         assert_eq!(row.cell(layout.panel_left, 0).glyph, "│");
@@ -9760,6 +9890,42 @@ mod tests {
         assert_eq!(
             renderer.finish_selection(16, 1),
             SelectionResult::Copy("copy".to_owned())
+        );
+    }
+
+    /// The transcript and the docked panel are two separate columns of text, so
+    /// a drag copies the one it started on and never mixes the two.
+    #[test]
+    fn a_drag_inside_the_side_panel_copies_the_panel_not_the_transcript() {
+        let layout =
+            side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = vec![
+            PaintLine::plain("transcript row"),
+            PaintLine::plain("second row"),
+        ];
+        renderer.side_panel = Some(layout);
+        renderer.side_panel_content = vec![
+            PaintLine::plain("작업 단계  1 / 1 완료"),
+            PaintLine::blank(),
+            PaintLine::plain("panel step"),
+        ];
+
+        // Row 0 is the panel's top rule, so its third content row is screen row 3.
+        let start = layout.content_left() as u16;
+        assert!(renderer.begin_selection(start, 3));
+        assert!(renderer.update_selection(start + 9, 3));
+        assert_eq!(
+            renderer.finish_selection(start + 9, 3),
+            SelectionResult::Copy("panel step".to_owned())
+        );
+
+        // A drag that starts in the transcript still answers with transcript text.
+        assert!(renderer.begin_selection(0, 0));
+        assert!(renderer.update_selection(13, 0));
+        assert_eq!(
+            renderer.finish_selection(13, 0),
+            SelectionResult::Copy("transcript row".to_owned())
         );
     }
 
@@ -15333,9 +15499,15 @@ mod tests {
                 },
                 PlanStep {
                     text: "2. 두 번째 단계".to_owned(),
-                    status: PlanStepStatus::Completed,
+                    status: PlanStepStatus::InProgress,
                     started_at: None,
                     elapsed: Some(Duration::from_secs(7)),
+                },
+                PlanStep {
+                    text: "3. 세 번째 단계".to_owned(),
+                    status: PlanStepStatus::Pending,
+                    started_at: None,
+                    elapsed: None,
                 },
             ],
             expanded: true,
@@ -15344,13 +15516,18 @@ mod tests {
         };
         let layout =
             side_panel_layout(140, SIDE_PANEL_WIDTHS[0]).expect("140 columns carry the panel");
-        let content = side_panel_plan_lines(&summary, layout.content_width());
+        let content = side_panel_plan_lines(&summary, layout.content_width(), 0.0, false);
 
-        assert_eq!(painted(&content[0]), "작업 단계  2 / 2 완료  (  0m 25s  )");
+        // The total rides on the heading only once every step is done, the same
+        // rule the card's own total line follows.
+        assert_eq!(painted(&content[0]), "작업 단계  1 / 3 완료");
         assert!(content[1].text.is_empty());
-        assert!(painted(&content[2]).starts_with("1. 첫 단계"));
+        assert_eq!(content[2].prefix, "✔ ");
+        assert_eq!(content[3].prefix, "▸ ");
+        assert_eq!(content[4].prefix, "  ");
+        assert!(painted(&content[2]).starts_with("✔ 1. 첫 단계"));
         assert!(painted(&content[2]).ends_with("(0m 18s)"));
-        assert!(painted(&content[3]).starts_with("2. 두 번째 단계"));
+        assert!(painted(&content[3]).starts_with("▸ 2. 두 번째 단계"));
         assert!(
             content
                 .iter()
@@ -15359,7 +15536,7 @@ mod tests {
         );
 
         let mut frame = CellFrame::new(140, 8);
-        paint_side_panel_into_frame(&mut frame, layout, 8, &content);
+        paint_side_panel_into_frame(&mut frame, layout, 8, &content, None);
 
         let heading: String = (0..UnicodeWidthStr::width("작업 단계"))
             .map(|offset| frame.cell(layout.content_left() + offset, 1).glyph.clone())
@@ -15368,6 +15545,21 @@ mod tests {
         let right = layout.panel_left + layout.panel_width - 1;
         assert_eq!(frame.cell(layout.panel_left, 1).glyph, "│");
         assert_eq!(frame.cell(right, 1).glyph, "│");
+
+        let finished = PlanSummary {
+            steps: summary
+                .steps
+                .iter()
+                .map(|step| PlanStep {
+                    status: PlanStepStatus::Completed,
+                    elapsed: step.elapsed.or(Some(Duration::from_secs(60))),
+                    ..step.clone()
+                })
+                .collect(),
+            ..summary
+        };
+        let done = side_panel_plan_lines(&finished, layout.content_width(), 0.0, false);
+        assert_eq!(painted(&done[0]), "작업 단계  3 / 3 완료  ( ⏱  1m 25s )");
     }
 
     #[test]
