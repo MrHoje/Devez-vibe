@@ -20,8 +20,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// nothing reads this today; rewrite it each release for the changelog.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "질문 직접 입력을 선택지 안에서 작성하고 번호로 선택할 수 있습니다.",
-    "작업 단계 시간과 Resume 기록을 정확히 복원하고 중복 카드를 제거했습니다.",
+    "상태 줄의 문맥 표시와 진행 애니메이션을 다듬었습니다.",
+    "재개한 대화의 모델 표시와 Claude 한국어 응답 규칙을 보완했습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
