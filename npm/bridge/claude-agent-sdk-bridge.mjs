@@ -1541,24 +1541,43 @@ function isCompactSummary(message, text) {
     || /^(this session is being continued from|caveat: the messages below were generated)/i.test(text.trim());
 }
 
+// Tags the runtime wraps around text it feeds itself. They ride along inside
+// ordinary user messages, so matching only the leading tag let the rest through.
+const INTERNAL_TAGS = [
+  "bash-input",
+  "bash-stdout",
+  "bash-stderr",
+  "command-message",
+  "command-name",
+  "command-args",
+  "local-command-caveat",
+  "local-command-stdout",
+  "local-command-stderr",
+  "task-notification",
+  "system-reminder",
+  "user-prompt-submit-hook",
+  "session-start-hook",
+  "ide_selection",
+  "ide_opened_file",
+];
+
+/** Drops every internal block, leaving only what the user actually typed. */
+function stripInternalTags(text) {
+  let rest = text;
+  for (const tag of INTERNAL_TAGS) {
+    rest = rest.replace(new RegExp(`<${tag}>[\\s\\S]*?</${tag}>`, "gi"), "");
+    // An unterminated opener means the rest of the message is internal too.
+    rest = rest.replace(new RegExp(`<${tag}>[\\s\\S]*$`, "i"), "");
+  }
+  return rest.trim();
+}
+
 function isInternalHistoryText(message, text) {
   if (message.isMeta || message.subtype === "local_command") return true;
   if (isCompactSummary(message, text)) return true;
-  const trimmed = text.trim();
-  const tag = trimmed.match(/^<([a-z0-9-]+)>/i)?.[1]?.toLowerCase();
   // The interruption marker carries a reason ("… for tool use"), so it has to be
   // matched by prefix rather than by the bare sentence.
-  return trimmed.startsWith("[Request interrupted by user")
-    || [
-      "bash-input",
-      "bash-stdout",
-      "bash-stderr",
-      "command-name",
-      "local-command-caveat",
-      "local-command-stdout",
-      "local-command-stderr",
-      "task-notification",
-    ].includes(tag);
+  return text.trim().startsWith("[Request interrupted by user");
 }
 
 function historyState(messages) {
@@ -1569,7 +1588,7 @@ function historyState(messages) {
   for (const message of messages) {
     const blocks = contentBlocks(message.message);
     const userText = message.type === "user"
-      ? stripHandoff(blocks.filter((block) => block.type === "text").map((block) => block.text || "").join("\n"))
+      ? stripInternalTags(stripHandoff(blocks.filter((block) => block.type === "text").map((block) => block.text || "").join("\n")))
       : "";
     if (userText
       && !blocks.some((block) => block.type === "tool_result")

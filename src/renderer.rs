@@ -2891,50 +2891,58 @@ const PROGRESS_TRACK_COLUMNS: usize = 20;
 /// row keeps the elapsed time alone instead.
 const PROGRESS_TRACK_MINIMUM: usize = 8;
 
-/// An indeterminate bar adds blocks from the right until full, then lets those
-/// rightmost blocks leave one at a time. Providers expose only start/end, so
-/// this still communicates activity without pretending to know real progress.
+/// An indeterminate bar sends one block across from the left to the accumulated
+/// blocks on the right. Once full, the rightmost block travels out to the right.
+/// Providers expose only start/end, so this communicates activity without
+/// pretending to know real progress.
 fn progress_bar_spans(phase: f32, track: usize, tone: Tone) -> Vec<PaintSpan> {
     const STEPS: usize = 5;
 
-    let frame = (phase.clamp(0.0, 0.999) * (STEPS * 2) as f32) as usize;
-    let filling = frame <= STEPS;
-    let filled_steps = if filling {
-        frame
-    } else {
-        STEPS * 2 - frame
-    };
-    let filled = (track * filled_steps).div_ceil(STEPS);
+    let position = phase.clamp(0.0, 0.999) * (STEPS * 2) as f32;
+    let frame = position as usize;
+    let frame_progress = position.fract();
     let mut spans = vec![PaintSpan {
         text: "[".to_owned(),
         tone: Tone::Muted,
         bold: false,
     }];
-    let remaining = track.saturating_sub(filled);
-    let push_empty = |spans: &mut Vec<PaintSpan>| {
-        if remaining > 0 {
-            spans.push(PaintSpan {
-                text: "░".repeat(remaining),
-                tone: Tone::Muted,
-                bold: false,
-            });
+    if frame < STEPS {
+        let stacked = track * frame / STEPS;
+        let next_stacked = track * (frame + 1) / STEPS;
+        let moving = next_stacked.saturating_sub(stacked);
+        let travel = track.saturating_sub(stacked + moving);
+        let offset = (travel as f32 * frame_progress).round() as usize;
+        let gap = travel.saturating_sub(offset);
+        if offset > 0 {
+            spans.push(PaintSpan { text: "░".repeat(offset), tone: Tone::Muted, bold: false });
         }
-    };
-    let push_filled = |spans: &mut Vec<PaintSpan>| {
-        if filled > 0 {
-            spans.push(PaintSpan {
-                text: "█".repeat(filled),
-                tone,
-                bold: false,
-            });
+        if moving > 0 {
+            spans.push(PaintSpan { text: "█".repeat(moving), tone, bold: false });
         }
-    };
-    if filling {
-        push_empty(&mut spans);
-        push_filled(&mut spans);
+        if gap > 0 {
+            spans.push(PaintSpan { text: "░".repeat(gap), tone: Tone::Muted, bold: false });
+        }
+        if stacked > 0 {
+            spans.push(PaintSpan { text: "█".repeat(stacked), tone, bold: false });
+        }
     } else {
-        push_filled(&mut spans);
-        push_empty(&mut spans);
+        let departed = frame - STEPS;
+        let stacked = track * (STEPS - departed - 1) / STEPS;
+        let previous_stacked = track * (STEPS - departed) / STEPS;
+        let moving = previous_stacked.saturating_sub(stacked);
+        let travel = track.saturating_sub(stacked);
+        let offset = (travel as f32 * frame_progress).round() as usize;
+        let visible_moving = moving.saturating_sub(offset);
+        let gap = track.saturating_sub(stacked + visible_moving);
+        if stacked > 0 {
+            spans.push(PaintSpan { text: "█".repeat(stacked), tone, bold: false });
+        }
+        if gap > 0 {
+            spans.push(PaintSpan { text: "░".repeat(gap), tone: Tone::Muted, bold: false });
+        }
+        if visible_moving > 0 {
+            spans.push(PaintSpan { text: "█".repeat(visible_moving), tone, bold: false });
+        }
     }
     spans.push(PaintSpan {
         text: "]".to_owned(),
@@ -12858,27 +12866,27 @@ mod tests {
     /// The compaction row spends its spare columns on a bar, and gives them back
     /// to elapsed time when the terminal has none to spare.
     #[test]
-    fn the_compacting_row_stacks_right_then_drains_right_that_fits() {
-        let empty = activity_lines("Compacting.. (4s)", None, 0.0, 80);
-        let stacked = activity_lines("Compacting.. (4s)", None, 0.4, 80);
+    fn the_compacting_row_moves_blocks_into_and_out_of_the_right_stack() {
+        let entering = activity_lines("Compacting.. (4s)", None, 0.05, 80);
+        let stacked = activity_lines("Compacting.. (4s)", None, 0.1, 80);
         let full = activity_lines("Compacting.. (4s)", None, 0.5, 80);
-        let draining = activity_lines("Compacting.. (4s)", None, 0.6, 80);
+        let leaving = activity_lines("Compacting.. (4s)", None, 0.55, 80);
 
         assert_eq!(
-            painted(&empty[0]),
-            " ⠋ Compacting.. [░░░░░░░░░░░░░░░░░░░░] (4s)"
+            painted(&entering[0]),
+            " ⠋ Compacting.. [░░░░░░░░████░░░░░░░░] (4s)"
         );
         assert_eq!(
             painted(&stacked[0]),
-            " ⠼ Compacting.. [░░░░████████████████] (4s)"
+            " ⠙ Compacting.. [████░░░░░░░░░░░░████] (4s)"
         );
         assert_eq!(
             painted(&full[0]),
             " ⠴ Compacting.. [████████████████████] (4s)"
         );
         assert_eq!(
-            painted(&draining[0]),
-            " ⠦ Compacting.. [████████████████░░░░] (4s)"
+            painted(&leaving[0]),
+            " ⠴ Compacting.. [████████████████░░██] (4s)"
         );
 
         let narrow = activity_lines("Compacting.. (4s)", None, 0.5, 30);

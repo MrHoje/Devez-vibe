@@ -42,7 +42,7 @@ const SPINNER: [&str; 8] = ["✢", "✳", "✶", "✻", "✽", "✻", "✶", "�
 const SHIMMER_PERIOD: Duration = Duration::from_millis(1_100);
 /// Compaction is a separate wait state, so its activity animation advances at a
 /// calmer pace than the ordinary response shimmer.
-const COMPACTION_ACTIVITY_PERIOD: Duration = Duration::from_secs(6);
+const COMPACTION_ACTIVITY_PERIOD: Duration = Duration::from_secs(12);
 const PLAN_SHIMMER_DURATION: Duration = SHIMMER_PERIOD.saturating_mul(5);
 
 /// One-off notices (copy, reroute, …) sit in the status line this long.

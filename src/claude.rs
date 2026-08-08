@@ -513,8 +513,12 @@ mod tests {
         assert!(bridge.contains("\"local-command-caveat\""));
         assert!(bridge.contains("\"bash-input\""));
         assert!(bridge.contains("\"task-notification\""));
+        assert!(bridge.contains("\"system-reminder\""));
+        assert!(bridge.contains("\"command-message\""));
+        assert!(bridge.contains("stripInternalTags(stripHandoff("));
         assert!(bridge.contains("isCompactSummary(message, text)"));
         assert!(bridge.contains("message.isCompactSummary === true"));
+        assert!(bridge.contains("[Request interrupted by user\""));
         assert!(bridge.contains("message.message?.model === \"<synthetic>\""));
         assert!(bridge.contains("prompt.model = turn.model"));
     }
