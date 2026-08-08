@@ -1533,8 +1533,17 @@ function contentBlocks(message) {
   return Array.isArray(content) ? content : [];
 }
 
+// A compaction summary is replayed as a user message even though the user never
+// wrote it: showing it puts a wall of recap text where the resumed conversation
+// should start.
+function isCompactSummary(message, text) {
+  return message.isCompactSummary === true
+    || /^(this session is being continued from|caveat: the messages below were generated)/i.test(text.trim());
+}
+
 function isInternalHistoryText(message, text) {
   if (message.isMeta || message.subtype === "local_command") return true;
+  if (isCompactSummary(message, text)) return true;
   const trimmed = text.trim();
   const tag = trimmed.match(/^<([a-z0-9-]+)>/i)?.[1]?.toLowerCase();
   return trimmed === "[Request interrupted by user]"

@@ -2917,12 +2917,6 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 각 Task는 착수할 때 in_progress, 끝나면 completed로 즉시 갱신한다.\n",
     "- 계획을 만들었다면 동시에 in_progress인 Task는 하나만 두고, 현재 Task를 completed로 바꾼 뒤 다음 Task를 in_progress로 바꾼다.\n",
     "- 종료 직전에 여러 Task를 한꺼번에 completed로 바꾸지 않는다. 각 Task의 첫 작업 도구를 호출하기 전에 해당 Task를 in_progress로 바꾸고, 그 작업이 끝난 직후 completed로 바꾼다.\n",
-    "내장 브라우저 규칙:\n",
-    "- DevezCode 브라우저는 ChatGPT의 Browser plugin(`iab`)이 아니라 `mcp__devez_browser__browser_*` MCP 도구다. ",
-    "사용자가 DevezCode 브라우저·Devez 브라우저·내장 브라우저·내장브라우저·인앱 브라우저·인앱브라우저를 요청하면 이 MCP 도구만 사용하고 Browser plugin을 초기화하거나 사용할 수 없다고 답하지 않는다. ",
-    "사용자가 크롬 브라우저를 명시한 경우에만 Chrome을 사용한다.\n",
-    "- 도구가 없다고 추측하지 말고 현재 제공된 도구를 먼저 확인한다.\n",
-    "- 기존 브라우저 탭이 있으면 임의로 선택하지 말고 사용자에게 선택을 받은 뒤 사용한다.\n",
 );
 
 /// Claude Code already owns its native task system. These rules preserve the
@@ -2992,12 +2986,6 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 각 Task는 착수 즉시 TaskUpdate로 `in_progress`, 끝나면 즉시 `completed`로 바꾼다.\n",
     "- 동시에 `in_progress`인 Task는 하나만 두고, 현재 Task를 `completed`로 바꾼 뒤 다음 Task를 `in_progress`로 바꾼다.\n",
     "- 종료 직전에 여러 Task를 한꺼번에 `completed`로 바꾸지 않는다. 각 Task의 첫 Read, Grep, Glob, Bash 등 작업 도구를 호출하기 전에 그 Task를 `in_progress`로 바꾸고, 해당 작업이 끝난 직후 `completed`로 바꾼다.\n",
-    "내장 브라우저 규칙:\n",
-    "- DevezCode 브라우저는 ChatGPT의 Browser plugin(`iab`)이 아니라 `mcp__devez_browser__browser_*` MCP 도구다. ",
-    "사용자가 DevezCode 브라우저·Devez 브라우저·내장 브라우저·내장브라우저·인앱 브라우저·인앱브라우저를 요청하면 이 MCP 도구만 사용한다. ",
-    "사용자가 크롬 브라우저를 명시한 경우에만 Chrome을 사용한다.\n",
-    "- 도구가 없다고 추측하지 말고 현재 제공된 도구를 먼저 확인한다.\n",
-    "- 기존 브라우저 탭이 있으면 임의로 선택하지 말고 사용자에게 선택을 받은 뒤 사용한다.\n",
 );
 
 /// The Claude selections a session has to be told, because the bridge opens a
@@ -4840,12 +4828,12 @@ mod tests {
     }
 
     #[test]
-    fn developer_instructions_use_the_available_embedded_browser_tools() {
-        assert!(DEVEZ_INSTRUCTIONS.contains("mcp__devez_browser__browser_*"));
-        assert!(DEVEZ_INSTRUCTIONS.contains("Browser plugin을 초기화하거나"));
-        assert!(DEVEZ_INSTRUCTIONS.contains("인앱브라우저"));
-        assert!(DEVEZ_INSTRUCTIONS.contains("크롬 브라우저"));
-        assert!(DEVEZ_INSTRUCTIONS.contains("임의로 선택하지 말고"));
+    fn developer_instructions_leave_browser_tool_choice_to_the_tool_list() {
+        for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS] {
+            assert!(!rules.contains("내장 브라우저 규칙"));
+            assert!(!rules.contains("browser_*"));
+            assert!(!rules.contains("Browser plugin"));
+        }
     }
 
     #[test]

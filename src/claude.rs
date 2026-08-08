@@ -513,6 +513,8 @@ mod tests {
         assert!(bridge.contains("\"local-command-caveat\""));
         assert!(bridge.contains("\"bash-input\""));
         assert!(bridge.contains("\"task-notification\""));
+        assert!(bridge.contains("isCompactSummary(message, text)"));
+        assert!(bridge.contains("message.isCompactSummary === true"));
         assert!(bridge.contains("message.message?.model === \"<synthetic>\""));
         assert!(bridge.contains("prompt.model = turn.model"));
     }

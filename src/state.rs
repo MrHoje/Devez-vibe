@@ -9399,10 +9399,10 @@ fn commit_user_input_answers(
                 .question
                 .trim()
                 .trim_end_matches(|ch: char| matches!(ch, ':' | '：' | '?' | '？'));
-            format!("{question}:\n↳ {answer}")
+            format!("{question}:\n  ↳ {answer}")
         })
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n\n");
     state.commit_welcome_card();
     // 답변 블록도 사용자가 직접 보낸 메시지와 같은 모델 색을 써야 하므로 제목에
     // 모델 이름을 넣는다. "You"로 두면 렌더러가 모델을 못 알아보고 기본 강조색으로
@@ -11113,7 +11113,7 @@ mod tests {
         let sent = state.committed.last().expect("sent answer history");
         assert_eq!(
             sent.body,
-            "첫 질문인가요:\n↳ 첫 답\n둘째 질문:\n↳ 둘째 답"
+            "첫 질문인가요:\n  ↳ 첫 답\n\n둘째 질문:\n  ↳ 둘째 답"
         );
     }
 

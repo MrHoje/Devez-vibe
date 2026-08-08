@@ -20,8 +20,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// nothing reads this today; rewrite it each release for the changelog.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "상태 줄의 문맥 표시와 진행 애니메이션을 다듬었습니다.",
-    "재개한 대화의 모델 표시와 Claude 한국어 응답 규칙을 보완했습니다.",
+    "대화를 이어받을 때 자동 요약본이 화면에 다시 보이지 않습니다.",
+    "질문 답변 기록을 더 읽기 좋게 정리하고 안내 규칙을 다듬었습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
