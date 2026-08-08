@@ -55,7 +55,11 @@ pub struct Rollout {
 
 impl Rollout {
     /// The model effective when a turn started, reconstructed from the latest
-    /// local `turn_context` record at or before that timestamp.
+    /// local `turn_context` record at or before that timestamp. A turn older
+    /// than every recorded context — the shape a resumed session leaves behind,
+    /// where the replayed history predates the first context written in this
+    /// run — takes the earliest one instead of nothing, so the prompt still
+    /// carries a model rather than falling back to the plain accent.
     pub fn model_for_turn(&self, started_at: i64) -> Option<&str> {
         self.turn_contexts
             .iter()
@@ -65,6 +69,7 @@ impl Rollout {
                     .is_some_and(|time| time.timestamp() <= started_at)
             })
             .last()
+            .or_else(|| self.turn_contexts.first())
             .map(|(_, model)| model.as_str())
     }
 }
