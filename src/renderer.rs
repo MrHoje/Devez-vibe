@@ -812,9 +812,10 @@ fn side_panel_layout(total_width: u16, panel_width: usize) -> Option<SidePanelLa
     })
 }
 
-fn side_panel_row(content_row: usize, content_width: usize) -> String {
-    let text = if content_row == 0 { "Side panel" } else { "" };
-    format!("{text:<content_width$}")
+/// The panel's interior is blank: it is a frame waiting for its own content,
+/// not a card with a caption of its own.
+fn side_panel_row(content_width: usize) -> String {
+    " ".repeat(content_width)
 }
 
 fn side_panel_border_style() -> CellStyle {
@@ -827,22 +828,6 @@ fn side_panel_border_style() -> CellStyle {
 /// The key that cycles the docked side panel, named on its own top rule the
 /// same way the plan panel names its own toggle key.
 const SIDE_PANEL_TOGGLE_HINT: &str = " Alt + P ";
-
-/// Closes the panel outright, the same mark a closable overlay's header uses.
-const SIDE_PANEL_CLOSE_MARK: &str = "X";
-/// Columns reserved before the corner for the close mark: a blank gap, the
-/// mark itself, then a rule stroke — the same "X ─╮" spacing a closable
-/// overlay's own header uses, so the mark reads as sitting inside the box
-/// rather than glued to the corner.
-const SIDE_PANEL_CLOSE_RESERVED: usize = 3;
-
-/// The column the close mark paints on, if the panel is wide enough to spare
-/// the room — shared by the paint step and its click region so they cannot
-/// drift apart.
-fn side_panel_close_column(layout: SidePanelLayout) -> Option<usize> {
-    (layout.panel_width.saturating_sub(2) >= SIDE_PANEL_CLOSE_RESERVED)
-        .then(|| layout.panel_left + layout.panel_width - 3)
-}
 
 fn side_panel_hint_style() -> CellStyle {
     CellStyle {
@@ -871,14 +856,7 @@ fn paint_side_panel_row_into_frame(
     let right = layout.panel_left + layout.panel_width - 1;
     if global_row == 0 {
         frame.write(layout.panel_left, frame_row, "╭", border_style);
-        let inner = layout.panel_width.saturating_sub(2);
-        let close_column = side_panel_close_column(layout);
-        let reserved_close = if close_column.is_some() {
-            SIDE_PANEL_CLOSE_RESERVED
-        } else {
-            0
-        };
-        let usable = inner.saturating_sub(reserved_close);
+        let usable = layout.panel_width.saturating_sub(2);
         let hint_width = UnicodeWidthStr::width(SIDE_PANEL_TOGGLE_HINT);
         if usable >= hint_width + 1 {
             let after = usable - hint_width - 1;
@@ -905,15 +883,6 @@ fn paint_side_panel_row_into_frame(
                 border_style,
             );
         }
-        if let Some(close_column) = close_column {
-            frame.write(
-                close_column,
-                frame_row,
-                SIDE_PANEL_CLOSE_MARK,
-                side_panel_hint_style(),
-            );
-            frame.write(close_column + 1, frame_row, "─", border_style);
-        }
         frame.write(right, frame_row, "╮", border_style);
         return;
     }
@@ -933,7 +902,7 @@ fn paint_side_panel_row_into_frame(
     frame.write(
         layout.content_left(),
         frame_row,
-        &side_panel_row(global_row - 1, layout.content_width()),
+        &side_panel_row(layout.content_width()),
         side_panel_hint_style(),
     );
 }
@@ -1904,18 +1873,6 @@ impl Renderer {
             }
             Some((row, control))
         });
-        // The panel always spans the whole screen, so its top rule is always
-        // row 0 — the same row regardless of scroll position or plan height.
-        if let Some(layout) = self.side_panel
-            && let Some(close_column) = side_panel_close_column(layout)
-            && let Some(line) = screen.get_mut(0)
-        {
-            let region = (close_column, close_column + 1, Pick::SidePanelClose);
-            match line.pick.as_mut() {
-                Some(picks) => picks.0.push(region),
-                None => line.pick = Some(PickRegions(vec![region])),
-            }
-        }
         self.reconcile_selection(&screen);
         let full_repaint_rows = plan_rows_requiring_full_repaint(
             &self.previous_lines,
@@ -2378,6 +2335,9 @@ fn paint_line_into_frame(
     let background = row_background(line.tone);
     let bubble_background = bubble_background(line);
     if let Some(background) = background {
+        // 사이드패널이 열려 있으면 본문 폭이 화면 폭보다 좁다. 화면 끝까지
+        // 칠하는 줄도 본문 폭 안에서 끝나야 배경이 패널 쪽으로 번지지 않는다.
+        let trailing_right = background_width.unwrap_or(frame.width).saturating_sub(1);
         let (start, right) = if matches!(line.tone, Tone::UserPrompt | Tone::UserPromptPadding) {
             let prefix_width = UnicodeWidthStr::width(line.prefix.as_str());
             let start = if CHAT_LAYOUT.load(Ordering::Relaxed) {
@@ -2387,11 +2347,11 @@ fn paint_line_into_frame(
             } else {
                 prefix_width
             };
-            (start, frame.width.saturating_sub(1))
+            (start, trailing_right)
         } else if line.tone == Tone::ModelChange {
             // Setting-change cards share the user's terminal-safe trailing cell.
             // Fast, Model, and Effort notices therefore end on the same column.
-            (0, frame.width.saturating_sub(1))
+            (0, trailing_right)
         } else {
             (0, background_width.unwrap_or(frame.width))
         };
@@ -2959,8 +2919,6 @@ pub enum Pick {
     ScrollToBottom,
     /// The `✕` on a panel's top rule: closes what Esc closes.
     Close,
-    /// The `X` on the docked side panel's top rule: closes the panel outright.
-    SidePanelClose,
 }
 
 /// Columns a clickable span reaches past its own text, either side. A word is a
@@ -8936,25 +8894,34 @@ mod tests {
         assert_eq!(frame.cell(hint_start, 0).style.background, None);
     }
 
-    /// The top rule carries a close mark, and its column must match the click
-    /// region a real click resolves against — the paint step and the pick are
-    /// two different call sites and must not drift apart.
+    /// The panel is closed by its own toggle key, so its rule carries no close
+    /// mark and its interior carries no caption of its own.
     #[test]
-    fn the_side_panel_top_rule_paints_a_close_mark_at_its_own_pick_column() {
+    fn the_side_panel_carries_no_close_mark_and_no_caption() {
         let layout =
             side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
-        let mut frame = CellFrame::new(100, 3);
+        let mut frame = CellFrame::new(100, 4);
 
-        paint_side_panel_into_frame(&mut frame, layout, 3);
+        paint_side_panel_into_frame(&mut frame, layout, 4);
 
-        let close_column = side_panel_close_column(layout).expect("wide enough for a close mark");
-        assert_eq!(frame.cell(close_column, 0).glyph, "X");
-        assert_eq!(frame.cell(close_column, 0).style.background, None);
         let right = layout.panel_left + layout.panel_width - 1;
-        assert!(
-            close_column < right,
-            "the mark must not overwrite the corner"
-        );
+        let hint_end = layout.panel_left + 2 + UnicodeWidthStr::width(SIDE_PANEL_TOGGLE_HINT);
+        for column in hint_end..right {
+            assert_eq!(
+                frame.cell(column, 0).glyph,
+                "─",
+                "the top rule runs unbroken to its corner"
+            );
+        }
+        for row in 1..3 {
+            let interior: String = (layout.panel_left + 1..right)
+                .map(|column| frame.cell(column, row).glyph.clone())
+                .collect();
+            assert!(
+                interior.trim().is_empty(),
+                "the panel interior stays blank, found {interior:?}"
+            );
+        }
     }
 
     /// Repainting a single animated row must restore that row's border cells, or
@@ -8977,7 +8944,9 @@ mod tests {
 
         assert_eq!(row.cell(layout.panel_left, 0).style.background, None);
         assert_eq!(row.cell(layout.panel_left, 0).glyph, "│");
-        assert_eq!(row.cell(layout.content_left(), 0).glyph, "S");
+        let right = layout.panel_left + layout.panel_width - 1;
+        assert_eq!(row.cell(right, 0).glyph, "│");
+        assert_eq!(row.cell(layout.content_left(), 0).glyph, " ");
     }
 
     #[test]
