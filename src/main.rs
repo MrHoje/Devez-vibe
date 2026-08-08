@@ -2929,11 +2929,20 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "진행 안내, 조사 중 알림, 도구 호출 전후 text, 최종 답변을 포함하며 영어 문장은 예외 없이 금지한다. ",
     "영어는 코드, 명령어, 경로, 제품명 등 기술 식별자와 사용자가 그대로 인용한 문자열에만 허용한다. ",
     "문장을 출력하기 직전에 한국어가 아닌 자연어 문장이 없는지 확인하고, 있으면 자연스러운 한국어로 바꾼다.\n",
-    "최우선 영어 라벨 금지 규칙: 사용자에게 보이는 모든 문장은 첫 글자부터 한국어여야 한다. ",
-    "`Now`, `Let me`, `I'll`, `Next`, `First`, `Okay`, `Alright`, `Fine`처럼 영어 낱말로 문장을 시작하지 않는다. ",
-    "이는 도구 호출 앞에 붙이는 한 줄짜리 진행 라벨에도 똑같이 적용되며, ",
-    "`Now paint_screen과 애니메이션 경로에 패널을 그립니다.`처럼 영어 낱말 뒤에 한국어를 이어 붙이는 형태가 가장 흔한 위반이다. ",
-    "이런 문장은 영어 낱말을 지우고 한국어만 남긴다. 예: `Now 토글 함수를 넣습니다.` → `토글 함수를 넣습니다.`\n",
+    "최우선 영어 문장 금지 규칙: 사용자에게 보이는 text는 한 글자도 빠짐없이 한국어 문장으로만 이루어진다. ",
+    "기술 식별자를 뺀 모든 낱말이 한국어여야 하며, 영어 낱말 하나로 이루어진 문장 조각도 허용하지 않는다. ",
+    "이 규칙은 최종 답변뿐 아니라 도구 호출 앞뒤에 붙이는 한 줄짜리 진행 라벨과 중간 보고에 똑같이 적용된다. ",
+    "특히 다음 두 가지가 반복해서 새는 위반이므로 출력 전에 반드시 걸러낸다. ",
+    "첫째, 영어 낱말로 문장을 시작한 뒤 한국어를 이어 붙이는 형태다. ",
+    "`Now`, `Next`, `First`, `Then`, `Let me`, `I'll`, `Okay`, `Alright`, `Fine`, `Alt`가 이 자리에 오면 지우고 한국어만 남긴다. ",
+    "예: `Now 토글 함수를 넣습니다.` → `토글 함수를 넣습니다.` ",
+    "둘째, 도구 결과를 확인한 소감이나 판정을 영어 한 문장으로 적고 그 뒤에 한국어 문장을 붙이는 형태다. ",
+    "`Confirmed ... works.`, `Good, that closes correctly.`, `Perfect.`, `Great.`, `Done.`, `That works.`처럼 쓰지 않는다. ",
+    "예: `Confirmed tone_rgb(Tone::Border) works. 이제 다시 그립니다.` → `tone_rgb(Tone::Border)가 동작하는 것을 확인했습니다. 이제 다시 그립니다.` ",
+    "확인 결과는 `확인했습니다.`, `예상대로 동작합니다.`, `문제없습니다.`처럼 한국어로 적는다. ",
+    "한 문장이나 한 문단 안에서 영어 절과 한국어 절을 섞지 않는다. ",
+    "text를 출력하기 직전에 그 text의 모든 문장을 훑어 첫 낱말과 나머지 낱말이 한국어인지 확인하고, ",
+    "기술 식별자가 아닌 영어가 하나라도 있으면 한국어로 바꾼 뒤에 출력한다.\n",
     "최우선 시작 응답 규칙: 단순 질문이 아닌 작업에서는 첫 응답 content block을 반드시 사용자에게 보이는 짧은 진행 안내 text로 출력한다. ",
     "TaskCreate를 포함한 어떤 tool_use도 이 text보다 먼저 출력하지 않는다. 같은 assistant message에 text와 tool_use를 함께 출력할 때도 text를 앞에 둔다. ",
     "진행 안내에는 요청에서 무엇을 먼저 확인하고 이어서 무엇을 할지 사용자의 언어로 한두 문장만 적는다. ",
@@ -5034,9 +5043,11 @@ mod tests {
         }
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`Now ...` 같은 독립된 영어 진행 문장"));
         // The ban only held when it moved above the format rules and named the
-        // English-word-then-Korean shape that actually leaked.
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("최우선 영어 라벨 금지 규칙"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("영어 낱말 뒤에 한국어를 이어 붙이는"));
+        // two shapes that actually leaked: an English label glued in front of a
+        // Korean sentence, and an English verdict on a tool result.
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("최우선 영어 문장 금지 규칙"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("영어 낱말로 문장을 시작한 뒤 한국어를 이어 붙이는"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`Good, that closes correctly.`"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("첫 도구 호출 전에"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("파일 경로, 코드 블록"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("도구를 두 번 이상 호출할 작업"));
