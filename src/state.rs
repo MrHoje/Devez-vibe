@@ -5068,8 +5068,15 @@ impl AppState {
                     diff,
                 }
             }
-            // Shift+Space folds the plan panel on every runtime. The terminal still
-            // reports a space, so the composer must not also type one.
+            // Alt+P folds the plan panel. Shift+Space is kept as the historical
+            // chord, but a Korean IME claims it as its own language toggle, so it
+            // never reaches us on those systems — Alt+P is the one that always does.
+            KeyCode::Char('p') | KeyCode::Char('P') if alt && !ctrl => {
+                self.toggle_plan_summary();
+                Action::Tick(true)
+            }
+            // The terminal still reports a space for Shift+Space, so the composer
+            // must not also type one.
             KeyCode::Char(' ') if shift && !ctrl && !alt => {
                 self.toggle_plan_summary();
                 Action::Tick(true)

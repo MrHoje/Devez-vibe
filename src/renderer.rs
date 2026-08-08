@@ -5483,8 +5483,9 @@ fn plan_lines(block: &Block, width: u16) -> Vec<PaintLine> {
 }
 
 /// The key that folds the plan panel, on every runtime. Shift+Tab belongs to
-/// Claude's permission modes, so the panel names the one key that always works.
-const PLAN_TOGGLE_HINT: &str = " Shift + Space ";
+/// Claude's permission modes, and a Korean IME eats Shift+Space, so the panel
+/// names the one key that always works.
+const PLAN_TOGGLE_HINT: &str = " Alt + P ";
 
 /// Reasoning summaries use a narrow `∴` gutter and a single dim italic
 /// paragraph. Plan blocks keep their heading and one physical row per step.
@@ -14553,7 +14554,7 @@ mod tests {
         assert_eq!(lines.len(), 12);
         assert!(painted(&lines[0]).starts_with("┌── 작업 단계 · 0 / 7 완료"));
         assert!(painted(&lines[0]).ends_with('┐'));
-        assert!(lines[0].tail.iter().any(|span| span.text == " Shift + Space "));
+        assert!(lines[0].tail.iter().any(|span| span.text == " Alt + P "));
         assert!(lines[0].tail.iter().any(|span| span.tone == Tone::FastOff));
         assert!(lines[1].text.is_empty());
         assert!(painted(&lines[8]).contains("     Task 7"));
@@ -14576,7 +14577,7 @@ mod tests {
 
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None);
 
-        assert!(painted(&lines[0]).ends_with(" Shift + Space ▲ ─┐"));
+        assert!(painted(&lines[0]).ends_with(" Alt + P ▲ ─┐"));
         assert_eq!(UnicodeWidthStr::width(painted(&lines[0]).as_str()), 79);
         assert!(lines[0].tail.iter().any(|span| span.tone == Tone::FastOff));
         assert_eq!(pick_on(&lines[0], "▲"), Some(Pick::PlanSummary));
@@ -14596,7 +14597,7 @@ mod tests {
 
         assert_eq!(lines.len(), 2);
         assert!(painted(&lines[0]).starts_with("─── 작업 단계"));
-        assert!(painted(&lines[0]).trim_end().ends_with("Shift + Space ▼ ──"));
+        assert!(painted(&lines[0]).trim_end().ends_with("Alt + P ▼ ──"));
         assert_eq!(lines[0].tail[0].tone, Tone::FastOff);
         assert!(!painted(&lines[0]).contains(['┌', '┐']));
         assert_eq!(pick_on(&lines[0], "작업 단계"), None);
@@ -14605,7 +14606,7 @@ mod tests {
         assert_eq!(
             Renderer::hover_columns(&lines[0], None, Some(&Pick::PlanSummary))
                 .map(|columns| columns.len()),
-            Some(19)
+            Some(13)
         );
     }
 
