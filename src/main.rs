@@ -2928,6 +2928,11 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "진행 안내, 조사 중 알림, 도구 호출 전후 text, 최종 답변을 포함하며 영어 문장은 예외 없이 금지한다. ",
     "영어는 코드, 명령어, 경로, 제품명 등 기술 식별자와 사용자가 그대로 인용한 문자열에만 허용한다. ",
     "문장을 출력하기 직전에 한국어가 아닌 자연어 문장이 없는지 확인하고, 있으면 자연스러운 한국어로 바꾼다.\n",
+    "최우선 영어 라벨 금지 규칙: 사용자에게 보이는 모든 문장은 첫 글자부터 한국어여야 한다. ",
+    "`Now`, `Let me`, `I'll`, `Next`, `First`, `Okay`, `Alright`, `Fine`처럼 영어 낱말로 문장을 시작하지 않는다. ",
+    "이는 도구 호출 앞에 붙이는 한 줄짜리 진행 라벨에도 똑같이 적용되며, ",
+    "`Now paint_screen과 애니메이션 경로에 패널을 그립니다.`처럼 영어 낱말 뒤에 한국어를 이어 붙이는 형태가 가장 흔한 위반이다. ",
+    "이런 문장은 영어 낱말을 지우고 한국어만 남긴다. 예: `Now 토글 함수를 넣습니다.` → `토글 함수를 넣습니다.`\n",
     "최우선 시작 응답 규칙: 단순 질문이 아닌 작업에서는 첫 응답 content block을 반드시 사용자에게 보이는 짧은 진행 안내 text로 출력한다. ",
     "TaskCreate를 포함한 어떤 tool_use도 이 text보다 먼저 출력하지 않는다. 같은 assistant message에 text와 tool_use를 함께 출력할 때도 text를 앞에 둔다. ",
     "진행 안내에는 요청에서 무엇을 먼저 확인하고 이어서 무엇을 할지 사용자의 언어로 한두 문장만 적는다. ",
@@ -4966,6 +4971,10 @@ mod tests {
             assert!(rules.contains("`다음 부분을 이어서 확인하겠습니다.`"));
         }
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`Now ...` 같은 독립된 영어 진행 문장"));
+        // The ban only held when it moved above the format rules and named the
+        // English-word-then-Korean shape that actually leaked.
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("최우선 영어 라벨 금지 규칙"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("영어 낱말 뒤에 한국어를 이어 붙이는"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("첫 도구 호출 전에"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("파일 경로, 코드 블록"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("도구를 두 번 이상 호출할 작업"));
