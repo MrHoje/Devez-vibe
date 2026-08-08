@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use crossterm::{
     event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     terminal,
@@ -29,8 +30,8 @@ use crate::{
         AnimationView, Block, BlockKind, ComposerMode, EffortSlider, HIDDEN_STATUS_LINE,
         LiveBlockView, ModeAccent, OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS,
         PermissionBadge, PermissionTone, PlanStep, PlanStepStatus, PlanSummary,
-        ProviderHandoffBlock, StatusLineView, SubagentView, SuggestionView, VibeTone, View,
-        WelcomeView, visible_window,
+        ProviderHandoffBlock, SIDE_PANEL_WIDTHS, StatusLineView, SubagentView, SuggestionView,
+        VibeTone, View, WelcomeView, visible_window,
     },
     rollout::{PlanSnapshot, Rollout, RolloutEvent, RolloutKind},
     theme::{self, ThemeKind},
@@ -123,6 +124,61 @@ pub enum DiffDisplayMode {
     Expand,
 }
 
+/// Alt+P steps the docked side panel through three widths before it closes
+/// again, rather than a plain on/off toggle — one press to open at the
+/// narrowest width, repeat presses to widen, one more to close.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SidePanelStage {
+    #[default]
+    Closed,
+    Small,
+    Medium,
+    Large,
+}
+
+impl SidePanelStage {
+    fn width(self) -> Option<usize> {
+        match self {
+            Self::Closed => None,
+            Self::Small => Some(SIDE_PANEL_WIDTHS[0]),
+            Self::Medium => Some(SIDE_PANEL_WIDTHS[1]),
+            Self::Large => Some(SIDE_PANEL_WIDTHS[2]),
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Closed => Self::Small,
+            Self::Small => Self::Medium,
+            Self::Medium => Self::Large,
+            Self::Large => Self::Closed,
+        }
+    }
+
+    fn from_config_value(value: &str) -> Self {
+        match value
+            .trim()
+            .trim_matches(['"', '\''])
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "small" => Self::Small,
+            "medium" => Self::Medium,
+            "large" => Self::Large,
+            _ => Self::Closed,
+        }
+    }
+
+    pub const fn config_value(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Large => "large",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum StatusLineField {
     Model,
@@ -170,7 +226,13 @@ macro_rules! choice_notice {
 }
 
 impl VibeMode {
-    pub const fn config_value(self) -> &'static str { match self { Self::Vibe => "vibe", Self::SuperVibe => "super_vibe", Self::Normal => "normal" } }
+    pub const fn config_value(self) -> &'static str {
+        match self {
+            Self::Vibe => "vibe",
+            Self::SuperVibe => "super_vibe",
+            Self::Normal => "normal",
+        }
+    }
     pub const fn label(self) -> &'static str {
         match self {
             Self::Vibe => "Vibe: On",
@@ -379,7 +441,6 @@ impl PermissionMode {
             Self::FullAccess => ModeAccent::Danger,
         }
     }
-
 }
 
 impl ClaudePermissionMode {
@@ -453,6 +514,9 @@ pub(crate) const CODEX_PROVIDER_KEY: &str = "codex_provider_enabled";
 /// Shift+Tab and a badge click both write it, so the next session — new or
 /// resumed — opens under the mode the user left behind.
 pub(crate) const CLAUDE_PERMISSION_MODE_KEY: &str = "claude_permission_mode";
+
+/// Vibe settings key holding the docked side panel's width stage.
+pub(crate) const SIDE_PANEL_STAGE_KEY: &str = "side_panel_stage";
 
 struct SlashCommand {
     name: &'static str,
@@ -588,7 +652,7 @@ const SLASH_COMMANDS: [SlashCommand; 30] = [
     },
     SlashCommand {
         name: "/side-panel",
-        description: "Show or hide the docked side panel",
+        description: "Cycle the docked side panel's width, then close it",
         takes_argument: false,
     },
     SlashCommand {
@@ -700,7 +764,8 @@ impl AccountPlan {
             .or_else(|| account.and_then(|account| account.get("subscriptionType")))
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty());
-        let window = |name: &str| usage.and_then(|usage| usage.pointer(&format!("/rate_limits/{name}")));
+        let window =
+            |name: &str| usage.and_then(|usage| usage.pointer(&format!("/rate_limits/{name}")));
         let percent = |value: Option<&Value>| {
             value
                 .and_then(|value| value.get("utilization"))
@@ -711,7 +776,9 @@ impl AccountPlan {
         let seven_day = window("seven_day");
         let mut usage_lines = Vec::new();
         for (label, value) in [("5h", five_hour), ("7d", seven_day)] {
-            let Some(percent) = percent(value) else { continue };
+            let Some(percent) = percent(value) else {
+                continue;
+            };
             let reset = value
                 .and_then(|value| value.get("resets_at"))
                 .and_then(Value::as_str)
@@ -801,7 +868,12 @@ fn remaining_label(reset_at: Option<u64>, now: u64) -> Option<String> {
 
 fn compact_reset_time(value: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(value)
-        .map(|instant| instant.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string())
+        .map(|instant| {
+            instant
+                .with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
         .unwrap_or_else(|_| value.to_owned())
 }
 
@@ -1082,6 +1154,8 @@ pub enum Action {
     /// Save the transcript's Shell display preference for future sessions.
     PersistShellDisplayMode(ShellDisplayMode),
     PersistDiffDisplayMode(DiffDisplayMode),
+    /// Save the docked side panel's width stage for future sessions.
+    PersistSidePanelStage(SidePanelStage),
     PersistVibeDisplayModes {
         vibe: VibeMode,
         response: ResponseLength,
@@ -2472,10 +2546,16 @@ fn resume_picker_rows(height: u16) -> usize {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ConversationView { #[default] List, Chat }
+pub enum ConversationView {
+    #[default]
+    List,
+    Chat,
+}
 
 impl ConversationView {
-    pub const fn is_chat(self) -> bool { matches!(self, Self::Chat) }
+    pub const fn is_chat(self) -> bool {
+        matches!(self, Self::Chat)
+    }
 }
 
 fn visible_resume_picker_rows() -> usize {
@@ -2894,8 +2974,9 @@ pub struct AppState {
     conversation_view: ConversationView,
     shell_display_mode: ShellDisplayMode,
     diff_display_mode: DiffDisplayMode,
-    /// Whether the docked right-hand side panel is showing. Session-only.
-    side_panel_open: bool,
+    /// The docked right-hand side panel's width stage. Persisted across
+    /// sessions so a panel left open reopens the same way next time.
+    side_panel_stage: SidePanelStage,
     status_line_settings: StatusLineSettings,
     /// Which runtimes this machine may connect to. Both start off — a fresh
     /// install picks in `/provider` — and nothing dials a runtime that is off.
@@ -3067,7 +3148,7 @@ impl AppState {
             response_length,
             shell_display_mode,
             diff_display_mode,
-            side_panel_open: false,
+            side_panel_stage: read_side_panel_stage(),
             status_line_settings: read_status_line_settings(),
             claude_provider_enabled: claude_provider_enabled(),
             codex_provider_enabled: codex_provider_enabled(),
@@ -3334,7 +3415,10 @@ impl AppState {
         if self.selected_provider() != ModelProvider::Codex {
             return false;
         }
-        if self.provider_model_indices(ModelProvider::Claude).is_empty() {
+        if self
+            .provider_model_indices(ModelProvider::Claude)
+            .is_empty()
+        {
             self.push_notice(
                 BlockKind::Error,
                 "Codex 사용 불가",
@@ -3468,14 +3552,18 @@ impl AppState {
             matches!(
                 (pending, &action),
                 (Action::SetFast(_), Action::SetFast(_))
-                    | (Action::SetClaudePermissionMode(_), Action::SetClaudePermissionMode(_))
+                    | (
+                        Action::SetClaudePermissionMode(_),
+                        Action::SetClaudePermissionMode(_)
+                    )
                     | (
                         Action::PersistVibeDisplayModes { .. },
                         Action::PersistVibeDisplayModes { .. }
                     )
             )
         };
-        self.deferred_startup_actions.retain(|pending| !same_setting(pending));
+        self.deferred_startup_actions
+            .retain(|pending| !same_setting(pending));
         self.deferred_startup_actions.push(action);
     }
 
@@ -3602,9 +3690,8 @@ impl AppState {
             return None;
         };
         let question = questions.get(*current)?;
-        user_input_text_focused(question, *selected).then(|| {
-            format!("{}\u{1f}{current}\u{1f}{}", id, question.id)
-        })
+        user_input_text_focused(question, *selected)
+            .then(|| format!("{}\u{1f}{current}\u{1f}{}", id, question.id))
     }
 
     /// Free-text question answers need the same short input delay as the main
@@ -4062,7 +4149,11 @@ impl AppState {
         // Ctrl+C spent on a copy is not a quit attempt, so it cannot leave the
         // quit armed behind for the next Ctrl+C to trip over.
         self.disarm_quit();
-        self.activity_notice = Some(("• Copied to clipboard".to_owned(), Instant::now(), NOTICE_TTL));
+        self.activity_notice = Some((
+            "• Copied to clipboard".to_owned(),
+            Instant::now(),
+            NOTICE_TTL,
+        ));
     }
 
     /// Arms the quit and puts up the warning that spends the same window.
@@ -4122,11 +4213,7 @@ impl AppState {
     /// Restores the safe-return marker when resuming the parent fails. The side
     /// thread stays current, and Esc/Ctrl+C must remain unable to reach the
     /// ordinary interrupt/quit branches on the retry.
-    pub fn restore_side_parent(
-        &mut self,
-        thread_id: String,
-        turn: Option<(String, Instant)>,
-    ) {
+    pub fn restore_side_parent(&mut self, thread_id: String, turn: Option<(String, Instant)>) {
         self.side_parent = Some(SideParent {
             thread_id,
             turn: turn.map(|(id, started_at)| ParentTurn { id, started_at }),
@@ -4165,8 +4252,11 @@ impl AppState {
 
     pub fn begin_side_prompt(&mut self, text: String) {
         self.commit_welcome_card();
-        self.committed
-            .push(Block::new(BlockKind::User, self.selected_model_name(), text));
+        self.committed.push(Block::new(
+            BlockKind::User,
+            self.selected_model_name(),
+            text,
+        ));
         self.reset_turn_item_tracking();
         self.busy = true;
     }
@@ -4665,6 +4755,7 @@ impl AppState {
             activity: self.activity(),
             activity_model: self.activity_model(),
             activity_phase: self.activity_phase(),
+            activity_progress_phase: self.compaction_progress_phase(),
             footer: self
                 .status_line_has_content()
                 .then(String::new)
@@ -4678,7 +4769,7 @@ impl AppState {
             chat_layout: self.conversation_view.is_chat(),
             shell_display_mode: self.shell_display_mode(),
             diff_display_mode: self.diff_display_mode(),
-            side_panel_open: self.side_panel_open,
+            side_panel_width: self.side_panel_stage.width(),
         }
     }
 
@@ -4779,6 +4870,7 @@ impl AppState {
             activity: self.activity(),
             activity_model: self.activity_model(),
             activity_phase: self.activity_phase(),
+            activity_progress_phase: self.compaction_progress_phase(),
             plan_summary: self.plan_summary.as_ref(),
             plan_active: self.busy,
             plan_shimmer_phase: self.plan_shimmer_phase(),
@@ -4926,9 +5018,7 @@ impl AppState {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
-        if !(key.code == KeyCode::Char('c')
-            && key.modifiers.contains(KeyModifiers::CONTROL))
-        {
+        if !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
             self.disarm_quit();
         }
         let old_text = self.editor.text();
@@ -4958,8 +5048,7 @@ impl AppState {
         // of repeat records while dismantling a composed syllable. A word
         // delete must stay one atomic editor operation.
         if matches!(key.kind, KeyEventKind::Repeat)
-            && ((key.code == KeyCode::Backspace
-                && key.modifiers.contains(KeyModifiers::CONTROL))
+            && ((key.code == KeyCode::Backspace && key.modifiers.contains(KeyModifiers::CONTROL))
                 || key.code == KeyCode::Char('\u{8}'))
         {
             return Action::None;
@@ -5143,19 +5232,19 @@ impl AppState {
                     diff,
                 }
             }
-            // Alt+P folds the plan panel. Shift+Space is kept as the historical
+            // Alt+W folds the plan panel. Shift+Space is kept as the historical
             // chord, but a Korean IME claims it as its own language toggle, so it
-            // never reaches us on those systems — Alt+P is the one that always does.
-            KeyCode::Char('p') | KeyCode::Char('P') if alt && !ctrl => {
+            // never reaches us on those systems — Alt+W is the one that always does.
+            KeyCode::Char('w') | KeyCode::Char('W') if alt && !ctrl => {
                 self.toggle_plan_summary();
                 Action::Tick(true)
             }
-            // Alt+S opens and closes the docked side panel. A bare capital would
-            // be swallowed by the composer's typed-text buffer, so the chord
-            // carries Alt to reach this branch at all.
-            KeyCode::Char('s') | KeyCode::Char('S') if alt && !ctrl => {
-                self.toggle_side_panel();
-                Action::Tick(true)
+            // Alt+P steps the docked side panel through its widths and closes
+            // it again on the fourth press. A bare capital would be swallowed
+            // by the composer's typed-text buffer, so the chord carries Alt to
+            // reach this branch at all.
+            KeyCode::Char('p') | KeyCode::Char('P') if alt && !ctrl => {
+                Action::PersistSidePanelStage(self.cycle_side_panel())
             }
             // The terminal still reports a space for Shift+Space, so the composer
             // must not also type one.
@@ -5686,19 +5775,16 @@ impl AppState {
                             Some("inProgress") => PlanStepStatus::InProgress,
                             _ => PlanStepStatus::Pending,
                         };
-                        let previous = self
-                            .plan_summary
-                            .as_ref()
-                            .and_then(|summary| {
-                                summary.steps.iter().find(|previous| {
-                                    previous.text == text
-                                })
-                            });
+                        let previous = self.plan_summary.as_ref().and_then(|summary| {
+                            summary.steps.iter().find(|previous| previous.text == text)
+                        });
                         let started_at = match status {
                             PlanStepStatus::InProgress => previous
                                 .and_then(|previous| previous.started_at)
                                 .or_else(|| Some(Instant::now())),
-                            PlanStepStatus::Completed => previous.and_then(|previous| previous.started_at),
+                            PlanStepStatus::Completed => {
+                                previous.and_then(|previous| previous.started_at)
+                            }
                             PlanStepStatus::Pending => None,
                         };
                         let elapsed = if status == PlanStepStatus::Completed {
@@ -5727,7 +5813,9 @@ impl AppState {
                     .as_ref()
                     .map_or(true, |summary| summary.expanded);
                 let elapsed = if !steps.is_empty()
-                    && steps.iter().all(|step| step.status == PlanStepStatus::Completed)
+                    && steps
+                        .iter()
+                        .all(|step| step.status == PlanStepStatus::Completed)
                 {
                     self.plan_summary
                         .as_ref()
@@ -5754,10 +5842,7 @@ impl AppState {
                     .flatten()
                     .filter_map(|entry| {
                         let id = entry.get("id").and_then(Value::as_str)?;
-                        let previous = self
-                            .subagents
-                            .iter()
-                            .find(|running| running.id == id);
+                        let previous = self.subagents.iter().find(|running| running.id == id);
                         let started_at = previous
                             .map(|running| running.started_at)
                             .unwrap_or_else(Instant::now);
@@ -6058,8 +6143,11 @@ impl AppState {
             return Action::None;
         }
         self.commit_welcome_card();
-        self.committed
-            .push(Block::new(BlockKind::User, self.selected_model_name(), display));
+        self.committed.push(Block::new(
+            BlockKind::User,
+            self.selected_model_name(),
+            display,
+        ));
         if self.busy {
             Action::Steer(text)
         } else {
@@ -6098,7 +6186,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/provider [claude|codex]  Claude·Codex provider 전환과 연결 사용/미사용\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 열기/닫기\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n{login_help}\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nShift+Space  작업 단계 접기/펴기\nAlt+S  우측 사이드패널 열기/닫기\nShift+Tab  Claude 권한 모드 전환"),
+                    format!("/provider [claude|codex]  Claude·Codex provider 전환과 연결 사용/미사용\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기 전환(닫힘→24→36→48)\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n{login_help}\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
                 ));
                 Action::None
             }
@@ -6106,20 +6194,18 @@ impl AppState {
                 self.open_runtime_picker();
                 Action::None
             }
-            "/provider" if parts.len() == 2 => {
-                match parts[1].to_ascii_lowercase().as_str() {
-                    "claude" => self.apply_runtime_choice(0),
-                    "codex" => self.apply_runtime_choice(1),
-                    _ => {
-                        self.committed.push(Block::new(
-                            BlockKind::Error,
-                            "Usage",
-                            "/provider [claude|codex]",
-                        ));
-                        Action::None
-                    }
+            "/provider" if parts.len() == 2 => match parts[1].to_ascii_lowercase().as_str() {
+                "claude" => self.apply_runtime_choice(0),
+                "codex" => self.apply_runtime_choice(1),
+                _ => {
+                    self.committed.push(Block::new(
+                        BlockKind::Error,
+                        "Usage",
+                        "/provider [claude|codex]",
+                    ));
+                    Action::None
                 }
-            }
+            },
             "/provider" => {
                 self.committed.push(Block::new(
                     BlockKind::Error,
@@ -6263,7 +6349,8 @@ impl AppState {
                 Action::None
             }
             "/vibemode" => {
-                self.committed.push(Block::new(BlockKind::Error, "Usage", "/vibemode"));
+                self.committed
+                    .push(Block::new(BlockKind::Error, "Usage", "/vibemode"));
                 Action::None
             }
             "/theme" if parts.len() == 1 => {
@@ -6480,10 +6567,7 @@ impl AppState {
                     .push(Block::new(BlockKind::Error, "Usage", "/statusline"));
                 Action::None
             }
-            "/side-panel" => {
-                self.toggle_side_panel();
-                Action::Tick(true)
-            }
+            "/side-panel" => Action::PersistSidePanelStage(self.cycle_side_panel()),
             "/new" if self.busy => {
                 self.committed.push(Block::new(
                     BlockKind::Warning,
@@ -6929,7 +7013,7 @@ impl AppState {
             PendingInteraction::ProviderLoading => {
                 self.pending = Some(PendingInteraction::ProviderLoading);
                 Action::None
-            },
+            }
             PendingInteraction::ProviderPicker(mut picker) => match picker.handle_key(key) {
                 ProviderPickerResult::None => {
                     self.pending = Some(PendingInteraction::ProviderPicker(picker));
@@ -7052,7 +7136,7 @@ impl AppState {
                     instructions,
                 });
                 action
-            },
+            }
             PendingInteraction::Approval {
                 id,
                 title,
@@ -7159,9 +7243,7 @@ impl AppState {
                     // than being swallowed as a character the picker has no use for.
                     let pressed = match key.code {
                         KeyCode::Char(ch) if !ctrl && !alt => match ch.to_digit(10) {
-                            Some(digit)
-                                if digit >= 1 && digit as usize - 1 <= chat_instead =>
-                            {
+                            Some(digit) if digit >= 1 && digit as usize - 1 <= chat_instead => {
                                 selected = digit as usize - 1;
                                 KeyCode::Enter
                             }
@@ -7340,11 +7422,8 @@ impl AppState {
                     .iter()
                     .position(|index| index == model_index)
                     .unwrap_or(0);
-                let window = visible_window(
-                    Some(selected_position),
-                    provider_models.len(),
-                    PICKER_ROWS,
-                );
+                let window =
+                    visible_window(Some(selected_position), provider_models.len(), PICKER_ROWS);
                 let start = window.start;
                 let mut lines = provider_models[window]
                     .iter()
@@ -7363,13 +7442,13 @@ impl AppState {
                     .get(*model_index)
                     .filter(|model| !model.efforts.is_empty())
                     .map(|model| {
-                    lines.push(OverlayLine {
-                        text: String::new(),
-                        selected: false,
-                        muted: true,
+                        lines.push(OverlayLine {
+                            text: String::new(),
+                            selected: false,
+                            muted: true,
+                        });
+                        effort_slider(model, *effort_index)
                     });
-                    effort_slider(model, *effort_index)
-                });
                 let hint = if slider.is_some() {
                     "↑↓ model  ·  ←→ effort  ·  Enter to continue  ·  Esc to cancel"
                 } else {
@@ -7472,8 +7551,7 @@ impl AppState {
                         .collect(),
                     selected: *selected,
                 }),
-                hint: "←→ 이동  ·  Enter 사용  ·  Space 연결 전환  ·  Esc 닫기"
-                    .to_owned(),
+                hint: "←→ 이동  ·  Enter 사용  ·  Space 연결 전환  ·  Esc 닫기".to_owned(),
                 style: OverlayStyle::Picker,
                 input: None,
                 input_label: "",
@@ -8088,9 +8166,7 @@ impl AppState {
         }
         SLASH_COMMANDS
             .iter()
-            .filter(|command| {
-                crate::open_code::PROVIDER_ENABLED || command.name != "/connect"
-            })
+            .filter(|command| crate::open_code::PROVIDER_ENABLED || command.name != "/connect")
             .filter(|command| {
                 !self.selected_model_name().starts_with("claude:") || command.name != "/fast"
             })
@@ -8390,18 +8466,23 @@ impl AppState {
         Some(self.selected_model_name().to_owned())
     }
 
-    /// Activity animation runs from the wall clock rather than counted ticks, so
-    /// its pace stays stable even when frames are delayed.
+    /// Activity text animation runs from the wall clock rather than counted ticks,
+    /// so its pace stays stable even when frames are delayed.
     fn activity_phase(&self) -> f32 {
-        let (started, period) = if let Some(started) = self.compacting_started_at {
-            (started, COMPACTION_ACTIVITY_PERIOD)
-        } else if let Some(started) = self.turn_started_at {
-            (started, SHIMMER_PERIOD)
-        } else {
+        let Some(started) = self.compacting_started_at.or(self.turn_started_at) else {
             return 0.0;
         };
-        let position = started.elapsed().as_millis() % period.as_millis();
-        position as f32 / period.as_millis() as f32
+        let position = started.elapsed().as_millis() % SHIMMER_PERIOD.as_millis();
+        position as f32 / SHIMMER_PERIOD.as_millis() as f32
+    }
+
+    /// The compacting block deliberately moves more slowly than its label.
+    fn compaction_progress_phase(&self) -> f32 {
+        let Some(started) = self.compacting_started_at else {
+            return 0.0;
+        };
+        let position = started.elapsed().as_millis() % COMPACTION_ACTIVITY_PERIOD.as_millis();
+        position as f32 / COMPACTION_ACTIVITY_PERIOD.as_millis() as f32
     }
 
     fn plan_shimmer_phase(&self) -> Option<f32> {
@@ -8643,13 +8724,27 @@ impl AppState {
         self.diff_display_mode
     }
 
-    pub fn toggle_side_panel(&mut self) {
-        self.side_panel_open = !self.side_panel_open;
+    /// Steps the panel to its next width, wrapping closed after the widest.
+    pub fn cycle_side_panel(&mut self) -> SidePanelStage {
+        self.side_panel_stage = self.side_panel_stage.next();
+        self.side_panel_stage
+    }
+
+    /// What the panel's own close mark and Esc-adjacent affordances use: shuts
+    /// the panel outright instead of stepping through it.
+    pub fn close_side_panel(&mut self) -> SidePanelStage {
+        self.side_panel_stage = SidePanelStage::Closed;
+        self.side_panel_stage
     }
 
     #[cfg(test)]
     pub fn side_panel_open(&self) -> bool {
-        self.side_panel_open
+        self.side_panel_stage != SidePanelStage::Closed
+    }
+
+    #[cfg(test)]
+    pub fn side_panel_stage(&self) -> SidePanelStage {
+        self.side_panel_stage
     }
 
     pub fn toggle_plan_summary(&mut self) {
@@ -8699,12 +8794,9 @@ impl AppState {
                     .iter()
                     .position(|index| *index == model_index)
                     .unwrap_or(0);
-                let start = visible_window(
-                    Some(selected_position),
-                    provider_models.len(),
-                    PICKER_ROWS,
-                )
-                .start;
+                let start =
+                    visible_window(Some(selected_position), provider_models.len(), PICKER_ROWS)
+                        .start;
                 let clicked = start + row;
                 if let Some(clicked) = provider_models.get(clicked).copied() {
                     // The digit keys do exactly this: take the model and move on
@@ -8840,12 +8932,10 @@ impl AppState {
                         answers.insert(question.id.clone(), label);
                         next_question_or_reply(id, questions, current, answers, self)
                     }
-                    Some(clicked) if clicked == chat_instead => {
-                        Action::RpcResponse {
-                            id,
-                            result: answers_response(&answers),
-                        }
-                    }
+                    Some(clicked) if clicked == chat_instead => Action::RpcResponse {
+                        id,
+                        result: answers_response(&answers),
+                    },
                     Some(clicked) if clicked == question.options.len() && question.allow_other => {
                         self.pending = Some(PendingInteraction::UserInput {
                             id,
@@ -9515,8 +9605,7 @@ const CHAT_INSTEAD_LABEL: &str = "이 내용으로 대화하기";
 /// Claude Code treats its automatic `Other` row as the editor itself: focus is
 /// the input mode. A question with no choices remains a plain text prompt.
 fn user_input_text_focused(question: &Question, selected: usize) -> bool {
-    question.options.is_empty()
-        || question.allow_other && selected == question.options.len()
+    question.options.is_empty() || question.allow_other && selected == question.options.len()
 }
 
 /// Where the row that leaves the question sits: after the options and after the
@@ -9534,6 +9623,12 @@ fn answers_response(answers: &BTreeMap<String, String>) -> Value {
 }
 
 fn parse_questions(params: &Value) -> Vec<Question> {
+    let decoded = (params.get("encoding").and_then(Value::as_str) == Some("base64-json"))
+        .then(|| params.get("payload").and_then(Value::as_str))
+        .flatten()
+        .and_then(|payload| BASE64.decode(payload).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let params = decoded.as_ref().unwrap_or(params);
     params
         .get("questions")
         .and_then(Value::as_array)
@@ -10779,6 +10874,14 @@ fn read_shell_display_mode() -> ShellDisplayMode {
         .unwrap_or_default()
 }
 
+/// The panel's width stage the last session left it on, so one left open
+/// reopens at the same width instead of always starting closed.
+fn read_side_panel_stage() -> SidePanelStage {
+    read_vibe_config_value(SIDE_PANEL_STAGE_KEY)
+        .map(|value| SidePanelStage::from_config_value(&value))
+        .unwrap_or_default()
+}
+
 #[allow(dead_code)]
 fn read_diff_display_mode() -> DiffDisplayMode {
     read_vibe_config_value("diff_display_mode")
@@ -10805,8 +10908,8 @@ fn provider_connected(key: &str) -> bool {
 fn read_status_line_settings() -> StatusLineSettings {
     let mut settings = StatusLineSettings::default();
     for field in StatusLineField::ALL {
-        if let Some(enabled) = read_vibe_config_value(field.config_key())
-            .and_then(|value| value.parse::<bool>().ok())
+        if let Some(enabled) =
+            read_vibe_config_value(field.config_key()).and_then(|value| value.parse::<bool>().ok())
         {
             settings.0[field.index()] = enabled;
         }
@@ -10817,8 +10920,7 @@ fn read_status_line_settings() -> StatusLineSettings {
 fn config_value(config: &str, key: &str) -> Option<String> {
     config.lines().find_map(|line| {
         let (found, value) = line.split('#').next()?.split_once('=')?;
-        (found.trim() == key)
-            .then(|| value.trim().trim_matches(['\"', '\'']).to_ascii_lowercase())
+        (found.trim() == key).then(|| value.trim().trim_matches(['\"', '\'']).to_ascii_lowercase())
     })
 }
 
@@ -10850,7 +10952,10 @@ pub(crate) fn write_vibe_config_value(key: &str, value: &str) -> std::io::Result
 }
 
 fn upsert_vibe_config_value(existing: &str, key: &str, value: &str) -> String {
-    let replacement = format!("{key} = {}", serde_json::to_string(value).unwrap_or_default());
+    let replacement = format!(
+        "{key} = {}",
+        serde_json::to_string(value).unwrap_or_default()
+    );
     let mut found = false;
     let mut lines = existing
         .lines()
@@ -10955,6 +11060,33 @@ fn parse_fast_mode(config: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn encoded_questions_preserve_backslashes_and_korean_text() {
+        let payload = BASE64.encode(
+            json!({
+                "questions": [{
+                    "id": "q0",
+                    "header": "정리 범위",
+                    "question": "경로 C:\\\\temp와 \\u{ac00}를 유지할까요?",
+                    "options": [{ "label": "유지", "description": "그대로 둡니다." }],
+                    "isOther": true
+                }]
+            })
+            .to_string(),
+        );
+        let questions = parse_questions(&json!({
+            "encoding": "base64-json",
+            "payload": payload
+        }));
+
+        assert_eq!(questions.len(), 1);
+        assert_eq!(
+            questions[0].question,
+            "경로 C:\\\\temp와 \\u{ac00}를 유지할까요?"
+        );
+        assert_eq!(questions[0].options[0].label, "유지");
+    }
+
     /// The old summary said only `± <absolute path>  +17 -8`; a reviewer needs the
     /// patch itself, so the block now carries the hunks and drops git's framing.
     #[test]
@@ -10980,6 +11112,44 @@ mod tests {
         let diff = "--- a/notes.md\n+++ b/notes.md\n@@ -1,2 +1,1 @@\n title\n---\n";
         assert_eq!(diff_rows(diff), ["@@ -1,2 +1,1 @@", " title", "---"]);
         assert_eq!(diff_stats(diff), (0, 1));
+    }
+
+    /// The stage cycles closed → small → medium → large → closed, and its saved
+    /// config value must round-trip through the same parser a restored session
+    /// reads it back with — otherwise a saved "large" would reopen closed.
+    #[test]
+    fn side_panel_stage_cycles_and_round_trips_its_config_value() {
+        let mut stage = SidePanelStage::Closed;
+        let mut widths = Vec::new();
+        for _ in 0..4 {
+            stage = stage.next();
+            widths.push(stage.width());
+        }
+        assert_eq!(
+            widths,
+            vec![
+                Some(SIDE_PANEL_WIDTHS[0]),
+                Some(SIDE_PANEL_WIDTHS[1]),
+                Some(SIDE_PANEL_WIDTHS[2]),
+                None,
+            ]
+        );
+
+        for stage in [
+            SidePanelStage::Closed,
+            SidePanelStage::Small,
+            SidePanelStage::Medium,
+            SidePanelStage::Large,
+        ] {
+            assert_eq!(
+                SidePanelStage::from_config_value(stage.config_value()),
+                stage
+            );
+        }
+        assert_eq!(
+            SidePanelStage::from_config_value("garbage"),
+            SidePanelStage::Closed
+        );
     }
 
     #[test]
@@ -11053,7 +11223,10 @@ mod tests {
         // The answer is typed among the options, so they stay on screen and the
         // row being typed on is the one marked.
         assert!(
-            overlay.lines.iter().any(|line| line.text.starts_with("첫째")),
+            overlay
+                .lines
+                .iter()
+                .any(|line| line.text.starts_with("첫째")),
             "the options left the screen while the answer was typed"
         );
         assert_eq!(
@@ -11101,7 +11274,12 @@ mod tests {
         state.handle_key(KeyEvent::new(KeyCode::Char('가'), KeyModifiers::NONE));
         let overlay = state.overlay_view().expect("overlay");
         assert!(overlay.input.is_none(), "a normal option became an editor");
-        assert!(overlay.lines.iter().any(|line| line.text == OTHER_ANSWER_LABEL));
+        assert!(
+            overlay
+                .lines
+                .iter()
+                .any(|line| line.text == OTHER_ANSWER_LABEL)
+        );
 
         state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -11300,10 +11478,16 @@ mod tests {
         state.busy = true;
         state.begin_server_request(json!(1), "item/tool/requestUserInput", &question);
 
-        assert!(state.render_tick().redraw, "the running turn normally animates");
+        assert!(
+            state.render_tick().redraw,
+            "the running turn normally animates"
+        );
         state.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
         let composing = state.render_tick();
-        assert!(!composing.redraw, "a tick would erase the terminal's IME preedit");
+        assert!(
+            !composing.redraw,
+            "a tick would erase the terminal's IME preedit"
+        );
         assert!(!composing.animation_only);
 
         state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
@@ -11390,7 +11574,11 @@ mod tests {
         // The welcome card would otherwise ride along at the head of the drain.
         state.show_welcome = false;
         let replayed = vec![
-            Block::new(BlockKind::Reasoning, "Plan", "1. 빌드 복구 후 테스트 재실행"),
+            Block::new(
+                BlockKind::Reasoning,
+                "Plan",
+                "1. 빌드 복구 후 테스트 재실행",
+            ),
             Block::new(BlockKind::Plan, "작업 단계", "2. 지침 검증"),
             Block::new(BlockKind::Assistant, "Codex", "본문은 남는다"),
         ];
@@ -11724,8 +11912,7 @@ mod tests {
 
         assert!(state.drain_committed().is_empty());
 
-        state
-            .ensure_active("dynamic-tool", BlockKind::Tool, "Tool · lookup");
+        state.ensure_active("dynamic-tool", BlockKind::Tool, "Tool · lookup");
         state.ensure_active("agent-tool", BlockKind::Tool, "Agent");
         assert!(state.view().live_blocks.is_empty());
 
@@ -12029,7 +12216,13 @@ mod tests {
                 .count(),
             0
         );
-        assert_eq!(state.plan_summary.as_ref().map(|summary| summary.steps.len()), Some(1));
+        assert_eq!(
+            state
+                .plan_summary
+                .as_ref()
+                .map(|summary| summary.steps.len()),
+            Some(1)
+        );
         assert_eq!(
             state
                 .committed
@@ -12290,7 +12483,11 @@ mod tests {
             .iter()
             .filter(|block| block.title.starts_with("Shell ·"))
             .count();
-        let thinking = state.committed.iter().filter(|block| is_thinking(block)).count();
+        let thinking = state
+            .committed
+            .iter()
+            .filter(|block| is_thinking(block))
+            .count();
         assert_eq!(shells, 1);
         assert_eq!(thinking, 1);
     }
@@ -12393,10 +12590,7 @@ mod tests {
 
         assert_eq!(state.view().subagents.len(), 1);
 
-        state.handle_notification(
-            "turn/subagents/updated",
-            &json!({ "subagents": [] }),
-        );
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
 
         assert!(state.view().subagents.is_empty());
     }
@@ -12453,12 +12647,20 @@ mod tests {
             "turn/subagent/line",
             &subagent_line_notification("tool", "Grep(fn login)"),
         );
-        state.handle_notification("turn/subagent/line", &subagent_line_notification("result", "3 matches"));
-        state.handle_notification("turn/subagent/line", &subagent_line_notification("text", "   "));
+        state.handle_notification(
+            "turn/subagent/line",
+            &subagent_line_notification("result", "3 matches"),
+        );
+        state.handle_notification(
+            "turn/subagent/line",
+            &subagent_line_notification("text", "   "),
+        );
 
         let log = &state.subagent_logs["toolu_1"];
         assert_eq!(
-            log.iter().map(|line| line.text.as_str()).collect::<Vec<_>>(),
+            log.iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
             ["auth 코드를 찾는 중", "⏺ Grep(fn login)", "  ⎿ 3 matches"],
             "a blank line carries nothing and is left out"
         );
@@ -12471,14 +12673,21 @@ mod tests {
     #[test]
     fn clicking_a_subagent_row_opens_its_transcript_and_esc_returns_to_main() {
         let mut state = state_with_a_running_subagent();
-        state.handle_notification("turn/subagent/line", &subagent_line_notification("text", "찾는 중"));
+        state.handle_notification(
+            "turn/subagent/line",
+            &subagent_line_notification("text", "찾는 중"),
+        );
 
         state.open_subagent(0);
         let overlay = state.overlay_view().expect("subagent panel");
 
         assert_eq!(overlay.title, "Explore · Find auth code");
         assert_eq!(
-            overlay.lines.iter().map(|line| line.text.as_str()).collect::<Vec<_>>(),
+            overlay
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
             ["찾는 중"]
         );
         assert!(overlay.closable);
@@ -12491,7 +12700,10 @@ mod tests {
     #[test]
     fn a_background_subagent_panel_survives_the_parent_turn() {
         let mut state = state_with_a_running_subagent();
-        state.handle_notification("turn/subagent/line", &subagent_line_notification("text", "찾는 중"));
+        state.handle_notification(
+            "turn/subagent/line",
+            &subagent_line_notification("text", "찾는 중"),
+        );
         state.open_subagent(0);
 
         state.handle_notification("turn/completed", &json!({}));
@@ -12499,10 +12711,7 @@ mod tests {
         assert!(state.overlay_view().is_some());
         assert_eq!(state.subagent_logs["toolu_1"].len(), 1);
 
-        state.handle_notification(
-            "turn/subagents/updated",
-            &json!({ "subagents": [] }),
-        );
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
 
         assert_eq!(
             state.overlay_view().map(|overlay| overlay.title),
@@ -12528,7 +12737,10 @@ mod tests {
     #[test]
     fn switching_sessions_clears_background_subagents_and_their_logs() {
         let mut state = state_with_a_running_subagent();
-        state.handle_notification("turn/subagent/line", &subagent_line_notification("text", "찾는 중"));
+        state.handle_notification(
+            "turn/subagent/line",
+            &subagent_line_notification("text", "찾는 중"),
+        );
 
         state.prepare_resume();
 
@@ -12635,16 +12847,32 @@ mod tests {
 
         // The welcome card is committed on the first plan update; the plan itself
         // stays in the fixed panel instead of becoming a transcript card.
-        assert!(state
-            .committed
-            .iter()
-            .all(|block| matches!(block.kind, BlockKind::Welcome)));
-        assert_eq!(state.plan_summary.as_ref().map(|summary| summary.steps.len()), Some(3));
+        assert!(
+            state
+                .committed
+                .iter()
+                .all(|block| matches!(block.kind, BlockKind::Welcome))
+        );
         assert_eq!(
-            state.plan_summary.as_ref().and_then(|summary| summary.explanation.as_deref()),
+            state
+                .plan_summary
+                .as_ref()
+                .map(|summary| summary.steps.len()),
+            Some(3)
+        );
+        assert_eq!(
+            state
+                .plan_summary
+                .as_ref()
+                .and_then(|summary| summary.explanation.as_deref()),
             Some("범위를 확인했습니다.")
         );
-        assert!(state.plan_summary.as_ref().is_some_and(|summary| summary.expanded));
+        assert!(
+            state
+                .plan_summary
+                .as_ref()
+                .is_some_and(|summary| summary.expanded)
+        );
         state.prepare_resume();
         assert!(state.plan_summary.is_none());
     }
@@ -12667,7 +12895,10 @@ mod tests {
             &json!({ "plan": [{ "step": "check", "status": "completed" }] }),
         );
 
-        assert_eq!(state.plan_summary.as_ref().unwrap().steps[0].elapsed, elapsed);
+        assert_eq!(
+            state.plan_summary.as_ref().unwrap().steps[0].elapsed,
+            elapsed
+        );
         assert!(elapsed.is_some());
     }
 
@@ -12686,7 +12917,12 @@ mod tests {
             &json!({ "plan": [{ "step": "check", "status": "completed" }] }),
         );
 
-        assert!(state.plan_summary.as_ref().is_some_and(|summary| !summary.expanded));
+        assert!(
+            state
+                .plan_summary
+                .as_ref()
+                .is_some_and(|summary| !summary.expanded)
+        );
     }
 
     #[test]
@@ -12695,8 +12931,16 @@ mod tests {
         state.restore_plan_snapshot(&PlanSnapshot {
             explanation: None,
             steps: vec![
-                crate::rollout::PlanStepSnapshot { text: "완료 작업".to_owned(), status: "completed".to_owned(), elapsed_ms: Some(1_000) },
-                crate::rollout::PlanStepSnapshot { text: "진행 중이던 작업".to_owned(), status: "in_progress".to_owned(), elapsed_ms: Some(2_000) },
+                crate::rollout::PlanStepSnapshot {
+                    text: "완료 작업".to_owned(),
+                    status: "completed".to_owned(),
+                    elapsed_ms: Some(1_000),
+                },
+                crate::rollout::PlanStepSnapshot {
+                    text: "진행 중이던 작업".to_owned(),
+                    status: "in_progress".to_owned(),
+                    elapsed_ms: Some(2_000),
+                },
             ],
         });
 
@@ -13633,7 +13877,10 @@ mod tests {
         let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert!(matches!(action, Action::Submit(text) if text == "beforeafter"));
-        assert_eq!(state.committed.last().map(|block| block.body.as_str()), Some("before [Image #1] after"));
+        assert_eq!(
+            state.committed.last().map(|block| block.body.as_str()),
+            Some("before [Image #1] after")
+        );
     }
 
     #[test]
@@ -14146,10 +14393,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(
-            state.activity().as_deref(),
-            Some("Completed (1m 5s)")
-        );
+        assert_eq!(state.activity().as_deref(), Some("Completed (1m 5s)"));
     }
 
     /// `/compact` has no assistant output of its own, so the activity row is the
@@ -14190,9 +14434,11 @@ mod tests {
         state.begin_compaction();
         state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
 
-        assert!(state
-            .activity()
-            .is_some_and(|activity| activity.starts_with("Compacting..")));
+        assert!(
+            state
+                .activity()
+                .is_some_and(|activity| activity.starts_with("Compacting.."))
+        );
 
         state.handle_notification("turn/completed", &json!({}));
 
@@ -14210,16 +14456,15 @@ mod tests {
         state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
         state.turn_started_at = Some(Instant::now() - Duration::from_secs(10));
 
-        assert!(state
-            .activity()
-            .is_some_and(|activity| activity.starts_with("Working.. (10s)")));
+        assert!(
+            state
+                .activity()
+                .is_some_and(|activity| activity.starts_with("Working.. (10s)"))
+        );
 
         state.select_model_and_effort("gpt-5.6-sol", Some("medium"));
         state.handle_notification("turn/completed", &json!({}));
-        assert_eq!(
-            state.activity().as_deref(),
-            Some("Completed (10s)")
-        );
+        assert_eq!(state.activity().as_deref(), Some("Completed (10s)"));
     }
 
     #[test]
@@ -14265,16 +14510,10 @@ mod tests {
         state.handle_key(KeyEvent::from(KeyCode::Esc));
         state.turn_started_at = Some(Instant::now() - Duration::from_secs(20));
 
-        assert_eq!(
-            state.activity().as_deref(),
-            Some("X Interrupted")
-        );
+        assert_eq!(state.activity().as_deref(), Some("X Interrupted"));
 
         state.handle_notification("turn/completed", &json!({}));
-        assert_eq!(
-            state.activity().as_deref(),
-            Some("X Interrupted")
-        );
+        assert_eq!(state.activity().as_deref(), Some("X Interrupted"));
     }
 
     #[test]
@@ -14374,7 +14613,10 @@ mod tests {
 
         assert!(matches!(action, Action::None));
         assert!(state.editor.is_empty());
-        assert_eq!(state.queued_prompts.front().map(String::as_str), Some("next prompt"));
+        assert_eq!(
+            state.queued_prompts.front().map(String::as_str),
+            Some("next prompt")
+        );
     }
 
     #[test]
@@ -14416,14 +14658,19 @@ mod tests {
             state.queued_prompts.front().map(String::as_str),
             Some("Claude로 이어서 처리해")
         );
-        assert!(state
-            .view()
-            .composer_placeholder
-            .contains("switched provider"));
+        assert!(
+            state
+                .view()
+                .composer_placeholder
+                .contains("switched provider")
+        );
 
         state.handle_notification("turn/completed", &json!({}));
         let queued = state.take_queued_prompt().unwrap();
-        assert!(matches!(state.start_queued_prompt(queued), Action::Submit(_)));
+        assert!(matches!(
+            state.start_queued_prompt(queued),
+            Action::Submit(_)
+        ));
         assert_eq!(state.selected_model_name(), "claude:sonnet");
     }
 
@@ -14577,7 +14824,10 @@ mod tests {
             remaining_label(Some(1_000 + 3 * 3_600 + 33 * 60), 1_000).as_deref(),
             Some("3h 33m")
         );
-        assert_eq!(remaining_label(Some(1_000 + 420), 1_000).as_deref(), Some("7m"));
+        assert_eq!(
+            remaining_label(Some(1_000 + 420), 1_000).as_deref(),
+            Some("7m")
+        );
         assert!(remaining_label(Some(900), 1_000).is_none());
         assert!(remaining_label(None, 1_000).is_none());
         assert!(parse_fast_mode(
@@ -16222,8 +16472,14 @@ mod tests {
             ClaudePermissionMode::from_wire("bypasspermissions"),
             Some(ClaudePermissionMode::BypassPermissions)
         );
-        assert_eq!(ClaudePermissionMode::from_wire("plan"), Some(ClaudePermissionMode::Plan));
-        assert_eq!(ClaudePermissionMode::from_wire("auto"), Some(ClaudePermissionMode::Auto));
+        assert_eq!(
+            ClaudePermissionMode::from_wire("plan"),
+            Some(ClaudePermissionMode::Plan)
+        );
+        assert_eq!(
+            ClaudePermissionMode::from_wire("auto"),
+            Some(ClaudePermissionMode::Auto)
+        );
         assert_eq!(ClaudePermissionMode::from_wire("nonsense"), None);
     }
 

@@ -387,12 +387,25 @@ fn plan_snapshot(input: &str) -> Option<PlanSnapshot> {
     for (offset, ch) in input[plan..].char_indices() {
         if quoted {
             escaped = ch == '\\' && !escaped;
-            if ch == '"' && !escaped { quoted = false; }
+            if ch == '"' && !escaped {
+                quoted = false;
+            }
             continue;
         }
-        if ch == '"' { quoted = true; continue; }
-        if ch == '[' { depth += 1; }
-        if ch == ']' { depth -= 1; if depth == 0 { end = plan + offset; break; } }
+        if ch == '"' {
+            quoted = true;
+            continue;
+        }
+        if ch == '[' {
+            depth += 1;
+        }
+        if ch == ']' {
+            depth -= 1;
+            if depth == 0 {
+                end = plan + offset;
+                break;
+            }
+        }
     }
     (depth == 0).then_some(())?;
     let body = &input[plan..end];
@@ -401,9 +414,16 @@ fn plan_snapshot(input: &str) -> Option<PlanSnapshot> {
         let step = js_string(item)?;
         let status_at = item.find("status:")? + "status:".len();
         let status = js_string(&item[status_at..])?;
-        steps.push(PlanStepSnapshot { text: step, status, elapsed_ms: None });
+        steps.push(PlanStepSnapshot {
+            text: step,
+            status,
+            elapsed_ms: None,
+        });
     }
-    (!steps.is_empty()).then_some(PlanSnapshot { explanation: None, steps })
+    (!steps.is_empty()).then_some(PlanSnapshot {
+        explanation: None,
+        steps,
+    })
 }
 
 fn with_plan_elapsed(
@@ -418,13 +438,20 @@ fn with_plan_elapsed(
                 started_at.entry(step.text.clone()).or_insert(now);
             }
             ("completed", Some(now)) => {
-                let duration = started_at.remove(&step.text).map(|started| now.saturating_sub(started)).unwrap_or(0);
+                let duration = started_at
+                    .remove(&step.text)
+                    .map(|started| now.saturating_sub(started))
+                    .unwrap_or(0);
                 elapsed.insert(step.text.clone(), duration);
             }
             _ => {}
         }
         step.elapsed_ms = elapsed.get(&step.text).copied().or_else(|| {
-            timestamp.and_then(|now| started_at.get(&step.text).map(|started| now.saturating_sub(*started)))
+            timestamp.and_then(|now| {
+                started_at
+                    .get(&step.text)
+                    .map(|started| now.saturating_sub(*started))
+            })
         });
     }
     plan

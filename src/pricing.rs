@@ -90,11 +90,12 @@ impl CostLedger {
     }
 
     pub fn estimate_usd(&self) -> Option<f64> {
-        self.by_model.iter().try_fold(0.0, |total, (model, tokens)| {
-            estimate_usd(model, *tokens).map(|cost| total + cost)
-        })
+        self.by_model
+            .iter()
+            .try_fold(0.0, |total, (model, tokens)| {
+                estimate_usd(model, *tokens).map(|cost| total + cost)
+            })
     }
-
 }
 
 /// Cache rates as a multiple of the model's input rate — current for both

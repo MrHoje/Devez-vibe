@@ -15,7 +15,9 @@ use crate::{
         ClaudeServer, is_claude_model, is_claude_request_id, is_claude_thread, raw_thread_id,
         visible_thread_id,
     },
-    open_code::{OpenCodeServer, has_connected_provider, is_open_code_model, is_open_code_request_id},
+    open_code::{
+        OpenCodeServer, has_connected_provider, is_open_code_model, is_open_code_request_id,
+    },
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,10 +226,7 @@ impl BackendServer {
                 }
                 let claude_catalog = self
                     .claude
-                    .request(
-                        "model/list",
-                        json!({ "cwd": self.cwd.to_string_lossy() }),
-                    )
+                    .request("model/list", json!({ "cwd": self.cwd.to_string_lossy() }))
                     .await
                     .unwrap_or_else(|_| crate::claude::model_catalog());
                 if let (Some(target), Some(extra)) = (
@@ -325,10 +324,7 @@ impl BackendServer {
                 if let Some(target) = response.get_mut("data").and_then(Value::as_array_mut) {
                     target.sort_by_key(|session| std::cmp::Reverse(session_updated_at(session)));
                     target.truncate(
-                        params
-                            .get("limit")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(100) as usize,
+                        params.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize
                     );
                 }
                 Ok(response)
@@ -353,7 +349,14 @@ impl BackendServer {
                         .get("id")
                         .and_then(Value::as_str)
                         .context("OpenCode thread/start 응답에 id가 없습니다.")?;
-                    self.register_route(id, RuntimeKind::OpenCode, None, Some(id.to_owned()), None, cwd);
+                    self.register_route(
+                        id,
+                        RuntimeKind::OpenCode,
+                        None,
+                        Some(id.to_owned()),
+                        None,
+                        cwd,
+                    );
                     Ok(response)
                 } else {
                     let response = self.codex()?.request(method, params).await?;
@@ -408,9 +411,7 @@ impl BackendServer {
             {
                 Ok(json!({ "data": [], "nextCursor": null }))
             }
-            "thread/turns/list"
-                if self.route_kind(thread_id(&params)?) == RuntimeKind::Claude =>
-            {
+            "thread/turns/list" if self.route_kind(thread_id(&params)?) == RuntimeKind::Claude => {
                 let visible = thread_id(&params)?;
                 let route = self.route(visible);
                 let backing = self.backing_id(visible, RuntimeKind::Claude)?;
@@ -432,10 +433,8 @@ impl BackendServer {
             "turn/start" | "turn/steer" => {
                 let visible = thread_id(&params)?.to_owned();
                 let previous = self.route_kind(&visible);
-                let selected = selected_runtime(
-                    params.get("model").and_then(Value::as_str),
-                    previous,
-                );
+                let selected =
+                    selected_runtime(params.get("model").and_then(Value::as_str), previous);
                 let snapshot = take_provider_handoff(&mut params);
                 let switching = method == "turn/start" && selected != previous;
                 let seen_through = self
@@ -557,14 +556,11 @@ impl BackendServer {
                         .unwrap_or_else(|| self.cwd.clone());
                     let mut response = self
                         .claude
-                        .request(
-                            "session/fork",
-                            {
-                                let mut request = claude_session_params(&params, &cwd, None);
-                                request["sessionId"] = json!(backing);
-                                request
-                            },
-                        )
+                        .request("session/fork", {
+                            let mut request = claude_session_params(&params, &cwd, None);
+                            request["sessionId"] = json!(backing);
+                            request
+                        })
                         .await?;
                     self.register_claude_response(&mut response, cwd)?;
                     Ok(response)
@@ -583,7 +579,14 @@ impl BackendServer {
                         .get("id")
                         .and_then(Value::as_str)
                         .context("OpenCode thread/fork 응답에 id가 없습니다.")?;
-                    self.register_route(id, RuntimeKind::OpenCode, None, Some(id.to_owned()), None, cwd);
+                    self.register_route(
+                        id,
+                        RuntimeKind::OpenCode,
+                        None,
+                        Some(id.to_owned()),
+                        None,
+                        cwd,
+                    );
                     Ok(response)
                 } else {
                     params["threadId"] = json!(self.backing_id(visible, RuntimeKind::Codex)?);
@@ -864,7 +867,10 @@ impl BackendServer {
 
     pub async fn shutdown(self) {
         let Self {
-            codex, open_code, claude, ..
+            codex,
+            open_code,
+            claude,
+            ..
         } = self;
         tokio::join!(
             async move {
@@ -888,9 +894,9 @@ impl BackendServer {
     }
 
     fn codex(&self) -> Result<&AppServer> {
-        self.codex.as_ref().context(
-            "Codex app-server를 사용할 수 없습니다. Claude provider를 사용하세요.",
-        )
+        self.codex
+            .as_ref()
+            .context("Codex app-server를 사용할 수 없습니다. Claude provider를 사용하세요.")
     }
 
     async fn ensure_open_code(&mut self) -> Result<&OpenCodeServer> {
@@ -922,14 +928,7 @@ impl BackendServer {
             .and_then(Value::as_str)
             .map(PathBuf::from)
             .unwrap_or_else(|| self.cwd.clone());
-        self.register_route(
-            id,
-            RuntimeKind::Codex,
-            Some(id.to_owned()),
-            None,
-            None,
-            cwd,
-        );
+        self.register_route(id, RuntimeKind::Codex, Some(id.to_owned()), None, None, cwd);
     }
 
     fn register_codex_response_as(&self, mut response: Value, visible: &str) -> Value {
@@ -1106,14 +1105,7 @@ impl BackendServer {
             RuntimeKind::OpenCode => open_code_id = Some(backing.to_owned()),
             RuntimeKind::Claude => claude_id = Some(backing.to_owned()),
         }
-        self.register_route(
-            visible,
-            active,
-            codex_id,
-            open_code_id,
-            claude_id,
-            cwd,
-        );
+        self.register_route(visible, active, codex_id, open_code_id, claude_id, cwd);
     }
 
     fn visible_id(&self, backing: &str, fallback: &str) -> String {
@@ -1173,12 +1165,7 @@ impl BackendServer {
 
     fn note_seen_through(&self, visible: &str, kind: RuntimeKind, block_id: u64) {
         {
-            if let Some(route) = self
-                .routes
-                .lock()
-                .expect("routes mutex")
-                .get_mut(visible)
-            {
+            if let Some(route) = self.routes.lock().expect("routes mutex").get_mut(visible) {
                 route.note_seen_through(kind, block_id);
             }
         }
@@ -1187,12 +1174,7 @@ impl BackendServer {
 
     fn restore_active_route(&self, visible: &str, active: RuntimeKind) {
         {
-            if let Some(route) = self
-                .routes
-                .lock()
-                .expect("routes mutex")
-                .get_mut(visible)
-            {
+            if let Some(route) = self.routes.lock().expect("routes mutex").get_mut(visible) {
                 route.active = active;
             }
         }
@@ -1455,9 +1437,7 @@ fn route_aliases(routes: &HashMap<String, Route>) -> HashMap<String, String> {
 fn route_resume_ids(routes: &HashMap<String, Route>) -> HashMap<String, String> {
     routes
         .iter()
-        .filter_map(|(visible, route)| {
-            resume_id_for(route).map(|resume| (visible.clone(), resume))
-        })
+        .filter_map(|(visible, route)| resume_id_for(route).map(|resume| (visible.clone(), resume)))
         .collect()
 }
 
@@ -1572,6 +1552,7 @@ fn is_vibe_setting_key(key: &str) -> bool {
             | crate::state::CODEX_PROVIDER_KEY
             | crate::state::CLAUDE_PROVIDER_KEY
             | crate::state::CLAUDE_PERMISSION_MODE_KEY
+            | crate::state::SIDE_PANEL_STAGE_KEY
     )
 }
 
@@ -1761,14 +1742,20 @@ fn insert_handoff_context(params: &mut Value, context: &str) {
 }
 
 fn combined_turn_instructions(params: &Value, runtime: RuntimeKind) -> Option<String> {
-    let rules_path = match runtime {
-        RuntimeKind::Claude => "/additionalContext/claude-devez-vibe-rules/value",
-        RuntimeKind::Codex | RuntimeKind::OpenCode => {
-            "/additionalContext/devez-vibe-rules/value"
-        }
+    // Claude already carries the full rules as its system prompt, so its turn
+    // repeats only the short reminder. The full rules stay behind it as the
+    // fallback for a host that predates the reminder key.
+    let rules_paths: &[&str] = match runtime {
+        RuntimeKind::Claude => &[
+            "/additionalContext/claude-devez-vibe-reminder/value",
+            "/additionalContext/claude-devez-vibe-rules/value",
+        ],
+        RuntimeKind::Codex | RuntimeKind::OpenCode => &["/additionalContext/devez-vibe-rules/value"],
     };
     let parts = [
-        params.pointer(rules_path).and_then(Value::as_str),
+        rules_paths
+            .iter()
+            .find_map(|path| params.pointer(path).and_then(Value::as_str)),
         params
             .pointer("/additionalContext/devez-vibe-mode/value")
             .and_then(Value::as_str),
@@ -1838,7 +1825,10 @@ fn selected_runtime(model: Option<&str>, current: RuntimeKind) -> RuntimeKind {
 fn apply_remembered_claude_selection(params: &mut Value, route: Option<&Route>) {
     for (key, remembered) in [
         ("model", route.and_then(|route| route.claude_model.clone())),
-        ("effort", route.and_then(|route| route.claude_effort.clone())),
+        (
+            "effort",
+            route.and_then(|route| route.claude_effort.clone()),
+        ),
     ] {
         let requested = params
             .get(key)
@@ -1910,11 +1900,7 @@ fn thread_id(params: &Value) -> Result<&str> {
 mod tests {
     use super::*;
 
-    fn route(
-        active: RuntimeKind,
-        codex_id: Option<&str>,
-        claude_id: Option<&str>,
-    ) -> Route {
+    fn route(active: RuntimeKind, codex_id: Option<&str>, claude_id: Option<&str>) -> Route {
         Route {
             active,
             codex_id: codex_id.map(ToOwned::to_owned),
@@ -1989,7 +1975,11 @@ mod tests {
 
     #[test]
     fn a_claude_named_thread_running_on_codex_resumes_from_its_rollout() {
-        let switched = route(RuntimeKind::Codex, Some("019f-rollout"), Some("claude-uuid"));
+        let switched = route(
+            RuntimeKind::Codex,
+            Some("019f-rollout"),
+            Some("claude-uuid"),
+        );
         assert_eq!(
             resume_id_for(&switched).as_deref(),
             Some("019f-rollout"),
@@ -2088,10 +2078,7 @@ mod tests {
                 == RuntimeKind::OpenCode
         );
         assert!(selected_runtime(Some("gpt-5.6-sol"), RuntimeKind::OpenCode) == RuntimeKind::Codex);
-        assert!(
-            selected_runtime(Some("claude:sonnet"), RuntimeKind::Codex)
-                == RuntimeKind::Claude
-        );
+        assert!(selected_runtime(Some("claude:sonnet"), RuntimeKind::Codex) == RuntimeKind::Claude);
     }
 
     /// DevezCode relaunches a room with `dvz -r <thread>`, so an unrouted id is the
@@ -2127,7 +2114,10 @@ mod tests {
             Path::new("C:/repo"),
             None,
         );
-        assert_eq!(with_effort.get("effort").and_then(Value::as_str), Some("max"));
+        assert_eq!(
+            with_effort.get("effort").and_then(Value::as_str),
+            Some("max")
+        );
     }
 
     #[test]
@@ -2206,9 +2196,23 @@ mod tests {
         });
         insert_handoff_context(&mut params, "history");
 
+        // No reminder key: an older host still gets the full rules per turn.
         assert_eq!(
             combined_turn_instructions(&params, RuntimeKind::Claude).as_deref(),
             Some("claude rules\n\nsuper vibe\n\nhistory")
+        );
+        assert_eq!(
+            combined_turn_instructions(&params, RuntimeKind::OpenCode).as_deref(),
+            Some("codex rules\n\nsuper vibe\n\nhistory")
+        );
+
+        // With it, the turn carries the reminder and leaves the full rules to
+        // the system prompt the session already opened on.
+        params["additionalContext"]["claude-devez-vibe-reminder"] =
+            json!({ "value": "claude reminder", "kind": "application" });
+        assert_eq!(
+            combined_turn_instructions(&params, RuntimeKind::Claude).as_deref(),
+            Some("claude reminder\n\nsuper vibe\n\nhistory")
         );
         assert_eq!(
             combined_turn_instructions(&params, RuntimeKind::OpenCode).as_deref(),

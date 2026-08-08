@@ -66,7 +66,10 @@ pub fn load_render_mode(cli_override: Option<&str>) -> Result<RenderMode> {
         return RenderMode::parse(value)
             .with_context(|| format!("지원하지 않는 렌더러입니다: {value}"));
     }
-    if let Some(value) = env::var("DEVEZ_VIBE_RENDERER").ok().filter(|v| !v.is_empty()) {
+    if let Some(value) = env::var("DEVEZ_VIBE_RENDERER")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
         return RenderMode::parse(&value)
             .with_context(|| format!("DEVEZ_VIBE_RENDERER 값을 알 수 없습니다: {value}"));
     }
@@ -205,7 +208,13 @@ impl Block {
 
     /// Credits come last so the variable-length list survives the round trip
     /// through [`BlockKind::Welcome`]'s newline-delimited body.
-    pub fn welcome(provider: &str, plan: &str, cwd: &str, account: &str, credits: &[String]) -> Self {
+    pub fn welcome(
+        provider: &str,
+        plan: &str,
+        cwd: &str,
+        account: &str,
+        credits: &[String],
+    ) -> Self {
         let mut body = format!("{provider}\n{plan}\n{cwd}\n{account}");
         for line in credits {
             body.push('\n');
@@ -213,7 +222,6 @@ impl Block {
         }
         Self::new(BlockKind::Welcome, "DEVEZ VIBE", body)
     }
-
 }
 
 pub struct OverlayView<'a> {
@@ -408,6 +416,8 @@ pub struct View<'a> {
     pub activity_model: Option<String>,
     /// Where the `Working` shimmer is in its sweep, `0.0..1.0`.
     pub activity_phase: f32,
+    /// Where the compaction progress block is in its slower trip, `0.0..1.0`.
+    pub activity_progress_phase: f32,
     pub footer: String,
     pub status_line: Option<StatusLineView>,
     pub composer_notice: Option<String>,
@@ -415,14 +425,15 @@ pub struct View<'a> {
     pub chat_layout: bool,
     pub shell_display_mode: ShellDisplayMode,
     pub diff_display_mode: DiffDisplayMode,
-    /// Whether the docked right-hand side panel is open.
-    pub side_panel_open: bool,
+    /// The docked right-hand side panel's width, or `None` while it is closed.
+    pub side_panel_width: Option<usize>,
 }
 
 pub struct AnimationView<'a> {
     pub activity: Option<String>,
     pub activity_model: Option<String>,
     pub activity_phase: f32,
+    pub activity_progress_phase: f32,
     pub plan_summary: Option<&'a PlanSummary>,
     pub plan_active: bool,
     pub plan_shimmer_phase: Option<f32>,
@@ -603,13 +614,6 @@ impl CellStyle {
             crossed_out: false,
         }
     }
-
-    fn panel() -> Self {
-        Self {
-            background: Some(blend(theme::palette().background, theme::palette().border, 72)),
-            ..Self::plain()
-        }
-    }
 }
 
 impl Cell {
@@ -759,11 +763,11 @@ impl CellFrame {
             column += glyph_width;
         }
     }
-
 }
 
-const SIDE_PANEL_WIDTH: usize = 24;
-const SIDE_PANEL_GAP: usize = 3;
+/// The three widths Alt+P cycles the panel through before it closes again.
+pub(crate) const SIDE_PANEL_WIDTHS: [usize; 3] = [24, 36, 48];
+const SIDE_PANEL_GAP: usize = 1;
 const SIDE_PANEL_MIN_MAIN_WIDTH: usize = 44;
 /// Writing into a terminal's final cell can trigger an implicit wrap and move
 /// the cursor before the next absolute paint command arrives.
@@ -786,62 +790,151 @@ impl SidePanelLayout {
     }
 
     fn content_width(self) -> usize {
-        self.panel_width.saturating_sub(2 * Self::HORIZONTAL_PADDING)
+        self.panel_width
+            .saturating_sub(2 * Self::HORIZONTAL_PADDING)
     }
 }
 
 /// Leaves the conversation enough room to stay readable before docking the
-/// fixed-width panel at the right edge; a narrow terminal keeps the panel shut.
-fn side_panel_layout(total_width: u16) -> Option<SidePanelLayout> {
+/// requested panel width at the right edge; a terminal too narrow for it keeps
+/// the panel shut rather than shrinking it to something else the user did not
+/// ask for.
+fn side_panel_layout(total_width: u16, panel_width: usize) -> Option<SidePanelLayout> {
     let total = usize::from(total_width);
-    let reserved = SIDE_PANEL_GAP + SIDE_PANEL_WIDTH + SIDE_PANEL_AUTOWRAP_GUARD;
+    let reserved = SIDE_PANEL_GAP + panel_width + SIDE_PANEL_AUTOWRAP_GUARD;
     (total >= SIDE_PANEL_MIN_MAIN_WIDTH + reserved).then(|| {
         let main_width = total - reserved;
         SidePanelLayout {
             main_width,
             panel_left: main_width + SIDE_PANEL_GAP,
-            panel_width: SIDE_PANEL_WIDTH,
+            panel_width,
         }
     })
 }
 
-fn side_panel_row(row: usize, rows: usize, content_width: usize) -> String {
-    let text = match row {
-        0 => "Side panel",
-        1 if rows > 1 => "Alt+S to close",
-        _ => "",
-    };
+fn side_panel_row(content_row: usize, content_width: usize) -> String {
+    let text = if content_row == 0 { "Side panel" } else { "" };
     format!("{text:<content_width$}")
 }
 
-/// Fills one row of the panel surface. The fill runs to the frame edge so the
-/// autowrap guard cell carries the panel background instead of a bare gap.
+fn side_panel_border_style() -> CellStyle {
+    CellStyle {
+        foreground: tone_rgb(Tone::Border),
+        ..CellStyle::plain()
+    }
+}
+
+/// The key that cycles the docked side panel, named on its own top rule the
+/// same way the plan panel names its own toggle key.
+const SIDE_PANEL_TOGGLE_HINT: &str = " Alt + P ";
+
+/// Closes the panel outright, the same mark a closable overlay's header uses.
+const SIDE_PANEL_CLOSE_MARK: &str = "X";
+/// Columns reserved before the corner for the close mark: a blank gap, the
+/// mark itself, then a rule stroke — the same "X ─╮" spacing a closable
+/// overlay's own header uses, so the mark reads as sitting inside the box
+/// rather than glued to the corner.
+const SIDE_PANEL_CLOSE_RESERVED: usize = 3;
+
+/// The column the close mark paints on, if the panel is wide enough to spare
+/// the room — shared by the paint step and its click region so they cannot
+/// drift apart.
+fn side_panel_close_column(layout: SidePanelLayout) -> Option<usize> {
+    (layout.panel_width.saturating_sub(2) >= SIDE_PANEL_CLOSE_RESERVED)
+        .then(|| layout.panel_left + layout.panel_width - 3)
+}
+
+fn side_panel_hint_style() -> CellStyle {
+    CellStyle {
+        foreground: tone_rgb(Tone::Muted),
+        ..CellStyle::plain()
+    }
+}
+
+/// Draws one row of the panel's outline into `frame_row` of `frame`. `global_row`
+/// is this row's position in the whole panel (0..`rows`), which is what decides
+/// whether it is the top rule, the bottom rule, or a bare `│` on each edge — the
+/// two differ when repainting a single animated row through its own 1-row frame.
+/// There is no fill, so the panel reads as an unfilled box like the composer and
+/// the plan card.
 fn paint_side_panel_row_into_frame(
     frame: &mut CellFrame,
     layout: SidePanelLayout,
     frame_row: usize,
-    content_row: usize,
+    global_row: usize,
     rows: usize,
 ) {
-    if frame_row >= frame.height {
+    if frame_row >= frame.height || rows == 0 {
         return;
     }
-    let panel_style = CellStyle::panel();
-    frame.fill(
-        layout.panel_left,
-        frame_row,
-        frame.width,
-        frame_row + 1,
-        panel_style,
-    );
+    let border_style = side_panel_border_style();
+    let right = layout.panel_left + layout.panel_width - 1;
+    if global_row == 0 {
+        frame.write(layout.panel_left, frame_row, "╭", border_style);
+        let inner = layout.panel_width.saturating_sub(2);
+        let close_column = side_panel_close_column(layout);
+        let reserved_close = if close_column.is_some() {
+            SIDE_PANEL_CLOSE_RESERVED
+        } else {
+            0
+        };
+        let usable = inner.saturating_sub(reserved_close);
+        let hint_width = UnicodeWidthStr::width(SIDE_PANEL_TOGGLE_HINT);
+        if usable >= hint_width + 1 {
+            let after = usable - hint_width - 1;
+            frame.write(layout.panel_left + 1, frame_row, "─", border_style);
+            frame.write(
+                layout.panel_left + 2,
+                frame_row,
+                SIDE_PANEL_TOGGLE_HINT,
+                side_panel_hint_style(),
+            );
+            if after > 0 {
+                frame.write(
+                    layout.panel_left + 2 + hint_width,
+                    frame_row,
+                    &"─".repeat(after),
+                    border_style,
+                );
+            }
+        } else if usable > 0 {
+            frame.write(
+                layout.panel_left + 1,
+                frame_row,
+                &"─".repeat(usable),
+                border_style,
+            );
+        }
+        if let Some(close_column) = close_column {
+            frame.write(
+                close_column,
+                frame_row,
+                SIDE_PANEL_CLOSE_MARK,
+                side_panel_hint_style(),
+            );
+            frame.write(close_column + 1, frame_row, "─", border_style);
+        }
+        frame.write(right, frame_row, "╮", border_style);
+        return;
+    }
+    if global_row + 1 == rows {
+        frame.write(layout.panel_left, frame_row, "╰", border_style);
+        frame.write(
+            layout.panel_left + 1,
+            frame_row,
+            &"─".repeat(layout.panel_width.saturating_sub(2)),
+            border_style,
+        );
+        frame.write(right, frame_row, "╯", border_style);
+        return;
+    }
+    frame.write(layout.panel_left, frame_row, "│", border_style);
+    frame.write(right, frame_row, "│", border_style);
     frame.write(
         layout.content_left(),
         frame_row,
-        &side_panel_row(content_row, rows, layout.content_width()),
-        CellStyle {
-            foreground: tone_rgb(Tone::Muted),
-            ..panel_style
-        },
+        &side_panel_row(global_row - 1, layout.content_width()),
+        side_panel_hint_style(),
     );
 }
 
@@ -984,25 +1077,21 @@ impl Renderer {
             return None;
         }
         let text = " Scroll to bottom (Ctrl+↓) ";
-        let start = usize::from(width)
-            .saturating_sub(UnicodeWidthStr::width(text))
-            / 2;
-        Some(
-            PaintLine {
-                prefix: " ".repeat(start),
-                prefix_tone: Tone::Plain,
-                text: text.to_owned(),
-                tone: Tone::ScrollToBottom,
-                bold: false,
-                tool_heading: None,
-                pick: Some(PickRegions::span(
-                    start,
-                    start + UnicodeWidthStr::width(text),
-                    Pick::ScrollToBottom,
-                )),
-                tail: Vec::new(),
-            },
-        )
+        let start = usize::from(width).saturating_sub(UnicodeWidthStr::width(text)) / 2;
+        Some(PaintLine {
+            prefix: " ".repeat(start),
+            prefix_tone: Tone::Plain,
+            text: text.to_owned(),
+            tone: Tone::ScrollToBottom,
+            bold: false,
+            tool_heading: None,
+            pick: Some(PickRegions::span(
+                start,
+                start + UnicodeWidthStr::width(text),
+                Pick::ScrollToBottom,
+            )),
+            tail: Vec::new(),
+        })
     }
 
     /// Rows a page key jumps. A row of overlap keeps a line of context in view.
@@ -1167,9 +1256,9 @@ impl Renderer {
             self.last_click
                 .replace((point, now))
                 .is_some_and(|(previous, clicked_at)| {
-                previous.row == point.row
-                    && previous.column.abs_diff(point.column) <= 1
-                    && now.duration_since(clicked_at) <= DOUBLE_CLICK_WINDOW
+                    previous.row == point.row
+                        && previous.column.abs_diff(point.column) <= 1
+                        && now.duration_since(clicked_at) <= DOUBLE_CLICK_WINDOW
                 });
         if !is_double_click {
             return None;
@@ -1250,7 +1339,10 @@ impl Renderer {
         }
         let row = row.min(self.previous_lines.len().saturating_sub(1) as u16);
         let line = &self.previous_lines[usize::from(row)];
-        if matches!(line.tone, Tone::AssistantBubbleHalf | Tone::UserPromptPadding) {
+        if matches!(
+            line.tone,
+            Tone::AssistantBubbleHalf | Tone::UserPromptPadding
+        ) {
             return None;
         }
         let width = painted_line_width(line).max(
@@ -1395,9 +1487,10 @@ impl Renderer {
         let total_width = total_width.max(20);
         // The panel is docked, not overlaid: every conversation row is laid out
         // against the narrowed main width so nothing runs under the panel.
-        let side_panel = (self.mode == RenderMode::Fullscreen && view.side_panel_open)
-            .then(|| side_panel_layout(total_width))
-            .flatten();
+        let side_panel = (self.mode == RenderMode::Fullscreen)
+            .then_some(view.side_panel_width)
+            .flatten()
+            .and_then(|panel_width| side_panel_layout(total_width, panel_width));
         if side_panel != self.side_panel {
             // Opening or closing moves every row's right edge, so the diff has
             // nothing reusable and the whole surface must be repainted.
@@ -1415,13 +1508,7 @@ impl Renderer {
             composer_mode: view.composer_mode,
         };
         let mut frame = if let Some(overlay) = view.overlay {
-            overlay_frame_with_expansion(
-                live_lines,
-                overlay,
-                view.welcome,
-                status,
-                frame_width,
-            )
+            overlay_frame_with_expansion(live_lines, overlay, view.welcome, status, frame_width)
         } else {
             normal_frame_with_expansion(
                 live_lines,
@@ -1435,6 +1522,7 @@ impl Renderer {
                 view.activity.as_deref(),
                 view.activity_model.as_deref(),
                 view.activity_phase,
+                view.activity_progress_phase,
                 status,
                 frame_width,
             )
@@ -1585,10 +1673,11 @@ impl Renderer {
             let Some(row) = self.animation_activity_row else {
                 return Ok(false);
             };
-            let mut activity_rows = activity_lines(
+            let mut activity_rows = activity_lines_with_progress(
                 activity,
                 view.activity_model.as_deref(),
                 view.activity_phase,
+                view.activity_progress_phase,
                 self.last_width,
             );
             if activity_rows.len() != 1 {
@@ -1629,13 +1718,9 @@ impl Renderer {
             .unwrap_or(0);
         let mut rows = HashSet::new();
         if updates.is_empty()
-            || updates
-                .iter()
-                .any(|(row, _)| {
-                    *row >= self.previous_lines.len()
-                        || *row >= painted_height
-                        || !rows.insert(*row)
-                })
+            || updates.iter().any(|(row, _)| {
+                *row >= self.previous_lines.len() || *row >= painted_height || !rows.insert(*row)
+            })
         {
             return Ok(false);
         }
@@ -1663,8 +1748,7 @@ impl Renderer {
             let repaint_plan_row = *screen_row < self.animation_plan_rows
                 && plan_row_requires_full_repaint(&self.previous_lines[*screen_row], line);
             let mut current = CellFrame::new(width, 1);
-            let hovered =
-                Self::hover_columns(line, self.hovered_tool, self.hovered_pick.as_ref());
+            let hovered = Self::hover_columns(line, self.hovered_tool, self.hovered_pick.as_ref());
             paint_line_into_frame(
                 &mut current,
                 0,
@@ -1703,9 +1787,7 @@ impl Renderer {
             // A changed plan step can shorten or restyle wide Korean text. Clear
             // just that row once; spinner frames keep the inexpensive diff path.
             let previous = (!*repaint_plan_row).then_some(previous);
-            if let Err(error) =
-                emit_frame_diff_at(&mut self.out, previous, current, *screen_row)
-            {
+            if let Err(error) = emit_frame_diff_at(&mut self.out, previous, current, *screen_row) {
                 result = Err(error);
                 break;
             }
@@ -1770,11 +1852,13 @@ impl Renderer {
         let content_rows = rows.saturating_sub(plan_rows).max(1);
         let old_view_rows = split_rows(content_rows, frame.lines.len(), self.wrapped.len()).0;
         self.commit_fullscreen_blocks(committed, width, old_view_rows);
-        let provisional_view_rows = split_rows(content_rows, frame.lines.len(), self.wrapped.len()).0;
+        let provisional_view_rows =
+            split_rows(content_rows, frame.lines.len(), self.wrapped.len()).0;
         self.scroll_back = self
             .scroll_back
             .min(self.wrapped.len().saturating_sub(provisional_view_rows));
-        let (view_rows, live_rows) = split_rows(content_rows, frame.lines.len(), self.wrapped.len());
+        let (view_rows, live_rows) =
+            split_rows(content_rows, frame.lines.len(), self.wrapped.len());
         // Padding the live frame is what puts the composer on the bottom row
         // *without* dragging the welcome card and the live blocks down with it:
         // `fit_frame` inserts the blanks at the dock, above the composer.
@@ -1792,13 +1876,14 @@ impl Renderer {
             .map(|index| plan_rows + view_rows + index);
         // The prompt rows follow the composer's top rule, and the live frame is
         // painted below the transcript window, so this is where they land.
-        let composer_selection = frame
-            .composer_index
-            .zip(frame.composer_layout.take())
-            .map(|(index, layout)| ComposerSelection {
-                first_row: plan_rows + view_rows + index + 1,
-                layout,
-            });
+        let composer_selection =
+            frame
+                .composer_index
+                .zip(frame.composer_layout.take())
+                .map(|(index, layout)| ComposerSelection {
+                    first_row: plan_rows + view_rows + index + 1,
+                    layout,
+                });
         let (mut screen, cursor_line) = compose_screen(
             &self.wrapped,
             frame.lines,
@@ -1819,6 +1904,18 @@ impl Renderer {
             }
             Some((row, control))
         });
+        // The panel always spans the whole screen, so its top rule is always
+        // row 0 — the same row regardless of scroll position or plan height.
+        if let Some(layout) = self.side_panel
+            && let Some(close_column) = side_panel_close_column(layout)
+            && let Some(line) = screen.get_mut(0)
+        {
+            let region = (close_column, close_column + 1, Pick::SidePanelClose);
+            match line.pick.as_mut() {
+                Some(picks) => picks.0.push(region),
+                None => line.pick = Some(PickRegions(vec![region])),
+            }
+        }
         self.reconcile_selection(&screen);
         let full_repaint_rows = plan_rows_requiring_full_repaint(
             &self.previous_lines,
@@ -1833,7 +1930,9 @@ impl Renderer {
             frame.cursor_col,
             frame.show_cursor,
             total_width,
-            scroll_to_bottom_overlay.as_ref().map(|(row, control)| (*row, control)),
+            scroll_to_bottom_overlay
+                .as_ref()
+                .map(|(row, control)| (*row, control)),
             &full_repaint_rows,
             plan_geometry_changed,
         )?;
@@ -2212,7 +2311,9 @@ fn clear_main_row(out: &mut impl Write, row: usize, width: usize) -> Result<()> 
 fn cell_style(tone: Tone, bold: bool, background: Option<Rgb>, selected: bool) -> CellStyle {
     if selected {
         return CellStyle {
-            foreground: Some(tone_rgb(tone).map_or_else(theme::selection_fg, theme::selection_text)),
+            foreground: Some(
+                tone_rgb(tone).map_or_else(theme::selection_fg, theme::selection_text),
+            ),
             background: Some(theme::selection_bg()),
             bold,
             italic: false,
@@ -2254,7 +2355,11 @@ fn paint_text_into_frame(
         let style = cell_style(
             tone,
             bold,
-            if hovered { Some(theme::palette().hover_bg) } else { background },
+            if hovered {
+                Some(theme::palette().hover_bg)
+            } else {
+                background
+            },
             selected,
         );
         frame.write(*column, row, unit, style);
@@ -2302,7 +2407,9 @@ fn paint_line_into_frame(
         );
     }
     let mut column = 0;
-    let prefix_background = word_background(line.prefix_tone).or(bubble_background).or(background);
+    let prefix_background = word_background(line.prefix_tone)
+        .or(bubble_background)
+        .or(background);
     paint_text_into_frame(
         frame,
         row,
@@ -2321,7 +2428,9 @@ fn paint_line_into_frame(
         &mut column,
         line.tone,
         line.bold,
-        word_background(line.tone).or(bubble_background).or(background),
+        word_background(line.tone)
+            .or(bubble_background)
+            .or(background),
         selected_columns.as_ref(),
         hovered_columns.as_ref(),
     );
@@ -2336,7 +2445,9 @@ fn paint_line_into_frame(
             &mut column,
             span.tone,
             span.bold,
-            word_background(span.tone).or(bubble_background).or(background),
+            word_background(span.tone)
+                .or(bubble_background)
+                .or(background),
             selected_columns.as_ref(),
             hovered_columns.as_ref(),
         );
@@ -2380,7 +2491,8 @@ fn emit_frame_diff_at(
     current: &CellFrame,
     row_offset: usize,
 ) -> Result<()> {
-    let previous = previous.filter(|frame| frame.width == current.width && frame.height == current.height);
+    let previous =
+        previous.filter(|frame| frame.width == current.width && frame.height == current.height);
     for row in 0..current.height {
         let screen_row = row.saturating_add(row_offset);
         let wide_damage = previous.and_then(|previous| wide_damage_range(previous, current, row));
@@ -2389,7 +2501,10 @@ fn emit_frame_diff_at(
         }
         let mut column = 0;
         while column < current.width {
-            if wide_damage.as_ref().is_some_and(|columns| columns.contains(&column)) {
+            if wide_damage
+                .as_ref()
+                .is_some_and(|columns| columns.contains(&column))
+            {
                 column += 1;
                 continue;
             }
@@ -2419,7 +2534,10 @@ fn emit_frame_diff_at(
             let style = cell.style;
             let mut text = String::new();
             while column + 1 < current.width {
-                if wide_damage.as_ref().is_some_and(|columns| columns.contains(&column)) {
+                if wide_damage
+                    .as_ref()
+                    .is_some_and(|columns| columns.contains(&column))
+                {
                     break;
                 }
                 let cell = current.cell(column, row);
@@ -2452,7 +2570,11 @@ fn emit_frame_diff_at(
 /// so a terminal is never asked to paint into the trailing half of a glyph.
 /// Keeping this local avoids clearing and flashing the entire composer row for
 /// every Korean character typed.
-fn wide_damage_range(previous: &CellFrame, current: &CellFrame, row: usize) -> Option<Range<usize>> {
+fn wide_damage_range(
+    previous: &CellFrame,
+    current: &CellFrame,
+    row: usize,
+) -> Option<Range<usize>> {
     let mut changed = (0..current.width).filter(|&column| {
         let before = previous.cell(column, row);
         let after = current.cell(column, row);
@@ -2552,14 +2674,11 @@ fn emit_synchronized_frame_diff_with_full_rows(
     // path, so the cursor is restored once rather than toggled every 80ms.
     let repainting_plan = repaint_full_frame || !full_rows.is_empty();
     let cursor_moves_outside_composer = cursor.is_some_and(|(_, row, show)| {
-        show
-            && cursor_shown
-            && frame_changed_outside_row(previous, current, usize::from(row))
+        show && cursor_shown && frame_changed_outside_row(previous, current, usize::from(row))
     });
     let hide_cursor = cursor_shown
-        && cursor.is_some_and(|(_, _, show)| {
-            !show || repainting_plan || cursor_moves_outside_composer
-        });
+        && cursor
+            .is_some_and(|(_, _, show)| !show || repainting_plan || cursor_moves_outside_composer);
     if hide_cursor {
         queue!(out, Hide)?;
     }
@@ -2581,12 +2700,9 @@ fn emit_synchronized_frame_diff_with_full_rows(
                 result = Err(error);
                 break;
             }
-            if let Some(previous) = diff_previous
-                .as_mut()
-                .filter(|previous| {
-                    previous.width == current.width && previous.height == current.height
-                })
-            {
+            if let Some(previous) = diff_previous.as_mut().filter(|previous| {
+                previous.width == current.width && previous.height == current.height
+            }) {
                 previous.cells[row * current.width..(row + 1) * current.width]
                     .clone_from_slice(&row_frame.cells);
             }
@@ -2843,6 +2959,8 @@ pub enum Pick {
     ScrollToBottom,
     /// The `✕` on a panel's top rule: closes what Esc closes.
     Close,
+    /// The `X` on the docked side panel's top rule: closes the panel outright.
+    SidePanelClose,
 }
 
 /// Columns a clickable span reaches past its own text, either side. A word is a
@@ -3056,13 +3174,25 @@ fn progress_bar_spans(phase: f32, track: usize, tone: Tone) -> Vec<PaintSpan> {
         bold: false,
     }];
     if visible_start > 0 {
-        spans.push(PaintSpan { text: "░".repeat(visible_start), tone: Tone::Muted, bold: false });
+        spans.push(PaintSpan {
+            text: "░".repeat(visible_start),
+            tone: Tone::Muted,
+            bold: false,
+        });
     }
     if visible > 0 {
-        spans.push(PaintSpan { text: "█".repeat(visible), tone, bold: false });
+        spans.push(PaintSpan {
+            text: "█".repeat(visible),
+            tone,
+            bold: false,
+        });
     }
     if remaining > 0 {
-        spans.push(PaintSpan { text: "░".repeat(remaining), tone: Tone::Muted, bold: false });
+        spans.push(PaintSpan {
+            text: "░".repeat(remaining),
+            tone: Tone::Muted,
+            bold: false,
+        });
     }
     spans.push(PaintSpan {
         text: "]".to_owned(),
@@ -3078,16 +3208,27 @@ fn activity_lines(
     phase: f32,
     width: u16,
 ) -> Vec<PaintLine> {
+    activity_lines_with_progress(activity, activity_model, phase, phase, width)
+}
+
+fn activity_lines_with_progress(
+    activity: &str,
+    activity_model: Option<&str>,
+    phase: f32,
+    progress_phase: f32,
+    width: u16,
+) -> Vec<PaintLine> {
     let tone = activity_model.and_then(model_tone).unwrap_or(Tone::Plain);
     if UnicodeWidthStr::width(activity) > width.saturating_sub(2) as usize {
         return wrapped_line(" ", tone, activity, tone, false, width);
     }
     // `/compact` wears the same loader as a turn: it is a wait the user started
     // and cannot see progress on any other way.
-    if let Some((label, trailer)) = SPINNING_ACTIVITY_LABELS
-        .iter()
-        .find_map(|label| activity.strip_prefix(label).map(|trailer| (*label, trailer)))
-    {
+    if let Some((label, trailer)) = SPINNING_ACTIVITY_LABELS.iter().find_map(|label| {
+        activity
+            .strip_prefix(label)
+            .map(|trailer| (*label, trailer))
+    }) {
         let shimmer_base = tone_rgb(tone).unwrap_or(theme::palette().foreground);
         let mut tail = vec![PaintSpan {
             text: format!(
@@ -3113,7 +3254,7 @@ fn activity_lines(
                     tone,
                     bold: false,
                 });
-                tail.extend(progress_bar_spans(phase, track, tone));
+                tail.extend(progress_bar_spans(progress_phase, track, tone));
             }
             tail.push(PaintSpan {
                 text: trailer.to_owned(),
@@ -3448,8 +3589,8 @@ fn selectable_content_columns(line: &PaintLine) -> Option<Range<usize>> {
         return Some(start..content.end.max(start));
     }
     let columns = composer_content_columns(line).or_else(|| {
-        let boxed_code = line.prefix.ends_with("│ ")
-            && line.tail.last().is_some_and(|span| span.text == "│");
+        let boxed_code =
+            line.prefix.ends_with("│ ") && line.tail.last().is_some_and(|span| span.text == "│");
         if boxed_code {
             let start = UnicodeWidthStr::width(line.prefix.as_str());
             let end = content.end.saturating_sub(1);
@@ -3543,7 +3684,10 @@ fn selection_columns_for_line(
     row: usize,
 ) -> Option<Range<usize>> {
     // A bubble's rounded edge rows are chrome, not text.
-    if matches!(line.tone, Tone::AssistantBubbleHalf | Tone::UserPromptPadding) {
+    if matches!(
+        line.tone,
+        Tone::AssistantBubbleHalf | Tone::UserPromptPadding
+    ) {
         return None;
     }
     let mut selected = range.columns_for_row(row, painted_line_width(line))?;
@@ -3638,6 +3782,7 @@ fn normal_frame(
         activity,
         None,
         0.5,
+        0.5,
         status,
         width,
     )
@@ -3656,6 +3801,7 @@ fn normal_frame_with_expansion(
     activity: Option<&str>,
     activity_model: Option<&str>,
     activity_phase: f32,
+    activity_progress_phase: f32,
     status: StatusArea,
     width: u16,
 ) -> Frame {
@@ -3679,13 +3825,16 @@ fn normal_frame_with_expansion(
         if !matches!(lines.last(), Some(line) if line == &PaintLine::blank()) {
             lines.push(PaintLine::blank());
         }
-        let mut activity_rows = activity_lines(activity, activity_model, activity_phase, width);
+        let mut activity_rows = activity_lines_with_progress(
+            activity,
+            activity_model,
+            activity_phase,
+            activity_progress_phase,
+            width,
+        );
         if let Some(mode) = composer_controls_mode
-            && let Some(row) = activity_line_with_composer_controls(
-                activity_rows[0].clone(),
-                mode,
-                width,
-            )
+            && let Some(row) =
+                activity_line_with_composer_controls(activity_rows[0].clone(), mode, width)
         {
             activity_rows[0] = row;
             // The active row now carries the controls, so the composer rule
@@ -4339,13 +4488,7 @@ fn overlay_frame(
         ShellDisplayMode::Collapse,
         DiffDisplayMode::Collapse,
     );
-    overlay_frame_with_expansion(
-        live_lines,
-        overlay,
-        welcome,
-        status,
-        width,
-    )
+    overlay_frame_with_expansion(live_lines, overlay, welcome, status, width)
 }
 
 fn overlay_frame_with_expansion(
@@ -4396,7 +4539,11 @@ fn overlay_frame_with_expansion(
                     };
                     // A detail line folds back under itself, not under the label
                     // above it, so its own indent is the continuation indent.
-                    let continuation = if part_index == 0 { "│   " } else { "│     " };
+                    let continuation = if part_index == 0 {
+                        "│   "
+                    } else {
+                        "│     "
+                    };
                     let tone = if row.muted {
                         Tone::Muted
                     } else if part.contains('●') && part.contains('○') {
@@ -4515,7 +4662,11 @@ fn overlay_frame_with_expansion(
                     };
                     // A detail line folds back under itself, not under the label
                     // above it, so its own indent is the continuation indent.
-                    let continuation = if part_index == 0 { "│   " } else { "│     " };
+                    let continuation = if part_index == 0 {
+                        "│   "
+                    } else {
+                        "│     "
+                    };
                     // The line under a label is that label's detail, not a claim
                     // of its own: it reads as the quieter half of one row.
                     let tone = if row.muted || part_index > 0 {
@@ -4665,7 +4816,11 @@ fn overlay_frame_with_expansion(
                         )
                         .into_iter()
                         .map(|line| {
-                            let marker = if row.selected { Tone::Accent } else { Tone::Muted };
+                            let marker = if row.selected {
+                                Tone::Accent
+                            } else {
+                                Tone::Muted
+                            };
                             close_panel_row(split_panel_border(line, marker), panel_width)
                                 .with_picks(&[(0, Pick::Row(row_index))])
                         }),
@@ -4791,11 +4946,7 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
     }
     if let Some(effort) = status.effort.filter(|effort| !effort.is_empty()) {
         let tone = status_effort_tone(&effort).unwrap_or(Tone::StatusText);
-        let span = push_status_span(
-            &mut spans,
-            format!("◆ {effort}"),
-            tone,
-        );
+        let span = push_status_span(&mut spans, format!("◆ {effort}"), tone);
         picks.push((span, Pick::EffortSetting));
     }
     if let Some(context) = status.context.filter(|context| !context.is_empty()) {
@@ -4807,7 +4958,7 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
     // The 5h window is dropped entirely when unknown rather than shown as a stub.
     let five_hour_remaining = status.five_hour_remaining.filter(|left| !left.is_empty());
     let five_hour = match (status.five_hour_percent, five_hour_remaining) {
-        (Some(percent), Some(left)) => Some(format!("5h: {percent}% · {left}")),
+        (Some(percent), Some(left)) => Some(format!("{left}: {percent}%")),
         (Some(percent), None) => Some(format!("5h: {percent}%")),
         (None, Some(left)) => Some(format!("5h: {left}")),
         (None, None) => None,
@@ -5629,8 +5780,8 @@ fn plan_lines(block: &Block, width: u16) -> Vec<PaintLine> {
 
 /// The key that folds the plan panel, on every runtime. Shift+Tab belongs to
 /// Claude's permission modes, and a Korean IME eats Shift+Space, so the panel
-/// names the one key that always works.
-const PLAN_TOGGLE_HINT: &str = " Alt + P ";
+/// names the one key that always works. Alt+P is reserved for the side panel.
+const PLAN_TOGGLE_HINT: &str = " Alt + W ";
 
 /// Reasoning summaries use a narrow `∴` gutter and a single dim italic
 /// paragraph. Plan blocks keep their heading and one physical row per step.
@@ -5642,14 +5793,18 @@ fn fixed_plan_summary_lines(
     plan_shimmer_phase: Option<f32>,
 ) -> Vec<PaintLine> {
     let line_width = panel_span(width);
-    let completed = summary.steps.iter().filter(|step| step.status == PlanStepStatus::Completed).count();
+    let completed = summary
+        .steps
+        .iter()
+        .filter(|step| step.status == PlanStepStatus::Completed)
+        .count();
     let effort_tone = plan_effort_tone(summary.steps.len());
     let title = format!("작업 단계 · {completed} / {} 완료", summary.steps.len());
     if !summary.expanded {
         let tail = format!("{PLAN_TOGGLE_HINT}▼ ──");
-        let rule = "─".repeat(
-            line_width.saturating_sub(5 + UnicodeWidthStr::width(title.as_str()) + UnicodeWidthStr::width(tail.as_str())),
-        );
+        let rule = "─".repeat(line_width.saturating_sub(
+            5 + UnicodeWidthStr::width(title.as_str()) + UnicodeWidthStr::width(tail.as_str()),
+        ));
         let header = PaintLine {
             prefix: String::new(),
             prefix_tone: Tone::Border,
@@ -5659,19 +5814,41 @@ fn fixed_plan_summary_lines(
             tool_heading: None,
             pick: None,
             tail: vec![
-                PaintSpan { text: PLAN_TOGGLE_HINT.to_owned(), tone: Tone::FastOff, bold: false },
-                PaintSpan { text: "▼ ".to_owned(), tone: Tone::Plain, bold: false },
-                PaintSpan { text: "──".to_owned(), tone: Tone::Plain, bold: false },
+                PaintSpan {
+                    text: PLAN_TOGGLE_HINT.to_owned(),
+                    tone: Tone::FastOff,
+                    bold: false,
+                },
+                PaintSpan {
+                    text: "▼ ".to_owned(),
+                    tone: Tone::Plain,
+                    bold: false,
+                },
+                PaintSpan {
+                    text: "──".to_owned(),
+                    tone: Tone::Plain,
+                    bold: false,
+                },
             ],
         };
-        return vec![header.with_picks(&[(1, Pick::PlanSummary), (2, Pick::PlanSummary)]), PaintLine::blank()];
+        return vec![
+            header.with_picks(&[(1, Pick::PlanSummary), (2, Pick::PlanSummary)]),
+            PaintLine::blank(),
+        ];
     }
     let mut lines = Vec::new();
     let steps = summary.steps.iter().collect::<Vec<_>>();
     for step in steps {
         let (prefix, bold) = match step.status {
             PlanStepStatus::Completed => ("  ✔  ".to_owned(), false),
-            PlanStepStatus::InProgress if plan_active => (format!("  {}  ", WORKING_SPINNER[(phase.clamp(0.0, 0.999) * WORKING_SPINNER.len() as f32) as usize]), true),
+            PlanStepStatus::InProgress if plan_active => (
+                format!(
+                    "  {}  ",
+                    WORKING_SPINNER
+                        [(phase.clamp(0.0, 0.999) * WORKING_SPINNER.len() as f32) as usize]
+                ),
+                true,
+            ),
             PlanStepStatus::InProgress => ("  ▸  ".to_owned(), false),
             PlanStepStatus::Pending => ("     ".to_owned(), false),
         };
@@ -5688,35 +5865,71 @@ fn fixed_plan_summary_lines(
         let in_progress = step.status == PlanStepStatus::InProgress;
         lines.push(PaintLine {
             prefix,
-            prefix_tone: if is_completed { Tone::FastOff } else if in_progress { Tone::Accent } else { Tone::Muted },
+            prefix_tone: if is_completed {
+                Tone::FastOff
+            } else if in_progress {
+                Tone::Accent
+            } else {
+                Tone::Muted
+            },
             text: task_text,
-            tone: if is_completed { Tone::PlanDone } else if in_progress { Tone::Accent } else { Tone::Plain }, bold, tool_heading: None, pick: None,
+            tone: if is_completed {
+                Tone::PlanDone
+            } else if in_progress {
+                Tone::Accent
+            } else {
+                Tone::Plain
+            },
+            bold,
+            tool_heading: None,
+            pick: None,
             tail: elapsed
                 .map(|time| {
-                    vec![
-                        PaintSpan {
-                            text: format!(" ({time})"),
-                            tone: Tone::Muted,
-                            bold: false,
-                        },
-                    ]
+                    vec![PaintSpan {
+                        text: format!(" ({time})"),
+                        tone: Tone::Muted,
+                        bold: false,
+                    }]
                 })
                 .unwrap_or_default(),
         });
     }
     let all_completed = !summary.steps.is_empty() && completed == summary.steps.len();
     let header_tail = format!("{PLAN_TOGGLE_HINT}▲ ─┐");
-    let header_rule = "─".repeat(
-        line_width
-            .saturating_sub(5 + UnicodeWidthStr::width(title.as_str()) + UnicodeWidthStr::width(header_tail.as_str())),
-    );
-    let mut header_tail = vec![PaintSpan { text: "┌── ".to_owned(), tone: Tone::Plain, bold: false }];
-    header_tail.extend(plan_title_shimmer_spans(&title, plan_shimmer_phase, effort_tone));
+    let header_rule = "─".repeat(line_width.saturating_sub(
+        5 + UnicodeWidthStr::width(title.as_str()) + UnicodeWidthStr::width(header_tail.as_str()),
+    ));
+    let mut header_tail = vec![PaintSpan {
+        text: "┌── ".to_owned(),
+        tone: Tone::Plain,
+        bold: false,
+    }];
+    header_tail.extend(plan_title_shimmer_spans(
+        &title,
+        plan_shimmer_phase,
+        effort_tone,
+    ));
     header_tail.extend([
-        PaintSpan { text: format!(" {header_rule}"), tone: Tone::Plain, bold: false },
-        PaintSpan { text: PLAN_TOGGLE_HINT.to_owned(), tone: Tone::FastOff, bold: false },
-        PaintSpan { text: "▲ ".to_owned(), tone: Tone::Plain, bold: false },
-        PaintSpan { text: "─┐".to_owned(), tone: Tone::Plain, bold: false },
+        PaintSpan {
+            text: format!(" {header_rule}"),
+            tone: Tone::Plain,
+            bold: false,
+        },
+        PaintSpan {
+            text: PLAN_TOGGLE_HINT.to_owned(),
+            tone: Tone::FastOff,
+            bold: false,
+        },
+        PaintSpan {
+            text: "▲ ".to_owned(),
+            tone: Tone::Plain,
+            bold: false,
+        },
+        PaintSpan {
+            text: "─┐".to_owned(),
+            tone: Tone::Plain,
+            bold: false,
+        },
     ]);
     let header = PaintLine {
         prefix: String::new(),
@@ -5762,28 +5975,33 @@ fn plan_effort_tone(step_count: usize) -> Tone {
     }
 }
 
-fn plan_title_shimmer_spans(
-    text: &str,
-    phase: Option<f32>,
-    effort_tone: Tone,
-) -> Vec<PaintSpan> {
+fn plan_title_shimmer_spans(text: &str, phase: Option<f32>, effort_tone: Tone) -> Vec<PaintSpan> {
     let Some(phase) = phase else {
-        return vec![PaintSpan { text: text.to_owned(), tone: Tone::Plain, bold: false }];
+        return vec![PaintSpan {
+            text: text.to_owned(),
+            tone: Tone::Plain,
+            bold: false,
+        }];
     };
     let loop_phase = (phase.clamp(0.0, 0.999) * PLAN_SHIMMER_LOOPS) % 1.0;
-    shimmer_spans_with_band(text, loop_phase, theme::palette().foreground, PLAN_SHIMMER_BAND)
-        .into_iter()
-        .map(|span| PaintSpan {
-            tone: match span.tone {
-                Tone::Shimmer(_, level) => Tone::PlanShimmer(
-                    tone_rgb(effort_tone).unwrap_or(theme::palette().foreground),
-                    level,
-                ),
-                tone => tone,
-            },
-            ..span
-        })
-        .collect()
+    shimmer_spans_with_band(
+        text,
+        loop_phase,
+        theme::palette().foreground,
+        PLAN_SHIMMER_BAND,
+    )
+    .into_iter()
+    .map(|span| PaintSpan {
+        tone: match span.tone {
+            Tone::Shimmer(_, level) => Tone::PlanShimmer(
+                tone_rgb(effort_tone).unwrap_or(theme::palette().foreground),
+                level,
+            ),
+            tone => tone,
+        },
+        ..span
+    })
+    .collect()
 }
 
 fn format_plan_elapsed(elapsed: Duration) -> String {
@@ -5986,11 +6204,25 @@ fn block_lines_with_mode(
     let mut lines = if conversational {
         Vec::new()
     } else {
-        wrapped_line(marker, tone, &block.title, Tone::Plain, true, conversational_width)
+        wrapped_line(
+            marker,
+            tone,
+            &block.title,
+            Tone::Plain,
+            true,
+            conversational_width,
+        )
     };
     if block.body.is_empty() {
         if conversational {
-            lines.extend(wrapped_line(marker, tone, "", content_tone, false, conversational_width));
+            lines.extend(wrapped_line(
+                marker,
+                tone,
+                "",
+                content_tone,
+                false,
+                conversational_width,
+            ));
         }
         let lines = if chat_layout {
             assistant_chat_bubble_lines(lines)
@@ -6032,7 +6264,12 @@ fn block_lines_with_mode(
         } else if force_diff {
             let (prefix, prefix_tone) =
                 body_prefix(&mut first_content, marker, tone, "  ", Tone::Muted);
-            lines.extend(diff_line(&prefix, prefix_tone, raw_line, conversational_width));
+            lines.extend(diff_line(
+                &prefix,
+                prefix_tone,
+                raw_line,
+                conversational_width,
+            ));
         } else if let Some(separator) = raw_lines.get(line_index + 1)
             && let Some(header) = markdown_table_cells(raw_line)
             && let Some(alignments) = markdown_table_alignments(separator, header.len())
@@ -6040,7 +6277,10 @@ fn block_lines_with_mode(
             let table_start = line_index;
             let mut rows = vec![header];
             line_index += 2;
-            while let Some(row) = raw_lines.get(line_index).and_then(|line| markdown_table_cells(line)) {
+            while let Some(row) = raw_lines
+                .get(line_index)
+                .and_then(|line| markdown_table_cells(line))
+            {
                 if row.len() != rows[0].len() {
                     break;
                 }
@@ -6186,8 +6426,7 @@ fn markdown_table_lines(
     if alignments.len() != columns {
         return None;
     }
-    let available = usize::from(width)
-        .saturating_sub(UnicodeWidthStr::width(prefix) + 1);
+    let available = usize::from(width).saturating_sub(UnicodeWidthStr::width(prefix) + 1);
     const COLUMN_GAP: usize = 2;
     const MIN_CELL_WIDTH: usize = 4;
     let gap_width = columns.saturating_sub(1).saturating_mul(COLUMN_GAP);
@@ -6238,8 +6477,7 @@ fn markdown_table_lines(
                         *alignment,
                     )
                 })
-                .collect::<Vec<_>>()
-                ;
+                .collect::<Vec<_>>();
             let row_prefix = if output.is_empty() {
                 prefix
             } else {
@@ -6249,7 +6487,11 @@ fn markdown_table_lines(
                 row_prefix,
                 prefix_tone,
                 &cells,
-                if row_index == 0 { Tone::MarkdownHeading } else { tone },
+                if row_index == 0 {
+                    Tone::MarkdownHeading
+                } else {
+                    tone
+                },
                 false,
                 COLUMN_GAP,
             ));
@@ -6347,11 +6589,19 @@ fn assistant_chat_bubble_lines(mut lines: Vec<PaintLine>) -> Vec<PaintLine> {
     for line in &mut lines {
         let padding = width.saturating_sub(painted_line_width(line));
         if padding > 0 {
-            line.tail.push(PaintSpan { text: " ".repeat(padding), tone: Tone::AssistantBubble, bold: false });
+            line.tail.push(PaintSpan {
+                text: " ".repeat(padding),
+                tone: Tone::AssistantBubble,
+                bold: false,
+            });
         }
         // Keep the bubble band on syntax and inline-highlight spans too. The
         // empty span is only a row marker; it emits no terminal cells.
-        line.tail.push(PaintSpan { text: String::new(), tone: Tone::AssistantBubble, bold: false });
+        line.tail.push(PaintSpan {
+            text: String::new(),
+            tone: Tone::AssistantBubble,
+            bold: false,
+        });
     }
     let half = |glyph: char| PaintLine {
         prefix: String::new(),
@@ -6414,12 +6664,13 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     const RIGHT_GAP: usize = 0;
 
     let region_width = conversation_region_width(width);
-    let left_margin = usize::from(width).saturating_sub(1).saturating_sub(region_width);
+    let left_margin = usize::from(width)
+        .saturating_sub(1)
+        .saturating_sub(region_width);
     // The `> ` marker sits inside the region too, so its two columns come off
     // the content along with the padding on both sides of the bubble.
-    let content_width = region_width.saturating_sub(
-        RIGHT_GAP + (CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP) * 2 + 2,
-    );
+    let content_width = region_width
+        .saturating_sub(RIGHT_GAP + (CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP) * 2 + 2);
     let raw_lines = if block.body.is_empty() {
         vec![""]
     } else {
@@ -6450,13 +6701,9 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         .map(|line| UnicodeWidthStr::width(line.text.as_str()))
         .max()
         .unwrap_or(CHAT_BUBBLE_PADDING * 2);
-    let bubble_width = text_width
-        + CHAT_BUBBLE_PADDING
-        + CHAT_BUBBLE_RIGHT_GAP
-        + 2;
-    let half_prefix = " ".repeat(
-        left_margin + region_width.saturating_sub(RIGHT_GAP + bubble_width),
-    );
+    let bubble_width = text_width + CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP + 2;
+    let half_prefix =
+        " ".repeat(left_margin + region_width.saturating_sub(RIGHT_GAP + bubble_width));
     for (index, line) in lines.iter_mut().enumerate() {
         let padding = text_width.saturating_sub(UnicodeWidthStr::width(line.text.as_str()));
         if padding > 0 {
@@ -6655,9 +6902,7 @@ fn styled_lines(
     width: u16,
 ) -> Vec<PaintLine> {
     let prefix_width = UnicodeWidthStr::width(prefix);
-    let available = (width as usize)
-        .saturating_sub(prefix_width + 1)
-        .max(1);
+    let available = (width as usize).saturating_sub(prefix_width + 1).max(1);
     let mut rows: Vec<Vec<PaintSpan>> = vec![Vec::new()];
     let mut used = 0;
     let mut tokens: Vec<(bool, Vec<PaintSpan>, usize)> = Vec::new();
@@ -6702,7 +6947,12 @@ fn styled_lines(
         }
         if used > 0 {
             for span in pending_space.drain(..) {
-                push_highlight_span(rows.last_mut().expect("at least one styled row"), &span.text, span.tone, span.bold);
+                push_highlight_span(
+                    rows.last_mut().expect("at least one styled row"),
+                    &span.text,
+                    span.tone,
+                    span.bold,
+                );
             }
             used += pending_space_width;
         }
@@ -7542,12 +7792,7 @@ fn input_lines_with_controls(
             })
             .collect(),
     };
-    (
-        rows,
-        cursor_row - visible_start + 1,
-        cursor_column,
-        layout,
-    )
+    (rows, cursor_row - visible_start + 1, cursor_column, layout)
 }
 
 /// Prompt rows the composer paints before it starts scrolling instead of growing.
@@ -7813,11 +8058,23 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
 
     let custom_spans = false.then(|| {
         vec![
-            PaintSpan { text: format!("Response: {}", mode.response_length), tone: Tone::Muted, bold: false },
+            PaintSpan {
+                text: format!("Response: {}", mode.response_length),
+                tone: Tone::Muted,
+                bold: false,
+            },
             separator_span(),
-            PaintSpan { text: format!("Shell: {}", mode.shell_display_mode), tone: Tone::Muted, bold: false },
+            PaintSpan {
+                text: format!("Shell: {}", mode.shell_display_mode),
+                tone: Tone::Muted,
+                bold: false,
+            },
             separator_span(),
-            PaintSpan { text: format!("Diff: {}", mode.diff_display_mode), tone: Tone::Muted, bold: false },
+            PaintSpan {
+                text: format!("Diff: {}", mode.diff_display_mode),
+                tone: Tone::Muted,
+                bold: false,
+            },
         ]
     });
     let primary_spans = custom_spans.unwrap_or_else(|| vec![vibe_mode_span.clone()]);
@@ -8034,12 +8291,7 @@ fn paint_scroll_to_bottom_into_frame(frame: &mut CellFrame, row: usize, control:
         start,
         row,
         &control.text,
-        cell_style(
-            control.tone,
-            false,
-            word_background(control.tone),
-            false,
-        ),
+        cell_style(control.tone, false, word_background(control.tone), false),
     );
 }
 
@@ -8211,7 +8463,9 @@ fn print_line_with_selection_bounded(
         hovered_columns.as_ref(),
         line.prefix_tone,
         false,
-        word_background(line.prefix_tone).or(bubble_background).or(background),
+        word_background(line.prefix_tone)
+            .or(bubble_background)
+            .or(background),
     )?;
     print_hovered_chunks(
         out,
@@ -8221,7 +8475,9 @@ fn print_line_with_selection_bounded(
         hovered_columns.as_ref(),
         line.tone,
         line.bold,
-        word_background(line.tone).or(bubble_background).or(background),
+        word_background(line.tone)
+            .or(bubble_background)
+            .or(background),
     )?;
     queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
     for span in &line.tail {
@@ -8238,7 +8494,9 @@ fn print_line_with_selection_bounded(
             hovered_columns.as_ref(),
             span.tone,
             span.bold,
-            word_background(span.tone).or(bubble_background).or(background),
+            word_background(span.tone)
+                .or(bubble_background)
+                .or(background),
         )?;
         queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
     }
@@ -8277,7 +8535,9 @@ fn print_line_columns(
         hovered_columns.as_ref(),
         line.prefix_tone,
         false,
-        word_background(line.prefix_tone).or(bubble_background).or(background),
+        word_background(line.prefix_tone)
+            .or(bubble_background)
+            .or(background),
     )?;
     print_line_columns_piece(
         out,
@@ -8288,7 +8548,9 @@ fn print_line_columns(
         hovered_columns.as_ref(),
         line.tone,
         line.bold,
-        word_background(line.tone).or(bubble_background).or(background),
+        word_background(line.tone)
+            .or(bubble_background)
+            .or(background),
     )?;
     for span in &line.tail {
         if span.tone == Tone::CopyJoin {
@@ -8303,7 +8565,9 @@ fn print_line_columns(
             hovered_columns.as_ref(),
             span.tone,
             span.bold,
-            word_background(span.tone).or(bubble_background).or(background),
+            word_background(span.tone)
+                .or(bubble_background)
+                .or(background),
         )?;
     }
     Ok(())
@@ -8600,13 +8864,14 @@ mod tests {
     /// it, and stops short of the terminal's autowrap cell.
     #[test]
     fn side_panel_layout_keeps_a_gap_and_the_autowrap_guard() {
-        let layout = side_panel_layout(100).expect("100 columns carry the panel");
+        let layout =
+            side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
 
-        assert_eq!(layout.panel_width, SIDE_PANEL_WIDTH);
+        assert_eq!(layout.panel_width, SIDE_PANEL_WIDTHS[0]);
         assert_eq!(layout.panel_left, layout.main_width + SIDE_PANEL_GAP);
         assert_eq!(layout.panel_left + layout.panel_width, 99);
         assert_eq!(layout.content_left(), layout.panel_left + 2);
-        assert_eq!(layout.content_width(), SIDE_PANEL_WIDTH - 4);
+        assert_eq!(layout.content_width(), SIDE_PANEL_WIDTHS[0] - 4);
     }
 
     /// A terminal that cannot spare the room keeps the conversation full width
@@ -8615,46 +8880,89 @@ mod tests {
     fn a_narrow_terminal_refuses_to_open_the_side_panel() {
         let smallest = (SIDE_PANEL_MIN_MAIN_WIDTH
             + SIDE_PANEL_GAP
-            + SIDE_PANEL_WIDTH
+            + SIDE_PANEL_WIDTHS[0]
             + SIDE_PANEL_AUTOWRAP_GUARD) as u16;
 
-        assert!(side_panel_layout(smallest - 1).is_none());
+        assert!(side_panel_layout(smallest - 1, SIDE_PANEL_WIDTHS[0]).is_none());
         assert_eq!(
-            side_panel_layout(smallest).map(|layout| layout.main_width),
+            side_panel_layout(smallest, SIDE_PANEL_WIDTHS[0]).map(|layout| layout.main_width),
             Some(SIDE_PANEL_MIN_MAIN_WIDTH)
         );
     }
 
-    /// A full-width row background must stop at the main width, and the panel
-    /// surface must carry through to the frame's last cell.
+    /// A full-width row background must stop at the main width, and the panel's
+    /// own columns must carry no background at all — it is an outline, not a
+    /// filled surface.
     #[test]
-    fn a_bounded_row_leaves_the_side_panel_surface_intact() {
-        let layout = side_panel_layout(100).expect("100 columns carry the panel");
-        let mut frame = CellFrame::new(100, 2);
+    fn a_bounded_row_leaves_the_side_panel_unfilled() {
+        let layout =
+            side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
+        let mut frame = CellFrame::new(100, 3);
         let line = PaintLine {
             tone: Tone::UserPromptPadding,
             ..PaintLine::plain("hello")
         };
 
         paint_line_into_frame(&mut frame, 0, &line, None, None, Some(layout.main_width));
-        paint_side_panel_into_frame(&mut frame, layout, 2);
+        paint_side_panel_into_frame(&mut frame, layout, 3);
 
         assert_eq!(frame.cell(layout.main_width, 0).style, CellStyle::plain());
-        assert_eq!(
-            frame.cell(layout.panel_left, 0).style.background,
-            CellStyle::panel().background
-        );
-        assert_eq!(
-            frame.cell(99, 1).style.background,
-            CellStyle::panel().background
+        assert_eq!(frame.cell(layout.panel_left, 0).style.background, None);
+        assert_eq!(frame.cell(99, 1).style.background, None);
+        assert_eq!(frame.cell(layout.panel_left, 0).glyph, "╭");
+        let right = layout.panel_left + layout.panel_width - 1;
+        assert_eq!(frame.cell(right, 0).glyph, "╮");
+        assert_eq!(frame.cell(layout.panel_left, 1).glyph, "│");
+        assert_eq!(frame.cell(right, 1).glyph, "│");
+        assert_eq!(frame.cell(layout.panel_left, 2).glyph, "╰");
+        assert_eq!(frame.cell(right, 2).glyph, "╯");
+    }
+
+    /// The panel names its own close key on the top rule, the same way the plan
+    /// panel names its toggle key on its own header.
+    #[test]
+    fn the_side_panel_top_rule_names_its_own_close_key() {
+        let layout =
+            side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
+        let mut frame = CellFrame::new(100, 3);
+
+        paint_side_panel_into_frame(&mut frame, layout, 3);
+
+        let hint_start = layout.panel_left + 2;
+        let hint: String = (0..UnicodeWidthStr::width(SIDE_PANEL_TOGGLE_HINT))
+            .map(|offset| frame.cell(hint_start + offset, 0).glyph.clone())
+            .collect();
+        assert_eq!(hint, SIDE_PANEL_TOGGLE_HINT);
+        assert_eq!(frame.cell(hint_start, 0).style.background, None);
+    }
+
+    /// The top rule carries a close mark, and its column must match the click
+    /// region a real click resolves against — the paint step and the pick are
+    /// two different call sites and must not drift apart.
+    #[test]
+    fn the_side_panel_top_rule_paints_a_close_mark_at_its_own_pick_column() {
+        let layout =
+            side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
+        let mut frame = CellFrame::new(100, 3);
+
+        paint_side_panel_into_frame(&mut frame, layout, 3);
+
+        let close_column = side_panel_close_column(layout).expect("wide enough for a close mark");
+        assert_eq!(frame.cell(close_column, 0).glyph, "X");
+        assert_eq!(frame.cell(close_column, 0).style.background, None);
+        let right = layout.panel_left + layout.panel_width - 1;
+        assert!(
+            close_column < right,
+            "the mark must not overwrite the corner"
         );
     }
 
-    /// Repainting a single animated row must restore that row's panel cells, or
-    /// the spinner would punch a hole through the panel.
+    /// Repainting a single animated row must restore that row's border cells, or
+    /// the spinner would punch a hole through the panel outline.
     #[test]
     fn a_single_row_repaint_redraws_that_row_of_the_side_panel() {
-        let layout = side_panel_layout(100).expect("100 columns carry the panel");
+        let layout =
+            side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
         let mut row = CellFrame::new(100, 1);
 
         paint_line_into_frame(
@@ -8667,11 +8975,9 @@ mod tests {
         );
         paint_side_panel_row_into_frame(&mut row, layout, 0, 1, 30);
 
-        assert_eq!(
-            row.cell(layout.panel_left, 0).style.background,
-            CellStyle::panel().background
-        );
-        assert_eq!(row.cell(layout.content_left(), 0).glyph, "A");
+        assert_eq!(row.cell(layout.panel_left, 0).style.background, None);
+        assert_eq!(row.cell(layout.panel_left, 0).glyph, "│");
+        assert_eq!(row.cell(layout.content_left(), 0).glyph, "S");
     }
 
     #[test]
@@ -8722,7 +9028,10 @@ mod tests {
             None,
         );
 
-        assert_eq!(frame.cell(6, 0).style.background, row_background(Tone::UserPrompt));
+        assert_eq!(
+            frame.cell(6, 0).style.background,
+            row_background(Tone::UserPrompt)
+        );
         assert_eq!(frame.cell(7, 0).style.background, None);
     }
 
@@ -8749,10 +9058,22 @@ mod tests {
             None,
         );
 
-        assert_eq!(frame.cell(0, 0).style.background, row_background(Tone::UserPrompt));
-        assert_eq!(frame.cell(1, 0).style.background, row_background(Tone::UserPrompt));
-        assert_eq!(frame.cell(2, 0).style.background, row_background(Tone::UserPrompt));
-        assert_eq!(frame.cell(6, 0).style.background, row_background(Tone::UserPrompt));
+        assert_eq!(
+            frame.cell(0, 0).style.background,
+            row_background(Tone::UserPrompt)
+        );
+        assert_eq!(
+            frame.cell(1, 0).style.background,
+            row_background(Tone::UserPrompt)
+        );
+        assert_eq!(
+            frame.cell(2, 0).style.background,
+            row_background(Tone::UserPrompt)
+        );
+        assert_eq!(
+            frame.cell(6, 0).style.background,
+            row_background(Tone::UserPrompt)
+        );
         assert_eq!(frame.cell(7, 0).style.background, None);
     }
 
@@ -8760,7 +9081,11 @@ mod tests {
     fn wrapped_user_prompt_repeats_its_border_on_every_row() {
         CHAT_LAYOUT.store(false, Ordering::Relaxed);
         let lines = user_prompt_lines(
-            &Block::new(BlockKind::User, "You", "a prompt long enough to wrap across several rows"),
+            &Block::new(
+                BlockKind::User,
+                "You",
+                "a prompt long enough to wrap across several rows",
+            ),
             18,
         );
 
@@ -8794,7 +9119,10 @@ mod tests {
             None,
         );
 
-        assert_eq!(frame.cell(6, 0).style.background, row_background(Tone::ModelChange));
+        assert_eq!(
+            frame.cell(6, 0).style.background,
+            row_background(Tone::ModelChange)
+        );
         assert_eq!(frame.cell(7, 0).style.background, None);
     }
 
@@ -8870,8 +9198,7 @@ mod tests {
         current.write(0, 0, "x", CellStyle::plain());
         let mut output = Vec::new();
 
-        emit_frame_diff_at(&mut output, Some(&previous), &current, 7)
-            .expect("row diff emits");
+        emit_frame_diff_at(&mut output, Some(&previous), &current, 7).expect("row diff emits");
 
         let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
         assert!(output.contains("\x1b[8;1H"));
@@ -8897,13 +9224,7 @@ mod tests {
             ..CellStyle::plain()
         };
         let mut before = CellFrame::new(16, 1);
-        before.fill(
-            0,
-            0,
-            16,
-            1,
-            style,
-        );
+        before.fill(0, 0, 16, 1, style);
         before.write(4, 0, "한글 단어", style);
         let mut after = CellFrame::new(16, 1);
         after.fill(0, 0, 16, 1, style);
@@ -9272,10 +9593,20 @@ mod tests {
         let (rows, cursor_row, _, layout) =
             input_lines(&editor, &[], 40, "", "placeholder", None, None);
 
-        assert_eq!(rows.len(), COMPOSER_MAX_PROMPT_ROWS + 2, "the two rules stay");
+        assert_eq!(
+            rows.len(),
+            COMPOSER_MAX_PROMPT_ROWS + 2,
+            "the two rules stay"
+        );
         assert_eq!(layout.rows.len(), COMPOSER_MAX_PROMPT_ROWS);
-        assert_eq!(cursor_row, COMPOSER_MAX_PROMPT_ROWS, "the last row is in view");
-        assert!(painted(&rows[1]).contains("11"), "the window follows the cursor");
+        assert_eq!(
+            cursor_row, COMPOSER_MAX_PROMPT_ROWS,
+            "the last row is in view"
+        );
+        assert!(
+            painted(&rows[1]).contains("11"),
+            "the window follows the cursor"
+        );
         assert!(painted(&rows[COMPOSER_MAX_PROMPT_ROWS]).contains("20"));
 
         // Back at the top, the window shows the first rows and the prompt mark.
@@ -9492,8 +9823,8 @@ mod tests {
             selection_columns_for_line(&list, full_row(&list, 0), 0),
             Some(2..painted_line_width(&list))
         );
-        let deeper = wrapped_line("    - ", Tone::Accent, "second", Tone::Plain, false, 80)
-            .remove(0);
+        let deeper =
+            wrapped_line("    - ", Tone::Accent, "second", Tone::Plain, false, 80).remove(0);
         assert_eq!(
             selection_columns_for_line(&deeper, full_row(&deeper, 0), 0),
             Some(4..painted_line_width(&deeper))
@@ -9587,7 +9918,10 @@ mod tests {
             start: CellPosition { column: 0, row: 2 },
             end: CellPosition { column: 7, row: 2 },
         };
-        assert_eq!(selection_columns_for_line(&lines[2], second_row, 2), Some(2..8));
+        assert_eq!(
+            selection_columns_for_line(&lines[2], second_row, 2),
+            Some(2..8)
+        );
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
         renderer.previous_lines = lines;
 
@@ -9831,10 +10165,16 @@ mod tests {
     #[test]
     fn multiline_user_prompt_uses_the_longest_line_as_one_right_bubble() {
         CHAT_LAYOUT.store(true, Ordering::Relaxed);
-        let lines = user_prompt_lines(&Block::new(BlockKind::User, "You", "longest line\nshort"), 80);
+        let lines = user_prompt_lines(
+            &Block::new(BlockKind::User, "You", "longest line\nshort"),
+            80,
+        );
 
         assert_eq!(lines[0].tone, Tone::UserPromptPadding);
-        assert_eq!(UnicodeWidthStr::width(lines[1].prefix.as_str()), UnicodeWidthStr::width(lines[2].prefix.as_str()));
+        assert_eq!(
+            UnicodeWidthStr::width(lines[1].prefix.as_str()),
+            UnicodeWidthStr::width(lines[2].prefix.as_str())
+        );
         assert_eq!(painted_line_width(&lines[1]), painted_line_width(&lines[2]));
         assert_eq!(lines[2].text.trim(), "short");
         assert!(lines[1].prefix.ends_with("› "));
@@ -9856,20 +10196,26 @@ mod tests {
     #[test]
     fn chat_messages_use_opposite_80_percent_anchors() {
         let user = block_lines(&Block::new(BlockKind::User, "You", "x".repeat(120)), 80);
-        let assistant = block_lines(&Block::new(BlockKind::Assistant, "Codex", "x".repeat(120)), 80);
+        let assistant = block_lines(
+            &Block::new(BlockKind::Assistant, "Codex", "x".repeat(120)),
+            80,
+        );
 
         assert_eq!(conversation_region_width(80), 63);
         assert_eq!(UnicodeWidthStr::width(user[1].prefix.as_str()), 20);
         assert_eq!(UnicodeWidthStr::width(user[1].text.as_str()), 59);
-        assert!(user
-            .iter()
-            .filter(|line| line.tone == Tone::UserPrompt)
-            .all(|line| UnicodeWidthStr::width(line.prefix.as_str()) >= 16
-                && painted_width(line) == 79));
-        assert!(assistant
-            .iter()
-            .filter(|line| !line.text.is_empty())
-            .all(|line| painted_width(line) <= 64));
+        assert!(
+            user.iter()
+                .filter(|line| line.tone == Tone::UserPrompt)
+                .all(|line| UnicodeWidthStr::width(line.prefix.as_str()) >= 16
+                    && painted_width(line) == 79)
+        );
+        assert!(
+            assistant
+                .iter()
+                .filter(|line| !line.text.is_empty())
+                .all(|line| painted_width(line) <= 64)
+        );
     }
 
     #[test]
@@ -10086,7 +10432,10 @@ mod tests {
     fn wrapped_lines_reserve_the_final_column_from_autowrap() {
         let lines = wrapped_line("● ", Tone::Accent, "abcdef", Tone::Plain, false, 8);
 
-        assert_eq!(lines.iter().map(painted_width).collect::<Vec<_>>(), vec![7, 3]);
+        assert_eq!(
+            lines.iter().map(painted_width).collect::<Vec<_>>(),
+            vec![7, 3]
+        );
         assert_eq!(painted(&lines[0]), "● abcde");
         assert_eq!(painted(&lines[1]), "  f");
     }
@@ -10306,10 +10655,12 @@ mod tests {
         assert!(lines[0].text.starts_with("항목"));
         assert_eq!(lines[0].tone, Tone::MarkdownHeading);
         assert!(!lines[0].bold);
-        assert!(lines[0]
-            .tail
-            .iter()
-            .all(|span| span.tone != Tone::AssistantBubble));
+        assert!(
+            lines[0]
+                .tail
+                .iter()
+                .all(|span| span.tone != Tone::AssistantBubble)
+        );
         assert!(lines[1].text.chars().all(|ch| ch == '─'));
         assert!(lines.last().expect("data row").text.contains("릴리즈 빌드"));
     }
@@ -10340,7 +10691,10 @@ mod tests {
     fn markdown_table_wraps_long_cells_and_honors_alignment() {
         let rows = vec![
             vec!["설명".to_owned(), "값".to_owned()],
-            vec!["긴 설명도 열 안에서 여러 줄로 자연스럽게 표시됩니다".to_owned(), "42".to_owned()],
+            vec![
+                "긴 설명도 열 안에서 여러 줄로 자연스럽게 표시됩니다".to_owned(),
+                "42".to_owned(),
+            ],
         ];
         let alignments = vec![TableAlignment::Left, TableAlignment::Right];
 
@@ -10348,7 +10702,11 @@ mod tests {
             .expect("table fits the available width");
 
         assert!(lines.len() > 3);
-        assert!(lines.iter().all(|line| UnicodeWidthStr::width(painted(line).as_str()) <= 29));
+        assert!(
+            lines
+                .iter()
+                .all(|line| UnicodeWidthStr::width(painted(line).as_str()) <= 29)
+        );
         assert!(lines.iter().any(|line| painted(line).ends_with("42")));
     }
 
@@ -10439,7 +10797,11 @@ mod tests {
                 .iter()
                 .any(|line| line.trim_end() == "  cargo run --release")
         );
-        assert!(rendered.iter().all(|line| !line.contains(['┌', '┐', '└', '┘', '│'])));
+        assert!(
+            rendered
+                .iter()
+                .all(|line| !line.contains(['┌', '┐', '└', '┘', '│']))
+        );
     }
 
     /// The gutter is what makes a patch readable: `@@` headers are spent on line
@@ -10649,10 +11011,12 @@ mod tests {
         );
         assert!(expanded.iter().any(|line| painted(line).contains("old")));
         assert!(expanded.iter().any(|line| painted(line).contains("after")));
-        assert!(expanded
-            .iter()
-            .filter(|line| line.tool_heading.is_some())
-            .all(|line| line.tool_heading == Some(group.id())));
+        assert!(
+            expanded
+                .iter()
+                .filter(|line| line.tool_heading.is_some())
+                .all(|line| line.tool_heading == Some(group.id()))
+        );
     }
 
     #[test]
@@ -11128,11 +11492,16 @@ mod tests {
         assert_eq!(line.prefix, " ");
         assert_eq!(line.text, "");
         assert_eq!(line.tail.first().map(|span| span.text.as_str()), Some("⠴ "));
-        assert_eq!(line.tail.first().map(|span| span.tone), Some(Tone::ModelTerra));
+        assert_eq!(
+            line.tail.first().map(|span| span.tone),
+            Some(Tone::ModelTerra)
+        );
         assert_eq!(line.tone, Tone::ModelTerra);
-        assert!(line.tail.iter().any(
-            |span| span.text == " (2m 12s)" && span.tone == Tone::ModelTerra
-        ));
+        assert!(
+            line.tail
+                .iter()
+                .any(|span| span.text == " (2m 12s)" && span.tone == Tone::ModelTerra)
+        );
         assert_eq!(
             line.tail
                 .iter()
@@ -11261,7 +11630,12 @@ mod tests {
 
         assert_eq!(
             lines.iter().map(painted).collect::<Vec<_>>(),
-            [" X Queue: first", " X Queue: second", " X Queue: third", " X Queue: fourth"]
+            [
+                " X Queue: first",
+                " X Queue: second",
+                " X Queue: third",
+                " X Queue: fourth"
+            ]
         );
         assert_eq!(pick_on(&lines[3], "X"), Some(Pick::RemoveQueuedPrompt(3)));
     }
@@ -11336,6 +11710,7 @@ mod tests {
             None,
             None,
             0.5,
+            0.5,
             StatusArea {
                 fallback: String::new(),
                 line: None,
@@ -11368,10 +11743,7 @@ mod tests {
         assert_eq!(rule_width(&line), 120);
         assert!(painted(&line).starts_with('╭'));
         // Two blanks off the rule, the badge, then the rule resumes for two columns.
-        assert_eq!(
-            texts,
-            ["  ", "Vibe: On", " · ", "Fast: On", " ", "─╮"]
-        );
+        assert_eq!(texts, ["  ", "Vibe: On", " · ", "Fast: On", " ", "─╮"]);
         assert_eq!(line.tail[1].tone, Tone::FastOn);
         assert_eq!(line.tail[3].tone, Tone::FastOn);
     }
@@ -11384,9 +11756,11 @@ mod tests {
         let line = input_top_line(120, "", Some(&mode));
 
         assert!(!painted(&line).contains("Fast:"));
-        assert!(line.pick.as_ref().is_none_or(|picks| {
-            picks.0.iter().all(|(_, _, pick)| *pick != Pick::FastMode)
-        }));
+        assert!(
+            line.pick
+                .as_ref()
+                .is_none_or(|picks| { picks.0.iter().all(|(_, _, pick)| *pick != Pick::FastMode) })
+        );
     }
 
     /// The slot Fast holds on a Codex thread carries Claude's permission mode,
@@ -11516,10 +11890,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(rule_width(&line), 80);
-        assert_eq!(
-            texts,
-            ["  ", "Vibe: On", " · ", "Fast: Off", " ", "─╮"]
-        );
+        assert_eq!(texts, ["  ", "Vibe: On", " · ", "Fast: Off", " ", "─╮"]);
         assert_eq!(line.tail[3].tone, Tone::FastOff);
     }
 
@@ -11557,7 +11928,11 @@ mod tests {
 
     #[test]
     fn vibe_badge_is_clickable_outside_custom_mode() {
-        let line = input_top_line(120, "", Some(&test_mode("Full Access", ModeAccent::Danger, false)));
+        let line = input_top_line(
+            120,
+            "",
+            Some(&test_mode("Full Access", ModeAccent::Danger, false)),
+        );
 
         assert_eq!(pick_on(&line, "Vibe: On"), Some(Pick::VibeMode));
     }
@@ -11794,10 +12169,17 @@ mod tests {
     fn transcript_gutters_use_the_theme_accent() {
         // The assistant gutter uses the same circular mark as a response's first row.
         for (block, tone) in [
-            (Block::new(BlockKind::Assistant, "Codex", "answer"), Tone::FastOff),
+            (
+                Block::new(BlockKind::Assistant, "Codex", "answer"),
+                Tone::FastOff,
+            ),
             (Block::new(BlockKind::Tool, "Shell", "output"), Tone::Accent),
             (
-                Block::new(BlockKind::FileChange, "Update(src/main.rs)", "Added 1 · Removed 0"),
+                Block::new(
+                    BlockKind::FileChange,
+                    "Update(src/main.rs)",
+                    "Added 1 · Removed 0",
+                ),
                 Tone::Accent,
             ),
             (Block::new(BlockKind::Diff, "Diff", "changed"), Tone::Accent),
@@ -11888,13 +12270,7 @@ mod tests {
             PaintLine::plain("second visible row"),
         ];
         let start = transcript_start_below_plan(&transcript, 0);
-        let (screen, _) = compose_screen(
-            &transcript,
-            text_rows(1, "composer"),
-            2,
-            start,
-            0,
-        );
+        let (screen, _) = compose_screen(&transcript, text_rows(1, "composer"), 2, start, 0);
 
         assert_eq!(start, 2);
         assert_eq!(
@@ -12065,7 +12441,10 @@ mod tests {
         assert_eq!(control.text, " Scroll to bottom (Ctrl+↓) ");
         assert_eq!(control.tone, Tone::ScrollToBottom);
         assert_eq!(tone_rgb(control.tone), Some(theme::palette().foreground));
-        assert_eq!(word_background(control.tone), Some(theme::palette().hover_bg));
+        assert_eq!(
+            word_background(control.tone),
+            Some(theme::palette().hover_bg)
+        );
         assert_eq!(
             pick_on(&control, "Scroll to bottom"),
             Some(Pick::ScrollToBottom)
@@ -12092,7 +12471,10 @@ mod tests {
         renderer.previous_lines = vec![line];
 
         assert!(renderer.begin_selection(12, 0));
-        assert_eq!(renderer.finish_selection(12, 0), SelectionResult::Click(12, 0));
+        assert_eq!(
+            renderer.finish_selection(12, 0),
+            SelectionResult::Click(12, 0)
+        );
         assert_eq!(renderer.pick_at(12, 0), Some(Pick::ScrollToBottom));
     }
 
@@ -12971,6 +13353,25 @@ mod tests {
     }
 
     #[test]
+    fn status_line_places_the_five_hour_countdown_before_its_percent() {
+        let line = status_line_row(
+            Some(StatusLineView {
+                model: None,
+                effort: None,
+                context: None,
+                five_hour_percent: Some(3),
+                five_hour_remaining: Some("4h 38m".to_owned()),
+                weekly_percent: None,
+                notice: None,
+            }),
+            "",
+            80,
+        );
+
+        assert!(painted(&line).contains("4h 38m: 3%"));
+    }
+
+    #[test]
     fn status_line_omits_a_disabled_branch_slot() {
         let line = status_line_row(
             Some(StatusLineView {
@@ -13100,6 +13501,16 @@ mod tests {
         assert_eq!(narrow, " ⠴ Compacting.. (4s)");
     }
 
+    #[test]
+    fn the_compacting_label_shimmers_independently_from_its_progress_block() {
+        let line = activity_lines_with_progress("Compacting.. (4s)", None, 0.0, 0.5, 80);
+
+        assert_eq!(
+            painted(&line[0]),
+            " ⠋ Compacting.. [░░░░░░░░████░░░░░░░░] (4s)"
+        );
+    }
+
     /// The reading belongs to compaction alone: an ordinary turn keeps its plain
     /// elapsed tail even though both rows share the loader.
     #[test]
@@ -13169,7 +13580,9 @@ mod tests {
                 "width {width}: card still draws a border"
             );
             assert!(
-                lines.iter().all(|line| painted_width(line) <= width as usize),
+                lines
+                    .iter()
+                    .all(|line| painted_width(line) <= width as usize),
                 "width {width}: a row overflows the terminal"
             );
         }
@@ -13589,36 +14002,36 @@ mod tests {
         editor.insert_str("직접 쓴 답");
         fn overlay(editor: Option<&Editor>) -> OverlayView<'_> {
             OverlayView {
-            closable: false,
-            title: "테스트".to_owned(),
-            lines: vec![
-                OverlayLine {
-                    text: "어느 것 고를래?".to_owned(),
-                    selected: false,
-                    muted: false,
-                },
-                OverlayLine {
-                    text: "선택지 A\n첫 번째".to_owned(),
-                    selected: false,
-                    muted: false,
-                },
-                OverlayLine {
-                    text: "직접 입력".to_owned(),
-                    selected: true,
-                    muted: false,
-                },
-                OverlayLine {
-                    text: "이 내용으로 대화하기".to_owned(),
-                    selected: false,
-                    muted: false,
-                },
-            ],
-            slider: None,
-            hint: "Enter 전송 · Esc 취소".to_owned(),
-            style: OverlayStyle::Question,
-            input: editor,
-            input_label: "Answer",
-            input_placeholder: "여기에 직접 입력…",
+                closable: false,
+                title: "테스트".to_owned(),
+                lines: vec![
+                    OverlayLine {
+                        text: "어느 것 고를래?".to_owned(),
+                        selected: false,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: "선택지 A\n첫 번째".to_owned(),
+                        selected: false,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: "직접 입력".to_owned(),
+                        selected: true,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: "이 내용으로 대화하기".to_owned(),
+                        selected: false,
+                        muted: false,
+                    },
+                ],
+                slider: None,
+                hint: "Enter 전송 · Esc 취소".to_owned(),
+                style: OverlayStyle::Question,
+                input: editor,
+                input_label: "Answer",
+                input_placeholder: "여기에 직접 입력…",
             }
         }
         let status = || StatusArea {
@@ -13658,9 +14071,7 @@ mod tests {
         let empty_frame = overlay_frame(&[], overlay(Some(&empty)), None, status(), 80);
         let empty_painted = empty_frame.lines.iter().map(painted).collect::<Vec<_>>();
         assert!(
-            empty_painted
-                .iter()
-                .any(|line| line.starts_with("│ ❯ 2. ")),
+            empty_painted.iter().any(|line| line.starts_with("│ ❯ 2. ")),
             "the empty answer row lost its selected row: {empty_painted:?}"
         );
         assert!(
@@ -14262,7 +14673,8 @@ mod tests {
         let steps = effort_step_lines(&slider, 80).remove(1);
         let selected = "│ MEDIUM │";
         let painted_steps = painted(&steps);
-        let selected_start = UnicodeWidthStr::width(&painted_steps[..painted_steps.find(selected).unwrap()]);
+        let selected_start =
+            UnicodeWidthStr::width(&painted_steps[..painted_steps.find(selected).unwrap()]);
 
         assert_eq!(
             Renderer::hover_columns(&steps, None, Some(&Pick::Effort(1))),
@@ -14509,8 +14921,7 @@ mod tests {
             "",
             Some(&test_mode("Full Access", ModeAccent::Danger, true)),
         );
-        let vibe =
-            Renderer::hover_columns(&line, None, Some(&Pick::VibeMode)).expect("vibe badge");
+        let vibe = Renderer::hover_columns(&line, None, Some(&Pick::VibeMode)).expect("vibe badge");
         let fast = Renderer::hover_columns(&line, None, Some(&Pick::FastMode)).expect("fast badge");
         let mut output = Vec::new();
 
@@ -14735,10 +15146,30 @@ mod tests {
     fn claude_models_use_the_devez_code_colors_everywhere() {
         let palette = theme::palette();
         for (model, model_tone, status_tone, color) in [
-            ("Claude Haiku", Tone::ModelHaiku, Tone::StatusModelHaiku, palette.status.model_haiku),
-            ("Claude Sonnet", Tone::ModelSonnet, Tone::StatusModelSonnet, palette.status.model_sonnet),
-            ("Claude Opus", Tone::ModelOpus, Tone::StatusModelOpus, palette.status.model_opus),
-            ("Claude Fable", Tone::ModelFable, Tone::StatusModelFable, palette.status.model_fable),
+            (
+                "Claude Haiku",
+                Tone::ModelHaiku,
+                Tone::StatusModelHaiku,
+                palette.status.model_haiku,
+            ),
+            (
+                "Claude Sonnet",
+                Tone::ModelSonnet,
+                Tone::StatusModelSonnet,
+                palette.status.model_sonnet,
+            ),
+            (
+                "Claude Opus",
+                Tone::ModelOpus,
+                Tone::StatusModelOpus,
+                palette.status.model_opus,
+            ),
+            (
+                "Claude Fable",
+                Tone::ModelFable,
+                Tone::StatusModelFable,
+                palette.status.model_fable,
+            ),
         ] {
             assert_eq!(super::model_tone(model), Some(model_tone));
             assert_eq!(status_model_tone(model), Some(status_tone));
@@ -14749,7 +15180,10 @@ mod tests {
 
     #[test]
     fn terra_uses_the_reference_green_model_colour() {
-        assert_eq!(tone_rgb(Tone::ModelTerra), Some(theme::palette().model_terra));
+        assert_eq!(
+            tone_rgb(Tone::ModelTerra),
+            Some(theme::palette().model_terra)
+        );
     }
 
     #[test]
@@ -14757,7 +15191,10 @@ mod tests {
         assert_eq!(model_tone("GPT-5.6"), Some(Tone::Model56));
         assert_eq!(model_tone("GPT-5.3-Codex-Spark"), Some(Tone::ModelSpark));
         assert_eq!(tone_rgb(Tone::Model56), Some(theme::palette().model_gpt56));
-        assert_eq!(tone_rgb(Tone::ModelSpark), Some(theme::palette().model_spark));
+        assert_eq!(
+            tone_rgb(Tone::ModelSpark),
+            Some(theme::palette().model_spark)
+        );
     }
 
     #[test]
@@ -14782,7 +15219,7 @@ mod tests {
         assert_eq!(lines.len(), 12);
         assert!(painted(&lines[0]).starts_with("┌── 작업 단계 · 0 / 7 완료"));
         assert!(painted(&lines[0]).ends_with('┐'));
-        assert!(lines[0].tail.iter().any(|span| span.text == " Alt + P "));
+        assert!(lines[0].tail.iter().any(|span| span.text == " Alt + W "));
         assert!(lines[0].tail.iter().any(|span| span.tone == Tone::FastOff));
         assert!(lines[1].text.is_empty());
         assert!(painted(&lines[8]).contains("     Task 7"));
@@ -14797,7 +15234,12 @@ mod tests {
     fn expanded_plan_summary_header_has_a_collapse_mark() {
         let summary = PlanSummary {
             explanation: None,
-            steps: vec![PlanStep { text: "Done".to_owned(), status: PlanStepStatus::Completed, started_at: None, elapsed: None }],
+            steps: vec![PlanStep {
+                text: "Done".to_owned(),
+                status: PlanStepStatus::Completed,
+                started_at: None,
+                elapsed: None,
+            }],
             expanded: true,
             started_at: Instant::now(),
             elapsed: None,
@@ -14805,7 +15247,7 @@ mod tests {
 
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None);
 
-        assert!(painted(&lines[0]).ends_with(" Alt + P ▲ ─┐"));
+        assert!(painted(&lines[0]).ends_with(" Alt + W ▲ ─┐"));
         assert_eq!(UnicodeWidthStr::width(painted(&lines[0]).as_str()), 79);
         assert!(lines[0].tail.iter().any(|span| span.tone == Tone::FastOff));
         assert_eq!(pick_on(&lines[0], "▲"), Some(Pick::PlanSummary));
@@ -14815,7 +15257,12 @@ mod tests {
     fn collapsed_plan_summary_shows_only_a_straight_header_with_expand_mark() {
         let summary = PlanSummary {
             explanation: None,
-            steps: vec![PlanStep { text: "Task".to_owned(), status: PlanStepStatus::Pending, started_at: None, elapsed: None }],
+            steps: vec![PlanStep {
+                text: "Task".to_owned(),
+                status: PlanStepStatus::Pending,
+                started_at: None,
+                elapsed: None,
+            }],
             expanded: false,
             started_at: Instant::now(),
             elapsed: None,
@@ -14825,7 +15272,7 @@ mod tests {
 
         assert_eq!(lines.len(), 2);
         assert!(painted(&lines[0]).starts_with("─── 작업 단계"));
-        assert!(painted(&lines[0]).trim_end().ends_with("Alt + P ▼ ──"));
+        assert!(painted(&lines[0]).trim_end().ends_with("Alt + W ▼ ──"));
         assert_eq!(lines[0].tail[0].tone, Tone::FastOff);
         assert!(!painted(&lines[0]).contains(['┌', '┐']));
         assert_eq!(pick_on(&lines[0], "작업 단계"), None);
@@ -14843,11 +15290,36 @@ mod tests {
         let summary = PlanSummary {
             explanation: None,
             steps: vec![
-                PlanStep { text: "Task 1".to_owned(), status: PlanStepStatus::Completed, started_at: None, elapsed: None },
-                PlanStep { text: "Task 2".to_owned(), status: PlanStepStatus::Pending, started_at: None, elapsed: None },
-                PlanStep { text: "Task 3".to_owned(), status: PlanStepStatus::Completed, started_at: None, elapsed: None },
-                PlanStep { text: "Task 4".to_owned(), status: PlanStepStatus::Pending, started_at: None, elapsed: None },
-                PlanStep { text: "Task 5".to_owned(), status: PlanStepStatus::Pending, started_at: None, elapsed: None },
+                PlanStep {
+                    text: "Task 1".to_owned(),
+                    status: PlanStepStatus::Completed,
+                    started_at: None,
+                    elapsed: None,
+                },
+                PlanStep {
+                    text: "Task 2".to_owned(),
+                    status: PlanStepStatus::Pending,
+                    started_at: None,
+                    elapsed: None,
+                },
+                PlanStep {
+                    text: "Task 3".to_owned(),
+                    status: PlanStepStatus::Completed,
+                    started_at: None,
+                    elapsed: None,
+                },
+                PlanStep {
+                    text: "Task 4".to_owned(),
+                    status: PlanStepStatus::Pending,
+                    started_at: None,
+                    elapsed: None,
+                },
+                PlanStep {
+                    text: "Task 5".to_owned(),
+                    status: PlanStepStatus::Pending,
+                    started_at: None,
+                    elapsed: None,
+                },
             ],
             expanded: true,
             started_at: Instant::now(),
@@ -14947,7 +15419,12 @@ mod tests {
     fn in_progress_plan_step_uses_the_working_spinner_without_shimmer() {
         let summary = PlanSummary {
             explanation: None,
-            steps: vec![PlanStep { text: "Working task".to_owned(), status: PlanStepStatus::InProgress, started_at: None, elapsed: None }],
+            steps: vec![PlanStep {
+                text: "Working task".to_owned(),
+                status: PlanStepStatus::InProgress,
+                started_at: None,
+                elapsed: None,
+            }],
             expanded: true,
             started_at: Instant::now(),
             elapsed: None,
@@ -14975,9 +15452,14 @@ mod tests {
     fn plan_title_shimmer_moves_five_times_over_the_default_text() {
         assert_eq!(PLAN_SHIMMER_BAND, SHIMMER_BAND * 2.5);
         assert_eq!(PLAN_SHIMMER_LOOPS, 5.0);
-        let title = plan_title_shimmer_spans("작업 단계 · 1 / 3 완료", Some(0.125), Tone::EffortMedium);
+        let title =
+            plan_title_shimmer_spans("작업 단계 · 1 / 3 완료", Some(0.125), Tone::EffortMedium);
 
-        assert!(title.iter().any(|span| matches!(span.tone, Tone::PlanShimmer(_, _))));
+        assert!(
+            title
+                .iter()
+                .any(|span| matches!(span.tone, Tone::PlanShimmer(_, _)))
+        );
         assert_eq!(
             plan_title_shimmer_spans("작업 단계 · 1 / 3 완료", None, Tone::EffortMedium)[0].tone,
             Tone::Plain
@@ -14988,7 +15470,12 @@ mod tests {
     fn inactive_in_progress_plan_step_uses_a_static_triangle() {
         let summary = PlanSummary {
             explanation: None,
-            steps: vec![PlanStep { text: "Paused task".to_owned(), status: PlanStepStatus::InProgress, started_at: None, elapsed: None }],
+            steps: vec![PlanStep {
+                text: "Paused task".to_owned(),
+                status: PlanStepStatus::InProgress,
+                started_at: None,
+                elapsed: None,
+            }],
             expanded: true,
             started_at: Instant::now(),
             elapsed: None,
@@ -15041,4 +15528,3 @@ mod tests {
         );
     }
 }
-

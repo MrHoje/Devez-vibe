@@ -28,8 +28,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use app_server::ServerEvent;
-use backend::BackendServer;
 use arboard::{Clipboard, ImageData};
+use backend::BackendServer;
 use clap::Parser;
 use completion::collect_workspace_entries;
 use crossterm::event::{
@@ -39,9 +39,7 @@ use crossterm::event::{
 use editor::Editor;
 use futures_util::StreamExt;
 use integrations::{McpServerInfo, PluginCatalog, PluginDetail, PluginInfo, PluginScope};
-use paste::{
-    BufferedText, BufferedTextTarget, ComposerInput, ComposerPasteBuffer, PasteBurst,
-};
+use paste::{BufferedText, BufferedTextTarget, ComposerInput, ComposerPasteBuffer, PasteBurst};
 use provider::{ProviderAuthKind, ProviderAuthRequest};
 use renderer::{BlockKind, Pick, RenderMode, Renderer, SelectionResult, TerminalSession, View};
 use serde_json::{Value, json};
@@ -140,14 +138,8 @@ async fn main() -> Result<()> {
     theme::set_current(selected_theme);
     devezcode::init();
     let cwd = resolve_cwd(cli.cwd.as_deref())?;
-    let mut server = BackendServer::spawn(
-        &cli.codex,
-        &cli.open_code,
-        &cli.node,
-        &cli.claude,
-        &cwd,
-    )
-    .await?;
+    let mut server =
+        BackendServer::spawn(&cli.codex, &cli.open_code, &cli.node, &cli.claude, &cwd).await?;
 
     let result = run(&cli, &mut server).await;
     server.shutdown().await;
@@ -189,9 +181,7 @@ async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
         || (is_resuming && claude::is_claude_thread(&resume_id));
     let requested_open_code = requested_model.is_some_and(open_code::is_open_code_model);
     let fallback_to_claude = should_fallback_to_claude(server.has_codex(), requested_model);
-    let (account, prefer_open_code) = if requested_claude
-        || default_to_claude
-        || fallback_to_claude
+    let (account, prefer_open_code) = if requested_claude || default_to_claude || fallback_to_claude
     {
         ("Claude subscription".to_owned(), false)
     } else if requested_open_code {
@@ -596,8 +586,7 @@ fn hold_until_thread(
             state.defer_startup_action(Action::SetFast(enabled));
             None
         }
-        action @ (Action::SetClaudePermissionMode(_)
-        | Action::PersistVibeDisplayModes { .. }) => {
+        action @ (Action::SetClaudePermissionMode(_) | Action::PersistVibeDisplayModes { .. }) => {
             state.defer_startup_action(action);
             None
         }
@@ -686,6 +675,7 @@ async fn choose_startup_session(
                 activity: None,
                 activity_model: None,
                 activity_phase: 0.0,
+                activity_progress_phase: 0.0,
                 footer: "Resume a Codex session".to_owned(),
                 status_line: None,
                 composer_notice: composer_notice.clone(),
@@ -693,7 +683,7 @@ async fn choose_startup_session(
                 chat_layout: false,
                 shell_display_mode: ShellDisplayMode::Collapse,
                 diff_display_mode: DiffDisplayMode::Collapse,
-                side_panel_open: false,
+                side_panel_width: None,
             },
         )?;
         match events.next().await {
@@ -1058,8 +1048,7 @@ async fn event_loop(
         }
         if redraw {
             let animation_started = Instant::now();
-            let animated =
-                animation_tick && renderer.render_animation(state.animation_view())?;
+            let animated = animation_tick && renderer.render_animation(state.animation_view())?;
             if animated {
                 perf::record_animation(animation_started.elapsed());
             }
@@ -1085,11 +1074,7 @@ fn is_side_exit_key(key: &KeyEvent) -> bool {
 /// Key-repeat records can remain queued while the parent thread is being
 /// resumed. Keep extending the guard while they arrive so a held close key can
 /// never become an interrupt or quit on the parent screen.
-fn suppress_side_exit_key(
-    guard: &mut Option<Instant>,
-    key: &KeyEvent,
-    now: Instant,
-) -> bool {
+fn suppress_side_exit_key(guard: &mut Option<Instant>, key: &KeyEvent, now: Instant) -> bool {
     let Some(until) = *guard else {
         return false;
     };
@@ -1216,22 +1201,39 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
     match pick {
         Pick::VibeMode => {
             let (shell, diff) = state.cycle_vibe_mode();
-            Action::PersistVibeDisplayModes { vibe: state.vibe_mode(), response: state.response_length(), shell, diff }
+            Action::PersistVibeDisplayModes {
+                vibe: state.vibe_mode(),
+                response: state.response_length(),
+                shell,
+                diff,
+            }
         }
         Pick::ResponseLength => {
             state.cycle_response_length();
             Action::PersistVibeDisplayModes {
-                vibe: state.vibe_mode(), response: state.response_length(),
-                shell: state.shell_display_mode(), diff: state.diff_display_mode(),
+                vibe: state.vibe_mode(),
+                response: state.response_length(),
+                shell: state.shell_display_mode(),
+                diff: state.diff_display_mode(),
             }
         }
         Pick::ShellDisplayMode => {
             state.cycle_shell_display_mode();
-            Action::PersistVibeDisplayModes { vibe: state.vibe_mode(), response: state.response_length(), shell: state.shell_display_mode(), diff: state.diff_display_mode() }
+            Action::PersistVibeDisplayModes {
+                vibe: state.vibe_mode(),
+                response: state.response_length(),
+                shell: state.shell_display_mode(),
+                diff: state.diff_display_mode(),
+            }
         }
         Pick::DiffDisplayMode => {
             state.cycle_diff_display_mode();
-            Action::PersistVibeDisplayModes { vibe: state.vibe_mode(), response: state.response_length(), shell: state.shell_display_mode(), diff: state.diff_display_mode() }
+            Action::PersistVibeDisplayModes {
+                vibe: state.vibe_mode(),
+                response: state.response_length(),
+                shell: state.shell_display_mode(),
+                diff: state.diff_display_mode(),
+            }
         }
         Pick::PlanSummary => {
             state.toggle_plan_summary();
@@ -1250,9 +1252,8 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
         Pick::EffortSetting => state.run_command("/effort"),
         Pick::Subagent(index) => state.open_subagent(index),
         Pick::ScrollToBottom => Action::ScrollToBottom,
-        Pick::Close => {
-            state.close_overlay()
-        }
+        Pick::Close => state.close_overlay(),
+        Pick::SidePanelClose => Action::PersistSidePanelStage(state.close_side_panel()),
         Pick::Row(index) => state.click_overlay_row(index),
         Pick::Effort(step) => state.click_effort_step(step),
     }
@@ -1468,8 +1469,28 @@ async fn execute_action(
                 );
             }
         }
-        Action::PersistVibeDisplayModes { vibe, response, shell, diff } => {
+        Action::PersistVibeDisplayModes {
+            vibe,
+            response,
+            shell,
+            diff,
+        } => {
             persist_vibe_display_modes(server, state, vibe, response, shell, diff).await;
+        }
+        Action::PersistSidePanelStage(stage) => {
+            if let Err(error) = server
+                .request(
+                    "config/value/write",
+                    config_value_write_params(state::SIDE_PANEL_STAGE_KEY, stage.config_value()),
+                )
+                .await
+            {
+                state.push_notice(
+                    BlockKind::Warning,
+                    "사이드패널 설정 저장 실패",
+                    error.to_string(),
+                );
+            }
         }
         Action::PersistStatusLine { key_path, enabled } => {
             if let Err(error) = server
@@ -1742,20 +1763,12 @@ async fn execute_action(
                             draw(state, renderer)?;
                             if callback_method == "auto" {
                                 match server
-                                    .complete_provider_oauth(
-                                        &provider_id,
-                                        method_index,
-                                        None,
-                                    )
+                                    .complete_provider_oauth(&provider_id, method_index, None)
                                     .await
                                 {
                                     Ok(()) => {
-                                        refresh_provider_models(
-                                            server,
-                                            state,
-                                            &provider_name,
-                                        )
-                                        .await;
+                                        refresh_provider_models(server, state, &provider_name)
+                                            .await;
                                     }
                                     Err(error) => {
                                         state.provider_connection_failed(error.to_string())
@@ -2305,7 +2318,10 @@ async fn execute_action(
 async fn activate_codex(server: &mut BackendServer, state: &mut AppState) {
     match server.start_codex().await {
         Ok(()) => match server
-            .request("model/list", json!({ "includeHidden": false, "limit": 100 }))
+            .request(
+                "model/list",
+                json!({ "includeHidden": false, "limit": 100 }),
+            )
             .await
         {
             Ok(response) => {
@@ -2590,9 +2606,12 @@ async fn apply_deferred_startup_actions(server: &BackendServer, state: &mut AppS
             Action::SetClaudePermissionMode(mode) => {
                 set_claude_permission_mode(server, state, mode).await
             }
-            Action::PersistVibeDisplayModes { vibe, response, shell, diff } => {
-                persist_vibe_display_modes(server, state, vibe, response, shell, diff).await
-            }
+            Action::PersistVibeDisplayModes {
+                vibe,
+                response,
+                shell,
+                diff,
+            } => persist_vibe_display_modes(server, state, vibe, response, shell, diff).await,
             _ => unreachable!("only startup-safe mode actions are deferred"),
         }
     }
@@ -2690,7 +2709,10 @@ async fn hydrate_thread_history(server: &BackendServer, response: &Value) -> Res
 
     loop {
         let page = server
-            .request("thread/turns/list", turns_list_params(&thread_id, cursor.as_deref()))
+            .request(
+                "thread/turns/list",
+                turns_list_params(&thread_id, cursor.as_deref()),
+            )
             .await?;
         let data = page
             .get("data")
@@ -2803,11 +2825,7 @@ async fn set_fast_mode(server: &BackendServer, state: &mut AppState, enabled: bo
                 )
                 .await
             {
-                state.push_notice(
-                    BlockKind::Warning,
-                    "Fast 설정 저장 실패",
-                    error.to_string(),
-                );
+                state.push_notice(BlockKind::Warning, "Fast 설정 저장 실패", error.to_string());
             }
         }
         Err(error) => state.push_notice(BlockKind::Error, "Fast 전환 실패", error.to_string()),
@@ -2861,7 +2879,11 @@ async fn persist_vibe_display_modes(
             .request("config/value/write", config_value_write_params(key, value))
             .await
         {
-            state.push_notice(BlockKind::Warning, "Vibe 표시 설정 저장 실패", error.to_string());
+            state.push_notice(
+                BlockKind::Warning,
+                "Vibe 표시 설정 저장 실패",
+                error.to_string(),
+            );
             break;
         }
     }
@@ -3013,10 +3035,7 @@ fn claude_session_settings(state: &AppState) -> ClaudeSessionSettings {
         effort: claude_model
             .then(|| state.selected_effort().to_owned())
             .unwrap_or_default(),
-        permission_mode: state
-            .claude_permission_mode_setting()
-            .wire()
-            .to_owned(),
+        permission_mode: state.claude_permission_mode_setting().wire().to_owned(),
     }
 }
 
@@ -3048,10 +3067,29 @@ fn resume_thread_params(thread_id: &str, claude: &ClaudeSessionSettings) -> Valu
     params
 }
 
+/// Claude reads the full rules once, as the system prompt the bridge appends to
+/// its preset. Repeating all of them in front of every user message bought no
+/// extra obedience — the English labels leaked through anyway — while burying
+/// the actual request under thousands of characters of boilerplate. So the turn
+/// carries this reminder instead: the handful of rules that were actually
+/// broken, short enough to read as an instruction rather than as a document.
+/// The preset notice rides along beside it and already restates the language
+/// rule, so this stays off that subject.
+const CLAUDE_TURN_REMINDER: &str = concat!(
+    "Devez Vibe 규칙 요약. 전체 규칙은 시스템 프롬프트에 있고, 이번 턴에 특히 지킬 것만 다시 적는다.\n",
+    "- 단순 질문이 아닌 작업은 첫 응답 content block을 짧은 한국어 진행 안내 text로 시작하고, ",
+    "TaskCreate를 포함한 어떤 tool_use도 그보다 먼저 내지 않는다.\n",
+    "- 작업 도구를 두 번 이상 호출할 작업은 첫 도구 호출 전에 TaskCreate로 작업 목록을 만들고, ",
+    "각 Task를 `pending` → `in_progress` → `completed` 순서로 하나씩 옮긴다.\n",
+    "- 답변은 서론 없이 결론부터 쓰고, 분량과 노출 범위는 함께 오는 응답 모드 안내를 따른다.\n",
+    "- 선택이나 승인을 요청할 때는 본문에 나열하지 말고 AskUserQuestion 도구로 묻는다.\n",
+);
+
 /// One `developer` message at the head of the thread loses its grip as turns
-/// pile up, so the same rules ride along with every turn. The active preset
-/// rides along too: the rules that depend on it are written as conditions, and
-/// the preset is a local display setting the provider is told nothing else about.
+/// pile up, so the rules ride along with every turn — in full for Codex, as
+/// [`CLAUDE_TURN_REMINDER`] for Claude. The active preset rides along too: the
+/// rules that depend on it are written as conditions, and the preset is a local
+/// display setting the provider is told nothing else about.
 fn turn_additional_context(vibe: VibeMode) -> Value {
     json!({
         "devez-vibe-rules": {
@@ -3060,6 +3098,10 @@ fn turn_additional_context(vibe: VibeMode) -> Value {
         },
         "claude-devez-vibe-rules": {
             "value": CLAUDE_DEVEZ_INSTRUCTIONS,
+            "kind": "application"
+        },
+        "claude-devez-vibe-reminder": {
+            "value": CLAUDE_TURN_REMINDER,
             "kind": "application"
         },
         "devez-vibe-mode": {
@@ -3158,16 +3200,16 @@ async fn refresh_provider_models(
         }
         Err(error) => {
             state.provider_connected(provider_name);
-            state.push_notice(
-                BlockKind::Warning,
-                "모델 새로고침 실패",
-                error.to_string(),
-            );
+            state.push_notice(BlockKind::Warning, "모델 새로고침 실패", error.to_string());
         }
     }
 }
 
-async fn write_plugin_enabled(server: &BackendServer, plugin_id: &str, enabled: bool) -> Result<Value> {
+async fn write_plugin_enabled(
+    server: &BackendServer,
+    plugin_id: &str,
+    enabled: bool,
+) -> Result<Value> {
     server
         .request(
             "config/value/write",
@@ -3409,8 +3451,7 @@ struct CostRestore {
 fn start_cost_restore(thread_id: String) -> mpsc::Receiver<CostRestore> {
     let lookup_thread_id = thread_id.clone();
     start_background_cost_restore(thread_id, move || {
-        state::codex_home()
-            .and_then(|home| rollout::load_cost_ledger(&home, &lookup_thread_id))
+        state::codex_home().and_then(|home| rollout::load_cost_ledger(&home, &lookup_thread_id))
     })
 }
 
@@ -3420,10 +3461,7 @@ fn start_background_cost_restore(
 ) -> mpsc::Receiver<CostRestore> {
     let (sender, receiver) = mpsc::channel(1);
     tokio::spawn(async move {
-        let ledger = tokio::task::spawn_blocking(restore)
-            .await
-            .ok()
-            .flatten();
+        let ledger = tokio::task::spawn_blocking(restore).await.ok().flatten();
         let _ = sender.send(CostRestore { thread_id, ledger }).await;
     });
     receiver
@@ -3750,9 +3788,9 @@ fn expand_collapsed_paste_shortcut(
     let Some(block) = state.editor.collapsed_paste_text() else {
         return false;
     };
-    if !clipboard_text().is_some_and(|text| {
-        paste::paste_payload_chars(&text) == paste::paste_payload_chars(&block)
-    }) {
+    if !clipboard_text()
+        .is_some_and(|text| paste::paste_payload_chars(&text) == paste::paste_payload_chars(&block))
+    {
         return false;
     }
     state.editor.expand_collapsed_paste();
@@ -3787,9 +3825,9 @@ fn is_selection_delete_key(key: &KeyEvent) -> bool {
         key.kind,
         crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
     ) && matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
-        && !key.modifiers.intersects(
-            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-        )
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
 }
 
 fn attach_pasted_local_image(state: &mut AppState, text: &str) -> bool {
@@ -3881,11 +3919,7 @@ fn observe_composer_key(
     if let Some(target) = state.pending_text_input_target() {
         apply_composer_inputs(
             state,
-            buffer.observe_targeted(
-                key,
-                now,
-                BufferedTextTarget::PendingUserInput(target),
-            ),
+            buffer.observe_targeted(key, now, BufferedTextTarget::PendingUserInput(target)),
         )
     } else if state.has_pending_interaction() {
         state.handle_key(key)
@@ -3934,11 +3968,7 @@ fn observe_composer_key_with_scroll(
         apply_composer_inputs_with_scroll(
             state,
             renderer,
-            buffer.observe_targeted(
-                key,
-                now,
-                BufferedTextTarget::PendingUserInput(target),
-            ),
+            buffer.observe_targeted(key, now, BufferedTextTarget::PendingUserInput(target)),
         )
     } else if state.has_pending_interaction() {
         state.handle_key(key)
@@ -4507,7 +4537,10 @@ mod tests {
             PathBuf::from(r"C:\Source\DevezCode")
         );
         let long = format!(r"\\?\C:\{}", "segment\\".repeat(40));
-        assert_eq!(plain_windows_path(PathBuf::from(&long)), PathBuf::from(long));
+        assert_eq!(
+            plain_windows_path(PathBuf::from(&long)),
+            PathBuf::from(long)
+        );
     }
 
     fn starting_state() -> AppState {
@@ -4637,7 +4670,10 @@ mod tests {
         assert!(!should_fallback_to_claude(false, None));
         assert!(should_fallback_to_claude(false, Some("gpt-5.6-sol")));
         assert!(!should_fallback_to_claude(false, Some("claude:sonnet")));
-        assert!(!should_fallback_to_claude(false, Some("opencode:provider/model")));
+        assert!(!should_fallback_to_claude(
+            false,
+            Some("opencode:provider/model")
+        ));
         assert!(!should_fallback_to_claude(true, None));
     }
 
@@ -4691,10 +4727,10 @@ mod tests {
         assert_eq!(state.selected_model_name(), "gpt-5.6-terra");
     }
 
-    /// Alt+S is a view toggle, so it must open and close the panel without
-    /// leaving a stray letter in the composer.
+    /// Alt+P steps the panel through its widths and wraps closed on the
+    /// fourth press, without ever leaving a stray letter in the composer.
     #[test]
-    fn alt_s_toggles_the_side_panel_without_editing_the_composer() {
+    fn alt_p_cycles_the_side_panel_through_its_widths_without_editing_the_composer() {
         let mut state = AppState::new(
             String::new(),
             ".".to_owned(),
@@ -4708,34 +4744,37 @@ mod tests {
         // printable key before the shortcut branches ever run.
         let mut paste = ComposerPasteBuffer::new();
         let now = Instant::now();
+        let press_alt_p =
+            |state: &mut AppState, renderer: &mut Renderer, paste: &mut ComposerPasteBuffer| {
+                observe_composer_key_with_scroll(
+                    state,
+                    renderer,
+                    paste,
+                    press(KeyCode::Char('p'), KeyModifiers::ALT),
+                    now,
+                );
+            };
 
-        observe_composer_key_with_scroll(
-            &mut state,
-            &mut renderer,
-            &mut paste,
-            press(KeyCode::Char('s'), KeyModifiers::ALT),
-            now,
-        );
-
-        assert!(state.side_panel_open());
+        press_alt_p(&mut state, &mut renderer, &mut paste);
+        assert_eq!(state.side_panel_stage(), state::SidePanelStage::Small);
         assert!(state.editor.text().is_empty());
 
-        observe_composer_key_with_scroll(
-            &mut state,
-            &mut renderer,
-            &mut paste,
-            press(KeyCode::Char('s'), KeyModifiers::ALT),
-            now,
-        );
+        press_alt_p(&mut state, &mut renderer, &mut paste);
+        assert_eq!(state.side_panel_stage(), state::SidePanelStage::Medium);
 
+        press_alt_p(&mut state, &mut renderer, &mut paste);
+        assert_eq!(state.side_panel_stage(), state::SidePanelStage::Large);
+
+        press_alt_p(&mut state, &mut renderer, &mut paste);
+        assert_eq!(state.side_panel_stage(), state::SidePanelStage::Closed);
         assert!(!state.side_panel_open());
         assert!(state.editor.text().is_empty());
     }
 
-    /// The slash command is the discoverable way in, so it must toggle the same
+    /// The slash command is the discoverable way in, so it must cycle the same
     /// panel state the chord does.
     #[test]
-    fn the_side_panel_slash_command_toggles_the_panel() {
+    fn the_side_panel_slash_command_cycles_the_panel() {
         let mut state = AppState::new(
             String::new(),
             ".".to_owned(),
@@ -4746,10 +4785,12 @@ mod tests {
         );
 
         state.run_slash_command("/side-panel");
-        assert!(state.side_panel_open());
+        assert_eq!(state.side_panel_stage(), state::SidePanelStage::Small);
 
         state.run_slash_command("/side-panel");
-        assert!(!state.side_panel_open());
+        state.run_slash_command("/side-panel");
+        state.run_slash_command("/side-panel");
+        assert_eq!(state.side_panel_stage(), state::SidePanelStage::Closed);
     }
 
     #[test]
@@ -4880,14 +4921,22 @@ mod tests {
             "high",
         );
 
-        assert_eq!(params.pointer("/developerInstructions").and_then(Value::as_str), Some(DEVEZ_INSTRUCTIONS));
+        assert_eq!(
+            params
+                .pointer("/developerInstructions")
+                .and_then(Value::as_str),
+            Some(DEVEZ_INSTRUCTIONS)
+        );
         assert_eq!(
             params
                 .pointer("/claudeDeveloperInstructions")
                 .and_then(Value::as_str),
             Some(CLAUDE_DEVEZ_INSTRUCTIONS)
         );
-        assert_eq!(params.pointer("/model").and_then(Value::as_str), Some("gpt-5.6-terra"));
+        assert_eq!(
+            params.pointer("/model").and_then(Value::as_str),
+            Some("gpt-5.6-terra")
+        );
     }
 
     #[test]
@@ -4903,9 +4952,14 @@ mod tests {
     fn resumed_threads_carry_the_current_rules() {
         let params = resume_thread_params("thread-1", &test_claude_settings());
 
-        assert_eq!(params.pointer("/threadId").and_then(Value::as_str), Some("thread-1"));
         assert_eq!(
-            params.pointer("/developerInstructions").and_then(Value::as_str),
+            params.pointer("/threadId").and_then(Value::as_str),
+            Some("thread-1")
+        );
+        assert_eq!(
+            params
+                .pointer("/developerInstructions")
+                .and_then(Value::as_str),
             Some(DEVEZ_INSTRUCTIONS)
         );
         assert_eq!(
@@ -4915,7 +4969,9 @@ mod tests {
             Some(CLAUDE_DEVEZ_INSTRUCTIONS)
         );
         assert_eq!(
-            params.pointer("/initialTurnsPage/itemsView").and_then(Value::as_str),
+            params
+                .pointer("/initialTurnsPage/itemsView")
+                .and_then(Value::as_str),
             Some("full")
         );
     }
@@ -4935,15 +4991,21 @@ mod tests {
         let params = resume_thread_params("claude:session-1", &test_claude_settings());
 
         assert_eq!(
-            params.pointer("/claudeFallbackModel").and_then(Value::as_str),
+            params
+                .pointer("/claudeFallbackModel")
+                .and_then(Value::as_str),
             Some("claude:opus")
         );
         assert_eq!(
-            params.pointer("/claudeFallbackEffort").and_then(Value::as_str),
+            params
+                .pointer("/claudeFallbackEffort")
+                .and_then(Value::as_str),
             Some("xhigh")
         );
         assert_eq!(
-            params.pointer("/claudePermissionMode").and_then(Value::as_str),
+            params
+                .pointer("/claudePermissionMode")
+                .and_then(Value::as_str),
             Some("acceptEdits")
         );
         assert!(params.get("model").is_none());
@@ -4979,7 +5041,9 @@ mod tests {
         // The caps truncated the one answer that has to stay whole, so both
         // capped presets carry the exception next to the cap that broke it.
         for vibe in [VibeMode::Vibe, VibeMode::SuperVibe] {
-            assert!(notice(vibe).contains("선택이나 승인을 요청할 때는 이 분량 제한을 적용하지 않는다"));
+            assert!(
+                notice(vibe).contains("선택이나 승인을 요청할 때는 이 분량 제한을 적용하지 않는다")
+            );
             assert!(notice(vibe).contains("AskUserQuestion 도구를 쓸 수 있으면"));
         }
     }
@@ -4989,11 +5053,15 @@ mod tests {
         let context = turn_additional_context(VibeMode::Vibe);
 
         assert_eq!(
-            context.pointer("/devez-vibe-rules/value").and_then(Value::as_str),
+            context
+                .pointer("/devez-vibe-rules/value")
+                .and_then(Value::as_str),
             Some(DEVEZ_INSTRUCTIONS)
         );
         assert_eq!(
-            context.pointer("/devez-vibe-rules/kind").and_then(Value::as_str),
+            context
+                .pointer("/devez-vibe-rules/kind")
+                .and_then(Value::as_str),
             Some("application")
         );
         assert_eq!(
@@ -5002,14 +5070,30 @@ mod tests {
                 .and_then(Value::as_str),
             Some(CLAUDE_DEVEZ_INSTRUCTIONS)
         );
+        // The full rules open the session; the turn repeats only the reminder,
+        // which stays short enough to read as an instruction.
+        assert_eq!(
+            context
+                .pointer("/claude-devez-vibe-reminder/value")
+                .and_then(Value::as_str),
+            Some(CLAUDE_TURN_REMINDER)
+        );
+        assert!(CLAUDE_TURN_REMINDER.chars().count() < CLAUDE_DEVEZ_INSTRUCTIONS.chars().count() / 4);
+        assert!(CLAUDE_TURN_REMINDER.contains("첫 응답 content block"));
+        assert!(CLAUDE_TURN_REMINDER.contains("TaskCreate"));
+        assert!(CLAUDE_TURN_REMINDER.contains("AskUserQuestion"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskCreate"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskUpdate"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("첫 응답 content block"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("모든 일반 문장은 반드시 한국어로 작성한다"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`I'll check ...`, `Fine. Building ...`"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("어떤 tool_use도 이 text보다 먼저 출력하지 않는다"));
+        assert!(
+            CLAUDE_DEVEZ_INSTRUCTIONS.contains("어떤 tool_use도 이 text보다 먼저 출력하지 않는다")
+        );
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("두 번째 작업 도구를 호출하면 지침 위반"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`pending`에서 `completed`로 바로 바꾸지 않는다"));
+        assert!(
+            CLAUDE_DEVEZ_INSTRUCTIONS.contains("`pending`에서 `completed`로 바로 바꾸지 않는다")
+        );
         // The length and disclosure caps live in the per-turn preset notice, so
         // the standing rules only point at it instead of restating it.
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("응답 모드 안내를 따르고"));
@@ -5023,7 +5107,10 @@ mod tests {
         // present them, so each provider gets the asking form it can actually use.
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("반드시 AskUserQuestion 도구로 묻는다"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("선택지가 다섯 개 이상이라"));
-        assert!(DEVEZ_INSTRUCTIONS.contains("선택이나 승인을 요청하는 답변에는 이 분량 제한을 적용하지 않는다"));
+        assert!(
+            DEVEZ_INSTRUCTIONS
+                .contains("선택이나 승인을 요청하는 답변에는 이 분량 제한을 적용하지 않는다")
+        );
         assert!(DEVEZ_INSTRUCTIONS.contains("선택지를 줄이거나 문장을 도중에 끊지 않는다"));
         // Read as a per-call duty, the opening notice turned into the same
         // contentless line before every tool call.
@@ -5037,9 +5124,16 @@ mod tests {
         // Korean sentence, and an English verdict on a tool result. Saying it
         // three times in three sections did not help, so it is stated once.
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("최우선 한국어 전용 규칙"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("영어 낱말로 문장을 시작한 뒤 한국어를 이어 붙이는"));
+        assert!(
+            CLAUDE_DEVEZ_INSTRUCTIONS.contains("영어 낱말로 문장을 시작한 뒤 한국어를 이어 붙이는")
+        );
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`Good, that closes correctly.`"));
-        assert_eq!(CLAUDE_DEVEZ_INSTRUCTIONS.matches("응답 언어는 한국어로 유지한다").count(), 1);
+        assert_eq!(
+            CLAUDE_DEVEZ_INSTRUCTIONS
+                .matches("응답 언어는 한국어로 유지한다")
+                .count(),
+            1
+        );
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("첫 도구 호출 전에"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("도구를 두 번 이상 호출할 작업"));
         assert!(DEVEZ_INSTRUCTIONS.contains("도구를 두 번 이상 호출할 작업"));
@@ -5049,7 +5143,9 @@ mod tests {
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("검증하지 못한 내용은 짧게 밝힌다"));
         for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS] {
             assert!(rules.contains("첫 검색 결과나 단일 키워드에 의존하지 않는다"));
-            assert!(rules.contains("찾지 못했다는 이유만으로 기능이나 코드가 없다고 단정하지 않는다"));
+            assert!(
+                rules.contains("찾지 못했다는 이유만으로 기능이나 코드가 없다고 단정하지 않는다")
+            );
             assert!(rules.contains("현재 구현, 과거 문제의 원인, 추측을 구분"));
             assert!(rules.contains("직접적인 결론, 이를 뒷받침하는 핵심 근거"));
             assert!(rules.contains("결론 정리"));
@@ -5062,7 +5158,9 @@ mod tests {
         let params = new_thread_params("C:\\repo", None, None, "startup", "low", "default", "max");
 
         assert_eq!(
-            params.pointer("/config/model_verbosity").and_then(Value::as_str),
+            params
+                .pointer("/config/model_verbosity")
+                .and_then(Value::as_str),
             Some("low")
         );
         assert_eq!(params.get("effort").and_then(Value::as_str), Some("max"));
@@ -5282,12 +5380,8 @@ mod tests {
             } else {
                 KeyCode::Char(ch)
             };
-            let action = observe_composer_key(
-                &mut state,
-                &mut buffer,
-                press(code, KeyModifiers::NONE),
-                at,
-            );
+            let action =
+                observe_composer_key(&mut state, &mut buffer, press(code, KeyModifiers::NONE), at);
             assert!(!matches!(action, Action::Submit(_)));
         }
 
@@ -5631,7 +5725,11 @@ mod tests {
             assert!(!matches!(action, Action::Submit(_)), "no key may submit");
         }
 
-        assert_eq!(state.editor.paste_summary_lines(), None, "the block expanded");
+        assert_eq!(
+            state.editor.paste_summary_lines(),
+            None,
+            "the block expanded"
+        );
         assert!(state.editor.text().starts_with(pasted));
     }
 
@@ -5944,22 +6042,27 @@ mod tests {
         let vibe = pick_action(&mut state, Pick::VibeMode);
         assert!(hold_until_thread(&mut state, vibe, &mut queued).is_none());
         assert!(hold_until_thread(&mut state, Action::SetFast(true), &mut queued).is_none());
-        assert!(hold_until_thread(
-            &mut state,
-            Action::SetClaudePermissionMode(state::ClaudePermissionMode::AcceptEdits),
-            &mut queued,
-        )
-        .is_none());
+        assert!(
+            hold_until_thread(
+                &mut state,
+                Action::SetClaudePermissionMode(state::ClaudePermissionMode::AcceptEdits),
+                &mut queued,
+            )
+            .is_none()
+        );
 
         let deferred = state.take_deferred_startup_actions();
         assert_eq!(deferred.len(), 3);
-        assert!(deferred.iter().any(|action| matches!(
-            action,
-            Action::PersistVibeDisplayModes { .. }
-        )));
-        assert!(deferred
-            .iter()
-            .any(|action| matches!(action, Action::SetFast(true))));
+        assert!(
+            deferred
+                .iter()
+                .any(|action| matches!(action, Action::PersistVibeDisplayModes { .. }))
+        );
+        assert!(
+            deferred
+                .iter()
+                .any(|action| matches!(action, Action::SetFast(true)))
+        );
         assert!(deferred.iter().any(|action| matches!(
             action,
             Action::SetClaudePermissionMode(state::ClaudePermissionMode::AcceptEdits)
@@ -6190,17 +6293,32 @@ mod tests {
         }))
         .expect("resume response");
 
-        assert_eq!(thread.pointer("/turns/0/id").and_then(Value::as_str), Some("turn-1"));
+        assert_eq!(
+            thread.pointer("/turns/0/id").and_then(Value::as_str),
+            Some("turn-1")
+        );
     }
 
     #[test]
     fn resume_history_pages_request_full_items_in_chronological_order() {
         let params = turns_list_params("thread-9", Some("cursor-100"));
 
-        assert_eq!(params.pointer("/threadId").and_then(Value::as_str), Some("thread-9"));
-        assert_eq!(params.pointer("/cursor").and_then(Value::as_str), Some("cursor-100"));
-        assert_eq!(params.pointer("/sortDirection").and_then(Value::as_str), Some("asc"));
-        assert_eq!(params.pointer("/itemsView").and_then(Value::as_str), Some("full"));
+        assert_eq!(
+            params.pointer("/threadId").and_then(Value::as_str),
+            Some("thread-9")
+        );
+        assert_eq!(
+            params.pointer("/cursor").and_then(Value::as_str),
+            Some("cursor-100")
+        );
+        assert_eq!(
+            params.pointer("/sortDirection").and_then(Value::as_str),
+            Some("asc")
+        );
+        assert_eq!(
+            params.pointer("/itemsView").and_then(Value::as_str),
+            Some("full")
+        );
 
         let first_page = turns_list_params("thread-9", None);
         assert!(first_page.get("cursor").is_none());

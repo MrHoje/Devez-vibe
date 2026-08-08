@@ -56,7 +56,7 @@ class AsyncQueue {
 }
 
 function write(message) {
-  process.stdout.write(`${JSON.stringify(message)}\n`);
+  process.stdout.write(`${JSON.stringify(message)}\n`, "utf8");
 }
 
 function notify(method, params) {
@@ -84,8 +84,18 @@ function hostRequest(method, params, signal) {
         signal?.removeEventListener("abort", abort);
         resolve(value);
       },
+      reject: (error) => {
+        signal?.removeEventListener("abort", abort);
+        reject(error);
+      },
     });
-    write({ id, method, params });
+    try {
+      write({ id, method, params });
+    } catch (error) {
+      if (!pendingHostRequests.delete(id)) return;
+      signal?.removeEventListener("abort", abort);
+      reject(error);
+    }
   });
 }
 
@@ -356,11 +366,29 @@ async function requestToolPermission(toolName, input, permission) {
       isOther: true,
       multiSelect: Boolean(question.multiSelect),
     }));
-    const response = await hostRequest(
+    const requestQuestions = () => hostRequest(
       "item/tool/requestUserInput",
-      { questions },
+      // Keep model-provided text out of the NDJSON envelope. This protects
+      // Korean text, backslashes, and malformed Unicode from a partial escape
+      // corrupting the request line before the host can open its dialog.
+      {
+        encoding: "base64-json",
+        payload: Buffer.from(JSON.stringify({ questions }), "utf8").toString("base64"),
+      },
       permission.signal,
     );
+    let response;
+    try {
+      response = await requestQuestions();
+    } catch (error) {
+      if (!isQuestionDeliveryError(error)) throw error;
+      try {
+        response = await requestQuestions();
+      } catch (retryError) {
+        if (!isQuestionDeliveryError(retryError)) throw retryError;
+        return { behavior: "deny", message: questionFallbackMessage(questions) };
+      }
+    }
     const answers = {};
     for (let index = 0; index < questions.length; index += 1) {
       const selected = response?.answers?.[`q${index}`]?.answers;
@@ -418,6 +446,25 @@ async function requestToolPermission(toolName, input, permission) {
       ? { updatedPermissions: permission.suggestions }
       : {}),
   };
+}
+
+function isQuestionDeliveryError(error) {
+  return error?.code === -32700
+    || String(error?.message || error).includes("사용자 입력 화면에 전달하지 못했습니다");
+}
+
+function questionFallbackMessage(questions) {
+  const text = questions.map((question, index) => {
+    const options = question.options
+      .map((option, optionIndex) => `${optionIndex + 1}. ${option.label}`)
+      .join(" / ");
+    return `${index + 1}. ${question.question}${options ? ` (${options})` : ""}`;
+  }).join("\n");
+  return [
+    "사용자 입력 창을 두 번 표시하지 못했습니다.",
+    "도구를 다시 호출하지 말고 다음 질문을 일반 텍스트로 사용자에게 제시한 뒤 답변을 기다리세요:",
+    text,
+  ].join("\n");
 }
 
 async function createSession(params, resumeId) {
@@ -2424,7 +2471,13 @@ lines.on("line", async (line) => {
     const pending = pendingHostRequests.get(message.id);
     if (pending) {
       pendingHostRequests.delete(message.id);
-      pending.resolve(message.result ?? { decision: "decline" });
+      if (message.error) {
+        const error = new Error(message.error.message || "호스트 요청이 거부되었습니다.");
+        error.code = message.error.code;
+        pending.reject(error);
+      } else {
+        pending.resolve(message.result ?? { decision: "decline" });
+      }
     }
     return;
   }

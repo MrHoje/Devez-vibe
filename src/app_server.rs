@@ -645,7 +645,9 @@ mod tests {
         assert!(config_declares_devez_browser(
             "  [mcp_servers.\"devez-browser\"]  # bridge\n"
         ));
-        assert!(config_declares_devez_browser("[mcp_servers.'devez-browser']"));
+        assert!(config_declares_devez_browser(
+            "[mcp_servers.'devez-browser']"
+        ));
         assert!(!config_declares_devez_browser(
             "[mcp_servers.chrome-devtools]\ncommand = \"npx\"\n"
         ));

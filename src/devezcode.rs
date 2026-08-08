@@ -364,9 +364,18 @@ mod tests {
     /// turn, so the host never files a completion record for it.
     #[test]
     fn host_activity_reports_compaction_apart_from_a_turn() {
-        assert_eq!(Activity::from_host(false, true, false).status(), "compacting");
-        assert_eq!(Activity::from_host(true, true, false).status(), "compacting");
-        assert_eq!(Activity::from_host(false, true, true).status(), "compacting");
+        assert_eq!(
+            Activity::from_host(false, true, false).status(),
+            "compacting"
+        );
+        assert_eq!(
+            Activity::from_host(true, true, false).status(),
+            "compacting"
+        );
+        assert_eq!(
+            Activity::from_host(false, true, true).status(),
+            "compacting"
+        );
     }
 
     #[test]

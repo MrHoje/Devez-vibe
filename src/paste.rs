@@ -136,12 +136,7 @@ impl ComposerPasteBuffer {
         now: Instant,
         expected_paste: Option<&str>,
     ) -> Vec<ComposerInput> {
-        self.observe_expected_targeted(
-            key,
-            now,
-            expected_paste,
-            BufferedTextTarget::Composer,
-        )
+        self.observe_expected_targeted(key, now, expected_paste, BufferedTextTarget::Composer)
     }
 
     fn observe_expected_targeted(
@@ -425,7 +420,10 @@ pub fn payload_char(key: &KeyEvent) -> Option<char> {
     if !matches!(key.kind, KeyEventKind::Press) {
         return None;
     }
-    paste_key_char(key, key.modifiers.difference(KeyModifiers::SHIFT).is_empty())
+    paste_key_char(
+        key,
+        key.modifiers.difference(KeyModifiers::SHIFT).is_empty(),
+    )
 }
 
 fn paste_key_char(key: &KeyEvent, plain: bool) -> Option<char> {
@@ -817,7 +815,9 @@ mod tests {
         ] {
             at += Duration::from_millis(500);
             assert!(
-                buffer.flush_if_idle(at - Duration::from_millis(1)).is_none(),
+                buffer
+                    .flush_if_idle(at - Duration::from_millis(1))
+                    .is_none(),
                 "the run is not released while the clipboard still explains it"
             );
             inputs.extend(buffer.observe(press(code), at));

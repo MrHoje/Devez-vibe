@@ -77,11 +77,21 @@ impl ClaudeClient {
     }
 
     async fn ensure_started(&self) -> Result<()> {
-        if self.outbound.lock().expect("Claude outbound mutex").is_some() {
+        if self
+            .outbound
+            .lock()
+            .expect("Claude outbound mutex")
+            .is_some()
+        {
             return Ok(());
         }
         let _guard = self.start_lock.lock().await;
-        if self.outbound.lock().expect("Claude outbound mutex").is_some() {
+        if self
+            .outbound
+            .lock()
+            .expect("Claude outbound mutex")
+            .is_some()
+        {
             return Ok(());
         }
         if self.process.lock().await.is_some() {
@@ -134,11 +144,32 @@ impl ClaudeClient {
                 match lines.next_line().await {
                     Ok(Some(line)) if line.trim().is_empty() => continue,
                     Ok(Some(line)) => match serde_json::from_str::<Value>(&line) {
-                        Ok(message) => route_message(message, &reader_pending, &reader_events).await,
+                        Ok(message) => {
+                            route_message(message, &reader_pending, &reader_events).await
+                        }
                         Err(error) => {
                             let _ = reader_events.send(ServerEvent::ProtocolWarning(format!(
                                 "Claude SDK JSON 해석 실패: {error}"
                             )));
+                            // A malformed question used to be discarded here, leaving
+                            // Claude blocked forever while the user never saw a dialog.
+                            // The bridge keeps the question and retries when it receives
+                            // this explicit delivery failure.
+                            if let Some(id) = recover_user_input_request_id(&line)
+                                && let Some(outbound) = reader_outbound
+                                    .lock()
+                                    .expect("Claude outbound mutex")
+                                    .as_ref()
+                                    .cloned()
+                            {
+                                let _ = outbound.send(json!({
+                                    "id": id,
+                                    "error": {
+                                        "code": -32700,
+                                        "message": "사용자 입력 화면에 전달하지 못했습니다. 다시 시도합니다."
+                                    }
+                                }));
+                            }
                         }
                     },
                     Ok(None) => break,
@@ -249,7 +280,13 @@ impl ClaudeServer {
     }
 
     pub async fn shutdown(self) {
-        if self.client.outbound.lock().expect("Claude outbound mutex").is_none() {
+        if self
+            .client
+            .outbound
+            .lock()
+            .expect("Claude outbound mutex")
+            .is_none()
+        {
             return;
         }
         let _ = self.client.send(json!({
@@ -349,6 +386,22 @@ fn claude_request_id(id: &Value) -> Result<&Value> {
         .context("Claude 사용자 입력 요청 id가 올바르지 않습니다.")
 }
 
+/// The bridge writes host request ids before the request payload. When a
+/// malformed payload cannot be decoded as JSON, recover only the generated
+/// ASCII id for a user-input request so the bridge can retry it safely.
+fn recover_user_input_request_id(line: &str) -> Option<&str> {
+    let method = r#""method":"item/tool/requestUserInput""#;
+    let prefix = line.split_once(method)?.0;
+    let marker = r#""id":""#;
+    let (_, after_id) = prefix.split_once(marker)?;
+    let id = after_id.split_once('"')?.0;
+    (!id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'))
+    .then_some(id)
+}
+
 async fn route_message(
     message: Value,
     pending: &PendingMap,
@@ -411,9 +464,17 @@ fn resolve_bridge_path(cwd: &Path) -> Result<PathBuf> {
     if let Ok(executable) = env::current_exe()
         && let Some(package_root) = executable.parent().and_then(Path::parent)
     {
-        candidates.push(package_root.join("bridge").join("claude-agent-sdk-bridge.mjs"));
+        candidates.push(
+            package_root
+                .join("bridge")
+                .join("claude-agent-sdk-bridge.mjs"),
+        );
     }
-    candidates.push(cwd.join("npm").join("bridge").join("claude-agent-sdk-bridge.mjs"));
+    candidates.push(
+        cwd.join("npm")
+            .join("bridge")
+            .join("claude-agent-sdk-bridge.mjs"),
+    );
     candidates.push(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("npm")
@@ -469,11 +530,31 @@ mod tests {
     }
 
     #[test]
+    fn malformed_user_input_request_recovers_only_the_safe_bridge_id() {
+        let line = r#"{"id":"claude-host-42","method":"item/tool/requestUserInput","params":{"payload":"\u12"}}"#;
+        assert_eq!(recover_user_input_request_id(line), Some("claude-host-42"));
+        assert_eq!(
+            recover_user_input_request_id(r#"{"id":"42","method":"turn/start"}"#),
+            None
+        );
+        assert_eq!(
+            recover_user_input_request_id(
+                r#"{"id":"not safe!","method":"item/tool/requestUserInput"}"#
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn model_catalog_uses_existing_model_shape() {
         let catalog = model_catalog();
         let models = catalog.get("data").and_then(Value::as_array).unwrap();
         assert_eq!(models.len(), 4);
-        assert!(models.iter().all(|model| model.get("model").and_then(Value::as_str) != Some("claude:default")));
+        assert!(
+            models
+                .iter()
+                .all(|model| model.get("model").and_then(Value::as_str) != Some("claude:default"))
+        );
         assert!(models.iter().all(|model| {
             model
                 .get("displayName")
@@ -499,7 +580,9 @@ mod tests {
     fn bridge_uses_the_latest_assistant_request_for_context_usage() {
         let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
 
-        assert!(bridge.contains("session.lastContextUsage = tokenBreakdown(message.message?.usage)"));
+        assert!(
+            bridge.contains("session.lastContextUsage = tokenBreakdown(message.message?.usage)")
+        );
         assert!(bridge.contains("last: session.lastContextUsage"));
         assert!(!bridge.contains("last: totals"));
     }
@@ -530,11 +613,9 @@ mod tests {
         assert!(bridge.contains("function historyState(messages)"));
         assert!(bridge.contains("session.tasks = historyState(messages).tasks;"));
         assert!(bridge.contains("if (numberedTaskIndex(subject) === 1) tasks.clear();"));
-        assert!(
-            bridge.contains(
-                "applyTaskUpdate(session.tasks, input, turnId, () => emitPlan(session), Date.now());"
-            )
-        );
+        assert!(bridge.contains(
+            "applyTaskUpdate(session.tasks, input, turnId, () => emitPlan(session), Date.now());"
+        ));
         // A restored plan totals to zero unless the step times ride with it.
         assert!(bridge.contains("elapsedMs: task.elapsedMs ?? null,"));
         assert!(bridge.contains("function messageTime(message)"));
@@ -561,7 +642,9 @@ mod tests {
     fn bridge_tracks_foreground_and_background_subagent_lifecycles() {
         let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
 
-        assert!(bridge.contains("if (SUBAGENT_TOOLS.includes(name)) startSubagent(session, block);"));
+        assert!(
+            bridge.contains("if (SUBAGENT_TOOLS.includes(name)) startSubagent(session, block);")
+        );
         assert!(bridge.contains("recordSubagentMessage(session, message)"));
         assert!(bridge.contains("recordSubagentResult(session, message)"));
         assert!(bridge.contains("notify(\"turn/subagent/line\""));

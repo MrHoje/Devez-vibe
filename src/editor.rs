@@ -18,9 +18,7 @@ pub struct Editor {
 
 impl Editor {
     pub fn is_empty(&self) -> bool {
-        self.buffer
-            .iter()
-            .all(|&ch| ch == ATTACHMENT_PLACEHOLDER)
+        self.buffer.iter().all(|&ch| ch == ATTACHMENT_PLACEHOLDER)
     }
 
     pub fn text(&self) -> String {
@@ -171,9 +169,7 @@ impl Editor {
         let cursor = if self.cursor <= start {
             self.cursor
         } else {
-            prefix.chars().count()
-                + summary.chars().count()
-                + self.cursor.saturating_sub(end)
+            prefix.chars().count() + summary.chars().count() + self.cursor.saturating_sub(end)
         };
         Some((format!("{prefix}{summary}{tail}"), cursor))
     }
@@ -385,9 +381,9 @@ impl Editor {
         }
         if self.cursor > 0
             && self
-            .buffer
-            .get(self.cursor - 1)
-            .is_some_and(|&ch| ch == ATTACHMENT_PLACEHOLDER)
+                .buffer
+                .get(self.cursor - 1)
+                .is_some_and(|&ch| ch == ATTACHMENT_PLACEHOLDER)
         {
             self.leave_history();
             self.cursor -= 1;
@@ -467,7 +463,10 @@ impl Editor {
         }
         self.kill_buffer = self.buffer[start..end].iter().collect();
         self.buffer.drain(start..end);
-        if self.collapsed_paste_start.is_some_and(|paste_start| start < paste_start) {
+        if self
+            .collapsed_paste_start
+            .is_some_and(|paste_start| start < paste_start)
+        {
             let removed = end - start;
             self.collapsed_paste_start = self.collapsed_paste_start.map(|value| value - removed);
             self.collapsed_paste_end = self.collapsed_paste_end.map(|value| value - removed);
@@ -606,9 +605,7 @@ impl Editor {
     }
 
     fn move_to_collapsed_paste_end(&mut self) {
-        if let (Some(start), Some(end)) =
-            (self.collapsed_paste_start, self.collapsed_paste_end)
-        {
+        if let (Some(start), Some(end)) = (self.collapsed_paste_start, self.collapsed_paste_end) {
             if self.cursor > start && self.cursor < end {
                 self.cursor = end;
             }
@@ -809,16 +806,30 @@ mod tests {
         editor.move_home();
 
         assert!(editor.move_up());
-        assert_eq!(editor.cursor(), 6, "up moves from the last row to the middle row");
+        assert_eq!(
+            editor.cursor(),
+            6,
+            "up moves from the last row to the middle row"
+        );
         assert!(editor.move_up());
-        assert_eq!(editor.cursor(), 0, "up moves from the middle row to the first row");
-        assert!(!editor.move_up(), "the first row leaves up for history navigation");
+        assert_eq!(
+            editor.cursor(),
+            0,
+            "up moves from the middle row to the first row"
+        );
+        assert!(
+            !editor.move_up(),
+            "the first row leaves up for history navigation"
+        );
 
         assert!(editor.move_down());
         assert_eq!(editor.cursor(), 6);
         assert!(editor.move_down());
         assert_eq!(editor.cursor(), 13);
-        assert!(!editor.move_down(), "the last row leaves down for history navigation");
+        assert!(
+            !editor.move_down(),
+            "the last row leaves down for history navigation"
+        );
     }
 
     #[test]
@@ -874,7 +885,10 @@ mod tests {
         editor.insert_paste_str("ab");
 
         assert_eq!(editor.paste_summary_lines(), Some(6));
-        assert_eq!(editor.collapsed_paste_range(), Some(2..2 + text.chars().count()));
+        assert_eq!(
+            editor.collapsed_paste_range(),
+            Some(2..2 + text.chars().count())
+        );
         assert_eq!(editor.text(), format!("ab{text}"));
     }
 
@@ -921,7 +935,10 @@ mod tests {
 
         assert_eq!(editor.text(), "alpha gamma");
         assert_eq!(editor.cursor(), 6);
-        assert!(!editor.delete_display_range(4..4), "an empty range is a no-op");
+        assert!(
+            !editor.delete_display_range(4..4),
+            "an empty range is a no-op"
+        );
     }
 
     #[test]
