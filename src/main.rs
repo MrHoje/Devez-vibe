@@ -1518,21 +1518,6 @@ async fn execute_action(
         } => {
             persist_vibe_display_modes(server, state, vibe, response, shell, diff).await;
         }
-        Action::PersistSidePanelStage(stage) => {
-            if let Err(error) = server
-                .request(
-                    "config/value/write",
-                    config_value_write_params(state::SIDE_PANEL_STAGE_KEY, stage.config_value()),
-                )
-                .await
-            {
-                state.push_notice(
-                    BlockKind::Warning,
-                    "사이드패널 설정 저장 실패",
-                    error.to_string(),
-                );
-            }
-        }
         Action::PersistStatusLine { key_path, enabled } => {
             if let Err(error) = server
                 .request(

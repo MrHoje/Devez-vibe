@@ -1553,7 +1553,6 @@ fn is_vibe_setting_key(key: &str) -> bool {
             | crate::state::CODEX_PROVIDER_KEY
             | crate::state::CLAUDE_PROVIDER_KEY
             | crate::state::CLAUDE_PERMISSION_MODE_KEY
-            | crate::state::SIDE_PANEL_STAGE_KEY
     )
 }
 

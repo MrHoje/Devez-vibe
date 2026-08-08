@@ -515,9 +515,6 @@ pub(crate) const CODEX_PROVIDER_KEY: &str = "codex_provider_enabled";
 /// resumed — opens under the mode the user left behind.
 pub(crate) const CLAUDE_PERMISSION_MODE_KEY: &str = "claude_permission_mode";
 
-/// Vibe settings key holding the docked side panel's width stage.
-pub(crate) const SIDE_PANEL_STAGE_KEY: &str = "side_panel_stage";
-
 struct SlashCommand {
     name: &'static str,
     description: &'static str,
@@ -1154,8 +1151,6 @@ pub enum Action {
     /// Save the transcript's Shell display preference for future sessions.
     PersistShellDisplayMode(ShellDisplayMode),
     PersistDiffDisplayMode(DiffDisplayMode),
-    /// Save the docked side panel's width stage for future sessions.
-    PersistSidePanelStage(SidePanelStage),
     PersistVibeDisplayModes {
         vibe: VibeMode,
         response: ResponseLength,
@@ -3164,7 +3159,10 @@ impl AppState {
             response_length,
             shell_display_mode,
             diff_display_mode,
-            side_panel_stage: read_side_panel_stage(),
+            // The stage belongs to a session, and no session is bound yet. Starting
+            // closed is what keeps a brand new session from flashing a panel open
+            // before its own (empty) stage is restored.
+            side_panel_stage: SidePanelStage::Closed,
             status_line_settings: read_status_line_settings(),
             claude_provider_enabled: claude_provider_enabled(),
             codex_provider_enabled: codex_provider_enabled(),
@@ -5280,7 +5278,8 @@ impl AppState {
             // by the composer's typed-text buffer, so the chord carries Alt to
             // reach this branch at all.
             KeyCode::Char('p') | KeyCode::Char('P') if alt && !ctrl => {
-                Action::PersistSidePanelStage(self.cycle_side_panel())
+                self.cycle_side_panel();
+                Action::None
             }
             // The terminal still reports a space for Shift+Space, so the composer
             // must not also type one.
@@ -6604,7 +6603,10 @@ impl AppState {
                     .push(Block::new(BlockKind::Error, "Usage", "/statusline"));
                 Action::None
             }
-            "/side-panel" => Action::PersistSidePanelStage(self.cycle_side_panel()),
+            "/side-panel" => {
+                self.cycle_side_panel();
+                Action::None
+            }
             "/new" if self.busy => {
                 self.committed.push(Block::new(
                     BlockKind::Warning,
@@ -10920,14 +10922,6 @@ fn read_vibe_config_value(key: &str) -> Option<String> {
 fn read_shell_display_mode() -> ShellDisplayMode {
     read_vibe_config_value("shell_display_mode")
         .and_then(|value| ShellDisplayMode::from_config_value(&value))
-        .unwrap_or_default()
-}
-
-/// The panel's width stage the last session left it on, so one left open
-/// reopens at the same width instead of always starting closed.
-fn read_side_panel_stage() -> SidePanelStage {
-    read_vibe_config_value(SIDE_PANEL_STAGE_KEY)
-        .map(|value| SidePanelStage::from_config_value(&value))
         .unwrap_or_default()
 }
 

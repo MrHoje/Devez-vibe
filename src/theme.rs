@@ -461,7 +461,7 @@ pub const GRAY: ThemePalette = ThemePalette {
         text: Rgb(0x1F, 0x29, 0x37),
         separator: Rgb(0x5F, 0x67, 0x74),
         branch: Rgb(0x00, 0x91, 0xD1),
-        context: Rgb(0x00, 0x8E, 0x5A),
+        context: Rgb(0x15, 0x80, 0x3D),
         model_haiku: Rgb(0x32, 0x6A, 0xA5),
         model_sonnet: Rgb(0xA1, 0x62, 0x07),
         model_opus: Rgb(0xC2, 0x41, 0x3E),
@@ -472,8 +472,8 @@ pub const GRAY: ThemePalette = ThemePalette {
         effort_xhigh: Rgb(0x65, 0x49, 0x7B),
         effort_max: Rgb(0xC2, 0x41, 0x3E),
         effort_ultra: Rgb(0xC2, 0x00, 0x78),
-        five_hour: Rgb(0x00, 0x5E, 0xD1),
-        weekly: Rgb(0x35, 0x00, 0xD1),
+        five_hour: Rgb(0x32, 0x6A, 0xA5),
+        weekly: Rgb(0x76, 0x55, 0x8F),
     },
     code: Rgb(0x1F, 0x29, 0x37),
     syntax_comment: Rgb(0x00, 0x80, 0x00),
@@ -527,7 +527,7 @@ pub const SOFT_PINK: ThemePalette = ThemePalette {
         text: Rgb(0x3B, 0x29, 0x31),
         separator: Rgb(0x73, 0x57, 0x63),
         branch: Rgb(0x00, 0x8D, 0xCC),
-        context: Rgb(0x00, 0x8B, 0x58),
+        context: Rgb(0x25, 0x72, 0x3C),
         model_haiku: Rgb(0x32, 0x6A, 0x9F),
         model_sonnet: Rgb(0x9A, 0x65, 0x0B),
         model_opus: Rgb(0xC2, 0x41, 0x3E),
@@ -538,8 +538,8 @@ pub const SOFT_PINK: ThemePalette = ThemePalette {
         effort_xhigh: Rgb(0x70, 0x46, 0x7E),
         effort_max: Rgb(0xC2, 0x41, 0x3E),
         effort_ultra: Rgb(0xBD, 0x00, 0x74),
-        five_hour: Rgb(0x00, 0x5B, 0xCC),
-        weekly: Rgb(0x33, 0x00, 0xCC),
+        five_hour: Rgb(0x32, 0x6A, 0x9F),
+        weekly: Rgb(0x84, 0x58, 0x8F),
     },
     code: Rgb(0x3B, 0x29, 0x31),
     syntax_comment: Rgb(0x3F, 0x76, 0x48),
@@ -1048,6 +1048,70 @@ mod tests {
                     status.effort_max
                 ],
                 efforts
+            );
+        }
+    }
+
+    #[test]
+    fn claude_status_usage_colors_match_the_devez_code_script() {
+        let expected = [
+            (
+                ThemeKind::Minimal,
+                [
+                    Rgb(0x00, 0x8E, 0x5A),
+                    Rgb(0x00, 0x5E, 0xD1),
+                    Rgb(0x35, 0x00, 0xD1),
+                ],
+            ),
+            (
+                ThemeKind::Soft,
+                [
+                    Rgb(0x00, 0x8B, 0x58),
+                    Rgb(0x00, 0x5B, 0xCC),
+                    Rgb(0x33, 0x00, 0xCC),
+                ],
+            ),
+            (
+                ThemeKind::Dark,
+                [
+                    Rgb(0x32, 0xB7, 0x86),
+                    Rgb(0x57, 0x91, 0xD7),
+                    Rgb(0x93, 0x7B, 0xD7),
+                ],
+            ),
+            (
+                ThemeKind::Gray,
+                [
+                    Rgb(0x15, 0x80, 0x3D),
+                    Rgb(0x32, 0x6A, 0xA5),
+                    Rgb(0x76, 0x55, 0x8F),
+                ],
+            ),
+            (
+                ThemeKind::SoftPink,
+                [
+                    Rgb(0x25, 0x72, 0x3C),
+                    Rgb(0x32, 0x6A, 0x9F),
+                    Rgb(0x84, 0x58, 0x8F),
+                ],
+            ),
+            (
+                ThemeKind::Midnight,
+                [
+                    Rgb(0x32, 0xB7, 0x86),
+                    Rgb(0x57, 0x91, 0xD7),
+                    Rgb(0x93, 0x7B, 0xD7),
+                ],
+            ),
+        ];
+
+        for (theme, usage) in expected {
+            let status = palette_of(theme).status;
+            assert_eq!(
+                [status.context, status.five_hour, status.weekly],
+                usage,
+                "{} usage colors differ from DevezCode",
+                theme.display_name()
             );
         }
     }

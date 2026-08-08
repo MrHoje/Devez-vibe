@@ -5107,10 +5107,10 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         (None, None) => None,
     };
     if let Some(five_hour) = five_hour {
-        push_status_span(&mut spans, five_hour, Tone::StatusText);
+        push_status_span(&mut spans, five_hour, Tone::LimitFiveHour);
     }
     if let Some(percent) = status.weekly_percent {
-        push_status_span(&mut spans, format!("week: {percent}%"), Tone::StatusText);
+        push_status_span(&mut spans, format!("week: {percent}%"), Tone::LimitWeekly);
     }
     // Fast: On/Off lives on the composer top rule beside the permission mode.
     if let Some(notice) = status.notice.filter(|notice| !notice.is_empty()) {
