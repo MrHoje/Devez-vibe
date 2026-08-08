@@ -10946,7 +10946,6 @@ mod tests {
                 .map(|row| overlay.lines[row].text.clone()),
             Some("가".to_owned())
         );
-
         // An arrow walks back out to the options it was typed among.
         state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         let overlay = state.overlay_view().expect("overlay");

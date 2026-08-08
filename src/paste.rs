@@ -265,6 +265,15 @@ impl ComposerPasteBuffer {
             .is_some_and(|last| now.duration_since(last) < self.idle_gap());
 
         match key.code {
+            // Shift+Space folds the plan panel, so it is a shortcut rather than
+            // typed text. Buffering it as a space would swallow the chord before
+            // the composer ever sees it.
+            KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::SHIFT) => self
+                .flush()
+                .into_iter()
+                .map(ComposerInput::Text)
+                .chain(std::iter::once(ComposerInput::Key(key)))
+                .collect(),
             KeyCode::Char(ch) if plain => self.push_char(ch, now, fast),
             KeyCode::Enter if plain && (self.shortcut_paste || self.pasted && fast) => {
                 self.text.push('\n');
