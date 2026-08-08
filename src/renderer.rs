@@ -572,6 +572,10 @@ struct ComposerLayout {
 struct ComposerRowLayout {
     /// Column the row's first glyph is painted at.
     start_column: usize,
+    /// Composer cursor positions at the row's left and right edges. Explicit
+    /// newlines consume the gap between adjacent rows; visual wraps do not.
+    start: usize,
+    end: usize,
     glyphs: Vec<ComposerGlyph>,
 }
 
@@ -1368,6 +1372,36 @@ impl Renderer {
             }
         }
         (start < end).then_some(start..end)
+    }
+
+    /// Maps a click on a visible composer row to the closest safe cursor
+    /// boundary. Clicking blank space clamps to that row instead of selecting
+    /// terminal padding, and wide glyphs can be approached from either side.
+    pub fn composer_cursor_position(&self, column: u16, row: u16) -> Option<usize> {
+        let composer = self.composer_selection.as_ref()?;
+        let offset = usize::from(row).checked_sub(composer.first_row)?;
+        let row = composer.layout.rows.get(offset)?;
+        let clicked = usize::from(column);
+        if clicked <= row.start_column {
+            return Some(row.start);
+        }
+        let mut glyph_column = row.start_column;
+        for glyph in &row.glyphs {
+            let glyph_end = glyph_column + glyph.width;
+            if clicked < glyph_end {
+                if glyph.span.start == glyph.span.end {
+                    return Some(glyph.span.start);
+                }
+                let right_half = glyph.width > 1 && (clicked - glyph_column) * 2 >= glyph.width;
+                return Some(if right_half {
+                    glyph.span.end
+                } else {
+                    glyph.span.start
+                });
+            }
+            glyph_column = glyph_end;
+        }
+        Some(row.end)
     }
 
     fn reconcile_selection(&mut self, lines: &[PaintLine]) {
@@ -6117,22 +6151,6 @@ fn plan_title_shimmer_spans(text: &str, phase: Option<f32>, effort_tone: Tone) -
     .collect()
 }
 
-/// Columns the leading `1. ` style number of a step occupies, so folded rows can
-/// hang under the text rather than under the number. Zero when a step opens with
-/// something else.
-fn step_number_width(text: &str) -> usize {
-    let digits = text.chars().take_while(char::is_ascii_digit).count();
-    if digits == 0 {
-        return 0;
-    }
-    let rest = &text[digits..];
-    if rest.starts_with(". ") {
-        digits + 2
-    } else {
-        0
-    }
-}
-
 /// The plan summary as the docked panel shows it: a heading, a blank row, then
 /// one row per step. The panel already draws a border of its own, so this drops
 /// the card chrome, the status gutter, and the toggle hint.
@@ -6156,7 +6174,7 @@ fn side_panel_plan_lines(
     let all_completed = !summary.steps.is_empty() && completed == summary.steps.len();
     if all_completed {
         let elapsed: Duration = summary.steps.iter().filter_map(|step| step.elapsed).sum();
-        title.push_str(&format!("  (  {}  )", format_plan_elapsed(elapsed)));
+        title.push_str(&format!("  ({})", format_plan_elapsed(elapsed)));
     }
     let mut lines = vec![
         PaintLine {
@@ -6204,32 +6222,28 @@ fn side_panel_plan_lines(
         } else {
             Tone::Plain
         };
-        // A step too wide for the panel folds instead of ending in an ellipsis,
-        // and its folded rows line up under the step's own text, not under the
-        // number that opens it.
-        let continuation = " ".repeat(mark_width + step_number_width(&step.text));
-        // The elapsed time sits at the end of the last row, so every row leaves
-        // that much room rather than only the row the time lands on.
-        let wrap_width = content_width.saturating_sub(time_width) + 1;
-        let mut wrapped = wrapped_line_with_continuation(
-            &mark,
-            &continuation,
+        // A step keeps one row of its own: too wide for the panel and it ends in
+        // an ellipsis rather than pushing the steps below it down.
+        lines.push(PaintLine {
+            prefix: mark,
             prefix_tone,
-            &step.text,
-            tone,
             bold,
-            u16::try_from(wrap_width).unwrap_or(u16::MAX),
-        );
-        if let Some(time) = elapsed
-            && let Some(last) = wrapped.last_mut()
-        {
-            last.tail.push(PaintSpan {
-                text: format!(" ({time})"),
-                tone: Tone::Muted,
-                bold: false,
-            });
-        }
-        lines.append(&mut wrapped);
+            text: compact_right(
+                &step.text,
+                content_width.saturating_sub(time_width + mark_width),
+            ),
+            tone,
+            tail: elapsed
+                .map(|time| {
+                    vec![PaintSpan {
+                        text: format!(" ({time})"),
+                        tone: Tone::Muted,
+                        bold: false,
+                    }]
+                })
+                .unwrap_or_default(),
+            ..PaintLine::plain("")
+        });
     }
     lines
 }
@@ -7881,6 +7895,7 @@ fn input_lines_with_controls(
         .max(4);
     let mut raw_rows = vec![String::new()];
     let mut row_glyphs: Vec<Vec<ComposerGlyph>> = vec![Vec::new()];
+    let mut row_ranges = vec![0..0];
     let mut row = 0;
     let input_prefix_width =
         UnicodeWidthStr::width(side_prefix) + UnicodeWidthStr::width(first_prefix);
@@ -7899,8 +7914,10 @@ fn input_lines_with_controls(
             .unwrap_or_else(|| index..index + 1);
 
         if ch == '\n' {
+            row_ranges[row].end = span.start;
             raw_rows.push(String::new());
             row_glyphs.push(Vec::new());
+            row_ranges.push(span.end..span.end);
             row += 1;
             column = input_prefix_width;
             continue;
@@ -7909,8 +7926,10 @@ fn input_lines_with_controls(
         let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
         let content_column = column.saturating_sub(input_prefix_width);
         if content_column + ch_width > content_width && !raw_rows[row].is_empty() {
+            row_ranges[row].end = span.start;
             raw_rows.push(String::new());
             row_glyphs.push(Vec::new());
+            row_ranges.push(span.start..span.start);
             row += 1;
             column = input_prefix_width;
             if index == editor_cursor {
@@ -7919,6 +7938,7 @@ fn input_lines_with_controls(
             }
         }
         raw_rows[row].push(ch);
+        row_ranges[row].end = span.end;
         // A combining mark rides along with the glyph it attaches to, so it is
         // deleted with it rather than being left behind on its own.
         match row_glyphs[row].last_mut() {
@@ -8018,10 +8038,13 @@ fn input_lines_with_controls(
     let layout = ComposerLayout {
         rows: row_glyphs
             .into_iter()
+            .zip(row_ranges)
             .skip(visible_start)
             .take(visible_end - visible_start)
-            .map(|glyphs| ComposerRowLayout {
+            .map(|(glyphs, range)| ComposerRowLayout {
                 start_column: input_prefix_width,
+                start: range.start,
+                end: range.end,
                 glyphs,
             })
             .collect(),
@@ -10026,6 +10049,99 @@ mod tests {
         // Chrome on its own selects nothing to delete.
         assert!(renderer.begin_selection(0, 1));
         assert_eq!(renderer.composer_selection_range(), None);
+    }
+
+    #[test]
+    fn composer_clicks_resolve_text_width_and_line_boundaries() {
+        let mut editor = Editor::default();
+        editor.set_text("ab한\ncd");
+        let (rows, _, _, layout) = input_lines(&editor, &[], 40, "", "placeholder", None, None);
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = rows;
+        renderer.composer_selection = Some(ComposerSelection {
+            first_row: 1,
+            layout,
+        });
+
+        assert_eq!(renderer.composer_cursor_position(0, 1), Some(0));
+        assert_eq!(renderer.composer_cursor_position(5, 1), Some(1));
+        assert_eq!(renderer.composer_cursor_position(6, 1), Some(2));
+        assert_eq!(renderer.composer_cursor_position(7, 1), Some(3));
+        assert_eq!(renderer.composer_cursor_position(30, 1), Some(3));
+        assert_eq!(renderer.composer_cursor_position(0, 2), Some(4));
+        assert_eq!(renderer.composer_cursor_position(30, 2), Some(6));
+        assert_eq!(renderer.composer_cursor_position(4, 0), None);
+        assert_eq!(renderer.composer_cursor_position(4, 3), None);
+    }
+
+    #[test]
+    fn composer_clicks_clamp_to_visual_wrap_boundaries() {
+        let mut editor = Editor::default();
+        editor.set_text("abcdefgh");
+        let (rows, _, _, layout) = input_lines(&editor, &[], 16, "", "placeholder", None, None);
+        assert_eq!(layout.rows.len(), 2);
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = rows;
+        renderer.composer_selection = Some(ComposerSelection {
+            first_row: 1,
+            layout,
+        });
+
+        assert_eq!(renderer.composer_cursor_position(14, 1), Some(7));
+        assert_eq!(renderer.composer_cursor_position(0, 2), Some(7));
+        assert_eq!(renderer.composer_cursor_position(14, 2), Some(8));
+    }
+
+    #[test]
+    fn composer_clicks_treat_an_image_label_as_one_character() {
+        let mut editor = Editor::default();
+        editor.set_text("a");
+        editor.insert_attachment();
+        editor.insert_str("b");
+        let (rows, _, _, layout) = input_lines(
+            &editor,
+            &["image.png".to_owned()],
+            40,
+            "",
+            "placeholder",
+            None,
+            None,
+        );
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = rows;
+        renderer.composer_selection = Some(ComposerSelection {
+            first_row: 1,
+            layout,
+        });
+
+        assert_eq!(renderer.composer_cursor_position(6, 1), Some(1));
+        assert_eq!(renderer.composer_cursor_position(16, 1), Some(2));
+    }
+
+    #[test]
+    fn composer_clicks_use_the_visible_window_of_a_long_draft() {
+        let mut editor = Editor::default();
+        editor.set_text(
+            (0..12)
+                .map(|index| format!("row{index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let (rows, _, _, layout) = input_lines(&editor, &[], 40, "", "placeholder", None, None);
+        assert_eq!(layout.rows.len(), COMPOSER_MAX_PROMPT_ROWS);
+        let first_visible = "row0\nrow1\n".chars().count();
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = rows;
+        renderer.composer_selection = Some(ComposerSelection {
+            first_row: 1,
+            layout,
+        });
+
+        assert_eq!(renderer.composer_cursor_position(0, 1), Some(first_visible));
+        assert_eq!(
+            renderer.composer_cursor_position(30, 10),
+            Some(editor.chars().len())
+        );
     }
 
     #[test]
@@ -15635,18 +15751,17 @@ mod tests {
             ..summary
         };
         let done = side_panel_plan_lines(&finished, layout.content_width(), 0.0, false);
-        assert_eq!(painted(&done[0]), "작업 단계  3 / 3 완료  (  1m 25s  )");
+        assert_eq!(painted(&done[0]), "작업 단계  3 / 3 완료  (1m 25s)");
     }
 
-    /// A step wider than the panel folds onto more rows instead of ending in an
-    /// ellipsis, and the folded rows hang under the step's text so the numbers
-    /// keep a column of their own.
+    /// A step wider than the panel keeps one row of its own and ends in an
+    /// ellipsis, so the steps below it never shift down.
     #[test]
-    fn a_long_side_panel_step_folds_under_its_own_text() {
+    fn a_long_side_panel_step_stays_on_one_row() {
         let summary = PlanSummary {
             explanation: None,
             steps: vec![PlanStep {
-                text: "1. 사이드패널 폭보다 훨씬 긴 작업 단계 제목을 넣어서 줄바꿈을 확인한다"
+                text: "1. 사이드패널 폭보다 훨씬 긴 작업 단계 제목을 넣어서 잘림을 확인한다"
                     .to_owned(),
                 status: PlanStepStatus::Pending,
                 started_at: None,
@@ -15661,21 +15776,10 @@ mod tests {
         let content = side_panel_plan_lines(&summary, layout.content_width(), 0.0, false);
 
         let rows = &content[2..];
-        assert!(rows.len() > 1, "the step folds onto more than one row");
-        assert!(
-            rows.iter().all(|row| !painted(row).contains('…')),
-            "folding replaces the ellipsis"
-        );
-        assert!(
-            rows.iter()
-                .all(|row| painted_line_width(row) <= layout.content_width()),
-            "no folded row runs past the panel's inner width"
-        );
-        // `"  "` is the pending mark's own gutter, `"1. "` the step's number.
+        assert_eq!(rows.len(), 1, "one step keeps one row");
+        assert!(painted(&rows[0]).ends_with('…'));
+        assert!(painted_line_width(&rows[0]) <= layout.content_width());
         assert_eq!(rows[0].prefix, "  ");
-        for row in &rows[1..] {
-            assert_eq!(row.prefix, "     ");
-        }
     }
 
     #[test]
