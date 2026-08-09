@@ -677,7 +677,22 @@ fn display_units(text: &str) -> Vec<&str> {
 }
 
 fn terminal_unit_width(unit: &str) -> usize {
-    UnicodeWidthStr::width(unit)
+    unit.chars()
+        .map(|ch| {
+            if ch == '\t' {
+                1
+            } else {
+                UnicodeWidthChar::width(ch).unwrap_or(0)
+            }
+        })
+        .sum()
+}
+
+fn terminal_text_width(text: &str) -> usize {
+    display_units(text)
+        .into_iter()
+        .map(terminal_unit_width)
+        .sum()
 }
 
 /// 터미널 기본 탭 정지 간격.
@@ -786,6 +801,11 @@ const SIDE_PANEL_AUTOWRAP_GUARD: usize = 1;
 
 fn devez_layout_signal(main_width: u16) -> String {
     format!("\x1b]777;devez-layout-v1;{main_width}\x07")
+}
+
+fn devez_unicode_signal() -> String {
+    let (major, minor, patch) = unicode_width::UNICODE_VERSION;
+    format!("\x1b]777;devez-unicode-v1;{major}.{minor}.{patch}\x07")
 }
 
 /// Where the docked panel sits once the terminal is wide enough to carry it
@@ -1627,6 +1647,9 @@ impl Renderer {
             self.side_panel = side_panel;
         }
         let width = side_panel.map_or(total_width, |layout| layout.main_width as u16);
+        if self.last_width == 0 {
+            queue!(self.out, Print(devez_unicode_signal()))?;
+        }
         if width != self.last_width {
             queue!(self.out, Print(devez_layout_signal(width)))?;
         }
@@ -6100,7 +6123,7 @@ fn fixed_plan_summary_lines(
     lines.insert(1, PaintLine::blank());
     if all_completed {
         let elapsed = summary.steps.iter().filter_map(|step| step.elapsed).sum();
-        let total = format!("⏱  {}", format_plan_elapsed(elapsed));
+        let total = format!("⏱︎  {}", format_plan_elapsed(elapsed));
         lines.push(PaintLine::plain(format!(
             "{}{}  ",
             " ".repeat(line_width.saturating_sub(UnicodeWidthStr::width(total.as_str()) + 2)),
@@ -8000,7 +8023,7 @@ fn input_lines_with_controls(
         } else {
             continuation_prefix
         };
-        let content_width = UnicodeWidthStr::width(content.as_str());
+        let content_width = terminal_text_width(content.as_str());
         let content_tone = if is_placeholder {
             Tone::Muted
         } else {
@@ -10968,6 +10991,24 @@ mod tests {
         // 탭이 차지하던 칸은 빈 칸으로 남아 배경이 그대로 칠해지고, 뒤따르는
         // 글자는 폭 계산과 같은 열에 그려진다.
         assert_eq!(glyphs, vec!["a".to_owned(), String::new(), "b".to_owned()]);
+    }
+
+    #[test]
+    fn pasted_icons_use_the_same_cells_as_the_devezcode_terminal() {
+        assert_eq!(display_units("⚙️👩‍💻🇰🇷"), vec!["⚙️", "👩‍", "💻", "🇰", "🇷"]);
+        assert_eq!(terminal_text_width("⚙️👩‍💻🇰🇷🫠"), 9);
+
+        let mut frame = CellFrame::new(12, 1);
+        frame.write(0, 0, "A⚙️B👩‍💻C", CellStyle::plain());
+
+        assert_eq!(frame.cell(0, 0).glyph, "A");
+        assert_eq!(frame.cell(1, 0).glyph, "⚙️");
+        assert_eq!(frame.cell(2, 0).glyph, "B");
+        assert_eq!(frame.cell(3, 0).glyph, "👩‍");
+        assert!(frame.cell(4, 0).continuation);
+        assert_eq!(frame.cell(5, 0).glyph, "💻");
+        assert!(frame.cell(6, 0).continuation);
+        assert_eq!(frame.cell(7, 0).glyph, "C");
     }
 
     #[test]
@@ -15667,6 +15708,14 @@ mod tests {
     }
 
     #[test]
+    fn devezcode_unicode_width_signal_is_explicit_and_private() {
+        assert_eq!(
+            devez_unicode_signal(),
+            "\x1b]777;devez-unicode-v1;17.0.0\x07"
+        );
+    }
+
+    #[test]
     fn terra_uses_the_reference_green_model_colour() {
         assert_eq!(
             tone_rgb(Tone::ModelTerra),
@@ -15947,7 +15996,7 @@ mod tests {
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None);
 
         assert!(painted(&lines[2]).contains("Done (1m 34s)"));
-        assert!(painted(&lines[3]).contains("⏱  1m 34s"));
+        assert!(painted(&lines[3]).contains("⏱︎  1m 34s"));
     }
 
     #[test]
