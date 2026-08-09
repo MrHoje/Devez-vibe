@@ -783,6 +783,13 @@ fn devez_unicode_signal() -> String {
     format!("\x1b]777;devez-unicode-v2;{major}.{minor}.{patch}\x07")
 }
 
+fn devez_composer_signal(rows: Option<(usize, usize)>) -> String {
+    rows.map_or_else(
+        || "\x1b]777;devez-composer-v1;none\x07".to_owned(),
+        |(top, bottom)| format!("\x1b]777;devez-composer-v1;{top};{bottom}\x07"),
+    )
+}
+
 /// Where the docked panel sits once the terminal is wide enough to carry it
 /// without squeezing the conversation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1672,6 +1679,8 @@ impl Renderer {
             );
         }
 
+        queue!(self.out, Print(devez_composer_signal(None)))?;
+
         let max_live = height.max(3) as usize;
         let natural_rows = frame.lines.len().min(max_live);
         let hidden_thinking_merge = self.mode == RenderMode::Inline
@@ -2024,6 +2033,15 @@ impl Renderer {
             .map(|index| plan_rows + view_rows + index);
         // The prompt rows follow the composer's top rule, and the live frame is
         // painted below the transcript window, so this is where they land.
+        let composer_rows = frame
+            .composer_index
+            .zip(frame.composer_layout.as_ref())
+            .map(|(index, layout)| {
+                let top = plan_rows + view_rows + index;
+                let bottom = (top + layout.rows.len() + 1).min(rows.saturating_sub(1));
+                (top, bottom)
+            });
+        queue!(self.out, Print(devez_composer_signal(composer_rows)))?;
         let composer_selection =
             frame
                 .composer_index
@@ -15803,6 +15821,18 @@ mod tests {
         assert_eq!(
             devez_unicode_signal(),
             "\x1b]777;devez-unicode-v2;17.0.0\x07"
+        );
+    }
+
+    #[test]
+    fn devezcode_composer_signal_reports_exact_rows_or_clears_them() {
+        assert_eq!(
+            devez_composer_signal(Some((38, 40))),
+            "\x1b]777;devez-composer-v1;38;40\x07"
+        );
+        assert_eq!(
+            devez_composer_signal(None),
+            "\x1b]777;devez-composer-v1;none\x07"
         );
     }
 
