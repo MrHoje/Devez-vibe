@@ -47,7 +47,13 @@ struct ClaudeProcess {
 }
 
 impl ClaudeClient {
-    pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+    pub async fn request(&self, method: &str, mut params: Value) -> Result<Value> {
+        if let Some(object) = params.as_object_mut() {
+            object.insert(
+                "claudePath".to_owned(),
+                json!(self.claude_path.to_string_lossy()),
+            );
+        }
         self.ensure_started().await?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (response_tx, response_rx) = oneshot::channel();
@@ -265,6 +271,10 @@ impl ClaudeServer {
             );
         }
         self.client.request(method, params).await
+    }
+
+    pub fn client(&self) -> ClaudeClient {
+        self.client.clone()
     }
 
     pub fn respond(&self, id: Value, result: Value) -> Result<()> {

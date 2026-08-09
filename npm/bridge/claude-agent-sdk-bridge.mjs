@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -455,6 +456,188 @@ async function requestToolPermission(toolName, input, permission) {
       ? { updatedPermissions: permission.suggestions }
       : {}),
   };
+}
+
+function runClaudeCommand(params, args) {
+  const executable = String(params.claudePath || "claude");
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, args, {
+      cwd: params.cwd || process.cwd(),
+      env: sanitizedEnvironment(),
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdout = [];
+    const stderr = [];
+    child.stdout.on("data", (chunk) => stdout.push(chunk));
+    child.stderr.on("data", (chunk) => stderr.push(chunk));
+    child.once("error", reject);
+    child.once("close", (code) => {
+      const output = Buffer.concat(stdout).toString("utf8").trim();
+      const detail = Buffer.concat(stderr).toString("utf8").trim();
+      if (code === 0) resolve(output);
+      else reject(new Error(detail || output || `Claude 명령이 종료 코드 ${code}로 실패했습니다.`));
+    });
+  });
+}
+
+async function runClaudeJson(params, args) {
+  const output = await runClaudeCommand(params, args);
+  try { return output ? JSON.parse(output) : null; }
+  catch (error) {
+    throw new Error(`Claude 플러그인 응답을 해석하지 못했습니다: ${error.message}`);
+  }
+}
+
+function splitPluginId(id, fallbackMarketplace = "local") {
+  const value = String(id || "");
+  const separator = value.lastIndexOf("@");
+  if (separator <= 0 || separator === value.length - 1) {
+    return { name: value || "plugin", marketplace: fallbackMarketplace };
+  }
+  return { name: value.slice(0, separator), marketplace: value.slice(separator + 1) };
+}
+
+function claudePluginValue(available, installed) {
+  const id = String(available?.pluginId || installed?.id || "plugin");
+  const parts = splitPluginId(id, available?.marketplaceName);
+  const displayName = String(available?.name || parts.name);
+  const description = String(available?.description || "");
+  const mcpServers = installed?.mcpServers && typeof installed.mcpServers === "object"
+    ? Object.keys(installed.mcpServers)
+    : [];
+  const capabilities = [];
+  if (mcpServers.length) capabilities.push(`${mcpServers.length} MCP servers`);
+  return {
+    id,
+    // Keep the marketplace-qualified id as the action target. The display name
+    // remains short, so typed searches still resolve the same way as Claude CLI.
+    name: id,
+    description,
+    installed: Boolean(installed),
+    enabled: Boolean(installed?.enabled),
+    availability: "AVAILABLE",
+    installPolicy: "USER_INSTALLABLE",
+    mustShowInstallationInterstitial: true,
+    interface: {
+      displayName,
+      shortDescription: description,
+      developerName: parts.marketplace,
+      capabilities,
+    },
+  };
+}
+
+function buildClaudePluginCatalog(installed, available, marketplaces) {
+  const groups = new Map();
+  const ensureGroup = (name, path = null) => {
+    const key = String(name || "local");
+    if (!groups.has(key)) {
+      groups.set(key, {
+        name: key,
+        ...(path ? { path } : {}),
+        interface: { displayName: key },
+        plugins: [],
+      });
+    } else if (path) {
+      groups.get(key).path = path;
+    }
+    return groups.get(key);
+  };
+  for (const marketplace of Array.isArray(marketplaces) ? marketplaces : []) {
+    ensureGroup(marketplace.name, marketplace.installLocation);
+  }
+
+  const installedById = new Map();
+  for (const plugin of Array.isArray(installed) ? installed : []) {
+    if (plugin?.id && !installedById.has(plugin.id)) installedById.set(plugin.id, plugin);
+  }
+  const seen = new Set();
+  for (const plugin of Array.isArray(available) ? available : []) {
+    const id = String(plugin?.pluginId || "");
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const parts = splitPluginId(id, plugin.marketplaceName);
+    ensureGroup(plugin.marketplaceName || parts.marketplace)
+      .plugins.push(claudePluginValue(plugin, installedById.get(id)));
+  }
+  for (const plugin of installedById.values()) {
+    if (seen.has(plugin.id)) continue;
+    const parts = splitPluginId(plugin.id);
+    ensureGroup(parts.marketplace).plugins.push(claudePluginValue(null, plugin));
+  }
+  for (const group of groups.values()) {
+    group.plugins.sort((left, right) => left.interface.displayName.localeCompare(right.interface.displayName));
+  }
+  return { marketplaces: [...groups.values()], marketplaceLoadErrors: [] };
+}
+
+async function claudePluginCatalog(params, installedOnly = false) {
+  const pluginArgs = installedOnly
+    ? ["plugin", "list", "--json"]
+    : ["plugin", "list", "--available", "--json"];
+  const [plugins, marketplaces] = await Promise.all([
+    runClaudeJson(params, pluginArgs),
+    runClaudeJson(params, ["plugin", "marketplace", "list", "--json"]),
+  ]);
+  const installed = installedOnly ? plugins : plugins?.installed;
+  const available = installedOnly ? [] : plugins?.available;
+  return buildClaudePluginCatalog(installed, available, marketplaces);
+}
+
+async function installedClaudePlugin(params, id) {
+  const plugins = await runClaudeJson(params, ["plugin", "list", "--json"]);
+  return (Array.isArray(plugins) ? plugins : []).find((plugin) => plugin?.id === id);
+}
+
+async function claudePluginDetail(params) {
+  const requested = String(params.pluginName || params.pluginId || "");
+  const raw = await runClaudeJson(params, ["plugin", "list", "--available", "--json"]);
+  const installed = (raw?.installed || []).find((plugin) => plugin?.id === requested);
+  const available = (raw?.available || []).find((plugin) => plugin?.pluginId === requested);
+  const entry = claudePluginValue(available, installed);
+  const skills = [];
+  if (installed?.installPath) {
+    try {
+      for (const child of await readdir(join(installed.installPath, "skills"), { withFileTypes: true })) {
+        if (child.isDirectory()) skills.push({ name: child.name });
+      }
+    } catch { /* Plugins do not have to provide skills. */ }
+  }
+  const mcpServers = installed?.mcpServers && typeof installed.mcpServers === "object"
+    ? Object.keys(installed.mcpServers).map((name) => ({ name }))
+    : [];
+  return {
+    plugin: {
+      summary: entry.interface.shortDescription,
+      description: entry.description,
+      skills,
+      mcpServers,
+      apps: [],
+      hooks: [],
+      scheduledTasks: [],
+    },
+  };
+}
+
+async function claudeSkills(params) {
+  const installed = await runClaudeJson(params, ["plugin", "list", "--json"]);
+  const skills = [];
+  for (const plugin of Array.isArray(installed) ? installed : []) {
+    if (!plugin?.enabled || !plugin.installPath) continue;
+    try {
+      for (const child of await readdir(join(plugin.installPath, "skills"), { withFileTypes: true })) {
+        if (!child.isDirectory()) continue;
+        skills.push({
+          name: child.name,
+          path: join(plugin.installPath, "skills", child.name, "SKILL.md"),
+          description: `${plugin.id} plugin skill`,
+          enabled: true,
+        });
+      }
+    } catch { /* Plugins do not have to provide skills. */ }
+  }
+  return { data: [{ cwd: params.cwd || process.cwd(), skills }] };
 }
 
 function isQuestionDeliveryError(error) {
@@ -1825,6 +2008,59 @@ async function readableCwd(id, cwd) {
 
 async function dispatch(method, params = {}) {
   if (method === "model/list") return loadModelCatalog(params);
+  if (method === "plugin/list") return claudePluginCatalog(params);
+  if (method === "plugin/installed") return claudePluginCatalog(params, true);
+  if (method === "plugin/read") return claudePluginDetail(params);
+  if (method === "plugin/install") {
+    const requested = String(params.pluginName || "");
+    const id = requested.includes("@") || !params.remoteMarketplaceName
+      ? requested
+      : `${requested}@${params.remoteMarketplaceName}`;
+    if (!id) throw new Error("설치할 Claude 플러그인 이름이 없습니다.");
+    await runClaudeCommand(params, ["plugin", "install", id, "--scope", "user"]);
+    return { pluginId: id, appsNeedingAuth: [] };
+  }
+  if (method === "plugin/uninstall") {
+    const id = String(params.pluginId || "");
+    if (!id) throw new Error("제거할 Claude 플러그인 이름이 없습니다.");
+    const installed = await installedClaudePlugin(params, id);
+    await runClaudeCommand(params, [
+      "plugin", "uninstall", id, "--scope", installed?.scope || "user",
+    ]);
+    return {};
+  }
+  if (method === "plugin/set-enabled") {
+    const id = String(params.pluginId || "");
+    if (!id) throw new Error("변경할 Claude 플러그인 이름이 없습니다.");
+    const installed = await installedClaudePlugin(params, id);
+    await runClaudeCommand(params, [
+      "plugin", params.enabled ? "enable" : "disable", id,
+      "--scope", installed?.scope || "user",
+    ]);
+    return { effectiveEnabled: Boolean(params.enabled) };
+  }
+  if (method === "marketplace/add") {
+    const ref = params.refName ? `@${params.refName}` : "";
+    const source = `${String(params.source || "")}${ref}`;
+    if (!source) throw new Error("추가할 Claude 마켓플레이스 주소가 없습니다.");
+    await runClaudeCommand(params, ["plugin", "marketplace", "add", source]);
+    return { alreadyAdded: false, installedRoot: source };
+  }
+  if (method === "marketplace/remove") {
+    const name = String(params.marketplaceName || "");
+    if (!name) throw new Error("제거할 Claude 마켓플레이스 이름이 없습니다.");
+    await runClaudeCommand(params, ["plugin", "marketplace", "remove", name]);
+    return {};
+  }
+  if (method === "marketplace/upgrade") {
+    const output = await runClaudeCommand(params, ["plugin", "marketplace", "update"]);
+    return { message: output, consideredRoots: ["Claude marketplaces"], errors: [] };
+  }
+  if (method === "skills/list") return claudeSkills(params);
+  if (method === "app/list") return { data: [] };
+  if (method === "plugin/reload") {
+    return { message: "Claude 플러그인 설정을 다시 읽었습니다. 새 대화부터 적용됩니다." };
+  }
   if (method === "session/permissionMode") {
     const session = lookupSession(params.sessionId);
     // A session that has not started yet picks the mode up from its first turn.
@@ -1985,6 +2221,24 @@ async function dispatch(method, params = {}) {
 }
 
 async function runSelfTest() {
+  const pluginCatalog = buildClaudePluginCatalog(
+    [{ id: "cloudflare@official", enabled: true, scope: "user" }],
+    [{
+      pluginId: "cloudflare@official",
+      name: "cloudflare",
+      description: "Cloud tools",
+      marketplaceName: "official",
+    }],
+    [{ name: "official", installLocation: "/tmp/official" }],
+  );
+  const plugin = pluginCatalog.marketplaces[0]?.plugins[0];
+  if (plugin?.id !== "cloudflare@official"
+    || plugin?.name !== "cloudflare@official"
+    || plugin?.interface?.displayName !== "cloudflare"
+    || plugin?.installed !== true
+    || plugin?.enabled !== true) {
+    throw new Error(`Claude plugin catalogue self-test failed: ${JSON.stringify(pluginCatalog)}`);
+  }
   const user = (uuid, text) => ({
     type: "user",
     uuid,

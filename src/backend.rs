@@ -12,13 +12,28 @@ use serde_json::{Value, json};
 use crate::{
     app_server::{AppServer, AppServerClient, ServerEvent},
     claude::{
-        ClaudeServer, is_claude_model, is_claude_request_id, is_claude_thread, raw_thread_id,
-        visible_thread_id,
+        ClaudeClient, ClaudeServer, is_claude_model, is_claude_request_id, is_claude_thread,
+        raw_thread_id, visible_thread_id,
     },
     open_code::{
         OpenCodeServer, has_connected_provider, is_open_code_model, is_open_code_request_id,
     },
 };
+
+#[derive(Clone)]
+pub enum IntegrationClient {
+    Codex(AppServerClient),
+    Claude(ClaudeClient),
+}
+
+impl IntegrationClient {
+    pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        match self {
+            Self::Codex(client) => client.request(method, params).await,
+            Self::Claude(client) => client.request(method, params).await,
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum RuntimeKind {
@@ -658,6 +673,28 @@ impl BackendServer {
 
     pub fn client(&self) -> Option<AppServerClient> {
         self.codex.as_ref().map(AppServer::client)
+    }
+
+    pub fn integration_client(&self, model: &str) -> Option<IntegrationClient> {
+        if is_claude_model(model) {
+            Some(IntegrationClient::Claude(self.claude.client()))
+        } else if is_open_code_model(model) {
+            None
+        } else {
+            self.client().map(IntegrationClient::Codex)
+        }
+    }
+
+    pub async fn integration_request(
+        &self,
+        model: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
+        self.integration_client(model)
+            .context("현재 provider는 플러그인 관리를 지원하지 않습니다.")?
+            .request(method, params)
+            .await
     }
 
     pub fn codex_thread_id(&self, visible: &str) -> Option<String> {

@@ -29,7 +29,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use app_server::ServerEvent;
 use arboard::{Clipboard, ImageData};
-use backend::BackendServer;
+use backend::{BackendServer, IntegrationClient};
 use clap::Parser;
 use completion::collect_workspace_entries;
 use crossterm::event::{
@@ -816,7 +816,11 @@ async fn event_loop(
             draw(state, renderer)?;
             continue;
         }
-        let current_integration_key = (state.thread_id.clone(), state.cwd.clone());
+        let current_integration_key = (
+            state.thread_id.clone(),
+            state.cwd.clone(),
+            state.selected_model_name().to_owned(),
+        );
         if integration_key.as_ref() != Some(&current_integration_key) {
             integration_key = Some(current_integration_key);
             integration_rx = Some(start_integration_refresh(server, state));
@@ -1898,7 +1902,7 @@ async fn execute_action(
             Ok(_) => state.apply_logout(),
             Err(error) => state.push_notice(BlockKind::Error, "로그아웃 실패", error.to_string()),
         },
-        Action::OpenPlugins { scope, notice } => match list_plugins(server, &state.cwd).await {
+        Action::OpenPlugins { scope, notice } => match list_plugins(server, state).await {
             Ok(response) => {
                 let catalog = PluginCatalog::from_value(&response);
                 state.update_plugins(&response);
@@ -1926,8 +1930,8 @@ async fn execute_action(
             // the plugin's current install state, not the state it had when the
             // list was drawn.
             let (detail, list) = tokio::join!(
-                server.request("plugin/read", params),
-                list_plugins(server, &state.cwd)
+                integration_request(server, state, "plugin/read", params),
+                list_plugins(server, state)
             );
             match (detail, list) {
                 (Ok(detail), Ok(list)) => {
@@ -1948,7 +1952,7 @@ async fn execute_action(
         }
         Action::ConfirmPluginInstall(plugin) => state.confirm_plugin_install(&plugin),
         Action::ConfirmPluginUninstall(plugin) => state.confirm_plugin_uninstall(&plugin),
-        Action::PreparePluginInstall(query) => match list_plugins(server, &state.cwd).await {
+        Action::PreparePluginInstall(query) => match list_plugins(server, state).await {
             Ok(response) => match PluginCatalog::from_value(&response).resolve(&query) {
                 Some(plugin) if plugin.installed && !plugin.enabled => state.push_notice(
                     BlockKind::System,
@@ -1982,7 +1986,7 @@ async fn execute_action(
                 state.push_notice(BlockKind::Error, "플러그인 조회 실패", error.to_string())
             }
         },
-        Action::PreparePluginUninstall(query) => match list_plugins(server, &state.cwd).await {
+        Action::PreparePluginUninstall(query) => match list_plugins(server, state).await {
             Ok(response) => match PluginCatalog::from_value(&response).resolve(&query) {
                 Some(plugin) if plugin.installed && !plugin.uninstall_allowed => state.push_notice(
                     BlockKind::Warning,
@@ -2008,7 +2012,7 @@ async fn execute_action(
                 state.push_notice(BlockKind::Error, "플러그인 조회 실패", error.to_string())
             }
         },
-        Action::SetPlugin { query, enabled } => match list_plugins(server, &state.cwd).await {
+        Action::SetPlugin { query, enabled } => match list_plugins(server, state).await {
             Ok(response) => match PluginCatalog::from_value(&response).resolve(&query) {
                 Some(plugin) if !plugin.installed => state.push_notice(
                     BlockKind::Warning,
@@ -2030,7 +2034,9 @@ async fn execute_action(
                     ),
                 ),
                 Some(plugin) => {
-                    if let Err(error) = write_plugin_enabled(server, &plugin.id, enabled).await {
+                    if let Err(error) =
+                        write_plugin_enabled(server, state, &plugin.id, enabled).await
+                    {
                         state.push_notice(
                             BlockKind::Error,
                             "플러그인 설정 실패",
@@ -2041,9 +2047,14 @@ async fn execute_action(
                             BlockKind::System,
                             "✓ Plugin updated",
                             format!(
-                                "{} · {}",
+                                "{} · {}{}",
                                 plugin.display_name,
-                                if enabled { "enabled" } else { "disabled" }
+                                if enabled { "enabled" } else { "disabled" },
+                                if claude::is_claude_model(state.selected_model_name()) {
+                                    "\n새 대화부터 적용됩니다."
+                                } else {
+                                    ""
+                                }
                             ),
                         );
                         let _ = refresh_integrations(server, state, true).await;
@@ -2060,7 +2071,7 @@ async fn execute_action(
             }
         },
         Action::SetPluginEnabled { plugin, enabled } => {
-            match write_plugin_enabled(server, &plugin.id, enabled).await {
+            match write_plugin_enabled(server, state, &plugin.id, enabled).await {
                 Ok(_) => {
                     let _ = refresh_integrations(server, state, true).await;
                     reopen_plugins(
@@ -2068,9 +2079,14 @@ async fn execute_action(
                         state,
                         scope_of(&plugin),
                         format!(
-                            "{} · {}",
+                            "{} · {}{}",
                             plugin.display_name,
-                            if enabled { "enabled" } else { "disabled" }
+                            if enabled { "enabled" } else { "disabled" },
+                            if claude::is_claude_model(state.selected_model_name()) {
+                                " · 새 대화부터 적용"
+                            } else {
+                                ""
+                            }
                         ),
                     )
                     .await;
@@ -2080,7 +2096,7 @@ async fn execute_action(
                 }
             }
         }
-        Action::OpenMarketplaces(notice) => match list_plugins(server, &state.cwd).await {
+        Action::OpenMarketplaces(notice) => match list_plugins(server, state).await {
             Ok(response) => {
                 state.open_marketplace_picker(&PluginCatalog::from_value(&response), notice);
             }
@@ -2100,7 +2116,7 @@ async fn execute_action(
             if let Some(ref_name) = ref_name {
                 params["refName"] = Value::String(ref_name.to_owned());
             }
-            match server.request("marketplace/add", params).await {
+            match integration_request(server, state, "marketplace/add", params).await {
                 Ok(response) => {
                     let already = response
                         .get("alreadyAdded")
@@ -2130,9 +2146,13 @@ async fn execute_action(
             }
         }
         Action::RemoveMarketplace(name) => {
-            match server
-                .request("marketplace/remove", json!({ "marketplaceName": name }))
-                .await
+            match integration_request(
+                server,
+                state,
+                "marketplace/remove",
+                json!({ "marketplaceName": name }),
+            )
+            .await
             {
                 Ok(_) => {
                     let _ = refresh_integrations(server, state, true).await;
@@ -2150,31 +2170,49 @@ async fn execute_action(
             // usable; restarting the MCP servers is what makes a plugin's tools
             // usable. Neither implies the other, so a reload does both.
             let integrations = refresh_integrations(server, state, true).await;
-            let reconnect = server.request("config/mcpServer/reload", json!({})).await;
-            let servers = match &reconnect {
-                Ok(_) => list_mcp_servers(server, &state.thread_id)
+            let using_claude = claude::is_claude_model(state.selected_model_name());
+            let reconnect = if using_claude {
+                integration_request(server, state, "plugin/reload", json!({})).await
+            } else {
+                server.request("config/mcpServer/reload", json!({})).await
+            };
+            let servers = match (&reconnect, using_claude) {
+                (Ok(_), false) => list_mcp_servers(server, &state.thread_id)
                     .await
                     .ok()
                     .map(|response| McpServerInfo::list_from_value(&response)),
-                Err(_) => None,
+                _ => None,
             };
-            let report = format_reload_report(
+            let mut report = format_reload_report(
                 integrations.as_ref().err().map(ToString::to_string),
                 reconnect.as_ref().err().map(ToString::to_string),
                 servers.as_deref(),
             );
+            if using_claude
+                && let Ok(response) = &reconnect
+                && let Some(message) = response.get("message").and_then(Value::as_str)
+            {
+                if !report.is_empty() {
+                    report.push('\n');
+                }
+                report.push_str(message);
+            }
             state.push_notice(
                 if integrations.is_err() || reconnect.is_err() {
                     BlockKind::Warning
                 } else {
                     BlockKind::System
                 },
-                "✓ Plugins reloaded",
+                if using_claude {
+                    "✓ Plugin settings refreshed"
+                } else {
+                    "✓ Plugins reloaded"
+                },
                 report,
             );
         }
         Action::UpgradeMarketplaces => {
-            match server.request("marketplace/upgrade", json!({})).await {
+            match integration_request(server, state, "marketplace/upgrade", json!({})).await {
                 Ok(response) => {
                     let _ = refresh_integrations(server, state, true).await;
                     reopen_marketplaces(server, state, format_upgrade_result(&response)).await;
@@ -2187,24 +2225,30 @@ async fn execute_action(
             }
         }
         Action::InstallPlugin(target) => {
-            let response = server
-                .request(
-                    "plugin/install",
-                    json!({
-                        "pluginName": target.plugin_name,
-                        "marketplacePath": target.marketplace_path,
-                        "remoteMarketplaceName": target.remote_marketplace_name
-                    }),
-                )
-                .await;
+            let using_claude = claude::is_claude_model(state.selected_model_name());
+            let response = integration_request(
+                server,
+                state,
+                "plugin/install",
+                json!({
+                    "pluginName": target.plugin_name,
+                    "marketplacePath": target.marketplace_path,
+                    "remoteMarketplaceName": target.remote_marketplace_name
+                }),
+            )
+            .await;
             match response {
                 Ok(response) => {
                     let auth = format_apps_needing_auth(&response);
                     // Skills and mentions come from the catalogue the refresh
                     // below re-reads, so they are live at once; a bundled MCP
                     // server only starts on a reconnect.
-                    let base = "Skill과 멘션은 바로 사용할 수 있습니다.\n\
-                                MCP 서버가 포함된 플러그인이면 /reload-plugins로 적용하세요.";
+                    let base = if using_claude {
+                        "설치했습니다. 새 대화부터 Skill과 도구가 적용됩니다."
+                    } else {
+                        "Skill과 멘션은 바로 사용할 수 있습니다.\n\
+                         MCP 서버가 포함된 플러그인이면 /reload-plugins로 적용하세요."
+                    };
                     state.push_notice(
                         BlockKind::System,
                         "✓ Plugin installed",
@@ -2222,19 +2266,28 @@ async fn execute_action(
             }
         }
         Action::UninstallPlugin(target) => {
-            match server
-                .request("plugin/uninstall", json!({ "pluginId": target.plugin_id }))
-                .await
+            let using_claude = claude::is_claude_model(state.selected_model_name());
+            match integration_request(
+                server,
+                state,
+                "plugin/uninstall",
+                json!({ "pluginId": target.plugin_id }),
+            )
+            .await
             {
                 Ok(_) => {
                     state.push_notice(
                         BlockKind::System,
                         "✓ Plugin uninstalled",
-                        format!(
-                            "{} · Skill과 멘션은 즉시 사라집니다.\n\
-                             MCP 도구가 있었다면 /reload-plugins로 정리하세요.",
-                            target.display_name
-                        ),
+                        if using_claude {
+                            format!("{} · 새 대화부터 제외됩니다.", target.display_name)
+                        } else {
+                            format!(
+                                "{} · Skill과 멘션은 즉시 사라집니다.\n\
+                                 MCP 도구가 있었다면 /reload-plugins로 정리하세요.",
+                                target.display_name
+                            )
+                        },
                     );
                     let _ = refresh_integrations(server, state, true).await;
                 }
@@ -3203,15 +3256,32 @@ async fn list_skills(server: &BackendServer, cwd: &str, force_reload: bool) -> R
         .await
 }
 
-async fn list_plugins(server: &BackendServer, cwd: &str) -> Result<Value> {
+async fn integration_request(
+    server: &BackendServer,
+    state: &AppState,
+    method: &str,
+    mut params: Value,
+) -> Result<Value> {
+    if let Some(object) = params.as_object_mut() {
+        object
+            .entry("cwd".to_owned())
+            .or_insert_with(|| Value::String(state.cwd.clone()));
+    }
     server
-        .request(
-            "plugin/list",
-            json!({
-                "cwds": [cwd]
-            }),
-        )
+        .integration_request(state.selected_model_name(), method, params)
         .await
+}
+
+async fn list_plugins(server: &BackendServer, state: &AppState) -> Result<Value> {
+    integration_request(
+        server,
+        state,
+        "plugin/list",
+        json!({
+            "cwds": [state.cwd]
+        }),
+    )
+    .await
 }
 
 async fn list_mcp_servers(server: &BackendServer, thread_id: &str) -> Result<Value> {
@@ -3252,19 +3322,30 @@ async fn refresh_provider_models(
 
 async fn write_plugin_enabled(
     server: &BackendServer,
+    state: &AppState,
     plugin_id: &str,
     enabled: bool,
 ) -> Result<Value> {
-    server
-        .request(
-            "config/value/write",
-            json!({
-                "keyPath": format!("plugins.{plugin_id}"),
-                "value": { "enabled": enabled },
-                "mergeStrategy": "upsert"
-            }),
+    if claude::is_claude_model(state.selected_model_name()) {
+        return integration_request(
+            server,
+            state,
+            "plugin/set-enabled",
+            json!({ "pluginId": plugin_id, "enabled": enabled }),
         )
-        .await
+        .await;
+    }
+    integration_request(
+        server,
+        state,
+        "config/value/write",
+        json!({
+            "keyPath": format!("plugins.{plugin_id}"),
+            "value": { "enabled": enabled },
+            "mergeStrategy": "upsert"
+        }),
+    )
+    .await
 }
 
 /// The list a plugin action should return to once the catalogue is refetched.
@@ -3280,7 +3361,7 @@ async fn reopen_plugins(
     scope: Option<PluginScope>,
     notice: String,
 ) {
-    match list_plugins(server, &state.cwd).await {
+    match list_plugins(server, state).await {
         Ok(response) => {
             let catalog = PluginCatalog::from_value(&response);
             state.update_plugins(&response);
@@ -3295,7 +3376,7 @@ async fn reopen_plugins(
 }
 
 async fn reopen_marketplaces(server: &BackendServer, state: &mut AppState, notice: String) {
-    match list_plugins(server, &state.cwd).await {
+    match list_plugins(server, state).await {
         Ok(response) => {
             state.open_marketplace_picker(&PluginCatalog::from_value(&response), Some(notice));
         }
@@ -3357,6 +3438,13 @@ fn format_reload_report(
 /// echoes the marketplaces it considered in `selectedMarketplaces`, which is the
 /// only trustworthy account of the upgrade's scope.
 fn format_upgrade_result(response: &Value) -> String {
+    if let Some(message) = response
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|message| !message.is_empty())
+    {
+        return message.to_owned();
+    }
     let strings = |key: &str| {
         response
             .get(key)
@@ -3404,7 +3492,7 @@ struct IntegrationCatalog {
 }
 
 async fn fetch_integrations(
-    client: Option<app_server::AppServerClient>,
+    client: Option<IntegrationClient>,
     cwd: String,
     app_thread_id: Option<String>,
     force_reload: bool,
@@ -3438,13 +3526,15 @@ async fn fetch_integrations(
         skills_client.request(
             "skills/list",
             json!({
-                "cwds": [cwd],
+                "cwd": cwd.clone(),
+                "cwds": [cwd.clone()],
                 "forceReload": force_reload
             }),
         ),
         plugins_client.request(
             "plugin/installed",
             json!({
+                "cwd": cwd.clone(),
                 "cwds": [cwd]
             }),
         ),
@@ -3531,7 +3621,7 @@ fn start_integration_refresh(
 ) -> mpsc::Receiver<IntegrationCatalog> {
     let app_thread_id = integration_app_thread_id(server, state);
     start_background_catalogue(fetch_integrations(
-        server.client(),
+        server.integration_client(state.selected_model_name()),
         state.cwd.clone(),
         app_thread_id,
         false,
@@ -3558,7 +3648,7 @@ async fn refresh_integrations(
 ) -> Result<()> {
     let app_thread_id = integration_app_thread_id(server, state);
     let catalog = fetch_integrations(
-        server.client(),
+        server.integration_client(state.selected_model_name()),
         state.cwd.clone(),
         app_thread_id,
         force_reload,
@@ -6617,6 +6707,11 @@ mod tests {
         assert_eq!(
             format_upgrade_result(&json!({})),
             "Git 마켓플레이스 · 이미 최신 상태입니다."
+        );
+
+        assert_eq!(
+            format_upgrade_result(&json!({ "message": "Claude marketplace updated" })),
+            "Claude marketplace updated"
         );
     }
 
