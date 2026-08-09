@@ -34,7 +34,7 @@ fn main() {
     let zero = javascript_ranges(&ranges(0));
     let wide = javascript_ranges(&ranges(2));
     println!(
-        "/* Generated from unicode-width 0.2.2 Unicode {}.{}.{} (MIT OR Apache-2.0). */\n!function(g){{const z=[{zero}],w=[{wide}];function h(c,r){{let l=0,u=r.length-1;while(l<=u){{const m=(l+u)>>1;if(c<r[m][0])u=m-1;else if(c>r[m][1])l=m+1;else return true}}return false}}function x(p){{return p>>1&3}}class A{{activate(t){{t.unicode.register({{version:'devez-{}.{}.{}',wcwidth:c=>h(c,z)?0:h(c,w)?2:1,charProperties(c,p){{let q=this.wcwidth(c),j=q===0&&p!==0;if(j){{const v=x(p);if(v===0)j=false;else if(v>q)q=v}}return(q&3)<<1|(j?1:0)}}}})}}dispose(){{}}}}g.DevezUnicodeAddon={{DevezUnicodeAddon:A}}}}(globalThis);",
+        "/* Generated from unicode-width 0.2.2 Unicode {}.{}.{} (MIT OR Apache-2.0). */\n!function(g){{const z=[{zero}],w=[{wide}];function h(c,r){{let l=0,u=r.length-1;while(l<=u){{const m=(l+u)>>1;if(c<r[m][0])u=m-1;else if(c>r[m][1])l=m+1;else return true}}return false}}function x(p){{return p>>1&3}}class A{{constructor(b){{this.b=b}}activate(t){{const v=this.b&&this.b._provider15Graphemes;if(!v)throw new Error('Unicode grapheme provider unavailable');const f=c=>h(c,z)?0:h(c,w)?2:1;t.unicode.register({{version:'devez-{}.{}.{}-graphemes',wcwidth:f,charProperties(c,p){{const a=v.charProperties(c,p),j=a&1,k=a>>3,s=f(c),o=x(p);let q=x(a);if(!j)q=s;else if(c===65038&&((p>>3)&15)===11)q=1;else q=Math.max(q,o,s);return(k<<3)|((q&3)<<1)|j}}}})}}dispose(){{}}}}g.DevezUnicodeAddon={{DevezUnicodeAddon:A}}}}(globalThis);",
         version.0, version.1, version.2, version.0, version.1, version.2
     );
 }
