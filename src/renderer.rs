@@ -10,6 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use crossterm::{
     cursor::{Hide, MoveDown, MoveTo, MoveToColumn, MoveUp, Show, position as cursor_position},
     event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
@@ -788,6 +789,54 @@ fn devez_composer_signal(rows: Option<(usize, usize)>) -> String {
         || "\x1b]777;devez-composer-v1;none\x07".to_owned(),
         |(top, bottom)| format!("\x1b]777;devez-composer-v1;{top};{bottom}\x07"),
     )
+}
+
+fn devez_emoji_candidate(glyph: &str) -> bool {
+    if glyph.contains('\u{fe0e}') {
+        return false;
+    }
+    glyph.chars().any(|ch| {
+        matches!(
+            ch as u32,
+            0x00A9 | 0x00AE | 0x203C | 0x2049 | 0x2122 | 0x2139 | 0x24C2
+                | 0x3030 | 0x303D | 0x3297 | 0x3299 | 0xFE0F | 0x20E3
+                | 0x2194..=0x2199 | 0x21A9..=0x21AA | 0x231A..=0x231B
+                | 0x2328..=0x2328 | 0x23CF..=0x23CF | 0x23E9..=0x23F3
+                | 0x23F8..=0x23FA | 0x25AA..=0x25AB | 0x25B6..=0x25B6
+                | 0x25C0..=0x25C0 | 0x25FB..=0x25FE | 0x2600..=0x27FF
+                | 0x2934..=0x2935 | 0x2B05..=0x2B07 | 0x2B1B..=0x2B1C
+                | 0x2B50..=0x2B50 | 0x2B55..=0x2B55 | 0x1F000..=0x1FAFF
+        )
+    })
+}
+
+/// DevezCode must not infer emoji positions from a broad screen region: the
+/// xterm buffer can expose a ZWJ sequence differently from the frame that dvz
+/// laid out. Send the final cell address, width and complete grapheme instead.
+fn devez_emoji_glyphs_signal(frame: &CellFrame) -> String {
+    let mut records = Vec::new();
+    for row in 0..frame.height {
+        let mut column = 0;
+        while column < frame.width {
+            let cell = frame.cell(column, row);
+            let mut width = 1;
+            while column + width < frame.width && frame.cell(column + width, row).continuation {
+                width += 1;
+            }
+            if !cell.continuation && devez_emoji_candidate(&cell.glyph) {
+                records.push(format!(
+                    "{row},{column},{width},{}",
+                    BASE64.encode(cell.glyph.as_bytes())
+                ));
+            }
+            column += width;
+        }
+    }
+    if records.is_empty() {
+        "\x1b]777;devez-glyphs-v1;none\x07".to_owned()
+    } else {
+        format!("\x1b]777;devez-glyphs-v1;{}\x07", records.join("|"))
+    }
 }
 
 /// Where the docked panel sits once the terminal is wide enough to carry it
@@ -1679,7 +1728,11 @@ impl Renderer {
             );
         }
 
-        queue!(self.out, Print(devez_composer_signal(None)))?;
+        queue!(
+            self.out,
+            Print(devez_composer_signal(None)),
+            Print("\x1b]777;devez-glyphs-v1;none\x07")
+        )?;
 
         let max_live = height.max(3) as usize;
         let natural_rows = frame.lines.len().min(max_live);
@@ -2251,6 +2304,7 @@ impl Renderer {
                 panel_selection,
             );
         }
+        queue!(self.out, Print(devez_emoji_glyphs_signal(&frame)))?;
         emit_synchronized_frame_diff_with_full_rows(
             &mut self.out,
             self.painted_frame.as_ref(),
@@ -6117,7 +6171,7 @@ fn fixed_plan_summary_lines(
     lines.insert(1, PaintLine::blank());
     if all_completed {
         let elapsed = summary.steps.iter().filter_map(|step| step.elapsed).sum();
-        let total = format!("⏱️  {}", format_plan_elapsed(elapsed));
+        let total = format!("⏱︎  {}", format_plan_elapsed(elapsed));
         lines.push(PaintLine::plain(format!(
             "{}{}  ",
             " ".repeat(line_width.saturating_sub(UnicodeWidthStr::width(total.as_str()) + 2)),
@@ -15837,6 +15891,22 @@ mod tests {
     }
 
     #[test]
+    fn devezcode_emoji_signal_uses_final_cell_positions_and_complete_graphemes() {
+        let mut frame = CellFrame::new(20, 2);
+        frame.write(1, 0, "A⚙️B👩‍💻", CellStyle::plain());
+        frame.write(0, 1, "⏱︎", CellStyle::plain());
+
+        assert_eq!(
+            devez_emoji_glyphs_signal(&frame),
+            format!(
+                "\x1b]777;devez-glyphs-v1;0,2,2,{}|0,5,2,{}\x07",
+                BASE64.encode("⚙️".as_bytes()),
+                BASE64.encode("👩‍💻".as_bytes())
+            )
+        );
+    }
+
+    #[test]
     fn terra_uses_the_reference_green_model_colour() {
         assert_eq!(
             tone_rgb(Tone::ModelTerra),
@@ -16119,7 +16189,7 @@ mod tests {
         let bottom_border = painted(&lines[4]);
 
         assert!(painted(&lines[2]).contains("Done (1m 34s)"));
-        assert!(elapsed_line.contains("⏱️  1m 34s"));
+        assert!(elapsed_line.contains("⏱︎  1m 34s"));
         assert_eq!(
             UnicodeWidthStr::width(elapsed_line.as_str()),
             UnicodeWidthStr::width(bottom_border.as_str())
