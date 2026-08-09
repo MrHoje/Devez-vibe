@@ -2004,6 +2004,31 @@ mod tests {
     }
 
     #[test]
+    fn claude_catalog_keeps_the_qualified_cli_action_target() {
+        let catalog = PluginCatalog::from_value(&json!({
+            "marketplaces": [{
+                "name": "claude-plugins-official",
+                "path": "C:/Users/test/.claude/plugins/marketplaces/official",
+                "plugins": [{
+                    "id": "cloudflare@claude-plugins-official",
+                    "name": "cloudflare@claude-plugins-official",
+                    "installed": true,
+                    "enabled": true,
+                    "availability": "AVAILABLE",
+                    "installPolicy": "USER_INSTALLABLE",
+                    "interface": { "displayName": "cloudflare" }
+                }]
+            }]
+        }));
+
+        let plugin = catalog.resolve("cloudflare").expect("short display name");
+        assert_eq!(plugin.display_name, "cloudflare");
+        assert_eq!(plugin.target().name, "cloudflare@claude-plugins-official");
+        assert!(plugin.toggle_allowed);
+        assert!(plugin.uninstall_allowed);
+    }
+
+    #[test]
     fn plugin_policy_blocks_illegal_actions_with_an_inline_reason() {
         let catalog = PluginCatalog::from_value(&plugin_response());
         let locked = catalog
