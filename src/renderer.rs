@@ -10,7 +10,6 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use crossterm::{
     cursor::{Hide, MoveDown, MoveTo, MoveToColumn, MoveUp, Show, position as cursor_position},
     event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
@@ -23,8 +22,7 @@ use crossterm::{
         enable_raw_mode, size as terminal_size,
     },
 };
-use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     editor::{ATTACHMENT_PLACEHOLDER, Editor},
@@ -656,19 +654,30 @@ struct LiveFrameCache {
     lines: Vec<PaintLine>,
 }
 
-/// Keep each extended grapheme together. Emoji variation selectors, flags and
-/// ZWJ sequences must reach the terminal as one glyph or the terminal buffer
-/// and this frame will advance by different cell counts.
+/// A terminal cell may be one visible character plus following zero-width
+/// selectors/combining marks. Keeping them together matters for text-style
+/// emoji such as `⚡︎`: terminals render it in one cell, and splitting the
+/// variation selector makes the frame's later cells drift from the screen.
 fn display_units(text: &str) -> Vec<&str> {
-    UnicodeSegmentation::graphemes(text, true).collect()
+    let mut units = Vec::new();
+    let mut start = None;
+    for (index, ch) in text.char_indices() {
+        if UnicodeWidthChar::width(ch).unwrap_or(0) > 0 {
+            if let Some(previous) = start.replace(index) {
+                units.push(&text[previous..index]);
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    if let Some(start) = start {
+        units.push(&text[start..]);
+    }
+    units
 }
 
 fn terminal_unit_width(unit: &str) -> usize {
     UnicodeWidthStr::width(unit)
-}
-
-fn terminal_text_width(text: &str) -> usize {
-    UnicodeWidthStr::width(text)
 }
 
 /// 터미널 기본 탭 정지 간격.
@@ -684,14 +693,14 @@ fn expand_tabs(text: &str) -> Cow<'_, str> {
     }
     let mut expanded = String::with_capacity(text.len());
     let mut column = 0;
-    for unit in display_units(text) {
-        if unit == "\t" {
+    for ch in text.chars() {
+        if ch == '\t' {
             let advance = TAB_STOP - column % TAB_STOP;
             expanded.extend(std::iter::repeat_n(' ', advance));
             column += advance;
         } else {
-            expanded.push_str(unit);
-            column += terminal_unit_width(unit);
+            expanded.push(ch);
+            column += UnicodeWidthChar::width(ch).unwrap_or(0);
         }
     }
     Cow::Owned(expanded)
@@ -777,66 +786,6 @@ const SIDE_PANEL_AUTOWRAP_GUARD: usize = 1;
 
 fn devez_layout_signal(main_width: u16) -> String {
     format!("\x1b]777;devez-layout-v1;{main_width}\x07")
-}
-
-fn devez_unicode_signal() -> String {
-    let (major, minor, patch) = unicode_width::UNICODE_VERSION;
-    format!("\x1b]777;devez-unicode-v2;{major}.{minor}.{patch}\x07")
-}
-
-fn devez_composer_signal(rows: Option<(usize, usize)>) -> String {
-    rows.map_or_else(
-        || "\x1b]777;devez-composer-v1;none\x07".to_owned(),
-        |(top, bottom)| format!("\x1b]777;devez-composer-v1;{top};{bottom}\x07"),
-    )
-}
-
-fn devez_emoji_candidate(glyph: &str) -> bool {
-    if glyph.contains('\u{fe0e}') {
-        return false;
-    }
-    glyph.chars().any(|ch| {
-        matches!(
-            ch as u32,
-            0x00A9 | 0x00AE | 0x203C | 0x2049 | 0x2122 | 0x2139 | 0x24C2
-                | 0x3030 | 0x303D | 0x3297 | 0x3299 | 0xFE0F | 0x20E3
-                | 0x2194..=0x2199 | 0x21A9..=0x21AA | 0x231A..=0x231B
-                | 0x2328..=0x2328 | 0x23CF..=0x23CF | 0x23E9..=0x23F3
-                | 0x23F8..=0x23FA | 0x25AA..=0x25AB | 0x25B6..=0x25B6
-                | 0x25C0..=0x25C0 | 0x25FB..=0x25FE | 0x2600..=0x27FF
-                | 0x2934..=0x2935 | 0x2B05..=0x2B07 | 0x2B1B..=0x2B1C
-                | 0x2B50..=0x2B50 | 0x2B55..=0x2B55 | 0x1F000..=0x1FAFF
-        )
-    })
-}
-
-/// DevezCode must not infer emoji positions from a broad screen region: the
-/// xterm buffer can expose a ZWJ sequence differently from the frame that dvz
-/// laid out. Send the final cell address, width and complete grapheme instead.
-fn devez_emoji_glyphs_signal(frame: &CellFrame) -> String {
-    let mut records = Vec::new();
-    for row in 0..frame.height {
-        let mut column = 0;
-        while column < frame.width {
-            let cell = frame.cell(column, row);
-            let mut width = 1;
-            while column + width < frame.width && frame.cell(column + width, row).continuation {
-                width += 1;
-            }
-            if !cell.continuation && devez_emoji_candidate(&cell.glyph) {
-                records.push(format!(
-                    "{row},{column},{width},{}",
-                    BASE64.encode(cell.glyph.as_bytes())
-                ));
-            }
-            column += width;
-        }
-    }
-    if records.is_empty() {
-        "\x1b]777;devez-glyphs-v1;none\x07".to_owned()
-    } else {
-        format!("\x1b]777;devez-glyphs-v1;{}\x07", records.join("|"))
-    }
 }
 
 /// Where the docked panel sits once the terminal is wide enough to carry it
@@ -1678,9 +1627,6 @@ impl Renderer {
             self.side_panel = side_panel;
         }
         let width = side_panel.map_or(total_width, |layout| layout.main_width as u16);
-        if self.last_width == 0 {
-            queue!(self.out, Print(devez_unicode_signal()))?;
-        }
         if width != self.last_width {
             queue!(self.out, Print(devez_layout_signal(width)))?;
         }
@@ -1727,12 +1673,6 @@ impl Renderer {
                 view.plan_shimmer_phase,
             );
         }
-
-        queue!(
-            self.out,
-            Print(devez_composer_signal(None)),
-            Print("\x1b]777;devez-glyphs-v1;none\x07")
-        )?;
 
         let max_live = height.max(3) as usize;
         let natural_rows = frame.lines.len().min(max_live);
@@ -2086,15 +2026,6 @@ impl Renderer {
             .map(|index| plan_rows + view_rows + index);
         // The prompt rows follow the composer's top rule, and the live frame is
         // painted below the transcript window, so this is where they land.
-        let composer_rows = frame
-            .composer_index
-            .zip(frame.composer_layout.as_ref())
-            .map(|(index, layout)| {
-                let top = plan_rows + view_rows + index;
-                let bottom = (top + layout.rows.len() + 1).min(rows.saturating_sub(1));
-                (top, bottom)
-            });
-        queue!(self.out, Print(devez_composer_signal(composer_rows)))?;
         let composer_selection =
             frame
                 .composer_index
@@ -2304,7 +2235,6 @@ impl Renderer {
                 panel_selection,
             );
         }
-        queue!(self.out, Print(devez_emoji_glyphs_signal(&frame)))?;
         emit_synchronized_frame_diff_with_full_rows(
             &mut self.out,
             self.painted_frame.as_ref(),
@@ -3873,10 +3803,10 @@ fn word_range_at(line: &CopyLine, column: usize) -> Option<Range<usize>> {
         .unwrap_or(0..UnicodeWidthStr::width(line.text.as_str()));
     let mut cells = Vec::new();
     let mut start = 0;
-    for unit in line.text.graphemes(true) {
-        let width = UnicodeWidthStr::width(unit);
+    for ch in line.text.chars() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
         if width > 0 && start >= content.start && start + width <= content.end {
-            cells.push((unit.chars().next().unwrap_or(' '), start, start + width));
+            cells.push((ch, start, start + width));
         }
         start += width;
     }
@@ -5271,12 +5201,11 @@ fn trim_spans(spans: &mut Vec<PaintSpan>, max_width: usize) -> bool {
         let Some(last) = spans.last_mut() else {
             break;
         };
-        let Some((index, unit)) = last.text.grapheme_indices(true).next_back() else {
+        let Some(ch) = last.text.pop() else {
             spans.pop();
             continue;
         };
-        overflow = overflow.saturating_sub(UnicodeWidthStr::width(unit));
-        last.text.truncate(index);
+        overflow = overflow.saturating_sub(UnicodeWidthChar::width(ch).unwrap_or(0));
         if last.text.is_empty() {
             spans.pop();
         }
@@ -6171,7 +6100,7 @@ fn fixed_plan_summary_lines(
     lines.insert(1, PaintLine::blank());
     if all_completed {
         let elapsed = summary.steps.iter().filter_map(|step| step.elapsed).sum();
-        let total = format!("⏱︎  {}", format_plan_elapsed(elapsed));
+        let total = format!("⏱  {}", format_plan_elapsed(elapsed));
         lines.push(PaintLine::plain(format!(
             "{}{}  ",
             " ".repeat(line_width.saturating_sub(UnicodeWidthStr::width(total.as_str()) + 2)),
@@ -7168,7 +7097,7 @@ fn attach_markdown_link_picks(lines: &mut [PaintLine], links: &[(String, String)
     };
     let mut label = first_label.as_str();
     let mut target = first_target.as_str();
-    let mut remaining = label.graphemes(true).count();
+    let mut remaining = label.chars().count();
 
     for line in lines {
         let mut column = UnicodeWidthStr::width(line.prefix.as_str());
@@ -7176,8 +7105,8 @@ fn attach_markdown_link_picks(lines: &mut [PaintLine], links: &[(String, String)
         for span in std::iter::once((&line.text, line.tone))
             .chain(line.tail.iter().map(|span| (&span.text, span.tone)))
         {
-            for unit in span.0.graphemes(true) {
-                let width = UnicodeWidthStr::width(unit);
+            for ch in span.0.chars() {
+                let width = UnicodeWidthChar::width(ch).unwrap_or(0);
                 if span.1 == Tone::MarkdownLink && remaining > 0 {
                     regions.push((column, column + width, Pick::OpenLink(target.to_owned())));
                     remaining -= 1;
@@ -7188,7 +7117,7 @@ fn attach_markdown_link_picks(lines: &mut [PaintLine], links: &[(String, String)
                         };
                         label = next_label.as_str();
                         target = next_target.as_str();
-                        remaining = label.graphemes(true).count();
+                        remaining = label.chars().count();
                     }
                 }
                 column += width;
@@ -7232,23 +7161,23 @@ fn styled_lines(
     let mut tokens: Vec<(bool, Vec<PaintSpan>, usize)> = Vec::new();
 
     for span in spans {
-        for unit in span.text.graphemes(true) {
-            let whitespace = unit.chars().all(char::is_whitespace);
-            let unit_width = UnicodeWidthStr::width(unit);
+        for ch in span.text.chars() {
+            let whitespace = ch.is_whitespace();
+            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
             if let Some((last_whitespace, parts, token_width)) = tokens.last_mut()
                 && *last_whitespace == whitespace
             {
-                push_highlight_span(parts, unit, span.tone, span.bold);
-                *token_width += unit_width;
+                push_highlight_span(parts, &ch.to_string(), span.tone, span.bold);
+                *token_width += char_width;
             } else {
                 tokens.push((
                     whitespace,
                     vec![PaintSpan {
-                        text: unit.to_owned(),
+                        text: ch.to_string(),
                         tone: span.tone,
                         bold: span.bold,
                     }],
-                    unit_width,
+                    char_width,
                 ));
             }
         }
@@ -7283,19 +7212,19 @@ fn styled_lines(
         pending_space_width = 0;
 
         for span in parts {
-            for unit in span.text.graphemes(true) {
-                let unit_width = UnicodeWidthStr::width(unit);
-                if used + unit_width > available && used > 0 {
+            for ch in span.text.chars() {
+                let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if used + char_width > available && used > 0 {
                     rows.push(Vec::new());
                     used = 0;
                 }
                 push_highlight_span(
                     rows.last_mut().expect("at least one styled row"),
-                    unit,
+                    &ch.to_string(),
                     span.tone,
                     span.bold,
                 );
-                used += unit_width;
+                used += char_width;
             }
         }
     }
@@ -7861,22 +7790,6 @@ fn composer_source_spans(editor: &Editor) -> (String, usize, Vec<Range<usize>>) 
     (source, cursor, spans)
 }
 
-fn composer_grapheme_span(
-    display_spans: &[Range<usize>],
-    char_start: usize,
-    char_end: usize,
-) -> Range<usize> {
-    let Some(spans) = display_spans.get(char_start..char_end) else {
-        return char_start..char_end;
-    };
-    let Some(first) = spans.first() else {
-        return char_start..char_start;
-    };
-    spans.iter().skip(1).fold(first.clone(), |merged, span| {
-        merged.start.min(span.start)..merged.end.max(span.end)
-    })
-}
-
 /// Blocks whose lines carry `devez-copy-v1` metadata. Excludes the ones drawn as
 /// cards, whose box art is content the reader asked to see.
 fn copy_metadata_applies(kind: BlockKind) -> bool {
@@ -7906,36 +7819,25 @@ fn inline_answer_rows(
         .saturating_sub(prefix_width + 1)
         .max(4);
     let cursor_index = editor.cursor();
-    let text_char_count = text.chars().count();
     let mut rows = vec![String::new()];
     let mut cursor_row = 0;
     let mut cursor_column = prefix_width;
     let mut column = prefix_width;
-    let mut char_start = 0;
-    let mut cursor_resolved = false;
-    for unit in text.graphemes(true) {
-        let char_end = char_start + unit.chars().count();
-        let width = UnicodeWidthStr::width(unit);
+    for (index, ch) in text.chars().enumerate() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
         if column + width > prefix_width + content_width && !rows[cursor_last(&rows)].is_empty() {
             rows.push(String::new());
             column = prefix_width;
         }
-        if !cursor_resolved && cursor_index <= char_start {
+        if index == cursor_index {
             cursor_row = rows.len() - 1;
             cursor_column = column;
-            cursor_resolved = true;
         }
         let row = cursor_last(&rows);
-        rows[row].push_str(unit);
+        rows[row].push(ch);
         column += width;
-        if !cursor_resolved && cursor_index < char_end {
-            cursor_row = row;
-            cursor_column = column;
-            cursor_resolved = true;
-        }
-        char_start = char_end;
     }
-    if !cursor_resolved || cursor_index >= text_char_count {
+    if cursor_index >= text.chars().count() {
         cursor_row = rows.len() - 1;
         cursor_column = column;
     }
@@ -7985,7 +7887,7 @@ fn input_lines_with_controls(
     const COMPOSER_IME_RIGHT_GUTTER: usize = 4;
     let (display, editor_cursor, display_spans) =
         composer_display_with_spans(editor, composer_images);
-    let display_char_count = display.chars().count();
+    let display_chars = display.chars().collect::<Vec<_>>();
     let panel_width = (width as usize).saturating_sub(1).max(16);
     let side_prefix = "│ ";
     let first_prefix = "> ";
@@ -8007,73 +7909,59 @@ fn input_lines_with_controls(
     let mut column = input_prefix_width;
     let mut cursor_row = 0;
     let mut cursor_column = column;
-    let mut char_start = 0;
-    let mut cursor_resolved = false;
 
-    for unit in display.graphemes(true) {
-        let char_end = char_start + unit.chars().count();
-        let span = composer_grapheme_span(&display_spans, char_start, char_end);
+    for (index, ch) in display_chars.iter().copied().enumerate() {
+        if index == editor_cursor {
+            cursor_row = row;
+            cursor_column = column;
+        }
+        let span = display_spans
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| index..index + 1);
 
-        if unit == "\n" {
-            if !cursor_resolved && editor_cursor <= char_start {
-                cursor_row = row;
-                cursor_column = column;
-                cursor_resolved = true;
-            }
+        if ch == '\n' {
             row_ranges[row].end = span.start;
             raw_rows.push(String::new());
             row_glyphs.push(Vec::new());
             row_ranges.push(span.end..span.end);
             row += 1;
             column = input_prefix_width;
-            if !cursor_resolved && editor_cursor <= char_end {
-                cursor_row = row;
-                cursor_column = column;
-                cursor_resolved = true;
-            }
-            char_start = char_end;
             continue;
         }
 
-        let unit_width = UnicodeWidthStr::width(unit);
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
         let content_column = column.saturating_sub(input_prefix_width);
-        if content_column + unit_width > content_width && !raw_rows[row].is_empty() {
+        if content_column + ch_width > content_width && !raw_rows[row].is_empty() {
             row_ranges[row].end = span.start;
             raw_rows.push(String::new());
             row_glyphs.push(Vec::new());
             row_ranges.push(span.start..span.start);
             row += 1;
             column = input_prefix_width;
+            if index == editor_cursor {
+                cursor_row = row;
+                cursor_column = column;
+            }
         }
-        if !cursor_resolved && editor_cursor <= char_start {
-            cursor_row = row;
-            cursor_column = column;
-            cursor_resolved = true;
-        }
-        raw_rows[row].push_str(unit);
+        raw_rows[row].push(ch);
         row_ranges[row].end = span.end;
-        // A zero-width grapheme rides along with the glyph it attaches to, so it
-        // is deleted with it rather than being left behind on its own.
+        // A combining mark rides along with the glyph it attaches to, so it is
+        // deleted with it rather than being left behind on its own.
         match row_glyphs[row].last_mut() {
-            Some(last) if unit_width == 0 && span.start < span.end => {
+            Some(last) if ch_width == 0 && span.start < span.end => {
                 last.span.start = last.span.start.min(span.start);
                 last.span.end = last.span.end.max(span.end);
             }
             _ => row_glyphs[row].push(ComposerGlyph {
-                width: unit_width,
+                width: ch_width,
                 span,
             }),
         }
-        column += unit_width;
-        if !cursor_resolved && editor_cursor < char_end {
-            cursor_row = row;
-            cursor_column = column;
-            cursor_resolved = true;
-        }
-        char_start = char_end;
+        column += ch_width;
     }
 
-    if !cursor_resolved || editor_cursor >= display_char_count {
+    if editor_cursor == display_chars.len() {
         cursor_row = row;
         cursor_column = column;
     }
@@ -8112,7 +8000,7 @@ fn input_lines_with_controls(
         } else {
             continuation_prefix
         };
-        let content_width = terminal_text_width(content.as_str());
+        let content_width = UnicodeWidthStr::width(content.as_str());
         let content_tone = if is_placeholder {
             Tone::Muted
         } else {
@@ -8601,13 +8489,13 @@ fn compact_text(text: &str, max_width: usize) -> String {
     }
     let mut output = String::new();
     let mut width = 0;
-    for unit in text.graphemes(true).rev() {
-        let unit_width = UnicodeWidthStr::width(unit);
-        if width + unit_width >= max_width {
+    for ch in text.chars().rev() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width >= max_width {
             break;
         }
-        output.insert_str(0, unit);
-        width += unit_width;
+        output.insert(0, ch);
+        width += ch_width;
     }
     format!("…{output}")
 }
@@ -8621,13 +8509,13 @@ fn compact_right(text: &str, max_width: usize) -> String {
     }
     let mut output = String::new();
     let mut width = 0;
-    for unit in text.graphemes(true) {
-        let unit_width = UnicodeWidthStr::width(unit);
-        if width + unit_width >= max_width {
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width >= max_width {
             break;
         }
-        output.push_str(unit);
-        width += unit_width;
+        output.push(ch);
+        width += ch_width;
     }
     output.push('…');
     output
@@ -10079,60 +9967,6 @@ mod tests {
     }
 
     #[test]
-    fn composer_keeps_pasted_emoji_as_complete_graphemes() {
-        let mut editor = Editor::default();
-        editor.set_text("⚙️👩‍💻🇰🇷🫠");
-
-        let (rows, cursor_row, cursor_column, layout) =
-            input_lines(&editor, &[], 40, "", "placeholder", None, None);
-
-        assert_eq!((cursor_row, cursor_column), (1, 12));
-        assert!(painted(&rows[1]).contains("⚙️👩‍💻🇰🇷🫠"));
-        assert_eq!(
-            layout.rows[0].glyphs,
-            vec![
-                ComposerGlyph {
-                    width: 2,
-                    span: 0..2,
-                },
-                ComposerGlyph {
-                    width: 2,
-                    span: 2..5,
-                },
-                ComposerGlyph {
-                    width: 2,
-                    span: 5..7,
-                },
-                ComposerGlyph {
-                    width: 2,
-                    span: 7..8,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn composer_wraps_only_between_complete_emoji() {
-        let mut editor = Editor::default();
-        editor.set_text("⚙️👩‍💻🇰🇷🫠⏱️");
-
-        let (rows, cursor_row, cursor_column, layout) =
-            input_lines(&editor, &[], 16, "", "placeholder", None, None);
-
-        assert_eq!((cursor_row, cursor_column), (2, 8));
-        assert!(painted(&rows[1]).contains("⚙️👩‍💻🇰🇷"));
-        assert!(painted(&rows[2]).contains("🫠⏱️"));
-        assert_eq!(
-            layout
-                .rows
-                .iter()
-                .map(|row| row.glyphs.len())
-                .collect::<Vec<_>>(),
-            vec![3, 2]
-        );
-    }
-
-    #[test]
     fn collapsed_paste_cursor_wraps_before_the_right_edge() {
         let mut editor = Editor::default();
         editor.insert_paste_str("1\n2\n3\n4\n5\n6");
@@ -11134,44 +10968,6 @@ mod tests {
         // 탭이 차지하던 칸은 빈 칸으로 남아 배경이 그대로 칠해지고, 뒤따르는
         // 글자는 폭 계산과 같은 열에 그려진다.
         assert_eq!(glyphs, vec!["a".to_owned(), String::new(), "b".to_owned()]);
-    }
-
-    #[test]
-    fn pasted_icons_use_the_same_cells_as_the_devezcode_terminal() {
-        assert_eq!(display_units("⚙️👩‍💻🇰🇷"), vec!["⚙️", "👩‍💻", "🇰🇷"]);
-        assert_eq!(terminal_text_width("⚙️👩‍💻🇰🇷🫠"), 8);
-
-        let mut frame = CellFrame::new(12, 1);
-        frame.write(0, 0, "A⚙️B👩‍💻C", CellStyle::plain());
-
-        assert_eq!(frame.cell(0, 0).glyph, "A");
-        assert_eq!(frame.cell(1, 0).glyph, "⚙️");
-        assert!(frame.cell(2, 0).continuation);
-        assert_eq!(frame.cell(3, 0).glyph, "B");
-        assert_eq!(frame.cell(4, 0).glyph, "👩‍💻");
-        assert!(frame.cell(5, 0).continuation);
-        assert_eq!(frame.cell(6, 0).glyph, "C");
-    }
-
-    #[test]
-    fn styled_rows_do_not_wrap_inside_an_emoji() {
-        let lines = styled_lines(
-            "",
-            Tone::Plain,
-            vec![PaintSpan {
-                text: "ABC👩‍💻D".to_owned(),
-                tone: Tone::Plain,
-                bold: false,
-            }],
-            Tone::Plain,
-            false,
-            6,
-        );
-
-        assert_eq!(
-            lines.iter().map(painted).collect::<Vec<_>>(),
-            vec!["ABC👩‍💻", "D"]
-        );
     }
 
     #[test]
@@ -15871,42 +15667,6 @@ mod tests {
     }
 
     #[test]
-    fn devezcode_unicode_width_signal_is_explicit_and_private() {
-        assert_eq!(
-            devez_unicode_signal(),
-            "\x1b]777;devez-unicode-v2;17.0.0\x07"
-        );
-    }
-
-    #[test]
-    fn devezcode_composer_signal_reports_exact_rows_or_clears_them() {
-        assert_eq!(
-            devez_composer_signal(Some((38, 40))),
-            "\x1b]777;devez-composer-v1;38;40\x07"
-        );
-        assert_eq!(
-            devez_composer_signal(None),
-            "\x1b]777;devez-composer-v1;none\x07"
-        );
-    }
-
-    #[test]
-    fn devezcode_emoji_signal_uses_final_cell_positions_and_complete_graphemes() {
-        let mut frame = CellFrame::new(20, 2);
-        frame.write(1, 0, "A⚙️B👩‍💻", CellStyle::plain());
-        frame.write(0, 1, "⏱︎", CellStyle::plain());
-
-        assert_eq!(
-            devez_emoji_glyphs_signal(&frame),
-            format!(
-                "\x1b]777;devez-glyphs-v1;0,2,2,{}|0,5,2,{}\x07",
-                BASE64.encode("⚙️".as_bytes()),
-                BASE64.encode("👩‍💻".as_bytes())
-            )
-        );
-    }
-
-    #[test]
     fn terra_uses_the_reference_green_model_colour() {
         assert_eq!(
             tone_rgb(Tone::ModelTerra),
@@ -16189,7 +15949,7 @@ mod tests {
         let bottom_border = painted(&lines[4]);
 
         assert!(painted(&lines[2]).contains("Done (1m 34s)"));
-        assert!(elapsed_line.contains("⏱︎  1m 34s"));
+        assert!(elapsed_line.contains("⏱  1m 34s"));
         assert_eq!(
             UnicodeWidthStr::width(elapsed_line.as_str()),
             UnicodeWidthStr::width(bottom_border.as_str())
