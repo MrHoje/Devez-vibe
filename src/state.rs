@@ -3717,6 +3717,27 @@ impl AppState {
             "✓ Provider changed",
             detail,
         ));
+        self.refresh_usage_for_selected_provider();
+    }
+
+    /// Repaints the 5h/week rows from the runtime that just took over. Without
+    /// this the status row keeps the previous provider's numbers until the next
+    /// three-second metadata tick, which reads them for the new provider anyway.
+    fn refresh_usage_for_selected_provider(&mut self) {
+        let (five_hour_percent, weekly_percent, five_hour_reset_at) =
+            if self.selected_provider() == ModelProvider::Claude {
+                (
+                    self.account_plan.five_hour_percent,
+                    self.account_plan.weekly_percent,
+                    self.account_plan.five_hour_reset_at,
+                )
+            } else {
+                read_codex_usage()
+            };
+        self.five_hour_percent = five_hour_percent;
+        self.weekly_percent = weekly_percent;
+        self.five_hour_reset_at = five_hour_reset_at;
+        self.five_hour_remaining = remaining_label(five_hour_reset_at, unix_now());
     }
 
     pub fn switch_to_codex(&mut self) {

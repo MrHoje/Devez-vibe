@@ -1462,6 +1462,11 @@ async fn execute_action(
         Action::Submit(text) => {
             renderer.scroll_to_bottom();
             let handoff = provider_handoff_snapshot(state, renderer);
+            // The prompt and its waiting state reach the screen before the request
+            // is awaited. A turn that has to build a runtime session first — the
+            // first prompt after a provider switch — would otherwise hold the frame
+            // for the whole round trip and read as a stall in the composer.
+            draw(state, renderer)?;
             start_turn(server, state, text, Some(handoff)).await
         }
         Action::Steer(text) => {
