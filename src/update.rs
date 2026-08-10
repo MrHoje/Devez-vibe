@@ -19,9 +19,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "provider를 섞어 쓴 세션을 다시 열 때 한쪽 provider의 대화가 사라지던 문제를 고쳤습니다.",
-    "대화 기록을 시간 순서대로 합쳐 보여주도록 바꿨습니다.",
-    "선택지를 고른 뒤 남는 답변에서 `(권장)` 표시를 빼도록 바꿨습니다.",
+    "Claude의 생각 과정도 답변 본문처럼 한 프레임씩 나눠 부드럽게 표시하도록 바꿨습니다.",
+    "글자가 한꺼번에 도착해도 표시 속도가 서서히 오르도록 바꿔 출력이 덜컥거리지 않습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

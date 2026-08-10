@@ -1011,6 +1011,14 @@ function emitOpeningNotice(session) {
 const SMOOTH_TEXT_INTERVAL_MS = 10;
 const SMOOTH_TEXT_TARGET_FRAMES = 10;
 const SMOOTH_TEXT_MAX_GRAPHEMES = 24;
+const SMOOTH_TEXT_MIN_RATE = 1;
+// Ease the per-frame rate toward the backlog's demand instead of adopting it at
+// once: a phrase-sized event would otherwise jump straight to a wide chunk and
+// read as a lurch, and the next tiny event would snap back to one grapheme.
+const SMOOTH_TEXT_RATE_EASING = 0.25;
+// Cap how far the eased rate may move in one frame so a sudden 400-grapheme
+// backlog ramps up over frames instead of widening the very first chunk.
+const SMOOTH_TEXT_RATE_STEP = 1;
 const graphemeSegmenter = typeof Intl.Segmenter === "function"
   ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
   : null;
@@ -1021,14 +1029,11 @@ function splitGraphemes(text) {
     : Array.from(text);
 }
 
-// Claude can deliver a whole phrase in one SDK event. Drain roughly one visual
-// frame's share at a time, catching up quickly when a large backlog arrives.
-function takeSmoothTextChunk(text) {
+// Claude can deliver a whole phrase in one SDK event. Drain a steady share per
+// visual frame, where the rate eases toward the backlog instead of tracking it
+// event by event.
+function takeSmoothTextChunk(text, size) {
   const graphemes = splitGraphemes(text);
-  const size = Math.min(
-    SMOOTH_TEXT_MAX_GRAPHEMES,
-    Math.max(1, Math.ceil(graphemes.length / SMOOTH_TEXT_TARGET_FRAMES)),
-  );
   return {
     chunk: graphemes.slice(0, size).join(""),
     rest: graphemes.slice(size).join(""),
@@ -1042,6 +1047,24 @@ class SmoothTextStream {
     this.pending = "";
     this.timer = null;
     this.waiters = [];
+    this.rate = SMOOTH_TEXT_MIN_RATE;
+    // Fractional rates only stay smooth if the leftover carries to the next
+    // frame; truncating every frame would quantize the pace back to integers.
+    this.carry = 0;
+  }
+
+  nextChunkSize(pendingLength) {
+    const demand = pendingLength / SMOOTH_TEXT_TARGET_FRAMES;
+    const target = Math.min(
+      SMOOTH_TEXT_MAX_GRAPHEMES,
+      Math.max(SMOOTH_TEXT_MIN_RATE, demand),
+    );
+    const eased = (target - this.rate) * SMOOTH_TEXT_RATE_EASING;
+    this.rate += Math.max(-SMOOTH_TEXT_RATE_STEP, Math.min(SMOOTH_TEXT_RATE_STEP, eased));
+    const budget = this.rate + this.carry;
+    const size = Math.max(SMOOTH_TEXT_MIN_RATE, Math.floor(budget));
+    this.carry = Math.max(0, budget - size);
+    return size;
   }
 
   push(text) {
@@ -1066,7 +1089,8 @@ class SmoothTextStream {
       for (const resolve of this.waiters.splice(0)) resolve();
       return;
     }
-    const { chunk, rest } = takeSmoothTextChunk(this.pending);
+    const size = this.nextChunkSize(splitGraphemes(this.pending).length);
+    const { chunk, rest } = takeSmoothTextChunk(this.pending, size);
     this.pending = rest;
     this.emit(chunk);
     if (this.pending) {
@@ -1160,9 +1184,12 @@ async function processStreamEvent(session, message) {
     const item = block.type === "text"
       ? { id, type: "agentMessage", text: "", provider: "Claude" }
       : { id, type: "reasoning", summary: [] };
-    const smooth = block.type === "text"
-      ? new SmoothTextStream((delta) => emitDelta(session, "item/agentMessage/delta", id, delta))
-      : null;
+    // Thinking arrives in the same phrase-sized events as text, so it needs the
+    // same paced drain — raw thinking deltas were the last visible stutter.
+    const method = block.type === "text"
+      ? "item/agentMessage/delta"
+      : "item/reasoning/summaryTextDelta";
+    const smooth = new SmoothTextStream((delta) => emitDelta(session, method, id, delta));
     // A held English line can end up dropped entirely, and an item announced
     // before that decision would stay on screen as an empty bubble. Hold the
     // start too, and emit it with the first text that survives.
@@ -1188,10 +1215,6 @@ async function processStreamEvent(session, message) {
     // Held text may still be dropped, and counting it as visible would suppress
     // the opening notice in its place — leaving the turn with nothing to show.
     if (current.type === "text" && current.languagePending == null) session.turn.sawVisibleText = true;
-    if (!current.smooth) {
-      emitDelta(session, "item/reasoning/summaryTextDelta", current.id, delta);
-      return;
-    }
     if (current.languagePending != null) {
       current.languagePending += delta;
       const probe = current.languagePending.trimStart();
@@ -3029,6 +3052,14 @@ async function runSelfTest() {
   await smooth.finish();
   if (emitted.length < 2 || emitted.join("") !== smoothText) {
     throw new Error(`Claude smooth stream self-test failed: ${JSON.stringify(emitted)}`);
+  }
+  const ramped = [];
+  const rampStream = new SmoothTextStream((chunk) => ramped.push(chunk), 0);
+  rampStream.push("가".repeat(400));
+  await rampStream.finish();
+  const rampSizes = ramped.map((chunk) => splitGraphemes(chunk).length);
+  if (rampSizes[0] > 2 || rampSizes.some((size, index) => index > 0 && size > rampSizes[index - 1] + 2)) {
+    throw new Error(`Claude smooth stream rate jumped: ${JSON.stringify(rampSizes.slice(0, 8))}`);
   }
   const flushed = [];
   const interrupted = new SmoothTextStream((chunk) => flushed.push(chunk), 1000);
