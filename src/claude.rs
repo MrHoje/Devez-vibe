@@ -620,6 +620,15 @@ mod tests {
     }
 
     #[test]
+    fn bridge_reports_context_usage_as_soon_as_compaction_ends() {
+        let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
+
+        assert!(bridge.contains("noteCompactBoundary(session, message.compact_metadata)"));
+        assert!(bridge.contains("const post = Number(metadata?.post_tokens);"));
+        assert!(bridge.contains("function noteCompactBoundary(session, metadata)"));
+    }
+
+    #[test]
     fn bridge_filters_local_commands_and_restores_each_turn_model() {
         let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
 

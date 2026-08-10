@@ -1847,6 +1847,30 @@ async function processResult(session, message) {
   await runPendingPrompt(session);
 }
 
+// Compaction ends the turn's only assistant message, so the context figure would
+// stay at its pre-compact value until the next turn answers. `post_tokens` is the
+// window right after the summary replaced the history: publish it at once.
+function noteCompactBoundary(session, metadata) {
+  const post = Number(metadata?.post_tokens);
+  if (!Number.isFinite(post) || post <= 0) return;
+  session.lastContextUsage = {
+    inputTokens: post,
+    cachedInputTokens: 0,
+    cacheWriteInputTokens: 0,
+    outputTokens: 0,
+    totalTokens: post,
+  };
+  notify("thread/tokenUsage/updated", {
+    threadId: session.id,
+    // No `total`: the running tally belongs to billing and compaction spends
+    // nothing on it.
+    tokenUsage: {
+      last: session.lastContextUsage,
+      modelContextWindow: session.lastContextWindow || undefined,
+    },
+  });
+}
+
 function rememberPermissionDenial(session, denial) {
   const toolUseId = String(denial.toolUseId || "");
   const existing = toolUseId
@@ -1910,6 +1934,7 @@ async function consume(session) {
     else if (message.type === "user") processUser(session, message);
     else if (message.type === "result") await processResult(session, message);
     else if (message.type === "system" && message.subtype === "compact_boundary") {
+      noteCompactBoundary(session, message.compact_metadata);
       notify("thread/compacted", { threadId: session.id });
     } else if (message.type === "system" && message.subtype === "permission_denied") {
       rememberPermissionDenial(session, {
