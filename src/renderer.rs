@@ -244,6 +244,7 @@ pub struct OverlayView<'a> {
 pub struct EffortSlider {
     pub efforts: Vec<String>,
     pub selected: usize,
+    pub detail: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -393,6 +394,34 @@ pub struct SubagentView {
     pub elapsed: Duration,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IntegrationItemState {
+    Active,
+    Inactive,
+    Pending,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntegrationItemView {
+    pub name: String,
+    pub state: IntegrationItemState,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderIntegrationView {
+    pub provider: String,
+    pub enabled: bool,
+    pub active: bool,
+    pub mcp_expanded: bool,
+    pub plugins_expanded: bool,
+    pub mcp: Option<Vec<IntegrationItemView>>,
+    pub plugins: Option<Vec<IntegrationItemView>>,
+    pub mcp_error: Option<String>,
+    pub plugin_error: Option<String>,
+}
+
 pub struct View<'a> {
     pub live_blocks: Vec<LiveBlockView<'a>>,
     pub overlay: Option<OverlayView<'a>>,
@@ -416,6 +445,8 @@ pub struct View<'a> {
     pub activity_model: Option<String>,
     /// Where the `Working` shimmer is in its sweep, `0.0..1.0`.
     pub activity_phase: f32,
+    /// The turn is active, but its first assistant text has not appeared yet.
+    pub waiting_for_response: bool,
     /// Where the compaction progress block is in its slower trip, `0.0..1.0`.
     pub activity_progress_phase: f32,
     pub footer: String,
@@ -427,12 +458,15 @@ pub struct View<'a> {
     pub diff_display_mode: DiffDisplayMode,
     /// The docked right-hand side panel's width, or `None` while it is closed.
     pub side_panel_width: Option<usize>,
+    pub side_panel_prompts_expanded: bool,
+    pub side_panel_integrations: Vec<ProviderIntegrationView>,
 }
 
 pub struct AnimationView<'a> {
     pub activity: Option<String>,
     pub activity_model: Option<String>,
     pub activity_phase: f32,
+    pub waiting_for_response: bool,
     pub activity_progress_phase: f32,
     pub plan_summary: Option<&'a PlanSummary>,
     pub plan_active: bool,
@@ -516,6 +550,9 @@ pub struct Renderer {
     /// The terminal's own width, which is what a painted frame spans.
     last_total_width: u16,
     last_height: u16,
+    /// Transcript rows available in the last fullscreen frame. Prompt jumps use
+    /// this to place their block at the top whenever enough history follows it.
+    last_transcript_rows: usize,
     theme: ThemeKind,
     history: Vec<Block>,
     /// Rows the transcript is held back from its newest end. Zero follows the
@@ -541,20 +578,27 @@ pub struct Renderer {
     /// Where the composer's prompt text was last painted, so a drag over it can
     /// be turned back into the characters it covered.
     composer_selection: Option<ComposerSelection>,
+    /// The last painted prompt rows, retained in both render modes so vertical
+    /// arrows can traverse visual wraps before falling back to prompt history.
+    composer_navigation_layout: Option<ComposerLayout>,
     painted_selection: Option<CellRange>,
     painted_frame: Option<CellFrame>,
     /// The docked panel's geometry for the frame now on screen, so animation
     /// repaints can restore the panel cells they would otherwise blank.
     side_panel: Option<SidePanelLayout>,
-    /// What the docked panel shows inside its own border on the frame now on
+    /// What the docked panel shows on its own surface in the frame now on
     /// screen: today the plan summary, moved out of the transcript.
     side_panel_content: Vec<PaintLine>,
+    /// Context and usage readings moved out of the composer status row while
+    /// the panel is visible.
+    side_panel_footer: Vec<PaintLine>,
     /// Which surface the live drag belongs to. The transcript and the panel are
     /// two separate columns of text, so a drag stays inside the one it started
     /// on instead of running across the border between them.
     selection_in_panel: bool,
     live_frame_cache: Option<LiveFrameCache>,
     animation_activity_row: Option<usize>,
+    animation_response_bullet_row: Option<usize>,
     animation_plan_rows: usize,
     #[cfg(test)]
     live_cache_rebuilds: usize,
@@ -587,6 +631,42 @@ struct ComposerRowLayout {
 struct ComposerGlyph {
     width: usize,
     span: Range<usize>,
+}
+
+fn composer_cursor_column(row: &ComposerRowLayout, cursor: usize) -> usize {
+    let mut column = row.start_column;
+    for glyph in &row.glyphs {
+        if cursor <= glyph.span.start {
+            return column;
+        }
+        column += glyph.width;
+        if cursor < glyph.span.end {
+            return column;
+        }
+    }
+    column
+}
+
+fn composer_cursor_at_column(row: &ComposerRowLayout, target: usize) -> usize {
+    if target <= row.start_column {
+        return row.start;
+    }
+    let mut column = row.start_column;
+    for glyph in &row.glyphs {
+        let end = column + glyph.width;
+        if target < end {
+            if glyph.span.start == glyph.span.end {
+                return glyph.span.start;
+            }
+            return if (target - column) * 2 < glyph.width {
+                glyph.span.start
+            } else {
+                glyph.span.end
+            };
+        }
+        column = end;
+    }
+    row.end
 }
 
 struct ComposerSelection {
@@ -778,11 +858,15 @@ impl CellFrame {
 
 /// The three widths Alt+P cycles the panel through before it closes again.
 pub(crate) const SIDE_PANEL_WIDTHS: [usize; 3] = [48, 60, 72];
+/// Keeps the completed MCP/Plugin panel implementation available without
+/// connecting it to session startup or the visible side panel.
+pub(crate) const SIDE_PANEL_INTEGRATIONS_CONNECTED: bool = false;
 const SIDE_PANEL_GAP: usize = 1;
 const SIDE_PANEL_MIN_MAIN_WIDTH: usize = 44;
-/// Writing into a terminal's final cell can trigger an implicit wrap and move
-/// the cursor before the next absolute paint command arrives.
-const SIDE_PANEL_AUTOWRAP_GUARD: usize = 1;
+/// Keeps section rules present without competing with the content above them.
+const SIDE_PANEL_DIVIDER_BLEND: u8 = 48;
+/// A quiet neutral lift that remains visible on the panel's secondary surface.
+const SIDE_PANEL_HOVER_BLEND: u8 = 24;
 
 fn devez_layout_signal(main_width: u16) -> String {
     format!("\x1b]777;devez-layout-v1;{main_width}\x07")
@@ -816,7 +900,7 @@ impl SidePanelLayout {
 /// ask for.
 fn side_panel_layout(total_width: u16, panel_width: usize) -> Option<SidePanelLayout> {
     let total = usize::from(total_width);
-    let reserved = SIDE_PANEL_GAP + panel_width + SIDE_PANEL_AUTOWRAP_GUARD;
+    let reserved = SIDE_PANEL_GAP + panel_width;
     (total >= SIDE_PANEL_MIN_MAIN_WIDTH + reserved).then(|| {
         let main_width = total - reserved;
         SidePanelLayout {
@@ -827,10 +911,16 @@ fn side_panel_layout(total_width: u16, panel_width: usize) -> Option<SidePanelLa
     })
 }
 
-/// The panel's interior is blank wherever its content does not reach, so the
-/// frame reads as one surface rather than a ragged column of writes.
-fn side_panel_row(content_width: usize) -> String {
-    " ".repeat(content_width)
+fn side_panel_background_style() -> CellStyle {
+    CellStyle {
+        background: Some(theme::palette().hover_bg),
+        ..CellStyle::plain()
+    }
+}
+
+fn side_panel_hover_background() -> Rgb {
+    let palette = theme::palette();
+    blend(palette.hover_bg, palette.foreground, SIDE_PANEL_HOVER_BLEND)
 }
 
 /// Paints one already-laid-out row of panel content at the panel's own left
@@ -842,6 +932,7 @@ fn paint_panel_content_row(
     frame_row: usize,
     line: &PaintLine,
     selected_columns: Option<Range<usize>>,
+    hovered_columns: Option<Range<usize>>,
 ) {
     let content_width = layout.content_width();
     if content_width == 0 {
@@ -854,43 +945,28 @@ fn paint_panel_content_row(
         &mut scratch,
         0,
         line,
-        selected_columns,
+        selected_columns.clone(),
         None,
         Some(content_width + 1),
     );
     for column in 0..content_width {
-        let cell = scratch.cell(column, 0).clone();
+        let mut cell = scratch.cell(column, 0).clone();
+        let selected = range_overlaps(selected_columns.as_ref(), column, column + 1);
+        let hovered = !selected && range_overlaps(hovered_columns.as_ref(), column, column + 1);
+        if hovered {
+            cell.style.background = Some(side_panel_hover_background());
+        } else {
+            cell.style
+                .background
+                .get_or_insert(theme::palette().hover_bg);
+        }
         *frame.cell_mut(layout.content_left() + column, frame_row) = cell;
     }
 }
 
-/// The plan card draws its own box in the plain foreground tone, and the panel
-/// takes that box over while it is open, so both read as the same frame in every
-/// theme rather than the panel sitting a shade apart.
-fn side_panel_border_style() -> CellStyle {
-    CellStyle {
-        foreground: tone_rgb(PLAN_BORDER_TONE),
-        ..CellStyle::plain()
-    }
-}
-
-/// The key that cycles the docked side panel, named on its own top rule the
-/// same way the plan panel names its own toggle key.
-const SIDE_PANEL_TOGGLE_HINT: &str = " Alt + P ";
-
-fn side_panel_hint_style() -> CellStyle {
-    CellStyle {
-        foreground: tone_rgb(Tone::Muted),
-        ..CellStyle::plain()
-    }
-}
-
-/// Draws one row of the panel's outline into `frame_row` of `frame`. `global_row`
-/// is this row's position in the whole panel (0..`rows`), which is what decides
-/// whether it is the top rule, the bottom rule, or a bare `│` on each edge — the
-/// two differ when repainting a single animated row through its own 1-row frame.
-/// There is no fill, so the panel reads as an unfilled box like the composer and
-/// the plan card.
+/// Paints one row of the docked panel as a borderless theme surface. The first
+/// and last rows stay empty to provide the same outer breathing room as the
+/// reference panel without drawing a rule or corner around it.
 fn paint_side_panel_row_into_frame(
     frame: &mut CellFrame,
     layout: SidePanelLayout,
@@ -899,79 +975,48 @@ fn paint_side_panel_row_into_frame(
     rows: usize,
     content: &[PaintLine],
     selection: Option<CellRange>,
+    footer: &[PaintLine],
+    hovered_pick: Option<&Pick>,
 ) {
     if frame_row >= frame.height || rows == 0 {
         return;
     }
-    let border_style = side_panel_border_style();
-    let right = layout.panel_left + layout.panel_width - 1;
-    if global_row == 0 {
-        frame.write(layout.panel_left, frame_row, "╭", border_style);
-        let usable = layout.panel_width.saturating_sub(2);
-        let hint_width = UnicodeWidthStr::width(SIDE_PANEL_TOGGLE_HINT);
-        if usable >= hint_width + 1 {
-            // 작업 단계 카드의 머리글처럼 안내를 오른쪽 모서리 가까이 붙이고,
-            // 모서리와의 사이에는 테두리 한 칸만 남긴다.
-            let before = usable - hint_width - 1;
-            if before > 0 {
-                frame.write(
-                    layout.panel_left + 1,
-                    frame_row,
-                    &"─".repeat(before),
-                    border_style,
-                );
-            }
-            frame.write(
-                layout.panel_left + 1 + before,
-                frame_row,
-                SIDE_PANEL_TOGGLE_HINT,
-                side_panel_hint_style(),
-            );
-            frame.write(
-                layout.panel_left + 1 + before + hint_width,
-                frame_row,
-                "─",
-                border_style,
-            );
-        } else if usable > 0 {
-            frame.write(
-                layout.panel_left + 1,
-                frame_row,
-                &"─".repeat(usable),
-                border_style,
-            );
-        }
-        frame.write(right, frame_row, "╮", border_style);
-        return;
-    }
-    if global_row + 1 == rows {
-        frame.write(layout.panel_left, frame_row, "╰", border_style);
-        frame.write(
-            layout.panel_left + 1,
-            frame_row,
-            &"─".repeat(layout.panel_width.saturating_sub(2)),
-            border_style,
-        );
-        frame.write(right, frame_row, "╯", border_style);
-        return;
-    }
-    frame.write(layout.panel_left, frame_row, "│", border_style);
-    frame.write(right, frame_row, "│", border_style);
-    frame.write(
-        layout.content_left(),
+    frame.fill(
+        layout.panel_left,
         frame_row,
-        &side_panel_row(layout.content_width()),
-        side_panel_hint_style(),
+        layout.panel_left + layout.panel_width,
+        frame_row + 1,
+        side_panel_background_style(),
     );
-    // The rule above the first content row is the panel's own top border, so the
-    // content starts one row below it.
+    if global_row == 0 || global_row + 1 == rows {
+        return;
+    }
+    let footer_start = rows.saturating_sub(footer.len().saturating_add(1));
+    if global_row >= footer_start
+        && global_row + 1 < rows
+        && let Some(line) = footer.get(global_row - footer_start)
+    {
+        let hovered_columns = Renderer::hover_columns(line, None, hovered_pick);
+        paint_panel_content_row(frame, layout, frame_row, line, None, hovered_columns);
+        return;
+    }
+    // Row zero is the panel's empty top inset, so content starts one row below it.
     if let Some(line) = content.get(global_row - 1) {
         let selected_columns =
             selection.and_then(|range| selection_columns_for_line(line, range, global_row - 1));
-        paint_panel_content_row(frame, layout, frame_row, line, selected_columns);
+        let hovered_columns = Renderer::hover_columns(line, None, hovered_pick);
+        paint_panel_content_row(
+            frame,
+            layout,
+            frame_row,
+            line,
+            selected_columns,
+            hovered_columns,
+        );
     }
 }
 
+#[cfg(test)]
 fn paint_side_panel_into_frame(
     frame: &mut CellFrame,
     layout: SidePanelLayout,
@@ -979,8 +1024,30 @@ fn paint_side_panel_into_frame(
     content: &[PaintLine],
     selection: Option<CellRange>,
 ) {
+    paint_side_panel_into_frame_with_footer(frame, layout, rows, content, selection, &[], None);
+}
+
+fn paint_side_panel_into_frame_with_footer(
+    frame: &mut CellFrame,
+    layout: SidePanelLayout,
+    rows: usize,
+    content: &[PaintLine],
+    selection: Option<CellRange>,
+    footer: &[PaintLine],
+    hovered_pick: Option<&Pick>,
+) {
     for row in 0..rows.min(frame.height) {
-        paint_side_panel_row_into_frame(frame, layout, row, row, rows, content, selection);
+        paint_side_panel_row_into_frame(
+            frame,
+            layout,
+            row,
+            row,
+            rows,
+            content,
+            selection,
+            footer,
+            hovered_pick,
+        );
     }
 }
 
@@ -1035,6 +1102,7 @@ impl Renderer {
             last_width: 0,
             last_total_width: 0,
             last_height: 0,
+            last_transcript_rows: 0,
             theme: selected_theme,
             history: Vec::new(),
             scroll_back: 0,
@@ -1051,13 +1119,16 @@ impl Renderer {
             selection: Selection::default(),
             last_click: None,
             composer_selection: None,
+            composer_navigation_layout: None,
             painted_selection: None,
             painted_frame: None,
             side_panel: None,
             side_panel_content: Vec::new(),
+            side_panel_footer: Vec::new(),
             selection_in_panel: false,
             live_frame_cache: None,
             animation_activity_row: None,
+            animation_response_bullet_row: None,
             animation_plan_rows: 0,
             #[cfg(test)]
             live_cache_rebuilds: 0,
@@ -1114,6 +1185,45 @@ impl Renderer {
         true
     }
 
+    /// Places a previously sent prompt at the top of the fullscreen transcript,
+    /// or as high as the remaining rows allow when it is near the newest end.
+    pub fn scroll_to_prompt(&mut self, block_id: u64) -> bool {
+        if self.mode != RenderMode::Fullscreen || self.last_transcript_rows == 0 {
+            return false;
+        }
+        let mut target_start = 0;
+        let mut found = false;
+        for block in visible_transcript_blocks(
+            &self.history,
+            self.shell_display_mode,
+            self.diff_display_mode,
+        ) {
+            if block.id() == block_id {
+                found = true;
+                break;
+            }
+            target_start += block_group_lines(
+                block,
+                self.last_width,
+                self.shell_display_mode,
+                self.diff_display_mode,
+                self.expanded_tools.contains(&block.id()),
+            )
+            .len();
+        }
+        if !found {
+            return false;
+        }
+        let max_back = self.wrapped.len().saturating_sub(self.last_transcript_rows);
+        let target = max_back.saturating_sub(target_start.min(max_back));
+        let moved = target != self.scroll_back;
+        self.scroll_back = target;
+        if moved {
+            self.clear_selection();
+        }
+        moved
+    }
+
     fn scroll_to_bottom_control(&self, width: u16) -> Option<PaintLine> {
         if self.mode != RenderMode::Fullscreen || self.scroll_back == 0 {
             return None;
@@ -1154,10 +1264,13 @@ impl Renderer {
         self.painted_hovered_pick = None;
         self.selection.clear();
         self.painted_selection = None;
+        self.composer_navigation_layout = None;
         self.painted_frame = None;
         self.live_frame_cache = None;
         self.animation_activity_row = None;
+        self.animation_response_bullet_row = None;
         self.animation_plan_rows = 0;
+        self.last_transcript_rows = 0;
         self.apply_terminal_theme()?;
         self.reset_screen()
     }
@@ -1193,6 +1306,20 @@ impl Renderer {
     pub fn pick_at(&self, column: u16, row: u16) -> Option<Pick> {
         if self.mode != RenderMode::Fullscreen {
             return None;
+        }
+        if self.column_is_in_panel(column) {
+            let layout = self.side_panel?;
+            let content_row = usize::from(row).checked_sub(1)?;
+            let content_column = usize::from(column).checked_sub(layout.content_left())?;
+            if content_column >= layout.content_width() {
+                return None;
+            }
+            return self
+                .side_panel_content
+                .get(content_row)?
+                .pick
+                .as_ref()?
+                .at(content_column);
         }
         self.previous_lines
             .get(row as usize)?
@@ -1408,6 +1535,28 @@ impl Renderer {
         Some(row.end)
     }
 
+    /// Resolves an Up/Down key against the visual rows from the last paint.
+    /// `None` means the cursor is already at that edge and history may handle it.
+    pub fn composer_vertical_cursor_position(&self, cursor: usize, delta: isize) -> Option<usize> {
+        let layout = self.composer_navigation_layout.as_ref()?;
+        let (row_index, row) = layout
+            .rows
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, row)| row.start <= cursor && cursor <= row.end)?;
+        let target_index = row_index.checked_add_signed(delta)?;
+        let target = layout.rows.get(target_index)?;
+        let desired_column = composer_cursor_column(row, cursor);
+        Some(composer_cursor_at_column(target, desired_column))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_composer_navigation_layout_for_test(&mut self, editor: &Editor, width: u16) {
+        let (_, _, _, layout) = input_lines(editor, &[], width, "", "", None, None);
+        self.composer_navigation_layout = Some(layout);
+    }
+
     fn reconcile_selection(&mut self, lines: &[PaintLine]) {
         let Some(range) = self.selection.range() else {
             return;
@@ -1433,7 +1582,7 @@ impl Renderer {
     }
 
     /// Maps a screen cell onto the panel's own content grid: one row per content
-    /// line below the top rule, and columns measured from the panel's left inset.
+    /// line below the top inset, and columns measured from the panel's left inset.
     fn panel_selection_point(&self, column: u16, row: u16) -> Option<CellPosition> {
         let layout = self.side_panel?;
         if self.side_panel_content.is_empty() || row == 0 {
@@ -1560,6 +1709,16 @@ impl Renderer {
         }
     }
 
+    fn remove_startup_update_from_history(&mut self) -> bool {
+        let before = self.history.len();
+        self.history.retain(|block| !is_startup_update(block));
+        let removed = self.history.len() != before;
+        if removed {
+            self.wrapped_width = 0;
+        }
+        removed
+    }
+
     fn reset_screen(&mut self) -> Result<()> {
         self.previous_lines.clear();
         self.painted_frame = None;
@@ -1600,6 +1759,14 @@ impl Renderer {
 
     pub fn render(&mut self, committed: &[Block], view: View<'_>) -> Result<()> {
         CHAT_LAYOUT.store(view.chat_layout, Ordering::Relaxed);
+        let committed_without_startup = view.plan_summary.is_some().then(|| {
+            committed
+                .iter()
+                .filter(|block| !is_startup_update(block))
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        let committed = committed_without_startup.as_deref().unwrap_or(committed);
         let mode_changed = self.shell_display_mode != view.shell_display_mode
             || self.diff_display_mode != view.diff_display_mode
             || self.chat_layout != view.chat_layout;
@@ -1608,9 +1775,11 @@ impl Renderer {
             self.diff_display_mode = view.diff_display_mode;
             self.chat_layout = view.chat_layout;
             self.wrapped_width = 0;
-            if self.mode == RenderMode::Inline {
-                self.relayout()?;
-            }
+        }
+        let startup_update_removed =
+            view.plan_summary.is_some() && self.remove_startup_update_from_history();
+        if self.mode == RenderMode::Inline && (mode_changed || startup_update_removed) {
+            self.relayout()?;
         }
         let (total_width, height) = terminal_size().unwrap_or((100, 30));
         let total_width = total_width.max(20);
@@ -1620,6 +1789,10 @@ impl Renderer {
             .then_some(view.side_panel_width)
             .flatten()
             .and_then(|panel_width| side_panel_layout(total_width, panel_width));
+        let mut status_line = view.status_line;
+        let side_panel_footer = side_panel
+            .map(|layout| move_context_to_side_panel(&mut status_line, layout.content_width()))
+            .unwrap_or_default();
         if side_panel != self.side_panel {
             // Opening or closing moves every row's right edge, so the diff has
             // nothing reusable and the whole surface must be repainted.
@@ -1635,7 +1808,7 @@ impl Renderer {
             self.live_frame_lines(&view.live_blocks, frame_width, height.max(3) as usize);
         let status = StatusArea {
             fallback: view.footer,
-            line: view.status_line,
+            line: status_line,
             composer_notice: view.composer_notice,
             composer_mode: view.composer_mode,
         };
@@ -1659,6 +1832,8 @@ impl Renderer {
                 frame_width,
             )
         };
+        let composer_navigation_layout = frame.composer_layout.clone();
+        self.side_panel_footer = side_panel_footer;
 
         if self.mode == RenderMode::Fullscreen {
             return self.render_fullscreen(
@@ -1671,6 +1846,9 @@ impl Renderer {
                 view.activity_phase,
                 view.plan_active,
                 view.plan_shimmer_phase,
+                view.waiting_for_response,
+                view.side_panel_prompts_expanded,
+                &view.side_panel_integrations,
             );
         }
 
@@ -1730,11 +1908,14 @@ impl Renderer {
         self.previous_lines = frame.lines.clone();
         self.cursor_line = frame.cursor_line;
         self.cursor_col = frame.cursor_col;
+        self.composer_navigation_layout = composer_navigation_layout;
         // Inline mode hands selection to the terminal, so nothing here maps a
         // drag back to the composer.
         self.composer_selection = None;
         self.animation_activity_row = None;
+        self.animation_response_bullet_row = None;
         self.animation_plan_rows = 0;
+        self.last_transcript_rows = 0;
         self.last_width = width;
         self.last_total_width = total_width;
         self.last_height = height;
@@ -1827,6 +2008,15 @@ impl Renderer {
             return Ok(false);
         }
 
+        if view.waiting_for_response
+            && let Some(row) = self.animation_response_bullet_row
+            && let Some(line) = self.previous_lines.get(row)
+        {
+            let mut line = line.clone();
+            line.prefix_tone = waiting_response_bullet_tone(view.activity_phase);
+            updates.push((row, line));
+        }
+
         let plan_lines = view
             .plan_summary
             .map(|summary| {
@@ -1900,6 +2090,8 @@ impl Renderer {
                     self.previous_lines.len(),
                     &self.side_panel_content,
                     None,
+                    &self.side_panel_footer,
+                    self.hovered_pick.as_ref(),
                 );
             }
             let start = screen_row * width;
@@ -1969,23 +2161,15 @@ impl Renderer {
         activity_phase: f32,
         plan_active: bool,
         plan_shimmer_phase: Option<f32>,
+        waiting_for_response: bool,
+        side_panel_prompts_expanded: bool,
+        side_panel_integrations: &[ProviderIntegrationView],
     ) -> Result<()> {
+        let composer_navigation_layout = frame.composer_layout.clone();
         let rows = height as usize;
         // The docked panel is where the plan lives while it is open, so the
         // transcript keeps its own full height and draws no card of its own.
         let plan_in_panel = self.side_panel.is_some();
-        let panel_content = match (self.side_panel, plan_summary) {
-            (Some(layout), Some(summary)) => {
-                side_panel_plan_lines(summary, layout.content_width(), activity_phase, plan_active)
-            }
-            _ => Vec::new(),
-        };
-        // A panel selection points at rows of this content, so a plan that gains
-        // or loses a step leaves the highlight describing something else.
-        if self.selection_in_panel && panel_content.len() != self.side_panel_content.len() {
-            self.selection.clear();
-        }
-        self.side_panel_content = panel_content;
         let plan_lines = plan_summary
             .filter(|_| !plan_in_panel)
             .map(|summary| {
@@ -2002,6 +2186,42 @@ impl Renderer {
         let content_rows = rows.saturating_sub(plan_rows).max(1);
         let old_view_rows = split_rows(content_rows, frame.lines.len(), self.wrapped.len()).0;
         self.commit_fullscreen_blocks(committed, width, old_view_rows);
+        let panel_content = self
+            .side_panel
+            .map(|layout| {
+                let mut lines = plan_summary
+                    .map(|summary| {
+                        side_panel_plan_lines(
+                            summary,
+                            layout.content_width(),
+                            activity_phase,
+                            plan_active,
+                        )
+                    })
+                    .unwrap_or_default();
+                lines.extend(side_panel_prompt_lines(
+                    &self.history,
+                    layout.content_width(),
+                    side_panel_prompts_expanded,
+                ));
+                if SIDE_PANEL_INTEGRATIONS_CONNECTED {
+                    let content_capacity = rows.saturating_sub(self.side_panel_footer.len() + 2);
+                    let remaining = content_capacity.saturating_sub(lines.len());
+                    lines.extend(side_panel_integration_lines(
+                        side_panel_integrations,
+                        layout.content_width(),
+                        remaining,
+                    ));
+                }
+                lines
+            })
+            .unwrap_or_default();
+        // A panel selection points at rows of this content, so content changes
+        // leave the highlight describing something else.
+        if self.selection_in_panel && panel_content.len() != self.side_panel_content.len() {
+            self.selection.clear();
+        }
+        self.side_panel_content = panel_content;
         let provisional_view_rows =
             split_rows(content_rows, frame.lines.len(), self.wrapped.len()).0;
         self.scroll_back = self
@@ -2009,6 +2229,7 @@ impl Renderer {
             .min(self.wrapped.len().saturating_sub(provisional_view_rows));
         let (view_rows, live_rows) =
             split_rows(content_rows, frame.lines.len(), self.wrapped.len());
+        self.last_transcript_rows = view_rows;
         // Padding the live frame is what puts the composer on the bottom row
         // *without* dragging the welcome card and the live blocks down with it:
         // `fit_frame` inserts the blanks at the dock, above the composer.
@@ -2042,6 +2263,11 @@ impl Renderer {
             frame.cursor_line,
         );
         screen.splice(0..0, plan_lines);
+        let response_bullet_row = waiting_for_response
+            .then(|| {
+                visible_response_bullet_row(&self.wrapped, start..start + view_rows, plan_rows)
+            })
+            .flatten();
         let cursor_line = cursor_line + plan_rows;
         let scroll_to_bottom_overlay = self.scroll_to_bottom_control(width).and_then(|control| {
             let row = plan_rows + scroll_to_bottom_overlay_row(view_rows, frame.composer_index)?;
@@ -2077,8 +2303,10 @@ impl Renderer {
         self.previous_lines = screen;
         self.cursor_line = cursor_line;
         self.cursor_col = frame.cursor_col;
+        self.composer_navigation_layout = composer_navigation_layout;
         self.composer_selection = composer_selection;
         self.animation_activity_row = animation_activity_row;
+        self.animation_response_bullet_row = response_bullet_row;
         self.animation_plan_rows = plan_rows;
         self.last_width = width;
         self.last_total_width = total_width;
@@ -2227,12 +2455,14 @@ impl Renderer {
             paint_scroll_to_bottom_into_frame(&mut frame, row, control);
         }
         if let Some(layout) = self.side_panel {
-            paint_side_panel_into_frame(
+            paint_side_panel_into_frame_with_footer(
                 &mut frame,
                 layout,
                 lines.len(),
                 &self.side_panel_content,
                 panel_selection,
+                &self.side_panel_footer,
+                self.hovered_pick.as_ref(),
             );
         }
         emit_synchronized_frame_diff_with_full_rows(
@@ -2920,6 +3150,19 @@ fn compose_screen(
     (screen, cursor_line)
 }
 
+fn visible_response_bullet_row(
+    wrapped: &[PaintLine],
+    visible: Range<usize>,
+    rows_before_transcript: usize,
+) -> Option<usize> {
+    let row = wrapped
+        .iter()
+        .rposition(|line| line.prefix == "• " && line.prefix_tone == Tone::FastOff)?;
+    visible
+        .contains(&row)
+        .then(|| rows_before_transcript + row - visible.start)
+}
+
 /// The plan already owns one blank row below its bottom border. If a scrolled
 /// transcript window lands on block-separator blanks, start at its next visible
 /// row so those separators do not stack below the fixed plan.
@@ -3036,6 +3279,7 @@ enum Tone {
     StatusEffortMax,
     StatusEffortUltra,
     Border,
+    SidePanelDivider,
     Branch,
     #[allow(dead_code)]
     LimitFiveHour,
@@ -3096,6 +3340,9 @@ pub enum Pick {
     ShellDisplayMode,
     DiffDisplayMode,
     PlanSummary,
+    PromptSection,
+    McpSection(String),
+    PluginSection(String),
     /// The `Fast: On`/`Fast: Off` badge: toggles the fast service tier.
     FastMode,
     /// Claude's permission mode badge: cycles the mode the way Shift+Tab does
@@ -3109,6 +3356,8 @@ pub enum Pick {
     Subagent(usize),
     /// The fullscreen transcript control that returns to its newest row.
     ScrollToBottom,
+    /// A recent prompt row in the docked panel: jumps to that transcript block.
+    Prompt(u64),
     /// The `✕` on a panel's top rule: closes what Esc closes.
     Close,
 }
@@ -3255,6 +3504,12 @@ const SHIMMER_BAND: f32 = 3.0;
 const PLAN_SHIMMER_BAND: f32 = SHIMMER_BAND * 2.5;
 const PLAN_SHIMMER_LOOPS: f32 = 5.0;
 
+fn waiting_response_bullet_tone(phase: f32) -> Tone {
+    let wave = 0.5 - 0.5 * (phase.clamp(0.0, 1.0) * std::f32::consts::TAU).cos();
+    let base = tone_rgb(Tone::FastOff).unwrap_or(theme::palette().muted);
+    Tone::Shimmer(base, (wave * 255.0).round() as u8)
+}
+
 /// One span per character, each lit by how close it is to the band's centre, so
 /// the label carries a soft gradient instead of a hard block. `phase` runs
 /// `0.0..1.0` across a single sweep: the band enters off the left edge and
@@ -3318,11 +3573,7 @@ fn progress_bar_spans(phase: f32, track: usize, tone: Tone) -> Vec<PaintSpan> {
     let visible_end = (offset + block as isize).clamp(0, track as isize) as usize;
     let visible = visible_end.saturating_sub(visible_start);
     let remaining = track.saturating_sub(visible_start + visible);
-    let mut spans = vec![PaintSpan {
-        text: "[".to_owned(),
-        tone: Tone::Muted,
-        bold: false,
-    }];
+    let mut spans = Vec::new();
     if visible_start > 0 {
         spans.push(PaintSpan {
             text: "░".repeat(visible_start),
@@ -3344,11 +3595,6 @@ fn progress_bar_spans(phase: f32, track: usize, tone: Tone) -> Vec<PaintSpan> {
             bold: false,
         });
     }
-    spans.push(PaintSpan {
-        text: "]".to_owned(),
-        tone: Tone::Muted,
-        bold: false,
-    });
     spans
 }
 
@@ -4262,45 +4508,59 @@ fn panel_bottom(inner_width: usize) -> PaintLine {
     }
 }
 
-/// Full-width update banner: a rule, the headline, the hint, and a closing rule.
+/// Release notes use the same compact heading-and-rows rhythm as the task list.
 fn update_lines(block: &Block, width: u16) -> Vec<PaintLine> {
-    let rule_width = (width as usize).saturating_sub(1).max(1);
-    let text_width = rule_width.saturating_sub(2);
-    let rule = || PaintLine {
-        prefix: String::new(),
-        prefix_tone: Tone::Border,
-        text: "─".repeat(rule_width),
-        tone: Tone::Border,
-        bold: false,
-        tool_heading: None,
-        pick: None,
-        tail: Vec::new(),
+    let max_width = panel_span(width);
+    let line_width = if is_startup_update(block) {
+        let title_width = UnicodeWidthStr::width(block.title.as_str()) + 6;
+        let body_width = block
+            .body
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(UnicodeWidthStr::width)
+            .max()
+            .unwrap_or_default()
+            + 15;
+        title_width.max(body_width).min(max_width)
+    } else {
+        max_width
     };
-    vec![
-        rule(),
+    let title = compact_text(&block.title, line_width.saturating_sub(7));
+    let title_width = UnicodeWidthStr::width(title.as_str());
+    let rule = "─".repeat(line_width.saturating_sub(6 + title_width));
+    let mut lines = vec![
         PaintLine {
-            prefix: "● ".to_owned(),
-            prefix_tone: Tone::Accent,
-            text: compact_text(&block.title, text_width),
-            tone: Tone::Accent,
-            bold: true,
-            tool_heading: None,
-            pick: None,
-            tail: Vec::new(),
+            tone: PLAN_BORDER_TONE,
+            ..PaintLine::plain(format!("┌── {title} {rule}┐"))
         },
-        PaintLine {
-            prefix: "  ".to_owned(),
-            prefix_tone: Tone::Muted,
-            text: compact_text(&block.body, text_width),
-            tone: Tone::Muted,
-            bold: false,
-            tool_heading: None,
-            pick: None,
-            tail: Vec::new(),
-        },
-        rule(),
         PaintLine::blank(),
-    ]
+    ];
+    let wrap_width = if is_startup_update(block) {
+        line_width.saturating_sub(1).min(u16::MAX as usize) as u16
+    } else {
+        width
+    };
+    for note in block.body.lines().filter(|line| !line.trim().is_empty()) {
+        lines.extend(wrapped_line(
+            "  •  ",
+            Tone::Muted,
+            note,
+            Tone::Muted,
+            false,
+            wrap_width,
+        ));
+    }
+    lines.push(PaintLine::blank());
+    lines.push(PaintLine {
+        tone: PLAN_BORDER_TONE,
+        ..PaintLine::plain(format!("└{}┘", "─".repeat(line_width.saturating_sub(2))))
+    });
+    lines.push(PaintLine::blank());
+    lines
+}
+
+fn is_startup_update(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::Update) && block.title == "Tip"
 }
 
 fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine> {
@@ -4732,6 +4992,22 @@ fn overlay_frame_with_expansion(
                         .into_iter()
                         .map(|line| panelize_content_line(line, panel_width)),
                 );
+                if let Some(detail) = slider.detail.as_deref() {
+                    lines.push(panel_padding_row(panel_width));
+                    lines.extend(
+                        wrapped_line_with_continuation(
+                            "│   ",
+                            "│   ",
+                            Tone::Border,
+                            detail,
+                            Tone::Muted,
+                            false,
+                            (panel_width.saturating_sub(1)).min(u16::MAX as usize) as u16,
+                        )
+                        .into_iter()
+                        .map(|line| close_panel_row(line, panel_width)),
+                    );
+                }
             }
             lines.push(panel_padding_row(panel_width));
             lines.push(panel_rule_row("╰─ ", &overlay.hint, '╯', panel_width));
@@ -5126,11 +5402,7 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
     // Align with the activity controls above by keeping two blank terminal
     // columns to the right of the status line.
     let max_width = width.saturating_sub(3) as usize;
-    let shortcut_hint = if has_effort {
-        "Shift + ↑↓ model · ←→ effort"
-    } else {
-        "Shift + ↑↓ model"
-    };
+    let shortcut_hint = status_line_shortcut_hint_from_effort(has_effort);
     let content_width = spans
         .iter()
         .map(|span| UnicodeWidthStr::width(span.text.as_str()))
@@ -5166,6 +5438,139 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         tail: spans.into_iter().skip(1).collect(),
     }
     .with_picks(&picks)
+}
+
+fn status_line_shortcut_hint_from_effort(has_effort: bool) -> &'static str {
+    if has_effort {
+        "Shift + ↑↓ model · ←→ effort"
+    } else {
+        "Shift + ↑↓ model"
+    }
+}
+
+fn side_panel_divider(content_width: usize) -> PaintLine {
+    PaintLine {
+        text: "─".repeat(content_width),
+        tone: Tone::SidePanelDivider,
+        ..PaintLine::plain("")
+    }
+}
+
+fn side_panel_section_heading(
+    title: &str,
+    expanded: bool,
+    content_width: usize,
+    pick: Pick,
+) -> PaintLine {
+    let prefix = if expanded { "▲ " } else { "▼ " };
+    let text = compact_right(
+        title,
+        content_width.saturating_sub(UnicodeWidthStr::width(prefix)),
+    );
+    let clickable_width = UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(text.as_str());
+    PaintLine {
+        prefix: prefix.to_owned(),
+        prefix_tone: Tone::Muted,
+        text,
+        tone: Tone::Plain,
+        bold: true,
+        pick: Some(PickRegions::span(0, clickable_width, pick)),
+        ..PaintLine::plain("")
+    }
+}
+
+fn side_panel_status_lines(
+    status: Option<&StatusLineView>,
+    content_width: usize,
+) -> Vec<PaintLine> {
+    let Some(status) = status else {
+        return Vec::new();
+    };
+    let Some(context) = status
+        .context
+        .as_deref()
+        .filter(|context| !context.is_empty())
+    else {
+        return Vec::new();
+    };
+    let context_tone = status
+        .model
+        .as_deref()
+        .and_then(model_tone)
+        .unwrap_or(Tone::Border);
+    vec![
+        side_panel_divider(content_width),
+        side_panel_context_line(context, content_width, context_tone),
+    ]
+}
+
+fn move_context_to_side_panel(
+    status: &mut Option<StatusLineView>,
+    content_width: usize,
+) -> Vec<PaintLine> {
+    let lines = side_panel_status_lines(status.as_ref(), content_width);
+    if !lines.is_empty()
+        && let Some(status) = status.as_mut()
+    {
+        status.context = None;
+    }
+    lines
+}
+
+fn side_panel_context_line(context: &str, content_width: usize, context_tone: Tone) -> PaintLine {
+    let value = context.strip_prefix("ctx: ").unwrap_or(context);
+    let (counts, percent) = value
+        .rsplit_once(" (")
+        .and_then(|(counts, percent)| {
+            percent
+                .strip_suffix("%)")
+                .and_then(|percent| percent.parse::<u8>().ok())
+                .map(|percent| (counts, percent.min(100)))
+        })
+        .unwrap_or((value, 0));
+    let counts = counts
+        .split_once('/')
+        .map(|(used, window)| {
+            format!(
+                "{}/{}K",
+                used.trim_end_matches(['k', 'K']),
+                window.trim_end_matches(['k', 'K'])
+            )
+        })
+        .unwrap_or_else(|| counts.to_owned());
+    let summary = format!("{counts} ({percent}%)");
+    let label = "Context: ";
+    let fixed_width = UnicodeWidthStr::width(label) + UnicodeWidthStr::width(summary.as_str()) + 3;
+    let track = content_width
+        .saturating_sub(fixed_width)
+        .min(PROGRESS_TRACK_COLUMNS);
+    if track == 0 {
+        return PaintLine::plain(compact_right(&format!("{label}{summary}"), content_width));
+    }
+
+    let filled = ((track as f32 * percent as f32 / 100.0).round() as usize).min(track);
+    PaintLine {
+        text: label.to_owned(),
+        bold: true,
+        tail: vec![
+            PaintSpan {
+                text: "█".repeat(filled),
+                tone: context_tone,
+                bold: false,
+            },
+            PaintSpan {
+                text: "░".repeat(track.saturating_sub(filled)),
+                tone: Tone::Muted,
+                bold: false,
+            },
+            PaintSpan {
+                text: format!(" {summary}"),
+                tone: Tone::StatusText,
+                bold: false,
+            },
+        ],
+        ..PaintLine::plain("")
+    }
 }
 
 fn push_status_span(spans: &mut Vec<PaintSpan>, text: impl Into<String>, tone: Tone) -> usize {
@@ -6158,9 +6563,9 @@ fn plan_title_shimmer_spans(text: &str, phase: Option<f32>, effort_tone: Tone) -
     .collect()
 }
 
-/// The plan summary as the docked panel shows it: a heading, a blank row, then
-/// one row per step. The panel already draws a border of its own, so this drops
-/// the card chrome, the status gutter, and the toggle hint.
+/// The plan summary as the docked panel shows it: a heading, a blank row, one
+/// row per step, another blank row, then a quiet section rule without card
+/// chrome or a toggle hint.
 fn side_panel_plan_lines(
     summary: &PlanSummary,
     content_width: usize,
@@ -6181,16 +6586,18 @@ fn side_panel_plan_lines(
     let all_completed = !summary.steps.is_empty() && completed == summary.steps.len();
     if all_completed {
         let elapsed: Duration = summary.steps.iter().filter_map(|step| step.elapsed).sum();
-        title.push_str(&format!("  ({})", format_plan_elapsed(elapsed)));
+        title.push_str(&format!("  [⏱  {}]", format_plan_elapsed(elapsed)));
     }
-    let mut lines = vec![
-        PaintLine {
-            tone: Tone::Plain,
-            bold: true,
-            ..PaintLine::plain(compact_right(&title, content_width))
-        },
-        PaintLine::blank(),
-    ];
+    let heading =
+        side_panel_section_heading(&title, summary.expanded, content_width, Pick::PlanSummary);
+    if !summary.expanded {
+        return vec![
+            heading,
+            PaintLine::blank(),
+            side_panel_divider(content_width),
+        ];
+    }
+    let mut lines = vec![heading, PaintLine::blank()];
     for step in &summary.steps {
         let elapsed_text = step.elapsed.map(format_plan_elapsed);
         let elapsed = elapsed_text.as_deref();
@@ -6252,7 +6659,228 @@ fn side_panel_plan_lines(
             ..PaintLine::plain("")
         });
     }
+    if !summary.steps.is_empty() {
+        lines.push(PaintLine::blank());
+    }
+    lines.push(side_panel_divider(content_width));
     lines
+}
+
+const SIDE_PANEL_PROMPT_LIMIT: usize = 5;
+
+/// The latest sent prompts as a compact panel section: heading, blank row,
+/// newest-first entries, another blank row, then a quiet section rule.
+fn side_panel_prompt_lines(
+    history: &[Block],
+    content_width: usize,
+    expanded: bool,
+) -> Vec<PaintLine> {
+    if content_width == 0 {
+        return Vec::new();
+    }
+    let heading =
+        side_panel_section_heading("Input Prompt", expanded, content_width, Pick::PromptSection);
+    if !expanded {
+        return vec![
+            heading,
+            PaintLine::blank(),
+            side_panel_divider(content_width),
+        ];
+    }
+    let mut lines = vec![heading, PaintLine::blank()];
+    let mut has_prompts = false;
+    for prompt in history
+        .iter()
+        .rev()
+        .filter(|block| matches!(block.kind, BlockKind::User))
+        .take(SIDE_PANEL_PROMPT_LIMIT)
+    {
+        has_prompts = true;
+        let text = prompt.body.split_whitespace().collect::<Vec<_>>().join(" ");
+        let marker_tone = model_tone(&prompt.title).unwrap_or(Tone::User);
+        let prefix = "› ";
+        let available = content_width.saturating_sub(UnicodeWidthStr::width(prefix));
+        lines.push(PaintLine {
+            prefix: prefix.to_owned(),
+            prefix_tone: marker_tone,
+            text: compact_right(&text, available),
+            tone: Tone::Plain,
+            pick: Some(PickRegions::span(
+                0,
+                content_width,
+                Pick::Prompt(prompt.id()),
+            )),
+            ..PaintLine::plain("")
+        });
+    }
+    if has_prompts {
+        lines.push(PaintLine::blank());
+    }
+    lines.push(side_panel_divider(content_width));
+    lines
+}
+
+/// Provider integration snapshots use the same compact, borderless hierarchy as
+/// the reference panel. The selected provider is always first because short
+/// terminals may not have room for both snapshots.
+fn side_panel_integration_lines(
+    providers: &[ProviderIntegrationView],
+    content_width: usize,
+    max_rows: usize,
+) -> Vec<PaintLine> {
+    if content_width == 0 || max_rows == 0 {
+        return Vec::new();
+    }
+    let mut providers = providers.iter().collect::<Vec<_>>();
+    providers.sort_by_key(|provider| !provider.active);
+
+    let mut lines = Vec::new();
+    for (index, provider) in providers.into_iter().enumerate() {
+        if index > 0 {
+            lines.push(PaintLine::blank());
+        }
+        lines.push(side_panel_provider_heading(provider, content_width));
+        if !provider.enabled {
+            continue;
+        }
+        lines.extend(side_panel_integration_section(
+            "MCP",
+            provider.mcp.as_deref(),
+            provider.mcp_error.as_deref(),
+            provider.mcp_expanded,
+            Pick::McpSection(provider.provider.clone()),
+            content_width,
+        ));
+        lines.extend(side_panel_integration_section(
+            "Plugin",
+            provider.plugins.as_deref(),
+            provider.plugin_error.as_deref(),
+            provider.plugins_expanded,
+            Pick::PluginSection(provider.provider.clone()),
+            content_width,
+        ));
+    }
+
+    if lines.len() <= max_rows {
+        return lines;
+    }
+    if max_rows == 1 {
+        lines.truncate(1);
+        return lines;
+    }
+    let hidden = lines.len().saturating_sub(max_rows - 1);
+    lines.truncate(max_rows - 1);
+    while lines
+        .last()
+        .is_some_and(|line| painted_line_width(line) == 0)
+    {
+        lines.pop();
+    }
+    lines.push(PaintLine {
+        tone: Tone::Muted,
+        ..PaintLine::plain(compact_right(&format!("… +{hidden}"), content_width))
+    });
+    lines
+}
+
+fn side_panel_provider_heading(
+    provider: &ProviderIntegrationView,
+    content_width: usize,
+) -> PaintLine {
+    let (prefix, prefix_tone, detail) = if !provider.enabled {
+        ("× ", Tone::Error, "연결 안 됨")
+    } else if provider.active {
+        ("▸ ", Tone::Accent, "사용 중")
+    } else if provider.mcp.is_some() || provider.plugins.is_some() {
+        ("· ", Tone::Muted, "최근 확인")
+    } else {
+        ("· ", Tone::Muted, "대기")
+    };
+    let available = content_width.saturating_sub(UnicodeWidthStr::width(prefix));
+    PaintLine {
+        prefix: prefix.to_owned(),
+        prefix_tone,
+        text: compact_right(&format!("{}  {detail}", provider.provider), available),
+        tone: Tone::Plain,
+        bold: true,
+        ..PaintLine::plain("")
+    }
+}
+
+fn side_panel_integration_section(
+    title: &str,
+    items: Option<&[IntegrationItemView]>,
+    error: Option<&str>,
+    expanded: bool,
+    pick: Pick,
+    content_width: usize,
+) -> Vec<PaintLine> {
+    let heading = side_panel_section_heading(title, expanded, content_width, pick);
+    if !expanded {
+        return vec![heading];
+    }
+    let mut lines = vec![heading];
+    match items {
+        Some(items) if !items.is_empty() => {
+            lines.extend(
+                items
+                    .iter()
+                    .map(|item| side_panel_integration_item_line(item, content_width)),
+            );
+            if error.is_some() {
+                lines.push(side_panel_integration_placeholder(
+                    "새로고침 실패",
+                    content_width,
+                ));
+            }
+        }
+        Some(_) if error.is_some() => lines.push(side_panel_integration_placeholder(
+            "현재 상태 미확인",
+            content_width,
+        )),
+        Some(_) => lines.push(side_panel_integration_placeholder("없음", content_width)),
+        None => lines.push(side_panel_integration_placeholder(
+            if error.is_some() {
+                "현재 상태 미확인"
+            } else {
+                "아직 확인하지 않음"
+            },
+            content_width,
+        )),
+    }
+    lines
+}
+
+fn side_panel_integration_item_line(item: &IntegrationItemView, content_width: usize) -> PaintLine {
+    let (prefix, prefix_tone) = match item.state {
+        IntegrationItemState::Active => ("● ", Tone::Success),
+        IntegrationItemState::Inactive => ("× ", Tone::Error),
+        IntegrationItemState::Pending => ("○ ", Tone::Warning),
+        IntegrationItemState::Unknown => ("· ", Tone::Muted),
+    };
+    let available = content_width.saturating_sub(UnicodeWidthStr::width(prefix));
+    let label = if item.detail.is_empty() {
+        item.name.clone()
+    } else {
+        format!("{}  {}", item.name, item.detail)
+    };
+    PaintLine {
+        prefix: prefix.to_owned(),
+        prefix_tone,
+        text: compact_right(&label, available),
+        tone: Tone::Plain,
+        ..PaintLine::plain("")
+    }
+}
+
+fn side_panel_integration_placeholder(text: &str, content_width: usize) -> PaintLine {
+    PaintLine {
+        prefix: "· ".to_owned(),
+        prefix_tone: Tone::Muted,
+        text: compact_right(text, content_width.saturating_sub(2)),
+        tone: Tone::Muted,
+        ..PaintLine::plain("")
+    }
 }
 
 fn format_plan_elapsed(elapsed: Duration) -> String {
@@ -6898,7 +7526,7 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
                     line,
                     Tone::UserPrompt,
                     false,
-                    width,
+                    width.saturating_sub(1),
                 )
             })
             .collect::<Vec<_>>();
@@ -8298,11 +8926,7 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
     let display_width = display_spans.len();
     let vibe_mode_span = PaintSpan {
         text: mode.vibe_mode.clone(),
-        tone: match mode.vibe_tone {
-            VibeTone::Off => Tone::Muted,
-            VibeTone::On => Tone::FastOn,
-            VibeTone::Super => Tone::VibeSuper,
-        },
+        tone: vibe_tone(mode.vibe_tone),
         bold: false,
     };
     let fast_label = if mode.fast_mode {
@@ -8451,6 +9075,9 @@ fn spans_width(spans: &[PaintSpan]) -> usize {
 /// palette has no ramp entry for.
 fn effort_tone(effort: &str) -> Option<Tone> {
     Some(match effort {
+        "Off" => vibe_tone(VibeTone::Off),
+        "On" => vibe_tone(VibeTone::On),
+        "Super Vibe" => vibe_tone(VibeTone::Super),
         "low" => Tone::EffortLow,
         "medium" => Tone::EffortMedium,
         "high" => Tone::EffortHigh,
@@ -8459,6 +9086,14 @@ fn effort_tone(effort: &str) -> Option<Tone> {
         "ultra" => Tone::EffortUltra,
         _ => return None,
     })
+}
+
+fn vibe_tone(vibe: VibeTone) -> Tone {
+    match vibe {
+        VibeTone::Off => Tone::Muted,
+        VibeTone::On => Tone::FastOn,
+        VibeTone::Super => Tone::VibeSuper,
+    }
 }
 
 fn rule_gap(width: usize) -> PaintSpan {
@@ -9050,6 +9685,11 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::StatusEffortMax => palette.status.effort_max,
         Tone::StatusEffortUltra => palette.status.effort_ultra,
         Tone::Border => palette.border,
+        Tone::SidePanelDivider => blend(
+            palette.hover_bg,
+            palette.foreground,
+            SIDE_PANEL_DIVIDER_BLEND,
+        ),
         Tone::Branch => palette.status.branch,
         Tone::LimitFiveHour => palette.status.five_hour,
         Tone::LimitWeekly => palette.status.weekly,
@@ -9125,15 +9765,15 @@ mod tests {
     use super::*;
 
     /// The panel takes a fixed slice of the right edge, leaves a gap in front of
-    /// it, and stops short of the terminal's autowrap cell.
+    /// it, and fills the terminal's last cell without printing into it directly.
     #[test]
-    fn side_panel_layout_keeps_a_gap_and_the_autowrap_guard() {
+    fn side_panel_layout_keeps_a_gap_and_reaches_the_right_edge() {
         let layout =
             side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
 
         assert_eq!(layout.panel_width, SIDE_PANEL_WIDTHS[0]);
         assert_eq!(layout.panel_left, layout.main_width + SIDE_PANEL_GAP);
-        assert_eq!(layout.panel_left + layout.panel_width, 99);
+        assert_eq!(layout.panel_left + layout.panel_width, 100);
         assert_eq!(layout.content_left(), layout.panel_left + 2);
         assert_eq!(layout.content_width(), SIDE_PANEL_WIDTHS[0] - 4);
     }
@@ -9142,10 +9782,7 @@ mod tests {
     /// rather than squeezing it behind the panel.
     #[test]
     fn a_narrow_terminal_refuses_to_open_the_side_panel() {
-        let smallest = (SIDE_PANEL_MIN_MAIN_WIDTH
-            + SIDE_PANEL_GAP
-            + SIDE_PANEL_WIDTHS[0]
-            + SIDE_PANEL_AUTOWRAP_GUARD) as u16;
+        let smallest = (SIDE_PANEL_MIN_MAIN_WIDTH + SIDE_PANEL_GAP + SIDE_PANEL_WIDTHS[0]) as u16;
 
         assert!(side_panel_layout(smallest - 1, SIDE_PANEL_WIDTHS[0]).is_none());
         assert_eq!(
@@ -9154,11 +9791,11 @@ mod tests {
         );
     }
 
-    /// A full-width row background must stop at the main width, and the panel's
-    /// own columns must carry no background at all — it is an outline, not a
-    /// filled surface.
+    /// A full-width transcript row stops before the gap, while every panel cell
+    /// carries the theme's flat surface colour without border glyphs.
     #[test]
-    fn a_bounded_row_leaves_the_side_panel_unfilled() {
+    fn a_bounded_row_leaves_the_gap_clear_and_fills_the_side_panel() {
+        theme::set_current(ThemeKind::Dark);
         let layout =
             side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
         let mut frame = CellFrame::new(100, 3);
@@ -9171,116 +9808,126 @@ mod tests {
         paint_side_panel_into_frame(&mut frame, layout, 3, &[], None);
 
         assert_eq!(frame.cell(layout.main_width, 0).style, CellStyle::plain());
-        assert_eq!(frame.cell(layout.panel_left, 0).style.background, None);
-        assert_eq!(frame.cell(99, 1).style.background, None);
-        assert_eq!(frame.cell(layout.panel_left, 0).glyph, "╭");
+        let background = Some(theme::palette().hover_bg);
+        assert_eq!(
+            frame.cell(layout.panel_left, 0).style.background,
+            background
+        );
         let right = layout.panel_left + layout.panel_width - 1;
-        assert_eq!(frame.cell(right, 0).glyph, "╮");
-        assert_eq!(frame.cell(layout.panel_left, 1).glyph, "│");
-        assert_eq!(frame.cell(right, 1).glyph, "│");
-        assert_eq!(frame.cell(layout.panel_left, 2).glyph, "╰");
-        assert_eq!(frame.cell(right, 2).glyph, "╯");
+        assert_eq!(frame.cell(right, 1).style.background, background);
+        assert_eq!(frame.cell(99, 1).style.background, background);
+        for row in 0..3 {
+            assert_eq!(frame.cell(layout.panel_left, row).glyph, " ");
+            assert_eq!(frame.cell(right, row).glyph, " ");
+        }
     }
 
-    /// The panel names its own toggle key on the top rule, tucked against the
-    /// right corner the same way the plan card's header names its own key.
+    /// The top inset is part of the same flat surface and contains no rule,
+    /// corner, caption, or shortcut hint.
     #[test]
-    fn the_side_panel_top_rule_names_its_own_toggle_key_on_the_right() {
+    fn the_side_panel_top_row_is_empty_background() {
         let layout =
             side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
         let mut frame = CellFrame::new(100, 3);
 
         paint_side_panel_into_frame(&mut frame, layout, 3, &[], None);
 
-        let hint_width = UnicodeWidthStr::width(SIDE_PANEL_TOGGLE_HINT);
-        let right = layout.panel_left + layout.panel_width - 1;
-        let hint_start = right - 1 - hint_width;
-        let hint: String = (0..hint_width)
-            .map(|offset| frame.cell(hint_start + offset, 0).glyph.clone())
-            .collect();
-        assert_eq!(hint, SIDE_PANEL_TOGGLE_HINT);
-        assert_eq!(frame.cell(hint_start, 0).style.background, None);
-        assert_eq!(frame.cell(hint_start - 1, 0).glyph, "─");
-        assert_eq!(frame.cell(right - 1, 0).glyph, "─");
+        for column in layout.panel_left..layout.panel_left + layout.panel_width {
+            let cell = frame.cell(column, 0);
+            assert_eq!(cell.glyph, " ");
+            assert_eq!(cell.style.background, Some(theme::palette().hover_bg));
+            assert_eq!(cell.style.foreground, None);
+        }
     }
 
-    /// The plan is framed by the card when the panel is shut and by the panel
-    /// when it is open, so both boxes must be drawn in the same colour — in every
-    /// theme, not just the one that happens to be selected.
     #[test]
-    fn the_side_panel_border_matches_the_plan_card_border_in_every_theme() {
-        let summary = PlanSummary {
-            explanation: None,
-            steps: vec![PlanStep {
-                text: "step".to_owned(),
-                status: PlanStepStatus::Completed,
-                started_at: None,
-                elapsed: None,
-            }],
-            expanded: true,
-            started_at: Instant::now(),
-            elapsed: None,
-        };
+    fn the_side_panel_places_a_subdued_divider_above_context() {
+        let layout =
+            side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
+        let mut frame = CellFrame::new(100, 4);
+        let footer = vec![
+            side_panel_divider(layout.content_width()),
+            PaintLine::plain("Context"),
+        ];
+
+        paint_side_panel_into_frame_with_footer(&mut frame, layout, 4, &[], None, &footer, None);
+
+        let context: String = (0..UnicodeWidthStr::width("Context"))
+            .map(|offset| frame.cell(layout.content_left() + offset, 2).glyph.clone())
+            .collect();
+        assert_eq!(context, "Context");
+        for column in layout.panel_left..layout.panel_left + layout.panel_width {
+            let cell = frame.cell(column, 1);
+            let in_content = (layout.content_left()
+                ..layout.content_left() + layout.content_width())
+                .contains(&column);
+            assert_eq!(cell.glyph, if in_content { "─" } else { " " });
+            assert_eq!(cell.style.background, Some(theme::palette().hover_bg));
+            assert_eq!(
+                cell.style.foreground,
+                in_content.then(|| tone_rgb(Tone::SidePanelDivider).unwrap())
+            );
+        }
+    }
+
+    /// Every theme supplies a readable secondary surface, and the docked panel
+    /// uses it from edge to edge without foreground border cells.
+    #[test]
+    fn the_side_panel_uses_each_themes_secondary_surface() {
         let layout =
             side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
 
         for theme in ThemeKind::ALL {
             theme::set_current(theme);
-            let card = fixed_plan_summary_lines(&summary, 80, 0.0, false, None);
-            let card_border = card
-                .iter()
-                .find_map(|line| line.text.starts_with('└').then_some(line.tone))
-                .expect("the card closes with its own bottom rule");
             let mut frame = CellFrame::new(100, 3);
             paint_side_panel_into_frame(&mut frame, layout, 3, &[], None);
 
-            let corner = frame.cell(layout.panel_left, 0);
-            assert_eq!(corner.glyph, "╭");
-            assert_eq!(
-                corner.style.foreground,
-                tone_rgb(card_border),
-                "{theme:?} paints the two borders differently"
-            );
+            let edge = frame.cell(layout.panel_left, 0);
+            assert_eq!(edge.glyph, " ");
+            assert_eq!(edge.style.foreground, None);
+            assert_eq!(edge.style.background, Some(theme::palette().hover_bg));
+        }
+        theme::set_current(ThemeKind::Dark);
+    }
+
+    #[test]
+    fn side_panel_dividers_are_softer_than_the_old_border_tone() {
+        let distance = |left: Rgb, right: Rgb| {
+            u16::from(left.0.abs_diff(right.0))
+                + u16::from(left.1.abs_diff(right.1))
+                + u16::from(left.2.abs_diff(right.2))
+        };
+
+        for theme in ThemeKind::ALL {
+            theme::set_current(theme);
+            let palette = theme::palette();
+            let divider = tone_rgb(Tone::SidePanelDivider).expect("divider color");
             assert!(
-                corner.style.foreground.is_some(),
-                "{theme:?} leaves the panel border without a colour"
+                distance(palette.hover_bg, divider) < distance(palette.hover_bg, palette.border)
             );
         }
         theme::set_current(ThemeKind::Dark);
     }
 
-    /// The panel is closed by its own toggle key, so its rule carries no close
-    /// mark and its interior carries no caption of its own.
+    /// An empty panel is one uninterrupted background rectangle.
     #[test]
-    fn the_side_panel_carries_no_close_mark_and_no_caption() {
+    fn the_empty_side_panel_carries_only_its_background() {
         let layout =
             side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
         let mut frame = CellFrame::new(100, 4);
 
         paint_side_panel_into_frame(&mut frame, layout, 4, &[], None);
 
-        let right = layout.panel_left + layout.panel_width - 1;
-        let hint_start = right - 1 - UnicodeWidthStr::width(SIDE_PANEL_TOGGLE_HINT);
-        for column in layout.panel_left + 1..hint_start {
-            assert_eq!(
-                frame.cell(column, 0).glyph,
-                "─",
-                "the top rule runs unbroken to its corner"
-            );
-        }
-        for row in 1..3 {
-            let interior: String = (layout.panel_left + 1..right)
-                .map(|column| frame.cell(column, row).glyph.clone())
-                .collect();
-            assert!(
-                interior.trim().is_empty(),
-                "the panel interior stays blank, found {interior:?}"
-            );
+        for row in 0..4 {
+            for column in layout.panel_left..layout.panel_left + layout.panel_width {
+                let cell = frame.cell(column, row);
+                assert_eq!(cell.glyph, " ");
+                assert_eq!(cell.style.background, Some(theme::palette().hover_bg));
+            }
         }
     }
 
-    /// Repainting a single animated row must restore that row's border cells, or
-    /// the spinner would punch a hole through the panel outline.
+    /// Repainting one animated row restores the same flat panel surface.
     #[test]
     fn a_single_row_repaint_redraws_that_row_of_the_side_panel() {
         let layout =
@@ -9295,12 +9942,19 @@ mod tests {
             None,
             Some(layout.main_width),
         );
-        paint_side_panel_row_into_frame(&mut row, layout, 0, 1, 30, &[], None);
+        paint_side_panel_row_into_frame(&mut row, layout, 0, 1, 30, &[], None, &[], None);
 
-        assert_eq!(row.cell(layout.panel_left, 0).style.background, None);
-        assert_eq!(row.cell(layout.panel_left, 0).glyph, "│");
+        assert_eq!(
+            row.cell(layout.panel_left, 0).style.background,
+            Some(theme::palette().hover_bg)
+        );
+        assert_eq!(row.cell(layout.panel_left, 0).glyph, " ");
         let right = layout.panel_left + layout.panel_width - 1;
-        assert_eq!(row.cell(right, 0).glyph, "│");
+        assert_eq!(row.cell(right, 0).glyph, " ");
+        assert_eq!(
+            row.cell(right, 0).style.background,
+            Some(theme::palette().hover_bg)
+        );
         assert_eq!(row.cell(layout.content_left(), 0).glyph, " ");
     }
 
@@ -9404,13 +10058,14 @@ mod tests {
     #[test]
     fn wrapped_user_prompt_repeats_its_border_on_every_row() {
         CHAT_LAYOUT.store(false, Ordering::Relaxed);
+        let width = 18;
         let lines = user_prompt_lines(
             &Block::new(
                 BlockKind::User,
                 "You",
                 "a prompt long enough to wrap across several rows",
             ),
-            18,
+            width,
         );
 
         let prompt_rows = lines
@@ -9419,6 +10074,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(prompt_rows.len() > 1);
         assert!(prompt_rows.iter().all(|line| line.prefix == "▌ "));
+        assert!(
+            prompt_rows
+                .iter()
+                .all(|line| painted_line_width(line) <= usize::from(width).saturating_sub(2))
+        );
     }
 
     #[test]
@@ -9902,6 +10562,19 @@ mod tests {
             painted(rows.last().expect("bottom rule")),
             "╰───────────────╯"
         );
+    }
+
+    #[test]
+    fn vertical_cursor_navigation_uses_wrapped_composer_rows_before_their_edges() {
+        let mut editor = Editor::default();
+        editor.set_text("abcdefghijkl");
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.set_composer_navigation_layout_for_test(&editor, 18);
+
+        assert_eq!(renderer.composer_vertical_cursor_position(12, -1), Some(4));
+        assert_eq!(renderer.composer_vertical_cursor_position(4, 1), Some(12));
+        assert_eq!(renderer.composer_vertical_cursor_position(4, -1), None);
+        assert_eq!(renderer.composer_vertical_cursor_position(12, 1), None);
     }
 
     #[test]
@@ -10828,25 +11501,101 @@ mod tests {
     }
 
     #[test]
-    fn update_banner_reserves_the_terminal_autowrap_column() {
+    fn update_card_uses_a_heading_and_one_row_per_item() {
         let block = Block::new(
             BlockKind::Update,
             "Update Available",
-            "New version 0.11.9 is available. Run: dvz update",
+            "첫 번째 안내\n두 번째 안내",
+        );
+        for width in [24u16, 80] {
+            let lines = block_lines(&block, width);
+
+            assert_eq!(lines.len(), 7);
+            assert!(painted(&lines[0]).starts_with("┌── Update Available "));
+            assert!(painted(&lines[0]).ends_with('┐'));
+            assert_eq!(
+                UnicodeWidthStr::width(painted(&lines[0]).as_str()),
+                width as usize - 1
+            );
+            assert!(lines[1].text.is_empty());
+            assert_eq!(lines[2].prefix, "  •  ");
+            assert_eq!(lines[2].text, "첫 번째 안내");
+            assert_eq!(lines[3].prefix, "  •  ");
+            assert_eq!(lines[3].text, "두 번째 안내");
+            assert!(lines[4].text.is_empty());
+            assert!(painted(&lines[5]).starts_with('└'));
+            assert!(painted(&lines[5]).ends_with('┘'));
+            assert_eq!(
+                UnicodeWidthStr::width(painted(&lines[5]).as_str()),
+                width as usize - 1
+            );
+            assert!(lines[6].text.is_empty());
+        }
+    }
+
+    #[test]
+    fn startup_tip_fits_its_longest_item_with_ten_right_padding_columns() {
+        let longest = "/side-panel (Alt + P): Toggle side panel";
+        let block = Block::new(
+            BlockKind::Update,
+            "Tip",
+            format!("/provider: Set provider\n{longest}\nShift + ↑↓ model · ←→ effort"),
         );
         let lines = block_lines(&block, 80);
+        let expected_width = UnicodeWidthStr::width(longest) + 15;
+        let longest_line = lines
+            .iter()
+            .find(|line| line.text == longest)
+            .expect("longest tip");
 
-        assert_eq!(lines.len(), 5);
-        assert!(lines[0].text.chars().all(|ch| ch == '─'));
-        assert_eq!(UnicodeWidthStr::width(lines[0].text.as_str()), 79);
-        assert_eq!(lines[0].text, lines[3].text);
-        assert_eq!(lines[1].prefix, "● ");
-        assert_eq!(lines[1].prefix_tone, Tone::Accent);
-        assert_eq!(lines[1].text, "Update Available");
-        assert!(lines[1].bold);
-        assert!(lines[2].text.contains("0.11.9"));
-        assert!(lines[2].text.ends_with("dvz update"));
-        assert!(lines[4].text.is_empty());
+        assert_eq!(UnicodeWidthStr::width(painted(&lines[0]).as_str()), expected_width);
+        assert_eq!(
+            UnicodeWidthStr::width(painted(&lines[lines.len() - 2]).as_str()),
+            expected_width
+        );
+        assert_eq!(
+            expected_width - UnicodeWidthStr::width(painted(longest_line).as_str()),
+            10
+        );
+
+        let narrow = block_lines(&block, 24);
+        assert_eq!(UnicodeWidthStr::width(painted(&narrow[0]).as_str()), 23);
+        assert_eq!(
+            UnicodeWidthStr::width(painted(&narrow[narrow.len() - 2]).as_str()),
+            23
+        );
+        assert!(narrow[2..narrow.len() - 2]
+            .iter()
+            .filter(|line| !painted(line).is_empty())
+            .all(|line| UnicodeWidthStr::width(painted(line).as_str()) <= 21));
+    }
+
+    #[test]
+    fn first_plan_removes_only_the_startup_tip() {
+        for mode in [RenderMode::Fullscreen, RenderMode::Inline] {
+            let startup = Block::new(BlockKind::Update, "Tip", "/provider");
+            let available = Block::new(
+                BlockKind::Update,
+                "Update Available",
+                "New version 1.3.13 is available.",
+            );
+            let answer = Block::new(BlockKind::Assistant, "Codex", "답변");
+            let mut renderer = Renderer::new(ThemeKind::Minimal, mode);
+            renderer.history = vec![startup, available, answer];
+            renderer.wrapped_width = 80;
+
+            assert!(renderer.remove_startup_update_from_history());
+            assert_eq!(
+                renderer
+                    .history
+                    .iter()
+                    .map(|block| block.title.as_str())
+                    .collect::<Vec<_>>(),
+                ["Update Available", "Codex"]
+            );
+            assert_eq!(renderer.wrapped_width, 0);
+            assert!(!renderer.remove_startup_update_from_history());
+        }
     }
 
     #[test]
@@ -12414,6 +13163,28 @@ mod tests {
         assert!(tones(&mode).contains(&("Vibe: On".to_owned(), Tone::VibeSuper)));
     }
 
+    #[test]
+    fn vibe_picker_steps_use_the_composer_vibe_tones() {
+        let expected = [Tone::Muted, Tone::FastOn, Tone::VibeSuper];
+
+        for (selected, tone) in expected.into_iter().enumerate() {
+            let slider = EffortSlider {
+                efforts: ["Off", "On", "Super Vibe"].map(ToOwned::to_owned).to_vec(),
+                selected,
+                detail: None,
+            };
+            let lines = effort_step_lines(&slider, 80);
+            assert_eq!(lines[0].tone, tone);
+            assert_eq!(lines[2].tone, tone);
+            assert!(
+                lines[1]
+                    .tail
+                    .iter()
+                    .any(|span| span.bold && span.tone == tone)
+            );
+        }
+    }
+
     /// Shell and diff readings live behind the vibe preset now, so the rule
     /// carries the view and the preset instead of one badge per reading.
     #[test]
@@ -12733,6 +13504,37 @@ mod tests {
     }
 
     #[test]
+    fn waiting_pulse_targets_only_the_latest_visible_response_bullet() {
+        let response = |text: &str| PaintLine {
+            prefix: "• ".to_owned(),
+            prefix_tone: Tone::FastOff,
+            text: text.to_owned(),
+            tone: Tone::Plain,
+            bold: false,
+            tool_heading: None,
+            pick: None,
+            tail: Vec::new(),
+        };
+        let transcript = vec![
+            response("older"),
+            PaintLine::blank(),
+            response("latest"),
+            PaintLine::blank(),
+        ];
+
+        assert_eq!(visible_response_bullet_row(&transcript, 2..4, 3), Some(3));
+        assert_eq!(visible_response_bullet_row(&transcript, 0..2, 0), None);
+        assert!(matches!(
+            waiting_response_bullet_tone(0.0),
+            Tone::Shimmer(_, 0)
+        ));
+        assert!(matches!(
+            waiting_response_bullet_tone(0.5),
+            Tone::Shimmer(_, 255)
+        ));
+    }
+
+    #[test]
     fn the_composer_holds_the_bottom_rows_at_every_scroll_position() {
         let transcript = text_rows(100, "t");
         let live = text_rows(3, "live");
@@ -12815,6 +13617,28 @@ mod tests {
         assert!(renderer.scroll(-100));
         assert_eq!(renderer.scroll_back, 0);
         assert!(!renderer.scroll(-1));
+    }
+
+    #[test]
+    fn prompt_jump_places_the_selected_block_at_the_top() {
+        let prompt = Block::new(BlockKind::User, "Codex", "selected prompt");
+        let prompt_id = prompt.id();
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.history = std::iter::once(prompt)
+            .chain(transcript_rows(12, "after"))
+            .collect();
+        renderer.last_width = 80;
+        renderer.last_transcript_rows = 4;
+        renderer.rewrap(80);
+
+        assert!(renderer.scroll_to_prompt(prompt_id));
+        let start = renderer
+            .wrapped
+            .len()
+            .saturating_sub(renderer.last_transcript_rows)
+            .saturating_sub(renderer.scroll_back);
+        assert_eq!(start, 0);
+        assert!(!renderer.scroll_to_prompt(u64::MAX));
     }
 
     #[test]
@@ -13806,6 +14630,35 @@ mod tests {
     }
 
     #[test]
+    fn opening_the_side_panel_hides_only_composer_context() {
+        let mut status = Some(StatusLineView {
+            model: Some("GPT-5.6 Codex".to_owned()),
+            effort: Some("xhigh".to_owned()),
+            context: Some("ctx: 164k/258k (63%)".to_owned()),
+            five_hour_percent: Some(14),
+            five_hour_remaining: Some("3h 6m".to_owned()),
+            weekly_percent: Some(27),
+            notice: None,
+        });
+
+        let footer = move_context_to_side_panel(&mut status, 44);
+        let line = status_line_row(status, "", 120);
+
+        assert!(painted(&line).contains("GPT-5.6 Codex"));
+        assert!(painted(&line).contains("◆ xhigh"));
+        assert!(!painted(&line).contains("ctx:"));
+        assert!(painted(&line).contains("3h 6m: 14%"));
+        assert!(painted(&line).contains("week: 27%"));
+        assert!(painted(&line).ends_with("Shift + ↑↓ model · ←→ effort"));
+        assert_eq!(footer.len(), 2);
+        assert_eq!(painted(&footer[0]), "─".repeat(44));
+        assert_eq!(footer[0].tone, Tone::SidePanelDivider);
+        assert!(painted(&footer[1]).starts_with("Context: "));
+        assert!(painted(&footer[1]).ends_with("164/258K (63%)"));
+        assert_eq!(footer[1].tail[0].tone, Tone::Model56);
+    }
+
+    #[test]
     fn status_line_places_the_five_hour_countdown_before_its_percent() {
         let line = status_line_row(
             Some(StatusLineView {
@@ -13937,15 +14790,15 @@ mod tests {
 
         assert_eq!(
             painted(&entering[0]),
-            " ⠹ Compacting.. [░░████░░░░░░░░░░░░░░] (4s)"
+            " ⠹ Compacting.. ░░████░░░░░░░░░░░░░░ (4s)"
         );
         assert_eq!(
             painted(&passing[0]),
-            " ⠴ Compacting.. [░░░░░░░░████░░░░░░░░] (4s)"
+            " ⠴ Compacting.. ░░░░░░░░████░░░░░░░░ (4s)"
         );
         assert_eq!(
             painted(&leaving[0]),
-            " ⠏ Compacting.. [░░░░░░░░░░░░░░░░░░██] (4s)"
+            " ⠏ Compacting.. ░░░░░░░░░░░░░░░░░░██ (4s)"
         );
 
         let narrow = activity_lines("Compacting.. (4s)", None, 0.5, 30);
@@ -13960,7 +14813,7 @@ mod tests {
 
         assert_eq!(
             painted(&line[0]),
-            " ⠋ Compacting.. [░░░░░░░░████░░░░░░░░] (4s)"
+            " ⠋ Compacting.. ░░░░░░░░████░░░░░░░░ (4s)"
         );
     }
 
@@ -14968,6 +15821,7 @@ mod tests {
                             .map(ToOwned::to_owned)
                             .to_vec(),
                         selected: 2,
+                        detail: None,
                     }),
                     hint: "Enter select".to_owned(),
                     style: OverlayStyle::Picker,
@@ -15047,6 +15901,7 @@ mod tests {
                 .map(ToOwned::to_owned)
                 .to_vec(),
             selected: 2,
+            detail: None,
         };
 
         let lines = effort_step_lines(&slider, 100);
@@ -15095,6 +15950,7 @@ mod tests {
                 .map(ToOwned::to_owned)
                 .to_vec(),
             selected: 2,
+            detail: None,
         };
 
         for width in [100, 40] {
@@ -15122,6 +15978,7 @@ mod tests {
         let slider = EffortSlider {
             efforts: ["low", "medium", "high"].map(ToOwned::to_owned).to_vec(),
             selected: 1,
+            detail: None,
         };
         let steps = effort_step_lines(&slider, 80).remove(1);
         let selected = "│ MEDIUM │";
@@ -15504,6 +16361,7 @@ mod tests {
                 slider: Some(EffortSlider {
                     efforts: ["low", "medium", "high"].map(ToOwned::to_owned).to_vec(),
                     selected: 1,
+                    detail: None,
                 }),
                 hint: "←→ to adjust".to_owned(),
                 style: OverlayStyle::Picker,
@@ -15540,6 +16398,7 @@ mod tests {
                 .map(ToOwned::to_owned)
                 .to_vec(),
             selected: 2,
+            detail: None,
         };
 
         let lines = effort_step_lines(&slider, 40);
@@ -15554,6 +16413,7 @@ mod tests {
                 &EffortSlider {
                     efforts: Vec::new(),
                     selected: 0,
+                    detail: None,
                 },
                 80,
             )
@@ -15565,6 +16425,7 @@ mod tests {
                 .map(ToOwned::to_owned)
                 .to_vec(),
             selected: 99,
+            detail: None,
         };
         let lines = effort_step_lines(&slider, 80);
         let selected = lines[1]
@@ -15658,9 +16519,9 @@ mod tests {
             signals,
             [
                 "\x1b]777;devez-layout-v1;141\x07",
-                "\x1b]777;devez-layout-v1;91\x07",
-                "\x1b]777;devez-layout-v1;79\x07",
-                "\x1b]777;devez-layout-v1;67\x07",
+                "\x1b]777;devez-layout-v1;92\x07",
+                "\x1b]777;devez-layout-v1;80\x07",
+                "\x1b]777;devez-layout-v1;68\x07",
                 "\x1b]777;devez-layout-v1;141\x07",
             ]
         );
@@ -15721,7 +16582,7 @@ mod tests {
     /// Inside the docked panel the plan drops its card chrome: a heading, one
     /// blank row, then the steps, all painted at the panel's own left inset.
     #[test]
-    fn the_side_panel_carries_the_plan_without_a_card_border() {
+    fn the_side_panel_carries_the_plan_on_a_flat_surface() {
         let summary = PlanSummary {
             explanation: None,
             steps: vec![
@@ -15754,7 +16615,11 @@ mod tests {
 
         // The total rides on the heading only once every step is done, the same
         // rule the card's own total line follows.
-        assert_eq!(painted(&content[0]), "작업 단계  1 / 3 완료");
+        assert_eq!(painted(&content[0]), "▲ 작업 단계  1 / 3 완료");
+        assert_eq!(
+            content[0].pick.as_ref().and_then(|picks| picks.at(0)),
+            Some(Pick::PlanSummary)
+        );
         assert!(content[1].text.is_empty());
         assert_eq!(content[2].prefix, "✔ ");
         assert_eq!(content[3].prefix, "▸ ");
@@ -15762,23 +16627,45 @@ mod tests {
         assert!(painted(&content[2]).starts_with("✔ 1. 첫 단계"));
         assert!(painted(&content[2]).ends_with("(0m 18s)"));
         assert!(painted(&content[3]).starts_with("▸ 2. 두 번째 단계"));
+        assert!(content[5] == PaintLine::blank());
+        assert_eq!(painted(&content[6]), "─".repeat(layout.content_width()));
+        assert_eq!(content[6].tone, Tone::SidePanelDivider);
         assert!(
             content
                 .iter()
                 .all(|line| !painted(line).contains('┌') && !painted(line).contains('└')),
-            "the panel draws the only border"
+            "the panel content has no card border"
         );
 
-        let mut frame = CellFrame::new(140, 8);
-        paint_side_panel_into_frame(&mut frame, layout, 8, &content, None);
+        let mut frame = CellFrame::new(140, 9);
+        paint_side_panel_into_frame(&mut frame, layout, 9, &content, None);
 
         let heading: String = (0..UnicodeWidthStr::width("작업 단계"))
-            .map(|offset| frame.cell(layout.content_left() + offset, 1).glyph.clone())
+            .map(|offset| {
+                frame
+                    .cell(layout.content_left() + 2 + offset, 1)
+                    .glyph
+                    .clone()
+            })
             .collect();
         assert_eq!(heading, "작업 단계");
         let right = layout.panel_left + layout.panel_width - 1;
-        assert_eq!(frame.cell(layout.panel_left, 1).glyph, "│");
-        assert_eq!(frame.cell(right, 1).glyph, "│");
+        for row in [1, 7] {
+            assert_eq!(frame.cell(layout.panel_left, row).glyph, " ");
+            assert_eq!(frame.cell(right, row).glyph, " ");
+            assert_eq!(
+                frame.cell(layout.panel_left, row).style.background,
+                Some(theme::palette().hover_bg)
+            );
+            assert_eq!(
+                frame.cell(right, row).style.background,
+                Some(theme::palette().hover_bg)
+            );
+        }
+        assert_eq!(
+            frame.cell(layout.content_left(), 7).style.foreground,
+            tone_rgb(Tone::SidePanelDivider)
+        );
 
         let finished = PlanSummary {
             steps: summary
@@ -15793,7 +16680,287 @@ mod tests {
             ..summary
         };
         let done = side_panel_plan_lines(&finished, layout.content_width(), 0.0, false);
-        assert_eq!(painted(&done[0]), "작업 단계  3 / 3 완료  (1m 25s)");
+        assert_eq!(painted(&done[0]), "▲ 작업 단계  3 / 3 완료  [⏱  1m 25s]");
+    }
+
+    #[test]
+    fn the_side_panel_lists_five_latest_prompts_with_requested_spacing() {
+        let prompts = (1..=7)
+            .map(|index| {
+                Block::new(
+                    BlockKind::User,
+                    "Codex",
+                    format!("prompt {index}\ncontinued"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = prompts
+            .iter()
+            .rev()
+            .take(SIDE_PANEL_PROMPT_LIMIT)
+            .map(Block::id)
+            .collect::<Vec<_>>();
+        let mut history = prompts;
+        history.push(Block::new(BlockKind::Assistant, "Codex", "latest response"));
+        let layout =
+            side_panel_layout(140, SIDE_PANEL_WIDTHS[0]).expect("140 columns carry the panel");
+
+        let lines = side_panel_prompt_lines(&history, layout.content_width(), true);
+
+        assert_eq!(painted(&lines[0]), "▲ Input Prompt");
+        assert_eq!(
+            lines[0].pick.as_ref().and_then(|picks| picks.at(0)),
+            Some(Pick::PromptSection)
+        );
+        assert!(lines[1].text.is_empty());
+        assert_eq!(lines.len(), 2 + SIDE_PANEL_PROMPT_LIMIT + 2);
+        for (offset, prompt_id) in expected.into_iter().enumerate() {
+            let line = &lines[offset + 2];
+            assert_eq!(
+                line.pick.as_ref().and_then(|picks| picks.at(0)),
+                Some(Pick::Prompt(prompt_id))
+            );
+            assert!(painted(line).contains(&format!("prompt {} continued", 7 - offset)));
+        }
+        assert!(lines[lines.len() - 2] == PaintLine::blank());
+        assert_eq!(
+            painted(lines.last().expect("prompt divider")),
+            "─".repeat(layout.content_width())
+        );
+        assert_eq!(
+            lines.last().expect("prompt divider").tone,
+            Tone::SidePanelDivider
+        );
+
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.side_panel = Some(layout);
+        renderer.side_panel_content = lines;
+        assert_eq!(
+            renderer.pick_at(layout.content_left() as u16, 3),
+            Some(Pick::Prompt(history[6].id()))
+        );
+    }
+
+    #[test]
+    fn side_panel_section_titles_collapse_to_their_heading_and_divider() {
+        let summary = PlanSummary {
+            explanation: None,
+            steps: vec![PlanStep {
+                text: "1. hidden step".to_owned(),
+                status: PlanStepStatus::Pending,
+                started_at: None,
+                elapsed: None,
+            }],
+            expanded: false,
+            started_at: Instant::now(),
+            elapsed: None,
+        };
+        let plan = side_panel_plan_lines(&summary, 44, 0.0, false);
+        let prompts = side_panel_prompt_lines(
+            &[Block::new(BlockKind::User, "Codex", "hidden prompt")],
+            44,
+            false,
+        );
+
+        assert_eq!(plan.len(), 3);
+        assert_eq!(painted(&plan[0]), "▼ 작업 단계  0 / 1 완료");
+        assert_eq!(
+            plan[0].pick.as_ref().and_then(|picks| picks.at(0)),
+            Some(Pick::PlanSummary)
+        );
+        assert!(plan[1] == PaintLine::blank());
+        assert_eq!(plan[2].tone, Tone::SidePanelDivider);
+        assert_eq!(prompts.len(), 3);
+        assert_eq!(painted(&prompts[0]), "▼ Input Prompt");
+        assert_eq!(
+            prompts[0].pick.as_ref().and_then(|picks| picks.at(0)),
+            Some(Pick::PromptSection)
+        );
+        assert!(prompts[1] == PaintLine::blank());
+        assert_eq!(prompts[2].tone, Tone::SidePanelDivider);
+    }
+
+    #[test]
+    fn clickable_side_panel_text_uses_a_subdued_hover_surface() {
+        let distance = |left: Rgb, right: Rgb| {
+            u16::from(left.0.abs_diff(right.0))
+                + u16::from(left.1.abs_diff(right.1))
+                + u16::from(left.2.abs_diff(right.2))
+        };
+        for theme in ThemeKind::ALL {
+            theme::set_current(theme);
+            let palette = theme::palette();
+            let hover = side_panel_hover_background();
+            let divider = tone_rgb(Tone::SidePanelDivider).expect("divider color");
+            assert_ne!(hover, palette.hover_bg);
+            assert!(distance(palette.hover_bg, hover) < distance(palette.hover_bg, divider));
+        }
+
+        theme::set_current(ThemeKind::Dark);
+        let layout =
+            side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
+        let heading = side_panel_section_heading("Input Prompt", true, 44, Pick::PromptSection);
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.side_panel = Some(layout);
+        renderer.side_panel_content = vec![heading.clone()];
+        renderer.previous_lines = vec![PaintLine::blank(); 3];
+        assert!(renderer.hover_at(layout.content_left() as u16, 1));
+        assert_eq!(renderer.hovered_pick, Some(Pick::PromptSection));
+
+        let mut frame = CellFrame::new(100, 3);
+        paint_side_panel_row_into_frame(
+            &mut frame,
+            layout,
+            1,
+            1,
+            3,
+            &[heading.clone()],
+            None,
+            &[],
+            Some(&Pick::PromptSection),
+        );
+        let heading_width = painted_line_width(&heading);
+        assert_eq!(
+            frame.cell(layout.content_left(), 1).style.background,
+            Some(side_panel_hover_background())
+        );
+        assert_eq!(
+            frame
+                .cell(layout.content_left() + heading_width, 1)
+                .style
+                .background,
+            Some(theme::palette().hover_bg)
+        );
+    }
+
+    #[test]
+    fn a_side_panel_prompt_uses_one_clickable_row_and_ellipsizes() {
+        let prompt = Block::new(
+            BlockKind::User,
+            "gpt-5.6-sol",
+            "첫 번째 긴 내용 두 번째 긴 내용 세 번째 긴 내용 네 번째 긴 내용",
+        );
+        let prompt_id = prompt.id();
+        let content_width = 16;
+
+        let lines = side_panel_prompt_lines(&[prompt], content_width, true);
+
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[2].prefix, "› ");
+        assert!(painted(&lines[2]).ends_with('…'));
+        assert_eq!(lines[2].prefix_tone, Tone::ModelSol);
+        assert_eq!(lines[2].tone, Tone::Plain);
+        assert_eq!(row_background(lines[2].tone), None);
+        assert_eq!(bubble_background(&lines[2]), None);
+        assert_eq!(
+            lines[2].pick.as_ref().and_then(|picks| picks.at(0)),
+            Some(Pick::Prompt(prompt_id))
+        );
+        assert!(painted_line_width(&lines[2]) <= content_width);
+        assert!(lines[3] == PaintLine::blank());
+        assert_eq!(lines[4].tone, Tone::SidePanelDivider);
+    }
+
+    #[test]
+    fn side_panel_integrations_use_reference_status_marks() {
+        let mut providers = vec![
+            ProviderIntegrationView {
+                provider: "Claude".to_owned(),
+                enabled: false,
+                active: false,
+                mcp_expanded: true,
+                plugins_expanded: true,
+                mcp: None,
+                plugins: None,
+                mcp_error: None,
+                plugin_error: None,
+            },
+            ProviderIntegrationView {
+                provider: "Codex".to_owned(),
+                enabled: true,
+                active: true,
+                mcp_expanded: true,
+                plugins_expanded: true,
+                mcp: Some(vec![
+                    IntegrationItemView {
+                        name: "context7".to_owned(),
+                        state: IntegrationItemState::Active,
+                        detail: "연결됨 · 도구 12".to_owned(),
+                    },
+                    IntegrationItemView {
+                        name: "figma".to_owned(),
+                        state: IntegrationItemState::Inactive,
+                        detail: "로그인 필요".to_owned(),
+                    },
+                    IntegrationItemView {
+                        name: "playwright".to_owned(),
+                        state: IntegrationItemState::Pending,
+                        detail: "연결 중".to_owned(),
+                    },
+                ]),
+                plugins: Some(vec![]),
+                mcp_error: None,
+                plugin_error: None,
+            },
+        ];
+
+        let lines = side_panel_integration_lines(&providers, 42, usize::MAX);
+
+        assert_eq!(painted(&lines[0]), "▸ Codex  사용 중");
+        assert_eq!(painted(&lines[1]), "▲ MCP");
+        assert_eq!(
+            lines[1].pick.as_ref().and_then(|picks| picks.at(0)),
+            Some(Pick::McpSection("Codex".to_owned()))
+        );
+        assert_eq!(painted(&lines[2]), "● context7  연결됨 · 도구 12");
+        assert_eq!(lines[2].prefix_tone, Tone::Success);
+        assert_eq!(painted(&lines[3]), "× figma  로그인 필요");
+        assert_eq!(lines[3].prefix_tone, Tone::Error);
+        assert_eq!(painted(&lines[4]), "○ playwright  연결 중");
+        assert_eq!(lines[4].prefix_tone, Tone::Warning);
+        assert!(lines.iter().any(|line| painted(line) == "▲ Plugin"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| painted(line) == "× Claude  연결 안 됨")
+        );
+
+        providers[1].mcp_expanded = false;
+        let collapsed = side_panel_integration_lines(&providers, 42, usize::MAX);
+        assert!(collapsed.iter().any(|line| painted(line) == "▼ MCP"));
+        assert!(!collapsed
+            .iter()
+            .any(|line| painted(line).contains("context7")));
+    }
+
+    #[test]
+    fn side_panel_integrations_fit_the_remaining_rows() {
+        let providers = vec![ProviderIntegrationView {
+            provider: "Codex".to_owned(),
+            enabled: true,
+            active: true,
+            mcp_expanded: true,
+            plugins_expanded: true,
+            mcp: Some(
+                (1..=6)
+                    .map(|index| IntegrationItemView {
+                        name: format!("server-{index}"),
+                        state: IntegrationItemState::Active,
+                        detail: "연결됨".to_owned(),
+                    })
+                    .collect(),
+            ),
+            plugins: Some(vec![]),
+            mcp_error: None,
+            plugin_error: None,
+        }];
+
+        let lines = side_panel_integration_lines(&providers, 30, 4);
+
+        assert_eq!(lines.len(), 4);
+        assert_eq!(painted(&lines[0]), "▸ Codex  사용 중");
+        assert_eq!(painted(&lines[1]), "▲ MCP");
+        assert!(painted(lines.last().expect("overflow marker")).starts_with("… +"));
     }
 
     /// A step wider than the panel keeps one row of its own and ends in an
@@ -15817,11 +16984,17 @@ mod tests {
             side_panel_layout(140, SIDE_PANEL_WIDTHS[0]).expect("140 columns carry the panel");
         let content = side_panel_plan_lines(&summary, layout.content_width(), 0.0, false);
 
-        let rows = &content[2..];
-        assert_eq!(rows.len(), 1, "one step keeps one row");
+        let rows = &content[2..content.len() - 2];
+        assert_eq!(rows.len(), 1, "one step keeps one row before the divider");
         assert!(painted(&rows[0]).ends_with('…'));
         assert!(painted_line_width(&rows[0]) <= layout.content_width());
         assert_eq!(rows[0].prefix, "  ");
+        assert!(content[content.len() - 2] == PaintLine::blank());
+        assert_eq!(
+            painted(content.last().unwrap()),
+            "─".repeat(layout.content_width())
+        );
+        assert_eq!(content.last().unwrap().tone, Tone::SidePanelDivider);
     }
 
     #[test]

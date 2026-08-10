@@ -386,6 +386,7 @@ fn claude_model(id: &str, display_name: &str, efforts: Value, is_default: bool) 
         "defaultReasoningEffort": default_effort,
         "supportedReasoningEfforts": efforts,
         "isDefault": is_default,
+        "supportsAutoMode": !id.ends_with("haiku"),
         "contextWindow": 200_000
     })
 }
@@ -540,6 +541,15 @@ mod tests {
     }
 
     #[test]
+    fn bridge_forwards_claude_permission_prompts_instead_of_auto_allowing_them() {
+        let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
+
+        assert!(bridge.contains("\"dontAsk\""));
+        assert!(bridge.contains("Forward every such request to the host"));
+        assert!(!bridge.contains("if (!permission.matchedAskRule && !planApproval)"));
+    }
+
+    #[test]
     fn malformed_user_input_request_recovers_only_the_safe_bridge_id() {
         let line = r#"{"id":"claude-host-42","method":"item/tool/requestUserInput","params":{"payload":"\u12"}}"#;
         assert_eq!(recover_user_input_request_id(line), Some("claude-host-42"));
@@ -565,7 +575,12 @@ mod tests {
                 .iter()
                 .filter_map(|model| model.get("model").and_then(Value::as_str))
                 .collect::<Vec<_>>(),
-            ["claude:fable", "claude:opus", "claude:sonnet", "claude:haiku"]
+            [
+                "claude:fable",
+                "claude:opus",
+                "claude:sonnet",
+                "claude:haiku"
+            ]
         );
         assert!(
             models

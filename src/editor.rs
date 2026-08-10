@@ -342,6 +342,16 @@ impl Editor {
     /// composer. A collapsed paste remains one unit even if a caller hands us
     /// an index from inside it.
     pub fn move_to_display_index(&mut self, index: usize) -> bool {
+        let changed =
+            self.move_to_display_index_preserving_history(index) || self.history_index.is_some();
+        self.leave_history();
+        changed
+    }
+
+    /// Moves to a painted cursor boundary without leaving prompt-history mode.
+    /// Arrow navigation uses this so moving inside a recalled multiline prompt
+    /// does not turn the recalled value into a new draft.
+    pub fn move_to_display_index_preserving_history(&mut self, index: usize) -> bool {
         let mut next = index.min(self.buffer.len());
         if let (Some(start), Some(end)) = (self.collapsed_paste_start, self.collapsed_paste_end)
             && next > start
@@ -353,8 +363,7 @@ impl Editor {
                 end
             };
         }
-        let changed = self.cursor != next || self.history_index.is_some();
-        self.leave_history();
+        let changed = self.cursor != next;
         self.cursor = next;
         changed
     }

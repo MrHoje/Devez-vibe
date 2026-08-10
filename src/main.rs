@@ -41,7 +41,10 @@ use futures_util::StreamExt;
 use integrations::{McpServerInfo, PluginCatalog, PluginDetail, PluginInfo, PluginScope};
 use paste::{BufferedText, BufferedTextTarget, ComposerInput, ComposerPasteBuffer, PasteBurst};
 use provider::{ProviderAuthKind, ProviderAuthRequest};
-use renderer::{BlockKind, Pick, RenderMode, Renderer, SelectionResult, TerminalSession, View};
+use renderer::{
+    BlockKind, Pick, RenderMode, Renderer, SIDE_PANEL_INTEGRATIONS_CONNECTED, SelectionResult,
+    TerminalSession, View,
+};
 use serde_json::{Value, json};
 use state::{
     AccountPlan, Action, AppState, DiffDisplayMode, LoginMethod, ModelInfo, SessionInfo,
@@ -243,6 +246,22 @@ async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
         models,
         &startup_model.model,
         Some(&startup_model.effort),
+    );
+    match server
+        .request("claude/permissions/status", json!({ "cwd": state.cwd }))
+        .await
+    {
+        Ok(status) => state.apply_claude_permission_status(&status),
+        Err(error) => state.push_notice(
+            BlockKind::Warning,
+            "Claude 권한 설정 조회 실패",
+            error.to_string(),
+        ),
+    }
+    state.push_notice(
+        BlockKind::Update,
+        "Tip",
+        "/provider: Set Claude Codex provider\n/side-panel: Choose side panel size\nAlt + P: Cycle side panel size\n/vibemode: Set Vibe mode\nShift + ↑↓ model · ←→ effort",
     );
     if fallback_to_claude {
         state.push_notice(
@@ -471,7 +490,13 @@ async fn await_thread(
                         ) {
                             Action::Tick(true)
                         } else {
-                            observe_composer_key(state, &mut composer_paste, key, Instant::now())
+                            observe_composer_key_with_scroll(
+                                state,
+                                renderer,
+                                &mut composer_paste,
+                                key,
+                                Instant::now(),
+                            )
                         }
                     }
                     Some(Ok(Event::Mouse(mouse))) => {
@@ -689,6 +714,7 @@ async fn choose_startup_session(
                 activity: None,
                 activity_model: None,
                 activity_phase: 0.0,
+                waiting_for_response: false,
                 activity_progress_phase: 0.0,
                 footer: "Resume a Codex session".to_owned(),
                 status_line: None,
@@ -698,6 +724,8 @@ async fn choose_startup_session(
                 shell_display_mode: ShellDisplayMode::Collapse,
                 diff_display_mode: DiffDisplayMode::Collapse,
                 side_panel_width: None,
+                side_panel_prompts_expanded: true,
+                side_panel_integrations: Vec::new(),
             },
         )?;
         match events.next().await {
@@ -816,14 +844,16 @@ async fn event_loop(
             draw(state, renderer)?;
             continue;
         }
-        let current_integration_key = (
-            state.thread_id.clone(),
-            state.cwd.clone(),
-            state.selected_model_name().to_owned(),
-        );
-        if integration_key.as_ref() != Some(&current_integration_key) {
-            integration_key = Some(current_integration_key);
-            integration_rx = Some(start_integration_refresh(server, state));
+        if SIDE_PANEL_INTEGRATIONS_CONNECTED {
+            let current_integration_key = (
+                state.thread_id.clone(),
+                state.cwd.clone(),
+                state.selected_model_name().to_owned(),
+            );
+            if integration_key.as_ref() != Some(&current_integration_key) {
+                integration_key = Some(current_integration_key);
+                integration_rx = Some(start_integration_refresh(server, state));
+            }
         }
         if indexed_cwd.as_deref() != Some(state.cwd.as_str()) {
             let cwd = state.cwd.clone();
@@ -968,6 +998,12 @@ async fn event_loop(
                 match server_event {
                     Some(ServerEvent::Notification { method, params }) => {
                         state.handle_notification(&method, &params);
+                        if matches!(
+                            method.as_str(),
+                            "mcpServer/oauthLogin/completed" | "mcpServer/startupStatus/updated"
+                        ) {
+                            integration_key = None;
+                        }
                         // Claude-only hand-off: this notification carries the SDK's
                         // fresh account usage at the end of every turn, and the host
                         // has no statusLine hook for us to ride on. Codex limits
@@ -1285,6 +1321,18 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
             state.toggle_plan_summary();
             Action::Tick(true)
         }
+        Pick::PromptSection => {
+            state.toggle_side_panel_prompts();
+            Action::Tick(true)
+        }
+        Pick::McpSection(provider) => {
+            state.toggle_side_panel_mcp(&provider);
+            Action::Tick(true)
+        }
+        Pick::PluginSection(provider) => {
+            state.toggle_side_panel_plugins(&provider);
+            Action::Tick(true)
+        }
         Pick::RemoveQueuedPrompt(index) => {
             state.remove_queued_prompt(index);
             Action::Tick(true)
@@ -1292,12 +1340,14 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
         Pick::OpenLink(target) => Action::OpenUrl(target),
         Pick::FastMode => Action::SetFast(!state.effective_fast_mode()),
         Pick::ClaudePermissionMode => {
-            Action::SetClaudePermissionMode(state.cycle_claude_permission_mode())
+            state.open_claude_permission_picker();
+            Action::None
         }
         Pick::Model => state.run_command("/model"),
         Pick::EffortSetting => state.run_command("/effort"),
         Pick::Subagent(index) => state.open_subagent(index),
         Pick::ScrollToBottom => Action::ScrollToBottom,
+        Pick::Prompt(block_id) => Action::ScrollToPrompt(block_id),
         Pick::Close => state.close_overlay(),
         Pick::Row(index) => state.click_overlay_row(index),
         Pick::Effort(step) => state.click_effort_step(step),
@@ -1407,6 +1457,7 @@ async fn execute_action(
         | Action::SetTheme(_)
         | Action::ClearScreen
         | Action::ScrollToBottom
+        | Action::ScrollToPrompt(_)
         | Action::Quit) => return execute_local_action(state, renderer, action),
         Action::Submit(text) => {
             renderer.scroll_to_bottom();
@@ -1484,6 +1535,87 @@ async fn execute_action(
         Action::SetClaudePermissionMode(mode) => {
             set_claude_permission_mode(server, state, mode).await;
         }
+        Action::DisableClaudeAutoMode => match server
+            .request(
+                "claude/permissions/auto-mode",
+                json!({ "cwd": state.cwd, "disabled": true }),
+            )
+            .await
+        {
+            Ok(status) => state.apply_claude_permission_policy(&status),
+            Err(error) => {
+                state.set_claude_auto_mode_disabled(false);
+                state.push_notice(
+                    BlockKind::Error,
+                    "Claude Auto mode 설정 실패",
+                    error.to_string(),
+                );
+            }
+        },
+        Action::OpenClaudePermissions(notice) => match server
+            .request("claude/permissions/status", json!({ "cwd": state.cwd }))
+            .await
+        {
+            Ok(status) => state.open_claude_permissions(&status, notice),
+            Err(error) => {
+                state.push_notice(BlockKind::Error, "Claude 권한 조회 실패", error.to_string())
+            }
+        },
+        Action::UpdateClaudePermission {
+            action,
+            behavior,
+            value,
+            destination,
+        } => match server
+            .request(
+                "claude/permissions/update",
+                json!({
+                    "cwd": state.cwd,
+                    "action": action,
+                    "behavior": behavior,
+                    "value": value,
+                    "destination": destination,
+                }),
+            )
+            .await
+        {
+            Ok(status) => state.open_claude_permissions(
+                &status,
+                Some(
+                    if action == "add" {
+                        "Claude 권한 규칙을 추가했습니다."
+                    } else {
+                        "Claude 권한 규칙을 제거했습니다."
+                    }
+                    .to_owned(),
+                ),
+            ),
+            Err(error) => state.push_notice(
+                BlockKind::Error,
+                "Claude 권한 규칙 변경 실패",
+                error.to_string(),
+            ),
+        },
+        Action::RetryClaudePermissionDenial { tool, input } => {
+            renderer.scroll_to_bottom();
+            if let Err(error) = server
+                .request(
+                    "claude/permissions/retry",
+                    json!({
+                        "threadId": state.thread_id,
+                        "tool": tool,
+                        "input": input,
+                    }),
+                )
+                .await
+            {
+                state.push_notice(
+                    BlockKind::Error,
+                    "Claude 권한 재시도 실패",
+                    error.to_string(),
+                );
+            }
+        }
         Action::PersistShellDisplayMode(mode) => {
             if let Err(error) = server
                 .request(
@@ -1510,6 +1642,21 @@ async fn execute_action(
                 state.push_notice(
                     BlockKind::Warning,
                     "Diff 표시 설정 저장 실패",
+                    error.to_string(),
+                );
+            }
+        }
+        Action::PersistSidePanelDefault(stage) => {
+            if let Err(error) = server
+                .request(
+                    "config/value/write",
+                    config_value_write_params("side_panel_stage", stage.config_value()),
+                )
+                .await
+            {
+                state.push_notice(
+                    BlockKind::Warning,
+                    "사이드패널 기본값 저장 실패",
                     error.to_string(),
                 );
             }
@@ -1685,9 +1832,15 @@ async fn execute_action(
         }
         Action::OpenMcp(notice) => match list_mcp_servers(server, &state.thread_id).await {
             Ok(response) => {
+                let model = state.selected_model_name().to_owned();
+                state.update_mcp_servers_for_model(&response, &model);
                 state.open_mcp_picker(McpServerInfo::list_from_value(&response), notice);
             }
-            Err(error) => state.push_notice(BlockKind::Error, "MCP 목록 실패", error.to_string()),
+            Err(error) => {
+                let model = state.selected_model_name().to_owned();
+                state.note_mcp_query_error_for_model(error.to_string(), &model);
+                state.push_notice(BlockKind::Error, "MCP 목록 실패", error.to_string());
+            }
         },
         Action::ReconnectMcp => {
             // `config/mcpServer/reload` re-reads the config and restarts every
@@ -1697,13 +1850,19 @@ async fn execute_action(
                     let notice = Some("재연결했습니다.".to_owned());
                     match list_mcp_servers(server, &state.thread_id).await {
                         Ok(response) => {
+                            let model = state.selected_model_name().to_owned();
+                            state.update_mcp_servers_for_model(&response, &model);
                             state.open_mcp_picker(McpServerInfo::list_from_value(&response), notice)
                         }
-                        Err(error) => state.push_notice(
-                            BlockKind::Warning,
-                            "재연결 후 조회 실패",
-                            error.to_string(),
-                        ),
+                        Err(error) => {
+                            let model = state.selected_model_name().to_owned();
+                            state.note_mcp_query_error_for_model(error.to_string(), &model);
+                            state.push_notice(
+                                BlockKind::Warning,
+                                "재연결 후 조회 실패",
+                                error.to_string(),
+                            );
+                        }
                     }
                 }
                 Err(error) => {
@@ -2176,13 +2335,25 @@ async fn execute_action(
             } else {
                 server.request("config/mcpServer/reload", json!({})).await
             };
-            let servers = match (&reconnect, using_claude) {
-                (Ok(_), false) => list_mcp_servers(server, &state.thread_id)
-                    .await
-                    .ok()
-                    .map(|response| McpServerInfo::list_from_value(&response)),
-                _ => None,
+            let mcp_response = if reconnect.is_ok() {
+                match list_mcp_servers(server, &state.thread_id).await {
+                    Ok(response) => Some(response),
+                    Err(error) => {
+                        let model = state.selected_model_name().to_owned();
+                        state.note_mcp_query_error_for_model(error.to_string(), &model);
+                        None
+                    }
+                }
+            } else {
+                None
             };
+            if let Some(response) = &mcp_response {
+                let model = state.selected_model_name().to_owned();
+                state.update_mcp_servers_for_model(response, &model);
+            }
+            let servers = (!using_claude)
+                .then(|| mcp_response.as_ref().map(McpServerInfo::list_from_value))
+                .flatten();
             let mut report = format_reload_report(
                 integrations.as_ref().err().map(ToString::to_string),
                 reconnect.as_ref().err().map(ToString::to_string),
@@ -2530,8 +2701,8 @@ enum Switched {
     Failed,
 }
 
-/// Wipes the screen, resumes `thread_id` behind the loading spinner, and restores
-/// its history. Shared by `/resume` and the return from a side conversation.
+/// Clears to a named loading screen while `thread_id` and its complete history
+/// load. Shared by `/resume` and the return from a side conversation.
 async fn resume_into_state(
     server: &BackendServer,
     state: &mut AppState,
@@ -2658,8 +2829,9 @@ fn abandon_thread_switch(
     state.set_request_failed(message);
 }
 
-/// Tail shared by `/new` and `/resume`: paint the bound session, reload the
-/// catalogues, then send whatever was typed during the wait.
+/// Tail shared by `/new` and `/resume`: finish deferred settings, replace the
+/// loading screen with the bound session, then send whatever was typed during
+/// the wait.
 async fn finish_thread_switch(
     server: &BackendServer,
     state: &mut AppState,
@@ -2677,7 +2849,7 @@ async fn finish_thread_switch(
 
 /// Commits mode clicks made while a new session had no id yet. Their local value
 /// was already visible and will be used by any queued first prompt; this only
-/// synchronizes the new thread and the saved default once both are addressable.
+/// synchronizes the new thread once it is addressable.
 async fn apply_deferred_startup_actions(server: &BackendServer, state: &mut AppState) {
     for action in state.take_deferred_startup_actions() {
         match action {
@@ -2861,6 +3033,9 @@ fn execute_local_action(
         Action::ScrollToBottom => {
             renderer.scroll_to_bottom();
         }
+        Action::ScrollToPrompt(block_id) => {
+            renderer.scroll_to_prompt(block_id);
+        }
         // `Action::None`, `Action::Tick`, and anything routed here by mistake: the
         // callers only ever pass the variants above, so silently doing nothing is
         // safer than panicking inside the render loop.
@@ -2916,27 +3091,31 @@ async fn set_claude_permission_mode(
     state: &mut AppState,
     mode: state::ClaudePermissionMode,
 ) {
-    if let Err(error) = server
+    let response = server
         .request(
             "thread/permissionMode/set",
             json!({ "threadId": state.thread_id, "permissionMode": mode.wire() }),
         )
-        .await
-    {
-        state.push_notice(BlockKind::Warning, "권한 모드 전환 실패", error.to_string());
-    }
-    if let Err(error) = server
-        .request(
-            "config/value/write",
-            config_value_write_params(state::CLAUDE_PERMISSION_MODE_KEY, mode.wire()),
-        )
-        .await
-    {
-        state.push_notice(
-            BlockKind::Warning,
-            "권한 모드 기본값 저장 실패",
-            error.to_string(),
-        );
+        .await;
+    match response {
+        Ok(response) => {
+            let effective = response
+                .get("permissionMode")
+                .and_then(Value::as_str)
+                .and_then(state::ClaudePermissionMode::from_wire)
+                .unwrap_or(mode);
+            state.set_claude_permission_mode(effective);
+            if let Some(rejection) = response.get("rejection").and_then(Value::as_str) {
+                state.push_notice(
+                    BlockKind::Warning,
+                    "권한 모드 전환 거부",
+                    rejection.to_owned(),
+                );
+            }
+        }
+        Err(error) => {
+            state.push_notice(BlockKind::Warning, "권한 모드 전환 실패", error.to_string());
+        }
     }
 }
 
@@ -3486,26 +3665,33 @@ fn format_upgrade_result(response: &Value) -> String {
 }
 
 struct IntegrationCatalog {
+    model: String,
     skills: std::result::Result<Value, String>,
     plugins: std::result::Result<Value, String>,
     apps: std::result::Result<Value, String>,
+    mcp: std::result::Result<Value, String>,
 }
 
 async fn fetch_integrations(
     client: Option<IntegrationClient>,
+    model: String,
     cwd: String,
     app_thread_id: Option<String>,
+    mcp_thread_id: Option<String>,
     force_reload: bool,
 ) -> IntegrationCatalog {
     let Some(client) = client else {
         return IntegrationCatalog {
+            model,
             skills: Ok(json!({ "data": [] })),
             plugins: Ok(json!({ "data": [] })),
             apps: Ok(json!({ "data": [] })),
+            mcp: Ok(json!({ "data": [] })),
         };
     };
     let skills_client = client.clone();
     let plugins_client = client.clone();
+    let mcp_client = client.clone();
     let apps = async {
         let Some(thread_id) = app_thread_id else {
             return Ok(json!({ "data": [] }));
@@ -3522,7 +3708,25 @@ async fn fetch_integrations(
             )
             .await
     };
-    let (skills, plugins, apps) = tokio::join!(
+    let mcp = async {
+        let Some(thread_id) = mcp_thread_id else {
+            return Ok(json!({
+                "data": [],
+                "unavailableReason": "provider 세션이 아직 시작되지 않았습니다."
+            }));
+        };
+        mcp_client
+            .request(
+                "mcpServerStatus/list",
+                json!({
+                    "threadId": thread_id,
+                    "detail": "toolsAndAuthOnly",
+                    "limit": 100
+                }),
+            )
+            .await
+    };
+    let (skills, plugins, apps, mcp) = tokio::join!(
         skills_client.request(
             "skills/list",
             json!({
@@ -3539,27 +3743,44 @@ async fn fetch_integrations(
             }),
         ),
         apps,
+        mcp,
     );
     IntegrationCatalog {
+        model,
         skills: skills.map_err(|error| error.to_string()),
         plugins: plugins.map_err(|error| error.to_string()),
         apps: apps.map_err(|error| error.to_string()),
+        mcp: mcp.map_err(|error| error.to_string()),
     }
 }
 
 fn apply_integrations(state: &mut AppState, catalog: IntegrationCatalog) -> Result<()> {
+    let model = catalog.model;
+    let is_current_provider = state.is_selected_provider_model(&model);
     let mut errors = Vec::new();
     match catalog.skills {
-        Ok(response) => state.update_skills(&response),
+        Ok(response) if is_current_provider => state.update_skills(&response),
+        Ok(_) => {}
         Err(error) => errors.push(format!("Skill 조회 실패: {error}")),
     }
     match catalog.plugins {
-        Ok(response) => state.update_plugins(&response),
-        Err(error) => errors.push(format!("플러그인 조회 실패: {error}")),
+        Ok(response) => state.update_plugins_for_model(&response, &model),
+        Err(error) => {
+            state.note_plugin_query_error_for_model(&error, &model);
+            errors.push(format!("플러그인 조회 실패: {error}"));
+        }
     }
     match catalog.apps {
-        Ok(response) => state.update_apps(&response),
+        Ok(response) if is_current_provider => state.update_apps(&response),
+        Ok(_) => {}
         Err(error) => errors.push(format!("App 조회 실패: {error}")),
+    }
+    match catalog.mcp {
+        Ok(response) => state.update_mcp_servers_for_model(&response, &model),
+        Err(error) => {
+            state.note_mcp_query_error_for_model(&error, &model);
+            errors.push(format!("MCP 조회 실패: {error}"));
+        }
     }
     if errors.is_empty() {
         Ok(())
@@ -3619,11 +3840,15 @@ fn start_integration_refresh(
     server: &BackendServer,
     state: &AppState,
 ) -> mpsc::Receiver<IntegrationCatalog> {
+    let model = state.selected_model_name().to_owned();
     let app_thread_id = integration_app_thread_id(server, state);
+    let mcp_thread_id = integration_mcp_thread_id(server, state);
     start_background_catalogue(fetch_integrations(
-        server.integration_client(state.selected_model_name()),
+        server.integration_client(&model),
+        model,
         state.cwd.clone(),
         app_thread_id,
+        mcp_thread_id,
         false,
     ))
 }
@@ -3646,11 +3871,15 @@ async fn refresh_integrations(
     state: &mut AppState,
     force_reload: bool,
 ) -> Result<()> {
+    let model = state.selected_model_name().to_owned();
     let app_thread_id = integration_app_thread_id(server, state);
+    let mcp_thread_id = integration_mcp_thread_id(server, state);
     let catalog = fetch_integrations(
-        server.integration_client(state.selected_model_name()),
+        server.integration_client(&model),
+        model,
         state.cwd.clone(),
         app_thread_id,
+        mcp_thread_id,
         force_reload,
     )
     .await;
@@ -4156,10 +4385,11 @@ fn apply_composer_inputs_with_scroll(
     let mut action = Action::None;
     for input in inputs {
         action = match input {
-            ComposerInput::Key(key) => match scroll_request(renderer, &key) {
-                Some(delta) => Action::Tick(renderer.scroll(delta)),
-                None => state.handle_key(key),
-            },
+            ComposerInput::Key(key) => composer_vertical_move(state, renderer, &key)
+                .unwrap_or_else(|| match scroll_request(renderer, &key) {
+                    Some(delta) => Action::Tick(renderer.scroll(delta)),
+                    None => state.handle_key(key),
+                }),
             ComposerInput::Text(text) => {
                 apply_composer_text(state, text);
                 Action::None
@@ -4167,6 +4397,39 @@ fn apply_composer_inputs_with_scroll(
         };
     }
     action
+}
+
+fn integration_mcp_thread_id(server: &BackendServer, state: &AppState) -> Option<String> {
+    if claude::is_claude_model(state.selected_model_name()) {
+        Some(state.thread_id.clone())
+    } else {
+        server.codex_thread_id(&state.thread_id)
+    }
+}
+
+fn composer_vertical_move(
+    state: &mut AppState,
+    renderer: &Renderer,
+    key: &KeyEvent,
+) -> Option<Action> {
+    if state.has_pending_interaction()
+        || key.modifiers.intersects(
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT | KeyModifiers::SUPER,
+        )
+    {
+        return None;
+    }
+    let delta = match key.code {
+        KeyCode::Up => -1,
+        KeyCode::Down => 1,
+        _ => return None,
+    };
+    let target =
+        renderer.composer_vertical_cursor_position(state.editor.display_cursor(), delta)?;
+    state
+        .editor
+        .move_to_display_index_preserving_history(target);
+    Some(Action::None)
 }
 
 fn observe_composer_key_with_scroll(
@@ -4872,6 +5135,59 @@ mod tests {
     }
 
     #[test]
+    fn clicking_a_recent_prompt_requests_its_transcript_jump() {
+        let mut state = starting_state();
+
+        assert!(matches!(
+            pick_action(&mut state, Pick::Prompt(42)),
+            Action::ScrollToPrompt(42)
+        ));
+    }
+
+    #[test]
+    fn clicking_the_prompt_section_title_toggles_its_rows() {
+        let mut state = starting_state();
+        assert!(state.view().side_panel_prompts_expanded);
+
+        assert!(matches!(
+            pick_action(&mut state, Pick::PromptSection),
+            Action::Tick(true)
+        ));
+        assert!(!state.view().side_panel_prompts_expanded);
+
+        pick_action(&mut state, Pick::PromptSection);
+        assert!(state.view().side_panel_prompts_expanded);
+    }
+
+    #[test]
+    fn clicking_integration_section_titles_toggles_their_rows() {
+        let mut state = starting_state();
+        let codex = || "Codex".to_owned();
+
+        assert!(state
+            .view()
+            .side_panel_integrations
+            .iter()
+            .find(|view| view.provider == "Codex")
+            .is_some_and(|view| view.mcp_expanded && view.plugins_expanded));
+
+        assert!(matches!(
+            pick_action(&mut state, Pick::McpSection(codex())),
+            Action::Tick(true)
+        ));
+        assert!(matches!(
+            pick_action(&mut state, Pick::PluginSection(codex())),
+            Action::Tick(true)
+        ));
+        assert!(state
+            .view()
+            .side_panel_integrations
+            .iter()
+            .find(|view| view.provider == "Codex")
+            .is_some_and(|view| !view.mcp_expanded && !view.plugins_expanded));
+    }
+
+    #[test]
     fn clicking_a_markdown_link_requests_the_platform_handler() {
         let mut state = starting_state();
 
@@ -4914,6 +5230,7 @@ mod tests {
                 is_default: true,
                 context_window: None,
                 fast_service_tier: Some("priority".to_owned()),
+                supports_auto_mode: false,
             }],
             "gpt-5.6-sol",
             None,
@@ -4935,6 +5252,7 @@ mod tests {
             is_default,
             context_window: None,
             fast_service_tier: None,
+            supports_auto_mode: false,
         }
     }
 
@@ -5000,6 +5318,33 @@ mod tests {
         assert_eq!(state.selected_model_name(), "gpt-5.6-terra");
     }
 
+    #[test]
+    fn up_moves_through_wrapped_composer_rows_before_recalling_history() {
+        let mut state = starting_state();
+        state.editor.set_text("remembered prompt");
+        state.editor.take_for_submit();
+        state.editor.set_text("abcdefghijkl");
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.set_composer_navigation_layout_for_test(&state.editor, 18);
+
+        apply_composer_inputs_with_scroll(
+            &mut state,
+            &mut renderer,
+            vec![ComposerInput::Key(press(KeyCode::Up, KeyModifiers::NONE))],
+        );
+        assert_eq!(state.editor.text(), "abcdefghijkl");
+        assert_eq!(state.editor.display_cursor(), 4);
+        assert_eq!(state.editor.history_position(), None);
+
+        apply_composer_inputs_with_scroll(
+            &mut state,
+            &mut renderer,
+            vec![ComposerInput::Key(press(KeyCode::Up, KeyModifiers::NONE))],
+        );
+        assert_eq!(state.editor.text(), "remembered prompt");
+        assert!(state.editor.history_position().is_some());
+    }
+
     /// Alt+P steps the panel through its widths and wraps closed on the
     /// fourth press, without ever leaving a stray letter in the composer.
     #[test]
@@ -5047,10 +5392,10 @@ mod tests {
         assert!(state.editor.text().is_empty());
     }
 
-    /// The slash command is the discoverable way in, so it must cycle the same
-    /// panel state the chord does.
+    /// The slash command opens a size picker, then asks whether the selection
+    /// belongs to this session or becomes the default.
     #[test]
-    fn the_side_panel_slash_command_cycles_the_panel() {
+    fn the_side_panel_slash_command_picks_a_size_and_scope() {
         let mut state = AppState::new(
             String::new(),
             ".".to_owned(),
@@ -5064,12 +5409,23 @@ mod tests {
         }
 
         state.run_slash_command("/side-panel");
-        assert_eq!(state.side_panel_stage(), state::SidePanelStage::Small);
+        let picker = state.view().overlay.expect("side-panel picker");
+        assert_eq!(picker.title, "Side panel");
+        assert_eq!(
+            picker.slider.expect("size choices").efforts,
+            ["Off", "Small", "Medium", "Large"]
+        );
 
-        state.run_slash_command("/side-panel");
-        state.run_slash_command("/side-panel");
-        state.run_slash_command("/side-panel");
-        assert_eq!(state.side_panel_stage(), state::SidePanelStage::Closed);
+        state.handle_key(press(KeyCode::Right, KeyModifiers::NONE));
+        state.handle_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            state.view().overlay.map(|overlay| overlay.title),
+            Some("Apply to".to_owned())
+        );
+
+        state.handle_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(state.side_panel_stage(), state::SidePanelStage::Small);
+        assert!(state.view().overlay.is_none());
     }
 
     #[test]
@@ -5482,16 +5838,18 @@ mod tests {
         let error = apply_integrations(
             &mut state,
             IntegrationCatalog {
+                model: "gpt-5.6-sol".to_owned(),
                 skills: Err("skills offline".to_owned()),
                 plugins: Err("plugins offline".to_owned()),
                 apps: Err("apps offline".to_owned()),
+                mcp: Err("mcp offline".to_owned()),
             },
         )
-        .expect_err("all three catalogue requests failed");
+        .expect_err("all four catalogue requests failed");
 
         assert_eq!(
             error.to_string(),
-            "Skill 조회 실패: skills offline; 플러그인 조회 실패: plugins offline; App 조회 실패: apps offline"
+            "Skill 조회 실패: skills offline; 플러그인 조회 실패: plugins offline; App 조회 실패: apps offline; MCP 조회 실패: mcp offline"
         );
     }
 
@@ -6534,10 +6892,10 @@ mod tests {
         );
     }
 
-    /// `/resume` wipes the same way, minus the welcome card — the restored history
-    /// is what fills the screen, so a panel that flashed and vanished would be noise.
+    /// `/resume` keeps the previous transcript painted and names the wait until
+    /// the replacement history is ready for one final screen swap.
     #[test]
-    fn resume_clears_the_screen_before_the_wait_begins() {
+    fn resume_wait_shows_a_loading_state_before_history_arrives() {
         let mut state = starting_state();
         state.attach_thread("thread-1".to_owned(), ".".to_owned(), "gpt-5.6-sol", None);
         state.handle_paste("old prompt");
@@ -6545,6 +6903,7 @@ mod tests {
 
         state.prepare_resume();
         state.begin_thread_switch();
+        state.set_host_loading(true);
 
         assert!(state.thread_pending());
         assert!(!state.busy);
@@ -6553,7 +6912,7 @@ mod tests {
         let view = state.view();
         assert!(view.welcome.is_none());
         assert!(view.status_line.is_some(), "the status line stays painted");
-        assert_eq!(view.activity, None, "the wait is silent");
+        assert_eq!(view.activity.as_deref(), Some("Loading session.."));
     }
 
     /// A failed switch must not strand the UI pending against a thread that will

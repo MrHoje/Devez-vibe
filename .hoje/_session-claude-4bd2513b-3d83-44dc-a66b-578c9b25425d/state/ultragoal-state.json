@@ -1,0 +1,17 @@
+{
+  "skill": "ultragoal",
+  "version": 1,
+  "session_id": "claude-4bd2513b-3d83-44dc-a66b-578c9b25425d",
+  "current_phase": "created",
+  "active": true,
+  "plan_path": "C:\\Source\\devezVibe\\.hoje\\_session-claude-4bd2513b-3d83-44dc-a66b-578c9b25425d\\ultragoal\\goals.json",
+  "intensity": "standard",
+  "state_revision": 1,
+  "updated_at": "2026-08-06T15:45:57.162Z",
+  "content_sha256": {
+    "algorithm": "sha256",
+    "value": "1a746ced25e046533ab9ce42b99851a6607fadafba0a4e894deb4ee89e3efcb8",
+    "covered_path": "C:\\Source\\devezVibe\\.hoje\\_session-claude-4bd2513b-3d83-44dc-a66b-578c9b25425d\\state\\ultragoal-state.json",
+    "computed_at": "2026-08-06T15:45:57.162Z"
+  }
+}

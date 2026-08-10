@@ -3,16 +3,18 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createReadStream } from "node:fs";
-import { readdir, readFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import {
   deleteSession,
   forkSession,
   getSessionInfo,
   getSessionMessages,
+  filterEscalatingDefaultMode,
   listSessions,
+  resolveSettings,
   startup,
 } from "@anthropic-ai/claude-agent-sdk";
 
@@ -182,6 +184,7 @@ function catalogEntry(model, defaultResolvedModel) {
     displayName: compactClaudeModelName(model),
     defaultReasoningEffort: efforts.includes("high") ? "high" : efforts.at(-1) || "",
     supportedReasoningEfforts: efforts.map((reasoningEffort) => ({ reasoningEffort })),
+    supportsAutoMode: Boolean(model.supportsAutoMode),
     isDefault: Boolean(defaultResolvedModel) && resolved === defaultResolvedModel,
     ...(contextWindow > 0 ? { contextWindow } : {}),
   };
@@ -295,7 +298,14 @@ function adoptSessionId(session, incoming) {
   });
 }
 
-const PERMISSION_MODES = ["default", "acceptEdits", "plan", "auto", "bypassPermissions"];
+const PERMISSION_MODES = [
+  "default",
+  "acceptEdits",
+  "plan",
+  "auto",
+  "dontAsk",
+  "bypassPermissions",
+];
 
 function permissionMode(requested, fallback = "default") {
   const mode = String(requested || "");
@@ -306,17 +316,161 @@ function permissionMode(requested, fallback = "default") {
 // disables bypass, say — leaves the session on the one it already had.
 async function applyPermissionMode(session, requested) {
   const mode = permissionMode(requested, session.permissionMode || "default");
-  if (mode === session.permissionMode) return;
+  if (mode === session.permissionMode) return null;
   try {
     await session.query.setPermissionMode(mode);
     session.permissionMode = mode;
+    return null;
   } catch (error) {
-    notify("claude/permissionMode/rejected", {
-      threadId: visibleSession(session.id),
-      permissionMode: mode,
-      message: error?.message || String(error),
-    });
+    return error?.message || String(error);
   }
+}
+
+async function claudePermissionStatus(params) {
+  const resolved = await resolveSettings({
+    cwd: params.cwd || process.cwd(),
+    settingSources: ["user", "project", "local"],
+  });
+  const effective = filterEscalatingDefaultMode(resolved);
+  const permissions = effective.permissions || {};
+  const bypassAccepted = effective.skipDangerousModePermissionPrompt === true
+    || effective.bypassPermissionsModeAccepted === true;
+  const bypassAvailable = permissions.disableBypassPermissionsMode !== "disable" && bypassAccepted;
+  const autoDisabled = effective.disableAutoMode === "disable";
+  let defaultMode = permissionMode(permissions.defaultMode);
+  if ((defaultMode === "bypassPermissions" && !bypassAvailable)
+      || (defaultMode === "auto" && autoDisabled)) defaultMode = "default";
+  const rules = [];
+  const directories = [];
+  for (const source of resolved.sources) {
+    const sourcePermissions = source.settings?.permissions || {};
+    for (const behavior of ["allow", "ask", "deny"]) {
+      for (const rule of Array.isArray(sourcePermissions[behavior])
+        ? sourcePermissions[behavior]
+        : []) {
+        rules.push({
+          behavior,
+          rule: String(rule),
+          source: source.source,
+          path: source.path || null,
+          mutable: ["user", "project", "local"].includes(source.source),
+        });
+      }
+    }
+    for (const directory of Array.isArray(sourcePermissions.additionalDirectories)
+      ? sourcePermissions.additionalDirectories
+      : []) {
+      directories.push({
+        directory: String(directory),
+        source: source.source,
+        path: source.path || null,
+        mutable: ["user", "project", "local"].includes(source.source),
+      });
+    }
+  }
+  const denials = [...sessions.values()]
+    .filter((session) => session.cwd === (params.cwd || process.cwd()))
+    .flatMap((session) => session.permissionDenials || [])
+    .slice(-20)
+    .reverse();
+  return {
+    defaultMode,
+    bypassAvailable,
+    autoDisabled,
+    rulesLocked: effective.allowManagedPermissionRulesOnly === true,
+    rules,
+    directories,
+    denials,
+  };
+}
+
+function permissionSettingsPath(cwd, destination) {
+  if (destination === "user") {
+    return join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "settings.json");
+  }
+  if (destination === "project") return join(cwd, ".claude", "settings.json");
+  if (destination === "local") return join(cwd, ".claude", "settings.local.json");
+  throw new Error(`지원하지 않는 Claude 권한 설정 범위: ${destination}`);
+}
+
+async function updateClaudePermission(params) {
+  const cwd = params.cwd || process.cwd();
+  const status = await claudePermissionStatus({ cwd });
+  if (status.rulesLocked) {
+    throw new Error("관리 정책에서 사용자·프로젝트 권한 규칙 변경을 비활성화했습니다.");
+  }
+  const destination = String(params.destination || "project");
+  const path = permissionSettingsPath(cwd, destination);
+  let settings = {};
+  try {
+    settings = JSON.parse(await readFile(path, "utf8"));
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) settings = {};
+  if (!settings.permissions || typeof settings.permissions !== "object"
+      || Array.isArray(settings.permissions)) settings.permissions = {};
+
+  const action = String(params.action || "");
+  const behavior = String(params.behavior || "");
+  const key = behavior === "directory" ? "additionalDirectories" : behavior;
+  if (!["allow", "ask", "deny", "additionalDirectories"].includes(key)) {
+    throw new Error(`지원하지 않는 Claude 권한 규칙 종류: ${behavior}`);
+  }
+  const value = String(params.value || "").trim();
+  if (!value) throw new Error("빈 Claude 권한 규칙은 저장할 수 없습니다.");
+  const values = Array.isArray(settings.permissions[key])
+    ? settings.permissions[key].map(String)
+    : [];
+  if (action === "add" && !values.includes(value)) values.push(value);
+  else if (action === "remove") {
+    const index = values.indexOf(value);
+    if (index >= 0) values.splice(index, 1);
+  } else if (action !== "add") {
+    throw new Error(`지원하지 않는 Claude 권한 규칙 작업: ${action}`);
+  }
+  settings.permissions[key] = values;
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  return claudePermissionStatus({ cwd });
+}
+
+async function setClaudeAutoModeDisabled(params) {
+  const cwd = params.cwd || process.cwd();
+  const path = permissionSettingsPath(cwd, "user");
+  let settings = {};
+  try {
+    settings = JSON.parse(await readFile(path, "utf8"));
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) settings = {};
+  if (params.disabled === false) delete settings.disableAutoMode;
+  else settings.disableAutoMode = "disable";
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  return claudePermissionStatus({ cwd });
+}
+
+async function retryClaudePermission(params) {
+  const session = lookupSession(params.sessionId);
+  if (!session) throw new Error("재시도할 Claude 세션을 찾을 수 없습니다.");
+  const tool = String(params.tool || "tool");
+  const input = params.input && typeof params.input === "object" ? params.input : {};
+  const previousMode = session.permissionMode;
+  return startPrompt({
+    sessionId: session.id,
+    permissionMode: previousMode === "auto" ? "default" : previousMode,
+    restorePermissionMode: previousMode === "auto" ? "auto" : null,
+    input: [{
+      type: "text",
+      text: [
+        `The user selected the denied ${tool} action in /permissions and asked to retry it.`,
+        "Retry that action now. A manual permission prompt will be shown before it runs.",
+        `Original tool input: ${JSON.stringify(input)}`,
+      ].join("\n"),
+    }],
+  });
 }
 
 function makeOptions(params, sessionId, resume) {
@@ -325,9 +479,8 @@ function makeOptions(params, sessionId, resume) {
     includePartialMessages: true,
     permissionMode: permissionMode(params.permissionMode),
     // Not a mode, a capability: the SDK refuses `bypassPermissions` outright
-    // unless the session was started with this. Devez Vibe already auto-allows
-    // tools through `canUseTool`, so allowing the mode to be *reachable* grants
-    // nothing the session did not already have.
+    // unless the session was started with this. The UI exposes it only after
+    // Claude's resolved settings and acknowledgement make the mode available.
     allowDangerouslySkipPermissions: true,
     enableFileCheckpointing: true,
     persistSession: true,
@@ -361,6 +514,28 @@ async function startAgentQuery(prompt, options) {
     warm.close();
     throw error;
   }
+}
+
+function permissionSuggestionLabel(suggestions) {
+  if (!Array.isArray(suggestions) || !suggestions.length) return null;
+  const rules = suggestions.flatMap((suggestion) =>
+    Array.isArray(suggestion.rules)
+      ? suggestion.rules.map((rule) => rule.ruleContent
+        ? `${rule.toolName}(${rule.ruleContent})`
+        : String(rule.toolName || ""))
+      : []);
+  const directories = suggestions.flatMap((suggestion) =>
+    Array.isArray(suggestion.directories) ? suggestion.directories.map(String) : []);
+  const values = [...new Set([...rules, ...directories].filter(Boolean))];
+  const destinations = new Set(suggestions.map((suggestion) => suggestion.destination));
+  const scope = destinations.has("userSettings")
+    ? "모든 프로젝트에서"
+    : destinations.has("projectSettings") || destinations.has("localSettings")
+      ? "이 프로젝트에서"
+      : "이번 세션에서";
+  return values.length
+    ? `${scope} 항상 허용: ${values.join(", ")}`
+    : `${scope} 다시 묻지 않기`;
 }
 
 async function requestToolPermission(toolName, input, permission) {
@@ -411,29 +586,33 @@ async function requestToolPermission(toolName, input, permission) {
     return { behavior: "allow", updatedInput: { ...input, answers } };
   }
 
-  // Plan mode only means anything if leaving it is the user's call — the CLI
-  // shows the plan and waits. The blanket allow below would answer for them.
+  // Claude calls this callback only after its selected mode and permission rules
+  // decide that a human answer is needed. Forward every such request to the host;
+  // auto-allowing the ordinary cases here would silently defeat default/auto mode.
   const planApproval = toolName === "ExitPlanMode";
-
-  // Devez Vibe runs in its existing full-access profile. Claude's callback is
-  // still kept so AskUserQuestion and explicit user-authored ask rules reach UI.
-  if (!permission.matchedAskRule && !planApproval) {
-    return { behavior: "allow", updatedInput: input };
-  }
+  const persistentApprovalLabel = permissionSuggestionLabel(permission.suggestions);
+  const common = {
+    claudePermission: true,
+    title: permission.title || permission.displayName,
+    persistentApprovalLabel,
+  };
 
   let method = "item/permissions/requestApproval";
   let params = {
+    ...common,
     reason: permission.decisionReason || permission.description || permission.title,
     permissions: { tool: toolName, blockedPath: permission.blockedPath },
   };
   if (planApproval) {
     params = {
+      ...common,
       reason: input.plan || permission.description || "계획대로 진행할까요?",
       permissions: { tool: toolName },
     };
   } else if (toolName === "Bash") {
     method = "item/commandExecution/requestApproval";
     params = {
+      ...common,
       command: input.command || "command",
       cwd: input.cwd,
       reason: permission.decisionReason || permission.description,
@@ -441,6 +620,7 @@ async function requestToolPermission(toolName, input, permission) {
   } else if (["Edit", "Write", "NotebookEdit"].includes(toolName)) {
     method = "item/fileChange/requestApproval";
     params = {
+      ...common,
       grantRoot: permission.blockedPath || input.file_path || input.notebook_path,
       reason: permission.decisionReason || permission.description,
     };
@@ -640,6 +820,44 @@ async function claudeSkills(params) {
   return { data: [{ cwd: params.cwd || process.cwd(), skills }] };
 }
 
+function claudeMcpStatusValue(statuses) {
+  return {
+    data: (Array.isArray(statuses) ? statuses : []).map((server) => ({
+      name: String(server?.name || "MCP"),
+      serverInfo: server?.serverInfo
+        ? {
+            title: String(server.serverInfo.name || server.name || "MCP"),
+            version: String(server.serverInfo.version || ""),
+          }
+        : null,
+      tools: Object.fromEntries(
+        (Array.isArray(server?.tools) ? server.tools : [])
+          .filter((tool) => tool?.name)
+          .map((tool) => [String(tool.name), tool]),
+      ),
+      resources: [],
+      authStatus: server?.status === "needs-auth"
+        ? "notLoggedIn"
+        : server?.status === "connected"
+          ? "unsupported"
+          : String(server?.status || "unknown"),
+      status: String(server?.status || "unknown"),
+      ...(server?.error ? { error: String(server.error) } : {}),
+    })),
+  };
+}
+
+async function claudeMcpStatus(params) {
+  const session = lookupSession(params.threadId || params.sessionId);
+  if (!session) {
+    return {
+      data: [],
+      unavailableReason: "Claude 세션이 아직 시작되지 않았습니다.",
+    };
+  }
+  return claudeMcpStatusValue(await session.query.mcpServerStatus());
+}
+
 function isQuestionDeliveryError(error) {
   return error?.code === -32700
     || String(error?.message || error).includes("사용자 입력 화면에 전달하지 못했습니다");
@@ -678,6 +896,7 @@ async function createSession(params, resumeId) {
     itemSequence: 1,
     streamBlocks: new Map(),
     tools: new Map(),
+    permissionDenials: [],
     tasks: new Map(),
     planCreatePending: false,
     subagents: new Map(),
@@ -1585,6 +1804,13 @@ function toolOutput(content, structured) {
 
 async function processResult(session, message) {
   if (!session.turn) return;
+  for (const denial of Array.isArray(message.permission_denials) ? message.permission_denials : []) {
+    rememberPermissionDenial(session, {
+      tool: denial.tool_name,
+      toolUseId: denial.tool_use_id,
+      input: denial.tool_input,
+    });
+  }
   const interrupted = session.turn.interruptRequested === true;
   const totals = [...Object.values(message.modelUsage || {})].reduce((sum, usage) => ({
     inputTokens: sum.inputTokens + Number(usage.inputTokens || 0) + Number(usage.cacheReadInputTokens || 0) + Number(usage.cacheCreationInputTokens || 0),
@@ -1608,12 +1834,37 @@ async function processResult(session, message) {
     ? { message: message.errors?.join("\n") || message.stop_reason || "Claude 실행 실패" }
     : null;
   finishTurn(session, error, message.duration_ms);
+  if (session.restorePermissionMode) {
+    const restore = session.restorePermissionMode;
+    session.restorePermissionMode = null;
+    await applyPermissionMode(session, restore);
+  }
   notify("claude/account/updated", {
     threadId: session.id,
     account: await safeAccount(session.query),
     usage: await safeUsage(session.query),
   });
   await runPendingPrompt(session);
+}
+
+function rememberPermissionDenial(session, denial) {
+  const toolUseId = String(denial.toolUseId || "");
+  const existing = toolUseId
+    ? session.permissionDenials.find((candidate) => candidate.toolUseId === toolUseId)
+    : null;
+  if (existing) {
+    existing.tool = String(denial.tool || existing.tool || "Tool");
+    existing.reason = String(denial.reason || existing.reason || "");
+    if (denial.input && typeof denial.input === "object") existing.input = denial.input;
+    return;
+  }
+  session.permissionDenials.push({
+    tool: String(denial.tool || "Tool"),
+    toolUseId,
+    reason: String(denial.reason || ""),
+    input: denial.input && typeof denial.input === "object" ? denial.input : {},
+  });
+  if (session.permissionDenials.length > 20) session.permissionDenials.shift();
 }
 
 // The turn that was waiting starts on its own, so the host sees it exactly like a
@@ -1660,6 +1911,12 @@ async function consume(session) {
     else if (message.type === "result") await processResult(session, message);
     else if (message.type === "system" && message.subtype === "compact_boundary") {
       notify("thread/compacted", { threadId: session.id });
+    } else if (message.type === "system" && message.subtype === "permission_denied") {
+      rememberPermissionDenial(session, {
+        tool: message.tool_name,
+        toolUseId: message.tool_use_id,
+        reason: message.decision_reason || message.decision_reason_type,
+      });
     } else if (message.type === "rate_limit_event") {
       notify("claude/account/updated", { threadId: session.id, rateLimitInfo: message.rate_limit_info });
     } else if (message.type === "system" && message.subtype === "api_retry") {
@@ -1736,7 +1993,18 @@ async function runPrompt(session, params) {
     await session.query.applyFlagSettings({ effortLevel: effort });
   }
   session.effort = effort;
-  await applyPermissionMode(session, params.permissionMode);
+  const permissionRejection = await applyPermissionMode(session, params.permissionMode);
+  if (permissionRejection) {
+    notify("claude/permissionMode/rejected", {
+      threadId: visibleSession(session.id),
+      permissionMode: params.permissionMode,
+      effectivePermissionMode: session.permissionMode,
+      message: permissionRejection,
+    });
+  }
+  if (params.restorePermissionMode) {
+    session.restorePermissionMode = permissionMode(params.restorePermissionMode);
+  }
   const content = await inputContent(params.input, params.handoffContext);
   const turnId = beginTurn(session, params.input);
   session.queue.push({
@@ -2008,6 +2276,7 @@ async function readableCwd(id, cwd) {
 
 async function dispatch(method, params = {}) {
   if (method === "model/list") return loadModelCatalog(params);
+  if (method === "mcpServerStatus/list") return claudeMcpStatus(params);
   if (method === "plugin/list") return claudePluginCatalog(params);
   if (method === "plugin/installed") return claudePluginCatalog(params, true);
   if (method === "plugin/read") return claudePluginDetail(params);
@@ -2061,12 +2330,20 @@ async function dispatch(method, params = {}) {
   if (method === "plugin/reload") {
     return { message: "Claude 플러그인 설정을 다시 읽었습니다. 새 대화부터 적용됩니다." };
   }
+  if (method === "permissions/status") return claudePermissionStatus(params);
+  if (method === "permissions/update") return updateClaudePermission(params);
+  if (method === "permissions/auto-mode") return setClaudeAutoModeDisabled(params);
+  if (method === "permissions/retry") return retryClaudePermission(params);
   if (method === "session/permissionMode") {
     const session = lookupSession(params.sessionId);
     // A session that has not started yet picks the mode up from its first turn.
     if (!session) return { permissionMode: permissionMode(params.permissionMode) };
-    await applyPermissionMode(session, params.permissionMode);
-    return { permissionMode: session.permissionMode };
+    session.restorePermissionMode = null;
+    const rejection = await applyPermissionMode(session, params.permissionMode);
+    return {
+      permissionMode: session.permissionMode,
+      ...(rejection ? { rejection } : {}),
+    };
   }
   if (method === "session/start") {
     const { session, account, usage } = await createSession(params);
@@ -2221,6 +2498,10 @@ async function dispatch(method, params = {}) {
 }
 
 async function runSelfTest() {
+  if (permissionMode("dontAsk") !== "dontAsk"
+    || permissionMode("not-a-mode", "auto") !== "auto") {
+    throw new Error("Claude permission mode self-test failed");
+  }
   const pluginCatalog = buildClaudePluginCatalog(
     [{ id: "cloudflare@official", enabled: true, scope: "user" }],
     [{
@@ -2238,6 +2519,21 @@ async function runSelfTest() {
     || plugin?.installed !== true
     || plugin?.enabled !== true) {
     throw new Error(`Claude plugin catalogue self-test failed: ${JSON.stringify(pluginCatalog)}`);
+  }
+  const mcpStatus = claudeMcpStatusValue([
+    {
+      name: "context7",
+      status: "connected",
+      serverInfo: { name: "Context7", version: "1.0.0" },
+      tools: [{ name: "resolve" }, { name: "docs" }],
+    },
+    { name: "figma", status: "needs-auth", tools: [] },
+  ]).data;
+  if (mcpStatus[0]?.name !== "context7"
+    || Object.keys(mcpStatus[0]?.tools || {}).length !== 2
+    || mcpStatus[0]?.status !== "connected"
+    || mcpStatus[1]?.authStatus !== "notLoggedIn") {
+    throw new Error(`Claude MCP status self-test failed: ${JSON.stringify(mcpStatus)}`);
   }
   const user = (uuid, text) => ({
     type: "user",

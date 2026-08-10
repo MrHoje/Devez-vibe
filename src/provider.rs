@@ -465,6 +465,7 @@ impl ProviderPicker {
                     })
                     .collect(),
                 selected: self.selected,
+                detail: None,
             }),
             hint: "←→ 이동  Enter 선택  Esc 닫기".to_owned(),
             closable: true,

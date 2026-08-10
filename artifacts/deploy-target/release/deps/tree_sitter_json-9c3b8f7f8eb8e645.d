@@ -1,0 +1,9 @@
+C:\Source\devezVibe\artifacts\deploy-target\release\deps\tree_sitter_json-9c3b8f7f8eb8e645.d: C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-json-0.24.8\bindings\rust\lib.rs C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-json-0.24.8\bindings\rust\../../src/node-types.json C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-json-0.24.8\bindings\rust\../../queries/highlights.scm
+
+C:\Source\devezVibe\artifacts\deploy-target\release\deps\libtree_sitter_json-9c3b8f7f8eb8e645.rlib: C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-json-0.24.8\bindings\rust\lib.rs C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-json-0.24.8\bindings\rust\../../src/node-types.json C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-json-0.24.8\bindings\rust\../../queries/highlights.scm
+
+C:\Source\devezVibe\artifacts\deploy-target\release\deps\libtree_sitter_json-9c3b8f7f8eb8e645.rmeta: C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-json-0.24.8\bindings\rust\lib.rs C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-json-0.24.8\bindings\rust\../../src/node-types.json C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-json-0.24.8\bindings\rust\../../queries/highlights.scm
+
+C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-json-0.24.8\bindings\rust\lib.rs:
+C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-json-0.24.8\bindings\rust\../../src/node-types.json:
+C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-json-0.24.8\bindings\rust\../../queries/highlights.scm:

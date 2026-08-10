@@ -627,6 +627,21 @@ impl BackendServer {
                     self.codex()?.request(method, params).await
                 }
             }
+            "claude/permissions/status" => self.claude.request("permissions/status", params).await,
+            "claude/permissions/update" => self.claude.request("permissions/update", params).await,
+            "claude/permissions/auto-mode" => {
+                self.claude.request("permissions/auto-mode", params).await
+            }
+            "claude/permissions/retry" => {
+                let visible = thread_id(&params)?;
+                if self.route_kind(visible) != RuntimeKind::Claude {
+                    return Err(anyhow::anyhow!(
+                        "Claude 세션에서만 권한 거부를 재시도할 수 있습니다."
+                    ));
+                }
+                params["sessionId"] = json!(self.backing_id(visible, RuntimeKind::Claude)?);
+                self.claude.request("permissions/retry", params).await
+            }
             // Only Claude has permission modes. A thread on another runtime — or
             // one Claude has not started yet — keeps the mode the next turn carries.
             "thread/permissionMode/set" => {
@@ -1582,6 +1597,7 @@ fn is_vibe_setting_key(key: &str) -> bool {
             | "model_verbosity"
             | "shell_display_mode"
             | "diff_display_mode"
+            | "side_panel_stage"
             | "status_line_model"
             | "status_line_effort"
             | "status_line_context"
@@ -1589,7 +1605,6 @@ fn is_vibe_setting_key(key: &str) -> bool {
             | "status_line_weekly"
             | crate::state::CODEX_PROVIDER_KEY
             | crate::state::CLAUDE_PROVIDER_KEY
-            | crate::state::CLAUDE_PERMISSION_MODE_KEY
     )
 }
 
@@ -2154,6 +2169,7 @@ mod tests {
         assert!(is_vibe_setting_key("vibe_mode"));
         assert!(is_vibe_setting_key("shell_display_mode"));
         assert!(is_vibe_setting_key("diff_display_mode"));
+        assert!(is_vibe_setting_key("side_panel_stage"));
         assert!(is_vibe_setting_key("status_line_context"));
         assert!(!is_vibe_setting_key("model"));
         assert!(!is_vibe_setting_key("plugins.example"));

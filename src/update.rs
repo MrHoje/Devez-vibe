@@ -16,12 +16,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Release notes kept with the build. The welcome card no longer prints them, so
-/// nothing reads this today; rewrite it each release for the changelog.
+/// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "대화를 이어받을 때 자동 요약본이 화면에 다시 보이지 않습니다.",
-    "질문 답변 기록을 더 읽기 좋게 정리하고 안내 규칙을 다듬었습니다.",
+    "Resume 시 최신 작업단계 기록 형식에서도 완료 상태를 정확히 복원합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

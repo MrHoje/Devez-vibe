@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "runtime": "hoje-native",
+  "sourceGjcVersion": "0.12.11",
+  "hojeObjective": "Complete the durable Hoje Goals plan under the original brief constraints; use ledger.jsonl as the audit trail.",
+  "brief": "Devez Vibe의 주입 지침을 반복 수정해 Claude와 Codex의 응답 형태를 서로 비슷하게 만들고, 작업 단계(작업 목록) 생성도 양쪽이 같게 동작하도록 만든다.\n\n공통 배경:\n- 지침은 세 곳에 있다. src/main.rs의 DEVEZ_INSTRUCTIONS(Codex용) 상수, 같은 파일의 CLAUDE_DEVEZ_INSTRUCTIONS(Claude용) 상수, src/state.rs의 VibeMode::turn_notice(매 턴 additionalContext로 전달되는 모드별 문장).\n- 1차 측정 결과: Codex는 update_plan을 2회 호출해 작업 목록을 만들었고 Claude는 한 번도 만들지 않았다. 답변은 Claude 4줄/불릿 2개, Codex 10줄/불릿 4개. 경로·코드·빌드 명령 노출은 양쪽 0.\n- 실험 자산은 C:\\Users\\eghis\\AppData\\Local\\Temp\\vibe-compare 에 있다. measure.py(지표 측정), codex-rules.txt와 claude-rules.txt(지침 추출본), codex-input.txt와 claude-input.txt(동일 프롬프트), repo(git worktree 사본), codex-final.txt와 claude-out.txt(1차 결과).\n\n공통 제약:\n- 실험 실행은 반드시 worktree 사본 안에서만 한다. 원본 저장소를 런타임 실행 대상으로 쓰지 않는다.\n- Codex 호출은 사본 디렉터리에서 `codex exec --sandbox workspace-write - < 입력파일` 형태로 한다. read-only 샌드박스는 Windows에서 CreateProcessAsUserW 오류로 실패한다. 승인 우회 플래그는 차단되어 쓸 수 없다.\n- Claude 호출은 `claude -p --permission-mode plan --model sonnet` 형태로 한다. 기본 출력에는 도구 호출이 남지 않으므로 작업 목록 생성 여부를 재려면 stream-json 계열 출력 형식이 필요하다.\n- 지침 상수를 바꿀 때마다 cargo test로 문구 검증 테스트를 통과시킨다.\n- 다른 세션이 같은 저장소의 backend.rs, paste.rs, editor.rs, renderer.rs, npm/bridge를 동시에 수정하고 있다. 그 파일들은 건드리지 않는다. 그 작업 때문에 컴파일이 깨지면 기다린 뒤 재시도한다.\n- 지침 길이가 늘어나면 매 턴 비용이 늘어난다. Claude용 지침은 현재 27줄 수준을 크게 넘기지 않는다.\n\n@goal: 측정 하네스 보강\n두 런타임의 응답을 같은 조건에서 반복 측정할 수 있게 실험 하네스를 정비한다. Claude 호출에서 도구 호출이 관측되도록 출력 형식을 바꾸고, 그 출력에서 작업 목록 생성 여부와 최종 답변 텍스트를 분리해 추출한다. Codex 출력에서도 실행 로그와 최종 답변을 분리해 지표가 로그에 오염되지 않게 한다. 조사형 프롬프트와 단순 질문형 프롬프트 두 종류를 준비하고, 한 번 실행하면 두 런타임 두 프롬프트를 모두 돌려 지표 표를 출력하는 실행 스크립트를 만든다. 지표에는 줄 수, 불릿 수, 코드 블록 수, 경로 언급, 식별자, 빌드 명령, 영어 줄, 착수 안내 유무, 완료 문구, 작업 목록 생성 여부와 호출 횟수를 포함한다. 완료 기준은 스크립트 한 번 실행으로 네 조합의 지표가 모두 채워져 나오고, 작업 목록 생성 여부가 양쪽 모두 실제 도구 호출 근거로 판정되는 것이다.\n\n@goal: 지침 조정과 수렴 반복\n하네스로 측정한 격차를 지침에 반영하고 다시 측정하는 루프를 돌려 두 런타임 출력을 수렴시킨다. 우선 작업 목록 생성 격차를 좁힌다. Claude용 지침과 모드별 문장에서 작업 목록 생성 조건을 더 강하게 못 박고, Codex용 지침도 같은 기준으로 맞춘다. 이어서 답변 길이와 불릿 수, 착수 안내 유무를 맞춘다. 매 라운드마다 지침을 수정하고 추출본을 갱신한 뒤 네 조합을 다시 측정하고, 라운드별 지표를 기록해 어떤 문구가 어떤 변화를 만들었는지 남긴다. 수렴 기준은 작업 목록 생성 여부가 양쪽 동일하고, 답변 줄 수와 불릿 수 차이가 각각 2 이내이며, 착수 안내 유무가 동일하고, 경로와 코드와 빌드 명령 노출이 양쪽 0인 것이다. 세 라운드 안에 수렴하지 않으면 남은 격차와 원인을 근거와 함께 정리한다.\n\n@goal: 결과 고정과 정리\n수렴한 지침을 회귀 테스트로 고정하고 실험 흔적을 정리한다. 새로 추가하거나 바꾼 지침 문구가 사라지면 실패하도록 문구 검증 테스트를 갱신하고 cargo test 전체를 통과시킨다. 라운드별 측정 결과와 최종 지표, 남은 한계를 요약해 남긴다. 실험용 worktree 사본은 제거하고 원본 저장소에 실험 부산물이 남지 않은 상태를 확인한다.\n",
+  "hojeGoalMode": "aggregate",
+  "intensity": "standard",
+  "createdAt": "2026-08-06T15:45:57.155Z",
+  "updatedAt": "2026-08-06T16:02:45.378Z",
+  "goals": [
+    {
+      "id": "G001",
+      "title": "측정 하네스 보강",
+      "objective": "두 런타임의 응답을 같은 조건에서 반복 측정할 수 있게 실험 하네스를 정비한다. Claude 호출에서 도구 호출이 관측되도록 출력 형식을 바꾸고, 그 출력에서 작업 목록 생성 여부와 최종 답변 텍스트를 분리해 추출한다. Codex 출력에서도 실행 로그와 최종 답변을 분리해 지표가 로그에 오염되지 않게 한다. 조사형 프롬프트와 단순 질문형 프롬프트 두 종류를 준비하고, 한 번 실행하면 두 런타임 두 프롬프트를 모두 돌려 지표 표를 출력하는 실행 스크립트를 만든다. 지표에는 줄 수, 불릿 수, 코드 블록 수, 경로 언급, 식별자, 빌드 명령, 영어 줄, 착수 안내 유무, 완료 문구, 작업 목록 생성 여부와 호출 횟수를 포함한다. 완료 기준은 스크립트 한 번 실행으로 네 조합의 지표가 모두 채워져 나오고, 작업 목록 생성 여부가 양쪽 모두 실제 도구 호출 근거로 판정되는 것이다.",
+      "status": "complete",
+      "createdAt": "2026-08-06T15:45:57.155Z",
+      "updatedAt": "2026-08-06T16:02:32.232Z",
+      "completionVerification": {
+        "receiptId": "evt-1786032152230-7ef7615e",
+        "qualityGateHash": "72c887ba82e869f7c3a86872e56de2bc60acb150d91a85abebb7a7d7822ecfd6",
+        "checkpointedAt": "2026-08-06T16:02:32.230Z",
+        "deferredToBatch": {
+          "batchId": "aggregate-default",
+          "metadataHash": "e0144dc4092f627ef3bf0e6c427fac4583869f815a51fdfa421787a3d057b7eb",
+          "changeSetHash": "cd512035cb3cd332b72834157c230e6562d8f2040a7a40958bc7bafdcabfb7b4",
+          "changeSetPaths": [
+            ".hoje/",
+            "Cargo.lock",
+            "Cargo.toml",
+            "npm/bridge/claude-agent-sdk-bridge.mjs",
+            "npm/package.json",
+            "src/claude.rs",
+            "src/devezcode.rs",
+            "src/editor.rs",
+            "src/main.rs",
+            "src/paste.rs",
+            "src/state.rs"
+          ]
+        }
+      }
+    },
+    {
+      "id": "G002",
+      "title": "지침 조정과 수렴 반복",
+      "objective": "하네스로 측정한 격차를 지침에 반영하고 다시 측정하는 루프를 돌려 두 런타임 출력을 수렴시킨다. 우선 작업 목록 생성 격차를 좁힌다. Claude용 지침과 모드별 문장에서 작업 목록 생성 조건을 더 강하게 못 박고, Codex용 지침도 같은 기준으로 맞춘다. 이어서 답변 길이와 불릿 수, 착수 안내 유무를 맞춘다. 매 라운드마다 지침을 수정하고 추출본을 갱신한 뒤 네 조합을 다시 측정하고, 라운드별 지표를 기록해 어떤 문구가 어떤 변화를 만들었는지 남긴다. 수렴 기준은 작업 목록 생성 여부가 양쪽 동일하고, 답변 줄 수와 불릿 수 차이가 각각 2 이내이며, 착수 안내 유무가 동일하고, 경로와 코드와 빌드 명령 노출이 양쪽 0인 것이다. 세 라운드 안에 수렴하지 않으면 남은 격차와 원인을 근거와 함께 정리한다.",
+      "status": "active",
+      "createdAt": "2026-08-06T15:45:57.155Z",
+      "updatedAt": "2026-08-06T16:02:45.378Z"
+    },
+    {
+      "id": "G003",
+      "title": "결과 고정과 정리",
+      "objective": "수렴한 지침을 회귀 테스트로 고정하고 실험 흔적을 정리한다. 새로 추가하거나 바꾼 지침 문구가 사라지면 실패하도록 문구 검증 테스트를 갱신하고 cargo test 전체를 통과시킨다. 라운드별 측정 결과와 최종 지표, 남은 한계를 요약해 남긴다. 실험용 worktree 사본은 제거하고 원본 저장소에 실험 부산물이 남지 않은 상태를 확인한다.",
+      "status": "pending",
+      "createdAt": "2026-08-06T15:45:57.155Z",
+      "updatedAt": "2026-08-06T15:45:57.155Z"
+    }
+  ],
+  "validationBatches": [],
+  "integrity": {
+    "algorithm": "sha256",
+    "value": "cbd7947091b662364c1d2c973fe8d2c7b6d0e7ff521e23aa8bfc1f1bc4505185",
+    "covered_path": "C:\\Source\\devezVibe\\.hoje\\_session-claude-4bd2513b-3d83-44dc-a66b-578c9b25425d\\ultragoal\\goals.json",
+    "computed_at": "2026-08-06T16:02:45.378Z"
+  }
+}

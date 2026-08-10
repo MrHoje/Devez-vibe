@@ -1,0 +1,9 @@
+C:\Source\devezVibe\artifacts\deploy-target\release\deps\tree_sitter_bash-f6a1250660950d59.d: C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-bash-0.25.1\bindings\rust\lib.rs C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-bash-0.25.1\bindings\rust\../../src/node-types.json C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-bash-0.25.1\bindings\rust\../../queries/highlights.scm
+
+C:\Source\devezVibe\artifacts\deploy-target\release\deps\libtree_sitter_bash-f6a1250660950d59.rlib: C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-bash-0.25.1\bindings\rust\lib.rs C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-bash-0.25.1\bindings\rust\../../src/node-types.json C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-bash-0.25.1\bindings\rust\../../queries/highlights.scm
+
+C:\Source\devezVibe\artifacts\deploy-target\release\deps\libtree_sitter_bash-f6a1250660950d59.rmeta: C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-bash-0.25.1\bindings\rust\lib.rs C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-bash-0.25.1\bindings\rust\../../src/node-types.json C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-bash-0.25.1\bindings\rust\../../queries/highlights.scm
+
+C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-bash-0.25.1\bindings\rust\lib.rs:
+C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-bash-0.25.1\bindings\rust\../../src/node-types.json:
+C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\tree-sitter-bash-0.25.1\bindings\rust\../../queries/highlights.scm:

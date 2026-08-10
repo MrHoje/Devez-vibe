@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "session_id": "claude-4bd2513b-3d83-44dc-a66b-578c9b25425d",
+  "skills": {
+    "ultragoal": {
+      "active": true,
+      "current_phase": "complete",
+      "updated_at": "2026-08-06T16:02:32.234Z"
+    }
+  },
+  "active_skill": "ultragoal",
+  "updated_at": "2026-08-06T16:02:32.234Z",
+  "integrity": {
+    "algorithm": "sha256",
+    "value": "8774862fdbced30631bbf2aa609351aa892e3d38beca6d3522c9c88d32a4832e",
+    "covered_path": "C:\\Source\\devezVibe\\.hoje\\_session-claude-4bd2513b-3d83-44dc-a66b-578c9b25425d\\state\\skill-active-state.json",
+    "computed_at": "2026-08-06T16:02:32.234Z"
+  }
+}

@@ -10,7 +10,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::Value;
 
 use crate::editor::Editor;
-use crate::renderer::{OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS, visible_window};
+use crate::renderer::{
+    IntegrationItemState, IntegrationItemView, OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS,
+    visible_window,
+};
 
 /// Rows a scrollable detail body lists at once, before it starts scrolling.
 const DETAIL_ROWS: usize = 12;
@@ -34,6 +37,9 @@ pub struct McpServerInfo {
     pub tools: Vec<String>,
     pub resources: usize,
     pub website_url: Option<String>,
+    /// Claude exposes the live transport state directly. Codex omits it for
+    /// listed servers, which already means the server completed startup.
+    pub connection_status: Option<String>,
     /// Set from `mcpServer/startupStatus/updated` when a server failed to start.
     pub failure: Option<String>,
 }
@@ -86,7 +92,17 @@ impl McpServerInfo {
                 .and_then(|info| info.get("websiteUrl"))
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
-            failure: None,
+            connection_status: entry
+                .get("status")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
+            failure: (entry.get("status").and_then(Value::as_str) == Some("failed")).then(|| {
+                entry
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("MCP 서버를 시작하지 못했습니다.")
+                    .to_owned()
+            }),
         })
     }
 
@@ -106,6 +122,7 @@ impl McpServerInfo {
             tools: (0..tools).map(|index| format!("tool{index}")).collect(),
             resources: 0,
             website_url: None,
+            connection_status: None,
             failure: None,
         }
     }
@@ -113,6 +130,9 @@ impl McpServerInfo {
     fn status(&self) -> &str {
         if self.failure.is_some() {
             return "failed";
+        }
+        if let Some(status) = self.connection_status.as_deref() {
+            return status;
         }
         match self.auth_status.as_str() {
             "notLoggedIn" => "needs login",
@@ -125,6 +145,13 @@ impl McpServerInfo {
     fn glyph(&self) -> &'static str {
         if self.failure.is_some() {
             "✗"
+        } else if matches!(
+            self.connection_status.as_deref(),
+            Some("disabled" | "failed")
+        ) {
+            "✗"
+        } else if self.connection_status.as_deref() == Some("pending") {
+            "○"
         } else if self.needs_login() {
             "○"
         } else {
@@ -134,6 +161,44 @@ impl McpServerInfo {
 
     fn label(&self) -> &str {
         self.title.as_deref().unwrap_or(&self.name)
+    }
+
+    pub fn panel_item(&self) -> IntegrationItemView {
+        let (state, detail) = if self.failure.is_some()
+            || matches!(
+                self.connection_status.as_deref(),
+                Some("disabled" | "failed")
+            ) {
+            (
+                IntegrationItemState::Inactive,
+                if self.connection_status.as_deref() == Some("disabled") {
+                    "비활성".to_owned()
+                } else {
+                    "실패".to_owned()
+                },
+            )
+        } else if self.needs_login() || self.connection_status.as_deref() == Some("needs-auth") {
+            (IntegrationItemState::Inactive, "로그인 필요".to_owned())
+        } else if self.connection_status.as_deref() == Some("pending") {
+            (IntegrationItemState::Pending, "연결 중".to_owned())
+        } else if matches!(self.connection_status.as_deref(), None | Some("connected")) {
+            let tools = self.tools.len();
+            (
+                IntegrationItemState::Active,
+                if tools == 0 {
+                    "연결됨".to_owned()
+                } else {
+                    format!("연결됨 · 도구 {tools}")
+                },
+            )
+        } else {
+            (IntegrationItemState::Unknown, "미확인".to_owned())
+        };
+        IntegrationItemView {
+            name: self.label().to_owned(),
+            state,
+            detail,
+        }
     }
 }
 
@@ -784,6 +849,34 @@ impl PluginCatalog {
         }
     }
 
+    pub fn installed_panel_items(&self) -> Vec<IntegrationItemView> {
+        let mut items = self
+            .plugins
+            .iter()
+            .filter(|plugin| plugin.installed)
+            .map(|plugin| {
+                let (state, detail) = if !plugin.available {
+                    (IntegrationItemState::Inactive, "관리자 차단")
+                } else if plugin.enabled {
+                    (IntegrationItemState::Active, "활성")
+                } else {
+                    (IntegrationItemState::Inactive, "비활성")
+                };
+                IntegrationItemView {
+                    name: plugin.display_name.clone(),
+                    state,
+                    detail: detail.to_owned(),
+                }
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| {
+            integration_state_order(left.state)
+                .cmp(&integration_state_order(right.state))
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        });
+        items
+    }
+
     /// Resolves a `/plugins <subcommand> NAME` argument. An exact id, name, or
     /// display-name match wins; otherwise a partial match only counts when it
     /// is the single candidate, so an ambiguous name never acts on the wrong
@@ -814,6 +907,15 @@ impl PluginCatalog {
             .iter()
             .filter(|plugin| plugin.installed)
             .collect()
+    }
+}
+
+fn integration_state_order(state: IntegrationItemState) -> u8 {
+    match state {
+        IntegrationItemState::Inactive => 0,
+        IntegrationItemState::Pending => 1,
+        IntegrationItemState::Unknown => 2,
+        IntegrationItemState::Active => 3,
     }
 }
 
@@ -1886,6 +1988,52 @@ mod tests {
     }
 
     #[test]
+    fn claude_mcp_states_keep_live_connection_meaning() {
+        let servers = McpServerInfo::list_from_value(&json!({
+            "data": [
+                {
+                    "name": "connected",
+                    "status": "connected",
+                    "tools": { "read": {}, "write": {} },
+                    "authStatus": "unsupported"
+                },
+                {
+                    "name": "failed",
+                    "status": "failed",
+                    "error": "spawn failed",
+                    "tools": {},
+                    "authStatus": "failed"
+                },
+                {
+                    "name": "login",
+                    "status": "needs-auth",
+                    "tools": {},
+                    "authStatus": "notLoggedIn"
+                },
+                {
+                    "name": "pending",
+                    "status": "pending",
+                    "tools": {},
+                    "authStatus": "pending"
+                }
+            ]
+        }));
+        let items = servers
+            .iter()
+            .map(McpServerInfo::panel_item)
+            .collect::<Vec<_>>();
+
+        assert_eq!(items[0].state, IntegrationItemState::Active);
+        assert_eq!(items[0].detail, "연결됨 · 도구 2");
+        assert_eq!(items[1].state, IntegrationItemState::Inactive);
+        assert_eq!(items[1].detail, "실패");
+        assert_eq!(items[2].state, IntegrationItemState::Inactive);
+        assert_eq!(items[2].detail, "로그인 필요");
+        assert_eq!(items[3].state, IntegrationItemState::Pending);
+        assert_eq!(items[3].detail, "연결 중");
+    }
+
+    #[test]
     fn mcp_detail_offers_login_only_when_the_server_needs_it() {
         let mut picker = McpPicker::new(McpServerInfo::list_from_value(&mcp_response()));
 
@@ -1983,6 +2131,49 @@ mod tests {
                 .and_then(|plugin| plugin.remote_marketplace_name.as_deref()),
             Some("openai-curated-remote")
         );
+    }
+
+    #[test]
+    fn plugin_panel_only_reports_installed_availability() {
+        let catalog = PluginCatalog::from_value(&json!({
+            "marketplaces": [{
+                "name": "local",
+                "plugins": [
+                    {
+                        "id": "enabled@local",
+                        "name": "enabled",
+                        "installed": true,
+                        "enabled": true,
+                        "availability": "AVAILABLE",
+                        "interface": { "displayName": "Enabled" }
+                    },
+                    {
+                        "id": "disabled@local",
+                        "name": "disabled",
+                        "installed": true,
+                        "enabled": false,
+                        "availability": "AVAILABLE",
+                        "interface": { "displayName": "Disabled" }
+                    },
+                    {
+                        "id": "remote@local",
+                        "name": "remote",
+                        "installed": false,
+                        "enabled": false,
+                        "availability": "AVAILABLE",
+                        "interface": { "displayName": "Remote" }
+                    }
+                ]
+            }]
+        }));
+
+        let items = catalog.installed_panel_items();
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].name, "Disabled");
+        assert_eq!(items[0].state, IntegrationItemState::Inactive);
+        assert_eq!(items[1].name, "Enabled");
+        assert_eq!(items[1].state, IntegrationItemState::Active);
     }
 
     #[test]

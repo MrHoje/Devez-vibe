@@ -1,0 +1,11 @@
+C:\Source\devezVibe\artifacts\deploy-target\release\deps\convert_case-5af692ee42715681.d: C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\convert_case-0.10.0\src\lib.rs C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\convert_case-0.10.0\src\boundary.rs C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\convert_case-0.10.0\src\case.rs C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\convert_case-0.10.0\src\converter.rs C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\convert_case-0.10.0\src\pattern.rs
+
+C:\Source\devezVibe\artifacts\deploy-target\release\deps\libconvert_case-5af692ee42715681.rlib: C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\convert_case-0.10.0\src\lib.rs C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\convert_case-0.10.0\src\boundary.rs C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\convert_case-0.10.0\src\case.rs C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\convert_case-0.10.0\src\converter.rs C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\convert_case-0.10.0\src\pattern.rs
+
+C:\Source\devezVibe\artifacts\deploy-target\release\deps\libconvert_case-5af692ee42715681.rmeta: C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\convert_case-0.10.0\src\lib.rs C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\convert_case-0.10.0\src\boundary.rs C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\convert_case-0.10.0\src\case.rs C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\convert_case-0.10.0\src\converter.rs C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\convert_case-0.10.0\src\pattern.rs
+
+C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\convert_case-0.10.0\src\lib.rs:
+C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\convert_case-0.10.0\src\boundary.rs:
+C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\convert_case-0.10.0\src\case.rs:
+C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\convert_case-0.10.0\src\converter.rs:
+C:\Users\eghis\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\convert_case-0.10.0\src\pattern.rs:

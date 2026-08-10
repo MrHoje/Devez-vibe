@@ -28,10 +28,11 @@ use crate::{
     provider::{ProviderAuthRequest, ProviderPicker, ProviderPickerResult},
     renderer::{
         AnimationView, Block, BlockKind, ComposerMode, EffortSlider, HIDDEN_STATUS_LINE,
-        LiveBlockView, ModeAccent, OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS,
-        PermissionBadge, PermissionTone, PlanStep, PlanStepStatus, PlanSummary,
-        ProviderHandoffBlock, SIDE_PANEL_WIDTHS, StatusLineView, SubagentView, SuggestionView,
-        VibeTone, View, WelcomeView, visible_window,
+        IntegrationItemState, IntegrationItemView, LiveBlockView, ModeAccent, OverlayLine,
+        OverlayStyle, OverlayView, PICKER_ROWS, PermissionBadge, PermissionTone, PlanStep,
+        PlanStepStatus, PlanSummary, ProviderHandoffBlock, ProviderIntegrationView,
+        SIDE_PANEL_WIDTHS, StatusLineView, SubagentView, SuggestionView, VibeTone, View,
+        WelcomeView, visible_window,
     },
     rollout::{PlanSnapshot, Rollout, RolloutEvent, RolloutKind},
     theme::{self, ThemeKind},
@@ -58,17 +59,16 @@ pub enum PermissionMode {
     FullAccess,
 }
 
-/// Claude Code's own permission modes, and every turn carries the choice to the
-/// bridge. Only `Auto` and `Plan` are selectable here — the badge toggles
-/// between the two — but the remaining variants stay so a value saved by an
-/// older build, or one the bridge reports back, still parses.
+/// Claude Code's own permission modes. Every turn carries the choice to the
+/// bridge, while `/permissions`, Shift+Tab, and the composer badge change it.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub enum ClaudePermissionMode {
+    #[default]
     Default,
     AcceptEdits,
     Plan,
-    #[default]
     Auto,
+    DontAsk,
     BypassPermissions,
 }
 
@@ -137,6 +137,8 @@ pub enum SidePanelStage {
 }
 
 impl SidePanelStage {
+    const CHOICES: [Self; 4] = [Self::Closed, Self::Small, Self::Medium, Self::Large];
+
     fn width(self) -> Option<usize> {
         match self {
             Self::Closed => None,
@@ -153,6 +155,22 @@ impl SidePanelStage {
             Self::Medium => Self::Large,
             Self::Large => Self::Closed,
         }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Closed => "Off",
+            Self::Small => "Small",
+            Self::Medium => "Medium",
+            Self::Large => "Large",
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::CHOICES
+            .iter()
+            .position(|stage| *stage == self)
+            .unwrap_or_default()
     }
 
     fn from_config_value(value: &str) -> Self {
@@ -226,6 +244,8 @@ macro_rules! choice_notice {
 }
 
 impl VibeMode {
+    const PICKER_CHOICES: [Self; 3] = [Self::Normal, Self::Vibe, Self::SuperVibe];
+
     pub const fn config_value(self) -> &'static str {
         match self {
             Self::Vibe => "vibe",
@@ -246,6 +266,30 @@ impl VibeMode {
             Self::Vibe => Self::SuperVibe,
             Self::SuperVibe => Self::Normal,
             Self::Normal => Self::Vibe,
+        }
+    }
+
+    const fn picker_index(self) -> usize {
+        match self {
+            Self::Normal => 0,
+            Self::Vibe => 1,
+            Self::SuperVibe => 2,
+        }
+    }
+
+    const fn picker_label(self) -> &'static str {
+        match self {
+            Self::Normal => "Off",
+            Self::Vibe => "On",
+            Self::SuperVibe => "Super Vibe",
+        }
+    }
+
+    const fn picker_detail(self) -> &'static str {
+        match self {
+            Self::Normal => "Diff와 명령어를 모두 표시합니다.",
+            Self::Vibe => "Diff와 명령어를 압축해서 표시합니다.",
+            Self::SuperVibe => "Diff와 명령어 등을 모두 숨깁니다.",
         }
     }
 
@@ -444,15 +488,43 @@ impl PermissionMode {
 }
 
 impl ClaudePermissionMode {
+    const BASE_CHOICES: [Self; 3] = [Self::Default, Self::AcceptEdits, Self::Plan];
+    const AUTO_CHOICES: [Self; 4] = [Self::Default, Self::AcceptEdits, Self::Plan, Self::Auto];
+    const BYPASS_CHOICES: [Self; 4] = [
+        Self::Default,
+        Self::AcceptEdits,
+        Self::Plan,
+        Self::BypassPermissions,
+    ];
+    const ALL_CHOICES: [Self; 5] = [
+        Self::Default,
+        Self::AcceptEdits,
+        Self::Plan,
+        Self::BypassPermissions,
+        Self::Auto,
+    ];
+
     /// Indicator text, wording and symbols taken from the CLI's own mode line so
     /// the badge is recognisable to anyone who has used Claude Code.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Default => "default",
-            Self::AcceptEdits => "⏵⏵ accept edits",
+            Self::Default => "ask permissions",
+            Self::AcceptEdits => "⏵⏵ accept edits on",
             Self::Plan => "⏸ plan mode",
             Self::Auto => "⏵⏵ auto mode",
+            Self::DontAsk => "don't ask",
             Self::BypassPermissions => "⏵⏵ bypass permissions",
+        }
+    }
+
+    fn picker_label(self) -> &'static str {
+        match self {
+            Self::Default => "Ask permissions",
+            Self::AcceptEdits => "Auto accept edits",
+            Self::Plan => "Plan mode",
+            Self::Auto => "Auto mode",
+            Self::DontAsk => "Don't ask",
+            Self::BypassPermissions => "Bypass permissions",
         }
     }
 
@@ -463,6 +535,7 @@ impl ClaudePermissionMode {
             Self::AcceptEdits => "acceptEdits",
             Self::Plan => "plan",
             Self::Auto => "auto",
+            Self::DontAsk => "dontAsk",
             Self::BypassPermissions => "bypassPermissions",
         }
     }
@@ -473,36 +546,81 @@ impl ClaudePermissionMode {
             Self::AcceptEdits => PermissionTone::AcceptEdits,
             Self::Plan => PermissionTone::Plan,
             Self::Auto => PermissionTone::Auto,
+            Self::DontAsk => PermissionTone::Neutral,
             Self::BypassPermissions => PermissionTone::Bypass,
         }
     }
 
-    /// The saved default read back out of the Vibe settings. The reader
-    /// lowercases every value it returns, so the match ignores case.
-    fn from_wire(value: &str) -> Option<Self> {
+    /// Reads the wire value reported by Claude settings or a live session.
+    pub(crate) fn from_wire(value: &str) -> Option<Self> {
         [
             Self::Default,
             Self::AcceptEdits,
             Self::Plan,
             Self::Auto,
+            Self::DontAsk,
             Self::BypassPermissions,
         ]
         .into_iter()
         .find(|mode| mode.wire().eq_ignore_ascii_case(value))
     }
 
-    /// Only auto and plan are offered, so the badge toggles between them. A mode
-    /// left over from an older build lands on plan on its first press.
-    fn next(self) -> Self {
-        match self {
-            Self::Plan => Self::Auto,
-            _ => Self::Plan,
+    fn choices(auto_available: bool, bypass_available: bool) -> &'static [Self] {
+        match (auto_available, bypass_available) {
+            (false, false) => &Self::BASE_CHOICES,
+            (true, false) => &Self::AUTO_CHOICES,
+            (false, true) => &Self::BYPASS_CHOICES,
+            (true, true) => &Self::ALL_CHOICES,
         }
+    }
+
+    fn picker_index(self, auto_available: bool, bypass_available: bool) -> usize {
+        Self::choices(auto_available, bypass_available)
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(0)
+    }
+
+    fn next(self, auto_available: bool, bypass_available: bool) -> Self {
+        let choices = Self::choices(auto_available, bypass_available);
+        let current = choices
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(choices.len() - 1);
+        choices[(current + 1) % choices.len()]
     }
 }
 
 /// Rows of the `/provider` picker, in the order they are drawn.
 const RUNTIME_CHOICES: [&str; 2] = ["Claude", "Codex"];
+const CLAUDE_PERMISSION_TABS: [&str; 5] =
+    ["Allow", "Ask", "Deny", "Directories", "Recently denied"];
+const CLAUDE_PERMISSION_SCOPES: [(&str, &str); 3] = [
+    ("User settings", "user"),
+    ("Project settings", "project"),
+    ("Local settings", "local"),
+];
+
+fn claude_permission_behavior(tab: usize) -> Option<&'static str> {
+    match tab {
+        0 => Some("allow"),
+        1 => Some("ask"),
+        2 => Some("deny"),
+        3 => Some("directory"),
+        _ => None,
+    }
+}
+
+fn claude_permission_source_label(source: &str) -> &str {
+    match source {
+        "user" | "userSettings" => "User settings",
+        "project" | "projectSettings" => "Project settings",
+        "local" | "localSettings" => "Local settings",
+        "managed" => "Managed settings",
+        "flag" => "Session settings",
+        _ => source,
+    }
+}
 
 /// Vibe settings keys holding which runtimes dvz may connect to. Absent means
 /// not connected: the first launch on a machine connects nothing until the user
@@ -510,18 +628,13 @@ const RUNTIME_CHOICES: [&str; 2] = ["Claude", "Codex"];
 pub(crate) const CLAUDE_PROVIDER_KEY: &str = "claude_provider_enabled";
 pub(crate) const CODEX_PROVIDER_KEY: &str = "codex_provider_enabled";
 
-/// Vibe settings key holding the permission mode the badge was last cycled to.
-/// Shift+Tab and a badge click both write it, so the next session — new or
-/// resumed — opens under the mode the user left behind.
-pub(crate) const CLAUDE_PERMISSION_MODE_KEY: &str = "claude_permission_mode";
-
 struct SlashCommand {
     name: &'static str,
     description: &'static str,
     takes_argument: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 30] = [
+const SLASH_COMMANDS: [SlashCommand; 31] = [
     SlashCommand {
         name: "/provider",
         description: "Switch between the Claude and Codex providers",
@@ -541,6 +654,11 @@ const SLASH_COMMANDS: [SlashCommand; 30] = [
         name: "/effort",
         description: "Set reasoning effort",
         takes_argument: true,
+    },
+    SlashCommand {
+        name: "/permissions",
+        description: "Manage the current provider's permission rules",
+        takes_argument: false,
     },
     SlashCommand {
         name: "/theme",
@@ -649,7 +767,7 @@ const SLASH_COMMANDS: [SlashCommand; 30] = [
     },
     SlashCommand {
         name: "/side-panel",
-        description: "Cycle the docked side panel's width, then close it",
+        description: "Choose the docked side panel size",
         takes_argument: false,
     },
     SlashCommand {
@@ -950,6 +1068,7 @@ pub struct ModelInfo {
     pub is_default: bool,
     pub context_window: Option<u64>,
     pub fast_service_tier: Option<String>,
+    pub supports_auto_mode: bool,
 }
 
 #[derive(Clone)]
@@ -988,6 +1107,15 @@ impl ModelProvider {
     }
 }
 
+fn integration_item_order(state: IntegrationItemState) -> u8 {
+    match state {
+        IntegrationItemState::Inactive => 0,
+        IntegrationItemState::Pending => 1,
+        IntegrationItemState::Unknown => 2,
+        IntegrationItemState::Active => 3,
+    }
+}
+
 impl ModelInfo {
     pub fn from_value(value: &Value) -> Option<Self> {
         let efforts = value
@@ -1011,6 +1139,10 @@ impl ModelInfo {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             context_window: value.get("contextWindow").and_then(Value::as_u64),
+            supports_auto_mode: value
+                .get("supportsAutoMode")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             fast_service_tier: value
                 .get("serviceTiers")
                 .and_then(Value::as_array)
@@ -1076,10 +1208,23 @@ pub enum Action {
     SetFast(bool),
     /// Hand Claude the permission mode the badge just cycled to.
     SetClaudePermissionMode(ClaudePermissionMode),
+    DisableClaudeAutoMode,
+    OpenClaudePermissions(Option<String>),
+    UpdateClaudePermission {
+        action: &'static str,
+        behavior: String,
+        value: String,
+        destination: String,
+    },
+    RetryClaudePermissionDenial {
+        tool: String,
+        input: Value,
+    },
     StartSide(Option<String>),
     ReturnFromSide,
     Compact,
     ScrollToBottom,
+    ScrollToPrompt(u64),
     Copy(String),
     #[allow(dead_code)]
     ShowDiff,
@@ -1148,6 +1293,8 @@ pub enum Action {
         model: String,
         effort: String,
     },
+    /// Save the picked side-panel size as the fallback for new sessions.
+    PersistSidePanelDefault(SidePanelStage),
     /// Save the transcript's Shell display preference for future sessions.
     PersistShellDisplayMode(ShellDisplayMode),
     PersistDiffDisplayMode(DiffDisplayMode),
@@ -1285,6 +1432,21 @@ pub enum ModelScope {
     Default,
 }
 
+#[derive(Clone)]
+struct ClaudePermissionEntry {
+    behavior: String,
+    value: String,
+    source: String,
+    mutable: bool,
+}
+
+#[derive(Clone)]
+struct ClaudePermissionDenial {
+    tool: String,
+    reason: String,
+    input: Value,
+}
+
 impl ModelScope {
     const CHOICES: [Self; 2] = [Self::Session, Self::Default];
 
@@ -1311,6 +1473,13 @@ enum PendingInteraction {
     EffortPicker {
         effort_index: usize,
     },
+    SidePanelPicker {
+        stage_index: usize,
+    },
+    SidePanelScope {
+        stage: SidePanelStage,
+        selected: usize,
+    },
     /// `/provider`: which runtime the next prompt goes to, and which runtimes
     /// dvz may dial at all. A machine that cannot reach the Codex app-server
     /// switches Codex off here, and nothing calls it again until it is back on.
@@ -1328,8 +1497,31 @@ enum PendingInteraction {
         setting: DisplaySetting,
         selected: usize,
     },
+    ClaudePermissionPicker {
+        selected: usize,
+    },
+    ClaudeAutoModeConsent {
+        selected: usize,
+    },
+    ClaudePermissionsPanel {
+        tab: usize,
+        selected: usize,
+        entries: Vec<ClaudePermissionEntry>,
+        denials: Vec<ClaudePermissionDenial>,
+        retry: Option<usize>,
+        rules_locked: bool,
+    },
+    ClaudePermissionScopePicker {
+        behavior: String,
+        selected: usize,
+    },
+    ClaudePermissionRuleInput {
+        behavior: String,
+        destination: String,
+        editor: Editor,
+    },
     VibeModePicker {
-        row: usize,
+        selected: usize,
         vibe: VibeMode,
         response: ResponseLength,
         shell: ShellDisplayMode,
@@ -1376,6 +1568,7 @@ enum PendingInteraction {
         detail: Vec<String>,
         once: Value,
         session: Option<Value>,
+        session_label: String,
         decline: Value,
     },
     UserInput {
@@ -2574,8 +2767,14 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
         PendingInteraction::ModelPicker { .. }
             | PendingInteraction::ModelScope { .. }
             | PendingInteraction::EffortPicker { .. }
+            | PendingInteraction::SidePanelPicker { .. }
+            | PendingInteraction::SidePanelScope { .. }
             | PendingInteraction::RuntimePicker { .. }
             | PendingInteraction::SettingPicker { .. }
+            | PendingInteraction::ClaudePermissionPicker { .. }
+            | PendingInteraction::ClaudePermissionsPanel { .. }
+            | PendingInteraction::ClaudePermissionScopePicker { .. }
+            | PendingInteraction::ClaudePermissionRuleInput { .. }
             | PendingInteraction::VibeModePicker { .. }
             | PendingInteraction::StatusLinePicker { .. }
             | PendingInteraction::SubagentTranscript { .. }
@@ -2873,6 +3072,36 @@ struct SubagentLogLine {
 /// oldest lines are dropped rather than held for the rest of the session.
 const SUBAGENT_LOG_LIMIT: usize = 400;
 
+#[derive(Clone)]
+struct ProviderIntegrationSnapshot {
+    mcp_expanded: bool,
+    plugins_expanded: bool,
+    mcp: Option<Vec<IntegrationItemView>>,
+    plugins: Option<Vec<IntegrationItemView>>,
+    mcp_error: Option<String>,
+    plugin_error: Option<String>,
+}
+
+impl Default for ProviderIntegrationSnapshot {
+    fn default() -> Self {
+        Self {
+            mcp_expanded: true,
+            plugins_expanded: true,
+            mcp: None,
+            plugins: None,
+            mcp_error: None,
+            plugin_error: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct McpFailure {
+    provider: ModelProvider,
+    name: String,
+    detail: Option<String>,
+}
+
 pub struct AppState {
     pub editor: Editor,
     composer_images: Vec<String>,
@@ -2942,6 +3171,8 @@ pub struct AppState {
     command_selection: usize,
     spinner_frame: usize,
     turn_started_at: Option<Instant>,
+    /// Whether the active turn has painted any assistant text yet.
+    turn_response_started: bool,
     /// When `/compact` was sent. Compaction produces no assistant text, so the
     /// activity row runs its own clock until the runtime reports the boundary.
     compacting_started_at: Option<Instant>,
@@ -2955,8 +3186,12 @@ pub struct AppState {
     /// trigger a redraw on its own.
     five_hour_remaining: Option<String>,
     fast_mode: bool,
-    /// Claude's permission mode for this thread.
+    /// Claude's permission mode for this thread and the optional modes exposed
+    /// by its own resolved settings.
     claude_permission_mode: ClaudePermissionMode,
+    bypass_permissions_allowed: bool,
+    claude_auto_mode_disabled: bool,
+    claude_auto_mode_confirmed: bool,
     side_parent: Option<SideParent>,
     last_assistant_markdown: Option<String>,
     composer_notice: Option<(String, Instant)>,
@@ -2972,6 +3207,7 @@ pub struct AppState {
     /// The docked right-hand side panel's width stage. Persisted across
     /// sessions so a panel left open reopens the same way next time.
     side_panel_stage: SidePanelStage,
+    side_panel_prompts_expanded: bool,
     status_line_settings: StatusLineSettings,
     /// Which runtimes this machine may connect to. Both start off — a fresh
     /// install picks in `/provider` — and nothing dials a runtime that is off.
@@ -2991,8 +3227,10 @@ pub struct AppState {
     completion_mode: CompletionMode,
     suggestions_dismissed_text: Option<String>,
     selected_completion_bindings: Vec<SelectedCompletionBinding>,
+    claude_integrations: ProviderIntegrationSnapshot,
+    codex_integrations: ProviderIntegrationSnapshot,
     /// MCP servers that failed to start, reported before any picker was open.
-    mcp_failures: Vec<(String, Option<String>)>,
+    mcp_failures: Vec<McpFailure>,
     /// A session chosen while `thread/start` was still in flight. `thread/resume`
     /// needs a bound thread to switch away from, so the target waits here until the
     /// event loop can run it.
@@ -3091,7 +3329,6 @@ impl AppState {
         let context_window = models
             .get(selected_model)
             .and_then(|model| model.context_window);
-
         let mut state = Self {
             editor: Editor::default(),
             composer_images: Vec::new(),
@@ -3141,6 +3378,7 @@ impl AppState {
             spinner_frame: 0,
             compacting_started_at: None,
             turn_started_at: None,
+            turn_response_started: false,
             last_completed_duration: None,
             branch,
             five_hour_percent,
@@ -3148,7 +3386,10 @@ impl AppState {
             five_hour_reset_at,
             five_hour_remaining: remaining_label(five_hour_reset_at, unix_now()),
             fast_mode: read_fast_mode(),
-            claude_permission_mode: read_claude_permission_mode(),
+            claude_permission_mode: ClaudePermissionMode::Default,
+            bypass_permissions_allowed: false,
+            claude_auto_mode_disabled: false,
+            claude_auto_mode_confirmed: false,
             side_parent: None,
             last_assistant_markdown: None,
             composer_notice: None,
@@ -3163,6 +3404,7 @@ impl AppState {
             // closed is what keeps a brand new session from flashing a panel open
             // before its own (empty) stage is restored.
             side_panel_stage: SidePanelStage::Closed,
+            side_panel_prompts_expanded: true,
             status_line_settings: read_status_line_settings(),
             claude_provider_enabled: claude_provider_enabled(),
             codex_provider_enabled: codex_provider_enabled(),
@@ -3177,6 +3419,8 @@ impl AppState {
             completion_mode: CompletionMode::All,
             suggestions_dismissed_text: None,
             selected_completion_bindings: Vec::new(),
+            claude_integrations: ProviderIntegrationSnapshot::default(),
+            codex_integrations: ProviderIntegrationSnapshot::default(),
             mcp_failures: Vec::new(),
             deferred_resume: None,
             deferred_startup_actions: Vec::new(),
@@ -3215,6 +3459,58 @@ impl AppState {
 
     fn selected_provider(&self) -> ModelProvider {
         ModelProvider::from_model(self.selected_model_name())
+    }
+
+    pub fn is_selected_provider_model(&self, model: &str) -> bool {
+        self.selected_provider() == ModelProvider::from_model(model)
+    }
+
+    fn selected_integration_snapshot_mut(&mut self) -> Option<&mut ProviderIntegrationSnapshot> {
+        self.integration_snapshot_mut(self.selected_provider())
+    }
+
+    fn integration_snapshot_mut(
+        &mut self,
+        provider: ModelProvider,
+    ) -> Option<&mut ProviderIntegrationSnapshot> {
+        match provider {
+            ModelProvider::Claude => Some(&mut self.claude_integrations),
+            ModelProvider::Codex => Some(&mut self.codex_integrations),
+            ModelProvider::OpenCode => None,
+        }
+    }
+
+    fn side_panel_integration_views(&self) -> Vec<ProviderIntegrationView> {
+        let selected = self.selected_provider();
+        [
+            (
+                "Claude",
+                self.claude_provider_enabled,
+                selected == ModelProvider::Claude,
+                &self.claude_integrations,
+            ),
+            (
+                "Codex",
+                self.codex_provider_enabled,
+                selected == ModelProvider::Codex,
+                &self.codex_integrations,
+            ),
+        ]
+        .into_iter()
+        .map(
+            |(provider, enabled, active, snapshot)| ProviderIntegrationView {
+                provider: provider.to_owned(),
+                enabled,
+                active,
+                mcp_expanded: snapshot.mcp_expanded,
+                plugins_expanded: snapshot.plugins_expanded,
+                mcp: snapshot.mcp.clone(),
+                plugins: snapshot.plugins.clone(),
+                mcp_error: snapshot.mcp_error.clone(),
+                plugin_error: snapshot.plugin_error.clone(),
+            },
+        )
+        .collect()
     }
 
     /// Claude 브리지는 실행 중 들어온 프롬프트를 스스로 대기시켜 다음 턴으로 보내므로
@@ -3409,6 +3705,7 @@ impl AppState {
         self.selected_model = index;
         self.selected_effort = effort.clone();
         self.context_window = model.context_window;
+        self.normalize_claude_permission_mode_for_selected_model();
         let detail = if effort.is_empty() {
             format!("↳ {} · {model_name}", provider.label())
         } else {
@@ -3492,6 +3789,7 @@ impl AppState {
         if !model.supports_effort(&self.selected_effort) {
             self.selected_effort = model.default_effort.clone();
         }
+        self.normalize_claude_permission_mode_for_selected_model();
     }
 
     /// True until `thread/start` answers. The UI is fully painted before that, so
@@ -3644,9 +3942,8 @@ impl AppState {
         }
     }
 
-    /// Puts the session back into its pending state so a switch can wipe the screen
-    /// and keep repainting while `thread/start` runs, instead of freezing on the
-    /// thread that is being replaced.
+    /// Puts the session back into its pending state while the replacement thread
+    /// loads, so the cleared screen is immediately repainted with loading status.
     pub fn begin_thread_switch(&mut self) {
         self.thread_id.clear();
         self.spinner_frame = 0;
@@ -3723,8 +4020,73 @@ impl AppState {
     }
 
     pub fn update_plugins(&mut self, response: &Value) {
-        self.mentions = parse_plugin_mentions(response);
-        self.rebuild_completion_catalog();
+        let model = self.selected_model_name().to_owned();
+        self.update_plugins_for_model(response, &model);
+    }
+
+    pub fn update_plugins_for_model(&mut self, response: &Value, model: &str) {
+        let provider = ModelProvider::from_model(model);
+        if provider == self.selected_provider() {
+            self.mentions = parse_plugin_mentions(response);
+        }
+        let plugins = PluginCatalog::from_value(response).installed_panel_items();
+        if let Some(snapshot) = self.integration_snapshot_mut(provider) {
+            snapshot.plugins = Some(plugins);
+            snapshot.plugin_error = None;
+        }
+        if provider == self.selected_provider() {
+            self.rebuild_completion_catalog();
+        }
+    }
+
+    pub fn update_mcp_servers_for_model(&mut self, response: &Value, model: &str) {
+        let provider = ModelProvider::from_model(model);
+        let mut servers = McpServerInfo::list_from_value(response);
+        let active_names = servers
+            .iter()
+            .map(|server| server.name.clone())
+            .collect::<HashSet<_>>();
+        self.mcp_failures.retain(|failure| {
+            failure.provider != provider || !active_names.contains(&failure.name)
+        });
+        let mut items = servers
+            .drain(..)
+            .map(|server| server.panel_item())
+            .collect::<Vec<_>>();
+        items.extend(
+            self.mcp_failures
+                .iter()
+                .filter(|failure| failure.provider == provider)
+                .map(|failure| IntegrationItemView {
+                    name: failure.name.clone(),
+                    state: IntegrationItemState::Inactive,
+                    detail: "실패".to_owned(),
+                }),
+        );
+        items.sort_by(|left, right| {
+            integration_item_order(left.state)
+                .cmp(&integration_item_order(right.state))
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        });
+        if let Some(snapshot) = self.integration_snapshot_mut(provider) {
+            snapshot.mcp = Some(items);
+            snapshot.mcp_error = response
+                .get("unavailableReason")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+        }
+    }
+
+    pub fn note_mcp_query_error_for_model(&mut self, error: impl Into<String>, model: &str) {
+        if let Some(snapshot) = self.integration_snapshot_mut(ModelProvider::from_model(model)) {
+            snapshot.mcp_error = Some(error.into());
+        }
+    }
+
+    pub fn note_plugin_query_error_for_model(&mut self, error: impl Into<String>, model: &str) {
+        if let Some(snapshot) = self.integration_snapshot_mut(ModelProvider::from_model(model)) {
+            snapshot.plugin_error = Some(error.into());
+        }
     }
 
     pub fn update_apps(&mut self, response: &Value) {
@@ -4132,9 +4494,183 @@ impl AppState {
     /// Steps to the next mode and reports it, so the caller can tell the runtime.
     /// The badge itself is the feedback — a notice under the composer would only
     /// flash away while the reading it duplicates stays on screen.
-    pub fn cycle_claude_permission_mode(&mut self) -> ClaudePermissionMode {
-        self.claude_permission_mode = self.claude_permission_mode.next();
-        self.claude_permission_mode
+    pub fn cycle_claude_permission_mode(&mut self) -> Action {
+        let auto_available = self.claude_auto_mode_available();
+        let mode = self
+            .claude_permission_mode
+            .next(auto_available, self.bypass_permissions_allowed);
+        self.choose_claude_permission_mode(mode)
+    }
+
+    pub fn set_claude_permission_mode(&mut self, mode: ClaudePermissionMode) {
+        self.claude_permission_mode = mode;
+    }
+
+    pub fn apply_claude_permission_status(&mut self, status: &Value) {
+        self.apply_claude_permission_policy(status);
+        let mode = status
+            .get("defaultMode")
+            .and_then(Value::as_str)
+            .and_then(ClaudePermissionMode::from_wire)
+            .unwrap_or_default();
+        self.claude_auto_mode_confirmed |= mode == ClaudePermissionMode::Auto;
+        self.claude_permission_mode = if (mode == ClaudePermissionMode::Auto
+            && self.selected_model_name().starts_with("claude:")
+            && !self.claude_auto_mode_available())
+            || (mode == ClaudePermissionMode::BypassPermissions && !self.bypass_permissions_allowed)
+        {
+            ClaudePermissionMode::Default
+        } else {
+            mode
+        };
+    }
+
+    pub fn apply_claude_permission_policy(&mut self, status: &Value) {
+        self.bypass_permissions_allowed = status
+            .get("bypassAvailable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        self.claude_auto_mode_disabled = status
+            .get("autoDisabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    }
+
+    pub fn set_claude_auto_mode_disabled(&mut self, disabled: bool) {
+        self.claude_auto_mode_disabled = disabled;
+    }
+
+    pub fn open_claude_permissions(&mut self, status: &Value, notice: Option<String>) {
+        self.apply_claude_permission_policy(status);
+        if let Some(notice) = notice {
+            self.composer_notice = Some((notice, Instant::now()));
+        }
+        let mut entries = status
+            .get("rules")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|rule| {
+                Some(ClaudePermissionEntry {
+                    behavior: rule.get("behavior")?.as_str()?.to_owned(),
+                    value: rule.get("rule")?.as_str()?.to_owned(),
+                    source: rule.get("source")?.as_str()?.to_owned(),
+                    mutable: rule
+                        .get("mutable")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                })
+            })
+            .collect::<Vec<_>>();
+        entries.extend(
+            status
+                .get("directories")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|directory| {
+                    Some(ClaudePermissionEntry {
+                        behavior: "directory".to_owned(),
+                        value: directory.get("directory")?.as_str()?.to_owned(),
+                        source: directory.get("source")?.as_str()?.to_owned(),
+                        mutable: directory
+                            .get("mutable")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                }),
+        );
+        let denials = status
+            .get("denials")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|denial| {
+                Some(ClaudePermissionDenial {
+                    tool: denial.get("tool")?.as_str()?.to_owned(),
+                    reason: denial
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
+                    input: denial.get("input").cloned().unwrap_or_else(|| json!({})),
+                })
+            })
+            .collect();
+        self.pending = Some(PendingInteraction::ClaudePermissionsPanel {
+            tab: 0,
+            selected: 0,
+            entries,
+            denials,
+            retry: None,
+            rules_locked: status
+                .get("rulesLocked")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        });
+    }
+
+    fn claude_auto_mode_available(&self) -> bool {
+        !self.claude_auto_mode_disabled
+            && self
+                .selected_model()
+                .is_some_and(|model| model.supports_auto_mode)
+    }
+
+    fn normalize_claude_permission_mode_for_selected_model(&mut self) {
+        if (self.claude_permission_mode == ClaudePermissionMode::Auto
+            && self.selected_model_name().starts_with("claude:")
+            && !self.claude_auto_mode_available())
+            || (self.claude_permission_mode == ClaudePermissionMode::BypassPermissions
+                && !self.bypass_permissions_allowed)
+        {
+            self.claude_permission_mode = ClaudePermissionMode::Default;
+        }
+    }
+
+    pub fn open_claude_permission_picker(&mut self) {
+        let auto_available = self.claude_auto_mode_available();
+        self.pending = Some(PendingInteraction::ClaudePermissionPicker {
+            selected: self
+                .claude_permission_mode
+                .picker_index(auto_available, self.bypass_permissions_allowed),
+        });
+    }
+
+    fn apply_claude_permission_picker(&mut self, selected: usize) -> Action {
+        let Some(mode) = ClaudePermissionMode::choices(
+            self.claude_auto_mode_available(),
+            self.bypass_permissions_allowed,
+        )
+        .get(selected)
+        .copied() else {
+            return Action::None;
+        };
+        self.choose_claude_permission_mode(mode)
+    }
+
+    fn choose_claude_permission_mode(&mut self, mode: ClaudePermissionMode) -> Action {
+        if mode == ClaudePermissionMode::Auto && !self.claude_auto_mode_confirmed {
+            self.pending = Some(PendingInteraction::ClaudeAutoModeConsent { selected: 0 });
+            return Action::None;
+        }
+        self.claude_permission_mode = mode;
+        Action::SetClaudePermissionMode(mode)
+    }
+
+    fn apply_claude_auto_mode_consent(&mut self, selected: usize) -> Action {
+        match selected {
+            0 => {
+                self.claude_auto_mode_confirmed = true;
+                self.claude_permission_mode = ClaudePermissionMode::Auto;
+                Action::SetClaudePermissionMode(ClaudePermissionMode::Auto)
+            }
+            2 => {
+                self.claude_auto_mode_disabled = true;
+                Action::DisableClaudeAutoMode
+            }
+            _ => Action::None,
+        }
     }
 
     pub fn effective_fast_mode(&self) -> bool {
@@ -4326,6 +4862,7 @@ impl AppState {
             })
             .or_else(|| effort.map(ToOwned::to_owned))
             .unwrap_or_else(|| self.selected_effort.clone());
+        self.normalize_claude_permission_mode_for_selected_model();
     }
 
     /// Rebuilds the transcript from a resumed thread. `rollout` fills in what
@@ -4419,6 +4956,7 @@ impl AppState {
     }
 
     fn reset_turn_item_tracking(&mut self) {
+        self.turn_response_started = false;
         self.completed_item_ids.clear();
         self.seen_operation_signatures.clear();
         self.turn_shell_results.clear();
@@ -4499,8 +5037,13 @@ impl AppState {
         if let Some(notice) = notice {
             picker = picker.with_notice(notice);
         }
-        for (name, detail) in std::mem::take(&mut self.mcp_failures) {
-            picker.apply_failure(&name, detail);
+        let provider = self.selected_provider();
+        for failure in std::mem::take(&mut self.mcp_failures) {
+            if failure.provider == provider {
+                picker.apply_failure(&failure.name, failure.detail);
+            } else {
+                self.mcp_failures.push(failure);
+            }
         }
         self.pending = Some(PendingInteraction::McpPicker(picker));
     }
@@ -4595,11 +5138,31 @@ impl AppState {
     /// servers come up.
     pub fn note_mcp_failure(&mut self, name: String, detail: Option<String>) {
         if let Some(PendingInteraction::McpPicker(picker)) = self.pending.as_mut() {
-            picker.apply_failure(&name, detail);
-            return;
+            picker.apply_failure(&name, detail.clone());
         }
-        self.mcp_failures.retain(|(known, _)| known != &name);
-        self.mcp_failures.push((name, detail));
+        let provider = self.selected_provider();
+        self.mcp_failures
+            .retain(|failure| failure.provider != provider || failure.name != name);
+        self.mcp_failures.push(McpFailure {
+            provider,
+            name: name.clone(),
+            detail,
+        });
+        if let Some(snapshot) = self.selected_integration_snapshot_mut()
+            && let Some(items) = snapshot.mcp.as_mut()
+        {
+            items.retain(|item| item.name != name);
+            items.push(IntegrationItemView {
+                name,
+                state: IntegrationItemState::Inactive,
+                detail: "실패".to_owned(),
+            });
+            items.sort_by(|left, right| {
+                integration_item_order(left.state)
+                    .cmp(&integration_item_order(right.state))
+                    .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            });
+        }
     }
 
     pub fn confirm_marketplace_add(&mut self, source: &str) {
@@ -4779,6 +5342,9 @@ impl AppState {
             activity: self.activity(),
             activity_model: self.activity_model(),
             activity_phase: self.activity_phase(),
+            waiting_for_response: self.busy
+                && !self.turn_response_started
+                && self.last_assistant_markdown.is_some(),
             activity_progress_phase: self.compaction_progress_phase(),
             footer: self
                 .status_line_has_content()
@@ -4794,6 +5360,8 @@ impl AppState {
             shell_display_mode: self.shell_display_mode(),
             diff_display_mode: self.diff_display_mode(),
             side_panel_width: self.side_panel_stage.width(),
+            side_panel_prompts_expanded: self.side_panel_prompts_expanded,
+            side_panel_integrations: self.side_panel_integration_views(),
         }
     }
 
@@ -4894,6 +5462,9 @@ impl AppState {
             activity: self.activity(),
             activity_model: self.activity_model(),
             activity_phase: self.activity_phase(),
+            waiting_for_response: self.busy
+                && !self.turn_response_started
+                && self.last_assistant_markdown.is_some(),
             activity_progress_phase: self.compaction_progress_phase(),
             plan_summary: self.plan_summary.as_ref(),
             plan_active: self.busy,
@@ -4969,6 +5540,9 @@ impl AppState {
             Some(PendingInteraction::MarketplacePicker(picker)) => picker.handle_paste(text),
             Some(PendingInteraction::ProviderPicker(picker)) => picker.handle_paste(text),
             Some(PendingInteraction::ProviderOAuthCode { editor, .. }) => editor.insert_str(text),
+            Some(PendingInteraction::ClaudePermissionRuleInput { editor, .. }) => {
+                editor.insert_str(text)
+            }
             Some(_) => {}
             None => {
                 if pasted {
@@ -5250,7 +5824,7 @@ impl AppState {
             // here, ahead of the plain Tab that queues a prompt during a turn.
             KeyCode::BackTab | KeyCode::Tab if key.code == KeyCode::BackTab || shift => {
                 if self.claude_permission_mode().is_some() {
-                    return Action::SetClaudePermissionMode(self.cycle_claude_permission_mode());
+                    return self.cycle_claude_permission_mode();
                 }
                 Action::Tick(true)
             }
@@ -5493,12 +6067,20 @@ impl AppState {
                 if let Some(reason) = params.get("reason").and_then(Value::as_str) {
                     detail.push(format!("이유: {reason}"));
                 }
+                let (session, session_label) =
+                    approval_session_choice(params, json!({ "decision": "acceptForSession" }));
                 self.pending = Some(PendingInteraction::Approval {
                     id,
-                    title: "명령 실행을 허용할까요?".to_owned(),
+                    title: params
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .filter(|title| !title.is_empty())
+                        .unwrap_or("명령 실행을 허용할까요?")
+                        .to_owned(),
                     detail,
                     once: json!({ "decision": "accept" }),
-                    session: Some(json!({ "decision": "acceptForSession" })),
+                    session,
+                    session_label,
                     decline: json!({ "decision": "decline" }),
                 });
                 Action::None
@@ -5511,12 +6093,20 @@ impl AppState {
                 if let Some(root) = params.get("grantRoot").and_then(Value::as_str) {
                     detail.push(format!("쓰기 경로: {root}"));
                 }
+                let (session, session_label) =
+                    approval_session_choice(params, json!({ "decision": "acceptForSession" }));
                 self.pending = Some(PendingInteraction::Approval {
                     id,
-                    title: "파일 변경을 허용할까요?".to_owned(),
+                    title: params
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .filter(|title| !title.is_empty())
+                        .unwrap_or("파일 변경을 허용할까요?")
+                        .to_owned(),
                     detail,
                     once: json!({ "decision": "accept" }),
-                    session: Some(json!({ "decision": "acceptForSession" })),
+                    session,
+                    session_label,
                     decline: json!({ "decision": "decline" }),
                 });
                 Action::None
@@ -5526,16 +6116,32 @@ impl AppState {
                     .get("permissions")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
-                let detail = permission_detail(&requested);
-                self.pending = Some(PendingInteraction::Approval {
-                    id,
-                    title: "추가 권한을 허용할까요?".to_owned(),
-                    detail,
-                    once: json!({ "permissions": requested, "scope": "turn" }),
-                    session: Some(json!({
+                let mut detail = params
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .filter(|reason| !reason.is_empty())
+                    .map(|reason| vec![reason.to_owned()])
+                    .unwrap_or_default();
+                detail.extend(permission_detail(&requested));
+                let (session, session_label) = approval_session_choice(
+                    params,
+                    json!({
                         "permissions": params.get("permissions").cloned().unwrap_or_else(|| json!({})),
                         "scope": "session"
-                    })),
+                    }),
+                );
+                self.pending = Some(PendingInteraction::Approval {
+                    id,
+                    title: params
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .filter(|title| !title.is_empty())
+                        .unwrap_or("추가 권한을 허용할까요?")
+                        .to_owned(),
+                    detail,
+                    once: json!({ "permissions": requested, "scope": "turn" }),
+                    session,
+                    session_label,
                     decline: json!({ "permissions": {}, "scope": "turn" }),
                 });
                 Action::None
@@ -5737,6 +6343,23 @@ impl AppState {
                     self.account = label.to_owned();
                 }
                 self.set_account_plan(AccountPlan::from_claude(account, usage));
+            }
+            "claude/permissionMode/rejected" => {
+                if let Some(mode) = params
+                    .get("effectivePermissionMode")
+                    .and_then(Value::as_str)
+                    .and_then(ClaudePermissionMode::from_wire)
+                {
+                    self.set_claude_permission_mode(mode);
+                }
+                self.push_notice(
+                    BlockKind::Warning,
+                    "권한 모드 전환 거부",
+                    params
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Claude 설정 또는 관리 정책에서 이 모드를 허용하지 않습니다."),
+                );
             }
             "turn/started" => {
                 if let Some(turn_id) = params
@@ -6222,7 +6845,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/provider [claude|codex]  Claude·Codex provider 전환과 연결 사용/미사용\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기 전환(닫힘→24→36→48)\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n{login_help}\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
+                    format!("/provider [claude|codex]  Claude·Codex provider 전환과 연결 사용/미사용\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/permissions  현재 provider 권한 규칙 관리\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n{login_help}\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
                 ));
                 Action::None
             }
@@ -6374,9 +6997,25 @@ impl AppState {
                 }
                 Action::None
             }
+            "/permissions" if parts.len() == 1 && using_claude => {
+                Action::OpenClaudePermissions(None)
+            }
+            "/permissions" if parts.len() == 1 => {
+                self.committed.push(Block::new(
+                    BlockKind::System,
+                    "Permissions",
+                    "Codex는 현재 Full Access 권한 프로필을 사용합니다.",
+                ));
+                Action::None
+            }
+            "/permissions" => {
+                self.committed
+                    .push(Block::new(BlockKind::Error, "Usage", "/permissions"));
+                Action::None
+            }
             "/vibemode" if parts.len() == 1 => {
                 self.pending = Some(PendingInteraction::VibeModePicker {
-                    row: 0,
+                    selected: self.vibe_mode.picker_index(),
                     vibe: self.vibe_mode,
                     response: self.response_length,
                     shell: self.shell_display_mode,
@@ -6603,8 +7242,18 @@ impl AppState {
                     .push(Block::new(BlockKind::Error, "Usage", "/statusline"));
                 Action::None
             }
+            "/side-panel" if parts.len() == 1 => {
+                self.pending = Some(PendingInteraction::SidePanelPicker {
+                    stage_index: self.side_panel_stage.index(),
+                });
+                Action::None
+            }
             "/side-panel" => {
-                self.cycle_side_panel();
+                self.committed.push(Block::new(
+                    BlockKind::Error,
+                    "Usage",
+                    "/side-panel",
+                ));
                 Action::None
             }
             "/new" if self.busy => {
@@ -6619,6 +7268,16 @@ impl AppState {
             "/status" => {
                 let model = self.selected_model_display_name();
                 let provider = self.selected_provider().label();
+                let permissions = self
+                    .claude_permission_mode()
+                    .map(|mode| format!("{} ({})", mode.label(), mode.wire()))
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{} ({})",
+                            self.permission_mode().label(),
+                            self.permission_mode().profile()
+                        )
+                    });
                 let connections = format!(
                     "Claude {} · Codex {}",
                     if self.claude_provider_enabled {
@@ -6636,12 +7295,10 @@ impl AppState {
                     BlockKind::System,
                     "Status",
                     format!(
-                        "thread: {}\nprovider: {provider}\nconnections: {connections}\nmodel: {model}\neffort: {}\ntheme: {}\npermissions: {} ({})\ncwd: {}",
+                        "thread: {}\nprovider: {provider}\nconnections: {connections}\nmodel: {model}\neffort: {}\ntheme: {}\npermissions: {permissions}\ncwd: {}",
                         self.thread_id,
                         self.selected_effort,
                         theme::current().display_name(),
-                        self.permission_mode().label(),
-                        self.permission_mode().profile(),
                         self.cwd
                     ),
                 ));
@@ -6830,6 +7487,61 @@ impl AppState {
                 self.pending = Some(PendingInteraction::EffortPicker { effort_index });
                 Action::None
             }
+            PendingInteraction::SidePanelPicker { mut stage_index } => {
+                match key.code {
+                    KeyCode::Esc => return Action::None,
+                    KeyCode::Left | KeyCode::Up => {
+                        stage_index = stage_index.saturating_sub(1);
+                    }
+                    KeyCode::Char('p') if ctrl => {
+                        stage_index = stage_index.saturating_sub(1);
+                    }
+                    KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
+                        stage_index = (stage_index + 1).min(SidePanelStage::CHOICES.len() - 1);
+                    }
+                    KeyCode::Char('n') if ctrl => {
+                        stage_index = (stage_index + 1).min(SidePanelStage::CHOICES.len() - 1);
+                    }
+                    KeyCode::Char(ch) if !ctrl && !alt && ('1'..='4').contains(&ch) => {
+                        let index = ch.to_digit(10).unwrap_or(1) as usize - 1;
+                        self.open_side_panel_scope(SidePanelStage::CHOICES[index]);
+                        return Action::None;
+                    }
+                    KeyCode::Enter => {
+                        self.open_side_panel_scope(SidePanelStage::CHOICES[stage_index]);
+                        return Action::None;
+                    }
+                    _ => {}
+                }
+                self.pending = Some(PendingInteraction::SidePanelPicker { stage_index });
+                Action::None
+            }
+            PendingInteraction::SidePanelScope {
+                stage,
+                mut selected,
+            } => {
+                match key.code {
+                    KeyCode::Esc => return Action::None,
+                    KeyCode::Up | KeyCode::Left => selected = selected.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
+                        selected = (selected + 1).min(ModelScope::CHOICES.len() - 1);
+                    }
+                    KeyCode::Char('k') if !ctrl && !alt => selected = selected.saturating_sub(1),
+                    KeyCode::Char('j') if !ctrl && !alt => {
+                        selected = (selected + 1).min(ModelScope::CHOICES.len() - 1);
+                    }
+                    KeyCode::Char(ch) if !ctrl && !alt && ('1'..='2').contains(&ch) => {
+                        let index = ch.to_digit(10).unwrap_or(1) as usize - 1;
+                        return self.apply_side_panel_scope(stage, ModelScope::CHOICES[index]);
+                    }
+                    KeyCode::Enter => {
+                        return self.apply_side_panel_scope(stage, ModelScope::CHOICES[selected]);
+                    }
+                    _ => {}
+                }
+                self.pending = Some(PendingInteraction::SidePanelScope { stage, selected });
+                Action::None
+            }
             PendingInteraction::RuntimePicker { mut selected } => {
                 match key.code {
                     KeyCode::Esc => return Action::None,
@@ -6880,14 +7592,237 @@ impl AppState {
                 self.pending = Some(PendingInteraction::SettingPicker { setting, selected });
                 Action::None
             }
+            PendingInteraction::ClaudePermissionPicker { mut selected } => {
+                let count = ClaudePermissionMode::choices(
+                    self.claude_auto_mode_available(),
+                    self.bypass_permissions_allowed,
+                )
+                .len();
+                match key.code {
+                    KeyCode::Esc => return Action::None,
+                    KeyCode::Left | KeyCode::Up => selected = selected.saturating_sub(1),
+                    KeyCode::Char('p') if ctrl => selected = selected.saturating_sub(1),
+                    KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
+                        selected = (selected + 1).min(count - 1);
+                    }
+                    KeyCode::Char('n') if ctrl => selected = (selected + 1).min(count - 1),
+                    KeyCode::Char(ch) if !ctrl && !alt && ('1'..='9').contains(&ch) => {
+                        let index = ch.to_digit(10).unwrap_or(1) as usize - 1;
+                        if index < count {
+                            return self.apply_claude_permission_picker(index);
+                        }
+                    }
+                    KeyCode::Enter => return self.apply_claude_permission_picker(selected),
+                    _ => {}
+                }
+                self.pending = Some(PendingInteraction::ClaudePermissionPicker { selected });
+                Action::None
+            }
+            PendingInteraction::ClaudeAutoModeConsent { mut selected } => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('n') if !ctrl && !alt => return Action::None,
+                    KeyCode::Up | KeyCode::Left => selected = selected.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
+                        selected = (selected + 1).min(2);
+                    }
+                    KeyCode::Char(ch @ '1'..='3') if !ctrl && !alt => {
+                        return self.apply_claude_auto_mode_consent(
+                            ch.to_digit(10).unwrap_or(1) as usize - 1,
+                        );
+                    }
+                    KeyCode::Enter => return self.apply_claude_auto_mode_consent(selected),
+                    _ => {}
+                }
+                self.pending = Some(PendingInteraction::ClaudeAutoModeConsent { selected });
+                Action::None
+            }
+            PendingInteraction::ClaudePermissionsPanel {
+                mut tab,
+                mut selected,
+                entries,
+                denials,
+                mut retry,
+                rules_locked,
+            } => {
+                let restore = |state: &mut Self, tab, selected, entries, denials, retry| {
+                    state.pending = Some(PendingInteraction::ClaudePermissionsPanel {
+                        tab,
+                        selected,
+                        entries,
+                        denials,
+                        retry,
+                        rules_locked,
+                    });
+                };
+                match key.code {
+                    KeyCode::Esc => {
+                        return retry
+                            .and_then(|index| denials.get(index))
+                            .map(|denial| Action::RetryClaudePermissionDenial {
+                                tool: denial.tool.clone(),
+                                input: denial.input.clone(),
+                            })
+                            .unwrap_or(Action::None);
+                    }
+                    KeyCode::Left => {
+                        tab = tab.saturating_sub(1);
+                        selected = 0;
+                    }
+                    KeyCode::Right | KeyCode::Tab => {
+                        tab = (tab + 1).min(CLAUDE_PERMISSION_TABS.len() - 1);
+                        selected = 0;
+                    }
+                    KeyCode::Up | KeyCode::Char('p') if key.code == KeyCode::Up || ctrl => {
+                        selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('n') if key.code == KeyCode::Down || ctrl => {
+                        let count = if let Some(behavior) = claude_permission_behavior(tab) {
+                            entries
+                                .iter()
+                                .filter(|entry| entry.behavior == behavior)
+                                .count()
+                        } else {
+                            denials.len()
+                        };
+                        selected = (selected + 1).min(count.saturating_sub(1));
+                    }
+                    KeyCode::Char('a') if tab < 4 && !rules_locked && !ctrl && !alt => {
+                        return {
+                            self.pending = Some(PendingInteraction::ClaudePermissionScopePicker {
+                                behavior: claude_permission_behavior(tab)
+                                    .expect("permission rule tab")
+                                    .to_owned(),
+                                selected: if tab == 2 { 2 } else { 1 },
+                            });
+                            Action::None
+                        };
+                    }
+                    KeyCode::Delete | KeyCode::Char('d') if tab < 4 && !ctrl && !alt => {
+                        let target = claude_permission_behavior(tab).and_then(|behavior| {
+                            entries
+                                .iter()
+                                .filter(|entry| entry.behavior == behavior)
+                                .nth(selected)
+                                .cloned()
+                        });
+                        if let Some(target) = target.filter(|entry| entry.mutable) {
+                            return Action::UpdateClaudePermission {
+                                action: "remove",
+                                behavior: target.behavior,
+                                value: target.value,
+                                destination: target.source,
+                            };
+                        }
+                        self.composer_notice = Some((
+                            if rules_locked {
+                                "관리 정책에서 권한 규칙 변경을 잠갔습니다."
+                            } else {
+                                "관리되는 권한 규칙은 제거할 수 없습니다."
+                            }
+                            .to_owned(),
+                            Instant::now(),
+                        ));
+                    }
+                    KeyCode::Char('r') if tab == 4 && !ctrl && !alt => {
+                        if selected < denials.len() {
+                            retry = (retry != Some(selected)).then_some(selected);
+                        }
+                    }
+                    _ => {}
+                }
+                restore(self, tab, selected, entries, denials, retry);
+                Action::None
+            }
+            PendingInteraction::ClaudePermissionScopePicker {
+                behavior,
+                mut selected,
+            } => {
+                match key.code {
+                    KeyCode::Esc => return Action::OpenClaudePermissions(None),
+                    KeyCode::Left | KeyCode::Up => selected = selected.saturating_sub(1),
+                    KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
+                        selected = (selected + 1).min(CLAUDE_PERMISSION_SCOPES.len() - 1);
+                    }
+                    KeyCode::Char(ch @ '1'..='3') if !ctrl && !alt => {
+                        selected = ch.to_digit(10).unwrap_or(1) as usize - 1;
+                        self.pending = Some(PendingInteraction::ClaudePermissionRuleInput {
+                            behavior,
+                            destination: CLAUDE_PERMISSION_SCOPES[selected].1.to_owned(),
+                            editor: Editor::default(),
+                        });
+                        return Action::None;
+                    }
+                    KeyCode::Enter => {
+                        self.pending = Some(PendingInteraction::ClaudePermissionRuleInput {
+                            behavior,
+                            destination: CLAUDE_PERMISSION_SCOPES[selected].1.to_owned(),
+                            editor: Editor::default(),
+                        });
+                        return Action::None;
+                    }
+                    _ => {}
+                }
+                self.pending =
+                    Some(PendingInteraction::ClaudePermissionScopePicker { behavior, selected });
+                Action::None
+            }
+            PendingInteraction::ClaudePermissionRuleInput {
+                behavior,
+                destination,
+                mut editor,
+            } => match key.code {
+                KeyCode::Esc => Action::OpenClaudePermissions(None),
+                KeyCode::Enter => match editor.take_for_submit() {
+                    Some(value) => Action::UpdateClaudePermission {
+                        action: "add",
+                        behavior,
+                        value,
+                        destination,
+                    },
+                    None => {
+                        self.pending = Some(PendingInteraction::ClaudePermissionRuleInput {
+                            behavior,
+                            destination,
+                            editor,
+                        });
+                        Action::None
+                    }
+                },
+                KeyCode::Backspace => {
+                    editor.backspace();
+                    self.pending = Some(PendingInteraction::ClaudePermissionRuleInput {
+                        behavior,
+                        destination,
+                        editor,
+                    });
+                    Action::None
+                }
+                KeyCode::Char(ch) if !ctrl && !alt => {
+                    editor.insert(ch);
+                    self.pending = Some(PendingInteraction::ClaudePermissionRuleInput {
+                        behavior,
+                        destination,
+                        editor,
+                    });
+                    Action::None
+                }
+                _ => {
+                    self.pending = Some(PendingInteraction::ClaudePermissionRuleInput {
+                        behavior,
+                        destination,
+                        editor,
+                    });
+                    Action::None
+                }
+            },
             PendingInteraction::VibeModePicker {
-                mut row,
+                mut selected,
                 vibe,
                 response,
                 shell,
                 diff,
             } => {
-                match key.code {
+                let moved = match key.code {
                     KeyCode::Esc => {
                         self.response_length = response;
                         self.shell_display_mode = shell;
@@ -6903,25 +7838,29 @@ impl AppState {
                             diff: self.diff_display_mode,
                         };
                     }
-                    KeyCode::Up => row = row.saturating_sub(1),
-                    KeyCode::Down => row = (row + 1).min(2),
-                    KeyCode::Left => match row {
-                        0 => self.response_length = self.response_length.next().next(),
-                        1 => self.shell_display_mode = self.shell_display_mode.next().next(),
-                        _ => self.diff_display_mode = self.diff_display_mode.next().next(),
-                    },
-                    KeyCode::Right => match row {
-                        0 => self.response_length = self.response_length.next(),
-                        1 => self.shell_display_mode = self.shell_display_mode.next(),
-                        _ => self.diff_display_mode = self.diff_display_mode.next(),
-                    },
-                    _ => {}
-                }
-                if matches!(key.code, KeyCode::Left | KeyCode::Right) {
-                    self.vibe_mode = VibeMode::Vibe;
+                    KeyCode::Left | KeyCode::Up => {
+                        selected = selected.saturating_sub(1);
+                        true
+                    }
+                    KeyCode::Char('p') if ctrl => {
+                        selected = selected.saturating_sub(1);
+                        true
+                    }
+                    KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
+                        selected = (selected + 1).min(VibeMode::PICKER_CHOICES.len() - 1);
+                        true
+                    }
+                    KeyCode::Char('n') if ctrl => {
+                        selected = (selected + 1).min(VibeMode::PICKER_CHOICES.len() - 1);
+                        true
+                    }
+                    _ => false,
+                };
+                if moved {
+                    self.apply_vibe_mode(VibeMode::PICKER_CHOICES[selected]);
                 }
                 self.pending = Some(PendingInteraction::VibeModePicker {
-                    row,
+                    selected,
                     vibe,
                     response,
                     shell,
@@ -7182,6 +8121,7 @@ impl AppState {
                 detail,
                 once,
                 session,
+                session_label,
                 decline,
             } => match hotkey {
                 KeyCode::Char('y') | KeyCode::Enter => Action::RpcResponse { id, result: once },
@@ -7200,6 +8140,7 @@ impl AppState {
                         detail,
                         once,
                         session,
+                        session_label,
                         decline,
                     });
                     Action::None
@@ -7580,6 +8521,70 @@ impl AppState {
                     input_placeholder: "",
                 })
             }
+            PendingInteraction::SidePanelPicker { stage_index } => Some(OverlayView {
+                closable: true,
+                title: "Side panel".to_owned(),
+                lines: Vec::new(),
+                slider: Some(EffortSlider {
+                    efforts: SidePanelStage::CHOICES
+                        .iter()
+                        .map(|stage| stage.label().to_owned())
+                        .collect(),
+                    selected: *stage_index,
+                    detail: None,
+                }),
+                hint: "←→ to adjust  ·  Enter to continue  ·  Esc to cancel".to_owned(),
+                style: OverlayStyle::Picker,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            }),
+            PendingInteraction::SidePanelScope { stage, selected } => {
+                let label_width = ModelScope::CHOICES
+                    .iter()
+                    .map(|scope| scope.label().len())
+                    .max()
+                    .unwrap_or_default();
+                let mut lines = vec![
+                    OverlayLine {
+                        text: stage.label().to_owned(),
+                        selected: false,
+                        muted: true,
+                    },
+                    OverlayLine {
+                        text: String::new(),
+                        selected: false,
+                        muted: true,
+                    },
+                ];
+                lines.extend(ModelScope::CHOICES.iter().enumerate().map(|(index, scope)| {
+                    let detail = match scope {
+                        ModelScope::Session => "Keeps this session's own size",
+                        ModelScope::Default => "Uses this size for new sessions",
+                    };
+                    OverlayLine {
+                        text: format!(
+                            "{}. {:<label_width$}  ·  {detail}",
+                            index + 1,
+                            scope.label()
+                        ),
+                        selected: index == *selected,
+                        muted: false,
+                    }
+                }));
+                Some(OverlayView {
+                    closable: true,
+                    title: "Apply to".to_owned(),
+                    lines,
+                    slider: None,
+                    hint: "1-2 select  ·  ↑↓ navigate  ·  Enter to apply  ·  Esc to cancel"
+                        .to_owned(),
+                    style: OverlayStyle::Picker,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                })
+            }
             PendingInteraction::RuntimePicker { selected } => Some(OverlayView {
                 closable: true,
                 title: "Provider".to_owned(),
@@ -7589,6 +8594,7 @@ impl AppState {
                         .map(|index| self.runtime_step_label(index))
                         .collect(),
                     selected: *selected,
+                    detail: None,
                 }),
                 hint: "←→ 이동  ·  Enter 사용  ·  Space 연결 전환  ·  Esc 닫기".to_owned(),
                 style: OverlayStyle::Picker,
@@ -7607,12 +8613,182 @@ impl AppState {
                         .map(|choice| (*choice).to_owned())
                         .collect(),
                     selected: *selected,
+                    detail: None,
                 }),
                 hint: "←→ to adjust  ·  Enter to confirm  ·  Esc to cancel".to_owned(),
                 style: OverlayStyle::Picker,
                 input: None,
                 input_label: "",
                 input_placeholder: "",
+            }),
+            PendingInteraction::ClaudePermissionPicker { selected } => Some(OverlayView {
+                closable: true,
+                title: "Permission mode".to_owned(),
+                lines: Vec::new(),
+                slider: Some(EffortSlider {
+                    efforts: ClaudePermissionMode::choices(
+                        self.claude_auto_mode_available(),
+                        self.bypass_permissions_allowed,
+                    )
+                    .iter()
+                    .map(|mode| mode.picker_label().to_owned())
+                    .collect(),
+                    selected: *selected,
+                    detail: None,
+                }),
+                hint: "←→ 이동  ·  Enter 적용  ·  Esc 닫기".to_owned(),
+                style: OverlayStyle::Picker,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            }),
+            PendingInteraction::ClaudeAutoModeConsent { selected } => Some(OverlayView {
+                closable: false,
+                title: "Enable auto mode?".to_owned(),
+                lines: [
+                    "Auto mode executes actions without permission prompts after a safety classifier reviews them.",
+                    "It reduces prompts but does not guarantee safety. Use it only when you trust the task direction.",
+                    "Yes, enable auto mode",
+                    "No",
+                    "No, don't ask again",
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, text)| OverlayLine {
+                    text: text.to_owned(),
+                    selected: index >= 2 && index - 2 == *selected,
+                    muted: index < 2,
+                })
+                .collect(),
+                slider: None,
+                hint: "↑↓ select  ·  Enter confirm  ·  Esc cancel".to_owned(),
+                style: OverlayStyle::Panel,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            }),
+            PendingInteraction::ClaudePermissionsPanel {
+                tab,
+                selected,
+                entries,
+                denials,
+                retry,
+                rules_locked,
+            } => {
+                let lines = if let Some(behavior) = claude_permission_behavior(*tab) {
+                    let mut lines = entries
+                        .iter()
+                        .filter(|entry| entry.behavior == behavior)
+                        .enumerate()
+                        .map(|(index, entry)| OverlayLine {
+                            text: format!(
+                                "{}\n{}",
+                                entry.value,
+                                claude_permission_source_label(&entry.source)
+                            ),
+                            selected: index == *selected,
+                            muted: false,
+                        })
+                        .collect::<Vec<_>>();
+                    if lines.is_empty() {
+                        lines.push(OverlayLine {
+                            text: format!("No {} rules", CLAUDE_PERMISSION_TABS[*tab].to_lowercase()),
+                            selected: false,
+                            muted: true,
+                        });
+                    }
+                    lines
+                } else {
+                    let mut lines = denials
+                        .iter()
+                        .enumerate()
+                        .map(|(index, denial)| OverlayLine {
+                            text: match (retry == &Some(index), denial.reason.is_empty()) {
+                                (true, true) => format!("↻ {}", denial.tool),
+                                (true, false) => {
+                                    format!("↻ {}\n{}", denial.tool, denial.reason)
+                                }
+                                (false, true) => denial.tool.clone(),
+                                (false, false) => {
+                                    format!("{}\n{}", denial.tool, denial.reason)
+                                }
+                            },
+                            selected: index == *selected,
+                            muted: false,
+                        })
+                        .collect::<Vec<_>>();
+                    if lines.is_empty() {
+                        lines.push(OverlayLine {
+                            text: "No recent denials".to_owned(),
+                            selected: false,
+                            muted: true,
+                        });
+                    }
+                    lines
+                };
+                Some(OverlayView {
+                    closable: true,
+                    title: format!("Permissions · {}", CLAUDE_PERMISSION_TABS[*tab]),
+                    lines,
+                    slider: None,
+                    hint: if *tab == 4 {
+                        if retry.is_some() {
+                            "←→ category  ·  ↑↓ move  ·  R unmark  ·  Esc retry & close".to_owned()
+                        } else {
+                            "←→ category  ·  ↑↓ move  ·  R retry  ·  Esc close".to_owned()
+                        }
+                    } else if *rules_locked {
+                        "←→ category  ·  ↑↓ move  ·  Managed rules only  ·  Esc close".to_owned()
+                    } else {
+                        "←→ category  ·  ↑↓ move  ·  A add  ·  D remove  ·  Esc close".to_owned()
+                    },
+                    style: OverlayStyle::CompactPanel,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                })
+            }
+            PendingInteraction::ClaudePermissionScopePicker { behavior, selected } => {
+                Some(OverlayView {
+                    closable: true,
+                    title: format!("Add {behavior} rule · Scope"),
+                    lines: Vec::new(),
+                    slider: Some(EffortSlider {
+                        efforts: CLAUDE_PERMISSION_SCOPES
+                            .iter()
+                            .map(|(label, _)| (*label).to_owned())
+                            .collect(),
+                        selected: *selected,
+                        detail: None,
+                    }),
+                    hint: "←→ move  ·  Enter select  ·  Esc back".to_owned(),
+                    style: OverlayStyle::Picker,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                })
+            }
+            PendingInteraction::ClaudePermissionRuleInput {
+                behavior,
+                destination,
+                editor,
+            } => Some(OverlayView {
+                closable: true,
+                title: format!(
+                    "Add {behavior} rule · {}",
+                    claude_permission_source_label(destination)
+                ),
+                lines: Vec::new(),
+                slider: None,
+                hint: "Enter save  ·  Esc back".to_owned(),
+                style: OverlayStyle::Panel,
+                input: Some(editor),
+                input_label: if behavior == "directory" { "Directory" } else { "Rule" },
+                input_placeholder: if behavior == "directory" {
+                    "../shared"
+                } else {
+                    "Bash(npm test)"
+                },
             }),
             PendingInteraction::SubagentTranscript { id, offset } => {
                 let log = self.subagent_logs.get(id);
@@ -7653,29 +8829,27 @@ impl AppState {
                     input_placeholder: "",
                 })
             }
-            PendingInteraction::VibeModePicker { row, .. } => Some(OverlayView {
-                closable: true,
-                title: "Vibe".to_owned(),
-                lines: [
-                    format!("Response: {}", self.response_length_label()),
-                    format!("Shell: {}", self.shell_display_mode.label()),
-                    format!("Diff: {}", self.diff_display_mode.label()),
-                ]
-                .into_iter()
-                .enumerate()
-                .map(|(index, text)| OverlayLine {
-                    text,
-                    selected: index == *row,
-                    muted: false,
+            PendingInteraction::VibeModePicker { selected, .. } => {
+                let vibe = VibeMode::PICKER_CHOICES[*selected];
+                Some(OverlayView {
+                    closable: true,
+                    title: "Vibe Mode".to_owned(),
+                    lines: Vec::new(),
+                    slider: Some(EffortSlider {
+                        efforts: VibeMode::PICKER_CHOICES
+                            .iter()
+                            .map(|mode| mode.picker_label().to_owned())
+                            .collect(),
+                        selected: *selected,
+                        detail: Some(vibe.picker_detail().to_owned()),
+                    }),
+                    hint: "←→ 이동  ·  Enter 적용  ·  Esc 취소".to_owned(),
+                    style: OverlayStyle::Picker,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
                 })
-                .collect(),
-                slider: None,
-                hint: "↑↓ row  ·  ←→ adjust  ·  Enter to confirm  ·  Esc to cancel".to_owned(),
-                style: OverlayStyle::Picker,
-                input: None,
-                input_label: "",
-                input_placeholder: "",
-            }),
+            }
             PendingInteraction::StatusLinePicker { selected } => Some(OverlayView {
                 closable: true,
                 title: "Status line".to_owned(),
@@ -7821,6 +8995,7 @@ impl AppState {
                 title,
                 detail,
                 session,
+                session_label,
                 ..
             } => {
                 let mut lines = detail
@@ -7838,7 +9013,7 @@ impl AppState {
                 });
                 if session.is_some() {
                     lines.push(OverlayLine {
-                        text: "[a] 세션 동안 허용".to_owned(),
+                        text: format!("[a] {session_label}"),
                         selected: false,
                         muted: false,
                     });
@@ -7853,7 +9028,11 @@ impl AppState {
                     title: title.clone(),
                     lines,
                     slider: None,
-                    hint: "y / a / n".to_owned(),
+                    hint: if session.is_some() {
+                        "y / a / n".to_owned()
+                    } else {
+                        "y / n".to_owned()
+                    },
                     style: OverlayStyle::Panel,
                     input: None,
                     input_label: "",
@@ -8434,15 +9613,17 @@ impl AppState {
         }
     }
 
-    /// Nothing is shown while the session is still starting. The screen is already
-    /// complete and the composer already works, so announcing the wait would only
-    /// draw attention to a delay the user is about to spend typing through anyway.
-    /// A prompt sent into that window still reports as `Working`, because it is.
+    /// A resumed session keeps the previous transcript visible and names the wait,
+    /// so the transition never looks like an empty new conversation. A fresh
+    /// session stays silent because its welcome screen is already complete.
     fn activity(&self) -> Option<String> {
         // An idle screen can go a long time between ticks, so the lifetime is
         // enforced on read as well: a faded warning must not outlive its arm.
         if let Some(notice) = self.live_activity_notice() {
             return Some(notice.to_owned());
+        }
+        if self.host_loading {
+            return Some("Loading session..".to_owned());
         }
         // Compaction outranks the ordinary turn label: the runtime that runs it as
         // a turn would otherwise report a `Working` response the user never asked for.
@@ -8620,6 +9801,19 @@ impl AppState {
         }
     }
 
+    fn open_side_panel_scope(&mut self, stage: SidePanelStage) {
+        self.pending = Some(PendingInteraction::SidePanelScope { stage, selected: 0 });
+    }
+
+    fn apply_side_panel_scope(&mut self, stage: SidePanelStage, scope: ModelScope) -> Action {
+        self.set_side_panel_stage(stage);
+        if scope == ModelScope::Default {
+            Action::PersistSidePanelDefault(stage)
+        } else {
+            Action::None
+        }
+    }
+
     fn apply_model(&mut self, index: usize, effort: Option<&str>) {
         self.commit_welcome_card();
         let Some(model) = self.models.get(index) else {
@@ -8634,6 +9828,7 @@ impl AppState {
         self.selected_model = index;
         self.selected_effort = selected_effort.clone();
         self.context_window = context_window.or(self.context_window);
+        self.normalize_claude_permission_mode_for_selected_model();
         self.committed.push(Block::new(
             BlockKind::ModelChange,
             "✓ Model changed",
@@ -8730,8 +9925,13 @@ impl AppState {
     }
 
     pub fn cycle_vibe_mode(&mut self) -> (ShellDisplayMode, DiffDisplayMode) {
-        self.vibe_mode = self.vibe_mode.next();
-        match self.vibe_mode {
+        self.apply_vibe_mode(self.vibe_mode.next());
+        (self.shell_display_mode, self.diff_display_mode)
+    }
+
+    fn apply_vibe_mode(&mut self, vibe_mode: VibeMode) {
+        self.vibe_mode = vibe_mode;
+        match vibe_mode {
             VibeMode::Vibe => {
                 self.response_length = ResponseLength::Short;
                 self.shell_display_mode = ShellDisplayMode::Collapse;
@@ -8748,7 +9948,6 @@ impl AppState {
                 self.diff_display_mode = DiffDisplayMode::Expand;
             }
         }
-        (self.shell_display_mode, self.diff_display_mode)
     }
 
     pub fn cycle_shell_display_mode(&mut self) -> ShellDisplayMode {
@@ -8767,9 +9966,14 @@ impl AppState {
     /// new stage is written against this session right away, so a resume reopens
     /// on the width this session was left on rather than another session's.
     pub fn cycle_side_panel(&mut self) -> SidePanelStage {
-        self.side_panel_stage = self.side_panel_stage.next();
+        let stage = self.side_panel_stage.next();
+        self.set_side_panel_stage(stage);
+        stage
+    }
+
+    fn set_side_panel_stage(&mut self, stage: SidePanelStage) {
+        self.side_panel_stage = stage;
         let _ = write_session_side_panel_stage(&self.thread_id, self.side_panel_stage);
-        self.side_panel_stage
     }
 
     /// Restores the panel this session was last left showing. Called whenever a
@@ -8780,7 +9984,8 @@ impl AppState {
         }
         // A session nobody opened the panel in starts closed instead of
         // inheriting whatever width the previous session was left on.
-        self.side_panel_stage = read_session_side_panel_stage(&self.thread_id).unwrap_or_default();
+        self.side_panel_stage = read_session_side_panel_stage(&self.thread_id)
+            .unwrap_or_else(read_default_side_panel_stage);
     }
 
     #[cfg(test)]
@@ -8796,6 +10001,30 @@ impl AppState {
     pub fn toggle_plan_summary(&mut self) {
         if let Some(summary) = &mut self.plan_summary {
             summary.expanded = !summary.expanded;
+        }
+    }
+
+    pub fn toggle_side_panel_prompts(&mut self) {
+        self.side_panel_prompts_expanded = !self.side_panel_prompts_expanded;
+    }
+
+    pub fn toggle_side_panel_mcp(&mut self, provider: &str) {
+        if let Some(snapshot) = self.integration_snapshot_mut(match provider {
+            "Claude" => ModelProvider::Claude,
+            "Codex" => ModelProvider::Codex,
+            _ => return,
+        }) {
+            snapshot.mcp_expanded = !snapshot.mcp_expanded;
+        }
+    }
+
+    pub fn toggle_side_panel_plugins(&mut self, provider: &str) {
+        if let Some(snapshot) = self.integration_snapshot_mut(match provider {
+            "Claude" => ModelProvider::Claude,
+            "Codex" => ModelProvider::Codex,
+            _ => return,
+        }) {
+            snapshot.plugins_expanded = !snapshot.plugins_expanded;
         }
     }
 
@@ -8878,6 +10107,19 @@ impl AppState {
                     }
                 }
             }
+            Some(PendingInteraction::SidePanelScope {
+                stage,
+                selected,
+            }) => match row
+                .checked_sub(MODEL_SCOPE_HEADER_ROWS)
+                .and_then(|choice| ModelScope::CHOICES.get(choice))
+            {
+                Some(scope) => self.apply_side_panel_scope(stage, *scope),
+                None => {
+                    self.pending = Some(PendingInteraction::SidePanelScope { stage, selected });
+                    Action::Tick(false)
+                }
+            },
             Some(PendingInteraction::ThemePicker { theme_index }) => {
                 match ThemeKind::ALL.get(row) {
                     Some(theme) => self.apply_theme(*theme),
@@ -8898,6 +10140,15 @@ impl AppState {
                 self.pending = Some(PendingInteraction::StatusLinePicker { selected: row });
                 self.toggle_status_line_field(StatusLineField::ALL[row])
             }
+            Some(PendingInteraction::ClaudeAutoModeConsent { selected }) => {
+                match row.checked_sub(2) {
+                    Some(choice) if choice < 3 => self.apply_claude_auto_mode_consent(choice),
+                    _ => {
+                        self.pending = Some(PendingInteraction::ClaudeAutoModeConsent { selected });
+                        Action::Tick(false)
+                    }
+                }
+            }
             Some(PendingInteraction::SessionPicker(mut picker)) => match picker.click_row(row) {
                 SessionPickerResult::Select(thread_id) => Action::ResumeThread(thread_id),
                 SessionPickerResult::Cancel => Action::None,
@@ -8906,6 +10157,32 @@ impl AppState {
                     Action::Tick(false)
                 }
             },
+            Some(PendingInteraction::ClaudePermissionsPanel {
+                tab,
+                selected,
+                entries,
+                denials,
+                retry,
+                rules_locked,
+            }) => {
+                let count = if let Some(behavior) = claude_permission_behavior(tab) {
+                    entries
+                        .iter()
+                        .filter(|entry| entry.behavior == behavior)
+                        .count()
+                } else {
+                    denials.len()
+                };
+                self.pending = Some(PendingInteraction::ClaudePermissionsPanel {
+                    tab,
+                    selected: if row < count { row } else { selected },
+                    entries,
+                    denials,
+                    retry,
+                    rules_locked,
+                });
+                Action::None
+            }
             // 승인 프롬프트의 [y]/[a]/[n] 행은 키와 같은 응답을 보낸다. 상세
             // 행(옵션 앞의 detail)은 클릭해도 답이 되지 않는다.
             Some(PendingInteraction::Approval {
@@ -8914,6 +10191,7 @@ impl AppState {
                 detail,
                 once,
                 session,
+                session_label,
                 decline,
             }) => {
                 let first = detail.len();
@@ -8937,6 +10215,7 @@ impl AppState {
                         detail,
                         once,
                         session,
+                        session_label,
                         decline,
                     });
                     Action::Tick(false)
@@ -9036,6 +10315,17 @@ impl AppState {
 
     pub fn close_overlay(&mut self) -> Action {
         match self.pending.take() {
+            Some(PendingInteraction::ClaudePermissionsPanel {
+                retry: Some(index),
+                denials,
+                ..
+            }) => denials
+                .get(index)
+                .map(|denial| Action::RetryClaudePermissionDenial {
+                    tool: denial.tool.clone(),
+                    input: denial.input.clone(),
+                })
+                .unwrap_or(Action::None),
             Some(pending) if closable_overlay(&pending) => Action::None,
             other => {
                 self.pending = other;
@@ -9078,11 +10368,79 @@ impl AppState {
                     }
                 }
             }
+            Some(PendingInteraction::SidePanelPicker { stage_index }) => {
+                match SidePanelStage::CHOICES.get(step).copied() {
+                    Some(stage) => {
+                        self.open_side_panel_scope(stage);
+                        Action::None
+                    }
+                    None => {
+                        self.pending = Some(PendingInteraction::SidePanelPicker { stage_index });
+                        Action::Tick(false)
+                    }
+                }
+            }
+            Some(PendingInteraction::VibeModePicker {
+                selected,
+                vibe,
+                response,
+                shell,
+                diff,
+            }) => {
+                if let Some(mode) = VibeMode::PICKER_CHOICES.get(step).copied() {
+                    self.apply_vibe_mode(mode);
+                    Action::PersistVibeDisplayModes {
+                        vibe: self.vibe_mode,
+                        response: self.response_length,
+                        shell: self.shell_display_mode,
+                        diff: self.diff_display_mode,
+                    }
+                } else {
+                    self.pending = Some(PendingInteraction::VibeModePicker {
+                        selected,
+                        vibe,
+                        response,
+                        shell,
+                        diff,
+                    });
+                    Action::Tick(false)
+                }
+            }
             Some(PendingInteraction::SettingPicker { setting, selected }) => {
                 if step < setting.choices().len() {
                     self.apply_setting_picker(setting, step)
                 } else {
                     self.pending = Some(PendingInteraction::SettingPicker { setting, selected });
+                    Action::Tick(false)
+                }
+            }
+            Some(PendingInteraction::ClaudePermissionPicker { selected }) => {
+                if step
+                    < ClaudePermissionMode::choices(
+                        self.claude_auto_mode_available(),
+                        self.bypass_permissions_allowed,
+                    )
+                    .len()
+                {
+                    self.apply_claude_permission_picker(step)
+                } else {
+                    self.pending = Some(PendingInteraction::ClaudePermissionPicker { selected });
+                    Action::Tick(false)
+                }
+            }
+            Some(PendingInteraction::ClaudePermissionScopePicker { behavior, selected }) => {
+                if step < CLAUDE_PERMISSION_SCOPES.len() {
+                    self.pending = Some(PendingInteraction::ClaudePermissionRuleInput {
+                        behavior,
+                        destination: CLAUDE_PERMISSION_SCOPES[step].1.to_owned(),
+                        editor: Editor::default(),
+                    });
+                    Action::None
+                } else {
+                    self.pending = Some(PendingInteraction::ClaudePermissionScopePicker {
+                        behavior,
+                        selected,
+                    });
                     Action::Tick(false)
                 }
             }
@@ -9254,6 +10612,9 @@ impl AppState {
         let Some(mut block) = active_item_block(&self.cwd, item) else {
             return;
         };
+        if matches!(block.kind, BlockKind::Assistant) && !block.body.is_empty() {
+            self.turn_response_started = true;
+        }
         let existing_batch = self
             .active
             .get(id)
@@ -9336,6 +10697,7 @@ impl AppState {
                 return;
             }
             if matches!(block.kind, BlockKind::Assistant) {
+                self.turn_response_started |= !block.body.is_empty();
                 self.last_assistant_markdown = Some(block.body.clone());
             }
             if matches!(block.kind, BlockKind::FileChange) {
@@ -9358,6 +10720,9 @@ impl AppState {
         let Some(delta) = params.get("delta").and_then(Value::as_str) else {
             return;
         };
+        if matches!(kind, BlockKind::Assistant) && !delta.is_empty() {
+            self.turn_response_started = true;
+        }
         let active = self.ensure_active(item_id, kind, title);
         append_capped(&mut active.block.body, delta);
         active.revision = active.revision.wrapping_add(1);
@@ -9563,6 +10928,7 @@ impl AppState {
         for id in std::mem::take(&mut self.active_order) {
             if let Some(item) = self.active.remove(&id) {
                 if matches!(item.block.kind, BlockKind::Assistant) {
+                    self.turn_response_started |= !item.block.body.is_empty();
                     self.last_assistant_markdown = Some(item.block.body.clone());
                 }
                 if matches!(item.block.kind, BlockKind::FileChange) {
@@ -10461,6 +11827,23 @@ fn permission_detail(value: &Value) -> Vec<String> {
     detail
 }
 
+fn approval_session_choice(params: &Value, response: Value) -> (Option<Value>, String) {
+    if params
+        .get("claudePermission")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let label = params
+            .get("persistentApprovalLabel")
+            .and_then(Value::as_str)
+            .filter(|label| !label.is_empty())
+            .unwrap_or("")
+            .to_owned();
+        return ((!label.is_empty()).then_some(response), label);
+    }
+    (Some(response), "세션 동안 허용".to_owned())
+}
+
 /// Heading for a `fileChange` item: the action and the file it touched. A batch
 /// is counted instead, and the body then
 /// names each file itself.
@@ -10614,6 +11997,7 @@ fn effort_slider(model: &ModelInfo, selected: usize) -> EffortSlider {
             .map(|effort| effort.id.clone())
             .collect(),
         selected: selected.min(model.efforts.len().saturating_sub(1)),
+        detail: None,
     }
 }
 
@@ -10868,17 +12252,6 @@ fn read_fast_mode() -> bool {
         .is_some_and(|config| parse_fast_mode(&config))
 }
 
-/// The permission mode the badge was last left on. Only auto and plan can be
-/// picked now, so anything else an older build saved opens on auto.
-fn read_claude_permission_mode() -> ClaudePermissionMode {
-    match read_vibe_config_value(CLAUDE_PERMISSION_MODE_KEY)
-        .and_then(|value| ClaudePermissionMode::from_wire(&value))
-    {
-        Some(mode @ (ClaudePermissionMode::Auto | ClaudePermissionMode::Plan)) => mode,
-        _ => ClaudePermissionMode::Auto,
-    }
-}
-
 fn read_vibe_mode() -> VibeMode {
     read_vibe_config_value("vibe_mode")
         .map(|value| match value.as_str() {
@@ -10927,6 +12300,12 @@ fn read_shell_display_mode() -> ShellDisplayMode {
 
 /// Where each session's own panel stage is kept. The stage is a per-session
 /// preference, so it rides beside the settings file rather than inside it.
+fn read_default_side_panel_stage() -> SidePanelStage {
+    read_vibe_config_value("side_panel_stage")
+        .map(|value| SidePanelStage::from_config_value(&value))
+        .unwrap_or_default()
+}
+
 fn side_panel_stages_path() -> Option<PathBuf> {
     vibe_settings_path().and_then(|path| Some(path.parent()?.join("side-panel-stages.json")))
 }
@@ -11315,6 +12694,7 @@ mod tests {
             is_default,
             context_window: None,
             fast_service_tier: Some("priority".to_owned()),
+            supports_auto_mode: slug.starts_with("claude:"),
         }
     }
 
@@ -11327,6 +12707,104 @@ mod tests {
             "gpt-5.6-sol",
             Some("high"),
         )
+    }
+
+    #[test]
+    fn integration_snapshots_stay_with_the_provider_that_was_queried() {
+        let mut state = AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![
+                test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
+                test_model("claude:claude-opus-5", "Claude Opus", false),
+            ],
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+        state.claude_provider_enabled = true;
+        state.codex_provider_enabled = true;
+        state.update_mcp_servers_for_model(
+            &json!({
+                "data": [{
+                    "name": "claude-mcp",
+                    "status": "connected",
+                    "tools": {},
+                    "authStatus": "unsupported"
+                }]
+            }),
+            "claude:claude-opus-5",
+        );
+        state.update_plugins_for_model(
+            &json!({
+                "marketplaces": [{
+                    "name": "codex",
+                    "plugins": [{
+                        "id": "codex-plugin@codex",
+                        "name": "codex-plugin",
+                        "installed": true,
+                        "enabled": true,
+                        "availability": "AVAILABLE",
+                        "interface": { "displayName": "Codex Plugin" }
+                    }]
+                }]
+            }),
+            "gpt-5.6-sol",
+        );
+
+        let views = state.side_panel_integration_views();
+        let claude = views
+            .iter()
+            .find(|view| view.provider == "Claude")
+            .expect("Claude snapshot");
+        let codex = views
+            .iter()
+            .find(|view| view.provider == "Codex")
+            .expect("Codex snapshot");
+
+        assert_eq!(
+            claude.mcp.as_ref().expect("Claude MCP")[0].name,
+            "claude-mcp"
+        );
+        assert!(claude.plugins.is_none());
+        assert_eq!(
+            codex.plugins.as_ref().expect("Codex plugin")[0].name,
+            "Codex Plugin"
+        );
+        assert!(codex.mcp.is_none());
+    }
+
+    #[test]
+    fn mcp_startup_failures_do_not_cross_provider_snapshots() {
+        let mut state = AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![
+                test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
+                test_model("claude:claude-opus-5", "Claude Opus", false),
+            ],
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+        state.update_mcp_servers_for_model(&json!({ "data": [] }), "gpt-5.6-sol");
+        state.note_mcp_failure("codex-failed".to_owned(), Some("spawn failed".to_owned()));
+        state.update_mcp_servers_for_model(&json!({ "data": [] }), "claude:claude-opus-5");
+
+        assert!(
+            state
+                .codex_integrations
+                .mcp
+                .as_ref()
+                .is_some_and(|items| items.iter().any(|item| item.name == "codex-failed"))
+        );
+        assert!(
+            state
+                .claude_integrations
+                .mcp
+                .as_ref()
+                .is_some_and(Vec::is_empty)
+        );
     }
 
     #[test]
@@ -11642,9 +13120,11 @@ mod tests {
         state.set_host_loading(true);
         assert!(!state.host_turn_busy());
         assert!(state.host_loading());
+        assert_eq!(state.view().activity.as_deref(), Some("Loading session.."));
 
         state.set_host_loading(false);
         assert!(!state.host_loading());
+        assert_eq!(state.view().activity, None);
     }
 
     #[test]
@@ -11778,12 +13258,32 @@ mod tests {
         }
         state.run_slash_command("/vibemode");
 
+        let overlay = state.overlay_view().expect("vibe picker");
+        let slider = overlay.slider.expect("vibe choices");
+        assert_eq!(slider.efforts, ["Off", "On", "Super Vibe"]);
+        assert_eq!(slider.selected, 1);
+        assert_eq!(
+            slider.detail.as_deref(),
+            Some("Diff와 명령어를 압축해서 표시합니다.")
+        );
+
         state.handle_key(KeyEvent::from(KeyCode::Right));
-        assert_eq!(state.response_length_label(), "Normal");
+        assert_eq!(state.vibe_mode(), VibeMode::SuperVibe);
+        assert_eq!(state.shell_display_mode(), ShellDisplayMode::Hide);
+        assert_eq!(state.diff_display_mode(), DiffDisplayMode::Hide);
+        assert_eq!(
+            state
+                .overlay_view()
+                .and_then(|overlay| overlay.slider)
+                .and_then(|slider| slider.detail),
+            Some("Diff와 명령어 등을 모두 숨깁니다.".to_owned())
+        );
 
         state.handle_key(KeyEvent::from(KeyCode::Esc));
         assert_eq!(state.response_length_label(), "Short");
         assert_eq!(state.vibe_mode_label(), "Vibe: On");
+        assert_eq!(state.shell_display_mode(), ShellDisplayMode::Collapse);
+        assert_eq!(state.diff_display_mode(), DiffDisplayMode::Collapse);
     }
 
     #[test]
@@ -13861,6 +15361,24 @@ mod tests {
     }
 
     #[test]
+    fn status_command_reports_the_active_claude_permission_mode() {
+        let mut state = AppState::new(
+            "claude:thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![test_model("claude:sonnet", "Sonnet", true)],
+            "claude:sonnet",
+            Some("high"),
+        );
+        state.claude_permission_mode = ClaudePermissionMode::DontAsk;
+
+        state.run_slash_command("/status");
+
+        let body = &state.committed.last().expect("status block").body;
+        assert!(body.contains("permissions: don't ask (dontAsk)"));
+    }
+
+    #[test]
     fn statusline_command_toggles_individual_status_fields_with_space() {
         let mut state = test_state();
         state.status_line_settings = StatusLineSettings::default();
@@ -14035,6 +15553,21 @@ mod tests {
         assert!(matches!(blocks[0].kind, BlockKind::Welcome));
         assert!(matches!(blocks[1].kind, BlockKind::System));
         assert!(!state.show_welcome);
+    }
+
+    #[test]
+    fn new_version_update_notice_is_english() {
+        let mut state = test_state();
+        state.show_welcome = false;
+
+        state.push_update_available("1.3.11");
+        let blocks = state.drain_committed();
+
+        assert_eq!(blocks[0].title, "Update Available");
+        assert_eq!(
+            blocks[0].body,
+            "New version 1.3.11 is available. Run: dvz update"
+        );
     }
 
     #[test]
@@ -14284,6 +15817,7 @@ mod tests {
             is_default: true,
             context_window: None,
             fast_service_tier: Some("priority".to_owned()),
+            supports_auto_mode: false,
         };
         let mut state = AppState::new(
             "thread".to_owned(),
@@ -14378,6 +15912,27 @@ mod tests {
             Action::PersistModelDefault { ref model, ref effort }
                 if model == "gpt-5.6-sol" && effort == "high"
         ));
+        assert!(state.overlay_view().is_none());
+    }
+
+    #[test]
+    fn choosing_the_default_side_panel_scope_applies_and_persists_the_size() {
+        let mut state = test_state();
+        state.thread_id.clear();
+        state.run_slash_command("/side-panel");
+
+        state.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        let overlay = state.overlay_view().expect("side-panel scope picker");
+        assert_eq!(overlay.title, "Apply to");
+        assert_eq!(overlay.lines[0].text, "Large");
+
+        let action = state.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+
+        assert!(matches!(
+            action,
+            Action::PersistSidePanelDefault(SidePanelStage::Large)
+        ));
+        assert_eq!(state.side_panel_stage(), SidePanelStage::Large);
         assert!(state.overlay_view().is_none());
     }
 
@@ -14664,6 +16219,23 @@ mod tests {
         state.select_model_and_effort("gpt-5.6-sol", Some("medium"));
         state.handle_notification("turn/completed", &json!({}));
         assert_eq!(state.activity().as_deref(), Some("Completed (10s)"));
+    }
+
+    #[test]
+    fn previous_response_waits_only_until_new_assistant_text_appears() {
+        let mut state = test_state();
+        state.last_assistant_markdown = Some("previous response".to_owned());
+        state.editor.set_text("next prompt");
+
+        assert!(matches!(state.submit_editor(), Action::Submit(_)));
+        assert!(state.view().waiting_for_response);
+
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({ "itemId": "answer", "delta": "new response" }),
+        );
+
+        assert!(!state.view().waiting_for_response);
     }
 
     #[test]
@@ -16493,6 +18065,242 @@ mod tests {
     }
 
     #[test]
+    fn permissions_command_opens_claude_rules_and_keeps_codex_fixed() {
+        let mut claude = AppState::new(
+            "claude:thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![test_model("claude:sonnet", "Sonnet", true)],
+            "claude:sonnet",
+            Some("high"),
+        );
+
+        assert!(matches!(
+            claude.run_slash_command("/permissions"),
+            Action::OpenClaudePermissions(None)
+        ));
+        claude.open_claude_permissions(
+            &json!({
+                "rules": [{
+                    "behavior": "allow",
+                    "rule": "Read(./docs/**)",
+                    "source": "projectSettings",
+                    "mutable": true
+                }],
+                "directories": [],
+                "denials": []
+            }),
+            None,
+        );
+        let panel = claude.overlay_view().expect("permission rules");
+        assert_eq!(panel.title, "Permissions · Allow");
+        assert!(panel.lines[0].text.contains("Read(./docs/**)"));
+        assert!(panel.lines[0].text.contains("Project settings"));
+        assert!(matches!(
+            claude.run_slash_command("/permissions dont-ask"),
+            Action::None
+        ));
+
+        let mut codex = test_state();
+        assert!(matches!(
+            codex.run_slash_command("/permissions"),
+            Action::None
+        ));
+        assert!(
+            codex
+                .committed
+                .last()
+                .is_some_and(|block| block.body.contains("Full Access"))
+        );
+    }
+
+    #[test]
+    fn claude_permission_requests_show_the_provider_reason() {
+        let mut state = test_state();
+        assert!(matches!(
+            state.begin_server_request(
+                json!(91),
+                "item/permissions/requestApproval",
+                &json!({
+                    "reason": "Claude가 외부 경로를 읽으려 합니다.",
+                    "permissions": { "tool": "Read", "blockedPath": "D:/outside" }
+                }),
+            ),
+            Action::None
+        ));
+
+        let overlay = state.overlay_view().expect("permission approval");
+        assert_eq!(overlay.title, "추가 권한을 허용할까요?");
+        assert!(
+            overlay
+                .lines
+                .iter()
+                .any(|line| line.text.contains("외부 경로"))
+        );
+    }
+
+    #[test]
+    fn claude_permission_prompts_only_offer_sdk_suggestions_persistently() {
+        let mut state = test_state();
+        state.begin_server_request(
+            json!(92),
+            "item/commandExecution/requestApproval",
+            &json!({
+                "claudePermission": true,
+                "title": "Claude wants to run npm test",
+                "command": "npm test"
+            }),
+        );
+        let overlay = state.overlay_view().expect("Claude approval");
+        assert_eq!(overlay.title, "Claude wants to run npm test");
+        assert!(
+            !overlay
+                .lines
+                .iter()
+                .any(|line| line.text.starts_with("[a]"))
+        );
+        assert_eq!(overlay.hint, "y / n");
+
+        let mut state = test_state();
+        state.begin_server_request(
+            json!(93),
+            "item/commandExecution/requestApproval",
+            &json!({
+                "claudePermission": true,
+                "command": "npm test",
+                "persistentApprovalLabel": "이 프로젝트에서 항상 허용: Bash(npm test)"
+            }),
+        );
+        let overlay = state.overlay_view().expect("Claude persistent approval");
+        assert!(overlay.lines.iter().any(|line| {
+            line.text == "[a] 이 프로젝트에서 항상 허용: Bash(npm test)"
+        }));
+        assert_eq!(overlay.hint, "y / a / n");
+    }
+
+    #[test]
+    fn recently_denied_actions_retry_with_the_original_input_after_close() {
+        let mut state = test_state();
+        state.open_claude_permissions(
+            &json!({
+                "rules": [],
+                "directories": [],
+                "denials": [{
+                    "tool": "Bash",
+                    "reason": "classifier",
+                    "input": { "command": "git push" }
+                }]
+            }),
+            None,
+        );
+        for _ in 0..4 {
+            assert!(matches!(
+                state.handle_key(KeyEvent::from(KeyCode::Right)),
+                Action::None
+            ));
+        }
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Char('r'))),
+            Action::None
+        ));
+        let overlay = state.overlay_view().expect("marked retry");
+        assert!(overlay.lines[0].text.starts_with("↻ Bash"));
+
+        match state.handle_key(KeyEvent::from(KeyCode::Esc)) {
+            Action::RetryClaudePermissionDenial { tool, input } => {
+                assert_eq!(tool, "Bash");
+                assert_eq!(
+                    input.get("command").and_then(Value::as_str),
+                    Some("git push")
+                );
+            }
+            _ => panic!("closing the panel should resume the marked denial"),
+        }
+    }
+
+    #[test]
+    fn claude_permission_rules_add_and_remove_in_the_selected_scope() {
+        let mut state = test_state();
+        state.open_claude_permissions(
+            &json!({ "rules": [], "directories": [], "denials": [] }),
+            None,
+        );
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Char('a'))),
+            Action::None
+        ));
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::None
+        ));
+        for ch in "Read".chars() {
+            assert!(matches!(
+                state.handle_key(KeyEvent::from(KeyCode::Char(ch))),
+                Action::None
+            ));
+        }
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::UpdateClaudePermission {
+                action: "add",
+                ref behavior,
+                ref value,
+                ref destination,
+            } if behavior == "allow" && value == "Read" && destination == "project"
+        ));
+
+        state.open_claude_permissions(
+            &json!({
+                "rules": [{
+                    "behavior": "allow",
+                    "rule": "Read",
+                    "source": "project",
+                    "mutable": true
+                }],
+                "directories": [],
+                "denials": []
+            }),
+            None,
+        );
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Char('d'))),
+            Action::UpdateClaudePermission {
+                action: "remove",
+                ref behavior,
+                ref value,
+                ref destination,
+            } if behavior == "allow" && value == "Read" && destination == "project"
+        ));
+    }
+
+    #[test]
+    fn auto_mode_requires_the_same_session_opt_in_as_claude_code() {
+        let mut state = AppState::new(
+            "claude:thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![test_model("claude:sonnet", "Sonnet", true)],
+            "claude:sonnet",
+            Some("high"),
+        );
+        state.claude_permission_mode = ClaudePermissionMode::Plan;
+
+        assert!(matches!(state.cycle_claude_permission_mode(), Action::None));
+        assert_eq!(
+            state.overlay_view().expect("auto opt-in").title,
+            "Enable auto mode?"
+        );
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::SetClaudePermissionMode(ClaudePermissionMode::Auto)
+        ));
+        assert_eq!(
+            state.claude_permission_mode(),
+            Some(ClaudePermissionMode::Auto)
+        );
+    }
+
+    #[test]
     fn marketplace_subcommands_route_through_the_confirmation_step() {
         let mut state = test_state();
 
@@ -16571,12 +18379,10 @@ mod tests {
         );
     }
 
-    /// The badge walks Claude's modes in the CLI's own order, and stops short of
-    /// a bypass the settings forbid — the CLI would reject that mode outright.
-    /// Only auto and plan are on offer, so the badge has to toggle between the
-    /// two and never reach the modes an older build could cycle into.
+    /// The badge walks Claude's modes in order and stops short of a bypass when
+    /// settings forbid it.
     #[test]
-    fn the_permission_badge_toggles_auto_and_plan() {
+    fn the_permission_badge_cycles_the_available_claude_modes() {
         let mut state = AppState::new(
             "claude:thread".to_owned(),
             "cwd".to_owned(),
@@ -16585,24 +18391,77 @@ mod tests {
             "claude:sonnet",
             Some("high"),
         );
-        state.claude_permission_mode = ClaudePermissionMode::Auto;
+        state.claude_permission_mode = ClaudePermissionMode::Default;
+        state.bypass_permissions_allowed = false;
+        state.claude_auto_mode_confirmed = true;
 
         assert_eq!(
             state.claude_permission_mode(),
-            Some(ClaudePermissionMode::Auto)
+            Some(ClaudePermissionMode::Default)
         );
-        let walked = std::iter::repeat_with(|| state.cycle_claude_permission_mode())
-            .take(4)
-            .collect::<Vec<_>>();
+        let walked = std::iter::repeat_with(|| match state.cycle_claude_permission_mode() {
+            Action::SetClaudePermissionMode(mode) => mode,
+            _ => panic!("confirmed auto mode should switch immediately"),
+        })
+        .take(4)
+        .collect::<Vec<_>>();
         assert_eq!(
             walked,
             [
+                ClaudePermissionMode::AcceptEdits,
                 ClaudePermissionMode::Plan,
                 ClaudePermissionMode::Auto,
-                ClaudePermissionMode::Plan,
-                ClaudePermissionMode::Auto,
+                ClaudePermissionMode::Default,
             ]
         );
+
+        state.bypass_permissions_allowed = true;
+        state.claude_permission_mode = ClaudePermissionMode::Default;
+        let walked = std::iter::repeat_with(|| match state.cycle_claude_permission_mode() {
+            Action::SetClaudePermissionMode(mode) => mode,
+            _ => panic!("confirmed auto mode should switch immediately"),
+        })
+        .take(5)
+        .collect::<Vec<_>>();
+        assert_eq!(
+            walked,
+            [
+                ClaudePermissionMode::AcceptEdits,
+                ClaudePermissionMode::Plan,
+                ClaudePermissionMode::BypassPermissions,
+                ClaudePermissionMode::Auto,
+                ClaudePermissionMode::Default,
+            ]
+        );
+    }
+
+    #[test]
+    fn unsupported_claude_models_hide_and_leave_auto_mode() {
+        let mut model = test_model("claude:haiku", "Haiku", true);
+        model.supports_auto_mode = false;
+        let mut state = AppState::new(
+            "claude:thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![model],
+            "claude:haiku",
+            Some("high"),
+        );
+        state.claude_permission_mode = ClaudePermissionMode::Auto;
+
+        state.replace_models(state.models.clone());
+
+        assert_eq!(
+            state.claude_permission_mode(),
+            Some(ClaudePermissionMode::Default)
+        );
+        state.open_claude_permission_picker();
+        let choices = state
+            .overlay_view()
+            .and_then(|view| view.slider)
+            .expect("permission choices")
+            .efforts;
+        assert!(!choices.iter().any(|choice| choice == "Auto mode"));
     }
 
     /// Shift+Tab is how the CLI cycles these, so it cycles them here too — and
@@ -16617,17 +18476,17 @@ mod tests {
             "claude:sonnet",
             Some("high"),
         );
-        state.claude_permission_mode = ClaudePermissionMode::Auto;
+        state.claude_permission_mode = ClaudePermissionMode::Default;
 
         let action = state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
 
         assert!(matches!(
             action,
-            Action::SetClaudePermissionMode(ClaudePermissionMode::Plan)
+            Action::SetClaudePermissionMode(ClaudePermissionMode::AcceptEdits)
         ));
         assert_eq!(
             state.claude_permission_mode(),
-            Some(ClaudePermissionMode::Plan)
+            Some(ClaudePermissionMode::AcceptEdits)
         );
         assert!(state.composer_notice.is_none());
     }
@@ -16644,7 +18503,7 @@ mod tests {
             "claude:sonnet",
             Some("high"),
         );
-        state.claude_permission_mode = ClaudePermissionMode::Auto;
+        state.claude_permission_mode = ClaudePermissionMode::Default;
         state.busy = true;
         state.editor.set_text("queued prompt");
 
@@ -16652,7 +18511,7 @@ mod tests {
 
         assert!(matches!(
             action,
-            Action::SetClaudePermissionMode(ClaudePermissionMode::Plan)
+            Action::SetClaudePermissionMode(ClaudePermissionMode::AcceptEdits)
         ));
         assert!(state.queued_prompts.is_empty());
     }
@@ -16684,10 +18543,9 @@ mod tests {
         assert_eq!(test_state().claude_permission_mode(), None);
     }
 
-    /// The saved default is read back through a settings reader that lowercases
-    /// every value, so `acceptEdits` has to survive the round trip.
+    /// Claude reports mode values in mixed case, so wire parsing must preserve them.
     #[test]
-    fn a_saved_permission_mode_is_read_back_case_insensitively() {
+    fn permission_modes_are_read_back_case_insensitively() {
         assert_eq!(
             ClaudePermissionMode::from_wire("acceptedits"),
             Some(ClaudePermissionMode::AcceptEdits)
@@ -16703,6 +18561,10 @@ mod tests {
         assert_eq!(
             ClaudePermissionMode::from_wire("auto"),
             Some(ClaudePermissionMode::Auto)
+        );
+        assert_eq!(
+            ClaudePermissionMode::from_wire("dontask"),
+            Some(ClaudePermissionMode::DontAsk)
         );
         assert_eq!(ClaudePermissionMode::from_wire("nonsense"), None);
     }

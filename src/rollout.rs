@@ -372,48 +372,12 @@ pub fn parse(text: &str) -> Rollout {
 }
 
 fn plan_snapshot(input: &str) -> Option<PlanSnapshot> {
-    let call = input.find("tools.update_plan(")?;
-    let input = &input[call..];
-    let plan_key = input.find("plan:")? + "plan:".len();
-    let after_key = &input[plan_key..];
-    let whitespace = after_key.len().saturating_sub(after_key.trim_start().len());
-    let plan = plan_key + whitespace;
-    input[plan..].strip_prefix('[')?;
-    let plan = plan + 1;
-    let mut depth = 1usize;
-    let mut end = plan;
-    let mut quoted = false;
-    let mut escaped = false;
-    for (offset, ch) in input[plan..].char_indices() {
-        if quoted {
-            escaped = ch == '\\' && !escaped;
-            if ch == '"' && !escaped {
-                quoted = false;
-            }
-            continue;
-        }
-        if ch == '"' {
-            quoted = true;
-            continue;
-        }
-        if ch == '[' {
-            depth += 1;
-        }
-        if ch == ']' {
-            depth -= 1;
-            if depth == 0 {
-                end = plan + offset;
-                break;
-            }
-        }
-    }
-    (depth == 0).then_some(())?;
-    let body = &input[plan..end];
+    let input = js_call_arguments(input, "tools.update_plan")?;
+    let body = js_array_body(js_object_value(input, "plan")?)?;
     let mut steps = Vec::new();
-    for item in body.split("step:").skip(1) {
-        let step = js_string(item)?;
-        let status_at = item.find("status:")? + "status:".len();
-        let status = js_string(&item[status_at..])?;
+    for item in js_array_items(body) {
+        let step = js_string(js_object_value(item, "step")?)?;
+        let status = js_string(js_object_value(item, "status")?)?;
         steps.push(PlanStepSnapshot {
             text: step,
             status,
@@ -421,9 +385,188 @@ fn plan_snapshot(input: &str) -> Option<PlanSnapshot> {
         });
     }
     (!steps.is_empty()).then_some(PlanSnapshot {
-        explanation: None,
+        explanation: js_object_value(input, "explanation").and_then(js_string),
         steps,
     })
+}
+
+/// The argument text for an actual JavaScript call, ignoring copies embedded in
+/// command strings, patch bodies and comments.
+fn js_call_arguments<'a>(input: &'a str, name: &str) -> Option<&'a str> {
+    let bytes = input.as_bytes();
+    let needle = name.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' | b'\'' | b'`' => index = js_quote_end(bytes, index)? + 1,
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && !(bytes[index] == b'*' && bytes[index + 1] == b'/')
+                {
+                    index += 1;
+                }
+                index = (index + 2).min(bytes.len());
+            }
+            _ if bytes.get(index..index + needle.len()) == Some(needle) => {
+                let mut cursor = index + needle.len();
+                while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor += 1;
+                }
+                if bytes.get(cursor) == Some(&b'(') {
+                    return Some(&input[cursor + 1..]);
+                }
+                index += needle.len();
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+/// Finds a top-level field in a JavaScript object literal. Codex emits both
+/// `plan:` and JSON-style `"plan":`, so resume must accept both spellings.
+fn js_object_value<'a>(input: &'a str, key: &str) -> Option<&'a str> {
+    let input = input.trim_start();
+    let bytes = input.as_bytes();
+    (bytes.first() == Some(&b'{')).then_some(())?;
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' | b'[' => {
+                depth += 1;
+                index += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return None;
+                }
+                index += 1;
+            }
+            quote @ (b'"' | b'\'' | b'`') => {
+                let end = js_quote_end(bytes, index)?;
+                if depth == 1
+                    && quote != b'`'
+                    && input.get(index + 1..end) == Some(key)
+                    && js_field_colon(bytes, end + 1).is_some()
+                {
+                    let colon = js_field_colon(bytes, end + 1)?;
+                    return Some(&input[colon + 1..]);
+                }
+                index = end + 1;
+            }
+            byte if depth == 1 && (byte.is_ascii_alphabetic() || byte == b'_') => {
+                let start = index;
+                index += 1;
+                while bytes
+                    .get(index)
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                {
+                    index += 1;
+                }
+                if input.get(start..index) == Some(key) && js_field_colon(bytes, index).is_some() {
+                    let colon = js_field_colon(bytes, index)?;
+                    return Some(&input[colon + 1..]);
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn js_field_colon(bytes: &[u8], mut index: usize) -> Option<usize> {
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    (bytes.get(index) == Some(&b':')).then_some(index)
+}
+
+fn js_quote_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let quote = *bytes.get(start)?;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().enumerate().skip(start + 1) {
+        if escaped {
+            escaped = false;
+        } else if *byte == b'\\' {
+            escaped = true;
+        } else if *byte == quote {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn js_array_body(input: &str) -> Option<&str> {
+    let input = input.trim_start();
+    let bytes = input.as_bytes();
+    (bytes.first() == Some(&b'[')).then_some(())?;
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' | b'\'' | b'`' => index = js_quote_end(bytes, index)? + 1,
+            b'[' => {
+                depth += 1;
+                index += 1;
+            }
+            b']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&input[1..index]);
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn js_array_items(input: &str) -> Vec<&str> {
+    let bytes = input.as_bytes();
+    let mut items = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' | b'\'' | b'`' => {
+                let Some(end) = js_quote_end(bytes, index) else {
+                    return Vec::new();
+                };
+                index = end + 1;
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                index += 1;
+            }
+            b'}' | b']' => {
+                let Some(next) = depth.checked_sub(1) else {
+                    return Vec::new();
+                };
+                depth = next;
+                index += 1;
+            }
+            b',' if depth == 0 => {
+                items.push(input[start..index].trim());
+                start = index + 1;
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    if !input[start..].trim().is_empty() {
+        items.push(input[start..].trim());
+    }
+    items
 }
 
 fn with_plan_elapsed(
@@ -459,9 +602,9 @@ fn with_plan_elapsed(
 
 fn js_string(input: &str) -> Option<String> {
     let input = input.trim_start();
-    let rest = input.strip_prefix('"')?;
-    let end = rest.find('"')?;
-    Some(rest[..end].replace("\\\"", "\""))
+    (input.as_bytes().first() == Some(&b'"')).then_some(())?;
+    let end = js_quote_end(input.as_bytes(), 0)?;
+    serde_json::from_str(&input[..=end]).ok()
 }
 
 /// Replays the compact accounting records a rollout keeps alongside its
@@ -914,6 +1057,26 @@ mod tests {
         assert_eq!(plan.steps[0].elapsed_ms, Some(6_000));
         assert_eq!(plan.steps[1].text, "수정");
         assert_eq!(plan.steps[1].status, "in_progress");
+    }
+
+    #[test]
+    fn update_plan_call_accepts_compact_quoted_keys() {
+        let rollout = parse(
+            r#"{"timestamp":"2026-08-09T17:05:57.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const r = await tools.update_plan({plan:[{step:\"1. 확인\",status:\"in_progress\"},{step:\"2. 수정\",status:\"pending\"}]}); text(r)"}}
+{"timestamp":"2026-08-09T17:12:42.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const r = await tools.update_plan({explanation:\"완료\",\"plan\":[{\"step\":\"1. 확인\",\"status\":\"completed\"},{\"step\":\"2. 수정\",\"status\":\"completed\"}]}); text(r)"}}"#,
+        );
+
+        let plan = rollout.last_plan.expect("plan snapshot");
+        assert_eq!(plan.explanation.as_deref(), Some("완료"));
+        assert!(plan.steps.iter().all(|step| step.status == "completed"));
+        assert_eq!(plan.steps[0].elapsed_ms, Some(405_000));
+    }
+
+    #[test]
+    fn update_plan_text_inside_a_shell_command_is_not_a_plan() {
+        let input = r#"const r = await tools.shell_command({"command":"rg 'tools.update_plan({\\\"plan\\\":[{\\\"step\\\":\\\"가짜\\\",\\\"status\\\":\\\"in_progress\\\"}]})' src"}); text(r);"#;
+
+        assert!(plan_snapshot(input).is_none());
     }
 
     #[test]
