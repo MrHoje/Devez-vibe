@@ -2397,6 +2397,14 @@ async function dispatch(method, params = {}) {
       ...(rejection ? { rejection } : {}),
     };
   }
+  // The host clears its `Working` row on `turn/completed` alone, so a single
+  // dropped notification would strand the spinner forever. This answers "is the
+  // turn you are still waiting on actually running?" from the bridge's own state.
+  if (method === "session/turnStatus") {
+    const session = lookupSession(params.sessionId);
+    if (!session) return { known: false, running: false, turnId: null };
+    return { known: true, running: Boolean(session.turn), turnId: session.turn?.id ?? null };
+  }
   if (method === "session/start") {
     const { session, account, usage } = await createSession(params);
     return {

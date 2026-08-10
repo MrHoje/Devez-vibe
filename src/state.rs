@@ -52,6 +52,9 @@ const NOTICE_TTL: Duration = Duration::from_millis(1_400);
 /// A second Ctrl+C only quits while its warning is still on screen, so the
 /// armed state and the notice share one window.
 const QUIT_ARM_WINDOW: Duration = Duration::from_secs(3);
+/// How quiet a turn has to go before the runtime is asked whether it is still
+/// running. Long enough that an ordinary think never triggers it.
+const TURN_STALL_SILENCE: Duration = Duration::from_secs(20);
 
 /// The permission presets Codex exposes through `/permissions`, cycled with Shift+Tab.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -3118,6 +3121,12 @@ pub struct AppState {
     /// app-server has announced that the turn is active.
     pending_interrupt: bool,
     turn_interrupted: bool,
+    /// When this turn last showed a sign of life. A `turn/completed` that never
+    /// arrives would otherwise leave the activity row waiting on nothing.
+    turn_progress_at: Option<Instant>,
+    /// When the last stall probe went out, so a quiet turn is asked about at a
+    /// steady pace instead of once per frame.
+    stall_probe_at: Option<Instant>,
     /// When the last Ctrl+C armed the quit. Stale arms expire with `QUIT_ARM_WINDOW`
     /// so a Ctrl+C pressed long after the warning faded never quits on its own.
     quit_armed_at: Option<Instant>,
@@ -3340,6 +3349,8 @@ impl AppState {
             turn_id: None,
             pending_interrupt: false,
             turn_interrupted: false,
+            turn_progress_at: None,
+            stall_probe_at: None,
             quit_armed_at: None,
             busy: false,
             host_loading: false,
@@ -4973,9 +4984,50 @@ impl AppState {
             self.turn_interrupted = false;
         }
         self.last_completed_duration = None;
+        self.turn_progress_at = Some(Instant::now());
+        self.stall_probe_at = None;
         // A prompt held back while the session was still starting has been counting
         // since the user pressed Enter, so keep that clock rather than restarting it.
         self.turn_started_at.get_or_insert_with(Instant::now);
+    }
+
+    /// A turn that has gone quiet for a while is worth asking the runtime about.
+    /// The answer decides whether the wait ends — silence alone never does, since
+    /// a long think looks exactly the same from here.
+    pub fn take_stall_probe(&mut self) -> Option<String> {
+        if !self.busy || self.compacting() {
+            self.stall_probe_at = None;
+            return None;
+        }
+        let turn_id = self.turn_id.clone()?;
+        if self.turn_progress_at?.elapsed() < TURN_STALL_SILENCE {
+            return None;
+        }
+        if self
+            .stall_probe_at
+            .is_some_and(|sent| sent.elapsed() < TURN_STALL_SILENCE)
+        {
+            return None;
+        }
+        self.stall_probe_at = Some(Instant::now());
+        Some(turn_id)
+    }
+
+    /// The runtime reports the turn we are still waiting on is over: its
+    /// `turn/completed` never arrived, so end the wait exactly as that would have.
+    pub fn resolve_stall_probe(&mut self, turn_id: &str) -> bool {
+        if !self.busy || self.turn_id.as_deref() != Some(turn_id) {
+            return false;
+        }
+        self.stall_probe_at = None;
+        let params = json!({ "threadId": self.thread_id.clone() });
+        self.handle_notification("turn/completed", &params);
+        self.push_notice(
+            BlockKind::Warning,
+            "응답 종료 알림 누락",
+            "턴은 이미 끝났는데 종료 알림이 오지 않아 진행 표시를 정리했습니다.",
+        );
+        true
     }
 
     fn reset_turn_item_tracking(&mut self) {
@@ -6300,6 +6352,16 @@ impl AppState {
         }
     }
 
+    /// The runtime names one Claude session two ways — bare, and `claude:`-prefixed.
+    /// Both spell this thread, and reading the bare one as somebody else's used to
+    /// throw away a whole turn: its output never painted and its completion never
+    /// ended the wait.
+    fn names_this_thread(&self, thread_id: &str) -> bool {
+        thread_id == self.thread_id
+            || crate::claude::raw_thread_id(thread_id)
+                == crate::claude::raw_thread_id(&self.thread_id)
+    }
+
     /// A parent turn keeps streaming behind a `/btw` fork. Its output stays out
     /// of the fork's view, but the end of the turn has to land somewhere so we
     /// do not restore a spinner for a turn that already finished.
@@ -6320,11 +6382,14 @@ impl AppState {
         if let Some(thread_id) = params
             .get("threadId")
             .and_then(Value::as_str)
-            .filter(|thread_id| *thread_id != self.thread_id)
+            .filter(|thread_id| !self.names_this_thread(thread_id))
         {
             self.note_background_turn(thread_id, method);
             return;
         }
+        // Anything this thread says counts as the turn still being alive, so the
+        // stall probe only fires on a wait that has genuinely gone silent.
+        self.turn_progress_at = Some(Instant::now());
         match method {
             "serverRequest/resolved" => {
                 if let Some(request_id) = params.get("requestId") {
@@ -9839,6 +9904,29 @@ impl AppState {
 
     fn apply_model(&mut self, index: usize, effort: Option<&str>) {
         self.commit_welcome_card();
+        // One conversation, one runtime. A thread exists only once a prompt has been
+        // sent, and moving that thread onto another runtime left it named after the
+        // first while its turns ran on the second — two names for one session, and
+        // the notifications for it stopped reaching the screen.
+        if !self.thread_pending() {
+            let next = self.models.get(index).map(|model| model_runtime(&model.model));
+            let current = self
+                .models
+                .get(self.selected_model)
+                .map(|model| model_runtime(&model.model));
+            if let (Some(next), Some(current)) = (next, current)
+                && next != current
+            {
+                self.push_notice(
+                    BlockKind::Warning,
+                    "Provider 고정됨",
+                    format!(
+                        "대화가 시작된 뒤에는 provider를 바꿀 수 없습니다. {next} 모델로 이야기하려면 /new로 새 대화를 여세요."
+                    ),
+                );
+                return;
+            }
+        }
         let Some(model) = self.models.get(index) else {
             return;
         };
@@ -12057,6 +12145,18 @@ fn relative_time(timestamp: u64) -> String {
     }
 }
 
+/// Which runtime a model runs on. Only the family matters: a conversation is
+/// pinned to the runtime that owns its session.
+fn model_runtime(model: &str) -> &'static str {
+    if crate::claude::is_claude_model(model) {
+        "Claude"
+    } else if crate::open_code::is_open_code_model(model) {
+        "OpenCode"
+    } else {
+        "Codex"
+    }
+}
+
 fn path_eq(left: &str, right: &str) -> bool {
     #[cfg(windows)]
     {
@@ -12745,6 +12845,44 @@ mod tests {
             "gpt-5.6-sol",
             Some("high"),
         )
+    }
+
+    fn two_runtime_state(thread_id: &str) -> AppState {
+        AppState::new(
+            thread_id.to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![
+                test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
+                test_model("claude:claude-opus-5", "Claude Opus", false),
+            ],
+            "gpt-5.6-sol",
+            Some("high"),
+        )
+    }
+
+    #[test]
+    fn a_conversation_that_has_started_keeps_the_runtime_it_started_on() {
+        let mut state = two_runtime_state("thread");
+
+        state.apply_model(1, None);
+
+        assert_eq!(state.selected_model_name(), "gpt-5.6-sol");
+        assert!(
+            state
+                .committed
+                .iter()
+                .any(|block| block.title == "Provider 고정됨")
+        );
+    }
+
+    #[test]
+    fn a_conversation_with_no_session_yet_can_still_change_runtime() {
+        let mut state = two_runtime_state("");
+
+        state.apply_model(1, None);
+
+        assert_eq!(state.selected_model_name(), "claude:claude-opus-5");
     }
 
     #[test]
@@ -16290,6 +16428,54 @@ mod tests {
 
         state.handle_notification("turn/completed", &json!({}));
         assert_eq!(state.activity_model().as_deref(), Some("gpt-5.6-terra"));
+    }
+
+    #[test]
+    fn a_bare_session_id_is_read_as_this_thread_not_a_background_one() {
+        let mut state = test_state();
+        state.thread_id = "claude:session-one".to_owned();
+        state.set_turn_started("turn-1".to_owned());
+
+        state.handle_notification("turn/completed", &json!({ "threadId": "session-one" }));
+
+        assert!(!state.busy, "the bare form names this same thread");
+    }
+
+    #[test]
+    fn a_quiet_turn_is_probed_once_per_window_and_a_busy_one_never_is() {
+        let mut state = test_state();
+        state.set_turn_started("turn-1".to_owned());
+
+        assert_eq!(state.take_stall_probe(), None, "a fresh turn is not quiet");
+
+        state.turn_progress_at = Some(Instant::now() - TURN_STALL_SILENCE);
+        assert_eq!(state.take_stall_probe().as_deref(), Some("turn-1"));
+        assert_eq!(state.take_stall_probe(), None, "one probe per window");
+
+        // Any word from the thread means the turn is alive after all.
+        state.handle_notification("item/started", &json!({}));
+        state.stall_probe_at = None;
+        assert_eq!(state.take_stall_probe(), None);
+    }
+
+    #[test]
+    fn a_probe_that_finds_the_turn_over_ends_the_wait() {
+        let mut state = test_state();
+        state.set_turn_started("turn-1".to_owned());
+        state.turn_progress_at = Some(Instant::now() - TURN_STALL_SILENCE);
+        let turn_id = state.take_stall_probe().expect("probe");
+
+        assert!(state.resolve_stall_probe(&turn_id));
+        assert!(!state.busy);
+        assert!(
+            state
+                .activity()
+                .is_some_and(|activity| activity.starts_with("Completed"))
+        );
+        // A stale answer about a turn that is no longer the live one changes nothing.
+        state.set_turn_started("turn-2".to_owned());
+        assert!(!state.resolve_stall_probe("turn-1"));
+        assert!(state.busy);
     }
 
     #[test]

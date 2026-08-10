@@ -50,7 +50,10 @@ use state::{
     AccountPlan, Action, AppState, DiffDisplayMode, LoginMethod, ModelInfo, SessionInfo,
     SessionPicker, SessionPickerResult, ShellDisplayMode, VibeMode, load_model_context_windows,
 };
-use tokio::{sync::mpsc, time::MissedTickBehavior};
+use tokio::{
+    sync::mpsc,
+    time::{MissedTickBehavior, timeout},
+};
 
 #[derive(Parser)]
 #[command(
@@ -333,21 +336,34 @@ async fn start_session(
         server.prepare_resume_runtime(resume_id).await?;
     }
     let claude = claude_session_settings(state);
+    let verbosity = state.model_verbosity();
+    // A fresh launch opens no session. The first prompt builds it, so the thread is
+    // named after the runtime the user actually sends on: starting one here named it
+    // after the launch default, and a provider picked before that first prompt had to
+    // borrow the session in under the other name.
+    let thread = async {
+        if is_resuming {
+            start_or_resume_thread(
+                server,
+                Some(resume_id),
+                model_override,
+                cli.cwd.as_ref().map(|_| cwd),
+                cwd,
+                verbosity,
+                &claude,
+                cli.effort.as_deref(),
+                requested_effort,
+            )
+            .await
+        } else {
+            Ok(Value::Null)
+        }
+    };
     let startup = await_thread(
         server,
         state,
         renderer,
-        start_or_resume_thread(
-            server,
-            is_resuming.then_some(resume_id),
-            model_override,
-            cli.cwd.as_ref().map(|_| cwd),
-            cwd,
-            state.model_verbosity(),
-            &claude,
-            cli.effort.as_deref(),
-            requested_effort,
-        ),
+        thread,
         read_runtime_account_plan(server, requested_model_name),
         None,
     )
@@ -359,6 +375,10 @@ async fn start_session(
     else {
         return Ok(());
     };
+    if thread_response.is_null() {
+        state.set_host_loading(false);
+        return run_after_startup(server, state, renderer, queued).await;
+    }
     apply_claude_account_metadata(state, &thread_response);
 
     let thread = if is_resuming {
@@ -404,6 +424,18 @@ async fn start_session(
         apply_resumed_token_usage(state, &thread_response);
     }
     state.set_host_loading(false);
+    run_after_startup(server, state, renderer, queued).await
+}
+
+/// The screen is live and the session is either bound or still waiting for the first
+/// prompt to build it. Arms the update check, sends anything typed during startup,
+/// and hands over to the event loop.
+async fn run_after_startup(
+    server: &mut BackendServer,
+    state: &mut AppState,
+    renderer: &mut Renderer,
+    queued: Option<String>,
+) -> Result<()> {
     draw(state, renderer)?;
 
     let (update_tx, update_rx) = mpsc::channel(1);
@@ -415,9 +447,61 @@ async fn start_session(
 
     if let Some(text) = queued {
         draw(state, renderer)?;
-        start_turn(server, state, text, None).await;
+        if !state.thread_pending() || open_pending_thread(server, state).await {
+            start_turn(server, state, text, None).await;
+        }
     }
     event_loop(server, state, renderer, update_rx).await
+}
+
+/// Builds the session the first prompt needs, on the runtime that prompt selected.
+/// Returns false when it could not be created, with the failure already on screen.
+async fn open_pending_thread(server: &BackendServer, state: &mut AppState) -> bool {
+    let model = state.selected_model_name().to_owned();
+    let params = new_thread_params(
+        &state.cwd,
+        Some(&model),
+        Some(state.service_tier()),
+        "first-prompt",
+        state.model_verbosity(),
+        state.claude_permission_mode_setting().wire(),
+        state.selected_effort(),
+    );
+    let response = match server.request("thread/start", params).await {
+        Ok(response) => response,
+        Err(error) => {
+            state.set_request_failed(format!("세션을 시작하지 못했습니다: {error}"));
+            return false;
+        }
+    };
+    apply_claude_account_metadata(state, &response);
+    let thread_id = response
+        .get("thread")
+        .and_then(|thread| thread.get("id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let cwd = response
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let actual_model = response
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or(&model)
+        .to_owned();
+    let (Some(thread_id), Some(cwd)) = (thread_id, cwd) else {
+        state.set_request_failed("thread/start 응답이 올바르지 않습니다.");
+        return false;
+    };
+    let effort = response
+        .get("reasoningEffort")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| state.selected_effort().to_owned());
+    state.attach_thread(thread_id, cwd, &actual_model, Some(&effort));
+    state.note_resume_id(&server.resume_id(&state.thread_id));
+    apply_deferred_startup_actions(server, state).await;
+    true
 }
 
 /// Runs the full UI while `thread/start` is still in flight: the screen is live,
@@ -818,6 +902,21 @@ async fn event_loop(
     loop {
         if let Some(thread_id) = state.take_cost_restore() {
             cost_restore_rx = Some(start_cost_restore(thread_id));
+        }
+        // A quiet turn is asked about rather than assumed dead. Only a runtime that
+        // answers "not running" ends the wait, so a long think is never cut short.
+        if let Some(turn_id) = state.take_stall_probe()
+            && !turn_is_running(server, &state.thread_id, &turn_id).await
+            && state.resolve_stall_probe(&turn_id)
+        {
+            let action = state
+                .take_queued_prompt()
+                .map(|text| state.start_queued_prompt(text))
+                .unwrap_or(Action::None);
+            if execute_action(server, state, renderer, action).await? {
+                break;
+            }
+            draw(state, renderer)?;
         }
         // A session picked while the previous one was still starting is switched to
         // here. The event loop is the only place that can drive it: the wait it was
@@ -1473,6 +1572,11 @@ async fn execute_action(
             // first prompt after a provider switch — would otherwise hold the frame
             // for the whole round trip and read as a stall in the composer.
             draw(state, renderer)?;
+            // A session that does not exist yet is built here, by the prompt that
+            // needs it, so it is named after the runtime this prompt runs on.
+            if state.thread_pending() && !open_pending_thread(server, state).await {
+                return Ok(false);
+            }
             start_turn(server, state, text, Some(handoff)).await
         }
         Action::Steer(text) => {
@@ -2597,76 +2701,22 @@ async fn activate_codex(server: &mut BackendServer, state: &mut AppState) {
     }
 }
 
-/// welcome panel goes up immediately, then `thread/start` is waited out behind a
-/// live screen exactly the way launch does it. Returns `true` when the user quits
-/// during the wait.
+/// Clears the screen back to the welcome panel without opening a session. The next
+/// prompt opens one, so the new conversation is named after the runtime it actually
+/// runs on. Returns `true` when the user quits, which this path never does.
 async fn start_new_thread(
-    server: &BackendServer,
+    _server: &BackendServer,
     state: &mut AppState,
     renderer: &mut Renderer,
 ) -> Result<bool> {
-    // Read the request out of the old session before it is torn down.
-    let selected_model = state.selected_model_name().to_owned();
-    let params = new_thread_params(
-        &state.cwd,
-        Some(&selected_model),
-        Some(state.service_tier()),
-        "clear",
-        state.model_verbosity(),
-        state.claude_permission_mode_setting().wire(),
-        state.selected_effort(),
-    );
-    let previous_thread = state.thread_id.clone();
-
     renderer.clear_screen()?;
     state.prepare_new_thread();
     state.begin_thread_switch();
-
-    let (response, queued) = match await_switch(
-        server,
-        state,
-        renderer,
-        previous_thread.clone(),
-        server.request("thread/start", params),
-        None,
-    )
-    .await?
-    {
-        Switch::Ready { response, queued } => (response, queued),
-        Switch::Quit => return Ok(true),
-        Switch::Failed => return Ok(false),
-    };
-    apply_claude_account_metadata(state, &response);
-
-    let thread_id = response
-        .get("thread")
-        .and_then(|thread| thread.get("id"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    let cwd = response
-        .get("cwd")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    let model = response
-        .get("model")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    let effort = response
-        .get("reasoningEffort")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    let (Some(thread_id), Some(cwd), Some(model)) = (thread_id, cwd, model) else {
-        abandon_thread_switch(
-            state,
-            previous_thread,
-            "thread/start 응답이 올바르지 않습니다.",
-        );
-        return Ok(false);
-    };
-
-    state.attach_thread(thread_id, cwd, &model, effort.as_deref());
-    state.note_resume_id(&server.resume_id(&state.thread_id));
-    finish_thread_switch(server, state, renderer, queued).await
+    // Nothing is started here: the next prompt builds the session, on whichever
+    // runtime is selected by then. Until it does, the screen is an empty new
+    // conversation with no session behind it.
+    draw(state, renderer)?;
+    Ok(false)
 }
 
 /// `/resume`, given the same treatment as [`start_new_thread`]: the screen resets
@@ -4617,6 +4667,26 @@ fn start_login_flow(state: &mut AppState, method: LoginMethod, response: &Value)
 
 /// Re-reads the identity and entitlements after a login or an `account/updated`
 /// notification. Best-effort: a failure leaves the previous values in place.
+/// Asks the runtime whether the turn the activity row is waiting on is still
+/// running. Every uncertain answer — an unsupported runtime, an error, a reply
+/// that never comes — reads as "running", so the wait is only ever ended by the
+/// runtime saying so outright.
+async fn turn_is_running(server: &BackendServer, thread_id: &str, turn_id: &str) -> bool {
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let params = json!({ "threadId": thread_id, "turnId": turn_id });
+    let Ok(Ok(status)) = timeout(PROBE_TIMEOUT, server.request("turn/status", params)).await else {
+        return true;
+    };
+    if status.get("known").and_then(Value::as_bool) != Some(true) {
+        return true;
+    }
+    status
+        .get("running")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
 async fn refresh_account(server: &BackendServer, state: &mut AppState) {
     if let Ok(label) = ensure_account(server).await {
         state.set_account(label);

@@ -3550,6 +3550,10 @@ const WORKING_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
 /// Activity labels that carry the loader glyph and the shimmer sweep.
 const SPINNING_ACTIVITY_LABELS: [&str; 2] = ["Working..", "Compacting.."];
 
+/// Glyphs that head an activity row which is already over. A shimmer on these
+/// reads as work still running, so they paint flat.
+const SETTLED_ACTIVITY_GLYPHS: [&str; 2] = ["✓", "X"];
+
 /// The loader glyph plus the space after it.
 const WORKING_SPINNER_COLUMNS: usize = 2;
 /// The label whose activity row also carries a progress bar.
@@ -3698,7 +3702,7 @@ fn activity_lines_with_progress(
         }
         None => (rest, ""),
     };
-    let mut tail = if glyph == "✓" {
+    let mut tail = if SETTLED_ACTIVITY_GLYPHS.contains(&glyph) {
         vec![PaintSpan {
             text: label.to_owned(),
             tone,
@@ -6968,6 +6972,53 @@ fn block_group_lines(
     lines
 }
 
+/// Claude opens a Korean sentence with an English connective — `Now 브리지에 …` —
+/// and no wording of the language rule has stopped it: the habit belongs to the
+/// English system prompt the preamble is generated under, not to the rule. So the
+/// leak is repaired where it is shown. Only a bare connective directly in front
+/// of Hangul is cut; a backtick-quoted mention or an all-English sentence is left
+/// alone, since cutting those would change what the answer says.
+fn without_leading_english_filler(body: &str) -> &str {
+    const FILLERS: [&str; 16] = [
+        "Now",
+        "Next",
+        "First",
+        "Then",
+        "Also",
+        "So",
+        "Finally",
+        "Actually",
+        "Okay",
+        "OK",
+        "Alright",
+        "Fine",
+        "Good",
+        "Let me",
+        "I'll",
+        "Alt",
+    ];
+
+    for filler in FILLERS {
+        let Some(rest) = body.strip_prefix(filler) else {
+            continue;
+        };
+        let rest = rest
+            .strip_prefix(|c| matches!(c, ',' | '.' | ':' | ';'))
+            .unwrap_or(rest);
+        let Some(rest) = rest.strip_prefix(' ') else {
+            continue;
+        };
+        if rest.starts_with(is_hangul) {
+            return rest;
+        }
+    }
+    body
+}
+
+fn is_hangul(c: char) -> bool {
+    matches!(c, '\u{AC00}'..='\u{D7A3}' | '\u{1100}'..='\u{11FF}' | '\u{3131}'..='\u{318E}')
+}
+
 fn block_lines_with_mode(
     block: &Block,
     width: u16,
@@ -7114,7 +7165,12 @@ fn block_lines_with_mode(
     let force_diff = matches!(block.kind, BlockKind::Diff);
     let mut code = false;
     let mut code_language = String::new();
-    let raw_lines = block.body.lines().collect::<Vec<_>>();
+    let body = if conversational {
+        without_leading_english_filler(&block.body)
+    } else {
+        &block.body
+    };
+    let raw_lines = body.lines().collect::<Vec<_>>();
     let mut line_index = 0;
     while let Some(raw_line) = raw_lines.get(line_index).copied() {
         let trimmed = raw_line.trim_start();
@@ -10877,6 +10933,63 @@ mod tests {
         assert_eq!(selection_columns_for_line(&rows[1], range, 1), Some(4..8));
     }
 
+    /// Three releases of rule wording did not stop the English opener, so the
+    /// display cuts it. Only a bare connective in front of Hangul goes.
+    #[test]
+    fn an_english_opener_in_front_of_hangul_is_cut_from_the_answer() {
+        assert_eq!(
+            without_leading_english_filler("Now 브리지에 상태 조회를 추가합니다."),
+            "브리지에 상태 조회를 추가합니다."
+        );
+        assert_eq!(
+            without_leading_english_filler("Alright, 토글 함수를 넣습니다."),
+            "토글 함수를 넣습니다."
+        );
+        assert_eq!(
+            without_leading_english_filler("Let me 확인하겠습니다."),
+            "확인하겠습니다."
+        );
+    }
+
+    /// Cutting these would change what the answer says, so they stay whole.
+    #[test]
+    fn an_answer_that_needs_its_english_opener_keeps_it() {
+        // A quoted mention of the banned word is the subject, not a label.
+        assert_eq!(
+            without_leading_english_filler("`Now`을 금지했습니다."),
+            "`Now`을 금지했습니다."
+        );
+        // An all-English sentence is a different violation; a cut leaves nonsense.
+        assert_eq!(
+            without_leading_english_filler("Now the tile view logic."),
+            "Now the tile view logic."
+        );
+        // A word that merely starts with a filler is not a filler.
+        assert_eq!(
+            without_leading_english_filler("Firstly 확인합니다."),
+            "Firstly 확인합니다."
+        );
+        assert_eq!(
+            without_leading_english_filler("파일을 고쳤습니다."),
+            "파일을 고쳤습니다."
+        );
+    }
+
+    #[test]
+    fn a_rendered_answer_drops_its_english_opener() {
+        let lines = block_lines(
+            &Block::new(BlockKind::Assistant, "Claude", "Now 상태 필드를 추가합니다."),
+            80,
+        );
+        let text = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<String>();
+
+        assert!(text.contains("상태 필드를 추가합니다."));
+        assert!(!text.contains("Now"));
+    }
+
     #[test]
     fn fullscreen_selection_preserves_response_and_thinking_icons() {
         // The bubble's own edge rows come first, so the marker row is found by
@@ -12729,6 +12842,21 @@ mod tests {
                 .iter()
                 .all(|span| !matches!(span.tone, Tone::Shimmer(_, _))),
             "a completed turn must not look like it is still working"
+        );
+    }
+
+    #[test]
+    fn interrupted_activity_label_is_static() {
+        let line = activity_lines("X Interrupted", Some("gpt-5.6-terra"), 0.5, 80)
+            .pop()
+            .expect("interrupted row");
+
+        assert_eq!(line.text, "X ");
+        assert!(
+            line.tail
+                .iter()
+                .all(|span| !matches!(span.tone, Tone::Shimmer(_, _))),
+            "an interrupted turn must not look like it is still working"
         );
     }
 

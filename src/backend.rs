@@ -570,6 +570,18 @@ impl BackendServer {
                 }
                 response
             }
+            // Only Claude can answer this today. An unknown runtime reports nothing
+            // so the host leaves its spinner alone rather than guessing.
+            "turn/status" => {
+                let visible = thread_id(&params)?;
+                if self.route_kind(visible) != RuntimeKind::Claude {
+                    return Ok(json!({ "known": false }));
+                }
+                let backing = self.backing_id(visible, RuntimeKind::Claude)?;
+                self.claude
+                    .request("session/turnStatus", json!({ "sessionId": backing }))
+                    .await
+            }
             "turn/interrupt" => {
                 let visible = thread_id(&params)?;
                 if self.route_kind(visible) == RuntimeKind::Claude {
@@ -1751,13 +1763,25 @@ fn route_aliases(routes: &HashMap<String, Route>) -> HashMap<String, String> {
         .into_iter()
         .flatten()
         {
-            if ambiguous.contains(backing) {
+            // A thread whose own id names this session does not compete for it — it
+            // is that session, under the other spelling of the same id. Without this
+            // an ordinary resume left two claims on one backing id, the alias was
+            // dropped as ambiguous, and every notification the runtime sent for that
+            // session became unroutable: the host discards what it cannot place, so
+            // the turn's output and its completion both disappeared.
+            let names_backing = thread_names_session(visible, backing);
+            if ambiguous.contains(backing) && !names_backing {
                 continue;
             }
             match aliases.get(backing) {
                 Some(previous) if previous != visible => {
-                    aliases.remove(backing);
-                    ambiguous.insert(backing.clone());
+                    if names_backing {
+                        aliases.insert(backing.clone(), visible.clone());
+                        ambiguous.remove(backing);
+                    } else if !thread_names_session(previous, backing) {
+                        aliases.remove(backing);
+                        ambiguous.insert(backing.clone());
+                    }
                 }
                 None => {
                     aliases.insert(backing.clone(), visible.clone());
@@ -1767,6 +1791,12 @@ fn route_aliases(routes: &HashMap<String, Route>) -> HashMap<String, String> {
         }
     }
     aliases
+}
+
+/// Whether this visible thread is the backing session itself rather than a thread
+/// that merely runs on it. Claude ids appear both bare and `claude:`-prefixed.
+fn thread_names_session(visible: &str, backing: &str) -> bool {
+    visible == backing || visible == visible_thread_id(backing)
 }
 
 /// The id that resumes each stored thread — the backing session of the runtime the
@@ -2560,6 +2590,27 @@ mod tests {
         assert_eq!(
             aliases.get("other-rollout").map(String::as_str),
             Some("room-three")
+        );
+    }
+
+    /// The session's own thread keeps the alias, so its notifications stay routable
+    /// even after a resume left a second thread pointing at the same session.
+    #[test]
+    fn a_thread_named_after_its_session_outranks_one_that_only_runs_on_it() {
+        let routes = HashMap::from([
+            (
+                "claude:session-one".to_owned(),
+                route(RuntimeKind::Claude, None, Some("session-one")),
+            ),
+            (
+                "019fe947-borrowed".to_owned(),
+                route(RuntimeKind::Claude, None, Some("session-one")),
+            ),
+        ]);
+
+        assert_eq!(
+            route_aliases(&routes).get("session-one").map(String::as_str),
+            Some("claude:session-one")
         );
     }
 
