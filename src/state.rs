@@ -5343,8 +5343,8 @@ impl AppState {
             activity_model: self.activity_model(),
             activity_phase: self.activity_phase(),
             waiting_for_response: self.busy
-                && (self.turn_response_started || self.last_assistant_markdown.is_some()),
-            response_bullet_effort: self.response_bullet_effort(),
+                && !self.turn_response_started
+                && self.last_assistant_markdown.is_some(),
             activity_progress_phase: self.compaction_progress_phase(),
             footer: self
                 .status_line_has_content()
@@ -5463,8 +5463,8 @@ impl AppState {
             activity_model: self.activity_model(),
             activity_phase: self.activity_phase(),
             waiting_for_response: self.busy
-                && (self.turn_response_started || self.last_assistant_markdown.is_some()),
-            response_bullet_effort: self.response_bullet_effort(),
+                && !self.turn_response_started
+                && self.last_assistant_markdown.is_some(),
             activity_progress_phase: self.compaction_progress_phase(),
             plan_summary: self.plan_summary.as_ref(),
             plan_active: self.busy,
@@ -9684,12 +9684,6 @@ impl AppState {
         // selected in the composer immediately. Billing keeps using the active
         // turn model separately in `active_cost_model`.
         Some(self.selected_model_name().to_owned())
-    }
-
-    fn response_bullet_effort(&self) -> Option<&str> {
-        self.pending_turn_effort
-            .as_deref()
-            .or(self.active_turn_effort.as_deref())
     }
 
     /// Activity text animation runs from the wall clock rather than counted ticks,
@@ -16228,45 +16222,20 @@ mod tests {
     }
 
     #[test]
-    fn response_bullet_moves_to_new_assistant_text_until_the_turn_completes() {
+    fn previous_response_waits_only_until_new_assistant_text_appears() {
         let mut state = test_state();
         state.last_assistant_markdown = Some("previous response".to_owned());
         state.editor.set_text("next prompt");
-        state.note_pending_turn_effort("high");
 
         assert!(matches!(state.submit_editor(), Action::Submit(_)));
         assert!(state.view().waiting_for_response);
-        assert_eq!(state.view().response_bullet_effort, Some("high"));
-
-        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
-        state.selected_effort = "low".to_owned();
-        assert_eq!(state.view().response_bullet_effort, Some("high"));
 
         state.handle_notification(
             "item/agentMessage/delta",
             &json!({ "itemId": "answer", "delta": "new response" }),
         );
 
-        assert!(state.view().waiting_for_response);
-
-        state.handle_notification("turn/completed", &json!({}));
         assert!(!state.view().waiting_for_response);
-    }
-
-    #[test]
-    fn first_response_bullet_starts_blinking_when_text_appears() {
-        let mut state = test_state();
-        state.editor.set_text("first prompt");
-
-        assert!(matches!(state.submit_editor(), Action::Submit(_)));
-        assert!(!state.view().waiting_for_response);
-
-        state.handle_notification(
-            "item/agentMessage/delta",
-            &json!({ "itemId": "answer", "delta": "first response" }),
-        );
-
-        assert!(state.view().waiting_for_response);
     }
 
     #[test]

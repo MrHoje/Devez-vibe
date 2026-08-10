@@ -19,7 +19,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "응답 중인 최신 불릿이 요청 당시 effort 색으로 부드럽게 깜빡입니다.",
+    "응답 중인 불릿 깜빡임 효과를 이전 표시 방식으로 되돌렸습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

@@ -445,10 +445,8 @@ pub struct View<'a> {
     pub activity_model: Option<String>,
     /// Where the `Working` shimmer is in its sweep, `0.0..1.0`.
     pub activity_phase: f32,
-    /// The turn has a response marker that should animate while work continues.
+    /// The turn is active, but its first assistant text has not appeared yet.
     pub waiting_for_response: bool,
-    /// Effort captured when the active request was submitted.
-    pub response_bullet_effort: Option<&'a str>,
     /// Where the compaction progress block is in its slower trip, `0.0..1.0`.
     pub activity_progress_phase: f32,
     pub footer: String,
@@ -469,7 +467,6 @@ pub struct AnimationView<'a> {
     pub activity_model: Option<String>,
     pub activity_phase: f32,
     pub waiting_for_response: bool,
-    pub response_bullet_effort: Option<&'a str>,
     pub activity_progress_phase: f32,
     pub plan_summary: Option<&'a PlanSummary>,
     pub plan_active: bool,
@@ -602,7 +599,6 @@ pub struct Renderer {
     live_frame_cache: Option<LiveFrameCache>,
     animation_activity_row: Option<usize>,
     animation_response_bullet_row: Option<usize>,
-    response_bullet_animation_started_at: Option<Instant>,
     animation_plan_rows: usize,
     #[cfg(test)]
     live_cache_rebuilds: usize,
@@ -1133,7 +1129,6 @@ impl Renderer {
             live_frame_cache: None,
             animation_activity_row: None,
             animation_response_bullet_row: None,
-            response_bullet_animation_started_at: None,
             animation_plan_rows: 0,
             #[cfg(test)]
             live_cache_rebuilds: 0,
@@ -1274,7 +1269,6 @@ impl Renderer {
         self.live_frame_cache = None;
         self.animation_activity_row = None;
         self.animation_response_bullet_row = None;
-        self.response_bullet_animation_started_at = None;
         self.animation_plan_rows = 0;
         self.last_transcript_rows = 0;
         self.apply_terminal_theme()?;
@@ -1853,7 +1847,6 @@ impl Renderer {
                 view.plan_active,
                 view.plan_shimmer_phase,
                 view.waiting_for_response,
-                view.response_bullet_effort,
                 view.side_panel_prompts_expanded,
                 &view.side_panel_integrations,
             );
@@ -1921,7 +1914,6 @@ impl Renderer {
         self.composer_selection = None;
         self.animation_activity_row = None;
         self.animation_response_bullet_row = None;
-        self.response_bullet_animation_started_at = None;
         self.animation_plan_rows = 0;
         self.last_transcript_rows = 0;
         self.last_width = width;
@@ -1979,14 +1971,6 @@ impl Renderer {
         lines[start..].to_vec()
     }
 
-    fn response_bullet_animation_phase(&self) -> f32 {
-        let Some(started_at) = self.response_bullet_animation_started_at else {
-            return 0.0;
-        };
-        let position = started_at.elapsed().as_millis() % RESPONSE_SHIMMER_PERIOD.as_millis();
-        position as f32 / RESPONSE_SHIMMER_PERIOD.as_millis() as f32
-    }
-
     pub fn render_animation(&mut self, view: AnimationView<'_>) -> Result<bool> {
         if self.mode != RenderMode::Fullscreen
             || self.last_width == 0
@@ -2029,11 +2013,7 @@ impl Renderer {
             && let Some(line) = self.previous_lines.get(row)
         {
             let mut line = line.clone();
-            paint_waiting_response_bullet(
-                &mut line,
-                self.response_bullet_animation_phase(),
-                view.response_bullet_effort,
-            );
+            line.prefix_tone = waiting_response_bullet_tone(view.activity_phase);
             updates.push((row, line));
         }
 
@@ -2182,7 +2162,6 @@ impl Renderer {
         plan_active: bool,
         plan_shimmer_phase: Option<f32>,
         waiting_for_response: bool,
-        response_bullet_effort: Option<&str>,
         side_panel_prompts_expanded: bool,
         side_panel_integrations: &[ProviderIntegrationView],
     ) -> Result<()> {
@@ -2285,22 +2264,10 @@ impl Renderer {
         );
         screen.splice(0..0, plan_lines);
         let response_bullet_row = waiting_for_response
-            .then(|| latest_response_bullet_row(&screen))
+            .then(|| {
+                visible_response_bullet_row(&self.wrapped, start..start + view_rows, plan_rows)
+            })
             .flatten();
-        if response_bullet_row.is_none() {
-            self.response_bullet_animation_started_at = None;
-        } else if self.response_bullet_animation_started_at.is_none() {
-            self.response_bullet_animation_started_at = Some(Instant::now());
-        }
-        if let Some(row) = response_bullet_row
-            && let Some(line) = screen.get_mut(row)
-        {
-            paint_waiting_response_bullet(
-                line,
-                self.response_bullet_animation_phase(),
-                response_bullet_effort,
-            );
-        }
         let cursor_line = cursor_line + plan_rows;
         let scroll_to_bottom_overlay = self.scroll_to_bottom_control(width).and_then(|control| {
             let row = plan_rows + scroll_to_bottom_overlay_row(view_rows, frame.composer_index)?;
@@ -3183,10 +3150,17 @@ fn compose_screen(
     (screen, cursor_line)
 }
 
-fn latest_response_bullet_row(lines: &[PaintLine]) -> Option<usize> {
-    lines
+fn visible_response_bullet_row(
+    wrapped: &[PaintLine],
+    visible: Range<usize>,
+    rows_before_transcript: usize,
+) -> Option<usize> {
+    let row = wrapped
         .iter()
-        .rposition(|line| line.prefix == "• " && line.prefix_tone == Tone::FastOff)
+        .rposition(|line| line.prefix == "• " && line.prefix_tone == Tone::FastOff)?;
+    visible
+        .contains(&row)
+        .then(|| rows_before_transcript + row - visible.start)
 }
 
 /// The plan already owns one blank row below its bottom border. If a scrolled
@@ -3343,9 +3317,6 @@ enum Tone {
     /// One character of a plan border shimmer, blended from the normal border
     /// colour toward the current effort colour.
     PlanShimmer(Rgb, u8),
-    /// The waiting response marker, blended from the theme background toward
-    /// the effort colour captured for its request.
-    ResponseShimmer(Rgb, u8),
     CopyJoin,
 }
 
@@ -3532,36 +3503,11 @@ impl PaintLine {
 const SHIMMER_BAND: f32 = 3.0;
 const PLAN_SHIMMER_BAND: f32 = SHIMMER_BAND * 2.5;
 const PLAN_SHIMMER_LOOPS: f32 = 5.0;
-const RESPONSE_SHIMMER_PERIOD: Duration = Duration::from_millis(900);
 
-/// A fixed medium spot avoids the visible size jump caused by swapping terminal
-/// glyphs. Only its highlight strength changes, so the shimmer stays continuous.
-fn paint_waiting_response_bullet(line: &mut PaintLine, phase: f32, effort: Option<&str>) {
-    line.prefix = "⦁ ".to_owned();
-    line.prefix_tone = waiting_response_bullet_tone(phase, effort);
-}
-
-fn waiting_response_bullet_wave(phase: f32) -> f32 {
-    let phase = phase.clamp(0.0, 1.0);
-    let progress = if phase <= 0.5 {
-        phase * 2.0
-    } else {
-        (1.0 - phase) * 2.0
-    };
-    0.5 - 0.5 * (progress * std::f32::consts::PI).cos()
-}
-
-/// Fade toward the theme highlight without changing the terminal glyph.
-fn waiting_response_bullet_tone(phase: f32, effort: Option<&str>) -> Tone {
-    let wave = waiting_response_bullet_wave(phase);
-    const MIN_STRENGTH: f32 = 13.0;
-    const MAX_STRENGTH: f32 = u8::MAX as f32;
-    let level = MIN_STRENGTH + wave * (MAX_STRENGTH - MIN_STRENGTH);
-    let target = effort
-        .and_then(effort_tone)
-        .and_then(tone_rgb)
-        .unwrap_or(theme::palette().accent);
-    Tone::ResponseShimmer(target, level.round() as u8)
+fn waiting_response_bullet_tone(phase: f32) -> Tone {
+    let wave = 0.5 - 0.5 * (phase.clamp(0.0, 1.0) * std::f32::consts::TAU).cos();
+    let base = tone_rgb(Tone::FastOff).unwrap_or(theme::palette().muted);
+    Tone::Shimmer(base, (wave * 255.0).round() as u8)
 }
 
 /// One span per character, each lit by how close it is to the band's centre, so
@@ -9137,7 +9083,7 @@ fn effort_tone(effort: &str) -> Option<Tone> {
         "high" => Tone::EffortHigh,
         "xhigh" => Tone::EffortXHigh,
         "max" => Tone::EffortMax,
-        "ultra" | "ultracode" => Tone::EffortUltra,
+        "ultra" => Tone::EffortUltra,
         _ => return None,
     })
 }
@@ -9775,7 +9721,6 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::DiffHeader => palette.diff_header,
         Tone::Shimmer(base, level) => blend(base, palette.foreground, level),
         Tone::PlanShimmer(effort, level) => blend(palette.foreground, effort, level),
-        Tone::ResponseShimmer(target, level) => blend(palette.background, target, level),
         Tone::CopyJoin => return None,
     })
 }
@@ -13559,7 +13504,7 @@ mod tests {
     }
 
     #[test]
-    fn waiting_shimmer_uses_the_requested_effort_colour_with_a_smoother_fade() {
+    fn waiting_pulse_targets_only_the_latest_visible_response_bullet() {
         let response = |text: &str| PaintLine {
             prefix: "• ".to_owned(),
             prefix_tone: Tone::FastOff,
@@ -13577,40 +13522,16 @@ mod tests {
             PaintLine::blank(),
         ];
 
-        assert_eq!(latest_response_bullet_row(&transcript), Some(2));
-        let mut with_live_response = transcript.clone();
-        with_live_response.push(response("new live response"));
-        assert_eq!(latest_response_bullet_row(&with_live_response), Some(4));
-        assert_eq!(RESPONSE_SHIMMER_PERIOD, Duration::from_millis(900));
-        let effort_colour = theme::palette().status.effort_high;
-        let mut marker = transcript[2].clone();
-        paint_waiting_response_bullet(&mut marker, 0.0, Some("high"));
-        assert_eq!(marker.prefix, "⦁ ");
-        assert_eq!(UnicodeWidthStr::width(marker.prefix.as_str()), 2);
-        assert_eq!(
-            marker.prefix_tone,
-            Tone::ResponseShimmer(effort_colour, 13)
-        );
-        paint_waiting_response_bullet(&mut marker, 0.125, Some("high"));
-        assert_eq!(
-            marker.prefix_tone,
-            Tone::ResponseShimmer(effort_colour, 48)
-        );
-        paint_waiting_response_bullet(&mut marker, 0.25, Some("high"));
-        assert_eq!(marker.prefix, "⦁ ");
-        assert_eq!(
-            marker.prefix_tone,
-            Tone::ResponseShimmer(effort_colour, 134)
-        );
-        paint_waiting_response_bullet(&mut marker, 0.5, Some("high"));
-        assert_eq!(marker.prefix, "⦁ ");
-        assert_eq!(
-            marker.prefix_tone,
-            Tone::ResponseShimmer(effort_colour, 255)
-        );
-        assert_eq!(tone_rgb(marker.prefix_tone), Some(effort_colour));
-        paint_waiting_response_bullet(&mut marker, 0.75, Some("high"));
-        assert_eq!(marker.prefix, "⦁ ");
+        assert_eq!(visible_response_bullet_row(&transcript, 2..4, 3), Some(3));
+        assert_eq!(visible_response_bullet_row(&transcript, 0..2, 0), None);
+        assert!(matches!(
+            waiting_response_bullet_tone(0.0),
+            Tone::Shimmer(_, 0)
+        ));
+        assert!(matches!(
+            waiting_response_bullet_tone(0.5),
+            Tone::Shimmer(_, 255)
+        ));
     }
 
     #[test]
