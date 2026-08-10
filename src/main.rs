@@ -998,6 +998,12 @@ async fn event_loop(
                 match server_event {
                     Some(ServerEvent::Notification { method, params }) => {
                         state.handle_notification(&method, &params);
+                        if method == "turn/completed" {
+                            server.persist_provider_handoff(
+                                &state.thread_id,
+                                provider_handoff_snapshot(state, renderer),
+                            );
+                        }
                         if matches!(
                             method.as_str(),
                             "mcpServer/oauthLogin/completed" | "mcpServer/startupStatus/updated"
@@ -3218,11 +3224,9 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "영어 낱말 하나로 이루어진 문장 조각도 허용하지 않으며, 한 문장이나 한 문단 안에서 영어 절과 한국어 절을 섞지 않는다. ",
     "반복해서 새는 위반이 둘 있으므로 출력 전에 반드시 걸러낸다. ",
     "첫째, 영어 낱말로 문장을 시작한 뒤 한국어를 이어 붙이는 형태다. ",
-    "`Now`, `Next`, `First`, `Then`, `Let me`, `I'll`, `Okay`, `Alright`, `Fine`, `Alt`가 이 자리에 오면 지우고 한국어만 남긴다. ",
-    "예: `Now 토글 함수를 넣습니다.` → `토글 함수를 넣습니다.` ",
-    "`Now ...` 같은 독립된 영어 진행 문장은 도구 호출 사이를 포함해 절대 출력하지 않으며, ",
-    "`I'll check ...`, `Fine. Building ...`, `Now the tile view logic.`도 똑같이 금지한다. ",
-    "특히 사용자에게 보이는 일반 text의 첫 낱말은 절대로 `Now`가 아니어야 한다. 진행 안내나 도구 결과 앞에 습관적으로 붙인 `Now`는 출력 직전에 지우고 한국어 문장으로 바로 시작한다. ",
+    "사용자에게 보이는 모든 text는 첫 글자가 한글 음절이어야 한다. 첫 낱말이 영어이면 그 낱말을 통째로 지우고 한국어 문장으로 다시 시작한다. ",
+    "이 자리에서 새는 낱말은 `Next`, `First`, `Then`, `Let me`, `I'll`, `Okay`, `Alright`, `Fine`, `Alt`과 그 밖의 영어 부사·접속사이며, 도구 호출 사이에 끼워 넣는 짧은 영어 진행 문장도 같은 위반이다. ",
+    "예: `First 토글 함수를 넣습니다.` → `토글 함수를 넣습니다.` ",
     "둘째, 도구 결과를 확인한 소감이나 판정을 영어 한 문장으로 적고 그 뒤에 한국어 문장을 붙이는 형태다. ",
     "`Confirmed ... works.`, `Good, that closes correctly.`, `Perfect.`, `Great.`, `Done.`, `That works.`처럼 쓰지 않는다. ",
     "예: `Confirmed tone_rgb(Tone::Border) works. 이제 다시 그립니다.` → `tone_rgb(Tone::Border)가 동작하는 것을 확인했습니다. 이제 다시 그립니다.` ",
@@ -3353,7 +3357,7 @@ const CLAUDE_TURN_REMINDER: &str = concat!(
     "- 단순 질문이 아닌 작업은 첫 응답 content block을 짧은 한국어 진행 안내 text로 시작하고, ",
     "TaskCreate를 포함한 어떤 tool_use도 그보다 먼저 내지 않는다. ",
     "진행 안내는 `진행 안내:` 같은 라벨 없이 문장으로 바로 시작한다.\n",
-    "- 사용자에게 보이는 일반 text의 첫 낱말로 `Now`를 절대 출력하지 않는다. 진행 안내나 도구 결과 앞의 `Now`는 지우고 한국어 문장으로 바로 시작한다.\n",
+    "- 사용자에게 보이는 모든 text는 첫 글자가 한글 음절이어야 한다. 영어 낱말로 시작했으면 그 낱말을 지우고 한국어 문장으로 다시 시작한다.\n",
     "- 결과 보고는 독립된 수정 하나당 불릿 하나와 짧은 문장 하나만 쓴다. 서로 다른 수정·원인·검증을 한 불릿에 묶지 말고, 검증 결과는 마지막 불릿 하나에 모은다. ",
     "결론은 바꾼 대상과 결과를 구체적으로 지목해 쓰고, 대상이 드러나지 않는 문장으로 얼버무리지 않는다.\n",
     "- 도구 한 번으로 끝난다고 확신할 수 없는 작업은 첫 작업 도구 전에 반드시 TaskCreate로 작업 목록을 만든다. 각 TaskCreate의 subject 자체는 반드시 `1. `, `2. `, `3. `처럼 번호로 시작하며, 화면 목록의 기호는 번호를 대신하지 않는다. 진행 안내나 조사 목록은 TaskCreate를 대신하지 않으며, 첫 도구 뒤나 두 번째 도구 앞에 TaskCreate를 호출하면 안 된다. 각 Task를 `pending` → `in_progress` → `completed` 순서로 하나씩 옮긴다.\n",
@@ -5677,6 +5681,8 @@ mod tests {
         // preset repeats the language rule where the turn cannot miss it.
         for vibe in [VibeMode::Vibe, VibeMode::SuperVibe, VibeMode::Normal] {
             assert!(notice(vibe).contains("영어로 시작하는 진행 문장"));
+            assert!(notice(vibe).contains("첫 글자가 한글 음절이어야 하고"));
+            assert!(!notice(vibe).contains("Now"));
         }
         // The caps truncated the one answer that has to stay whole, so both
         // capped presets carry the exception next to the cap that broke it.
@@ -5733,7 +5739,7 @@ mod tests {
             CLAUDE_TURN_REMINDER.chars().count() < CLAUDE_DEVEZ_INSTRUCTIONS.chars().count() / 4
         );
         assert!(CLAUDE_TURN_REMINDER.contains("첫 응답 content block"));
-        assert!(CLAUDE_TURN_REMINDER.contains("첫 낱말로 `Now`를 절대 출력하지 않는다"));
+        assert!(CLAUDE_TURN_REMINDER.contains("첫 글자가 한글 음절이어야 한다"));
         assert!(CLAUDE_TURN_REMINDER.contains("독립된 수정 하나당 불릿 하나와 짧은 문장 하나"));
         assert!(CLAUDE_TURN_REMINDER.contains("검증 결과는 마지막 불릿 하나에 모은다"));
         assert!(CLAUDE_TURN_REMINDER.contains("TaskCreate"));
@@ -5745,7 +5751,7 @@ mod tests {
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskCreate"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("첫 응답 content block"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("모든 일반 문장은 반드시 한국어로 작성한다"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`I'll check ...`, `Fine. Building ...`"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`Let me`, `I'll`, `Okay`, `Alright`, `Fine`"));
         assert!(
             CLAUDE_DEVEZ_INSTRUCTIONS.contains("어떤 tool_use도 이 text보다 먼저 출력하지 않는다")
         );
@@ -5781,8 +5787,12 @@ mod tests {
         for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS] {
             assert!(rules.contains("`다음 부분을 이어서 확인하겠습니다.`"));
         }
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`Now ...` 같은 독립된 영어 진행 문장"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("일반 text의 첫 낱말은 절대로 `Now`가 아니어야 한다"));
+        // Spelling the banned opener out five times primed the very word it
+        // banned, so the rule is stated positively and the token appears nowhere.
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("첫 글자가 한글 음절이어야 한다"));
+        for rules in [CLAUDE_DEVEZ_INSTRUCTIONS, CLAUDE_TURN_REMINDER] {
+            assert!(!rules.contains("Now"));
+        }
         // The ban only held when it moved above the format rules and named the
         // two shapes that actually leaked: an English label glued in front of a
         // Korean sentence, and an English verdict on a tool result. Saying it
