@@ -19,11 +19,10 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "대화방을 실행할 때 만들지 않고 첫 메시지를 보낼 때 만들도록 바꿔, 방 이름이 실제로 대화하는 provider와 어긋나지 않습니다.",
-    "대화를 시작한 뒤에는 provider를 바꾸지 못하게 막고, 새 대화로 열라는 안내를 남깁니다.",
-    "한 대화가 두 이름으로 갈렸을 때 응답과 종료 알림이 화면에 도달하지 못하던 문제를 고쳤습니다.",
-    "응답이 20초 넘게 조용하면 실제로 진행 중인지 확인해 이미 끝난 대화의 진행 표시를 스스로 내립니다.",
-    "중단한 대화의 `X Interrupted` 표시가 계속 반짝이던 것을 멈췄습니다.",
+    "글자가 흘러나오는 속도를 화면이 다시 그려지는 리듬에 맞춰, Claude 응답이 끊기듯 튀지 않고 고르게 이어집니다.",
+    "속도 조절을 외부 브리지에서 화면 쪽으로 옮겨, provider마다 제각각이던 도착 간격이 그대로 보이지 않습니다.",
+    "생각 과정과 계획 문구도 같은 리듬으로 드러납니다.",
+    "이모지처럼 여러 글자가 하나로 합쳐지는 문자는 중간에 쪼개지지 않습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

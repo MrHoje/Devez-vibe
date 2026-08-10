@@ -7005,6 +7005,12 @@ fn without_leading_english_filler(body: &str) -> &str {
         let rest = rest
             .strip_prefix(|c| matches!(c, ',' | '.' | ':' | ';'))
             .unwrap_or(rest);
+        // A streamed answer arrives a few characters at a time, so the opener
+        // lands before the Hangul that proves it is one. Holding the row empty
+        // for those few frames is what keeps the word off the screen entirely.
+        if rest.is_empty() || rest == " " {
+            return "";
+        }
         let Some(rest) = rest.strip_prefix(' ') else {
             continue;
         };
@@ -10949,6 +10955,9 @@ mod tests {
             without_leading_english_filler("Let me 확인하겠습니다."),
             "확인하겠습니다."
         );
+        // Mid-stream, before the Hangul that follows has arrived.
+        assert_eq!(without_leading_english_filler("Now"), "");
+        assert_eq!(without_leading_english_filler("Now "), "");
     }
 
     /// Cutting these would change what the answer says, so they stay whole.

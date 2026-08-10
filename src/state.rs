@@ -1415,6 +1415,95 @@ struct ActiveItem {
     block: Block,
     shell_batch: Option<String>,
     revision: u64,
+    pace: TextPace,
+}
+
+/// Providers deliver assistant text at their own uneven cadence: a phrase in one
+/// event, a single character in the next. Holding the arrivals here and revealing
+/// a share of them on each redraw ties the visible pace to the frame loop instead
+/// of to the delivery jitter.
+const STREAM_TARGET_FRAMES: f32 = 6.0;
+const STREAM_MAX_CLUSTERS: f32 = 48.0;
+/// Ease toward the backlog's demand instead of adopting it at once, and cap how
+/// far one frame may move, so a sudden phrase ramps up rather than lurching.
+const STREAM_RATE_EASING: f32 = 0.25;
+const STREAM_RATE_STEP: f32 = 2.0;
+
+#[derive(Default)]
+struct TextPace {
+    pending: String,
+    rate: f32,
+    carry: f32,
+}
+
+impl TextPace {
+    fn push(&mut self, delta: &str) {
+        self.pending.push_str(delta);
+    }
+
+    fn take(&mut self) -> Option<String> {
+        if self.pending.is_empty() {
+            self.rate = 0.0;
+            self.carry = 0.0;
+            return None;
+        }
+        let backlog = visible_cluster_count(&self.pending) as f32;
+        let target = (backlog / STREAM_TARGET_FRAMES).clamp(1.0, STREAM_MAX_CLUSTERS);
+        self.rate +=
+            ((target - self.rate) * STREAM_RATE_EASING).clamp(-STREAM_RATE_STEP, STREAM_RATE_STEP);
+        // Fractional rates only stay even if the leftover carries to the next
+        // frame; truncating every frame would quantize the pace to integers.
+        let budget = self.rate.max(1.0) + self.carry;
+        let size = budget.floor();
+        self.carry = budget - size;
+        let end = visible_cluster_end(&self.pending, size as usize);
+        Some(self.pending.drain(..end).collect())
+    }
+
+    fn flush(&mut self) -> Option<String> {
+        self.rate = 0.0;
+        self.carry = 0.0;
+        (!self.pending.is_empty()).then(|| std::mem::take(&mut self.pending))
+    }
+}
+
+/// A joiner, variation selector, combining mark, or skin-tone modifier belongs to
+/// the character before it. Splitting between them would paint a broken glyph for
+/// one frame.
+fn joins_previous(ch: char) -> bool {
+    matches!(
+        u32::from(ch),
+        0x200d | 0x0300..=0x036f | 0x1ab0..=0x1aff | 0x1dc0..=0x1dff | 0x20d0..=0x20f0
+            | 0xfe00..=0xfe0f | 0x1f3fb..=0x1f3ff
+    )
+}
+
+fn visible_cluster_count(text: &str) -> usize {
+    let mut count = 0;
+    let mut prev_joiner = false;
+    for (index, ch) in text.char_indices() {
+        if index == 0 || !(prev_joiner || joins_previous(ch)) {
+            count += 1;
+        }
+        prev_joiner = ch == '\u{200d}';
+    }
+    count
+}
+
+/// Byte offset just past `clusters` visible characters.
+fn visible_cluster_end(text: &str, clusters: usize) -> usize {
+    let mut taken = 0;
+    let mut prev_joiner = false;
+    for (index, ch) in text.char_indices() {
+        if index == 0 || !(prev_joiner || joins_previous(ch)) {
+            if taken == clusters {
+                return index;
+            }
+            taken += 1;
+        }
+        prev_joiner = ch == '\u{200d}';
+    }
+    text.len()
 }
 
 struct ShellBatch {
@@ -6390,6 +6479,12 @@ impl AppState {
         // Anything this thread says counts as the turn still being alive, so the
         // stall probe only fires on a wait that has genuinely gone silent.
         self.turn_progress_at = Some(Instant::now());
+        if matches!(
+            method,
+            "item/completed" | "turn/completed" | "turn/failed" | "turn/aborted"
+        ) {
+            self.flush_stream_text();
+        }
         match method {
             "serverRequest/resolved" => {
                 if let Some(request_id) = params.get("requestId") {
@@ -10757,12 +10852,20 @@ impl AppState {
                 self.register_shell_member(batch_id, id, &block);
             }
         }
+        // Text already waiting for its frame belongs to this item; re-announcing
+        // the item must not discard it.
+        let pace = self
+            .active
+            .remove(id)
+            .map(|existing| existing.pace)
+            .unwrap_or_default();
         self.active.insert(
             id.to_owned(),
             ActiveItem {
                 block,
                 shell_batch,
                 revision,
+                pace,
             },
         );
     }
@@ -10835,8 +10938,34 @@ impl AppState {
             self.turn_response_started = true;
         }
         let active = self.ensure_active(item_id, kind, title);
-        append_capped(&mut active.block.body, delta);
-        active.revision = active.revision.wrapping_add(1);
+        active.pace.push(delta);
+    }
+
+    /// Reveal one frame's share of every stream that is still holding text.
+    /// Returns whether anything became visible.
+    pub fn drain_stream_text(&mut self) -> bool {
+        let mut changed = false;
+        for active in self.active.values_mut() {
+            let Some(chunk) = active.pace.take() else {
+                continue;
+            };
+            append_capped(&mut active.block.body, &chunk);
+            active.revision = active.revision.wrapping_add(1);
+            changed = true;
+        }
+        changed
+    }
+
+    /// Held text must land before an item or turn is finalized; anything still
+    /// waiting would otherwise be dropped when the block leaves `active`.
+    fn flush_stream_text(&mut self) {
+        for active in self.active.values_mut() {
+            let Some(rest) = active.pace.flush() else {
+                continue;
+            };
+            append_capped(&mut active.block.body, &rest);
+            active.revision = active.revision.wrapping_add(1);
+        }
     }
 
     /// Command output can arrive before `item/started`. Mark it as Shell at the
@@ -10879,6 +11008,7 @@ impl AppState {
                     block: Block::new(BlockKind::Tool, "Shell · command", ""),
                     shell_batch: None,
                     revision: 0,
+                    pace: TextPace::default(),
                 },
             );
         }
@@ -10957,6 +11087,7 @@ impl AppState {
                     block: Block::new(kind, title, ""),
                     shell_batch: None,
                     revision: 0,
+                    pace: TextPace::default(),
                 },
             );
         }
@@ -16373,6 +16504,53 @@ mod tests {
         state.handle_notification("turn/completed", &json!({}));
 
         assert!(!state.compacting());
+    }
+
+    #[test]
+    fn streamed_text_is_revealed_on_frames_instead_of_on_arrival() {
+        let mut state = test_state();
+        let text = "한 문장이 통째로 도착해도 화면에는 나눠서 드러납니다.";
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({ "itemId": "item-1", "delta": text }),
+        );
+
+        assert_eq!(state.active["item-1"].block.body, "");
+
+        assert!(state.drain_stream_text());
+        let first = state.active["item-1"].block.body.clone();
+        assert!(!first.is_empty());
+        assert!(first.chars().count() < text.chars().count());
+
+        while state.drain_stream_text() {}
+        assert_eq!(state.active["item-1"].block.body, text);
+    }
+
+    #[test]
+    fn a_finished_turn_never_drops_text_that_has_not_been_shown() {
+        let mut state = test_state();
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({ "itemId": "item-1", "delta": "아직 드러나지 않은 글자" }),
+        );
+        state.handle_notification("turn/completed", &json!({}));
+
+        assert!(
+            state
+                .committed
+                .iter()
+                .any(|block| block.body == "아직 드러나지 않은 글자")
+        );
+    }
+
+    #[test]
+    fn a_joined_emoji_is_never_split_across_frames() {
+        let family = "👨‍👩‍👧‍👦";
+        assert_eq!(visible_cluster_count(family), 1);
+        assert_eq!(visible_cluster_end(family, 0), 0);
+        assert_eq!(visible_cluster_end(family, 1), family.len());
+        assert_eq!(visible_cluster_count("가나다"), 3);
+        assert_eq!(visible_cluster_end("가나다", 2), "가나".len());
     }
 
     #[test]

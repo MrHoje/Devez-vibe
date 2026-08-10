@@ -1006,117 +1006,10 @@ function emitOpeningNotice(session) {
   session.turn.openingNoticeEmitted = true;
 }
 
-// Windows rounds larger timer delays up to the next scheduler slice. Ten
-// milliseconds lands near one terminal frame instead of visibly stepping at ~30ms.
-const SMOOTH_TEXT_INTERVAL_MS = 10;
-const SMOOTH_TEXT_TARGET_FRAMES = 10;
-const SMOOTH_TEXT_MAX_GRAPHEMES = 24;
-const SMOOTH_TEXT_MIN_RATE = 1;
-// Ease the per-frame rate toward the backlog's demand instead of adopting it at
-// once: a phrase-sized event would otherwise jump straight to a wide chunk and
-// read as a lurch, and the next tiny event would snap back to one grapheme.
-const SMOOTH_TEXT_RATE_EASING = 0.25;
-// Cap how far the eased rate may move in one frame so a sudden 400-grapheme
-// backlog ramps up over frames instead of widening the very first chunk.
-const SMOOTH_TEXT_RATE_STEP = 1;
-const graphemeSegmenter = typeof Intl.Segmenter === "function"
-  ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
-  : null;
-
-function splitGraphemes(text) {
-  return graphemeSegmenter
-    ? Array.from(graphemeSegmenter.segment(text), ({ segment }) => segment)
-    : Array.from(text);
-}
-
-// Claude can deliver a whole phrase in one SDK event. Drain a steady share per
-// visual frame, where the rate eases toward the backlog instead of tracking it
-// event by event.
-function takeSmoothTextChunk(text, size) {
-  const graphemes = splitGraphemes(text);
-  return {
-    chunk: graphemes.slice(0, size).join(""),
-    rest: graphemes.slice(size).join(""),
-  };
-}
-
-class SmoothTextStream {
-  constructor(emit, intervalMs = SMOOTH_TEXT_INTERVAL_MS) {
-    this.emit = emit;
-    this.intervalMs = intervalMs;
-    this.pending = "";
-    this.timer = null;
-    this.waiters = [];
-    this.rate = SMOOTH_TEXT_MIN_RATE;
-    // Fractional rates only stay smooth if the leftover carries to the next
-    // frame; truncating every frame would quantize the pace back to integers.
-    this.carry = 0;
-  }
-
-  nextChunkSize(pendingLength) {
-    const demand = pendingLength / SMOOTH_TEXT_TARGET_FRAMES;
-    const target = Math.min(
-      SMOOTH_TEXT_MAX_GRAPHEMES,
-      Math.max(SMOOTH_TEXT_MIN_RATE, demand),
-    );
-    const eased = (target - this.rate) * SMOOTH_TEXT_RATE_EASING;
-    this.rate += Math.max(-SMOOTH_TEXT_RATE_STEP, Math.min(SMOOTH_TEXT_RATE_STEP, eased));
-    const budget = this.rate + this.carry;
-    const size = Math.max(SMOOTH_TEXT_MIN_RATE, Math.floor(budget));
-    this.carry = Math.max(0, budget - size);
-    return size;
-  }
-
-  push(text) {
-    this.pending += text;
-    this.schedule();
-  }
-
-  schedule() {
-    if (this.timer != null) return;
-    // Wait one visual frame before the first drain. Claude often sends several
-    // tiny deltas back-to-back; batching them removes the uneven one-character
-    // jumps while keeping added latency below one frame.
-    this.timer = setTimeout(() => {
-      this.timer = null;
-      this.drain();
-    }, this.intervalMs);
-  }
-
-  drain() {
-    if (!this.pending) {
-      this.timer = null;
-      for (const resolve of this.waiters.splice(0)) resolve();
-      return;
-    }
-    const size = this.nextChunkSize(splitGraphemes(this.pending).length);
-    const { chunk, rest } = takeSmoothTextChunk(this.pending, size);
-    this.pending = rest;
-    this.emit(chunk);
-    if (this.pending) {
-      this.schedule();
-    } else {
-      for (const resolve of this.waiters.splice(0)) resolve();
-    }
-  }
-
-  finish() {
-    if (!this.pending && this.timer == null) return Promise.resolve();
-    return new Promise((resolve) => this.waiters.push(resolve));
-  }
-
-  flush() {
-    if (this.timer != null) clearTimeout(this.timer);
-    this.timer = null;
-    if (this.pending) this.emit(this.pending);
-    this.pending = "";
-    for (const resolve of this.waiters.splice(0)) resolve();
-  }
-}
-
-function flushSmoothStreams(session) {
-  for (const block of session.streamBlocks.values()) block.smooth?.flush();
-}
+// Text pacing lives in the host renderer, not here. A timer in this process
+// runs on Node's scheduler, which cannot line up with the terminal's redraw
+// rhythm — the mismatch was itself the visible stutter. Forward each delta as
+// it arrives and let the renderer reveal it on its own frames.
 
 function tokenBreakdown(usage) {
   if (!usage) return null;
@@ -1174,7 +1067,6 @@ async function processStreamEvent(session, message) {
   if (!session.turn || message.parent_tool_use_id) return;
   const event = message.event || {};
   if (event.type === "message_start") {
-    flushSmoothStreams(session);
     session.streamBlocks.clear();
   }
   if (event.type === "content_block_start") {
@@ -1184,12 +1076,10 @@ async function processStreamEvent(session, message) {
     const item = block.type === "text"
       ? { id, type: "agentMessage", text: "", provider: "Claude" }
       : { id, type: "reasoning", summary: [] };
-    // Thinking arrives in the same phrase-sized events as text, so it needs the
-    // same paced drain — raw thinking deltas were the last visible stutter.
     const method = block.type === "text"
       ? "item/agentMessage/delta"
       : "item/reasoning/summaryTextDelta";
-    const smooth = new SmoothTextStream((delta) => emitDelta(session, method, id, delta));
+    const emit = (delta) => emitDelta(session, method, id, delta);
     // A held English line can end up dropped entirely, and an item announced
     // before that decision would stay on screen as an empty bubble. Hold the
     // start too, and emit it with the first text that survives.
@@ -1198,7 +1088,7 @@ async function processStreamEvent(session, message) {
       id,
       type: block.type,
       text: "",
-      smooth,
+      emit,
       languagePending: held ? "" : null,
       holdEnglishProgress: false,
       pendingStart: held ? item : null,
@@ -1226,11 +1116,11 @@ async function processStreamEvent(session, message) {
       }
       emitHeldStart(session, current);
       session.turn.sawVisibleText = true;
-      current.smooth.push(current.languagePending);
+      current.emit(current.languagePending);
       current.languagePending = null;
       return;
     }
-    current.smooth.push(delta);
+    current.emit(delta);
     return;
   }
   if (event.type === "content_block_stop") {
@@ -1246,10 +1136,9 @@ async function processStreamEvent(session, message) {
       }
       emitHeldStart(session, current);
       if (visible.trim()) session.turn.sawVisibleText = true;
-      current.smooth?.push(visible);
+      current.emit(visible);
     }
     emitHeldStart(session, current);
-    await current.smooth?.finish();
     const item = current.type === "text"
       ? { id: current.id, type: "agentMessage", text: current.text, provider: "Claude" }
       : { id: current.id, type: "reasoning", summary: [current.text] };
@@ -1935,7 +1824,6 @@ async function runPendingPrompt(session) {
 function finishTurn(session, error, durationMs) {
   if (!session.turn) return;
   flushPendingPlan(session);
-  flushSmoothStreams(session);
   clearForegroundSubagents(session);
   const turn = { id: session.turn.id, status: error ? "failed" : "completed" };
   if (error) turn.error = { message: error instanceof Error ? error.message : error.message || String(error) };
@@ -3049,33 +2937,6 @@ async function runSelfTest() {
     event.method === "item/completed" && event.params?.item?.type === "agentMessage");
   if (keptStarted !== 0 || keptCompleted?.params?.item?.text !== "타일 보기 로직을 고쳤습니다.") {
     throw new Error(`Claude held Korean text self-test failed: ${JSON.stringify(keptEvents)}`);
-  }
-  const smoothText = "Claude가 👨‍👩‍👧‍👦 한 문장을 한꺼번에 보내도 부드럽게 표시합니다.";
-  const emitted = [];
-  const smooth = new SmoothTextStream((chunk) => emitted.push(chunk), 0);
-  smooth.push(smoothText);
-  if (emitted.length !== 0) {
-    throw new Error(`Claude smooth stream did not batch its first frame: ${JSON.stringify(emitted)}`);
-  }
-  await smooth.finish();
-  if (emitted.length < 2 || emitted.join("") !== smoothText) {
-    throw new Error(`Claude smooth stream self-test failed: ${JSON.stringify(emitted)}`);
-  }
-  const ramped = [];
-  const rampStream = new SmoothTextStream((chunk) => ramped.push(chunk), 0);
-  rampStream.push("가".repeat(400));
-  await rampStream.finish();
-  const rampSizes = ramped.map((chunk) => splitGraphemes(chunk).length);
-  if (rampSizes[0] > 2 || rampSizes.some((size, index) => index > 0 && size > rampSizes[index - 1] + 2)) {
-    throw new Error(`Claude smooth stream rate jumped: ${JSON.stringify(rampSizes.slice(0, 8))}`);
-  }
-  const flushed = [];
-  const interrupted = new SmoothTextStream((chunk) => flushed.push(chunk), 1000);
-  interrupted.push(smoothText);
-  interrupted.flush();
-  await interrupted.finish();
-  if (flushed.join("") !== smoothText) {
-    throw new Error(`Claude smooth stream flush self-test failed: ${JSON.stringify(flushed)}`);
   }
   process.stdout.write("Claude bridge self-test passed\n");
 }

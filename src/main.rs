@@ -890,6 +890,10 @@ async fn event_loop(
     let mut composer_paste = ComposerPasteBuffer::new();
     let mut activity_tick = tokio::time::interval(Duration::from_millis(80));
     activity_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Streamed text is revealed here rather than when a delta lands, so the pace
+    // follows the redraw rhythm instead of the provider's arrival jitter.
+    let mut stream_tick = tokio::time::interval(STREAM_FRAME);
+    stream_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut resize = ResizeTracker::new();
     let (workspace_tx, mut workspace_rx) = mpsc::channel(1);
     let mut cost_restore_rx = None;
@@ -1137,6 +1141,10 @@ async fn event_loop(
                                 .unwrap_or(Action::None)
                         } else if method == "skills/changed" {
                             Action::RefreshSkills
+                        } else if is_paced_text_delta(&method) {
+                            // The frame tick paints this; drawing on arrival would
+                            // put the provider's cadence back on screen.
+                            Action::Tick(false)
                         } else {
                             Action::None
                         }
@@ -1194,6 +1202,13 @@ async fn event_loop(
             _ = wait_for_paste_flush(paste_deadline), if paste_deadline.is_some() => {
                 Action::Tick(flush_composer_paste(state, &mut composer_paste, Instant::now()))
             }
+            _ = stream_tick.tick() => {
+                let revealed = state.drain_stream_text();
+                if revealed {
+                    animation_tick = false;
+                }
+                Action::Tick(revealed)
+            }
             _ = activity_tick.tick() => {
                 let tick = state.render_tick();
                 let mut redraw = tick.redraw;
@@ -1241,6 +1256,16 @@ async fn event_loop(
 
 const WHEEL_ROWS: isize = 3;
 const SIDE_EXIT_KEY_SETTLE: Duration = Duration::from_millis(250);
+/// One terminal frame. Windows rounds larger delays up to the next scheduler
+/// slice, so this stays at the shortest interval that still lands evenly.
+const STREAM_FRAME: Duration = Duration::from_millis(16);
+
+fn is_paced_text_delta(method: &str) -> bool {
+    matches!(
+        method,
+        "item/agentMessage/delta" | "item/reasoning/summaryTextDelta" | "item/plan/delta"
+    )
+}
 
 fn is_side_exit_key(key: &KeyEvent) -> bool {
     key.code == KeyCode::Esc
