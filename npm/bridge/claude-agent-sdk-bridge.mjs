@@ -2130,9 +2130,13 @@ function historyState(messages) {
         status: "completed",
         items: [{ id: `claude-user-${message.uuid}`, type: "userMessage", content: [{ type: "text", text: userText }] }],
       };
+      const startedAt = messageTime(message);
+      if (startedAt != null) turn.startedAt = Math.floor(startedAt / 1000);
       turns.push(turn);
     }
     if (!turn) continue;
+    const completedAt = messageTime(message);
+    if (completedAt != null) turn.completedAt = Math.floor(completedAt / 1000);
     if (message.type === "assistant") {
       if (message.message?.model === "<synthetic>") {
         turn.synthetic = true;

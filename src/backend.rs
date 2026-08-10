@@ -1,8 +1,12 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     env, fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
+    process,
     sync::{Arc, Mutex as StdMutex},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -35,7 +39,7 @@ impl IntegrationClient {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum RuntimeKind {
     Codex,
     OpenCode,
@@ -70,6 +74,10 @@ struct Route {
     claude_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_effort: Option<String>,
+    /// Monotonic-enough wall-clock stamp used when several dvz processes merge
+    /// their route maps. Older route files deserialize this as zero.
+    #[serde(default)]
+    updated_at: u64,
 }
 
 impl Route {
@@ -89,6 +97,14 @@ impl Route {
     /// the CLI can rotate while the thread keeps the id it was announced under.
     fn is_worth_storing(&self) -> bool {
         self.backing_count() > 1 || self.claude_id.is_some()
+    }
+
+    fn has_claude_codex_backings(&self) -> bool {
+        self.claude_id.is_some() && self.codex_id.is_some()
+    }
+
+    fn touch(&mut self) {
+        self.updated_at = store_timestamp();
     }
 
     fn seen_through(&self, kind: RuntimeKind) -> u64 {
@@ -380,7 +396,7 @@ impl BackendServer {
                 }
             }
             "thread/resume" => {
-                let visible = thread_id(&params)?.to_owned();
+                let visible = self.canonical_visible(thread_id(&params)?);
                 if self.route_kind(&visible) == RuntimeKind::Claude {
                     let backing = self
                         .backing_id(&visible, RuntimeKind::Claude)
@@ -421,15 +437,24 @@ impl BackendServer {
                     Ok(self.register_codex_response_as(response, &visible))
                 }
             }
+            "thread/turns/list" if self
+                .is_mixed_provider_route(&self.canonical_visible(thread_id(&params)?)) =>
+            {
+                let visible = self.canonical_visible(thread_id(&params)?);
+                if let Some(history) = load_provider_handoff(&visible) {
+                    return Ok(provider_handoff_history_page(&history));
+                }
+                self.mixed_provider_history(&visible, &params).await
+            }
             "thread/turns/list"
                 if self.route_kind(thread_id(&params)?) == RuntimeKind::OpenCode =>
             {
                 Ok(json!({ "data": [], "nextCursor": null }))
             }
             "thread/turns/list" if self.route_kind(thread_id(&params)?) == RuntimeKind::Claude => {
-                let visible = thread_id(&params)?;
-                let route = self.route(visible);
-                let backing = self.backing_id(visible, RuntimeKind::Claude)?;
+                let visible = self.canonical_visible(thread_id(&params)?);
+                let route = self.route(&visible);
+                let backing = self.backing_id(&visible, RuntimeKind::Claude)?;
                 self.claude
                     .request(
                         "session/history",
@@ -441,12 +466,12 @@ impl BackendServer {
                     .await
             }
             "thread/turns/list" => {
-                let visible = thread_id(&params)?.to_owned();
+                let visible = self.canonical_visible(thread_id(&params)?);
                 params["threadId"] = json!(self.backing_id(&visible, RuntimeKind::Codex)?);
                 self.codex()?.request(method, params).await
             }
             "turn/start" | "turn/steer" => {
-                let visible = thread_id(&params)?.to_owned();
+                let visible = self.canonical_visible(thread_id(&params)?);
                 let previous = self.route_kind(&visible);
                 let selected =
                     selected_runtime(params.get("model").and_then(Value::as_str), previous);
@@ -735,11 +760,22 @@ impl BackendServer {
     }
 
     pub async fn prepare_resume_runtime(&mut self, visible: &str) -> Result<()> {
-        match self.route_kind(visible) {
+        let visible = self.canonical_visible(visible);
+        match self.route_kind(&visible) {
             RuntimeKind::Codex => self.start_codex().await,
             RuntimeKind::OpenCode => self.ensure_open_code().await.map(|_| ()),
             RuntimeKind::Claude => Ok(()),
+        }?;
+        // A mixed session's visible history may need both native transcripts for
+        // the first resume after this feature is installed. Claude is always
+        // available through the bridge; starting Codex here makes the fallback
+        // migration possible even when Claude is the active provider. Failure is
+        // deliberately non-fatal: a newer session-history sidecar can restore the
+        // visible transcript without the inactive runtime.
+        if self.is_mixed_provider_route(&visible) && self.codex.is_none() {
+            let _ = self.start_codex().await;
         }
+        Ok(())
     }
 
     pub async fn provider_catalog(&mut self) -> Result<Value> {
@@ -1073,30 +1109,22 @@ impl BackendServer {
                 claude_seen_through: 0,
                 claude_model: None,
                 claude_effort: None,
+                updated_at: 0,
             });
             route.active = active;
             route.cwd = cwd;
             if let Some(id) = codex_id {
-                self.aliases
-                    .lock()
-                    .expect("aliases mutex")
-                    .insert(id.clone(), visible.to_owned());
                 route.codex_id = Some(id);
             }
             if let Some(id) = open_code_id {
-                self.aliases
-                    .lock()
-                    .expect("aliases mutex")
-                    .insert(id.clone(), visible.to_owned());
                 route.open_code_id = Some(id);
             }
             if let Some(id) = claude_id {
-                self.aliases
-                    .lock()
-                    .expect("aliases mutex")
-                    .insert(id.clone(), visible.to_owned());
                 route.claude_id = Some(id);
             }
+            route.touch();
+            let aliases = route_aliases(&routes);
+            *self.aliases.lock().expect("aliases mutex") = aliases;
         }
         self.persist_routes();
         self.note_resume_id(visible);
@@ -1137,6 +1165,22 @@ impl BackendServer {
             .as_ref()
             .and_then(resume_id_for)
             .unwrap_or_else(|| visible.to_owned())
+    }
+
+    /// Persists the portable transcript after a completed turn. Native Claude and
+    /// Codex sessions remain the execution backends, but this sidecar is the
+    /// chronological visible history used when a mixed session is resumed.
+    pub fn persist_provider_handoff(&self, visible: &str, snapshot: Value) {
+        if !self.is_mixed_provider_route(visible) {
+            return;
+        }
+        let Some(snapshot) = ProviderHandoff::from_value(snapshot) else {
+            return;
+        };
+        let Some(path) = provider_history_path(visible) else {
+            return;
+        };
+        let _ = save_provider_handoff(&path, &snapshot);
     }
 
     fn register_discovered_route(
@@ -1186,10 +1230,124 @@ impl BackendServer {
             .cloned()
     }
 
+    fn is_mixed_provider_route(&self, visible: &str) -> bool {
+        let visible = self.canonical_visible(visible);
+        self.route(&visible)
+            .is_some_and(|route| route.has_claude_codex_backings())
+    }
+
+    /// Reads both native histories for a legacy mixed route that has no visible
+    /// transcript sidecar yet. Newer turns are persisted from the rendered
+    /// transcript, while this path gives existing sessions a one-time migration
+    /// instead of dropping the inactive provider's turns on resume.
+    async fn mixed_provider_history(&self, visible: &str, params: &Value) -> Result<Value> {
+        let route = self
+            .route(visible)
+            .context("혼합 provider 라우트를 찾을 수 없습니다.")?;
+        let cwd = route.cwd.clone();
+        let active = route.active;
+
+        let claude_turns = match self
+            .claude
+            .request(
+                "session/history",
+                json!({
+                    "sessionId": route
+                        .claude_id
+                        .as_deref()
+                        .context("혼합 라우트에 Claude 세션 ID가 없습니다.")?,
+                    "cwd": cwd
+                }),
+            )
+            .await
+        {
+            Ok(response) => response
+                .get("data")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            Err(error) if active == RuntimeKind::Claude => return Err(error),
+            Err(_) => Vec::new(),
+        };
+
+        let codex_turns = match route.codex_id.as_deref() {
+            Some(backing) if self.codex.is_some() => {
+                match self.codex_history(params, backing).await {
+                    Ok(turns) => turns,
+                    Err(error) if active == RuntimeKind::Codex => return Err(error),
+                    Err(_) => Vec::new(),
+                }
+            }
+            _ if active == RuntimeKind::Codex => {
+                return Err(anyhow::anyhow!(
+                    "혼합 라우트의 Codex runtime을 시작하지 못했습니다."
+                ));
+            }
+            _ => Vec::new(),
+        };
+
+        Ok(json!({
+            "data": merge_provider_turns(
+                claude_turns
+                    .into_iter()
+                    .chain(codex_turns)
+                    .collect(),
+            ),
+            "nextCursor": null
+        }))
+    }
+
+    async fn codex_history(&self, params: &Value, backing: &str) -> Result<Vec<Value>> {
+        let mut turns = Vec::new();
+        let mut cursor = None;
+        let mut previous_cursor = None;
+
+        loop {
+            let mut request = params.clone();
+            request["threadId"] = json!(backing);
+            if let Some(cursor) = cursor.as_deref() {
+                request["cursor"] = json!(cursor);
+            } else if let Some(object) = request.as_object_mut() {
+                object.remove("cursor");
+            }
+            let page = self.codex()?.request("thread/turns/list", request).await?;
+            if let Some(data) = page.get("data").and_then(Value::as_array) {
+                turns.extend(data.iter().cloned());
+            }
+            let next = page
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            if next.is_none() || next == previous_cursor {
+                break;
+            }
+            previous_cursor = cursor;
+            cursor = next;
+        }
+        Ok(turns)
+    }
+
+    /// DevezCode stores the active native backing id for a mixed room. Resolve
+    /// that id back to the visible route before any provider branch runs, so a
+    /// restart does not create a new Codex-only route and hide the Claude half.
+    fn canonical_visible(&self, id: &str) -> String {
+        if self.route(id).is_some() {
+            return id.to_owned();
+        }
+        let backing = raw_thread_id(id);
+        self.aliases
+            .lock()
+            .expect("aliases mutex")
+            .get(backing)
+            .cloned()
+            .unwrap_or_else(|| id.to_owned())
+    }
+
     fn route_kind(&self, visible: &str) -> RuntimeKind {
-        self.route(visible)
+        let visible = self.canonical_visible(visible);
+        self.route(&visible)
             .map(|route| route.active)
-            .unwrap_or_else(|| id_runtime(visible))
+            .unwrap_or_else(|| id_runtime(&visible))
     }
 
     /// Remembers what a Claude turn ran on. Written on every turn and persisted
@@ -1212,6 +1370,7 @@ impl BackendServer {
             if let Some(effort) = effort {
                 route.claude_effort = Some(effort.to_owned());
             }
+            route.touch();
         }
         self.persist_routes();
     }
@@ -1220,6 +1379,7 @@ impl BackendServer {
         {
             if let Some(route) = self.routes.lock().expect("routes mutex").get_mut(visible) {
                 route.note_seen_through(kind, block_id);
+                route.touch();
             }
         }
         self.persist_routes();
@@ -1229,6 +1389,7 @@ impl BackendServer {
         {
             if let Some(route) = self.routes.lock().expect("routes mutex").get_mut(visible) {
                 route.active = active;
+                route.touch();
             }
         }
         self.persist_routes();
@@ -1239,14 +1400,15 @@ impl BackendServer {
     }
 
     fn backing_id(&self, visible: &str, kind: RuntimeKind) -> Result<String> {
-        let route = self.route(visible);
+        let visible = self.canonical_visible(visible);
+        let route = self.route(&visible);
         let backing = match kind {
             RuntimeKind::Codex => route.and_then(|route| route.codex_id),
             RuntimeKind::OpenCode => route.and_then(|route| route.open_code_id),
             RuntimeKind::Claude => route.and_then(|route| route.claude_id),
         };
         backing
-            .or_else(|| (self.route_kind(visible) == kind).then(|| visible.to_owned()))
+            .or_else(|| (self.route_kind(&visible) == kind).then(|| visible.to_owned()))
             .with_context(|| format!("세션 `{visible}`의 런타임 연결을 찾을 수 없습니다."))
     }
 
@@ -1416,6 +1578,13 @@ fn empty_list_response() -> Value {
     json!({ "data": [], "nextCursor": null })
 }
 
+fn store_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or_default()
+}
+
 fn route_store_path() -> Option<PathBuf> {
     if let Some(app_data) = env::var_os("APPDATA") {
         return Some(
@@ -1429,6 +1598,25 @@ fn route_store_path() -> Option<PathBuf> {
             .join("devez-vibe")
             .join("session-routes.json")
     })
+}
+
+fn provider_history_path(visible: &str) -> Option<PathBuf> {
+    let root = env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .map(|app_data| app_data.join("DevezVibe").join("session-history"))
+        .or_else(|| {
+            env::var_os("HOME").map(PathBuf::from).map(|home| {
+                home.join(".config")
+                    .join("devez-vibe")
+                    .join("session-history")
+            })
+        })?;
+    let encoded = visible
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Some(root.join(format!("{encoded}.json")))
 }
 
 /// The runtime a thread id names on its own: Claude namespaces its sessions,
@@ -1451,38 +1639,134 @@ fn load_routes(path: &Path) -> HashMap<String, Route> {
         .unwrap_or_default()
 }
 
+fn load_provider_handoff(visible: &str) -> Option<ProviderHandoff> {
+    let path = provider_history_path(visible)?;
+    let data = fs::read(path).ok()?;
+    serde_json::from_slice::<Value>(&data)
+        .ok()
+        .and_then(ProviderHandoff::from_value)
+}
+
 fn save_routes(path: &Path, routes: &HashMap<String, Route>) -> Result<()> {
     // Every room DevezCode opens runs its own dvz, and each one only knows its own
     // threads. Writing just this process's map would drop the sibling rooms' routes,
     // and a dropped route is a room that resumes into the wrong runtime's session.
-    let mut stored = load_routes(path);
-    for (visible, route) in routes.iter().filter(|(_, route)| route.is_worth_storing()) {
-        stored.insert(visible.clone(), route.clone());
-    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let temp = path.with_extension("json.tmp");
-    fs::write(&temp, serde_json::to_vec_pretty(&stored)?)?;
-    fs::rename(&temp, path)?;
+    let _lock = acquire_store_lock(path)?;
+    let mut stored = load_routes(path);
+    for (visible, route) in routes.iter().filter(|(_, route)| route.is_worth_storing()) {
+        let replace = stored
+            .get(visible)
+            .is_none_or(|existing| {
+                existing.updated_at == 0 || route.updated_at >= existing.updated_at
+            });
+        if replace {
+            stored.insert(visible.clone(), route.clone());
+        }
+    }
+    write_locked_json(path, &stored)
+}
+
+fn save_provider_handoff(path: &Path, snapshot: &ProviderHandoff) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _lock = acquire_store_lock(path)?;
+    write_locked_json(path, snapshot)
+}
+
+fn write_locked_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("session-store.json");
+    let temp = path.with_file_name(format!(".{file_name}.{}.tmp", process::id()));
+    fs::write(&temp, bytes)?;
+    if let Err(error) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error.into());
+    }
     Ok(())
 }
 
+struct StoreLock {
+    path: PathBuf,
+    _file: fs::File,
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_store_lock(path: &Path) -> Result<StoreLock> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("session-store.json");
+    let lock_path = path.with_file_name(format!("{file_name}.lock"));
+    for _ in 0..240 {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(file) => {
+                return Ok(StoreLock {
+                    path: lock_path,
+                    _file: file,
+                });
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                if fs::metadata(&lock_path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > Duration::from_secs(600))
+                {
+                    let _ = fs::remove_file(&lock_path);
+                    continue;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    anyhow::bail!("세션 저장소 잠금 획득 시간이 초과되었습니다: {}", path.display())
+}
+
 fn route_aliases(routes: &HashMap<String, Route>) -> HashMap<String, String> {
-    routes
-        .iter()
-        .flat_map(|(visible, route)| {
-            [
-                route.codex_id.as_ref(),
-                route.open_code_id.as_ref(),
-                route.claude_id.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            .map(|backing| (backing.clone(), visible.clone()))
-            .collect::<Vec<_>>()
-        })
-        .collect()
+    let mut aliases = HashMap::new();
+    let mut ambiguous = HashSet::new();
+    for (visible, route) in routes {
+        for backing in [
+            route.codex_id.as_ref(),
+            route.open_code_id.as_ref(),
+            route.claude_id.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if ambiguous.contains(backing) {
+                continue;
+            }
+            match aliases.get(backing) {
+                Some(previous) if previous != visible => {
+                    aliases.remove(backing);
+                    ambiguous.insert(backing.clone());
+                }
+                None => {
+                    aliases.insert(backing.clone(), visible.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    aliases
 }
 
 /// The id that resumes each stored thread — the backing session of the runtime the
@@ -1499,6 +1783,120 @@ fn resume_id_for(route: &Route) -> Option<String> {
         RuntimeKind::Claude => route.claude_id.as_deref().map(visible_thread_id),
         RuntimeKind::Codex => route.codex_id.clone(),
         RuntimeKind::OpenCode => route.open_code_id.clone(),
+    }
+}
+
+fn merge_provider_turns(turns: Vec<Value>) -> Vec<Value> {
+    let mut indexed = turns.into_iter().enumerate().collect::<Vec<_>>();
+    indexed.sort_by_key(|(index, turn)| (turn_timestamp(turn).unwrap_or(i64::MAX), *index));
+    let mut seen = HashSet::new();
+    indexed
+        .into_iter()
+        .filter_map(|(_, turn)| {
+            let id = turn.get("id").and_then(Value::as_str);
+            if let Some(id) = id
+                && !seen.insert(id.to_owned())
+            {
+                return None;
+            }
+            Some(turn)
+        })
+        .collect()
+}
+
+fn turn_timestamp(turn: &Value) -> Option<i64> {
+    for name in ["startedAt", "createdAt", "updatedAt"] {
+        let Some(value) = turn.get(name) else {
+            continue;
+        };
+        if let Some(timestamp) = value.as_i64() {
+            return Some(timestamp);
+        }
+        if let Some(timestamp) = value.as_str() {
+            if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(timestamp) {
+                return Some(parsed.timestamp());
+            }
+        }
+    }
+    None
+}
+
+fn provider_handoff_history_page(snapshot: &ProviderHandoff) -> Value {
+    let mut turns = Vec::new();
+    let mut current_turn = None;
+
+    for entry in &snapshot.entries {
+        let item = provider_handoff_item(entry);
+        let starts_turn = entry.kind == "user" || current_turn.is_none();
+        if starts_turn {
+            let turn_id = format!("devez-handoff-turn-{}", entry.id);
+            turns.push(json!({
+                "id": turn_id,
+                "status": "completed",
+                "model": (entry.kind == "user").then_some(entry.title.clone()),
+                "items": [item]
+            }));
+            current_turn = Some(turns.len() - 1);
+        } else if let Some(index) = current_turn
+            && let Some(items) = turns[index].get_mut("items").and_then(Value::as_array_mut)
+        {
+            items.push(item);
+        }
+    }
+
+    json!({ "data": turns, "nextCursor": null })
+}
+
+fn provider_handoff_item(entry: &ProviderHandoffEntry) -> Value {
+    let id = format!("devez-handoff-item-{}", entry.id);
+    match entry.kind.as_str() {
+        "user" => json!({
+            "id": id,
+            "type": "userMessage",
+            "model": entry.title,
+            "content": [{ "type": "text", "text": entry.body }]
+        }),
+        "assistant" => json!({
+            "id": id,
+            "type": "agentMessage",
+            "provider": if entry.title.is_empty() { "Devez Vibe" } else { &entry.title },
+            "text": entry.body
+        }),
+        "reasoning" => json!({
+            "id": id,
+            "type": "reasoning",
+            "summary": [entry.body]
+        }),
+        "plan" => json!({
+            "id": id,
+            "type": "plan",
+            "text": entry.body
+        }),
+        "tool" if entry.title.starts_with("Shell ·") => json!({
+            "id": id,
+            "type": "commandExecution",
+            "command": entry.title.trim_start_matches("Shell ·").trim(),
+            "status": "completed",
+            "aggregatedOutput": entry.body
+        }),
+        "tool" => json!({
+            "id": id,
+            "type": "agentMessage",
+            "provider": entry.title,
+            "text": entry.body
+        }),
+        "file_change" => json!({
+            "id": id,
+            "type": "agentMessage",
+            "provider": "File change",
+            "text": entry.body
+        }),
+        _ => json!({
+            "id": id,
+            "type": "agentMessage",
+            "provider": entry.title,
+            "text": entry.body
+        }),
     }
 }
 
@@ -1654,6 +2052,8 @@ fn toml_string(value: &str) -> String {
 
 const PROVIDER_HANDOFF_MAX_CHARS: usize = 120_000;
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ProviderHandoffEntry {
     id: u64,
     kind: String,
@@ -1661,6 +2061,8 @@ struct ProviderHandoffEntry {
     body: String,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ProviderHandoff {
     last_block_id: u64,
     cwd: String,
@@ -1986,6 +2388,7 @@ mod tests {
             claude_seen_through: 7,
             claude_model: None,
             claude_effort: None,
+            updated_at: 0,
         }
     }
 
@@ -2102,6 +2505,95 @@ mod tests {
         );
         assert!(stored.contains_key("claude:room-two"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provider_handoff_history_rebuilds_both_sides_of_a_mixed_session() {
+        let snapshot = ProviderHandoff::from_value(json!({
+            "lastBlockId": 4,
+            "cwd": "C:/repo",
+            "entries": [
+                { "id": 1, "kind": "user", "title": "claude:sonnet", "body": "Claude 질문" },
+                { "id": 2, "kind": "assistant", "title": "Claude", "body": "Claude 답변" },
+                { "id": 3, "kind": "user", "title": "gpt-5", "body": "Codex 질문" },
+                { "id": 4, "kind": "assistant", "title": "Codex", "body": "Codex 답변" }
+            ]
+        }))
+        .expect("handoff snapshot");
+
+        let page = provider_handoff_history_page(&snapshot);
+        let turns = page["data"].as_array().expect("history turns");
+
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0]["items"][0]["type"], json!("userMessage"));
+        assert_eq!(
+            turns[0]["items"][1]["text"],
+            json!("Claude 답변")
+        );
+        assert_eq!(
+            turns[1]["items"][0]["content"][0]["text"],
+            json!("Codex 질문")
+        );
+        assert_eq!(turns[1]["items"][1]["provider"], json!("Codex"));
+    }
+
+    #[test]
+    fn duplicate_backing_ids_are_not_resolved_to_an_arbitrary_visible_session() {
+        let routes = HashMap::from([
+            (
+                "room-one".to_owned(),
+                route(RuntimeKind::Codex, Some("same-rollout"), Some("claude-one")),
+            ),
+            (
+                "room-two".to_owned(),
+                route(RuntimeKind::Codex, Some("same-rollout"), Some("claude-two")),
+            ),
+            (
+                "room-three".to_owned(),
+                route(RuntimeKind::Claude, Some("other-rollout"), Some("claude-three")),
+            ),
+        ]);
+
+        let aliases = route_aliases(&routes);
+
+        assert!(!aliases.contains_key("same-rollout"));
+        assert_eq!(
+            aliases.get("other-rollout").map(String::as_str),
+            Some("room-three")
+        );
+    }
+
+    #[test]
+    fn a_stale_process_cannot_replace_a_newer_route_snapshot() {
+        let dir = std::env::temp_dir().join("dvz-route-version-test");
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("session-routes.json");
+
+        let mut newer = route(RuntimeKind::Codex, Some("newer-rollout"), Some("claude"));
+        newer.updated_at = 2;
+        save_routes(&path, &HashMap::from([("room".to_owned(), newer)])).unwrap();
+
+        let mut stale = route(RuntimeKind::Claude, Some("stale-rollout"), Some("claude"));
+        stale.updated_at = 1;
+        save_routes(&path, &HashMap::from([("room".to_owned(), stale)])).unwrap();
+
+        assert_eq!(load_routes(&path)["room"].active, RuntimeKind::Codex);
+        assert_eq!(
+            load_routes(&path)["room"].codex_id.as_deref(),
+            Some("newer-rollout")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provider_turns_are_merged_by_native_start_time() {
+        let turns = merge_provider_turns(vec![
+            json!({ "id": "codex", "startedAt": 20 }),
+            json!({ "id": "claude", "startedAt": 10 }),
+        ]);
+
+        assert_eq!(turns[0]["id"], json!("claude"));
+        assert_eq!(turns[1]["id"], json!("codex"));
     }
 
     #[tokio::test]

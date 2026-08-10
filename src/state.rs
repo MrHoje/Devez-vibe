@@ -11019,6 +11019,7 @@ fn commit_user_input_answers(
                 .question
                 .trim()
                 .trim_end_matches(|ch: char| matches!(ch, ':' | '：' | '?' | '？'));
+            let answer = strip_recommendation_mark(answer);
             format!("{question}:\n  ↳ {answer}")
         })
         .collect::<Vec<_>>()
@@ -11031,6 +11032,20 @@ fn commit_user_input_answers(
     state
         .committed
         .push(Block::new(BlockKind::User, title, body));
+}
+
+/// `(권장)`은 고르기 전에만 쓸모 있는 안내라, 확정된 답변 기록에서는 떼어 낸다.
+fn strip_recommendation_mark(answer: &str) -> &str {
+    let trimmed = answer.trim_end();
+    for mark in ["(권장)", "(Recommended)"] {
+        if let Some(rest) = trimmed.strip_suffix(mark) {
+            let rest = rest.trim_end();
+            if !rest.is_empty() {
+                return rest;
+            }
+        }
+    }
+    trimmed
 }
 
 /// The two rows a question carries beyond its own options.
