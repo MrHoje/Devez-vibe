@@ -19,7 +19,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "Resume 시 최신 작업단계 기록 형식에서도 완료 상태를 정확히 복원합니다.",
+    "응답 중인 최신 불릿이 요청 당시 effort 색으로 부드럽게 깜빡입니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
