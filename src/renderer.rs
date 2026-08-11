@@ -434,7 +434,7 @@ pub struct View<'a> {
     pub editor: &'a Editor,
     pub composer_images: &'a [String],
     pub queued_prompts: Vec<String>,
-    /// Running subagents shown under the composer.
+    /// Running subagents shown under the status line.
     pub subagents: Vec<SubagentView>,
     pub composer_placeholder: &'a str,
     pub welcome: Option<WelcomeView>,
@@ -447,6 +447,10 @@ pub struct View<'a> {
     pub activity_phase: f32,
     /// The turn is active, but its first assistant text has not appeared yet.
     pub waiting_for_response: bool,
+    /// How many characters at the end of the streamed text are still arriving,
+    /// so they can be brought up from the background instead of appearing at
+    /// full strength the instant they land.
+    pub stream_fade_tail: usize,
     /// Where the compaction progress block is in its slower trip, `0.0..1.0`.
     pub activity_progress_phase: f32,
     pub footer: String,
@@ -1856,6 +1860,7 @@ impl Renderer {
                 view.waiting_for_response,
                 view.side_panel_prompts_expanded,
                 &view.side_panel_integrations,
+                view.stream_fade_tail,
             );
         }
 
@@ -2171,6 +2176,7 @@ impl Renderer {
         waiting_for_response: bool,
         side_panel_prompts_expanded: bool,
         side_panel_integrations: &[ProviderIntegrationView],
+        stream_fade_tail: usize,
     ) -> Result<()> {
         let composer_navigation_layout = frame.composer_layout.clone();
         let rows = height as usize;
@@ -2237,6 +2243,12 @@ impl Renderer {
         let (view_rows, live_rows) =
             split_rows(content_rows, frame.lines.len(), self.wrapped.len());
         self.last_transcript_rows = view_rows;
+        // The live blocks run from the top of the frame down to the dock, and the
+        // padding below goes in at the dock, so this row survives `fit_frame`.
+        let stream_fade = (stream_fade_tail > 0 && frame.dock_index > 0).then(|| StreamFade {
+            last_row: plan_rows + view_rows + frame.dock_index - 1,
+            tail: stream_fade_tail,
+        });
         // Padding the live frame is what puts the composer on the bottom row
         // *without* dragging the welcome card and the live blocks down with it:
         // `fit_frame` inserts the blanks at the dock, above the composer.
@@ -2306,6 +2318,7 @@ impl Renderer {
                 .map(|(row, control)| (*row, control)),
             &full_repaint_rows,
             plan_geometry_changed,
+            stream_fade,
         )?;
         self.previous_lines = screen;
         self.cursor_line = cursor_line;
@@ -2434,6 +2447,7 @@ impl Renderer {
         scroll_to_bottom_overlay: Option<(usize, &PaintLine)>,
         full_repaint_rows: &[usize],
         repaint_full_frame: bool,
+        stream_fade: Option<StreamFade>,
     ) -> Result<()> {
         let selection = self.selection.range().filter(|range| {
             if self.selection_in_panel {
@@ -2460,6 +2474,9 @@ impl Renderer {
         }
         if let Some((row, control)) = scroll_to_bottom_overlay {
             paint_scroll_to_bottom_into_frame(&mut frame, row, control);
+        }
+        if let Some(fade) = stream_fade {
+            fade_stream_tail_into_frame(&mut frame, fade);
         }
         if let Some(layout) = self.side_panel {
             paint_side_panel_into_frame_with_footer(
@@ -3359,7 +3376,7 @@ pub enum Pick {
     Model,
     /// The status line's effort reading: opens `/effort`.
     EffortSetting,
-    /// A running-subagent row under the composer: opens its transcript panel.
+    /// A running-subagent row under the status line: opens its transcript panel.
     Subagent(usize),
     /// The fullscreen transcript control that returns to its newest row.
     ScrollToBottom,
@@ -3762,7 +3779,7 @@ fn queue_preview_line(prompt: &str, index: usize, width: u16) -> PaintLine {
     .with_picks(&[(0, Pick::RemoveQueuedPrompt(index))])
 }
 
-/// Running subagents are listed under the composer, one row each, so a fan-out
+/// Running subagents are listed under the status line, one row each, so a fan-out
 /// stays visible without pushing the transcript around. Rows disappear as each
 /// subagent finishes; background rows may outlive the parent turn.
 fn subagent_lines(subagents: &[SubagentView], width: u16) -> Vec<PaintLine> {
@@ -4299,10 +4316,10 @@ fn normal_frame_with_expansion(
     let composer_index = lines.len();
     let cursor_line = composer_index + input_cursor_line;
     lines.extend(input_lines);
-    lines.extend(subagent_lines(subagents, width));
     if status.fallback != HIDDEN_STATUS_LINE {
         lines.push(status_line_row(status.line, &status.fallback, width));
     }
+    lines.extend(subagent_lines(subagents, width));
 
     Frame {
         lines,
@@ -9263,6 +9280,63 @@ fn paint_scroll_to_bottom_into_frame(frame: &mut CellFrame, row: usize, control:
     );
 }
 
+/// Where the streamed text ends on screen, and how many characters behind that
+/// point are still settling.
+#[derive(Clone, Copy)]
+pub struct StreamFade {
+    /// The last row the live blocks occupy.
+    pub last_row: usize,
+    pub tail: usize,
+}
+
+/// A character arriving at full strength is a hard edge, and at fifty characters
+/// a second the eye reads a row of hard edges as stutter however evenly they are
+/// spaced. Bringing the newest few up from the background turns each arrival into
+/// a rise instead.
+///
+/// The tail is walked backwards from the end of the text, and a run of box-drawing
+/// glyphs ends it: past that lies a bubble edge or a rule, which is furniture
+/// rather than text and has no business dimming.
+fn fade_stream_tail_into_frame(frame: &mut CellFrame, fade: StreamFade) {
+    if fade.tail == 0 {
+        return;
+    }
+    let background = theme::palette().background;
+    let mut faded = 0usize;
+    if frame.height == 0 {
+        return;
+    }
+    for row in (0..=fade.last_row.min(frame.height - 1)).rev() {
+        for column in (0..frame.width).rev() {
+            let cell = frame.cell_mut(column, row);
+            if cell.continuation || cell.glyph.trim().is_empty() {
+                continue;
+            }
+            if is_box_drawing(&cell.glyph) {
+                return;
+            }
+            let Some(foreground) = cell.style.foreground else {
+                continue;
+            };
+            // The newest character sits deepest in the background and each one
+            // before it stands a step closer to full strength.
+            let level = 255 - (255 * (faded + 1) / (fade.tail + 1)) as u8;
+            cell.style.foreground = Some(blend(foreground, background, level));
+            faded += 1;
+            if faded >= fade.tail {
+                return;
+            }
+        }
+    }
+}
+
+fn is_box_drawing(glyph: &str) -> bool {
+    glyph
+        .chars()
+        .next()
+        .is_some_and(|ch| matches!(u32::from(ch), 0x2500..=0x257f | 0x2580..=0x259f))
+}
+
 /// Whether a piece of the row painted across `start..end` falls under the
 /// hovered columns. Every clickable span was measured off the painted row, so a
 /// piece is either inside the highlight or outside it, never half-lit.
@@ -13042,7 +13116,7 @@ mod tests {
     }
 
     #[test]
-    fn running_subagents_sit_between_the_composer_and_the_status_line() {
+    fn running_subagents_sit_below_the_status_line() {
         let editor = Editor::default();
         let frame = normal_frame_with_expansion(
             Vec::new(),
@@ -13073,7 +13147,7 @@ mod tests {
             .expect("subagent row");
 
         assert!(subagent_index > composer_index);
-        assert_eq!(subagent_index, frame.lines.len() - 2);
+        assert_eq!(subagent_index, frame.lines.len() - 1);
     }
 
     #[test]

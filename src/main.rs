@@ -802,6 +802,7 @@ async fn choose_startup_session(
                 activity_model: None,
                 activity_phase: 0.0,
                 waiting_for_response: false,
+                stream_fade_tail: 0,
                 activity_progress_phase: 0.0,
                 footer: "Resume a Codex session".to_owned(),
                 status_line: None,

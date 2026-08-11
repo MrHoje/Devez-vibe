@@ -1425,7 +1425,7 @@ struct ActiveItem {
 /// above the gap between bursts: the reveal runs a fraction of a second behind
 /// what has arrived, and that cushion is what lets the pace stay even across a
 /// burst instead of emptying and waiting.
-const STREAM_TARGET_LATENCY: f32 = 0.25;
+const STREAM_TARGET_LATENCY: f32 = 0.45;
 /// Clusters per second. The floor keeps a thin trickle moving; the ceiling keeps
 /// a burst from arriving as one visible jump.
 const STREAM_MIN_RATE: f32 = 25.0;
@@ -1440,16 +1440,35 @@ const STREAM_RATE_DECAY: f32 = 1.5;
 /// reveal once the loop comes back.
 const STREAM_MAX_STEP: Duration = Duration::from_millis(40);
 
+/// How many characters at the end of the streamed text are still rising toward
+/// full strength, and how fast that tail retreats. A longer tail spreads the rise
+/// over more steps, so each one is a smaller change in brightness; the ceiling is
+/// what keeps a whole phrase from reading as dim.
+const STREAM_FADE_MAX_TAIL: f32 = 14.0;
+/// Characters per second the tail gives back. Just under the rate text arrives
+/// at, so the tail keeps its length while an answer flows and takes a moment to
+/// clear once it ends instead of snapping to full strength.
+const STREAM_FADE_SPEED: f32 = 40.0;
+/// How long a finishing notice may wait for the text ahead of it. A provider can
+/// hand over a long tail at once, and a turn that looks stuck is worse than a
+/// last line that lands whole.
+const HELD_NOTIFICATION_LIMIT: Duration = Duration::from_millis(1500);
+
 /// What one reveal pass put on screen, and what it left waiting.
 #[derive(Default)]
 pub struct StreamReveal {
     pub clusters: usize,
     pub backlog: usize,
+    /// The settling tail changed length, so the frame needs repainting even when
+    /// no new character appeared.
+    pub fade_changed: bool,
+    /// Notices held behind the reveal were delivered on this pass.
+    pub released: bool,
 }
 
 impl StreamReveal {
     pub fn changed(&self) -> bool {
-        self.clusters > 0
+        self.clusters > 0 || self.fade_changed || self.released
     }
 }
 
@@ -3307,6 +3326,13 @@ pub struct AppState {
     turn_started_at: Option<Instant>,
     /// Whether the active turn has painted any assistant text yet.
     turn_response_started: bool,
+    /// How many characters at the end of the streamed text are still settling.
+    /// Each reveal lengthens it and time shortens it, so the tail is long while
+    /// text is flowing and gone shortly after it stops.
+    stream_fade_tail: f32,
+    /// Notices waiting for the text still being revealed, in arrival order.
+    held_notifications: Vec<(String, Value)>,
+    held_since: Option<Instant>,
     /// When `/compact` was sent. Compaction produces no assistant text, so the
     /// activity row runs its own clock until the runtime reports the boundary.
     compacting_started_at: Option<Instant>,
@@ -3523,6 +3549,9 @@ impl AppState {
             compacting_started_at: None,
             turn_started_at: None,
             turn_response_started: false,
+            stream_fade_tail: 0.0,
+            held_notifications: Vec::new(),
+            held_since: None,
             last_completed_duration: None,
             branch,
             five_hour_percent,
@@ -5551,6 +5580,7 @@ impl AppState {
             waiting_for_response: self.busy
                 && !self.turn_response_started
                 && self.last_assistant_markdown.is_some(),
+            stream_fade_tail: self.stream_fade_tail.round() as usize,
             activity_progress_phase: self.compaction_progress_phase(),
             footer: self
                 .status_line_has_content()
@@ -6521,6 +6551,63 @@ impl AppState {
         // Anything this thread says counts as the turn still being alive, so the
         // stall probe only fires on a wait that has genuinely gone silent.
         self.turn_progress_at = Some(Instant::now());
+        // A finishing notice arrives while the last words of the answer are still
+        // waiting their turn on screen. Handling it now would flush them all at
+        // once, which lands as a block of text appearing at full strength — the
+        // one moment the paced reveal was meant to remove. Hold it instead, and
+        // keep holding everything after it so the order is preserved.
+        if !self.held_notifications.is_empty() || self.should_hold_for_stream(method) {
+            self.hold_notification(method, params);
+            return;
+        }
+        self.dispatch_notification(method, params);
+    }
+
+    /// Whether this notice has to wait for the text still being revealed.
+    fn should_hold_for_stream(&self, method: &str) -> bool {
+        matches!(
+            method,
+            "item/completed" | "turn/completed" | "turn/failed" | "turn/aborted"
+        ) && self.stream_text_pending()
+    }
+
+    fn stream_text_pending(&self) -> bool {
+        self.active
+            .values()
+            .any(|active| !active.pace.pending.is_empty())
+    }
+
+    fn hold_notification(&mut self, method: &str, params: &Value) {
+        if self.held_notifications.is_empty() {
+            self.held_since = Some(Instant::now());
+        }
+        self.held_notifications
+            .push((method.to_owned(), params.clone()));
+    }
+
+    /// Deliver the held notices once the text they follow has all appeared, or
+    /// once the wait has run long enough that holding them is the bigger problem.
+    fn release_held_notifications(&mut self) -> bool {
+        if self.held_notifications.is_empty() {
+            return false;
+        }
+        let expired = self
+            .held_since
+            .is_some_and(|since| since.elapsed() >= HELD_NOTIFICATION_LIMIT);
+        if self.stream_text_pending() && !expired {
+            return false;
+        }
+        if expired {
+            self.flush_stream_text();
+        }
+        self.held_since = None;
+        for (method, params) in std::mem::take(&mut self.held_notifications) {
+            self.dispatch_notification(&method, &params);
+        }
+        true
+    }
+
+    fn dispatch_notification(&mut self, method: &str, params: &Value) {
         if matches!(
             method,
             "item/completed" | "turn/completed" | "turn/failed" | "turn/aborted"
@@ -10995,7 +11082,21 @@ impl AppState {
             }
             reveal.backlog += visible_cluster_count(&active.pace.pending);
         }
+        reveal.fade_changed = self.advance_stream_fade(reveal.clusters, elapsed);
+        reveal.released = self.release_held_notifications();
         reveal
+    }
+
+    /// Lengthen the settling tail by what just appeared and shorten it by the
+    /// time that passed. A character therefore starts at the tail's far end and
+    /// walks out of it, which is what turns a hard appearance into a rise.
+    /// Returns whether the visible length changed.
+    fn advance_stream_fade(&mut self, revealed: usize, elapsed: Duration) -> bool {
+        let before = self.stream_fade_tail.round() as usize;
+        let grown = self.stream_fade_tail + revealed as f32;
+        let faded = grown - STREAM_FADE_SPEED * elapsed.as_secs_f32();
+        self.stream_fade_tail = faded.clamp(0.0, STREAM_FADE_MAX_TAIL);
+        before != self.stream_fade_tail.round() as usize
     }
 
     /// Held text must land before an item or turn is finalized; anything still
@@ -16630,6 +16731,27 @@ mod tests {
         assert!(pace.rate >= reached * 0.9, "{} vs {reached}", pace.rate);
     }
 
+    /// The settling tail follows the text: it grows while characters arrive and
+    /// retreats once they stop, so a finished answer never sits half-lit.
+    #[test]
+    fn the_settling_tail_grows_while_text_flows_and_clears_after_it() {
+        let mut state = test_state();
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({ "itemId": "item-1", "delta": "글자가 흐르는 동안 꼬리가 자랍니다.".repeat(20) }),
+        );
+
+        drain_frames(&mut state, 60);
+        assert!(state.stream_fade_tail > 0.0);
+
+        // Nothing left to reveal, so time alone takes the tail back.
+        drain_frames(&mut state, 4000);
+        assert_eq!(state.stream_fade_tail, 0.0);
+    }
+
+    /// The turn ends while the last words are still being revealed, so the notice
+    /// waits for them. It must wait, not discard: every character still reaches
+    /// the transcript.
     #[test]
     fn a_finished_turn_never_drops_text_that_has_not_been_shown() {
         let mut state = test_state();
@@ -16639,12 +16761,34 @@ mod tests {
         );
         state.handle_notification("turn/completed", &json!({}));
 
+        assert!(state.committed.is_empty());
+
+        drain_frames(&mut state, 2000);
+
         assert!(
             state
                 .committed
                 .iter()
                 .any(|block| block.body == "아직 드러나지 않은 글자")
         );
+    }
+
+    /// A provider can hand over more text than the reveal can clear in any
+    /// reasonable time. The wait is bounded so the turn never looks stuck.
+    #[test]
+    fn a_held_finish_gives_up_waiting_rather_than_stalling_the_turn() {
+        let mut state = test_state();
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({ "itemId": "item-1", "delta": "아주 긴 마무리 문장입니다.".repeat(400) }),
+        );
+        state.handle_notification("turn/completed", &json!({}));
+        assert!(!state.held_notifications.is_empty());
+
+        state.held_since = Some(Instant::now() - HELD_NOTIFICATION_LIMIT);
+        state.drain_stream_text(TEST_FRAME);
+
+        assert!(state.held_notifications.is_empty());
     }
 
     #[test]

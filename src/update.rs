@@ -19,10 +19,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "실행하는 동안 Windows 타이머 해상도를 올려, 글자가 나가는 간격이 두 배로 튀지 않습니다.",
-    "글자를 내보낼지 확인하는 주기를 화면 갱신보다 촘촘하게 줄여, 한 글자의 자리가 갱신 경계에 끌려가지 않습니다.",
-    "응답을 조금 더 모았다가 일정한 속도로 풀어, 뭉치로 도착해도 고르게 이어집니다.",
-    "화면을 그리는 시간과 글자가 밀린 양을 계측에 남깁니다.",
+    "새로 나온 글자가 배경색에서 본문색으로 밝아지며 나타납니다.",
+    "응답을 조금 더 모았다가 풀어, 뭉치로 도착해도 속도가 고르게 유지됩니다.",
+    "응답이 끝났다는 알림을 남은 글자가 다 나올 때까지 붙들어, 마지막 문장이 한 번에 찍히지 않습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
