@@ -317,7 +317,12 @@ impl VibeMode {
                 " ",
                 language_notice!(),
             ),
-            Self::Normal => concat!("현재 응답 모드: Off. ", choice_notice!(), " ", language_notice!()),
+            Self::Normal => concat!(
+                "현재 응답 모드: Off. ",
+                choice_notice!(),
+                " ",
+                language_notice!()
+            ),
         }
     }
 }
@@ -1713,6 +1718,7 @@ enum PendingInteraction {
         id: Value,
         title: String,
         detail: Vec<String>,
+        selected: usize,
         once: Value,
         session: Option<Value>,
         session_label: String,
@@ -2000,35 +2006,13 @@ impl McpApproval {
 
     fn handle_key(&mut self, key: KeyEvent) -> Option<Value> {
         match key.code {
-            KeyCode::Esc => Some(mcp_elicitation_response("cancel", None)),
             KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
                 None
             }
-            KeyCode::Down | KeyCode::Tab => {
+            KeyCode::Down => {
                 self.selected = (self.selected + 1).min(self.options.len().saturating_sub(1));
                 None
-            }
-            KeyCode::Char(ch) if ch.is_ascii_digit() => {
-                let index = ch.to_digit(10)?.checked_sub(1)? as usize;
-                if index >= self.options.len() {
-                    return None;
-                }
-                self.selected = index;
-                self.response()
-            }
-            // 'ㅛ'/'ㅜ': 한글 IME가 켜진 채 누른 y/n.
-            KeyCode::Char('y') | KeyCode::Char('ㅛ') => {
-                self.selected = 0;
-                self.response()
-            }
-            KeyCode::Char('n') | KeyCode::Char('ㅜ') => {
-                self.selected = self
-                    .options
-                    .iter()
-                    .position(|option| matches!(option.action, "decline" | "cancel"))
-                    .unwrap_or(self.options.len().saturating_sub(1));
-                self.response()
             }
             KeyCode::Enter => self.response(),
             _ => None,
@@ -3684,12 +3668,6 @@ impl AppState {
             },
         )
         .collect()
-    }
-
-    /// Claude 브리지는 실행 중 들어온 프롬프트를 스스로 대기시켜 다음 턴으로 보내므로
-    /// 호스트 큐(Tab)가 겹칠 자리가 없다. Tab을 무동작으로 두고 힌트도 감춘다.
-    fn queueing_supported(&self) -> bool {
-        self.selected_provider() != ModelProvider::Claude
     }
 
     fn provider_switch_pending(&self) -> bool {
@@ -5557,12 +5535,8 @@ impl AppState {
                 })
                 .collect(),
             composer_placeholder: if self.provider_switch_pending() {
-                if self.queueing_supported() {
-                    "Enter: queue for switched provider · Tab: queue"
-                } else {
-                    "Enter: queue for switched provider"
-                }
-            } else if self.busy && self.queueing_supported() {
+                "Enter: queue for switched provider · Tab: queue"
+            } else if self.busy {
                 "Enter: steer · Tab: queue"
             } else {
                 ""
@@ -5799,8 +5773,7 @@ impl AppState {
         if !matches!(
             self.pending,
             Some(
-                PendingInteraction::Approval { .. }
-                    | PendingInteraction::Confirm { .. }
+                PendingInteraction::Confirm { .. }
                     | PendingInteraction::McpApproval(_)
                     | PendingInteraction::McpUrl { .. }
             )
@@ -6179,13 +6152,7 @@ impl AppState {
                 self.editor.newline();
                 Action::None
             }
-            KeyCode::Tab if self.busy => {
-                if self.queueing_supported() {
-                    self.queue_editor()
-                } else {
-                    Action::None
-                }
-            }
+            KeyCode::Tab if self.busy => self.queue_editor(),
             KeyCode::Enter => self.submit_editor(),
             KeyCode::Esc if self.busy => self.request_interrupt(),
             code if (code == KeyCode::Backspace && ctrl) || code == KeyCode::Char('\u{8}') => {
@@ -6314,6 +6281,7 @@ impl AppState {
                         .unwrap_or("명령 실행을 허용할까요?")
                         .to_owned(),
                     detail,
+                    selected: 0,
                     once: json!({ "decision": "accept" }),
                     session,
                     session_label,
@@ -6340,6 +6308,7 @@ impl AppState {
                         .unwrap_or("파일 변경을 허용할까요?")
                         .to_owned(),
                     detail,
+                    selected: 0,
                     once: json!({ "decision": "accept" }),
                     session,
                     session_label,
@@ -6375,6 +6344,7 @@ impl AppState {
                         .unwrap_or("추가 권한을 허용할까요?")
                         .to_owned(),
                     detail,
+                    selected: 0,
                     once: json!({ "permissions": requested, "scope": "turn" }),
                     session,
                     session_label,
@@ -7561,11 +7531,8 @@ impl AppState {
                 Action::None
             }
             "/side-panel" => {
-                self.committed.push(Block::new(
-                    BlockKind::Error,
-                    "Usage",
-                    "/side-panel",
-                ));
+                self.committed
+                    .push(Block::new(BlockKind::Error, "Usage", "/side-panel"));
                 Action::None
             }
             "/new" if self.busy => {
@@ -8431,17 +8398,47 @@ impl AppState {
                 id,
                 title,
                 detail,
+                mut selected,
                 once,
                 session,
                 session_label,
                 decline,
-            } => match hotkey {
-                KeyCode::Char('y') | KeyCode::Enter => Action::RpcResponse { id, result: once },
-                KeyCode::Char('a') if session.is_some() => Action::RpcResponse {
+            } => match key.code {
+                KeyCode::Up => {
+                    selected = selected.saturating_sub(1);
+                    self.pending = Some(PendingInteraction::Approval {
+                        id,
+                        title,
+                        detail,
+                        selected,
+                        once,
+                        session,
+                        session_label,
+                        decline,
+                    });
+                    Action::None
+                }
+                KeyCode::Down => {
+                    let last = 1 + usize::from(session.is_some());
+                    selected = (selected + 1).min(last);
+                    self.pending = Some(PendingInteraction::Approval {
+                        id,
+                        title,
+                        detail,
+                        selected,
+                        once,
+                        session,
+                        session_label,
+                        decline,
+                    });
+                    Action::None
+                }
+                KeyCode::Enter if selected == 0 => Action::RpcResponse { id, result: once },
+                KeyCode::Enter if session.is_some() && selected == 1 => Action::RpcResponse {
                     id,
                     result: session.expect("checked"),
                 },
-                KeyCode::Char('n') | KeyCode::Esc => Action::RpcResponse {
+                KeyCode::Enter => Action::RpcResponse {
                     id,
                     result: decline,
                 },
@@ -8450,6 +8447,7 @@ impl AppState {
                         id,
                         title,
                         detail,
+                        selected,
                         once,
                         session,
                         session_label,
@@ -9306,6 +9304,7 @@ impl AppState {
             PendingInteraction::Approval {
                 title,
                 detail,
+                selected,
                 session,
                 session_label,
                 ..
@@ -9319,20 +9318,20 @@ impl AppState {
                     })
                     .collect::<Vec<_>>();
                 lines.push(OverlayLine {
-                    text: "[y] 이번만 허용".to_owned(),
-                    selected: true,
+                    text: "이번만 허용".to_owned(),
+                    selected: *selected == 0,
                     muted: false,
                 });
                 if session.is_some() {
                     lines.push(OverlayLine {
-                        text: format!("[a] {session_label}"),
-                        selected: false,
+                        text: session_label.clone(),
+                        selected: *selected == 1,
                         muted: false,
                     });
                 }
                 lines.push(OverlayLine {
-                    text: "[n] 거부".to_owned(),
-                    selected: false,
+                    text: "거부".to_owned(),
+                    selected: *selected == 1 + usize::from(session.is_some()),
                     muted: false,
                 });
                 Some(OverlayView {
@@ -9340,11 +9339,7 @@ impl AppState {
                     title: title.clone(),
                     lines,
                     slider: None,
-                    hint: if session.is_some() {
-                        "y / a / n".to_owned()
-                    } else {
-                        "y / n".to_owned()
-                    },
+                    hint: "↑↓ 선택   Enter 확정".to_owned(),
                     style: OverlayStyle::Panel,
                     input: None,
                     input_label: "",
@@ -9381,7 +9376,7 @@ impl AppState {
                     title: "MCP approval".to_owned(),
                     lines,
                     slider: None,
-                    hint: "↑↓ select   Enter confirm   Esc cancel".to_owned(),
+                    hint: "↑↓ 선택   Enter 확정".to_owned(),
                     style: OverlayStyle::Panel,
                     input: None,
                     input_label: "",
@@ -10133,7 +10128,10 @@ impl AppState {
         // first while its turns ran on the second — two names for one session, and
         // the notifications for it stopped reaching the screen.
         if !self.thread_pending() {
-            let next = self.models.get(index).map(|model| model_runtime(&model.model));
+            let next = self
+                .models
+                .get(index)
+                .map(|model| model_runtime(&model.model));
             let current = self
                 .models
                 .get(self.selected_model)
@@ -10442,10 +10440,7 @@ impl AppState {
                     }
                 }
             }
-            Some(PendingInteraction::SidePanelScope {
-                stage,
-                selected,
-            }) => match row
+            Some(PendingInteraction::SidePanelScope { stage, selected }) => match row
                 .checked_sub(MODEL_SCOPE_HEADER_ROWS)
                 .and_then(|choice| ModelScope::CHOICES.get(choice))
             {
@@ -10518,12 +10513,13 @@ impl AppState {
                 });
                 Action::None
             }
-            // 승인 프롬프트의 [y]/[a]/[n] 행은 키와 같은 응답을 보낸다. 상세
-            // 행(옵션 앞의 detail)은 클릭해도 답이 되지 않는다.
+            // 승인 프롬프트의 선택지 행은 클릭한 선택으로 응답한다. 상세
+            // 행(선택지 앞의 detail)은 클릭해도 답이 되지 않는다.
             Some(PendingInteraction::Approval {
                 id,
                 title,
                 detail,
+                selected,
                 once,
                 session,
                 session_label,
@@ -10548,6 +10544,7 @@ impl AppState {
                         id,
                         title,
                         detail,
+                        selected,
                         once,
                         session,
                         session_label,
@@ -16992,7 +16989,7 @@ mod tests {
     }
 
     #[test]
-    fn a_busy_claude_turn_hides_the_hint_and_ignores_tab() {
+    fn a_busy_claude_turn_shows_the_hint_and_queues_tab() {
         let mut state = AppState::new(
             "main-thread".to_owned(),
             "cwd".to_owned(),
@@ -17008,11 +17005,16 @@ mod tests {
         let action = state.handle_key(KeyEvent::from(KeyCode::Tab));
 
         assert!(matches!(action, Action::None));
-        assert_eq!(state.view().composer_placeholder, "");
-        // Claude 브리지가 직접 대기시키므로 호스트 큐에는 아무것도 들어가지 않고,
-        // 사용자가 입력한 글도 컴포저에 그대로 남는다.
-        assert!(state.queued_prompts.is_empty());
-        assert_eq!(state.editor.display_text(), "next prompt");
+        assert_eq!(
+            state.view().composer_placeholder,
+            "Enter: steer · Tab: queue"
+        );
+        // Claude도 Enter 스티어링을 지원하므로 Tab은 다음 턴까지 미루는 호스트 큐로 간다.
+        assert_eq!(
+            state.queued_prompts.front().map(String::as_str),
+            Some("next prompt")
+        );
+        assert_eq!(state.editor.display_text(), "");
     }
 
     #[test]
@@ -17469,58 +17471,71 @@ mod tests {
     }
 
     #[test]
-    fn command_approval_answers_to_hangul_jamo_keys() {
-        // 한글 IME가 켜진 채 y를 누르면 'ㅛ'가 도착한다.
+    fn command_approval_ignores_shortcut_and_escape_keys() {
         let mut state = command_approval_state();
-        match state.handle_key(KeyEvent::from(KeyCode::Char('ㅛ'))) {
+        for code in [
+            KeyCode::Char('y'),
+            KeyCode::Char('a'),
+            KeyCode::Char('n'),
+            KeyCode::Char('ㅛ'),
+            KeyCode::Char('ㅜ'),
+            KeyCode::Esc,
+            KeyCode::Tab,
+        ] {
+            assert!(matches!(
+                state.handle_key(KeyEvent::from(code)),
+                Action::None
+            ));
+            assert!(state.pending.is_some());
+        }
+
+        assert!(state.paste_as_prompt_answer("y").is_none());
+        assert!(state.pending.is_some());
+    }
+
+    #[test]
+    fn command_approval_moves_with_arrows_and_confirms_with_enter() {
+        let mut state = command_approval_state();
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Down)),
+            Action::None
+        ));
+        let overlay = state.overlay_view().expect("approval selection");
+        assert!(overlay.lines[3].selected);
+        assert_eq!(overlay.hint, "↑↓ 선택   Enter 확정");
+        match state.handle_key(KeyEvent::from(KeyCode::Enter)) {
             Action::RpcResponse { result, .. } => {
                 assert_eq!(
                     result.get("decision").and_then(Value::as_str),
-                    Some("accept")
+                    Some("acceptForSession")
                 );
             }
-            _ => panic!("'ㅛ' should accept like 'y'"),
+            _ => panic!("selected session approval should be confirmed"),
         }
 
         let mut state = command_approval_state();
-        match state.handle_key(KeyEvent::from(KeyCode::Char('ㅜ'))) {
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Down)),
+            Action::None
+        ));
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Down)),
+            Action::None
+        ));
+        match state.handle_key(KeyEvent::from(KeyCode::Enter)) {
             Action::RpcResponse { result, .. } => {
                 assert_eq!(
                     result.get("decision").and_then(Value::as_str),
                     Some("decline")
                 );
             }
-            _ => panic!("'ㅜ' should decline like 'n'"),
+            _ => panic!("selected decline should be confirmed"),
         }
-    }
-
-    #[test]
-    fn command_approval_answers_to_pasted_single_chars() {
-        // 호스트 입력창이 bracketed paste로 흘려보낸 "y".
-        let mut state = command_approval_state();
-        match state.paste_as_prompt_answer("y") {
-            Some(Action::RpcResponse { result, .. }) => {
-                assert_eq!(
-                    result.get("decision").and_then(Value::as_str),
-                    Some("accept")
-                );
-            }
-            _ => panic!("pasted 'y' should accept"),
-        }
-
-        // 여러 글자는 답이 아니다 — 기존 paste 경로로 돌려보낸다.
-        let mut state = command_approval_state();
-        assert!(state.paste_as_prompt_answer("yes please").is_none());
-        assert!(state.pending.is_some());
-
-        // 프롬프트가 없으면 관여하지 않는다.
-        let mut state = test_state();
-        assert!(state.paste_as_prompt_answer("y").is_none());
     }
 
     #[test]
     fn command_approval_rows_answer_to_clicks() {
-        // detail 두 줄(명령, 위치) 뒤에 [y]/[a]/[n] 행이 온다.
+        // detail 두 줄(명령, 위치) 뒤에 승인 선택지 세 행이 온다.
         let mut state = command_approval_state();
         let clicked = state.click_overlay_row(0);
         assert!(matches!(clicked, Action::Tick(false)));
@@ -17533,7 +17548,7 @@ mod tests {
                     Some("accept")
                 );
             }
-            _ => panic!("the [y] row should accept"),
+            _ => panic!("the once row should accept"),
         }
 
         let mut state = command_approval_state();
@@ -17544,7 +17559,7 @@ mod tests {
                     Some("acceptForSession")
                 );
             }
-            _ => panic!("the [a] row should accept for the session"),
+            _ => panic!("the session row should accept for the session"),
         }
 
         let mut state = command_approval_state();
@@ -17555,7 +17570,7 @@ mod tests {
                     Some("decline")
                 );
             }
-            _ => panic!("the [n] row should decline"),
+            _ => panic!("the decline row should decline"),
         }
     }
 
@@ -17619,6 +17634,23 @@ mod tests {
             Some(PendingInteraction::McpApproval(ref approval))
                 if approval.options.len() == 4 && approval.detail == ["Title: Roadmap"]
         ));
+
+        for code in [
+            KeyCode::Char('y'),
+            KeyCode::Char('n'),
+            KeyCode::Char('2'),
+            KeyCode::Tab,
+            KeyCode::Esc,
+        ] {
+            assert!(matches!(
+                state.handle_key(KeyEvent::from(code)),
+                Action::None
+            ));
+            assert!(matches!(
+                state.pending,
+                Some(PendingInteraction::McpApproval(ref approval)) if approval.selected == 0
+            ));
+        }
 
         assert!(matches!(
             state.handle_key(KeyEvent::from(KeyCode::Down)),
@@ -18807,9 +18839,9 @@ mod tests {
             !overlay
                 .lines
                 .iter()
-                .any(|line| line.text.starts_with("[a]"))
+                .any(|line| line.text.contains("이 프로젝트에서 항상 허용"))
         );
-        assert_eq!(overlay.hint, "y / n");
+        assert_eq!(overlay.hint, "↑↓ 선택   Enter 확정");
 
         let mut state = test_state();
         state.begin_server_request(
@@ -18822,10 +18854,12 @@ mod tests {
             }),
         );
         let overlay = state.overlay_view().expect("Claude persistent approval");
-        assert!(overlay.lines.iter().any(|line| {
-            line.text == "[a] 이 프로젝트에서 항상 허용: Bash(npm test)"
-        }));
-        assert_eq!(overlay.hint, "y / a / n");
+        assert!(
+            overlay.lines.iter().any(|line| {
+                line.text == "이 프로젝트에서 항상 허용: Bash(npm test)"
+            })
+        );
+        assert_eq!(overlay.hint, "↑↓ 선택   Enter 확정");
     }
 
     #[test]

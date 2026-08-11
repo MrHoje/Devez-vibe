@@ -437,8 +437,8 @@ impl BackendServer {
                     Ok(self.register_codex_response_as(response, &visible))
                 }
             }
-            "thread/turns/list" if self
-                .is_mixed_provider_route(&self.canonical_visible(thread_id(&params)?)) =>
+            "thread/turns/list"
+                if self.is_mixed_provider_route(&self.canonical_visible(thread_id(&params)?)) =>
             {
                 let visible = self.canonical_visible(thread_id(&params)?);
                 if let Some(history) = load_provider_handoff(&visible) {
@@ -505,6 +505,25 @@ impl BackendServer {
                 let response: Result<Value> = async {
                     if selected == RuntimeKind::Claude {
                         let backing = self.ensure_claude_route(&visible, &params).await?;
+                        // Steering joins the turn already running, so it carries no
+                        // model or permission change of its own.
+                        if method == "turn/steer" {
+                            return self
+                                .claude
+                                .request(
+                                    "session/steer",
+                                    json!({
+                                        "sessionId": backing,
+                                        "input": params.get("input").cloned().unwrap_or_else(|| json!([])),
+                                        "expectedTurnId": params
+                                            .get("expectedTurnId")
+                                            .cloned()
+                                            .unwrap_or(Value::Null),
+                                        "handoffContext": turn_context
+                                    }),
+                                )
+                                .await;
+                        }
                         self.claude
                             .request(
                                 "session/prompt",
@@ -1669,11 +1688,9 @@ fn save_routes(path: &Path, routes: &HashMap<String, Route>) -> Result<()> {
     let _lock = acquire_store_lock(path)?;
     let mut stored = load_routes(path);
     for (visible, route) in routes.iter().filter(|(_, route)| route.is_worth_storing()) {
-        let replace = stored
-            .get(visible)
-            .is_none_or(|existing| {
-                existing.updated_at == 0 || route.updated_at >= existing.updated_at
-            });
+        let replace = stored.get(visible).is_none_or(|existing| {
+            existing.updated_at == 0 || route.updated_at >= existing.updated_at
+        });
         if replace {
             stored.insert(visible.clone(), route.clone());
         }
@@ -1748,7 +1765,10 @@ fn acquire_store_lock(path: &Path) -> Result<StoreLock> {
             Err(error) => return Err(error.into()),
         }
     }
-    anyhow::bail!("세션 저장소 잠금 획득 시간이 초과되었습니다: {}", path.display())
+    anyhow::bail!(
+        "세션 저장소 잠금 획득 시간이 초과되었습니다: {}",
+        path.display()
+    )
 }
 
 fn route_aliases(routes: &HashMap<String, Route>) -> HashMap<String, String> {
@@ -2546,10 +2566,7 @@ mod tests {
 
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0]["items"][0]["type"], json!("userMessage"));
-        assert_eq!(
-            turns[0]["items"][1]["text"],
-            json!("Claude 답변")
-        );
+        assert_eq!(turns[0]["items"][1]["text"], json!("Claude 답변"));
         assert_eq!(
             turns[1]["items"][0]["content"][0]["text"],
             json!("Codex 질문")
@@ -2570,7 +2587,11 @@ mod tests {
             ),
             (
                 "room-three".to_owned(),
-                route(RuntimeKind::Claude, Some("other-rollout"), Some("claude-three")),
+                route(
+                    RuntimeKind::Claude,
+                    Some("other-rollout"),
+                    Some("claude-three"),
+                ),
             ),
         ]);
 
@@ -2599,7 +2620,9 @@ mod tests {
         ]);
 
         assert_eq!(
-            route_aliases(&routes).get("session-one").map(String::as_str),
+            route_aliases(&routes)
+                .get("session-one")
+                .map(String::as_str),
             Some("claude:session-one")
         );
     }

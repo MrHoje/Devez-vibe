@@ -892,6 +892,8 @@ async function createSession(params, resumeId) {
     turn: null,
     // Prompts that arrived while a turn was running, run in order afterwards.
     pendingPrompts: [],
+    // Steered prompts whose answer may still need a turn of its own.
+    steerPending: 0,
     turnSequence: 1,
     itemSequence: 1,
     streamBlocks: new Map(),
@@ -1836,6 +1838,15 @@ function finishTurn(session, error, durationMs) {
 async function consume(session) {
   for await (const message of session.query) {
     adoptSessionId(session, message.session_id);
+    // A steered prompt answered after its turn already ended still deserves a
+    // turn of its own, or the host would drop every event that follows.
+    if (!session.turn
+      && session.steerPending > 0
+      && !message.parent_tool_use_id
+      && (message.type === "stream_event" || message.type === "assistant")) {
+      session.steerPending -= 1;
+      beginTurn(session);
+    }
     if (message.type === "stream_event") {
       if (message.event?.type === "content_block_delta" && (message.event?.delta?.text || message.event?.delta?.thinking)) {
         if (session.turn) session.turn.sawStreamText = true;
@@ -1917,6 +1928,32 @@ async function startPrompt(params) {
   return runPrompt(session, params);
 }
 
+// Steering pushes the prompt straight into the SDK input stream, so the running
+// turn picks it up at its next model request instead of waiting for the turn to
+// end. Model, effort and permission mode stay untouched: the turn is mid-flight.
+async function steerPrompt(params) {
+  const id = liveSessionId(params.sessionId);
+  const session = sessions.get(id);
+  if (!session) throw new Error(`Claude 세션을 찾을 수 없습니다: ${id}`);
+  if (!session.turn) return runPrompt(session, params);
+  if (params.expectedTurnId && params.expectedTurnId !== session.turn.id) {
+    throw new Error(`turn ID가 일치하지 않습니다: ${params.expectedTurnId}`);
+  }
+  // The CLI may answer the steered message in a cycle of its own, ending the
+  // running turn first. Remember the debt so that answer opens a fresh turn
+  // instead of arriving with no turn to attach to.
+  session.steerPending = (session.steerPending || 0) + 1;
+  const content = await inputContent(params.input, params.handoffContext);
+  session.queue.push({
+    type: "user",
+    message: { role: "user", content },
+    parent_tool_use_id: null,
+    session_id: id,
+    origin: { kind: "human" },
+  });
+  return { turn: { id: session.turn.id }, steered: true };
+}
+
 async function runPrompt(session, params) {
   const id = session.id;
   if (params.model) {
@@ -1924,6 +1961,7 @@ async function runPrompt(session, params) {
     await session.query.setModel(model);
     session.model = visibleModel(params.model);
   }
+  session.steerPending = 0;
   const effort = supportedEffort(modelCapabilities(session.models, params.model || session.model), params.effort);
   if (effort) {
     await session.query.applyFlagSettings({ effortLevel: effort });
@@ -2380,11 +2418,15 @@ async function dispatch(method, params = {}) {
     return { data: historyTurns(messages), nextCursor: null };
   }
   if (method === "session/prompt") return startPrompt(params);
+  if (method === "session/steer") return steerPrompt(params);
   if (method === "session/interrupt") {
     const session = lookupSession(params.sessionId);
     // Stopping the run drops what was waiting behind it too, so nothing the user
     // just cancelled starts on its own afterwards.
-    if (session) session.pendingPrompts.length = 0;
+    if (session) {
+      session.pendingPrompts.length = 0;
+      session.steerPending = 0;
+    }
     if (session?.turn) {
       const turn = session.turn;
       turn.interruptRequested = true;

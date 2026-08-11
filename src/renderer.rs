@@ -3791,30 +3791,13 @@ fn subagent_lines(subagents: &[SubagentView], width: u16) -> Vec<PaintLine> {
 }
 
 fn subagent_line(subagent: &SubagentView, index: usize, width: u16) -> PaintLine {
-    let mut detail = String::new();
-    if !subagent.description.is_empty() {
-        detail.push_str(&subagent.description);
-    }
-    if !subagent.tool.is_empty() {
-        if !detail.is_empty() {
-            detail.push_str(" · ");
-        }
-        detail.push_str(&subagent.tool);
-    }
-    let elapsed = format!(" · {}s", subagent.elapsed.as_secs());
-    // The gutter, glyph, name, and elapsed reading are fixed, so only the middle
-    // detail is compacted when the terminal cannot hold the whole row.
-    let reserved = 1
-        + UnicodeWidthStr::width(SUBAGENT_GLYPH)
-        + 1
-        + UnicodeWidthStr::width(subagent.name.as_str())
-        + UnicodeWidthStr::width(elapsed.as_str());
+    let elapsed = format!(" · {}", format_subagent_elapsed(subagent.elapsed.as_secs()));
+    // The gutter, glyph, and elapsed reading are fixed, so only the name is
+    // compacted when the terminal cannot hold the whole row.
+    let reserved =
+        1 + UnicodeWidthStr::width(SUBAGENT_GLYPH) + 1 + UnicodeWidthStr::width(elapsed.as_str());
     let available = usize::from(width).saturating_sub(reserved + 1);
-    let text = if detail.is_empty() || available == 0 {
-        String::new()
-    } else {
-        format!(" {}", compact_right(&detail, available))
-    };
+    let name = compact_right(&subagent.name, available);
 
     PaintLine {
         prefix: " ".to_owned(),
@@ -3826,13 +3809,8 @@ fn subagent_line(subagent: &SubagentView, index: usize, width: u16) -> PaintLine
         pick: None,
         tail: vec![
             PaintSpan {
-                text: format!(" {}", subagent.name),
+                text: format!(" {name}"),
                 tone: Tone::Plain,
-                bold: false,
-            },
-            PaintSpan {
-                text,
-                tone: Tone::Muted,
                 bold: false,
             },
             PaintSpan {
@@ -3842,13 +3820,19 @@ fn subagent_line(subagent: &SubagentView, index: usize, width: u16) -> PaintLine
             },
         ],
     }
-    // The bullet, the agent name, and its detail all open the same panel; the
-    // elapsed reading is left alone so the row's right edge stays quiet.
-    .with_picks(&[
-        (0, Pick::Subagent(index)),
-        (1, Pick::Subagent(index)),
-        (2, Pick::Subagent(index)),
-    ])
+    // The bullet and agent name open the same panel; the elapsed reading is left
+    // alone so the row's right edge stays quiet.
+    .with_picks(&[(0, Pick::Subagent(index)), (1, Pick::Subagent(index))])
+}
+
+fn format_subagent_elapsed(seconds: u64) -> String {
+    let minutes = seconds / 60;
+    let seconds = seconds % 60;
+    if minutes == 0 {
+        format!("{seconds}s")
+    } else {
+        format!("{minutes}m {seconds}s")
+    }
 }
 
 /// Matches the transcript's running-tool bullet so the composer rows read as the
@@ -7004,22 +6988,8 @@ fn block_group_lines(
 /// alone, since cutting those would change what the answer says.
 fn without_leading_english_filler(body: &str) -> &str {
     const FILLERS: [&str; 16] = [
-        "Now",
-        "Next",
-        "First",
-        "Then",
-        "Also",
-        "So",
-        "Finally",
-        "Actually",
-        "Okay",
-        "OK",
-        "Alright",
-        "Fine",
-        "Good",
-        "Let me",
-        "I'll",
-        "Alt",
+        "Now", "Next", "First", "Then", "Also", "So", "Finally", "Actually", "Okay", "OK",
+        "Alright", "Fine", "Good", "Let me", "I'll", "Alt",
     ];
 
     for filler in FILLERS {
@@ -11068,7 +11038,11 @@ mod tests {
     #[test]
     fn a_rendered_answer_drops_its_english_opener() {
         let lines = block_lines(
-            &Block::new(BlockKind::Assistant, "Claude", "Now 상태 필드를 추가합니다."),
+            &Block::new(
+                BlockKind::Assistant,
+                "Claude",
+                "Now 상태 필드를 추가합니다.",
+            ),
             80,
         );
         let text = lines
@@ -11751,7 +11725,10 @@ mod tests {
             .find(|line| line.text == longest)
             .expect("longest tip");
 
-        assert_eq!(UnicodeWidthStr::width(painted(&lines[0]).as_str()), expected_width);
+        assert_eq!(
+            UnicodeWidthStr::width(painted(&lines[0]).as_str()),
+            expected_width
+        );
         assert_eq!(
             UnicodeWidthStr::width(painted(&lines[lines.len() - 2]).as_str()),
             expected_width
@@ -11767,10 +11744,12 @@ mod tests {
             UnicodeWidthStr::width(painted(&narrow[narrow.len() - 2]).as_str()),
             23
         );
-        assert!(narrow[2..narrow.len() - 2]
-            .iter()
-            .filter(|line| !painted(line).is_empty())
-            .all(|line| UnicodeWidthStr::width(painted(line).as_str()) <= 21));
+        assert!(
+            narrow[2..narrow.len() - 2]
+                .iter()
+                .filter(|line| !painted(line).is_empty())
+                .all(|line| UnicodeWidthStr::width(painted(line).as_str()) <= 21)
+        );
     }
 
     #[test]
@@ -13071,9 +13050,9 @@ mod tests {
     }
 
     #[test]
-    fn running_subagents_are_one_row_each_with_the_current_tool() {
+    fn running_subagents_show_only_name_and_elapsed_time() {
         let subagents = [
-            test_subagent("Explore", "Find auth code", "Grep(fn login)", 12),
+            test_subagent("Explore", "Find auth code", "Grep(fn login)", 93),
             test_subagent("developer", "Fix the parser", "", 3),
         ];
 
@@ -13082,20 +13061,23 @@ mod tests {
                 .iter()
                 .map(painted)
                 .collect::<Vec<_>>(),
-            [
-                " ⏺ Explore Find auth code · Grep(fn login) · 12s",
-                " ⏺ developer Fix the parser · 3s",
-            ]
+            [" ⏺ Explore · 1m 33s", " ⏺ developer · 3s",]
         );
     }
 
     #[test]
-    fn subagent_row_truncates_only_the_middle_detail() {
-        let subagent = test_subagent("Explore", "a very long subagent description", "", 7);
+    fn subagent_row_compacts_only_the_name() {
+        let subagent = test_subagent(
+            "very-long-agent-name",
+            "hidden description",
+            "Grep(hidden)",
+            93,
+        );
 
         let line = subagent_line(&subagent, 0, 30);
 
-        assert_eq!(painted(&line), " ⏺ Explore a very long s… · 7s");
+        assert!(!painted(&line).contains("hidden"));
+        assert!(painted(&line).ends_with(" · 1m 33s"));
         assert!(painted_line_width(&line) <= 30);
     }
 
@@ -17146,9 +17128,11 @@ mod tests {
         providers[1].mcp_expanded = false;
         let collapsed = side_panel_integration_lines(&providers, 42, usize::MAX);
         assert!(collapsed.iter().any(|line| painted(line) == "▼ MCP"));
-        assert!(!collapsed
-            .iter()
-            .any(|line| painted(line).contains("context7")));
+        assert!(
+            !collapsed
+                .iter()
+                .any(|line| painted(line).contains("context7"))
+        );
     }
 
     #[test]

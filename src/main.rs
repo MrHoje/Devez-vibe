@@ -1531,8 +1531,8 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
 }
 
 /// Maps a key to a transcript scroll, or `None` to let the session have it.
-/// PageDown always returns a fullscreen transcript to its latest row. Shift
-/// keeps PageUp out of the way of composer and picker cursor navigation.
+/// Page keys move one viewport at a time while Ctrl+Down keeps the explicit
+/// shortcut to the latest row.
 fn scroll_request(renderer: &Renderer, key: &KeyEvent) -> Option<isize> {
     if renderer.mode() != RenderMode::Fullscreen {
         return None;
@@ -1540,14 +1540,9 @@ fn scroll_request(renderer: &Renderer, key: &KeyEvent) -> Option<isize> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Down {
         return Some(isize::MIN);
     }
-    if key.code == KeyCode::PageDown {
-        return Some(isize::MIN);
-    }
-    if !key.modifiers.contains(KeyModifiers::SHIFT) {
-        return None;
-    }
     match key.code {
         KeyCode::PageUp => Some(renderer.page_rows()),
+        KeyCode::PageDown => Some(-renderer.page_rows()),
         _ => None,
     }
 }
@@ -3292,6 +3287,9 @@ fn config_value_write_params(key_path: &str, value: &str) -> Value {
 const DEVEZ_INSTRUCTIONS: &str = concat!(
     "Updated Plan의 설명과 모든 Task 제목은 반드시 자연스러운 한국어로 작성한다. ",
     "코드, 명령어, 경로, 제품명 등 기술 식별자는 원문을 유지한다.\n",
+    "사용자가 요청했거나 원인, 영향, 변경 범위, 실행 방법을 정확히 판단하는 데 꼭 필요한 경우가 아니면 ",
+    "클래스명, 메서드명, 변수명 등 기술 식별자, 파일 경로, 명령어와 코드 조각을 답변에 쓰지 않는다. ",
+    "필요한 경우에도 사용자 판단에 필요한 최소 범위만 쓴다.\n",
     "답변 형식 규칙:\n",
     "- 서론, 인사, 맺음말 요약을 쓰지 않고 결론부터 쓴다.\n",
     "- 응답 모드와 관계없이 최종 답변은 가능한 한 불릿 두세 개, 200자 내외로 쓴다. 사용자가 자세한 설명을 요청할 때만 늘린다.\n",
@@ -3300,7 +3298,7 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "분량을 맞추려고 선택지를 줄이거나 문장을 도중에 끊지 않는다. ",
     "마지막 줄에서 무엇을 선택하면 되는지 한 문장으로 묻는다.\n",
     "- 산문 문단 대신 불릿과 코드 블록을 쓴다.\n",
-    "- 코드 변경은 파일 경로와 핵심 코드만 보여주고, 요청받지 않은 해설을 덧붙이지 않는다.\n",
+    "- 코드 변경 보고에서도 파일 경로와 핵심 코드는 사용자 판단에 꼭 필요한 경우에만 최소한으로 보여주고, 요청받지 않은 해설을 덧붙이지 않는다.\n",
     "- 계획이나 작업 단계를 답변 본문에 다시 나열하지 않는다.\n",
     "- 파일 수정, 명령 실행처럼 실제로 무언가를 바꾼 작업을 마쳤을 때만 마지막 문장을 완료 보고로 쓴다. ",
     "질문에 답하거나 조사·설명만 한 응답, 사용자의 제안을 거절하거나 확인만 한 응답에는 완료 문구를 붙이지 않는다.\n",
@@ -3336,6 +3334,9 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
 const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "Devez Vibe에서 작업한다. Task 목록의 설명과 모든 Task 제목은 반드시 자연스러운 한국어로 작성한다. ",
     "코드, 명령어, 경로, 제품명 등 기술 식별자는 원문을 유지한다.\n",
+    "사용자가 요청했거나 원인, 영향, 변경 범위, 실행 방법을 정확히 판단하는 데 꼭 필요한 경우가 아니면 ",
+    "클래스명, 메서드명, 변수명 등 기술 식별자, 파일 경로, 명령어와 코드 조각을 답변에 쓰지 않는다. ",
+    "필요한 경우에도 사용자 판단에 필요한 최소 범위만 쓴다.\n",
     "최우선 한국어 전용 규칙: 사용자에게 보이는 text는 한 글자도 빠짐없이 한국어 문장으로만 이루어진다. ",
     "진행 안내, 조사 중 알림, 도구 호출 앞뒤에 붙이는 한 줄짜리 라벨, 중간 보고, 최종 답변이 모두 여기에 해당하며, ",
     "모든 일반 문장은 반드시 한국어로 작성한다. 사용자가 영어로 요청해도 Devez Vibe의 응답 언어는 한국어로 유지한다. ",
@@ -3371,7 +3372,7 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "답변 형식 규칙:\n",
     "- 서론, 인사, 맺음말 요약을 쓰지 않고 결론부터 쓴다.\n",
     "- 산문 문단 대신 불릿과 코드 블록을 쓴다.\n",
-    "- 코드 변경은 파일 경로와 핵심 코드만 보여주고, 요청받지 않은 해설을 덧붙이지 않는다.\n",
+    "- 코드 변경 보고에서도 파일 경로와 핵심 코드는 사용자 판단에 꼭 필요한 경우에만 최소한으로 보여주고, 요청받지 않은 해설을 덧붙이지 않는다.\n",
     "- 응답 모드와 관계없이 최종 답변은 가능한 한 불릿 두세 개, 200자 내외로 쓴다. 사용자가 자세한 설명을 요청할 때만 늘린다.\n",
     "- 사용자에게 선택이나 승인을 요청할 때는 본문에 선택지를 나열하지 말고 반드시 AskUserQuestion 도구로 묻는다.\n",
     "- 선택지가 다섯 개 이상이라 AskUserQuestion에 담기지 않을 때만 본문에 글로 나열한다. ",
@@ -4331,9 +4332,8 @@ fn apply_fragile_clipboard_paste(
 }
 
 fn fragile_clipboard_text(text: &str) -> bool {
-    text.chars().any(|ch| {
-        matches!(ch, '\u{200d}' | '\u{fe0e}' | '\u{fe0f}') || u32::from(ch) > 0xffff
-    })
+    text.chars()
+        .any(|ch| matches!(ch, '\u{200d}' | '\u{fe0e}' | '\u{fe0f}') || u32::from(ch) > 0xffff)
 }
 
 fn apply_fragile_clipboard_paste_from_key(
@@ -5283,12 +5283,14 @@ mod tests {
         let mut state = starting_state();
         let codex = || "Codex".to_owned();
 
-        assert!(state
-            .view()
-            .side_panel_integrations
-            .iter()
-            .find(|view| view.provider == "Codex")
-            .is_some_and(|view| view.mcp_expanded && view.plugins_expanded));
+        assert!(
+            state
+                .view()
+                .side_panel_integrations
+                .iter()
+                .find(|view| view.provider == "Codex")
+                .is_some_and(|view| view.mcp_expanded && view.plugins_expanded)
+        );
 
         assert!(matches!(
             pick_action(&mut state, Pick::McpSection(codex())),
@@ -5298,12 +5300,14 @@ mod tests {
             pick_action(&mut state, Pick::PluginSection(codex())),
             Action::Tick(true)
         ));
-        assert!(state
-            .view()
-            .side_panel_integrations
-            .iter()
-            .find(|view| view.provider == "Codex")
-            .is_some_and(|view| !view.mcp_expanded && !view.plugins_expanded));
+        assert!(
+            state
+                .view()
+                .side_panel_integrations
+                .iter()
+                .find(|view| view.provider == "Codex")
+                .is_some_and(|view| !view.mcp_expanded && !view.plugins_expanded)
+        );
     }
 
     #[test]
@@ -5558,12 +5562,16 @@ mod tests {
     }
 
     #[test]
-    fn page_down_returns_a_scrolled_fullscreen_transcript_to_the_latest_row() {
+    fn page_keys_scroll_a_fullscreen_transcript_by_one_viewport() {
         let renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
 
         assert_eq!(
+            scroll_request(&renderer, &press(KeyCode::PageUp, KeyModifiers::NONE)),
+            Some(renderer.page_rows())
+        );
+        assert_eq!(
             scroll_request(&renderer, &press(KeyCode::PageDown, KeyModifiers::NONE)),
-            Some(isize::MIN)
+            Some(-renderer.page_rows())
         );
     }
 
@@ -5844,11 +5852,18 @@ mod tests {
         );
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("두 번째 작업 도구를 호출하거나"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskCreate를 대신하지 않는다"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("독립된 수정 하나당 불릿 하나와 짧은 문장 하나"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("서로 다른 수정, 원인, 영향을 같은 불릿이나 문장에 묶지 않는다"));
+        assert!(
+            CLAUDE_DEVEZ_INSTRUCTIONS.contains("독립된 수정 하나당 불릿 하나와 짧은 문장 하나")
+        );
+        assert!(
+            CLAUDE_DEVEZ_INSTRUCTIONS
+                .contains("서로 다른 수정, 원인, 영향을 같은 불릿이나 문장에 묶지 않는다")
+        );
         assert!(DEVEZ_INSTRUCTIONS.contains("확인된 원인, 사용자에게 미치는 영향, 실제 조치"));
         assert!(DEVEZ_INSTRUCTIONS.contains("`update_plan`을 대신하지 않는다"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("모든 TaskCreate의 subject에는 반드시 제목 자체"));
+        assert!(
+            CLAUDE_DEVEZ_INSTRUCTIONS.contains("모든 TaskCreate의 subject에는 반드시 제목 자체")
+        );
         assert!(DEVEZ_INSTRUCTIONS.contains("`update_plan`의 각 step에는 반드시 제목 자체"));
         // The length cap is the same in every mode, so it is stated here once
         // rather than deferred to the preset notice.
@@ -5897,6 +5912,14 @@ mod tests {
         assert!(DEVEZ_INSTRUCTIONS.contains("도구를 두 번 이상 호출할 작업"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("동시에 `in_progress`인 Task는 하나만"));
         assert!(DEVEZ_INSTRUCTIONS.contains("같은 내용을 반복하지 않는다"));
+        for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS] {
+            assert!(rules.contains("클래스명, 메서드명, 변수명 등 기술 식별자"));
+            assert!(rules.contains("꼭 필요한 경우가 아니면"));
+            assert!(rules.contains("사용자 판단에 필요한 최소 범위만 쓴다"));
+            assert!(rules.contains(
+                "코드 변경 보고에서도 파일 경로와 핵심 코드는 사용자 판단에 꼭 필요한 경우에만"
+            ));
+        }
         // Verification reporting is left to the host's own honest-reporting rule.
         // Restating it here only competed with that wording.
         for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS] {
@@ -5911,7 +5934,10 @@ mod tests {
             assert!(rules.contains("현재 구현, 과거 문제의 원인, 추측을 구분"));
             assert!(rules.contains("직접적인 결론, 이를 뒷받침하는 핵심 근거"));
             assert!(rules.contains("`수정했습니다`, `확인했습니다`만으로 결과를 끝내지 않는다"));
-            assert!(rules.contains("실제 응답이나 오류를 받기 전 취소·거절·완료·원인을 단정하지 않는다"));
+            assert!(
+                rules
+                    .contains("실제 응답이나 오류를 받기 전 취소·거절·완료·원인을 단정하지 않는다")
+            );
             assert!(rules.contains("필요한 질문을 일반 text로 다시 보여 주고"));
             assert!(rules.contains("결론 정리"));
             assert!(rules.contains("종료 직전에 여러 Task를 한꺼번에"));
