@@ -11279,9 +11279,10 @@ fn commit_user_input_answers(
 }
 
 /// `(권장)`은 고르기 전에만 쓸모 있는 안내라, 확정된 답변 기록에서는 떼어 낸다.
+/// 같은 뜻으로 붙는 `(추천)`도 함께 떼어 낸다.
 fn strip_recommendation_mark(answer: &str) -> &str {
     let trimmed = answer.trim_end();
-    for mark in ["(권장)", "(Recommended)"] {
+    for mark in ["(권장)", "(추천)", "(Recommended)"] {
         if let Some(rest) = trimmed.strip_suffix(mark) {
             let rest = rest.trim_end();
             if !rest.is_empty() {
@@ -12842,6 +12843,20 @@ fn parse_fast_mode(config: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mark guides the choice and means nothing once one is made, in either
+    /// wording the model reaches for.
+    #[test]
+    fn a_chosen_answer_drops_its_recommendation_mark() {
+        assert_eq!(strip_recommendation_mark("바로 배포 (권장)"), "바로 배포");
+        assert_eq!(strip_recommendation_mark("바로 배포 (추천)"), "바로 배포");
+        assert_eq!(
+            strip_recommendation_mark("바로 배포 (Recommended)"),
+            "바로 배포"
+        );
+        // Nothing else to show, so the mark is the answer and stays whole.
+        assert_eq!(strip_recommendation_mark("(추천)"), "(추천)");
+    }
 
     #[test]
     fn encoded_questions_preserve_backslashes_and_korean_text() {

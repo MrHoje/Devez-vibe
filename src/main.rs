@@ -462,7 +462,10 @@ async fn open_pending_thread(server: &BackendServer, state: &mut AppState) -> bo
         &state.cwd,
         Some(&model),
         Some(state.service_tier()),
-        "first-prompt",
+        // Codex accepts only `startup` or `clear` here and rejects the whole
+        // request otherwise, so a session opened by the first prompt reports the
+        // same source a session opened at launch does.
+        "startup",
         state.model_verbosity(),
         state.claude_permission_mode_setting().wire(),
         state.selected_effort(),
@@ -3438,6 +3441,11 @@ fn turn_additional_context(vibe: VibeMode) -> Value {
     })
 }
 
+/// Every value Codex accepts for `sessionStartSource`. It rejects the whole
+/// `thread/start` request on anything else, so a new source cannot be invented
+/// to describe where the session came from.
+const THREAD_START_SOURCES: [&str; 2] = ["startup", "clear"];
+
 fn new_thread_params(
     cwd: &str,
     model: Option<&str>,
@@ -3447,6 +3455,10 @@ fn new_thread_params(
     claude_permission_mode: &str,
     effort: &str,
 ) -> Value {
+    debug_assert!(
+        THREAD_START_SOURCES.contains(&session_start_source),
+        "Codex rejects thread/start with an unknown session start source"
+    );
     let mut params = json!({
         "cwd": cwd,
         "permissions": ":danger-full-access",

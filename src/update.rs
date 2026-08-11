@@ -19,10 +19,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "글자가 드러나는 양을 흐른 시간에 맞춰, 화면 갱신이 늦어져도 응답이 끊기듯 멈추지 않습니다.",
-    "응답이 뭉치로 도착하는 사이의 짧은 공백에서 속도를 처음부터 다시 올리던 문제를 고쳤습니다.",
-    "화면을 한 번에 내보내도록 바꿔 터미널이 밀리는 구간이 줄었습니다.",
-    "답변 분량 규칙을 Vibe 모드와 무관하게 하나로 모으고, 매 턴 덧붙던 규칙 요약을 걷어냈습니다.",
+    "첫 프롬프트로 Codex 세션을 열 때 요청이 거절되던 문제를 고쳤습니다.",
+    "선택지에서 `(추천)`이 붙은 항목을 고르면 답변 기록에서 그 표시를 뗍니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
