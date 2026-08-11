@@ -19,10 +19,10 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "글자가 흘러나오는 속도를 화면이 다시 그려지는 리듬에 맞춰, Claude 응답이 끊기듯 튀지 않고 고르게 이어집니다.",
-    "속도 조절을 외부 브리지에서 화면 쪽으로 옮겨, provider마다 제각각이던 도착 간격이 그대로 보이지 않습니다.",
-    "생각 과정과 계획 문구도 같은 리듬으로 드러납니다.",
-    "이모지처럼 여러 글자가 하나로 합쳐지는 문자는 중간에 쪼개지지 않습니다.",
+    "글자가 드러나는 양을 흐른 시간에 맞춰, 화면 갱신이 늦어져도 응답이 끊기듯 멈추지 않습니다.",
+    "응답이 뭉치로 도착하는 사이의 짧은 공백에서 속도를 처음부터 다시 올리던 문제를 고쳤습니다.",
+    "화면을 한 번에 내보내도록 바꿔 터미널이 밀리는 구간이 줄었습니다.",
+    "답변 분량 규칙을 Vibe 모드와 무관하게 하나로 모으고, 매 턴 덧붙던 규칙 요약을 걷어냈습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

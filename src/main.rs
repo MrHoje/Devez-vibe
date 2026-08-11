@@ -894,6 +894,7 @@ async fn event_loop(
     // follows the redraw rhythm instead of the provider's arrival jitter.
     let mut stream_tick = tokio::time::interval(STREAM_FRAME);
     stream_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut last_stream_reveal = Instant::now();
     let mut resize = ResizeTracker::new();
     let (workspace_tx, mut workspace_rx) = mpsc::channel(1);
     let mut cost_restore_rx = None;
@@ -1203,7 +1204,13 @@ async fn event_loop(
                 Action::Tick(flush_composer_paste(state, &mut composer_paste, Instant::now()))
             }
             _ = stream_tick.tick() => {
-                let revealed = state.drain_stream_text();
+                // Measured, not assumed: a repaint can overrun the interval and the
+                // runtime drops the ticks it missed, so the reveal is sized by the
+                // time that actually passed.
+                let now = Instant::now();
+                let elapsed = now.duration_since(last_stream_reveal);
+                last_stream_reveal = now;
+                let revealed = state.drain_stream_text(elapsed);
                 if revealed {
                     animation_tick = false;
                 }
@@ -3248,16 +3255,14 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "코드, 명령어, 경로, 제품명 등 기술 식별자는 원문을 유지한다.\n",
     "답변 형식 규칙:\n",
     "- 서론, 인사, 맺음말 요약을 쓰지 않고 결론부터 쓴다.\n",
-    "- 기본 분량은 세 줄 전후이며, 사용자가 자세한 설명을 요청할 때만 늘린다.\n",
+    "- 응답 모드와 관계없이 최종 답변은 가능한 한 불릿 두세 개, 200자 내외로 쓴다. 사용자가 자세한 설명을 요청할 때만 늘린다.\n",
     "- 다만 사용자에게 선택이나 승인을 요청하는 답변에는 이 분량 제한을 적용하지 않는다. ",
     "고를 수 있는 선택지, 각 선택지의 결과, 판단에 필요한 사실을 하나도 빠뜨리지 않고 적고, ",
     "분량을 맞추려고 선택지를 줄이거나 문장을 도중에 끊지 않는다. ",
     "마지막 줄에서 무엇을 선택하면 되는지 한 문장으로 묻는다.\n",
     "- 산문 문단 대신 불릿과 코드 블록을 쓴다.\n",
     "- 코드 변경은 파일 경로와 핵심 코드만 보여주고, 요청받지 않은 해설을 덧붙이지 않는다.\n",
-    "- Super Vibe 모드에서는 파일 경로, 코드 블록, 함수·클래스·변수·설정 키 이름을 답변에 넣지 않는다. ",
-    "무엇을 어떻게 바꿨는지 일상 언어로만 설명하고, 계획이나 작업 단계를 답변 본문에 다시 나열하지 않는다. ",
-    "사용자가 코드나 경로를 직접 요청했거나, 그것 없이는 사용자가 판단할 수 없는 경우에만 보여준다.\n",
+    "- 계획이나 작업 단계를 답변 본문에 다시 나열하지 않는다.\n",
     "- 파일 수정, 명령 실행처럼 실제로 무언가를 바꾼 작업을 마쳤을 때만 마지막 문장을 완료 보고로 쓴다. ",
     "질문에 답하거나 조사·설명만 한 응답, 사용자의 제안을 거절하거나 확인만 한 응답에는 완료 문구를 붙이지 않는다.\n",
     "- 완료 보고는 수행한 동작을 그대로 목적어로 삼아 `~했습니다.`로 끝낸다. 예: `임시 파일 정리 주기를 변경했습니다.` ",
@@ -3268,7 +3273,7 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 저장소의 사실이나 원인을 조사할 때는 첫 검색 결과나 단일 키워드에 의존하지 않는다. 관련 상태·표시·입력 흐름을 추적하고, 적절한 테스트 또는 변경 이력과 교차 확인한다.\n",
     "- 검색에서 찾지 못했다는 이유만으로 기능이나 코드가 없다고 단정하지 않는다. 현재 구현, 과거 문제의 원인, 추측을 구분하고 근거가 부족하면 미확인이라고 밝힌다.\n",
     "- 최종 답변에는 직접적인 결론, 이를 뒷받침하는 핵심 근거, 확인 범위나 한계만 우선해서 담는다. 읽기 전용 수행 여부나 내부 절차는 결과 판단에 필요할 때만 언급한다.\n",
-    "- 조사나 수정 결과를 보고할 때는 확인된 원인, 사용자에게 미치는 영향, 실제 조치, 확인 결과를 짧게 함께 적는다. 원인을 확인하지 못했으면 추측으로 메우지 말고 미확인이라고 밝힌다. `수정했습니다`, `확인했습니다`만으로 결과를 끝내지 않는다.\n",
+    "- 조사나 수정 결과를 보고할 때는 확인된 원인, 사용자에게 미치는 영향, 실제 조치를 짧게 함께 적는다. 원인을 확인하지 못했으면 추측으로 메우지 말고 미확인이라고 밝힌다. `수정했습니다`, `확인했습니다`만으로 결과를 끝내지 않는다.\n",
     "- 결론과 완료 보고는 바꾼 대상과 결과를 구체적으로 지목해 쓴다. `일부 수정했습니다`, `관련 부분을 개선했습니다`처럼 대상이 드러나지 않는 문장으로 얼버무리지 않는다.\n",
     "- 재개 기록, 사용자 질문, 권한 응답처럼 외부 상태를 기다리는 경우에는 실제 응답이나 오류를 받기 전 취소·거절·완료·원인을 단정하지 않는다. 질문 도구가 전달되지 않거나 응답을 받지 못했다는 오류가 오면 필요한 질문을 일반 text로 다시 보여 주고, 답이 필요한 작업은 사용자가 답하기 전 파일을 바꾸지 않는다.\n",
     "- Skill 적용, 지침 확인, 내부 도구 호출 같은 내부 절차를 사용자에게 commentary로 알리지 않는다. ",
@@ -3328,7 +3333,7 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 서론, 인사, 맺음말 요약을 쓰지 않고 결론부터 쓴다.\n",
     "- 산문 문단 대신 불릿과 코드 블록을 쓴다.\n",
     "- 코드 변경은 파일 경로와 핵심 코드만 보여주고, 요청받지 않은 해설을 덧붙이지 않는다.\n",
-    "- 분량과 노출 범위는 매 턴 붙는 응답 모드 안내를 따르고, 그 안내가 없을 때만 세 줄 전후로 쓴다.\n",
+    "- 응답 모드와 관계없이 최종 답변은 가능한 한 불릿 두세 개, 200자 내외로 쓴다. 사용자가 자세한 설명을 요청할 때만 늘린다.\n",
     "- 사용자에게 선택이나 승인을 요청할 때는 본문에 선택지를 나열하지 말고 반드시 AskUserQuestion 도구로 묻는다.\n",
     "- 선택지가 다섯 개 이상이라 AskUserQuestion에 담기지 않을 때만 본문에 글로 나열한다. ",
     "이때는 분량 제한을 적용하지 않고, 선택지와 각각의 결과를 하나도 빠뜨리지 않고 적은 뒤 ",
@@ -3343,14 +3348,13 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 저장소의 사실이나 원인을 조사할 때는 첫 검색 결과나 단일 키워드에 의존하지 않는다. 관련 상태·표시·입력 흐름을 추적하고, 적절한 테스트 또는 변경 이력과 교차 확인한다.\n",
     "- 검색에서 찾지 못했다는 이유만으로 기능이나 코드가 없다고 단정하지 않는다. 현재 구현, 과거 문제의 원인, 추측을 구분하고 근거가 부족하면 미확인이라고 밝힌다.\n",
     "- 최종 답변에는 직접적인 결론, 이를 뒷받침하는 핵심 근거, 확인 범위나 한계만 우선해서 담는다. 읽기 전용 수행 여부나 내부 절차는 결과 판단에 필요할 때만 언급한다.\n",
-    "- 조사나 수정 결과는 독립된 수정 하나당 불릿 하나와 짧은 문장 하나만 쓴다. 서로 다른 수정, 원인, 영향, 검증을 같은 불릿이나 문장에 묶지 않는다. 검증 결과는 마지막 불릿 하나에 모으고, 원인은 사용자가 물었거나 판단에 필요할 때만 별도 불릿으로 쓴다. 원인을 확인하지 못했으면 추측으로 메우지 말고 미확인이라고 밝힌다. `수정했습니다`, `확인했습니다`만으로 결과를 끝내지 않는다.\n",
+    "- 조사나 수정 결과는 독립된 수정 하나당 불릿 하나와 짧은 문장 하나만 쓴다. 서로 다른 수정, 원인, 영향을 같은 불릿이나 문장에 묶지 않는다. 원인은 사용자가 물었거나 판단에 필요할 때만 별도 불릿으로 쓴다. 원인을 확인하지 못했으면 추측으로 메우지 말고 미확인이라고 밝힌다. `수정했습니다`, `확인했습니다`만으로 결과를 끝내지 않는다.\n",
     "- 결론과 완료 보고는 바꾼 대상과 결과를 구체적으로 지목해 쓴다. `일부 수정했습니다`, `관련 부분을 개선했습니다`처럼 대상이 드러나지 않는 문장으로 얼버무리지 않는다.\n",
     "- 재개 기록, 사용자 질문, 권한 응답처럼 외부 상태를 기다리는 경우에는 실제 응답이나 오류를 받기 전 취소·거절·완료·원인을 단정하지 않는다. 질문 도구가 전달되지 않거나 응답을 받지 못했다는 오류가 오면 필요한 질문을 일반 text로 다시 보여 주고, 답이 필요한 작업은 사용자가 답하기 전 파일을 바꾸지 않는다.\n",
     "진행 보고 규칙:\n",
     "- 무엇을 알아냈는지 담기지 않은 진행 문장은 쓰지 않는다. ",
     "`다음 부분을 이어서 확인하겠습니다.`, `이어서 진행하겠습니다.`, `계속 확인하겠습니다.`처럼 ",
     "다음에 무엇을 왜 보는지 없는 문장은 같은 응답에서 한 번도 쓰지 않는다.\n",
-    "- 완료 보고는 세 줄 이내로 쓰며, 검증하지 못한 내용은 짧게 밝힌다.\n",
     "- Skill 적용, 지침 확인, 내부 도구 호출 같은 내부 절차는 알리지 않는다.\n",
 );
 
@@ -3409,57 +3413,22 @@ fn resume_thread_params(thread_id: &str, claude: &ClaudeSessionSettings) -> Valu
     params
 }
 
-/// Codex keeps the full rules in the thread's developer instructions. Each turn
-/// only needs the rules that prevent the costly, visible failures.
-const CODEX_TURN_REMINDER: &str = concat!(
-    "Devez Vibe 핵심 규칙 요약. 전체 규칙은 스레드 지침에 있고, 이번 턴에 특히 지킬 것만 다시 적는다.\n",
-    "- 사용자에게 보이는 일반 문장은 한국어로 쓰고, 작업이면 첫 응답에서 무엇을 확인·수정할지 짧게 알린다. `진행 안내:` 같은 라벨이나 머리글은 붙이지 않는다.\n",
-    "- 도구 한 번으로 끝난다고 확신할 수 없는 작업은 첫 작업 도구 전에 반드시 `update_plan`을 호출해 한국어 제목의 짧은 계획을 만든다. 각 step 제목 자체는 반드시 `1. `, `2. `, `3. `처럼 번호로 시작하며, 화면 목록의 기호는 번호를 대신하지 않는다. 진행 안내나 조사 목록은 계획을 대신하지 않으며, 첫 도구 뒤나 두 번째 도구 앞에 계획을 만들면 안 된다. 계획의 한 단계만 in_progress로 두고, 그 단계의 도구 호출 전후에 즉시 상태를 갱신한다.\n",
-    "- 답변은 결론부터 간결하게 쓰며, 확인한 근거와 검증하지 못한 한계를 구분한다.\n",
-    "- 선택이나 승인이 필요하면 제공된 질문 기능을 우선 사용하고, 선택지·결과·판단에 필요한 사실을 빠뜨리지 않는다.\n",
-);
-
-/// Claude reads the full rules once, as the system prompt the bridge appends to
-/// its preset. Repeating all of them in front of every user message bought no
-/// extra obedience — the English labels leaked through anyway — while burying
-/// the actual request under thousands of characters of boilerplate. So the turn
-/// carries this reminder instead: the handful of rules that were actually
-/// broken, short enough to read as an instruction rather than as a document.
-/// The preset notice rides along beside it and already restates the language
-/// rule, so this stays off that subject.
-const CLAUDE_TURN_REMINDER: &str = concat!(
-    "Devez Vibe 규칙 요약. 전체 규칙은 시스템 프롬프트에 있고, 이번 턴에 특히 지킬 것만 다시 적는다.\n",
-    "- 단순 질문이 아닌 작업은 첫 응답 content block을 짧은 한국어 진행 안내 text로 시작하고, ",
-    "TaskCreate를 포함한 어떤 tool_use도 그보다 먼저 내지 않는다. ",
-    "진행 안내는 `진행 안내:` 같은 라벨 없이 문장으로 바로 시작한다.\n",
-    "- 사용자에게 보이는 모든 text는 첫 글자가 한글 음절이어야 한다. 영어 낱말로 시작했으면 그 낱말을 지우고 한국어 문장으로 다시 시작한다.\n",
-    "- 결과 보고는 독립된 수정 하나당 불릿 하나와 짧은 문장 하나만 쓴다. 서로 다른 수정·원인·검증을 한 불릿에 묶지 말고, 검증 결과는 마지막 불릿 하나에 모은다. ",
-    "결론은 바꾼 대상과 결과를 구체적으로 지목해 쓰고, 대상이 드러나지 않는 문장으로 얼버무리지 않는다.\n",
-    "- 도구 한 번으로 끝난다고 확신할 수 없는 작업은 첫 작업 도구 전에 반드시 TaskCreate로 작업 목록을 만든다. 각 TaskCreate의 subject 자체는 반드시 `1. `, `2. `, `3. `처럼 번호로 시작하며, 화면 목록의 기호는 번호를 대신하지 않는다. 진행 안내나 조사 목록은 TaskCreate를 대신하지 않으며, 첫 도구 뒤나 두 번째 도구 앞에 TaskCreate를 호출하면 안 된다. 각 Task를 `pending` → `in_progress` → `completed` 순서로 하나씩 옮긴다.\n",
-    "- 답변은 서론 없이 결론부터 쓰고, 분량과 노출 범위는 함께 오는 응답 모드 안내를 따른다.\n",
-    "- 선택이나 승인을 요청할 때는 본문에 나열하지 말고 AskUserQuestion 도구로 묻는다.\n",
-);
-
-/// One `developer` message at the head of the thread loses its grip as turns
-/// pile up, so the core rules ride along with every turn. The active preset rides along too: the
-/// rules that depend on it are written as conditions, and the preset is a local
-/// display setting the provider is told nothing else about.
+/// Codex and Claude both read the full rules once — Codex as the thread's
+/// developer instructions, Claude as the system prompt the bridge appends to its
+/// preset. A per-turn restatement of those same rules, long or short, only
+/// competed with the copy they already hold, so the turn carries no rules of its
+/// own. Only the preset rides along: the rules that depend on it are written as
+/// conditions, and the preset is a local display setting the provider is told
+/// nothing else about. The full rules stay here for the one runtime with no
+/// standing instructions of its own.
 fn turn_additional_context(vibe: VibeMode) -> Value {
     json!({
         "devez-vibe-rules": {
             "value": DEVEZ_INSTRUCTIONS,
             "kind": "application"
         },
-        "codex-devez-vibe-reminder": {
-            "value": CODEX_TURN_REMINDER,
-            "kind": "application"
-        },
         "claude-devez-vibe-rules": {
             "value": CLAUDE_DEVEZ_INSTRUCTIONS,
-            "kind": "application"
-        },
-        "claude-devez-vibe-reminder": {
-            "value": CLAUDE_TURN_REMINDER,
             "kind": "application"
         },
         "devez-vibe-mode": {
@@ -4716,7 +4685,8 @@ async fn refresh_account(server: &BackendServer, state: &mut AppState) {
     if let Ok(label) = ensure_account(server).await {
         state.set_account(label);
     }
-    state.set_account_plan(read_account_plan(server).await);
+    let model = state.selected_model_name().to_owned();
+    state.set_account_plan(read_runtime_account_plan(server, &model).await);
 }
 
 /// Plan and reset-credit entitlements for the welcome card. Fails soft: the panel
@@ -5748,8 +5718,9 @@ mod tests {
         assert!(params.get("effort").is_none());
     }
 
-    /// A rule written as "under Super Vibe, …" needs the preset in the request to
-    /// mean anything, and nothing else in a turn carries it.
+    /// Nothing else in a turn carries which preset is active. The preset no
+    /// longer changes how the answer is written, so what rides along is the
+    /// language rule and the exception the length cap kept breaking.
     #[test]
     fn every_turn_names_the_active_preset() {
         let notice = |vibe| {
@@ -5760,32 +5731,32 @@ mod tests {
                 .expect("the turn names its preset")
         };
 
-        let super_vibe = notice(VibeMode::SuperVibe);
-        assert!(super_vibe.contains("Super Vibe"));
-        assert!(super_vibe.contains("파일 경로, 코드 블록"));
-        assert!(super_vibe.contains("빌드나 테스트 명령을 넣지 않는다"));
-        // Without a stated ceiling the completion report grows into five bullets.
-        assert!(super_vibe.contains("세 줄 이내"));
-        // Banning identifiers left answers vague, so the cap carries its own
-        // demand for specificity.
-        assert!(super_vibe.contains("애매한 문장으로 얼버무리지 않는다"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("완료 보고는 세 줄 이내로"));
+        assert!(notice(VibeMode::SuperVibe).contains("Super Vibe"));
         assert!(notice(VibeMode::Vibe).contains("현재 응답 모드: Vibe"));
         assert!(notice(VibeMode::Normal).contains("현재 응답 모드: Off"));
+        // One length rule now holds in every mode, and it lives in the standing
+        // rules. A per-preset cap here would only contradict it.
+        for vibe in [VibeMode::Vibe, VibeMode::SuperVibe, VibeMode::Normal] {
+            assert!(!notice(vibe).contains("불릿"));
+            assert!(!notice(vibe).contains("세 줄"));
+            assert!(!notice(vibe).contains("파일 경로"));
+            assert!(!notice(vibe).contains("자세히"));
+        }
         // The English tool-call label leaks through the system prompt, so every
         // preset repeats the language rule where the turn cannot miss it.
         for vibe in [VibeMode::Vibe, VibeMode::SuperVibe, VibeMode::Normal] {
             assert!(notice(vibe).contains("영어로 시작하는 진행 문장"));
             assert!(notice(vibe).contains("첫 글자가 한글 음절이어야 하고"));
             assert!(!notice(vibe).contains("Now"));
-        }
-        // The caps truncated the one answer that has to stay whole, so both
-        // capped presets carry the exception next to the cap that broke it.
-        for vibe in [VibeMode::Vibe, VibeMode::SuperVibe] {
             assert!(
                 notice(vibe).contains("선택이나 승인을 요청할 때는 이 분량 제한을 적용하지 않는다")
             );
             assert!(notice(vibe).contains("AskUserQuestion 도구를 쓸 수 있으면"));
+        }
+        // The cap the exception refers to, stated once for every mode.
+        for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS] {
+            assert!(rules.contains("불릿 두세 개, 200자 내외"));
+            assert!(!rules.contains("세 줄"));
         }
     }
 
@@ -5811,38 +5782,11 @@ mod tests {
                 .and_then(Value::as_str),
             Some(CLAUDE_DEVEZ_INSTRUCTIONS)
         );
-        assert_eq!(
-            context
-                .pointer("/codex-devez-vibe-reminder/value")
-                .and_then(Value::as_str),
-            Some(CODEX_TURN_REMINDER)
-        );
-        assert!(CODEX_TURN_REMINDER.contains("`update_plan`"));
-        assert!(CODEX_TURN_REMINDER.contains("대신하지 않으며"));
-        assert!(CODEX_TURN_REMINDER.contains("확신할 수 없는"));
-        assert!(CODEX_TURN_REMINDER.contains("각 step 제목 자체"));
-        assert!(CODEX_TURN_REMINDER.contains("`1. `, `2. `, `3. `"));
-        // The full rules open the session; the turn repeats only the reminder,
-        // which stays short enough to read as an instruction.
-        assert_eq!(
-            context
-                .pointer("/claude-devez-vibe-reminder/value")
-                .and_then(Value::as_str),
-            Some(CLAUDE_TURN_REMINDER)
-        );
-        assert!(
-            CLAUDE_TURN_REMINDER.chars().count() < CLAUDE_DEVEZ_INSTRUCTIONS.chars().count() / 4
-        );
-        assert!(CLAUDE_TURN_REMINDER.contains("첫 응답 content block"));
-        assert!(CLAUDE_TURN_REMINDER.contains("첫 글자가 한글 음절이어야 한다"));
-        assert!(CLAUDE_TURN_REMINDER.contains("독립된 수정 하나당 불릿 하나와 짧은 문장 하나"));
-        assert!(CLAUDE_TURN_REMINDER.contains("검증 결과는 마지막 불릿 하나에 모은다"));
-        assert!(CLAUDE_TURN_REMINDER.contains("TaskCreate"));
-        assert!(CLAUDE_TURN_REMINDER.contains("대신하지 않으며"));
-        assert!(CLAUDE_TURN_REMINDER.contains("확신할 수 없는"));
-        assert!(CLAUDE_TURN_REMINDER.contains("각 TaskCreate의 subject 자체"));
-        assert!(CLAUDE_TURN_REMINDER.contains("`1. `, `2. `, `3. `"));
-        assert!(CLAUDE_TURN_REMINDER.contains("AskUserQuestion"));
+        // Both providers hold the rules already — Codex as its thread
+        // instructions, Claude as its system prompt — so no per-turn restatement
+        // rides along beside them.
+        assert!(context.get("codex-devez-vibe-reminder").is_none());
+        assert!(context.get("claude-devez-vibe-reminder").is_none());
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskCreate"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("첫 응답 content block"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("모든 일반 문장은 반드시 한국어로 작성한다"));
@@ -5853,15 +5797,14 @@ mod tests {
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("두 번째 작업 도구를 호출하거나"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskCreate를 대신하지 않는다"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("독립된 수정 하나당 불릿 하나와 짧은 문장 하나"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("서로 다른 수정, 원인, 영향, 검증을 같은 불릿이나 문장에 묶지 않는다"));
-        assert!(DEVEZ_INSTRUCTIONS.contains("확인된 원인, 사용자에게 미치는 영향, 실제 조치, 확인 결과"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("서로 다른 수정, 원인, 영향을 같은 불릿이나 문장에 묶지 않는다"));
+        assert!(DEVEZ_INSTRUCTIONS.contains("확인된 원인, 사용자에게 미치는 영향, 실제 조치"));
         assert!(DEVEZ_INSTRUCTIONS.contains("`update_plan`을 대신하지 않는다"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("모든 TaskCreate의 subject에는 반드시 제목 자체"));
         assert!(DEVEZ_INSTRUCTIONS.contains("`update_plan`의 각 step에는 반드시 제목 자체"));
-        // The length and disclosure caps live in the per-turn preset notice, so
-        // the standing rules only point at it instead of restating it.
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("응답 모드 안내를 따르고"));
-        assert!(!CLAUDE_DEVEZ_INSTRUCTIONS.contains("전체 200자 이내"));
+        // The length cap is the same in every mode, so it is stated here once
+        // rather than deferred to the preset notice.
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("응답 모드와 관계없이"));
         for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS] {
             assert!(rules.contains("완료 문구를 붙이지 않는다"));
             assert!(rules.contains("`~한 내용을 완료했습니다.`처럼 명사절을 겹쳐 쓰거나"));
@@ -5885,9 +5828,7 @@ mod tests {
         // Spelling the banned opener out five times primed the very word it
         // banned, so the rule is stated positively and the token appears nowhere.
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("첫 글자가 한글 음절이어야 한다"));
-        for rules in [CLAUDE_DEVEZ_INSTRUCTIONS, CLAUDE_TURN_REMINDER] {
-            assert!(!rules.contains("Now"));
-        }
+        assert!(!CLAUDE_DEVEZ_INSTRUCTIONS.contains("Now"));
         // The ban only held when it moved above the format rules and named the
         // two shapes that actually leaked: an English label glued in front of a
         // Korean sentence, and an English verdict on a tool result. Saying it
@@ -5908,7 +5849,12 @@ mod tests {
         assert!(DEVEZ_INSTRUCTIONS.contains("도구를 두 번 이상 호출할 작업"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("동시에 `in_progress`인 Task는 하나만"));
         assert!(DEVEZ_INSTRUCTIONS.contains("같은 내용을 반복하지 않는다"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("검증하지 못한 내용은 짧게 밝힌다"));
+        // Verification reporting is left to the host's own honest-reporting rule.
+        // Restating it here only competed with that wording.
+        for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS] {
+            assert!(!rules.contains("검증 결과"));
+            assert!(!rules.contains("검증하지 못한"));
+        }
         for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS] {
             assert!(rules.contains("첫 검색 결과나 단일 키워드에 의존하지 않는다"));
             assert!(
@@ -5931,9 +5877,6 @@ mod tests {
             assert!(rules.contains("그대로 출력할 문구가 아니다"));
             assert!(rules.contains("대상이 드러나지 않는 문장으로 얼버무리지 않는다"));
         }
-        assert!(CLAUDE_TURN_REMINDER.contains("라벨 없이 문장으로 바로 시작한다"));
-        assert!(CLAUDE_TURN_REMINDER.contains("얼버무리지 않는다"));
-        assert!(CODEX_TURN_REMINDER.contains("라벨이나 머리글은 붙이지 않는다"));
     }
 
     #[test]

@@ -298,32 +298,26 @@ impl VibeMode {
     }
 
     /// What the turn tells the model about the preset it is answering under. The
-    /// rules name Super Vibe by condition, and a condition the model cannot
-    /// evaluate is no rule at all — nothing else in a request says which preset
-    /// is active, so the answer came back full of paths and code either way.
+    /// preset governs what the transcript collapses, not how the answer is
+    /// written: one length rule now holds in every mode, and asking the answer to
+    /// hide paths and identifiers on top of that only cost the user the one place
+    /// they were still readable. What stays here is what a turn cannot get
+    /// elsewhere — the choice exception and the language rule.
     pub const fn turn_notice(self) -> &'static str {
         match self {
             Self::Vibe => concat!(
-                "현재 응답 모드: Vibe. 최종 답변은 불릿 세 개 이내로 쓴다. ",
-                "결론부터 쓰고, 코드 변경은 파일 경로와 핵심 코드만 보여준다. ",
+                "현재 응답 모드: Vibe. ",
                 choice_notice!(),
                 " ",
                 language_notice!(),
             ),
             Self::SuperVibe => concat!(
-                "현재 응답 모드: Super Vibe. 최종 답변은 불릿 두 개 또는 세 줄 이내로 쓴다. ",
-                "파일 경로, 코드 블록, 함수·클래스·변수·설정 키 이름, 빌드나 테스트 명령을 넣지 않는다. ",
-                "무엇을 어떻게 바꿨는지 일상 언어로만 설명하고, 배경 설명과 원인 해설은 사용자가 물을 때만 덧붙인다. ",
-                "일상 언어로 쓰더라도 바꾼 대상과 동작 결과는 특정해서 쓰고, `일부 수정했습니다`처럼 애매한 문장으로 얼버무리지 않는다. ",
-                "사용자가 코드나 경로를 직접 요청한 경우에만 예외로 보여준다. ",
+                "현재 응답 모드: Super Vibe. ",
                 choice_notice!(),
                 " ",
                 language_notice!(),
             ),
-            Self::Normal => concat!(
-                "현재 응답 모드: Off. 필요한 만큼 자세히 설명하고 파일 경로와 코드를 그대로 보여준다. ",
-                language_notice!(),
-            ),
+            Self::Normal => concat!("현재 응답 모드: Off. ", choice_notice!(), " ", language_notice!()),
         }
     }
 }
@@ -1420,14 +1414,27 @@ struct ActiveItem {
 
 /// Providers deliver assistant text at their own uneven cadence: a phrase in one
 /// event, a single character in the next. Holding the arrivals here and revealing
-/// a share of them on each redraw ties the visible pace to the frame loop instead
-/// of to the delivery jitter.
-const STREAM_TARGET_FRAMES: f32 = 6.0;
-const STREAM_MAX_CLUSTERS: f32 = 48.0;
-/// Ease toward the backlog's demand instead of adopting it at once, and cap how
-/// far one frame may move, so a sudden phrase ramps up rather than lurching.
-const STREAM_RATE_EASING: f32 = 0.25;
-const STREAM_RATE_STEP: f32 = 2.0;
+/// a measured share of them keeps the visible pace steady.
+///
+/// The share is measured against elapsed time rather than against frames. A frame
+/// that takes twice as long to paint would otherwise reveal the same amount of
+/// text over twice the time, and a frame the runtime skipped would reveal nothing
+/// at all — that is the same jitter this is meant to hide, just moved one layer
+/// down.
+/// How long the text already in hand should take to appear.
+const STREAM_TARGET_LATENCY: f32 = 0.1;
+/// Clusters per second. The floor keeps a thin trickle moving; the ceiling keeps
+/// a burst from arriving as one visible jump.
+const STREAM_MIN_RATE: f32 = 45.0;
+const STREAM_MAX_RATE: f32 = 1600.0;
+/// How quickly the rate closes on the backlog's demand, per second. Rising is
+/// faster than falling so a burst is absorbed promptly while the pace afterwards
+/// settles gradually instead of snapping back.
+const STREAM_RATE_ATTACK: f32 = 14.0;
+const STREAM_RATE_DECAY: f32 = 2.5;
+/// A stall — a slow repaint, a descheduled loop — must not turn into one large
+/// reveal once the loop comes back.
+const STREAM_MAX_STEP: Duration = Duration::from_millis(50);
 
 #[derive(Default)]
 struct TextPace {
@@ -1441,21 +1448,31 @@ impl TextPace {
         self.pending.push_str(delta);
     }
 
-    fn take(&mut self) -> Option<String> {
+    fn take(&mut self, elapsed: Duration) -> Option<String> {
         if self.pending.is_empty() {
-            self.rate = 0.0;
+            // The rate is kept, not cleared. Claude's deltas arrive in bursts
+            // separated by short gaps, and restarting from the floor at every gap
+            // is what made a steady answer read as stop-and-go.
             self.carry = 0.0;
             return None;
         }
+        let step = elapsed.min(STREAM_MAX_STEP).as_secs_f32();
         let backlog = visible_cluster_count(&self.pending) as f32;
-        let target = (backlog / STREAM_TARGET_FRAMES).clamp(1.0, STREAM_MAX_CLUSTERS);
-        self.rate +=
-            ((target - self.rate) * STREAM_RATE_EASING).clamp(-STREAM_RATE_STEP, STREAM_RATE_STEP);
-        // Fractional rates only stay even if the leftover carries to the next
-        // frame; truncating every frame would quantize the pace to integers.
-        let budget = self.rate.max(1.0) + self.carry;
+        let demand = (backlog / STREAM_TARGET_LATENCY).clamp(STREAM_MIN_RATE, STREAM_MAX_RATE);
+        let closing = if demand > self.rate {
+            STREAM_RATE_ATTACK
+        } else {
+            STREAM_RATE_DECAY
+        };
+        self.rate += (demand - self.rate) * (closing * step).min(1.0);
+        // Fractional budgets only stay even if the leftover carries to the next
+        // reveal; truncating every time would quantize the pace to integers.
+        let budget = self.rate * step + self.carry;
         let size = budget.floor();
         self.carry = budget - size;
+        if size < 1.0 {
+            return None;
+        }
         let end = visible_cluster_end(&self.pending, size as usize);
         Some(self.pending.drain(..end).collect())
     }
@@ -3425,7 +3442,15 @@ impl AppState {
         let diff_display_mode = read_vibe_config_value("diff_display_mode")
             .and_then(|value| DiffDisplayMode::from_config_value(&value))
             .unwrap_or(default_diff_display_mode);
-        let (five_hour_percent, weekly_percent, five_hour_reset_at) = read_codex_usage();
+        // A Claude launch has no codex-usage.json of its own; reading it here would
+        // show the last Codex session's numbers under a Claude status row until the
+        // real Claude usage arrives.
+        let (five_hour_percent, weekly_percent, five_hour_reset_at) =
+            if crate::claude::is_claude_model(model) {
+                (None, None, None)
+            } else {
+                read_codex_usage()
+            };
         let context_window = models
             .get(selected_model)
             .and_then(|model| model.context_window);
@@ -10941,12 +10966,12 @@ impl AppState {
         active.pace.push(delta);
     }
 
-    /// Reveal one frame's share of every stream that is still holding text.
-    /// Returns whether anything became visible.
-    pub fn drain_stream_text(&mut self) -> bool {
+    /// Reveal the share of held text that `elapsed` has earned, for every stream
+    /// still holding some. Returns whether anything became visible.
+    pub fn drain_stream_text(&mut self, elapsed: Duration) -> bool {
         let mut changed = false;
         for active in self.active.values_mut() {
-            let Some(chunk) = active.pace.take() else {
+            let Some(chunk) = active.pace.take(elapsed) else {
                 continue;
             };
             append_capped(&mut active.block.body, &chunk);
@@ -16506,6 +16531,8 @@ mod tests {
         assert!(!state.compacting());
     }
 
+    const TEST_FRAME: Duration = Duration::from_millis(16);
+
     #[test]
     fn streamed_text_is_revealed_on_frames_instead_of_on_arrival() {
         let mut state = test_state();
@@ -16517,13 +16544,49 @@ mod tests {
 
         assert_eq!(state.active["item-1"].block.body, "");
 
-        assert!(state.drain_stream_text());
+        assert!(state.drain_stream_text(TEST_FRAME));
         let first = state.active["item-1"].block.body.clone();
         assert!(!first.is_empty());
         assert!(first.chars().count() < text.chars().count());
 
-        while state.drain_stream_text() {}
+        for _ in 0..240 {
+            state.drain_stream_text(TEST_FRAME);
+        }
         assert_eq!(state.active["item-1"].block.body, text);
+    }
+
+    /// A frame the loop took twice as long to reach owes twice as much text.
+    /// Sizing by frame count instead is what let a slow repaint stall the pace.
+    #[test]
+    fn a_longer_gap_reveals_proportionally_more_text() {
+        let text = "이 문장은 한 프레임에 다 드러나지 않을 만큼 충분히 길게 이어집니다.".repeat(4);
+        let revealed = |elapsed| {
+            let mut pace = TextPace::default();
+            pace.push(&text);
+            pace.take(elapsed).map(|chunk| chunk.chars().count())
+        };
+
+        let one = revealed(TEST_FRAME).expect("one frame reveals text");
+        let two = revealed(TEST_FRAME * 2).expect("two frames reveal text");
+        assert!(two > one, "{two} should exceed {one}");
+    }
+
+    /// Deltas arrive in bursts with short gaps between them. Clearing the pace at
+    /// every gap would restart each burst from the slowest rate.
+    #[test]
+    fn a_gap_between_bursts_keeps_the_pace_it_reached() {
+        let mut pace = TextPace::default();
+        pace.push(&"흐름을 유지하는지 확인하는 긴 문장입니다.".repeat(6));
+        for _ in 0..10 {
+            pace.take(TEST_FRAME);
+        }
+        let reached = pace.rate;
+        assert!(reached > STREAM_MIN_RATE);
+
+        // Drained dry, then the next burst lands.
+        while pace.take(TEST_FRAME).is_some() {}
+        assert!(pace.take(TEST_FRAME).is_none());
+        assert!(pace.rate >= reached * 0.9, "{} vs {reached}", pace.rate);
     }
 
     #[test]

@@ -2225,9 +2225,10 @@ fn insert_handoff_context(params: &mut Value, context: &str) {
     });
 }
 
-/// Codex receives `additionalContext` directly. Replace the large standing
-/// rules with its short reminder and omit Claude-only entries before the turn
-/// crosses that provider boundary.
+/// Codex receives `additionalContext` directly. It already holds the rules as
+/// the thread's developer instructions, so the standing copies are dropped here
+/// along with the Claude-only entries, leaving the turn carrying the preset
+/// alone.
 fn prepare_codex_turn_context(params: &mut Value) {
     let Some(context) = params
         .get_mut("additionalContext")
@@ -2235,27 +2236,16 @@ fn prepare_codex_turn_context(params: &mut Value) {
     else {
         return;
     };
-    if let Some(reminder) = context.get("codex-devez-vibe-reminder").cloned() {
-        context.insert("devez-vibe-rules".to_owned(), reminder);
-    }
-    context.remove("codex-devez-vibe-reminder");
+    context.remove("devez-vibe-rules");
     context.remove("claude-devez-vibe-rules");
-    context.remove("claude-devez-vibe-reminder");
 }
 
 fn combined_turn_instructions(params: &Value, runtime: RuntimeKind) -> Option<String> {
-    // Claude already carries the full rules as its system prompt, so its turn
-    // repeats only the short reminder. The full rules stay behind it as the
-    // fallback for a host that predates the reminder key.
+    // Claude holds the full rules as its system prompt and Codex as its thread
+    // instructions, so neither turn restates them. Only OpenCode, which has no
+    // standing instructions of its own, carries them here.
     let rules_paths: &[&str] = match runtime {
-        RuntimeKind::Codex => &[
-            "/additionalContext/codex-devez-vibe-reminder/value",
-            "/additionalContext/devez-vibe-rules/value",
-        ],
-        RuntimeKind::Claude => &[
-            "/additionalContext/claude-devez-vibe-reminder/value",
-            "/additionalContext/claude-devez-vibe-rules/value",
-        ],
+        RuntimeKind::Codex | RuntimeKind::Claude => &[],
         RuntimeKind::OpenCode => &["/additionalContext/devez-vibe-rules/value"],
     };
     let parts = [
@@ -2814,23 +2804,16 @@ mod tests {
         });
         insert_handoff_context(&mut params, "history");
 
-        // No reminder key: an older host still gets the full rules per turn.
+        // Claude opens on the rules as its system prompt, so its turn carries
+        // the preset and the handoff alone. OpenCode has no such prompt of its
+        // own and still needs them.
         assert_eq!(
             combined_turn_instructions(&params, RuntimeKind::Claude).as_deref(),
-            Some("claude rules\n\nsuper vibe\n\nhistory")
+            Some("super vibe\n\nhistory")
         );
         assert_eq!(
-            combined_turn_instructions(&params, RuntimeKind::OpenCode).as_deref(),
-            Some("codex rules\n\nsuper vibe\n\nhistory")
-        );
-
-        // With it, the turn carries the reminder and leaves the full rules to
-        // the system prompt the session already opened on.
-        params["additionalContext"]["claude-devez-vibe-reminder"] =
-            json!({ "value": "claude reminder", "kind": "application" });
-        assert_eq!(
-            combined_turn_instructions(&params, RuntimeKind::Claude).as_deref(),
-            Some("claude reminder\n\nsuper vibe\n\nhistory")
+            combined_turn_instructions(&params, RuntimeKind::Codex).as_deref(),
+            Some("super vibe\n\nhistory")
         );
         assert_eq!(
             combined_turn_instructions(&params, RuntimeKind::OpenCode).as_deref(),
@@ -2839,38 +2822,27 @@ mod tests {
     }
 
     #[test]
-    fn codex_turn_keeps_only_its_reminder_at_the_provider_boundary() {
+    fn codex_turn_keeps_only_the_preset_at_the_provider_boundary() {
         let mut params = json!({
             "additionalContext": {
                 "devez-vibe-rules": { "value": "full rules", "kind": "application" },
-                "codex-devez-vibe-reminder": { "value": "short reminder", "kind": "application" },
                 "claude-devez-vibe-rules": { "value": "claude full rules", "kind": "application" },
-                "claude-devez-vibe-reminder": { "value": "claude reminder", "kind": "application" },
                 "devez-vibe-mode": { "value": "mode", "kind": "application" }
             }
         });
 
         prepare_codex_turn_context(&mut params);
 
-        assert_eq!(
-            params
-                .pointer("/additionalContext/devez-vibe-rules/value")
-                .and_then(Value::as_str),
-            Some("short reminder")
-        );
+        // The thread's developer instructions already carry the rules; sending
+        // them again with every turn only doubled them.
         assert!(
             params
-                .pointer("/additionalContext/codex-devez-vibe-reminder")
+                .pointer("/additionalContext/devez-vibe-rules")
                 .is_none()
         );
         assert!(
             params
                 .pointer("/additionalContext/claude-devez-vibe-rules")
-                .is_none()
-        );
-        assert!(
-            params
-                .pointer("/additionalContext/claude-devez-vibe-reminder")
                 .is_none()
         );
         assert_eq!(

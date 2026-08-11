@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     collections::HashSet,
     env, fs,
-    io::{Stdout, Write, stdout},
+    io::{BufWriter, Stdout, Write, stdout},
     ops::Range,
     path::PathBuf,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -537,8 +537,15 @@ impl Drop for TerminalSession {
     }
 }
 
+/// One frame of escape sequences for a wide terminal runs to tens of kilobytes.
+/// `std::io::stdout` buffers only a kilobyte at a time, so a single repaint left
+/// through it as dozens of separate console writes; on Windows each one is a
+/// round trip expensive enough to push a frame past its interval. Holding a whole
+/// frame and handing it over in one write is what keeps the pace even.
+const FRAME_BUFFER_BYTES: usize = 512 * 1024;
+
 pub struct Renderer {
-    out: Stdout,
+    out: BufWriter<Stdout>,
     mode: RenderMode,
     previous_lines: Vec<PaintLine>,
     cursor_line: usize,
@@ -1093,7 +1100,7 @@ impl Renderer {
     pub fn new(selected_theme: ThemeKind, mode: RenderMode) -> Self {
         theme::set_current(selected_theme);
         Self {
-            out: stdout(),
+            out: BufWriter::with_capacity(FRAME_BUFFER_BYTES, stdout()),
             mode,
             previous_lines: Vec::new(),
             cursor_line: 0,
@@ -3181,7 +3188,7 @@ fn scroll_to_bottom_overlay_row(view_rows: usize, composer_index: Option<usize>)
     composer_index.map(|index| view_rows + index.saturating_sub(3))
 }
 
-fn move_to_row(out: &mut Stdout, current_row: &mut usize, target_row: usize) -> Result<()> {
+fn move_to_row(out: &mut impl Write, current_row: &mut usize, target_row: usize) -> Result<()> {
     match target_row.cmp(current_row) {
         std::cmp::Ordering::Greater => {
             queue!(
