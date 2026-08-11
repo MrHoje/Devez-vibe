@@ -3279,7 +3279,6 @@ enum Tone {
     Warning,
     Error,
     Code,
-    Orange,
     EffortLow,
     EffortMedium,
     EffortHigh,
@@ -3659,11 +3658,7 @@ fn activity_lines_with_progress(
     progress_phase: f32,
     width: u16,
 ) -> Vec<PaintLine> {
-    let tone = if activity == COPY_NOTICE {
-        Tone::Orange
-    } else {
-        activity_model.and_then(model_tone).unwrap_or(Tone::Plain)
-    };
+    let tone = activity_model.and_then(model_tone).unwrap_or(Tone::Plain);
     if UnicodeWidthStr::width(activity) > width.saturating_sub(2) as usize {
         return wrapped_line(" ", tone, activity, tone, false, width);
     }
@@ -3939,7 +3934,7 @@ fn activity_copy_notice_line(notice: &str, width: u16) -> PaintLine {
             rule_gap(gap),
             PaintSpan {
                 text: notice,
-                tone: Tone::Orange,
+                tone: Tone::Accent,
                 bold: false,
             },
             rule_gap(1),
@@ -9811,7 +9806,6 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::Warning => palette.warning,
         Tone::Error => palette.error,
         Tone::Code => palette.code,
-        Tone::Orange => palette.orange,
         Tone::EffortLow => palette.status.effort_low,
         Tone::EffortMedium => palette.status.effort_medium,
         Tone::EffortHigh => palette.status.effort_high,
@@ -12973,7 +12967,6 @@ mod tests {
             .expect("copy notice row");
         assert_eq!(painted_line_width(notice), 118);
         assert!(painted(notice).ends_with("• Copied to clipboard "));
-        assert_eq!(notice.tail[1].tone, Tone::Orange);
         assert!(!painted(notice).contains("feature/copy-notice"));
         assert!(!painted(notice).contains("Vibe: On"));
         assert!(!painted(notice).contains("Fast: On"));
@@ -13038,12 +13031,12 @@ mod tests {
     }
 
     #[test]
-    fn copy_notice_activity_uses_orange_theme_text() {
+    fn copy_notice_activity_uses_plain_text() {
         let line = activity_lines("• Copied to clipboard", None, 0.5, 80)
             .pop()
             .expect("copy notice row");
 
-        assert_eq!(line.tone, Tone::Orange);
+        assert_eq!(line.tone, Tone::Plain);
         assert_eq!(line.text, "• ");
     }
 
