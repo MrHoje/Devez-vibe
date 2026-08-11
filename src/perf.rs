@@ -21,6 +21,11 @@ struct PerfWindow {
     animation_max: Duration,
     live_blocks: usize,
     live_bytes: usize,
+    reveals: u64,
+    reveal_gap_total: Duration,
+    reveal_gap_max: Duration,
+    revealed_clusters: u64,
+    backlog_max: usize,
 }
 
 static PERF: OnceLock<Option<Mutex<PerfWindow>>> = OnceLock::new();
@@ -45,6 +50,11 @@ fn perf() -> Option<&'static Mutex<PerfWindow>> {
             animation_max: Duration::ZERO,
             live_blocks: 0,
             live_bytes: 0,
+            reveals: 0,
+            reveal_gap_total: Duration::ZERO,
+            reveal_gap_max: Duration::ZERO,
+            revealed_clusters: 0,
+            backlog_max: 0,
         }))
     })
     .as_ref()
@@ -71,6 +81,25 @@ pub fn record_draw(
     report_if_due(&mut window);
 }
 
+/// One pass of the streaming reveal: how long since the previous one, how much
+/// text it put on screen, and how much was still waiting behind it. A steady gap
+/// with a small backlog means the pacing is even and the stutter is elsewhere; a
+/// gap that spikes, or a backlog that keeps growing, points back here.
+pub fn record_reveal(gap: Duration, clusters: usize, backlog: usize) {
+    let Some(perf) = perf() else {
+        return;
+    };
+    let Ok(mut window) = perf.lock() else {
+        return;
+    };
+    window.reveals += 1;
+    window.reveal_gap_total += gap;
+    window.reveal_gap_max = window.reveal_gap_max.max(gap);
+    window.revealed_clusters += clusters as u64;
+    window.backlog_max = window.backlog_max.max(backlog);
+    report_if_due(&mut window);
+}
+
 pub fn record_animation(elapsed: Duration) {
     let Some(perf) = perf() else {
         return;
@@ -91,8 +120,9 @@ fn report_if_due(window: &mut PerfWindow) {
     }
     let draws = window.draws.max(1);
     let animations = window.animations.max(1);
+    let reveals = window.reveals.max(1);
     let line = format!(
-        "window_ms={} draws={} animations={} draws_per_sec={:.1} animation_per_sec={:.1} view_avg_us={} render_avg_us={} render_max_us={} animation_avg_us={} animation_max_us={} live_blocks={} live_kib={}\n",
+        "window_ms={} draws={} animations={} draws_per_sec={:.1} animation_per_sec={:.1} view_avg_us={} render_avg_us={} render_max_us={} animation_avg_us={} animation_max_us={} live_blocks={} live_kib={} reveals={} reveal_gap_avg_us={} reveal_gap_max_us={} reveal_clusters={} reveal_clusters_per_sec={:.1} backlog_max={}\n",
         elapsed.as_millis(),
         window.draws,
         window.animations,
@@ -105,6 +135,12 @@ fn report_if_due(window: &mut PerfWindow) {
         window.animation_max.as_micros(),
         window.live_blocks,
         window.live_bytes / 1024,
+        window.reveals,
+        window.reveal_gap_total.as_micros() / u128::from(reveals),
+        window.reveal_gap_max.as_micros(),
+        window.revealed_clusters,
+        window.revealed_clusters as f64 / elapsed.as_secs_f64(),
+        window.backlog_max,
     );
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
@@ -121,4 +157,9 @@ fn report_if_due(window: &mut PerfWindow) {
     window.render_max = Duration::ZERO;
     window.animation_total = Duration::ZERO;
     window.animation_max = Duration::ZERO;
+    window.reveals = 0;
+    window.reveal_gap_total = Duration::ZERO;
+    window.reveal_gap_max = Duration::ZERO;
+    window.revealed_clusters = 0;
+    window.backlog_max = 0;
 }

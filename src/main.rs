@@ -894,7 +894,8 @@ async fn event_loop(
     let mut activity_tick = tokio::time::interval(Duration::from_millis(80));
     activity_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // Streamed text is revealed here rather than when a delta lands, so the pace
-    // follows the redraw rhythm instead of the provider's arrival jitter.
+    // follows a clock of its own instead of the provider's arrival jitter.
+    let _timer_resolution = TimerResolution::raise();
     let mut stream_tick = tokio::time::interval(STREAM_FRAME);
     stream_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_stream_reveal = Instant::now();
@@ -1213,7 +1214,9 @@ async fn event_loop(
                 let now = Instant::now();
                 let elapsed = now.duration_since(last_stream_reveal);
                 last_stream_reveal = now;
-                let revealed = state.drain_stream_text(elapsed);
+                let reveal = state.drain_stream_text(elapsed);
+                perf::record_reveal(elapsed, reveal.clusters, reveal.backlog);
+                let revealed = reveal.changed();
                 if revealed {
                     animation_tick = false;
                 }
@@ -1266,9 +1269,41 @@ async fn event_loop(
 
 const WHEEL_ROWS: isize = 3;
 const SIDE_EXIT_KEY_SETTLE: Duration = Duration::from_millis(250);
-/// One terminal frame. Windows rounds larger delays up to the next scheduler
-/// slice, so this stays at the shortest interval that still lands evenly.
-const STREAM_FRAME: Duration = Duration::from_millis(16);
+/// How often held text is checked for its next reveal. Assistant text arrives at
+/// roughly fifty characters a second, well under one per screen refresh, so what
+/// the eye reads as stutter is the spacing between single characters rather than
+/// the refresh rate. A tick well below one frame lets that spacing land where the
+/// pace asks for it instead of on the nearest refresh boundary.
+const STREAM_FRAME: Duration = Duration::from_millis(4);
+
+/// Windows resolves timers to the system tick — 15.6ms by default — so a 16ms
+/// request alternates between one tick and two, and the reveal it drives jitters
+/// between 16ms and 31ms. Raising the resolution for as long as the app runs is
+/// what makes a sub-frame tick mean anything.
+struct TimerResolution;
+
+impl TimerResolution {
+    fn raise() -> Self {
+        #[cfg(windows)]
+        // SAFETY: `timeBeginPeriod` takes a millisecond count and only changes
+        // this process's timer resolution. It is paired with `timeEndPeriod` in
+        // `Drop`, as the API requires.
+        unsafe {
+            windows_sys::Win32::Media::timeBeginPeriod(1);
+        }
+        Self
+    }
+}
+
+impl Drop for TimerResolution {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        // SAFETY: Undoes the matching `timeBeginPeriod(1)` above.
+        unsafe {
+            windows_sys::Win32::Media::timeEndPeriod(1);
+        }
+    }
+}
 
 fn is_paced_text_delta(method: &str) -> bool {
     matches!(

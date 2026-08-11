@@ -1421,20 +1421,37 @@ struct ActiveItem {
 /// text over twice the time, and a frame the runtime skipped would reveal nothing
 /// at all — that is the same jitter this is meant to hide, just moved one layer
 /// down.
-/// How long the text already in hand should take to appear.
-const STREAM_TARGET_LATENCY: f32 = 0.1;
+/// How long the text already in hand should take to appear. Held deliberately
+/// above the gap between bursts: the reveal runs a fraction of a second behind
+/// what has arrived, and that cushion is what lets the pace stay even across a
+/// burst instead of emptying and waiting.
+const STREAM_TARGET_LATENCY: f32 = 0.25;
 /// Clusters per second. The floor keeps a thin trickle moving; the ceiling keeps
 /// a burst from arriving as one visible jump.
-const STREAM_MIN_RATE: f32 = 45.0;
+const STREAM_MIN_RATE: f32 = 25.0;
 const STREAM_MAX_RATE: f32 = 1600.0;
-/// How quickly the rate closes on the backlog's demand, per second. Rising is
-/// faster than falling so a burst is absorbed promptly while the pace afterwards
-/// settles gradually instead of snapping back.
-const STREAM_RATE_ATTACK: f32 = 14.0;
-const STREAM_RATE_DECAY: f32 = 2.5;
+/// How quickly the rate closes on the backlog's demand, per second. Both are
+/// gentle on purpose. Assistant text arrives near fifty characters a second, so
+/// the rate that matters is the average one, and a rate that chased each burst
+/// would spend the answer alternating between a sprint and a wait.
+const STREAM_RATE_ATTACK: f32 = 4.0;
+const STREAM_RATE_DECAY: f32 = 1.5;
 /// A stall — a slow repaint, a descheduled loop — must not turn into one large
 /// reveal once the loop comes back.
-const STREAM_MAX_STEP: Duration = Duration::from_millis(50);
+const STREAM_MAX_STEP: Duration = Duration::from_millis(40);
+
+/// What one reveal pass put on screen, and what it left waiting.
+#[derive(Default)]
+pub struct StreamReveal {
+    pub clusters: usize,
+    pub backlog: usize,
+}
+
+impl StreamReveal {
+    pub fn changed(&self) -> bool {
+        self.clusters > 0
+    }
+}
 
 #[derive(Default)]
 struct TextPace {
@@ -10967,18 +10984,18 @@ impl AppState {
     }
 
     /// Reveal the share of held text that `elapsed` has earned, for every stream
-    /// still holding some. Returns whether anything became visible.
-    pub fn drain_stream_text(&mut self, elapsed: Duration) -> bool {
-        let mut changed = false;
+    /// still holding some.
+    pub fn drain_stream_text(&mut self, elapsed: Duration) -> StreamReveal {
+        let mut reveal = StreamReveal::default();
         for active in self.active.values_mut() {
-            let Some(chunk) = active.pace.take(elapsed) else {
-                continue;
-            };
-            append_capped(&mut active.block.body, &chunk);
-            active.revision = active.revision.wrapping_add(1);
-            changed = true;
+            if let Some(chunk) = active.pace.take(elapsed) {
+                reveal.clusters += visible_cluster_count(&chunk);
+                append_capped(&mut active.block.body, &chunk);
+                active.revision = active.revision.wrapping_add(1);
+            }
+            reveal.backlog += visible_cluster_count(&active.pace.pending);
         }
-        changed
+        reveal
     }
 
     /// Held text must land before an item or turn is finalized; anything still
@@ -16546,7 +16563,16 @@ mod tests {
         assert!(!state.compacting());
     }
 
-    const TEST_FRAME: Duration = Duration::from_millis(16);
+    const TEST_FRAME: Duration = STREAM_FRAME_FOR_TESTS;
+    /// The loop's tick sits well under one character's worth of time, so a test
+    /// that wants to see text has to run several of them.
+    const STREAM_FRAME_FOR_TESTS: Duration = Duration::from_millis(4);
+
+    fn drain_frames(state: &mut AppState, frames: usize) {
+        for _ in 0..frames {
+            state.drain_stream_text(TEST_FRAME);
+        }
+    }
 
     #[test]
     fn streamed_text_is_revealed_on_frames_instead_of_on_arrival() {
@@ -16559,30 +16585,28 @@ mod tests {
 
         assert_eq!(state.active["item-1"].block.body, "");
 
-        assert!(state.drain_stream_text(TEST_FRAME));
+        drain_frames(&mut state, 25);
         let first = state.active["item-1"].block.body.clone();
         assert!(!first.is_empty());
         assert!(first.chars().count() < text.chars().count());
 
-        for _ in 0..240 {
-            state.drain_stream_text(TEST_FRAME);
-        }
+        drain_frames(&mut state, 2000);
         assert_eq!(state.active["item-1"].block.body, text);
     }
 
-    /// A frame the loop took twice as long to reach owes twice as much text.
+    /// A pass the loop took twice as long to reach owes twice as much text.
     /// Sizing by frame count instead is what let a slow repaint stall the pace.
     #[test]
     fn a_longer_gap_reveals_proportionally_more_text() {
-        let text = "이 문장은 한 프레임에 다 드러나지 않을 만큼 충분히 길게 이어집니다.".repeat(4);
+        let text = "이 문장은 한 번에 다 드러나지 않을 만큼 충분히 길게 이어집니다.".repeat(40);
         let revealed = |elapsed| {
             let mut pace = TextPace::default();
             pace.push(&text);
             pace.take(elapsed).map(|chunk| chunk.chars().count())
         };
 
-        let one = revealed(TEST_FRAME).expect("one frame reveals text");
-        let two = revealed(TEST_FRAME * 2).expect("two frames reveal text");
+        let one = revealed(TEST_FRAME * 5).expect("a short gap reveals text");
+        let two = revealed(TEST_FRAME * 10).expect("a longer gap reveals text");
         assert!(two > one, "{two} should exceed {one}");
     }
 
@@ -16599,7 +16623,9 @@ mod tests {
         assert!(reached > STREAM_MIN_RATE);
 
         // Drained dry, then the next burst lands.
-        while pace.take(TEST_FRAME).is_some() {}
+        while !pace.pending.is_empty() {
+            pace.take(TEST_FRAME);
+        }
         assert!(pace.take(TEST_FRAME).is_none());
         assert!(pace.rate >= reached * 0.9, "{} vs {reached}", pace.rate);
     }
