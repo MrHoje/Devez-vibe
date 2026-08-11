@@ -1257,10 +1257,9 @@ impl Renderer {
         })
     }
 
-    /// Rows a page key jumps. A row of overlap keeps a line of context in view.
+    /// Rows currently visible in the transcript viewport.
     pub fn page_rows(&self) -> isize {
-        // Floored at 3 above, so the overlap subtraction always leaves at least 1.
-        self.last_height.max(3) as isize - 2
+        self.last_transcript_rows.max(1) as isize
     }
 
     pub fn clear_screen(&mut self) -> Result<()> {
@@ -13817,6 +13816,20 @@ mod tests {
         assert!(renderer.scroll(-100));
         assert_eq!(renderer.scroll_back, 0);
         assert!(!renderer.scroll(-1));
+    }
+
+    #[test]
+    fn page_scroll_uses_the_visible_transcript_height() {
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.last_height = 40;
+        renderer.last_transcript_rows = 8;
+        renderer.wrapped = text_rows(80, "t");
+        renderer.scroll_back = 24;
+
+        let page = renderer.page_rows();
+        assert_eq!(page, 8);
+        assert!(renderer.scroll(-page));
+        assert_eq!(renderer.scroll_back, 16);
     }
 
     #[test]

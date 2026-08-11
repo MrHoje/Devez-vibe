@@ -43,7 +43,7 @@ function run(command, commandArgs, cwd) {
 }
 
 function cargoVersion() {
-  const cargo = readFileSync(join(root, "Cargo.toml"), "utf8");
+  const cargo = readFileSync(join(root, "Cargo.toml"), "utf8").replace(/^\uFEFF/, "");
   const packageSection = cargo.split(/^\[/m)[1] ?? "";
   const match = packageSection.match(/^version\s*=\s*"([^"]+)"/m);
   if (!match) {
@@ -62,7 +62,7 @@ function alreadyPublished(name, version) {
 }
 
 const version = cargoVersion();
-const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+const manifest = JSON.parse(readFileSync(manifestPath, "utf8").replace(/^\uFEFF/, ""));
 
 if (manifest.version !== version) {
   manifest.version = version;
