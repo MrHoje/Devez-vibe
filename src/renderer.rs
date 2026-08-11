@@ -1601,6 +1601,15 @@ impl Renderer {
         }
     }
 
+    /// An animation may repaint every other row while a drag keeps this row
+    /// still. Panel selections use a different row grid and survive their
+    /// ordinary full-frame paint path unchanged.
+    fn animation_row_is_selected(&self, row: usize) -> bool {
+        !self.selection_in_panel && self.selection.range().is_some_and(|range| {
+            usize::from(range.start.row) <= row && row <= usize::from(range.end.row)
+        })
+    }
+
     /// True when the column belongs to the docked panel rather than the
     /// transcript. The gap between them counts as the panel's, so a drag that
     /// starts a hair left of the border still reads as a panel drag.
@@ -2006,7 +2015,6 @@ impl Renderer {
             || self.last_width == 0
             || self.previous_lines.is_empty()
             || self.painted_frame.is_none()
-            || self.selection.range().is_some()
         {
             return Ok(false);
         }
@@ -2081,6 +2089,10 @@ impl Renderer {
             })
         {
             return Ok(false);
+        }
+        updates.retain(|(row, _)| !self.animation_row_is_selected(*row));
+        if updates.is_empty() {
+            return Ok(true);
         }
         self.paint_animation_rows(&updates)?;
         for (row, line) in updates {
@@ -6436,8 +6448,9 @@ fn fixed_plan_summary_lines(
         .unwrap_or_else(|| plan_effort_tone(summary.steps.len()));
     let all_completed = !summary.steps.is_empty() && completed == summary.steps.len();
     let completion_displayed = all_completed && !plan_active;
+    let displayed_completed = completed.saturating_sub(usize::from(all_completed && plan_active));
     let title = if all_completed && plan_active {
-        format!("작업 단계 · {completed} / {} 응답 정리 중", summary.steps.len())
+        format!("작업 단계 · {displayed_completed} / {} 진행 중", summary.steps.len())
     } else {
         format!("작업 단계 · {completed} / {} 완료", summary.steps.len())
     };
@@ -6673,8 +6686,9 @@ fn side_panel_plan_lines(
         .count();
     let all_completed = !summary.steps.is_empty() && completed == summary.steps.len();
     let completion_displayed = all_completed && !plan_active;
+    let displayed_completed = completed.saturating_sub(usize::from(all_completed && plan_active));
     let mut title = if all_completed && plan_active {
-        format!("작업 단계  {completed} / {} 응답 정리 중", summary.steps.len())
+        format!("작업 단계  {displayed_completed} / {} 진행 중", summary.steps.len())
     } else {
         format!("작업 단계  {completed} / {} 완료", summary.steps.len())
     };
@@ -14623,6 +14637,26 @@ mod tests {
     }
 
     #[test]
+    fn plan_animation_holds_only_the_dragged_rows() {
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = vec![PaintLine::plain("selected"), PaintLine::plain("animated")];
+        assert!(renderer.begin_selection(0, 0));
+        assert!(renderer.update_selection(2, 0));
+
+        assert!(renderer.animation_row_is_selected(0));
+        assert!(!renderer.animation_row_is_selected(1));
+        let mut updates = vec![(0, PaintLine::plain("held")), (1, PaintLine::plain("moving"))];
+        updates.retain(|(row, _)| !renderer.animation_row_is_selected(*row));
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, 1);
+        assert_eq!(updates[0].1.text, "moving");
+        assert_eq!(
+            renderer.finish_selection(2, 0),
+            SelectionResult::Copy("sel".to_owned())
+        );
+    }
+
+    #[test]
     fn rewrapping_preserves_expanded_bash_output() {
         let block = Block::new(BlockKind::Tool, "Shell · first", "one\ntwo");
         let id = block.id();
@@ -17043,14 +17077,14 @@ mod tests {
             ..summary
         };
         let waiting = side_panel_plan_lines(&finished, layout.content_width(), 0.0, true);
-        assert_eq!(painted(&waiting[0]), "▲ 작업 단계  3 / 3 응답 정리 중");
+        assert_eq!(painted(&waiting[0]), "▲ 작업 단계  2 / 3 진행 중");
         assert_ne!(waiting[4].prefix, "✔ ");
         assert_eq!(waiting[4].prefix_tone, Tone::Accent);
         assert_eq!(waiting[4].tone, Tone::Accent);
         assert!(waiting.iter().all(|line| !painted(line).contains('⏱')));
 
         let waiting_card = fixed_plan_summary_lines(&finished, 80, 0.0, true, None, None);
-        assert!(painted(&waiting_card[0]).contains("작업 단계 · 3 / 3 응답 정리 중"));
+        assert!(painted(&waiting_card[0]).contains("작업 단계 · 2 / 3 진행 중"));
         assert_ne!(waiting_card[4].prefix, "  ✔  ");
         assert_eq!(waiting_card[4].prefix_tone, Tone::Accent);
         assert_eq!(waiting_card[4].tone, Tone::Accent);

@@ -3325,6 +3325,9 @@ pub struct AppState {
     transient_status: Option<String>,
     show_welcome: bool,
     plan_summary: Option<PlanSummary>,
+    /// The turn that published the visible plan. A later turn must not revive
+    /// its completed final step while it is still waiting for its own plan.
+    plan_turn_id: Option<String>,
     plan_shimmer_started_at: Option<Instant>,
     subagents: Vec<RunningSubagent>,
     /// Recorded subagent work, keyed by the parent tool-use id. Kept for the rest
@@ -3551,6 +3554,7 @@ impl AppState {
             transient_status: None,
             show_welcome: true,
             plan_summary: None,
+            plan_turn_id: None,
             plan_shimmer_started_at: None,
             subagents: Vec::new(),
             subagent_logs: HashMap::new(),
@@ -5135,11 +5139,13 @@ impl AppState {
             started_at: Instant::now(),
             elapsed: None,
         });
+        self.plan_turn_id = None;
     }
 
     pub fn set_turn_started(&mut self, turn_id: String) {
         if self.turn_id.as_deref() != Some(turn_id.as_str()) {
             self.reset_turn_item_tracking();
+            self.plan_turn_id = None;
         }
         self.turn_id = Some(turn_id);
         self.busy = true;
@@ -5510,6 +5516,10 @@ impl AppState {
         committed
     }
 
+    fn plan_is_active(&self) -> bool {
+        self.busy && self.turn_id.is_some() && self.plan_turn_id == self.turn_id
+    }
+
     pub fn view(&self) -> View<'_> {
         let mut operation_signatures = self.seen_operation_signatures.clone();
         let live_blocks = self
@@ -5543,7 +5553,7 @@ impl AppState {
             live_blocks,
             overlay: self.overlay_view(),
             plan_summary: self.plan_summary.as_ref(),
-            plan_active: self.busy,
+            plan_active: self.plan_is_active(),
             plan_shimmer_phase: self.plan_shimmer_phase(),
             plan_effort: self
                 .active_turn_effort
@@ -5706,7 +5716,7 @@ impl AppState {
                 && self.last_assistant_markdown.is_some(),
             activity_progress_phase: self.compaction_progress_phase(),
             plan_summary: self.plan_summary.as_ref(),
-            plan_active: self.busy,
+            plan_active: self.plan_is_active(),
             plan_shimmer_phase: self.plan_shimmer_phase(),
             plan_effort: self
                 .active_turn_effort
@@ -6805,6 +6815,7 @@ impl AppState {
                     started_at,
                     elapsed,
                 });
+                self.plan_turn_id = self.turn_id.clone();
                 self.plan_shimmer_started_at = Some(Instant::now());
                 self.commit_welcome_card();
             }
@@ -15092,6 +15103,32 @@ mod tests {
             elapsed
         );
         assert!(elapsed.is_some());
+    }
+
+    #[test]
+    fn completed_plan_does_not_reopen_when_the_next_turn_starts() {
+        let mut state = test_state();
+        state.set_turn_started("turn-one".to_owned());
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [{ "step": "done", "status": "completed" }] }),
+        );
+        assert!(state.view().plan_active);
+
+        state.handle_notification("turn/completed", &json!({}));
+        state.set_turn_started("turn-two".to_owned());
+
+        assert!(!state.view().plan_active);
+        assert_eq!(
+            state.plan_summary.as_ref().unwrap().steps[0].status,
+            PlanStepStatus::Completed
+        );
+
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [{ "step": "next", "status": "inProgress" }] }),
+        );
+        assert!(state.view().plan_active);
     }
 
     #[test]
