@@ -6779,7 +6779,6 @@ impl AppState {
                             previous
                                 .and_then(|previous| previous.elapsed)
                                 .or_else(|| started_at.map(|started| started.elapsed()))
-                                .or(Some(Duration::ZERO))
                         } else {
                             None
                         };
@@ -15107,6 +15106,18 @@ mod tests {
             elapsed
         );
         assert!(elapsed.is_some());
+    }
+
+    #[test]
+    fn completed_plan_step_without_an_observed_start_has_no_fake_zero_time() {
+        let mut state = test_state();
+
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [{ "step": "check", "status": "completed" }] }),
+        );
+
+        assert_eq!(state.plan_summary.as_ref().unwrap().steps[0].elapsed, None);
     }
 
     #[test]

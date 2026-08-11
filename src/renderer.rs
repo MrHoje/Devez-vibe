@@ -7014,7 +7014,10 @@ fn side_panel_integration_placeholder(text: &str, content_width: usize) -> Paint
 
 fn format_plan_elapsed(elapsed: Duration) -> String {
     let seconds = elapsed.as_secs();
-    format!("{}m {}s", seconds / 60, seconds % 60)
+    match seconds / 60 {
+        0 => format!("{seconds}s"),
+        minutes => format!("{minutes}m {}s", seconds % 60),
+    }
 }
 
 fn reasoning_lines(block: &Block, width: u16) -> Vec<PaintLine> {
@@ -17050,7 +17053,7 @@ mod tests {
         assert_eq!(content[3].prefix, "▸ ");
         assert_eq!(content[4].prefix, "  ");
         assert!(painted(&content[2]).starts_with("✔ 1. 첫 단계"));
-        assert!(painted(&content[2]).ends_with("(0m 18s)"));
+        assert!(painted(&content[2]).ends_with("(18s)"));
         assert!(painted(&content[3]).starts_with("▸ 2. 두 번째 단계"));
         assert!(content[5] == PaintLine::blank());
         assert_eq!(painted(&content[6]), "─".repeat(layout.content_width()));

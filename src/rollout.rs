@@ -581,11 +581,11 @@ fn with_plan_elapsed(
                 started_at.entry(step.text.clone()).or_insert(now);
             }
             ("completed", Some(now)) => {
-                let duration = started_at
-                    .remove(&step.text)
-                    .map(|started| now.saturating_sub(started))
-                    .unwrap_or(0);
-                elapsed.insert(step.text.clone(), duration);
+                if let Some(started) = started_at.remove(&step.text) {
+                    elapsed
+                        .entry(step.text.clone())
+                        .or_insert_with(|| now.saturating_sub(started));
+                }
             }
             _ => {}
         }
@@ -1070,6 +1070,21 @@ mod tests {
         assert_eq!(plan.explanation.as_deref(), Some("완료"));
         assert!(plan.steps.iter().all(|step| step.status == "completed"));
         assert_eq!(plan.steps[0].elapsed_ms, Some(405_000));
+    }
+
+    #[test]
+    fn later_plan_snapshots_keep_every_completed_step_elapsed() {
+        let rollout = parse(
+            r#"{"timestamp":"2026-08-11T09:00:00.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const r = await tools.update_plan({plan:[{step:\"1. 확인\",status:\"in_progress\"},{step:\"2. 수정\",status:\"pending\"},{step:\"3. 검증\",status:\"pending\"}]});"}}
+{"timestamp":"2026-08-11T09:00:10.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const r = await tools.update_plan({plan:[{step:\"1. 확인\",status:\"completed\"},{step:\"2. 수정\",status:\"in_progress\"},{step:\"3. 검증\",status:\"pending\"}]});"}}
+{"timestamp":"2026-08-11T09:00:54.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const r = await tools.update_plan({plan:[{step:\"1. 확인\",status:\"completed\"},{step:\"2. 수정\",status:\"completed\"},{step:\"3. 검증\",status:\"in_progress\"}]});"}}
+{"timestamp":"2026-08-11T09:01:06.000Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"const r = await tools.update_plan({plan:[{step:\"1. 확인\",status:\"completed\"},{step:\"2. 수정\",status:\"completed\"},{step:\"3. 검증\",status:\"completed\"}]});"}}"#,
+        );
+
+        let plan = rollout.last_plan.expect("plan snapshot");
+        assert_eq!(plan.steps[0].elapsed_ms, Some(10_000));
+        assert_eq!(plan.steps[1].elapsed_ms, Some(44_000));
+        assert_eq!(plan.steps[2].elapsed_ms, Some(12_000));
     }
 
     #[test]
