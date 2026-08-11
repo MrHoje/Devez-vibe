@@ -2029,7 +2029,12 @@ impl Renderer {
             let mut line = activity_rows.pop().expect("one activity row");
             if let Some(mode) = view.composer_mode.as_ref()
                 && let Some(with_controls) =
-                    activity_line_with_composer_controls(line.clone(), mode, self.last_width)
+                    activity_line_with_composer_controls(
+                        line.clone(),
+                        mode,
+                        None,
+                        self.last_width,
+                    )
             {
                 line = with_controls;
             }
@@ -3726,7 +3731,7 @@ fn activity_lines_with_progress(
             tail,
         }];
     }
-    if activity.starts_with("✨ Completed (") {
+    if activity.starts_with("✧ Completed (") {
         return vec![PaintLine {
             prefix: " ".to_owned(),
             prefix_tone: tone,
@@ -3876,18 +3881,35 @@ fn queue_preview_lines(prompts: &[String], width: u16) -> Vec<PaintLine> {
 fn activity_line_with_composer_controls(
     mut line: PaintLine,
     mode: &ComposerMode,
+    notice: Option<&str>,
     width: u16,
 ) -> Option<PaintLine> {
     // Match the status row below: its leading gutter and this trailing hover
     // cell leave the terminal's final column empty, so both controls share an
     // edge without clipping Fast's right-hand hit area.
     let right_edge = (width as usize).saturating_sub(3);
+    if let Some(notice) = notice {
+        let available = right_edge.saturating_sub(painted_line_width(&line));
+        let notice = compact_right(notice, available);
+        if notice.is_empty() {
+            return None;
+        }
+        line.tail.push(rule_gap(
+            available.saturating_sub(UnicodeWidthStr::width(notice.as_str())),
+        ));
+        line.tail.push(PaintSpan {
+            text: notice,
+            tone: Tone::Accent,
+            bold: false,
+        });
+        line.tail.push(rule_gap(1));
+        return Some(line);
+    }
     let available = right_edge
         .saturating_sub(painted_line_width(&line))
         .saturating_sub(COMPOSER_MODE_GAP);
     let badge = fitting_badge_spans(mode, available)?;
     let gap = right_edge - painted_line_width(&line) - spans_width(&badge.spans);
-
     let badge_start = line.tail.len() + 2;
     let mut picks = Vec::new();
     picks.extend(
@@ -4248,6 +4270,13 @@ fn normal_frame_with_expansion(
 
     let mut dock_index = lines.len();
     let composer_mode = status.composer_mode.as_ref();
+    let activity_copy_notice = status
+        .composer_notice
+        .as_deref()
+        .filter(|notice| *notice == COPY_NOTICE);
+    let composer_notice = (activity.is_none() || activity_copy_notice.is_none())
+        .then_some(status.composer_notice.as_deref())
+        .flatten();
     let mut composer_controls_mode = composer_mode;
     let activity_uses_composer_spacer = activity.is_some() && suggestions.is_empty();
     let idle_controls_can_use_composer_spacer =
@@ -4268,7 +4297,12 @@ fn normal_frame_with_expansion(
         );
         if let Some(mode) = composer_controls_mode
             && let Some(row) =
-                activity_line_with_composer_controls(activity_rows[0].clone(), mode, width)
+                activity_line_with_composer_controls(
+                    activity_rows[0].clone(),
+                    mode,
+                    activity_copy_notice,
+                    width,
+                )
         {
             activity_rows[0] = row;
             // The active row now carries the controls, so the composer rule
@@ -4296,7 +4330,8 @@ fn normal_frame_with_expansion(
     if !activity_uses_composer_spacer {
         if idle_controls_can_use_composer_spacer
             && let Some(mode) = composer_controls_mode
-            && let Some(row) = activity_line_with_composer_controls(PaintLine::blank(), mode, width)
+            && let Some(row) =
+                activity_line_with_composer_controls(PaintLine::blank(), mode, None, width)
         {
             lines.push(row);
             composer_controls_mode = None;
@@ -4319,7 +4354,7 @@ fn normal_frame_with_expansion(
             width,
             &recalled,
             composer_placeholder,
-            status.composer_notice.as_deref(),
+            composer_notice,
             composer_mode,
             composer_controls_mode,
         );
@@ -6444,8 +6479,18 @@ fn fixed_plan_summary_lines(
     }
     let mut lines = Vec::new();
     let steps = summary.steps.iter().collect::<Vec<_>>();
-    for step in steps {
+    let last_step_index = steps.len().saturating_sub(1);
+    for (index, step) in steps.into_iter().enumerate() {
+        let response_cleanup_step = plan_active && all_completed && index == last_step_index;
         let (prefix, bold) = match step.status {
+            PlanStepStatus::Completed if response_cleanup_step => (
+                format!(
+                    "  {}  ",
+                    WORKING_SPINNER
+                        [(phase.clamp(0.0, 0.999) * WORKING_SPINNER.len() as f32) as usize]
+                ),
+                true,
+            ),
             PlanStepStatus::Completed => ("  ✔  ".to_owned(), false),
             PlanStepStatus::InProgress if plan_active => (
                 format!(
@@ -6467,8 +6512,8 @@ fn fixed_plan_summary_lines(
             .saturating_sub(UnicodeWidthStr::width(prefix.as_str()))
             .saturating_sub(time_width);
         let task_text = compact_right(&step.text, task_width);
-        let is_completed = step.status == PlanStepStatus::Completed;
-        let in_progress = step.status == PlanStepStatus::InProgress;
+        let is_completed = step.status == PlanStepStatus::Completed && !response_cleanup_step;
+        let in_progress = step.status == PlanStepStatus::InProgress || response_cleanup_step;
         lines.push(PaintLine {
             prefix,
             prefix_tone: if is_completed {
@@ -6649,17 +6694,27 @@ fn side_panel_plan_lines(
         ];
     }
     let mut lines = vec![heading, PaintLine::blank()];
-    for step in &summary.steps {
+    let last_step_index = summary.steps.len().saturating_sub(1);
+    for (index, step) in summary.steps.iter().enumerate() {
         let elapsed_text = step.elapsed.map(format_plan_elapsed);
         let elapsed = elapsed_text.as_deref();
         let time_width = elapsed
             .map(|time| UnicodeWidthStr::width(time) + 3)
             .unwrap_or_default();
-        let is_completed = step.status == PlanStepStatus::Completed;
-        let in_progress = step.status == PlanStepStatus::InProgress;
+        let response_cleanup_step = plan_active && all_completed && index == last_step_index;
+        let is_completed = step.status == PlanStepStatus::Completed && !response_cleanup_step;
+        let in_progress = step.status == PlanStepStatus::InProgress || response_cleanup_step;
         // The status mark keeps its own gutter so every step's text starts on the
         // same column, whether or not the step carries a mark.
         let (mark, bold) = match step.status {
+            PlanStepStatus::Completed if response_cleanup_step => (
+                format!(
+                    "{} ",
+                    WORKING_SPINNER
+                        [(phase.clamp(0.0, 0.999) * WORKING_SPINNER.len() as f32) as usize]
+                ),
+                true,
+            ),
             PlanStepStatus::Completed => ("✔ ".to_owned(), false),
             PlanStepStatus::InProgress if plan_active => (
                 format!(
@@ -8793,6 +8848,8 @@ const COMPOSER_MODE_GAP: usize = 2;
 const COMPOSER_MODE_TAIL_RULE: usize = 2;
 /// Blank columns between the bottom rule and a transient notice.
 const COMPOSER_NOTICE_GAP: usize = 2;
+/// Copy confirmation replaces the activity row's right-hand status controls.
+const COPY_NOTICE: &str = "• Copied to clipboard";
 /// Rule segment trailing a transient notice at the right edge.
 const COMPOSER_NOTICE_TAIL_RULE: usize = 2;
 /// Separator between the permission mode and the fast-tier flag.
@@ -12836,7 +12893,7 @@ mod tests {
             &editor,
             None,
             &[],
-            Some("✨ Completed (1m 36s)"),
+            Some("✧ Completed (1m 36s)"),
             StatusArea {
                 fallback: String::new(),
                 line: None,
@@ -12917,7 +12974,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_notice_keeps_the_left_hand_activity() {
+    fn copy_notice_replaces_only_the_right_hand_controls() {
         let editor = Editor::default();
         let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
         mode.branch = Some("feature/copy-notice".to_owned());
@@ -12941,13 +12998,15 @@ mod tests {
             .iter()
             .find(|line| painted_line_text(line).contains("Working.. (2s)"))
             .expect("activity row");
-        assert!(painted(notice).contains("feature/copy-notice"));
-        assert!(painted(notice).contains("Vibe: On"));
-        assert!(painted(notice).contains("Fast: On"));
-        assert!(frame
+        assert!(painted(notice).contains("• Copied to clipboard"));
+        assert!(!painted(notice).contains("feature/copy-notice"));
+        assert!(!painted(notice).contains("Vibe: On"));
+        assert!(!painted(notice).contains("Fast: On"));
+        assert!(!frame
             .lines
             .iter()
-            .any(|line| painted_line_text(line).contains("• Copied to clipboard")));
+            .filter(|line| painted_line_text(line).contains("• Copied to clipboard"))
+            .any(|line| line != notice));
     }
 
     #[test]
@@ -12978,7 +13037,7 @@ mod tests {
 
     #[test]
     fn completed_activity_label_is_static() {
-        let line = activity_lines("✨ Completed (2m 12s)", Some("gpt-5.6-terra"), 0.5, 80)
+        let line = activity_lines("✧ Completed (2m 12s)", Some("gpt-5.6-terra"), 0.5, 80)
             .pop()
             .expect("completion row");
 
@@ -16489,6 +16548,7 @@ mod tests {
         let line = activity_line_with_composer_controls(
             PaintLine::blank(),
             &test_mode("Full Access", ModeAccent::Danger, false),
+            None,
             120,
         )
         .expect("activity row has controls");
@@ -16511,7 +16571,7 @@ mod tests {
         let mut crowded = PaintLine::blank();
         crowded.text = "x".repeat(110);
 
-        assert!(activity_line_with_composer_controls(crowded, &mode, 120).is_none());
+        assert!(activity_line_with_composer_controls(crowded, &mode, None, 120).is_none());
 
         let rule = input_top_line(120, "", Some(&mode));
         assert_eq!(pick_on(&rule, "Vibe: On"), Some(Pick::VibeMode));
@@ -16984,16 +17044,23 @@ mod tests {
         };
         let waiting = side_panel_plan_lines(&finished, layout.content_width(), 0.0, true);
         assert_eq!(painted(&waiting[0]), "▲ 작업 단계  3 / 3 응답 정리 중");
+        assert_ne!(waiting[4].prefix, "✔ ");
+        assert_eq!(waiting[4].prefix_tone, Tone::Accent);
+        assert_eq!(waiting[4].tone, Tone::Accent);
         assert!(waiting.iter().all(|line| !painted(line).contains('⏱')));
 
         let waiting_card = fixed_plan_summary_lines(&finished, 80, 0.0, true, None, None);
         assert!(painted(&waiting_card[0]).contains("작업 단계 · 3 / 3 응답 정리 중"));
+        assert_ne!(waiting_card[4].prefix, "  ✔  ");
+        assert_eq!(waiting_card[4].prefix_tone, Tone::Accent);
+        assert_eq!(waiting_card[4].tone, Tone::Accent);
         assert!(waiting_card
             .iter()
             .all(|line| !painted(line).contains('⏱')));
 
         let done = side_panel_plan_lines(&finished, layout.content_width(), 0.0, false);
         assert_eq!(painted(&done[0]), "▲ 작업 단계  3 / 3 완료  [⏱  1m 25s]");
+        assert_eq!(done[4].prefix, "✔ ");
     }
 
     #[test]

@@ -9990,7 +9990,7 @@ impl AppState {
             return Some("X Interrupted".to_owned());
         }
         self.last_completed_duration
-            .map(|duration| format!("✨ Completed ({})", format_elapsed(duration.as_secs())))
+            .map(|duration| format!("✧ Completed ({})", format_elapsed(duration.as_secs())))
     }
 
     /// `/compact` was accepted by the runtime: run the activity spinner until the
@@ -16652,7 +16652,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(state.activity().as_deref(), Some("✨ Completed (1m 5s)"));
+        assert_eq!(state.activity().as_deref(), Some("✧ Completed (1m 5s)"));
     }
 
     /// `/compact` has no assistant output of its own, so the activity row is the
@@ -16860,7 +16860,7 @@ mod tests {
 
         state.select_model_and_effort("gpt-5.6-sol", Some("medium"));
         state.handle_notification("turn/completed", &json!({}));
-        assert_eq!(state.activity().as_deref(), Some("✨ Completed (10s)"));
+        assert_eq!(state.activity().as_deref(), Some("✧ Completed (10s)"));
     }
 
     #[test]
@@ -16936,7 +16936,7 @@ mod tests {
         assert!(
             state
                 .activity()
-                .is_some_and(|activity| activity.starts_with("✨ Completed"))
+                .is_some_and(|activity| activity.starts_with("✧ Completed"))
         );
         // A stale answer about a turn that is no longer the live one changes nothing.
         state.set_turn_started("turn-2".to_owned());
