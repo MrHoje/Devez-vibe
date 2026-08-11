@@ -2041,15 +2041,13 @@ impl Renderer {
                 return Ok(false);
             }
             let mut line = activity_rows.pop().expect("one activity row");
-            let copy_notice = view
-                .composer_notice
-                .filter(|notice| *notice == COPY_NOTICE);
+            let composer_notice = view.composer_notice;
             if let Some(mode) = view.composer_mode.as_ref()
                 && let Some(with_controls) =
                     activity_line_with_composer_controls(
                         line.clone(),
                         mode,
-                        copy_notice,
+                        composer_notice,
                         self.last_width,
                     )
             {
@@ -4291,13 +4289,9 @@ fn normal_frame_with_expansion(
 
     let mut dock_index = lines.len();
     let composer_mode = status.composer_mode.as_ref();
-    let activity_copy_notice = status
-        .composer_notice
-        .as_deref()
-        .filter(|notice| *notice == COPY_NOTICE);
-    let composer_notice = (activity.is_none() || activity_copy_notice.is_none())
-        .then_some(status.composer_notice.as_deref())
-        .flatten();
+    // During a response, every transient notice uses the same right-hand slot.
+    let activity_composer_notice = status.composer_notice.as_deref();
+    let mut composer_notice = status.composer_notice.as_deref();
     let mut composer_controls_mode = composer_mode;
     let activity_uses_composer_spacer = activity.is_some() && suggestions.is_empty();
     let idle_controls_can_use_composer_spacer =
@@ -4321,11 +4315,14 @@ fn normal_frame_with_expansion(
                 activity_line_with_composer_controls(
                     activity_rows[0].clone(),
                     mode,
-                    activity_copy_notice,
+                    activity_composer_notice,
                     width,
                 )
         {
             activity_rows[0] = row;
+            if activity_composer_notice.is_some() {
+                composer_notice = None;
+            }
             // The active row now carries the controls, so the composer rule
             // leaves them alone rather than painting a second copy.
             composer_controls_mode = None;
@@ -8874,8 +8871,6 @@ const COMPOSER_MODE_GAP: usize = 2;
 const COMPOSER_MODE_TAIL_RULE: usize = 2;
 /// Blank columns between the bottom rule and a transient notice.
 const COMPOSER_NOTICE_GAP: usize = 2;
-/// Copy confirmation replaces the activity row's right-hand status controls.
-const COPY_NOTICE: &str = "• Copied to clipboard";
 /// Rule segment trailing a transient notice at the right edge.
 const COMPOSER_NOTICE_TAIL_RULE: usize = 2;
 /// Separator between the permission mode and the fast-tier flag.
@@ -13033,6 +13028,37 @@ mod tests {
             .iter()
             .filter(|line| painted_line_text(line).contains("• Copied to clipboard"))
             .any(|line| line != notice));
+    }
+
+    #[test]
+    fn next_request_notice_uses_the_copy_notice_location_while_working() {
+        let editor = Editor::default();
+        let mode = test_mode("Full Access", ModeAccent::Danger, true);
+        let frame = normal_frame(
+            &[],
+            &editor,
+            None,
+            &[],
+            Some("Working.. (2s)"),
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: Some("Applies to the next request".to_owned()),
+                composer_mode: Some(mode),
+            },
+            120,
+        );
+
+        let activity = frame
+            .lines
+            .iter()
+            .find(|line| painted_line_text(line).contains("Working.. (2s)"))
+            .expect("activity row");
+        assert!(painted(activity).contains("Applies to the next request"));
+        assert!(frame.lines.iter().all(|line| {
+            !painted(line).starts_with('╰')
+                || !painted(line).contains("Applies to the next request")
+        }));
     }
 
     #[test]
