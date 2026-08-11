@@ -878,6 +878,9 @@ const SIDE_PANEL_MIN_MAIN_WIDTH: usize = 44;
 const SIDE_PANEL_DIVIDER_BLEND: u8 = 48;
 /// A quiet neutral lift that remains visible on the panel's secondary surface.
 const SIDE_PANEL_HOVER_BLEND: u8 = 24;
+/// A stronger lift makes the floating transcript control visibly interactive.
+const SCROLL_TO_BOTTOM_HOVER_BLEND: u8 = 48;
+const COPY_NOTICE: &str = "• Copied to clipboard";
 
 fn devez_layout_signal(main_width: u16) -> String {
     format!("\x1b]777;devez-layout-v1;{main_width}\x07")
@@ -932,6 +935,19 @@ fn side_panel_background_style() -> CellStyle {
 fn side_panel_hover_background() -> Rgb {
     let palette = theme::palette();
     blend(palette.hover_bg, palette.foreground, SIDE_PANEL_HOVER_BLEND)
+}
+
+fn scroll_to_bottom_background(hovered: bool) -> Rgb {
+    let palette = theme::palette();
+    if hovered {
+        blend(
+            palette.hover_bg,
+            palette.foreground,
+            SCROLL_TO_BOTTOM_HOVER_BLEND,
+        )
+    } else {
+        palette.hover_bg
+    }
 }
 
 /// Paints one already-laid-out row of panel content at the panel's own left
@@ -2472,7 +2488,8 @@ impl Renderer {
             );
         }
         if let Some((row, control)) = scroll_to_bottom_overlay {
-            paint_scroll_to_bottom_into_frame(&mut frame, row, control);
+            let hovered = self.hovered_pick.as_ref() == Some(&Pick::ScrollToBottom);
+            paint_scroll_to_bottom_into_frame(&mut frame, row, control, hovered);
         }
         if let Some(fade) = stream_fade {
             fade_stream_tail_into_frame(&mut frame, fade);
@@ -3262,6 +3279,7 @@ enum Tone {
     Warning,
     Error,
     Code,
+    Orange,
     EffortLow,
     EffortMedium,
     EffortHigh,
@@ -3641,7 +3659,11 @@ fn activity_lines_with_progress(
     progress_phase: f32,
     width: u16,
 ) -> Vec<PaintLine> {
-    let tone = activity_model.and_then(model_tone).unwrap_or(Tone::Plain);
+    let tone = if activity == COPY_NOTICE {
+        Tone::Orange
+    } else {
+        activity_model.and_then(model_tone).unwrap_or(Tone::Plain)
+    };
     if UnicodeWidthStr::width(activity) > width.saturating_sub(2) as usize {
         return wrapped_line(" ", tone, activity, tone, false, width);
     }
@@ -3661,7 +3683,14 @@ fn activity_lines_with_progress(
             tone,
             bold: false,
         }];
-        tail.extend(shimmer_spans(label, phase, shimmer_base));
+        // Working keeps its elapsed reading in the same sweep, so the active
+        // state does not visually stop before the time at the right.
+        let shimmer_text = if label == COMPACTING_LABEL {
+            label.to_owned()
+        } else {
+            format!("{label}{trailer}")
+        };
+        tail.extend(shimmer_spans(&shimmer_text, phase, shimmer_base));
         if label == COMPACTING_LABEL {
             let spent = 1
                 + WORKING_SPINNER_COLUMNS
@@ -3679,12 +3708,6 @@ fn activity_lines_with_progress(
                 });
                 tail.extend(progress_bar_spans(progress_phase, track, tone));
             }
-            tail.push(PaintSpan {
-                text: trailer.to_owned(),
-                tone,
-                bold: false,
-            });
-        } else {
             tail.push(PaintSpan {
                 text: trailer.to_owned(),
                 tone,
@@ -3897,6 +3920,33 @@ fn activity_line_with_composer_controls(
     Some(line.with_picks(&picks))
 }
 
+/// The copy acknowledgement occupies the persistent control slot while it is
+/// visible. This keeps the activity row in place without showing stale branch,
+/// Fast, or permission state beside it.
+fn activity_copy_notice_line(notice: &str, width: u16) -> PaintLine {
+    let right_edge = (width as usize).saturating_sub(3);
+    let notice = compact_right(notice, right_edge);
+    let gap = right_edge.saturating_sub(UnicodeWidthStr::width(notice.as_str()));
+    PaintLine {
+        prefix: String::new(),
+        prefix_tone: Tone::Plain,
+        text: String::new(),
+        tone: Tone::Plain,
+        bold: false,
+        tool_heading: None,
+        pick: None,
+        tail: vec![
+            rule_gap(gap),
+            PaintSpan {
+                text: notice,
+                tone: Tone::Orange,
+                bold: false,
+            },
+            rule_gap(1),
+        ],
+    }
+}
+
 fn painted_line_text(line: &PaintLine) -> String {
     std::iter::once(line.prefix.as_str())
         .chain(std::iter::once(line.text.as_str()))
@@ -4022,8 +4072,11 @@ fn selectable_content_columns(line: &PaintLine) -> Option<Range<usize>> {
     match columns {
         Some(columns) => {
             let start = columns.start.max(content.start);
-            let end = columns.end.min(content.end);
-            (start < end).then_some(start..end)
+            // `Some(start..start)` means this row deliberately has no selectable
+            // cells.  Keep that distinction from `None`: a blank response row
+            // still owns its continuation gutter, but that gutter is chrome.
+            let end = columns.end.min(content.end).max(start);
+            Some(start..end)
         }
         // A bubble row with no gutter of its own is still narrower than the band
         // it is painted on, so the padding has to be trimmed off here too.
@@ -4239,7 +4292,13 @@ fn normal_frame_with_expansion(
             activity_progress_phase,
             width,
         );
-        if let Some(mode) = composer_controls_mode
+        if activity == COPY_NOTICE {
+            // Copy confirmation already takes over the current activity, such as
+            // Working. Give it the same right-hand slot as the composer controls
+            // and leave those controls hidden until the notice expires.
+            activity_rows[0] = activity_copy_notice_line(activity, width);
+            composer_controls_mode = None;
+        } else if let Some(mode) = composer_controls_mode
             && let Some(row) =
                 activity_line_with_composer_controls(activity_rows[0].clone(), mode, width)
         {
@@ -6369,7 +6428,13 @@ fn fixed_plan_summary_lines(
         .filter(|step| step.status == PlanStepStatus::Completed)
         .count();
     let effort_tone = plan_effort_tone(summary.steps.len());
-    let title = format!("작업 단계 · {completed} / {} 완료", summary.steps.len());
+    let all_completed = !summary.steps.is_empty() && completed == summary.steps.len();
+    let completion_displayed = all_completed && !plan_active;
+    let title = if all_completed && plan_active {
+        format!("작업 단계 · {completed} / {} 응답 정리 중", summary.steps.len())
+    } else {
+        format!("작업 단계 · {completed} / {} 완료", summary.steps.len())
+    };
     if !summary.expanded {
         let tail = format!("{PLAN_TOGGLE_HINT}▼ ──");
         let rule = "─".repeat(line_width.saturating_sub(
@@ -6464,7 +6529,6 @@ fn fixed_plan_summary_lines(
                 .unwrap_or_default(),
         });
     }
-    let all_completed = !summary.steps.is_empty() && completed == summary.steps.len();
     let header_tail = format!("{PLAN_TOGGLE_HINT}▲ ─┐");
     let header_rule = "─".repeat(line_width.saturating_sub(
         5 + UnicodeWidthStr::width(title.as_str()) + UnicodeWidthStr::width(header_tail.as_str()),
@@ -6514,7 +6578,7 @@ fn fixed_plan_summary_lines(
     let header = header.with_picks(&[(4, Pick::PlanSummary), (5, Pick::PlanSummary)]);
     lines.insert(0, header);
     lines.insert(1, PaintLine::blank());
-    if all_completed {
+    if completion_displayed {
         let elapsed = summary.steps.iter().filter_map(|step| step.elapsed).sum();
         let total = format!("⏱  {}", format_plan_elapsed(elapsed));
         lines.push(PaintLine::plain(format!(
@@ -6591,11 +6655,16 @@ fn side_panel_plan_lines(
         .iter()
         .filter(|step| step.status == PlanStepStatus::Completed)
         .count();
-    let mut title = format!("작업 단계  {completed} / {} 완료", summary.steps.len());
+    let all_completed = !summary.steps.is_empty() && completed == summary.steps.len();
+    let completion_displayed = all_completed && !plan_active;
+    let mut title = if all_completed && plan_active {
+        format!("작업 단계  {completed} / {} 응답 정리 중", summary.steps.len())
+    } else {
+        format!("작업 단계  {completed} / {} 완료", summary.steps.len())
+    };
     // The card prints its own total once every step is done. The panel has no
     // room for a line of its own, so the same total rides on the heading.
-    let all_completed = !summary.steps.is_empty() && completed == summary.steps.len();
-    if all_completed {
+    if completion_displayed {
         let elapsed: Duration = summary.steps.iter().filter_map(|step| step.elapsed).sum();
         title.push_str(&format!("  [⏱  {}]", format_plan_elapsed(elapsed)));
     }
@@ -9215,37 +9284,23 @@ fn print_line(out: &mut impl Write, line: &PaintLine) -> Result<()> {
     print_line_with_selection(out, line, None, None)
 }
 
-/// Paints over a transcript row after it was drawn, preserving the surrounding
-/// text while the control occupies only its own centred button cells.
-#[allow(dead_code)]
-fn paint_scroll_to_bottom_overlay(
-    out: &mut impl Write,
+fn paint_scroll_to_bottom_into_frame(
+    frame: &mut CellFrame,
     row: usize,
     control: &PaintLine,
-) -> Result<()> {
-    let background = word_background(control.tone).expect("scroll control background");
-    let foreground = tone_rgb(control.tone).expect("scroll control foreground");
-    queue!(
-        out,
-        MoveTo(
-            UnicodeWidthStr::width(control.prefix.as_str()).min(u16::MAX as usize) as u16,
-            row.min(u16::MAX as usize) as u16
-        ),
-        SetBackgroundColor(rgb_color(background)),
-        SetForegroundColor(rgb_color(foreground)),
-        Print(&control.text),
-        ResetColor
-    )?;
-    Ok(())
-}
-
-fn paint_scroll_to_bottom_into_frame(frame: &mut CellFrame, row: usize, control: &PaintLine) {
+    hovered: bool,
+) {
     let start = UnicodeWidthStr::width(control.prefix.as_str());
     frame.write(
         start,
         row,
         &control.text,
-        cell_style(control.tone, false, word_background(control.tone), false),
+        cell_style(
+            control.tone,
+            false,
+            Some(scroll_to_bottom_background(hovered)),
+            false,
+        ),
     );
 }
 
@@ -9434,7 +9489,6 @@ fn word_background(tone: Tone) -> Option<Rgb> {
         Tone::AssistantBubble | Tone::AssistantBubbleHalf => assistant_bubble_background(),
         Tone::DiffAddedWord => palette.diff_add_word_bg,
         Tone::DiffRemovedWord => palette.diff_remove_word_bg,
-        Tone::ScrollToBottom => palette.hover_bg,
         // The status-line model reading stays flat at rest; only the hover pass
         // paints a band behind it.
         _ => return None,
@@ -9757,6 +9811,7 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::Warning => palette.warning,
         Tone::Error => palette.error,
         Tone::Code => palette.code,
+        Tone::Orange => palette.orange,
         Tone::EffortLow => palette.status.effort_low,
         Tone::EffortMedium => palette.status.effort_medium,
         Tone::EffortHigh => palette.status.effort_high,
@@ -11233,6 +11288,31 @@ mod tests {
             renderer.finish_selection(7, 2),
             SelectionResult::Copy("first\nsecond".to_owned())
         );
+    }
+
+    #[test]
+    fn fullscreen_selection_excludes_an_empty_response_row_gutter() {
+        let lines = block_lines(
+            &Block::new(BlockKind::Assistant, "Codex", "first\n\nsecond"),
+            80,
+        );
+        let (row, blank) = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.prefix == "  " && line.text.is_empty())
+            .expect("blank response row");
+        let range = CellRange {
+            start: CellPosition {
+                column: 0,
+                row: row as u16,
+            },
+            end: CellPosition {
+                column: painted_line_width(blank).saturating_sub(1) as u16,
+                row: row as u16,
+            },
+        };
+
+        assert_eq!(selection_columns_for_line(blank, range, row), None);
     }
 
     #[test]
@@ -12867,6 +12947,40 @@ mod tests {
     }
 
     #[test]
+    fn copy_notice_replaces_the_right_hand_composer_controls() {
+        let editor = Editor::default();
+        let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
+        mode.branch = Some("feature/copy-notice".to_owned());
+        let frame = normal_frame(
+            &[],
+            &editor,
+            None,
+            &[],
+            Some(COPY_NOTICE),
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: Some(mode),
+            },
+            120,
+        );
+
+        let notice = frame
+            .lines
+            .iter()
+            .find(|line| painted_line_text(line).contains(COPY_NOTICE))
+            .expect("copy notice row");
+        assert_eq!(painted_line_width(notice), 118);
+        assert!(painted(notice).ends_with("• Copied to clipboard "));
+        assert_eq!(notice.tail[1].tone, Tone::Orange);
+        assert!(!painted(notice).contains("feature/copy-notice"));
+        assert!(!painted(notice).contains("Vibe: On"));
+        assert!(!painted(notice).contains("Fast: On"));
+        assert!(notice.pick.is_none());
+    }
+
+    #[test]
     fn working_activity_uses_its_model_tone() {
         let line = activity_lines("Working.. (2m 12s)", Some("gpt-5.6-terra"), 0.5, 80)
             .pop()
@@ -12880,11 +12994,6 @@ mod tests {
             Some(Tone::ModelTerra)
         );
         assert_eq!(line.tone, Tone::ModelTerra);
-        assert!(
-            line.tail
-                .iter()
-                .any(|span| span.text == " (2m 12s)" && span.tone == Tone::ModelTerra)
-        );
         assert_eq!(
             line.tail
                 .iter()
@@ -12893,7 +13002,7 @@ mod tests {
                     _ => None,
                 })
                 .collect::<String>(),
-            "Working.."
+            "Working.. (2m 12s)"
         );
     }
 
@@ -12929,12 +13038,12 @@ mod tests {
     }
 
     #[test]
-    fn copy_notice_activity_uses_plain_text() {
+    fn copy_notice_activity_uses_orange_theme_text() {
         let line = activity_lines("• Copied to clipboard", None, 0.5, 80)
             .pop()
             .expect("copy notice row");
 
-        assert_eq!(line.tone, Tone::Plain);
+        assert_eq!(line.tone, Tone::Orange);
         assert_eq!(line.text, "• ");
     }
 
@@ -13931,10 +14040,7 @@ mod tests {
         assert_eq!(control.text, " Scroll to bottom (Ctrl+↓) ");
         assert_eq!(control.tone, Tone::ScrollToBottom);
         assert_eq!(tone_rgb(control.tone), Some(theme::palette().foreground));
-        assert_eq!(
-            word_background(control.tone),
-            Some(theme::palette().hover_bg)
-        );
+        assert_eq!(word_background(control.tone), None);
         assert_eq!(
             pick_on(&control, "Scroll to bottom"),
             Some(Pick::ScrollToBottom)
@@ -13947,6 +14053,20 @@ mod tests {
                         + UnicodeWidthStr::width(control.text.as_str())
             )
         );
+        let start = UnicodeWidthStr::width(control.prefix.as_str());
+        let mut frame = CellFrame::new(80, 1);
+        paint_scroll_to_bottom_into_frame(&mut frame, 0, &control, false);
+        assert_eq!(
+            frame.cell(start, 0).style.background,
+            Some(theme::palette().hover_bg)
+        );
+
+        paint_scroll_to_bottom_into_frame(&mut frame, 0, &control, true);
+        assert_eq!(
+            frame.cell(start, 0).style.background,
+            Some(scroll_to_bottom_background(true))
+        );
+        assert_ne!(scroll_to_bottom_background(true), theme::palette().hover_bg);
         assert_eq!(scroll_to_bottom_overlay_row(12, Some(7)), Some(16));
 
         renderer.scroll_to_bottom();
@@ -16892,6 +17012,16 @@ mod tests {
                 .collect(),
             ..summary
         };
+        let waiting = side_panel_plan_lines(&finished, layout.content_width(), 0.0, true);
+        assert_eq!(painted(&waiting[0]), "▲ 작업 단계  3 / 3 응답 정리 중");
+        assert!(waiting.iter().all(|line| !painted(line).contains('⏱')));
+
+        let waiting_card = fixed_plan_summary_lines(&finished, 80, 0.0, true, None);
+        assert!(painted(&waiting_card[0]).contains("작업 단계 · 3 / 3 응답 정리 중"));
+        assert!(waiting_card
+            .iter()
+            .all(|line| !painted(line).contains('⏱')));
+
         let done = side_panel_plan_lines(&finished, layout.content_width(), 0.0, false);
         assert_eq!(painted(&done[0]), "▲ 작업 단계  3 / 3 완료  [⏱  1m 25s]");
     }
