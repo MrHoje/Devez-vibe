@@ -431,6 +431,8 @@ pub struct View<'a> {
     pub plan_active: bool,
     /// A one-shot frame shimmer started by a plan creation or update.
     pub plan_shimmer_phase: Option<f32>,
+    /// The effort fixed when the active request started, used for plan shimmer.
+    pub plan_effort: Option<&'a str>,
     pub editor: &'a Editor,
     pub composer_images: &'a [String],
     pub queued_prompts: Vec<String>,
@@ -475,6 +477,7 @@ pub struct AnimationView<'a> {
     pub plan_summary: Option<&'a PlanSummary>,
     pub plan_active: bool,
     pub plan_shimmer_phase: Option<f32>,
+    pub plan_effort: Option<&'a str>,
     pub composer_mode: Option<ComposerMode>,
 }
 
@@ -880,7 +883,6 @@ const SIDE_PANEL_DIVIDER_BLEND: u8 = 48;
 const SIDE_PANEL_HOVER_BLEND: u8 = 24;
 /// A stronger lift makes the floating transcript control visibly interactive.
 const SCROLL_TO_BOTTOM_HOVER_BLEND: u8 = 48;
-const COPY_NOTICE: &str = "• Copied to clipboard";
 
 fn devez_layout_signal(main_width: u16) -> String {
     format!("\x1b]777;devez-layout-v1;{main_width}\x07")
@@ -1872,6 +1874,7 @@ impl Renderer {
                 view.activity_phase,
                 view.plan_active,
                 view.plan_shimmer_phase,
+                view.plan_effort,
                 view.waiting_for_response,
                 view.side_panel_prompts_expanded,
                 &view.side_panel_integrations,
@@ -2053,6 +2056,7 @@ impl Renderer {
                     view.activity_phase,
                     view.plan_active,
                     view.plan_shimmer_phase,
+                    view.plan_effort,
                 )
             })
             .unwrap_or_default();
@@ -2188,6 +2192,7 @@ impl Renderer {
         activity_phase: f32,
         plan_active: bool,
         plan_shimmer_phase: Option<f32>,
+        plan_effort: Option<&str>,
         waiting_for_response: bool,
         side_panel_prompts_expanded: bool,
         side_panel_integrations: &[ProviderIntegrationView],
@@ -2207,6 +2212,7 @@ impl Renderer {
                     activity_phase,
                     plan_active,
                     plan_shimmer_phase,
+                    plan_effort,
                 )
             })
             .unwrap_or_default();
@@ -3720,7 +3726,7 @@ fn activity_lines_with_progress(
             tail,
         }];
     }
-    if activity.starts_with("Completed (") {
+    if activity.starts_with("✨ Completed (") {
         return vec![PaintLine {
             prefix: " ".to_owned(),
             prefix_tone: tone,
@@ -3913,33 +3919,6 @@ fn activity_line_with_composer_controls(
     line.tail.extend(badge.spans);
     line.tail.push(rule_gap(1));
     Some(line.with_picks(&picks))
-}
-
-/// The copy acknowledgement occupies the persistent control slot while it is
-/// visible. This keeps the activity row in place without showing stale branch,
-/// Fast, or permission state beside it.
-fn activity_copy_notice_line(notice: &str, width: u16) -> PaintLine {
-    let right_edge = (width as usize).saturating_sub(3);
-    let notice = compact_right(notice, right_edge);
-    let gap = right_edge.saturating_sub(UnicodeWidthStr::width(notice.as_str()));
-    PaintLine {
-        prefix: String::new(),
-        prefix_tone: Tone::Plain,
-        text: String::new(),
-        tone: Tone::Plain,
-        bold: false,
-        tool_heading: None,
-        pick: None,
-        tail: vec![
-            rule_gap(gap),
-            PaintSpan {
-                text: notice,
-                tone: Tone::Accent,
-                bold: false,
-            },
-            rule_gap(1),
-        ],
-    }
 }
 
 fn painted_line_text(line: &PaintLine) -> String {
@@ -4287,13 +4266,7 @@ fn normal_frame_with_expansion(
             activity_progress_phase,
             width,
         );
-        if activity == COPY_NOTICE {
-            // Copy confirmation already takes over the current activity, such as
-            // Working. Give it the same right-hand slot as the composer controls
-            // and leave those controls hidden until the notice expires.
-            activity_rows[0] = activity_copy_notice_line(activity, width);
-            composer_controls_mode = None;
-        } else if let Some(mode) = composer_controls_mode
+        if let Some(mode) = composer_controls_mode
             && let Some(row) =
                 activity_line_with_composer_controls(activity_rows[0].clone(), mode, width)
         {
@@ -6415,6 +6388,7 @@ fn fixed_plan_summary_lines(
     phase: f32,
     plan_active: bool,
     plan_shimmer_phase: Option<f32>,
+    plan_effort: Option<&str>,
 ) -> Vec<PaintLine> {
     let line_width = panel_span(width);
     let completed = summary
@@ -6422,7 +6396,9 @@ fn fixed_plan_summary_lines(
         .iter()
         .filter(|step| step.status == PlanStepStatus::Completed)
         .count();
-    let effort_tone = plan_effort_tone(summary.steps.len());
+    let effort_tone = plan_effort
+        .and_then(effort_tone)
+        .unwrap_or_else(|| plan_effort_tone(summary.steps.len()));
     let all_completed = !summary.steps.is_empty() && completed == summary.steps.len();
     let completion_displayed = all_completed && !plan_active;
     let title = if all_completed && plan_active {
@@ -12860,7 +12836,7 @@ mod tests {
             &editor,
             None,
             &[],
-            Some("✓ Completed (1m 36s)"),
+            Some("✨ Completed (1m 36s)"),
             StatusArea {
                 fallback: String::new(),
                 line: None,
@@ -12941,7 +12917,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_notice_replaces_the_right_hand_composer_controls() {
+    fn copy_notice_keeps_the_left_hand_activity() {
         let editor = Editor::default();
         let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
         mode.branch = Some("feature/copy-notice".to_owned());
@@ -12950,11 +12926,11 @@ mod tests {
             &editor,
             None,
             &[],
-            Some(COPY_NOTICE),
+            Some("Working.. (2s)"),
             StatusArea {
                 fallback: String::new(),
                 line: None,
-                composer_notice: None,
+                composer_notice: Some("• Copied to clipboard".to_owned()),
                 composer_mode: Some(mode),
             },
             120,
@@ -12963,14 +12939,15 @@ mod tests {
         let notice = frame
             .lines
             .iter()
-            .find(|line| painted_line_text(line).contains(COPY_NOTICE))
-            .expect("copy notice row");
-        assert_eq!(painted_line_width(notice), 118);
-        assert!(painted(notice).ends_with("• Copied to clipboard "));
-        assert!(!painted(notice).contains("feature/copy-notice"));
-        assert!(!painted(notice).contains("Vibe: On"));
-        assert!(!painted(notice).contains("Fast: On"));
-        assert!(notice.pick.is_none());
+            .find(|line| painted_line_text(line).contains("Working.. (2s)"))
+            .expect("activity row");
+        assert!(painted(notice).contains("feature/copy-notice"));
+        assert!(painted(notice).contains("Vibe: On"));
+        assert!(painted(notice).contains("Fast: On"));
+        assert!(frame
+            .lines
+            .iter()
+            .any(|line| painted_line_text(line).contains("• Copied to clipboard")));
     }
 
     #[test]
@@ -13001,7 +12978,7 @@ mod tests {
 
     #[test]
     fn completed_activity_label_is_static() {
-        let line = activity_lines("Completed (2m 12s)", Some("gpt-5.6-terra"), 0.5, 80)
+        let line = activity_lines("✨ Completed (2m 12s)", Some("gpt-5.6-terra"), 0.5, 80)
             .pop()
             .expect("completion row");
 
@@ -16767,9 +16744,9 @@ mod tests {
     #[test]
     fn model_families_have_distinct_consistent_tones() {
         let tones = [
-            model_tone("GPT-5.6-Sol"),
-            model_tone("GPT-5.6-Terra"),
-            model_tone("GPT-5.6-Luna"),
+            model_tone("GPT-5.6 Sol"),
+            model_tone("GPT-5.6 Terra"),
+            model_tone("GPT-5.6 Luna"),
             model_tone("GPT-5.5"),
         ];
 
@@ -16787,25 +16764,25 @@ mod tests {
         let palette = theme::palette();
         for (model, model_tone, status_tone, color) in [
             (
-                "Claude Haiku",
+                "Claude Haiku 4.5",
                 Tone::ModelHaiku,
                 Tone::StatusModelHaiku,
                 palette.status.model_haiku,
             ),
             (
-                "Claude Sonnet",
+                "Claude Sonnet 5",
                 Tone::ModelSonnet,
                 Tone::StatusModelSonnet,
                 palette.status.model_sonnet,
             ),
             (
-                "Claude Opus",
+                "Claude Opus 5",
                 Tone::ModelOpus,
                 Tone::StatusModelOpus,
                 palette.status.model_opus,
             ),
             (
-                "Claude Fable",
+                "Claude Fable 5",
                 Tone::ModelFable,
                 Tone::StatusModelFable,
                 palette.status.model_fable,
@@ -16864,7 +16841,7 @@ mod tests {
     #[test]
     fn gpt56_and_spark_use_their_reference_model_colours() {
         assert_eq!(model_tone("GPT-5.6"), Some(Tone::Model56));
-        assert_eq!(model_tone("GPT-5.3-Codex-Spark"), Some(Tone::ModelSpark));
+        assert_eq!(model_tone("GPT-5.3 Codex Spark"), Some(Tone::ModelSpark));
         assert_eq!(tone_rgb(Tone::Model56), Some(theme::palette().model_gpt56));
         assert_eq!(
             tone_rgb(Tone::ModelSpark),
@@ -16889,7 +16866,7 @@ mod tests {
             elapsed: None,
         };
 
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, true, None);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, true, None, None);
 
         assert_eq!(lines.len(), 12);
         assert!(painted(&lines[0]).starts_with("┌── 작업 단계 · 0 / 7 완료"));
@@ -17009,7 +16986,7 @@ mod tests {
         assert_eq!(painted(&waiting[0]), "▲ 작업 단계  3 / 3 응답 정리 중");
         assert!(waiting.iter().all(|line| !painted(line).contains('⏱')));
 
-        let waiting_card = fixed_plan_summary_lines(&finished, 80, 0.0, true, None);
+        let waiting_card = fixed_plan_summary_lines(&finished, 80, 0.0, true, None, None);
         assert!(painted(&waiting_card[0]).contains("작업 단계 · 3 / 3 응답 정리 중"));
         assert!(waiting_card
             .iter()
@@ -17350,7 +17327,7 @@ mod tests {
             elapsed: None,
         };
 
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None, None);
 
         assert!(painted(&lines[0]).ends_with(" Alt + W ▲ ─┐"));
         assert_eq!(UnicodeWidthStr::width(painted(&lines[0]).as_str()), 79);
@@ -17373,7 +17350,7 @@ mod tests {
             elapsed: None,
         };
 
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None, None);
 
         assert_eq!(lines.len(), 2);
         assert!(painted(&lines[0]).starts_with("─── 작업 단계"));
@@ -17431,7 +17408,7 @@ mod tests {
             elapsed: None,
         };
 
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None, None);
 
         assert!(painted(&lines[2]).contains("  ✔  Task 1"));
         assert!(painted(&lines[3]).contains("     Task 2"));
@@ -17455,7 +17432,7 @@ mod tests {
             elapsed: Some(Duration::from_secs(94)),
         };
 
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None, None);
         let elapsed_line = painted(&lines[3]);
         let bottom_border = painted(&lines[4]);
 
@@ -17544,7 +17521,7 @@ mod tests {
             started_at: Instant::now(),
             elapsed: None,
         };
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.5, true, None);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.5, true, None, None);
         assert!(lines[2].prefix.contains('⠴'));
         assert_eq!(lines[2].text, "Working task");
         assert_eq!(lines[2].tone, Tone::Accent);
@@ -17561,6 +17538,41 @@ mod tests {
         assert_eq!(plan_effort_tone(5), Tone::EffortXHigh);
         assert_eq!(plan_effort_tone(6), Tone::EffortMax);
         assert_eq!(plan_effort_tone(7), Tone::EffortUltra);
+    }
+
+    #[test]
+    fn plan_update_shimmer_uses_the_active_request_effort() {
+        let summary = PlanSummary {
+            explanation: None,
+            steps: (1..=7)
+                .map(|index| PlanStep {
+                    text: format!("Task {index}"),
+                    status: PlanStepStatus::Pending,
+                    started_at: None,
+                    elapsed: None,
+                })
+                .collect(),
+            expanded: true,
+            started_at: Instant::now(),
+            elapsed: None,
+        };
+
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.5, true, Some(0.5), Some("medium"));
+        let shimmer_colours = lines[0]
+            .tail
+            .iter()
+            .filter_map(|span| match span.tone {
+                Tone::PlanShimmer(colour, _) => Some(colour),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(!shimmer_colours.is_empty());
+        assert!(
+            shimmer_colours
+                .iter()
+                .all(|colour| *colour == tone_rgb(Tone::EffortMedium).expect("effort colour"))
+        );
     }
 
     #[test]
@@ -17596,7 +17608,7 @@ mod tests {
             elapsed: None,
         };
 
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.5, false, None);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.5, false, None, None);
 
         assert_eq!(lines[2].prefix, "  ▸  ");
         assert_eq!(lines[2].prefix_tone, Tone::Accent);

@@ -1132,10 +1132,11 @@ impl ModelInfo {
                 })
             })
             .collect::<Vec<_>>();
+        let display_name = normalized_model_display_name(value.get("displayName")?.as_str()?);
         Some(Self {
             id: value.get("id")?.as_str()?.to_owned(),
             model: value.get("model")?.as_str()?.to_owned(),
-            display_name: value.get("displayName")?.as_str()?.to_owned(),
+            display_name,
             default_effort: value.get("defaultReasoningEffort")?.as_str()?.to_owned(),
             efforts,
             is_default: value
@@ -1197,6 +1198,31 @@ impl ModelInfo {
             "spark" | "5.3" => identity.contains("5.3") && identity.contains("spark"),
             _ => false,
         }
+    }
+}
+
+fn normalized_model_display_name(display_name: &str) -> String {
+    let Some(rest) = display_name.strip_prefix("GPT-") else {
+        return display_name.to_owned();
+    };
+    let Some((version, variants)) = rest.split_once('-') else {
+        return display_name.to_owned();
+    };
+    if version
+        .chars()
+        .all(|character| character.is_ascii_digit() || character == '.')
+        && variants
+            .split('-')
+            .all(|variant| {
+                !variant.is_empty()
+                    && variant
+                        .chars()
+                        .all(|character| character.is_ascii_alphabetic())
+            })
+    {
+        format!("GPT-{version} {}", variants.replace('-', " "))
+    } else {
+        display_name.to_owned()
     }
 }
 
@@ -4872,10 +4898,9 @@ impl AppState {
         // Ctrl+C spent on a copy is not a quit attempt, so it cannot leave the
         // quit armed behind for the next Ctrl+C to trip over.
         self.disarm_quit();
-        self.activity_notice = Some((
+        self.composer_notice = Some((
             "• Copied to clipboard".to_owned(),
             Instant::now(),
-            NOTICE_TTL,
         ));
     }
 
@@ -5520,6 +5545,10 @@ impl AppState {
             plan_summary: self.plan_summary.as_ref(),
             plan_active: self.busy,
             plan_shimmer_phase: self.plan_shimmer_phase(),
+            plan_effort: self
+                .active_turn_effort
+                .as_deref()
+                .or(self.pending_turn_effort.as_deref()),
             editor: &self.editor,
             composer_images: &self.composer_images,
             queued_prompts: self.queued_prompts.iter().cloned().collect(),
@@ -5679,6 +5708,10 @@ impl AppState {
             plan_summary: self.plan_summary.as_ref(),
             plan_active: self.busy,
             plan_shimmer_phase: self.plan_shimmer_phase(),
+            plan_effort: self
+                .active_turn_effort
+                .as_deref()
+                .or(self.pending_turn_effort.as_deref()),
             composer_mode: Some(self.composer_mode()),
         }
     }
@@ -9957,7 +9990,7 @@ impl AppState {
             return Some("X Interrupted".to_owned());
         }
         self.last_completed_duration
-            .map(|duration| format!("Completed ({})", format_elapsed(duration.as_secs())))
+            .map(|duration| format!("✨ Completed ({})", format_elapsed(duration.as_secs())))
     }
 
     /// `/compact` was accepted by the runtime: run the activity spinner until the
@@ -16136,7 +16169,7 @@ mod tests {
         let model = ModelInfo::from_value(&json!({
             "id": "gpt-5.6-sol",
             "model": "gpt-5.6-sol",
-            "displayName": "GPT-5.6 Sol",
+            "displayName": "GPT-5.6-Sol",
             "supportedReasoningEfforts": [{"reasoningEffort": "high"}],
             "defaultReasoningEffort": "high",
             "serviceTiers": [{
@@ -16147,7 +16180,17 @@ mod tests {
         }))
         .expect("model");
 
+        assert_eq!(model.display_name, "GPT-5.6 Sol");
         assert_eq!(model.fast_service_tier.as_deref(), Some("priority"));
+    }
+
+    #[test]
+    fn model_display_names_replace_all_gpt_variant_hyphens() {
+        assert_eq!(
+            normalized_model_display_name("GPT-5.3-Codex-Spark"),
+            "GPT-5.3 Codex Spark"
+        );
+        assert_eq!(normalized_model_display_name("Claude Opus 5"), "Claude Opus 5");
     }
 
     #[test]
@@ -16323,9 +16366,9 @@ mod tests {
     #[test]
     fn model_aliases_and_number_keys_select_catalog_entries() {
         let models = vec![
-            test_model("gpt-5.6-sol", "GPT-5.6-Sol", true),
-            test_model("gpt-5.6-terra", "GPT-5.6-Terra", false),
-            test_model("gpt-5.6-luna", "GPT-5.6-Luna", false),
+            test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
+            test_model("gpt-5.6-terra", "GPT-5.6 Terra", false),
+            test_model("gpt-5.6-luna", "GPT-5.6 Luna", false),
             test_model("gpt-5.5", "GPT-5.5", false),
         ];
         assert!(models[0].matches_query("sol"));
@@ -16342,7 +16385,7 @@ mod tests {
             Some("high"),
         );
         state.run_slash_command("/model terra");
-        assert_eq!(state.selected_model_display_name(), "GPT-5.6-Terra");
+        assert_eq!(state.selected_model_display_name(), "GPT-5.6 Terra");
 
         state.run_slash_command("/model");
         let overlay = state.overlay_view().expect("model picker");
@@ -16350,13 +16393,13 @@ mod tests {
         assert!(overlay.lines[1].text.starts_with("2. "));
         // Picking a model now asks how long it should last before applying.
         state.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
-        assert_eq!(state.selected_model_display_name(), "GPT-5.6-Terra");
+        assert_eq!(state.selected_model_display_name(), "GPT-5.6 Terra");
         assert_eq!(
             state.overlay_view().expect("scope picker").title,
             "Apply to"
         );
         state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(state.selected_model_display_name(), "GPT-5.6-Sol");
+        assert_eq!(state.selected_model_display_name(), "GPT-5.6 Sol");
         assert!(state.overlay_view().is_none());
     }
 
@@ -16609,7 +16652,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(state.activity().as_deref(), Some("Completed (1m 5s)"));
+        assert_eq!(state.activity().as_deref(), Some("✨ Completed (1m 5s)"));
     }
 
     /// `/compact` has no assistant output of its own, so the activity row is the
@@ -16817,7 +16860,7 @@ mod tests {
 
         state.select_model_and_effort("gpt-5.6-sol", Some("medium"));
         state.handle_notification("turn/completed", &json!({}));
-        assert_eq!(state.activity().as_deref(), Some("Completed (10s)"));
+        assert_eq!(state.activity().as_deref(), Some("✨ Completed (10s)"));
     }
 
     #[test]
@@ -16893,7 +16936,7 @@ mod tests {
         assert!(
             state
                 .activity()
-                .is_some_and(|activity| activity.starts_with("Completed"))
+                .is_some_and(|activity| activity.starts_with("✨ Completed"))
         );
         // A stale answer about a turn that is no longer the live one changes nothing.
         state.set_turn_started("turn-2".to_owned());
@@ -16935,15 +16978,20 @@ mod tests {
     }
 
     #[test]
-    fn copy_notice_replaces_the_activity_without_using_the_composer_notice() {
+    fn copy_notice_keeps_the_activity_and_uses_the_composer_notice() {
         let mut state = test_state();
         state.busy = true;
         state.turn_started_at = Some(Instant::now() - Duration::from_secs(10));
 
         state.set_copy_notice();
 
-        assert_eq!(state.activity().as_deref(), Some("• Copied to clipboard"));
-        assert_eq!(state.view().composer_notice, None);
+        assert!(state
+            .activity()
+            .is_some_and(|activity| activity.starts_with("Working..")));
+        assert_eq!(
+            state.view().composer_notice.as_deref(),
+            Some("• Copied to clipboard")
+        );
     }
 
     fn busy_state_with_live_turn() -> AppState {
@@ -17058,7 +17106,7 @@ mod tests {
     fn prompt_after_a_busy_provider_switch_waits_for_the_new_provider() {
         let models = vec![
             test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
-            test_model("claude:sonnet", "Claude Sonnet", false),
+            test_model("claude:sonnet", "Claude Sonnet 5", false),
         ];
         let mut state = AppState::new(
             "thread".to_owned(),
@@ -18362,9 +18410,9 @@ mod tests {
     fn provider_commands_filter_model_picker_and_direct_selection() {
         let models = vec![
             test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
-            test_model("claude:sonnet", "Claude Sonnet", false),
+            test_model("claude:sonnet", "Claude Sonnet 5", false),
             test_model("gpt-5.6-terra", "GPT-5.6 Terra", false),
-            test_model("claude:haiku", "Claude Haiku", false),
+            test_model("claude:haiku", "Claude Haiku 4.5", false),
         ];
         let mut state = AppState::new(
             "thread".to_owned(),
@@ -18397,7 +18445,13 @@ mod tests {
             .filter(|line| !line.text.is_empty())
             .collect::<Vec<_>>();
         assert_eq!(model_lines.len(), 2);
-        assert!(model_lines.iter().all(|line| line.text.contains("Claude")));
+        assert_eq!(
+            model_lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["1. Claude Sonnet 5", "2. Claude Haiku 4.5"]
+        );
         state.pending = None;
 
         state.run_slash_command("/model 2");

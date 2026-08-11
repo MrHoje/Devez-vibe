@@ -791,6 +791,7 @@ async fn choose_startup_session(
                 plan_summary: None,
                 plan_active: false,
                 plan_shimmer_phase: None,
+                plan_effort: None,
                 editor: &editor,
                 composer_images: &[],
                 queued_prompts: Vec::new(),

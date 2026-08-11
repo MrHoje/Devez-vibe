@@ -365,10 +365,10 @@ pub fn model_catalog() -> Value {
     };
     json!({
         "data": [
-            claude_model("claude:fable", "Fable", efforts(), false),
-            claude_model("claude:opus", "Opus", efforts(), false),
-            claude_model("claude:sonnet", "Sonnet", efforts(), true),
-            claude_model("claude:haiku", "Haiku", json!([]), false)
+            claude_model("claude:fable", "Claude Fable 5", efforts(), false),
+            claude_model("claude:opus", "Claude Opus 5", efforts(), false),
+            claude_model("claude:sonnet", "Claude Sonnet 5", efforts(), true),
+            claude_model("claude:haiku", "Claude Haiku 4.5", json!([]), false)
         ]
     })
 }
@@ -587,12 +587,18 @@ mod tests {
                 .iter()
                 .all(|model| model.get("model").and_then(Value::as_str) != Some("claude:default"))
         );
-        assert!(models.iter().all(|model| {
-            model
-                .get("displayName")
-                .and_then(Value::as_str)
-                .is_some_and(|name| !name.starts_with("Claude"))
-        }));
+        assert_eq!(
+            models
+                .iter()
+                .filter_map(|model| model.get("displayName").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            [
+                "Claude Fable 5",
+                "Claude Opus 5",
+                "Claude Sonnet 5",
+                "Claude Haiku 4.5"
+            ]
+        );
         assert_eq!(
             models
                 .iter()
