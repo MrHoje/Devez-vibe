@@ -478,6 +478,7 @@ pub struct AnimationView<'a> {
     pub plan_active: bool,
     pub plan_shimmer_phase: Option<f32>,
     pub plan_effort: Option<&'a str>,
+    pub composer_notice: Option<&'a str>,
     pub composer_mode: Option<ComposerMode>,
 }
 
@@ -1585,7 +1586,7 @@ impl Renderer {
         self.composer_navigation_layout = Some(layout);
     }
 
-    fn reconcile_selection(&mut self, lines: &[PaintLine]) {
+    fn reconcile_selection(&mut self, lines: &[PaintLine], plan_rows: usize) {
         let Some(range) = self.selection.range() else {
             return;
         };
@@ -1594,8 +1595,13 @@ impl Renderer {
         if self.selection_in_panel {
             return;
         }
-        let changed = (usize::from(range.start.row)..=usize::from(range.end.row))
-            .any(|row| self.previous_lines.get(row) != lines.get(row));
+        let changed = (usize::from(range.start.row)..=usize::from(range.end.row)).any(|row| {
+            let Some((previous, current)) = self.previous_lines.get(row).zip(lines.get(row)) else {
+                return true;
+            };
+            previous != current
+                && !(row < plan_rows && !plan_row_requires_full_repaint(previous, current))
+        });
         if changed {
             self.selection.clear();
         }
@@ -2035,12 +2041,15 @@ impl Renderer {
                 return Ok(false);
             }
             let mut line = activity_rows.pop().expect("one activity row");
+            let copy_notice = view
+                .composer_notice
+                .filter(|notice| *notice == COPY_NOTICE);
             if let Some(mode) = view.composer_mode.as_ref()
                 && let Some(with_controls) =
                     activity_line_with_composer_controls(
                         line.clone(),
                         mode,
-                        None,
+                        copy_notice,
                         self.last_width,
                     )
             {
@@ -2337,7 +2346,7 @@ impl Renderer {
             }
             Some((row, control))
         });
-        self.reconcile_selection(&screen);
+        self.reconcile_selection(&screen, plan_rows);
         let full_repaint_rows = plan_rows_requiring_full_repaint(
             &self.previous_lines,
             self.animation_plan_rows,
@@ -14624,7 +14633,7 @@ mod tests {
         renderer.reconcile_selection(&[
             PaintLine::plain("selected"),
             PaintLine::plain("changed status"),
-        ]);
+        ], 0);
         assert_eq!(
             renderer.finish_selection(2, 0),
             SelectionResult::Copy("sel".to_owned())
@@ -14632,8 +14641,27 @@ mod tests {
 
         assert!(renderer.begin_selection(0, 0));
         assert!(renderer.update_selection(2, 0));
-        renderer.reconcile_selection(&[PaintLine::plain("replaced"), PaintLine::plain("status")]);
+        renderer.reconcile_selection(&[PaintLine::plain("replaced"), PaintLine::plain("status")], 0);
         assert_eq!(renderer.finish_selection(2, 0), SelectionResult::None);
+    }
+
+    #[test]
+    fn progress_spinner_repaint_keeps_the_drag_selection() {
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        let mut previous = PaintLine::plain("진행 단계");
+        previous.prefix = "  ⠋  ".to_owned();
+        previous.prefix_tone = Tone::Accent;
+        previous.tone = Tone::Accent;
+        previous.bold = true;
+        let mut spinner = previous.clone();
+        spinner.prefix = "  ⠙  ".to_owned();
+        renderer.previous_lines = vec![previous];
+
+        assert!(renderer.begin_selection(5, 0));
+        assert!(renderer.update_selection(7, 0));
+        renderer.reconcile_selection(&[spinner], 1);
+
+        assert!(renderer.selection.range().is_some());
     }
 
     #[test]

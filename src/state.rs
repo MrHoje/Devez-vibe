@@ -5722,6 +5722,10 @@ impl AppState {
                 .active_turn_effort
                 .as_deref()
                 .or(self.pending_turn_effort.as_deref()),
+            composer_notice: self
+                .composer_notice
+                .as_ref()
+                .map(|(notice, _)| notice.as_str()),
             composer_mode: Some(self.composer_mode()),
         }
     }
@@ -17027,6 +17031,10 @@ mod tests {
             .is_some_and(|activity| activity.starts_with("Working..")));
         assert_eq!(
             state.view().composer_notice.as_deref(),
+            Some("• Copied to clipboard")
+        );
+        assert_eq!(
+            state.animation_view().composer_notice,
             Some("• Copied to clipboard")
         );
     }
