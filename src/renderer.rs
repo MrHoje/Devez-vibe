@@ -8436,7 +8436,7 @@ fn attach_history_to_prompt(
     history: Option<(u64, &str, bool)>,
     chat_layout: bool,
 ) {
-    let Some((group_id, title, _expanded)) = history else {
+    let Some((group_id, title, expanded)) = history else {
         return;
     };
     let protected_right = usize::from(width).saturating_sub(1);
@@ -8457,6 +8457,10 @@ fn attach_history_to_prompt(
         if start < end {
             line.pick = Some(PickRegions::span(start, end, Pick::History(group_id)));
         }
+    }
+
+    if expanded {
+        return;
     }
 
     let label = title.to_owned();
@@ -18923,7 +18927,7 @@ mod tests {
             .map(painted)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(expanded.contains("+1 Response"));
+        assert!(!expanded.contains("+1 Response"));
         assert!(expanded.contains("펼쳐진 진행 메시지"));
         assert!(renderer.wrapped.last() == Some(&PaintLine::blank()));
         let view_rows = split_rows(30, 10, renderer.wrapped.len()).0;
@@ -18937,6 +18941,31 @@ mod tests {
             })
             .count();
         assert_eq!(visible_prompt_rows, 3);
+    }
+
+    #[test]
+    fn expanded_prompt_history_hides_only_its_response_label() {
+        let prompt = Block::new(BlockKind::User, "gpt-5.6-sol", "보낸 프롬프트");
+        let history_id = 42;
+        let lines = user_prompt_lines_with_history(
+            &prompt,
+            80,
+            Some((history_id, "+4 Response", true)),
+            false,
+        );
+
+        assert!(
+            lines
+                .iter()
+                .all(|line| !painted(line).contains("+4 Response"))
+        );
+        assert!(lines.iter().all(|line| {
+            line.pick
+                .as_ref()
+                .is_some_and(|regions| regions.columns_of(&Pick::History(history_id)).is_some())
+                || line == &PaintLine::blank()
+        }));
+        assert!(lines.last() == Some(&PaintLine::blank()));
     }
 
     #[test]
