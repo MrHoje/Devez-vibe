@@ -3910,6 +3910,7 @@ enum Tone {
     #[allow(dead_code)]
     LimitWeekly,
     FastOn,
+    ResponseCompleted,
     FastOff,
     VibeSuper,
     ClaudeAcceptEdits,
@@ -9939,7 +9940,7 @@ fn corner_composer_rule(mut line: PaintLine, left: char, right: char) -> PaintLi
     line
 }
 
-/// Widest badge that fits in `budget`. Codex places Response before Vibe;
+/// Widest badge that fits in `budget`. Codex places Response after Vibe;
 /// Claude places it between Vibe and Access. Tightening drops the optional
 /// controls as a unit rather than clipping a label.
 fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans> {
@@ -9962,7 +9963,7 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
     let response_span = PaintSpan {
         text: format!("Response: {}", mode.response_display_mode),
         tone: if response_completed {
-            Tone::FastOn
+            Tone::ResponseCompleted
         } else {
             Tone::FastOff
         },
@@ -10041,12 +10042,12 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
     }
 
     let primary_spans = custom_spans
-        .unwrap_or_else(|| vec![response_span, separator_span(), vibe_mode_span.clone()]);
+        .unwrap_or_else(|| vec![vibe_mode_span.clone(), separator_span(), response_span]);
     [
         BadgeSpans {
             spans: [display_spans, primary_spans].concat(),
-            vibe_mode_index: Some(display_width + 2),
-            response_display_mode_index: Some(display_width),
+            vibe_mode_index: Some(display_width),
+            response_display_mode_index: Some(display_width + 2),
             shell_display_mode_index: None,
             diff_display_mode_index: None,
             permission_index: None,
@@ -10768,6 +10769,10 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::LimitFiveHour => palette.status.five_hour,
         Tone::LimitWeekly => palette.status.weekly,
         Tone::FastOn => palette.blue,
+        // Completed stays recognizably blue without competing with the active
+        // Vibe badge. Blending with each theme's own muted color preserves the
+        // theme's temperature on both light and dark backgrounds.
+        Tone::ResponseCompleted => blend(palette.blue, palette.muted, 72),
         Tone::FastOff => palette.muted,
         Tone::VibeSuper => palette.warning,
         Tone::ClaudeAcceptEdits => theme::claude_mode_colors().accept_edits,
@@ -14317,10 +14322,10 @@ mod tests {
         // Two blanks off the rule, the badge, then the rule resumes for two columns.
         assert_eq!(
             texts,
-            ["  ", "Response: Completed", " · ", "Vibe: On", " ", "─╮"]
+            ["  ", "Vibe: On", " · ", "Response: Completed", " ", "─╮"]
         );
         assert_eq!(line.tail[1].tone, Tone::FastOn);
-        assert_eq!(line.tail[3].tone, Tone::FastOn);
+        assert_eq!(line.tail[3].tone, Tone::ResponseCompleted);
         assert!(!painted(&line).contains("Fast:"));
     }
 
@@ -14479,8 +14484,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(rule_width(&line), 80);
-        assert_eq!(texts, ["  ", "Response: All", " · ", "Vibe: On", " ", "─╮"]);
-        assert_eq!(line.tail[1].tone, Tone::FastOff);
+        assert_eq!(texts, ["  ", "Vibe: On", " · ", "Response: All", " ", "─╮"]);
+        assert_eq!(line.tail[3].tone, Tone::FastOff);
     }
 
     #[test]
@@ -14511,7 +14516,7 @@ mod tests {
 
         let line = input_top_line(120, "", Some(&mode));
 
-        assert!(painted(&line).contains("* main | Response: Completed · Vibe: On"));
+        assert!(painted(&line).contains("* main | Vibe: On · Response: Completed"));
         assert!(!painted(&line).contains("$0.95"));
     }
 
@@ -14541,7 +14546,7 @@ mod tests {
         let on = tones(&mode);
         assert!(on.contains(&("Vibe: On".to_owned(), Tone::FastOn)));
         assert!(!on.iter().any(|(text, _)| text == "View: Chat"));
-        assert!(on.contains(&("Response: Completed".to_owned(), Tone::FastOn)));
+        assert!(on.contains(&("Response: Completed".to_owned(), Tone::ResponseCompleted)));
 
         mode.response_display_mode = "All".to_owned();
         assert!(tones(&mode).contains(&("Response: All".to_owned(), Tone::FastOff)));
@@ -14551,6 +14556,30 @@ mod tests {
 
         mode.vibe_tone = VibeTone::Super;
         assert!(tones(&mode).contains(&("Vibe: On".to_owned(), Tone::VibeSuper)));
+    }
+
+    #[test]
+    fn completed_response_blue_is_softened_for_every_theme() {
+        let distance = |left: Rgb, right: Rgb| {
+            u16::from(left.0.abs_diff(right.0))
+                + u16::from(left.1.abs_diff(right.1))
+                + u16::from(left.2.abs_diff(right.2))
+        };
+
+        for theme_kind in ThemeKind::ALL {
+            theme::set_current(theme_kind);
+            let palette = theme::palette();
+            let completed = tone_rgb(Tone::ResponseCompleted).expect("Completed color");
+
+            assert_eq!(completed, blend(palette.blue, palette.muted, 72));
+            assert!(
+                distance(completed, palette.muted) < distance(palette.blue, palette.muted),
+                "theme={} completed={}",
+                theme_kind.id(),
+                completed.hex()
+            );
+        }
+        theme::set_current(ThemeKind::Dark);
     }
 
     #[test]
@@ -14613,7 +14642,7 @@ mod tests {
         assert_eq!(rule_width(&line), 40);
         assert_eq!(
             texts,
-            ["  ", "Response: Completed", " · ", "Vibe: On", " ", "─╮"]
+            ["  ", "Vibe: On", " · ", "Response: Completed", " ", "─╮"]
         );
     }
 
