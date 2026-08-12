@@ -149,7 +149,13 @@ function modelCapabilities(models, model) {
 }
 
 function opus48Capabilities(models, existing = {}) {
-  const opus = models.find((model) => model.value === "opus") || {};
+  // The CLI now exposes the Opus alias as `opus[1m]` (and only `default`
+  // resolves to it), so an exact `value === "opus"` match finds nothing and the
+  // synthesized Opus 4.8 row loses supportsAutoMode/supportsFastMode. Match the
+  // Opus family instead, falling back to `default`.
+  const opus = models.find((model) => String(model.value || "").toLowerCase().startsWith("opus"))
+    || models.find((model) => model.value === "default")
+    || {};
   const opusEfforts = Array.isArray(opus.supportedEffortLevels)
     ? opus.supportedEffortLevels
     : [];
@@ -2846,11 +2852,12 @@ async function runSelfTest() {
   }
   const catalogModels = [
     {
-      value: "opus",
-      resolvedModel: "claude-opus-5",
+      value: "opus[1m]",
+      resolvedModel: "claude-opus-5[1m]",
       displayName: "Opus 5",
       supportsEffort: true,
       supportedEffortLevels: ["high", "max"],
+      supportsAutoMode: true,
     },
     { value: "sonnet", resolvedModel: "claude-sonnet-5", displayName: "Sonnet 5" },
     {
@@ -2865,6 +2872,7 @@ async function runSelfTest() {
   if (catalog[0]?.displayName !== "Opus 5"
     || catalog[1]?.displayName !== "Opus 4.8"
     || catalog[1]?.model !== "claude:claude-opus-4-8"
+    || catalog[1]?.supportsAutoMode !== true
     || catalog[1]?.supportedReasoningEfforts?.[1]?.reasoningEffort !== "max"
     || supportedEffort(
       modelCapabilities(catalogModels, "claude:claude-opus-4-8"),
