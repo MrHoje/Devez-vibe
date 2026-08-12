@@ -6894,7 +6894,7 @@ fn fixed_plan_summary_lines(
         )
     } else {
         format!(
-            "{UPDATED_PLAN_TITLE} · {completed} / {} Completed",
+            "{UPDATED_PLAN_TITLE} · {completed} / {}",
             summary.steps.len()
         )
     };
@@ -7138,7 +7138,7 @@ fn side_panel_plan_lines(
         )
     } else {
         format!(
-            "{UPDATED_PLAN_TITLE}  {completed} / {} Completed",
+            "{UPDATED_PLAN_TITLE}  {completed} / {}",
             summary.steps.len()
         )
     };
@@ -8380,7 +8380,7 @@ fn attach_history_to_prompt(
     history: Option<(u64, &str, bool)>,
     chat_layout: bool,
 ) {
-    let Some((group_id, title, expanded)) = history else {
+    let Some((group_id, title, _expanded)) = history else {
         return;
     };
     let protected_right = usize::from(width).saturating_sub(1);
@@ -8403,7 +8403,7 @@ fn attach_history_to_prompt(
         }
     }
 
-    let label = format!("{title} {}", if expanded { '▾' } else { '▸' });
+    let label = title.to_owned();
     let label_width = UnicodeWidthStr::width(label.as_str());
     let Some(bottom) = lines.last_mut() else {
         return;
@@ -11599,7 +11599,7 @@ mod tests {
         ];
         renderer.side_panel = Some(layout);
         renderer.side_panel_content = vec![
-            PaintLine::plain("Updated Plan  1 / 1 Completed"),
+            PaintLine::plain("Updated Plan  1 / 1"),
             PaintLine::blank(),
             PaintLine::plain("panel step"),
         ];
@@ -17913,7 +17913,7 @@ mod tests {
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, true, None, None);
 
         assert_eq!(lines.len(), 12);
-        assert!(painted(&lines[0]).starts_with("┌── Updated Plan · 0 / 7 Completed"));
+        assert!(painted(&lines[0]).starts_with("┌── Updated Plan · 0 / 7"));
         assert!(painted(&lines[0]).ends_with('┐'));
         assert!(lines[0].tail.iter().any(|span| span.text == " Alt + W "));
         assert!(lines[0].tail.iter().any(|span| span.tone == Tone::FastOff));
@@ -17962,7 +17962,7 @@ mod tests {
 
         // The total rides on the heading only once every step is done, the same
         // rule the card's own total line follows.
-        assert_eq!(painted(&content[0]), "▲ Updated Plan  1 / 3 Completed");
+        assert_eq!(painted(&content[0]), "▲ Updated Plan  1 / 3");
         assert_eq!(
             content[0].pick.as_ref().and_then(|picks| picks.at(0)),
             Some(Pick::PlanSummary)
@@ -18041,10 +18041,7 @@ mod tests {
         assert!(waiting_card.iter().all(|line| !painted(line).contains('⏱')));
 
         let done = side_panel_plan_lines(&finished, layout.content_width(), 0.0, false);
-        assert_eq!(
-            painted(&done[0]),
-            "▲ Updated Plan  3 / 3 Completed  [⏱  1m 25s]"
-        );
+        assert_eq!(painted(&done[0]), "▲ Updated Plan  3 / 3  [⏱  1m 25s]");
         assert_eq!(done[4].prefix, "✔ ");
     }
 
@@ -18128,7 +18125,7 @@ mod tests {
         );
 
         assert_eq!(plan.len(), 3);
-        assert_eq!(painted(&plan[0]), "▼ Updated Plan  0 / 1 Completed");
+        assert_eq!(painted(&plan[0]), "▼ Updated Plan  0 / 1");
         assert_eq!(
             plan[0].pick.as_ref().and_then(|picks| picks.at(0)),
             Some(Pick::PlanSummary)
@@ -18515,6 +18512,48 @@ mod tests {
     }
 
     #[test]
+    fn steer_history_attaches_to_the_prompt_before_each_response_segment() {
+        let first_prompt = Block::new(BlockKind::User, "Codex", "첫 요청");
+        let first_prompt_id = first_prompt.id();
+        let first_progress = Block::new(BlockKind::Assistant, "Codex", "첫 요청 진행 기록");
+        let second_prompt = Block::new(BlockKind::User, "Codex", "추가 요청");
+        let second_prompt_id = second_prompt.id();
+        let second_progress = Block::new(BlockKind::Assistant, "Codex", "추가 요청 확인");
+        let final_answer = Block::new(BlockKind::Assistant, "Codex", "최종 답변");
+        let first_group = Block::progress_group(vec![first_progress.clone()]);
+        let second_group = Block::progress_group(vec![second_progress.clone()]);
+        let mut history = vec![
+            first_prompt,
+            first_progress,
+            second_prompt,
+            second_progress,
+            final_answer,
+        ];
+        merge_history_block(&mut history, first_group);
+        merge_history_block(&mut history, second_group);
+
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.history = history;
+
+        assert_eq!(
+            renderer
+                .progress_group_for_prompt(first_prompt_id)
+                .expect("first prompt History")
+                .children()[0]
+                .body,
+            "첫 요청 진행 기록"
+        );
+        assert_eq!(
+            renderer
+                .progress_group_for_prompt(second_prompt_id)
+                .expect("steer prompt History")
+                .children()[0]
+                .body,
+            "추가 요청 확인"
+        );
+    }
+
+    #[test]
     fn history_toggle_anchors_the_current_transcript_height() {
         let progress = Block::progress_group(vec![
             Block::new(BlockKind::Assistant, "Codex", "첫 진행 메시지"),
@@ -18586,7 +18625,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(prompt_lines.len(), 4);
-        assert!(painted(prompt_lines.last().unwrap()).ends_with("History · 1 ▸  "));
+        assert!(painted(prompt_lines.last().unwrap()).ends_with("History · 1  "));
         assert_eq!(painted_line_width(prompt_lines.last().unwrap()), 79);
         let history_span = prompt_lines
             .last()
@@ -18612,7 +18651,7 @@ mod tests {
         let history_row = renderer
             .wrapped
             .iter()
-            .position(|line| painted(line).contains("History · 1 ▸"))
+            .position(|line| painted(line).contains("History · 1"))
             .expect("History label is visible");
         assert!(renderer.wrapped.get(history_row + 1) == Some(&PaintLine::blank()));
 
@@ -18657,7 +18696,7 @@ mod tests {
                 );
                 let bottom = lines
                     .iter()
-                    .find(|line| painted(line).contains("History · 6 ▸"))
+                    .find(|line| painted(line).contains("History · 6"))
                     .unwrap_or_else(|| {
                         panic!(
                             "prompt has History padding: chat_layout={chat_layout}, width={width}, lines={:?}",
@@ -18669,11 +18708,11 @@ mod tests {
                     .last()
                     .map(|span| UnicodeWidthStr::width(span.text.as_str()))
                     .unwrap_or_default();
-                let expected_padding = if chat_layout && width == 24 { 1 } else { 2 };
+                let expected_padding = 2;
                 assert_eq!(right_padding, expected_padding);
                 assert!(
                     painted(bottom)
-                        .ends_with(&format!("History · 6 ▸{}", " ".repeat(expected_padding)))
+                        .ends_with(&format!("History · 6{}", " ".repeat(expected_padding)))
                 );
                 assert_eq!(painted_line_width(bottom), usize::from(width) - 1);
                 assert!(lines.last() == Some(&PaintLine::blank()));
@@ -18702,7 +18741,7 @@ mod tests {
         );
         let line = lines
             .iter()
-            .find(|line| painted(line).contains("History · 1 ▸"))
+            .find(|line| painted(line).contains("History · 1"))
             .expect("History label is visible");
         let hovered = Renderer::hover_columns(line, None, Some(&Pick::History(history_id)))
             .expect("History hover covers the prompt");
@@ -18762,7 +18801,7 @@ mod tests {
             .map(painted)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(expanded.contains("History · 1 ▾"));
+        assert!(expanded.contains("History · 1"));
         assert!(expanded.contains("펼쳐진 진행 메시지"));
         assert!(renderer.wrapped.last() == Some(&PaintLine::blank()));
         let view_rows = split_rows(30, 10, renderer.wrapped.len()).0;
@@ -19022,11 +19061,8 @@ mod tests {
     fn plan_title_shimmer_moves_five_times_over_the_default_text() {
         assert_eq!(PLAN_SHIMMER_BAND, SHIMMER_BAND * 2.5);
         assert_eq!(PLAN_SHIMMER_LOOPS, 5.0);
-        let title = plan_title_shimmer_spans(
-            "Updated Plan · 1 / 3 Completed",
-            Some(0.125),
-            Tone::EffortMedium,
-        );
+        let title =
+            plan_title_shimmer_spans("Updated Plan · 1 / 3", Some(0.125), Tone::EffortMedium);
 
         assert!(
             title
@@ -19034,8 +19070,7 @@ mod tests {
                 .any(|span| matches!(span.tone, Tone::PlanShimmer(_, _)))
         );
         assert_eq!(
-            plan_title_shimmer_spans("Updated Plan · 1 / 3 Completed", None, Tone::EffortMedium)[0]
-                .tone,
+            plan_title_shimmer_spans("Updated Plan · 1 / 3", None, Tone::EffortMedium)[0].tone,
             Tone::Plain
         );
     }

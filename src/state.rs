@@ -3316,6 +3316,11 @@ pub struct AppState {
     /// commentary and final output; runtimes without that label use the last
     /// message on a successful turn as the final answer.
     turn_response_blocks: Vec<Block>,
+    /// User prompt block ids for the active turn, including every steer. A
+    /// steer joins the existing provider turn and gets no response id of its
+    /// own, so these local creation boundaries keep later progress attached to
+    /// the prompt that preceded it.
+    turn_prompt_ids: Vec<u64>,
     response_grouped: bool,
     response_collapse: Option<ResponseCollapseTransition>,
     /// App-server lifecycle notifications can be replayed. An item id belongs
@@ -3555,6 +3560,7 @@ impl AppState {
             turn_file_changes: Vec::new(),
             turn_file_change_anchor: None,
             turn_response_blocks: Vec::new(),
+            turn_prompt_ids: Vec::new(),
             response_grouped: false,
             response_collapse: None,
             completed_item_ids: HashSet::new(),
@@ -5020,12 +5026,10 @@ impl AppState {
 
     pub fn begin_side_prompt(&mut self, text: String) {
         self.commit_welcome_card();
-        self.committed.push(Block::new(
-            BlockKind::User,
-            self.selected_model_name(),
-            text,
-        ));
         self.reset_turn_item_tracking();
+        let prompt = Block::new(BlockKind::User, self.selected_model_name(), text);
+        self.turn_prompt_ids.push(prompt.id());
+        self.committed.push(prompt);
         self.busy = true;
     }
 
@@ -5225,6 +5229,7 @@ impl AppState {
         self.turn_file_changes.clear();
         self.turn_file_change_anchor = None;
         self.turn_response_blocks.clear();
+        self.turn_prompt_ids.clear();
         self.response_grouped = false;
         self.response_collapse = None;
     }
@@ -5274,14 +5279,17 @@ impl AppState {
         if progress.is_empty() {
             return;
         }
-        let group = Block::progress_group(progress);
+        let groups = progress_groups_for_prompt_ids(progress, &self.turn_prompt_ids);
+        let Some(last_group) = groups.last() else {
+            return;
+        };
         self.response_collapse =
             (self.vibe_mode == VibeMode::SuperVibe).then(|| ResponseCollapseTransition {
-                group_id: group.id(),
+                group_id: last_group.id(),
                 started_at: Instant::now(),
             });
         self.response_grouped = true;
-        self.committed.push(group);
+        self.committed.extend(groups);
     }
 
     /// Returns an interrupt the user requested while `turn/start` was still
@@ -7224,15 +7232,16 @@ impl AppState {
             return Action::None;
         }
         self.commit_welcome_card();
-        self.committed.push(Block::new(
-            BlockKind::User,
-            self.selected_model_name(),
-            display,
-        ));
-        if self.busy {
+        let steering = self.busy;
+        if !steering {
+            self.reset_turn_item_tracking();
+        }
+        let prompt = Block::new(BlockKind::User, self.selected_model_name(), display);
+        self.turn_prompt_ids.push(prompt.id());
+        self.committed.push(prompt);
+        if steering {
             Action::Steer(text)
         } else {
-            self.reset_turn_item_tracking();
             self.busy = true;
             // Time the turn from Enter, not from the server's acknowledgement: a
             // prompt held back by a starting session would otherwise read 0s.
@@ -12090,7 +12099,25 @@ fn merged_turn_blocks(
     }
 }
 
-fn group_turn_response(mut blocks: Vec<Block>) -> Vec<Block> {
+fn progress_groups_for_prompt_ids(progress: Vec<Block>, prompt_ids: &[u64]) -> Vec<Block> {
+    let mut groups: Vec<(usize, Vec<Block>)> = Vec::new();
+    for block in progress {
+        let boundary = prompt_ids.partition_point(|prompt_id| *prompt_id < block.id());
+        if groups
+            .last()
+            .is_none_or(|(current, _)| *current != boundary)
+        {
+            groups.push((boundary, Vec::new()));
+        }
+        groups.last_mut().expect("progress group").1.push(block);
+    }
+    groups
+        .into_iter()
+        .map(|(_, children)| Block::progress_group(children))
+        .collect()
+}
+
+fn group_turn_response(blocks: Vec<Block>) -> Vec<Block> {
     let assistant_indices = blocks
         .iter()
         .enumerate()
@@ -12108,27 +12135,50 @@ fn group_turn_response(mut blocks: Vec<Block>) -> Vec<Block> {
         .into_iter()
         .filter(|&index| index < final_index && !blocks[index].body.trim().is_empty())
         .collect::<Vec<_>>();
-    let Some(&insert_at) = progress_indices.first() else {
+    let Some(_) = progress_indices.first() else {
         return blocks;
     };
-    let fold_indices = (insert_at..final_index)
+    let fold_indices = (progress_indices[0]..final_index)
         .filter(|&index| {
             is_context_compaction(&blocks[index])
                 || (matches!(blocks[index].kind, BlockKind::Assistant)
                     && !blocks[index].body.trim().is_empty())
         })
         .collect::<Vec<_>>();
+    let mut groups: Vec<(Option<usize>, Vec<Block>)> = Vec::new();
+    for &index in &fold_indices {
+        let prompt = blocks[..index]
+            .iter()
+            .rposition(|block| matches!(block.kind, BlockKind::User));
+        if groups.last().is_none_or(|(current, _)| *current != prompt) {
+            groups.push((prompt, Vec::new()));
+        }
+        groups
+            .last_mut()
+            .expect("progress group")
+            .1
+            .push(blocks[index].clone());
+    }
     let progress_ids = fold_indices
         .iter()
         .map(|&index| blocks[index].id())
         .collect::<HashSet<_>>();
-    let progress = fold_indices
-        .iter()
-        .map(|&index| blocks[index].clone())
-        .collect::<Vec<_>>();
-    blocks.retain(|block| !progress_ids.contains(&block.id()));
-    blocks.insert(insert_at, Block::progress_group(progress));
-    blocks
+    let mut replacements = groups
+        .into_iter()
+        .map(|(_, children)| {
+            let group = Block::progress_group(children);
+            (group.id(), group)
+        })
+        .collect::<HashMap<_, _>>();
+    let mut grouped = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        if let Some(group) = replacements.remove(&block.id()) {
+            grouped.push(group);
+        } else if !progress_ids.contains(&block.id()) {
+            grouped.push(block);
+        }
+    }
+    grouped
 }
 
 /// The turn's `startedAt` (unix seconds), formatted the same way the rollout's
@@ -16993,6 +17043,64 @@ mod tests {
     }
 
     #[test]
+    fn steer_splits_progress_history_at_the_new_prompt() {
+        let mut state = test_state();
+        while state.vibe_mode() != VibeMode::SuperVibe {
+            state.cycle_vibe_mode();
+        }
+        assert!(matches!(
+            state.submit_text("첫 요청".to_owned(), "첫 요청".to_owned()),
+            Action::Submit(_)
+        ));
+        state.drain_committed();
+        state.set_turn_started("turn-1".to_owned());
+
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "item": { "id": "progress-1", "type": "agentMessage", "phase": "commentary", "text": "첫 요청 진행 기록" }
+            }),
+        );
+        state.drain_committed();
+
+        assert!(matches!(
+            state.submit_text("추가 요청".to_owned(), "추가 요청".to_owned()),
+            Action::Steer(_)
+        ));
+        state.drain_committed();
+        for (id, phase, text) in [
+            ("progress-2", "commentary", "추가 요청 확인"),
+            ("progress-3", "commentary", "추가 요청 수정"),
+            ("final", "final_answer", "수정을 마쳤습니다."),
+        ] {
+            state.handle_notification(
+                "item/completed",
+                &json!({
+                    "item": { "id": id, "type": "agentMessage", "phase": phase, "text": text }
+                }),
+            );
+            state.drain_committed();
+        }
+
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "status": "completed" } }),
+        );
+        let groups = state
+            .drain_committed()
+            .into_iter()
+            .filter(|block| matches!(block.kind, BlockKind::ProgressGroup))
+            .collect::<Vec<_>>();
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].title, "History · 1");
+        assert_eq!(groups[0].children()[0].body, "첫 요청 진행 기록");
+        assert_eq!(groups[1].title, "History · 2");
+        assert_eq!(groups[1].children()[0].body, "추가 요청 확인");
+        assert_eq!(groups[1].children()[1].body, "추가 요청 수정");
+    }
+
+    #[test]
     fn context_compaction_between_updates_folds_into_live_history() {
         let mut state = test_state();
         while state.vibe_mode() != VibeMode::SuperVibe {
@@ -17055,6 +17163,32 @@ mod tests {
 
         assert_eq!(group.title, "History · 3");
         assert_eq!(group.children()[1].title, "Context compacted");
+    }
+
+    #[test]
+    fn resumed_steer_history_stays_with_each_prompt() {
+        let blocks = vec![
+            Block::new(BlockKind::User, "Codex", "첫 요청"),
+            Block::new(BlockKind::Assistant, "Codex", "첫 요청 진행 기록")
+                .with_assistant_phase(AssistantPhase::Commentary),
+            Block::new(BlockKind::User, "Codex", "추가 요청"),
+            Block::new(BlockKind::Assistant, "Codex", "추가 요청 확인")
+                .with_assistant_phase(AssistantPhase::Commentary),
+            Block::new(BlockKind::System, "Context compacted", ""),
+            Block::new(BlockKind::Assistant, "Codex", "최종 답변")
+                .with_assistant_phase(AssistantPhase::FinalAnswer),
+        ];
+
+        let grouped = group_turn_response(blocks);
+        let groups = grouped
+            .iter()
+            .filter(|block| matches!(block.kind, BlockKind::ProgressGroup))
+            .collect::<Vec<_>>();
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].children()[0].body, "첫 요청 진행 기록");
+        assert_eq!(groups[1].children()[0].body, "추가 요청 확인");
+        assert_eq!(groups[1].children()[1].title, "Context compacted");
     }
 
     #[test]
