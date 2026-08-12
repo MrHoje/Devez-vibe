@@ -2079,11 +2079,30 @@ impl Renderer {
     pub fn render(&mut self, committed: &[Block], view: View<'_>) -> Result<()> {
         CHAT_LAYOUT.store(view.chat_layout, Ordering::Relaxed);
         let response_collapse_changed = self.response_collapse != view.response_collapse;
+        let response_collapse_started =
+            self.response_collapse.is_none() && view.response_collapse.is_some();
         if response_collapse_changed {
+            if response_collapse_started
+                && self.mode == RenderMode::Fullscreen
+                && self.scroll_back == 0
+                && self.last_transcript_rows > 0
+            {
+                // The final item and turn completion can be delivered together,
+                // before the committed answer has had a frame of its own. In
+                // that case its old live rows belong in the target transcript
+                // height too; otherwise the first collapse frame already moves
+                // the answer upward.
+                let live_rows = self
+                    .live_frame_cache
+                    .as_ref()
+                    .map(|cache| cache.lines.len())
+                    .unwrap_or_default();
+                self.history_view_rows_anchor =
+                    Some(self.last_transcript_rows.saturating_add(live_rows));
+            }
             self.response_collapse = view.response_collapse;
             self.wrapped_width = 0;
             self.live_frame_cache = None;
-            self.history_view_rows_anchor = None;
             self.history_view_start_anchor = None;
         }
         let committed_without_startup = view.plan_summary.is_some().then(|| {
@@ -2535,7 +2554,7 @@ impl Renderer {
             .unwrap_or_default();
         let plan_rows = plan_lines.len().min(rows.saturating_sub(1));
         let content_rows = rows.saturating_sub(plan_rows).max(1);
-        if !committed.is_empty() {
+        if !committed.is_empty() && self.response_collapse.is_none() {
             self.history_view_rows_anchor = None;
             self.history_view_start_anchor = None;
         }
@@ -2617,7 +2636,7 @@ impl Renderer {
         // *without* dragging the welcome card and the live blocks down with it:
         // `fit_frame` inserts the blanks at the dock, above the composer.
         fit_frame(&mut frame, live_rows);
-        let max_back = self.wrapped.len() - view_rows;
+        let max_back = self.wrapped.len().saturating_sub(view_rows);
         self.scroll_back = self.history_view_start_anchor.take().map_or_else(
             || self.scroll_back.min(max_back),
             |start| scroll_back_for_transcript_start(self.wrapped.len(), view_rows, start),
@@ -3093,7 +3112,11 @@ fn split_rows_with_transcript_anchor(
         return split_rows(rows, live_natural, transcript_len);
     };
     let capacity = rows.saturating_sub(live_natural);
-    let view_rows = anchored_view_rows.min(transcript_len).min(capacity);
+    // An automatic response fold can make the transcript shorter than the
+    // viewport it occupied one frame earlier. Keep that allocation until new
+    // output arrives; `compose_screen` fills the missing rows above the
+    // transcript so the completed answer does not jump upward.
+    let view_rows = anchored_view_rows.min(capacity);
     (view_rows, rows - view_rows)
 }
 
@@ -3701,9 +3724,11 @@ fn compose_screen(
     let start = start.min(wrapped.len());
     let end = (start + view_rows).min(wrapped.len());
     let mut screen = Vec::with_capacity(view_rows + live.len());
+    screen.extend((0..view_rows.saturating_sub(wrapped.len())).map(|_| PaintLine::blank()));
     screen.extend(wrapped[start..end].iter().cloned());
-    // `split_rows` never asks for more transcript than there is, so this only
-    // guards the invariant rather than laying anything out.
+    // A plan can skip separator rows at the start of its transcript window.
+    // Any remaining shortfall stays below that slice; only a genuinely short
+    // anchored transcript receives the leading padding above.
     screen.resize(view_rows, PaintLine::blank());
     let cursor_line = screen.len() + live_cursor_line;
     screen.extend(live);
@@ -15024,6 +15049,40 @@ mod tests {
         let mut stabilized = completed_frame();
         assert!(stabilized.absorb_leading_spacer());
         assert_eq!(screen_row(&completed_transcript, stabilized), streaming_row);
+    }
+
+    #[test]
+    fn response_collapse_keeps_the_final_answer_on_its_previous_row() {
+        let rows = 10;
+        let live_rows = 2;
+        let answer = PaintLine::plain("마지막 답변");
+        let before = text_rows(8, "progress")
+            .into_iter()
+            .chain([answer.clone(), PaintLine::blank()])
+            .collect::<Vec<_>>();
+        let anchored_view_rows = split_rows(rows, live_rows, before.len()).0;
+        let answer_row = |wrapped: &[PaintLine]| {
+            let (view_rows, _) = split_rows_with_transcript_anchor(
+                rows,
+                live_rows,
+                wrapped.len(),
+                Some(anchored_view_rows),
+            );
+            let start = wrapped.len().saturating_sub(view_rows);
+            compose_screen(wrapped, text_rows(live_rows, "live"), view_rows, start, 0)
+                .0
+                .iter()
+                .position(|line| line.text == "마지막 답변")
+                .expect("answer row")
+        };
+
+        let before_row = answer_row(&before);
+        let after = text_rows(5, "progress")
+            .into_iter()
+            .chain([answer, PaintLine::blank()])
+            .collect::<Vec<_>>();
+
+        assert_eq!(answer_row(&after), before_row);
     }
 
     #[test]
