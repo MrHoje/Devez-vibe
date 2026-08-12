@@ -236,7 +236,7 @@ impl Block {
         let child_id = children.first().map(Block::id);
         let mut block = Self::new(
             BlockKind::ProgressGroup,
-            format!("진행 기록 · {count}개"),
+            format!("{HISTORY_TITLE} · {count}"),
             "",
         );
         if let Some(child_id) = child_id {
@@ -2428,6 +2428,9 @@ impl Renderer {
         let content_rows = rows.saturating_sub(plan_rows).max(1);
         let old_view_rows = split_rows(content_rows, frame.lines.len(), self.wrapped.len()).0;
         self.commit_fullscreen_blocks(committed, width, old_view_rows);
+        if self.scroll_back == 0 && self.wrapped.last() == Some(&PaintLine::blank()) {
+            frame.absorb_leading_spacer();
+        }
         let panel_content = self
             .side_panel
             .map(|layout| {
@@ -3470,6 +3473,22 @@ struct Frame {
     /// drag over them can be mapped back to composer characters.
     composer_layout: Option<ComposerLayout>,
     activity_index: Option<usize>,
+}
+
+impl Frame {
+    /// A committed transcript block already ends in its own separator. When the
+    /// pinned frame starts with another spacer, remove that duplicate and shift
+    /// every frame-local address with it so the completed answer stays put.
+    fn absorb_leading_spacer(&mut self) -> bool {
+        if self.dock_index != 0 || self.lines.first() != Some(&PaintLine::blank()) {
+            return false;
+        }
+        self.lines.remove(0);
+        self.cursor_line = self.cursor_line.saturating_sub(1);
+        self.composer_index = self.composer_index.map(|index| index.saturating_sub(1));
+        self.activity_index = self.activity_index.map(|index| index.saturating_sub(1));
+        true
+    }
 }
 
 struct StatusArea {
@@ -6584,13 +6603,20 @@ fn hunk_start(row: &str) -> Option<(usize, usize)> {
 /// Title the app-server's reasoning summaries stream under, and the only one
 /// that renders as a bare thought instead of a labelled section.
 const THINKING_TITLE: &str = "Thinking…";
+const UPDATED_PLAN_TITLE: &str = "Updated Plan";
+const HISTORY_TITLE: &str = "History";
 
 /// Codex paints a plan update as `- 작업 단계`, the explanation hanging off
 /// a `└`, then one checkbox row per step indented four columns: `✔` for done,
 /// `□` for the rest, with the in-progress step lit instead of dimmed. The body
 /// carries `▸` for that step so the row keeps a status the text alone can't.
 fn plan_lines(block: &Block, width: u16) -> Vec<PaintLine> {
-    let mut lines = wrapped_line("- ", Tone::Plain, &block.title, Tone::Plain, true, width);
+    let title = if block.title == "작업 단계" {
+        UPDATED_PLAN_TITLE
+    } else {
+        &block.title
+    };
+    let mut lines = wrapped_line("- ", Tone::Plain, title, Tone::Plain, true, width);
     let mut steps = 0usize;
     for row in block.body.lines().filter(|row| !row.trim().is_empty()) {
         // The checkbox itself is never struck through, only the step behind it.
@@ -6657,11 +6683,14 @@ fn fixed_plan_summary_lines(
     let displayed_completed = completed.saturating_sub(usize::from(all_completed && plan_active));
     let title = if all_completed && plan_active {
         format!(
-            "작업 단계 · {displayed_completed} / {} 진행 중",
+            "{UPDATED_PLAN_TITLE} · {displayed_completed} / {} 진행 중",
             summary.steps.len()
         )
     } else {
-        format!("작업 단계 · {completed} / {} 완료", summary.steps.len())
+        format!(
+            "{UPDATED_PLAN_TITLE} · {completed} / {} 완료",
+            summary.steps.len()
+        )
     };
     if !summary.expanded {
         let tail = format!("{PLAN_TOGGLE_HINT}▼ ──");
@@ -6898,11 +6927,14 @@ fn side_panel_plan_lines(
     let displayed_completed = completed.saturating_sub(usize::from(all_completed && plan_active));
     let mut title = if all_completed && plan_active {
         format!(
-            "작업 단계  {displayed_completed} / {} 진행 중",
+            "{UPDATED_PLAN_TITLE}  {displayed_completed} / {} 진행 중",
             summary.steps.len()
         )
     } else {
-        format!("작업 단계  {completed} / {} 완료", summary.steps.len())
+        format!(
+            "{UPDATED_PLAN_TITLE}  {completed} / {} 완료",
+            summary.steps.len()
+        )
     };
     // The card prints its own total once every step is done. The panel has no
     // room for a line of its own, so the same total rides on the heading.
@@ -11268,7 +11300,7 @@ mod tests {
         ];
         renderer.side_panel = Some(layout);
         renderer.side_panel_content = vec![
-            PaintLine::plain("작업 단계  1 / 1 완료"),
+            PaintLine::plain("Updated Plan  1 / 1 완료"),
             PaintLine::blank(),
             PaintLine::plain("panel step"),
         ];
@@ -14399,6 +14431,60 @@ mod tests {
     }
 
     #[test]
+    fn completed_answer_stays_on_the_streaming_row() {
+        let rows = 8;
+        let older = text_rows(12, "old");
+        let answer = PaintLine::plain("마지막 답변");
+        let activity = PaintLine::plain("상태");
+        let composer = PaintLine::plain("입력창");
+        let screen_row = |wrapped: &[PaintLine], mut frame: Frame| {
+            let (view_rows, live_rows) = split_rows(rows, frame.lines.len(), wrapped.len());
+            fit_frame(&mut frame, live_rows);
+            let start = wrapped.len().saturating_sub(view_rows);
+            compose_screen(wrapped, frame.lines, view_rows, start, frame.cursor_line)
+                .0
+                .iter()
+                .position(|line| line.text == "마지막 답변")
+                .expect("answer row")
+        };
+        let streaming = Frame {
+            lines: vec![
+                answer.clone(),
+                PaintLine::blank(),
+                activity.clone(),
+                composer.clone(),
+            ],
+            cursor_line: 3,
+            cursor_col: 0,
+            show_cursor: true,
+            dock_index: 2,
+            composer_index: Some(3),
+            composer_layout: None,
+            activity_index: Some(2),
+        };
+        let streaming_row = screen_row(&older, streaming);
+
+        let mut completed_transcript = older;
+        completed_transcript.extend([answer, PaintLine::blank()]);
+        let completed_frame = || Frame {
+            lines: vec![PaintLine::blank(), activity.clone(), composer.clone()],
+            cursor_line: 2,
+            cursor_col: 0,
+            show_cursor: true,
+            dock_index: 0,
+            composer_index: Some(2),
+            composer_layout: None,
+            activity_index: Some(1),
+        };
+        let shifted_row = screen_row(&completed_transcript, completed_frame());
+        assert_eq!(shifted_row + 1, streaming_row);
+
+        let mut stabilized = completed_frame();
+        assert!(stabilized.absorb_leading_spacer());
+        assert_eq!(screen_row(&completed_transcript, stabilized), streaming_row);
+    }
+
+    #[test]
     fn the_welcome_card_stays_at_the_top_while_the_composer_reaches_the_bottom() {
         // `dock_index` is what `fit_frame` pads at, so the welcome row above it
         // holds still while the composer below it is pushed to the last row.
@@ -15468,7 +15554,7 @@ mod tests {
         );
 
         assert_eq!(lines[0].prefix, "- ");
-        assert_eq!(lines[0].text, "작업 단계");
+        assert_eq!(lines[0].text, UPDATED_PLAN_TITLE);
         assert!(lines[0].bold);
         assert_eq!(lines[1].prefix, "  └ ");
         assert_eq!(lines[1].text, "why");
@@ -17481,7 +17567,7 @@ mod tests {
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, true, None, None);
 
         assert_eq!(lines.len(), 12);
-        assert!(painted(&lines[0]).starts_with("┌── 작업 단계 · 0 / 7 완료"));
+        assert!(painted(&lines[0]).starts_with("┌── Updated Plan · 0 / 7 완료"));
         assert!(painted(&lines[0]).ends_with('┐'));
         assert!(lines[0].tail.iter().any(|span| span.text == " Alt + W "));
         assert!(lines[0].tail.iter().any(|span| span.tone == Tone::FastOff));
@@ -17530,7 +17616,7 @@ mod tests {
 
         // The total rides on the heading only once every step is done, the same
         // rule the card's own total line follows.
-        assert_eq!(painted(&content[0]), "▲ 작업 단계  1 / 3 완료");
+        assert_eq!(painted(&content[0]), "▲ Updated Plan  1 / 3 완료");
         assert_eq!(
             content[0].pick.as_ref().and_then(|picks| picks.at(0)),
             Some(Pick::PlanSummary)
@@ -17555,7 +17641,7 @@ mod tests {
         let mut frame = CellFrame::new(140, 9);
         paint_side_panel_into_frame(&mut frame, layout, 9, &content, None);
 
-        let heading: String = (0..UnicodeWidthStr::width("작업 단계"))
+        let heading: String = (0..UnicodeWidthStr::width(UPDATED_PLAN_TITLE))
             .map(|offset| {
                 frame
                     .cell(layout.content_left() + 2 + offset, 1)
@@ -17563,7 +17649,7 @@ mod tests {
                     .clone()
             })
             .collect();
-        assert_eq!(heading, "작업 단계");
+        assert_eq!(heading, UPDATED_PLAN_TITLE);
         let right = layout.panel_left + layout.panel_width - 1;
         for row in [1, 7] {
             assert_eq!(frame.cell(layout.panel_left, row).glyph, " ");
@@ -17595,21 +17681,21 @@ mod tests {
             ..summary
         };
         let waiting = side_panel_plan_lines(&finished, layout.content_width(), 0.0, true);
-        assert_eq!(painted(&waiting[0]), "▲ 작업 단계  2 / 3 진행 중");
+        assert_eq!(painted(&waiting[0]), "▲ Updated Plan  2 / 3 진행 중");
         assert_ne!(waiting[4].prefix, "✔ ");
         assert_eq!(waiting[4].prefix_tone, Tone::Accent);
         assert_eq!(waiting[4].tone, Tone::Accent);
         assert!(waiting.iter().all(|line| !painted(line).contains('⏱')));
 
         let waiting_card = fixed_plan_summary_lines(&finished, 80, 0.0, true, None, None);
-        assert!(painted(&waiting_card[0]).contains("작업 단계 · 2 / 3 진행 중"));
+        assert!(painted(&waiting_card[0]).contains("Updated Plan · 2 / 3 진행 중"));
         assert_ne!(waiting_card[4].prefix, "  ✔  ");
         assert_eq!(waiting_card[4].prefix_tone, Tone::Accent);
         assert_eq!(waiting_card[4].tone, Tone::Accent);
         assert!(waiting_card.iter().all(|line| !painted(line).contains('⏱')));
 
         let done = side_panel_plan_lines(&finished, layout.content_width(), 0.0, false);
-        assert_eq!(painted(&done[0]), "▲ 작업 단계  3 / 3 완료  [⏱  1m 25s]");
+        assert_eq!(painted(&done[0]), "▲ Updated Plan  3 / 3 완료  [⏱  1m 25s]");
         assert_eq!(done[4].prefix, "✔ ");
     }
 
@@ -17693,7 +17779,7 @@ mod tests {
         );
 
         assert_eq!(plan.len(), 3);
-        assert_eq!(painted(&plan[0]), "▼ 작업 단계  0 / 1 완료");
+        assert_eq!(painted(&plan[0]), "▼ Updated Plan  0 / 1 완료");
         assert_eq!(
             plan[0].pick.as_ref().and_then(|picks| picks.at(0)),
             Some(Pick::PlanSummary)
@@ -17970,11 +18056,11 @@ mod tests {
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None, None);
 
         assert_eq!(lines.len(), 2);
-        assert!(painted(&lines[0]).starts_with("─── 작업 단계"));
+        assert!(painted(&lines[0]).starts_with("─── Updated Plan"));
         assert!(painted(&lines[0]).trim_end().ends_with("Alt + W ▼ ──"));
         assert_eq!(lines[0].tail[0].tone, Tone::FastOff);
         assert!(!painted(&lines[0]).contains(['┌', '┐']));
-        assert_eq!(pick_on(&lines[0], "작업 단계"), None);
+        assert_eq!(pick_on(&lines[0], UPDATED_PLAN_TITLE), None);
         assert_eq!(pick_on(&lines[0], "▼"), Some(Pick::PlanSummary));
         assert!(lines[1] == PaintLine::blank());
         assert_eq!(
@@ -18084,7 +18170,7 @@ mod tests {
             .map(painted)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(!ordinary.contains("진행 기록"));
+        assert!(!ordinary.contains(HISTORY_TITLE));
         assert!(ordinary.contains("첫 진행 메시지"));
         assert!(ordinary.contains("두 번째 진행 메시지"));
 
@@ -18096,7 +18182,7 @@ mod tests {
             .map(painted)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(super_vibe.contains("진행 기록 · 2개"));
+        assert!(super_vibe.contains("History · 2"));
         assert!(!super_vibe.contains("첫 진행 메시지"));
     }
 
@@ -18313,7 +18399,7 @@ mod tests {
         assert_eq!(PLAN_SHIMMER_BAND, SHIMMER_BAND * 2.5);
         assert_eq!(PLAN_SHIMMER_LOOPS, 5.0);
         let title =
-            plan_title_shimmer_spans("작업 단계 · 1 / 3 완료", Some(0.125), Tone::EffortMedium);
+            plan_title_shimmer_spans("Updated Plan · 1 / 3 완료", Some(0.125), Tone::EffortMedium);
 
         assert!(
             title
@@ -18321,7 +18407,7 @@ mod tests {
                 .any(|span| matches!(span.tone, Tone::PlanShimmer(_, _)))
         );
         assert_eq!(
-            plan_title_shimmer_spans("작업 단계 · 1 / 3 완료", None, Tone::EffortMedium)[0].tone,
+            plan_title_shimmer_spans("Updated Plan · 1 / 3 완료", None, Tone::EffortMedium)[0].tone,
             Tone::Plain
         );
     }

@@ -14775,7 +14775,7 @@ mod tests {
             .iter()
             .map(|block| block.title.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(titles[0], "진행 기록 · 1개");
+        assert_eq!(titles[0], "History · 1");
         assert_eq!(titles[1], "Shell · 1 command · completed · 1.6s");
         assert_eq!(titles[3], "Codex");
         assert!(matches!(state.committed[0].kind, BlockKind::ProgressGroup));
@@ -15114,7 +15114,7 @@ mod tests {
             .map(|block| block.title.as_str())
             .collect::<Vec<_>>();
         assert_eq!(titles.len(), 3);
-        assert_eq!(titles[0], "진행 기록 · 1개");
+        assert_eq!(titles[0], "History · 1");
         assert_eq!(state.committed[0].children().len(), 1);
         assert_eq!(titles[1], "Update(0 files)");
         assert_eq!(titles[2], "Codex");
@@ -16942,7 +16942,7 @@ mod tests {
             .expect("progress group");
 
         assert_eq!(group.children().len(), 2);
-        assert_eq!(group.title, "진행 기록 · 2개");
+        assert_eq!(group.title, "History · 2");
         assert!(state.response_collapse_view().is_some());
     }
 
