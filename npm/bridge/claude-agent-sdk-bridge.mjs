@@ -850,7 +850,7 @@ async function claudeSkills(params) {
   const installed = await runClaudeJson(params, ["plugin", "list", "--json"]);
   const skills = [];
   for (const plugin of Array.isArray(installed) ? installed : []) {
-    if (!plugin?.enabled || !plugin.installPath) continue;
+    if (!plugin?.installPath) continue;
     try {
       for (const child of await readdir(join(plugin.installPath, "skills"), { withFileTypes: true })) {
         if (!child.isDirectory()) continue;
@@ -858,7 +858,9 @@ async function claudeSkills(params) {
           name: child.name,
           path: join(plugin.installPath, "skills", child.name, "SKILL.md"),
           description: `${plugin.id} plugin skill`,
-          enabled: true,
+          enabled: Boolean(plugin.enabled),
+          scope: plugin.scope || "user",
+          pluginId: plugin.id,
         });
       }
     } catch { /* Plugins do not have to provide skills. */ }

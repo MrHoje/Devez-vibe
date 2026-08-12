@@ -1349,7 +1349,12 @@ pub enum Action {
     /// plugin installed this session takes effect without relaunching.
     ReloadPlugins,
     ShowSkills,
+    OpenSkills {
+        provider: SkillProvider,
+        notice: Option<String>,
+    },
     SetSkill {
+        provider: SkillProvider,
         name: String,
         enabled: bool,
     },
@@ -1748,6 +1753,13 @@ enum PendingInteraction {
     StatusLinePicker {
         selected: usize,
     },
+    SkillsPicker {
+        provider: SkillProvider,
+        selected: usize,
+        skills: Vec<SkillBinding>,
+        errors: Vec<String>,
+        notice: Option<String>,
+    },
     /// Second step of `/model`: how long the pick should last. Asked after the
     /// model is chosen so the common case (this session) stays two keystrokes.
     ModelScope {
@@ -1864,12 +1876,44 @@ impl DisplaySetting {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkillProvider {
+    Claude,
+    Codex,
+}
+
+impl SkillProvider {
+    pub fn from_model(model: &str) -> Self {
+        if model.starts_with("claude:") || model.starts_with("opencode:") {
+            Self::Claude
+        } else {
+            Self::Codex
+        }
+    }
+
+    pub const fn model_hint(self) -> &'static str {
+        match self {
+            Self::Claude => "claude:sonnet",
+            Self::Codex => "gpt-5",
+        }
+    }
+
+    const fn other(self) -> Self {
+        match self {
+            Self::Claude => Self::Codex,
+            Self::Codex => Self::Claude,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SkillBinding {
     name: String,
     path: String,
     description: String,
     enabled: bool,
+    scope: String,
+    source: Option<String>,
 }
 
 #[derive(Clone)]
@@ -2727,6 +2771,12 @@ fn parse_skill_bindings(response: &Value) -> Vec<SkillBinding> {
                 description: skill
                     .get("description")
                     .and_then(Value::as_str)
+                    .or_else(|| {
+                        skill
+                            .get("interface")
+                            .and_then(|interface| interface.get("shortDescription"))
+                            .and_then(Value::as_str)
+                    })
                     .or_else(|| skill.get("shortDescription").and_then(Value::as_str))
                     .unwrap_or_default()
                     .to_owned(),
@@ -2734,7 +2784,39 @@ fn parse_skill_bindings(response: &Value) -> Vec<SkillBinding> {
                     .get("enabled")
                     .and_then(Value::as_bool)
                     .unwrap_or(true),
+                scope: skill
+                    .get("scope")
+                    .and_then(Value::as_str)
+                    .unwrap_or("user")
+                    .to_owned(),
+                source: skill
+                    .get("pluginId")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
             })
+        })
+        .collect()
+}
+
+fn parse_skill_errors(response: &Value) -> Vec<String> {
+    response
+        .get("data")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .get("errors")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+        })
+        .filter_map(|error| {
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
         })
         .collect()
 }
@@ -2991,6 +3073,7 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
             | PendingInteraction::ClaudePermissionRuleInput { .. }
             | PendingInteraction::VibeModePicker { .. }
             | PendingInteraction::StatusLinePicker { .. }
+            | PendingInteraction::SkillsPicker { .. }
             | PendingInteraction::SubagentTranscript { .. }
             | PendingInteraction::SessionPicker(_)
             | PendingInteraction::ProviderPicker(_)
@@ -4307,6 +4390,35 @@ impl AppState {
     pub fn update_skills(&mut self, response: &Value) {
         self.skills = parse_skill_bindings(response);
         self.rebuild_completion_catalog();
+    }
+
+    pub fn update_skills_for_provider(&mut self, provider: SkillProvider, response: &Value) {
+        if SkillProvider::from_model(self.selected_model_name()) == provider {
+            self.update_skills(response);
+        }
+    }
+
+    pub fn open_skills_picker(
+        &mut self,
+        provider: SkillProvider,
+        response: &Value,
+        notice: Option<String>,
+    ) {
+        self.update_skills_for_provider(provider, response);
+        let mut skills = parse_skill_bindings(response);
+        skills.sort_by(|left, right| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        self.pending = Some(PendingInteraction::SkillsPicker {
+            provider,
+            selected: 0,
+            skills,
+            errors: parse_skill_errors(response),
+            notice,
+        });
     }
 
     pub fn update_plugins(&mut self, response: &Value) {
@@ -7705,12 +7817,14 @@ impl AppState {
             "/skills" if parts.len() == 1 => Action::ShowSkills,
             "/skills" if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("enable") => {
                 Action::SetSkill {
+                    provider: SkillProvider::from_model(self.selected_model_name()),
                     name: parts[2..].join(" "),
                     enabled: true,
                 }
             }
             "/skills" if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("disable") => {
                 Action::SetSkill {
+                    provider: SkillProvider::from_model(self.selected_model_name()),
                     name: parts[2..].join(" "),
                     enabled: false,
                 }
@@ -8448,6 +8562,53 @@ impl AppState {
                     Action::None
                 }
             },
+            PendingInteraction::SkillsPicker {
+                provider,
+                mut selected,
+                skills,
+                errors,
+                notice,
+            } => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter => return Action::None,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                        return Action::OpenSkills {
+                            provider: provider.other(),
+                            notice: None,
+                        };
+                    }
+                    KeyCode::Up | KeyCode::Char('k') if !ctrl && !alt => {
+                        selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Char('p') if ctrl => {
+                        selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if !ctrl && !alt => {
+                        selected = (selected + 1).min(skills.len().saturating_sub(1));
+                    }
+                    KeyCode::Char('n') if ctrl => {
+                        selected = (selected + 1).min(skills.len().saturating_sub(1));
+                    }
+                    KeyCode::Char(' ') => {
+                        if let Some(skill) = skills.get(selected) {
+                            return Action::SetSkill {
+                                provider,
+                                name: skill.path.clone(),
+                                enabled: !skill.enabled,
+                            };
+                        }
+                    }
+                    _ => {}
+                }
+                self.pending = Some(PendingInteraction::SkillsPicker {
+                    provider,
+                    selected,
+                    skills,
+                    errors,
+                    notice,
+                });
+                Action::None
+            }
             PendingInteraction::ThemePicker { mut theme_index } => {
                 match key.code {
                     KeyCode::Esc => return Action::None,
@@ -9447,6 +9608,100 @@ impl AppState {
                 input_label: "",
                 input_placeholder: "",
             }),
+            PendingInteraction::SkillsPicker {
+                provider,
+                selected,
+                skills,
+                errors,
+                notice,
+            } => {
+                let window = visible_window(Some(*selected), skills.len(), PICKER_ROWS);
+                let mut lines = Vec::new();
+                if let Some(notice) = notice.as_deref() {
+                    lines.push(OverlayLine {
+                        text: format!("✓ {notice}"),
+                        selected: false,
+                        muted: true,
+                    });
+                }
+                lines.extend(errors.iter().map(|error| OverlayLine {
+                    text: format!("▲ {error}"),
+                    selected: false,
+                    muted: true,
+                }));
+                let prefix_rows = lines.len();
+                if prefix_rows > 0 {
+                    lines.push(OverlayLine {
+                        text: String::new(),
+                        selected: false,
+                        muted: true,
+                    });
+                }
+                lines.extend(skills[window.clone()].iter().enumerate().map(
+                    |(offset, skill)| {
+                        let index = window.start + offset;
+                        let source = skill.source.as_deref().map(|source| {
+                            format!(" · plugin {source} 전체")
+                        });
+                        let detail = if skill.description.is_empty() {
+                            source.unwrap_or_default()
+                        } else {
+                            format!("{}{}", skill.description, source.unwrap_or_default())
+                        };
+                        OverlayLine {
+                            text: if detail.is_empty() {
+                                format!(
+                                    "{} ${}  ·  {}",
+                                    if skill.enabled { '☑' } else { '☐' },
+                                    skill.name,
+                                    skill.scope
+                                )
+                            } else {
+                                format!(
+                                    "{} ${}  ·  {}\n{}",
+                                    if skill.enabled { '☑' } else { '☐' },
+                                    skill.name,
+                                    skill.scope,
+                                    detail
+                                )
+                            },
+                            selected: index == *selected,
+                            muted: false,
+                        }
+                    },
+                ));
+                if skills.is_empty() {
+                    lines.push(OverlayLine {
+                        text: "설치된 Skill이 없습니다.".to_owned(),
+                        selected: false,
+                        muted: true,
+                    });
+                }
+                Some(OverlayView {
+                    closable: true,
+                    title: format!(
+                        "Skills · {}  {}",
+                        if *provider == SkillProvider::Claude {
+                            "[Claude]"
+                        } else {
+                            "Claude"
+                        },
+                        if *provider == SkillProvider::Codex {
+                            "[Codex]"
+                        } else {
+                            "Codex"
+                        }
+                    ),
+                    lines,
+                    slider: None,
+                    hint: "←→ provider  ·  ↑↓ navigate  ·  Space toggle  ·  Enter/Esc close"
+                        .to_owned(),
+                    style: OverlayStyle::Picker,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                })
+            }
             PendingInteraction::ThemePicker { theme_index } => Some(OverlayView {
                 closable: false,
                 title: "Theme".to_owned(),
@@ -10754,6 +11009,37 @@ impl AppState {
             // a mis-aimed click never drops a provider.
             Some(PendingInteraction::RuntimePicker { .. }) if row < RUNTIME_CHOICES.len() => {
                 self.apply_runtime_choice(row)
+            }
+            Some(PendingInteraction::SkillsPicker {
+                provider,
+                selected,
+                skills,
+                errors,
+                notice,
+            }) => {
+                let prefix_rows = errors.len() + usize::from(notice.is_some());
+                let prefix_rows = prefix_rows + usize::from(prefix_rows > 0);
+                let window = visible_window(Some(selected), skills.len(), PICKER_ROWS);
+                let clicked = row
+                    .checked_sub(prefix_rows)
+                    .and_then(|row| window.start.checked_add(row));
+                match clicked.and_then(|index| skills.get(index)) {
+                    Some(skill) => Action::SetSkill {
+                        provider,
+                        name: skill.path.clone(),
+                        enabled: !skill.enabled,
+                    },
+                    None => {
+                        self.pending = Some(PendingInteraction::SkillsPicker {
+                            provider,
+                            selected,
+                            skills,
+                            errors,
+                            notice,
+                        });
+                        Action::Tick(false)
+                    }
+                }
             }
             Some(PendingInteraction::StatusLinePicker { .. })
                 if row < StatusLineField::ALL.len() =>
@@ -16286,6 +16572,80 @@ mod tests {
     }
 
     #[test]
+    fn skills_picker_separates_providers_and_toggles_the_selected_skill() {
+        let response = json!({
+            "data": [{
+                "skills": [{
+                    "name": "browser",
+                    "path": "C:/claude/plugins/browser/skills/browser/SKILL.md",
+                    "description": "Browser automation",
+                    "enabled": true,
+                    "scope": "user",
+                    "pluginId": "browser@official"
+                }]
+            }]
+        });
+        let mut state = test_state();
+        state.open_skills_picker(SkillProvider::Claude, &response, None);
+
+        let overlay = state.overlay_view().expect("skills picker");
+        assert_eq!(overlay.title, "Skills · [Claude]  Codex");
+        assert!(overlay.lines[0].text.starts_with("☑ $browser"));
+        assert!(
+            overlay.lines[0]
+                .text
+                .contains("plugin browser@official 전체")
+        );
+
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Char(' '))),
+            Action::SetSkill {
+                provider: SkillProvider::Claude,
+                ref name,
+                enabled: false,
+            } if name.ends_with("browser/SKILL.md")
+        ));
+
+        state.open_skills_picker(SkillProvider::Claude, &response, None);
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Right)),
+            Action::OpenSkills {
+                provider: SkillProvider::Codex,
+                notice: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn clicking_a_skill_row_skips_notice_rows_and_toggles_it() {
+        let response = json!({
+            "data": [{
+                "skills": [{
+                    "name": "review",
+                    "path": "C:/skills/review/SKILL.md",
+                    "enabled": false,
+                    "scope": "repo"
+                }]
+            }]
+        });
+        let mut state = test_state();
+        state.open_skills_picker(
+            SkillProvider::Codex,
+            &response,
+            Some("설정이 저장되었습니다.".to_owned()),
+        );
+
+        assert!(matches!(
+            state.click_overlay_row(2),
+            Action::SetSkill {
+                provider: SkillProvider::Codex,
+                ref name,
+                enabled: true,
+            } if name == "C:/skills/review/SKILL.md"
+        ));
+    }
+
+    #[test]
     fn modified_enter_keys_insert_newlines_without_submitting() {
         for modifiers in [KeyModifiers::CONTROL, KeyModifiers::SHIFT] {
             let mut state = test_state();
@@ -19634,6 +19994,7 @@ mod tests {
         assert!(matches!(
             state.run_slash_command("/skills disable imagegen"),
             Action::SetSkill {
+                provider: SkillProvider::Codex,
                 ref name,
                 enabled: false
             } if name == "imagegen"

@@ -9863,7 +9863,7 @@ fn corner_composer_rule(mut line: PaintLine, left: char, right: char) -> PaintLi
 }
 
 /// Widest badge that fits in `budget`. Codex places Response after Vibe;
-/// Claude places it between Vibe and Access. Tightening drops the optional
+/// Claude places Access before Vibe. Tightening drops the optional
 /// controls as a unit rather than clipping a label.
 fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans> {
     let mut display_spans = Vec::new();
@@ -9940,19 +9940,20 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
             .map(|permission| BadgeSpans {
                 spans: [
                     display_spans.clone(),
-                    [primary_spans.clone(), vec![separator_span()]].concat(),
                     vec![PaintSpan {
                         text: permission.label.clone(),
                         tone: permission_tone(permission.tone),
                         bold: false,
                     }],
+                    vec![separator_span()],
+                    primary_spans.clone(),
                 ]
                 .concat(),
-                vibe_mode_index: Some(display_width),
-                response_display_mode_index: show_response.then_some(display_width + 2),
+                vibe_mode_index: Some(display_width + 2),
+                response_display_mode_index: show_response.then_some(display_width + 4),
                 shell_display_mode_index: None,
                 diff_display_mode_index: None,
-                permission_index: Some(display_width + primary_spans.len() + 1),
+                permission_index: Some(display_width),
             })
             .chain(std::iter::once(BadgeSpans {
                 spans: [display_spans.clone(), primary_spans.clone()].concat(),
@@ -14061,7 +14062,7 @@ mod tests {
         assert!(!painted(&line).contains("Fast:"));
     }
 
-    /// Claude keeps Response between Vibe and its permission mode, with each
+    /// Claude places its permission mode before Vibe, with each
     /// control painted in its own colour and clickable on its own columns.
     #[test]
     fn claude_composer_shows_the_permission_mode_in_the_fast_slot() {
@@ -14074,17 +14075,36 @@ mod tests {
 
         let line = input_top_line(120, "", Some(&mode));
 
-        assert!(painted(&line).contains("Vibe: On · ⏸ plan mode"));
+        assert!(painted(&line).contains("⏸ plan mode · Vibe: On"));
         assert!(!painted(&line).contains("Response:"));
         assert!(painted(&line).contains("⏸ plan mode"));
         assert_eq!(
             pick_on(&line, "⏸ plan mode"),
             Some(Pick::ClaudePermissionMode)
         );
+        assert_eq!(pick_on(&line, "Vibe: On"), Some(Pick::VibeMode));
         assert!(
             line.tail
                 .iter()
                 .any(|span| span.tone == Tone::ClaudePlan && span.text.contains("plan mode"))
+        );
+    }
+
+    #[test]
+    fn claude_super_vibe_keeps_response_after_vibe() {
+        let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, false);
+        mode.model = "claude:sonnet".to_owned();
+        mode.claude_permission = Some(PermissionBadge {
+            label: "⏸ plan mode".to_owned(),
+            tone: PermissionTone::Plan,
+        });
+
+        let line = input_top_line(120, "", Some(&mode));
+
+        assert!(painted(&line).contains("⏸ plan mode · Vibe: Super Vibe · Response: Completed"));
+        assert_eq!(
+            pick_on(&line, "Response: Completed"),
+            Some(Pick::ResponseDisplayMode)
         );
     }
 

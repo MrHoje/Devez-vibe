@@ -48,7 +48,8 @@ use renderer::{
 use serde_json::{Value, json};
 use state::{
     AccountPlan, Action, AppState, DiffDisplayMode, LoginMethod, ModelInfo, SessionInfo,
-    SessionPicker, SessionPickerResult, ShellDisplayMode, VibeMode, load_model_context_windows,
+    SessionPicker, SessionPickerResult, ShellDisplayMode, SkillProvider, VibeMode,
+    load_model_context_windows,
 };
 use tokio::{
     sync::mpsc,
@@ -2675,69 +2676,83 @@ async fn execute_action(
                 }
             }
         }
-        Action::ShowSkills => match list_skills(server, &state.cwd, true).await {
-            Ok(response) => {
-                state.update_skills(&response);
-                state.push_notice(BlockKind::System, "Skills", format_skills(&response));
-            }
-            Err(error) => state.push_notice(BlockKind::Error, "Skill 목록 실패", error.to_string()),
-        },
-        Action::SetSkill { name, enabled } => match list_skills(server, &state.cwd, false).await {
+        Action::ShowSkills => {
+            let provider = SkillProvider::from_model(state.selected_model_name());
+            open_skills(server, state, provider, None).await;
+        }
+        Action::OpenSkills { provider, notice } => {
+            open_skills(server, state, provider, notice).await;
+        }
+        Action::SetSkill {
+            provider,
+            name,
+            enabled,
+        } => match list_skills(server, &state.cwd, false, provider).await {
             Ok(skills) => match resolve_skill(&skills, &name) {
-                Some(skill) if skill.enabled == enabled => state.push_notice(
-                    BlockKind::System,
-                    "Skill unchanged",
-                    format!(
-                        "{} · already {}",
-                        skill.name,
-                        if enabled { "enabled" } else { "disabled" }
-                    ),
-                ),
-                Some(skill) => match server
-                    .request(
-                        "skills/config/write",
-                        json!({
-                            "name": null,
-                            "path": skill.path,
-                            "enabled": enabled
-                        }),
+                Some(skill) if skill.enabled == enabled => {
+                    open_skills(
+                        server,
+                        state,
+                        provider,
+                        Some(format!(
+                            "{} · 이미 {}",
+                            skill.name,
+                            if enabled { "켜짐" } else { "꺼짐" }
+                        )),
                     )
-                    .await
-                {
-                    Ok(response) => {
-                        let effective = response
-                            .get("effectiveEnabled")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(enabled);
-                        state.push_notice(
-                            BlockKind::System,
-                            "✓ Skill updated",
-                            format!(
-                                "{} · {}",
-                                skill.name,
-                                if effective { "enabled" } else { "disabled" }
-                            ),
-                        );
-                        let _ = refresh_integrations(server, state, true).await;
+                    .await;
+                }
+                Some(skill) => {
+                    match write_skill_enabled(server, &state.cwd, provider, &skill, enabled).await {
+                        Ok(response) => {
+                            let effective = response
+                                .get("effectiveEnabled")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(enabled);
+                            open_skills(
+                                server,
+                                state,
+                                provider,
+                                Some(format!(
+                                    "{} · {}",
+                                    skill.name,
+                                    if effective { "켜짐" } else { "꺼짐" }
+                                )),
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            open_skills(
+                                server,
+                                state,
+                                provider,
+                                Some(format!("{} · 변경 실패: {error}", skill.name)),
+                            )
+                            .await;
+                        }
                     }
-                    Err(error) => {
-                        state.push_notice(BlockKind::Error, "Skill 변경 실패", error.to_string())
-                    }
-                },
-                None => state.push_notice(
-                    BlockKind::Error,
-                    "Skill을 찾을 수 없음",
-                    format!("{name}\n/skills에서 정확한 이름을 확인하세요."),
-                ),
+                }
+                None => {
+                    open_skills(
+                        server,
+                        state,
+                        provider,
+                        Some(format!("{name} · Skill을 찾을 수 없습니다.")),
+                    )
+                    .await;
+                }
             },
             Err(error) => state.push_notice(BlockKind::Error, "Skill 조회 실패", error.to_string()),
         },
-        Action::RefreshSkills => match list_skills(server, &state.cwd, true).await {
-            Ok(response) => state.update_skills(&response),
-            Err(error) => {
-                state.push_notice(BlockKind::Warning, "Skill 새로고침 실패", error.to_string())
+        Action::RefreshSkills => {
+            let provider = SkillProvider::from_model(state.selected_model_name());
+            match list_skills(server, &state.cwd, true, provider).await {
+                Ok(response) => state.update_skills_for_provider(provider, &response),
+                Err(error) => {
+                    state.push_notice(BlockKind::Warning, "Skill 새로고침 실패", error.to_string())
+                }
             }
-        },
+        }
         // The pick is already live for this session; this only makes it stick.
         Action::PersistModelDefault { model, effort } => {
             let writes = [("model", model), ("model_reasoning_effort", effort)];
@@ -3575,16 +3590,47 @@ fn new_thread_params(
     params
 }
 
-async fn list_skills(server: &BackendServer, cwd: &str, force_reload: bool) -> Result<Value> {
+async fn list_skills(
+    server: &mut BackendServer,
+    cwd: &str,
+    force_reload: bool,
+    provider: SkillProvider,
+) -> Result<Value> {
+    if provider == SkillProvider::Codex {
+        server.start_codex().await?;
+    }
     server
-        .request(
+        .integration_request(
+            provider.model_hint(),
             "skills/list",
             json!({
+                "cwd": cwd,
                 "cwds": [cwd],
                 "forceReload": force_reload
             }),
         )
         .await
+}
+
+async fn open_skills(
+    server: &mut BackendServer,
+    state: &mut AppState,
+    provider: SkillProvider,
+    notice: Option<String>,
+) {
+    match list_skills(server, &state.cwd, true, provider).await {
+        Ok(response) => state.open_skills_picker(provider, &response, notice),
+        Err(error) => {
+            let response = json!({
+                "data": [{
+                    "cwd": state.cwd.clone(),
+                    "skills": [],
+                    "errors": [{ "message": error.to_string() }]
+                }]
+            });
+            state.open_skills_picker(provider, &response, notice);
+        }
+    }
 }
 
 async fn integration_request(
@@ -4055,6 +4101,43 @@ struct ResolvedSkill {
     name: String,
     path: String,
     enabled: bool,
+    source: Option<String>,
+}
+
+async fn write_skill_enabled(
+    server: &BackendServer,
+    cwd: &str,
+    provider: SkillProvider,
+    skill: &ResolvedSkill,
+    enabled: bool,
+) -> Result<Value> {
+    let (method, params) = match provider {
+        SkillProvider::Claude => {
+            let plugin_id = skill
+                .source
+                .as_deref()
+                .context("Claude Skill의 원본 플러그인을 확인할 수 없습니다.")?;
+            (
+                "plugin/set-enabled",
+                json!({
+                    "cwd": cwd,
+                    "pluginId": plugin_id,
+                    "enabled": enabled
+                }),
+            )
+        }
+        SkillProvider::Codex => (
+            "skills/config/write",
+            json!({
+                "name": null,
+                "path": skill.path,
+                "enabled": enabled
+            }),
+        ),
+    };
+    server
+        .integration_request(provider.model_hint(), method, params)
+        .await
 }
 
 fn resolve_skill(response: &Value, query: &str) -> Option<ResolvedSkill> {
@@ -4088,6 +4171,10 @@ fn resolve_skill(response: &Value, query: &str) -> Option<ResolvedSkill> {
                 .get("enabled")
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
+            source: skill
+                .get("pluginId")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
         };
         if name.eq_ignore_ascii_case(query) || path.eq_ignore_ascii_case(query) {
             exact.push(resolved());
@@ -4104,64 +4191,6 @@ fn resolve_skill(response: &Value, query: &str) -> Option<ResolvedSkill> {
         partial.pop()
     } else {
         None
-    }
-}
-
-fn format_skills(response: &Value) -> String {
-    let mut lines = Vec::new();
-    for entry in response
-        .get("data")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default()
-    {
-        for skill in entry
-            .get("skills")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-        {
-            let name = skill.get("name").and_then(Value::as_str).unwrap_or("skill");
-            let enabled = skill
-                .get("enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            let scope = skill.get("scope").and_then(Value::as_str).unwrap_or("user");
-            let description = skill
-                .get("interface")
-                .and_then(|interface| interface.get("shortDescription"))
-                .and_then(Value::as_str)
-                .or_else(|| skill.get("shortDescription").and_then(Value::as_str))
-                .unwrap_or_default();
-            lines.push(format!(
-                "{} ${name} · {scope}{}",
-                if enabled { "✓" } else { "○" },
-                if description.is_empty() {
-                    String::new()
-                } else {
-                    format!(" — {description}")
-                }
-            ));
-        }
-        for error in entry
-            .get("errors")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-        {
-            lines.push(format!(
-                "▲ {}",
-                error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Skill load error")
-            ));
-        }
-    }
-    if lines.is_empty() {
-        "사용 가능한 Skill이 없습니다.".to_owned()
-    } else {
-        lines.join("\n")
     }
 }
 
