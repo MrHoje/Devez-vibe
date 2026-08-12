@@ -3540,9 +3540,9 @@ fn emit_frame_columns(
     Ok(())
 }
 
-/// Repaints a semantic plan row from its first column without moving the
-/// cursor between style runs. ConPTY can duplicate wide glyphs when a host
-/// replays absolute cursor jumps in the middle of a Korean row.
+/// Clears and repaints a semantic plan row from its first column without moving
+/// the cursor between style runs. ConPTY can duplicate wide glyphs when a host
+/// overwrites an existing Korean row or replays a cursor jump in its middle.
 fn emit_row_sequential(
     out: &mut impl Write,
     frame: &CellFrame,
@@ -3552,7 +3552,13 @@ fn emit_row_sequential(
     if frame.width == 0 {
         return Ok(());
     }
-    queue!(out, MoveTo(0, screen_row.min(u16::MAX as usize) as u16))?;
+    queue!(
+        out,
+        MoveTo(0, screen_row.min(u16::MAX as usize) as u16),
+        SetAttribute(Attribute::Reset),
+        ResetColor,
+        Clear(ClearType::CurrentLine)
+    )?;
     let mut column = 0;
     while column + 1 < frame.width {
         let style = frame.cell(column, row).style;
@@ -12310,13 +12316,20 @@ mod tests {
 
     #[test]
     fn korean_plan_row_repaints_without_mid_row_cursor_jumps() {
-        let previous = CellFrame::new(24, 2);
-        let mut current = previous.clone();
-        current.write(0, 0, "• ", CellStyle::plain());
-        current.write(
-            2,
+        let mut previous = CellFrame::new(96, 2);
+        previous.write(0, 0, "  ▸  ", CellStyle::plain());
+        previous.write(
+            5,
             0,
-            "1. 작업 단계 확인",
+            "2. 서버 PTY 세션과 안전한 수명 관리 계층을 구현한다",
+            CellStyle::plain(),
+        );
+        let mut current = CellFrame::new(96, 2);
+        current.write(0, 0, "  ✔  ", CellStyle::plain());
+        current.write(
+            5,
+            0,
+            "2. 서버 PTY 세션과 안전한 수명 관리 계층을 구현한다",
             CellStyle {
                 foreground: Some(Rgb(240, 160, 60)),
                 ..CellStyle::plain()
@@ -12337,10 +12350,17 @@ mod tests {
             .expect("Korean plan row emits");
 
             let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
-            assert!(output.contains("• "));
-            assert!(output.contains("1. 작업 단계 확인"));
+            let row_start = output.find("\x1b[1;1H").expect("row starts at column zero");
+            let clear = output[row_start..]
+                .find("\x1b[2K")
+                .map(|offset| row_start + offset)
+                .expect("the old Korean row is cleared first");
+            let task = output
+                .find("2. 서버 PTY 세션과 안전한 수명 관리 계층을 구현한다")
+                .expect("the complete task is repainted");
+            assert!(row_start < clear && clear < task);
             assert_eq!(output.matches("\x1b[1;1H").count(), 1);
-            assert!(!output.contains("\x1b[1;3H"));
+            assert!(!output.contains("\x1b[1;6H"));
         }
     }
 
