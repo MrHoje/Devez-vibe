@@ -626,6 +626,9 @@ pub struct Renderer {
     /// transcript would otherwise claim newly available rows when expanded and
     /// make its final line jump down even though the composer stayed fixed.
     history_view_rows_anchor: Option<usize>,
+    /// Transcript start held for the render immediately after a prompt-hosted
+    /// History toggle, keeping that prompt on the pointer's screen row.
+    history_view_start_anchor: Option<usize>,
     theme: ThemeKind,
     history: Vec<Block>,
     /// Rows the transcript is held back from its newest end. Zero follows the
@@ -1223,6 +1226,7 @@ impl Renderer {
             last_transcript_start: 0,
             last_transcript_screen_start: 0,
             history_view_rows_anchor: None,
+            history_view_start_anchor: None,
             theme: selected_theme,
             history: Vec::new(),
             scroll_back: 0,
@@ -1306,6 +1310,7 @@ impl Renderer {
         self.scroll_back = target;
         if moved {
             self.history_view_rows_anchor = None;
+            self.history_view_start_anchor = None;
         }
         let preserve_drag = self.selection_in_transcript && self.selection.is_dragging();
         let cleared = !preserve_drag && self.clear_selection();
@@ -1320,6 +1325,7 @@ impl Renderer {
         }
         self.scroll_back = 0;
         self.history_view_rows_anchor = None;
+        self.history_view_start_anchor = None;
         self.clear_selection();
         true
     }
@@ -1352,6 +1358,7 @@ impl Renderer {
         self.scroll_back = target;
         if moved {
             self.history_view_rows_anchor = None;
+            self.history_view_start_anchor = None;
             self.clear_selection();
         }
         moved
@@ -1408,6 +1415,7 @@ impl Renderer {
         self.animation_plan_rows = 0;
         self.last_transcript_rows = 0;
         self.history_view_rows_anchor = None;
+        self.history_view_start_anchor = None;
         self.apply_terminal_theme()?;
         self.reset_screen()
     }
@@ -1424,12 +1432,24 @@ impl Renderer {
             return false;
         };
 
+        self.toggle_tool(id)
+    }
+
+    pub fn toggle_tool(&mut self, id: u64) -> bool {
+        if self.mode != RenderMode::Fullscreen {
+            return false;
+        }
+
         let history_toggle = self
             .history
             .iter()
             .any(|block| block.id() == id && matches!(block.kind, BlockKind::ProgressGroup));
+        let hosted_history_toggle = history_toggle && self.prompt_for_progress_group(id).is_some();
         self.history_view_rows_anchor =
-            (history_toggle && self.scroll_back == 0).then_some(self.last_transcript_rows);
+            (history_toggle && !hosted_history_toggle && self.scroll_back == 0)
+                .then_some(self.last_transcript_rows);
+        self.history_view_start_anchor =
+            hosted_history_toggle.then_some(self.last_transcript_start);
 
         if !self.expanded_tools.remove(&id) {
             self.expanded_tools.insert(id);
@@ -1522,8 +1542,14 @@ impl Renderer {
                 start = end;
             }
         }
-        // A whole-row region runs to the end of the painted row, not past it.
-        Some(columns.start..columns.end.min(painted_line_width(line)))
+        // History owns the prompt's whole painted background, including the
+        // trailing padding that contains no glyphs. Other controls still stop
+        // at their last painted character.
+        if matches!(hovered_pick, Pick::History(_)) {
+            Some(columns)
+        } else {
+            Some(columns.start..columns.end.min(painted_line_width(line)))
+        }
     }
 
     /// A live drag keeps the surface it began on, so leaving the transcript for
@@ -1580,10 +1606,11 @@ impl Renderer {
         const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
         let point = self.selection_point(column, row)?;
-        if self
-            .progress_group_rows
-            .iter()
-            .any(|range| range.contains(&point.row))
+        if matches!(self.pick_at(column, row), Some(Pick::History(_)))
+            || self
+                .progress_group_rows
+                .iter()
+                .any(|range| range.contains(&point.row))
         {
             self.last_click = None;
             return None;
@@ -1922,7 +1949,47 @@ impl Renderer {
             .map(|(_, reveal)| reveal)
     }
 
+    fn progress_group_for_prompt(&self, prompt_id: u64) -> Option<&Block> {
+        let mut current_prompt = None;
+        for block in &self.history {
+            if matches!(block.kind, BlockKind::User) {
+                current_prompt = Some(block.id());
+            } else if matches!(block.kind, BlockKind::ProgressGroup)
+                && current_prompt == Some(prompt_id)
+            {
+                return Some(block);
+            }
+        }
+        None
+    }
+
+    fn prompt_for_progress_group(&self, group_id: u64) -> Option<u64> {
+        let mut prompt_id = None;
+        for block in &self.history {
+            if matches!(block.kind, BlockKind::User) {
+                prompt_id = Some(block.id());
+            } else if matches!(block.kind, BlockKind::ProgressGroup) && block.id() == group_id {
+                return prompt_id;
+            }
+        }
+        None
+    }
+
     fn history_block_lines(&self, block: &Block, width: u16) -> Vec<PaintLine> {
+        if matches!(block.kind, BlockKind::User)
+            && self.fold_progress_groups
+            && let Some(group) = self.progress_group_for_prompt(block.id())
+        {
+            let reveal = self.response_reveal_for(group.id());
+            let expanded = self.expanded_tools.contains(&group.id())
+                || reveal.is_some_and(|value| value > f32::EPSILON);
+            return user_prompt_lines_with_history(
+                block,
+                width,
+                Some((group.id(), &group.title, expanded)),
+                self.chat_layout,
+            );
+        }
         if matches!(block.kind, BlockKind::ProgressGroup) && !self.fold_progress_groups {
             return block
                 .children()
@@ -1938,6 +2005,16 @@ impl Renderer {
                     )
                 })
                 .collect();
+        }
+        if matches!(block.kind, BlockKind::ProgressGroup)
+            && self.prompt_for_progress_group(block.id()).is_some()
+        {
+            return embedded_progress_group_lines(
+                block,
+                width,
+                self.expanded_tools.contains(&block.id()),
+                self.response_reveal_for(block.id()),
+            );
         }
         block_group_lines_at(
             block,
@@ -2005,6 +2082,7 @@ impl Renderer {
             self.wrapped_width = 0;
             self.live_frame_cache = None;
             self.history_view_rows_anchor = None;
+            self.history_view_start_anchor = None;
         }
         let committed_without_startup = view.plan_summary.is_some().then(|| {
             committed
@@ -2025,6 +2103,7 @@ impl Renderer {
             self.fold_progress_groups = view.fold_progress_groups;
             self.wrapped_width = 0;
             self.history_view_rows_anchor = None;
+            self.history_view_start_anchor = None;
         }
         let startup_update_removed =
             view.plan_summary.is_some() && self.remove_startup_update_from_history();
@@ -2038,6 +2117,7 @@ impl Renderer {
         let total_width = total_width.max(20);
         if total_width != self.last_total_width || height != self.last_height {
             self.history_view_rows_anchor = None;
+            self.history_view_start_anchor = None;
         }
         // The panel is docked, not overlaid: every conversation row is laid out
         // against the narrowed main width so nothing runs under the panel.
@@ -2451,6 +2531,7 @@ impl Renderer {
         let content_rows = rows.saturating_sub(plan_rows).max(1);
         if !committed.is_empty() {
             self.history_view_rows_anchor = None;
+            self.history_view_start_anchor = None;
         }
         let old_view_rows = split_rows(content_rows, frame.lines.len(), self.wrapped.len()).0;
         self.commit_fullscreen_blocks(committed, width, old_view_rows);
@@ -2521,7 +2602,10 @@ impl Renderer {
         // `fit_frame` inserts the blanks at the dock, above the composer.
         fit_frame(&mut frame, live_rows);
         let max_back = self.wrapped.len() - view_rows;
-        self.scroll_back = self.scroll_back.min(max_back);
+        self.scroll_back = self.history_view_start_anchor.take().map_or_else(
+            || self.scroll_back.min(max_back),
+            |start| scroll_back_for_transcript_start(self.wrapped.len(), view_rows, start),
+        );
         let start = max_back - self.scroll_back;
         let start = if plan_summary.is_some() && !plan_in_panel {
             transcript_start_below_plan(&self.wrapped, start)
@@ -2647,6 +2731,17 @@ impl Renderer {
                 // replacement wholly after the viewport changes its distance
                 // from the bottom.
                 if self.scroll_back > 0 && relation == ViewportRelation::After {
+                    let row_delta = self.wrapped.len() as isize - before as isize;
+                    self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
+                }
+            } else if matches!(block.kind, BlockKind::ProgressGroup)
+                && self.fold_progress_groups
+                && self.prompt_for_progress_group(block.id()).is_some()
+            {
+                // The new control lives in the already-wrapped prompt, so the
+                // prompt and the hidden group must be rebuilt together.
+                self.rewrap(width);
+                if self.scroll_back > 0 {
                     let row_delta = self.wrapped.len() as isize - before as isize;
                     self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
                 }
@@ -2986,6 +3081,15 @@ fn split_rows_with_transcript_anchor(
     (view_rows, rows - view_rows)
 }
 
+fn scroll_back_for_transcript_start(
+    transcript_len: usize,
+    view_rows: usize,
+    transcript_start: usize,
+) -> usize {
+    let max_back = transcript_len.saturating_sub(view_rows);
+    max_back.saturating_sub(transcript_start.min(max_back))
+}
+
 #[allow(dead_code)]
 fn clear_main_row(out: &mut impl Write, row: usize, width: usize) -> Result<()> {
     queue!(
@@ -3098,10 +3202,50 @@ fn paint_line_into_frame(
             },
         );
     }
+    let history_columns = line.pick.as_ref().and_then(|regions| {
+        regions
+            .0
+            .iter()
+            .find_map(|(start, end, pick)| matches!(pick, Pick::History(_)).then_some(*start..*end))
+    });
+    let history_hovered = hovered_columns.as_ref().is_some_and(|hovered| {
+        history_columns
+            .as_ref()
+            .is_some_and(|columns| range_overlaps(Some(hovered), columns.start, columns.end))
+    });
+    let history_background = history_columns.as_ref().map(|_| {
+        if history_hovered {
+            scroll_to_bottom_background(true)
+        } else {
+            theme::palette().user_prompt_bg
+        }
+    });
+    if let (Some(columns), Some(background)) = (history_columns.as_ref(), history_background) {
+        frame.fill(
+            columns.start,
+            row,
+            columns.end.min(frame.width),
+            row + 1,
+            CellStyle {
+                background: Some(background),
+                ..CellStyle::plain()
+            },
+        );
+    }
+    let text_hovered_columns = (!history_hovered)
+        .then_some(hovered_columns.as_ref())
+        .flatten();
     let mut column = 0;
-    let prefix_background = word_background(line.prefix_tone)
-        .or(bubble_background)
-        .or(background);
+    let prefix_width = UnicodeWidthStr::width(line.prefix.as_str());
+    let history_prefix_background = history_columns
+        .as_ref()
+        .filter(|columns| columns.start < prefix_width)
+        .and(history_background);
+    let prefix_background = history_prefix_background.or_else(|| {
+        word_background(line.prefix_tone)
+            .or(bubble_background)
+            .or(background)
+    });
     paint_text_into_frame(
         frame,
         row,
@@ -3111,7 +3255,7 @@ fn paint_line_into_frame(
         false,
         prefix_background,
         selected_columns.as_ref(),
-        hovered_columns.as_ref(),
+        text_hovered_columns,
     );
     paint_text_into_frame(
         frame,
@@ -3120,11 +3264,13 @@ fn paint_line_into_frame(
         &mut column,
         line.tone,
         line.bold,
-        word_background(line.tone)
-            .or(bubble_background)
-            .or(background),
+        history_background.or_else(|| {
+            word_background(line.tone)
+                .or(bubble_background)
+                .or(background)
+        }),
         selected_columns.as_ref(),
-        hovered_columns.as_ref(),
+        text_hovered_columns,
     );
     for span in &line.tail {
         if span.tone == Tone::CopyJoin {
@@ -3137,11 +3283,13 @@ fn paint_line_into_frame(
             &mut column,
             span.tone,
             span.bold,
-            word_background(span.tone)
-                .or(bubble_background)
-                .or(background),
+            history_background.or_else(|| {
+                word_background(span.tone)
+                    .or(bubble_background)
+                    .or(background)
+            }),
             selected_columns.as_ref(),
-            hovered_columns.as_ref(),
+            text_hovered_columns,
         );
     }
 }
@@ -3685,6 +3833,8 @@ pub enum Pick {
     Subagent(usize),
     /// The fullscreen transcript control that returns to its newest row.
     ScrollToBottom,
+    /// A completed response's progress disclosure, hosted by its user prompt.
+    History(u64),
     /// A recent prompt row in the docked panel: jumps to that transcript block.
     Prompt(u64),
     /// The `✕` on a panel's top rule: closes what Esc closes.
@@ -7386,6 +7536,27 @@ fn progress_group_lines(
         return lines;
     }
     lines.push(PaintLine::blank());
+    lines.extend(progress_group_body_lines(block, width, reveal));
+    lines
+}
+
+fn embedded_progress_group_lines(
+    block: &Block,
+    width: u16,
+    expanded: bool,
+    reveal: Option<f32>,
+) -> Vec<PaintLine> {
+    if !expanded && reveal.is_none_or(|value| value <= f32::EPSILON) {
+        return Vec::new();
+    }
+    let mut lines = progress_group_body_lines(block, width, reveal);
+    if !lines.is_empty() {
+        lines.push(PaintLine::blank());
+    }
+    lines
+}
+
+fn progress_group_body_lines(block: &Block, width: u16, reveal: Option<f32>) -> Vec<PaintLine> {
     let mut body = block
         .children()
         .iter()
@@ -7418,8 +7589,7 @@ fn progress_group_lines(
             fade_response_line(edge, opacity);
         }
     }
-    lines.extend(body);
-    lines
+    body
 }
 
 fn fade_response_line(line: &mut PaintLine, opacity: u8) {
@@ -8087,8 +8257,17 @@ fn block_lines_with_expansion(block: &Block, width: u16, expanded: bool) -> Vec<
 }
 
 fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
+    user_prompt_lines_with_history(block, width, None, CHAT_LAYOUT.load(Ordering::Relaxed))
+}
+
+fn user_prompt_lines_with_history(
+    block: &Block,
+    width: u16,
+    history: Option<(u64, &str, bool)>,
+    chat_layout: bool,
+) -> Vec<PaintLine> {
     let marker_tone = model_tone(&block.title).unwrap_or(Tone::User);
-    if !CHAT_LAYOUT.load(Ordering::Relaxed) {
+    if !chat_layout {
         // 세로선은 블록에 기록된 전송 시점 모델 색을 쓰고, 모델을 못 알아보면 기존 강조색으로 돌아간다.
         let border_tone = model_tone(&block.title).unwrap_or(Tone::Accent);
         let lines = block
@@ -8116,6 +8295,10 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         let mut lines = lines;
         lines.insert(0, top);
         lines.push(bottom);
+        attach_history_to_prompt(&mut lines, width, history, false);
+        if history.is_some() {
+            lines.push(PaintLine::blank());
+        }
         return lines;
     }
     const RIGHT_GAP: usize = 0;
@@ -8180,7 +8363,66 @@ fn user_prompt_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     bottom.prefix = half_prefix;
     lines.insert(0, top);
     lines.push(bottom);
+    attach_history_to_prompt(&mut lines, width, history, true);
+    if history.is_some() {
+        lines.push(PaintLine::blank());
+    }
     lines
+}
+
+fn attach_history_to_prompt(
+    lines: &mut [PaintLine],
+    width: u16,
+    history: Option<(u64, &str, bool)>,
+    chat_layout: bool,
+) {
+    let Some((group_id, title, expanded)) = history else {
+        return;
+    };
+    let protected_right = usize::from(width).saturating_sub(1);
+    for line in lines.iter_mut() {
+        let prefix_width = UnicodeWidthStr::width(line.prefix.as_str());
+        let start = if chat_layout {
+            prefix_width
+        } else {
+            // Keep the coloured model border itself unchanged, but include the
+            // padding cell immediately after it in the prompt-wide hover.
+            prefix_width.saturating_sub(1)
+        };
+        let end = if chat_layout {
+            painted_line_width(line).min(protected_right)
+        } else {
+            protected_right
+        };
+        if start < end {
+            line.pick = Some(PickRegions::span(start, end, Pick::History(group_id)));
+        }
+    }
+
+    let label = format!("{title} {}", if expanded { '▾' } else { '▸' });
+    let label_width = UnicodeWidthStr::width(label.as_str());
+    let Some(bottom) = lines.last_mut() else {
+        return;
+    };
+    let padding_width = UnicodeWidthStr::width(bottom.text.as_str());
+    if label_width > padding_width {
+        return;
+    }
+    let right_padding = padding_width.saturating_sub(label_width).min(2);
+    // Replace the suffix of the existing padding instead of growing the row:
+    // the terminal's protected autowrap cell therefore remains untouched.
+    bottom.text = " ".repeat(padding_width - label_width - right_padding);
+    bottom.tail.clear();
+    bottom.tail.push(PaintSpan {
+        text: label,
+        tone: Tone::ScrollToBottom,
+        bold: false,
+    });
+    bottom.tail.push(PaintSpan {
+        text: " ".repeat(right_padding),
+        tone: Tone::UserPromptPadding,
+        bold: false,
+    });
 }
 
 fn conversation_region_width(width: u16) -> usize {
@@ -14509,6 +14751,27 @@ mod tests {
     }
 
     #[test]
+    fn prompt_hosted_history_keeps_the_clicked_row_fixed_when_toggled() {
+        let collapsed_len = 30;
+        let collapsed_view_rows = 10;
+        let anchored_start = 20;
+        let clicked_transcript_row = 22;
+        let clicked_screen_row = clicked_transcript_row - anchored_start;
+
+        let expanded_len = 38;
+        let expanded_view_rows = 15;
+        let expanded_back =
+            scroll_back_for_transcript_start(expanded_len, expanded_view_rows, anchored_start);
+        let expanded_start = expanded_len - expanded_view_rows - expanded_back;
+        assert_eq!(clicked_transcript_row - expanded_start, clicked_screen_row);
+
+        let collapsed_back =
+            scroll_back_for_transcript_start(collapsed_len, collapsed_view_rows, anchored_start);
+        let collapsed_start = collapsed_len - collapsed_view_rows - collapsed_back;
+        assert_eq!(clicked_transcript_row - collapsed_start, clicked_screen_row);
+    }
+
+    #[test]
     fn completed_answer_stays_on_the_streaming_row() {
         let rows = 8;
         let older = text_rows(12, "old");
@@ -18283,6 +18546,210 @@ mod tests {
         assert_eq!(renderer.double_click_word(3, 2), None);
         assert_eq!(renderer.double_click_word(3, 2), None);
         assert_eq!(renderer.selected_text(), None);
+    }
+
+    #[test]
+    fn history_on_prompt_keeps_the_right_margin_and_hovers_the_whole_background() {
+        theme::set_current(ThemeKind::Dark);
+        let prompt = Block::new(
+            BlockKind::User,
+            "gpt-5.6-sol",
+            "첫 번째 프롬프트 줄\n두 번째 프롬프트 줄",
+        );
+        let progress = Block::progress_group(vec![Block::new(
+            BlockKind::Assistant,
+            "Codex",
+            "진행 메시지",
+        )]);
+        let progress_id = progress.id();
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.chat_layout = true;
+        renderer.fold_progress_groups = true;
+        renderer.history.extend([prompt, progress]);
+        renderer.rewrap(80);
+
+        let prompt_lines = renderer
+            .wrapped
+            .iter()
+            .filter(|line| {
+                line.pick.as_ref().is_some_and(|regions| {
+                    regions
+                        .0
+                        .iter()
+                        .any(|(_, _, pick)| *pick == Pick::History(progress_id))
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(prompt_lines.len(), 4);
+        assert!(painted(prompt_lines.last().unwrap()).ends_with("History · 1 ▸  "));
+        assert_eq!(painted_line_width(prompt_lines.last().unwrap()), 79);
+        let history_row = renderer
+            .wrapped
+            .iter()
+            .position(|line| painted(line).contains("History · 1 ▸"))
+            .expect("History label is visible");
+        assert!(renderer.wrapped.get(history_row + 1) == Some(&PaintLine::blank()));
+
+        for line in prompt_lines {
+            let hovered = Renderer::hover_columns(line, None, Some(&Pick::History(progress_id)))
+                .expect("every prompt row is the History target");
+            assert_eq!(hovered.end, 79);
+            let mut idle_frame = CellFrame::new(80, 1);
+            paint_line_into_frame(&mut idle_frame, 0, line, None, None, None);
+            for column in hovered.clone() {
+                assert_eq!(
+                    idle_frame.cell(column, 0).style.background,
+                    Some(theme::palette().user_prompt_bg)
+                );
+            }
+            assert_eq!(idle_frame.cell(79, 0).style.background, None);
+
+            let mut frame = CellFrame::new(80, 1);
+            paint_line_into_frame(&mut frame, 0, line, None, Some(hovered.clone()), None);
+            for column in hovered {
+                assert_eq!(
+                    frame.cell(column, 0).style.background,
+                    Some(scroll_to_bottom_background(true))
+                );
+            }
+            assert_eq!(frame.cell(79, 0).style.background, None);
+        }
+    }
+
+    #[test]
+    fn history_right_padding_survives_layout_and_width_changes() {
+        let prompt = Block::new(BlockKind::User, "gpt-5.6-sol", "폭이 달라지는 프롬프트");
+        let history_id = 99;
+
+        for chat_layout in [false, true] {
+            for width in [24, 40, 80, 120] {
+                let lines = user_prompt_lines_with_history(
+                    &prompt,
+                    width,
+                    Some((history_id, "History · 6", false)),
+                    chat_layout,
+                );
+                let bottom = lines
+                    .iter()
+                    .find(|line| painted(line).contains("History · 6 ▸"))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "prompt has History padding: chat_layout={chat_layout}, width={width}, lines={:?}",
+                            lines.iter().map(painted).collect::<Vec<_>>()
+                        )
+                    });
+                let right_padding = bottom
+                    .tail
+                    .last()
+                    .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+                    .unwrap_or_default();
+                let expected_padding = if chat_layout && width == 24 { 1 } else { 2 };
+                assert_eq!(right_padding, expected_padding);
+                assert!(
+                    painted(bottom)
+                        .ends_with(&format!("History · 6 ▸{}", " ".repeat(expected_padding)))
+                );
+                assert_eq!(painted_line_width(bottom), usize::from(width) - 1);
+                assert!(lines.last() == Some(&PaintLine::blank()));
+                assert_eq!(
+                    bottom.pick.as_ref().and_then(|regions| {
+                        regions
+                            .columns_of(&Pick::History(history_id))
+                            .map(|columns| columns.end)
+                    }),
+                    Some(usize::from(width) - 1)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_chat_history_hover_colours_the_space_after_the_model_border() {
+        theme::set_current(ThemeKind::Dark);
+        let prompt = Block::new(BlockKind::User, "gpt-5.6-sol", "보낸 프롬프트");
+        let history_id = 99;
+        let lines = user_prompt_lines_with_history(
+            &prompt,
+            80,
+            Some((history_id, "History · 1", false)),
+            false,
+        );
+        let line = lines
+            .iter()
+            .find(|line| painted(line).contains("History · 1 ▸"))
+            .expect("History label is visible");
+        let hovered = Renderer::hover_columns(line, None, Some(&Pick::History(history_id)))
+            .expect("History hover covers the prompt");
+        assert_eq!(hovered.start, 1);
+
+        let mut frame = CellFrame::new(80, 1);
+        paint_line_into_frame(&mut frame, 0, line, None, Some(hovered), None);
+        assert_eq!(
+            frame.cell(1, 0).style.background,
+            Some(scroll_to_bottom_background(true))
+        );
+    }
+
+    #[test]
+    fn prompt_history_click_expands_without_double_click_selection() {
+        let prompt = Block::new(BlockKind::User, "gpt-5.6-sol", "보낸 프롬프트");
+        let progress = Block::progress_group(vec![Block::new(
+            BlockKind::Assistant,
+            "Codex",
+            "펼쳐진 진행 메시지",
+        )]);
+        let progress_id = progress.id();
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.chat_layout = true;
+        renderer.fold_progress_groups = true;
+        renderer.history.extend([prompt, progress]);
+        renderer.last_width = 80;
+        renderer.rewrap(80);
+        renderer.previous_lines = renderer.wrapped.clone();
+
+        let (row, column) = renderer
+            .previous_lines
+            .iter()
+            .enumerate()
+            .find_map(|(row, line)| {
+                let columns = line
+                    .pick
+                    .as_ref()?
+                    .columns_of(&Pick::History(progress_id))?;
+                Some((row as u16, columns.start as u16))
+            })
+            .expect("prompt carries the History target");
+        assert_eq!(
+            renderer.pick_at(column, row),
+            Some(Pick::History(progress_id))
+        );
+        assert_eq!(renderer.double_click_word(column, row), None);
+        assert_eq!(renderer.double_click_word(column, row), None);
+        assert_eq!(renderer.selected_text(), None);
+
+        assert!(renderer.toggle_tool(progress_id));
+        assert_eq!(renderer.history_view_rows_anchor, None);
+        assert_eq!(renderer.history_view_start_anchor, Some(0));
+        let expanded = renderer
+            .wrapped
+            .iter()
+            .map(painted)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(expanded.contains("History · 1 ▾"));
+        assert!(expanded.contains("펼쳐진 진행 메시지"));
+        assert!(renderer.wrapped.last() == Some(&PaintLine::blank()));
+        let view_rows = split_rows(30, 10, renderer.wrapped.len()).0;
+        let start = renderer.wrapped.len().saturating_sub(view_rows);
+        let visible_prompt_rows = renderer.wrapped[start..start + view_rows]
+            .iter()
+            .filter(|line| {
+                line.pick.as_ref().is_some_and(|regions| {
+                    regions.columns_of(&Pick::History(progress_id)).is_some()
+                })
+            })
+            .count();
+        assert_eq!(visible_prompt_rows, 3);
     }
 
     #[test]
