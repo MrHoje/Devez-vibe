@@ -176,7 +176,7 @@ const CHAT_BUBBLE_PADDING: usize = 1;
 /// Extra cell that keeps the right edge visibly clear after terminal painting.
 const CHAT_BUBBLE_RIGHT_GAP: usize = 1;
 /// History stays readable while sitting a little behind the prompt text.
-const HISTORY_LABEL_MUTED_BLEND: u8 = 96;
+const HISTORY_LABEL_MUTED_BLEND: u8 = 120;
 
 impl Block {
     pub fn new(kind: BlockKind, title: impl Into<String>, body: impl Into<String>) -> Self {
@@ -238,7 +238,7 @@ impl Block {
         let child_id = children.first().map(Block::id);
         let mut block = Self::new(
             BlockKind::ProgressGroup,
-            format!("{HISTORY_TITLE} · {count}"),
+            format!("+{count} {HISTORY_TITLE}"),
             "",
         );
         if let Some(child_id) = child_id {
@@ -2456,8 +2456,12 @@ impl Renderer {
         for (screen_row, previous, current, repaint_plan_row) in &rows {
             // A changed plan step can shorten or restyle wide Korean text. Clear
             // just that row once; spinner frames keep the inexpensive diff path.
-            let previous = (!*repaint_plan_row).then_some(previous);
-            if let Err(error) = emit_frame_diff_at(&mut self.out, previous, current, *screen_row) {
+            let repaint_result = if *repaint_plan_row {
+                emit_row_sequential(&mut self.out, current, 0, *screen_row)
+            } else {
+                emit_frame_diff_at(&mut self.out, Some(previous), current, *screen_row)
+            };
+            if let Err(error) = repaint_result {
                 result = Err(error);
                 break;
             }
@@ -3498,6 +3502,62 @@ fn emit_frame_columns(
     Ok(())
 }
 
+/// Repaints a semantic plan row from its first column without moving the
+/// cursor between style runs. ConPTY can duplicate wide glyphs when a host
+/// replays absolute cursor jumps in the middle of a Korean row.
+fn emit_row_sequential(
+    out: &mut impl Write,
+    frame: &CellFrame,
+    row: usize,
+    screen_row: usize,
+) -> Result<()> {
+    if frame.width == 0 {
+        return Ok(());
+    }
+    queue!(out, MoveTo(0, screen_row.min(u16::MAX as usize) as u16))?;
+    let mut column = 0;
+    while column + 1 < frame.width {
+        let style = frame.cell(column, row).style;
+        let mut text = String::new();
+        while column + 1 < frame.width {
+            let cell = frame.cell(column, row);
+            if !cell.continuation && cell.style != style {
+                break;
+            }
+            if !cell.continuation {
+                text.push_str(&cell.glyph);
+            }
+            column += 1;
+        }
+        set_cell_style(out, style)?;
+        queue!(out, Print(text))?;
+    }
+    set_cell_style(out, frame.cell(frame.width - 1, row).style)?;
+    queue!(out, Clear(ClearType::UntilNewLine))?;
+    queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
+    Ok(())
+}
+
+fn emit_full_frame_with_sequential_rows(
+    out: &mut impl Write,
+    current: &CellFrame,
+    sequential_rows: &[usize],
+) -> Result<()> {
+    for row in 0..current.height {
+        if sequential_rows.contains(&row) {
+            emit_row_sequential(out, current, row, row)?;
+            continue;
+        }
+        let row_frame = CellFrame {
+            width: current.width,
+            height: 1,
+            cells: current.cells[row * current.width..(row + 1) * current.width].to_vec(),
+        };
+        emit_frame_diff_at(out, None, &row_frame, row)?;
+    }
+    Ok(())
+}
+
 /// A semantic plan change can alter the fixed panel height, which also moves
 /// transcript and composer rows. Repaint the complete frame once so no old row
 /// remains at its former terminal position. Spinner-only frames still use the
@@ -3526,27 +3586,23 @@ fn emit_synchronized_frame_diff_with_full_rows(
     }
     let mut result = Ok(());
     if repaint_full_frame {
-        result = emit_frame_diff(out, None, current);
+        result = emit_full_frame_with_sequential_rows(out, current, full_rows);
     } else {
         let mut diff_previous = previous.cloned();
         for &row in full_rows {
             if row >= current.height {
                 continue;
             }
-            let row_frame = CellFrame {
-                width: current.width,
-                height: 1,
-                cells: current.cells[row * current.width..(row + 1) * current.width].to_vec(),
-            };
-            if let Err(error) = emit_frame_diff_at(out, None, &row_frame, row) {
+            if let Err(error) = emit_row_sequential(out, current, row, row) {
                 result = Err(error);
                 break;
             }
             if let Some(previous) = diff_previous.as_mut().filter(|previous| {
                 previous.width == current.width && previous.height == current.height
             }) {
-                previous.cells[row * current.width..(row + 1) * current.width]
-                    .clone_from_slice(&row_frame.cells);
+                previous.cells[row * current.width..(row + 1) * current.width].clone_from_slice(
+                    &current.cells[row * current.width..(row + 1) * current.width],
+                );
             }
         }
         if result.is_ok() {
@@ -6810,7 +6866,7 @@ fn hunk_start(row: &str) -> Option<(usize, usize)> {
 /// that renders as a bare thought instead of a labelled section.
 const THINKING_TITLE: &str = "Thinking…";
 const UPDATED_PLAN_TITLE: &str = "Updated Plan";
-const HISTORY_TITLE: &str = "History";
+const HISTORY_TITLE: &str = "Response";
 
 /// Codex paints a plan update as `- 작업 단계`, the explanation hanging off
 /// a `└`, then one checkbox row per step indented four columns: `✔` for done,
@@ -12208,6 +12264,42 @@ mod tests {
         assert!(!output.contains("composer"));
         assert_eq!(output.matches("\x1b[?25l").count(), 1);
         assert_eq!(output.matches("\x1b[?25h").count(), 1);
+    }
+
+    #[test]
+    fn korean_plan_row_repaints_without_mid_row_cursor_jumps() {
+        let previous = CellFrame::new(24, 2);
+        let mut current = previous.clone();
+        current.write(0, 0, "• ", CellStyle::plain());
+        current.write(
+            2,
+            0,
+            "1. 작업 단계 확인",
+            CellStyle {
+                foreground: Some(Rgb(240, 160, 60)),
+                ..CellStyle::plain()
+            },
+        );
+
+        for repaint_full_frame in [false, true] {
+            let mut output = Vec::new();
+            emit_synchronized_frame_diff_with_full_rows(
+                &mut output,
+                Some(&previous),
+                &current,
+                &[0],
+                repaint_full_frame,
+                Some((0, 1, true)),
+                false,
+            )
+            .expect("Korean plan row emits");
+
+            let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
+            assert!(output.contains("• "));
+            assert!(output.contains("1. 작업 단계 확인"));
+            assert_eq!(output.matches("\x1b[1;1H").count(), 1);
+            assert!(!output.contains("\x1b[1;3H"));
+        }
     }
 
     #[test]
@@ -18625,14 +18717,14 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(prompt_lines.len(), 4);
-        assert!(painted(prompt_lines.last().unwrap()).ends_with("History · 1  "));
+        assert!(painted(prompt_lines.last().unwrap()).ends_with("+1 Response  "));
         assert_eq!(painted_line_width(prompt_lines.last().unwrap()), 79);
         let history_span = prompt_lines
             .last()
             .unwrap()
             .tail
             .iter()
-            .find(|span| span.text.starts_with("History"))
+            .find(|span| span.text.starts_with("+1 Response"))
             .expect("History label has its own tone");
         assert_eq!(history_span.tone, Tone::History);
         assert_eq!(
@@ -18651,7 +18743,7 @@ mod tests {
         let history_row = renderer
             .wrapped
             .iter()
-            .position(|line| painted(line).contains("History · 1"))
+            .position(|line| painted(line).contains("+1 Response"))
             .expect("History label is visible");
         assert!(renderer.wrapped.get(history_row + 1) == Some(&PaintLine::blank()));
 
@@ -18682,6 +18774,36 @@ mod tests {
     }
 
     #[test]
+    fn response_label_stays_subdued_and_readable_in_every_theme() {
+        let distance = |left: Rgb, right: Rgb| {
+            u16::from(left.0.abs_diff(right.0))
+                + u16::from(left.1.abs_diff(right.1))
+                + u16::from(left.2.abs_diff(right.2))
+        };
+        for theme_kind in ThemeKind::ALL {
+            theme::set_current(theme_kind);
+            let palette = theme::palette();
+            let label = tone_rgb(Tone::History).expect("Response label colour");
+            let earlier = blend(palette.foreground, palette.muted, 96);
+
+            assert_ne!(label, palette.foreground, "theme={}", theme_kind.id());
+            assert_ne!(label, palette.muted, "theme={}", theme_kind.id());
+            assert!(
+                distance(label, palette.muted) < distance(earlier, palette.muted),
+                "theme={}",
+                theme_kind.id()
+            );
+            assert!(
+                theme::contrast_ratio(label, palette.user_prompt_bg) >= 4.5,
+                "theme={} contrast={}",
+                theme_kind.id(),
+                theme::contrast_ratio(label, palette.user_prompt_bg)
+            );
+        }
+        theme::set_current(ThemeKind::Dark);
+    }
+
+    #[test]
     fn history_right_padding_survives_layout_and_width_changes() {
         let prompt = Block::new(BlockKind::User, "gpt-5.6-sol", "폭이 달라지는 프롬프트");
         let history_id = 99;
@@ -18691,12 +18813,12 @@ mod tests {
                 let lines = user_prompt_lines_with_history(
                     &prompt,
                     width,
-                    Some((history_id, "History · 6", false)),
+                    Some((history_id, "+6 Response", false)),
                     chat_layout,
                 );
                 let bottom = lines
                     .iter()
-                    .find(|line| painted(line).contains("History · 6"))
+                    .find(|line| painted(line).contains("+6 Response"))
                     .unwrap_or_else(|| {
                         panic!(
                             "prompt has History padding: chat_layout={chat_layout}, width={width}, lines={:?}",
@@ -18712,7 +18834,7 @@ mod tests {
                 assert_eq!(right_padding, expected_padding);
                 assert!(
                     painted(bottom)
-                        .ends_with(&format!("History · 6{}", " ".repeat(expected_padding)))
+                        .ends_with(&format!("+6 Response{}", " ".repeat(expected_padding)))
                 );
                 assert_eq!(painted_line_width(bottom), usize::from(width) - 1);
                 assert!(lines.last() == Some(&PaintLine::blank()));
@@ -18736,12 +18858,12 @@ mod tests {
         let lines = user_prompt_lines_with_history(
             &prompt,
             80,
-            Some((history_id, "History · 1", false)),
+            Some((history_id, "+1 Response", false)),
             false,
         );
         let line = lines
             .iter()
-            .find(|line| painted(line).contains("History · 1"))
+            .find(|line| painted(line).contains("+1 Response"))
             .expect("History label is visible");
         let hovered = Renderer::hover_columns(line, None, Some(&Pick::History(history_id)))
             .expect("History hover covers the prompt");
@@ -18801,7 +18923,7 @@ mod tests {
             .map(painted)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(expanded.contains("History · 1"));
+        assert!(expanded.contains("+1 Response"));
         assert!(expanded.contains("펼쳐진 진행 메시지"));
         assert!(renderer.wrapped.last() == Some(&PaintLine::blank()));
         let view_rows = split_rows(30, 10, renderer.wrapped.len()).0;
@@ -18845,7 +18967,7 @@ mod tests {
             .map(painted)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(super_vibe.contains("History · 2"));
+        assert!(super_vibe.contains("+2 Response"));
         assert!(!super_vibe.contains("첫 진행 메시지"));
     }
 

@@ -14871,7 +14871,7 @@ mod tests {
             .iter()
             .map(|block| block.title.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(titles[0], "History · 1");
+        assert_eq!(titles[0], "+1 Response");
         assert_eq!(titles[1], "Shell · 1 command · completed · 1.6s");
         assert_eq!(titles[3], "Codex");
         assert!(matches!(state.committed[0].kind, BlockKind::ProgressGroup));
@@ -15210,7 +15210,7 @@ mod tests {
             .map(|block| block.title.as_str())
             .collect::<Vec<_>>();
         assert_eq!(titles.len(), 3);
-        assert_eq!(titles[0], "History · 1");
+        assert_eq!(titles[0], "+1 Response");
         assert_eq!(state.committed[0].children().len(), 1);
         assert_eq!(titles[1], "Update(0 files)");
         assert_eq!(titles[2], "Codex");
@@ -17038,7 +17038,7 @@ mod tests {
             .expect("progress group");
 
         assert_eq!(group.children().len(), 2);
-        assert_eq!(group.title, "History · 2");
+        assert_eq!(group.title, "+2 Response");
         assert!(state.response_collapse_view().is_some());
     }
 
@@ -17093,9 +17093,9 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].title, "History · 1");
+        assert_eq!(groups[0].title, "+1 Response");
         assert_eq!(groups[0].children()[0].body, "첫 요청 진행 기록");
-        assert_eq!(groups[1].title, "History · 2");
+        assert_eq!(groups[1].title, "+2 Response");
         assert_eq!(groups[1].children()[0].body, "추가 요청 확인");
         assert_eq!(groups[1].children()[1].body, "추가 요청 수정");
     }
@@ -17139,7 +17139,7 @@ mod tests {
             .find(|block| matches!(block.kind, BlockKind::ProgressGroup))
             .expect("progress group");
 
-        assert_eq!(group.title, "History · 3");
+        assert_eq!(group.title, "+3 Response");
         assert_eq!(group.children()[1].title, "Context compacted");
     }
 
@@ -17161,7 +17161,7 @@ mod tests {
             .find(|block| matches!(block.kind, BlockKind::ProgressGroup))
             .expect("progress group");
 
-        assert_eq!(group.title, "History · 3");
+        assert_eq!(group.title, "+3 Response");
         assert_eq!(group.children()[1].title, "Context compacted");
     }
 
