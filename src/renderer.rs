@@ -3405,7 +3405,7 @@ fn compose_screen(
     (screen, cursor_line)
 }
 
-const RESPONSE_BULLET_PREFIX: &str = " •";
+const RESPONSE_BULLET_PREFIX: &str = "• ";
 
 fn visible_response_bullet_row(
     wrapped: &[PaintLine],
@@ -7301,6 +7301,7 @@ fn progress_group_lines(
     if !showing_body {
         return lines;
     }
+    lines.push(PaintLine::blank());
     let mut body = block
         .children()
         .iter()
@@ -7546,8 +7547,6 @@ fn block_lines_with_mode_at(
         | BlockKind::FileChange => {
             unreachable!("handled above")
         }
-        // Keep the response text on the same column while centring the compact
-        // bullet under disclosure glyphs such as `▸` and `▾`.
         BlockKind::Assistant => (RESPONSE_BULLET_PREFIX, Tone::FastOff),
         BlockKind::Diff => ("● ", Tone::Accent),
         BlockKind::Warning => ("▲ ", Tone::Warning),
@@ -18027,7 +18026,9 @@ mod tests {
 
         assert!(open.len() > folding.len());
         assert!(folding.len() > closed.len());
-        assert!(matches!(folding[1].tone, Tone::ResponseTransition(_, _)));
+        assert!(open[1] == PaintLine::blank());
+        assert!(folding[1] == PaintLine::blank());
+        assert!(matches!(folding[2].tone, Tone::ResponseTransition(_, _)));
         assert!(reopened.len() > closed.len());
         let reopened_text = reopened.iter().map(painted).collect::<Vec<_>>().join("\n");
         assert!(reopened_text.contains("첫 진행 메시지"));
@@ -18061,9 +18062,9 @@ mod tests {
         renderer.rewrap(80);
         renderer.previous_lines = renderer.wrapped.clone();
 
-        assert!(renderer.progress_group_rows[0].contains(&1));
-        assert_eq!(renderer.double_click_word(3, 1), None);
-        assert_eq!(renderer.double_click_word(3, 1), None);
+        assert!(renderer.progress_group_rows[0].contains(&2));
+        assert_eq!(renderer.double_click_word(3, 2), None);
+        assert_eq!(renderer.double_click_word(3, 2), None);
         assert_eq!(renderer.selected_text(), None);
     }
 
