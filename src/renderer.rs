@@ -8501,11 +8501,10 @@ fn attach_history_to_prompt(
         }
     }
 
-    // Keep the count hidden while the response is open, but leave the same
-    // upward disclosure mark the Updated Plan header uses so the close action
-    // remains visible at the prompt's right edge.
+    // Replace the response count with an explicit close action while the
+    // response is open so the prompt control keeps describing what a click does.
     let label = if expanded {
-        "▲".to_owned()
+        "Hide".to_owned()
     } else {
         title.to_owned()
     };
@@ -18985,7 +18984,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_prompt_history_shows_only_its_collapse_triangle() {
+    fn expanded_prompt_history_replaces_its_response_count_with_hide() {
         let prompt = Block::new(BlockKind::User, "gpt-5.6-sol", "보낸 프롬프트");
         let history_id = 42;
         let lines = user_prompt_lines_with_history(
@@ -19002,9 +19001,9 @@ mod tests {
         );
         let collapse = lines
             .iter()
-            .find(|line| painted(line).contains('▲'))
-            .expect("expanded History has a collapse triangle");
-        assert!(painted(collapse).ends_with("▲  "));
+            .find(|line| painted(line).contains("Hide"))
+            .expect("expanded History has a Hide action");
+        assert!(painted(collapse).ends_with("Hide  "));
         assert_eq!(collapse.tail[0].tone, Tone::History);
         assert!(lines.iter().all(|line| {
             line.pick
