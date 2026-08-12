@@ -264,7 +264,7 @@ async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
     state.push_notice(
         BlockKind::Update,
         "Tip",
-        "/provider: Set Claude Codex provider\n/side-panel: Choose side panel size\nAlt + P: Cycle side panel size\n/vibemode: Set Vibe mode\nShift + ↑↓ model · ←→ effort",
+        "/provider: Set Claude Codex provider\n/side-panel: Choose side panel size\nAlt + P: Cycle side panel size\n/vibemode: Set Vibe mode\n/Response: Set Response compression type\nShift + ↑↓ model · ←→ effort",
     );
     if fallback_to_claude {
         state.push_notice(
@@ -755,7 +755,9 @@ fn hold_until_thread(
             state.defer_startup_action(Action::SetFast(enabled));
             None
         }
-        action @ (Action::SetClaudePermissionMode(_) | Action::PersistVibeDisplayModes { .. }) => {
+        action @ (Action::SetClaudePermissionMode(_)
+        | Action::PersistResponseDisplayMode(_)
+        | Action::PersistVibeDisplayModes { .. }) => {
             state.defer_startup_action(action);
             None
         }
@@ -1519,6 +1521,10 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
                 diff: state.diff_display_mode(),
             }
         }
+        Pick::ResponseDisplayMode => {
+            let mode = state.cycle_response_display_mode();
+            Action::PersistResponseDisplayMode(mode)
+        }
         Pick::ShellDisplayMode => {
             state.cycle_shell_display_mode();
             Action::PersistVibeDisplayModes {
@@ -1883,6 +1889,21 @@ async fn execute_action(
                 state.push_notice(
                     BlockKind::Warning,
                     "사이드패널 기본값 저장 실패",
+                    error.to_string(),
+                );
+            }
+        }
+        Action::PersistResponseDisplayMode(mode) => {
+            if let Err(error) = server
+                .request(
+                    "config/value/write",
+                    config_value_write_params("response_display_mode", mode.config_value()),
+                )
+                .await
+            {
+                state.push_notice(
+                    BlockKind::Warning,
+                    "Response 표시 설정 저장 실패",
                     error.to_string(),
                 );
             }
@@ -3028,6 +3049,21 @@ async fn apply_deferred_startup_actions(server: &BackendServer, state: &mut AppS
             Action::SetFast(enabled) => set_fast_mode(server, state, enabled).await,
             Action::SetClaudePermissionMode(mode) => {
                 set_claude_permission_mode(server, state, mode).await
+            }
+            Action::PersistResponseDisplayMode(mode) => {
+                if let Err(error) = server
+                    .request(
+                        "config/value/write",
+                        config_value_write_params("response_display_mode", mode.config_value()),
+                    )
+                    .await
+                {
+                    state.push_notice(
+                        BlockKind::Warning,
+                        "Response 표시 설정 저장 실패",
+                        error.to_string(),
+                    );
+                }
             }
             Action::PersistVibeDisplayModes {
                 vibe,
@@ -5285,6 +5321,17 @@ mod tests {
         assert_eq!(state.response_length_label(), "Normal");
         state.handle_key(press(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(state.response_length_label(), "Normal");
+    }
+
+    #[test]
+    fn clicking_the_response_display_badge_toggles_its_persisted_mode() {
+        let mut state = starting_state();
+        let before = state.response_display_mode();
+
+        let action = pick_action(&mut state, Pick::ResponseDisplayMode);
+
+        assert!(matches!(action, Action::PersistResponseDisplayMode(_)));
+        assert_ne!(state.response_display_mode(), before);
     }
 
     #[test]

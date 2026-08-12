@@ -2043,6 +2043,7 @@ fn is_vibe_setting_key(key: &str) -> bool {
         "vibe_mode"
             | "conversation_view"
             | "model_verbosity"
+            | "response_display_mode"
             | "shell_display_mode"
             | "diff_display_mode"
             | "side_panel_stage"
@@ -2723,6 +2724,7 @@ mod tests {
     #[test]
     fn vibe_display_settings_are_local_but_provider_settings_are_not() {
         assert!(is_vibe_setting_key("vibe_mode"));
+        assert!(is_vibe_setting_key("response_display_mode"));
         assert!(is_vibe_setting_key("shell_display_mode"));
         assert!(is_vibe_setting_key("diff_display_mode"));
         assert!(is_vibe_setting_key("side_panel_stage"));

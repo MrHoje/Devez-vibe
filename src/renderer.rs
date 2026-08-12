@@ -391,7 +391,9 @@ pub struct ComposerMode {
     pub accent: ModeAccent,
     pub model: String,
     pub response_length: String,
-    pub fast_mode: bool,
+    /// Whether completed progress responses remain visible or fold into the
+    /// prompt once the final answer arrives.
+    pub response_display_mode: String,
     /// Claude's permission mode, painted where a Codex thread shows Fast. `None`
     /// for the runtimes that have no such mode.
     pub claude_permission: Option<PermissionBadge>,
@@ -1194,6 +1196,22 @@ fn merge_history_block(history: &mut Vec<Block>, incoming: Block) -> bool {
     true
 }
 
+/// A prompt already paints its own empty top padding row. When it follows a
+/// transcript block, reuse that row as the inter-block separator instead of
+/// keeping the prior block's trailing blank as a second empty row.
+fn append_transcript_block_lines(
+    transcript: &mut Vec<PaintLine>,
+    kind: BlockKind,
+    lines: Vec<PaintLine>,
+) -> Range<usize> {
+    if matches!(kind, BlockKind::User) && transcript.last() == Some(&PaintLine::blank()) {
+        transcript.pop();
+    }
+    let start = transcript.len();
+    transcript.extend(lines);
+    start..transcript.len()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewportRelation {
     Before,
@@ -1338,7 +1356,7 @@ impl Renderer {
         if self.mode != RenderMode::Fullscreen || self.last_transcript_rows == 0 {
             return false;
         }
-        let mut target_start = 0;
+        let mut preceding_lines = Vec::new();
         let mut found = false;
         for block in visible_transcript_blocks(
             &self.history,
@@ -1349,11 +1367,13 @@ impl Renderer {
                 found = true;
                 break;
             }
-            target_start += self.history_block_lines(block, self.last_width).len();
+            let lines = self.history_block_lines(block, self.last_width);
+            append_transcript_block_lines(&mut preceding_lines, block.kind, lines);
         }
         if !found {
             return false;
         }
+        let target_start = preceding_lines.len();
         let max_back = self.wrapped.len().saturating_sub(self.last_transcript_rows);
         let target = max_back.saturating_sub(target_start.min(max_back));
         let moved = target != self.scroll_back;
@@ -2744,13 +2764,17 @@ impl Renderer {
                 .iter()
                 .position(|existing| existing.id() == block.id())
                 .map(|index| {
-                    let changed_start = self.history[..index]
-                        .iter()
-                        .flat_map(|existing| self.history_block_lines(existing, width))
-                        .count();
-                    let changed_end =
-                        changed_start + self.history_block_lines(&self.history[index], width).len();
-                    changed_start..changed_end
+                    let mut preceding_lines = Vec::new();
+                    for existing in &self.history[..index] {
+                        let lines = self.history_block_lines(existing, width);
+                        append_transcript_block_lines(&mut preceding_lines, existing.kind, lines);
+                    }
+                    let lines = self.history_block_lines(&self.history[index], width);
+                    append_transcript_block_lines(
+                        &mut preceding_lines,
+                        self.history[index].kind,
+                        lines,
+                    )
                 });
             merge_history_block(&mut self.history, block.clone());
 
@@ -2782,15 +2806,13 @@ impl Renderer {
                 }
             } else {
                 let lines = self.history_block_lines(block, width);
+                let range = append_transcript_block_lines(&mut self.wrapped, block.kind, lines);
                 if matches!(block.kind, BlockKind::ProgressGroup) && self.fold_progress_groups {
-                    let start = self.wrapped.len();
-                    let content_end = start
-                        + lines
-                            .len()
-                            .saturating_sub(usize::from(lines.last() == Some(&PaintLine::blank())));
-                    self.progress_group_rows.push(start..content_end);
+                    let content_end = range.end.saturating_sub(usize::from(
+                        self.wrapped.get(range.end.saturating_sub(1)) == Some(&PaintLine::blank()),
+                    ));
+                    self.progress_group_rows.push(range.start..content_end);
                 }
-                self.wrapped.extend(lines);
                 if self.scroll_back > 0 {
                     let row_delta = self.wrapped.len() as isize - before as isize;
                     self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
@@ -2808,15 +2830,13 @@ impl Renderer {
             self.diff_display_mode,
         ) {
             let lines = self.history_block_lines(block, width);
+            let range = append_transcript_block_lines(&mut wrapped, block.kind, lines);
             if matches!(block.kind, BlockKind::ProgressGroup) && self.fold_progress_groups {
-                let start = wrapped.len();
-                let content_end = start
-                    + lines
-                        .len()
-                        .saturating_sub(usize::from(lines.last() == Some(&PaintLine::blank())));
-                progress_group_rows.push(start..content_end);
+                let content_end = range.end.saturating_sub(usize::from(
+                    wrapped.get(range.end.saturating_sub(1)) == Some(&PaintLine::blank()),
+                ));
+                progress_group_rows.push(range.start..content_end);
             }
-            wrapped.extend(lines);
         }
         self.wrapped = wrapped;
         self.progress_group_rows = progress_group_rows;
@@ -3940,6 +3960,8 @@ pub enum Pick {
     OpenLink(String),
     /// The Vibe preset applies its response and transcript display settings.
     VibeMode,
+    /// Chooses whether completed progress responses stay visible or fold away.
+    ResponseDisplayMode,
     /// Legacy internal picks retained for command and regression-test routing.
     #[allow(dead_code)]
     ResponseLength,
@@ -3949,7 +3971,9 @@ pub enum Pick {
     PromptSection,
     McpSection(String),
     PluginSection(String),
-    /// The `Fast: On`/`Fast: Off` badge: toggles the fast service tier.
+    /// Legacy service-tier action retained for command routing and tests; the
+    /// composer no longer paints a Fast badge.
+    #[allow(dead_code)]
     FastMode,
     /// Claude's permission mode badge: cycles the mode the way Shift+Tab does
     /// in the Claude Code CLI.
@@ -4484,13 +4508,13 @@ fn activity_line_with_composer_controls(
     );
     picks.extend(
         badge
-            .response_length_index
+            .vibe_mode_index
             .map(|index| (badge_start + index, Pick::VibeMode)),
     );
     picks.extend(
         badge
-            .fast_index
-            .map(|index| (badge_start + index, Pick::FastMode)),
+            .response_display_mode_index
+            .map(|index| (badge_start + index, Pick::ResponseDisplayMode)),
     );
     picks.extend(
         badge
@@ -6026,7 +6050,8 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
     if let Some(percent) = status.weekly_percent {
         push_status_span(&mut spans, format!("week: {percent}%"), Tone::StatusText);
     }
-    // Fast: On/Off lives on the composer top rule beside the permission mode.
+    // Composer controls live on the top rule, so the status row only carries
+    // provider usage and notices.
     if let Some(notice) = status.notice.filter(|notice| !notice.is_empty()) {
         push_status_span(&mut spans, notice, Tone::Muted);
     }
@@ -7915,7 +7940,9 @@ fn block_lines_with_mode_at(
         return lines;
     }
     if is_context_compaction_block(block) {
-        return wrapped_line("● ", Tone::Accent, &block.title, Tone::Accent, true, width);
+        let mut lines = wrapped_line("● ", Tone::Accent, &block.title, Tone::Accent, true, width);
+        lines.push(PaintLine::blank());
+        return lines;
     }
 
     let (marker, tone) = match block.kind {
@@ -8528,11 +8555,14 @@ fn attach_history_to_prompt(
         }
     }
 
-    if expanded {
-        return;
-    }
-
-    let label = title.to_owned();
+    // Keep the count hidden while the response is open, but leave the same
+    // upward disclosure mark the Updated Plan header uses so the close action
+    // remains visible at the prompt's right edge.
+    let label = if expanded {
+        "▲".to_owned()
+    } else {
+        title.to_owned()
+    };
     let label_width = UnicodeWidthStr::width(label.as_str());
     let Some(bottom) = lines.last_mut() else {
         return;
@@ -9755,13 +9785,13 @@ fn input_top_line_with_controls(
         );
         picks.extend(
             badge
-                .response_length_index
+                .vibe_mode_index
                 .map(|index| (badge_start + index, Pick::VibeMode)),
         );
         picks.extend(
             badge
-                .fast_index
-                .map(|index| (badge_start + index, Pick::FastMode)),
+                .response_display_mode_index
+                .map(|index| (badge_start + index, Pick::ResponseDisplayMode)),
         );
         picks.extend(
             badge
@@ -9909,10 +9939,9 @@ fn corner_composer_rule(mut line: PaintLine, left: char, right: char) -> PaintLi
     line
 }
 
-/// Widest badge that fits in `budget`: response length · Shell display mode ·
-/// Diff display mode · fast flag. Tightening drops optional trailing controls;
-/// response length remains. Parts
-/// are never ellipsized — a half-written label or clipped price is worse than none.
+/// Widest badge that fits in `budget`. Codex places Response before Vibe;
+/// Claude places it between Vibe and Access. Tightening drops the optional
+/// controls as a unit rather than clipping a label.
 fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans> {
     let mut display_spans = Vec::new();
     if let Some(branch) = mode.branch.as_deref().filter(|branch| !branch.is_empty()) {
@@ -9929,14 +9958,10 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
         tone: vibe_tone(mode.vibe_tone),
         bold: false,
     };
-    let fast_label = if mode.fast_mode {
-        "Fast: On"
-    } else {
-        "Fast: Off"
-    };
-    let fast_span = PaintSpan {
-        text: fast_label.to_owned(),
-        tone: if mode.fast_mode {
+    let response_completed = mode.response_display_mode == "Completed";
+    let response_span = PaintSpan {
+        text: format!("Response: {}", mode.response_display_mode),
+        tone: if response_completed {
             Tone::FastOn
         } else {
             Tone::FastOff
@@ -9965,18 +9990,22 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
             },
         ]
     });
-    let primary_spans = custom_spans.unwrap_or_else(|| vec![vibe_mode_span.clone()]);
-    let without_fast = BadgeSpans {
-        spans: [display_spans.clone(), primary_spans.clone()].concat(),
-        response_length_index: Some(display_width),
+    let vibe_only = BadgeSpans {
+        spans: [display_spans.clone(), vec![vibe_mode_span.clone()]].concat(),
+        vibe_mode_index: Some(display_width),
+        response_display_mode_index: None,
         shell_display_mode_index: None,
         diff_display_mode_index: None,
-        fast_index: None,
         permission_index: None,
     };
     if mode.model.starts_with("claude:") {
-        // Claude has no service tier to flip; the permission mode takes the slot
-        // Fast holds on a Codex thread, and drops first when the rule tightens.
+        let primary_spans = custom_spans.unwrap_or_else(|| {
+            vec![
+                vibe_mode_span.clone(),
+                separator_span(),
+                response_span.clone(),
+            ]
+        });
         let ladder = mode
             .claude_permission
             .iter()
@@ -9991,38 +10020,41 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
                     }],
                 ]
                 .concat(),
-                response_length_index: Some(display_width),
+                vibe_mode_index: Some(display_width),
+                response_display_mode_index: Some(display_width + 2),
                 shell_display_mode_index: None,
                 diff_display_mode_index: None,
-                fast_index: None,
                 permission_index: Some(display_width + primary_spans.len() + 1),
             })
-            .chain(std::iter::once(without_fast));
+            .chain(std::iter::once(BadgeSpans {
+                spans: [display_spans.clone(), primary_spans.clone()].concat(),
+                vibe_mode_index: Some(display_width),
+                response_display_mode_index: Some(display_width + 2),
+                shell_display_mode_index: None,
+                diff_display_mode_index: None,
+                permission_index: None,
+            }))
+            .chain(std::iter::once(vibe_only));
         return ladder
             .into_iter()
             .find(|candidate| spans_width(&candidate.spans) <= budget);
     }
 
-    // Fast is the only optional trailing control for models that expose it.
-    let ladder = [
+    let primary_spans = custom_spans
+        .unwrap_or_else(|| vec![response_span, separator_span(), vibe_mode_span.clone()]);
+    [
         BadgeSpans {
-            spans: [
-                display_spans.clone(),
-                [primary_spans.clone(), vec![separator_span()]].concat(),
-                vec![fast_span.clone()],
-            ]
-            .concat(),
-            response_length_index: Some(display_width),
+            spans: [display_spans, primary_spans].concat(),
+            vibe_mode_index: Some(display_width + 2),
+            response_display_mode_index: Some(display_width),
             shell_display_mode_index: None,
             diff_display_mode_index: None,
-            fast_index: Some(display_width + primary_spans.len() + 1),
             permission_index: None,
         },
-        without_fast,
-    ];
-    ladder
-        .into_iter()
-        .find(|candidate| spans_width(&candidate.spans) <= budget)
+        vibe_only,
+    ]
+    .into_iter()
+    .find(|candidate| spans_width(&candidate.spans) <= budget)
 }
 
 /// The badge as painted, plus where its two clickable parts sit inside it. The
@@ -10030,10 +10062,10 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
 /// that picked the candidate knows which rung it settled on.
 struct BadgeSpans {
     spans: Vec<PaintSpan>,
-    response_length_index: Option<usize>,
+    vibe_mode_index: Option<usize>,
+    response_display_mode_index: Option<usize>,
     shell_display_mode_index: Option<usize>,
     diff_display_mode_index: Option<usize>,
-    fast_index: Option<usize>,
     permission_index: Option<usize>,
 }
 
@@ -13904,7 +13936,8 @@ mod tests {
             .position(|line| painted_line_text(line).contains("Completed"))
             .expect("activity row");
         assert!(!painted(&frame.lines[activity]).contains("View: Chat"));
-        assert!(painted(&frame.lines[activity]).contains("Fast: Off"));
+        assert!(painted(&frame.lines[activity]).contains("Response: Completed"));
+        assert!(!painted(&frame.lines[activity]).contains("Fast:"));
         assert!(!painted(&frame.lines[activity + 1]).contains("View: Chat"));
         assert_eq!(painted_width(&frame.lines[activity]), 158);
         assert_eq!(frame.lines[activity + 1].tone, Tone::ModelTerra);
@@ -13968,6 +14001,7 @@ mod tests {
         assert!(!painted(notice).contains("feature/copy-notice"));
         assert!(!painted(notice).contains("Vibe: On"));
         assert!(!painted(notice).contains("Fast: On"));
+        assert!(!painted(notice).contains("Response: Completed"));
         assert!(
             !frame
                 .lines
@@ -14099,7 +14133,7 @@ mod tests {
                 .sum::<usize>()
     }
 
-    fn test_mode(label: &str, accent: ModeAccent, fast_mode: bool) -> ComposerMode {
+    fn test_mode(label: &str, accent: ModeAccent, _fast_mode: bool) -> ComposerMode {
         ComposerMode {
             branch: None,
             vibe_mode: "Vibe: On".to_owned(),
@@ -14108,7 +14142,7 @@ mod tests {
             accent,
             model: "GPT-5.6-Terra".to_owned(),
             response_length: "Short".to_owned(),
-            fast_mode,
+            response_display_mode: "Completed".to_owned(),
             claude_permission: None,
             effort: "high".to_owned(),
             cost: None,
@@ -14281,9 +14315,13 @@ mod tests {
         assert_eq!(rule_width(&line), 120);
         assert!(painted(&line).starts_with('╭'));
         // Two blanks off the rule, the badge, then the rule resumes for two columns.
-        assert_eq!(texts, ["  ", "Vibe: On", " · ", "Fast: On", " ", "─╮"]);
+        assert_eq!(
+            texts,
+            ["  ", "Response: Completed", " · ", "Vibe: On", " ", "─╮"]
+        );
         assert_eq!(line.tail[1].tone, Tone::FastOn);
         assert_eq!(line.tail[3].tone, Tone::FastOn);
+        assert!(!painted(&line).contains("Fast:"));
     }
 
     #[test]
@@ -14301,8 +14339,8 @@ mod tests {
         );
     }
 
-    /// The slot Fast holds on a Codex thread carries Claude's permission mode,
-    /// painted in that mode's own colour and clickable like the other badges.
+    /// Claude keeps Response between Vibe and its permission mode, with each
+    /// control painted in its own colour and clickable on its own columns.
     #[test]
     fn claude_composer_shows_the_permission_mode_in_the_fast_slot() {
         let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
@@ -14314,6 +14352,7 @@ mod tests {
 
         let line = input_top_line(120, "", Some(&mode));
 
+        assert!(painted(&line).contains("Vibe: On · Response: Completed · ⏸ plan mode"));
         assert!(painted(&line).contains("⏸ plan mode"));
         assert_eq!(
             pick_on(&line, "⏸ plan mode"),
@@ -14346,7 +14385,8 @@ mod tests {
         let composer = frame.composer_index.expect("composer index");
 
         assert!(!painted(&frame.lines[composer - 1]).contains("View: Chat"));
-        assert!(painted(&frame.lines[composer - 1]).contains("Fast: Off"));
+        assert!(painted(&frame.lines[composer - 1]).contains("Response: Completed"));
+        assert!(!painted(&frame.lines[composer - 1]).contains("Fast:"));
         assert!(!painted(&frame.lines[composer]).contains("View: Chat"));
     }
 
@@ -14375,7 +14415,10 @@ mod tests {
         let line = input_top_line(120, "", Some(&mode));
         assert_eq!(pick_on(&line, "View: Chat"), None);
         assert_eq!(pick_on(&line, "Vibe: On"), Some(Pick::VibeMode));
-        assert_eq!(pick_on(&line, "Fast: On"), Some(Pick::FastMode));
+        assert_eq!(
+            pick_on(&line, "Response: Completed"),
+            Some(Pick::ResponseDisplayMode)
+        );
         // The rule, and the middle of the separator between the badges, are not
         // settings — the columns beside each badge belong to that badge.
         assert_eq!(pick_mid(&line, " · "), None);
@@ -14401,25 +14444,33 @@ mod tests {
         let line = input_top_line(120, "3/12", Some(&mode));
 
         assert_eq!(pick_on(&line, "Vibe: On"), Some(Pick::VibeMode));
-        assert_eq!(pick_on(&line, "Fast: On"), Some(Pick::FastMode));
+        assert_eq!(
+            pick_on(&line, "Response: Completed"),
+            Some(Pick::ResponseDisplayMode)
+        );
         assert_eq!(pick_on(&line, "[$0.95]"), None);
         assert_eq!(pick_on(&line, "3/12"), None);
     }
 
-    /// Removing View leaves enough room for Fast beside the Vibe control.
+    /// The compact rule keeps Response before Vibe and both remain clickable.
     #[test]
-    fn removed_view_keeps_the_fast_flag_clickable() {
+    fn compact_rule_keeps_response_and_vibe_clickable() {
         let mode = test_mode("Full Access", ModeAccent::Danger, true);
         let line = input_top_line(40, "", Some(&mode));
 
-        assert!(painted(&line).contains("Fast: On"));
+        assert!(painted(&line).contains("Response: Completed"));
+        assert!(!painted(&line).contains("Fast:"));
         assert_eq!(pick_on(&line, "Vibe: On"), Some(Pick::VibeMode));
-        assert_eq!(pick_on(&line, "Fast: On"), Some(Pick::FastMode));
+        assert_eq!(
+            pick_on(&line, "Response: Completed"),
+            Some(Pick::ResponseDisplayMode)
+        );
     }
 
     #[test]
-    fn compression_is_retained_before_fast_off_at_narrow_width() {
-        let mode = test_mode("Default", ModeAccent::Safe, false);
+    fn all_response_mode_uses_the_fast_off_tone() {
+        let mut mode = test_mode("Default", ModeAccent::Safe, false);
+        mode.response_display_mode = "All".to_owned();
         let line = input_top_line(80, "", Some(&mode));
         let texts = line
             .tail
@@ -14428,8 +14479,8 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(rule_width(&line), 80);
-        assert_eq!(texts, ["  ", "Vibe: On", " · ", "Fast: Off", " ", "─╮"]);
-        assert_eq!(line.tail[3].tone, Tone::FastOff);
+        assert_eq!(texts, ["  ", "Response: All", " · ", "Vibe: On", " ", "─╮"]);
+        assert_eq!(line.tail[1].tone, Tone::FastOff);
     }
 
     #[test]
@@ -14460,7 +14511,7 @@ mod tests {
 
         let line = input_top_line(120, "", Some(&mode));
 
-        assert!(painted(&line).contains("* main | Vibe: On"));
+        assert!(painted(&line).contains("* main | Response: Completed · Vibe: On"));
         assert!(!painted(&line).contains("$0.95"));
     }
 
@@ -14476,7 +14527,7 @@ mod tests {
     }
 
     #[test]
-    fn vibe_and_fast_badges_use_their_role_tones() {
+    fn vibe_and_response_badges_use_their_role_tones() {
         let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
         let tones = |mode: &ComposerMode| {
             fitting_badge_spans(mode, 120)
@@ -14490,7 +14541,10 @@ mod tests {
         let on = tones(&mode);
         assert!(on.contains(&("Vibe: On".to_owned(), Tone::FastOn)));
         assert!(!on.iter().any(|(text, _)| text == "View: Chat"));
-        assert!(on.contains(&("Fast: On".to_owned(), Tone::FastOn)));
+        assert!(on.contains(&("Response: Completed".to_owned(), Tone::FastOn)));
+
+        mode.response_display_mode = "All".to_owned();
+        assert!(tones(&mode).contains(&("Response: All".to_owned(), Tone::FastOff)));
 
         mode.vibe_tone = VibeTone::Off;
         assert!(tones(&mode).contains(&("Vibe: On".to_owned(), Tone::Muted)));
@@ -14535,18 +14589,19 @@ mod tests {
     }
 
     #[test]
-    fn hidden_cost_leaves_room_for_fast_control() {
+    fn hidden_cost_leaves_room_for_response_control() {
         let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
         mode.cost = Some("$0.95".to_owned());
         let line = input_top_line(66, "", Some(&mode));
         assert_eq!(rule_width(&line), 66);
         assert!(!painted(&line).contains("$0.95"));
         assert!(painted(&line).contains("Vibe: On"));
-        assert!(painted(&line).contains("Fast: On"));
+        assert!(painted(&line).contains("Response: Completed"));
+        assert!(!painted(&line).contains("Fast:"));
     }
 
     #[test]
-    fn tight_composer_rule_keeps_the_mode_and_fast_flag_after_view_removal() {
+    fn tight_composer_rule_keeps_response_and_vibe() {
         let mode = test_mode("Full Access", ModeAccent::Danger, true);
         let line = input_top_line(40, "", Some(&mode));
         let texts = line
@@ -14556,7 +14611,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(rule_width(&line), 40);
-        assert_eq!(texts, ["  ", "Vibe: On", " · ", "Fast: On", " ", "─╮"]);
+        assert_eq!(
+            texts,
+            ["  ", "Response: Completed", " · ", "Vibe: On", " ", "─╮"]
+        );
     }
 
     #[test]
@@ -14760,6 +14818,7 @@ mod tests {
         assert_eq!(lines[0].prefix_tone, Tone::Accent);
         assert_eq!(lines[0].tone, Tone::Accent);
         assert_eq!(lines[0].text, "Context compacted");
+        assert!(lines[1] == PaintLine::blank());
     }
 
     #[test]
@@ -15083,6 +15142,36 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(answer_row(&after), before_row);
+    }
+
+    #[test]
+    fn a_prompt_after_an_answer_has_only_one_visual_spacer_row() {
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.wrapped_width = 80;
+        let answer = Block::new(BlockKind::Assistant, "Codex", "이전 답변");
+        let prompt = Block::new(BlockKind::User, "Codex", "다음 프롬프트");
+        renderer.commit_fullscreen_blocks(&[answer], 80, 20);
+        renderer.commit_fullscreen_blocks(&[prompt], 80, 20);
+
+        let answer = renderer
+            .wrapped
+            .iter()
+            .position(|line| line.text == "이전 답변")
+            .expect("answer row");
+        let prompt = renderer
+            .wrapped
+            .iter()
+            .position(|line| line.text.contains("다음 프롬프트"))
+            .expect("prompt row");
+        let visual_spacers = renderer.wrapped[answer + 1..prompt]
+            .iter()
+            .filter(|line| painted(line).trim().is_empty())
+            .count();
+
+        assert_eq!(visual_spacers, 1);
+        let incremental = renderer.wrapped.clone();
+        renderer.rewrap(80);
+        assert!(renderer.wrapped == incremental);
     }
 
     #[test]
@@ -17794,7 +17883,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_badge_hover_keeps_a_trailing_click_cell() {
+    fn response_badge_hover_keeps_a_leading_click_cell() {
         theme::set_current(ThemeKind::Dark);
         let line = activity_line_with_composer_controls(
             PaintLine::blank(),
@@ -17803,13 +17892,13 @@ mod tests {
             120,
         )
         .expect("activity row has controls");
-        let hovered = Renderer::hover_columns(&line, None, Some(&Pick::FastMode))
-            .expect("fast badge is clickable");
+        let hovered = Renderer::hover_columns(&line, None, Some(&Pick::ResponseDisplayMode))
+            .expect("response badge is clickable");
         let text = painted(&line);
-        let fast_end = UnicodeWidthStr::width(&text[..text.find("Fast: Off").unwrap()])
-            + UnicodeWidthStr::width("Fast: Off");
+        let response_start =
+            UnicodeWidthStr::width(&text[..text.find("Response: Completed").unwrap()]);
 
-        assert_eq!(hovered.end, fast_end + 1);
+        assert_eq!(hovered.start, response_start.saturating_sub(1));
     }
 
     /// A long activity label crowds the controls off the active row. They belong
@@ -17831,7 +17920,7 @@ mod tests {
     #[test]
     fn moving_between_badges_repaints_only_the_old_and_new_badge_cells() {
         // If this instead repaints 10..47, Shell/Diff/Panel would visibly flash
-        // while the pointer moves from Response to Fast.
+        // while the pointer moves from Response to Vibe.
         assert_eq!(
             hover_repaint_columns(Some(10..26), Some(38..47)),
             vec![10..26, 38..47]
@@ -17846,17 +17935,19 @@ mod tests {
             Some(&test_mode("Full Access", ModeAccent::Danger, true)),
         );
         let vibe = Renderer::hover_columns(&line, None, Some(&Pick::VibeMode)).expect("vibe badge");
-        let fast = Renderer::hover_columns(&line, None, Some(&Pick::FastMode)).expect("fast badge");
+        let response = Renderer::hover_columns(&line, None, Some(&Pick::ResponseDisplayMode))
+            .expect("response badge");
         let mut output = Vec::new();
 
-        for columns in hover_repaint_columns(Some(vibe), Some(fast.clone())) {
-            print_line_columns(&mut output, &line, None, Some(fast.clone()), columns)
+        for columns in hover_repaint_columns(Some(vibe), Some(response.clone())) {
+            print_line_columns(&mut output, &line, None, Some(response.clone()), columns)
                 .expect("partial repaint");
         }
 
         let painted = String::from_utf8(output).expect("utf-8 paint");
         assert!(painted.contains("Vibe: On"));
-        assert!(painted.contains("Fast: On"));
+        assert!(painted.contains("Response: Completed"));
+        assert!(!painted.contains("Fast:"));
         assert!(!painted.contains("View: Chat"));
     }
 
@@ -18763,7 +18854,11 @@ mod tests {
                 .iter()
                 .any(|line| line.text == "Context compacted")
         );
-        assert!(expanded.iter().any(|line| line.text == "Context compacted"));
+        let compaction = expanded
+            .iter()
+            .position(|line| line.text == "Context compacted")
+            .expect("expanded History includes compaction");
+        assert!(expanded.get(compaction + 1) == Some(&PaintLine::blank()));
     }
 
     #[test]
@@ -19103,7 +19198,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_prompt_history_hides_only_its_response_label() {
+    fn expanded_prompt_history_shows_only_its_collapse_triangle() {
         let prompt = Block::new(BlockKind::User, "gpt-5.6-sol", "보낸 프롬프트");
         let history_id = 42;
         let lines = user_prompt_lines_with_history(
@@ -19118,6 +19213,12 @@ mod tests {
                 .iter()
                 .all(|line| !painted(line).contains("+4 Response"))
         );
+        let collapse = lines
+            .iter()
+            .find(|line| painted(line).contains('▲'))
+            .expect("expanded History has a collapse triangle");
+        assert!(painted(collapse).ends_with("▲  "));
+        assert_eq!(collapse.tail[0].tone, Tone::History);
         assert!(lines.iter().all(|line| {
             line.pick
                 .as_ref()

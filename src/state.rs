@@ -112,6 +112,46 @@ impl ResponseLength {
     }
 }
 
+/// Whether completed turns keep every progress response visible or fold the
+/// progress above the final answer into its prompt disclosure.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResponseDisplayMode {
+    All,
+    #[default]
+    Completed,
+}
+
+impl ResponseDisplayMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Completed => "Completed",
+        }
+    }
+
+    pub const fn config_value(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Completed => "completed",
+        }
+    }
+
+    fn from_config_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "all" => Some(Self::All),
+            "completed" => Some(Self::Completed),
+            _ => None,
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::All => Self::Completed,
+            Self::Completed => Self::All,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ShellDisplayMode {
     #[default]
@@ -639,7 +679,7 @@ struct SlashCommand {
     takes_argument: bool,
 }
 
-const SLASH_COMMANDS: [SlashCommand; 31] = [
+const SLASH_COMMANDS: [SlashCommand; 32] = [
     SlashCommand {
         name: "/provider",
         description: "Switch between the Claude and Codex providers",
@@ -653,6 +693,11 @@ const SLASH_COMMANDS: [SlashCommand; 31] = [
     SlashCommand {
         name: "/fast",
         description: "Choose the model's fast service tier",
+        takes_argument: true,
+    },
+    SlashCommand {
+        name: "/Response",
+        description: "Set Response compression type",
         takes_argument: true,
     },
     SlashCommand {
@@ -1328,6 +1373,8 @@ pub enum Action {
     },
     /// Save the picked side-panel size as the fallback for new sessions.
     PersistSidePanelDefault(SidePanelStage),
+    /// Save whether completed progress responses stay visible or fold away.
+    PersistResponseDisplayMode(ResponseDisplayMode),
     /// Save the transcript's Shell display preference for future sessions.
     PersistShellDisplayMode(ShellDisplayMode),
     PersistDiffDisplayMode(DiffDisplayMode),
@@ -1788,6 +1835,7 @@ enum PendingInteraction {
 
 #[derive(Clone, Copy)]
 enum DisplaySetting {
+    Response,
     Shell,
     Diff,
     Fast,
@@ -1796,6 +1844,7 @@ enum DisplaySetting {
 impl DisplaySetting {
     fn title(self) -> &'static str {
         match self {
+            Self::Response => "Response",
             Self::Shell => "Shell",
             Self::Diff => "Diff",
             Self::Fast => "Fast",
@@ -1804,8 +1853,19 @@ impl DisplaySetting {
 
     fn choices(self) -> &'static [&'static str] {
         match self {
+            Self::Response => &["All", "Completed"],
             Self::Shell | Self::Diff => &["Hide", "Collapse", "Expand"],
             Self::Fast => &["On", "Off"],
+        }
+    }
+
+    fn detail(self, selected: usize) -> Option<String> {
+        match (self, selected) {
+            (Self::Response, 0) => Some("모든 진행 응답을 항상 표시합니다.".to_owned()),
+            (Self::Response, 1) => {
+                Some("완료되면 마지막 답변만 남기고 이전 응답을 접습니다.".to_owned())
+            }
+            _ => None,
         }
     }
 }
@@ -3394,6 +3454,7 @@ pub struct AppState {
     activity_notice: Option<(String, Instant, Duration)>,
     status_metadata_refreshed_at: Instant,
     response_length: ResponseLength,
+    response_display_mode: ResponseDisplayMode,
     vibe_mode: VibeMode,
     conversation_view: ConversationView,
     shell_display_mode: ShellDisplayMode,
@@ -3513,6 +3574,9 @@ impl AppState {
                 _ => ResponseLength::Short,
             })
             .unwrap_or(default_response_length);
+        let response_display_mode = read_vibe_config_value("response_display_mode")
+            .and_then(|value| ResponseDisplayMode::from_config_value(&value))
+            .unwrap_or_default();
         let shell_display_mode = read_vibe_config_value("shell_display_mode")
             .and_then(|value| ShellDisplayMode::from_config_value(&value))
             .unwrap_or(default_shell_display_mode);
@@ -3610,6 +3674,7 @@ impl AppState {
             vibe_mode,
             conversation_view,
             response_length,
+            response_display_mode,
             shell_display_mode,
             diff_display_mode,
             // The stage belongs to a session, and no session is bound yet. Starting
@@ -4091,6 +4156,10 @@ impl AppState {
             matches!(
                 (pending, &action),
                 (Action::SetFast(_), Action::SetFast(_))
+                    | (
+                        Action::PersistResponseDisplayMode(_),
+                        Action::PersistResponseDisplayMode(_)
+                    )
                     | (
                         Action::SetClaudePermissionMode(_),
                         Action::SetClaudePermissionMode(_)
@@ -4601,7 +4670,7 @@ impl AppState {
             accent: self.permission_mode().accent(),
             model: self.selected_model_name().to_owned(),
             response_length: self.response_length_label().to_owned(),
-            fast_mode: self.effective_fast_mode(),
+            response_display_mode: self.response_display_mode.label().to_owned(),
             claude_permission: self.claude_permission_badge(),
             effort: self.selected_effort.clone(),
             shell_display_mode: self.shell_display_mode().label().to_owned(),
@@ -5283,8 +5352,9 @@ impl AppState {
         let Some(last_group) = groups.last() else {
             return;
         };
-        self.response_collapse =
-            (self.vibe_mode == VibeMode::SuperVibe).then(|| ResponseCollapseTransition {
+        self.response_collapse = (self.vibe_mode == VibeMode::SuperVibe
+            && self.response_display_mode == ResponseDisplayMode::Completed)
+            .then(|| ResponseCollapseTransition {
                 group_id: last_group.id(),
                 started_at: Instant::now(),
             });
@@ -5630,7 +5700,8 @@ impl AppState {
             overlay: self.overlay_view(),
             plan_summary: self.plan_summary.as_ref(),
             response_collapse: self.response_collapse_view(),
-            fold_progress_groups: self.vibe_mode == VibeMode::SuperVibe,
+            fold_progress_groups: self.vibe_mode == VibeMode::SuperVibe
+                && self.response_display_mode == ResponseDisplayMode::Completed,
             plan_active: self.plan_is_active(),
             plan_shimmer_phase: self.plan_shimmer_phase(),
             plan_effort: self
@@ -7281,7 +7352,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/provider [claude|codex]  Claude·Codex provider 전환과 연결 사용/미사용\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/permissions  현재 provider 권한 규칙 관리\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n{login_help}\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
+                    format!("/provider [claude|codex]  Claude·Codex provider 전환과 연결 사용/미사용\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n/permissions  현재 provider 권한 규칙 관리\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n{login_help}\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
                 ));
                 Action::None
             }
@@ -7447,6 +7518,27 @@ impl AppState {
             "/permissions" => {
                 self.committed
                     .push(Block::new(BlockKind::Error, "Usage", "/permissions"));
+                Action::None
+            }
+            "/Response" | "/response" if parts.len() == 1 => {
+                self.open_setting_picker(
+                    DisplaySetting::Response,
+                    match self.response_display_mode {
+                        ResponseDisplayMode::All => 0,
+                        ResponseDisplayMode::Completed => 1,
+                    },
+                );
+                Action::None
+            }
+            "/Response" | "/response" if parts.len() == 2 => {
+                self.set_display_setting(DisplaySetting::Response, parts[1])
+            }
+            "/Response" | "/response" => {
+                self.committed.push(Block::new(
+                    BlockKind::Error,
+                    "Usage",
+                    "/Response [All|Completed]",
+                ));
                 Action::None
             }
             "/vibemode" if parts.len() == 1 => {
@@ -9075,7 +9167,7 @@ impl AppState {
                         .map(|choice| (*choice).to_owned())
                         .collect(),
                     selected: *selected,
-                    detail: None,
+                    detail: setting.detail(*selected),
                 }),
                 hint: "←→ to adjust  ·  Enter to confirm  ·  Esc to cancel".to_owned(),
                 style: OverlayStyle::Picker,
@@ -10172,7 +10264,9 @@ impl AppState {
     }
 
     fn response_collapse_view(&self) -> Option<(u64, f32)> {
-        if self.vibe_mode != VibeMode::SuperVibe {
+        if self.vibe_mode != VibeMode::SuperVibe
+            || self.response_display_mode != ResponseDisplayMode::Completed
+        {
             return None;
         }
         let transition = self.response_collapse?;
@@ -10426,6 +10520,24 @@ impl AppState {
 
     pub const fn response_length(&self) -> ResponseLength {
         self.response_length
+    }
+
+    #[cfg(test)]
+    pub const fn response_display_mode(&self) -> ResponseDisplayMode {
+        self.response_display_mode
+    }
+
+    pub fn cycle_response_display_mode(&mut self) -> ResponseDisplayMode {
+        let mode = self.response_display_mode.next();
+        self.set_response_display_mode(mode);
+        mode
+    }
+
+    fn set_response_display_mode(&mut self, mode: ResponseDisplayMode) {
+        self.response_display_mode = mode;
+        if mode == ResponseDisplayMode::All {
+            self.response_collapse = None;
+        }
     }
 
     pub fn cycle_vibe_mode(&mut self) -> (ShellDisplayMode, DiffDisplayMode) {
@@ -11004,6 +11116,15 @@ impl AppState {
 
     fn apply_setting_picker(&mut self, setting: DisplaySetting, selected: usize) -> Action {
         match setting {
+            DisplaySetting::Response => {
+                let mode = match selected {
+                    0 => ResponseDisplayMode::All,
+                    1 => ResponseDisplayMode::Completed,
+                    _ => self.response_display_mode,
+                };
+                self.set_response_display_mode(mode);
+                Action::PersistResponseDisplayMode(mode)
+            }
             DisplaySetting::Shell => {
                 let mode = match selected {
                     0 => ShellDisplayMode::Hide,
@@ -13904,6 +14025,55 @@ mod tests {
         assert_eq!(state.model_verbosity(), "high");
     }
 
+    #[test]
+    fn response_command_shows_descriptions_and_applies_both_modes() {
+        let mut state = test_state();
+        state.set_response_display_mode(ResponseDisplayMode::Completed);
+
+        assert!(matches!(state.run_slash_command("/Response"), Action::None));
+        let overlay = state.overlay_view().expect("Response picker");
+        let slider = overlay.slider.expect("Response choices");
+        assert_eq!(overlay.title, "Response");
+        assert_eq!(slider.efforts, ["All", "Completed"]);
+        assert_eq!(slider.selected, 1);
+        assert_eq!(
+            slider.detail.as_deref(),
+            Some("완료되면 마지막 답변만 남기고 이전 응답을 접습니다.")
+        );
+
+        let action = state.click_effort_step(0);
+        assert!(matches!(
+            action,
+            Action::PersistResponseDisplayMode(ResponseDisplayMode::All)
+        ));
+        assert_eq!(state.response_display_mode(), ResponseDisplayMode::All);
+
+        let action = state.run_slash_command("/response Completed");
+        assert!(matches!(
+            action,
+            Action::PersistResponseDisplayMode(ResponseDisplayMode::Completed)
+        ));
+        assert_eq!(
+            state.response_display_mode(),
+            ResponseDisplayMode::Completed
+        );
+    }
+
+    #[test]
+    fn all_response_mode_disables_super_vibe_progress_folding() {
+        let mut state = test_state();
+        while state.vibe_mode() != VibeMode::SuperVibe {
+            state.cycle_vibe_mode();
+        }
+
+        state.set_response_display_mode(ResponseDisplayMode::Completed);
+        assert!(state.view().fold_progress_groups);
+
+        state.set_response_display_mode(ResponseDisplayMode::All);
+        assert!(!state.view().fold_progress_groups);
+        assert!(state.response_collapse_view().is_none());
+    }
+
     /// The panel is the session's task view — the steps a turn is working
     /// through, live. Super Vibe keeps it: what that preset drops is the plan
     /// replayed into the transcript as a block, not the panel itself.
@@ -16129,6 +16299,19 @@ mod tests {
     }
 
     #[test]
+    fn response_display_mode_accepts_only_supported_config_values() {
+        assert_eq!(
+            ResponseDisplayMode::from_config_value("all"),
+            Some(ResponseDisplayMode::All)
+        );
+        assert_eq!(
+            ResponseDisplayMode::from_config_value("Completed"),
+            Some(ResponseDisplayMode::Completed)
+        );
+        assert_eq!(ResponseDisplayMode::from_config_value("compact"), None);
+    }
+
+    #[test]
     fn status_line_fields_use_the_configured_booleans() {
         assert_eq!(
             parse_status_line_field(
@@ -16295,13 +16478,16 @@ mod tests {
     }
 
     #[test]
-    fn fast_mode_updates_the_badge_and_reports_the_switch() {
+    fn fast_mode_reports_the_switch_without_a_composer_badge() {
         let mut state = test_state();
 
         state.set_fast_mode(true);
 
         assert!(state.fast_mode);
-        assert!(state.composer_mode().fast_mode);
+        assert_eq!(
+            state.composer_mode().response_display_mode,
+            state.response_display_mode().label()
+        );
         assert!(state.transient_status.is_none());
         let on = state
             .committed
@@ -16323,15 +16509,16 @@ mod tests {
     }
 
     #[test]
-    fn composer_badge_carries_fixed_access_and_fast_tier() {
+    fn composer_badge_carries_fixed_access_and_response_display_mode() {
         let mut state = test_state();
         state.set_fast_mode(false);
+        state.set_response_display_mode(ResponseDisplayMode::Completed);
 
         let badge = state.composer_mode();
 
         assert_eq!(badge.label, "Full Access");
         assert_eq!(badge.response_length, "Short");
-        assert!(!badge.fast_mode);
+        assert_eq!(badge.response_display_mode, "Completed");
 
         state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(state.composer_mode().label, "Full Access");
