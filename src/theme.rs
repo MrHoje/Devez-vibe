@@ -176,7 +176,6 @@ pub struct ThemePalette {
     pub syntax_function: Rgb,
     pub syntax_attribute: Rgb,
     pub syntax_property: Rgb,
-    pub diff_header: Rgb,
     pub diff_add_bg: Rgb,
     pub diff_remove_bg: Rgb,
     /// The stronger tint painted over just the words that changed inside an
@@ -289,7 +288,6 @@ pub const MINIMAL: ThemePalette = ThemePalette {
     syntax_function: Rgb(0x79, 0x5E, 0x26),
     syntax_attribute: Rgb(0xA3, 0x15, 0x15),
     syntax_property: Rgb(0x00, 0x10, 0x80),
-    diff_header: Rgb(0x05, 0x63, 0xC1),
     diff_add_bg: Rgb(0xDA, 0xF0, 0xDE),
     diff_remove_bg: Rgb(0xF1, 0xD7, 0xDA),
     diff_add_word_bg: Rgb(0x9E, 0xDD, 0xAE),
@@ -353,7 +351,6 @@ pub const SOFT: ThemePalette = ThemePalette {
     syntax_function: Rgb(0x68, 0x4B, 0x8A),
     syntax_attribute: Rgb(0x9A, 0x4D, 0x12),
     syntax_property: Rgb(0x3D, 0x6E, 0x8E),
-    diff_header: Rgb(0x3A, 0x6F, 0xA5),
     diff_add_bg: Rgb(0xD9, 0xE5, 0xD8),
     diff_remove_bg: Rgb(0xEC, 0xD1, 0xD2),
     diff_add_word_bg: Rgb(0x7B, 0xAA, 0x68),
@@ -417,7 +414,6 @@ pub const DARK: ThemePalette = ThemePalette {
     syntax_function: Rgb(0xDC, 0xDC, 0xAA),
     syntax_attribute: Rgb(0xC5, 0x86, 0xC0),
     syntax_property: Rgb(0x9C, 0xDC, 0xFE),
-    diff_header: Rgb(0x4F, 0xA6, 0xFF),
     diff_add_bg: Rgb(0x26, 0x3D, 0x2A),
     diff_remove_bg: Rgb(0x47, 0x29, 0x28),
     diff_add_word_bg: Rgb(0x2A, 0x6B, 0x3C),
@@ -484,7 +480,6 @@ pub const GRAY: ThemePalette = ThemePalette {
     syntax_function: Rgb(0x79, 0x5E, 0x26),
     syntax_attribute: Rgb(0xB4, 0x53, 0x09),
     syntax_property: Rgb(0x1E, 0x5F, 0xAB),
-    diff_header: Rgb(0x37, 0x41, 0x51),
     diff_add_bg: Rgb(0xE7, 0xF6, 0xEB),
     diff_remove_bg: Rgb(0xFC, 0xE8, 0xE8),
     diff_add_word_bg: Rgb(0x9E, 0xDD, 0xAE),
@@ -550,7 +545,6 @@ pub const SOFT_PINK: ThemePalette = ThemePalette {
     syntax_function: Rgb(0x84, 0x58, 0x8F),
     syntax_attribute: Rgb(0xA1, 0x62, 0x07),
     syntax_property: Rgb(0x32, 0x6A, 0x9F),
-    diff_header: Rgb(0xB5, 0x4A, 0x6B),
     diff_add_bg: Rgb(0xE9, 0xF5, 0xEC),
     diff_remove_bg: Rgb(0xFD, 0xE7, 0xE7),
     diff_add_word_bg: Rgb(0x9E, 0xD8, 0xAE),
@@ -616,7 +610,6 @@ pub const MIDNIGHT: ThemePalette = ThemePalette {
     syntax_function: Rgb(0xDC, 0xDC, 0xAA),
     syntax_attribute: Rgb(0xC5, 0x86, 0xC0),
     syntax_property: Rgb(0x9C, 0xDC, 0xFE),
-    diff_header: Rgb(0x4F, 0xA6, 0xFF),
     diff_add_bg: Rgb(0x16, 0x36, 0x2F),
     diff_remove_bg: Rgb(0x3B, 0x1F, 0x2B),
     diff_add_word_bg: Rgb(0x1E, 0x5E, 0x4C),
@@ -809,7 +802,6 @@ mod tests {
                 ("syntax_function", palette.syntax_function),
                 ("syntax_attribute", palette.syntax_attribute),
                 ("syntax_property", palette.syntax_property),
-                ("diff_header", palette.diff_header),
             ];
             for (name, color) in text_colors {
                 let ratio = contrast_ratio(color, palette.background);

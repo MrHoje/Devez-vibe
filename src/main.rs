@@ -1512,15 +1512,6 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
                 diff,
             }
         }
-        Pick::ResponseLength => {
-            state.cycle_response_length();
-            Action::PersistVibeDisplayModes {
-                vibe: state.vibe_mode(),
-                response: state.response_length(),
-                shell: state.shell_display_mode(),
-                diff: state.diff_display_mode(),
-            }
-        }
         Pick::ResponseDisplayMode => {
             let mode = state.cycle_response_display_mode();
             Action::PersistResponseDisplayMode(mode)
@@ -1564,7 +1555,6 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
             Action::Tick(true)
         }
         Pick::OpenLink(target) => Action::OpenUrl(target),
-        Pick::FastMode => Action::SetFast(!state.effective_fast_mode()),
         Pick::ClaudePermissionMode => {
             state.open_claude_permission_picker();
             Action::None
@@ -2046,35 +2036,6 @@ async fn execute_action(
             {
                 state.end_compaction();
                 state.push_notice(BlockKind::Error, "압축 실패", error.to_string());
-            }
-        }
-        Action::ShowDiff => {
-            let output = tokio::process::Command::new("git")
-                .args(["diff", "--no-ext-diff", "--"])
-                .current_dir(&state.cwd)
-                .output()
-                .await;
-            match output {
-                Ok(output) if output.status.success() => {
-                    let diff = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                    state.push_notice(
-                        BlockKind::Diff,
-                        "Git diff",
-                        if diff.is_empty() {
-                            "No tracked changes".to_owned()
-                        } else {
-                            diff
-                        },
-                    );
-                }
-                Ok(output) => state.push_notice(
-                    BlockKind::Error,
-                    "Git diff 실패",
-                    String::from_utf8_lossy(&output.stderr).trim(),
-                ),
-                Err(error) => {
-                    state.push_notice(BlockKind::Error, "Git diff 실패", error.to_string())
-                }
             }
         }
         Action::OpenMcp(notice) => match list_mcp_servers(server, &state.thread_id).await {
@@ -5310,20 +5271,6 @@ mod tests {
     }
 
     #[test]
-    fn clicking_the_response_badge_cycles_response_length() {
-        let mut state = starting_state();
-
-        let action = pick_action(&mut state, Pick::ResponseLength);
-
-        // Every display badge persists the whole vibe group, so one reading can
-        // never be saved without the preset it belongs to.
-        assert!(matches!(action, Action::PersistVibeDisplayModes { .. }));
-        assert_eq!(state.response_length_label(), "Normal");
-        state.handle_key(press(KeyCode::BackTab, KeyModifiers::SHIFT));
-        assert_eq!(state.response_length_label(), "Normal");
-    }
-
-    #[test]
     fn clicking_the_response_display_badge_toggles_its_persisted_mode() {
         let mut state = starting_state();
         let before = state.response_display_mode();
@@ -6679,18 +6626,6 @@ mod tests {
         );
     }
 
-    /// The Fast badge is a direct toggle; `/fast` remains the explicit chooser.
-    #[test]
-    fn clicking_the_fast_badge_toggles_the_service_tier() {
-        let mut state = state_with_a_model();
-        state.set_fast_mode(false);
-
-        assert!(matches!(
-            pick_action(&mut state, Pick::FastMode),
-            Action::SetFast(true)
-        ));
-    }
-
     /// An open picker is no reason to make the other reading dead: clicking it
     /// switches straight over, which is how one gets from `/model` to `/effort`
     /// without touching the keyboard.
@@ -6715,16 +6650,6 @@ mod tests {
             state.view().overlay.map(|overlay| overlay.title),
             Some("Model".to_owned())
         );
-    }
-
-    #[test]
-    fn an_open_picker_still_swallows_the_response_badge() {
-        let mut state = state_with_a_model();
-        pick_action(&mut state, Pick::Model);
-
-        pick_action(&mut state, Pick::ResponseLength);
-
-        assert_eq!(state.response_length_label(), "Short");
     }
 
     /// Clicking a model row does what typing its number does: takes the model and
@@ -6975,7 +6900,6 @@ mod tests {
         assert!(hold_until_thread(&mut state, Action::ClearScreen, &mut queued).is_some());
         assert!(hold_until_thread(&mut state, Action::Quit, &mut queued).is_some());
         assert!(hold_until_thread(&mut state, Action::Compact, &mut queued).is_none());
-        assert!(hold_until_thread(&mut state, Action::ShowDiff, &mut queued).is_none());
     }
 
     #[test]

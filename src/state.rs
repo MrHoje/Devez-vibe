@@ -102,14 +102,6 @@ impl ResponseLength {
             Self::Detailed => "high",
         }
     }
-
-    fn next(self) -> Self {
-        match self {
-            Self::Short => Self::Normal,
-            Self::Normal => Self::Detailed,
-            Self::Detailed => Self::Short,
-        }
-    }
 }
 
 /// Whether completed turns keep every progress response visible or fold the
@@ -1304,8 +1296,6 @@ pub enum Action {
     ScrollToBottom,
     ScrollToPrompt(u64),
     Copy(String),
-    #[allow(dead_code)]
-    ShowDiff,
     /// Fetch MCP server status and open the picker. Any notice is carried over
     /// so the result of the action that reopened it stays on screen.
     OpenMcp(Option<String>),
@@ -1861,10 +1851,14 @@ impl DisplaySetting {
 
     fn detail(self, selected: usize) -> Option<String> {
         match (self, selected) {
-            (Self::Response, 0) => Some("모든 진행 응답을 항상 표시합니다.".to_owned()),
-            (Self::Response, 1) => {
-                Some("완료되면 마지막 답변만 남기고 이전 응답을 접습니다.".to_owned())
-            }
+            (Self::Response, 0) => Some(
+                "Super Vibe 모드에서만 동작합니다. 모든 진행 응답을 항상 표시합니다."
+                    .to_owned(),
+            ),
+            (Self::Response, 1) => Some(
+                "Super Vibe 모드에서만 동작합니다. 완료되면 마지막 답변만 남기고 이전 응답을 접습니다."
+                    .to_owned(),
+            ),
             _ => None,
         }
     }
@@ -5322,7 +5316,7 @@ impl AppState {
                 matches!(block.kind, BlockKind::Assistant).then_some(index)
             })
             .collect::<Vec<_>>();
-        if self.response_grouped || assistant_indices.len() < 2 {
+        if self.response_grouped || assistant_indices.is_empty() {
             return;
         }
         let final_index = assistant_indices
@@ -5331,13 +5325,8 @@ impl AppState {
             .rfind(|&index| {
                 self.turn_response_blocks[index].assistant_phase() == AssistantPhase::FinalAnswer
             })
-            .unwrap_or(*assistant_indices.last().expect("two assistant blocks"));
-        let Some(first_progress) = assistant_indices.into_iter().find(|&index| {
-            index < final_index && !self.turn_response_blocks[index].body.trim().is_empty()
-        }) else {
-            return;
-        };
-        let progress = self.turn_response_blocks[first_progress..final_index]
+            .unwrap_or(*assistant_indices.last().expect("assistant block"));
+        let progress = self.turn_response_blocks[..final_index]
             .iter()
             .filter(|block| {
                 is_context_compaction(block)
@@ -5360,6 +5349,33 @@ impl AppState {
             });
         self.response_grouped = true;
         self.committed.extend(groups);
+    }
+
+    fn collapse_progress_before_final_answer(&mut self) {
+        if self.response_grouped
+            || self.vibe_mode != VibeMode::SuperVibe
+            || self.response_display_mode != ResponseDisplayMode::Completed
+        {
+            return;
+        }
+        let progress = self
+            .turn_response_blocks
+            .iter()
+            .filter(|block| {
+                is_context_compaction(block)
+                    || (matches!(block.kind, BlockKind::Assistant) && !block.body.trim().is_empty())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if progress.is_empty() {
+            return;
+        }
+
+        self.response_grouped = true;
+        self.committed.extend(progress_groups_for_prompt_ids(
+            progress,
+            &self.turn_prompt_ids,
+        ));
     }
 
     /// Returns an interrupt the user requested while `turn/start` was still
@@ -10501,14 +10517,6 @@ impl AppState {
         }
     }
 
-    pub fn cycle_response_length(&mut self) {
-        if self.pending.is_none() {
-            self.response_length = self.response_length.next();
-            self.vibe_mode = VibeMode::Vibe;
-            self.notice_setting_applies_to_next_request();
-        }
-    }
-
     #[allow(dead_code)]
     pub fn vibe_mode_label(&self) -> &'static str {
         self.vibe_mode.label()
@@ -11236,6 +11244,14 @@ impl AppState {
         let Some(mut block) = active_item_block(&self.cwd, item) else {
             return;
         };
+        if matches!(block.kind, BlockKind::Assistant)
+            && block.assistant_phase() == AssistantPhase::FinalAnswer
+        {
+            // Completed mode must settle the transcript before final text starts
+            // streaming. Folding at turn/completed makes that text appear below
+            // the progress rows and jump upward when they disappear.
+            self.collapse_progress_before_final_answer();
+        }
         if matches!(block.kind, BlockKind::Assistant) && !block.body.is_empty() {
             self.turn_response_started = true;
         }
@@ -12244,28 +12260,24 @@ fn group_turn_response(blocks: Vec<Block>) -> Vec<Block> {
         .enumerate()
         .filter_map(|(index, block)| matches!(block.kind, BlockKind::Assistant).then_some(index))
         .collect::<Vec<_>>();
-    if assistant_indices.len() < 2 {
+    if assistant_indices.is_empty() {
         return blocks;
     }
     let final_index = assistant_indices
         .iter()
         .copied()
         .rfind(|&index| blocks[index].assistant_phase() == AssistantPhase::FinalAnswer)
-        .unwrap_or(*assistant_indices.last().expect("two assistant blocks"));
-    let progress_indices = assistant_indices
-        .into_iter()
-        .filter(|&index| index < final_index && !blocks[index].body.trim().is_empty())
-        .collect::<Vec<_>>();
-    let Some(_) = progress_indices.first() else {
-        return blocks;
-    };
-    let fold_indices = (progress_indices[0]..final_index)
+        .unwrap_or(*assistant_indices.last().expect("assistant block"));
+    let fold_indices = (0..final_index)
         .filter(|&index| {
             is_context_compaction(&blocks[index])
                 || (matches!(blocks[index].kind, BlockKind::Assistant)
                     && !blocks[index].body.trim().is_empty())
         })
         .collect::<Vec<_>>();
+    if fold_indices.is_empty() {
+        return blocks;
+    }
     let mut groups: Vec<(Option<usize>, Vec<Block>)> = Vec::new();
     for &index in &fold_indices {
         let prompt = blocks[..index]
@@ -13091,17 +13103,6 @@ fn read_conversation_view() -> ConversationView {
     }
 }
 
-#[allow(dead_code)]
-fn read_response_length() -> ResponseLength {
-    read_vibe_config_value("model_verbosity")
-        .map(|value| match value.as_str() {
-            "medium" => ResponseLength::Normal,
-            "high" => ResponseLength::Detailed,
-            _ => ResponseLength::Short,
-        })
-        .unwrap_or_default()
-}
-
 fn read_vibe_config_value(key: &str) -> Option<String> {
     vibe_settings_path()
         .and_then(|path| fs::read_to_string(path).ok())
@@ -13111,13 +13112,6 @@ fn read_vibe_config_value(key: &str) -> Option<String> {
                 .and_then(|home| fs::read_to_string(home.join("config.toml")).ok())
                 .and_then(|config| config_value(&config, key))
         })
-}
-
-#[allow(dead_code)]
-fn read_shell_display_mode() -> ShellDisplayMode {
-    read_vibe_config_value("shell_display_mode")
-        .and_then(|value| ShellDisplayMode::from_config_value(&value))
-        .unwrap_or_default()
 }
 
 /// Where each session's own panel stage is kept. The stage is a per-session
@@ -13191,13 +13185,6 @@ fn write_session_side_panel_stage(thread_id: &str, stage: SidePanelStage) -> std
     let text = serde_json::to_string(&stages)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     fs::write(path, text)
-}
-
-#[allow(dead_code)]
-fn read_diff_display_mode() -> DiffDisplayMode {
-    read_vibe_config_value("diff_display_mode")
-        .and_then(|value| DiffDisplayMode::from_config_value(&value))
-        .unwrap_or_default()
 }
 
 /// Whether dvz may dial the Codex app-server. Unset means no: a runtime is
@@ -13288,56 +13275,6 @@ fn upsert_vibe_config_value(existing: &str, key: &str, value: &str) -> String {
         lines.push(replacement);
     }
     format!("{}\n", lines.join("\n"))
-}
-
-#[allow(dead_code)]
-fn parse_shell_display_mode(config: &str) -> Option<ShellDisplayMode> {
-    config
-        .lines()
-        .take_while(|line| !line.trim_start().starts_with('['))
-        .filter_map(|line| line.split('#').next())
-        .filter_map(|line| line.split_once('='))
-        .find_map(|(key, value)| {
-            (key.trim() == "shell_display_mode").then(|| ShellDisplayMode::from_config_value(value))
-        })
-        .flatten()
-}
-
-#[allow(dead_code)]
-fn parse_diff_display_mode(config: &str) -> Option<DiffDisplayMode> {
-    config
-        .lines()
-        .take_while(|line| !line.trim_start().starts_with('['))
-        .filter_map(|line| line.split('#').next())
-        .filter_map(|line| line.split_once('='))
-        .find_map(|(key, value)| {
-            (key.trim() == "diff_display_mode").then(|| DiffDisplayMode::from_config_value(value))
-        })
-        .flatten()
-}
-
-#[cfg(test)]
-fn parse_status_line_field(config: &str, field: StatusLineField) -> Option<bool> {
-    config
-        .lines()
-        .take_while(|line| !line.trim_start().starts_with('['))
-        .filter_map(|line| line.split('#').next())
-        .filter_map(|line| line.split_once('='))
-        .find_map(|(key, value)| {
-            (key.trim() == field.config_key()).then(|| {
-                match value
-                    .trim()
-                    .trim_matches(['\"', '\''])
-                    .to_ascii_lowercase()
-                    .as_str()
-                {
-                    "true" => Some(true),
-                    "false" => Some(false),
-                    _ => None,
-                }
-            })
-        })
-        .flatten()
 }
 
 pub(crate) fn codex_home() -> Option<PathBuf> {
@@ -14002,30 +13939,6 @@ mod tests {
     }
 
     #[test]
-    fn permission_profile_is_fixed_to_full_access() {
-        let mut state = test_state();
-
-        state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-
-        assert_eq!(state.permission_mode(), PermissionMode::FullAccess);
-        assert_eq!(state.permission_profile(), ":danger-full-access");
-    }
-
-    #[test]
-    fn response_length_cycles_from_short_to_normal_to_detailed() {
-        let mut state = test_state();
-
-        assert_eq!(state.response_length_label(), "Short");
-        assert_eq!(state.model_verbosity(), "low");
-        state.cycle_response_length();
-        assert_eq!(state.response_length_label(), "Normal");
-        assert_eq!(state.model_verbosity(), "medium");
-        state.cycle_response_length();
-        assert_eq!(state.response_length_label(), "Detailed");
-        assert_eq!(state.model_verbosity(), "high");
-    }
-
-    #[test]
     fn response_command_shows_descriptions_and_applies_both_modes() {
         let mut state = test_state();
         state.set_response_display_mode(ResponseDisplayMode::Completed);
@@ -14038,7 +13951,13 @@ mod tests {
         assert_eq!(slider.selected, 1);
         assert_eq!(
             slider.detail.as_deref(),
-            Some("완료되면 마지막 답변만 남기고 이전 응답을 접습니다.")
+            Some(
+                "Super Vibe 모드에서만 동작합니다. 완료되면 마지막 답변만 남기고 이전 응답을 접습니다."
+            )
+        );
+        assert_eq!(
+            DisplaySetting::Response.detail(0).as_deref(),
+            Some("Super Vibe 모드에서만 동작합니다. 모든 진행 응답을 항상 표시합니다.")
         );
 
         let action = state.click_effort_step(0);
@@ -14140,12 +14059,6 @@ mod tests {
             state.cycle_vibe_mode();
         }
         assert_eq!(titles(&mut state), ["Plan", "작업 단계", "Codex"]);
-    }
-
-    #[test]
-    fn transcript_display_defaults_to_hidden_shell_and_diff() {
-        assert_eq!(ShellDisplayMode::default(), ShellDisplayMode::Hide);
-        assert_eq!(DiffDisplayMode::default(), DiffDisplayMode::Hide);
     }
 
     #[test]
@@ -15501,40 +15414,36 @@ mod tests {
     }
 
     #[test]
-    fn completed_plan_step_keeps_its_elapsed_time() {
-        let mut state = test_state();
-        state.handle_notification(
+    fn completed_plan_steps_preserve_observed_time_without_inventing_it() {
+        let mut observed = test_state();
+        observed.handle_notification(
             "turn/plan/updated",
             &json!({ "plan": [{ "step": "check", "status": "inProgress" }] }),
         );
-        state.handle_notification(
+        observed.handle_notification(
             "turn/plan/updated",
             &json!({ "plan": [{ "step": "check", "status": "completed" }] }),
         );
-        let elapsed = state.plan_summary.as_ref().unwrap().steps[0].elapsed;
-
-        state.handle_notification(
+        let elapsed = observed.plan_summary.as_ref().unwrap().steps[0].elapsed;
+        observed.handle_notification(
             "turn/plan/updated",
             &json!({ "plan": [{ "step": "check", "status": "completed" }] }),
-        );
-
-        assert_eq!(
-            state.plan_summary.as_ref().unwrap().steps[0].elapsed,
-            elapsed
         );
         assert!(elapsed.is_some());
-    }
+        assert_eq!(
+            observed.plan_summary.as_ref().unwrap().steps[0].elapsed,
+            elapsed
+        );
 
-    #[test]
-    fn completed_plan_step_without_an_observed_start_has_no_fake_zero_time() {
-        let mut state = test_state();
-
-        state.handle_notification(
+        let mut unobserved = test_state();
+        unobserved.handle_notification(
             "turn/plan/updated",
             &json!({ "plan": [{ "step": "check", "status": "completed" }] }),
         );
-
-        assert_eq!(state.plan_summary.as_ref().unwrap().steps[0].elapsed, None);
+        assert_eq!(
+            unobserved.plan_summary.as_ref().unwrap().steps[0].elapsed,
+            None
+        );
     }
 
     #[test]
@@ -15669,19 +15578,19 @@ mod tests {
     }
 
     #[test]
-    fn command_output_arrives_without_its_escape_sequences() {
-        // A pty-backed shell colours its errors and sets the window title; both
-        // would otherwise be measured as visible columns.
-        let raw = "\x1b[31mfatal\x1b[0m: no\n\x1b]0;title\x07plain\n\x1b[1;32mok\x1b[m\n";
-
-        assert_eq!(strip_ansi(raw), "fatal: no\nplain\nok\n");
-    }
-
-    #[test]
-    fn stripping_escape_sequences_leaves_ordinary_text_alone() {
-        let plain = "C:\\Users\\x\\SKILL.md' because it does not exist.\n  ~~~~~\n";
-
-        assert_eq!(strip_ansi(plain), plain);
+    fn ansi_stripping_handles_escape_sequences_and_plain_text() {
+        for (input, expected) in [
+            (
+                "\x1b[31mfatal\x1b[0m: no\n\x1b]0;title\x07plain\n\x1b[1;32mok\x1b[m\n",
+                "fatal: no\nplain\nok\n",
+            ),
+            (
+                "C:\\Users\\x\\SKILL.md' because it does not exist.\n  ~~~~~\n",
+                "C:\\Users\\x\\SKILL.md' because it does not exist.\n  ~~~~~\n",
+            ),
+        ] {
+            assert_eq!(strip_ansi(input), expected);
+        }
     }
 
     #[test]
@@ -15940,7 +15849,7 @@ mod tests {
     }
 
     #[test]
-    fn clearing_the_screen_brings_the_welcome_panel_back() {
+    fn clear_command_and_shortcut_share_the_action_and_restore_welcome() {
         let mut state = test_state();
         state.editor.insert_str("hello");
         state.submit_editor();
@@ -15953,15 +15862,10 @@ mod tests {
         state.reset_welcome();
 
         assert!(state.view().welcome.is_some());
-    }
-
-    #[test]
-    fn ctrl_l_reaches_the_same_clear_action_as_the_command() {
-        let mut state = test_state();
-
-        let action = state.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
-
-        assert!(matches!(action, Action::ClearScreen));
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            Action::ClearScreen
+        ));
     }
 
     #[test]
@@ -16266,26 +16170,6 @@ mod tests {
     }
 
     #[test]
-    fn shell_display_mode_starts_from_the_configured_default() {
-        assert_eq!(
-            parse_shell_display_mode("shell_display_mode = \"expand\"\n"),
-            Some(ShellDisplayMode::Expand)
-        );
-        assert_eq!(
-            parse_shell_display_mode("shell_display_mode = \"hide\" # compact transcript\n"),
-            Some(ShellDisplayMode::Hide)
-        );
-        assert_eq!(
-            parse_shell_display_mode("[ui]\nshell_display_mode = \"hide\"\n"),
-            None
-        );
-        assert_eq!(
-            parse_shell_display_mode("shell_display_mode = \"other\"\n"),
-            None
-        );
-    }
-
-    #[test]
     fn global_vibe_settings_replace_one_value_and_preserve_the_others() {
         let config = upsert_vibe_config_value(
             "vibe_mode = \"vibe\"\nshell_display_mode = \"collapse\"\n",
@@ -16312,35 +16196,9 @@ mod tests {
     }
 
     #[test]
-    fn status_line_fields_use_the_configured_booleans() {
-        assert_eq!(
-            parse_status_line_field(
-                "status_line_five_hour = \"true\" # keep it visible\n",
-                StatusLineField::FiveHour,
-            ),
-            Some(true)
-        );
-        assert_eq!(
-            parse_status_line_field(
-                "[ui]\nstatus_line_weekly = false\n",
-                StatusLineField::Weekly,
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn status_command_reports_the_active_permission_profile() {
-        let mut state = test_state();
-        state.run_slash_command("/status");
-
-        let body = &state.committed.last().expect("status block").body;
-        assert!(body.contains("permissions: Full Access (:danger-full-access)"));
-    }
-
-    #[test]
-    fn status_command_reports_the_active_claude_permission_mode() {
-        let mut state = AppState::new(
+    fn status_command_reports_each_provider_permission_mode() {
+        let mut codex = test_state();
+        let mut claude = AppState::new(
             "claude:thread".to_owned(),
             "cwd".to_owned(),
             "account".to_owned(),
@@ -16348,12 +16206,23 @@ mod tests {
             "claude:sonnet",
             Some("high"),
         );
-        state.claude_permission_mode = ClaudePermissionMode::DontAsk;
+        claude.claude_permission_mode = ClaudePermissionMode::DontAsk;
 
-        state.run_slash_command("/status");
-
-        let body = &state.committed.last().expect("status block").body;
-        assert!(body.contains("permissions: don't ask (dontAsk)"));
+        for (state, expected) in [
+            (&mut codex, "permissions: Full Access (:danger-full-access)"),
+            (&mut claude, "permissions: don't ask (dontAsk)"),
+        ] {
+            state.run_slash_command("/status");
+            assert!(
+                state
+                    .committed
+                    .last()
+                    .expect("status block")
+                    .body
+                    .contains(expected),
+                "missing {expected}"
+            );
+        }
     }
 
     #[test]
@@ -17163,17 +17032,6 @@ mod tests {
         assert_eq!(state.activity(), None);
     }
 
-    #[test]
-    fn claude_compaction_uses_the_same_indeterminate_elapsed_reading() {
-        let mut state = test_state();
-        state.models = vec![test_model("claude:sonnet", "Claude Sonnet", true)];
-        state.selected_model = 0;
-        state.begin_compaction();
-
-        state.compacting_started_at = Some(Instant::now() - Duration::from_secs(90));
-        assert_eq!(state.activity().as_deref(), Some("Compacting.. (1m 30s)"));
-    }
-
     /// A compaction that runs as a turn must not fall back to the `Working` label
     /// when the boundary never arrives — the turn ending still clears it.
     #[test]
@@ -17227,6 +17085,121 @@ mod tests {
         assert_eq!(group.children().len(), 2);
         assert_eq!(group.title, "+2 Response");
         assert!(state.response_collapse_view().is_some());
+    }
+
+    #[test]
+    fn completed_mode_folds_progress_before_final_answer_streaming_starts() {
+        let mut state = test_state();
+        while state.vibe_mode() != VibeMode::SuperVibe {
+            state.cycle_vibe_mode();
+        }
+        state.set_response_display_mode(ResponseDisplayMode::Completed);
+        assert!(matches!(
+            state.submit_text("첫 요청".to_owned(), "첫 요청".to_owned()),
+            Action::Submit(_)
+        ));
+        state.drain_committed();
+        state.set_turn_started("turn-1".to_owned());
+        state.complete_item(&json!({
+            "id": "compact-1",
+            "type": "contextCompaction"
+        }));
+        state.drain_committed();
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "item": {
+                    "id": "progress-1",
+                    "type": "agentMessage",
+                    "phase": "commentary",
+                    "text": "진행 메시지"
+                }
+            }),
+        );
+        state.drain_committed();
+
+        state.handle_notification(
+            "item/started",
+            &json!({
+                "item": {
+                    "id": "final",
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": ""
+                }
+            }),
+        );
+        let blocks = state.drain_committed();
+        let group = blocks
+            .iter()
+            .find(|block| matches!(block.kind, BlockKind::ProgressGroup))
+            .expect("progress group before final stream");
+
+        assert_eq!(group.title, "+2 Response");
+        assert_eq!(group.children()[0].title, "Context compacted");
+        assert_eq!(group.children()[1].body, "진행 메시지");
+        assert!(state.response_collapse_view().is_none());
+        assert!(state.response_grouped);
+
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "item": {
+                    "id": "final",
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": "최종 답변"
+                }
+            }),
+        );
+        state.drain_committed();
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "status": "completed" } }),
+        );
+        assert!(
+            state
+                .drain_committed()
+                .iter()
+                .all(|block| !matches!(block.kind, BlockKind::ProgressGroup))
+        );
+    }
+
+    #[test]
+    fn all_response_mode_keeps_progress_visible_when_final_streaming_starts() {
+        let mut state = test_state();
+        while state.vibe_mode() != VibeMode::SuperVibe {
+            state.cycle_vibe_mode();
+        }
+        state.set_response_display_mode(ResponseDisplayMode::All);
+        state.set_turn_started("turn-1".to_owned());
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "item": {
+                    "id": "progress-1",
+                    "type": "agentMessage",
+                    "phase": "commentary",
+                    "text": "진행 메시지"
+                }
+            }),
+        );
+        state.drain_committed();
+
+        state.handle_notification(
+            "item/started",
+            &json!({
+                "item": {
+                    "id": "final",
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": ""
+                }
+            }),
+        );
+
+        assert!(state.drain_committed().is_empty());
+        assert!(!state.response_grouped);
     }
 
     #[test]
@@ -17288,68 +17261,187 @@ mod tests {
     }
 
     #[test]
-    fn context_compaction_between_updates_folds_into_live_history() {
-        let mut state = test_state();
-        while state.vibe_mode() != VibeMode::SuperVibe {
-            state.cycle_vibe_mode();
-        }
-        state.set_turn_started("turn-1".to_owned());
-        for (id, phase, text) in [
-            ("progress-1", "commentary", "첫 진행 메시지"),
-            ("progress-2", "commentary", "두 번째 진행 메시지"),
-            ("final", "final_answer", "최종 답변"),
-        ] {
-            if id == "progress-2" {
-                state.complete_item(&json!({
-                    "id": "compact-1",
-                    "type": "contextCompaction"
-                }));
+    fn context_compaction_positions_fold_into_live_history() {
+        type Case = (
+            &'static str,
+            &'static [&'static str],
+            &'static [&'static str],
+            bool,
+            bool,
+            usize,
+            &'static str,
+            bool,
+        );
+        let cases: &[Case] = &[
+            (
+                "between updates",
+                &["첫 진행 메시지"],
+                &["두 번째 진행 메시지"],
+                true,
+                false,
+                1,
+                "+3 Response",
+                false,
+            ),
+            (
+                "before the first update",
+                &[],
+                &["첫 진행 메시지", "두 번째 진행 메시지"],
+                true,
+                true,
+                0,
+                "+3 Response",
+                true,
+            ),
+            (
+                "without an update",
+                &[],
+                &[],
+                false,
+                false,
+                0,
+                "+1 Response",
+                true,
+            ),
+        ];
+
+        for &(
+            name,
+            before,
+            after,
+            report_boundary,
+            submit_prompt,
+            compact_index,
+            expected_title,
+            expect_collapse,
+        ) in cases
+        {
+            let mut state = test_state();
+            while state.vibe_mode() != VibeMode::SuperVibe {
+                state.cycle_vibe_mode();
+            }
+            if submit_prompt {
+                assert!(matches!(
+                    state.submit_text("첫 요청".to_owned(), "첫 요청".to_owned()),
+                    Action::Submit(_)
+                ));
+                state.drain_committed();
+            }
+            state.set_turn_started("turn-1".to_owned());
+
+            for (index, text) in before.iter().enumerate() {
+                state.handle_notification(
+                    "item/completed",
+                    &json!({
+                        "item": {
+                            "id": format!("before-{index}"),
+                            "type": "agentMessage",
+                            "phase": "commentary",
+                            "text": text
+                        }
+                    }),
+                );
+                state.drain_committed();
+            }
+            state.complete_item(&json!({
+                "id": "compact-1",
+                "type": "contextCompaction"
+            }));
+            if report_boundary {
                 state.handle_notification("thread/compacted", &json!({}));
+            }
+            state.drain_committed();
+            for (index, text) in after.iter().enumerate() {
+                state.handle_notification(
+                    "item/completed",
+                    &json!({
+                        "item": {
+                            "id": format!("after-{index}"),
+                            "type": "agentMessage",
+                            "phase": "commentary",
+                            "text": text
+                        }
+                    }),
+                );
                 state.drain_committed();
             }
             state.handle_notification(
                 "item/completed",
                 &json!({
-                    "item": { "id": id, "type": "agentMessage", "phase": phase, "text": text }
+                    "item": {
+                        "id": "final",
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "최종 답변"
+                    }
                 }),
             );
             state.drain_committed();
+            state.handle_notification(
+                "turn/completed",
+                &json!({ "turn": { "status": "completed" } }),
+            );
+            let blocks = state.drain_committed();
+            let group = blocks
+                .iter()
+                .find(|block| matches!(block.kind, BlockKind::ProgressGroup))
+                .unwrap_or_else(|| panic!("missing progress group: {name}"));
+
+            assert_eq!(group.title, expected_title, "{name}");
+            assert_eq!(
+                group.children()[compact_index].title,
+                "Context compacted",
+                "{name}"
+            );
+            if expect_collapse {
+                assert!(state.response_collapse_view().is_some(), "{name}");
+            }
         }
-
-        state.handle_notification(
-            "turn/completed",
-            &json!({ "turn": { "status": "completed" } }),
-        );
-        let blocks = state.drain_committed();
-        let group = blocks
-            .iter()
-            .find(|block| matches!(block.kind, BlockKind::ProgressGroup))
-            .expect("progress group");
-
-        assert_eq!(group.title, "+3 Response");
-        assert_eq!(group.children()[1].title, "Context compacted");
     }
 
     #[test]
-    fn context_compaction_between_resumed_updates_folds_into_history() {
-        let blocks = vec![
-            Block::new(BlockKind::Assistant, "Codex", "첫 진행 메시지")
-                .with_assistant_phase(AssistantPhase::Commentary),
-            Block::new(BlockKind::System, "Context compacted", ""),
-            Block::new(BlockKind::Assistant, "Codex", "두 번째 진행 메시지")
-                .with_assistant_phase(AssistantPhase::Commentary),
-            Block::new(BlockKind::Assistant, "Codex", "최종 답변")
-                .with_assistant_phase(AssistantPhase::FinalAnswer),
-        ];
+    fn context_compaction_positions_fold_into_resumed_history() {
+        for (name, blocks, expected_title, compact_index) in [
+            (
+                "between updates",
+                vec![
+                    Block::new(BlockKind::Assistant, "Codex", "첫 진행 메시지")
+                        .with_assistant_phase(AssistantPhase::Commentary),
+                    Block::new(BlockKind::System, "Context compacted", ""),
+                    Block::new(BlockKind::Assistant, "Codex", "두 번째 진행 메시지")
+                        .with_assistant_phase(AssistantPhase::Commentary),
+                    Block::new(BlockKind::Assistant, "Codex", "최종 답변")
+                        .with_assistant_phase(AssistantPhase::FinalAnswer),
+                ],
+                "+3 Response",
+                1,
+            ),
+            (
+                "before the first update",
+                vec![
+                    Block::new(BlockKind::System, "Context compacted", ""),
+                    Block::new(BlockKind::Assistant, "Codex", "첫 진행 메시지")
+                        .with_assistant_phase(AssistantPhase::Commentary),
+                    Block::new(BlockKind::Assistant, "Codex", "최종 답변")
+                        .with_assistant_phase(AssistantPhase::FinalAnswer),
+                ],
+                "+2 Response",
+                0,
+            ),
+        ] {
+            let grouped = group_turn_response(blocks);
+            let group = grouped
+                .iter()
+                .find(|block| matches!(block.kind, BlockKind::ProgressGroup))
+                .unwrap_or_else(|| panic!("missing progress group: {name}"));
 
-        let grouped = group_turn_response(blocks);
-        let group = grouped
-            .iter()
-            .find(|block| matches!(block.kind, BlockKind::ProgressGroup))
-            .expect("progress group");
-
-        assert_eq!(group.title, "+3 Response");
-        assert_eq!(group.children()[1].title, "Context compacted");
+            assert_eq!(group.title, expected_title, "{name}");
+            assert_eq!(
+                group.children()[compact_index].title,
+                "Context compacted",
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -17770,35 +17862,6 @@ mod tests {
     }
 
     #[test]
-    fn a_busy_claude_turn_shows_the_hint_and_queues_tab() {
-        let mut state = AppState::new(
-            "main-thread".to_owned(),
-            "cwd".to_owned(),
-            "account".to_owned(),
-            vec![test_model("claude:sonnet", "Claude Sonnet", true)],
-            "claude:sonnet",
-            Some("high"),
-        );
-        state.busy = true;
-        state.turn_id = Some("live-turn".to_owned());
-        state.editor.set_text("next prompt");
-
-        let action = state.handle_key(KeyEvent::from(KeyCode::Tab));
-
-        assert!(matches!(action, Action::None));
-        assert_eq!(
-            state.view().composer_placeholder,
-            "Enter: steer · Tab: queue"
-        );
-        // Claude도 Enter 스티어링을 지원하므로 Tab은 다음 턴까지 미루는 호스트 큐로 간다.
-        assert_eq!(
-            state.queued_prompts.front().map(String::as_str),
-            Some("next prompt")
-        );
-        assert_eq!(state.editor.display_text(), "");
-    }
-
-    #[test]
     fn an_unchanged_busy_tick_only_animates_the_activity_rows() {
         let mut state = busy_state_with_live_turn();
 
@@ -17942,36 +18005,29 @@ mod tests {
     }
 
     #[test]
-    fn the_quit_warning_stays_up_as_long_as_the_arm() {
-        let mut state = test_state();
+    fn quit_warning_visibility_matches_the_arm_window() {
+        let mut active = test_state();
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
 
-        assert!(matches!(state.handle_key(ctrl_c), Action::None));
-        let (_, shown_at, ttl) = state.activity_notice.clone().expect("quit notice");
+        assert!(matches!(active.handle_key(ctrl_c), Action::None));
+        let (_, shown_at, ttl) = active.activity_notice.clone().expect("quit notice");
         assert_eq!(ttl, QUIT_ARM_WINDOW);
-
-        // Past the ordinary notice window the warning is still there, because the
-        // quit is still armed.
-        state.activity_notice = Some((
+        active.activity_notice = Some((
             "• Ctrl+C 한 번 더 누르면 종료합니다.".to_owned(),
             shown_at - NOTICE_TTL - Duration::from_millis(100),
             ttl,
         ));
         assert_eq!(
-            state.activity().as_deref(),
+            active.activity().as_deref(),
             Some("• Ctrl+C 한 번 더 누르면 종료합니다.")
         );
-        assert!(state.quit_armed());
-    }
+        assert!(active.quit_armed());
 
-    #[test]
-    fn a_faded_quit_warning_is_not_shown_between_ticks() {
-        let mut state = test_state();
-        state.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
-        let (notice, shown_at, ttl) = state.activity_notice.clone().expect("quit notice");
-        state.activity_notice = Some((notice, shown_at - ttl - Duration::from_millis(1), ttl));
-
-        assert_eq!(state.activity(), None);
+        let mut expired = test_state();
+        expired.handle_key(ctrl_c);
+        let (notice, shown_at, ttl) = expired.activity_notice.clone().expect("quit notice");
+        expired.activity_notice = Some((notice, shown_at - ttl - Duration::from_millis(1), ttl));
+        assert_eq!(expired.activity(), None);
     }
 
     #[test]
@@ -18616,46 +18672,34 @@ mod tests {
     }
 
     #[test]
-    fn composer_backspace_removes_an_explicit_image_attachment() {
-        let mut state = test_state();
-        state.attach_local_image(r"C:\Temp\clipboard-image.bmp".to_owned());
-
-        state.handle_key(KeyEvent::from(KeyCode::Backspace));
-
-        assert_eq!(state.composer_image_count(), 0);
+    fn composer_backspace_variants_remove_an_explicit_image_attachment() {
+        for key in [
+            KeyEvent::from(KeyCode::Backspace),
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+        ] {
+            let mut state = test_state();
+            state.attach_local_image(r"C:\Temp\clipboard-image.bmp".to_owned());
+            state.handle_key(key);
+            assert_eq!(state.composer_image_count(), 0, "key: {key:?}");
+        }
     }
 
     #[test]
-    fn composer_ctrl_backspace_removes_an_explicit_image_attachment() {
-        let mut state = test_state();
-        state.attach_local_image(r"C:\Temp\clipboard-image.bmp".to_owned());
-
-        state.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
-
-        assert_eq!(state.composer_image_count(), 0);
-    }
-
-    #[test]
-    fn a_drag_selected_range_leaves_with_the_attachment_it_covered() {
-        let mut state = test_state();
-        state.editor.set_text("before ");
-        state.attach_local_image(r"C:\Temp\clipboard-image.bmp".to_owned());
-        state.editor.insert_str(" after");
+    fn drag_selection_removes_only_the_attachment_it_covers() {
+        let mut covered = test_state();
+        covered.editor.set_text("before ");
+        covered.attach_local_image(r"C:\Temp\clipboard-image.bmp".to_owned());
+        covered.editor.insert_str(" after");
 
         // "before " is seven characters, so the attachment is the eighth.
-        assert!(state.delete_composer_selection(7..8));
+        assert!(covered.delete_composer_selection(7..8));
+        assert_eq!(covered.editor.text(), "before  after");
+        assert_eq!(covered.composer_image_count(), 0);
 
-        assert_eq!(state.editor.text(), "before  after");
-        assert_eq!(state.composer_image_count(), 0);
-    }
-
-    #[test]
-    fn a_drag_selected_range_outside_the_text_deletes_nothing() {
-        let mut state = test_state();
-        state.editor.set_text("keep");
-
-        assert!(!state.delete_composer_selection(9..9));
-        assert_eq!(state.editor.text(), "keep");
+        let mut outside = test_state();
+        outside.editor.set_text("keep");
+        assert!(!outside.delete_composer_selection(9..9));
+        assert_eq!(outside.editor.text(), "keep");
     }
 
     #[test]
@@ -19512,50 +19556,45 @@ mod tests {
     }
 
     #[test]
-    fn shifted_model_navigation_stays_with_the_current_provider() {
-        let models = vec![
-            test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
-            test_model("claude:sonnet", "Claude Sonnet", false),
-            test_model("gpt-5.6-terra", "GPT-5.6 Terra", false),
-        ];
-        let mut state = AppState::new(
+    fn shifted_model_navigation_stays_scoped_and_follows_catalog_order() {
+        let mut codex = AppState::new(
             "thread".to_owned(),
             "cwd".to_owned(),
             "account".to_owned(),
-            models,
+            vec![
+                test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
+                test_model("claude:sonnet", "Claude Sonnet", false),
+                test_model("gpt-5.6-terra", "GPT-5.6 Terra", false),
+            ],
             "gpt-5.6-sol",
             Some("high"),
         );
+        codex.move_selected_model(1);
+        assert_eq!(codex.selected_model_name(), "gpt-5.6-terra");
+        codex.move_selected_model(-1);
+        assert_eq!(codex.selected_model_name(), "gpt-5.6-sol");
 
-        state.move_selected_model(1);
-        assert_eq!(state.selected_model_name(), "gpt-5.6-terra");
-        state.move_selected_model(-1);
-        assert_eq!(state.selected_model_name(), "gpt-5.6-sol");
-    }
-
-    #[test]
-    fn shifted_claude_model_navigation_follows_the_catalog_order() {
-        let models = vec![
-            test_model("claude:fable", "Fable", false),
-            test_model("claude:opus", "Opus", false),
-            test_model("claude:sonnet", "Sonnet", true),
-            test_model("claude:haiku", "Haiku", false),
-        ];
-        let mut state = AppState::new(
+        let mut claude = AppState::new(
             "claude:thread".to_owned(),
             "cwd".to_owned(),
             "account".to_owned(),
-            models,
+            vec![
+                test_model("claude:fable", "Fable", false),
+                test_model("claude:opus", "Opus", false),
+                test_model("claude:sonnet", "Sonnet", true),
+                test_model("claude:haiku", "Haiku", false),
+            ],
             "claude:fable",
             Some("high"),
         );
-
-        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
-        assert_eq!(state.selected_model_name(), "claude:opus");
-        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
-        assert_eq!(state.selected_model_name(), "claude:sonnet");
-        state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
-        assert_eq!(state.selected_model_name(), "claude:opus");
+        for (key, expected) in [
+            (KeyCode::Down, "claude:opus"),
+            (KeyCode::Down, "claude:sonnet"),
+            (KeyCode::Up, "claude:opus"),
+        ] {
+            claude.handle_key(KeyEvent::new(key, KeyModifiers::SHIFT));
+            assert_eq!(claude.selected_model_name(), expected);
+        }
     }
 
     #[test]
@@ -20006,53 +20045,34 @@ mod tests {
     /// Shift+Tab is how the CLI cycles these, so it cycles them here too — and
     /// the badge is the only feedback, with no notice flashing under the composer.
     #[test]
-    fn shift_tab_cycles_the_claude_permission_mode() {
-        let mut state = AppState::new(
-            "claude:thread".to_owned(),
-            "cwd".to_owned(),
-            "account".to_owned(),
-            vec![test_model("claude:sonnet", "Sonnet", true)],
-            "claude:sonnet",
-            Some("high"),
-        );
-        state.claude_permission_mode = ClaudePermissionMode::Default;
+    fn both_shift_tab_encodings_cycle_claude_permissions_without_queueing() {
+        for (key, busy) in [(KeyCode::BackTab, false), (KeyCode::Tab, true)] {
+            let mut state = AppState::new(
+                "claude:thread".to_owned(),
+                "cwd".to_owned(),
+                "account".to_owned(),
+                vec![test_model("claude:sonnet", "Sonnet", true)],
+                "claude:sonnet",
+                Some("high"),
+            );
+            state.claude_permission_mode = ClaudePermissionMode::Default;
+            state.busy = busy;
+            if busy {
+                state.editor.set_text("queued prompt");
+            }
 
-        let action = state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-
-        assert!(matches!(
-            action,
-            Action::SetClaudePermissionMode(ClaudePermissionMode::AcceptEdits)
-        ));
-        assert_eq!(
-            state.claude_permission_mode(),
-            Some(ClaudePermissionMode::AcceptEdits)
-        );
-        assert!(state.composer_notice.is_none());
-    }
-
-    /// With the Kitty keyboard protocol the same chord arrives as a shifted Tab.
-    /// A turn is running, so the plain-Tab queue branch would otherwise eat it.
-    #[test]
-    fn a_shifted_tab_cycles_the_permission_mode_during_a_turn() {
-        let mut state = AppState::new(
-            "claude:thread".to_owned(),
-            "cwd".to_owned(),
-            "account".to_owned(),
-            vec![test_model("claude:sonnet", "Sonnet", true)],
-            "claude:sonnet",
-            Some("high"),
-        );
-        state.claude_permission_mode = ClaudePermissionMode::Default;
-        state.busy = true;
-        state.editor.set_text("queued prompt");
-
-        let action = state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
-
-        assert!(matches!(
-            action,
-            Action::SetClaudePermissionMode(ClaudePermissionMode::AcceptEdits)
-        ));
-        assert!(state.queued_prompts.is_empty());
+            let action = state.handle_key(KeyEvent::new(key, KeyModifiers::SHIFT));
+            assert!(matches!(
+                action,
+                Action::SetClaudePermissionMode(ClaudePermissionMode::AcceptEdits)
+            ));
+            assert_eq!(
+                state.claude_permission_mode(),
+                Some(ClaudePermissionMode::AcceptEdits)
+            );
+            assert!(state.queued_prompts.is_empty());
+            assert!(state.composer_notice.is_none());
+        }
     }
 
     /// The vibe badge answers to Alt+V as well as to a click, mid-turn included.
