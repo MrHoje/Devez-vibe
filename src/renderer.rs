@@ -1196,17 +1196,14 @@ fn merge_history_block(history: &mut Vec<Block>, incoming: Block) -> bool {
     true
 }
 
-/// A prompt already paints its own empty top padding row. When it follows a
-/// transcript block, reuse that row as the inter-block separator instead of
-/// keeping the prior block's trailing blank as a second empty row.
+/// Appends one rendered transcript block and returns the rows it owns. Every
+/// non-empty block already ends in one standalone blank row. A user prompt's
+/// coloured top padding belongs to the bubble and must not consume that row:
+/// doing so makes adjacent prompts and answer-to-prompt boundaries touch.
 fn append_transcript_block_lines(
     transcript: &mut Vec<PaintLine>,
-    kind: BlockKind,
     lines: Vec<PaintLine>,
 ) -> Range<usize> {
-    if matches!(kind, BlockKind::User) && transcript.last() == Some(&PaintLine::blank()) {
-        transcript.pop();
-    }
     let start = transcript.len();
     transcript.extend(lines);
     start..transcript.len()
@@ -1368,7 +1365,7 @@ impl Renderer {
                 break;
             }
             let lines = self.history_block_lines(block, self.last_width);
-            append_transcript_block_lines(&mut preceding_lines, block.kind, lines);
+            append_transcript_block_lines(&mut preceding_lines, lines);
         }
         if !found {
             return false;
@@ -2767,14 +2764,10 @@ impl Renderer {
                     let mut preceding_lines = Vec::new();
                     for existing in &self.history[..index] {
                         let lines = self.history_block_lines(existing, width);
-                        append_transcript_block_lines(&mut preceding_lines, existing.kind, lines);
+                        append_transcript_block_lines(&mut preceding_lines, lines);
                     }
                     let lines = self.history_block_lines(&self.history[index], width);
-                    append_transcript_block_lines(
-                        &mut preceding_lines,
-                        self.history[index].kind,
-                        lines,
-                    )
+                    append_transcript_block_lines(&mut preceding_lines, lines)
                 });
             merge_history_block(&mut self.history, block.clone());
 
@@ -2806,7 +2799,7 @@ impl Renderer {
                 }
             } else {
                 let lines = self.history_block_lines(block, width);
-                let range = append_transcript_block_lines(&mut self.wrapped, block.kind, lines);
+                let range = append_transcript_block_lines(&mut self.wrapped, lines);
                 if matches!(block.kind, BlockKind::ProgressGroup) && self.fold_progress_groups {
                     let content_end = range.end.saturating_sub(usize::from(
                         self.wrapped.get(range.end.saturating_sub(1)) == Some(&PaintLine::blank()),
@@ -2830,7 +2823,7 @@ impl Renderer {
             self.diff_display_mode,
         ) {
             let lines = self.history_block_lines(block, width);
-            let range = append_transcript_block_lines(&mut wrapped, block.kind, lines);
+            let range = append_transcript_block_lines(&mut wrapped, lines);
             if matches!(block.kind, BlockKind::ProgressGroup) && self.fold_progress_groups {
                 let content_end = range.end.saturating_sub(usize::from(
                     wrapped.get(range.end.saturating_sub(1)) == Some(&PaintLine::blank()),
@@ -15174,13 +15167,20 @@ mod tests {
     }
 
     #[test]
-    fn a_prompt_after_an_answer_has_only_one_visual_spacer_row() {
+    fn a_prompt_after_an_answer_keeps_one_standalone_spacer_row() {
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.fold_progress_groups = true;
         renderer.wrapped_width = 80;
         let answer = Block::new(BlockKind::Assistant, "Codex", "이전 답변");
         let prompt = Block::new(BlockKind::User, "Codex", "다음 프롬프트");
+        let progress = Block::progress_group(vec![Block::new(
+            BlockKind::Assistant,
+            "Codex",
+            "다음 요청 진행 기록",
+        )]);
         renderer.commit_fullscreen_blocks(&[answer], 80, 20);
         renderer.commit_fullscreen_blocks(&[prompt], 80, 20);
+        renderer.commit_fullscreen_blocks(&[progress], 80, 20);
 
         let answer = renderer
             .wrapped
@@ -15192,12 +15192,70 @@ mod tests {
             .iter()
             .position(|line| line.text.contains("다음 프롬프트"))
             .expect("prompt row");
-        let visual_spacers = renderer.wrapped[answer + 1..prompt]
+        let standalone_spacers = renderer.wrapped[answer + 1..prompt]
             .iter()
-            .filter(|line| painted(line).trim().is_empty())
+            .filter(|line| *line == &PaintLine::blank())
             .count();
 
-        assert_eq!(visual_spacers, 1);
+        assert_eq!(standalone_spacers, 1);
+        assert!(renderer.wrapped[prompt - 2] == PaintLine::blank());
+        assert_eq!(renderer.wrapped[prompt - 1].tone, Tone::UserPromptPadding);
+        let incremental = renderer.wrapped.clone();
+        renderer.rewrap(80);
+        assert!(renderer.wrapped == incremental);
+    }
+
+    #[test]
+    fn consecutive_prompts_with_folded_responses_keep_one_standalone_spacer_row() {
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.fold_progress_groups = true;
+        renderer.wrapped_width = 80;
+        let first_prompt = Block::new(BlockKind::User, "Codex", "첫 프롬프트");
+        let first_group = Block::progress_group(vec![Block::new(
+            BlockKind::Assistant,
+            "Codex",
+            "첫 요청 진행 기록",
+        )]);
+        let second_prompt = Block::new(BlockKind::User, "Codex", "두 번째 프롬프트");
+        let second_group = Block::progress_group(vec![Block::new(
+            BlockKind::Assistant,
+            "Codex",
+            "두 번째 요청 진행 기록",
+        )]);
+
+        for block in [first_prompt, first_group, second_prompt, second_group] {
+            renderer.commit_fullscreen_blocks(&[block], 80, 20);
+        }
+
+        let first = renderer
+            .wrapped
+            .iter()
+            .position(|line| line.text.contains("첫 프롬프트"))
+            .expect("first prompt row");
+        let second = renderer
+            .wrapped
+            .iter()
+            .position(|line| line.text.contains("두 번째 프롬프트"))
+            .expect("second prompt row");
+        let separators = renderer.wrapped[first + 1..second]
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, line)| {
+                (line == &PaintLine::blank()).then_some(first + 1 + offset)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(separators.len(), 1);
+        let separator = separators[0];
+        assert_eq!(
+            renderer.wrapped[separator - 1].tone,
+            Tone::UserPromptPadding
+        );
+        assert_eq!(
+            renderer.wrapped[separator + 1].tone,
+            Tone::UserPromptPadding
+        );
+        assert!(painted(&renderer.wrapped[separator - 1]).contains("+1 Response"));
         let incremental = renderer.wrapped.clone();
         renderer.rewrap(80);
         assert!(renderer.wrapped == incremental);
