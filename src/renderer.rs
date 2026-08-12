@@ -2541,7 +2541,17 @@ impl Renderer {
         }
         let old_view_rows = split_rows(content_rows, frame.lines.len(), self.wrapped.len()).0;
         self.commit_fullscreen_blocks(committed, width, old_view_rows);
-        if self.scroll_back == 0 && self.wrapped.last() == Some(&PaintLine::blank()) {
+        let live_rows_after_absorb = frame.lines.len().saturating_sub(1);
+        if self.wrapped.last() == Some(&PaintLine::blank())
+            && trailing_transcript_spacer_will_be_visible(
+                content_rows,
+                live_rows_after_absorb,
+                self.wrapped.len(),
+                self.history_view_rows_anchor,
+                self.scroll_back,
+                self.history_view_start_anchor,
+            )
+        {
             frame.absorb_leading_spacer();
         }
         let panel_content = self
@@ -3094,6 +3104,34 @@ fn scroll_back_for_transcript_start(
 ) -> usize {
     let max_back = transcript_len.saturating_sub(view_rows);
     max_back.saturating_sub(transcript_start.min(max_back))
+}
+
+/// Whether the transcript's own trailing separator will actually occupy the
+/// spacer above the pinned activity row after a History toggle applies its
+/// one-frame viewport anchor. Looking only at the previous `scroll_back` can
+/// remove the live spacer before that anchor turns the view into scrollback.
+fn trailing_transcript_spacer_will_be_visible(
+    rows: usize,
+    live_rows_after_absorb: usize,
+    transcript_len: usize,
+    anchored_view_rows: Option<usize>,
+    current_scroll_back: usize,
+    anchored_start: Option<usize>,
+) -> bool {
+    let view_rows = split_rows_with_transcript_anchor(
+        rows,
+        live_rows_after_absorb,
+        transcript_len,
+        anchored_view_rows,
+    )
+    .0;
+    let max_back = transcript_len.saturating_sub(view_rows);
+    let scroll_back = anchored_start.map_or_else(
+        || current_scroll_back.min(max_back),
+        |start| scroll_back_for_transcript_start(transcript_len, view_rows, start),
+    );
+    let start = max_back.saturating_sub(scroll_back);
+    start.saturating_add(view_rows) >= transcript_len
 }
 
 #[allow(dead_code)]
@@ -14870,6 +14908,48 @@ mod tests {
             scroll_back_for_transcript_start(collapsed_len, collapsed_view_rows, anchored_start);
         let collapsed_start = collapsed_len - collapsed_view_rows - collapsed_back;
         assert_eq!(clicked_transcript_row - collapsed_start, clicked_screen_row);
+    }
+
+    #[test]
+    fn prompt_history_expansion_keeps_the_activity_spacer_across_consecutive_frames() {
+        let rows = 8;
+        let expanded_len = 12;
+        let live_rows_after_absorb = 2;
+
+        let first_frame_absorbs = trailing_transcript_spacer_will_be_visible(
+            rows,
+            live_rows_after_absorb,
+            expanded_len,
+            None,
+            0,
+            Some(0),
+        );
+        assert!(
+            !first_frame_absorbs,
+            "the anchored view does not reach the trailing blank"
+        );
+
+        let live_rows_without_absorb = live_rows_after_absorb + 1;
+        let first_view_rows = split_rows(rows, live_rows_without_absorb, expanded_len).0;
+        let first_scroll_back = scroll_back_for_transcript_start(expanded_len, first_view_rows, 0);
+        let next_frame_absorbs = trailing_transcript_spacer_will_be_visible(
+            rows,
+            live_rows_after_absorb,
+            expanded_len,
+            None,
+            first_scroll_back,
+            None,
+        );
+        assert_eq!(next_frame_absorbs, first_frame_absorbs);
+
+        assert!(trailing_transcript_spacer_will_be_visible(
+            rows,
+            live_rows_after_absorb,
+            6,
+            None,
+            0,
+            Some(0),
+        ));
     }
 
     #[test]
