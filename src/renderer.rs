@@ -1600,7 +1600,7 @@ impl Renderer {
                 return true;
             };
             previous != current
-                && !(row < plan_rows && !plan_row_requires_full_repaint(previous, current))
+                && (row >= plan_rows || plan_row_requires_full_repaint(previous, current))
         });
         if changed {
             self.selection.clear();
@@ -1611,9 +1611,10 @@ impl Renderer {
     /// still. Panel selections use a different row grid and survive their
     /// ordinary full-frame paint path unchanged.
     fn animation_row_is_selected(&self, row: usize) -> bool {
-        !self.selection_in_panel && self.selection.range().is_some_and(|range| {
-            usize::from(range.start.row) <= row && row <= usize::from(range.end.row)
-        })
+        !self.selection_in_panel
+            && self.selection.range().is_some_and(|range| {
+                usize::from(range.start.row) <= row && row <= usize::from(range.end.row)
+            })
     }
 
     /// True when the column belongs to the docked panel rather than the
@@ -2043,13 +2044,12 @@ impl Renderer {
             let mut line = activity_rows.pop().expect("one activity row");
             let composer_notice = view.composer_notice;
             if let Some(mode) = view.composer_mode.as_ref()
-                && let Some(with_controls) =
-                    activity_line_with_composer_controls(
-                        line.clone(),
-                        mode,
-                        composer_notice,
-                        self.last_width,
-                    )
+                && let Some(with_controls) = activity_line_with_composer_controls(
+                    line.clone(),
+                    mode,
+                    composer_notice,
+                    self.last_width,
+                )
             {
                 line = with_controls;
             }
@@ -3037,7 +3037,7 @@ fn wide_damage_range(
                 || UnicodeWidthStr::width(after.glyph.as_str()) > 1)
     });
     let mut start = changed.next()?;
-    let mut end = changed.last().unwrap_or(start) + 1;
+    let mut end = changed.next_back().unwrap_or(start) + 1;
 
     while start > 0
         && (previous.cell(start, row).continuation || current.cell(start, row).continuation)
@@ -3315,7 +3315,6 @@ enum Tone {
     EffortXHigh,
     EffortMax,
     EffortUltra,
-    Context,
     StatusText,
     StatusSeparator,
     UserPrompt,
@@ -3539,22 +3538,22 @@ impl PaintLine {
             .enumerate()
         {
             let width = UnicodeWidthStr::width(text);
-            if width > 0 {
-                if let Some((_, pick)) = picks.iter().find(|(at, _)| *at == index) {
-                    // The status model badge already owns a padded background,
-                    // so its hover stops at that badge instead of bleeding into
-                    // the adjacent separators.
-                    let bleed = if matches!(pick, Pick::Model) {
-                        0
-                    } else {
-                        PICK_BLEED
-                    };
-                    regions.push((
-                        column.saturating_sub(bleed),
-                        column + width + bleed,
-                        pick.clone(),
-                    ));
-                }
+            if width > 0
+                && let Some((_, pick)) = picks.iter().find(|(at, _)| *at == index)
+            {
+                // The status model badge already owns a padded background,
+                // so its hover stops at that badge instead of bleeding into
+                // the adjacent separators.
+                let bleed = if matches!(pick, Pick::Model) {
+                    0
+                } else {
+                    PICK_BLEED
+                };
+                regions.push((
+                    column.saturating_sub(bleed),
+                    column + width + bleed,
+                    pick.clone(),
+                ));
             }
             column += width;
         }
@@ -3672,6 +3671,9 @@ fn progress_bar_spans(phase: f32, track: usize, tone: Tone) -> Vec<PaintSpan> {
     spans
 }
 
+/// Test-only shorthand: the app always drives the spinner and its progress bar
+/// from the same phase, so tests say it once.
+#[cfg(test)]
 fn activity_lines(
     activity: &str,
     activity_model: Option<&str>,
@@ -4311,13 +4313,12 @@ fn normal_frame_with_expansion(
             width,
         );
         if let Some(mode) = composer_controls_mode
-            && let Some(row) =
-                activity_line_with_composer_controls(
-                    activity_rows[0].clone(),
-                    mode,
-                    activity_composer_notice,
-                    width,
-                )
+            && let Some(row) = activity_line_with_composer_controls(
+                activity_rows[0].clone(),
+                mode,
+                activity_composer_notice,
+                width,
+            )
         {
             activity_rows[0] = row;
             if activity_composer_notice.is_some() {
@@ -6456,7 +6457,10 @@ fn fixed_plan_summary_lines(
     let completion_displayed = all_completed && !plan_active;
     let displayed_completed = completed.saturating_sub(usize::from(all_completed && plan_active));
     let title = if all_completed && plan_active {
-        format!("작업 단계 · {displayed_completed} / {} 진행 중", summary.steps.len())
+        format!(
+            "작업 단계 · {displayed_completed} / {} 진행 중",
+            summary.steps.len()
+        )
     } else {
         format!("작업 단계 · {completed} / {} 완료", summary.steps.len())
     };
@@ -6694,7 +6698,10 @@ fn side_panel_plan_lines(
     let completion_displayed = all_completed && !plan_active;
     let displayed_completed = completed.saturating_sub(usize::from(all_completed && plan_active));
     let mut title = if all_completed && plan_active {
-        format!("작업 단계  {displayed_completed} / {} 진행 중", summary.steps.len())
+        format!(
+            "작업 단계  {displayed_completed} / {} 진행 중",
+            summary.steps.len()
+        )
     } else {
         format!("작업 단계  {completed} / {} 완료", summary.steps.len())
     };
@@ -7417,13 +7424,13 @@ fn block_lines_with_mode(
         }
         line_index += 1;
     }
-    let lines = if chat_layout {
+
+    if chat_layout {
         assistant_chat_bubble_lines(lines)
     } else {
         lines.push(PaintLine::blank());
         lines
-    };
-    lines
+    }
 }
 
 fn markdown_table_cells(line: &str) -> Option<Vec<String>> {
@@ -7497,14 +7504,11 @@ fn markdown_table_lines(
         .collect::<Vec<_>>();
     let content_width = available.saturating_sub(gap_width);
     while widths.iter().sum::<usize>() > content_width {
-        let Some((index, _)) = widths
+        let (index, _) = widths
             .iter()
             .enumerate()
             .filter(|(_, value)| **value > MIN_CELL_WIDTH)
-            .max_by_key(|(_, value)| **value)
-        else {
-            return None;
-        };
+            .max_by_key(|(_, value)| **value)?;
         widths[index] -= 1;
     }
 
@@ -8703,6 +8707,9 @@ fn input_lines_with_controls(
         .max(4);
     let mut raw_rows = vec![String::new()];
     let mut row_glyphs: Vec<Vec<ComposerGlyph>> = vec![Vec::new()];
+    // One row exists before the first glyph lands, so the vec starts holding
+    // that row's empty range rather than a range of rows.
+    #[allow(clippy::single_range_in_vec_init)]
     let mut row_ranges = vec![0..0];
     let mut row = 0;
     let input_prefix_width =
@@ -8891,9 +8898,11 @@ fn input_top_line_with_controls(
     controls_mode: Option<&ComposerMode>,
 ) -> PaintLine {
     let chrome_tone = composer_chrome_tone(mode);
-    let left = (!label.is_empty())
-        .then(|| format!("{OPENING_RULE}{label} "))
-        .unwrap_or_default();
+    let left = if !label.is_empty() {
+        format!("{OPENING_RULE}{label} ")
+    } else {
+        Default::default()
+    };
     let left_width = UnicodeWidthStr::width(left.as_str());
     // Right-hand badges eat into this budget; whatever survives stays as rule.
     let mut budget = panel_width.saturating_sub(left_width + COMPOSER_RULE_MIN);
@@ -9407,7 +9416,7 @@ fn is_box_drawing(glyph: &str) -> bool {
     glyph
         .chars()
         .next()
-        .is_some_and(|ch| matches!(u32::from(ch), 0x2500..=0x257f | 0x2580..=0x259f))
+        .is_some_and(|ch| matches!(u32::from(ch), 0x2500..=0x259f))
 }
 
 /// Whether a piece of the row painted across `start..end` falls under the
@@ -9866,7 +9875,6 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::EffortXHigh => palette.status.effort_xhigh,
         Tone::EffortMax => palette.status.effort_max,
         Tone::EffortUltra => palette.status.effort_ultra,
-        Tone::Context => palette.status.context,
         Tone::StatusText => palette.status.text,
         Tone::StatusSeparator => palette.status.separator,
         Tone::UserPrompt => palette.foreground,
@@ -10920,6 +10928,31 @@ mod tests {
         assert_eq!(
             renderer.finish_selection(13, 0),
             SelectionResult::Copy("transcript row".to_owned())
+        );
+    }
+
+    /// A drag that runs off the bottom of the panel has to land on its last
+    /// content row. Letting the row index reach the content length instead
+    /// drops the point entirely and the drag stops answering mid-gesture.
+    #[test]
+    fn a_panel_drag_past_the_last_row_still_lands_on_it() {
+        let layout =
+            side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = vec![PaintLine::plain("transcript row")];
+        renderer.side_panel = Some(layout);
+        renderer.side_panel_content = vec![
+            PaintLine::plain("first"),
+            PaintLine::blank(),
+            PaintLine::plain("last"),
+        ];
+
+        let left = layout.content_left() as u16;
+        assert!(renderer.begin_selection(left, 1));
+        assert!(renderer.update_selection(left + 20, 40));
+        assert_eq!(
+            renderer.finish_selection(left + 20, 40),
+            SelectionResult::Copy("first\n\nlast".to_owned())
         );
     }
 
@@ -12816,7 +12849,7 @@ mod tests {
         // Both the inline case (live blocks above the composer) and the
         // fullscreen one, where the transcript has already been committed and
         // the live frame is nothing but the composer.
-        let with_block = vec![Block::new(BlockKind::Assistant, "Codex", "done")];
+        let with_block = [Block::new(BlockKind::Assistant, "Codex", "done")];
         for live in [&[][..], &with_block[..]] {
             let bare = frame(live, None);
             let noticed = frame(live, Some("• Copied to clipboard"));
@@ -13023,11 +13056,13 @@ mod tests {
         assert!(!painted(notice).contains("feature/copy-notice"));
         assert!(!painted(notice).contains("Vibe: On"));
         assert!(!painted(notice).contains("Fast: On"));
-        assert!(!frame
-            .lines
-            .iter()
-            .filter(|line| painted_line_text(line).contains("• Copied to clipboard"))
-            .any(|line| line != notice));
+        assert!(
+            !frame
+                .lines
+                .iter()
+                .filter(|line| painted_line_text(line).contains("• Copied to clipboard"))
+                .any(|line| line != notice)
+        );
     }
 
     #[test]
@@ -14659,10 +14694,13 @@ mod tests {
 
         assert!(renderer.begin_selection(0, 0));
         assert!(renderer.update_selection(2, 0));
-        renderer.reconcile_selection(&[
-            PaintLine::plain("selected"),
-            PaintLine::plain("changed status"),
-        ], 0);
+        renderer.reconcile_selection(
+            &[
+                PaintLine::plain("selected"),
+                PaintLine::plain("changed status"),
+            ],
+            0,
+        );
         assert_eq!(
             renderer.finish_selection(2, 0),
             SelectionResult::Copy("sel".to_owned())
@@ -14670,7 +14708,10 @@ mod tests {
 
         assert!(renderer.begin_selection(0, 0));
         assert!(renderer.update_selection(2, 0));
-        renderer.reconcile_selection(&[PaintLine::plain("replaced"), PaintLine::plain("status")], 0);
+        renderer.reconcile_selection(
+            &[PaintLine::plain("replaced"), PaintLine::plain("status")],
+            0,
+        );
         assert_eq!(renderer.finish_selection(2, 0), SelectionResult::None);
     }
 
@@ -14702,7 +14743,10 @@ mod tests {
 
         assert!(renderer.animation_row_is_selected(0));
         assert!(!renderer.animation_row_is_selected(1));
-        let mut updates = vec![(0, PaintLine::plain("held")), (1, PaintLine::plain("moving"))];
+        let mut updates = vec![
+            (0, PaintLine::plain("held")),
+            (1, PaintLine::plain("moving")),
+        ];
         updates.retain(|(row, _)| !renderer.animation_row_is_selected(*row));
         assert_eq!(updates.len(), 1);
         assert_eq!(updates[0].0, 1);
@@ -16565,7 +16609,7 @@ mod tests {
                 continue;
             }
             let mut sequence = String::new();
-            while let Some(ch) = chars.next() {
+            for ch in chars.by_ref() {
                 sequence.push(ch);
                 if ch.is_ascii_alphabetic() {
                     break;
@@ -16947,18 +16991,6 @@ mod tests {
     }
 
     #[test]
-    fn context_status_line_uses_its_theme_specific_colour() {
-        for theme_kind in ThemeKind::ALL {
-            theme::set_current(theme_kind);
-            assert_eq!(
-                tone_rgb(Tone::Context),
-                Some(theme::palette().status.context),
-                "{theme_kind:?} context status colour"
-            );
-        }
-    }
-
-    #[test]
     fn side_panel_cycles_report_each_real_main_width() {
         let total = 141;
         let stages = [None, Some(48), Some(60), Some(72), None];
@@ -17145,9 +17177,7 @@ mod tests {
         assert_ne!(waiting_card[4].prefix, "  ✔  ");
         assert_eq!(waiting_card[4].prefix_tone, Tone::Accent);
         assert_eq!(waiting_card[4].tone, Tone::Accent);
-        assert!(waiting_card
-            .iter()
-            .all(|line| !painted(line).contains('⏱')));
+        assert!(waiting_card.iter().all(|line| !painted(line).contains('⏱')));
 
         let done = side_panel_plan_lines(&finished, layout.content_width(), 0.0, false);
         assert_eq!(painted(&done[0]), "▲ 작업 단계  3 / 3 완료  [⏱  1m 25s]");
@@ -17285,7 +17315,7 @@ mod tests {
             1,
             1,
             3,
-            &[heading.clone()],
+            std::slice::from_ref(&heading),
             None,
             &[],
             Some(&Pick::PromptSection),

@@ -328,6 +328,53 @@ fn summarize(text: &str) -> String {
         .collect()
 }
 
+/// The agent ids DevezCode may announce us under. `devezvibe` is the current
+/// one; `devezcli` is what hosts released before the rename still send, and it
+/// also names the state folder they watch — so the folder is derived from the
+/// value instead of hard-coded, and either host version lines up.
+const TRACKING_AGENTS: [&str; 2] = ["devezvibe", "devezcli"];
+
+fn tracking_agent_folder(agent: Option<&str>) -> Option<&'static str> {
+    let agent = agent?;
+    TRACKING_AGENTS
+        .into_iter()
+        .find(|known| agent.eq_ignore_ascii_case(known))
+}
+
+fn owner_path(base: &std::path::Path, room: &str) -> PathBuf {
+    base.join("owners").join(format!("{room}.txt"))
+}
+
+fn try_claim_owner(base: &std::path::Path, room: &str, token: &str) -> bool {
+    let path = owner_path(base, room);
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    if fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let Ok(mut file) = OpenOptions::new().write(true).create_new(true).open(&path) else {
+        return false;
+    };
+    if file.write_all(token.as_bytes()).is_ok() {
+        true
+    } else {
+        drop(file);
+        let _ = fs::remove_file(path);
+        false
+    }
+}
+
+fn owns_room(base: &std::path::Path, room: &str, token: &str) -> bool {
+    fs::read_to_string(owner_path(base, room)).is_ok_and(|owner| owner.trim() == token)
+}
+
+fn release_owner(base: &std::path::Path, room: &str, token: &str) {
+    if owns_room(base, room, token) {
+        let _ = fs::remove_file(owner_path(base, room));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,52 +532,5 @@ mod tests {
         assert!(try_claim_owner(&base, room, "next-root"));
 
         let _ = fs::remove_dir_all(base);
-    }
-}
-
-/// The agent ids DevezCode may announce us under. `devezvibe` is the current
-/// one; `devezcli` is what hosts released before the rename still send, and it
-/// also names the state folder they watch — so the folder is derived from the
-/// value instead of hard-coded, and either host version lines up.
-const TRACKING_AGENTS: [&str; 2] = ["devezvibe", "devezcli"];
-
-fn tracking_agent_folder(agent: Option<&str>) -> Option<&'static str> {
-    let agent = agent?;
-    TRACKING_AGENTS
-        .into_iter()
-        .find(|known| agent.eq_ignore_ascii_case(known))
-}
-
-fn owner_path(base: &std::path::Path, room: &str) -> PathBuf {
-    base.join("owners").join(format!("{room}.txt"))
-}
-
-fn try_claim_owner(base: &std::path::Path, room: &str, token: &str) -> bool {
-    let path = owner_path(base, room);
-    let Some(dir) = path.parent() else {
-        return false;
-    };
-    if fs::create_dir_all(dir).is_err() {
-        return false;
-    }
-    let Ok(mut file) = OpenOptions::new().write(true).create_new(true).open(&path) else {
-        return false;
-    };
-    if file.write_all(token.as_bytes()).is_ok() {
-        true
-    } else {
-        drop(file);
-        let _ = fs::remove_file(path);
-        false
-    }
-}
-
-fn owns_room(base: &std::path::Path, room: &str, token: &str) -> bool {
-    fs::read_to_string(owner_path(base, room)).is_ok_and(|owner| owner.trim() == token)
-}
-
-fn release_owner(base: &std::path::Path, room: &str, token: &str) {
-    if owns_room(base, room, token) {
-        let _ = fs::remove_file(owner_path(base, room));
     }
 }

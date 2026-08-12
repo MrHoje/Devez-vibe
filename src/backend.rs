@@ -1862,10 +1862,10 @@ fn turn_timestamp(turn: &Value) -> Option<i64> {
         if let Some(timestamp) = value.as_i64() {
             return Some(timestamp);
         }
-        if let Some(timestamp) = value.as_str() {
-            if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(timestamp) {
-                return Some(parsed.timestamp());
-            }
+        if let Some(timestamp) = value.as_str()
+            && let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(timestamp)
+        {
+            return Some(parsed.timestamp());
         }
     }
     None

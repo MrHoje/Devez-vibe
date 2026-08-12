@@ -63,12 +63,11 @@ impl Rollout {
     pub fn model_for_turn(&self, started_at: i64) -> Option<&str> {
         self.turn_contexts
             .iter()
-            .filter(|(timestamp, _)| {
+            .rfind(|(timestamp, _)| {
                 chrono::DateTime::parse_from_rfc3339(timestamp)
                     .ok()
                     .is_some_and(|time| time.timestamp() <= started_at)
             })
-            .last()
             .or_else(|| self.turn_contexts.first())
             .map(|(_, model)| model.as_str())
     }

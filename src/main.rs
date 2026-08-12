@@ -565,9 +565,8 @@ async fn await_thread(
                             &mut composer_paste,
                             &key,
                             Instant::now(),
-                        ) {
-                            Action::None
-                        } else if is_clipboard_image_shortcut(&key) && attach_clipboard_image(state) {
+                        ) || (is_clipboard_image_shortcut(&key) && attach_clipboard_image(state))
+                        {
                             Action::None
                         } else if expand_collapsed_paste_shortcut(
                             state,
@@ -997,10 +996,8 @@ async fn event_loop(
                             &mut composer_paste,
                             &key,
                             Instant::now(),
-                        ) {
-                            renderer.clear_selection();
-                            Action::None
-                        } else if is_clipboard_image_shortcut(&key) && attach_clipboard_image(state) {
+                        ) || (is_clipboard_image_shortcut(&key) && attach_clipboard_image(state))
+                        {
                             renderer.clear_selection();
                             Action::None
                         } else if expand_collapsed_paste_shortcut(
@@ -1396,14 +1393,14 @@ fn renderer_mouse_action(
     // release.  Chrome controls must not depend on that release: activate a
     // known pick as soon as it is pressed, while plain text keeps the normal
     // drag-to-select path below.
-    if let MouseRequest::SelectionStart(column, row) = request {
-        if let Some(pick) = renderer.pick_at(column, row) {
-            let cleared = renderer.clear_selection();
-            return match on_click(MouseClick::Pick(pick)) {
-                Action::Tick(changed) => Action::Tick(changed || cleared),
-                action => action,
-            };
-        }
+    if let MouseRequest::SelectionStart(column, row) = request
+        && let Some(pick) = renderer.pick_at(column, row)
+    {
+        let cleared = renderer.clear_selection();
+        return match on_click(MouseClick::Pick(pick)) {
+            Action::Tick(changed) => Action::Tick(changed || cleared),
+            action => action,
+        };
     }
 
     match request {
@@ -3416,12 +3413,16 @@ struct ClaudeSessionSettings {
 fn claude_session_settings(state: &AppState) -> ClaudeSessionSettings {
     let claude_model = claude::is_claude_model(state.selected_model_name());
     ClaudeSessionSettings {
-        model: claude_model
-            .then(|| state.selected_model_name().to_owned())
-            .unwrap_or_default(),
-        effort: claude_model
-            .then(|| state.selected_effort().to_owned())
-            .unwrap_or_default(),
+        model: if claude_model {
+            state.selected_model_name().to_owned()
+        } else {
+            Default::default()
+        },
+        effort: if claude_model {
+            state.selected_effort().to_owned()
+        } else {
+            Default::default()
+        },
         permission_mode: state.claude_permission_mode_setting().wire().to_owned(),
     }
 }
@@ -4252,8 +4253,8 @@ fn expand_collapsed_paste_shortcut(
     let Some(block) = state.editor.collapsed_paste_text() else {
         return false;
     };
-    if !clipboard_text()
-        .is_some_and(|text| paste::paste_payload_chars(&text) == paste::paste_payload_chars(&block))
+    if clipboard_text()
+        .is_none_or(|text| paste::paste_payload_chars(&text) != paste::paste_payload_chars(&block))
     {
         return false;
     }
@@ -4324,11 +4325,11 @@ fn apply_fragile_clipboard_paste(
     let Some(text) = text.filter(|text| fragile_clipboard_text(text)) else {
         return false;
     };
-    if paste::paste_payload_chars(text).first().copied() != paste::payload_char(&key) {
+    if paste::paste_payload_chars(text).first().copied() != paste::payload_char(key) {
         return false;
     }
     apply_clipboard_text_paste(state, buffer, text, now);
-    let _ = buffer.observe_expected(key.clone(), now, None);
+    let _ = buffer.observe_expected(*key, now, None);
     true
 }
 
@@ -4343,7 +4344,7 @@ fn apply_fragile_clipboard_paste_from_key(
     key: &KeyEvent,
     now: Instant,
 ) -> bool {
-    if !paste::payload_char(key).is_some_and(|ch| u32::from(ch) > 0xffff) {
+    if paste::payload_char(key).is_none_or(|ch| u32::from(ch) <= 0xffff) {
         return false;
     }
     let text = clipboard_text();
@@ -4402,20 +4403,6 @@ fn apply_direct_paste(state: &mut AppState, text: &str) {
     }
 }
 
-fn apply_composer_inputs(state: &mut AppState, inputs: Vec<ComposerInput>) -> Action {
-    let mut action = Action::None;
-    for input in inputs {
-        action = match input {
-            ComposerInput::Key(key) => state.handle_key(key),
-            ComposerInput::Text(text) => {
-                apply_composer_text(state, text);
-                Action::None
-            }
-        };
-    }
-    action
-}
-
 /// Windows Terminal pastes by synthesizing key records and keeps the `Ctrl+V`
 /// to itself, so the only announcement a second paste gets is its first
 /// character. When that character opens the block the composer is showing
@@ -4442,38 +4429,6 @@ fn arm_verified_collapsed_paste(
         return;
     }
     buffer.expect_verified_paste(&block, now);
-}
-
-fn observe_composer_key(
-    state: &mut AppState,
-    buffer: &mut ComposerPasteBuffer,
-    key: KeyEvent,
-    now: Instant,
-) -> Action {
-    // Windows reports key-up records while its IME still owns the visible
-    // preedit. They change no editor state, and repainting for one replaces the
-    // preedit with our placeholder before the composed syllable can commit.
-    if key.kind == KeyEventKind::Release {
-        return Action::Tick(false);
-    }
-    if let Some(target) = state.pending_text_input_target() {
-        apply_composer_inputs(
-            state,
-            buffer.observe_targeted(key, now, BufferedTextTarget::PendingUserInput(target)),
-        )
-    } else if state.has_pending_interaction() {
-        state.handle_key(key)
-    } else {
-        arm_verified_collapsed_paste(state, buffer, &key, now);
-        if apply_fragile_clipboard_paste_from_key(state, buffer, &key, now) {
-            return Action::None;
-        }
-        let expected_paste = state.editor.collapsed_paste_text();
-        apply_composer_inputs(
-            state,
-            buffer.observe_expected(key, now, expected_paste.as_deref()),
-        )
-    }
 }
 
 fn apply_composer_inputs_with_scroll(
@@ -5121,6 +5076,19 @@ mod tests {
     use theme::ThemeKind;
 
     use super::*;
+
+    /// Drives a key through the same path the event loop uses. The renderer is
+    /// the real one so scroll and vertical-move keys resolve as they do in the
+    /// app instead of against a second, drifting copy of the branch.
+    fn observe_key(
+        state: &mut AppState,
+        buffer: &mut ComposerPasteBuffer,
+        key: KeyEvent,
+        now: Instant,
+    ) -> Action {
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        observe_composer_key_with_scroll(state, &mut renderer, buffer, key, now)
+    }
 
     #[test]
     fn the_resolved_folder_drops_the_windows_verbatim_prefix() {
@@ -6183,8 +6151,7 @@ mod tests {
             } else {
                 KeyCode::Char(ch)
             };
-            let action =
-                observe_composer_key(&mut state, &mut buffer, press(code, KeyModifiers::NONE), at);
+            let action = observe_key(&mut state, &mut buffer, press(code, KeyModifiers::NONE), at);
             assert!(!matches!(action, Action::Submit(_)));
         }
 
@@ -6219,7 +6186,7 @@ mod tests {
             KeyEventKind::Release,
         );
         assert!(matches!(
-            observe_composer_key(&mut state, &mut buffer, release, Instant::now()),
+            observe_key(&mut state, &mut buffer, release, Instant::now()),
             Action::Tick(false)
         ));
         assert_eq!(
@@ -6234,7 +6201,7 @@ mod tests {
 
         let committed_at = Instant::now();
         assert!(matches!(
-            observe_composer_key(
+            observe_key(
                 &mut state,
                 &mut buffer,
                 press(KeyCode::Char('테'), KeyModifiers::NONE),
@@ -6296,7 +6263,7 @@ mod tests {
         let committed_at = Instant::now();
 
         assert!(matches!(
-            observe_composer_key(
+            observe_key(
                 &mut state,
                 &mut buffer,
                 press(KeyCode::Char('답'), KeyModifiers::NONE),
@@ -6304,7 +6271,7 @@ mod tests {
             ),
             Action::None
         ));
-        let action = observe_composer_key(
+        let action = observe_key(
             &mut state,
             &mut buffer,
             press(KeyCode::Enter, KeyModifiers::NONE),
@@ -6346,7 +6313,7 @@ mod tests {
         let mut buffer = ComposerPasteBuffer::new();
         let committed_at = Instant::now();
 
-        observe_composer_key(
+        observe_key(
             &mut state,
             &mut buffer,
             press(KeyCode::Char('답'), KeyModifiers::NONE),
@@ -6391,7 +6358,7 @@ mod tests {
         let selected_at = Instant::now();
 
         assert!(matches!(
-            observe_composer_key(
+            observe_key(
                 &mut state,
                 &mut buffer,
                 press(KeyCode::Char('4'), KeyModifiers::NONE),
@@ -6399,7 +6366,7 @@ mod tests {
             ),
             Action::None
         ));
-        observe_composer_key(
+        observe_key(
             &mut state,
             &mut buffer,
             press(KeyCode::Char('답'), KeyModifiers::NONE),
@@ -6416,7 +6383,7 @@ mod tests {
         assert!(overlay.lines[4].selected);
 
         assert!(matches!(
-            observe_composer_key(
+            observe_key(
                 &mut state,
                 &mut buffer,
                 press(KeyCode::Enter, KeyModifiers::NONE),
@@ -6444,7 +6411,7 @@ mod tests {
         state.handle_key(press(KeyCode::Char('2'), KeyModifiers::NONE));
         let mut buffer = ComposerPasteBuffer::new();
         let committed_at = Instant::now();
-        observe_composer_key(
+        observe_key(
             &mut state,
             &mut buffer,
             press(KeyCode::Char('직'), KeyModifiers::NONE),
@@ -6466,7 +6433,7 @@ mod tests {
         let mut state = starting_state();
         let mut buffer = ComposerPasteBuffer::new();
         let typed_at = Instant::now();
-        observe_composer_key(
+        observe_key(
             &mut state,
             &mut buffer,
             press(KeyCode::Char('초'), KeyModifiers::NONE),
@@ -6523,8 +6490,7 @@ mod tests {
             } else {
                 KeyCode::Char(ch)
             };
-            let action =
-                observe_composer_key(&mut state, &mut buffer, press(code, KeyModifiers::NONE), at);
+            let action = observe_key(&mut state, &mut buffer, press(code, KeyModifiers::NONE), at);
             assert!(!matches!(action, Action::Submit(_)), "no key may submit");
         }
 
@@ -6556,7 +6522,7 @@ mod tests {
         state.editor.set_text("/statusline");
         state.handle_key(press(KeyCode::Enter, KeyModifiers::NONE));
 
-        let action = observe_composer_key(
+        let action = observe_key(
             &mut state,
             &mut ComposerPasteBuffer::new(),
             press(KeyCode::Char(' '), KeyModifiers::NONE),

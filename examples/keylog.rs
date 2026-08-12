@@ -12,6 +12,7 @@
 //! Two samples are needed, and they have to be kept apart:
 //!   1. type a short sentence and press Enter
 //!   2. paste two or three short lines
+//!
 //! Esc twice quits. This probe never changes the console mode, so quitting it
 //! any way at all leaves the terminal as it found it.
 

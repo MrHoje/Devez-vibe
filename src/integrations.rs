@@ -143,16 +143,14 @@ impl McpServerInfo {
     }
 
     fn glyph(&self) -> &'static str {
-        if self.failure.is_some() {
+        if self.failure.is_some()
+            || matches!(
+                self.connection_status.as_deref(),
+                Some("disabled" | "failed")
+            )
+        {
             "✗"
-        } else if matches!(
-            self.connection_status.as_deref(),
-            Some("disabled" | "failed")
-        ) {
-            "✗"
-        } else if self.connection_status.as_deref() == Some("pending") {
-            "○"
-        } else if self.needs_login() {
+        } else if self.connection_status.as_deref() == Some("pending") || self.needs_login() {
             "○"
         } else {
             "✓"

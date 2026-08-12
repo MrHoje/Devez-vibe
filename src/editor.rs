@@ -255,11 +255,11 @@ impl Editor {
     /// Moves within physical input rows. Returns false at the first row so the
     /// caller can fall back to history navigation.
     pub fn move_up(&mut self) -> bool {
-        if let Some(end) = self.collapsed_paste_end {
-            if self.cursor <= end {
-                self.cursor = end;
-                return true;
-            }
+        if let Some(end) = self.collapsed_paste_end
+            && self.cursor <= end
+        {
+            self.cursor = end;
+            return true;
         }
         let line_start = self.buffer[..self.cursor]
             .iter()
@@ -655,10 +655,11 @@ impl Editor {
     }
 
     fn move_to_collapsed_paste_end(&mut self) {
-        if let (Some(start), Some(end)) = (self.collapsed_paste_start, self.collapsed_paste_end) {
-            if self.cursor > start && self.cursor < end {
-                self.cursor = end;
-            }
+        if let (Some(start), Some(end)) = (self.collapsed_paste_start, self.collapsed_paste_end)
+            && self.cursor > start
+            && self.cursor < end
+        {
+            self.cursor = end;
         }
     }
 

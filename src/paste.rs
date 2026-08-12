@@ -331,9 +331,9 @@ impl ComposerPasteBuffer {
     }
 
     pub fn flush_if_idle(&mut self, now: Instant) -> Option<BufferedText> {
-        if !self
+        if self
             .last
-            .is_some_and(|last| now.duration_since(last) >= self.idle_gap())
+            .is_none_or(|last| now.duration_since(last) < self.idle_gap())
         {
             return None;
         }
@@ -609,6 +609,37 @@ mod tests {
         burst.observe(press(KeyCode::Char('c')), base + Duration::from_millis(2));
 
         assert!(burst.is_active());
+    }
+
+    /// The other gap tests say `FAST_GAP` rather than a number, so they follow
+    /// the constant wherever it moves. This one pins the measured envelope the
+    /// constant was chosen from: the fastest typing seen was 123ms between
+    /// characters, so a run at that pace has to stay typing, and a paste
+    /// arriving an order of magnitude quicker has to read as a burst.
+    #[test]
+    fn the_fast_gap_sits_between_measured_paste_and_typing_speeds() {
+        let typed_gap = Duration::from_millis(123);
+        let pasted_gap = Duration::from_millis(2);
+        assert!(
+            pasted_gap < FAST_GAP && FAST_GAP < typed_gap,
+            "FAST_GAP {FAST_GAP:?} left the gap between paste and typing speeds"
+        );
+
+        let mut typing = PasteBurst::new();
+        let mut at = Instant::now();
+        for ch in "abcdef".chars() {
+            typing.observe(press(KeyCode::Char(ch)), at);
+            at += typed_gap;
+        }
+        assert!(!typing.is_active(), "typing at 123ms became a paste");
+
+        let mut pasting = PasteBurst::new();
+        let mut at = Instant::now();
+        for ch in "abcdef".chars() {
+            pasting.observe(press(KeyCode::Char(ch)), at);
+            at += pasted_gap;
+        }
+        assert!(pasting.is_active(), "a 2ms run stopped reading as a paste");
     }
 
     #[test]

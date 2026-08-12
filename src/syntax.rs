@@ -177,11 +177,11 @@ fn push_span(spans: &mut Vec<SyntaxSpan>, text: &str, kind: SyntaxKind) {
     if text.is_empty() {
         return;
     }
-    if let Some(last) = spans.last_mut() {
-        if last.kind == kind {
-            last.text.push_str(text);
-            return;
-        }
+    if let Some(last) = spans.last_mut()
+        && last.kind == kind
+    {
+        last.text.push_str(text);
+        return;
     }
     spans.push(SyntaxSpan {
         text: text.to_owned(),

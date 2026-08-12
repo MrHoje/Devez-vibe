@@ -1211,14 +1211,12 @@ fn normalized_model_display_name(display_name: &str) -> String {
     if version
         .chars()
         .all(|character| character.is_ascii_digit() || character == '.')
-        && variants
-            .split('-')
-            .all(|variant| {
-                !variant.is_empty()
-                    && variant
-                        .chars()
-                        .all(|character| character.is_ascii_alphabetic())
-            })
+        && variants.split('-').all(|variant| {
+            !variant.is_empty()
+                && variant
+                    .chars()
+                    .all(|character| character.is_ascii_alphabetic())
+        })
     {
         format!("GPT-{version} {}", variants.replace('-', " "))
     } else {
@@ -4902,10 +4900,7 @@ impl AppState {
         // Ctrl+C spent on a copy is not a quit attempt, so it cannot leave the
         // quit armed behind for the next Ctrl+C to trip over.
         self.disarm_quit();
-        self.composer_notice = Some((
-            "• Copied to clipboard".to_owned(),
-            Instant::now(),
-        ));
+        self.composer_notice = Some(("• Copied to clipboard".to_owned(), Instant::now()));
     }
 
     /// Arms the quit and puts up the warning that spends the same window.
@@ -6798,7 +6793,7 @@ impl AppState {
                 let expanded = self
                     .plan_summary
                     .as_ref()
-                    .map_or(true, |summary| summary.expanded);
+                    .is_none_or(|summary| summary.expanded);
                 let elapsed = if !steps.is_empty()
                     && steps
                         .iter()
@@ -6952,10 +6947,10 @@ impl AppState {
                     if let Some(total) = usage.get("total") {
                         self.token_totals = TokenTotals::from_breakdown(total);
                         let model = self.active_cost_model().to_owned();
-                        if !self.cost_restore_pending {
-                            if let Some(ledger) = self.cost_ledger.as_mut() {
-                                ledger.record_cumulative(&model, self.token_totals);
-                            }
+                        if !self.cost_restore_pending
+                            && let Some(ledger) = self.cost_ledger.as_mut()
+                        {
+                            ledger.record_cumulative(&model, self.token_totals);
                         }
                     }
                     self.context_window = usage
@@ -7153,9 +7148,11 @@ impl AppState {
         let using_claude = self.selected_model_name().starts_with("claude:");
         match parts.first().copied().unwrap_or_default() {
             "/help" => {
-                let provider_help = crate::open_code::PROVIDER_ENABLED
-                    .then_some("/connect  OpenCode provider 연결\n")
-                    .unwrap_or_default();
+                let provider_help = if crate::open_code::PROVIDER_ENABLED {
+                    "/connect  OpenCode provider 연결\n"
+                } else {
+                    Default::default()
+                };
                 let login_help = if using_claude {
                     "/login  Claude 로그인 방법\n/logout  Claude 로그아웃 방법"
                 } else {
@@ -7166,11 +7163,14 @@ impl AppState {
                 } else {
                     "/fast [on|off]  Fast 서비스 티어 선택\n"
                 };
-                let effort_help = self
+                let effort_help = if self
                     .selected_model()
                     .is_some_and(|model| !model.efforts.is_empty())
-                    .then_some("/effort [LEVEL]  추론 수준\n")
-                    .unwrap_or_default();
+                {
+                    "/effort [LEVEL]  추론 수준\n"
+                } else {
+                    Default::default()
+                };
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
@@ -7216,7 +7216,7 @@ impl AppState {
                 } else {
                     self.open_setting_picker(
                         DisplaySetting::Fast,
-                        self.effective_fast_mode().then_some(0).unwrap_or(1),
+                        if self.effective_fast_mode() { 0 } else { 1 },
                     );
                     Action::None
                 }
@@ -10269,11 +10269,11 @@ impl AppState {
             .efforts
             .get(next_index)
             .map(|effort| effort.id.clone());
-        if next_index != current_index {
-            if let Some(effort) = effort {
-                self.selected_effort = effort;
-                self.notice_setting_applies_to_next_request();
-            }
+        if next_index != current_index
+            && let Some(effort) = effort
+        {
+            self.selected_effort = effort;
+            self.notice_setting_applies_to_next_request();
         }
     }
 
@@ -11412,7 +11412,7 @@ fn commit_user_input_answers(
         .iter()
         .filter_map(|question| {
             let answer = answers.get(&question.id)?.trim();
-            (!answer.is_empty()).then(|| (question, answer))
+            (!answer.is_empty()).then_some((question, answer))
         })
         .collect::<Vec<_>>();
     if answered.is_empty() {
@@ -11424,7 +11424,7 @@ fn commit_user_input_answers(
             let question = question
                 .question
                 .trim()
-                .trim_end_matches(|ch: char| matches!(ch, ':' | '：' | '?' | '？'));
+                .trim_end_matches([':', '：', '?', '？']);
             let answer = strip_recommendation_mark(answer);
             format!("{question}:\n  ↳ {answer}")
         })
@@ -11887,10 +11887,10 @@ fn merged_turn_blocks(
             last_ts = ts;
         }
         if let Some(mut block) = completed_item_block(cwd, item) {
-            if matches!(block.kind, BlockKind::User) {
-                if let Some(model) = prompt_model {
-                    block.title = model.to_owned();
-                }
+            if matches!(block.kind, BlockKind::User)
+                && let Some(model) = prompt_model
+            {
+                block.title = model.to_owned();
             }
             rows.push((last_ts.clone(), order, block));
             order += 1;
@@ -15670,11 +15670,12 @@ mod tests {
     /// not in the status line where they used to park until the next thread.
     #[test]
     fn one_off_events_land_in_the_composer_notice_and_expire() {
-        for (method, params, expected) in [(
-            "model/rerouted",
-            json!({ "fromModel": "Sol", "toModel": "Luna" }),
-            "Sol → Luna로 전환됨",
-        )] {
+        {
+            let (method, params, expected) = (
+                "model/rerouted",
+                json!({ "fromModel": "Sol", "toModel": "Luna" }),
+                "Sol → Luna로 전환됨",
+            );
             let mut state = test_state();
 
             state.handle_notification(method, &params);
@@ -16068,8 +16069,7 @@ mod tests {
             state
                 .committed
                 .iter()
-                .filter(|block| block.title.starts_with("✓ Fast mode"))
-                .last()
+                .rfind(|block| block.title.starts_with("✓ Fast mode"))
                 .map(|block| block.title.as_str()),
             Some("✓ Fast mode Off")
         );
@@ -16242,7 +16242,10 @@ mod tests {
             normalized_model_display_name("GPT-5.3-Codex-Spark"),
             "GPT-5.3 Codex Spark"
         );
-        assert_eq!(normalized_model_display_name("Claude Opus 5"), "Claude Opus 5");
+        assert_eq!(
+            normalized_model_display_name("Claude Opus 5"),
+            "Claude Opus 5"
+        );
     }
 
     #[test]
@@ -17037,9 +17040,11 @@ mod tests {
 
         state.set_copy_notice();
 
-        assert!(state
-            .activity()
-            .is_some_and(|activity| activity.starts_with("Working..")));
+        assert!(
+            state
+                .activity()
+                .is_some_and(|activity| activity.starts_with("Working.."))
+        );
         assert_eq!(
             state.view().composer_notice.as_deref(),
             Some("• Copied to clipboard")
@@ -17771,6 +17776,66 @@ mod tests {
             }
             _ => panic!("MCP approval should return a scoped accept response"),
         }
+    }
+
+    #[test]
+    fn mcp_approval_arrows_stop_at_the_first_and_last_option() {
+        let mut state = test_state();
+        state.begin_server_request(
+            json!(12),
+            "mcpServer/elicitation/request",
+            &json!({
+                "serverName": "calendar",
+                "message": "Create an event?",
+                "mode": "form",
+                "requestedSchema": { "type": "object", "properties": {} },
+                "_meta": {
+                    "codex_approval_kind": "mcp_tool_call",
+                    "persist": ["session", "always"]
+                }
+            }),
+        );
+        let options = match state.pending {
+            Some(PendingInteraction::McpApproval(ref approval)) => approval.options.len(),
+            _ => panic!("approval should be pending"),
+        };
+        assert!(options > 1);
+
+        // Held past the end, the selection has to sit on the last option rather
+        // than run off it: an index past the options answers nothing at all.
+        for _ in 0..options + 3 {
+            state.handle_key(KeyEvent::from(KeyCode::Down));
+        }
+        assert!(matches!(
+            state.pending,
+            Some(PendingInteraction::McpApproval(ref approval))
+                if approval.selected == options - 1
+        ));
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::RpcResponse { .. }
+        ));
+
+        // And the same going the other way.
+        let mut state = test_state();
+        state.begin_server_request(
+            json!(13),
+            "mcpServer/elicitation/request",
+            &json!({
+                "serverName": "calendar",
+                "message": "Create an event?",
+                "mode": "form",
+                "requestedSchema": { "type": "object", "properties": {} },
+                "_meta": { "codex_approval_kind": "mcp_tool_call" }
+            }),
+        );
+        for _ in 0..3 {
+            state.handle_key(KeyEvent::from(KeyCode::Up));
+        }
+        assert!(matches!(
+            state.pending,
+            Some(PendingInteraction::McpApproval(ref approval)) if approval.selected == 0
+        ));
     }
 
     #[test]
