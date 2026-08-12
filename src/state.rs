@@ -3311,10 +3311,11 @@ pub struct AppState {
     /// first transcript row instead of appending another collapsed card.
     turn_file_changes: Vec<Block>,
     turn_file_change_anchor: Option<Block>,
-    /// Assistant messages completed in this turn. Codex labels commentary and
-    /// final output; runtimes without that label use the last message on a
-    /// successful turn as the final answer.
-    turn_assistant_blocks: Vec<Block>,
+    /// Foldable transcript milestones in their live order: assistant messages
+    /// plus any context compaction that happened between them. Codex labels
+    /// commentary and final output; runtimes without that label use the last
+    /// message on a successful turn as the final answer.
+    turn_response_blocks: Vec<Block>,
     response_grouped: bool,
     response_collapse: Option<ResponseCollapseTransition>,
     /// App-server lifecycle notifications can be replayed. An item id belongs
@@ -3553,7 +3554,7 @@ impl AppState {
             turn_shell_duration_ms: None,
             turn_file_changes: Vec::new(),
             turn_file_change_anchor: None,
-            turn_assistant_blocks: Vec::new(),
+            turn_response_blocks: Vec::new(),
             response_grouped: false,
             response_collapse: None,
             completed_item_ids: HashSet::new(),
@@ -5223,32 +5224,51 @@ impl AppState {
         self.turn_shell_duration_ms = None;
         self.turn_file_changes.clear();
         self.turn_file_change_anchor = None;
-        self.turn_assistant_blocks.clear();
+        self.turn_response_blocks.clear();
         self.response_grouped = false;
         self.response_collapse = None;
     }
 
-    fn push_unique_operation(&mut self, block: Block) {
+    fn push_unique_operation(&mut self, block: Block) -> bool {
         if let Some(signature) = operation_signature(&block)
             && !self.seen_operation_signatures.insert(signature)
         {
-            return;
+            return false;
         }
         push_latest_thinking(&mut self.committed, block);
+        true
     }
 
     fn collapse_completed_response(&mut self) {
-        if self.response_grouped || self.turn_assistant_blocks.len() < 2 {
+        let assistant_indices = self
+            .turn_response_blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, block)| {
+                matches!(block.kind, BlockKind::Assistant).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if self.response_grouped || assistant_indices.len() < 2 {
             return;
         }
-        let final_index = self
-            .turn_assistant_blocks
+        let final_index = assistant_indices
             .iter()
-            .rposition(|block| block.assistant_phase() == AssistantPhase::FinalAnswer)
-            .unwrap_or(self.turn_assistant_blocks.len() - 1);
-        let progress = self.turn_assistant_blocks[..final_index]
+            .copied()
+            .rfind(|&index| {
+                self.turn_response_blocks[index].assistant_phase() == AssistantPhase::FinalAnswer
+            })
+            .unwrap_or(*assistant_indices.last().expect("two assistant blocks"));
+        let Some(first_progress) = assistant_indices.into_iter().find(|&index| {
+            index < final_index && !self.turn_response_blocks[index].body.trim().is_empty()
+        }) else {
+            return;
+        };
+        let progress = self.turn_response_blocks[first_progress..final_index]
             .iter()
-            .filter(|block| !block.body.trim().is_empty())
+            .filter(|block| {
+                is_context_compaction(block)
+                    || (matches!(block.kind, BlockKind::Assistant) && !block.body.trim().is_empty())
+            })
             .cloned()
             .collect::<Vec<_>>();
         if progress.is_empty() {
@@ -5503,7 +5523,7 @@ impl AppState {
         self.quit_armed_at = None;
         self.plan_summary = None;
         self.response_collapse = None;
-        self.turn_assistant_blocks.clear();
+        self.turn_response_blocks.clear();
         self.response_grouped = false;
         self.subagents.clear();
         self.subagent_logs.clear();
@@ -7133,11 +7153,14 @@ impl AppState {
             }
             "thread/compacted" => {
                 self.end_compaction();
-                self.push_unique_operation(Block::new(
+                let block = Block::new(
                     BlockKind::System,
                     "Context compacted",
                     "대화 컨텍스트가 압축되었습니다.",
-                ));
+                );
+                if self.push_unique_operation(block.clone()) {
+                    self.turn_response_blocks.push(block);
+                }
             }
             _ => {}
         }
@@ -11179,7 +11202,13 @@ impl AppState {
             if matches!(block.kind, BlockKind::Assistant) {
                 self.turn_response_started |= !block.body.is_empty();
                 self.last_assistant_markdown = Some(block.body.clone());
-                self.turn_assistant_blocks.push(block.clone());
+                self.turn_response_blocks.push(block.clone());
+            }
+            if is_context_compaction(&block) {
+                if self.push_unique_operation(block.clone()) {
+                    self.turn_response_blocks.push(block);
+                }
+                return;
             }
             if matches!(block.kind, BlockKind::FileChange) {
                 if let Some(signature) = operation_signature(&block)
@@ -11453,7 +11482,13 @@ impl AppState {
                 if matches!(item.block.kind, BlockKind::Assistant) {
                     self.turn_response_started |= !item.block.body.is_empty();
                     self.last_assistant_markdown = Some(item.block.body.clone());
-                    self.turn_assistant_blocks.push(item.block.clone());
+                    self.turn_response_blocks.push(item.block.clone());
+                }
+                if is_context_compaction(&item.block) {
+                    if self.push_unique_operation(item.block.clone()) {
+                        self.turn_response_blocks.push(item.block);
+                    }
+                    continue;
                 }
                 if matches!(item.block.kind, BlockKind::FileChange) {
                     if operation_signature(&item.block)
@@ -11766,11 +11801,15 @@ fn is_plan_block(block: &Block) -> bool {
         || (matches!(block.kind, BlockKind::Reasoning) && block.title == "Plan")
 }
 
+fn is_context_compaction(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::System) && block.title == "Context compacted"
+}
+
 /// Operations whose repeated cards add no information. The body participates
 /// in the signature, so two calls to the same tool with different results stay
 /// visible; Web Search includes its query in the title for the same reason.
 fn operation_signature(block: &Block) -> Option<String> {
-    if matches!(block.kind, BlockKind::System) && block.title == "Context compacted" {
+    if is_context_compaction(block) {
         return Some("context-compaction".to_owned());
     }
     let (family, include_title) = match block.kind {
@@ -12072,11 +12111,18 @@ fn group_turn_response(mut blocks: Vec<Block>) -> Vec<Block> {
     let Some(&insert_at) = progress_indices.first() else {
         return blocks;
     };
-    let progress_ids = progress_indices
+    let fold_indices = (insert_at..final_index)
+        .filter(|&index| {
+            is_context_compaction(&blocks[index])
+                || (matches!(blocks[index].kind, BlockKind::Assistant)
+                    && !blocks[index].body.trim().is_empty())
+        })
+        .collect::<Vec<_>>();
+    let progress_ids = fold_indices
         .iter()
         .map(|&index| blocks[index].id())
         .collect::<HashSet<_>>();
-    let progress = progress_indices
+    let progress = fold_indices
         .iter()
         .map(|&index| blocks[index].clone())
         .collect::<Vec<_>>();
@@ -16944,6 +16990,71 @@ mod tests {
         assert_eq!(group.children().len(), 2);
         assert_eq!(group.title, "History · 2");
         assert!(state.response_collapse_view().is_some());
+    }
+
+    #[test]
+    fn context_compaction_between_updates_folds_into_live_history() {
+        let mut state = test_state();
+        while state.vibe_mode() != VibeMode::SuperVibe {
+            state.cycle_vibe_mode();
+        }
+        state.set_turn_started("turn-1".to_owned());
+        for (id, phase, text) in [
+            ("progress-1", "commentary", "첫 진행 메시지"),
+            ("progress-2", "commentary", "두 번째 진행 메시지"),
+            ("final", "final_answer", "최종 답변"),
+        ] {
+            if id == "progress-2" {
+                state.complete_item(&json!({
+                    "id": "compact-1",
+                    "type": "contextCompaction"
+                }));
+                state.handle_notification("thread/compacted", &json!({}));
+                state.drain_committed();
+            }
+            state.handle_notification(
+                "item/completed",
+                &json!({
+                    "item": { "id": id, "type": "agentMessage", "phase": phase, "text": text }
+                }),
+            );
+            state.drain_committed();
+        }
+
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "status": "completed" } }),
+        );
+        let blocks = state.drain_committed();
+        let group = blocks
+            .iter()
+            .find(|block| matches!(block.kind, BlockKind::ProgressGroup))
+            .expect("progress group");
+
+        assert_eq!(group.title, "History · 3");
+        assert_eq!(group.children()[1].title, "Context compacted");
+    }
+
+    #[test]
+    fn context_compaction_between_resumed_updates_folds_into_history() {
+        let blocks = vec![
+            Block::new(BlockKind::Assistant, "Codex", "첫 진행 메시지")
+                .with_assistant_phase(AssistantPhase::Commentary),
+            Block::new(BlockKind::System, "Context compacted", ""),
+            Block::new(BlockKind::Assistant, "Codex", "두 번째 진행 메시지")
+                .with_assistant_phase(AssistantPhase::Commentary),
+            Block::new(BlockKind::Assistant, "Codex", "최종 답변")
+                .with_assistant_phase(AssistantPhase::FinalAnswer),
+        ];
+
+        let grouped = group_turn_response(blocks);
+        let group = grouped
+            .iter()
+            .find(|block| matches!(block.kind, BlockKind::ProgressGroup))
+            .expect("progress group");
+
+        assert_eq!(group.title, "History · 3");
+        assert_eq!(group.children()[1].title, "Context compacted");
     }
 
     #[test]

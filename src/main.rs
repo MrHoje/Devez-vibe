@@ -1443,6 +1443,9 @@ fn renderer_mouse_action(
         && let Some(pick) = renderer.pick_at(column, row)
     {
         let cleared = renderer.clear_selection();
+        if let Pick::History(group_id) = pick {
+            return Action::Tick(renderer.toggle_tool(group_id) || cleared);
+        }
         return match on_click(MouseClick::Pick(pick)) {
             Action::Tick(changed) => Action::Tick(changed || cleared),
             action => action,
@@ -1564,6 +1567,7 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
         Pick::EffortSetting => state.run_command("/effort"),
         Pick::Subagent(index) => state.open_subagent(index),
         Pick::ScrollToBottom => Action::ScrollToBottom,
+        Pick::History(_) => Action::None,
         Pick::Prompt(block_id) => Action::ScrollToPrompt(block_id),
         Pick::Close => state.close_overlay(),
         Pick::Row(index) => state.click_overlay_row(index),
