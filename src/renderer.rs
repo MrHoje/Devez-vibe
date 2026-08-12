@@ -175,6 +175,8 @@ static CHAT_LAYOUT: AtomicBool = AtomicBool::new(true);
 const CHAT_BUBBLE_PADDING: usize = 1;
 /// Extra cell that keeps the right edge visibly clear after terminal painting.
 const CHAT_BUBBLE_RIGHT_GAP: usize = 1;
+/// History stays readable while sitting a little behind the prompt text.
+const HISTORY_LABEL_MUTED_BLEND: u8 = 96;
 
 impl Block {
     pub fn new(kind: BlockKind, title: impl Into<String>, body: impl Into<String>) -> Self {
@@ -3710,6 +3712,8 @@ enum Tone {
     User,
     /// A centred transcript control: default text on a compact button band.
     ScrollToBottom,
+    /// Prompt-hosted History text, softened without becoming fully muted.
+    History,
     #[allow(dead_code)]
     Success,
     Warning,
@@ -8415,7 +8419,7 @@ fn attach_history_to_prompt(
     bottom.tail.clear();
     bottom.tail.push(PaintSpan {
         text: label,
-        tone: Tone::ScrollToBottom,
+        tone: Tone::History,
         bold: false,
     });
     bottom.tail.push(PaintSpan {
@@ -10550,6 +10554,7 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::Accent => palette.accent,
         Tone::User => palette.blue,
         Tone::ScrollToBottom => palette.foreground,
+        Tone::History => blend(palette.foreground, palette.muted, HISTORY_LABEL_MUTED_BLEND),
         Tone::Success => palette.success,
         Tone::Warning => palette.warning,
         Tone::Error => palette.error,
@@ -18583,6 +18588,27 @@ mod tests {
         assert_eq!(prompt_lines.len(), 4);
         assert!(painted(prompt_lines.last().unwrap()).ends_with("History · 1 ▸  "));
         assert_eq!(painted_line_width(prompt_lines.last().unwrap()), 79);
+        let history_span = prompt_lines
+            .last()
+            .unwrap()
+            .tail
+            .iter()
+            .find(|span| span.text.starts_with("History"))
+            .expect("History label has its own tone");
+        assert_eq!(history_span.tone, Tone::History);
+        assert_eq!(
+            tone_rgb(history_span.tone),
+            Some(blend(
+                theme::palette().foreground,
+                theme::palette().muted,
+                HISTORY_LABEL_MUTED_BLEND
+            ))
+        );
+        assert_ne!(
+            tone_rgb(history_span.tone),
+            Some(theme::palette().foreground)
+        );
+        assert_ne!(tone_rgb(history_span.tone), Some(theme::palette().muted));
         let history_row = renderer
             .wrapped
             .iter()
