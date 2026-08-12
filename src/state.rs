@@ -1176,6 +1176,10 @@ impl ModelInfo {
     pub fn matches_query(&self, query: &str) -> bool {
         if self.id.eq_ignore_ascii_case(query)
             || self.model.eq_ignore_ascii_case(query)
+            || self
+                .model
+                .strip_prefix("claude:")
+                .is_some_and(|model| model.eq_ignore_ascii_case(query))
             || self.display_name.eq_ignore_ascii_case(query)
         {
             return true;
@@ -8049,10 +8053,10 @@ impl AppState {
                             Instant::now(),
                         ));
                     }
-                    KeyCode::Char('r') if tab == 4 && !ctrl && !alt => {
-                        if selected < denials.len() {
-                            retry = (retry != Some(selected)).then_some(selected);
-                        }
+                    KeyCode::Char('r')
+                        if tab == 4 && !ctrl && !alt && selected < denials.len() =>
+                    {
+                        retry = (retry != Some(selected)).then_some(selected);
                     }
                     _ => {}
                 }
@@ -12065,13 +12069,11 @@ fn plan_step_from_text(line: &str) -> Option<crate::rollout::PlanStepSnapshot> {
             .or_else(|| line.strip_prefix("* [~] "))
         {
             ("in_progress", text)
-        } else if let Some(text) = line
-            .strip_prefix("- [ ] ")
-            .or_else(|| line.strip_prefix("* [ ] "))
-        {
-            ("pending", text)
         } else {
-            return None;
+            let text = line
+                .strip_prefix("- [ ] ")
+                .or_else(|| line.strip_prefix("* [ ] "))?;
+            ("pending", text)
         };
     (!text.trim().is_empty()).then_some(crate::rollout::PlanStepSnapshot {
         text: text.trim().to_owned(),
@@ -18532,6 +18534,11 @@ mod tests {
         let models = vec![
             test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
             test_model("claude:sonnet", "Claude Sonnet 5", false),
+            test_model(
+                "claude:claude-opus-4-8",
+                "Claude Opus 4.8",
+                false,
+            ),
             test_model("gpt-5.6-terra", "GPT-5.6 Terra", false),
             test_model("claude:haiku", "Claude Haiku 4.5", false),
         ];
@@ -18565,17 +18572,24 @@ mod tests {
             .iter()
             .filter(|line| !line.text.is_empty())
             .collect::<Vec<_>>();
-        assert_eq!(model_lines.len(), 2);
+        assert_eq!(model_lines.len(), 3);
         assert_eq!(
             model_lines
                 .iter()
                 .map(|line| line.text.as_str())
                 .collect::<Vec<_>>(),
-            ["1. Claude Sonnet 5", "2. Claude Haiku 4.5"]
+            [
+                "1. Claude Sonnet 5",
+                "2. Claude Opus 4.8",
+                "3. Claude Haiku 4.5"
+            ]
         );
         state.pending = None;
 
-        state.run_slash_command("/model 2");
+        state.run_slash_command("/model claude-opus-4-8");
+        assert_eq!(state.selected_model_name(), "claude:claude-opus-4-8");
+
+        state.run_slash_command("/model 3");
         assert_eq!(state.selected_model_name(), "claude:haiku");
 
         assert!(matches!(

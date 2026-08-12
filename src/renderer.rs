@@ -7878,7 +7878,8 @@ fn inline_link(rest: &str) -> Option<(String, String, usize)> {
     }
     let after_paren = &after_bracket[close + 2..];
     let end = after_paren.find(')')?;
-    let target = &after_paren[..end];
+    let raw_target = &after_paren[..end];
+    let target = markdown_link_target_body(raw_target);
     let consumed = usize::from(image) + 1 + close + 2 + end + 1;
 
     let mut text = label.to_owned();
@@ -7889,7 +7890,50 @@ fn inline_link(rest: &str) -> Option<(String, String, usize)> {
     {
         text.push_str(&suffix);
     }
-    Some((text, target.to_owned(), consumed))
+    Some((text, markdown_link_open_target(raw_target), consumed))
+}
+
+/// Converts Codex-style local file targets into values understood by the
+/// platform opener. Windows absolute paths arrive with a URI-like leading
+/// slash, while source links can carry a line/column suffix that is useful in
+/// the label but is not part of the file name.
+fn markdown_link_open_target(target: &str) -> String {
+    let target = markdown_link_target_body(target);
+    let target = target
+        .strip_prefix('/')
+        .filter(|inner| is_windows_drive_path(inner))
+        .unwrap_or(target);
+
+    if is_local_file_target(target)
+        && let Some(suffix) = line_suffix(target)
+    {
+        return target.strip_suffix(&suffix).unwrap_or(target).to_owned();
+    }
+    target.to_owned()
+}
+
+fn markdown_link_target_body(target: &str) -> &str {
+    target
+        .strip_prefix('<')
+        .and_then(|inner| inner.strip_suffix('>'))
+        .unwrap_or(target)
+}
+
+fn is_windows_drive_path(target: &str) -> bool {
+    let bytes = target.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+}
+
+fn is_local_file_target(target: &str) -> bool {
+    is_windows_drive_path(target)
+        || target.starts_with('/')
+        || target.starts_with('\\')
+        || target
+            .get(..5)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
 }
 
 /// Restores the link targets after styled wrapping. Markdown rendering keeps only
@@ -12652,6 +12696,51 @@ mod tests {
         assert_eq!(
             line.pick.as_ref().and_then(|picks| picks.at(start - 1)),
             None
+        );
+    }
+
+    #[test]
+    fn markdown_local_file_links_use_platform_openable_targets() {
+        let lines = markdown_line(
+            "",
+            Tone::Plain,
+            "[전체 프로세스 명세서](</D:/eGhisSource/eGhisCCC/docs/work-item-analysis-process-spec.md:83:12>)",
+            Tone::Plain,
+            false,
+            100,
+        );
+        let line = &lines[0];
+
+        assert_eq!(line.text, "전체 프로세스 명세서:83:12");
+        assert_eq!(
+            line.pick.as_ref().and_then(|picks| picks.at(0)),
+            Some(Pick::OpenLink(
+                "D:/eGhisSource/eGhisCCC/docs/work-item-analysis-process-spec.md".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn markdown_link_target_normalization_preserves_non_file_urls() {
+        assert_eq!(
+            markdown_link_open_target("/D:/Docs/spec.md"),
+            "D:/Docs/spec.md"
+        );
+        assert_eq!(
+            markdown_link_open_target("D:\\Docs\\spec.md:83"),
+            "D:\\Docs\\spec.md"
+        );
+        assert_eq!(
+            markdown_link_open_target("file:///D:/Docs/spec.md:83:12"),
+            "file:///D:/Docs/spec.md"
+        );
+        assert_eq!(
+            markdown_link_open_target("https://example.com/releases/83"),
+            "https://example.com/releases/83"
+        );
+        assert_eq!(
+            markdown_link_open_target("HTTPS://example.com/file:83"),
+            "HTTPS://example.com/file:83"
         );
     }
 

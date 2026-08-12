@@ -367,6 +367,12 @@ pub fn model_catalog() -> Value {
         "data": [
             claude_model("claude:fable", "Claude Fable 5", efforts(), false),
             claude_model("claude:opus", "Claude Opus 5", efforts(), false),
+            claude_model(
+                "claude:claude-opus-4-8",
+                "Claude Opus 4.8",
+                efforts(),
+                false,
+            ),
             claude_model("claude:sonnet", "Claude Sonnet 5", efforts(), true),
             claude_model("claude:haiku", "Claude Haiku 4.5", json!([]), false)
         ]
@@ -569,7 +575,7 @@ mod tests {
     fn model_catalog_uses_existing_model_shape() {
         let catalog = model_catalog();
         let models = catalog.get("data").and_then(Value::as_array).unwrap();
-        assert_eq!(models.len(), 4);
+        assert_eq!(models.len(), 5);
         assert_eq!(
             models
                 .iter()
@@ -578,6 +584,7 @@ mod tests {
             [
                 "claude:fable",
                 "claude:opus",
+                "claude:claude-opus-4-8",
                 "claude:sonnet",
                 "claude:haiku"
             ]
@@ -595,6 +602,7 @@ mod tests {
             [
                 "Claude Fable 5",
                 "Claude Opus 5",
+                "Claude Opus 4.8",
                 "Claude Sonnet 5",
                 "Claude Haiku 4.5"
             ]

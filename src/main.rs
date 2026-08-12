@@ -447,16 +447,59 @@ async fn run_after_startup(
 
     if let Some(text) = queued {
         draw(state, renderer)?;
-        if !state.thread_pending() || open_pending_thread(server, state).await {
-            start_turn(server, state, text, None).await;
+        if !state.thread_pending() || open_pending_thread(server, state, renderer).await? {
+            start_turn(server, state, renderer, text, None).await?;
         }
     }
     event_loop(server, state, renderer, update_rx).await
 }
 
+/// Keeps the activity row alive while a request needed to begin a turn is waiting
+/// for its acknowledgement. The request itself still owns the ordering; only the
+/// paint clock is allowed to advance alongside it.
+async fn await_with_activity<T>(
+    state: &mut AppState,
+    renderer: &mut Renderer,
+    request: impl Future<Output = T>,
+) -> Result<T> {
+    await_with_ticks(request, Duration::from_millis(80), || {
+        let tick = state.render_tick();
+        if !tick.redraw {
+            return Ok(());
+        }
+        let animated = tick.animation_only && renderer.render_animation(state.animation_view())?;
+        if !animated {
+            draw(state, renderer)?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+async fn await_with_ticks<T>(
+    request: impl Future<Output = T>,
+    interval: Duration,
+    mut on_tick: impl FnMut() -> Result<()>,
+) -> Result<T> {
+    let start = tokio::time::Instant::now() + interval;
+    let mut ticker = tokio::time::interval_at(start, interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    tokio::pin!(request);
+    loop {
+        tokio::select! {
+            response = &mut request => return Ok(response),
+            _ = ticker.tick() => on_tick()?,
+        }
+    }
+}
+
 /// Builds the session the first prompt needs, on the runtime that prompt selected.
 /// Returns false when it could not be created, with the failure already on screen.
-async fn open_pending_thread(server: &BackendServer, state: &mut AppState) -> bool {
+async fn open_pending_thread(
+    server: &BackendServer,
+    state: &mut AppState,
+    renderer: &mut Renderer,
+) -> Result<bool> {
     let model = state.selected_model_name().to_owned();
     let params = new_thread_params(
         &state.cwd,
@@ -470,13 +513,14 @@ async fn open_pending_thread(server: &BackendServer, state: &mut AppState) -> bo
         state.claude_permission_mode_setting().wire(),
         state.selected_effort(),
     );
-    let response = match server.request("thread/start", params).await {
-        Ok(response) => response,
-        Err(error) => {
-            state.set_request_failed(format!("세션을 시작하지 못했습니다: {error}"));
-            return false;
-        }
-    };
+    let response =
+        match await_with_activity(state, renderer, server.request("thread/start", params)).await? {
+            Ok(response) => response,
+            Err(error) => {
+                state.set_request_failed(format!("세션을 시작하지 못했습니다: {error}"));
+                return Ok(false);
+            }
+        };
     apply_claude_account_metadata(state, &response);
     let thread_id = response
         .get("thread")
@@ -494,7 +538,7 @@ async fn open_pending_thread(server: &BackendServer, state: &mut AppState) -> bo
         .to_owned();
     let (Some(thread_id), Some(cwd)) = (thread_id, cwd) else {
         state.set_request_failed("thread/start 응답이 올바르지 않습니다.");
-        return false;
+        return Ok(false);
     };
     let effort = response
         .get("reasoningEffort")
@@ -504,7 +548,7 @@ async fn open_pending_thread(server: &BackendServer, state: &mut AppState) -> bo
     state.attach_thread(thread_id, cwd, &actual_model, Some(&effort));
     state.note_resume_id(&server.resume_id(&state.thread_id));
     apply_deferred_startup_actions(server, state).await;
-    true
+    Ok(true)
 }
 
 /// Runs the full UI while `thread/start` is still in flight: the screen is live,
@@ -948,7 +992,7 @@ async fn event_loop(
             // place for it.
             if let Some(text) = deferred.prompt {
                 draw(state, renderer)?;
-                send_queued_prompt(server, state, text).await;
+                send_queued_prompt(server, state, renderer, text).await?;
             }
             draw(state, renderer)?;
             continue;
@@ -1638,10 +1682,10 @@ async fn execute_action(
             draw(state, renderer)?;
             // A session that does not exist yet is built here, by the prompt that
             // needs it, so it is named after the runtime this prompt runs on.
-            if state.thread_pending() && !open_pending_thread(server, state).await {
+            if state.thread_pending() && !open_pending_thread(server, state, renderer).await? {
                 return Ok(false);
             }
-            start_turn(server, state, text, Some(handoff)).await
+            start_turn(server, state, renderer, text, Some(handoff)).await?
         }
         Action::Steer(text) => {
             renderer.scroll_to_bottom();
@@ -1904,7 +1948,7 @@ async fn execute_action(
                         state.enter_side_thread(thread_id, cwd, &model, effort.as_deref());
                         if let Some(prompt) = prompt {
                             state.begin_side_prompt(prompt.clone());
-                            start_turn(server, state, prompt, None).await;
+                            start_turn(server, state, renderer, prompt, None).await?;
                         }
                     } else {
                         state.push_notice(
@@ -2849,7 +2893,7 @@ async fn resume_into_state(
         state,
         renderer,
         previous_thread.clone(),
-        server.request("thread/resume", resume_thread_params(thread_id, &claude)),
+        request_resume_thread(server, resume_thread_params(thread_id, &claude)),
         protect_side_exit_keys.then(|| Instant::now() + SIDE_EXIT_KEY_SETTLE),
     )
     .await?
@@ -2967,7 +3011,7 @@ async fn finish_thread_switch(
     draw(state, renderer)?;
     if let Some(text) = queued {
         draw(state, renderer)?;
-        send_queued_prompt(server, state, text).await;
+        send_queued_prompt(server, state, renderer, text).await?;
     }
     Ok(false)
 }
@@ -2996,10 +3040,14 @@ async fn apply_deferred_startup_actions(server: &BackendServer, state: &mut AppS
 /// Sends a prompt typed during a switch. Returning from a side conversation can
 /// bring a turn back with it, so the prompt joins that turn rather than starting a
 /// competing one.
-async fn send_queued_prompt(server: &BackendServer, state: &mut AppState, text: String) {
+async fn send_queued_prompt(
+    server: &BackendServer,
+    state: &mut AppState,
+    renderer: &mut Renderer,
+    text: String,
+) -> Result<()> {
     let Some(turn_id) = state.turn_id.clone() else {
-        start_turn(server, state, text, None).await;
-        return;
+        return start_turn(server, state, renderer, text, None).await;
     };
     devezcode::note_prompt(&text);
     let input = state.turn_input(text);
@@ -3008,9 +3056,12 @@ async fn send_queued_prompt(server: &BackendServer, state: &mut AppState, text: 
         "expectedTurnId": turn_id,
         "input": input
     });
-    if let Err(error) = server.request("turn/steer", params).await {
+    if let Err(error) =
+        await_with_activity(state, renderer, server.request("turn/steer", params)).await?
+    {
         state.push_notice(BlockKind::Error, "추가 입력 실패", error.to_string());
     }
+    Ok(())
 }
 
 /// The fields `/resume` needs out of a `thread/resume` response.
@@ -4189,9 +4240,10 @@ fn provider_handoff_snapshot(state: &AppState, renderer: &Renderer) -> Value {
 async fn start_turn(
     server: &BackendServer,
     state: &mut AppState,
+    renderer: &mut Renderer,
     text: String,
     provider_handoff: Option<Value>,
-) {
+) -> Result<()> {
     devezcode::note_prompt(&text);
     let model = state.selected_model_name().to_owned();
     let effort = state.selected_effort().to_owned();
@@ -4215,12 +4267,13 @@ async fn start_turn(
     if let Some(provider_handoff) = provider_handoff {
         params["providerHandoff"] = provider_handoff;
     }
-    match server.request("turn/start", params).await {
+    match await_with_activity(state, renderer, server.request("turn/start", params)).await? {
         // The response reserves an id, but the app-server makes it
         // interruptible only after the subsequent `turn/started` notification.
         Ok(_) => {}
         Err(error) => state.set_request_failed(error.to_string()),
     }
+    Ok(())
 }
 
 fn attach_clipboard_image(state: &mut AppState) -> bool {
@@ -4798,7 +4851,7 @@ async fn start_or_resume_thread(
         if let Some(cwd) = resume_cwd {
             params["cwd"] = json!(cwd.to_string_lossy());
         }
-        server.request("thread/resume", params).await
+        request_resume_thread(server, params).await
     } else {
         server
             .request(
@@ -4814,6 +4867,25 @@ async fn start_or_resume_thread(
                 ),
             )
             .await
+    }
+}
+
+const ACTIVE_WRITER_RESUME_ERROR: &str = "already has an active writer";
+const ACTIVE_WRITER_RESUME_NOTICE: &str =
+    "이 대화는 다른 Codex 창에서 사용 중입니다. 기존 대화를 닫은 뒤 다시 시도하세요.";
+
+async fn request_resume_thread(server: &BackendServer, params: Value) -> Result<Value> {
+    server
+        .request("thread/resume", params)
+        .await
+        .map_err(|error| anyhow::anyhow!(resume_error_message(&error.to_string())))
+}
+
+fn resume_error_message(error: &str) -> String {
+    if error.contains(ACTIVE_WRITER_RESUME_ERROR) {
+        ACTIVE_WRITER_RESUME_NOTICE.to_owned()
+    } else {
+        error.to_owned()
     }
 }
 
@@ -5705,6 +5777,20 @@ mod tests {
                 .and_then(Value::as_str),
             Some("full")
         );
+    }
+
+    #[test]
+    fn an_active_writer_resume_error_explains_how_to_retry() {
+        let error = "thread/resume: thread 019ff007 already has an active writer (-32600)";
+
+        assert_eq!(resume_error_message(error), ACTIVE_WRITER_RESUME_NOTICE);
+    }
+
+    #[test]
+    fn other_resume_errors_keep_the_runtime_message() {
+        let error = "thread/resume: no rollout found for thread id 019ff007";
+
+        assert_eq!(resume_error_message(error), error);
     }
 
     fn test_claude_settings() -> ClaudeSessionSettings {
@@ -6722,6 +6808,45 @@ mod tests {
             base + Duration::from_millis(700)
         ));
         assert_eq!(guard, None);
+    }
+
+    #[tokio::test]
+    async fn a_slow_start_request_keeps_advancing_its_paint_clock() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let waiting_ticks = Arc::clone(&ticks);
+        let waiting_wake = Arc::clone(&wake);
+        let response = timeout(
+            Duration::from_secs(1),
+            await_with_ticks(
+                async move {
+                    while waiting_ticks.load(Ordering::SeqCst) < 3 {
+                        waiting_wake.notified().await;
+                    }
+                    "ready"
+                },
+                Duration::from_millis(2),
+                || {
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                    wake.notify_one();
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .expect("the paint clock did not advance")
+        .unwrap();
+
+        assert_eq!(response, "ready");
+        assert!(
+            ticks.load(Ordering::SeqCst) >= 3,
+            "the wait kept repainting before the reply"
+        );
     }
 
     /// A prompt sent before `thread/start` answers must not be dropped: it is held

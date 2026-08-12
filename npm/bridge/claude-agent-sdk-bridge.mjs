@@ -27,6 +27,8 @@ const sessionAliases = new Map();
 const pendingHostRequests = new Map();
 const modelCatalogs = new Map();
 const CLAUDE_MODEL_ORDER = ["fable", "opus", "sonnet", "haiku"];
+const OPUS_48_MODEL = "claude-opus-4-8";
+const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 let nextHostRequest = 1;
 
 class AsyncQueue {
@@ -138,8 +140,34 @@ function capabilityContextWindow(capabilities, ...names) {
 
 function modelCapabilities(models, model) {
   const value = stripClaudeModel(model);
-  return models.find((candidate) => candidate.value === value || candidate.resolvedModel === value)
+  const capabilities = models.find((candidate) =>
+    candidate.value === value || candidate.resolvedModel === value)
     || (!value ? models.find((candidate) => candidate.value === "default") : undefined);
+  return value === OPUS_48_MODEL
+    ? opus48Capabilities(models, capabilities)
+    : capabilities;
+}
+
+function opus48Capabilities(models, existing = {}) {
+  const opus = models.find((model) => model.value === "opus") || {};
+  const opusEfforts = Array.isArray(opus.supportedEffortLevels)
+    ? opus.supportedEffortLevels
+    : [];
+  const existingEfforts = Array.isArray(existing.supportedEffortLevels)
+    ? existing.supportedEffortLevels
+    : [];
+  const supportedEffortLevels = opusEfforts.length
+    ? opusEfforts
+    : existingEfforts.length ? existingEfforts : CLAUDE_EFFORT_LEVELS;
+  return {
+    ...opus,
+    ...existing,
+    value: OPUS_48_MODEL,
+    resolvedModel: OPUS_48_MODEL,
+    displayName: "Opus 4.8",
+    supportsEffort: true,
+    supportedEffortLevels,
+  };
 }
 
 function supportedEffort(model, requested) {
@@ -190,6 +218,26 @@ function catalogEntry(model, defaultResolvedModel) {
   };
 }
 
+function claudeCatalogEntries(models, defaultResolvedModel) {
+  const catalogModels = models.filter((model) => model.value && model.value !== "default");
+  const entries = catalogModels.map((model) => catalogEntry(model, defaultResolvedModel));
+  const existingIndex = entries.findIndex((entry) =>
+    stripClaudeModel(entry.model) === OPUS_48_MODEL
+      || stripClaudeModel(entry.id) === OPUS_48_MODEL
+      || entry.displayName === "Opus 4.8");
+  const existing = existingIndex >= 0 ? catalogModels[existingIndex] : {};
+  if (existingIndex >= 0) entries.splice(existingIndex, 1);
+  const opus48 = catalogEntry(opus48Capabilities(models, existing), defaultResolvedModel);
+  const opus5Index = entries.findIndex((entry) => entry.displayName === "Opus 5");
+  const opusIndex = opus5Index >= 0
+    ? opus5Index
+    : entries.findIndex((entry) => /\bopus\b/i.test(entry.displayName));
+  const fableIndex = entries.findIndex((entry) => /\bfable\b/i.test(entry.displayName));
+  const insertAfter = opusIndex >= 0 ? opusIndex : fableIndex;
+  entries.splice(insertAfter + 1, 0, opus48);
+  return entries;
+}
+
 async function loadModelCatalog(params) {
   const cacheKey = `${params.claudePath || "claude"}\n${params.cwd || process.cwd()}`;
   if (modelCatalogs.has(cacheKey)) return modelCatalogs.get(cacheKey);
@@ -223,9 +271,7 @@ async function loadModelCatalog(params) {
           - (rightOrder < 0 ? CLAUDE_MODEL_ORDER.length : rightOrder);
       });
       return {
-        data: models
-          .filter((model) => model.value && model.value !== "default")
-          .map((model) => catalogEntry(model, defaultResolvedModel)),
+        data: claudeCatalogEntries(models, defaultResolvedModel),
       };
     } finally {
       input.close();
@@ -2752,6 +2798,34 @@ async function runSelfTest() {
   ];
   if (windows.join(",") !== "1000000,200000,300000") {
     throw new Error(`Claude context window self-test failed: ${windows.join(",")}`);
+  }
+  const catalogModels = [
+    {
+      value: "opus",
+      resolvedModel: "claude-opus-5",
+      displayName: "Opus 5",
+      supportsEffort: true,
+      supportedEffortLevels: ["high", "max"],
+    },
+    { value: "sonnet", resolvedModel: "claude-sonnet-5", displayName: "Sonnet 5" },
+    {
+      value: "claude-opus-4-8",
+      resolvedModel: "claude-opus-4-8",
+      displayName: "Opus 4.8",
+      supportsEffort: false,
+      supportedEffortLevels: [],
+    },
+  ];
+  const catalog = claudeCatalogEntries(catalogModels, "claude-sonnet-5");
+  if (catalog[0]?.displayName !== "Opus 5"
+    || catalog[1]?.displayName !== "Opus 4.8"
+    || catalog[1]?.model !== "claude:claude-opus-4-8"
+    || catalog[1]?.supportedReasoningEfforts?.[1]?.reasoningEffort !== "max"
+    || supportedEffort(
+      modelCapabilities(catalogModels, "claude:claude-opus-4-8"),
+      "max",
+    ) !== "max") {
+    throw new Error(`Claude pinned model self-test failed: ${JSON.stringify(catalog)}`);
   }
   const notification = taskNotifications({
     origin: { kind: "task-notification" },
