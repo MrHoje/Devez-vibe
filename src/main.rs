@@ -38,7 +38,7 @@ use crossterm::event::{
 };
 use editor::Editor;
 use futures_util::StreamExt;
-use integrations::{McpServerInfo, PluginCatalog, PluginDetail, PluginInfo, PluginScope};
+use integrations::{McpServerInfo, PluginCatalog, PluginDetail};
 use paste::{BufferedText, BufferedTextTarget, ComposerInput, ComposerPasteBuffer, PasteBurst};
 use provider::{ProviderAuthKind, ProviderAuthRequest};
 use renderer::{
@@ -265,7 +265,7 @@ async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
     state.push_notice(
         BlockKind::Update,
         "Tip",
-        "/provider: Set Claude Codex provider\n/side-panel: Choose side panel size\nAlt + P: Cycle side panel size\n/vibemode: Set Vibe mode\n/Response: Set Response compression type\nShift + ↑↓ model · ←→ effort",
+        "/provider: Set Claude Codex provider\n/side-panel: Choose side panel size\n/vibemode: Set Vibe mode\n/Response: Set Response compression type\nShift + ↑↓ model · ←→ effort\nAlt + P: Cycle side panel size",
     );
     if fallback_to_claude {
         state.push_notice(
@@ -932,6 +932,174 @@ async fn choose_startup_session(
     result
 }
 
+enum ManagementUpdate {
+    Skill {
+        provider: SkillProvider,
+        name: String,
+        path: String,
+        source: Option<String>,
+        enabled: bool,
+        result: std::result::Result<Value, String>,
+    },
+    Plugin {
+        provider: SkillProvider,
+        id: String,
+        name: String,
+        enabled: bool,
+        result: std::result::Result<Value, String>,
+    },
+    Mcp {
+        provider: SkillProvider,
+        name: String,
+        enabled: bool,
+        result: std::result::Result<Value, String>,
+    },
+    McpReconnect {
+        provider: SkillProvider,
+        result: std::result::Result<Value, String>,
+    },
+    McpLogin {
+        name: String,
+        claude: bool,
+        result: std::result::Result<Value, String>,
+    },
+}
+
+fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
+    match update {
+        ManagementUpdate::Skill {
+            provider,
+            name,
+            path,
+            source,
+            enabled,
+            result,
+        } => match result {
+            Ok(response) => {
+                let effective = response
+                    .get("effectiveEnabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(enabled);
+                state.apply_skill_enabled(
+                    provider,
+                    &path,
+                    source.as_deref(),
+                    effective,
+                    Some(format!(
+                        "{name} · {}",
+                        if effective { "켜짐" } else { "꺼짐" }
+                    )),
+                );
+            }
+            Err(error) => {
+                let message = format!("{name} · 변경 실패: {error}");
+                if !state.apply_skill_enabled(
+                    provider,
+                    &path,
+                    source.as_deref(),
+                    !enabled,
+                    Some(message.clone()),
+                ) {
+                    state.push_notice(BlockKind::Error, "Skill 변경 실패", message);
+                }
+            }
+        },
+        ManagementUpdate::Plugin {
+            provider,
+            id,
+            name,
+            enabled,
+            result,
+        } => match result {
+            Ok(_) => {
+                state.apply_plugin_enabled(
+                    provider,
+                    &id,
+                    enabled,
+                    format!(
+                        "{name} · {}{}",
+                        if enabled { "켜짐" } else { "꺼짐" },
+                        if provider == SkillProvider::Claude {
+                            " · 새 대화부터 적용"
+                        } else {
+                            ""
+                        }
+                    ),
+                );
+            }
+            Err(error) => {
+                let message = format!("{name} · 변경 실패: {error}");
+                if !state.apply_plugin_enabled(provider, &id, !enabled, message.clone()) {
+                    state.push_notice(BlockKind::Error, "Plugin 변경 실패", message);
+                }
+            }
+        },
+        ManagementUpdate::Mcp {
+            provider,
+            name,
+            enabled,
+            result,
+        } => match result {
+            Ok(_) => {
+                state.apply_mcp_enabled(
+                    provider,
+                    &name,
+                    enabled,
+                    format!("{name} · {}", if enabled { "켜짐" } else { "꺼짐" }),
+                );
+            }
+            Err(error) => {
+                let message = format!("{name} · 변경 실패: {error}");
+                if !state.apply_mcp_enabled(provider, &name, !enabled, message.clone()) {
+                    state.push_notice(BlockKind::Error, "MCP 변경 실패", message);
+                }
+            }
+        },
+        ManagementUpdate::McpReconnect { provider, result } => match result {
+            Ok(response) => {
+                state.finish_mcp_reconnect(provider, &response, "재연결했습니다.".to_owned())
+            }
+            Err(error) => state.push_notice(BlockKind::Error, "MCP 재연결 실패", error),
+        },
+        ManagementUpdate::McpLogin {
+            name,
+            claude,
+            result,
+        } => match result {
+            Ok(response) => {
+                if let Some(url) = response.get("authorizationUrl").and_then(Value::as_str) {
+                    state.push_notice(
+                        BlockKind::System,
+                        "MCP login",
+                        format!("브라우저에서 인증을 완료하세요.\n{url}"),
+                    );
+                    if let Err(error) = open_url(url) {
+                        state.push_notice(
+                            BlockKind::Warning,
+                            "브라우저 열기 실패",
+                            error.to_string(),
+                        );
+                    }
+                } else if claude {
+                    state.apply_mcp_enabled(
+                        SkillProvider::Claude,
+                        &name,
+                        true,
+                        format!("{name} · 로그인 연결을 다시 시도했습니다."),
+                    );
+                } else {
+                    state.push_notice(
+                        BlockKind::Error,
+                        "MCP login 실패",
+                        "authorizationUrl이 없습니다.",
+                    );
+                }
+            }
+            Err(error) => state.push_notice(BlockKind::Error, "MCP login 실패", error),
+        },
+    }
+}
+
 async fn event_loop(
     server: &mut BackendServer,
     state: &mut AppState,
@@ -951,6 +1119,7 @@ async fn event_loop(
     let mut last_stream_reveal = Instant::now();
     let mut resize = ResizeTracker::new();
     let (workspace_tx, mut workspace_rx) = mpsc::channel(1);
+    let (management_tx, mut management_rx) = mpsc::unbounded_channel();
     let mut cost_restore_rx = None;
     let mut indexed_cwd = None;
     let mut integration_key = None;
@@ -972,7 +1141,7 @@ async fn event_loop(
                 .take_queued_prompt()
                 .map(|text| state.start_queued_prompt(text))
                 .unwrap_or(Action::None);
-            if execute_action(server, state, renderer, action).await? {
+            if execute_action(server, state, renderer, &management_tx, action).await? {
                 break;
             }
             draw(state, renderer)?;
@@ -986,6 +1155,7 @@ async fn event_loop(
                 server,
                 state,
                 renderer,
+                &management_tx,
                 Action::ResumeThread(deferred.target),
             )
             .await?;
@@ -1252,6 +1422,10 @@ async fn event_loop(
                 }
                 Action::None
             }
+            Some(update) = management_rx.recv() => {
+                apply_management_update(state, update);
+                Action::None
+            }
             _ = wait_for_paste_flush(paste_deadline), if paste_deadline.is_some() => {
                 Action::Tick(flush_composer_paste(state, &mut composer_paste, Instant::now()))
             }
@@ -1294,7 +1468,7 @@ async fn event_loop(
         // much slower than parsing and used to make long pastes crawl.
         let redraw = !matches!(&action, Action::Tick(false)) && !composer_paste.is_buffering();
         let returning_from_side = matches!(&action, Action::ReturnFromSide);
-        let should_quit = execute_action(server, state, renderer, action).await?;
+        let should_quit = execute_action(server, state, renderer, &management_tx, action).await?;
         if returning_from_side {
             side_exit_key_guard = Some(Instant::now() + SIDE_EXIT_KEY_SETTLE);
         }
@@ -1660,6 +1834,7 @@ async fn execute_action(
     server: &mut BackendServer,
     state: &mut AppState,
     renderer: &mut Renderer,
+    management_tx: &mpsc::UnboundedSender<ManagementUpdate>,
     action: Action,
 ) -> Result<bool> {
     match action {
@@ -2039,7 +2214,7 @@ async fn execute_action(
                 state.push_notice(BlockKind::Error, "압축 실패", error.to_string());
             }
         }
-        Action::OpenMcp(notice) => match list_mcp_servers(server, &state.thread_id).await {
+        Action::OpenMcp(notice) => match list_mcp_servers(server, state).await {
             Ok(response) => {
                 let model = state.selected_model_name().to_owned();
                 state.update_mcp_servers_for_model(&response, &model);
@@ -2051,33 +2226,84 @@ async fn execute_action(
                 state.push_notice(BlockKind::Error, "MCP 목록 실패", error.to_string());
             }
         },
-        Action::ReconnectMcp => {
-            // `config/mcpServer/reload` re-reads the config and restarts every
-            // server so the picker reflects the current connection state.
-            match server.request("config/mcpServer/reload", json!({})).await {
-                Ok(_) => {
-                    let notice = Some("재연결했습니다.".to_owned());
-                    match list_mcp_servers(server, &state.thread_id).await {
-                        Ok(response) => {
-                            let model = state.selected_model_name().to_owned();
-                            state.update_mcp_servers_for_model(&response, &model);
-                            state.open_mcp_picker(McpServerInfo::list_from_value(&response), notice)
-                        }
-                        Err(error) => {
-                            let model = state.selected_model_name().to_owned();
-                            state.note_mcp_query_error_for_model(error.to_string(), &model);
-                            state.push_notice(
-                                BlockKind::Warning,
-                                "재연결 후 조회 실패",
-                                error.to_string(),
-                            );
-                        }
+        Action::ReconnectMcp(name) => {
+            let provider = SkillProvider::from_model(state.selected_model_name());
+            let client = server.integration_client(provider.model_hint());
+            let thread_id = integration_mcp_thread_id(server, state);
+            let (Some(client), Some(thread_id)) = (client, thread_id) else {
+                state.push_notice(
+                    BlockKind::Error,
+                    "MCP 재연결 실패",
+                    "현재 provider의 MCP 세션이 아직 시작되지 않았습니다.",
+                );
+                return Ok(false);
+            };
+            let sender = management_tx.clone();
+            tokio::spawn(async move {
+                let reconnect = match provider {
+                    SkillProvider::Claude => {
+                        client
+                            .request(
+                                "mcp/reconnect",
+                                json!({ "sessionId": thread_id.clone(), "name": name }),
+                            )
+                            .await
                     }
+                    SkillProvider::Codex => {
+                        client.request("config/mcpServer/reload", json!({})).await
+                    }
+                };
+                let result = match reconnect {
+                    Ok(_) => client
+                        .request(
+                            "mcpServerStatus/list",
+                            json!({
+                                "threadId": thread_id,
+                                "detail": "toolsAndAuthOnly",
+                                "limit": 100
+                            }),
+                        )
+                        .await
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                };
+                let _ = sender.send(ManagementUpdate::McpReconnect { provider, result });
+            });
+        }
+        Action::SetMcpEnabled {
+            provider,
+            name,
+            enabled,
+        } => {
+            let Some(client) = server.integration_client(provider.model_hint()) else {
+                state.apply_mcp_enabled(
+                    provider,
+                    &name,
+                    !enabled,
+                    format!("{name} · 변경 실패: provider가 연결되지 않았습니다."),
+                );
+                return Ok(false);
+            };
+            let (method, params) = mcp_toggle_request(provider, &state.thread_id, &name, enabled);
+            let sender = management_tx.clone();
+            tokio::spawn(async move {
+                let mut result = client
+                    .request(method, params)
+                    .await
+                    .map_err(|error| error.to_string());
+                if provider == SkillProvider::Codex && result.is_ok() {
+                    result = client
+                        .request("config/mcpServer/reload", json!({}))
+                        .await
+                        .map_err(|error| error.to_string());
                 }
-                Err(error) => {
-                    state.push_notice(BlockKind::Error, "MCP 재연결 실패", error.to_string())
-                }
-            }
+                let _ = sender.send(ManagementUpdate::Mcp {
+                    provider,
+                    name,
+                    enabled,
+                    result,
+                });
+            });
         }
         Action::ConnectProvider => {
             state.open_provider_loading();
@@ -2200,43 +2426,43 @@ async fn execute_action(
             }
         }
         Action::McpLogin(name) => {
-            match server
-                .request(
+            let model = state.selected_model_name().to_owned();
+            let claude = claude::is_claude_model(&model);
+            let Some(client) = server.integration_client(&model) else {
+                state.push_notice(
+                    BlockKind::Error,
+                    "MCP login 실패",
+                    "현재 provider가 연결되지 않았습니다.",
+                );
+                return Ok(false);
+            };
+            let (method, params) = if claude {
+                (
+                    "mcp/login",
+                    json!({ "sessionId": state.thread_id, "name": name.clone() }),
+                )
+            } else {
+                (
                     "mcpServer/oauth/login",
                     json!({
-                        "name": name,
+                        "name": name.clone(),
                         "threadId": state.thread_id,
                         "timeoutSecs": 300
                     }),
                 )
-                .await
-            {
-                Ok(response) => {
-                    if let Some(url) = response.get("authorizationUrl").and_then(Value::as_str) {
-                        state.push_notice(
-                            BlockKind::System,
-                            "MCP login",
-                            format!("브라우저에서 인증을 완료하세요.\n{url}"),
-                        );
-                        if let Err(error) = open_url(url) {
-                            state.push_notice(
-                                BlockKind::Warning,
-                                "브라우저 열기 실패",
-                                error.to_string(),
-                            );
-                        }
-                    } else {
-                        state.push_notice(
-                            BlockKind::Error,
-                            "MCP login 실패",
-                            "authorizationUrl이 없습니다.",
-                        );
-                    }
-                }
-                Err(error) => {
-                    state.push_notice(BlockKind::Error, "MCP login 실패", error.to_string())
-                }
-            }
+            };
+            let sender = management_tx.clone();
+            tokio::spawn(async move {
+                let result = client
+                    .request(method, params)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(ManagementUpdate::McpLogin {
+                    name,
+                    claude,
+                    result,
+                });
+            });
         }
         Action::StartLogin(method) => {
             // The modal normally blocks input, so this only guards a stale login id.
@@ -2402,8 +2628,14 @@ async fn execute_action(
                     ),
                 ),
                 Some(plugin) => {
-                    if let Err(error) =
-                        write_plugin_enabled(server, state, &plugin.id, enabled).await
+                    if let Err(error) = write_plugin_enabled(
+                        server,
+                        state,
+                        &plugin.id,
+                        plugin.scope.as_deref(),
+                        enabled,
+                    )
+                    .await
                     {
                         state.push_notice(
                             BlockKind::Error,
@@ -2439,28 +2671,39 @@ async fn execute_action(
             }
         },
         Action::SetPluginEnabled { plugin, enabled } => {
-            match write_plugin_enabled(server, state, &plugin.id, enabled).await {
-                Ok(_) => {
-                    let _ = refresh_integrations(server, state, true).await;
-                    reopen_plugins(
-                        server,
-                        state,
-                        scope_of(&plugin),
-                        format!(
-                            "{} · {}{}",
-                            plugin.display_name,
-                            if enabled { "enabled" } else { "disabled" },
-                            if claude::is_claude_model(state.selected_model_name()) {
-                                " · 새 대화부터 적용"
-                            } else {
-                                ""
-                            }
-                        ),
-                    )
-                    .await;
+            let model = state.selected_model_name().to_owned();
+            let provider = SkillProvider::from_model(&model);
+            let (method, params) =
+                plugin_write_request(&model, &plugin.id, plugin.scope.as_deref(), enabled);
+            match server.integration_client(&model) {
+                Some(client) => {
+                    let sender = management_tx.clone();
+                    let id = plugin.id;
+                    let name = plugin.display_name;
+                    tokio::spawn(async move {
+                        let result = client
+                            .request(method, params)
+                            .await
+                            .map_err(|error| error.to_string());
+                        let _ = sender.send(ManagementUpdate::Plugin {
+                            provider,
+                            id,
+                            name,
+                            enabled,
+                            result,
+                        });
+                    });
                 }
-                Err(error) => {
-                    state.push_notice(BlockKind::Error, "플러그인 설정 실패", error.to_string())
+                None => {
+                    state.apply_plugin_enabled(
+                        provider,
+                        &plugin.id,
+                        !enabled,
+                        format!(
+                            "{} · 변경 실패: provider가 연결되지 않았습니다.",
+                            plugin.display_name
+                        ),
+                    );
                 }
             }
         }
@@ -2545,7 +2788,7 @@ async fn execute_action(
                 server.request("config/mcpServer/reload", json!({})).await
             };
             let mcp_response = if reconnect.is_ok() {
-                match list_mcp_servers(server, &state.thread_id).await {
+                match list_mcp_servers(server, state).await {
                     Ok(response) => Some(response),
                     Err(error) => {
                         let model = state.selected_model_name().to_owned();
@@ -2700,38 +2943,46 @@ async fn execute_action(
                             if enabled { "켜짐" } else { "꺼짐" }
                         )),
                     )
-                    .await;
+                    .await
                 }
-                Some(skill) => {
-                    match write_skill_enabled(server, &state.cwd, provider, &skill, enabled).await {
-                        Ok(response) => {
-                            let effective = response
-                                .get("effectiveEnabled")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(enabled);
-                            open_skills(
-                                server,
-                                state,
-                                provider,
-                                Some(format!(
-                                    "{} · {}",
-                                    skill.name,
-                                    if effective { "켜짐" } else { "꺼짐" }
-                                )),
-                            )
-                            .await;
-                        }
-                        Err(error) => {
-                            open_skills(
-                                server,
-                                state,
-                                provider,
-                                Some(format!("{} · 변경 실패: {error}", skill.name)),
-                            )
-                            .await;
-                        }
+                Some(skill) => match write_skill_enabled(
+                    server,
+                    &state.cwd,
+                    provider,
+                    &skill.path,
+                    skill.source.as_deref(),
+                    &skill.scope,
+                    enabled,
+                )
+                .await
+                {
+                    Ok(response) => {
+                        let effective = response
+                            .get("effectiveEnabled")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(enabled);
+                        open_skills(
+                            server,
+                            state,
+                            provider,
+                            Some(format!(
+                                "{} · {}",
+                                skill.name,
+                                if effective { "켜짐" } else { "꺼짐" }
+                            )),
+                        )
+                        .await;
                     }
-                }
+                    Err(error) => {
+                        open_skills(
+                            server,
+                            state,
+                            provider,
+                            Some(format!("{} · 변경 실패: {error}", skill.name)),
+                        )
+                        .await;
+                    }
+                },
                 None => {
                     open_skills(
                         server,
@@ -2744,6 +2995,63 @@ async fn execute_action(
             },
             Err(error) => state.push_notice(BlockKind::Error, "Skill 조회 실패", error.to_string()),
         },
+        Action::SetSkillEnabled {
+            provider,
+            name,
+            path,
+            source,
+            scope,
+            enabled,
+        } => {
+            let request = skill_write_request(
+                &state.cwd,
+                provider,
+                &path,
+                source.as_deref(),
+                &scope,
+                enabled,
+            );
+            let client = server.integration_client(provider.model_hint());
+            match (request, client) {
+                (Ok((method, params)), Some(client)) => {
+                    let sender = management_tx.clone();
+                    tokio::spawn(async move {
+                        let result = client
+                            .request(method, params)
+                            .await
+                            .map_err(|error| error.to_string());
+                        let _ = sender.send(ManagementUpdate::Skill {
+                            provider,
+                            name,
+                            path,
+                            source,
+                            enabled,
+                            result,
+                        });
+                    });
+                }
+                (Err(error), _) => {
+                    state.apply_skill_enabled(
+                        provider,
+                        &path,
+                        source.as_deref(),
+                        !enabled,
+                        Some(format!("{name} · 변경 실패: {error}")),
+                    );
+                }
+                (_, None) => {
+                    state.apply_skill_enabled(
+                        provider,
+                        &path,
+                        source.as_deref(),
+                        !enabled,
+                        Some(format!(
+                            "{name} · 변경 실패: provider가 연결되지 않았습니다."
+                        )),
+                    );
+                }
+            }
+        }
         Action::RefreshSkills => {
             let provider = SkillProvider::from_model(state.selected_model_name());
             match list_skills(server, &state.cwd, true, provider).await {
@@ -3661,9 +3969,12 @@ async fn list_plugins(server: &BackendServer, state: &AppState) -> Result<Value>
     .await
 }
 
-async fn list_mcp_servers(server: &BackendServer, thread_id: &str) -> Result<Value> {
+async fn list_mcp_servers(server: &BackendServer, state: &AppState) -> Result<Value> {
+    let thread_id = integration_mcp_thread_id(server, state)
+        .context("현재 provider의 MCP 세션이 아직 시작되지 않았습니다.")?;
     server
-        .request(
+        .integration_request(
+            state.selected_model_name(),
             "mcpServerStatus/list",
             json!({
                 "threadId": thread_id,
@@ -3701,20 +4012,31 @@ async fn write_plugin_enabled(
     server: &BackendServer,
     state: &AppState,
     plugin_id: &str,
+    scope: Option<&str>,
     enabled: bool,
 ) -> Result<Value> {
-    if claude::is_claude_model(state.selected_model_name()) {
-        return integration_request(
-            server,
-            state,
+    let (method, params) =
+        plugin_write_request(state.selected_model_name(), plugin_id, scope, enabled);
+    integration_request(server, state, method, params).await
+}
+
+fn plugin_write_request(
+    model: &str,
+    plugin_id: &str,
+    scope: Option<&str>,
+    enabled: bool,
+) -> (&'static str, Value) {
+    if claude::is_claude_model(model) {
+        return (
             "plugin/set-enabled",
-            json!({ "pluginId": plugin_id, "enabled": enabled }),
-        )
-        .await;
+            json!({
+                "pluginId": plugin_id,
+                "scope": scope.unwrap_or("user"),
+                "enabled": enabled
+            }),
+        );
     }
-    integration_request(
-        server,
-        state,
+    (
         "config/value/write",
         json!({
             "keyPath": format!("plugins.{plugin_id}"),
@@ -3722,32 +4044,30 @@ async fn write_plugin_enabled(
             "mergeStrategy": "upsert"
         }),
     )
-    .await
 }
 
-/// The list a plugin action should return to once the catalogue is refetched.
-fn scope_of(plugin: &PluginInfo) -> Option<PluginScope> {
-    Some(PluginScope::Marketplace(plugin.marketplace_name.clone()))
-}
-
-/// Refetches the catalogue and reopens the plugin picker where it was, so an
-/// action's result is visible in the list it was taken from.
-async fn reopen_plugins(
-    server: &BackendServer,
-    state: &mut AppState,
-    scope: Option<PluginScope>,
-    notice: String,
-) {
-    match list_plugins(server, state).await {
-        Ok(response) => {
-            let catalog = PluginCatalog::from_value(&response);
-            state.update_plugins(&response);
-            state.open_plugin_picker(catalog, scope, Some(notice));
-        }
-        Err(error) => state.push_notice(
-            BlockKind::Warning,
-            "플러그인 목록 새로고침 실패",
-            format!("{notice}\n{error}"),
+fn mcp_toggle_request(
+    provider: SkillProvider,
+    thread_id: &str,
+    name: &str,
+    enabled: bool,
+) -> (&'static str, Value) {
+    match provider {
+        SkillProvider::Claude => (
+            "mcp/toggle",
+            json!({
+                "sessionId": thread_id,
+                "name": name,
+                "enabled": enabled
+            }),
+        ),
+        SkillProvider::Codex => (
+            "config/value/write",
+            json!({
+                "keyPath": format!("mcp_servers.{name}.enabled"),
+                "value": enabled,
+                "mergeStrategy": "upsert"
+            }),
         ),
     }
 }
@@ -4101,6 +4421,7 @@ struct ResolvedSkill {
     name: String,
     path: String,
     enabled: bool,
+    scope: String,
     source: Option<String>,
 }
 
@@ -4108,20 +4429,34 @@ async fn write_skill_enabled(
     server: &BackendServer,
     cwd: &str,
     provider: SkillProvider,
-    skill: &ResolvedSkill,
+    path: &str,
+    source: Option<&str>,
+    scope: &str,
     enabled: bool,
 ) -> Result<Value> {
+    let (method, params) = skill_write_request(cwd, provider, path, source, scope, enabled)?;
+    server
+        .integration_request(provider.model_hint(), method, params)
+        .await
+}
+
+fn skill_write_request(
+    cwd: &str,
+    provider: SkillProvider,
+    path: &str,
+    source: Option<&str>,
+    scope: &str,
+    enabled: bool,
+) -> Result<(&'static str, Value)> {
     let (method, params) = match provider {
         SkillProvider::Claude => {
-            let plugin_id = skill
-                .source
-                .as_deref()
-                .context("Claude Skill의 원본 플러그인을 확인할 수 없습니다.")?;
+            let plugin_id = source.context("Claude Skill의 원본 플러그인을 확인할 수 없습니다.")?;
             (
                 "plugin/set-enabled",
                 json!({
                     "cwd": cwd,
                     "pluginId": plugin_id,
+                    "scope": scope,
                     "enabled": enabled
                 }),
             )
@@ -4130,14 +4465,12 @@ async fn write_skill_enabled(
             "skills/config/write",
             json!({
                 "name": null,
-                "path": skill.path,
+                "path": path,
                 "enabled": enabled
             }),
         ),
     };
-    server
-        .integration_request(provider.model_hint(), method, params)
-        .await
+    Ok((method, params))
 }
 
 fn resolve_skill(response: &Value, query: &str) -> Option<ResolvedSkill> {
@@ -4171,6 +4504,11 @@ fn resolve_skill(response: &Value, query: &str) -> Option<ResolvedSkill> {
                 .get("enabled")
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
+            scope: skill
+                .get("scope")
+                .and_then(Value::as_str)
+                .unwrap_or("user")
+                .to_owned(),
             source: skill
                 .get("pluginId")
                 .and_then(Value::as_str)
@@ -7375,6 +7713,38 @@ mod tests {
         let skill = resolve_skill(&response, "C:/two/SKILL.md").expect("path match");
         assert_eq!(skill.name, "review");
         assert!(!skill.enabled);
+    }
+
+    #[test]
+    fn management_writes_use_each_providers_native_protocol() {
+        let (method, params) =
+            mcp_toggle_request(SkillProvider::Claude, "claude-session", "browser", false);
+        assert_eq!(method, "mcp/toggle");
+        assert_eq!(params["sessionId"], "claude-session");
+        assert_eq!(params["enabled"], false);
+
+        let (method, params) = mcp_toggle_request(SkillProvider::Codex, "unused", "browser", true);
+        assert_eq!(method, "config/value/write");
+        assert_eq!(params["keyPath"], "mcp_servers.browser.enabled");
+        assert_eq!(params["value"], true);
+
+        let (method, params) =
+            plugin_write_request("claude:sonnet", "browser@catalog", Some("project"), true);
+        assert_eq!(method, "plugin/set-enabled");
+        assert_eq!(params["scope"], "project");
+
+        let (method, params) = skill_write_request(
+            "C:/repo",
+            SkillProvider::Codex,
+            "C:/skills/review/SKILL.md",
+            None,
+            "user",
+            false,
+        )
+        .expect("Codex skill request");
+        assert_eq!(method, "skills/config/write");
+        assert_eq!(params["path"], "C:/skills/review/SKILL.md");
+        assert_eq!(params["enabled"], false);
     }
 
     #[test]

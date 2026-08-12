@@ -8,18 +8,61 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::Value;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::editor::Editor;
 use crate::renderer::{
-    IntegrationItemState, IntegrationItemView, OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS,
+    IntegrationItemState, IntegrationItemView, OverlayLine, OverlayStyle, OverlayView,
     visible_window,
 };
 
-/// Rows a scrollable detail body lists at once, before it starts scrolling.
-const DETAIL_ROWS: usize = 12;
+/// Management lists use one stable viewport across MCP, plugins, skills, and
+/// marketplaces. Keeping every option on one row makes ten choices predictable.
+const MANAGEMENT_ROWS: usize = 10;
+const DETAIL_ROWS: usize = 10;
+const MANAGEMENT_NAME_COLUMNS: usize = 30;
 
 /// How far PageUp/PageDown jump, matching the resume picker.
 const PAGE: usize = 8;
+
+fn compact_column(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_owned();
+    }
+    let mut output = String::new();
+    let mut width = 0;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width >= max_width {
+            break;
+        }
+        output.push(ch);
+        width += ch_width;
+    }
+    output.push('…');
+    output
+}
+
+fn management_row(label: &str, detail: &str) -> String {
+    let label = compact_column(label, MANAGEMENT_NAME_COLUMNS);
+    let padding =
+        " ".repeat(MANAGEMENT_NAME_COLUMNS.saturating_sub(UnicodeWidthStr::width(label.as_str())));
+    let detail = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    if detail.is_empty() {
+        label
+    } else {
+        format!("{label}{padding}  {detail}")
+    }
+}
+
+fn pad_management_rows(lines: &mut Vec<OverlayLine>) {
+    lines.truncate(MANAGEMENT_ROWS);
+    lines.resize_with(MANAGEMENT_ROWS, || OverlayLine {
+        text: String::new(),
+        selected: false,
+        muted: true,
+    });
+}
 
 // ---------------------------------------------------------------------------
 // MCP servers
@@ -142,21 +185,6 @@ impl McpServerInfo {
         }
     }
 
-    fn glyph(&self) -> &'static str {
-        if self.failure.is_some()
-            || matches!(
-                self.connection_status.as_deref(),
-                Some("disabled" | "failed")
-            )
-        {
-            "✗"
-        } else if self.connection_status.as_deref() == Some("pending") || self.needs_login() {
-            "○"
-        } else {
-            "✓"
-        }
-    }
-
     fn label(&self) -> &str {
         self.title.as_deref().unwrap_or(&self.name)
     }
@@ -233,8 +261,12 @@ pub enum McpPickerResult {
     Cancel,
     /// Start the OAuth flow for this server.
     Login(String),
-    /// Re-read the MCP config and restart the servers.
-    Reconnect,
+    /// Reconnect the selected server. Codex maps this to its global reload.
+    Reconnect(String),
+    Toggle {
+        name: String,
+        enabled: bool,
+    },
 }
 
 pub struct McpPicker {
@@ -286,7 +318,12 @@ impl McpPicker {
                     McpPickerResult::None
                 }
             }
-            KeyCode::Char('r') if ctrl => McpPickerResult::Reconnect,
+            KeyCode::Char('r') if ctrl => self
+                .selected_server()
+                .map(|server| McpPickerResult::Reconnect(server.name.clone()))
+                .unwrap_or(McpPickerResult::None),
+            KeyCode::Char(' ') => self.toggle_selected(),
+            KeyCode::Char('l') => self.login_selected(),
             KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
                 McpPickerResult::None
@@ -345,15 +382,12 @@ impl McpPicker {
                 McpPickerResult::None
             }
             KeyCode::Char('c') if ctrl => McpPickerResult::Cancel,
-            KeyCode::Char('l') => match self.selected_server() {
-                Some(server) if server.needs_login() => McpPickerResult::Login(server.name.clone()),
-                Some(_) => {
-                    self.notice = Some("이 서버는 OAuth 로그인이 필요하지 않습니다.".to_owned());
-                    McpPickerResult::None
-                }
-                None => McpPickerResult::None,
-            },
-            KeyCode::Char('r') => McpPickerResult::Reconnect,
+            KeyCode::Char('l') => self.login_selected(),
+            KeyCode::Char(' ') => self.toggle_selected(),
+            KeyCode::Char('r') => self
+                .selected_server()
+                .map(|server| McpPickerResult::Reconnect(server.name.clone()))
+                .unwrap_or(McpPickerResult::None),
             KeyCode::Up => {
                 self.tool_offset = self.tool_offset.saturating_sub(1);
                 McpPickerResult::None
@@ -379,6 +413,60 @@ impl McpPicker {
             self.query.insert_str(text);
             self.selected = 0;
         }
+    }
+
+    fn login_selected(&mut self) -> McpPickerResult {
+        match self.selected_server() {
+            Some(server) if server.needs_login() => McpPickerResult::Login(server.name.clone()),
+            Some(_) => {
+                self.notice = Some("이 서버는 OAuth 로그인이 필요하지 않습니다.".to_owned());
+                McpPickerResult::None
+            }
+            None => McpPickerResult::None,
+        }
+    }
+
+    fn toggle_selected(&mut self) -> McpPickerResult {
+        let Some(server) = self.selected_server() else {
+            return McpPickerResult::None;
+        };
+        McpPickerResult::Toggle {
+            name: server.name.clone(),
+            enabled: server.connection_status.as_deref() == Some("disabled"),
+        }
+    }
+
+    pub fn begin_enabled(&mut self, name: &str, enabled: bool, notice: impl Into<String>) {
+        self.set_enabled_state(name, enabled, true, notice);
+    }
+
+    pub fn apply_enabled(&mut self, name: &str, enabled: bool, notice: impl Into<String>) {
+        self.set_enabled_state(name, enabled, false, notice);
+    }
+
+    fn set_enabled_state(
+        &mut self,
+        name: &str,
+        enabled: bool,
+        pending: bool,
+        notice: impl Into<String>,
+    ) {
+        if let Some(server) = self
+            .servers
+            .iter_mut()
+            .find(|server| server.name.eq_ignore_ascii_case(name))
+        {
+            server.connection_status = Some(
+                if enabled {
+                    if pending { "pending" } else { "connected" }
+                } else {
+                    "disabled"
+                }
+                .to_owned(),
+            );
+            server.failure = None;
+        }
+        self.notice = Some(notice.into());
     }
 
     /// Applies a failure report, so a server that never came up is still listed.
@@ -417,18 +505,23 @@ impl McpPicker {
             return self.detail_view();
         }
         let filtered = self.filtered();
-        let window = visible_window(Some(self.selected), filtered.len(), PICKER_ROWS);
+        let window = visible_window(Some(self.selected), filtered.len(), MANAGEMENT_ROWS);
         let start = window.start;
         let mut lines = filtered[window]
             .iter()
             .enumerate()
             .map(|(offset, server)| OverlayLine {
-                text: format!(
-                    "{} {}  ·  {}  ·  {} tools",
-                    server.glyph(),
-                    server.label(),
-                    server.status(),
-                    server.tools.len()
+                text: management_row(
+                    &format!(
+                        "[{}] {}",
+                        if server.connection_status.as_deref() == Some("disabled") {
+                            ' '
+                        } else {
+                            'x'
+                        },
+                        server.label()
+                    ),
+                    &format!("{} · 도구 {}개", server.status(), server.tools.len()),
                 ),
                 selected: start + offset == self.selected,
                 muted: false,
@@ -445,16 +538,17 @@ impl McpPicker {
                 muted: true,
             });
         }
+        pad_management_rows(&mut lines);
         OverlayView {
             closable: false,
-            title: format!("MCP servers · {}", self.servers.len()),
+            title: "MCP".to_owned(),
             lines,
             slider: None,
             hint: self
                 .notice
                 .clone()
-                .unwrap_or_else(|| "↑↓ 이동  Enter 상세  Ctrl+R 재연결  Esc 닫기".to_owned()),
-            style: OverlayStyle::Panel,
+                .unwrap_or_else(|| "이동 ↑↓  ·  전환 Space  ·  상세 Enter  ·  로그인 L  ·  재연결 Ctrl+R  ·  닫기 Esc".to_owned()),
+            style: OverlayStyle::CompactPanel,
             input: Some(&self.query),
             input_label: "",
             input_placeholder: "서버 또는 도구 이름으로 검색…",
@@ -543,20 +637,15 @@ impl McpPicker {
                     muted: true,
                 });
             }
-            if end < server.tools.len() {
-                lines.push(OverlayLine {
-                    text: format!("  … +{}", server.tools.len() - end),
-                    selected: false,
-                    muted: true,
-                });
-            }
         }
+
+        lines.truncate(DETAIL_ROWS);
 
         let hint = self.notice.clone().unwrap_or_else(|| {
             if server.needs_login() {
-                "L 로그인  R 재연결  ↑↓ 도구 스크롤  Esc 뒤로".to_owned()
+                "로그인 L  ·  전환 Space  ·  재연결 R  ·  도구 스크롤 ↑↓  ·  뒤로 Esc".to_owned()
             } else {
-                "R 재연결  ↑↓ 도구 스크롤  Esc 뒤로".to_owned()
+                "전환 Space  ·  재연결 R  ·  도구 스크롤 ↑↓  ·  뒤로 Esc".to_owned()
             }
         });
         OverlayView {
@@ -565,7 +654,7 @@ impl McpPicker {
             lines,
             slider: None,
             hint,
-            style: OverlayStyle::Panel,
+            style: OverlayStyle::CompactPanel,
             input: None,
             input_label: "",
             input_placeholder: "",
@@ -591,6 +680,7 @@ pub struct PluginInfo {
     pub description: Option<String>,
     pub installed: bool,
     pub enabled: bool,
+    pub scope: Option<String>,
     pub available: bool,
     pub toggle_allowed: bool,
     pub uninstall_allowed: bool,
@@ -648,6 +738,10 @@ impl PluginInfo {
                 .get("enabled")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            scope: plugin
+                .get("scope")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
             available: availability != Some("DISABLED_BY_ADMIN")
                 && install_policy != Some("NOT_AVAILABLE"),
             toggle_allowed: installed
@@ -692,18 +786,6 @@ impl PluginInfo {
             name: self.name.clone(),
             marketplace_path: self.marketplace_path.clone(),
             remote_marketplace_name: self.remote_marketplace_name.clone(),
-        }
-    }
-
-    fn glyph(&self) -> &'static str {
-        if !self.available {
-            "⊘"
-        } else if self.installed && self.enabled {
-            "✓"
-        } else if self.installed {
-            "○"
-        } else {
-            "·"
         }
     }
 
@@ -1160,6 +1242,10 @@ impl PluginPicker {
                 Some(plugin) => PluginPickerResult::OpenDetail(plugin.target()),
                 None => PluginPickerResult::None,
             },
+            KeyCode::Char(' ') => match self.selected_plugin().cloned() {
+                Some(plugin) => self.set_enabled(plugin.clone(), !plugin.enabled),
+                None => PluginPickerResult::None,
+            },
             KeyCode::Char('u') if ctrl => {
                 self.query.clear();
                 self.selected = 0;
@@ -1274,6 +1360,18 @@ impl PluginPicker {
         }
     }
 
+    pub fn apply_enabled(&mut self, id: &str, enabled: bool, notice: impl Into<String>) {
+        if let Some(plugin) = self
+            .catalog
+            .plugins
+            .iter_mut()
+            .find(|plugin| plugin.id == id)
+        {
+            plugin.enabled = enabled;
+        }
+        self.notice = Some(notice.into());
+    }
+
     pub fn handle_paste(&mut self, text: &str) {
         if matches!(self.view, PluginView::Plugins(_)) {
             self.query.insert_str(text);
@@ -1354,16 +1452,17 @@ impl PluginPicker {
 
     fn scopes_view(&self) -> OverlayView<'_> {
         let rows = self.scope_rows();
-        let window = visible_window(Some(self.selected), rows.len(), PICKER_ROWS);
+        let window = visible_window(Some(self.selected), rows.len(), MANAGEMENT_ROWS);
         let start = window.start;
         let mut lines = rows[window]
             .iter()
             .enumerate()
             .map(|(offset, row)| {
                 let text = match row {
-                    ScopeRow::Installed => {
-                        format!("Installed  ·  {}", self.catalog.installed().len())
-                    }
+                    ScopeRow::Installed => management_row(
+                        "Installed",
+                        &format!("플러그인 {}개", self.catalog.installed().len()),
+                    ),
                     ScopeRow::Marketplace(name) => {
                         let marketplace = self
                             .catalog
@@ -1371,16 +1470,17 @@ impl PluginPicker {
                             .iter()
                             .find(|candidate| &candidate.name == name);
                         match marketplace {
-                            Some(marketplace) => format!(
-                                "{}  ·  {} plugins  ·  {} installed",
-                                marketplace.display_name,
-                                marketplace.plugin_count,
-                                marketplace.installed_count
+                            Some(marketplace) => management_row(
+                                &marketplace.display_name,
+                                &format!(
+                                    "플러그인 {}개 · 설치 {}개",
+                                    marketplace.plugin_count, marketplace.installed_count
+                                ),
                             ),
                             None => name.clone(),
                         }
                     }
-                    ScopeRow::Marketplaces => "Manage marketplaces →".to_owned(),
+                    ScopeRow::Marketplaces => management_row("Marketplaces", "소스 추가·제거·갱신"),
                 };
                 OverlayLine {
                     text,
@@ -1389,13 +1489,7 @@ impl PluginPicker {
                 }
             })
             .collect::<Vec<_>>();
-        for error in &self.catalog.load_errors {
-            lines.push(OverlayLine {
-                text: format!("! {error}"),
-                selected: false,
-                muted: true,
-            });
-        }
+        pad_management_rows(&mut lines);
         OverlayView {
             closable: false,
             title: "Plugins".to_owned(),
@@ -1404,8 +1498,16 @@ impl PluginPicker {
             hint: self
                 .notice
                 .clone()
-                .unwrap_or_else(|| "↑↓ 이동  Enter 열기  M 마켓플레이스  Esc 닫기".to_owned()),
-            style: OverlayStyle::Panel,
+                .or_else(|| {
+                    self.catalog
+                        .load_errors
+                        .first()
+                        .map(|error| format!("오류 · {error}"))
+                })
+                .unwrap_or_else(|| {
+                    "이동 ↑↓  ·  열기 Enter  ·  마켓플레이스 M  ·  닫기 Esc".to_owned()
+                }),
+            style: OverlayStyle::CompactPanel,
             input: None,
             input_label: "",
             input_placeholder: "",
@@ -1414,22 +1516,26 @@ impl PluginPicker {
 
     fn plugins_view(&self, scope: &PluginScope) -> OverlayView<'_> {
         let plugins = self.visible_plugins();
-        let window = visible_window(Some(self.selected), plugins.len(), PICKER_ROWS);
+        let window = visible_window(Some(self.selected), plugins.len(), MANAGEMENT_ROWS);
         let start = window.start;
         let mut lines = plugins[window]
             .iter()
             .enumerate()
             .map(|(offset, plugin)| OverlayLine {
-                text: format!(
-                    "{} {}  ·  {}{}",
-                    plugin.glyph(),
-                    plugin.display_name,
-                    plugin.status(),
-                    plugin
-                        .description
-                        .as_deref()
-                        .map(|text| format!("\n{text}"))
-                        .unwrap_or_default()
+                text: management_row(
+                    &format!(
+                        "[{}] {}",
+                        if plugin.installed && plugin.enabled {
+                            'x'
+                        } else {
+                            ' '
+                        },
+                        plugin.display_name
+                    ),
+                    &match plugin.description.as_deref() {
+                        Some(description) => format!("{} · {description}", plugin.status()),
+                        None => plugin.status().to_owned(),
+                    },
                 ),
                 selected: start + offset == self.selected,
                 muted: false,
@@ -1446,6 +1552,7 @@ impl PluginPicker {
                 muted: true,
             });
         }
+        pad_management_rows(&mut lines);
         let title = match scope {
             PluginScope::Installed => format!("Installed plugins · {}", plugins.len()),
             PluginScope::Marketplace(name) => {
@@ -1468,8 +1575,8 @@ impl PluginPicker {
             hint: self
                 .notice
                 .clone()
-                .unwrap_or_else(|| "↑↓ 이동  Enter 상세  Esc 뒤로".to_owned()),
-            style: OverlayStyle::Panel,
+                .unwrap_or_else(|| "이동 ↑↓  ·  전환 Space  ·  상세 Enter  ·  뒤로 Esc".to_owned()),
+            style: OverlayStyle::CompactPanel,
             input: Some(&self.query),
             input_label: "",
             input_placeholder: "플러그인 검색…",
@@ -1610,13 +1717,7 @@ impl PluginPicker {
         let body = self.detail_body();
         let end = (offset + DETAIL_ROWS).min(body.len());
         let mut lines = body[offset.min(end)..end].to_vec();
-        if end < body.len() {
-            lines.push(OverlayLine {
-                text: format!("… +{}", body.len() - end),
-                selected: false,
-                muted: true,
-            });
-        }
+        lines.truncate(DETAIL_ROWS);
 
         // Only advertise the actions this plugin's policy actually allows.
         let mut actions = Vec::new();
@@ -1643,7 +1744,7 @@ impl PluginPicker {
             lines,
             slider: None,
             hint: self.notice.clone().unwrap_or_else(|| actions.join("  ")),
-            style: OverlayStyle::Panel,
+            style: OverlayStyle::CompactPanel,
             input: None,
             input_label: "",
             input_placeholder: "",
@@ -1836,25 +1937,23 @@ impl MarketplacePicker {
             };
         }
 
-        let window = visible_window(Some(self.selected), self.marketplaces.len(), PICKER_ROWS);
+        let window = visible_window(
+            Some(self.selected),
+            self.marketplaces.len(),
+            MANAGEMENT_ROWS,
+        );
         let start = window.start;
         let mut lines = self.marketplaces[window]
             .iter()
             .enumerate()
             .map(|(offset, marketplace)| OverlayLine {
-                text: format!(
-                    "{} {}  ·  {} plugins\n{}",
-                    if marketplace.is_configurable() {
-                        "•"
-                    } else {
-                        "☁"
-                    },
-                    marketplace.name,
-                    marketplace.plugin_count,
-                    marketplace
-                        .path
-                        .as_deref()
-                        .unwrap_or("remote catalog (Codex managed)")
+                text: management_row(
+                    &marketplace.name,
+                    &format!(
+                        "플러그인 {}개 · {}",
+                        marketplace.plugin_count,
+                        marketplace.path.as_deref().unwrap_or("Codex 원격 카탈로그")
+                    ),
                 ),
                 selected: start + offset == self.selected,
                 muted: false,
@@ -1867,6 +1966,7 @@ impl MarketplacePicker {
                 muted: true,
             });
         }
+        pad_management_rows(&mut lines);
         OverlayView {
             closable: false,
             title: format!("Marketplaces · {}", self.marketplaces.len()),
@@ -1875,7 +1975,7 @@ impl MarketplacePicker {
             hint: self.notice.clone().unwrap_or_else(|| {
                 "A 추가  X 제거  U 모든 Git 마켓플레이스 갱신  Esc 뒤로".to_owned()
             }),
-            style: OverlayStyle::Panel,
+            style: OverlayStyle::CompactPanel,
             input: None,
             input_label: "",
             input_placeholder: "",
@@ -1986,6 +2086,69 @@ mod tests {
     }
 
     #[test]
+    fn management_lists_keep_ten_single_line_rows_with_details_on_the_right() {
+        let servers = (1..=12)
+            .map(|index| McpServerInfo::probe(&format!("server-{index:02}"), "unsupported", index))
+            .collect();
+        let mcp_picker = McpPicker::new(servers);
+        let mcp = mcp_picker.overlay_view();
+        assert_eq!(mcp.lines.len(), MANAGEMENT_ROWS);
+        assert!(matches!(mcp.style, OverlayStyle::CompactPanel));
+        assert!(mcp.lines[0].text.contains("도구 1개"));
+        assert!(mcp.lines.iter().all(|line| !line.text.contains('\n')));
+
+        let plugin_picker = PluginPicker::new(
+            PluginCatalog::from_value(&plugin_response()),
+            Some(PluginScope::Marketplace("openai-bundled".to_owned())),
+        );
+        let plugins = plugin_picker.overlay_view();
+        assert_eq!(plugins.lines.len(), MANAGEMENT_ROWS);
+        assert!(matches!(plugins.style, OverlayStyle::CompactPanel));
+        assert!(plugins.lines.iter().all(|line| !line.text.contains('\n')));
+
+        let catalog = PluginCatalog::from_value(&plugin_response());
+        let marketplace_picker = MarketplacePicker::new(catalog.marketplaces);
+        let marketplaces = marketplace_picker.overlay_view();
+        assert_eq!(marketplaces.lines.len(), MANAGEMENT_ROWS);
+        assert!(matches!(marketplaces.style, OverlayStyle::CompactPanel));
+        assert!(
+            marketplaces
+                .lines
+                .iter()
+                .all(|line| !line.text.contains('\n'))
+        );
+    }
+
+    #[test]
+    fn list_toggles_return_immediately_and_update_the_local_checkbox() {
+        let mut mcp = McpPicker::new(vec![McpServerInfo::probe("browser", "unsupported", 2)]);
+        assert!(matches!(
+            mcp.handle_key(press(KeyCode::Char(' '))),
+            McpPickerResult::Toggle {
+                ref name,
+                enabled: false
+            } if name == "browser"
+        ));
+        mcp.apply_enabled("browser", false, "저장 중");
+        assert!(mcp.overlay_view().lines[0].text.starts_with("[ ] browser"));
+
+        let mut plugins = PluginPicker::new(
+            PluginCatalog::from_value(&plugin_response()),
+            Some(PluginScope::Marketplace("openai-bundled".to_owned())),
+        );
+        assert!(matches!(
+            plugins.handle_key(press(KeyCode::Char(' '))),
+            PluginPickerResult::SetEnabled { enabled: false, .. }
+        ));
+        plugins.apply_enabled("browser@openai-bundled", false, "저장 중");
+        assert!(
+            plugins.overlay_view().lines[0]
+                .text
+                .starts_with("[ ] Browser")
+        );
+    }
+
+    #[test]
     fn claude_mcp_states_keep_live_connection_meaning() {
         let servers = McpServerInfo::list_from_value(&json!({
             "data": [
@@ -2072,12 +2235,12 @@ mod tests {
         let mut picker = McpPicker::new(McpServerInfo::list_from_value(&mcp_response()));
         assert!(matches!(
             picker.handle_key(ctrl(KeyCode::Char('r'))),
-            McpPickerResult::Reconnect
+            McpPickerResult::Reconnect(ref name) if name == "chrome-devtools"
         ));
         picker.handle_key(press(KeyCode::Enter));
         assert!(matches!(
             picker.handle_key(press(KeyCode::Char('r'))),
-            McpPickerResult::Reconnect
+            McpPickerResult::Reconnect(ref name) if name == "chrome-devtools"
         ));
     }
 
@@ -2109,7 +2272,7 @@ mod tests {
         let mut picker = McpPicker::new(McpServerInfo::list_from_value(&mcp_response()));
         picker.apply_failure("github", Some("spawn failed".to_owned()));
         assert_eq!(picker.filtered()[1].status(), "failed");
-        assert_eq!(picker.filtered()[1].glyph(), "✗");
+        assert_eq!(picker.filtered()[1].status(), "failed");
     }
 
     #[test]

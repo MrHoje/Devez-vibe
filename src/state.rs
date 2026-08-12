@@ -12,6 +12,7 @@ use crossterm::{
     terminal,
 };
 use serde_json::{Map, Value, json};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     completion::{
@@ -1301,7 +1302,12 @@ pub enum Action {
     OpenMcp(Option<String>),
     McpLogin(String),
     /// Re-read the MCP configuration and restart the servers.
-    ReconnectMcp,
+    ReconnectMcp(Option<String>),
+    SetMcpEnabled {
+        provider: SkillProvider,
+        name: String,
+        enabled: bool,
+    },
     ConnectProvider,
     SubmitProviderAuth(Box<ProviderAuthRequest>),
     CompleteProviderOAuth {
@@ -1356,6 +1362,15 @@ pub enum Action {
     SetSkill {
         provider: SkillProvider,
         name: String,
+        enabled: bool,
+    },
+    /// Toggle the exact picker row without listing and resolving it again.
+    SetSkillEnabled {
+        provider: SkillProvider,
+        name: String,
+        path: String,
+        source: Option<String>,
+        scope: String,
         enabled: bool,
     },
     RefreshSkills,
@@ -2821,6 +2836,51 @@ fn parse_skill_errors(response: &Value) -> Vec<String> {
         .collect()
 }
 
+fn compact_skill_column(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_owned();
+    }
+    if max_width <= 1 {
+        return "…".to_owned();
+    }
+    let mut output = String::new();
+    let mut width = 0;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width >= max_width {
+            break;
+        }
+        output.push(ch);
+        width += ch_width;
+    }
+    output.push('…');
+    output
+}
+
+fn skill_picker_row(skill: &SkillBinding, name_width: usize) -> String {
+    let label = compact_skill_column(
+        &format!("[{}] {}", if skill.enabled { 'x' } else { ' ' }, skill.name),
+        name_width,
+    );
+    let padding = " ".repeat(name_width.saturating_sub(UnicodeWidthStr::width(label.as_str())));
+    let mut description = skill
+        .description
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if let Some(source) = skill.source.as_deref() {
+        if !description.is_empty() {
+            description.push_str(" · ");
+        }
+        description.push_str(&format!("{source} plugin 전체 전환"));
+    }
+    if description.is_empty() {
+        label
+    } else {
+        format!("{label}{padding}  {description}")
+    }
+}
+
 fn parse_plugin_mentions(response: &Value) -> Vec<MentionBinding> {
     let mut mentions = Vec::new();
     for marketplace in response
@@ -3050,6 +3110,8 @@ fn visible_resume_picker_rows() -> usize {
 /// Rows the `Apply to` step prints before its choices: the pick it is confirming
 /// and the blank under it.
 const MODEL_SCOPE_HEADER_ROWS: usize = 2;
+const SKILLS_PICKER_ROWS: usize = 10;
+const SKILL_NAME_MAX_COLUMNS: usize = 32;
 
 /// Whether a panel wears the `✕` that shuts it. The user opened these three and
 /// the session list themselves, so they may drop them; everything else on this
@@ -4398,6 +4460,50 @@ impl AppState {
         }
     }
 
+    pub fn apply_skill_enabled(
+        &mut self,
+        provider: SkillProvider,
+        path: &str,
+        source: Option<&str>,
+        enabled: bool,
+        status: Option<String>,
+    ) -> bool {
+        let mut applied = false;
+        let matches = |skill: &SkillBinding| {
+            if provider == SkillProvider::Claude && source.is_some() {
+                skill.source.as_deref() == source
+            } else {
+                skill.path == path
+            }
+        };
+        if SkillProvider::from_model(self.selected_model_name()) == provider {
+            for skill in &mut self.skills {
+                if matches(skill) {
+                    skill.enabled = enabled;
+                    applied = true;
+                }
+            }
+            self.rebuild_completion_catalog();
+        }
+        if let Some(PendingInteraction::SkillsPicker {
+            provider: open_provider,
+            skills,
+            notice,
+            ..
+        }) = self.pending.as_mut()
+            && *open_provider == provider
+        {
+            for skill in skills {
+                if matches(skill) {
+                    skill.enabled = enabled;
+                    applied = true;
+                }
+            }
+            *notice = status;
+        }
+        applied
+    }
+
     pub fn open_skills_picker(
         &mut self,
         provider: SkillProvider,
@@ -5563,6 +5669,36 @@ impl AppState {
         self.pending = Some(PendingInteraction::McpPicker(picker));
     }
 
+    pub fn apply_mcp_enabled(
+        &mut self,
+        provider: SkillProvider,
+        name: &str,
+        enabled: bool,
+        notice: impl Into<String>,
+    ) -> bool {
+        if SkillProvider::from_model(self.selected_model_name()) == provider
+            && let Some(PendingInteraction::McpPicker(picker)) = self.pending.as_mut()
+        {
+            picker.apply_enabled(name, enabled, notice);
+            return true;
+        }
+        false
+    }
+
+    pub fn finish_mcp_reconnect(
+        &mut self,
+        provider: SkillProvider,
+        response: &Value,
+        notice: String,
+    ) {
+        self.update_mcp_servers_for_model(response, provider.model_hint());
+        if SkillProvider::from_model(self.selected_model_name()) == provider
+            && matches!(self.pending, Some(PendingInteraction::McpPicker(_)))
+        {
+            self.open_mcp_picker(McpServerInfo::list_from_value(response), Some(notice));
+        }
+    }
+
     pub fn open_provider_picker(&mut self, catalog: &Value) {
         self.pending = Some(PendingInteraction::ProviderPicker(
             ProviderPicker::from_value(catalog),
@@ -5626,6 +5762,22 @@ impl AppState {
             picker = picker.with_notice(notice);
         }
         self.pending = Some(PendingInteraction::PluginPicker(picker));
+    }
+
+    pub fn apply_plugin_enabled(
+        &mut self,
+        provider: SkillProvider,
+        id: &str,
+        enabled: bool,
+        notice: impl Into<String>,
+    ) -> bool {
+        if SkillProvider::from_model(self.selected_model_name()) == provider
+            && let Some(PendingInteraction::PluginPicker(picker)) = self.pending.as_mut()
+        {
+            picker.apply_enabled(id, enabled, notice);
+            return true;
+        }
+        false
     }
 
     pub fn open_plugin_detail(
@@ -7480,7 +7632,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/provider [claude|codex]  Claude·Codex provider 전환과 연결 사용/미사용\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n/permissions  현재 provider 권한 규칙 관리\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n/mcp [reconnect|login NAME]  MCP 서버 탐색과 재연결\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n{login_help}\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
+                    format!("/provider [claude|codex]  Claude·Codex provider 전환과 연결 사용/미사용\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n/permissions  현재 provider 권한 규칙 관리\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n/mcp [reconnect [NAME]|login NAME]  MCP 서버 탐색과 관리\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n{login_help}\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
                 ));
                 Action::None
             }
@@ -7706,13 +7858,16 @@ impl AppState {
                 Action::McpLogin(parts[2..].join(" "))
             }
             "/mcp" if parts.len() == 2 && parts[1].eq_ignore_ascii_case("reconnect") => {
-                Action::ReconnectMcp
+                Action::ReconnectMcp(None)
+            }
+            "/mcp" if parts.len() >= 3 && parts[1].eq_ignore_ascii_case("reconnect") => {
+                Action::ReconnectMcp(Some(parts[2..].join(" ")))
             }
             "/mcp" => {
                 self.committed.push(Block::new(
                     BlockKind::Error,
                     "Usage",
-                    "/mcp, /mcp reconnect 또는 /mcp login SERVER",
+                    "/mcp, /mcp reconnect [SERVER] 또는 /mcp login SERVER",
                 ));
                 Action::None
             }
@@ -8570,7 +8725,7 @@ impl AppState {
                 notice,
             } => {
                 match key.code {
-                    KeyCode::Esc | KeyCode::Enter => return Action::None,
+                    KeyCode::Esc => return Action::None,
                     KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
                         return Action::OpenSkills {
                             provider: provider.other(),
@@ -8589,12 +8744,30 @@ impl AppState {
                     KeyCode::Char('n') if ctrl => {
                         selected = (selected + 1).min(skills.len().saturating_sub(1));
                     }
-                    KeyCode::Char(' ') => {
-                        if let Some(skill) = skills.get(selected) {
-                            return Action::SetSkill {
+                    KeyCode::Char(' ') | KeyCode::Enter => {
+                        if let Some(skill) = skills.get(selected).cloned() {
+                            let enabled = !skill.enabled;
+                            self.pending = Some(PendingInteraction::SkillsPicker {
                                 provider,
-                                name: skill.path.clone(),
-                                enabled: !skill.enabled,
+                                selected,
+                                skills,
+                                errors,
+                                notice,
+                            });
+                            self.apply_skill_enabled(
+                                provider,
+                                &skill.path,
+                                skill.source.as_deref(),
+                                enabled,
+                                Some(format!("{} · 저장 중", skill.name)),
+                            );
+                            return Action::SetSkillEnabled {
+                                provider,
+                                name: skill.name,
+                                path: skill.path,
+                                source: skill.source,
+                                scope: skill.scope,
+                                enabled,
                             };
                         }
                     }
@@ -8644,8 +8817,24 @@ impl AppState {
                     Action::None
                 }
                 McpPickerResult::Cancel => Action::None,
-                McpPickerResult::Login(name) => Action::McpLogin(name),
-                McpPickerResult::Reconnect => Action::ReconnectMcp,
+                McpPickerResult::Login(name) => {
+                    self.pending = Some(PendingInteraction::McpPicker(picker));
+                    Action::McpLogin(name)
+                }
+                McpPickerResult::Reconnect(name) => {
+                    self.pending = Some(PendingInteraction::McpPicker(picker));
+                    Action::ReconnectMcp(Some(name))
+                }
+                McpPickerResult::Toggle { name, enabled } => {
+                    let provider = SkillProvider::from_model(self.selected_model_name());
+                    picker.begin_enabled(&name, enabled, format!("{name} · 저장 중"));
+                    self.pending = Some(PendingInteraction::McpPicker(picker));
+                    Action::SetMcpEnabled {
+                        provider,
+                        name,
+                        enabled,
+                    }
+                }
             },
             PendingInteraction::PluginPicker(mut picker) => {
                 let result = picker.handle_key(key);
@@ -8665,6 +8854,10 @@ impl AppState {
                     PluginPickerResult::Install(plugin) => Action::ConfirmPluginInstall(plugin),
                     PluginPickerResult::Uninstall(plugin) => Action::ConfirmPluginUninstall(plugin),
                     PluginPickerResult::SetEnabled { plugin, enabled } => {
+                        let id = plugin.id.clone();
+                        let label = plugin.display_name.clone();
+                        picker.apply_enabled(&id, enabled, format!("{label} · 저장 중"));
+                        self.pending = Some(PendingInteraction::PluginPicker(picker));
                         Action::SetPluginEnabled { plugin, enabled }
                     }
                     PluginPickerResult::OpenMarketplaces => Action::OpenMarketplaces(None),
@@ -9615,88 +9808,52 @@ impl AppState {
                 errors,
                 notice,
             } => {
-                let window = visible_window(Some(*selected), skills.len(), PICKER_ROWS);
-                let mut lines = Vec::new();
-                if let Some(notice) = notice.as_deref() {
-                    lines.push(OverlayLine {
-                        text: format!("✓ {notice}"),
-                        selected: false,
-                        muted: true,
-                    });
-                }
-                lines.extend(errors.iter().map(|error| OverlayLine {
-                    text: format!("▲ {error}"),
-                    selected: false,
-                    muted: true,
-                }));
-                let prefix_rows = lines.len();
-                if prefix_rows > 0 {
-                    lines.push(OverlayLine {
-                        text: String::new(),
-                        selected: false,
-                        muted: true,
-                    });
-                }
-                lines.extend(skills[window.clone()].iter().enumerate().map(
-                    |(offset, skill)| {
-                        let index = window.start + offset;
-                        let source = skill.source.as_deref().map(|source| {
-                            format!(" · plugin {source} 전체")
-                        });
-                        let detail = if skill.description.is_empty() {
-                            source.unwrap_or_default()
-                        } else {
-                            format!("{}{}", skill.description, source.unwrap_or_default())
-                        };
-                        OverlayLine {
-                            text: if detail.is_empty() {
-                                format!(
-                                    "{} ${}  ·  {}",
-                                    if skill.enabled { '☑' } else { '☐' },
-                                    skill.name,
-                                    skill.scope
-                                )
-                            } else {
-                                format!(
-                                    "{} ${}  ·  {}\n{}",
-                                    if skill.enabled { '☑' } else { '☐' },
-                                    skill.name,
-                                    skill.scope,
-                                    detail
-                                )
-                            },
-                            selected: index == *selected,
-                            muted: false,
-                        }
-                    },
-                ));
+                let window = visible_window(Some(*selected), skills.len(), SKILLS_PICKER_ROWS);
+                let mut lines = skills[window.clone()]
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, skill)| OverlayLine {
+                        text: skill_picker_row(skill, SKILL_NAME_MAX_COLUMNS),
+                        selected: window.start + offset == *selected,
+                        muted: false,
+                    })
+                    .collect::<Vec<_>>();
                 if skills.is_empty() {
                     lines.push(OverlayLine {
-                        text: "설치된 Skill이 없습니다.".to_owned(),
+                        text: errors
+                            .first()
+                            .map(|error| format!("오류 · {error}"))
+                            .unwrap_or_else(|| "설치된 Skill이 없습니다.".to_owned()),
                         selected: false,
                         muted: true,
                     });
                 }
-                Some(OverlayView {
-                    closable: true,
-                    title: format!(
-                        "Skills · {}  {}",
+                lines.resize_with(SKILLS_PICKER_ROWS, || OverlayLine {
+                    text: String::new(),
+                    selected: false,
+                    muted: true,
+                });
+                let hint = if let Some(notice) = notice.as_deref() {
+                    format!("상태 · {notice}  ·  이동 ↑↓  ·  전환 Space/Enter  ·  닫기 Esc")
+                } else if !errors.is_empty() {
+                    format!("오류 {}개  ·  이동 ↑↓  ·  전환 Space/Enter  ·  닫기 Esc", errors.len())
+                } else {
+                    format!(
+                        "제공자 {} ←→  ·  이동 ↑↓  ·  전환 Space/Enter  ·  닫기 Esc",
                         if *provider == SkillProvider::Claude {
-                            "[Claude]"
-                        } else {
                             "Claude"
-                        },
-                        if *provider == SkillProvider::Codex {
-                            "[Codex]"
                         } else {
                             "Codex"
                         }
-                    ),
+                    )
+                };
+                Some(OverlayView {
+                    closable: true,
+                    title: "Skills".to_owned(),
                     lines,
                     slider: None,
-                    hint: "←→ provider  ·  ↑↓ navigate  ·  Space toggle  ·  Enter/Esc close"
-                        .to_owned(),
-                    style: OverlayStyle::Picker,
+                    hint,
+                    style: OverlayStyle::CompactPanel,
                     input: None,
                     input_label: "",
                     input_placeholder: "",
@@ -11017,18 +11174,38 @@ impl AppState {
                 errors,
                 notice,
             }) => {
-                let prefix_rows = errors.len() + usize::from(notice.is_some());
-                let prefix_rows = prefix_rows + usize::from(prefix_rows > 0);
-                let window = visible_window(Some(selected), skills.len(), PICKER_ROWS);
-                let clicked = row
-                    .checked_sub(prefix_rows)
-                    .and_then(|row| window.start.checked_add(row));
-                match clicked.and_then(|index| skills.get(index)) {
-                    Some(skill) => Action::SetSkill {
-                        provider,
-                        name: skill.path.clone(),
-                        enabled: !skill.enabled,
-                    },
+                let window = visible_window(Some(selected), skills.len(), SKILLS_PICKER_ROWS);
+                let clicked = window.start.checked_add(row);
+                let skill = clicked
+                    .filter(|index| *index < window.end)
+                    .and_then(|index| skills.get(index))
+                    .cloned();
+                match skill {
+                    Some(skill) => {
+                        let enabled = !skill.enabled;
+                        self.pending = Some(PendingInteraction::SkillsPicker {
+                            provider,
+                            selected,
+                            skills,
+                            errors,
+                            notice,
+                        });
+                        self.apply_skill_enabled(
+                            provider,
+                            &skill.path,
+                            skill.source.as_deref(),
+                            enabled,
+                            Some(format!("{} · 저장 중", skill.name)),
+                        );
+                        Action::SetSkillEnabled {
+                            provider,
+                            name: skill.name,
+                            path: skill.path,
+                            source: skill.source,
+                            scope: skill.scope,
+                            enabled,
+                        }
+                    }
                     None => {
                         self.pending = Some(PendingInteraction::SkillsPicker {
                             provider,
@@ -16589,21 +16766,39 @@ mod tests {
         state.open_skills_picker(SkillProvider::Claude, &response, None);
 
         let overlay = state.overlay_view().expect("skills picker");
-        assert_eq!(overlay.title, "Skills · [Claude]  Codex");
-        assert!(overlay.lines[0].text.starts_with("☑ $browser"));
+        assert_eq!(overlay.title, "Skills");
+        assert_eq!(overlay.lines.len(), 10);
+        assert!(overlay.lines[0].text.starts_with("[x] browser"));
+        assert!(overlay.lines[0].text.contains("Browser automation"));
         assert!(
             overlay.lines[0]
                 .text
-                .contains("plugin browser@official 전체")
+                .contains("browser@official plugin 전체 전환")
         );
+        assert!(overlay.lines.iter().all(|line| !line.text.contains('\n')));
 
         assert!(matches!(
             state.handle_key(KeyEvent::from(KeyCode::Char(' '))),
-            Action::SetSkill {
+            Action::SetSkillEnabled {
                 provider: SkillProvider::Claude,
-                ref name,
+                ref path,
+                ref scope,
                 enabled: false,
-            } if name.ends_with("browser/SKILL.md")
+                ..
+            } if path.ends_with("browser/SKILL.md") && scope == "user"
+        ));
+        let overlay = state.overlay_view().expect("optimistic skills picker");
+        assert!(overlay.lines[0].text.starts_with("[ ] browser"));
+        assert!(overlay.hint.contains("저장 중"));
+
+        state.open_skills_picker(SkillProvider::Claude, &response, None);
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::SetSkillEnabled {
+                provider: SkillProvider::Claude,
+                enabled: false,
+                ..
+            }
         ));
 
         state.open_skills_picker(SkillProvider::Claude, &response, None);
@@ -16617,7 +16812,7 @@ mod tests {
     }
 
     #[test]
-    fn clicking_a_skill_row_skips_notice_rows_and_toggles_it() {
+    fn clicking_a_skill_row_toggles_it_even_when_the_title_has_a_notice() {
         let response = json!({
             "data": [{
                 "skills": [{
@@ -16636,13 +16831,41 @@ mod tests {
         );
 
         assert!(matches!(
-            state.click_overlay_row(2),
-            Action::SetSkill {
+            state.click_overlay_row(0),
+            Action::SetSkillEnabled {
                 provider: SkillProvider::Codex,
-                ref name,
+                ref path,
                 enabled: true,
-            } if name == "C:/skills/review/SKILL.md"
+                ..
+            } if path == "C:/skills/review/SKILL.md"
         ));
+    }
+
+    #[test]
+    fn skills_picker_keeps_ten_rows_and_scrolls_the_selection() {
+        let skills = (1..=12)
+            .map(|index| {
+                json!({
+                    "name": format!("skill-{index:02}"),
+                    "path": format!("C:/skills/skill-{index:02}/SKILL.md"),
+                    "description": format!("Description {index}"),
+                    "enabled": true
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = json!({ "data": [{ "skills": skills }] });
+        let mut state = test_state();
+        state.open_skills_picker(SkillProvider::Codex, &response, None);
+
+        for _ in 0..10 {
+            state.handle_key(KeyEvent::from(KeyCode::Down));
+        }
+
+        let overlay = state.overlay_view().expect("skills picker");
+        assert_eq!(overlay.lines.len(), 10);
+        assert!(overlay.lines[0].text.starts_with("[x] skill-03"));
+        assert!(overlay.lines[8].text.starts_with("[x] skill-11"));
+        assert!(overlay.lines[8].selected);
     }
 
     #[test]
@@ -19733,6 +19956,34 @@ mod tests {
         assert_eq!(state.selected_model_name(), "claude:sonnet");
     }
 
+    #[test]
+    fn late_mcp_toggle_results_do_not_modify_another_provider_picker() {
+        let mut state = test_state();
+        state.open_mcp_picker(
+            vec![McpServerInfo::probe("browser", "unsupported", 2)],
+            None,
+        );
+
+        assert!(!state.apply_mcp_enabled(
+            SkillProvider::Claude,
+            "browser",
+            false,
+            "late Claude result",
+        ));
+        assert!(
+            state.overlay_view().expect("Codex MCP picker").lines[0]
+                .text
+                .starts_with("[x]")
+        );
+
+        assert!(state.apply_mcp_enabled(SkillProvider::Codex, "browser", false, "saved",));
+        assert!(
+            state.overlay_view().expect("Codex MCP picker").lines[0]
+                .text
+                .starts_with("[ ]")
+        );
+    }
+
     /// The company-PC case: Codex is switched off, so nothing in the picker,
     /// the command, or a later launch dials the app-server.
     #[test]
@@ -19966,7 +20217,11 @@ mod tests {
         ));
         assert!(matches!(
             state.run_slash_command("/mcp reconnect"),
-            Action::ReconnectMcp
+            Action::ReconnectMcp(None)
+        ));
+        assert!(matches!(
+            state.run_slash_command("/mcp reconnect github"),
+            Action::ReconnectMcp(Some(ref name)) if name == "github"
         ));
         assert!(matches!(
             state.run_slash_command("/mcp login github"),

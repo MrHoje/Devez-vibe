@@ -742,6 +742,7 @@ function claudePluginValue(available, installed) {
     description,
     installed: Boolean(installed),
     enabled: Boolean(installed?.enabled),
+    scope: installed?.scope || "user",
     availability: "AVAILABLE",
     installPolicy: "USER_INSTALLABLE",
     mustShowInstallationInterstitial: true,
@@ -904,6 +905,17 @@ async function claudeMcpStatus(params) {
     };
   }
   return claudeMcpStatusValue(await session.query.mcpServerStatus());
+}
+
+async function reconnectClaudeMcp(session, requested) {
+  const names = requested
+    ? [requested]
+    : (await session.query.mcpServerStatus())
+        .filter((server) => server?.status !== "disabled")
+        .map((server) => String(server.name || ""))
+        .filter(Boolean);
+  for (const name of names) await session.query.reconnectMcpServer(name);
+  return names;
 }
 
 function isQuestionDeliveryError(error) {
@@ -2303,6 +2315,21 @@ async function readableCwd(id, cwd) {
 async function dispatch(method, params = {}) {
   if (method === "model/list") return loadModelCatalog(params);
   if (method === "mcpServerStatus/list") return claudeMcpStatus(params);
+  if (method === "mcp/reconnect" || method === "mcp/login") {
+    const session = lookupSession(params.sessionId || params.threadId);
+    if (!session) throw new Error("Claude 세션이 아직 시작되지 않았습니다.");
+    const requested = String(params.name || "").trim();
+    const names = await reconnectClaudeMcp(session, requested);
+    return { reconnected: names };
+  }
+  if (method === "mcp/toggle") {
+    const session = lookupSession(params.sessionId || params.threadId);
+    if (!session) throw new Error("Claude 세션이 아직 시작되지 않았습니다.");
+    const name = String(params.name || "").trim();
+    if (!name) throw new Error("변경할 Claude MCP 서버 이름이 없습니다.");
+    await session.query.toggleMcpServer(name, Boolean(params.enabled));
+    return { effectiveEnabled: Boolean(params.enabled) };
+  }
   if (method === "plugin/list") return claudePluginCatalog(params);
   if (method === "plugin/installed") return claudePluginCatalog(params, true);
   if (method === "plugin/read") return claudePluginDetail(params);
@@ -2327,10 +2354,11 @@ async function dispatch(method, params = {}) {
   if (method === "plugin/set-enabled") {
     const id = String(params.pluginId || "");
     if (!id) throw new Error("변경할 Claude 플러그인 이름이 없습니다.");
-    const installed = await installedClaudePlugin(params, id);
+    const requestedScope = String(params.scope || "").trim();
+    const installed = requestedScope ? null : await installedClaudePlugin(params, id);
     await runClaudeCommand(params, [
       "plugin", params.enabled ? "enable" : "disable", id,
-      "--scope", installed?.scope || "user",
+      "--scope", requestedScope || installed?.scope || "user",
     ]);
     return { effectiveEnabled: Boolean(params.enabled) };
   }
@@ -2572,6 +2600,21 @@ async function runSelfTest() {
     || mcpStatus[0]?.status !== "connected"
     || mcpStatus[1]?.authStatus !== "notLoggedIn") {
     throw new Error(`Claude MCP status self-test failed: ${JSON.stringify(mcpStatus)}`);
+  }
+  const reconnected = [];
+  const fakeMcpSession = {
+    query: {
+      mcpServerStatus: async () => [
+        { name: "connected", status: "connected" },
+        { name: "disabled", status: "disabled" },
+      ],
+      reconnectMcpServer: async (name) => reconnected.push(name),
+    },
+  };
+  await reconnectClaudeMcp(fakeMcpSession, "");
+  await reconnectClaudeMcp(fakeMcpSession, "disabled");
+  if (reconnected.join(",") !== "connected,disabled") {
+    throw new Error(`Claude MCP reconnect self-test failed: ${reconnected.join(",")}`);
   }
   const user = (uuid, text) => ({
     type: "user",
