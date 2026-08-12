@@ -4,7 +4,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CellPosition {
-    pub row: u16,
+    pub row: usize,
     pub column: u16,
 }
 
@@ -16,7 +16,6 @@ pub(crate) struct CellRange {
 
 impl CellRange {
     pub fn columns_for_row(self, row: usize, line_width: usize) -> Option<Range<usize>> {
-        let row = u16::try_from(row).ok()?;
         if row < self.start.row || row > self.end.row {
             return None;
         }
@@ -136,7 +135,7 @@ pub(crate) fn extract_text(lines: &[CopyLine], range: CellRange) -> String {
     let mut output = String::new();
     let mut previous_row: Option<usize> = None;
 
-    for row in usize::from(range.start.row)..=usize::from(range.end.row) {
+    for row in range.start.row..=range.end.row {
         let Some(line) = lines.get(row) else {
             break;
         };
@@ -269,7 +268,7 @@ pub(crate) fn selection_chunks(
 mod tests {
     use super::*;
 
-    fn point(column: u16, row: u16) -> CellPosition {
+    fn point(column: u16, row: usize) -> CellPosition {
         CellPosition { column, row }
     }
 

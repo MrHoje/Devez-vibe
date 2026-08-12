@@ -93,6 +93,9 @@ pub enum BlockKind {
     Update,
     User,
     Assistant,
+    /// Earlier assistant updates from one completed turn, folded behind a
+    /// disclosure row while the final answer stays visible below it.
+    ProgressGroup,
     Reasoning,
     /// A `turn/plan/updated` snapshot. Its body is the encoded plan: `└ ` rows
     /// are the explanation, `✔ `/`▸ `/`□ ` rows are done/in-progress/pending
@@ -108,6 +111,14 @@ pub enum BlockKind {
     System,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AssistantPhase {
+    #[default]
+    Unknown,
+    Commentary,
+    FinalAnswer,
+}
+
 #[derive(Clone)]
 pub struct Block {
     id: u64,
@@ -115,6 +126,7 @@ pub struct Block {
     pub title: String,
     pub body: String,
     children: Vec<Block>,
+    assistant_phase: AssistantPhase,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,6 +148,7 @@ impl ProviderHandoffBlock {
             BlockKind::FileChange | BlockKind::Diff => "file_change",
             BlockKind::Welcome
             | BlockKind::Update
+            | BlockKind::ProgressGroup
             | BlockKind::ModelChange
             | BlockKind::Warning
             | BlockKind::Error
@@ -171,6 +184,7 @@ impl Block {
             title: title.into(),
             body: body.into(),
             children: Vec::new(),
+            assistant_phase: AssistantPhase::Unknown,
         }
     }
 
@@ -180,6 +194,21 @@ impl Block {
 
     pub fn adopt_id(&mut self, source: &Self) {
         self.id = source.id;
+    }
+
+    pub fn with_assistant_phase(mut self, phase: AssistantPhase) -> Self {
+        self.assistant_phase = phase;
+        self
+    }
+
+    pub const fn assistant_phase(&self) -> AssistantPhase {
+        self.assistant_phase
+    }
+
+    pub fn adopt_assistant_phase(&mut self, source: &Self) {
+        if self.assistant_phase == AssistantPhase::Unknown {
+            self.assistant_phase = source.assistant_phase;
+        }
     }
 
     pub fn shell_group(kind: BlockKind, title: impl Into<String>, children: Vec<Block>) -> Self {
@@ -195,6 +224,21 @@ impl Block {
     pub fn file_change_group(title: impl Into<String>, children: Vec<Block>) -> Self {
         let child_id = children.first().map(Block::id);
         let mut block = Self::new(BlockKind::FileChange, title, "");
+        if let Some(child_id) = child_id {
+            block.id = child_id;
+        }
+        block.children = children;
+        block
+    }
+
+    pub fn progress_group(children: Vec<Block>) -> Self {
+        let count = children.len();
+        let child_id = children.first().map(Block::id);
+        let mut block = Self::new(
+            BlockKind::ProgressGroup,
+            format!("진행 기록 · {count}개"),
+            "",
+        );
         if let Some(child_id) = child_id {
             block.id = child_id;
         }
@@ -427,6 +471,11 @@ pub struct View<'a> {
     pub overlay: Option<OverlayView<'a>>,
     /// A persistent right-hand panel, available only to the fullscreen renderer.
     pub plan_summary: Option<&'a PlanSummary>,
+    /// The newly folded progress group and the share of its rows still visible.
+    pub response_collapse: Option<(u64, f32)>,
+    /// Progress records are disclosure rows only in Super Vibe. Other presets
+    /// render their child responses exactly as ordinary transcript blocks.
+    pub fold_progress_groups: bool,
     /// Whether the current turn is still active, so an in-progress plan row may animate.
     pub plan_active: bool,
     /// A one-shot frame shimmer started by a plan creation or update.
@@ -568,6 +617,11 @@ pub struct Renderer {
     /// Transcript rows available in the last fullscreen frame. Prompt jumps use
     /// this to place their block at the top whenever enough history follows it.
     last_transcript_rows: usize,
+    /// The wrapped transcript row shown at the top of the last fullscreen frame.
+    /// Transcript drags use this stable coordinate while the viewport scrolls.
+    last_transcript_start: usize,
+    /// Screen row where that transcript window begins, below any fixed plan.
+    last_transcript_screen_start: usize,
     theme: ThemeKind,
     history: Vec<Block>,
     /// Rows the transcript is held back from its newest end. Zero follows the
@@ -582,6 +636,11 @@ pub struct Renderer {
     diff_display_mode: DiffDisplayMode,
     chat_layout: bool,
     expanded_tools: HashSet<u64>,
+    response_collapse: Option<(u64, f32)>,
+    fold_progress_groups: bool,
+    /// Wrapped transcript rows owned by folded progress records. Double-click
+    /// word selection is intentionally disabled only inside these rows.
+    progress_group_rows: Vec<Range<usize>>,
     hovered_tool: Option<u64>,
     painted_hovered_tool: Option<u64>,
     /// The clickable piece of chrome under the pointer, and the one the screen
@@ -611,6 +670,9 @@ pub struct Renderer {
     /// two separate columns of text, so a drag stays inside the one it started
     /// on instead of running across the border between them.
     selection_in_panel: bool,
+    /// Transcript selections use wrapped-history row coordinates rather than
+    /// screen rows, allowing a live drag to continue across wheel scrolling.
+    selection_in_transcript: bool,
     live_frame_cache: Option<LiveFrameCache>,
     animation_activity_row: Option<usize>,
     animation_response_bullet_row: Option<usize>,
@@ -1102,6 +1164,27 @@ fn replace_history_block(history: &mut Vec<Block>, incoming: Block) -> bool {
     true
 }
 
+fn merge_history_block(history: &mut Vec<Block>, incoming: Block) -> bool {
+    if !matches!(incoming.kind, BlockKind::ProgressGroup) {
+        return replace_history_block(history, incoming);
+    }
+    let child_ids = incoming
+        .children()
+        .iter()
+        .map(Block::id)
+        .collect::<HashSet<_>>();
+    let insertion = history
+        .iter()
+        .position(|block| child_ids.contains(&block.id()) || block.id() == incoming.id());
+    let Some(insertion) = insertion else {
+        history.push(incoming);
+        return false;
+    };
+    history.retain(|block| !child_ids.contains(&block.id()) && block.id() != incoming.id());
+    history.insert(insertion.min(history.len()), incoming);
+    true
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewportRelation {
     Before,
@@ -1133,6 +1216,8 @@ impl Renderer {
             last_total_width: 0,
             last_height: 0,
             last_transcript_rows: 0,
+            last_transcript_start: 0,
+            last_transcript_screen_start: 0,
             theme: selected_theme,
             history: Vec::new(),
             scroll_back: 0,
@@ -1142,6 +1227,9 @@ impl Renderer {
             diff_display_mode: DiffDisplayMode::Collapse,
             chat_layout: false,
             expanded_tools: HashSet::new(),
+            response_collapse: None,
+            fold_progress_groups: false,
+            progress_group_rows: Vec::new(),
             hovered_tool: None,
             painted_hovered_tool: None,
             hovered_pick: None,
@@ -1156,6 +1244,7 @@ impl Renderer {
             side_panel_content: Vec::new(),
             side_panel_footer: Vec::new(),
             selection_in_panel: false,
+            selection_in_transcript: false,
             live_frame_cache: None,
             animation_activity_row: None,
             animation_response_bullet_row: None,
@@ -1175,7 +1264,19 @@ impl Renderer {
     pub fn provider_handoff_blocks(&self) -> Vec<ProviderHandoffBlock> {
         self.history
             .iter()
-            .filter_map(ProviderHandoffBlock::from_block)
+            .flat_map(|block| {
+                if matches!(block.kind, BlockKind::ProgressGroup) {
+                    block
+                        .children()
+                        .iter()
+                        .filter_map(ProviderHandoffBlock::from_block)
+                        .collect::<Vec<_>>()
+                } else {
+                    ProviderHandoffBlock::from_block(block)
+                        .into_iter()
+                        .collect()
+                }
+            })
             .collect()
     }
 
@@ -1198,10 +1299,9 @@ impl Renderer {
             .min(self.wrapped.len());
         let moved = target != self.scroll_back;
         self.scroll_back = target;
-        if moved {
-            self.clear_selection();
-        }
-        moved
+        let preserve_drag = self.selection_in_transcript && self.selection.is_dragging();
+        let cleared = !preserve_drag && self.clear_selection();
+        moved || cleared
     }
 
     /// Returns the fullscreen transcript to its newest position. Inline mode
@@ -1232,14 +1332,7 @@ impl Renderer {
                 found = true;
                 break;
             }
-            target_start += block_group_lines(
-                block,
-                self.last_width,
-                self.shell_display_mode,
-                self.diff_display_mode,
-                self.expanded_tools.contains(&block.id()),
-            )
-            .len();
+            target_start += self.history_block_lines(block, self.last_width).len();
         }
         if !found {
             return false;
@@ -1287,11 +1380,15 @@ impl Renderer {
         self.wrapped_width = 0;
         self.scroll_back = 0;
         self.expanded_tools.clear();
+        self.response_collapse = None;
+        self.progress_group_rows.clear();
         self.hovered_tool = None;
         self.painted_hovered_tool = None;
         self.hovered_pick = None;
         self.painted_hovered_pick = None;
         self.selection.clear();
+        self.selection_in_panel = false;
+        self.selection_in_transcript = false;
         self.painted_selection = None;
         self.composer_navigation_layout = None;
         self.painted_frame = None;
@@ -1422,6 +1519,8 @@ impl Renderer {
 
     pub fn begin_selection(&mut self, column: u16, row: u16) -> bool {
         self.selection_in_panel = self.column_is_in_panel(column);
+        self.selection_in_transcript =
+            !self.selection_in_panel && self.transcript_row_at_screen(usize::from(row)).is_some();
         let Some(point) = self.selection_point(column, row) else {
             return false;
         };
@@ -1453,7 +1552,7 @@ impl Renderer {
             // The panel carries no clickable chrome, and its cells are not the
             // transcript's, so a bare click there must not resolve to a pick.
             SelectionFinish::Click(_) if in_panel => SelectionResult::None,
-            SelectionFinish::Click(cell) => SelectionResult::Click(cell.column, cell.row),
+            SelectionFinish::Click(cell) => SelectionResult::Click(cell.column, row),
             SelectionFinish::None => SelectionResult::None,
         }
     }
@@ -1463,6 +1562,14 @@ impl Renderer {
         const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
         let point = self.selection_point(column, row)?;
+        if self
+            .progress_group_rows
+            .iter()
+            .any(|range| range.contains(&point.row))
+        {
+            self.last_click = None;
+            return None;
+        }
         let now = Instant::now();
         let is_double_click =
             self.last_click
@@ -1478,7 +1585,7 @@ impl Renderer {
         self.last_click = None;
 
         let lines = self.copy_lines();
-        let line = lines.get(usize::from(point.row))?;
+        let line = lines.get(point.row)?;
         let range = word_range_at(line, usize::from(point.column))?;
         self.selection.set_range(CellRange {
             start: CellPosition {
@@ -1495,6 +1602,8 @@ impl Renderer {
     }
 
     pub fn clear_selection(&mut self) -> bool {
+        self.selection_in_panel = false;
+        self.selection_in_transcript = false;
         self.selection.clear()
     }
 
@@ -1511,6 +1620,9 @@ impl Renderer {
     /// answer to the cursor, the way a selection does in any other editor. `None`
     /// unless the drag actually landed on prompt text.
     pub fn composer_selection_range(&self) -> Option<Range<usize>> {
+        if self.selection_in_transcript || self.selection_in_panel {
+            return None;
+        }
         let range = self.selection.range()?;
         let composer = self.composer_selection.as_ref()?;
         let mut start = usize::MAX;
@@ -1590,12 +1702,17 @@ impl Renderer {
         let Some(range) = self.selection.range() else {
             return;
         };
+        // Wrapped transcript coordinates do not move with the viewport. A wheel
+        // scroll therefore changes screen rows without changing selected text.
+        if self.selection_in_transcript {
+            return;
+        }
         // A panel selection indexes the panel's own content, which this frame's
         // transcript rows say nothing about.
         if self.selection_in_panel {
             return;
         }
-        let changed = (usize::from(range.start.row)..=usize::from(range.end.row)).any(|row| {
+        let changed = (range.start.row..=range.end.row).any(|row| {
             let Some((previous, current)) = self.previous_lines.get(row).zip(lines.get(row)) else {
                 return true;
             };
@@ -1613,7 +1730,15 @@ impl Renderer {
     fn animation_row_is_selected(&self, row: usize) -> bool {
         !self.selection_in_panel
             && self.selection.range().is_some_and(|range| {
-                usize::from(range.start.row) <= row && row <= usize::from(range.end.row)
+                let row = if self.selection_in_transcript {
+                    let Some(row) = self.transcript_row_at_screen(row) else {
+                        return false;
+                    };
+                    row
+                } else {
+                    row
+                };
+                range.start.row <= row && row <= range.end.row
             })
     }
 
@@ -1643,8 +1768,18 @@ impl Renderer {
         let column = column.min(width - 1);
         Some(CellPosition {
             column: u16::try_from(column).ok()?,
-            row: u16::try_from(content_row).ok()?,
+            row: content_row,
         })
+    }
+
+    fn transcript_row_at_screen(&self, row: usize) -> Option<usize> {
+        let first = self.last_transcript_screen_start;
+        let offset = row.checked_sub(first)?;
+        if offset >= self.last_transcript_rows {
+            return None;
+        }
+        let transcript_row = self.last_transcript_start + offset;
+        (transcript_row < self.wrapped.len()).then_some(transcript_row)
     }
 
     fn selection_point(&self, column: u16, row: u16) -> Option<CellPosition> {
@@ -1654,8 +1789,17 @@ impl Renderer {
         if self.selection_target_is_panel(column) {
             return self.panel_selection_point(column, row);
         }
-        let row = row.min(self.previous_lines.len().saturating_sub(1) as u16);
-        let line = &self.previous_lines[usize::from(row)];
+        let screen_row = if self.selection_in_transcript {
+            let first = self.last_transcript_screen_start;
+            if self.last_transcript_rows == 0 {
+                return None;
+            }
+            let last = first + self.last_transcript_rows.saturating_sub(1);
+            usize::from(row).clamp(first, last)
+        } else {
+            usize::from(row).min(self.previous_lines.len().saturating_sub(1))
+        };
+        let line = &self.previous_lines[screen_row];
         if matches!(
             line.tone,
             Tone::AssistantBubbleHalf | Tone::UserPromptPadding
@@ -1678,12 +1822,19 @@ impl Renderer {
         {
             return None;
         }
+        let row = if self.selection_in_transcript {
+            self.transcript_row_at_screen(screen_row)?
+        } else {
+            screen_row
+        };
         Some(CellPosition { column, row })
     }
 
     fn copy_lines(&self) -> Vec<CopyLine> {
         let source = if self.selection_in_panel {
             &self.side_panel_content
+        } else if self.selection_in_transcript {
+            &self.wrapped
         } else {
             &self.previous_lines
         };
@@ -1731,13 +1882,7 @@ impl Renderer {
         for block in
             visible_transcript_blocks(&history, self.shell_display_mode, self.diff_display_mode)
         {
-            let lines = block_group_lines(
-                block,
-                width,
-                self.shell_display_mode,
-                self.diff_display_mode,
-                self.expanded_tools.contains(&block.id()),
-            );
+            let lines = self.history_block_lines(block, width);
             if let Err(error) = self.print_permanent(block, &lines) {
                 outcome = Err(error);
                 break;
@@ -1749,8 +1894,41 @@ impl Renderer {
 
     fn record_inline_history(&mut self, committed: &[Block]) {
         for block in committed.iter().cloned() {
-            replace_history_block(&mut self.history, block);
+            merge_history_block(&mut self.history, block);
         }
+    }
+
+    fn response_reveal_for(&self, block_id: u64) -> Option<f32> {
+        self.response_collapse
+            .filter(|(group_id, _)| *group_id == block_id)
+            .map(|(_, reveal)| reveal)
+    }
+
+    fn history_block_lines(&self, block: &Block, width: u16) -> Vec<PaintLine> {
+        if matches!(block.kind, BlockKind::ProgressGroup) && !self.fold_progress_groups {
+            return block
+                .children()
+                .iter()
+                .flat_map(|child| {
+                    block_group_lines_at(
+                        child,
+                        width,
+                        self.shell_display_mode,
+                        self.diff_display_mode,
+                        self.expanded_tools.contains(&child.id()),
+                        None,
+                    )
+                })
+                .collect();
+        }
+        block_group_lines_at(
+            block,
+            width,
+            self.shell_display_mode,
+            self.diff_display_mode,
+            self.expanded_tools.contains(&block.id()),
+            self.response_reveal_for(block.id()),
+        )
     }
 
     fn remove_startup_update_from_history(&mut self) -> bool {
@@ -1803,6 +1981,12 @@ impl Renderer {
 
     pub fn render(&mut self, committed: &[Block], view: View<'_>) -> Result<()> {
         CHAT_LAYOUT.store(view.chat_layout, Ordering::Relaxed);
+        let response_collapse_changed = self.response_collapse != view.response_collapse;
+        if response_collapse_changed {
+            self.response_collapse = view.response_collapse;
+            self.wrapped_width = 0;
+            self.live_frame_cache = None;
+        }
         let committed_without_startup = view.plan_summary.is_some().then(|| {
             committed
                 .iter()
@@ -1813,16 +1997,21 @@ impl Renderer {
         let committed = committed_without_startup.as_deref().unwrap_or(committed);
         let mode_changed = self.shell_display_mode != view.shell_display_mode
             || self.diff_display_mode != view.diff_display_mode
-            || self.chat_layout != view.chat_layout;
+            || self.chat_layout != view.chat_layout
+            || self.fold_progress_groups != view.fold_progress_groups;
         if mode_changed {
             self.shell_display_mode = view.shell_display_mode;
             self.diff_display_mode = view.diff_display_mode;
             self.chat_layout = view.chat_layout;
+            self.fold_progress_groups = view.fold_progress_groups;
             self.wrapped_width = 0;
         }
         let startup_update_removed =
             view.plan_summary.is_some() && self.remove_startup_update_from_history();
-        if self.mode == RenderMode::Inline && (mode_changed || startup_update_removed) {
+        if self.mode == RenderMode::Inline
+            && (mode_changed || startup_update_removed)
+            && !response_collapse_changed
+        {
             self.relayout()?;
         }
         let (total_width, height) = terminal_size().unwrap_or((100, 30));
@@ -1914,10 +2103,11 @@ impl Renderer {
             || self.last_height != height
             || !committed.is_empty()
             || mode_changed
-            || hidden_thinking_merge;
+            || hidden_thinking_merge
+            || response_collapse_changed;
         if needs_full_repaint {
             self.erase_live()?;
-            if hidden_thinking_merge || inline_history_replacement {
+            if hidden_thinking_merge || inline_history_replacement || response_collapse_changed {
                 self.record_inline_history(committed);
                 self.relayout()?;
             } else {
@@ -1926,13 +2116,7 @@ impl Renderer {
                     self.shell_display_mode,
                     self.diff_display_mode,
                 ) {
-                    let lines = block_group_lines(
-                        block,
-                        frame_width,
-                        self.shell_display_mode,
-                        self.diff_display_mode,
-                        false,
-                    );
+                    let lines = self.history_block_lines(block, frame_width);
                     self.print_permanent(block, &lines)?;
                 }
                 self.record_inline_history(committed);
@@ -2344,6 +2528,8 @@ impl Renderer {
             }
             Some((row, control))
         });
+        self.last_transcript_start = start;
+        self.last_transcript_screen_start = plan_rows;
         self.reconcile_selection(&screen, plan_rows);
         let full_repaint_rows = plan_rows_requiring_full_repaint(
             &self.previous_lines,
@@ -2384,7 +2570,7 @@ impl Renderer {
         if self.wrapped_width != width {
             let before = self.wrapped.len();
             for block in committed.iter().cloned() {
-                replace_history_block(&mut self.history, block);
+                merge_history_block(&mut self.history, block);
             }
             self.rewrap(width);
             if self.scroll_back > 0 {
@@ -2403,28 +2589,13 @@ impl Renderer {
                 .map(|index| {
                     let changed_start = self.history[..index]
                         .iter()
-                        .flat_map(|existing| {
-                            block_group_lines(
-                                existing,
-                                width,
-                                self.shell_display_mode,
-                                self.diff_display_mode,
-                                self.expanded_tools.contains(&existing.id()),
-                            )
-                        })
+                        .flat_map(|existing| self.history_block_lines(existing, width))
                         .count();
-                    let changed_end = changed_start
-                        + block_group_lines(
-                            &self.history[index],
-                            width,
-                            self.shell_display_mode,
-                            self.diff_display_mode,
-                            self.expanded_tools.contains(&block.id()),
-                        )
-                        .len();
+                    let changed_end =
+                        changed_start + self.history_block_lines(&self.history[index], width).len();
                     changed_start..changed_end
                 });
-            replace_history_block(&mut self.history, block.clone());
+            merge_history_block(&mut self.history, block.clone());
 
             if let Some(changed) = replacement {
                 let viewport_start = before
@@ -2442,13 +2613,15 @@ impl Renderer {
                     self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
                 }
             } else {
-                let lines = block_group_lines(
-                    block,
-                    width,
-                    self.shell_display_mode,
-                    self.diff_display_mode,
-                    self.expanded_tools.contains(&block.id()),
-                );
+                let lines = self.history_block_lines(block, width);
+                if matches!(block.kind, BlockKind::ProgressGroup) && self.fold_progress_groups {
+                    let start = self.wrapped.len();
+                    let content_end = start
+                        + lines
+                            .len()
+                            .saturating_sub(usize::from(lines.last() == Some(&PaintLine::blank())));
+                    self.progress_group_rows.push(start..content_end);
+                }
                 self.wrapped.extend(lines);
                 if self.scroll_back > 0 {
                     let row_delta = self.wrapped.len() as isize - before as isize;
@@ -2460,21 +2633,25 @@ impl Renderer {
 
     fn rewrap(&mut self, width: u16) {
         let mut wrapped = Vec::new();
+        let mut progress_group_rows = Vec::new();
         for block in visible_transcript_blocks(
             &self.history,
             self.shell_display_mode,
             self.diff_display_mode,
         ) {
-            let lines = block_group_lines(
-                block,
-                width,
-                self.shell_display_mode,
-                self.diff_display_mode,
-                self.expanded_tools.contains(&block.id()),
-            );
+            let lines = self.history_block_lines(block, width);
+            if matches!(block.kind, BlockKind::ProgressGroup) && self.fold_progress_groups {
+                let start = wrapped.len();
+                let content_end = start
+                    + lines
+                        .len()
+                        .saturating_sub(usize::from(lines.last() == Some(&PaintLine::blank())));
+                progress_group_rows.push(start..content_end);
+            }
             wrapped.extend(lines);
         }
         self.wrapped = wrapped;
+        self.progress_group_rows = progress_group_rows;
         self.wrapped_width = width;
     }
 
@@ -2497,6 +2674,8 @@ impl Renderer {
         let selection = self.selection.range().filter(|range| {
             if self.selection_in_panel {
                 selection_is_worth_painting(*range, &self.side_panel_content)
+            } else if self.selection_in_transcript {
+                selection_is_worth_painting(*range, &self.wrapped)
             } else {
                 selection_is_worth_painting(*range, lines)
             }
@@ -2506,8 +2685,14 @@ impl Renderer {
         let mut frame = CellFrame::new(usize::from(total_width), lines.len());
         for (row, line) in lines.iter().enumerate() {
             let hovered = Self::hover_columns(line, self.hovered_tool, self.hovered_pick.as_ref());
-            let selected_columns =
-                transcript_selection.and_then(|range| selection_columns_for_line(line, range, row));
+            let selected_columns = transcript_selection.and_then(|range| {
+                let selection_row = if self.selection_in_transcript {
+                    self.transcript_row_at_screen(row)?
+                } else {
+                    row
+                };
+                selection_columns_for_line(line, range, selection_row)
+            });
             paint_line_into_frame(
                 &mut frame,
                 row,
@@ -3220,14 +3405,16 @@ fn compose_screen(
     (screen, cursor_line)
 }
 
+const RESPONSE_BULLET_PREFIX: &str = " •";
+
 fn visible_response_bullet_row(
     wrapped: &[PaintLine],
     visible: Range<usize>,
     rows_before_transcript: usize,
 ) -> Option<usize> {
-    let row = wrapped
-        .iter()
-        .rposition(|line| line.prefix == "• " && line.prefix_tone == Tone::FastOff)?;
+    let row = wrapped.iter().rposition(|line| {
+        line.prefix == RESPONSE_BULLET_PREFIX && line.prefix_tone == Tone::FastOff
+    })?;
     visible
         .contains(&row)
         .then(|| rows_before_transcript + row - visible.start)
@@ -3386,6 +3573,8 @@ enum Tone {
     /// One character of a plan border shimmer, blended from the normal border
     /// colour toward the current effort colour.
     PlanShimmer(Rgb, u8),
+    /// The oldest row still visible while progress messages fold upward.
+    ResponseTransition(Rgb, u8),
     CopyJoin,
 }
 
@@ -4184,7 +4373,7 @@ fn selection_is_worth_painting(range: CellRange, lines: &[PaintLine]) -> bool {
     const MINIMUM: usize = 2;
     let mut count = 0;
 
-    for row in usize::from(range.start.row)..=usize::from(range.end.row) {
+    for row in range.start.row..=range.end.row {
         let Some(line) = lines.get(row) else {
             break;
         };
@@ -5898,9 +6087,19 @@ fn hidden_thinking_merge_at_history_boundary(
 
 fn replaces_inline_history(history: &[Block], committed: &[Block]) -> bool {
     committed.iter().any(|incoming| {
-        history
-            .iter()
-            .any(|existing| existing.id() == incoming.id())
+        let child_ids = matches!(incoming.kind, BlockKind::ProgressGroup).then(|| {
+            incoming
+                .children()
+                .iter()
+                .map(Block::id)
+                .collect::<HashSet<_>>()
+        });
+        history.iter().any(|existing| {
+            existing.id() == incoming.id()
+                || child_ids
+                    .as_ref()
+                    .is_some_and(|ids| ids.contains(&existing.id()))
+        })
     })
 }
 
@@ -7081,6 +7280,77 @@ fn block_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     block_lines_with_expansion(block, width, false)
 }
 
+fn progress_group_lines(
+    block: &Block,
+    width: u16,
+    expanded: bool,
+    reveal: Option<f32>,
+) -> Vec<PaintLine> {
+    let showing_body = expanded || reveal.is_some_and(|value| value > f32::EPSILON);
+    let marker = if showing_body { "▾ " } else { "▸ " };
+    let mut lines = vec![PaintLine {
+        prefix: marker.to_owned(),
+        prefix_tone: Tone::FastOff,
+        text: block.title.clone(),
+        tone: Tone::Muted,
+        bold: false,
+        tool_heading: Some(block.id()),
+        pick: None,
+        tail: Vec::new(),
+    }];
+    if !showing_body {
+        return lines;
+    }
+    let mut body = block
+        .children()
+        .iter()
+        .flat_map(|child| {
+            block_lines_with_mode(
+                child,
+                width,
+                ShellDisplayMode::Collapse,
+                DiffDisplayMode::Expand,
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    while matches!(body.last(), Some(line) if line == &PaintLine::blank()) {
+        body.pop();
+    }
+    if let Some(reveal) = reveal {
+        let reveal = reveal.clamp(0.0, 1.0);
+        let scaled = reveal * body.len() as f32;
+        let visible = scaled.ceil() as usize;
+        let start = body.len().saturating_sub(visible);
+        body = body.split_off(start);
+        if let Some(edge) = body.first_mut() {
+            let fraction = scaled - scaled.floor();
+            let opacity = if fraction <= f32::EPSILON {
+                u8::MAX
+            } else {
+                (fraction.max(0.12) * 255.0).round() as u8
+            };
+            fade_response_line(edge, opacity);
+        }
+    }
+    lines.extend(body);
+    lines
+}
+
+fn fade_response_line(line: &mut PaintLine, opacity: u8) {
+    let fade = |tone| {
+        Tone::ResponseTransition(
+            tone_rgb(tone).unwrap_or_else(|| theme::palette().foreground),
+            opacity,
+        )
+    };
+    line.prefix_tone = fade(line.prefix_tone);
+    line.tone = fade(line.tone);
+    for span in &mut line.tail {
+        span.tone = fade(span.tone);
+    }
+}
+
 fn block_group_lines(
     block: &Block,
     width: u16,
@@ -7088,12 +7358,31 @@ fn block_group_lines(
     diff_display_mode: DiffDisplayMode,
     expanded: bool,
 ) -> Vec<PaintLine> {
-    let mut lines = block_lines_with_mode(
+    block_group_lines_at(
         block,
         width,
         shell_display_mode,
         diff_display_mode,
         expanded,
+        None,
+    )
+}
+
+fn block_group_lines_at(
+    block: &Block,
+    width: u16,
+    shell_display_mode: ShellDisplayMode,
+    diff_display_mode: DiffDisplayMode,
+    expanded: bool,
+    response_reveal: Option<f32>,
+) -> Vec<PaintLine> {
+    let mut lines = block_lines_with_mode_at(
+        block,
+        width,
+        shell_display_mode,
+        diff_display_mode,
+        expanded,
+        response_reveal,
     );
     while matches!(lines.last(), Some(line) if line == &PaintLine::blank()) {
         lines.pop();
@@ -7150,6 +7439,24 @@ fn block_lines_with_mode(
     diff_display_mode: DiffDisplayMode,
     expanded: bool,
 ) -> Vec<PaintLine> {
+    block_lines_with_mode_at(
+        block,
+        width,
+        shell_display_mode,
+        diff_display_mode,
+        expanded,
+        None,
+    )
+}
+
+fn block_lines_with_mode_at(
+    block: &Block,
+    width: u16,
+    shell_display_mode: ShellDisplayMode,
+    diff_display_mode: DiffDisplayMode,
+    expanded: bool,
+    response_reveal: Option<f32>,
+) -> Vec<PaintLine> {
     if is_bash_block(block) {
         return shell_group_lines(block, width, shell_display_mode, expanded);
     }
@@ -7173,6 +7480,9 @@ fn block_lines_with_mode(
     }
     if matches!(block.kind, BlockKind::User) {
         return user_prompt_lines(block, width);
+    }
+    if matches!(block.kind, BlockKind::ProgressGroup) {
+        return progress_group_lines(block, width, expanded, response_reveal);
     }
     if matches!(block.kind, BlockKind::Reasoning) {
         return reasoning_lines(block, width);
@@ -7229,10 +7539,16 @@ fn block_lines_with_mode(
             unreachable!("handled above")
         }
         BlockKind::User => unreachable!("user blocks are rendered separately"),
-        BlockKind::Reasoning | BlockKind::Plan | BlockKind::Tool | BlockKind::FileChange => {
+        BlockKind::ProgressGroup
+        | BlockKind::Reasoning
+        | BlockKind::Plan
+        | BlockKind::Tool
+        | BlockKind::FileChange => {
             unreachable!("handled above")
         }
-        BlockKind::Assistant => ("• ", Tone::FastOff),
+        // Keep the response text on the same column while centring the compact
+        // bullet under disclosure glyphs such as `▸` and `▾`.
+        BlockKind::Assistant => (RESPONSE_BULLET_PREFIX, Tone::FastOff),
         BlockKind::Diff => ("● ", Tone::Accent),
         BlockKind::Warning => ("▲ ", Tone::Warning),
         BlockKind::Error => ("✕ ", Tone::Error),
@@ -9988,6 +10304,7 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::DiffHeader => palette.diff_header,
         Tone::Shimmer(base, level) => blend(base, palette.foreground, level),
         Tone::PlanShimmer(effort, level) => blend(palette.foreground, effort, level),
+        Tone::ResponseTransition(base, level) => blend(palette.background, base, level),
         Tone::CopyJoin => return None,
     })
 }
@@ -11427,13 +11744,10 @@ mod tests {
             .find(|(_, line)| line.prefix == "  " && line.text.is_empty())
             .expect("blank response row");
         let range = CellRange {
-            start: CellPosition {
-                column: 0,
-                row: row as u16,
-            },
+            start: CellPosition { column: 0, row },
             end: CellPosition {
                 column: painted_line_width(blank).saturating_sub(1) as u16,
-                row: row as u16,
+                row,
             },
         };
 
@@ -12040,7 +12354,7 @@ mod tests {
             start: CellPosition { column: 2, row: 1 },
             end: CellPosition {
                 column: width - 2,
-                row: (lines.len() - 1) as u16,
+                row: lines.len() - 1,
             },
         };
         let mut frame = CellFrame::new(usize::from(width), lines.len());
@@ -12270,7 +12584,7 @@ mod tests {
             .iter()
             .find(|line| line.text.trim() == "first")
             .expect("first list item");
-        assert_eq!(first_item.prefix, "• ");
+        assert_eq!(first_item.prefix, RESPONSE_BULLET_PREFIX);
         assert_eq!(second_item.prefix, "  ");
         CHAT_LAYOUT.store(true, Ordering::Relaxed);
     }
@@ -14019,7 +14333,7 @@ mod tests {
     #[test]
     fn waiting_pulse_targets_only_the_latest_visible_response_bullet() {
         let response = |text: &str| PaintLine {
-            prefix: "• ".to_owned(),
+            prefix: RESPONSE_BULLET_PREFIX.to_owned(),
             prefix_tone: Tone::FastOff,
             text: text.to_owned(),
             tone: Tone::Plain,
@@ -14729,7 +15043,7 @@ mod tests {
     #[test]
     fn a_one_character_drag_is_left_unpainted() {
         let lines = vec![PaintLine::plain("a한b"), PaintLine::plain("cd")];
-        let range = |start: (u16, u16), end: (u16, u16)| CellRange {
+        let range = |start: (u16, usize), end: (u16, usize)| CellRange {
             start: CellPosition {
                 column: start.0,
                 row: start.1,
@@ -14764,6 +15078,33 @@ mod tests {
         assert!(renderer.update_selection(3, 0));
         assert!(renderer.scroll(1));
         assert_eq!(renderer.finish_selection(3, 0), SelectionResult::None);
+    }
+
+    #[test]
+    fn fullscreen_transcript_drag_continues_across_wheel_scrolling() {
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.wrapped = text_rows(10, "line");
+        renderer.scroll_back = 2;
+        renderer.last_transcript_rows = 4;
+        renderer.last_transcript_start = 4;
+        renderer.last_transcript_screen_start = 0;
+        renderer.previous_lines = renderer.wrapped[4..8].to_vec();
+
+        assert!(renderer.begin_selection(4, 2));
+        assert!(renderer.update_selection(0, 0));
+        assert!(renderer.scroll(3));
+
+        // The next frame shows older history, but the original anchor remains
+        // attached to line6 instead of becoming the new row-two text.
+        renderer.last_transcript_start = 1;
+        renderer.previous_lines = renderer.wrapped[1..5].to_vec();
+        assert!(renderer.update_selection(0, 0));
+        assert_eq!(
+            renderer.finish_selection(0, 0),
+            SelectionResult::Copy(
+                ["line1", "line2", "line3", "line4", "line5", "line6"].join("\n")
+            )
+        );
     }
 
     #[test]
@@ -17642,6 +17983,120 @@ mod tests {
                 .map(|columns| columns.len()),
             Some(13)
         );
+    }
+
+    #[test]
+    fn progress_group_folds_from_its_top_and_can_be_expanded_again() {
+        let progress = Block::progress_group(vec![
+            Block::new(BlockKind::Assistant, "Codex", "첫 진행 메시지"),
+            Block::new(BlockKind::Assistant, "Codex", "두 번째 진행 메시지"),
+        ]);
+
+        let open = block_lines_with_mode_at(
+            &progress,
+            80,
+            ShellDisplayMode::Collapse,
+            DiffDisplayMode::Collapse,
+            false,
+            Some(1.0),
+        );
+        let folding = block_lines_with_mode_at(
+            &progress,
+            80,
+            ShellDisplayMode::Collapse,
+            DiffDisplayMode::Collapse,
+            false,
+            Some(0.4),
+        );
+        let closed = block_lines_with_mode_at(
+            &progress,
+            80,
+            ShellDisplayMode::Collapse,
+            DiffDisplayMode::Collapse,
+            false,
+            None,
+        );
+        let reopened = block_lines_with_mode_at(
+            &progress,
+            80,
+            ShellDisplayMode::Collapse,
+            DiffDisplayMode::Collapse,
+            true,
+            None,
+        );
+
+        assert!(open.len() > folding.len());
+        assert!(folding.len() > closed.len());
+        assert!(matches!(folding[1].tone, Tone::ResponseTransition(_, _)));
+        assert!(reopened.len() > closed.len());
+        let reopened_text = reopened.iter().map(painted).collect::<Vec<_>>().join("\n");
+        assert!(reopened_text.contains("첫 진행 메시지"));
+        assert!(reopened_text.contains("두 번째 진행 메시지"));
+        assert_eq!(closed[0].tool_heading, Some(progress.id()));
+
+        let reopened_group = block_group_lines(
+            &progress,
+            80,
+            ShellDisplayMode::Collapse,
+            DiffDisplayMode::Collapse,
+            true,
+        );
+        assert!(reopened_group.last() == Some(&PaintLine::blank()));
+        assert!(
+            reopened_group.get(reopened_group.len().saturating_sub(2)) != Some(&PaintLine::blank())
+        );
+    }
+
+    #[test]
+    fn progress_group_ignores_double_click_word_selection() {
+        let progress = Block::progress_group(vec![Block::new(
+            BlockKind::Assistant,
+            "Codex",
+            "진행 메시지",
+        )]);
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.fold_progress_groups = true;
+        renderer.expanded_tools.insert(progress.id());
+        renderer.history.push(progress);
+        renderer.rewrap(80);
+        renderer.previous_lines = renderer.wrapped.clone();
+
+        assert!(renderer.progress_group_rows[0].contains(&1));
+        assert_eq!(renderer.double_click_word(3, 1), None);
+        assert_eq!(renderer.double_click_word(3, 1), None);
+        assert_eq!(renderer.selected_text(), None);
+    }
+
+    #[test]
+    fn progress_group_is_a_disclosure_row_only_in_super_vibe() {
+        let progress = Block::progress_group(vec![
+            Block::new(BlockKind::Assistant, "Codex", "첫 진행 메시지"),
+            Block::new(BlockKind::Assistant, "Codex", "두 번째 진행 메시지"),
+        ]);
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.history.push(progress);
+
+        renderer.rewrap(80);
+        let ordinary = renderer
+            .wrapped
+            .iter()
+            .map(painted)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!ordinary.contains("진행 기록"));
+        assert!(ordinary.contains("첫 진행 메시지"));
+        assert!(ordinary.contains("두 번째 진행 메시지"));
+
+        renderer.fold_progress_groups = true;
+        renderer.rewrap(80);
+        let super_vibe = renderer
+            .wrapped
+            .iter()
+            .map(painted)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(super_vibe.contains("진행 기록 · 2개"));
+        assert!(!super_vibe.contains("첫 진행 메시지"));
     }
 
     #[test]

@@ -27,10 +27,10 @@ use crate::{
     pricing::{self, CostLedger, TokenTotals},
     provider::{ProviderAuthRequest, ProviderPicker, ProviderPickerResult},
     renderer::{
-        AnimationView, Block, BlockKind, ComposerMode, EffortSlider, HIDDEN_STATUS_LINE,
-        IntegrationItemState, IntegrationItemView, LiveBlockView, ModeAccent, OverlayLine,
-        OverlayStyle, OverlayView, PICKER_ROWS, PermissionBadge, PermissionTone, PlanStep,
-        PlanStepStatus, PlanSummary, ProviderHandoffBlock, ProviderIntegrationView,
+        AnimationView, AssistantPhase, Block, BlockKind, ComposerMode, EffortSlider,
+        HIDDEN_STATUS_LINE, IntegrationItemState, IntegrationItemView, LiveBlockView, ModeAccent,
+        OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS, PermissionBadge, PermissionTone,
+        PlanStep, PlanStepStatus, PlanSummary, ProviderHandoffBlock, ProviderIntegrationView,
         SIDE_PANEL_WIDTHS, StatusLineView, SubagentView, SuggestionView, VibeTone, View,
         WelcomeView, visible_window,
     },
@@ -46,6 +46,7 @@ const SHIMMER_PERIOD: Duration = Duration::from_millis(1_100);
 /// calmer pace than the ordinary response shimmer.
 const COMPACTION_ACTIVITY_PERIOD: Duration = Duration::from_secs(2);
 const PLAN_SHIMMER_DURATION: Duration = SHIMMER_PERIOD.saturating_mul(5);
+const RESPONSE_COLLAPSE_DURATION: Duration = Duration::from_millis(120);
 
 /// One-off notices (copy, reroute, …) sit in the status line this long.
 const NOTICE_TTL: Duration = Duration::from_millis(1_400);
@@ -3207,6 +3208,12 @@ pub struct TickResult {
     pub animation_only: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ResponseCollapseTransition {
+    group_id: u64,
+    started_at: Instant,
+}
+
 /// One subagent the provider is currently running for this session. The bridge
 /// reports elapsed time per update, but the row ticks between updates, so the
 /// start instant is kept locally and reused while the same id stays running.
@@ -3304,6 +3311,12 @@ pub struct AppState {
     /// first transcript row instead of appending another collapsed card.
     turn_file_changes: Vec<Block>,
     turn_file_change_anchor: Option<Block>,
+    /// Assistant messages completed in this turn. Codex labels commentary and
+    /// final output; runtimes without that label use the last message on a
+    /// successful turn as the final answer.
+    turn_assistant_blocks: Vec<Block>,
+    response_grouped: bool,
+    response_collapse: Option<ResponseCollapseTransition>,
     /// App-server lifecycle notifications can be replayed. An item id belongs
     /// to one logical operation, so only its first completion may reach history.
     completed_item_ids: HashSet<String>,
@@ -3540,6 +3553,9 @@ impl AppState {
             turn_shell_duration_ms: None,
             turn_file_changes: Vec::new(),
             turn_file_change_anchor: None,
+            turn_assistant_blocks: Vec::new(),
+            response_grouped: false,
+            response_collapse: None,
             completed_item_ids: HashSet::new(),
             seen_operation_signatures: HashSet::new(),
             pending: None,
@@ -5207,6 +5223,9 @@ impl AppState {
         self.turn_shell_duration_ms = None;
         self.turn_file_changes.clear();
         self.turn_file_change_anchor = None;
+        self.turn_assistant_blocks.clear();
+        self.response_grouped = false;
+        self.response_collapse = None;
     }
 
     fn push_unique_operation(&mut self, block: Block) {
@@ -5216,6 +5235,33 @@ impl AppState {
             return;
         }
         push_latest_thinking(&mut self.committed, block);
+    }
+
+    fn collapse_completed_response(&mut self) {
+        if self.response_grouped || self.turn_assistant_blocks.len() < 2 {
+            return;
+        }
+        let final_index = self
+            .turn_assistant_blocks
+            .iter()
+            .rposition(|block| block.assistant_phase() == AssistantPhase::FinalAnswer)
+            .unwrap_or(self.turn_assistant_blocks.len() - 1);
+        let progress = self.turn_assistant_blocks[..final_index]
+            .iter()
+            .filter(|block| !block.body.trim().is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        if progress.is_empty() {
+            return;
+        }
+        let group = Block::progress_group(progress);
+        self.response_collapse =
+            (self.vibe_mode == VibeMode::SuperVibe).then(|| ResponseCollapseTransition {
+                group_id: group.id(),
+                started_at: Instant::now(),
+            });
+        self.response_grouped = true;
+        self.committed.push(group);
     }
 
     /// Returns an interrupt the user requested while `turn/start` was still
@@ -5456,6 +5502,9 @@ impl AppState {
         self.activity_notice = None;
         self.quit_armed_at = None;
         self.plan_summary = None;
+        self.response_collapse = None;
+        self.turn_assistant_blocks.clear();
+        self.response_grouped = false;
         self.subagents.clear();
         self.subagent_logs.clear();
         self.busy = false;
@@ -5552,6 +5601,8 @@ impl AppState {
             live_blocks,
             overlay: self.overlay_view(),
             plan_summary: self.plan_summary.as_ref(),
+            response_collapse: self.response_collapse_view(),
+            fold_progress_groups: self.vibe_mode == VibeMode::SuperVibe,
             plan_active: self.plan_is_active(),
             plan_shimmer_phase: self.plan_shimmer_phase(),
             plan_effort: self
@@ -5644,6 +5695,11 @@ impl AppState {
             self.plan_shimmer_started_at = None;
             full_redraw = true;
         }
+        let response_collapse_active = self.response_collapse_view().is_some();
+        if self.response_collapse.is_some() && !response_collapse_active {
+            self.response_collapse = None;
+            full_redraw = true;
+        }
         if animating {
             self.spinner_frame = (self.spinner_frame + 1) % SPINNER.len();
         }
@@ -5697,9 +5753,14 @@ impl AppState {
         }
         TickResult {
             redraw: !inline_answer_active
-                && (animating || subagent_elapsed_changed || plan_shimmer_active || full_redraw),
+                && (animating
+                    || subagent_elapsed_changed
+                    || plan_shimmer_active
+                    || response_collapse_active
+                    || full_redraw),
             animation_only: !inline_answer_active
                 && (animating || plan_shimmer_active)
+                && !response_collapse_active
                 && !subagent_elapsed_changed
                 && !full_redraw,
         }
@@ -6707,6 +6768,17 @@ impl AppState {
                 }
             }
             "turn/completed" => {
+                let turn_error = params
+                    .get("turn")
+                    .and_then(|turn| turn.get("error"))
+                    .filter(|error| !error.is_null());
+                let turn_status = params
+                    .get("turn")
+                    .and_then(|turn| turn.get("status"))
+                    .and_then(Value::as_str);
+                let successful = !self.turn_interrupted
+                    && turn_error.is_none()
+                    && !matches!(turn_status, Some("failed" | "aborted" | "interrupted"));
                 self.busy = false;
                 // A runtime that compacts inside a turn ends the spinner here even
                 // if it never announced the boundary.
@@ -6728,11 +6800,7 @@ impl AppState {
                         self.turn_started_at.map(|started| started.elapsed());
                 }
                 self.turn_started_at = None;
-                if let Some(error) = params
-                    .get("turn")
-                    .and_then(|turn| turn.get("error"))
-                    .filter(|error| !error.is_null())
-                {
+                if let Some(error) = turn_error {
                     self.committed.push(Block::new(
                         BlockKind::Error,
                         "Turn 실패",
@@ -6743,6 +6811,9 @@ impl AppState {
                     ));
                 }
                 self.flush_orphaned_active();
+                if successful {
+                    self.collapse_completed_response();
+                }
             }
             "turn/plan/updated" => {
                 let explanation = params
@@ -8053,9 +8124,7 @@ impl AppState {
                             Instant::now(),
                         ));
                     }
-                    KeyCode::Char('r')
-                        if tab == 4 && !ctrl && !alt && selected < denials.len() =>
-                    {
+                    KeyCode::Char('r') if tab == 4 && !ctrl && !alt && selected < denials.len() => {
                         retry = (retry != Some(selected)).then_some(selected);
                     }
                     _ => {}
@@ -10070,6 +10139,25 @@ impl AppState {
             .then(|| elapsed.as_secs_f32() / PLAN_SHIMMER_DURATION.as_secs_f32())
     }
 
+    fn response_collapse_view(&self) -> Option<(u64, f32)> {
+        if self.vibe_mode != VibeMode::SuperVibe {
+            return None;
+        }
+        let transition = self.response_collapse?;
+        let progress = transition.started_at.elapsed().as_secs_f32()
+            / RESPONSE_COLLAPSE_DURATION.as_secs_f32();
+        if progress >= 1.0 {
+            return None;
+        }
+        let progress = progress.clamp(0.0, 1.0);
+        let eased = progress * progress * (3.0 - 2.0 * progress);
+        Some((transition.group_id, 1.0 - eased))
+    }
+
+    pub fn response_collapse_animating(&self) -> bool {
+        self.response_collapse_view().is_some()
+    }
+
     fn status_line(&self) -> StatusLineView {
         let context = self.context_window.and_then(|window| {
             (window > 0).then(|| {
@@ -11065,6 +11153,7 @@ impl AppState {
         if let Some(mut block) = completed_item_block(&self.cwd, item) {
             if let Some(active) = active.as_ref() {
                 block.adopt_id(&active.block);
+                block.adopt_assistant_phase(&active.block);
                 if block.body.is_empty() {
                     block.body = active.block.body.clone();
                 }
@@ -11090,6 +11179,7 @@ impl AppState {
             if matches!(block.kind, BlockKind::Assistant) {
                 self.turn_response_started |= !block.body.is_empty();
                 self.last_assistant_markdown = Some(block.body.clone());
+                self.turn_assistant_blocks.push(block.clone());
             }
             if matches!(block.kind, BlockKind::FileChange) {
                 if let Some(signature) = operation_signature(&block)
@@ -11363,6 +11453,7 @@ impl AppState {
                 if matches!(item.block.kind, BlockKind::Assistant) {
                     self.turn_response_started |= !item.block.body.is_empty();
                     self.last_assistant_markdown = Some(item.block.body.clone());
+                    self.turn_assistant_blocks.push(item.block.clone());
                 }
                 if matches!(item.block.kind, BlockKind::FileChange) {
                     if operation_signature(&item.block)
@@ -11530,15 +11621,26 @@ fn parse_questions(params: &Value) -> Vec<Question> {
         .collect()
 }
 
+fn assistant_phase(item: &Value) -> AssistantPhase {
+    match item.get("phase").and_then(Value::as_str) {
+        Some("commentary") => AssistantPhase::Commentary,
+        Some("final_answer") | Some("finalAnswer") => AssistantPhase::FinalAnswer,
+        _ => AssistantPhase::Unknown,
+    }
+}
+
 fn active_item_block(cwd: &str, item: &Value) -> Option<Block> {
     match item.get("type")?.as_str()? {
-        "agentMessage" => Some(Block::new(
-            BlockKind::Assistant,
-            item.get("provider")
-                .and_then(Value::as_str)
-                .unwrap_or("Codex"),
-            item.get("text").and_then(Value::as_str).unwrap_or_default(),
-        )),
+        "agentMessage" => Some(
+            Block::new(
+                BlockKind::Assistant,
+                item.get("provider")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Codex"),
+                item.get("text").and_then(Value::as_str).unwrap_or_default(),
+            )
+            .with_assistant_phase(assistant_phase(item)),
+        ),
         "reasoning" => Some(Block::new(
             BlockKind::Reasoning,
             "Thinking…",
@@ -11936,7 +12038,51 @@ fn merged_turn_blocks(
     }
     // The timestamps are a fixed-width UTC format, so string order is time order.
     rows.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
-    normalized_turn_blocks(rows.into_iter().map(|(_, _, block)| block).collect())
+    let blocks = normalized_turn_blocks(rows.into_iter().map(|(_, _, block)| block).collect());
+    let successful = turn
+        .get("status")
+        .and_then(Value::as_str)
+        .is_none_or(|status| status == "completed")
+        && turn.get("error").is_none_or(Value::is_null);
+    if successful {
+        group_turn_response(blocks)
+    } else {
+        blocks
+    }
+}
+
+fn group_turn_response(mut blocks: Vec<Block>) -> Vec<Block> {
+    let assistant_indices = blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| matches!(block.kind, BlockKind::Assistant).then_some(index))
+        .collect::<Vec<_>>();
+    if assistant_indices.len() < 2 {
+        return blocks;
+    }
+    let final_index = assistant_indices
+        .iter()
+        .copied()
+        .rfind(|&index| blocks[index].assistant_phase() == AssistantPhase::FinalAnswer)
+        .unwrap_or(*assistant_indices.last().expect("two assistant blocks"));
+    let progress_indices = assistant_indices
+        .into_iter()
+        .filter(|&index| index < final_index && !blocks[index].body.trim().is_empty())
+        .collect::<Vec<_>>();
+    let Some(&insert_at) = progress_indices.first() else {
+        return blocks;
+    };
+    let progress_ids = progress_indices
+        .iter()
+        .map(|&index| blocks[index].id())
+        .collect::<HashSet<_>>();
+    let progress = progress_indices
+        .iter()
+        .map(|&index| blocks[index].clone())
+        .collect::<Vec<_>>();
+    blocks.retain(|block| !progress_ids.contains(&block.id()));
+    blocks.insert(insert_at, Block::progress_group(progress));
+    blocks
 }
 
 /// The turn's `startedAt` (unix seconds), formatted the same way the rollout's
@@ -14629,9 +14775,11 @@ mod tests {
             .iter()
             .map(|block| block.title.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(titles[0], "Codex");
+        assert_eq!(titles[0], "진행 기록 · 1개");
         assert_eq!(titles[1], "Shell · 1 command · completed · 1.6s");
         assert_eq!(titles[3], "Codex");
+        assert!(matches!(state.committed[0].kind, BlockKind::ProgressGroup));
+        assert_eq!(state.committed[0].children().len(), 1);
         assert!(matches!(state.committed[1].kind, BlockKind::Tool));
         assert_eq!(state.committed[1].children().len(), 1);
         assert_eq!(
@@ -14966,7 +15114,8 @@ mod tests {
             .map(|block| block.title.as_str())
             .collect::<Vec<_>>();
         assert_eq!(titles.len(), 3);
-        assert_eq!(titles[0], "Codex");
+        assert_eq!(titles[0], "진행 기록 · 1개");
+        assert_eq!(state.committed[0].children().len(), 1);
         assert_eq!(titles[1], "Update(0 files)");
         assert_eq!(titles[2], "Codex");
     }
@@ -16761,6 +16910,95 @@ mod tests {
         assert!(!state.compacting());
     }
 
+    #[test]
+    fn codex_final_answer_folds_only_earlier_commentary() {
+        let mut state = test_state();
+        while state.vibe_mode() != VibeMode::SuperVibe {
+            state.cycle_vibe_mode();
+        }
+        state.set_turn_started("turn-1".to_owned());
+        for (id, phase, text) in [
+            ("progress-1", "commentary", "원격 변경을 확인했습니다."),
+            ("progress-2", "commentary", "전체 테스트가 통과했습니다."),
+            ("final", "final_answer", "배포를 완료했습니다."),
+        ] {
+            state.handle_notification(
+                "item/completed",
+                &json!({
+                    "item": { "id": id, "type": "agentMessage", "phase": phase, "text": text }
+                }),
+            );
+            state.drain_committed();
+        }
+
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "status": "completed" } }),
+        );
+        let blocks = state.drain_committed();
+        let group = blocks
+            .iter()
+            .find(|block| matches!(block.kind, BlockKind::ProgressGroup))
+            .expect("progress group");
+
+        assert_eq!(group.children().len(), 2);
+        assert_eq!(group.title, "진행 기록 · 2개");
+        assert!(state.response_collapse_view().is_some());
+    }
+
+    #[test]
+    fn ordinary_vibe_modes_do_not_start_response_collapse_animation() {
+        for mode in [VibeMode::Vibe, VibeMode::Normal] {
+            let mut state = test_state();
+            while state.vibe_mode() != mode {
+                state.cycle_vibe_mode();
+            }
+            state.set_turn_started("turn-1".to_owned());
+            for (id, text) in [("progress", "확인 중입니다."), ("final", "완료했습니다.")]
+            {
+                state.handle_notification(
+                    "item/completed",
+                    &json!({ "item": { "id": id, "type": "agentMessage", "text": text } }),
+                );
+                state.drain_committed();
+            }
+
+            state.handle_notification(
+                "turn/completed",
+                &json!({ "turn": { "status": "completed" } }),
+            );
+
+            assert!(state.response_collapse_view().is_none());
+            assert!(!state.view().fold_progress_groups);
+        }
+    }
+
+    #[test]
+    fn claude_uses_the_last_successful_message_but_never_folds_an_interruption() {
+        let mut state = test_state();
+        state.set_turn_started("turn-1".to_owned());
+        for (id, text) in [("progress", "확인 중입니다."), ("last", "완료했습니다.")] {
+            state.handle_notification(
+                "item/completed",
+                &json!({ "item": { "id": id, "type": "agentMessage", "provider": "Claude", "text": text } }),
+            );
+            state.drain_committed();
+        }
+        state.turn_interrupted = true;
+
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "status": "completed" } }),
+        );
+
+        assert!(
+            state
+                .drain_committed()
+                .iter()
+                .all(|block| !matches!(block.kind, BlockKind::ProgressGroup))
+        );
+    }
+
     const TEST_FRAME: Duration = STREAM_FRAME_FOR_TESTS;
     /// The loop's tick sits well under one character's worth of time, so a test
     /// that wants to see text has to run several of them.
@@ -18534,11 +18772,7 @@ mod tests {
         let models = vec![
             test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
             test_model("claude:sonnet", "Claude Sonnet 5", false),
-            test_model(
-                "claude:claude-opus-4-8",
-                "Claude Opus 4.8",
-                false,
-            ),
+            test_model("claude:claude-opus-4-8", "Claude Opus 4.8", false),
             test_model("gpt-5.6-terra", "GPT-5.6 Terra", false),
             test_model("claude:haiku", "Claude Haiku 4.5", false),
         ];

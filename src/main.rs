@@ -832,6 +832,8 @@ async fn choose_startup_session(
                 live_blocks: Vec::new(),
                 overlay: Some(picker.overlay_view()),
                 plan_summary: None,
+                response_collapse: None,
+                fold_progress_groups: false,
                 plan_active: false,
                 plan_shimmer_phase: None,
                 plan_effort: None,
@@ -1259,7 +1261,7 @@ async fn event_loop(
                 last_stream_reveal = now;
                 let reveal = state.drain_stream_text(elapsed);
                 perf::record_reveal(elapsed, reveal.clusters, reveal.backlog);
-                let revealed = reveal.changed();
+                let revealed = reveal.changed() || state.response_collapse_animating();
                 if revealed {
                     animation_tick = false;
                 }
@@ -1448,10 +1450,7 @@ fn renderer_mouse_action(
     }
 
     match request {
-        MouseRequest::Scroll(delta) => {
-            let cleared = renderer.clear_selection();
-            Action::Tick(renderer.scroll(delta) || cleared)
-        }
+        MouseRequest::Scroll(delta) => Action::Tick(renderer.scroll(delta)),
         MouseRequest::SelectionStart(column, row) => {
             Action::Tick(renderer.begin_selection(column, row))
         }
