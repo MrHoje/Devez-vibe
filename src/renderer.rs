@@ -1493,12 +1493,25 @@ impl Renderer {
             .history
             .iter()
             .any(|block| block.id() == id && matches!(block.kind, BlockKind::ProgressGroup));
-        let hosted_history_toggle = history_toggle && self.prompt_for_progress_group(id).is_some();
+        let hosted_prompt = history_toggle
+            .then(|| self.prompt_for_progress_group(id))
+            .flatten();
+        let hosted_history_toggle = hosted_prompt.is_some();
+        let expanding = !self.expanded_tools.contains(&id);
+        let latest_prompt = self
+            .history
+            .iter()
+            .rev()
+            .find(|block| matches!(block.kind, BlockKind::User))
+            .map(Block::id);
+        let expanding_latest_prompt_history =
+            expanding && hosted_prompt.is_some() && hosted_prompt == latest_prompt;
         self.history_view_rows_anchor =
             (history_toggle && !hosted_history_toggle && self.scroll_back == 0)
                 .then_some(self.last_transcript_rows);
-        self.history_view_start_anchor =
-            hosted_history_toggle.then_some(self.last_transcript_start);
+        self.history_view_start_anchor = (hosted_history_toggle
+            && !expanding_latest_prompt_history)
+            .then_some(self.last_transcript_start);
 
         if !self.expanded_tools.remove(&id) {
             self.expanded_tools.insert(id);
@@ -1506,7 +1519,12 @@ impl Renderer {
         let old_len = self.wrapped.len();
         self.rewrap(self.last_width.max(20));
         let delta = self.wrapped.len() as isize - old_len as isize;
-        if self.scroll_back > 0 {
+        if expanding_latest_prompt_history {
+            self.scroll_back = 0;
+            self.history_view_rows_anchor = None;
+            self.history_view_start_anchor = None;
+            self.clear_selection();
+        } else if self.scroll_back > 0 {
             self.scroll_back = self.scroll_back.saturating_add_signed(delta);
         }
         true
@@ -19655,6 +19673,7 @@ mod tests {
         renderer.last_width = 80;
         renderer.rewrap(80);
         renderer.previous_lines = renderer.wrapped.clone();
+        renderer.scroll_back = 2;
 
         let (row, column) = renderer
             .previous_lines
@@ -19678,7 +19697,8 @@ mod tests {
 
         assert!(renderer.toggle_tool(progress_id));
         assert_eq!(renderer.history_view_rows_anchor, None);
-        assert_eq!(renderer.history_view_start_anchor, Some(0));
+        assert_eq!(renderer.history_view_start_anchor, None);
+        assert_eq!(renderer.scroll_back, 0);
         let expanded = renderer
             .wrapped
             .iter()
@@ -19699,6 +19719,36 @@ mod tests {
             })
             .count();
         assert_eq!(visible_prompt_rows, 3);
+    }
+
+    #[test]
+    fn expanding_middle_prompt_history_keeps_the_current_view_anchor() {
+        let first_prompt = Block::new(BlockKind::User, "gpt-5.6-sol", "첫 프롬프트");
+        let first_progress = Block::progress_group(vec![Block::new(
+            BlockKind::Assistant,
+            "Codex",
+            "첫 프롬프트의 접힌 응답",
+        )]);
+        let first_progress_id = first_progress.id();
+        let latest_prompt = Block::new(BlockKind::User, "gpt-5.6-sol", "마지막 프롬프트");
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.chat_layout = true;
+        renderer.fold_progress_groups = true;
+        renderer
+            .history
+            .extend([first_prompt, first_progress, latest_prompt]);
+        renderer.last_width = 80;
+        renderer.rewrap(80);
+        renderer.last_transcript_start = 3;
+        renderer.scroll_back = 2;
+        let collapsed_rows = renderer.wrapped.len();
+
+        assert!(renderer.toggle_tool(first_progress_id));
+
+        let added_rows = renderer.wrapped.len() - collapsed_rows;
+        assert!(added_rows > 0);
+        assert_eq!(renderer.history_view_start_anchor, Some(3));
+        assert_eq!(renderer.scroll_back, 2 + added_rows);
     }
 
     #[test]
