@@ -7984,7 +7984,17 @@ fn block_lines_with_mode_at(
     } else {
         &block.body
     };
-    let raw_lines = body.lines().collect::<Vec<_>>();
+    let mut raw_lines = body.lines().collect::<Vec<_>>();
+    if conversational {
+        // Assistant messages commonly finish with `\n\n`. `str::lines` turns
+        // that final pair into an empty content row, even though the transcript
+        // block already owns its separator. Keep intentional blank rows inside
+        // the answer, but do not let a trailing delimiter grow the live frame
+        // at the instant streaming finishes and move the answer upward.
+        while raw_lines.last().is_some_and(|line| line.trim().is_empty()) {
+            raw_lines.pop();
+        }
+    }
     let mut line_index = 0;
     while let Some(raw_line) = raw_lines.get(line_index).copied() {
         let trimmed = raw_line.trim_start();
@@ -12072,6 +12082,29 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_keeps_internal_blank_rows_but_drops_trailing_ones() {
+        set_chat_layout(false);
+        let lines = block_group_lines(
+            &Block::new(BlockKind::Assistant, "Codex", "첫 줄\n\n둘째 줄\n\n"),
+            80,
+            ShellDisplayMode::Collapse,
+            DiffDisplayMode::Collapse,
+            false,
+        );
+
+        assert!(lines.last() == Some(&PaintLine::blank()));
+        assert!(lines[lines.len() - 2].text.contains("둘째 줄"));
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.prefix == "  " && line.text.is_empty())
+                .count(),
+            1,
+            "내용 사이의 빈 행만 남아야 합니다"
+        );
+    }
+
+    #[test]
     fn fullscreen_selection_copies_right_aligned_user_bubbles() {
         let lines = block_lines(&Block::new(BlockKind::User, "You", "first\nsecond"), 80);
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
@@ -15425,6 +15458,78 @@ mod tests {
         assert_eq!(answer_row(&screen), streaming_row);
         let screen = simulate_fullscreen_frame(&mut renderer, &[], &[], None, None, rows, width);
         assert_eq!(answer_row(&screen), streaming_row);
+    }
+
+    #[test]
+    fn trailing_newlines_do_not_move_a_streaming_answer() {
+        set_chat_layout(false);
+        for (rows, width) in [(18, 60), (24, 80), (32, 120)] {
+            let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+            renderer.shell_display_mode = ShellDisplayMode::Hide;
+            renderer.diff_display_mode = DiffDisplayMode::Hide;
+
+            let mut history = Vec::new();
+            for index in 0..10 {
+                history.push(Block::new(
+                    BlockKind::User,
+                    "Codex",
+                    format!("과거 프롬프트 {index}"),
+                ));
+                history.push(Block::new(
+                    BlockKind::Assistant,
+                    "Codex",
+                    format!("과거 답변 {index}"),
+                ));
+            }
+            simulate_fullscreen_frame(
+                &mut renderer,
+                &history,
+                &[],
+                Some("Working"),
+                None,
+                rows,
+                width,
+            );
+
+            let mut answer = Block::new(
+                BlockKind::Assistant,
+                "Codex",
+                "스트리밍 중인 최종 답변입니다.",
+            );
+            let screen = simulate_fullscreen_frame(
+                &mut renderer,
+                &[],
+                std::slice::from_ref(&answer),
+                Some("Working"),
+                None,
+                rows,
+                width,
+            );
+            let streaming_row = answer_row(&screen);
+
+            answer.body.push_str("\n\n");
+            let screen = simulate_fullscreen_frame(
+                &mut renderer,
+                &[],
+                std::slice::from_ref(&answer),
+                Some("Working"),
+                None,
+                rows,
+                width,
+            );
+            assert_eq!(answer_row(&screen), streaming_row);
+
+            let screen = simulate_fullscreen_frame(
+                &mut renderer,
+                std::slice::from_ref(&answer),
+                &[],
+                None,
+                None,
+                rows,
+                width,
+            );
+            assert_eq!(answer_row(&screen), streaming_row);
+        }
     }
 
     #[test]
