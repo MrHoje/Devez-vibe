@@ -2684,19 +2684,16 @@ impl Renderer {
             self.history_view_rows_anchor,
         );
         self.last_transcript_rows = view_rows;
-        let conversation_top_padding =
-            conversation_top_padding(&frame, live_rows, self.wrapped.len());
         // The live blocks run from the top of the frame down to the dock, and the
-        // padding above the conversation is accounted for separately, so this row
-        // survives `fit_frame` without widening the activity gap.
+        // padding below goes in at the dock, so this row survives `fit_frame`.
         let stream_fade = (stream_fade_tail > 0 && frame.dock_index > 0).then(|| StreamFade {
-            last_row: plan_rows + conversation_top_padding + view_rows + frame.dock_index - 1,
+            last_row: plan_rows + view_rows + frame.dock_index - 1,
             tail: stream_fade_tail,
         });
-        fit_frame(
-            &mut frame,
-            live_rows.saturating_sub(conversation_top_padding),
-        );
+        // Until the conversation fills the screen, its unused height stays
+        // above the pinned activity/composer dock. Once full, only the reserved
+        // activity spacer remains visible.
+        fit_frame(&mut frame, live_rows);
         let max_back = self.wrapped.len().saturating_sub(view_rows);
         self.scroll_back = self.history_view_start_anchor.take().map_or_else(
             || self.scroll_back.min(max_back),
@@ -2710,7 +2707,7 @@ impl Renderer {
         };
         let animation_activity_row = frame
             .activity_index
-            .map(|index| plan_rows + conversation_top_padding + view_rows + index);
+            .map(|index| plan_rows + view_rows + index);
         // The prompt rows follow the composer's top rule, and the live frame is
         // painted below the transcript window, so this is where they land.
         let composer_selection =
@@ -2718,7 +2715,7 @@ impl Renderer {
                 .composer_index
                 .zip(frame.composer_layout.take())
                 .map(|(index, layout)| ComposerSelection {
-                    first_row: plan_rows + conversation_top_padding + view_rows + index + 1,
+                    first_row: plan_rows + view_rows + index + 1,
                     layout,
                 });
         let (mut screen, cursor_line) = compose_screen(
@@ -2728,25 +2725,15 @@ impl Renderer {
             start,
             frame.cursor_line,
         );
-        screen.splice(
-            0..0,
-            (0..conversation_top_padding).map(|_| PaintLine::blank()),
-        );
         screen.splice(0..0, plan_lines);
         let response_bullet_row = waiting_for_response
             .then(|| {
-                visible_response_bullet_row(
-                    &self.wrapped,
-                    start..start + view_rows,
-                    plan_rows + conversation_top_padding,
-                )
+                visible_response_bullet_row(&self.wrapped, start..start + view_rows, plan_rows)
             })
             .flatten();
-        let cursor_line = cursor_line + plan_rows + conversation_top_padding;
+        let cursor_line = cursor_line + plan_rows;
         let scroll_to_bottom_overlay = self.scroll_to_bottom_control(width).and_then(|control| {
-            let row = plan_rows
-                + conversation_top_padding
-                + scroll_to_bottom_overlay_row(view_rows, frame.composer_index)?;
+            let row = plan_rows + scroll_to_bottom_overlay_row(view_rows, frame.composer_index)?;
             let line = screen.get_mut(row)?;
             let start = UnicodeWidthStr::width(control.prefix.as_str());
             let end = start + UnicodeWidthStr::width(control.text.as_str());
@@ -2757,7 +2744,7 @@ impl Renderer {
             Some((row, control))
         });
         self.last_transcript_start = start;
-        self.last_transcript_screen_start = plan_rows + conversation_top_padding;
+        self.last_transcript_screen_start = plan_rows;
         self.reconcile_selection(&screen, plan_rows);
         let full_repaint_rows = plan_rows_requiring_full_repaint(
             &self.previous_lines,
@@ -5989,16 +5976,6 @@ fn fit_frame(frame: &mut Frame, target_rows: usize) {
     frame.cursor_line = frame.cursor_line.min(frame.lines.len().saturating_sub(1));
 }
 
-/// The ordinary frame filler belongs above an active conversation, not between
-/// its latest response and the pinned activity row. Welcome and overlay frames
-/// have no transcript and keep their existing top-aligned layout.
-fn conversation_top_padding(frame: &Frame, live_rows: usize, transcript_len: usize) -> usize {
-    if frame.activity_index.is_none() || transcript_len == 0 {
-        return 0;
-    }
-    live_rows.saturating_sub(frame.lines.len())
-}
-
 fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -> PaintLine {
     let Some(status) = status else {
         return PaintLine {
@@ -8026,7 +8003,10 @@ fn block_lines_with_mode_at(
         // block already owns its separator. Keep intentional blank rows inside
         // the answer, but do not let a trailing delimiter grow the live frame
         // at the instant streaming finishes and move the answer upward.
-        while raw_lines.last().is_some_and(|line| line.trim().is_empty()) {
+        while raw_lines
+            .last()
+            .is_some_and(|line| UnicodeWidthStr::width(line.trim()) == 0)
+        {
             raw_lines.pop();
         }
     }
@@ -15249,26 +15229,17 @@ mod tests {
             renderer.history_view_rows_anchor,
         );
         renderer.last_transcript_rows = view_rows;
-        let conversation_top_padding =
-            conversation_top_padding(&frame, live_rows, renderer.wrapped.len());
-        fit_frame(
-            &mut frame,
-            live_rows.saturating_sub(conversation_top_padding),
-        );
+        fit_frame(&mut frame, live_rows);
         let max_back = renderer.wrapped.len().saturating_sub(view_rows);
         let start = max_back - renderer.scroll_back.min(max_back);
-        let (mut screen, _) = compose_screen(
+        compose_screen(
             &renderer.wrapped,
             frame.lines,
             view_rows,
             start,
             frame.cursor_line,
-        );
-        screen.splice(
-            0..0,
-            (0..conversation_top_padding).map(|_| PaintLine::blank()),
-        );
-        screen
+        )
+        .0
     }
 
     fn answer_row(screen: &[PaintLine]) -> usize {
@@ -15486,7 +15457,7 @@ mod tests {
             rows,
             width,
         );
-        assert_eq!(answer_row(&screen), late_streaming_row);
+        assert_eq!(answer_row(&screen) + 2, late_streaming_row);
 
         // 단계 구분이 없는 제공자는 다음 텍스트가 시작되기 전에 기존 응답을
         // 같은 자식 id의 접힌 그룹으로 교체한다.
@@ -15611,85 +15582,141 @@ mod tests {
     }
 
     #[test]
-    fn two_rows_stay_above_activity_during_streaming_and_completion() {
+    fn two_rows_stay_above_activity_once_the_conversation_fills_the_screen() {
         set_chat_layout(false);
-        for history_pairs in [0, 10] {
-            for (rows, width) in [(18, 60), (19, 60), (24, 80), (25, 80), (32, 120), (33, 120)] {
-                let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
-                renderer.shell_display_mode = ShellDisplayMode::Hide;
-                renderer.diff_display_mode = DiffDisplayMode::Hide;
+        for (rows, width) in [(18, 60), (19, 60), (24, 80), (25, 80), (32, 120), (33, 120)] {
+            let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+            renderer.shell_display_mode = ShellDisplayMode::Hide;
+            renderer.diff_display_mode = DiffDisplayMode::Hide;
 
-                let mut history = Vec::new();
-                for index in 0..history_pairs {
-                    history.push(Block::new(
-                        BlockKind::User,
-                        "Codex",
-                        format!("과거 프롬프트 {index}"),
-                    ));
-                    history.push(Block::new(
-                        BlockKind::Assistant,
-                        "Codex",
-                        format!("과거 답변 {index}"),
-                    ));
-                }
-                history.push(Block::new(BlockKind::User, "Codex", "현재 프롬프트"));
-                simulate_fullscreen_frame(
-                    &mut renderer,
-                    &history,
-                    &[],
-                    Some("Working"),
-                    None,
-                    rows,
-                    width,
-                );
-
-                let answer = Block::new(
+            let mut history = Vec::new();
+            for index in 0..10 {
+                history.push(Block::new(
+                    BlockKind::User,
+                    "Codex",
+                    format!("과거 프롬프트 {index}"),
+                ));
+                history.push(Block::new(
                     BlockKind::Assistant,
                     "Codex",
-                    "스트리밍 중인 최종 답변입니다.",
-                );
-                let assert_gap = |screen: &[PaintLine]| {
-                    assert_eq!(screen.len(), rows);
-                    let answer = answer_row(screen);
-                    let activity = screen
-                        .iter()
-                        .position(|line| {
-                            let text = painted_line_text(line);
-                            text.contains("Working") || text.contains("Completed")
-                        })
-                        .expect("activity row");
-                    assert_eq!(
-                        activity - answer,
-                        3,
-                        "history_pairs={history_pairs}, rows={rows}, width={width}"
-                    );
-                    assert!(screen[answer + 1] == PaintLine::blank());
-                    assert!(screen[answer + 2] == PaintLine::blank());
-                    answer
-                };
-
-                let screen = simulate_fullscreen_frame(
-                    &mut renderer,
-                    &[],
-                    std::slice::from_ref(&answer),
-                    Some("Working"),
-                    None,
-                    rows,
-                    width,
-                );
-                let streaming_row = assert_gap(&screen);
-
-                let screen = simulate_fullscreen_frame(
-                    &mut renderer,
-                    std::slice::from_ref(&answer),
-                    &[],
-                    Some("Completed"),
-                    None,
-                    rows,
-                    width,
-                );
-                assert_eq!(assert_gap(&screen), streaming_row);
+                    format!("과거 답변 {index}"),
+                ));
             }
+            history.push(Block::new(BlockKind::User, "Codex", "현재 프롬프트"));
+            simulate_fullscreen_frame(
+                &mut renderer,
+                &history,
+                &[],
+                Some("Working"),
+                None,
+                rows,
+                width,
+            );
+
+            let mut answer = Block::new(
+                BlockKind::Assistant,
+                "Codex",
+                "스트리밍 중인 최종 답변입니다.",
+            );
+            let assert_gap = |screen: &[PaintLine]| {
+                assert_eq!(screen.len(), rows);
+                let answer = answer_row(screen);
+                let activity = screen
+                    .iter()
+                    .position(|line| {
+                        let text = painted_line_text(line);
+                        text.contains("Working") || text.contains("Completed")
+                    })
+                    .expect("activity row");
+                assert_eq!(activity - answer, 3, "rows={rows}, width={width}");
+                assert!(screen[answer + 1] == PaintLine::blank());
+                assert!(screen[answer + 2] == PaintLine::blank());
+                answer
+            };
+
+            let screen = simulate_fullscreen_frame(
+                &mut renderer,
+                &[],
+                std::slice::from_ref(&answer),
+                Some("Working"),
+                None,
+                rows,
+                width,
+            );
+            let streaming_row = assert_gap(&screen);
+
+            answer.body.push_str("\n   \n\t\n\u{200b}");
+            let screen = simulate_fullscreen_frame(
+                &mut renderer,
+                &[],
+                std::slice::from_ref(&answer),
+                Some("Working"),
+                None,
+                rows,
+                width,
+            );
+            assert_eq!(assert_gap(&screen), streaming_row);
+
+            let screen = simulate_fullscreen_frame(
+                &mut renderer,
+                std::slice::from_ref(&answer),
+                &[],
+                Some("Completed"),
+                None,
+                rows,
+                width,
+            );
+            assert_eq!(assert_gap(&screen), streaming_row);
+        }
+    }
+
+    #[test]
+    fn sparse_first_turn_stays_top_aligned_until_the_conversation_fills_the_screen() {
+        set_chat_layout(false);
+        let width = 120;
+        let committed = vec![
+            Block::welcome("Codex", "Super Vibe", "D:\\hojeSource\\Devez-vibe", "", &[]),
+            Block::new(BlockKind::Update, "Tip", "/provider: Set provider"),
+            Block::new(BlockKind::User, "Codex", "첫 프롬프트 위치 기준"),
+        ];
+        let answer = Block::new(
+            BlockKind::Assistant,
+            "Codex",
+            "스트리밍 중인 최종 답변입니다.",
+        );
+
+        let render = |rows, live: &[Block]| {
+            let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+            renderer.shell_display_mode = ShellDisplayMode::Hide;
+            renderer.diff_display_mode = DiffDisplayMode::Hide;
+            simulate_fullscreen_frame(
+                &mut renderer,
+                &committed,
+                live,
+                Some("Working"),
+                None,
+                rows,
+                width,
+            )
+        };
+        let row_of = |screen: &[PaintLine], marker: &str| {
+            screen
+                .iter()
+                .position(|line| painted_line_text(line).contains(marker))
+                .unwrap_or_else(|| panic!("missing row: {marker}"))
+        };
+
+        for live in [&[][..], std::slice::from_ref(&answer)] {
+            let shorter = render(30, live);
+            let taller = render(31, live);
+
+            for marker in ["DEVEZ VIBE", "첫 프롬프트 위치 기준"] {
+                assert_eq!(row_of(&shorter, marker), row_of(&taller, marker));
+            }
+            if !live.is_empty() {
+                assert_eq!(answer_row(&shorter), answer_row(&taller));
+            }
+            assert_eq!(row_of(&shorter, "Working") + 1, row_of(&taller, "Working"));
         }
     }
 
