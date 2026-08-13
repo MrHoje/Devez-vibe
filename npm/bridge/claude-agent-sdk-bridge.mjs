@@ -537,6 +537,9 @@ function makeOptions(params, sessionId, resume) {
     enableFileCheckpointing: true,
     persistSession: true,
     settingSources: ["user", "project", "local"],
+    // The flag settings layer outranks user/project/local, so a CLI output style
+    // never stacks on top of the DevezVibe instructions we append below.
+    settings: { outputStyle: "default" },
     skills: "all",
     tools: { type: "preset", preset: "claude_code" },
     systemPrompt: {
