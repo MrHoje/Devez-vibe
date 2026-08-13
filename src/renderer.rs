@@ -4940,8 +4940,13 @@ fn normal_frame_with_expansion(
     let composer_index = lines.len();
     let cursor_line = composer_index + input_cursor_line;
     lines.extend(input_lines);
-    if status.fallback != HIDDEN_STATUS_LINE {
+    let status_line_painted = status.fallback != HIDDEN_STATUS_LINE;
+    if status_line_painted {
         lines.push(status_line_row(status.line, &status.fallback, width));
+    }
+    // Separate the running-subagent rows from the status line with one blank row.
+    if status_line_painted && !subagents.is_empty() {
+        lines.push(PaintLine::blank());
     }
     lines.extend(subagent_lines(subagents, width));
 
@@ -6017,7 +6022,7 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
     if let Some(model) = status.model.filter(|model| !model.is_empty()) {
         let span = push_status_span(
             &mut spans,
-            format!(" {} ", compact_right(&model, 28)),
+            compact_right(&model, 28),
             status_model_tone(&model).unwrap_or(Tone::StatusText),
         );
         picks.push((span, Pick::Model));
@@ -17159,7 +17164,7 @@ mod tests {
         );
 
         assert_eq!(line.prefix, " ");
-        assert_eq!(line.text, " GPT-5.6 Sol ");
+        assert_eq!(line.text, "GPT-5.6 Sol");
     }
 
     /// The two readings the status line lets you change answer to a click; the
