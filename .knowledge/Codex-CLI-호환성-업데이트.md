@@ -65,5 +65,6 @@ Codex 0.x.y 기준으로 호환성 업데이트해
 
 | 날짜 | 확인 Codex 버전 | 결과 | 비고 |
 | --- | --- | --- | --- |
+| 2026-08-13 | 0.147.0 | 반영 완료 | MCP 2026-07-28 프로토콜이 `features.mcp_2026_07_28` opt-in으로 추가돼 app-server 실행 시 `-c`로 켠다(사용자 config 선언이 있으면 존중). `initialize` capabilities는 `extensions`에 `openai/form`을 선언하도록 바뀌어 legacy alias와 함께 보낸다. `mcpServerStatus/list`의 `nextCursor`는 `limit: 100` 단일 조회로 계속 충분해 미적용. |
 | 2026-07-29 | 0.146.0 | 호환 유지, 기능 반영 후보 확인 | `app-server generate-ts --experimental` 스키마와 현재 요청 경로를 대조했다. 세션 이름·고정과 유지형 사이드 대화는 적용 후보이며, Plugin 발행 기능은 필요 시 적용한다. |
 | 2026-07-26 | 0.145.0 | 기준 설정 | DevezCLI 현 구현 기준 |

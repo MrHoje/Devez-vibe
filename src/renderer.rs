@@ -4442,7 +4442,7 @@ fn subagent_line(subagent: &SubagentView, index: usize, width: u16) -> PaintLine
     // The gutter, glyph, and elapsed reading are fixed, so only the name is
     // compacted when the terminal cannot hold the whole row.
     let reserved =
-        1 + UnicodeWidthStr::width(SUBAGENT_GLYPH) + 1 + UnicodeWidthStr::width(elapsed.as_str());
+        1 + UnicodeWidthStr::width(SUBAGENT_GLYPH) + 2 + UnicodeWidthStr::width(elapsed.as_str());
     let available = usize::from(width).saturating_sub(reserved + 1);
     let name = compact_right(&subagent.name, available);
 
@@ -4456,7 +4456,7 @@ fn subagent_line(subagent: &SubagentView, index: usize, width: u16) -> PaintLine
         pick: None,
         tail: vec![
             PaintSpan {
-                text: format!(" {name}"),
+                text: format!("  {name}"),
                 tone: Tone::Plain,
                 bold: false,
             },
@@ -4482,9 +4482,9 @@ fn format_subagent_elapsed(seconds: u64) -> String {
     }
 }
 
-/// Matches the transcript's running-tool bullet so the composer rows read as the
-/// same kind of activity.
-const SUBAGENT_GLYPH: &str = "⏺";
+/// A small bullet keeps the running-subagent rows lighter than the transcript's
+/// tool bullet, so a fan-out reads as quieter activity under the status line.
+const SUBAGENT_GLYPH: &str = "•";
 
 fn queue_preview_lines(prompts: &[String], width: u16) -> Vec<PaintLine> {
     prompts
@@ -14087,7 +14087,7 @@ mod tests {
                 .iter()
                 .map(painted)
                 .collect::<Vec<_>>(),
-            [" ⏺ Explore · 1m 33s", " ⏺ developer · 3s",]
+            [" •  Explore · 1m 33s", " •  developer · 3s",]
         );
     }
 
@@ -14117,7 +14117,7 @@ mod tests {
             80,
         );
 
-        assert_eq!(pick_on(&lines[0], "⏺"), Some(Pick::Subagent(0)));
+        assert_eq!(pick_on(&lines[0], "•"), Some(Pick::Subagent(0)));
         assert_eq!(pick_on(&lines[0], "Explore"), Some(Pick::Subagent(0)));
         assert_eq!(pick_on(&lines[1], "developer"), Some(Pick::Subagent(1)));
         assert_eq!(pick_on(&lines[0], "4s"), None);
@@ -18601,8 +18601,8 @@ mod tests {
         cells
     }
 
-    /// The highlight is the clickable span and its one column of bleed — not the
-    /// whole separator it reaches into, and not the border beside it.
+    /// The highlight is exactly the clickable span — not the separator it sits
+    /// beside, and not the border beside that.
     #[test]
     fn the_highlight_covers_exactly_the_clickable_columns() {
         theme::set_current(ThemeKind::Dark);
@@ -18625,7 +18625,7 @@ mod tests {
         print_line_with_selection(&mut output, &line, None, Some(hovered)).expect("paint");
 
         let painted = String::from_utf8(output).expect("utf-8 escapes");
-        assert_eq!(hovered_cells(&painted), " GPT-5.6 Sol ");
+        assert_eq!(hovered_cells(&painted), "GPT-5.6 Sol");
     }
 
     /// Only the piece under the pointer lights up, and it lights up wherever the

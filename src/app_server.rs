@@ -127,6 +127,7 @@ impl AppServer {
         let resolved_codex = resolve_command(codex_path);
         let mut command = codex_command(&resolved_codex);
         apply_originator_override(&mut command);
+        apply_mcp_2026_protocol_override(&mut command);
         apply_devezcode_room_override(&mut command, devezcode_room);
         isolate_ctrl_c(&mut command);
         let mut child = command
@@ -303,7 +304,13 @@ fn initialize_params() -> Value {
         "capabilities": {
             "experimentalApi": true,
             "requestAttestation": false,
-            "mcpServerOpenaiFormElicitation": true
+            // `mcpServerOpenaiFormElicitation` is the legacy alias an older
+            // app-server still understands; `extensions` is how 0.147 wants the
+            // same opt-in declared. Sending both keeps either version working.
+            "mcpServerOpenaiFormElicitation": true,
+            "extensions": {
+                "openai/form": {}
+            }
         }
     })
 }
@@ -377,6 +384,40 @@ fn apply_originator_override(command: &mut Command) {
     }
 }
 
+/// Codex 0.147 keeps the MCP 2026-07-28 protocol — paginated discovery,
+/// multi-round requests, and non-blocking server startup — behind an opt-in
+/// feature. Turn it on for this invocation so a slow MCP server no longer holds
+/// up the turn that needs it. A config that already decided the flag wins, so
+/// turning it off stays possible.
+fn apply_mcp_2026_protocol_override(command: &mut Command) {
+    if codex_config_declares_mcp_2026_protocol() {
+        return;
+    }
+    command.arg("-c").arg(MCP_2026_PROTOCOL_OVERRIDE);
+}
+
+fn codex_config_declares_mcp_2026_protocol() -> bool {
+    crate::state::codex_home()
+        .map(|home| home.join("config.toml"))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|config| config_declares_mcp_2026_protocol(&config))
+}
+
+/// The key only exists under `[features]`, so a bare assignment anywhere in the
+/// file is the user's decision no matter which section it sits in.
+fn config_declares_mcp_2026_protocol(config: &str) -> bool {
+    config.lines().any(|line| {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        let Some((key, _)) = line.split_once('=') else {
+            return false;
+        };
+        matches!(
+            key.trim().trim_matches(['"', '\'']),
+            MCP_2026_FEATURE_KEY | "features.mcp_2026_07_28"
+        )
+    })
+}
+
 /// Codex app-server starts stdio MCP children with an isolated environment.
 /// Put the DevezCode room in this invocation's MCP override so every browser
 /// call is bound to the tab that started Devez Vibe, without mutating global config.
@@ -436,6 +477,8 @@ fn toml_string(value: &str) -> String {
 }
 
 const ORIGINATOR_OVERRIDE_ENV: &str = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
+const MCP_2026_FEATURE_KEY: &str = "mcp_2026_07_28";
+const MCP_2026_PROTOCOL_OVERRIDE: &str = "features.mcp_2026_07_28=true";
 
 #[cfg(windows)]
 fn isolate_ctrl_c(command: &mut Command) {
@@ -602,10 +645,47 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
+        // Codex 0.147 reads the extension declaration instead of the alias.
+        assert_eq!(
+            params.pointer("/capabilities/extensions/openai~1form"),
+            Some(&json!({}))
+        );
         assert_eq!(
             params.pointer("/clientInfo/name").and_then(Value::as_str),
             Some("devez-vibe")
         );
+    }
+
+    #[test]
+    fn the_mcp_2026_protocol_stays_opt_in_through_the_config() {
+        // A config that says nothing leaves the launch override in charge.
+        assert!(!config_declares_mcp_2026_protocol(
+            "model = \"gpt-5\"\n[features]\ntool_search = true\n"
+        ));
+        assert!(config_declares_mcp_2026_protocol(
+            "[features]\nmcp_2026_07_28 = false\n"
+        ));
+        assert!(config_declares_mcp_2026_protocol(
+            "features.mcp_2026_07_28 = true  # already decided\n"
+        ));
+        // A commented-out line is not a decision.
+        assert!(!config_declares_mcp_2026_protocol(
+            "[features]\n# mcp_2026_07_28 = true\n"
+        ));
+
+        let mut command = codex_command(Path::new("codex"));
+        apply_mcp_2026_protocol_override(&mut command);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        // The real Codex home decides, so only assert the pair stays together.
+        if let Some(index) = args.iter().position(|arg| arg == MCP_2026_PROTOCOL_OVERRIDE) {
+            assert_eq!(args.get(index - 1).map(String::as_str), Some("-c"));
+        } else {
+            assert!(codex_config_declares_mcp_2026_protocol());
+        }
     }
 
     #[test]

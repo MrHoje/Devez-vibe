@@ -1683,24 +1683,43 @@ function notificationTag(body, name) {
   return match?.[1]?.trim() || "";
 }
 
+// 완료 통지는 SDK 빌드에 따라 문자열·text 블록·다른 블록 형태로 올 수 있다.
+// 감지가 본문 구조에 좌우되면 백그라운드 서브에이전트가 영원히 남으므로, 잡을 수
+// 있는 모든 문자열을 한데 모은다.
+function messageAllText(message) {
+  const content = message.message?.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts = [];
+  for (const block of content) {
+    if (typeof block === "string") parts.push(block);
+    else if (typeof block?.text === "string") parts.push(block.text);
+    else if (typeof block?.content === "string") parts.push(block.content);
+  }
+  return parts.join("\n");
+}
+
 function taskNotifications(message) {
-  if (message.origin?.kind !== "task-notification"
-    && !messageTextParts(message).some((text) => text.includes("<task-notification>"))) {
+  const raw = messageAllText(message);
+  if (message.origin?.kind !== "task-notification" && !raw.includes("<task-notification>")) {
     return [];
   }
   const notifications = [];
-  for (const text of messageTextParts(message)) {
-    for (const match of text.matchAll(/<task-notification>([\s\S]*?)<\/task-notification>/g)) {
-      const body = match[1];
-      notifications.push({
-        taskId: notificationTag(body, "task-id"),
-        toolUseId: notificationTag(body, "tool-use-id"),
-        status: notificationTag(body, "status"),
-        summary: notificationTag(body, "summary"),
-      });
-    }
+  for (const match of raw.matchAll(/<task-notification>([\s\S]*?)<\/task-notification>/g)) {
+    const body = match[1];
+    notifications.push({
+      taskId: notificationTag(body, "task-id"),
+      toolUseId: notificationTag(body, "tool-use-id"),
+      status: notificationTag(body, "status"),
+      summary: notificationTag(body, "summary"),
+    });
   }
   return notifications;
+}
+
+// 통지 요약은 보통 `Agent "Explore" finished` 형태로 에이전트 이름을 따옴표로 담는다.
+function subagentNameFromSummary(summary) {
+  return String(summary || "").match(/"([^"]+)"/)?.[1] || "";
 }
 
 function finishNotifiedSubagents(session, notifications) {
@@ -1708,9 +1727,18 @@ function finishNotifiedSubagents(session, notifications) {
     const byToolUse = notification.toolUseId
       ? session.subagents.get(notification.toolUseId)
       : null;
-    const running = byToolUse || (notification.taskId
+    let running = byToolUse || (notification.taskId
       ? [...session.subagents.values()].find((agent) => agent.taskId === notification.taskId)
       : null);
+    // 전달 형태에 따라 id가 어긋날 수 있다. 그때는 요약이 지목한 이름의 백그라운드
+    // 에이전트를 지워, 끝난 에이전트가 그래도 행에서 사라지게 한다.
+    if (!running) {
+      const name = subagentNameFromSummary(notification.summary);
+      if (name) {
+        running = [...session.subagents.values()]
+          .find((agent) => agent.background && agent.name === name);
+      }
+    }
     if (!running) continue;
     emitSubagentLine(session, running.id, {
       kind: notification.status === "completed" ? "result" : "error",
@@ -2898,6 +2926,33 @@ async function runSelfTest() {
     || notification[0].status !== "completed"
     || notification[0].summary !== 'Agent "Explore" finished') {
     throw new Error(`Claude task notification self-test failed: ${JSON.stringify(notification)}`);
+  }
+  // 통지가 문자열이 아닌 text 블록 배열로 와도 감지해야 한다.
+  const blockNotification = taskNotifications({
+    message: {
+      content: [{
+        type: "text",
+        text: `[SYSTEM NOTIFICATION]\n<task-notification>\n<task-id>agent-9</task-id>\n<tool-use-id>toolu_9</tool-use-id>\n<status>completed</status>\n<summary>Agent "Explore" finished</summary>\n</task-notification>`,
+      }],
+    },
+  });
+  if (blockNotification.length !== 1 || blockNotification[0].taskId !== "agent-9") {
+    throw new Error(`Claude block notification self-test failed: ${JSON.stringify(blockNotification)}`);
+  }
+  // id가 어긋나도 요약의 이름으로 백그라운드 서브에이전트를 정리해야 한다.
+  const nameFallbackSession = {
+    id: "name-fallback-session",
+    turn: { id: "t", sawStreamText: false },
+    subagents: new Map([[
+      "toolu_live",
+      { id: "toolu_live", taskId: "agent-live", background: true, name: "Explore", description: "", tool: "", startedAt: Date.now() },
+    ]]),
+  };
+  finishNotifiedSubagents(nameFallbackSession, [{
+    taskId: "mismatch", toolUseId: "mismatch", status: "completed", summary: 'Agent "Explore" finished',
+  }]);
+  if (nameFallbackSession.subagents.size !== 0) {
+    throw new Error("Claude subagent name fallback self-test failed");
   }
   const lifecycleSession = {
     id: "self-test-session",

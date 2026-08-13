@@ -13674,6 +13674,12 @@ fn read_conversation_view() -> ConversationView {
 }
 
 fn read_vibe_config_value(key: &str) -> Option<String> {
+    // Tests build their state through the same constructor, so a maintainer whose
+    // own settings.toml carries a different display mode would fail the tests that
+    // assume the shipped defaults. Under test the file is not consulted at all.
+    if cfg!(test) {
+        return None;
+    }
     vibe_settings_path()
         .and_then(|path| fs::read_to_string(path).ok())
         .and_then(|config| config_value(&config, key))

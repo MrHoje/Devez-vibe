@@ -19,8 +19,10 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "마지막 스트림 조각을 라이브 화면에 먼저 그린 뒤 완료 상태로 전환합니다.",
-    "하단에서 응답 완료 순간 마지막 줄이 한 칸 위로 튀는 현상을 방지합니다.",
+    "Codex의 새 MCP 프로토콜을 켜, MCP 서버가 늦게 올라와도 대화가 기다리지 않습니다.",
+    "Claude 실행 파일을 최신 버전으로 올려, 긴 경로와 좁은 터미널에서 나던 오류를 없앴습니다.",
+    "끝난 백그라운드 에이전트가 실행 목록에 남아 있던 문제를 고쳤습니다.",
+    "실행 중인 에이전트 줄을 상태줄과 한 줄 띄우고 작은 점으로 표시해 한눈에 구분됩니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

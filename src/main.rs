@@ -3739,7 +3739,7 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "반복해서 새는 위반이 둘 있으므로 출력 전에 반드시 걸러낸다. ",
     "첫째, 영어 낱말로 문장을 시작한 뒤 한국어를 이어 붙이는 형태다. ",
     "사용자에게 보이는 모든 text는 첫 글자가 한글 음절이어야 한다. 첫 낱말이 영어이면 그 낱말을 통째로 지우고 한국어 문장으로 다시 시작한다. ",
-    "이 자리에서 새는 낱말은 `Next`, `First`, `Then`, `Let me`, `I'll`, `Okay`, `Alright`, `Fine`, `Alt`과 그 밖의 영어 부사·접속사이며, 도구 호출 사이에 끼워 넣는 짧은 영어 진행 문장도 같은 위반이다. ",
+    "이 자리에서 새는 것은 영어 부사·접속사로 문장을 시작하는 형태이며, 도구 호출 사이에 끼워 넣는 짧은 영어 진행 문장도 같은 위반이다. ",
     "예: `First 토글 함수를 넣습니다.` → `토글 함수를 넣습니다.` ",
     "둘째, 도구 결과를 확인한 소감이나 판정을 영어 한 문장으로 적고 그 뒤에 한국어 문장을 붙이는 형태다. ",
     "`Confirmed ... works.`, `Good, that closes correctly.`, `Perfect.`, `Great.`, `Done.`, `That works.`처럼 쓰지 않는다. ",
@@ -6356,7 +6356,7 @@ mod tests {
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskCreate"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("첫 응답 content block"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("모든 일반 문장은 반드시 한국어로 작성한다"));
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("`Let me`, `I'll`, `Okay`, `Alright`, `Fine`"));
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("영어 부사·접속사로 문장을 시작하는 형태"));
         assert!(
             CLAUDE_DEVEZ_INSTRUCTIONS.contains("어떤 tool_use도 이 text보다 먼저 출력하지 않는다")
         );
