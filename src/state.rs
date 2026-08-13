@@ -17640,6 +17640,9 @@ mod tests {
         while state.vibe_mode() != VibeMode::SuperVibe {
             state.cycle_vibe_mode();
         }
+        // 접힘은 Completed 표시 모드에서만 일어난다. 생성자는 이 값을 디스크 설정에서
+        // 읽으므로, 머신 설정에 흔들리지 않게 테스트에서 명시한다.
+        state.set_response_display_mode(ResponseDisplayMode::Completed);
         state.set_turn_started("turn-1".to_owned());
         for (id, phase, text) in [
             ("progress-1", "commentary", "원격 변경을 확인했습니다."),
@@ -17903,6 +17906,8 @@ mod tests {
             while state.vibe_mode() != VibeMode::SuperVibe {
                 state.cycle_vibe_mode();
             }
+            // 생성자가 디스크 설정에서 읽는 값에 흔들리지 않도록 Completed를 명시한다.
+            state.set_response_display_mode(ResponseDisplayMode::Completed);
             if submit_prompt {
                 assert!(matches!(
                     state.submit_text("첫 요청".to_owned(), "첫 요청".to_owned()),

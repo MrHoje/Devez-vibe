@@ -15022,6 +15022,225 @@ mod tests {
         assert!(renderer.wrapped == incremental);
     }
 
+    /// `render_fullscreen`의 합성 절차를 그대로 따라가 한 프레임의 화면 행을 만든다.
+    fn simulate_fullscreen_frame(
+        renderer: &mut Renderer,
+        committed: &[Block],
+        live: &[Block],
+        activity: Option<&str>,
+        collapse: Option<(u64, f32)>,
+        rows: usize,
+        width: u16,
+    ) -> Vec<PaintLine> {
+        renderer.update_response_collapse(collapse);
+        let live_views = live
+            .iter()
+            .map(|block| LiveBlockView {
+                block,
+                revision: block.body.len() as u64,
+            })
+            .collect::<Vec<_>>();
+        let live_lines = renderer.live_frame_lines(&live_views, width, rows.max(3));
+        let editor = Editor::default();
+        let status = StatusArea {
+            fallback: HIDDEN_STATUS_LINE.to_owned(),
+            line: None,
+            composer_notice: None,
+            composer_mode: Some(ComposerMode {
+                branch: Some("main".to_owned()),
+                vibe_mode: "Super Vibe".to_owned(),
+                vibe_tone: VibeTone::Super,
+                label: String::new(),
+                accent: ModeAccent::Calm,
+                model: "Claude Opus 4.8".to_owned(),
+                response_length: "짧게".to_owned(),
+                response_display_mode: "완료".to_owned(),
+                claude_permission: None,
+                effort: "high".to_owned(),
+                shell_display_mode: "숨김".to_owned(),
+                diff_display_mode: "숨김".to_owned(),
+                cost: None,
+            }),
+        };
+        let mut frame = normal_frame_with_expansion(
+            live_lines,
+            &editor,
+            &[],
+            &[],
+            &[],
+            "",
+            None,
+            &[],
+            activity,
+            None,
+            0.5,
+            0.5,
+            status,
+            width,
+        );
+        if !committed.is_empty() && renderer.response_collapse.is_none() {
+            renderer.history_view_rows_anchor = None;
+            renderer.history_view_start_anchor = None;
+        }
+        let old_view_rows = split_rows(rows, frame.lines.len(), renderer.wrapped.len()).0;
+        renderer.commit_fullscreen_blocks(committed, width, old_view_rows);
+        let live_rows_after_absorb = frame.lines.len().saturating_sub(1);
+        if renderer.wrapped.last() == Some(&PaintLine::blank())
+            && trailing_transcript_spacer_will_be_visible(
+                rows,
+                live_rows_after_absorb,
+                renderer.wrapped.len(),
+                renderer.history_view_rows_anchor,
+                renderer.scroll_back,
+                renderer.history_view_start_anchor,
+            )
+        {
+            frame.absorb_leading_spacer();
+        }
+        let (view_rows, live_rows) = split_rows_with_transcript_anchor(
+            rows,
+            frame.lines.len(),
+            renderer.wrapped.len(),
+            renderer.history_view_rows_anchor,
+        );
+        renderer.last_transcript_rows = view_rows;
+        fit_frame(&mut frame, live_rows);
+        let max_back = renderer.wrapped.len().saturating_sub(view_rows);
+        let start = max_back - renderer.scroll_back.min(max_back);
+        compose_screen(&renderer.wrapped, frame.lines, view_rows, start, frame.cursor_line).0
+    }
+
+    fn answer_row(screen: &[PaintLine]) -> usize {
+        screen
+            .iter()
+            .position(|line| line.text.contains("스트리밍 중인 최종 답변"))
+            .expect("answer row")
+    }
+
+    #[test]
+    fn a_claude_turn_keeps_the_streamed_answer_row_through_fold_and_release() {
+        set_chat_layout(false);
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.fold_progress_groups = true;
+        renderer.shell_display_mode = ShellDisplayMode::Hide;
+        renderer.diff_display_mode = DiffDisplayMode::Hide;
+        let rows = 24;
+        let width = 80;
+
+        let mut older = Vec::new();
+        for index in 0..12 {
+            older.push(Block::new(
+                BlockKind::User,
+                "Codex",
+                format!("과거 프롬프트 {index}"),
+            ));
+            older.push(Block::new(
+                BlockKind::Assistant,
+                "Codex",
+                format!("과거 답변 {index}"),
+            ));
+        }
+        let previous_prompt = Block::new(BlockKind::User, "Codex", "이전 프롬프트");
+        let previous_answer = Block::new(BlockKind::Assistant, "Codex", "이전 답변입니다.");
+        let prompt = Block::new(BlockKind::User, "Codex", "새 프롬프트");
+        let commentary =
+            Block::new(BlockKind::Assistant, "Codex", "진행 상황을 먼저 알립니다.");
+        let mut answer = Block::new(BlockKind::Assistant, "Codex", "스트리밍")
+            .with_assistant_phase(AssistantPhase::FinalAnswer);
+
+        // 프롬프트 제출 직후: 응답 대기.
+        let mut initial = older;
+        initial.extend([previous_prompt, previous_answer, prompt]);
+        simulate_fullscreen_frame(&mut renderer, &initial, &[], Some("Working"), None, rows, width);
+
+        // 중간 진행 메시지가 라이브로 흐르다 committed로 이동한다.
+        simulate_fullscreen_frame(
+            &mut renderer,
+            &[],
+            std::slice::from_ref(&commentary),
+            Some("Working"),
+            None,
+            rows,
+            width,
+        );
+        simulate_fullscreen_frame(
+            &mut renderer,
+            std::slice::from_ref(&commentary),
+            &[],
+            Some("Working"),
+            None,
+            rows,
+            width,
+        );
+
+        // Claude 브리지는 phase를 주지 않으므로 최종 답변이 진행 메시지 아래에서 흐른다.
+        simulate_fullscreen_frame(
+            &mut renderer,
+            &[],
+            std::slice::from_ref(&answer),
+            Some("Working"),
+            None,
+            rows,
+            width,
+        );
+        answer.body.push_str(" 중인 최종 답변입니다.");
+        let screen = simulate_fullscreen_frame(
+            &mut renderer,
+            &[],
+            std::slice::from_ref(&answer),
+            Some("Working"),
+            None,
+            rows,
+            width,
+        );
+        let streaming_row = answer_row(&screen);
+
+        // 답변 항목 완료: committed로 이동해도 같은 행을 지킨다.
+        let screen = simulate_fullscreen_frame(
+            &mut renderer,
+            std::slice::from_ref(&answer),
+            &[],
+            Some("Working"),
+            None,
+            rows,
+            width,
+        );
+        assert_eq!(answer_row(&screen), streaming_row);
+
+        // 턴 종료: 진행 기록 접힘이 시작되고 activity가 사라져도 답변은 그대로다.
+        let group = Block::progress_group(vec![commentary.clone()]);
+        let group_id = group.id();
+        let screen = simulate_fullscreen_frame(
+            &mut renderer,
+            &[group],
+            &[],
+            None,
+            Some((group_id, 1.0)),
+            rows,
+            width,
+        );
+        assert_eq!(answer_row(&screen), streaming_row);
+
+        // 접힘 애니메이션 중에도, anchor가 풀린 뒤에도 답변 행이 흔들리지 않는다.
+        let screen = simulate_fullscreen_frame(
+            &mut renderer,
+            &[],
+            &[],
+            None,
+            Some((group_id, 0.4)),
+            rows,
+            width,
+        );
+        assert_eq!(answer_row(&screen), streaming_row);
+        let screen = simulate_fullscreen_frame(&mut renderer, &[], &[], None, None, rows, width);
+        let settled = answer_row(&screen);
+        assert_eq!(settled, streaming_row);
+
+        // 정착 후 답변 위에는 독립된 빈 줄 하나와 프롬프트 여백 행만 있다.
+        assert!(screen[settled - 1] == PaintLine::blank());
+        assert_eq!(screen[settled - 2].tone, Tone::UserPromptPadding);
+    }
+
     #[test]
     fn the_welcome_card_stays_at_the_top_while_the_composer_reaches_the_bottom() {
         // `dock_index` is what `fit_frame` pads at, so the welcome row above it
