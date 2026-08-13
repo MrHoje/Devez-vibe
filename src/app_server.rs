@@ -394,27 +394,44 @@ fn apply_mcp_2026_protocol_override(command: &mut Command) {
         return;
     }
     command.arg("-c").arg(MCP_2026_PROTOCOL_OVERRIDE);
+    apply_unstable_features_warning_override(command);
+}
+
+/// Codex greets every launch that has an under-development feature on with a
+/// warning naming the flag. The flag above is ours, not something the user
+/// asked for, so silence the warning we caused — but only when the config has
+/// not decided the setting itself.
+fn apply_unstable_features_warning_override(command: &mut Command) {
+    if codex_config_declares_unstable_features_warning() {
+        return;
+    }
+    command.arg("-c").arg(UNSTABLE_WARNING_OVERRIDE);
 }
 
 fn codex_config_declares_mcp_2026_protocol() -> bool {
+    codex_config_declares(&[MCP_2026_FEATURE_KEY, "features.mcp_2026_07_28"])
+}
+
+fn codex_config_declares_unstable_features_warning() -> bool {
+    codex_config_declares(&[UNSTABLE_WARNING_KEY])
+}
+
+fn codex_config_declares(keys: &[&str]) -> bool {
     crate::state::codex_home()
         .map(|home| home.join("config.toml"))
         .and_then(|path| std::fs::read_to_string(path).ok())
-        .is_some_and(|config| config_declares_mcp_2026_protocol(&config))
+        .is_some_and(|config| config_declares(&config, keys))
 }
 
-/// The key only exists under `[features]`, so a bare assignment anywhere in the
-/// file is the user's decision no matter which section it sits in.
-fn config_declares_mcp_2026_protocol(config: &str) -> bool {
+/// Both keys are unique to their own setting, so a bare assignment anywhere in
+/// the file is the user's decision no matter which section it sits in.
+fn config_declares(config: &str, keys: &[&str]) -> bool {
     config.lines().any(|line| {
         let line = line.split('#').next().unwrap_or_default().trim();
         let Some((key, _)) = line.split_once('=') else {
             return false;
         };
-        matches!(
-            key.trim().trim_matches(['"', '\'']),
-            MCP_2026_FEATURE_KEY | "features.mcp_2026_07_28"
-        )
+        keys.contains(&key.trim().trim_matches(['"', '\'']))
     })
 }
 
@@ -479,6 +496,8 @@ fn toml_string(value: &str) -> String {
 const ORIGINATOR_OVERRIDE_ENV: &str = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
 const MCP_2026_FEATURE_KEY: &str = "mcp_2026_07_28";
 const MCP_2026_PROTOCOL_OVERRIDE: &str = "features.mcp_2026_07_28=true";
+const UNSTABLE_WARNING_KEY: &str = "suppress_unstable_features_warning";
+const UNSTABLE_WARNING_OVERRIDE: &str = "suppress_unstable_features_warning=true";
 
 #[cfg(windows)]
 fn isolate_ctrl_c(command: &mut Command) {
@@ -658,20 +677,19 @@ mod tests {
 
     #[test]
     fn the_mcp_2026_protocol_stays_opt_in_through_the_config() {
+        let keys = [MCP_2026_FEATURE_KEY, "features.mcp_2026_07_28"];
         // A config that says nothing leaves the launch override in charge.
-        assert!(!config_declares_mcp_2026_protocol(
-            "model = \"gpt-5\"\n[features]\ntool_search = true\n"
+        assert!(!config_declares(
+            "model = \"gpt-5\"\n[features]\ntool_search = true\n",
+            &keys
         ));
-        assert!(config_declares_mcp_2026_protocol(
-            "[features]\nmcp_2026_07_28 = false\n"
-        ));
-        assert!(config_declares_mcp_2026_protocol(
-            "features.mcp_2026_07_28 = true  # already decided\n"
+        assert!(config_declares("[features]\nmcp_2026_07_28 = false\n", &keys));
+        assert!(config_declares(
+            "features.mcp_2026_07_28 = true  # already decided\n",
+            &keys
         ));
         // A commented-out line is not a decision.
-        assert!(!config_declares_mcp_2026_protocol(
-            "[features]\n# mcp_2026_07_28 = true\n"
-        ));
+        assert!(!config_declares("[features]\n# mcp_2026_07_28 = true\n", &keys));
 
         let mut command = codex_command(Path::new("codex"));
         apply_mcp_2026_protocol_override(&mut command);
@@ -685,6 +703,33 @@ mod tests {
             assert_eq!(args.get(index - 1).map(String::as_str), Some("-c"));
         } else {
             assert!(codex_config_declares_mcp_2026_protocol());
+        }
+    }
+
+    #[test]
+    fn turning_the_feature_on_also_silences_the_warning_it_causes() {
+        let keys = [UNSTABLE_WARNING_KEY];
+        assert!(!config_declares("model = \"gpt-5\"\n", &keys));
+        assert!(config_declares(
+            "suppress_unstable_features_warning = false\n",
+            &keys
+        ));
+
+        let mut command = codex_command(Path::new("codex"));
+        apply_mcp_2026_protocol_override(&mut command);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        // The warning override rides along with the flag that triggers it.
+        let carries_flag = args.iter().any(|arg| arg == MCP_2026_PROTOCOL_OVERRIDE);
+        let carries_warning = args.iter().any(|arg| arg == UNSTABLE_WARNING_OVERRIDE);
+        if carries_flag && !codex_config_declares_unstable_features_warning() {
+            assert!(carries_warning);
+        }
+        if !carries_flag {
+            assert!(!carries_warning);
         }
     }
 
