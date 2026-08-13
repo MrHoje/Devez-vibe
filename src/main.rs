@@ -1679,17 +1679,12 @@ fn renderer_mouse_action(
 fn pick_action(state: &mut AppState, pick: Pick) -> Action {
     match pick {
         Pick::VibeMode => {
-            let (shell, diff) = state.cycle_vibe_mode();
-            Action::PersistVibeDisplayModes {
-                vibe: state.vibe_mode(),
-                response: state.response_length(),
-                shell,
-                diff,
-            }
+            state.open_vibe_mode_picker();
+            Action::None
         }
         Pick::ResponseDisplayMode => {
-            let mode = state.cycle_response_display_mode();
-            Action::PersistResponseDisplayMode(mode)
+            state.open_response_display_picker();
+            Action::None
         }
         Pick::ShellDisplayMode => {
             state.cycle_shell_display_mode();
@@ -5638,14 +5633,33 @@ mod tests {
     }
 
     #[test]
-    fn clicking_the_response_display_badge_toggles_its_persisted_mode() {
+    fn clicking_the_response_display_badge_opens_its_picker() {
         let mut state = starting_state();
         let before = state.response_display_mode();
 
         let action = pick_action(&mut state, Pick::ResponseDisplayMode);
 
-        assert!(matches!(action, Action::PersistResponseDisplayMode(_)));
-        assert_ne!(state.response_display_mode(), before);
+        assert!(matches!(action, Action::None));
+        assert_eq!(state.response_display_mode(), before);
+        assert_eq!(
+            state.view().overlay.map(|overlay| overlay.title),
+            Some("Response".to_owned())
+        );
+    }
+
+    #[test]
+    fn clicking_the_vibe_badge_opens_its_picker() {
+        let mut state = starting_state();
+        let before = state.vibe_mode();
+
+        let action = pick_action(&mut state, Pick::VibeMode);
+
+        assert!(matches!(action, Action::None));
+        assert_eq!(state.vibe_mode(), before);
+        assert_eq!(
+            state.view().overlay.map(|overlay| overlay.title),
+            Some("Vibe Mode".to_owned())
+        );
     }
 
     #[test]
@@ -7274,7 +7288,13 @@ mod tests {
         let mut state = starting_state();
         let mut queued = None;
 
-        let vibe = pick_action(&mut state, Pick::VibeMode);
+        let (shell, diff) = state.cycle_vibe_mode();
+        let vibe = Action::PersistVibeDisplayModes {
+            vibe: state.vibe_mode(),
+            response: state.response_length(),
+            shell,
+            diff,
+        };
         assert!(hold_until_thread(&mut state, vibe, &mut queued).is_none());
         assert!(hold_until_thread(&mut state, Action::SetFast(true), &mut queued).is_none());
         assert!(

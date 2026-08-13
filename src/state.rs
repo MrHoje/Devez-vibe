@@ -137,12 +137,6 @@ impl ResponseDisplayMode {
         }
     }
 
-    const fn next(self) -> Self {
-        match self {
-            Self::All => Self::Completed,
-            Self::Completed => Self::All,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -5145,6 +5139,30 @@ impl AppState {
         });
     }
 
+    /// Opens the Vibe preset picker, the way `/vibemode` and the composer's Vibe
+    /// badge do — a menu instead of an instant cycle.
+    pub fn open_vibe_mode_picker(&mut self) {
+        self.pending = Some(PendingInteraction::VibeModePicker {
+            selected: self.vibe_mode.picker_index(),
+            vibe: self.vibe_mode,
+            response: self.response_length,
+            shell: self.shell_display_mode,
+            diff: self.diff_display_mode,
+        });
+    }
+
+    /// Opens the Response display picker, the way `/Response` and the composer's
+    /// Response badge do.
+    pub fn open_response_display_picker(&mut self) {
+        self.open_setting_picker(
+            DisplaySetting::Response,
+            match self.response_display_mode {
+                ResponseDisplayMode::All => 0,
+                ResponseDisplayMode::Completed => 1,
+            },
+        );
+    }
+
     fn apply_claude_permission_picker(&mut self, selected: usize) -> Action {
         let Some(mode) = ClaudePermissionMode::choices(
             self.claude_auto_mode_available(),
@@ -7801,13 +7819,7 @@ impl AppState {
                 Action::None
             }
             "/Response" | "/response" if parts.len() == 1 => {
-                self.open_setting_picker(
-                    DisplaySetting::Response,
-                    match self.response_display_mode {
-                        ResponseDisplayMode::All => 0,
-                        ResponseDisplayMode::Completed => 1,
-                    },
-                );
+                self.open_response_display_picker();
                 Action::None
             }
             "/Response" | "/response" if parts.len() == 2 => {
@@ -7822,13 +7834,7 @@ impl AppState {
                 Action::None
             }
             "/vibemode" if parts.len() == 1 => {
-                self.pending = Some(PendingInteraction::VibeModePicker {
-                    selected: self.vibe_mode.picker_index(),
-                    vibe: self.vibe_mode,
-                    response: self.response_length,
-                    shell: self.shell_display_mode,
-                    diff: self.diff_display_mode,
-                });
+                self.open_vibe_mode_picker();
                 Action::None
             }
             "/vibemode" => {
@@ -10945,12 +10951,6 @@ impl AppState {
     #[cfg(test)]
     pub const fn response_display_mode(&self) -> ResponseDisplayMode {
         self.response_display_mode
-    }
-
-    pub fn cycle_response_display_mode(&mut self) -> ResponseDisplayMode {
-        let mode = self.response_display_mode.next();
-        self.set_response_display_mode(mode);
-        mode
     }
 
     fn set_response_display_mode(&mut self, mode: ResponseDisplayMode) {
