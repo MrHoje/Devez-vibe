@@ -4795,6 +4795,17 @@ fn normal_frame(
     )
 }
 
+const ACTIVITY_TOP_SPACER_ROWS: usize = 2;
+
+fn reserve_activity_top_spacer(lines: &mut Vec<PaintLine>) {
+    let existing = lines
+        .iter()
+        .rev()
+        .take_while(|line| **line == PaintLine::blank())
+        .count();
+    lines.extend((existing..ACTIVITY_TOP_SPACER_ROWS).map(|_| PaintLine::blank()));
+}
+
 #[allow(clippy::too_many_arguments)]
 fn normal_frame_with_expansion(
     live_lines: Vec<PaintLine>,
@@ -4832,9 +4843,10 @@ fn normal_frame_with_expansion(
     // Transient rows stay in the pinned dock instead of scrolling away with the
     // conversation. Activity leads any command suggestions.
     if let Some(activity) = activity {
-        if !matches!(lines.last(), Some(line) if line == &PaintLine::blank()) {
-            lines.push(PaintLine::blank());
-        }
+        // Working and Completed share this reservation so changing state never
+        // shifts the transcript. The activity row itself occupies the separate
+        // composer spacer below these two rows.
+        reserve_activity_top_spacer(&mut lines);
         let mut activity_rows = activity_lines_with_progress(
             activity,
             activity_model,
@@ -13674,10 +13686,12 @@ mod tests {
         );
     }
 
-    /// Working and settled activity both occupy the row reserved above the composer.
+    /// Working and settled activity both keep the same two rows above them.
     #[test]
-    fn settled_and_working_activity_keep_the_reserved_composer_row() {
+    fn settled_and_working_activity_keep_two_top_spacer_rows() {
+        set_chat_layout(false);
         let editor = Editor::default();
+        let live = [Block::new(BlockKind::Assistant, "Codex", "응답")];
         for (label, marker, expected_tone) in [
             (
                 "✶ Working (2s • esc to interrupt)",
@@ -13687,7 +13701,7 @@ mod tests {
             ("✧ Completed (1m 36s)", "Completed", None),
         ] {
             let frame = normal_frame(
-                &[],
+                &live,
                 &editor,
                 None,
                 &[],
@@ -13709,8 +13723,10 @@ mod tests {
             if let Some(expected_tone) = expected_tone {
                 assert_eq!(frame.lines[activity].tone, expected_tone);
             }
-            assert!(activity >= 1);
+            assert!(activity >= 3);
             assert!(frame.lines[activity - 1] == PaintLine::blank());
+            assert!(frame.lines[activity - 2] == PaintLine::blank());
+            assert!(frame.lines[activity - 3] != PaintLine::blank());
             assert!(painted(&frame.lines[activity + 1]).starts_with('╭'));
         }
     }
@@ -14607,6 +14623,7 @@ mod tests {
 
         assert!(activity > 0);
         assert!(frame.lines[activity - 1] == PaintLine::blank());
+        assert!(frame.lines[activity - 2] == PaintLine::blank());
         assert!(frame.lines[activity + 1] == PaintLine::blank());
         assert!(activity < suggestions);
     }
@@ -14943,30 +14960,36 @@ mod tests {
             lines: vec![
                 answer.clone(),
                 PaintLine::blank(),
+                PaintLine::blank(),
                 activity.clone(),
                 composer.clone(),
             ],
-            cursor_line: 3,
+            cursor_line: 4,
             cursor_col: 0,
             show_cursor: true,
             dock_index: 2,
-            composer_index: Some(3),
+            composer_index: Some(4),
             composer_layout: None,
-            activity_index: Some(2),
+            activity_index: Some(3),
         };
         let streaming_row = screen_row(&older, streaming);
 
         let mut completed_transcript = older;
         completed_transcript.extend([answer, PaintLine::blank()]);
         let completed_frame = || Frame {
-            lines: vec![PaintLine::blank(), activity.clone(), composer.clone()],
-            cursor_line: 2,
+            lines: vec![
+                PaintLine::blank(),
+                PaintLine::blank(),
+                activity.clone(),
+                composer.clone(),
+            ],
+            cursor_line: 3,
             cursor_col: 0,
             show_cursor: true,
             dock_index: 0,
-            composer_index: Some(2),
+            composer_index: Some(3),
             composer_layout: None,
-            activity_index: Some(1),
+            activity_index: Some(2),
         };
         let shifted_row = screen_row(&completed_transcript, completed_frame());
         assert_eq!(shifted_row + 1, streaming_row);
@@ -15320,14 +15343,14 @@ mod tests {
         );
         assert_eq!(answer_row(&screen), streaming_row);
 
-        // 턴 종료: 진행 기록 접힘이 시작되고 activity가 사라져도 답변은 그대로다.
+        // 턴 종료: 진행 기록 접힘이 시작되고 Working이 Completed로 바뀌어도 답변은 그대로다.
         let group = Block::progress_group(vec![commentary.clone()]);
         let group_id = group.id();
         let screen = simulate_fullscreen_frame(
             &mut renderer,
             &[group],
             &[],
-            None,
+            Some("Completed"),
             Some((group_id, 1.0)),
             rows,
             width,
@@ -15339,13 +15362,21 @@ mod tests {
             &mut renderer,
             &[],
             &[],
-            None,
+            Some("Completed"),
             Some((group_id, 0.4)),
             rows,
             width,
         );
         assert_eq!(answer_row(&screen), streaming_row);
-        let screen = simulate_fullscreen_frame(&mut renderer, &[], &[], None, None, rows, width);
+        let screen = simulate_fullscreen_frame(
+            &mut renderer,
+            &[],
+            &[],
+            Some("Completed"),
+            None,
+            rows,
+            width,
+        );
         let settled = answer_row(&screen);
         assert_eq!(settled, streaming_row);
 
@@ -15414,8 +15445,15 @@ mod tests {
             width,
         );
         let late_group = Block::progress_group(vec![progress.clone()]);
-        let screen =
-            simulate_fullscreen_frame(&mut late, &[late_group], &[], None, None, rows, width);
+        let screen = simulate_fullscreen_frame(
+            &mut late,
+            &[late_group],
+            &[],
+            Some("Completed"),
+            None,
+            rows,
+            width,
+        );
         assert_eq!(answer_row(&screen) + 2, late_streaming_row);
 
         // 단계 구분이 없는 제공자는 다음 텍스트가 시작되기 전에 기존 응답을
@@ -15456,7 +15494,15 @@ mod tests {
             width,
         );
         assert_eq!(answer_row(&screen), streaming_row);
-        let screen = simulate_fullscreen_frame(&mut renderer, &[], &[], None, None, rows, width);
+        let screen = simulate_fullscreen_frame(
+            &mut renderer,
+            &[],
+            &[],
+            Some("Completed"),
+            None,
+            rows,
+            width,
+        );
         assert_eq!(answer_row(&screen), streaming_row);
     }
 
@@ -15523,12 +15569,87 @@ mod tests {
                 &mut renderer,
                 std::slice::from_ref(&answer),
                 &[],
-                None,
+                Some("Completed"),
                 None,
                 rows,
                 width,
             );
             assert_eq!(answer_row(&screen), streaming_row);
+        }
+    }
+
+    #[test]
+    fn two_rows_stay_above_activity_during_streaming_and_completion() {
+        set_chat_layout(false);
+        for (rows, width) in [(18, 60), (24, 80), (32, 120)] {
+            let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+            renderer.shell_display_mode = ShellDisplayMode::Hide;
+            renderer.diff_display_mode = DiffDisplayMode::Hide;
+
+            let mut history = Vec::new();
+            for index in 0..10 {
+                history.push(Block::new(
+                    BlockKind::User,
+                    "Codex",
+                    format!("과거 프롬프트 {index}"),
+                ));
+                history.push(Block::new(
+                    BlockKind::Assistant,
+                    "Codex",
+                    format!("과거 답변 {index}"),
+                ));
+            }
+            simulate_fullscreen_frame(
+                &mut renderer,
+                &history,
+                &[],
+                Some("Working"),
+                None,
+                rows,
+                width,
+            );
+
+            let answer = Block::new(
+                BlockKind::Assistant,
+                "Codex",
+                "스트리밍 중인 최종 답변입니다.",
+            );
+            let assert_gap = |screen: &[PaintLine]| {
+                let answer = answer_row(screen);
+                let activity = screen
+                    .iter()
+                    .position(|line| {
+                        let text = painted_line_text(line);
+                        text.contains("Working") || text.contains("Completed")
+                    })
+                    .expect("activity row");
+                assert_eq!(activity - answer, 3);
+                assert!(screen[answer + 1] == PaintLine::blank());
+                assert!(screen[answer + 2] == PaintLine::blank());
+                answer
+            };
+
+            let screen = simulate_fullscreen_frame(
+                &mut renderer,
+                &[],
+                std::slice::from_ref(&answer),
+                Some("Working"),
+                None,
+                rows,
+                width,
+            );
+            let streaming_row = assert_gap(&screen);
+
+            let screen = simulate_fullscreen_frame(
+                &mut renderer,
+                std::slice::from_ref(&answer),
+                &[],
+                Some("Completed"),
+                None,
+                rows,
+                width,
+            );
+            assert_eq!(assert_gap(&screen), streaming_row);
         }
     }
 
