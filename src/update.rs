@@ -19,9 +19,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "새로 나온 글자가 배경색에서 본문색으로 밝아지며 나타납니다.",
-    "응답을 조금 더 모았다가 풀어, 뭉치로 도착해도 속도가 고르게 유지됩니다.",
-    "응답이 끝났다는 알림을 남은 글자가 다 나올 때까지 붙들어, 마지막 문장이 한 번에 찍히지 않습니다.",
+    "마지막 스트림 조각을 라이브 화면에 먼저 그린 뒤 완료 상태로 전환합니다.",
+    "하단에서 응답 완료 순간 마지막 줄이 한 칸 위로 튀는 현상을 방지합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

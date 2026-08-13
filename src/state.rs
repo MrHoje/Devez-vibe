@@ -1537,6 +1537,10 @@ const STREAM_FADE_SPEED: f32 = 40.0;
 /// hand over a long tail at once, and a turn that looks stuck is worse than a
 /// last line that lands whole.
 const HELD_NOTIFICATION_LIMIT: Duration = Duration::from_millis(1500);
+/// Keep the fully revealed live answer on screen for at least one terminal paint
+/// before its completion moves the same text into transcript history. The main
+/// loop runs this pass every 4 ms; five quiet passes clear a 60 Hz paint boundary.
+const FINAL_STREAM_FRAME_TICKS: u8 = 5;
 
 /// What one reveal pass put on screen, and what it left waiting.
 #[derive(Default)]
@@ -1548,11 +1552,13 @@ pub struct StreamReveal {
     pub fade_changed: bool,
     /// Notices held behind the reveal were delivered on this pass.
     pub released: bool,
+    /// A forced final stream frame was prepared before completion is delivered.
+    pub final_frame_ready: bool,
 }
 
 impl StreamReveal {
     pub fn changed(&self) -> bool {
-        self.clusters > 0 || self.fade_changed || self.released
+        self.clusters > 0 || self.fade_changed || self.released || self.final_frame_ready
     }
 }
 
@@ -3559,6 +3565,8 @@ pub struct AppState {
     /// Notices waiting for the text still being revealed, in arrival order.
     held_notifications: Vec<(String, Value)>,
     held_since: Option<Instant>,
+    /// Quiet reveal ticks left before a fully visible live answer may complete.
+    held_final_frame_ticks: u8,
     /// When `/compact` was sent. Compaction produces no assistant text, so the
     /// activity row runs its own clock until the runtime reports the boundary.
     compacting_started_at: Option<Instant>,
@@ -3787,6 +3795,7 @@ impl AppState {
             stream_fade_tail: 0.0,
             held_notifications: Vec::new(),
             held_since: None,
+            held_final_frame_ticks: 0,
             last_completed_duration: None,
             branch,
             five_hour_percent,
@@ -7055,6 +7064,7 @@ impl AppState {
     fn hold_notification(&mut self, method: &str, params: &Value) {
         if self.held_notifications.is_empty() {
             self.held_since = Some(Instant::now());
+            self.held_final_frame_ticks = 0;
         }
         self.held_notifications
             .push((method.to_owned(), params.clone()));
@@ -7062,24 +7072,39 @@ impl AppState {
 
     /// Deliver the held notices once the text they follow has all appeared, or
     /// once the wait has run long enough that holding them is the bigger problem.
-    fn release_held_notifications(&mut self) -> bool {
+    fn release_held_notifications(&mut self, revealed_text: bool) -> (bool, bool) {
         if self.held_notifications.is_empty() {
-            return false;
+            self.held_final_frame_ticks = 0;
+            return (false, false);
         }
         let expired = self
             .held_since
             .is_some_and(|since| since.elapsed() >= HELD_NOTIFICATION_LIMIT);
         if self.stream_text_pending() && !expired {
-            return false;
+            return (false, false);
         }
-        if expired {
+        if self.stream_text_pending() {
             self.flush_stream_text();
+            self.held_final_frame_ticks = FINAL_STREAM_FRAME_TICKS;
+            return (true, false);
+        }
+        if revealed_text {
+            // The chunk that emptied the queue has not been rendered yet. Keep
+            // the item live so its final wrapped height is painted before the
+            // same body moves into transcript history.
+            self.held_final_frame_ticks = FINAL_STREAM_FRAME_TICKS;
+            return (false, false);
+        }
+        if self.held_final_frame_ticks > 0 {
+            self.held_final_frame_ticks -= 1;
+            return (false, false);
         }
         self.held_since = None;
+        self.held_final_frame_ticks = 0;
         for (method, params) in std::mem::take(&mut self.held_notifications) {
             self.dispatch_notification(&method, &params);
         }
-        true
+        (false, true)
     }
 
     fn dispatch_notification(&mut self, method: &str, params: &Value) {
@@ -11941,7 +11966,8 @@ impl AppState {
             reveal.backlog += visible_cluster_count(&active.pace.pending);
         }
         reveal.fade_changed = self.advance_stream_fade(reveal.clusters, elapsed);
-        reveal.released = self.release_held_notifications();
+        (reveal.final_frame_ready, reveal.released) =
+            self.release_held_notifications(reveal.clusters > 0);
         reveal
     }
 
@@ -18540,22 +18566,65 @@ mod tests {
         );
     }
 
-    /// A provider can hand over more text than the reveal can clear in any
-    /// reasonable time. The wait is bounded so the turn never looks stuck.
     #[test]
-    fn a_held_finish_gives_up_waiting_rather_than_stalling_the_turn() {
+    fn the_last_revealed_chunk_stays_live_before_completion() {
         let mut state = test_state();
+        let text = "마지막 글자가 줄 경계를 넘더라도 완료 전 라이브 화면에 먼저 보입니다.";
         state.handle_notification(
             "item/agentMessage/delta",
-            &json!({ "itemId": "item-1", "delta": "아주 긴 마무리 문장입니다.".repeat(400) }),
+            &json!({ "itemId": "item-1", "delta": text }),
+        );
+        state.handle_notification("turn/completed", &json!({}));
+
+        for _ in 0..2000 {
+            let reveal = state.drain_stream_text(TEST_FRAME);
+            if state
+                .active
+                .get("item-1")
+                .is_some_and(|item| item.block.body == text)
+            {
+                assert!(!reveal.released);
+                assert!(!state.held_notifications.is_empty());
+                assert!(state.drain_committed().is_empty());
+                return;
+            }
+        }
+
+        panic!("the full live answer was never revealed");
+    }
+
+    /// A provider can hand over more text than the reveal can clear in any
+    /// reasonable time. The wait is bounded, but the flushed text still gets a
+    /// live frame before completion moves it into history.
+    #[test]
+    fn an_expired_finish_paints_its_full_live_frame_before_completing() {
+        let mut state = test_state();
+        let text = "아주 긴 마무리 문장입니다.".repeat(400);
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({ "itemId": "item-1", "delta": text }),
         );
         state.handle_notification("turn/completed", &json!({}));
         assert!(!state.held_notifications.is_empty());
 
         state.held_since = Some(Instant::now() - HELD_NOTIFICATION_LIMIT);
-        state.drain_stream_text(TEST_FRAME);
+        let reveal = state.drain_stream_text(TEST_FRAME);
 
+        assert!(reveal.final_frame_ready);
+        assert!(!state.held_notifications.is_empty());
+        assert_eq!(state.active["item-1"].block.body, text);
+        assert!(state.drain_committed().is_empty());
+
+        for _ in 0..FINAL_STREAM_FRAME_TICKS {
+            let reveal = state.drain_stream_text(TEST_FRAME);
+            assert!(!reveal.released);
+            assert!(!state.held_notifications.is_empty());
+        }
+        let reveal = state.drain_stream_text(TEST_FRAME);
+
+        assert!(reveal.released);
         assert!(state.held_notifications.is_empty());
+        assert!(state.committed.iter().any(|block| block.body == text));
     }
 
     #[test]
