@@ -15407,6 +15407,133 @@ mod tests {
     }
 
     #[test]
+    fn streamed_answer_row_survives_every_prefold_height() {
+        set_chat_layout(false);
+        for rows in 18..=40 {
+            for width in [48, 80, 120] {
+                for older_pairs in [0, 4, 12] {
+                    for progress_rows in 1..=8 {
+                        for answer_rows in 1..=8 {
+                            let mut renderer =
+                                Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+                            renderer.fold_progress_groups = true;
+                            renderer.shell_display_mode = ShellDisplayMode::Hide;
+                            renderer.diff_display_mode = DiffDisplayMode::Hide;
+
+                            let mut initial = Vec::new();
+                            for index in 0..older_pairs {
+                                initial.push(Block::new(
+                                    BlockKind::User,
+                                    "Codex",
+                                    format!("과거 프롬프트 {index}"),
+                                ));
+                                initial.push(Block::new(
+                                    BlockKind::Assistant,
+                                    "Codex",
+                                    format!("과거 답변 {index}"),
+                                ));
+                            }
+                            initial.push(Block::new(BlockKind::User, "Codex", "현재 프롬프트"));
+                            simulate_fullscreen_frame(
+                                &mut renderer,
+                                &initial,
+                                &[],
+                                Some("Working"),
+                                None,
+                                rows,
+                                width,
+                            );
+
+                            let progress = Block::new(
+                                BlockKind::Assistant,
+                                "Codex",
+                                (0..progress_rows)
+                                    .map(|row| format!("진행 메시지 {row}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                            );
+                            simulate_fullscreen_frame(
+                                &mut renderer,
+                                std::slice::from_ref(&progress),
+                                &[],
+                                Some("Working"),
+                                None,
+                                rows,
+                                width,
+                            );
+                            let group = Block::progress_group(vec![progress]);
+                            simulate_fullscreen_frame(
+                                &mut renderer,
+                                std::slice::from_ref(&group),
+                                &[],
+                                Some("Working"),
+                                None,
+                                rows,
+                                width,
+                            );
+
+                            let answer = Block::new(
+                                BlockKind::Assistant,
+                                "Codex",
+                                (0..answer_rows)
+                                    .map(|row| {
+                                        if row == 0 {
+                                            "스트리밍 중인 최종 답변입니다.".to_owned()
+                                        } else {
+                                            format!("최종 답변 {row}")
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                            );
+                            let screen = simulate_fullscreen_frame(
+                                &mut renderer,
+                                &[],
+                                std::slice::from_ref(&answer),
+                                Some("Working"),
+                                None,
+                                rows,
+                                width,
+                            );
+                            let streaming_row = answer_row(&screen);
+
+                            let screen = simulate_fullscreen_frame(
+                                &mut renderer,
+                                std::slice::from_ref(&answer),
+                                &[],
+                                Some("Working"),
+                                None,
+                                rows,
+                                width,
+                            );
+                            assert_eq!(
+                                answer_row(&screen),
+                                streaming_row,
+                                "item completion rows={rows}, width={width}, older={older_pairs}, progress={progress_rows}, answer={answer_rows}"
+                            );
+
+                            let screen = simulate_fullscreen_frame(
+                                &mut renderer,
+                                &[],
+                                &[],
+                                Some("Completed"),
+                                None,
+                                rows,
+                                width,
+                            );
+                            assert_eq!(
+                                answer_row(&screen),
+                                streaming_row,
+                                "settled rows={rows}, width={width}, older={older_pairs}, progress={progress_rows}, answer={answer_rows}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_short_unphased_turn_starts_its_answer_on_the_settled_row() {
         set_chat_layout(false);
         let rows = 24;
@@ -15735,6 +15862,78 @@ mod tests {
                 assert_eq!(answer_row(&shorter), answer_row(&taller));
             }
             assert_eq!(row_of(&shorter, "Working") + 1, row_of(&taller, "Working"));
+        }
+    }
+
+    #[test]
+    fn sparse_first_turn_keeps_every_answer_row_when_it_completes() {
+        set_chat_layout(false);
+        for rows in 14..=48 {
+            for width in [48, 60, 80, 100, 120] {
+                for body_rows in 1..=24 {
+                    let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+                    renderer.shell_display_mode = ShellDisplayMode::Hide;
+                    renderer.diff_display_mode = DiffDisplayMode::Hide;
+                    let history = vec![
+                        Block::welcome(
+                            "Claude",
+                            "Claude Team",
+                            "D:\\hojeSource\\Devez-vibe",
+                            "",
+                            &[],
+                        ),
+                        Block::new(BlockKind::Update, "Tip", "/provider: Set provider"),
+                        Block::new(BlockKind::User, "Claude", "첫 프롬프트 위치 기준"),
+                    ];
+                    simulate_fullscreen_frame(
+                        &mut renderer,
+                        &history,
+                        &[],
+                        Some("Working"),
+                        None,
+                        rows,
+                        width,
+                    );
+                    let body = (0..body_rows)
+                        .map(|row| format!("스트리밍 중인 최종 답변입니다. {row}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let answer = Block::new(BlockKind::Assistant, "Claude", body);
+                    let live = simulate_fullscreen_frame(
+                        &mut renderer,
+                        &[],
+                        std::slice::from_ref(&answer),
+                        Some("Working"),
+                        None,
+                        rows,
+                        width,
+                    );
+                    let completed = simulate_fullscreen_frame(
+                        &mut renderer,
+                        std::slice::from_ref(&answer),
+                        &[],
+                        Some("Completed"),
+                        None,
+                        rows,
+                        width,
+                    );
+                    let answer_rows = |screen: &[PaintLine]| {
+                        screen
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, line)| {
+                                line.prefix == RESPONSE_BULLET_PREFIX || line.prefix == "  "
+                            })
+                            .map(|(row, line)| (row, painted_line_text(line)))
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(
+                        answer_rows(&completed),
+                        answer_rows(&live),
+                        "rows={rows}, width={width}, body_rows={body_rows}"
+                    );
+                }
+            }
         }
     }
 

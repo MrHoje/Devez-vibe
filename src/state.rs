@@ -11806,14 +11806,13 @@ impl AppState {
         let Some(mut block) = active_item_block(&self.cwd, item) else {
             return;
         };
-        if matches!(block.kind, BlockKind::Assistant)
-            && block.assistant_phase() != AssistantPhase::Commentary
-        {
-            // Codex identifies the final answer. Claude and OpenCode do not, so
-            // each new unphased response is the current answer candidate. Rebuild
-            // the folded groups from everything completed before it; repeating
-            // this on a later candidate replaces the same group by child id.
-            // The live text therefore starts on the row it will keep at turn end.
+        if matches!(block.kind, BlockKind::Assistant) {
+            // A provider can label the streaming item's phase late or not at all.
+            // Treat every new assistant item as the next visible response boundary:
+            // the first item has nothing to fold, and each later item replaces the
+            // same prompt-hosted group with everything completed before it. This
+            // makes the item's first streamed row its settled row even when a final
+            // answer was announced as commentary at item start.
             self.collapse_progress_before_next_answer();
         }
         if matches!(block.kind, BlockKind::Assistant) && !block.body.is_empty() {
@@ -17954,6 +17953,72 @@ mod tests {
                 .iter()
                 .all(|block| !matches!(block.kind, BlockKind::ProgressGroup))
         );
+    }
+
+    #[test]
+    fn completed_mode_folds_before_a_final_stream_mislabeled_as_commentary() {
+        let mut state = test_state();
+        while state.vibe_mode() != VibeMode::SuperVibe {
+            state.cycle_vibe_mode();
+        }
+        state.set_response_display_mode(ResponseDisplayMode::Completed);
+        assert!(matches!(
+            state.submit_text("짧은 요청".to_owned(), "짧은 요청".to_owned()),
+            Action::Submit(_)
+        ));
+        state.drain_committed();
+        state.set_turn_started("turn-1".to_owned());
+
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "item": {
+                    "id": "progress",
+                    "type": "agentMessage",
+                    "phase": "commentary",
+                    "text": "진행 메시지"
+                }
+            }),
+        );
+        state.drain_committed();
+
+        state.handle_notification(
+            "item/started",
+            &json!({
+                "item": {
+                    "id": "final",
+                    "type": "agentMessage",
+                    "phase": "commentary",
+                    "text": ""
+                }
+            }),
+        );
+        let group = state
+            .drain_committed()
+            .into_iter()
+            .find(|block| matches!(block.kind, BlockKind::ProgressGroup))
+            .expect("progress is folded before the mislabeled final stream");
+        assert_eq!(group.children().len(), 1);
+
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "item": {
+                    "id": "final",
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": "최종 답변"
+                }
+            }),
+        );
+        state.drain_committed();
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "status": "completed" } }),
+        );
+
+        assert!(state.drain_committed().is_empty());
+        assert!(state.response_collapse_view().is_none());
     }
 
     #[test]
