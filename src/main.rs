@@ -3792,7 +3792,7 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- Skill 적용, 지침 확인, 내부 도구 호출 같은 내부 절차는 알리지 않는다.\n",
 );
 
-const CLAUDE_TURN_REMINDER: &str = "최종 답변은 불릿 2~3개, 전체 200자 내외로 쓰고 불릿 하나에 두 문장을 넘기지 않는다. 필요한 경우가 아니면 영어로 응답하지 않으며, 도구 호출 앞뒤 text도 첫 글자가 한글이어야 하고 영어 문장으로 시작하거나 영어 판정 뒤 한국어를 잇지 않는다.";
+const CLAUDE_TURN_REMINDER: &str = "최종 답변은 불릿 2~3개, 전체 200자 내외로 쓰고 불릿 하나에 두 문장을 넘기지 않는다. 필요한 경우가 아니면 영어로 응답하지 않으며, 도구 호출 앞뒤 text도 첫 글자가 한글이어야 하고 영어 문장으로 시작하거나 영어 판정 뒤 한국어를 잇지 않는다. 클래스명·메서드명·변수명·파일 경로·코드 조각은 사용자 판단에 꼭 필요할 때만 최소로 쓴다.";
 
 /// The Claude selections a session has to be told, because the bridge opens a
 /// fresh SDK session for every start and resume. Anything left out here comes
@@ -6352,6 +6352,7 @@ mod tests {
         assert!(CLAUDE_TURN_REMINDER.contains("불릿 하나에 두 문장을 넘기지 않는다"));
         assert!(CLAUDE_TURN_REMINDER.contains("필요한 경우가 아니면 영어로 응답하지 않으며"));
         assert!(CLAUDE_TURN_REMINDER.contains("도구 호출 앞뒤 text도 첫 글자가 한글이어야 하고"));
+        assert!(CLAUDE_TURN_REMINDER.contains("사용자 판단에 꼭 필요할 때만 최소로 쓴다"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskCreate"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("첫 응답 content block"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("모든 일반 문장은 반드시 한국어로 작성한다"));
