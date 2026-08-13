@@ -2259,6 +2259,7 @@ fn prepare_codex_turn_context(params: &mut Value) {
     };
     context.remove("devez-vibe-rules");
     context.remove("claude-devez-vibe-rules");
+    context.remove("claude-devez-vibe-reminder");
 }
 
 fn combined_turn_instructions(params: &Value, runtime: RuntimeKind) -> Option<String> {
@@ -2269,6 +2270,13 @@ fn combined_turn_instructions(params: &Value, runtime: RuntimeKind) -> Option<St
         RuntimeKind::Codex | RuntimeKind::Claude => &[],
         RuntimeKind::OpenCode => &["/additionalContext/devez-vibe-rules/value"],
     };
+    let claude_reminder = (runtime == RuntimeKind::Claude)
+        .then(|| {
+            params
+                .pointer("/additionalContext/claude-devez-vibe-reminder/value")
+                .and_then(Value::as_str)
+        })
+        .flatten();
     let parts = [
         rules_paths
             .iter()
@@ -2279,6 +2287,7 @@ fn combined_turn_instructions(params: &Value, runtime: RuntimeKind) -> Option<St
         params
             .pointer("/additionalContext/provider-handoff/value")
             .and_then(Value::as_str),
+        claude_reminder,
     ]
     .into_iter()
     .flatten()
@@ -2824,17 +2833,18 @@ mod tests {
             "additionalContext": {
                 "devez-vibe-rules": { "value": "codex rules", "kind": "application" },
                 "claude-devez-vibe-rules": { "value": "claude rules", "kind": "application" },
-                "devez-vibe-mode": { "value": "super vibe", "kind": "application" }
+                "devez-vibe-mode": { "value": "super vibe", "kind": "application" },
+                "claude-devez-vibe-reminder": { "value": "claude reminder", "kind": "application" }
             }
         });
         insert_handoff_context(&mut params, "history");
 
         // Claude opens on the rules as its system prompt, so its turn carries
-        // the preset and the handoff alone. OpenCode has no such prompt of its
-        // own and still needs them.
+        // only the preset, handoff, and short output reminder. OpenCode has no
+        // such prompt of its own and still needs the full rules.
         assert_eq!(
             combined_turn_instructions(&params, RuntimeKind::Claude).as_deref(),
-            Some("super vibe\n\nhistory")
+            Some("super vibe\n\nhistory\n\nclaude reminder")
         );
         assert_eq!(
             combined_turn_instructions(&params, RuntimeKind::Codex).as_deref(),
@@ -2852,6 +2862,7 @@ mod tests {
             "additionalContext": {
                 "devez-vibe-rules": { "value": "full rules", "kind": "application" },
                 "claude-devez-vibe-rules": { "value": "claude full rules", "kind": "application" },
+                "claude-devez-vibe-reminder": { "value": "claude reminder", "kind": "application" },
                 "devez-vibe-mode": { "value": "mode", "kind": "application" }
             }
         });
@@ -2868,6 +2879,11 @@ mod tests {
         assert!(
             params
                 .pointer("/additionalContext/claude-devez-vibe-rules")
+                .is_none()
+        );
+        assert!(
+            params
+                .pointer("/additionalContext/claude-devez-vibe-reminder")
                 .is_none()
         );
         assert_eq!(

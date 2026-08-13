@@ -136,7 +136,6 @@ impl ResponseDisplayMode {
             _ => None,
         }
     }
-
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4332,6 +4331,7 @@ impl AppState {
             self.rebuild_completion_catalog();
         }
         self.restore_session_side_panel();
+        self.restore_session_modes();
         self.select_model_and_effort(model, effort);
     }
 
@@ -4877,6 +4877,7 @@ impl AppState {
             model: self.selected_model_name().to_owned(),
             response_length: self.response_length_label().to_owned(),
             response_display_mode: self.response_display_mode.label().to_owned(),
+            fast_mode: self.effective_fast_mode(),
             claude_permission: self.claude_permission_badge(),
             effort: self.selected_effort.clone(),
             shell_display_mode: self.shell_display_mode().label().to_owned(),
@@ -5206,8 +5207,8 @@ impl AppState {
                 .is_some_and(|model| model.fast_service_tier.is_some())
     }
 
-    /// Only the explicit toggle lands here, so it is the one place that owes the
-    /// user a line: the badge alone leaves a `/fast` with no visible answer.
+    /// The explicit choice confirms the new service tier in the transcript as
+    /// well as updating the persistent composer badge.
     pub fn set_fast_mode(&mut self, enabled: bool) {
         self.fast_mode = enabled;
         self.commit_welcome_card();
@@ -5358,6 +5359,7 @@ impl AppState {
         self.reset_turn_item_tracking();
         self.show_welcome = true;
         self.restore_session_side_panel();
+        self.restore_session_modes();
         self.select_model_and_effort(model, effort);
     }
 
@@ -5587,9 +5589,8 @@ impl AppState {
         self.committed.extend(groups);
     }
 
-    fn collapse_progress_before_final_answer(&mut self) {
-        if self.response_grouped
-            || self.vibe_mode != VibeMode::SuperVibe
+    fn collapse_progress_before_next_answer(&mut self) {
+        if self.vibe_mode != VibeMode::SuperVibe
             || self.response_display_mode != ResponseDisplayMode::Completed
         {
             return;
@@ -11024,6 +11025,79 @@ impl AppState {
             .unwrap_or_else(read_default_side_panel_stage);
     }
 
+    /// Records this session's vibe/response modes beside its thread id so a later
+    /// resume reopens on them. Called after any change that persists a mode.
+    pub fn persist_session_modes(&self) {
+        let _ = write_session_modes(
+            &self.thread_id,
+            vec![
+                (
+                    "vibe_mode".to_owned(),
+                    self.vibe_mode.config_value().to_owned(),
+                ),
+                (
+                    "model_verbosity".to_owned(),
+                    self.response_length.model_verbosity().to_owned(),
+                ),
+                (
+                    "response_display_mode".to_owned(),
+                    self.response_display_mode.config_value().to_owned(),
+                ),
+                (
+                    "shell_display_mode".to_owned(),
+                    self.shell_display_mode.config_value().to_owned(),
+                ),
+                (
+                    "diff_display_mode".to_owned(),
+                    self.diff_display_mode.config_value().to_owned(),
+                ),
+            ],
+        );
+    }
+
+    /// Restores the vibe/response modes this session was last left on. A thread
+    /// with nothing saved keeps the global defaults already loaded, which is how
+    /// resuming an older session stays on the global latest value.
+    fn restore_session_modes(&mut self) {
+        let Some(modes) = read_session_modes(&self.thread_id) else {
+            return;
+        };
+        for (key, value) in modes {
+            match key.as_str() {
+                "vibe_mode" => {
+                    self.vibe_mode = match value.as_str() {
+                        "super_vibe" => VibeMode::SuperVibe,
+                        "normal" => VibeMode::Normal,
+                        _ => VibeMode::Vibe,
+                    };
+                }
+                "model_verbosity" => {
+                    self.response_length = match value.as_str() {
+                        "medium" => ResponseLength::Normal,
+                        "high" => ResponseLength::Detailed,
+                        _ => ResponseLength::Short,
+                    };
+                }
+                "response_display_mode" => {
+                    if let Some(mode) = ResponseDisplayMode::from_config_value(&value) {
+                        self.response_display_mode = mode;
+                    }
+                }
+                "shell_display_mode" => {
+                    if let Some(mode) = ShellDisplayMode::from_config_value(&value) {
+                        self.shell_display_mode = mode;
+                    }
+                }
+                "diff_display_mode" => {
+                    if let Some(mode) = DiffDisplayMode::from_config_value(&value) {
+                        self.diff_display_mode = mode;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     #[cfg(test)]
     pub fn side_panel_open(&self) -> bool {
         self.side_panel_stage != SidePanelStage::Closed
@@ -11708,12 +11782,14 @@ impl AppState {
             return;
         };
         if matches!(block.kind, BlockKind::Assistant)
-            && block.assistant_phase() == AssistantPhase::FinalAnswer
+            && block.assistant_phase() != AssistantPhase::Commentary
         {
-            // Completed mode must settle the transcript before final text starts
-            // streaming. Folding at turn/completed makes that text appear below
-            // the progress rows and jump upward when they disappear.
-            self.collapse_progress_before_final_answer();
+            // Codex identifies the final answer. Claude and OpenCode do not, so
+            // each new unphased response is the current answer candidate. Rebuild
+            // the folded groups from everything completed before it; repeating
+            // this on a later candidate replaces the same group by child id.
+            // The live text therefore starts on the row it will keep at turn end.
+            self.collapse_progress_before_next_answer();
         }
         if matches!(block.kind, BlockKind::Assistant) && !block.body.is_empty() {
             self.turn_response_started = true;
@@ -11839,6 +11915,12 @@ impl AppState {
         let Some(delta) = params.get("delta").and_then(Value::as_str) else {
             return;
         };
+        if matches!(kind, BlockKind::Assistant) && !self.active.contains_key(item_id) {
+            // OpenCode can begin an assistant item with its first delta instead
+            // of a separate item/started notification. Settle earlier responses
+            // at that same boundary so every provider reaches the common layout.
+            self.collapse_progress_before_next_answer();
+        }
         if matches!(kind, BlockKind::Assistant) && !delta.is_empty() {
             self.turn_response_started = true;
         }
@@ -13648,6 +13730,74 @@ fn write_session_side_panel_stage(thread_id: &str, stage: SidePanelStage) -> std
     let text = serde_json::to_string(&stages)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     fs::write(path, text)
+}
+
+/// Per-session vibe/response modes, kept beside the settings file the way the
+/// side-panel stages are: a resume of the same thread reopens on the modes it
+/// was left on rather than whatever the global default has drifted to since.
+fn session_modes_path() -> Option<PathBuf> {
+    vibe_settings_path().and_then(|path| Some(path.parent()?.join("session-modes.json")))
+}
+
+/// How many sessions the file remembers, trimmed oldest-first like the side
+/// panel's own history so the file cannot grow without bound.
+const SESSION_MODE_HISTORY: usize = 200;
+
+fn read_session_modes_file() -> Vec<(String, Vec<(String, String)>)> {
+    let Some(path) = session_modes_path() else {
+        return Vec::new();
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+/// The vibe/response modes `thread_id` was last left on, or `None` when this
+/// session has none saved — in which case the caller keeps the global defaults.
+fn read_session_modes(thread_id: &str) -> Option<Vec<(String, String)>> {
+    if thread_id.is_empty() {
+        return None;
+    }
+    read_session_modes_file()
+        .into_iter()
+        .find(|(id, _)| id == thread_id)
+        .map(|(_, modes)| modes)
+}
+
+fn write_session_modes(thread_id: &str, modes: Vec<(String, String)>) -> std::io::Result<()> {
+    if thread_id.is_empty() {
+        return Ok(());
+    }
+    let path = session_modes_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Devez Vibe 설정 경로를 찾을 수 없습니다.",
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let sessions = upsert_session_modes(read_session_modes_file(), thread_id, modes);
+    let text = serde_json::to_string(&sessions)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    fs::write(path, text)
+}
+
+/// Moves `thread_id` to the newest end with its current modes, then trims the
+/// oldest entries past the history limit — the side panel's rule, reused.
+fn upsert_session_modes(
+    mut sessions: Vec<(String, Vec<(String, String)>)>,
+    thread_id: &str,
+    modes: Vec<(String, String)>,
+) -> Vec<(String, Vec<(String, String)>)> {
+    sessions.retain(|(id, _)| id != thread_id);
+    sessions.push((thread_id.to_owned(), modes));
+    if sessions.len() > SESSION_MODE_HISTORY {
+        let excess = sessions.len() - SESSION_MODE_HISTORY;
+        sessions.drain(0..excess);
+    }
+    sessions
 }
 
 /// Whether dvz may dial the Codex app-server. Unset means no: a runtime is
@@ -16646,6 +16796,33 @@ mod tests {
     }
 
     #[test]
+    fn session_modes_replace_the_same_thread_and_trim_oldest_first() {
+        // A thread already on record is updated in place, moved to the newest
+        // end, and never duplicated — the way a resume must find exactly one
+        // entry for the thread it reopens.
+        let sessions = upsert_session_modes(
+            vec![(
+                "thread-a".to_owned(),
+                vec![("vibe_mode".to_owned(), "vibe".to_owned())],
+            )],
+            "thread-a",
+            vec![("vibe_mode".to_owned(), "super_vibe".to_owned())],
+        );
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].1[0].1, "super_vibe");
+
+        // Past the history limit the oldest entries fall off the front, so the
+        // file cannot grow without bound as sessions accumulate.
+        let mut many: Vec<(String, Vec<(String, String)>)> = (0..SESSION_MODE_HISTORY)
+            .map(|index| (format!("thread-{index}"), Vec::new()))
+            .collect();
+        many = upsert_session_modes(many, "thread-new", Vec::new());
+        assert_eq!(many.len(), SESSION_MODE_HISTORY);
+        assert_eq!(many.last().expect("newest entry").0, "thread-new");
+        assert!(!many.iter().any(|(id, _)| id == "thread-0"));
+    }
+
+    #[test]
     fn response_display_mode_accepts_only_supported_config_values() {
         assert_eq!(
             ResponseDisplayMode::from_config_value("all"),
@@ -16930,12 +17107,13 @@ mod tests {
     }
 
     #[test]
-    fn fast_mode_reports_the_switch_without_a_composer_badge() {
+    fn fast_mode_updates_the_composer_badge_and_reports_the_switch() {
         let mut state = test_state();
 
         state.set_fast_mode(true);
 
         assert!(state.fast_mode);
+        assert!(state.composer_mode().fast_mode);
         assert_eq!(
             state.composer_mode().response_display_mode,
             state.response_display_mode().label()
@@ -16950,6 +17128,7 @@ mod tests {
 
         state.set_fast_mode(false);
 
+        assert!(!state.composer_mode().fast_mode);
         assert_eq!(
             state
                 .committed
@@ -17749,6 +17928,147 @@ mod tests {
                 .iter()
                 .all(|block| !matches!(block.kind, BlockKind::ProgressGroup))
         );
+    }
+
+    #[test]
+    fn completed_mode_refolds_unphased_progress_before_each_new_response() {
+        let mut state = test_state();
+        while state.vibe_mode() != VibeMode::SuperVibe {
+            state.cycle_vibe_mode();
+        }
+        state.set_response_display_mode(ResponseDisplayMode::Completed);
+        assert!(matches!(
+            state.submit_text("짧은 요청".to_owned(), "짧은 요청".to_owned()),
+            Action::Submit(_)
+        ));
+        state.drain_committed();
+        state.set_turn_started("turn-1".to_owned());
+
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "item": {
+                    "id": "claude-progress-1",
+                    "type": "agentMessage",
+                    "provider": "Claude",
+                    "text": "첫 진행 메시지"
+                }
+            }),
+        );
+        state.drain_committed();
+
+        state.handle_notification(
+            "item/started",
+            &json!({
+                "item": {
+                    "id": "claude-progress-2",
+                    "type": "agentMessage",
+                    "provider": "Claude",
+                    "text": ""
+                }
+            }),
+        );
+        let first_group = state
+            .drain_committed()
+            .into_iter()
+            .find(|block| matches!(block.kind, BlockKind::ProgressGroup))
+            .expect("first Claude progress is folded before the next stream");
+        assert_eq!(first_group.children().len(), 1);
+
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "item": {
+                    "id": "claude-progress-2",
+                    "type": "agentMessage",
+                    "provider": "Claude",
+                    "text": "두 번째 진행 메시지"
+                }
+            }),
+        );
+        state.drain_committed();
+        state.handle_notification(
+            "item/started",
+            &json!({
+                "item": {
+                    "id": "claude-final",
+                    "type": "agentMessage",
+                    "provider": "Claude",
+                    "text": ""
+                }
+            }),
+        );
+        let updated_group = state
+            .drain_committed()
+            .into_iter()
+            .find(|block| matches!(block.kind, BlockKind::ProgressGroup))
+            .expect("all earlier Claude progress is folded before the final stream");
+
+        assert_eq!(updated_group.id(), first_group.id());
+        assert_eq!(updated_group.children().len(), 2);
+        assert_eq!(updated_group.children()[1].body, "두 번째 진행 메시지");
+        assert!(state.response_grouped);
+        assert!(state.response_collapse_view().is_none());
+
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "item": {
+                    "id": "claude-final",
+                    "type": "agentMessage",
+                    "provider": "Claude",
+                    "text": "최종 답변"
+                }
+            }),
+        );
+        let completed = state.drain_committed();
+        assert!(completed.iter().any(|block| block.body == "최종 답변"));
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "status": "completed" } }),
+        );
+        assert!(state.drain_committed().is_empty());
+        assert!(state.response_collapse_view().is_none());
+    }
+
+    #[test]
+    fn completed_mode_folds_progress_before_a_delta_only_response() {
+        let mut state = test_state();
+        while state.vibe_mode() != VibeMode::SuperVibe {
+            state.cycle_vibe_mode();
+        }
+        state.set_response_display_mode(ResponseDisplayMode::Completed);
+        state.set_turn_started("turn-1".to_owned());
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "item": {
+                    "id": "progress",
+                    "type": "agentMessage",
+                    "provider": "OpenCode",
+                    "text": "진행 메시지"
+                }
+            }),
+        );
+        state.drain_committed();
+
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({
+                "itemId": "delta-only-answer",
+                "provider": "OpenCode",
+                "delta": "최종 답변"
+            }),
+        );
+        let group = state
+            .drain_committed()
+            .into_iter()
+            .find(|block| matches!(block.kind, BlockKind::ProgressGroup))
+            .expect("progress is folded before the first answer delta");
+
+        assert_eq!(group.children().len(), 1);
+        assert_eq!(group.children()[0].body, "진행 메시지");
+        assert!(state.active.contains_key("delta-only-answer"));
     }
 
     #[test]

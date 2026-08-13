@@ -421,6 +421,9 @@ pub struct ComposerMode {
     /// Whether completed progress responses remain visible or fold into the
     /// prompt once the final answer arrives.
     pub response_display_mode: String,
+    /// Codex's fast service tier. Claude uses the same visual slot for its
+    /// permission mode instead.
+    pub fast_mode: bool,
     /// Claude's permission mode, painted where a Codex thread shows Fast. `None`
     /// for the runtimes that have no such mode.
     pub claude_permission: Option<PermissionBadge>,
@@ -3981,6 +3984,8 @@ pub enum Pick {
     VibeMode,
     /// Chooses whether completed progress responses stay visible or fold away.
     ResponseDisplayMode,
+    /// Opens the same service-tier picker as `/fast`.
+    FastMode,
     ShellDisplayMode,
     DiffDisplayMode,
     PlanSummary,
@@ -4527,6 +4532,11 @@ fn activity_line_with_composer_controls(
         badge
             .response_display_mode_index
             .map(|index| (badge_start + index, Pick::ResponseDisplayMode)),
+    );
+    picks.extend(
+        badge
+            .fast_index
+            .map(|index| (badge_start + index, Pick::FastMode)),
     );
     picks.extend(
         badge
@@ -9718,6 +9728,11 @@ fn input_top_line_with_controls(
         );
         picks.extend(
             badge
+                .fast_index
+                .map(|index| (badge_start + index, Pick::FastMode)),
+        );
+        picks.extend(
+            badge
                 .permission_index
                 .map(|index| (badge_start + index, Pick::ClaudePermissionMode)),
         );
@@ -9892,6 +9907,20 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
         },
         bold: false,
     };
+    let fast_span = PaintSpan {
+        text: if mode.fast_mode {
+            "Fast: On"
+        } else {
+            "Fast: Off"
+        }
+        .to_owned(),
+        tone: if mode.fast_mode {
+            Tone::ResponseCompleted
+        } else {
+            Tone::FastOff
+        },
+        bold: false,
+    };
 
     let custom_spans = false.then(|| {
         vec![
@@ -9920,6 +9949,7 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
         response_display_mode_index: None,
         shell_display_mode_index: None,
         diff_display_mode_index: None,
+        fast_index: None,
         permission_index: None,
     };
     if mode.model.starts_with("claude:") {
@@ -9953,6 +9983,7 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
                 response_display_mode_index: show_response.then_some(display_width + 4),
                 shell_display_mode_index: None,
                 diff_display_mode_index: None,
+                fast_index: None,
                 permission_index: Some(display_width),
             })
             .chain(std::iter::once(BadgeSpans {
@@ -9961,6 +9992,7 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
                 response_display_mode_index: show_response.then_some(display_width + 2),
                 shell_display_mode_index: None,
                 diff_display_mode_index: None,
+                fast_index: None,
                 permission_index: None,
             }))
             .chain(std::iter::once(vibe_only));
@@ -9975,13 +10007,29 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
                 .unwrap_or_else(|| vec![vibe_mode_span.clone(), separator_span(), response_span])
         })
         .unwrap_or_else(|| vec![vibe_mode_span.clone()]);
+    let with_fast = BadgeSpans {
+        spans: [
+            display_spans.clone(),
+            primary_spans.clone(),
+            vec![separator_span(), fast_span],
+        ]
+        .concat(),
+        vibe_mode_index: Some(display_width),
+        response_display_mode_index: show_response.then_some(display_width + 2),
+        shell_display_mode_index: None,
+        diff_display_mode_index: None,
+        fast_index: Some(display_width + primary_spans.len() + 1),
+        permission_index: None,
+    };
     [
+        with_fast,
         BadgeSpans {
             spans: [display_spans, primary_spans].concat(),
             vibe_mode_index: Some(display_width),
             response_display_mode_index: show_response.then_some(display_width + 2),
             shell_display_mode_index: None,
             diff_display_mode_index: None,
+            fast_index: None,
             permission_index: None,
         },
         vibe_only,
@@ -9999,6 +10047,7 @@ struct BadgeSpans {
     response_display_mode_index: Option<usize>,
     shell_display_mode_index: Option<usize>,
     diff_display_mode_index: Option<usize>,
+    fast_index: Option<usize>,
     permission_index: Option<usize>,
 }
 
@@ -13659,7 +13708,7 @@ mod tests {
             .expect("activity row");
         assert!(!painted(&frame.lines[activity]).contains("View: Chat"));
         assert!(!painted(&frame.lines[activity]).contains("Response:"));
-        assert!(!painted(&frame.lines[activity]).contains("Fast:"));
+        assert!(painted(&frame.lines[activity]).contains("Fast: Off"));
         assert!(!painted(&frame.lines[activity + 1]).contains("View: Chat"));
         assert_eq!(painted_width(&frame.lines[activity]), 158);
         assert_eq!(frame.lines[activity + 1].tone, Tone::ModelTerra);
@@ -13857,7 +13906,7 @@ mod tests {
                 .sum::<usize>()
     }
 
-    fn test_mode(label: &str, accent: ModeAccent, _fast_mode: bool) -> ComposerMode {
+    fn test_mode(label: &str, accent: ModeAccent, fast_mode: bool) -> ComposerMode {
         ComposerMode {
             branch: None,
             vibe_mode: "Vibe: On".to_owned(),
@@ -13867,6 +13916,7 @@ mod tests {
             model: "GPT-5.6-Terra".to_owned(),
             response_length: "Short".to_owned(),
             response_display_mode: "Completed".to_owned(),
+            fast_mode,
             claude_permission: None,
             effort: "high".to_owned(),
             cost: None,
@@ -14046,10 +14096,10 @@ mod tests {
         assert_eq!(rule_width(&line), 120);
         assert!(painted(&line).starts_with('╭'));
         // Two blanks off the rule, the badge, then the rule resumes for two columns.
-        assert_eq!(texts, ["  ", "Vibe: On", " ", "─╮"]);
+        assert_eq!(texts, ["  ", "Vibe: On", " · ", "Fast: On", " ", "─╮"]);
         assert_eq!(line.tail[1].tone, Tone::FastOn);
         assert!(!painted(&line).contains("Response:"));
-        assert!(!painted(&line).contains("Fast:"));
+        assert_eq!(line.tail[3].tone, Tone::ResponseCompleted);
     }
 
     #[test]
@@ -14106,6 +14156,7 @@ mod tests {
             pick_on(&line, "Response: Completed"),
             Some(Pick::ResponseDisplayMode)
         );
+        assert!(!painted(&line).contains("Fast:"));
     }
 
     #[test]
@@ -14129,7 +14180,7 @@ mod tests {
 
         assert!(!painted(&frame.lines[composer - 1]).contains("View: Chat"));
         assert!(!painted(&frame.lines[composer - 1]).contains("Response:"));
-        assert!(!painted(&frame.lines[composer - 1]).contains("Fast:"));
+        assert!(painted(&frame.lines[composer - 1]).contains("Fast: Off"));
         assert!(!painted(&frame.lines[composer]).contains("View: Chat"));
     }
 
@@ -14162,6 +14213,8 @@ mod tests {
             pick_on(&line, "Response: Completed"),
             Some(Pick::ResponseDisplayMode)
         );
+        assert_eq!(pick_on(&line, "Fast: On"), Some(Pick::FastMode));
+        assert!(painted(&line).contains("Response: Completed · Fast: On"));
         // The rule, and the middle of the separator between the badges, are not
         // settings — the columns beside each badge belong to that badge.
         assert_eq!(pick_mid(&line, " · "), None);
@@ -14191,6 +14244,7 @@ mod tests {
             pick_on(&line, "Response: Completed"),
             Some(Pick::ResponseDisplayMode)
         );
+        assert_eq!(pick_on(&line, "Fast: On"), Some(Pick::FastMode));
         assert_eq!(pick_on(&line, "[$0.95]"), None);
         assert_eq!(pick_on(&line, "3/12"), None);
     }
@@ -14224,9 +14278,19 @@ mod tests {
         assert_eq!(rule_width(&line), 80);
         assert_eq!(
             texts,
-            ["  ", "Vibe: Super Vibe", " · ", "Response: All", " ", "─╮"]
+            [
+                "  ",
+                "Vibe: Super Vibe",
+                " · ",
+                "Response: All",
+                " · ",
+                "Fast: Off",
+                " ",
+                "─╮"
+            ]
         );
         assert_eq!(line.tail[3].tone, Tone::FastOff);
+        assert_eq!(line.tail[5].tone, Tone::FastOff);
     }
 
     #[test]
@@ -14278,6 +14342,7 @@ mod tests {
         assert!(on.contains(&("Vibe: Super Vibe".to_owned(), Tone::VibeSuper)));
         assert!(!on.iter().any(|(text, _)| text == "View: Chat"));
         assert!(on.contains(&("Response: Completed".to_owned(), Tone::ResponseCompleted)));
+        assert!(on.contains(&("Fast: On".to_owned(), Tone::ResponseCompleted)));
 
         mode.response_display_mode = "All".to_owned();
         assert!(tones(&mode).contains(&("Response: All".to_owned(), Tone::FastOff)));
@@ -14359,7 +14424,7 @@ mod tests {
         assert!(!painted(&line).contains("$0.95"));
         assert!(painted(&line).contains("Vibe: Super Vibe"));
         assert!(painted(&line).contains("Response: Completed"));
-        assert!(!painted(&line).contains("Fast:"));
+        assert!(painted(&line).contains("Fast: On"));
     }
 
     #[test]
@@ -15055,6 +15120,7 @@ mod tests {
                 model: "Claude Opus 4.8".to_owned(),
                 response_length: "짧게".to_owned(),
                 response_display_mode: "완료".to_owned(),
+                fast_mode: false,
                 claude_permission: None,
                 effort: "high".to_owned(),
                 shell_display_mode: "숨김".to_owned(),
@@ -15107,7 +15173,14 @@ mod tests {
         fit_frame(&mut frame, live_rows);
         let max_back = renderer.wrapped.len().saturating_sub(view_rows);
         let start = max_back - renderer.scroll_back.min(max_back);
-        compose_screen(&renderer.wrapped, frame.lines, view_rows, start, frame.cursor_line).0
+        compose_screen(
+            &renderer.wrapped,
+            frame.lines,
+            view_rows,
+            start,
+            frame.cursor_line,
+        )
+        .0
     }
 
     fn answer_row(screen: &[PaintLine]) -> usize {
@@ -15143,15 +15216,22 @@ mod tests {
         let previous_prompt = Block::new(BlockKind::User, "Codex", "이전 프롬프트");
         let previous_answer = Block::new(BlockKind::Assistant, "Codex", "이전 답변입니다.");
         let prompt = Block::new(BlockKind::User, "Codex", "새 프롬프트");
-        let commentary =
-            Block::new(BlockKind::Assistant, "Codex", "진행 상황을 먼저 알립니다.");
+        let commentary = Block::new(BlockKind::Assistant, "Codex", "진행 상황을 먼저 알립니다.");
         let mut answer = Block::new(BlockKind::Assistant, "Codex", "스트리밍")
             .with_assistant_phase(AssistantPhase::FinalAnswer);
 
         // 프롬프트 제출 직후: 응답 대기.
         let mut initial = older;
         initial.extend([previous_prompt, previous_answer, prompt]);
-        simulate_fullscreen_frame(&mut renderer, &initial, &[], Some("Working"), None, rows, width);
+        simulate_fullscreen_frame(
+            &mut renderer,
+            &initial,
+            &[],
+            Some("Working"),
+            None,
+            rows,
+            width,
+        );
 
         // 중간 진행 메시지가 라이브로 흐르다 committed로 이동한다.
         simulate_fullscreen_frame(
@@ -15239,6 +15319,112 @@ mod tests {
         // 정착 후 답변 위에는 독립된 빈 줄 하나와 프롬프트 여백 행만 있다.
         assert!(screen[settled - 1] == PaintLine::blank());
         assert_eq!(screen[settled - 2].tone, Tone::UserPromptPadding);
+    }
+
+    #[test]
+    fn a_short_unphased_turn_starts_its_answer_on_the_settled_row() {
+        set_chat_layout(false);
+        let rows = 24;
+        let width = 80;
+
+        let prompt = Block::new(BlockKind::User, "Claude", "짧은 요청");
+        let progress = Block::new(BlockKind::Assistant, "Claude", "진행 상황을 확인했습니다.");
+        let answer = Block::new(
+            BlockKind::Assistant,
+            "Claude",
+            "스트리밍 중인 최종 답변입니다.",
+        );
+
+        let renderer = || {
+            let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+            renderer.fold_progress_groups = true;
+            renderer.shell_display_mode = ShellDisplayMode::Hide;
+            renderer.diff_display_mode = DiffDisplayMode::Hide;
+            renderer
+        };
+        let mut late = renderer();
+        simulate_fullscreen_frame(
+            &mut late,
+            std::slice::from_ref(&prompt),
+            &[],
+            Some("Working"),
+            None,
+            rows,
+            width,
+        );
+        simulate_fullscreen_frame(
+            &mut late,
+            std::slice::from_ref(&progress),
+            &[],
+            Some("Working"),
+            None,
+            rows,
+            width,
+        );
+        let screen = simulate_fullscreen_frame(
+            &mut late,
+            &[],
+            std::slice::from_ref(&answer),
+            Some("Working"),
+            None,
+            rows,
+            width,
+        );
+        let late_streaming_row = answer_row(&screen);
+        simulate_fullscreen_frame(
+            &mut late,
+            std::slice::from_ref(&answer),
+            &[],
+            Some("Working"),
+            None,
+            rows,
+            width,
+        );
+        let late_group = Block::progress_group(vec![progress.clone()]);
+        let screen =
+            simulate_fullscreen_frame(&mut late, &[late_group], &[], None, None, rows, width);
+        assert_eq!(answer_row(&screen) + 2, late_streaming_row);
+
+        // 단계 구분이 없는 제공자는 다음 텍스트가 시작되기 전에 기존 응답을
+        // 같은 자식 id의 접힌 그룹으로 교체한다.
+        let mut renderer = renderer();
+        simulate_fullscreen_frame(
+            &mut renderer,
+            &[prompt],
+            &[],
+            Some("Working"),
+            None,
+            rows,
+            width,
+        );
+        let group = Block::progress_group(vec![progress]);
+        let screen = simulate_fullscreen_frame(
+            &mut renderer,
+            &[group],
+            std::slice::from_ref(&answer),
+            Some("Working"),
+            None,
+            rows,
+            width,
+        );
+        let streaming_row = answer_row(&screen);
+        assert!(
+            renderer.wrapped.len() < rows / 2,
+            "the transcript is intentionally short"
+        );
+
+        let screen = simulate_fullscreen_frame(
+            &mut renderer,
+            std::slice::from_ref(&answer),
+            &[],
+            Some("Working"),
+            None,
+            rows,
+            width,
+        );
+        assert_eq!(answer_row(&screen), streaming_row);
+        let screen = simulate_fullscreen_frame(&mut renderer, &[], &[], None, None, rows, width);
+        assert_eq!(answer_row(&screen), streaming_row);
     }
 
     #[test]

@@ -494,7 +494,7 @@ async fn await_with_ticks<T>(
     }
 }
 
-/// Builds the session the first prompt needs, on the runtime that prompt selected.
+/// Builds the session the first thread-bound action needs, on the selected runtime.
 /// Returns false when it could not be created, with the failure already on screen.
 async fn open_pending_thread(
     server: &BackendServer,
@@ -507,8 +507,8 @@ async fn open_pending_thread(
         Some(&model),
         Some(state.service_tier()),
         // Codex accepts only `startup` or `clear` here and rejects the whole
-        // request otherwise, so a session opened by the first prompt reports the
-        // same source a session opened at launch does.
+        // request otherwise, so a session opened before the first prompt reports
+        // the same source a session opened by that prompt does.
         "startup",
         state.model_verbosity(),
         state.claude_permission_mode_setting().wire(),
@@ -1686,6 +1686,7 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
             state.open_response_display_picker();
             Action::None
         }
+        Pick::FastMode => state.run_command("/fast"),
         Pick::ShellDisplayMode => {
             state.cycle_shell_display_mode();
             Action::PersistVibeDisplayModes {
@@ -1921,6 +1922,18 @@ async fn execute_action(
             }
         }
         Action::SetFast(enabled) => {
+            // Unlike a prompt, a Fast choice can be the first thread-bound action
+            // after launch or `/new`. Create the selected provider's session first
+            // so `thread/settings/update` never receives an empty thread id.
+            if state.thread_pending() {
+                state.set_host_loading(true);
+                draw(state, renderer)?;
+                let opened = open_pending_thread(server, state, renderer).await;
+                state.set_host_loading(false);
+                if !opened? {
+                    return Ok(false);
+                }
+            }
             set_fast_mode(server, state, enabled).await;
         }
         // The mode also rides along with every turn, so a session that has not
@@ -2023,6 +2036,7 @@ async fn execute_action(
                     error.to_string(),
                 );
             }
+            state.persist_session_modes();
         }
         Action::PersistDiffDisplayMode(mode) => {
             if let Err(error) = server
@@ -2038,6 +2052,7 @@ async fn execute_action(
                     error.to_string(),
                 );
             }
+            state.persist_session_modes();
         }
         Action::PersistSidePanelDefault(stage) => {
             if let Err(error) = server
@@ -2068,6 +2083,7 @@ async fn execute_action(
                     error.to_string(),
                 );
             }
+            state.persist_session_modes();
         }
         Action::PersistVibeDisplayModes {
             vibe,
@@ -3343,6 +3359,7 @@ async fn apply_deferred_startup_actions(server: &BackendServer, state: &mut AppS
                         error.to_string(),
                     );
                 }
+                state.persist_session_modes();
             }
             Action::PersistVibeDisplayModes {
                 vibe,
@@ -3548,15 +3565,15 @@ async fn set_fast_mode(server: &BackendServer, state: &mut AppState, enabled: bo
     } else {
         "default".to_owned()
     };
-    let update = server
-        .request(
-            "thread/settings/update",
-            json!({
-                "threadId": state.thread_id,
-                "serviceTier": service_tier
-            }),
-        )
-        .await;
+    let Some(params) = fast_settings_update_params(&state.thread_id, &service_tier) else {
+        state.push_notice(
+            BlockKind::Error,
+            "Fast 전환 실패",
+            "세션을 먼저 시작하지 못했습니다.",
+        );
+        return;
+    };
+    let update = server.request("thread/settings/update", params).await;
     match update {
         Ok(_) => {
             if state.effective_fast_mode() != enabled {
@@ -3578,6 +3595,15 @@ async fn set_fast_mode(server: &BackendServer, state: &mut AppState, enabled: bo
         }
         Err(error) => state.push_notice(BlockKind::Error, "Fast 전환 실패", error.to_string()),
     }
+}
+
+fn fast_settings_update_params(thread_id: &str, service_tier: &str) -> Option<Value> {
+    (!thread_id.is_empty()).then(|| {
+        json!({
+            "threadId": thread_id,
+            "serviceTier": service_tier
+        })
+    })
 }
 
 async fn set_claude_permission_mode(
@@ -3639,6 +3665,7 @@ async fn persist_vibe_display_modes(
             break;
         }
     }
+    state.persist_session_modes();
 }
 
 fn config_value_write_params(key_path: &str, value: &str) -> Value {
@@ -3765,6 +3792,8 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- Skill 적용, 지침 확인, 내부 도구 호출 같은 내부 절차는 알리지 않는다.\n",
 );
 
+const CLAUDE_TURN_REMINDER: &str = "최종 답변은 불릿 2~3개, 전체 200자 내외로 쓰고 불릿 하나에 두 문장을 넘기지 않는다. 필요한 경우가 아니면 영어로 응답하지 않는다.";
+
 /// The Claude selections a session has to be told, because the bridge opens a
 /// fresh SDK session for every start and resume. Anything left out here comes
 /// back as the SDK's own default, which is what used to reset the model, the
@@ -3826,11 +3855,8 @@ fn resume_thread_params(thread_id: &str, claude: &ClaudeSessionSettings) -> Valu
 
 /// Codex and Claude both read the full rules once — Codex as the thread's
 /// developer instructions, Claude as the system prompt the bridge appends to its
-/// preset. A per-turn restatement of those same rules, long or short, only
-/// competed with the copy they already hold, so the turn carries no rules of its
-/// own. Only the preset rides along: the rules that depend on it are written as
-/// conditions, and the preset is a local display setting the provider is told
-/// nothing else about. The full rules stay here for the one runtime with no
+/// preset. Claude also gets one short per-turn reminder for the response limits
+/// it tends to miss. The full rules stay here for the one runtime with no
 /// standing instructions of its own.
 fn turn_additional_context(vibe: VibeMode) -> Value {
     json!({
@@ -3840,6 +3866,10 @@ fn turn_additional_context(vibe: VibeMode) -> Value {
         },
         "claude-devez-vibe-rules": {
             "value": CLAUDE_DEVEZ_INSTRUCTIONS,
+            "kind": "application"
+        },
+        "claude-devez-vibe-reminder": {
+            "value": CLAUDE_TURN_REMINDER,
             "kind": "application"
         },
         "devez-vibe-mode": {
@@ -3885,10 +3915,12 @@ fn new_thread_params(
     if !claude_permission_mode.is_empty() {
         params["claudePermissionMode"] = json!(claude_permission_mode);
     }
-    // Without this the runtime starts on its own default effort and the reply
-    // overwrites the effort the first frame already showed.
+    // Claude reads the shared top-level value, while Codex reads its thread
+    // default from config. Keep both so the first response cannot replace the
+    // effort selected before the provider-specific session exists.
     if !effort.is_empty() {
         params["effort"] = json!(effort);
+        params["config"]["model_reasoning_effort"] = json!(effort);
     }
     params
 }
@@ -5648,6 +5680,19 @@ mod tests {
     }
 
     #[test]
+    fn clicking_the_fast_badge_opens_the_fast_picker() {
+        let mut state = state_with_a_model();
+
+        let action = pick_action(&mut state, Pick::FastMode);
+
+        assert!(matches!(action, Action::None));
+        assert_eq!(
+            state.view().overlay.map(|overlay| overlay.title),
+            Some("Fast".to_owned())
+        );
+    }
+
+    #[test]
     fn clicking_the_vibe_badge_opens_its_picker() {
         let mut state = starting_state();
         let before = state.vibe_mode();
@@ -6091,7 +6136,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_threads_include_the_model_selected_for_the_first_frame() {
+    fn fresh_threads_include_the_model_and_effort_selected_before_first_prompt() {
         let params = new_thread_params(
             "C:\\repo",
             Some("gpt-5.6-terra"),
@@ -6117,6 +6162,28 @@ mod tests {
         assert_eq!(
             params.pointer("/model").and_then(Value::as_str),
             Some("gpt-5.6-terra")
+        );
+        assert_eq!(
+            params
+                .pointer("/config/model_reasoning_effort")
+                .and_then(Value::as_str),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn fast_update_is_built_only_after_thread_start_binds_an_id() {
+        assert!(fast_settings_update_params("", "priority").is_none());
+
+        let params = fast_settings_update_params("thread-1", "priority")
+            .expect("a bound thread can receive its Fast setting");
+        assert_eq!(
+            params.pointer("/threadId").and_then(Value::as_str),
+            Some("thread-1")
+        );
+        assert_eq!(
+            params.pointer("/serviceTier").and_then(Value::as_str),
+            Some("priority")
         );
     }
 
@@ -6272,11 +6339,18 @@ mod tests {
                 .and_then(Value::as_str),
             Some(CLAUDE_DEVEZ_INSTRUCTIONS)
         );
-        // Both providers hold the rules already — Codex as its thread
-        // instructions, Claude as its system prompt — so no per-turn restatement
-        // rides along beside them.
+        // Both providers hold the full rules already. Claude alone gets a short
+        // reminder for the output limits it repeatedly misses.
         assert!(context.get("codex-devez-vibe-reminder").is_none());
-        assert!(context.get("claude-devez-vibe-reminder").is_none());
+        assert_eq!(
+            context
+                .pointer("/claude-devez-vibe-reminder/value")
+                .and_then(Value::as_str),
+            Some(CLAUDE_TURN_REMINDER)
+        );
+        assert!(CLAUDE_TURN_REMINDER.contains("불릿 2~3개, 전체 200자 내외"));
+        assert!(CLAUDE_TURN_REMINDER.contains("불릿 하나에 두 문장을 넘기지 않는다"));
+        assert!(CLAUDE_TURN_REMINDER.contains("필요한 경우가 아니면 영어로 응답하지 않는다"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskCreate"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("첫 응답 content block"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("모든 일반 문장은 반드시 한국어로 작성한다"));
