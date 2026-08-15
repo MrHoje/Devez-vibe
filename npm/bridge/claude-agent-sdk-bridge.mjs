@@ -2,7 +2,7 @@
 
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { createReadStream } from "node:fs";
+import { createReadStream, existsSync, readdirSync } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -525,6 +525,36 @@ async function retryClaudePermission(params) {
   });
 }
 
+function subdirectories(dir) {
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
+}
+
+// A plugin output style marked `force-for-plugin` overrides the `outputStyle`
+// setting, so pinning that setting is not enough on its own: every installed
+// plugin shipping a style has to be switched off as well. Installed plugins
+// live at plugins/cache/<marketplace>/<plugin>/<version>, which is also where
+// the `<plugin>@<marketplace>` id the setting expects comes from.
+function styleShippingPlugins() {
+  const root = join(homedir(), ".claude", "plugins", "cache");
+  const disabled = {};
+  for (const marketplace of subdirectories(root)) {
+    const marketplaceDir = join(root, marketplace);
+    for (const plugin of subdirectories(marketplaceDir)) {
+      const pluginDir = join(marketplaceDir, plugin);
+      const shipsStyle = subdirectories(pluginDir).some((version) =>
+        existsSync(join(pluginDir, version, "output-styles")));
+      if (shipsStyle) disabled[`${plugin}@${marketplace}`] = false;
+    }
+  }
+  return disabled;
+}
+
 function makeOptions(params, sessionId, resume) {
   const options = {
     cwd: params.cwd || process.cwd(),
@@ -539,7 +569,10 @@ function makeOptions(params, sessionId, resume) {
     settingSources: ["user", "project", "local"],
     // The flag settings layer outranks user/project/local, so a CLI output style
     // never stacks on top of the DevezVibe instructions we append below.
-    settings: { outputStyle: "default" },
+    settings: {
+      outputStyle: "default",
+      enabledPlugins: styleShippingPlugins(),
+    },
     skills: "all",
     tools: { type: "preset", preset: "claude_code" },
     systemPrompt: {
