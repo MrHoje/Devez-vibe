@@ -6011,6 +6011,7 @@ impl AppState {
             fold_progress_groups: self.vibe_mode == VibeMode::SuperVibe
                 && self.response_display_mode == ResponseDisplayMode::Completed,
             plan_active: self.plan_is_active(),
+            turn_active: self.busy,
             plan_shimmer_phase: self.plan_shimmer_phase(),
             plan_effort: self
                 .active_turn_effort

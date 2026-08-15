@@ -512,6 +512,9 @@ pub struct View<'a> {
     pub fold_progress_groups: bool,
     /// Whether the current turn is still active, so an in-progress plan row may animate.
     pub plan_active: bool,
+    /// Whether the provider turn is still open. Question-close viewport anchors
+    /// live only for that turn and release when it ends.
+    pub turn_active: bool,
     /// A one-shot frame shimmer started by a plan creation or update.
     pub plan_shimmer_phase: Option<f32>,
     /// The effort fixed when the active request started, used for plan shimmer.
@@ -663,6 +666,11 @@ pub struct Renderer {
     /// Transcript start held for the render immediately after a prompt-hosted
     /// History toggle, keeping that prompt on the pointer's screen row.
     history_view_start_anchor: Option<usize>,
+    /// A blocking question is part of the live dock. When it closes, keep the
+    /// transcript allocation it occupied plus the newly committed answer rows,
+    /// so the provider's continuation fills the vacated space below the answer.
+    question_view_rows_anchor: Option<usize>,
+    question_overlay_open: bool,
     theme: ThemeKind,
     history: Vec<Block>,
     /// Rows the transcript is held back from its newest end. Zero follows the
@@ -1274,6 +1282,8 @@ impl Renderer {
             last_transcript_screen_start: 0,
             history_view_rows_anchor: None,
             history_view_start_anchor: None,
+            question_view_rows_anchor: None,
+            question_overlay_open: false,
             theme: selected_theme,
             history: Vec::new(),
             scroll_back: 0,
@@ -1358,6 +1368,7 @@ impl Renderer {
         if moved {
             self.history_view_rows_anchor = None;
             self.history_view_start_anchor = None;
+            self.question_view_rows_anchor = None;
         }
         let preserve_drag = self.selection_in_transcript && self.selection.is_dragging();
         let cleared = !preserve_drag && self.clear_selection();
@@ -1367,7 +1378,11 @@ impl Renderer {
     /// Returns the fullscreen transcript to its newest position. Inline mode
     /// leaves scrolling to the terminal's own scrollback.
     pub fn scroll_to_bottom(&mut self) -> bool {
-        if self.mode != RenderMode::Fullscreen || self.scroll_back == 0 {
+        if self.mode != RenderMode::Fullscreen {
+            return false;
+        }
+        let anchored = self.question_view_rows_anchor.take().is_some();
+        if self.scroll_back == 0 && !anchored {
             return false;
         }
         self.scroll_back = 0;
@@ -1408,9 +1423,18 @@ impl Renderer {
         if moved {
             self.history_view_rows_anchor = None;
             self.history_view_start_anchor = None;
+            self.question_view_rows_anchor = None;
             self.clear_selection();
         }
         moved
+    }
+
+    fn observe_question_overlay(&mut self, style: Option<OverlayStyle>) -> Option<usize> {
+        let open = style == Some(OverlayStyle::Question);
+        let closed_from =
+            (self.question_overlay_open && !open).then_some(self.last_transcript_rows);
+        self.question_overlay_open = open;
+        closed_from
     }
 
     fn scroll_to_bottom_control(&self, width: u16) -> Option<PaintLine> {
@@ -1465,6 +1489,8 @@ impl Renderer {
         self.last_transcript_rows = 0;
         self.history_view_rows_anchor = None;
         self.history_view_start_anchor = None;
+        self.question_view_rows_anchor = None;
+        self.question_overlay_open = false;
         self.apply_terminal_theme()?;
         self.reset_screen()
     }
@@ -1506,6 +1532,7 @@ impl Renderer {
             .map(Block::id);
         let expanding_latest_prompt_history =
             expanding && hosted_prompt.is_some() && hosted_prompt == latest_prompt;
+        self.question_view_rows_anchor = None;
         self.history_view_rows_anchor =
             (history_toggle && !hosted_history_toggle && self.scroll_back == 0)
                 .then_some(self.last_transcript_rows);
@@ -2180,6 +2207,8 @@ impl Renderer {
 
     pub fn render(&mut self, committed: &[Block], view: View<'_>) -> Result<()> {
         set_chat_layout(view.chat_layout);
+        let question_closed_from =
+            self.observe_question_overlay(view.overlay.as_ref().map(|overlay| overlay.style));
         let response_collapse_changed = self.update_response_collapse(view.response_collapse);
         let committed_without_startup = view.plan_summary.is_some().then(|| {
             committed
@@ -2201,6 +2230,7 @@ impl Renderer {
             self.wrapped_width = 0;
             self.history_view_rows_anchor = None;
             self.history_view_start_anchor = None;
+            self.question_view_rows_anchor = None;
         }
         let startup_update_removed =
             view.plan_summary.is_some() && self.remove_startup_update_from_history();
@@ -2215,6 +2245,7 @@ impl Renderer {
         if total_width != self.last_total_width || height != self.last_height {
             self.history_view_rows_anchor = None;
             self.history_view_start_anchor = None;
+            self.question_view_rows_anchor = None;
         }
         // The panel is docked, not overlaid: every conversation row is laid out
         // against the narrowed main width so nothing runs under the panel.
@@ -2233,6 +2264,9 @@ impl Renderer {
             self.side_panel = side_panel;
         }
         let width = side_panel.map_or(total_width, |layout| layout.main_width as u16);
+        if self.last_width != 0 && width != self.last_width {
+            self.question_view_rows_anchor = None;
+        }
         if width != self.last_width {
             queue!(self.out, Print(devez_layout_signal(width)))?;
         }
@@ -2280,7 +2314,9 @@ impl Renderer {
                 view.plan_active,
                 view.plan_shimmer_phase,
                 view.plan_effort,
+                view.turn_active,
                 view.waiting_for_response,
+                question_closed_from,
                 view.side_panel_prompts_expanded,
                 &view.side_panel_integrations,
                 view.stream_fade_tail,
@@ -2605,7 +2641,9 @@ impl Renderer {
         plan_active: bool,
         plan_shimmer_phase: Option<f32>,
         plan_effort: Option<&str>,
+        turn_active: bool,
         waiting_for_response: bool,
+        question_closed_from: Option<usize>,
         side_panel_prompts_expanded: bool,
         side_panel_integrations: &[ProviderIntegrationView],
         stream_fade_tail: usize,
@@ -2630,19 +2668,33 @@ impl Renderer {
             .unwrap_or_default();
         let plan_rows = plan_lines.len().min(rows.saturating_sub(1));
         let content_rows = rows.saturating_sub(plan_rows).max(1);
+        if !turn_active {
+            self.question_view_rows_anchor = None;
+        }
         if !committed.is_empty() && self.response_collapse.is_none() {
             self.history_view_rows_anchor = None;
             self.history_view_start_anchor = None;
         }
         let old_view_rows = split_rows(content_rows, frame.lines.len(), self.wrapped.len()).0;
+        let transcript_rows_before = self.wrapped.len();
         self.commit_fullscreen_blocks(committed, width, old_view_rows);
+        if let Some(previous_view_rows) = question_closed_from {
+            self.question_view_rows_anchor = Some(question_close_view_rows(
+                previous_view_rows,
+                transcript_rows_before,
+                self.wrapped.len(),
+            ));
+        }
+        let anchored_view_rows = self
+            .question_view_rows_anchor
+            .or(self.history_view_rows_anchor);
         let live_rows_after_absorb = frame.lines.len().saturating_sub(1);
         if self.wrapped.last() == Some(&PaintLine::blank())
             && trailing_transcript_spacer_will_be_visible(
                 content_rows,
                 live_rows_after_absorb,
                 self.wrapped.len(),
-                self.history_view_rows_anchor,
+                anchored_view_rows,
                 self.scroll_back,
                 self.history_view_start_anchor,
             )
@@ -2689,7 +2741,7 @@ impl Renderer {
             content_rows,
             frame.lines.len(),
             self.wrapped.len(),
-            self.history_view_rows_anchor,
+            anchored_view_rows,
         )
         .0;
         self.scroll_back = self
@@ -2699,7 +2751,7 @@ impl Renderer {
             content_rows,
             frame.lines.len(),
             self.wrapped.len(),
-            self.history_view_rows_anchor,
+            anchored_view_rows,
         );
         self.last_transcript_rows = view_rows;
         // The live blocks run from the top of the frame down to the dock, and the
@@ -3168,6 +3220,17 @@ fn split_rows(rows: usize, live_natural: usize, transcript_len: usize) -> (usize
     // `fit_frame` trims the frame's oldest rows to make it fit.
     let view_rows = transcript_len.min(rows.saturating_sub(live_natural));
     (view_rows, rows - view_rows)
+}
+
+/// Preserve the transcript's top row when a docked question becomes committed
+/// answer history. The new answer rows replace part of the question panel; the
+/// provider's continuation can then grow underneath without moving history.
+fn question_close_view_rows(
+    previous_view_rows: usize,
+    transcript_rows_before: usize,
+    transcript_rows_after: usize,
+) -> usize {
+    previous_view_rows.saturating_add(transcript_rows_after.saturating_sub(transcript_rows_before))
 }
 
 /// A History disclosure changes only which transcript rows are visible. Keep
@@ -14877,6 +14940,49 @@ mod tests {
     }
 
     #[test]
+    fn closing_a_question_keeps_the_transcript_still_while_the_reply_starts() {
+        let rows = 24;
+        let transcript_before = 30;
+        let question_rows = 12;
+        let answer_rows = 3;
+        let previous_view_rows = split_rows(rows, question_rows, transcript_before).0;
+        let previous_start = transcript_before - previous_view_rows;
+        let anchored_view_rows = question_close_view_rows(
+            previous_view_rows,
+            transcript_before,
+            transcript_before + answer_rows,
+        );
+
+        for followup_rows in [4, 6, 8] {
+            let (view_rows, _) = split_rows_with_transcript_anchor(
+                rows,
+                followup_rows,
+                transcript_before + answer_rows,
+                Some(anchored_view_rows),
+            );
+            let start = transcript_before + answer_rows - view_rows;
+            assert_eq!(start, previous_start);
+        }
+    }
+
+    #[test]
+    fn only_a_question_to_conversation_transition_creates_the_anchor() {
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.last_transcript_rows = 7;
+
+        assert_eq!(
+            renderer.observe_question_overlay(Some(OverlayStyle::Picker)),
+            None
+        );
+        assert_eq!(
+            renderer.observe_question_overlay(Some(OverlayStyle::Question)),
+            None
+        );
+        assert_eq!(renderer.observe_question_overlay(None), Some(7));
+        assert_eq!(renderer.observe_question_overlay(None), None);
+    }
+
+    #[test]
     fn history_expansion_keeps_the_last_transcript_line_on_its_previous_row() {
         let rows = 30;
         let live_rows = 10;
@@ -16032,6 +16138,15 @@ mod tests {
 
         assert!(renderer.scroll_to_bottom());
         assert_eq!(renderer.scroll_back, 0);
+    }
+
+    #[test]
+    fn fullscreen_scroll_to_bottom_releases_a_question_anchor() {
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.question_view_rows_anchor = Some(8);
+
+        assert!(renderer.scroll_to_bottom());
+        assert_eq!(renderer.question_view_rows_anchor, None);
     }
 
     #[test]

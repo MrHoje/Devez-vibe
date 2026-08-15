@@ -19,6 +19,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
+    "선택지에 답한 뒤 후속 출력이 이어질 때 화면이 위아래로 튀던 문제를 고쳤습니다.",
     "Codex의 새 MCP 프로토콜을 켜, MCP 서버가 늦게 올라와도 대화가 기다리지 않습니다.",
     "Claude 실행 파일을 최신 버전으로 올려, 긴 경로와 좁은 터미널에서 나던 오류를 없앴습니다.",
     "끝난 백그라운드 에이전트가 실행 목록에 남아 있던 문제를 고쳤습니다.",
