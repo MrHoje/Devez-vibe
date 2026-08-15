@@ -4618,7 +4618,8 @@ fn provider_handoff_snapshot(state: &AppState, renderer: &Renderer) -> Value {
                 "id": block.id,
                 "kind": block.kind,
                 "title": block.title,
-                "body": block.body
+                "body": block.body,
+                "responseDurationMs": block.response_duration_ms
             })
         })
         .collect::<Vec<_>>();

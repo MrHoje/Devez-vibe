@@ -33,7 +33,7 @@ use crate::{
         OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS, PermissionBadge, PermissionTone,
         PlanStep, PlanStepStatus, PlanSummary, ProviderHandoffBlock, ProviderIntegrationView,
         SIDE_PANEL_WIDTHS, StatusLineView, SubagentView, SuggestionView, VibeTone, View,
-        WelcomeView, visible_window,
+        WelcomeView, format_elapsed, visible_window,
     },
     rollout::{PlanSnapshot, Rollout, RolloutEvent, RolloutKind},
     theme::{self, ThemeKind},
@@ -3514,11 +3514,12 @@ pub struct AppState {
     /// commentary and final output; runtimes without that label use the last
     /// message on a successful turn as the final answer.
     turn_response_blocks: Vec<Block>,
-    /// User prompt block ids for the active turn, including every steer. A
+    /// User prompt blocks for the active turn, including every steer. A
     /// steer joins the existing provider turn and gets no response id of its
     /// own, so these local creation boundaries keep later progress attached to
-    /// the prompt that preceded it.
-    turn_prompt_ids: Vec<u64>,
+    /// the prompt that preceded it. The last clone also receives the completed
+    /// duration and replaces its already-rendered transcript block.
+    turn_prompts: Vec<Block>,
     response_grouped: bool,
     response_collapse: Option<ResponseCollapseTransition>,
     /// App-server lifecycle notifications can be replayed. An item id belongs
@@ -3764,7 +3765,7 @@ impl AppState {
             turn_file_changes: Vec::new(),
             turn_file_change_anchor: None,
             turn_response_blocks: Vec::new(),
-            turn_prompt_ids: Vec::new(),
+            turn_prompts: Vec::new(),
             response_grouped: false,
             response_collapse: None,
             completed_item_ids: HashSet::new(),
@@ -4964,9 +4965,9 @@ impl AppState {
 
     fn committed_before_current_prompt(&self) -> &[Block] {
         let end = self.committed.len().saturating_sub(usize::from(
-            self.committed
-                .last()
-                .is_some_and(|block| matches!(block.kind, BlockKind::User)),
+            self.committed.last().is_some_and(|block| {
+                matches!(block.kind, BlockKind::User) && block.response_duration().is_none()
+            }),
         ));
         &self.committed[..end]
     }
@@ -5337,7 +5338,7 @@ impl AppState {
         self.commit_welcome_card();
         self.reset_turn_item_tracking();
         let prompt = Block::new(BlockKind::User, self.selected_model_name(), text);
-        self.turn_prompt_ids.push(prompt.id());
+        self.turn_prompts.push(prompt.clone());
         self.committed.push(prompt);
         self.busy = true;
     }
@@ -5411,13 +5412,7 @@ impl AppState {
             .collect::<Vec<_>>();
         self.editor.replace_history(prompt_history);
         self.turn_interrupted = false;
-        self.last_completed_duration = turns.iter().rev().find_map(|turn| {
-            let started = turn.get("startedAt")?.as_i64()?;
-            let completed = turn.get("completedAt")?.as_i64()?;
-            u64::try_from(completed.checked_sub(started)?)
-                .ok()
-                .map(Duration::from_secs)
-        });
+        self.last_completed_duration = turns.iter().rev().find_map(completed_turn_duration);
         // Neither the turn nor the rollout names a model for every prompt — a
         // Codex thread carries no per-turn model at all. The thread reopened on
         // one model, so use it rather than dropping the prompt's marker back to
@@ -5427,7 +5422,15 @@ impl AppState {
             let Some(items) = turn.get("items").and_then(Value::as_array) else {
                 continue;
             };
-            for mut block in merged_turn_blocks(&self.cwd, turn, items, rollout) {
+            let mut blocks = merged_turn_blocks(&self.cwd, turn, items, rollout);
+            if let Some(duration) = completed_turn_duration(turn)
+                && let Some(prompt) = blocks
+                    .iter_mut()
+                    .rfind(|block| matches!(block.kind, BlockKind::User))
+            {
+                prompt.set_response_duration(duration);
+            }
+            for mut block in blocks {
                 if matches!(block.kind, BlockKind::User) && block.title == UNKNOWN_PROMPT_MODEL {
                     block.title = resumed_model.clone();
                 }
@@ -5473,7 +5476,8 @@ impl AppState {
     }
 
     pub fn set_turn_started(&mut self, turn_id: String) {
-        if self.turn_id.as_deref() != Some(turn_id.as_str()) {
+        let acknowledging_local_prompt = self.busy && self.turn_id.is_none();
+        if self.turn_id.as_deref() != Some(turn_id.as_str()) && !acknowledging_local_prompt {
             self.reset_turn_item_tracking();
             self.plan_turn_id = None;
         }
@@ -5539,7 +5543,7 @@ impl AppState {
         self.turn_file_changes.clear();
         self.turn_file_change_anchor = None;
         self.turn_response_blocks.clear();
-        self.turn_prompt_ids.clear();
+        self.turn_prompts.clear();
         self.response_grouped = false;
         self.response_collapse = None;
     }
@@ -5584,7 +5588,7 @@ impl AppState {
         if progress.is_empty() {
             return;
         }
-        let groups = progress_groups_for_prompt_ids(progress, &self.turn_prompt_ids);
+        let groups = progress_groups_for_prompts(progress, &self.turn_prompts);
         let Some(last_group) = groups.last() else {
             return;
         };
@@ -5618,10 +5622,8 @@ impl AppState {
         }
 
         self.response_grouped = true;
-        self.committed.extend(progress_groups_for_prompt_ids(
-            progress,
-            &self.turn_prompt_ids,
-        ));
+        self.committed
+            .extend(progress_groups_for_prompts(progress, &self.turn_prompts));
     }
 
     /// Returns an interrupt the user requested while `turn/start` was still
@@ -7224,6 +7226,13 @@ impl AppState {
                         self.turn_started_at.map(|started| started.elapsed());
                 }
                 self.turn_started_at = None;
+                if successful
+                    && let (Some(duration), Some(prompt)) =
+                        (self.last_completed_duration, self.turn_prompts.last_mut())
+                {
+                    prompt.set_response_duration(duration);
+                    self.committed.push(prompt.clone());
+                }
                 if let Some(error) = turn_error {
                     self.committed.push(Block::new(
                         BlockKind::Error,
@@ -7633,7 +7642,7 @@ impl AppState {
             self.reset_turn_item_tracking();
         }
         let prompt = Block::new(BlockKind::User, self.selected_model_name(), display);
-        self.turn_prompt_ids.push(prompt.id());
+        self.turn_prompts.push(prompt.clone());
         self.committed.push(prompt);
         if steering {
             Action::Steer(text)
@@ -12807,10 +12816,10 @@ fn merged_turn_blocks(
     }
 }
 
-fn progress_groups_for_prompt_ids(progress: Vec<Block>, prompt_ids: &[u64]) -> Vec<Block> {
+fn progress_groups_for_prompts(progress: Vec<Block>, prompts: &[Block]) -> Vec<Block> {
     let mut groups: Vec<(usize, Vec<Block>)> = Vec::new();
     for block in progress {
-        let boundary = prompt_ids.partition_point(|prompt_id| *prompt_id < block.id());
+        let boundary = prompts.partition_point(|prompt| prompt.id() < block.id());
         if groups
             .last()
             .is_none_or(|(current, _)| *current != boundary)
@@ -12823,6 +12832,17 @@ fn progress_groups_for_prompt_ids(progress: Vec<Block>, prompt_ids: &[u64]) -> V
         .into_iter()
         .map(|(_, children)| Block::progress_group(children))
         .collect()
+}
+
+fn completed_turn_duration(turn: &Value) -> Option<Duration> {
+    if let Some(duration_ms) = turn.get("durationMs").and_then(Value::as_u64) {
+        return Some(Duration::from_millis(duration_ms));
+    }
+    let started = turn.get("startedAt")?.as_i64()?;
+    let completed = turn.get("completedAt")?.as_i64()?;
+    u64::try_from(completed.checked_sub(started)?)
+        .ok()
+        .map(Duration::from_secs)
 }
 
 fn group_turn_response(blocks: Vec<Block>) -> Vec<Block> {
@@ -13359,17 +13379,6 @@ fn plural(count: usize, noun: &str) -> String {
     match count {
         1 => noun.to_owned(),
         _ => format!("{noun}s"),
-    }
-}
-
-/// Wall-clock elapsed for the activity row: `42s`, `1m 10s`, `1h 3m 49s`. A long
-/// turn reads as minutes rather than as a three-digit second count.
-fn format_elapsed(seconds: u64) -> String {
-    let (hours, minutes, seconds) = (seconds / 3_600, (seconds % 3_600) / 60, seconds % 60);
-    match (hours, minutes) {
-        (0, 0) => format!("{seconds}s"),
-        (0, _) => format!("{minutes}m {seconds}s"),
-        _ => format!("{hours}h {minutes}m {seconds}s"),
     }
 }
 
@@ -17798,13 +17807,45 @@ mod tests {
                 "turns": [{
                     "startedAt": 1_784_992_100_i64,
                     "completedAt": 1_784_992_165_i64,
-                    "items": []
+                    "items": [{
+                        "type": "userMessage",
+                        "content": [{ "type": "text", "text": "이전 프롬프트" }]
+                    }]
                 }]
             }),
             None,
         );
 
         assert_eq!(state.activity().as_deref(), Some("✧ Completed (1m 5s)"));
+        assert_eq!(
+            state.committed[0].response_duration(),
+            Some(Duration::from_secs(65))
+        );
+    }
+
+    #[test]
+    fn completed_turn_records_its_elapsed_time_on_the_last_prompt() {
+        let mut state = test_state();
+        state.editor.set_text("응답 시간을 기록해");
+        assert!(matches!(state.submit_editor(), Action::Submit(_)));
+        let prompt_id = state.committed.last().expect("submitted prompt").id();
+
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
+        state.turn_started_at = Some(Instant::now() - Duration::from_secs(70));
+        state.handle_notification("turn/completed", &json!({}));
+
+        let completed_prompt = state
+            .committed
+            .iter()
+            .rev()
+            .find(|block| block.id() == prompt_id)
+            .expect("completed prompt replacement");
+        assert_eq!(
+            completed_prompt
+                .response_duration()
+                .map(|duration| duration.as_secs()),
+            Some(70)
+        );
     }
 
     /// `/compact` has no assistant output of its own, so the activity row is the
@@ -18024,7 +18065,12 @@ mod tests {
             &json!({ "turn": { "status": "completed" } }),
         );
 
-        assert!(state.drain_committed().is_empty());
+        assert!(
+            state
+                .drain_committed()
+                .iter()
+                .all(|block| !matches!(block.kind, BlockKind::ProgressGroup))
+        );
         assert!(state.response_collapse_view().is_none());
     }
 
@@ -18125,7 +18171,12 @@ mod tests {
             "turn/completed",
             &json!({ "turn": { "status": "completed" } }),
         );
-        assert!(state.drain_committed().is_empty());
+        assert!(
+            state
+                .drain_committed()
+                .iter()
+                .all(|block| !matches!(block.kind, BlockKind::ProgressGroup))
+        );
         assert!(state.response_collapse_view().is_none());
     }
 

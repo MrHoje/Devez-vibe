@@ -129,6 +129,7 @@ pub struct Block {
     pub body: String,
     children: Vec<Block>,
     assistant_phase: AssistantPhase,
+    response_duration: Option<Duration>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,6 +138,7 @@ pub struct ProviderHandoffBlock {
     pub kind: &'static str,
     pub title: String,
     pub body: String,
+    pub response_duration_ms: Option<u64>,
 }
 
 impl ProviderHandoffBlock {
@@ -161,6 +163,9 @@ impl ProviderHandoffBlock {
             kind,
             title: block.title.clone(),
             body: block.body.clone(),
+            response_duration_ms: block
+                .response_duration
+                .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
         })
     }
 }
@@ -214,6 +219,7 @@ impl Block {
             body: body.into(),
             children: Vec::new(),
             assistant_phase: AssistantPhase::Unknown,
+            response_duration: None,
         }
     }
 
@@ -238,6 +244,14 @@ impl Block {
         if self.assistant_phase == AssistantPhase::Unknown {
             self.assistant_phase = source.assistant_phase;
         }
+    }
+
+    pub fn set_response_duration(&mut self, duration: Duration) {
+        self.response_duration = Some(duration);
+    }
+
+    pub const fn response_duration(&self) -> Option<Duration> {
+        self.response_duration
     }
 
     pub fn shell_group(kind: BlockKind, title: impl Into<String>, children: Vec<Block>) -> Self {
@@ -8518,7 +8532,7 @@ fn user_prompt_lines_with_history(
         let mut lines = lines;
         lines.insert(0, top);
         lines.push(bottom);
-        attach_history_to_prompt(&mut lines, width, history, false);
+        attach_prompt_footer(&mut lines, width, history, block.response_duration(), false);
         if history.is_some() {
             lines.push(PaintLine::blank());
         }
@@ -8559,11 +8573,15 @@ fn user_prompt_lines_with_history(
             " ".repeat(CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP)
         );
     }
+    let footer_width = prompt_footer_label(history, block.response_duration())
+        .map(|label| UnicodeWidthStr::width(label.as_str()))
+        .unwrap_or_default();
     let text_width = lines
         .iter()
         .map(|line| UnicodeWidthStr::width(line.text.as_str()))
         .max()
-        .unwrap_or(CHAT_BUBBLE_PADDING * 2);
+        .unwrap_or(CHAT_BUBBLE_PADDING * 2)
+        .max(footer_width.saturating_sub(2).min(content_width));
     let bubble_width = text_width + CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP + 2;
     let half_prefix =
         " ".repeat(left_margin + region_width.saturating_sub(RIGHT_GAP + bubble_width));
@@ -8586,48 +8604,64 @@ fn user_prompt_lines_with_history(
     bottom.prefix = half_prefix;
     lines.insert(0, top);
     lines.push(bottom);
-    attach_history_to_prompt(&mut lines, width, history, true);
+    attach_prompt_footer(&mut lines, width, history, block.response_duration(), true);
     if history.is_some() {
         lines.push(PaintLine::blank());
     }
     lines
 }
 
-fn attach_history_to_prompt(
+fn prompt_footer_label(
+    history: Option<(u64, &str, bool)>,
+    response_duration: Option<Duration>,
+) -> Option<String> {
+    let history = history.map(|(_, title, expanded)| {
+        if expanded {
+            "Hide".to_owned()
+        } else {
+            title.to_owned()
+        }
+    });
+    let duration = response_duration.map(|duration| format_elapsed(duration.as_secs()));
+    match (history, duration) {
+        (Some(history), Some(duration)) => Some(format!("{history}  {duration}")),
+        (Some(history), None) => Some(history),
+        (None, Some(duration)) => Some(duration),
+        (None, None) => None,
+    }
+}
+
+fn attach_prompt_footer(
     lines: &mut [PaintLine],
     width: u16,
     history: Option<(u64, &str, bool)>,
+    response_duration: Option<Duration>,
     chat_layout: bool,
 ) {
-    let Some((group_id, title, expanded)) = history else {
-        return;
-    };
-    let protected_right = usize::from(width).saturating_sub(1);
-    for line in lines.iter_mut() {
-        let prefix_width = UnicodeWidthStr::width(line.prefix.as_str());
-        let start = if chat_layout {
-            prefix_width
-        } else {
-            // Keep the coloured model border itself unchanged, but include the
-            // padding cell immediately after it in the prompt-wide hover.
-            prefix_width.saturating_sub(1)
-        };
-        let end = if chat_layout {
-            painted_line_width(line).min(protected_right)
-        } else {
-            protected_right
-        };
-        if start < end {
-            line.pick = Some(PickRegions::span(start, end, Pick::History(group_id)));
+    if let Some((group_id, _, _)) = history {
+        let protected_right = usize::from(width).saturating_sub(1);
+        for line in lines.iter_mut() {
+            let prefix_width = UnicodeWidthStr::width(line.prefix.as_str());
+            let start = if chat_layout {
+                prefix_width
+            } else {
+                // Keep the coloured model border itself unchanged, but include the
+                // padding cell immediately after it in the prompt-wide hover.
+                prefix_width.saturating_sub(1)
+            };
+            let end = if chat_layout {
+                painted_line_width(line).min(protected_right)
+            } else {
+                protected_right
+            };
+            if start < end {
+                line.pick = Some(PickRegions::span(start, end, Pick::History(group_id)));
+            }
         }
     }
 
-    // Replace the response count with an explicit close action while the
-    // response is open so the prompt control keeps describing what a click does.
-    let label = if expanded {
-        "Hide".to_owned()
-    } else {
-        title.to_owned()
+    let Some(label) = prompt_footer_label(history, response_duration) else {
+        return;
     };
     let label_width = UnicodeWidthStr::width(label.as_str());
     let Some(bottom) = lines.last_mut() else {
@@ -8652,6 +8686,16 @@ fn attach_history_to_prompt(
         tone: Tone::UserPromptPadding,
         bold: false,
     });
+}
+
+/// Wall-clock elapsed shared by the activity row and completed prompt footer.
+pub(crate) fn format_elapsed(seconds: u64) -> String {
+    let (hours, minutes, seconds) = (seconds / 3_600, (seconds % 3_600) / 60, seconds % 60);
+    match (hours, minutes) {
+        (0, 0) => format!("{seconds}s"),
+        (0, _) => format!("{minutes}m {seconds}s"),
+        _ => format!("{hours}h {minutes}m {seconds}s"),
+    }
 }
 
 fn conversation_region_width(width: u16) -> usize {
@@ -19870,6 +19914,39 @@ mod tests {
             }
             assert_eq!(frame.cell(79, 0).style.background, None);
         }
+    }
+
+    #[test]
+    fn completed_duration_stays_at_the_prompt_bottom_right_in_both_layouts() {
+        let mut prompt = Block::new(BlockKind::User, "gpt-5.6-sol", "짧은 질문");
+        prompt.set_response_duration(Duration::from_secs(70));
+
+        for chat_layout in [false, true] {
+            let lines = user_prompt_lines_with_history(&prompt, 80, None, chat_layout);
+            let footer = lines
+                .iter()
+                .find(|line| painted(line).contains("1m 10s"))
+                .expect("completed duration is visible");
+
+            assert!(painted(footer).ends_with("1m 10s  "));
+            assert_eq!(footer.tail[0].tone, Tone::History);
+            assert_eq!(painted_line_width(footer), 79);
+        }
+    }
+
+    #[test]
+    fn completed_duration_shares_the_footer_with_response_history() {
+        let mut prompt = Block::new(BlockKind::User, "gpt-5.6-sol", "보낸 프롬프트");
+        prompt.set_response_duration(Duration::from_secs(42));
+        let lines =
+            user_prompt_lines_with_history(&prompt, 80, Some((99, "+1 Response", false)), true);
+        let footer = lines
+            .iter()
+            .find(|line| painted(line).contains("+1 Response"))
+            .expect("history and duration footer");
+
+        assert!(painted(footer).ends_with("+1 Response  42s  "));
+        assert_eq!(painted_line_width(footer), 79);
     }
 
     #[test]

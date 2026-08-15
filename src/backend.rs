@@ -449,7 +449,11 @@ impl BackendServer {
             "thread/turns/list"
                 if self.route_kind(thread_id(&params)?) == RuntimeKind::OpenCode =>
             {
-                Ok(json!({ "data": [], "nextCursor": null }))
+                let visible = self.canonical_visible(thread_id(&params)?);
+                Ok(load_provider_handoff(&visible)
+                    .as_ref()
+                    .map(provider_handoff_history_page)
+                    .unwrap_or_else(|| json!({ "data": [], "nextCursor": null })))
             }
             "thread/turns/list" if self.route_kind(thread_id(&params)?) == RuntimeKind::Claude => {
                 let visible = self.canonical_visible(thread_id(&params)?);
@@ -1199,12 +1203,9 @@ impl BackendServer {
     }
 
     /// Persists the portable transcript after a completed turn. Native Claude and
-    /// Codex sessions remain the execution backends, but this sidecar is the
-    /// chronological visible history used when a mixed session is resumed.
+    /// Codex sessions remain the preferred history sources, while OpenCode and
+    /// mixed sessions use this sidecar to restore their visible transcript.
     pub fn persist_provider_handoff(&self, visible: &str, snapshot: Value) {
-        if !self.is_mixed_provider_route(visible) {
-            return;
-        }
         let Some(snapshot) = ProviderHandoff::from_value(snapshot) else {
             return;
         };
@@ -1884,6 +1885,7 @@ fn provider_handoff_history_page(snapshot: &ProviderHandoff) -> Value {
                 "id": turn_id,
                 "status": "completed",
                 "model": (entry.kind == "user").then_some(entry.title.clone()),
+                "durationMs": entry.response_duration_ms,
                 "items": [item]
             }));
             current_turn = Some(turns.len() - 1);
@@ -2110,6 +2112,8 @@ struct ProviderHandoffEntry {
     kind: String,
     title: String,
     body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    response_duration_ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2143,6 +2147,7 @@ impl ProviderHandoff {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_owned(),
+                    response_duration_ms: entry.get("responseDurationMs").and_then(Value::as_u64),
                 })
             })
             .collect();
@@ -2563,7 +2568,7 @@ mod tests {
             "lastBlockId": 4,
             "cwd": "C:/repo",
             "entries": [
-                { "id": 1, "kind": "user", "title": "claude:sonnet", "body": "Claude 질문" },
+                { "id": 1, "kind": "user", "title": "claude:sonnet", "body": "Claude 질문", "responseDurationMs": 65000 },
                 { "id": 2, "kind": "assistant", "title": "Claude", "body": "Claude 답변" },
                 { "id": 3, "kind": "user", "title": "gpt-5", "body": "Codex 질문" },
                 { "id": 4, "kind": "assistant", "title": "Codex", "body": "Codex 답변" }
@@ -2575,6 +2580,7 @@ mod tests {
         let turns = page["data"].as_array().expect("history turns");
 
         assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0]["durationMs"], json!(65_000));
         assert_eq!(turns[0]["items"][0]["type"], json!("userMessage"));
         assert_eq!(turns[0]["items"][1]["text"], json!("Claude 답변"));
         assert_eq!(
