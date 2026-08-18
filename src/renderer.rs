@@ -3214,14 +3214,26 @@ fn plan_rows_requiring_full_repaint(
     if previous_plan_rows != current_plan_rows {
         return (0..current_plan_rows).collect();
     }
-    (0..current_plan_rows)
+    let mut rows = (0..current_plan_rows)
         .filter(|&row| {
             previous
                 .get(row)
                 .zip(current.get(row))
                 .is_some_and(|(before, after)| plan_row_requires_full_repaint(before, after))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    // ConPTY can disturb the following row while a semantic plan body row is
+    // cleared and repainted. The border itself is unchanged, so an ordinary
+    // frame diff would trust the stale terminal contents and leave it broken.
+    if rows.iter().any(|&row| row >= 2)
+        && let Some(border_row) = current[..current_plan_rows]
+            .iter()
+            .rposition(|line| line.text.starts_with('└'))
+        && !rows.contains(&border_row)
+    {
+        rows.push(border_row);
+    }
+    rows
 }
 
 /// Splits the screen between the transcript and the live frame, as
@@ -20326,6 +20338,40 @@ mod tests {
             ),
             vec![1]
         );
+    }
+
+    #[test]
+    fn completed_plan_transition_repaints_its_bottom_border() {
+        let summary = PlanSummary {
+            explanation: None,
+            steps: vec![
+                PlanStep {
+                    text: "1. 첫 단계".to_owned(),
+                    status: PlanStepStatus::Completed,
+                    started_at: None,
+                    elapsed: Some(Duration::from_secs(17)),
+                },
+                PlanStep {
+                    text: "2. 운영 전 확인 절차와 전환 조건 대조".to_owned(),
+                    status: PlanStepStatus::Completed,
+                    started_at: None,
+                    elapsed: Some(Duration::from_secs(46)),
+                },
+            ],
+            expanded: true,
+            started_at: Instant::now(),
+            elapsed: Some(Duration::from_secs(63)),
+        };
+        let active = fixed_plan_summary_lines(&summary, 80, 0.0, true, None, None);
+        let completed = fixed_plan_summary_lines(&summary, 80, 0.0, false, None, None);
+        let border_row = completed.len() - 2;
+
+        let repainted =
+            plan_rows_requiring_full_repaint(&active, active.len(), &completed, completed.len());
+
+        assert!(repainted.contains(&border_row));
+        assert!(painted(&completed[border_row]).starts_with('└'));
+        assert!(painted(&completed[border_row]).ends_with('┘'));
     }
 
     #[test]
