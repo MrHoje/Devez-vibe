@@ -2556,8 +2556,6 @@ impl Renderer {
 
         let mut rows = Vec::with_capacity(updates.len());
         for (screen_row, line) in updates {
-            let repaint_plan_row = *screen_row < self.animation_plan_rows
-                && plan_row_requires_full_repaint(&self.previous_lines[*screen_row], line);
             let mut current = CellFrame::new(width, 1);
             let hovered = Self::hover_columns(line, self.hovered_tool, self.hovered_pick.as_ref());
             paint_line_into_frame(
@@ -2589,7 +2587,15 @@ impl Renderer {
                 height: 1,
                 cells: painted.cells[start..start + width].to_vec(),
             };
-            rows.push((*screen_row, previous, current, repaint_plan_row));
+            // Semantic plan changes and any changed cell on a row that carries
+            // a wide glyph — an animated spinner prefix, a shimmer tone, or a
+            // hover restyle beside Korean text — both take the sequential path.
+            // A cell diff would jump the cursor into the row's middle, which
+            // ConPTY re-synthesizes with the wide glyphs duplicated.
+            let repaint_sequential = (*screen_row < self.animation_plan_rows
+                && plan_row_requires_full_repaint(&self.previous_lines[*screen_row], line))
+                || wide_row_needs_sequential_repaint(&previous, &current);
+            rows.push((*screen_row, previous, current, repaint_sequential));
         }
 
         queue!(self.out, Print("\x1b[?2026h"))?;
@@ -2598,10 +2604,10 @@ impl Renderer {
             queue!(self.out, Hide)?;
         }
         let mut result = Ok(());
-        for (screen_row, previous, current, repaint_plan_row) in &rows {
-            // A changed plan step can shorten or restyle wide Korean text. Clear
-            // just that row once; spinner frames keep the inexpensive diff path.
-            let repaint_result = if *repaint_plan_row {
+        for (screen_row, previous, current, repaint_sequential) in &rows {
+            // Changed rows carrying wide glyphs clear and repaint whole; only
+            // narrow-glyph rows keep the inexpensive cell diff path.
+            let repaint_result = if *repaint_sequential {
                 emit_row_sequential(&mut self.out, current, 0, *screen_row)
             } else {
                 emit_frame_diff_at(&mut self.out, Some(previous), current, *screen_row)
@@ -3201,10 +3207,37 @@ fn plan_row_requires_full_repaint(previous: &PaintLine, current: &PaintLine) -> 
             .eq(current.tail.iter().map(|span| span.text.as_str()))
 }
 
+/// True when any painted part of the row holds a double-width glyph. Any change
+/// on such a row must repaint it whole: a cell diff moves the cursor into the
+/// row's middle, and ConPTY re-synthesizes that jump with each wide glyph
+/// duplicated and the columns drifted.
+fn paint_line_holds_wide_glyphs(line: &PaintLine) -> bool {
+    std::iter::once(line.prefix.as_str())
+        .chain(std::iter::once(line.text.as_str()))
+        .chain(line.tail.iter().map(|span| span.text.as_str()))
+        .flat_map(str::chars)
+        .any(|ch| UnicodeWidthChar::width(ch).unwrap_or(0) > 1)
+}
+
+/// The cell-level twin of [`paint_line_holds_wide_glyphs`] for one-row frames:
+/// a changed cell anywhere on a row that carries a wide glyph — before or after
+/// the change — demands the sequential full-row repaint.
+fn wide_row_needs_sequential_repaint(previous: &CellFrame, current: &CellFrame) -> bool {
+    if previous.width != current.width {
+        return true;
+    }
+    (0..current.width).any(|column| previous.cell(column, 0) != current.cell(column, 0))
+        && (0..current.width).any(|column| {
+            previous.cell(column, 0).continuation || current.cell(column, 0).continuation
+        })
+}
+
 /// A plan state change first reaches the normal render path, before the next
 /// animation tick can compare its rows. Mark changed step rows here so they get
 /// one safe full repaint in that first synchronized frame. Spinner-only prefix
-/// changes keep using the inexpensive cell diff.
+/// changes keep the inexpensive cell diff on narrow-glyph rows, but a row that
+/// carries a wide glyph repaints whole on any change at all — ConPTY duplicates
+/// wide glyphs while re-synthesizing a cursor jump into such a row's middle.
 fn plan_rows_requiring_full_repaint(
     previous: &[PaintLine],
     previous_plan_rows: usize,
@@ -3219,7 +3252,12 @@ fn plan_rows_requiring_full_repaint(
             previous
                 .get(row)
                 .zip(current.get(row))
-                .is_some_and(|(before, after)| plan_row_requires_full_repaint(before, after))
+                .is_some_and(|(before, after)| {
+                    plan_row_requires_full_repaint(before, after)
+                        || (before != after
+                            && (paint_line_holds_wide_glyphs(before)
+                                || paint_line_holds_wide_glyphs(after)))
+                })
         })
         .collect::<Vec<_>>();
     // ConPTY can disturb the following row while a semantic plan body row is
@@ -20305,7 +20343,7 @@ mod tests {
 
     #[test]
     fn initial_plan_change_repaints_only_the_changed_step_row() {
-        let mut before = PaintLine::plain("작업");
+        let mut before = PaintLine::plain("Task");
         before.prefix = "  ⠋  ".to_owned();
         before.prefix_tone = Tone::Accent;
         before.tone = Tone::Accent;
@@ -20338,6 +20376,63 @@ mod tests {
             ),
             vec![1]
         );
+    }
+
+    #[test]
+    fn spinner_tick_on_a_korean_plan_row_repaints_the_whole_row() {
+        let mut before = PaintLine::plain("작업");
+        before.prefix = "  ⠋  ".to_owned();
+        before.prefix_tone = Tone::Accent;
+        before.tone = Tone::Accent;
+        let mut spinner = before.clone();
+        spinner.prefix = "  ⠙  ".to_owned();
+
+        // A cursor jump into a wide row's middle is what ConPTY re-synthesizes
+        // with the glyphs duplicated, so even a spinner-only tick goes whole.
+        assert_eq!(
+            plan_rows_requiring_full_repaint(
+                &[PaintLine::plain("header"), before],
+                2,
+                &[PaintLine::plain("header"), spinner],
+                2,
+            ),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn changed_cells_on_a_wide_row_demand_the_sequential_repaint() {
+        let mut previous = CellFrame::new(16, 1);
+        previous.write(0, 0, "  ⠋  한글 단계", CellStyle::plain());
+        let mut current = previous.clone();
+        current.write(0, 0, "  ⠙  한글 단계", CellStyle::plain());
+        assert!(wide_row_needs_sequential_repaint(&previous, &current));
+
+        // The same row untouched keeps the diff silent.
+        assert!(!wide_row_needs_sequential_repaint(&previous, &previous.clone()));
+
+        // A narrow-glyph row keeps the inexpensive cell diff.
+        let mut previous = CellFrame::new(16, 1);
+        previous.write(0, 0, "  ⠋  Task", CellStyle::plain());
+        let mut current = previous.clone();
+        current.write(0, 0, "  ⠙  Task", CellStyle::plain());
+        assert!(!wide_row_needs_sequential_repaint(&previous, &current));
+
+        // A hover restyle beside Korean text changes styles, not glyphs, and
+        // still needs the whole row.
+        let mut previous = CellFrame::new(16, 1);
+        previous.write(0, 0, "한글 단계", CellStyle::plain());
+        let mut current = CellFrame::new(16, 1);
+        current.write(
+            0,
+            0,
+            "한글 단계",
+            CellStyle {
+                bold: true,
+                ..CellStyle::plain()
+            },
+        );
+        assert!(wide_row_needs_sequential_repaint(&previous, &current));
     }
 
     #[test]
