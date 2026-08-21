@@ -889,9 +889,53 @@ async function claudePluginDetail(params) {
   };
 }
 
+// SKILL.md 앞머리(frontmatter)에서 슬래시 이름과 설명만 가볍게 읽는다.
+async function readSkillMeta(skillMdPath, fallbackName) {
+  let name = fallbackName;
+  let description = "";
+  try {
+    const text = await readFile(skillMdPath, "utf8");
+    const front = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    const body = front ? front[1] : "";
+    const nameLine = body.match(/^name:\s*(.+?)\s*$/m);
+    const descLine = body.match(/^description:\s*(.+?)\s*$/m);
+    const unquote = (value) => value.replace(/^["']|["']$/g, "").trim();
+    if (nameLine && unquote(nameLine[1])) name = unquote(nameLine[1]);
+    if (descLine) description = unquote(descLine[1]);
+  } catch { /* SKILL.md가 없거나 읽을 수 없을 수 있다. */ }
+  return { name, description };
+}
+
+// 플러그인이 아닌 개인·프로젝트 스킬 디렉터리(<root>/<name>/SKILL.md)를 훑는다.
+async function localSkills(root, scope) {
+  const skills = [];
+  let entries;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch {
+    return skills; // 스킬 디렉터리가 없을 수 있다.
+  }
+  for (const child of entries) {
+    if (!child.isDirectory()) continue;
+    const path = join(root, child.name, "SKILL.md");
+    if (!existsSync(path)) continue;
+    const meta = await readSkillMeta(path, child.name);
+    skills.push({
+      name: meta.name,
+      path,
+      description: meta.description || `${scope} skill`,
+      enabled: true,
+      scope,
+      pluginId: null,
+    });
+  }
+  return skills;
+}
+
 async function claudeSkills(params) {
   const installed = await runClaudeJson(params, ["plugin", "list", "--json"]);
   const skills = [];
+  const seen = new Set();
   for (const plugin of Array.isArray(installed) ? installed : []) {
     if (!plugin?.installPath) continue;
     try {
@@ -905,10 +949,22 @@ async function claudeSkills(params) {
           scope: plugin.scope || "user",
           pluginId: plugin.id,
         });
+        seen.add(child.name);
       }
     } catch { /* Plugins do not have to provide skills. */ }
   }
-  return { data: [{ cwd: params.cwd || process.cwd(), skills }] };
+  const cwd = params.cwd || process.cwd();
+  const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+  const local = [
+    ...(await localSkills(join(configDir, "skills"), "user")),
+    ...(await localSkills(join(cwd, ".claude", "skills"), "project")),
+  ];
+  for (const skill of local) {
+    if (seen.has(skill.name)) continue;
+    seen.add(skill.name);
+    skills.push(skill);
+  }
+  return { data: [{ cwd, skills }] };
 }
 
 function claudeMcpStatusValue(statuses) {

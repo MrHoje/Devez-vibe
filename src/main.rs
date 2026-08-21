@@ -4478,7 +4478,8 @@ fn skill_write_request(
 ) -> Result<(&'static str, Value)> {
     let (method, params) = match provider {
         SkillProvider::Claude => {
-            let plugin_id = source.context("Claude Skill의 원본 플러그인을 확인할 수 없습니다.")?;
+            let plugin_id = source
+                .context("개인·프로젝트 스킬은 파일이 있으면 항상 켜져 있어 여기서 끌 수 없습니다.")?;
             (
                 "plugin/set-enabled",
                 json!({
