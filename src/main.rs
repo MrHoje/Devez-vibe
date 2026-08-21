@@ -1125,6 +1125,8 @@ async fn event_loop(
     let mut indexed_cwd = None;
     let mut integration_key = None;
     let mut integration_rx = None;
+    let mut skills_key = None;
+    let mut skills_rx = None;
     let mut side_exit_key_guard = None;
     draw(state, renderer)?;
 
@@ -1182,6 +1184,16 @@ async fn event_loop(
             if integration_key.as_ref() != Some(&current_integration_key) {
                 integration_key = Some(current_integration_key);
                 integration_rx = Some(start_integration_refresh(server, state));
+            }
+        }
+        // The side panel stays disconnected, but `$` completion still needs the
+        // skill list. Load it for Claude on the first draw and on every cwd/model
+        // change, independent of the panel-wide integration refresh above.
+        if claude::is_claude_model(state.selected_model_name()) {
+            let current_skills_key = (state.cwd.clone(), state.selected_model_name().to_owned());
+            if skills_key.as_ref() != Some(&current_skills_key) {
+                skills_key = Some(current_skills_key);
+                skills_rx = Some(start_skills_refresh(server, state));
             }
         }
         if indexed_cwd.as_deref() != Some(state.cwd.as_str()) {
@@ -1414,6 +1426,12 @@ async fn event_loop(
             Some(catalog) = recv_integrations(&mut integration_rx) => {
                 if let Err(error) = apply_integrations(state, catalog) {
                     state.push_notice(BlockKind::Warning, "통합 기능 조회 실패", error.to_string());
+                }
+                Action::None
+            }
+            Some((provider, result)) = recv_skills(&mut skills_rx) => {
+                if let Ok(response) = result {
+                    state.update_skills_for_provider(provider, &response);
                 }
                 Action::None
             }
@@ -4410,6 +4428,43 @@ async fn recv_integrations(
         *receiver = None;
     }
     catalogue
+}
+
+type SkillsResult = (SkillProvider, std::result::Result<Value, String>);
+
+/// Fetches only the skill list for the current provider in the background, so
+/// `$` completion has skills without opening `/skills` first.
+fn start_skills_refresh(server: &BackendServer, state: &AppState) -> mpsc::Receiver<SkillsResult> {
+    let model = state.selected_model_name().to_owned();
+    let provider = SkillProvider::from_model(&model);
+    let client = server.integration_client(&model);
+    let cwd = state.cwd.clone();
+    let (sender, receiver) = mpsc::channel(1);
+    tokio::spawn(async move {
+        let result = match client {
+            Some(client) => client
+                .request(
+                    "skills/list",
+                    json!({ "cwd": cwd.clone(), "cwds": [cwd], "forceReload": true }),
+                )
+                .await
+                .map_err(|error| error.to_string()),
+            None => Ok(json!({ "data": [] })),
+        };
+        let _ = sender.send((provider, result)).await;
+    });
+    receiver
+}
+
+async fn recv_skills(receiver: &mut Option<mpsc::Receiver<SkillsResult>>) -> Option<SkillsResult> {
+    let Some(channel) = receiver.as_mut() else {
+        return std::future::pending().await;
+    };
+    let result = channel.recv().await;
+    if result.is_none() {
+        *receiver = None;
+    }
+    result
 }
 
 async fn refresh_integrations(
