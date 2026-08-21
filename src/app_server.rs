@@ -683,13 +683,19 @@ mod tests {
             "model = \"gpt-5\"\n[features]\ntool_search = true\n",
             &keys
         ));
-        assert!(config_declares("[features]\nmcp_2026_07_28 = false\n", &keys));
+        assert!(config_declares(
+            "[features]\nmcp_2026_07_28 = false\n",
+            &keys
+        ));
         assert!(config_declares(
             "features.mcp_2026_07_28 = true  # already decided\n",
             &keys
         ));
         // A commented-out line is not a decision.
-        assert!(!config_declares("[features]\n# mcp_2026_07_28 = true\n", &keys));
+        assert!(!config_declares(
+            "[features]\n# mcp_2026_07_28 = true\n",
+            &keys
+        ));
 
         let mut command = codex_command(Path::new("codex"));
         apply_mcp_2026_protocol_override(&mut command);
@@ -699,7 +705,10 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         // The real Codex home decides, so only assert the pair stays together.
-        if let Some(index) = args.iter().position(|arg| arg == MCP_2026_PROTOCOL_OVERRIDE) {
+        if let Some(index) = args
+            .iter()
+            .position(|arg| arg == MCP_2026_PROTOCOL_OVERRIDE)
+        {
             assert_eq!(args.get(index - 1).map(String::as_str), Some("-c"));
         } else {
             assert!(codex_config_declares_mcp_2026_protocol());

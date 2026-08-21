@@ -1911,6 +1911,13 @@ async fn execute_action(
             return resume_thread(server, state, renderer, &target).await;
         }
         Action::ActivateCodex => activate_codex(server, state).await,
+        Action::ActivateOpenCode => {
+            if open_code::has_connected_provider() {
+                activate_open_code(server, state).await;
+            } else {
+                open_provider_connection(server, state, renderer).await?;
+            }
+        }
         Action::PersistProviderConnection {
             key_path,
             connected,
@@ -2335,14 +2342,7 @@ async fn execute_action(
                 });
             });
         }
-        Action::ConnectProvider => {
-            state.open_provider_loading();
-            draw(state, renderer)?;
-            match server.provider_catalog().await {
-                Ok(catalog) => state.open_provider_picker(&catalog),
-                Err(error) => state.provider_connection_failed(error.to_string()),
-            }
-        }
+        Action::ConnectProvider => open_provider_connection(server, state, renderer).await?,
         Action::SubmitProviderAuth(request) => {
             let ProviderAuthRequest {
                 provider_id,
@@ -3145,6 +3145,43 @@ async fn activate_codex(server: &mut BackendServer, state: &mut AppState) {
         },
         Err(error) => state.push_notice(BlockKind::Error, "Codex 사용 불가", error.to_string()),
     }
+}
+
+async fn activate_open_code(server: &mut BackendServer, state: &mut AppState) {
+    match server.start_open_code().await {
+        Ok(()) => match server
+            .request(
+                "model/list",
+                json!({ "includeHidden": false, "limit": 100 }),
+            )
+            .await
+        {
+            Ok(response) => {
+                state.replace_models(parse_models(&response));
+                state.switch_to_open_code();
+            }
+            Err(error) => state.push_notice(
+                BlockKind::Error,
+                "OpenCode 모델 조회 실패",
+                error.to_string(),
+            ),
+        },
+        Err(error) => state.push_notice(BlockKind::Error, "OpenCode 사용 불가", error.to_string()),
+    }
+}
+
+async fn open_provider_connection(
+    server: &mut BackendServer,
+    state: &mut AppState,
+    renderer: &mut Renderer,
+) -> Result<()> {
+    state.open_provider_loading();
+    draw(state, renderer)?;
+    match server.provider_catalog().await {
+        Ok(catalog) => state.open_provider_picker(&catalog),
+        Err(error) => state.provider_connection_failed(error.to_string()),
+    }
+    Ok(())
 }
 
 /// Clears the screen back to the welcome panel without opening a session. The next
@@ -4046,6 +4083,7 @@ async fn refresh_provider_models(
         Ok(response) => {
             state.replace_models(parse_models(&response));
             state.provider_connected(provider_name);
+            state.activate_first_opencode_model();
         }
         Err(error) => {
             state.provider_connected(provider_name);
@@ -4533,8 +4571,9 @@ fn skill_write_request(
 ) -> Result<(&'static str, Value)> {
     let (method, params) = match provider {
         SkillProvider::Claude => {
-            let plugin_id = source
-                .context("개인·프로젝트 스킬은 파일이 있으면 항상 켜져 있어 여기서 끌 수 없습니다.")?;
+            let plugin_id = source.context(
+                "개인·프로젝트 스킬은 파일이 있으면 항상 켜져 있어 여기서 끌 수 없습니다.",
+            )?;
             (
                 "plugin/set-enabled",
                 json!({

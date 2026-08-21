@@ -339,6 +339,7 @@ pub enum OverlayStyle {
     Panel,
     CompactPanel,
     Picker,
+    SearchPicker,
     /// A question the server is waiting on: a picker-style box with a bold
     /// prompt and numbered options. The first row is the prompt and the last is
     /// the row that hands the turn back to the composer, which is why the rule
@@ -4053,6 +4054,7 @@ enum Tone {
     ModelSonnet,
     ModelOpus,
     ModelFable,
+    ModelOpenCode,
     StatusModel56,
     StatusModelSol,
     StatusModelTerra,
@@ -5706,9 +5708,13 @@ fn overlay_frame_with_expansion(
     // Set when a free-text answer is typed on the option row it was picked on,
     // which is where the cursor then belongs.
     let mut inline_cursor = None;
+    let mut cursor_line = lines.len();
+    let mut cursor_col = 0;
+    let mut composer_index = None;
+    let mut embedded_search_active = false;
 
     match overlay.style {
-        OverlayStyle::Picker => {
+        OverlayStyle::Picker | OverlayStyle::SearchPicker => {
             let panel_width = panel_span(width);
             // Keep one ordinary terminal cell open before the closing border;
             // the effort track below uses the same narrower content area.
@@ -5719,6 +5725,37 @@ fn overlay_frame_with_expansion(
                 overlay.closable,
             ));
             lines.push(panel_padding_row(panel_width));
+
+            if overlay.style == OverlayStyle::SearchPicker
+                && let Some(editor) = overlay.input
+            {
+                // Search belongs to the model group, not to the composer. Keep
+                // only a plain nested border and its editor; passing no mode
+                // deliberately removes the selected model's chrome colour.
+                const MODEL_SEARCH_MAX_WIDTH: usize = 48;
+                let search_width = panel_width.saturating_sub(3).min(MODEL_SEARCH_MAX_WIDTH);
+                let input_width = (search_width + 1).min(u16::MAX as usize) as u16;
+                let left_inset = panel_width
+                    .saturating_sub(2 + search_width)
+                    .saturating_div(2);
+                let (input, input_cursor_line, input_cursor_col, _) = input_lines(
+                    editor,
+                    &[],
+                    input_width,
+                    overlay.input_label,
+                    overlay.input_placeholder,
+                    None,
+                    None,
+                );
+                cursor_line = lines.len() + input_cursor_line;
+                cursor_col = input_cursor_col + left_inset + 1;
+                lines.extend(input.into_iter().map(|mut line| {
+                    line.prefix.insert_str(0, &" ".repeat(left_inset));
+                    panelize_content_line(line, panel_width)
+                }));
+                lines.push(panel_padding_row(panel_width));
+                embedded_search_active = true;
+            }
 
             for (row_index, row) in overlay.lines.iter().enumerate() {
                 if row.text.is_empty() {
@@ -6041,12 +6078,11 @@ fn overlay_frame_with_expansion(
             lines.push(panel_rule_row("╰─ ", &overlay.hint, '╯', panel_width));
         }
     }
-    let mut cursor_line = lines.len() - 1;
-    let mut cursor_col = 0;
-    let mut composer_index = None;
     let show_cursor = if let Some((line, column)) = inline_cursor {
         cursor_line = line;
         cursor_col = column;
+        true
+    } else if embedded_search_active {
         true
     } else if let Some(editor) = overlay.input {
         // The composer rule reads as part of the picker without this gap.
@@ -6144,12 +6180,16 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         .effort
         .as_deref()
         .is_some_and(|effort| !effort.is_empty());
+    let has_model_shortcut = status
+        .model
+        .as_deref()
+        .is_some_and(|model| !is_open_code_model_label(model));
     let mut spans = Vec::new();
     let mut picks = Vec::new();
     if let Some(model) = status.model.filter(|model| !model.is_empty()) {
         let span = push_status_span(
             &mut spans,
-            compact_right(&model, 28),
+            compact_right(&model, 40),
             status_model_tone(&model).unwrap_or(Tone::StatusText),
         );
         picks.push((span, Pick::Model));
@@ -6187,13 +6227,13 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
     // Align with the activity controls above by keeping two blank terminal
     // columns to the right of the status line.
     let max_width = width.saturating_sub(3) as usize;
-    let shortcut_hint = status_line_shortcut_hint_from_effort(has_effort);
+    let shortcut_hint = status_line_shortcut_hint(has_model_shortcut, has_effort);
     let content_width = spans
         .iter()
         .map(|span| UnicodeWidthStr::width(span.text.as_str()))
         .sum::<usize>();
     let hint_width = UnicodeWidthStr::width(shortcut_hint);
-    if content_width + hint_width <= max_width {
+    if !shortcut_hint.is_empty() && content_width + hint_width <= max_width {
         spans.push(PaintSpan {
             text: " ".repeat(max_width - content_width - hint_width),
             tone: Tone::Muted,
@@ -6225,11 +6265,12 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
     .with_picks(&picks)
 }
 
-fn status_line_shortcut_hint_from_effort(has_effort: bool) -> &'static str {
-    if has_effort {
-        "Shift + ↑↓ model · ←→ effort"
-    } else {
-        "Shift + ↑↓ model"
+fn status_line_shortcut_hint(has_model_shortcut: bool, has_effort: bool) -> &'static str {
+    match (has_model_shortcut, has_effort) {
+        (true, true) => "Shift + ↑↓ model · ←→ effort",
+        (true, false) => "Shift + ↑↓ model",
+        (false, true) => "←→ effort",
+        (false, false) => "",
     }
 }
 
@@ -8553,10 +8594,10 @@ fn user_prompt_lines_with_history(
     history: Option<(u64, &str, bool)>,
     chat_layout: bool,
 ) -> Vec<PaintLine> {
-    let marker_tone = model_tone(&block.title).unwrap_or(Tone::User);
+    let marker_tone = chrome_model_tone(&block.title).unwrap_or(Tone::User);
     if !chat_layout {
         // 세로선은 블록에 기록된 전송 시점 모델 색을 쓰고, 모델을 못 알아보면 기존 강조색으로 돌아간다.
-        let border_tone = model_tone(&block.title).unwrap_or(Tone::Accent);
+        let border_tone = chrome_model_tone(&block.title).unwrap_or(Tone::Accent);
         let lines = block
             .body
             .lines()
@@ -10058,7 +10099,7 @@ fn input_bottom_line(
 }
 
 fn composer_chrome_tone(mode: Option<&ComposerMode>) -> Tone {
-    mode.and_then(|mode| model_tone(&mode.model))
+    mode.and_then(|mode| chrome_model_tone(&mode.model))
         .unwrap_or(Tone::Border)
 }
 
@@ -10700,7 +10741,36 @@ fn set_selection_style(
     Ok(())
 }
 
+fn is_open_code_model_label(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.starts_with("opencode:")
+        || model.starts_with("opencode/")
+        || model.starts_with("opencode-")
+        || model.contains("opencode ·")
+        || model.starts_with("go ·")
+        || model.starts_with("zen ·")
+        || model.contains(" go ·")
+        || model.contains(" zen ·")
+        || model.contains(" · opencode go")
+        || model.contains(" · opencode zen")
+}
+
+/// 컴포저 테두리와 프롬프트 세로선이 쓰는 색. OpenCode 모델은 어느 vendor의
+/// 모델을 타든 테마의 OpenCode 파란색을 쓴다. `/model` 목록이 쓰는
+/// `model_tone`에는 색을 주지 않아 선택창만 무채색으로 남는다.
+fn chrome_model_tone(model: &str) -> Option<Tone> {
+    if is_open_code_model_label(model) {
+        return Some(Tone::ModelOpenCode);
+    }
+    model_tone(model)
+}
+
 fn model_tone(model: &str) -> Option<Tone> {
+    // OpenCode rides other vendors' models (claude, gpt), so the substring
+    // matches below would steal their colors for a different runtime.
+    if is_open_code_model_label(model) {
+        return None;
+    }
     let model = model.to_ascii_lowercase();
     if model.contains("haiku") {
         Some(Tone::ModelHaiku)
@@ -10728,6 +10798,9 @@ fn model_tone(model: &str) -> Option<Tone> {
 }
 
 fn status_model_tone(model: &str) -> Option<Tone> {
+    if is_open_code_model_label(model) {
+        return Some(Tone::ModelOpenCode);
+    }
     match model_tone(model)? {
         Tone::Model56 => Some(Tone::StatusModel56),
         Tone::ModelSol => Some(Tone::StatusModelSol),
@@ -10793,6 +10866,7 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::ModelSonnet => palette.status.model_sonnet,
         Tone::ModelOpus => palette.status.model_opus,
         Tone::ModelFable => palette.status.model_fable,
+        Tone::ModelOpenCode => palette.model_opencode,
         Tone::StatusModel56 => palette.model_gpt56,
         Tone::StatusModelSol => palette.model_sol,
         Tone::StatusModelTerra => palette.model_terra,
@@ -17289,6 +17363,30 @@ mod tests {
     }
 
     #[test]
+    fn opencode_status_uses_model_first_text_blue_and_no_model_shortcut() {
+        theme::set_current(ThemeKind::Dark);
+        let line = status_line_row(
+            Some(StatusLineView {
+                model: Some("DeepSeek V4 Flash · OpenCode Go".to_owned()),
+                effort: Some("high".to_owned()),
+                context: None,
+                five_hour_percent: None,
+                five_hour_remaining: None,
+                weekly_percent: None,
+                notice: None,
+            }),
+            "",
+            100,
+        );
+
+        assert!(painted(&line).contains("DeepSeek V4 Flash · OpenCode Go"));
+        assert!(painted(&line).ends_with("←→ effort"));
+        assert!(!painted(&line).contains("Shift + ↑↓"));
+        assert_eq!(line.tone, Tone::ModelOpenCode);
+        assert_eq!(tone_rgb(line.tone), Some(Rgb(0x5C, 0x9C, 0xF5)));
+    }
+
+    #[test]
     fn status_line_places_the_model_and_effort_shortcuts_at_the_far_right() {
         let line = status_line_row(
             Some(StatusLineView {
@@ -18324,6 +18422,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_search_picker_keeps_a_plain_input_inside_the_model_panel() {
+        let mut editor = Editor::default();
+        editor.insert_str("luna");
+        let render = |width| {
+            overlay_frame(
+                &[],
+                OverlayView {
+                    closable: true,
+                    title: "Model".to_owned(),
+                    lines: vec![OverlayLine {
+                        text: "1. GPT-5.6 Luna · OpenCode Go".to_owned(),
+                        selected: true,
+                        muted: false,
+                    }],
+                    slider: None,
+                    hint: "Type to search  ·  ↑↓ model  ·  Enter to continue".to_owned(),
+                    style: OverlayStyle::SearchPicker,
+                    input: Some(&editor),
+                    input_label: "",
+                    input_placeholder: "Search models…",
+                },
+                None,
+                StatusArea {
+                    fallback: String::new(),
+                    line: None,
+                    composer_notice: None,
+                    composer_mode: None,
+                },
+                width,
+            )
+        };
+        let frame = render(80);
+        let painted_lines = frame.lines.iter().map(painted).collect::<Vec<_>>();
+        let title = painted_lines
+            .iter()
+            .position(|line| line.contains("╭─ Model"))
+            .expect("model panel title");
+        let search = painted_lines
+            .iter()
+            .position(|line| line.contains("luna"))
+            .expect("search input");
+        let model = painted_lines
+            .iter()
+            .position(|line| line.contains("GPT-5.6 Luna"))
+            .expect("filtered model");
+
+        assert!(title < search && search < model);
+        let top = painted_lines[search - 1].chars().collect::<Vec<_>>();
+        let left = top.iter().position(|ch| *ch == '╭').expect("search left");
+        let right = top.iter().rposition(|ch| *ch == '╮').expect("search right");
+        assert_eq!(right - left + 1, 48);
+        assert!(left.abs_diff(top.len() - right - 1) <= 1);
+        assert!(painted_lines[search].contains("│ > luna"));
+        assert_eq!(frame.composer_index, None);
+        assert!(frame.show_cursor);
+        assert_eq!(frame.cursor_line, search);
+        for line in &frame.lines[search - 1..=search + 1] {
+            assert_ne!(line.prefix_tone, Tone::ModelOpenCode);
+            assert_ne!(line.tone, Tone::ModelOpenCode);
+            assert!(
+                line.tail
+                    .iter()
+                    .all(|span| span.tone != Tone::ModelOpenCode)
+            );
+        }
+
+        for width in [24, 40] {
+            let frame = render(width);
+            let painted_lines = frame.lines.iter().map(painted).collect::<Vec<_>>();
+            let search = painted_lines
+                .iter()
+                .position(|line| line.contains("luna"))
+                .expect("responsive search input");
+            let top = painted_lines[search - 1].chars().collect::<Vec<_>>();
+            let left = top.iter().position(|ch| *ch == '╭').expect("search left");
+            let right = top.iter().rposition(|ch| *ch == '╮').expect("search right");
+            assert_eq!(right - left + 1, panel_span(width).saturating_sub(3));
+        }
+    }
+
     /// A picker docks over the transcript, so opening `/model`, `/effort` or
     /// `/resume` used to blank the welcome card for as long as it was up.
     #[test]
@@ -18536,6 +18715,7 @@ mod tests {
     fn every_overlay_keeps_exactly_one_blank_row_before_the_statusline() {
         for style in [
             OverlayStyle::Picker,
+            OverlayStyle::SearchPicker,
             OverlayStyle::Panel,
             OverlayStyle::CompactPanel,
             OverlayStyle::Question,
@@ -19102,6 +19282,58 @@ mod tests {
             }
         }
         assert!(model_tone("GPT-5.4").is_none());
+    }
+
+    #[test]
+    fn opencode_models_stay_plain_regardless_of_vendor_names() {
+        assert!(model_tone("opencode:anthropic/claude-sonnet-5").is_none());
+        assert!(model_tone("opencode-go/gpt-5.6-luna").is_none());
+        assert!(model_tone("Go · GPT-5.6 Luna").is_none());
+        assert!(model_tone("Zen · GPT-5.3 Codex Spark").is_none());
+        assert!(model_tone("7. Go · GPT-5.6 Luna").is_none());
+        assert!(model_tone("8. Go · Muse Spark 1.2 Contributor").is_none());
+        assert!(model_tone("4. Zen · Muse Spark 1.2 Free").is_none());
+        assert!(model_tone("7. GPT-5.6 Luna · OpenCode Go").is_none());
+        assert!(model_tone("4. Muse Spark 1.2 Free · OpenCode Zen").is_none());
+        assert_eq!(
+            model_tone("OpenCode · Anthropic/Claude Sonnet"),
+            model_tone("opencode · anthropic/claude sonnet")
+        );
+        assert!(model_tone("opencode · anthropic/claude sonnet").is_none());
+    }
+
+    #[test]
+    fn opencode_models_use_the_theme_blue_outside_the_model_picker() {
+        for model in [
+            "opencode:anthropic/claude-sonnet-5",
+            "opencode-go/gpt-5.6-luna",
+            "OpenCode · Anthropic/Claude Sonnet",
+            "Go · GPT-5.6 Luna",
+            "Zen · GPT-5.3 Codex Spark",
+            "GPT-5.6 Luna · OpenCode Go",
+            "Muse Spark 1.2 Free · OpenCode Zen",
+        ] {
+            assert_eq!(chrome_model_tone(model), Some(Tone::ModelOpenCode));
+            assert_eq!(status_model_tone(model), Some(Tone::ModelOpenCode));
+        }
+        for theme in ThemeKind::ALL {
+            theme::set_current(theme);
+            assert_eq!(
+                tone_rgb(Tone::ModelOpenCode),
+                Some(theme::palette_of(theme).model_opencode)
+            );
+        }
+        theme::set_current(ThemeKind::Dark);
+        assert_eq!(tone_rgb(Tone::ModelOpenCode), Some(Rgb(0x5C, 0x9C, 0xF5)));
+        // 다른 모델은 기존 색을 그대로 쓴다.
+        assert_eq!(chrome_model_tone("Claude Fable 5"), Some(Tone::ModelFable));
+        assert_eq!(chrome_model_tone("GPT-5.4"), None);
+        // `/model` 목록이 쓰는 경로만 색이 없다.
+        assert!(model_tone("opencode:anthropic/claude-sonnet-5").is_none());
+        assert_eq!(
+            status_model_tone("opencode:anthropic/claude-sonnet-5"),
+            Some(Tone::ModelOpenCode)
+        );
     }
 
     #[test]
@@ -20409,7 +20641,10 @@ mod tests {
         assert!(wide_row_needs_sequential_repaint(&previous, &current));
 
         // The same row untouched keeps the diff silent.
-        assert!(!wide_row_needs_sequential_repaint(&previous, &previous.clone()));
+        assert!(!wide_row_needs_sequential_repaint(
+            &previous,
+            &previous.clone()
+        ));
 
         // A narrow-glyph row keeps the inexpensive cell diff.
         let mut previous = CellFrame::new(16, 1);

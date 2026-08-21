@@ -62,7 +62,8 @@ dvz update
 가장 최근 세션을 바로 이어갑니다. 실행 중에는 `/resume [SESSION]` 또는 별칭
 `/continue`로 세션을 전환할 수 있습니다. 입력창의 전체 명령은 `/help`에서 확인합니다.
 
-OpenCode provider 연동은 후속 개선 전까지 비활성화되어 있습니다.
+OpenCode provider는 실행 중 `/provider opencode` 또는 `/connect`로 연결하며,
+API key 또는 OAuth로 인증합니다 (`opencode-go` 포함).
 
 ### 업데이트
 

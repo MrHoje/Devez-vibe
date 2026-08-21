@@ -40,6 +40,9 @@ use crate::{
 };
 
 const SPINNER: [&str; 8] = ["✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳"];
+/// 한 줄 간격과 세 줄 effort 트랙이 차지하는 높이. effort가 없는 모델도
+/// 같은 공간을 남겨 모델을 이동할 때 선택창이 위아래로 흔들리지 않게 한다.
+const MODEL_PICKER_EFFORT_ROWS: usize = 4;
 
 /// How long one shimmer sweep across the `Working` label takes.
 const SHIMMER_PERIOD: Duration = Duration::from_millis(1_100);
@@ -622,8 +625,10 @@ impl ClaudePermissionMode {
     }
 }
 
-/// Rows of the `/provider` picker, in the order they are drawn.
-const RUNTIME_CHOICES: [&str; 2] = ["Claude", "Codex"];
+/// Rows of the `/provider` picker, in the order they are drawn. OpenCode is a
+/// connect-only row: it has no settings key, its connection lives in the
+/// opencode `auth.json` that the backend mirrors into the model catalog.
+const RUNTIME_CHOICES: [&str; 3] = ["Claude", "Codex", "OpenCode"];
 const CLAUDE_PERMISSION_TABS: [&str; 5] =
     ["Allow", "Ask", "Deny", "Directories", "Recently denied"];
 const CLAUDE_PERMISSION_SCOPES: [(&str, &str); 3] = [
@@ -668,7 +673,7 @@ struct SlashCommand {
 const SLASH_COMMANDS: [SlashCommand; 32] = [
     SlashCommand {
         name: "/provider",
-        description: "Switch between the Claude and Codex providers",
+        description: "Switch between the Claude and Codex providers, or connect OpenCode",
         takes_argument: true,
     },
     SlashCommand {
@@ -1260,6 +1265,19 @@ fn normalized_model_display_name(display_name: &str) -> String {
     }
 }
 
+fn move_model_index_in(candidates: &[usize], model_index: usize, direction: i8) -> usize {
+    let position = candidates
+        .iter()
+        .position(|candidate| *candidate == model_index)
+        .unwrap_or(0);
+    let next = match direction {
+        -1 => position.saturating_sub(1),
+        1 => (position + 1).min(candidates.len().saturating_sub(1)),
+        _ => position,
+    };
+    candidates.get(next).copied().unwrap_or(model_index)
+}
+
 pub enum Action {
     None,
     Submit(String),
@@ -1269,6 +1287,7 @@ pub enum Action {
     OpenResume,
     ResumeThread(String),
     ActivateCodex,
+    ActivateOpenCode,
     SetFast(bool),
     /// Hand Claude the permission mode the badge just cycled to.
     SetClaudePermissionMode(ClaudePermissionMode),
@@ -1706,6 +1725,9 @@ enum PendingInteraction {
     ModelPicker {
         model_index: usize,
         effort_index: usize,
+        /// OpenCode exposes enough models to warrant live filtering. Other
+        /// providers keep their compact numbered picker and therefore no input.
+        query: Option<Editor>,
     },
     EffortPicker {
         effort_index: usize,
@@ -3609,6 +3631,8 @@ pub struct AppState {
     /// install picks in `/provider` — and nothing dials a runtime that is off.
     claude_provider_enabled: bool,
     codex_provider_enabled: bool,
+    /// Authentication exists independently of the lazily started model catalog.
+    opencode_provider_connected: bool,
     /// Set at launch when this machine has never picked a runtime. While it is
     /// up the composer holds prompts back and points at the picker.
     provider_choice_pending: bool,
@@ -3827,6 +3851,7 @@ impl AppState {
             status_line_settings: read_status_line_settings(),
             claude_provider_enabled: claude_provider_enabled(),
             codex_provider_enabled: codex_provider_enabled(),
+            opencode_provider_connected: initial_opencode_provider_connected(),
             provider_choice_pending: false,
             account_plan: AccountPlan::default(),
             account_refresh_due: false,
@@ -3953,13 +3978,72 @@ impl AppState {
         self.provider_model_indices(self.selected_provider())
     }
 
-    /// Where the current provider sits in `RUNTIME_CHOICES`. OpenCode has no
-    /// row of its own, so it reads as Claude — the runtime it runs under.
+    fn model_picker_indices(&self, query: Option<&Editor>) -> Vec<usize> {
+        let candidates = self.current_provider_model_indices();
+        let Some(query) = query else {
+            return candidates;
+        };
+        let query = query.text().trim().to_lowercase();
+        if query.is_empty() {
+            return candidates;
+        }
+        let terms = query.split_whitespace().collect::<Vec<_>>();
+        candidates
+            .into_iter()
+            .filter(|index| {
+                let model = &self.models[*index];
+                let identity =
+                    format!("{} {} {}", model.id, model.model, model.display_name).to_lowercase();
+                terms.iter().all(|term| identity.contains(term))
+            })
+            .collect()
+    }
+
+    fn reset_filtered_model_selection(
+        &self,
+        model_index: &mut usize,
+        effort_index: &mut usize,
+        query: Option<&Editor>,
+    ) {
+        let candidates = self.model_picker_indices(query);
+        if !candidates.contains(model_index)
+            && let Some(first) = candidates.first().copied()
+        {
+            *model_index = first;
+            *effort_index = self.effort_index_for_model(first);
+        }
+    }
+
+    /// Where the current provider sits in `RUNTIME_CHOICES`.
     fn runtime_choice_index(&self) -> usize {
         match self.selected_provider() {
             ModelProvider::Codex => 1,
+            ModelProvider::OpenCode => 2,
             _ => 0,
         }
+    }
+
+    /// Whether the lazily started opencode runtime has added its models yet.
+    fn opencode_loaded(&self) -> bool {
+        self.models
+            .iter()
+            .any(|model| crate::open_code::is_open_code_model(&model.model))
+    }
+
+    /// Lands the session on the first opencode model after a provider connects,
+    /// mirroring how the other runtimes switch on connect.
+    pub fn activate_first_opencode_model(&mut self) {
+        if self.selected_provider() == ModelProvider::OpenCode {
+            return;
+        }
+        let Some(index) = self
+            .models
+            .iter()
+            .position(|model| crate::open_code::is_open_code_model(&model.model))
+        else {
+            return;
+        };
+        self.apply_model(index, None);
     }
 
     /// Whether the runtime on a `/provider` row may be dialled at all. Nothing is
@@ -3967,6 +4051,8 @@ impl AppState {
     fn runtime_connected(&self, index: usize) -> bool {
         if index == 1 {
             self.codex_provider_enabled
+        } else if index == 2 {
+            self.opencode_provider_connected
         } else {
             self.claude_provider_enabled
         }
@@ -4000,8 +4086,18 @@ impl AppState {
 
     /// Enter on a `/provider` row: use that runtime. A row that is not connected
     /// yet connects first — choosing it *is* the connection — and the choice is
-    /// saved, so the next launch starts where this one left off.
+    /// saved, so the next launch starts where this one left off. The OpenCode row
+    /// connects through the provider picker instead; once connected, Enter moves
+    /// the session onto its first model.
     fn apply_runtime_choice(&mut self, index: usize) -> Action {
+        if index == 2 {
+            return if self.opencode_loaded() {
+                self.activate_first_opencode_model();
+                Action::None
+            } else {
+                Action::ActivateOpenCode
+            };
+        }
         let connecting = !self.runtime_connected(index);
         let key_path = self.set_runtime_connection(index, true);
         let activate_codex = index == 1 && self.selected_provider() != ModelProvider::Codex;
@@ -4026,7 +4122,12 @@ impl AppState {
     /// Space on a `/provider` row: connect or disconnect that runtime and record
     /// it for later launches. Dropping the runtime in use hands the session to
     /// whatever is still connected; if nothing is, the composer waits for a pick.
+    /// The OpenCode row has nothing to toggle — its connection lives in
+    /// `auth.json`, so only Enter (use or connect) applies to it.
     fn toggle_runtime_connection(&mut self, index: usize) -> Action {
+        if index == 2 {
+            return Action::None;
+        }
         let connected = !self.runtime_connected(index);
         let key_path = self.set_runtime_connection(index, connected);
         let mut activate_codex = false;
@@ -4154,6 +4255,10 @@ impl AppState {
 
     pub fn switch_to_codex(&mut self) {
         self.switch_provider(ModelProvider::Codex);
+    }
+
+    pub fn switch_to_open_code(&mut self) {
+        self.switch_provider(ModelProvider::OpenCode);
     }
 
     pub fn fallback_from_codex(&mut self, message: impl Into<String>) -> bool {
@@ -4964,11 +5069,12 @@ impl AppState {
     }
 
     fn committed_before_current_prompt(&self) -> &[Block] {
-        let end = self.committed.len().saturating_sub(usize::from(
-            self.committed.last().is_some_and(|block| {
-                matches!(block.kind, BlockKind::User) && block.response_duration().is_none()
-            }),
-        ));
+        let end =
+            self.committed
+                .len()
+                .saturating_sub(usize::from(self.committed.last().is_some_and(|block| {
+                    matches!(block.kind, BlockKind::User) && block.response_duration().is_none()
+                })));
         &self.committed[..end]
     }
 
@@ -5768,6 +5874,7 @@ impl AppState {
     }
 
     pub fn provider_connected(&mut self, provider_name: &str) {
+        self.opencode_provider_connected = true;
         self.pending = None;
         self.push_notice(
             BlockKind::System,
@@ -6238,6 +6345,7 @@ impl AppState {
         self.disarm_quit();
         let old_text = self.editor.text();
         let binding_count = self.selected_completion_bindings.len();
+        let mut model_query_changed = false;
         match &mut self.pending {
             Some(PendingInteraction::UserInput {
                 questions,
@@ -6262,6 +6370,12 @@ impl AppState {
                 form.editor.insert_str(text);
             }
             Some(PendingInteraction::SessionPicker(picker)) => picker.handle_paste(text),
+            Some(PendingInteraction::ModelPicker {
+                query: Some(query), ..
+            }) => {
+                query.insert_str(text);
+                model_query_changed = true;
+            }
             Some(PendingInteraction::McpPicker(picker)) => picker.handle_paste(text),
             Some(PendingInteraction::PluginPicker(picker)) => picker.handle_paste(text),
             Some(PendingInteraction::MarketplacePicker(picker)) => picker.handle_paste(text),
@@ -6280,7 +6394,27 @@ impl AppState {
                 self.command_selection = 0;
             }
         }
+        if model_query_changed {
+            self.normalize_pending_model_picker();
+        }
         self.sync_selected_completion_bindings(&old_text, binding_count);
+    }
+
+    fn normalize_pending_model_picker(&mut self) {
+        let Some(PendingInteraction::ModelPicker {
+            mut model_index,
+            mut effort_index,
+            query,
+        }) = self.pending.take()
+        else {
+            return;
+        };
+        self.reset_filtered_model_selection(&mut model_index, &mut effort_index, query.as_ref());
+        self.pending = Some(PendingInteraction::ModelPicker {
+            model_index,
+            effort_index,
+            query,
+        });
     }
 
     /// 호스트(DevezCode 등)가 입력창 텍스트를 bracketed paste로 pty에 쓰면
@@ -6397,11 +6531,15 @@ impl AppState {
         if key.modifiers == KeyModifiers::SHIFT {
             match key.code {
                 KeyCode::Up => {
-                    self.move_selected_model(-1);
+                    if self.selected_provider() != ModelProvider::OpenCode {
+                        self.move_selected_model(-1);
+                    }
                     return Action::None;
                 }
                 KeyCode::Down => {
-                    self.move_selected_model(1);
+                    if self.selected_provider() != ModelProvider::OpenCode {
+                        self.move_selected_model(1);
+                    }
                     return Action::None;
                 }
                 KeyCode::Left => {
@@ -7686,7 +7824,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/provider [claude|codex]  Claude·Codex provider 전환과 연결 사용/미사용\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n/permissions  현재 provider 권한 규칙 관리\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n/mcp [reconnect [NAME]|login NAME]  MCP 서버 탐색과 관리\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n{login_help}\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
+                    format!("/provider [claude|codex|opencode]  Claude·Codex 전환, OpenCode 연결\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n/permissions  현재 provider 권한 규칙 관리\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n/mcp [reconnect [NAME]|login NAME]  MCP 서버 탐색과 관리\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n{login_help}\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
                 ));
                 Action::None
             }
@@ -7697,11 +7835,12 @@ impl AppState {
             "/provider" if parts.len() == 2 => match parts[1].to_ascii_lowercase().as_str() {
                 "claude" => self.apply_runtime_choice(0),
                 "codex" => self.apply_runtime_choice(1),
+                "opencode" if crate::open_code::PROVIDER_ENABLED => self.apply_runtime_choice(2),
                 _ => {
                     self.committed.push(Block::new(
                         BlockKind::Error,
                         "Usage",
-                        "/provider [claude|codex]",
+                        "/provider [claude|codex|opencode]",
                     ));
                     Action::None
                 }
@@ -7710,7 +7849,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::Error,
                     "Usage",
-                    "/provider [claude|codex]",
+                    "/provider [claude|codex|opencode]",
                 ));
                 Action::None
             }
@@ -7772,6 +7911,8 @@ impl AppState {
                 self.pending = Some(PendingInteraction::ModelPicker {
                     model_index: self.selected_model,
                     effort_index,
+                    query: (self.selected_provider() == ModelProvider::OpenCode)
+                        .then(Editor::default),
                 });
                 Action::None
             }
@@ -8202,34 +8343,42 @@ impl AppState {
             PendingInteraction::ModelPicker {
                 mut model_index,
                 mut effort_index,
+                mut query,
             } => {
+                let searchable = query.is_some();
                 match key.code {
                     KeyCode::Esc => return Action::None,
                     KeyCode::Up => {
-                        model_index = self.move_model_index(model_index, -1);
+                        let candidates = self.model_picker_indices(query.as_ref());
+                        model_index = move_model_index_in(&candidates, model_index, -1);
                         effort_index = self.effort_index_for_model(model_index);
                     }
-                    KeyCode::Char('k') if !ctrl && !alt => {
+                    KeyCode::Char('k') if !searchable && !ctrl && !alt => {
                         model_index = self.move_model_index(model_index, -1);
                         effort_index = self.effort_index_for_model(model_index);
                     }
                     KeyCode::Char('p') if ctrl => {
-                        model_index = self.move_model_index(model_index, -1);
+                        let candidates = self.model_picker_indices(query.as_ref());
+                        model_index = move_model_index_in(&candidates, model_index, -1);
                         effort_index = self.effort_index_for_model(model_index);
                     }
                     KeyCode::Down => {
-                        model_index = self.move_model_index(model_index, 1);
+                        let candidates = self.model_picker_indices(query.as_ref());
+                        model_index = move_model_index_in(&candidates, model_index, 1);
                         effort_index = self.effort_index_for_model(model_index);
                     }
-                    KeyCode::Char('j') if !ctrl && !alt => {
+                    KeyCode::Char('j') if !searchable && !ctrl && !alt => {
                         model_index = self.move_model_index(model_index, 1);
                         effort_index = self.effort_index_for_model(model_index);
                     }
                     KeyCode::Char('n') if ctrl => {
-                        model_index = self.move_model_index(model_index, 1);
+                        let candidates = self.model_picker_indices(query.as_ref());
+                        model_index = move_model_index_in(&candidates, model_index, 1);
                         effort_index = self.effort_index_for_model(model_index);
                     }
-                    KeyCode::Char(ch) if !ctrl && !alt && ('1'..='9').contains(&ch) => {
+                    KeyCode::Char(ch)
+                        if !searchable && !ctrl && !alt && ('1'..='9').contains(&ch) =>
+                    {
                         let index = ch.to_digit(10).unwrap_or_default() as usize - 1;
                         if let Some(model_index) =
                             self.current_provider_model_indices().get(index).copied()
@@ -8240,6 +8389,75 @@ impl AppState {
                             );
                             return Action::None;
                         }
+                    }
+                    KeyCode::Left if searchable => {
+                        query.as_mut().expect("searchable query").move_left();
+                    }
+                    KeyCode::Right if searchable => {
+                        query.as_mut().expect("searchable query").move_right();
+                    }
+                    KeyCode::Home if searchable => {
+                        query.as_mut().expect("searchable query").move_home();
+                    }
+                    KeyCode::End if searchable => {
+                        query.as_mut().expect("searchable query").move_end();
+                    }
+                    KeyCode::Backspace if searchable && ctrl => {
+                        query.as_mut().expect("searchable query").delete_word_left();
+                        self.reset_filtered_model_selection(
+                            &mut model_index,
+                            &mut effort_index,
+                            query.as_ref(),
+                        );
+                    }
+                    KeyCode::Backspace if searchable => {
+                        query.as_mut().expect("searchable query").backspace();
+                        self.reset_filtered_model_selection(
+                            &mut model_index,
+                            &mut effort_index,
+                            query.as_ref(),
+                        );
+                    }
+                    KeyCode::Delete if searchable && ctrl => {
+                        query
+                            .as_mut()
+                            .expect("searchable query")
+                            .delete_word_right();
+                        self.reset_filtered_model_selection(
+                            &mut model_index,
+                            &mut effort_index,
+                            query.as_ref(),
+                        );
+                    }
+                    KeyCode::Delete if searchable => {
+                        query.as_mut().expect("searchable query").delete();
+                        self.reset_filtered_model_selection(
+                            &mut model_index,
+                            &mut effort_index,
+                            query.as_ref(),
+                        );
+                    }
+                    KeyCode::Char('u') if searchable && ctrl => {
+                        query.as_mut().expect("searchable query").clear();
+                        self.reset_filtered_model_selection(
+                            &mut model_index,
+                            &mut effort_index,
+                            query.as_ref(),
+                        );
+                    }
+                    KeyCode::Char('b') if searchable && alt => {
+                        query.as_mut().expect("searchable query").move_word_left();
+                    }
+                    KeyCode::Char('f') if searchable && alt => {
+                        query.as_mut().expect("searchable query").move_word_right();
+                    }
+                    KeyCode::Char(ch) if searchable && !ctrl && !alt => {
+                        query.as_mut().expect("searchable query").insert(ch);
+                        self.reset_filtered_model_selection(
+                            &mut model_index,
+                            &mut effort_index,
+                            query.as_ref(),
+                        );
                     }
                     KeyCode::Left => {
                         effort_index = effort_index.saturating_sub(1);
@@ -8254,14 +8472,20 @@ impl AppState {
                         effort_index = (effort_index + 1).min(count - 1);
                     }
                     KeyCode::Enter => {
-                        self.open_model_scope(model_index, effort_index);
-                        return Action::None;
+                        if self
+                            .model_picker_indices(query.as_ref())
+                            .contains(&model_index)
+                        {
+                            self.open_model_scope(model_index, effort_index);
+                            return Action::None;
+                        }
                     }
                     _ => {}
                 }
                 self.pending = Some(PendingInteraction::ModelPicker {
                     model_index,
                     effort_index,
+                    query,
                 });
                 Action::None
             }
@@ -8409,7 +8633,7 @@ impl AppState {
                         self.pending = Some(PendingInteraction::RuntimePicker { selected });
                         return self.toggle_runtime_connection(selected);
                     }
-                    KeyCode::Char(ch @ '1'..='2') => {
+                    KeyCode::Char(ch @ '1'..='3') => {
                         let row = ch.to_digit(10).unwrap_or(1) as usize - 1;
                         return self.apply_runtime_choice(row);
                     }
@@ -9362,8 +9586,9 @@ impl AppState {
             PendingInteraction::ModelPicker {
                 model_index,
                 effort_index,
+                query,
             } => {
-                let provider_models = self.current_provider_model_indices();
+                let provider_models = self.model_picker_indices(query.as_ref());
                 let selected_position = provider_models
                     .iter()
                     .position(|index| index == model_index)
@@ -9383,9 +9608,24 @@ impl AppState {
                         }
                     })
                     .collect::<Vec<_>>();
+                if query.is_some() {
+                    if lines.is_empty() {
+                        lines.push(OverlayLine {
+                            text: "No models match your search.".to_owned(),
+                            selected: false,
+                            muted: true,
+                        });
+                    }
+                    lines.extend((lines.len()..PICKER_ROWS).map(|_| OverlayLine {
+                        text: String::new(),
+                        selected: false,
+                        muted: true,
+                    }));
+                }
                 let slider = self
                     .models
                     .get(*model_index)
+                    .filter(|_| provider_models.contains(model_index))
                     .filter(|model| !model.efforts.is_empty())
                     .map(|model| {
                         lines.push(OverlayLine {
@@ -9395,7 +9635,18 @@ impl AppState {
                         });
                         effort_slider(model, *effort_index)
                     });
-                let hint = if slider.is_some() {
+                if slider.is_none() {
+                    lines.extend((0..MODEL_PICKER_EFFORT_ROWS).map(|_| OverlayLine {
+                        text: String::new(),
+                        selected: false,
+                        muted: true,
+                    }));
+                }
+                let hint = if query.is_some() && slider.is_some() {
+                    "Type to search  ·  ↑↓ model  ·  Tab effort  ·  Enter to continue  ·  Esc to cancel"
+                } else if query.is_some() {
+                    "Type to search  ·  ↑↓ model  ·  Enter to continue  ·  Esc to cancel"
+                } else if slider.is_some() {
                     "↑↓ model  ·  ←→ effort  ·  Enter to continue  ·  Esc to cancel"
                 } else {
                     "↑↓ model  ·  Enter to continue  ·  Esc to cancel"
@@ -9406,10 +9657,14 @@ impl AppState {
                     lines,
                     slider,
                     hint: hint.to_owned(),
-                    style: OverlayStyle::Picker,
-                    input: None,
+                    style: if query.is_some() {
+                        OverlayStyle::SearchPicker
+                    } else {
+                        OverlayStyle::Picker
+                    },
+                    input: query.as_ref(),
                     input_label: "",
-                    input_placeholder: "",
+                    input_placeholder: "Search models…",
                 })
             }
             PendingInteraction::ModelScope {
@@ -10910,16 +11165,7 @@ impl AppState {
 
     fn move_model_index(&self, model_index: usize, direction: i8) -> usize {
         let candidates = self.current_provider_model_indices();
-        let position = candidates
-            .iter()
-            .position(|candidate| *candidate == model_index)
-            .unwrap_or(0);
-        let next = match direction {
-            -1 => position.saturating_sub(1),
-            1 => (position + 1).min(candidates.len().saturating_sub(1)),
-            _ => position,
-        };
-        candidates.get(next).copied().unwrap_or(model_index)
+        move_model_index_in(&candidates, model_index, direction)
     }
 
     fn move_selected_model(&mut self, direction: i8) {
@@ -11208,17 +11454,20 @@ impl AppState {
             Some(PendingInteraction::ModelPicker {
                 model_index,
                 effort_index,
+                query,
             }) => {
-                let provider_models = self.current_provider_model_indices();
+                let provider_models = self.model_picker_indices(query.as_ref());
                 let selected_position = provider_models
                     .iter()
                     .position(|index| *index == model_index)
                     .unwrap_or(0);
-                let start =
-                    visible_window(Some(selected_position), provider_models.len(), PICKER_ROWS)
-                        .start;
+                let window =
+                    visible_window(Some(selected_position), provider_models.len(), PICKER_ROWS);
+                let start = window.start;
                 let clicked = start + row;
-                if let Some(clicked) = provider_models.get(clicked).copied() {
+                if row < window.len()
+                    && let Some(clicked) = provider_models.get(clicked).copied()
+                {
                     // The digit keys do exactly this: take the model and move on
                     // to the question of how long the pick lasts.
                     self.open_model_scope(clicked, self.effort_index_for_model(clicked));
@@ -11227,6 +11476,7 @@ impl AppState {
                     self.pending = Some(PendingInteraction::ModelPicker {
                         model_index,
                         effort_index,
+                        query,
                     });
                 }
                 Action::None
@@ -11534,7 +11784,9 @@ impl AppState {
     /// nothing else to answer for, so a click there settles it.
     pub fn click_effort_step(&mut self, step: usize) -> Action {
         match self.pending.take() {
-            Some(PendingInteraction::ModelPicker { model_index, .. }) => {
+            Some(PendingInteraction::ModelPicker {
+                model_index, query, ..
+            }) => {
                 let count = self
                     .models
                     .get(model_index)
@@ -11544,6 +11796,7 @@ impl AppState {
                 self.pending = Some(PendingInteraction::ModelPicker {
                     model_index,
                     effort_index: step.min(count - 1),
+                    query,
                 });
                 Action::None
             }
@@ -13851,6 +14104,17 @@ pub(crate) fn claude_provider_enabled() -> bool {
     provider_connected(CLAUDE_PROVIDER_KEY)
 }
 
+fn initial_opencode_provider_connected() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        crate::open_code::has_connected_provider()
+    }
+}
+
 fn provider_connected(key: &str) -> bool {
     read_vibe_config_value(key)
         .and_then(|value| value.parse::<bool>().ok())
@@ -14132,6 +14396,33 @@ mod tests {
             "account".to_owned(),
             vec![test_model("gpt-5.6-sol", "GPT-5.6 Sol", true)],
             "gpt-5.6-sol",
+            Some("high"),
+        )
+    }
+
+    fn opencode_picker_state() -> AppState {
+        AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![
+                test_model(
+                    "opencode:opencode-go/deepseek-v4-flash",
+                    "DeepSeek V4 Flash · OpenCode Go",
+                    true,
+                ),
+                test_model(
+                    "opencode:opencode-go/gpt-5.6-luna",
+                    "GPT-5.6 Luna · OpenCode Go",
+                    false,
+                ),
+                test_model(
+                    "opencode:opencode/muse-spark",
+                    "Muse Spark · OpenCode Zen",
+                    false,
+                ),
+            ],
+            "opencode:opencode-go/deepseek-v4-flash",
             Some("high"),
         )
     }
@@ -14808,6 +15099,90 @@ mod tests {
         state.handle_key(KeyEvent::new(KeyCode::Right, shift));
         assert_eq!(state.selected_effort(), "ultra");
         assert!(state.committed.is_empty());
+    }
+
+    #[test]
+    fn shifted_up_and_down_do_not_change_opencode_models() {
+        let mut state = AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![
+                test_model(
+                    "opencode:opencode-go/deepseek-v4-flash",
+                    "DeepSeek V4 Flash · OpenCode Go",
+                    true,
+                ),
+                test_model(
+                    "opencode:opencode-go/gpt-5.6-luna",
+                    "GPT-5.6 Luna · OpenCode Go",
+                    false,
+                ),
+            ],
+            "opencode:opencode-go/deepseek-v4-flash",
+            Some("high"),
+        );
+
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+
+        assert_eq!(
+            state.selected_model_name(),
+            "opencode:opencode-go/deepseek-v4-flash"
+        );
+        assert!(state.committed.is_empty());
+    }
+
+    #[test]
+    fn opencode_model_picker_filters_from_its_search_editor() {
+        let mut state = opencode_picker_state();
+        assert!(matches!(state.run_slash_command("/model"), Action::None));
+
+        let initial = state.overlay_view().expect("OpenCode model picker");
+        assert!(matches!(initial.style, OverlayStyle::SearchPicker));
+        assert!(initial.input.is_some());
+        assert_eq!(initial.input_placeholder, "Search models…");
+
+        for ch in "luna".chars() {
+            state.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        let filtered = state.overlay_view().expect("filtered model picker");
+        assert!(filtered.lines[0].text.contains("GPT-5.6 Luna"));
+        assert!(filtered.lines[0].selected);
+        assert_eq!(filtered.lines.len(), PICKER_ROWS + 1);
+        assert!(
+            filtered.lines[1..PICKER_ROWS]
+                .iter()
+                .all(|line| line.text.is_empty())
+        );
+
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let scope = state.overlay_view().expect("model scope");
+        assert_eq!(scope.title, "Apply to");
+        assert!(scope.lines[0].text.contains("GPT-5.6 Luna"));
+    }
+
+    #[test]
+    fn opencode_model_search_handles_paste_and_empty_results() {
+        let mut state = opencode_picker_state();
+        state.run_slash_command("/model");
+        state.handle_paste("deepseek");
+
+        let filtered = state.overlay_view().expect("filtered model picker");
+        assert!(filtered.lines[0].text.contains("DeepSeek V4 Flash"));
+        assert!(filtered.lines[0].selected);
+
+        state.handle_paste(" missing");
+        let empty = state.overlay_view().expect("empty model picker");
+        assert_eq!(empty.lines[0].text, "No models match your search.");
+        assert!(empty.slider.is_none());
+        assert_eq!(empty.lines.len(), PICKER_ROWS + MODEL_PICKER_EFFORT_ROWS);
+
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            state.pending,
+            Some(PendingInteraction::ModelPicker { .. })
+        ));
     }
 
     #[test]
@@ -16758,6 +17133,17 @@ mod tests {
         let model_picker = state.overlay_view().expect("model picker");
         assert!(model_picker.slider.is_none());
         assert!(!model_picker.hint.contains("effort"));
+        let physical_body_rows =
+            model_picker.lines.len() + usize::from(model_picker.slider.is_some()) * 3;
+        assert_eq!(physical_body_rows, 1 + MODEL_PICKER_EFFORT_ROWS);
+        assert_eq!(
+            model_picker
+                .lines
+                .iter()
+                .filter(|line| line.text.is_empty())
+                .count(),
+            MODEL_PICKER_EFFORT_ROWS
+        );
 
         state.pending = None;
         assert!(matches!(state.run_slash_command("/effort"), Action::None));
@@ -20307,7 +20693,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_connect_is_hidden_from_slash_command_suggestions() {
+    fn enabled_connect_appears_in_slash_command_suggestions() {
         let mut state = test_state();
         state.editor.insert_str("/con");
 
@@ -20315,7 +20701,7 @@ mod tests {
             state
                 .matching_slash_commands()
                 .iter()
-                .all(|command| command.name != "/connect")
+                .any(|command| command.name == "/connect")
         );
     }
 
@@ -20430,7 +20816,11 @@ mod tests {
         let slider = overlay.slider.expect("provider steps");
         assert_eq!(
             slider.efforts,
-            ["Claude · 연결됨 · 사용 중", "Codex · 연결됨 · 미사용"]
+            [
+                "Claude · 연결됨 · 사용 중",
+                "Codex · 연결됨 · 미사용",
+                "OpenCode · 연결 안 됨 · 미사용"
+            ]
         );
         assert_eq!(slider.selected, 0);
 
@@ -20560,7 +20950,8 @@ mod tests {
             overlay.slider.expect("provider steps").efforts,
             [
                 "Claude · 연결 안 됨 · 사용 중",
-                "Codex · 연결 안 됨 · 미사용"
+                "Codex · 연결 안 됨 · 미사용",
+                "OpenCode · 연결 안 됨 · 미사용"
             ]
         );
         state.pending = None;
@@ -20599,7 +20990,6 @@ mod tests {
         assert_eq!(state.selected_model_name(), "gpt-5.6-sol");
 
         state.run_slash_command("/provider");
-        state.handle_key(KeyEvent::from(KeyCode::Down));
         assert!(matches!(
             state.handle_key(KeyEvent::from(KeyCode::Char(' '))),
             Action::PersistProviderConnection {
@@ -20655,6 +21045,25 @@ mod tests {
         state.claude_provider_enabled = true;
         state.codex_provider_enabled = true;
         state
+    }
+
+    #[test]
+    fn opencode_connection_label_uses_authentication_before_models_are_loaded() {
+        let mut state = provider_picker_state();
+        state.opencode_provider_connected = true;
+
+        state.run_slash_command("/provider");
+        let steps = state
+            .overlay_view()
+            .expect("provider picker")
+            .slider
+            .expect("provider steps")
+            .efforts;
+        assert_eq!(steps[2], "OpenCode · 연결됨 · 미사용");
+        assert!(matches!(
+            state.click_effort_step(2),
+            Action::ActivateOpenCode
+        ));
     }
 
     #[test]
@@ -20744,7 +21153,14 @@ mod tests {
             state.run_slash_command("/mcp login github"),
             Action::McpLogin(ref name) if name == "github"
         ));
-        assert!(matches!(state.run_slash_command("/connect"), Action::None));
+        assert!(matches!(
+            state.run_slash_command("/connect"),
+            Action::ConnectProvider
+        ));
+        assert!(matches!(
+            state.run_slash_command("/provider opencode"),
+            Action::ActivateOpenCode
+        ));
         assert!(matches!(
             state.run_slash_command("/plugins"),
             Action::OpenPlugins {

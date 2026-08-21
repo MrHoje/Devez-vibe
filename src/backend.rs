@@ -19,9 +19,7 @@ use crate::{
         ClaudeClient, ClaudeServer, is_claude_model, is_claude_request_id, is_claude_thread,
         raw_thread_id, visible_thread_id,
     },
-    open_code::{
-        OpenCodeServer, has_connected_provider, is_open_code_model, is_open_code_request_id,
-    },
+    open_code::{OpenCodeServer, is_open_code_model, is_open_code_request_id},
 };
 
 #[derive(Clone)]
@@ -153,9 +151,7 @@ impl BackendServer {
         claude_path: &Path,
         cwd: &Path,
     ) -> Result<Self> {
-        let open_code = if crate::open_code::PROVIDER_ENABLED
-            && (has_connected_provider() || open_code_is_startup_default())
-        {
+        let open_code = if crate::open_code::PROVIDER_ENABLED && open_code_is_startup_default() {
             OpenCodeServer::spawn(open_code_path, cwd).await.ok()
         } else {
             None
@@ -374,7 +370,11 @@ impl BackendServer {
                     let open_code = self.open_code()?;
                     let cwd = request_cwd(&params).unwrap_or_else(|| self.cwd.clone());
                     let response = open_code
-                        .start_session(&cwd, model.expect("checked"))
+                        .start_session(
+                            &cwd,
+                            model.expect("checked"),
+                            params.get("effort").and_then(Value::as_str),
+                        )
                         .await?;
                     let id = response
                         .get("id")
@@ -855,6 +855,10 @@ impl BackendServer {
 
     pub fn has_open_code(&self) -> bool {
         self.open_code.is_some()
+    }
+
+    pub async fn start_open_code(&mut self) -> Result<()> {
+        self.ensure_open_code().await.map(|_| ())
     }
 
     pub fn respond(&self, id: Value, result: Value) -> Result<()> {
@@ -1473,7 +1477,10 @@ impl BackendServer {
             .map(|route| route.cwd)
             .or_else(|| request_cwd(params))
             .unwrap_or_else(|| self.cwd.clone());
-        let response = self.open_code()?.start_session(&cwd, &model).await?;
+        let response = self
+            .open_code()?
+            .start_session(&cwd, &model, params.get("effort").and_then(Value::as_str))
+            .await?;
         let backing = response
             .get("id")
             .and_then(Value::as_str)
@@ -1488,7 +1495,7 @@ impl BackendServer {
             self.route(visible).and_then(|route| route.claude_id),
             cwd,
         );
-        Ok((backing, Some(model)))
+        Ok((backing, None))
     }
 
     async fn ensure_codex_route(&self, visible: &str, params: &Value) -> Result<String> {

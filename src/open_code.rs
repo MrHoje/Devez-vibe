@@ -24,18 +24,122 @@ use tokio::{
 
 use crate::app_server::ServerEvent;
 
-/// OpenCode 연동 코드는 후속 개선을 위해 유지하되 현재 배포에서는 비활성화한다.
-pub const PROVIDER_ENABLED: bool = false;
+/// OpenCode provider 연동. /provider opencode와 /connect가 이 스위치를 따른다.
+pub const PROVIDER_ENABLED: bool = true;
 
 type PendingResponse = oneshot::Sender<Result<Value, String>>;
 type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
 type DetachedMap = Arc<Mutex<HashMap<u64, DetachedTurn>>>;
 type ToolMap = Arc<Mutex<HashMap<String, Value>>>;
+type StreamMap = Arc<Mutex<HashMap<String, SessionStreams>>>;
+type Notification = (String, Value);
 
 #[derive(Clone)]
 struct DetachedTurn {
     session_id: String,
     turn_id: String,
+}
+
+/// ACP는 본문·사고 조각만 흘려보내고 항목 경계를 알리지 않는다. 조각을
+/// 항목으로 묶어 시작·완료를 만들어 주지 않으면 한 턴의 모든 문장이 화면에서
+/// 한 덩어리로 붙는다. 여기서 세션마다 열린 항목을 추적해 경계를 복원한다.
+/// 사고 조각은 화면에 보내지 않는다. OpenCode는 요약이 아니라 사고 원문
+/// 전체를 흘려보내서 그대로 표시하면 답변보다 길게 남는다. 대신 사고의
+/// 시작은 앞 본문 항목이 끝났다는 경계 신호로만 쓴다.
+#[derive(Default)]
+struct SessionStreams {
+    next_item: u64,
+    message: Option<StreamItem>,
+}
+
+struct StreamItem {
+    id: String,
+    source: Option<String>,
+    text: String,
+}
+
+impl SessionStreams {
+    fn message_chunk(
+        &mut self,
+        session_id: &str,
+        message_id: Option<&str>,
+        delta: &str,
+    ) -> Vec<Notification> {
+        let mut out = Vec::new();
+        if message_id.is_some()
+            && self
+                .message
+                .as_ref()
+                .is_some_and(|current| current.source.as_deref() != message_id)
+        {
+            self.close_message(session_id, &mut out);
+        }
+        if self.message.is_none() {
+            self.next_item += 1;
+            let item = StreamItem {
+                id: format!("opencode-message-{}", self.next_item),
+                source: message_id.map(ToOwned::to_owned),
+                text: String::new(),
+            };
+            out.push((
+                "item/started".to_owned(),
+                json!({
+                    "threadId": session_id,
+                    "item": {
+                        "id": item.id,
+                        "type": "agentMessage",
+                        "text": "",
+                        "provider": "OpenCode"
+                    }
+                }),
+            ));
+            self.message = Some(item);
+        }
+        let current = self.message.as_mut().expect("message stream exists");
+        current.text.push_str(delta);
+        out.push((
+            "item/agentMessage/delta".to_owned(),
+            json!({
+                "threadId": session_id,
+                "itemId": current.id,
+                "delta": delta,
+                "provider": "OpenCode"
+            }),
+        ));
+        out
+    }
+
+    /// 사고는 다음 응답의 서두이므로 앞의 본문 항목은 여기서 끝난다.
+    /// 사고 내용 자체는 표시하지 않는다.
+    fn thought_boundary(&mut self, session_id: &str) -> Vec<Notification> {
+        let mut out = Vec::new();
+        self.close_message(session_id, &mut out);
+        out
+    }
+
+    /// 도구 호출 시작과 턴 종료가 항목이 끝났다고 확신할 수 있는 경계다.
+    fn close_all(&mut self, session_id: &str) -> Vec<Notification> {
+        let mut out = Vec::new();
+        self.close_message(session_id, &mut out);
+        out
+    }
+
+    fn close_message(&mut self, session_id: &str, out: &mut Vec<Notification>) {
+        if let Some(current) = self.message.take() {
+            out.push((
+                "item/completed".to_owned(),
+                json!({
+                    "threadId": session_id,
+                    "item": {
+                        "id": current.id,
+                        "type": "agentMessage",
+                        "text": current.text,
+                        "provider": "OpenCode"
+                    }
+                }),
+            ));
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -198,6 +302,11 @@ impl ProviderAuthServer {
         }))
     }
 
+    async fn model_catalog(&self) -> Result<Value> {
+        self.wait_until_ready().await?;
+        self.get(&["provider"]).await
+    }
+
     pub async fn set_api_key(
         &self,
         provider_id: &str,
@@ -340,6 +449,7 @@ impl OpenCodeServer {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let detached: DetachedMap = Arc::new(Mutex::new(HashMap::new()));
         let tools: ToolMap = Arc::new(Mutex::new(HashMap::new()));
+        let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
 
         let writer_task = tokio::spawn(async move {
             let mut stdin = stdin;
@@ -359,6 +469,7 @@ impl OpenCodeServer {
         let reader_pending = Arc::clone(&pending);
         let reader_detached = Arc::clone(&detached);
         let reader_tools = Arc::clone(&tools);
+        let reader_streams = Arc::clone(&streams);
         let reader_events = event_tx.clone();
         let reader_task = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
@@ -372,6 +483,7 @@ impl OpenCodeServer {
                                     &reader_pending,
                                     &reader_detached,
                                     &reader_tools,
+                                    &reader_streams,
                                     &reader_events,
                                 )
                                 .await;
@@ -461,14 +573,26 @@ impl OpenCodeServer {
             .get("sessionId")
             .and_then(Value::as_str)
             .context("OpenCode 모델 조회 세션에 id가 없습니다.")?;
+        let provider_catalog = self
+            .provider_auth
+            .model_catalog()
+            .await
+            .unwrap_or(Value::Null);
+        let current_model = current_model(&response);
+        let current_efforts = config_option_values(&response, "effort");
         let connected = connected_provider_ids();
         let models = model_options(&response)
             .into_iter()
             .filter_map(|(value, name)| {
                 let provider = value.split_once('/')?.0;
-                (provider != "openai"
-                    && (connected.is_empty() || connected.iter().any(|id| id == provider)))
-                .then(|| open_code_model(&value, &name))
+                if !provider_visible(&connected, provider) {
+                    return None;
+                }
+                let mut efforts = model_reasoning_efforts(&provider_catalog, &value);
+                if efforts.is_empty() && current_model == Some(value.as_str()) {
+                    efforts.clone_from(&current_efforts);
+                }
+                Some(open_code_model(&value, &name, &efforts))
             })
             .collect::<Vec<_>>();
         let _ = self
@@ -515,7 +639,12 @@ impl OpenCodeServer {
             .await
     }
 
-    pub async fn start_session(&self, cwd: &Path, model: &str) -> Result<Value> {
+    pub async fn start_session(
+        &self,
+        cwd: &Path,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<Value> {
         let response = self
             .client
             .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
@@ -525,20 +654,12 @@ impl OpenCodeServer {
             .and_then(Value::as_str)
             .context("OpenCode 새 세션에 id가 없습니다.")?;
         let model = strip_model_prefix(model);
-        self.client
-            .request(
-                "session/set_config_option",
-                json!({
-                    "sessionId": session_id,
-                    "configId": "model",
-                    "value": model
-                }),
-            )
-            .await?;
+        self.set_model(session_id, model, effort).await?;
         Ok(thread_response(
             session_id,
             cwd,
             &format!("opencode:{model}"),
+            effort.unwrap_or("default"),
         ))
     }
 
@@ -557,7 +678,8 @@ impl OpenCodeServer {
         let model = current_model(&response)
             .map(|model| format!("opencode:{model}"))
             .unwrap_or_else(|| "opencode:unknown/unknown".to_owned());
-        Ok(thread_response(session_id, cwd, &model))
+        let effort = current_config_option(&response, "effort").unwrap_or("default");
+        Ok(thread_response(session_id, cwd, &model, effort))
     }
 
     pub async fn list_sessions(&self, cwd: Option<&Path>) -> Result<Value> {
@@ -603,7 +725,8 @@ impl OpenCodeServer {
         let model = current_model(&response)
             .map(|model| format!("opencode:{model}"))
             .unwrap_or_else(|| "opencode:unknown/unknown".to_owned());
-        Ok(thread_response(forked, cwd, &model))
+        let effort = current_config_option(&response, "effort").unwrap_or("default");
+        Ok(thread_response(forked, cwd, &model, effort))
     }
 
     pub async fn start_prompt(&self, session_id: &str, text: &str) -> Result<String> {
@@ -723,6 +846,7 @@ async fn route_message(
     pending: &PendingMap,
     detached: &DetachedMap,
     tools: &ToolMap,
+    streams: &StreamMap,
     events: &mpsc::UnboundedSender<ServerEvent>,
 ) {
     if let Some(id) = message.get("id").and_then(Value::as_u64)
@@ -738,6 +862,17 @@ async fn route_message(
             return;
         }
         if let Some(turn) = detached.lock().await.remove(&id) {
+            // 열린 본문·사고 항목은 턴이 끝나면 여기서 완료 처리해야
+            // 진행 표시가 이 항목을 기다리며 남지 않는다.
+            let boundary = streams
+                .lock()
+                .await
+                .entry(turn.session_id.clone())
+                .or_default()
+                .close_all(&turn.session_id);
+            for (method, params) in boundary {
+                notify(events, &method, params);
+            }
             if let Some(error) = message.get("error") {
                 let detail = format_rpc_error(error);
                 let _ = events.send(ServerEvent::Notification {
@@ -776,6 +911,7 @@ async fn route_message(
         route_session_update(
             message.get("params").cloned().unwrap_or(Value::Null),
             tools,
+            streams,
             events,
         )
         .await;
@@ -800,6 +936,7 @@ async fn route_message(
 async fn route_session_update(
     params: Value,
     tools: &ToolMap,
+    streams: &StreamMap,
     events: &mpsc::UnboundedSender<ServerEvent>,
 ) {
     let session_id = params
@@ -811,41 +948,43 @@ async fn route_session_update(
     };
     match update.get("sessionUpdate").and_then(Value::as_str) {
         Some("agent_message_chunk") => {
-            if let Some(delta) = content_text(update.get("content")) {
-                let item_id = update
-                    .get("messageId")
-                    .and_then(Value::as_str)
-                    .unwrap_or("opencode-agent-message");
-                notify(
-                    events,
-                    "item/agentMessage/delta",
-                    json!({
-                        "threadId": session_id,
-                        "itemId": item_id,
-                        "delta": delta,
-                        "provider": "OpenCode"
-                    }),
-                );
+            if let Some(delta) =
+                content_text(update.get("content")).filter(|delta| !delta.is_empty())
+            {
+                let message_id = update.get("messageId").and_then(Value::as_str);
+                let notifications = streams
+                    .lock()
+                    .await
+                    .entry(session_id.to_owned())
+                    .or_default()
+                    .message_chunk(session_id, message_id, delta);
+                for (method, params) in notifications {
+                    notify(events, &method, params);
+                }
             }
         }
         Some("agent_thought_chunk") => {
-            if let Some(delta) = content_text(update.get("content")) {
-                let item_id = update
-                    .get("messageId")
-                    .and_then(Value::as_str)
-                    .unwrap_or("opencode-reasoning");
-                notify(
-                    events,
-                    "item/reasoning/summaryTextDelta",
-                    json!({
-                        "threadId": session_id,
-                        "itemId": item_id,
-                        "delta": delta
-                    }),
-                );
+            let notifications = streams
+                .lock()
+                .await
+                .entry(session_id.to_owned())
+                .or_default()
+                .thought_boundary(session_id);
+            for (method, params) in notifications {
+                notify(events, &method, params);
             }
         }
         Some("tool_call") => {
+            // 도구 호출이 시작되면 그 앞의 본문은 진행 문장으로 확정된다.
+            let boundary = streams
+                .lock()
+                .await
+                .entry(session_id.to_owned())
+                .or_default()
+                .close_all(session_id);
+            for (method, params) in boundary {
+                notify(events, &method, params);
+            }
             let item = tool_item(update, false);
             if let Some(id) = item.get("id").and_then(Value::as_str) {
                 tools.lock().await.insert(id.to_owned(), update.clone());
@@ -1200,27 +1339,109 @@ fn model_options(response: &Value) -> Vec<(String, String)> {
 }
 
 fn current_model(response: &Value) -> Option<&str> {
+    current_config_option(response, "model")
+}
+
+fn current_config_option<'a>(response: &'a Value, id: &str) -> Option<&'a str> {
     response
         .get("configOptions")
         .and_then(Value::as_array)?
         .iter()
-        .find(|option| option.get("id").and_then(Value::as_str) == Some("model"))?
+        .find(|option| option.get("id").and_then(Value::as_str) == Some(id))?
         .get("currentValue")?
         .as_str()
 }
 
-fn open_code_model(model: &str, display_name: &str) -> Value {
+fn config_option_values(response: &Value, id: &str) -> Vec<String> {
+    response
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|option| option.get("id").and_then(Value::as_str) == Some(id))
+        .and_then(|option| option.get("options"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|option| option.get("value")?.as_str().map(ToOwned::to_owned))
+        .collect()
+}
+
+fn model_reasoning_efforts(catalog: &Value, model: &str) -> Vec<String> {
+    let Some((provider_id, model_id)) = model.split_once('/') else {
+        return Vec::new();
+    };
+    let Some(variants) = catalog
+        .get("all")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|provider| provider.get("id").and_then(Value::as_str) == Some(provider_id))
+        .and_then(|provider| provider.get("models"))
+        .and_then(|models| models.get(model_id))
+        .and_then(|model| model.get("variants"))
+        .and_then(Value::as_object)
+    else {
+        return Vec::new();
+    };
+    const ORDER: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+    let mut efforts = variants
+        .iter()
+        .filter_map(|(name, variant)| {
+            variant
+                .get("reasoningEffort")
+                .and_then(Value::as_str)
+                .map(|effort| effort.to_owned())
+                .or_else(|| ORDER.contains(&name.as_str()).then(|| name.clone()))
+        })
+        .collect::<Vec<_>>();
+    efforts.sort_by_key(|effort| {
+        ORDER
+            .iter()
+            .position(|candidate| candidate == effort)
+            .unwrap_or(ORDER.len())
+    });
+    efforts.dedup();
+    efforts
+}
+
+fn open_code_model(model: &str, display_name: &str, efforts: &[String]) -> Value {
+    let default_effort = efforts.first().map(String::as_str).unwrap_or("default");
+    let supported_efforts = efforts
+        .iter()
+        .map(|effort| json!({ "reasoningEffort": effort }))
+        .collect::<Vec<_>>();
     json!({
         "id": format!("opencode:{model}"),
         "model": format!("opencode:{model}"),
-        "displayName": format!("OpenCode · {display_name}"),
-        "defaultReasoningEffort": "default",
-        "supportedReasoningEfforts": [{ "reasoningEffort": "default" }],
+        "displayName": open_code_model_display_name(model, display_name),
+        "defaultReasoningEffort": default_effort,
+        "supportedReasoningEfforts": supported_efforts,
         "isDefault": false
     })
 }
 
-fn thread_response(session_id: &str, cwd: &Path, model: &str) -> Value {
+fn open_code_model_display_name(model: &str, display_name: &str) -> String {
+    let provider = model
+        .split_once('/')
+        .map(|(provider, _)| provider)
+        .unwrap_or(model);
+    let family = match provider {
+        "opencode-go" => "OpenCode Go",
+        "opencode" => "OpenCode Zen",
+        _ => display_name
+            .split_once('/')
+            .map(|(provider, _)| provider)
+            .unwrap_or(provider),
+    };
+    let name = display_name
+        .split_once('/')
+        .map(|(_, name)| name)
+        .unwrap_or(display_name);
+    format!("{name} · {family}")
+}
+
+fn thread_response(session_id: &str, cwd: &Path, model: &str, effort: &str) -> Value {
     json!({
         "id": session_id,
         "thread": {
@@ -1230,7 +1451,7 @@ fn thread_response(session_id: &str, cwd: &Path, model: &str) -> Value {
         },
         "cwd": cwd,
         "model": model,
-        "reasoningEffort": "default"
+        "reasoningEffort": effort
     })
 }
 
@@ -1244,6 +1465,23 @@ pub fn is_open_code_model(model: &str) -> bool {
 
 pub fn has_connected_provider() -> bool {
     !connected_provider_ids().is_empty()
+}
+
+/// Zen (`opencode`) and Go (`opencode-go`) are one runtime from the picker's
+/// point of view: authenticating either unlocks both model families. `openai`
+/// stays hidden, and everything else still needs its own key.
+fn provider_visible(connected: &[String], provider: &str) -> bool {
+    if provider == "openai" {
+        return false;
+    }
+    connected.is_empty()
+        || connected.iter().any(|id| id == provider)
+        || match provider {
+            "opencode" | "opencode-go" => connected
+                .iter()
+                .any(|id| *id == "opencode" || *id == "opencode-go"),
+            _ => false,
+        }
 }
 
 fn connected_provider_ids() -> Vec<String> {
@@ -1351,13 +1589,153 @@ mod tests {
 
     #[test]
     fn open_code_models_are_namespaced() {
-        let model = open_code_model("anthropic/claude-sonnet", "Anthropic/Claude Sonnet");
+        let model = open_code_model("anthropic/claude-sonnet", "Anthropic/Claude Sonnet", &[]);
         assert_eq!(
             model.get("model").and_then(Value::as_str),
             Some("opencode:anthropic/claude-sonnet")
         );
         assert!(is_open_code_model("opencode:anthropic/claude-sonnet"));
         assert!(!is_open_code_model("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn open_code_model_names_put_the_model_before_the_provider() {
+        let go = open_code_model(
+            "opencode-go/deepseek-v4",
+            "OpenCode Go/DeepSeek V4 Flash",
+            &[],
+        );
+        let zen = open_code_model("opencode/deepseek-v4", "OpenCode/DeepSeek V4 Flash", &[]);
+        let anthropic = open_code_model("anthropic/claude-sonnet", "Anthropic/Claude Sonnet", &[]);
+
+        assert_eq!(
+            go.get("displayName").and_then(Value::as_str),
+            Some("DeepSeek V4 Flash · OpenCode Go")
+        );
+        assert_eq!(
+            zen.get("displayName").and_then(Value::as_str),
+            Some("DeepSeek V4 Flash · OpenCode Zen")
+        );
+        assert_eq!(
+            anthropic.get("displayName").and_then(Value::as_str),
+            Some("Claude Sonnet · Anthropic")
+        );
+    }
+
+    #[test]
+    fn model_variants_become_model_specific_effort_choices() {
+        let catalog = json!({
+            "all": [{
+                "id": "opencode-go",
+                "models": {
+                    "gpt-5.6-luna": {
+                        "variants": {
+                            "xhigh": { "reasoningEffort": "xhigh" },
+                            "none": { "reasoningEffort": "none" },
+                            "medium": { "reasoningEffort": "medium" },
+                            "low": { "reasoningEffort": "low" },
+                            "high": { "reasoningEffort": "high" },
+                            "max": { "reasoningEffort": "max" }
+                        }
+                    },
+                    "muse-spark": {
+                        "variants": {
+                            "minimal": { "reasoningEffort": "minimal" },
+                            "low": { "reasoningEffort": "low" },
+                            "high": { "reasoningEffort": "high" }
+                        }
+                    }
+                }
+            }]
+        });
+        let luna = model_reasoning_efforts(&catalog, "opencode-go/gpt-5.6-luna");
+        let muse = model_reasoning_efforts(&catalog, "opencode-go/muse-spark");
+
+        assert_eq!(luna, ["none", "low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(muse, ["minimal", "low", "high"]);
+        let model = open_code_model(
+            "opencode-go/gpt-5.6-luna",
+            "OpenCode Go/GPT-5.6 Luna",
+            &luna,
+        );
+        assert_eq!(
+            model.get("defaultReasoningEffort").and_then(Value::as_str),
+            Some("none")
+        );
+        assert_eq!(
+            model
+                .get("supportedReasoningEfforts")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn zen_and_go_authentication_unlocks_both_model_families() {
+        let zen_only = vec!["opencode".to_owned()];
+        assert!(provider_visible(&zen_only, "opencode"));
+        assert!(provider_visible(&zen_only, "opencode-go"));
+        assert!(!provider_visible(&zen_only, "xai"));
+
+        let go_only = vec!["opencode-go".to_owned()];
+        assert!(provider_visible(&go_only, "opencode"));
+        assert!(provider_visible(&go_only, "opencode-go"));
+        assert!(!provider_visible(&go_only, "anthropic"));
+
+        assert!(!provider_visible(&[], "openai"));
+        assert!(provider_visible(&[], "xai"));
+    }
+
+    #[test]
+    fn message_stream_splits_at_tool_boundary() {
+        let mut streams = SessionStreams::default();
+        let first = streams.message_chunk("s", None, "진행 문장");
+        assert_eq!(first[0].0, "item/started");
+        assert_eq!(first[1].0, "item/agentMessage/delta");
+        let boundary = streams.close_all("s");
+        assert_eq!(boundary[0].0, "item/completed");
+        assert_eq!(
+            boundary[0].1.pointer("/item/text").and_then(Value::as_str),
+            Some("진행 문장")
+        );
+        let second = streams.message_chunk("s", None, "최종 답변");
+        assert_ne!(
+            first[1].1.get("itemId").and_then(Value::as_str),
+            second[1].1.get("itemId").and_then(Value::as_str)
+        );
+    }
+
+    #[test]
+    fn thought_boundary_closes_open_message_without_showing_thought() {
+        let mut streams = SessionStreams::default();
+        streams.message_chunk("s", None, "본문");
+        let events = streams.thought_boundary("s");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "item/completed");
+        assert_eq!(
+            events[0].1.pointer("/item/type").and_then(Value::as_str),
+            Some("agentMessage")
+        );
+        // 사고만 이어지는 동안에는 아무것도 내보내지 않는다.
+        assert!(streams.thought_boundary("s").is_empty());
+    }
+
+    #[test]
+    fn changed_message_id_starts_new_item() {
+        let mut streams = SessionStreams::default();
+        streams.message_chunk("s", Some("m1"), "첫 메시지");
+        let events = streams.message_chunk("s", Some("m2"), "둘째 메시지");
+        assert_eq!(events[0].0, "item/completed");
+        assert_eq!(
+            events[0].1.pointer("/item/text").and_then(Value::as_str),
+            Some("첫 메시지")
+        );
+        assert_eq!(events[1].0, "item/started");
+        // 같은 메시지 id가 이어지면 항목을 나누지 않는다.
+        let same = streams.message_chunk("s", Some("m2"), " 계속");
+        assert_eq!(same.len(), 1);
+        assert_eq!(same[0].0, "item/agentMessage/delta");
     }
 
     #[test]
