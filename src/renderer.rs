@@ -7212,23 +7212,43 @@ fn notice_card_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         ));
     }
     let inner = content.iter().map(painted_line_width).max().unwrap_or(0);
+    // Card walls share the marker's muted tone so the two corners, both side
+    // rules, and the `◆`/`↳` gutters read as one unbroken frame.
+    let border = Tone::Muted;
     let mut lines = Vec::with_capacity(content.len() + 3);
     lines.push(PaintLine {
-        tone: PLAN_BORDER_TONE,
+        tone: border,
         ..PaintLine::plain(format!("┌{}┐", "─".repeat(inner + 2)))
     });
-    // Like the plan panel, only the corner rules frame the card; the rows
-    // between them stay wall-free and simply sit inside the corners.
+    // Each row sits between two side rules; the right wall is padded flush so
+    // the box closes at the same column on every line.
     for mut row in content {
-        row.prefix = format!("  {}", row.prefix);
+        let pad = inner.saturating_sub(painted_line_width(&row));
+        row.prefix = format!("│ {}", row.prefix);
+        row.tail.push(PaintSpan {
+            text: format!("{} │", " ".repeat(pad)),
+            tone: border,
+            bold: false,
+        });
         lines.push(row);
     }
     lines.push(PaintLine {
-        tone: PLAN_BORDER_TONE,
+        tone: border,
         ..PaintLine::plain(format!("└{}┘", "─".repeat(inner + 2)))
     });
     lines.push(PaintLine::blank());
     lines
+}
+
+/// The card colours a model name with its own family tone, falling back to the
+/// accent only for labels that name no known model (a theme, say). OpenCode
+/// rides other vendors' models, so it keeps its own runtime tone here.
+fn notice_model_tone(model: &str) -> Tone {
+    if is_open_code_model_label(model) {
+        Tone::ModelOpenCode
+    } else {
+        model_tone(model).unwrap_or(Tone::Accent)
+    }
 }
 
 /// A setting detail such as `GPT-5.6 Sol · high` names a model and an effort:
@@ -7242,7 +7262,9 @@ fn coloured_notice_detail(detail: &str, wrap_width: u16) -> Option<PaintLine> {
         Some((lead, effort)) => vec![
             PaintSpan {
                 text: lead.to_owned(),
-                tone: Tone::Accent,
+                // The model name wears the colour of the model it names, the
+                // same tone the status line paints it in.
+                tone: notice_model_tone(lead),
                 bold: false,
             },
             PaintSpan {
@@ -7258,7 +7280,7 @@ fn coloured_notice_detail(detail: &str, wrap_width: u16) -> Option<PaintLine> {
         ],
         None => vec![PaintSpan {
             text: detail.to_owned(),
-            tone: Tone::Accent,
+            tone: notice_model_tone(detail),
             bold: false,
         }],
     };
@@ -13039,11 +13061,14 @@ mod tests {
         let card_width = painted_width(&lines[0]);
         assert!(card_width < 40);
         assert_eq!(painted_width(&lines[3]), card_width);
-        assert!(
-            lines[1..3]
-                .iter()
-                .all(|line| painted_width(line) < card_width && !painted(line).contains('│'))
-        );
+        // Every content row is walled on both sides and closes flush with the
+        // corners above and below it.
+        assert!(lines[1..3].iter().all(|line| {
+            let painted = painted(line);
+            painted.starts_with('│')
+                && painted.ends_with('│')
+                && painted_width(line) == card_width
+        }));
         assert!(lines[4].text.is_empty());
     }
 
@@ -13057,9 +13082,12 @@ mod tests {
         let lines = block_lines(&block, 80);
 
         let detail = &lines[2];
-        assert_eq!(detail.tail.len(), 3);
-        assert_eq!(detail.tail[0].tone, Tone::Accent);
+        // The model name span, the separator, the effort span, then the right
+        // wall the card appends to close the row.
+        assert_eq!(detail.tail.len(), 4);
+        assert_eq!(detail.tail[0].tone, Tone::ModelTerra);
         assert_eq!(detail.tail[2].tone, Tone::EffortHigh);
+        assert!(detail.tail[3].text.ends_with('│'));
     }
 
     #[test]
@@ -13074,7 +13102,9 @@ mod tests {
         assert!(painted(&lines[0]).starts_with('┌'));
         assert!(painted(&lines[1]).contains("◆ Provider"));
         assert!(painted(&lines[2]).contains("↳ 현재 Codex provider를 사용 중입니다."));
-        assert_eq!(painted_width(&lines[0]), painted_width(&lines[2]) + 2);
+        // Walled rows now match the corner rows column for column.
+        assert_eq!(painted_width(&lines[0]), painted_width(&lines[2]));
+        assert!(painted(&lines[2]).starts_with('│') && painted(&lines[2]).ends_with('│'));
     }
 
     #[test]
