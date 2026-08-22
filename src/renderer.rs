@@ -339,7 +339,12 @@ pub enum OverlayStyle {
     Panel,
     CompactPanel,
     Picker,
-    SearchPicker,
+    SearchPicker {
+        /// Whether the embedded search field owns the keyboard focus, and with
+        /// it the visible terminal cursor. When the model list holds the focus
+        /// instead, the cursor hides so ←→ read as the effort control.
+        input_focused: bool,
+    },
     /// A question the server is waiting on: a picker-style box with a bold
     /// prompt and numbered options. The first row is the prompt and the last is
     /// the row that hands the turn back to the composer, which is why the rule
@@ -5714,7 +5719,7 @@ fn overlay_frame_with_expansion(
     let mut embedded_search_active = false;
 
     match overlay.style {
-        OverlayStyle::Picker | OverlayStyle::SearchPicker => {
+        OverlayStyle::Picker | OverlayStyle::SearchPicker { .. } => {
             let panel_width = panel_span(width);
             // Keep one ordinary terminal cell open before the closing border;
             // the effort track below uses the same narrower content area.
@@ -5726,7 +5731,7 @@ fn overlay_frame_with_expansion(
             ));
             lines.push(panel_padding_row(panel_width));
 
-            if overlay.style == OverlayStyle::SearchPicker
+            if let OverlayStyle::SearchPicker { input_focused } = overlay.style
                 && let Some(editor) = overlay.input
             {
                 // Search belongs to the model group, not to the composer. Keep
@@ -5747,14 +5752,16 @@ fn overlay_frame_with_expansion(
                     None,
                     None,
                 );
-                cursor_line = lines.len() + input_cursor_line;
-                cursor_col = input_cursor_col + left_inset + 1;
+                if input_focused {
+                    cursor_line = lines.len() + input_cursor_line;
+                    cursor_col = input_cursor_col + left_inset + 1;
+                    embedded_search_active = true;
+                }
                 lines.extend(input.into_iter().map(|mut line| {
                     line.prefix.insert_str(0, &" ".repeat(left_inset));
                     panelize_content_line(line, panel_width)
                 }));
                 lines.push(panel_padding_row(panel_width));
-                embedded_search_active = true;
             }
 
             for (row_index, row) in overlay.lines.iter().enumerate() {
@@ -18544,7 +18551,9 @@ mod tests {
                     }],
                     slider: None,
                     hint: "Type to search  ·  ↑↓ model  ·  Enter to continue".to_owned(),
-                    style: OverlayStyle::SearchPicker,
+                    style: OverlayStyle::SearchPicker {
+                        input_focused: true,
+                    },
                     input: Some(&editor),
                     input_label: "",
                     input_placeholder: "Search models…",
@@ -18820,7 +18829,9 @@ mod tests {
     fn every_overlay_keeps_exactly_one_blank_row_before_the_statusline() {
         for style in [
             OverlayStyle::Picker,
-            OverlayStyle::SearchPicker,
+            OverlayStyle::SearchPicker {
+                input_focused: true,
+            },
             OverlayStyle::Panel,
             OverlayStyle::CompactPanel,
             OverlayStyle::Question,

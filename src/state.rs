@@ -1728,6 +1728,9 @@ enum PendingInteraction {
         /// OpenCode exposes enough models to warrant live filtering. Other
         /// providers keep their compact numbered picker and therefore no input.
         query: Option<Editor>,
+        /// ↑ past the top row hands ←→ to the search cursor; ↓ hands them back
+        /// to the effort track. Only ever true while `query` is `Some`.
+        search_focused: bool,
     },
     EffortPicker {
         effort_index: usize,
@@ -6457,6 +6460,7 @@ impl AppState {
             mut model_index,
             mut effort_index,
             query,
+            search_focused,
         }) = self.pending.take()
         else {
             return;
@@ -6466,6 +6470,7 @@ impl AppState {
             model_index,
             effort_index,
             query,
+            search_focused,
         });
     }
 
@@ -8012,6 +8017,7 @@ impl AppState {
                     effort_index,
                     query: (self.selected_provider() == ModelProvider::OpenCode)
                         .then(Editor::default),
+                    search_focused: false,
                 });
                 Action::None
             }
@@ -8448,14 +8454,24 @@ impl AppState {
                 mut model_index,
                 mut effort_index,
                 mut query,
+                mut search_focused,
             } => {
                 let searchable = query.is_some();
                 match key.code {
                     KeyCode::Esc => return Action::None,
                     KeyCode::Up => {
                         let candidates = self.model_picker_indices(query.as_ref());
-                        model_index = move_model_index_in(&candidates, model_index, -1);
-                        effort_index = self.effort_index_for_model(model_index);
+                        // The search field sits above the list, so ↑ past the
+                        // top row moves the focus onto it instead of stopping.
+                        if searchable
+                            && (search_focused
+                                || candidates.first().is_none_or(|first| *first == model_index))
+                        {
+                            search_focused = true;
+                        } else {
+                            model_index = move_model_index_in(&candidates, model_index, -1);
+                            effort_index = self.effort_index_for_model(model_index);
+                        }
                     }
                     KeyCode::Char('k') if !searchable && !ctrl && !alt => {
                         model_index = self.move_model_index(model_index, -1);
@@ -8465,6 +8481,14 @@ impl AppState {
                         let candidates = self.model_picker_indices(query.as_ref());
                         model_index = move_model_index_in(&candidates, model_index, -1);
                         effort_index = self.effort_index_for_model(model_index);
+                    }
+                    KeyCode::Down if search_focused => {
+                        search_focused = false;
+                        self.reset_filtered_model_selection(
+                            &mut model_index,
+                            &mut effort_index,
+                            query.as_ref(),
+                        );
                     }
                     KeyCode::Down => {
                         let candidates = self.model_picker_indices(query.as_ref());
@@ -8494,16 +8518,16 @@ impl AppState {
                             return Action::None;
                         }
                     }
-                    KeyCode::Left if searchable => {
+                    KeyCode::Left if search_focused => {
                         query.as_mut().expect("searchable query").move_left();
                     }
-                    KeyCode::Right if searchable => {
+                    KeyCode::Right if search_focused => {
                         query.as_mut().expect("searchable query").move_right();
                     }
-                    KeyCode::Home if searchable => {
+                    KeyCode::Home if search_focused => {
                         query.as_mut().expect("searchable query").move_home();
                     }
-                    KeyCode::End if searchable => {
+                    KeyCode::End if search_focused => {
                         query.as_mut().expect("searchable query").move_end();
                     }
                     KeyCode::Backspace if searchable && ctrl => {
@@ -8590,6 +8614,7 @@ impl AppState {
                     model_index,
                     effort_index,
                     query,
+                    search_focused,
                 });
                 Action::None
             }
@@ -9695,6 +9720,7 @@ impl AppState {
                 model_index,
                 effort_index,
                 query,
+                search_focused,
             } => {
                 let provider_models = self.model_picker_indices(query.as_ref());
                 let selected_position = provider_models
@@ -9750,8 +9776,10 @@ impl AppState {
                         muted: true,
                     }));
                 }
-                let hint = if query.is_some() && slider.is_some() {
-                    "Type to search  ·  ↑↓ model  ·  Tab effort  ·  Enter to continue  ·  Esc to cancel"
+                let hint = if query.is_some() && *search_focused {
+                    "Type to search  ·  ←→ cursor  ·  ↓ model  ·  Enter to continue  ·  Esc to cancel"
+                } else if query.is_some() && slider.is_some() {
+                    "Type to search  ·  ↑↓ model  ·  ←→ effort  ·  Enter to continue  ·  Esc to cancel"
                 } else if query.is_some() {
                     "Type to search  ·  ↑↓ model  ·  Enter to continue  ·  Esc to cancel"
                 } else if slider.is_some() {
@@ -9766,7 +9794,9 @@ impl AppState {
                     slider,
                     hint: hint.to_owned(),
                     style: if query.is_some() {
-                        OverlayStyle::SearchPicker
+                        OverlayStyle::SearchPicker {
+                            input_focused: *search_focused,
+                        }
                     } else {
                         OverlayStyle::Picker
                     },
@@ -11564,6 +11594,7 @@ impl AppState {
                 model_index,
                 effort_index,
                 query,
+                search_focused,
             }) => {
                 let provider_models = self.model_picker_indices(query.as_ref());
                 let selected_position = provider_models
@@ -11586,6 +11617,7 @@ impl AppState {
                         model_index,
                         effort_index,
                         query,
+                        search_focused,
                     });
                 }
                 Action::None
@@ -11906,6 +11938,9 @@ impl AppState {
                     model_index,
                     effort_index: step.min(count - 1),
                     query,
+                    // A click on the track is an effort interaction, so ←→
+                    // should keep adjusting it afterwards.
+                    search_focused: false,
                 });
                 Action::None
             }
@@ -15245,7 +15280,10 @@ mod tests {
         assert!(matches!(state.run_slash_command("/model"), Action::None));
 
         let initial = state.overlay_view().expect("OpenCode model picker");
-        assert!(matches!(initial.style, OverlayStyle::SearchPicker));
+        assert!(matches!(
+            initial.style,
+            OverlayStyle::SearchPicker { .. }
+        ));
         assert!(initial.input.is_some());
         assert_eq!(initial.input_placeholder, "Search models…");
 
@@ -15289,6 +15327,80 @@ mod tests {
             state.pending,
             Some(PendingInteraction::ModelPicker { .. })
         ));
+    }
+
+    #[test]
+    fn opencode_picker_arrows_adjust_effort_while_a_model_is_focused() {
+        let mut state = opencode_picker_state();
+        state.run_slash_command("/model");
+
+        let start = {
+            let view = state.overlay_view().expect("model picker");
+            assert!(matches!(
+                view.style,
+                OverlayStyle::SearchPicker {
+                    input_focused: false
+                }
+            ));
+            assert!(view.hint.contains("←→ effort"));
+            view.slider.as_ref().expect("effort slider").selected
+        };
+
+        state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        {
+            let view = state.overlay_view().expect("model picker");
+            assert_eq!(
+                view.slider.as_ref().expect("effort slider").selected,
+                start + 1
+            );
+        }
+
+        state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        let view = state.overlay_view().expect("model picker");
+        assert_eq!(view.slider.as_ref().expect("effort slider").selected, start);
+    }
+
+    #[test]
+    fn up_from_the_top_model_moves_focus_to_search_and_down_hands_it_back() {
+        let mut state = opencode_picker_state();
+        state.run_slash_command("/model");
+        let start = {
+            let view = state.overlay_view().expect("model picker");
+            view.slider.as_ref().expect("effort slider").selected
+        };
+
+        state.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        for ch in "ab".chars() {
+            state.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        {
+            let view = state.overlay_view().expect("model picker");
+            assert!(matches!(
+                view.style,
+                OverlayStyle::SearchPicker {
+                    input_focused: true
+                }
+            ));
+            assert!(view.hint.contains("←→ cursor"));
+            assert_eq!(view.input.expect("search editor").text(), "acb");
+        }
+
+        state.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let view = state.overlay_view().expect("model picker");
+        assert!(matches!(
+            view.style,
+            OverlayStyle::SearchPicker {
+                input_focused: false
+            }
+        ));
+        assert_eq!(
+            view.slider.as_ref().expect("effort slider").selected,
+            start + 1
+        );
     }
 
     #[test]
