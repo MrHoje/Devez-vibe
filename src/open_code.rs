@@ -32,12 +32,29 @@ type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
 type DetachedMap = Arc<Mutex<HashMap<u64, DetachedTurn>>>;
 type ToolMap = Arc<Mutex<HashMap<String, Value>>>;
 type StreamMap = Arc<Mutex<HashMap<String, SessionStreams>>>;
+type ActiveMap = Arc<Mutex<HashMap<String, ActiveTurn>>>;
+type LoadingMap = Arc<Mutex<HashMap<String, Vec<HistoryChunk>>>>;
+type HistoryMap = Arc<Mutex<HashMap<String, Value>>>;
 type Notification = (String, Value);
 
 #[derive(Clone)]
 struct DetachedTurn {
     session_id: String,
     turn_id: String,
+}
+
+/// 한 세션에서 지금 돌고 있는 턴. 추가 지시가 같은 턴에 합류하도록 미결
+/// prompt 수를 세고, 마지막 응답에서만 turn/completed를 발행한다.
+struct ActiveTurn {
+    turn_id: String,
+    outstanding: usize,
+}
+
+/// session/load가 응답 전에 재생해 주는 과거 대화 조각. 재개 화면 복원에 쓴다.
+struct HistoryChunk {
+    user: bool,
+    message_id: Option<String>,
+    text: String,
 }
 
 /// ACP는 본문·사고 조각만 흘려보내고 항목 경계를 알리지 않는다. 조각을
@@ -50,6 +67,8 @@ struct DetachedTurn {
 struct SessionStreams {
     next_item: u64,
     message: Option<StreamItem>,
+    /// 지금 돌고 있는 하위 에이전트(task 도구) 목록.
+    subagents: Vec<Value>,
 }
 
 struct StreamItem {
@@ -140,6 +159,66 @@ impl SessionStreams {
             ));
         }
     }
+
+    /// OpenCode의 task 도구는 하위 에이전트다. 실행 목록을 유지해 화면의
+    /// 하위 에이전트 행으로 알린다.
+    fn subagent_started(&mut self, session_id: &str, update: &Value) -> Option<Notification> {
+        let entry = subagent_entry(update)?;
+        let id = entry.get("id").and_then(Value::as_str)?.to_owned();
+        self.subagents
+            .retain(|existing| existing.get("id").and_then(Value::as_str) != Some(id.as_str()));
+        self.subagents.push(entry);
+        Some(self.subagents_notification(session_id))
+    }
+
+    fn subagent_finished(&mut self, session_id: &str, tool_id: &str) -> Option<Notification> {
+        let before = self.subagents.len();
+        self.subagents
+            .retain(|existing| existing.get("id").and_then(Value::as_str) != Some(tool_id));
+        (self.subagents.len() != before).then(|| self.subagents_notification(session_id))
+    }
+
+    /// 턴이 끝나면 남은 하위 에이전트 행을 거둬 spinner처럼 남지 않게 한다.
+    fn subagents_cleared(&mut self, session_id: &str) -> Option<Notification> {
+        if self.subagents.is_empty() {
+            return None;
+        }
+        self.subagents.clear();
+        Some(self.subagents_notification(session_id))
+    }
+
+    fn subagents_notification(&self, session_id: &str) -> Notification {
+        (
+            "turn/subagents/updated".to_owned(),
+            json!({ "threadId": session_id, "subagents": self.subagents }),
+        )
+    }
+}
+
+/// task 도구 호출에서 하위 에이전트 행 하나를 만든다. task가 아니면 None.
+fn subagent_entry(update: &Value) -> Option<Value> {
+    let input = update.get("rawInput");
+    let subagent_type = input
+        .and_then(|input| input.get("subagent_type"))
+        .and_then(Value::as_str);
+    let title = update
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if subagent_type.is_none() && !title.eq_ignore_ascii_case("task") {
+        return None;
+    }
+    let id = update.get("toolCallId").and_then(Value::as_str)?;
+    let description = input
+        .and_then(|input| input.get("description"))
+        .and_then(Value::as_str)
+        .unwrap_or(title);
+    Some(json!({
+        "id": id,
+        "name": subagent_type.unwrap_or("agent"),
+        "description": description,
+        "tool": "Task"
+    }))
 }
 
 #[derive(Clone)]
@@ -147,6 +226,7 @@ pub struct OpenCodeClient {
     outbound: Arc<StdMutex<Option<mpsc::UnboundedSender<Value>>>>,
     pending: PendingMap,
     detached: DetachedMap,
+    active_turns: ActiveMap,
     next_id: Arc<AtomicU64>,
     next_turn: Arc<AtomicU64>,
     events: mpsc::UnboundedSender<ServerEvent>,
@@ -173,12 +253,38 @@ impl OpenCodeClient {
         }
     }
 
-    pub async fn start_prompt(&self, session_id: &str, prompt: Vec<Value>) -> Result<String> {
+    pub async fn start_prompt(
+        &self,
+        session_id: &str,
+        prompt: Vec<Value>,
+        steer: bool,
+    ) -> Result<String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let turn_id = format!(
-            "opencode-turn-{}",
-            self.next_turn.fetch_add(1, Ordering::Relaxed)
-        );
+        // 추가 지시는 이미 도는 턴에 합류한다. 새 턴을 만들면 스피너와 항목
+        // 추적이 턴이 바뀐 것으로 읽고 진행 표시가 끊긴다.
+        let (turn_id, joined) = {
+            let mut active = self.active_turns.lock().await;
+            match active.get_mut(session_id) {
+                Some(turn) if steer => {
+                    turn.outstanding += 1;
+                    (turn.turn_id.clone(), true)
+                }
+                _ => {
+                    let turn_id = format!(
+                        "opencode-turn-{}",
+                        self.next_turn.fetch_add(1, Ordering::Relaxed)
+                    );
+                    active.insert(
+                        session_id.to_owned(),
+                        ActiveTurn {
+                            turn_id: turn_id.clone(),
+                            outstanding: 1,
+                        },
+                    );
+                    (turn_id, false)
+                }
+            }
+        };
         self.detached.lock().await.insert(
             id,
             DetachedTurn {
@@ -196,15 +302,26 @@ impl OpenCodeClient {
             }
         })) {
             self.detached.lock().await.remove(&id);
+            let mut active = self.active_turns.lock().await;
+            if let Some(turn) = active.get_mut(session_id)
+                && turn.turn_id == turn_id
+            {
+                turn.outstanding = turn.outstanding.saturating_sub(1);
+                if turn.outstanding == 0 {
+                    active.remove(session_id);
+                }
+            }
             return Err(error);
         }
-        let _ = self.events.send(ServerEvent::Notification {
-            method: "turn/started".to_owned(),
-            params: json!({
-                "threadId": session_id,
-                "turn": { "id": turn_id }
-            }),
-        });
+        if !joined {
+            let _ = self.events.send(ServerEvent::Notification {
+                method: "turn/started".to_owned(),
+                params: json!({
+                    "threadId": session_id,
+                    "turn": { "id": turn_id }
+                }),
+            });
+        }
         Ok(turn_id)
     }
 
@@ -253,6 +370,10 @@ pub struct OpenCodeServer {
     child: Child,
     client: OpenCodeClient,
     provider_auth: ProviderAuthServer,
+    /// session/load가 진행 중인 세션의 재생 조각 버퍼.
+    loading: LoadingMap,
+    /// 마지막 session/load가 재생해 준 과거 대화 페이지.
+    history: HistoryMap,
     events: mpsc::UnboundedReceiver<ServerEvent>,
     writer_task: JoinHandle<()>,
     reader_task: JoinHandle<()>,
@@ -448,6 +569,8 @@ impl OpenCodeServer {
         let (event_tx, events) = mpsc::unbounded_channel::<ServerEvent>();
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let detached: DetachedMap = Arc::new(Mutex::new(HashMap::new()));
+        let active_turns: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
+        let loading: LoadingMap = Arc::new(Mutex::new(HashMap::new()));
         let tools: ToolMap = Arc::new(Mutex::new(HashMap::new()));
         let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
 
@@ -468,6 +591,8 @@ impl OpenCodeServer {
 
         let reader_pending = Arc::clone(&pending);
         let reader_detached = Arc::clone(&detached);
+        let reader_active = Arc::clone(&active_turns);
+        let reader_loading = Arc::clone(&loading);
         let reader_tools = Arc::clone(&tools);
         let reader_streams = Arc::clone(&streams);
         let reader_events = event_tx.clone();
@@ -482,6 +607,8 @@ impl OpenCodeServer {
                                     message,
                                     &reader_pending,
                                     &reader_detached,
+                                    &reader_active,
+                                    &reader_loading,
                                     &reader_tools,
                                     &reader_streams,
                                     &reader_events,
@@ -509,6 +636,24 @@ impl OpenCodeServer {
             for (_, sender) in pending.drain() {
                 let _ = sender.send(Err("OpenCode ACP 연결이 종료되었습니다.".to_owned()));
             }
+            drop(pending);
+            // 연결이 죽으면 응답을 기다리던 턴을 닫아 스피너가 영원히 남지
+            // 않게 한다.
+            reader_active.lock().await.clear();
+            let mut detached = reader_detached.lock().await;
+            for (_, turn) in detached.drain() {
+                let _ = reader_events.send(ServerEvent::Notification {
+                    method: "turn/completed".to_owned(),
+                    params: json!({
+                        "threadId": turn.session_id,
+                        "turn": {
+                            "id": turn.turn_id,
+                            "error": { "message": "OpenCode ACP 연결이 종료되었습니다." }
+                        }
+                    }),
+                });
+            }
+            drop(detached);
             let _ = reader_events.send(ServerEvent::Closed(
                 "OpenCode ACP 연결이 종료되었습니다.".to_owned(),
             ));
@@ -528,6 +673,7 @@ impl OpenCodeServer {
             outbound: Arc::new(StdMutex::new(Some(outbound_tx))),
             pending,
             detached,
+            active_turns,
             next_id: Arc::new(AtomicU64::new(1)),
             next_turn: Arc::new(AtomicU64::new(1)),
             events: event_tx,
@@ -536,6 +682,8 @@ impl OpenCodeServer {
             child,
             client,
             provider_auth: ProviderAuthServer::new(port)?,
+            loading,
+            history: Arc::new(Mutex::new(HashMap::new())),
             events,
             writer_task,
             reader_task,
@@ -664,7 +812,13 @@ impl OpenCodeServer {
     }
 
     pub async fn resume_session(&self, cwd: &Path, session_id: &str) -> Result<Value> {
-        let response = self
+        // session/load는 응답 전에 과거 대화를 session/update로 재생한다.
+        // 그 조각을 화면에 흘리는 대신 모아서 재개 화면을 채운다.
+        self.loading
+            .lock()
+            .await
+            .insert(session_id.to_owned(), Vec::new());
+        let result = self
             .client
             .request(
                 "session/load",
@@ -674,12 +828,32 @@ impl OpenCodeServer {
                     "mcpServers": []
                 }),
             )
-            .await?;
+            .await;
+        let chunks = self
+            .loading
+            .lock()
+            .await
+            .remove(session_id)
+            .unwrap_or_default();
+        let response = result?;
+        let turns = history_turns(session_id, &chunks);
         let model = current_model(&response)
             .map(|model| format!("opencode:{model}"))
             .unwrap_or_else(|| "opencode:unknown/unknown".to_owned());
         let effort = current_config_option(&response, "effort").unwrap_or("default");
-        Ok(thread_response(session_id, cwd, &model, effort))
+        let mut value = thread_response(session_id, cwd, &model, effort);
+        value["thread"]["turns"] = Value::Array(turns.clone());
+        self.history.lock().await.insert(
+            session_id.to_owned(),
+            json!({ "data": turns, "nextCursor": null }),
+        );
+        Ok(value)
+    }
+
+    /// 마지막 session/load가 재생해 준 과거 대화 페이지. thread/turns/list가
+    /// 사이드카 없이도 재개 내역을 채울 수 있게 한다.
+    pub async fn history_page(&self, session_id: &str) -> Option<Value> {
+        self.history.lock().await.get(session_id).cloned()
     }
 
     pub async fn list_sessions(&self, cwd: Option<&Path>) -> Result<Value> {
@@ -731,7 +905,11 @@ impl OpenCodeServer {
 
     pub async fn start_prompt(&self, session_id: &str, text: &str) -> Result<String> {
         self.client
-            .start_prompt(session_id, vec![json!({ "type": "text", "text": text })])
+            .start_prompt(
+                session_id,
+                vec![json!({ "type": "text", "text": text })],
+                false,
+            )
             .await
     }
 
@@ -740,6 +918,7 @@ impl OpenCodeServer {
         session_id: &str,
         input: &[Value],
         instructions: Option<&str>,
+        steer: bool,
     ) -> Result<String> {
         let mut prompt = Vec::new();
         if let Some(instructions) = instructions {
@@ -776,7 +955,7 @@ impl OpenCodeServer {
         if prompt.is_empty() {
             prompt.push(json!({ "type": "text", "text": "" }));
         }
-        self.client.start_prompt(session_id, prompt).await
+        self.client.start_prompt(session_id, prompt, steer).await
     }
 
     pub async fn set_model(
@@ -845,6 +1024,8 @@ async fn route_message(
     message: Value,
     pending: &PendingMap,
     detached: &DetachedMap,
+    active: &ActiveMap,
+    loading: &LoadingMap,
     tools: &ToolMap,
     streams: &StreamMap,
     events: &mpsc::UnboundedSender<ServerEvent>,
@@ -862,19 +1043,8 @@ async fn route_message(
             return;
         }
         if let Some(turn) = detached.lock().await.remove(&id) {
-            // 열린 본문·사고 항목은 턴이 끝나면 여기서 완료 처리해야
-            // 진행 표시가 이 항목을 기다리며 남지 않는다.
-            let boundary = streams
-                .lock()
-                .await
-                .entry(turn.session_id.clone())
-                .or_default()
-                .close_all(&turn.session_id);
-            for (method, params) in boundary {
-                notify(events, &method, params);
-            }
-            if let Some(error) = message.get("error") {
-                let detail = format_rpc_error(error);
+            let error_detail = message.get("error").map(format_rpc_error);
+            if let Some(detail) = &error_detail {
                 let _ = events.send(ServerEvent::Notification {
                     method: "error".to_owned(),
                     params: json!({
@@ -884,6 +1054,42 @@ async fn route_message(
                         "provider": "OpenCode"
                     }),
                 });
+            }
+            // 합류한 추가 지시가 아직 돌고 있으면 턴을 끝내지 않는다.
+            let finished = {
+                let mut active = active.lock().await;
+                match active.get_mut(&turn.session_id) {
+                    Some(current) if current.turn_id == turn.turn_id => {
+                        current.outstanding = current.outstanding.saturating_sub(1);
+                        let done = current.outstanding == 0;
+                        if done {
+                            active.remove(&turn.session_id);
+                        }
+                        done
+                    }
+                    _ => true,
+                }
+            };
+            if !finished {
+                return;
+            }
+            // 열린 본문·사고 항목은 턴이 끝나면 여기서 완료 처리해야
+            // 진행 표시가 이 항목을 기다리며 남지 않는다.
+            let (boundary, subagents) = {
+                let mut streams = streams.lock().await;
+                let entry = streams.entry(turn.session_id.clone()).or_default();
+                (
+                    entry.close_all(&turn.session_id),
+                    entry.subagents_cleared(&turn.session_id),
+                )
+            };
+            for (method, params) in boundary {
+                notify(events, &method, params);
+            }
+            if let Some((method, params)) = subagents {
+                notify(events, &method, params);
+            }
+            if let Some(detail) = error_detail {
                 let _ = events.send(ServerEvent::Notification {
                     method: "turn/completed".to_owned(),
                     params: json!({
@@ -908,13 +1114,23 @@ async fn route_message(
     }
 
     if message.get("method").and_then(Value::as_str) == Some("session/update") {
-        route_session_update(
-            message.get("params").cloned().unwrap_or(Value::Null),
-            tools,
-            streams,
-            events,
-        )
-        .await;
+        let params = message.get("params").cloned().unwrap_or(Value::Null);
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        // session/load가 재생 중인 세션의 조각은 화면 대신 복원 버퍼로 간다.
+        {
+            let mut loading = loading.lock().await;
+            if let Some(chunks) = loading.get_mut(&session_id) {
+                if let Some(update) = params.get("update") {
+                    record_history_chunk(chunks, update);
+                }
+                return;
+            }
+        }
+        route_session_update(params, tools, streams, events).await;
         return;
     }
 
@@ -995,6 +1211,15 @@ async fn route_session_update(
                 "item/started",
                 json!({ "threadId": session_id, "item": item }),
             );
+            if let Some((method, params)) = streams
+                .lock()
+                .await
+                .entry(session_id.to_owned())
+                .or_default()
+                .subagent_started(session_id, update)
+            {
+                notify(events, &method, params);
+            }
         }
         Some("tool_call_update") => {
             let id = update
@@ -1012,6 +1237,15 @@ async fn route_session_update(
                         "item/completed",
                         json!({ "threadId": session_id, "item": tool_item(&merged, true) }),
                     );
+                    if let Some((method, params)) = streams
+                        .lock()
+                        .await
+                        .entry(session_id.to_owned())
+                        .or_default()
+                        .subagent_finished(session_id, id)
+                    {
+                        notify(events, &method, params);
+                    }
                 }
                 _ => {
                     tools.lock().await.insert(id.to_owned(), merged);
@@ -1441,6 +1675,73 @@ fn open_code_model_display_name(model: &str, display_name: &str) -> String {
     format!("{name} · {family}")
 }
 
+/// session/load 재생에서 온 본문 조각 하나를 누적한다. 같은 메시지의 조각은
+/// 한 항목으로 합치고, Devez Vibe가 주입한 규칙 블록은 사용자 글이 아니므로
+/// 버린다.
+fn record_history_chunk(chunks: &mut Vec<HistoryChunk>, update: &Value) {
+    let user = match update.get("sessionUpdate").and_then(Value::as_str) {
+        Some("user_message_chunk") => true,
+        Some("agent_message_chunk") => false,
+        _ => return,
+    };
+    let Some(text) = content_text(update.get("content")).filter(|text| !text.is_empty()) else {
+        return;
+    };
+    if user && text.trim_start().starts_with("<devez-vibe-rules>") {
+        return;
+    }
+    let message_id = update.get("messageId").and_then(Value::as_str);
+    if let Some(last) = chunks.last_mut()
+        && last.user == user
+        && (message_id.is_none() || last.message_id.as_deref() == message_id)
+    {
+        last.text.push_str(text);
+        return;
+    }
+    chunks.push(HistoryChunk {
+        user,
+        message_id: message_id.map(ToOwned::to_owned),
+        text: text.to_owned(),
+    });
+}
+
+/// 모은 조각을 load_history가 아는 turns 형태로 바꾼다. 사용자 메시지가 새
+/// 턴을 열고 나머지 항목은 그 턴에 붙는다.
+fn history_turns(session_id: &str, chunks: &[HistoryChunk]) -> Vec<Value> {
+    let mut turns: Vec<Value> = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let id = format!("{session_id}-history-{index}");
+        let item = if chunk.user {
+            json!({
+                "id": id,
+                "type": "userMessage",
+                "content": [{ "type": "text", "text": chunk.text }]
+            })
+        } else {
+            json!({
+                "id": id,
+                "type": "agentMessage",
+                "provider": "OpenCode",
+                "text": chunk.text
+            })
+        };
+        if chunk.user || turns.is_empty() {
+            turns.push(json!({
+                "id": format!("{session_id}-history-turn-{index}"),
+                "status": "completed",
+                "items": [item]
+            }));
+        } else if let Some(items) = turns
+            .last_mut()
+            .and_then(|turn| turn.get_mut("items"))
+            .and_then(Value::as_array_mut)
+        {
+            items.push(item);
+        }
+    }
+    turns
+}
+
 fn thread_response(session_id: &str, cwd: &Path, model: &str, effort: &str) -> Value {
     json!({
         "id": session_id,
@@ -1736,6 +2037,517 @@ mod tests {
         let same = streams.message_chunk("s", Some("m2"), " 계속");
         assert_eq!(same.len(), 1);
         assert_eq!(same[0].0, "item/agentMessage/delta");
+    }
+
+    #[test]
+    fn task_tool_calls_become_subagent_rows() {
+        let mut streams = SessionStreams::default();
+        let update = json!({
+            "toolCallId": "call_1",
+            "title": "task",
+            "kind": "other",
+            "rawInput": { "subagent_type": "explore", "description": "코드 조사" }
+        });
+
+        let started = streams
+            .subagent_started("s", &update)
+            .expect("task 도구는 하위 에이전트 행이 된다");
+        assert_eq!(started.0, "turn/subagents/updated");
+        assert_eq!(
+            started.1.pointer("/subagents/0/id").and_then(Value::as_str),
+            Some("call_1")
+        );
+        assert_eq!(
+            started
+                .1
+                .pointer("/subagents/0/name")
+                .and_then(Value::as_str),
+            Some("explore")
+        );
+        assert_eq!(
+            started
+                .1
+                .pointer("/subagents/0/description")
+                .and_then(Value::as_str),
+            Some("코드 조사")
+        );
+
+        // 같은 id가 다시 시작돼도 행이 늘지 않는다.
+        let repeated = streams
+            .subagent_started("s", &update)
+            .expect("갱신도 행 하나로 남는다");
+        assert_eq!(
+            repeated
+                .1
+                .pointer("/subagents")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let finished = streams
+            .subagent_finished("s", "call_1")
+            .expect("완료는 행을 지운다");
+        assert_eq!(
+            finished
+                .1
+                .pointer("/subagents")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        // 이미 지운 id는 알림을 다시 만들지 않는다.
+        assert!(streams.subagent_finished("s", "call_1").is_none());
+    }
+
+    #[test]
+    fn ordinary_tools_never_become_subagent_rows() {
+        assert!(
+            subagent_entry(&json!({
+                "toolCallId": "call_2",
+                "title": "grep",
+                "rawInput": { "pattern": "fn main" }
+            }))
+            .is_none()
+        );
+        // 제목이 task이면 subagent_type이 없어도 하위 에이전트로 본다.
+        assert!(
+            subagent_entry(&json!({
+                "toolCallId": "call_3",
+                "title": "Task",
+                "rawInput": {}
+            }))
+            .is_some()
+        );
+        // id가 없으면 행을 만들 수 없다.
+        assert!(
+            subagent_entry(&json!({
+                "title": "task",
+                "rawInput": { "subagent_type": "explore" }
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn turn_end_clears_remaining_subagent_rows() {
+        let mut streams = SessionStreams::default();
+        streams.subagent_started(
+            "s",
+            &json!({
+                "toolCallId": "call_1",
+                "title": "task",
+                "rawInput": { "subagent_type": "developer", "description": "구현" }
+            }),
+        );
+
+        let cleared = streams
+            .subagents_cleared("s")
+            .expect("턴이 끝나면 남은 행을 거둔다");
+        assert_eq!(
+            cleared
+                .1
+                .pointer("/subagents")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        // 비어 있으면 알림을 반복하지 않는다.
+        assert!(streams.subagents_cleared("s").is_none());
+    }
+
+    #[test]
+    fn replayed_history_becomes_turns_without_injected_rules() {
+        let mut chunks = Vec::new();
+        record_history_chunk(
+            &mut chunks,
+            &json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": {
+                    "type": "text",
+                    "text": "<devez-vibe-rules>\n규칙\n</devez-vibe-rules>"
+                }
+            }),
+        );
+        record_history_chunk(
+            &mut chunks,
+            &json!({
+                "sessionUpdate": "user_message_chunk",
+                "content": { "type": "text", "text": "질문" }
+            }),
+        );
+        record_history_chunk(
+            &mut chunks,
+            &json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "답" }
+            }),
+        );
+        record_history_chunk(
+            &mut chunks,
+            &json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": "변" }
+            }),
+        );
+        record_history_chunk(
+            &mut chunks,
+            &json!({
+                "sessionUpdate": "tool_call",
+                "content": { "type": "text", "text": "무시" }
+            }),
+        );
+
+        let turns = history_turns("ses_1", &chunks);
+        assert_eq!(turns.len(), 1);
+        let items = turns[0]
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("턴에는 항목이 있다");
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0].get("type").and_then(Value::as_str),
+            Some("userMessage")
+        );
+        assert_eq!(
+            items[0].pointer("/content/0/text").and_then(Value::as_str),
+            Some("질문")
+        );
+        assert_eq!(
+            items[1].get("type").and_then(Value::as_str),
+            Some("agentMessage")
+        );
+        assert_eq!(items[1].get("text").and_then(Value::as_str), Some("답변"));
+    }
+
+    #[tokio::test]
+    async fn steer_joins_the_running_turn_and_completes_once() {
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Value>();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+        let client = OpenCodeClient {
+            outbound: Arc::new(StdMutex::new(Some(outbound_tx))),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            detached: Arc::new(Mutex::new(HashMap::new())),
+            active_turns: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+            next_turn: Arc::new(AtomicU64::new(1)),
+            events: event_tx.clone(),
+        };
+        let tools: ToolMap = Arc::new(Mutex::new(HashMap::new()));
+        let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
+        let loading: LoadingMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let first = client
+            .start_prompt("ses_1", vec![json!({ "type": "text", "text": "질문" })], false)
+            .await
+            .expect("첫 prompt");
+        let steered = client
+            .start_prompt(
+                "ses_1",
+                vec![json!({ "type": "text", "text": "추가 지시" })],
+                true,
+            )
+            .await
+            .expect("추가 지시 prompt");
+        // 추가 지시는 새 턴을 만들지 않고 같은 턴에 합류한다.
+        assert_eq!(first, steered);
+
+        let first_request = outbound_rx.recv().await.expect("첫 요청");
+        let second_request = outbound_rx.recv().await.expect("둘째 요청");
+        let first_id = first_request.get("id").and_then(Value::as_u64).expect("id");
+        let second_id = second_request
+            .get("id")
+            .and_then(Value::as_u64)
+            .expect("id");
+
+        // turn/started는 첫 prompt에서 한 번만 나온다.
+        let started = event_rx.recv().await.expect("turn/started");
+        assert!(matches!(
+            &started,
+            ServerEvent::Notification { method, .. } if method == "turn/started"
+        ));
+        assert!(event_rx.try_recv().is_err());
+
+        // 첫 prompt가 끝나도 추가 지시가 남아 있으면 턴은 끝나지 않는다.
+        route_message(
+            json!({ "jsonrpc": "2.0", "id": first_id, "result": {} }),
+            &client.pending,
+            &client.detached,
+            &client.active_turns,
+            &loading,
+            &tools,
+            &streams,
+            &event_tx,
+        )
+        .await;
+        assert!(event_rx.try_recv().is_err());
+
+        // 마지막 응답에서만 turn/completed가 한 번 나온다.
+        route_message(
+            json!({ "jsonrpc": "2.0", "id": second_id, "result": {} }),
+            &client.pending,
+            &client.detached,
+            &client.active_turns,
+            &loading,
+            &tools,
+            &streams,
+            &event_tx,
+        )
+        .await;
+        let completed = event_rx.recv().await.expect("turn/completed");
+        match completed {
+            ServerEvent::Notification { method, params } => {
+                assert_eq!(method, "turn/completed");
+                assert_eq!(
+                    params.pointer("/turn/id").and_then(Value::as_str),
+                    Some(first.as_str())
+                );
+            }
+            _ => panic!("turn/completed 알림이어야 한다"),
+        }
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    fn drain_notifications(rx: &mut mpsc::UnboundedReceiver<ServerEvent>) -> Vec<(String, Value)> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ServerEvent::Notification { method, params } = event {
+                out.push((method, params));
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn subagent_rows_follow_tool_completion_and_turn_end() {
+        let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Value>();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+        let client = OpenCodeClient {
+            outbound: Arc::new(StdMutex::new(Some(outbound_tx))),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            detached: Arc::new(Mutex::new(HashMap::new())),
+            active_turns: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+            next_turn: Arc::new(AtomicU64::new(1)),
+            events: event_tx.clone(),
+        };
+        let tools: ToolMap = Arc::new(Mutex::new(HashMap::new()));
+        let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
+        let loading: LoadingMap = Arc::new(Mutex::new(HashMap::new()));
+        let route = |message: Value| {
+            route_message(
+                message,
+                &client.pending,
+                &client.detached,
+                &client.active_turns,
+                &loading,
+                &tools,
+                &streams,
+                &event_tx,
+            )
+        };
+
+        let turn = client
+            .start_prompt("ses_1", vec![json!({ "type": "text", "text": "작업" })], false)
+            .await
+            .expect("prompt");
+        let request_id = outbound_rx
+            .recv()
+            .await
+            .and_then(|request| request.get("id").and_then(Value::as_u64))
+            .expect("prompt 요청 id");
+        drain_notifications(&mut event_rx);
+
+        // 첫 task 도구: 시작하면 행이 생기고, 완료 신호가 오면 행이 사라진다.
+        route(json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "ses_1",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "task_1",
+                    "title": "task",
+                    "kind": "other",
+                    "status": "pending",
+                    "rawInput": { "subagent_type": "developer", "description": "구현" }
+                }
+            }
+        }))
+        .await;
+        let started = drain_notifications(&mut event_rx);
+        let rows = started
+            .iter()
+            .find(|(method, _)| method == "turn/subagents/updated")
+            .expect("시작 시 하위 에이전트 행 알림");
+        assert_eq!(
+            rows.1
+                .pointer("/subagents")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+
+        route(json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "ses_1",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "task_1",
+                    "status": "completed",
+                    "rawOutput": { "output": "끝" }
+                }
+            }
+        }))
+        .await;
+        let finished = drain_notifications(&mut event_rx);
+        let rows = finished
+            .iter()
+            .find(|(method, _)| method == "turn/subagents/updated")
+            .expect("완료 시 행 제거 알림");
+        assert_eq!(
+            rows.1
+                .pointer("/subagents")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+
+        // 둘째 task는 완료 신호를 놓친다. 턴이 끝나면 행을 거둔 뒤에
+        // turn/completed가 나와야 화면에 도는 행이 남지 않는다.
+        route(json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "ses_1",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "task_2",
+                    "title": "task",
+                    "kind": "other",
+                    "status": "pending",
+                    "rawInput": { "subagent_type": "qa-tester", "description": "검증" }
+                }
+            }
+        }))
+        .await;
+        drain_notifications(&mut event_rx);
+        route(json!({ "jsonrpc": "2.0", "id": request_id, "result": {} })).await;
+        let ended = drain_notifications(&mut event_rx);
+        let cleared_index = ended
+            .iter()
+            .position(|(method, params)| {
+                method == "turn/subagents/updated"
+                    && params
+                        .pointer("/subagents")
+                        .and_then(Value::as_array)
+                        .is_some_and(Vec::is_empty)
+            })
+            .expect("턴 종료가 남은 행을 거둔다");
+        let completed_index = ended
+            .iter()
+            .position(|(method, params)| {
+                method == "turn/completed"
+                    && params.pointer("/turn/id").and_then(Value::as_str) == Some(turn.as_str())
+            })
+            .expect("턴 종료 알림");
+        assert!(cleared_index < completed_index);
+    }
+
+    #[tokio::test]
+    async fn a_failed_task_tool_also_removes_its_subagent_row() {
+        let tools: ToolMap = Arc::new(Mutex::new(HashMap::new()));
+        let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+
+        route_session_update(
+            json!({
+                "sessionId": "ses_1",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "task_1",
+                    "title": "task",
+                    "status": "pending",
+                    "rawInput": { "subagent_type": "developer", "description": "구현" }
+                }
+            }),
+            &tools,
+            &streams,
+            &event_tx,
+        )
+        .await;
+        drain_notifications(&mut event_rx);
+
+        route_session_update(
+            json!({
+                "sessionId": "ses_1",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "task_1",
+                    "status": "failed",
+                    "rawOutput": { "error": "실패" }
+                }
+            }),
+            &tools,
+            &streams,
+            &event_tx,
+        )
+        .await;
+        let events = drain_notifications(&mut event_rx);
+        let rows = events
+            .iter()
+            .find(|(method, _)| method == "turn/subagents/updated")
+            .expect("실패도 행을 제거한다");
+        assert_eq!(
+            rows.1
+                .pointer("/subagents")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn session_updates_during_load_fill_the_history_buffer() {
+        let tools: ToolMap = Arc::new(Mutex::new(HashMap::new()));
+        let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
+        let loading: LoadingMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let detached: DetachedMap = Arc::new(Mutex::new(HashMap::new()));
+        let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+        loading.lock().await.insert("ses_1".to_owned(), Vec::new());
+
+        route_message(
+            json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "ses_1",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": { "type": "text", "text": "복원된 답변" }
+                    }
+                }
+            }),
+            &pending,
+            &detached,
+            &active,
+            &loading,
+            &tools,
+            &streams,
+            &event_tx,
+        )
+        .await;
+
+        // 재생 조각은 화면 알림 대신 복원 버퍼로 간다.
+        assert!(event_rx.try_recv().is_err());
+        let buffered = loading.lock().await.remove("ses_1").expect("버퍼");
+        assert_eq!(buffered.len(), 1);
+        assert!(!buffered[0].user);
+        assert_eq!(buffered[0].text, "복원된 답변");
     }
 
     #[test]

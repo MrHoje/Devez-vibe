@@ -450,10 +450,22 @@ impl BackendServer {
                 if self.route_kind(thread_id(&params)?) == RuntimeKind::OpenCode =>
             {
                 let visible = self.canonical_visible(thread_id(&params)?);
-                Ok(load_provider_handoff(&visible)
+                if let Some(page) = load_provider_handoff(&visible)
                     .as_ref()
                     .map(provider_handoff_history_page)
-                    .unwrap_or_else(|| json!({ "data": [], "nextCursor": null })))
+                {
+                    return Ok(page);
+                }
+                // 사이드카가 없으면 session/load가 재생해 준 내역으로 채운다.
+                // opencode CLI에서 만든 세션도 이 경로로 복원된다.
+                let backing = self
+                    .backing_id(&visible, RuntimeKind::OpenCode)
+                    .unwrap_or_else(|_| visible.clone());
+                let page = match self.open_code() {
+                    Ok(open_code) => open_code.history_page(&backing).await,
+                    Err(_) => None,
+                };
+                Ok(page.unwrap_or_else(|| json!({ "data": [], "nextCursor": null })))
             }
             "thread/turns/list" if self.route_kind(thread_id(&params)?) == RuntimeKind::Claude => {
                 let visible = self.canonical_visible(thread_id(&params)?);
@@ -562,7 +574,12 @@ impl BackendServer {
                             .unwrap_or_default();
                         let turn = self
                             .open_code()?
-                            .start_prompt_content(&backing, input, turn_context.as_deref())
+                            .start_prompt_content(
+                                &backing,
+                                input,
+                                turn_context.as_deref(),
+                                method == "turn/steer",
+                            )
                             .await?;
                         Ok(json!({ "turn": { "id": turn } }))
                     } else {

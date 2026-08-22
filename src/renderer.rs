@@ -7176,6 +7176,97 @@ fn plan_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     lines
 }
 
+/// Setting changes and system notes share one card: a `◆` heading, `↳` detail
+/// rows, and the plan panel's box drawn to the widest row instead of the full
+/// terminal width.
+fn notice_card_lines(block: &Block, width: u16) -> Vec<PaintLine> {
+    let title = block.title.trim_start_matches("✓ ").trim_start();
+    // Two walls plus the reserved final column bound how wide a row may wrap.
+    let wrap_width = ((width as usize).saturating_sub(4).max(9)) as u16;
+    let mut content = wrapped_line("◆ ", Tone::Muted, title, Tone::Plain, true, wrap_width);
+    for row in block.body.lines() {
+        let detail = row.trim_start().trim_start_matches("↳ ").trim_end();
+        if detail.is_empty() {
+            continue;
+        }
+        if matches!(block.kind, BlockKind::ModelChange)
+            && let Some(line) = coloured_notice_detail(detail, wrap_width)
+        {
+            content.push(line);
+            continue;
+        }
+        content.extend(wrapped_line(
+            "  ↳ ",
+            Tone::Muted,
+            detail,
+            Tone::Plain,
+            false,
+            wrap_width,
+        ));
+    }
+    let inner = content.iter().map(painted_line_width).max().unwrap_or(0);
+    let mut lines = Vec::with_capacity(content.len() + 3);
+    lines.push(PaintLine {
+        tone: PLAN_BORDER_TONE,
+        ..PaintLine::plain(format!("┌{}┐", "─".repeat(inner + 2)))
+    });
+    // Like the plan panel, only the corner rules frame the card; the rows
+    // between them stay wall-free and simply sit inside the corners.
+    for mut row in content {
+        row.prefix = format!("  {}", row.prefix);
+        lines.push(row);
+    }
+    lines.push(PaintLine {
+        tone: PLAN_BORDER_TONE,
+        ..PaintLine::plain(format!("└{}┘", "─".repeat(inner + 2)))
+    });
+    lines.push(PaintLine::blank());
+    lines
+}
+
+/// A setting detail such as `GPT-5.6 Sol · high` names a model and an effort:
+/// the model wears the accent colour and the effort its own tier colour. Rows
+/// too wide to stay on one line fall back to the plain wrapped form.
+fn coloured_notice_detail(detail: &str, wrap_width: u16) -> Option<PaintLine> {
+    if UnicodeWidthStr::width(detail) + 5 > wrap_width as usize {
+        return None;
+    }
+    let tail = match detail.rsplit_once(" · ") {
+        Some((lead, effort)) => vec![
+            PaintSpan {
+                text: lead.to_owned(),
+                tone: Tone::Accent,
+                bold: false,
+            },
+            PaintSpan {
+                text: " · ".to_owned(),
+                tone: Tone::Muted,
+                bold: false,
+            },
+            PaintSpan {
+                text: effort.to_owned(),
+                tone: effort_tone(effort).unwrap_or(Tone::Accent),
+                bold: false,
+            },
+        ],
+        None => vec![PaintSpan {
+            text: detail.to_owned(),
+            tone: Tone::Accent,
+            bold: false,
+        }],
+    };
+    Some(PaintLine {
+        prefix: "  ↳ ".to_owned(),
+        prefix_tone: Tone::Muted,
+        text: String::new(),
+        tone: Tone::Plain,
+        bold: false,
+        tool_heading: None,
+        pick: None,
+        tail,
+    })
+}
+
 /// The key that folds the plan panel, on every runtime. Shift+Tab belongs to
 /// Claude's permission modes, and a Korean IME eats Shift+Space, so the panel
 /// names the one key that always works. Alt+P is reserved for the side panel.
@@ -8081,42 +8172,17 @@ fn block_lines_with_mode_at(
             DiffDisplayMode::Expand => file_change_expanded_lines(block, width),
         };
     }
-    if matches!(block.kind, BlockKind::ModelChange) {
-        let mut lines = vec![PaintLine {
-            prefix: "  ".to_owned(),
-            prefix_tone: Tone::ModelChange,
-            text: block.title.clone(),
-            tone: Tone::ModelChange,
-            bold: true,
-            tool_heading: None,
-            pick: None,
-            tail: Vec::new(),
-        }];
-        // A title that says everything (Fast mode On) carries no detail line, so
-        // an empty body drops the row instead of painting a hole under it.
-        if !block.body.is_empty() {
-            lines.push(PaintLine {
-                prefix: "    ".to_owned(),
-                prefix_tone: Tone::ModelChange,
-                text: block.body.clone(),
-                tone: Tone::ModelChange,
-                bold: false,
-                tool_heading: None,
-                pick: None,
-                tail: Vec::new(),
-            });
-        }
-        lines.push(PaintLine::blank());
-        return lines;
-    }
     if is_context_compaction_block(block) {
         let mut lines = wrapped_line("● ", Tone::Accent, &block.title, Tone::Accent, true, width);
         lines.push(PaintLine::blank());
         return lines;
     }
+    if matches!(block.kind, BlockKind::ModelChange | BlockKind::System) {
+        return notice_card_lines(block, width);
+    }
 
     let (marker, tone) = match block.kind {
-        BlockKind::Welcome | BlockKind::Update | BlockKind::ModelChange => {
+        BlockKind::Welcome | BlockKind::Update | BlockKind::ModelChange | BlockKind::System => {
             unreachable!("handled above")
         }
         BlockKind::User => unreachable!("user blocks are rendered separately"),
@@ -8130,7 +8196,6 @@ fn block_lines_with_mode_at(
         BlockKind::Assistant => (RESPONSE_BULLET_PREFIX, Tone::FastOff),
         BlockKind::Warning => ("▲ ", Tone::Warning),
         BlockKind::Error => ("✕ ", Tone::Error),
-        BlockKind::System => ("◆ ", Tone::Muted),
     };
 
     let conversational = matches!(block.kind, BlockKind::Assistant);
@@ -12198,7 +12263,7 @@ mod tests {
             .into_iter()
             .find(|line| line.prefix == "- ")
             .expect("plan bullet");
-        let list = block_lines(&Block::new(BlockKind::System, "Notice", "- first"), 80)
+        let list = block_lines(&Block::new(BlockKind::Warning, "Notice", "- first"), 80)
             .into_iter()
             .find(|line| line.prefix == "  - ")
             .expect("list bullet");
@@ -12950,19 +13015,59 @@ mod tests {
     }
 
     #[test]
-    fn model_change_uses_a_background_card_and_indented_turn_marker() {
+    fn setting_and_system_notices_share_a_content_fit_card() {
         let block = Block::new(
             BlockKind::ModelChange,
-            "Model changed",
+            "✓ Model changed",
             "↳ GPT-5.6 Terra · xhigh",
         );
         let lines = block_lines(&block, 80);
 
-        assert_eq!(lines.len(), 3);
-        assert!(lines[..2].iter().all(|line| line.tone == Tone::ModelChange));
-        assert_eq!(lines[1].prefix, "    ");
-        assert!(lines[1].text.starts_with('↳'));
-        assert!(lines[2].text.is_empty());
+        assert_eq!(lines.len(), 5);
+        assert!(painted(&lines[0]).starts_with('┌'));
+        assert!(painted(&lines[0]).ends_with('┐'));
+        assert!(painted(&lines[1]).contains("◆ Model changed"));
+        assert!(painted(&lines[2]).contains("↳ GPT-5.6 Terra · xhigh"));
+        assert!(painted(&lines[3]).starts_with('└'));
+        let card_width = painted_width(&lines[0]);
+        assert!(card_width < 40);
+        assert_eq!(painted_width(&lines[3]), card_width);
+        assert!(
+            lines[1..3]
+                .iter()
+                .all(|line| painted_width(line) < card_width && !painted(line).contains('│'))
+        );
+        assert!(lines[4].text.is_empty());
+    }
+
+    #[test]
+    fn model_change_detail_colours_model_and_effort() {
+        let block = Block::new(
+            BlockKind::ModelChange,
+            "✓ Model changed",
+            "↳ GPT-5.6 Terra · high",
+        );
+        let lines = block_lines(&block, 80);
+
+        let detail = &lines[2];
+        assert_eq!(detail.tail.len(), 3);
+        assert_eq!(detail.tail[0].tone, Tone::Accent);
+        assert_eq!(detail.tail[2].tone, Tone::EffortHigh);
+    }
+
+    #[test]
+    fn system_notices_use_the_same_card_with_a_detail_row() {
+        let block = Block::new(
+            BlockKind::System,
+            "Provider",
+            "현재 Codex provider를 사용 중입니다.",
+        );
+        let lines = block_lines(&block, 80);
+
+        assert!(painted(&lines[0]).starts_with('┌'));
+        assert!(painted(&lines[1]).contains("◆ Provider"));
+        assert!(painted(&lines[2]).contains("↳ 현재 Codex provider를 사용 중입니다."));
+        assert_eq!(painted_width(&lines[0]), painted_width(&lines[2]) + 2);
     }
 
     #[test]

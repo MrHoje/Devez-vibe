@@ -3159,6 +3159,8 @@ async fn activate_open_code(server: &mut BackendServer, state: &mut AppState) {
             Ok(response) => {
                 state.replace_models(parse_models(&response));
                 state.switch_to_open_code();
+                // 전환 직후 헤더가 이전 런타임의 계정·플랜을 들고 있지 않게 한다.
+                refresh_account(server, state).await;
             }
             Err(error) => state.push_notice(
                 BlockKind::Error,
@@ -5230,10 +5232,17 @@ async fn turn_is_running(server: &BackendServer, thread_id: &str, turn_id: &str)
 }
 
 async fn refresh_account(server: &BackendServer, state: &mut AppState) {
+    let model = state.selected_model_name().to_owned();
+    // OpenCode 계정은 opencode CLI가 관리한다. Codex의 account/read를 빌려
+    // ChatGPT 이메일을 보여 주지 않는다.
+    if open_code::is_open_code_model(&model) {
+        state.set_account("OpenCode CLI".to_owned());
+        state.set_account_plan(AccountPlan::default());
+        return;
+    }
     if let Ok(label) = ensure_account(server).await {
         state.set_account(label);
     }
-    let model = state.selected_model_name().to_owned();
     state.set_account_plan(read_runtime_account_plan(server, &model).await);
 }
 
@@ -5248,7 +5257,7 @@ async fn read_account_plan(server: &BackendServer) -> AccountPlan {
 }
 
 async fn read_runtime_account_plan(server: &BackendServer, model: &str) -> AccountPlan {
-    if claude::is_claude_model(model) {
+    if claude::is_claude_model(model) || open_code::is_open_code_model(model) {
         AccountPlan::default()
     } else {
         read_account_plan(server).await

@@ -3458,6 +3458,12 @@ struct SubagentLogLine {
 /// oldest lines are dropped rather than held for the rest of the session.
 const SUBAGENT_LOG_LIMIT: usize = 400;
 
+/// 턴이 끝난 뒤 하위 에이전트 행이 아무 갱신 없이 버틸 수 있는 시간. 브리지가
+/// 하위 에이전트가 살아 있는 동안 5초마다 목록을 다시 알려 주므로, 이 유예에
+/// 걸리는 행은 생존 신호를 세 번 연속 놓친 것뿐이다. 살아 있는 행은 로그와
+/// 목록 갱신이 유예를 계속 미뤄서 여기 걸리지 않는다.
+const SUBAGENT_LINGER_GRACE: Duration = Duration::from_secs(15);
+
 #[derive(Clone)]
 struct ProviderIntegrationSnapshot {
     mcp_expanded: bool,
@@ -3572,6 +3578,9 @@ pub struct AppState {
     plan_turn_id: Option<String>,
     plan_shimmer_started_at: Option<Instant>,
     subagents: Vec<RunningSubagent>,
+    /// 턴이 끝났는데 하위 에이전트 행이 남아 있으면 그 시각. 유예가 지나도록
+    /// 갱신이 없으면 종료 알림을 놓친 것으로 보고 행을 거둔다.
+    subagents_settled_at: Option<Instant>,
     /// Recorded subagent work, keyed by the parent tool-use id. Kept for the rest
     /// of the turn so a panel opened on a finished subagent still has something
     /// to show.
@@ -3811,6 +3820,7 @@ impl AppState {
             plan_turn_id: None,
             plan_shimmer_started_at: None,
             subagents: Vec::new(),
+            subagents_settled_at: None,
             subagent_logs: HashMap::new(),
             command_selection: 0,
             spinner_frame: 0,
@@ -4171,20 +4181,16 @@ impl AppState {
         }
     }
 
-    /// One `/provider` step states both facts independently: whether this
-    /// runtime may connect and whether this session currently uses it.
-    fn runtime_step_label(&self, index: usize) -> String {
+    /// A `/provider` row only reports whether that runtime can be used. The
+    /// selected row already identifies the pending choice, so repeating the
+    /// current session as "사용 중/미사용" only adds noise.
+    fn runtime_row_label(&self, index: usize) -> String {
         let connection = if self.runtime_connected(index) {
             "연결됨"
         } else {
             "연결 안 됨"
         };
-        let usage = if index == self.runtime_choice_index() {
-            "사용 중"
-        } else {
-            "미사용"
-        };
-        format!("{} · {connection} · {usage}", RUNTIME_CHOICES[index])
+        format!("{} · {connection}", RUNTIME_CHOICES[index])
     }
 
     fn switch_provider(&mut self, provider: ModelProvider) {
@@ -4238,14 +4244,16 @@ impl AppState {
     /// three-second metadata tick, which reads them for the new provider anyway.
     fn refresh_usage_for_selected_provider(&mut self) {
         let (five_hour_percent, weekly_percent, five_hour_reset_at) =
-            if self.selected_provider() == ModelProvider::Claude {
-                (
+            match self.selected_provider() {
+                ModelProvider::Claude => (
                     self.account_plan.five_hour_percent,
                     self.account_plan.weekly_percent,
                     self.account_plan.five_hour_reset_at,
-                )
-            } else {
-                read_codex_usage()
+                ),
+                // OpenCode는 사용량 정보를 주지 않는다. Codex 수치를 빌려
+                // 보여 주는 대신 비워 둔다.
+                ModelProvider::OpenCode => (None, None, None),
+                _ => read_codex_usage(),
             };
         self.five_hour_percent = five_hour_percent;
         self.weekly_percent = weekly_percent;
@@ -6185,6 +6193,32 @@ impl AppState {
         self.render_tick().redraw
     }
 
+    /// 턴이 끝난 뒤 유예가 지나도록 갱신이 없는 하위 에이전트 행을 거둔다.
+    /// 걷어낸 것이 있으면 true.
+    fn sweep_settled_subagents(&mut self) -> bool {
+        let Some(settled) = self.subagents_settled_at else {
+            return false;
+        };
+        if self.busy {
+            self.subagents_settled_at = None;
+            return false;
+        }
+        if settled.elapsed() < SUBAGENT_LINGER_GRACE {
+            return false;
+        }
+        self.subagents_settled_at = None;
+        if self.subagents.is_empty() {
+            return false;
+        }
+        self.subagents.clear();
+        let mut retained = HashSet::new();
+        if let Some(PendingInteraction::SubagentTranscript { id, .. }) = &self.pending {
+            retained.insert(id.clone());
+        }
+        self.subagent_logs.retain(|id, _| retained.contains(id));
+        true
+    }
+
     pub fn render_tick(&mut self) -> TickResult {
         let mut full_redraw = false;
         // Windows Terminal owns the visible IME preedit until composition is
@@ -6206,6 +6240,9 @@ impl AppState {
                 running.painted_elapsed_secs = elapsed;
                 subagent_elapsed_changed = true;
             }
+        }
+        if self.sweep_settled_subagents() {
+            full_redraw = true;
         }
         let plan_shimmer_active = self.plan_shimmer_phase().is_some();
         if self.plan_shimmer_started_at.is_some() && !plan_shimmer_active {
@@ -6231,6 +6268,12 @@ impl AppState {
                     self.weekly_percent,
                     self.five_hour_reset_at,
                 )
+            } else if self
+                .selected_model()
+                .is_some_and(|model| model.model.starts_with("opencode:"))
+            {
+                // OpenCode에는 사용량 출처가 없어 Codex 파일을 읽지 않는다.
+                (None, None, None)
             } else {
                 read_codex_usage()
             };
@@ -7359,6 +7402,10 @@ impl AppState {
                 }
                 self.subagent_logs
                     .retain(|id, _| retained_logs.contains(id));
+                // 종료 알림을 놓친 하위 에이전트 행이 사용자가 지시할 때까지
+                // 남지 않게 유예를 건다. 살아 있는 백그라운드 에이전트는 로그
+                // 갱신이 유예를 계속 미뤄 준다.
+                self.subagents_settled_at = (!self.subagents.is_empty()).then(Instant::now);
                 if !self.turn_interrupted || self.last_completed_duration.is_none() {
                     self.last_completed_duration =
                         self.turn_started_at.map(|started| started.elapsed());
@@ -7501,6 +7548,10 @@ impl AppState {
                         })
                     })
                     .collect();
+                // 갱신이 온 순간부터 유예를 다시 센다. 턴이 도는 중에는 유예를
+                // 걸지 않고, 빈 목록이면 지울 것도 없다.
+                self.subagents_settled_at =
+                    (!self.busy && !self.subagents.is_empty()).then(Instant::now);
             }
             "turn/subagent/line" => {
                 if let Some(parent) = params.get("parentToolUseId").and_then(Value::as_str)
@@ -7525,6 +7576,10 @@ impl AppState {
                     });
                     if log.len() > SUBAGENT_LOG_LIMIT {
                         log.drain(..log.len() - SUBAGENT_LOG_LIMIT);
+                    }
+                    // 로그가 오는 동안은 살아 있는 것이므로 유예를 미룬다.
+                    if self.subagents_settled_at.is_some() {
+                        self.subagents_settled_at = Some(Instant::now());
                     }
                 }
             }
@@ -7796,6 +7851,41 @@ impl AppState {
     pub(crate) fn run_slash_command(&mut self, command: &str) -> Action {
         let parts = command.split_whitespace().collect::<Vec<_>>();
         let using_claude = self.selected_model_name().starts_with("claude:");
+        // OpenCode에는 아래 통합 기능이 없다. Claude나 Codex 런타임으로 잘못
+        // 전달해 다른 계정을 만지는 대신 여기서 안내하고 끝낸다.
+        if self.selected_model_name().starts_with("opencode:") {
+            let notice = match parts.first().copied().unwrap_or_default() {
+                "/mcp" => Some((
+                    "MCP",
+                    "OpenCode의 MCP 서버는 opencode 설정 파일에서 관리합니다. Devez Vibe 연동은 아직 지원하지 않습니다.",
+                )),
+                "/plugins" | "/reload-plugins" | "/reload-skills" => Some((
+                    "Plugins",
+                    "OpenCode provider는 플러그인 관리를 지원하지 않습니다.",
+                )),
+                "/skills" => Some((
+                    "Skills",
+                    "OpenCode provider는 스킬 관리를 지원하지 않습니다.",
+                )),
+                "/login" => Some((
+                    "OpenCode 로그인",
+                    "터미널에서 `opencode auth login`을 실행한 뒤 /connect로 다시 연결하세요.",
+                )),
+                "/logout" => Some((
+                    "OpenCode 로그아웃",
+                    "터미널에서 `opencode auth logout`을 실행하세요.",
+                )),
+                "/permissions" => Some((
+                    "Permissions",
+                    "OpenCode는 현재 Full Access 권한으로 실행됩니다.",
+                )),
+                _ => None,
+            };
+            if let Some((title, body)) = notice {
+                self.push_notice(BlockKind::System, title, body.to_owned());
+                return Action::None;
+            }
+        }
         match parts.first().copied().unwrap_or_default() {
             "/help" => {
                 let provider_help = if crate::open_code::PROVIDER_ENABLED {
@@ -8272,13 +8362,18 @@ impl AppState {
                         )
                     });
                 let connections = format!(
-                    "Claude {} · Codex {}",
+                    "Claude {} · Codex {} · OpenCode {}",
                     if self.claude_provider_enabled {
                         "연결됨"
                     } else {
                         "연결 안 함"
                     },
                     if self.codex_provider_enabled {
+                        "연결됨"
+                    } else {
+                        "연결 안 함"
+                    },
+                    if self.opencode_provider_connected {
                         "연결됨"
                     } else {
                         "연결 안 함"
@@ -8621,13 +8716,17 @@ impl AppState {
             PendingInteraction::RuntimePicker { mut selected } => {
                 match key.code {
                     KeyCode::Esc => return Action::None,
-                    KeyCode::Up | KeyCode::Left => selected = selected.saturating_sub(1),
+                    KeyCode::Up => selected = selected.saturating_sub(1),
                     KeyCode::Char('p') if ctrl => selected = selected.saturating_sub(1),
-                    KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
+                    KeyCode::Char('k') if !ctrl && !alt => selected = selected.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Tab => {
                         selected = (selected + 1).min(RUNTIME_CHOICES.len() - 1);
                     }
                     KeyCode::Char('n') if ctrl => {
                         selected = (selected + 1).min(RUNTIME_CHOICES.len() - 1);
+                    }
+                    KeyCode::Char('j') if !ctrl && !alt => {
+                        selected = (selected + 1).min(RUNTIME_CHOICES.len() - 1)
                     }
                     KeyCode::Char(' ') => {
                         self.pending = Some(PendingInteraction::RuntimePicker { selected });
@@ -9809,15 +9908,16 @@ impl AppState {
             PendingInteraction::RuntimePicker { selected } => Some(OverlayView {
                 closable: true,
                 title: "Provider".to_owned(),
-                lines: Vec::new(),
-                slider: Some(EffortSlider {
-                    efforts: (0..RUNTIME_CHOICES.len())
-                        .map(|index| self.runtime_step_label(index))
-                        .collect(),
-                    selected: *selected,
-                    detail: None,
-                }),
-                hint: "←→ 이동  ·  Enter 사용  ·  Space 연결 전환  ·  Esc 닫기".to_owned(),
+                lines: (0..RUNTIME_CHOICES.len())
+                    .map(|index| OverlayLine {
+                        text: format!("{}. {}", index + 1, self.runtime_row_label(index)),
+                        selected: index == *selected,
+                        muted: false,
+                    })
+                    .collect(),
+                slider: None,
+                hint: "1-3 선택  ·  ↑↓ 이동  ·  Enter 사용  ·  Space 연결 전환  ·  Esc 닫기"
+                    .to_owned(),
                 style: OverlayStyle::Picker,
                 input: None,
                 input_label: "",
@@ -11891,9 +11991,6 @@ impl AppState {
                     });
                     Action::Tick(false)
                 }
-            }
-            Some(PendingInteraction::RuntimePicker { .. }) if step < RUNTIME_CHOICES.len() => {
-                self.apply_runtime_choice(step)
             }
             Some(PendingInteraction::ProviderPicker(mut picker)) => {
                 match picker.select_step(step) {
@@ -16146,6 +16243,90 @@ mod tests {
         state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
 
         assert!(state.view().subagents.is_empty());
+    }
+
+    #[test]
+    fn a_lingering_subagent_row_is_swept_after_the_grace_period() {
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({
+                "subagents": [{ "id": "toolu_1", "name": "Explore", "description": "", "tool": "Grep" }],
+            }),
+        );
+        state.handle_notification(
+            "turn/subagent/line",
+            &json!({
+                "parentToolUseId": "toolu_1",
+                "line": { "kind": "text", "text": "조사 중" },
+            }),
+        );
+        state.handle_notification("turn/completed", &json!({}));
+
+        // 유예가 지나기 전에는 백그라운드 에이전트로 보고 남겨 둔다.
+        assert!(!state.sweep_settled_subagents());
+        assert_eq!(state.subagents.len(), 1);
+
+        // 유예가 지나도록 아무 갱신이 없으면 종료 알림을 놓친 것이다.
+        state.subagents_settled_at = Some(Instant::now() - SUBAGENT_LINGER_GRACE);
+        assert!(state.sweep_settled_subagents());
+        assert!(state.subagents.is_empty());
+        assert!(state.subagent_logs.is_empty());
+        assert!(state.subagents_settled_at.is_none());
+    }
+
+    #[test]
+    fn subagent_activity_defers_the_linger_sweep() {
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({
+                "subagents": [{ "id": "toolu_1", "name": "Explore", "description": "", "tool": "Grep" }],
+            }),
+        );
+        state.handle_notification("turn/completed", &json!({}));
+        state.subagents_settled_at = Some(Instant::now() - SUBAGENT_LINGER_GRACE);
+
+        // 로그 한 줄이 오면 아직 살아 있는 것이므로 유예를 다시 센다.
+        state.handle_notification(
+            "turn/subagent/line",
+            &json!({
+                "parentToolUseId": "toolu_1",
+                "line": { "kind": "text", "text": "아직 작업 중" },
+            }),
+        );
+        assert!(!state.sweep_settled_subagents());
+        assert_eq!(state.subagents.len(), 1);
+
+        // 목록 갱신도 유예를 다시 센다.
+        state.subagents_settled_at = Some(Instant::now() - SUBAGENT_LINGER_GRACE);
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({
+                "subagents": [{ "id": "toolu_1", "name": "Explore", "description": "", "tool": "Read" }],
+            }),
+        );
+        assert!(!state.sweep_settled_subagents());
+        assert_eq!(state.subagents.len(), 1);
+    }
+
+    #[test]
+    fn a_new_turn_cancels_the_linger_sweep() {
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({
+                "subagents": [{ "id": "toolu_1", "name": "Explore", "description": "", "tool": "Grep" }],
+            }),
+        );
+        state.handle_notification("turn/completed", &json!({}));
+        state.subagents_settled_at = Some(Instant::now() - SUBAGENT_LINGER_GRACE);
+
+        // 새 턴이 시작되면 목록은 그 턴의 알림이 관리하므로 유예를 버린다.
+        state.busy = true;
+        assert!(!state.sweep_settled_subagents());
+        assert!(state.subagents_settled_at.is_none());
+        assert_eq!(state.subagents.len(), 1);
     }
 
     #[test]
@@ -20812,28 +20993,26 @@ mod tests {
 
         state.run_slash_command("/provider");
         let overlay = state.overlay_view().expect("provider picker");
-        assert!(overlay.lines.is_empty());
-        let slider = overlay.slider.expect("provider steps");
+        assert!(overlay.slider.is_none());
         assert_eq!(
-            slider.efforts,
+            overlay
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
             [
-                "Claude · 연결됨 · 사용 중",
-                "Codex · 연결됨 · 미사용",
-                "OpenCode · 연결 안 됨 · 미사용"
+                "1. Claude · 연결됨",
+                "2. Codex · 연결됨",
+                "3. OpenCode · 연결 안 됨"
             ]
         );
-        assert_eq!(slider.selected, 0);
+        assert!(overlay.lines[0].selected);
+
+        state.handle_key(KeyEvent::from(KeyCode::Right));
+        assert!(state.overlay_view().expect("picker").lines[0].selected);
 
         state.handle_key(KeyEvent::from(KeyCode::Down));
-        assert_eq!(
-            state
-                .overlay_view()
-                .expect("picker")
-                .slider
-                .expect("provider steps")
-                .selected,
-            1
-        );
+        assert!(state.overlay_view().expect("picker").lines[1].selected);
 
         assert!(matches!(
             state.handle_key(KeyEvent::from(KeyCode::Enter)),
@@ -20850,16 +21029,8 @@ mod tests {
 
         state.switch_to_codex();
         state.run_slash_command("/provider");
-        assert_eq!(
-            state
-                .overlay_view()
-                .expect("picker")
-                .slider
-                .expect("provider steps")
-                .selected,
-            1
-        );
-        assert!(matches!(state.click_effort_step(0), Action::None));
+        assert!(state.overlay_view().expect("picker").lines[1].selected);
+        assert!(matches!(state.click_overlay_row(0), Action::None));
         assert_eq!(state.selected_model_name(), "claude:sonnet");
     }
 
@@ -20908,10 +21079,7 @@ mod tests {
             }
         ));
         let overlay = state.overlay_view().expect("picker stays open");
-        assert_eq!(
-            overlay.slider.expect("provider steps").efforts[1],
-            "Codex · 연결 안 됨 · 미사용"
-        );
+        assert_eq!(overlay.lines[1].text, "2. Codex · 연결 안 됨");
         state.pending = None;
 
         // The command reconnects rather than failing: choosing Codex is what
@@ -20947,11 +21115,15 @@ mod tests {
         assert!(state.provider_choice_pending);
         let overlay = state.overlay_view().expect("provider picker");
         assert_eq!(
-            overlay.slider.expect("provider steps").efforts,
+            overlay
+                .lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
             [
-                "Claude · 연결 안 됨 · 사용 중",
-                "Codex · 연결 안 됨 · 미사용",
-                "OpenCode · 연결 안 됨 · 미사용"
+                "1. Claude · 연결 안 됨",
+                "2. Codex · 연결 안 됨",
+                "3. OpenCode · 연결 안 됨"
             ]
         );
         state.pending = None;
@@ -21053,15 +21225,10 @@ mod tests {
         state.opencode_provider_connected = true;
 
         state.run_slash_command("/provider");
-        let steps = state
-            .overlay_view()
-            .expect("provider picker")
-            .slider
-            .expect("provider steps")
-            .efforts;
-        assert_eq!(steps[2], "OpenCode · 연결됨 · 미사용");
+        let overlay = state.overlay_view().expect("provider picker");
+        assert_eq!(overlay.lines[2].text, "3. OpenCode · 연결됨");
         assert!(matches!(
-            state.click_effort_step(2),
+            state.click_overlay_row(2),
             Action::ActivateOpenCode
         ));
     }

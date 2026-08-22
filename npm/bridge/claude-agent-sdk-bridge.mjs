@@ -1748,6 +1748,15 @@ function firstLine(value, limit) {
 }
 
 function emitSubagents(session) {
+  // 하위 에이전트가 도는 동안 주기적으로 목록을 다시 알린다. 화면이 이
+  // 생존 신호로 살아 있는 행과 종료 신호를 놓친 행을 구분한다.
+  if (session.subagents.size && !session.subagentPulse) {
+    session.subagentPulse = setInterval(() => emitSubagents(session), 5000);
+    session.subagentPulse.unref?.();
+  } else if (!session.subagents.size && session.subagentPulse) {
+    clearInterval(session.subagentPulse);
+    session.subagentPulse = null;
+  }
   notify("turn/subagents/updated", {
     threadId: session.id,
     turnId: session.turn?.id,
