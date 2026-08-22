@@ -4069,7 +4069,9 @@ impl AppState {
     }
 
     pub fn any_provider_connected(&self) -> bool {
-        self.claude_provider_enabled || self.codex_provider_enabled
+        self.claude_provider_enabled
+            || self.codex_provider_enabled
+            || self.opencode_provider_connected
     }
 
     pub fn open_runtime_picker(&mut self) {
@@ -4102,6 +4104,9 @@ impl AppState {
     fn apply_runtime_choice(&mut self, index: usize) -> Action {
         if index == 2 {
             return if self.opencode_loaded() {
+                // OpenCode를 고른 것도 선택이므로 대기를 푼다. 풀지 않으면
+                // 이후 모든 Enter가 선택 창을 다시 연다.
+                self.provider_choice_pending = false;
                 self.activate_first_opencode_model();
                 Action::None
             } else {
@@ -4266,6 +4271,10 @@ impl AppState {
     }
 
     pub fn switch_to_open_code(&mut self) {
+        // ACP가 실제로 떠서 모델 목록까지 받은 뒤에 불리므로 연결로 기록하고,
+        // 제공자 선택 대기도 여기서 푼다.
+        self.opencode_provider_connected = true;
+        self.provider_choice_pending = false;
         self.switch_provider(ModelProvider::OpenCode);
     }
 
@@ -21217,6 +21226,37 @@ mod tests {
         state.claude_provider_enabled = true;
         state.codex_provider_enabled = true;
         state
+    }
+
+    #[test]
+    fn choosing_opencode_clears_the_pending_provider_choice() {
+        let models = vec![
+            test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
+            test_model("opencode:anthropic/claude-sonnet", "Claude Sonnet", false),
+        ];
+        let mut state = AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            models,
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+        state.claude_provider_enabled = false;
+        state.codex_provider_enabled = false;
+        state.provider_choice_pending = true;
+
+        // 모델이 이미 로드된 상태에서 OpenCode 행에 Enter.
+        state.apply_runtime_choice(2);
+        assert!(!state.provider_choice_pending);
+
+        // 활성화 경로(ACP 기동 후 전환)도 대기를 풀고 연결로 기록한다.
+        state.provider_choice_pending = true;
+        state.opencode_provider_connected = false;
+        state.switch_to_open_code();
+        assert!(!state.provider_choice_pending);
+        assert!(state.opencode_provider_connected);
+        assert!(state.any_provider_connected());
     }
 
     #[test]
