@@ -129,7 +129,7 @@ impl AppServer {
         apply_originator_override(&mut command);
         apply_mcp_2026_protocol_override(&mut command);
         apply_devezcode_room_override(&mut command, devezcode_room);
-        isolate_ctrl_c(&mut command);
+        crate::child_process::isolate_backend(&mut command);
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -498,16 +498,6 @@ const MCP_2026_FEATURE_KEY: &str = "mcp_2026_07_28";
 const MCP_2026_PROTOCOL_OVERRIDE: &str = "features.mcp_2026_07_28=true";
 const UNSTABLE_WARNING_KEY: &str = "suppress_unstable_features_warning";
 const UNSTABLE_WARNING_OVERRIDE: &str = "suppress_unstable_features_warning=true";
-
-#[cfg(windows)]
-fn isolate_ctrl_c(command: &mut Command) {
-    // Keep Ctrl+C in the terminal UI. Without a separate process group, a
-    // fallback `cmd.exe /c codex.cmd` receives it and prints its Y/N prompt.
-    command.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP
-}
-
-#[cfg(not(windows))]
-fn isolate_ctrl_c(_: &mut Command) {}
 
 /// Finds the platform binary the `@openai/codex` npm package vendors, mirroring the
 /// lookup `bin/codex.js` performs. `root` is the directory holding the npm shim.

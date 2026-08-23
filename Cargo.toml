@@ -1,6 +1,6 @@
 ﻿[package]
 name = "devez-vibe"
-version = "1.6.3"
+version = "1.6.4"
 edition = "2024"
 license = "MIT"
 description = "A stable terminal client for Codex and Claude Agent SDK"
@@ -39,4 +39,4 @@ tree-sitter-typescript = "0.23"
 unicode-width = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Media"] }
+windows-sys = { version = "0.61", features = ["Win32_Media", "Win32_System_Threading"] }

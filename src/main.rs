@@ -1,5 +1,6 @@
 mod app_server;
 mod backend;
+mod child_process;
 mod claude;
 mod completion;
 mod devezcode;
@@ -1134,6 +1135,16 @@ async fn event_loop(
         if let Some(thread_id) = state.take_cost_restore() {
             cost_restore_rx = Some(start_cost_restore(thread_id));
         }
+        let subagent_probes = state.take_codex_subagent_probes();
+        if !subagent_probes.is_empty() {
+            let mut changed = false;
+            for (id, running) in codex_subagent_statuses(server, subagent_probes).await {
+                changed |= state.resolve_codex_subagent_probe(&id, running);
+            }
+            if changed {
+                draw(state, renderer)?;
+            }
+        }
         // A quiet turn is asked about rather than assumed dead. Only a runtime that
         // answers "not running" ends the wait, so a long think is never cut short.
         if let Some(turn_id) = state.take_stall_probe()
@@ -1467,6 +1478,10 @@ async fn event_loop(
                 let tick = state.render_tick();
                 let mut redraw = tick.redraw;
                 animation_tick = tick.animation_only;
+                if renderer.recover_external_screen_write() {
+                    redraw = true;
+                    animation_tick = false;
+                }
                 // Ctrl+wheel font zoom changes the cell grid without always
                 // sending a `Resize`, so the size is polled here as well.
                 resize.observe(terminal_size());
@@ -4694,6 +4709,11 @@ fn open_url(url: &str) -> Result<()> {
         command
     };
     command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    child_process::isolate_launcher(&mut command);
+    command
         .spawn()
         .with_context(|| format!("URL을 열지 못했습니다: {url}"))?;
     Ok(())
@@ -5231,6 +5251,45 @@ async fn turn_is_running(server: &BackendServer, thread_id: &str, turn_id: &str)
         .unwrap_or(true)
 }
 
+/// Codex does not emit a periodic child heartbeat. Re-read every quiet child in
+/// parallel so a long command remains visible while a missed terminal event is
+/// still bounded. Unknown/error replies are deliberately left to the state's
+/// retry counter rather than guessed terminal here.
+async fn codex_subagent_statuses(
+    server: &BackendServer,
+    ids: Vec<String>,
+) -> Vec<(String, Option<bool>)> {
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let Some(client) = server.client() else {
+        return ids.into_iter().map(|id| (id, None)).collect();
+    };
+    futures_util::future::join_all(ids.into_iter().map(|id| {
+        let client = client.clone();
+        async move {
+            let params = json!({ "threadId": id.clone() });
+            let running = match timeout(PROBE_TIMEOUT, client.request("thread/read", params)).await
+            {
+                Ok(Ok(response)) => codex_thread_running(&response),
+                _ => None,
+            };
+            (id, running)
+        }
+    }))
+    .await
+}
+
+fn codex_thread_running(response: &Value) -> Option<bool> {
+    match response
+        .pointer("/thread/status/type")
+        .and_then(Value::as_str)
+    {
+        Some("active") => Some(true),
+        Some("idle" | "notLoaded" | "systemError") => Some(false),
+        _ => None,
+    }
+}
+
 async fn refresh_account(server: &BackendServer, state: &mut AppState) {
     let model = state.selected_model_name().to_owned();
     // OpenCode 계정은 opencode CLI가 관리한다. Codex의 account/read를 빌려
@@ -5648,6 +5707,21 @@ mod tests {
     use theme::ThemeKind;
 
     use super::*;
+
+    #[test]
+    fn codex_child_thread_status_distinguishes_running_terminal_and_unknown() {
+        assert_eq!(
+            codex_thread_running(&json!({ "thread": { "status": { "type": "active" } } })),
+            Some(true)
+        );
+        for terminal in ["idle", "notLoaded", "systemError"] {
+            assert_eq!(
+                codex_thread_running(&json!({ "thread": { "status": { "type": terminal } } })),
+                Some(false)
+            );
+        }
+        assert_eq!(codex_thread_running(&json!({ "thread": {} })), None);
+    }
 
     /// Drives a key through the same path the event loop uses. The renderer is
     /// the real one so scroll and vertical-move keys resolve as they do in the

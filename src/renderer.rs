@@ -1344,6 +1344,38 @@ impl Renderer {
         self.mode
     }
 
+    /// Invalidate a stale frame cache after an unexpected console write.
+    /// The next normal draw repaints the full screen from known state.
+    #[cfg(windows)]
+    pub fn recover_external_screen_write(&mut self) -> bool {
+        if self.mode != RenderMode::Fullscreen || self.painted_frame.is_none() {
+            return false;
+        }
+
+        let expected = (
+            self.cursor_col
+                .min(usize::from(self.last_total_width).saturating_sub(2))
+                .min(u16::MAX as usize) as u16,
+            self.cursor_line.min(u16::MAX as usize) as u16,
+        );
+        if !screen_write_recovery_needed(
+            self.mode,
+            self.painted_frame.is_some(),
+            expected,
+            cursor_position().ok(),
+        ) {
+            return false;
+        }
+
+        self.painted_frame = None;
+        true
+    }
+
+    #[cfg(not(windows))]
+    pub fn recover_external_screen_write(&mut self) -> bool {
+        false
+    }
+
     /// Provider runtimes cannot resume each other's native session IDs. This
     /// keeps the portable, user-visible part of the transcript available for a
     /// handoff while leaving welcome cards and local UI notices behind.
@@ -11057,9 +11089,57 @@ fn rgb_color(color: Rgb) -> Color {
     }
 }
 
+#[cfg(any(windows, test))]
+fn screen_write_recovery_needed(
+    mode: RenderMode,
+    has_painted_frame: bool,
+    expected_cursor: (u16, u16),
+    actual_cursor: Option<(u16, u16)>,
+) -> bool {
+    mode == RenderMode::Fullscreen
+        && has_painted_frame
+        && actual_cursor.is_some_and(|actual| actual != expected_cursor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_screen_write_recovery_requires_a_displaced_fullscreen_cursor() {
+        let expected = (8, 24);
+
+        assert!(screen_write_recovery_needed(
+            RenderMode::Fullscreen,
+            true,
+            expected,
+            Some((0, 25)),
+        ));
+        assert!(!screen_write_recovery_needed(
+            RenderMode::Fullscreen,
+            true,
+            expected,
+            Some(expected),
+        ));
+        assert!(!screen_write_recovery_needed(
+            RenderMode::Fullscreen,
+            true,
+            expected,
+            None,
+        ));
+        assert!(!screen_write_recovery_needed(
+            RenderMode::Inline,
+            true,
+            expected,
+            Some((0, 25)),
+        ));
+        assert!(!screen_write_recovery_needed(
+            RenderMode::Fullscreen,
+            false,
+            expected,
+            Some((0, 25)),
+        ));
+    }
 
     /// The panel takes a fixed slice of the right edge, leaves a gap in front of
     /// it, and fills the terminal's last cell without printing into it directly.

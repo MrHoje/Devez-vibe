@@ -3450,6 +3450,50 @@ struct RunningSubagent {
     painted_elapsed_secs: u64,
 }
 
+/// Codex app-server reports collaboration and child-thread lifecycle separately.
+/// Keep the child metadata after its row disappears so a delayed activity event
+/// cannot revive work that a turn-completed or thread-closed event already ended.
+#[derive(Clone, Debug, Default)]
+struct CodexSubagent {
+    agent_path: Option<String>,
+    nickname: Option<String>,
+    role: Option<String>,
+    description: String,
+    tool: String,
+    has_run: bool,
+    terminal: bool,
+    probe_failures: u8,
+}
+
+impl CodexSubagent {
+    fn display_name(&self) -> String {
+        if let Some(path) = self
+            .agent_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            return path.to_owned();
+        }
+        let nickname = self
+            .nickname
+            .as_deref()
+            .map(str::trim)
+            .filter(|nickname| !nickname.is_empty());
+        let role = self
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|role| !role.is_empty());
+        match (nickname, role) {
+            (Some(nickname), Some(role)) => format!("{nickname} [{role}]"),
+            (Some(nickname), None) => nickname.to_owned(),
+            (None, Some(role)) => format!("[{role}]"),
+            (None, None) => "Agent".to_owned(),
+        }
+    }
+}
+
 /// One recorded line of a subagent's work, as shown in its transcript panel.
 #[derive(Clone, Debug)]
 struct SubagentLogLine {
@@ -3466,6 +3510,10 @@ const SUBAGENT_LOG_LIMIT: usize = 400;
 /// 걸리는 행은 생존 신호를 세 번 연속 놓친 것뿐이다. 살아 있는 행은 로그와
 /// 목록 갱신이 유예를 계속 미뤄서 여기 걸리지 않는다.
 const SUBAGENT_LINGER_GRACE: Duration = Duration::from_secs(15);
+/// Codex child liveness is re-read from the app-server before a quiet row is
+/// removed. Three unknown replies bound a broken probe without cutting off one
+/// transient failure.
+const CODEX_SUBAGENT_PROBE_FAILURE_LIMIT: u8 = 3;
 
 #[derive(Clone)]
 struct ProviderIntegrationSnapshot {
@@ -3581,6 +3629,9 @@ pub struct AppState {
     plan_turn_id: Option<String>,
     plan_shimmer_started_at: Option<Instant>,
     subagents: Vec<RunningSubagent>,
+    /// Child threads observed through Codex collaboration events. Unlike the
+    /// visible rows, terminal entries stay here until the session changes.
+    codex_subagents: HashMap<String, CodexSubagent>,
     /// 턴이 끝났는데 하위 에이전트 행이 남아 있으면 그 시각. 유예가 지나도록
     /// 갱신이 없으면 종료 알림을 놓친 것으로 보고 행을 거둔다.
     subagents_settled_at: Option<Instant>,
@@ -3823,6 +3874,7 @@ impl AppState {
             plan_turn_id: None,
             plan_shimmer_started_at: None,
             subagents: Vec::new(),
+            codex_subagents: HashMap::new(),
             subagents_settled_at: None,
             subagent_logs: HashMap::new(),
             command_selection: 0,
@@ -6041,6 +6093,8 @@ impl AppState {
         self.turn_response_blocks.clear();
         self.response_grouped = false;
         self.subagents.clear();
+        self.codex_subagents.clear();
+        self.subagents_settled_at = None;
         self.subagent_logs.clear();
         self.busy = false;
         self.turn_id = None;
@@ -6218,9 +6272,25 @@ impl AppState {
         if settled.elapsed() < SUBAGENT_LINGER_GRACE {
             return false;
         }
+        // Claude and OpenCode publish five-second heartbeats, so silence is a
+        // useful fallback there. Codex does not: a child may legitimately spend
+        // longer than this inside one command. The event loop probes thread/read
+        // for those rows and only removes a confirmed terminal child.
+        if self.subagents.iter().any(|running| {
+            self.codex_subagents
+                .get(&running.id)
+                .is_some_and(|metadata| !metadata.terminal)
+        }) {
+            return false;
+        }
         self.subagents_settled_at = None;
         if self.subagents.is_empty() {
             return false;
+        }
+        for running in &self.subagents {
+            if let Some(metadata) = self.codex_subagents.get_mut(&running.id) {
+                metadata.terminal = true;
+            }
         }
         self.subagents.clear();
         let mut retained = HashSet::new();
@@ -6229,6 +6299,63 @@ impl AppState {
         }
         self.subagent_logs.retain(|id, _| retained.contains(id));
         true
+    }
+
+    /// Returns quiet Codex child ids that must be reconciled against the native
+    /// thread status. Taking a batch resets the retry window so an unavailable
+    /// app-server cannot turn the main loop into a tight request loop.
+    pub fn take_codex_subagent_probes(&mut self) -> Vec<String> {
+        let Some(settled) = self.subagents_settled_at else {
+            return Vec::new();
+        };
+        if self.busy || settled.elapsed() < SUBAGENT_LINGER_GRACE {
+            return Vec::new();
+        }
+        let ids = self
+            .subagents
+            .iter()
+            .filter_map(|running| {
+                self.codex_subagents
+                    .get(&running.id)
+                    .filter(|metadata| !metadata.terminal)
+                    .map(|_| running.id.clone())
+            })
+            .collect::<Vec<_>>();
+        if !ids.is_empty() {
+            self.subagents_settled_at = Some(Instant::now());
+        }
+        ids
+    }
+
+    /// Applies one thread/read result. `None` means the runtime could not give a
+    /// trustworthy answer; only repeated unknown replies use the bounded fallback.
+    pub fn resolve_codex_subagent_probe(&mut self, id: &str, running: Option<bool>) -> bool {
+        if !self.subagents.iter().any(|subagent| subagent.id == id) {
+            return false;
+        }
+        let should_finish = {
+            let Some(metadata) = self.codex_subagents.get_mut(id) else {
+                return false;
+            };
+            if metadata.terminal {
+                return false;
+            }
+            match running {
+                Some(true) => {
+                    metadata.probe_failures = 0;
+                    false
+                }
+                Some(false) => true,
+                None => {
+                    metadata.probe_failures = metadata.probe_failures.saturating_add(1);
+                    metadata.probe_failures >= CODEX_SUBAGENT_PROBE_FAILURE_LIMIT
+                }
+            }
+        };
+        if should_finish {
+            self.finish_codex_subagent(id);
+        }
+        should_finish
     }
 
     pub fn render_tick(&mut self) -> TickResult {
@@ -7205,6 +7332,425 @@ impl AppState {
                 == crate::claude::raw_thread_id(&self.thread_id)
     }
 
+    fn codex_subagent_source_is_known(&self, thread_id: &str) -> bool {
+        self.names_this_thread(thread_id) || self.codex_subagents.contains_key(thread_id)
+    }
+
+    fn remember_codex_subagent(&mut self, id: &str) {
+        self.codex_subagents.entry(id.to_owned()).or_default();
+    }
+
+    fn update_codex_subagent_identity(
+        &mut self,
+        id: &str,
+        agent_path: Option<&str>,
+        nickname: Option<&str>,
+        role: Option<&str>,
+        description: Option<&str>,
+    ) {
+        let metadata = self.codex_subagents.entry(id.to_owned()).or_default();
+        if let Some(path) = agent_path.map(str::trim).filter(|path| !path.is_empty()) {
+            metadata.agent_path = Some(path.to_owned());
+        }
+        if let Some(nickname) = nickname
+            .map(str::trim)
+            .filter(|nickname| !nickname.is_empty())
+        {
+            metadata.nickname = Some(nickname.to_owned());
+        }
+        if let Some(role) = role.map(str::trim).filter(|role| !role.is_empty()) {
+            metadata.role = Some(role.to_owned());
+        }
+        if let Some(description) = description
+            .map(|description| compact_command(description, 96))
+            .filter(|description| !description.is_empty())
+        {
+            metadata.description = description;
+        }
+        self.refresh_codex_subagent_row(id);
+    }
+
+    fn refresh_codex_subagent_row(&mut self, id: &str) {
+        let Some(metadata) = self.codex_subagents.get(id) else {
+            return;
+        };
+        let name = metadata.display_name();
+        let description = metadata.description.clone();
+        let tool = metadata.tool.clone();
+        if let Some(running) = self.subagents.iter_mut().find(|running| running.id == id) {
+            running.name = name;
+            running.description = description;
+            running.tool = tool;
+        }
+    }
+
+    /// `authoritative` is reserved for the child thread's own start/status event
+    /// or a completed collaboration call carrying a running state. A delayed
+    /// `subAgentActivity.started` hint cannot revive a terminal child.
+    fn start_codex_subagent(&mut self, id: &str, authoritative: bool) {
+        let Some(metadata) = self.codex_subagents.get_mut(id) else {
+            return;
+        };
+        if metadata.terminal && !authoritative {
+            return;
+        }
+        if authoritative {
+            metadata.terminal = false;
+        }
+        metadata.probe_failures = 0;
+        metadata.has_run = true;
+        let name = metadata.display_name();
+        let description = metadata.description.clone();
+        let tool = metadata.tool.clone();
+        if let Some(running) = self.subagents.iter_mut().find(|running| running.id == id) {
+            running.name = name;
+            running.description = description;
+            running.tool = tool;
+        } else {
+            self.subagents.push(RunningSubagent {
+                id: id.to_owned(),
+                name,
+                description,
+                tool,
+                started_at: Instant::now(),
+                painted_elapsed_secs: 0,
+            });
+        }
+        // A child can outlive its parent turn. Keep the existing missed-signal
+        // watchdog armed while idle, and disarm it while the parent is active.
+        self.subagents_settled_at = (!self.busy).then(Instant::now);
+    }
+
+    fn finish_codex_subagent(&mut self, id: &str) {
+        let Some(metadata) = self.codex_subagents.get_mut(id) else {
+            return;
+        };
+        metadata.terminal = true;
+        self.subagents.retain(|running| running.id != id);
+        self.subagents_settled_at = if self.subagents.is_empty() {
+            None
+        } else {
+            (!self.busy).then(Instant::now)
+        };
+    }
+
+    fn set_codex_subagent_tool(&mut self, id: &str, tool: &str) {
+        let Some(metadata) = self.codex_subagents.get_mut(id) else {
+            return;
+        };
+        metadata.tool = compact_command(tool, 120);
+        metadata.probe_failures = 0;
+        self.refresh_codex_subagent_row(id);
+    }
+
+    fn record_subagent_line(&mut self, parent: &str, kind: &str, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        if let Some(metadata) = self.codex_subagents.get_mut(parent) {
+            metadata.probe_failures = 0;
+        }
+        let text = match kind {
+            "tool" => format!("⏺ {text}"),
+            "result" => format!("  ⎿ {text}"),
+            "error" => format!("  ⎿ 오류: {text}"),
+            _ => text.to_owned(),
+        };
+        let log = self.subagent_logs.entry(parent.to_owned()).or_default();
+        log.push(SubagentLogLine {
+            text,
+            muted: kind != "text",
+        });
+        if log.len() > SUBAGENT_LOG_LIMIT {
+            log.drain(..log.len() - SUBAGENT_LOG_LIMIT);
+        }
+        if self.subagents_settled_at.is_some() {
+            self.subagents_settled_at = Some(Instant::now());
+        }
+    }
+
+    fn observe_codex_subagent_notification(&mut self, method: &str, params: &Value) {
+        match method {
+            "thread/started" => {
+                let Some(thread) = params.get("thread") else {
+                    return;
+                };
+                let Some(id) = thread.get("id").and_then(Value::as_str) else {
+                    return;
+                };
+                let Some(parent) = thread.get("parentThreadId").and_then(Value::as_str) else {
+                    return;
+                };
+                if !self.codex_subagent_source_is_known(parent) {
+                    return;
+                }
+                self.update_codex_subagent_identity(
+                    id,
+                    None,
+                    thread.get("agentNickname").and_then(Value::as_str),
+                    thread.get("agentRole").and_then(Value::as_str),
+                    None,
+                );
+                if thread.pointer("/status/type").and_then(Value::as_str) == Some("active") {
+                    self.start_codex_subagent(id, true);
+                }
+            }
+            "thread/status/changed" => {
+                let Some(id) = params.get("threadId").and_then(Value::as_str) else {
+                    return;
+                };
+                let Some(metadata) = self.codex_subagents.get(id) else {
+                    return;
+                };
+                let has_run = metadata.has_run;
+                match params.pointer("/status/type").and_then(Value::as_str) {
+                    Some("active") => self.start_codex_subagent(id, false),
+                    Some("idle" | "notLoaded" | "systemError") if has_run => {
+                        self.finish_codex_subagent(id)
+                    }
+                    _ => {}
+                }
+            }
+            "thread/closed" => {
+                if let Some(id) = params.get("threadId").and_then(Value::as_str)
+                    && self.codex_subagents.contains_key(id)
+                {
+                    self.finish_codex_subagent(id);
+                }
+            }
+            "turn/started" => {
+                if let Some(id) = params.get("threadId").and_then(Value::as_str)
+                    && self.codex_subagents.contains_key(id)
+                {
+                    self.start_codex_subagent(id, true);
+                }
+            }
+            "turn/completed" | "turn/failed" | "turn/aborted" => {
+                if let Some(id) = params.get("threadId").and_then(Value::as_str)
+                    && self.codex_subagents.contains_key(id)
+                {
+                    if let Some(error) = params
+                        .pointer("/turn/error/message")
+                        .and_then(Value::as_str)
+                        .or_else(|| params.get("message").and_then(Value::as_str))
+                    {
+                        self.record_subagent_line(id, "error", error);
+                    }
+                    self.finish_codex_subagent(id);
+                }
+            }
+            "item/started" | "item/completed" => self.observe_codex_subagent_item(method, params),
+            _ => {}
+        }
+    }
+
+    fn observe_codex_subagent_item(&mut self, method: &str, params: &Value) {
+        let Some(item) = params.get("item") else {
+            return;
+        };
+        let source = params
+            .get("threadId")
+            .and_then(Value::as_str)
+            .or_else(|| item.get("senderThreadId").and_then(Value::as_str));
+        let Some(source) = source.filter(|source| self.codex_subagent_source_is_known(source))
+        else {
+            return;
+        };
+
+        match item.get("type").and_then(Value::as_str) {
+            Some("subAgentActivity") => {
+                let Some(id) = item.get("agentThreadId").and_then(Value::as_str) else {
+                    return;
+                };
+                self.update_codex_subagent_identity(
+                    id,
+                    item.get("agentPath").and_then(Value::as_str),
+                    None,
+                    None,
+                    None,
+                );
+                match item.get("kind").and_then(Value::as_str) {
+                    Some("started") => self.start_codex_subagent(id, false),
+                    // Matches Codex's own TUI: interaction is activity copy, not
+                    // a liveness transition.
+                    Some("interacted") => {}
+                    Some("interrupted") => self.finish_codex_subagent(id),
+                    _ => {}
+                }
+            }
+            Some("collabAgentToolCall") => {
+                self.observe_codex_collab_call(method, item);
+            }
+            _ => {}
+        }
+
+        if self.codex_subagents.contains_key(source) {
+            self.record_codex_subagent_item(source, method, item);
+        }
+    }
+
+    fn observe_codex_collab_call(&mut self, method: &str, item: &Value) {
+        let tool = item.get("tool").and_then(Value::as_str).unwrap_or_default();
+        let call_status = item
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let completed = method == "item/completed" && call_status != "inProgress";
+        let mut receivers = item
+            .get("receiverThreadIds")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        if let Some(states) = item.get("agentsStates").and_then(Value::as_object) {
+            for id in states.keys() {
+                if !receivers.contains(id) {
+                    receivers.push(id.clone());
+                }
+            }
+        }
+
+        for id in receivers {
+            self.remember_codex_subagent(&id);
+            if tool == "spawnAgent" {
+                self.update_codex_subagent_identity(
+                    &id,
+                    None,
+                    None,
+                    None,
+                    item.get("prompt").and_then(Value::as_str),
+                );
+            }
+            let agent_status = item
+                .get("agentsStates")
+                .and_then(Value::as_object)
+                .and_then(|states| states.get(&id))
+                .and_then(|state| state.get("status"))
+                .and_then(Value::as_str);
+            match agent_status {
+                Some("pendingInit" | "running") => self.start_codex_subagent(&id, true),
+                Some("interrupted" | "completed" | "errored" | "shutdown" | "notFound") => {
+                    self.finish_codex_subagent(&id)
+                }
+                _ if completed && tool == "spawnAgent" && call_status == "completed" => {
+                    self.start_codex_subagent(&id, true)
+                }
+                _ if completed && tool == "closeAgent" && call_status == "completed" => {
+                    self.finish_codex_subagent(&id)
+                }
+                _ if completed && tool == "spawnAgent" && call_status == "failed" => {
+                    self.finish_codex_subagent(&id)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn record_codex_subagent_item(&mut self, id: &str, method: &str, item: &Value) {
+        let completed = method == "item/completed";
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        let activity = match item_type {
+            "agentMessage" | "plan" if completed => item
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|text| ("text", compact_command(text, 320))),
+            "reasoning" if completed => item
+                .get("summary")
+                .and_then(Value::as_array)
+                .and_then(|summary| summary.last())
+                .and_then(Value::as_str)
+                .map(|text| ("result", compact_command(text, 240))),
+            "commandExecution" if !completed => {
+                let command = item
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("command");
+                let label = format!("$ {}", compact_command(command, 200));
+                self.set_codex_subagent_tool(id, &label);
+                Some(("tool", label))
+            }
+            "commandExecution" => {
+                let status = item
+                    .get("exitCode")
+                    .and_then(Value::as_i64)
+                    .map(|exit| format!("exit {exit}"))
+                    .or_else(|| {
+                        item.get("status")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned)
+                    })
+                    .unwrap_or_else(|| "completed".to_owned());
+                Some((
+                    if status == "completed" || status == "exit 0" {
+                        "result"
+                    } else {
+                        "error"
+                    },
+                    status,
+                ))
+            }
+            "fileChange" if completed => {
+                let count = item
+                    .get("changes")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or_default();
+                Some(("tool", format!("Updated {count} file(s)")))
+            }
+            "mcpToolCall" if !completed => {
+                let label = format!(
+                    "MCP {}/{}",
+                    item.get("server")
+                        .and_then(Value::as_str)
+                        .unwrap_or("server"),
+                    item.get("tool").and_then(Value::as_str).unwrap_or("tool")
+                );
+                self.set_codex_subagent_tool(id, &label);
+                Some(("tool", label))
+            }
+            "dynamicToolCall" if !completed => {
+                let namespace = item
+                    .get("namespace")
+                    .and_then(Value::as_str)
+                    .filter(|namespace| !namespace.is_empty());
+                let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+                let label = namespace
+                    .map(|namespace| format!("Tool {namespace}/{tool}"))
+                    .unwrap_or_else(|| format!("Tool {tool}"));
+                self.set_codex_subagent_tool(id, &label);
+                Some(("tool", label))
+            }
+            "webSearch" if completed => item.get("query").and_then(Value::as_str).map(|query| {
+                (
+                    "tool",
+                    format!("Web search: {}", compact_command(query, 200)),
+                )
+            }),
+            "collabAgentToolCall" if completed => item
+                .get("tool")
+                .and_then(Value::as_str)
+                .map(|tool| ("tool", format!("Agent {tool}"))),
+            "subAgentActivity" if completed => {
+                let action = match item.get("kind").and_then(Value::as_str) {
+                    Some("started") => "Started",
+                    Some("interacted") => "Contacted",
+                    Some("interrupted") => "Interrupted",
+                    _ => "Updated",
+                };
+                item.get("agentPath")
+                    .and_then(Value::as_str)
+                    .map(|path| ("tool", format!("{action} {path}")))
+            }
+            _ => None,
+        };
+        if let Some((kind, text)) = activity {
+            self.record_subagent_line(id, kind, &text);
+        }
+    }
+
     /// A parent turn keeps streaming behind a `/btw` fork. Its output stays out
     /// of the fork's view, but the end of the turn has to land somewhere so we
     /// do not restore a spinner for a turn that already finished.
@@ -7222,6 +7768,9 @@ impl AppState {
     }
 
     pub fn handle_notification(&mut self, method: &str, params: &Value) {
+        // Codex emits child-thread events on the shared app-server stream. Read
+        // them before the ordinary current-thread filter discards them.
+        self.observe_codex_subagent_notification(method, params);
         if let Some(thread_id) = params
             .get("threadId")
             .and_then(Value::as_str)
@@ -7570,31 +8119,10 @@ impl AppState {
             "turn/subagent/line" => {
                 if let Some(parent) = params.get("parentToolUseId").and_then(Value::as_str)
                     && let Some(line) = params.get("line")
-                    && let Some(text) = line
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|text| !text.is_empty())
+                    && let Some(text) = line.get("text").and_then(Value::as_str)
                 {
                     let kind = line.get("kind").and_then(Value::as_str).unwrap_or("text");
-                    let text = match kind {
-                        "tool" => format!("⏺ {text}"),
-                        "result" => format!("  ⎿ {text}"),
-                        "error" => format!("  ⎿ 오류: {text}"),
-                        _ => text.to_owned(),
-                    };
-                    let log = self.subagent_logs.entry(parent.to_owned()).or_default();
-                    log.push(SubagentLogLine {
-                        text,
-                        muted: kind != "text",
-                    });
-                    if log.len() > SUBAGENT_LOG_LIMIT {
-                        log.drain(..log.len() - SUBAGENT_LOG_LIMIT);
-                    }
-                    // 로그가 오는 동안은 살아 있는 것이므로 유예를 미룬다.
-                    if self.subagents_settled_at.is_some() {
-                        self.subagents_settled_at = Some(Instant::now());
-                    }
+                    self.record_subagent_line(parent, kind, text);
                 }
             }
             "item/started" => {
@@ -16465,6 +16993,283 @@ mod tests {
 
         assert_eq!(state.subagents[0].started_at, started);
         assert_eq!(state.subagents[0].tool, "Read");
+    }
+
+    fn spawn_codex_subagent(state: &mut AppState, child: &str) {
+        state.busy = true;
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "threadId": "thread",
+                "item": {
+                    "id": "spawn-1",
+                    "type": "collabAgentToolCall",
+                    "tool": "spawnAgent",
+                    "status": "completed",
+                    "senderThreadId": "thread",
+                    "receiverThreadIds": [child],
+                    "prompt": "인증 흐름을 조사하고 결과를 보고해",
+                    "agentsStates": {
+                        (child): { "status": "running", "message": null }
+                    }
+                }
+            }),
+        );
+    }
+
+    fn codex_activity(child: &str, kind: &str) -> Value {
+        json!({
+            "threadId": "thread",
+            "item": {
+                "id": format!("activity-{kind}"),
+                "type": "subAgentActivity",
+                "kind": kind,
+                "agentThreadId": child,
+                "agentPath": "/root/auth-explorer"
+            }
+        })
+    }
+
+    #[test]
+    fn codex_child_thread_is_shown_with_native_identity_activity_and_completion() {
+        let mut state = test_state();
+        let child = "00000000-0000-0000-0000-000000000102";
+        spawn_codex_subagent(&mut state, child);
+
+        assert_eq!(state.view().subagents.len(), 1);
+        assert_eq!(state.view().subagents[0].name, "Agent");
+
+        state.handle_notification(
+            "thread/started",
+            &json!({
+                "thread": {
+                    "id": child,
+                    "parentThreadId": "thread",
+                    "agentNickname": "Robie",
+                    "agentRole": "explorer",
+                    "status": { "type": "active", "activeFlags": [] }
+                }
+            }),
+        );
+        assert_eq!(state.view().subagents[0].name, "Robie [explorer]");
+
+        state.handle_notification("item/completed", &codex_activity(child, "started"));
+        assert_eq!(state.view().subagents[0].name, "/root/auth-explorer");
+
+        state.handle_notification(
+            "item/started",
+            &json!({
+                "threadId": child,
+                "item": {
+                    "id": "command-1",
+                    "type": "commandExecution",
+                    "command": "rg auth src",
+                    "status": "inProgress"
+                }
+            }),
+        );
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "threadId": child,
+                "item": {
+                    "id": "message-1",
+                    "type": "agentMessage",
+                    "text": "인증 흐름을 찾았습니다."
+                }
+            }),
+        );
+        assert_eq!(
+            state.subagent_logs[child]
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            ["⏺ $ rg auth src", "인증 흐름을 찾았습니다."]
+        );
+
+        state.handle_notification(
+            "turn/completed",
+            &json!({
+                "threadId": child,
+                "turn": { "id": "child-turn", "status": "completed" }
+            }),
+        );
+        assert!(state.view().subagents.is_empty());
+        assert!(state.codex_subagents[child].terminal);
+    }
+
+    #[test]
+    fn delayed_codex_activity_cannot_revive_a_stopped_child_but_a_new_turn_can() {
+        let mut state = test_state();
+        let child = "00000000-0000-0000-0000-000000000103";
+        spawn_codex_subagent(&mut state, child);
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "threadId": child, "turn": { "status": "completed" } }),
+        );
+
+        state.handle_notification("item/completed", &codex_activity(child, "started"));
+        state.handle_notification(
+            "thread/status/changed",
+            &json!({
+                "threadId": child,
+                "status": { "type": "active", "activeFlags": [] }
+            }),
+        );
+        assert!(state.view().subagents.is_empty());
+
+        state.handle_notification(
+            "turn/started",
+            &json!({ "threadId": child, "turn": { "id": "next-turn" } }),
+        );
+        assert_eq!(state.view().subagents.len(), 1);
+    }
+
+    #[test]
+    fn every_terminal_codex_agent_state_removes_the_running_row() {
+        let child = "00000000-0000-0000-0000-000000000104";
+        for terminal in [
+            "interrupted",
+            "completed",
+            "errored",
+            "shutdown",
+            "notFound",
+        ] {
+            let mut state = test_state();
+            spawn_codex_subagent(&mut state, child);
+            state.handle_notification(
+                "item/completed",
+                &json!({
+                    "threadId": "thread",
+                    "item": {
+                        "id": "wait-1",
+                        "type": "collabAgentToolCall",
+                        "tool": "wait",
+                        "status": "completed",
+                        "senderThreadId": "thread",
+                        "receiverThreadIds": [child],
+                        "agentsStates": {
+                            (child): { "status": terminal, "message": null }
+                        }
+                    }
+                }),
+            );
+
+            assert!(
+                state.view().subagents.is_empty(),
+                "terminal state {terminal} must remove the row"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_wait_keeps_a_running_child_and_close_removes_it_without_a_child_signal() {
+        let mut state = test_state();
+        let child = "00000000-0000-0000-0000-000000000107";
+        spawn_codex_subagent(&mut state, child);
+        let started_at = state.subagents[0].started_at;
+
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "threadId": "thread",
+                "item": {
+                    "id": "wait-running",
+                    "type": "collabAgentToolCall",
+                    "tool": "wait",
+                    "status": "completed",
+                    "senderThreadId": "thread",
+                    "receiverThreadIds": [child],
+                    "agentsStates": {
+                        (child): { "status": "running", "message": null }
+                    }
+                }
+            }),
+        );
+        assert_eq!(state.subagents.len(), 1);
+        assert_eq!(state.subagents[0].started_at, started_at);
+
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "threadId": "thread",
+                "item": {
+                    "id": "close-1",
+                    "type": "collabAgentToolCall",
+                    "tool": "closeAgent",
+                    "status": "completed",
+                    "senderThreadId": "thread",
+                    "receiverThreadIds": [child],
+                    "agentsStates": {}
+                }
+            }),
+        );
+        assert!(state.view().subagents.is_empty());
+    }
+
+    #[test]
+    fn codex_idle_and_closed_are_independent_terminal_signals() {
+        let child = "00000000-0000-0000-0000-000000000105";
+        let mut state = test_state();
+        spawn_codex_subagent(&mut state, child);
+        state.handle_notification(
+            "thread/status/changed",
+            &json!({ "threadId": child, "status": { "type": "idle" } }),
+        );
+        assert!(state.view().subagents.is_empty());
+
+        spawn_codex_subagent(&mut state, child);
+        assert_eq!(state.view().subagents.len(), 1);
+        state.handle_notification("thread/closed", &json!({ "threadId": child }));
+        assert!(state.view().subagents.is_empty());
+    }
+
+    #[test]
+    fn codex_quiet_child_is_probed_before_its_row_is_removed() {
+        let mut state = test_state();
+        let child = "00000000-0000-0000-0000-000000000106";
+        spawn_codex_subagent(&mut state, child);
+
+        state.handle_notification(
+            "turn/completed",
+            &json!({
+                "threadId": "thread",
+                "turn": { "id": "parent-turn", "status": "completed" }
+            }),
+        );
+        state.subagents_settled_at = Some(Instant::now() - SUBAGENT_LINGER_GRACE);
+        assert!(!state.sweep_settled_subagents());
+        assert_eq!(state.take_codex_subagent_probes(), [child]);
+        assert!(state.take_codex_subagent_probes().is_empty());
+        assert!(!state.resolve_codex_subagent_probe(child, Some(true)));
+        assert_eq!(state.view().subagents.len(), 1);
+
+        state.subagents_settled_at = Some(Instant::now() - SUBAGENT_LINGER_GRACE);
+        assert_eq!(state.take_codex_subagent_probes(), [child]);
+        assert!(state.resolve_codex_subagent_probe(child, Some(false)));
+        assert!(state.view().subagents.is_empty());
+        assert!(state.codex_subagents[child].terminal);
+
+        state.handle_notification("item/completed", &codex_activity(child, "started"));
+        assert!(state.view().subagents.is_empty());
+    }
+
+    #[test]
+    fn codex_unknown_probe_replies_have_a_bounded_fallback() {
+        let mut state = test_state();
+        let child = "00000000-0000-0000-0000-000000000108";
+        spawn_codex_subagent(&mut state, child);
+        state.handle_notification("turn/completed", &json!({ "threadId": "thread" }));
+
+        for attempt in 1..=CODEX_SUBAGENT_PROBE_FAILURE_LIMIT {
+            state.subagents_settled_at = Some(Instant::now() - SUBAGENT_LINGER_GRACE);
+            assert_eq!(state.take_codex_subagent_probes(), [child]);
+            let removed = state.resolve_codex_subagent_probe(child, None);
+            assert_eq!(removed, attempt == CODEX_SUBAGENT_PROBE_FAILURE_LIMIT);
+        }
+
+        assert!(state.view().subagents.is_empty());
+        assert!(state.codex_subagents[child].terminal);
     }
 
     fn state_with_a_running_subagent() -> AppState {

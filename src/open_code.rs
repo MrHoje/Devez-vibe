@@ -178,13 +178,93 @@ impl SessionStreams {
         (self.subagents.len() != before).then(|| self.subagents_notification(session_id))
     }
 
-    /// 턴이 끝나면 남은 하위 에이전트 행을 거둬 spinner처럼 남지 않게 한다.
+    /// OpenCode의 background task는 바깥 tool call이 끝나도 자식 세션이 계속
+    /// 돈다. 순정 tool metadata의 sessionId를 붙여 status API와 대조한다.
+    fn subagent_tool_completed(
+        &mut self,
+        session_id: &str,
+        tool_id: &str,
+        update: &Value,
+    ) -> Option<Notification> {
+        let Some(task_id) = background_subagent_task_id(update) else {
+            return self.subagent_finished(session_id, tool_id);
+        };
+        let entry = self
+            .subagents
+            .iter_mut()
+            .find(|entry| entry.get("id").and_then(Value::as_str) == Some(tool_id))?;
+        entry["background"] = Value::Bool(true);
+        entry["taskId"] = Value::String(task_id.to_owned());
+        entry["missingPolls"] = json!(0);
+        Some(self.subagents_notification(session_id))
+    }
+
+    /// 턴이 끝나면 foreground 행만 거둔다. background 행은 자식 세션 status가
+    /// idle이 되거나 연결이 닫힐 때까지 살아 있어야 한다.
     fn subagents_cleared(&mut self, session_id: &str) -> Option<Notification> {
+        let before = self.subagents.len();
+        self.subagents
+            .retain(|entry| entry.get("background").and_then(Value::as_bool) == Some(true));
+        (self.subagents.len() != before).then(|| self.subagents_notification(session_id))
+    }
+
+    fn all_subagents_cleared(&mut self, session_id: &str) -> Option<Notification> {
         if self.subagents.is_empty() {
             return None;
         }
         self.subagents.clear();
         Some(self.subagents_notification(session_id))
+    }
+
+    fn has_background_subagents(&self) -> bool {
+        self.subagents
+            .iter()
+            .any(|entry| entry.get("background").and_then(Value::as_bool) == Some(true))
+    }
+
+    /// `/session/status` omits idle sessions. Two consecutive missing snapshots
+    /// avoid a launch race, while each active snapshot acts as the row heartbeat.
+    fn reconcile_background_subagents(
+        &mut self,
+        session_id: &str,
+        statuses: &Value,
+    ) -> Option<Notification> {
+        let mut changed = false;
+        let mut retained_background = false;
+        self.subagents.retain_mut(|entry| {
+            if entry.get("background").and_then(Value::as_bool) != Some(true) {
+                return true;
+            }
+            let task_id = entry
+                .get("taskId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let active = !task_id.is_empty()
+                && statuses
+                    .get(task_id)
+                    .and_then(|status| status.get("type"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|status| status != "idle");
+            if active {
+                entry["missingPolls"] = json!(0);
+                retained_background = true;
+                return true;
+            }
+            let missing = entry
+                .get("missingPolls")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+                + 1;
+            entry["missingPolls"] = json!(missing);
+            if missing < 2 {
+                retained_background = true;
+                true
+            } else {
+                changed = true;
+                false
+            }
+        });
+        (changed || retained_background).then(|| self.subagents_notification(session_id))
     }
 
     fn subagents_notification(&self, session_id: &str) -> Notification {
@@ -217,8 +297,22 @@ fn subagent_entry(update: &Value) -> Option<Value> {
         "id": id,
         "name": subagent_type.unwrap_or("agent"),
         "description": description,
-        "tool": "Task"
+        "tool": "Task",
+        "background": false
     }))
+}
+
+fn background_subagent_task_id(update: &Value) -> Option<&str> {
+    let metadata = update.pointer("/rawOutput/metadata")?;
+    (metadata.get("background").and_then(Value::as_bool) == Some(true))
+        .then_some(())
+        .and_then(|()| {
+            metadata
+                .get("sessionId")
+                .or_else(|| metadata.get("jobId"))
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+        })
 }
 
 #[derive(Clone)]
@@ -378,8 +472,10 @@ pub struct OpenCodeServer {
     writer_task: JoinHandle<()>,
     reader_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
+    subagent_task: JoinHandle<()>,
 }
 
+#[derive(Clone)]
 pub struct ProviderAuthServer {
     client: reqwest::Client,
     base_url: reqwest::Url,
@@ -426,6 +522,10 @@ impl ProviderAuthServer {
     async fn model_catalog(&self) -> Result<Value> {
         self.wait_until_ready().await?;
         self.get(&["provider"]).await
+    }
+
+    async fn session_status(&self) -> Result<Value> {
+        self.get(&["session", "status"]).await
     }
 
     pub async fn set_api_key(
@@ -538,7 +638,7 @@ impl OpenCodeServer {
         drop(listener);
         let resolved = resolve_command(open_code_path);
         let mut command = command_for(&resolved);
-        isolate_ctrl_c(&mut command);
+        crate::child_process::isolate_backend(&mut command);
         command
             .args([
                 "acp",
@@ -573,6 +673,7 @@ impl OpenCodeServer {
         let loading: LoadingMap = Arc::new(Mutex::new(HashMap::new()));
         let tools: ToolMap = Arc::new(Mutex::new(HashMap::new()));
         let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
+        let provider_auth = ProviderAuthServer::new(port)?;
 
         let writer_task = tokio::spawn(async move {
             let mut stdin = stdin;
@@ -654,6 +755,16 @@ impl OpenCodeServer {
                 });
             }
             drop(detached);
+            let cleared = {
+                let mut streams = reader_streams.lock().await;
+                streams
+                    .iter_mut()
+                    .filter_map(|(session_id, stream)| stream.all_subagents_cleared(session_id))
+                    .collect::<Vec<_>>()
+            };
+            for (method, params) in cleared {
+                notify(&reader_events, &method, params);
+            }
             let _ = reader_events.send(ServerEvent::Closed(
                 "OpenCode ACP 연결이 종료되었습니다.".to_owned(),
             ));
@@ -665,6 +776,44 @@ impl OpenCodeServer {
             while let Ok(Some(line)) = lines.next_line().await {
                 if line.contains("ERROR") || line.contains("Error") {
                     let _ = stderr_events.send(ServerEvent::ProtocolWarning(line));
+                }
+            }
+        });
+
+        let subagent_auth = provider_auth.clone();
+        let subagent_streams = Arc::clone(&streams);
+        let subagent_events = event_tx.clone();
+        let subagent_task = tokio::spawn(async move {
+            loop {
+                sleep(Duration::from_secs(5)).await;
+                if subagent_events.is_closed() {
+                    break;
+                }
+                let has_background = subagent_streams
+                    .lock()
+                    .await
+                    .values()
+                    .any(SessionStreams::has_background_subagents);
+                if !has_background {
+                    continue;
+                }
+                let Ok(statuses) = subagent_auth.session_status().await else {
+                    continue;
+                };
+                if !statuses.is_object() {
+                    continue;
+                }
+                let updates = {
+                    let mut streams = subagent_streams.lock().await;
+                    streams
+                        .iter_mut()
+                        .filter_map(|(session_id, stream)| {
+                            stream.reconcile_background_subagents(session_id, &statuses)
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for (method, params) in updates {
+                    notify(&subagent_events, &method, params);
                 }
             }
         });
@@ -681,13 +830,14 @@ impl OpenCodeServer {
         Ok(Self {
             child,
             client,
-            provider_auth: ProviderAuthServer::new(port)?,
+            provider_auth,
             loading,
             history: Arc::new(Mutex::new(HashMap::new())),
             events,
             writer_task,
             reader_task,
             stderr_task,
+            subagent_task,
         })
     }
 
@@ -1017,6 +1167,7 @@ impl OpenCodeServer {
         }
         self.reader_task.abort();
         self.stderr_task.abort();
+        self.subagent_task.abort();
     }
 }
 
@@ -1230,20 +1381,23 @@ async fn route_session_update(
             let merged = merge_tool_update(previous, update);
             emit_plan(&merged, session_id, events);
             match update.get("status").and_then(Value::as_str) {
-                Some("completed" | "failed") => {
+                status @ Some("completed" | "failed") => {
                     tools.lock().await.remove(id);
                     notify(
                         events,
                         "item/completed",
                         json!({ "threadId": session_id, "item": tool_item(&merged, true) }),
                     );
-                    if let Some((method, params)) = streams
-                        .lock()
-                        .await
-                        .entry(session_id.to_owned())
-                        .or_default()
-                        .subagent_finished(session_id, id)
-                    {
+                    let subagents = {
+                        let mut streams = streams.lock().await;
+                        let entry = streams.entry(session_id.to_owned()).or_default();
+                        if status == Some("completed") {
+                            entry.subagent_tool_completed(session_id, id, &merged)
+                        } else {
+                            entry.subagent_finished(session_id, id)
+                        }
+                    };
+                    if let Some((method, params)) = subagents {
                         notify(events, &method, params);
                     }
                 }
@@ -1840,14 +1994,6 @@ fn command_for(path: &Path) -> Command {
     Command::new(path)
 }
 
-#[cfg(windows)]
-fn isolate_ctrl_c(command: &mut Command) {
-    command.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP
-}
-
-#[cfg(not(windows))]
-fn isolate_ctrl_c(_: &mut Command) {}
-
 fn resolve_command(command: &Path) -> PathBuf {
     if command.components().count() > 1 || command.exists() {
         return command.to_path_buf();
@@ -2154,6 +2300,91 @@ mod tests {
         );
         // 비어 있으면 알림을 반복하지 않는다.
         assert!(streams.subagents_cleared("s").is_none());
+    }
+
+    #[test]
+    fn background_subagent_waits_for_child_session_status() {
+        let mut streams = SessionStreams::default();
+        streams.subagent_started(
+            "s",
+            &json!({
+                "toolCallId": "call_1",
+                "title": "task",
+                "rawInput": { "subagent_type": "developer", "description": "구현" }
+            }),
+        );
+
+        let kept = streams
+            .subagent_tool_completed(
+                "s",
+                "call_1",
+                &json!({
+                    "rawOutput": {
+                        "metadata": {
+                            "background": true,
+                            "sessionId": "child_1",
+                            "jobId": "job_1"
+                        }
+                    }
+                }),
+            )
+            .expect("바깥 도구가 끝나도 background 행은 유지한다");
+        assert_eq!(
+            kept.1
+                .pointer("/subagents/0/taskId")
+                .and_then(Value::as_str),
+            Some("child_1")
+        );
+        assert!(streams.subagents_cleared("s").is_none());
+
+        let active = streams
+            .reconcile_background_subagents("s", &json!({ "child_1": { "type": "busy" } }))
+            .expect("실행 중 상태는 heartbeat를 보낸다");
+        assert_eq!(
+            active
+                .1
+                .pointer("/subagents")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        let first_missing = streams
+            .reconcile_background_subagents("s", &json!({}))
+            .expect("첫 누락은 시작 경합으로 보고 행을 유지한다");
+        assert_eq!(
+            first_missing
+                .1
+                .pointer("/subagents")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        let finished = streams
+            .reconcile_background_subagents("s", &json!({}))
+            .expect("연속 누락이면 종료된 자식 세션 행을 제거한다");
+        assert_eq!(
+            finished
+                .1
+                .pointer("/subagents")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+
+        streams.subagent_started(
+            "s",
+            &json!({ "toolCallId": "call_2", "title": "task", "rawInput": {} }),
+        );
+        let cleared = streams
+            .all_subagents_cleared("s")
+            .expect("전송 연결 종료는 모든 행을 제거한다");
+        assert!(
+            cleared
+                .1
+                .pointer("/subagents")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+        );
     }
 
     #[test]
@@ -2506,6 +2737,70 @@ mod tests {
                 .and_then(Value::as_array)
                 .map(Vec::len),
             Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_background_task_keeps_its_subagent_row() {
+        let tools: ToolMap = Arc::new(Mutex::new(HashMap::new()));
+        let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+
+        route_session_update(
+            json!({
+                "sessionId": "ses_1",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "task_1",
+                    "title": "task",
+                    "status": "pending",
+                    "rawInput": { "subagent_type": "developer", "description": "구현" }
+                }
+            }),
+            &tools,
+            &streams,
+            &event_tx,
+        )
+        .await;
+        drain_notifications(&mut event_rx);
+
+        route_session_update(
+            json!({
+                "sessionId": "ses_1",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "task_1",
+                    "status": "completed",
+                    "rawOutput": {
+                        "metadata": {
+                            "background": true,
+                            "sessionId": "child_1",
+                            "jobId": "child_1"
+                        }
+                    }
+                }
+            }),
+            &tools,
+            &streams,
+            &event_tx,
+        )
+        .await;
+        let events = drain_notifications(&mut event_rx);
+        let rows = events
+            .iter()
+            .find(|(method, _)| method == "turn/subagents/updated")
+            .expect("background 완료는 행 유지 알림을 보낸다");
+        assert_eq!(
+            rows.1
+                .pointer("/subagents/0/taskId")
+                .and_then(Value::as_str),
+            Some("child_1")
+        );
+        assert_eq!(
+            rows.1
+                .pointer("/subagents/0/background")
+                .and_then(Value::as_bool),
+            Some(true)
         );
     }
 

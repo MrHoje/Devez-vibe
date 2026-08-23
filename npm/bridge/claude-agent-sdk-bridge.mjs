@@ -1061,22 +1061,27 @@ async function createSession(params, resumeId) {
     planCreatePending: false,
     subagents: new Map(),
     knownSubagents: new Map(),
+    hiddenSubagentTasks: new Set(),
+    subagentPulse: null,
     lastContextUsage: null,
     lastContextWindow: 0,
   };
   const agentQuery = await startAgentQuery(queue, makeOptions(params, id, resumeId));
   session.query = agentQuery;
   sessions.set(id, session);
-  const consumer = consume(session).catch((error) => {
-    notify("error", {
-      threadId: id,
-      provider: "Claude",
-      error: { message: error instanceof Error ? error.message : String(error) },
-      willRetry: false,
+  const consumer = consume(session)
+    .catch((error) => {
+      notify("error", {
+        threadId: id,
+        provider: "Claude",
+        error: { message: error instanceof Error ? error.message : String(error) },
+        willRetry: false,
+      });
+      if (session.turn) finishTurn(session, error);
+    })
+    .finally(() => {
+      clearSubagents(session);
     });
-    clearSubagents(session);
-    if (session.turn) finishTurn(session, error);
-  });
   session.consumer = consumer;
   let initialization;
   try {
@@ -1583,17 +1588,33 @@ function numberedTaskSubject(subject, index) {
 // 서브에이전트는 자기 메시지를 부모 Task 툴콜의 `parent_tool_use_id`와 함께 흘려보낸다.
 // 그 ID로 묶어 두면 지금 어떤 에이전트가 무슨 도구를 돌리는지 그대로 복원할 수 있다.
 const SUBAGENT_TOOLS = ["Agent", "Task"];
+const SUBAGENT_PULSE_MS = 5000;
+const BACKGROUND_SUBAGENT_LEASE_MS = 60_000;
 
 function startSubagent(session, block) {
   const input = block.input || {};
+  const existing = findSubagent(session, block.id);
+  if (existing) {
+    existing.toolUseId = block.id;
+    existing.name = firstLine(input.subagent_type || input.agentType || existing.name || "agent", 40);
+    existing.description = firstLine(
+      input.description || input.prompt || existing.description || "",
+      120,
+    );
+    existing.lastSeenAt = Date.now();
+    emitSubagents(session);
+    return;
+  }
   session.subagents.set(block.id, {
     id: block.id,
+    toolUseId: block.id,
     taskId: "",
     background: false,
     name: firstLine(input.subagent_type || input.agentType || "agent", 40),
     description: firstLine(input.description || input.prompt || "", 120),
     tool: "",
     startedAt: Date.now(),
+    lastSeenAt: Date.now(),
   });
   emitSubagents(session);
 }
@@ -1606,10 +1627,11 @@ function isBackgroundSubagentResult(result) {
 // live until its later task-notification names the same task or tool-use id.
 function keepBackgroundSubagent(session, toolUseId, result) {
   if (!isBackgroundSubagentResult(result)) return false;
-  const running = session.subagents.get(toolUseId);
+  const running = findSubagent(session, toolUseId);
   if (!running) return false;
   running.background = true;
   running.taskId = firstLine(result?.agentId || result?.taskId || "", 80);
+  running.lastSeenAt = Date.now();
   if (running.taskId) {
     session.knownSubagents.set(running.taskId, {
       name: running.name,
@@ -1631,12 +1653,14 @@ function resumeBackgroundSubagent(session, toolUseId, pending, result) {
   const input = pending?.input || {};
   const running = {
     id: toolUseId,
+    toolUseId,
     taskId,
     background: true,
     name: known?.name || "agent",
     description: known?.description || firstLine(input.summary || input.message || "", 120),
     tool: "",
     startedAt: Date.now(),
+    lastSeenAt: Date.now(),
   };
   session.subagents.set(toolUseId, running);
   session.knownSubagents.set(taskId, {
@@ -1649,7 +1673,199 @@ function resumeBackgroundSubagent(session, toolUseId, pending, result) {
 
 function findSubagent(session, id) {
   return session.subagents.get(id)
-    || [...session.subagents.values()].find((agent) => agent.taskId === id);
+    || [...session.subagents.values()].find(
+      (agent) => agent.taskId === id || agent.toolUseId === id,
+    );
+}
+
+function isSubagentTaskType(taskType) {
+  return String(taskType || "").toLowerCase().includes("agent");
+}
+
+// Claude's SDK exposes task_started/task_progress/task_updated/task_notification
+// as structured lifecycle edges. Prefer those fields over parsing the injected
+// XML fallback so a formatting change cannot leave a stale running row.
+function upsertStructuredSubagent(session, message) {
+  const taskId = firstLine(message.task_id || "", 80);
+  const toolUseId = firstLine(message.tool_use_id || "", 80);
+  const subagentType = firstLine(message.subagent_type || "", 40);
+  if (taskId && session.hiddenSubagentTasks?.has(taskId)) return null;
+  const byTool = toolUseId && findSubagent(session, toolUseId);
+  const byTask = taskId && findSubagent(session, taskId);
+  let running = byTool || byTask;
+  // The SDK does not order the background level snapshot against task_started.
+  // If both paths created a row, keep the tool-use row and fold the placeholder
+  // into it before publishing the next snapshot.
+  if (byTool && byTask && byTool !== byTask) {
+    byTool.background ||= byTask.background;
+    byTool.taskId ||= byTask.taskId;
+    byTool.toolUseId ||= byTask.toolUseId;
+    if ((!byTool.name || byTool.name === "agent") && byTask.name) byTool.name = byTask.name;
+    if (!byTool.description) byTool.description = byTask.description;
+    if (!byTool.tool) byTool.tool = byTask.tool;
+    byTool.startedAt = Math.min(byTool.startedAt, byTask.startedAt);
+    byTool.lastSeenAt = Math.max(byTool.lastSeenAt || 0, byTask.lastSeenAt || 0);
+    session.subagents.delete(byTask.id);
+    running = byTool;
+  }
+  if (!running && !subagentType && !isSubagentTaskType(message.task_type)) return null;
+  if (!running) {
+    const known = taskId ? session.knownSubagents.get(taskId) : null;
+    const id = toolUseId || `task:${taskId}`;
+    running = {
+      id,
+      toolUseId,
+      taskId,
+      background: false,
+      name: subagentType || known?.name || "agent",
+      description: firstLine(message.description || known?.description || "", 120),
+      tool: "",
+      startedAt: Date.now(),
+      lastSeenAt: Date.now(),
+    };
+    session.subagents.set(id, running);
+  }
+  if (toolUseId) running.toolUseId = toolUseId;
+  if (taskId) running.taskId = taskId;
+  if (subagentType) running.name = subagentType;
+  const description = firstLine(message.description || "", 120);
+  if (description) running.description = description;
+  running.lastSeenAt = Date.now();
+  if (running.taskId) {
+    session.knownSubagents.set(running.taskId, {
+      name: running.name,
+      description: running.description,
+    });
+  }
+  return running;
+}
+
+function finishStructuredSubagent(session, message, kind, text) {
+  const taskId = firstLine(message.task_id || "", 80);
+  const toolUseId = firstLine(message.tool_use_id || "", 80);
+  const wasHidden = taskId ? session.hiddenSubagentTasks?.delete(taskId) === true : false;
+  const running = (toolUseId && findSubagent(session, toolUseId))
+    || (taskId && findSubagent(session, taskId));
+  if (!running) return wasHidden;
+  emitSubagentLine(session, running.id, { kind, text });
+  session.subagents.delete(running.id);
+  emitSubagents(session);
+  return true;
+}
+
+function syncBackgroundSubagents(session, tasks) {
+  const live = (Array.isArray(tasks) ? tasks : []).filter((task) => {
+    const taskId = firstLine(task?.task_id || "", 80);
+    return !taskId || !session.hiddenSubagentTasks?.has(taskId);
+  });
+  const liveIds = new Set(live.map((task) => firstLine(task?.task_id || "", 80)).filter(Boolean));
+  let changed = false;
+  for (const [id, running] of session.subagents) {
+    if (!running.background || !running.taskId || liveIds.has(running.taskId)) continue;
+    session.subagents.delete(id);
+    changed = true;
+  }
+  for (const task of live) {
+    const taskId = firstLine(task?.task_id || "", 80);
+    if (!taskId) continue;
+    let running = findSubagent(session, taskId);
+    const known = session.knownSubagents.get(taskId);
+    if (!running && !known && !isSubagentTaskType(task?.task_type)) continue;
+    if (!running) {
+      running = {
+        id: `task:${taskId}`,
+        toolUseId: "",
+        taskId,
+        background: true,
+        name: known?.name || "agent",
+        description: firstLine(task?.description || known?.description || "", 120),
+        tool: "",
+        startedAt: Date.now(),
+        lastSeenAt: Date.now(),
+      };
+      session.subagents.set(running.id, running);
+      changed = true;
+    }
+    running.background = true;
+    running.lastSeenAt = Date.now();
+    const description = firstLine(task?.description || "", 120);
+    if (description && description !== running.description) {
+      running.description = description;
+      changed = true;
+    }
+  }
+  if (changed || liveIds.size) emitSubagents(session);
+}
+
+function processSubagentSystemMessage(session, message) {
+  if (message.subtype === "task_started") {
+    if (message.skip_transcript === true) {
+      const taskId = firstLine(message.task_id || "", 80);
+      const toolUseId = firstLine(message.tool_use_id || "", 80);
+      if (taskId) {
+        session.hiddenSubagentTasks ||= new Set();
+        session.hiddenSubagentTasks.add(taskId);
+      }
+      const running = (toolUseId && findSubagent(session, toolUseId))
+        || (taskId && findSubagent(session, taskId));
+      if (running) {
+        session.subagents.delete(running.id);
+        emitSubagents(session);
+      }
+      return true;
+    }
+    const running = upsertStructuredSubagent(session, message);
+    if (!running) return false;
+    emitSubagents(session);
+    return true;
+  }
+  if (message.subtype === "task_progress") {
+    const running = upsertStructuredSubagent(session, message);
+    if (!running) return false;
+    const tool = firstLine(message.last_tool_name || "", 80);
+    if (tool) running.tool = tool;
+    const summary = firstLine(message.summary || "", 200);
+    if (summary && summary !== running.lastSummary) {
+      running.lastSummary = summary;
+      emitSubagentLine(session, running.id, { kind: "result", text: summary });
+    }
+    emitSubagents(session);
+    return true;
+  }
+  if (message.subtype === "task_updated") {
+    const taskId = firstLine(message.task_id || "", 80);
+    const patch = message.patch || {};
+    const status = patch.status;
+    if (["completed", "failed", "killed"].includes(status)) {
+      return finishStructuredSubagent(
+        session,
+        message,
+        status === "completed" ? "result" : "error",
+        firstLine(patch.error || status, 200),
+      );
+    }
+    const running = taskId && findSubagent(session, taskId);
+    if (!running) return false;
+    if (patch.description) running.description = firstLine(patch.description, 120);
+    if (patch.is_backgrounded === true) running.background = true;
+    running.lastSeenAt = Date.now();
+    emitSubagents(session);
+    return true;
+  }
+  if (message.subtype === "task_notification") {
+    const status = firstLine(message.status || "completed", 40);
+    return finishStructuredSubagent(
+      session,
+      message,
+      status === "completed" ? "result" : "error",
+      firstLine(message.summary || status, 200),
+    );
+  }
+  if (message.subtype === "background_tasks_changed") {
+    syncBackgroundSubagents(session, message.tasks);
+    return true;
+  }
+  return false;
 }
 
 // 서브에이전트가 실제로 무엇을 했는지는 자식 메시지에만 남는다. 열람용 기록은 여기서
@@ -1657,6 +1873,7 @@ function findSubagent(session, id) {
 function recordSubagentMessage(session, message) {
   const running = findSubagent(session, message.parent_tool_use_id);
   if (!running) return;
+  running.lastSeenAt = Date.now();
   const content = Array.isArray(message.message?.content) ? message.message.content : [];
   let toolChanged = false;
   for (const block of content) {
@@ -1679,6 +1896,7 @@ function recordSubagentMessage(session, message) {
 function recordSubagentResult(session, message) {
   const running = findSubagent(session, message.parent_tool_use_id);
   if (!running) return;
+  running.lastSeenAt = Date.now();
   const content = Array.isArray(message.message?.content) ? message.message.content : [];
   for (const block of content) {
     if (block.type !== "tool_result") continue;
@@ -1714,7 +1932,9 @@ function subagentToolLabel(block) {
 }
 
 function finishSubagent(session, toolUseId) {
-  if (!session.subagents.delete(toolUseId)) return;
+  const running = findSubagent(session, toolUseId);
+  if (!running) return;
+  session.subagents.delete(running.id);
   emitSubagents(session);
 }
 
@@ -1738,20 +1958,35 @@ function clearForegroundSubagents(session) {
 }
 
 function clearSubagents(session) {
-  if (!session.subagents.size) return;
+  const changed = session.subagents.size > 0;
   session.subagents.clear();
-  emitSubagents(session);
+  session.hiddenSubagentTasks?.clear();
+  if (session.subagentPulse) {
+    clearInterval(session.subagentPulse);
+    session.subagentPulse = null;
+  }
+  if (changed) emitSubagents(session);
 }
 
 function firstLine(value, limit) {
   return String(value ?? "").split("\n")[0].trim().slice(0, limit);
 }
 
-function emitSubagents(session) {
-  // 하위 에이전트가 도는 동안 주기적으로 목록을 다시 알린다. 화면이 이
-  // 생존 신호로 살아 있는 행과 종료 신호를 놓친 행을 구분한다.
+function emitSubagents(session, pulse = false) {
+  // 구조화된 진행 신호가 끊긴 백그라운드 행은 pulse로 영구 연장하지 않는다.
+  // 정상 작업은 task_progress/background_tasks_changed가 lease를 갱신하고,
+  // 종료 edge와 level 신호를 모두 놓친 행만 유한 시간 뒤 제거된다.
+  if (pulse) {
+    const now = Date.now();
+    for (const [id, agent] of session.subagents) {
+      const lastSeenAt = agent.lastSeenAt || agent.startedAt || now;
+      if (agent.background && now - lastSeenAt >= BACKGROUND_SUBAGENT_LEASE_MS) {
+        session.subagents.delete(id);
+      }
+    }
+  }
   if (session.subagents.size && !session.subagentPulse) {
-    session.subagentPulse = setInterval(() => emitSubagents(session), 5000);
+    session.subagentPulse = setInterval(() => emitSubagents(session, true), SUBAGENT_PULSE_MS);
     session.subagentPulse.unref?.();
   } else if (!session.subagents.size && session.subagentPulse) {
     clearInterval(session.subagentPulse);
@@ -2050,6 +2285,9 @@ async function consume(session) {
     } else if (message.type === "assistant") processAssistant(session, message);
     else if (message.type === "user") processUser(session, message);
     else if (message.type === "result") await processResult(session, message);
+    else if (message.type === "system" && processSubagentSystemMessage(session, message)) {
+      // Structured SDK task lifecycle handled above.
+    }
     else if (message.type === "system" && message.subtype === "compact_boundary") {
       noteCompactBoundary(session, message.compact_metadata);
       notify("thread/compacted", { threadId: session.id });
@@ -2671,6 +2909,7 @@ async function dispatch(method, params = {}) {
   if (method === "session/close") {
     const session = lookupSession(params.sessionId);
     if (session) {
+      clearSubagents(session);
       session.queue.close();
       session.query.close();
       sessions.delete(session.id);
@@ -2688,6 +2927,7 @@ async function dispatch(method, params = {}) {
   }
   if (method === "shutdown") {
     for (const session of sessions.values()) {
+      clearSubagents(session);
       session.queue.close();
       session.query.close();
     }
@@ -3136,6 +3376,168 @@ async function runSelfTest() {
       throw new Error("Claude failed task notification did not finish the resumed agent");
     }
     finishTurn(lifecycleSession, null, 1);
+
+    const structuredSession = {
+      id: "structured-self-test",
+      turn: null,
+      subagents: new Map(),
+      knownSubagents: new Map(),
+      hiddenSubagentTasks: new Set(),
+      subagentPulse: null,
+    };
+    processSubagentSystemMessage(structuredSession, {
+      type: "system",
+      subtype: "task_started",
+      task_id: "agent-structured",
+      tool_use_id: "toolu_structured",
+      task_type: "agent",
+      subagent_type: "Explore",
+      description: "Inspect structured events",
+    });
+    processSubagentSystemMessage(structuredSession, {
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{
+        task_id: "agent-structured",
+        task_type: "agent",
+        description: "Inspect structured events",
+      }],
+    });
+    processSubagentSystemMessage(structuredSession, {
+      type: "system",
+      subtype: "task_progress",
+      task_id: "agent-structured",
+      tool_use_id: "toolu_structured",
+      subagent_type: "Explore",
+      description: "Inspect structured events",
+      last_tool_name: "Read",
+      summary: "Reading lifecycle source",
+    });
+    const structured = structuredSession.subagents.get("toolu_structured");
+    if (!structured?.background || structured.tool !== "Read") {
+      throw new Error(`Claude structured task progress self-test failed: ${JSON.stringify(structured)}`);
+    }
+    processSubagentSystemMessage(structuredSession, {
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [],
+    });
+    if (structuredSession.subagents.size !== 0) {
+      throw new Error("Claude background task snapshot did not remove a finished subagent");
+    }
+
+    processSubagentSystemMessage(structuredSession, {
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "agent-reordered", task_type: "agent", description: "Race" }],
+    });
+    startSubagent(structuredSession, {
+      id: "toolu_reordered",
+      input: { subagent_type: "Explore", description: "Race" },
+    });
+    processSubagentSystemMessage(structuredSession, {
+      type: "system",
+      subtype: "task_started",
+      task_id: "agent-reordered",
+      tool_use_id: "toolu_reordered",
+      task_type: "agent",
+      subagent_type: "Explore",
+    });
+    const reordered = findSubagent(structuredSession, "toolu_reordered");
+    if (structuredSession.subagents.size !== 1
+      || !reordered?.background
+      || reordered.taskId !== "agent-reordered") {
+      throw new Error(`Claude reordered lifecycle self-test failed: ${JSON.stringify([...structuredSession.subagents])}`);
+    }
+    processSubagentSystemMessage(structuredSession, {
+      type: "system",
+      subtype: "task_notification",
+      task_id: "agent-reordered",
+      tool_use_id: "toolu_reordered",
+      status: "completed",
+      summary: "Agent finished",
+    });
+
+    processSubagentSystemMessage(structuredSession, {
+      type: "system",
+      subtype: "task_started",
+      task_id: "agent-edge-first",
+      tool_use_id: "toolu_edge_first",
+      task_type: "agent",
+      subagent_type: "Explore",
+      description: "Edge first",
+    });
+    startSubagent(structuredSession, {
+      id: "toolu_edge_first",
+      input: { subagent_type: "Explore", description: "Edge first" },
+    });
+    const edgeFirst = findSubagent(structuredSession, "toolu_edge_first");
+    if (structuredSession.subagents.size !== 1 || edgeFirst?.taskId !== "agent-edge-first") {
+      throw new Error(`Claude edge-first lifecycle self-test failed: ${JSON.stringify([...structuredSession.subagents])}`);
+    }
+    finishSubagent(structuredSession, "toolu_edge_first");
+    if (structuredSession.subagents.size !== 0) {
+      throw new Error("Claude aliased tool completion did not remove the subagent row");
+    }
+
+    processSubagentSystemMessage(structuredSession, {
+      type: "system",
+      subtype: "task_started",
+      task_id: "agent-hidden",
+      task_type: "agent",
+      subagent_type: "Explore",
+      skip_transcript: true,
+    });
+    processSubagentSystemMessage(structuredSession, {
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "agent-hidden", task_type: "agent", description: "Housekeeping" }],
+    });
+    if (structuredSession.subagents.size !== 0) {
+      throw new Error("Claude skip_transcript task was shown as a subagent row");
+    }
+    processSubagentSystemMessage(structuredSession, {
+      type: "system",
+      subtype: "task_notification",
+      task_id: "agent-hidden",
+      status: "completed",
+      summary: "Hidden task finished",
+    });
+
+    processSubagentSystemMessage(structuredSession, {
+      type: "system",
+      subtype: "task_started",
+      task_id: "agent-notified",
+      tool_use_id: "toolu_notified",
+      task_type: "agent",
+      subagent_type: "Explore",
+    });
+    processSubagentSystemMessage(structuredSession, {
+      type: "system",
+      subtype: "task_notification",
+      task_id: "agent-notified",
+      tool_use_id: "toolu_notified",
+      status: "failed",
+      summary: "Agent failed",
+    });
+    if (structuredSession.subagents.size !== 0) {
+      throw new Error("Claude structured task notification did not remove a failed subagent");
+    }
+
+    structuredSession.subagents.set("expired", {
+      id: "expired",
+      taskId: "agent-expired",
+      background: true,
+      name: "Explore",
+      description: "",
+      tool: "",
+      startedAt: Date.now() - BACKGROUND_SUBAGENT_LEASE_MS - 1,
+      lastSeenAt: Date.now() - BACKGROUND_SUBAGENT_LEASE_MS - 1,
+    });
+    emitSubagents(structuredSession, true);
+    if (structuredSession.subagents.size !== 0) {
+      throw new Error("Claude expired background subagent lease self-test failed");
+    }
   } finally {
     process.stdout.write = stdoutWrite;
   }
@@ -3300,5 +3702,8 @@ lines.on("line", async (line) => {
 });
 
 lines.on("close", () => {
-  for (const session of sessions.values()) session.query.close();
+  for (const session of sessions.values()) {
+    clearSubagents(session);
+    session.query.close();
+  }
 });

@@ -112,7 +112,7 @@ impl ClaudeClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        isolate_ctrl_c(&mut command);
+        crate::child_process::isolate_backend(&mut command);
         let mut child = command.spawn().with_context(|| {
             format!(
                 "Claude Agent SDK 브리지를 시작하지 못했습니다: {}",
@@ -526,14 +526,6 @@ fn resolve_command(command: &Path) -> PathBuf {
     command.to_path_buf()
 }
 
-#[cfg(windows)]
-fn isolate_ctrl_c(command: &mut Command) {
-    command.creation_flags(0x0000_0200);
-}
-
-#[cfg(not(windows))]
-fn isolate_ctrl_c(_: &mut Command) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -709,6 +701,10 @@ mod tests {
         assert!(bridge.contains("message.origin?.kind !== \"task-notification\""));
         assert!(bridge.contains("finishNotifiedSubagents(session, notifications)"));
         assert!(bridge.contains("resumeBackgroundSubagent(session, block.tool_use_id"));
+        assert!(bridge.contains("processSubagentSystemMessage(session, message)"));
+        assert!(bridge.contains("message.subtype === \"background_tasks_changed\""));
+        assert!(bridge.contains("message.subtype === \"task_notification\""));
+        assert!(bridge.contains("BACKGROUND_SUBAGENT_LEASE_MS"));
         assert!(bridge.contains("clearForegroundSubagents(session)"));
         assert!(bridge.contains("if (!session.turn) beginTurn(session);"));
         assert!(bridge.contains("notify(\"turn/subagents/updated\""));
