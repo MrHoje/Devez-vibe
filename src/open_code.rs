@@ -37,6 +37,10 @@ type LoadingMap = Arc<Mutex<HashMap<String, Vec<HistoryChunk>>>>;
 type HistoryMap = Arc<Mutex<HashMap<String, Value>>>;
 type Notification = (String, Value);
 
+/// Background child status is local OpenCode state, so polling once a second
+/// removes a completed row promptly without adding external network traffic.
+const BACKGROUND_SUBAGENT_STATUS_POLL: Duration = Duration::from_secs(1);
+
 #[derive(Clone)]
 struct DetachedTurn {
     session_id: String,
@@ -196,6 +200,7 @@ impl SessionStreams {
         entry["background"] = Value::Bool(true);
         entry["taskId"] = Value::String(task_id.to_owned());
         entry["missingPolls"] = json!(0);
+        entry["observedActive"] = Value::Bool(false);
         Some(self.subagents_notification(session_id))
     }
 
@@ -222,8 +227,9 @@ impl SessionStreams {
             .any(|entry| entry.get("background").and_then(Value::as_bool) == Some(true))
     }
 
-    /// `/session/status` omits idle sessions. Two consecutive missing snapshots
-    /// avoid a launch race, while each active snapshot acts as the row heartbeat.
+    /// `/session/status` omits idle sessions. Before the child is observed, two
+    /// missing snapshots absorb the launch race. Once it has been active, the
+    /// first missing or explicit idle snapshot is authoritative completion.
     fn reconcile_background_subagents(
         &mut self,
         session_id: &str,
@@ -239,16 +245,22 @@ impl SessionStreams {
                 .get("taskId")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let active = !task_id.is_empty()
-                && statuses
-                    .get(task_id)
-                    .and_then(|status| status.get("type"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|status| status != "idle");
-            if active {
+            let status = (!task_id.is_empty())
+                .then(|| statuses.get(task_id))
+                .flatten()
+                .and_then(|status| status.get("type"))
+                .and_then(Value::as_str);
+            if status.is_some_and(|status| status != "idle") {
                 entry["missingPolls"] = json!(0);
+                entry["observedActive"] = Value::Bool(true);
                 retained_background = true;
                 return true;
+            }
+            if status == Some("idle")
+                || entry.get("observedActive").and_then(Value::as_bool) == Some(true)
+            {
+                changed = true;
+                return false;
             }
             let missing = entry
                 .get("missingPolls")
@@ -785,7 +797,7 @@ impl OpenCodeServer {
         let subagent_events = event_tx.clone();
         let subagent_task = tokio::spawn(async move {
             loop {
-                sleep(Duration::from_secs(5)).await;
+                sleep(BACKGROUND_SUBAGENT_STATUS_POLL).await;
                 if subagent_events.is_closed() {
                     break;
                 }
@@ -2337,20 +2349,9 @@ mod tests {
         );
         assert!(streams.subagents_cleared("s").is_none());
 
-        let active = streams
-            .reconcile_background_subagents("s", &json!({ "child_1": { "type": "busy" } }))
-            .expect("실행 중 상태는 heartbeat를 보낸다");
-        assert_eq!(
-            active
-                .1
-                .pointer("/subagents")
-                .and_then(Value::as_array)
-                .map(Vec::len),
-            Some(1)
-        );
         let first_missing = streams
             .reconcile_background_subagents("s", &json!({}))
-            .expect("첫 누락은 시작 경합으로 보고 행을 유지한다");
+            .expect("관측 전 첫 누락은 시작 경합으로 보고 행을 유지한다");
         assert_eq!(
             first_missing
                 .1
@@ -2359,11 +2360,11 @@ mod tests {
                 .map(Vec::len),
             Some(1)
         );
-        let finished = streams
+        let quick_finish = streams
             .reconcile_background_subagents("s", &json!({}))
-            .expect("연속 누락이면 종료된 자식 세션 행을 제거한다");
+            .expect("관측 전에도 연속 누락이면 빠른 종료로 확정한다");
         assert_eq!(
-            finished
+            quick_finish
                 .1
                 .pointer("/subagents")
                 .and_then(Value::as_array)
@@ -2374,6 +2375,62 @@ mod tests {
         streams.subagent_started(
             "s",
             &json!({ "toolCallId": "call_2", "title": "task", "rawInput": {} }),
+        );
+        streams.subagent_tool_completed(
+            "s",
+            "call_2",
+            &json!({
+                "rawOutput": { "metadata": { "background": true, "sessionId": "child_2" } }
+            }),
+        );
+        let active = streams
+            .reconcile_background_subagents("s", &json!({ "child_2": { "type": "busy" } }))
+            .expect("실행 중 상태는 heartbeat를 보낸다");
+        assert_eq!(
+            active
+                .1
+                .pointer("/subagents")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
+        let observed_finish = streams
+            .reconcile_background_subagents("s", &json!({}))
+            .expect("실행이 확인된 자식은 첫 누락에 바로 제거한다");
+        assert_eq!(
+            observed_finish
+                .1
+                .pointer("/subagents")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+
+        streams.subagent_started(
+            "s",
+            &json!({ "toolCallId": "call_3", "title": "task", "rawInput": {} }),
+        );
+        streams.subagent_tool_completed(
+            "s",
+            "call_3",
+            &json!({
+                "rawOutput": { "metadata": { "background": true, "sessionId": "child_3" } }
+            }),
+        );
+        let explicit_idle = streams
+            .reconcile_background_subagents("s", &json!({ "child_3": { "type": "idle" } }))
+            .expect("명시적 idle은 첫 상태 확인에서 제거한다");
+        assert!(
+            explicit_idle
+                .1
+                .pointer("/subagents")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+        );
+
+        streams.subagent_started(
+            "s",
+            &json!({ "toolCallId": "call_4", "title": "task", "rawInput": {} }),
         );
         let cleared = streams
             .all_subagents_cleared("s")

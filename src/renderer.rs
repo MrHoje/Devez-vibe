@@ -542,7 +542,8 @@ pub struct View<'a> {
     pub editor: &'a Editor,
     pub composer_images: &'a [String],
     pub queued_prompts: Vec<String>,
-    /// Running subagents shown under the status line.
+    /// Running subagents shown in the side panel when it is open, or under the
+    /// status line as the narrow-layout fallback.
     pub subagents: Vec<SubagentView>,
     pub composer_placeholder: &'a str,
     pub welcome: Option<WelcomeView>,
@@ -2358,6 +2359,11 @@ impl Renderer {
             composer_notice: view.composer_notice,
             composer_mode: view.composer_mode,
         };
+        let main_subagents = if side_panel.is_some() {
+            &[][..]
+        } else {
+            view.subagents.as_slice()
+        };
         let mut frame = if let Some(overlay) = view.overlay {
             overlay_frame_with_expansion(live_lines, overlay, view.welcome, status, frame_width)
         } else {
@@ -2366,7 +2372,7 @@ impl Renderer {
                 view.editor,
                 view.composer_images,
                 &view.queued_prompts,
-                &view.subagents,
+                main_subagents,
                 view.composer_placeholder,
                 view.welcome,
                 &view.suggestions,
@@ -2396,6 +2402,7 @@ impl Renderer {
                 view.turn_active,
                 view.waiting_for_response,
                 question_closed_from,
+                &view.subagents,
                 view.side_panel_prompts_expanded,
                 &view.side_panel_integrations,
                 view.stream_fade_tail,
@@ -2729,6 +2736,7 @@ impl Renderer {
         turn_active: bool,
         waiting_for_response: bool,
         question_closed_from: Option<usize>,
+        subagents: &[SubagentView],
         side_panel_prompts_expanded: bool,
         side_panel_integrations: &[ProviderIntegrationView],
         stream_fade_tail: usize,
@@ -2789,16 +2797,19 @@ impl Renderer {
         let panel_content = self
             .side_panel
             .map(|layout| {
-                let mut lines = plan_summary
-                    .map(|summary| {
-                        side_panel_plan_lines(
-                            summary,
-                            layout.content_width(),
-                            activity_phase,
-                            plan_active,
-                        )
-                    })
-                    .unwrap_or_default();
+                let mut lines = side_panel_subagent_lines(subagents, layout.content_width());
+                lines.extend(
+                    plan_summary
+                        .map(|summary| {
+                            side_panel_plan_lines(
+                                summary,
+                                layout.content_width(),
+                                activity_phase,
+                                plan_active,
+                            )
+                        })
+                        .unwrap_or_default(),
+                );
                 lines.extend(side_panel_prompt_lines(
                     &self.history,
                     layout.content_width(),
@@ -7732,6 +7743,58 @@ fn side_panel_plan_lines(
         lines.push(PaintLine::blank());
     }
     lines.push(side_panel_divider(content_width));
+    lines
+}
+
+const SIDE_PANEL_SUBAGENT_LIMIT: usize = 5;
+
+/// Active provider subagents take the top of the docked panel while any are
+/// running. The same list remains below the status line when the panel is shut,
+/// so opening the panel moves the information instead of duplicating it.
+fn side_panel_subagent_lines(subagents: &[SubagentView], content_width: usize) -> Vec<PaintLine> {
+    if subagents.is_empty() || content_width == 0 {
+        return Vec::new();
+    }
+
+    let mut lines = vec![
+        PaintLine {
+            text: compact_right(
+                &format!("Subagents  {} 실행 중", subagents.len()),
+                content_width,
+            ),
+            bold: true,
+            ..PaintLine::plain("")
+        },
+        PaintLine::blank(),
+    ];
+    for (index, subagent) in subagents.iter().take(SIDE_PANEL_SUBAGENT_LIMIT).enumerate() {
+        let elapsed = format!(" · {}", format_subagent_elapsed(subagent.elapsed.as_secs()));
+        let prefix = "• ";
+        let available = content_width.saturating_sub(
+            UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(elapsed.as_str()),
+        );
+        lines.push(PaintLine {
+            prefix: prefix.to_owned(),
+            prefix_tone: Tone::Accent,
+            text: compact_right(&subagent.name, available),
+            tone: Tone::Plain,
+            tail: vec![PaintSpan {
+                text: elapsed,
+                tone: Tone::Muted,
+                bold: false,
+            }],
+            pick: Some(PickRegions::span(0, content_width, Pick::Subagent(index))),
+            ..PaintLine::plain("")
+        });
+    }
+    let hidden = subagents.len().saturating_sub(SIDE_PANEL_SUBAGENT_LIMIT);
+    if hidden > 0 {
+        lines.push(PaintLine {
+            tone: Tone::Muted,
+            ..PaintLine::plain(compact_right(&format!("… +{hidden}"), content_width))
+        });
+    }
+    lines.extend([PaintLine::blank(), side_panel_divider(content_width)]);
     lines
 }
 
@@ -14601,6 +14664,40 @@ mod tests {
         assert_eq!(pick_on(&lines[0], "Explore"), Some(Pick::Subagent(0)));
         assert_eq!(pick_on(&lines[1], "developer"), Some(Pick::Subagent(1)));
         assert_eq!(pick_on(&lines[0], "4s"), None);
+    }
+
+    #[test]
+    fn the_side_panel_lists_running_subagents_as_clickable_rows() {
+        let subagents = [
+            test_subagent("Explore", "Find auth code", "Grep(fn login)", 93),
+            test_subagent("developer", "Fix the parser", "", 3),
+        ];
+
+        let lines = side_panel_subagent_lines(&subagents, 44);
+
+        assert_eq!(painted(&lines[0]), "Subagents  2 실행 중");
+        assert!(lines[1] == PaintLine::blank());
+        assert_eq!(painted(&lines[2]), "• Explore · 1m 33s");
+        assert_eq!(painted(&lines[3]), "• developer · 3s");
+        assert_eq!(pick_on(&lines[2], "Explore"), Some(Pick::Subagent(0)));
+        assert_eq!(pick_on(&lines[2], "1m 33s"), Some(Pick::Subagent(0)));
+        assert_eq!(pick_on(&lines[3], "developer"), Some(Pick::Subagent(1)));
+        assert!(lines[4] == PaintLine::blank());
+        assert_eq!(lines[5].tone, Tone::SidePanelDivider);
+        assert!(lines.iter().all(|line| painted_line_width(line) <= 44));
+    }
+
+    #[test]
+    fn the_side_panel_hides_the_subagent_section_when_idle_and_caps_fan_out() {
+        assert!(side_panel_subagent_lines(&[], 44).is_empty());
+        let subagents = (0..=SIDE_PANEL_SUBAGENT_LIMIT)
+            .map(|index| test_subagent(&format!("agent-{index}"), "", "", 1))
+            .collect::<Vec<_>>();
+
+        let lines = side_panel_subagent_lines(&subagents, 44);
+
+        assert_eq!(painted(&lines[0]), "Subagents  6 실행 중");
+        assert_eq!(painted(&lines[2 + SIDE_PANEL_SUBAGENT_LIMIT]), "… +1");
     }
 
     #[test]

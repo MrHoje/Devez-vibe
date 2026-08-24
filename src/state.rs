@@ -3507,10 +3507,10 @@ struct SubagentLogLine {
 /// oldest lines are dropped rather than held for the rest of the session.
 const SUBAGENT_LOG_LIMIT: usize = 400;
 
-/// 턴이 끝난 뒤 하위 에이전트 행이 아무 갱신 없이 버틸 수 있는 시간. 브리지가
-/// 하위 에이전트가 살아 있는 동안 5초마다 목록을 다시 알려 주므로, 이 유예에
-/// 걸리는 행은 생존 신호를 세 번 연속 놓친 것뿐이다. 살아 있는 행은 로그와
-/// 목록 갱신이 유예를 계속 미뤄서 여기 걸리지 않는다.
+/// 턴이 끝난 뒤 하위 에이전트 행이 아무 갱신 없이 버틸 수 있는 시간. Claude는
+/// 5초마다, OpenCode는 1초마다 목록을 다시 알려 주므로 이 유예에 걸리는 행은
+/// 생존 신호를 여러 번 연속 놓친 것뿐이다. 살아 있는 행은 로그와 목록 갱신이
+/// 유예를 계속 미뤄서 여기 걸리지 않는다.
 const SUBAGENT_LINGER_GRACE: Duration = Duration::from_secs(15);
 /// Codex child liveness is re-read from the app-server before a quiet row is
 /// removed. Three unknown replies bound a broken probe without cutting off one
@@ -6321,7 +6321,7 @@ impl AppState {
         if settled.elapsed() < SUBAGENT_LINGER_GRACE {
             return false;
         }
-        // Claude and OpenCode publish five-second heartbeats, so silence is a
+        // Claude and OpenCode publish periodic heartbeats, so silence is a
         // useful fallback there. Codex does not: a child may legitimately spend
         // longer than this inside one command. The event loop probes thread/read
         // for those rows and only removes a confirmed terminal child.
@@ -17113,6 +17113,29 @@ mod tests {
     }
 
     #[test]
+    fn a_terminal_subagent_snapshot_clears_the_row_during_the_parent_turn() {
+        let mut state = test_state();
+        state.busy = true;
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({
+                "subagents": [{
+                    "id": "toolu_1",
+                    "name": "Explore",
+                    "description": "검수",
+                    "tool": "Read"
+                }]
+            }),
+        );
+        assert_eq!(state.view().subagents.len(), 1);
+
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
+
+        assert!(state.view().subagents.is_empty());
+        assert!(state.subagents_settled_at.is_none());
+    }
+
+    #[test]
     fn a_lingering_subagent_row_is_swept_after_the_grace_period() {
         let mut state = test_state();
         state.handle_notification(
@@ -17317,6 +17340,33 @@ mod tests {
     }
 
     #[test]
+    fn every_terminal_codex_turn_event_removes_the_running_row() {
+        let child = "00000000-0000-0000-0000-000000000109";
+        for method in ["turn/completed", "turn/failed", "turn/aborted"] {
+            let mut state = test_state();
+            spawn_codex_subagent(&mut state, child);
+
+            state.handle_notification(
+                method,
+                &json!({
+                    "threadId": child,
+                    "turn": { "id": "child-turn", "status": method.trim_start_matches("turn/") }
+                }),
+            );
+
+            assert!(
+                state.view().subagents.is_empty(),
+                "terminal event {method} must remove the row"
+            );
+        }
+
+        let mut state = test_state();
+        spawn_codex_subagent(&mut state, child);
+        state.handle_notification("item/completed", &codex_activity(child, "interrupted"));
+        assert!(state.view().subagents.is_empty());
+    }
+
+    #[test]
     fn delayed_codex_activity_cannot_revive_a_stopped_child_but_a_new_turn_can() {
         let mut state = test_state();
         let child = "00000000-0000-0000-0000-000000000103";
@@ -17429,12 +17479,17 @@ mod tests {
     fn codex_idle_and_closed_are_independent_terminal_signals() {
         let child = "00000000-0000-0000-0000-000000000105";
         let mut state = test_state();
-        spawn_codex_subagent(&mut state, child);
-        state.handle_notification(
-            "thread/status/changed",
-            &json!({ "threadId": child, "status": { "type": "idle" } }),
-        );
-        assert!(state.view().subagents.is_empty());
+        for status in ["idle", "notLoaded", "systemError"] {
+            spawn_codex_subagent(&mut state, child);
+            state.handle_notification(
+                "thread/status/changed",
+                &json!({ "threadId": child, "status": { "type": status } }),
+            );
+            assert!(
+                state.view().subagents.is_empty(),
+                "terminal status {status} must remove the row"
+            );
+        }
 
         spawn_codex_subagent(&mut state, child);
         assert_eq!(state.view().subagents.len(), 1);

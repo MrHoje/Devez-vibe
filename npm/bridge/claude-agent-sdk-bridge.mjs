@@ -3524,6 +3524,29 @@ async function runSelfTest() {
       throw new Error("Claude structured task notification did not remove a failed subagent");
     }
 
+    for (const status of ["completed", "failed", "killed"]) {
+      const taskId = `agent-updated-${status}`;
+      const toolUseId = `toolu_updated_${status}`;
+      processSubagentSystemMessage(structuredSession, {
+        type: "system",
+        subtype: "task_started",
+        task_id: taskId,
+        tool_use_id: toolUseId,
+        task_type: "agent",
+        subagent_type: "Explore",
+      });
+      processSubagentSystemMessage(structuredSession, {
+        type: "system",
+        subtype: "task_updated",
+        task_id: taskId,
+        tool_use_id: toolUseId,
+        patch: { status, error: status === "completed" ? undefined : `Agent ${status}` },
+      });
+      if (structuredSession.subagents.size !== 0) {
+        throw new Error(`Claude task_updated ${status} did not remove the subagent`);
+      }
+    }
+
     structuredSession.subagents.set("expired", {
       id: "expired",
       taskId: "agent-expired",
