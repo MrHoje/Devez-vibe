@@ -1847,7 +1847,7 @@ enum PendingInteraction {
         current: usize,
         selected: usize,
         editor: Editor,
-        answers: BTreeMap<String, String>,
+        answers: BTreeMap<String, Vec<String>>,
     },
     McpForm(McpForm),
     McpApproval(McpApproval),
@@ -2029,6 +2029,8 @@ struct Question {
     question: String,
     options: Vec<QuestionOption>,
     allow_other: bool,
+    /// 여러 줄을 함께 고르는 질문. 켜져 있으면 Space가 줄을 켜고 끄며 Enter가 확정한다.
+    multi_select: bool,
 }
 
 struct QuestionOption {
@@ -10077,7 +10079,12 @@ impl AppState {
                                 });
                                 return Action::None;
                             };
-                            answers.insert(question.id.clone(), answer);
+                            if question.multi_select {
+                                // 다중 선택 질문의 직접 입력은 켜 둔 줄들과 함께 간다.
+                                answers.entry(question.id.clone()).or_default().push(answer);
+                            } else {
+                                answers.insert(question.id.clone(), vec![answer]);
+                            }
                             return next_question_or_reply(id, questions, current, answers, self);
                         }
                         // Claude Code makes `Other` an input option rather than a
@@ -10123,7 +10130,13 @@ impl AppState {
                         KeyCode::Char(ch) if !ctrl && !alt => match ch.to_digit(10) {
                             Some(digit) if digit >= 1 && digit as usize - 1 <= chat_instead => {
                                 selected = digit as usize - 1;
-                                KeyCode::Enter
+                                // 다중 선택은 번호가 그 줄을 켜고 끄기만 한다. 보내는 일은
+                                // Enter 몫이라 번호를 눌러도 질문이 닫히지 않는다.
+                                if question.multi_select && selected < question.options.len() {
+                                    KeyCode::Char(' ')
+                                } else {
+                                    KeyCode::Enter
+                                }
                             }
                             _ => key.code,
                         },
@@ -10132,12 +10145,32 @@ impl AppState {
                     match pressed {
                         KeyCode::Up => selected = selected.saturating_sub(1),
                         KeyCode::Down => selected = (selected + 1).min(chat_instead),
+                        KeyCode::Char(' ')
+                            if question.multi_select && selected < question.options.len() =>
+                        {
+                            toggle_answer(
+                                &mut answers,
+                                &question.id,
+                                &question.options[selected].label,
+                            );
+                        }
                         KeyCode::Enter => {
                             if selected < question.options.len() {
-                                answers.insert(
-                                    question.id.clone(),
-                                    question.options[selected].label.clone(),
-                                );
+                                if question.multi_select {
+                                    // 아직 아무 줄도 켜지 않았으면 커서가 놓인 줄이 답이다.
+                                    if !answers.contains_key(&question.id) {
+                                        toggle_answer(
+                                            &mut answers,
+                                            &question.id,
+                                            &question.options[selected].label,
+                                        );
+                                    }
+                                } else {
+                                    answers.insert(
+                                        question.id.clone(),
+                                        vec![question.options[selected].label.clone()],
+                                    );
+                                }
                                 return next_question_or_reply(
                                     id, questions, current, answers, self,
                                 );
@@ -11303,6 +11336,7 @@ impl AppState {
                 current,
                 selected,
                 editor,
+                answers,
                 ..
             } => {
                 let question = &questions[*current];
@@ -11318,8 +11352,22 @@ impl AppState {
                 let text_focused = user_input_text_focused(question, *selected);
                 if !question.options.is_empty() {
                     lines.extend(question.options.iter().enumerate().map(|(index, option)| {
+                        // 다중 선택 질문은 줄마다 켜짐 상태를 앞에 달아 보여 준다.
+                        let label = if question.multi_select {
+                            format!(
+                                "{} {}",
+                                if answer_picked(answers, &question.id, &option.label) {
+                                    '☑'
+                                } else {
+                                    '☐'
+                                },
+                                option.label
+                            )
+                        } else {
+                            option.label.clone()
+                        };
                         OverlayLine {
-                            text: format!("{}\n{}", option.label, option.description),
+                            text: format!("{label}\n{}", option.description),
                             selected: index == *selected,
                             muted: false,
                         }
@@ -11355,6 +11403,8 @@ impl AppState {
                     slider: None,
                     hint: if text_focused {
                         "Enter 전송 · Esc 취소".to_owned()
+                    } else if question.multi_select {
+                        "Space 선택 · Enter 확정 · ↑/↓ 이동 · Esc 취소".to_owned()
                     } else {
                         "Enter 선택 · ↑/↓ 이동 · Esc 취소".to_owned()
                     },
@@ -12415,8 +12465,22 @@ impl AppState {
                 match clicked {
                     Some(clicked) if clicked < question.options.len() => {
                         let label = question.options[clicked].label.clone();
-                        answers.insert(question.id.clone(), label);
-                        next_question_or_reply(id, questions, current, answers, self)
+                        if question.multi_select {
+                            // 다중 선택은 클릭도 그 줄을 켜고 끄기만 한다.
+                            toggle_answer(&mut answers, &question.id, &label);
+                            self.pending = Some(PendingInteraction::UserInput {
+                                id,
+                                questions,
+                                current,
+                                selected: clicked,
+                                editor,
+                                answers,
+                            });
+                            Action::Tick(false)
+                        } else {
+                            answers.insert(question.id.clone(), vec![label]);
+                            next_question_or_reply(id, questions, current, answers, self)
+                        }
                     }
                     Some(clicked) if clicked == chat_instead => Action::RpcResponse {
                         id,
@@ -13203,7 +13267,7 @@ fn next_question_or_reply(
     id: Value,
     questions: Vec<Question>,
     current: usize,
-    answers: BTreeMap<String, String>,
+    answers: BTreeMap<String, Vec<String>>,
     state: &mut AppState,
 ) -> Action {
     if current + 1 == questions.len() {
@@ -13231,13 +13295,19 @@ fn next_question_or_reply(
 fn commit_user_input_answers(
     state: &mut AppState,
     questions: &[Question],
-    answers: &BTreeMap<String, String>,
+    answers: &BTreeMap<String, Vec<String>>,
 ) {
     let answered = questions
         .iter()
         .filter_map(|question| {
-            let answer = answers.get(&question.id)?.trim();
-            (!answer.is_empty()).then_some((question, answer))
+            // 다중 선택 질문은 켜 둔 줄들을 한 답으로 이어 적는다.
+            let picks = answers
+                .get(&question.id)?
+                .iter()
+                .map(|answer| strip_recommendation_mark(answer.trim()))
+                .filter(|answer| !answer.is_empty())
+                .collect::<Vec<_>>();
+            (!picks.is_empty()).then(|| (question, picks.join(", ")))
         })
         .collect::<Vec<_>>();
     if answered.is_empty() {
@@ -13250,7 +13320,6 @@ fn commit_user_input_answers(
                 .question
                 .trim()
                 .trim_end_matches([':', '：', '?', '？']);
-            let answer = strip_recommendation_mark(answer);
             format!("{question}:\n  ↳ {answer}")
         })
         .collect::<Vec<_>>()
@@ -13296,12 +13365,34 @@ fn chat_instead_index(question: &Question) -> usize {
     question.options.len() + usize::from(question.allow_other)
 }
 
-fn answers_response(answers: &BTreeMap<String, String>) -> Value {
+fn answers_response(answers: &BTreeMap<String, Vec<String>>) -> Value {
     let mut map = Map::new();
     for (id, answer) in answers {
-        map.insert(id.clone(), json!({ "answers": [answer] }));
+        map.insert(id.clone(), json!({ "answers": answer }));
     }
     json!({ "answers": map })
+}
+
+/// 다중 선택 질문의 한 줄을 켜고 끈다. 마지막 줄을 끄면 답 자체를 비워, 아무것도
+/// 고르지 않은 질문이 빈 배열로 전달되지 않게 한다.
+fn toggle_answer(answers: &mut BTreeMap<String, Vec<String>>, id: &str, label: &str) {
+    let picks = answers.entry(id.to_owned()).or_default();
+    match picks.iter().position(|pick| pick == label) {
+        Some(index) => {
+            picks.remove(index);
+            if picks.is_empty() {
+                answers.remove(id);
+            }
+        }
+        None => picks.push(label.to_owned()),
+    }
+}
+
+/// 다중 선택 질문에서 그 줄을 켜 두었는지.
+fn answer_picked(answers: &BTreeMap<String, Vec<String>>, id: &str, label: &str) -> bool {
+    answers
+        .get(id)
+        .is_some_and(|picks| picks.iter().any(|pick| pick == label))
 }
 
 fn parse_questions(params: &Value) -> Vec<Question> {
@@ -13346,6 +13437,10 @@ fn parse_questions(params: &Value) -> Vec<Question> {
                     .get("isOther")
                     .and_then(Value::as_bool)
                     .unwrap_or(true),
+                multi_select: question
+                    .get("multiSelect")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             })
         })
         .collect()
@@ -15545,6 +15640,82 @@ mod tests {
             ),
             "row 2 did not answer with its own option"
         );
+    }
+
+    /// 체크박스로 오는 질문은 한 줄만 고르고 닫히면 나머지 답을 잃는다. Space와
+    /// 번호는 줄을 켜고 끄기만 하고, 보내는 일은 Enter가 맡아야 한다.
+    #[test]
+    fn a_multi_select_question_sends_every_checked_row() {
+        let question = json!({
+            "questions": [{
+                "id": "q1",
+                "question": "무엇이 필요한가요?",
+                "multiSelect": true,
+                "options": [
+                    { "label": "크기 조절", "description": "설명" },
+                    { "label": "위치 기억", "description": "설명" },
+                    { "label": "주소 기억", "description": "설명" }
+                ]
+            }]
+        });
+
+        let mut state = test_state();
+        state.begin_server_request(json!(1), "item/tool/requestUserInput", &question);
+        // 번호는 그 줄을 켜기만 하므로 질문이 그대로 열려 있어야 한다.
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+            Action::None
+        ));
+        state.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        let overlay = state.overlay_view().expect("overlay");
+        assert!(
+            overlay.lines[1].text.starts_with('\u{2611}'),
+            "켠 줄이 표시되지 않았다: {}",
+            overlay.lines[1].text
+        );
+        assert!(
+            overlay.lines[2].text.starts_with('\u{2610}'),
+            "켜지 않은 줄이 켜진 것처럼 보인다: {}",
+            overlay.lines[2].text
+        );
+        assert!(overlay.hint.contains("Space"), "토글 안내가 없다");
+
+        // 같은 줄을 다시 누르면 꺼진다.
+        state.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        let answered = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Action::RpcResponse { result, .. } = answered else {
+            panic!("Enter가 답을 보내지 않았다");
+        };
+        assert_eq!(
+            result["answers"]["q1"]["answers"],
+            json!(["크기 조절", "주소 기억"])
+        );
+    }
+
+    /// 아무 줄도 켜지 않은 채 Enter를 누르면 커서가 놓인 줄이 답이다.
+    #[test]
+    fn a_multi_select_question_falls_back_to_the_focused_row() {
+        let question = json!({
+            "questions": [{
+                "id": "q1",
+                "question": "무엇이 필요한가요?",
+                "multiSelect": true,
+                "options": [
+                    { "label": "크기 조절", "description": "설명" },
+                    { "label": "위치 기억", "description": "설명" }
+                ]
+            }]
+        });
+
+        let mut state = test_state();
+        state.begin_server_request(json!(1), "item/tool/requestUserInput", &question);
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let answered = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Action::RpcResponse { result, .. } = answered else {
+            panic!("Enter가 답을 보내지 않았다");
+        };
+        assert_eq!(result["answers"]["q1"]["answers"], json!(["위치 기억"]));
     }
 
     #[test]
