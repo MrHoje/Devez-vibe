@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{BufWriter, Stdout, Write, stdout},
     ops::Range,
@@ -701,6 +701,10 @@ pub struct Renderer {
     /// the whole screen every keystroke, and re-wrapping the transcript each
     /// time would make typing cost O(transcript).
     wrapped: Vec<PaintLine>,
+    /// The last fullscreen transcript exactly as it was painted, including
+    /// temporary assistant rows. Selection and scrolling must use the same row
+    /// grid the user sees rather than the committed-history subset alone.
+    fullscreen_display_lines: Vec<PaintLine>,
     wrapped_width: u16,
     shell_display_mode: ShellDisplayMode,
     diff_display_mode: DiffDisplayMode,
@@ -744,6 +748,10 @@ pub struct Renderer {
     /// screen rows, allowing a live drag to continue across wheel scrolling.
     selection_in_transcript: bool,
     live_frame_cache: Option<LiveFrameCache>,
+    /// Assistant blocks already painted as temporary transcript rows. When the
+    /// same id is committed, only a real wrapping difference may change a
+    /// scrolled reader's distance from the bottom.
+    fullscreen_stream_rows: HashMap<u64, usize>,
     animation_activity_row: Option<usize>,
     animation_response_bullet_row: Option<usize>,
     animation_plan_rows: usize,
@@ -1309,6 +1317,7 @@ impl Renderer {
             history: Vec::new(),
             scroll_back: 0,
             wrapped: Vec::new(),
+            fullscreen_display_lines: Vec::new(),
             wrapped_width: 0,
             shell_display_mode: ShellDisplayMode::Collapse,
             diff_display_mode: DiffDisplayMode::Collapse,
@@ -1333,6 +1342,7 @@ impl Renderer {
             selection_in_panel: false,
             selection_in_transcript: false,
             live_frame_cache: None,
+            fullscreen_stream_rows: HashMap::new(),
             animation_activity_row: None,
             animation_response_bullet_row: None,
             animation_plan_rows: 0,
@@ -1442,7 +1452,7 @@ impl Renderer {
         let target = self
             .scroll_back
             .saturating_add_signed(delta)
-            .min(self.wrapped.len());
+            .min(self.fullscreen_transcript_len());
         let moved = target != self.scroll_back;
         self.scroll_back = target;
         if moved {
@@ -1496,7 +1506,9 @@ impl Renderer {
             return false;
         }
         let target_start = preceding_lines.len();
-        let max_back = self.wrapped.len().saturating_sub(self.last_transcript_rows);
+        let max_back = self
+            .fullscreen_transcript_len()
+            .saturating_sub(self.last_transcript_rows);
         let target = max_back.saturating_sub(target_start.min(max_back));
         let moved = target != self.scroll_back;
         self.scroll_back = target;
@@ -1507,6 +1519,13 @@ impl Renderer {
             self.clear_selection();
         }
         moved
+    }
+
+    fn fullscreen_transcript_len(&self) -> usize {
+        self.fullscreen_stream_rows
+            .values()
+            .copied()
+            .fold(self.wrapped.len(), usize::saturating_add)
     }
 
     fn observe_question_overlay(&mut self, style: Option<OverlayStyle>) -> Option<usize> {
@@ -1563,6 +1582,8 @@ impl Renderer {
         self.composer_navigation_layout = None;
         self.painted_frame = None;
         self.live_frame_cache = None;
+        self.fullscreen_stream_rows.clear();
+        self.fullscreen_display_lines.clear();
         self.animation_activity_row = None;
         self.animation_response_bullet_row = None;
         self.animation_plan_rows = 0;
@@ -1917,13 +1938,30 @@ impl Renderer {
         self.composer_navigation_layout = Some(layout);
     }
 
-    fn reconcile_selection(&mut self, lines: &[PaintLine], plan_rows: usize) {
+    fn reconcile_selection(
+        &mut self,
+        lines: &[PaintLine],
+        plan_rows: usize,
+        transcript: &[PaintLine],
+    ) {
         let Some(range) = self.selection.range() else {
             return;
         };
         // Wrapped transcript coordinates do not move with the viewport. A wheel
         // scroll therefore changes screen rows without changing selected text.
+        // Active assistant rows share that grid now, but a delta that changes a
+        // selected temporary row invalidates the highlight just as the old live
+        // frame did.
         if self.selection_in_transcript {
+            let changed = (range.start.row..=range.end.row).any(|row| {
+                self.fullscreen_display_lines
+                    .get(row)
+                    .zip(transcript.get(row))
+                    .is_none_or(|(previous, current)| previous != current)
+            });
+            if changed {
+                self.selection.clear();
+            }
             return;
         }
         // A panel selection indexes the panel's own content, which this frame's
@@ -1998,7 +2036,7 @@ impl Renderer {
             return None;
         }
         let transcript_row = self.last_transcript_start + offset;
-        (transcript_row < self.wrapped.len()).then_some(transcript_row)
+        (transcript_row < self.fullscreen_display_lines.len()).then_some(transcript_row)
     }
 
     fn selection_point(&self, column: u16, row: u16) -> Option<CellPosition> {
@@ -2053,7 +2091,7 @@ impl Renderer {
         let source = if self.selection_in_panel {
             &self.side_panel_content
         } else if self.selection_in_transcript {
-            &self.wrapped
+            &self.fullscreen_display_lines
         } else {
             &self.previous_lines
         };
@@ -2088,9 +2126,14 @@ impl Renderer {
     pub fn relayout(&mut self) -> Result<()> {
         if self.mode == RenderMode::Fullscreen {
             // Nothing to reprint: the transcript is ours, and the next `render`
-            // rebuilds it at the new width. Dropping the cache is the whole job.
+            // rebuilds it at the new width. Temporary stream row ownership must
+            // survive the reset so the following width delta is measured from
+            // the transcript that was actually on screen.
+            let streamed_rows = self.fullscreen_stream_rows.clone();
             self.wrapped_width = 0;
-            return self.reset_screen();
+            self.reset_screen()?;
+            self.fullscreen_stream_rows = streamed_rows;
+            return Ok(());
         }
         self.reset_screen()?;
         let width = terminal_size().unwrap_or((100, 30)).0.max(20);
@@ -2135,18 +2178,10 @@ impl Renderer {
             && self.scroll_back == 0
             && self.last_transcript_rows > 0
         {
-            // The final item and turn completion can be delivered together,
-            // before the committed answer has had a frame of its own. In
-            // that case its old live rows belong in the target transcript
-            // height too; otherwise the first collapse frame already moves
-            // the answer upward.
-            let live_rows = self
-                .live_frame_cache
-                .as_ref()
-                .map(|cache| cache.lines.len())
-                .unwrap_or_default();
-            self.history_view_rows_anchor =
-                Some(self.last_transcript_rows.saturating_add(live_rows));
+            // Streaming assistant rows already live in the transcript viewport.
+            // Folding progress therefore preserves exactly that allocation;
+            // there is no second live-frame height to add during completion.
+            self.history_view_rows_anchor = Some(self.last_transcript_rows);
         } else if finished {
             // The anchor exists only to hold the answer steady while rows fold.
             // Releasing it on the final frame lets the shortened transcript
@@ -2254,6 +2289,8 @@ impl Renderer {
         self.painted_hovered_tool = None;
         self.selection.clear();
         self.painted_selection = None;
+        self.fullscreen_stream_rows.clear();
+        self.fullscreen_display_lines.clear();
         self.cursor_line = 0;
         self.cursor_col = 0;
         self.cursor_shown = true;
@@ -2351,8 +2388,23 @@ impl Renderer {
             queue!(self.out, Print(devez_layout_signal(width)))?;
         }
         let frame_width = width;
-        let live_lines =
-            self.live_frame_lines(&view.live_blocks, frame_width, height.max(3) as usize);
+        // Fullscreen assistant output shares the transcript surface with its
+        // completed form. Keeping active and completed text on one surface
+        // removes the live-frame -> history transfer that previously needed
+        // several timing and spacer corrections to conceal a row jump.
+        let (streamed_blocks, docked_blocks) = if self.mode == RenderMode::Fullscreen {
+            split_fullscreen_live_blocks(&view.live_blocks)
+        } else {
+            (Vec::new(), view.live_blocks.clone())
+        };
+        let (streamed_lines, streamed_rows) = render_streamed_transcript_lines(
+            &streamed_blocks,
+            frame_width,
+            &self.expanded_tools,
+            self.shell_display_mode,
+            self.diff_display_mode,
+        );
+        let live_lines = self.live_frame_lines(&docked_blocks, frame_width, height.max(3) as usize);
         let status = StatusArea {
             fallback: view.footer,
             line: status_line,
@@ -2406,6 +2458,8 @@ impl Renderer {
                 view.side_panel_prompts_expanded,
                 &view.side_panel_integrations,
                 view.stream_fade_tail,
+                streamed_lines,
+                streamed_rows,
             );
         }
 
@@ -2740,6 +2794,8 @@ impl Renderer {
         side_panel_prompts_expanded: bool,
         side_panel_integrations: &[ProviderIntegrationView],
         stream_fade_tail: usize,
+        streamed_lines: Vec<PaintLine>,
+        streamed_rows: HashMap<u64, usize>,
     ) -> Result<()> {
         let composer_navigation_layout = frame.composer_layout.clone();
         let rows = height as usize;
@@ -2770,7 +2826,25 @@ impl Renderer {
         }
         let old_view_rows = split_rows(content_rows, frame.lines.len(), self.wrapped.len()).0;
         let transcript_rows_before = self.wrapped.len();
-        self.commit_fullscreen_blocks(committed, width, old_view_rows);
+        let already_visible = self.fullscreen_stream_rows.clone();
+        self.commit_fullscreen_blocks_with_visible(
+            committed,
+            width,
+            old_view_rows,
+            &already_visible,
+        );
+        let committed_ids = committed.iter().map(Block::id).collect::<HashSet<_>>();
+        let retained_stream_rows = already_visible
+            .iter()
+            .filter(|(id, _)| !committed_ids.contains(id))
+            .map(|(_, rows)| *rows)
+            .sum::<usize>();
+        let next_stream_rows = streamed_rows.values().copied().sum::<usize>();
+        if self.scroll_back > 0 {
+            let row_delta = next_stream_rows as isize - retained_stream_rows as isize;
+            self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
+        }
+        self.fullscreen_stream_rows = streamed_rows;
         if let Some(previous_view_rows) = question_closed_from {
             self.question_view_rows_anchor = Some(question_close_view_rows(
                 previous_view_rows,
@@ -2778,15 +2852,17 @@ impl Renderer {
                 self.wrapped.len(),
             ));
         }
+        let mut display_wrapped = self.wrapped.clone();
+        display_wrapped.extend(streamed_lines);
         let anchored_view_rows = self
             .question_view_rows_anchor
             .or(self.history_view_rows_anchor);
         let live_rows_after_absorb = frame.lines.len().saturating_sub(1);
-        if self.wrapped.last() == Some(&PaintLine::blank())
+        if display_wrapped.last() == Some(&PaintLine::blank())
             && trailing_transcript_spacer_will_be_visible(
                 content_rows,
                 live_rows_after_absorb,
-                self.wrapped.len(),
+                display_wrapped.len(),
                 anchored_view_rows,
                 self.scroll_back,
                 self.history_view_start_anchor,
@@ -2836,41 +2912,44 @@ impl Renderer {
         let provisional_view_rows = split_rows_with_transcript_anchor(
             content_rows,
             frame.lines.len(),
-            self.wrapped.len(),
+            display_wrapped.len(),
             anchored_view_rows,
         )
         .0;
         self.scroll_back = self
             .scroll_back
-            .min(self.wrapped.len().saturating_sub(provisional_view_rows));
+            .min(display_wrapped.len().saturating_sub(provisional_view_rows));
         let (view_rows, live_rows) = split_rows_with_transcript_anchor(
             content_rows,
             frame.lines.len(),
-            self.wrapped.len(),
+            display_wrapped.len(),
             anchored_view_rows,
         );
         self.last_transcript_rows = view_rows;
-        // The live blocks run from the top of the frame down to the dock, and the
-        // padding below goes in at the dock, so this row survives `fit_frame`.
-        let stream_fade = (stream_fade_tail > 0 && frame.dock_index > 0).then(|| StreamFade {
-            last_row: plan_rows + view_rows + frame.dock_index - 1,
-            tail: stream_fade_tail,
-        });
         // Until the conversation fills the screen, its unused height stays
         // above the pinned activity/composer dock. Once full, only the reserved
         // activity spacer remains visible.
         fit_frame(&mut frame, live_rows);
-        let max_back = self.wrapped.len().saturating_sub(view_rows);
+        let max_back = display_wrapped.len().saturating_sub(view_rows);
         self.scroll_back = self.history_view_start_anchor.take().map_or_else(
             || self.scroll_back.min(max_back),
-            |start| scroll_back_for_transcript_start(self.wrapped.len(), view_rows, start),
+            |start| scroll_back_for_transcript_start(display_wrapped.len(), view_rows, start),
         );
         let start = max_back - self.scroll_back;
         let start = if plan_summary.is_some() && !plan_in_panel {
-            transcript_start_below_plan(&self.wrapped, start)
+            transcript_start_below_plan(&display_wrapped, start)
         } else {
             start
         };
+        // Fade only the newest visible transcript tail. A user reading older
+        // history must never see unrelated rows restyled by a hidden stream.
+        let stream_fade = (stream_fade_tail > 0
+            && view_rows > 0
+            && start.saturating_add(view_rows) >= display_wrapped.len())
+        .then(|| StreamFade {
+            last_row: plan_rows + view_rows - 1,
+            tail: stream_fade_tail,
+        });
         let animation_activity_row = frame
             .activity_index
             .map(|index| plan_rows + view_rows + index);
@@ -2885,7 +2964,7 @@ impl Renderer {
                     layout,
                 });
         let (mut screen, cursor_line) = compose_screen(
-            &self.wrapped,
+            &display_wrapped,
             frame.lines,
             view_rows,
             start,
@@ -2894,7 +2973,7 @@ impl Renderer {
         screen.splice(0..0, plan_lines);
         let response_bullet_row = waiting_for_response
             .then(|| {
-                visible_response_bullet_row(&self.wrapped, start..start + view_rows, plan_rows)
+                visible_response_bullet_row(&display_wrapped, start..start + view_rows, plan_rows)
             })
             .flatten();
         let cursor_line = cursor_line + plan_rows;
@@ -2911,7 +2990,8 @@ impl Renderer {
         });
         self.last_transcript_start = start;
         self.last_transcript_screen_start = plan_rows;
-        self.reconcile_selection(&screen, plan_rows);
+        self.reconcile_selection(&screen, plan_rows, &display_wrapped);
+        self.fullscreen_display_lines = display_wrapped;
         let full_repaint_rows = plan_rows_requiring_full_repaint(
             &self.previous_lines,
             self.animation_plan_rows,
@@ -2919,9 +2999,14 @@ impl Renderer {
             plan_rows,
         );
         let plan_geometry_changed = self.animation_plan_rows != plan_rows;
+        let composer_rows = composer_selection
+            .as_ref()
+            .map(|composer| composer.first_row..composer.first_row + composer.layout.rows.len())
+            .unwrap_or(0..0);
         self.paint_screen(
             &screen,
             cursor_line,
+            composer_rows,
             frame.cursor_col,
             frame.show_cursor,
             total_width,
@@ -2947,7 +3032,18 @@ impl Renderer {
         Ok(())
     }
 
+    #[cfg(test)]
     fn commit_fullscreen_blocks(&mut self, committed: &[Block], width: u16, view_rows: usize) {
+        self.commit_fullscreen_blocks_with_visible(committed, width, view_rows, &HashMap::new());
+    }
+
+    fn commit_fullscreen_blocks_with_visible(
+        &mut self,
+        committed: &[Block],
+        width: u16,
+        view_rows: usize,
+        already_visible: &HashMap<u64, usize>,
+    ) {
         if self.wrapped_width != width {
             let before = self.wrapped.len();
             for block in committed.iter().cloned() {
@@ -2955,7 +3051,12 @@ impl Renderer {
             }
             self.rewrap(width);
             if self.scroll_back > 0 {
-                let row_delta = self.wrapped.len() as isize - before as isize;
+                let transferred = committed
+                    .iter()
+                    .filter_map(|block| already_visible.get(&block.id()))
+                    .sum::<usize>();
+                let row_delta =
+                    self.wrapped.len() as isize - before as isize - transferred as isize;
                 self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
             }
             return;
@@ -3014,7 +3115,9 @@ impl Renderer {
                     self.progress_group_rows.push(range.start..content_end);
                 }
                 if self.scroll_back > 0 {
-                    let row_delta = self.wrapped.len() as isize - before as isize;
+                    let row_delta = self.wrapped.len() as isize
+                        - before as isize
+                        - already_visible.get(&block.id()).copied().unwrap_or(0) as isize;
                     self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
                 }
             }
@@ -3051,6 +3154,7 @@ impl Renderer {
         &mut self,
         lines: &[PaintLine],
         cursor_line: usize,
+        composer_rows: Range<usize>,
         cursor_col: usize,
         show_cursor: bool,
         total_width: u16,
@@ -3063,7 +3167,7 @@ impl Renderer {
             if self.selection_in_panel {
                 selection_is_worth_painting(*range, &self.side_panel_content)
             } else if self.selection_in_transcript {
-                selection_is_worth_painting(*range, &self.wrapped)
+                selection_is_worth_painting(*range, &self.fullscreen_display_lines)
             } else {
                 selection_is_worth_painting(*range, lines)
             }
@@ -3108,11 +3212,24 @@ impl Renderer {
                 self.hovered_pick.as_ref(),
             );
         }
+        // Streaming text and its fade restyle change Korean rows many times per
+        // second. Mid-row cell patches are not stable after ConPTY/xterm host
+        // replay, so every changed wide row outside the active composer is
+        // emitted once from column zero. The composer keeps its local diff so
+        // typing never makes the visible cursor travel across the row.
+        let mut sequential_rows = full_repaint_rows.to_vec();
+        sequential_rows.extend(wide_rows_requiring_sequential_repaint(
+            self.painted_frame.as_ref(),
+            &frame,
+            composer_rows,
+        ));
+        sequential_rows.sort_unstable();
+        sequential_rows.dedup();
         emit_synchronized_frame_diff_with_full_rows(
             &mut self.out,
             self.painted_frame.as_ref(),
             &frame,
-            full_repaint_rows,
+            &sequential_rows,
             repaint_full_frame,
             Some((
                 cursor_col
@@ -3306,6 +3423,34 @@ fn wide_row_needs_sequential_repaint(previous: &CellFrame, current: &CellFrame) 
         && (0..current.width).any(|column| {
             previous.cell(column, 0).continuation || current.cell(column, 0).continuation
         })
+}
+
+/// Fullscreen rows outside the composer are safe to repaint sequentially while
+/// synchronized output hides the cursor. This closes the host-replay path that
+/// can temporarily wrap a changed Korean stream row onto the row below.
+fn wide_rows_requiring_sequential_repaint(
+    previous: Option<&CellFrame>,
+    current: &CellFrame,
+    composer_rows: Range<usize>,
+) -> Vec<usize> {
+    let Some(previous) = previous
+        .filter(|previous| previous.width == current.width && previous.height == current.height)
+    else {
+        return Vec::new();
+    };
+
+    (0..current.height)
+        .filter(|&row| !composer_rows.contains(&row))
+        .filter(|&row| {
+            let start = row * current.width;
+            let end = start + current.width;
+            previous.cells[start..end] != current.cells[start..end]
+                && previous.cells[start..end]
+                    .iter()
+                    .chain(&current.cells[start..end])
+                    .any(|cell| cell.continuation)
+        })
+        .collect()
 }
 
 /// A plan state change first reaches the normal render path, before the next
@@ -3888,10 +4033,9 @@ fn emit_full_frame_with_sequential_rows(
     Ok(())
 }
 
-/// A semantic plan change can alter the fixed panel height, which also moves
-/// transcript and composer rows. Repaint the complete frame once so no old row
-/// remains at its former terminal position. Spinner-only frames still use the
-/// ordinary incremental diff.
+/// Emits one synchronized frame. Callers may nominate rows that must be walked
+/// from column zero (semantic plan changes and changed wide stream rows), while
+/// every other row keeps the ordinary cell diff.
 fn emit_synchronized_frame_diff_with_full_rows(
     out: &mut impl Write,
     previous: Option<&CellFrame>,
@@ -3902,15 +4046,15 @@ fn emit_synchronized_frame_diff_with_full_rows(
     cursor_shown: bool,
 ) -> Result<()> {
     queue!(out, Print("\x1b[?2026h"))?;
-    // Hide only for a semantic plan repaint. Spinner frames never reach this
-    // path, so the cursor is restored once rather than toggled every 80ms.
-    let repainting_plan = repaint_full_frame || !full_rows.is_empty();
+    // A sequential row moves the terminal cursor away from the composer. Hide
+    // it for the synchronized batch and restore it once at the end.
+    let repainting_rows = repaint_full_frame || !full_rows.is_empty();
     let cursor_moves_outside_composer = cursor.is_some_and(|(_, row, show)| {
         show && cursor_shown && frame_changed_outside_row(previous, current, usize::from(row))
     });
     let hide_cursor = cursor_shown
         && cursor
-            .is_some_and(|(_, _, show)| !show || repainting_plan || cursor_moves_outside_composer);
+            .is_some_and(|(_, _, show)| !show || repainting_rows || cursor_moves_outside_composer);
     if hide_cursor {
         queue!(out, Hide)?;
     }
@@ -4988,6 +5132,57 @@ fn render_live_block_lines(
         )
     })
     .collect()
+}
+
+fn split_fullscreen_live_blocks<'a>(
+    live: &[LiveBlockView<'a>],
+) -> (Vec<LiveBlockView<'a>>, Vec<LiveBlockView<'a>>) {
+    live.iter()
+        .copied()
+        .partition(|live| matches!(live.block.kind, BlockKind::Assistant))
+}
+
+fn render_streamed_transcript_lines(
+    live: &[LiveBlockView<'_>],
+    width: u16,
+    expanded_tools: &HashSet<u64>,
+    shell_display_mode: ShellDisplayMode,
+    diff_display_mode: DiffDisplayMode,
+) -> (Vec<PaintLine>, HashMap<u64, usize>) {
+    let mut output = Vec::new();
+    let mut rows = HashMap::new();
+    for live in live {
+        let mut block = live.block.clone();
+        block.body = stable_streaming_markdown_body(&block.body);
+        let lines = block_group_lines(
+            &block,
+            width,
+            shell_display_mode,
+            diff_display_mode,
+            expanded_tools.contains(&block.id()),
+        );
+        rows.insert(block.id(), lines.len());
+        output.extend(lines);
+    }
+    (output, rows)
+}
+
+/// A fenced-code delimiter is recognized only when its third backtick arrives.
+/// Rendering the first one or two as ordinary text and then hiding the completed
+/// delimiter makes the transcript shrink for one frame. Hold an unfinished marker
+/// while it can still complete, and keep a terminal completed marker out too: the
+/// Markdown renderer hides that marker anyway, while an otherwise empty Assistant
+/// block still owns its placeholder rows until real code arrives.
+fn stable_streaming_markdown_body(body: &str) -> String {
+    let content_end = body.trim_end_matches(['\r', '\n']).len();
+    let line_start = body[..content_end].rfind('\n').map_or(0, |index| index + 1);
+    let marker = body[line_start..content_end].trim_start();
+    let unfinished_at_physical_end = content_end == body.len() && matches!(marker, "`" | "``");
+    if unfinished_at_physical_end || marker.starts_with("```") {
+        body[..line_start].to_owned()
+    } else {
+        body.to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -13301,9 +13496,7 @@ mod tests {
         // corners above and below it.
         assert!(lines[1..3].iter().all(|line| {
             let painted = painted(line);
-            painted.starts_with('│')
-                && painted.ends_with('│')
-                && painted_width(line) == card_width
+            painted.starts_with('│') && painted.ends_with('│') && painted_width(line) == card_width
         }));
         assert!(lines[4].text.is_empty());
     }
@@ -15873,7 +16066,15 @@ mod tests {
                 revision: block.body.len() as u64,
             })
             .collect::<Vec<_>>();
-        let live_lines = renderer.live_frame_lines(&live_views, width, rows.max(3));
+        let (streamed, docked) = split_fullscreen_live_blocks(&live_views);
+        let (streamed_lines, streamed_rows) = render_streamed_transcript_lines(
+            &streamed,
+            width,
+            &renderer.expanded_tools,
+            renderer.shell_display_mode,
+            renderer.diff_display_mode,
+        );
+        let live_lines = renderer.live_frame_lines(&docked, width, rows.max(3));
         let editor = Editor::default();
         let status = StatusArea {
             fallback: HIDDEN_STATUS_LINE.to_owned(),
@@ -15917,13 +16118,33 @@ mod tests {
             renderer.history_view_start_anchor = None;
         }
         let old_view_rows = split_rows(rows, frame.lines.len(), renderer.wrapped.len()).0;
-        renderer.commit_fullscreen_blocks(committed, width, old_view_rows);
+        let already_visible = renderer.fullscreen_stream_rows.clone();
+        renderer.commit_fullscreen_blocks_with_visible(
+            committed,
+            width,
+            old_view_rows,
+            &already_visible,
+        );
+        let committed_ids = committed.iter().map(Block::id).collect::<HashSet<_>>();
+        let retained_stream_rows = already_visible
+            .iter()
+            .filter(|(id, _)| !committed_ids.contains(id))
+            .map(|(_, rows)| *rows)
+            .sum::<usize>();
+        let next_stream_rows = streamed_rows.values().copied().sum::<usize>();
+        if renderer.scroll_back > 0 {
+            let row_delta = next_stream_rows as isize - retained_stream_rows as isize;
+            renderer.scroll_back = renderer.scroll_back.saturating_add_signed(row_delta);
+        }
+        renderer.fullscreen_stream_rows = streamed_rows;
+        let mut display_wrapped = renderer.wrapped.clone();
+        display_wrapped.extend(streamed_lines);
         let live_rows_after_absorb = frame.lines.len().saturating_sub(1);
-        if renderer.wrapped.last() == Some(&PaintLine::blank())
+        if display_wrapped.last() == Some(&PaintLine::blank())
             && trailing_transcript_spacer_will_be_visible(
                 rows,
                 live_rows_after_absorb,
-                renderer.wrapped.len(),
+                display_wrapped.len(),
                 renderer.history_view_rows_anchor,
                 renderer.scroll_back,
                 renderer.history_view_start_anchor,
@@ -15934,21 +16155,23 @@ mod tests {
         let (view_rows, live_rows) = split_rows_with_transcript_anchor(
             rows,
             frame.lines.len(),
-            renderer.wrapped.len(),
+            display_wrapped.len(),
             renderer.history_view_rows_anchor,
         );
         renderer.last_transcript_rows = view_rows;
         fit_frame(&mut frame, live_rows);
-        let max_back = renderer.wrapped.len().saturating_sub(view_rows);
+        let max_back = display_wrapped.len().saturating_sub(view_rows);
         let start = max_back - renderer.scroll_back.min(max_back);
-        compose_screen(
-            &renderer.wrapped,
+        let screen = compose_screen(
+            &display_wrapped,
             frame.lines,
             view_rows,
             start,
             frame.cursor_line,
         )
-        .0
+        .0;
+        renderer.fullscreen_display_lines = display_wrapped;
+        screen
     }
 
     fn answer_row(screen: &[PaintLine]) -> usize {
@@ -16350,7 +16573,7 @@ mod tests {
     /// paragraph's first character a two-row jump, and the answer would travel
     /// twice as far in a single frame.
     #[test]
-    fn a_closing_paragraph_moves_a_streaming_answer_by_one_row() {
+    fn a_closing_paragraph_scrolls_forward_by_only_one_row() {
         set_chat_layout(false);
         for (rows, width) in [(18, 60), (24, 80), (32, 120)] {
             let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
@@ -16431,6 +16654,352 @@ mod tests {
     }
 
     #[test]
+    fn every_paragraph_prefix_keeps_its_rows_when_the_stream_becomes_history() {
+        set_chat_layout(false);
+        for (rows, width) in [(18, 60), (24, 80), (32, 120)] {
+            for body in [
+                "스트리밍 중인 최종 답변입니다.",
+                "스트리밍 중인 최종 답변입니다.\n",
+                "스트리밍 중인 최종 답변입니다.\n\n",
+                "스트리밍 중인 최종 답변입니다.\n\n다",
+                "스트리밍 중인 최종 답변입니다.\n\n다음 문단입니다.",
+                "스트리밍 중인 최종 답변입니다.\n\n다음 문단입니다.\n\n",
+            ] {
+                let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+                renderer.shell_display_mode = ShellDisplayMode::Hide;
+                renderer.diff_display_mode = DiffDisplayMode::Hide;
+                let history = (0..10)
+                    .flat_map(|index| {
+                        [
+                            Block::new(BlockKind::User, "Codex", format!("과거 프롬프트 {index}")),
+                            Block::new(BlockKind::Assistant, "Codex", format!("과거 답변 {index}")),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                simulate_fullscreen_frame(
+                    &mut renderer,
+                    &history,
+                    &[],
+                    Some("Working"),
+                    None,
+                    rows,
+                    width,
+                );
+
+                let answer = Block::new(BlockKind::Assistant, "Codex", body);
+                let live = simulate_fullscreen_frame(
+                    &mut renderer,
+                    &[],
+                    std::slice::from_ref(&answer),
+                    Some("Working"),
+                    None,
+                    rows,
+                    width,
+                );
+                let completed = simulate_fullscreen_frame(
+                    &mut renderer,
+                    std::slice::from_ref(&answer),
+                    &[],
+                    Some("Completed"),
+                    None,
+                    rows,
+                    width,
+                );
+                let response_rows = |screen: &[PaintLine]| {
+                    screen
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, line)| {
+                            line.prefix == RESPONSE_BULLET_PREFIX || line.prefix == "  "
+                        })
+                        .map(|(row, line)| (row, painted_line_text(line)))
+                        .collect::<Vec<_>>()
+                };
+
+                assert_eq!(
+                    response_rows(&completed),
+                    response_rows(&live),
+                    "rows={rows}, width={width}, body={body:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_opening_code_fence_never_exposes_a_temporary_marker_row() {
+        set_chat_layout(false);
+        let mut answer = Block::new(BlockKind::Assistant, "Codex", "");
+        let rendered = |block: &Block| {
+            render_streamed_transcript_lines(
+                &[LiveBlockView { block, revision: 0 }],
+                60,
+                &HashSet::new(),
+                ShellDisplayMode::Hide,
+                DiffDisplayMode::Hide,
+            )
+            .0
+        };
+        let empty = rendered(&answer);
+
+        for body in ["`", "``", "```", "```\n"] {
+            answer.body = body.to_owned();
+            assert!(rendered(&answer) == empty, "body={body:?}");
+        }
+    }
+
+    #[test]
+    fn paragraph_streaming_never_starts_lower_and_then_recovers_upward() {
+        set_chat_layout(false);
+        for (rows, width, history_pairs) in [(18, 60, 10), (24, 80, 0), (32, 120, 12)] {
+            let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+            renderer.shell_display_mode = ShellDisplayMode::Hide;
+            renderer.diff_display_mode = DiffDisplayMode::Hide;
+            let history = (0..history_pairs)
+                .flat_map(|index| {
+                    [
+                        Block::new(BlockKind::User, "Codex", format!("프롬프트 {index}")),
+                        Block::new(BlockKind::Assistant, "Codex", format!("기록 답변 {index}")),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            simulate_fullscreen_frame(
+                &mut renderer,
+                &history,
+                &[],
+                Some("Working"),
+                None,
+                rows,
+                width,
+            );
+
+            let full_answer = concat!(
+                "스트리밍 중인 최종 답변입니다.\n\n",
+                "다음 문단은 **강조**와 [링크](https://example.com/path)를 포함합니다.\n\n",
+                "마지막 문단입니다.\n\n",
+                "```rust\n",
+                "fn main() {\n",
+                "    println!(\"한글\");\n",
+                "}\n",
+                "```\n\n",
+                "끝입니다."
+            );
+            let first_answer_end = "스트리밍 중인 최종 답변입니다.".len();
+            let mut answer = Block::new(BlockKind::Assistant, "Codex", "");
+            let mut previous_row = None;
+            let prefix_ends = full_answer
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain(std::iter::once(full_answer.len()))
+                .filter(|&end| end >= first_answer_end);
+            for end in prefix_ends {
+                let body = &full_answer[..end];
+                answer.body = body.to_owned();
+                let screen = simulate_fullscreen_frame(
+                    &mut renderer,
+                    &[],
+                    std::slice::from_ref(&answer),
+                    Some("Working"),
+                    None,
+                    rows,
+                    width,
+                );
+                let row = answer_row(&screen);
+                if let Some(previous_row) = previous_row {
+                    assert!(
+                        row <= previous_row,
+                        "응답이 아래에서 시작한 뒤 복구되는 역방향 이동: rows={rows}, width={width}, body={body:?}"
+                    );
+                }
+                previous_row = Some(row);
+            }
+
+            let completed = simulate_fullscreen_frame(
+                &mut renderer,
+                std::slice::from_ref(&answer),
+                &[],
+                Some("Completed"),
+                None,
+                rows,
+                width,
+            );
+            assert_eq!(answer_row(&completed), previous_row.expect("streamed row"));
+        }
+    }
+
+    #[test]
+    fn committing_a_streamed_answer_does_not_move_a_scrolled_reader() {
+        set_chat_layout(false);
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.shell_display_mode = ShellDisplayMode::Hide;
+        renderer.diff_display_mode = DiffDisplayMode::Hide;
+        let history = (0..16)
+            .flat_map(|index| {
+                [
+                    Block::new(BlockKind::User, "Codex", format!("프롬프트 {index}")),
+                    Block::new(BlockKind::Assistant, "Codex", format!("기록 답변 {index}")),
+                ]
+            })
+            .collect::<Vec<_>>();
+        simulate_fullscreen_frame(&mut renderer, &history, &[], Some("Working"), None, 24, 80);
+        let answer = Block::new(
+            BlockKind::Assistant,
+            "Codex",
+            "스트리밍 중인 최종 답변입니다.\n둘째 줄",
+        );
+        simulate_fullscreen_frame(
+            &mut renderer,
+            &[],
+            std::slice::from_ref(&answer),
+            Some("Working"),
+            None,
+            24,
+            80,
+        );
+        renderer.scroll_back = 5;
+        let before = simulate_fullscreen_frame(
+            &mut renderer,
+            &[],
+            std::slice::from_ref(&answer),
+            Some("Working"),
+            None,
+            24,
+            80,
+        );
+        let scroll_back = renderer.scroll_back;
+        let after = simulate_fullscreen_frame(
+            &mut renderer,
+            std::slice::from_ref(&answer),
+            &[],
+            Some("Working"),
+            None,
+            24,
+            80,
+        );
+
+        assert_eq!(renderer.scroll_back, scroll_back);
+        assert_eq!(
+            before.iter().map(painted_line_text).collect::<Vec<_>>(),
+            after.iter().map(painted_line_text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn growing_a_streamed_answer_does_not_move_a_scrolled_reader() {
+        set_chat_layout(false);
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.shell_display_mode = ShellDisplayMode::Hide;
+        renderer.diff_display_mode = DiffDisplayMode::Hide;
+        let history = (0..16)
+            .flat_map(|index| {
+                [
+                    Block::new(BlockKind::User, "Codex", format!("프롬프트 {index}")),
+                    Block::new(BlockKind::Assistant, "Codex", format!("기록 답변 {index}")),
+                ]
+            })
+            .collect::<Vec<_>>();
+        simulate_fullscreen_frame(&mut renderer, &history, &[], Some("Working"), None, 24, 80);
+        let mut answer = Block::new(BlockKind::Assistant, "Codex", "스트리밍 응답");
+        simulate_fullscreen_frame(
+            &mut renderer,
+            &[],
+            std::slice::from_ref(&answer),
+            Some("Working"),
+            None,
+            24,
+            80,
+        );
+        renderer.scroll_back = 10;
+        let before = simulate_fullscreen_frame(
+            &mut renderer,
+            &[],
+            std::slice::from_ref(&answer),
+            Some("Working"),
+            None,
+            24,
+            80,
+        );
+        let before_scroll = renderer.scroll_back;
+        let before_rows = renderer.fullscreen_stream_rows[&answer.id()];
+
+        answer
+            .body
+            .push_str("\n둘째 줄\n셋째 줄\n넷째 줄\n다섯째 줄");
+        let after = simulate_fullscreen_frame(
+            &mut renderer,
+            &[],
+            std::slice::from_ref(&answer),
+            Some("Working"),
+            None,
+            24,
+            80,
+        );
+        let added_rows = renderer.fullscreen_stream_rows[&answer.id()] - before_rows;
+
+        assert_eq!(renderer.scroll_back, before_scroll + added_rows);
+        assert_eq!(
+            before.iter().map(painted_line_text).collect::<Vec<_>>(),
+            after.iter().map(painted_line_text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn relayout_preserves_stream_rows_for_scrollback_width_adjustment() {
+        set_chat_layout(false);
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.shell_display_mode = ShellDisplayMode::Hide;
+        renderer.diff_display_mode = DiffDisplayMode::Hide;
+        let history = (0..16)
+            .flat_map(|index| {
+                [
+                    Block::new(BlockKind::User, "Codex", format!("프롬프트 {index}")),
+                    Block::new(
+                        BlockKind::Assistant,
+                        "Codex",
+                        format!("기록 답변 {index}의 폭 변경 검증 문장"),
+                    ),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let answer = Block::new(
+            BlockKind::Assistant,
+            "Codex",
+            "스트리밍 응답도 창 너비에 따라 여러 행으로 다시 감깁니다.",
+        );
+        simulate_fullscreen_frame(&mut renderer, &history, &[], Some("Working"), None, 24, 80);
+        simulate_fullscreen_frame(
+            &mut renderer,
+            &[],
+            std::slice::from_ref(&answer),
+            Some("Working"),
+            None,
+            24,
+            80,
+        );
+        renderer.scroll_back = 10;
+        let before_total = renderer.fullscreen_transcript_len();
+        let before_scroll = renderer.scroll_back;
+        let before_stream_rows = renderer.fullscreen_stream_rows.clone();
+
+        renderer.relayout().expect("fullscreen relayout");
+        assert_eq!(renderer.fullscreen_stream_rows, before_stream_rows);
+        simulate_fullscreen_frame(
+            &mut renderer,
+            &[],
+            std::slice::from_ref(&answer),
+            Some("Working"),
+            None,
+            24,
+            50,
+        );
+        let total_delta = renderer.fullscreen_transcript_len() as isize - before_total as isize;
+
+        assert_eq!(
+            renderer.scroll_back,
+            before_scroll.saturating_add_signed(total_delta)
+        );
+    }
+
+    #[test]
     fn two_rows_stay_above_activity_once_the_conversation_fills_the_screen() {
         set_chat_layout(false);
         for (rows, width) in [(18, 60), (19, 60), (24, 80), (25, 80), (32, 120), (33, 120)] {
@@ -16480,7 +17049,9 @@ mod tests {
                 assert_eq!(activity - answer, expected, "rows={rows}, width={width}");
                 for offset in 1..expected {
                     assert!(
-                        painted_line_text(&screen[answer + offset]).trim().is_empty(),
+                        painted_line_text(&screen[answer + offset])
+                            .trim()
+                            .is_empty(),
                         "rows={rows}, width={width}, offset={offset}"
                     );
                 }
@@ -16700,6 +17271,16 @@ mod tests {
     }
 
     #[test]
+    fn scrolling_includes_the_active_assistant_transcript() {
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.wrapped = text_rows(30, "t");
+        renderer.fullscreen_stream_rows.insert(42, 6);
+
+        assert!(renderer.scroll(100));
+        assert_eq!(renderer.scroll_back, 36);
+    }
+
+    #[test]
     fn page_scroll_uses_the_visible_transcript_height() {
         let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
         renderer.last_height = 40;
@@ -16724,11 +17305,11 @@ mod tests {
         renderer.last_width = 80;
         renderer.last_transcript_rows = 4;
         renderer.rewrap(80);
+        renderer.fullscreen_stream_rows.insert(42, 3);
 
         assert!(renderer.scroll_to_prompt(prompt_id));
         let start = renderer
-            .wrapped
-            .len()
+            .fullscreen_transcript_len()
             .saturating_sub(renderer.last_transcript_rows)
             .saturating_sub(renderer.scroll_back);
         assert_eq!(start, 0);
@@ -17367,6 +17948,7 @@ mod tests {
         renderer.last_transcript_rows = 4;
         renderer.last_transcript_start = 4;
         renderer.last_transcript_screen_start = 0;
+        renderer.fullscreen_display_lines = renderer.wrapped.clone();
         renderer.previous_lines = renderer.wrapped[4..8].to_vec();
 
         assert!(renderer.begin_selection(4, 2));
@@ -17409,6 +17991,7 @@ mod tests {
                 PaintLine::plain("changed status"),
             ],
             0,
+            &[],
         );
         assert_eq!(
             renderer.finish_selection(2, 0),
@@ -17420,6 +18003,7 @@ mod tests {
         renderer.reconcile_selection(
             &[PaintLine::plain("replaced"), PaintLine::plain("status")],
             0,
+            &[],
         );
         assert_eq!(renderer.finish_selection(2, 0), SelectionResult::None);
     }
@@ -17438,9 +18022,35 @@ mod tests {
 
         assert!(renderer.begin_selection(5, 0));
         assert!(renderer.update_selection(7, 0));
-        renderer.reconcile_selection(&[spinner], 1);
+        renderer.reconcile_selection(&[spinner], 1, &[]);
 
         assert!(renderer.selection.range().is_some());
+    }
+
+    #[test]
+    fn active_assistant_rows_use_transcript_selection_coordinates() {
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.wrapped = vec![PaintLine::plain("기록")];
+        renderer.fullscreen_display_lines = vec![
+            PaintLine::plain("기록"),
+            PaintLine::plain("활성 스트리밍 응답"),
+        ];
+        renderer.previous_lines = renderer.fullscreen_display_lines.clone();
+        renderer.last_transcript_rows = 2;
+        renderer.last_transcript_start = 0;
+        renderer.last_transcript_screen_start = 0;
+
+        assert!(renderer.begin_selection(0, 1));
+        assert!(renderer.selection_in_transcript);
+        assert!(renderer.update_selection(3, 1));
+        assert_eq!(renderer.selected_text(), Some("활성".to_owned()));
+
+        let changed = vec![
+            PaintLine::plain("기록"),
+            PaintLine::plain("활성 스트리밍 응답 추가"),
+        ];
+        renderer.reconcile_selection(&changed, 0, &changed);
+        assert!(renderer.selection.range().is_none());
     }
 
     #[test]
@@ -21125,6 +21735,52 @@ mod tests {
             },
         );
         assert!(wide_row_needs_sequential_repaint(&previous, &current));
+    }
+
+    #[test]
+    fn streamed_korean_row_repaints_from_zero_but_composer_keeps_its_local_diff() {
+        let mut previous = CellFrame::new(32, 2);
+        previous.write(0, 0, "• 스트리밍 응답", CellStyle::plain());
+        previous.write(0, 1, "› 입력", CellStyle::plain());
+        let mut current = previous.clone();
+        current.write(0, 0, "• 스트리밍 응답입니다", CellStyle::plain());
+        current.write(0, 1, "› 입력값", CellStyle::plain());
+
+        let rows = wide_rows_requiring_sequential_repaint(Some(&previous), &current, 1..2);
+        assert_eq!(rows, vec![0]);
+
+        let mut output = Vec::new();
+        emit_synchronized_frame_diff_with_full_rows(
+            &mut output,
+            Some(&previous),
+            &current,
+            &rows,
+            false,
+            Some((8, 1, true)),
+            true,
+        )
+        .expect("stream frame emits");
+        let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
+
+        assert!(output.contains("\x1b[1;1H"));
+        assert!(output.contains("• 스트리밍 응답입니다"));
+        assert!(output.contains("\x1b[2;9H"));
+        assert!(!output.contains("\x1b[1;15H"));
+    }
+
+    #[test]
+    fn multiline_composer_rows_keep_local_wide_glyph_diffs() {
+        let mut previous = CellFrame::new(32, 3);
+        previous.write(0, 0, "• 스트리밍", CellStyle::plain());
+        previous.write(0, 1, "› 첫 입력", CellStyle::plain());
+        previous.write(0, 2, "  둘째 입력", CellStyle::plain());
+        let mut current = previous.clone();
+        current.write(0, 0, "• 스트리밍 응답", CellStyle::plain());
+        current.write(0, 1, "› 첫 입력값", CellStyle::plain());
+        current.write(0, 2, "  둘째 입력값", CellStyle::plain());
+
+        let rows = wide_rows_requiring_sequential_repaint(Some(&previous), &current, 1..3);
+        assert_eq!(rows, vec![0]);
     }
 
     #[test]
