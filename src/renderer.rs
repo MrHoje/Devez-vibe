@@ -4435,42 +4435,45 @@ const PROGRESS_TRACK_COLUMNS: usize = 20;
 /// row keeps the elapsed time alone instead.
 const PROGRESS_TRACK_MINIMUM: usize = 8;
 
-/// An indeterminate block enters from the left, crosses the track, and leaves
+/// An indeterminate band enters from the left, crosses the track, and leaves
 /// through the right edge. Providers expose only start/end, so this communicates
-/// activity without pretending to know real progress.
-fn progress_bar_spans(phase: f32, track: usize, tone: Tone) -> Vec<PaintSpan> {
-    const BLOCK_COLUMNS: usize = 4;
+/// activity without pretending to know real progress. The band fades in and out
+/// through the block-density glyphs so it reads as a sweep rather than a jump.
+fn progress_bar_spans(phase: f32, track: usize, base: Rgb) -> Vec<PaintSpan> {
+    /// Half-width of the sweep in columns: how far its glow reaches either side.
+    const BAND_COLUMNS: f32 = 5.0;
 
-    let block = track.min(BLOCK_COLUMNS);
-    let travel = track + block;
-    let offset = (phase.clamp(0.0, 0.999) * travel as f32).round() as isize - block as isize;
-    let visible_start = offset.max(0) as usize;
-    let visible_end = (offset + block as isize).clamp(0, track as isize) as usize;
-    let visible = visible_end.saturating_sub(visible_start);
-    let remaining = track.saturating_sub(visible_start + visible);
-    let mut spans = Vec::new();
-    if visible_start > 0 {
-        spans.push(PaintSpan {
-            text: "░".repeat(visible_start),
-            tone: Tone::Muted,
-            bold: false,
-        });
-    }
-    if visible > 0 {
-        spans.push(PaintSpan {
-            text: "█".repeat(visible),
-            tone,
-            bold: false,
-        });
-    }
-    if remaining > 0 {
-        spans.push(PaintSpan {
-            text: "░".repeat(remaining),
-            tone: Tone::Muted,
-            bold: false,
-        });
-    }
-    spans
+    let travel = track as f32 + BAND_COLUMNS * 2.0;
+    let centre = phase.clamp(0.0, 1.0) * travel - BAND_COLUMNS;
+    (0..track)
+        .map(|column| {
+            let distance = (column as f32 - centre).abs() / BAND_COLUMNS;
+            // The same raised cosine the label shimmer uses, so the bar and the
+            // text either side of it share one easing.
+            let level = if distance >= 1.0 {
+                0.0
+            } else {
+                0.5 * (1.0 + (distance * std::f32::consts::PI).cos())
+            };
+            // Density carries the sweep where the terminal quantises colour, so
+            // the band still reads on palettes with little room between tones.
+            let glyph = match level {
+                level if level >= 0.75 => '█',
+                level if level >= 0.45 => '▓',
+                level if level >= 0.15 => '▒',
+                _ => '░',
+            };
+            PaintSpan {
+                text: glyph.to_string(),
+                tone: if level > 0.0 {
+                    Tone::Shimmer(base, (level * 255.0).round() as u8)
+                } else {
+                    Tone::Muted
+                },
+                bold: false,
+            }
+        })
+        .collect()
 }
 
 /// Test-only shorthand: the app always drives the spinner and its progress bar
@@ -4535,7 +4538,7 @@ fn activity_lines_with_progress(
                     tone,
                     bold: false,
                 });
-                tail.extend(progress_bar_spans(progress_phase, track, tone));
+                tail.extend(progress_bar_spans(progress_phase, track, shimmer_base));
             }
             tail.push(PaintSpan {
                 text: trailer.to_owned(),
@@ -18001,22 +18004,22 @@ mod tests {
     /// The compaction row spends its spare columns on a bar, and gives them back
     /// to elapsed time when the terminal has none to spare.
     #[test]
-    fn the_compacting_row_moves_one_block_left_to_right() {
+    fn the_compacting_row_sweeps_one_band_left_to_right() {
         let entering = activity_lines("Compacting.. (4s)", None, 0.25, 80);
         let passing = activity_lines("Compacting.. (4s)", None, 0.5, 80);
-        let leaving = activity_lines("Compacting.. (4s)", None, 0.9, 80);
+        let leaving = activity_lines("Compacting.. (4s)", None, 0.8, 80);
 
         assert_eq!(
             painted(&entering[0]),
-            " ⠹ Compacting.. ░░████░░░░░░░░░░░░░░ (4s)"
+            " ⠹ Compacting.. ▓████▓▒░░░░░░░░░░░░░ (4s)"
         );
         assert_eq!(
             painted(&passing[0]),
-            " ⠴ Compacting.. ░░░░░░░░████░░░░░░░░ (4s)"
+            " ⠴ Compacting.. ░░░░░░░▒▓███▓▒░░░░░░ (4s)"
         );
         assert_eq!(
             painted(&leaving[0]),
-            " ⠏ Compacting.. ░░░░░░░░░░░░░░░░░░██ (4s)"
+            " ⠇ Compacting.. ░░░░░░░░░░░░░░░░▒▓██ (4s)"
         );
 
         let narrow = activity_lines("Compacting.. (4s)", None, 0.5, 30);
@@ -18026,12 +18029,12 @@ mod tests {
     }
 
     #[test]
-    fn the_compacting_label_shimmers_independently_from_its_progress_block() {
+    fn the_compacting_label_shimmers_independently_from_its_progress_band() {
         let line = activity_lines_with_progress("Compacting.. (4s)", None, 0.0, 0.5, 80);
 
         assert_eq!(
             painted(&line[0]),
-            " ⠋ Compacting.. ░░░░░░░░████░░░░░░░░ (4s)"
+            " ⠋ Compacting.. ░░░░░░░▒▓███▓▒░░░░░░ (4s)"
         );
     }
 
