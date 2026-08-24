@@ -4437,19 +4437,28 @@ const PROGRESS_TRACK_MINIMUM: usize = 8;
 
 /// An indeterminate band enters from the left, crosses the track, and leaves
 /// through the right edge. Providers expose only start/end, so this communicates
-/// activity without pretending to know real progress. The band fades in and out
-/// through the block-density glyphs so it reads as a sweep rather than a jump.
+/// activity without pretending to know real progress. The band darkens towards
+/// its leading edge and trails off behind it, so the sweep reads as one
+/// direction rather than a symmetric blob.
 fn progress_bar_spans(phase: f32, track: usize, base: Rgb) -> Vec<PaintSpan> {
-    /// Half-width of the sweep in columns: how far its glow reaches either side.
-    const BAND_COLUMNS: f32 = 5.0;
+    /// Columns of trail behind the leading edge, where the band fades out.
+    const TRAIL_COLUMNS: f32 = 6.0;
+    /// Columns of fade ahead of the leading edge: enough to soften the head
+    /// without blunting which way the sweep runs.
+    const HEAD_COLUMNS: f32 = 1.5;
 
-    let travel = track as f32 + BAND_COLUMNS * 2.0;
-    let centre = phase.clamp(0.0, 1.0) * travel - BAND_COLUMNS;
+    let travel = track as f32 + TRAIL_COLUMNS + HEAD_COLUMNS;
+    let head = phase.clamp(0.0, 1.0) * travel - TRAIL_COLUMNS;
     (0..track)
         .map(|column| {
-            let distance = (column as f32 - centre).abs() / BAND_COLUMNS;
-            // The same raised cosine the label shimmer uses, so the bar and the
-            // text either side of it share one easing.
+            let delta = column as f32 - head;
+            let distance = if delta > 0.0 {
+                delta / HEAD_COLUMNS
+            } else {
+                -delta / TRAIL_COLUMNS
+            };
+            // A raised cosine either side of the head, the same easing the label
+            // shimmer uses, just with a longer tail than nose.
             let level = if distance >= 1.0 {
                 0.0
             } else {
@@ -18011,15 +18020,15 @@ mod tests {
 
         assert_eq!(
             painted(&entering[0]),
-            " ⠹ Compacting.. ▓████▓▒░░░░░░░░░░░░░ (4s)"
+            " ⠹ Compacting.. ██░░░░░░░░░░░░░░░░░░ (4s)"
         );
         assert_eq!(
             painted(&passing[0]),
-            " ⠴ Compacting.. ░░░░░░░▒▓███▓▒░░░░░░ (4s)"
+            " ⠴ Compacting.. ░░░░▒▓███░░░░░░░░░░░ (4s)"
         );
         assert_eq!(
             painted(&leaving[0]),
-            " ⠇ Compacting.. ░░░░░░░░░░░░░░░░▒▓██ (4s)"
+            " ⠇ Compacting.. ░░░░░░░░░░░░▒▓███▒░░ (4s)"
         );
 
         let narrow = activity_lines("Compacting.. (4s)", None, 0.5, 30);
@@ -18034,7 +18043,7 @@ mod tests {
 
         assert_eq!(
             painted(&line[0]),
-            " ⠋ Compacting.. ░░░░░░░▒▓███▓▒░░░░░░ (4s)"
+            " ⠋ Compacting.. ░░░░▒▓███░░░░░░░░░░░ (4s)"
         );
     }
 
