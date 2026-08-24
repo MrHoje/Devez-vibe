@@ -8406,15 +8406,22 @@ fn block_lines_with_mode_at(
     let mut raw_lines = body.lines().collect::<Vec<_>>();
     if conversational {
         // Assistant messages commonly finish with `\n\n`. `str::lines` turns
-        // that final pair into an empty content row, even though the transcript
-        // block already owns its separator. Keep intentional blank rows inside
-        // the answer, but do not let a trailing delimiter grow the live frame
-        // at the instant streaming finishes and move the answer upward.
-        while raw_lines
-            .last()
-            .is_some_and(|line| UnicodeWidthStr::width(line.trim()) == 0)
-        {
-            raw_lines.pop();
+        // that final pair into empty content rows, and the transcript block
+        // already owns its separator, so exactly one of them is kept and the
+        // rest are dropped.
+        //
+        // That one row is what a closed paragraph costs. Dropping it as well
+        // makes the next paragraph's first character pay for two rows at once —
+        // the gap and the row it lands on appear together — and a live frame
+        // that grows by two in a single frame drags the whole answer upward
+        // with it. Keeping it also leaves the row count unchanged when
+        // streaming ends, so a finished answer stays where it was drawn.
+        let content_end = raw_lines
+            .iter()
+            .rposition(|line| UnicodeWidthStr::width(line.trim()) != 0);
+        match content_end {
+            Some(end) => raw_lines.truncate((end + 2).min(raw_lines.len())),
+            None => raw_lines.clear(),
         }
     }
     let mut line_index = 0;
@@ -12614,8 +12621,55 @@ mod tests {
         assert_eq!(selection_columns_for_line(blank, range, row), None);
     }
 
+    /// The live frame grows one row at a time, including across a paragraph
+    /// boundary. Two rows in a single frame is what carried the answer upward by
+    /// two and left the new row looking like it landed one row too low.
     #[test]
-    fn an_answer_keeps_internal_blank_rows_but_drops_trailing_ones() {
+    fn a_streaming_answer_grows_one_row_at_a_paragraph_boundary() {
+        set_chat_layout(false);
+        let editor = Editor::default();
+        let height = |body: &str| {
+            let live = [Block::new(BlockKind::Assistant, "Codex", body)];
+            normal_frame(
+                &live,
+                &editor,
+                None,
+                &[],
+                Some("Working (2s)"),
+                StatusArea {
+                    fallback: String::new(),
+                    line: None,
+                    composer_notice: None,
+                    composer_mode: None,
+                },
+                80,
+            )
+            .lines
+            .len()
+        };
+
+        let mut previous = height("첫 문단입니다.");
+        for body in [
+            "첫 문단입니다.\n\n",
+            "첫 문단입니다.\n\n두",
+            "첫 문단입니다.\n\n두 번째 문단입니다.",
+            "첫 문단입니다.\n\n두 번째 문단입니다.\n\n",
+            "첫 문단입니다.\n\n두 번째 문단입니다.\n\n세",
+        ] {
+            let current = height(body);
+            assert!(
+                current.saturating_sub(previous) <= 1,
+                "{body:?}에서 {previous}행에서 {current}행으로 한 번에 늘었습니다"
+            );
+            previous = current;
+        }
+    }
+
+    /// A closed paragraph keeps one blank row and no more, whether it closed in
+    /// the middle of the answer or at its end. The row at the end is what stops
+    /// the next paragraph's first character from costing two rows at once.
+    #[test]
+    fn an_answer_keeps_one_blank_row_per_closed_paragraph() {
         set_chat_layout(false);
         let lines = block_group_lines(
             &Block::new(BlockKind::Assistant, "Codex", "첫 줄\n\n둘째 줄\n\n"),
@@ -12626,14 +12680,14 @@ mod tests {
         );
 
         assert!(lines.last() == Some(&PaintLine::blank()));
-        assert!(lines[lines.len() - 2].text.contains("둘째 줄"));
+        assert!(lines[lines.len() - 3].text.contains("둘째 줄"));
         assert_eq!(
             lines
                 .iter()
                 .filter(|line| line.prefix == "  " && line.text.is_empty())
                 .count(),
-            1,
-            "내용 사이의 빈 행만 남아야 합니다"
+            2,
+            "닫힌 문단마다 빈 행 하나씩만 남아야 합니다"
         );
     }
 
@@ -16279,8 +16333,12 @@ mod tests {
         assert_eq!(answer_row(&screen), streaming_row);
     }
 
+    /// Closing a paragraph costs the one row it is worth, and ending the stream
+    /// costs none. Holding that row back instead would hand the next
+    /// paragraph's first character a two-row jump, and the answer would travel
+    /// twice as far in a single frame.
     #[test]
-    fn trailing_newlines_do_not_move_a_streaming_answer() {
+    fn a_closing_paragraph_moves_a_streaming_answer_by_one_row() {
         set_chat_layout(false);
         for (rows, width) in [(18, 60), (24, 80), (32, 120)] {
             let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
@@ -16336,7 +16394,12 @@ mod tests {
                 rows,
                 width,
             );
-            assert_eq!(answer_row(&screen), streaming_row);
+            let closed_row = answer_row(&screen);
+            assert_eq!(
+                streaming_row.saturating_sub(closed_row),
+                1,
+                "문단이 닫힐 때 한 행만 올라가야 합니다: rows={rows}, width={width}"
+            );
 
             let screen = simulate_fullscreen_frame(
                 &mut renderer,
@@ -16347,7 +16410,11 @@ mod tests {
                 rows,
                 width,
             );
-            assert_eq!(answer_row(&screen), streaming_row);
+            assert_eq!(
+                answer_row(&screen),
+                closed_row,
+                "스트리밍이 끝날 때는 움직이지 않아야 합니다: rows={rows}, width={width}"
+            );
         }
     }
 
@@ -16388,7 +16455,7 @@ mod tests {
                 "Codex",
                 "스트리밍 중인 최종 답변입니다.",
             );
-            let assert_gap = |screen: &[PaintLine]| {
+            let assert_gap = |screen: &[PaintLine], expected: usize| {
                 assert_eq!(screen.len(), rows);
                 let answer = answer_row(screen);
                 let activity = screen
@@ -16398,9 +16465,13 @@ mod tests {
                         text.contains("Working") || text.contains("Completed")
                     })
                     .expect("activity row");
-                assert_eq!(activity - answer, 3, "rows={rows}, width={width}");
-                assert!(screen[answer + 1] == PaintLine::blank());
-                assert!(screen[answer + 2] == PaintLine::blank());
+                assert_eq!(activity - answer, expected, "rows={rows}, width={width}");
+                for offset in 1..expected {
+                    assert!(
+                        painted_line_text(&screen[answer + offset]).trim().is_empty(),
+                        "rows={rows}, width={width}, offset={offset}"
+                    );
+                }
                 answer
             };
 
@@ -16413,8 +16484,10 @@ mod tests {
                 rows,
                 width,
             );
-            let streaming_row = assert_gap(&screen);
+            let streaming_row = assert_gap(&screen, 3);
 
+            // Whitespace-only rows close the paragraph, so one of them stays and
+            // the reserved pair sits above the activity as before.
             answer.body.push_str("\n   \n\t\n\u{200b}");
             let screen = simulate_fullscreen_frame(
                 &mut renderer,
@@ -16425,7 +16498,12 @@ mod tests {
                 rows,
                 width,
             );
-            assert_eq!(assert_gap(&screen), streaming_row);
+            let closed_row = assert_gap(&screen, 4);
+            assert_eq!(
+                streaming_row.saturating_sub(closed_row),
+                1,
+                "rows={rows}, width={width}"
+            );
 
             let screen = simulate_fullscreen_frame(
                 &mut renderer,
@@ -16436,7 +16514,7 @@ mod tests {
                 rows,
                 width,
             );
-            assert_eq!(assert_gap(&screen), streaming_row);
+            assert_eq!(assert_gap(&screen, 4), closed_row);
         }
     }
 
