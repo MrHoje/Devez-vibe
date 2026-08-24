@@ -44,7 +44,7 @@ use paste::{BufferedText, BufferedTextTarget, ComposerInput, ComposerPasteBuffer
 use provider::{ProviderAuthKind, ProviderAuthRequest};
 use renderer::{
     BlockKind, Pick, RenderMode, Renderer, SIDE_PANEL_INTEGRATIONS_CONNECTED, SelectionResult,
-    TerminalSession, View,
+    SplitFocus, TerminalSession, View,
 };
 use serde_json::{Value, json};
 use state::{
@@ -1102,6 +1102,235 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
     }
 }
 
+fn focused_state_mut<'a>(
+    main: &'a mut AppState,
+    btw: &'a mut Option<AppState>,
+    focus: SplitFocus,
+) -> &'a mut AppState {
+    match (focus, btw.as_mut()) {
+        (SplitFocus::Btw, Some(btw)) => btw,
+        _ => main,
+    }
+}
+
+fn event_thread_id(params: &Value) -> Option<&str> {
+    params
+        .get("threadId")
+        .and_then(Value::as_str)
+        .or_else(|| params.pointer("/turn/threadId").and_then(Value::as_str))
+}
+
+fn collapse_main_plan_for_btw(state: &mut AppState) -> Option<bool> {
+    let expanded = state.plan_summary_expanded();
+    state.set_plan_summary_expanded(false);
+    expanded
+}
+
+fn restore_main_plan_after_btw(state: &mut AppState, expanded: &mut Option<bool>) {
+    if let Some(expanded) = expanded.take() {
+        state.set_plan_summary_expanded(expanded);
+    }
+}
+
+fn draw_conversations(
+    main: &mut AppState,
+    btw: &mut Option<AppState>,
+    focus: SplitFocus,
+    renderer: &mut Renderer,
+) -> Result<()> {
+    let Some(btw) = btw.as_mut() else {
+        return draw(main, renderer);
+    };
+    devezcode::sync(
+        main.host_session_id(),
+        main.busy,
+        main.compacting(),
+        main.host_loading(),
+        main.awaiting_input(),
+    );
+    let main_discarded = main.take_discarded_prompt_ids();
+    let btw_discarded = btw.take_discarded_prompt_ids();
+    renderer.remove_history_blocks(&main_discarded)?;
+    renderer.remove_split_history_blocks(&btw_discarded);
+    let main_committed = main.drain_committed();
+    let btw_committed = btw.drain_committed();
+    let result = renderer.render_split(
+        &main_committed,
+        main.view(),
+        &btw_committed,
+        btw.view(),
+        focus,
+    );
+    if result.is_ok() {
+        main.note_response_frame_rendered(&main_committed);
+        btw.note_response_frame_rendered(&btw_committed);
+    }
+    result
+}
+
+async fn start_split_turn(
+    server: &BackendServer,
+    state: &mut AppState,
+    text: String,
+    provider_handoff: Option<Value>,
+) {
+    devezcode::note_prompt(&text);
+    let model = state.selected_model_name().to_owned();
+    let effort = state.selected_effort().to_owned();
+    state.note_pending_turn_model(&model);
+    state.note_pending_turn_effort(&effort);
+    let input = state.turn_input(text);
+    let mut params = json!({
+        "threadId": state.thread_id,
+        "input": input,
+        "model": model,
+        "serviceTier": state.service_tier(),
+        "permissions": state.permission_profile(),
+        "additionalContext": turn_additional_context(state.vibe_mode())
+    });
+    if !effort.is_empty() {
+        params["effort"] = json!(effort);
+    }
+    if let Some(mode) = state.claude_permission_mode() {
+        params["claudePermissionMode"] = json!(mode.wire());
+    }
+    if let Some(provider_handoff) = provider_handoff {
+        params["providerHandoff"] = provider_handoff;
+    }
+    if let Err(error) = server.request("turn/start", params).await {
+        state.set_request_failed(error.to_string());
+    }
+}
+
+async fn open_btw(
+    server: &mut BackendServer,
+    main: &mut AppState,
+    prompt: Option<String>,
+) -> Option<AppState> {
+    let response = server
+        .request(
+            "thread/fork",
+            json!({
+                "threadId": main.thread_id,
+                "model": main.selected_model_name(),
+                "effort": main.selected_effort(),
+                "claudeDeveloperInstructions": CLAUDE_DEVEZ_INSTRUCTIONS,
+                "serviceTier": main.service_tier(),
+                "ephemeral": true,
+                "threadSource": "devez-vibe"
+            }),
+        )
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            main.push_notice(BlockKind::Error, "BTW 시작 실패", error.to_string());
+            return None;
+        }
+    };
+    let Some(thread_id) = response
+        .get("thread")
+        .and_then(|thread| thread.get("id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+    else {
+        main.push_notice(
+            BlockKind::Error,
+            "BTW 시작 실패",
+            "thread/fork 응답에 thread ID가 없습니다.",
+        );
+        return None;
+    };
+    let cwd = response
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or(&main.cwd)
+        .to_owned();
+    let model = main.selected_model_name().to_owned();
+    let effort = main.selected_effort().to_owned();
+    let mut btw = main.forked_side_state(thread_id, cwd, &model, Some(&effort));
+    if let Some(prompt) = prompt {
+        btw.begin_side_prompt(prompt.clone());
+        start_split_turn(server, &mut btw, prompt, None).await;
+    }
+    Some(btw)
+}
+
+async fn close_btw(
+    server: &mut BackendServer,
+    btw: &mut Option<AppState>,
+    renderer: &mut Renderer,
+) {
+    let Some(btw) = btw.take() else {
+        return;
+    };
+    if let Some(turn_id) = btw.turn_id {
+        let _ = server
+            .request(
+                "turn/interrupt",
+                json!({ "threadId": btw.thread_id, "turnId": turn_id }),
+            )
+            .await;
+    }
+    let _ = server
+        .request("thread/unsubscribe", json!({ "threadId": btw.thread_id }))
+        .await;
+    renderer.end_split();
+}
+
+async fn execute_split_conversation_action(
+    server: &mut BackendServer,
+    state: &mut AppState,
+    renderer: &mut Renderer,
+    management_tx: &mpsc::UnboundedSender<ManagementUpdate>,
+    action: Action,
+    provider_handoff: Option<Value>,
+) -> Result<bool> {
+    match action {
+        Action::Submit(text) => {
+            renderer.scroll_to_bottom();
+            start_split_turn(server, state, text, provider_handoff).await;
+            Ok(false)
+        }
+        Action::Steer(text) => {
+            let Some(turn_id) = state.turn_id.clone() else {
+                state.set_request_failed("활성 turn ID가 없어 추가 입력을 보낼 수 없습니다.");
+                return Ok(false);
+            };
+            devezcode::note_prompt(&text);
+            let input = state.turn_input(text);
+            if let Err(error) = server
+                .request(
+                    "turn/steer",
+                    json!({
+                        "threadId": state.thread_id,
+                        "expectedTurnId": turn_id,
+                        "input": input
+                    }),
+                )
+                .await
+            {
+                state.push_notice(BlockKind::Error, "추가 입력 실패", error.to_string());
+            }
+            Ok(false)
+        }
+        Action::Interrupt => {
+            if let Some(turn_id) = state.turn_id.clone()
+                && let Err(error) = server
+                    .request(
+                        "turn/interrupt",
+                        json!({ "threadId": state.thread_id, "turnId": turn_id }),
+                    )
+                    .await
+            {
+                state.push_notice(BlockKind::Error, "중단 실패", error.to_string());
+            }
+            Ok(false)
+        }
+        action => execute_action(server, state, renderer, management_tx, action).await,
+    }
+}
+
 async fn event_loop(
     server: &mut BackendServer,
     state: &mut AppState,
@@ -1129,6 +1358,9 @@ async fn event_loop(
     let mut skills_key = None;
     let mut skills_rx = None;
     let mut side_exit_key_guard = None;
+    let mut btw_state = None;
+    let mut btw_parent_plan_expanded = None;
+    let mut split_focus = SplitFocus::Btw;
     draw(state, renderer)?;
 
     loop {
@@ -1142,7 +1374,7 @@ async fn event_loop(
                 changed |= state.resolve_codex_subagent_probe(&id, running);
             }
             if changed {
-                draw(state, renderer)?;
+                draw_conversations(state, &mut btw_state, split_focus, renderer)?;
             }
         }
         // A quiet turn is asked about rather than assumed dead. Only a runtime that
@@ -1155,16 +1387,34 @@ async fn event_loop(
                 .take_queued_prompt()
                 .map(|text| state.start_queued_prompt(text))
                 .unwrap_or(Action::None);
-            if execute_action(server, state, renderer, &management_tx, action).await? {
+            let handoff = matches!(&action, Action::Submit(_))
+                .then(|| provider_handoff_snapshot(state, renderer));
+            if btw_state.is_some() {
+                if execute_split_conversation_action(
+                    server,
+                    state,
+                    renderer,
+                    &management_tx,
+                    action,
+                    handoff,
+                )
+                .await?
+                {
+                    break;
+                }
+            } else if execute_action(server, state, renderer, &management_tx, action).await? {
                 break;
             }
-            draw(state, renderer)?;
+            draw_conversations(state, &mut btw_state, split_focus, renderer)?;
         }
         // A session picked while the previous one was still starting is switched to
         // here. The event loop is the only place that can drive it: the wait it was
         // requested from cannot resume out of itself without recursing into another
         // wait, whereas this loop just comes back around.
         if let Some(deferred) = state.take_deferred_resume() {
+            close_btw(server, &mut btw_state, renderer).await;
+            restore_main_plan_after_btw(state, &mut btw_parent_plan_expanded);
+            split_focus = SplitFocus::Main;
             let should_quit = execute_action(
                 server,
                 state,
@@ -1221,59 +1471,90 @@ async fn event_loop(
         }
         let mut connection_closed = false;
         let mut animation_tick = false;
+        let mut action_focus = split_focus;
         let paste_deadline = composer_paste.flush_deadline();
         let action = tokio::select! {
             terminal_event = terminal_events.next() => {
                 match terminal_event {
                     Some(Ok(Event::Key(key))) => {
-                        if suppress_side_exit_key(
-                            &mut side_exit_key_guard,
-                            &key,
-                            Instant::now(),
-                        ) {
-                            state.disarm_quit();
-                            renderer.clear_selection();
-                            Action::None
-                        } else if paste_clipboard_text_shortcut(
-                            state,
-                            &mut composer_paste,
-                            &key,
-                            Instant::now(),
-                        ) || (is_clipboard_image_shortcut(&key) && attach_clipboard_image(state))
+                        if btw_state.is_some()
+                            && key.code == KeyCode::Tab
+                            && key.modifiers.is_empty()
+                            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
                         {
-                            renderer.clear_selection();
-                            Action::None
-                        } else if expand_collapsed_paste_shortcut(
-                            state,
-                            &mut composer_paste,
-                            &key,
-                            Instant::now(),
-                        ) {
+                            let input_state = focused_state_mut(state, &mut btw_state, split_focus);
+                            flush_composer_paste(input_state, &mut composer_paste, Instant::now());
+                            split_focus = split_focus.toggled();
                             renderer.clear_selection();
                             Action::Tick(true)
-                        } else if is_selection_delete_key(&key)
-                            && let Some(range) = renderer.composer_selection_range()
-                            && state.delete_composer_selection(range)
-                        {
-                            // The drag selected composer text, so the key takes the
-                            // selection rather than the character at the cursor.
-                            renderer.clear_selection();
-                            Action::Tick(true)
-                        } else if key.code == KeyCode::Char('c')
-                            && key.modifiers.contains(KeyModifiers::CONTROL)
-                        {
-                            if let Some(text) = renderer.selected_text() {
-                                // This Ctrl+C is a copy, so it neither arms nor
-                                // spends the quit.
-                                state.disarm_quit();
+                        } else {
+                            let input_state =
+                                focused_state_mut(state, &mut btw_state, split_focus);
+                            if suppress_side_exit_key(
+                                &mut side_exit_key_guard,
+                                &key,
+                                Instant::now(),
+                            ) {
+                                input_state.disarm_quit();
                                 renderer.clear_selection();
-                                Action::Copy(text)
+                                Action::None
+                            } else if paste_clipboard_text_shortcut(
+                                input_state,
+                                &mut composer_paste,
+                                &key,
+                                Instant::now(),
+                            ) || (is_clipboard_image_shortcut(&key)
+                                && attach_clipboard_image(input_state))
+                            {
+                                renderer.clear_selection();
+                                Action::None
+                            } else if expand_collapsed_paste_shortcut(
+                                input_state,
+                                &mut composer_paste,
+                                &key,
+                                Instant::now(),
+                            ) {
+                                renderer.clear_selection();
+                                Action::Tick(true)
+                            } else if is_selection_delete_key(&key)
+                                && let Some(range) = renderer.composer_selection_range()
+                                && input_state.delete_composer_selection(range)
+                            {
+                                // The drag selected composer text, so the key takes the
+                                // selection rather than the character at the cursor.
+                                renderer.clear_selection();
+                                Action::Tick(true)
+                            } else if key.code == KeyCode::Char('c')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                if let Some(text) = renderer.selected_text() {
+                                    // This Ctrl+C is a copy, so it neither arms nor
+                                    // spends the quit.
+                                    input_state.disarm_quit();
+                                    renderer.clear_selection();
+                                    Action::Copy(text)
+                                } else {
+                                    // Typing means the drag is over and its highlight is
+                                    // stale, so it goes before the key is acted on.
+                                    let cleared = renderer.clear_selection();
+                                    let action = observe_composer_key_with_scroll(
+                                        input_state,
+                                        renderer,
+                                        &mut composer_paste,
+                                        key,
+                                        Instant::now(),
+                                    );
+                                    match action {
+                                        Action::Tick(false) if cleared => Action::Tick(true),
+                                        action => action,
+                                    }
+                                }
                             } else {
                                 // Typing means the drag is over and its highlight is
                                 // stale, so it goes before the key is acted on.
                                 let cleared = renderer.clear_selection();
                                 let action = observe_composer_key_with_scroll(
-                                    state,
+                                    input_state,
                                     renderer,
                                     &mut composer_paste,
                                     key,
@@ -1284,50 +1565,41 @@ async fn event_loop(
                                     action => action,
                                 }
                             }
-                        } else {
-                        // Typing means the drag is over and its highlight is
-                        // stale, so it goes before the key is acted on.
-                        let cleared = renderer.clear_selection();
-                        let action = observe_composer_key_with_scroll(
-                            state,
-                            renderer,
-                            &mut composer_paste,
-                            key,
-                            Instant::now(),
-                        );
-                        match action {
-                            Action::Tick(false) if cleared => Action::Tick(true),
-                            action => action,
-                        }
                         }
                     }
                     Some(Ok(Event::Mouse(mouse))) => {
+                        let input_state = focused_state_mut(state, &mut btw_state, split_focus);
                         // Clicking or scrolling is input as well, so a Ctrl+C armed
                         // before it must not be spent by the Ctrl+C after it.
-                        state.disarm_quit();
+                        input_state.disarm_quit();
                         renderer_mouse_action(renderer, &mouse, |click| match click {
-                            MouseClick::Pick(pick) => pick_action(state, pick),
+                            MouseClick::Pick(pick) => pick_action(input_state, pick),
                             MouseClick::Composer(index) => {
-                                Action::Tick(state.move_composer_cursor(index))
+                                Action::Tick(input_state.move_composer_cursor(index))
                             }
                         })
                     }
                     Some(Ok(Event::Paste(text))) => {
+                        let input_state = focused_state_mut(state, &mut btw_state, split_focus);
                         renderer.clear_selection();
                         if composer_paste.take_discarded_paste(&text) {
                             // The shortcut already expanded the block this
                             // payload stands for.
                             Action::Tick(true)
                         } else {
-                        flush_composer_paste(state, &mut composer_paste, Instant::now());
-                        if let Some(action) = state.paste_as_prompt_answer(&text) {
-                            action
-                        } else {
-                            if !attach_clipboard_image(state) {
-                                apply_direct_paste(state, &text);
+                            flush_composer_paste(
+                                input_state,
+                                &mut composer_paste,
+                                Instant::now(),
+                            );
+                            if let Some(action) = input_state.paste_as_prompt_answer(&text) {
+                                action
+                            } else {
+                                if !attach_clipboard_image(input_state) {
+                                    apply_direct_paste(input_state, &text);
+                                }
+                                Action::None
                             }
-                            Action::None
-                        }
                         }
                     }
                     Some(Ok(Event::Resize(columns, rows))) => {
@@ -1347,11 +1619,20 @@ async fn event_loop(
             server_event = server.next_event() => {
                 match server_event {
                     Some(ServerEvent::Notification { method, params }) => {
-                        state.handle_notification(&method, &params);
-                        if method == "turn/completed" {
+                        let target_is_btw = btw_state.as_ref().is_some_and(|btw| {
+                            event_thread_id(&params) == Some(btw.thread_id.as_str())
+                        });
+                        action_focus = if target_is_btw {
+                            SplitFocus::Btw
+                        } else {
+                            SplitFocus::Main
+                        };
+                        let target = focused_state_mut(state, &mut btw_state, action_focus);
+                        target.handle_notification(&method, &params);
+                        if method == "turn/completed" && !target_is_btw {
                             server.persist_provider_handoff(
-                                &state.thread_id,
-                                provider_handoff_snapshot(state, renderer),
+                                &target.thread_id,
+                                provider_handoff_snapshot(target, renderer),
                             );
                         }
                         if matches!(
@@ -1371,20 +1652,20 @@ async fn event_loop(
                             );
                         }
                         let interrupt_after_start = method == "turn/started"
-                            && state.take_pending_interrupt().is_some();
-                        if state.take_account_refresh() {
-                            refresh_account(server, state).await;
+                            && target.take_pending_interrupt().is_some();
+                        if target.take_account_refresh() {
+                            refresh_account(server, target).await;
                         }
                         if interrupt_after_start {
                             Action::Interrupt
                         } else if method == "turn/completed"
                             // A runtime that compacts without running a turn ends
                             // the wait here, so the queue drains from here too.
-                            || (method == "thread/compacted" && !state.host_turn_busy())
+                            || (method == "thread/compacted" && !target.host_turn_busy())
                         {
-                            state
+                            target
                                 .take_queued_prompt()
-                                .map(|text| state.start_queued_prompt(text))
+                                .map(|text| target.start_queued_prompt(text))
                                 .unwrap_or(Action::None)
                         } else if method == "skills/changed" {
                             Action::RefreshSkills
@@ -1397,7 +1678,16 @@ async fn event_loop(
                         }
                     }
                     Some(ServerEvent::Request { id, method, params }) => {
-                        state.begin_server_request(id, &method, &params)
+                        let target_is_btw = btw_state.as_ref().is_some_and(|btw| {
+                            event_thread_id(&params) == Some(btw.thread_id.as_str())
+                        });
+                        action_focus = if target_is_btw {
+                            SplitFocus::Btw
+                        } else {
+                            SplitFocus::Main
+                        };
+                        focused_state_mut(state, &mut btw_state, action_focus)
+                            .begin_server_request(id, &method, &params)
                     }
                     Some(ServerEvent::ProtocolWarning(message)) => {
                         state.push_notice(BlockKind::Warning, "프로토콜 경고", message);
@@ -1457,7 +1747,8 @@ async fn event_loop(
                 Action::None
             }
             _ = wait_for_paste_flush(paste_deadline), if paste_deadline.is_some() => {
-                Action::Tick(flush_composer_paste(state, &mut composer_paste, Instant::now()))
+                let input_state = focused_state_mut(state, &mut btw_state, split_focus);
+                Action::Tick(flush_composer_paste(input_state, &mut composer_paste, Instant::now()))
             }
             _ = stream_tick.tick() => {
                 // Measured, not assumed: a repaint can overrun the interval and the
@@ -1466,18 +1757,28 @@ async fn event_loop(
                 let now = Instant::now();
                 let elapsed = now.duration_since(last_stream_reveal);
                 last_stream_reveal = now;
-                let reveal = state.drain_stream_text(elapsed);
-                perf::record_reveal(elapsed, reveal.clusters, reveal.backlog);
-                let revealed = reveal.changed() || state.response_collapse_animating();
+                let main_reveal = state.drain_stream_text(elapsed);
+                let btw_reveal = btw_state
+                    .as_mut()
+                    .map(|btw| btw.drain_stream_text(elapsed));
+                perf::record_reveal(elapsed, main_reveal.clusters, main_reveal.backlog);
+                let revealed = main_reveal.changed()
+                    || state.response_collapse_animating()
+                    || btw_reveal.as_ref().is_some_and(|reveal| reveal.changed())
+                    || btw_state
+                        .as_ref()
+                        .is_some_and(AppState::response_collapse_animating);
                 if revealed {
                     animation_tick = false;
                 }
                 Action::Tick(revealed)
             }
             _ = activity_tick.tick() => {
-                let tick = state.render_tick();
-                let mut redraw = tick.redraw;
-                animation_tick = tick.animation_only;
+                let main_tick = state.render_tick();
+                let btw_tick = btw_state.as_mut().map(AppState::render_tick);
+                let mut redraw = main_tick.redraw
+                    || btw_tick.as_ref().is_some_and(|tick| tick.redraw);
+                animation_tick = btw_state.is_none() && main_tick.animation_only;
                 if renderer.recover_external_screen_write() {
                     redraw = true;
                     animation_tick = false;
@@ -1502,18 +1803,56 @@ async fn event_loop(
         // much slower than parsing and used to make long pastes crawl.
         let redraw = !matches!(&action, Action::Tick(false)) && !composer_paste.is_buffering();
         let returning_from_side = matches!(&action, Action::ReturnFromSide);
-        let should_quit = execute_action(server, state, renderer, &management_tx, action).await?;
+        let split_handoff = (btw_state.is_some()
+            && action_focus == SplitFocus::Main
+            && matches!(&action, Action::Submit(_)))
+        .then(|| provider_handoff_snapshot(state, renderer));
+        let should_quit = match action {
+            Action::StartSide(prompt) if btw_state.is_none() => {
+                if let Some(btw) = open_btw(server, state, prompt).await {
+                    btw_parent_plan_expanded = collapse_main_plan_for_btw(state);
+                    btw_state = Some(btw);
+                    split_focus = SplitFocus::Btw;
+                }
+                false
+            }
+            Action::StartSide(_) => {
+                split_focus = SplitFocus::Btw;
+                false
+            }
+            Action::ReturnFromSide if btw_state.is_some() => {
+                close_btw(server, &mut btw_state, renderer).await;
+                restore_main_plan_after_btw(state, &mut btw_parent_plan_expanded);
+                split_focus = SplitFocus::Main;
+                false
+            }
+            action if btw_state.is_some() => {
+                let target = focused_state_mut(state, &mut btw_state, action_focus);
+                execute_split_conversation_action(
+                    server,
+                    target,
+                    renderer,
+                    &management_tx,
+                    action,
+                    split_handoff,
+                )
+                .await?
+            }
+            action => execute_action(server, state, renderer, &management_tx, action).await?,
+        };
         if returning_from_side {
             side_exit_key_guard = Some(Instant::now() + SIDE_EXIT_KEY_SETTLE);
         }
         if redraw {
             let animation_started = Instant::now();
-            let animated = animation_tick && renderer.render_animation(state.animation_view())?;
+            let animated = btw_state.is_none()
+                && animation_tick
+                && renderer.render_animation(state.animation_view())?;
             if animated {
                 perf::record_animation(animation_started.elapsed());
             }
             if !animated {
-                draw(state, renderer)?;
+                draw_conversations(state, &mut btw_state, split_focus, renderer)?;
             }
         }
         if should_quit || connection_closed {
@@ -1593,7 +1932,7 @@ fn suppress_side_exit_key(guard: &mut Option<Instant>, key: &KeyEvent, now: Inst
 
 #[derive(Debug, PartialEq, Eq)]
 enum MouseRequest {
-    Scroll(isize),
+    Scroll(isize, u16, u16),
     SelectionStart(u16, u16),
     SelectionUpdate(u16, u16),
     SelectionEnd(u16, u16),
@@ -1613,8 +1952,10 @@ enum MouseClick {
 fn mouse_request(mouse: &MouseEvent) -> MouseRequest {
     if mouse.modifiers.contains(KeyModifiers::SHIFT) {
         return match mouse.kind {
-            MouseEventKind::ScrollUp => MouseRequest::Scroll(WHEEL_ROWS),
-            MouseEventKind::ScrollDown => MouseRequest::Scroll(-WHEEL_ROWS),
+            MouseEventKind::ScrollUp => MouseRequest::Scroll(WHEEL_ROWS, mouse.column, mouse.row),
+            MouseEventKind::ScrollDown => {
+                MouseRequest::Scroll(-WHEEL_ROWS, mouse.column, mouse.row)
+            }
             MouseEventKind::Down(MouseButton::Left)
             | MouseEventKind::Drag(MouseButton::Left)
             | MouseEventKind::Up(MouseButton::Left) => MouseRequest::CancelSelection,
@@ -1622,8 +1963,8 @@ fn mouse_request(mouse: &MouseEvent) -> MouseRequest {
         };
     }
     match mouse.kind {
-        MouseEventKind::ScrollUp => MouseRequest::Scroll(WHEEL_ROWS),
-        MouseEventKind::ScrollDown => MouseRequest::Scroll(-WHEEL_ROWS),
+        MouseEventKind::ScrollUp => MouseRequest::Scroll(WHEEL_ROWS, mouse.column, mouse.row),
+        MouseEventKind::ScrollDown => MouseRequest::Scroll(-WHEEL_ROWS, mouse.column, mouse.row),
         MouseEventKind::Down(MouseButton::Left) => {
             MouseRequest::SelectionStart(mouse.column, mouse.row)
         }
@@ -1664,7 +2005,7 @@ fn renderer_mouse_action(
     }
 
     match request {
-        MouseRequest::Scroll(delta) => Action::Tick(renderer.scroll(delta)),
+        MouseRequest::Scroll(delta, _, row) => Action::Tick(renderer.scroll_at(row, delta)),
         MouseRequest::SelectionStart(column, row) => {
             Action::Tick(renderer.begin_selection(column, row))
         }
@@ -6009,6 +6350,59 @@ mod tests {
         )
     }
 
+    #[test]
+    fn split_focus_routes_input_and_thread_events_to_the_matching_pane() {
+        let mut main = state_with_a_model();
+        main.thread_id = "main-thread".to_owned();
+        let mut btw = Some(main.forked_side_state(
+            "btw-thread".to_owned(),
+            main.cwd.clone(),
+            main.selected_model_name(),
+            Some(main.selected_effort()),
+        ));
+
+        focused_state_mut(&mut main, &mut btw, SplitFocus::Main)
+            .editor
+            .set_text("main");
+        focused_state_mut(&mut main, &mut btw, SplitFocus::Btw)
+            .editor
+            .set_text("btw");
+
+        assert_eq!(main.editor.text(), "main");
+        assert_eq!(btw.as_ref().expect("BTW pane").editor.text(), "btw");
+        assert_eq!(
+            event_thread_id(&json!({ "threadId": "btw-thread" })),
+            Some("btw-thread")
+        );
+        assert_eq!(
+            event_thread_id(&json!({ "turn": { "threadId": "main-thread" } })),
+            Some("main-thread")
+        );
+    }
+
+    #[test]
+    fn btw_temporarily_collapses_and_restores_the_main_plan() {
+        let mut main = state_with_a_model();
+        main.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [{ "step": "check", "status": "inProgress" }] }),
+        );
+        assert_eq!(main.plan_summary_expanded(), Some(true));
+
+        let mut saved = collapse_main_plan_for_btw(&mut main);
+        assert_eq!(saved, Some(true));
+        assert_eq!(main.plan_summary_expanded(), Some(false));
+
+        restore_main_plan_after_btw(&mut main, &mut saved);
+        assert_eq!(main.plan_summary_expanded(), Some(true));
+        assert_eq!(saved, None);
+
+        main.set_plan_summary_expanded(false);
+        let mut saved = collapse_main_plan_for_btw(&mut main);
+        restore_main_plan_after_btw(&mut main, &mut saved);
+        assert_eq!(main.plan_summary_expanded(), Some(false));
+    }
+
     fn model(name: &str, default_effort: &str, is_default: bool, efforts: &[&str]) -> ModelInfo {
         ModelInfo {
             id: name.to_owned(),
@@ -8088,7 +8482,7 @@ mod tests {
         );
         assert_eq!(
             mouse_request(&at(MouseEventKind::ScrollUp, KeyModifiers::NONE)),
-            MouseRequest::Scroll(WHEEL_ROWS)
+            MouseRequest::Scroll(WHEEL_ROWS, 4, 7)
         );
         assert_eq!(
             mouse_request(&at(MouseEventKind::Moved, KeyModifiers::NONE)),
@@ -8106,7 +8500,7 @@ mod tests {
         );
         assert_eq!(
             mouse_request(&at(MouseEventKind::ScrollUp, KeyModifiers::SHIFT)),
-            MouseRequest::Scroll(WHEEL_ROWS)
+            MouseRequest::Scroll(WHEEL_ROWS, 4, 7)
         );
         assert_eq!(
             mouse_request(&at(

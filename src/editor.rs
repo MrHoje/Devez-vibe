@@ -430,7 +430,10 @@ impl Editor {
         self.leave_history();
         let end = self.cursor;
         self.move_word_left_for_delete();
-        self.kill_buffer = self.buffer[self.cursor..end].iter().collect();
+        self.kill_buffer = self.buffer[self.cursor..end]
+            .iter()
+            .filter(|&&ch| ch != ATTACHMENT_PLACEHOLDER)
+            .collect();
         self.buffer.drain(self.cursor..end);
     }
 
@@ -491,7 +494,10 @@ impl Editor {
         if start == end {
             return;
         }
-        self.kill_buffer = self.buffer[start..end].iter().collect();
+        self.kill_buffer = self.buffer[start..end]
+            .iter()
+            .filter(|&&ch| ch != ATTACHMENT_PLACEHOLDER)
+            .collect();
         self.buffer.drain(start..end);
         if self
             .collapsed_paste_start
@@ -517,7 +523,10 @@ impl Editor {
         if end == self.cursor {
             return;
         }
-        self.kill_buffer = self.buffer[self.cursor..end].iter().collect();
+        self.kill_buffer = self.buffer[self.cursor..end]
+            .iter()
+            .filter(|&&ch| ch != ATTACHMENT_PLACEHOLDER)
+            .collect();
         self.buffer.drain(self.cursor..end);
     }
 
@@ -537,7 +546,10 @@ impl Editor {
         if start == self.cursor && start > 0 {
             start -= 1;
         }
-        self.kill_buffer = self.buffer[start..self.cursor].iter().collect();
+        self.kill_buffer = self.buffer[start..self.cursor]
+            .iter()
+            .filter(|&&ch| ch != ATTACHMENT_PLACEHOLDER)
+            .collect();
         self.buffer.drain(start..self.cursor);
         self.cursor = start;
     }

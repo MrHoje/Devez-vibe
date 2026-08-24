@@ -57,8 +57,8 @@ dvz [--resume [SESSION] | --continue] [--model MODEL] [--effort EFFORT]
 dvz update
 ```
 
-`npm install -g devez-vibe@latest`와 동일하며, 실행 중인 바이너리를 교체할 수 있도록
-별도 창에서 설치가 진행됩니다.
+`npm install -g devez-vibe@latest`와 동일합니다. 별도 창이 열린 뒤 모든 `dvz` 세션이
+종료되기를 기다렸다가 설치하며, npm 레지스트리 전파가 늦으면 자동으로 재시도합니다.
 
 업데이트 확인을 끄려면 `DEVEZ_VIBE_NO_UPDATE_CHECK` 환경변수를 설정합니다.
 

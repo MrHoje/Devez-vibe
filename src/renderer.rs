@@ -19,6 +19,7 @@ use crossterm::{
     execute, queue,
     style::{
         Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+        force_color_output,
     },
     terminal::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
@@ -694,6 +695,18 @@ pub struct Renderer {
     question_overlay_open: bool,
     theme: ThemeKind,
     history: Vec<Block>,
+    /// Transcript owned by the lower `/btw` pane while split view is open.
+    split_history: Vec<Block>,
+    split_active: bool,
+    split_focus: SplitFocus,
+    split_main_rows: usize,
+    split_main_scroll_back: usize,
+    split_main_max_scroll: usize,
+    split_main_view_rows: usize,
+    split_btw_scroll_back: usize,
+    split_btw_max_scroll: usize,
+    split_btw_view_rows: usize,
+    split_selection_focus: Option<SplitFocus>,
     /// Rows the transcript is held back from its newest end. Zero follows the
     /// live output. Fullscreen only: inline scrolling belongs to the terminal.
     scroll_back: usize,
@@ -1263,17 +1276,42 @@ fn merge_history_block(history: &mut Vec<Block>, incoming: Block) -> bool {
     true
 }
 
-/// Appends one rendered transcript block and returns the rows it owns. Every
-/// non-empty block already ends in one standalone blank row. A user prompt's
-/// coloured top padding belongs to the bubble and must not consume that row:
-/// doing so makes adjacent prompts and answer-to-prompt boundaries touch.
-fn append_transcript_block_lines(
+/// Appends one rendered transcript block and returns the rows it owns. OpenCode
+/// sends each progress update as a separate assistant item, so adjacent updates
+/// share one line break instead of each keeping a standalone separator row.
+fn append_compact_open_code_response(
     transcript: &mut Vec<PaintLine>,
+    previous: Option<&Block>,
+    block: &Block,
     lines: Vec<PaintLine>,
 ) -> Range<usize> {
+    if previous.is_some_and(|previous| {
+        matches!(previous.kind, BlockKind::Assistant)
+            && previous.title == "OpenCode"
+            && matches!(block.kind, BlockKind::Assistant)
+            && block.title == "OpenCode"
+    }) && transcript.last() == Some(&PaintLine::blank())
+    {
+        transcript.pop();
+    }
     let start = transcript.len();
     transcript.extend(lines);
     start..transcript.len()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitFocus {
+    Main,
+    Btw,
+}
+
+impl SplitFocus {
+    pub const fn toggled(self) -> Self {
+        match self {
+            Self::Main => Self::Btw,
+            Self::Btw => Self::Main,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1315,6 +1353,17 @@ impl Renderer {
             question_overlay_open: false,
             theme: selected_theme,
             history: Vec::new(),
+            split_history: Vec::new(),
+            split_active: false,
+            split_focus: SplitFocus::Main,
+            split_main_rows: 0,
+            split_main_scroll_back: 0,
+            split_main_max_scroll: 0,
+            split_main_view_rows: 0,
+            split_btw_scroll_back: 0,
+            split_btw_max_scroll: 0,
+            split_btw_view_rows: 0,
+            split_selection_focus: None,
             scroll_back: 0,
             wrapped: Vec::new(),
             fullscreen_display_lines: Vec::new(),
@@ -1449,6 +1498,9 @@ impl Renderer {
         if self.mode != RenderMode::Fullscreen {
             return false;
         }
+        if self.split_active {
+            return self.scroll_split_pane(self.split_focus, delta);
+        }
         let target = self
             .scroll_back
             .saturating_add_signed(delta)
@@ -1465,11 +1517,45 @@ impl Renderer {
         moved || cleared
     }
 
+    pub fn scroll_at(&mut self, row: u16, delta: isize) -> bool {
+        if !self.split_active {
+            return self.scroll(delta);
+        }
+        let pane = if usize::from(row) < self.split_main_rows {
+            SplitFocus::Main
+        } else {
+            SplitFocus::Btw
+        };
+        self.scroll_split_pane(pane, delta)
+    }
+
+    fn scroll_split_pane(&mut self, pane: SplitFocus, delta: isize) -> bool {
+        let (scroll_back, max_scroll) = match pane {
+            SplitFocus::Main => (&mut self.split_main_scroll_back, self.split_main_max_scroll),
+            SplitFocus::Btw => (&mut self.split_btw_scroll_back, self.split_btw_max_scroll),
+        };
+        let target = scroll_back.saturating_add_signed(delta).min(max_scroll);
+        let moved = target != *scroll_back;
+        *scroll_back = target;
+        let cleared = moved && self.clear_selection();
+        moved || cleared
+    }
+
     /// Returns the fullscreen transcript to its newest position. Inline mode
     /// leaves scrolling to the terminal's own scrollback.
     pub fn scroll_to_bottom(&mut self) -> bool {
         if self.mode != RenderMode::Fullscreen {
             return false;
+        }
+        if self.split_active {
+            let scroll_back = match self.split_focus {
+                SplitFocus::Main => &mut self.split_main_scroll_back,
+                SplitFocus::Btw => &mut self.split_btw_scroll_back,
+            };
+            let moved = *scroll_back != 0;
+            *scroll_back = 0;
+            let cleared = moved && self.clear_selection();
+            return moved || cleared;
         }
         let anchored = self.question_view_rows_anchor.take().is_some();
         if self.scroll_back == 0 && !anchored {
@@ -1490,6 +1576,7 @@ impl Renderer {
         }
         let mut preceding_lines = Vec::new();
         let mut found = false;
+        let mut previous = None;
         for block in visible_transcript_blocks(
             &self.history,
             self.shell_display_mode,
@@ -1500,7 +1587,8 @@ impl Renderer {
                 break;
             }
             let lines = self.history_block_lines(block, self.last_width);
-            append_transcript_block_lines(&mut preceding_lines, lines);
+            append_compact_open_code_response(&mut preceding_lines, previous, block, lines);
+            previous = Some(block);
         }
         if !found {
             return false;
@@ -1560,11 +1648,28 @@ impl Renderer {
 
     /// Rows currently visible in the transcript viewport.
     pub fn page_rows(&self) -> isize {
+        if self.split_active {
+            return match self.split_focus {
+                SplitFocus::Main => self.split_main_view_rows,
+                SplitFocus::Btw => self.split_btw_view_rows,
+            }
+            .max(1) as isize;
+        }
         self.last_transcript_rows.max(1) as isize
     }
 
     pub fn clear_screen(&mut self) -> Result<()> {
         self.history.clear();
+        self.split_history.clear();
+        self.split_active = false;
+        self.split_main_rows = 0;
+        self.split_main_scroll_back = 0;
+        self.split_main_max_scroll = 0;
+        self.split_main_view_rows = 0;
+        self.split_btw_scroll_back = 0;
+        self.split_btw_max_scroll = 0;
+        self.split_btw_view_rows = 0;
+        self.split_selection_focus = None;
         self.wrapped.clear();
         self.wrapped_width = 0;
         self.scroll_back = 0;
@@ -1594,6 +1699,24 @@ impl Renderer {
         self.question_overlay_open = false;
         self.apply_terminal_theme()?;
         self.reset_screen()
+    }
+
+    pub fn end_split(&mut self) {
+        self.split_history.clear();
+        self.split_active = false;
+        self.split_main_rows = 0;
+        self.split_main_scroll_back = 0;
+        self.split_main_max_scroll = 0;
+        self.split_main_view_rows = 0;
+        self.split_btw_scroll_back = 0;
+        self.split_btw_max_scroll = 0;
+        self.split_btw_view_rows = 0;
+        self.split_selection_focus = None;
+        self.previous_lines.clear();
+        self.painted_frame = None;
+        self.wrapped_width = 0;
+        self.composer_selection = None;
+        self.composer_navigation_layout = None;
     }
 
     pub fn toggle_tool_at(&mut self, row: u16) -> bool {
@@ -1757,9 +1880,15 @@ impl Renderer {
     }
 
     pub fn begin_selection(&mut self, column: u16, row: u16) -> bool {
-        self.selection_in_panel = self.column_is_in_panel(column);
-        self.selection_in_transcript =
-            !self.selection_in_panel && self.transcript_row_at_screen(usize::from(row)).is_some();
+        if self.split_active {
+            self.split_selection_focus = Some(self.split_pane_at_row(usize::from(row)));
+            self.selection_in_panel = false;
+            self.selection_in_transcript = false;
+        } else {
+            self.selection_in_panel = self.column_is_in_panel(column);
+            self.selection_in_transcript = !self.selection_in_panel
+                && self.transcript_row_at_screen(usize::from(row)).is_some();
+        }
         let Some(point) = self.selection_point(column, row) else {
             return false;
         };
@@ -1844,6 +1973,7 @@ impl Renderer {
     pub fn clear_selection(&mut self) -> bool {
         self.selection_in_panel = false;
         self.selection_in_transcript = false;
+        self.split_selection_focus = None;
         self.selection.clear()
     }
 
@@ -2039,6 +2169,23 @@ impl Renderer {
         (transcript_row < self.fullscreen_display_lines.len()).then_some(transcript_row)
     }
 
+    fn split_pane_at_row(&self, row: usize) -> SplitFocus {
+        if row < self.split_main_rows {
+            SplitFocus::Main
+        } else {
+            SplitFocus::Btw
+        }
+    }
+
+    fn split_pane_row_bounds(&self, pane: SplitFocus) -> Range<usize> {
+        match pane {
+            SplitFocus::Main => 0..self.split_main_rows.min(self.previous_lines.len()),
+            SplitFocus::Btw => {
+                self.split_main_rows.min(self.previous_lines.len())..self.previous_lines.len()
+            }
+        }
+    }
+
     fn selection_point(&self, column: u16, row: u16) -> Option<CellPosition> {
         if self.mode != RenderMode::Fullscreen || self.previous_lines.is_empty() {
             return None;
@@ -2046,7 +2193,16 @@ impl Renderer {
         if self.selection_target_is_panel(column) {
             return self.panel_selection_point(column, row);
         }
-        let screen_row = if self.selection_in_transcript {
+        let screen_row = if self.split_active {
+            let pane = self
+                .split_selection_focus
+                .unwrap_or_else(|| self.split_pane_at_row(usize::from(row)));
+            let bounds = self.split_pane_row_bounds(pane);
+            if bounds.is_empty() {
+                return None;
+            }
+            usize::from(row).clamp(bounds.start, bounds.end - 1)
+        } else if self.selection_in_transcript {
             let first = self.last_transcript_screen_start;
             if self.last_transcript_rows == 0 {
                 return None;
@@ -2237,20 +2393,21 @@ impl Renderer {
             );
         }
         if matches!(block.kind, BlockKind::ProgressGroup) && !self.fold_progress_groups {
-            return block
-                .children()
-                .iter()
-                .flat_map(|child| {
-                    block_group_lines_at(
-                        child,
-                        width,
-                        self.shell_display_mode,
-                        self.diff_display_mode,
-                        self.expanded_tools.contains(&child.id()),
-                        None,
-                    )
-                })
-                .collect();
+            let mut lines = Vec::new();
+            let mut previous = None;
+            for child in block.children() {
+                let child_lines = block_group_lines_at(
+                    child,
+                    width,
+                    self.shell_display_mode,
+                    self.diff_display_mode,
+                    self.expanded_tools.contains(&child.id()),
+                    None,
+                );
+                append_compact_open_code_response(&mut lines, previous, child, child_lines);
+                previous = Some(child);
+            }
+            return lines;
         }
         if matches!(block.kind, BlockKind::ProgressGroup)
             && self.prompt_for_progress_group(block.id()).is_some()
@@ -2323,6 +2480,7 @@ impl Renderer {
     }
 
     pub fn render(&mut self, committed: &[Block], view: View<'_>) -> Result<()> {
+        self.split_active = false;
         set_chat_layout(view.chat_layout);
         let question_closed_from =
             self.observe_question_overlay(view.overlay.as_ref().map(|overlay| overlay.style));
@@ -2529,6 +2687,126 @@ impl Renderer {
         Ok(())
     }
 
+    pub fn remove_split_history_blocks(&mut self, block_ids: &[u64]) {
+        if block_ids.is_empty() {
+            return;
+        }
+        let block_ids = block_ids.iter().copied().collect::<HashSet<_>>();
+        self.split_history
+            .retain(|block| !block_ids.contains(&block.id()));
+    }
+
+    pub fn render_split(
+        &mut self,
+        main_committed: &[Block],
+        main_view: View<'_>,
+        btw_committed: &[Block],
+        btw_view: View<'_>,
+        focus: SplitFocus,
+    ) -> Result<()> {
+        let (width, height) = terminal_size().unwrap_or((100, 30));
+        let width = width.max(20);
+        let height = height.max(8) as usize;
+        if !self.split_active {
+            self.selection.clear();
+            self.selection_in_panel = false;
+            self.selection_in_transcript = false;
+            self.split_selection_focus = None;
+            self.split_main_scroll_back = 0;
+            self.split_btw_scroll_back = 0;
+        }
+        self.split_active = true;
+        self.split_focus = focus;
+        self.side_panel = None;
+
+        for block in main_committed.iter().cloned() {
+            merge_history_block(&mut self.history, block);
+        }
+        for block in btw_committed.iter().cloned() {
+            merge_history_block(&mut self.split_history, block);
+        }
+
+        let main_rows = height / 2;
+        let btw_rows = height - main_rows;
+        let main = split_pane_frame_scrolled(
+            &self.history,
+            main_view,
+            width,
+            main_rows,
+            None,
+            focus == SplitFocus::Main,
+            &self.expanded_tools,
+            self.split_main_scroll_back,
+        );
+        let btw = split_pane_frame_scrolled(
+            &self.split_history,
+            btw_view,
+            width,
+            btw_rows,
+            Some("BTW"),
+            focus == SplitFocus::Btw,
+            &self.expanded_tools,
+            self.split_btw_scroll_back,
+        );
+        self.split_main_rows = main_rows;
+        self.split_main_max_scroll = main.max_scroll;
+        self.split_main_scroll_back = main.scroll_back;
+        self.split_main_view_rows = main.view_rows;
+        self.split_btw_max_scroll = btw.max_scroll;
+        self.split_btw_scroll_back = btw.scroll_back;
+        self.split_btw_view_rows = btw.view_rows;
+
+        let (cursor_line, cursor_col, composer_selection, composer_layout) = match focus {
+            SplitFocus::Main => (
+                main.cursor_line,
+                main.cursor_col,
+                main.composer_selection,
+                main.composer_layout,
+            ),
+            SplitFocus::Btw => (
+                main_rows + btw.cursor_line,
+                btw.cursor_col,
+                btw.composer_selection.map(|mut selection| {
+                    selection.first_row += main_rows;
+                    selection
+                }),
+                btw.composer_layout,
+            ),
+        };
+        let mut screen = main.lines;
+        screen.extend(btw.lines);
+        self.reconcile_selection(&screen, 0, &[]);
+        let composer_rows = composer_selection
+            .as_ref()
+            .map(|composer| composer.first_row..composer.first_row + composer.layout.rows.len())
+            .unwrap_or(0..0);
+        self.paint_screen(
+            &screen,
+            cursor_line,
+            composer_rows,
+            cursor_col,
+            true,
+            width,
+            None,
+            &[],
+            true,
+            None,
+        )?;
+        self.previous_lines = screen;
+        self.cursor_line = cursor_line;
+        self.cursor_col = cursor_col;
+        self.composer_selection = composer_selection;
+        self.composer_navigation_layout = composer_layout;
+        self.animation_activity_row = None;
+        self.animation_response_bullet_row = None;
+        self.animation_plan_rows = 0;
+        self.last_width = width;
+        self.last_total_width = width;
+        self.last_height = height as u16;
+        self.out.flush()?;
+        Ok(())
+    }
+
     fn live_frame_lines(
         &mut self,
         live: &[LiveBlockView<'_>],
@@ -2578,7 +2856,8 @@ impl Renderer {
     }
 
     pub fn render_animation(&mut self, view: AnimationView<'_>) -> Result<bool> {
-        if self.mode != RenderMode::Fullscreen
+        if self.split_active
+            || self.mode != RenderMode::Fullscreen
             || self.last_width == 0
             || self.previous_lines.is_empty()
             || self.painted_frame.is_none()
@@ -3070,12 +3349,24 @@ impl Renderer {
                 .position(|existing| existing.id() == block.id())
                 .map(|index| {
                     let mut preceding_lines = Vec::new();
+                    let mut previous = None;
                     for existing in &self.history[..index] {
                         let lines = self.history_block_lines(existing, width);
-                        append_transcript_block_lines(&mut preceding_lines, lines);
+                        append_compact_open_code_response(
+                            &mut preceding_lines,
+                            previous,
+                            existing,
+                            lines,
+                        );
+                        previous = Some(existing);
                     }
                     let lines = self.history_block_lines(&self.history[index], width);
-                    append_transcript_block_lines(&mut preceding_lines, lines)
+                    append_compact_open_code_response(
+                        &mut preceding_lines,
+                        previous,
+                        &self.history[index],
+                        lines,
+                    )
                 });
             merge_history_block(&mut self.history, block.clone());
 
@@ -3107,7 +3398,23 @@ impl Renderer {
                 }
             } else {
                 let lines = self.history_block_lines(block, width);
-                let range = append_transcript_block_lines(&mut self.wrapped, lines);
+                let visible = visible_transcript_blocks(
+                    &self.history,
+                    self.shell_display_mode,
+                    self.diff_display_mode,
+                );
+                let previous = visible
+                    .iter()
+                    .position(|visible| visible.id() == block.id())
+                    .and_then(|index| index.checked_sub(1))
+                    .and_then(|index| visible.get(index))
+                    .copied();
+                let range = append_compact_open_code_response(
+                    &mut self.wrapped,
+                    previous,
+                    block,
+                    lines,
+                );
                 if matches!(block.kind, BlockKind::ProgressGroup) && self.fold_progress_groups {
                     let content_end = range.end.saturating_sub(usize::from(
                         self.wrapped.get(range.end.saturating_sub(1)) == Some(&PaintLine::blank()),
@@ -3127,19 +3434,22 @@ impl Renderer {
     fn rewrap(&mut self, width: u16) {
         let mut wrapped = Vec::new();
         let mut progress_group_rows = Vec::new();
+        let mut previous = None;
         for block in visible_transcript_blocks(
             &self.history,
             self.shell_display_mode,
             self.diff_display_mode,
         ) {
             let lines = self.history_block_lines(block, width);
-            let range = append_transcript_block_lines(&mut wrapped, lines);
+            let range =
+                append_compact_open_code_response(&mut wrapped, previous, block, lines);
             if matches!(block.kind, BlockKind::ProgressGroup) && self.fold_progress_groups {
                 let content_end = range.end.saturating_sub(usize::from(
                     wrapped.get(range.end.saturating_sub(1)) == Some(&PaintLine::blank()),
                 ));
                 progress_group_rows.push(range.start..content_end);
             }
+            previous = Some(block);
         }
         self.wrapped = wrapped;
         self.progress_group_rows = progress_group_rows;
@@ -3645,14 +3955,23 @@ fn paint_line_into_frame(
 ) {
     let background = row_background(line.tone);
     let bubble_background = bubble_background(line);
+    let boxed_content = boxed_split_content_columns(line);
     if let Some(background) = background {
         // 사이드패널이 열려 있으면 본문 폭이 화면 폭보다 좁다. 화면 끝까지
         // 칠하는 줄도 본문 폭 안에서 끝나야 배경이 패널 쪽으로 번지지 않는다.
-        let trailing_right = background_width.unwrap_or(frame.width).saturating_sub(1);
+        let trailing_right = boxed_content
+            .as_ref()
+            .map(|columns| columns.end)
+            .unwrap_or_else(|| background_width.unwrap_or(frame.width).saturating_sub(1));
         let (start, right) = if matches!(line.tone, Tone::UserPrompt | Tone::UserPromptPadding) {
-            let prefix_width = UnicodeWidthStr::width(line.prefix.as_str());
+            let prompt_prefix = boxed_content
+                .as_ref()
+                .and_then(|_| line.tail.first().map(|span| span.text.as_str()))
+                .unwrap_or(line.prefix.as_str());
+            let prefix_width = boxed_content.as_ref().map_or(0, |columns| columns.start)
+                + UnicodeWidthStr::width(prompt_prefix);
             let start = if chat_layout() {
-                let marker_width = usize::from(line.prefix.ends_with("› "))
+                let marker_width = usize::from(prompt_prefix.ends_with("› "))
                     * (CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP + 2);
                 prefix_width.saturating_sub(marker_width + 1)
             } else {
@@ -3662,7 +3981,12 @@ fn paint_line_into_frame(
         } else if line.tone == Tone::ModelChange {
             // Setting-change cards share the user's terminal-safe trailing cell.
             // Fast, Model, and Effort notices therefore end on the same column.
-            (0, trailing_right)
+            (
+                boxed_content.as_ref().map_or(0, |columns| columns.start),
+                trailing_right,
+            )
+        } else if let Some(columns) = boxed_content.as_ref() {
+            (columns.start, columns.end)
         } else {
             (0, background_width.unwrap_or(frame.width))
         };
@@ -3716,11 +4040,15 @@ fn paint_line_into_frame(
         .as_ref()
         .filter(|columns| columns.start < prefix_width)
         .and(history_background);
-    let prefix_background = history_prefix_background.or_else(|| {
+    let prefix_background = if boxed_content.is_some() {
         word_background(line.prefix_tone)
-            .or(bubble_background)
-            .or(background)
-    });
+    } else {
+        history_prefix_background.or_else(|| {
+            word_background(line.prefix_tone)
+                .or(bubble_background)
+                .or(background)
+        })
+    };
     paint_text_into_frame(
         frame,
         row,
@@ -3747,10 +4075,18 @@ fn paint_line_into_frame(
         selected_columns.as_ref(),
         text_hovered_columns,
     );
-    for span in &line.tail {
+    for (index, span) in line.tail.iter().enumerate() {
         if span.tone == Tone::CopyJoin {
             continue;
         }
+        let is_outer_right = boxed_content.is_some() && index + 1 == line.tail.len();
+        let span_background = if is_outer_right {
+            word_background(span.tone)
+        } else {
+            word_background(span.tone)
+                .or(bubble_background)
+                .or(background)
+        };
         paint_text_into_frame(
             frame,
             row,
@@ -3758,18 +4094,21 @@ fn paint_line_into_frame(
             &mut column,
             span.tone,
             span.bold,
-            history_background.or_else(|| {
-                word_background(span.tone)
-                    .or(bubble_background)
-                    .or(background)
-            }),
+            history_background.or(span_background),
             selected_columns.as_ref(),
             text_hovered_columns,
         );
     }
 }
 
+fn honor_force_color() {
+    if env::var_os("FORCE_COLOR").is_some() {
+        force_color_output(true);
+    }
+}
+
 fn set_cell_style(out: &mut impl Write, style: CellStyle) -> Result<()> {
+    honor_force_color();
     queue!(
         out,
         SetAttribute(Attribute::Reset),
@@ -4116,6 +4455,388 @@ fn frame_changed_outside_row(
         let end = start + current.width;
         previous.cells[start..end] != current.cells[start..end]
     })
+}
+
+struct SplitPaneFrame {
+    lines: Vec<PaintLine>,
+    cursor_line: usize,
+    cursor_col: usize,
+    composer_selection: Option<ComposerSelection>,
+    composer_layout: Option<ComposerLayout>,
+    max_scroll: usize,
+    scroll_back: usize,
+    view_rows: usize,
+}
+
+fn mute_line(line: &mut PaintLine) {
+    line.prefix_tone = Tone::Muted;
+    line.tone = Tone::Muted;
+    line.bold = false;
+    for span in &mut line.tail {
+        span.tone = Tone::Muted;
+        span.bold = false;
+    }
+}
+
+fn split_pane_header(label: &str, width: u16, active: bool) -> PaintLine {
+    let prefix = "┌─ ";
+    let marker = " · ";
+    let used = UnicodeWidthStr::width(prefix)
+        + UnicodeWidthStr::width(label)
+        + UnicodeWidthStr::width(marker);
+    let shortcut = compact_right(
+        "Tab switch · Ctrl+C close",
+        usize::from(width).saturating_sub(used + COMPOSER_RULE_MIN + 2),
+    );
+    let rule_width = usize::from(width).saturating_sub(
+        used + UnicodeWidthStr::width(shortcut.as_str()) + usize::from(!shortcut.is_empty()) + 1,
+    );
+    PaintLine {
+        prefix: prefix.to_owned(),
+        prefix_tone: Tone::Muted,
+        text: label.to_owned(),
+        tone: if active { Tone::Accent } else { Tone::Muted },
+        bold: active,
+        tool_heading: None,
+        pick: None,
+        tail: [
+            Some(PaintSpan {
+                text: marker.to_owned(),
+                tone: Tone::Muted,
+                bold: false,
+            }),
+            (!shortcut.is_empty()).then(|| PaintSpan {
+                text: format!("{shortcut} "),
+                tone: Tone::Muted,
+                bold: false,
+            }),
+            Some(PaintSpan {
+                text: "─".repeat(rule_width),
+                tone: Tone::Muted,
+                bold: false,
+            }),
+            Some(PaintSpan {
+                text: "┐".to_owned(),
+                tone: Tone::Muted,
+                bold: false,
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+    }
+}
+
+fn split_pane_bottom(width: u16) -> PaintLine {
+    PaintLine {
+        prefix: "└".to_owned(),
+        prefix_tone: Tone::Muted,
+        text: "─".repeat(usize::from(width).saturating_sub(2)),
+        tone: Tone::Muted,
+        bold: false,
+        tool_heading: None,
+        pick: None,
+        tail: vec![PaintSpan {
+            text: "┘".to_owned(),
+            tone: Tone::Muted,
+            bold: false,
+        }],
+    }
+}
+
+fn box_split_pane_line(line: PaintLine, content_width: usize) -> PaintLine {
+    let painted_width = painted_line_width(&line);
+    let mut tail = vec![
+        PaintSpan {
+            text: line.prefix,
+            tone: line.prefix_tone,
+            bold: false,
+        },
+        PaintSpan {
+            text: line.text,
+            tone: line.tone,
+            bold: line.bold,
+        },
+    ];
+    tail.extend(line.tail);
+    tail.extend([
+        PaintSpan {
+            text: " ".repeat(content_width.saturating_sub(painted_width)),
+            tone: Tone::Muted,
+            bold: false,
+        },
+        PaintSpan {
+            text: " │".to_owned(),
+            tone: Tone::Muted,
+            bold: false,
+        },
+    ]);
+    PaintLine {
+        prefix: "│ ".to_owned(),
+        prefix_tone: Tone::Muted,
+        text: String::new(),
+        tone: line.tone,
+        bold: false,
+        tool_heading: line.tool_heading,
+        pick: line.pick.map(|pick| pick.shifted(2)),
+        tail,
+    }
+}
+
+fn boxed_split_content_columns(line: &PaintLine) -> Option<Range<usize>> {
+    (line.prefix == "│ " && line.tail.last().is_some_and(|span| span.text == " │")).then(|| {
+        let start = UnicodeWidthStr::width(line.prefix.as_str());
+        start..painted_line_width(line).saturating_sub(2)
+    })
+}
+
+fn shift_composer_layout(layout: &mut ComposerLayout, columns: usize) {
+    for row in &mut layout.rows {
+        row.start_column = row.start_column.saturating_add(columns);
+    }
+}
+
+fn compact_split_activity_spacer(frame: &mut Frame) {
+    let Some(activity_index) = frame.activity_index else {
+        return;
+    };
+    let blank_rows = frame.lines[..activity_index]
+        .iter()
+        .rev()
+        .take_while(|line| **line == PaintLine::blank())
+        .count();
+    let remove = blank_rows.saturating_sub(1);
+    if remove == 0 {
+        return;
+    }
+    let start = activity_index - remove;
+    frame.lines.drain(start..activity_index);
+    frame.cursor_line = frame.cursor_line.saturating_sub(remove);
+    frame.dock_index = if frame.dock_index <= start {
+        frame.dock_index
+    } else if frame.dock_index >= activity_index {
+        frame.dock_index - remove
+    } else {
+        start
+    };
+    frame.composer_index = frame
+        .composer_index
+        .map(|index| index.saturating_sub(remove));
+    frame.activity_index = Some(start);
+}
+
+fn split_history_lines(
+    history: &[Block],
+    width: u16,
+    expanded_tools: &HashSet<u64>,
+    shell_display_mode: ShellDisplayMode,
+    diff_display_mode: DiffDisplayMode,
+    fold_progress_groups: bool,
+) -> Vec<PaintLine> {
+    let mut lines = Vec::new();
+    let mut previous = None;
+    for block in visible_transcript_blocks(history, shell_display_mode, diff_display_mode) {
+        let block_lines = if matches!(block.kind, BlockKind::ProgressGroup) && !fold_progress_groups
+        {
+            let mut child_lines = Vec::new();
+            let mut previous_child = None;
+            for child in block.children() {
+                let rendered = block_group_lines(
+                    child,
+                    width,
+                    shell_display_mode,
+                    diff_display_mode,
+                    expanded_tools.contains(&child.id()),
+                );
+                append_compact_open_code_response(
+                    &mut child_lines,
+                    previous_child,
+                    child,
+                    rendered,
+                );
+                previous_child = Some(child);
+            }
+            child_lines
+        } else {
+            block_group_lines(
+                block,
+                width,
+                shell_display_mode,
+                diff_display_mode,
+                expanded_tools.contains(&block.id()),
+            )
+        };
+        append_compact_open_code_response(&mut lines, previous, block, block_lines);
+        previous = Some(block);
+    }
+    lines
+}
+
+#[cfg(test)]
+fn split_pane_frame(
+    history: &[Block],
+    view: View<'_>,
+    width: u16,
+    rows: usize,
+    label: Option<&str>,
+    active: bool,
+    expanded_tools: &HashSet<u64>,
+) -> SplitPaneFrame {
+    split_pane_frame_scrolled(history, view, width, rows, label, active, expanded_tools, 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn split_pane_frame_scrolled(
+    history: &[Block],
+    view: View<'_>,
+    width: u16,
+    rows: usize,
+    label: Option<&str>,
+    active: bool,
+    expanded_tools: &HashSet<u64>,
+    scroll_back: usize,
+) -> SplitPaneFrame {
+    set_chat_layout(view.chat_layout);
+    let boxed = label.is_some();
+    let outer_top_rows = usize::from(boxed) * 2;
+    let outer_bottom_rows = usize::from(boxed);
+    let box_width = if boxed {
+        width.saturating_sub(1)
+    } else {
+        width
+    };
+    let content_width = if boxed {
+        box_width.saturating_sub(4).max(16)
+    } else {
+        width
+    };
+    let mut fixed_top = boxed.then(|| vec![PaintLine::blank()]).unwrap_or_default();
+    if let Some(summary) = view.plan_summary {
+        fixed_top.extend(fixed_plan_summary_lines(
+            summary,
+            content_width,
+            view.activity_phase,
+            view.plan_active,
+            view.plan_shimmer_phase,
+            view.plan_effort,
+        ));
+    }
+    let fixed_capacity = rows.saturating_sub(outer_top_rows + outer_bottom_rows + 3);
+    fixed_top.truncate(fixed_capacity);
+    let body_rows = rows
+        .saturating_sub(outer_top_rows + outer_bottom_rows + fixed_top.len())
+        .max(1);
+    let transcript = split_history_lines(
+        history,
+        content_width,
+        expanded_tools,
+        view.shell_display_mode,
+        view.diff_display_mode,
+        view.fold_progress_groups,
+    );
+    let live_lines = render_live_block_lines(
+        &view.live_blocks,
+        content_width,
+        expanded_tools,
+        view.shell_display_mode,
+        view.diff_display_mode,
+    );
+    let status = if active {
+        StatusArea {
+            fallback: view.footer,
+            line: view.status_line,
+            composer_notice: view.composer_notice,
+            composer_mode: view.composer_mode,
+        }
+    } else {
+        StatusArea {
+            fallback: view.footer,
+            line: view.status_line,
+            composer_notice: None,
+            composer_mode: None,
+        }
+    };
+    let overlay = active.then_some(view.overlay).flatten();
+    let mut frame = if let Some(overlay) = overlay {
+        overlay_frame_with_expansion(live_lines, overlay, view.welcome, status, content_width)
+    } else {
+        normal_frame_with_expansion(
+            live_lines,
+            view.editor,
+            view.composer_images,
+            &view.queued_prompts,
+            if active { &view.subagents } else { &[] },
+            view.composer_placeholder,
+            view.welcome,
+            if active { &view.suggestions } else { &[] },
+            view.activity.as_deref(),
+            view.activity_model.as_deref(),
+            view.activity_phase,
+            view.activity_progress_phase,
+            status,
+            content_width,
+        )
+    };
+    if label.is_none() {
+        compact_split_activity_spacer(&mut frame);
+    }
+    let (view_rows, live_rows) = split_rows(body_rows, frame.lines.len(), transcript.len());
+    fit_frame(&mut frame, live_rows);
+    if !active && let Some(start) = frame.composer_index {
+        for line in frame.lines.iter_mut().skip(start) {
+            mute_line(line);
+        }
+    }
+    let max_scroll = transcript.len().saturating_sub(view_rows);
+    let scroll_back = scroll_back.min(max_scroll);
+    let start = max_scroll - scroll_back;
+    let composer_selection =
+        frame
+            .composer_index
+            .zip(frame.composer_layout.clone())
+            .map(|(index, mut layout)| {
+                if boxed {
+                    shift_composer_layout(&mut layout, 2);
+                }
+                ComposerSelection {
+                    first_row: outer_top_rows + fixed_top.len() + view_rows + index + 1,
+                    layout,
+                }
+            });
+    let mut composer_layout = frame.composer_layout.clone();
+    if boxed {
+        if let Some(layout) = &mut composer_layout {
+            shift_composer_layout(layout, 2);
+        }
+    }
+    let (mut lines, cursor_line) = compose_screen(
+        &transcript,
+        frame.lines,
+        view_rows,
+        start,
+        frame.cursor_line,
+    );
+    let fixed_rows = fixed_top.len();
+    lines.splice(0..0, fixed_top);
+    if let Some(label) = label {
+        lines = lines
+            .into_iter()
+            .map(|line| box_split_pane_line(line, usize::from(content_width)))
+            .collect();
+        lines.insert(0, split_pane_header(label, box_width, active));
+        lines.insert(0, PaintLine::blank());
+        lines.push(split_pane_bottom(box_width));
+    }
+    SplitPaneFrame {
+        lines,
+        cursor_line: cursor_line + fixed_rows + outer_top_rows,
+        cursor_col: frame.cursor_col + usize::from(boxed) * 2,
+        composer_selection,
+        composer_layout,
+        max_scroll,
+        scroll_back,
+        view_rows,
+    }
 }
 
 /// Lays out one fullscreen frame: `view_rows` of transcript from `start`, then the
@@ -4963,6 +5684,19 @@ fn composer_content_columns(line: &PaintLine) -> Option<Range<usize>> {
 /// and paste matches Claude Code.
 fn selectable_content_columns(line: &PaintLine) -> Option<Range<usize>> {
     let content = bubble_content_columns(line);
+    if let Some(bounds) = boxed_split_content_columns(line) {
+        let start = if line.tone == Tone::UserPrompt {
+            bounds.start
+                + line
+                    .tail
+                    .first()
+                    .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+                    .unwrap_or(0)
+        } else {
+            bounds.start
+        };
+        return Some(start.min(bounds.end)..bounds.end);
+    }
     // 프롬프트의 세로선과 그 뒤 여백은 텍스트가 아니다. 본문이 빈 줄이라도 빈
     // 범위를 돌려주어야 하며, `None`으로 돌려보내면 제한이 없다는 뜻이 되어 그
     // 줄에서는 세로선까지 선택된다.
@@ -5116,22 +5850,25 @@ fn render_live_block_lines(
     shell_display_mode: ShellDisplayMode,
     diff_display_mode: DiffDisplayMode,
 ) -> Vec<PaintLine> {
-    visible_transcript_blocks(
+    let visible = visible_transcript_blocks(
         live.iter().map(|live| live.block),
         shell_display_mode,
         diff_display_mode,
-    )
-    .into_iter()
-    .flat_map(|block| {
-        block_group_lines(
+    );
+    let mut lines = Vec::new();
+    let mut previous = None;
+    for block in visible {
+        let block_lines = block_group_lines(
             block,
             width,
             shell_display_mode,
             diff_display_mode,
             expanded_tools.contains(&block.id()),
-        )
-    })
-    .collect()
+        );
+        append_compact_open_code_response(&mut lines, previous, block, block_lines);
+        previous = Some(block);
+    }
+    lines
 }
 
 fn split_fullscreen_live_blocks<'a>(
@@ -10925,6 +11662,7 @@ fn set_piece_style(
     tone: Tone,
     bold: bool,
 ) -> Result<()> {
+    honor_force_color();
     queue!(
         out,
         SetBackgroundColor(background.map_or(Color::Reset, rgb_color))
@@ -11409,6 +12147,266 @@ fn screen_write_recovery_needed(
 mod tests {
     use super::*;
 
+    fn split_test_view(editor: &Editor) -> View<'_> {
+        View {
+            live_blocks: Vec::new(),
+            overlay: None,
+            plan_summary: None,
+            response_collapse: None,
+            fold_progress_groups: false,
+            plan_active: false,
+            turn_active: false,
+            plan_shimmer_phase: None,
+            plan_effort: None,
+            editor,
+            composer_images: &[],
+            queued_prompts: Vec::new(),
+            subagents: Vec::new(),
+            composer_placeholder: "",
+            welcome: None,
+            suggestions: Vec::new(),
+            activity: None,
+            activity_model: None,
+            activity_phase: 0.0,
+            waiting_for_response: false,
+            stream_fade_tail: 0,
+            activity_progress_phase: 0.0,
+            footer: HIDDEN_STATUS_LINE.to_owned(),
+            status_line: None,
+            composer_notice: None,
+            composer_mode: None,
+            chat_layout: false,
+            shell_display_mode: ShellDisplayMode::Collapse,
+            diff_display_mode: DiffDisplayMode::Collapse,
+            side_panel_width: None,
+            side_panel_prompts_expanded: true,
+            side_panel_integrations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn split_panes_keep_the_composer_at_the_bottom_and_mute_the_inactive_one() {
+        let mut editor = Editor::default();
+        editor.set_text("draft");
+        let inactive = split_pane_frame(
+            &[],
+            split_test_view(&editor),
+            80,
+            12,
+            None,
+            false,
+            &HashSet::new(),
+        );
+        assert_eq!(inactive.lines.len(), 12);
+        assert!(
+            !inactive
+                .lines
+                .iter()
+                .any(|line| line.prefix.contains("MAIN"))
+        );
+        assert!(inactive.lines[9..].iter().all(|line| {
+            line.prefix_tone == Tone::Muted
+                && line.tone == Tone::Muted
+                && line.tail.iter().all(|span| span.tone == Tone::Muted)
+        }));
+
+        let active = split_pane_frame(
+            &[],
+            split_test_view(&editor),
+            80,
+            12,
+            Some("BTW"),
+            true,
+            &HashSet::new(),
+        );
+        assert_eq!(active.lines.len(), 12);
+        assert!(active.lines[0] == PaintLine::blank());
+        assert!(
+            painted_line_text(&active.lines[1]).starts_with("┌─ BTW · Tab switch · Ctrl+C close ─")
+        );
+        assert_eq!(painted_line_width(&active.lines[1]), 79);
+        assert_eq!(active.lines[1].prefix_tone, Tone::Muted);
+        assert_eq!(active.lines[1].tone, Tone::Accent);
+        assert!(active.lines[2..11].iter().all(|line| {
+            let text = painted_line_text(line);
+            text.starts_with("│ ") && text.ends_with(" │") && painted_line_width(line) == 79
+        }));
+        assert!(painted_line_text(&active.lines[11]).starts_with('└'));
+        assert!(painted_line_text(&active.lines[11]).ends_with('┘'));
+        assert_eq!(painted_line_width(&active.lines[11]), 79);
+        assert!(
+            active
+                .lines
+                .iter()
+                .flat_map(|line| &line.tail)
+                .any(|span| span.text == "draft")
+        );
+        assert_eq!(active.cursor_col, inactive.cursor_col + 2);
+        assert_eq!(
+            active.composer_layout.as_ref().unwrap().rows[0].start_column,
+            inactive.composer_layout.as_ref().unwrap().rows[0].start_column + 2
+        );
+        assert_eq!(
+            active.composer_selection.as_ref().unwrap().layout.rows[0].start_column,
+            inactive.composer_selection.as_ref().unwrap().layout.rows[0].start_column + 2
+        );
+        assert_eq!(SplitFocus::Main.toggled(), SplitFocus::Btw);
+        assert_eq!(SplitFocus::Btw.toggled(), SplitFocus::Main);
+    }
+
+    #[test]
+    fn main_split_keeps_only_one_blank_row_before_activity() {
+        let mut frame = Frame {
+            lines: vec![
+                PaintLine::plain("response"),
+                PaintLine::blank(),
+                PaintLine::blank(),
+                PaintLine::plain("Completed"),
+                PaintLine::plain("composer"),
+            ],
+            cursor_line: 4,
+            cursor_col: 0,
+            show_cursor: true,
+            dock_index: 1,
+            composer_index: Some(4),
+            composer_layout: None,
+            activity_index: Some(3),
+        };
+
+        compact_split_activity_spacer(&mut frame);
+
+        assert_eq!(frame.lines.len(), 4);
+        assert!(frame.lines[1] == PaintLine::blank());
+        assert_eq!(frame.lines[2].text, "Completed");
+        assert_eq!(frame.activity_index, Some(2));
+        assert_eq!(frame.composer_index, Some(3));
+        assert_eq!(frame.cursor_line, 3);
+    }
+
+    #[test]
+    fn inactive_split_pane_keeps_a_muted_status_line_without_composer_controls() {
+        let editor = Editor::default();
+        let mut inactive_view = split_test_view(&editor);
+        inactive_view.footer = "model · context · shortcuts".to_owned();
+        let inactive = split_pane_frame(&[], inactive_view, 80, 10, None, false, &HashSet::new());
+        let inactive_status = inactive
+            .lines
+            .iter()
+            .find(|line| painted_line_text(line).contains("model · context · shortcuts"))
+            .expect("inactive status line");
+        assert_eq!(inactive_status.prefix_tone, Tone::Muted);
+        assert_eq!(inactive_status.tone, Tone::Muted);
+        assert!(
+            inactive_status
+                .tail
+                .iter()
+                .all(|span| span.tone == Tone::Muted)
+        );
+
+        let mut active_view = split_test_view(&editor);
+        active_view.footer = "model · context · shortcuts".to_owned();
+        let active = split_pane_frame(&[], active_view, 80, 10, Some("BTW"), true, &HashSet::new());
+        assert!(
+            active
+                .lines
+                .iter()
+                .any(|line| { painted_line_text(line).contains("model · context · shortcuts") })
+        );
+    }
+
+    #[test]
+    fn inactive_btw_keeps_its_status_inside_the_muted_outer_box() {
+        let editor = Editor::default();
+        let mut view = split_test_view(&editor);
+        view.footer = "BTW status".to_owned();
+
+        let btw = split_pane_frame(&[], view, 80, 12, Some("BTW"), false, &HashSet::new());
+
+        assert_eq!(btw.lines[1].prefix_tone, Tone::Muted);
+        let status = btw
+            .lines
+            .iter()
+            .find(|line| painted_line_text(line).contains("BTW status"))
+            .expect("boxed BTW status");
+        assert!(painted_line_text(status).starts_with("│ "));
+        assert!(painted_line_text(status).ends_with(" │"));
+        assert!(status.tail.iter().all(|span| span.tone == Tone::Muted));
+    }
+
+    #[test]
+    fn main_split_starts_with_the_plan_instead_of_a_main_header() {
+        let editor = Editor::default();
+        let summary = PlanSummary {
+            explanation: None,
+            steps: vec![PlanStep {
+                text: "1. 화면 정리".to_owned(),
+                status: PlanStepStatus::InProgress,
+                started_at: Some(Instant::now()),
+                elapsed: None,
+            }],
+            expanded: true,
+            started_at: Instant::now(),
+            elapsed: None,
+        };
+        let mut view = split_test_view(&editor);
+        view.plan_summary = Some(&summary);
+
+        let main = split_pane_frame(&[], view, 100, 16, None, true, &HashSet::new());
+
+        assert!(painted_line_text(&main.lines[0]).contains("Updated Plan"));
+        assert!(
+            !main
+                .lines
+                .iter()
+                .any(|line| painted_line_text(line).contains("MAIN"))
+        );
+    }
+
+    #[test]
+    fn split_pane_frame_uses_its_own_scroll_offset() {
+        let editor = Editor::default();
+        let history = (0..12)
+            .map(|index| Block::new(BlockKind::Assistant, "Codex", format!("answer {index}")))
+            .collect::<Vec<_>>();
+
+        let latest = split_pane_frame_scrolled(
+            &history,
+            split_test_view(&editor),
+            80,
+            12,
+            None,
+            true,
+            &HashSet::new(),
+            0,
+        );
+        let earlier = split_pane_frame_scrolled(
+            &history,
+            split_test_view(&editor),
+            80,
+            12,
+            None,
+            true,
+            &HashSet::new(),
+            4,
+        );
+
+        assert!(latest.max_scroll >= 4);
+        assert_eq!(latest.scroll_back, 0);
+        assert_eq!(earlier.scroll_back, 4);
+        assert_ne!(
+            latest
+                .lines
+                .iter()
+                .map(painted_line_text)
+                .collect::<Vec<_>>(),
+            earlier
+                .lines
+                .iter()
+                .map(painted_line_text)
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn external_screen_write_recovery_requires_a_displaced_fullscreen_cursor() {
         let expected = (8, 24);
@@ -11711,6 +12709,75 @@ mod tests {
             row_background(Tone::UserPrompt)
         );
         assert_eq!(frame.cell(7, 0).style.background, None);
+    }
+
+    #[test]
+    fn boxed_btw_prompt_background_stays_between_the_outer_borders() {
+        set_chat_layout(false);
+        let line = box_split_pane_line(
+            PaintLine {
+                prefix: "▌ ".to_owned(),
+                prefix_tone: Tone::Accent,
+                text: "hi".to_owned(),
+                tone: Tone::UserPrompt,
+                bold: false,
+                tool_heading: None,
+                pick: None,
+                tail: Vec::new(),
+            },
+            16,
+        );
+        let mut frame = CellFrame::new(21, 1);
+
+        paint_line_into_frame(&mut frame, 0, &line, None, None, None);
+
+        assert_eq!(frame.cell(0, 0).glyph, "│");
+        assert_eq!(frame.cell(0, 0).style.background, None);
+        assert_eq!(
+            frame.cell(2, 0).style.background,
+            row_background(Tone::UserPrompt)
+        );
+        assert_eq!(
+            frame.cell(17, 0).style.background,
+            row_background(Tone::UserPrompt)
+        );
+        assert_eq!(frame.cell(18, 0).style.background, None);
+        assert_eq!(frame.cell(19, 0).glyph, "│");
+        assert_eq!(frame.cell(19, 0).style.background, None);
+        assert_eq!(selectable_content_columns(&line), Some(4..18));
+    }
+
+    #[test]
+    fn boxed_btw_assistant_background_also_leaves_both_borders_clear() {
+        set_chat_layout(true);
+        let line = box_split_pane_line(
+            PaintLine {
+                prefix: "• ".to_owned(),
+                prefix_tone: Tone::Plain,
+                text: "answer".to_owned(),
+                tone: Tone::Plain,
+                bold: false,
+                tool_heading: None,
+                pick: None,
+                tail: vec![PaintSpan {
+                    text: String::new(),
+                    tone: Tone::AssistantBubble,
+                    bold: false,
+                }],
+            },
+            16,
+        );
+        let mut frame = CellFrame::new(21, 1);
+
+        paint_line_into_frame(&mut frame, 0, &line, None, None, None);
+
+        assert_eq!(frame.cell(0, 0).style.background, None);
+        assert_eq!(
+            frame.cell(2, 0).style.background,
+            Some(assistant_bubble_background())
+        );
+        assert_eq!(frame.cell(18, 0).style.background, None);
+        assert_eq!(frame.cell(19, 0).style.background, None);
     }
 
     #[test]
@@ -17281,6 +18348,72 @@ mod tests {
     }
 
     #[test]
+    fn split_wheel_scrolls_main_and_btw_independently() {
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.split_active = true;
+        renderer.split_focus = SplitFocus::Main;
+        renderer.split_main_rows = 10;
+        renderer.split_main_max_scroll = 30;
+        renderer.split_btw_max_scroll = 40;
+
+        assert!(renderer.scroll_at(2, 6));
+        assert_eq!(renderer.split_main_scroll_back, 6);
+        assert_eq!(renderer.split_btw_scroll_back, 0);
+
+        assert!(renderer.scroll_at(14, 9));
+        assert_eq!(renderer.split_main_scroll_back, 6);
+        assert_eq!(renderer.split_btw_scroll_back, 9);
+
+        assert!(renderer.scroll(-3));
+        assert_eq!(renderer.split_main_scroll_back, 3);
+        assert_eq!(renderer.split_btw_scroll_back, 9);
+
+        renderer.split_focus = SplitFocus::Btw;
+        assert!(renderer.scroll(-4));
+        assert_eq!(renderer.split_main_scroll_back, 3);
+        assert_eq!(renderer.split_btw_scroll_back, 5);
+    }
+
+    #[test]
+    fn split_drag_selection_never_crosses_into_the_other_pane() {
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.split_active = true;
+        renderer.split_main_rows = 3;
+        renderer.previous_lines = [
+            "main zero",
+            "main one",
+            "main two",
+            "btw zero",
+            "btw one",
+            "btw two",
+        ]
+        .into_iter()
+        .map(PaintLine::plain)
+        .collect();
+
+        assert!(renderer.begin_selection(0, 1));
+        assert!(renderer.update_selection(7, 5));
+        let SelectionResult::Copy(main) = renderer.finish_selection(7, 5) else {
+            panic!("main selection");
+        };
+        assert!(main.contains("main one"));
+        assert!(main.contains("main two"));
+        assert!(!main.contains("btw"));
+
+        renderer.clear_selection();
+        assert!(renderer.begin_selection(0, 4));
+        assert!(renderer.update_selection(7, 0));
+        let SelectionResult::Copy(btw) = renderer.finish_selection(7, 0) else {
+            panic!("BTW selection");
+        };
+        assert!(!btw.is_empty());
+        assert!(!btw.contains("main"));
+        let range = renderer.selection.range().expect("BTW range");
+        assert_eq!(range.start.row, 3);
+        assert_eq!(range.end.row, 4);
+    }
+
+    #[test]
     fn page_scroll_uses_the_visible_transcript_height() {
         let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
         renderer.last_height = 40;
@@ -21557,6 +22690,89 @@ mod tests {
             .join("\n");
         assert!(super_vibe.contains("+2 Response"));
         assert!(!super_vibe.contains("첫 진행 메시지"));
+    }
+
+    #[test]
+    fn consecutive_open_code_responses_use_single_line_breaks() {
+        set_chat_layout(false);
+        let first = Block::new(BlockKind::Assistant, "OpenCode", "첫 출력");
+        let second = Block::new(BlockKind::Assistant, "OpenCode", "둘째 출력");
+        let group = Block::progress_group(vec![first.clone(), second.clone()]);
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.fold_progress_groups = false;
+
+        let history = renderer.history_block_lines(&group, 80);
+        let first_row = history
+            .iter()
+            .position(|line| line.text == "첫 출력")
+            .expect("first OpenCode response");
+        let second_row = history
+            .iter()
+            .position(|line| line.text == "둘째 출력")
+            .expect("second OpenCode response");
+        assert_eq!(second_row, first_row + 1);
+        assert!(history.last() == Some(&PaintLine::blank()));
+
+        let other_provider = Block::progress_group(vec![
+            Block::new(BlockKind::Assistant, "Codex", "기존 첫 출력"),
+            Block::new(BlockKind::Assistant, "Codex", "기존 둘째 출력"),
+        ]);
+        let existing_spacing = renderer.history_block_lines(&other_provider, 80);
+        let first_row = existing_spacing
+            .iter()
+            .position(|line| line.text == "기존 첫 출력")
+            .expect("first existing response");
+        let second_row = existing_spacing
+            .iter()
+            .position(|line| line.text == "기존 둘째 출력")
+            .expect("second existing response");
+        assert_eq!(second_row, first_row + 2);
+
+        renderer.wrapped_width = 80;
+        renderer.commit_fullscreen_blocks(std::slice::from_ref(&first), 80, 20);
+        renderer.commit_fullscreen_blocks(std::slice::from_ref(&second), 80, 20);
+        let first_row = renderer
+            .wrapped
+            .iter()
+            .position(|line| line.text == "첫 출력")
+            .expect("first committed OpenCode response");
+        let second_row = renderer
+            .wrapped
+            .iter()
+            .position(|line| line.text == "둘째 출력")
+            .expect("second committed OpenCode response");
+        assert_eq!(second_row, first_row + 1);
+        let incremental = renderer.wrapped.clone();
+        renderer.rewrap(80);
+        assert!(renderer.wrapped == incremental);
+
+        let live = [
+            LiveBlockView {
+                block: &first,
+                revision: 0,
+            },
+            LiveBlockView {
+                block: &second,
+                revision: 0,
+            },
+        ];
+        let live_lines = render_live_block_lines(
+            &live,
+            80,
+            &HashSet::new(),
+            ShellDisplayMode::Collapse,
+            DiffDisplayMode::Collapse,
+        );
+        let first_row = live_lines
+            .iter()
+            .position(|line| line.text == "첫 출력")
+            .expect("first live OpenCode response");
+        let second_row = live_lines
+            .iter()
+            .position(|line| line.text == "둘째 출력")
+            .expect("second live OpenCode response");
+        assert_eq!(second_row, first_row + 1);
+        assert!(live_lines.last() == Some(&PaintLine::blank()));
     }
 
     #[test]

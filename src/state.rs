@@ -687,8 +687,8 @@ const SLASH_COMMANDS: [SlashCommand; 32] = [
         takes_argument: true,
     },
     SlashCommand {
-        name: "/Response",
-        description: "Set Response compression type",
+        name: "/response",
+        description: "Set response compression type",
         takes_argument: true,
     },
     SlashCommand {
@@ -1097,6 +1097,16 @@ fn unix_now() -> u64 {
 
 fn context_token_label(tokens: u64) -> String {
     format!("{}k", tokens / 1_000)
+}
+
+fn context_status_token_label(tokens: u64) -> String {
+    if tokens == 0 {
+        "0".to_owned()
+    } else if tokens >= 1_000_000 {
+        format!("{}M", tokens / 1_000_000)
+    } else {
+        context_token_label(tokens)
+    }
 }
 
 #[derive(Clone)]
@@ -5524,6 +5534,52 @@ impl AppState {
         ));
     }
 
+    pub fn forked_side_state(
+        &self,
+        thread_id: String,
+        cwd: String,
+        model: &str,
+        effort: Option<&str>,
+    ) -> Self {
+        let mut side = Self::new(
+            thread_id,
+            cwd,
+            self.account.clone(),
+            self.models.clone(),
+            model,
+            effort,
+        );
+        side.side_parent = Some(SideParent {
+            thread_id: self.thread_id.clone(),
+            turn: None,
+        });
+        side.show_welcome = false;
+        side.fast_mode = self.fast_mode;
+        side.claude_permission_mode = self.claude_permission_mode;
+        side.bypass_permissions_allowed = self.bypass_permissions_allowed;
+        side.claude_auto_mode_disabled = self.claude_auto_mode_disabled;
+        side.claude_auto_mode_confirmed = self.claude_auto_mode_confirmed;
+        side.response_length = self.response_length;
+        side.response_display_mode = self.response_display_mode;
+        side.vibe_mode = self.vibe_mode;
+        side.conversation_view = self.conversation_view;
+        side.shell_display_mode = self.shell_display_mode;
+        side.diff_display_mode = self.diff_display_mode;
+        side.status_line_settings = self.status_line_settings.clone();
+        side.claude_provider_enabled = self.claude_provider_enabled;
+        side.codex_provider_enabled = self.codex_provider_enabled;
+        side.opencode_provider_connected = self.opencode_provider_connected;
+        side.account_plan = self.account_plan.clone();
+        side.skills = self.skills.clone();
+        side.mentions = self.mentions.clone();
+        side.app_mentions = self.app_mentions.clone();
+        side.workspace_entries = self.workspace_entries.clone();
+        side.completion_catalog = self.completion_catalog.clone();
+        side.claude_integrations = self.claude_integrations.clone();
+        side.codex_integrations = self.codex_integrations.clone();
+        side
+    }
+
     pub fn begin_side_prompt(&mut self, text: String) {
         self.commit_welcome_card();
         self.reset_turn_item_tracking();
@@ -6156,6 +6212,7 @@ impl AppState {
     pub fn prepare_new_thread(&mut self) {
         self.prepare_resume();
         self.editor.clear();
+        self.composer_images.clear();
         self.show_welcome = true;
     }
 
@@ -6708,6 +6765,40 @@ impl AppState {
         true
     }
 
+    fn delete_from_composer(&mut self, delete: impl FnOnce(&mut Editor)) {
+        let before = self.editor.chars().to_vec();
+        delete(&mut self.editor);
+        let removed = before.len().saturating_sub(self.editor.chars().len());
+        if removed == 0 {
+            return;
+        }
+        let start = self.editor.display_cursor().min(before.len());
+        let end = (start + removed).min(before.len());
+        let first_image = before[..start]
+            .iter()
+            .filter(|&&ch| ch == ATTACHMENT_PLACEHOLDER)
+            .count();
+        let removed_images = before[start..end]
+            .iter()
+            .filter(|&&ch| ch == ATTACHMENT_PLACEHOLDER)
+            .count();
+        if removed_images > 0 {
+            let image_end = (first_image + removed_images).min(self.composer_images.len());
+            self.composer_images
+                .drain(first_image.min(image_end)..image_end);
+        }
+    }
+
+    fn sync_composer_images_after_history_navigation(&mut self) {
+        let placeholders = self
+            .editor
+            .chars()
+            .iter()
+            .filter(|&&ch| ch == ATTACHMENT_PLACEHOLDER)
+            .count();
+        self.composer_images.truncate(placeholders);
+    }
+
     /// Applies a cursor position resolved from a click on the main composer.
     /// Blocking prompts own keyboard focus, so the composer beneath one ignores
     /// stray clicks just as selection deletion does.
@@ -6895,6 +6986,7 @@ impl AppState {
                     } else {
                         selected.name.to_owned()
                     });
+                    self.composer_images.clear();
                     self.command_selection = 0;
                     return Action::None;
                 }
@@ -6902,6 +6994,7 @@ impl AppState {
                     let selected =
                         slash_matches[self.command_selection.min(slash_matches.len() - 1)];
                     self.editor.set_text(selected.name);
+                    self.composer_images.clear();
                     self.command_selection = 0;
                     return self.submit_editor();
                 }
@@ -6996,7 +7089,7 @@ impl AppState {
                 Action::Quit
             }
             KeyCode::Char('d') if ctrl => {
-                self.editor.delete();
+                self.delete_from_composer(Editor::delete);
                 Action::None
             }
             KeyCode::Char('l') if ctrl => Action::ClearScreen,
@@ -7009,15 +7102,15 @@ impl AppState {
                 Action::None
             }
             KeyCode::Char('w') if ctrl => {
-                self.editor.delete_word_left();
+                self.delete_from_composer(Editor::delete_word_left);
                 Action::None
             }
             KeyCode::Char('k') if ctrl => {
-                self.editor.delete_to_line_end();
+                self.delete_from_composer(Editor::delete_to_line_end);
                 Action::None
             }
             KeyCode::Char('u') if ctrl => {
-                self.editor.delete_to_line_start();
+                self.delete_from_composer(Editor::delete_to_line_start);
                 Action::None
             }
             KeyCode::Char('y') if ctrl => {
@@ -7044,42 +7137,22 @@ impl AppState {
             KeyCode::Enter => self.submit_editor(),
             KeyCode::Esc if self.busy => self.request_interrupt(),
             code if (code == KeyCode::Backspace && ctrl) || code == KeyCode::Char('\u{8}') => {
-                if let Some(index) = self.editor.attachment_before_cursor() {
-                    self.editor.delete_word_left();
-                    self.composer_images.remove(index);
-                } else {
-                    self.editor.delete_word_left();
-                }
+                self.delete_from_composer(Editor::delete_word_left);
                 self.command_selection = 0;
                 Action::None
             }
             KeyCode::Backspace => {
-                if let Some(index) = self.editor.attachment_before_cursor() {
-                    self.editor.backspace();
-                    self.composer_images.remove(index);
-                } else {
-                    self.editor.backspace();
-                }
+                self.delete_from_composer(Editor::backspace);
                 self.command_selection = 0;
                 Action::None
             }
             KeyCode::Delete if ctrl => {
-                if let Some(index) = self.editor.attachment_at_cursor() {
-                    self.editor.delete_word_right();
-                    self.composer_images.remove(index);
-                } else {
-                    self.editor.delete_word_right();
-                }
+                self.delete_from_composer(Editor::delete_word_right);
                 self.command_selection = 0;
                 Action::None
             }
             KeyCode::Delete => {
-                if let Some(index) = self.editor.attachment_at_cursor() {
-                    self.editor.delete();
-                    self.composer_images.remove(index);
-                } else {
-                    self.editor.delete();
-                }
+                self.delete_from_composer(Editor::delete);
                 self.command_selection = 0;
                 Action::None
             }
@@ -7110,12 +7183,14 @@ impl AppState {
             KeyCode::Up => {
                 if !self.editor.move_up() {
                     self.editor.history_previous();
+                    self.sync_composer_images_after_history_navigation();
                 }
                 Action::None
             }
             KeyCode::Down => {
                 if !self.editor.move_down() {
                     self.editor.history_next();
+                    self.sync_composer_images_after_history_navigation();
                 }
                 Action::None
             }
@@ -8184,6 +8259,16 @@ impl AppState {
                     self.complete_item(item);
                 }
             }
+            "rawResponseItem/completed" => {
+                if params
+                    .get("item")
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("compaction_trigger")
+                {
+                    self.begin_compaction();
+                }
+            }
             "item/agentMessage/delta" => {
                 let title = params
                     .get("provider")
@@ -8372,6 +8457,9 @@ impl AppState {
         if self.provider_choice_pending && !self.any_provider_connected() && !command {
             self.open_runtime_picker();
             return Action::None;
+        }
+        if command {
+            self.composer_images.clear();
         }
         let display = submission_display(&self.editor.display_text(), self.composer_images.len());
         let text = self.editor.take_for_submit().unwrap_or_default();
@@ -8943,6 +9031,15 @@ impl AppState {
             "/status" => {
                 let model = self.selected_model_display_name();
                 let provider = self.selected_provider().label();
+                let context = self.context_window.map(|window| {
+                    let used = self.context_tokens.min(window);
+                    let left = 100u64.saturating_sub(used.saturating_mul(100) / window.max(1));
+                    format!(
+                        "Context window: {left}% left ({} used / {})",
+                        context_status_token_label(used),
+                        context_status_token_label(window)
+                    )
+                });
                 let permissions = self
                     .claude_permission_mode()
                     .map(|mode| format!("{} ({})", mode.label(), mode.wire()))
@@ -8975,9 +9072,10 @@ impl AppState {
                     BlockKind::System,
                     "Status",
                     format!(
-                        "thread: {}\nprovider: {provider}\nconnections: {connections}\nmodel: {model}\neffort: {}\ntheme: {}\npermissions: {permissions}\ncwd: {}",
+                        "thread: {}\nprovider: {provider}\nconnections: {connections}\nmodel: {model}\neffort: {}\n{}theme: {}\npermissions: {permissions}\ncwd: {}",
                         self.thread_id,
                         self.selected_effort,
+                        context.map(|value| format!("{value}\n")).unwrap_or_default(),
                         theme::current().display_name(),
                         self.cwd
                     ),
@@ -12156,6 +12254,16 @@ impl AppState {
     pub fn toggle_plan_summary(&mut self) {
         if let Some(summary) = &mut self.plan_summary {
             summary.expanded = !summary.expanded;
+        }
+    }
+
+    pub fn plan_summary_expanded(&self) -> Option<bool> {
+        self.plan_summary.as_ref().map(|summary| summary.expanded)
+    }
+
+    pub fn set_plan_summary_expanded(&mut self, expanded: bool) {
+        if let Some(summary) = &mut self.plan_summary {
+            summary.expanded = expanded;
         }
     }
 
@@ -18673,6 +18781,25 @@ mod tests {
     }
 
     #[test]
+    fn status_command_reports_context_window_usage() {
+        let mut state = test_state();
+        state.context_window = Some(1_000_000);
+        state.context_tokens = 0;
+
+        state.run_slash_command("/status");
+
+        assert!(
+            state
+                .committed
+                .last()
+                .expect("status block")
+                .body
+                .contains("Context window: 100% left (0 used / 1M)"),
+            "missing context window status"
+        );
+    }
+
+    #[test]
     fn statusline_command_toggles_individual_status_fields_with_space() {
         let mut state = test_state();
         state.status_line_settings = StatusLineSettings::default();
@@ -19427,6 +19554,7 @@ mod tests {
             Some("high"),
         );
         state.editor.set_text("leftover input");
+        state.attach_local_image(r"C:\Temp\clipboard-image.bmp".to_owned());
         state
             .committed
             .push(Block::new(BlockKind::Assistant, "", "old response"));
@@ -19440,6 +19568,7 @@ mod tests {
         state.prepare_new_thread();
 
         assert!(state.editor.is_empty());
+        assert_eq!(state.composer_image_count(), 0);
         assert!(state.committed.is_empty());
         assert_eq!(state.context_tokens, 0);
         assert_eq!(state.context_window, None);
@@ -19631,6 +19760,28 @@ mod tests {
 
         assert!(!state.compacting());
         assert_eq!(state.activity(), None);
+    }
+
+    #[test]
+    fn automatic_compaction_trigger_uses_the_same_activity_row() {
+        let mut state = test_state();
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
+
+        state.handle_notification(
+            "rawResponseItem/completed",
+            &json!({ "item": { "type": "compaction_trigger" } }),
+        );
+
+        assert!(state.compacting());
+        assert!(
+            state
+                .activity()
+                .is_some_and(|activity| activity.starts_with("Compacting.."))
+        );
+
+        state.handle_notification("thread/compacted", &json!({}));
+
+        assert!(!state.compacting());
     }
 
     /// A compaction that runs as a turn must not fall back to the `Working` label
@@ -21610,6 +21761,170 @@ mod tests {
             state.handle_key(key);
             assert_eq!(state.composer_image_count(), 0, "key: {key:?}");
         }
+    }
+
+    #[test]
+    fn composer_ctrl_backspace_after_an_image_newline_removes_the_attachment() {
+        let mut state = test_state();
+        state.attach_local_image(r"C:\Temp\clipboard-image.bmp".to_owned());
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+
+        state.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
+
+        assert!(state.editor.chars().is_empty());
+        assert_eq!(state.composer_image_count(), 0);
+
+        state.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert!(
+            state
+                .editor
+                .chars()
+                .iter()
+                .all(|&ch| ch != ATTACHMENT_PLACEHOLDER),
+            "yank must not restore an attachment without its image"
+        );
+    }
+
+    #[test]
+    fn forked_side_state_keeps_an_independent_composer_and_parent_identity() {
+        let mut parent = test_state();
+        parent.editor.set_text("main draft");
+        let mut btw = parent.forked_side_state(
+            "btw-thread".to_owned(),
+            parent.cwd.clone(),
+            parent.selected_model_name(),
+            Some(parent.selected_effort()),
+        );
+
+        btw.editor.set_text("btw draft");
+        assert_eq!(parent.editor.text(), "main draft");
+        assert_eq!(btw.editor.text(), "btw draft");
+        assert_eq!(btw.thread_id, "btw-thread");
+        assert_eq!(btw.side_parent_thread_id(), Some(parent.thread_id.as_str()));
+        assert_eq!(btw.selected_model_name(), parent.selected_model_name());
+        assert_eq!(btw.selected_effort(), parent.selected_effort());
+        assert!(
+            btw.committed.is_empty(),
+            "pane header replaces the old BTW card"
+        );
+    }
+
+    #[test]
+    fn composer_range_deletions_remove_covered_attachments() {
+        let cases = [
+            (
+                KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+                false,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                false,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+                true,
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                true,
+            ),
+            (KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL), true),
+        ];
+        for (key, delete_from_start) in cases {
+            let mut state = test_state();
+            if key.code == KeyCode::Delete {
+                state.editor.set_text(" ");
+            }
+            state.attach_local_image(r"C:\Temp\clipboard-image.bmp".to_owned());
+            state.editor.insert_str("caption");
+            if delete_from_start {
+                state.editor.move_home();
+            }
+
+            state.handle_key(key);
+
+            assert_eq!(state.composer_image_count(), 0, "key: {key:?}");
+            assert!(
+                state
+                    .editor
+                    .chars()
+                    .iter()
+                    .all(|&ch| ch != ATTACHMENT_PLACEHOLDER),
+                "key: {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_range_delete_keeps_attachments_before_the_deleted_range() {
+        let mut state = test_state();
+        state.attach_local_image(r"C:\Temp\first.bmp".to_owned());
+        state.editor.insert_str(" between ");
+        state.attach_local_image(r"C:\Temp\second.bmp".to_owned());
+        state.editor.newline();
+
+        state.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
+
+        assert_eq!(state.composer_images, [r"C:\Temp\first.bmp"]);
+        assert_eq!(
+            state
+                .editor
+                .chars()
+                .iter()
+                .filter(|&&ch| ch == ATTACHMENT_PLACEHOLDER)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn composer_history_navigation_does_not_leave_detached_image_labels() {
+        let mut state = test_state();
+        state.editor.set_text("previous prompt");
+        assert_eq!(
+            state.editor.take_for_submit().as_deref(),
+            Some("previous prompt")
+        );
+        state.attach_local_image(r"C:\Temp\clipboard-image.bmp".to_owned());
+
+        state.handle_key(KeyEvent::from(KeyCode::Up));
+
+        assert_eq!(state.editor.text(), "previous prompt");
+        assert_eq!(state.composer_image_count(), 0);
+        assert!(
+            state
+                .editor
+                .chars()
+                .iter()
+                .all(|&ch| ch != ATTACHMENT_PLACEHOLDER)
+        );
+    }
+
+    #[test]
+    fn composer_slash_commands_do_not_leave_detached_image_labels() {
+        let mut completed = test_state();
+        completed.attach_local_image(r"C:\Temp\completion-image.bmp".to_owned());
+        completed.editor.insert_str("/sta");
+
+        completed.handle_key(KeyEvent::from(KeyCode::Tab));
+
+        assert_eq!(completed.composer_image_count(), 0);
+        assert!(
+            completed
+                .editor
+                .chars()
+                .iter()
+                .all(|&ch| ch != ATTACHMENT_PLACEHOLDER)
+        );
+
+        let mut submitted = test_state();
+        submitted.attach_local_image(r"C:\Temp\command-image.bmp".to_owned());
+        submitted.editor.insert_str("/status");
+
+        submitted.submit_editor();
+
+        assert_eq!(submitted.composer_image_count(), 0);
+        assert!(submitted.editor.chars().is_empty());
     }
 
     #[test]
