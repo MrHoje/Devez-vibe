@@ -5158,6 +5158,8 @@ fn draw(state: &mut AppState, renderer: &mut Renderer) -> Result<()> {
         state.host_loading(),
         state.awaiting_input(),
     );
+    let discarded_prompt_ids = state.take_discarded_prompt_ids();
+    renderer.remove_history_blocks(&discarded_prompt_ids)?;
     let committed = state.drain_committed();
     let view = state.view();
     let view_elapsed = draw_started.elapsed();
@@ -5169,6 +5171,9 @@ fn draw(state: &mut AppState, renderer: &mut Renderer) -> Result<()> {
         .sum();
     let render_started = Instant::now();
     let result = renderer.render(&committed, view);
+    if result.is_ok() {
+        state.note_response_frame_rendered(&committed);
+    }
     perf::record_draw(
         view_elapsed,
         render_started.elapsed(),
@@ -7518,6 +7523,13 @@ mod tests {
 
         assert_eq!(queued, None);
         assert!(!state.busy);
+        assert!(
+            state
+                .drain_committed()
+                .iter()
+                .all(|block| !matches!(block.kind, BlockKind::User))
+        );
+        assert_eq!(state.take_discarded_prompt_ids().len(), 1);
         // The first Ctrl+C interrupts and arms the quit, so its notice takes the
         // activity slot ahead of the interrupted label.
         assert!(

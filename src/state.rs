@@ -3599,6 +3599,10 @@ pub struct AppState {
     /// the prompt that preceded it. The last clone also receives the completed
     /// duration and replaces its already-rendered transcript block.
     turn_prompts: Vec<Block>,
+    /// User prompt cards withdrawn by an interrupt before assistant text began.
+    /// The renderer may already own them, so their ids cross the state boundary
+    /// once and trigger a transcript rebuild.
+    discarded_prompt_ids: Vec<u64>,
     response_grouped: bool,
     response_collapse: Option<ResponseCollapseTransition>,
     /// App-server lifecycle notifications can be replayed. An item id belongs
@@ -3642,8 +3646,11 @@ pub struct AppState {
     command_selection: usize,
     spinner_frame: usize,
     turn_started_at: Option<Instant>,
-    /// Whether the active turn has painted any assistant text yet.
+    /// Whether the active turn has received any assistant text yet.
     turn_response_started: bool,
+    /// Whether a frame has actually shown assistant text for the active turn.
+    /// Stream deltas can arrive before their paced text reaches the terminal.
+    turn_response_visible: bool,
     /// How many characters at the end of the streamed text are still settling.
     /// Each reveal lengthens it and time shortens it, so the tail is long while
     /// text is flowing and gone shortly after it stops.
@@ -3853,6 +3860,7 @@ impl AppState {
             turn_file_change_anchor: None,
             turn_response_blocks: Vec::new(),
             turn_prompts: Vec::new(),
+            discarded_prompt_ids: Vec::new(),
             response_grouped: false,
             response_collapse: None,
             completed_item_ids: HashSet::new(),
@@ -3882,6 +3890,7 @@ impl AppState {
             compacting_started_at: None,
             turn_started_at: None,
             turn_response_started: false,
+            turn_response_visible: false,
             stream_fade_tail: 0.0,
             held_notifications: Vec::new(),
             held_since: None,
@@ -4575,6 +4584,7 @@ impl AppState {
     /// Drops a prompt that was queued before the thread existed, so Ctrl+C reads
     /// the same as interrupting a live turn.
     pub fn cancel_queued_prompt(&mut self) {
+        self.discard_unanswered_turn_prompts();
         self.last_completed_duration = self.turn_started_at.map(|started| started.elapsed());
         self.turn_interrupted = self.last_completed_duration.is_some();
         self.busy = false;
@@ -5713,6 +5723,7 @@ impl AppState {
 
     fn reset_turn_item_tracking(&mut self) {
         self.turn_response_started = false;
+        self.turn_response_visible = false;
         self.completed_item_ids.clear();
         self.seen_operation_signatures.clear();
         self.turn_shell_results.clear();
@@ -5831,6 +5842,7 @@ impl AppState {
     /// Interrupt an active turn immediately, or remember the request until the
     /// app-server announces that a just-started turn is active.
     fn request_interrupt(&mut self) -> Action {
+        self.discard_unanswered_turn_prompts();
         // Before `thread/start` binds a session, the main-loop startup helper
         // owns queued-prompt cancellation. Keep its established Ctrl+C/Esc
         // path rather than treating that as a pending turn.
@@ -5851,6 +5863,41 @@ impl AppState {
             self.last_completed_duration = self.turn_started_at.map(|started| started.elapsed());
         }
         Action::Tick(true)
+    }
+
+    fn discard_unanswered_turn_prompts(&mut self) {
+        if self.turn_response_visible || self.turn_prompts.is_empty() {
+            return;
+        }
+        let ids = self
+            .turn_prompts
+            .drain(..)
+            .map(|prompt| prompt.id())
+            .collect::<HashSet<_>>();
+        self.committed.retain(|block| !ids.contains(&block.id()));
+        self.discarded_prompt_ids.extend(ids);
+    }
+
+    pub fn take_discarded_prompt_ids(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.discarded_prompt_ids)
+    }
+
+    pub fn note_response_frame_rendered(&mut self, committed: &[Block]) {
+        if self.turn_response_visible {
+            return;
+        }
+        let committed_response_visible = committed.iter().any(|block| {
+            matches!(block.kind, BlockKind::Assistant)
+                && !block.body.is_empty()
+                && self
+                    .turn_response_blocks
+                    .iter()
+                    .any(|response| response.id() == block.id())
+        });
+        let live_response_visible = self.active.values().any(|item| {
+            matches!(item.block.kind, BlockKind::Assistant) && !item.block.body.is_empty()
+        });
+        self.turn_response_visible = committed_response_visible || live_response_visible;
     }
 
     pub fn open_session_picker(&mut self, sessions: Vec<SessionInfo>) {
@@ -20387,6 +20434,68 @@ mod tests {
 
         state.handle_notification("turn/completed", &json!({}));
         assert_eq!(state.activity().as_deref(), Some("X Interrupted"));
+    }
+
+    #[test]
+    fn interrupt_before_assistant_text_discards_the_sent_prompt() {
+        let mut state = test_state();
+        state.editor.set_text("표시하지 않을 요청");
+        assert!(matches!(state.submit_editor(), Action::Submit(_)));
+        let prompt = state.drain_committed().pop().expect("submitted prompt");
+        state.set_turn_started("turn-1".to_owned());
+
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Esc)),
+            Action::Interrupt
+        ));
+
+        assert_eq!(state.take_discarded_prompt_ids(), vec![prompt.id()]);
+        assert!(state.turn_prompts.is_empty());
+        assert!(state.drain_committed().is_empty());
+    }
+
+    #[test]
+    fn interrupt_after_assistant_text_keeps_the_sent_prompt() {
+        let mut state = test_state();
+        state.editor.set_text("표시할 요청");
+        assert!(matches!(state.submit_editor(), Action::Submit(_)));
+        let prompt = state.drain_committed().pop().expect("submitted prompt");
+        state.set_turn_started("turn-1".to_owned());
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({ "itemId": "answer", "delta": "응답" }),
+        );
+        for _ in 0..10 {
+            state.drain_stream_text(Duration::from_millis(40));
+        }
+        state.note_response_frame_rendered(&[]);
+
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Esc)),
+            Action::Interrupt
+        ));
+
+        assert!(state.take_discarded_prompt_ids().is_empty());
+        assert_eq!(state.turn_prompts.last().map(Block::id), Some(prompt.id()));
+    }
+
+    #[test]
+    fn interrupt_before_a_received_delta_is_painted_discards_the_prompt() {
+        let mut state = test_state();
+        state.editor.set_text("아직 표시되지 않은 요청");
+        assert!(matches!(state.submit_editor(), Action::Submit(_)));
+        let prompt = state.drain_committed().pop().expect("submitted prompt");
+        state.set_turn_started("turn-1".to_owned());
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({ "itemId": "answer", "delta": "대기 중인 응답" }),
+        );
+
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Esc)),
+            Action::Interrupt
+        ));
+        assert_eq!(state.take_discarded_prompt_ids(), vec![prompt.id()]);
     }
 
     #[test]

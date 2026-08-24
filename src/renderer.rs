@@ -1402,6 +1402,33 @@ impl Renderer {
         self.history.iter().map(Block::id).max().unwrap_or_default()
     }
 
+    /// Removes prompt cards that were already committed before an early
+    /// interrupt. Inline mode rebuilds terminal scrollback; fullscreen mode can
+    /// invalidate its wrapped cache and let the next frame erase the old rows.
+    pub fn remove_history_blocks(&mut self, block_ids: &[u64]) -> Result<()> {
+        if block_ids.is_empty() {
+            return Ok(());
+        }
+        let block_ids = block_ids.iter().copied().collect::<HashSet<_>>();
+        let before = self.history.len();
+        self.history
+            .retain(|block| !block_ids.contains(&block.id()));
+        if self.history.len() == before {
+            return Ok(());
+        }
+        self.expanded_tools
+            .retain(|block_id| !block_ids.contains(block_id));
+        self.wrapped_width = 0;
+        self.live_frame_cache = None;
+        self.history_view_rows_anchor = None;
+        self.history_view_start_anchor = None;
+        self.question_view_rows_anchor = None;
+        if self.mode == RenderMode::Inline {
+            self.relayout()?;
+        }
+        Ok(())
+    }
+
     /// Moves the transcript view by `delta` rows, positive being back into
     /// history. Reports whether the view actually moved, so a wheel spun at
     /// either end costs no repaint. The clamp against the bottom happens here;
@@ -16528,6 +16555,23 @@ mod tests {
 
         assert!(renderer.scroll_to_bottom());
         assert_eq!(renderer.scroll_back, 0);
+    }
+
+    #[test]
+    fn fullscreen_history_removes_an_early_interrupted_prompt() {
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        let kept = Block::new(BlockKind::Assistant, "Codex", "이전 응답");
+        let removed = Block::new(BlockKind::User, "Codex", "중단한 요청");
+        renderer.history = vec![kept.clone(), removed.clone()];
+        renderer.wrapped_width = 80;
+
+        renderer
+            .remove_history_blocks(&[removed.id()])
+            .expect("history removal");
+
+        assert_eq!(renderer.history.len(), 1);
+        assert_eq!(renderer.history[0].id(), kept.id());
+        assert_eq!(renderer.wrapped_width, 0);
     }
 
     #[test]
