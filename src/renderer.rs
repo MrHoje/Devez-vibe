@@ -34,7 +34,10 @@ use crate::{
         CellPosition, CellRange, CopyLine, Selection, SelectionFinish, extract_text,
         selected_char_count, selection_chunks,
     },
-    state::{DiffDisplayMode, QUESTION_TAB_SEPARATOR, ShellDisplayMode},
+    state::{
+        DiffDisplayMode, QUESTION_ANSWERED_MARK, QUESTION_TAB_CURSOR, QUESTION_TAB_SEPARATOR,
+        ShellDisplayMode,
+    },
     syntax::{self, SyntaxKind},
     theme::{self, Rgb, ThemeKind},
 };
@@ -6337,13 +6340,9 @@ fn question_tab_row(tabs: &str, width: usize) -> PaintLine {
     line.prefix = "│   ".to_owned();
     line.prefix_tone = Tone::Border;
     let mut used = 0;
-    let mut current = false;
     let mut clipped = false;
     for (index, tab) in tabs.split(QUESTION_TAB_SEPARATOR).enumerate() {
-        // 헤더 자체에 구분점이 들어 있어도 대괄호가 닫힐 때까지 한 단계로 본다.
-        if tab.starts_with('[') {
-            current = true;
-        }
+        let current = tab.starts_with(QUESTION_TAB_CURSOR);
         let mut spans = Vec::new();
         if index > 0 {
             spans.push(PaintSpan {
@@ -6352,9 +6351,15 @@ fn question_tab_row(tabs: &str, width: usize) -> PaintLine {
                 bold: false,
             });
         }
+        // 답을 마친 단계도 색을 얻고, 지금 있는 단계는 거기에 굵기까지 얻는다.
+        let answered = tab.contains(QUESTION_ANSWERED_MARK);
         spans.push(PaintSpan {
             text: tab.to_owned(),
-            tone: if current { Tone::Accent } else { Tone::Muted },
+            tone: if current || answered {
+                Tone::Accent
+            } else {
+                Tone::Muted
+            },
             bold: current,
         });
         let span_width = spans
@@ -6367,9 +6372,6 @@ fn question_tab_row(tabs: &str, width: usize) -> PaintLine {
         }
         used += span_width;
         line.tail.extend(spans);
-        if tab.ends_with(']') {
-            current = false;
-        }
     }
     if clipped {
         line.tail.push(PaintSpan {
@@ -7202,9 +7204,11 @@ fn overlay_frame_with_expansion(
                     } else {
                         continuation.clone()
                     };
+                    // 켜 둔 선택지는 커서가 떠나도 색을 지켜, 무엇을 골랐는지가
+                    // 목록 전체에서 한눈에 남는다.
                     let tone = if part_index > 0 || row.muted {
                         Tone::Muted
-                    } else if row.selected {
+                    } else if row.selected || part.starts_with(QUESTION_ANSWERED_MARK) {
                         Tone::Accent
                     } else {
                         Tone::Plain
@@ -8847,7 +8851,6 @@ fn side_panel_header_lines(cwd: &str, content_width: usize) -> Vec<PaintLine> {
             tone: Tone::Muted,
             ..PaintLine::plain("")
         },
-        PaintLine::blank(),
         side_panel_divider(content_width),
     ]
 }

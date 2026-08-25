@@ -11485,9 +11485,9 @@ impl AppState {
                             format!(
                                 "{} {}",
                                 if answer_picked(answers, &question.id, &option.label) {
-                                    '☑'
+                                    QUESTION_ANSWERED_MARK
                                 } else {
-                                    '☐'
+                                    QUESTION_PENDING_MARK
                                 },
                                 option.label
                             )
@@ -13472,12 +13472,12 @@ fn question_tabs(
                 question.header.clone()
             };
             let mark = if answers.contains_key(&question.id) {
-                '\u{2611}'
+                QUESTION_ANSWERED_MARK
             } else {
-                '\u{2610}'
+                QUESTION_PENDING_MARK
             };
             if index == current {
-                format!("[{mark} {header}]")
+                format!("{QUESTION_TAB_CURSOR} {mark} {header}")
             } else {
                 format!("{mark} {header}")
             }
@@ -13575,6 +13575,18 @@ fn strip_recommendation_mark(answer: &str) -> &str {
 /// 단계 줄에서 단계 사이에 놓이는 구분점. 렌더러가 같은 구분자로 줄을 다시
 /// 갈라 지금 있는 단계만 강조하므로 양쪽이 같은 문자열을 써야 한다.
 pub const QUESTION_TAB_SEPARATOR: &str = " \u{00b7} ";
+
+/// 답을 마친 단계와 켠 선택지 앞에 붙는 상자. 완료 계획이 쓰는 체크와 같은
+/// 글자를 담아 끝난 것은 어디서나 같은 모양으로 읽힌다. 렌더러도 이 글자로
+/// 어느 줄을 강조할지 가른다.
+pub const QUESTION_ANSWERED_MARK: &str = "[\u{2714}]";
+/// 아직 답하지 않은 단계와 꺼진 선택지 앞에 붙는 빈 상자. 켠 상자와 자리가
+/// 어긋나지 않도록 안쪽을 공백 한 칸으로 두어 너비를 맞춘다.
+pub const QUESTION_PENDING_MARK: &str = "[ ]";
+
+/// 지금 있는 단계 앞에 붙는 마커. 상자가 대괄호를 쓰게 되면서 단계를 다시
+/// 대괄호로 감쌀 수 없으니, 선택지 목록과 같은 마커로 어디에 와 있는지 짚는다.
+pub const QUESTION_TAB_CURSOR: &str = "\u{276f}";
 
 /// The two rows a question carries beyond its own options.
 const OTHER_ANSWER_LABEL: &str = "직접 입력";
@@ -15843,7 +15855,9 @@ mod tests {
         let overlay = state.overlay_view().expect("둘째 질문이 다시 열려야 한다");
         assert!(overlay.title.contains("2/3"));
         assert!(
-            overlay.lines[0].text.contains("[☑ Q2]"),
+            overlay.lines[0].text.contains(&format!(
+                "{QUESTION_TAB_CURSOR} {QUESTION_ANSWERED_MARK} Q2"
+            )),
             "탭 줄이 지금 질문을 짚어야 한다"
         );
         assert!(
@@ -15973,12 +15987,12 @@ mod tests {
         state.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
         let overlay = state.overlay_view().expect("overlay");
         assert!(
-            overlay.lines[1].text.starts_with('\u{2611}'),
+            overlay.lines[1].text.starts_with(QUESTION_ANSWERED_MARK),
             "켠 줄이 표시되지 않았다: {}",
             overlay.lines[1].text
         );
         assert!(
-            overlay.lines[2].text.starts_with('\u{2610}'),
+            overlay.lines[2].text.starts_with(QUESTION_PENDING_MARK),
             "켜지 않은 줄이 켜진 것처럼 보인다: {}",
             overlay.lines[2].text
         );
@@ -15994,6 +16008,15 @@ mod tests {
         assert_eq!(
             result["answers"]["q1"]["answers"],
             json!(["크기 조절", "주소 기억"])
+        );
+    }
+
+    /// 켠 상자와 빈 상자의 너비가 다르면 목록의 글자 자리가 줄마다 흔들린다.
+    #[test]
+    fn a_checked_box_takes_the_same_columns_as_an_empty_one() {
+        assert_eq!(
+            UnicodeWidthStr::width(QUESTION_ANSWERED_MARK),
+            UnicodeWidthStr::width(QUESTION_PENDING_MARK)
         );
     }
 
