@@ -2737,6 +2737,7 @@ impl Renderer {
             focus == SplitFocus::Main,
             &self.expanded_tools,
             self.split_main_scroll_back,
+            self.split_main_max_scroll,
         );
         let btw = split_pane_frame_scrolled(
             &self.split_history,
@@ -2747,6 +2748,7 @@ impl Renderer {
             focus == SplitFocus::Btw,
             &self.expanded_tools,
             self.split_btw_scroll_back,
+            self.split_btw_max_scroll,
         );
         self.split_main_rows = main_rows;
         self.split_main_max_scroll = main.max_scroll;
@@ -4682,7 +4684,17 @@ fn split_pane_frame(
     active: bool,
     expanded_tools: &HashSet<u64>,
 ) -> SplitPaneFrame {
-    split_pane_frame_scrolled(history, view, width, rows, label, active, expanded_tools, 0)
+    split_pane_frame_scrolled(
+        history,
+        view,
+        width,
+        rows,
+        label,
+        active,
+        expanded_tools,
+        0,
+        0,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4695,6 +4707,7 @@ fn split_pane_frame_scrolled(
     active: bool,
     expanded_tools: &HashSet<u64>,
     scroll_back: usize,
+    previous_max_scroll: usize,
 ) -> SplitPaneFrame {
     set_chat_layout(view.chat_layout);
     let boxed = label.is_some();
@@ -4726,7 +4739,7 @@ fn split_pane_frame_scrolled(
     let body_rows = rows
         .saturating_sub(outer_top_rows + outer_bottom_rows + fixed_top.len())
         .max(1);
-    let transcript = split_history_lines(
+    let mut transcript = split_history_lines(
         history,
         content_width,
         expanded_tools,
@@ -4734,8 +4747,20 @@ fn split_pane_frame_scrolled(
         view.diff_display_mode,
         view.fold_progress_groups,
     );
+    // A streamed Assistant owns transcript rows in both fullscreen layouts.
+    // Keeping it in the split pane's dock would revive the old live-to-history
+    // transfer and move the answer when `/btw` closes or the item commits.
+    let (streamed_blocks, docked_blocks) = split_fullscreen_live_blocks(&view.live_blocks);
+    let (streamed_lines, _) = render_streamed_transcript_lines(
+        &streamed_blocks,
+        content_width,
+        expanded_tools,
+        view.shell_display_mode,
+        view.diff_display_mode,
+    );
+    transcript.extend(streamed_lines);
     let live_lines = render_live_block_lines(
-        &view.live_blocks,
+        &docked_blocks,
         content_width,
         expanded_tools,
         view.shell_display_mode,
@@ -4788,7 +4813,12 @@ fn split_pane_frame_scrolled(
         }
     }
     let max_scroll = transcript.len().saturating_sub(view_rows);
-    let scroll_back = scroll_back.min(max_scroll);
+    let scroll_back = if scroll_back == 0 {
+        0
+    } else {
+        let max_delta = max_scroll as isize - previous_max_scroll as isize;
+        scroll_back.saturating_add_signed(max_delta).min(max_scroll)
+    };
     let start = max_scroll - scroll_back;
     let composer_selection =
         frame
@@ -12255,6 +12285,96 @@ mod tests {
     }
 
     #[test]
+    fn split_streamed_answer_keeps_its_row_when_committed() {
+        set_chat_layout(false);
+        for rows in 8..=20 {
+            for width in [48, 80, 120] {
+                for history_pairs in [0, 4, 12] {
+                    for answer_rows in 1..=8 {
+                        let editor = Editor::default();
+                        let history = (0..history_pairs)
+                            .flat_map(|index| {
+                                [
+                                    Block::new(
+                                        BlockKind::User,
+                                        "Codex",
+                                        format!("과거 프롬프트 {index}"),
+                                    ),
+                                    Block::new(
+                                        BlockKind::Assistant,
+                                        "Codex",
+                                        format!("과거 답변 {index}"),
+                                    ),
+                                ]
+                            })
+                            .collect::<Vec<_>>();
+                        let answer = Block::new(
+                            BlockKind::Assistant,
+                            "Codex",
+                            (0..answer_rows)
+                                .map(|row| {
+                                    if row == 0 {
+                                        "스트리밍 중인 최종 답변입니다.".to_owned()
+                                    } else {
+                                        format!("최종 답변 {row}")
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        );
+                        let mut live_view = split_test_view(&editor);
+                        live_view.live_blocks = vec![LiveBlockView {
+                            block: &answer,
+                            revision: answer.body.len() as u64,
+                        }];
+                        live_view.activity = Some("Working".to_owned());
+                        let live = split_pane_frame(
+                            &history,
+                            live_view,
+                            width,
+                            rows,
+                            None,
+                            true,
+                            &HashSet::new(),
+                        );
+
+                        let mut completed_history = history;
+                        completed_history.push(answer);
+                        let mut completed_view = split_test_view(&editor);
+                        completed_view.activity = Some("Working".to_owned());
+                        let completed = split_pane_frame(
+                            &completed_history,
+                            completed_view,
+                            width,
+                            rows,
+                            None,
+                            true,
+                            &HashSet::new(),
+                        );
+                        let answer_row = |frame: &SplitPaneFrame| {
+                            frame.lines.iter().position(|line| {
+                                painted_line_text(line).contains("스트리밍 중인 최종 답변입니다.")
+                            })
+                        };
+                        let live_row = answer_row(&live);
+                        let completed_row = answer_row(&completed);
+
+                        assert_eq!(
+                            live_row.is_some(),
+                            completed_row.is_some(),
+                            "visibility rows={rows}, width={width}, history={history_pairs}, answer={answer_rows}"
+                        );
+                        assert_eq!(
+                            live_row, completed_row,
+                            "rows={rows}, width={width}, history={history_pairs}, answer={answer_rows}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn main_split_keeps_only_one_blank_row_before_activity() {
         let mut frame = Frame {
             lines: vec![
@@ -12378,6 +12498,7 @@ mod tests {
             true,
             &HashSet::new(),
             0,
+            0,
         );
         let earlier = split_pane_frame_scrolled(
             &history,
@@ -12388,6 +12509,7 @@ mod tests {
             true,
             &HashSet::new(),
             4,
+            latest.max_scroll,
         );
 
         assert!(latest.max_scroll >= 4);
@@ -12400,6 +12522,170 @@ mod tests {
                 .map(painted_line_text)
                 .collect::<Vec<_>>(),
             earlier
+                .lines
+                .iter()
+                .map(painted_line_text)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn growing_split_stream_keeps_a_scrolled_reader_on_the_same_rows() {
+        fn streamed_view<'a>(editor: &'a Editor, answer: &'a Block) -> View<'a> {
+            let mut view = split_test_view(editor);
+            view.live_blocks = vec![LiveBlockView {
+                block: answer,
+                revision: answer.body.len() as u64,
+            }];
+            view.activity = Some("Working".to_owned());
+            view
+        }
+
+        set_chat_layout(false);
+        let editor = Editor::default();
+        let history = (0..20)
+            .flat_map(|index| {
+                [
+                    Block::new(BlockKind::User, "Codex", format!("프롬프트 {index}")),
+                    Block::new(BlockKind::Assistant, "Codex", format!("기록 답변 {index}")),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut answer = Block::new(
+            BlockKind::Assistant,
+            "Codex",
+            "스트리밍 중인 최종 답변입니다.",
+        );
+        let latest = split_pane_frame_scrolled(
+            &history,
+            streamed_view(&editor, &answer),
+            80,
+            12,
+            None,
+            true,
+            &HashSet::new(),
+            0,
+            0,
+        );
+        let before = split_pane_frame_scrolled(
+            &history,
+            streamed_view(&editor, &answer),
+            80,
+            12,
+            None,
+            true,
+            &HashSet::new(),
+            latest.max_scroll,
+            latest.max_scroll,
+        );
+
+        answer
+            .body
+            .push_str("\n둘째 줄\n셋째 줄\n넷째 줄\n다섯째 줄");
+        let after = split_pane_frame_scrolled(
+            &history,
+            streamed_view(&editor, &answer),
+            80,
+            12,
+            None,
+            true,
+            &HashSet::new(),
+            before.scroll_back,
+            before.max_scroll,
+        );
+
+        assert!(after.max_scroll > before.max_scroll);
+        assert_eq!(after.scroll_back, after.max_scroll);
+        assert_eq!(
+            before
+                .lines
+                .iter()
+                .map(painted_line_text)
+                .collect::<Vec<_>>(),
+            after
+                .lines
+                .iter()
+                .map(painted_line_text)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn committing_split_stream_keeps_a_scrolled_reader_on_the_same_rows() {
+        set_chat_layout(false);
+        let editor = Editor::default();
+        let history = (0..20)
+            .flat_map(|index| {
+                [
+                    Block::new(BlockKind::User, "Codex", format!("프롬프트 {index}")),
+                    Block::new(BlockKind::Assistant, "Codex", format!("기록 답변 {index}")),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let answer = Block::new(
+            BlockKind::Assistant,
+            "Codex",
+            "스트리밍 중인 최종 답변입니다.\n둘째 줄\n셋째 줄",
+        );
+        let mut live_view = split_test_view(&editor);
+        live_view.live_blocks = vec![LiveBlockView {
+            block: &answer,
+            revision: answer.body.len() as u64,
+        }];
+        live_view.activity = Some("Working".to_owned());
+        let latest = split_pane_frame_scrolled(
+            &history,
+            live_view,
+            80,
+            12,
+            None,
+            true,
+            &HashSet::new(),
+            0,
+            0,
+        );
+        let mut scrolled_view = split_test_view(&editor);
+        scrolled_view.live_blocks = vec![LiveBlockView {
+            block: &answer,
+            revision: answer.body.len() as u64,
+        }];
+        scrolled_view.activity = Some("Working".to_owned());
+        let before = split_pane_frame_scrolled(
+            &history,
+            scrolled_view,
+            80,
+            12,
+            None,
+            true,
+            &HashSet::new(),
+            latest.max_scroll,
+            latest.max_scroll,
+        );
+
+        let mut completed_history = history;
+        completed_history.push(answer);
+        let mut completed_view = split_test_view(&editor);
+        completed_view.activity = Some("Working".to_owned());
+        let after = split_pane_frame_scrolled(
+            &completed_history,
+            completed_view,
+            80,
+            12,
+            None,
+            true,
+            &HashSet::new(),
+            before.scroll_back,
+            before.max_scroll,
+        );
+
+        assert_eq!(before.scroll_back, after.scroll_back);
+        assert_eq!(
+            before
+                .lines
+                .iter()
+                .map(painted_line_text)
+                .collect::<Vec<_>>(),
+            after
                 .lines
                 .iter()
                 .map(painted_line_text)
@@ -18064,6 +18350,91 @@ mod tests {
             renderer.scroll_back,
             before_scroll.saturating_add_signed(total_delta)
         );
+    }
+
+    #[test]
+    fn side_panel_width_cycle_leaves_no_stale_stream_geometry() {
+        set_chat_layout(false);
+        for (rows, total_width, panel_width) in [(18, 100, 24), (24, 120, 36), (32, 140, 48)] {
+            let narrowed_width = side_panel_layout(total_width, panel_width)
+                .expect("side panel layout")
+                .main_width as u16;
+            let history = (0..10)
+                .flat_map(|index| {
+                    [
+                        Block::new(BlockKind::User, "Codex", format!("프롬프트 {index}")),
+                        Block::new(BlockKind::Assistant, "Codex", format!("기록 답변 {index}")),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let mut answer = Block::new(
+                BlockKind::Assistant,
+                "Codex",
+                "스트리밍 중인 최종 답변입니다. 폭 전환 전 문장입니다.",
+            );
+            let renderer = || {
+                let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+                renderer.shell_display_mode = ShellDisplayMode::Hide;
+                renderer.diff_display_mode = DiffDisplayMode::Hide;
+                renderer
+            };
+            let mut cycled = renderer();
+            simulate_fullscreen_frame(
+                &mut cycled,
+                &history,
+                std::slice::from_ref(&answer),
+                Some("Working"),
+                None,
+                rows,
+                total_width,
+            );
+            answer
+                .body
+                .push_str(" 사이드패널이 열린 동안 추가된 문장입니다.");
+            simulate_fullscreen_frame(
+                &mut cycled,
+                &[],
+                std::slice::from_ref(&answer),
+                Some("Working"),
+                None,
+                rows,
+                narrowed_width,
+            );
+            answer
+                .body
+                .push_str(" 다시 닫힌 뒤에도 이어지는 문장입니다.");
+            let cycled_screen = simulate_fullscreen_frame(
+                &mut cycled,
+                &[],
+                std::slice::from_ref(&answer),
+                Some("Working"),
+                None,
+                rows,
+                total_width,
+            );
+
+            let mut baseline = renderer();
+            let baseline_screen = simulate_fullscreen_frame(
+                &mut baseline,
+                &history,
+                std::slice::from_ref(&answer),
+                Some("Working"),
+                None,
+                rows,
+                total_width,
+            );
+            assert_eq!(
+                cycled_screen
+                    .iter()
+                    .map(painted_line_text)
+                    .collect::<Vec<_>>(),
+                baseline_screen
+                    .iter()
+                    .map(painted_line_text)
+                    .collect::<Vec<_>>(),
+                "rows={rows}, total={total_width}, panel={panel_width}"
+            );
+        }
     }
 
     #[test]

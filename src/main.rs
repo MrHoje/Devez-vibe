@@ -1822,6 +1822,7 @@ async fn event_loop(
             }
             Action::ReturnFromSide if btw_state.is_some() => {
                 close_btw(server, &mut btw_state, renderer).await;
+                state.settle_response_collapse();
                 restore_main_plan_after_btw(state, &mut btw_parent_plan_expanded);
                 split_focus = SplitFocus::Main;
                 false

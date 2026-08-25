@@ -11871,6 +11871,13 @@ impl AppState {
         self.response_collapse_view().is_some()
     }
 
+    /// A split pane already presents the parent's completed response in its
+    /// collapsed form. Returning to the main surface must not replay the
+    /// background transition against a different viewport geometry.
+    pub fn settle_response_collapse(&mut self) {
+        self.response_collapse = None;
+    }
+
     fn status_line(&self) -> StatusLineView {
         let context = self.context_window.and_then(|window| {
             (window > 0).then(|| {
@@ -19843,6 +19850,38 @@ mod tests {
     }
 
     #[test]
+    fn returning_from_btw_settles_a_background_response_collapse() {
+        let mut state = test_state();
+        while state.vibe_mode() != VibeMode::SuperVibe {
+            state.cycle_vibe_mode();
+        }
+        state.set_response_display_mode(ResponseDisplayMode::Completed);
+        state.set_turn_started("turn-1".to_owned());
+        for (id, phase, text) in [
+            ("progress", "commentary", "진행 상황을 확인했습니다."),
+            ("final", "final_answer", "최종 답변입니다."),
+        ] {
+            state.handle_notification(
+                "item/completed",
+                &json!({
+                    "item": { "id": id, "type": "agentMessage", "phase": phase, "text": text }
+                }),
+            );
+            state.drain_committed();
+        }
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "status": "completed" } }),
+        );
+        assert!(state.response_collapse_view().is_some());
+
+        state.settle_response_collapse();
+
+        assert!(state.response_collapse_view().is_none());
+        assert!(!state.response_collapse_animating());
+    }
+
+    #[test]
     fn completed_mode_folds_progress_before_final_answer_streaming_starts() {
         let mut state = test_state();
         while state.vibe_mode() != VibeMode::SuperVibe {
@@ -21789,6 +21828,9 @@ mod tests {
     fn forked_side_state_keeps_an_independent_composer_and_parent_identity() {
         let mut parent = test_state();
         parent.editor.set_text("main draft");
+        parent.cycle_side_panel();
+        parent.cycle_side_panel();
+        let parent_panel = parent.side_panel_stage();
         let mut btw = parent.forked_side_state(
             "btw-thread".to_owned(),
             parent.cwd.clone(),
@@ -21797,12 +21839,15 @@ mod tests {
         );
 
         btw.editor.set_text("btw draft");
+        btw.cycle_side_panel();
         assert_eq!(parent.editor.text(), "main draft");
         assert_eq!(btw.editor.text(), "btw draft");
         assert_eq!(btw.thread_id, "btw-thread");
         assert_eq!(btw.side_parent_thread_id(), Some(parent.thread_id.as_str()));
         assert_eq!(btw.selected_model_name(), parent.selected_model_name());
         assert_eq!(btw.selected_effort(), parent.selected_effort());
+        assert_eq!(parent.side_panel_stage(), parent_panel);
+        assert_ne!(btw.side_panel_stage(), parent.side_panel_stage());
         assert!(
             btw.committed.is_empty(),
             "pane header replaces the old BTW card"
