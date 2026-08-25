@@ -2802,6 +2802,8 @@ fn looks_like_uri(value: &str) -> bool {
 }
 
 fn parse_skill_bindings(response: &Value) -> Vec<SkillBinding> {
+    // 같은 플러그인이 user/project/local 스코프로 중복 등록되면 백엔드가 동일한 스킬을 스코프 수만큼 돌려준다.
+    let mut seen = HashSet::new();
     response
         .get("data")
         .and_then(Value::as_array)
@@ -2845,6 +2847,12 @@ fn parse_skill_bindings(response: &Value) -> Vec<SkillBinding> {
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
             })
+        })
+        .filter(|skill| {
+            seen.insert((
+                skill.name.clone(),
+                skill.source.clone().unwrap_or_else(|| skill.path.clone()),
+            ))
         })
         .collect()
 }
@@ -18864,6 +18872,37 @@ mod tests {
         let overlay = state.overlay_view().expect("status line picker stays open");
         assert_eq!(overlay.lines[1].text, "☐ Effort");
         assert!(overlay.lines[1].selected);
+    }
+
+    #[test]
+    fn skills_picker_collapses_a_plugin_installed_under_several_scopes() {
+        let entry = |scope: &str| {
+            json!({
+                "name": "redmine-usage",
+                "path": "C:/claude/plugins/knowledge-mcp/skills/redmine-usage/SKILL.md",
+                "description": "Redmine usage",
+                "enabled": true,
+                "scope": scope,
+                "pluginId": "knowledge-mcp@eghis"
+            })
+        };
+        let response = json!({
+            "data": [{
+                "skills": [entry("local"), entry("local"), entry("user"), entry("project")]
+            }]
+        });
+        let mut state = test_state();
+        state.open_skills_picker(SkillProvider::Claude, &response, None);
+
+        let overlay = state.overlay_view().expect("skills picker");
+        assert_eq!(
+            overlay
+                .lines
+                .iter()
+                .filter(|line| line.text.contains("redmine-usage"))
+                .count(),
+            1
+        );
     }
 
     #[test]

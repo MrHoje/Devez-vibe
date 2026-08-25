@@ -5329,6 +5329,9 @@ const PROGRESS_TRACK_COLUMNS: usize = 20;
 /// Below this the bar reads as a handful of blocks rather than a track, so the
 /// row keeps the elapsed time alone instead.
 const PROGRESS_TRACK_MINIMUM: usize = 8;
+/// A half-height block: a full-cell band sits as tall as the text beside it and
+/// reads heavier than the row deserves, so the track keeps to the lower half.
+const PROGRESS_GLYPH: char = '▄';
 
 /// An indeterminate band enters from the left, crosses the track, and leaves
 /// through the right edge. Providers expose only start/end, so this communicates
@@ -5359,16 +5362,11 @@ fn progress_bar_spans(phase: f32, track: usize, base: Rgb) -> Vec<PaintSpan> {
             } else {
                 0.5 * (1.0 + (distance * std::f32::consts::PI).cos())
             };
-            // Density carries the sweep where the terminal quantises colour, so
-            // the band still reads on palettes with little room between tones.
-            let glyph = match level {
-                level if level >= 0.75 => '█',
-                level if level >= 0.45 => '▓',
-                level if level >= 0.15 => '▒',
-                _ => '░',
-            };
+            // One glyph the whole way across: the sweep rides on brightness
+            // alone, since swapping density would put the band back at full cell
+            // height in its brightest columns.
             PaintSpan {
-                text: glyph.to_string(),
+                text: PROGRESS_GLYPH.to_string(),
                 tone: if level > 0.0 {
                     Tone::Shimmer(base, (level * 255.0).round() as u8)
                 } else {
@@ -20132,17 +20130,15 @@ mod tests {
         let passing = activity_lines("Compacting.. (4s)", None, 0.5, 80);
         let leaving = activity_lines("Compacting.. (4s)", None, 0.8, 80);
 
-        assert_eq!(
-            painted(&entering[0]),
-            " ⠹ Compacting.. ██░░░░░░░░░░░░░░░░░░ (4s)"
-        );
-        assert_eq!(
-            painted(&passing[0]),
-            " ⠴ Compacting.. ░░░░▒▓███░░░░░░░░░░░ (4s)"
-        );
-        assert_eq!(
-            painted(&leaving[0]),
-            " ⠇ Compacting.. ░░░░░░░░░░░░▒▓███▒░░ (4s)"
+        let track = PROGRESS_GLYPH.to_string().repeat(PROGRESS_TRACK_COLUMNS);
+        assert_eq!(painted(&entering[0]), format!(" ⠹ Compacting.. {track} (4s)"));
+        assert_eq!(painted(&passing[0]), format!(" ⠴ Compacting.. {track} (4s)"));
+        assert_eq!(painted(&leaving[0]), format!(" ⠇ Compacting.. {track} (4s)"));
+
+        // The glyph no longer moves, so the band is where the row is brightest.
+        assert!(
+            brightest_column(&entering[0]) < brightest_column(&passing[0])
+                && brightest_column(&passing[0]) < brightest_column(&leaving[0])
         );
 
         let narrow = activity_lines("Compacting.. (4s)", None, 0.5, 30);
@@ -20154,11 +20150,33 @@ mod tests {
     #[test]
     fn the_compacting_label_shimmers_independently_from_its_progress_band() {
         let line = activity_lines_with_progress("Compacting.. (4s)", None, 0.0, 0.5, 80);
+        let paired = activity_lines("Compacting.. (4s)", None, 0.5, 80);
 
-        assert_eq!(
-            painted(&line[0]),
-            " ⠋ Compacting.. ░░░░▒▓███░░░░░░░░░░░ (4s)"
-        );
+        assert_eq!(progress_levels(&line[0]), progress_levels(&paired[0]));
+        assert!(painted(&line[0]).starts_with(" ⠋ Compacting.. "));
+    }
+
+    /// The bar paints one glyph per column, so its band is read off the shimmer
+    /// levels rather than off the glyphs.
+    fn progress_levels(line: &PaintLine) -> Vec<u8> {
+        line.tail
+            .iter()
+            .filter(|span| span.text.starts_with(PROGRESS_GLYPH))
+            .map(|span| match span.tone {
+                Tone::Shimmer(_, level) => level,
+                _ => 0,
+            })
+            .collect()
+    }
+
+    fn brightest_column(line: &PaintLine) -> usize {
+        let levels = progress_levels(line);
+        levels
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, level)| **level)
+            .map(|(column, _)| column)
+            .expect("a compaction row carries a bar")
     }
 
     /// The reading belongs to compaction alone: an ordinary turn keeps its plain
