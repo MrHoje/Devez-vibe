@@ -3238,11 +3238,12 @@ impl Renderer {
             |start| scroll_back_for_transcript_start(display_wrapped.len(), view_rows, start),
         );
         let start = max_back - self.scroll_back;
-        let start = if plan_summary.is_some() && !plan_in_panel {
-            transcript_start_below_plan(&display_wrapped, start)
-        } else {
-            start
-        };
+        let start = transcript_start_with_plan(
+            &display_wrapped,
+            start,
+            plan_summary.is_some() && !plan_in_panel,
+            self.scroll_back,
+        );
         // Fade only the newest visible transcript tail. A user reading older
         // history must never see unrelated rows restyled by a hidden stream.
         let stream_fade = (stream_fade_tail > 0
@@ -4936,6 +4937,22 @@ fn transcript_start_below_plan(wrapped: &[PaintLine], start: usize) -> usize {
             .count()
 }
 
+/// 최신 응답을 보는 동안에는 계획 아래 행을 건너뛰지 않는다. 끝에 닿은 창에서
+/// 시작 행만 앞으로 밀면 부족한 행이 하단에 채워져 Completed 위 여백이 늘어난다.
+/// 과거를 스크롤하는 창에서만 기존 구분 줄 건너뛰기를 적용한다.
+fn transcript_start_with_plan(
+    wrapped: &[PaintLine],
+    start: usize,
+    plan_visible: bool,
+    scroll_back: usize,
+) -> usize {
+    if plan_visible && scroll_back > 0 {
+        transcript_start_below_plan(wrapped, start)
+    } else {
+        start.min(wrapped.len())
+    }
+}
+
 /// The overlay floats two rows above the composer, covering only the button's
 /// cells rather than claiming a transcript row of its own.
 fn scroll_to_bottom_overlay_row(view_rows: usize, composer_index: Option<usize>) -> Option<usize> {
@@ -5333,9 +5350,6 @@ const WORKING_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
 /// work outlives its turn, so its row keeps the loader while the turn is over.
 const SPINNING_ACTIVITY_LABELS: [&str; 3] = ["Working..", "Compacting..", "Background:"];
 
-/// 끝난 턴의 진행 줄 앞에 서는 별. 이 글리프만 굵게 그린다.
-const COMPLETED_ACTIVITY_GLYPH: &str = "✧";
-
 /// Glyphs that head an activity row which is already over. A shimmer on these
 /// reads as work still running, so they paint flat.
 const SETTLED_ACTIVITY_GLYPHS: [&str; 2] = ["✓", "X"];
@@ -5421,14 +5435,13 @@ fn activity_lines_with_progress(
             .map(|trailer| (*label, trailer))
     }) {
         let shimmer_base = tone_rgb(tone).unwrap_or(theme::palette().foreground);
-        // 도는 글리프는 굵게 그린다. 얇은 점 무늬는 문구 옆에서 눌려 보인다.
         let mut tail = vec![PaintSpan {
             text: format!(
                 "{} ",
                 WORKING_SPINNER[(phase.clamp(0.0, 0.999) * WORKING_SPINNER.len() as f32) as usize]
             ),
             tone,
-            bold: true,
+            bold: false,
         }];
         // Working keeps its elapsed reading in the same sweep, so the active
         // state does not visually stop before the time at the right.
@@ -5472,21 +5485,16 @@ fn activity_lines_with_progress(
             tail,
         }];
     }
-    if let Some(rest) = activity.strip_prefix(COMPLETED_ACTIVITY_GLYPH) {
-        // 별만 굵게 남기고 읽을 문구는 보통 굵기로 둔다.
+    if activity.starts_with("✧ Completed (") {
         return vec![PaintLine {
             prefix: " ".to_owned(),
             prefix_tone: tone,
-            text: COMPLETED_ACTIVITY_GLYPH.to_owned(),
+            text: activity.to_owned(),
             tone,
-            bold: true,
+            bold: false,
             tool_heading: None,
             pick: None,
-            tail: vec![PaintSpan {
-                text: rest.to_owned(),
-                tone,
-                bold: false,
-            }],
+            tail: Vec::new(),
         }];
     }
     let shimmer_base = tone_rgb(tone).unwrap_or(theme::palette().foreground);
@@ -16100,28 +16108,6 @@ mod tests {
         );
     }
 
-    /// 도는 글리프와 끝난 턴의 별은 굵게, 함께 놓인 문구는 보통 굵기로 그린다.
-    #[test]
-    fn the_loader_and_the_completed_star_paint_bold() {
-        let working = activity_lines("Working.. (2s)", None, 0.5, 80)
-            .pop()
-            .expect("working row");
-        let loader = working.tail.first().expect("loader span");
-        assert_eq!(loader.text, "⠴ ");
-        assert!(loader.bold);
-
-        let completed = activity_lines("✧ Completed (2s)", None, 0.5, 80)
-            .pop()
-            .expect("completed row");
-        assert_eq!(completed.text, "✧");
-        assert!(completed.bold);
-        assert_eq!(
-            completed.tail.first().map(|span| span.text.as_str()),
-            Some(" Completed (2s)")
-        );
-        assert!(completed.tail.iter().all(|span| !span.bold));
-    }
-
     #[test]
     fn settled_activity_labels_never_shimmer() {
         for (label, expected_prefix, expected_text, expected_tone) in [
@@ -17046,6 +17032,34 @@ mod tests {
             screen.iter().map(painted).collect::<Vec<_>>(),
             ["first visible row", "second visible row", "composer0"]
         );
+    }
+
+    #[test]
+    fn latest_plan_frame_keeps_one_blank_row_above_completed() {
+        let transcript = vec![
+            PaintLine::blank(),
+            PaintLine::plain("마지막 응답"),
+            PaintLine::blank(),
+        ];
+        let start = transcript_start_with_plan(&transcript, 0, true, 0);
+        let (screen, _) = compose_screen(
+            &transcript,
+            vec![PaintLine::plain("Completed")],
+            3,
+            start,
+            0,
+        );
+        let response = screen
+            .iter()
+            .position(|line| line.text == "마지막 응답")
+            .expect("response row");
+        let completed = screen
+            .iter()
+            .position(|line| line.text == "Completed")
+            .expect("completed row");
+
+        assert_eq!(start, 0, "최신 위치의 계획 보정은 시작 행을 밀지 않는다");
+        assert_eq!(completed - response, 2, "빈 줄은 정확히 한 줄이다");
     }
 
     #[test]
