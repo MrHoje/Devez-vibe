@@ -10251,6 +10251,14 @@ impl AppState {
                     match pressed {
                         KeyCode::Up => selected = selected.saturating_sub(1),
                         KeyCode::Down => selected = (selected + 1).min(chat_instead),
+                        // 여러 단계짜리 질문은 좌우로 오갈 수 있다. 앞 질문의 답을
+                        // 고쳐 놓고 다시 돌아올 수 있어야 마지막 Enter가 뜻대로 간다.
+                        KeyCode::Left | KeyCode::BackTab if current > 0 => {
+                            return show_question(id, questions, current - 1, answers, self);
+                        }
+                        KeyCode::Right | KeyCode::Tab if current + 1 < questions.len() => {
+                            return show_question(id, questions, current + 1, answers, self);
+                        }
                         KeyCode::Char(' ')
                             if question.multi_select && selected < question.options.len() =>
                         {
@@ -10756,7 +10764,7 @@ impl AppState {
                         .enumerate()
                         .map(|(index, entry)| OverlayLine {
                             text: format!(
-                                "{}\n{}",
+                                "{}\n\n{}",
                                 entry.value,
                                 claude_permission_source_label(&entry.source)
                             ),
@@ -11446,8 +11454,21 @@ impl AppState {
                 ..
             } => {
                 let question = &questions[*current];
+                // 여러 단계짜리 질문은 Claude Code처럼 질문 위에 탭 줄을 둔다. 어느
+                // 질문에 와 있고 어디까지 답했는지가 한 줄로 드러난다.
+                let prompt = if questions.len() > 1 {
+                    format!(
+                        "{}
+
+{}",
+                        question_tabs(questions, *current, answers),
+                        question.question
+                    )
+                } else {
+                    question.question.clone()
+                };
                 let mut lines = vec![OverlayLine {
-                    text: question.question.clone(),
+                    text: prompt,
                     selected: false,
                     muted: false,
                 }];
@@ -11500,6 +11521,7 @@ impl AppState {
                 }
                 Some(OverlayView {
                     closable: false,
+                    // 단계는 탭 줄이 이미 말해 주므로 제목은 이 질문의 이름만 든다.
                     title: if question.header.is_empty() {
                         format!("Question {}/{}", current + 1, questions.len())
                     } else {
@@ -11507,12 +11529,19 @@ impl AppState {
                     },
                     lines,
                     slider: None,
-                    hint: if text_focused {
-                        "Enter 전송 · Esc 취소".to_owned()
-                    } else if question.multi_select {
-                        "Space 선택 · Enter 확정 · ↑/↓ 이동 · Esc 취소".to_owned()
-                    } else {
-                        "Enter 선택 · ↑/↓ 이동 · Esc 취소".to_owned()
+                    hint: {
+                        let steps = if questions.len() > 1 {
+                            " · Tab/←→ 질문 이동"
+                        } else {
+                            ""
+                        };
+                        if text_focused {
+                            "Enter 전송 · Esc 취소".to_owned()
+                        } else if question.multi_select {
+                            format!("Space 선택 · Enter 확정 · ↑/↓ 이동{steps} · Esc 취소")
+                        } else {
+                            format!("Enter 선택 · ↑/↓ 이동{steps} · Esc 취소")
+                        }
                     },
                     style: OverlayStyle::Question,
                     input: text_focused.then_some(editor),
@@ -13400,16 +13429,85 @@ fn next_question_or_reply(
             result: answers_response(&answers),
         };
     }
-    let next = current + 1;
+    show_question(id, questions, current + 1, answers, state)
+}
+
+/// Opens one question of a multi-step ask, restoring whatever answer it already
+/// holds so stepping back with the arrows shows the earlier choice rather than a
+/// blank question.
+fn show_question(
+    id: Value,
+    questions: Vec<Question>,
+    target: usize,
+    answers: BTreeMap<String, Vec<String>>,
+    state: &mut AppState,
+) -> Action {
+    let (selected, editor) = restore_question_focus(&questions[target], &answers);
     state.pending = Some(PendingInteraction::UserInput {
         id,
         questions,
-        current: next,
-        selected: 0,
-        editor: Editor::default(),
+        current: target,
+        selected,
+        editor,
         answers,
     });
     Action::None
+}
+
+/// The tab strip over a multi-step question: every question's header with a box
+/// showing whether it has an answer yet, the current one wrapped in brackets.
+fn question_tabs(
+    questions: &[Question],
+    current: usize,
+    answers: &BTreeMap<String, Vec<String>>,
+) -> String {
+    let tabs = questions
+        .iter()
+        .enumerate()
+        .map(|(index, question)| {
+            let header = if question.header.is_empty() {
+                format!("Q{}", index + 1)
+            } else {
+                question.header.clone()
+            };
+            let mark = if answers.contains_key(&question.id) {
+                '\u{2611}'
+            } else {
+                '\u{2610}'
+            };
+            if index == current {
+                format!("[{mark} {header}]")
+            } else {
+                format!("{mark} {header}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("  ");
+    format!("\u{2190} {tabs} \u{2192}")
+}
+
+/// Where the cursor and the free-text row should sit when a question is shown
+/// again: on the option that was taken, or on the text that was typed.
+fn restore_question_focus(
+    question: &Question,
+    answers: &BTreeMap<String, Vec<String>>,
+) -> (usize, Editor) {
+    let mut editor = Editor::default();
+    let Some(picked) = answers.get(&question.id) else {
+        return (0, editor);
+    };
+    if let Some(index) = picked
+        .iter()
+        .find_map(|answer| question.options.iter().position(|o| &o.label == answer))
+    {
+        return (index, editor);
+    }
+    // 옵션 어디에도 없는 답은 직접 입력으로 남긴 것이다.
+    if question.allow_other && let Some(text) = picked.last() {
+        editor.set_text(text.clone());
+        return (question.options.len(), editor);
+    }
+    (0, editor)
 }
 
 /// Leave the answer in conversation history when the blocking question closes.
@@ -15694,6 +15792,83 @@ mod tests {
         assert_eq!(
             sent.body,
             "첫 질문인가요:\n  ↳ 첫 답\n\n둘째 질문:\n  ↳ 둘째 답"
+        );
+    }
+
+    /// 여러 단계짜리 질문은 좌우 화살표와 Tab으로 오갈 수 있어야 한다. 앞 단계로 돌아가면
+    /// 그때 고른 줄에 커서가 놓이고, 답을 고쳐도 뒤 단계의 답은 그대로 남는다.
+    #[test]
+    fn arrows_and_tab_step_between_questions_and_keep_the_answers_given_so_far() {
+        let mut state = test_state();
+        state.begin_server_request(
+            json!(1),
+            "item/tool/requestUserInput",
+            &json!({
+                "questions": [
+                    {
+                        "id": "q1",
+                        "question": "첫 질문:",
+                        "options": [
+                            { "label": "첫 답", "description": "설명" },
+                            { "label": "고친 답", "description": "설명" }
+                        ]
+                    },
+                    {
+                        "id": "q2",
+                        "question": "둘째 질문:",
+                        "options": [
+                            { "label": "아니오", "description": "설명" },
+                            { "label": "둘째 답", "description": "설명" }
+                        ]
+                    },
+                    {
+                        "id": "q3",
+                        "question": "셋째 질문:",
+                        "options": [{ "label": "셋째 답", "description": "설명" }]
+                    }
+                ]
+            }),
+        );
+
+        state.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        // 셋째 질문에서 두 단계 뒤로 물러난다. Shift+Tab도 같은 길이다.
+        state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        let overlay = state.overlay_view().expect("둘째 질문이 다시 열려야 한다");
+        assert!(overlay.title.contains("2/3"));
+        assert!(
+            overlay.lines[0].text.contains("[☑ Q2]"),
+            "탭 줄이 지금 질문을 짚어야 한다"
+        );
+        assert!(
+            overlay.lines[2].selected,
+            "앞서 고른 줄에 커서가 놓여야 한다"
+        );
+
+        state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            Action::None
+        ));
+        // 첫 질문의 답을 고치면 곧바로 둘째 질문으로 넘어간다.
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::RpcResponse { .. }
+        ));
+
+        let sent = state.committed.last().expect("sent answer history");
+        assert_eq!(
+            sent.body,
+            "첫 질문:
+  ↳ 고친 답
+
+둘째 질문:
+  ↳ 둘째 답
+
+셋째 질문:
+  ↳ 셋째 답"
         );
     }
 

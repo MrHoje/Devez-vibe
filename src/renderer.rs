@@ -7011,22 +7011,33 @@ fn overlay_frame_with_expansion(
 
             let mut rows = overlay.lines.iter().enumerate();
             if let Some((_, prompt)) = rows.next() {
-                lines.extend(
-                    wrapped_line_with_continuation(
-                        "│   ",
-                        "│   ",
-                        Tone::Border,
-                        &prompt.text,
-                        Tone::Plain,
-                        true,
-                        wrap_width,
-                    )
-                    .into_iter()
-                    .map(|mut line| {
-                        line.bold = true;
-                        close_panel_row(line, panel_width)
-                    }),
-                );
+                // 질문 앞에 붙은 줄은 단계 탭처럼 곁들이는 안내다. 질문 자체인
+                // 마지막 줄만 굵게 두고 나머지는 흐리게 그린다.
+                let parts = prompt.text.lines().collect::<Vec<_>>();
+                let last_part = parts.len().saturating_sub(1);
+                for (part_index, part) in parts.into_iter().enumerate() {
+                    let is_prompt = part_index == last_part;
+                    if part.is_empty() {
+                        lines.push(panel_padding_row(panel_width));
+                        continue;
+                    }
+                    lines.extend(
+                        wrapped_line_with_continuation(
+                            "│   ",
+                            "│   ",
+                            Tone::Border,
+                            part,
+                            if is_prompt { Tone::Plain } else { Tone::Muted },
+                            true,
+                            wrap_width,
+                        )
+                        .into_iter()
+                        .map(|mut line| {
+                            line.bold = is_prompt;
+                            close_panel_row(line, panel_width)
+                        }),
+                    );
+                }
                 lines.push(panel_padding_row(panel_width));
             }
 
