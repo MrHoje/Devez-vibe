@@ -1380,11 +1380,13 @@ async fn event_loop(
         // Codex는 백그라운드 터미널을 알림으로 알려주지 않아 목록을 물어봐야
         // 진행 표시의 개수를 맞출 수 있다.
         if let Some(thread_id) = state.take_codex_background_probe() {
-            let count = codex_background_terminal_count(server, &thread_id).await;
-            if let Some(count) = count
-                && state.set_background_tasks(count)
-            {
-                draw_conversations(state, &mut btw_state, split_focus, renderer)?;
+            match codex_background_terminal_count(server, &thread_id).await {
+                Some(count) => {
+                    if state.set_background_tasks(count) {
+                        draw_conversations(state, &mut btw_state, split_focus, renderer)?;
+                    }
+                }
+                None => state.note_codex_background_probe_failure(),
             }
         }
         // A quiet turn is asked about rather than assumed dead. Only a runtime that
@@ -4140,6 +4142,11 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 무엇을 알아냈는지 담기지 않은 진행 문장은 쓰지 않는다. ",
     "`다음 부분을 이어서 확인하겠습니다.`, `이어서 진행하겠습니다.`, `계속 확인하겠습니다.`처럼 ",
     "다음에 무엇을 왜 보는지 없는 문장은 같은 응답에서 한 번도 쓰지 않는다.\n",
+    "진행 표시 규칙:\n",
+    "- 도구를 호출하기 직전마다 그 호출로 지금 무엇을 하는지 20자 내외의 한국어 구로 적어 `⟦…⟧` 한 줄로 먼저 낸다. ",
+    "예: `⟦저장소 최상위 목록 확인 중⟧`, `⟦디렉터리별 항목 수 세는 중⟧`.\n",
+    "- 이 줄은 화면 아래 진행 표시에만 나타나고 대화 본문에는 보이지 않는다. 그러므로 진행 안내 문장이나 답변을 대신하지 않으며, 그 줄만 내고 도구 호출을 건너뛰지 않는다.\n",
+    "- `⟦`와 `⟧`는 이 진행 문구에만 쓰고 답변 본문, 코드, 명령어 안에는 쓰지 않는다.\n",
     "계획 규칙:\n",
     "- 실행 단계가 두 개 이상이거나 도구를 두 번 이상 호출할 작업, 설계 판단이 필요한 작업에서는 첫 작업 도구 호출 전에 반드시 `update_plan`을 호출해 짧은 계획을 먼저 세운다. 진행 안내 문장, 조사 항목 나열, 답변 본문의 불릿은 `update_plan`을 대신하지 않는다.\n",
     "- 단순 질문, 단 한 번의 고립된 조회, 한 줄 수정처럼 도구 한 번으로 끝난다고 확신할 수 있는 요청에만 계획을 만들지 않는다. 한 번으로 끝날지 확신할 수 없으면 반드시 계획부터 만든다. 첫 작업 도구를 호출한 뒤 두 번째 도구 앞에서 계획을 만드는 것은 지침 위반이다.\n",
@@ -4215,6 +4222,11 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "`다음 부분을 이어서 확인하겠습니다.`, `이어서 진행하겠습니다.`, `계속 확인하겠습니다.`처럼 ",
     "다음에 무엇을 왜 보는지 없는 문장은 같은 응답에서 한 번도 쓰지 않는다.\n",
     "- Skill 적용, 지침 확인, 내부 도구 호출 같은 내부 절차는 알리지 않는다.\n",
+    "진행 표시 규칙:\n",
+    "- 도구를 호출하기 직전마다 그 호출로 지금 무엇을 하는지 20자 내외의 한국어 구로 적어 `⟦…⟧` 한 줄로 먼저 낸다. ",
+    "예: `⟦저장소 최상위 목록 확인 중⟧`, `⟦디렉터리별 항목 수 세는 중⟧`.\n",
+    "- 이 줄은 화면 아래 진행 표시에만 나타나고 대화 본문에는 보이지 않는다. 그러므로 진행 안내 text나 답변을 대신하지 않으며, 그 줄만 내고 도구 호출을 건너뛰지 않는다.\n",
+    "- `⟦`와 `⟧`는 이 진행 문구에만 쓰고 답변 본문, 코드, 명령어 안에는 쓰지 않는다.\n",
 );
 
 const CLAUDE_TURN_REMINDER: &str = "최종 답변은 불릿 2~3개, 전체 200자 내외로 쓰고 불릿 하나에 두 문장을 넘기지 않는다. 필요한 경우가 아니면 영어로 응답하지 않으며, 도구 호출 앞뒤 text도 첫 글자가 한글이어야 하고 영어 문장으로 시작하거나 영어 판정 뒤 한국어를 잇지 않는다. 클래스명·메서드명·변수명·파일 경로·코드 조각은 사용자 판단에 꼭 필요할 때만 최소로 쓴다.";
@@ -5636,43 +5648,38 @@ async fn codex_subagent_statuses(
     .await
 }
 
-/// 백그라운드 터미널 목록에서 아직 도는 것만 센다. 종료 표시가 붙은 항목은
-/// 목록에 남아 있어도 진행 표시에서 빼야 한다.
+/// Codex는 이미 끝난 프로세스를 목록에서 빼고 돌려주므로 받은 항목이 곧 도는
+/// 작업이다. 목록이 여러 페이지면 끝까지 따라가 전체 개수를 센다.
 async fn codex_background_terminal_count(server: &BackendServer, thread_id: &str) -> Option<usize> {
     const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
     let client = server.client()?;
-    let params = json!({ "threadId": thread_id });
-    let response = timeout(
-        PROBE_TIMEOUT,
-        client.request("thread/backgroundTerminals/list", params),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    Some(
-        response
-            .get("data")
-            .and_then(Value::as_array)?
-            .iter()
-            .filter(|terminal| codex_background_terminal_running(terminal))
-            .count(),
-    )
-}
-
-fn codex_background_terminal_running(terminal: &Value) -> bool {
-    if terminal.get("exitCode").is_some_and(|code| !code.is_null()) {
-        return false;
-    }
-    match terminal.get("status") {
-        Some(Value::String(status)) => {
-            matches!(status.as_str(), "running" | "active" | "started")
+    let mut cursor: Option<String> = None;
+    let mut count = 0usize;
+    loop {
+        let mut params = json!({ "threadId": thread_id, "limit": 100 });
+        if let Some(cursor) = cursor.as_deref() {
+            params["cursor"] = json!(cursor);
         }
-        Some(status) => status
-            .get("type")
+        let response = timeout(
+            PROBE_TIMEOUT,
+            client.request("thread/backgroundTerminals/list", params),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        count = count.checked_add(response.get("data").and_then(Value::as_array)?.len())?;
+        let Some(next) = response
+            .get("nextCursor")
             .and_then(Value::as_str)
-            .is_none_or(|kind| matches!(kind, "running" | "active" | "started")),
-        None => true,
+            .map(ToOwned::to_owned)
+        else {
+            return Some(count);
+        };
+        if cursor.as_deref() == Some(next.as_str()) {
+            return None;
+        }
+        cursor = Some(next);
     }
 }
 

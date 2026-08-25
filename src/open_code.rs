@@ -190,13 +190,30 @@ impl SessionStreams {
         tool_id: &str,
         update: &Value,
     ) -> Option<Notification> {
-        let Some(task_id) = background_subagent_task_id(update) else {
+        if background_subagent_task_id(update).is_none() {
             return self.subagent_finished(session_id, tool_id);
-        };
+        }
+        self.subagent_backgrounded(session_id, tool_id, update)
+    }
+
+    /// 돌던 task를 백그라운드로 넘기면 순정은 tool이 끝나기 전에 metadata부터
+    /// 갱신한다. 그 갱신에서 바로 표시해야 진행 표시의 개수가 늦지 않는다.
+    fn subagent_backgrounded(
+        &mut self,
+        session_id: &str,
+        tool_id: &str,
+        update: &Value,
+    ) -> Option<Notification> {
+        let task_id = background_subagent_task_id(update)?;
         let entry = self
             .subagents
             .iter_mut()
             .find(|entry| entry.get("id").and_then(Value::as_str) == Some(tool_id))?;
+        if entry.get("background").and_then(Value::as_bool) == Some(true)
+            && entry.get("taskId").and_then(Value::as_str) == Some(task_id)
+        {
+            return None;
+        }
         entry["background"] = Value::Bool(true);
         entry["taskId"] = Value::String(task_id.to_owned());
         entry["missingPolls"] = json!(0);
@@ -1425,6 +1442,18 @@ async fn route_session_update(
                     }
                 }
                 _ => {
+                    // 아직 도는 tool이라도 백그라운드로 넘어갔다는 metadata가
+                    // 붙었으면 그 자리에서 백그라운드 행으로 돌린다.
+                    let subagents = {
+                        let mut streams = streams.lock().await;
+                        streams
+                            .entry(session_id.to_owned())
+                            .or_default()
+                            .subagent_backgrounded(session_id, id, &merged)
+                    };
+                    if let Some((method, params)) = subagents {
+                        notify(events, &method, params);
+                    }
                     tools.lock().await.insert(id.to_owned(), merged);
                 }
             }
@@ -2363,6 +2392,49 @@ mod tests {
             .expect("백그라운드 전환 알림");
 
         assert_eq!(backgrounded.1.pointer("/backgroundTasks"), Some(&json!(1)));
+    }
+
+    /// 순정은 돌던 task를 백그라운드로 넘길 때 tool이 끝나기 전에 metadata부터
+    /// 갱신한다. 그 갱신만으로도 백그라운드 행이 되어야 개수가 늦지 않는다.
+    #[test]
+    fn a_promoted_task_becomes_a_background_row_before_its_tool_ends() {
+        let mut streams = SessionStreams::default();
+        streams.subagent_started(
+            "s",
+            &json!({
+                "toolCallId": "call_1",
+                "title": "task",
+                "rawInput": { "subagent_type": "developer", "description": "구현" }
+            }),
+        );
+
+        let promoted = streams
+            .subagent_backgrounded(
+                "s",
+                "call_1",
+                &json!({
+                    "rawOutput": {
+                        "metadata": { "background": true, "sessionId": "child_1" }
+                    }
+                }),
+            )
+            .expect("진행 중 승격도 백그라운드 행이 된다");
+
+        assert_eq!(promoted.1.pointer("/backgroundTasks"), Some(&json!(1)));
+        // 같은 갱신이 되풀이돼도 알림을 다시 보내지 않는다.
+        assert!(
+            streams
+                .subagent_backgrounded(
+                    "s",
+                    "call_1",
+                    &json!({
+                        "rawOutput": {
+                            "metadata": { "background": true, "sessionId": "child_1" }
+                        }
+                    }),
+                )
+                .is_none()
+        );
     }
 
     #[test]

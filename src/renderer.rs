@@ -3447,12 +3447,8 @@ impl Renderer {
                     .and_then(|index| index.checked_sub(1))
                     .and_then(|index| visible.get(index))
                     .copied();
-                let range = append_compact_open_code_response(
-                    &mut self.wrapped,
-                    previous,
-                    block,
-                    lines,
-                );
+                let range =
+                    append_compact_open_code_response(&mut self.wrapped, previous, block, lines);
                 if matches!(block.kind, BlockKind::ProgressGroup) && self.fold_progress_groups {
                     let content_end = range.end.saturating_sub(usize::from(
                         self.wrapped.get(range.end.saturating_sub(1)) == Some(&PaintLine::blank()),
@@ -3479,8 +3475,7 @@ impl Renderer {
             self.diff_display_mode,
         ) {
             let lines = self.history_block_lines(block, width);
-            let range =
-                append_compact_open_code_response(&mut wrapped, previous, block, lines);
+            let range = append_compact_open_code_response(&mut wrapped, previous, block, lines);
             if matches!(block.kind, BlockKind::ProgressGroup) && self.fold_progress_groups {
                 let content_end = range.end.saturating_sub(usize::from(
                     wrapped.get(range.end.saturating_sub(1)) == Some(&PaintLine::blank()),
@@ -5359,7 +5354,7 @@ const SETTLED_ACTIVITY_GLYPHS: [&str; 2] = ["✓", "X"];
 
 /// 진행 줄이 로더 글리프와 시머를 달아야 하는지, 달아야 한다면 어디까지가 라벨이고
 /// 어디부터가 꼬리인지. 이름이 알려진 문구를 먼저 맞춰 보고, 그 자리를 대신 차지한
-/// 도구 라벨은 끝난 줄과 대기 줄만 걸러 낸 나머지로 받는다.
+/// 진행 문구는 끝난 줄과 대기 줄만 걸러 낸 나머지로 받는다.
 fn spinning_activity_label(activity: &str) -> Option<(&str, &str)> {
     if let Some(found) = SPINNING_ACTIVITY_LABELS.iter().find_map(|label| {
         activity
@@ -5369,7 +5364,7 @@ fn spinning_activity_label(activity: &str) -> Option<(&str, &str)> {
         return Some(found);
     }
     // 끝난 줄은 글리프로 시작하고, 대기 줄은 경과 시간을 달지 않는다. 둘 다 아닌
-    // 줄은 지금 도는 도구가 이름을 올린 줄이다.
+    // 줄은 모델이 낸 진행 문구가 이름을 올린 줄이다.
     let settled = SETTLED_ACTIVITY_GLYPHS
         .iter()
         .any(|glyph| activity.starts_with(glyph))
@@ -16125,13 +16120,18 @@ mod tests {
         );
     }
 
-    /// 도구가 `Working..` 자리를 대신해도 그 줄은 도는 중이므로 로더와 시머를
+    /// 진행 문구가 `Working..` 자리를 대신해도 그 줄은 도는 중이므로 로더와 시머를
     /// 그대로 단다. 이름만 바뀌고 움직임이 멈추면 멈춘 줄로 읽힌다.
     #[test]
-    fn a_running_tool_label_keeps_the_loader_and_the_shimmer() {
-        let line = activity_lines("Shell · cargo test (2m 12s)", Some("gpt-5.6-terra"), 0.5, 80)
-            .pop()
-            .expect("running tool row");
+    fn a_progress_note_row_keeps_the_loader_and_the_shimmer() {
+        let line = activity_lines(
+            "저장소 목록 확인 중 (2m 12s)",
+            Some("gpt-5.6-terra"),
+            0.5,
+            80,
+        )
+        .pop()
+        .expect("progress note row");
 
         assert_eq!(line.tail.first().map(|span| span.text.as_str()), Some("⠴ "));
         assert_eq!(
@@ -16142,7 +16142,7 @@ mod tests {
                     _ => None,
                 })
                 .collect::<String>(),
-            "Shell · cargo test (2m 12s)"
+            "저장소 목록 확인 중 (2m 12s)"
         );
     }
 

@@ -721,5 +721,9 @@ mod tests {
         ));
         assert!(bridge.contains("emitBackgroundTasks(session, tasks);"));
         assert!(bridge.contains("emitBackgroundTasks(session, []);"));
+        // level 신호는 매번 통째로 갈아끼운다. 시작·완료 edge와 짝지으면 순서가
+        // 보장되지 않아 유령 작업이 남는다.
+        assert!(bridge.contains("const count = Array.isArray(tasks) ? tasks.length : 0;"));
+        assert!(!bridge.contains("dropBackgroundTask"));
     }
 }

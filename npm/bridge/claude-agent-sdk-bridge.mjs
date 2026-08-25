@@ -1062,6 +1062,8 @@ async function createSession(params, resumeId) {
     subagents: new Map(),
     knownSubagents: new Map(),
     hiddenSubagentTasks: new Set(),
+    // level 신호는 CLI 프로세스가 뜰 때 아무것도 보내지 않는다. 새 세션은 빈
+    // 집합에서 시작해야 이전 프로세스의 개수가 남지 않는다.
     backgroundTasks: 0,
     subagentPulse: null,
     lastContextUsage: null,
@@ -1754,13 +1756,12 @@ function finishStructuredSubagent(session, message, kind, text) {
   return true;
 }
 
-// 백그라운드 목록에는 위임 에이전트뿐 아니라 백그라운드로 돌린 명령도 들어온다.
-// 서브에이전트 행과 달리 진행 표시는 종류를 가리지 않고 도는 것을 모두 센다.
+// background_tasks_changed는 살아 있는 백그라운드 작업 전체를 담은 level 신호다.
+// SDK 문서가 못박은 대로 매번 집합을 통째로 갈아끼우고, 시작·완료 edge와는 짝짓지
+// 않는다. 순서가 보장되지 않아 섞으면 오히려 유령 작업이 남는다. 목록에는 위임
+// 에이전트뿐 아니라 백그라운드로 돌린 명령도 들어오므로 종류는 가리지 않는다.
 function emitBackgroundTasks(session, tasks) {
-  const count = (Array.isArray(tasks) ? tasks : []).filter((task) => {
-    const status = String(task?.status || "").toLowerCase();
-    return !status || status === "running" || status === "in_progress" || status === "pending";
-  }).length;
+  const count = Array.isArray(tasks) ? tasks.length : 0;
   if (count === session.backgroundTasks) return;
   session.backgroundTasks = count;
   notify("turn/backgroundTasks/updated", { threadId: session.id, count });

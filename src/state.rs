@@ -63,6 +63,8 @@ const TURN_STALL_SILENCE: Duration = Duration::from_secs(20);
 
 /// Codex 백그라운드 터미널 목록을 다시 물어보는 간격.
 const CODEX_BACKGROUND_POLL: Duration = Duration::from_secs(2);
+/// 이만큼 잇달아 실패하면 그 스레드에서는 목록을 더 묻지 않는다.
+const CODEX_BACKGROUND_PROBE_LIMIT: u8 = 3;
 
 /// The permission presets Codex exposes through `/permissions`, cycled with Shift+Tab.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1534,9 +1536,6 @@ struct ActiveItem {
     shell_batch: Option<String>,
     revision: u64,
     pace: TextPace,
-    /// 이 아이템이 도구일 때 진행 줄에 올릴 짧은 라벨. 도구가 아닌 아이템은 비어
-    /// 있어서 답변이나 추론이 진행 줄을 차지하지 않는다.
-    running_label: Option<String>,
 }
 
 /// Providers deliver assistant text at their own uneven cadence: a phrase in one
@@ -3680,8 +3679,15 @@ pub struct AppState {
     /// 백그라운드로 도는 작업 수. 위임 에이전트와 백그라운드 명령을 함께 세며,
     /// provider마다 다른 신호를 하나의 알림으로 모아 받는다.
     background_tasks: usize,
+    /// 백그라운드 작업이 돌기 시작한 시각. 턴이 끝난 뒤에도 그 줄의 로더와
+    /// 시머가 계속 돌 기준이 필요하다.
+    background_tasks_since: Option<Instant>,
     /// Codex는 백그라운드 터미널을 알림으로 알려주지 않아 목록을 물어봐야 한다.
     codex_background_probed_at: Option<Instant>,
+    /// 마지막으로 물어본 스레드. 세션을 이어받으면 조용해도 한 번은 물어본다.
+    codex_background_probed_thread: Option<String>,
+    /// 목록 조회가 잇달아 실패한 횟수. 그 요청을 모르는 런타임에 계속 묻지 않는다.
+    codex_background_probe_failures: u8,
     command_selection: usize,
     spinner_frame: usize,
     turn_started_at: Option<Instant>,
@@ -3721,6 +3727,14 @@ pub struct AppState {
     side_parent: Option<SideParent>,
     last_assistant_markdown: Option<String>,
     composer_notice: Option<(String, Instant)>,
+    /// 모델이 도구를 부르기 직전에 낸 진행 문구와 그 문구가 도착한 시각.
+    progress_note: Option<(String, Instant)>,
+    /// 현재 진행 문구가 가리키는 도구. 동시에 여러 도구가 돌아도 먼저 끝난 도구가
+    /// 더 최신 문구를 지우지 않도록 시작 알림에서 연결한다.
+    progress_note_tool_id: Option<String>,
+    /// 진행 문구 표기는 델타 경계에서 쪼개져 도착할 수 있다. 닫는 기호를 아직 못
+    /// 본 조각을 아이템별로 들고 있다가 다음 델타와 이어 붙인다.
+    progress_note_partial: HashMap<String, String>,
     /// Text, when it went up, and how long it stays. The quit warning needs a
     /// longer window than the rest, so the lifetime rides along with the notice.
     activity_notice: Option<(String, Instant, Duration)>,
@@ -3925,7 +3939,10 @@ impl AppState {
             subagents_settled_at: None,
             subagent_logs: HashMap::new(),
             background_tasks: 0,
+            background_tasks_since: None,
             codex_background_probed_at: None,
+            codex_background_probed_thread: None,
+            codex_background_probe_failures: 0,
             command_selection: 0,
             spinner_frame: 0,
             compacting_started_at: None,
@@ -3950,6 +3967,9 @@ impl AppState {
             side_parent: None,
             last_assistant_markdown: None,
             composer_notice: None,
+            progress_note: None,
+            progress_note_tool_id: None,
+            progress_note_partial: HashMap::new(),
             activity_notice: None,
             status_metadata_refreshed_at: Instant::now(),
             vibe_mode,
@@ -5809,6 +5829,11 @@ impl AppState {
     }
 
     fn reset_turn_item_tracking(&mut self) {
+        // 진행 문구는 그 턴 안에서만 뜻이 있다. 다음 턴으로 넘어가면 끝난 일을
+        // 지금 하는 일처럼 보여 주게 된다.
+        self.progress_note = None;
+        self.progress_note_tool_id = None;
+        self.progress_note_partial.clear();
         self.turn_response_started = false;
         self.turn_response_visible = false;
         self.completed_item_ids.clear();
@@ -6231,6 +6256,9 @@ impl AppState {
         self.subagents_settled_at = None;
         self.subagent_logs.clear();
         self.background_tasks = 0;
+        self.background_tasks_since = None;
+        self.codex_background_probed_thread = None;
+        self.codex_background_probe_failures = 0;
         self.busy = false;
         self.turn_id = None;
         self.pending_interrupt = false;
@@ -6504,7 +6532,9 @@ impl AppState {
         let inline_answer_active = self.buffers_pending_text_input();
         // Compaction animates the same row a turn does, so it keeps the frame
         // loop alive even on a runtime that reports no turn while it runs.
-        let animating = self.busy || self.compacting();
+        // 백그라운드 작업은 턴이 끝나도 계속 돈다. 그 줄의 로더가 멈추면 이미
+        // 끝난 일처럼 보여서, 도는 동안에는 프레임 루프를 살려 둔다.
+        let animating = self.busy || self.compacting() || self.background_tasks > 0;
         // A background Claude agent outlives its parent turn. Its elapsed label
         // changes once a second, and the narrow animation path does not repaint
         // these rows, so only that boundary asks for a full frame.
@@ -8268,7 +8298,7 @@ impl AppState {
                 // 백그라운드 수를 함께 싣는 provider만 진행 표시를 갱신한다.
                 // 필드가 없으면 다른 경로가 보낸 값을 덮지 않는다.
                 if let Some(count) = params.get("backgroundTasks").and_then(Value::as_u64) {
-                    self.background_tasks = count as usize;
+                    self.set_background_tasks(count as usize);
                 }
                 // 갱신이 온 순간부터 유예를 다시 센다. 턴이 도는 중에는 유예를
                 // 걸지 않고, 빈 목록이면 지울 것도 없다.
@@ -8278,10 +8308,11 @@ impl AppState {
             // 백그라운드 작업 수는 provider마다 신호가 달라 백엔드에서 하나의
             // 알림으로 모아 보낸다. 위임 에이전트와 백그라운드 명령을 함께 센다.
             "turn/backgroundTasks/updated" => {
-                self.background_tasks = params
+                let count = params
                     .get("count")
                     .and_then(Value::as_u64)
                     .unwrap_or_default() as usize;
+                self.set_background_tasks(count);
             }
             "turn/subagent/line" => {
                 if let Some(parent) = params.get("parentToolUseId").and_then(Value::as_str)
@@ -11854,10 +11885,10 @@ impl AppState {
             if self.turn_interrupted {
                 return Some("X Interrupted".to_owned());
             }
-            // 도구가 도는 동안에는 `Working..` 대신 그 도구가 무엇을 하는지 보여준다.
-            // 도구 사이의 빈 구간은 이름 붙일 동작이 없으니 원래 문구로 돌아간다.
+            // 지금 하는 일에 이름이 있으면 `Working..` 대신 그 이름을 보여준다.
+            // 이름 붙일 동작이 없는 구간에서만 원래 문구로 돌아간다.
             let label = self
-                .running_tool_label()
+                .running_label()
                 .unwrap_or_else(|| "Working..".to_owned());
             return Some(format!(
                 "{label} ({}){}",
@@ -11885,36 +11916,115 @@ impl AppState {
     pub fn take_codex_background_probe(&mut self) -> Option<String> {
         if self.selected_provider() != ModelProvider::Codex
             || self.thread_id.is_empty()
-            || (!self.busy && self.background_tasks == 0)
+            || self.codex_background_probe_failures >= CODEX_BACKGROUND_PROBE_LIMIT
         {
             return None;
         }
-        if self
-            .codex_background_probed_at
-            .is_some_and(|probed| probed.elapsed() < CODEX_BACKGROUND_POLL)
-        {
-            return None;
+        // 이어받은 세션에는 이미 도는 백그라운드가 있을 수 있다. 그 스레드를
+        // 처음 볼 때는 턴이 조용해도 한 번 물어봐야 표시가 비지 않는다.
+        let first_look =
+            self.codex_background_probed_thread.as_deref() != Some(self.thread_id.as_str());
+        if !first_look {
+            if !self.busy && self.background_tasks == 0 {
+                return None;
+            }
+            if self
+                .codex_background_probed_at
+                .is_some_and(|probed| probed.elapsed() < CODEX_BACKGROUND_POLL)
+            {
+                return None;
+            }
         }
         self.codex_background_probed_at = Some(Instant::now());
+        self.codex_background_probed_thread = Some(self.thread_id.clone());
         Some(self.thread_id.clone())
     }
 
+    /// 목록 조회가 실패했다. 백그라운드 터미널을 모르는 런타임이면 계속 물어봐야
+    /// 답이 없으므로 몇 번 어긋나면 그 스레드에서는 더 묻지 않는다.
+    pub fn note_codex_background_probe_failure(&mut self) {
+        self.codex_background_probe_failures =
+            self.codex_background_probe_failures.saturating_add(1);
+    }
+
     pub fn set_background_tasks(&mut self, count: usize) -> bool {
+        self.codex_background_probe_failures = 0;
         if self.background_tasks == count {
             return false;
         }
         self.background_tasks = count;
+        // 이미 돌던 작업의 시머를 개수가 바뀌었다고 처음으로 되돌리지 않는다.
+        if count == 0 {
+            self.background_tasks_since = None;
+        } else if self.background_tasks_since.is_none() {
+            self.background_tasks_since = Some(Instant::now());
+        }
         true
     }
 
-    /// 진행 줄에 올릴, 지금 도는 도구의 라벨. 가장 나중에 시작된 도구가 화면에서
-    /// 마지막으로 움직인 것이라 그쪽을 고른다.
-    fn running_tool_label(&self) -> Option<String> {
-        self.active_order
-            .iter()
-            .rev()
-            .filter_map(|id| self.active.get(id))
-            .find_map(|active| active.running_label.clone())
+    /// 모델이 낸 `⟦…⟧` 진행 문구를 본문에서 떼어 내고, 화면에 남을 텍스트만
+    /// 돌려준다. 표기가 델타 경계에서 잘려 도착할 수 있어 닫는 기호를 못 본
+    /// 조각은 다음 델타까지 들고 있는다.
+    fn take_progress_notes(&mut self, item_id: &str, text: &str) -> String {
+        let carried = self
+            .progress_note_partial
+            .remove(item_id)
+            .unwrap_or_default();
+        let (visible, held) = self.scan_progress_notes(&format!("{carried}{text}"));
+        if held.is_empty() {
+            self.progress_note_partial.remove(item_id);
+        } else {
+            self.progress_note_partial.insert(item_id.to_owned(), held);
+        }
+        visible
+    }
+
+    /// 한 번에 다 온 본문에서 진행 문구를 걷어낸다. 닫히지 않은 표기는 이 본문이
+    /// 전부인 이상 진행 문구가 아니므로 본문에 그대로 남긴다.
+    fn strip_progress_notes(&mut self, text: &str) -> String {
+        let (visible, held) = self.scan_progress_notes(text);
+        format!("{visible}{held}")
+    }
+
+    /// 본문을 훑어 닫힌 진행 문구는 걷어내고, 아직 닫히지 않은 꼬리는 따로 돌려준다.
+    fn scan_progress_notes(&mut self, text: &str) -> (String, String) {
+        let mut rest = text.to_owned();
+        let mut visible = String::new();
+        let held = loop {
+            let Some(open) = rest.find(PROGRESS_NOTE_OPEN) else {
+                visible.push_str(&rest);
+                break String::new();
+            };
+            visible.push_str(&rest[..open]);
+            let after_open = rest[open + PROGRESS_NOTE_OPEN.len()..].to_owned();
+            let Some(close) = after_open.find(PROGRESS_NOTE_CLOSE) else {
+                // 아직 닫히지 않았다. 표기가 진짜 진행 문구인지는 닫는 기호를
+                // 봐야 알 수 있으니 그때까지 본문에도 내보내지 않는다.
+                break format!("{PROGRESS_NOTE_OPEN}{after_open}");
+            };
+            let note = after_open[..close].trim();
+            if !note.is_empty() {
+                self.progress_note =
+                    Some((compact_command(note, PROGRESS_NOTE_MAX), Instant::now()));
+                self.progress_note_tool_id = None;
+            }
+            rest = after_open[close + PROGRESS_NOTE_CLOSE.len()..].to_owned();
+            // 문구가 제 줄을 통째로 썼다면 뒤따르는 줄바꿈도 함께 걷어낸다.
+            // 남겨 두면 본문이 빈 줄로 시작한다.
+            if visible.is_empty() || visible.ends_with('\n') {
+                rest = rest
+                    .strip_prefix('\n')
+                    .map(ToOwned::to_owned)
+                    .unwrap_or(rest);
+            }
+        };
+        (visible, held)
+    }
+
+    /// 진행 줄이 부를 이름. 모델이 낸 진행 문구가 있을 때만 그 문구를 쓴다. 도구
+    /// 이름과 대상은 이미 카드로 보이니 여기서 다시 부르지 않는다.
+    fn running_label(&self) -> Option<String> {
+        self.progress_note.as_ref().map(|(note, _)| note.clone())
     }
 
     /// `Working.. (11s) · 2 background tasks`처럼 진행 줄 뒤에 붙는 꼬리.
@@ -11922,7 +12032,10 @@ impl AppState {
         if self.background_tasks == 0 {
             return String::new();
         }
-        format!(" · {}", background_tasks_phrase(self.background_tasks, true))
+        format!(
+            " · {}",
+            background_tasks_phrase(self.background_tasks, true)
+        )
     }
 
     /// `/compact` was accepted by the runtime: run the activity spinner until the
@@ -11961,7 +12074,11 @@ impl AppState {
     /// Activity text animation runs from the wall clock rather than counted ticks,
     /// so its pace stays stable even when frames are delayed.
     fn activity_phase(&self) -> f32 {
-        let Some(started) = self.compacting_started_at.or(self.turn_started_at) else {
+        let Some(started) = self
+            .compacting_started_at
+            .or(self.turn_started_at)
+            .or(self.background_tasks_since)
+        else {
             return 0.0;
         };
         let position = started.elapsed().as_millis() % SHIMMER_PERIOD.as_millis();
@@ -13095,9 +13212,18 @@ impl AppState {
         if self.completed_item_ids.contains(id) {
             return;
         }
+        if is_progress_tool_item(item)
+            && self.progress_note.is_some()
+            && self.progress_note_tool_id.is_none()
+        {
+            self.progress_note_tool_id = Some(id.to_owned());
+        }
         let Some(mut block) = active_item_block(&self.cwd, item) else {
             return;
         };
+        if matches!(block.kind, BlockKind::Assistant) && block.body.contains(PROGRESS_NOTE_OPEN) {
+            block.body = self.strip_progress_notes(&block.body);
+        }
         if matches!(block.kind, BlockKind::Assistant) {
             // A provider can label the streaming item's phase late or not at all.
             // Treat every new assistant item as the next visible response boundary:
@@ -13148,7 +13274,6 @@ impl AppState {
             .remove(id)
             .map(|existing| existing.pace)
             .unwrap_or_default();
-        let running_label = running_tool_label(&self.cwd, item);
         self.active.insert(
             id.to_owned(),
             ActiveItem {
@@ -13156,7 +13281,6 @@ impl AppState {
                 shell_batch,
                 revision,
                 pace,
-                running_label,
             },
         );
     }
@@ -13171,10 +13295,15 @@ impl AppState {
         let active = id.and_then(|id| {
             let active = self.active.remove(id);
             self.active_order.retain(|candidate| candidate != id);
+            self.progress_note_partial.remove(id);
             active
         });
         if item.get("type").and_then(Value::as_str) == Some("userMessage") {
             return;
+        }
+        if is_progress_tool_item(item) && self.progress_note_tool_id.as_deref() == id {
+            self.progress_note = None;
+            self.progress_note_tool_id = None;
         }
         if let Some(mut block) = completed_item_block(&self.cwd, item) {
             if let Some(active) = active.as_ref() {
@@ -13183,6 +13312,15 @@ impl AppState {
                 if block.body.is_empty() {
                     block.body = active.block.body.clone();
                 }
+            }
+            if matches!(block.kind, BlockKind::Assistant) && block.body.contains(PROGRESS_NOTE_OPEN)
+            {
+                block.body = self.strip_progress_notes(&block.body);
+            }
+            // 진행 문구만 담고 끝난 답변은 화면에 남길 것이 없다. 빈 카드를 커밋하면
+            // 도구 사이마다 빈 답변 줄이 하나씩 쌓인다.
+            if matches!(block.kind, BlockKind::Assistant) && block.body.trim().is_empty() {
+                return;
             }
             if let (Some(id), Some(batch_id)) = (
                 id,
@@ -13233,6 +13371,21 @@ impl AppState {
         let Some(delta) = params.get("delta").and_then(Value::as_str) else {
             return;
         };
+        // 진행 문구는 답변이 아니다. 카드를 열기 전에 걷어내야 문구만 온 델타가
+        // 빈 답변 카드를 만들지 않는다.
+        let held;
+        let delta = if matches!(kind, BlockKind::Assistant)
+            && (delta.contains(PROGRESS_NOTE_OPEN)
+                || self.progress_note_partial.contains_key(item_id))
+        {
+            held = self.take_progress_notes(item_id, delta);
+            held.as_str()
+        } else {
+            delta
+        };
+        if delta.is_empty() {
+            return;
+        }
         if matches!(kind, BlockKind::Assistant) && !self.active.contains_key(item_id) {
             // OpenCode can begin an assistant item with its first delta instead
             // of a separate item/started notification. Settle earlier responses
@@ -13329,7 +13482,6 @@ impl AppState {
                     shell_batch: None,
                     revision: 0,
                     pace: TextPace::default(),
-                    running_label: Some("Shell".to_owned()),
                 },
             );
         }
@@ -13409,7 +13561,6 @@ impl AppState {
                     shell_batch: None,
                     revision: 0,
                     pace: TextPace::default(),
-                    running_label: None,
                 },
             );
         }
@@ -13872,85 +14023,27 @@ fn active_item_block(cwd: &str, item: &Value) -> Option<Block> {
     }
 }
 
-/// 진행 줄은 경과 시간과 백그라운드 꼬리를 함께 이고 있어서, 라벨이 그 줄을 혼자
+/// 모델이 진행 문구를 감싸는 표기. 답변 본문이나 코드에 나올 일이 없는 기호라서
+/// 본문과 섞일 걱정 없이 걷어낼 수 있다.
+const PROGRESS_NOTE_OPEN: &str = "⟦";
+const PROGRESS_NOTE_CLOSE: &str = "⟧";
+
+/// 진행 줄은 경과 시간과 백그라운드 꼬리를 함께 이고 있어서, 문구가 그 줄을 혼자
 /// 밀어내지 않을 만큼에서 끊는다.
-const RUNNING_TOOL_LABEL_MAX: usize = 48;
-const RUNNING_TOOL_HINT_MAX: usize = 40;
+const PROGRESS_NOTE_MAX: usize = 48;
 
-/// 진행 줄에 올릴 도구 라벨. 카드 제목과 달리 무엇을 대상으로 도는지가 먼저
-/// 보이도록 도구 이름과 대표 인자만 남긴다.
-fn running_tool_label(cwd: &str, item: &Value) -> Option<String> {
-    let label = match item.get("type")?.as_str()? {
-        "commandExecution" => format!(
-            "Shell · {}",
-            compact_command(
-                item.get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or("command"),
-                RUNNING_TOOL_LABEL_MAX
-            )
-        ),
-        "fileChange" => file_changes_title(
-            cwd,
-            item.get("changes")
-                .and_then(Value::as_array)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]),
-        ),
-        "webSearch" => {
-            let query = compact_command(
-                item.get("query")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
-                RUNNING_TOOL_LABEL_MAX,
-            );
-            if query.is_empty() {
-                "Web search".to_owned()
-            } else {
-                format!("Web search · {query}")
-            }
-        }
-        "mcpToolCall" => format!(
-            "MCP · {} › {}",
-            item.get("server")
-                .and_then(Value::as_str)
-                .unwrap_or("server"),
-            item.get("tool").and_then(Value::as_str).unwrap_or("tool")
-        ),
-        "dynamicToolCall" => {
-            let tool = item.get("tool").and_then(Value::as_str).unwrap_or("Tool");
-            match tool_argument_hint(cwd, item.get("arguments")) {
-                Some(hint) => format!("{tool} · {hint}"),
-                None => tool.to_owned(),
-            }
-        }
-        "collabAgentToolCall" => "Agent".to_owned(),
-        _ => return None,
-    };
-    let label = compact_command(&label, RUNNING_TOOL_LABEL_MAX);
-    (!label.is_empty()).then_some(label)
-}
-
-/// 도구 인자 중 대상이 드러나는 값 하나. 이름이 알려진 키를 먼저 찾고, 없으면
-/// 첫 문자열 인자를 쓴다.
-fn tool_argument_hint(cwd: &str, arguments: Option<&Value>) -> Option<String> {
-    const PREFERRED: [&str; 8] = [
-        "file_path",
-        "path",
-        "pattern",
-        "query",
-        "command",
-        "url",
-        "description",
-        "prompt",
-    ];
-    let arguments = arguments?.as_object()?;
-    let value = PREFERRED
-        .iter()
-        .find_map(|key| arguments.get(*key).and_then(Value::as_str))
-        .or_else(|| arguments.values().find_map(Value::as_str))?;
-    let hint = compact_command(&display_path(cwd, value), RUNNING_TOOL_HINT_MAX);
-    (!hint.is_empty()).then_some(hint)
+fn is_progress_tool_item(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some(
+            "commandExecution"
+                | "fileChange"
+                | "webSearch"
+                | "mcpToolCall"
+                | "dynamicToolCall"
+                | "collabAgentToolCall"
+        )
+    )
 }
 
 fn is_thinking(block: &Block) -> bool {
@@ -16705,53 +16798,50 @@ mod tests {
         assert_eq!(state.take_pending_interrupt(), None);
     }
 
-    /// 진행 줄은 도구가 도는 동안 그 도구를 이름으로 부른다. 도구가 끝나면 이름
-    /// 붙일 동작이 없으니 원래 문구로 돌아간다.
+    /// 모델이 낸 진행 문구는 진행 줄에만 오르고 대화 본문에는 남지 않는다.
     #[test]
-    fn a_running_tool_names_the_activity_row_until_it_ends() {
+    fn a_progress_note_reaches_the_activity_row_and_leaves_the_transcript_alone() {
         let mut state = test_state();
         state.busy = true;
         state.turn_started_at = Some(Instant::now());
 
-        state.start_item(&json!({
-            "id": "cmd-1",
-            "type": "commandExecution",
-            "command": "cargo test"
-        }));
-        let running = state.view().activity.expect("running activity");
-        assert!(running.starts_with("Shell · cargo test ("), "{running}");
+        state.append_delta(
+            &json!({"itemId": "msg-1", "delta": "⟦저장소 목록 확인 중⟧\n"}),
+            BlockKind::Assistant,
+            "Codex",
+        );
 
-        state.complete_item(&json!({
-            "id": "cmd-1",
-            "type": "commandExecution",
-            "command": "cargo test",
-            "status": "completed",
-            "exitCode": 0
-        }));
-        let between = state.view().activity.expect("activity between tools");
-        assert!(between.starts_with("Working.. ("), "{between}");
+        let running = state.view().activity.expect("running activity");
+        assert!(running.starts_with("저장소 목록 확인 중 ("), "{running}");
+        assert!(
+            !state.active.contains_key("msg-1"),
+            "문구만 온 델타는 답변 카드를 열지 않는다"
+        );
     }
 
-    /// 도구 이름만으로는 무엇을 만지는지 알 수 없어서, 인자에서 대상 하나를 끌어와
-    /// 붙인다.
+    /// 표기가 델타 경계에서 잘려 도착해도 조각이 본문으로 새면 안 된다.
     #[test]
-    fn a_running_tool_label_carries_what_the_tool_is_working_on() {
+    fn a_progress_note_split_across_deltas_is_still_kept_out_of_the_transcript() {
         let mut state = test_state();
         state.busy = true;
         state.turn_started_at = Some(Instant::now());
 
-        state.start_item(&json!({
-            "id": "tool-1",
-            "type": "dynamicToolCall",
-            "tool": "Read",
-            "arguments": {"file_path": "src/state.rs"}
-        }));
+        for delta in ["⟦파일 목록", " 세는 중⟧", "찾았습니다"] {
+            state.append_delta(
+                &json!({"itemId": "msg-1", "delta": delta}),
+                BlockKind::Assistant,
+                "Codex",
+            );
+        }
+        state.flush_stream_text();
 
         let running = state.view().activity.expect("running activity");
-        assert!(running.starts_with("Read · src/state.rs ("), "{running}");
+        assert!(running.starts_with("파일 목록 세는 중 ("), "{running}");
+        let body = state.active["msg-1"].block.body.clone();
+        assert_eq!(body, "찾았습니다", "본문에는 답변만 남는다");
     }
 
-    /// 답변과 추론은 도구가 아니라서 진행 줄을 가져가지 않는다.
+    /// 진행 문구가 아닌 일반 답변은 진행 줄을 건드리지 않는다.
     #[test]
     fn assistant_text_leaves_the_activity_row_alone() {
         let mut state = test_state();
@@ -16766,6 +16856,100 @@ mod tests {
 
         let running = state.view().activity.expect("running activity");
         assert!(running.starts_with("Working.. ("), "{running}");
+    }
+
+    /// 도구가 도는 것만으로는 진행 줄이 바뀌지 않는다. 도구 이름과 대상은 카드로
+    /// 이미 보이므로 진행 줄은 모델이 문구를 낼 때만 이름을 바꾼다.
+    #[test]
+    fn a_running_tool_alone_leaves_the_activity_row_on_working() {
+        let mut state = test_state();
+        state.busy = true;
+        state.turn_started_at = Some(Instant::now());
+
+        state.start_item(&json!({
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "command": "cargo test"
+        }));
+
+        let running = state.view().activity.expect("running activity");
+        assert!(running.starts_with("Working.. ("), "{running}");
+    }
+
+    /// 도구가 끝난 뒤에는 이전 진행 문구를 최종 답변 스트리밍에 남기지 않는다.
+    #[test]
+    fn a_completed_tool_clears_its_progress_note_before_the_final_answer() {
+        let mut state = test_state();
+        state.busy = true;
+        state.turn_started_at = Some(Instant::now());
+        state.append_delta(
+            &json!({"itemId": "note", "delta": "⟦테스트 실행 중⟧\n"}),
+            BlockKind::Assistant,
+            "Codex",
+        );
+        state.start_item(&json!({
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "command": "cargo test"
+        }));
+
+        state.complete_item(&json!({
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "command": "cargo test",
+            "status": "completed",
+            "exitCode": 0
+        }));
+
+        let final_stream = state.view().activity.expect("final activity");
+        assert!(final_stream.starts_with("Working.. ("), "{final_stream}");
+    }
+
+    /// 동시에 도는 이전 도구가 먼저 끝나도 더 최신 도구의 진행 문구는 유지한다.
+    #[test]
+    fn an_older_concurrent_tool_cannot_clear_the_newer_progress_note() {
+        let mut state = test_state();
+        state.busy = true;
+        state.turn_started_at = Some(Instant::now());
+
+        for (note_id, tool_id, note) in [
+            ("note-1", "cmd-1", "첫 작업 실행 중"),
+            ("note-2", "cmd-2", "둘째 작업 실행 중"),
+        ] {
+            state.append_delta(
+                &json!({"itemId": note_id, "delta": format!("⟦{note}⟧\n")}),
+                BlockKind::Assistant,
+                "Codex",
+            );
+            state.start_item(&json!({
+                "id": tool_id,
+                "type": "commandExecution",
+                "command": tool_id
+            }));
+        }
+
+        state.complete_item(&json!({
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "command": "cmd-1",
+            "status": "completed",
+            "exitCode": 0
+        }));
+        let still_running = state.view().activity.expect("newer tool activity");
+        assert!(
+            still_running.starts_with("둘째 작업 실행 중 ("),
+            "{still_running}"
+        );
+
+        state.complete_item(&json!({
+            "id": "cmd-2",
+            "type": "commandExecution",
+            "command": "cmd-2",
+            "status": "completed",
+            "exitCode": 0
+        }));
+        let finished = state.view().activity.expect("activity after both tools");
+        assert!(finished.starts_with("Working.. ("), "{finished}");
     }
 
     #[test]
@@ -21221,6 +21405,61 @@ mod tests {
         state.handle_notification("turn/backgroundTasks/updated", &json!({ "count": 0 }));
 
         assert_eq!(state.activity().as_deref(), Some("✧ Completed (11s)"));
+    }
+
+    /// 턴이 끝나도 백그라운드 줄은 아직 도는 일이다. 프레임 루프가 멈추면 로더가
+    /// 굳고 시머도 서서, 끝난 작업처럼 보인다.
+    #[test]
+    fn a_background_only_row_keeps_its_frames_running() {
+        let mut state = test_state();
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
+        state.handle_notification("turn/backgroundTasks/updated", &json!({ "count": 2 }));
+        state.handle_notification("turn/completed", &json!({}));
+
+        assert!(state.tick(), "백그라운드가 도는 동안 프레임을 계속 그린다");
+        state.background_tasks_since = Some(Instant::now() - SHIMMER_PERIOD / 2);
+        assert!(state.activity_phase() > 0.0, "시머가 흐른다");
+
+        state.handle_notification("turn/backgroundTasks/updated", &json!({ "count": 0 }));
+
+        assert!(!state.tick(), "다 끝나면 프레임 루프도 쉰다");
+    }
+
+    /// 이어받은 스레드에는 이미 도는 백그라운드가 있을 수 있다. 조용하다고 한 번도
+    /// 묻지 않으면 그 표시를 영영 놓친다.
+    #[test]
+    fn a_quiet_codex_thread_is_still_asked_once() {
+        let mut state = test_state();
+
+        assert_eq!(
+            state.take_codex_background_probe().as_deref(),
+            Some("thread")
+        );
+        assert!(
+            state.take_codex_background_probe().is_none(),
+            "조용한 스레드를 되풀이해 묻지 않는다"
+        );
+    }
+
+    /// 백그라운드 터미널 목록을 모르는 런타임에 2초마다 계속 묻는 것은 낭비다.
+    #[test]
+    fn background_probes_give_up_on_a_runtime_that_keeps_failing() {
+        let mut state = test_state();
+        state.busy = true;
+
+        for _ in 0..CODEX_BACKGROUND_PROBE_LIMIT {
+            assert!(state.take_codex_background_probe().is_some());
+            state.note_codex_background_probe_failure();
+            state.codex_background_probed_at = Some(Instant::now() - CODEX_BACKGROUND_POLL);
+        }
+
+        assert!(state.take_codex_background_probe().is_none());
+
+        // 답이 한 번이라도 오면 다시 묻는다.
+        state.set_background_tasks(1);
+        state.codex_background_probed_at = Some(Instant::now() - CODEX_BACKGROUND_POLL);
+
+        assert!(state.take_codex_background_probe().is_some());
     }
 
     /// OpenCode는 하위 에이전트 목록에 개수를 실어 보낸다. 개수를 싣지 않는
