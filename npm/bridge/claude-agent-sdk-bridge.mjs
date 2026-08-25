@@ -1062,6 +1062,7 @@ async function createSession(params, resumeId) {
     subagents: new Map(),
     knownSubagents: new Map(),
     hiddenSubagentTasks: new Set(),
+    backgroundTasks: 0,
     subagentPulse: null,
     lastContextUsage: null,
     lastContextWindow: 0,
@@ -1753,7 +1754,20 @@ function finishStructuredSubagent(session, message, kind, text) {
   return true;
 }
 
+// 백그라운드 목록에는 위임 에이전트뿐 아니라 백그라운드로 돌린 명령도 들어온다.
+// 서브에이전트 행과 달리 진행 표시는 종류를 가리지 않고 도는 것을 모두 센다.
+function emitBackgroundTasks(session, tasks) {
+  const count = (Array.isArray(tasks) ? tasks : []).filter((task) => {
+    const status = String(task?.status || "").toLowerCase();
+    return !status || status === "running" || status === "in_progress" || status === "pending";
+  }).length;
+  if (count === session.backgroundTasks) return;
+  session.backgroundTasks = count;
+  notify("turn/backgroundTasks/updated", { threadId: session.id, count });
+}
+
 function syncBackgroundSubagents(session, tasks) {
+  emitBackgroundTasks(session, tasks);
   const live = (Array.isArray(tasks) ? tasks : []).filter((task) => {
     const taskId = firstLine(task?.task_id || "", 80);
     return !taskId || !session.hiddenSubagentTasks?.has(taskId);
@@ -1961,6 +1975,7 @@ function clearSubagents(session) {
   const changed = session.subagents.size > 0;
   session.subagents.clear();
   session.hiddenSubagentTasks?.clear();
+  emitBackgroundTasks(session, []);
   if (session.subagentPulse) {
     clearInterval(session.subagentPulse);
     session.subagentPulse = null;

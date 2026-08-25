@@ -3816,7 +3816,7 @@ fn plan_rows_requiring_full_repaint(
     if previous_plan_rows != current_plan_rows {
         return (0..current_plan_rows).collect();
     }
-    let rows = (0..current_plan_rows)
+    let mut rows = (0..current_plan_rows)
         .filter(|&row| {
             previous
                 .get(row)
@@ -3829,6 +3829,17 @@ fn plan_rows_requiring_full_repaint(
                 })
         })
         .collect::<Vec<_>>();
+    // ConPTY can disturb the following row while a semantic plan body row is
+    // cleared and repainted. The border itself is unchanged, so an ordinary
+    // frame diff would trust the stale terminal contents and leave it broken.
+    if rows.iter().any(|&row| row >= 2)
+        && let Some(border_row) = current[..current_plan_rows]
+            .iter()
+            .rposition(|line| line.text.starts_with('└'))
+        && !rows.contains(&border_row)
+    {
+        rows.push(border_row);
+    }
     rows
 }
 
@@ -5338,12 +5349,36 @@ fn shimmer_spans_with_band(label: &str, phase: f32, base: Rgb, band: f32) -> Vec
 /// Gajae-Code's Unicode activity loader frames.
 const WORKING_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Activity labels that carry the loader glyph and the shimmer sweep.
-const SPINNING_ACTIVITY_LABELS: [&str; 2] = ["Working..", "Compacting.."];
+/// Activity labels that carry the loader glyph and the shimmer sweep. Background
+/// work outlives its turn, so its row keeps the loader while the turn is over.
+const SPINNING_ACTIVITY_LABELS: [&str; 3] = ["Working..", "Compacting..", "Background:"];
 
 /// Glyphs that head an activity row which is already over. A shimmer on these
 /// reads as work still running, so they paint flat.
 const SETTLED_ACTIVITY_GLYPHS: [&str; 2] = ["✓", "X"];
+
+/// 진행 줄이 로더 글리프와 시머를 달아야 하는지, 달아야 한다면 어디까지가 라벨이고
+/// 어디부터가 꼬리인지. 이름이 알려진 문구를 먼저 맞춰 보고, 그 자리를 대신 차지한
+/// 도구 라벨은 끝난 줄과 대기 줄만 걸러 낸 나머지로 받는다.
+fn spinning_activity_label(activity: &str) -> Option<(&str, &str)> {
+    if let Some(found) = SPINNING_ACTIVITY_LABELS.iter().find_map(|label| {
+        activity
+            .strip_prefix(label)
+            .map(|trailer| (*label, trailer))
+    }) {
+        return Some(found);
+    }
+    // 끝난 줄은 글리프로 시작하고, 대기 줄은 경과 시간을 달지 않는다. 둘 다 아닌
+    // 줄은 지금 도는 도구가 이름을 올린 줄이다.
+    let settled = SETTLED_ACTIVITY_GLYPHS
+        .iter()
+        .any(|glyph| activity.starts_with(glyph))
+        || activity.starts_with('✧');
+    if settled || !activity.ends_with(')') {
+        return None;
+    }
+    Some((activity, ""))
+}
 
 /// The loader glyph plus the space after it.
 const WORKING_SPINNER_COLUMNS: usize = 2;
@@ -5354,63 +5389,45 @@ const PROGRESS_TRACK_COLUMNS: usize = 20;
 /// Below this the bar reads as a handful of blocks rather than a track, so the
 /// row keeps the elapsed time alone instead.
 const PROGRESS_TRACK_MINIMUM: usize = 8;
-/// The compaction track is a rule, not a bar: a thin line reads as a hint that
-/// work is running without carrying the weight of a filled band.
-const PROGRESS_GLYPH: char = '─';
-/// The band's own columns thicken the rule so the sweep is legible even where
-/// the terminal flattens the brightness ramp.
-const PROGRESS_GLYPH_BAND: char = '━';
-/// The compaction rule is shorter than the context gauge: it says "still going",
-/// not "this far along", so it does not need the width.
-const COMPACTION_TRACK_COLUMNS: usize = 12;
-
-/// An indeterminate band enters from the left, crosses the track, and leaves
+/// The rule the track is drawn with. The moving block reads as a brighter run of
+/// the same glyph, so the bar stays one continuous line rather than two shapes.
+const PROGRESS_TRACK_GLYPH: &str = "\u{2550}";
+/// An indeterminate block enters from the left, crosses the track, and leaves
 /// through the right edge. Providers expose only start/end, so this communicates
-/// activity without pretending to know real progress. The band darkens towards
-/// its leading edge and trails off behind it, so the sweep reads as one
-/// direction rather than a symmetric blob.
-fn progress_bar_spans(phase: f32, track: usize, base: Rgb) -> Vec<PaintSpan> {
-    /// Columns of trail behind the leading edge, where the band fades out.
-    const TRAIL_COLUMNS: f32 = 4.0;
-    /// Columns of fade ahead of the leading edge: enough to soften the head
-    /// without blunting which way the sweep runs.
-    const HEAD_COLUMNS: f32 = 1.5;
+/// activity without pretending to know real progress.
+fn progress_bar_spans(phase: f32, track: usize, tone: Tone) -> Vec<PaintSpan> {
+    const BLOCK_COLUMNS: usize = 4;
 
-    let travel = track as f32 + TRAIL_COLUMNS + HEAD_COLUMNS;
-    let head = phase.clamp(0.0, 1.0) * travel - TRAIL_COLUMNS;
-    (0..track)
-        .map(|column| {
-            let delta = column as f32 - head;
-            let distance = if delta > 0.0 {
-                delta / HEAD_COLUMNS
-            } else {
-                -delta / TRAIL_COLUMNS
-            };
-            // A raised cosine either side of the head, the same easing the label
-            // shimmer uses, just with a longer tail than nose.
-            let level = if distance >= 1.0 {
-                0.0
-            } else {
-                0.5 * (1.0 + (distance * std::f32::consts::PI).cos())
-            };
-            // Both glyphs are single-column rules of the same height, so
-            // thickening the band's core adds weight where the sweep is without
-            // changing the row's shape.
-            PaintSpan {
-                text: if level > 0.5 {
-                    PROGRESS_GLYPH_BAND.to_string()
-                } else {
-                    PROGRESS_GLYPH.to_string()
-                },
-                tone: if level > 0.0 {
-                    Tone::Shimmer(base, (level * 255.0).round() as u8)
-                } else {
-                    Tone::Muted
-                },
-                bold: false,
-            }
-        })
-        .collect()
+    let block = track.min(BLOCK_COLUMNS);
+    let travel = track + block;
+    let offset = (phase.clamp(0.0, 0.999) * travel as f32).round() as isize - block as isize;
+    let visible_start = offset.max(0) as usize;
+    let visible_end = (offset + block as isize).clamp(0, track as isize) as usize;
+    let visible = visible_end.saturating_sub(visible_start);
+    let remaining = track.saturating_sub(visible_start + visible);
+    let mut spans = Vec::new();
+    if visible_start > 0 {
+        spans.push(PaintSpan {
+            text: PROGRESS_TRACK_GLYPH.repeat(visible_start),
+            tone: Tone::Muted,
+            bold: false,
+        });
+    }
+    if visible > 0 {
+        spans.push(PaintSpan {
+            text: PROGRESS_TRACK_GLYPH.repeat(visible),
+            tone,
+            bold: true,
+        });
+    }
+    if remaining > 0 {
+        spans.push(PaintSpan {
+            text: PROGRESS_TRACK_GLYPH.repeat(remaining),
+            tone: Tone::Muted,
+            bold: false,
+        });
+    }
+    spans
 }
 
 /// Test-only shorthand: the app always drives the spinner and its progress bar
@@ -5438,11 +5455,7 @@ fn activity_lines_with_progress(
     }
     // `/compact` wears the same loader as a turn: it is a wait the user started
     // and cannot see progress on any other way.
-    if let Some((label, trailer)) = SPINNING_ACTIVITY_LABELS.iter().find_map(|label| {
-        activity
-            .strip_prefix(label)
-            .map(|trailer| (*label, trailer))
-    }) {
+    if let Some((label, trailer)) = spinning_activity_label(activity) {
         let shimmer_base = tone_rgb(tone).unwrap_or(theme::palette().foreground);
         let mut tail = vec![PaintSpan {
             text: format!(
@@ -5468,14 +5481,14 @@ fn activity_lines_with_progress(
                 + 3;
             let track = usize::from(width)
                 .saturating_sub(spent)
-                .min(COMPACTION_TRACK_COLUMNS);
+                .min(PROGRESS_TRACK_COLUMNS);
             if track >= PROGRESS_TRACK_MINIMUM {
                 tail.push(PaintSpan {
                     text: " ".to_owned(),
                     tone,
                     bold: false,
                 });
-                tail.extend(progress_bar_spans(progress_phase, track, shimmer_base));
+                tail.extend(progress_bar_spans(progress_phase, track, tone));
             }
             tail.push(PaintSpan {
                 text: trailer.to_owned(),
@@ -8590,6 +8603,10 @@ fn fixed_plan_summary_lines(
     } else {
         lines.push(PaintLine::blank());
     }
+    lines.push(PaintLine {
+        tone: PLAN_BORDER_TONE,
+        ..PaintLine::plain(format!("└{}┘", "─".repeat(line_width.saturating_sub(2))))
+    });
     lines
 }
 
@@ -16108,6 +16125,38 @@ mod tests {
         );
     }
 
+    /// 도구가 `Working..` 자리를 대신해도 그 줄은 도는 중이므로 로더와 시머를
+    /// 그대로 단다. 이름만 바뀌고 움직임이 멈추면 멈춘 줄로 읽힌다.
+    #[test]
+    fn a_running_tool_label_keeps_the_loader_and_the_shimmer() {
+        let line = activity_lines("Shell · cargo test (2m 12s)", Some("gpt-5.6-terra"), 0.5, 80)
+            .pop()
+            .expect("running tool row");
+
+        assert_eq!(line.tail.first().map(|span| span.text.as_str()), Some("⠴ "));
+        assert_eq!(
+            line.tail
+                .iter()
+                .filter_map(|span| match span.tone {
+                    Tone::Shimmer(_, _) => Some(span.text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            "Shell · cargo test (2m 12s)"
+        );
+    }
+
+    /// 세션을 여는 대기 줄은 경과 시간을 달지 않는다. 도구 라벨을 받아 주는 규칙이
+    /// 그 줄까지 데려가 로더를 새로 붙이면 안 된다.
+    #[test]
+    fn the_loading_activity_row_stays_without_a_loader() {
+        let line = activity_lines("Loading session..", None, 0.5, 80)
+            .pop()
+            .expect("loading row");
+
+        assert_ne!(line.tail.first().map(|span| span.text.as_str()), Some("⠴ "));
+    }
+
     #[test]
     fn settled_activity_labels_never_shimmer() {
         for (label, expected_prefix, expected_text, expected_tone) in [
@@ -20218,28 +20267,47 @@ mod tests {
         assert!(painted(frame.lines.last().expect("composer bottom rule")).starts_with('╰'));
     }
 
+    /// Where the bright run of the track starts, counted in columns from the
+    /// track's left edge.
+    fn lit_track_offset(line: &PaintLine) -> Option<usize> {
+        let mut offset = 0;
+        for span in &line.tail {
+            if !span.text.starts_with(PROGRESS_TRACK_GLYPH) {
+                continue;
+            }
+            if span.bold {
+                return Some(offset);
+            }
+            offset += span.text.chars().count();
+        }
+        None
+    }
+
     /// The compaction row spends its spare columns on a bar, and gives them back
     /// to elapsed time when the terminal has none to spare.
     #[test]
-    fn the_compacting_row_sweeps_one_band_left_to_right() {
+    fn the_compacting_row_moves_one_block_left_to_right() {
         let entering = activity_lines("Compacting.. (4s)", None, 0.25, 80);
         let passing = activity_lines("Compacting.. (4s)", None, 0.5, 80);
-        let leaving = activity_lines("Compacting.. (4s)", None, 0.8, 80);
+        let leaving = activity_lines("Compacting.. (4s)", None, 0.9, 80);
 
-        // The band thickens the columns it is passing through, so the row is
-        // read as a fixed-width rule rather than as one exact string.
-        for (line, spinner) in [(&entering, "⠹"), (&passing, "⠴"), (&leaving, "⠇")] {
-            let painted = painted(&line[0]);
-            assert!(painted.starts_with(&format!(" {spinner} Compacting.. ")));
-            assert!(painted.ends_with(" (4s)"));
-            assert_eq!(progress_levels(&line[0]).len(), COMPACTION_TRACK_COLUMNS);
-        }
-
-        // The glyph no longer moves, so the band is where the row is brightest.
-        assert!(
-            brightest_column(&entering[0]) < brightest_column(&passing[0])
-                && brightest_column(&passing[0]) < brightest_column(&leaving[0])
+        assert_eq!(
+            painted(&entering[0]),
+            " ⠹ Compacting.. ════════════════════ (4s)"
         );
+        assert_eq!(
+            painted(&passing[0]),
+            " ⠴ Compacting.. ════════════════════ (4s)"
+        );
+        assert_eq!(
+            painted(&leaving[0]),
+            " ⠏ Compacting.. ════════════════════ (4s)"
+        );
+        // The track paints one continuous rule, so the travelling run shows up as
+        // the bright stretch inside it rather than a different glyph.
+        assert_eq!(lit_track_offset(&entering[0]), Some(2));
+        assert_eq!(lit_track_offset(&passing[0]), Some(8));
+        assert_eq!(lit_track_offset(&leaving[0]), Some(18));
 
         let narrow = activity_lines("Compacting.. (4s)", None, 0.5, 30);
         let narrow = painted(&narrow[0]);
@@ -20248,37 +20316,14 @@ mod tests {
     }
 
     #[test]
-    fn the_compacting_label_shimmers_independently_from_its_progress_band() {
+    fn the_compacting_label_shimmers_independently_from_its_progress_block() {
         let line = activity_lines_with_progress("Compacting.. (4s)", None, 0.0, 0.5, 80);
-        let paired = activity_lines("Compacting.. (4s)", None, 0.5, 80);
 
-        assert_eq!(progress_levels(&line[0]), progress_levels(&paired[0]));
-        assert!(painted(&line[0]).starts_with(" ⠋ Compacting.. "));
-    }
-
-    /// The bar paints one glyph per column, so its band is read off the shimmer
-    /// levels rather than off the glyphs.
-    fn progress_levels(line: &PaintLine) -> Vec<u8> {
-        line.tail
-            .iter()
-            .filter(|span| {
-                span.text.starts_with(PROGRESS_GLYPH) || span.text.starts_with(PROGRESS_GLYPH_BAND)
-            })
-            .map(|span| match span.tone {
-                Tone::Shimmer(_, level) => level,
-                _ => 0,
-            })
-            .collect()
-    }
-
-    fn brightest_column(line: &PaintLine) -> usize {
-        let levels = progress_levels(line);
-        levels
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, level)| **level)
-            .map(|(column, _)| column)
-            .expect("a compaction row carries a bar")
+        assert_eq!(
+            painted(&line[0]),
+            " ⠋ Compacting.. ════════════════════ (4s)"
+        );
+        assert_eq!(lit_track_offset(&line[0]), Some(8));
     }
 
     /// The reading belongs to compaction alone: an ordinary turn keeps its plain
@@ -20288,6 +20333,17 @@ mod tests {
         let line = activity_lines("Working.. (4s)", None, 0.0, 80);
 
         assert_eq!(painted(&line[0]), " ⠋ Working.. (4s)");
+    }
+
+    /// 턴이 끝나도 백그라운드 작업은 계속 돈다. 그 줄은 완료 줄이 아니라 아직
+    /// 도는 일이므로 로더를 그대로 단다.
+    #[test]
+    fn a_background_only_row_keeps_the_loader() {
+        let turn = activity_lines("Working.. (11s) · 2 background tasks", None, 0.0, 80);
+        let after = activity_lines("Background: 2 tasks…", None, 0.0, 80);
+
+        assert_eq!(painted(&turn[0]), " ⠋ Working.. (11s) · 2 background tasks");
+        assert_eq!(painted(&after[0]), " ⠋ Background: 2 tasks…");
     }
 
     fn painted(line: &PaintLine) -> String {
@@ -22116,7 +22172,7 @@ mod tests {
 
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, true, None, None);
 
-        assert_eq!(lines.len(), 10);
+        assert_eq!(lines.len(), 11);
         assert!(painted(&lines[0]).starts_with("┌── Updated Plan · 0 / 7"));
         assert!(painted(&lines[0]).ends_with('┐'));
         assert!(lines[0].tail.iter().any(|span| span.text == " Alt + W "));
@@ -22125,7 +22181,8 @@ mod tests {
         assert!(painted(&lines[8]).contains("     Task 7"));
         assert!(!painted(&lines[8]).ends_with('┃'));
         assert!(lines[9].text.is_empty());
-        assert!(!lines.iter().any(|line| painted(line).starts_with('└')));
+        assert!(painted(&lines[10]).starts_with('└'));
+        assert!(painted(&lines[10]).ends_with('┘'));
     }
 
     #[test]
@@ -23373,11 +23430,16 @@ mod tests {
 
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None, None);
         let elapsed_line = painted(&lines[3]);
+        let bottom_border = painted(&lines[4]);
 
         assert!(painted(&lines[2]).contains("Done (1m 34s)"));
         assert!(elapsed_line.contains("⏱  1m 34s"));
         assert_eq!(
             UnicodeWidthStr::width(elapsed_line.as_str()),
+            UnicodeWidthStr::width(bottom_border.as_str())
+        );
+        assert_eq!(
+            UnicodeWidthStr::width(bottom_border.as_str()),
             panel_span(80)
         );
     }
@@ -23526,7 +23588,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_plan_transition_repaints_its_elapsed_row() {
+    fn completed_plan_transition_repaints_its_bottom_border() {
         let summary = PlanSummary {
             explanation: None,
             steps: vec![
@@ -23549,13 +23611,14 @@ mod tests {
         };
         let active = fixed_plan_summary_lines(&summary, 80, 0.0, true, None, None);
         let completed = fixed_plan_summary_lines(&summary, 80, 0.0, false, None, None);
-        let elapsed_row = completed.len() - 1;
+        let border_row = completed.len() - 1;
 
         let repainted =
             plan_rows_requiring_full_repaint(&active, active.len(), &completed, completed.len());
 
-        assert!(repainted.contains(&elapsed_row));
-        assert!(painted(&completed[elapsed_row]).contains("⏱"));
+        assert!(repainted.contains(&border_row));
+        assert!(painted(&completed[border_row]).starts_with('└'));
+        assert!(painted(&completed[border_row]).ends_with('┘'));
     }
 
     #[test]

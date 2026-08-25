@@ -709,4 +709,17 @@ mod tests {
         assert!(bridge.contains("if (!session.turn) beginTurn(session);"));
         assert!(bridge.contains("notify(\"turn/subagents/updated\""));
     }
+
+    /// 진행 표시의 개수는 위임 에이전트만이 아니라 백그라운드로 돌린 명령까지
+    /// 세야 해서, 행 목록과 달리 종류를 가리지 않는 별도 알림으로 나간다.
+    #[test]
+    fn bridge_reports_every_background_task_for_the_activity_row() {
+        let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
+
+        assert!(bridge.contains(
+            "notify(\"turn/backgroundTasks/updated\", { threadId: session.id, count });"
+        ));
+        assert!(bridge.contains("emitBackgroundTasks(session, tasks);"));
+        assert!(bridge.contains("emitBackgroundTasks(session, []);"));
+    }
 }

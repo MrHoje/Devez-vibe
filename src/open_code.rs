@@ -280,9 +280,20 @@ impl SessionStreams {
     }
 
     fn subagents_notification(&self, session_id: &str) -> Notification {
+        // OpenCode의 background task는 task 도구를 백그라운드로 돌린 것이라
+        // 같은 목록에서 세어 진행 표시에 함께 보낸다.
+        let background_tasks = self
+            .subagents
+            .iter()
+            .filter(|entry| entry.get("background").and_then(Value::as_bool) == Some(true))
+            .count();
         (
             "turn/subagents/updated".to_owned(),
-            json!({ "threadId": session_id, "subagents": self.subagents }),
+            json!({
+                "threadId": session_id,
+                "subagents": self.subagents,
+                "backgroundTasks": background_tasks
+            }),
         )
     }
 }
@@ -2314,6 +2325,46 @@ mod tests {
         assert!(streams.subagents_cleared("s").is_none());
     }
 
+    /// 백그라운드로 넘어간 task 수는 진행 표시가 쓰므로 목록 알림에 함께 실린다.
+    #[test]
+    fn subagent_notifications_carry_the_background_task_count() {
+        let mut streams = SessionStreams::default();
+        streams.subagent_started(
+            "s",
+            &json!({
+                "toolCallId": "call_1",
+                "title": "task",
+                "rawInput": { "subagent_type": "developer", "description": "구현" }
+            }),
+        );
+
+        let foreground = streams
+            .subagent_started(
+                "s",
+                &json!({
+                    "toolCallId": "call_2",
+                    "title": "task",
+                    "rawInput": { "subagent_type": "qa-tester", "description": "검증" }
+                }),
+            )
+            .expect("행 알림");
+        assert_eq!(foreground.1.pointer("/backgroundTasks"), Some(&json!(0)));
+
+        let backgrounded = streams
+            .subagent_tool_completed(
+                "s",
+                "call_1",
+                &json!({
+                    "rawOutput": {
+                        "metadata": { "background": true, "sessionId": "child_1" }
+                    }
+                }),
+            )
+            .expect("백그라운드 전환 알림");
+
+        assert_eq!(backgrounded.1.pointer("/backgroundTasks"), Some(&json!(1)));
+    }
+
     #[test]
     fn background_subagent_waits_for_child_session_status() {
         let mut streams = SessionStreams::default();
@@ -2526,7 +2577,11 @@ mod tests {
         let loading: LoadingMap = Arc::new(Mutex::new(HashMap::new()));
 
         let first = client
-            .start_prompt("ses_1", vec![json!({ "type": "text", "text": "질문" })], false)
+            .start_prompt(
+                "ses_1",
+                vec![json!({ "type": "text", "text": "질문" })],
+                false,
+            )
             .await
             .expect("첫 prompt");
         let steered = client
@@ -2636,7 +2691,11 @@ mod tests {
         };
 
         let turn = client
-            .start_prompt("ses_1", vec![json!({ "type": "text", "text": "작업" })], false)
+            .start_prompt(
+                "ses_1",
+                vec![json!({ "type": "text", "text": "작업" })],
+                false,
+            )
             .await
             .expect("prompt");
         let request_id = outbound_rx

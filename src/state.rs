@@ -61,6 +61,9 @@ const QUIT_ARM_WINDOW: Duration = Duration::from_secs(3);
 /// running. Long enough that an ordinary think never triggers it.
 const TURN_STALL_SILENCE: Duration = Duration::from_secs(20);
 
+/// Codex 백그라운드 터미널 목록을 다시 물어보는 간격.
+const CODEX_BACKGROUND_POLL: Duration = Duration::from_secs(2);
+
 /// The permission presets Codex exposes through `/permissions`, cycled with Shift+Tab.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PermissionMode {
@@ -1034,6 +1037,14 @@ fn compact_reset_time(value: &str) -> String {
 }
 
 /// Maps the server's `planType` onto the wording OpenAI uses for the plan.
+/// `2 tasks`처럼 진행 표시에 들어가는 작업 수 표기. 진행 줄 뒤에 붙을 때만
+/// 무엇이 도는지 밝혀야 해서 `background`를 앞에 얹는다.
+fn background_tasks_phrase(count: usize, qualified: bool) -> String {
+    let plural = if count == 1 { "" } else { "s" };
+    let qualifier = if qualified { "background " } else { "" };
+    format!("{count} {qualifier}task{plural}")
+}
+
 fn plan_label(raw: &str) -> String {
     let key = raw
         .chars()
@@ -1523,6 +1534,9 @@ struct ActiveItem {
     shell_batch: Option<String>,
     revision: u64,
     pace: TextPace,
+    /// 이 아이템이 도구일 때 진행 줄에 올릴 짧은 라벨. 도구가 아닌 아이템은 비어
+    /// 있어서 답변이나 추론이 진행 줄을 차지하지 않는다.
+    running_label: Option<String>,
 }
 
 /// Providers deliver assistant text at their own uneven cadence: a phrase in one
@@ -3663,6 +3677,11 @@ pub struct AppState {
     /// of the turn so a panel opened on a finished subagent still has something
     /// to show.
     subagent_logs: HashMap<String, Vec<SubagentLogLine>>,
+    /// 백그라운드로 도는 작업 수. 위임 에이전트와 백그라운드 명령을 함께 세며,
+    /// provider마다 다른 신호를 하나의 알림으로 모아 받는다.
+    background_tasks: usize,
+    /// Codex는 백그라운드 터미널을 알림으로 알려주지 않아 목록을 물어봐야 한다.
+    codex_background_probed_at: Option<Instant>,
     command_selection: usize,
     spinner_frame: usize,
     turn_started_at: Option<Instant>,
@@ -3905,6 +3924,8 @@ impl AppState {
             codex_subagents: HashMap::new(),
             subagents_settled_at: None,
             subagent_logs: HashMap::new(),
+            background_tasks: 0,
+            codex_background_probed_at: None,
             command_selection: 0,
             spinner_frame: 0,
             compacting_started_at: None,
@@ -4332,18 +4353,18 @@ impl AppState {
     /// this the status row keeps the previous provider's numbers until the next
     /// three-second metadata tick, which reads them for the new provider anyway.
     fn refresh_usage_for_selected_provider(&mut self) {
-        let (five_hour_percent, weekly_percent, five_hour_reset_at) =
-            match self.selected_provider() {
-                ModelProvider::Claude => (
-                    self.account_plan.five_hour_percent,
-                    self.account_plan.weekly_percent,
-                    self.account_plan.five_hour_reset_at,
-                ),
-                // OpenCode는 사용량 정보를 주지 않는다. Codex 수치를 빌려
-                // 보여 주는 대신 비워 둔다.
-                ModelProvider::OpenCode => (None, None, None),
-                _ => read_codex_usage(),
-            };
+        let (five_hour_percent, weekly_percent, five_hour_reset_at) = match self.selected_provider()
+        {
+            ModelProvider::Claude => (
+                self.account_plan.five_hour_percent,
+                self.account_plan.weekly_percent,
+                self.account_plan.five_hour_reset_at,
+            ),
+            // OpenCode는 사용량 정보를 주지 않는다. Codex 수치를 빌려
+            // 보여 주는 대신 비워 둔다.
+            ModelProvider::OpenCode => (None, None, None),
+            _ => read_codex_usage(),
+        };
         self.five_hour_percent = five_hour_percent;
         self.weekly_percent = weekly_percent;
         self.five_hour_reset_at = five_hour_reset_at;
@@ -6209,6 +6230,7 @@ impl AppState {
         self.codex_subagents.clear();
         self.subagents_settled_at = None;
         self.subagent_logs.clear();
+        self.background_tasks = 0;
         self.busy = false;
         self.turn_id = None;
         self.pending_interrupt = false;
@@ -8243,10 +8265,23 @@ impl AppState {
                         })
                     })
                     .collect();
+                // 백그라운드 수를 함께 싣는 provider만 진행 표시를 갱신한다.
+                // 필드가 없으면 다른 경로가 보낸 값을 덮지 않는다.
+                if let Some(count) = params.get("backgroundTasks").and_then(Value::as_u64) {
+                    self.background_tasks = count as usize;
+                }
                 // 갱신이 온 순간부터 유예를 다시 센다. 턴이 도는 중에는 유예를
                 // 걸지 않고, 빈 목록이면 지울 것도 없다.
                 self.subagents_settled_at =
                     (!self.busy && !self.subagents.is_empty()).then(Instant::now);
+            }
+            // 백그라운드 작업 수는 provider마다 신호가 달라 백엔드에서 하나의
+            // 알림으로 모아 보낸다. 위임 에이전트와 백그라운드 명령을 함께 센다.
+            "turn/backgroundTasks/updated" => {
+                self.background_tasks = params
+                    .get("count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default() as usize;
             }
             "turn/subagent/line" => {
                 if let Some(parent) = params.get("parentToolUseId").and_then(Value::as_str)
@@ -11819,13 +11854,75 @@ impl AppState {
             if self.turn_interrupted {
                 return Some("X Interrupted".to_owned());
             }
-            return Some(format!("Working.. ({})", format_elapsed(elapsed)));
+            // 도구가 도는 동안에는 `Working..` 대신 그 도구가 무엇을 하는지 보여준다.
+            // 도구 사이의 빈 구간은 이름 붙일 동작이 없으니 원래 문구로 돌아간다.
+            let label = self
+                .running_tool_label()
+                .unwrap_or_else(|| "Working..".to_owned());
+            return Some(format!(
+                "{label} ({}){}",
+                format_elapsed(elapsed),
+                self.background_tasks_suffix()
+            ));
         }
         if self.turn_interrupted && self.last_completed_duration.is_some() {
             return Some("X Interrupted".to_owned());
         }
+        // 백그라운드 작업은 턴이 끝나도 계속 돈다. 끝난 턴의 소요 시간보다 아직
+        // 도는 작업을 알리는 쪽이 급해서 그 줄을 대신 차지한다.
+        if self.background_tasks > 0 {
+            return Some(format!(
+                "Background: {}…",
+                background_tasks_phrase(self.background_tasks, false)
+            ));
+        }
         self.last_completed_duration
             .map(|duration| format!("✧ Completed ({})", format_elapsed(duration.as_secs())))
+    }
+
+    /// Codex 스레드에 백그라운드 터미널이 몇 개 도는지 물어볼 때가 되면 그 스레드를
+    /// 돌려준다. 턴이 돌거나 이미 도는 작업이 있는 동안에만 묻는다.
+    pub fn take_codex_background_probe(&mut self) -> Option<String> {
+        if self.selected_provider() != ModelProvider::Codex
+            || self.thread_id.is_empty()
+            || (!self.busy && self.background_tasks == 0)
+        {
+            return None;
+        }
+        if self
+            .codex_background_probed_at
+            .is_some_and(|probed| probed.elapsed() < CODEX_BACKGROUND_POLL)
+        {
+            return None;
+        }
+        self.codex_background_probed_at = Some(Instant::now());
+        Some(self.thread_id.clone())
+    }
+
+    pub fn set_background_tasks(&mut self, count: usize) -> bool {
+        if self.background_tasks == count {
+            return false;
+        }
+        self.background_tasks = count;
+        true
+    }
+
+    /// 진행 줄에 올릴, 지금 도는 도구의 라벨. 가장 나중에 시작된 도구가 화면에서
+    /// 마지막으로 움직인 것이라 그쪽을 고른다.
+    fn running_tool_label(&self) -> Option<String> {
+        self.active_order
+            .iter()
+            .rev()
+            .filter_map(|id| self.active.get(id))
+            .find_map(|active| active.running_label.clone())
+    }
+
+    /// `Working.. (11s) · 2 background tasks`처럼 진행 줄 뒤에 붙는 꼬리.
+    fn background_tasks_suffix(&self) -> String {
+        if self.background_tasks == 0 {
+            return String::new();
+        }
+        format!(" · {}", background_tasks_phrase(self.background_tasks, true))
     }
 
     /// `/compact` was accepted by the runtime: run the activity spinner until the
@@ -13051,6 +13148,7 @@ impl AppState {
             .remove(id)
             .map(|existing| existing.pace)
             .unwrap_or_default();
+        let running_label = running_tool_label(&self.cwd, item);
         self.active.insert(
             id.to_owned(),
             ActiveItem {
@@ -13058,6 +13156,7 @@ impl AppState {
                 shell_batch,
                 revision,
                 pace,
+                running_label,
             },
         );
     }
@@ -13230,6 +13329,7 @@ impl AppState {
                     shell_batch: None,
                     revision: 0,
                     pace: TextPace::default(),
+                    running_label: Some("Shell".to_owned()),
                 },
             );
         }
@@ -13309,6 +13409,7 @@ impl AppState {
                     shell_batch: None,
                     revision: 0,
                     pace: TextPace::default(),
+                    running_label: None,
                 },
             );
         }
@@ -13503,7 +13604,9 @@ fn restore_question_focus(
         return (index, editor);
     }
     // 옵션 어디에도 없는 답은 직접 입력으로 남긴 것이다.
-    if question.allow_other && let Some(text) = picked.last() {
+    if question.allow_other
+        && let Some(text) = picked.last()
+    {
         editor.set_text(text.clone());
         return (question.options.len(), editor);
     }
@@ -13767,6 +13870,87 @@ fn active_item_block(cwd: &str, item: &Value) -> Option<Block> {
         )),
         _ => None,
     }
+}
+
+/// 진행 줄은 경과 시간과 백그라운드 꼬리를 함께 이고 있어서, 라벨이 그 줄을 혼자
+/// 밀어내지 않을 만큼에서 끊는다.
+const RUNNING_TOOL_LABEL_MAX: usize = 48;
+const RUNNING_TOOL_HINT_MAX: usize = 40;
+
+/// 진행 줄에 올릴 도구 라벨. 카드 제목과 달리 무엇을 대상으로 도는지가 먼저
+/// 보이도록 도구 이름과 대표 인자만 남긴다.
+fn running_tool_label(cwd: &str, item: &Value) -> Option<String> {
+    let label = match item.get("type")?.as_str()? {
+        "commandExecution" => format!(
+            "Shell · {}",
+            compact_command(
+                item.get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("command"),
+                RUNNING_TOOL_LABEL_MAX
+            )
+        ),
+        "fileChange" => file_changes_title(
+            cwd,
+            item.get("changes")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        ),
+        "webSearch" => {
+            let query = compact_command(
+                item.get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                RUNNING_TOOL_LABEL_MAX,
+            );
+            if query.is_empty() {
+                "Web search".to_owned()
+            } else {
+                format!("Web search · {query}")
+            }
+        }
+        "mcpToolCall" => format!(
+            "MCP · {} › {}",
+            item.get("server")
+                .and_then(Value::as_str)
+                .unwrap_or("server"),
+            item.get("tool").and_then(Value::as_str).unwrap_or("tool")
+        ),
+        "dynamicToolCall" => {
+            let tool = item.get("tool").and_then(Value::as_str).unwrap_or("Tool");
+            match tool_argument_hint(cwd, item.get("arguments")) {
+                Some(hint) => format!("{tool} · {hint}"),
+                None => tool.to_owned(),
+            }
+        }
+        "collabAgentToolCall" => "Agent".to_owned(),
+        _ => return None,
+    };
+    let label = compact_command(&label, RUNNING_TOOL_LABEL_MAX);
+    (!label.is_empty()).then_some(label)
+}
+
+/// 도구 인자 중 대상이 드러나는 값 하나. 이름이 알려진 키를 먼저 찾고, 없으면
+/// 첫 문자열 인자를 쓴다.
+fn tool_argument_hint(cwd: &str, arguments: Option<&Value>) -> Option<String> {
+    const PREFERRED: [&str; 8] = [
+        "file_path",
+        "path",
+        "pattern",
+        "query",
+        "command",
+        "url",
+        "description",
+        "prompt",
+    ];
+    let arguments = arguments?.as_object()?;
+    let value = PREFERRED
+        .iter()
+        .find_map(|key| arguments.get(*key).and_then(Value::as_str))
+        .or_else(|| arguments.values().find_map(Value::as_str))?;
+    let hint = compact_command(&display_path(cwd, value), RUNNING_TOOL_HINT_MAX);
+    (!hint.is_empty()).then_some(hint)
 }
 
 fn is_thinking(block: &Block) -> bool {
@@ -16324,10 +16508,7 @@ mod tests {
         assert!(matches!(state.run_slash_command("/model"), Action::None));
 
         let initial = state.overlay_view().expect("OpenCode model picker");
-        assert!(matches!(
-            initial.style,
-            OverlayStyle::SearchPicker { .. }
-        ));
+        assert!(matches!(initial.style, OverlayStyle::SearchPicker { .. }));
         assert!(initial.input.is_some());
         assert_eq!(initial.input_placeholder, "Search models…");
 
@@ -16522,6 +16703,69 @@ mod tests {
         state.set_turn_started("next-turn".to_owned());
 
         assert_eq!(state.take_pending_interrupt(), None);
+    }
+
+    /// 진행 줄은 도구가 도는 동안 그 도구를 이름으로 부른다. 도구가 끝나면 이름
+    /// 붙일 동작이 없으니 원래 문구로 돌아간다.
+    #[test]
+    fn a_running_tool_names_the_activity_row_until_it_ends() {
+        let mut state = test_state();
+        state.busy = true;
+        state.turn_started_at = Some(Instant::now());
+
+        state.start_item(&json!({
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "command": "cargo test"
+        }));
+        let running = state.view().activity.expect("running activity");
+        assert!(running.starts_with("Shell · cargo test ("), "{running}");
+
+        state.complete_item(&json!({
+            "id": "cmd-1",
+            "type": "commandExecution",
+            "command": "cargo test",
+            "status": "completed",
+            "exitCode": 0
+        }));
+        let between = state.view().activity.expect("activity between tools");
+        assert!(between.starts_with("Working.. ("), "{between}");
+    }
+
+    /// 도구 이름만으로는 무엇을 만지는지 알 수 없어서, 인자에서 대상 하나를 끌어와
+    /// 붙인다.
+    #[test]
+    fn a_running_tool_label_carries_what_the_tool_is_working_on() {
+        let mut state = test_state();
+        state.busy = true;
+        state.turn_started_at = Some(Instant::now());
+
+        state.start_item(&json!({
+            "id": "tool-1",
+            "type": "dynamicToolCall",
+            "tool": "Read",
+            "arguments": {"file_path": "src/state.rs"}
+        }));
+
+        let running = state.view().activity.expect("running activity");
+        assert!(running.starts_with("Read · src/state.rs ("), "{running}");
+    }
+
+    /// 답변과 추론은 도구가 아니라서 진행 줄을 가져가지 않는다.
+    #[test]
+    fn assistant_text_leaves_the_activity_row_alone() {
+        let mut state = test_state();
+        state.busy = true;
+        state.turn_started_at = Some(Instant::now());
+
+        state.start_item(&json!({
+            "id": "msg-1",
+            "type": "agentMessage",
+            "text": "고칠 곳을 찾았습니다"
+        }));
+
+        let running = state.view().activity.expect("running activity");
+        assert!(running.starts_with("Working.. ("), "{running}");
     }
 
     #[test]
@@ -20950,6 +21194,51 @@ mod tests {
         state.select_model_and_effort("gpt-5.6-sol", Some("medium"));
         state.handle_notification("turn/completed", &json!({}));
         assert_eq!(state.activity().as_deref(), Some("✧ Completed (10s)"));
+    }
+
+    /// 백그라운드 작업은 턴이 끝나도 계속 돈다. 도는 동안에는 진행 줄과 끝난
+    /// 줄 모두에 개수가 남아야 사용자가 아직 무언가 돌고 있다는 것을 안다.
+    #[test]
+    fn background_task_count_rides_the_activity_row() {
+        let mut state = test_state();
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
+        state.turn_started_at = Some(Instant::now() - Duration::from_secs(11));
+        state.handle_notification("turn/backgroundTasks/updated", &json!({ "count": 2 }));
+
+        assert_eq!(
+            state.activity().as_deref(),
+            Some("Working.. (11s) · 2 background tasks")
+        );
+
+        state.handle_notification("turn/completed", &json!({}));
+
+        assert_eq!(state.activity().as_deref(), Some("Background: 2 tasks…"));
+
+        state.handle_notification("turn/backgroundTasks/updated", &json!({ "count": 1 }));
+
+        assert_eq!(state.activity().as_deref(), Some("Background: 1 task…"));
+
+        state.handle_notification("turn/backgroundTasks/updated", &json!({ "count": 0 }));
+
+        assert_eq!(state.activity().as_deref(), Some("✧ Completed (11s)"));
+    }
+
+    /// OpenCode는 하위 에이전트 목록에 개수를 실어 보낸다. 개수를 싣지 않는
+    /// provider의 목록 갱신이 그 값을 0으로 지워서는 안 된다.
+    #[test]
+    fn a_subagent_update_without_a_count_keeps_the_background_total() {
+        let mut state = test_state();
+        state.handle_notification("turn/backgroundTasks/updated", &json!({ "count": 3 }));
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
+
+        assert_eq!(state.background_tasks, 3);
+
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({ "subagents": [], "backgroundTasks": 1 }),
+        );
+
+        assert_eq!(state.background_tasks, 1);
     }
 
     #[test]

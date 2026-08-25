@@ -1377,6 +1377,16 @@ async fn event_loop(
                 draw_conversations(state, &mut btw_state, split_focus, renderer)?;
             }
         }
+        // Codex는 백그라운드 터미널을 알림으로 알려주지 않아 목록을 물어봐야
+        // 진행 표시의 개수를 맞출 수 있다.
+        if let Some(thread_id) = state.take_codex_background_probe() {
+            let count = codex_background_terminal_count(server, &thread_id).await;
+            if let Some(count) = count
+                && state.set_background_tasks(count)
+            {
+                draw_conversations(state, &mut btw_state, split_focus, renderer)?;
+            }
+        }
         // A quiet turn is asked about rather than assumed dead. Only a runtime that
         // answers "not running" ends the wait, so a long think is never cut short.
         if let Some(turn_id) = state.take_stall_probe()
@@ -5624,6 +5634,46 @@ async fn codex_subagent_statuses(
         }
     }))
     .await
+}
+
+/// 백그라운드 터미널 목록에서 아직 도는 것만 센다. 종료 표시가 붙은 항목은
+/// 목록에 남아 있어도 진행 표시에서 빼야 한다.
+async fn codex_background_terminal_count(server: &BackendServer, thread_id: &str) -> Option<usize> {
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let client = server.client()?;
+    let params = json!({ "threadId": thread_id });
+    let response = timeout(
+        PROBE_TIMEOUT,
+        client.request("thread/backgroundTerminals/list", params),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    Some(
+        response
+            .get("data")
+            .and_then(Value::as_array)?
+            .iter()
+            .filter(|terminal| codex_background_terminal_running(terminal))
+            .count(),
+    )
+}
+
+fn codex_background_terminal_running(terminal: &Value) -> bool {
+    if terminal.get("exitCode").is_some_and(|code| !code.is_null()) {
+        return false;
+    }
+    match terminal.get("status") {
+        Some(Value::String(status)) => {
+            matches!(status.as_str(), "running" | "active" | "started")
+        }
+        Some(status) => status
+            .get("type")
+            .and_then(Value::as_str)
+            .is_none_or(|kind| matches!(kind, "running" | "active" | "started")),
+        None => true,
+    }
 }
 
 fn codex_thread_running(response: &Value) -> Option<bool> {
