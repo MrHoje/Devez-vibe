@@ -61,11 +61,6 @@ const QUIT_ARM_WINDOW: Duration = Duration::from_secs(3);
 /// running. Long enough that an ordinary think never triggers it.
 const TURN_STALL_SILENCE: Duration = Duration::from_secs(20);
 
-/// Codex 백그라운드 터미널 목록을 다시 물어보는 간격.
-const CODEX_BACKGROUND_POLL: Duration = Duration::from_secs(2);
-/// 이만큼 잇달아 실패하면 그 스레드에서는 목록을 더 묻지 않는다.
-const CODEX_BACKGROUND_PROBE_LIMIT: u8 = 3;
-
 /// The permission presets Codex exposes through `/permissions`, cycled with Shift+Tab.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PermissionMode {
@@ -1039,14 +1034,6 @@ fn compact_reset_time(value: &str) -> String {
 }
 
 /// Maps the server's `planType` onto the wording OpenAI uses for the plan.
-/// `2 tasks`처럼 진행 표시에 들어가는 작업 수 표기. 진행 줄 뒤에 붙을 때만
-/// 무엇이 도는지 밝혀야 해서 `background`를 앞에 얹는다.
-fn background_tasks_phrase(count: usize, qualified: bool) -> String {
-    let plural = if count == 1 { "" } else { "s" };
-    let qualifier = if qualified { "background " } else { "" };
-    format!("{count} {qualifier}task{plural}")
-}
-
 fn plan_label(raw: &str) -> String {
     let key = raw
         .chars()
@@ -3676,18 +3663,6 @@ pub struct AppState {
     /// of the turn so a panel opened on a finished subagent still has something
     /// to show.
     subagent_logs: HashMap<String, Vec<SubagentLogLine>>,
-    /// 백그라운드로 도는 작업 수. 위임 에이전트와 백그라운드 명령을 함께 세며,
-    /// provider마다 다른 신호를 하나의 알림으로 모아 받는다.
-    background_tasks: usize,
-    /// 백그라운드 작업이 돌기 시작한 시각. 턴이 끝난 뒤에도 그 줄의 로더와
-    /// 시머가 계속 돌 기준이 필요하다.
-    background_tasks_since: Option<Instant>,
-    /// Codex는 백그라운드 터미널을 알림으로 알려주지 않아 목록을 물어봐야 한다.
-    codex_background_probed_at: Option<Instant>,
-    /// 마지막으로 물어본 스레드. 세션을 이어받으면 조용해도 한 번은 물어본다.
-    codex_background_probed_thread: Option<String>,
-    /// 목록 조회가 잇달아 실패한 횟수. 그 요청을 모르는 런타임에 계속 묻지 않는다.
-    codex_background_probe_failures: u8,
     command_selection: usize,
     spinner_frame: usize,
     turn_started_at: Option<Instant>,
@@ -3930,11 +3905,6 @@ impl AppState {
             codex_subagents: HashMap::new(),
             subagents_settled_at: None,
             subagent_logs: HashMap::new(),
-            background_tasks: 0,
-            background_tasks_since: None,
-            codex_background_probed_at: None,
-            codex_background_probed_thread: None,
-            codex_background_probe_failures: 0,
             command_selection: 0,
             spinner_frame: 0,
             compacting_started_at: None,
@@ -6239,10 +6209,6 @@ impl AppState {
         self.codex_subagents.clear();
         self.subagents_settled_at = None;
         self.subagent_logs.clear();
-        self.background_tasks = 0;
-        self.background_tasks_since = None;
-        self.codex_background_probed_thread = None;
-        self.codex_background_probe_failures = 0;
         self.busy = false;
         self.turn_id = None;
         self.pending_interrupt = false;
@@ -6369,6 +6335,7 @@ impl AppState {
             } else {
                 ""
             },
+            cwd: self.cwd.clone(),
             welcome: self.show_welcome.then(|| self.welcome_view()),
             suggestions: if self.pending.is_none() {
                 self.completion_suggestion_views()
@@ -6516,9 +6483,7 @@ impl AppState {
         let inline_answer_active = self.buffers_pending_text_input();
         // Compaction animates the same row a turn does, so it keeps the frame
         // loop alive even on a runtime that reports no turn while it runs.
-        // 백그라운드 작업은 턴이 끝나도 계속 돈다. 그 줄의 로더가 멈추면 이미
-        // 끝난 일처럼 보여서, 도는 동안에는 프레임 루프를 살려 둔다.
-        let animating = self.busy || self.compacting() || self.background_tasks > 0;
+        let animating = self.busy || self.compacting();
         // A background Claude agent outlives its parent turn. Its elapsed label
         // changes once a second, and the narrow animation path does not repaint
         // these rows, so only that boundary asks for a full frame.
@@ -8279,24 +8244,10 @@ impl AppState {
                         })
                     })
                     .collect();
-                // 백그라운드 수를 함께 싣는 provider만 진행 표시를 갱신한다.
-                // 필드가 없으면 다른 경로가 보낸 값을 덮지 않는다.
-                if let Some(count) = params.get("backgroundTasks").and_then(Value::as_u64) {
-                    self.set_background_tasks(count as usize);
-                }
                 // 갱신이 온 순간부터 유예를 다시 센다. 턴이 도는 중에는 유예를
                 // 걸지 않고, 빈 목록이면 지울 것도 없다.
                 self.subagents_settled_at =
                     (!self.busy && !self.subagents.is_empty()).then(Instant::now);
-            }
-            // 백그라운드 작업 수는 provider마다 신호가 달라 백엔드에서 하나의
-            // 알림으로 모아 보낸다. 위임 에이전트와 백그라운드 명령을 함께 센다.
-            "turn/backgroundTasks/updated" => {
-                let count = params
-                    .get("count")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default() as usize;
-                self.set_background_tasks(count);
             }
             "turn/subagent/line" => {
                 if let Some(parent) = params.get("parentToolUseId").and_then(Value::as_str)
@@ -11869,87 +11820,13 @@ impl AppState {
             if self.turn_interrupted {
                 return Some("X Interrupted".to_owned());
             }
-            return Some(format!(
-                "Working.. ({}){}",
-                format_elapsed(elapsed),
-                self.background_tasks_suffix()
-            ));
+            return Some(format!("Working.. ({})", format_elapsed(elapsed)));
         }
         if self.turn_interrupted && self.last_completed_duration.is_some() {
             return Some("X Interrupted".to_owned());
         }
-        // 백그라운드 작업은 턴이 끝나도 계속 돈다. 끝난 턴의 소요 시간보다 아직
-        // 도는 작업을 알리는 쪽이 급해서 그 줄을 대신 차지한다.
-        if self.background_tasks > 0 {
-            return Some(format!(
-                "Background: {}…",
-                background_tasks_phrase(self.background_tasks, false)
-            ));
-        }
         self.last_completed_duration
             .map(|duration| format!("✧ Completed ({})", format_elapsed(duration.as_secs())))
-    }
-
-    /// Codex 스레드에 백그라운드 터미널이 몇 개 도는지 물어볼 때가 되면 그 스레드를
-    /// 돌려준다. 턴이 돌거나 이미 도는 작업이 있는 동안에만 묻는다.
-    pub fn take_codex_background_probe(&mut self) -> Option<String> {
-        if self.selected_provider() != ModelProvider::Codex
-            || self.thread_id.is_empty()
-            || self.codex_background_probe_failures >= CODEX_BACKGROUND_PROBE_LIMIT
-        {
-            return None;
-        }
-        // 이어받은 세션에는 이미 도는 백그라운드가 있을 수 있다. 그 스레드를
-        // 처음 볼 때는 턴이 조용해도 한 번 물어봐야 표시가 비지 않는다.
-        let first_look =
-            self.codex_background_probed_thread.as_deref() != Some(self.thread_id.as_str());
-        if !first_look {
-            if !self.busy && self.background_tasks == 0 {
-                return None;
-            }
-            if self
-                .codex_background_probed_at
-                .is_some_and(|probed| probed.elapsed() < CODEX_BACKGROUND_POLL)
-            {
-                return None;
-            }
-        }
-        self.codex_background_probed_at = Some(Instant::now());
-        self.codex_background_probed_thread = Some(self.thread_id.clone());
-        Some(self.thread_id.clone())
-    }
-
-    /// 목록 조회가 실패했다. 백그라운드 터미널을 모르는 런타임이면 계속 물어봐야
-    /// 답이 없으므로 몇 번 어긋나면 그 스레드에서는 더 묻지 않는다.
-    pub fn note_codex_background_probe_failure(&mut self) {
-        self.codex_background_probe_failures =
-            self.codex_background_probe_failures.saturating_add(1);
-    }
-
-    pub fn set_background_tasks(&mut self, count: usize) -> bool {
-        self.codex_background_probe_failures = 0;
-        if self.background_tasks == count {
-            return false;
-        }
-        self.background_tasks = count;
-        // 이미 돌던 작업의 시머를 개수가 바뀌었다고 처음으로 되돌리지 않는다.
-        if count == 0 {
-            self.background_tasks_since = None;
-        } else if self.background_tasks_since.is_none() {
-            self.background_tasks_since = Some(Instant::now());
-        }
-        true
-    }
-
-    /// `Working.. (11s) · 2 background tasks`처럼 진행 줄 뒤에 붙는 꼬리.
-    fn background_tasks_suffix(&self) -> String {
-        if self.background_tasks == 0 {
-            return String::new();
-        }
-        format!(
-            " · {}",
-            background_tasks_phrase(self.background_tasks, true)
-        )
     }
 
     /// `/compact` was accepted by the runtime: run the activity spinner until the
@@ -11988,11 +11865,7 @@ impl AppState {
     /// Activity text animation runs from the wall clock rather than counted ticks,
     /// so its pace stays stable even when frames are delayed.
     fn activity_phase(&self) -> f32 {
-        let Some(started) = self
-            .compacting_started_at
-            .or(self.turn_started_at)
-            .or(self.background_tasks_since)
-        else {
+        let Some(started) = self.compacting_started_at.or(self.turn_started_at) else {
             return 0.0;
         };
         let position = started.elapsed().as_millis() % SHIMMER_PERIOD.as_millis();
@@ -13589,7 +13462,7 @@ fn question_tabs(
     current: usize,
     answers: &BTreeMap<String, Vec<String>>,
 ) -> String {
-    let tabs = questions
+    questions
         .iter()
         .enumerate()
         .map(|(index, question)| {
@@ -13610,8 +13483,7 @@ fn question_tabs(
             }
         })
         .collect::<Vec<_>>()
-        .join("  ");
-    format!("\u{2190} {tabs} \u{2192}")
+        .join(QUESTION_TAB_SEPARATOR)
 }
 
 /// Where the cursor and the free-text row should sit when a question is shown
@@ -13699,6 +13571,10 @@ fn strip_recommendation_mark(answer: &str) -> &str {
     }
     trimmed
 }
+
+/// 단계 줄에서 단계 사이에 놓이는 구분점. 렌더러가 같은 구분자로 줄을 다시
+/// 갈라 지금 있는 단계만 강조하므로 양쪽이 같은 문자열을 써야 한다.
+pub const QUESTION_TAB_SEPARATOR: &str = " \u{00b7} ";
 
 /// The two rows a question carries beyond its own options.
 const OTHER_ANSWER_LABEL: &str = "직접 입력";
@@ -21077,106 +20953,6 @@ mod tests {
         state.select_model_and_effort("gpt-5.6-sol", Some("medium"));
         state.handle_notification("turn/completed", &json!({}));
         assert_eq!(state.activity().as_deref(), Some("✧ Completed (10s)"));
-    }
-
-    /// 백그라운드 작업은 턴이 끝나도 계속 돈다. 도는 동안에는 진행 줄과 끝난
-    /// 줄 모두에 개수가 남아야 사용자가 아직 무언가 돌고 있다는 것을 안다.
-    #[test]
-    fn background_task_count_rides_the_activity_row() {
-        let mut state = test_state();
-        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
-        state.turn_started_at = Some(Instant::now() - Duration::from_secs(11));
-        state.handle_notification("turn/backgroundTasks/updated", &json!({ "count": 2 }));
-
-        assert_eq!(
-            state.activity().as_deref(),
-            Some("Working.. (11s) · 2 background tasks")
-        );
-
-        state.handle_notification("turn/completed", &json!({}));
-
-        assert_eq!(state.activity().as_deref(), Some("Background: 2 tasks…"));
-
-        state.handle_notification("turn/backgroundTasks/updated", &json!({ "count": 1 }));
-
-        assert_eq!(state.activity().as_deref(), Some("Background: 1 task…"));
-
-        state.handle_notification("turn/backgroundTasks/updated", &json!({ "count": 0 }));
-
-        assert_eq!(state.activity().as_deref(), Some("✧ Completed (11s)"));
-    }
-
-    /// 턴이 끝나도 백그라운드 줄은 아직 도는 일이다. 프레임 루프가 멈추면 로더가
-    /// 굳고 시머도 서서, 끝난 작업처럼 보인다.
-    #[test]
-    fn a_background_only_row_keeps_its_frames_running() {
-        let mut state = test_state();
-        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
-        state.handle_notification("turn/backgroundTasks/updated", &json!({ "count": 2 }));
-        state.handle_notification("turn/completed", &json!({}));
-
-        assert!(state.tick(), "백그라운드가 도는 동안 프레임을 계속 그린다");
-        state.background_tasks_since = Some(Instant::now() - SHIMMER_PERIOD / 2);
-        assert!(state.activity_phase() > 0.0, "시머가 흐른다");
-
-        state.handle_notification("turn/backgroundTasks/updated", &json!({ "count": 0 }));
-
-        assert!(!state.tick(), "다 끝나면 프레임 루프도 쉰다");
-    }
-
-    /// 이어받은 스레드에는 이미 도는 백그라운드가 있을 수 있다. 조용하다고 한 번도
-    /// 묻지 않으면 그 표시를 영영 놓친다.
-    #[test]
-    fn a_quiet_codex_thread_is_still_asked_once() {
-        let mut state = test_state();
-
-        assert_eq!(
-            state.take_codex_background_probe().as_deref(),
-            Some("thread")
-        );
-        assert!(
-            state.take_codex_background_probe().is_none(),
-            "조용한 스레드를 되풀이해 묻지 않는다"
-        );
-    }
-
-    /// 백그라운드 터미널 목록을 모르는 런타임에 2초마다 계속 묻는 것은 낭비다.
-    #[test]
-    fn background_probes_give_up_on_a_runtime_that_keeps_failing() {
-        let mut state = test_state();
-        state.busy = true;
-
-        for _ in 0..CODEX_BACKGROUND_PROBE_LIMIT {
-            assert!(state.take_codex_background_probe().is_some());
-            state.note_codex_background_probe_failure();
-            state.codex_background_probed_at = Some(Instant::now() - CODEX_BACKGROUND_POLL);
-        }
-
-        assert!(state.take_codex_background_probe().is_none());
-
-        // 답이 한 번이라도 오면 다시 묻는다.
-        state.set_background_tasks(1);
-        state.codex_background_probed_at = Some(Instant::now() - CODEX_BACKGROUND_POLL);
-
-        assert!(state.take_codex_background_probe().is_some());
-    }
-
-    /// OpenCode는 하위 에이전트 목록에 개수를 실어 보낸다. 개수를 싣지 않는
-    /// provider의 목록 갱신이 그 값을 0으로 지워서는 안 된다.
-    #[test]
-    fn a_subagent_update_without_a_count_keeps_the_background_total() {
-        let mut state = test_state();
-        state.handle_notification("turn/backgroundTasks/updated", &json!({ "count": 3 }));
-        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
-
-        assert_eq!(state.background_tasks, 3);
-
-        state.handle_notification(
-            "turn/subagents/updated",
-            &json!({ "subagents": [], "backgroundTasks": 1 }),
-        );
-
-        assert_eq!(state.background_tasks, 1);
     }
 
     #[test]

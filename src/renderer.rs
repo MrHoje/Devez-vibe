@@ -34,7 +34,7 @@ use crate::{
         CellPosition, CellRange, CopyLine, Selection, SelectionFinish, extract_text,
         selected_char_count, selection_chunks,
     },
-    state::{DiffDisplayMode, ShellDisplayMode},
+    state::{DiffDisplayMode, QUESTION_TAB_SEPARATOR, ShellDisplayMode},
     syntax::{self, SyntaxKind},
     theme::{self, Rgb, ThemeKind},
 };
@@ -572,6 +572,8 @@ pub struct View<'a> {
     pub diff_display_mode: DiffDisplayMode,
     /// The docked right-hand side panel's width, or `None` while it is closed.
     pub side_panel_width: Option<usize>,
+    /// The working folder shown in the side panel header.
+    pub cwd: String,
     pub side_panel_prompts_expanded: bool,
     pub side_panel_integrations: Vec<ProviderIntegrationView>,
 }
@@ -2450,7 +2452,7 @@ impl Renderer {
 
     fn remove_startup_update_from_history(&mut self) -> bool {
         let before = self.history.len();
-        self.history.retain(|block| !is_startup_update(block));
+        self.history.retain(|block| !is_startup_banner(block));
         let removed = self.history.len() != before;
         if removed {
             self.wrapped_width = 0;
@@ -2507,7 +2509,7 @@ impl Renderer {
         let committed_without_startup = view.plan_summary.is_some().then(|| {
             committed
                 .iter()
-                .filter(|block| !is_startup_update(block))
+                .filter(|block| !is_startup_banner(block))
                 .cloned()
                 .collect::<Vec<_>>()
         });
@@ -2632,6 +2634,7 @@ impl Renderer {
                 view.waiting_for_response,
                 question_closed_from,
                 &view.subagents,
+                &view.cwd,
                 view.side_panel_prompts_expanded,
                 &view.side_panel_integrations,
                 view.stream_fade_tail,
@@ -3091,6 +3094,7 @@ impl Renderer {
         waiting_for_response: bool,
         question_closed_from: Option<usize>,
         subagents: &[SubagentView],
+        cwd: &str,
         side_panel_prompts_expanded: bool,
         side_panel_integrations: &[ProviderIntegrationView],
         stream_fade_tail: usize,
@@ -3175,7 +3179,8 @@ impl Renderer {
         let panel_content = self
             .side_panel
             .map(|layout| {
-                let mut lines = side_panel_subagent_lines(subagents, layout.content_width());
+                let mut lines = side_panel_header_lines(cwd, layout.content_width());
+                lines.extend(side_panel_subagent_lines(subagents, layout.content_width()));
                 lines.extend(
                     plan_summary
                         .map(|summary| {
@@ -5346,9 +5351,8 @@ fn shimmer_spans_with_band(label: &str, phase: f32, base: Rgb, band: f32) -> Vec
 /// Gajae-Code's Unicode activity loader frames.
 const WORKING_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Activity labels that carry the loader glyph and the shimmer sweep. Background
-/// work outlives its turn, so its row keeps the loader while the turn is over.
-const SPINNING_ACTIVITY_LABELS: [&str; 3] = ["Working..", "Compacting..", "Background:"];
+/// Activity labels that carry the loader glyph and the shimmer sweep.
+const SPINNING_ACTIVITY_LABELS: [&str; 2] = ["Working..", "Compacting.."];
 
 /// Glyphs that head an activity row which is already over. A shimmer on these
 /// reads as work still running, so they paint flat.
@@ -6326,6 +6330,57 @@ fn close_panel_row(mut line: PaintLine, panel_width: usize) -> PaintLine {
     line
 }
 
+/// 단계 줄은 지금 있는 단계만 굵은 강조색으로 세우고, 남은 단계와 구분점은
+/// 흐린 채로 둔다. 어느 단계에 와 있는지가 글자보다 색으로 먼저 읽힌다.
+fn question_tab_row(tabs: &str, width: usize) -> PaintLine {
+    let mut line = PaintLine::plain(String::new());
+    line.prefix = "│   ".to_owned();
+    line.prefix_tone = Tone::Border;
+    let mut used = 0;
+    let mut current = false;
+    let mut clipped = false;
+    for (index, tab) in tabs.split(QUESTION_TAB_SEPARATOR).enumerate() {
+        // 헤더 자체에 구분점이 들어 있어도 대괄호가 닫힐 때까지 한 단계로 본다.
+        if tab.starts_with('[') {
+            current = true;
+        }
+        let mut spans = Vec::new();
+        if index > 0 {
+            spans.push(PaintSpan {
+                text: QUESTION_TAB_SEPARATOR.to_owned(),
+                tone: Tone::Muted,
+                bold: false,
+            });
+        }
+        spans.push(PaintSpan {
+            text: tab.to_owned(),
+            tone: if current { Tone::Accent } else { Tone::Muted },
+            bold: current,
+        });
+        let span_width = spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+            .sum::<usize>();
+        if used + span_width > width {
+            clipped = true;
+            break;
+        }
+        used += span_width;
+        line.tail.extend(spans);
+        if tab.ends_with(']') {
+            current = false;
+        }
+    }
+    if clipped {
+        line.tail.push(PaintSpan {
+            text: "…".to_owned(),
+            tone: Tone::Muted,
+            bold: false,
+        });
+    }
+    line
+}
+
 /// The row's leading `│` belongs to the panel, not to the row. Toning the whole
 /// prefix with the selection painted that border in the accent as well, so the
 /// box read as though its own edge were the thing being picked. Keep the border
@@ -6423,6 +6478,12 @@ fn update_lines(block: &Block, width: u16) -> Vec<PaintLine> {
 
 fn is_startup_update(block: &Block) -> bool {
     matches!(block.kind, BlockKind::Update) && block.title == "Tip"
+}
+
+/// The rows that only introduce the session — the welcome masthead and the
+/// startup tip. The first plan takes both away together.
+fn is_startup_banner(block: &Block) -> bool {
+    is_startup_update(block) || matches!(block.kind, BlockKind::Welcome)
 }
 
 fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine> {
@@ -7048,6 +7109,14 @@ fn overlay_frame_with_expansion(
                     let is_prompt = part_index == last_part;
                     if part.is_empty() {
                         lines.push(panel_padding_row(panel_width));
+                        continue;
+                    }
+                    // 맨 앞 줄은 단계 줄이라 지금 있는 단계만 따로 세워 준다.
+                    if part_index == 0 && !is_prompt {
+                        lines.push(close_panel_row(
+                            question_tab_row(part, wrap_width as usize),
+                            panel_width,
+                        ));
                         continue;
                     }
                     lines.extend(
@@ -8757,6 +8826,32 @@ fn side_panel_plan_lines(
     lines
 }
 
+/// The panel's own masthead: product and version, the working folder under it,
+/// then the same quiet rule every other section closes with.
+fn side_panel_header_lines(cwd: &str, content_width: usize) -> Vec<PaintLine> {
+    if content_width == 0 {
+        return Vec::new();
+    }
+    vec![
+        PaintLine {
+            text: compact_right(
+                &format!("DEVEZ VIBE  v{}", crate::update::CURRENT_VERSION),
+                content_width,
+            ),
+            tone: Tone::Accent,
+            bold: true,
+            ..PaintLine::plain("")
+        },
+        PaintLine {
+            text: compact_right(cwd, content_width),
+            tone: Tone::Muted,
+            ..PaintLine::plain("")
+        },
+        PaintLine::blank(),
+        side_panel_divider(content_width),
+    ]
+}
+
 const SIDE_PANEL_SUBAGENT_LIMIT: usize = 5;
 
 /// Active provider subagents take the top of the docked panel while any are
@@ -8821,6 +8916,17 @@ fn side_panel_prompt_lines(
     if content_width == 0 {
         return Vec::new();
     }
+    // No prompt has been sent yet, so the section stays away entirely rather
+    // than leaving an empty heading behind, exactly as the plan section does.
+    let prompts = history
+        .iter()
+        .rev()
+        .filter(|block| matches!(block.kind, BlockKind::User))
+        .take(SIDE_PANEL_PROMPT_LIMIT)
+        .collect::<Vec<_>>();
+    if prompts.is_empty() {
+        return Vec::new();
+    }
     let heading =
         side_panel_section_heading("Input Prompt", expanded, content_width, Pick::PromptSection);
     if !expanded {
@@ -8831,14 +8937,7 @@ fn side_panel_prompt_lines(
         ];
     }
     let mut lines = vec![heading, PaintLine::blank()];
-    let mut has_prompts = false;
-    for prompt in history
-        .iter()
-        .rev()
-        .filter(|block| matches!(block.kind, BlockKind::User))
-        .take(SIDE_PANEL_PROMPT_LIMIT)
-    {
-        has_prompts = true;
+    for prompt in prompts {
         let text = prompt.body.split_whitespace().collect::<Vec<_>>().join(" ");
         let marker_tone = model_tone(&prompt.title).unwrap_or(Tone::User);
         let prefix = "› ";
@@ -8856,9 +8955,7 @@ fn side_panel_prompt_lines(
             ..PaintLine::plain("")
         });
     }
-    if has_prompts {
-        lines.push(PaintLine::blank());
-    }
+    lines.push(PaintLine::blank());
     lines.push(side_panel_divider(content_width));
     lines
 }
@@ -12221,6 +12318,7 @@ mod tests {
             plan_summary: None,
             response_collapse: None,
             fold_progress_groups: false,
+            cwd: String::new(),
             plan_active: false,
             turn_active: false,
             plan_shimmer_phase: None,
@@ -20308,17 +20406,6 @@ mod tests {
         let line = activity_lines("Working.. (4s)", None, 0.0, 80);
 
         assert_eq!(painted(&line[0]), " ⠋ Working.. (4s)");
-    }
-
-    /// 턴이 끝나도 백그라운드 작업은 계속 돈다. 그 줄은 완료 줄이 아니라 아직
-    /// 도는 일이므로 로더를 그대로 단다.
-    #[test]
-    fn a_background_only_row_keeps_the_loader() {
-        let turn = activity_lines("Working.. (11s) · 2 background tasks", None, 0.0, 80);
-        let after = activity_lines("Background: 2 tasks…", None, 0.0, 80);
-
-        assert_eq!(painted(&turn[0]), " ⠋ Working.. (11s) · 2 background tasks");
-        assert_eq!(painted(&after[0]), " ⠋ Background: 2 tasks…");
     }
 
     fn painted(line: &PaintLine) -> String {

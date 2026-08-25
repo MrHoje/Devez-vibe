@@ -835,6 +835,7 @@ async fn choose_startup_session(
             View {
                 live_blocks: Vec::new(),
                 overlay: Some(picker.overlay_view()),
+                cwd: String::new(),
                 plan_summary: None,
                 response_collapse: None,
                 fold_progress_groups: false,
@@ -1375,18 +1376,6 @@ async fn event_loop(
             }
             if changed {
                 draw_conversations(state, &mut btw_state, split_focus, renderer)?;
-            }
-        }
-        // Codex는 백그라운드 터미널을 알림으로 알려주지 않아 목록을 물어봐야
-        // 진행 표시의 개수를 맞출 수 있다.
-        if let Some(thread_id) = state.take_codex_background_probe() {
-            match codex_background_terminal_count(server, &thread_id).await {
-                Some(count) => {
-                    if state.set_background_tasks(count) {
-                        draw_conversations(state, &mut btw_state, split_focus, renderer)?;
-                    }
-                }
-                None => state.note_codex_background_probe_failure(),
             }
         }
         // A quiet turn is asked about rather than assumed dead. Only a runtime that
@@ -5636,41 +5625,6 @@ async fn codex_subagent_statuses(
         }
     }))
     .await
-}
-
-/// Codex는 이미 끝난 프로세스를 목록에서 빼고 돌려주므로 받은 항목이 곧 도는
-/// 작업이다. 목록이 여러 페이지면 끝까지 따라가 전체 개수를 센다.
-async fn codex_background_terminal_count(server: &BackendServer, thread_id: &str) -> Option<usize> {
-    const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-
-    let client = server.client()?;
-    let mut cursor: Option<String> = None;
-    let mut count = 0usize;
-    loop {
-        let mut params = json!({ "threadId": thread_id, "limit": 100 });
-        if let Some(cursor) = cursor.as_deref() {
-            params["cursor"] = json!(cursor);
-        }
-        let response = timeout(
-            PROBE_TIMEOUT,
-            client.request("thread/backgroundTerminals/list", params),
-        )
-        .await
-        .ok()?
-        .ok()?;
-        count = count.checked_add(response.get("data").and_then(Value::as_array)?.len())?;
-        let Some(next) = response
-            .get("nextCursor")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-        else {
-            return Some(count);
-        };
-        if cursor.as_deref() == Some(next.as_str()) {
-            return None;
-        }
-        cursor = Some(next);
-    }
 }
 
 fn codex_thread_running(response: &Value) -> Option<bool> {
