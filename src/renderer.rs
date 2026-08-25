@@ -710,6 +710,10 @@ pub struct Renderer {
     /// Rows the transcript is held back from its newest end. Zero follows the
     /// live output. Fullscreen only: inline scrolling belongs to the terminal.
     scroll_back: usize,
+    /// Once a reader explicitly returns from history to the newest completed
+    /// output, collapse any visually blank transcript tail into the two rows
+    /// already reserved above activity. Live streaming keeps its phased spacing.
+    compact_bottom_gap: bool,
     /// The transcript already wrapped for `wrapped_width`. Fullscreen repaints
     /// the whole screen every keystroke, and re-wrapping the transcript each
     /// time would make typing cost O(transcript).
@@ -1365,6 +1369,7 @@ impl Renderer {
             split_btw_view_rows: 0,
             split_selection_focus: None,
             scroll_back: 0,
+            compact_bottom_gap: false,
             wrapped: Vec::new(),
             fullscreen_display_lines: Vec::new(),
             wrapped_width: 0,
@@ -1501,6 +1506,7 @@ impl Renderer {
         if self.split_active {
             return self.scroll_split_pane(self.split_focus, delta);
         }
+        let was_scrolled = self.scroll_back > 0;
         let target = self
             .scroll_back
             .saturating_add_signed(delta)
@@ -1508,6 +1514,7 @@ impl Renderer {
         let moved = target != self.scroll_back;
         self.scroll_back = target;
         if moved {
+            self.compact_bottom_gap = was_scrolled && target == 0;
             self.history_view_rows_anchor = None;
             self.history_view_start_anchor = None;
             self.question_view_rows_anchor = None;
@@ -1548,6 +1555,7 @@ impl Renderer {
             return false;
         }
         if self.split_active {
+            self.compact_bottom_gap = false;
             let scroll_back = match self.split_focus {
                 SplitFocus::Main => &mut self.split_main_scroll_back,
                 SplitFocus::Btw => &mut self.split_btw_scroll_back,
@@ -1562,6 +1570,7 @@ impl Renderer {
             return false;
         }
         self.scroll_back = 0;
+        self.compact_bottom_gap = true;
         self.history_view_rows_anchor = None;
         self.history_view_start_anchor = None;
         self.clear_selection();
@@ -1673,6 +1682,7 @@ impl Renderer {
         self.wrapped.clear();
         self.wrapped_width = 0;
         self.scroll_back = 0;
+        self.compact_bottom_gap = false;
         self.expanded_tools.clear();
         self.response_collapse = None;
         self.progress_group_rows.clear();
@@ -1712,6 +1722,7 @@ impl Renderer {
         self.split_btw_max_scroll = 0;
         self.split_btw_view_rows = 0;
         self.split_selection_focus = None;
+        self.compact_bottom_gap = false;
         self.previous_lines.clear();
         self.painted_frame = None;
         self.wrapped_width = 0;
@@ -3120,6 +3131,7 @@ impl Renderer {
             .filter(|(id, _)| !committed_ids.contains(id))
             .map(|(_, rows)| *rows)
             .sum::<usize>();
+        let stream_active = !streamed_rows.is_empty();
         let next_stream_rows = streamed_rows.values().copied().sum::<usize>();
         if self.scroll_back > 0 {
             let row_delta = next_stream_rows as isize - retained_stream_rows as isize;
@@ -3138,6 +3150,7 @@ impl Renderer {
         let anchored_view_rows = self
             .question_view_rows_anchor
             .or(self.history_view_rows_anchor);
+        let mut absorbed_spacers = 0;
         let live_rows_after_absorb = frame.lines.len().saturating_sub(1);
         if display_wrapped.last() == Some(&PaintLine::blank())
             && trailing_transcript_spacer_will_be_visible(
@@ -3148,8 +3161,31 @@ impl Renderer {
                 self.scroll_back,
                 self.history_view_start_anchor,
             )
+            && frame.absorb_leading_spacer()
         {
-            frame.absorb_leading_spacer();
+            absorbed_spacers = 1;
+        }
+        if self.compact_bottom_gap && !stream_active {
+            let trailing_spacers = display_wrapped
+                .iter()
+                .rev()
+                .take_while(|line| painted_line_text(line).trim().is_empty())
+                .count();
+            while absorbed_spacers < trailing_spacers {
+                let live_rows_after_absorb = frame.lines.len().saturating_sub(1);
+                if !trailing_transcript_spacer_will_be_visible(
+                    content_rows,
+                    live_rows_after_absorb,
+                    display_wrapped.len(),
+                    anchored_view_rows,
+                    self.scroll_back,
+                    self.history_view_start_anchor,
+                ) || !frame.absorb_leading_spacer()
+                {
+                    break;
+                }
+                absorbed_spacers += 1;
+            }
         }
         let panel_content = self
             .side_panel
@@ -3780,7 +3816,7 @@ fn plan_rows_requiring_full_repaint(
     if previous_plan_rows != current_plan_rows {
         return (0..current_plan_rows).collect();
     }
-    let mut rows = (0..current_plan_rows)
+    let rows = (0..current_plan_rows)
         .filter(|&row| {
             previous
                 .get(row)
@@ -3793,17 +3829,6 @@ fn plan_rows_requiring_full_repaint(
                 })
         })
         .collect::<Vec<_>>();
-    // ConPTY can disturb the following row while a semantic plan body row is
-    // cleared and repainted. The border itself is unchanged, so an ordinary
-    // frame diff would trust the stale terminal contents and leave it broken.
-    if rows.iter().any(|&row| row >= 2)
-        && let Some(border_row) = current[..current_plan_rows]
-            .iter()
-            .rposition(|line| line.text.starts_with('└'))
-        && !rows.contains(&border_row)
-    {
-        rows.push(border_row);
-    }
     rows
 }
 
@@ -4908,9 +4933,9 @@ fn visible_response_bullet_row(
         .then(|| rows_before_transcript + row - visible.start)
 }
 
-/// The plan already owns one blank row below its bottom border. If a scrolled
-/// transcript window lands on block-separator blanks, start at its next visible
-/// row so those separators do not stack below the fixed plan.
+/// A collapsed plan already owns its separator, while an expanded plan is meant
+/// to meet output without another gap. If a scrolled transcript window lands on
+/// block-separator blanks, start at its next visible row in either layout.
 fn transcript_start_below_plan(wrapped: &[PaintLine], start: usize) -> usize {
     let start = start.min(wrapped.len());
     start
@@ -5329,9 +5354,15 @@ const PROGRESS_TRACK_COLUMNS: usize = 20;
 /// Below this the bar reads as a handful of blocks rather than a track, so the
 /// row keeps the elapsed time alone instead.
 const PROGRESS_TRACK_MINIMUM: usize = 8;
-/// A half-height block: a full-cell band sits as tall as the text beside it and
-/// reads heavier than the row deserves, so the track keeps to the lower half.
-const PROGRESS_GLYPH: char = '▄';
+/// The compaction track is a rule, not a bar: a thin line reads as a hint that
+/// work is running without carrying the weight of a filled band.
+const PROGRESS_GLYPH: char = '─';
+/// The band's own columns thicken the rule so the sweep is legible even where
+/// the terminal flattens the brightness ramp.
+const PROGRESS_GLYPH_BAND: char = '━';
+/// The compaction rule is shorter than the context gauge: it says "still going",
+/// not "this far along", so it does not need the width.
+const COMPACTION_TRACK_COLUMNS: usize = 12;
 
 /// An indeterminate band enters from the left, crosses the track, and leaves
 /// through the right edge. Providers expose only start/end, so this communicates
@@ -5340,7 +5371,7 @@ const PROGRESS_GLYPH: char = '▄';
 /// direction rather than a symmetric blob.
 fn progress_bar_spans(phase: f32, track: usize, base: Rgb) -> Vec<PaintSpan> {
     /// Columns of trail behind the leading edge, where the band fades out.
-    const TRAIL_COLUMNS: f32 = 6.0;
+    const TRAIL_COLUMNS: f32 = 4.0;
     /// Columns of fade ahead of the leading edge: enough to soften the head
     /// without blunting which way the sweep runs.
     const HEAD_COLUMNS: f32 = 1.5;
@@ -5362,11 +5393,15 @@ fn progress_bar_spans(phase: f32, track: usize, base: Rgb) -> Vec<PaintSpan> {
             } else {
                 0.5 * (1.0 + (distance * std::f32::consts::PI).cos())
             };
-            // One glyph the whole way across: the sweep rides on brightness
-            // alone, since swapping density would put the band back at full cell
-            // height in its brightest columns.
+            // Both glyphs are single-column rules of the same height, so
+            // thickening the band's core adds weight where the sweep is without
+            // changing the row's shape.
             PaintSpan {
-                text: PROGRESS_GLYPH.to_string(),
+                text: if level > 0.5 {
+                    PROGRESS_GLYPH_BAND.to_string()
+                } else {
+                    PROGRESS_GLYPH.to_string()
+                },
                 tone: if level > 0.0 {
                     Tone::Shimmer(base, (level * 255.0).round() as u8)
                 } else {
@@ -5433,7 +5468,7 @@ fn activity_lines_with_progress(
                 + 3;
             let track = usize::from(width)
                 .saturating_sub(spent)
-                .min(PROGRESS_TRACK_COLUMNS);
+                .min(COMPACTION_TRACK_COLUMNS);
             if track >= PROGRESS_TRACK_MINIMUM {
                 tail.push(PaintSpan {
                     text: " ".to_owned(),
@@ -8555,11 +8590,6 @@ fn fixed_plan_summary_lines(
     } else {
         lines.push(PaintLine::blank());
     }
-    lines.push(PaintLine {
-        tone: PLAN_BORDER_TONE,
-        ..PaintLine::plain(format!("└{}┘", "─".repeat(line_width.saturating_sub(2))))
-    });
-    lines.push(PaintLine::blank());
     lines
 }
 
@@ -17493,6 +17523,7 @@ mod tests {
             .filter(|(id, _)| !committed_ids.contains(id))
             .map(|(_, rows)| *rows)
             .sum::<usize>();
+        let stream_active = !streamed_rows.is_empty();
         let next_stream_rows = streamed_rows.values().copied().sum::<usize>();
         if renderer.scroll_back > 0 {
             let row_delta = next_stream_rows as isize - retained_stream_rows as isize;
@@ -17501,6 +17532,7 @@ mod tests {
         renderer.fullscreen_stream_rows = streamed_rows;
         let mut display_wrapped = renderer.wrapped.clone();
         display_wrapped.extend(streamed_lines);
+        let mut absorbed_spacers = 0;
         let live_rows_after_absorb = frame.lines.len().saturating_sub(1);
         if display_wrapped.last() == Some(&PaintLine::blank())
             && trailing_transcript_spacer_will_be_visible(
@@ -17511,8 +17543,31 @@ mod tests {
                 renderer.scroll_back,
                 renderer.history_view_start_anchor,
             )
+            && frame.absorb_leading_spacer()
         {
-            frame.absorb_leading_spacer();
+            absorbed_spacers = 1;
+        }
+        if renderer.compact_bottom_gap && !stream_active {
+            let trailing_spacers = display_wrapped
+                .iter()
+                .rev()
+                .take_while(|line| painted_line_text(line).trim().is_empty())
+                .count();
+            while absorbed_spacers < trailing_spacers {
+                let live_rows_after_absorb = frame.lines.len().saturating_sub(1);
+                if !trailing_transcript_spacer_will_be_visible(
+                    rows,
+                    live_rows_after_absorb,
+                    display_wrapped.len(),
+                    renderer.history_view_rows_anchor,
+                    renderer.scroll_back,
+                    renderer.history_view_start_anchor,
+                ) || !frame.absorb_leading_spacer()
+                {
+                    break;
+                }
+                absorbed_spacers += 1;
+            }
         }
         let (view_rows, live_rows) = split_rows_with_transcript_anchor(
             rows,
@@ -18493,7 +18548,12 @@ mod tests {
                         text.contains("Working") || text.contains("Completed")
                     })
                     .expect("activity row");
-                assert_eq!(activity - answer, expected, "rows={rows}, width={width}");
+                assert_eq!(
+                    activity - answer,
+                    expected,
+                    "rows={rows}, width={width}, screen={:?}",
+                    screen.iter().map(painted_line_text).collect::<Vec<_>>()
+                );
                 for offset in 1..expected {
                     assert!(
                         painted_line_text(&screen[answer + offset])
@@ -18517,7 +18577,7 @@ mod tests {
             let streaming_row = assert_gap(&screen, 3);
 
             // Whitespace-only rows close the paragraph, so one of them stays and
-            // the reserved pair sits above the activity as before.
+            // the reserved pair sits above the activity while streaming.
             answer.body.push_str("\n   \n\t\n\u{200b}");
             let screen = simulate_fullscreen_frame(
                 &mut renderer,
@@ -18545,6 +18605,28 @@ mod tests {
                 width,
             );
             assert_eq!(assert_gap(&screen, 4), closed_row);
+
+            renderer.scroll_back = 3;
+            simulate_fullscreen_frame(
+                &mut renderer,
+                &[],
+                &[],
+                Some("Completed"),
+                None,
+                rows,
+                width,
+            );
+            assert!(renderer.scroll_to_bottom());
+            let screen = simulate_fullscreen_frame(
+                &mut renderer,
+                &[],
+                &[],
+                Some("Completed"),
+                None,
+                rows,
+                width,
+            );
+            assert_eq!(assert_gap(&screen, 3), closed_row + 1);
         }
     }
 
@@ -18707,6 +18789,7 @@ mod tests {
 
         assert!(renderer.scroll(10));
         assert_eq!(renderer.scroll_back, 10);
+        assert!(!renderer.compact_bottom_gap);
         // Past the oldest row it clamps, and a wheel spun at the end is a no-op
         // so the caller can skip the repaint.
         assert!(renderer.scroll(100));
@@ -18714,6 +18797,7 @@ mod tests {
         assert!(!renderer.scroll(5));
         assert!(renderer.scroll(-100));
         assert_eq!(renderer.scroll_back, 0);
+        assert!(renderer.compact_bottom_gap);
         assert!(!renderer.scroll(-1));
     }
 
@@ -18836,6 +18920,7 @@ mod tests {
 
         assert!(renderer.scroll_to_bottom());
         assert_eq!(renderer.scroll_back, 0);
+        assert!(renderer.compact_bottom_gap);
     }
 
     #[test]
@@ -20141,10 +20226,14 @@ mod tests {
         let passing = activity_lines("Compacting.. (4s)", None, 0.5, 80);
         let leaving = activity_lines("Compacting.. (4s)", None, 0.8, 80);
 
-        let track = PROGRESS_GLYPH.to_string().repeat(PROGRESS_TRACK_COLUMNS);
-        assert_eq!(painted(&entering[0]), format!(" ⠹ Compacting.. {track} (4s)"));
-        assert_eq!(painted(&passing[0]), format!(" ⠴ Compacting.. {track} (4s)"));
-        assert_eq!(painted(&leaving[0]), format!(" ⠇ Compacting.. {track} (4s)"));
+        // The band thickens the columns it is passing through, so the row is
+        // read as a fixed-width rule rather than as one exact string.
+        for (line, spinner) in [(&entering, "⠹"), (&passing, "⠴"), (&leaving, "⠇")] {
+            let painted = painted(&line[0]);
+            assert!(painted.starts_with(&format!(" {spinner} Compacting.. ")));
+            assert!(painted.ends_with(" (4s)"));
+            assert_eq!(progress_levels(&line[0]).len(), COMPACTION_TRACK_COLUMNS);
+        }
 
         // The glyph no longer moves, so the band is where the row is brightest.
         assert!(
@@ -20172,7 +20261,9 @@ mod tests {
     fn progress_levels(line: &PaintLine) -> Vec<u8> {
         line.tail
             .iter()
-            .filter(|span| span.text.starts_with(PROGRESS_GLYPH))
+            .filter(|span| {
+                span.text.starts_with(PROGRESS_GLYPH) || span.text.starts_with(PROGRESS_GLYPH_BAND)
+            })
             .map(|span| match span.tone {
                 Tone::Shimmer(_, level) => level,
                 _ => 0,
@@ -22025,7 +22116,7 @@ mod tests {
 
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, true, None, None);
 
-        assert_eq!(lines.len(), 12);
+        assert_eq!(lines.len(), 10);
         assert!(painted(&lines[0]).starts_with("┌── Updated Plan · 0 / 7"));
         assert!(painted(&lines[0]).ends_with('┐'));
         assert!(lines[0].tail.iter().any(|span| span.text == " Alt + W "));
@@ -22034,9 +22125,49 @@ mod tests {
         assert!(painted(&lines[8]).contains("     Task 7"));
         assert!(!painted(&lines[8]).ends_with('┃'));
         assert!(lines[9].text.is_empty());
-        assert!(painted(&lines[10]).starts_with('└'));
-        assert!(painted(&lines[10]).ends_with('┘'));
-        assert!(lines[11].text.is_empty());
+        assert!(!lines.iter().any(|line| painted(line).starts_with('└')));
+    }
+
+    #[test]
+    fn expanding_plan_keeps_a_full_streamed_transcript_on_the_same_bottom_row() {
+        let mut summary = PlanSummary {
+            explanation: None,
+            steps: (1..=3)
+                .map(|index| PlanStep {
+                    text: format!("Task {index}"),
+                    status: PlanStepStatus::Pending,
+                    started_at: None,
+                    elapsed: None,
+                })
+                .collect(),
+            expanded: false,
+            started_at: Instant::now(),
+            elapsed: None,
+        };
+        for (rows, width) in [(18, 60), (24, 80), (32, 120)] {
+            let answer_row = |summary: &PlanSummary| {
+                let plan = fixed_plan_summary_lines(summary, width, 0.0, true, None, None);
+                let plan_rows = plan.len();
+                let mut transcript = text_rows(40, "history");
+                transcript.last_mut().expect("answer row").text = "streamed answer".to_owned();
+                let live = text_rows(4, "dock");
+                let content_rows = rows - plan_rows;
+                let (view_rows, _) = split_rows(content_rows, live.len(), transcript.len());
+                let start = transcript.len() - view_rows;
+                let (mut screen, _) = compose_screen(&transcript, live, view_rows, start, 0);
+                screen.splice(0..0, plan);
+                screen
+                    .iter()
+                    .position(|line| line.text == "streamed answer")
+                    .expect("visible answer")
+            };
+            let collapsed = answer_row(&summary);
+            summary.expanded = true;
+            let expanded = answer_row(&summary);
+            summary.expanded = false;
+
+            assert_eq!(expanded, collapsed, "rows={rows}, width={width}");
+        }
     }
 
     /// Inside the docked panel the plan drops its card chrome: a heading, one
@@ -23242,16 +23373,11 @@ mod tests {
 
         let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None, None);
         let elapsed_line = painted(&lines[3]);
-        let bottom_border = painted(&lines[4]);
 
         assert!(painted(&lines[2]).contains("Done (1m 34s)"));
         assert!(elapsed_line.contains("⏱  1m 34s"));
         assert_eq!(
             UnicodeWidthStr::width(elapsed_line.as_str()),
-            UnicodeWidthStr::width(bottom_border.as_str())
-        );
-        assert_eq!(
-            UnicodeWidthStr::width(bottom_border.as_str()),
             panel_span(80)
         );
     }
@@ -23400,7 +23526,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_plan_transition_repaints_its_bottom_border() {
+    fn completed_plan_transition_repaints_its_elapsed_row() {
         let summary = PlanSummary {
             explanation: None,
             steps: vec![
@@ -23423,14 +23549,13 @@ mod tests {
         };
         let active = fixed_plan_summary_lines(&summary, 80, 0.0, true, None, None);
         let completed = fixed_plan_summary_lines(&summary, 80, 0.0, false, None, None);
-        let border_row = completed.len() - 2;
+        let elapsed_row = completed.len() - 1;
 
         let repainted =
             plan_rows_requiring_full_repaint(&active, active.len(), &completed, completed.len());
 
-        assert!(repainted.contains(&border_row));
-        assert!(painted(&completed[border_row]).starts_with('└'));
-        assert!(painted(&completed[border_row]).ends_with('┘'));
+        assert!(repainted.contains(&elapsed_row));
+        assert!(painted(&completed[elapsed_row]).contains("⏱"));
     }
 
     #[test]
