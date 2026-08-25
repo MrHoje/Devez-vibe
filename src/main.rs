@@ -840,7 +840,6 @@ async fn choose_startup_session(
                 response_collapse: None,
                 fold_progress_groups: false,
                 plan_active: false,
-                turn_active: false,
                 plan_shimmer_phase: None,
                 plan_effort: None,
                 editor: &editor,
@@ -7661,7 +7660,7 @@ mod tests {
 
         assert_eq!(
             state.view().overlay.expect("status line picker").lines[0].text,
-            "☐ Model"
+            format!("{} Model", crate::state::UNCHECKED_BOX)
         );
     }
 

@@ -3619,6 +3619,10 @@ pub struct AppState {
     /// the prompt that preceded it. The last clone also receives the completed
     /// duration and replaces its already-rendered transcript block.
     turn_prompts: Vec<Block>,
+    /// Every user-authored boundary inside the active provider turn. Besides
+    /// submitted prompts and steers, this includes answers to blocking questions
+    /// so response grouping cannot move later provider output above that answer.
+    turn_response_boundaries: Vec<Block>,
     /// User prompt cards withdrawn by an interrupt before assistant text began.
     /// The renderer may already own them, so their ids cross the state boundary
     /// once and trigger a transcript rebuild.
@@ -3880,6 +3884,7 @@ impl AppState {
             turn_file_change_anchor: None,
             turn_response_blocks: Vec::new(),
             turn_prompts: Vec::new(),
+            turn_response_boundaries: Vec::new(),
             discarded_prompt_ids: Vec::new(),
             response_grouped: false,
             response_collapse: None,
@@ -5593,6 +5598,7 @@ impl AppState {
         self.reset_turn_item_tracking();
         let prompt = Block::new(BlockKind::User, self.selected_model_name(), text);
         self.turn_prompts.push(prompt.clone());
+        self.turn_response_boundaries.push(prompt.clone());
         self.committed.push(prompt);
         self.busy = true;
     }
@@ -5799,6 +5805,7 @@ impl AppState {
         self.turn_file_change_anchor = None;
         self.turn_response_blocks.clear();
         self.turn_prompts.clear();
+        self.turn_response_boundaries.clear();
         self.response_grouped = false;
         self.response_collapse = None;
     }
@@ -5843,7 +5850,7 @@ impl AppState {
         if progress.is_empty() {
             return;
         }
-        let groups = progress_groups_for_prompts(progress, &self.turn_prompts);
+        let groups = progress_groups_for_prompts(progress, &self.turn_response_boundaries);
         let Some(last_group) = groups.last() else {
             return;
         };
@@ -5877,8 +5884,10 @@ impl AppState {
         }
 
         self.response_grouped = true;
-        self.committed
-            .extend(progress_groups_for_prompts(progress, &self.turn_prompts));
+        self.committed.extend(progress_groups_for_prompts(
+            progress,
+            &self.turn_response_boundaries,
+        ));
     }
 
     /// Returns an interrupt the user requested while `turn/start` was still
@@ -5941,6 +5950,8 @@ impl AppState {
             .map(|prompt| prompt.id())
             .collect::<HashSet<_>>();
         self.committed.retain(|block| !ids.contains(&block.id()));
+        self.turn_response_boundaries
+            .retain(|block| !ids.contains(&block.id()));
         self.discarded_prompt_ids.extend(ids);
     }
 
@@ -6308,7 +6319,6 @@ impl AppState {
             fold_progress_groups: self.vibe_mode == VibeMode::SuperVibe
                 && self.response_display_mode == ResponseDisplayMode::Completed,
             plan_active: self.plan_is_active(),
-            turn_active: self.busy,
             plan_shimmer_phase: self.plan_shimmer_phase(),
             plan_effort: self
                 .active_turn_effort
@@ -8524,6 +8534,7 @@ impl AppState {
         }
         let prompt = Block::new(BlockKind::User, self.selected_model_name(), display);
         self.turn_prompts.push(prompt.clone());
+        self.turn_response_boundaries.push(prompt.clone());
         self.committed.push(prompt);
         if steering {
             Action::Steer(text)
@@ -10943,9 +10954,9 @@ impl AppState {
                         text: format!(
                             "{} {}",
                             if self.status_line_settings.enabled(*field) {
-                                '☑'
+                                CHECKED_BOX
                             } else {
-                                '☐'
+                                UNCHECKED_BOX
                             },
                             field.label()
                         ),
@@ -11485,9 +11496,9 @@ impl AppState {
                             format!(
                                 "{} {}",
                                 if answer_picked(answers, &question.id, &option.label) {
-                                    QUESTION_ANSWERED_MARK
+                                    CHECKED_BOX
                                 } else {
-                                    QUESTION_PENDING_MARK
+                                    UNCHECKED_BOX
                                 },
                                 option.label
                             )
@@ -13472,9 +13483,9 @@ fn question_tabs(
                 question.header.clone()
             };
             let mark = if answers.contains_key(&question.id) {
-                QUESTION_ANSWERED_MARK
+                CHECKED_BOX
             } else {
-                QUESTION_PENDING_MARK
+                UNCHECKED_BOX
             };
             if index == current {
                 format!("{QUESTION_TAB_CURSOR} {mark} {header}")
@@ -13552,9 +13563,9 @@ fn commit_user_input_answers(
     // 모델 이름을 넣는다. "You"로 두면 렌더러가 모델을 못 알아보고 기본 강조색으로
     // 떨어진다.
     let title = state.selected_model_name().to_owned();
-    state
-        .committed
-        .push(Block::new(BlockKind::User, title, body));
+    let answer = Block::new(BlockKind::User, title, body);
+    state.turn_response_boundaries.push(answer.clone());
+    state.committed.push(answer);
 }
 
 /// `(권장)`은 고르기 전에만 쓸모 있는 안내라, 확정된 답변 기록에서는 떼어 낸다.
@@ -13576,13 +13587,13 @@ fn strip_recommendation_mark(answer: &str) -> &str {
 /// 갈라 지금 있는 단계만 강조하므로 양쪽이 같은 문자열을 써야 한다.
 pub const QUESTION_TAB_SEPARATOR: &str = " \u{00b7} ";
 
-/// 답을 마친 단계와 켠 선택지 앞에 붙는 상자. 완료 계획이 쓰는 체크와 같은
-/// 글자를 담아 끝난 것은 어디서나 같은 모양으로 읽힌다. 렌더러도 이 글자로
-/// 어느 줄을 강조할지 가른다.
-pub const QUESTION_ANSWERED_MARK: &str = "[\u{2714}]";
-/// 아직 답하지 않은 단계와 꺼진 선택지 앞에 붙는 빈 상자. 켠 상자와 자리가
-/// 어긋나지 않도록 안쪽을 공백 한 칸으로 두어 너비를 맞춘다.
-pub const QUESTION_PENDING_MARK: &str = "[ ]";
+/// 켠 줄 앞에 붙는 상자. 답을 마친 단계, 고른 선택지, 켜 둔 상태줄 항목이
+/// 모두 이 상자를 쓰고, 완료 계획과 같은 체크를 담아 끝난 것은 어디서나 같은
+/// 모양으로 읽힌다. 렌더러도 이 글자로 어느 줄을 강조할지 가른다.
+pub const CHECKED_BOX: &str = "[\u{2714}]";
+/// 아직 켜지 않은 줄 앞에 붙는 빈 상자. 켠 상자와 자리가 어긋나지 않도록
+/// 안쪽을 공백 한 칸으로 두어 너비를 맞춘다.
+pub const UNCHECKED_BOX: &str = "[ ]";
 
 /// 지금 있는 단계 앞에 붙는 마커. 상자가 대괄호를 쓰게 되면서 단계를 다시
 /// 대괄호로 감쌀 수 없으니, 선택지 목록과 같은 마커로 어디에 와 있는지 짚는다.
@@ -15855,9 +15866,9 @@ mod tests {
         let overlay = state.overlay_view().expect("둘째 질문이 다시 열려야 한다");
         assert!(overlay.title.contains("2/3"));
         assert!(
-            overlay.lines[0].text.contains(&format!(
-                "{QUESTION_TAB_CURSOR} {QUESTION_ANSWERED_MARK} Q2"
-            )),
+            overlay.lines[0]
+                .text
+                .contains(&format!("{QUESTION_TAB_CURSOR} {CHECKED_BOX} Q2")),
             "탭 줄이 지금 질문을 짚어야 한다"
         );
         assert!(
@@ -15987,12 +15998,12 @@ mod tests {
         state.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
         let overlay = state.overlay_view().expect("overlay");
         assert!(
-            overlay.lines[1].text.starts_with(QUESTION_ANSWERED_MARK),
+            overlay.lines[1].text.starts_with(CHECKED_BOX),
             "켠 줄이 표시되지 않았다: {}",
             overlay.lines[1].text
         );
         assert!(
-            overlay.lines[2].text.starts_with(QUESTION_PENDING_MARK),
+            overlay.lines[2].text.starts_with(UNCHECKED_BOX),
             "켜지 않은 줄이 켜진 것처럼 보인다: {}",
             overlay.lines[2].text
         );
@@ -16015,8 +16026,8 @@ mod tests {
     #[test]
     fn a_checked_box_takes_the_same_columns_as_an_empty_one() {
         assert_eq!(
-            UnicodeWidthStr::width(QUESTION_ANSWERED_MARK),
-            UnicodeWidthStr::width(QUESTION_PENDING_MARK)
+            UnicodeWidthStr::width(CHECKED_BOX),
+            UnicodeWidthStr::width(UNCHECKED_BOX)
         );
     }
 
@@ -17647,7 +17658,7 @@ mod tests {
         assert_eq!(
             state.subagent_logs[child]
                 .iter()
-                .map(|line| line.text.as_str())
+                .map(|line| line.text.clone())
                 .collect::<Vec<_>>(),
             ["⏺ $ rg auth src", "인증 흐름을 찾았습니다."]
         );
@@ -19031,11 +19042,11 @@ mod tests {
                 .map(|line| line.text.as_str())
                 .collect::<Vec<_>>(),
             [
-                "☑ Model",
-                "☑ Effort",
-                "☑ Context",
-                "☑ 5h limit",
-                "☑ Weekly limit",
+                format!("{CHECKED_BOX} Model"),
+                format!("{CHECKED_BOX} Effort"),
+                format!("{CHECKED_BOX} Context"),
+                format!("{CHECKED_BOX} 5h limit"),
+                format!("{CHECKED_BOX} Weekly limit"),
             ]
         );
         assert!(overlay.lines[0].selected);
@@ -19043,13 +19054,13 @@ mod tests {
         state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
 
         let overlay = state.overlay_view().expect("status line picker stays open");
-        assert_eq!(overlay.lines[0].text, "☐ Model");
+        assert_eq!(overlay.lines[0].text, format!("{UNCHECKED_BOX} Model"));
         assert_eq!(state.status_line().model, None);
 
         state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         let overlay = state.overlay_view().expect("status line picker stays open");
-        assert_eq!(overlay.lines[1].text, "☐ Effort");
+        assert_eq!(overlay.lines[1].text, format!("{UNCHECKED_BOX} Effort"));
         assert_eq!(state.status_line().effort, None);
 
         state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -19071,7 +19082,7 @@ mod tests {
             }
         ));
         let overlay = state.overlay_view().expect("status line picker stays open");
-        assert_eq!(overlay.lines[1].text, "☐ Effort");
+        assert_eq!(overlay.lines[1].text, format!("{UNCHECKED_BOX} Effort"));
         assert!(overlay.lines[1].selected);
     }
 
@@ -20509,6 +20520,190 @@ mod tests {
         assert_eq!(groups[1].title, "+2 Response");
         assert_eq!(groups[1].children()[0].body, "추가 요청 확인");
         assert_eq!(groups[1].children()[1].body, "추가 요청 수정");
+    }
+
+    #[test]
+    fn question_answer_splits_progress_history_before_turn_completion() {
+        let mut state = test_state();
+        while state.vibe_mode() != VibeMode::SuperVibe {
+            state.cycle_vibe_mode();
+        }
+        state.set_response_display_mode(ResponseDisplayMode::All);
+        assert!(matches!(
+            state.submit_text("첫 요청".to_owned(), "첫 요청".to_owned()),
+            Action::Submit(_)
+        ));
+        state.drain_committed();
+        state.set_turn_started("turn-1".to_owned());
+
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "item": {
+                    "id": "before-question",
+                    "type": "agentMessage",
+                    "phase": "commentary",
+                    "text": "질문 전 응답"
+                }
+            }),
+        );
+        state.drain_committed();
+
+        state.begin_server_request(
+            json!(1),
+            "item/tool/requestUserInput",
+            &json!({
+                "questions": [{
+                    "id": "q1",
+                    "question": "어떤 방식으로 할까요?",
+                    "options": [{ "label": "첫 방식", "description": "설명" }]
+                }]
+            }),
+        );
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::RpcResponse { .. }
+        ));
+        let answer = state
+            .drain_committed()
+            .into_iter()
+            .find(|block| matches!(block.kind, BlockKind::User))
+            .expect("질문 답변 기록");
+
+        for (id, phase, text) in [
+            ("after-question", "commentary", "질문 뒤 응답"),
+            ("final", "final_answer", "최종 답변"),
+        ] {
+            state.handle_notification(
+                "item/completed",
+                &json!({
+                    "item": { "id": id, "type": "agentMessage", "phase": phase, "text": text }
+                }),
+            );
+            state.drain_committed();
+        }
+
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "status": "completed" } }),
+        );
+        let groups = state
+            .drain_committed()
+            .into_iter()
+            .filter(|block| matches!(block.kind, BlockKind::ProgressGroup))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            groups.len(),
+            2,
+            "질문 답변 양쪽 응답은 한 묶음이 될 수 없다"
+        );
+        assert_eq!(groups[0].children()[0].body, "질문 전 응답");
+        assert_eq!(groups[1].children()[0].body, "질문 뒤 응답");
+        assert!(groups[0].id() < answer.id());
+        assert!(groups[1].id() > answer.id());
+    }
+
+    #[test]
+    fn completed_mode_keeps_question_answer_between_incremental_response_groups() {
+        let mut state = test_state();
+        while state.vibe_mode() != VibeMode::SuperVibe {
+            state.cycle_vibe_mode();
+        }
+        state.set_response_display_mode(ResponseDisplayMode::Completed);
+        assert!(matches!(
+            state.submit_text("첫 요청".to_owned(), "첫 요청".to_owned()),
+            Action::Submit(_)
+        ));
+        state.drain_committed();
+        state.set_turn_started("turn-1".to_owned());
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "item": {
+                    "id": "before-question",
+                    "type": "agentMessage",
+                    "phase": "commentary",
+                    "text": "질문 전 응답"
+                }
+            }),
+        );
+        state.drain_committed();
+
+        state.begin_server_request(
+            json!(1),
+            "item/tool/requestUserInput",
+            &json!({
+                "questions": [{
+                    "id": "q1",
+                    "question": "어떤 방식으로 할까요?",
+                    "options": [{ "label": "첫 방식", "description": "설명" }]
+                }]
+            }),
+        );
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::RpcResponse { .. }
+        ));
+        let answer = state
+            .drain_committed()
+            .into_iter()
+            .find(|block| matches!(block.kind, BlockKind::User))
+            .expect("질문 답변 기록");
+
+        state.handle_notification(
+            "item/started",
+            &json!({
+                "item": {
+                    "id": "after-question",
+                    "type": "agentMessage",
+                    "phase": "commentary",
+                    "text": ""
+                }
+            }),
+        );
+        let first_group = state
+            .drain_committed()
+            .into_iter()
+            .find(|block| matches!(block.kind, BlockKind::ProgressGroup))
+            .expect("질문 전 응답 묶음");
+        assert!(first_group.id() < answer.id());
+
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "item": {
+                    "id": "after-question",
+                    "type": "agentMessage",
+                    "phase": "commentary",
+                    "text": "질문 뒤 응답"
+                }
+            }),
+        );
+        state.drain_committed();
+        state.handle_notification(
+            "item/started",
+            &json!({
+                "item": {
+                    "id": "final",
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": ""
+                }
+            }),
+        );
+        let groups = state
+            .drain_committed()
+            .into_iter()
+            .filter(|block| matches!(block.kind, BlockKind::ProgressGroup))
+            .collect::<Vec<_>>();
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].children()[0].body, "질문 전 응답");
+        assert_eq!(groups[1].children()[0].body, "질문 뒤 응답");
+        assert_eq!(groups[0].id(), first_group.id());
+        assert!(groups[0].id() < answer.id());
+        assert!(groups[1].id() > answer.id());
     }
 
     #[test]

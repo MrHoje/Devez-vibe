@@ -35,8 +35,7 @@ use crate::{
         selected_char_count, selection_chunks,
     },
     state::{
-        DiffDisplayMode, QUESTION_ANSWERED_MARK, QUESTION_TAB_CURSOR, QUESTION_TAB_SEPARATOR,
-        ShellDisplayMode,
+        CHECKED_BOX, DiffDisplayMode, QUESTION_TAB_CURSOR, QUESTION_TAB_SEPARATOR, ShellDisplayMode,
     },
     syntax::{self, SyntaxKind},
     theme::{self, Rgb, ThemeKind},
@@ -536,9 +535,6 @@ pub struct View<'a> {
     pub fold_progress_groups: bool,
     /// Whether the current turn is still active, so an in-progress plan row may animate.
     pub plan_active: bool,
-    /// Whether the provider turn is still open. Question-close viewport anchors
-    /// live only for that turn and release when it ends.
-    pub turn_active: bool,
     /// A one-shot frame shimmer started by a plan creation or update.
     pub plan_shimmer_phase: Option<f32>,
     /// The effort fixed when the active request started, used for plan shimmer.
@@ -693,11 +689,6 @@ pub struct Renderer {
     /// Transcript start held for the render immediately after a prompt-hosted
     /// History toggle, keeping that prompt on the pointer's screen row.
     history_view_start_anchor: Option<usize>,
-    /// A blocking question is part of the live dock. When it closes, keep the
-    /// transcript allocation it occupied plus the newly committed answer rows,
-    /// so the provider's continuation fills the vacated space below the answer.
-    question_view_rows_anchor: Option<usize>,
-    question_overlay_open: bool,
     theme: ThemeKind,
     history: Vec<Block>,
     /// Transcript owned by the lower `/btw` pane while split view is open.
@@ -1373,8 +1364,6 @@ impl Renderer {
             last_transcript_screen_start: 0,
             history_view_rows_anchor: None,
             history_view_start_anchor: None,
-            question_view_rows_anchor: None,
-            question_overlay_open: false,
             theme: selected_theme,
             history: Vec::new(),
             split_history: Vec::new(),
@@ -1506,7 +1495,6 @@ impl Renderer {
         self.live_frame_cache = None;
         self.history_view_rows_anchor = None;
         self.history_view_start_anchor = None;
-        self.question_view_rows_anchor = None;
         if self.mode == RenderMode::Inline {
             self.relayout()?;
         }
@@ -1534,7 +1522,6 @@ impl Renderer {
         if moved {
             self.history_view_rows_anchor = None;
             self.history_view_start_anchor = None;
-            self.question_view_rows_anchor = None;
         }
         let preserve_drag = self.selection_in_transcript && self.selection.is_dragging();
         let cleared = !preserve_drag && self.clear_selection();
@@ -1581,8 +1568,7 @@ impl Renderer {
             let cleared = moved && self.clear_selection();
             return moved || cleared;
         }
-        let anchored = self.question_view_rows_anchor.take().is_some();
-        if self.scroll_back == 0 && !anchored {
+        if self.scroll_back == 0 {
             return false;
         }
         self.scroll_back = 0;
@@ -1627,7 +1613,6 @@ impl Renderer {
         if moved {
             self.history_view_rows_anchor = None;
             self.history_view_start_anchor = None;
-            self.question_view_rows_anchor = None;
             self.clear_selection();
         }
         moved
@@ -1638,14 +1623,6 @@ impl Renderer {
             .values()
             .copied()
             .fold(self.wrapped.len(), usize::saturating_add)
-    }
-
-    fn observe_question_overlay(&mut self, style: Option<OverlayStyle>) -> Option<usize> {
-        let open = style == Some(OverlayStyle::Question);
-        let closed_from =
-            (self.question_overlay_open && !open).then_some(self.last_transcript_rows);
-        self.question_overlay_open = open;
-        closed_from
     }
 
     fn scroll_to_bottom_control(&self, width: u16) -> Option<PaintLine> {
@@ -1719,8 +1696,6 @@ impl Renderer {
         self.last_transcript_rows = 0;
         self.history_view_rows_anchor = None;
         self.history_view_start_anchor = None;
-        self.question_view_rows_anchor = None;
-        self.question_overlay_open = false;
         self.apply_terminal_theme()?;
         self.reset_screen()
     }
@@ -1780,7 +1755,6 @@ impl Renderer {
             .map(Block::id);
         let expanding_latest_prompt_history =
             expanding && hosted_prompt.is_some() && hosted_prompt == latest_prompt;
-        self.question_view_rows_anchor = None;
         self.history_view_rows_anchor =
             (history_toggle && !hosted_history_toggle && self.scroll_back == 0)
                 .then_some(self.last_transcript_rows);
@@ -2506,8 +2480,6 @@ impl Renderer {
     pub fn render(&mut self, committed: &[Block], view: View<'_>) -> Result<()> {
         self.split_active = false;
         set_chat_layout(view.chat_layout);
-        let question_closed_from =
-            self.observe_question_overlay(view.overlay.as_ref().map(|overlay| overlay.style));
         let response_collapse_changed = self.update_response_collapse(view.response_collapse);
         let committed_without_startup = view.plan_summary.is_some().then(|| {
             committed
@@ -2529,7 +2501,6 @@ impl Renderer {
             self.wrapped_width = 0;
             self.history_view_rows_anchor = None;
             self.history_view_start_anchor = None;
-            self.question_view_rows_anchor = None;
         }
         let startup_update_removed =
             view.plan_summary.is_some() && self.remove_startup_update_from_history();
@@ -2544,7 +2515,6 @@ impl Renderer {
         if total_width != self.last_total_width || height != self.last_height {
             self.history_view_rows_anchor = None;
             self.history_view_start_anchor = None;
-            self.question_view_rows_anchor = None;
         }
         // The panel is docked, not overlaid: every conversation row is laid out
         // against the narrowed main width so nothing runs under the panel.
@@ -2563,9 +2533,6 @@ impl Renderer {
             self.side_panel = side_panel;
         }
         let width = side_panel.map_or(total_width, |layout| layout.main_width as u16);
-        if self.last_width != 0 && width != self.last_width {
-            self.question_view_rows_anchor = None;
-        }
         if width != self.last_width {
             queue!(self.out, Print(devez_layout_signal(width)))?;
         }
@@ -2633,9 +2600,7 @@ impl Renderer {
                 view.plan_active,
                 view.plan_shimmer_phase,
                 view.plan_effort,
-                view.turn_active,
                 view.waiting_for_response,
-                question_closed_from,
                 &view.subagents,
                 &view.cwd,
                 view.side_panel_prompts_expanded,
@@ -3093,9 +3058,7 @@ impl Renderer {
         plan_active: bool,
         plan_shimmer_phase: Option<f32>,
         plan_effort: Option<&str>,
-        turn_active: bool,
         waiting_for_response: bool,
-        question_closed_from: Option<usize>,
         subagents: &[SubagentView],
         cwd: &str,
         side_panel_prompts_expanded: bool,
@@ -3124,15 +3087,11 @@ impl Renderer {
             .unwrap_or_default();
         let plan_rows = plan_lines.len().min(rows.saturating_sub(1));
         let content_rows = rows.saturating_sub(plan_rows).max(1);
-        if !turn_active {
-            self.question_view_rows_anchor = None;
-        }
         if !committed.is_empty() && self.response_collapse.is_none() {
             self.history_view_rows_anchor = None;
             self.history_view_start_anchor = None;
         }
         let old_view_rows = split_rows(content_rows, frame.lines.len(), self.wrapped.len()).0;
-        let transcript_rows_before = self.wrapped.len();
         let already_visible = self.fullscreen_stream_rows.clone();
         self.commit_fullscreen_blocks_with_visible(
             committed,
@@ -3152,18 +3111,9 @@ impl Renderer {
             self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
         }
         self.fullscreen_stream_rows = streamed_rows;
-        if let Some(previous_view_rows) = question_closed_from {
-            self.question_view_rows_anchor = Some(question_close_view_rows(
-                previous_view_rows,
-                transcript_rows_before,
-                self.wrapped.len(),
-            ));
-        }
         let mut display_wrapped = self.wrapped.clone();
         display_wrapped.extend(streamed_lines);
-        let anchored_view_rows = self
-            .question_view_rows_anchor
-            .or(self.history_view_rows_anchor);
+        let anchored_view_rows = self.history_view_rows_anchor;
         let live_rows_after_absorb = frame.lines.len().saturating_sub(1);
         if display_wrapped
             .last()
@@ -3842,17 +3792,6 @@ fn split_rows(rows: usize, live_natural: usize, transcript_len: usize) -> (usize
     // `fit_frame` trims the frame's oldest rows to make it fit.
     let view_rows = transcript_len.min(rows.saturating_sub(live_natural));
     (view_rows, rows - view_rows)
-}
-
-/// Preserve the transcript's top row when a docked question becomes committed
-/// answer history. The new answer rows replace part of the question panel; the
-/// provider's continuation can then grow underneath without moving history.
-fn question_close_view_rows(
-    previous_view_rows: usize,
-    transcript_rows_before: usize,
-    transcript_rows_after: usize,
-) -> usize {
-    previous_view_rows.saturating_add(transcript_rows_after.saturating_sub(transcript_rows_before))
 }
 
 /// A History disclosure changes only which transcript rows are visible. Keep
@@ -6352,7 +6291,7 @@ fn question_tab_row(tabs: &str, width: usize) -> PaintLine {
             });
         }
         // 답을 마친 단계도 색을 얻고, 지금 있는 단계는 거기에 굵기까지 얻는다.
-        let answered = tab.contains(QUESTION_ANSWERED_MARK);
+        let answered = tab.contains(CHECKED_BOX);
         spans.push(PaintSpan {
             text: tab.to_owned(),
             tone: if current || answered {
@@ -6920,6 +6859,9 @@ fn overlay_frame_with_expansion(
                         Tone::Muted
                     } else if part.contains('●') && part.contains('○') {
                         Tone::Accent
+                    } else if part.starts_with(CHECKED_BOX) {
+                        // 켜 둔 항목은 커서가 떠나도 색을 지킨다.
+                        Tone::Accent
                     } else {
                         model_tone(part).unwrap_or(Tone::Plain)
                     };
@@ -7208,7 +7150,7 @@ fn overlay_frame_with_expansion(
                     // 목록 전체에서 한눈에 남는다.
                     let tone = if part_index > 0 || row.muted {
                         Tone::Muted
-                    } else if row.selected || part.starts_with(QUESTION_ANSWERED_MARK) {
+                    } else if row.selected || part.starts_with(CHECKED_BOX) {
                         Tone::Accent
                     } else {
                         Tone::Plain
@@ -12323,7 +12265,6 @@ mod tests {
             fold_progress_groups: false,
             cwd: String::new(),
             plan_active: false,
-            turn_active: false,
             plan_shimmer_phase: None,
             plan_effort: None,
             editor,
@@ -17233,46 +17174,32 @@ mod tests {
     }
 
     #[test]
-    fn closing_a_question_keeps_the_transcript_still_while_the_reply_starts() {
-        let rows = 24;
-        let transcript_before = 30;
-        let question_rows = 12;
-        let answer_rows = 3;
-        let previous_view_rows = split_rows(rows, question_rows, transcript_before).0;
-        let previous_start = transcript_before - previous_view_rows;
-        let anchored_view_rows = question_close_view_rows(
-            previous_view_rows,
-            transcript_before,
-            transcript_before + answer_rows,
-        );
+    fn closing_a_question_returns_the_answer_to_the_normal_activity_gap() {
+        for (rows, natural_live_rows) in [(24, 3), (32, 6), (40, 10)] {
+            let mut transcript = text_rows(60, "history");
+            transcript.push(PaintLine::plain("question answer"));
+            transcript.push(PaintLine::blank());
+            let mut live = vec![PaintLine::plain("Working")];
+            live.extend(text_rows(natural_live_rows - 1, "dock"));
+            let (view_rows, live_rows) = split_rows(rows, live.len(), transcript.len());
+            let start = transcript.len() - view_rows;
+            let (screen, _) = compose_screen(&transcript, live, view_rows, start, 0);
+            let answer_row = screen
+                .iter()
+                .position(|line| line.text == "question answer")
+                .expect("question answer row");
+            let activity_row = screen
+                .iter()
+                .position(|line| line.text == "Working")
+                .expect("activity row");
 
-        for followup_rows in [4, 6, 8] {
-            let (view_rows, _) = split_rows_with_transcript_anchor(
-                rows,
-                followup_rows,
-                transcript_before + answer_rows,
-                Some(anchored_view_rows),
+            assert_eq!(live_rows, natural_live_rows);
+            assert_eq!(
+                activity_row - answer_row,
+                2,
+                "답변 아래에는 빈 줄 하나만 둔다"
             );
-            let start = transcript_before + answer_rows - view_rows;
-            assert_eq!(start, previous_start);
         }
-    }
-
-    #[test]
-    fn only_a_question_to_conversation_transition_creates_the_anchor() {
-        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
-        renderer.last_transcript_rows = 7;
-
-        assert_eq!(
-            renderer.observe_question_overlay(Some(OverlayStyle::Picker)),
-            None
-        );
-        assert_eq!(
-            renderer.observe_question_overlay(Some(OverlayStyle::Question)),
-            None
-        );
-        assert_eq!(renderer.observe_question_overlay(None), Some(7));
-        assert_eq!(renderer.observe_question_overlay(None), None);
     }
 
     #[test]
@@ -19063,15 +18990,6 @@ mod tests {
         assert_eq!(renderer.history.len(), 1);
         assert_eq!(renderer.history[0].id(), kept.id());
         assert_eq!(renderer.wrapped_width, 0);
-    }
-
-    #[test]
-    fn fullscreen_scroll_to_bottom_releases_a_question_anchor() {
-        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
-        renderer.question_view_rows_anchor = Some(8);
-
-        assert!(renderer.scroll_to_bottom());
-        assert_eq!(renderer.question_view_rows_anchor, None);
     }
 
     #[test]
