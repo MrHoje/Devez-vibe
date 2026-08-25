@@ -4229,7 +4229,7 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- `⟦`와 `⟧`는 이 진행 문구에만 쓰고 답변 본문, 코드, 명령어 안에는 쓰지 않는다.\n",
 );
 
-const CLAUDE_TURN_REMINDER: &str = "최종 답변은 불릿 2~3개, 전체 200자 내외로 쓰고 불릿 하나에 두 문장을 넘기지 않는다. 필요한 경우가 아니면 영어로 응답하지 않으며, 도구 호출 앞뒤 text도 첫 글자가 한글이어야 하고 영어 문장으로 시작하거나 영어 판정 뒤 한국어를 잇지 않는다. 클래스명·메서드명·변수명·파일 경로·코드 조각은 사용자 판단에 꼭 필요할 때만 최소로 쓴다.";
+const CLAUDE_TURN_REMINDER: &str = "최종 답변은 불릿 2~3개, 전체 200자 내외로 쓰고 불릿 하나에 두 문장을 넘기지 않는다. 필요한 경우가 아니면 영어로 응답하지 않으며, 도구 호출 앞뒤 text도 첫 글자가 한글이어야 하고 영어 문장으로 시작하거나 영어 판정 뒤 한국어를 잇지 않는다. 클래스명·메서드명·변수명·파일 경로·코드 조각은 사용자 판단에 꼭 필요할 때만 최소로 쓴다. 도구를 부르기 직전마다 무엇을 하는지 20자 내외 한국어 구를 `⟦…⟧` 한 줄로 먼저 낸다. 예: `⟦파일 목록 확인 중⟧`.";
 
 /// The Claude selections a session has to be told, because the bridge opens a
 /// fresh SDK session for every start and resume. Anything left out here comes

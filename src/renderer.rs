@@ -710,10 +710,6 @@ pub struct Renderer {
     /// Rows the transcript is held back from its newest end. Zero follows the
     /// live output. Fullscreen only: inline scrolling belongs to the terminal.
     scroll_back: usize,
-    /// Once a reader explicitly returns from history to the newest completed
-    /// output, collapse any visually blank transcript tail into the two rows
-    /// already reserved above activity. Live streaming keeps its phased spacing.
-    compact_bottom_gap: bool,
     /// The transcript already wrapped for `wrapped_width`. Fullscreen repaints
     /// the whole screen every keystroke, and re-wrapping the transcript each
     /// time would make typing cost O(transcript).
@@ -1300,7 +1296,22 @@ fn append_compact_open_code_response(
     }
     let start = transcript.len();
     transcript.extend(lines);
+    if matches!(block.kind, BlockKind::Assistant) {
+        trim_trailing_visual_blank_rows(transcript, 1);
+    }
     start..transcript.len()
+}
+
+/// 완료된 응답은 문단 종료 줄과 블록 구분 줄이 겹쳐도 다음 UI 요소 앞에 시각적
+/// 빈 줄을 하나만 남긴다. 활성 스트림은 이 경로를 거치지 않아 문단 성장 간격을
+/// 그대로 유지한다.
+fn trim_trailing_visual_blank_rows(lines: &mut Vec<PaintLine>, keep: usize) {
+    let trailing = lines
+        .iter()
+        .rev()
+        .take_while(|line| painted_line_text(line).trim().is_empty())
+        .count();
+    lines.truncate(lines.len().saturating_sub(trailing.saturating_sub(keep)));
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1369,7 +1380,6 @@ impl Renderer {
             split_btw_view_rows: 0,
             split_selection_focus: None,
             scroll_back: 0,
-            compact_bottom_gap: false,
             wrapped: Vec::new(),
             fullscreen_display_lines: Vec::new(),
             wrapped_width: 0,
@@ -1506,7 +1516,6 @@ impl Renderer {
         if self.split_active {
             return self.scroll_split_pane(self.split_focus, delta);
         }
-        let was_scrolled = self.scroll_back > 0;
         let target = self
             .scroll_back
             .saturating_add_signed(delta)
@@ -1514,7 +1523,6 @@ impl Renderer {
         let moved = target != self.scroll_back;
         self.scroll_back = target;
         if moved {
-            self.compact_bottom_gap = was_scrolled && target == 0;
             self.history_view_rows_anchor = None;
             self.history_view_start_anchor = None;
             self.question_view_rows_anchor = None;
@@ -1555,7 +1563,6 @@ impl Renderer {
             return false;
         }
         if self.split_active {
-            self.compact_bottom_gap = false;
             let scroll_back = match self.split_focus {
                 SplitFocus::Main => &mut self.split_main_scroll_back,
                 SplitFocus::Btw => &mut self.split_btw_scroll_back,
@@ -1570,7 +1577,6 @@ impl Renderer {
             return false;
         }
         self.scroll_back = 0;
-        self.compact_bottom_gap = true;
         self.history_view_rows_anchor = None;
         self.history_view_start_anchor = None;
         self.clear_selection();
@@ -1682,7 +1688,6 @@ impl Renderer {
         self.wrapped.clear();
         self.wrapped_width = 0;
         self.scroll_back = 0;
-        self.compact_bottom_gap = false;
         self.expanded_tools.clear();
         self.response_collapse = None;
         self.progress_group_rows.clear();
@@ -1722,7 +1727,6 @@ impl Renderer {
         self.split_btw_max_scroll = 0;
         self.split_btw_view_rows = 0;
         self.split_selection_focus = None;
-        self.compact_bottom_gap = false;
         self.previous_lines.clear();
         self.painted_frame = None;
         self.wrapped_width = 0;
@@ -3131,7 +3135,6 @@ impl Renderer {
             .filter(|(id, _)| !committed_ids.contains(id))
             .map(|(_, rows)| *rows)
             .sum::<usize>();
-        let stream_active = !streamed_rows.is_empty();
         let next_stream_rows = streamed_rows.values().copied().sum::<usize>();
         if self.scroll_back > 0 {
             let row_delta = next_stream_rows as isize - retained_stream_rows as isize;
@@ -3150,9 +3153,10 @@ impl Renderer {
         let anchored_view_rows = self
             .question_view_rows_anchor
             .or(self.history_view_rows_anchor);
-        let mut absorbed_spacers = 0;
         let live_rows_after_absorb = frame.lines.len().saturating_sub(1);
-        if display_wrapped.last() == Some(&PaintLine::blank())
+        if display_wrapped
+            .last()
+            .is_some_and(|line| painted_line_text(line).trim().is_empty())
             && trailing_transcript_spacer_will_be_visible(
                 content_rows,
                 live_rows_after_absorb,
@@ -3161,31 +3165,8 @@ impl Renderer {
                 self.scroll_back,
                 self.history_view_start_anchor,
             )
-            && frame.absorb_leading_spacer()
         {
-            absorbed_spacers = 1;
-        }
-        if self.compact_bottom_gap && !stream_active {
-            let trailing_spacers = display_wrapped
-                .iter()
-                .rev()
-                .take_while(|line| painted_line_text(line).trim().is_empty())
-                .count();
-            while absorbed_spacers < trailing_spacers {
-                let live_rows_after_absorb = frame.lines.len().saturating_sub(1);
-                if !trailing_transcript_spacer_will_be_visible(
-                    content_rows,
-                    live_rows_after_absorb,
-                    display_wrapped.len(),
-                    anchored_view_rows,
-                    self.scroll_back,
-                    self.history_view_start_anchor,
-                ) || !frame.absorb_leading_spacer()
-                {
-                    break;
-                }
-                absorbed_spacers += 1;
-            }
+            frame.absorb_leading_spacer();
         }
         let panel_content = self
             .side_panel
@@ -5386,7 +5367,7 @@ const PROGRESS_TRACK_COLUMNS: usize = 20;
 const PROGRESS_TRACK_MINIMUM: usize = 8;
 /// The rule the track is drawn with. The moving block reads as a brighter run of
 /// the same glyph, so the bar stays one continuous line rather than two shapes.
-const PROGRESS_TRACK_GLYPH: &str = "\u{2550}";
+const PROGRESS_TRACK_GLYPH: &str = "\u{25ac}";
 /// An indeterminate block enters from the left, crosses the track, and leaves
 /// through the right edge. Providers expose only start/end, so this communicates
 /// activity without pretending to know real progress.
@@ -6032,7 +6013,7 @@ fn normal_frame(
     )
 }
 
-const ACTIVITY_TOP_SPACER_ROWS: usize = 2;
+const ACTIVITY_TOP_SPACER_ROWS: usize = 1;
 
 fn reserve_activity_top_spacer(lines: &mut Vec<PaintLine>) {
     let existing = lines
@@ -6080,9 +6061,9 @@ fn normal_frame_with_expansion(
     // Transient rows stay in the pinned dock instead of scrolling away with the
     // conversation. Activity leads any command suggestions.
     if let Some(activity) = activity {
-        // Working and Completed share this reservation so changing state never
-        // shifts the transcript. The activity row itself occupies the separate
-        // composer spacer below these two rows.
+        // Working and Completed share one spacer. A completed transcript also
+        // normalizes its own trailing separator to one row, so session history,
+        // scrolling, and paragraph endings cannot add a second visible gap.
         reserve_activity_top_spacer(&mut lines);
         let mut activity_rows = activity_lines_with_progress(
             activity,
@@ -15918,9 +15899,9 @@ mod tests {
         );
     }
 
-    /// Working and settled activity both keep the same two rows above them.
+    /// Working and settled activity both keep the same single row above them.
     #[test]
-    fn settled_and_working_activity_keep_two_top_spacer_rows() {
+    fn settled_and_working_activity_keep_one_top_spacer_row() {
         set_chat_layout(false);
         let editor = Editor::default();
         let live = [Block::new(BlockKind::Assistant, "Codex", "응답")];
@@ -15955,10 +15936,9 @@ mod tests {
             if let Some(expected_tone) = expected_tone {
                 assert_eq!(frame.lines[activity].tone, expected_tone);
             }
-            assert!(activity >= 3);
+            assert!(activity >= 2);
             assert!(frame.lines[activity - 1] == PaintLine::blank());
-            assert!(frame.lines[activity - 2] == PaintLine::blank());
-            assert!(frame.lines[activity - 3] != PaintLine::blank());
+            assert!(frame.lines[activity - 2] != PaintLine::blank());
             assert!(painted(&frame.lines[activity + 1]).starts_with('╭'));
         }
     }
@@ -16926,7 +16906,6 @@ mod tests {
 
         assert!(activity > 0);
         assert!(frame.lines[activity - 1] == PaintLine::blank());
-        assert!(frame.lines[activity - 2] == PaintLine::blank());
         assert!(frame.lines[activity + 1] == PaintLine::blank());
         assert!(activity < suggestions);
     }
@@ -17396,10 +17375,11 @@ mod tests {
 
     #[test]
     fn a_prompt_after_an_answer_keeps_one_standalone_spacer_row() {
+        set_chat_layout(false);
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
         renderer.fold_progress_groups = true;
         renderer.wrapped_width = 80;
-        let answer = Block::new(BlockKind::Assistant, "Codex", "이전 답변");
+        let answer = Block::new(BlockKind::Assistant, "Codex", "이전 답변\n\n");
         let prompt = Block::new(BlockKind::User, "Codex", "다음 프롬프트");
         let progress = Block::progress_group(vec![Block::new(
             BlockKind::Assistant,
@@ -17422,11 +17402,25 @@ mod tests {
             .expect("prompt row");
         let standalone_spacers = renderer.wrapped[answer + 1..prompt]
             .iter()
-            .filter(|line| *line == &PaintLine::blank())
+            .filter(|line| painted_line_text(line).trim().is_empty())
             .count();
 
         assert_eq!(standalone_spacers, 1);
-        assert!(renderer.wrapped[prompt - 2] == PaintLine::blank());
+        assert_eq!(
+            prompt - answer,
+            3,
+            "답변 뒤에는 빈 줄 한 줄과 입력 상단 여백만 둔다: {:?}",
+            renderer
+                .wrapped
+                .iter()
+                .map(painted_line_text)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            painted_line_text(&renderer.wrapped[prompt - 2])
+                .trim()
+                .is_empty()
+        );
         assert_eq!(renderer.wrapped[prompt - 1].tone, Tone::UserPromptPadding);
         let incremental = renderer.wrapped.clone();
         renderer.rewrap(80);
@@ -17572,7 +17566,6 @@ mod tests {
             .filter(|(id, _)| !committed_ids.contains(id))
             .map(|(_, rows)| *rows)
             .sum::<usize>();
-        let stream_active = !streamed_rows.is_empty();
         let next_stream_rows = streamed_rows.values().copied().sum::<usize>();
         if renderer.scroll_back > 0 {
             let row_delta = next_stream_rows as isize - retained_stream_rows as isize;
@@ -17581,9 +17574,10 @@ mod tests {
         renderer.fullscreen_stream_rows = streamed_rows;
         let mut display_wrapped = renderer.wrapped.clone();
         display_wrapped.extend(streamed_lines);
-        let mut absorbed_spacers = 0;
         let live_rows_after_absorb = frame.lines.len().saturating_sub(1);
-        if display_wrapped.last() == Some(&PaintLine::blank())
+        if display_wrapped
+            .last()
+            .is_some_and(|line| painted_line_text(line).trim().is_empty())
             && trailing_transcript_spacer_will_be_visible(
                 rows,
                 live_rows_after_absorb,
@@ -17592,31 +17586,8 @@ mod tests {
                 renderer.scroll_back,
                 renderer.history_view_start_anchor,
             )
-            && frame.absorb_leading_spacer()
         {
-            absorbed_spacers = 1;
-        }
-        if renderer.compact_bottom_gap && !stream_active {
-            let trailing_spacers = display_wrapped
-                .iter()
-                .rev()
-                .take_while(|line| painted_line_text(line).trim().is_empty())
-                .count();
-            while absorbed_spacers < trailing_spacers {
-                let live_rows_after_absorb = frame.lines.len().saturating_sub(1);
-                if !trailing_transcript_spacer_will_be_visible(
-                    rows,
-                    live_rows_after_absorb,
-                    display_wrapped.len(),
-                    renderer.history_view_rows_anchor,
-                    renderer.scroll_back,
-                    renderer.history_view_start_anchor,
-                ) || !frame.absorb_leading_spacer()
-                {
-                    break;
-                }
-                absorbed_spacers += 1;
-            }
+            frame.absorb_leading_spacer();
         }
         let (view_rows, live_rows) = split_rows_with_transcript_anchor(
             rows,
@@ -18113,14 +18084,14 @@ mod tests {
             );
             assert_eq!(
                 answer_row(&screen),
-                closed_row,
-                "스트리밍이 끝날 때는 움직이지 않아야 합니다: rows={rows}, width={width}"
+                closed_row + 1,
+                "완료 시 중복 구분 줄만 접혀 한 행 아래로 정착해야 합니다: rows={rows}, width={width}"
             );
         }
     }
 
     #[test]
-    fn every_paragraph_prefix_keeps_its_rows_when_the_stream_becomes_history() {
+    fn every_paragraph_prefix_keeps_content_and_only_settles_downward_on_completion() {
         set_chat_layout(false);
         for (rows, width) in [(18, 60), (24, 80), (32, 120)] {
             for body in [
@@ -18172,20 +18143,39 @@ mod tests {
                     width,
                 );
                 let response_rows = |screen: &[PaintLine]| {
+                    let current_start = screen
+                        .iter()
+                        .position(|line| {
+                            painted_line_text(line).contains("스트리밍 중인 최종 답변입니다.")
+                        })
+                        .expect("현재 응답 첫 행");
                     screen
                         .iter()
                         .enumerate()
+                        .skip(current_start)
                         .filter(|(_, line)| {
-                            line.prefix == RESPONSE_BULLET_PREFIX || line.prefix == "  "
+                            (line.prefix == RESPONSE_BULLET_PREFIX || line.prefix == "  ")
+                                && !painted_line_text(line).trim().is_empty()
                         })
                         .map(|(row, line)| (row, painted_line_text(line)))
                         .collect::<Vec<_>>()
                 };
-
+                let live_rows = response_rows(&live);
+                let completed_rows = response_rows(&completed);
                 assert_eq!(
-                    response_rows(&completed),
-                    response_rows(&live),
+                    completed_rows
+                        .iter()
+                        .map(|(_, text)| text)
+                        .collect::<Vec<_>>(),
+                    live_rows.iter().map(|(_, text)| text).collect::<Vec<_>>(),
                     "rows={rows}, width={width}, body={body:?}"
+                );
+                assert!(
+                    completed_rows.iter().zip(&live_rows).all(
+                        |((completed_row, _), (live_row, _))| *completed_row == *live_row
+                            || *completed_row == *live_row + 1
+                    ),
+                    "완료 응답은 위로 되돌아가거나 두 행 이상 움직이면 안 됩니다: rows={rows}, width={width}, body={body:?}"
                 );
             }
         }
@@ -18551,7 +18541,7 @@ mod tests {
     }
 
     #[test]
-    fn two_rows_stay_above_activity_once_the_conversation_fills_the_screen() {
+    fn completed_activity_keeps_exactly_one_blank_row_at_every_geometry() {
         set_chat_layout(false);
         for (rows, width) in [(18, 60), (19, 60), (24, 80), (25, 80), (32, 120), (33, 120)] {
             let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
@@ -18623,10 +18613,9 @@ mod tests {
                 rows,
                 width,
             );
-            let streaming_row = assert_gap(&screen, 3);
+            let streaming_row = assert_gap(&screen, 2);
 
-            // Whitespace-only rows close the paragraph, so one of them stays and
-            // the reserved pair sits above the activity while streaming.
+            // 활성 스트림은 다음 문단이 한 행씩 자라도록 닫힌 문단 한 줄을 유지한다.
             answer.body.push_str("\n   \n\t\n\u{200b}");
             let screen = simulate_fullscreen_frame(
                 &mut renderer,
@@ -18637,7 +18626,7 @@ mod tests {
                 rows,
                 width,
             );
-            let closed_row = assert_gap(&screen, 4);
+            let closed_row = assert_gap(&screen, 3);
             assert_eq!(
                 streaming_row.saturating_sub(closed_row),
                 1,
@@ -18653,7 +18642,8 @@ mod tests {
                 rows,
                 width,
             );
-            assert_eq!(assert_gap(&screen, 4), closed_row);
+            let completed_row = assert_gap(&screen, 2);
+            assert_eq!(completed_row, closed_row + 1);
 
             renderer.scroll_back = 3;
             simulate_fullscreen_frame(
@@ -18675,7 +18665,7 @@ mod tests {
                 rows,
                 width,
             );
-            assert_eq!(assert_gap(&screen, 3), closed_row + 1);
+            assert_eq!(assert_gap(&screen, 2), completed_row);
         }
     }
 
@@ -18838,7 +18828,6 @@ mod tests {
 
         assert!(renderer.scroll(10));
         assert_eq!(renderer.scroll_back, 10);
-        assert!(!renderer.compact_bottom_gap);
         // Past the oldest row it clamps, and a wheel spun at the end is a no-op
         // so the caller can skip the repaint.
         assert!(renderer.scroll(100));
@@ -18846,7 +18835,6 @@ mod tests {
         assert!(!renderer.scroll(5));
         assert!(renderer.scroll(-100));
         assert_eq!(renderer.scroll_back, 0);
-        assert!(renderer.compact_bottom_gap);
         assert!(!renderer.scroll(-1));
     }
 
@@ -18969,7 +18957,6 @@ mod tests {
 
         assert!(renderer.scroll_to_bottom());
         assert_eq!(renderer.scroll_back, 0);
-        assert!(renderer.compact_bottom_gap);
     }
 
     #[test]
@@ -20293,15 +20280,15 @@ mod tests {
 
         assert_eq!(
             painted(&entering[0]),
-            " ⠹ Compacting.. ════════════════════ (4s)"
+            " ⠹ Compacting.. ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ (4s)"
         );
         assert_eq!(
             painted(&passing[0]),
-            " ⠴ Compacting.. ════════════════════ (4s)"
+            " ⠴ Compacting.. ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ (4s)"
         );
         assert_eq!(
             painted(&leaving[0]),
-            " ⠏ Compacting.. ════════════════════ (4s)"
+            " ⠏ Compacting.. ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ (4s)"
         );
         // The track paints one continuous rule, so the travelling run shows up as
         // the bright stretch inside it rather than a different glyph.
@@ -20321,7 +20308,7 @@ mod tests {
 
         assert_eq!(
             painted(&line[0]),
-            " ⠋ Compacting.. ════════════════════ (4s)"
+            " ⠋ Compacting.. ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ (4s)"
         );
         assert_eq!(lit_track_offset(&line[0]), Some(8));
     }
