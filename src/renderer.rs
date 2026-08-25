@@ -1309,9 +1309,13 @@ fn trim_trailing_visual_blank_rows(lines: &mut Vec<PaintLine>, keep: usize) {
     let trailing = lines
         .iter()
         .rev()
-        .take_while(|line| painted_line_text(line).trim().is_empty())
+        .take_while(|line| paint_line_is_visually_blank(line))
         .count();
     lines.truncate(lines.len().saturating_sub(trailing.saturating_sub(keep)));
+}
+
+fn paint_line_is_visually_blank(line: &PaintLine) -> bool {
+    UnicodeWidthStr::width(painted_line_text(line).trim()) == 0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3156,7 +3160,7 @@ impl Renderer {
         let live_rows_after_absorb = frame.lines.len().saturating_sub(1);
         if display_wrapped
             .last()
-            .is_some_and(|line| painted_line_text(line).trim().is_empty())
+            .is_some_and(paint_line_is_visually_blank)
             && trailing_transcript_spacer_will_be_visible(
                 content_rows,
                 live_rows_after_absorb,
@@ -5329,32 +5333,12 @@ const WORKING_SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "
 /// work outlives its turn, so its row keeps the loader while the turn is over.
 const SPINNING_ACTIVITY_LABELS: [&str; 3] = ["Working..", "Compacting..", "Background:"];
 
+/// 끝난 턴의 진행 줄 앞에 서는 별. 이 글리프만 굵게 그린다.
+const COMPLETED_ACTIVITY_GLYPH: &str = "✧";
+
 /// Glyphs that head an activity row which is already over. A shimmer on these
 /// reads as work still running, so they paint flat.
 const SETTLED_ACTIVITY_GLYPHS: [&str; 2] = ["✓", "X"];
-
-/// 진행 줄이 로더 글리프와 시머를 달아야 하는지, 달아야 한다면 어디까지가 라벨이고
-/// 어디부터가 꼬리인지. 이름이 알려진 문구를 먼저 맞춰 보고, 그 자리를 대신 차지한
-/// 진행 문구는 끝난 줄과 대기 줄만 걸러 낸 나머지로 받는다.
-fn spinning_activity_label(activity: &str) -> Option<(&str, &str)> {
-    if let Some(found) = SPINNING_ACTIVITY_LABELS.iter().find_map(|label| {
-        activity
-            .strip_prefix(label)
-            .map(|trailer| (*label, trailer))
-    }) {
-        return Some(found);
-    }
-    // 끝난 줄은 글리프로 시작하고, 대기 줄은 경과 시간을 달지 않는다. 둘 다 아닌
-    // 줄은 모델이 낸 진행 문구가 이름을 올린 줄이다.
-    let settled = SETTLED_ACTIVITY_GLYPHS
-        .iter()
-        .any(|glyph| activity.starts_with(glyph))
-        || activity.starts_with('✧');
-    if settled || !activity.ends_with(')') {
-        return None;
-    }
-    Some((activity, ""))
-}
 
 /// The loader glyph plus the space after it.
 const WORKING_SPINNER_COLUMNS: usize = 2;
@@ -5431,15 +5415,20 @@ fn activity_lines_with_progress(
     }
     // `/compact` wears the same loader as a turn: it is a wait the user started
     // and cannot see progress on any other way.
-    if let Some((label, trailer)) = spinning_activity_label(activity) {
+    if let Some((label, trailer)) = SPINNING_ACTIVITY_LABELS.iter().find_map(|label| {
+        activity
+            .strip_prefix(label)
+            .map(|trailer| (*label, trailer))
+    }) {
         let shimmer_base = tone_rgb(tone).unwrap_or(theme::palette().foreground);
+        // 도는 글리프는 굵게 그린다. 얇은 점 무늬는 문구 옆에서 눌려 보인다.
         let mut tail = vec![PaintSpan {
             text: format!(
                 "{} ",
                 WORKING_SPINNER[(phase.clamp(0.0, 0.999) * WORKING_SPINNER.len() as f32) as usize]
             ),
             tone,
-            bold: false,
+            bold: true,
         }];
         // Working keeps its elapsed reading in the same sweep, so the active
         // state does not visually stop before the time at the right.
@@ -5483,16 +5472,21 @@ fn activity_lines_with_progress(
             tail,
         }];
     }
-    if activity.starts_with("✧ Completed (") {
+    if let Some(rest) = activity.strip_prefix(COMPLETED_ACTIVITY_GLYPH) {
+        // 별만 굵게 남기고 읽을 문구는 보통 굵기로 둔다.
         return vec![PaintLine {
             prefix: " ".to_owned(),
             prefix_tone: tone,
-            text: activity.to_owned(),
+            text: COMPLETED_ACTIVITY_GLYPH.to_owned(),
             tone,
-            bold: false,
+            bold: true,
             tool_heading: None,
             pick: None,
-            tail: Vec::new(),
+            tail: vec![PaintSpan {
+                text: rest.to_owned(),
+                tone,
+                bold: false,
+            }],
         }];
     }
     let shimmer_base = tone_rgb(tone).unwrap_or(theme::palette().foreground);
@@ -5943,13 +5937,16 @@ fn render_streamed_transcript_lines(
     for live in live {
         let mut block = live.block.clone();
         block.body = stable_streaming_markdown_body(&block.body);
-        let lines = block_group_lines(
+        let mut lines = block_group_lines(
             &block,
             width,
             shell_display_mode,
             diff_display_mode,
             expanded_tools.contains(&block.id()),
         );
+        // 활성 응답과 완료 기록이 같은 꼬리 행을 가져야 턴 종료 순간 답변이 한 행
+        // 내려가지 않는다. 닫힌 문단과 블록 구분 줄이 겹치면 화면에는 하나만 둔다.
+        trim_trailing_visual_blank_rows(&mut lines, 1);
         rows.insert(block.id(), lines.len());
         output.extend(lines);
     }
@@ -12343,16 +12340,19 @@ mod tests {
                         let answer = Block::new(
                             BlockKind::Assistant,
                             "Codex",
-                            (0..answer_rows)
-                                .map(|row| {
-                                    if row == 0 {
-                                        "스트리밍 중인 최종 답변입니다.".to_owned()
-                                    } else {
-                                        format!("최종 답변 {row}")
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n"),
+                            format!(
+                                "{}\n\n",
+                                (0..answer_rows)
+                                    .map(|row| {
+                                        if row == 0 {
+                                            "스트리밍 중인 최종 답변입니다.".to_owned()
+                                        } else {
+                                            format!("최종 답변 {row}")
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            ),
                         );
                         let mut live_view = split_test_view(&editor);
                         live_view.live_blocks = vec![LiveBlockView {
@@ -16100,41 +16100,26 @@ mod tests {
         );
     }
 
-    /// 진행 문구가 `Working..` 자리를 대신해도 그 줄은 도는 중이므로 로더와 시머를
-    /// 그대로 단다. 이름만 바뀌고 움직임이 멈추면 멈춘 줄로 읽힌다.
+    /// 도는 글리프와 끝난 턴의 별은 굵게, 함께 놓인 문구는 보통 굵기로 그린다.
     #[test]
-    fn a_progress_note_row_keeps_the_loader_and_the_shimmer() {
-        let line = activity_lines(
-            "저장소 목록 확인 중 (2m 12s)",
-            Some("gpt-5.6-terra"),
-            0.5,
-            80,
-        )
-        .pop()
-        .expect("progress note row");
-
-        assert_eq!(line.tail.first().map(|span| span.text.as_str()), Some("⠴ "));
-        assert_eq!(
-            line.tail
-                .iter()
-                .filter_map(|span| match span.tone {
-                    Tone::Shimmer(_, _) => Some(span.text.as_str()),
-                    _ => None,
-                })
-                .collect::<String>(),
-            "저장소 목록 확인 중 (2m 12s)"
-        );
-    }
-
-    /// 세션을 여는 대기 줄은 경과 시간을 달지 않는다. 도구 라벨을 받아 주는 규칙이
-    /// 그 줄까지 데려가 로더를 새로 붙이면 안 된다.
-    #[test]
-    fn the_loading_activity_row_stays_without_a_loader() {
-        let line = activity_lines("Loading session..", None, 0.5, 80)
+    fn the_loader_and_the_completed_star_paint_bold() {
+        let working = activity_lines("Working.. (2s)", None, 0.5, 80)
             .pop()
-            .expect("loading row");
+            .expect("working row");
+        let loader = working.tail.first().expect("loader span");
+        assert_eq!(loader.text, "⠴ ");
+        assert!(loader.bold);
 
-        assert_ne!(line.tail.first().map(|span| span.text.as_str()), Some("⠴ "));
+        let completed = activity_lines("✧ Completed (2s)", None, 0.5, 80)
+            .pop()
+            .expect("completed row");
+        assert_eq!(completed.text, "✧");
+        assert!(completed.bold);
+        assert_eq!(
+            completed.tail.first().map(|span| span.text.as_str()),
+            Some(" Completed (2s)")
+        );
+        assert!(completed.tail.iter().all(|span| !span.bold));
     }
 
     #[test]
@@ -17402,7 +17387,7 @@ mod tests {
             .expect("prompt row");
         let standalone_spacers = renderer.wrapped[answer + 1..prompt]
             .iter()
-            .filter(|line| painted_line_text(line).trim().is_empty())
+            .filter(|line| paint_line_is_visually_blank(line))
             .count();
 
         assert_eq!(standalone_spacers, 1);
@@ -17416,11 +17401,7 @@ mod tests {
                 .map(painted_line_text)
                 .collect::<Vec<_>>()
         );
-        assert!(
-            painted_line_text(&renderer.wrapped[prompt - 2])
-                .trim()
-                .is_empty()
-        );
+        assert!(paint_line_is_visually_blank(&renderer.wrapped[prompt - 2]));
         assert_eq!(renderer.wrapped[prompt - 1].tone, Tone::UserPromptPadding);
         let incremental = renderer.wrapped.clone();
         renderer.rewrap(80);
@@ -17577,7 +17558,7 @@ mod tests {
         let live_rows_after_absorb = frame.lines.len().saturating_sub(1);
         if display_wrapped
             .last()
-            .is_some_and(|line| painted_line_text(line).trim().is_empty())
+            .is_some_and(paint_line_is_visually_blank)
             && trailing_transcript_spacer_will_be_visible(
                 rows,
                 live_rows_after_absorb,
@@ -18005,12 +17986,10 @@ mod tests {
         assert_eq!(answer_row(&screen), streaming_row);
     }
 
-    /// Closing a paragraph costs the one row it is worth, and ending the stream
-    /// costs none. Holding that row back instead would hand the next
-    /// paragraph's first character a two-row jump, and the answer would travel
-    /// twice as far in a single frame.
+    /// 닫힌 문단과 블록 구분 줄은 활성 스트림과 완료 기록에서 똑같이 한 행으로
+    /// 정규화한다. 그래야 문단 종료와 턴 종료 어느 쪽도 답변 행을 옮기지 않는다.
     #[test]
-    fn a_closing_paragraph_scrolls_forward_by_only_one_row() {
+    fn a_closing_paragraph_and_completion_keep_the_answer_row() {
         set_chat_layout(false);
         for (rows, width) in [(18, 60), (24, 80), (32, 120)] {
             let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
@@ -18068,9 +18047,8 @@ mod tests {
             );
             let closed_row = answer_row(&screen);
             assert_eq!(
-                streaming_row.saturating_sub(closed_row),
-                1,
-                "문단이 닫힐 때 한 행만 올라가야 합니다: rows={rows}, width={width}"
+                closed_row, streaming_row,
+                "문단 종료 순간 응답 행이 바뀌면 안 됩니다: rows={rows}, width={width}"
             );
 
             let screen = simulate_fullscreen_frame(
@@ -18084,14 +18062,14 @@ mod tests {
             );
             assert_eq!(
                 answer_row(&screen),
-                closed_row + 1,
-                "완료 시 중복 구분 줄만 접혀 한 행 아래로 정착해야 합니다: rows={rows}, width={width}"
+                closed_row,
+                "완료 순간 응답 행이 바뀌면 안 됩니다: rows={rows}, width={width}"
             );
         }
     }
 
     #[test]
-    fn every_paragraph_prefix_keeps_content_and_only_settles_downward_on_completion() {
+    fn every_paragraph_prefix_keeps_the_same_rows_on_completion() {
         set_chat_layout(false);
         for (rows, width) in [(18, 60), (24, 80), (32, 120)] {
             for body in [
@@ -18155,7 +18133,7 @@ mod tests {
                         .skip(current_start)
                         .filter(|(_, line)| {
                             (line.prefix == RESPONSE_BULLET_PREFIX || line.prefix == "  ")
-                                && !painted_line_text(line).trim().is_empty()
+                                && !paint_line_is_visually_blank(line)
                         })
                         .map(|(row, line)| (row, painted_line_text(line)))
                         .collect::<Vec<_>>()
@@ -18171,11 +18149,11 @@ mod tests {
                     "rows={rows}, width={width}, body={body:?}"
                 );
                 assert!(
-                    completed_rows.iter().zip(&live_rows).all(
-                        |((completed_row, _), (live_row, _))| *completed_row == *live_row
-                            || *completed_row == *live_row + 1
-                    ),
-                    "완료 응답은 위로 되돌아가거나 두 행 이상 움직이면 안 됩니다: rows={rows}, width={width}, body={body:?}"
+                    completed_rows
+                        .iter()
+                        .zip(&live_rows)
+                        .all(|((completed_row, _), (live_row, _))| *completed_row == *live_row),
+                    "완료 응답은 한 행도 움직이면 안 됩니다: rows={rows}, width={width}, body={body:?}"
                 );
             }
         }
@@ -18615,7 +18593,7 @@ mod tests {
             );
             let streaming_row = assert_gap(&screen, 2);
 
-            // 활성 스트림은 다음 문단이 한 행씩 자라도록 닫힌 문단 한 줄을 유지한다.
+            // 공백·탭·폭 없는 문자로 끝나도 활성 스트림과 완료 기록의 꼬리는 같다.
             answer.body.push_str("\n   \n\t\n\u{200b}");
             let screen = simulate_fullscreen_frame(
                 &mut renderer,
@@ -18626,12 +18604,8 @@ mod tests {
                 rows,
                 width,
             );
-            let closed_row = assert_gap(&screen, 3);
-            assert_eq!(
-                streaming_row.saturating_sub(closed_row),
-                1,
-                "rows={rows}, width={width}"
-            );
+            let closed_row = assert_gap(&screen, 2);
+            assert_eq!(streaming_row, closed_row, "rows={rows}, width={width}");
 
             let screen = simulate_fullscreen_frame(
                 &mut renderer,
@@ -18643,7 +18617,7 @@ mod tests {
                 width,
             );
             let completed_row = assert_gap(&screen, 2);
-            assert_eq!(completed_row, closed_row + 1);
+            assert_eq!(completed_row, closed_row);
 
             renderer.scroll_back = 3;
             simulate_fullscreen_frame(

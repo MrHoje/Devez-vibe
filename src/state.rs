@@ -3727,14 +3727,6 @@ pub struct AppState {
     side_parent: Option<SideParent>,
     last_assistant_markdown: Option<String>,
     composer_notice: Option<(String, Instant)>,
-    /// 모델이 도구를 부르기 직전에 낸 진행 문구와 그 문구가 도착한 시각.
-    progress_note: Option<(String, Instant)>,
-    /// 현재 진행 문구가 가리키는 도구. 동시에 여러 도구가 돌아도 먼저 끝난 도구가
-    /// 더 최신 문구를 지우지 않도록 시작 알림에서 연결한다.
-    progress_note_tool_id: Option<String>,
-    /// 진행 문구 표기는 델타 경계에서 쪼개져 도착할 수 있다. 닫는 기호를 아직 못
-    /// 본 조각을 아이템별로 들고 있다가 다음 델타와 이어 붙인다.
-    progress_note_partial: HashMap<String, String>,
     /// Text, when it went up, and how long it stays. The quit warning needs a
     /// longer window than the rest, so the lifetime rides along with the notice.
     activity_notice: Option<(String, Instant, Duration)>,
@@ -3967,9 +3959,6 @@ impl AppState {
             side_parent: None,
             last_assistant_markdown: None,
             composer_notice: None,
-            progress_note: None,
-            progress_note_tool_id: None,
-            progress_note_partial: HashMap::new(),
             activity_notice: None,
             status_metadata_refreshed_at: Instant::now(),
             vibe_mode,
@@ -5829,11 +5818,6 @@ impl AppState {
     }
 
     fn reset_turn_item_tracking(&mut self) {
-        // 진행 문구는 그 턴 안에서만 뜻이 있다. 다음 턴으로 넘어가면 끝난 일을
-        // 지금 하는 일처럼 보여 주게 된다.
-        self.progress_note = None;
-        self.progress_note_tool_id = None;
-        self.progress_note_partial.clear();
         self.turn_response_started = false;
         self.turn_response_visible = false;
         self.completed_item_ids.clear();
@@ -11885,13 +11869,8 @@ impl AppState {
             if self.turn_interrupted {
                 return Some("X Interrupted".to_owned());
             }
-            // 지금 하는 일에 이름이 있으면 `Working..` 대신 그 이름을 보여준다.
-            // 이름 붙일 동작이 없는 구간에서만 원래 문구로 돌아간다.
-            let label = self
-                .running_label()
-                .unwrap_or_else(|| "Working..".to_owned());
             return Some(format!(
-                "{label} ({}){}",
+                "Working.. ({}){}",
                 format_elapsed(elapsed),
                 self.background_tasks_suffix()
             ));
@@ -11960,71 +11939,6 @@ impl AppState {
             self.background_tasks_since = Some(Instant::now());
         }
         true
-    }
-
-    /// 모델이 낸 `⟦…⟧` 진행 문구를 본문에서 떼어 내고, 화면에 남을 텍스트만
-    /// 돌려준다. 표기가 델타 경계에서 잘려 도착할 수 있어 닫는 기호를 못 본
-    /// 조각은 다음 델타까지 들고 있는다.
-    fn take_progress_notes(&mut self, item_id: &str, text: &str) -> String {
-        let carried = self
-            .progress_note_partial
-            .remove(item_id)
-            .unwrap_or_default();
-        let (visible, held) = self.scan_progress_notes(&format!("{carried}{text}"));
-        if held.is_empty() {
-            self.progress_note_partial.remove(item_id);
-        } else {
-            self.progress_note_partial.insert(item_id.to_owned(), held);
-        }
-        visible
-    }
-
-    /// 한 번에 다 온 본문에서 진행 문구를 걷어낸다. 닫히지 않은 표기는 이 본문이
-    /// 전부인 이상 진행 문구가 아니므로 본문에 그대로 남긴다.
-    fn strip_progress_notes(&mut self, text: &str) -> String {
-        let (visible, held) = self.scan_progress_notes(text);
-        format!("{visible}{held}")
-    }
-
-    /// 본문을 훑어 닫힌 진행 문구는 걷어내고, 아직 닫히지 않은 꼬리는 따로 돌려준다.
-    fn scan_progress_notes(&mut self, text: &str) -> (String, String) {
-        let mut rest = text.to_owned();
-        let mut visible = String::new();
-        let held = loop {
-            let Some(open) = rest.find(PROGRESS_NOTE_OPEN) else {
-                visible.push_str(&rest);
-                break String::new();
-            };
-            visible.push_str(&rest[..open]);
-            let after_open = rest[open + PROGRESS_NOTE_OPEN.len()..].to_owned();
-            let Some(close) = after_open.find(PROGRESS_NOTE_CLOSE) else {
-                // 아직 닫히지 않았다. 표기가 진짜 진행 문구인지는 닫는 기호를
-                // 봐야 알 수 있으니 그때까지 본문에도 내보내지 않는다.
-                break format!("{PROGRESS_NOTE_OPEN}{after_open}");
-            };
-            let note = after_open[..close].trim();
-            if !note.is_empty() {
-                self.progress_note =
-                    Some((compact_command(note, PROGRESS_NOTE_MAX), Instant::now()));
-                self.progress_note_tool_id = None;
-            }
-            rest = after_open[close + PROGRESS_NOTE_CLOSE.len()..].to_owned();
-            // 문구가 제 줄을 통째로 썼다면 뒤따르는 줄바꿈도 함께 걷어낸다.
-            // 남겨 두면 본문이 빈 줄로 시작한다.
-            if visible.is_empty() || visible.ends_with('\n') {
-                rest = rest
-                    .strip_prefix('\n')
-                    .map(ToOwned::to_owned)
-                    .unwrap_or(rest);
-            }
-        };
-        (visible, held)
-    }
-
-    /// 진행 줄이 부를 이름. 모델이 낸 진행 문구가 있을 때만 그 문구를 쓴다. 도구
-    /// 이름과 대상은 이미 카드로 보이니 여기서 다시 부르지 않는다.
-    fn running_label(&self) -> Option<String> {
-        self.progress_note.as_ref().map(|(note, _)| note.clone())
     }
 
     /// `Working.. (11s) · 2 background tasks`처럼 진행 줄 뒤에 붙는 꼬리.
@@ -13212,18 +13126,9 @@ impl AppState {
         if self.completed_item_ids.contains(id) {
             return;
         }
-        if is_progress_tool_item(item)
-            && self.progress_note.is_some()
-            && self.progress_note_tool_id.is_none()
-        {
-            self.progress_note_tool_id = Some(id.to_owned());
-        }
         let Some(mut block) = active_item_block(&self.cwd, item) else {
             return;
         };
-        if matches!(block.kind, BlockKind::Assistant) && block.body.contains(PROGRESS_NOTE_OPEN) {
-            block.body = self.strip_progress_notes(&block.body);
-        }
         if matches!(block.kind, BlockKind::Assistant) {
             // A provider can label the streaming item's phase late or not at all.
             // Treat every new assistant item as the next visible response boundary:
@@ -13295,15 +13200,10 @@ impl AppState {
         let active = id.and_then(|id| {
             let active = self.active.remove(id);
             self.active_order.retain(|candidate| candidate != id);
-            self.progress_note_partial.remove(id);
             active
         });
         if item.get("type").and_then(Value::as_str) == Some("userMessage") {
             return;
-        }
-        if is_progress_tool_item(item) && self.progress_note_tool_id.as_deref() == id {
-            self.progress_note = None;
-            self.progress_note_tool_id = None;
         }
         if let Some(mut block) = completed_item_block(&self.cwd, item) {
             if let Some(active) = active.as_ref() {
@@ -13312,15 +13212,6 @@ impl AppState {
                 if block.body.is_empty() {
                     block.body = active.block.body.clone();
                 }
-            }
-            if matches!(block.kind, BlockKind::Assistant) && block.body.contains(PROGRESS_NOTE_OPEN)
-            {
-                block.body = self.strip_progress_notes(&block.body);
-            }
-            // 진행 문구만 담고 끝난 답변은 화면에 남길 것이 없다. 빈 카드를 커밋하면
-            // 도구 사이마다 빈 답변 줄이 하나씩 쌓인다.
-            if matches!(block.kind, BlockKind::Assistant) && block.body.trim().is_empty() {
-                return;
             }
             if let (Some(id), Some(batch_id)) = (
                 id,
@@ -13371,21 +13262,6 @@ impl AppState {
         let Some(delta) = params.get("delta").and_then(Value::as_str) else {
             return;
         };
-        // 진행 문구는 답변이 아니다. 카드를 열기 전에 걷어내야 문구만 온 델타가
-        // 빈 답변 카드를 만들지 않는다.
-        let held;
-        let delta = if matches!(kind, BlockKind::Assistant)
-            && (delta.contains(PROGRESS_NOTE_OPEN)
-                || self.progress_note_partial.contains_key(item_id))
-        {
-            held = self.take_progress_notes(item_id, delta);
-            held.as_str()
-        } else {
-            delta
-        };
-        if delta.is_empty() {
-            return;
-        }
         if matches!(kind, BlockKind::Assistant) && !self.active.contains_key(item_id) {
             // OpenCode can begin an assistant item with its first delta instead
             // of a separate item/started notification. Settle earlier responses
@@ -14021,29 +13897,6 @@ fn active_item_block(cwd: &str, item: &Value) -> Option<Block> {
         )),
         _ => None,
     }
-}
-
-/// 모델이 진행 문구를 감싸는 표기. 답변 본문이나 코드에 나올 일이 없는 기호라서
-/// 본문과 섞일 걱정 없이 걷어낼 수 있다.
-const PROGRESS_NOTE_OPEN: &str = "⟦";
-const PROGRESS_NOTE_CLOSE: &str = "⟧";
-
-/// 진행 줄은 경과 시간과 백그라운드 꼬리를 함께 이고 있어서, 문구가 그 줄을 혼자
-/// 밀어내지 않을 만큼에서 끊는다.
-const PROGRESS_NOTE_MAX: usize = 48;
-
-fn is_progress_tool_item(item: &Value) -> bool {
-    matches!(
-        item.get("type").and_then(Value::as_str),
-        Some(
-            "commandExecution"
-                | "fileChange"
-                | "webSearch"
-                | "mcpToolCall"
-                | "dynamicToolCall"
-                | "collabAgentToolCall"
-        )
-    )
 }
 
 fn is_thinking(block: &Block) -> bool {
@@ -16796,160 +16649,6 @@ mod tests {
         state.set_turn_started("next-turn".to_owned());
 
         assert_eq!(state.take_pending_interrupt(), None);
-    }
-
-    /// 모델이 낸 진행 문구는 진행 줄에만 오르고 대화 본문에는 남지 않는다.
-    #[test]
-    fn a_progress_note_reaches_the_activity_row_and_leaves_the_transcript_alone() {
-        let mut state = test_state();
-        state.busy = true;
-        state.turn_started_at = Some(Instant::now());
-
-        state.append_delta(
-            &json!({"itemId": "msg-1", "delta": "⟦저장소 목록 확인 중⟧\n"}),
-            BlockKind::Assistant,
-            "Codex",
-        );
-
-        let running = state.view().activity.expect("running activity");
-        assert!(running.starts_with("저장소 목록 확인 중 ("), "{running}");
-        assert!(
-            !state.active.contains_key("msg-1"),
-            "문구만 온 델타는 답변 카드를 열지 않는다"
-        );
-    }
-
-    /// 표기가 델타 경계에서 잘려 도착해도 조각이 본문으로 새면 안 된다.
-    #[test]
-    fn a_progress_note_split_across_deltas_is_still_kept_out_of_the_transcript() {
-        let mut state = test_state();
-        state.busy = true;
-        state.turn_started_at = Some(Instant::now());
-
-        for delta in ["⟦파일 목록", " 세는 중⟧", "찾았습니다"] {
-            state.append_delta(
-                &json!({"itemId": "msg-1", "delta": delta}),
-                BlockKind::Assistant,
-                "Codex",
-            );
-        }
-        state.flush_stream_text();
-
-        let running = state.view().activity.expect("running activity");
-        assert!(running.starts_with("파일 목록 세는 중 ("), "{running}");
-        let body = state.active["msg-1"].block.body.clone();
-        assert_eq!(body, "찾았습니다", "본문에는 답변만 남는다");
-    }
-
-    /// 진행 문구가 아닌 일반 답변은 진행 줄을 건드리지 않는다.
-    #[test]
-    fn assistant_text_leaves_the_activity_row_alone() {
-        let mut state = test_state();
-        state.busy = true;
-        state.turn_started_at = Some(Instant::now());
-
-        state.start_item(&json!({
-            "id": "msg-1",
-            "type": "agentMessage",
-            "text": "고칠 곳을 찾았습니다"
-        }));
-
-        let running = state.view().activity.expect("running activity");
-        assert!(running.starts_with("Working.. ("), "{running}");
-    }
-
-    /// 도구가 도는 것만으로는 진행 줄이 바뀌지 않는다. 도구 이름과 대상은 카드로
-    /// 이미 보이므로 진행 줄은 모델이 문구를 낼 때만 이름을 바꾼다.
-    #[test]
-    fn a_running_tool_alone_leaves_the_activity_row_on_working() {
-        let mut state = test_state();
-        state.busy = true;
-        state.turn_started_at = Some(Instant::now());
-
-        state.start_item(&json!({
-            "id": "cmd-1",
-            "type": "commandExecution",
-            "command": "cargo test"
-        }));
-
-        let running = state.view().activity.expect("running activity");
-        assert!(running.starts_with("Working.. ("), "{running}");
-    }
-
-    /// 도구가 끝난 뒤에는 이전 진행 문구를 최종 답변 스트리밍에 남기지 않는다.
-    #[test]
-    fn a_completed_tool_clears_its_progress_note_before_the_final_answer() {
-        let mut state = test_state();
-        state.busy = true;
-        state.turn_started_at = Some(Instant::now());
-        state.append_delta(
-            &json!({"itemId": "note", "delta": "⟦테스트 실행 중⟧\n"}),
-            BlockKind::Assistant,
-            "Codex",
-        );
-        state.start_item(&json!({
-            "id": "cmd-1",
-            "type": "commandExecution",
-            "command": "cargo test"
-        }));
-
-        state.complete_item(&json!({
-            "id": "cmd-1",
-            "type": "commandExecution",
-            "command": "cargo test",
-            "status": "completed",
-            "exitCode": 0
-        }));
-
-        let final_stream = state.view().activity.expect("final activity");
-        assert!(final_stream.starts_with("Working.. ("), "{final_stream}");
-    }
-
-    /// 동시에 도는 이전 도구가 먼저 끝나도 더 최신 도구의 진행 문구는 유지한다.
-    #[test]
-    fn an_older_concurrent_tool_cannot_clear_the_newer_progress_note() {
-        let mut state = test_state();
-        state.busy = true;
-        state.turn_started_at = Some(Instant::now());
-
-        for (note_id, tool_id, note) in [
-            ("note-1", "cmd-1", "첫 작업 실행 중"),
-            ("note-2", "cmd-2", "둘째 작업 실행 중"),
-        ] {
-            state.append_delta(
-                &json!({"itemId": note_id, "delta": format!("⟦{note}⟧\n")}),
-                BlockKind::Assistant,
-                "Codex",
-            );
-            state.start_item(&json!({
-                "id": tool_id,
-                "type": "commandExecution",
-                "command": tool_id
-            }));
-        }
-
-        state.complete_item(&json!({
-            "id": "cmd-1",
-            "type": "commandExecution",
-            "command": "cmd-1",
-            "status": "completed",
-            "exitCode": 0
-        }));
-        let still_running = state.view().activity.expect("newer tool activity");
-        assert!(
-            still_running.starts_with("둘째 작업 실행 중 ("),
-            "{still_running}"
-        );
-
-        state.complete_item(&json!({
-            "id": "cmd-2",
-            "type": "commandExecution",
-            "command": "cmd-2",
-            "status": "completed",
-            "exitCode": 0
-        }));
-        let finished = state.view().activity.expect("activity after both tools");
-        assert!(finished.starts_with("Working.. ("), "{finished}");
     }
 
     #[test]
