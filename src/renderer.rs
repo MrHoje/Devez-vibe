@@ -11548,6 +11548,8 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
         fast_index: Some(display_width + primary_spans.len() + 1),
         permission_index: None,
     };
+    // OpenCode has no service-tier switch, so its composer never shows Fast.
+    let hide_fast = is_open_code_model_label(&mode.model);
     [
         with_fast,
         BadgeSpans {
@@ -11562,6 +11564,7 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
         vibe_only,
     ]
     .into_iter()
+    .filter(|candidate| !hide_fast || candidate.fast_index.is_none())
     .find(|candidate| spans_width(&candidate.spans) <= budget)
 }
 
