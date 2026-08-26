@@ -3707,6 +3707,9 @@ pub struct AppState {
     claude_auto_mode_disabled: bool,
     claude_auto_mode_confirmed: bool,
     side_parent: Option<SideParent>,
+    /// BTW panes run the plan silently: steps still advance, but the panel and
+    /// its transcript cards stay off the split view.
+    plan_panel_hidden: bool,
     last_assistant_markdown: Option<String>,
     composer_notice: Option<(String, Instant)>,
     /// Text, when it went up, and how long it stays. The quit warning needs a
@@ -3936,6 +3939,7 @@ impl AppState {
             claude_auto_mode_disabled: false,
             claude_auto_mode_confirmed: false,
             side_parent: None,
+            plan_panel_hidden: false,
             last_assistant_markdown: None,
             composer_notice: None,
             activity_notice: None,
@@ -5567,6 +5571,7 @@ impl AppState {
             model,
             effort,
         );
+        side.plan_panel_hidden = true;
         side.side_parent = Some(SideParent {
             thread_id: self.thread_id.clone(),
             turn: None,
@@ -6283,14 +6288,21 @@ impl AppState {
             // so they cannot flash for one frame and disappear later.
             committed.retain(|block| !is_shell_hidden_block(block));
         }
-        if self.vibe_mode == VibeMode::SuperVibe {
+        if self.vibe_mode == VibeMode::SuperVibe || self.plan_panel_hidden {
             committed.retain(|block| !is_plan_block(block));
         }
         committed
     }
 
     fn plan_is_active(&self) -> bool {
-        self.busy && self.turn_id.is_some() && self.plan_turn_id == self.turn_id
+        !self.plan_panel_hidden
+            && self.busy
+            && self.turn_id.is_some()
+            && self.plan_turn_id == self.turn_id
+    }
+
+    fn visible_plan_summary(&self) -> Option<&PlanSummary> {
+        self.plan_summary.as_ref().filter(|_| !self.plan_panel_hidden)
     }
 
     pub fn view(&self) -> View<'_> {
@@ -6306,7 +6318,8 @@ impl AppState {
                 if item.shell_batch.is_some()
                     || (self.shell_display_mode == ShellDisplayMode::Hide
                         && is_shell_hidden_block(&item.block))
-                    || (self.vibe_mode == VibeMode::SuperVibe && is_plan_block(&item.block))
+                    || ((self.vibe_mode == VibeMode::SuperVibe || self.plan_panel_hidden)
+                        && is_plan_block(&item.block))
                     || is_empty_thinking(&item.block)
                 {
                     return None;
@@ -6325,7 +6338,7 @@ impl AppState {
         View {
             live_blocks,
             overlay: self.overlay_view(),
-            plan_summary: self.plan_summary.as_ref(),
+            plan_summary: self.visible_plan_summary(),
             response_collapse: self.response_collapse_view(),
             fold_progress_groups: self.vibe_mode == VibeMode::SuperVibe
                 && self.response_display_mode == ResponseDisplayMode::Completed,
@@ -6610,7 +6623,7 @@ impl AppState {
                 && !self.turn_response_started
                 && self.last_assistant_markdown.is_some(),
             activity_progress_phase: self.compaction_progress_phase(),
-            plan_summary: self.plan_summary.as_ref(),
+            plan_summary: self.visible_plan_summary(),
             plan_active: self.plan_is_active(),
             plan_shimmer_phase: self.plan_shimmer_phase(),
             plan_effort: self
@@ -16179,6 +16192,43 @@ mod tests {
         state.set_response_display_mode(ResponseDisplayMode::All);
         assert!(!state.view().fold_progress_groups);
         assert!(state.response_collapse_view().is_none());
+    }
+
+    /// A BTW pane borrows the bottom of the split, so its plan runs silently:
+    /// steps keep advancing internally while the panel and its transcript
+    /// cards stay off screen.
+    #[test]
+    fn btw_runs_its_plan_without_showing_the_panel() {
+        let parent = test_state();
+        let mut btw = parent.forked_side_state(
+            "btw-thread".to_owned(),
+            parent.cwd.clone(),
+            parent.selected_model_name(),
+            Some(parent.selected_effort()),
+        );
+        btw.plan_summary = Some(PlanSummary {
+            explanation: None,
+            steps: vec![PlanStep {
+                text: "1. 원인 확인".to_owned(),
+                status: PlanStepStatus::InProgress,
+                started_at: None,
+                elapsed: None,
+            }],
+            expanded: true,
+            started_at: Instant::now(),
+            elapsed: None,
+        });
+        btw.committed.push(Block::new(
+            BlockKind::Plan,
+            "Updated Plan",
+            "1. 원인 확인",
+        ));
+
+        assert!(btw.view().plan_summary.is_none());
+        assert!(btw.animation_view().plan_summary.is_none());
+        assert!(!btw.view().plan_active);
+        assert!(btw.plan_summary.is_some());
+        assert!(btw.drain_committed().is_empty());
     }
 
     /// The panel is the session's task view — the steps a turn is working
