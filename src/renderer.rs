@@ -10065,6 +10065,11 @@ pub(crate) fn format_elapsed(seconds: u64) -> String {
     }
 }
 
+/// 12시간 표기의 일반적인 순서는 시각 뒤에 AM/PM이 붙는 형태다.
+pub(crate) fn format_clock_time(at: chrono::DateTime<chrono::Local>) -> String {
+    at.format("%-I:%M %p").to_string()
+}
+
 fn conversation_region_width(width: u16) -> usize {
     usize::from(width).saturating_sub(1).saturating_mul(80) / 100
 }

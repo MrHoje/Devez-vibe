@@ -33,7 +33,7 @@ use crate::{
         OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS, PermissionBadge, PermissionTone,
         PlanStep, PlanStepStatus, PlanSummary, ProviderHandoffBlock, ProviderIntegrationView,
         SIDE_PANEL_WIDTHS, StatusLineView, SubagentView, SuggestionView, VibeTone, View,
-        WelcomeView, format_elapsed, visible_window,
+        WelcomeView, format_clock_time, format_elapsed, visible_window,
     },
     rollout::{PlanSnapshot, Rollout, RolloutEvent, RolloutKind},
     theme::{self, ThemeKind},
@@ -3688,6 +3688,9 @@ pub struct AppState {
     /// activity row runs its own clock until the runtime reports the boundary.
     compacting_started_at: Option<Instant>,
     last_completed_duration: Option<Duration>,
+    /// 완료 표시에 붙는 벽시계 시각. 경과 시간과 달리 되짚어 계산할 수 없어
+    /// 턴이 끝나는 순간에만 기록한다.
+    last_completed_at: Option<chrono::DateTime<chrono::Local>>,
     branch: Option<String>,
     five_hour_percent: Option<u8>,
     weekly_percent: Option<u8>,
@@ -3921,6 +3924,7 @@ impl AppState {
             held_since: None,
             held_final_frame_ticks: 0,
             last_completed_duration: None,
+            last_completed_at: None,
             branch,
             five_hour_percent,
             weekly_percent,
@@ -4611,6 +4615,7 @@ impl AppState {
     pub fn cancel_queued_prompt(&mut self) {
         self.discard_unanswered_turn_prompts();
         self.last_completed_duration = self.turn_started_at.map(|started| started.elapsed());
+        self.last_completed_at = self.last_completed_duration.map(|_| chrono::Local::now());
         self.turn_interrupted = self.last_completed_duration.is_some();
         self.busy = false;
         self.turn_id = None;
@@ -5673,6 +5678,8 @@ impl AppState {
         self.editor.replace_history(prompt_history);
         self.turn_interrupted = false;
         self.last_completed_duration = turns.iter().rev().find_map(completed_turn_duration);
+        // 재개한 스레드는 지난 턴이 끝난 시각을 알려 주지 않아 시각을 비워 둔다.
+        self.last_completed_at = None;
         // Neither the turn nor the rollout names a model for every prompt — a
         // Codex thread carries no per-turn model at all. The thread reopened on
         // one model, so use it rather than dropping the prompt's marker back to
@@ -5747,6 +5754,7 @@ impl AppState {
             self.turn_interrupted = false;
         }
         self.last_completed_duration = None;
+        self.last_completed_at = None;
         self.turn_progress_at = Some(Instant::now());
         self.stall_probe_at = None;
         // A prompt held back while the session was still starting has been counting
@@ -5929,6 +5937,7 @@ impl AppState {
             if self.last_completed_duration.is_none() {
                 self.last_completed_duration =
                     self.turn_started_at.map(|started| started.elapsed());
+                self.last_completed_at = self.last_completed_duration.map(|_| chrono::Local::now());
             }
             return Action::Interrupt;
         }
@@ -5936,6 +5945,7 @@ impl AppState {
             self.pending_interrupt = true;
             self.turn_interrupted = true;
             self.last_completed_duration = self.turn_started_at.map(|started| started.elapsed());
+            self.last_completed_at = self.last_completed_duration.map(|_| chrono::Local::now());
         }
         Action::Tick(true)
     }
@@ -6226,6 +6236,7 @@ impl AppState {
         self.turn_interrupted = false;
         self.turn_started_at = None;
         self.last_completed_duration = None;
+        self.last_completed_at = None;
     }
 
     pub fn prepare_new_thread(&mut self) {
@@ -8115,6 +8126,8 @@ impl AppState {
                 if !self.turn_interrupted || self.last_completed_duration.is_none() {
                     self.last_completed_duration =
                         self.turn_started_at.map(|started| started.elapsed());
+                    self.last_completed_at =
+                        self.last_completed_duration.map(|_| chrono::Local::now());
                 }
                 self.turn_started_at = None;
                 if successful
@@ -11836,8 +11849,13 @@ impl AppState {
         if self.turn_interrupted && self.last_completed_duration.is_some() {
             return Some("X Interrupted".to_owned());
         }
-        self.last_completed_duration
-            .map(|duration| format!("✧ Completed ({})", format_elapsed(duration.as_secs())))
+        self.last_completed_duration.map(|duration| {
+            let elapsed = format_elapsed(duration.as_secs());
+            match self.last_completed_at {
+                Some(at) => format!("✧ Completed ({elapsed}) · {}", format_clock_time(at)),
+                None => format!("✧ Completed ({elapsed})"),
+            }
+        })
     }
 
     /// `/compact` was accepted by the runtime: run the activity spinner until the
@@ -21170,7 +21188,12 @@ mod tests {
 
         state.select_model_and_effort("gpt-5.6-sol", Some("medium"));
         state.handle_notification("turn/completed", &json!({}));
-        assert_eq!(state.activity().as_deref(), Some("✧ Completed (10s)"));
+        let completed = state.activity().expect("완료 표시");
+        let expected = format!(
+            "✧ Completed (10s) · {}",
+            format_clock_time(state.last_completed_at.expect("완료 시각"))
+        );
+        assert_eq!(completed, expected);
     }
 
     #[test]
