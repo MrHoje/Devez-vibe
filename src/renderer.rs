@@ -9501,6 +9501,18 @@ fn without_leading_english_filler(body: &str) -> &str {
     body
 }
 
+/// 답변 항목이 앞 항목에 이어 붙던 흔적으로 공백 한두 칸을 달고 도착할 때가
+/// 있다. 그 공백은 화면에서 불릿 뒤로 한 칸 밀린 첫 글자로 보인다. 네 칸부터는
+/// 들여쓰기가 뜻을 가지므로 코드로 보고 그대로 둔다.
+fn without_stray_leading_spaces(body: &str) -> &str {
+    let spaces = body.len() - body.trim_start_matches(' ').len();
+    if spaces == 0 || spaces >= 4 {
+        body
+    } else {
+        &body[spaces..]
+    }
+}
+
 fn is_hangul(c: char) -> bool {
     matches!(c, '\u{AC00}'..='\u{D7A3}' | '\u{1100}'..='\u{11FF}' | '\u{3131}'..='\u{318E}')
 }
@@ -9651,7 +9663,7 @@ fn block_lines_with_mode_at(
     let mut code = false;
     let mut code_language = String::new();
     let body = if conversational {
-        without_leading_english_filler(&block.body)
+        without_stray_leading_spaces(without_leading_english_filler(&block.body))
     } else {
         &block.body
     };
@@ -24193,5 +24205,25 @@ mod tests {
                 .map(painted_line_text)
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// 진행 문구가 앞 항목에 이어 붙던 흔적으로 공백을 달고 오면 불릿 뒤 첫
+    /// 글자가 한 칸 밀려 보였다.
+    #[test]
+    fn a_stray_leading_space_does_not_shift_the_answer() {
+        assert_eq!(without_stray_leading_spaces(" 이제 부착 처리를 봅니다."), "이제 부착 처리를 봅니다.");
+        assert_eq!(without_stray_leading_spaces("이제 부착 처리를 봅니다."), "이제 부착 처리를 봅니다.");
+        // 네 칸부터는 코드 들여쓰기로 보고 건드리지 않는다.
+        assert_eq!(without_stray_leading_spaces("    let x = 1;"), "    let x = 1;");
+
+        set_chat_layout(false);
+        let block = Block::new(BlockKind::Assistant, "Codex", " 이제 부착 처리를 봅니다.");
+        let lines = block_lines_with_expansion(&block, 80, false);
+        let first = lines
+            .iter()
+            .find(|line| !painted_line_text(line).trim().is_empty())
+            .expect("answer row");
+
+        assert_eq!(painted_line_text(first), "• 이제 부착 처리를 봅니다.");
     }
 }

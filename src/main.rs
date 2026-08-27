@@ -4261,12 +4261,12 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "필요한 경우에도 사용자 판단에 필요한 최소 범위만 쓴다.\n",
     "답변 형식 규칙:\n",
     "- 서론, 인사, 맺음말 요약을 쓰지 않고 결론부터 쓴다.\n",
-    "- 응답 모드와 관계없이 최종 답변은 `- ` 불릿 두세 개로 끝내고, 불릿 하나에 한 문장만 쓴다. 사용자가 자세한 설명을 요청할 때만 늘린다.\n",
+    "- 응답 모드와 관계없이 최종 답변은 가능한 한 불릿 두세 개, 전체 200자 내외로 쓰며 불릿 하나에 두 문장을 넘기지 않는다. 사용자가 자세한 설명을 요청할 때만 늘린다.\n",
     "- 다만 사용자에게 선택이나 승인을 요청하는 답변에는 이 분량 제한을 적용하지 않는다. ",
     "고를 수 있는 선택지, 각 선택지의 결과, 판단에 필요한 사실을 하나도 빠뜨리지 않고 적고, ",
     "분량을 맞추려고 선택지를 줄이거나 문장을 도중에 끊지 않는다. ",
     "마지막 줄에서 무엇을 선택하면 되는지 한 문장으로 묻는다.\n",
-    "- 산문 문단 대신 `- ` 불릿으로 나열하고, 코드는 코드 블록으로 보여 준다.\n",
+    "- 산문 문단 대신 불릿과 코드 블록을 쓴다.\n",
     "- 코드 변경 보고에서도 파일 경로와 핵심 코드는 사용자 판단에 꼭 필요한 경우에만 최소한으로 보여주고, 요청받지 않은 해설을 덧붙이지 않는다.\n",
     "- 계획이나 작업 단계를 답변 본문에 다시 나열하지 않는다.\n",
     "- 파일 수정, 명령 실행처럼 실제로 무언가를 바꾼 작업을 마쳤을 때만 마지막 문장을 완료 보고로 쓴다. ",
@@ -4340,9 +4340,9 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "종료 직전에 여러 Task를 한꺼번에 `completed`로 바꾸지 않는다.\n",
     "답변 형식 규칙:\n",
     "- 서론, 인사, 맺음말 요약을 쓰지 않고 결론부터 쓴다.\n",
-    "- 산문 문단 대신 `- ` 불릿으로 나열하고, 코드는 코드 블록으로 보여 준다.\n",
+    "- 산문 문단 대신 불릿과 코드 블록을 쓴다.\n",
     "- 코드 변경 보고에서도 파일 경로와 핵심 코드는 사용자 판단에 꼭 필요한 경우에만 최소한으로 보여주고, 요청받지 않은 해설을 덧붙이지 않는다.\n",
-    "- 응답 모드와 관계없이 최종 답변은 `- ` 불릿 두세 개로 끝내고, 불릿 하나에 한 문장만 쓴다. 사용자가 자세한 설명을 요청할 때만 늘린다.\n",
+    "- 응답 모드와 관계없이 최종 답변은 가능한 한 불릿 두세 개, 전체 200자 내외로 쓰며 불릿 하나에 두 문장을 넘기지 않는다. 사용자가 자세한 설명을 요청할 때만 늘린다.\n",
     "- 사용자에게 선택이나 승인을 요청할 때는 본문에 선택지를 나열하지 말고 반드시 AskUserQuestion 도구로 묻는다.\n",
     "- 선택지가 다섯 개 이상이라 AskUserQuestion에 담기지 않을 때만 본문에 글로 나열한다. ",
     "이때는 분량 제한을 적용하지 않고, 선택지와 각각의 결과를 하나도 빠뜨리지 않고 적은 뒤 ",
@@ -4367,7 +4367,7 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- Skill 적용, 지침 확인, 내부 도구 호출 같은 내부 절차는 알리지 않는다.\n",
 );
 
-const CLAUDE_TURN_REMINDER: &str = "최종 답변은 `- ` 불릿 2~3개로 끝내고 불릿 하나에 한 문장만 쓴다. 필요한 경우가 아니면 영어로 응답하지 않으며, 도구 호출 앞뒤 text도 첫 글자가 한글이어야 하고 영어 문장으로 시작하거나 영어 판정 뒤 한국어를 잇지 않는다. 클래스명·메서드명·변수명·파일 경로·코드 조각은 사용자 판단에 꼭 필요할 때만 최소로 쓴다.";
+const CLAUDE_TURN_REMINDER: &str = "최종 답변은 불릿 2~3개, 전체 200자 내외로 쓰고 불릿 하나에 두 문장을 넘기지 않는다. 필요한 경우가 아니면 영어로 응답하지 않으며, 도구 호출 앞뒤 text도 첫 글자가 한글이어야 하고 영어 문장으로 시작하거나 영어 판정 뒤 한국어를 잇지 않는다. 클래스명·메서드명·변수명·파일 경로·코드 조각은 사용자 판단에 꼭 필요할 때만 최소로 쓴다.";
 
 /// The Claude selections a session has to be told, because the bridge opens a
 /// fresh SDK session for every start and resume. Anything left out here comes
@@ -7138,8 +7138,8 @@ mod tests {
         }
         // The cap the exception refers to, stated once for every mode.
         for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS] {
-            assert!(rules.contains("`- ` 불릿 두세 개로 끝내고"));
-            assert!(rules.contains("불릿 하나에 한 문장만 쓴다"));
+            assert!(rules.contains("불릿 두세 개, 전체 200자 내외"));
+            assert!(rules.contains("불릿 하나에 두 문장을 넘기지 않는다"));
             assert!(!rules.contains("세 줄"));
         }
     }
@@ -7175,8 +7175,8 @@ mod tests {
                 .and_then(Value::as_str),
             Some(CLAUDE_TURN_REMINDER)
         );
-        assert!(CLAUDE_TURN_REMINDER.contains("`- ` 불릿 2~3개로 끝내고"));
-        assert!(CLAUDE_TURN_REMINDER.contains("불릿 하나에 한 문장만 쓴다"));
+        assert!(CLAUDE_TURN_REMINDER.contains("불릿 2~3개, 전체 200자 내외"));
+        assert!(CLAUDE_TURN_REMINDER.contains("불릿 하나에 두 문장을 넘기지 않는다"));
         assert!(CLAUDE_TURN_REMINDER.contains("필요한 경우가 아니면 영어로 응답하지 않으며"));
         assert!(CLAUDE_TURN_REMINDER.contains("도구 호출 앞뒤 text도 첫 글자가 한글이어야 하고"));
         assert!(CLAUDE_TURN_REMINDER.contains("사용자 판단에 꼭 필요할 때만 최소로 쓴다"));
