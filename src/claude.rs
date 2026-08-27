@@ -736,7 +736,14 @@ mod tests {
         assert!(bridge.contains("session.ambientSubagentTasks"));
         assert!(bridge.contains("BACKGROUND_SUBAGENT_LEASE_MS"));
         assert!(bridge.contains("clearForegroundSubagents(session)"));
-        assert!(bridge.contains("if (!session.turn) beginTurn(session);"));
+        assert!(bridge.contains("if (!session.turn) {"));
+        assert!(bridge.contains("beginUntrackedTurn(session, message)"));
+        assert!(bridge.contains("await consumeMessage(session, message)"));
+        assert!(bridge.contains("session.automaticTurnsPending > 0"));
+        assert!(bridge.contains("if (message.isReplay === true) return;"));
+        assert!(
+            bridge.contains("message.type !== \"stream_event\" && message.type !== \"assistant\"")
+        );
         assert!(bridge.contains("notify(\"turn/subagents/updated\""));
     }
 

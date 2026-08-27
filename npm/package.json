@@ -1,6 +1,6 @@
 {
   "name": "devez-vibe",
-  "version": "1.6.44",
+  "version": "1.6.45",
   "description": "Stable terminal UI for Codex and Claude Agent SDK",
   "keywords": [
     "codex",
@@ -23,6 +23,8 @@
   "files": [
     "bin/dvz.exe",
     "bridge/claude-agent-sdk-bridge.mjs",
+    "install-skills.mjs",
+    "skills/luna-loop/",
     "README.md",
     "LICENSE"
   ],
@@ -34,6 +36,9 @@
   ],
   "engines": {
     "node": ">=18"
+  },
+  "scripts": {
+    "postinstall": "node install-skills.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.247"

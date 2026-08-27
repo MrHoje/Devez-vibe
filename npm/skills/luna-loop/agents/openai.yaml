@@ -1,0 +1,7 @@
+interface:
+  display_name: "루프 검증"
+  short_description: "수정 후 Luna 반복 검증과 병렬 재검수를 자동화"
+  default_prompt: "직접 $luna-loop을 호출해 수정 사항을 검증하고 문제가 남으면 재수정한 뒤 다시 검증해 주세요."
+
+policy:
+  allow_implicit_invocation: false

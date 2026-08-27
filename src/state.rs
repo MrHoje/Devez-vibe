@@ -5511,12 +5511,8 @@ impl AppState {
         self.commit_welcome_card();
         self.committed.push(Block::new(
             BlockKind::ModelChange,
-            if enabled {
-                "✓ Fast mode On"
-            } else {
-                "✓ Fast mode Off"
-            },
-            "",
+            "✓ Fast changed",
+            if enabled { "↳ On" } else { "↳ Off" },
         ));
     }
 
@@ -7757,6 +7753,9 @@ impl AppState {
         role: Option<&str>,
         description: Option<&str>,
     ) {
+        let description = description
+            .map(|prompt| compact_command(&strip_workspace_prefix(prompt, &self.cwd), 96))
+            .filter(|description| !description.is_empty());
         let metadata = self.codex_subagents.entry(id.to_owned()).or_default();
         if let Some(path) = agent_path.map(str::trim).filter(|path| !path.is_empty()) {
             metadata.agent_path = Some(path.to_owned());
@@ -7770,10 +7769,7 @@ impl AppState {
         if let Some(role) = role.map(str::trim).filter(|role| !role.is_empty()) {
             metadata.role = Some(role.to_owned());
         }
-        if let Some(description) = description
-            .map(|description| compact_command(description, 96))
-            .filter(|description| !description.is_empty())
-        {
+        if let Some(description) = description {
             metadata.description = description;
         }
         self.refresh_codex_subagent_row(id);
@@ -15180,6 +15176,39 @@ fn pretty_json(value: Option<&Value>) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
+/// 자식 에이전트 행에 쓸 짧은 요약을 Codex는 따로 주지 않아 spawnAgent 프롬프트
+/// 앞부분이 그대로 라벨이 된다. 프롬프트마다 되풀이되는 작업 폴더 절대경로와 그
+/// 앞의 머리말은 행마다 같은 자리만 먹으므로 표시 전에 걷어낸다. 경로가 머리말이
+/// 아니라 본문 한가운데에서 처음 나오면 손대지 않는다.
+const WORKSPACE_PREFIX_SCAN: usize = 20;
+
+fn strip_workspace_prefix(prompt: &str, cwd: &str) -> String {
+    let one_line = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let root = cwd.trim_end_matches(['/', '\\']);
+    if root.is_empty() {
+        return one_line;
+    }
+    // Windows는 대소문자를 가리지 않고 두 구분자를 모두 받는다. 접기는 바이트 수를
+    // 바꾸지 않으므로 여기서 찾은 위치를 원문에 그대로 쓸 수 있다.
+    let fold = |text: &str| text.replace('\\', "/").to_ascii_lowercase();
+    let Some(at) = fold(&one_line).find(&fold(root)) else {
+        return one_line;
+    };
+    if one_line[..at].chars().count() > WORKSPACE_PREFIX_SCAN {
+        return one_line;
+    }
+    let rest = one_line[at + root.len()..].trim_start_matches(['/', '\\']);
+    let rest = ["에서는", "에서의", "에서", "에는", "의", "에", "를", "을", "는", "은"]
+        .into_iter()
+        .find_map(|particle| rest.strip_prefix(particle))
+        .unwrap_or(rest);
+    let rest = rest.trim_start_matches([' ', ',', ':', '-', '·']).trim();
+    match rest.is_empty() {
+        true => one_line,
+        false => rest.to_owned(),
+    }
+}
+
 fn compact_command(command: &str, max_chars: usize) -> String {
     let one_line = command.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.chars().count() <= max_chars {
@@ -18368,6 +18397,33 @@ mod tests {
         state
     }
 
+    #[test]
+    fn a_codex_subagent_label_drops_the_repeated_workspace_prefix() {
+        assert_eq!(
+            strip_workspace_prefix(
+                "현재 저장소 D:\\hojeSource\\Devez-vibe의 renderer.rs 테스트를 감사하라",
+                "D:\\hojeSource\\Devez-vibe",
+            ),
+            "renderer.rs 테스트를 감사하라"
+        );
+        assert_eq!(
+            strip_workspace_prefix(
+                "Audit d:/hojesource/devez-vibe/src/state.rs for leaks",
+                "D:\\hojeSource\\Devez-vibe",
+            ),
+            "src/state.rs for leaks",
+            "either separator and either case still names the same folder"
+        );
+        assert_eq!(
+            strip_workspace_prefix(
+                "렌더러 테스트가 어떤 순서로 실패하는지 먼저 확인한 다음 왜 D:\\hojeSource\\Devez-vibe 밖을 읽는지 밝혀라",
+                "D:\\hojeSource\\Devez-vibe",
+            ),
+            "렌더러 테스트가 어떤 순서로 실패하는지 먼저 확인한 다음 왜 D:\\hojeSource\\Devez-vibe 밖을 읽는지 밝혀라",
+            "a path deep in the body is content, not a heading"
+        );
+    }
+
     fn subagent_line_notification(kind: &str, text: &str) -> Value {
         json!({
             "parentToolUseId": "toolu_1",
@@ -19837,9 +19893,9 @@ mod tests {
         let on = state
             .committed
             .iter()
-            .find(|block| block.title.starts_with("✓ Fast mode"))
+            .find(|block| block.title == "✓ Fast changed")
             .expect("fast mode notice");
-        assert_eq!(on.title, "✓ Fast mode On");
+        assert_eq!(on.body, "↳ On");
 
         state.set_fast_mode(false);
 
@@ -19848,9 +19904,9 @@ mod tests {
             state
                 .committed
                 .iter()
-                .rfind(|block| block.title.starts_with("✓ Fast mode"))
-                .map(|block| block.title.as_str()),
-            Some("✓ Fast mode Off")
+                .rfind(|block| block.title == "✓ Fast changed")
+                .map(|block| block.body.as_str()),
+            Some("↳ Off")
         );
     }
 
@@ -23905,6 +23961,10 @@ mod tests {
         assert_eq!(
             state.committed.last().map(|block| block.title.as_str()),
             Some("✓ Provider changed")
+        );
+        assert_eq!(
+            state.committed.last().map(|block| block.body.as_str()),
+            Some("↳ Claude · Claude Sonnet 5 · high")
         );
 
         state.run_slash_command("/model");

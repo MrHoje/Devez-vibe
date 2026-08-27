@@ -1066,6 +1066,8 @@ async function createSession(params, resumeId) {
     pendingPrompts: [],
     // Steered prompts whose answer may still need a turn of its own.
     steerPending: 0,
+    // SDK task notifications can prompt the main agent without a host request.
+    automaticTurnsPending: 0,
     turnSequence: 1,
     itemSequence: 1,
     streamBlocks: new Map(),
@@ -1898,6 +1900,9 @@ function processSubagentSystemMessage(session, message) {
     return true;
   }
   if (message.subtype === "task_notification") {
+    if (message.ambient !== true && message.skip_transcript !== true) {
+      session.automaticTurnsPending = (session.automaticTurnsPending || 0) + 1;
+    }
     if (message.ambient === true && message.task_id) {
       session.ambientSubagentTasks ||= new Set();
       session.ambientSubagentTasks.add(firstLine(message.task_id, 80));
@@ -2136,6 +2141,9 @@ function finishNotifiedSubagents(session, notifications) {
 }
 
 function processUser(session, message) {
+  // Resume replays are historical transcript frames, not fresh task results or
+  // prompts. Re-processing their notification XML would invent a new turn.
+  if (message.isReplay === true) return;
   // 자식 tool_result의 tool_use_id는 부모 세션의 것과 다른 공간이므로, 부모 흐름에
   // 섞이기 전에 서브에이전트 기록으로 보낸다.
   if (message.parent_tool_use_id) {
@@ -2144,7 +2152,10 @@ function processUser(session, message) {
   }
   const notifications = taskNotifications(message);
   if (notifications.length) {
-    if (!session.turn) beginTurn(session);
+    if (!session.turn) {
+      if (session.automaticTurnsPending > 0) session.automaticTurnsPending -= 1;
+      beginTurn(session);
+    }
     finishNotifiedSubagents(session, notifications);
     return;
   }
@@ -2315,43 +2326,52 @@ function finishTurn(session, error, durationMs) {
   session.streamBlocks.clear();
 }
 
+// A task notification or steered prompt can start a main-agent response after
+// the host's previous turn already closed. Only a booked continuation may open
+// this fallback turn; stale top-level frames from initialization/resume stay out.
+function beginUntrackedTurn(session, message) {
+  if (session.turn || message.parent_tool_use_id) return false;
+  if (message.type !== "stream_event" && message.type !== "assistant") return false;
+  if (session.automaticTurnsPending > 0) session.automaticTurnsPending -= 1;
+  else if (session.steerPending > 0) session.steerPending -= 1;
+  else return false;
+  beginTurn(session);
+  return true;
+}
+
+async function consumeMessage(session, message) {
+  adoptSessionId(session, message.session_id);
+  beginUntrackedTurn(session, message);
+  if (message.type === "stream_event") {
+    if (message.event?.type === "content_block_delta" && (message.event?.delta?.text || message.event?.delta?.thinking)) {
+      if (session.turn) session.turn.sawStreamText = true;
+    }
+    await processStreamEvent(session, message);
+  } else if (message.type === "assistant") processAssistant(session, message);
+  else if (message.type === "user") processUser(session, message);
+  else if (message.type === "result") await processResult(session, message);
+  else if (message.type === "system" && processSubagentSystemMessage(session, message)) {
+    // Structured SDK task lifecycle handled above.
+  }
+  else if (message.type === "system" && message.subtype === "compact_boundary") {
+    noteCompactBoundary(session, message.compact_metadata);
+    notify("thread/compacted", { threadId: session.id });
+  } else if (message.type === "system" && message.subtype === "permission_denied") {
+    rememberPermissionDenial(session, {
+      tool: message.tool_name,
+      toolUseId: message.tool_use_id,
+      reason: message.decision_reason || message.decision_reason_type,
+    });
+  } else if (message.type === "rate_limit_event") {
+    notify("claude/account/updated", { threadId: session.id, rateLimitInfo: message.rate_limit_info });
+  } else if (message.type === "system" && message.subtype === "api_retry") {
+    notify("warning", { threadId: session.id, provider: "Claude", message: `Claude API 재시도 ${message.attempt}/${message.max_retries}` });
+  }
+}
+
 async function consume(session) {
   for await (const message of session.query) {
-    adoptSessionId(session, message.session_id);
-    // A steered prompt answered after its turn already ended still deserves a
-    // turn of its own, or the host would drop every event that follows.
-    if (!session.turn
-      && session.steerPending > 0
-      && !message.parent_tool_use_id
-      && (message.type === "stream_event" || message.type === "assistant")) {
-      session.steerPending -= 1;
-      beginTurn(session);
-    }
-    if (message.type === "stream_event") {
-      if (message.event?.type === "content_block_delta" && (message.event?.delta?.text || message.event?.delta?.thinking)) {
-        if (session.turn) session.turn.sawStreamText = true;
-      }
-      await processStreamEvent(session, message);
-    } else if (message.type === "assistant") processAssistant(session, message);
-    else if (message.type === "user") processUser(session, message);
-    else if (message.type === "result") await processResult(session, message);
-    else if (message.type === "system" && processSubagentSystemMessage(session, message)) {
-      // Structured SDK task lifecycle handled above.
-    }
-    else if (message.type === "system" && message.subtype === "compact_boundary") {
-      noteCompactBoundary(session, message.compact_metadata);
-      notify("thread/compacted", { threadId: session.id });
-    } else if (message.type === "system" && message.subtype === "permission_denied") {
-      rememberPermissionDenial(session, {
-        tool: message.tool_name,
-        toolUseId: message.tool_use_id,
-        reason: message.decision_reason || message.decision_reason_type,
-      });
-    } else if (message.type === "rate_limit_event") {
-      notify("claude/account/updated", { threadId: session.id, rateLimitInfo: message.rate_limit_info });
-    } else if (message.type === "system" && message.subtype === "api_retry") {
-      notify("warning", { threadId: session.id, provider: "Claude", message: `Claude API 재시도 ${message.attempt}/${message.max_retries}` });
-    }
+    await consumeMessage(session, message);
   }
 }
 
@@ -3486,6 +3506,177 @@ async function runSelfTest() {
     return true;
   };
   try {
+    const automaticTurnSession = {
+      id: "automatic-turn-self-test",
+      turn: null,
+      turnSequence: 1,
+      itemSequence: 1,
+      steerPending: 0,
+      automaticTurnsPending: 0,
+      streamBlocks: new Map(),
+      tools: new Map(),
+      tasks: new Map(),
+      planCreatePending: false,
+      subagents: new Map([
+        ["toolu_automatic", {
+          id: "toolu_automatic",
+          toolUseId: "toolu_automatic",
+          taskId: "automatic-agent",
+          background: true,
+          name: "Explore",
+          description: "Inspect automatic response",
+          tool: "",
+          startedAt: Date.now(),
+          lastSeenAt: Date.now(),
+        }],
+        ["toolu_automatic_2", {
+          id: "toolu_automatic_2",
+          toolUseId: "toolu_automatic_2",
+          taskId: "automatic-agent-2",
+          background: true,
+          name: "Explore",
+          description: "Inspect a second automatic response",
+          tool: "",
+          startedAt: Date.now(),
+          lastSeenAt: Date.now(),
+        }],
+      ]),
+      knownSubagents: new Map(),
+      hiddenSubagentTasks: new Set(),
+      ambientSubagentTasks: new Set(),
+      subagentPulse: null,
+      models: [],
+      model: "claude:default",
+      pendingPrompts: [],
+      permissionDenials: [],
+      lastContextUsage: null,
+      lastContextWindow: 0,
+      query: {
+        async accountInfo() { return null; },
+        async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET() { return null; },
+      },
+    };
+    await consumeMessage(automaticTurnSession, {
+      type: "assistant",
+      parent_tool_use_id: null,
+      message: { content: [{ type: "text", text: "stale replay" }] },
+    });
+    if (automaticTurnSession.turn !== null) {
+      throw new Error("Claude stale top-level response incorrectly opened a host turn");
+    }
+    await consumeMessage(automaticTurnSession, {
+      type: "user",
+      isReplay: true,
+      origin: { kind: "task-notification" },
+      parent_tool_use_id: null,
+      message: { content: `<task-notification>
+<task-id>automatic-agent</task-id>
+<tool-use-id>toolu_automatic</tool-use-id>
+<status>completed</status><summary>Historical completion</summary>
+</task-notification>` },
+    });
+    if (automaticTurnSession.turn !== null
+      || automaticTurnSession.automaticTurnsPending !== 0
+      || automaticTurnSession.subagents.size !== 2) {
+      throw new Error("Claude replayed task notification changed live turn state");
+    }
+
+    await consumeMessage(automaticTurnSession, {
+      type: "system",
+      subtype: "task_notification",
+      task_id: "automatic-agent",
+      tool_use_id: "toolu_automatic",
+      status: "completed",
+      summary: "Agent finished",
+    });
+    await consumeMessage(automaticTurnSession, {
+      type: "system",
+      subtype: "task_notification",
+      task_id: "automatic-agent-2",
+      tool_use_id: "toolu_automatic_2",
+      status: "completed",
+      summary: "Second agent finished",
+    });
+    if (automaticTurnSession.subagents.size !== 0
+      || automaticTurnSession.automaticTurnsPending !== 2
+      || automaticTurnSession.turn !== null) {
+      throw new Error("Claude task notifications did not book both automatic turns");
+    }
+    await consumeMessage(automaticTurnSession, {
+      type: "assistant",
+      parent_tool_use_id: "toolu_child",
+      message: { content: [{ type: "text", text: "child" }] },
+    });
+    if (automaticTurnSession.turn !== null
+      || automaticTurnSession.automaticTurnsPending !== 2) {
+      throw new Error("Claude child response consumed the pending main-agent turn");
+    }
+
+    await consumeMessage(automaticTurnSession, {
+      type: "stream_event",
+      parent_tool_use_id: null,
+      event: { type: "message_start" },
+    });
+    await consumeMessage(automaticTurnSession, {
+      type: "stream_event",
+      parent_tool_use_id: null,
+      event: {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "text" },
+      },
+    });
+    await consumeMessage(automaticTurnSession, {
+      type: "stream_event",
+      parent_tool_use_id: null,
+      event: {
+        type: "content_block_delta",
+        index: 0,
+        delta: { text: "automatic summary one" },
+      },
+    });
+    await consumeMessage(automaticTurnSession, {
+      type: "stream_event",
+      parent_tool_use_id: null,
+      event: { type: "content_block_stop", index: 0 },
+    });
+    await consumeMessage(automaticTurnSession, {
+      type: "assistant",
+      parent_tool_use_id: null,
+      message: { content: [{ type: "text", text: "automatic summary one" }] },
+    });
+    if (automaticTurnSession.turn === null
+      || automaticTurnSession.automaticTurnsPending !== 1) {
+      throw new Error("Claude streamed automatic response did not open one host turn");
+    }
+    await consumeMessage(automaticTurnSession, {
+      type: "result",
+      is_error: false,
+      modelUsage: {},
+      permission_denials: [],
+      duration_ms: 1,
+    });
+    if (automaticTurnSession.turn !== null) {
+      throw new Error("Claude automatic response did not complete its host turn");
+    }
+
+    await consumeMessage(automaticTurnSession, {
+      type: "assistant",
+      parent_tool_use_id: null,
+      message: { content: [{ type: "text", text: "automatic summary two" }] },
+    });
+    await consumeMessage(automaticTurnSession, {
+      type: "result",
+      is_error: false,
+      modelUsage: {},
+      permission_denials: [],
+      duration_ms: 1,
+    });
+    if (automaticTurnSession.turn !== null
+      || automaticTurnSession.automaticTurnsPending !== 0) {
+      throw new Error("Claude consecutive automatic responses left a pending turn");
+    }
+
     processUser(lifecycleSession, {
       message: { content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "launched" }] },
       tool_use_result: { isAsync: true, status: "async_launched", agentId: "agent-1" },
@@ -3786,6 +3977,12 @@ async function runSelfTest() {
   const lifecycleMethods = lifecycleEvents.map((event) => event.method);
   if (!lifecycleMethods.includes("turn/subagents/updated")
     || lifecycleMethods.filter((method) => method === "turn/started").length < 3
+    || !lifecycleEvents.some((event) => event.method === "item/completed"
+      && event.params?.item?.type === "agentMessage"
+      && event.params.item.text === "automatic summary one")
+    || !lifecycleEvents.some((event) => event.method === "item/completed"
+      && event.params?.item?.type === "agentMessage"
+      && event.params.item.text === "automatic summary two")
     || !lifecycleEvents.some((event) => event.method === "turn/subagent/line"
       && event.params?.line?.kind === "error")) {
     throw new Error(`Claude subagent lifecycle events self-test failed: ${lifecycleMethods}`);

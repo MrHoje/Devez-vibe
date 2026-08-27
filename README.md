@@ -16,6 +16,10 @@ npm install -g devez-vibe
 
 설치하면 `dvz` 명령을 사용할 수 있습니다.
 
+설치 과정에서 `luna-loop` 스킬도 Codex와 Claude의 사용자 스킬 경로에 함께 설치됩니다.
+스킬은 자동 적용되지 않으며 `$luna-loop`로 직접 호출해야 합니다. 실제
+`gpt-5.6-luna` 검증을 사용하려면 Codex provider와 Luna 위임 기능이 연결돼 있어야 합니다.
+
 | 요건 | 값 |
 | --- | --- |
 | OS | Windows x64 |

@@ -3584,13 +3584,24 @@ impl Renderer {
         // Streaming text and its fade restyle change Korean rows many times per
         // second. Mid-row cell patches are not stable after ConPTY/xterm host
         // replay, so every changed wide row outside the active composer is
-        // emitted once from column zero. The composer keeps its local diff so
-        // typing never makes the visible cursor travel across the row.
+        // emitted once from column zero. The composer normally keeps its local
+        // diff so typing never makes the visible cursor travel across the row.
+        // When wrapping changes the composer's screen rows, however, an old
+        // Korean row temporarily occupies the new continuation row. Repaint
+        // that geometry transition sequentially once so the old final glyph
+        // cannot flash on the still-empty row below.
+        let previous_composer_rows = self
+            .composer_selection
+            .as_ref()
+            .map(|composer| composer.first_row..composer.first_row + composer.layout.rows.len())
+            .unwrap_or(0..0);
+        let protected_composer_rows =
+            composer_rows_protected_from_sequential_repaint(previous_composer_rows, composer_rows);
         let mut sequential_rows = full_repaint_rows.to_vec();
         sequential_rows.extend(wide_rows_requiring_sequential_repaint(
             self.painted_frame.as_ref(),
             &frame,
-            composer_rows,
+            protected_composer_rows,
         ));
         sequential_rows.sort_unstable();
         sequential_rows.dedup();
@@ -3820,6 +3831,16 @@ fn wide_rows_requiring_sequential_repaint(
                     .any(|cell| cell.continuation)
         })
         .collect()
+}
+
+/// Stable composer rows keep their local diff so ordinary typing does not move
+/// the caret across the row. A wrap that changes their screen range protects
+/// none for one frame, allowing the displaced old Korean row to be repainted.
+fn composer_rows_protected_from_sequential_repaint(
+    previous: Range<usize>,
+    current: Range<usize>,
+) -> Range<usize> {
+    if previous == current { current } else { 0..0 }
 }
 
 /// A plan state change first reaches the normal render path, before the next
@@ -8471,37 +8492,56 @@ fn plan_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     lines
 }
 
-/// Setting changes and system notes share one card: a `◆` heading, `↳` detail
-/// rows, and the plan panel's box drawn to the widest row instead of the full
-/// terminal width.
+/// Setting changes keep their title, arrow, and selected value on one row.
+/// System notes retain a `◆` heading and `↳` detail rows. Both use the plan
+/// panel's content-fit box instead of the full terminal width.
 fn notice_card_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     let title = block.title.trim_start_matches("✓ ").trim_start();
     // Two walls plus the reserved final column bound how wide a row may wrap.
     let wrap_width = ((width as usize).saturating_sub(4).max(9)) as u16;
-    let mut content = wrapped_line("◆ ", Tone::Muted, title, Tone::Plain, true, wrap_width);
-    for row in block.body.lines() {
-        let detail = row.trim_start().trim_start_matches("↳ ").trim_end();
-        if detail.is_empty() {
-            continue;
+    let details = block
+        .body
+        .lines()
+        .map(|row| row.trim_start().trim_start_matches("↳ ").trim_end())
+        .filter(|detail| !detail.is_empty())
+        .collect::<Vec<_>>();
+    let content = if matches!(block.kind, BlockKind::ModelChange)
+        && let [detail] = details.as_slice()
+        && UnicodeWidthStr::width(title) + UnicodeWidthStr::width(*detail) + 3
+            <= wrap_width as usize
+    {
+        let mut line = PaintLine {
+            text: title.to_owned(),
+            tone: Tone::Plain,
+            bold: true,
+            ..PaintLine::plain("")
+        };
+        line.tail.push(PaintSpan {
+            text: " → ".to_owned(),
+            tone: Tone::Muted,
+            bold: false,
+        });
+        if let Some(detail) = coloured_notice_detail(detail, wrap_width) {
+            line.tail.extend(detail.tail);
         }
-        if matches!(block.kind, BlockKind::ModelChange)
-            && let Some(line) = coloured_notice_detail(detail, wrap_width)
-        {
-            content.push(line);
-            continue;
+        vec![line]
+    } else {
+        let mut content = wrapped_line("◆ ", Tone::Muted, title, Tone::Plain, true, wrap_width);
+        for detail in details {
+            content.extend(wrapped_line(
+                "  ↳ ",
+                Tone::Muted,
+                detail,
+                Tone::Plain,
+                false,
+                wrap_width,
+            ));
         }
-        content.extend(wrapped_line(
-            "  ↳ ",
-            Tone::Muted,
-            detail,
-            Tone::Plain,
-            false,
-            wrap_width,
-        ));
-    }
+        content
+    };
     let inner = content.iter().map(painted_line_width).max().unwrap_or(0);
     // Card walls share the marker's muted tone so the two corners, both side
-    // rules, and the `◆`/`↳` gutters read as one unbroken frame.
+    // rules, and any marker gutters read as one unbroken frame.
     let border = Tone::Muted;
     let mut lines = Vec::with_capacity(content.len() + 3);
     lines.push(PaintLine {
@@ -15219,30 +15259,27 @@ mod tests {
     }
 
     #[test]
-    fn setting_and_system_notices_share_a_content_fit_card() {
+    fn setting_notice_places_the_change_and_value_on_one_row() {
         let block = Block::new(
             BlockKind::ModelChange,
-            "✓ Model changed",
-            "↳ GPT-5.6 Terra · xhigh",
+            "✓ Provider changed",
+            "↳ Codex · GPT-5.6 Sol · low",
         );
         let lines = block_lines(&block, 80);
 
-        assert_eq!(lines.len(), 5);
+        assert_eq!(lines.len(), 4);
         assert!(painted(&lines[0]).starts_with('┌'));
         assert!(painted(&lines[0]).ends_with('┐'));
-        assert!(painted(&lines[1]).contains("◆ Model changed"));
-        assert!(painted(&lines[2]).contains("↳ GPT-5.6 Terra · xhigh"));
-        assert!(painted(&lines[3]).starts_with('└'));
+        assert!(painted(&lines[1]).contains("Provider changed → Codex · GPT-5.6 Sol · low"));
+        assert!(painted(&lines[2]).starts_with('└'));
         let card_width = painted_width(&lines[0]);
-        assert!(card_width < 40);
-        assert_eq!(painted_width(&lines[3]), card_width);
-        // Every content row is walled on both sides and closes flush with the
-        // corners above and below it.
-        assert!(lines[1..3].iter().all(|line| {
+        assert!(card_width < 55);
+        assert_eq!(painted_width(&lines[2]), card_width);
+        assert!([&lines[1]].iter().all(|line| {
             let painted = painted(line);
             painted.starts_with('│') && painted.ends_with('│') && painted_width(line) == card_width
         }));
-        assert!(lines[4].text.is_empty());
+        assert!(lines[3].text.is_empty());
     }
 
     #[test]
@@ -15254,13 +15291,12 @@ mod tests {
         );
         let lines = block_lines(&block, 80);
 
-        let detail = &lines[2];
-        // The model name span, the separator, the effort span, then the right
-        // wall the card appends to close the row.
-        assert_eq!(detail.tail.len(), 4);
-        assert_eq!(detail.tail[0].tone, Tone::ModelTerra);
-        assert_eq!(detail.tail[2].tone, Tone::EffortHigh);
-        assert!(detail.tail[3].text.ends_with('│'));
+        let detail = &lines[1];
+        // The arrow, model name, separator, effort, then the closing wall.
+        assert_eq!(detail.tail.len(), 5);
+        assert_eq!(detail.tail[1].tone, Tone::ModelTerra);
+        assert_eq!(detail.tail[3].tone, Tone::EffortHigh);
+        assert!(detail.tail[4].text.ends_with('│'));
     }
 
     #[test]
@@ -23972,7 +24008,7 @@ mod tests {
     }
 
     #[test]
-    fn multiline_composer_rows_keep_local_wide_glyph_diffs() {
+    fn stable_multiline_composer_rows_keep_local_wide_glyph_diffs() {
         let mut previous = CellFrame::new(32, 3);
         previous.write(0, 0, "• 스트리밍", CellStyle::plain());
         previous.write(0, 1, "› 첫 입력", CellStyle::plain());
@@ -23982,8 +24018,49 @@ mod tests {
         current.write(0, 1, "› 첫 입력값", CellStyle::plain());
         current.write(0, 2, "  둘째 입력값", CellStyle::plain());
 
-        let rows = wide_rows_requiring_sequential_repaint(Some(&previous), &current, 1..3);
+        let protected = composer_rows_protected_from_sequential_repaint(1..3, 1..3);
+        assert_eq!(protected, 1..3);
+        let rows = wide_rows_requiring_sequential_repaint(Some(&previous), &current, protected);
         assert_eq!(rows, vec![0]);
+    }
+
+    #[test]
+    fn composer_wrap_geometry_repaints_the_old_korean_row_sequentially() {
+        let mut previous = CellFrame::new(32, 4);
+        previous.write(0, 1, "╭────────╮", CellStyle::plain());
+        previous.write(0, 2, "│ > 마지막글자 │", CellStyle::plain());
+        previous.write(0, 3, "╰────────╯", CellStyle::plain());
+
+        let mut current = CellFrame::new(32, 4);
+        current.write(0, 0, "╭────────╮", CellStyle::plain());
+        current.write(0, 1, "│ > 마지막글자 │", CellStyle::plain());
+        current.write(0, 2, "│              │", CellStyle::plain());
+        current.write(0, 3, "╰────────╯", CellStyle::plain());
+
+        // The composer moved from 2..3 to 1..3 when the continuation row was
+        // inserted. No composer row is protected during this one transition,
+        // so both the moved Korean row and its old screen row repaint from zero.
+        let protected = composer_rows_protected_from_sequential_repaint(2..3, 1..3);
+        assert_eq!(protected, 0..0);
+        let rows = wide_rows_requiring_sequential_repaint(Some(&previous), &current, protected);
+        assert_eq!(rows, vec![1, 2]);
+
+        let mut output = Vec::new();
+        emit_synchronized_frame_diff_with_full_rows(
+            &mut output,
+            Some(&previous),
+            &current,
+            &rows,
+            false,
+            Some((4, 2, true)),
+            true,
+        )
+        .expect("composer wrap frame emits");
+        let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
+
+        assert!(output.contains("\x1b[2;1H"));
+        assert!(output.contains("\x1b[3;1H"));
+        assert!(!output.contains("\x1b[3;15H"));
     }
 
     #[test]

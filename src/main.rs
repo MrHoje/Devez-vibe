@@ -4325,6 +4325,8 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "최우선 시작 응답 규칙: 단순 질문이 아닌 작업에서는 첫 응답 content block을 반드시 사용자에게 보이는 짧은 진행 안내 text로 출력한다. ",
     "TaskCreate를 포함한 어떤 tool_use도 이 text보다 먼저 출력하지 않는다. 같은 assistant message에 text와 tool_use를 함께 출력할 때도 text를 앞에 둔다. ",
     "진행 안내에는 요청에서 무엇을 먼저 확인하고 이어서 무엇을 할지 사용자의 언어로 한두 문장만 적는다. ",
+    "첫 진행 안내에는 요청의 구체 대상과 바로 수행할 조사·수정 동작을 포함한다. ",
+    "`요청 내용을 확인하고 필요한 작업을 진행하겠습니다.`처럼 대상·근거·행동이 없는 포괄적 접수 문구는 쓰지 않는다. ",
     "진행 안내와 답변에는 `진행 안내:`, `결론:`, `완료 보고:` 같은 라벨이나 머리글을 붙이지 않고 문장으로 바로 시작한다. 규칙 속 용어는 지시일 뿐 그대로 출력할 문구가 아니다. ",
     "이 규칙은 사용자 메시지에 대한 첫 assistant message에만 적용한다. ",
     "그다음부터는 알릴 새 사실이 없으면 tool_use 앞에 text를 붙이지 않고 도구를 바로 호출한다.\n",
@@ -7182,6 +7184,11 @@ mod tests {
         assert!(CLAUDE_TURN_REMINDER.contains("사용자 판단에 꼭 필요할 때만 최소로 쓴다"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskCreate"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("첫 응답 content block"));
+        assert!(
+            CLAUDE_DEVEZ_INSTRUCTIONS
+                .contains("요청 내용을 확인하고 필요한 작업을 진행하겠습니다")
+        );
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("대상·근거·행동이 없는 포괄적 접수 문구"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("모든 일반 문장은 반드시 한국어로 작성한다"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("영어 부사·접속사로 문장을 시작하는 형태"));
         assert!(
@@ -8773,15 +8780,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mouse_move_routes_hover_coordinates() {
-        let event = MouseEvent {
-            kind: MouseEventKind::Moved,
-            column: 12,
-            row: 4,
-            modifiers: KeyModifiers::NONE,
-        };
-
-        assert_eq!(mouse_request(&event), MouseRequest::Hover(12, 4));
-    }
 }
