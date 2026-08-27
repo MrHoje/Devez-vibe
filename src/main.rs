@@ -710,6 +710,7 @@ fn hold_until_thread(
         | Action::Quit
         | Action::SetTheme(_)
         | Action::Copy(_)
+        | Action::Cut(_)
         | Action::OpenUrl(_)) => Some(action),
         Action::ScrollToBottom => Some(Action::ScrollToBottom),
         // Once a switch is owed, the prompt belongs to the session being resumed. The
@@ -1551,6 +1552,16 @@ async fn event_loop(
                                 renderer.clear_selection();
                                 selection_edited = true;
                                 Action::Tick(true)
+                            } else if is_cut_shortcut(&key)
+                                && let Some(range) = composer_replace_range(renderer, input_state)
+                                && let Some(text) = input_state.composer_text_in(range.clone())
+                                && input_state.delete_composer_selection(range)
+                            {
+                                // The text reaches the clipboard first, so a cut that
+                                // the delete somehow refuses leaves the prompt intact.
+                                renderer.clear_selection();
+                                selection_edited = true;
+                                Action::Cut(text)
                             } else if is_selection_replace_key(&key)
                                 && let Some(range) = composer_replace_range(renderer, input_state)
                                 && input_state.delete_composer_selection(range)
@@ -2343,6 +2354,7 @@ async fn execute_action(
         action @ (Action::None
         | Action::Tick(_)
         | Action::Copy(_)
+        | Action::Cut(_)
         | Action::OpenUrl(_)
         | Action::SetTheme(_)
         | Action::ScrollToBottom
@@ -4080,6 +4092,16 @@ fn execute_local_action(
                 Err(error) => state.push_notice(BlockKind::Error, "복사 실패", error.to_string()),
             }
         }
+        // The composer already gave the text up; only the clipboard is left. A
+        // failure says so rather than pretending the cut landed somewhere.
+        Action::Cut(text) => {
+            match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(&text)) {
+                Ok(()) => state.set_cut_notice(),
+                Err(error) => {
+                    state.push_notice(BlockKind::Error, "잘라내기 실패", error.to_string())
+                }
+            }
+        }
         Action::OpenUrl(url) => {
             if let Err(error) = open_url(&url) {
                 state.push_notice(BlockKind::Warning, "브라우저 열기 실패", error.to_string());
@@ -5451,6 +5473,17 @@ fn composer_replace_range(
         return (end > 0).then_some(0..end);
     }
     renderer.composer_selection_range()
+}
+
+/// Ctrl+X over selected composer text cuts it. With a Korean IME on, the chord
+/// can arrive as its 두벌식 jamo, which nothing else claims.
+fn is_cut_shortcut(key: &KeyEvent) -> bool {
+    matches!(
+        key.kind,
+        crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
+    ) && matches!(key.code, KeyCode::Char('x' | 'X' | 'ㅌ'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SUPER)
 }
 
 /// A plain character typed over selected composer text replaces it, as it does in

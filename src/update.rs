@@ -19,11 +19,11 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "선택지에 답한 뒤 후속 출력이 이어질 때 화면이 위아래로 튀던 문제를 고쳤습니다.",
-    "Codex의 새 MCP 프로토콜을 켜, MCP 서버가 늦게 올라와도 대화가 기다리지 않습니다.",
-    "Claude 실행 파일을 최신 버전으로 올려, 긴 경로와 좁은 터미널에서 나던 오류를 없앴습니다.",
-    "끝난 백그라운드 에이전트가 실행 목록에 남아 있던 문제를 고쳤습니다.",
-    "실행 중인 에이전트 줄을 상태줄과 한 줄 띄우고 작은 점으로 표시해 한눈에 구분됩니다.",
+    "한글을 입력할 때 글자가 겹쳐 보이거나, 이미 쓴 글자가 지워졌다 다시 써지던 문제를 고쳤습니다.",
+    "입력창 글이 다음 줄로 넘어갈 때 같은 글이 아래에 잠깐 비치던 현상도 함께 없앴습니다.",
+    "선택한 입력창 글을 Ctrl+X로 잘라낼 수 있습니다. 한글 입력 상태에서도 동작합니다.",
+    "Ctrl+S로 쓰던 글을 잠시 치워 두었다가, 빈 입력창에서 같은 키로 다시 불러올 수 있습니다.",
+    "답변 분량을 글자 수 대신 불릿 개수로 제한해, 문장이 중간에 끊기지 않습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

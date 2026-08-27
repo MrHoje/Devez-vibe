@@ -19,7 +19,7 @@ use crate::{
         CompletionCandidate, CompletionKind, CompletionMode, CompletionTarget, completion_target,
         completion_text, filter_candidates,
     },
-    editor::{ATTACHMENT_PLACEHOLDER, Editor},
+    editor::{ATTACHMENT_PLACEHOLDER, Editor, Stash},
     integrations::{
         MarketplacePicker, MarketplacePickerResult, McpPicker, McpPickerResult, McpServerInfo,
         PluginCatalog, PluginDetail, PluginInfo, PluginPicker, PluginPickerResult, PluginScope,
@@ -1334,6 +1334,9 @@ pub enum Action {
     ScrollToBottom,
     ScrollToPrompt(u64),
     Copy(String),
+    /// The selected prompt text, already removed from the composer. Only the
+    /// clipboard write and its notice are left to do.
+    Cut(String),
     /// Highlight the whole prompt. The selection lives in the renderer, which
     /// alone knows where the composer's characters were painted.
     SelectComposerAll,
@@ -3592,9 +3595,17 @@ struct McpFailure {
     detail: Option<String>,
 }
 
+/// A composer draft held aside by `Ctrl+S`, with the images attached to it.
+struct StashedPrompt {
+    composer: Stash,
+    images: Vec<String>,
+}
+
 pub struct AppState {
     pub editor: Editor,
     composer_images: Vec<String>,
+    /// The draft `Ctrl+S` set aside, waiting for the chord that brings it back.
+    stashed_prompt: Option<StashedPrompt>,
     queued_prompts: VecDeque<String>,
     pub thread_id: String,
     /// The id a later `-r` has to use for this thread, when that is no longer the
@@ -3898,6 +3909,7 @@ impl AppState {
         let mut state = Self {
             editor: Editor::default(),
             composer_images: Vec::new(),
+            stashed_prompt: None,
             queued_prompts: VecDeque::new(),
             thread_id,
             resume_id: String::new(),
@@ -5515,6 +5527,11 @@ impl AppState {
         self.composer_notice = Some(("• Copied to clipboard".to_owned(), Instant::now()));
     }
 
+    pub fn set_cut_notice(&mut self) {
+        self.disarm_quit();
+        self.composer_notice = Some(("• Cut to clipboard".to_owned(), Instant::now()));
+    }
+
     /// Arms the quit and puts up the warning that spends the same window.
     fn arm_quit(&mut self) {
         self.quit_armed_at = Some(Instant::now());
@@ -5541,6 +5558,40 @@ impl AppState {
     /// so nothing parks there waiting for a new thread to wipe it.
     fn set_composer_notice(&mut self, message: String) {
         self.composer_notice = Some((message, Instant::now()));
+    }
+
+    /// `Ctrl+S`. A composer with something in it hands its draft to the stash
+    /// and is left empty; an empty composer takes the stashed draft back. An
+    /// empty composer with nothing stashed has no work to do. A second stash
+    /// replaces the first, as it does in the CLI.
+    fn toggle_composer_stash(&mut self) {
+        if self.editor.is_empty() && self.composer_images.is_empty() {
+            if self.restore_stashed_prompt() {
+                self.set_composer_notice("• 보관한 초안을 되돌렸습니다".to_owned());
+            }
+            return;
+        }
+        self.stashed_prompt = Some(StashedPrompt {
+            composer: self.editor.take_stash(),
+            images: std::mem::take(&mut self.composer_images),
+        });
+        self.selected_completion_bindings.clear();
+        self.suggestions_dismissed_text = None;
+        self.command_selection = 0;
+        self.set_composer_notice("• 초안 보관 · Ctrl+S로 되돌립니다".to_owned());
+    }
+
+    /// Puts the stashed draft back into the composer. Reports whether there was
+    /// one to put back.
+    fn restore_stashed_prompt(&mut self) -> bool {
+        let Some(stashed) = self.stashed_prompt.take() else {
+            return false;
+        };
+        self.editor.restore_stash(stashed.composer);
+        self.composer_images = stashed.images;
+        self.suggestions_dismissed_text = None;
+        self.command_selection = 0;
+        true
     }
 
     pub fn side_parent_thread_id(&self) -> Option<&str> {
@@ -6452,6 +6503,10 @@ impl AppState {
                 "Enter: queue for switched provider · Tab: queue"
             } else if self.busy {
                 "Enter: steer · Tab: queue"
+            } else if self.stashed_prompt.is_some() {
+                // An empty composer is the only place the stash can be reclaimed
+                // from, so its own hint sits exactly where the chord applies.
+                "Ctrl+S: 보관한 초안 되돌리기"
             } else {
                 ""
             },
@@ -6857,6 +6912,21 @@ impl AppState {
         Some(self.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)))
     }
 
+    /// The composer text a range covers, for a cut that has to reach the
+    /// clipboard before the delete takes it. Image placeholders stand for
+    /// attachments rather than characters, so they are left out.
+    pub fn composer_text_in(&self, range: std::ops::Range<usize>) -> Option<String> {
+        let chars = self.editor.chars();
+        let start = range.start.min(chars.len());
+        let end = range.end.min(chars.len());
+        let text: String = chars
+            .get(start..end)?
+            .iter()
+            .filter(|&&ch| ch != ATTACHMENT_PLACEHOLDER)
+            .collect();
+        (!text.is_empty()).then_some(text)
+    }
+
     /// Deletes the composer characters a drag selected, along with any attachment
     /// whose placeholder the drag covered. Reports whether the range was
     /// consumed, so a Backspace that finds nothing selected still falls through
@@ -7252,6 +7322,13 @@ impl AppState {
             }
             KeyCode::Char('y') if ctrl => {
                 self.editor.yank();
+                Action::None
+            }
+            // Ctrl+S sets the draft aside, as it does in the CLI, and brings it
+            // back when the composer is empty. With a Korean IME on, the chord
+            // can arrive as its 두벌식 jamo, which no chord of its own claims.
+            KeyCode::Char('s' | 'ㄴ') if ctrl => {
+                self.toggle_composer_stash();
                 Action::None
             }
             KeyCode::Char('j') if ctrl => {
@@ -8703,7 +8780,17 @@ impl AppState {
             return Action::None;
         }
         if text.starts_with('/') && !text.contains('\n') {
-            return self.run_slash_command(&text);
+            let action = self.run_slash_command(&text);
+            // A slash command starts no turn, so the draft that was set aside to
+            // make room for it comes back on its own — unless the command itself
+            // left something in the composer.
+            if self.editor.is_empty()
+                && self.composer_images.is_empty()
+                && self.restore_stashed_prompt()
+            {
+                self.set_composer_notice("• 보관한 초안을 되돌렸습니다".to_owned());
+            }
+            return action;
         }
         if self.provider_switch_pending() {
             self.queued_prompts.push_back(text);
@@ -8815,7 +8902,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/provider [claude|codex|opencode]  Claude·Codex 전환, OpenCode 연결\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
+                    format!("/provider [claude|codex|opencode]  Claude·Codex 전환, OpenCode 연결\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
                 ));
                 Action::None
             }
@@ -15735,6 +15822,81 @@ mod tests {
             Action::None
         ));
         assert_eq!(state.editor.text(), "hello worldㅁ");
+    }
+
+    #[test]
+    fn ctrl_s_sets_the_draft_aside_and_brings_it_back() {
+        let mut state = test_state();
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        // An empty composer with nothing stashed has no work to do.
+        assert!(matches!(state.handle_key(ctrl_s), Action::None));
+        assert!(state.stashed_prompt.is_none());
+        assert!(state.view().composer_notice.is_none());
+
+        state.editor.set_text("half written prompt");
+        state.editor.move_home();
+        state.editor.move_word_right();
+        let cursor = state.editor.cursor();
+        state.composer_images.push(r"C:\Temp\shot.bmp".to_owned());
+
+        state.handle_key(ctrl_s);
+        assert!(state.editor.is_empty());
+        assert!(state.composer_images.is_empty());
+        assert_eq!(
+            state.view().composer_placeholder,
+            "Ctrl+S: 보관한 초안 되돌리기"
+        );
+
+        // A Korean IME sends the chord as its 두벌식 jamo.
+        state.handle_key(KeyEvent::new(KeyCode::Char('ㄴ'), KeyModifiers::CONTROL));
+        assert_eq!(state.editor.text(), "half written prompt");
+        assert_eq!(state.editor.cursor(), cursor);
+        assert_eq!(state.composer_images, [r"C:\Temp\shot.bmp"]);
+        assert!(state.stashed_prompt.is_none());
+        assert_eq!(state.view().composer_placeholder, "");
+
+        // A second stash replaces the first.
+        state.handle_key(ctrl_s);
+        state.editor.set_text("newer draft");
+        state.handle_key(ctrl_s);
+        state.handle_key(ctrl_s);
+        assert_eq!(state.editor.text(), "newer draft");
+    }
+
+    #[test]
+    fn a_slash_command_hands_the_stashed_draft_back() {
+        let mut state = test_state();
+        state.editor.set_text("draft in progress");
+        state.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(state.editor.is_empty());
+
+        // A slash command starts no turn, so the draft it made room for returns
+        // on its own.
+        state.submit_text("/help".to_owned(), "/help".to_owned());
+        assert_eq!(state.editor.text(), "draft in progress");
+        assert!(state.stashed_prompt.is_none());
+    }
+
+    #[test]
+    fn a_cut_reads_the_selected_text_without_the_attachment_placeholders() {
+        let mut state = test_state();
+        state.editor.set_text("hello world");
+
+        assert_eq!(
+            state.composer_text_in(0..11).as_deref(),
+            Some("hello world")
+        );
+        assert_eq!(state.composer_text_in(6..11).as_deref(), Some("world"));
+        // A range taken from the paint can outrun a composer that has since
+        // shrunk, so it clamps rather than losing the cut.
+        assert_eq!(state.composer_text_in(6..99).as_deref(), Some("world"));
+        // An empty range has nothing to put on the clipboard.
+        assert_eq!(state.composer_text_in(3..3), None);
+
+        // An image stands for an attachment, not for a character.
+        state.editor.set_text(format!("{ATTACHMENT_PLACEHOLDER}ok"));
+        assert_eq!(state.composer_text_in(0..3).as_deref(), Some("ok"));
     }
 
     fn opencode_picker_state() -> AppState {

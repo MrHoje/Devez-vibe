@@ -3,6 +3,18 @@ pub const ATTACHMENT_PLACEHOLDER: char = '\u{fffc}';
 /// How many lines a paste needs before the composer shows it as one summary.
 const COLLAPSE_MIN_LINES: usize = 6;
 
+/// A composer draft set aside by `Ctrl+S`. It carries what the composer was
+/// showing — the text, the cursor, and a collapsed paste — but not the prompt
+/// history, which belongs to the composer rather than to one draft.
+#[derive(Clone, Default)]
+pub struct Stash {
+    buffer: Vec<char>,
+    cursor: usize,
+    collapsed_paste_lines: Option<usize>,
+    collapsed_paste_start: Option<usize>,
+    collapsed_paste_end: Option<usize>,
+}
+
 #[derive(Default)]
 pub struct Editor {
     buffer: Vec<char>,
@@ -330,6 +342,31 @@ impl Editor {
         self.collapsed_paste_lines = None;
         self.collapsed_paste_start = None;
         self.collapsed_paste_end = None;
+    }
+
+    /// Lifts the current draft out of the composer, leaving it empty. The
+    /// caller holds the stash until something puts it back.
+    pub fn take_stash(&mut self) -> Stash {
+        let stash = Stash {
+            buffer: std::mem::take(&mut self.buffer),
+            cursor: self.cursor,
+            collapsed_paste_lines: self.collapsed_paste_lines,
+            collapsed_paste_start: self.collapsed_paste_start,
+            collapsed_paste_end: self.collapsed_paste_end,
+        };
+        self.clear();
+        stash
+    }
+
+    /// Puts a stashed draft back, cursor included.
+    pub fn restore_stash(&mut self, stash: Stash) {
+        self.history_index = None;
+        self.draft.clear();
+        self.buffer = stash.buffer;
+        self.cursor = stash.cursor.min(self.buffer.len());
+        self.collapsed_paste_lines = stash.collapsed_paste_lines;
+        self.collapsed_paste_start = stash.collapsed_paste_start;
+        self.collapsed_paste_end = stash.collapsed_paste_end;
     }
 
     pub fn set_text(&mut self, text: impl Into<String>) {
