@@ -1697,6 +1697,17 @@ function isSubagentTaskType(taskType) {
   return String(taskType || "").toLowerCase().includes("agent");
 }
 
+// 백그라운드 목록에는 하위 에이전트만이 아니라 백그라운드로 돌린 명령과
+// 워크플로도 함께 실린다. 이름 자리에 그 종류를 세워 두면 행만 보고도 무엇이
+// 도는지 구분할 수 있다. 모르는 종류는 서버가 준 값을 그대로 쓴다.
+function backgroundTaskName(taskType) {
+  const type = String(taskType || "").toLowerCase();
+  if (type.includes("shell") || type.includes("bash") || type.includes("command")) return "Bash";
+  if (type.includes("workflow")) return "Workflow";
+  if (type.includes("monitor")) return "Monitor";
+  return firstLine(taskType || "agent", 40);
+}
+
 // Claude's SDK exposes task_started/task_progress/task_updated/task_notification
 // as structured lifecycle edges. Prefer those fields over parsing the injected
 // XML fallback so a formatting change cannot leave a stale running row.
@@ -1803,14 +1814,13 @@ function syncBackgroundSubagents(session, tasks) {
     if (!taskId) continue;
     let running = findSubagent(session, taskId);
     const known = session.knownSubagents.get(taskId);
-    if (!running && !known && !isSubagentTaskType(task?.task_type)) continue;
     if (!running) {
       running = {
         id: `task:${taskId}`,
         toolUseId: "",
         taskId,
         background: true,
-        name: known?.name || "agent",
+        name: known?.name || backgroundTaskName(task?.task_type),
         description: firstLine(task?.description || known?.description || "", 120),
         tool: "",
         startedAt: Date.now(),
@@ -3685,6 +3695,26 @@ async function runSelfTest() {
     });
     if (structuredSession.ambientSubagentTasks.size !== 0) {
       throw new Error("Claude ambient task completion did not clear hidden state");
+    }
+
+    // 백그라운드로 돌린 명령도 하위 에이전트와 같은 행으로 보여야 한다. 그
+    // 목록은 REPLACE 의미라 다음 빈 스냅샷이 행을 걷어 간다.
+    processSubagentSystemMessage(structuredSession, {
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "shell-1", task_type: "local_shell", description: "sleep 600" }],
+    });
+    const shell = findSubagent(structuredSession, "shell-1");
+    if (shell?.name !== "Bash" || shell.description !== "sleep 600") {
+      throw new Error(`Claude background command self-test failed: ${JSON.stringify(shell)}`);
+    }
+    processSubagentSystemMessage(structuredSession, {
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [],
+    });
+    if (structuredSession.subagents.size !== 0) {
+      throw new Error("Claude background command row outlived its snapshot");
     }
 
     processSubagentSystemMessage(structuredSession, {

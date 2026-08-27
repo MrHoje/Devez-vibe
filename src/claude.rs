@@ -739,4 +739,15 @@ mod tests {
         assert!(bridge.contains("if (!session.turn) beginTurn(session);"));
         assert!(bridge.contains("notify(\"turn/subagents/updated\""));
     }
+
+    /// 백그라운드 목록은 하위 에이전트만의 것이 아니다. 백그라운드로 돌린 명령을
+    /// 종류로 걸러 내면 실행 중인 일이 화면에서 통째로 사라진다.
+    #[test]
+    fn bridge_lists_background_commands_next_to_subagents() {
+        let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
+
+        assert!(bridge.contains("name: known?.name || backgroundTaskName(task?.task_type)"));
+        assert!(!bridge.contains("if (!running && !known && !isSubagentTaskType(task?.task_type))"));
+        assert!(bridge.contains("function backgroundTaskName(taskType)"));
+    }
 }
