@@ -791,6 +791,10 @@ impl BackendServer {
         }
     }
 
+    pub fn open_code_provider_api(&self) -> Option<crate::open_code::ProviderAuthServer> {
+        self.open_code.as_ref().map(OpenCodeServer::provider_api)
+    }
+
     pub async fn integration_request(
         &self,
         model: &str,

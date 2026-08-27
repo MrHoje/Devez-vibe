@@ -6482,33 +6482,31 @@ fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine
         .max()
         .unwrap_or_default()
         .min(inner_width.saturating_sub(13 + SUGGESTION_RIGHT_INSET));
+    let command_name_width = suggestions
+        .iter()
+        .filter(|suggestion| suggestion.category.is_none())
+        .map(|suggestion| UnicodeWidthStr::width(suggestion.command.as_str()))
+        .max()
+        .unwrap_or(COMMAND_COLUMN_WIDTH)
+        .max(COMMAND_COLUMN_WIDTH)
+        .min(inner_width.saturating_sub(13 + SUGGESTION_RIGHT_INSET));
     for suggestion in visible {
         let marker = if suggestion.selected { "❯" } else { " " };
         let line = match suggestion.category.as_deref() {
-            Some(category) => completion_suggestion_line(
+            Some(category) => named_suggestion_line(
                 suggestion,
-                category,
+                &format!("[{category}] {}", suggestion.command),
                 marker,
                 completion_name_width,
                 panel_width,
             ),
-            None => {
-                let content = format!(
-                    " {marker} {:<COMMAND_COLUMN_WIDTH$} {}",
-                    suggestion.command, suggestion.description
-                );
-                panel_line_keep_left_inset(
-                    &content,
-                    panel_width,
-                    SUGGESTION_RIGHT_INSET,
-                    if suggestion.selected {
-                        Tone::Accent
-                    } else {
-                        Tone::Muted
-                    },
-                    suggestion.selected,
-                )
-            }
+            None => named_suggestion_line(
+                suggestion,
+                &suggestion.command,
+                marker,
+                command_name_width,
+                panel_width,
+            ),
         };
         lines.push(line);
     }
@@ -6528,9 +6526,9 @@ fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine
     lines
 }
 
-fn completion_suggestion_line(
+fn named_suggestion_line(
     suggestion: &SuggestionView,
-    category: &str,
+    label: &str,
     marker: &str,
     name_width: usize,
     panel_width: usize,
@@ -6540,7 +6538,7 @@ fn completion_suggestion_line(
     let description_width = inner_width
         .saturating_sub(SUGGESTION_RIGHT_INSET)
         .saturating_sub(fixed_width);
-    let name = compact_right(&format!("[{category}] {}", suggestion.command), name_width);
+    let name = compact_right(label, name_width);
     let name_padding = name_width.saturating_sub(UnicodeWidthStr::width(name.as_str()));
     let description = compact_right(&suggestion.description, description_width);
     let description_padding =
@@ -20620,7 +20618,10 @@ mod tests {
         let lines = suggestion_lines(&suggestions, 40);
         let option = lines
             .iter()
-            .find(|line| line.text.contains("/renderer") || line.text.contains("scrollback"))
+            .find(|line| {
+                let line = painted(line);
+                line.contains("/renderer") || line.contains("scrollback")
+            })
             .expect("option row");
 
         assert!(!painted(option).contains(['\r', '\n']));
@@ -20683,6 +20684,10 @@ mod tests {
             UnicodeWidthStr::width(&short_name_row[..short_description]),
             UnicodeWidthStr::width(&long_name_row[..long_description])
         );
+        assert_eq!(lines[2].tail[2].tone, Tone::Accent);
+        assert_eq!(lines[2].tail[3].tone, Tone::Muted);
+        assert_eq!(lines[3].tail[2].tone, Tone::Plain);
+        assert_eq!(lines[3].tail[3].tone, Tone::Muted);
     }
 
     #[test]

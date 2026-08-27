@@ -1456,15 +1456,12 @@ async fn event_loop(
                 integration_rx = Some(start_integration_refresh(server, state));
             }
         }
-        // The side panel stays disconnected, but `$` completion still needs the
-        // skill list. Load it for Claude on the first draw and on every cwd/model
-        // change, independent of the panel-wide integration refresh above.
-        if claude::is_claude_model(state.selected_model_name()) {
-            let current_skills_key = (state.cwd.clone(), state.selected_model_name().to_owned());
-            if skills_key.as_ref() != Some(&current_skills_key) {
-                skills_key = Some(current_skills_key);
-                skills_rx = Some(start_skills_refresh(server, state));
-            }
+        // The side panel stays disconnected, but `@` and `$` completion still
+        // need the selected provider's own skill list on every cwd/model change.
+        let current_skills_key = (state.cwd.clone(), state.selected_model_name().to_owned());
+        if skills_key.as_ref() != Some(&current_skills_key) {
+            skills_key = Some(current_skills_key);
+            skills_rx = Some(start_skills_refresh(server, state).await);
         }
         if indexed_cwd.as_deref() != Some(state.cwd.as_str()) {
             let cwd = state.cwd.clone();
@@ -1739,9 +1736,9 @@ async fn event_loop(
                 }
                 Action::None
             }
-            Some((provider, result)) = recv_skills(&mut skills_rx) => {
+            Some((model, result)) = recv_skills(&mut skills_rx) => {
                 if let Ok(response) = result {
-                    state.update_skills_for_provider(provider, &response);
+                    state.update_skills_for_model(&model, &response);
                 }
                 Action::None
             }
@@ -4861,28 +4858,49 @@ async fn recv_integrations(
     catalogue
 }
 
-type SkillsResult = (SkillProvider, std::result::Result<Value, String>);
+type SkillsResult = (String, std::result::Result<Value, String>);
 
 /// Fetches only the skill list for the current provider in the background, so
 /// `$` completion has skills without opening `/skills` first.
-fn start_skills_refresh(server: &BackendServer, state: &AppState) -> mpsc::Receiver<SkillsResult> {
+async fn start_skills_refresh(
+    server: &mut BackendServer,
+    state: &AppState,
+) -> mpsc::Receiver<SkillsResult> {
     let model = state.selected_model_name().to_owned();
-    let provider = SkillProvider::from_model(&model);
+    let startup_error =
+        if !claude::is_claude_model(&model) && !open_code::is_open_code_model(&model) {
+            server
+                .start_codex()
+                .await
+                .err()
+                .map(|error| error.to_string())
+        } else {
+            None
+        };
     let client = server.integration_client(&model);
+    let open_code_api = open_code::is_open_code_model(&model)
+        .then(|| server.open_code_provider_api())
+        .flatten();
     let cwd = state.cwd.clone();
     let (sender, receiver) = mpsc::channel(1);
+    let result_model = model.clone();
     tokio::spawn(async move {
-        let result = match client {
-            Some(client) => client
+        let result = if let Some(error) = startup_error {
+            Err(error)
+        } else if let Some(api) = open_code_api {
+            api.skills().await.map_err(|error| error.to_string())
+        } else if let Some(client) = client {
+            client
                 .request(
                     "skills/list",
                     json!({ "cwd": cwd.clone(), "cwds": [cwd], "forceReload": true }),
                 )
                 .await
-                .map_err(|error| error.to_string()),
-            None => Ok(json!({ "data": [] })),
+                .map_err(|error| error.to_string())
+        } else {
+            Err("현재 provider의 Skill 조회 연결이 없습니다.".to_owned())
         };
-        let _ = sender.send((provider, result)).await;
+        let _ = sender.send((result_model, result)).await;
     });
     receiver
 }

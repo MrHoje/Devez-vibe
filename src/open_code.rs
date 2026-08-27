@@ -536,6 +536,11 @@ impl ProviderAuthServer {
         self.get(&["provider"]).await
     }
 
+    pub async fn skills(&self) -> Result<Value> {
+        self.wait_until_ready().await?;
+        Ok(normalize_skill_catalog(self.get(&["skill"]).await?))
+    }
+
     async fn session_status(&self) -> Result<Value> {
         self.get(&["session", "status"]).await
     }
@@ -640,6 +645,35 @@ impl ProviderAuthServer {
             .extend(segments);
         Ok(url)
     }
+}
+
+fn normalize_skill_catalog(response: Value) -> Value {
+    let skills = response
+        .as_array()
+        .or_else(|| response.get("data").and_then(Value::as_array))
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|skill| {
+            let name = skill.get("name").and_then(Value::as_str)?;
+            let path = skill
+                .get("location")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("opencode://skill/{name}"));
+            Some(json!({
+                "name": name,
+                "path": path,
+                "description": skill
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                "enabled": true,
+                "scope": "opencode"
+            }))
+        })
+        .collect::<Vec<_>>();
+    json!({ "data": [{ "skills": skills, "errors": [] }] })
 }
 
 impl OpenCodeServer {
@@ -872,6 +906,10 @@ impl OpenCodeServer {
                 }),
             )
             .await
+    }
+
+    pub fn provider_api(&self) -> ProviderAuthServer {
+        self.provider_auth.clone()
     }
 
     pub async fn model_catalog(&self, cwd: &Path) -> Result<Value> {
@@ -2045,6 +2083,31 @@ fn image_mime(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_code_skill_catalog_is_normalized_for_composer_completion() {
+        let catalog = normalize_skill_catalog(json!([
+            {
+                "name": "review",
+                "description": "Review a change",
+                "location": "C:/skills/review/SKILL.md"
+            },
+            {
+                "name": "built-in",
+                "description": "Built in skill"
+            }
+        ]));
+        let skills = catalog
+            .pointer("/data/0/skills")
+            .and_then(Value::as_array)
+            .expect("normalized skills");
+
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0]["path"], "C:/skills/review/SKILL.md");
+        assert_eq!(skills[0]["scope"], "opencode");
+        assert_eq!(skills[1]["path"], "opencode://skill/built-in");
+        assert_eq!(skills[1]["enabled"], true);
+    }
 
     #[test]
     fn open_code_models_are_namespaced() {

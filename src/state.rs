@@ -4047,6 +4047,13 @@ impl AppState {
         ModelProvider::from_model(self.selected_model_name())
     }
 
+    fn clear_provider_completions(&mut self) {
+        self.skills.clear();
+        self.mentions.clear();
+        self.app_mentions.clear();
+        self.rebuild_completion_catalog();
+    }
+
     pub fn is_selected_provider_model(&self, model: &str) -> bool {
         self.selected_provider() == ModelProvider::from_model(model)
     }
@@ -4332,7 +4339,8 @@ impl AppState {
 
     fn switch_provider(&mut self, provider: ModelProvider) {
         self.commit_welcome_card();
-        if self.selected_provider() == provider {
+        let previous_provider = self.selected_provider();
+        if previous_provider == provider {
             self.committed.push(Block::new(
                 BlockKind::System,
                 "Provider",
@@ -4363,6 +4371,7 @@ impl AppState {
         self.selected_effort = effort.clone();
         self.context_window = model.context_window;
         self.normalize_claude_permission_mode_for_selected_model();
+        self.clear_provider_completions();
         let detail = if effort.is_empty() {
             format!("↳ {} · {model_name}", provider.label())
         } else {
@@ -4716,6 +4725,12 @@ impl AppState {
 
     pub fn update_skills_for_provider(&mut self, provider: SkillProvider, response: &Value) {
         if SkillProvider::from_model(self.selected_model_name()) == provider {
+            self.update_skills(response);
+        }
+    }
+
+    pub fn update_skills_for_model(&mut self, model: &str, response: &Value) {
+        if self.is_selected_provider_model(model) {
             self.update_skills(response);
         }
     }
@@ -5681,6 +5696,7 @@ impl AppState {
     /// Points the status line at what the server actually picked, without the
     /// confirmation card [`Self::apply_model`] posts for a user-driven change.
     fn select_model_and_effort(&mut self, model: &str, effort: Option<&str>) {
+        let previous_provider = self.selected_provider();
         if let Some(index) = self
             .models
             .iter()
@@ -5700,6 +5716,9 @@ impl AppState {
             .or_else(|| effort.map(ToOwned::to_owned))
             .unwrap_or_else(|| self.selected_effort.clone());
         self.normalize_claude_permission_mode_for_selected_model();
+        if self.selected_provider() != previous_provider {
+            self.clear_provider_completions();
+        }
     }
 
     /// Rebuilds the transcript from a resumed thread. `rollout` fills in what
@@ -6427,9 +6446,9 @@ impl AppState {
                 })
                 .collect(),
             composer_placeholder: if self.provider_switch_pending() {
-                "Enter: queue for switched provider · Tab: queue · @: Mention · $: Tools"
+                "Enter: queue for switched provider · Tab: queue"
             } else if self.busy {
-                "Enter: steer · Tab: queue · @: Mention · $: Tools"
+                "Enter: steer · Tab: queue"
             } else {
                 ""
             },
@@ -12209,6 +12228,8 @@ impl AppState {
         let Some(model) = self.models.get(index) else {
             return;
         };
+        let previous_provider = self.selected_provider();
+        let next_provider = ModelProvider::from_model(&model.model);
         let selected_effort = effort
             .filter(|effort| model.supports_effort(effort))
             .unwrap_or(&model.default_effort)
@@ -12219,6 +12240,9 @@ impl AppState {
         self.selected_effort = selected_effort.clone();
         self.context_window = context_window.or(self.context_window);
         self.normalize_claude_permission_mode_for_selected_model();
+        if next_provider != previous_provider {
+            self.clear_provider_completions();
+        }
         self.committed.push(Block::new(
             BlockKind::ModelChange,
             "✓ Model changed",
@@ -21877,7 +21901,7 @@ mod tests {
 
         assert_eq!(
             state.view().composer_placeholder,
-            "Enter: steer · Tab: queue · @: Mention · $: Tools"
+            "Enter: steer · Tab: queue"
         );
     }
 
@@ -23204,6 +23228,73 @@ mod tests {
             ),
         ]);
         state
+    }
+
+    #[test]
+    fn provider_skill_refreshes_do_not_leak_across_runtime_switches() {
+        let mut state = AppState::new(
+            String::new(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![
+                test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
+                test_model("claude:claude-opus-5", "Claude Opus", false),
+                test_model(
+                    "opencode:opencode-go/deepseek-v4-flash",
+                    "DeepSeek V4 Flash · OpenCode Go",
+                    false,
+                ),
+            ],
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+        let skills = |name: &str| {
+            json!({
+                "data": [{
+                    "skills": [{
+                        "name": name,
+                        "path": format!("C:/skills/{name}/SKILL.md"),
+                        "description": format!("{name} skill"),
+                        "enabled": true
+                    }]
+                }]
+            })
+        };
+
+        state.update_skills_for_model("gpt-5.6-sol", &skills("codex-skill"));
+        state.editor.set_text("$");
+        assert!(
+            state
+                .view()
+                .suggestions
+                .iter()
+                .any(|suggestion| suggestion.command == "codex-skill")
+        );
+
+        state.switch_to_open_code();
+        assert!(
+            state
+                .view()
+                .suggestions
+                .iter()
+                .all(|suggestion| suggestion.command != "codex-skill")
+        );
+        state.update_skills_for_model(
+            "opencode:opencode-go/deepseek-v4-flash",
+            &skills("opencode-skill"),
+        );
+        state.update_skills_for_model("gpt-5.6-sol", &skills("late-codex-skill"));
+        let suggestions = state.view().suggestions;
+        assert!(
+            suggestions
+                .iter()
+                .any(|suggestion| suggestion.command == "opencode-skill")
+        );
+        assert!(
+            suggestions
+                .iter()
+                .all(|suggestion| suggestion.command != "late-codex-skill")
+        );
     }
 
     #[test]
