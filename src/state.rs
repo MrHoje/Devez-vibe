@@ -5567,7 +5567,7 @@ impl AppState {
     fn toggle_composer_stash(&mut self) {
         if self.editor.is_empty() && self.composer_images.is_empty() {
             if self.restore_stashed_prompt() {
-                self.set_composer_notice("• 보관한 초안을 되돌렸습니다".to_owned());
+                self.set_composer_notice("• Draft restored".to_owned());
             }
             return;
         }
@@ -5578,7 +5578,7 @@ impl AppState {
         self.selected_completion_bindings.clear();
         self.suggestions_dismissed_text = None;
         self.command_selection = 0;
-        self.set_composer_notice("• 초안 보관 · Ctrl+S로 되돌립니다".to_owned());
+        self.set_composer_notice("• Draft stashed · Ctrl+S to restore".to_owned());
     }
 
     /// Puts the stashed draft back into the composer. Reports whether there was
@@ -6506,7 +6506,7 @@ impl AppState {
             } else if self.stashed_prompt.is_some() {
                 // An empty composer is the only place the stash can be reclaimed
                 // from, so its own hint sits exactly where the chord applies.
-                "Ctrl+S: 보관한 초안 되돌리기"
+                "Ctrl+S: restore stashed draft"
             } else {
                 ""
             },
@@ -8788,7 +8788,7 @@ impl AppState {
                 && self.composer_images.is_empty()
                 && self.restore_stashed_prompt()
             {
-                self.set_composer_notice("• 보관한 초안을 되돌렸습니다".to_owned());
+                self.set_composer_notice("• Draft restored".to_owned());
             }
             return action;
         }
@@ -15845,7 +15845,7 @@ mod tests {
         assert!(state.composer_images.is_empty());
         assert_eq!(
             state.view().composer_placeholder,
-            "Ctrl+S: 보관한 초안 되돌리기"
+            "Ctrl+S: restore stashed draft"
         );
 
         // A Korean IME sends the chord as its 두벌식 jamo.

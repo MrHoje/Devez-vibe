@@ -11306,7 +11306,14 @@ fn input_lines_with_controls(
     {
         let is_placeholder = editor.is_empty() && composer_images.is_empty() && index == 0;
         let content = if is_placeholder {
-            placeholder.to_owned()
+            // The cursor rests on the first cell after the prompt prefix, so a
+            // hint that started there would be read through the cursor block.
+            // One blank column keeps both legible.
+            if placeholder.is_empty() {
+                String::new()
+            } else {
+                format!(" {placeholder}")
+            }
         } else {
             raw
         };
