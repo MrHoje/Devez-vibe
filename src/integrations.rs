@@ -547,7 +547,7 @@ impl McpPicker {
             hint: self
                 .notice
                 .clone()
-                .unwrap_or_else(|| "이동 ↑↓  ·  전환 Space  ·  상세 Enter  ·  로그인 L  ·  재연결 Ctrl+R  ·  닫기 Esc".to_owned()),
+                .unwrap_or_else(|| "Move ↑↓  ·  Toggle Space  ·  Details Enter  ·  Sign in L  ·  Reconnect Ctrl+R  ·  Close Esc".to_owned()),
             style: OverlayStyle::CompactPanel,
             input: Some(&self.query),
             input_label: "",
@@ -566,7 +566,7 @@ impl McpPicker {
                     muted: true,
                 }],
                 slider: None,
-                hint: "Esc 뒤로".to_owned(),
+                hint: "Esc Back".to_owned(),
                 style: OverlayStyle::Panel,
                 input: None,
                 input_label: "",
@@ -643,9 +643,9 @@ impl McpPicker {
 
         let hint = self.notice.clone().unwrap_or_else(|| {
             if server.needs_login() {
-                "로그인 L  ·  전환 Space  ·  재연결 R  ·  도구 스크롤 ↑↓  ·  뒤로 Esc".to_owned()
+                "Sign in L  ·  Toggle Space  ·  Reconnect R  ·  Scroll tools ↑↓  ·  Back Esc".to_owned()
             } else {
-                "전환 Space  ·  재연결 R  ·  도구 스크롤 ↑↓  ·  뒤로 Esc".to_owned()
+                "Toggle Space  ·  Reconnect R  ·  Scroll tools ↑↓  ·  Back Esc".to_owned()
             }
         });
         OverlayView {
@@ -1505,7 +1505,7 @@ impl PluginPicker {
                         .map(|error| format!("오류 · {error}"))
                 })
                 .unwrap_or_else(|| {
-                    "이동 ↑↓  ·  열기 Enter  ·  마켓플레이스 M  ·  닫기 Esc".to_owned()
+                    "Move ↑↓  ·  Open Enter  ·  Marketplaces M  ·  Close Esc".to_owned()
                 }),
             style: OverlayStyle::CompactPanel,
             input: None,
@@ -1575,7 +1575,7 @@ impl PluginPicker {
             hint: self
                 .notice
                 .clone()
-                .unwrap_or_else(|| "이동 ↑↓  ·  전환 Space  ·  상세 Enter  ·  뒤로 Esc".to_owned()),
+                .unwrap_or_else(|| "Move ↑↓  ·  Toggle Space  ·  Details Enter  ·  Back Esc".to_owned()),
             style: OverlayStyle::CompactPanel,
             input: Some(&self.query),
             input_label: "",
@@ -1707,7 +1707,7 @@ impl PluginPicker {
                     muted: true,
                 }],
                 slider: None,
-                hint: "Esc 뒤로".to_owned(),
+                hint: "Esc Back".to_owned(),
                 style: OverlayStyle::Panel,
                 input: None,
                 input_label: "",
@@ -1737,7 +1737,7 @@ impl PluginPicker {
         if plugin.website_url.is_some() {
             actions.push("O 웹사이트");
         }
-        actions.push("Esc 뒤로");
+        actions.push("Esc Back");
         OverlayView {
             closable: false,
             title: format!("Plugin · {}", plugin.display_name),
@@ -1929,7 +1929,7 @@ impl MarketplacePicker {
                 hint: self
                     .notice
                     .clone()
-                    .unwrap_or_else(|| "Enter 추가  Esc 취소".to_owned()),
+                    .unwrap_or_else(|| "Enter Add  Esc Cancel".to_owned()),
                 style: OverlayStyle::Panel,
                 input: Some(source),
                 input_label: "Source",
@@ -1973,7 +1973,7 @@ impl MarketplacePicker {
             lines,
             slider: None,
             hint: self.notice.clone().unwrap_or_else(|| {
-                "A 추가  X 제거  U 모든 Git 마켓플레이스 갱신  Esc 뒤로".to_owned()
+                "A Add  X Remove  U Refresh all Git marketplaces  Esc Back".to_owned()
             }),
             style: OverlayStyle::CompactPanel,
             input: None,

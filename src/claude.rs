@@ -747,6 +747,20 @@ mod tests {
         assert!(bridge.contains("notify(\"turn/subagents/updated\""));
     }
 
+    /// 교차 제공자 검증자는 Agent 도구가 아니라 셸로 뜬다. 명령만 보이면 몇 개가
+    /// 돌고 언제 끝나는지 알 수 없으므로 같은 서브에이전트 목록에 올린다.
+    #[test]
+    fn bridge_lists_shell_launched_delegated_agents_as_subagents() {
+        let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
+
+        assert!(bridge.contains("else if (name === \"Bash\") startDelegatedSubagent(session, block);"));
+        assert!(bridge.contains("const DELEGATED_AGENT_PATTERN = /\\bcodex\\s+exec\\b/;"));
+        // 표시 이름은 실제로 지정된 모델을 따른다.
+        assert!(bridge.contains("name: firstLine(delegatedAgentModel(command) || \"codex\", 40)"));
+        // 위임 실행이 아닌 일반 명령은 목록에 올리지 않는다.
+        assert!(bridge.contains("if (!DELEGATED_AGENT_PATTERN.test(command)) return;"));
+    }
+
     /// 백그라운드 목록은 하위 에이전트만의 것이 아니다. 백그라운드로 돌린 명령을
     /// 종류로 걸러 내면 실행 중인 일이 화면에서 통째로 사라진다.
     #[test]

@@ -16,8 +16,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     completion::{
-        CompletionCandidate, CompletionKind, CompletionMode, CompletionTarget, completion_target,
-        completion_text, filter_candidates,
+        CompletionCandidate, CompletionKind, CompletionMode, CompletionSource, CompletionTarget,
+        completion_target, completion_text, filter_candidates,
     },
     editor::{ATTACHMENT_PLACEHOLDER, Editor, Stash},
     integrations::{
@@ -1995,6 +1995,16 @@ struct SkillBinding {
     source: Option<String>,
 }
 
+impl SkillBinding {
+    fn completion_source(&self) -> CompletionSource {
+        if self.scope.eq_ignore_ascii_case("user") && self.source.is_none() {
+            CompletionSource::User
+        } else {
+            CompletionSource::Provider
+        }
+    }
+}
+
 #[derive(Clone)]
 struct MentionBinding {
     trigger: String,
@@ -3791,6 +3801,7 @@ pub struct AppState {
     workspace_entries: Vec<CompletionCandidate>,
     completion_catalog: Vec<CompletionCandidate>,
     completion_mode: CompletionMode,
+    dollar_completion_source: CompletionSource,
     suggestions_dismissed_text: Option<String>,
     selected_completion_bindings: Vec<SelectedCompletionBinding>,
     claude_integrations: ProviderIntegrationSnapshot,
@@ -4018,6 +4029,7 @@ impl AppState {
             workspace_entries: Vec::new(),
             completion_catalog: Vec::new(),
             completion_mode: CompletionMode::All,
+            dollar_completion_source: CompletionSource::User,
             suggestions_dismissed_text: None,
             selected_completion_bindings: Vec::new(),
             claude_integrations: ProviderIntegrationSnapshot::default(),
@@ -5698,6 +5710,7 @@ impl AppState {
         side.app_mentions = self.app_mentions.clone();
         side.workspace_entries = self.workspace_entries.clone();
         side.completion_catalog = self.completion_catalog.clone();
+        side.dollar_completion_source = self.dollar_completion_source;
         side.claude_integrations = self.claude_integrations.clone();
         side.codex_integrations = self.codex_integrations.clone();
         side
@@ -7124,8 +7137,18 @@ impl AppState {
                         self.command_selection = 0;
                         return Action::None;
                     }
+                    KeyCode::Left if target.sigil == '$' => {
+                        self.dollar_completion_source = CompletionSource::User;
+                        self.command_selection = 0;
+                        return Action::None;
+                    }
                     KeyCode::Right if target.sigil == '@' => {
                         self.completion_mode = self.completion_mode.next();
+                        self.command_selection = 0;
+                        return Action::None;
+                    }
+                    KeyCode::Right if target.sigil == '$' => {
+                        self.dollar_completion_source = CompletionSource::Provider;
                         self.command_selection = 0;
                         return Action::None;
                     }
@@ -7406,9 +7429,13 @@ impl AppState {
             }
             KeyCode::Char(ch) if !ctrl => {
                 self.editor.insert(ch);
+                self.suggestions_dismissed_text = None;
                 self.command_selection = 0;
                 if matches!(ch, '$' | '@') {
                     self.completion_mode = CompletionMode::All;
+                }
+                if ch == '$' {
+                    self.dollar_completion_source = CompletionSource::User;
                 }
                 Action::None
             }
@@ -10961,7 +10988,7 @@ impl AppState {
                     })
                     .collect(),
                 slider: None,
-                hint: "1-3 선택  ·  ↑↓ 이동  ·  Enter 사용  ·  Space 연결 전환  ·  Esc 닫기"
+                hint: "1-3 Select  ·  ↑↓ Move  ·  Enter Use  ·  Space Toggle connection  ·  Esc Close"
                     .to_owned(),
                 style: OverlayStyle::Picker,
                 input: None,
@@ -11002,7 +11029,7 @@ impl AppState {
                     selected: *selected,
                     detail: None,
                 }),
-                hint: "←→ 이동  ·  Enter 적용  ·  Esc 닫기".to_owned(),
+                hint: "←→ Move  ·  Enter Apply  ·  Esc Close".to_owned(),
                 style: OverlayStyle::Picker,
                 input: None,
                 input_label: "",
@@ -11209,7 +11236,7 @@ impl AppState {
                         selected: *selected,
                         detail: Some(vibe.picker_detail().to_owned()),
                     }),
-                    hint: "←→ 이동  ·  Enter 적용  ·  Esc 취소".to_owned(),
+                    hint: "←→ Move  ·  Enter Apply  ·  Esc Cancel".to_owned(),
                     style: OverlayStyle::Picker,
                     input: None,
                     input_label: "",
@@ -11276,12 +11303,12 @@ impl AppState {
                     muted: true,
                 });
                 let hint = if let Some(notice) = notice.as_deref() {
-                    format!("상태 · {notice}  ·  이동 ↑↓  ·  전환 Space/Enter  ·  닫기 Esc")
+                    format!("Status · {notice}  ·  Move ↑↓  ·  Toggle Space/Enter  ·  Close Esc")
                 } else if !errors.is_empty() {
-                    format!("오류 {}개  ·  이동 ↑↓  ·  전환 Space/Enter  ·  닫기 Esc", errors.len())
+                    format!("{} errors  ·  Move ↑↓  ·  Toggle Space/Enter  ·  Close Esc", errors.len())
                 } else {
                     format!(
-                        "제공자 {} ←→  ·  이동 ↑↓  ·  전환 Space/Enter  ·  닫기 Esc",
+                        "Provider {} ←→  ·  Move ↑↓  ·  Toggle Space/Enter  ·  Close Esc",
                         if *provider == SkillProvider::Claude {
                             "Claude"
                         } else {
@@ -11376,7 +11403,7 @@ impl AppState {
                     title: format!("{provider_name} · OAuth"),
                     lines,
                     slider: None,
-                    hint: "O 브라우저 열기  Enter 코드 전송  Esc 취소".to_owned(),
+                    hint: "O Open browser  Enter Send code  Esc Cancel".to_owned(),
                     closable: false,
                     style: OverlayStyle::Panel,
                     input: Some(editor),
@@ -11440,7 +11467,7 @@ impl AppState {
                     title: title.clone(),
                     lines,
                     slider: None,
-                    hint: "↑↓ 선택   Enter 확정".to_owned(),
+                    hint: "↑↓ Select   Enter Confirm".to_owned(),
                     style: OverlayStyle::Panel,
                     input: None,
                     input_label: "",
@@ -11477,7 +11504,7 @@ impl AppState {
                     title: "MCP approval".to_owned(),
                     lines,
                     slider: None,
-                    hint: "↑↓ 선택   Enter 확정".to_owned(),
+                    hint: "↑↓ Select   Enter Confirm".to_owned(),
                     style: OverlayStyle::Panel,
                     input: None,
                     input_label: "",
@@ -11625,7 +11652,7 @@ impl AppState {
                         muted: false,
                     },
                     OverlayLine {
-                        text: "[Enter] 완료 후 계속".to_owned(),
+                        text: "[Enter] Continue when done".to_owned(),
                         selected: false,
                         muted: false,
                     },
@@ -11802,16 +11829,16 @@ impl AppState {
                     slider: None,
                     hint: {
                         let steps = if questions.len() > 1 {
-                            " · Tab/←→ 질문 이동"
+                            " · Tab/←→ Next question"
                         } else {
                             ""
                         };
                         if text_focused {
-                            "Enter 전송 · Esc 취소".to_owned()
+                            "Enter Send · Esc Cancel".to_owned()
                         } else if question.multi_select {
-                            format!("Space 선택 · Enter 확정 · ↑/↓ 이동{steps} · Esc 취소")
+                            format!("Space Select · Enter Confirm · ↑/↓ Move{steps} · Esc Cancel")
                         } else {
-                            format!("Enter 선택 · ↑/↓ 이동{steps} · Esc 취소")
+                            format!("Enter Select · ↑/↓ Move{steps} · Esc Cancel")
                         }
                     },
                     style: OverlayStyle::Question,
@@ -11892,7 +11919,8 @@ impl AppState {
                         &skill.description,
                         completion_text(CompletionKind::Skill, &skill.name, None),
                     )
-                    .with_binding(&skill.name, &skill.path),
+                    .with_binding(&skill.name, &skill.path)
+                    .with_source(skill.completion_source()),
                 );
             }
         }
@@ -11922,15 +11950,16 @@ impl AppState {
             return None;
         }
         let target = completion_target(&text, self.editor.cursor())?;
-        let matches = filter_candidates(
+        let mut matches = filter_candidates(
             &self.completion_catalog,
             target.sigil,
             &target.query,
             self.completion_mode,
-        )
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
+        );
+        if target.sigil == '$' {
+            matches.retain(|candidate| candidate.source == self.dollar_completion_source);
+        }
+        let matches = matches.into_iter().cloned().collect::<Vec<_>>();
         let shell_like = target.sigil == '$'
             && target
                 .query
@@ -11945,16 +11974,19 @@ impl AppState {
 
     fn completion_suggestion_views(&self) -> Option<Vec<SuggestionView>> {
         let (target, matches) = self.matching_completions()?;
-        let hint = (target.sigil == '@').then(|| {
-            format!(
+        let provider = ModelProvider::from_model(self.selected_model_name());
+        let hint = if target.sigil == '@' {
+            Some(format!(
                 "←/→ mode  ·  {}  ·  Enter/Tab insert  ·  Esc close",
                 self.completion_mode.label()
-            )
-        });
+            ))
+        } else {
+            Some("←/→ source  ·  Enter/Tab insert  ·  Esc close".to_owned())
+        };
         let panel_title = if target.sigil == '@' {
             "Mentions"
         } else {
-            "Tools"
+            dollar_completion_panel_title(self.dollar_completion_source, provider)
         };
         if matches.is_empty() {
             return Some(vec![SuggestionView {
@@ -13838,7 +13870,11 @@ fn strip_recommendation_mark(answer: &str) -> &str {
 
 /// 단계 줄에서 단계 사이에 놓이는 구분점. 렌더러가 같은 구분자로 줄을 다시
 /// 갈라 지금 있는 단계만 강조하므로 양쪽이 같은 문자열을 써야 한다.
-pub const QUESTION_TAB_SEPARATOR: &str = " \u{00b7} ";
+pub const QUESTION_TAB_SEPARATOR: &str = "   ";
+
+/// 기술 자동완성 제목 뒤에 숨겨 두는 탭 줄 구분자. 렌더러가 제목과 탭을
+/// 갈라 Claude 질문 창과 같은 상단 주제 줄로 그린다.
+pub const COMPLETION_TAB_MARKER: &str = "\u{001e}";
 
 /// 켠 줄 앞에 붙는 상자. 답을 마친 단계, 고른 선택지, 켜 둔 상태줄 항목이
 /// 모두 이 상자를 쓰고, 완료 계획과 같은 체크를 담아 끝난 것은 어디서나 같은
@@ -13851,6 +13887,20 @@ pub const UNCHECKED_BOX: &str = "[ ]";
 /// 지금 있는 단계 앞에 붙는 마커. 상자가 대괄호를 쓰게 되면서 단계를 다시
 /// 대괄호로 감쌀 수 없으니, 선택지 목록과 같은 마커로 어디에 와 있는지 짚는다.
 pub const QUESTION_TAB_CURSOR: &str = "\u{276f}";
+
+fn dollar_completion_panel_title(
+    source: CompletionSource,
+    provider: ModelProvider,
+) -> &'static str {
+    match (source, provider) {
+        (CompletionSource::User, ModelProvider::Claude) => "Skills\u{001e}❯ User   Claude",
+        (CompletionSource::Provider, ModelProvider::Claude) => "Skills\u{001e}User   ❯ Claude",
+        (CompletionSource::User, ModelProvider::Codex) => "Skills\u{001e}❯ User   Codex",
+        (CompletionSource::Provider, ModelProvider::Codex) => "Skills\u{001e}User   ❯ Codex",
+        (CompletionSource::User, ModelProvider::OpenCode) => "Skills\u{001e}❯ User   OpenCode",
+        (CompletionSource::Provider, ModelProvider::OpenCode) => "Skills\u{001e}User   ❯ OpenCode",
+    }
+}
 
 /// The two rows a question carries beyond its own options.
 const OTHER_ANSWER_LABEL: &str = "직접 입력";
@@ -22640,7 +22690,7 @@ mod tests {
         ));
         let overlay = state.overlay_view().expect("approval selection");
         assert!(overlay.lines[3].selected);
-        assert_eq!(overlay.hint, "↑↓ 선택   Enter 확정");
+        assert_eq!(overlay.hint, "↑↓ Select   Enter Confirm");
         match state.handle_key(KeyEvent::from(KeyCode::Enter)) {
             Action::RpcResponse { result, .. } => {
                 assert_eq!(
@@ -23555,22 +23605,61 @@ mod tests {
     }
 
     #[test]
-    fn composer_completion_catalogs_match_current_codex() {
+    fn dollar_completion_moves_between_user_and_current_provider() {
         let mut state = composer_completion_state();
+        state.update_skills(&json!({
+            "data": [{
+                "skills": [
+                    {
+                        "name": "review",
+                        "path": "C:/skills/review/SKILL.md",
+                        "description": "Review a change",
+                        "enabled": true,
+                        "scope": "user"
+                    },
+                    {
+                        "name": "debug",
+                        "path": "codex-system://debug",
+                        "description": "Debug a change",
+                        "enabled": true,
+                        "scope": "system"
+                    }
+                ]
+            }]
+        }));
         state.editor.set_text("$");
-        let dollar = state
+        let user = state
+            .view()
+            .suggestions
+            .iter()
+            .map(|suggestion| suggestion.category.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(user, [Some("Skill".to_owned())]);
+        let title = state.view().suggestions[0].panel_title;
+        assert!(title.contains("❯ User   Codex"));
+        assert!(!title.contains('·'));
+
+        state.handle_key(KeyEvent::from(KeyCode::Right));
+        let provider = state
             .view()
             .suggestions
             .iter()
             .map(|suggestion| suggestion.category.clone())
             .collect::<Vec<_>>();
         assert_eq!(
-            dollar,
+            provider,
             [
                 Some("Plugin".to_owned()),
                 Some("Skill".to_owned()),
                 Some("App".to_owned())
             ]
+        );
+
+        state.handle_key(KeyEvent::from(KeyCode::Left));
+        assert_eq!(
+            state.view().suggestions[0].command,
+            "review",
+            "User가 왼쪽 탭이어야 합니다."
         );
 
         state.editor.set_text("@");
@@ -23580,7 +23669,14 @@ mod tests {
             .iter()
             .map(|suggestion| suggestion.category.clone())
             .collect::<Vec<_>>();
-        assert_eq!(at, [Some("Plugin".to_owned()), Some("Skill".to_owned())]);
+        assert_eq!(
+            at,
+            [
+                Some("Plugin".to_owned()),
+                Some("Skill".to_owned()),
+                Some("Skill".to_owned())
+            ]
+        );
 
         state.editor.set_text("@src");
         let filesystem = state
@@ -23596,6 +23692,26 @@ mod tests {
     }
 
     #[test]
+    fn dollar_completion_stays_open_while_a_turn_is_working() {
+        let mut state = composer_completion_state();
+        state.busy = true;
+        state.editor.set_text("$rev");
+
+        let suggestions = state.view().suggestions;
+        assert!(
+            suggestions
+                .iter()
+                .any(|suggestion| suggestion.command == "review")
+        );
+        assert!(suggestions[0].panel_title.contains(COMPLETION_TAB_MARKER));
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::None
+        ));
+        assert_eq!(state.editor.text(), "$review ");
+    }
+
+    #[test]
     fn composer_completion_enter_inserts_a_skill_without_submitting() {
         let mut state = composer_completion_state();
         state.editor.set_text("@rev");
@@ -23604,6 +23720,40 @@ mod tests {
 
         assert!(matches!(action, Action::None));
         assert_eq!(state.editor.text(), "$review ");
+    }
+
+    #[test]
+    fn composer_completion_first_enter_inserts_and_second_enter_submits() {
+        for sigil in ['@', '$'] {
+            let mut state = composer_completion_state();
+            state.handle_key(KeyEvent::from(KeyCode::Char(sigil)));
+
+            assert!(!state.view().suggestions.is_empty());
+            assert!(matches!(
+                state.handle_key(KeyEvent::from(KeyCode::Down)),
+                Action::None
+            ));
+            assert!(matches!(
+                state.handle_key(KeyEvent::from(KeyCode::Enter)),
+                Action::None
+            ));
+            assert_eq!(state.editor.text(), "$review ");
+            assert!(matches!(
+                state.handle_key(KeyEvent::from(KeyCode::Enter)),
+                Action::Submit(text) if text == "$review "
+            ));
+        }
+    }
+
+    #[test]
+    fn composer_completion_reopens_after_dismissing_the_same_first_input() {
+        let mut state = composer_completion_state();
+        state.handle_key(KeyEvent::from(KeyCode::Char('@')));
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        state.handle_key(KeyEvent::from(KeyCode::Backspace));
+        state.handle_key(KeyEvent::from(KeyCode::Char('@')));
+
+        assert!(!state.view().suggestions.is_empty());
     }
 
     #[test]
@@ -23799,6 +23949,7 @@ mod tests {
             }]
         }));
         state.editor.set_text("$cal");
+        state.handle_key(KeyEvent::from(KeyCode::Right));
         state.handle_key(KeyEvent::from(KeyCode::Down));
         state.handle_key(KeyEvent::from(KeyCode::Enter));
 
@@ -23854,6 +24005,7 @@ mod tests {
         state.editor.set_text("$cal");
         state.handle_key(KeyEvent::from(KeyCode::Enter));
         state.handle_paste("$cal");
+        state.handle_key(KeyEvent::from(KeyCode::Right));
         state.handle_key(KeyEvent::from(KeyCode::Down));
         state.handle_key(KeyEvent::from(KeyCode::Enter));
 
@@ -24507,7 +24659,7 @@ mod tests {
                 .iter()
                 .any(|line| line.text.contains("이 프로젝트에서 항상 허용"))
         );
-        assert_eq!(overlay.hint, "↑↓ 선택   Enter 확정");
+        assert_eq!(overlay.hint, "↑↓ Select   Enter Confirm");
 
         let mut state = test_state();
         state.begin_server_request(
@@ -24525,7 +24677,7 @@ mod tests {
                 line.text == "이 프로젝트에서 항상 허용: Bash(npm test)"
             })
         );
-        assert_eq!(overlay.hint, "↑↓ 선택   Enter 확정");
+        assert_eq!(overlay.hint, "↑↓ Select   Enter Confirm");
     }
 
     #[test]

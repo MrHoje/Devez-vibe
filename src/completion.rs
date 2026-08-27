@@ -11,6 +11,13 @@ pub enum CompletionKind {
     Directory,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CompletionSource {
+    #[default]
+    User,
+    Provider,
+}
+
 impl CompletionKind {
     pub fn is_filesystem(self) -> bool {
         matches!(self, Self::File | Self::Directory)
@@ -76,6 +83,7 @@ pub struct CompletionCandidate {
     pub description: String,
     pub insert_text: String,
     pub binding: Option<CompletionBinding>,
+    pub source: CompletionSource,
     search_label: String,
     search_insert: String,
 }
@@ -103,6 +111,7 @@ impl CompletionCandidate {
             description: description.into(),
             insert_text,
             binding: None,
+            source: CompletionSource::Provider,
         }
     }
 
@@ -111,6 +120,11 @@ impl CompletionCandidate {
             name: name.into(),
             path: path.into(),
         });
+        self
+    }
+
+    pub fn with_source(mut self, source: CompletionSource) -> Self {
+        self.source = source;
         self
     }
 }

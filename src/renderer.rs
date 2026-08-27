@@ -35,7 +35,8 @@ use crate::{
         selected_char_count, selection_chunks,
     },
     state::{
-        CHECKED_BOX, DiffDisplayMode, QUESTION_TAB_CURSOR, QUESTION_TAB_SEPARATOR, ShellDisplayMode,
+        CHECKED_BOX, COMPLETION_TAB_MARKER, DiffDisplayMode, QUESTION_TAB_CURSOR,
+        QUESTION_TAB_SEPARATOR, ShellDisplayMode,
     },
     syntax::{self, SyntaxKind},
     theme::{self, Rgb, ThemeKind},
@@ -6543,6 +6544,50 @@ fn is_startup_update(block: &Block) -> bool {
     matches!(block.kind, BlockKind::Update) && block.title == "Tip"
 }
 
+/// `/help` output. It is a reference sheet, not a notice, so it drops the
+/// notice card's side walls.
+fn is_help_block(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::System) && block.title == "Commands"
+}
+
+/// The command sheet borrows the tip card's open frame: a titled rule on top,
+/// a closing rule at the bottom, and no side walls between them. Rows carry a
+/// `- ` marker so each command starts at the same column.
+fn help_card_lines(block: &Block, width: u16) -> Vec<PaintLine> {
+    let line_width = panel_span(width);
+    let title = compact_text(&block.title, line_width.saturating_sub(7));
+    let title_width = UnicodeWidthStr::width(title.as_str());
+    let rule = "─".repeat(line_width.saturating_sub(6 + title_width));
+    let mut lines = vec![
+        PaintLine {
+            tone: PLAN_BORDER_TONE,
+            ..PaintLine::plain(format!("┌── {title} {rule}┐"))
+        },
+        PaintLine::blank(),
+    ];
+    for row in block.body.lines() {
+        if row.trim().is_empty() {
+            lines.push(PaintLine::blank());
+            continue;
+        }
+        lines.extend(wrapped_line(
+            "  - ",
+            Tone::Muted,
+            row.trim_end(),
+            Tone::Plain,
+            false,
+            width,
+        ));
+    }
+    lines.push(PaintLine::blank());
+    lines.push(PaintLine {
+        tone: PLAN_BORDER_TONE,
+        ..PaintLine::plain(format!("└{}┘", "─".repeat(line_width.saturating_sub(2))))
+    });
+    lines.push(PaintLine::blank());
+    lines
+}
+
 /// The rows that only introduce the session — the welcome masthead and the
 /// startup tip. The first plan takes both away together.
 fn is_startup_banner(block: &Block) -> bool {
@@ -6552,12 +6597,22 @@ fn is_startup_banner(block: &Block) -> bool {
 fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine> {
     let panel_width = panel_span(width);
     let inner_width = panel_width.saturating_sub(2);
-    let title = suggestions
+    let panel_heading = suggestions
         .first()
         .map(|suggestion| suggestion.panel_title)
         .unwrap_or("Commands");
+    let (title, tabs) = panel_heading
+        .split_once(COMPLETION_TAB_MARKER)
+        .map_or((panel_heading, None), |(title, tabs)| (title, Some(tabs)));
     let mut lines = vec![panel_title_row(title, panel_width, false)];
     lines.push(panel_padding_row(panel_width));
+    if let Some(tabs) = tabs {
+        lines.push(close_panel_row(
+            question_tab_row(tabs, inner_width),
+            panel_width,
+        ));
+        lines.push(panel_padding_row(panel_width));
+    }
     let visible = &suggestions[visible_window(
         suggestions.iter().position(|item| item.selected),
         suggestions.len(),
@@ -6601,19 +6656,14 @@ fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine
         };
         lines.push(line);
     }
-    if let Some(hint) = suggestions
+    let hint = suggestions
         .iter()
-        .find_map(|suggestion| suggestion.hint.as_deref())
-    {
-        lines.push(panel_line_keep_left(
-            &format!("   {hint}"),
-            panel_width,
-            Tone::Muted,
-            false,
-        ));
-    }
+        .find_map(|suggestion| suggestion.hint.as_deref());
     lines.push(panel_padding_row(panel_width));
-    lines.push(panel_bottom(inner_width));
+    lines.push(match hint {
+        Some(hint) => panel_rule_row("╰─ ", hint, '╯', panel_width),
+        None => panel_bottom(inner_width),
+    });
     lines
 }
 
@@ -6713,10 +6763,6 @@ fn panel_padding_row(panel_width: usize) -> PaintLine {
 
 fn panel_line(text: &str, width: usize, tone: Tone, bold: bool) -> PaintLine {
     panel_line_with(text, width, tone, bold, compact_text)
-}
-
-fn panel_line_keep_left(text: &str, width: usize, tone: Tone, bold: bool) -> PaintLine {
-    panel_line_with(text, width, tone, bold, compact_right)
 }
 
 /// A left-anchored row that keeps `right_inset` blank columns before the right
@@ -9632,6 +9678,9 @@ fn block_lines_with_mode_at(
         lines.push(PaintLine::blank());
         return lines;
     }
+    if is_help_block(block) {
+        return help_card_lines(block, width);
+    }
     if matches!(block.kind, BlockKind::ModelChange | BlockKind::System) {
         return notice_card_lines(block, width);
     }
@@ -11212,6 +11261,65 @@ fn cursor_last(rows: &[String]) -> usize {
     rows.len() - 1
 }
 
+/// `/`, `@`, `$`로 시작하는 컴포저 토큰만 테마 강조색으로 나눈다. 본문은
+/// 기존 색을 유지하고, 이메일의 `@`나 경로 중간의 `/`는 명령으로 보지 않는다.
+fn composer_token_spans(content: &str, base_tone: Tone) -> Vec<PaintSpan> {
+    if content.is_empty() || base_tone == Tone::Muted {
+        return vec![PaintSpan {
+            text: content.to_owned(),
+            tone: base_tone,
+            bold: false,
+        }];
+    }
+    let chars = content.chars().collect::<Vec<_>>();
+    let mut spans = Vec::new();
+    let mut plain_start = 0;
+    let mut index = 0;
+    while index < chars.len() {
+        let starts_token = match chars[index] {
+            '/' => index == 0,
+            '@' | '$' => index == 0 || chars[index - 1].is_whitespace(),
+            _ => false,
+        };
+        if !starts_token {
+            index += 1;
+            continue;
+        }
+        if plain_start < index {
+            spans.push(PaintSpan {
+                text: chars[plain_start..index].iter().collect(),
+                tone: base_tone,
+                bold: false,
+            });
+        }
+        let end = (index + 1..chars.len())
+            .find(|position| chars[*position].is_whitespace())
+            .unwrap_or(chars.len());
+        spans.push(PaintSpan {
+            text: chars[index..end].iter().collect(),
+            tone: Tone::Accent,
+            bold: false,
+        });
+        index = end;
+        plain_start = end;
+    }
+    if plain_start < chars.len() {
+        spans.push(PaintSpan {
+            text: chars[plain_start..].iter().collect(),
+            tone: base_tone,
+            bold: false,
+        });
+    }
+    if spans.is_empty() {
+        spans.push(PaintSpan {
+            text: content.to_owned(),
+            tone: base_tone,
+            bold: false,
+        });
+    }
+    spans
+}
+
 fn input_lines(
     editor: &Editor,
     composer_images: &[String],
@@ -11380,6 +11488,24 @@ fn input_lines_with_controls(
         } else {
             Tone::Plain
         };
+        let mut tail = composer_token_spans(&content, content_tone);
+        tail.extend([
+            PaintSpan {
+                text: " ".repeat(panel_width.saturating_sub(
+                    UnicodeWidthStr::width(side_prefix)
+                        + UnicodeWidthStr::width(prompt_prefix)
+                        + content_width
+                        + 1,
+                )),
+                tone: chrome_tone,
+                bold: false,
+            },
+            PaintSpan {
+                text: "│".to_owned(),
+                tone: chrome_tone,
+                bold: false,
+            },
+        ]);
         rows.push(PaintLine {
             prefix: side_prefix.to_owned(),
             prefix_tone: chrome_tone,
@@ -11388,28 +11514,7 @@ fn input_lines_with_controls(
             bold: false,
             tool_heading: None,
             pick: None,
-            tail: vec![
-                PaintSpan {
-                    text: content,
-                    tone: content_tone,
-                    bold: false,
-                },
-                PaintSpan {
-                    text: " ".repeat(panel_width.saturating_sub(
-                        UnicodeWidthStr::width(side_prefix)
-                            + UnicodeWidthStr::width(prompt_prefix)
-                            + content_width
-                            + 1,
-                    )),
-                    tone: chrome_tone,
-                    bold: false,
-                },
-                PaintSpan {
-                    text: "│".to_owned(),
-                    tone: chrome_tone,
-                    bold: false,
-                },
-            ],
+            tail,
         });
     }
     // Both composer rules share the welcome card's border colour, so the frame
@@ -16058,12 +16163,12 @@ mod tests {
         let lines = markdown_line(
             "",
             Tone::Plain,
-            "[Enter] 완료 후 계속",
+            "[Enter] Continue when done",
             Tone::Plain,
             false,
             80,
         );
-        assert_eq!(lines[0].text, "[Enter] 완료 후 계속");
+        assert_eq!(lines[0].text, "[Enter] Continue when done");
         assert_eq!(line_suffix("https://example.com:8080"), None);
         assert_eq!(line_suffix("src/main.rs:83:12").as_deref(), Some(":83:12"));
     }
@@ -16603,6 +16708,28 @@ mod tests {
             Some(Tone::ModelTerra)
         );
         assert_eq!(rows.last().map(|line| line.tone), Some(Tone::ModelTerra));
+    }
+
+    #[test]
+    fn composer_command_tokens_alone_use_the_theme_accent() {
+        let mut editor = Editor::default();
+        editor.set_text("/model gpt @github 와 $review mail foo@example.com");
+
+        let (rows, _, _, _) = input_lines(&editor, &[], 100, "", "", None, None);
+        let accent = rows[1]
+            .tail
+            .iter()
+            .filter(|span| span.tone == Tone::Accent)
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(accent, ["/model", "@github", "$review"]);
+        assert!(
+            rows[1]
+                .tail
+                .iter()
+                .any(|span| { span.tone == Tone::Plain && span.text.contains("foo@example.com") })
+        );
     }
 
     #[test]
@@ -17353,6 +17480,30 @@ mod tests {
                 .expect("transcript gutter");
             assert_eq!(line.prefix_tone, tone);
         }
+    }
+
+    /// The command sheet is read, not skimmed. Side walls squeeze the longest
+    /// command rows, so it keeps only the two corner rules the tip card uses.
+    #[test]
+    fn command_help_keeps_corner_rules_without_side_walls() {
+        let lines = block_lines(
+            &Block::new(BlockKind::System, "Commands", "/quit  Exit\n\n/new  New chat"),
+            80,
+        );
+        let rendered = lines.iter().map(painted).collect::<Vec<_>>();
+
+        assert!(rendered[0].starts_with("┌── Commands "));
+        assert!(rendered[0].ends_with('┐'));
+        let closing = rendered
+            .iter()
+            .rposition(|line| line.starts_with('└'))
+            .expect("closing rule");
+        assert!(rendered[closing].ends_with('┘'));
+        // Every row between the rules stays free of side walls.
+        assert!(rendered[1..closing].iter().all(|line| !line.contains('│')));
+        // Rows carry the plan marker instead of the notice card's arrow.
+        assert!(lines.iter().any(|line| line.prefix == "  - "));
+        assert!(lines.iter().all(|line| line.prefix != "  ↳ "));
     }
 
     #[test]
@@ -21018,6 +21169,46 @@ mod tests {
     }
 
     #[test]
+    fn mention_and_skill_hints_live_on_the_bottom_rule() {
+        for title in ["Mentions", "Skills\u{001e}❯ User   Claude"] {
+            let suggestions = vec![SuggestionView {
+                command: "review".to_owned(),
+                description: "Review a change".to_owned(),
+                selected: true,
+                category: None,
+                panel_title: title,
+                hint: Some("Enter select".to_owned()),
+            }];
+
+            let lines = suggestion_lines(&suggestions, 80);
+            let bottom = painted(lines.last().expect("bottom rule"));
+            assert!(bottom.starts_with("╰─ Enter select "));
+            assert!(bottom.ends_with('╯'));
+        }
+    }
+
+    #[test]
+    fn skill_completion_uses_the_question_style_topic_tabs() {
+        let suggestions = vec![SuggestionView {
+            command: "review".to_owned(),
+            description: "Review a change".to_owned(),
+            selected: true,
+            category: Some("Skill".to_owned()),
+            panel_title: "Skills\u{001e}❯ User   Claude",
+            hint: Some("←/→ source".to_owned()),
+        }];
+
+        let lines = suggestion_lines(&suggestions, 80)
+            .iter()
+            .map(painted)
+            .collect::<Vec<_>>();
+
+        assert!(lines[0].starts_with("╭─ Skills "));
+        assert!(lines.iter().any(|line| line.contains("❯ User   Claude")));
+        assert!(lines.iter().any(|line| line.contains("[Skill] review")));
+    }
+
+    #[test]
     fn panel_overlay_keeps_its_border_when_a_row_folds() {
         // An unbreakable run far wider than the terminal, like an OAuth URL.
         let long = "a".repeat(400);
@@ -21109,7 +21300,7 @@ mod tests {
                     },
                 ],
                 slider: None,
-                hint: "↑↓ 선택  Enter 확인  Esc 취소".to_owned(),
+                hint: "↑↓ Select  Enter Confirm  Esc Cancel".to_owned(),
                 style: OverlayStyle::Panel,
                 input: None,
                 input_label: "",
@@ -21175,7 +21366,7 @@ mod tests {
                     muted: false,
                 }],
                 slider: None,
-                hint: "Enter 전송 · Esc 취소".to_owned(),
+                hint: "Enter Send · Esc Cancel".to_owned(),
                 style: OverlayStyle::Question,
                 input: Some(&editor),
                 input_label: "Answer",
@@ -21288,7 +21479,7 @@ mod tests {
                     },
                 ],
                 slider: None,
-                hint: "Enter 전송 · Esc 취소".to_owned(),
+                hint: "Enter Send · Esc Cancel".to_owned(),
                 style: OverlayStyle::Question,
                 input: editor,
                 input_label: "Answer",
@@ -21378,7 +21569,7 @@ mod tests {
                     },
                 ],
                 slider: None,
-                hint: "Enter 선택 · ↑/↓ 이동 · Esc 취소".to_owned(),
+                hint: "Enter Select · ↑/↓ Move · Esc Cancel".to_owned(),
                 style: OverlayStyle::Question,
                 input: None,
                 input_label: "",

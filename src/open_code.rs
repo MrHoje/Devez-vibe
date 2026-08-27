@@ -27,6 +27,21 @@ use crate::app_server::ServerEvent;
 /// OpenCode provider 연동. /provider opencode와 /connect가 이 스위치를 따른다.
 pub const PROVIDER_ENABLED: bool = true;
 
+fn explicit_skill_instruction(input: &[Value]) -> Option<String> {
+    let names = input
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("skill"))
+        .filter_map(|item| item.get("name").and_then(Value::as_str))
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    (!names.is_empty()).then(|| {
+        format!(
+            "<devez-vibe-explicit-skills>\nThe user explicitly selected these OpenCode skills. Before handling the request, call the native skill tool once for each exact name: {}.\n</devez-vibe-explicit-skills>",
+            names.join(", ")
+        )
+    })
+}
+
 type PendingResponse = oneshot::Sender<Result<Value, String>>;
 type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
 type DetachedMap = Arc<Mutex<HashMap<u64, DetachedTurn>>>;
@@ -656,9 +671,8 @@ fn normalize_skill_catalog(response: Value) -> Value {
         .iter()
         .filter_map(|skill| {
             let name = skill.get("name").and_then(Value::as_str)?;
-            let path = skill
-                .get("location")
-                .and_then(Value::as_str)
+            let location = skill.get("location").and_then(Value::as_str);
+            let path = location
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| format!("opencode://skill/{name}"));
             Some(json!({
@@ -669,11 +683,34 @@ fn normalize_skill_catalog(response: Value) -> Value {
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
                 "enabled": true,
-                "scope": "opencode"
+                "scope": open_code_skill_scope(location)
             }))
         })
         .collect::<Vec<_>>();
     json!({ "data": [{ "skills": skills, "errors": [] }] })
+}
+
+fn open_code_skill_scope(location: Option<&str>) -> &'static str {
+    let Some(path) = location.map(Path::new) else {
+        return "system";
+    };
+    let Some(home) = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME")) else {
+        return "provider";
+    };
+    let home = PathBuf::from(home);
+    let config = env::var_os("OPENCODE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("XDG_CONFIG_HOME").map(|root| PathBuf::from(root).join("opencode")))
+        .unwrap_or_else(|| home.join(".config").join("opencode"));
+    [
+        config.join("skills"),
+        home.join(".claude").join("skills"),
+        home.join(".agents").join("skills"),
+    ]
+    .iter()
+    .any(|root| path.starts_with(root))
+    .then_some("user")
+    .unwrap_or("provider")
 }
 
 impl OpenCodeServer {
@@ -1128,6 +1165,9 @@ impl OpenCodeServer {
                     "<devez-vibe-rules>\n{instructions}\n</devez-vibe-rules>"
                 )
             }));
+        }
+        if let Some(instruction) = explicit_skill_instruction(input) {
+            prompt.push(json!({ "type": "text", "text": instruction }));
         }
         for item in input {
             match item.get("type").and_then(Value::as_str) {
@@ -2104,9 +2144,25 @@ mod tests {
 
         assert_eq!(skills.len(), 2);
         assert_eq!(skills[0]["path"], "C:/skills/review/SKILL.md");
-        assert_eq!(skills[0]["scope"], "opencode");
+        assert_eq!(skills[0]["scope"], "provider");
         assert_eq!(skills[1]["path"], "opencode://skill/built-in");
+        assert_eq!(skills[1]["scope"], "system");
         assert_eq!(skills[1]["enabled"], true);
+    }
+
+    #[test]
+    fn open_code_global_compatible_skills_are_user_owned() {
+        let home = env::var_os("USERPROFILE")
+            .or_else(|| env::var_os("HOME"))
+            .map(PathBuf::from)
+            .expect("home");
+        let skill = home
+            .join(".claude")
+            .join("skills")
+            .join("personal")
+            .join("SKILL.md");
+
+        assert_eq!(open_code_skill_scope(skill.to_str()), "user");
     }
 
     #[test]
@@ -2984,6 +3040,18 @@ mod tests {
     fn image_extensions_map_to_acp_mime_types() {
         assert_eq!(image_mime(Path::new("screen.webp")), "image/webp");
         assert_eq!(image_mime(Path::new("screen.png")), "image/png");
+    }
+
+    #[test]
+    fn explicit_skill_items_request_the_native_open_code_skill_tool() {
+        let instruction = explicit_skill_instruction(&[
+            json!({ "type": "text", "text": "$luna-loop 검증" }),
+            json!({ "type": "skill", "name": "luna-loop", "path": "SKILL.md" }),
+        ])
+        .expect("명시적 Skill 지침");
+
+        assert!(instruction.contains("native skill tool"));
+        assert!(instruction.contains("luna-loop"));
     }
 
     #[test]

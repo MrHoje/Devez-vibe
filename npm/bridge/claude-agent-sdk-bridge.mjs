@@ -26,7 +26,13 @@ const sessions = new Map();
 const sessionAliases = new Map();
 const pendingHostRequests = new Map();
 const modelCatalogs = new Map();
+const skillCatalogs = new Map();
 const CLAUDE_MODEL_ORDER = ["fable", "opus", "sonnet", "haiku"];
+const CLAUDE_PROVIDER_SKILLS = new Set([
+  "deep-research", "design-sync", "dataviz", "update-config", "verify", "debug",
+  "code-review", "simplify", "batch", "fewer-permission-prompts", "doctor", "loop",
+  "schedule", "claude-api", "run", "run-skill-generator", "security-review",
+]);
 const OPUS_48_MODEL = "claude-opus-4-8";
 const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 const CLAUDE_TASK_TOOLS = ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList"];
@@ -955,15 +961,19 @@ async function claudeSkills(params) {
     try {
       for (const child of await readdir(join(plugin.installPath, "skills"), { withFileTypes: true })) {
         if (!child.isDirectory()) continue;
+        const path = join(plugin.installPath, "skills", child.name, "SKILL.md");
+        const meta = await readSkillMeta(path, child.name);
+        const namespace = String(plugin.id || "plugin").split("@")[0];
+        const name = `${namespace}:${meta.name}`;
         skills.push({
-          name: child.name,
-          path: join(plugin.installPath, "skills", child.name, "SKILL.md"),
-          description: `${plugin.id} plugin skill`,
+          name,
+          path,
+          description: meta.description || `${plugin.id} plugin skill`,
           enabled: Boolean(plugin.enabled),
           scope: plugin.scope || "user",
           pluginId: plugin.id,
         });
-        seen.add(child.name);
+        seen.add(name);
       }
     } catch { /* Plugins do not have to provide skills. */ }
   }
@@ -978,7 +988,77 @@ async function claudeSkills(params) {
     seen.add(skill.name);
     skills.push(skill);
   }
+  for (const command of await supportedClaudeSkills(params)) {
+    const name = String(command?.name || "").replace(/^\//, "");
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    const description = String(command?.description || "Claude skill");
+    const scope = description.endsWith("(user)")
+      ? "user"
+      : description.endsWith("(project)") ? "project" : "system";
+    const pluginId = name.includes(":") ? name.split(":")[0] : null;
+    skills.push({
+      name,
+      path: `claude-command://${encodeURIComponent(name)}`,
+      description,
+      enabled: true,
+      scope,
+      pluginId,
+    });
+  }
   return { data: [{ cwd, skills }] };
+}
+
+async function supportedClaudeSkills(params) {
+  const cwd = params.cwd || process.cwd();
+  const live = [...sessions.values()].find((session) =>
+    session.query && sameCwd(session.cwd, cwd));
+  if (live) return filterClaudeSkillCommands(await live.query.supportedCommands());
+  const cacheKey = `${params.claudePath || "claude"}\n${params.cwd || process.cwd()}`;
+  if (params.forceReload) skillCatalogs.delete(cacheKey);
+  if (skillCatalogs.has(cacheKey)) return skillCatalogs.get(cacheKey);
+  const pending = (async () => {
+    const input = new AsyncQueue();
+    const options = {
+      cwd: params.cwd || process.cwd(),
+      persistSession: false,
+      settingSources: ["user", "project", "local"],
+      skills: "all",
+      tools: [],
+      env: sanitizedEnvironment(),
+      stderr: (data) => process.stderr.write(data),
+    };
+    applyClaudeExecutable(options, params);
+    const agentQuery = await startAgentQuery(input, options);
+    const consumer = (async () => {
+      try { for await (const _message of agentQuery) { /* initialization only */ } }
+      catch { /* supportedCommands reports the useful failure. */ }
+    })();
+    try {
+      return filterClaudeSkillCommands(await agentQuery.supportedCommands());
+    } finally {
+      input.close();
+      agentQuery.close();
+      await Promise.race([consumer, new Promise((resolve) => setTimeout(resolve, 1000))]);
+    }
+  })();
+  skillCatalogs.set(cacheKey, pending);
+  try {
+    return await pending;
+  } catch (error) {
+    skillCatalogs.delete(cacheKey);
+    throw error;
+  }
+}
+
+function filterClaudeSkillCommands(commands) {
+  return commands.filter((command) => {
+    const name = String(command?.name || "");
+    const description = String(command?.description || "");
+    return CLAUDE_PROVIDER_SKILLS.has(name)
+      || name.includes(":")
+      || /\((user|project|dynamic workflow)\)$/.test(description);
+  });
 }
 
 function claudeMcpStatusValue(statuses) {
@@ -1391,6 +1471,7 @@ function processToolUse(session, block) {
   session.tools.set(block.id, { name, input, item });
   emitItem(session, "started", item);
   if (SUBAGENT_TOOLS.includes(name)) startSubagent(session, block);
+  else if (name === "Bash") startDelegatedSubagent(session, block);
 }
 
 function toolItem(session, id, name, input) {
@@ -1629,6 +1710,33 @@ function startSubagent(session, block) {
     background: false,
     name: firstLine(input.subagent_type || input.agentType || "agent", 40),
     description: firstLine(input.description || input.prompt || "", 120),
+    tool: "",
+    startedAt: Date.now(),
+    lastSeenAt: Date.now(),
+  });
+  emitSubagents(session);
+}
+
+// 교차 제공자 검증자는 Agent 도구가 아니라 셸로 띄우므로, 위임 실행을 알아보고
+// 같은 서브에이전트 항목으로 노출한다. 결과가 오면 기존 종료 경로가 항목을 지운다.
+const DELEGATED_AGENT_PATTERN = /\bcodex\s+exec\b/;
+
+function delegatedAgentModel(command) {
+  const match = command.match(/(?:^|\s)(?:-m|--model)[\s=]+"?([\w.-]+)"?/);
+  return match ? match[1] : "";
+}
+
+function startDelegatedSubagent(session, block) {
+  const command = typeof block.input?.command === "string" ? block.input.command : "";
+  if (!DELEGATED_AGENT_PATTERN.test(command)) return;
+  if (findSubagent(session, block.id)) return;
+  session.subagents.set(block.id, {
+    id: block.id,
+    toolUseId: block.id,
+    taskId: "",
+    background: false,
+    name: firstLine(delegatedAgentModel(command) || "codex", 40),
+    description: firstLine(command.replace(/\s+/g, " "), 120),
     tool: "",
     startedAt: Date.now(),
     lastSeenAt: Date.now(),
@@ -2403,8 +2511,10 @@ function stripHandoff(text) {
 
 async function inputContent(input, handoffContext) {
   const content = [];
+  const explicitSkills = [];
   for (const item of Array.isArray(input) ? input : []) {
     if (item.type === "text") content.push({ type: "text", text: item.text || "" });
+    else if (item.type === "skill" && item.name) explicitSkills.push(String(item.name));
     else if (item.type === "localImage" && item.path) {
       const bytes = await readFile(item.path);
       const extension = item.path.split(".").pop()?.toLowerCase();
@@ -2414,6 +2524,17 @@ async function inputContent(input, handoffContext) {
         : "image/jpeg";
       content.push({ type: "image", source: { type: "base64", media_type: mediaType, data: bytes.toString("base64") } });
     }
+  }
+  if (explicitSkills.length) {
+    content.unshift({
+      type: "text",
+      text: [
+        "<devez-vibe-explicit-skills>",
+        "The user explicitly selected these Claude Code skills. Invoke each skill before handling the request:",
+        ...explicitSkills.map((name) => `- /${name}`),
+        "</devez-vibe-explicit-skills>",
+      ].join("\n"),
+    });
   }
   return prependHandoff(content.length ? content : [{ type: "text", text: "" }], handoffContext);
 }
@@ -4097,6 +4218,21 @@ async function runSelfTest() {
     event.method === "item/completed" && event.params?.item?.type === "agentMessage");
   if (keptStarted !== 0 || keptCompleted?.params?.item?.text !== "타일 보기 로직을 고쳤습니다.") {
     throw new Error(`Claude held Korean text self-test failed: ${JSON.stringify(keptEvents)}`);
+  }
+  const explicitSkillContent = await inputContent([
+    { type: "text", text: "$debug investigate" },
+    { type: "skill", name: "debug", path: "claude-command://debug" },
+  ]);
+  if (!explicitSkillContent[0]?.text?.includes("/debug")) {
+    throw new Error(`Claude explicit skill self-test failed: ${JSON.stringify(explicitSkillContent)}`);
+  }
+  const filteredSkills = filterClaudeSkillCommands([
+    { name: "compact", description: "Compact context" },
+    { name: "debug", description: "Debug a problem" },
+    { name: "personal", description: "Personal skill (user)" },
+  ]).map((skill) => skill.name);
+  if (filteredSkills.join(",") !== "debug,personal") {
+    throw new Error(`Claude skill filtering self-test failed: ${filteredSkills.join(",")}`);
   }
   process.stdout.write("Claude bridge self-test passed\n");
 }
