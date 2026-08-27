@@ -5518,14 +5518,56 @@ fn subagent_lines(subagents: &[SubagentView], width: u16) -> Vec<PaintLine> {
         .collect()
 }
 
+/// 이름 뒤에 이만큼도 남지 않으면 호출 설명을 통째로 뺀다. 한두 글자만 남기고
+/// 잘린 설명은 무엇을 시켰는지 알려 주지 못한 채 폭만 먹는다.
+const SUBAGENT_DESCRIPTION_MIN_WIDTH: usize = 12;
+const SUBAGENT_DESCRIPTION_SEPARATOR: &str = " · ";
+
+/// 이름 옆에 그 호출로 무엇을 시켰는지 붙인다. 자리가 모자라면 None을 돌려
+/// 이름과 경과 시간만 남긴다.
+fn subagent_description_span(description: &str, available: usize) -> Option<PaintSpan> {
+    let description = description.trim();
+    if description.is_empty() || available < SUBAGENT_DESCRIPTION_MIN_WIDTH {
+        return None;
+    }
+    let separator_width = UnicodeWidthStr::width(SUBAGENT_DESCRIPTION_SEPARATOR);
+    let text = compact_right(description, available.saturating_sub(separator_width));
+    Some(PaintSpan {
+        text: format!("{SUBAGENT_DESCRIPTION_SEPARATOR}{text}"),
+        tone: Tone::Muted,
+        bold: false,
+    })
+}
+
 fn subagent_line(subagent: &SubagentView, index: usize, width: u16) -> PaintLine {
     let elapsed = format!(" · {}", format_subagent_elapsed(subagent.elapsed.as_secs()));
-    // The gutter, glyph, and elapsed reading are fixed, so only the name is
-    // compacted when the terminal cannot hold the whole row.
+    // The gutter, glyph, and elapsed reading are fixed, so the name is compacted
+    // first and the call description takes only what the name leaves behind.
     let reserved =
         1 + UnicodeWidthStr::width(SUBAGENT_GLYPH) + 2 + UnicodeWidthStr::width(elapsed.as_str());
     let available = usize::from(width).saturating_sub(reserved + 1);
     let name = compact_right(&subagent.name, available);
+    let description = subagent_description_span(
+        &subagent.description,
+        available.saturating_sub(UnicodeWidthStr::width(name.as_str())),
+    );
+
+    let mut picks = vec![(0, Pick::Subagent(index)), (1, Pick::Subagent(index))];
+    let mut tail = vec![PaintSpan {
+        text: format!("  {name}"),
+        tone: Tone::Plain,
+        bold: false,
+    }];
+    if let Some(description) = description {
+        // 클릭 영역 색인은 본문 다음에 tail이 이어지므로 tail 위치보다 하나 크다.
+        picks.push((tail.len() + 1, Pick::Subagent(index)));
+        tail.push(description);
+    }
+    tail.push(PaintSpan {
+        text: elapsed,
+        tone: Tone::Muted,
+        bold: false,
+    });
 
     PaintLine {
         prefix: " ".to_owned(),
@@ -5535,22 +5577,11 @@ fn subagent_line(subagent: &SubagentView, index: usize, width: u16) -> PaintLine
         bold: false,
         tool_heading: None,
         pick: None,
-        tail: vec![
-            PaintSpan {
-                text: format!("  {name}"),
-                tone: Tone::Plain,
-                bold: false,
-            },
-            PaintSpan {
-                text: elapsed,
-                tone: Tone::Muted,
-                bold: false,
-            },
-        ],
+        tail,
     }
-    // The bullet and agent name open the same panel; the elapsed reading is left
-    // alone so the row's right edge stays quiet.
-    .with_picks(&[(0, Pick::Subagent(index)), (1, Pick::Subagent(index))])
+    // The bullet, agent name, and its description open the same panel; the
+    // elapsed reading is left alone so the row's right edge stays quiet.
+    .with_picks(&picks)
 }
 
 fn format_subagent_elapsed(seconds: u64) -> String {
@@ -8908,16 +8939,24 @@ fn side_panel_subagent_lines(subagents: &[SubagentView], content_width: usize) -
         let available = content_width.saturating_sub(
             UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(elapsed.as_str()),
         );
+        let name = compact_right(&subagent.name, available);
+        let description = subagent_description_span(
+            &subagent.description,
+            available.saturating_sub(UnicodeWidthStr::width(name.as_str())),
+        );
+        let mut tail = Vec::new();
+        tail.extend(description);
+        tail.push(PaintSpan {
+            text: elapsed,
+            tone: Tone::Muted,
+            bold: false,
+        });
         lines.push(PaintLine {
             prefix: prefix.to_owned(),
             prefix_tone: Tone::Accent,
-            text: compact_right(&subagent.name, available),
+            text: name,
             tone: Tone::Plain,
-            tail: vec![PaintSpan {
-                text: elapsed,
-                tone: Tone::Muted,
-                bold: false,
-            }],
+            tail,
             pick: Some(PickRegions::span(0, content_width, Pick::Subagent(index))),
             ..PaintLine::plain("")
         });
@@ -16404,7 +16443,7 @@ mod tests {
     }
 
     #[test]
-    fn running_subagents_show_only_name_and_elapsed_time() {
+    fn running_subagents_show_the_name_its_call_description_and_elapsed_time() {
         let subagents = [
             test_subagent("Explore", "Find auth code", "Grep(fn login)", 93),
             test_subagent("developer", "Fix the parser", "", 3),
@@ -16415,8 +16454,18 @@ mod tests {
                 .iter()
                 .map(painted)
                 .collect::<Vec<_>>(),
-            [" •  Explore · 1m 33s", " •  developer · 3s",]
+            [
+                " •  Explore · Find auth code · 1m 33s",
+                " •  developer · Fix the parser · 3s",
+            ]
         );
+    }
+
+    #[test]
+    fn a_subagent_row_without_a_description_shows_only_its_name() {
+        let subagent = test_subagent("Explore", "", "Grep(fn login)", 4);
+
+        assert_eq!(painted(&subagent_line(&subagent, 0, 80)), " •  Explore · 4s");
     }
 
     #[test]
@@ -16436,6 +16485,17 @@ mod tests {
     }
 
     #[test]
+    fn a_narrow_subagent_row_drops_the_description_before_the_name() {
+        let subagent = test_subagent("Explore", "Find the auth code path", "", 4);
+
+        let line = subagent_line(&subagent, 0, 26);
+
+        assert!(painted(&line).contains("Explore"));
+        assert!(!painted(&line).contains("Find"));
+        assert!(painted_line_width(&line) <= 26);
+    }
+
+    #[test]
     fn a_subagent_row_opens_its_own_panel_but_its_elapsed_reading_does_not() {
         let lines = subagent_lines(
             &[
@@ -16447,6 +16507,7 @@ mod tests {
 
         assert_eq!(pick_on(&lines[0], "•"), Some(Pick::Subagent(0)));
         assert_eq!(pick_on(&lines[0], "Explore"), Some(Pick::Subagent(0)));
+        assert_eq!(pick_on(&lines[0], "Find auth code"), Some(Pick::Subagent(0)));
         assert_eq!(pick_on(&lines[1], "developer"), Some(Pick::Subagent(1)));
         assert_eq!(pick_on(&lines[0], "4s"), None);
     }
@@ -16462,8 +16523,8 @@ mod tests {
 
         assert_eq!(painted(&lines[0]), "Subagents  2 실행 중");
         assert!(lines[1] == PaintLine::blank());
-        assert_eq!(painted(&lines[2]), "• Explore · 1m 33s");
-        assert_eq!(painted(&lines[3]), "• developer · 3s");
+        assert_eq!(painted(&lines[2]), "• Explore · Find auth code · 1m 33s");
+        assert_eq!(painted(&lines[3]), "• developer · Fix the parser · 3s");
         assert_eq!(pick_on(&lines[2], "Explore"), Some(Pick::Subagent(0)));
         assert_eq!(pick_on(&lines[2], "1m 33s"), Some(Pick::Subagent(0)));
         assert_eq!(pick_on(&lines[3], "developer"), Some(Pick::Subagent(1)));
