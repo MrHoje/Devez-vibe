@@ -29,6 +29,7 @@ const modelCatalogs = new Map();
 const CLAUDE_MODEL_ORDER = ["fable", "opus", "sonnet", "haiku"];
 const OPUS_48_MODEL = "claude-opus-4-8";
 const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+const CLAUDE_TASK_TOOLS = ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList"];
 let nextHostRequest = 1;
 
 class AsyncQueue {
@@ -575,6 +576,12 @@ function makeOptions(params, sessionId, resume) {
     },
     skills: "all",
     tools: { type: "preset", preset: "claude_code" },
+    // Task tools left the default surface in SDK 0.3.233. Listing them here
+    // keeps the plan panel available without replacing the Claude Code preset.
+    allowedTools: [...CLAUDE_TASK_TOOLS],
+    // DevezVibe keeps per-task controls available through Claude's TaskStop
+    // tool, so a turn interrupt must not tear down independent background work.
+    perTaskStopAffordance: true,
     systemPrompt: {
       type: "preset",
       preset: "claude_code",
@@ -661,6 +668,13 @@ async function requestToolPermission(toolName, input, permission) {
         if (!isQuestionDeliveryError(retryError)) throw retryError;
         return { behavior: "deny", message: questionFallbackMessage(questions) };
       }
+    }
+    // Esc on the host cancels the question outright. Claude Code stops the turn
+    // there, so the tool must not be handed an empty answer set: that reads as a
+    // successful call and the model keeps talking about a question nobody
+    // answered. The host sends its own interrupt right behind this reply.
+    if (response?.cancelled) {
+      return { behavior: "deny", message: "사용자가 질문을 취소하고 작업을 중단했습니다." };
     }
     const answers = {};
     for (let index = 0; index < questions.length; index += 1) {
@@ -1062,6 +1076,7 @@ async function createSession(params, resumeId) {
     subagents: new Map(),
     knownSubagents: new Map(),
     hiddenSubagentTasks: new Set(),
+    ambientSubagentTasks: new Set(),
     subagentPulse: null,
     lastContextUsage: null,
     lastContextWindow: 0,
@@ -1359,7 +1374,7 @@ function processAssistant(session, message) {
 function processToolUse(session, block) {
   const name = block.name || "Tool";
   const input = block.input || {};
-  if (name === "TaskCreate" || name === "TaskUpdate" || name === "TaskList") {
+  if (CLAUDE_TASK_TOOLS.includes(name)) {
     updatePlanFromToolUse(session, name, block.id, input);
     session.tools.set(block.id, { name, input, suppressed: true });
     return;
@@ -1689,7 +1704,8 @@ function upsertStructuredSubagent(session, message) {
   const taskId = firstLine(message.task_id || "", 80);
   const toolUseId = firstLine(message.tool_use_id || "", 80);
   const subagentType = firstLine(message.subagent_type || "", 40);
-  if (taskId && session.hiddenSubagentTasks?.has(taskId)) return null;
+  if (taskId && (session.hiddenSubagentTasks?.has(taskId)
+    || session.ambientSubagentTasks?.has(taskId))) return null;
   const byTool = toolUseId && findSubagent(session, toolUseId);
   const byTask = taskId && findSubagent(session, taskId);
   let running = byTool || byTask;
@@ -1743,7 +1759,13 @@ function upsertStructuredSubagent(session, message) {
 function finishStructuredSubagent(session, message, kind, text) {
   const taskId = firstLine(message.task_id || "", 80);
   const toolUseId = firstLine(message.tool_use_id || "", 80);
-  const wasHidden = taskId ? session.hiddenSubagentTasks?.delete(taskId) === true : false;
+  const wasTranscriptHidden = taskId
+    ? session.hiddenSubagentTasks?.delete(taskId) === true
+    : false;
+  const wasAmbient = taskId
+    ? session.ambientSubagentTasks?.delete(taskId) === true
+    : false;
+  const wasHidden = wasTranscriptHidden || wasAmbient;
   const running = (toolUseId && findSubagent(session, toolUseId))
     || (taskId && findSubagent(session, taskId));
   if (!running) return wasHidden;
@@ -1754,13 +1776,24 @@ function finishStructuredSubagent(session, message, kind, text) {
 }
 
 function syncBackgroundSubagents(session, tasks) {
-  const live = (Array.isArray(tasks) ? tasks : []).filter((task) => {
+  const snapshot = Array.isArray(tasks) ? tasks : [];
+  session.ambientSubagentTasks = new Set(snapshot
+    .filter((task) => task?.ambient === true)
+    .map((task) => firstLine(task?.task_id || "", 80))
+    .filter(Boolean));
+  const live = snapshot.filter((task) => {
     const taskId = firstLine(task?.task_id || "", 80);
-    return !taskId || !session.hiddenSubagentTasks?.has(taskId);
+    return task?.ambient !== true
+      && (!taskId || !session.hiddenSubagentTasks?.has(taskId));
   });
   const liveIds = new Set(live.map((task) => firstLine(task?.task_id || "", 80)).filter(Boolean));
   let changed = false;
   for (const [id, running] of session.subagents) {
+    if (running.taskId && session.ambientSubagentTasks.has(running.taskId)) {
+      session.subagents.delete(id);
+      changed = true;
+      continue;
+    }
     if (!running.background || !running.taskId || liveIds.has(running.taskId)) continue;
     session.subagents.delete(id);
     changed = true;
@@ -1799,12 +1832,14 @@ function syncBackgroundSubagents(session, tasks) {
 
 function processSubagentSystemMessage(session, message) {
   if (message.subtype === "task_started") {
-    if (message.skip_transcript === true) {
+    if (message.skip_transcript === true || message.ambient === true) {
       const taskId = firstLine(message.task_id || "", 80);
       const toolUseId = firstLine(message.tool_use_id || "", 80);
       if (taskId) {
-        session.hiddenSubagentTasks ||= new Set();
-        session.hiddenSubagentTasks.add(taskId);
+        const hidden = message.ambient === true
+          ? (session.ambientSubagentTasks ||= new Set())
+          : (session.hiddenSubagentTasks ||= new Set());
+        hidden.add(taskId);
       }
       const running = (toolUseId && findSubagent(session, toolUseId))
         || (taskId && findSubagent(session, taskId));
@@ -1853,6 +1888,10 @@ function processSubagentSystemMessage(session, message) {
     return true;
   }
   if (message.subtype === "task_notification") {
+    if (message.ambient === true && message.task_id) {
+      session.ambientSubagentTasks ||= new Set();
+      session.ambientSubagentTasks.add(firstLine(message.task_id, 80));
+    }
     const status = firstLine(message.status || "completed", 40);
     return finishStructuredSubagent(
       session,
@@ -1961,6 +2000,7 @@ function clearSubagents(session) {
   const changed = session.subagents.size > 0;
   session.subagents.clear();
   session.hiddenSubagentTasks?.clear();
+  session.ambientSubagentTasks?.clear();
   if (session.subagentPulse) {
     clearInterval(session.subagentPulse);
     session.subagentPulse = null;
@@ -2547,7 +2587,7 @@ function historyState(messages) {
             tasks.set(`pending:${block.id}`, { id: `pending:${block.id}`, subject: block.input?.subject || "작업", status: "pending", turnId: turn.id });
           } else if (block.name === "TaskUpdate") {
             applyTaskUpdate(tasks, block.input || {}, turn.id, undefined, messageTime(message));
-          } else if (!["TaskList", "AskUserQuestion"].includes(block.name)) turn.items.push(pending.item);
+          } else if (!["TaskGet", "TaskList", "AskUserQuestion"].includes(block.name)) turn.items.push(pending.item);
         }
       }
     } else if (message.type === "user") {
@@ -3034,6 +3074,21 @@ async function runSelfTest() {
     || permissionMode("not-a-mode", "auto") !== "auto") {
     throw new Error("Claude permission mode self-test failed");
   }
+  const latestOptions = makeOptions({ cwd: process.cwd() }, "00000000-0000-4000-8000-000000000000");
+  if (latestOptions.perTaskStopAffordance !== true
+    || CLAUDE_TASK_TOOLS.some((tool) => !latestOptions.allowedTools.includes(tool))) {
+    throw new Error(`Claude latest SDK options self-test failed: ${JSON.stringify(latestOptions.allowedTools)}`);
+  }
+  const lookupSession = {
+    turn: { id: "task-get-turn" },
+    tools: new Map(),
+    tasks: new Map(),
+    planCreatePending: false,
+  };
+  processToolUse(lookupSession, { id: "task-get", name: "TaskGet", input: { taskId: "1" } });
+  if (lookupSession.tools.get("task-get")?.suppressed !== true) {
+    throw new Error("Claude TaskGet transcript suppression self-test failed");
+  }
   const pluginCatalog = buildClaudePluginCatalog(
     [{ id: "cloudflare@official", enabled: true, scope: "user" }],
     [{
@@ -3474,6 +3529,7 @@ async function runSelfTest() {
       subagents: new Map(),
       knownSubagents: new Map(),
       hiddenSubagentTasks: new Set(),
+      ambientSubagentTasks: new Set(),
       subagentPulse: null,
     };
     processSubagentSystemMessage(structuredSession, {
@@ -3594,6 +3650,42 @@ async function runSelfTest() {
       status: "completed",
       summary: "Hidden task finished",
     });
+
+    processSubagentSystemMessage(structuredSession, {
+      type: "system",
+      subtype: "task_started",
+      task_id: "agent-ambient",
+      tool_use_id: "toolu_ambient",
+      task_type: "agent",
+      subagent_type: "Explore",
+      description: "Refresh housekeeping",
+      ambient: true,
+    });
+    processSubagentSystemMessage(structuredSession, {
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{
+        task_id: "agent-ambient",
+        task_type: "agent",
+        description: "Refresh housekeeping",
+        ambient: true,
+      }],
+    });
+    if (structuredSession.subagents.size !== 0
+      || !structuredSession.ambientSubagentTasks.has("agent-ambient")) {
+      throw new Error("Claude ambient task was shown as a subagent row");
+    }
+    processSubagentSystemMessage(structuredSession, {
+      type: "system",
+      subtype: "task_notification",
+      task_id: "agent-ambient",
+      status: "completed",
+      summary: "Ambient task finished",
+      ambient: true,
+    });
+    if (structuredSession.ambientSubagentTasks.size !== 0) {
+      throw new Error("Claude ambient task completion did not clear hidden state");
+    }
 
     processSubagentSystemMessage(structuredSession, {
       type: "system",

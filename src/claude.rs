@@ -675,6 +675,34 @@ mod tests {
     }
 
     #[test]
+    fn bridge_enables_latest_claude_task_and_interrupt_contracts() {
+        let package: Value =
+            serde_json::from_str(include_str!("../npm/package.json")).expect("npm package");
+        let lock: Value =
+            serde_json::from_str(include_str!("../npm/package-lock.json")).expect("npm lock");
+        let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
+
+        assert_eq!(
+            package
+                .pointer("/dependencies/@anthropic-ai~1claude-agent-sdk")
+                .and_then(Value::as_str),
+            Some("0.3.247")
+        );
+        assert_eq!(
+            lock.pointer("/packages//dependencies/@anthropic-ai~1claude-agent-sdk")
+                .and_then(Value::as_str),
+            Some("0.3.247")
+        );
+        assert!(bridge.contains(
+            "const CLAUDE_TASK_TOOLS = [\"TaskCreate\", \"TaskGet\", \"TaskUpdate\", \"TaskList\"]"
+        ));
+        assert!(bridge.contains("allowedTools: [...CLAUDE_TASK_TOOLS]"));
+        assert!(bridge.contains("perTaskStopAffordance: true"));
+        assert!(bridge.contains("if (CLAUDE_TASK_TOOLS.includes(name))"));
+        assert!(bridge.contains("[\"TaskGet\", \"TaskList\", \"AskUserQuestion\"]"));
+    }
+
+    #[test]
     fn bridge_renumbers_tasks_from_one_and_never_sends_an_empty_plan() {
         let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
 
@@ -704,6 +732,8 @@ mod tests {
         assert!(bridge.contains("processSubagentSystemMessage(session, message)"));
         assert!(bridge.contains("message.subtype === \"background_tasks_changed\""));
         assert!(bridge.contains("message.subtype === \"task_notification\""));
+        assert!(bridge.contains("message.ambient === true"));
+        assert!(bridge.contains("session.ambientSubagentTasks"));
         assert!(bridge.contains("BACKGROUND_SUBAGENT_LEASE_MS"));
         assert!(bridge.contains("clearForegroundSubagents(session)"));
         assert!(bridge.contains("if (!session.turn) beginTurn(session);"));

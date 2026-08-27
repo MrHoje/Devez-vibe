@@ -3133,7 +3133,6 @@ impl Renderer {
             .side_panel
             .map(|layout| {
                 let mut lines = side_panel_header_lines(cwd, layout.content_width());
-                lines.extend(side_panel_subagent_lines(subagents, layout.content_width()));
                 lines.extend(
                     plan_summary
                         .map(|summary| {
@@ -3151,6 +3150,7 @@ impl Renderer {
                     layout.content_width(),
                     side_panel_prompts_expanded,
                 ));
+                lines.extend(side_panel_subagent_lines(subagents, layout.content_width()));
                 if SIDE_PANEL_INTEGRATIONS_CONNECTED {
                     let content_capacity = rows.saturating_sub(self.side_panel_footer.len() + 2);
                     let remaining = content_capacity.saturating_sub(lines.len());
@@ -6436,35 +6436,50 @@ fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine
         .unwrap_or("Commands");
     let mut lines = vec![panel_title_row(title, panel_width, false)];
     lines.push(panel_padding_row(panel_width));
-    for suggestion in &suggestions[visible_window(
+    let visible = &suggestions[visible_window(
         suggestions.iter().position(|item| item.selected),
         suggestions.len(),
         SUGGESTION_ROWS,
-    )] {
+    )];
+    let completion_name_width = suggestions
+        .iter()
+        .filter_map(|suggestion| {
+            suggestion.category.as_deref().map(|category| {
+                UnicodeWidthStr::width(format!("[{category}] {}", suggestion.command).as_str())
+            })
+        })
+        .max()
+        .unwrap_or_default()
+        .min(inner_width.saturating_sub(13 + SUGGESTION_RIGHT_INSET));
+    for suggestion in visible {
         let marker = if suggestion.selected { "❯" } else { " " };
-        let content = match suggestion.category.as_deref() {
-            Some(category) if suggestion.description.is_empty() => {
-                format!(" {marker} [{category}] {}", suggestion.command)
+        let line = match suggestion.category.as_deref() {
+            Some(category) => completion_suggestion_line(
+                suggestion,
+                category,
+                marker,
+                completion_name_width,
+                panel_width,
+            ),
+            None => {
+                let content = format!(
+                    " {marker} {:<COMMAND_COLUMN_WIDTH$} {}",
+                    suggestion.command, suggestion.description
+                );
+                panel_line_keep_left_inset(
+                    &content,
+                    panel_width,
+                    SUGGESTION_RIGHT_INSET,
+                    if suggestion.selected {
+                        Tone::Accent
+                    } else {
+                        Tone::Muted
+                    },
+                    suggestion.selected,
+                )
             }
-            Some(category) => format!(
-                " {marker} [{category}] {}  {}",
-                suggestion.command, suggestion.description
-            ),
-            None => format!(
-                " {marker} {:<COMMAND_COLUMN_WIDTH$} {}",
-                suggestion.command, suggestion.description
-            ),
         };
-        lines.push(panel_line_keep_left(
-            &content,
-            panel_width,
-            if suggestion.selected {
-                Tone::Accent
-            } else {
-                Tone::Muted
-            },
-            suggestion.selected,
-        ));
+        lines.push(line);
     }
     if let Some(hint) = suggestions
         .iter()
@@ -6482,8 +6497,77 @@ fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine
     lines
 }
 
+fn completion_suggestion_line(
+    suggestion: &SuggestionView,
+    category: &str,
+    marker: &str,
+    name_width: usize,
+    panel_width: usize,
+) -> PaintLine {
+    let inner_width = panel_width.saturating_sub(2);
+    let fixed_width = 3 + name_width + 2;
+    let description_width = inner_width
+        .saturating_sub(SUGGESTION_RIGHT_INSET)
+        .saturating_sub(fixed_width);
+    let name = compact_right(&format!("[{category}] {}", suggestion.command), name_width);
+    let name_padding = name_width.saturating_sub(UnicodeWidthStr::width(name.as_str()));
+    let description = compact_right(&suggestion.description, description_width);
+    let description_padding =
+        description_width.saturating_sub(UnicodeWidthStr::width(description.as_str()));
+    let name_tone = if suggestion.selected {
+        Tone::Accent
+    } else {
+        Tone::Plain
+    };
+
+    PaintLine {
+        prefix: "│".to_owned(),
+        prefix_tone: Tone::Border,
+        text: " ".to_owned(),
+        tone: Tone::Muted,
+        bold: false,
+        tool_heading: None,
+        pick: None,
+        tail: vec![
+            PaintSpan {
+                text: marker.to_owned(),
+                tone: if suggestion.selected {
+                    Tone::Accent
+                } else {
+                    Tone::Muted
+                },
+                bold: suggestion.selected,
+            },
+            PaintSpan {
+                text: " ".to_owned(),
+                tone: Tone::Muted,
+                bold: false,
+            },
+            PaintSpan {
+                text: format!("{name}{}  ", " ".repeat(name_padding)),
+                tone: name_tone,
+                bold: suggestion.selected,
+            },
+            PaintSpan {
+                text: description,
+                tone: Tone::Muted,
+                bold: false,
+            },
+            PaintSpan {
+                text: format!(
+                    "{}│",
+                    " ".repeat(description_padding + SUGGESTION_RIGHT_INSET)
+                ),
+                tone: Tone::Border,
+                bold: false,
+            },
+        ],
+    }
+}
+
 /// Rows the command dock shows at once. Longer lists scroll.
 const SUGGESTION_ROWS: usize = 6;
+const SUGGESTION_RIGHT_INSET: usize = 1;
 const COMMAND_COLUMN_WIDTH: usize = 16;
 
 /// The slice of a list to draw so `selected` is always on screen, keeping a
@@ -8426,7 +8510,7 @@ fn fixed_plan_summary_lines(
     let displayed_completed = completed.saturating_sub(usize::from(all_completed && plan_active));
     let title = if all_completed && plan_active {
         format!(
-            "{UPDATED_PLAN_TITLE} · {displayed_completed} / {} 진행 중",
+            "{UPDATED_PLAN_TITLE} · {displayed_completed} / {} Working",
             summary.steps.len()
         )
     } else {
@@ -8669,7 +8753,7 @@ fn side_panel_plan_lines(
     let displayed_completed = completed.saturating_sub(usize::from(all_completed && plan_active));
     let mut title = if all_completed && plan_active {
         format!(
-            "{UPDATED_PLAN_TITLE}  {displayed_completed} / {} 진행 중",
+            "{UPDATED_PLAN_TITLE}  {displayed_completed} / {} Working",
             summary.steps.len()
         )
     } else {
@@ -8682,7 +8766,7 @@ fn side_panel_plan_lines(
     // room for a line of its own, so the same total rides on the heading.
     if completion_displayed {
         let elapsed: Duration = summary.steps.iter().filter_map(|step| step.elapsed).sum();
-        title.push_str(&format!("  [⏱  {}]", format_plan_elapsed(elapsed)));
+        title.push_str(&format!("  [{}]", format_plan_elapsed(elapsed)));
     }
     let heading =
         side_panel_section_heading(&title, summary.expanded, content_width, Pick::PlanSummary);
@@ -8799,7 +8883,7 @@ fn side_panel_header_lines(cwd: &str, content_width: usize) -> Vec<PaintLine> {
 
 const SIDE_PANEL_SUBAGENT_LIMIT: usize = 5;
 
-/// Active provider subagents take the top of the docked panel while any are
+/// Active provider subagents sit below the input prompt section while any are
 /// running. The same list remains below the status line when the panel is shut,
 /// so opening the panel moves the information instead of duplicating it.
 fn side_panel_subagent_lines(subagents: &[SubagentView], content_width: usize) -> Vec<PaintLine> {
@@ -20499,6 +20583,7 @@ mod tests {
 
         assert!(painted(option).contains("/renderer"));
         assert!(!painted(option).contains("…nderer"));
+        assert!(painted(option).ends_with("… │"));
         assert_eq!(painted_width(option), panel_span(72));
     }
 
@@ -20537,6 +20622,83 @@ mod tests {
             UnicodeWidthStr::width(&short_name_row[..short_description]),
             UnicodeWidthStr::width(&long_name_row[..long_description])
         );
+    }
+
+    #[test]
+    fn completion_dock_aligns_and_tints_names_separately_from_descriptions() {
+        let suggestions = vec![
+            SuggestionView {
+                command: "review".to_owned(),
+                description: "Review a change".to_owned(),
+                selected: true,
+                category: Some("Skill".to_owned()),
+                panel_title: "Mentions",
+                hint: None,
+            },
+            SuggestionView {
+                command: "browser-automation".to_owned(),
+                description: "Control a browser through a deliberately long completion description"
+                    .to_owned(),
+                selected: false,
+                category: Some("Plugin".to_owned()),
+                panel_title: "Mentions",
+                hint: None,
+            },
+        ];
+
+        let lines = suggestion_lines(&suggestions, 80);
+        let short_name_row = painted(&lines[2]);
+        let long_name_row = painted(&lines[3]);
+        let short_description = short_name_row
+            .find("Review a change")
+            .expect("short description");
+        let long_description = long_name_row
+            .find("Control a browser")
+            .expect("long description");
+
+        assert_eq!(
+            UnicodeWidthStr::width(&short_name_row[..short_description]),
+            UnicodeWidthStr::width(&long_name_row[..long_description])
+        );
+        assert_eq!(lines[2].tail[2].tone, Tone::Accent);
+        assert_eq!(lines[2].tail[3].tone, Tone::Muted);
+        assert_eq!(lines[3].tail[2].tone, Tone::Plain);
+        assert_eq!(lines[3].tail[3].tone, Tone::Muted);
+        assert!(long_name_row.ends_with("… │"));
+    }
+
+    #[test]
+    fn completion_description_column_stays_fixed_while_the_list_scrolls() {
+        let mut suggestions = (0..7)
+            .map(|index| SuggestionView {
+                command: if index == 6 {
+                    "the-longest-completion-name".to_owned()
+                } else {
+                    format!("item-{index}")
+                },
+                description: format!("description-{index}"),
+                selected: index == 0,
+                category: Some("Skill".to_owned()),
+                panel_title: "Mentions",
+                hint: None,
+            })
+            .collect::<Vec<_>>();
+        let first = suggestion_lines(&suggestions, 80);
+        suggestions[0].selected = false;
+        suggestions[6].selected = true;
+        let scrolled = suggestion_lines(&suggestions, 80);
+        let description_column = |lines: &[PaintLine]| {
+            lines
+                .iter()
+                .map(painted)
+                .find_map(|line| {
+                    line.find("description-1")
+                        .map(|at| UnicodeWidthStr::width(&line[..at]))
+                })
+                .expect("overlapping completion row")
+        };
+
+        assert_eq!(description_column(&first), description_column(&scrolled));
     }
 
     #[test]
@@ -22319,21 +22481,21 @@ mod tests {
             ..summary
         };
         let waiting = side_panel_plan_lines(&finished, layout.content_width(), 0.0, true);
-        assert_eq!(painted(&waiting[0]), "▲ Updated Plan  2 / 3 진행 중");
+        assert_eq!(painted(&waiting[0]), "▲ Updated Plan  2 / 3 Working");
         assert_ne!(waiting[4].prefix, "✔ ");
         assert_eq!(waiting[4].prefix_tone, Tone::Accent);
         assert_eq!(waiting[4].tone, Tone::Accent);
         assert!(waiting.iter().all(|line| !painted(line).contains('⏱')));
 
         let waiting_card = fixed_plan_summary_lines(&finished, 80, 0.0, true, None, None);
-        assert!(painted(&waiting_card[0]).contains("Updated Plan · 2 / 3 진행 중"));
+        assert!(painted(&waiting_card[0]).contains("Updated Plan · 2 / 3 Working"));
         assert_ne!(waiting_card[4].prefix, "  ✔  ");
         assert_eq!(waiting_card[4].prefix_tone, Tone::Accent);
         assert_eq!(waiting_card[4].tone, Tone::Accent);
         assert!(waiting_card.iter().all(|line| !painted(line).contains('⏱')));
 
         let done = side_panel_plan_lines(&finished, layout.content_width(), 0.0, false);
-        assert_eq!(painted(&done[0]), "▲ Updated Plan  3 / 3  [⏱  1m 25s]");
+        assert_eq!(painted(&done[0]), "▲ Updated Plan  3 / 3  [1m 25s]");
         assert_eq!(done[4].prefix, "✔ ");
     }
 

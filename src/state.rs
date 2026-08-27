@@ -670,6 +670,21 @@ struct SlashCommand {
     takes_argument: bool,
 }
 
+impl SlashCommand {
+    /// Whether the command reaches anything on `provider`. OpenCode has no
+    /// account, permission, MCP, plugin, or skill surface of its own, and Claude
+    /// has no fast service tier, so those commands stay out of the suggestion
+    /// list — and out of `/help` — while such a runtime is selected.
+    fn supports(&self, provider: ModelProvider) -> bool {
+        match self.name {
+            "/login" | "/logout" | "/permissions" | "/mcp" | "/plugins" | "/reload-plugins"
+            | "/skills" => provider != ModelProvider::OpenCode,
+            "/fast" => provider != ModelProvider::Claude,
+            _ => true,
+        }
+    }
+}
+
 const SLASH_COMMANDS: [SlashCommand; 32] = [
     SlashCommand {
         name: "/provider",
@@ -813,7 +828,7 @@ const SLASH_COMMANDS: [SlashCommand; 32] = [
     },
     SlashCommand {
         name: "/clear",
-        description: "Clear the terminal",
+        description: "Alias for /new",
         takes_argument: false,
     },
     SlashCommand {
@@ -1429,7 +1444,6 @@ pub enum Action {
         activate_codex: bool,
     },
     Quit,
-    ClearScreen,
     Tick(bool),
     RpcResponse {
         id: Value,
@@ -1438,6 +1452,14 @@ pub enum Action {
     RpcError {
         id: Value,
         message: String,
+    },
+    /// Esc on a question the runtime is blocked on: the request is answered as
+    /// cancelled and the turn it belongs to stops, exactly as Claude Code does.
+    /// `interrupt` is false only when the turn is not active yet, in which case
+    /// the interrupt is already remembered and must not be sent twice.
+    CancelUserInput {
+        id: Value,
+        interrupt: bool,
     },
 }
 
@@ -1731,6 +1753,11 @@ impl ModelScope {
     }
 }
 
+struct ApprovalChoice {
+    label: String,
+    result: Value,
+}
+
 enum PendingInteraction {
     ModelPicker {
         model_index: usize,
@@ -1846,10 +1873,7 @@ enum PendingInteraction {
         title: String,
         detail: Vec<String>,
         selected: usize,
-        once: Value,
-        session: Option<Value>,
-        session_label: String,
-        decline: Value,
+        choices: Vec<ApprovalChoice>,
     },
     UserInput {
         id: Value,
@@ -3619,6 +3643,10 @@ pub struct AppState {
     /// the prompt that preceded it. The last clone also receives the completed
     /// duration and replaces its already-rendered transcript block.
     turn_prompts: Vec<Block>,
+    /// When each visible user prompt began waiting for the next response segment.
+    /// Blocking-question answers share the provider turn, so the turn's one clock
+    /// cannot recover their individual elapsed values.
+    turn_prompt_started_at: HashMap<u64, Instant>,
     /// Every user-authored boundary inside the active provider turn. Besides
     /// submitted prompts and steers, this includes answers to blocking questions
     /// so response grouping cannot move later provider output above that answer.
@@ -3636,6 +3664,7 @@ pub struct AppState {
     /// repeated searches/tool results from producing identical transcript rows.
     seen_operation_signatures: HashSet<String>,
     pending: Option<PendingInteraction>,
+    pending_user_input_deadline: Option<(Value, Instant)>,
     /// Tokens the *current* prompt occupies, not the thread's running tally.
     /// The tally climbs past the window on every turn and is not a context gauge.
     context_tokens: u64,
@@ -3655,6 +3684,9 @@ pub struct AppState {
     /// The turn that published the visible plan. A later turn must not revive
     /// its completed final step while it is still waiting for its own plan.
     plan_turn_id: Option<String>,
+    /// 재개한 세션에서 기록으로부터 되살린 계획. 다음 턴이 시작되면 지난 세션의
+    /// 계획이 화면에 남지 않도록 비운다.
+    plan_restored: bool,
     plan_shimmer_started_at: Option<Instant>,
     subagents: Vec<RunningSubagent>,
     /// Child threads observed through Codex collaboration events. Unlike the
@@ -3890,6 +3922,7 @@ impl AppState {
             turn_file_change_anchor: None,
             turn_response_blocks: Vec::new(),
             turn_prompts: Vec::new(),
+            turn_prompt_started_at: HashMap::new(),
             turn_response_boundaries: Vec::new(),
             discarded_prompt_ids: Vec::new(),
             response_grouped: false,
@@ -3897,6 +3930,7 @@ impl AppState {
             completed_item_ids: HashSet::new(),
             seen_operation_signatures: HashSet::new(),
             pending: None,
+            pending_user_input_deadline: None,
             context_tokens: 0,
             token_totals: TokenTotals::default(),
             cost_ledger: Some(CostLedger::default()),
@@ -3911,6 +3945,7 @@ impl AppState {
             show_welcome: true,
             plan_summary: None,
             plan_turn_id: None,
+            plan_restored: false,
             plan_shimmer_started_at: None,
             subagents: Vec::new(),
             codex_subagents: HashMap::new(),
@@ -5607,9 +5642,9 @@ impl AppState {
         self.commit_welcome_card();
         self.reset_turn_item_tracking();
         let prompt = Block::new(BlockKind::User, self.selected_model_name(), text);
-        self.turn_prompts.push(prompt.clone());
-        self.turn_response_boundaries.push(prompt.clone());
-        self.committed.push(prompt);
+        let started_at = Instant::now();
+        self.begin_turn_prompt(prompt, started_at);
+        self.turn_started_at = Some(started_at);
         self.busy = true;
     }
 
@@ -5745,6 +5780,7 @@ impl AppState {
             elapsed: None,
         });
         self.plan_turn_id = None;
+        self.plan_restored = true;
     }
 
     pub fn set_turn_started(&mut self, turn_id: String) {
@@ -5752,6 +5788,12 @@ impl AppState {
         if self.turn_id.as_deref() != Some(turn_id.as_str()) && !acknowledging_local_prompt {
             self.reset_turn_item_tracking();
             self.plan_turn_id = None;
+        }
+        // 지난 세션에서 되살린 계획은 새 턴이 자기 계획을 낼 때까지 그대로 남아
+        // 갱신되지 않는 것처럼 보인다. 새 턴이 시작되는 순간 자리를 비운다.
+        if self.plan_restored {
+            self.plan_restored = false;
+            self.plan_summary = None;
         }
         self.turn_id = Some(turn_id);
         self.busy = true;
@@ -5818,9 +5860,32 @@ impl AppState {
         self.turn_file_change_anchor = None;
         self.turn_response_blocks.clear();
         self.turn_prompts.clear();
+        self.turn_prompt_started_at.clear();
         self.turn_response_boundaries.clear();
         self.response_grouped = false;
         self.response_collapse = None;
+    }
+
+    fn begin_turn_prompt(&mut self, prompt: Block, started_at: Instant) {
+        self.finish_active_turn_prompt(started_at);
+        self.turn_prompt_started_at.insert(prompt.id(), started_at);
+        self.turn_prompts.push(prompt.clone());
+        self.turn_response_boundaries.push(prompt.clone());
+        self.committed.push(prompt);
+    }
+
+    fn finish_active_turn_prompt(&mut self, completed_at: Instant) {
+        let Some(prompt) = self.turn_prompts.last_mut() else {
+            return;
+        };
+        if prompt.response_duration().is_some() {
+            return;
+        }
+        let Some(started_at) = self.turn_prompt_started_at.get(&prompt.id()).copied() else {
+            return;
+        };
+        prompt.set_response_duration(completed_at.saturating_duration_since(started_at));
+        self.committed.push(prompt.clone());
     }
 
     fn push_unique_operation(&mut self, block: Block) -> bool {
@@ -5965,6 +6030,8 @@ impl AppState {
             .map(|prompt| prompt.id())
             .collect::<HashSet<_>>();
         self.committed.retain(|block| !ids.contains(&block.id()));
+        self.turn_prompt_started_at
+            .retain(|id, _| !ids.contains(id));
         self.turn_response_boundaries
             .retain(|block| !ids.contains(&block.id()));
         self.discarded_prompt_ids.extend(ids);
@@ -6228,6 +6295,7 @@ impl AppState {
         self.activity_notice = None;
         self.quit_armed_at = None;
         self.plan_summary = None;
+        self.plan_restored = false;
         self.response_collapse = None;
         self.turn_response_blocks.clear();
         self.response_grouped = false;
@@ -6269,12 +6337,6 @@ impl AppState {
         );
     }
 
-    /// Brings the welcome panel back after the screen is wiped, so a cleared
-    /// terminal looks like a fresh start instead of a bare composer.
-    pub fn reset_welcome(&mut self) {
-        self.show_welcome = true;
-    }
-
     pub fn drain_committed(&mut self) -> Vec<Block> {
         if self.show_welcome && !self.committed.is_empty() {
             let pending = std::mem::take(&mut self.committed);
@@ -6302,7 +6364,9 @@ impl AppState {
     }
 
     fn visible_plan_summary(&self) -> Option<&PlanSummary> {
-        self.plan_summary.as_ref().filter(|_| !self.plan_panel_hidden)
+        self.plan_summary
+            .as_ref()
+            .filter(|_| !self.plan_panel_hidden)
     }
 
     pub fn view(&self) -> View<'_> {
@@ -6363,9 +6427,9 @@ impl AppState {
                 })
                 .collect(),
             composer_placeholder: if self.provider_switch_pending() {
-                "Enter: queue for switched provider · Tab: queue"
+                "Enter: queue for switched provider · Tab: queue · @: Mention · $: Tools"
             } else if self.busy {
-                "Enter: steer · Tab: queue"
+                "Enter: steer · Tab: queue · @: Mention · $: Tools"
             } else {
                 ""
             },
@@ -7135,7 +7199,6 @@ impl AppState {
                 self.delete_from_composer(Editor::delete);
                 Action::None
             }
-            KeyCode::Char('l') if ctrl => Action::ClearScreen,
             KeyCode::Char('a') if ctrl => {
                 self.editor.move_home();
                 Action::None
@@ -7265,33 +7328,67 @@ impl AppState {
 
         match method {
             "item/commandExecution/requestApproval" => {
-                let command = params
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or("명령 실행");
-                let mut detail = vec![command.to_owned()];
-                if let Some(cwd) = params.get("cwd").and_then(Value::as_str) {
-                    detail.push(format!("위치: {cwd}"));
+                let choices = command_approval_choices(params);
+                if choices.is_empty() {
+                    return Action::RpcError {
+                        id,
+                        message: "서버가 지원 가능한 승인 결정을 제공하지 않았습니다.".to_owned(),
+                    };
+                }
+                let network_context = params
+                    .get("networkApprovalContext")
+                    .filter(|value| !value.is_null());
+                let mut detail = Vec::new();
+                if let Some(network_context) = network_context {
+                    let host = network_context
+                        .get("host")
+                        .and_then(Value::as_str)
+                        .unwrap_or("알 수 없는 호스트");
+                    let protocol = network_context
+                        .get("protocol")
+                        .and_then(Value::as_str)
+                        .unwrap_or("network");
+                    detail.push(format!("네트워크 대상: {protocol}://{host}"));
+                } else {
+                    detail.push(
+                        params
+                            .get("command")
+                            .and_then(Value::as_str)
+                            .unwrap_or("명령 실행")
+                            .to_owned(),
+                    );
+                    if let Some(cwd) = params.get("cwd").and_then(Value::as_str) {
+                        detail.push(format!("위치: {cwd}"));
+                    }
                 }
                 if let Some(reason) = params.get("reason").and_then(Value::as_str) {
                     detail.push(format!("이유: {reason}"));
                 }
-                let (session, session_label) =
-                    approval_session_choice(params, json!({ "decision": "acceptForSession" }));
+                if let Some(permissions) = params
+                    .get("additionalPermissions")
+                    .filter(|value| !value.is_null())
+                {
+                    detail.extend(
+                        permission_detail(permissions)
+                            .into_iter()
+                            .map(|line| format!("추가 {line}")),
+                    );
+                }
                 self.pending = Some(PendingInteraction::Approval {
                     id,
                     title: params
                         .get("title")
                         .and_then(Value::as_str)
                         .filter(|title| !title.is_empty())
-                        .unwrap_or("명령 실행을 허용할까요?")
+                        .unwrap_or(if network_context.is_some() {
+                            "네트워크 접근을 허용할까요?"
+                        } else {
+                            "명령 실행을 허용할까요?"
+                        })
                         .to_owned(),
                     detail,
                     selected: 0,
-                    once: json!({ "decision": "accept" }),
-                    session,
-                    session_label,
-                    decline: json!({ "decision": "decline" }),
+                    choices,
                 });
                 Action::None
             }
@@ -7315,10 +7412,12 @@ impl AppState {
                         .to_owned(),
                     detail,
                     selected: 0,
-                    once: json!({ "decision": "accept" }),
-                    session,
-                    session_label,
-                    decline: json!({ "decision": "decline" }),
+                    choices: approval_choices(
+                        json!({ "decision": "accept" }),
+                        session.map(|result| (session_label, result)),
+                        "거부",
+                        json!({ "decision": "decline" }),
+                    ),
                 });
                 Action::None
             }
@@ -7351,10 +7450,12 @@ impl AppState {
                         .to_owned(),
                     detail,
                     selected: 0,
-                    once: json!({ "permissions": requested, "scope": "turn" }),
-                    session,
-                    session_label,
-                    decline: json!({ "permissions": {}, "scope": "turn" }),
+                    choices: approval_choices(
+                        json!({ "permissions": requested, "scope": "turn" }),
+                        session.map(|result| (session_label, result)),
+                        "거부",
+                        json!({ "permissions": {}, "scope": "turn" }),
+                    ),
                 });
                 Action::None
             }
@@ -7366,14 +7467,20 @@ impl AppState {
                         result: json!({ "answers": {} }),
                     };
                 }
+                self.finish_active_turn_prompt(Instant::now());
                 self.pending = Some(PendingInteraction::UserInput {
-                    id,
+                    id: id.clone(),
                     questions,
                     current: 0,
                     selected: 0,
                     editor: Editor::default(),
                     answers: BTreeMap::new(),
                 });
+                self.pending_user_input_deadline = params
+                    .get("autoResolutionMs")
+                    .and_then(Value::as_u64)
+                    .and_then(|millis| Instant::now().checked_add(Duration::from_millis(millis)))
+                    .map(|deadline| (id.clone(), deadline));
                 Action::None
             }
             "mcpServer/elicitation/request" => {
@@ -7487,6 +7594,33 @@ impl AppState {
         if matches {
             self.pending = None;
         }
+        if self
+            .pending_user_input_deadline
+            .as_ref()
+            .is_some_and(|(id, _)| id == request_id)
+        {
+            self.pending_user_input_deadline = None;
+        }
+    }
+
+    pub fn take_expired_user_input_response(&mut self) -> Option<Action> {
+        let (request_id, deadline) = self.pending_user_input_deadline.as_ref()?;
+        if Instant::now() < *deadline {
+            return None;
+        }
+        let request_id = request_id.clone();
+        self.pending_user_input_deadline = None;
+        if !matches!(
+            self.pending.as_ref(),
+            Some(PendingInteraction::UserInput { id, .. }) if id == &request_id
+        ) {
+            return None;
+        }
+        self.pending = None;
+        Some(Action::RpcResponse {
+            id: request_id,
+            result: json!({ "answers": {} }),
+        })
     }
 
     /// The runtime names one Claude session two ways — bare, and `claude:`-prefixed.
@@ -8143,12 +8277,8 @@ impl AppState {
                         self.last_completed_duration.map(|_| chrono::Local::now());
                 }
                 self.turn_started_at = None;
-                if successful
-                    && let (Some(duration), Some(prompt)) =
-                        (self.last_completed_duration, self.turn_prompts.last_mut())
-                {
-                    prompt.set_response_duration(duration);
-                    self.committed.push(prompt.clone());
+                if successful {
+                    self.finish_active_turn_prompt(Instant::now());
                 }
                 if let Some(error) = turn_error {
                     self.committed.push(Block::new(
@@ -8239,6 +8369,7 @@ impl AppState {
                     elapsed,
                 });
                 self.plan_turn_id = self.turn_id.clone();
+                self.plan_restored = false;
                 self.plan_shimmer_started_at = Some(Instant::now());
                 self.commit_welcome_card();
             }
@@ -8559,16 +8690,15 @@ impl AppState {
             self.reset_turn_item_tracking();
         }
         let prompt = Block::new(BlockKind::User, self.selected_model_name(), display);
-        self.turn_prompts.push(prompt.clone());
-        self.turn_response_boundaries.push(prompt.clone());
-        self.committed.push(prompt);
+        let started_at = Instant::now();
+        self.begin_turn_prompt(prompt, started_at);
         if steering {
             Action::Steer(text)
         } else {
             self.busy = true;
             // Time the turn from Enter, not from the server's acknowledgement: a
             // prompt held back by a starting session would otherwise read 0s.
-            self.turn_started_at = Some(Instant::now());
+            self.turn_started_at = Some(started_at);
             Action::Submit(text)
         }
     }
@@ -8618,10 +8748,25 @@ impl AppState {
                 } else {
                     Default::default()
                 };
-                let login_help = if using_claude {
-                    "/login  Claude 로그인 방법\n/logout  Claude 로그아웃 방법"
+                // The suggestion list already hides what the selected runtime
+                // cannot reach; `/help` lists the same set so the two agree.
+                let on_opencode = self.selected_provider() == ModelProvider::OpenCode;
+                let login_help = if on_opencode {
+                    Default::default()
+                } else if using_claude {
+                    "/login  Claude 로그인 방법\n/logout  Claude 로그아웃 방법\n"
                 } else {
-                    "/login  ChatGPT 계정 로그인\n/logout  계정 연결 해제"
+                    "/login  ChatGPT 계정 로그인\n/logout  계정 연결 해제\n"
+                };
+                let permissions_help = if on_opencode {
+                    Default::default()
+                } else {
+                    "/permissions  현재 provider 권한 규칙 관리\n"
+                };
+                let integration_help = if on_opencode {
+                    Default::default()
+                } else {
+                    "/mcp [reconnect [NAME]|login NAME]  MCP 서버 탐색과 관리\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n"
                 };
                 let fast_help = if using_claude {
                     ""
@@ -8639,7 +8784,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/provider [claude|codex|opencode]  Claude·Codex 전환, OpenCode 연결\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n/permissions  현재 provider 권한 규칙 관리\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n/mcp [reconnect [NAME]|login NAME]  MCP 서버 탐색과 관리\n/plugins [install|uninstall|enable|disable NAME]  플러그인 탐색과 관리\n/plugins marketplace [add SOURCE|remove NAME|upgrade]  마켓플레이스 관리\n/reload-plugins  플러그인 변경을 현재 세션에 적용\n/skills [enable|disable NAME]  Skill 관리\n/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n{login_help}\n/status  현재 설정\n/usage  사용 한도\n/clear  화면 정리\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
+                    format!("/provider [claude|codex|opencode]  Claude·Codex 전환, OpenCode 연결\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
                 ));
                 Action::None
             }
@@ -9065,7 +9210,7 @@ impl AppState {
                     .push(Block::new(BlockKind::Error, "Usage", "/side-panel"));
                 Action::None
             }
-            "/new" if self.busy => {
+            "/new" | "/clear" if self.busy => {
                 self.committed.push(Block::new(
                     BlockKind::Warning,
                     "진행 중",
@@ -9073,7 +9218,7 @@ impl AppState {
                 ));
                 Action::None
             }
-            "/new" => Action::NewThread,
+            "/new" | "/clear" => Action::NewThread,
             "/status" => {
                 let model = self.selected_model_display_name();
                 let provider = self.selected_provider().label();
@@ -9144,7 +9289,6 @@ impl AppState {
                 ));
                 Action::None
             }
-            "/clear" => Action::ClearScreen,
             "/quit" | "/exit" => Action::Quit,
             unknown => {
                 self.committed.push(Block::new(
@@ -10133,10 +10277,7 @@ impl AppState {
                 title,
                 detail,
                 mut selected,
-                once,
-                session,
-                session_label,
-                decline,
+                choices,
             } => match key.code {
                 KeyCode::Up => {
                     selected = selected.saturating_sub(1);
@@ -10145,47 +10286,37 @@ impl AppState {
                         title,
                         detail,
                         selected,
-                        once,
-                        session,
-                        session_label,
-                        decline,
+                        choices,
                     });
                     Action::None
                 }
                 KeyCode::Down => {
-                    let last = 1 + usize::from(session.is_some());
+                    let last = choices.len().saturating_sub(1);
                     selected = (selected + 1).min(last);
                     self.pending = Some(PendingInteraction::Approval {
                         id,
                         title,
                         detail,
                         selected,
-                        once,
-                        session,
-                        session_label,
-                        decline,
+                        choices,
                     });
                     Action::None
                 }
-                KeyCode::Enter if selected == 0 => Action::RpcResponse { id, result: once },
-                KeyCode::Enter if session.is_some() && selected == 1 => Action::RpcResponse {
-                    id,
-                    result: session.expect("checked"),
-                },
-                KeyCode::Enter => Action::RpcResponse {
-                    id,
-                    result: decline,
-                },
+                KeyCode::Enter => {
+                    choices
+                        .get(selected)
+                        .map_or(Action::None, |choice| Action::RpcResponse {
+                            id,
+                            result: choice.result.clone(),
+                        })
+                }
                 _ => {
                     self.pending = Some(PendingInteraction::Approval {
                         id,
                         title,
                         detail,
                         selected,
-                        once,
-                        session,
-                        session_label,
-                        decline,
+                        choices,
                     });
                     Action::None
                 }
@@ -10199,10 +10330,11 @@ impl AppState {
                 mut answers,
             } => {
                 if key.code == KeyCode::Esc {
-                    return Action::RpcResponse {
-                        id,
-                        result: answers_response(&answers),
-                    };
+                    // 순정과 같게: Esc는 답을 보내지 않고 턴을 멈춘다. 빈 답을
+                    // 돌려주면 도구가 성공한 셈이 되어 턴이 그대로 이어진다.
+                    self.clear_resolved_server_request(&id);
+                    let interrupt = matches!(self.request_interrupt(), Action::Interrupt);
+                    return Action::CancelUserInput { id, interrupt };
                 }
 
                 let question = &questions[current];
@@ -11173,8 +11305,7 @@ impl AppState {
                 title,
                 detail,
                 selected,
-                session,
-                session_label,
+                choices,
                 ..
             } => {
                 let mut lines = detail
@@ -11185,23 +11316,11 @@ impl AppState {
                         muted: false,
                     })
                     .collect::<Vec<_>>();
-                lines.push(OverlayLine {
-                    text: "이번만 허용".to_owned(),
-                    selected: *selected == 0,
+                lines.extend(choices.iter().enumerate().map(|(index, choice)| OverlayLine {
+                    text: choice.label.clone(),
+                    selected: *selected == index,
                     muted: false,
-                });
-                if session.is_some() {
-                    lines.push(OverlayLine {
-                        text: session_label.clone(),
-                        selected: *selected == 1,
-                        muted: false,
-                    });
-                }
-                lines.push(OverlayLine {
-                    text: "거부".to_owned(),
-                    selected: *selected == 1 + usize::from(session.is_some()),
-                    muted: false,
-                });
+                }));
                 Some(OverlayView {
                     closable: false,
                     title: title.clone(),
@@ -11595,12 +11714,11 @@ impl AppState {
         if !text.starts_with('/') || text.chars().any(char::is_whitespace) {
             return Vec::new();
         }
+        let provider = self.selected_provider();
         SLASH_COMMANDS
             .iter()
             .filter(|command| crate::open_code::PROVIDER_ENABLED || command.name != "/connect")
-            .filter(|command| {
-                !self.selected_model_name().starts_with("claude:") || command.name != "/fast"
-            })
+            .filter(|command| command.supports(provider))
             .filter(|command| {
                 command.name != "/effort"
                     || self
@@ -12594,24 +12712,13 @@ impl AppState {
                 title,
                 detail,
                 selected,
-                once,
-                session,
-                session_label,
-                decline,
+                choices,
             }) => {
                 let first = detail.len();
-                let decline_row = first + 1 + usize::from(session.is_some());
-                if row == first {
-                    Action::RpcResponse { id, result: once }
-                } else if session.is_some() && row == first + 1 {
+                if let Some(choice) = row.checked_sub(first).and_then(|index| choices.get(index)) {
                     Action::RpcResponse {
                         id,
-                        result: session.expect("checked"),
-                    }
-                } else if row == decline_row {
-                    Action::RpcResponse {
-                        id,
-                        result: decline,
+                        result: choice.result.clone(),
                     }
                 } else {
                     self.pending = Some(PendingInteraction::Approval {
@@ -12619,10 +12726,7 @@ impl AppState {
                         title,
                         detail,
                         selected,
-                        once,
-                        session,
-                        session_label,
-                        decline,
+                        choices,
                     });
                     Action::Tick(false)
                 }
@@ -13595,8 +13699,7 @@ fn commit_user_input_answers(
     // 떨어진다.
     let title = state.selected_model_name().to_owned();
     let answer = Block::new(BlockKind::User, title, body);
-    state.turn_response_boundaries.push(answer.clone());
-    state.committed.push(answer);
+    state.begin_turn_prompt(answer, Instant::now());
 }
 
 /// `(권장)`은 고르기 전에만 쓸모 있는 안내라, 확정된 답변 기록에서는 떼어 낸다.
@@ -14600,6 +14703,85 @@ fn approval_session_choice(params: &Value, response: Value) -> (Option<Value>, S
         return ((!label.is_empty()).then_some(response), label);
     }
     (Some(response), "세션 동안 허용".to_owned())
+}
+
+fn approval_choices(
+    once: Value,
+    session: Option<(String, Value)>,
+    decline_label: &str,
+    decline: Value,
+) -> Vec<ApprovalChoice> {
+    let mut choices = vec![ApprovalChoice {
+        label: "이번만 허용".to_owned(),
+        result: once,
+    }];
+    if let Some((label, result)) = session {
+        choices.push(ApprovalChoice { label, result });
+    }
+    choices.push(ApprovalChoice {
+        label: decline_label.to_owned(),
+        result: decline,
+    });
+    choices
+}
+
+fn command_approval_choices(params: &Value) -> Vec<ApprovalChoice> {
+    if params
+        .get("claudePermission")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let (session, session_label) =
+            approval_session_choice(params, json!({ "decision": "acceptForSession" }));
+        return approval_choices(
+            json!({ "decision": "accept" }),
+            session.map(|result| (session_label, result)),
+            "거부",
+            json!({ "decision": "decline" }),
+        );
+    }
+    let Some(decisions) = params.get("availableDecisions").and_then(Value::as_array) else {
+        return approval_choices(
+            json!({ "decision": "accept" }),
+            Some((
+                "세션 동안 허용".to_owned(),
+                json!({ "decision": "acceptForSession" }),
+            )),
+            "거부",
+            json!({ "decision": "decline" }),
+        );
+    };
+    decisions
+        .iter()
+        .filter_map(|decision| {
+            let label = match decision.as_str() {
+                Some("accept") => "이번만 허용".to_owned(),
+                Some("acceptForSession") => "세션 동안 허용".to_owned(),
+                Some("decline") => "거부".to_owned(),
+                Some("cancel") => "취소".to_owned(),
+                Some(_) => return None,
+                None if decision.get("acceptWithExecpolicyAmendment").is_some() => {
+                    let amendment =
+                        decision.pointer("/acceptWithExecpolicyAmendment/execpolicy_amendment");
+                    format!("비슷한 명령도 허용: {}", pretty_json(amendment))
+                }
+                None if decision.get("applyNetworkPolicyAmendment").is_some() => {
+                    let amendment =
+                        decision.pointer("/applyNetworkPolicyAmendment/network_policy_amendment");
+                    let host = amendment
+                        .and_then(|value| value.get("host"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("이 호스트");
+                    format!("이후에도 네트워크 허용: {host}")
+                }
+                None => return None,
+            };
+            Some(ApprovalChoice {
+                label,
+                result: json!({ "decision": decision.clone() }),
+            })
+        })
+        .collect()
 }
 
 /// Heading for a `fileChange` item: the action and the file it touched. A batch
@@ -16218,11 +16400,8 @@ mod tests {
             started_at: Instant::now(),
             elapsed: None,
         });
-        btw.committed.push(Block::new(
-            BlockKind::Plan,
-            "Updated Plan",
-            "1. 원인 확인",
-        ));
+        btw.committed
+            .push(Block::new(BlockKind::Plan, "Updated Plan", "1. 원인 확인"));
 
         assert!(btw.view().plan_summary.is_none());
         assert!(btw.animation_view().plan_summary.is_none());
@@ -18307,6 +18486,52 @@ mod tests {
         );
     }
 
+    /// `/clear`는 `/new`와 같은 새 대화이므로 고정된 계획 카드도 함께 사라진다.
+    #[test]
+    fn a_new_conversation_drops_the_pinned_plan_card() {
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [{ "step": "1. 확인", "status": "inProgress" }] }),
+        );
+        assert!(state.view().plan_summary.is_some());
+
+        state.prepare_new_thread();
+
+        assert!(state.plan_summary.is_none());
+        assert!(state.view().plan_summary.is_none());
+    }
+
+    /// 재개한 세션의 옛 계획이 다음 턴까지 남아 갱신되지 않는 것처럼 보이지 않게 한다.
+    #[test]
+    fn a_restored_plan_makes_way_for_the_next_turn() {
+        let mut state = test_state();
+        state.restore_plan_snapshot(&PlanSnapshot {
+            explanation: None,
+            steps: vec![crate::rollout::PlanStepSnapshot {
+                text: "지난 세션 작업".to_owned(),
+                status: "completed".to_owned(),
+                elapsed_ms: Some(1_000),
+            }],
+        });
+        assert!(state.plan_summary.is_some());
+
+        state.set_turn_started("turn-after-resume".to_owned());
+        assert!(state.plan_summary.is_none());
+
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [{ "step": "1. 새 작업", "status": "inProgress" }] }),
+        );
+        let steps = &state.plan_summary.as_ref().expect("new plan").steps;
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].text, "1. 새 작업");
+
+        // 이 세션이 직접 낸 계획은 다음 턴이 시작해도 사라지지 않는다.
+        state.set_turn_started("turn-next".to_owned());
+        assert!(state.plan_summary.is_some());
+    }
+
     #[test]
     fn resumed_plan_keeps_in_progress_steps() {
         let mut state = test_state();
@@ -18660,23 +18885,28 @@ mod tests {
         assert_eq!(welcome.cwd, state.cwd);
     }
 
+    /// `/clear`는 `/new`의 별칭이고, Ctrl+L에는 더 이상 아무 동작도 걸려 있지 않다.
     #[test]
-    fn clear_command_and_shortcut_share_the_action_and_restore_welcome() {
+    fn clear_starts_a_new_conversation_and_ctrl_l_does_nothing() {
         let mut state = test_state();
         state.editor.insert_str("hello");
         state.submit_editor();
         assert!(state.view().welcome.is_none());
 
+        // 응답이 도는 동안에는 `/new`와 마찬가지로 새 대화를 열지 않는다.
+        assert!(matches!(state.run_slash_command("/clear"), Action::None));
+
+        state.busy = false;
         assert!(matches!(
             state.run_slash_command("/clear"),
-            Action::ClearScreen
+            Action::NewThread
         ));
-        state.reset_welcome();
+        state.prepare_new_thread();
 
         assert!(state.view().welcome.is_some());
         assert!(matches!(
             state.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
-            Action::ClearScreen
+            Action::None
         ));
     }
 
@@ -19515,6 +19745,59 @@ mod tests {
         assert!(error.body.contains("/renderer"));
     }
 
+    /// A command only some runtimes answer is offered only while one of those
+    /// runtimes is selected, so the list never suggests a guaranteed failure.
+    #[test]
+    fn slash_suggestions_only_offer_what_the_selected_runtime_supports() {
+        fn names(state: &mut AppState, prefix: &str) -> Vec<&'static str> {
+            state.editor.set_text(prefix);
+            state
+                .matching_slash_commands()
+                .into_iter()
+                .map(|command| command.name)
+                .collect()
+        }
+
+        let mut codex = test_state();
+        for command in [
+            "/permissions",
+            "/mcp",
+            "/plugins",
+            "/reload-plugins",
+            "/skills",
+            "/login",
+            "/logout",
+            "/fast",
+        ] {
+            assert!(names(&mut codex, command).contains(&command), "{command}");
+        }
+
+        let mut claude = AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![test_model("claude:sonnet", "Sonnet", true)],
+            "claude:sonnet",
+            Some("high"),
+        );
+        assert!(names(&mut claude, "/fast").is_empty());
+        assert!(names(&mut claude, "/plugins").contains(&"/plugins"));
+
+        let mut opencode = opencode_picker_state();
+        for command in [
+            "/permissions",
+            "/mcp",
+            "/plugins",
+            "/reload-plugins",
+            "/skills",
+            "/login",
+            "/logout",
+        ] {
+            assert!(names(&mut opencode, command).is_empty(), "{command}");
+        }
+        assert!(names(&mut opencode, "/model").contains(&"/model"));
+    }
+
     #[test]
     fn theme_command_supports_picker_and_direct_selection() {
         let mut state = test_state();
@@ -20053,6 +20336,9 @@ mod tests {
 
         state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
         state.turn_started_at = Some(Instant::now() - Duration::from_secs(70));
+        state
+            .turn_prompt_started_at
+            .insert(prompt_id, Instant::now() - Duration::from_secs(70));
         state.handle_notification("turn/completed", &json!({}));
 
         let completed_prompt = state
@@ -20066,6 +20352,72 @@ mod tests {
                 .response_duration()
                 .map(|duration| duration.as_secs()),
             Some(70)
+        );
+    }
+
+    #[test]
+    fn blocking_question_answers_record_each_response_segment_time() {
+        let question = json!({
+            "questions": [{
+                "id": "q1",
+                "question": "어떻게 할까요?",
+                "options": [{ "label": "진행", "description": "계속합니다." }]
+            }]
+        });
+        let mut state = test_state();
+        state.editor.set_text("처음 요청");
+        assert!(matches!(state.submit_editor(), Action::Submit(_)));
+        let first_prompt = state.drain_committed().pop().expect("처음 프롬프트");
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
+        state
+            .turn_prompt_started_at
+            .insert(first_prompt.id(), Instant::now() - Duration::from_secs(10));
+
+        state.begin_server_request(json!(1), "item/tool/requestUserInput", &question);
+        let completed_first = state.drain_committed().pop().expect("처음 응답 시간");
+        assert_eq!(
+            completed_first
+                .response_duration()
+                .map(|time| time.as_secs()),
+            Some(10)
+        );
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::RpcResponse { .. }
+        ));
+        let first_answer = state.drain_committed().pop().expect("첫 질문 답변");
+        state
+            .turn_prompt_started_at
+            .insert(first_answer.id(), Instant::now() - Duration::from_secs(6));
+
+        state.begin_server_request(json!(2), "item/tool/requestUserInput", &question);
+        let completed_answer = state.drain_committed().pop().expect("첫 답변 응답 시간");
+        assert_eq!(
+            completed_answer
+                .response_duration()
+                .map(|time| time.as_secs()),
+            Some(6)
+        );
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::RpcResponse { .. }
+        ));
+        let second_answer = state.drain_committed().pop().expect("둘째 질문 답변");
+        state
+            .turn_prompt_started_at
+            .insert(second_answer.id(), Instant::now() - Duration::from_secs(4));
+
+        state.handle_notification("turn/completed", &json!({}));
+        let completed_second = state
+            .drain_committed()
+            .into_iter()
+            .find(|block| block.id() == second_answer.id())
+            .expect("둘째 답변 응답 시간");
+        assert_eq!(
+            completed_second
+                .response_duration()
+                .map(|time| time.as_secs()),
+            Some(4)
         );
     }
 
@@ -20635,7 +20987,9 @@ mod tests {
         let answer = state
             .drain_committed()
             .into_iter()
-            .find(|block| matches!(block.kind, BlockKind::User))
+            .find(|block| {
+                matches!(block.kind, BlockKind::User) && block.body.starts_with("어떤 방식으로")
+            })
             .expect("질문 답변 기록");
 
         for (id, phase, text) in [
@@ -20716,7 +21070,9 @@ mod tests {
         let answer = state
             .drain_committed()
             .into_iter()
-            .find(|block| matches!(block.kind, BlockKind::User))
+            .find(|block| {
+                matches!(block.kind, BlockKind::User) && block.body.starts_with("어떤 방식으로")
+            })
             .expect("질문 답변 기록");
 
         state.handle_notification(
@@ -21461,6 +21817,44 @@ mod tests {
         state
     }
 
+    /// 순정 Claude Code처럼 질문에서 Esc는 답을 보내지 않고 턴을 멈춘다. 빈 답을
+    /// 돌려주면 도구가 성공한 셈이 되어, 아무도 답하지 않은 질문을 두고 모델이
+    /// 말을 이어 간다.
+    #[test]
+    fn escape_on_a_question_cancels_the_request_and_stops_the_turn() {
+        let mut state = busy_state_with_live_turn();
+        state.begin_server_request(
+            json!(1),
+            "item/tool/requestUserInput",
+            &json!({
+                "questions": [{
+                    "id": "q1",
+                    "question": "어떤 방식으로 할까요?",
+                    "options": [
+                        { "label": "첫 방식", "description": "설명" },
+                        { "label": "둘째 방식", "description": "설명" }
+                    ]
+                }]
+            }),
+        );
+        // 답을 하나 골라 둔 뒤 Esc를 눌러도 그 답이 새어 나가면 안 된다.
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+        let action = state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(
+            matches!(
+                action,
+                Action::CancelUserInput {
+                    interrupt: true,
+                    ref id,
+                } if *id == json!(1)
+            ),
+            "Esc가 질문을 취소하고 턴을 멈추지 않았다"
+        );
+        assert!(state.overlay_view().is_none(), "취소한 질문이 남아 있다");
+    }
+
     #[test]
     fn plan_notification_commits_the_welcome_card() {
         let mut state = test_state();
@@ -21483,7 +21877,7 @@ mod tests {
 
         assert_eq!(
             state.view().composer_placeholder,
-            "Enter: steer · Tab: queue"
+            "Enter: steer · Tab: queue · @: Mention · $: Tools"
         );
     }
 
@@ -22035,6 +22429,156 @@ mod tests {
             }
             _ => panic!("the decline row should decline"),
         }
+    }
+
+    #[test]
+    fn command_approval_uses_only_the_server_available_decisions() {
+        let mut state = test_state();
+        state.begin_server_request(
+            json!(31),
+            "item/commandExecution/requestApproval",
+            &json!({
+                "networkApprovalContext": {
+                    "host": "api.example.com",
+                    "protocol": "https"
+                },
+                "command": "curl https://api.example.com",
+                "additionalPermissions": {
+                    "network": { "enabled": true },
+                    "fileSystem": null
+                },
+                "availableDecisions": [
+                    "accept",
+                    {
+                        "applyNetworkPolicyAmendment": {
+                            "network_policy_amendment": {
+                                "host": "api.example.com",
+                                "action": "allow"
+                            }
+                        }
+                    },
+                    "cancel"
+                ]
+            }),
+        );
+
+        let overlay = state.overlay_view().expect("network approval");
+        assert_eq!(overlay.title, "네트워크 접근을 허용할까요?");
+        assert!(
+            overlay
+                .lines
+                .iter()
+                .any(|line| line.text == "네트워크 대상: https://api.example.com")
+        );
+        assert!(
+            overlay
+                .lines
+                .iter()
+                .any(|line| line.text == "추가 네트워크: 허용")
+        );
+        assert!(
+            !overlay.lines.iter().any(|line| line.text.contains("curl")),
+            "network-only approval must not present a command as its explanation"
+        );
+        assert!(
+            !overlay
+                .lines
+                .iter()
+                .any(|line| line.text == "세션 동안 허용")
+                && !overlay.lines.iter().any(|line| line.text == "거부")
+        );
+
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        let Action::RpcResponse { result, .. } = state.handle_key(KeyEvent::from(KeyCode::Enter))
+        else {
+            panic!("network amendment choice should answer the request");
+        };
+        assert_eq!(
+            result["decision"],
+            json!({
+                "applyNetworkPolicyAmendment": {
+                    "network_policy_amendment": {
+                        "host": "api.example.com",
+                        "action": "allow"
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn command_approval_rejects_empty_or_unsupported_available_decisions() {
+        for decisions in [json!([]), json!(["futureDecision", { "unknown": {} }])] {
+            let mut state = test_state();
+            let action = state.begin_server_request(
+                json!(32),
+                "item/commandExecution/requestApproval",
+                &json!({
+                    "command": "cargo test",
+                    "availableDecisions": decisions
+                }),
+            );
+
+            assert!(matches!(
+                action,
+                Action::RpcError { ref id, ref message }
+                    if *id == json!(32)
+                        && message == "서버가 지원 가능한 승인 결정을 제공하지 않았습니다."
+            ));
+            assert!(state.pending.is_none());
+            assert!(state.overlay_view().is_none());
+        }
+    }
+
+    #[test]
+    fn user_input_auto_resolution_sends_one_empty_answer() {
+        let mut state = test_state();
+        state.begin_server_request(
+            json!(41),
+            "item/tool/requestUserInput",
+            &json!({
+                "autoResolutionMs": 0,
+                "questions": [{
+                    "id": "q1",
+                    "question": "선택할까요?",
+                    "options": [{ "label": "예", "description": "진행" }]
+                }]
+            }),
+        );
+
+        let Some(Action::RpcResponse { id, result }) = state.take_expired_user_input_response()
+        else {
+            panic!("expired question should submit an empty answer");
+        };
+        assert_eq!(id, json!(41));
+        assert_eq!(result, json!({ "answers": {} }));
+        assert!(state.pending.is_none());
+        assert!(state.take_expired_user_input_response().is_none());
+    }
+
+    #[test]
+    fn resolved_or_user_answered_question_wins_the_auto_resolution_race() {
+        let question = json!({
+            "autoResolutionMs": 0,
+            "questions": [{
+                "id": "q1",
+                "question": "선택할까요?",
+                "options": [{ "label": "예", "description": "진행" }]
+            }]
+        });
+
+        let mut resolved = test_state();
+        resolved.begin_server_request(json!(42), "item/tool/requestUserInput", &question);
+        resolved.handle_notification("serverRequest/resolved", &json!({ "requestId": 42 }));
+        assert!(resolved.take_expired_user_input_response().is_none());
+
+        let mut answered = test_state();
+        answered.begin_server_request(json!(43), "item/tool/requestUserInput", &question);
+        assert!(matches!(
+            answered.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::RpcResponse { .. }
+        ));
+        assert!(answered.take_expired_user_input_response().is_none());
     }
 
     #[test]

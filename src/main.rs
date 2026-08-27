@@ -707,7 +707,6 @@ fn hold_until_thread(
         action @ (Action::None
         | Action::Tick(_)
         | Action::Quit
-        | Action::ClearScreen
         | Action::SetTheme(_)
         | Action::Copy(_)
         | Action::OpenUrl(_)) => Some(action),
@@ -1784,27 +1783,38 @@ async fn event_loop(
                 Action::Tick(revealed)
             }
             _ = activity_tick.tick() => {
-                let main_tick = state.render_tick();
-                let btw_tick = btw_state.as_mut().map(AppState::render_tick);
-                let mut redraw = main_tick.redraw
-                    || btw_tick.as_ref().is_some_and(|tick| tick.redraw);
-                animation_tick = btw_state.is_none() && main_tick.animation_only;
-                if renderer.recover_external_screen_write() {
-                    redraw = true;
-                    animation_tick = false;
+                if let Some(action) = state.take_expired_user_input_response() {
+                    action_focus = SplitFocus::Main;
+                    action
+                } else if let Some(action) = btw_state
+                    .as_mut()
+                    .and_then(AppState::take_expired_user_input_response)
+                {
+                    action_focus = SplitFocus::Btw;
+                    action
+                } else {
+                    let main_tick = state.render_tick();
+                    let btw_tick = btw_state.as_mut().map(AppState::render_tick);
+                    let mut redraw = main_tick.redraw
+                        || btw_tick.as_ref().is_some_and(|tick| tick.redraw);
+                    animation_tick = btw_state.is_none() && main_tick.animation_only;
+                    if renderer.recover_external_screen_write() {
+                        redraw = true;
+                        animation_tick = false;
+                    }
+                    // Ctrl+wheel font zoom changes the cell grid without always
+                    // sending a `Resize`, so the size is polled here as well.
+                    resize.observe(terminal_size());
+                    if resize.settled() {
+                        renderer.relayout()?;
+                        redraw = true;
+                        animation_tick = false;
+                    } else if resize.pending() {
+                        // Nothing painted onto a grid that is still moving survives.
+                        redraw = false;
+                    }
+                    Action::Tick(redraw)
                 }
-                // Ctrl+wheel font zoom changes the cell grid without always
-                // sending a `Resize`, so the size is polled here as well.
-                resize.observe(terminal_size());
-                if resize.settled() {
-                    renderer.relayout()?;
-                    redraw = true;
-                    animation_tick = false;
-                } else if resize.pending() {
-                    // Nothing painted onto a grid that is still moving survives.
-                    redraw = false;
-                }
-                Action::Tick(redraw)
             }
         };
 
@@ -2212,6 +2222,16 @@ async fn recv_update(receiver: &mut Option<mpsc::Receiver<String>>) -> Option<St
     latest
 }
 
+async fn interrupt_turn(server: &mut BackendServer, state: &mut AppState) {
+    let Some(turn_id) = state.turn_id.clone() else {
+        return;
+    };
+    let params = json!({ "threadId": state.thread_id, "turnId": turn_id });
+    if let Err(error) = server.request("turn/interrupt", params).await {
+        state.push_notice(BlockKind::Error, "중단 실패", error.to_string());
+    }
+}
+
 async fn execute_action(
     server: &mut BackendServer,
     state: &mut AppState,
@@ -2225,7 +2245,6 @@ async fn execute_action(
         | Action::Copy(_)
         | Action::OpenUrl(_)
         | Action::SetTheme(_)
-        | Action::ClearScreen
         | Action::ScrollToBottom
         | Action::ScrollToPrompt(_)
         | Action::Quit) => return execute_local_action(state, renderer, action),
@@ -2261,15 +2280,18 @@ async fn execute_action(
                 state.push_notice(BlockKind::Error, "추가 입력 실패", error.to_string());
             }
         }
-        Action::Interrupt => {
-            if let Some(turn_id) = state.turn_id.clone() {
-                let params = json!({
-                    "threadId": state.thread_id,
-                    "turnId": turn_id
-                });
-                if let Err(error) = server.request("turn/interrupt", params).await {
-                    state.push_notice(BlockKind::Error, "중단 실패", error.to_string());
-                }
+        Action::Interrupt => interrupt_turn(server, state).await,
+        // Cancelling a question the runtime is blocked on takes both halves: the
+        // request has to be answered so the bridge stops waiting, and the turn it
+        // belongs to has to stop, or the tool would simply carry on unanswered.
+        Action::CancelUserInput { id, interrupt } => {
+            // Codex types this reply as `{answers}`, so the cancel marker rides
+            // alongside an empty answer set rather than replacing it.
+            if let Err(error) = server.respond(id, json!({ "answers": {}, "cancelled": true })) {
+                state.push_notice(BlockKind::Error, "응답 전송 실패", error.to_string());
+            }
+            if interrupt {
+                interrupt_turn(server, state).await;
             }
         }
         Action::NewThread => return start_new_thread(server, state, renderer).await,
@@ -3484,7 +3506,7 @@ async fn execute_action(
             if let Err(error) = server.respond_error(id, -32601, &message) {
                 state.push_notice(BlockKind::Error, "오류 응답 실패", error.to_string());
             }
-        } // Both /clear and Ctrl+L land here, so the welcome comes back either way.
+        }
     }
     Ok(false)
 }
@@ -3967,10 +3989,6 @@ fn execute_local_action(
             if let Err(error) = theme::save(selected) {
                 state.push_notice(BlockKind::Warning, "테마 저장 실패", error.to_string());
             }
-        }
-        Action::ClearScreen => {
-            state.reset_welcome();
-            renderer.clear_screen()?;
         }
         Action::ScrollToBottom => {
             renderer.scroll_to_bottom();
@@ -7973,7 +7991,14 @@ mod tests {
         let mut state = starting_state();
         let mut queued = None;
 
-        assert!(hold_until_thread(&mut state, Action::ClearScreen, &mut queued).is_some());
+        assert!(
+            hold_until_thread(
+                &mut state,
+                Action::SetTheme(theme::ThemeKind::Soft),
+                &mut queued
+            )
+            .is_some()
+        );
         assert!(hold_until_thread(&mut state, Action::Quit, &mut queued).is_some());
         assert!(hold_until_thread(&mut state, Action::Compact, &mut queued).is_none());
     }

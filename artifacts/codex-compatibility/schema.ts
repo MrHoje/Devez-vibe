@@ -67,7 +67,7 @@ export type ApplyPatchApprovalResponse = { decision: ReviewDecision, };
 /**
  * Authentication mode for OpenAI-backed providers.
  */
-export type AuthMode = "apikey" | "chatgpt" | "chatgptAuthTokens" | "headers" | "agentIdentity" | "personalAccessToken" | "bedrockApiKey";
+export type AuthMode = "apikey" | "chatgpt" | "chatgptAuthTokens" | "headers" | "agentIdentity" | "personalAccessToken" | "bedrockApiKey" | "bedrockAccessKeys";
 
 // AutoCompactTokenLimitScope.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -110,6 +110,8 @@ import type { RequestId } from "./RequestId";
 import type { AppsInstalledParams } from "./v2/AppsInstalledParams";
 import type { AppsListParams } from "./v2/AppsListParams";
 import type { AppsReadParams } from "./v2/AppsReadParams";
+import type { BedrockDiscoverParams } from "./v2/BedrockDiscoverParams";
+import type { BedrockSetupParams } from "./v2/BedrockSetupParams";
 import type { CancelLoginAccountParams } from "./v2/CancelLoginAccountParams";
 import type { CollaborationModeListParams } from "./v2/CollaborationModeListParams";
 import type { CommandExecParams } from "./v2/CommandExecParams";
@@ -126,6 +128,7 @@ import type { EnvironmentStatusParams } from "./v2/EnvironmentStatusParams";
 import type { ExperimentalFeatureEnablementSetParams } from "./v2/ExperimentalFeatureEnablementSetParams";
 import type { ExperimentalFeatureListParams } from "./v2/ExperimentalFeatureListParams";
 import type { ExternalAgentConfigDetectParams } from "./v2/ExternalAgentConfigDetectParams";
+import type { ExternalAgentConfigImportHistoryRecordParams } from "./v2/ExternalAgentConfigImportHistoryRecordParams";
 import type { ExternalAgentConfigImportParams } from "./v2/ExternalAgentConfigImportParams";
 import type { FeedbackUploadParams } from "./v2/FeedbackUploadParams";
 import type { FsCopyParams } from "./v2/FsCopyParams";
@@ -138,6 +141,7 @@ import type { FsUnwatchParams } from "./v2/FsUnwatchParams";
 import type { FsWatchParams } from "./v2/FsWatchParams";
 import type { FsWriteFileParams } from "./v2/FsWriteFileParams";
 import type { GetAccountParams } from "./v2/GetAccountParams";
+import type { GetAccountTokenUsageParams } from "./v2/GetAccountTokenUsageParams";
 import type { HooksListParams } from "./v2/HooksListParams";
 import type { ListMcpServerStatusParams } from "./v2/ListMcpServerStatusParams";
 import type { LoginAccountParams } from "./v2/LoginAccountParams";
@@ -145,6 +149,8 @@ import type { MarketplaceAddParams } from "./v2/MarketplaceAddParams";
 import type { MarketplaceRemoveParams } from "./v2/MarketplaceRemoveParams";
 import type { MarketplaceUpgradeParams } from "./v2/MarketplaceUpgradeParams";
 import type { McpResourceReadParams } from "./v2/McpResourceReadParams";
+import type { McpServerEventStreamStartParams } from "./v2/McpServerEventStreamStartParams";
+import type { McpServerEventStreamStopParams } from "./v2/McpServerEventStreamStopParams";
 import type { McpServerOauthLoginParams } from "./v2/McpServerOauthLoginParams";
 import type { McpServerToolCallParams } from "./v2/McpServerToolCallParams";
 import type { MockExperimentalMethodParams } from "./v2/MockExperimentalMethodParams";
@@ -155,6 +161,7 @@ import type { PluginInstallParams } from "./v2/PluginInstallParams";
 import type { PluginInstalledParams } from "./v2/PluginInstalledParams";
 import type { PluginListParams } from "./v2/PluginListParams";
 import type { PluginReadParams } from "./v2/PluginReadParams";
+import type { PluginSearchParams } from "./v2/PluginSearchParams";
 import type { PluginShareCheckoutParams } from "./v2/PluginShareCheckoutParams";
 import type { PluginShareDeleteParams } from "./v2/PluginShareDeleteParams";
 import type { PluginShareListParams } from "./v2/PluginShareListParams";
@@ -166,6 +173,13 @@ import type { ProcessKillParams } from "./v2/ProcessKillParams";
 import type { ProcessResizePtyParams } from "./v2/ProcessResizePtyParams";
 import type { ProcessSpawnParams } from "./v2/ProcessSpawnParams";
 import type { ProcessWriteStdinParams } from "./v2/ProcessWriteStdinParams";
+import type { ProjectCreateParams } from "./v2/ProjectCreateParams";
+import type { ProjectDeleteParams } from "./v2/ProjectDeleteParams";
+import type { ProjectImportParams } from "./v2/ProjectImportParams";
+import type { ProjectListParams } from "./v2/ProjectListParams";
+import type { ProjectMoveParams } from "./v2/ProjectMoveParams";
+import type { ProjectReadParams } from "./v2/ProjectReadParams";
+import type { ProjectUpdateParams } from "./v2/ProjectUpdateParams";
 import type { RemoteControlClientsListParams } from "./v2/RemoteControlClientsListParams";
 import type { RemoteControlClientsRevokeParams } from "./v2/RemoteControlClientsRevokeParams";
 import type { RemoteControlDisableParams } from "./v2/RemoteControlDisableParams";
@@ -174,6 +188,7 @@ import type { RemoteControlPairingStartParams } from "./v2/RemoteControlPairingS
 import type { RemoteControlPairingStatusParams } from "./v2/RemoteControlPairingStatusParams";
 import type { ReviewStartParams } from "./v2/ReviewStartParams";
 import type { SendAddCreditsNudgeEmailParams } from "./v2/SendAddCreditsNudgeEmailParams";
+import type { ServerDiagnosticsParams } from "./v2/ServerDiagnosticsParams";
 import type { SkillsConfigWriteParams } from "./v2/SkillsConfigWriteParams";
 import type { SkillsExtraRootsSetParams } from "./v2/SkillsExtraRootsSetParams";
 import type { SkillsListParams } from "./v2/SkillsListParams";
@@ -196,6 +211,12 @@ import type { ThreadListParams } from "./v2/ThreadListParams";
 import type { ThreadLoadedListParams } from "./v2/ThreadLoadedListParams";
 import type { ThreadMemoryModeSetParams } from "./v2/ThreadMemoryModeSetParams";
 import type { ThreadMetadataUpdateParams } from "./v2/ThreadMetadataUpdateParams";
+import type { ThreadQueueAddParams } from "./v2/ThreadQueueAddParams";
+import type { ThreadQueueDeleteParams } from "./v2/ThreadQueueDeleteParams";
+import type { ThreadQueueListParams } from "./v2/ThreadQueueListParams";
+import type { ThreadQueueReorderParams } from "./v2/ThreadQueueReorderParams";
+import type { ThreadQueueStartParams } from "./v2/ThreadQueueStartParams";
+import type { ThreadQueueUpdateParams } from "./v2/ThreadQueueUpdateParams";
 import type { ThreadReadParams } from "./v2/ThreadReadParams";
 import type { ThreadRealtimeAppendAudioParams } from "./v2/ThreadRealtimeAppendAudioParams";
 import type { ThreadRealtimeAppendSpeechParams } from "./v2/ThreadRealtimeAppendSpeechParams";
@@ -204,13 +225,20 @@ import type { ThreadRealtimeListVoicesParams } from "./v2/ThreadRealtimeListVoic
 import type { ThreadRealtimeStartParams } from "./v2/ThreadRealtimeStartParams";
 import type { ThreadRealtimeStopParams } from "./v2/ThreadRealtimeStopParams";
 import type { ThreadResumeParams } from "./v2/ThreadResumeParams";
+import type { ThreadRevertParams } from "./v2/ThreadRevertParams";
 import type { ThreadRollbackParams } from "./v2/ThreadRollbackParams";
 import type { ThreadSearchOccurrencesParams } from "./v2/ThreadSearchOccurrencesParams";
 import type { ThreadSearchParams } from "./v2/ThreadSearchParams";
+import type { ThreadSectionCreateParams } from "./v2/ThreadSectionCreateParams";
+import type { ThreadSectionDeleteParams } from "./v2/ThreadSectionDeleteParams";
+import type { ThreadSectionListParams } from "./v2/ThreadSectionListParams";
+import type { ThreadSectionMoveParams } from "./v2/ThreadSectionMoveParams";
+import type { ThreadSectionUpdateParams } from "./v2/ThreadSectionUpdateParams";
 import type { ThreadSetNameParams } from "./v2/ThreadSetNameParams";
 import type { ThreadSettingsUpdateParams } from "./v2/ThreadSettingsUpdateParams";
 import type { ThreadShellCommandParams } from "./v2/ThreadShellCommandParams";
 import type { ThreadStartParams } from "./v2/ThreadStartParams";
+import type { ThreadTimelineListParams } from "./v2/ThreadTimelineListParams";
 import type { ThreadTurnsListParams } from "./v2/ThreadTurnsListParams";
 import type { ThreadUnarchiveParams } from "./v2/ThreadUnarchiveParams";
 import type { ThreadUnsubscribeParams } from "./v2/ThreadUnsubscribeParams";
@@ -222,7 +250,7 @@ import type { WindowsSandboxSetupStartParams } from "./v2/WindowsSandboxSetupSta
 /**
  * Request from the client to the server.
  */
-export type ClientRequest = { "method": "initialize", id: RequestId, params: InitializeParams, } | { "method": "thread/start", id: RequestId, params: ThreadStartParams, } | { "method": "thread/resume", id: RequestId, params: ThreadResumeParams, } | { "method": "thread/fork", id: RequestId, params: ThreadForkParams, } | { "method": "thread/archive", id: RequestId, params: ThreadArchiveParams, } | { "method": "thread/delete", id: RequestId, params: ThreadDeleteParams, } | { "method": "thread/unsubscribe", id: RequestId, params: ThreadUnsubscribeParams, } | { "method": "thread/increment_elicitation", id: RequestId, params: ThreadIncrementElicitationParams, } | { "method": "thread/decrement_elicitation", id: RequestId, params: ThreadDecrementElicitationParams, } | { "method": "thread/name/set", id: RequestId, params: ThreadSetNameParams, } | { "method": "thread/goal/set", id: RequestId, params: ThreadGoalSetParams, } | { "method": "thread/goal/get", id: RequestId, params: ThreadGoalGetParams, } | { "method": "thread/goal/clear", id: RequestId, params: ThreadGoalClearParams, } | { "method": "thread/metadata/update", id: RequestId, params: ThreadMetadataUpdateParams, } | { "method": "thread/settings/update", id: RequestId, params: ThreadSettingsUpdateParams, } | { "method": "thread/memoryMode/set", id: RequestId, params: ThreadMemoryModeSetParams, } | { "method": "memory/reset", id: RequestId, params: undefined, } | { "method": "thread/unarchive", id: RequestId, params: ThreadUnarchiveParams, } | { "method": "thread/compact/start", id: RequestId, params: ThreadCompactStartParams, } | { "method": "thread/shellCommand", id: RequestId, params: ThreadShellCommandParams, } | { "method": "thread/approveGuardianDeniedAction", id: RequestId, params: ThreadApproveGuardianDeniedActionParams, } | { "method": "thread/backgroundTerminals/clean", id: RequestId, params: ThreadBackgroundTerminalsCleanParams, } | { "method": "thread/backgroundTerminals/list", id: RequestId, params: ThreadBackgroundTerminalsListParams, } | { "method": "thread/backgroundTerminals/terminate", id: RequestId, params: ThreadBackgroundTerminalsTerminateParams, } | { "method": "thread/rollback", id: RequestId, params: ThreadRollbackParams, } | { "method": "thread/list", id: RequestId, params: ThreadListParams, } | { "method": "thread/search", id: RequestId, params: ThreadSearchParams, } | { "method": "thread/searchOccurrences", id: RequestId, params: ThreadSearchOccurrencesParams, } | { "method": "thread/loaded/list", id: RequestId, params: ThreadLoadedListParams, } | { "method": "thread/read", id: RequestId, params: ThreadReadParams, } | { "method": "thread/turns/list", id: RequestId, params: ThreadTurnsListParams, } | { "method": "thread/items/list", id: RequestId, params: ThreadItemsListParams, } | { "method": "thread/inject_items", id: RequestId, params: ThreadInjectItemsParams, } | { "method": "skills/list", id: RequestId, params: SkillsListParams, } | { "method": "skills/extraRoots/set", id: RequestId, params: SkillsExtraRootsSetParams, } | { "method": "hooks/list", id: RequestId, params: HooksListParams, } | { "method": "marketplace/add", id: RequestId, params: MarketplaceAddParams, } | { "method": "marketplace/remove", id: RequestId, params: MarketplaceRemoveParams, } | { "method": "marketplace/upgrade", id: RequestId, params: MarketplaceUpgradeParams, } | { "method": "plugin/list", id: RequestId, params: PluginListParams, } | { "method": "plugin/installed", id: RequestId, params: PluginInstalledParams, } | { "method": "plugin/read", id: RequestId, params: PluginReadParams, } | { "method": "plugin/skill/read", id: RequestId, params: PluginSkillReadParams, } | { "method": "plugin/share/save", id: RequestId, params: PluginShareSaveParams, } | { "method": "plugin/share/updateTargets", id: RequestId, params: PluginShareUpdateTargetsParams, } | { "method": "plugin/share/list", id: RequestId, params: PluginShareListParams, } | { "method": "plugin/share/checkout", id: RequestId, params: PluginShareCheckoutParams, } | { "method": "plugin/share/delete", id: RequestId, params: PluginShareDeleteParams, } | { "method": "app/read", id: RequestId, params: AppsReadParams, } | { "method": "app/list", id: RequestId, params: AppsListParams, } | { "method": "app/installed", id: RequestId, params: AppsInstalledParams, } | { "method": "fs/readFile", id: RequestId, params: FsReadFileParams, } | { "method": "fs/writeFile", id: RequestId, params: FsWriteFileParams, } | { "method": "fs/createDirectory", id: RequestId, params: FsCreateDirectoryParams, } | { "method": "fs/getMetadata", id: RequestId, params: FsGetMetadataParams, } | { "method": "fs/readDirectory", id: RequestId, params: FsReadDirectoryParams, } | { "method": "fs/remove", id: RequestId, params: FsRemoveParams, } | { "method": "fs/copy", id: RequestId, params: FsCopyParams, } | { "method": "fs/watch", id: RequestId, params: FsWatchParams, } | { "method": "fs/unwatch", id: RequestId, params: FsUnwatchParams, } | { "method": "skills/config/write", id: RequestId, params: SkillsConfigWriteParams, } | { "method": "plugin/install", id: RequestId, params: PluginInstallParams, } | { "method": "plugin/uninstall", id: RequestId, params: PluginUninstallParams, } | { "method": "turn/start", id: RequestId, params: TurnStartParams, } | { "method": "turn/steer", id: RequestId, params: TurnSteerParams, } | { "method": "turn/interrupt", id: RequestId, params: TurnInterruptParams, } | { "method": "thread/realtime/start", id: RequestId, params: ThreadRealtimeStartParams, } | { "method": "thread/realtime/appendAudio", id: RequestId, params: ThreadRealtimeAppendAudioParams, } | { "method": "thread/realtime/appendText", id: RequestId, params: ThreadRealtimeAppendTextParams, } | { "method": "thread/realtime/appendSpeech", id: RequestId, params: ThreadRealtimeAppendSpeechParams, } | { "method": "thread/realtime/stop", id: RequestId, params: ThreadRealtimeStopParams, } | { "method": "thread/realtime/listVoices", id: RequestId, params: ThreadRealtimeListVoicesParams, } | { "method": "review/start", id: RequestId, params: ReviewStartParams, } | { "method": "model/list", id: RequestId, params: ModelListParams, } | { "method": "modelProvider/capabilities/read", id: RequestId, params: ModelProviderCapabilitiesReadParams, } | { "method": "experimentalFeature/list", id: RequestId, params: ExperimentalFeatureListParams, } | { "method": "permissionProfile/list", id: RequestId, params: PermissionProfileListParams, } | { "method": "experimentalFeature/enablement/set", id: RequestId, params: ExperimentalFeatureEnablementSetParams, } | { "method": "remoteControl/enable", id: RequestId, params: RemoteControlEnableParams | null, } | { "method": "remoteControl/disable", id: RequestId, params: RemoteControlDisableParams | null, } | { "method": "remoteControl/status/read", id: RequestId, params: undefined, } | { "method": "remoteControl/pairing/start", id: RequestId, params: RemoteControlPairingStartParams, } | { "method": "remoteControl/pairing/status", id: RequestId, params: RemoteControlPairingStatusParams, } | { "method": "remoteControl/client/list", id: RequestId, params: RemoteControlClientsListParams, } | { "method": "remoteControl/client/revoke", id: RequestId, params: RemoteControlClientsRevokeParams, } | { "method": "collaborationMode/list", id: RequestId, params: CollaborationModeListParams, } | { "method": "mock/experimentalMethod", id: RequestId, params: MockExperimentalMethodParams, } | { "method": "environment/add", id: RequestId, params: EnvironmentAddParams, } | { "method": "environment/info", id: RequestId, params: EnvironmentInfoParams, } | { "method": "environment/status", id: RequestId, params: EnvironmentStatusParams, } | { "method": "mcpServer/oauth/login", id: RequestId, params: McpServerOauthLoginParams, } | { "method": "config/mcpServer/reload", id: RequestId, params: undefined, } | { "method": "mcpServerStatus/list", id: RequestId, params: ListMcpServerStatusParams, } | { "method": "mcpServer/resource/read", id: RequestId, params: McpResourceReadParams, } | { "method": "mcpServer/tool/call", id: RequestId, params: McpServerToolCallParams, } | { "method": "windowsSandbox/setupStart", id: RequestId, params: WindowsSandboxSetupStartParams, } | { "method": "windowsSandbox/readiness", id: RequestId, params: undefined, } | { "method": "account/login/start", id: RequestId, params: LoginAccountParams, } | { "method": "account/login/cancel", id: RequestId, params: CancelLoginAccountParams, } | { "method": "account/logout", id: RequestId, params: undefined, } | { "method": "account/rateLimits/read", id: RequestId, params: undefined, } | { "method": "account/rateLimitResetCredit/consume", id: RequestId, params: ConsumeAccountRateLimitResetCreditParams, } | { "method": "account/usage/read", id: RequestId, params: undefined, } | { "method": "account/workspaceMessages/read", id: RequestId, params: undefined, } | { "method": "account/sendAddCreditsNudgeEmail", id: RequestId, params: SendAddCreditsNudgeEmailParams, } | { "method": "feedback/upload", id: RequestId, params: FeedbackUploadParams, } | { "method": "command/exec", id: RequestId, params: CommandExecParams, } | { "method": "command/exec/write", id: RequestId, params: CommandExecWriteParams, } | { "method": "command/exec/terminate", id: RequestId, params: CommandExecTerminateParams, } | { "method": "command/exec/resize", id: RequestId, params: CommandExecResizeParams, } | { "method": "process/spawn", id: RequestId, params: ProcessSpawnParams, } | { "method": "process/writeStdin", id: RequestId, params: ProcessWriteStdinParams, } | { "method": "process/kill", id: RequestId, params: ProcessKillParams, } | { "method": "process/resizePty", id: RequestId, params: ProcessResizePtyParams, } | { "method": "config/read", id: RequestId, params: ConfigReadParams, } | { "method": "externalAgentConfig/detect", id: RequestId, params: ExternalAgentConfigDetectParams, } | { "method": "externalAgentConfig/import", id: RequestId, params: ExternalAgentConfigImportParams, } | { "method": "externalAgentConfig/import/readHistories", id: RequestId, params: undefined, } | { "method": "config/value/write", id: RequestId, params: ConfigValueWriteParams, } | { "method": "config/batchWrite", id: RequestId, params: ConfigBatchWriteParams, } | { "method": "configRequirements/read", id: RequestId, params: undefined, } | { "method": "account/read", id: RequestId, params: GetAccountParams, } | { "method": "getConversationSummary", id: RequestId, params: GetConversationSummaryParams, } | { "method": "gitDiffToRemote", id: RequestId, params: GitDiffToRemoteParams, } | { "method": "getAuthStatus", id: RequestId, params: GetAuthStatusParams, } | { "method": "fuzzyFileSearch", id: RequestId, params: FuzzyFileSearchParams, } | { "method": "fuzzyFileSearch/sessionStart", id: RequestId, params: FuzzyFileSearchSessionStartParams, } | { "method": "fuzzyFileSearch/sessionUpdate", id: RequestId, params: FuzzyFileSearchSessionUpdateParams, } | { "method": "fuzzyFileSearch/sessionStop", id: RequestId, params: FuzzyFileSearchSessionStopParams, };
+export type ClientRequest = { "method": "initialize", id: RequestId, params: InitializeParams, } | { "method": "server/diagnostics", id: RequestId, params: ServerDiagnosticsParams, } | { "method": "thread/start", id: RequestId, params: ThreadStartParams, } | { "method": "thread/resume", id: RequestId, params: ThreadResumeParams, } | { "method": "thread/fork", id: RequestId, params: ThreadForkParams, } | { "method": "thread/archive", id: RequestId, params: ThreadArchiveParams, } | { "method": "thread/delete", id: RequestId, params: ThreadDeleteParams, } | { "method": "thread/unsubscribe", id: RequestId, params: ThreadUnsubscribeParams, } | { "method": "thread/increment_elicitation", id: RequestId, params: ThreadIncrementElicitationParams, } | { "method": "thread/decrement_elicitation", id: RequestId, params: ThreadDecrementElicitationParams, } | { "method": "thread/name/set", id: RequestId, params: ThreadSetNameParams, } | { "method": "thread/goal/set", id: RequestId, params: ThreadGoalSetParams, } | { "method": "thread/goal/get", id: RequestId, params: ThreadGoalGetParams, } | { "method": "thread/goal/clear", id: RequestId, params: ThreadGoalClearParams, } | { "method": "thread/queue/add", id: RequestId, params: ThreadQueueAddParams, } | { "method": "thread/queue/list", id: RequestId, params: ThreadQueueListParams, } | { "method": "thread/queue/update", id: RequestId, params: ThreadQueueUpdateParams, } | { "method": "thread/queue/delete", id: RequestId, params: ThreadQueueDeleteParams, } | { "method": "thread/queue/reorder", id: RequestId, params: ThreadQueueReorderParams, } | { "method": "thread/queue/start", id: RequestId, params: ThreadQueueStartParams, } | { "method": "thread/metadata/update", id: RequestId, params: ThreadMetadataUpdateParams, } | { "method": "thread/section/move", id: RequestId, params: ThreadSectionMoveParams, } | { "method": "thread/settings/update", id: RequestId, params: ThreadSettingsUpdateParams, } | { "method": "thread/memoryMode/set", id: RequestId, params: ThreadMemoryModeSetParams, } | { "method": "memory/reset", id: RequestId, params: undefined, } | { "method": "thread/unarchive", id: RequestId, params: ThreadUnarchiveParams, } | { "method": "thread/compact/start", id: RequestId, params: ThreadCompactStartParams, } | { "method": "thread/shellCommand", id: RequestId, params: ThreadShellCommandParams, } | { "method": "thread/approveGuardianDeniedAction", id: RequestId, params: ThreadApproveGuardianDeniedActionParams, } | { "method": "thread/backgroundTerminals/clean", id: RequestId, params: ThreadBackgroundTerminalsCleanParams, } | { "method": "thread/backgroundTerminals/list", id: RequestId, params: ThreadBackgroundTerminalsListParams, } | { "method": "thread/backgroundTerminals/terminate", id: RequestId, params: ThreadBackgroundTerminalsTerminateParams, } | { "method": "thread/rollback", id: RequestId, params: ThreadRollbackParams, } | { "method": "thread/revert", id: RequestId, params: ThreadRevertParams, } | { "method": "thread/list", id: RequestId, params: ThreadListParams, } | { "method": "project/list", id: RequestId, params: ProjectListParams, } | { "method": "project/read", id: RequestId, params: ProjectReadParams, } | { "method": "project/create", id: RequestId, params: ProjectCreateParams, } | { "method": "project/import", id: RequestId, params: ProjectImportParams, } | { "method": "project/update", id: RequestId, params: ProjectUpdateParams, } | { "method": "project/move", id: RequestId, params: ProjectMoveParams, } | { "method": "project/delete", id: RequestId, params: ProjectDeleteParams, } | { "method": "threadSection/list", id: RequestId, params: ThreadSectionListParams, } | { "method": "threadSection/create", id: RequestId, params: ThreadSectionCreateParams, } | { "method": "threadSection/update", id: RequestId, params: ThreadSectionUpdateParams, } | { "method": "threadSection/delete", id: RequestId, params: ThreadSectionDeleteParams, } | { "method": "thread/search", id: RequestId, params: ThreadSearchParams, } | { "method": "thread/searchOccurrences", id: RequestId, params: ThreadSearchOccurrencesParams, } | { "method": "thread/loaded/list", id: RequestId, params: ThreadLoadedListParams, } | { "method": "thread/read", id: RequestId, params: ThreadReadParams, } | { "method": "thread/turns/list", id: RequestId, params: ThreadTurnsListParams, } | { "method": "thread/items/list", id: RequestId, params: ThreadItemsListParams, } | { "method": "thread/inject_items", id: RequestId, params: ThreadInjectItemsParams, } | { "method": "skills/list", id: RequestId, params: SkillsListParams, } | { "method": "skills/extraRoots/set", id: RequestId, params: SkillsExtraRootsSetParams, } | { "method": "hooks/list", id: RequestId, params: HooksListParams, } | { "method": "marketplace/add", id: RequestId, params: MarketplaceAddParams, } | { "method": "marketplace/remove", id: RequestId, params: MarketplaceRemoveParams, } | { "method": "marketplace/upgrade", id: RequestId, params: MarketplaceUpgradeParams, } | { "method": "plugin/list", id: RequestId, params: PluginListParams, } | { "method": "plugin/search", id: RequestId, params: PluginSearchParams, } | { "method": "plugin/installed", id: RequestId, params: PluginInstalledParams, } | { "method": "plugin/read", id: RequestId, params: PluginReadParams, } | { "method": "plugin/skill/read", id: RequestId, params: PluginSkillReadParams, } | { "method": "plugin/share/save", id: RequestId, params: PluginShareSaveParams, } | { "method": "plugin/share/updateTargets", id: RequestId, params: PluginShareUpdateTargetsParams, } | { "method": "plugin/share/list", id: RequestId, params: PluginShareListParams, } | { "method": "plugin/share/checkout", id: RequestId, params: PluginShareCheckoutParams, } | { "method": "plugin/share/delete", id: RequestId, params: PluginShareDeleteParams, } | { "method": "app/read", id: RequestId, params: AppsReadParams, } | { "method": "app/list", id: RequestId, params: AppsListParams, } | { "method": "app/installed", id: RequestId, params: AppsInstalledParams, } | { "method": "fs/readFile", id: RequestId, params: FsReadFileParams, } | { "method": "fs/writeFile", id: RequestId, params: FsWriteFileParams, } | { "method": "fs/createDirectory", id: RequestId, params: FsCreateDirectoryParams, } | { "method": "fs/getMetadata", id: RequestId, params: FsGetMetadataParams, } | { "method": "fs/readDirectory", id: RequestId, params: FsReadDirectoryParams, } | { "method": "fs/remove", id: RequestId, params: FsRemoveParams, } | { "method": "fs/copy", id: RequestId, params: FsCopyParams, } | { "method": "fs/watch", id: RequestId, params: FsWatchParams, } | { "method": "fs/unwatch", id: RequestId, params: FsUnwatchParams, } | { "method": "skills/config/write", id: RequestId, params: SkillsConfigWriteParams, } | { "method": "plugin/install", id: RequestId, params: PluginInstallParams, } | { "method": "plugin/uninstall", id: RequestId, params: PluginUninstallParams, } | { "method": "turn/start", id: RequestId, params: TurnStartParams, } | { "method": "turn/steer", id: RequestId, params: TurnSteerParams, } | { "method": "turn/interrupt", id: RequestId, params: TurnInterruptParams, } | { "method": "thread/realtime/start", id: RequestId, params: ThreadRealtimeStartParams, } | { "method": "thread/realtime/appendAudio", id: RequestId, params: ThreadRealtimeAppendAudioParams, } | { "method": "thread/realtime/appendText", id: RequestId, params: ThreadRealtimeAppendTextParams, } | { "method": "thread/realtime/appendSpeech", id: RequestId, params: ThreadRealtimeAppendSpeechParams, } | { "method": "thread/realtime/stop", id: RequestId, params: ThreadRealtimeStopParams, } | { "method": "thread/timeline/list", id: RequestId, params: ThreadTimelineListParams, } | { "method": "thread/realtime/listVoices", id: RequestId, params: ThreadRealtimeListVoicesParams, } | { "method": "review/start", id: RequestId, params: ReviewStartParams, } | { "method": "model/list", id: RequestId, params: ModelListParams, } | { "method": "modelProvider/capabilities/read", id: RequestId, params: ModelProviderCapabilitiesReadParams, } | { "method": "experimentalFeature/list", id: RequestId, params: ExperimentalFeatureListParams, } | { "method": "permissionProfile/list", id: RequestId, params: PermissionProfileListParams, } | { "method": "experimentalFeature/enablement/set", id: RequestId, params: ExperimentalFeatureEnablementSetParams, } | { "method": "remoteControl/enable", id: RequestId, params: RemoteControlEnableParams | null, } | { "method": "remoteControl/disable", id: RequestId, params: RemoteControlDisableParams | null, } | { "method": "remoteControl/status/read", id: RequestId, params: undefined, } | { "method": "remoteControl/pairing/start", id: RequestId, params: RemoteControlPairingStartParams, } | { "method": "remoteControl/pairing/status", id: RequestId, params: RemoteControlPairingStatusParams, } | { "method": "remoteControl/client/list", id: RequestId, params: RemoteControlClientsListParams, } | { "method": "remoteControl/client/revoke", id: RequestId, params: RemoteControlClientsRevokeParams, } | { "method": "collaborationMode/list", id: RequestId, params: CollaborationModeListParams, } | { "method": "mock/experimentalMethod", id: RequestId, params: MockExperimentalMethodParams, } | { "method": "environment/add", id: RequestId, params: EnvironmentAddParams, } | { "method": "environment/info", id: RequestId, params: EnvironmentInfoParams, } | { "method": "environment/status", id: RequestId, params: EnvironmentStatusParams, } | { "method": "mcpServer/oauth/login", id: RequestId, params: McpServerOauthLoginParams, } | { "method": "config/mcpServer/reload", id: RequestId, params: undefined, } | { "method": "mcpServerStatus/list", id: RequestId, params: ListMcpServerStatusParams, } | { "method": "mcpServer/resource/read", id: RequestId, params: McpResourceReadParams, } | { "method": "mcpServer/event/stream/start", id: RequestId, params: McpServerEventStreamStartParams, } | { "method": "mcpServer/event/stream/stop", id: RequestId, params: McpServerEventStreamStopParams, } | { "method": "mcpServer/tool/call", id: RequestId, params: McpServerToolCallParams, } | { "method": "windowsSandbox/setupStart", id: RequestId, params: WindowsSandboxSetupStartParams, } | { "method": "windowsSandbox/readiness", id: RequestId, params: undefined, } | { "method": "account/login/start", id: RequestId, params: LoginAccountParams, } | { "method": "account/bedrock/discover", id: RequestId, params: BedrockDiscoverParams, } | { "method": "account/bedrock/setup", id: RequestId, params: BedrockSetupParams, } | { "method": "account/login/cancel", id: RequestId, params: CancelLoginAccountParams, } | { "method": "account/logout", id: RequestId, params: undefined, } | { "method": "account/rateLimits/read", id: RequestId, params: undefined, } | { "method": "account/rateLimitResetCredit/consume", id: RequestId, params: ConsumeAccountRateLimitResetCreditParams, } | { "method": "account/usage/read", id: RequestId, params?: GetAccountTokenUsageParams | undefined, } | { "method": "account/workspaceMessages/read", id: RequestId, params: undefined, } | { "method": "account/sendAddCreditsNudgeEmail", id: RequestId, params: SendAddCreditsNudgeEmailParams, } | { "method": "feedback/upload", id: RequestId, params: FeedbackUploadParams, } | { "method": "command/exec", id: RequestId, params: CommandExecParams, } | { "method": "command/exec/write", id: RequestId, params: CommandExecWriteParams, } | { "method": "command/exec/terminate", id: RequestId, params: CommandExecTerminateParams, } | { "method": "command/exec/resize", id: RequestId, params: CommandExecResizeParams, } | { "method": "process/spawn", id: RequestId, params: ProcessSpawnParams, } | { "method": "process/writeStdin", id: RequestId, params: ProcessWriteStdinParams, } | { "method": "process/kill", id: RequestId, params: ProcessKillParams, } | { "method": "process/resizePty", id: RequestId, params: ProcessResizePtyParams, } | { "method": "config/read", id: RequestId, params: ConfigReadParams, } | { "method": "externalAgentConfig/detect", id: RequestId, params: ExternalAgentConfigDetectParams, } | { "method": "externalAgentConfig/import", id: RequestId, params: ExternalAgentConfigImportParams, } | { "method": "externalAgentConfig/import/recordHistory", id: RequestId, params: ExternalAgentConfigImportHistoryRecordParams, } | { "method": "externalAgentConfig/import/readHistories", id: RequestId, params: undefined, } | { "method": "config/value/write", id: RequestId, params: ConfigValueWriteParams, } | { "method": "config/batchWrite", id: RequestId, params: ConfigBatchWriteParams, } | { "method": "configRequirements/read", id: RequestId, params: undefined, } | { "method": "account/read", id: RequestId, params: GetAccountParams, } | { "method": "getConversationSummary", id: RequestId, params: GetConversationSummaryParams, } | { "method": "gitDiffToRemote", id: RequestId, params: GitDiffToRemoteParams, } | { "method": "getAuthStatus", id: RequestId, params: GetAuthStatusParams, } | { "method": "fuzzyFileSearch", id: RequestId, params: FuzzyFileSearchParams, } | { "method": "fuzzyFileSearch/sessionStart", id: RequestId, params: FuzzyFileSearchSessionStartParams, } | { "method": "fuzzyFileSearch/sessionUpdate", id: RequestId, params: FuzzyFileSearchSessionUpdateParams, } | { "method": "fuzzyFileSearch/sessionStop", id: RequestId, params: FuzzyFileSearchSessionStopParams, };
 
 // CodexResponseHandoffMode.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -499,18 +527,27 @@ export type GitSha = string;
 
 export type ImageDetail = "auto" | "low" | "high" | "original";
 
+// ImageGenerationFailure.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ImageGenerationFailure = { "type": "usageLimitExceeded", limitId: string, resetsAt: number | null, };
+
 // ImageGenerationItem.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 import type { AbsolutePathBuf } from "./AbsolutePathBuf";
+import type { ImageGenerationFailure } from "./ImageGenerationFailure";
 
-export type ImageGenerationItem = { id: string, status: string, revisedPrompt: string | null, result: string, savedPath?: AbsolutePathBuf, };
+export type ImageGenerationItem = { id: string, status: string, revisedPrompt: string | null, result: string, transparentBackground?: boolean, failure: ImageGenerationFailure | null, savedPath?: AbsolutePathBuf, };
 
 // InitializeCapabilities.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { JsonValue } from "./serde_json/JsonValue";
 
 /**
  * Client-declared capabilities negotiated during initialize.
@@ -525,14 +562,20 @@ experimentalApi: boolean,
  */
 requestAttestation: boolean,
 /**
- * Allow downstream MCP servers to request OpenAI extended form elicitations.
+ * Legacy opt-in for the `openai/form` MCP extension.
+ *
+ * New clients should declare `openai/form` in [`Self::extensions`].
  */
 mcpServerOpenaiFormElicitation?: boolean,
 /**
  * Exact notification method names that should be suppressed for this
  * connection (for example `thread/started`).
  */
-optOutNotificationMethods?: Array<string> | null, };
+optOutNotificationMethods?: Array<string> | null,
+/**
+ * MCP extension settings declared by the app-server client.
+ */
+extensions?: { [key in string]?: JsonValue } | null, };
 
 // InitializeParams.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -593,7 +636,7 @@ export type InternalChatMessageMetadataPassthrough = { turn_id?: string, };
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
-export type InternalSessionSource = "memory_consolidation";
+export type InternalSessionSource = "memory_consolidation" | "guardian";
 
 // LegacyAppPathString.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -735,14 +778,16 @@ path: string, } | { "type": "list_files", cmd: string, path: string | null, } | 
  * created by [`Self::from_abs_path`] are opaque to these lexical operations.
  *
  * `file:` paths retain their URI spelling so they can be parsed independently
- * of the current host. A local POSIX `file:` URI can also retain
- * percent-encoded non-UTF-8 bytes for lossless native round trips.
+ * of the current host, except that Windows drive letters are canonicalized to
+ * uppercase. A local POSIX `file:` URI can also retain percent-encoded non-UTF-8
+ * bytes for lossless native round trips.
  *
  * Like [VS Code resources], path operations use `/` URI separators on every
  * host. Lexical path operations preserve a URL authority without interpreting
- * Windows drive or UNC roots from path text. Native path normalization,
- * filesystem aliases, symlinks, case sensitivity, and Unicode normalization
- * are not resolved.
+ * Windows drive or UNC roots from path text. Windows path equality and hashing
+ * ignore ASCII case, while POSIX paths remain case-sensitive. Native path
+ * normalization, filesystem aliases, symlinks, and Unicode normalization are
+ * not resolved.
  *
  * Serde represents a `PathUri` as its canonical URI string. Deserialization
  * accepts only valid `file:` URI strings. These strings round-trip through
@@ -764,7 +809,7 @@ export type Personality = "none" | "friendly" | "pragmatic";
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
-export type PlanType = "free" | "go" | "plus" | "pro" | "prolite" | "team" | "self_serve_business_usage_based" | "business" | "enterprise_cbp_usage_based" | "enterprise" | "edu" | "unknown";
+export type PlanType = "free" | "go" | "plus" | "pro" | "prolite" | "team" | "self_serve_business_prolite" | "self_serve_business_usage_based" | "business" | "ent26" | "enterprise_cbp_automation" | "enterprise_cbp_usage_based" | "enterprise" | "edu" | "edu_plus" | "edu_pro" | "unknown";
 
 // RealtimeConversationVersion.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -903,7 +948,7 @@ id?: ResponseItemId,
 /**
  * Set when using the Responses API.
  */
-call_id: string | null, status: LocalShellStatus, action: LocalShellAction, internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "function_call", id?: ResponseItemId, name: string, namespace?: string, arguments: string, call_id: string, internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "tool_search_call", id?: ResponseItemId, call_id: string | null, status?: string, execution: string, arguments: unknown, internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "function_call_output", id?: ResponseItemId, call_id: string, output: FunctionCallOutputBody, internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "custom_tool_call", id?: ResponseItemId, status?: string, call_id: string, name: string, namespace?: string, input: string, internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "custom_tool_call_output", id?: ResponseItemId, call_id: string, name?: string, output: FunctionCallOutputBody, internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "tool_search_output", id?: ResponseItemId, call_id: string | null, status: string, execution: string, tools: unknown[], internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "web_search_call", id?: ResponseItemId, status?: string, action?: WebSearchAction, internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "image_generation_call", id?: ResponseItemId, status: string, revised_prompt?: string, result: string, internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "compaction", id?: ResponseItemId, encrypted_content: string, internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "compaction_trigger", } | { "type": "context_compaction", id?: ResponseItemId, encrypted_content?: string, internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "other" };
+call_id: string | null, status: LocalShellStatus, action: LocalShellAction, internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "function_call", id?: ResponseItemId, name: string, namespace?: string, arguments: string, encrypted_function_args?: Array<string>, call_id: string, internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "tool_search_call", id?: ResponseItemId, call_id: string | null, status?: string, execution: string, arguments: unknown, internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "function_call_output", id?: ResponseItemId, call_id?: string, name?: string, namespace?: string, output: FunctionCallOutputBody, internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "custom_tool_call", id?: ResponseItemId, status?: string, call_id: string, name: string, namespace?: string, input: string, internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "custom_tool_call_output", id?: ResponseItemId, call_id: string, name?: string, output: FunctionCallOutputBody, internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "tool_search_output", id?: ResponseItemId, call_id: string | null, status: string, execution: string, tools: unknown[], internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "web_search_call", id?: ResponseItemId, status?: string, action?: WebSearchAction, internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "image_generation_call", id?: ResponseItemId, status: string, revised_prompt?: string, result: string, internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "compaction", id?: ResponseItemId, encrypted_content: string, internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "compaction_trigger", } | { "type": "context_compaction", id?: ResponseItemId, encrypted_content?: string, internal_chat_message_metadata_passthrough?: InternalChatMessageMetadataPassthrough, } | { "type": "other" };
 
 // ResponseItemId.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -926,7 +971,7 @@ import type { NetworkPolicyAmendment } from "./NetworkPolicyAmendment";
 /**
  * User's decision in response to an ExecApprovalRequest.
  */
-export type ReviewDecision = "approved" | { "approved_execpolicy_amendment": { proposed_execpolicy_amendment: ExecPolicyAmendment, } } | "approved_for_session" | { "network_policy_amendment": { network_policy_amendment: NetworkPolicyAmendment, } } | { "denied": { rejection: string, } } | "timed_out" | "abort";
+export type ReviewDecision = "approved" | { "approved_execpolicy_amendment": { proposed_execpolicy_amendment: ExecPolicyAmendment, } } | "approved_for_session" | "approved_mcp_policy_amendment" | { "network_policy_amendment": { network_policy_amendment: NetworkPolicyAmendment, } } | { "denied": { rejection: string, } } | "timed_out" | "abort";
 
 // ServerNotification.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -958,6 +1003,7 @@ import type { ItemCompletedNotification } from "./v2/ItemCompletedNotification";
 import type { ItemGuardianApprovalReviewCompletedNotification } from "./v2/ItemGuardianApprovalReviewCompletedNotification";
 import type { ItemGuardianApprovalReviewStartedNotification } from "./v2/ItemGuardianApprovalReviewStartedNotification";
 import type { ItemStartedNotification } from "./v2/ItemStartedNotification";
+import type { McpServerEventStreamNotification } from "./v2/McpServerEventStreamNotification";
 import type { McpServerOauthLoginCompletedNotification } from "./v2/McpServerOauthLoginCompletedNotification";
 import type { McpServerStatusUpdatedNotification } from "./v2/McpServerStatusUpdatedNotification";
 import type { McpToolCallProgressNotification } from "./v2/McpToolCallProgressNotification";
@@ -967,6 +1013,7 @@ import type { ModelVerificationNotification } from "./v2/ModelVerificationNotifi
 import type { PlanDeltaNotification } from "./v2/PlanDeltaNotification";
 import type { ProcessExitedNotification } from "./v2/ProcessExitedNotification";
 import type { ProcessOutputDeltaNotification } from "./v2/ProcessOutputDeltaNotification";
+import type { ProjectChangedNotification } from "./v2/ProjectChangedNotification";
 import type { RawResponseCompletedNotification } from "./v2/RawResponseCompletedNotification";
 import type { RawResponseItemCompletedNotification } from "./v2/RawResponseItemCompletedNotification";
 import type { ReasoningSummaryPartAddedNotification } from "./v2/ReasoningSummaryPartAddedNotification";
@@ -975,6 +1022,7 @@ import type { ReasoningTextDeltaNotification } from "./v2/ReasoningTextDeltaNoti
 import type { RemoteControlStatusChangedNotification } from "./v2/RemoteControlStatusChangedNotification";
 import type { ServerRequestResolvedNotification } from "./v2/ServerRequestResolvedNotification";
 import type { SkillsChangedNotification } from "./v2/SkillsChangedNotification";
+import type { StrictReviewRequiredNotification } from "./v2/StrictReviewRequiredNotification";
 import type { TerminalInteractionNotification } from "./v2/TerminalInteractionNotification";
 import type { ThreadArchivedNotification } from "./v2/ThreadArchivedNotification";
 import type { ThreadClosedNotification } from "./v2/ThreadClosedNotification";
@@ -982,14 +1030,20 @@ import type { ThreadDeletedNotification } from "./v2/ThreadDeletedNotification";
 import type { ThreadGoalClearedNotification } from "./v2/ThreadGoalClearedNotification";
 import type { ThreadGoalUpdatedNotification } from "./v2/ThreadGoalUpdatedNotification";
 import type { ThreadNameUpdatedNotification } from "./v2/ThreadNameUpdatedNotification";
+import type { ThreadProjectUpdatedNotification } from "./v2/ThreadProjectUpdatedNotification";
+import type { ThreadQueueChangedNotification } from "./v2/ThreadQueueChangedNotification";
 import type { ThreadRealtimeClosedNotification } from "./v2/ThreadRealtimeClosedNotification";
 import type { ThreadRealtimeErrorNotification } from "./v2/ThreadRealtimeErrorNotification";
 import type { ThreadRealtimeItemAddedNotification } from "./v2/ThreadRealtimeItemAddedNotification";
+import type { ThreadRealtimeItemCompletedNotification } from "./v2/ThreadRealtimeItemCompletedNotification";
+import type { ThreadRealtimeItemStartedNotification } from "./v2/ThreadRealtimeItemStartedNotification";
+import type { ThreadRealtimeItemTranscriptDeltaNotification } from "./v2/ThreadRealtimeItemTranscriptDeltaNotification";
 import type { ThreadRealtimeOutputAudioDeltaNotification } from "./v2/ThreadRealtimeOutputAudioDeltaNotification";
 import type { ThreadRealtimeSdpNotification } from "./v2/ThreadRealtimeSdpNotification";
 import type { ThreadRealtimeStartedNotification } from "./v2/ThreadRealtimeStartedNotification";
 import type { ThreadRealtimeTranscriptDeltaNotification } from "./v2/ThreadRealtimeTranscriptDeltaNotification";
 import type { ThreadRealtimeTranscriptDoneNotification } from "./v2/ThreadRealtimeTranscriptDoneNotification";
+import type { ThreadRevertedNotification } from "./v2/ThreadRevertedNotification";
 import type { ThreadSettingsUpdatedNotification } from "./v2/ThreadSettingsUpdatedNotification";
 import type { ThreadStartedNotification } from "./v2/ThreadStartedNotification";
 import type { ThreadStatusChangedNotification } from "./v2/ThreadStatusChangedNotification";
@@ -1007,7 +1061,7 @@ import type { WindowsWorldWritableWarningNotification } from "./v2/WindowsWorldW
 /**
  * Notification sent from the server to the client.
  */
-export type ServerNotification = { "method": "error", "params": ErrorNotification } | { "method": "thread/started", "params": ThreadStartedNotification } | { "method": "thread/status/changed", "params": ThreadStatusChangedNotification } | { "method": "thread/archived", "params": ThreadArchivedNotification } | { "method": "thread/deleted", "params": ThreadDeletedNotification } | { "method": "thread/unarchived", "params": ThreadUnarchivedNotification } | { "method": "thread/closed", "params": ThreadClosedNotification } | { "method": "skills/changed", "params": SkillsChangedNotification } | { "method": "thread/name/updated", "params": ThreadNameUpdatedNotification } | { "method": "thread/goal/updated", "params": ThreadGoalUpdatedNotification } | { "method": "thread/goal/cleared", "params": ThreadGoalClearedNotification } | { "method": "thread/environment/connected", "params": EnvironmentConnectionNotification } | { "method": "thread/environment/disconnected", "params": EnvironmentConnectionNotification } | { "method": "thread/settings/updated", "params": ThreadSettingsUpdatedNotification } | { "method": "thread/tokenUsage/updated", "params": ThreadTokenUsageUpdatedNotification } | { "method": "turn/started", "params": TurnStartedNotification } | { "method": "hook/started", "params": HookStartedNotification } | { "method": "turn/completed", "params": TurnCompletedNotification } | { "method": "hook/completed", "params": HookCompletedNotification } | { "method": "turn/diff/updated", "params": TurnDiffUpdatedNotification } | { "method": "turn/plan/updated", "params": TurnPlanUpdatedNotification } | { "method": "item/started", "params": ItemStartedNotification } | { "method": "item/autoApprovalReview/started", "params": ItemGuardianApprovalReviewStartedNotification } | { "method": "item/autoApprovalReview/completed", "params": ItemGuardianApprovalReviewCompletedNotification } | { "method": "item/completed", "params": ItemCompletedNotification } | { "method": "rawResponseItem/completed", "params": RawResponseItemCompletedNotification } | { "method": "rawResponse/completed", "params": RawResponseCompletedNotification } | { "method": "item/agentMessage/delta", "params": AgentMessageDeltaNotification } | { "method": "item/plan/delta", "params": PlanDeltaNotification } | { "method": "command/exec/outputDelta", "params": CommandExecOutputDeltaNotification } | { "method": "process/outputDelta", "params": ProcessOutputDeltaNotification } | { "method": "process/exited", "params": ProcessExitedNotification } | { "method": "item/commandExecution/outputDelta", "params": CommandExecutionOutputDeltaNotification } | { "method": "item/commandExecution/terminalInteraction", "params": TerminalInteractionNotification } | { "method": "item/fileChange/outputDelta", "params": FileChangeOutputDeltaNotification } | { "method": "item/fileChange/patchUpdated", "params": FileChangePatchUpdatedNotification } | { "method": "serverRequest/resolved", "params": ServerRequestResolvedNotification } | { "method": "item/mcpToolCall/progress", "params": McpToolCallProgressNotification } | { "method": "mcpServer/oauthLogin/completed", "params": McpServerOauthLoginCompletedNotification } | { "method": "mcpServer/startupStatus/updated", "params": McpServerStatusUpdatedNotification } | { "method": "account/updated", "params": AccountUpdatedNotification } | { "method": "account/rateLimits/updated", "params": AccountRateLimitsUpdatedNotification } | { "method": "app/list/updated", "params": AppListUpdatedNotification } | { "method": "remoteControl/status/changed", "params": RemoteControlStatusChangedNotification } | { "method": "externalAgentConfig/import/progress", "params": ExternalAgentConfigImportProgressNotification } | { "method": "externalAgentConfig/import/completed", "params": ExternalAgentConfigImportCompletedNotification } | { "method": "fs/changed", "params": FsChangedNotification } | { "method": "item/reasoning/summaryTextDelta", "params": ReasoningSummaryTextDeltaNotification } | { "method": "item/reasoning/summaryPartAdded", "params": ReasoningSummaryPartAddedNotification } | { "method": "item/reasoning/textDelta", "params": ReasoningTextDeltaNotification } | { "method": "thread/compacted", "params": ContextCompactedNotification } | { "method": "model/rerouted", "params": ModelReroutedNotification } | { "method": "model/verification", "params": ModelVerificationNotification } | { "method": "turn/moderationMetadata", "params": TurnModerationMetadataNotification } | { "method": "model/safetyBuffering/updated", "params": ModelSafetyBufferingUpdatedNotification } | { "method": "warning", "params": WarningNotification } | { "method": "guardianWarning", "params": GuardianWarningNotification } | { "method": "deprecationNotice", "params": DeprecationNoticeNotification } | { "method": "configWarning", "params": ConfigWarningNotification } | { "method": "fuzzyFileSearch/sessionUpdated", "params": FuzzyFileSearchSessionUpdatedNotification } | { "method": "fuzzyFileSearch/sessionCompleted", "params": FuzzyFileSearchSessionCompletedNotification } | { "method": "thread/realtime/started", "params": ThreadRealtimeStartedNotification } | { "method": "thread/realtime/itemAdded", "params": ThreadRealtimeItemAddedNotification } | { "method": "thread/realtime/transcript/delta", "params": ThreadRealtimeTranscriptDeltaNotification } | { "method": "thread/realtime/transcript/done", "params": ThreadRealtimeTranscriptDoneNotification } | { "method": "thread/realtime/outputAudio/delta", "params": ThreadRealtimeOutputAudioDeltaNotification } | { "method": "thread/realtime/sdp", "params": ThreadRealtimeSdpNotification } | { "method": "thread/realtime/error", "params": ThreadRealtimeErrorNotification } | { "method": "thread/realtime/closed", "params": ThreadRealtimeClosedNotification } | { "method": "windows/worldWritableWarning", "params": WindowsWorldWritableWarningNotification } | { "method": "windowsSandbox/setupCompleted", "params": WindowsSandboxSetupCompletedNotification } | { "method": "account/login/completed", "params": AccountLoginCompletedNotification };
+export type ServerNotification = { "method": "error", "params": ErrorNotification } | { "method": "thread/started", "params": ThreadStartedNotification } | { "method": "thread/status/changed", "params": ThreadStatusChangedNotification } | { "method": "thread/archived", "params": ThreadArchivedNotification } | { "method": "thread/deleted", "params": ThreadDeletedNotification } | { "method": "thread/unarchived", "params": ThreadUnarchivedNotification } | { "method": "thread/closed", "params": ThreadClosedNotification } | { "method": "thread/reverted", "params": ThreadRevertedNotification } | { "method": "skills/changed", "params": SkillsChangedNotification } | { "method": "thread/name/updated", "params": ThreadNameUpdatedNotification } | { "method": "thread/goal/updated", "params": ThreadGoalUpdatedNotification } | { "method": "thread/goal/cleared", "params": ThreadGoalClearedNotification } | { "method": "thread/queue/changed", "params": ThreadQueueChangedNotification } | { "method": "project/changed", "params": ProjectChangedNotification } | { "method": "thread/project/updated", "params": ThreadProjectUpdatedNotification } | { "method": "thread/environment/connected", "params": EnvironmentConnectionNotification } | { "method": "thread/environment/disconnected", "params": EnvironmentConnectionNotification } | { "method": "thread/settings/updated", "params": ThreadSettingsUpdatedNotification } | { "method": "thread/tokenUsage/updated", "params": ThreadTokenUsageUpdatedNotification } | { "method": "turn/started", "params": TurnStartedNotification } | { "method": "hook/started", "params": HookStartedNotification } | { "method": "turn/completed", "params": TurnCompletedNotification } | { "method": "hook/completed", "params": HookCompletedNotification } | { "method": "turn/diff/updated", "params": TurnDiffUpdatedNotification } | { "method": "turn/plan/updated", "params": TurnPlanUpdatedNotification } | { "method": "item/started", "params": ItemStartedNotification } | { "method": "item/autoApprovalReview/started", "params": ItemGuardianApprovalReviewStartedNotification } | { "method": "item/autoApprovalReview/completed", "params": ItemGuardianApprovalReviewCompletedNotification } | { "method": "autoApprovalReview/strictReviewRequired", "params": StrictReviewRequiredNotification } | { "method": "item/completed", "params": ItemCompletedNotification } | { "method": "rawResponseItem/completed", "params": RawResponseItemCompletedNotification } | { "method": "rawResponse/completed", "params": RawResponseCompletedNotification } | { "method": "item/agentMessage/delta", "params": AgentMessageDeltaNotification } | { "method": "item/plan/delta", "params": PlanDeltaNotification } | { "method": "command/exec/outputDelta", "params": CommandExecOutputDeltaNotification } | { "method": "process/outputDelta", "params": ProcessOutputDeltaNotification } | { "method": "process/exited", "params": ProcessExitedNotification } | { "method": "item/commandExecution/outputDelta", "params": CommandExecutionOutputDeltaNotification } | { "method": "item/commandExecution/terminalInteraction", "params": TerminalInteractionNotification } | { "method": "item/fileChange/outputDelta", "params": FileChangeOutputDeltaNotification } | { "method": "item/fileChange/patchUpdated", "params": FileChangePatchUpdatedNotification } | { "method": "serverRequest/resolved", "params": ServerRequestResolvedNotification } | { "method": "item/mcpToolCall/progress", "params": McpToolCallProgressNotification } | { "method": "mcpServer/oauthLogin/completed", "params": McpServerOauthLoginCompletedNotification } | { "method": "mcpServer/startupStatus/updated", "params": McpServerStatusUpdatedNotification } | { "method": "mcpServer/event/stream/notification", "params": McpServerEventStreamNotification } | { "method": "account/updated", "params": AccountUpdatedNotification } | { "method": "account/rateLimits/updated", "params": AccountRateLimitsUpdatedNotification } | { "method": "app/list/updated", "params": AppListUpdatedNotification } | { "method": "remoteControl/status/changed", "params": RemoteControlStatusChangedNotification } | { "method": "externalAgentConfig/import/progress", "params": ExternalAgentConfigImportProgressNotification } | { "method": "externalAgentConfig/import/completed", "params": ExternalAgentConfigImportCompletedNotification } | { "method": "fs/changed", "params": FsChangedNotification } | { "method": "item/reasoning/summaryTextDelta", "params": ReasoningSummaryTextDeltaNotification } | { "method": "item/reasoning/summaryPartAdded", "params": ReasoningSummaryPartAddedNotification } | { "method": "item/reasoning/textDelta", "params": ReasoningTextDeltaNotification } | { "method": "thread/compacted", "params": ContextCompactedNotification } | { "method": "model/rerouted", "params": ModelReroutedNotification } | { "method": "model/verification", "params": ModelVerificationNotification } | { "method": "turn/moderationMetadata", "params": TurnModerationMetadataNotification } | { "method": "model/safetyBuffering/updated", "params": ModelSafetyBufferingUpdatedNotification } | { "method": "warning", "params": WarningNotification } | { "method": "guardianWarning", "params": GuardianWarningNotification } | { "method": "deprecationNotice", "params": DeprecationNoticeNotification } | { "method": "configWarning", "params": ConfigWarningNotification } | { "method": "fuzzyFileSearch/sessionUpdated", "params": FuzzyFileSearchSessionUpdatedNotification } | { "method": "fuzzyFileSearch/sessionCompleted", "params": FuzzyFileSearchSessionCompletedNotification } | { "method": "thread/realtime/started", "params": ThreadRealtimeStartedNotification } | { "method": "thread/realtime/itemAdded", "params": ThreadRealtimeItemAddedNotification } | { "method": "thread/realtime/item/started", "params": ThreadRealtimeItemStartedNotification } | { "method": "thread/realtime/item/transcript/delta", "params": ThreadRealtimeItemTranscriptDeltaNotification } | { "method": "thread/realtime/item/completed", "params": ThreadRealtimeItemCompletedNotification } | { "method": "thread/realtime/transcript/delta", "params": ThreadRealtimeTranscriptDeltaNotification } | { "method": "thread/realtime/transcript/done", "params": ThreadRealtimeTranscriptDoneNotification } | { "method": "thread/realtime/outputAudio/delta", "params": ThreadRealtimeOutputAudioDeltaNotification } | { "method": "thread/realtime/sdp", "params": ThreadRealtimeSdpNotification } | { "method": "thread/realtime/error", "params": ThreadRealtimeErrorNotification } | { "method": "thread/realtime/closed", "params": ThreadRealtimeClosedNotification } | { "method": "windows/worldWritableWarning", "params": WindowsWorldWritableWarningNotification } | { "method": "windowsSandbox/setupCompleted", "params": WindowsSandboxSetupCompletedNotification } | { "method": "account/login/completed", "params": AccountLoginCompletedNotification };
 
 // ServerNotificationEnvelope.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -1039,6 +1093,7 @@ import type { ItemCompletedNotification } from "./v2/ItemCompletedNotification";
 import type { ItemGuardianApprovalReviewCompletedNotification } from "./v2/ItemGuardianApprovalReviewCompletedNotification";
 import type { ItemGuardianApprovalReviewStartedNotification } from "./v2/ItemGuardianApprovalReviewStartedNotification";
 import type { ItemStartedNotification } from "./v2/ItemStartedNotification";
+import type { McpServerEventStreamNotification } from "./v2/McpServerEventStreamNotification";
 import type { McpServerOauthLoginCompletedNotification } from "./v2/McpServerOauthLoginCompletedNotification";
 import type { McpServerStatusUpdatedNotification } from "./v2/McpServerStatusUpdatedNotification";
 import type { McpToolCallProgressNotification } from "./v2/McpToolCallProgressNotification";
@@ -1048,6 +1103,7 @@ import type { ModelVerificationNotification } from "./v2/ModelVerificationNotifi
 import type { PlanDeltaNotification } from "./v2/PlanDeltaNotification";
 import type { ProcessExitedNotification } from "./v2/ProcessExitedNotification";
 import type { ProcessOutputDeltaNotification } from "./v2/ProcessOutputDeltaNotification";
+import type { ProjectChangedNotification } from "./v2/ProjectChangedNotification";
 import type { RawResponseCompletedNotification } from "./v2/RawResponseCompletedNotification";
 import type { RawResponseItemCompletedNotification } from "./v2/RawResponseItemCompletedNotification";
 import type { ReasoningSummaryPartAddedNotification } from "./v2/ReasoningSummaryPartAddedNotification";
@@ -1056,6 +1112,7 @@ import type { ReasoningTextDeltaNotification } from "./v2/ReasoningTextDeltaNoti
 import type { RemoteControlStatusChangedNotification } from "./v2/RemoteControlStatusChangedNotification";
 import type { ServerRequestResolvedNotification } from "./v2/ServerRequestResolvedNotification";
 import type { SkillsChangedNotification } from "./v2/SkillsChangedNotification";
+import type { StrictReviewRequiredNotification } from "./v2/StrictReviewRequiredNotification";
 import type { TerminalInteractionNotification } from "./v2/TerminalInteractionNotification";
 import type { ThreadArchivedNotification } from "./v2/ThreadArchivedNotification";
 import type { ThreadClosedNotification } from "./v2/ThreadClosedNotification";
@@ -1063,14 +1120,20 @@ import type { ThreadDeletedNotification } from "./v2/ThreadDeletedNotification";
 import type { ThreadGoalClearedNotification } from "./v2/ThreadGoalClearedNotification";
 import type { ThreadGoalUpdatedNotification } from "./v2/ThreadGoalUpdatedNotification";
 import type { ThreadNameUpdatedNotification } from "./v2/ThreadNameUpdatedNotification";
+import type { ThreadProjectUpdatedNotification } from "./v2/ThreadProjectUpdatedNotification";
+import type { ThreadQueueChangedNotification } from "./v2/ThreadQueueChangedNotification";
 import type { ThreadRealtimeClosedNotification } from "./v2/ThreadRealtimeClosedNotification";
 import type { ThreadRealtimeErrorNotification } from "./v2/ThreadRealtimeErrorNotification";
 import type { ThreadRealtimeItemAddedNotification } from "./v2/ThreadRealtimeItemAddedNotification";
+import type { ThreadRealtimeItemCompletedNotification } from "./v2/ThreadRealtimeItemCompletedNotification";
+import type { ThreadRealtimeItemStartedNotification } from "./v2/ThreadRealtimeItemStartedNotification";
+import type { ThreadRealtimeItemTranscriptDeltaNotification } from "./v2/ThreadRealtimeItemTranscriptDeltaNotification";
 import type { ThreadRealtimeOutputAudioDeltaNotification } from "./v2/ThreadRealtimeOutputAudioDeltaNotification";
 import type { ThreadRealtimeSdpNotification } from "./v2/ThreadRealtimeSdpNotification";
 import type { ThreadRealtimeStartedNotification } from "./v2/ThreadRealtimeStartedNotification";
 import type { ThreadRealtimeTranscriptDeltaNotification } from "./v2/ThreadRealtimeTranscriptDeltaNotification";
 import type { ThreadRealtimeTranscriptDoneNotification } from "./v2/ThreadRealtimeTranscriptDoneNotification";
+import type { ThreadRevertedNotification } from "./v2/ThreadRevertedNotification";
 import type { ThreadSettingsUpdatedNotification } from "./v2/ThreadSettingsUpdatedNotification";
 import type { ThreadStartedNotification } from "./v2/ThreadStartedNotification";
 import type { ThreadStatusChangedNotification } from "./v2/ThreadStatusChangedNotification";
@@ -1098,7 +1161,7 @@ export type ServerNotificationEnvelope = {
  * Optional so clients can decode notifications from older app-server
  * versions. Current app-server versions always populate it.
  */
-emittedAtMs?: number, } & ({ "method": "error", "params": ErrorNotification } | { "method": "thread/started", "params": ThreadStartedNotification } | { "method": "thread/status/changed", "params": ThreadStatusChangedNotification } | { "method": "thread/archived", "params": ThreadArchivedNotification } | { "method": "thread/deleted", "params": ThreadDeletedNotification } | { "method": "thread/unarchived", "params": ThreadUnarchivedNotification } | { "method": "thread/closed", "params": ThreadClosedNotification } | { "method": "skills/changed", "params": SkillsChangedNotification } | { "method": "thread/name/updated", "params": ThreadNameUpdatedNotification } | { "method": "thread/goal/updated", "params": ThreadGoalUpdatedNotification } | { "method": "thread/goal/cleared", "params": ThreadGoalClearedNotification } | { "method": "thread/environment/connected", "params": EnvironmentConnectionNotification } | { "method": "thread/environment/disconnected", "params": EnvironmentConnectionNotification } | { "method": "thread/settings/updated", "params": ThreadSettingsUpdatedNotification } | { "method": "thread/tokenUsage/updated", "params": ThreadTokenUsageUpdatedNotification } | { "method": "turn/started", "params": TurnStartedNotification } | { "method": "hook/started", "params": HookStartedNotification } | { "method": "turn/completed", "params": TurnCompletedNotification } | { "method": "hook/completed", "params": HookCompletedNotification } | { "method": "turn/diff/updated", "params": TurnDiffUpdatedNotification } | { "method": "turn/plan/updated", "params": TurnPlanUpdatedNotification } | { "method": "item/started", "params": ItemStartedNotification } | { "method": "item/autoApprovalReview/started", "params": ItemGuardianApprovalReviewStartedNotification } | { "method": "item/autoApprovalReview/completed", "params": ItemGuardianApprovalReviewCompletedNotification } | { "method": "item/completed", "params": ItemCompletedNotification } | { "method": "rawResponseItem/completed", "params": RawResponseItemCompletedNotification } | { "method": "rawResponse/completed", "params": RawResponseCompletedNotification } | { "method": "item/agentMessage/delta", "params": AgentMessageDeltaNotification } | { "method": "item/plan/delta", "params": PlanDeltaNotification } | { "method": "command/exec/outputDelta", "params": CommandExecOutputDeltaNotification } | { "method": "process/outputDelta", "params": ProcessOutputDeltaNotification } | { "method": "process/exited", "params": ProcessExitedNotification } | { "method": "item/commandExecution/outputDelta", "params": CommandExecutionOutputDeltaNotification } | { "method": "item/commandExecution/terminalInteraction", "params": TerminalInteractionNotification } | { "method": "item/fileChange/outputDelta", "params": FileChangeOutputDeltaNotification } | { "method": "item/fileChange/patchUpdated", "params": FileChangePatchUpdatedNotification } | { "method": "serverRequest/resolved", "params": ServerRequestResolvedNotification } | { "method": "item/mcpToolCall/progress", "params": McpToolCallProgressNotification } | { "method": "mcpServer/oauthLogin/completed", "params": McpServerOauthLoginCompletedNotification } | { "method": "mcpServer/startupStatus/updated", "params": McpServerStatusUpdatedNotification } | { "method": "account/updated", "params": AccountUpdatedNotification } | { "method": "account/rateLimits/updated", "params": AccountRateLimitsUpdatedNotification } | { "method": "app/list/updated", "params": AppListUpdatedNotification } | { "method": "remoteControl/status/changed", "params": RemoteControlStatusChangedNotification } | { "method": "externalAgentConfig/import/progress", "params": ExternalAgentConfigImportProgressNotification } | { "method": "externalAgentConfig/import/completed", "params": ExternalAgentConfigImportCompletedNotification } | { "method": "fs/changed", "params": FsChangedNotification } | { "method": "item/reasoning/summaryTextDelta", "params": ReasoningSummaryTextDeltaNotification } | { "method": "item/reasoning/summaryPartAdded", "params": ReasoningSummaryPartAddedNotification } | { "method": "item/reasoning/textDelta", "params": ReasoningTextDeltaNotification } | { "method": "thread/compacted", "params": ContextCompactedNotification } | { "method": "model/rerouted", "params": ModelReroutedNotification } | { "method": "model/verification", "params": ModelVerificationNotification } | { "method": "turn/moderationMetadata", "params": TurnModerationMetadataNotification } | { "method": "model/safetyBuffering/updated", "params": ModelSafetyBufferingUpdatedNotification } | { "method": "warning", "params": WarningNotification } | { "method": "guardianWarning", "params": GuardianWarningNotification } | { "method": "deprecationNotice", "params": DeprecationNoticeNotification } | { "method": "configWarning", "params": ConfigWarningNotification } | { "method": "fuzzyFileSearch/sessionUpdated", "params": FuzzyFileSearchSessionUpdatedNotification } | { "method": "fuzzyFileSearch/sessionCompleted", "params": FuzzyFileSearchSessionCompletedNotification } | { "method": "thread/realtime/started", "params": ThreadRealtimeStartedNotification } | { "method": "thread/realtime/itemAdded", "params": ThreadRealtimeItemAddedNotification } | { "method": "thread/realtime/transcript/delta", "params": ThreadRealtimeTranscriptDeltaNotification } | { "method": "thread/realtime/transcript/done", "params": ThreadRealtimeTranscriptDoneNotification } | { "method": "thread/realtime/outputAudio/delta", "params": ThreadRealtimeOutputAudioDeltaNotification } | { "method": "thread/realtime/sdp", "params": ThreadRealtimeSdpNotification } | { "method": "thread/realtime/error", "params": ThreadRealtimeErrorNotification } | { "method": "thread/realtime/closed", "params": ThreadRealtimeClosedNotification } | { "method": "windows/worldWritableWarning", "params": WindowsWorldWritableWarningNotification } | { "method": "windowsSandbox/setupCompleted", "params": WindowsSandboxSetupCompletedNotification } | { "method": "account/login/completed", "params": AccountLoginCompletedNotification });
+emittedAtMs?: number, } & ({ "method": "error", "params": ErrorNotification } | { "method": "thread/started", "params": ThreadStartedNotification } | { "method": "thread/status/changed", "params": ThreadStatusChangedNotification } | { "method": "thread/archived", "params": ThreadArchivedNotification } | { "method": "thread/deleted", "params": ThreadDeletedNotification } | { "method": "thread/unarchived", "params": ThreadUnarchivedNotification } | { "method": "thread/closed", "params": ThreadClosedNotification } | { "method": "thread/reverted", "params": ThreadRevertedNotification } | { "method": "skills/changed", "params": SkillsChangedNotification } | { "method": "thread/name/updated", "params": ThreadNameUpdatedNotification } | { "method": "thread/goal/updated", "params": ThreadGoalUpdatedNotification } | { "method": "thread/goal/cleared", "params": ThreadGoalClearedNotification } | { "method": "thread/queue/changed", "params": ThreadQueueChangedNotification } | { "method": "project/changed", "params": ProjectChangedNotification } | { "method": "thread/project/updated", "params": ThreadProjectUpdatedNotification } | { "method": "thread/environment/connected", "params": EnvironmentConnectionNotification } | { "method": "thread/environment/disconnected", "params": EnvironmentConnectionNotification } | { "method": "thread/settings/updated", "params": ThreadSettingsUpdatedNotification } | { "method": "thread/tokenUsage/updated", "params": ThreadTokenUsageUpdatedNotification } | { "method": "turn/started", "params": TurnStartedNotification } | { "method": "hook/started", "params": HookStartedNotification } | { "method": "turn/completed", "params": TurnCompletedNotification } | { "method": "hook/completed", "params": HookCompletedNotification } | { "method": "turn/diff/updated", "params": TurnDiffUpdatedNotification } | { "method": "turn/plan/updated", "params": TurnPlanUpdatedNotification } | { "method": "item/started", "params": ItemStartedNotification } | { "method": "item/autoApprovalReview/started", "params": ItemGuardianApprovalReviewStartedNotification } | { "method": "item/autoApprovalReview/completed", "params": ItemGuardianApprovalReviewCompletedNotification } | { "method": "autoApprovalReview/strictReviewRequired", "params": StrictReviewRequiredNotification } | { "method": "item/completed", "params": ItemCompletedNotification } | { "method": "rawResponseItem/completed", "params": RawResponseItemCompletedNotification } | { "method": "rawResponse/completed", "params": RawResponseCompletedNotification } | { "method": "item/agentMessage/delta", "params": AgentMessageDeltaNotification } | { "method": "item/plan/delta", "params": PlanDeltaNotification } | { "method": "command/exec/outputDelta", "params": CommandExecOutputDeltaNotification } | { "method": "process/outputDelta", "params": ProcessOutputDeltaNotification } | { "method": "process/exited", "params": ProcessExitedNotification } | { "method": "item/commandExecution/outputDelta", "params": CommandExecutionOutputDeltaNotification } | { "method": "item/commandExecution/terminalInteraction", "params": TerminalInteractionNotification } | { "method": "item/fileChange/outputDelta", "params": FileChangeOutputDeltaNotification } | { "method": "item/fileChange/patchUpdated", "params": FileChangePatchUpdatedNotification } | { "method": "serverRequest/resolved", "params": ServerRequestResolvedNotification } | { "method": "item/mcpToolCall/progress", "params": McpToolCallProgressNotification } | { "method": "mcpServer/oauthLogin/completed", "params": McpServerOauthLoginCompletedNotification } | { "method": "mcpServer/startupStatus/updated", "params": McpServerStatusUpdatedNotification } | { "method": "mcpServer/event/stream/notification", "params": McpServerEventStreamNotification } | { "method": "account/updated", "params": AccountUpdatedNotification } | { "method": "account/rateLimits/updated", "params": AccountRateLimitsUpdatedNotification } | { "method": "app/list/updated", "params": AppListUpdatedNotification } | { "method": "remoteControl/status/changed", "params": RemoteControlStatusChangedNotification } | { "method": "externalAgentConfig/import/progress", "params": ExternalAgentConfigImportProgressNotification } | { "method": "externalAgentConfig/import/completed", "params": ExternalAgentConfigImportCompletedNotification } | { "method": "fs/changed", "params": FsChangedNotification } | { "method": "item/reasoning/summaryTextDelta", "params": ReasoningSummaryTextDeltaNotification } | { "method": "item/reasoning/summaryPartAdded", "params": ReasoningSummaryPartAddedNotification } | { "method": "item/reasoning/textDelta", "params": ReasoningTextDeltaNotification } | { "method": "thread/compacted", "params": ContextCompactedNotification } | { "method": "model/rerouted", "params": ModelReroutedNotification } | { "method": "model/verification", "params": ModelVerificationNotification } | { "method": "turn/moderationMetadata", "params": TurnModerationMetadataNotification } | { "method": "model/safetyBuffering/updated", "params": ModelSafetyBufferingUpdatedNotification } | { "method": "warning", "params": WarningNotification } | { "method": "guardianWarning", "params": GuardianWarningNotification } | { "method": "deprecationNotice", "params": DeprecationNoticeNotification } | { "method": "configWarning", "params": ConfigWarningNotification } | { "method": "fuzzyFileSearch/sessionUpdated", "params": FuzzyFileSearchSessionUpdatedNotification } | { "method": "fuzzyFileSearch/sessionCompleted", "params": FuzzyFileSearchSessionCompletedNotification } | { "method": "thread/realtime/started", "params": ThreadRealtimeStartedNotification } | { "method": "thread/realtime/itemAdded", "params": ThreadRealtimeItemAddedNotification } | { "method": "thread/realtime/item/started", "params": ThreadRealtimeItemStartedNotification } | { "method": "thread/realtime/item/transcript/delta", "params": ThreadRealtimeItemTranscriptDeltaNotification } | { "method": "thread/realtime/item/completed", "params": ThreadRealtimeItemCompletedNotification } | { "method": "thread/realtime/transcript/delta", "params": ThreadRealtimeTranscriptDeltaNotification } | { "method": "thread/realtime/transcript/done", "params": ThreadRealtimeTranscriptDoneNotification } | { "method": "thread/realtime/outputAudio/delta", "params": ThreadRealtimeOutputAudioDeltaNotification } | { "method": "thread/realtime/sdp", "params": ThreadRealtimeSdpNotification } | { "method": "thread/realtime/error", "params": ThreadRealtimeErrorNotification } | { "method": "thread/realtime/closed", "params": ThreadRealtimeClosedNotification } | { "method": "windows/worldWritableWarning", "params": WindowsWorldWritableWarningNotification } | { "method": "windowsSandbox/setupCompleted", "params": WindowsSandboxSetupCompletedNotification } | { "method": "account/login/completed", "params": AccountLoginCompletedNotification });
 
 // ServerRequest.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -1301,6 +1364,7 @@ export type { GitDiffToRemoteParams } from "./GitDiffToRemoteParams";
 export type { GitDiffToRemoteResponse } from "./GitDiffToRemoteResponse";
 export type { GitSha } from "./GitSha";
 export type { ImageDetail } from "./ImageDetail";
+export type { ImageGenerationFailure } from "./ImageGenerationFailure";
 export type { ImageGenerationItem } from "./ImageGenerationItem";
 export type { InitializeCapabilities } from "./InitializeCapabilities";
 export type { InitializeParams } from "./InitializeParams";
@@ -1375,8 +1439,9 @@ export type Account = { "type": "apiKey", } | { "type": "chatgpt", email: string
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { DesktopOnboardingEntrypoint } from "./DesktopOnboardingEntrypoint";
 
-export type AccountLoginCompletedNotification = { loginId: string | null, success: boolean, error: string | null, };
+export type AccountLoginCompletedNotification = { loginId: string | null, success: boolean, error: string | null, onboardingEntrypoint: DesktopOnboardingEntrypoint | null, };
 
 // v2/AccountRateLimitsUpdatedNotification.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -1499,12 +1564,26 @@ export type AdditionalPermissionProfile = {
  */
 network: AdditionalNetworkPermissions | null, fileSystem: AdditionalFileSystemPermissions | null, };
 
+// v2/AgentMessageDelivery.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type AgentMessageDelivery = "async";
+
 // v2/AgentMessageDeltaNotification.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
 export type AgentMessageDeltaNotification = { threadId: string, turnId: string, itemId: string, delta: string, };
+
+// v2/AllowDenyRequirement.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type AllowDenyRequirement = "allow" | "deny";
 
 // v2/AnalyticsConfig.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -1563,7 +1642,7 @@ export type AppListUpdatedNotification = { data: Array<AppInfo>, };
 import type { AppReview } from "./AppReview";
 import type { AppScreenshot } from "./AppScreenshot";
 
-export type AppMetadata = { review: AppReview | null, categories: Array<string> | null, subCategories: Array<string> | null, seoDescription: string | null, screenshots: Array<AppScreenshot> | null, developer: string | null, version: string | null, versionId: string | null, versionNotes: string | null, firstPartyType: string | null, firstPartyRequiresInstall: boolean | null, showInComposerWhenUnlinked: boolean | null, };
+export type AppMetadata = { review: AppReview | null, categories: Array<string> | null, subCategories: Array<string> | null, seoDescription: string | null, screenshots: Array<AppScreenshot> | null, developer: string | null, version: string | null, versionId: string | null, versionNotes: string | null, firstPartyRequiresInstall: boolean | null, showInComposerWhenUnlinked: boolean | null, };
 
 // v2/AppReview.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -1619,7 +1698,7 @@ export type AppToolApproval = "auto" | "prompt" | "writes" | "approve";
 /**
  * EXPERIMENTAL - metadata returned by app/read.
  */
-export type AppToolSummary = { name: string, title: string | null, description: string, };
+export type AppToolSummary = { name: string, title: string | null, description: string, isEnabled: boolean, disabledReason: string | null, isReadOnly: boolean, };
 
 // v2/AppToolsConfig.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -1750,6 +1829,10 @@ export type AppsReadParams = {
  */
 appIds: Array<string>,
 /**
+ * Optional loaded thread id used to evaluate effective app configuration.
+ */
+threadId?: string | null,
+/**
  * When true, include display-only public tool summaries in the returned metadata.
  */
 includeTools?: boolean, };
@@ -1799,6 +1882,105 @@ token: string, };
  * [UNSTABLE] Source that produced a terminal approval auto-review decision.
  */
 export type AutoReviewDecisionSource = "agent";
+
+// v2/AutoReviewRequirements.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type AutoReviewRequirements = { requiredOnModels: Array<string> | null, ignoreRules: Array<string> | null, };
+
+// v2/AwsCredentialType.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type AwsCredentialType = "accessKeys" | "bedrockApiKey";
+
+// v2/BedrockAwsProfile.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type BedrockAwsProfile = { name: string, region: string | null, };
+
+// v2/BedrockDiscoverParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type BedrockDiscoverParams = Record<string, never>;
+
+// v2/BedrockDiscoverResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { BedrockAwsProfile } from "./BedrockAwsProfile";
+import type { BedrockEnvironmentCredential } from "./BedrockEnvironmentCredential";
+
+export type BedrockDiscoverResponse = { profiles: Array<BedrockAwsProfile>, environmentCredentials: Array<BedrockEnvironmentCredential>, };
+
+// v2/BedrockEnvironmentCredential.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { AwsCredentialType } from "./AwsCredentialType";
+
+export type BedrockEnvironmentCredential = { type: AwsCredentialType, region: string | null, };
+
+// v2/BedrockSetupParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type BedrockSetupParams = { "type": "profile", profile: string, region: string, } | { "type": "environment", region: string, };
+
+// v2/BedrockSetupResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type BedrockSetupResponse = Record<string, never>;
+
+// v2/BrowserUseAccessApprovalLifetime.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type BrowserUseAccessApprovalLifetime = "turn" | "thread";
+
+// v2/BrowserUseConfig.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { BrowserUseOriginPolicyConfig } from "./BrowserUseOriginPolicyConfig";
+
+export type BrowserUseConfig = { allow_history_access: boolean | null, default_origin_policy: BrowserUseOriginPolicyConfig | null, origins: { [key in string]?: BrowserUseOriginPolicyConfig } | null, };
+
+// v2/BrowserUseOriginPolicy.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { AllowDenyRequirement } from "./AllowDenyRequirement";
+import type { BrowserUseAccessApprovalLifetime } from "./BrowserUseAccessApprovalLifetime";
+
+export type BrowserUseOriginPolicy = { access: AllowDenyRequirement | null, downloads: AllowDenyRequirement | null, uploads: AllowDenyRequirement | null, fullCdpAccess: AllowDenyRequirement | null, autoReview: AllowDenyRequirement | null, persistentApproval: boolean | null, accessApprovalLifetime: BrowserUseAccessApprovalLifetime | null, };
+
+// v2/BrowserUseOriginPolicyConfig.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { AllowDenyRequirement } from "./AllowDenyRequirement";
+
+export type BrowserUseOriginPolicyConfig = { access: AllowDenyRequirement | null, downloads: AllowDenyRequirement | null, uploads: AllowDenyRequirement | null, full_cdp_access: AllowDenyRequirement | null, };
+
+// v2/BrowserUseRequirements.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { BrowserUseOriginPolicy } from "./BrowserUseOriginPolicy";
+
+export type BrowserUseRequirements = { allowHistoryAccess: boolean | null, disableAutoReview: boolean | null, allowGlobalPersistentApproval: boolean | null, defaultOriginPolicy: BrowserUseOriginPolicy | null, origins: { [key in string]?: BrowserUseOriginPolicy } | null, };
 
 // v2/ByteRange.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -1875,6 +2057,13 @@ export type ChatgptAuthTokensRefreshReason = "unauthorized";
 
 export type ChatgptAuthTokensRefreshResponse = { accessToken: string, chatgptAccountId: string, chatgptPlanType: string | null, };
 
+// v2/CliAuthCredentialsStoreMode.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type CliAuthCredentialsStoreMode = "file" | "keyring" | "auto" | "ephemeral";
+
 // v2/CodexErrorInfo.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
@@ -1887,7 +2076,7 @@ import type { NonSteerableTurnKind } from "./NonSteerableTurnKind";
  * When an upstream HTTP status is available (for example, from the Responses API or a provider),
  * it is forwarded in `httpStatusCode` on the relevant `codexErrorInfo` variant.
  */
-export type CodexErrorInfo = "contextWindowExceeded" | "sessionBudgetExceeded" | "usageLimitExceeded" | "serverOverloaded" | "cyberPolicy" | { "httpConnectionFailed": { httpStatusCode: number | null, } } | { "responseStreamConnectionFailed": { httpStatusCode: number | null, } } | "internalServerError" | "unauthorized" | "badRequest" | "threadRollbackFailed" | "sandboxError" | { "responseStreamDisconnected": { httpStatusCode: number | null, } } | { "responseTooManyFailedAttempts": { httpStatusCode: number | null, } } | { "activeTurnNotSteerable": { turnKind: NonSteerableTurnKind, } } | "other";
+export type CodexErrorInfo = "contextWindowExceeded" | "sessionBudgetExceeded" | "usageLimitExceeded" | "serverOverloaded" | "cyberPolicy" | "misalignmentPolicyViolation" | { "httpConnectionFailed": { httpStatusCode: number | null, } } | { "responseStreamConnectionFailed": { httpStatusCode: number | null, } } | "internalServerError" | "unauthorized" | "badRequest" | "threadRollbackFailed" | "sandboxError" | { "responseStreamDisconnected": { httpStatusCode: number | null, } } | { "responseTooManyFailedAttempts": { httpStatusCode: number | null, } } | { "activeTurnNotSteerable": { turnKind: NonSteerableTurnKind, } } | "other";
 
 // v2/CollabAgentState.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -1909,14 +2098,14 @@ export type CollabAgentStatus = "pendingInit" | "running" | "interrupted" | "com
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
-export type CollabAgentTool = "spawnAgent" | "sendInput" | "resumeAgent" | "wait" | "closeAgent";
+export type CollabAgentTool = "spawnAgent" | "sendInput" | "resumeAgent" | "wait" | "closeAgent" | "sendMessage" | "followupTask" | "interruptAgent" | "listAgents";
 
 // v2/CollabAgentToolCallStatus.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
-export type CollabAgentToolCallStatus = "inProgress" | "completed" | "failed";
+export type CollabAgentToolCallStatus = "inProgress" | "completed" | "failed" | "interrupted";
 
 // v2/CollaborationModeListParams.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -1955,9 +2144,9 @@ export type CollaborationModeMask = { name: string, mode: ModeKind | null, model
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
-import type { AbsolutePathBuf } from "../AbsolutePathBuf";
+import type { LegacyAppPathString } from "../LegacyAppPathString";
 
-export type CommandAction = { "type": "read", command: string, name: string, path: AbsolutePathBuf, } | { "type": "listFiles", command: string, path: string | null, } | { "type": "search", command: string, query: string | null, path: string | null, } | { "type": "unknown", command: string, };
+export type CommandAction = { "type": "read", command: string, name: string, path: LegacyAppPathString, } | { "type": "listFiles", command: string, path: string | null, } | { "type": "search", command: string, query: string | null, path: string | null, } | { "type": "unknown", command: string, };
 
 // v2/CommandExecOutputDeltaNotification.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -2250,6 +2439,16 @@ import type { NetworkPolicyAmendment } from "./NetworkPolicyAmendment";
 
 export type CommandExecutionApprovalDecision = "accept" | "acceptForSession" | { "acceptWithExecpolicyAmendment": { execpolicy_amendment: ExecPolicyAmendment, } } | { "applyNetworkPolicyAmendment": { network_policy_amendment: NetworkPolicyAmendment, } } | "decline" | "cancel";
 
+// v2/CommandExecutionApprovalKind.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * Distinguishes a command approval from input sent to an existing terminal.
+ */
+export type CommandExecutionApprovalKind = "command" | "writeStdin";
+
 // v2/CommandExecutionOutputDeltaNotification.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
@@ -2265,11 +2464,16 @@ import type { LegacyAppPathString } from "../LegacyAppPathString";
 import type { AdditionalPermissionProfile } from "./AdditionalPermissionProfile";
 import type { CommandAction } from "./CommandAction";
 import type { CommandExecutionApprovalDecision } from "./CommandExecutionApprovalDecision";
+import type { CommandExecutionApprovalKind } from "./CommandExecutionApprovalKind";
 import type { ExecPolicyAmendment } from "./ExecPolicyAmendment";
 import type { NetworkApprovalContext } from "./NetworkApprovalContext";
 import type { NetworkPolicyAmendment } from "./NetworkPolicyAmendment";
 
-export type CommandExecutionRequestApprovalParams = { threadId: string, turnId: string, itemId: string,
+export type CommandExecutionRequestApprovalParams = {
+/**
+ * Kind of action under review. Defaults to `command` for older servers.
+ */
+kind: CommandExecutionApprovalKind, threadId: string, turnId: string, itemId: string,
 /**
  * Unix timestamp (in milliseconds) when this approval request started.
  */
@@ -2282,6 +2486,7 @@ startedAtMs: number,
  * For zsh-exec-bridge subcommand approvals, multiple callbacks can belong to
  * one parent `itemId`, so `approvalId` is a distinct opaque callback id
  * (a UUID) used to disambiguate routing.
+ * Stdin approvals also use a distinct callback id; inspect `kind` to distinguish them.
  */
 approvalId?: string | null,
 /**
@@ -2354,12 +2559,75 @@ export type CommandExecutionStatus = "inProgress" | "completed" | "failed" | "de
 
 export type CommandMigration = { name: string, };
 
+// v2/ComputerUseConfig.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { AllowDenyRequirement } from "./AllowDenyRequirement";
+import type { ComputerUseMacosConfig } from "./ComputerUseMacosConfig";
+import type { ComputerUseWindowsConfig } from "./ComputerUseWindowsConfig";
+
+export type ComputerUseConfig = { default_app_access: AllowDenyRequirement | null, macos: ComputerUseMacosConfig | null, windows: ComputerUseWindowsConfig | null, };
+
+// v2/ComputerUseMacosConfig.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { AllowDenyRequirement } from "./AllowDenyRequirement";
+
+export type ComputerUseMacosConfig = { bundle_ids: { [key in string]?: AllowDenyRequirement } | null, };
+
+// v2/ComputerUseMacosRequirements.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { AllowDenyRequirement } from "./AllowDenyRequirement";
+
+export type ComputerUseMacosRequirements = { bundleIds: { [key in string]?: AllowDenyRequirement } | null, };
+
 // v2/ComputerUseRequirements.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { AllowDenyRequirement } from "./AllowDenyRequirement";
+import type { ComputerUseMacosRequirements } from "./ComputerUseMacosRequirements";
+import type { ComputerUseWindowsRequirements } from "./ComputerUseWindowsRequirements";
 
-export type ComputerUseRequirements = { allowLockedComputerUse: boolean | null, };
+export type ComputerUseRequirements = { allowLockedComputerUse: boolean | null, allowPersistentApproval: boolean | null, defaultAppAccess: AllowDenyRequirement | null, macos: ComputerUseMacosRequirements | null, windows: ComputerUseWindowsRequirements | null, };
+
+// v2/ComputerUseWindowsConfig.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { AllowDenyRequirement } from "./AllowDenyRequirement";
+import type { ComputerUseWindowsExeConfig } from "./ComputerUseWindowsExeConfig";
+
+export type ComputerUseWindowsConfig = { aumids: { [key in string]?: AllowDenyRequirement } | null, exes: Array<ComputerUseWindowsExeConfig> | null, };
+
+// v2/ComputerUseWindowsExeConfig.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { AllowDenyRequirement } from "./AllowDenyRequirement";
+
+export type ComputerUseWindowsExeConfig = { publisher_name: string, product_name: string, binary_name: string | null, access: AllowDenyRequirement, };
+
+// v2/ComputerUseWindowsExeRequirement.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { AllowDenyRequirement } from "./AllowDenyRequirement";
+
+export type ComputerUseWindowsExeRequirement = { publisherName: string, productName: string, binaryName: string | null, access: AllowDenyRequirement, };
+
+// v2/ComputerUseWindowsRequirements.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { AllowDenyRequirement } from "./AllowDenyRequirement";
+import type { ComputerUseWindowsExeRequirement } from "./ComputerUseWindowsExeRequirement";
+
+export type ComputerUseWindowsRequirements = { aumids: { [key in string]?: AllowDenyRequirement } | null, exes: Array<ComputerUseWindowsExeRequirement> | null, };
 
 // v2/Config.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -2376,6 +2644,8 @@ import type { AnalyticsConfig } from "./AnalyticsConfig";
 import type { ApprovalsReviewer } from "./ApprovalsReviewer";
 import type { AppsConfig } from "./AppsConfig";
 import type { AskForApproval } from "./AskForApproval";
+import type { BrowserUseConfig } from "./BrowserUseConfig";
+import type { ComputerUseConfig } from "./ComputerUseConfig";
 import type { ForcedChatgptWorkspaceIds } from "./ForcedChatgptWorkspaceIds";
 import type { SandboxMode } from "./SandboxMode";
 import type { SandboxWorkspaceWrite } from "./SandboxWorkspaceWrite";
@@ -2386,7 +2656,7 @@ export type Config = { model: string | null, review_model: string | null, model_
  * [UNSTABLE] Optional default for where approval requests are routed for
  * review.
  */
-approvals_reviewer: ApprovalsReviewer | null, sandbox_mode: SandboxMode | null, sandbox_workspace_write: SandboxWorkspaceWrite | null, forced_chatgpt_workspace_id: ForcedChatgptWorkspaceIds | null, forced_login_method: ForcedLoginMethod | null, web_search: WebSearchMode | null, tools: ToolsV2 | null, instructions: string | null, developer_instructions: string | null, compact_prompt: string | null, model_reasoning_effort: ReasoningEffort | null, model_reasoning_summary: ReasoningSummary | null, model_verbosity: Verbosity | null, service_tier: string | null, analytics: AnalyticsConfig | null, apps: AppsConfig | null, desktop: { [key in string]?: JsonValue } | null, } & ({ [key in string]?: number | string | boolean | Array<JsonValue> | { [key in string]?: JsonValue } | null });
+approvals_reviewer: ApprovalsReviewer | null, sandbox_mode: SandboxMode | null, sandbox_workspace_write: SandboxWorkspaceWrite | null, forced_chatgpt_workspace_id: ForcedChatgptWorkspaceIds | null, forced_login_method: ForcedLoginMethod | null, web_search: WebSearchMode | null, tools: ToolsV2 | null, instructions: string | null, developer_instructions: string | null, compact_prompt: string | null, model_reasoning_effort: ReasoningEffort | null, model_reasoning_summary: ReasoningSummary | null, model_verbosity: Verbosity | null, service_tier: string | null, analytics: AnalyticsConfig | null, apps: AppsConfig | null, browser_use: BrowserUseConfig | null, computer_use: ComputerUseConfig | null, desktop: { [key in string]?: JsonValue } | null, } & ({ [key in string]?: number | string | boolean | Array<JsonValue> | { [key in string]?: JsonValue } | null });
 
 // v2/ConfigBatchWriteParams.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -2400,7 +2670,9 @@ export type ConfigBatchWriteParams = { edits: Array<ConfigEdit>,
  */
 filePath?: string | null, expectedVersion?: string | null,
 /**
- * When true, hot-reload the updated user config into all loaded threads after writing.
+ * When true, hot-reload updated runtime settings into loaded threads after writing.
+ * Session-static model, reasoning-effort, Plan-mode reasoning-effort, service-tier, and
+ * personality defaults are not reloaded.
  */
 reloadUserConfig?: boolean, };
 
@@ -2436,7 +2708,11 @@ export type ConfigLayerMetadata = { name: ConfigLayerSource, version: string, };
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 import type { AbsolutePathBuf } from "../AbsolutePathBuf";
 
-export type ConfigLayerSource = { "type": "mdm", domain: string, key: string, } | { "type": "system",
+export type ConfigLayerSource = { "type": "packagedDefaults",
+/**
+ * Path to the packaged default configuration file.
+ */
+file: AbsolutePathBuf, } | { "type": "mdm", domain: string, key: string, } | { "type": "system",
 /**
  * This is the path to the system config.toml file, though it is not
  * guaranteed to exist.
@@ -2490,10 +2766,16 @@ export type ConfigReadResponse = { config: Config, origins: { [key in string]?: 
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { PathUri } from "../PathUri";
 import type { WebSearchMode } from "../WebSearchMode";
 import type { ApprovalsReviewer } from "./ApprovalsReviewer";
 import type { AskForApproval } from "./AskForApproval";
+import type { AutoReviewRequirements } from "./AutoReviewRequirements";
+import type { BrowserUseRequirements } from "./BrowserUseRequirements";
+import type { CliAuthCredentialsStoreMode } from "./CliAuthCredentialsStoreMode";
 import type { ComputerUseRequirements } from "./ComputerUseRequirements";
+import type { FeedbackRequirements } from "./FeedbackRequirements";
+import type { InAppBrowserRequirements } from "./InAppBrowserRequirements";
 import type { ManagedHooksRequirements } from "./ManagedHooksRequirements";
 import type { ModelsRequirements } from "./ModelsRequirements";
 import type { NetworkRequirements } from "./NetworkRequirements";
@@ -2501,7 +2783,7 @@ import type { ResidencyRequirement } from "./ResidencyRequirement";
 import type { SandboxMode } from "./SandboxMode";
 import type { WindowsSandboxSetupMode } from "./WindowsSandboxSetupMode";
 
-export type ConfigRequirements = { allowedApprovalPolicies: Array<AskForApproval> | null, allowedApprovalsReviewers: Array<ApprovalsReviewer> | null, allowedSandboxModes: Array<SandboxMode> | null, allowedWindowsSandboxImplementations: Array<WindowsSandboxSetupMode> | null, allowedPermissionProfiles: { [key in string]?: boolean } | null, defaultPermissions: string | null, allowedWebSearchModes: Array<WebSearchMode> | null, allowManagedHooksOnly: boolean | null, allowAppshots: boolean | null, allowRemoteControl: boolean | null, computerUse: ComputerUseRequirements | null, featureRequirements: { [key in string]?: boolean } | null, hooks: ManagedHooksRequirements | null, enforceResidency: ResidencyRequirement | null, network: NetworkRequirements | null, models: ModelsRequirements | null, };
+export type ConfigRequirements = { cliAuthCredentialsStore: CliAuthCredentialsStoreMode | null, chatgptBaseUrl: string | null, additionalDeveloperInstructions: string | null, allowedApprovalPolicies: Array<AskForApproval> | null, allowedApprovalsReviewers: Array<ApprovalsReviewer> | null, allowedSandboxModes: Array<SandboxMode> | null, allowedWindowsSandboxImplementations: Array<WindowsSandboxSetupMode> | null, allowedPermissionProfiles: { [key in string]?: boolean } | null, defaultPermissions: string | null, allowedWebSearchModes: Array<WebSearchMode> | null, allowManagedHooksOnly: boolean | null, allowBrowserAndComputerUse: boolean | null, allowAppshots: boolean | null, allowRemoteControl: boolean | null, computerUse: ComputerUseRequirements | null, browserUse: BrowserUseRequirements | null, inAppBrowser: InAppBrowserRequirements | null, featureRequirements: { [key in string]?: boolean } | null, hooks: ManagedHooksRequirements | null, enforceResidency: ResidencyRequirement | null, network: NetworkRequirements | null, autoReview: AutoReviewRequirements | null, models: ModelsRequirements | null, sqliteHome: PathUri | null, logDir: PathUri | null, modelCatalogJson: PathUri | null, checkForUpdateOnStartup: boolean | null, allowLoginShell: boolean | null, feedback: FeedbackRequirements | null, windowsSandboxPrivateDesktop: boolean | null, };
 
 // v2/ConfigRequirementsReadResponse.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -2570,6 +2852,7 @@ filePath: AbsolutePathBuf, overriddenMetadata: OverriddenMetadata | null, };
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { JsonValue } from "../serde_json/JsonValue";
 
 export type ConfiguredHookHandler = { "type": "command", command: string, commandWindows: string | null, timeoutSec: bigint | null, async: boolean, statusMessage: string | null,
 /**
@@ -2578,7 +2861,7 @@ export type ConfiguredHookHandler = { "type": "command", command: string, comman
  * evaluated against the original context; a spilled preview also includes recovery
  * metadata.
  */
-additionalContextLimit: number | null, } | { "type": "prompt", } | { "type": "agent", };
+additionalContextLimit: number | null, } | { "type": "mcp_tool", server: string, tool: string, input: { [key in string]?: JsonValue }, timeoutSec: bigint | null, statusMessage: string | null, } | { "type": "prompt", } | { "type": "agent", };
 
 // v2/ConfiguredHookMatcherGroup.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -2680,6 +2963,13 @@ summary: string,
  * Optional extra guidance, such as migration steps or rationale.
  */
 details: string | null, };
+
+// v2/DesktopOnboardingEntrypoint.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type DesktopOnboardingEntrypoint = "life_sciences";
 
 // v2/DynamicToolCallOutputContentItem.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -2985,6 +3275,14 @@ includeHome?: boolean,
  */
 cwds?: Array<string> | null,
 /**
+ * Maximum age in days for detected sessions. Missing values use the default limit.
+ */
+maxSessionAgeDays?: number | null,
+/**
+ * Maximum number of sessions to detect. Missing values use the default limit.
+ */
+maxSessions?: number | null,
+/**
  * Deprecated field retained for compatibility. This field is ignored; use `migrationSource`
  * to select the migration source.
  */
@@ -2999,8 +3297,9 @@ migrationSource?: string | null, };
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 import type { ExternalAgentConfigMigrationItem } from "./ExternalAgentConfigMigrationItem";
+import type { ExternalAgentDetectedConnectorCandidate } from "./ExternalAgentDetectedConnectorCandidate";
 
-export type ExternalAgentConfigDetectResponse = { items: Array<ExternalAgentConfigMigrationItem>, };
+export type ExternalAgentConfigDetectResponse = { items: Array<ExternalAgentConfigMigrationItem>, connectors: Array<ExternalAgentDetectedConnectorCandidate>, };
 
 // v2/ExternalAgentConfigImportCompletedNotification.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -3026,7 +3325,52 @@ export type ExternalAgentConfigImportHistoriesReadResponse = { data: Array<Exter
 import type { ExternalAgentConfigImportItemTypeFailure } from "./ExternalAgentConfigImportItemTypeFailure";
 import type { ExternalAgentConfigImportItemTypeSuccess } from "./ExternalAgentConfigImportItemTypeSuccess";
 
-export type ExternalAgentConfigImportHistory = { importId: string, completedAtMs: bigint, successes: Array<ExternalAgentConfigImportItemTypeSuccess>, failures: Array<ExternalAgentConfigImportItemTypeFailure>, };
+export type ExternalAgentConfigImportHistory = { importId: string, providerId: string | null, completedAtMs: bigint, successes: Array<ExternalAgentConfigImportItemTypeSuccess>, failures: Array<ExternalAgentConfigImportItemTypeFailure>, };
+
+// v2/ExternalAgentConfigImportHistoryRecordParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ExternalAgentConfigImportHistoryRecordTypeResultParams } from "./ExternalAgentConfigImportHistoryRecordTypeResultParams";
+
+export type ExternalAgentConfigImportHistoryRecordParams = {
+/**
+ * Opaque provider identifier for the externally completed import.
+ */
+providerId: string,
+/**
+ * Completed results grouped by imported item type.
+ */
+itemTypeResults: Array<ExternalAgentConfigImportHistoryRecordTypeResultParams>, };
+
+// v2/ExternalAgentConfigImportHistoryRecordResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ExternalAgentConfigImportHistoryRecordResponse = { importId: string, };
+
+// v2/ExternalAgentConfigImportHistoryRecordSuccessParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ExternalAgentConfigMigrationItemType } from "./ExternalAgentConfigMigrationItemType";
+
+export type ExternalAgentConfigImportHistoryRecordSuccessParams = { itemType: ExternalAgentConfigMigrationItemType, cwd: string | null, source: string | null, target: string | null,
+/**
+ * Original title for an imported session, when available.
+ */
+title?: string | null, };
+
+// v2/ExternalAgentConfigImportHistoryRecordTypeResultParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ExternalAgentConfigImportHistoryRecordSuccessParams } from "./ExternalAgentConfigImportHistoryRecordSuccessParams";
+import type { ExternalAgentConfigImportItemTypeFailure } from "./ExternalAgentConfigImportItemTypeFailure";
+import type { ExternalAgentConfigMigrationItemType } from "./ExternalAgentConfigMigrationItemType";
+
+export type ExternalAgentConfigImportHistoryRecordTypeResultParams = { itemType: ExternalAgentConfigMigrationItemType, successes: Array<ExternalAgentConfigImportHistoryRecordSuccessParams>, failures: Array<ExternalAgentConfigImportItemTypeFailure>, };
 
 // v2/ExternalAgentConfigImportItemTypeFailure.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -3042,7 +3386,11 @@ export type ExternalAgentConfigImportItemTypeFailure = { itemType: ExternalAgent
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 import type { ExternalAgentConfigMigrationItemType } from "./ExternalAgentConfigMigrationItemType";
 
-export type ExternalAgentConfigImportItemTypeSuccess = { itemType: ExternalAgentConfigMigrationItemType, cwd: string | null, source: string | null, target: string | null, };
+export type ExternalAgentConfigImportItemTypeSuccess = { itemType: ExternalAgentConfigMigrationItemType, cwd: string | null, source: string | null, target: string | null,
+/**
+ * Original title for an imported session; null for other item types.
+ */
+title: string | null, };
 
 // v2/ExternalAgentConfigImportParams.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -3055,6 +3403,11 @@ export type ExternalAgentConfigImportParams = { migrationItems: Array<ExternalAg
  * Optional identifier for the product that initiated the import.
  */
 source?: string | null,
+/**
+ * Opaque provider identifier supplied by the caller for analytics attribution and import
+ * history display. This does not select the migration source.
+ */
+providerId?: string | null,
 /**
  * Migration-source selector used to produce the migration items. Pass the same value to
  * detection and import; missing or unrecognized values use the default source.
@@ -3106,6 +3459,21 @@ cwd: string | null, details: MigrationDetails | null, };
 
 export type ExternalAgentConfigMigrationItemType = "AGENTS_MD" | "CONFIG" | "SKILLS" | "PLUGINS" | "MCP_SERVER_CONFIG" | "SUBAGENTS" | "HOOKS" | "COMMANDS" | "MEMORY" | "SESSIONS";
 
+// v2/ExternalAgentDetectedConnectorCandidate.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ExternalAgentDetectedConnectorSource } from "./ExternalAgentDetectedConnectorSource";
+
+export type ExternalAgentDetectedConnectorCandidate = { name: string, sessionCount: number, source: ExternalAgentDetectedConnectorSource, };
+
+// v2/ExternalAgentDetectedConnectorSource.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ExternalAgentDetectedConnectorSource = "remoteMcpServersConfig" | "sessionToolUse";
+
 // v2/ExternalAgentImportedConnectorCandidate.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
@@ -3120,6 +3488,13 @@ export type ExternalAgentImportedConnectorCandidate = { name: string, sessionCou
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
 export type ExternalAgentImportedConnectorSource = "remoteMcpServersConfig";
+
+// v2/FeedbackRequirements.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type FeedbackRequirements = { enabled: boolean | null, };
 
 // v2/FeedbackUploadParams.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -3608,14 +3983,30 @@ import type { Account } from "./Account";
 
 export type GetAccountResponse = { account: Account | null, requiresOpenaiAuth: boolean, };
 
+// v2/GetAccountTokenUsageParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type GetAccountTokenUsageParams = {
+/**
+ * When present, read estimated usage for this thread instead of account-wide token activity.
+ */
+threadId?: string | null, };
+
 // v2/GetAccountTokenUsageResponse.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 import type { AccountTokenUsageDailyBucket } from "./AccountTokenUsageDailyBucket";
 import type { AccountTokenUsageSummary } from "./AccountTokenUsageSummary";
+import type { ThreadUsage } from "./ThreadUsage";
 
-export type GetAccountTokenUsageResponse = { summary: AccountTokenUsageSummary, dailyUsageBuckets: Array<AccountTokenUsageDailyBucket> | null, };
+export type GetAccountTokenUsageResponse = { summary: AccountTokenUsageSummary, dailyUsageBuckets: Array<AccountTokenUsageDailyBucket> | null,
+/**
+ * Estimated usage when a thread was requested and its billing route is available.
+ */
+threadUsage?: ThreadUsage | null, };
 
 // v2/GetWorkspaceMessagesResponse.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -3669,11 +4060,12 @@ export type GuardianApprovalReview = { status: GuardianApprovalReviewStatus, ris
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 import type { AbsolutePathBuf } from "../AbsolutePathBuf";
+import type { LegacyAppPathString } from "../LegacyAppPathString";
 import type { GuardianCommandSource } from "./GuardianCommandSource";
 import type { NetworkApprovalProtocol } from "./NetworkApprovalProtocol";
 import type { RequestPermissionProfile } from "./RequestPermissionProfile";
 
-export type GuardianApprovalReviewAction = { "type": "command", source: GuardianCommandSource, command: string, cwd: AbsolutePathBuf, } | { "type": "execve", source: GuardianCommandSource, program: string, argv: Array<string>, cwd: AbsolutePathBuf, } | { "type": "applyPatch", cwd: AbsolutePathBuf, files: Array<AbsolutePathBuf>, } | { "type": "networkAccess", target: string, host: string, protocol: NetworkApprovalProtocol, port: number, } | { "type": "mcpToolCall", server: string, toolName: string, connectorId: string | null, connectorName: string | null, toolTitle: string | null, } | { "type": "requestPermissions", reason: string | null, permissions: RequestPermissionProfile, };
+export type GuardianApprovalReviewAction = { "type": "command", source: GuardianCommandSource, command: string, cwd: AbsolutePathBuf, } | { "type": "execve", source: GuardianCommandSource, program: string, argv: Array<string>, cwd: AbsolutePathBuf, } | { "type": "writeStdin", approvalId: string, processId: string, stdin: string, cwd: LegacyAppPathString, } | { "type": "applyPatch", cwd: AbsolutePathBuf, files: Array<AbsolutePathBuf>, } | { "type": "networkAccess", target: string, host: string, protocol: NetworkApprovalProtocol, port: number, } | { "type": "mcpToolCall", server: string, toolName: string, connectorId: string | null, connectorName: string | null, toolTitle: string | null, } | { "type": "requestPermissions", reason: string | null, permissions: RequestPermissionProfile, };
 
 // v2/GuardianApprovalReviewStatus.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -3747,7 +4139,7 @@ export type HookErrorInfo = { path: string, message: string, };
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
-export type HookEventName = "preToolUse" | "permissionRequest" | "postToolUse" | "preCompact" | "postCompact" | "sessionStart" | "sessionEnd" | "userPromptSubmit" | "subagentStart" | "subagentStop" | "stop";
+export type HookEventName = "preToolUse" | "permissionRequest" | "postToolUse" | "preCompact" | "postCompact" | "sessionStart" | "sessionEnd" | "userPromptSubmit" | "subagentStart" | "subagentStop" | "stop" | "interrupt";
 
 // v2/HookExecutionMode.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -3761,7 +4153,7 @@ export type HookExecutionMode = "sync" | "async";
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
-export type HookHandlerType = "command" | "prompt" | "agent";
+export type HookHandlerType = "command" | "mcpTool" | "prompt" | "agent";
 
 // v2/HookMetadata.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -3769,16 +4161,15 @@ export type HookHandlerType = "command" | "prompt" | "agent";
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 import type { AbsolutePathBuf } from "../AbsolutePathBuf";
 import type { HookEventName } from "./HookEventName";
-import type { HookHandlerType } from "./HookHandlerType";
 import type { HookSource } from "./HookSource";
 import type { HookTrustStatus } from "./HookTrustStatus";
 
-export type HookMetadata = { key: string, eventName: HookEventName, handlerType: HookHandlerType, matcher: string | null, command: string | null, timeoutSec: bigint, statusMessage: string | null,
+export type HookMetadata = { key: string, eventName: HookEventName, matcher: string | null, timeoutSec: bigint, statusMessage: string | null,
 /**
  * Configured `additionalContext` spill threshold.
  * `null` uses 2,500 tokens; `0` disables spilling.
  */
-additionalContextLimit: number | null, sourcePath: AbsolutePathBuf, source: HookSource, pluginId: string | null, displayOrder: bigint, enabled: boolean, isManaged: boolean, currentHash: string, trustStatus: HookTrustStatus, };
+additionalContextLimit: number | null, sourcePath: AbsolutePathBuf, source: HookSource, pluginId: string | null, displayOrder: bigint, enabled: boolean, isManaged: boolean, currentHash: string, trustStatus: HookTrustStatus, } & ({ "handlerType": "command", command: string, async: boolean, } | { "handlerType": "mcpTool", server: string, tool: string, } | { "handlerType": "prompt", } | { "handlerType": "agent", });
 
 // v2/HookMigration.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -3888,6 +4279,13 @@ import type { HooksListEntry } from "./HooksListEntry";
 
 export type HooksListResponse = { data: Array<HooksListEntry>, };
 
+// v2/InAppBrowserRequirements.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type InAppBrowserRequirements = { allowExternalBrowserSettingsImport: boolean | null, };
+
 // v2/InstalledApp.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
@@ -3956,6 +4354,8 @@ reviewId: string,
  * In most cases, one review maps to one target item. The exceptions are
  * - execve reviews, where a single command may contain multiple execve
  *   calls to review (only possible when using the shell_zsh_fork feature)
+ * - stdin reviews, which refer to the existing parent command item and
+ *   have a separate approval ID in the action payload
  * - network policy reviews, where there is no target item
  *
  * A network call is triggered by a CommandExecution item, so having a
@@ -3991,6 +4391,8 @@ reviewId: string,
  * In most cases, one review maps to one target item. The exceptions are
  * - execve reviews, where a single command may contain multiple execve
  *   calls to review (only possible when using the shell_zsh_fork feature)
+ * - stdin reviews, which refer to the existing parent command item and
+ *   have a separate approval ID in the action payload
  * - network policy reviews, where there is no target item
  *
  * A network call is triggered by a CommandExecution item, so having a
@@ -4068,7 +4470,7 @@ chatgptAccountId: string,
  * When `null`, Codex attempts to derive the plan type from access-token
  * claims. If unavailable, the plan defaults to `unknown`.
  */
-chatgptPlanType?: string | null, } | { "type": "amazonBedrock", apiKey: string, region: string, };
+chatgptPlanType?: string | null, } | { "type": "amazonBedrock", apiKey: string, region: string, } | { "type": "amazonBedrockAccessKeys", accessKeyId: string, secretAccessKey: string, sessionToken?: string | null, region: string, };
 
 // v2/LoginAccountResponse.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -4109,7 +4511,7 @@ export type LogoutAccountResponse = Record<string, never>;
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 import type { ConfiguredHookMatcherGroup } from "./ConfiguredHookMatcherGroup";
 
-export type ManagedHooksRequirements = { managedDir: string | null, windowsManagedDir: string | null, PreToolUse: Array<ConfiguredHookMatcherGroup>, PermissionRequest: Array<ConfiguredHookMatcherGroup>, PostToolUse: Array<ConfiguredHookMatcherGroup>, PreCompact: Array<ConfiguredHookMatcherGroup>, PostCompact: Array<ConfiguredHookMatcherGroup>, SessionStart: Array<ConfiguredHookMatcherGroup>, SessionEnd: Array<ConfiguredHookMatcherGroup>, UserPromptSubmit: Array<ConfiguredHookMatcherGroup>, SubagentStart: Array<ConfiguredHookMatcherGroup>, SubagentStop: Array<ConfiguredHookMatcherGroup>, Stop: Array<ConfiguredHookMatcherGroup>, };
+export type ManagedHooksRequirements = { managedDir: string | null, windowsManagedDir: string | null, PreToolUse: Array<ConfiguredHookMatcherGroup>, PermissionRequest: Array<ConfiguredHookMatcherGroup>, PostToolUse: Array<ConfiguredHookMatcherGroup>, PreCompact: Array<ConfiguredHookMatcherGroup>, PostCompact: Array<ConfiguredHookMatcherGroup>, SessionStart: Array<ConfiguredHookMatcherGroup>, SessionEnd: Array<ConfiguredHookMatcherGroup>, UserPromptSubmit: Array<ConfiguredHookMatcherGroup>, SubagentStart: Array<ConfiguredHookMatcherGroup>, SubagentStop: Array<ConfiguredHookMatcherGroup>, Stop: Array<ConfiguredHookMatcherGroup>, Interrupt: Array<ConfiguredHookMatcherGroup>, };
 
 // v2/MarketplaceAddParams.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -4184,7 +4586,7 @@ export type MarketplaceUpgradeResponse = { selectedMarketplaces: Array<string>, 
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
-export type McpAuthStatus = "unsupported" | "notLoggedIn" | "bearerToken" | "oAuth";
+export type McpAuthStatus = "unknown" | "unsupported" | "notLoggedIn" | "bearerToken" | "oAuth";
 
 // v2/McpElicitationArrayType.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -4378,7 +4780,11 @@ export type McpElicitationUntitledSingleSelectEnumSchema = { type: McpElicitatio
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
-export type McpResourceReadParams = { threadId?: string | null, server: string, uri: string, };
+export type McpResourceReadParams = { threadId?: string | null,
+/**
+ * Originating MCP tool call used to select the resource's app.
+ */
+originCallId?: string | null, server: string, uri: string, connectorId?: string | null, };
 
 // v2/McpResourceReadResponse.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -4386,7 +4792,18 @@ export type McpResourceReadParams = { threadId?: string | null, server: string, 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 import type { ResourceContent } from "../ResourceContent";
 
-export type McpResourceReadResponse = { contents: Array<ResourceContent>, };
+export type McpResourceReadResponse = { contents: Array<ResourceContent>,
+/**
+ * Originating call when the server applied app-specific resource scoping.
+ */
+originCallId: string | null, };
+
+// v2/McpServerConnectionStatus.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type McpServerConnectionStatus = "notStarted" | "starting" | "connected" | "authenticationRequired" | "failed" | "cancelled" | "disabled";
 
 // v2/McpServerElicitationAction.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -4432,12 +4849,64 @@ content: JsonValue | null,
  */
 _meta: JsonValue | null, };
 
+// v2/McpServerEventNotification.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { JsonValue } from "../serde_json/JsonValue";
+
+export type McpServerEventNotification = { method: string, params: JsonValue, };
+
+// v2/McpServerEventStreamNotification.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { McpServerEventNotification } from "./McpServerEventNotification";
+
+export type McpServerEventStreamNotification = { subscriptionId: string, notification: McpServerEventNotification, };
+
+// v2/McpServerEventStreamStartParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { JsonValue } from "../serde_json/JsonValue";
+
+export type McpServerEventStreamStartParams = { threadId: string, server: string, subscriptionId: string, name: string, arguments: JsonValue, _meta?: JsonValue | null, };
+
+// v2/McpServerEventStreamStartResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type McpServerEventStreamStartResponse = Record<string, never>;
+
+// v2/McpServerEventStreamStopParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type McpServerEventStreamStopParams = { subscriptionId: string, };
+
+// v2/McpServerEventStreamStopResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type McpServerEventStreamStopResponse = Record<string, never>;
+
 // v2/McpServerMigration.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
 export type McpServerMigration = { name: string, };
+
+// v2/McpServerOauthClientRegistration.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type McpServerOauthClientRegistration = "auto" | "cimd" | "dcr";
 
 // v2/McpServerOauthLoginCompletedNotification.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -4450,8 +4919,13 @@ export type McpServerOauthLoginCompletedNotification = { name: string, threadId:
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { McpServerOauthClientRegistration } from "./McpServerOauthClientRegistration";
 
-export type McpServerOauthLoginParams = { name: string, threadId?: string | null, scopes?: Array<string> | null, timeoutSecs?: bigint | null, };
+export type McpServerOauthLoginParams = { name: string, threadId?: string | null,
+/**
+ * Registration strategy for this login only; omission selects automatic discovery.
+ */
+clientRegistration?: McpServerOauthClientRegistration | null, scopes?: Array<string> | null, timeoutSecs?: bigint | null, };
 
 // v2/McpServerOauthLoginResponse.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -4490,8 +4964,13 @@ import type { Resource } from "../Resource";
 import type { ResourceTemplate } from "../ResourceTemplate";
 import type { Tool } from "../Tool";
 import type { McpAuthStatus } from "./McpAuthStatus";
+import type { McpServerConnectionStatus } from "./McpServerConnectionStatus";
 
-export type McpServerStatus = { name: string, serverInfo: McpServerInfo | null, tools: { [key in string]?: Tool }, resources: Array<Resource>, resourceTemplates: Array<ResourceTemplate>, authStatus: McpAuthStatus, };
+export type McpServerStatus = { name: string,
+/**
+ * Current thread-runtime connection state; null when unavailable or the configuration changed.
+ */
+runtimeStatus: McpServerConnectionStatus | null, pluginId: string | null, serverInfo: McpServerInfo | null, tools: { [key in string]?: Tool }, resources: Array<Resource>, resourceTemplates: Array<ResourceTemplate>, authStatus: McpAuthStatus, };
 
 // v2/McpServerStatusDetail.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -4635,9 +5114,14 @@ import type { ReasoningEffort } from "../ReasoningEffort";
 import type { ModelAvailabilityNux } from "./ModelAvailabilityNux";
 import type { ModelServiceTier } from "./ModelServiceTier";
 import type { ModelUpgradeInfo } from "./ModelUpgradeInfo";
+import type { MultiAgentVersion } from "./MultiAgentVersion";
 import type { ReasoningEffortOption } from "./ReasoningEffortOption";
 
-export type Model = { id: string, model: string, upgrade: string | null, upgradeInfo: ModelUpgradeInfo | null, availabilityNux: ModelAvailabilityNux | null, displayName: string, description: string, hidden: boolean, supportedReasoningEfforts: Array<ReasoningEffortOption>, defaultReasoningEffort: ReasoningEffort, inputModalities: Array<InputModality>, supportsPersonality: boolean,
+export type Model = { id: string, model: string, upgrade: string | null, upgradeInfo: ModelUpgradeInfo | null, availabilityNux: ModelAvailabilityNux | null, displayName: string, description: string, modelSpecialty: string | null, hidden: boolean, supportedReasoningEfforts: Array<ReasoningEffortOption>, defaultReasoningEffort: ReasoningEffort, inputModalities: Array<InputModality>, supportsPersonality: boolean,
+/**
+ * Multi-agent runtime declared by this model, when available.
+ */
+multiAgentVersion: MultiAgentVersion | null,
 /**
  * Deprecated: use `serviceTiers` instead.
  */
@@ -4734,7 +5218,11 @@ export type ModelServiceTier = { id: string, name: string, description: string, 
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
-export type ModelUpgradeInfo = { model: string, upgradeCopy: string | null, modelLink: string | null, migrationMarkdown: string | null, };
+export type ModelUpgradeInfo = { model: string, upgradeCopy: string | null, modelLink: string | null, migrationMarkdown: string | null,
+/**
+ * Informational Unix timestamp for this upgrade's scheduled retirement, if known.
+ */
+retirementAt: number | null, };
 
 // v2/ModelVerification.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -4758,6 +5246,16 @@ export type ModelVerificationNotification = { threadId: string, turnId: string, 
 import type { NewThreadModelDefaults } from "./NewThreadModelDefaults";
 
 export type ModelsRequirements = { newThread: NewThreadModelDefaults | null, };
+
+// v2/MultiAgentVersion.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * Multi-agent runtime supported by a model.
+ */
+export type MultiAgentVersion = "disabled" | "v1" | "v2";
 
 // v2/NetworkAccess.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -5005,6 +5503,13 @@ import type { SkillSummary } from "./SkillSummary";
 
 export type PluginDetail = { marketplaceName: string, marketplacePath: AbsolutePathBuf | null, summary: PluginSummary, shareUrl: string | null, description: string | null, skills: Array<SkillSummary>, hooks: Array<PluginHookSummary>, apps: Array<AppSummary>, appTemplates: Array<AppTemplateSummary>, mcpServers: Array<string>, scheduledTasks: Array<ScheduledTaskSummary> | null, };
 
+// v2/PluginDisabledReason.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type PluginDisabledReason = "disabled_by_admin" | "plan_not_eligible" | "required_app_unavailable" | "unknown";
+
 // v2/PluginHookSummary.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
@@ -5019,7 +5524,11 @@ export type PluginHookSummary = { key: string, eventName: HookEventName, };
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 import type { AbsolutePathBuf } from "../AbsolutePathBuf";
 
-export type PluginInstallParams = { marketplacePath?: AbsolutePathBuf | null, remoteMarketplaceName?: string | null, pluginName: string, };
+export type PluginInstallParams = { marketplacePath?: AbsolutePathBuf | null, remoteMarketplaceName?: string | null,
+/**
+ * Client-generated identifier used to correlate one installation attempt.
+ */
+installAttemptId?: string | null, pluginName: string, };
 
 // v2/PluginInstallPolicy.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -5139,7 +5648,11 @@ cwds?: Array<AbsolutePathBuf> | null,
  * Optional marketplace kind filter. When omitted, only local marketplaces are queried, plus
  * the default remote catalog when enabled by feature flag.
  */
-marketplaceKinds?: Array<PluginListMarketplaceKind> | null, };
+marketplaceKinds?: Array<PluginListMarketplaceKind> | null,
+/**
+ * Whether the client requests a fresh remote plugin catalog fetch.
+ */
+forceRefetch?: boolean, };
 
 // v2/PluginListResponse.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -5181,6 +5694,39 @@ import type { PluginDetail } from "./PluginDetail";
 
 export type PluginReadResponse = { plugin: PluginDetail, };
 
+// v2/PluginSearchParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { AbsolutePathBuf } from "../AbsolutePathBuf";
+import type { PluginSearchScope } from "./PluginSearchScope";
+
+export type PluginSearchParams = { searchTerm: string, scope?: PluginSearchScope | null, cwds?: Array<AbsolutePathBuf> | null, cursor?: string | null, limit?: number | null, };
+
+// v2/PluginSearchResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { PluginSearchResult } from "./PluginSearchResult";
+
+export type PluginSearchResponse = { data: Array<PluginSearchResult>, nextCursor: string | null, };
+
+// v2/PluginSearchResult.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { AbsolutePathBuf } from "../AbsolutePathBuf";
+import type { PluginSummary } from "./PluginSummary";
+
+export type PluginSearchResult = { plugin: PluginSummary, marketplaceName: string, marketplacePath: AbsolutePathBuf | null, };
+
+// v2/PluginSearchScope.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type PluginSearchScope = "global" | "workspace" | "personal";
+
 // v2/PluginShareCheckoutParams.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
@@ -5207,7 +5753,7 @@ export type PluginShareContext = { remotePluginId: string,
 /**
  * Version of the remote shared plugin release when available.
  */
-remoteVersion: string | null, discoverability: PluginShareDiscoverability | null, shareUrl: string | null, creatorAccountUserId: string | null, creatorName: string | null, sharePrincipals: Array<PluginSharePrincipal> | null, };
+remoteVersion: string | null, discoverability: PluginShareDiscoverability | null, shareUrl: string | null, creatorAccountUserId: string | null, creatorName: string | null, sharePrincipals: Array<PluginSharePrincipal> | null, canPublishToWorkspace: boolean | null, };
 
 // v2/PluginShareDeleteParams.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -5292,7 +5838,7 @@ export type PluginShareSaveParams = { pluginPath: AbsolutePathBuf, remotePluginI
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
-export type PluginShareSaveResponse = { remotePluginId: string, shareUrl: string, };
+export type PluginShareSaveResponse = { remotePluginId: string, shareUrl: string, canPublishToWorkspace: boolean | null, };
 
 // v2/PluginShareTarget.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -5371,6 +5917,7 @@ registry: string | null, } | { "type": "remote" };
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 import type { PluginAuthPolicy } from "./PluginAuthPolicy";
 import type { PluginAvailability } from "./PluginAvailability";
+import type { PluginDisabledReason } from "./PluginDisabledReason";
 import type { PluginInstallPolicy } from "./PluginInstallPolicy";
 import type { PluginInstallPolicySource } from "./PluginInstallPolicySource";
 import type { PluginInterface } from "./PluginInterface";
@@ -5393,11 +5940,23 @@ localVersion: string | null, name: string,
 /**
  * Remote sharing context associated with this plugin when available.
  */
-shareContext: PluginShareContext | null, source: PluginSource, installed: boolean, enabled: boolean, installPolicy: PluginInstallPolicy, installPolicySource: PluginInstallPolicySource | null, mustShowInstallationInterstitial: boolean | null, authPolicy: PluginAuthPolicy,
+shareContext: PluginShareContext | null, source: PluginSource, installed: boolean,
+/**
+ * Unix timestamp in seconds when the remote plugin was installed, when available.
+ */
+installedAt: number | null, enabled: boolean, installPolicy: PluginInstallPolicy, installPolicySource: PluginInstallPolicySource | null, mustShowInstallationInterstitial: boolean | null, authPolicy: PluginAuthPolicy,
 /**
  * Availability state for installing and using the plugin.
  */
-availability: PluginAvailability, interface: PluginInterface | null, keywords: Array<string>, };
+availability: PluginAvailability,
+/**
+ * Why the remote plugin is unavailable, when provided by plugin-service.
+ */
+disabledReason: PluginDisabledReason | null,
+/**
+ * Raw plugin-service plan identifiers eligible to install the plugin.
+ */
+eligiblePlanTypes: Array<string> | null, interface: PluginInterface | null, keywords: Array<string>, };
 
 // v2/PluginUninstallParams.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -5690,6 +6249,151 @@ closeStdin?: boolean, };
  * Empty success response for `process/writeStdin`.
  */
 export type ProcessWriteStdinResponse = Record<string, never>;
+
+// v2/Project.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ProjectRoot } from "./ProjectRoot";
+
+export type Project = { id: string, name: string, roots: Array<ProjectRoot>, metadata: { [key in string]?: string }, position: number, createdAt: number, updatedAt: number, };
+
+// v2/ProjectChangeType.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ProjectChangeType = "created" | "updated" | "deleted";
+
+// v2/ProjectChangedNotification.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ProjectChangeType } from "./ProjectChangeType";
+
+export type ProjectChangedNotification = { projectId: string, changeType: ProjectChangeType, };
+
+// v2/ProjectCreateParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ProjectRoot } from "./ProjectRoot";
+
+export type ProjectCreateParams = { name: string, roots: Array<ProjectRoot>, metadata?: { [key in string]?: string } | null, idempotencyKey: string, };
+
+// v2/ProjectCreateResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { Project } from "./Project";
+
+export type ProjectCreateResponse = { project: Project, };
+
+// v2/ProjectDeleteParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ProjectDeleteParams = { projectId: string, };
+
+// v2/ProjectDeleteResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ProjectDeleteResponse = Record<string, never>;
+
+// v2/ProjectImportParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ProjectRoot } from "./ProjectRoot";
+
+export type ProjectImportParams = { name: string, roots: Array<ProjectRoot>, metadata?: { [key in string]?: string } | null, threads?: Array<string> | null, idempotencyKey: string, };
+
+// v2/ProjectImportResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { Project } from "./Project";
+
+export type ProjectImportResponse = { project: Project, };
+
+// v2/ProjectListParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ProjectListParams = { cursor?: string | null, limit?: number | null, };
+
+// v2/ProjectListResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { Project } from "./Project";
+
+export type ProjectListResponse = { data: Array<Project>, nextCursor: string | null, };
+
+// v2/ProjectMoveParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ProjectMoveParams = { projectId: string, beforeProjectId?: string | null, };
+
+// v2/ProjectMoveResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ProjectMoveResponse = Record<string, never>;
+
+// v2/ProjectReadParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ProjectReadParams = { projectId: string, };
+
+// v2/ProjectReadResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { Project } from "./Project";
+
+export type ProjectReadResponse = { project: Project, };
+
+// v2/ProjectRoot.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { AbsolutePathBuf } from "../AbsolutePathBuf";
+
+export type ProjectRoot = { path: AbsolutePathBuf, };
+
+// v2/ProjectUpdateParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ProjectRoot } from "./ProjectRoot";
+
+export type ProjectUpdateParams = { projectId: string, name?: string | null, roots?: Array<ProjectRoot> | null, metadata?: { [key in string]?: string } | null, };
+
+// v2/ProjectUpdateResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { Project } from "./Project";
+
+export type ProjectUpdateResponse = { project: Project, };
+
+// v2/QueuedSubmission.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { UserInput } from "./UserInput";
+
+export type QueuedSubmission = { id: string, input: Array<UserInput>, clientUserMessageId: string, };
 
 // v2/RateLimitReachedType.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -6101,6 +6805,36 @@ import type { AddCreditsNudgeEmailStatus } from "./AddCreditsNudgeEmailStatus";
 
 export type SendAddCreditsNudgeEmailResponse = { status: AddCreditsNudgeEmailStatus, };
 
+// v2/ServerDiagnosticsGauge.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ServerDiagnosticsGauge = { name: string, value: number, };
+
+// v2/ServerDiagnosticsParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ServerDiagnosticsParams = Record<string, never>;
+
+// v2/ServerDiagnosticsProcess.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ServerDiagnosticsProcess = { id: number, residentMemoryBytes: number | null, physicalFootprintBytes: number | null, };
+
+// v2/ServerDiagnosticsResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ServerDiagnosticsGauge } from "./ServerDiagnosticsGauge";
+import type { ServerDiagnosticsProcess } from "./ServerDiagnosticsProcess";
+
+export type ServerDiagnosticsResponse = { process: ServerDiagnosticsProcess, gauges: Array<ServerDiagnosticsGauge>, };
+
 // v2/ServerRequestResolvedNotification.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
@@ -6145,7 +6879,15 @@ export type SkillErrorInfo = { path: string, message: string, };
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 import type { AbsolutePathBuf } from "../AbsolutePathBuf";
 
-export type SkillInterface = { displayName?: string, shortDescription?: string, iconSmall?: AbsolutePathBuf, iconLarge?: AbsolutePathBuf, brandColor?: string, defaultPrompt?: string, };
+export type SkillInterface = { displayName?: string, shortDescription?: string, iconSmall?: AbsolutePathBuf, iconLarge?: AbsolutePathBuf,
+/**
+ * Remote small icon URL from the plugin catalog.
+ */
+iconSmallUrl: string | null,
+/**
+ * Remote large icon URL from the plugin catalog.
+ */
+iconLargeUrl: string | null, brandColor?: string, defaultPrompt?: string, };
 
 // v2/SkillMetadata.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -6160,7 +6902,11 @@ export type SkillMetadata = { name: string, description: string,
 /**
  * Legacy short_description from SKILL.md. Prefer SKILL.json interface.short_description.
  */
-shortDescription?: string, interface?: SkillInterface, dependencies?: SkillDependencies, path: AbsolutePathBuf, scope: SkillScope, enabled: boolean, };
+shortDescription?: string, interface?: SkillInterface, dependencies?: SkillDependencies, path: AbsolutePathBuf, scope: SkillScope, enabled: boolean,
+/**
+ * Owning plugin ID, matching `PluginSummary.id`, when known.
+ */
+pluginId: string | null, };
 
 // v2/SkillMigration.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -6289,12 +7035,23 @@ export type SortDirection = "asc" | "desc";
 
 export type SpendControlLimitSnapshot = { limit: string, used: string, remainingPercent: number, resetsAt: number, };
 
+// v2/StrictReviewRequiredNotification.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type StrictReviewRequiredNotification = { threadId: string, turnId: string,
+/**
+ * Unix timestamp (in milliseconds) when this review started.
+ */
+startedAtMs: number, };
+
 // v2/SubAgentActivityKind.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
-export type SubAgentActivityKind = "started" | "interacted" | "interrupted";
+export type SubAgentActivityKind = "started" | "interacted" | "interrupted" | "completed";
 
 // v2/SubagentMigration.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -6358,6 +7115,7 @@ import type { GitInfo } from "./GitInfo";
 import type { SessionSource } from "./SessionSource";
 import type { ThreadExtra } from "./ThreadExtra";
 import type { ThreadHistoryMode } from "./ThreadHistoryMode";
+import type { ThreadSection } from "./ThreadSection";
 import type { ThreadSource } from "./ThreadSource";
 import type { ThreadStatus } from "./ThreadStatus";
 import type { Turn } from "./Turn";
@@ -6391,6 +7149,18 @@ preview: string,
  * Whether the thread is ephemeral and should not be materialized on disk.
  */
 ephemeral: boolean,
+/**
+ * The independently persisted section selected for this thread, if any.
+ */
+section: ThreadSection | null,
+/**
+ * Unix timestamp in seconds when the thread entered its current section.
+ */
+sectionEnteredAt: number | null,
+/**
+ * Canonical project assignment owned by app-server, if any.
+ */
+projectId: string | null,
 /**
  * Persisted thread history contract selected when this thread was created.
  */
@@ -6515,9 +7285,9 @@ export type ThreadArchivedNotification = { threadId: string, };
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
-import type { AbsolutePathBuf } from "../AbsolutePathBuf";
+import type { LegacyAppPathString } from "../LegacyAppPathString";
 
-export type ThreadBackgroundTerminal = { itemId: string, processId: string, command: string, cwd: AbsolutePathBuf, osPid: number | null, cpuPercent: number | null, rssKb: bigint | null, };
+export type ThreadBackgroundTerminal = { itemId: string, processId: string, command: string, cwd: LegacyAppPathString, osPid: number | null, cpuPercent: number | null, rssKb: bigint | null, };
 
 // v2/ThreadBackgroundTerminalsCleanParams.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -6920,6 +7690,7 @@ import type { ReasoningEffort } from "../ReasoningEffort";
 import type { SleepItem } from "../SleepItem";
 import type { WebSearchItem } from "../WebSearchItem";
 import type { JsonValue } from "../serde_json/JsonValue";
+import type { AgentMessageDelivery } from "./AgentMessageDelivery";
 import type { CollabAgentState } from "./CollabAgentState";
 import type { CollabAgentTool } from "./CollabAgentTool";
 import type { CollabAgentToolCallStatus } from "./CollabAgentToolCallStatus";
@@ -6939,7 +7710,15 @@ import type { PatchApplyStatus } from "./PatchApplyStatus";
 import type { SubAgentActivityKind } from "./SubAgentActivityKind";
 import type { UserInput } from "./UserInput";
 
-export type ThreadItem = { "type": "userMessage", id: string, clientId: string | null, content: Array<UserInput>, } | { "type": "hookPrompt", id: string, fragments: Array<HookPromptFragment>, } | { "type": "agentMessage", id: string, text: string, phase: MessagePhase | null, memoryCitation: MemoryCitation | null, } | { "type": "plan", id: string, text: string, } | { "type": "reasoning", id: string, summary: Array<string>, content: Array<string>, } | { "type": "commandExecution", id: string,
+export type ThreadItem = { "type": "userMessage", id: string, clientId: string | null, content: Array<UserInput>, } | { "type": "hookPrompt", id: string, fragments: Array<HookPromptFragment>, } | { "type": "agentMessage", id: string, text: string, phase: MessagePhase | null, memoryCitation: MemoryCitation | null, delivery: AgentMessageDelivery | null, } | { "type": "plan", id: string, text: string, } | { "type": "reasoning", id: string, summary: Array<string>, content: Array<string>, } | { "type": "commandExecution", id: string,
+/**
+ * Trusted first-party plugin id when this command resolves to one plugin script.
+ */
+pluginId: string | null,
+/**
+ * Safe plugin-relative path when this command resolves to one plugin script.
+ */
+scriptPath: string | null,
 /**
  * The command to be executed.
  */
@@ -6973,7 +7752,7 @@ durationMs: number | null, } | { "type": "fileChange", id: string, changes: Arra
 /**
  * Deprecated: use `appContext.resourceUri` instead.
  */
-mcpAppResourceUri?: string, pluginId: string | null, result: McpToolCallResult | null, error: McpToolCallError | null,
+mcpAppResourceUri?: string, pluginId: string | null, readOnlyHint: boolean | null, result: McpToolCallResult | null, error: McpToolCallError | null,
 /**
  * The duration of the MCP tool call in milliseconds.
  */
@@ -7115,6 +7894,16 @@ sourceKinds?: Array<ThreadSourceKind> | null,
  */
 archived?: boolean | null,
 /**
+ * Omit to include every section, set to `null` for unsectioned threads,
+ * or provide a section ID to return only threads in that section.
+ */
+sectionId?: string | null,
+/**
+ * Omit to include every project, set to null for unassigned threads,
+ * or provide a project ID to return only threads in that project.
+ */
+projectId?: string | null,
+/**
  * Optional cwd filter or filters; when set, only threads whose session cwd
  * exactly matches one of these paths are returned.
  */
@@ -7235,6 +8024,11 @@ import type { ThreadMetadataGitInfoUpdateParams } from "./ThreadMetadataGitInfoU
 
 export type ThreadMetadataUpdateParams = { threadId: string,
 /**
+ * Omit to leave the project unchanged, use an empty string to clear it,
+ * or provide an existing project ID to assign it.
+ */
+projectId?: string | null,
+/**
  * Patch the stored Git metadata for this thread.
  * Omit a field to leave it unchanged, set it to `null` to clear it, or
  * provide a string to replace the stored value.
@@ -7255,6 +8049,122 @@ export type ThreadMetadataUpdateResponse = { thread: Thread, };
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
 export type ThreadNameUpdatedNotification = { threadId: string, threadName?: string, };
+
+// v2/ThreadProjectUpdatedNotification.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ThreadProjectUpdatedNotification = { threadId: string, projectId: string | null, };
+
+// v2/ThreadQueueAddParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { UserInput } from "./UserInput";
+
+export type ThreadQueueAddParams = { threadId: string, input: Array<UserInput>, clientUserMessageId: string, };
+
+// v2/ThreadQueueAddResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { QueuedSubmission } from "./QueuedSubmission";
+
+export type ThreadQueueAddResponse = { queuedSubmission: QueuedSubmission, };
+
+// v2/ThreadQueueChangedNotification.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ThreadQueueChangedNotification = { threadId: string, };
+
+// v2/ThreadQueueDeleteParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ThreadQueueDeleteParams = { threadId: string, queuedSubmissionId: string, };
+
+// v2/ThreadQueueDeleteResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ThreadQueueDeleteResponse = { deleted: boolean, };
+
+// v2/ThreadQueueListParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ThreadQueueListParams = { threadId: string,
+/**
+ * Opaque pagination cursor returned by a previous call.
+ */
+cursor?: string | null,
+/**
+ * Optional page size; defaults to the standard thread-list page size.
+ */
+limit?: number | null, };
+
+// v2/ThreadQueueListResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { QueuedSubmission } from "./QueuedSubmission";
+
+export type ThreadQueueListResponse = { data: Array<QueuedSubmission>,
+/**
+ * Opaque cursor for the next page, or `null` when no submissions remain.
+ */
+nextCursor: string | null, };
+
+// v2/ThreadQueueReorderParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ThreadQueueReorderParams = { threadId: string, queuedSubmissionIds: Array<string>, };
+
+// v2/ThreadQueueReorderResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ThreadQueueReorderResponse = Record<string, never>;
+
+// v2/ThreadQueueStartParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ThreadQueueStartParams = { threadId: string, queuedSubmissionId?: string | null, };
+
+// v2/ThreadQueueStartResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { Turn } from "./Turn";
+
+export type ThreadQueueStartResponse = { turn: Turn, };
+
+// v2/ThreadQueueUpdateParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { UserInput } from "./UserInput";
+
+export type ThreadQueueUpdateParams = { threadId: string, queuedSubmissionId: string, input: Array<UserInput>, };
+
+// v2/ThreadQueueUpdateResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { QueuedSubmission } from "./QueuedSubmission";
+
+export type ThreadQueueUpdateResponse = { queuedSubmission: QueuedSubmission, };
 
 // v2/ThreadReadParams.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -7347,6 +8257,16 @@ export type ThreadRealtimeAppendTextResponse = Record<string, never>;
  */
 export type ThreadRealtimeAudioChunk = { data: string, sampleRate: number, numChannels: number, samplesPerChannel: number | null, itemId: string | null, };
 
+// v2/ThreadRealtimeBemItemPresentation.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * EXPERIMENTAL - how an existing agent item appears in a realtime conversation.
+ */
+export type ThreadRealtimeBemItemPresentation = { "type": "wholeItem" } | { "type": "inlineMarkdown" } | { "type": "inlineVisualization", index: number, };
+
 // v2/ThreadRealtimeClosedNotification.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
@@ -7378,6 +8298,19 @@ import type { ConversationTextRole } from "../ConversationTextRole";
  */
 export type ThreadRealtimeInitialItem = { role: ConversationTextRole, text: string, };
 
+// v2/ThreadRealtimeItem.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ThreadRealtimeBemItemPresentation } from "./ThreadRealtimeBemItemPresentation";
+import type { ThreadRealtimeSessionOutcome } from "./ThreadRealtimeSessionOutcome";
+import type { ThreadRealtimeTranscriptRole } from "./ThreadRealtimeTranscriptRole";
+
+/**
+ * EXPERIMENTAL - a thread-scoped realtime item in the canonical timeline.
+ */
+export type ThreadRealtimeItem = { id: string, realtimeSessionId: string, } & ({ "type": "realtimeSessionStarted" } | { "type": "transcriptSegment", role: ThreadRealtimeTranscriptRole, text: string, } | { "type": "bemItemPromoted", turnId: string, itemId: string, presentation: ThreadRealtimeBemItemPresentation, } | { "type": "realtimeSessionClosed", outcome: ThreadRealtimeSessionOutcome, });
+
 // v2/ThreadRealtimeItemAddedNotification.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
@@ -7388,6 +8321,38 @@ import type { JsonValue } from "../serde_json/JsonValue";
  * EXPERIMENTAL - raw non-audio thread realtime item emitted by the backend.
  */
 export type ThreadRealtimeItemAddedNotification = { threadId: string, item: JsonValue, };
+
+// v2/ThreadRealtimeItemCompletedNotification.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ThreadRealtimeItem } from "./ThreadRealtimeItem";
+
+/**
+ * EXPERIMENTAL - a realtime timeline item published after canonical commit.
+ */
+export type ThreadRealtimeItemCompletedNotification = { threadId: string, item: ThreadRealtimeItem, };
+
+// v2/ThreadRealtimeItemStartedNotification.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ThreadRealtimeItem } from "./ThreadRealtimeItem";
+
+/**
+ * EXPERIMENTAL - a realtime timeline item started before its content streams.
+ */
+export type ThreadRealtimeItemStartedNotification = { threadId: string, item: ThreadRealtimeItem, };
+
+// v2/ThreadRealtimeItemTranscriptDeltaNotification.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * EXPERIMENTAL - text appended to an active realtime transcript item.
+ */
+export type ThreadRealtimeItemTranscriptDeltaNotification = { threadId: string, itemId: string, delta: string, };
 
 // v2/ThreadRealtimeListVoicesParams.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -7431,6 +8396,13 @@ export type ThreadRealtimeOutputAudioDeltaNotification = { threadId: string, aud
  */
 export type ThreadRealtimeSdpNotification = { threadId: string, sdp: string, };
 
+// v2/ThreadRealtimeSessionOutcome.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ThreadRealtimeSessionOutcome = "ended" | "failed";
+
 // v2/ThreadRealtimeStartParams.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
@@ -7452,6 +8424,11 @@ export type ThreadRealtimeStartParams = { threadId: string,
  */
 clientManagedHandoffs?: boolean | null,
 /**
+ * Controls whether a realtime V3 delegation produces an acknowledgement filler.
+ * Omitted values preserve the Realtime API's default behavior.
+ */
+delegationAckFiller?: boolean | null,
+/**
  * Routes any transcript tail remaining at session end through Codex. Defaults to false.
  * TODO: Remove this rollout knob once transcript-tail flushing is always enabled.
  */
@@ -7470,6 +8447,11 @@ codexResponseItemPrefix?: string | null,
  */
 codexResponseHandoffMode?: CodexResponseHandoffMode | null,
 /**
+ * Overrides BEM channel prefixes by `analysis`, `commentary`, or `final`.
+ * Omitted channels retain their default uppercase bracketed prefixes.
+ */
+codexResponseHandoffChannelPrefixes?: { [key in string]?: Array<string> } | null,
+/**
  * Overrides the configured realtime model for this session only.
  */
 model?: string | null,
@@ -7487,7 +8469,15 @@ includeStartupContext?: boolean | null,
  * This is only supported by realtime V3 and is sent during session startup. Requests are
  * limited to 128 items and 8,192 estimated text tokens in total.
  */
-initialItems?: Array<ThreadRealtimeInitialItem> | null, prompt?: string | null | null, realtimeSessionId?: string | null, transport?: ThreadRealtimeStartTransport | null,
+initialItems?: Array<ThreadRealtimeInitialItem> | null,
+/**
+ * Developer instructions given to the backing Codex model when this realtime session starts.
+ */
+realtimeStartInstructions?: string | null,
+/**
+ * Developer instructions given to the backing Codex model when this realtime session ends.
+ */
+realtimeEndInstructions?: string | null, prompt?: string | null | null, realtimeSessionId?: string | null, transport?: ThreadRealtimeStartTransport | null,
 /**
  * Overrides the configured realtime protocol version for this session only.
  */
@@ -7516,7 +8506,11 @@ export type ThreadRealtimeStartTransport = { "type": "websocket" } | { "type": "
  * SDP offer generated by a WebRTC RTCPeerConnection after configuring audio and the
  * realtime events data channel.
  */
-sdp: string, };
+sdp: string, } | { "type": "existingCall",
+/**
+ * Identifier of a realtime call already created and negotiated by the client.
+ */
+callId: string, };
 
 // v2/ThreadRealtimeStartedNotification.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -7578,6 +8572,13 @@ export type ThreadRealtimeTranscriptDoneNotification = { threadId: string, role:
  * Final complete text for the transcript part.
  */
 text: string, };
+
+// v2/ThreadRealtimeTranscriptRole.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ThreadRealtimeTranscriptRole = "user" | "assistant";
 
 // v2/ThreadResumeInitialTurnsPageParams.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -7721,19 +8722,69 @@ multiAgentMode: MultiAgentMode,
  */
 initialTurnsPage: TurnsPage | null,
 /**
- * Opaque head cursor for hydrating paginated turns backwards.
+ * Opaque cursor for hydrating paginated turns backwards.
  *
  * Pass this as `cursor` to `thread/turns/list` with
- * `sortDirection: "desc"`. The first page includes the cursor's head turn.
+ * `sortDirection: "desc"`. The first page includes the turn identified by the cursor.
  */
 turnsBackwardsCursor: string | null,
 /**
- * Opaque head cursor for hydrating paginated items backwards.
+ * Opaque cursor for hydrating paginated items backwards.
  *
  * Pass this as `cursor` to `thread/items/list` with
- * `sortDirection: "desc"`. The first page includes the cursor's head item.
+ * `sortDirection: "desc"`. The first page includes the item identified by the cursor.
  */
 itemsBackwardsCursor: string | null, };
+
+// v2/ThreadRevertParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * Replace a paginated thread's durable history with the prefix before one turn.
+ *
+ * This only changes persisted conversation history. It does not revert local file changes.
+ */
+export type ThreadRevertParams = { threadId: string,
+/**
+ * Turn excluded from the replacement history, together with every later turn.
+ */
+beforeTurnId: string, };
+
+// v2/ThreadRevertResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { Thread } from "./Thread";
+
+export type ThreadRevertResponse = {
+/**
+ * Updated loaded thread metadata. `turns` is always empty; hydrate retained history through
+ * `thread/turns/list`.
+ */
+thread: Thread,
+/**
+ * Opaque cursor for hydrating paginated turns backwards.
+ *
+ * Pass this as `cursor` to `thread/turns/list` with
+ * `sortDirection: "desc"`. The first page includes the turn identified by the cursor.
+ */
+turnsBackwardsCursor: string | null,
+/**
+ * Opaque cursor for hydrating paginated items backwards.
+ *
+ * Pass this as `cursor` to `thread/items/list` with
+ * `sortDirection: "desc"`. The first page includes the item identified by the cursor.
+ */
+itemsBackwardsCursor: string | null, };
+
+// v2/ThreadRevertedNotification.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ThreadRevertedNotification = { threadId: string, };
 
 // v2/ThreadRollbackParams.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -7831,7 +8882,7 @@ nextCursor: string | null, };
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 import type { SortDirection } from "./SortDirection";
-import type { ThreadSortKey } from "./ThreadSortKey";
+import type { ThreadSearchSortKey } from "./ThreadSearchSortKey";
 import type { ThreadSourceKind } from "./ThreadSourceKind";
 
 export type ThreadSearchParams = {
@@ -7846,7 +8897,7 @@ limit?: number | null,
 /**
  * Optional sort key; defaults to created_at.
  */
-sortKey?: ThreadSortKey | null,
+sortKey?: ThreadSearchSortKey | null,
 /**
  * Optional sort direction; defaults to descending (newest first).
  */
@@ -7894,6 +8945,13 @@ import type { Thread } from "./Thread";
 
 export type ThreadSearchResult = { thread: Thread, snippet: string, };
 
+// v2/ThreadSearchSortKey.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ThreadSearchSortKey = "created_at" | "updated_at" | "recency_at";
+
 // v2/ThreadSearchTextRange.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
@@ -7911,6 +8969,185 @@ start: number,
  * Exclusive UTF-16 code-unit offset.
  */
 end: number, };
+
+// v2/ThreadSection.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ThreadSectionAppearance } from "./ThreadSectionAppearance";
+
+/**
+ * An independently persisted, user-visible thread section.
+ */
+export type ThreadSection = {
+/**
+ * Opaque UUIDv7 identity that remains stable when the section is renamed.
+ */
+id: string,
+/**
+ * The current user-visible section name.
+ */
+name: string,
+/**
+ * Optional appearance synchronized across clients.
+ */
+appearance: ThreadSectionAppearance | null, };
+
+// v2/ThreadSectionAppearance.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * Extensible visual presentation for a custom thread section.
+ */
+export type ThreadSectionAppearance = { icon: string | null, color: string | null, };
+
+// v2/ThreadSectionCreateParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ThreadSectionAppearance } from "./ThreadSectionAppearance";
+
+/**
+ * Parameters for creating an independently persisted thread section.
+ */
+export type ThreadSectionCreateParams = {
+/**
+ * The user-visible name of the section.
+ */
+name: string, appearance?: ThreadSectionAppearance | null, };
+
+// v2/ThreadSectionCreateResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ThreadSection } from "./ThreadSection";
+
+/**
+ * The independently persisted section created by the server.
+ */
+export type ThreadSectionCreateResponse = { section: ThreadSection, };
+
+// v2/ThreadSectionDeleteParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * Parameters for deleting an independently persisted thread section.
+ */
+export type ThreadSectionDeleteParams = {
+/**
+ * The stable, server-generated identity of the section to delete.
+ */
+sectionId: string, };
+
+// v2/ThreadSectionDeleteResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * Successful deletion does not return additional section data.
+ */
+export type ThreadSectionDeleteResponse = Record<string, never>;
+
+// v2/ThreadSectionListParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * Parameters for listing independently persisted thread sections.
+ */
+export type ThreadSectionListParams = {
+/**
+ * Opaque pagination cursor returned by a previous call.
+ */
+cursor?: string | null,
+/**
+ * Maximum number of sections to return.
+ */
+limit?: number | null, };
+
+// v2/ThreadSectionListResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ThreadSection } from "./ThreadSection";
+
+/**
+ * One page of independently persisted thread sections.
+ */
+export type ThreadSectionListResponse = { data: Array<ThreadSection>,
+/**
+ * Opaque cursor for the next page, or `null` when no sections remain.
+ */
+nextCursor: string | null, };
+
+// v2/ThreadSectionMoveParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * Parameters for moving a thread within a server-owned section ordering.
+ */
+export type ThreadSectionMoveParams = {
+/**
+ * Thread to move into, within, or out of a section.
+ */
+threadId: string,
+/**
+ * Destination section, or `null` to remove the thread from its section.
+ */
+sectionId: string | null,
+/**
+ * Existing thread to insert before; omission or null appends to the section.
+ */
+beforeThreadId?: string | null, };
+
+// v2/ThreadSectionMoveResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ThreadSectionMoveResponse = Record<string, never>;
+
+// v2/ThreadSectionUpdateParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ThreadSectionAppearance } from "./ThreadSectionAppearance";
+
+/**
+ * Parameters for updating an independently persisted thread section.
+ */
+export type ThreadSectionUpdateParams = {
+/**
+ * The stable, server-generated identity of the section to update.
+ */
+sectionId: string,
+/**
+ * The updated user-visible name of the section.
+ */
+name: string,
+/**
+ * Omit to preserve appearance, use `null` to clear it, or provide a replacement.
+ */
+appearance?: ThreadSectionAppearance | null, };
+
+// v2/ThreadSectionUpdateResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ThreadSection } from "./ThreadSection";
+
+/**
+ * The independently persisted section after its name is updated.
+ */
+export type ThreadSectionUpdateResponse = { section: ThreadSection, };
 
 // v2/ThreadSetNameParams.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -8056,7 +9293,7 @@ export type ThreadShellCommandResponse = Record<string, never>;
 
 // This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
 
-export type ThreadSortKey = "created_at" | "updated_at" | "recency_at";
+export type ThreadSortKey = "created_at" | "updated_at" | "recency_at" | "section_position";
 
 // v2/ThreadSource.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -8121,6 +9358,11 @@ historyMode?: ThreadHistoryMode | null, sessionStartSource?: ThreadStartSource |
  * Optional client-supplied analytics source classification for this thread.
  */
 threadSource?: ThreadSource | null,
+/**
+ * Optional project identity for this new thread. Durable threads persist
+ * the assignment; ephemeral threads expose it only in live responses.
+ */
+projectId?: string | null,
 /**
  * Optional sticky environments for this thread.
  *
@@ -8218,6 +9460,41 @@ export type ThreadStatus = { "type": "notLoaded" } | { "type": "idle" } | { "typ
 import type { ThreadStatus } from "./ThreadStatus";
 
 export type ThreadStatusChangedNotification = { threadId: string, status: ThreadStatus, };
+
+// v2/ThreadTimelineEntry.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ThreadItem } from "./ThreadItem";
+import type { ThreadRealtimeItem } from "./ThreadRealtimeItem";
+import type { TurnError } from "./TurnError";
+import type { TurnStatus } from "./TurnStatus";
+
+/**
+ * EXPERIMENTAL - one item or turn boundary in canonical rollout order.
+ */
+export type ThreadTimelineEntry = { "type": "item", position: number, turnId: string, item: ThreadItem, } | { "type": "realtime", position: number, item: ThreadRealtimeItem, } | { "type": "turnStarted", position: number, turnId: string, startedAt: number | null, } | { "type": "turnCompleted", position: number, turnId: string, status: TurnStatus, error: TurnError | null, startedAt: number | null, completedAt: number | null, durationMs: number | null, };
+
+// v2/ThreadTimelineListParams.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+/**
+ * EXPERIMENTAL - list ordinary and realtime thread history in rollout order.
+ */
+export type ThreadTimelineListParams = { threadId: string, cursor?: string | null, limit?: number | null, };
+
+// v2/ThreadTimelineListResponse.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ThreadTimelineEntry } from "./ThreadTimelineEntry";
+
+/**
+ * EXPERIMENTAL - a bounded timeline page with its resolved opening voice state.
+ */
+export type ThreadTimelineListResponse = { data: Array<ThreadTimelineEntry>, nextCursor: string | null, activeRealtimeSessionAtPageStart: string | null, };
 
 // v2/ThreadTokenUsage.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -8324,6 +9601,21 @@ export type ThreadUnsubscribeResponse = { status: ThreadUnsubscribeStatus, };
 
 export type ThreadUnsubscribeStatus = "notLoaded" | "notSubscribed" | "unsubscribed";
 
+// v2/ThreadUsage.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+import type { ThreadUsageBreakdownGroup } from "./ThreadUsageBreakdownGroup";
+
+export type ThreadUsage = { threadId: string, estimatedUsageCreditsMicros: bigint, estimatedUsageUsdMicros: bigint | null, groups: Array<ThreadUsageBreakdownGroup>, };
+
+// v2/ThreadUsageBreakdownGroup.ts
+// GENERATED CODE! DO NOT MODIFY BY HAND!
+
+// This file was generated by [ts-rs](https://github.com/Aleph-Alpha/ts-rs). Do not edit this file manually.
+
+export type ThreadUsageBreakdownGroup = { model: string | null, reasoningEffort: string | null, speed: string | null, estimatedUsageCreditsMicros: bigint, netNewInputTokens: bigint | null, cachedInputTokens: bigint | null, inputTokens: bigint | null, outputTokens: bigint | null, totalTokens: bigint | null, };
+
 // v2/TokenUsageBreakdown.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
 
@@ -8360,7 +9652,11 @@ import type { ToolRequestUserInputQuestion } from "./ToolRequestUserInputQuestio
 /**
  * EXPERIMENTAL. Params sent with a request_user_input event.
  */
-export type ToolRequestUserInputParams = { threadId: string, turnId: string, itemId: string, questions: Array<ToolRequestUserInputQuestion>, autoResolutionMs: number | null, };
+export type ToolRequestUserInputParams = { threadId: string, turnId: string, itemId: string, questions: Array<ToolRequestUserInputQuestion>, isBlocking: boolean,
+/**
+ * @deprecated Use `isBlocking` to decide whether the request should block.
+ */
+autoResolutionMs: number | null, };
 
 // v2/ToolRequestUserInputQuestion.ts
 // GENERATED CODE! DO NOT MODIFY BY HAND!
@@ -8829,7 +10125,9 @@ export type { AdditionalContextKind } from "./AdditionalContextKind";
 export type { AdditionalFileSystemPermissions } from "./AdditionalFileSystemPermissions";
 export type { AdditionalNetworkPermissions } from "./AdditionalNetworkPermissions";
 export type { AdditionalPermissionProfile } from "./AdditionalPermissionProfile";
+export type { AgentMessageDelivery } from "./AgentMessageDelivery";
 export type { AgentMessageDeltaNotification } from "./AgentMessageDeltaNotification";
+export type { AllowDenyRequirement } from "./AllowDenyRequirement";
 export type { AnalyticsConfig } from "./AnalyticsConfig";
 export type { AppBranding } from "./AppBranding";
 export type { AppInfo } from "./AppInfo";
@@ -8856,6 +10154,19 @@ export type { AskForApproval } from "./AskForApproval";
 export type { AttestationGenerateParams } from "./AttestationGenerateParams";
 export type { AttestationGenerateResponse } from "./AttestationGenerateResponse";
 export type { AutoReviewDecisionSource } from "./AutoReviewDecisionSource";
+export type { AutoReviewRequirements } from "./AutoReviewRequirements";
+export type { AwsCredentialType } from "./AwsCredentialType";
+export type { BedrockAwsProfile } from "./BedrockAwsProfile";
+export type { BedrockDiscoverParams } from "./BedrockDiscoverParams";
+export type { BedrockDiscoverResponse } from "./BedrockDiscoverResponse";
+export type { BedrockEnvironmentCredential } from "./BedrockEnvironmentCredential";
+export type { BedrockSetupParams } from "./BedrockSetupParams";
+export type { BedrockSetupResponse } from "./BedrockSetupResponse";
+export type { BrowserUseAccessApprovalLifetime } from "./BrowserUseAccessApprovalLifetime";
+export type { BrowserUseConfig } from "./BrowserUseConfig";
+export type { BrowserUseOriginPolicy } from "./BrowserUseOriginPolicy";
+export type { BrowserUseOriginPolicyConfig } from "./BrowserUseOriginPolicyConfig";
+export type { BrowserUseRequirements } from "./BrowserUseRequirements";
 export type { ByteRange } from "./ByteRange";
 export type { CancelLoginAccountParams } from "./CancelLoginAccountParams";
 export type { CancelLoginAccountResponse } from "./CancelLoginAccountResponse";
@@ -8864,6 +10175,7 @@ export type { CapabilityRootLocation } from "./CapabilityRootLocation";
 export type { ChatgptAuthTokensRefreshParams } from "./ChatgptAuthTokensRefreshParams";
 export type { ChatgptAuthTokensRefreshReason } from "./ChatgptAuthTokensRefreshReason";
 export type { ChatgptAuthTokensRefreshResponse } from "./ChatgptAuthTokensRefreshResponse";
+export type { CliAuthCredentialsStoreMode } from "./CliAuthCredentialsStoreMode";
 export type { CodexErrorInfo } from "./CodexErrorInfo";
 export type { CollabAgentState } from "./CollabAgentState";
 export type { CollabAgentStatus } from "./CollabAgentStatus";
@@ -8885,13 +10197,21 @@ export type { CommandExecTerminateResponse } from "./CommandExecTerminateRespons
 export type { CommandExecWriteParams } from "./CommandExecWriteParams";
 export type { CommandExecWriteResponse } from "./CommandExecWriteResponse";
 export type { CommandExecutionApprovalDecision } from "./CommandExecutionApprovalDecision";
+export type { CommandExecutionApprovalKind } from "./CommandExecutionApprovalKind";
 export type { CommandExecutionOutputDeltaNotification } from "./CommandExecutionOutputDeltaNotification";
 export type { CommandExecutionRequestApprovalParams } from "./CommandExecutionRequestApprovalParams";
 export type { CommandExecutionRequestApprovalResponse } from "./CommandExecutionRequestApprovalResponse";
 export type { CommandExecutionSource } from "./CommandExecutionSource";
 export type { CommandExecutionStatus } from "./CommandExecutionStatus";
 export type { CommandMigration } from "./CommandMigration";
+export type { ComputerUseConfig } from "./ComputerUseConfig";
+export type { ComputerUseMacosConfig } from "./ComputerUseMacosConfig";
+export type { ComputerUseMacosRequirements } from "./ComputerUseMacosRequirements";
 export type { ComputerUseRequirements } from "./ComputerUseRequirements";
+export type { ComputerUseWindowsConfig } from "./ComputerUseWindowsConfig";
+export type { ComputerUseWindowsExeConfig } from "./ComputerUseWindowsExeConfig";
+export type { ComputerUseWindowsExeRequirement } from "./ComputerUseWindowsExeRequirement";
+export type { ComputerUseWindowsRequirements } from "./ComputerUseWindowsRequirements";
 export type { Config } from "./Config";
 export type { ConfigBatchWriteParams } from "./ConfigBatchWriteParams";
 export type { ConfigEdit } from "./ConfigEdit";
@@ -8916,6 +10236,7 @@ export type { CreditsSnapshot } from "./CreditsSnapshot";
 export type { CurrentTimeReadParams } from "./CurrentTimeReadParams";
 export type { CurrentTimeReadResponse } from "./CurrentTimeReadResponse";
 export type { DeprecationNoticeNotification } from "./DeprecationNoticeNotification";
+export type { DesktopOnboardingEntrypoint } from "./DesktopOnboardingEntrypoint";
 export type { DynamicToolCallOutputContentItem } from "./DynamicToolCallOutputContentItem";
 export type { DynamicToolCallParams } from "./DynamicToolCallParams";
 export type { DynamicToolCallResponse } from "./DynamicToolCallResponse";
@@ -8946,6 +10267,10 @@ export type { ExternalAgentConfigDetectResponse } from "./ExternalAgentConfigDet
 export type { ExternalAgentConfigImportCompletedNotification } from "./ExternalAgentConfigImportCompletedNotification";
 export type { ExternalAgentConfigImportHistoriesReadResponse } from "./ExternalAgentConfigImportHistoriesReadResponse";
 export type { ExternalAgentConfigImportHistory } from "./ExternalAgentConfigImportHistory";
+export type { ExternalAgentConfigImportHistoryRecordParams } from "./ExternalAgentConfigImportHistoryRecordParams";
+export type { ExternalAgentConfigImportHistoryRecordResponse } from "./ExternalAgentConfigImportHistoryRecordResponse";
+export type { ExternalAgentConfigImportHistoryRecordSuccessParams } from "./ExternalAgentConfigImportHistoryRecordSuccessParams";
+export type { ExternalAgentConfigImportHistoryRecordTypeResultParams } from "./ExternalAgentConfigImportHistoryRecordTypeResultParams";
 export type { ExternalAgentConfigImportItemTypeFailure } from "./ExternalAgentConfigImportItemTypeFailure";
 export type { ExternalAgentConfigImportItemTypeSuccess } from "./ExternalAgentConfigImportItemTypeSuccess";
 export type { ExternalAgentConfigImportParams } from "./ExternalAgentConfigImportParams";
@@ -8954,8 +10279,11 @@ export type { ExternalAgentConfigImportResponse } from "./ExternalAgentConfigImp
 export type { ExternalAgentConfigImportTypeResult } from "./ExternalAgentConfigImportTypeResult";
 export type { ExternalAgentConfigMigrationItem } from "./ExternalAgentConfigMigrationItem";
 export type { ExternalAgentConfigMigrationItemType } from "./ExternalAgentConfigMigrationItemType";
+export type { ExternalAgentDetectedConnectorCandidate } from "./ExternalAgentDetectedConnectorCandidate";
+export type { ExternalAgentDetectedConnectorSource } from "./ExternalAgentDetectedConnectorSource";
 export type { ExternalAgentImportedConnectorCandidate } from "./ExternalAgentImportedConnectorCandidate";
 export type { ExternalAgentImportedConnectorSource } from "./ExternalAgentImportedConnectorSource";
+export type { FeedbackRequirements } from "./FeedbackRequirements";
 export type { FeedbackUploadParams } from "./FeedbackUploadParams";
 export type { FeedbackUploadResponse } from "./FeedbackUploadResponse";
 export type { FileChangeApprovalDecision } from "./FileChangeApprovalDecision";
@@ -8992,6 +10320,7 @@ export type { FsWriteFileResponse } from "./FsWriteFileResponse";
 export type { GetAccountParams } from "./GetAccountParams";
 export type { GetAccountRateLimitsResponse } from "./GetAccountRateLimitsResponse";
 export type { GetAccountResponse } from "./GetAccountResponse";
+export type { GetAccountTokenUsageParams } from "./GetAccountTokenUsageParams";
 export type { GetAccountTokenUsageResponse } from "./GetAccountTokenUsageResponse";
 export type { GetWorkspaceMessagesResponse } from "./GetWorkspaceMessagesResponse";
 export type { GitInfo } from "./GitInfo";
@@ -9022,6 +10351,7 @@ export type { HookTrustStatus } from "./HookTrustStatus";
 export type { HooksListEntry } from "./HooksListEntry";
 export type { HooksListParams } from "./HooksListParams";
 export type { HooksListResponse } from "./HooksListResponse";
+export type { InAppBrowserRequirements } from "./InAppBrowserRequirements";
 export type { InstalledApp } from "./InstalledApp";
 export type { ItemCompletedNotification } from "./ItemCompletedNotification";
 export type { ItemGuardianApprovalReviewCompletedNotification } from "./ItemGuardianApprovalReviewCompletedNotification";
@@ -9068,10 +10398,18 @@ export type { McpElicitationUntitledMultiSelectEnumSchema } from "./McpElicitati
 export type { McpElicitationUntitledSingleSelectEnumSchema } from "./McpElicitationUntitledSingleSelectEnumSchema";
 export type { McpResourceReadParams } from "./McpResourceReadParams";
 export type { McpResourceReadResponse } from "./McpResourceReadResponse";
+export type { McpServerConnectionStatus } from "./McpServerConnectionStatus";
 export type { McpServerElicitationAction } from "./McpServerElicitationAction";
 export type { McpServerElicitationRequestParams } from "./McpServerElicitationRequestParams";
 export type { McpServerElicitationRequestResponse } from "./McpServerElicitationRequestResponse";
+export type { McpServerEventNotification } from "./McpServerEventNotification";
+export type { McpServerEventStreamNotification } from "./McpServerEventStreamNotification";
+export type { McpServerEventStreamStartParams } from "./McpServerEventStreamStartParams";
+export type { McpServerEventStreamStartResponse } from "./McpServerEventStreamStartResponse";
+export type { McpServerEventStreamStopParams } from "./McpServerEventStreamStopParams";
+export type { McpServerEventStreamStopResponse } from "./McpServerEventStreamStopResponse";
 export type { McpServerMigration } from "./McpServerMigration";
+export type { McpServerOauthClientRegistration } from "./McpServerOauthClientRegistration";
 export type { McpServerOauthLoginCompletedNotification } from "./McpServerOauthLoginCompletedNotification";
 export type { McpServerOauthLoginParams } from "./McpServerOauthLoginParams";
 export type { McpServerOauthLoginResponse } from "./McpServerOauthLoginResponse";
@@ -9109,6 +10447,7 @@ export type { ModelUpgradeInfo } from "./ModelUpgradeInfo";
 export type { ModelVerification } from "./ModelVerification";
 export type { ModelVerificationNotification } from "./ModelVerificationNotification";
 export type { ModelsRequirements } from "./ModelsRequirements";
+export type { MultiAgentVersion } from "./MultiAgentVersion";
 export type { NetworkAccess } from "./NetworkAccess";
 export type { NetworkApprovalContext } from "./NetworkApprovalContext";
 export type { NetworkApprovalProtocol } from "./NetworkApprovalProtocol";
@@ -9132,6 +10471,7 @@ export type { PlanDeltaNotification } from "./PlanDeltaNotification";
 export type { PluginAuthPolicy } from "./PluginAuthPolicy";
 export type { PluginAvailability } from "./PluginAvailability";
 export type { PluginDetail } from "./PluginDetail";
+export type { PluginDisabledReason } from "./PluginDisabledReason";
 export type { PluginHookSummary } from "./PluginHookSummary";
 export type { PluginInstallParams } from "./PluginInstallParams";
 export type { PluginInstallPolicy } from "./PluginInstallPolicy";
@@ -9146,6 +10486,10 @@ export type { PluginListResponse } from "./PluginListResponse";
 export type { PluginMarketplaceEntry } from "./PluginMarketplaceEntry";
 export type { PluginReadParams } from "./PluginReadParams";
 export type { PluginReadResponse } from "./PluginReadResponse";
+export type { PluginSearchParams } from "./PluginSearchParams";
+export type { PluginSearchResponse } from "./PluginSearchResponse";
+export type { PluginSearchResult } from "./PluginSearchResult";
+export type { PluginSearchScope } from "./PluginSearchScope";
 export type { PluginShareCheckoutParams } from "./PluginShareCheckoutParams";
 export type { PluginShareCheckoutResponse } from "./PluginShareCheckoutResponse";
 export type { PluginShareContext } from "./PluginShareContext";
@@ -9184,6 +10528,25 @@ export type { ProcessSpawnResponse } from "./ProcessSpawnResponse";
 export type { ProcessTerminalSize } from "./ProcessTerminalSize";
 export type { ProcessWriteStdinParams } from "./ProcessWriteStdinParams";
 export type { ProcessWriteStdinResponse } from "./ProcessWriteStdinResponse";
+export type { Project } from "./Project";
+export type { ProjectChangeType } from "./ProjectChangeType";
+export type { ProjectChangedNotification } from "./ProjectChangedNotification";
+export type { ProjectCreateParams } from "./ProjectCreateParams";
+export type { ProjectCreateResponse } from "./ProjectCreateResponse";
+export type { ProjectDeleteParams } from "./ProjectDeleteParams";
+export type { ProjectDeleteResponse } from "./ProjectDeleteResponse";
+export type { ProjectImportParams } from "./ProjectImportParams";
+export type { ProjectImportResponse } from "./ProjectImportResponse";
+export type { ProjectListParams } from "./ProjectListParams";
+export type { ProjectListResponse } from "./ProjectListResponse";
+export type { ProjectMoveParams } from "./ProjectMoveParams";
+export type { ProjectMoveResponse } from "./ProjectMoveResponse";
+export type { ProjectReadParams } from "./ProjectReadParams";
+export type { ProjectReadResponse } from "./ProjectReadResponse";
+export type { ProjectRoot } from "./ProjectRoot";
+export type { ProjectUpdateParams } from "./ProjectUpdateParams";
+export type { ProjectUpdateResponse } from "./ProjectUpdateResponse";
+export type { QueuedSubmission } from "./QueuedSubmission";
 export type { RateLimitReachedType } from "./RateLimitReachedType";
 export type { RateLimitResetCredit } from "./RateLimitResetCredit";
 export type { RateLimitResetCreditStatus } from "./RateLimitResetCreditStatus";
@@ -9229,6 +10592,10 @@ export type { ScheduledTaskWeekday } from "./ScheduledTaskWeekday";
 export type { SelectedCapabilityRoot } from "./SelectedCapabilityRoot";
 export type { SendAddCreditsNudgeEmailParams } from "./SendAddCreditsNudgeEmailParams";
 export type { SendAddCreditsNudgeEmailResponse } from "./SendAddCreditsNudgeEmailResponse";
+export type { ServerDiagnosticsGauge } from "./ServerDiagnosticsGauge";
+export type { ServerDiagnosticsParams } from "./ServerDiagnosticsParams";
+export type { ServerDiagnosticsProcess } from "./ServerDiagnosticsProcess";
+export type { ServerDiagnosticsResponse } from "./ServerDiagnosticsResponse";
 export type { ServerRequestResolvedNotification } from "./ServerRequestResolvedNotification";
 export type { SessionMigration } from "./SessionMigration";
 export type { SessionSource } from "./SessionSource";
@@ -9250,6 +10617,7 @@ export type { SkillsListParams } from "./SkillsListParams";
 export type { SkillsListResponse } from "./SkillsListResponse";
 export type { SortDirection } from "./SortDirection";
 export type { SpendControlLimitSnapshot } from "./SpendControlLimitSnapshot";
+export type { StrictReviewRequiredNotification } from "./StrictReviewRequiredNotification";
 export type { SubAgentActivityKind } from "./SubAgentActivityKind";
 export type { SubagentMigration } from "./SubagentMigration";
 export type { TerminalInteractionNotification } from "./TerminalInteractionNotification";
@@ -9310,6 +10678,20 @@ export type { ThreadMetadataGitInfoUpdateParams } from "./ThreadMetadataGitInfoU
 export type { ThreadMetadataUpdateParams } from "./ThreadMetadataUpdateParams";
 export type { ThreadMetadataUpdateResponse } from "./ThreadMetadataUpdateResponse";
 export type { ThreadNameUpdatedNotification } from "./ThreadNameUpdatedNotification";
+export type { ThreadProjectUpdatedNotification } from "./ThreadProjectUpdatedNotification";
+export type { ThreadQueueAddParams } from "./ThreadQueueAddParams";
+export type { ThreadQueueAddResponse } from "./ThreadQueueAddResponse";
+export type { ThreadQueueChangedNotification } from "./ThreadQueueChangedNotification";
+export type { ThreadQueueDeleteParams } from "./ThreadQueueDeleteParams";
+export type { ThreadQueueDeleteResponse } from "./ThreadQueueDeleteResponse";
+export type { ThreadQueueListParams } from "./ThreadQueueListParams";
+export type { ThreadQueueListResponse } from "./ThreadQueueListResponse";
+export type { ThreadQueueReorderParams } from "./ThreadQueueReorderParams";
+export type { ThreadQueueReorderResponse } from "./ThreadQueueReorderResponse";
+export type { ThreadQueueStartParams } from "./ThreadQueueStartParams";
+export type { ThreadQueueStartResponse } from "./ThreadQueueStartResponse";
+export type { ThreadQueueUpdateParams } from "./ThreadQueueUpdateParams";
+export type { ThreadQueueUpdateResponse } from "./ThreadQueueUpdateResponse";
 export type { ThreadReadParams } from "./ThreadReadParams";
 export type { ThreadReadResponse } from "./ThreadReadResponse";
 export type { ThreadRealtimeAppendAudioParams } from "./ThreadRealtimeAppendAudioParams";
@@ -9319,14 +10701,20 @@ export type { ThreadRealtimeAppendSpeechResponse } from "./ThreadRealtimeAppendS
 export type { ThreadRealtimeAppendTextParams } from "./ThreadRealtimeAppendTextParams";
 export type { ThreadRealtimeAppendTextResponse } from "./ThreadRealtimeAppendTextResponse";
 export type { ThreadRealtimeAudioChunk } from "./ThreadRealtimeAudioChunk";
+export type { ThreadRealtimeBemItemPresentation } from "./ThreadRealtimeBemItemPresentation";
 export type { ThreadRealtimeClosedNotification } from "./ThreadRealtimeClosedNotification";
 export type { ThreadRealtimeErrorNotification } from "./ThreadRealtimeErrorNotification";
 export type { ThreadRealtimeInitialItem } from "./ThreadRealtimeInitialItem";
+export type { ThreadRealtimeItem } from "./ThreadRealtimeItem";
 export type { ThreadRealtimeItemAddedNotification } from "./ThreadRealtimeItemAddedNotification";
+export type { ThreadRealtimeItemCompletedNotification } from "./ThreadRealtimeItemCompletedNotification";
+export type { ThreadRealtimeItemStartedNotification } from "./ThreadRealtimeItemStartedNotification";
+export type { ThreadRealtimeItemTranscriptDeltaNotification } from "./ThreadRealtimeItemTranscriptDeltaNotification";
 export type { ThreadRealtimeListVoicesParams } from "./ThreadRealtimeListVoicesParams";
 export type { ThreadRealtimeListVoicesResponse } from "./ThreadRealtimeListVoicesResponse";
 export type { ThreadRealtimeOutputAudioDeltaNotification } from "./ThreadRealtimeOutputAudioDeltaNotification";
 export type { ThreadRealtimeSdpNotification } from "./ThreadRealtimeSdpNotification";
+export type { ThreadRealtimeSessionOutcome } from "./ThreadRealtimeSessionOutcome";
 export type { ThreadRealtimeStartParams } from "./ThreadRealtimeStartParams";
 export type { ThreadRealtimeStartResponse } from "./ThreadRealtimeStartResponse";
 export type { ThreadRealtimeStartTransport } from "./ThreadRealtimeStartTransport";
@@ -9335,9 +10723,13 @@ export type { ThreadRealtimeStopParams } from "./ThreadRealtimeStopParams";
 export type { ThreadRealtimeStopResponse } from "./ThreadRealtimeStopResponse";
 export type { ThreadRealtimeTranscriptDeltaNotification } from "./ThreadRealtimeTranscriptDeltaNotification";
 export type { ThreadRealtimeTranscriptDoneNotification } from "./ThreadRealtimeTranscriptDoneNotification";
+export type { ThreadRealtimeTranscriptRole } from "./ThreadRealtimeTranscriptRole";
 export type { ThreadResumeInitialTurnsPageParams } from "./ThreadResumeInitialTurnsPageParams";
 export type { ThreadResumeParams } from "./ThreadResumeParams";
 export type { ThreadResumeResponse } from "./ThreadResumeResponse";
+export type { ThreadRevertParams } from "./ThreadRevertParams";
+export type { ThreadRevertResponse } from "./ThreadRevertResponse";
+export type { ThreadRevertedNotification } from "./ThreadRevertedNotification";
 export type { ThreadRollbackParams } from "./ThreadRollbackParams";
 export type { ThreadRollbackResponse } from "./ThreadRollbackResponse";
 export type { ThreadSearchOccurrence } from "./ThreadSearchOccurrence";
@@ -9346,7 +10738,20 @@ export type { ThreadSearchOccurrencesResponse } from "./ThreadSearchOccurrencesR
 export type { ThreadSearchParams } from "./ThreadSearchParams";
 export type { ThreadSearchResponse } from "./ThreadSearchResponse";
 export type { ThreadSearchResult } from "./ThreadSearchResult";
+export type { ThreadSearchSortKey } from "./ThreadSearchSortKey";
 export type { ThreadSearchTextRange } from "./ThreadSearchTextRange";
+export type { ThreadSection } from "./ThreadSection";
+export type { ThreadSectionAppearance } from "./ThreadSectionAppearance";
+export type { ThreadSectionCreateParams } from "./ThreadSectionCreateParams";
+export type { ThreadSectionCreateResponse } from "./ThreadSectionCreateResponse";
+export type { ThreadSectionDeleteParams } from "./ThreadSectionDeleteParams";
+export type { ThreadSectionDeleteResponse } from "./ThreadSectionDeleteResponse";
+export type { ThreadSectionListParams } from "./ThreadSectionListParams";
+export type { ThreadSectionListResponse } from "./ThreadSectionListResponse";
+export type { ThreadSectionMoveParams } from "./ThreadSectionMoveParams";
+export type { ThreadSectionMoveResponse } from "./ThreadSectionMoveResponse";
+export type { ThreadSectionUpdateParams } from "./ThreadSectionUpdateParams";
+export type { ThreadSectionUpdateResponse } from "./ThreadSectionUpdateResponse";
 export type { ThreadSetNameParams } from "./ThreadSetNameParams";
 export type { ThreadSetNameResponse } from "./ThreadSetNameResponse";
 export type { ThreadSettings } from "./ThreadSettings";
@@ -9364,6 +10769,9 @@ export type { ThreadStartSource } from "./ThreadStartSource";
 export type { ThreadStartedNotification } from "./ThreadStartedNotification";
 export type { ThreadStatus } from "./ThreadStatus";
 export type { ThreadStatusChangedNotification } from "./ThreadStatusChangedNotification";
+export type { ThreadTimelineEntry } from "./ThreadTimelineEntry";
+export type { ThreadTimelineListParams } from "./ThreadTimelineListParams";
+export type { ThreadTimelineListResponse } from "./ThreadTimelineListResponse";
 export type { ThreadTokenUsage } from "./ThreadTokenUsage";
 export type { ThreadTokenUsageUpdatedNotification } from "./ThreadTokenUsageUpdatedNotification";
 export type { ThreadTurnsListParams } from "./ThreadTurnsListParams";
@@ -9374,6 +10782,8 @@ export type { ThreadUnarchivedNotification } from "./ThreadUnarchivedNotificatio
 export type { ThreadUnsubscribeParams } from "./ThreadUnsubscribeParams";
 export type { ThreadUnsubscribeResponse } from "./ThreadUnsubscribeResponse";
 export type { ThreadUnsubscribeStatus } from "./ThreadUnsubscribeStatus";
+export type { ThreadUsage } from "./ThreadUsage";
+export type { ThreadUsageBreakdownGroup } from "./ThreadUsageBreakdownGroup";
 export type { TokenUsageBreakdown } from "./TokenUsageBreakdown";
 export type { ToolRequestUserInputAnswer } from "./ToolRequestUserInputAnswer";
 export type { ToolRequestUserInputOption } from "./ToolRequestUserInputOption";
