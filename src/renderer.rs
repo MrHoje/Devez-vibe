@@ -4197,19 +4197,20 @@ fn emit_frame_diff_at(
         previous.filter(|frame| frame.width == current.width && frame.height == current.height);
     for row in 0..current.height {
         let screen_row = row.saturating_add(row_offset);
-        let wide_damage = previous.and_then(|previous| wide_damage_range(previous, current, row));
-        if let Some(columns) = wide_damage.clone() {
-            emit_frame_columns(out, current, row, screen_row, columns)?;
-        }
+        // ConPTY re-synthesizes a cursor jump into a Korean row's middle with
+        // the wide glyphs duplicated, and the composer keeps this diff so typing
+        // never drags the visible cursor to column zero. A row whose damage
+        // touches a wide glyph therefore redraws from its first damaged column
+        // to the end of the row in one continuous run, rather than patching each
+        // changed span in place. Only the columns before that point keep the
+        // ordinary cell diff, and a wide glyph can no longer sit among them.
+        let tail_start = previous
+            .and_then(|previous| wide_damage_range(previous, current, row))
+            .map(|columns| columns.start)
+            .filter(|start| start + 1 < current.width);
+        let diff_end = tail_start.unwrap_or(current.width);
         let mut column = 0;
-        while column < current.width {
-            if wide_damage
-                .as_ref()
-                .is_some_and(|columns| columns.contains(&column))
-            {
-                column += 1;
-                continue;
-            }
+        while column < diff_end {
             let cell = current.cell(column, row);
             let changed = previous.is_none_or(|previous| cell != previous.cell(column, row));
             if !changed || cell.continuation {
@@ -4235,13 +4236,7 @@ fn emit_frame_diff_at(
             let start = column;
             let style = cell.style;
             let mut text = String::new();
-            while column + 1 < current.width {
-                if wide_damage
-                    .as_ref()
-                    .is_some_and(|columns| columns.contains(&column))
-                {
-                    break;
-                }
+            while column < diff_end && column + 1 < current.width {
                 let cell = current.cell(column, row);
                 let changed = previous.is_none_or(|previous| cell != previous.cell(column, row));
                 if !changed || (!cell.continuation && cell.style != style) {
@@ -4262,8 +4257,57 @@ fn emit_frame_diff_at(
             set_cell_style(out, style)?;
             queue!(out, Print(text))?;
         }
+        if let Some(start) = tail_start {
+            emit_row_tail_from(out, current, row, screen_row, start)?;
+        }
     }
     queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
+    Ok(())
+}
+
+/// Repaints a row from its first damaged column to the end with a single cursor
+/// move, so a host replaying the output never sees a jump land in the middle of
+/// a wide glyph. Unlike `emit_row_sequential` this leaves the columns before
+/// that point untouched, which is what keeps the composer's caret from
+/// travelling to column zero on every keystroke.
+fn emit_row_tail_from(
+    out: &mut impl Write,
+    frame: &CellFrame,
+    row: usize,
+    screen_row: usize,
+    start_column: usize,
+) -> Result<()> {
+    if start_column + 1 >= frame.width {
+        return Ok(());
+    }
+    queue!(
+        out,
+        MoveTo(
+            start_column.min(u16::MAX as usize) as u16,
+            screen_row.min(u16::MAX as usize) as u16
+        )
+    )?;
+    let mut column = start_column;
+    while column + 1 < frame.width {
+        let style = frame.cell(column, row).style;
+        let mut text = String::new();
+        while column + 1 < frame.width {
+            let cell = frame.cell(column, row);
+            if !cell.continuation && cell.style != style {
+                break;
+            }
+            if !cell.continuation {
+                text.push_str(&cell.glyph);
+            }
+            column += 1;
+        }
+        set_cell_style(out, style)?;
+        queue!(out, Print(text))?;
+    }
+    // The terminal erase fills the final visual cell with this background
+    // without printing into the autowrap column.
+    set_cell_style(out, frame.cell(frame.width - 1, row).style)?;
+    queue!(out, Clear(ClearType::UntilNewLine))?;
     Ok(())
 }
 
@@ -4300,62 +4344,6 @@ fn wide_damage_range(
         end += 1;
     }
     Some(start..end)
-}
-
-fn emit_frame_columns(
-    out: &mut impl Write,
-    frame: &CellFrame,
-    row: usize,
-    screen_row: usize,
-    columns: Range<usize>,
-) -> Result<()> {
-    let mut column = columns.start.min(frame.width);
-    let end = columns.end.min(frame.width);
-    while column < end {
-        let cell = frame.cell(column, row);
-        if cell.continuation {
-            column += 1;
-            continue;
-        }
-        if column + 1 == frame.width {
-            queue!(
-                out,
-                MoveTo(
-                    column.min(u16::MAX as usize) as u16,
-                    screen_row.min(u16::MAX as usize) as u16
-                )
-            )?;
-            set_cell_style(out, cell.style)?;
-            queue!(out, Clear(ClearType::UntilNewLine))?;
-            column += 1;
-            continue;
-        }
-        let style = cell.style;
-        let start = column;
-        let mut text = String::new();
-        while column < end && column + 1 < frame.width {
-            let cell = frame.cell(column, row);
-            if !cell.continuation && cell.style != style {
-                break;
-            }
-            if cell.continuation {
-                column += 1;
-            } else {
-                text.push_str(&cell.glyph);
-                column += terminal_unit_width(&cell.glyph).max(1);
-            }
-        }
-        queue!(
-            out,
-            MoveTo(
-                start.min(u16::MAX as usize) as u16,
-                screen_row.min(u16::MAX as usize) as u16
-            )
-        )?;
-        set_cell_style(out, style)?;
-        queue!(out, Print(text))?;
-    }
-    Ok(())
 }
 
 /// Clears and repaints a semantic plan row from its first column without moving
@@ -13510,6 +13498,47 @@ mod tests {
 
         let damage = wide_damage_range(&before, &after, 0).expect("wide text changed");
         assert_eq!(damage, 5..9);
+    }
+
+    #[test]
+    fn a_damaged_korean_composer_row_repaints_its_tail_with_one_cursor_move() {
+        let mut before = CellFrame::new(20, 1);
+        before.write(0, 0, "› 안녕", CellStyle::plain());
+        let mut after = CellFrame::new(20, 1);
+        after.write(0, 0, "› 안녕하", CellStyle::plain());
+
+        let mut output = Vec::new();
+        emit_frame_diff(&mut output, Some(&before), &after).expect("frame diff emits");
+        let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
+
+        // One move to the damage, then a single run to the row's end. A second
+        // jump is what ConPTY replays with the wide glyphs duplicated.
+        assert_eq!(output.matches("\x1b[1;").count(), 1);
+        assert!(output.contains("\x1b[1;7H"));
+        assert!(output.contains('하'));
+        // The caret never travels back to column zero, so typing stays still.
+        assert!(!output.contains("\x1b[1;1H"));
+        assert!(!output.contains("\x1b[2K"));
+    }
+
+    #[test]
+    fn a_narrow_change_ahead_of_the_wide_damage_still_repaints() {
+        let mut before = CellFrame::new(20, 1);
+        before.write(0, 0, "a 안녕", CellStyle::plain());
+        let mut after = CellFrame::new(20, 1);
+        after.write(0, 0, "b 안녕하", CellStyle::plain());
+
+        let mut output = Vec::new();
+        emit_frame_diff(&mut output, Some(&before), &after).expect("frame diff emits");
+        let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
+
+        // The columns before the damage keep the ordinary patch, and they carry
+        // narrow glyphs alone.
+        assert!(output.contains("\x1b[1;1H"));
+        assert!(output.contains('b'));
+        assert!(output.contains("\x1b[1;7H"));
+        assert!(output.contains('하'));
+        assert_eq!(output.matches("\x1b[1;").count(), 2);
     }
 
     #[test]
