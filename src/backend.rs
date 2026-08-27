@@ -265,7 +265,18 @@ impl BackendServer {
                 Ok(response)
             }
             "thread/list" => {
-                let mut response = if let Some(codex) = self.codex.as_ref() {
+                let provider = params
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                if let Some(object) = params.as_object_mut() {
+                    object.remove("provider");
+                }
+                let include =
+                    |candidate: &str| provider.as_deref().is_none_or(|value| value == candidate);
+                let mut response = if include("codex")
+                    && let Some(codex) = self.codex.as_ref()
+                {
                     codex.request(method, params.clone()).await?
                 } else {
                     empty_list_response()
@@ -290,7 +301,9 @@ impl BackendServer {
                         merge_session(sessions, session);
                     }
                 }
-                if let Some(open_code) = &self.open_code {
+                if include("opencode")
+                    && let Some(open_code) = &self.open_code
+                {
                     let cwd = params.get("cwd").and_then(Value::as_str).map(Path::new);
                     if let Ok(extra) = open_code.list_sessions(cwd).await
                         && let (Some(target), Some(sessions)) = (
@@ -317,16 +330,17 @@ impl BackendServer {
                     }
                 }
                 let cwd = params.get("cwd").and_then(Value::as_str).map(Path::new);
-                if let Ok(extra) = self
-                    .claude
-                    .request(
-                        "session/list",
-                        json!({
-                            "cwd": cwd,
-                            "limit": params.get("limit").and_then(Value::as_u64).unwrap_or(100)
-                        }),
-                    )
-                    .await
+                if include("claude")
+                    && let Ok(extra) = self
+                        .claude
+                        .request(
+                            "session/list",
+                            json!({
+                                "cwd": cwd,
+                                "limit": params.get("limit").and_then(Value::as_u64).unwrap_or(100)
+                            }),
+                        )
+                        .await
                     && let (Some(target), Some(sessions)) = (
                         response.get_mut("data").and_then(Value::as_array_mut),
                         extra.get("data").and_then(Value::as_array),

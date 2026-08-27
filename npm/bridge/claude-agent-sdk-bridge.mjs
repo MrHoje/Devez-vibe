@@ -3,7 +3,7 @@
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createReadStream, existsSync, readdirSync } from "node:fs";
-import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -2685,6 +2685,98 @@ async function readableCwd(id, cwd) {
   return await transcriptCwd(id) || cwd;
 }
 
+function sameCwd(left, right) {
+  if (!left || !right) return !left && !right;
+  const normalize = (value) => value.replaceAll("\\", "/").replace(/\/$/, "");
+  const normalizedLeft = normalize(left);
+  const normalizedRight = normalize(right);
+  return process.platform === "win32"
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
+function transcriptPreview(messages) {
+  const prompt = historyTurns(messages)
+    .flatMap((turn) => turn.items || [])
+    .find((item) => item.type === "userMessage");
+  return prompt?.content?.find((item) => item.type === "text")?.text || "Untitled Claude session";
+}
+
+async function transcriptSessions(cwd) {
+  if (!cwd) return [];
+  let projects;
+  try {
+    projects = await readdir(claudeProjectsDir(), { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const rows = new Map();
+  for (const project of projects) {
+    if (!project.isDirectory()) continue;
+    const dir = join(claudeProjectsDir(), project.name);
+    let files;
+    try {
+      files = await readdir(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      if (!file.isFile() || !/^[0-9a-f-]{36}\.jsonl$/i.test(file.name)) continue;
+      const path = join(dir, file.name);
+      let recordedCwd;
+      try {
+        recordedCwd = await readTranscriptCwd(path);
+      } catch {
+        continue;
+      }
+      if (!recordedCwd || (cwd && !sameCwd(recordedCwd, cwd))) continue;
+      const id = file.name.slice(0, -".jsonl".length);
+      try {
+        const [messages, metadata] = await Promise.all([
+          getSessionMessages(id, { dir: recordedCwd, includeSystemMessages: true }),
+          stat(path),
+        ]);
+        if (!messages.length) continue;
+        const row = {
+          id: visibleSession(id),
+          preview: transcriptPreview(messages),
+          cwd: recordedCwd,
+          updatedAt: Math.floor(metadata.mtimeMs / 1000),
+        };
+        const previous = rows.get(row.id);
+        if (!previous || row.updatedAt >= previous.updatedAt) rows.set(row.id, row);
+      } catch {
+        continue;
+      }
+    }
+  }
+  return [...rows.values()];
+}
+
+async function claudeSessionList(params) {
+  const offset = params.offset || 0;
+  const limit = params.limit || 100;
+  const found = await listSessions({
+    dir: params.cwd,
+    limit: offset + limit,
+    offset: 0,
+    includeProgrammatic: true,
+  });
+  const rows = new Map(found.map((session) => [visibleSession(session.sessionId), {
+    id: visibleSession(session.sessionId),
+    name: session.customTitle || undefined,
+    preview: session.summary || session.firstPrompt || "Untitled Claude session",
+    cwd: session.cwd || params.cwd || "",
+    updatedAt: Math.floor((session.lastModified || 0) / 1000),
+  }]));
+  for (const row of await transcriptSessions(params.cwd)) {
+    if (!rows.has(row.id)) rows.set(row.id, row);
+  }
+  return [...rows.values()]
+    .sort((left, right) => right.updatedAt - left.updatedAt)
+    .slice(offset, offset + limit);
+}
+
 async function dispatch(method, params = {}) {
   if (method === "model/list") return loadModelCatalog(params);
   if (method === "mcpServerStatus/list") return claudeMcpStatus(params);
@@ -2844,20 +2936,8 @@ async function dispatch(method, params = {}) {
     };
   }
   if (method === "session/list") {
-    const found = await listSessions({
-      dir: params.cwd,
-      limit: params.limit || 100,
-      offset: params.offset || 0,
-      includeProgrammatic: true,
-    });
     return {
-      data: found.map((session) => ({
-        id: visibleSession(session.sessionId),
-        name: session.customTitle || undefined,
-        preview: session.summary || session.firstPrompt || "Untitled Claude session",
-        cwd: session.cwd || params.cwd || "",
-        updatedAt: Math.floor((session.lastModified || 0) / 1000),
-      })),
+      data: await claudeSessionList(params),
       nextCursor: null,
     };
   }
@@ -2939,6 +3019,17 @@ async function dispatch(method, params = {}) {
 }
 
 async function runSelfTest() {
+  const equivalentCwd = process.platform === "win32"
+    ? sameCwd("D:\\Repo", "d:/repo/")
+    : sameCwd("/tmp/repo", "/tmp/repo/");
+  const preview = transcriptPreview([{
+    type: "user",
+    uuid: "session-list-prompt",
+    message: { content: "세션 목록 질문" },
+  }]);
+  if (!equivalentCwd || preview !== "세션 목록 질문") {
+    throw new Error(`Claude session list self-test failed: ${JSON.stringify({ equivalentCwd, preview })}`);
+  }
   if (permissionMode("dontAsk") !== "dontAsk"
     || permissionMode("not-a-mode", "auto") !== "auto") {
     throw new Error("Claude permission mode self-test failed");

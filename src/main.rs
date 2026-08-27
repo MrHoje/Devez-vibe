@@ -176,7 +176,7 @@ async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
     }
     let codex_unavailable_reason = server.codex_unavailable_reason().map(ToOwned::to_owned);
     let cwd = resolve_cwd(cli.cwd.as_deref())?;
-    let resume_id = resolve_startup_session(cli, server, &cwd).await?;
+    let resume_id = resolve_startup_session(cli, server, &cwd, requested_model).await?;
     let Some(resume_id) = resume_id else {
         return Ok(());
     };
@@ -783,7 +783,15 @@ fn hold_until_thread(
 /// Fills the resume picker from `thread/list`. Shared so the picker looks the same
 /// whether it is opened from a live session or from a session still starting up.
 async fn open_resume_picker(server: &BackendServer, state: &mut AppState) {
-    match list_sessions(server, None, None, 100).await {
+    match list_sessions(
+        server,
+        Some(Path::new(&state.cwd)),
+        None,
+        100,
+        Some(state.selected_model_name()),
+    )
+    .await
+    {
         Ok(sessions) => state.open_session_picker(sessions),
         Err(error) => state.push_notice(BlockKind::Error, "세션 목록 실패", error.to_string()),
     }
@@ -793,9 +801,11 @@ async fn resolve_startup_session(
     cli: &Cli,
     server: &BackendServer,
     cwd: &Path,
+    requested_model: Option<&str>,
 ) -> Result<Option<String>> {
+    let provider_model = requested_model.or(Some("claude:default"));
     if cli.continue_session {
-        let sessions = list_sessions(server, Some(cwd), None, 1).await?;
+        let sessions = list_sessions(server, Some(cwd), None, 1, provider_model).await?;
         let session = sessions
             .first()
             .context("이 작업 폴더에서 계속할 세션을 찾지 못했습니다.")?;
@@ -805,12 +815,12 @@ async fn resolve_startup_session(
     match cli.resume.as_deref() {
         None => Ok(Some(String::new())),
         Some("") => {
-            let sessions = list_sessions(server, None, None, 100).await?;
+            let sessions = list_sessions(server, Some(cwd), None, 100, provider_model).await?;
             let mode = renderer::load_render_mode(cli.renderer.as_deref())?;
             choose_startup_session(sessions, cwd, mode).await
         }
         Some(target) => Ok(Some(
-            resolve_session_target(server, target, Some(cwd)).await?,
+            resolve_session_target(server, target, Some(cwd), provider_model).await?,
         )),
     }
 }
@@ -3573,14 +3583,20 @@ async fn resume_thread(
     // Turning a name into an id is a quick lookup, and a miss has to leave the
     // current session untouched, so it runs before anything is torn down.
     let current_cwd = state.cwd.clone();
-    let thread_id =
-        match resolve_session_target(server, target, Some(Path::new(&current_cwd))).await {
-            Ok(thread_id) => thread_id,
-            Err(error) => {
-                state.push_notice(BlockKind::Error, "세션 재개 실패", error.to_string());
-                return Ok(false);
-            }
-        };
+    let thread_id = match resolve_session_target(
+        server,
+        target,
+        Some(Path::new(&current_cwd)),
+        Some(state.selected_model_name()),
+    )
+    .await
+    {
+        Ok(thread_id) => thread_id,
+        Err(error) => {
+            state.push_notice(BlockKind::Error, "세션 재개 실패", error.to_string());
+            return Ok(false);
+        }
+    };
 
     if let Err(error) = server.prepare_resume_runtime(&thread_id).await {
         state.push_notice(BlockKind::Error, "세션 재개 실패", error.to_string());
@@ -5800,6 +5816,7 @@ async fn list_sessions(
     cwd: Option<&Path>,
     search: Option<&str>,
     limit: u64,
+    provider_model: Option<&str>,
 ) -> Result<Vec<SessionInfo>> {
     let mut params = json!({
         "limit": limit,
@@ -5811,6 +5828,9 @@ async fn list_sessions(
     }
     if let Some(search) = search {
         params["searchTerm"] = json!(search);
+    }
+    if let Some(model) = provider_model {
+        params["provider"] = json!(session_provider(model));
     }
     let response = server.request("thread/list", params).await?;
     Ok(response
@@ -5826,12 +5846,13 @@ async fn resolve_session_target(
     server: &BackendServer,
     target: &str,
     cwd: Option<&Path>,
+    provider_model: Option<&str>,
 ) -> Result<String> {
     if looks_like_thread_id(target) {
         return Ok(target.to_owned());
     }
 
-    let sessions = list_sessions(server, None, Some(target), 100).await?;
+    let sessions = list_sessions(server, cwd, Some(target), 100, provider_model).await?;
     let exact = sessions.iter().find(|session| {
         session
             .name
@@ -5947,6 +5968,16 @@ fn requested_startup_model<'a>(
 
 fn is_codex_model(model: &str) -> bool {
     !claude::is_claude_model(model) && !open_code::is_open_code_model(model)
+}
+
+fn session_provider(model: &str) -> &'static str {
+    if claude::is_claude_model(model) {
+        "claude"
+    } else if open_code::is_open_code_model(model) {
+        "opencode"
+    } else {
+        "codex"
+    }
 }
 
 fn preferred_claude_model(models: &[ModelInfo]) -> Option<&str> {
@@ -8005,6 +8036,13 @@ mod tests {
             state.drain_committed().is_empty(),
             "no `session not ready` notice is raised"
         );
+    }
+
+    #[test]
+    fn resume_list_uses_the_selected_provider() {
+        assert_eq!(session_provider("gpt-5.6-sol"), "codex");
+        assert_eq!(session_provider("claude:opus[1m]"), "claude");
+        assert_eq!(session_provider("opencode:opencode/big-pickle"), "opencode");
     }
 
     /// Picking a session mid-wait cannot run `thread/resume` yet — the thread being
