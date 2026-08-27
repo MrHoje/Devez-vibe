@@ -735,6 +735,12 @@ pub struct Renderer {
     /// Where the composer's prompt text was last painted, so a drag over it can
     /// be turned back into the characters it covered.
     composer_selection: Option<ComposerSelection>,
+    /// True while the highlight is the one Ctrl+A made. It stands for the whole
+    /// prompt rather than the cells it was taken from, so an edit answers to the
+    /// composer's own length even when the paint behind it is a frame stale.
+    composer_select_all: bool,
+    /// The last value handed to the host, so the flag is sent only when it turns.
+    reported_select_all: bool,
     /// The last painted prompt rows, retained in both render modes so vertical
     /// arrows can traverse visual wraps before falling back to prompt history.
     composer_navigation_layout: Option<ComposerLayout>,
@@ -1395,6 +1401,8 @@ impl Renderer {
             selection: Selection::default(),
             last_click: None,
             composer_selection: None,
+            composer_select_all: false,
+            reported_select_all: false,
             composer_navigation_layout: None,
             painted_selection: None,
             painted_frame: None,
@@ -1878,6 +1886,7 @@ impl Renderer {
     }
 
     pub fn begin_selection(&mut self, column: u16, row: u16) -> bool {
+        self.composer_select_all = false;
         if self.split_active {
             self.split_selection_focus = Some(self.split_pane_at_row(usize::from(row)));
             self.selection_in_panel = false;
@@ -1954,6 +1963,7 @@ impl Renderer {
         let lines = self.copy_lines();
         let line = lines.get(point.row)?;
         let range = word_range_at(line, usize::from(point.column))?;
+        self.composer_select_all = false;
         self.selection.set_range(CellRange {
             start: CellPosition {
                 row: point.row,
@@ -1972,7 +1982,34 @@ impl Renderer {
         self.selection_in_panel = false;
         self.selection_in_transcript = false;
         self.split_selection_focus = None;
+        self.composer_select_all = false;
         self.selection.clear()
+    }
+
+    /// True while Ctrl+A's highlight stands, so an edit knows it covers the whole
+    /// prompt rather than a range of painted cells.
+    pub fn composer_select_all_active(&self) -> bool {
+        self.composer_select_all && self.selection.range().is_some()
+    }
+
+    /// Tells DevezCode whether the whole prompt is selected, when that turns.
+    ///
+    /// The host hands an IME syllable over only once the composition ends, so
+    /// the keystroke that starts one never reaches this process — a selection
+    /// would sit untouched under the composition preview until some later event
+    /// committed it. Knowing the flag, the host can send the delete itself.
+    pub fn report_composer_selection(&mut self) -> Result<()> {
+        let active = self.composer_select_all_active();
+        if self.reported_select_all == active {
+            return Ok(());
+        }
+        self.reported_select_all = active;
+        let flag = u8::from(active);
+        execute!(
+            self.out,
+            Print(format!("\x1b]777;devez-select-v1;{flag}\x07"))
+        )?;
+        Ok(())
     }
 
     /// Returns the active transcript selection without changing it. Keyboard
@@ -2012,6 +2049,51 @@ impl Renderer {
             }
         }
         (start < end).then_some(start..end)
+    }
+
+    /// Highlights every composer character, as a drag across the whole prompt
+    /// would. The range lands in the same place a drag leaves it, so Backspace,
+    /// Delete and typing answer to it without knowing where it came from.
+    pub fn select_composer_all(&mut self) -> bool {
+        self.composer_select_all = false;
+        let Some(composer) = self.composer_selection.as_ref() else {
+            return false;
+        };
+        let mut start: Option<CellPosition> = None;
+        let mut end: Option<CellPosition> = None;
+        for (offset, row) in composer.layout.rows.iter().enumerate() {
+            let screen_row = composer.first_row + offset;
+            let mut column = row.start_column;
+            for glyph in &row.glyphs {
+                // Padding stands for no text, so it never anchors the selection.
+                if glyph.span.start < glyph.span.end && glyph.width > 0 {
+                    let (Ok(first), Ok(last)) = (
+                        u16::try_from(column),
+                        u16::try_from(column + glyph.width - 1),
+                    ) else {
+                        return false;
+                    };
+                    start.get_or_insert(CellPosition {
+                        row: screen_row,
+                        column: first,
+                    });
+                    end = Some(CellPosition {
+                        row: screen_row,
+                        column: last,
+                    });
+                }
+                column += glyph.width;
+            }
+        }
+        let (Some(start), Some(end)) = (start, end) else {
+            return false;
+        };
+        self.selection_in_transcript = false;
+        self.selection_in_panel = false;
+        self.split_selection_focus = None;
+        self.composer_select_all = true;
+        self.selection.set_range(CellRange { start, end });
+        true
     }
 
     /// Maps a click on a visible composer row to the closest safe cursor
@@ -7766,6 +7848,14 @@ fn is_empty_thinking_block(block: &Block) -> bool {
     is_thinking_block(block) && block.body.trim().is_empty()
 }
 
+/// 공백만 담긴 응답 블록은 한 행도 그리지 않는다. 목록에 남겨 두면 뒤따르는
+/// 블록이 이 블록을 직전 이웃으로 보고 여백을 접어, 프롬프트와 답변이 붙는다.
+fn is_blank_bodied_assistant_block(block: &Block) -> bool {
+    matches!(block.kind, BlockKind::Assistant)
+        && !block.body.is_empty()
+        && block.body.trim().is_empty()
+}
+
 fn is_file_change_block(block: &Block) -> bool {
     matches!(block.kind, BlockKind::FileChange)
 }
@@ -7787,7 +7877,7 @@ fn visible_transcript_blocks<'a>(
 ) -> Vec<&'a Block> {
     let mut visible: Vec<&Block> = Vec::new();
     for block in blocks {
-        if is_empty_thinking_block(block) {
+        if is_empty_thinking_block(block) || is_blank_bodied_assistant_block(block) {
             continue;
         }
         if shell_display_mode == ShellDisplayMode::Hide
@@ -13975,6 +14065,48 @@ mod tests {
 
         // Chrome on its own selects nothing to delete.
         assert!(renderer.begin_selection(0, 1));
+        assert_eq!(renderer.composer_selection_range(), None);
+    }
+
+    #[test]
+    fn ctrl_a_selects_every_composer_character_across_wrapped_rows() {
+        let mut editor = Editor::default();
+        editor.set_text("abcdefgh");
+        let (rows, _, _, layout) = input_lines(&editor, &[], 16, "", "placeholder", None, None);
+        assert_eq!(layout.rows.len(), 2);
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = rows;
+        renderer.composer_selection = Some(ComposerSelection {
+            first_row: 1,
+            layout,
+        });
+
+        assert!(renderer.select_composer_all());
+        assert_eq!(renderer.composer_selection_range(), Some(0..8));
+        // The highlight stands for the prompt itself, so an edit can answer to
+        // the composer instead of to the cells this paint happened to use.
+        assert!(renderer.composer_select_all_active());
+
+        // The paint that follows the key leaves the prompt rows alone, so the
+        // highlight has to survive it.
+        let lines = renderer.previous_lines.clone();
+        renderer.reconcile_selection(&lines, 0, &[]);
+        assert_eq!(renderer.composer_selection_range(), Some(0..8));
+
+        // A drag makes an ordinary range again.
+        assert!(renderer.begin_selection(10, 1));
+        assert!(!renderer.composer_select_all_active());
+
+        // An empty composer has nothing to highlight.
+        let (rows, _, _, layout) =
+            input_lines(&Editor::default(), &[], 16, "", "placeholder", None, None);
+        renderer.previous_lines = rows;
+        renderer.composer_selection = Some(ComposerSelection {
+            first_row: 1,
+            layout,
+        });
+        assert!(renderer.clear_selection());
+        assert!(!renderer.select_composer_all());
         assert_eq!(renderer.composer_selection_range(), None);
     }
 
@@ -23980,6 +24112,50 @@ mod tests {
             body.tail
                 .first()
                 .is_some_and(|span| span.tone == Tone::Border)
+        );
+    }
+
+    /// OpenCode는 답변 앞에 개행만 담긴 응답 항목을 먼저 보낸다. 그 항목이 목록에
+    /// 남아 있으면 이어지는 답변이 여백을 접어 프롬프트에 달라붙었다.
+    #[test]
+    fn a_blank_open_code_response_keeps_the_prompt_spacer() {
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.fold_progress_groups = true;
+        renderer.chat_layout = false;
+        set_chat_layout(false);
+        renderer.wrapped_width = 80;
+        let prompt = Block::new(BlockKind::User, "OpenCode", "보낸 프롬프트");
+        let blank = Block::new(BlockKind::Assistant, "OpenCode", "
+");
+        let answer = Block::new(BlockKind::Assistant, "OpenCode", "응답 첫 줄
+");
+        for block in [prompt, blank, answer] {
+            renderer.commit_fullscreen_blocks(&[block], 80, 20);
+        }
+
+        let prompt_row = renderer
+            .wrapped
+            .iter()
+            .position(|line| line.text.contains("보낸 프롬프트"))
+            .expect("prompt row");
+        let answer_row = renderer
+            .wrapped
+            .iter()
+            .position(|line| painted_line_text(line).contains("응답 첫 줄"))
+            .expect("answer row");
+        let spacers = renderer.wrapped[prompt_row + 1..answer_row]
+            .iter()
+            .filter(|line| paint_line_is_visually_blank(line))
+            .count();
+
+        assert_eq!(
+            spacers,
+            1,
+            "프롬프트와 답변 사이 구분 줄이 남아야 한다: {:?}",
+            renderer.wrapped[prompt_row..=answer_row]
+                .iter()
+                .map(painted_line_text)
+                .collect::<Vec<_>>()
         );
     }
 }

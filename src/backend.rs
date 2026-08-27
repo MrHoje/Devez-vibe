@@ -2311,12 +2311,16 @@ fn prepare_codex_turn_context(params: &mut Value) {
 
 fn combined_turn_instructions(params: &Value, runtime: RuntimeKind) -> Option<String> {
     // Claude holds the full rules as its system prompt and Codex as its thread
-    // instructions, so neither turn restates them. Only OpenCode, which has no
-    // standing instructions of its own, carries them here.
-    let rules_paths: &[&str] = match runtime {
-        RuntimeKind::Codex | RuntimeKind::Claude => &[],
-        RuntimeKind::OpenCode => &["/additionalContext/devez-vibe-rules/value"],
-    };
+    // instructions, so neither turn restates them. OpenCode is left alone on
+    // purpose: it receives neither the rules nor the response-mode notice, and
+    // only the handoff summary still travels with the turn.
+    let mode = (runtime != RuntimeKind::OpenCode)
+        .then(|| {
+            params
+                .pointer("/additionalContext/devez-vibe-mode/value")
+                .and_then(Value::as_str)
+        })
+        .flatten();
     let claude_reminder = (runtime == RuntimeKind::Claude)
         .then(|| {
             params
@@ -2325,12 +2329,7 @@ fn combined_turn_instructions(params: &Value, runtime: RuntimeKind) -> Option<St
         })
         .flatten();
     let parts = [
-        rules_paths
-            .iter()
-            .find_map(|path| params.pointer(path).and_then(Value::as_str)),
-        params
-            .pointer("/additionalContext/devez-vibe-mode/value")
-            .and_then(Value::as_str),
+        mode,
         params
             .pointer("/additionalContext/provider-handoff/value")
             .and_then(Value::as_str),
@@ -2888,8 +2887,8 @@ mod tests {
         insert_handoff_context(&mut params, "history");
 
         // Claude opens on the rules as its system prompt, so its turn carries
-        // only the preset, handoff, and short output reminder. OpenCode has no
-        // such prompt of its own and still needs the full rules.
+        // only the preset, handoff, and short output reminder. OpenCode takes
+        // neither the rules nor the preset, leaving the handoff alone.
         assert_eq!(
             combined_turn_instructions(&params, RuntimeKind::Claude).as_deref(),
             Some("super vibe\n\nhistory\n\nclaude reminder")
@@ -2900,7 +2899,7 @@ mod tests {
         );
         assert_eq!(
             combined_turn_instructions(&params, RuntimeKind::OpenCode).as_deref(),
-            Some("codex rules\n\nsuper vibe\n\nhistory")
+            Some("history")
         );
     }
 

@@ -1334,6 +1334,9 @@ pub enum Action {
     ScrollToBottom,
     ScrollToPrompt(u64),
     Copy(String),
+    /// Highlight the whole prompt. The selection lives in the renderer, which
+    /// alone knows where the composer's characters were painted.
+    SelectComposerAll,
     /// Fetch MCP server status and open the picker. Any notice is carried over
     /// so the result of the action that reopened it stays on screen.
     OpenMcp(Option<String>),
@@ -7218,9 +7221,18 @@ impl AppState {
                 self.delete_from_composer(Editor::delete);
                 Action::None
             }
-            KeyCode::Char('a') if ctrl => {
-                self.editor.move_home();
-                Action::None
+            // Ctrl+A selects the whole prompt, as it does in an ordinary editor.
+            // An empty composer has nothing to select, so it keeps the historical
+            // move to the line start there; Home does that job either way. With a
+            // Korean IME on, the chord can arrive as its 두벌식 jamo, which no
+            // chord of its own claims.
+            KeyCode::Char('a' | 'ㅁ') if ctrl => {
+                if self.editor.is_empty() && self.composer_images.is_empty() {
+                    self.editor.move_home();
+                    Action::None
+                } else {
+                    Action::SelectComposerAll
+                }
             }
             KeyCode::Char('e') if ctrl => {
                 self.editor.move_end();
@@ -15696,6 +15708,33 @@ mod tests {
             "gpt-5.6-sol",
             Some("high"),
         )
+    }
+
+    #[test]
+    fn ctrl_a_asks_for_a_full_selection_only_when_the_composer_has_text() {
+        let mut state = test_state();
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+
+        assert!(matches!(state.handle_key(ctrl_a), Action::None));
+
+        state.editor.set_text("hello world");
+        assert!(matches!(
+            state.handle_key(ctrl_a),
+            Action::SelectComposerAll
+        ));
+        assert_eq!(state.editor.text(), "hello world");
+
+        // A Korean IME sends the chord as its 두벌식 jamo.
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('ㅁ'), KeyModifiers::CONTROL)),
+            Action::SelectComposerAll
+        ));
+        // The jamo on its own is still text.
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Char('ㅁ'))),
+            Action::None
+        ));
+        assert_eq!(state.editor.text(), "hello worldㅁ");
     }
 
     fn opencode_picker_state() -> AppState {

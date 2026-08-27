@@ -5,6 +5,7 @@ mod claude;
 mod completion;
 mod devezcode;
 mod editor;
+mod input_log;
 mod integrations;
 mod open_code;
 mod paste;
@@ -1477,12 +1478,31 @@ async fn event_loop(
         }
         let mut connection_closed = false;
         let mut animation_tick = false;
+        // Set when an edit took a selection. Paste batching holds the screen still
+        // while keys arrive in a burst, but text vanishing from the prompt has to
+        // be seen at once — otherwise the selection looks untouched until the next
+        // unrelated event flushes the batch.
+        let mut selection_edited = false;
         let mut action_focus = split_focus;
         let paste_deadline = composer_paste.flush_deadline();
         let action = tokio::select! {
             terminal_event = terminal_events.next() => {
                 match terminal_event {
                     Some(Ok(Event::Key(key))) => {
+                        if input_log::enabled() {
+                            let selection = renderer.composer_selection_range();
+                            let select_all = renderer.composer_select_all_active();
+                            let text = focused_state_mut(state, &mut btw_state, split_focus)
+                                .editor
+                                .text();
+                            input_log::record(|| {
+                                format!(
+                                    "key {:?} mods={:?} kind={:?} select_all={select_all} \
+                                     selection={selection:?} composer={text:?}",
+                                    key.code, key.modifiers, key.kind
+                                )
+                            });
+                        }
                         if btw_state.is_some()
                             && key.code == KeyCode::Tab
                             && key.modifiers.is_empty()
@@ -1523,13 +1543,42 @@ async fn event_loop(
                                 renderer.clear_selection();
                                 Action::Tick(true)
                             } else if is_selection_delete_key(&key)
-                                && let Some(range) = renderer.composer_selection_range()
+                                && let Some(range) = composer_replace_range(renderer, input_state)
                                 && input_state.delete_composer_selection(range)
                             {
                                 // The drag selected composer text, so the key takes the
                                 // selection rather than the character at the cursor.
                                 renderer.clear_selection();
+                                selection_edited = true;
                                 Action::Tick(true)
+                            } else if is_selection_replace_key(&key)
+                                && let Some(range) = composer_replace_range(renderer, input_state)
+                                && input_state.delete_composer_selection(range)
+                            {
+                                // Typing over a selection replaces it, so the character
+                                // is inserted where the selected text used to be. Text
+                                // an IME commits arrives as these same keys, so a
+                                // syllable typed over the selection replaces it too.
+                                input_log::record(|| {
+                                    format!("  replaced selection for {:?}", key.code)
+                                });
+                                renderer.clear_selection();
+                                selection_edited = true;
+                                let action = observe_composer_key_with_scroll(
+                                    input_state,
+                                    renderer,
+                                    &mut composer_paste,
+                                    key,
+                                    Instant::now(),
+                                );
+                                // The batch would otherwise hold this character
+                                // until the next event, leaving an empty prompt on
+                                // screen where the replacement should already be.
+                                flush_composer_paste_now(input_state, &mut composer_paste);
+                                match action {
+                                    Action::Tick(false) => Action::Tick(true),
+                                    action => action,
+                                }
                             } else if key.code == KeyCode::Char('c')
                                 && key.modifiers.contains(KeyModifiers::CONTROL)
                             {
@@ -1541,8 +1590,12 @@ async fn event_loop(
                                     Action::Copy(text)
                                 } else {
                                     // Typing means the drag is over and its highlight is
-                                    // stale, so it goes before the key is acted on.
-                                    let cleared = renderer.clear_selection();
+                                    // stale, so it goes before the key is acted on. A
+                                    // release is the tail of a press that was already
+                                    // acted on, and terminals that report it must not
+                                    // undo the selection that press just made.
+                                    let cleared = key.kind != KeyEventKind::Release
+                                        && renderer.clear_selection();
                                     let action = observe_composer_key_with_scroll(
                                         input_state,
                                         renderer,
@@ -1557,8 +1610,12 @@ async fn event_loop(
                                 }
                             } else {
                                 // Typing means the drag is over and its highlight is
-                                // stale, so it goes before the key is acted on.
-                                let cleared = renderer.clear_selection();
+                                // stale, so it goes before the key is acted on. A
+                                // release is the tail of a press that was already acted
+                                // on, and terminals that report it must not undo the
+                                // selection that press just made.
+                                let cleared =
+                                    key.kind != KeyEventKind::Release && renderer.clear_selection();
                                 let action = observe_composer_key_with_scroll(
                                     input_state,
                                     renderer,
@@ -1587,6 +1644,25 @@ async fn event_loop(
                     }
                     Some(Ok(Event::Paste(text))) => {
                         let input_state = focused_state_mut(state, &mut btw_state, split_focus);
+                        if input_log::enabled() {
+                            let select_all = renderer.composer_select_all_active();
+                            let selection = renderer.composer_selection_range();
+                            let composer = input_state.editor.text();
+                            input_log::record(|| {
+                                format!(
+                                    "paste {text:?} select_all={select_all} \
+                                     selection={selection:?} composer={composer:?}"
+                                )
+                            });
+                        }
+                        // A paste replaces the selection the way typing does. Text an
+                        // IME commits can reach the composer this way too, and it is
+                        // the replacement the user typed, so it takes the same path.
+                        if let Some(range) = composer_replace_range(renderer, input_state) {
+                            input_state.delete_composer_selection(range);
+                            selection_edited = true;
+                            input_log::record(|| "  replaced selection for paste".to_owned());
+                        }
                         renderer.clear_selection();
                         if composer_paste.take_discarded_paste(&text) {
                             // The shortcut already expanded the block this
@@ -1818,13 +1894,23 @@ async fn event_loop(
         // Windows exposes a paste as many key events. Do not render between
         // those events while the composer is collecting them; rendering is
         // much slower than parsing and used to make long pastes crawl.
-        let redraw = !matches!(&action, Action::Tick(false)) && !composer_paste.is_buffering();
+        let redraw = selection_edited
+            || (!matches!(&action, Action::Tick(false)) && !composer_paste.is_buffering());
         let returning_from_side = matches!(&action, Action::ReturnFromSide);
         let split_handoff = (btw_state.is_some()
             && action_focus == SplitFocus::Main
             && matches!(&action, Action::Submit(_)))
         .then(|| provider_handoff_snapshot(state, renderer));
+        let mut select_all_pending = false;
         let should_quit = match action {
+            // Claimed ahead of the split routing: the highlight belongs to the
+            // renderer, which paints whichever composer the key came from. It is
+            // taken after the paint, when the prompt rows the highlight indexes
+            // are the ones on screen.
+            Action::SelectComposerAll => {
+                select_all_pending = true;
+                false
+            }
             Action::StartSide(prompt) if btw_state.is_none() => {
                 if let Some(btw) = open_btw(server, state, prompt).await {
                     btw_parent_plan_expanded = collapse_main_plan_for_btw(state);
@@ -1873,6 +1959,23 @@ async fn event_loop(
                 draw_conversations(state, &mut btw_state, split_focus, renderer)?;
             }
         }
+        // The paint above is what tells the renderer where the prompt characters
+        // ended up, so the highlight is taken from it and painted by one more.
+        if select_all_pending {
+            let selected = renderer.select_composer_all();
+            input_log::record(|| {
+                format!(
+                    "  select all -> {selected} selection={:?}",
+                    renderer.composer_selection_range()
+                )
+            });
+            if selected {
+                draw_conversations(state, &mut btw_state, split_focus, renderer)?;
+            }
+        }
+        // Sent after the highlight settles for this pass, so the host's copy of
+        // the flag matches what is on screen before the next key reaches it.
+        renderer.report_composer_selection()?;
         if should_quit || connection_closed {
             break;
         }
@@ -2244,6 +2347,7 @@ async fn execute_action(
         | Action::SetTheme(_)
         | Action::ScrollToBottom
         | Action::ScrollToPrompt(_)
+        | Action::SelectComposerAll
         | Action::Quit) => return execute_local_action(state, renderer, action),
         Action::Submit(text) => {
             renderer.scroll_to_bottom();
@@ -3993,6 +4097,9 @@ fn execute_local_action(
         Action::ScrollToPrompt(block_id) => {
             renderer.scroll_to_prompt(block_id);
         }
+        Action::SelectComposerAll => {
+            renderer.select_composer_all();
+        }
         // `Action::None`, `Action::Tick`, and anything routed here by mistake: the
         // callers only ever pass the variants above, so silently doing nothing is
         // safer than panicking inside the render loop.
@@ -5331,6 +5438,34 @@ fn is_selection_delete_key(key: &KeyEvent) -> bool {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
 }
 
+/// The composer characters an edit typed over the selection should take. Ctrl+A
+/// means the whole prompt, and answering from the composer rather than from the
+/// painted cells keeps that true while a paint is still catching up — an IME
+/// commits its syllable well after the key that started it.
+fn composer_replace_range(
+    renderer: &Renderer,
+    state: &AppState,
+) -> Option<std::ops::Range<usize>> {
+    if renderer.composer_select_all_active() {
+        let end = state.editor.chars().len();
+        return (end > 0).then_some(0..end);
+    }
+    renderer.composer_selection_range()
+}
+
+/// A plain character typed over selected composer text replaces it, as it does in
+/// any other editor. Chords are excluded: they carry their own meanings, and Enter
+/// submits rather than edits, so neither disturbs the selection here.
+fn is_selection_replace_key(key: &KeyEvent) -> bool {
+    matches!(
+        key.kind,
+        crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
+    ) && matches!(key.code, KeyCode::Char(_))
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+}
+
 fn attach_pasted_local_image(state: &mut AppState, text: &str) -> bool {
     let Some(path) = local_image_path_from_paste(text) else {
         return false;
@@ -5475,6 +5610,18 @@ fn observe_composer_key_with_scroll(
             renderer,
             buffer.observe_expected(key, now, expected_paste.as_deref()),
         )
+    }
+}
+
+/// Empties the batch immediately, for the one case that cannot wait for it to go
+/// idle: the character typed over a selection, which has to appear in the same
+/// frame the selected text disappears from.
+fn flush_composer_paste_now(state: &mut AppState, buffer: &mut ComposerPasteBuffer) -> bool {
+    if let Some(text) = buffer.flush_now() {
+        apply_composer_text(state, text);
+        true
+    } else {
+        false
     }
 }
 

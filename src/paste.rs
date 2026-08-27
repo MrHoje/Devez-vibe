@@ -379,6 +379,13 @@ impl ComposerPasteBuffer {
         vec![ComposerInput::Text(prior)]
     }
 
+    /// Hands over whatever is waiting, without the idle gap. An edit that took a
+    /// selection has to reach the prompt in the same frame the selection leaves
+    /// it, so the text behind it cannot sit in the batch a moment longer.
+    pub fn flush_now(&mut self) -> Option<BufferedText> {
+        self.flush()
+    }
+
     fn flush(&mut self) -> Option<BufferedText> {
         let buffered = (!self.text.is_empty()).then(|| BufferedText {
             text: std::mem::take(&mut self.text),
