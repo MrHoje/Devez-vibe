@@ -6437,6 +6437,11 @@ impl AppState {
         if self.vibe_mode == VibeMode::SuperVibe || self.plan_panel_hidden {
             committed.retain(|block| !is_plan_block(block));
         }
+        if self.vibe_mode == VibeMode::SuperVibe {
+            // Super Vibe answers carry the conclusion alone, so the reasoning
+            // summary that precedes them is dropped here too.
+            committed.retain(|block| !is_thinking(block));
+        }
         committed
     }
 
@@ -6468,6 +6473,7 @@ impl AppState {
                         && is_shell_hidden_block(&item.block))
                     || ((self.vibe_mode == VibeMode::SuperVibe || self.plan_panel_hidden)
                         && is_plan_block(&item.block))
+                    || (self.vibe_mode == VibeMode::SuperVibe && is_thinking(&item.block))
                     || is_empty_thinking(&item.block)
                 {
                     return None;
@@ -16864,6 +16870,57 @@ mod tests {
             state.cycle_vibe_mode();
         }
         assert_eq!(titles(&mut state), ["Plan", "작업 단계", "Codex"]);
+    }
+
+    #[test]
+    /// A Super Vibe answer is the conclusion alone, so the dim italic thought
+    /// that streams ahead of it is dropped. Only the model that emits reasoning
+    /// showed it at all, which made the mode look inconsistent between models.
+    fn super_vibe_drops_the_reasoning_summary_from_the_transcript() {
+        let mut state = test_state();
+        state.show_welcome = false;
+        let replayed = vec![
+            Block::new(BlockKind::Reasoning, "Thinking…", "원인을 찾았습니다"),
+            Block::new(BlockKind::Assistant, "Codex", "본문은 남는다"),
+        ];
+        let titles = |state: &mut AppState| {
+            state.committed = replayed.clone();
+            state
+                .drain_committed()
+                .iter()
+                .map(|block| block.title.clone())
+                .collect::<Vec<_>>()
+        };
+        while state.vibe_mode() != VibeMode::SuperVibe {
+            state.cycle_vibe_mode();
+        }
+
+        assert_eq!(titles(&mut state), ["Codex"]);
+
+        while state.vibe_mode() != VibeMode::Vibe {
+            state.cycle_vibe_mode();
+        }
+        assert_eq!(titles(&mut state), ["Thinking…", "Codex"]);
+    }
+
+    #[test]
+    /// Hiding it only on the drain would still let the thought paint while it
+    /// streams, so the live frame drops it under the same mode.
+    fn super_vibe_hides_the_streaming_thought_from_the_live_frame() {
+        let mut state = test_state();
+        state
+            .ensure_active("reasoning", BlockKind::Reasoning, "Thinking…")
+            .block
+            .body = "원인을 좁히는 중".to_owned();
+        while state.vibe_mode() != VibeMode::SuperVibe {
+            state.cycle_vibe_mode();
+        }
+        assert!(state.view().live_blocks.is_empty());
+
+        while state.vibe_mode() != VibeMode::Vibe {
+            state.cycle_vibe_mode();
+        }
+        assert_eq!(state.view().live_blocks.len(), 1);
     }
 
     #[test]
