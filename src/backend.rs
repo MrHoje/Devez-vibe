@@ -748,6 +748,7 @@ impl BackendServer {
                 }
             }
             "claude/permissions/status" => self.claude.request("permissions/status", params).await,
+            "claude/account/read" => self.claude.request("account/read", params).await,
             "claude/permissions/update" => self.claude.request("permissions/update", params).await,
             "claude/permissions/auto-mode" => {
                 self.claude.request("permissions/auto-mode", params).await

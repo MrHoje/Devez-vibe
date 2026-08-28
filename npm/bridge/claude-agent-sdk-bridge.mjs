@@ -3020,6 +3020,9 @@ async function dispatch(method, params = {}) {
   }
   if (method === "skills/list") return claudeSkills(params);
   if (method === "app/list") return { data: [] };
+  if (method === "account/read") {
+    return await runClaudeJson(params, ["auth", "status", "--json"]) || {};
+  }
   if (method === "plugin/reload") {
     return { message: "Claude 플러그인 설정을 다시 읽었습니다. 새 대화부터 적용됩니다." };
   }

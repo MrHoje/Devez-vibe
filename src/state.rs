@@ -1305,6 +1305,7 @@ fn move_model_index_in(candidates: &[usize], model_index: usize, direction: i8) 
 
 pub enum Action {
     None,
+    ShowStatus,
     Submit(String),
     Steer(String),
     Interrupt,
@@ -9369,60 +9370,7 @@ impl AppState {
                 Action::None
             }
             "/new" | "/clear" => Action::NewThread,
-            "/status" => {
-                let model = self.selected_model_display_name();
-                let provider = self.selected_provider().label();
-                let context = self.context_window.map(|window| {
-                    let used = self.context_tokens.min(window);
-                    let left = 100u64.saturating_sub(used.saturating_mul(100) / window.max(1));
-                    format!(
-                        "Context window: {left}% left ({} used / {})",
-                        context_status_token_label(used),
-                        context_status_token_label(window)
-                    )
-                });
-                let permissions = self
-                    .claude_permission_mode()
-                    .map(|mode| format!("{} ({})", mode.label(), mode.wire()))
-                    .unwrap_or_else(|| {
-                        format!(
-                            "{} ({})",
-                            self.permission_mode().label(),
-                            self.permission_mode().profile()
-                        )
-                    });
-                let connections = format!(
-                    "Claude {} · Codex {} · OpenCode {}",
-                    if self.claude_provider_enabled {
-                        "연결됨"
-                    } else {
-                        "연결 안 함"
-                    },
-                    if self.codex_provider_enabled {
-                        "연결됨"
-                    } else {
-                        "연결 안 함"
-                    },
-                    if self.opencode_provider_connected {
-                        "연결됨"
-                    } else {
-                        "연결 안 함"
-                    }
-                );
-                self.committed.push(Block::new(
-                    BlockKind::System,
-                    "Status",
-                    format!(
-                        "thread: {}\nprovider: {provider}\nconnections: {connections}\nmodel: {model}\neffort: {}\n{}theme: {}\npermissions: {permissions}\ncwd: {}",
-                        self.thread_id,
-                        self.selected_effort,
-                        context.map(|value| format!("{value}\n")).unwrap_or_default(),
-                        theme::current().display_name(),
-                        self.cwd
-                    ),
-                ));
-                Action::None
-            }
+            "/status" => Action::ShowStatus,
             "/usage" => {
                 let five_hour = self
                     .five_hour_percent
@@ -9449,6 +9397,61 @@ impl AppState {
                 Action::None
             }
         }
+    }
+
+    pub fn show_status(&mut self) {
+        let model = self.selected_model_display_name();
+        let provider = self.selected_provider().label();
+        let context = self.context_window.map(|window| {
+            let used = self.context_tokens.min(window);
+            let left = 100u64.saturating_sub(used.saturating_mul(100) / window.max(1));
+            format!(
+                "Context window: {left}% left ({} used / {})",
+                context_status_token_label(used),
+                context_status_token_label(window)
+            )
+        });
+        let permissions = self
+            .claude_permission_mode()
+            .map(|mode| format!("{} ({})", mode.label(), mode.wire()))
+            .unwrap_or_else(|| {
+                format!(
+                    "{} ({})",
+                    self.permission_mode().label(),
+                    self.permission_mode().profile()
+                )
+            });
+        let connections = format!(
+            "Claude {} · Codex {} · OpenCode {}",
+            if self.claude_provider_enabled {
+                "연결됨"
+            } else {
+                "연결 안 함"
+            },
+            if self.codex_provider_enabled {
+                "연결됨"
+            } else {
+                "연결 안 함"
+            },
+            if self.opencode_provider_connected {
+                "연결됨"
+            } else {
+                "연결 안 함"
+            }
+        );
+        self.committed.push(Block::new(
+            BlockKind::System,
+            "Status",
+            format!(
+                "thread: {}\nprovider: {provider}\naccount: {}\nconnections: {connections}\nmodel: {model}\neffort: {}\n{}theme: {}\npermissions: {permissions}\ncwd: {}",
+                self.thread_id,
+                self.account,
+                self.selected_effort,
+                context.map(|value| format!("{value}\n")).unwrap_or_default(),
+                theme::current().display_name(),
+                self.cwd
+            ),
+        ));
     }
 
     fn handle_pending_key(&mut self, key: KeyEvent) -> Action {
@@ -19764,7 +19767,11 @@ mod tests {
             (&mut codex, "permissions: Full Access (:danger-full-access)"),
             (&mut claude, "permissions: don't ask (dontAsk)"),
         ] {
-            state.run_slash_command("/status");
+            assert!(matches!(
+                state.run_slash_command("/status"),
+                Action::ShowStatus
+            ));
+            state.show_status();
             assert!(
                 state
                     .committed
@@ -19783,7 +19790,7 @@ mod tests {
         state.context_window = Some(1_000_000);
         state.context_tokens = 0;
 
-        state.run_slash_command("/status");
+        state.show_status();
 
         assert!(
             state
@@ -19793,6 +19800,39 @@ mod tests {
                 .body
                 .contains("Context window: 100% left (0 used / 1M)"),
             "missing context window status"
+        );
+    }
+
+    #[test]
+    fn status_command_reports_the_selected_provider_account() {
+        let mut codex = test_state();
+        codex.set_account("codex@example.com".to_owned());
+        codex.show_status();
+        assert!(
+            codex
+                .committed
+                .last()
+                .expect("Codex status block")
+                .body
+                .contains("provider: Codex\naccount: codex@example.com")
+        );
+
+        let mut claude = AppState::new(
+            "claude:thread".to_owned(),
+            "cwd".to_owned(),
+            "claude@example.com".to_owned(),
+            vec![test_model("claude:sonnet", "Sonnet", true)],
+            "claude:sonnet",
+            Some("high"),
+        );
+        claude.show_status();
+        assert!(
+            claude
+                .committed
+                .last()
+                .expect("Claude status block")
+                .body
+                .contains("provider: Claude\naccount: claude@example.com")
         );
     }
 

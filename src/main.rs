@@ -682,6 +682,10 @@ async fn await_thread(
             // straight to the RPC rather than through `execute_action`, which would
             // make the two mutually recursive — `/resume` waits the same way.
             Some(Action::OpenResume) => open_resume_picker(server, state).await,
+            Some(Action::ShowStatus) => {
+                refresh_account(server, state).await;
+                state.show_status();
+            }
             Some(action) => {
                 if execute_local_action(state, renderer, action)? {
                     return Ok(Startup::Quit);
@@ -714,6 +718,7 @@ fn hold_until_thread(
         | Action::Copy(_)
         | Action::Cut(_)
         | Action::OpenUrl(_)) => Some(action),
+        Action::ShowStatus => Some(Action::ShowStatus),
         Action::ScrollToBottom => Some(Action::ScrollToBottom),
         // Once a switch is owed, the prompt belongs to the session being resumed. The
         // session being started is about to be walked away from, and `prepare_resume`
@@ -2370,6 +2375,10 @@ async fn execute_action(
         | Action::ScrollToPrompt(_)
         | Action::SelectComposerAll
         | Action::Quit) => return execute_local_action(state, renderer, action),
+        Action::ShowStatus => {
+            refresh_account(server, state).await;
+            state.show_status();
+        }
         Action::Submit(text) => {
             renderer.scroll_to_bottom();
             let handoff = provider_handoff_snapshot(state, renderer);
@@ -5891,10 +5900,38 @@ async fn refresh_account(server: &BackendServer, state: &mut AppState) {
         state.set_account_plan(AccountPlan::default());
         return;
     }
+    if claude::is_claude_model(&model) {
+        if let Ok(account) = server
+            .request("claude/account/read", json!({ "cwd": state.cwd }))
+            .await
+            && let Some(label) = claude_account_label(&account)
+        {
+            state.set_account(label);
+        }
+        return;
+    }
     if let Ok(label) = ensure_account(server).await {
         state.set_account(label);
     }
     state.set_account_plan(read_runtime_account_plan(server, &model).await);
+}
+
+fn claude_account_label(account: &Value) -> Option<String> {
+    if account.get("loggedIn").and_then(Value::as_bool) == Some(false) {
+        return Some("signed out".to_owned());
+    }
+    account
+        .get("email")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            account
+                .get("authMethod")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("Claude {value}"))
+        })
 }
 
 /// Plan and reset-credit entitlements for the welcome card. Fails soft: the panel
@@ -6314,6 +6351,23 @@ mod tests {
     use theme::ThemeKind;
 
     use super::*;
+
+    #[test]
+    fn claude_account_status_prefers_email_and_reports_signed_out() {
+        assert_eq!(
+            claude_account_label(&json!({
+                "loggedIn": true,
+                "authMethod": "claude.ai",
+                "email": "claude@example.com"
+            }))
+            .as_deref(),
+            Some("claude@example.com")
+        );
+        assert_eq!(
+            claude_account_label(&json!({ "loggedIn": false })).as_deref(),
+            Some("signed out")
+        );
+    }
 
     #[test]
     fn codex_child_thread_status_distinguishes_running_terminal_and_unknown() {

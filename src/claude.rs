@@ -635,6 +635,14 @@ mod tests {
     }
 
     #[test]
+    fn bridge_reads_the_current_claude_account_without_a_session() {
+        let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
+
+        assert!(bridge.contains("method === \"account/read\""));
+        assert!(bridge.contains("[\"auth\", \"status\", \"--json\"]"));
+    }
+
+    #[test]
     fn bridge_filters_local_commands_and_restores_each_turn_model() {
         let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
 
