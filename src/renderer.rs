@@ -4314,9 +4314,16 @@ fn emit_frame_diff_at(
         // all narrow, as when a space or Latin letter follows Hangul — therefore
         // redraws from its first damaged column to the end of the row in one
         // continuous run, rather than patching each changed span in place.
-        let tail_start = previous
-            .and_then(|previous| tail_repaint_start(previous, current, row))
-            .filter(|start| start + 1 < current.width);
+        let tail_start = match previous {
+            Some(previous) => tail_repaint_start(previous, current, row),
+            // A fresh paint has no diff to localize; a row carrying a wide
+            // glyph still walks from column zero in one continuous run so the
+            // host never replays style-run jumps into its middle.
+            None => (0..current.width)
+                .any(|column| current.cell(column, row).continuation)
+                .then_some(0),
+        }
+        .filter(|start| start + 1 < current.width);
         let diff_end = tail_start.unwrap_or(current.width);
         let mut column = 0;
         while column < diff_end {
