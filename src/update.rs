@@ -19,12 +19,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "설치할 때 `luna-loop` 스킬이 Codex와 Claude의 사용자 스킬 폴더에 함께 설치됩니다. 자동으로 켜지지 않고 `$luna-loop`로 직접 불러야 동작합니다.",
-    "백그라운드로 맡긴 자식 에이전트가 끝난 뒤 이어지는 답변이 화면에 나오지 않던 문제를 고쳤습니다.",
-    "대화를 이어서 열 때 지난 기록이 다시 흘러 새 답변처럼 보이던 현상을 없앴습니다.",
-    "모델·제공자·Fast 설정을 바꿨을 때 뜨는 알림을 바뀐 값까지 한 줄에 담아 보여 줍니다.",
-    "입력창이 다음 줄로 넘어가는 순간 이전 한글 줄이 아래에 잠깐 남던 잔상을 없앴습니다.",
-    "Codex 자식 에이전트 목록에서 줄마다 반복되던 작업 폴더 경로를 빼고 실제 할 일만 보여 줍니다.",
+    "대화를 분기해 새 스레드를 열 때 원래 대화의 모델과 추론 강도를 그대로 이어받습니다.",
+    "분기한 대화를 나중에 다시 열어도 처음 열렸던 모델과 추론 강도가 유지됩니다.",
+    "OpenCode 대화를 분기할 때 모델과 추론 강도가 기본값으로 되돌아가던 문제를 고쳤습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
