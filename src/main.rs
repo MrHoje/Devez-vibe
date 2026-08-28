@@ -674,7 +674,9 @@ async fn await_thread(
             _ = spinner_tick.tick() => Action::Tick(state.tick()),
         };
 
-        redraw = !matches!(&action, Action::Tick(false)) && !composer_paste.is_buffering();
+        let force_paint = composer_paste.take_force_paint();
+        redraw = force_paint
+            || (!matches!(&action, Action::Tick(false)) && !composer_paste.is_buffering());
         match hold_until_thread(state, action, &mut queued) {
             // Listing sessions is the one server call the wait makes itself. It goes
             // straight to the RPC rather than through `execute_action`, which would
@@ -1906,7 +1908,9 @@ async fn event_loop(
         // Windows exposes a paste as many key events. Do not render between
         // those events while the composer is collecting them; rendering is
         // much slower than parsing and used to make long pastes crawl.
+        let force_paint = composer_paste.take_force_paint();
         let redraw = selection_edited
+            || force_paint
             || (!matches!(&action, Action::Tick(false)) && !composer_paste.is_buffering());
         let returning_from_side = matches!(&action, Action::ReturnFromSide);
         let split_handoff = (btw_state.is_some()

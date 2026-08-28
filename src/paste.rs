@@ -102,6 +102,12 @@ pub struct ComposerPasteBuffer {
     verified_paste: bool,
     discard: Option<Vec<char>>,
     discard_index: usize,
+    /// One repaint owed even while the discard transaction keeps per-key
+    /// paints off. Set when the clipboard itself was just applied to the
+    /// composer: that change is already on screen state, and a terminal that
+    /// never re-synthesizes the payload (DevezCode forwards only `Ctrl+V`)
+    /// sends no further event to trigger the paint.
+    force_paint: bool,
     disabled: bool,
 }
 
@@ -311,6 +317,12 @@ impl ComposerPasteBuffer {
         self.discard = Some(paste_payload_chars(text));
         self.discard_index = 0;
         self.last = Some(now);
+        self.force_paint = true;
+    }
+
+    /// The one repaint a direct clipboard apply is owed, taken exactly once.
+    pub fn take_force_paint(&mut self) -> bool {
+        std::mem::take(&mut self.force_paint)
     }
 
     /// Answers for an `Event::Paste` carrying the payload already being
@@ -972,6 +984,18 @@ mod tests {
 
         assert!(buffer.flush_if_idle(base + FAST_GAP).is_some());
         assert_eq!(buffer.flush_deadline(), None);
+    }
+
+    #[test]
+    fn a_direct_clipboard_apply_is_owed_exactly_one_repaint() {
+        // A terminal that forwards only Ctrl+V (DevezCode) never re-synthesizes
+        // the payload, so the paint the discard transaction suppresses would
+        // otherwise wait for the next unrelated key.
+        let mut buffer = ComposerPasteBuffer::new();
+        buffer.discard_expected("abc", Instant::now());
+        assert!(buffer.is_buffering());
+        assert!(buffer.take_force_paint());
+        assert!(!buffer.take_force_paint());
     }
 
     #[test]
