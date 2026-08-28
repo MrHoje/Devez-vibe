@@ -863,6 +863,7 @@ async fn choose_startup_session(
                 editor: &editor,
                 composer_images: &[],
                 queued_prompts: Vec::new(),
+                steered_prompts: Vec::new(),
                 subagents: Vec::new(),
                 composer_highlights: Vec::new(),
             composer_placeholder: "",

@@ -3608,6 +3608,15 @@ struct McpFailure {
     detail: Option<String>,
 }
 
+/// What a steer card needs to materialize later: how the prompt read, which
+/// model took it, and when Enter fired (so its duration keeps counting from
+/// the real send, not from when the card finally joins the transcript).
+struct PendingSteerPrompt {
+    display: String,
+    model: String,
+    started_at: Instant,
+}
+
 /// A composer draft held aside by `Ctrl+S`, with the images attached to it.
 struct StashedPrompt {
     composer: Stash,
@@ -3620,6 +3629,13 @@ pub struct AppState {
     /// The draft `Ctrl+S` set aside, waiting for the chord that brings it back.
     stashed_prompt: Option<StashedPrompt>,
     queued_prompts: VecDeque<String>,
+    /// Prompts steered into a running turn, held back from the transcript until
+    /// the response text already in flight lands. Committing them at Enter time
+    /// would split that answer: the record would read prompt-then-old-answer.
+    /// Display text and model are captured at Enter; the card block itself is
+    /// only created on flush, since block ids double as transcript order for
+    /// progress grouping.
+    pending_steer_prompts: Vec<PendingSteerPrompt>,
     pub thread_id: String,
     /// The id a later `-r` has to use for this thread, when that is no longer the
     /// thread's own id. A Claude-named room whose turns moved to Codex keeps its
@@ -3925,6 +3941,7 @@ impl AppState {
             composer_images: Vec::new(),
             stashed_prompt: None,
             queued_prompts: VecDeque::new(),
+            pending_steer_prompts: Vec::new(),
             thread_id,
             resume_id: String::new(),
             turn_id: None,
@@ -5951,6 +5968,16 @@ impl AppState {
         self.response_collapse = None;
     }
 
+    /// Slots every held steer card into the transcript, in Enter order. Runs
+    /// where the in-flight answer is known to be on the record already: after a
+    /// completed assistant message, at turn end, or before a fresh prompt.
+    fn flush_pending_steer_prompts(&mut self) {
+        for pending in std::mem::take(&mut self.pending_steer_prompts) {
+            let prompt = Block::new(BlockKind::User, &pending.model, pending.display);
+            self.begin_turn_prompt(prompt, pending.started_at);
+        }
+    }
+
     fn begin_turn_prompt(&mut self, prompt: Block, started_at: Instant) {
         self.finish_active_turn_prompt(started_at);
         self.turn_prompt_started_at.insert(prompt.id(), started_at);
@@ -6506,6 +6533,11 @@ impl AppState {
             editor: &self.editor,
             composer_images: &self.composer_images,
             queued_prompts: self.queued_prompts.iter().cloned().collect(),
+            steered_prompts: self
+                .pending_steer_prompts
+                .iter()
+                .map(|pending| pending.display.clone())
+                .collect(),
             subagents: self
                 .subagents
                 .iter()
@@ -8435,6 +8467,10 @@ impl AppState {
                 if successful {
                     self.collapse_completed_response();
                 }
+                // A steer the turn never answered with text still has to appear:
+                // it slots in after everything this turn produced, ahead of the
+                // follow-up cycle the runtime may open for it.
+                self.flush_pending_steer_prompts();
             }
             "turn/plan/updated" => {
                 let explanation = params
@@ -8840,12 +8876,20 @@ impl AppState {
         if !steering {
             self.reset_turn_item_tracking();
         }
-        let prompt = Block::new(BlockKind::User, self.selected_model_name(), display);
         let started_at = Instant::now();
-        self.begin_turn_prompt(prompt, started_at);
         if steering {
+            // The turn already has a response in flight; the card waits for it
+            // (see `pending_steer_prompts`) while the text itself steers now.
+            self.pending_steer_prompts.push(PendingSteerPrompt {
+                display,
+                model: self.selected_model_name().to_owned(),
+                started_at,
+            });
             Action::Steer(text)
         } else {
+            self.flush_pending_steer_prompts();
+            let prompt = Block::new(BlockKind::User, self.selected_model_name(), display);
+            self.begin_turn_prompt(prompt, started_at);
             self.busy = true;
             // Time the turn from Enter, not from the server's acknowledgement: a
             // prompt held back by a starting session would otherwise read 0s.
@@ -13493,7 +13537,13 @@ impl AppState {
                 self.commit_turn_file_change(block);
                 return;
             }
+            let assistant = matches!(block.kind, BlockKind::Assistant);
             self.push_unique_operation(block);
+            // The answer that was in flight when a steer landed is now on the
+            // record, so the steer card can finally take its place after it.
+            if assistant {
+                self.flush_pending_steer_prompts();
+            }
         }
     }
 
@@ -21446,12 +21496,54 @@ mod tests {
             .filter(|block| matches!(block.kind, BlockKind::ProgressGroup))
             .collect::<Vec<_>>();
 
+        // The steer card waits for the answer already in flight, so the first
+        // response completed after the steer still groups with the first
+        // prompt; only what follows the card belongs to the new prompt.
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].title, "+1 Response");
+        assert_eq!(groups[0].title, "+2 Response");
         assert_eq!(groups[0].children()[0].body, "첫 요청 진행 기록");
-        assert_eq!(groups[1].title, "+2 Response");
-        assert_eq!(groups[1].children()[0].body, "추가 요청 확인");
-        assert_eq!(groups[1].children()[1].body, "추가 요청 수정");
+        assert_eq!(groups[0].children()[1].body, "추가 요청 확인");
+        assert_eq!(groups[1].title, "+1 Response");
+        assert_eq!(groups[1].children()[0].body, "추가 요청 수정");
+    }
+
+    /// The screenshot bug: a prompt steered while an answer was in flight used
+    /// to land above that answer, splitting question from answer. The card now
+    /// waits until the in-flight response text is on the record.
+    #[test]
+    fn steered_prompt_waits_for_the_in_flight_answer() {
+        let mut state = test_state();
+        assert!(matches!(
+            state.submit_text("첫 요청".to_owned(), "첫 요청".to_owned()),
+            Action::Submit(_)
+        ));
+        state.drain_committed();
+        state.set_turn_started("turn-1".to_owned());
+
+        assert!(matches!(
+            state.submit_text("끼어든 질문".to_owned(), "끼어든 질문".to_owned()),
+            Action::Steer(_)
+        ));
+        assert!(
+            state.drain_committed().is_empty(),
+            "the steer card must wait for the in-flight answer"
+        );
+
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "item": { "id": "old-answer", "type": "agentMessage", "phase": "final_answer", "text": "이전 요청 완료 보고" }
+            }),
+        );
+        let order = state
+            .drain_committed()
+            .into_iter()
+            .filter(|block| matches!(block.kind, BlockKind::User | BlockKind::Assistant))
+            .map(|block| block.body)
+            .collect::<Vec<_>>();
+        // "첫 요청" in the middle is the earlier card re-committed with its
+        // duration stamped; it updates the existing row instead of adding one.
+        assert_eq!(order, vec!["이전 요청 완료 보고", "첫 요청", "끼어든 질문"]);
     }
 
     #[test]

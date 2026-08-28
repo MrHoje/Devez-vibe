@@ -543,6 +543,9 @@ pub struct View<'a> {
     pub editor: &'a Editor,
     pub composer_images: &'a [String],
     pub queued_prompts: Vec<String>,
+    /// Prompts already steered into the running turn, shown next to the queue
+    /// until the in-flight answer lands and their card joins the transcript.
+    pub steered_prompts: Vec<String>,
     /// Running subagents shown in the side panel when it is open, or under the
     /// status line as the narrow-layout fallback.
     pub subagents: Vec<SubagentView>,
@@ -2740,6 +2743,7 @@ impl Renderer {
                 view.composer_images,
                 &view.composer_highlights,
                 &view.queued_prompts,
+                &view.steered_prompts,
                 main_subagents,
                 view.composer_placeholder,
                 view.welcome,
@@ -4931,6 +4935,7 @@ fn split_pane_frame_scrolled(
             view.composer_images,
             &view.composer_highlights,
             &view.queued_prompts,
+            &view.steered_prompts,
             if active { &view.subagents } else { &[] },
             view.composer_placeholder,
             view.welcome,
@@ -5694,6 +5699,32 @@ fn queue_preview_line(prompt: &str, index: usize, width: u16) -> PaintLine {
     .with_picks(&[(0, Pick::RemoveQueuedPrompt(index))])
 }
 
+/// A steered prompt already went to the agent, so its row carries no remove
+/// pick; it only reassures that the message is in and waiting for its place
+/// in the transcript.
+fn steer_preview_lines(prompts: &[String], width: u16) -> Vec<PaintLine> {
+    prompts
+        .iter()
+        .map(|prompt| PaintLine {
+            prefix: " ".to_owned(),
+            prefix_tone: Tone::Muted,
+            text: String::new(),
+            tone: Tone::Muted,
+            bold: false,
+            tool_heading: None,
+            pick: None,
+            tail: vec![PaintSpan {
+                text: format!(
+                    "Steer: {}",
+                    compact_right(prompt, usize::from(width).saturating_sub(11))
+                ),
+                tone: Tone::Muted,
+                bold: false,
+            }],
+        })
+        .collect()
+}
+
 /// Running subagents are listed under the status line, one row each, so a fan-out
 /// stays visible without pushing the transcript around. Rows disappear as each
 /// subagent finishes; background rows may outlive the parent turn.
@@ -6171,6 +6202,7 @@ fn normal_frame(
         &[],
         &[],
         &[],
+        &[],
         "",
         welcome,
         suggestions,
@@ -6201,6 +6233,7 @@ fn normal_frame_with_expansion(
     composer_images: &[String],
     composer_highlights: &[String],
     queued_prompts: &[String],
+    steered_prompts: &[String],
     subagents: &[SubagentView],
     composer_placeholder: &str,
     welcome: Option<WelcomeView>,
@@ -6289,6 +6322,7 @@ fn normal_frame_with_expansion(
             lines.push(PaintLine::blank());
         }
     }
+    lines.extend(steer_preview_lines(steered_prompts, width));
     lines.extend(queue_preview_lines(queued_prompts, width));
 
     // Recalled history is labelled on the composer rule, so the position stays
@@ -12758,6 +12792,7 @@ mod tests {
             editor,
             composer_images: &[],
             queued_prompts: Vec::new(),
+            steered_prompts: Vec::new(),
             subagents: Vec::new(),
             composer_highlights: Vec::new(),
             composer_placeholder: "",
@@ -17108,6 +17143,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
             &[test_subagent("Explore", "Find auth code", "", 4)],
             "",
             None,
@@ -18289,6 +18325,7 @@ mod tests {
         let mut frame = normal_frame_with_expansion(
             live_lines,
             &editor,
+            &[],
             &[],
             &[],
             &[],
