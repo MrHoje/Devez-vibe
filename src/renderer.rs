@@ -6412,7 +6412,11 @@ fn question_tab_row(tabs: &str, width: usize) -> PaintLine {
     let mut used = 0;
     let mut clipped = false;
     for (index, tab) in tabs.split(QUESTION_TAB_SEPARATOR).enumerate() {
-        let current = tab.starts_with(QUESTION_TAB_CURSOR);
+        // 단계 줄은 꺾쇠로, 좌우로 오가는 소스 탭은 `[ 이름 ]`으로 지금 자리를
+        // 짚는다. 완료 상자로 시작하는 단계와 달리 대괄호가 이름을 감싼다.
+        let trimmed = tab.trim();
+        let current = tab.starts_with(QUESTION_TAB_CURSOR)
+            || trimmed.starts_with("[ ") && trimmed.ends_with(" ]");
         let mut spans = Vec::new();
         if index > 0 {
             spans.push(PaintSpan {
@@ -21241,7 +21245,7 @@ mod tests {
 
     #[test]
     fn mention_and_skill_hints_live_on_the_bottom_rule() {
-        for title in ["Mentions", "Skills\u{001e}❯ User   Claude"] {
+        for title in ["Mentions", "Skills\u{001e}[ User ]     Claude"] {
             let suggestions = vec![SuggestionView {
                 command: "review".to_owned(),
                 description: "Review a change".to_owned(),
@@ -21259,13 +21263,34 @@ mod tests {
     }
 
     #[test]
+    fn a_bracketed_source_tab_reads_as_the_current_one() {
+        let row = question_tab_row("[ User ]     Claude", 60);
+        let accent = row
+            .tail
+            .iter()
+            .filter(|span| span.tone == Tone::Accent)
+            .map(|span| span.text.trim())
+            .collect::<Vec<_>>();
+        assert_eq!(accent, ["[ User ]"]);
+
+        let moved = question_tab_row("  User     [ Claude ]", 60);
+        let accent = moved
+            .tail
+            .iter()
+            .filter(|span| span.tone == Tone::Accent)
+            .map(|span| span.text.trim())
+            .collect::<Vec<_>>();
+        assert_eq!(accent, ["[ Claude ]"]);
+    }
+
+    #[test]
     fn skill_completion_uses_the_question_style_topic_tabs() {
         let suggestions = vec![SuggestionView {
             command: "review".to_owned(),
             description: "Review a change".to_owned(),
             selected: true,
             category: Some("Skill".to_owned()),
-            panel_title: "Skills\u{001e}❯ User   Claude",
+            panel_title: "Skills\u{001e}[ User ]     Claude",
             hint: Some("←/→ source".to_owned()),
         }];
 
@@ -21275,7 +21300,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(lines[0].starts_with("╭─ Skills "));
-        assert!(lines.iter().any(|line| line.contains("❯ User   Claude")));
+        assert!(lines.iter().any(|line| line.contains("[ User ]     Claude")));
         assert!(lines.iter().any(|line| line.contains("[Skill] review")));
     }
 

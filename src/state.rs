@@ -13954,12 +13954,12 @@ fn dollar_completion_panel_title(
     provider: ModelProvider,
 ) -> &'static str {
     match (source, provider) {
-        (CompletionSource::User, ModelProvider::Claude) => "Skills\u{001e}❯  User      Claude",
-        (CompletionSource::Provider, ModelProvider::Claude) => "Skills\u{001e}   User   ❯  Claude",
-        (CompletionSource::User, ModelProvider::Codex) => "Skills\u{001e}❯  User      Codex",
-        (CompletionSource::Provider, ModelProvider::Codex) => "Skills\u{001e}   User   ❯  Codex",
-        (CompletionSource::User, ModelProvider::OpenCode) => "Skills\u{001e}❯  User      OpenCode",
-        (CompletionSource::Provider, ModelProvider::OpenCode) => "Skills\u{001e}   User   ❯  OpenCode",
+        (CompletionSource::User, ModelProvider::Claude) => "Skills\u{001e}[ User ]     Claude",
+        (CompletionSource::Provider, ModelProvider::Claude) => "Skills\u{001e}  User     [ Claude ]",
+        (CompletionSource::User, ModelProvider::Codex) => "Skills\u{001e}[ User ]     Codex",
+        (CompletionSource::Provider, ModelProvider::Codex) => "Skills\u{001e}  User     [ Codex ]",
+        (CompletionSource::User, ModelProvider::OpenCode) => "Skills\u{001e}[ User ]     OpenCode",
+        (CompletionSource::Provider, ModelProvider::OpenCode) => "Skills\u{001e}  User     [ OpenCode ]",
     }
 }
 
@@ -23760,7 +23760,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(user, [Some("Skill".to_owned())]);
         let title = state.view().suggestions[0].panel_title;
-        assert!(title.contains("❯  User      Codex"));
+        assert!(title.contains("[ User ]     Codex"));
         assert!(!title.contains('·'));
 
         state.handle_key(KeyEvent::from(KeyCode::Right));
