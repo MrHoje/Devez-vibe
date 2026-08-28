@@ -38,11 +38,15 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 /// Below this, a character did not come from a finger. The slowest paste gap
-/// measured was 0ms and the fastest typing gap 123ms, so this sits in open
-/// space between them — high enough to absorb the redraw that happens between
-/// two key events in the real application, low enough that reaching it by
-/// typing would take about 2,400 characters per minute.
+/// measured through a redraw was 7ms and the fastest typing gap 123ms, so this
+/// leaves room for picker screens that still repaint between key records.
 const FAST_GAP: Duration = Duration::from_millis(16);
+
+/// The main composer suppresses repainting while its classifier is open, so
+/// rendering cannot widen the measured 0–2ms gap between pasted key records.
+/// Keep its wait just above that envelope instead of charging every typed
+/// character the picker-safe 16ms delay.
+const COMPOSER_FAST_GAP: Duration = Duration::from_millis(4);
 
 /// `Ctrl+V` is an explicit paste signal even when Windows delivers the payload
 /// as ordinary key records. Keep that transaction open across short scheduler
@@ -422,7 +426,7 @@ impl ComposerPasteBuffer {
         } else if self.shortcut_paste {
             SHORTCUT_PASTE_GAP
         } else {
-            FAST_GAP
+            COMPOSER_FAST_GAP
         }
     }
 }
@@ -672,7 +676,7 @@ mod tests {
         }
 
         assert_eq!(
-            buffer.flush_if_idle(at + Duration::from_millis(FAST_GAP.as_millis() as u64)),
+            buffer.flush_if_idle(at + Duration::from_millis(COMPOSER_FAST_GAP.as_millis() as u64)),
             Some(BufferedText {
                 text: r"C:\Temp\clipboard.png".to_owned(),
                 pasted: true,
@@ -688,7 +692,7 @@ mod tests {
         buffer.observe(press(KeyCode::Char('C')), base);
 
         assert_eq!(
-            buffer.flush_if_idle(base + FAST_GAP),
+            buffer.flush_if_idle(base + COMPOSER_FAST_GAP),
             Some(BufferedText {
                 text: "C".to_owned(),
                 pasted: false,
@@ -751,7 +755,7 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            buffer.flush_if_idle(base + FAST_GAP + Duration::from_millis(2)),
+            buffer.flush_if_idle(base + COMPOSER_FAST_GAP + Duration::from_millis(2)),
             Some(BufferedText {
                 text: "첫줄\n".to_owned(),
                 pasted: true,
@@ -980,9 +984,9 @@ mod tests {
         assert_eq!(buffer.flush_deadline(), None);
 
         buffer.observe(press(KeyCode::Char('a')), base);
-        assert_eq!(buffer.flush_deadline(), Some(base + FAST_GAP));
+        assert_eq!(buffer.flush_deadline(), Some(base + COMPOSER_FAST_GAP));
 
-        assert!(buffer.flush_if_idle(base + FAST_GAP).is_some());
+        assert!(buffer.flush_if_idle(base + COMPOSER_FAST_GAP).is_some());
         assert_eq!(buffer.flush_deadline(), None);
     }
 
