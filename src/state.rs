@@ -6508,6 +6508,7 @@ impl AppState {
                     elapsed: running.started_at.elapsed(),
                 })
                 .collect(),
+            composer_highlights: self.composer_highlight_tokens(),
             composer_placeholder: if self.provider_switch_pending() {
                 "Enter: queue for switched provider · Tab: queue"
             } else if self.busy {
@@ -11850,6 +11851,66 @@ impl AppState {
         }
     }
 
+    /// 컴포저에서 테마 강조색을 받을 토큰. 실제 슬래시 커맨드, 스킬, 플러그인,
+    /// 앱, 작업 폴더 항목과 정확히 일치하는 것만 담는다. `/`, `@`, `$` 하나만
+    /// 친 상태나 일치하는 후보가 없는 이름은 강조하지 않는다.
+    fn composer_highlight_tokens(&self) -> Vec<String> {
+        let text = self.editor.display_text();
+        let mut tokens: Vec<String> = Vec::new();
+        for line in text.lines() {
+            for (index, raw) in line.split_whitespace().enumerate() {
+                let Some(sigil) = raw.chars().next() else {
+                    continue;
+                };
+                if !matches!(sigil, '/' | '@' | '$') || (sigil == '/' && index > 0) {
+                    continue;
+                }
+                if tokens.iter().any(|token| token == raw) || !self.completion_token_exists(raw) {
+                    continue;
+                }
+                tokens.push(raw.to_owned());
+            }
+        }
+        tokens
+    }
+
+    /// Whether a composer token names something the completion menus offer.
+    fn completion_token_exists(&self, token: &str) -> bool {
+        let Some(name) = token.get(1..).filter(|name| !name.is_empty()) else {
+            return false;
+        };
+        match token.as_bytes()[0] {
+            b'/' => {
+                let provider = self.selected_provider();
+                SLASH_COMMANDS
+                    .iter()
+                    .filter(|command| {
+                        crate::open_code::PROVIDER_ENABLED || command.name != "/connect"
+                    })
+                    .any(|command| command.supports(provider) && command.name == token)
+            }
+            b'$' => {
+                self.skills
+                    .iter()
+                    .any(|skill| skill.enabled && skill.name.eq_ignore_ascii_case(name))
+                    || self
+                        .app_mentions
+                        .iter()
+                        .any(|mention| mention.trigger.eq_ignore_ascii_case(name))
+            }
+            b'@' => {
+                self.mentions
+                    .iter()
+                    .any(|mention| mention.trigger.eq_ignore_ascii_case(name))
+                    || self.workspace_entries.iter().any(|entry| {
+                        entry.label.eq_ignore_ascii_case(name)
+                            || entry.insert_text.eq_ignore_ascii_case(name)
+                    })
+            }
+            _ => false,
+        }
+    }
+
     fn matching_slash_commands(&self) -> Vec<&'static SlashCommand> {
         let text = self.editor.text();
         if !text.starts_with('/') || text.chars().any(char::is_whitespace) {
@@ -13893,12 +13954,12 @@ fn dollar_completion_panel_title(
     provider: ModelProvider,
 ) -> &'static str {
     match (source, provider) {
-        (CompletionSource::User, ModelProvider::Claude) => "Skills\u{001e}❯ User   Claude",
-        (CompletionSource::Provider, ModelProvider::Claude) => "Skills\u{001e}User   ❯ Claude",
-        (CompletionSource::User, ModelProvider::Codex) => "Skills\u{001e}❯ User   Codex",
-        (CompletionSource::Provider, ModelProvider::Codex) => "Skills\u{001e}User   ❯ Codex",
-        (CompletionSource::User, ModelProvider::OpenCode) => "Skills\u{001e}❯ User   OpenCode",
-        (CompletionSource::Provider, ModelProvider::OpenCode) => "Skills\u{001e}User   ❯ OpenCode",
+        (CompletionSource::User, ModelProvider::Claude) => "Skills\u{001e}❯  User      Claude",
+        (CompletionSource::Provider, ModelProvider::Claude) => "Skills\u{001e}   User   ❯  Claude",
+        (CompletionSource::User, ModelProvider::Codex) => "Skills\u{001e}❯  User      Codex",
+        (CompletionSource::Provider, ModelProvider::Codex) => "Skills\u{001e}   User   ❯  Codex",
+        (CompletionSource::User, ModelProvider::OpenCode) => "Skills\u{001e}❯  User      OpenCode",
+        (CompletionSource::Provider, ModelProvider::OpenCode) => "Skills\u{001e}   User   ❯  OpenCode",
     }
 }
 
@@ -23068,6 +23129,69 @@ mod tests {
     }
 
     #[test]
+    fn dollar_panel_tabs_keep_their_labels_on_one_column() {
+        let column = |title: &str, label: &str| {
+            let tab = title.split('\u{001e}').nth(1).expect("tab row");
+            let byte = tab.find(label).expect("label");
+            tab[..byte].chars().count()
+        };
+
+        for (provider, name) in [
+            (ModelProvider::Claude, "Claude"),
+            (ModelProvider::Codex, "Codex"),
+            (ModelProvider::OpenCode, "OpenCode"),
+        ] {
+            let user = dollar_completion_panel_title(CompletionSource::User, provider);
+            let source = dollar_completion_panel_title(CompletionSource::Provider, provider);
+
+            // 좌우 화살표로 소스를 바꿔도 두 이름은 같은 열에 머문다.
+            assert_eq!(column(user, "User"), column(source, "User"));
+            assert_eq!(column(user, name), column(source, name));
+        }
+    }
+
+    #[test]
+    fn composer_highlights_only_tokens_that_name_something_real() {
+        let mut state = test_state();
+        state.update_skills(&json!({
+            "data": [{
+                "cwd": "cwd",
+                "errors": [],
+                "skills": [
+                    {
+                        "name": "review",
+                        "path": "C:/skills/review/SKILL.md",
+                        "description": "Review",
+                        "enabled": true,
+                        "scope": "user"
+                    },
+                    {
+                        "name": "disabled",
+                        "path": "C:/skills/disabled/SKILL.md",
+                        "description": "Disabled",
+                        "enabled": false,
+                        "scope": "user"
+                    }
+                ]
+            }]
+        }));
+        state.update_workspace_entries(vec![CompletionCandidate::new(
+            CompletionKind::File,
+            "src/main.rs",
+            "",
+            "src/main.rs",
+        )]);
+        state
+            .editor
+            .set_text("/model $review @src/main.rs / @ $ /nope $disabled @missing.rs");
+
+        assert_eq!(
+            state.composer_highlight_tokens(),
+            ["/model", "$review", "@src/main.rs"]
+        );
+    }
+
+    #[test]
     fn explicit_skill_plugin_and_app_mentions_become_typed_turn_items() {
         let mut state = test_state();
         state.update_skills(&json!({
@@ -23636,7 +23760,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(user, [Some("Skill".to_owned())]);
         let title = state.view().suggestions[0].panel_title;
-        assert!(title.contains("❯ User   Codex"));
+        assert!(title.contains("❯  User      Codex"));
         assert!(!title.contains('·'));
 
         state.handle_key(KeyEvent::from(KeyCode::Right));

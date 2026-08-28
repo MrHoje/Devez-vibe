@@ -547,6 +547,9 @@ pub struct View<'a> {
     /// status line as the narrow-layout fallback.
     pub subagents: Vec<SubagentView>,
     pub composer_placeholder: &'a str,
+    /// 컴포저에서 테마 강조색으로 그릴 `/`, `@`, `$` 토큰. 실제 커맨드나
+    /// 후보와 일치하는 것만 담기므로, 비어 있으면 강조 없이 그린다.
+    pub composer_highlights: Vec<String>,
     pub welcome: Option<WelcomeView>,
     pub suggestions: Vec<SuggestionView>,
     pub activity: Option<String>,
@@ -2655,6 +2658,7 @@ impl Renderer {
                 live_lines,
                 view.editor,
                 view.composer_images,
+                &view.composer_highlights,
                 &view.queued_prompts,
                 main_subagents,
                 view.composer_placeholder,
@@ -4845,6 +4849,7 @@ fn split_pane_frame_scrolled(
             live_lines,
             view.editor,
             view.composer_images,
+            &view.composer_highlights,
             &view.queued_prompts,
             if active { &view.subagents } else { &[] },
             view.composer_placeholder,
@@ -6075,6 +6080,7 @@ fn normal_frame(
         &[],
         &[],
         &[],
+        &[],
         "",
         welcome,
         suggestions,
@@ -6103,6 +6109,7 @@ fn normal_frame_with_expansion(
     live_lines: Vec<PaintLine>,
     editor: &Editor,
     composer_images: &[String],
+    composer_highlights: &[String],
     queued_prompts: &[String],
     subagents: &[SubagentView],
     composer_placeholder: &str,
@@ -6204,6 +6211,7 @@ fn normal_frame_with_expansion(
         input_lines_with_controls(
             editor,
             composer_images,
+            composer_highlights,
             width,
             &recalled,
             composer_placeholder,
@@ -6675,7 +6683,9 @@ fn named_suggestion_line(
     panel_width: usize,
 ) -> PaintLine {
     let inner_width = panel_width.saturating_sub(2);
-    let fixed_width = 3 + name_width + 2;
+    // 마커 뒤에 여유 칸을 두어, 마커를 두 칸으로 그리는 글꼴에서도 이름 열이
+    // 옆으로 밀리지 않는다.
+    let fixed_width = 4 + name_width + 2;
     let description_width = inner_width
         .saturating_sub(SUGGESTION_RIGHT_INSET)
         .saturating_sub(fixed_width);
@@ -6709,7 +6719,7 @@ fn named_suggestion_line(
                 bold: suggestion.selected,
             },
             PaintSpan {
-                text: " ".to_owned(),
+                text: "  ".to_owned(),
                 tone: Tone::Muted,
                 bold: false,
             },
@@ -7094,16 +7104,16 @@ fn overlay_frame_with_expansion(
                 }
                 for (part_index, part) in row.text.lines().enumerate() {
                     let prefix = if part_index == 0 {
-                        if row.selected { "│ ❯ " } else { "│   " }
+                        if row.selected { "│ ❯  " } else { "│    " }
                     } else {
-                        "│     "
+                        "│      "
                     };
                     // A detail line folds back under itself, not under the label
                     // above it, so its own indent is the continuation indent.
                     let continuation = if part_index == 0 {
-                        "│   "
+                        "│    "
                     } else {
-                        "│     "
+                        "│      "
                     };
                     let tone = if row.muted {
                         Tone::Muted
@@ -7167,8 +7177,10 @@ fn overlay_frame_with_expansion(
             lines.push(panel_rule_row("╰─ ", &overlay.hint, '╯', panel_width));
         }
         OverlayStyle::CompactPanel => {
-            /// `" ❯ "`: what a compact row spends before its own text starts.
-            const COMPACT_ROW_GUTTER_COLUMNS: usize = 3;
+            /// `" ❯  "`: what a compact row spends before its own text starts.
+            /// The extra blank after the marker keeps the text on one column even
+            /// where the glyph is drawn two cells wide.
+            const COMPACT_ROW_GUTTER_COLUMNS: usize = 4;
             /// Blank columns kept before the right border so a truncated row
             /// never crowds the box.
             const COMPACT_ROW_RIGHT_INSET: usize = 3;
@@ -7185,7 +7197,7 @@ fn overlay_frame_with_expansion(
             for (row_index, row) in overlay.lines.iter().enumerate() {
                 let marker = if row.selected { "❯" } else { " " };
                 let mut line = panel_line_keep_left_inset(
-                    &format!(" {marker} {}", row.text),
+                    &format!(" {marker}  {}", row.text),
                     panel_width,
                     COMPACT_ROW_RIGHT_INSET,
                     if row.selected {
@@ -7236,16 +7248,16 @@ fn overlay_frame_with_expansion(
                 }
                 for (part_index, part) in row.text.lines().enumerate() {
                     let prefix = if part_index == 0 {
-                        if row.selected { "│ ❯ " } else { "│   " }
+                        if row.selected { "│ ❯  " } else { "│    " }
                     } else {
-                        "│     "
+                        "│      "
                     };
                     // A detail line folds back under itself, not under the label
                     // above it, so its own indent is the continuation indent.
                     let continuation = if part_index == 0 {
-                        "│   "
+                        "│    "
                     } else {
-                        "│     "
+                        "│      "
                     };
                     // The line under a label is that label's detail, not a claim
                     // of its own: it reads as the quieter half of one row.
@@ -7337,7 +7349,9 @@ fn overlay_frame_with_expansion(
             // the last number so every label starts on the same column.
             let option_count = overlay.lines.len().saturating_sub(1);
             let number_width = option_count.max(1).to_string().len();
-            let label_column = 6 + number_width;
+            // `❯` 뒤에 여유 칸을 두어, 마커를 두 칸으로 그리는 글꼴에서도
+            // 라벨이 밀리지 않고 같은 열에서 시작한다.
+            let label_column = 7 + number_width;
             let continuation = format!("│{}", " ".repeat(label_column.saturating_sub(1)));
             let last = overlay.lines.len().saturating_sub(1);
             // A question that still lists its options types the free-text answer on
@@ -7355,7 +7369,7 @@ fn overlay_frame_with_expansion(
                     // The selected row already identifies the free-text choice.
                     // Keep every cell after its number empty until text commits,
                     // so no label or placeholder can sit under the IME preedit.
-                    let prefix = format!("│ ❯ {number:>number_width$}. ");
+                    let prefix = format!("│ ❯  {number:>number_width$}. ");
                     let (rows_text, cursor_row, cursor_column) = inline_answer_rows(
                         editor,
                         UnicodeWidthStr::width(prefix.as_str()),
@@ -7390,7 +7404,7 @@ fn overlay_frame_with_expansion(
                 for (part_index, part) in row.text.lines().enumerate() {
                     let prefix = if part_index == 0 {
                         format!(
-                            "│ {} {number:>number_width$}. ",
+                            "│ {}  {number:>number_width$}. ",
                             if row.selected { "❯" } else { " " }
                         )
                     } else {
@@ -11263,8 +11277,10 @@ fn cursor_last(rows: &[String]) -> usize {
 
 /// `/`, `@`, `$`로 시작하는 컴포저 토큰만 테마 강조색으로 나눈다. 본문은
 /// 기존 색을 유지하고, 이메일의 `@`나 경로 중간의 `/`는 명령으로 보지 않는다.
-fn composer_token_spans(content: &str, base_tone: Tone) -> Vec<PaintSpan> {
-    if content.is_empty() || base_tone == Tone::Muted {
+/// 실제 커맨드나 후보와 일치해 `highlights`에 담긴 토큰만 강조하므로, 기호만
+/// 친 상태나 없는 이름은 본문과 같은 색으로 남는다.
+fn composer_token_spans(content: &str, base_tone: Tone, highlights: &[String]) -> Vec<PaintSpan> {
+    if content.is_empty() || base_tone == Tone::Muted || highlights.is_empty() {
         return vec![PaintSpan {
             text: content.to_owned(),
             tone: base_tone,
@@ -11285,6 +11301,14 @@ fn composer_token_spans(content: &str, base_tone: Tone) -> Vec<PaintSpan> {
             index += 1;
             continue;
         }
+        let end = (index + 1..chars.len())
+            .find(|position| chars[*position].is_whitespace())
+            .unwrap_or(chars.len());
+        let token = chars[index..end].iter().collect::<String>();
+        if !highlights.iter().any(|highlight| *highlight == token) {
+            index = end;
+            continue;
+        }
         if plain_start < index {
             spans.push(PaintSpan {
                 text: chars[plain_start..index].iter().collect(),
@@ -11292,11 +11316,8 @@ fn composer_token_spans(content: &str, base_tone: Tone) -> Vec<PaintSpan> {
                 bold: false,
             });
         }
-        let end = (index + 1..chars.len())
-            .find(|position| chars[*position].is_whitespace())
-            .unwrap_or(chars.len());
         spans.push(PaintSpan {
-            text: chars[index..end].iter().collect(),
+            text: token,
             tone: Tone::Accent,
             bold: false,
         });
@@ -11332,6 +11353,7 @@ fn input_lines(
     input_lines_with_controls(
         editor,
         composer_images,
+        &[],
         width,
         label,
         placeholder,
@@ -11344,6 +11366,7 @@ fn input_lines(
 fn input_lines_with_controls(
     editor: &Editor,
     composer_images: &[String],
+    composer_highlights: &[String],
     width: u16,
     label: &str,
     placeholder: &str,
@@ -11488,7 +11511,7 @@ fn input_lines_with_controls(
         } else {
             Tone::Plain
         };
-        let mut tail = composer_token_spans(&content, content_tone);
+        let mut tail = composer_token_spans(&content, content_tone, composer_highlights);
         tail.extend([
             PaintSpan {
                 text: " ".repeat(panel_width.saturating_sub(
@@ -12642,6 +12665,7 @@ mod tests {
             composer_images: &[],
             queued_prompts: Vec::new(),
             subagents: Vec::new(),
+            composer_highlights: Vec::new(),
             composer_placeholder: "",
             welcome: None,
             suggestions: Vec::new(),
@@ -16714,8 +16738,19 @@ mod tests {
     fn composer_command_tokens_alone_use_the_theme_accent() {
         let mut editor = Editor::default();
         editor.set_text("/model gpt @github 와 $review mail foo@example.com");
+        let highlights = ["/model".to_owned(), "@github".to_owned(), "$review".to_owned()];
 
-        let (rows, _, _, _) = input_lines(&editor, &[], 100, "", "", None, None);
+        let (rows, _, _, _) = input_lines_with_controls(
+            &editor,
+            &[],
+            &highlights,
+            100,
+            "",
+            "",
+            None,
+            None,
+            None,
+        );
         let accent = rows[1]
             .tail
             .iter()
@@ -16729,6 +16764,40 @@ mod tests {
                 .tail
                 .iter()
                 .any(|span| { span.tone == Tone::Plain && span.text.contains("foo@example.com") })
+        );
+    }
+
+    #[test]
+    fn composer_leaves_unmatched_command_tokens_in_the_plain_tone() {
+        let mut editor = Editor::default();
+        editor.set_text("/ @ $ /nope $missing @absent.rs /model");
+        let highlights = ["/model".to_owned()];
+
+        let (rows, _, _, _) = input_lines_with_controls(
+            &editor,
+            &[],
+            &highlights,
+            100,
+            "",
+            "",
+            None,
+            None,
+            None,
+        );
+        let accent = rows[1]
+            .tail
+            .iter()
+            .filter(|span| span.tone == Tone::Accent)
+            .map(|span| span.text.as_str())
+            .collect::<Vec<_>>();
+
+        // `/model` sits mid-row here, so only the token the catalog knows is lit.
+        assert!(accent.is_empty());
+        assert!(
+            rows[1]
+                .tail
+                .iter()
+                .any(|span| span.tone == Tone::Plain && span.text.contains("/nope $missing"))
         );
     }
 
@@ -16893,6 +16962,7 @@ mod tests {
         let frame = normal_frame_with_expansion(
             Vec::new(),
             &editor,
+            &[],
             &[],
             &[],
             &[test_subagent("Explore", "Find auth code", "", 4)],
@@ -18076,6 +18146,7 @@ mod tests {
         let mut frame = normal_frame_with_expansion(
             live_lines,
             &editor,
+            &[],
             &[],
             &[],
             &[],
@@ -21500,7 +21571,7 @@ mod tests {
             .position(|line| line.contains("직접 쓴 답"))
             .expect("the typed answer is missing");
 
-        assert!(typed[answer_row].starts_with("│ ❯ 2. 직접 쓴 답"));
+        assert!(typed[answer_row].starts_with("│ ❯  2. 직접 쓴 답"));
         assert!(
             typed.iter().any(|line| line.contains("선택지 A")),
             "the options left the screen while the answer was typed"
@@ -21514,7 +21585,7 @@ mod tests {
         assert_eq!(frame.cursor_line, answer_row);
         assert_eq!(
             frame.cursor_col,
-            UnicodeWidthStr::width("│ ❯ 2. 직접 쓴 답")
+            UnicodeWidthStr::width("│ ❯  2. 직접 쓴 답")
         );
 
         // Empty, no label or placeholder occupies the cells where Windows
@@ -21523,7 +21594,7 @@ mod tests {
         let empty_frame = overlay_frame(&[], overlay(Some(&empty)), None, status(), 80);
         let empty_painted = empty_frame.lines.iter().map(painted).collect::<Vec<_>>();
         assert!(
-            empty_painted.iter().any(|line| line.starts_with("│ ❯ 2. ")),
+            empty_painted.iter().any(|line| line.starts_with("│ ❯  2. ")),
             "the empty answer row lost its selected row: {empty_painted:?}"
         );
         assert!(
@@ -21595,10 +21666,10 @@ mod tests {
 
         assert!(painted[0].starts_with("╭─ 테스트 "));
         assert!(painted[0].ends_with('╮'));
-        assert!(row("선택지 A").starts_with("│ ❯ 1. 선택지 A"));
-        assert!(row("선택지 B").starts_with("│   2. 선택지 B"));
-        assert!(row("직접 입력").starts_with("│   3. "));
-        assert!(row("이 내용으로 대화하기").starts_with("│   4. "));
+        assert!(row("선택지 A").starts_with("│ ❯  1. 선택지 A"));
+        assert!(row("선택지 B").starts_with("│    2. 선택지 B"));
+        assert!(row("직접 입력").starts_with("│    3. "));
+        assert!(row("이 내용으로 대화하기").starts_with("│    4. "));
         assert!(
             painted
                 .iter()
