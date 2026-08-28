@@ -4309,14 +4309,13 @@ fn emit_frame_diff_at(
         let screen_row = row.saturating_add(row_offset);
         // ConPTY re-synthesizes a cursor jump into a Korean row's middle with
         // the wide glyphs duplicated, and the composer keeps this diff so typing
-        // never drags the visible cursor to column zero. A row whose damage
-        // touches a wide glyph therefore redraws from its first damaged column
-        // to the end of the row in one continuous run, rather than patching each
-        // changed span in place. Only the columns before that point keep the
-        // ordinary cell diff, and a wide glyph can no longer sit among them.
+        // never drags the visible cursor to column zero. Any damage in a row
+        // that carries a wide glyph anywhere — even when the changed cells are
+        // all narrow, as when a space or Latin letter follows Hangul — therefore
+        // redraws from its first damaged column to the end of the row in one
+        // continuous run, rather than patching each changed span in place.
         let tail_start = previous
-            .and_then(|previous| wide_damage_range(previous, current, row))
-            .map(|columns| columns.start)
+            .and_then(|previous| tail_repaint_start(previous, current, row))
             .filter(|start| start + 1 < current.width);
         let diff_end = tail_start.unwrap_or(current.width);
         let mut column = 0;
@@ -4421,39 +4420,33 @@ fn emit_row_tail_from(
     Ok(())
 }
 
-/// Returns the smallest safe repaint range around changed double-width glyphs.
-/// The range starts before any old/current continuation cell and ends after it,
-/// so a terminal is never asked to paint into the trailing half of a glyph.
-/// Keeping this local avoids clearing and flashing the entire composer row for
-/// every Korean character typed.
-fn wide_damage_range(
-    previous: &CellFrame,
-    current: &CellFrame,
-    row: usize,
-) -> Option<Range<usize>> {
-    let mut changed = (0..current.width).filter(|&column| {
+/// Returns the column a damaged row must repaint from as one continuous run, or
+/// `None` when the ordinary cell diff stays safe. ConPTY duplicates wide glyphs
+/// when it replays patches into a row that carries them, even patches whose own
+/// cells are narrow, so any damage in such a row starts the tail at its first
+/// changed column. The start backs off any continuation cell so a terminal is
+/// never asked to paint into the trailing half of a glyph, and rows made of
+/// narrow glyphs alone keep the local diff that avoids flashing the composer.
+fn tail_repaint_start(previous: &CellFrame, current: &CellFrame, row: usize) -> Option<usize> {
+    let mut start = (0..current.width)
+        .find(|&column| previous.cell(column, row) != current.cell(column, row))?;
+    let row_carries_wide = (0..current.width).any(|column| {
         let before = previous.cell(column, row);
         let after = current.cell(column, row);
-        before != after
-            && (before.continuation
-                || after.continuation
-                || UnicodeWidthStr::width(before.glyph.as_str()) > 1
-                || UnicodeWidthStr::width(after.glyph.as_str()) > 1)
+        before.continuation
+            || after.continuation
+            || UnicodeWidthStr::width(before.glyph.as_str()) > 1
+            || UnicodeWidthStr::width(after.glyph.as_str()) > 1
     });
-    let mut start = changed.next()?;
-    let mut end = changed.next_back().unwrap_or(start) + 1;
-
+    if !row_carries_wide {
+        return None;
+    }
     while start > 0
         && (previous.cell(start, row).continuation || current.cell(start, row).continuation)
     {
         start -= 1;
     }
-    while end < current.width
-        && (previous.cell(end, row).continuation || current.cell(end, row).continuation)
-    {
-        end += 1;
-    }
-    Some(start..end)
+    Some(start)
 }
 
 /// Clears and repaints a semantic plan row from its first column without moving
@@ -13807,14 +13800,23 @@ mod tests {
     }
 
     #[test]
-    fn changed_korean_text_uses_a_local_safe_repaint_range() {
+    fn changed_korean_text_repaints_from_its_first_damaged_column() {
         let mut before = CellFrame::new(16, 1);
         before.write(0, 0, "한글 단어", CellStyle::plain());
         let mut after = CellFrame::new(16, 1);
         after.write(0, 0, "한글 ", CellStyle::plain());
 
-        let damage = wide_damage_range(&before, &after, 0).expect("wide text changed");
-        assert_eq!(damage, 5..9);
+        assert_eq!(tail_repaint_start(&before, &after, 0), Some(5));
+    }
+
+    #[test]
+    fn a_narrow_only_row_keeps_the_local_diff() {
+        let mut before = CellFrame::new(16, 1);
+        before.write(0, 0, "plain text", CellStyle::plain());
+        let mut after = CellFrame::new(16, 1);
+        after.write(0, 0, "plain texz", CellStyle::plain());
+
+        assert_eq!(tail_repaint_start(&before, &after, 0), None);
     }
 
     #[test]
@@ -13839,7 +13841,7 @@ mod tests {
     }
 
     #[test]
-    fn a_narrow_change_ahead_of_the_wide_damage_still_repaints() {
+    fn a_narrow_change_ahead_of_wide_damage_joins_one_continuous_repaint() {
         let mut before = CellFrame::new(20, 1);
         before.write(0, 0, "a 안녕", CellStyle::plain());
         let mut after = CellFrame::new(20, 1);
@@ -13849,13 +13851,31 @@ mod tests {
         emit_frame_diff(&mut output, Some(&before), &after).expect("frame diff emits");
         let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
 
-        // The columns before the damage keep the ordinary patch, and they carry
-        // narrow glyphs alone.
+        // A second jump into the Korean row is what ConPTY replays with the
+        // wide glyphs duplicated, so the whole damage repaints as one run.
         assert!(output.contains("\x1b[1;1H"));
-        assert!(output.contains('b'));
+        assert!(output.contains("b 안녕하"));
+        assert_eq!(output.matches("\x1b[1;").count(), 1);
+    }
+
+    #[test]
+    fn a_narrow_change_inside_a_korean_row_repaints_its_tail_in_one_run() {
+        let mut before = CellFrame::new(20, 1);
+        before.write(0, 0, "안녕 a", CellStyle::plain());
+        let mut after = CellFrame::new(20, 1);
+        after.write(0, 0, "안녕 ab", CellStyle::plain());
+
+        let mut output = Vec::new();
+        emit_frame_diff(&mut output, Some(&before), &after).expect("frame diff emits");
+        let output = String::from_utf8(output).expect("terminal bytes are UTF-8");
+
+        // The damage is narrow, but the row carries Hangul ahead of it: a
+        // mid-row patch here still makes ConPTY duplicate those wide glyphs.
         assert!(output.contains("\x1b[1;7H"));
-        assert!(output.contains('하'));
-        assert_eq!(output.matches("\x1b[1;").count(), 2);
+        assert!(output.contains('b'));
+        assert!(!output.contains("\x1b[1;1H"));
+        assert_eq!(output.matches("\x1b[1;").count(), 1);
+        assert!(!output.contains("\x1b[2K"));
     }
 
     #[test]
@@ -13888,7 +13908,7 @@ mod tests {
         let mut after = CellFrame::new(12, 1);
         after.write(4, 0, "x한", CellStyle::plain());
 
-        assert_eq!(wide_damage_range(&before, &after, 0), Some(4..7));
+        assert_eq!(tail_repaint_start(&before, &after, 0), Some(4));
 
         let mut output = Vec::new();
         emit_frame_diff(&mut output, Some(&before), &after).expect("frame diff emits");
