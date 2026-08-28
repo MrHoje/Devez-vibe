@@ -1233,12 +1233,6 @@ function isKoreanPrompt(input) {
   return /[\uac00-\ud7a3]/.test(prompt);
 }
 
-function openingNotice(input) {
-  return isKoreanPrompt(input)
-    ? "요청 내용을 확인하고 필요한 작업을 진행하겠습니다."
-    : "I’ll review the request and proceed with the necessary work.";
-}
-
 // `Now the tile view logic.` carries nothing a Korean reader needs, and the
 // stand-in that used to replace it carried even less — the same sentence before
 // every tool call, however many calls the turn made. Drop the line instead; the
@@ -1253,19 +1247,6 @@ function normalizeProgressText(turn, text) {
     return "";
   }
   return value;
-}
-
-// Claude can answer with a tool_use as its first and only content block even
-// when the prompt asks for an opening update. Keep the visible contract stable
-// without duplicating a real model-written update.
-function emitOpeningNotice(session) {
-  if (!session.turn || session.turn.openingNoticeEmitted) return;
-  const text = session.turn.openingNotice;
-  const id = nextItemId(session, "opening");
-  const item = { id, type: "agentMessage", text, provider: "Claude" };
-  emitItem(session, "started", item);
-  emitItem(session, "completed", item);
-  session.turn.openingNoticeEmitted = true;
 }
 
 // Text pacing lives in the host renderer, not here. A timer in this process
@@ -1447,7 +1428,11 @@ function processAssistant(session, message) {
       emitItem(session, "completed", item);
     }
   }
-  if (hasToolUse && !hasVisibleText) emitOpeningNotice(session);
+  // A turn that opens straight into a tool call used to get a stand-in notice
+  // here. The sentence named no target and no action — the very shape the rules
+  // ban — and its language followed the one prompt's script, so a path-only
+  // message in a Korean session came back in English. The tool item that
+  // follows already says what is being done.
   for (const block of content) {
     if (block.type === "tool_use") processToolUse(session, block);
   }
@@ -2624,8 +2609,6 @@ function beginTurn(session, input = []) {
     sawStreamText: false,
     sawVisibleText: false,
     koreanRequest: isKoreanPrompt(input),
-    openingNotice: openingNotice(input),
-    openingNoticeEmitted: false,
   };
   session.lastContextUsage = null;
   notify("turn/started", { threadId: session.id, turn: { id: turnId } });
