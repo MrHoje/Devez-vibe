@@ -13957,31 +13957,31 @@ fn dollar_completion_panel_title(
 ) -> &'static str {
     match (source, provider) {
         (CompletionSource::User, ModelProvider::Claude) => {
-            "Skills\u{001e}[ User ]       Plugins         Claude"
+            "Skills\u{001e}[ User ]   Plugins     Claude"
         }
         (CompletionSource::Plugin, ModelProvider::Claude) => {
-            "Skills\u{001e}  User       [ Plugins ]       Claude"
+            "Skills\u{001e}  User   [ Plugins ]   Claude"
         }
         (CompletionSource::Provider, ModelProvider::Claude) => {
-            "Skills\u{001e}  User         Plugins       [ Claude ]"
+            "Skills\u{001e}  User     Plugins   [ Claude ]"
         }
         (CompletionSource::User, ModelProvider::Codex) => {
-            "Skills\u{001e}[ User ]       Plugins         Codex"
+            "Skills\u{001e}[ User ]   Plugins     Codex"
         }
         (CompletionSource::Plugin, ModelProvider::Codex) => {
-            "Skills\u{001e}  User       [ Plugins ]       Codex"
+            "Skills\u{001e}  User   [ Plugins ]   Codex"
         }
         (CompletionSource::Provider, ModelProvider::Codex) => {
-            "Skills\u{001e}  User         Plugins       [ Codex ]"
+            "Skills\u{001e}  User     Plugins   [ Codex ]"
         }
         (CompletionSource::User, ModelProvider::OpenCode) => {
-            "Skills\u{001e}[ User ]       Plugins         OpenCode"
+            "Skills\u{001e}[ User ]   Plugins     OpenCode"
         }
         (CompletionSource::Plugin, ModelProvider::OpenCode) => {
-            "Skills\u{001e}  User       [ Plugins ]       OpenCode"
+            "Skills\u{001e}  User   [ Plugins ]   OpenCode"
         }
         (CompletionSource::Provider, ModelProvider::OpenCode) => {
-            "Skills\u{001e}  User         Plugins       [ OpenCode ]"
+            "Skills\u{001e}  User     Plugins   [ OpenCode ]"
         }
     }
 }
