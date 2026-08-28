@@ -7940,7 +7940,8 @@ mod tests {
             None,
             "the block expanded"
         );
-        assert!(state.editor.text().starts_with(pasted));
+        // The buffer keeps the paste with its line endings normalized to LF.
+        assert!(state.editor.text().starts_with(&pasted.replace("\r\n", "\n")));
     }
 
     /// The model and effort readings stand for the commands that change them, so a

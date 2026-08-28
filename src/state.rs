@@ -6855,7 +6855,7 @@ impl AppState {
         let old_text = self.editor.text();
         let binding_count = self.selected_completion_bindings.len();
         if pasted {
-            self.editor.insert_paste_str(text);
+            self.editor.insert_paste_str(&sanitize_pasted_text(text));
         } else {
             self.editor.insert_str(text);
         }
@@ -6864,6 +6864,8 @@ impl AppState {
     }
 
     fn handle_inserted_text(&mut self, text: &str, pasted: bool) {
+        let sanitized = pasted.then(|| sanitize_pasted_text(text));
+        let text = sanitized.as_deref().unwrap_or(text);
         // Pasted or buffered text is input, not a quit, so it disarms like a keypress.
         self.disarm_quit();
         let old_text = self.editor.text();
@@ -14576,6 +14578,33 @@ fn merged_turn_blocks(
     }
 }
 
+/// Pasted text enters the editor buffer verbatim, but terminals and the width
+/// tables disagree about control characters: a tab advances the cursor to the
+/// next tab stop and a stray CR returns it to column 0, while the composer
+/// counts both as zero width — the right border then lands off the frame.
+/// Terminals that re-synthesize a paste as key records never let these
+/// through; the direct clipboard path (DevezCode) does. Newlines survive,
+/// tabs become spaces, every other control character vanishes.
+fn sanitize_pasted_text(text: &str) -> String {
+    let mut sanitized = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                sanitized.push('\n');
+            }
+            '\n' => sanitized.push('\n'),
+            '\t' => sanitized.push_str("    "),
+            ch if ch.is_control() => {}
+            ch => sanitized.push(ch),
+        }
+    }
+    sanitized
+}
+
 fn progress_groups_for_prompts(progress: Vec<Block>, prompts: &[Block]) -> Vec<Block> {
     let mut groups: Vec<(usize, Vec<Block>)> = Vec::new();
     for block in progress {
@@ -21505,6 +21534,16 @@ mod tests {
         assert_eq!(groups[0].children()[1].body, "추가 요청 확인");
         assert_eq!(groups[1].title, "+1 Response");
         assert_eq!(groups[1].children()[0].body, "추가 요청 수정");
+    }
+
+    /// Tabs and stray CRs from a raw clipboard paste shear the composer's right
+    /// border: the terminal advances/returns the cursor while the width math
+    /// counts them as zero. They must never reach the editor buffer.
+    #[test]
+    fn pasted_control_characters_never_reach_the_composer_buffer() {
+        let mut state = test_state();
+        state.handle_paste("a\tb\r\nc\rd\u{7f}e");
+        assert_eq!(state.editor.text(), "a    b\nc\nde");
     }
 
     /// The screenshot bug: a prompt steered while an answer was in flight used
