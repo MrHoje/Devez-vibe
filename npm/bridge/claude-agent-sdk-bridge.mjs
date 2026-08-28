@@ -3149,7 +3149,15 @@ async function dispatch(method, params = {}) {
     const source = liveSessionId(params.sessionId);
     const forked = await forkSession(source, { dir: await readableCwd(source, params.cwd) });
     const id = forked.sessionId || forked;
-    const { session, account, usage } = await createSession(params, id);
+    // A fork continues the thread it branched from, so the parent's own model and
+    // effort outrank the host's fallback: without this the new session opens on
+    // the model default instead of what the parent was running.
+    const parent = sessions.get(source);
+    const { session, account, usage } = await createSession({
+      ...params,
+      model: stripClaudeModel(params.model) ? params.model : (parent?.model || params.fallbackModel || params.model),
+      effort: params.effort || parent?.effort || params.fallbackEffort,
+    }, id);
     return {
       id,
       thread: { id, turns: [] },

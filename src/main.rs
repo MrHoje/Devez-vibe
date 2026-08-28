@@ -2677,10 +2677,15 @@ async fn execute_action(
                         .and_then(Value::as_str)
                         .unwrap_or_else(|| state.selected_model_name())
                         .to_owned();
+                    // The fork inherits the parent's effort, so an answer that
+                    // omits it must not drop the pane back to the model default.
                     let effort = response
                         .get("reasoningEffort")
                         .and_then(Value::as_str)
-                        .map(ToOwned::to_owned);
+                        .filter(|effort| !effort.is_empty())
+                        .unwrap_or_else(|| state.selected_effort())
+                        .to_owned();
+                    let effort = (!effort.is_empty()).then_some(effort);
                     if let Some(thread_id) = thread_id {
                         renderer.clear_screen()?;
                         state.enter_side_thread(thread_id, cwd, &model, effort.as_deref());

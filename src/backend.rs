@@ -670,6 +670,27 @@ impl BackendServer {
                         })
                         .await?;
                     self.register_claude_response(&mut response, cwd)?;
+                    // The fork's own route has no turns yet, so remember what it
+                    // opened on; a later resume would otherwise fall back to the
+                    // bridge defaults instead of the parent's selection.
+                    if let Some(forked) = response
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                    {
+                        let model = response
+                            .get("model")
+                            .and_then(Value::as_str)
+                            .or_else(|| params.get("model").and_then(Value::as_str))
+                            .map(ToOwned::to_owned);
+                        let effort = response
+                            .get("reasoningEffort")
+                            .and_then(Value::as_str)
+                            .filter(|effort| !effort.is_empty())
+                            .or_else(|| params.get("effort").and_then(Value::as_str))
+                            .map(ToOwned::to_owned);
+                        self.note_claude_selection(&forked, model.as_deref(), effort.as_deref());
+                    }
                     Ok(response)
                 } else if self.route_kind(visible) == RuntimeKind::OpenCode {
                     let route = self.route(visible);
@@ -681,7 +702,15 @@ impl BackendServer {
                         .as_ref()
                         .map(|route| route.cwd.clone())
                         .unwrap_or_else(|| self.cwd.clone());
-                    let response = self.open_code()?.fork_session(&cwd, backing).await?;
+                    let model = params.get("model").and_then(Value::as_str);
+                    let effort = params
+                        .get("effort")
+                        .and_then(Value::as_str)
+                        .filter(|effort| !effort.is_empty());
+                    let response = self
+                        .open_code()?
+                        .fork_session(&cwd, backing, model, effort)
+                        .await?;
                     let id = response
                         .get("id")
                         .and_then(Value::as_str)

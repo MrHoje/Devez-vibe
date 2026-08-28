@@ -1117,7 +1117,13 @@ impl OpenCodeServer {
         Ok(json!({ "data": data, "nextCursor": response.get("nextCursor") }))
     }
 
-    pub async fn fork_session(&self, cwd: &Path, session_id: &str) -> Result<Value> {
+    pub async fn fork_session(
+        &self,
+        cwd: &Path,
+        session_id: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<Value> {
         let response = self
             .client
             .request(
@@ -1132,12 +1138,24 @@ impl OpenCodeServer {
         let forked = response
             .get("sessionId")
             .and_then(Value::as_str)
-            .context("OpenCode 분기 세션에 id가 없습니다.")?;
+            .context("OpenCode 분기 세션에 id가 없습니다.")?
+            .to_owned();
+        // A fork starts on the workspace defaults, so the parent's own selection
+        // has to be written onto the new session before it answers anything.
+        if let Some(model) = model.filter(|model| is_open_code_model(model)) {
+            self.set_model(&forked, model, effort).await?;
+            return Ok(thread_response(
+                &forked,
+                cwd,
+                model,
+                effort.unwrap_or("default"),
+            ));
+        }
         let model = current_model(&response)
             .map(|model| format!("opencode:{model}"))
             .unwrap_or_else(|| "opencode:unknown/unknown".to_owned());
         let effort = current_config_option(&response, "effort").unwrap_or("default");
-        Ok(thread_response(forked, cwd, &model, effort))
+        Ok(thread_response(&forked, cwd, &model, effort))
     }
 
     pub async fn start_prompt(&self, session_id: &str, text: &str) -> Result<String> {
