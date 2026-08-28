@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use crate::terminal_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CellPosition {
@@ -273,6 +273,7 @@ pub(crate) fn selection_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal_width::with_devezcode_xterm_widths;
 
     fn point(column: u16, row: usize) -> CellPosition {
         CellPosition { column, row }
@@ -420,6 +421,36 @@ mod tests {
             ),
             "e\u{301}"
         );
+    }
+
+    #[test]
+    fn devezcode_selection_uses_the_same_paw_width_as_xterm() {
+        with_devezcode_xterm_widths(|| {
+            let lines = vec![line("A🐾B")];
+            assert_eq!(
+                extract_text(
+                    &lines,
+                    CellRange {
+                        start: point(2, 0),
+                        end: point(2, 0),
+                    }
+                ),
+                "B"
+            );
+            assert_eq!(
+                selection_chunks("A🐾B", 0, Some(2..3)),
+                vec![
+                    SelectionChunk {
+                        text: "A🐾".to_owned(),
+                        selected: false,
+                    },
+                    SelectionChunk {
+                        text: "B".to_owned(),
+                        selected: true,
+                    },
+                ]
+            );
+        });
     }
 
     #[test]

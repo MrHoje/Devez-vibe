@@ -8,7 +8,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::Value;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use crate::terminal_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::editor::Editor;
 use crate::renderer::{
@@ -1986,7 +1986,17 @@ impl MarketplacePicker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal_width::with_devezcode_xterm_widths;
     use serde_json::json;
+
+    #[test]
+    fn devezcode_management_rows_pad_paw_prints_with_xterm_width() {
+        with_devezcode_xterm_widths(|| {
+            let row = management_row("🐾 plugin", "connected");
+            let detail = row.find("connected").expect("detail");
+            assert_eq!(UnicodeWidthStr::width(&row[..detail]), MANAGEMENT_NAME_COLUMNS + 2);
+        });
+    }
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

@@ -12,7 +12,7 @@ use crossterm::{
     terminal,
 };
 use serde_json::{Map, Value, json};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use crate::terminal_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     completion::{
@@ -15873,6 +15873,15 @@ fn parse_fast_mode(config: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal_width::with_devezcode_xterm_widths;
+
+    #[test]
+    fn devezcode_skill_columns_compact_with_xterm_width() {
+        with_devezcode_xterm_widths(|| {
+            assert_eq!(compact_skill_column("🐾🐾", 2), "🐾🐾");
+            assert_eq!(UnicodeWidthStr::width("🐾🐾"), 2);
+        });
+    }
 
     /// The mark guides the choice and means nothing once one is made, in either
     /// wording the model reaches for.

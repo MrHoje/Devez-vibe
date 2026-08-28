@@ -26,8 +26,6 @@ use crossterm::{
         enable_raw_mode, size as terminal_size,
     },
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
 use crate::{
     editor::{ATTACHMENT_PLACEHOLDER, Editor},
     selection::{
@@ -39,8 +37,12 @@ use crate::{
         QUESTION_TAB_SEPARATOR, ShellDisplayMode,
     },
     syntax::{self, SyntaxKind},
+    terminal_width::{UnicodeWidthChar, UnicodeWidthStr, wrap_ascii_space},
     theme::{self, Rgb, ThemeKind},
 };
+
+#[cfg(test)]
+use crate::terminal_width::with_devezcode_xterm_widths;
 
 /// Which of the two ways of putting the transcript on screen is in use.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -3550,6 +3552,15 @@ impl Renderer {
                     self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
                 }
             } else {
+                if visible_transcript_blocks(
+                    std::iter::once(block),
+                    self.shell_display_mode,
+                    self.diff_display_mode,
+                )
+                .is_empty()
+                {
+                    continue;
+                }
                 let lines = self.history_block_lines(block, width);
                 let visible = visible_transcript_blocks(
                     &self.history,
@@ -6140,6 +6151,9 @@ fn render_streamed_transcript_lines(
     for live in live {
         let mut block = live.block.clone();
         block.body = stable_streaming_markdown_body(&block.body);
+        if is_blank_bodied_assistant_block(&block) {
+            continue;
+        }
         let mut lines = block_group_lines(
             &block,
             width,
@@ -6160,8 +6174,8 @@ fn render_streamed_transcript_lines(
 /// Rendering the first one or two as ordinary text and then hiding the completed
 /// delimiter makes the transcript shrink for one frame. Hold an unfinished marker
 /// while it can still complete, and keep a terminal completed marker out too: the
-/// Markdown renderer hides that marker anyway, while an otherwise empty Assistant
-/// block still owns its placeholder rows until real code arrives.
+/// Markdown renderer hides that marker anyway. Empty Assistant blocks own no
+/// visible row, so an unfinished fence stays hidden until real code arrives.
 fn stable_streaming_markdown_body(body: &str) -> String {
     let content_end = body.trim_end_matches(['\r', '\n']).len();
     let line_start = body[..content_end].rfind('\n').map_or(0, |index| index + 1);
@@ -8045,12 +8059,10 @@ fn is_empty_thinking_block(block: &Block) -> bool {
     is_thinking_block(block) && block.body.trim().is_empty()
 }
 
-/// 공백만 담긴 응답 블록은 한 행도 그리지 않는다. 목록에 남겨 두면 뒤따르는
+/// 본문이 없거나 공백만 담긴 응답 블록은 한 행도 그리지 않는다. 목록에 남겨 두면
 /// 블록이 이 블록을 직전 이웃으로 보고 여백을 접어, 프롬프트와 답변이 붙는다.
 fn is_blank_bodied_assistant_block(block: &Block) -> bool {
-    matches!(block.kind, BlockKind::Assistant)
-        && !block.body.is_empty()
-        && block.body.trim().is_empty()
+    matches!(block.kind, BlockKind::Assistant) && block.body.trim().is_empty()
 }
 
 fn is_file_change_block(block: &Block) -> bool {
@@ -10228,12 +10240,7 @@ fn table_rule_line(
 }
 
 fn table_cell_lines(cell: &str, width: usize) -> Vec<String> {
-    textwrap::wrap(
-        cell,
-        textwrap::Options::new(width)
-            .break_words(true)
-            .word_separator(textwrap::WordSeparator::AsciiSpace),
-    )
+    wrap_ascii_space(cell, width)
     .into_iter()
     .map(|line| line.into_owned())
     .collect::<Vec<_>>()
@@ -11195,13 +11202,10 @@ fn wrapped_line_with_continuation(
     // `CellFrame` leaves the physical final column blank to avoid terminal
     // autowrap, so text wrapping must reserve that same column as well.
     let available = width.saturating_sub(prefix_width + 1).max(4);
-    // `AsciiSpace` keeps links and paths intact so they fold to the next row as
-    // one word; `break_words` is the last resort for a word wider than the row.
-    let options = textwrap::Options::new(available)
-        .break_words(true)
-        .word_separator(textwrap::WordSeparator::AsciiSpace);
+    // ASCII-space wrapping keeps links and paths intact so they fold to the next
+    // row as one word; long words still break using the active terminal width.
     let expanded = expand_tabs(text);
-    let wrapped = textwrap::wrap(expanded.as_ref(), options);
+    let wrapped = wrap_ascii_space(expanded.as_ref(), available);
     if wrapped.is_empty() {
         return vec![PaintLine {
             prefix: prefix.to_owned(),
@@ -15756,6 +15760,58 @@ mod tests {
     }
 
     #[test]
+    fn devezcode_widths_match_xterm6_for_emoji_and_cjk() {
+        with_devezcode_xterm_widths(|| {
+            assert_eq!(UnicodeWidthStr::width("🐾"), 1);
+            assert_eq!(UnicodeWidthStr::width("👩‍💻"), 2);
+            assert_eq!(UnicodeWidthStr::width("🇰🇷"), 2);
+            assert_eq!(UnicodeWidthStr::width("가"), 2);
+            assert_eq!(UnicodeWidthChar::width('\u{0301}'), Some(0));
+            assert_eq!(UnicodeWidthChar::width('\u{1ab0}'), Some(1));
+            assert_eq!(UnicodeWidthChar::width('\u{1d167}'), Some(0));
+            assert_eq!(
+                UnicodeWidthChar::width(char::from_u32(0x20000).expect("CJK extension")),
+                Some(2)
+            );
+        });
+        assert_eq!(
+            UnicodeWidthStr::width("🐾"),
+            unicode_width::UnicodeWidthStr::width("🐾")
+        );
+    }
+
+    #[test]
+    fn devezcode_paw_print_keeps_following_frame_cells_aligned() {
+        with_devezcode_xterm_widths(|| {
+            let mut frame = CellFrame::new(12, 1);
+            frame.write(0, 0, "A🐾B가C", CellStyle::plain());
+
+            assert_eq!(frame.cell(0, 0).glyph, "A");
+            assert_eq!(frame.cell(1, 0).glyph, "🐾");
+            assert_eq!(frame.cell(2, 0).glyph, "B");
+            assert_eq!(frame.cell(3, 0).glyph, "가");
+            assert!(frame.cell(4, 0).continuation);
+            assert_eq!(frame.cell(5, 0).glyph, "C");
+        });
+    }
+
+    #[test]
+    fn devezcode_paw_print_keeps_every_composer_border_on_one_column() {
+        with_devezcode_xterm_widths(|| {
+            let mut editor = Editor::default();
+            editor.set_text(
+                "🐾 스킬 생성 자체는 가능한 기능이지만, 오른쪽 세로줄은 모든 행에서 같아야 한다",
+            );
+            let (rows, _, _, _) = input_lines(&editor, &[], 48, "", "", None, None);
+            let input_rows = &rows[1..rows.len() - 1];
+
+            assert!(input_rows.len() > 1, "fixture must wrap");
+            assert!(input_rows.iter().all(|row| painted_line_width(row) == 47));
+            assert!(input_rows.iter().all(|row| painted(row).ends_with('│')));
+        });
+    }
+
+    #[test]
     fn wrapped_lines_keep_korean_words_together() {
         let lines = wrapped_line("● ", Tone::Accent, "가나다 라마바", Tone::Plain, false, 10);
 
@@ -19012,6 +19068,7 @@ mod tests {
             .0
         };
         let empty = rendered(&answer);
+        assert!(empty.is_empty());
 
         for body in ["`", "``", "```", "```\n"] {
             answer.body = body.to_owned();
@@ -20105,6 +20162,53 @@ mod tests {
 
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].body, "actual summary");
+    }
+
+    #[test]
+    fn empty_assistant_placeholders_do_not_leave_response_bullets() {
+        let blocks = vec![
+            Block::new(BlockKind::Assistant, "Codex", ""),
+            Block::new(BlockKind::Assistant, "Codex", " \n"),
+            Block::new(BlockKind::Assistant, "Codex", "actual answer"),
+        ];
+
+        let visible = visible_transcript_blocks(
+            &blocks,
+            ShellDisplayMode::Collapse,
+            DiffDisplayMode::Collapse,
+        );
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].body, "actual answer");
+    }
+
+    #[test]
+    fn fullscreen_incremental_commit_skips_empty_assistant_rows() {
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.fold_progress_groups = true;
+        renderer.commit_fullscreen_blocks(
+            &[Block::new(BlockKind::User, "Codex", "prompt")],
+            80,
+            20,
+        );
+        let before = renderer.wrapped.clone();
+
+        renderer.commit_fullscreen_blocks(
+            &[Block::new(BlockKind::Assistant, "Codex", "")],
+            80,
+            20,
+        );
+        assert!(renderer.wrapped == before, "empty commit changed wrapped rows");
+
+        renderer.commit_fullscreen_blocks(
+            &[Block::new(BlockKind::Assistant, "Codex", "actual answer")],
+            80,
+            20,
+        );
+        assert!(renderer.wrapped.iter().any(|line| line.text == "actual answer"));
+        assert!(!renderer.wrapped.iter().any(|line| {
+            line.prefix == RESPONSE_BULLET_PREFIX && line.text.trim().is_empty()
+        }));
     }
 
     #[test]

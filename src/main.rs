@@ -17,6 +17,7 @@ mod rollout;
 mod selection;
 mod state;
 mod syntax;
+mod terminal_width;
 mod theme;
 mod update;
 
