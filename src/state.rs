@@ -1997,7 +1997,9 @@ struct SkillBinding {
 
 impl SkillBinding {
     fn completion_source(&self) -> CompletionSource {
-        if self.scope.eq_ignore_ascii_case("user") && self.source.is_none() {
+        if self.source.is_some() {
+            CompletionSource::Plugin
+        } else if self.scope.eq_ignore_ascii_case("user") {
             CompletionSource::User
         } else {
             CompletionSource::Provider
@@ -7139,7 +7141,7 @@ impl AppState {
                         return Action::None;
                     }
                     KeyCode::Left if target.sigil == '$' => {
-                        self.dollar_completion_source = CompletionSource::User;
+                        self.dollar_completion_source = self.dollar_completion_source.previous();
                         self.command_selection = 0;
                         return Action::None;
                     }
@@ -7149,7 +7151,7 @@ impl AppState {
                         return Action::None;
                     }
                     KeyCode::Right if target.sigil == '$' => {
-                        self.dollar_completion_source = CompletionSource::Provider;
+                        self.dollar_completion_source = self.dollar_completion_source.next();
                         self.command_selection = 0;
                         return Action::None;
                     }
@@ -13954,12 +13956,33 @@ fn dollar_completion_panel_title(
     provider: ModelProvider,
 ) -> &'static str {
     match (source, provider) {
-        (CompletionSource::User, ModelProvider::Claude) => "Skills\u{001e}[ User ]     Claude",
-        (CompletionSource::Provider, ModelProvider::Claude) => "Skills\u{001e}  User     [ Claude ]",
-        (CompletionSource::User, ModelProvider::Codex) => "Skills\u{001e}[ User ]     Codex",
-        (CompletionSource::Provider, ModelProvider::Codex) => "Skills\u{001e}  User     [ Codex ]",
-        (CompletionSource::User, ModelProvider::OpenCode) => "Skills\u{001e}[ User ]     OpenCode",
-        (CompletionSource::Provider, ModelProvider::OpenCode) => "Skills\u{001e}  User     [ OpenCode ]",
+        (CompletionSource::User, ModelProvider::Claude) => {
+            "Skills\u{001e}[ User ]       Plugins         Claude"
+        }
+        (CompletionSource::Plugin, ModelProvider::Claude) => {
+            "Skills\u{001e}  User       [ Plugins ]       Claude"
+        }
+        (CompletionSource::Provider, ModelProvider::Claude) => {
+            "Skills\u{001e}  User         Plugins       [ Claude ]"
+        }
+        (CompletionSource::User, ModelProvider::Codex) => {
+            "Skills\u{001e}[ User ]       Plugins         Codex"
+        }
+        (CompletionSource::Plugin, ModelProvider::Codex) => {
+            "Skills\u{001e}  User       [ Plugins ]       Codex"
+        }
+        (CompletionSource::Provider, ModelProvider::Codex) => {
+            "Skills\u{001e}  User         Plugins       [ Codex ]"
+        }
+        (CompletionSource::User, ModelProvider::OpenCode) => {
+            "Skills\u{001e}[ User ]       Plugins         OpenCode"
+        }
+        (CompletionSource::Plugin, ModelProvider::OpenCode) => {
+            "Skills\u{001e}  User       [ Plugins ]       OpenCode"
+        }
+        (CompletionSource::Provider, ModelProvider::OpenCode) => {
+            "Skills\u{001e}  User         Plugins       [ OpenCode ]"
+        }
     }
 }
 
@@ -23729,7 +23752,7 @@ mod tests {
     }
 
     #[test]
-    fn dollar_completion_moves_between_user_and_current_provider() {
+    fn dollar_completion_moves_between_user_plugins_and_current_provider() {
         let mut state = composer_completion_state();
         state.update_skills(&json!({
             "data": [{
@@ -23747,21 +23770,40 @@ mod tests {
                         "description": "Debug a change",
                         "enabled": true,
                         "scope": "system"
+                    },
+                    {
+                        "name": "plugged",
+                        "path": "C:/claude/plugins/knowledge/skills/plugged/SKILL.md",
+                        "description": "Plugin skill",
+                        "enabled": true,
+                        "scope": "user",
+                        "pluginId": "knowledge"
                     }
                 ]
             }]
         }));
         state.editor.set_text("$");
-        let user = state
-            .view()
-            .suggestions
-            .iter()
-            .map(|suggestion| suggestion.category.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(user, [Some("Skill".to_owned())]);
-        let title = state.view().suggestions[0].panel_title;
-        assert!(title.contains("[ User ]     Codex"));
-        assert!(!title.contains('·'));
+        let user = state.view().suggestions;
+        assert_eq!(
+            user.iter()
+                .map(|suggestion| suggestion.command.clone())
+                .collect::<Vec<_>>(),
+            ["review".to_owned()]
+        );
+        assert!(user[0].panel_title.contains("[ User ]"));
+        assert!(!user[0].panel_title.contains('·'));
+
+        state.handle_key(KeyEvent::from(KeyCode::Right));
+        let plugins = state.view().suggestions;
+        assert_eq!(
+            plugins
+                .iter()
+                .map(|suggestion| suggestion.command.clone())
+                .collect::<Vec<_>>(),
+            ["plugged".to_owned()],
+            "플러그인이 설치한 스킬은 Plugins 탭에 모인다."
+        );
+        assert!(plugins[0].panel_title.contains("[ Plugins ]"));
 
         state.handle_key(KeyEvent::from(KeyCode::Right));
         let provider = state
@@ -23779,11 +23821,17 @@ mod tests {
             ]
         );
 
-        state.handle_key(KeyEvent::from(KeyCode::Left));
+        state.handle_key(KeyEvent::from(KeyCode::Right));
         assert_eq!(
             state.view().suggestions[0].command,
             "review",
-            "User가 왼쪽 탭이어야 합니다."
+            "오른쪽 끝에서 User 탭으로 돌아온다."
+        );
+
+        state.handle_key(KeyEvent::from(KeyCode::Left));
+        assert!(
+            state.view().suggestions[0].panel_title.contains("[ Codex ]"),
+            "왼쪽 키는 반대로 순환한다."
         );
 
         state.editor.set_text("@");
@@ -23797,6 +23845,7 @@ mod tests {
             at,
             [
                 Some("Plugin".to_owned()),
+                Some("Skill".to_owned()),
                 Some("Skill".to_owned()),
                 Some("Skill".to_owned())
             ]
@@ -24074,6 +24123,7 @@ mod tests {
         }));
         state.editor.set_text("$cal");
         state.handle_key(KeyEvent::from(KeyCode::Right));
+        state.handle_key(KeyEvent::from(KeyCode::Right));
         state.handle_key(KeyEvent::from(KeyCode::Down));
         state.handle_key(KeyEvent::from(KeyCode::Enter));
 
@@ -24129,6 +24179,7 @@ mod tests {
         state.editor.set_text("$cal");
         state.handle_key(KeyEvent::from(KeyCode::Enter));
         state.handle_paste("$cal");
+        state.handle_key(KeyEvent::from(KeyCode::Right));
         state.handle_key(KeyEvent::from(KeyCode::Right));
         state.handle_key(KeyEvent::from(KeyCode::Down));
         state.handle_key(KeyEvent::from(KeyCode::Enter));

@@ -68,6 +68,12 @@ impl Selection {
         self.dragging
     }
 
+    /// Where the drag last stood. A release the renderer cannot resolve to a
+    /// cell finishes here rather than leaving the drag open.
+    pub const fn focus(&self) -> Option<CellPosition> {
+        self.focus
+    }
+
     pub fn begin(&mut self, point: CellPosition) {
         self.anchor = Some(point);
         self.focus = Some(point);

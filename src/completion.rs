@@ -15,7 +15,26 @@ pub enum CompletionKind {
 pub enum CompletionSource {
     #[default]
     User,
+    Plugin,
     Provider,
+}
+
+impl CompletionSource {
+    pub fn previous(self) -> Self {
+        match self {
+            Self::User => Self::Provider,
+            Self::Plugin => Self::User,
+            Self::Provider => Self::Plugin,
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::User => Self::Plugin,
+            Self::Plugin => Self::Provider,
+            Self::Provider => Self::User,
+        }
+    }
 }
 
 impl CompletionKind {

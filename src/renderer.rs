@@ -766,6 +766,9 @@ pub struct Renderer {
     /// Transcript selections use wrapped-history row coordinates rather than
     /// screen rows, allowing a live drag to continue across wheel scrolling.
     selection_in_transcript: bool,
+    /// Screen row the live drag was pressed on. Only the direction matters: it
+    /// tells a release which side of a chrome row the selection came from.
+    selection_anchor_screen_row: Option<usize>,
     live_frame_cache: Option<LiveFrameCache>,
     /// Assistant blocks already painted as temporary transcript rows. When the
     /// same id is committed, only a real wrapping difference may change a
@@ -1415,6 +1418,7 @@ impl Renderer {
             side_panel_footer: Vec::new(),
             selection_in_panel: false,
             selection_in_transcript: false,
+            selection_anchor_screen_row: None,
             live_frame_cache: None,
             fullscreen_stream_rows: HashMap::new(),
             animation_activity_row: None,
@@ -1900,23 +1904,31 @@ impl Renderer {
             self.selection_in_transcript = !self.selection_in_panel
                 && self.transcript_row_at_screen(usize::from(row)).is_some();
         }
-        let Some(point) = self.selection_point(column, row) else {
+        let Some(point) = self.selection_point(column, row, RowSnap::Interior) else {
             return false;
         };
+        self.selection_anchor_screen_row = Some(usize::from(row));
         self.selection.begin(point);
         true
     }
 
     pub fn update_selection(&mut self, column: u16, row: u16) -> bool {
-        let Some(point) = self.selection_point(column, row) else {
+        let Some(point) = self.selection_point(column, row, self.drag_row_snap(row)) else {
             return false;
         };
         self.selection.update(point)
     }
 
     pub fn finish_selection(&mut self, column: u16, row: u16) -> SelectionResult {
-        let Some(point) = self.selection_point(column, row) else {
-            return SelectionResult::None;
+        // A release the frame cannot resolve to a cell still ends the drag:
+        // dropping it here would leave the selection stuck open and throw away
+        // the text the user had already highlighted.
+        let point = match self.selection_point(column, row, self.drag_row_snap(row)) {
+            Some(point) => point,
+            None => match self.selection.focus() {
+                Some(focus) => focus,
+                None => return SelectionResult::None,
+            },
         };
         let in_panel = self.selection_target_is_panel(column);
         match self.selection.finish(point) {
@@ -1940,7 +1952,7 @@ impl Renderer {
     pub fn double_click_word(&mut self, column: u16, row: u16) -> Option<String> {
         const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
-        let point = self.selection_point(column, row)?;
+        let point = self.selection_point(column, row, RowSnap::Interior)?;
         if matches!(self.pick_at(column, row), Some(Pick::History(_)))
             || self
                 .progress_group_rows
@@ -1985,6 +1997,7 @@ impl Renderer {
     pub fn clear_selection(&mut self) -> bool {
         self.selection_in_panel = false;
         self.selection_in_transcript = false;
+        self.selection_anchor_screen_row = None;
         self.split_selection_focus = None;
         self.composer_select_all = false;
         self.selection.clear()
@@ -2270,14 +2283,14 @@ impl Renderer {
         }
     }
 
-    fn selection_point(&self, column: u16, row: u16) -> Option<CellPosition> {
+    fn selection_point(&self, column: u16, row: u16, snap: RowSnap) -> Option<CellPosition> {
         if self.mode != RenderMode::Fullscreen || self.previous_lines.is_empty() {
             return None;
         }
         if self.selection_target_is_panel(column) {
             return self.panel_selection_point(column, row);
         }
-        let screen_row = if self.split_active {
+        let (first, last) = if self.split_active {
             let pane = self
                 .split_selection_focus
                 .unwrap_or_else(|| self.split_pane_at_row(usize::from(row)));
@@ -2285,24 +2298,23 @@ impl Renderer {
             if bounds.is_empty() {
                 return None;
             }
-            usize::from(row).clamp(bounds.start, bounds.end - 1)
+            (bounds.start, bounds.end - 1)
         } else if self.selection_in_transcript {
             let first = self.last_transcript_screen_start;
             if self.last_transcript_rows == 0 {
                 return None;
             }
-            let last = first + self.last_transcript_rows.saturating_sub(1);
-            usize::from(row).clamp(first, last)
+            (first, first + self.last_transcript_rows.saturating_sub(1))
         } else {
-            usize::from(row).min(self.previous_lines.len().saturating_sub(1))
+            (0, self.previous_lines.len().saturating_sub(1))
         };
-        let line = &self.previous_lines[screen_row];
-        if matches!(
-            line.tone,
-            Tone::AssistantBubbleHalf | Tone::UserPromptPadding
-        ) {
+        let last = last.min(self.previous_lines.len().saturating_sub(1));
+        if first > last {
             return None;
         }
+        let screen_row =
+            self.selectable_screen_row(usize::from(row).clamp(first, last), first, last, snap)?;
+        let line = self.previous_lines.get(screen_row)?;
         let width = painted_line_width(line).max(
             line.pick
                 .as_ref()
@@ -2314,17 +2326,85 @@ impl Renderer {
         } else {
             column.min(width.saturating_sub(1).min(u16::MAX as usize) as u16)
         };
-        if line.tone == Tone::UserPrompt
-            && usize::from(column) < UnicodeWidthStr::width(line.prefix.as_str())
-        {
-            return None;
-        }
+        // A prompt's coloured border is chrome, but a press on it still means
+        // the prompt: the point moves to the first text cell rather than
+        // dropping the drag the user started there.
+        let column = if line.tone == Tone::UserPrompt {
+            let prefix = UnicodeWidthStr::width(line.prefix.as_str());
+            if prefix >= width {
+                return None;
+            }
+            column.max(u16::try_from(prefix).ok()?)
+        } else {
+            column
+        };
         let row = if self.selection_in_transcript {
             self.transcript_row_at_screen(screen_row)?
         } else {
             screen_row
         };
         Some(CellPosition { column, row })
+    }
+
+    /// Bubble edges and prompt padding are chrome rather than text, so a press
+    /// or release that lands on one resolves to the nearest row that does carry
+    /// text. Without this a one-cell miss kills the whole drag.
+    fn selectable_screen_row(
+        &self,
+        screen_row: usize,
+        first: usize,
+        last: usize,
+        snap: RowSnap,
+    ) -> Option<usize> {
+        let is_chrome = |row: usize| {
+            self.previous_lines.get(row).is_some_and(|line| {
+                matches!(
+                    line.tone,
+                    Tone::AssistantBubbleHalf | Tone::UserPromptPadding
+                )
+            })
+        };
+        if !is_chrome(screen_row) {
+            return Some(screen_row);
+        }
+        let down = (screen_row + 1..=last).find(|row| !is_chrome(*row));
+        let up = (first..screen_row).rev().find(|row| !is_chrome(*row));
+        match snap {
+            RowSnap::Up => up.or(down),
+            RowSnap::Down => down.or(up),
+            RowSnap::Interior => {
+                if self.chrome_row_closes_its_block(screen_row) {
+                    up.or(down)
+                } else {
+                    down.or(up)
+                }
+            }
+        }
+    }
+
+    /// True when a chrome row sits below the text it wraps: a bubble's lower
+    /// half-block, or the padding under a prompt.
+    fn chrome_row_closes_its_block(&self, screen_row: usize) -> bool {
+        let Some(line) = self.previous_lines.get(screen_row) else {
+            return false;
+        };
+        match line.tone {
+            Tone::AssistantBubbleHalf => line.text.starts_with('▀'),
+            Tone::UserPromptPadding => screen_row
+                .checked_sub(1)
+                .and_then(|row| self.previous_lines.get(row))
+                .is_some_and(|previous| previous.tone == Tone::UserPrompt),
+            _ => false,
+        }
+    }
+
+    /// Which way a live drag resolves a chrome row: back toward its anchor, so
+    /// the selection never runs past the block the pointer is over.
+    fn drag_row_snap(&self, row: u16) -> RowSnap {
+        match self.selection_anchor_screen_row {
+            Some(anchor) if usize::from(row) > anchor => RowSnap::Up,
+            _ => RowSnap::Down,
+        }
     }
 
     fn copy_lines(&self) -> Vec<CopyLine> {
@@ -5203,6 +5283,16 @@ pub enum Pick {
     Prompt(u64),
     /// The `✕` on a panel's top rule: closes what Esc closes.
     Close,
+}
+
+/// Which way a chrome row resolves to text when a pointer lands on one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowSnap {
+    /// A press belongs to the block the chrome row wraps.
+    Interior,
+    /// A drag resolves back toward the row it was pressed on.
+    Up,
+    Down,
 }
 
 /// Columns a clickable span reaches past its own text, either side. A word is a
@@ -14874,14 +14964,63 @@ mod tests {
     }
 
     #[test]
-    fn user_prompt_bubble_cannot_start_selection_outside_its_text() {
+    fn user_prompt_bubble_starts_selection_on_its_nearest_text_cell() {
         let lines = block_lines(&Block::new(BlockKind::User, "You", "prompt"), 80);
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
         renderer.previous_lines = lines;
+        let text_row = renderer
+            .previous_lines
+            .iter()
+            .position(|line| line.tone == Tone::UserPrompt)
+            .expect("the prompt paints a text row");
+        let prefix =
+            UnicodeWidthStr::width(renderer.previous_lines[text_row].prefix.as_str()) as u16;
 
-        assert!(!renderer.begin_selection(0, 0));
-        assert!(!renderer.begin_selection(72, 0));
-        assert!(renderer.begin_selection(72, 1));
+        // The padding around a prompt is the prompt's own chrome, so a press
+        // there starts the drag on the text that padding wraps.
+        assert!(renderer.begin_selection(72, 0));
+        assert_eq!(
+            renderer.selection.range().map(|range| range.start.row),
+            Some(text_row)
+        );
+        renderer.clear_selection();
+
+        // Same for the coloured border down the left: the drag starts at the
+        // first cell of the prompt that carries text.
+        assert!(renderer.begin_selection(0, text_row as u16));
+        assert_eq!(
+            renderer.selection.range().map(|range| range.start.column),
+            Some(prefix)
+        );
+    }
+
+    #[test]
+    fn a_release_on_prompt_padding_still_copies_the_drag() {
+        let lines = block_lines(&Block::new(BlockKind::User, "You", "prompt"), 80);
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = lines;
+        let text_row = renderer
+            .previous_lines
+            .iter()
+            .position(|line| line.tone == Tone::UserPrompt)
+            .expect("the prompt paints a text row");
+        let padding_below = renderer
+            .previous_lines
+            .iter()
+            .enumerate()
+            .skip(text_row)
+            .find(|(_, line)| line.tone == Tone::UserPromptPadding)
+            .map(|(row, _)| row as u16)
+            .expect("the prompt is padded underneath");
+
+        assert!(renderer.begin_selection(0, text_row as u16));
+        let finished = renderer.finish_selection(79, padding_below);
+
+        assert!(
+            matches!(&finished, SelectionResult::Copy(text) if text.contains("prompt")),
+            "a drag released on the padding under the prompt copies it: {finished:?}"
+        );
+        assert!(!renderer.selection.is_dragging());
     }
 
     #[test]
