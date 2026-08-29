@@ -436,19 +436,20 @@ fn config_declares(config: &str, keys: &[&str]) -> bool {
 }
 
 /// Codex app-server starts stdio MCP children with an isolated environment.
-/// Put the DevezCode room in this invocation's MCP override so every browser
-/// call is bound to the tab that started Devez Vibe, without mutating global config.
+/// Put the DevezCode room and bridge discovery variable names in this
+/// invocation's MCP overrides so every browser call is bound to the tab that
+/// started Devez Vibe, without mutating global config or persisting the token.
 ///
-/// The override only carries `env`, so on a Codex home that never declared the
-/// browser server it would create an entry with neither `command` nor `url` and
-/// Codex would refuse the whole config with `invalid transport`, taking the
-/// app-server down with it. Skip the override there: the browser MCP does not
-/// exist in that install anyway, so there is no room to bind.
+/// The overrides only carry nested `env` / `env_vars`, so on a Codex home that
+/// never declared the browser server they would create an entry with neither
+/// `command` nor `url` and Codex would refuse the whole config with
+/// `invalid transport`, taking the app-server down with it. Skip the overrides
+/// there: the browser MCP does not exist in that install anyway.
 fn apply_devezcode_room_override(command: &mut Command, room: Option<&str>) {
     if !codex_config_declares_devez_browser() {
         return;
     }
-    if let Some(override_value) = devezcode_room_override(room) {
+    for override_value in devezcode_browser_overrides(room) {
         command.arg("-c").arg(override_value);
     }
 }
@@ -479,6 +480,17 @@ fn devezcode_room_override(room: Option<&str>) -> Option<String> {
             toml_string(room)
         )
     })
+}
+
+fn devezcode_browser_overrides(room: Option<&str>) -> Vec<String> {
+    let Some(room_override) = devezcode_room_override(room) else {
+        return Vec::new();
+    };
+    vec![
+        room_override,
+        "mcp_servers.devez-browser.env_vars=[\"DEVEZCODE_BRIDGE_PIPE\",\"DEVEZCODE_BRIDGE_TOKEN\"]"
+            .to_string(),
+    ]
 }
 
 fn toml_string(value: &str) -> String {
@@ -753,12 +765,16 @@ mod tests {
     }
 
     #[test]
-    fn app_server_passes_the_devezcode_room_to_browser_mcp_only() {
+    fn app_server_passes_the_devezcode_room_and_bridge_discovery_to_browser_mcp_only() {
         assert_eq!(
-            devezcode_room_override(Some("room-1")),
-            Some("mcp_servers.devez-browser.env.DEVEZCODE_ROOM_ID=\"room-1\"".to_string())
+            devezcode_browser_overrides(Some("room-1")),
+            vec![
+                "mcp_servers.devez-browser.env.DEVEZCODE_ROOM_ID=\"room-1\"".to_string(),
+                "mcp_servers.devez-browser.env_vars=[\"DEVEZCODE_BRIDGE_PIPE\",\"DEVEZCODE_BRIDGE_TOKEN\"]"
+                    .to_string(),
+            ]
         );
-        assert_eq!(devezcode_room_override(None), None);
+        assert!(devezcode_browser_overrides(None).is_empty());
     }
 
     #[test]
