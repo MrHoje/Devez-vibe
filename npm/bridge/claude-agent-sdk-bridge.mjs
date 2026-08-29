@@ -357,32 +357,55 @@ function adoptSessionId(session, incoming) {
   });
 }
 
-const PERMISSION_MODES = [
-  "default",
-  "acceptEdits",
-  "plan",
-  "auto",
-  "dontAsk",
-  "bypassPermissions",
-];
+const BOOTSTRAP_PERMISSION_MODE = "default";
+const PREFERRED_PERMISSION_MODE = "bypassPermissions";
+const FALLBACK_PERMISSION_MODE = "auto";
 
-function permissionMode(requested, fallback = "default") {
-  const mode = String(requested || "");
-  return PERMISSION_MODES.includes(mode) ? mode : fallback;
+function permissionError(error) {
+  return error?.message || String(error);
 }
 
-// Moves a live session onto a mode the badge picked. A rejected mode — policy
-// disables bypass, say — leaves the session on the one it already had.
-async function applyPermissionMode(session, requested) {
-  const mode = permissionMode(requested, session.permissionMode || "default");
-  if (mode === session.permissionMode) return null;
-  try {
-    await session.query.setPermissionMode(mode);
-    session.permissionMode = mode;
+// No tool-capable turn is admitted until the SDK has confirmed bypass mode or,
+// when policy rejects it, confirmed auto mode. A double rejection fails the
+// session instead of silently continuing in the bootstrap default mode.
+async function applyPermissionMode(session) {
+  if (session.permissionModeVerified
+      && (session.permissionMode === PREFERRED_PERMISSION_MODE
+        || (session.bypassUnavailable && session.permissionMode === FALLBACK_PERMISSION_MODE))) {
     return null;
-  } catch (error) {
-    return error?.message || String(error);
   }
+  if (!session.bypassUnavailable) {
+    try {
+      await session.query.setPermissionMode(PREFERRED_PERMISSION_MODE);
+      session.permissionMode = PREFERRED_PERMISSION_MODE;
+      session.permissionModeVerified = true;
+      return null;
+    } catch (error) {
+      session.bypassUnavailable = true;
+      session.bypassRejection = permissionError(error);
+    }
+  }
+  try {
+    await session.query.setPermissionMode(FALLBACK_PERMISSION_MODE);
+    session.permissionMode = FALLBACK_PERMISSION_MODE;
+    session.permissionModeVerified = true;
+    return session.bypassRejection;
+  } catch (error) {
+    session.permissionModeVerified = false;
+    throw new Error(
+      `Claude bypass 모드가 거부되었고 auto 폴백도 적용하지 못했습니다: ${permissionError(error)}`,
+    );
+  }
+}
+
+function notifyPermissionFallback(session, rejection) {
+  if (!rejection) return;
+  notify("claude/permissionMode/rejected", {
+    threadId: visibleSession(session.id),
+    permissionMode: PREFERRED_PERMISSION_MODE,
+    effectivePermissionMode: FALLBACK_PERMISSION_MODE,
+    message: `Bypass 모드를 사용할 수 없어 auto 모드로 실행합니다: ${rejection}`,
+  });
 }
 
 async function claudePermissionStatus(params) {
@@ -396,9 +419,7 @@ async function claudePermissionStatus(params) {
     || effective.bypassPermissionsModeAccepted === true;
   const bypassAvailable = permissions.disableBypassPermissionsMode !== "disable" && bypassAccepted;
   const autoDisabled = effective.disableAutoMode === "disable";
-  let defaultMode = permissionMode(permissions.defaultMode);
-  if ((defaultMode === "bypassPermissions" && !bypassAvailable)
-      || (defaultMode === "auto" && autoDisabled)) defaultMode = "default";
+  const defaultMode = bypassAvailable ? PREFERRED_PERMISSION_MODE : FALLBACK_PERMISSION_MODE;
   const rules = [];
   const directories = [];
   for (const source of resolved.sources) {
@@ -516,16 +537,14 @@ async function retryClaudePermission(params) {
   if (!session) throw new Error("재시도할 Claude 세션을 찾을 수 없습니다.");
   const tool = String(params.tool || "tool");
   const input = params.input && typeof params.input === "object" ? params.input : {};
-  const previousMode = session.permissionMode;
   return startPrompt({
     sessionId: session.id,
-    permissionMode: previousMode === "auto" ? "default" : previousMode,
-    restorePermissionMode: previousMode === "auto" ? "auto" : null,
+    permissionMode: session.permissionMode,
     input: [{
       type: "text",
       text: [
         `The user selected the denied ${tool} action in /permissions and asked to retry it.`,
-        "Retry that action now. A manual permission prompt will be shown before it runs.",
+        `Retry that action now under ${session.permissionMode} mode.`,
         `Original tool input: ${JSON.stringify(input)}`,
       ].join("\n"),
     }],
@@ -566,10 +585,11 @@ function makeOptions(params, sessionId, resume) {
   const options = {
     cwd: params.cwd || process.cwd(),
     includePartialMessages: true,
-    permissionMode: permissionMode(params.permissionMode),
-    // Not a mode, a capability: the SDK refuses `bypassPermissions` outright
-    // unless the session was started with this. The UI exposes it only after
-    // Claude's resolved settings and acknowledgement make the mode available.
+    // Initialization performs no tool work. The bridge verifies bypass or its
+    // auto fallback immediately afterwards and before exposing the session.
+    permissionMode: BOOTSTRAP_PERMISSION_MODE,
+    // Not a mode, a capability: the SDK refuses the preferred bypass transition
+    // outright unless the session was initialized with this allowance.
     allowDangerouslySkipPermissions: true,
     enableFileCheckpointing: true,
     persistSession: true,
@@ -1137,7 +1157,10 @@ async function createSession(params, resumeId) {
     cwd: params.cwd || process.cwd(),
     model: visibleModel(params.model),
     effort: params.effort || "",
-    permissionMode: permissionMode(params.permissionMode),
+    permissionMode: BOOTSTRAP_PERMISSION_MODE,
+    permissionModeVerified: false,
+    bypassUnavailable: false,
+    bypassRejection: null,
     models: [],
     queue,
     query: null,
@@ -1181,8 +1204,10 @@ async function createSession(params, resumeId) {
     });
   session.consumer = consumer;
   let initialization;
+  let permissionRejection;
   try {
     initialization = await agentQuery.initializationResult();
+    permissionRejection = await applyPermissionMode(session);
   } catch (error) {
     sessions.delete(id);
     queue.close();
@@ -1190,6 +1215,7 @@ async function createSession(params, resumeId) {
     await Promise.race([consumer, new Promise((resolve) => setTimeout(resolve, 1000))]);
     throw error;
   }
+  notifyPermissionFallback(session, permissionRejection);
   session.models = Array.isArray(initialization.models) ? initialization.models : [];
   const capabilities = modelCapabilities(session.models, params.model);
   // A resumed session can only name its model as the resolved id the transcript
@@ -2332,11 +2358,6 @@ async function processResult(session, message) {
     ? { message: message.errors?.join("\n") || message.stop_reason || "Claude 실행 실패" }
     : null;
   finishTurn(session, error, message.duration_ms);
-  if (session.restorePermissionMode) {
-    const restore = session.restorePermissionMode;
-    session.restorePermissionMode = null;
-    await applyPermissionMode(session, restore);
-  }
   notify("claude/account/updated", {
     threadId: session.id,
     account: await safeAccount(session.query),
@@ -2569,6 +2590,9 @@ async function runPrompt(session, params) {
     const model = stripClaudeModel(params.model);
     await session.query.setModel(model);
     session.model = visibleModel(params.model);
+    // Model switches can change which permission modes policy accepts. Recheck
+    // the preferred/fallback pair before admitting the turn.
+    session.permissionModeVerified = false;
   }
   session.steerPending = 0;
   const effort = supportedEffort(modelCapabilities(session.models, params.model || session.model), params.effort);
@@ -2576,18 +2600,8 @@ async function runPrompt(session, params) {
     await session.query.applyFlagSettings({ effortLevel: effort });
   }
   session.effort = effort;
-  const permissionRejection = await applyPermissionMode(session, params.permissionMode);
-  if (permissionRejection) {
-    notify("claude/permissionMode/rejected", {
-      threadId: visibleSession(session.id),
-      permissionMode: params.permissionMode,
-      effectivePermissionMode: session.permissionMode,
-      message: permissionRejection,
-    });
-  }
-  if (params.restorePermissionMode) {
-    session.restorePermissionMode = permissionMode(params.restorePermissionMode);
-  }
+  const permissionRejection = await applyPermissionMode(session);
+  notifyPermissionFallback(session, permissionRejection);
   const content = await inputContent(params.input, params.handoffContext);
   const turnId = beginTurn(session, params.input);
   session.queue.push({
@@ -3032,10 +3046,9 @@ async function dispatch(method, params = {}) {
   if (method === "permissions/retry") return retryClaudePermission(params);
   if (method === "session/permissionMode") {
     const session = lookupSession(params.sessionId);
-    // A session that has not started yet picks the mode up from its first turn.
-    if (!session) return { permissionMode: permissionMode(params.permissionMode) };
-    session.restorePermissionMode = null;
-    const rejection = await applyPermissionMode(session, params.permissionMode);
+    if (!session) return { permissionMode: PREFERRED_PERMISSION_MODE };
+    const rejection = await applyPermissionMode(session);
+    notifyPermissionFallback(session, rejection);
     return {
       permissionMode: session.permissionMode,
       ...(rejection ? { rejection } : {}),
@@ -3203,7 +3216,54 @@ async function dispatch(method, params = {}) {
   throw new Error(`지원하지 않는 Claude 브리지 메서드: ${method}`);
 }
 
+async function runPermissionModeSelfTest() {
+  const fakeSession = (setPermissionMode) => ({
+    id: "permission-mode-self-test",
+    permissionMode: BOOTSTRAP_PERMISSION_MODE,
+    permissionModeVerified: false,
+    bypassUnavailable: false,
+    bypassRejection: null,
+    query: { setPermissionMode },
+  });
+
+  const preferredCalls = [];
+  const preferred = fakeSession(async (mode) => preferredCalls.push(mode));
+  const preferredRejection = await applyPermissionMode(preferred);
+  if (preferredRejection !== null
+      || preferred.permissionMode !== PREFERRED_PERMISSION_MODE
+      || preferredCalls.join(",") !== PREFERRED_PERMISSION_MODE) {
+    throw new Error(`Claude bypass permission self-test failed: ${JSON.stringify(preferredCalls)}`);
+  }
+
+  const fallbackCalls = [];
+  const fallback = fakeSession(async (mode) => {
+    fallbackCalls.push(mode);
+    if (mode === PREFERRED_PERMISSION_MODE) throw new Error("organization policy");
+  });
+  const fallbackRejection = await applyPermissionMode(fallback);
+  await applyPermissionMode(fallback);
+  if (fallbackRejection !== "organization policy"
+      || fallback.permissionMode !== FALLBACK_PERMISSION_MODE
+      || fallbackCalls.join(",") !== `${PREFERRED_PERMISSION_MODE},${FALLBACK_PERMISSION_MODE}`) {
+    throw new Error(`Claude auto fallback self-test failed: ${JSON.stringify(fallbackCalls)}`);
+  }
+
+  const rejected = fakeSession(async (mode) => {
+    throw new Error(`${mode} rejected`);
+  });
+  let doubleRejection = "";
+  try {
+    await applyPermissionMode(rejected);
+  } catch (error) {
+    doubleRejection = permissionError(error);
+  }
+  if (!doubleRejection.includes("auto 폴백도 적용하지 못했습니다")) {
+    throw new Error(`Claude permission double rejection self-test failed: ${doubleRejection}`);
+  }
+}
+
 async function runSelfTest() {
+  await runPermissionModeSelfTest();
   const equivalentCwd = process.platform === "win32"
     ? sameCwd("D:\\Repo", "d:/repo/")
     : sameCwd("/tmp/repo", "/tmp/repo/");
@@ -3215,12 +3275,9 @@ async function runSelfTest() {
   if (!equivalentCwd || preview !== "세션 목록 질문") {
     throw new Error(`Claude session list self-test failed: ${JSON.stringify({ equivalentCwd, preview })}`);
   }
-  if (permissionMode("dontAsk") !== "dontAsk"
-    || permissionMode("not-a-mode", "auto") !== "auto") {
-    throw new Error("Claude permission mode self-test failed");
-  }
-  const latestOptions = makeOptions({ cwd: process.cwd() }, "00000000-0000-4000-8000-000000000000");
-  if (latestOptions.perTaskStopAffordance !== true
+  const latestOptions = makeOptions({ cwd: process.cwd(), permissionMode: "plan" }, "00000000-0000-4000-8000-000000000000");
+  if (latestOptions.permissionMode !== BOOTSTRAP_PERMISSION_MODE
+    || latestOptions.perTaskStopAffordance !== true
     || CLAUDE_TASK_TOOLS.some((tool) => !latestOptions.allowedTools.includes(tool))) {
     throw new Error(`Claude latest SDK options self-test failed: ${JSON.stringify(latestOptions.allowedTools)}`);
   }
@@ -4229,6 +4286,12 @@ async function runSelfTest() {
     throw new Error(`Claude skill filtering self-test failed: ${filteredSkills.join(",")}`);
   }
   process.stdout.write("Claude bridge self-test passed\n");
+}
+
+if (process.argv.includes("--permission-mode-self-test")) {
+  await runPermissionModeSelfTest();
+  process.stdout.write("권한 모드 자체 점검 통과\n");
+  process.exit(0);
 }
 
 if (process.argv.includes("--self-test")) {

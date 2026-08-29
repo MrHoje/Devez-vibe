@@ -254,17 +254,6 @@ async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
         &startup_model.model,
         Some(&startup_model.effort),
     );
-    match server
-        .request("claude/permissions/status", json!({ "cwd": state.cwd }))
-        .await
-    {
-        Ok(status) => state.apply_claude_permission_status(&status),
-        Err(error) => state.push_notice(
-            BlockKind::Warning,
-            "Claude 권한 설정 조회 실패",
-            error.to_string(),
-        ),
-    }
     state.push_notice(
         BlockKind::Update,
         "Tip",
@@ -766,8 +755,7 @@ fn hold_until_thread(
             state.defer_startup_action(Action::SetFast(enabled));
             None
         }
-        action @ (Action::SetClaudePermissionMode(_)
-        | Action::PersistResponseDisplayMode(_)
+        action @ (Action::PersistResponseDisplayMode(_)
         | Action::PersistVibeDisplayModes { .. }) => {
             state.defer_startup_action(action);
             None
@@ -2249,10 +2237,6 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
             Action::Tick(true)
         }
         Pick::OpenLink(target) => Action::OpenUrl(target),
-        Pick::ClaudePermissionMode => {
-            state.open_claude_permission_picker();
-            Action::None
-        }
         Pick::Model => state.run_command("/model"),
         Pick::EffortSetting => state.run_command("/effort"),
         Pick::Subagent(index) => state.open_subagent(index),
@@ -2484,28 +2468,6 @@ async fn execute_action(
             }
             set_fast_mode(server, state, enabled).await;
         }
-        // The mode also rides along with every turn, so a session that has not
-        // started yet still opens under it. This call is what moves a live one.
-        Action::SetClaudePermissionMode(mode) => {
-            set_claude_permission_mode(server, state, mode).await;
-        }
-        Action::DisableClaudeAutoMode => match server
-            .request(
-                "claude/permissions/auto-mode",
-                json!({ "cwd": state.cwd, "disabled": true }),
-            )
-            .await
-        {
-            Ok(status) => state.apply_claude_permission_policy(&status),
-            Err(error) => {
-                state.set_claude_auto_mode_disabled(false);
-                state.push_notice(
-                    BlockKind::Error,
-                    "Claude Auto mode 설정 실패",
-                    error.to_string(),
-                );
-            }
-        },
         Action::OpenClaudePermissions(notice) => match server
             .request("claude/permissions/status", json!({ "cwd": state.cwd }))
             .await
@@ -3933,9 +3895,6 @@ async fn apply_deferred_startup_actions(server: &BackendServer, state: &mut AppS
     for action in state.take_deferred_startup_actions() {
         match action {
             Action::SetFast(enabled) => set_fast_mode(server, state, enabled).await,
-            Action::SetClaudePermissionMode(mode) => {
-                set_claude_permission_mode(server, state, mode).await
-            }
             Action::PersistResponseDisplayMode(mode) => {
                 if let Err(error) = server
                     .request(
@@ -4204,39 +4163,6 @@ fn fast_settings_update_params(thread_id: &str, service_tier: &str) -> Option<Va
             "serviceTier": service_tier
         })
     })
-}
-
-async fn set_claude_permission_mode(
-    server: &BackendServer,
-    state: &mut AppState,
-    mode: state::ClaudePermissionMode,
-) {
-    let response = server
-        .request(
-            "thread/permissionMode/set",
-            json!({ "threadId": state.thread_id, "permissionMode": mode.wire() }),
-        )
-        .await;
-    match response {
-        Ok(response) => {
-            let effective = response
-                .get("permissionMode")
-                .and_then(Value::as_str)
-                .and_then(state::ClaudePermissionMode::from_wire)
-                .unwrap_or(mode);
-            state.set_claude_permission_mode(effective);
-            if let Some(rejection) = response.get("rejection").and_then(Value::as_str) {
-                state.push_notice(
-                    BlockKind::Warning,
-                    "권한 모드 전환 거부",
-                    rejection.to_owned(),
-                );
-            }
-        }
-        Err(error) => {
-            state.push_notice(BlockKind::Warning, "권한 모드 전환 실패", error.to_string());
-        }
-    }
 }
 
 async fn persist_vibe_display_modes(
@@ -7138,7 +7064,7 @@ mod tests {
         ClaudeSessionSettings {
             model: "claude:opus".to_owned(),
             effort: "xhigh".to_owned(),
-            permission_mode: "acceptEdits".to_owned(),
+            permission_mode: "bypassPermissions".to_owned(),
         }
     }
 
@@ -7164,7 +7090,7 @@ mod tests {
             params
                 .pointer("/claudePermissionMode")
                 .and_then(Value::as_str),
-            Some("acceptEdits")
+            Some("bypassPermissions")
         );
         assert!(params.get("model").is_none());
         assert!(params.get("effort").is_none());
@@ -8277,7 +8203,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_keeps_mode_clicks_until_the_thread_is_bound() {
+    fn startup_keeps_composer_setting_clicks_until_the_thread_is_bound() {
         let mut state = starting_state();
         let mut queued = None;
 
@@ -8290,17 +8216,9 @@ mod tests {
         };
         assert!(hold_until_thread(&mut state, vibe, &mut queued).is_none());
         assert!(hold_until_thread(&mut state, Action::SetFast(true), &mut queued).is_none());
-        assert!(
-            hold_until_thread(
-                &mut state,
-                Action::SetClaudePermissionMode(state::ClaudePermissionMode::AcceptEdits),
-                &mut queued,
-            )
-            .is_none()
-        );
 
         let deferred = state.take_deferred_startup_actions();
-        assert_eq!(deferred.len(), 3);
+        assert_eq!(deferred.len(), 2);
         assert!(
             deferred
                 .iter()
@@ -8311,10 +8229,6 @@ mod tests {
                 .iter()
                 .any(|action| matches!(action, Action::SetFast(true)))
         );
-        assert!(deferred.iter().any(|action| matches!(
-            action,
-            Action::SetClaudePermissionMode(state::ClaudePermissionMode::AcceptEdits)
-        )));
     }
 
     /// The resume picker reads `thread/list`, not the thread being started, so

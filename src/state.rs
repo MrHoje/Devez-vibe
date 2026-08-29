@@ -30,7 +30,7 @@ use crate::{
     renderer::{
         AnimationView, AssistantPhase, Block, BlockKind, ComposerMode, EffortSlider,
         HIDDEN_STATUS_LINE, IntegrationItemState, IntegrationItemView, LiveBlockView, ModeAccent,
-        OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS, PermissionBadge, PermissionTone,
+        OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS,
         PlanStep, PlanStepStatus, PlanSummary, ProviderHandoffBlock, ProviderIntegrationView,
         SIDE_PANEL_WIDTHS, StatusLineView, SubagentView, SuggestionView, VibeTone, View,
         WelcomeView, format_clock_time, format_elapsed, visible_window,
@@ -67,16 +67,10 @@ pub enum PermissionMode {
     FullAccess,
 }
 
-/// Claude Code's own permission modes. Every turn carries the choice to the
-/// bridge, while `/permissions`, Shift+Tab, and the composer badge change it.
+/// Claude requests bypass permissions and lets the bridge fall back to auto.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub enum ClaudePermissionMode {
     #[default]
-    Default,
-    AcceptEdits,
-    Plan,
-    Auto,
-    DontAsk,
     BypassPermissions,
 }
 
@@ -522,106 +516,13 @@ impl PermissionMode {
 }
 
 impl ClaudePermissionMode {
-    const BASE_CHOICES: [Self; 3] = [Self::Default, Self::AcceptEdits, Self::Plan];
-    const AUTO_CHOICES: [Self; 4] = [Self::Default, Self::AcceptEdits, Self::Plan, Self::Auto];
-    const BYPASS_CHOICES: [Self; 4] = [
-        Self::Default,
-        Self::AcceptEdits,
-        Self::Plan,
-        Self::BypassPermissions,
-    ];
-    const ALL_CHOICES: [Self; 5] = [
-        Self::Default,
-        Self::AcceptEdits,
-        Self::Plan,
-        Self::BypassPermissions,
-        Self::Auto,
-    ];
-
-    /// Indicator text, wording and symbols taken from the CLI's own mode line so
-    /// the badge is recognisable to anyone who has used Claude Code.
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Default => "ask permissions",
-            Self::AcceptEdits => "⏵⏵ accept edits on",
-            Self::Plan => "⏸ plan mode",
-            Self::Auto => "⏵⏵ auto mode",
-            Self::DontAsk => "don't ask",
-            Self::BypassPermissions => "⏵⏵ bypass permissions",
-        }
-    }
-
-    fn picker_label(self) -> &'static str {
-        match self {
-            Self::Default => "Ask permissions",
-            Self::AcceptEdits => "Auto accept edits",
-            Self::Plan => "Plan mode",
-            Self::Auto => "Auto mode",
-            Self::DontAsk => "Don't ask",
-            Self::BypassPermissions => "Bypass permissions",
-        }
+        "⏵⏵ bypass permissions → auto fallback"
     }
 
     /// The value the Claude Agent SDK takes for `permissionMode`.
     pub fn wire(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::AcceptEdits => "acceptEdits",
-            Self::Plan => "plan",
-            Self::Auto => "auto",
-            Self::DontAsk => "dontAsk",
-            Self::BypassPermissions => "bypassPermissions",
-        }
-    }
-
-    fn tone(self) -> PermissionTone {
-        match self {
-            Self::Default => PermissionTone::Neutral,
-            Self::AcceptEdits => PermissionTone::AcceptEdits,
-            Self::Plan => PermissionTone::Plan,
-            Self::Auto => PermissionTone::Auto,
-            Self::DontAsk => PermissionTone::Neutral,
-            Self::BypassPermissions => PermissionTone::Bypass,
-        }
-    }
-
-    /// Reads the wire value reported by Claude settings or a live session.
-    pub(crate) fn from_wire(value: &str) -> Option<Self> {
-        [
-            Self::Default,
-            Self::AcceptEdits,
-            Self::Plan,
-            Self::Auto,
-            Self::DontAsk,
-            Self::BypassPermissions,
-        ]
-        .into_iter()
-        .find(|mode| mode.wire().eq_ignore_ascii_case(value))
-    }
-
-    fn choices(auto_available: bool, bypass_available: bool) -> &'static [Self] {
-        match (auto_available, bypass_available) {
-            (false, false) => &Self::BASE_CHOICES,
-            (true, false) => &Self::AUTO_CHOICES,
-            (false, true) => &Self::BYPASS_CHOICES,
-            (true, true) => &Self::ALL_CHOICES,
-        }
-    }
-
-    fn picker_index(self, auto_available: bool, bypass_available: bool) -> usize {
-        Self::choices(auto_available, bypass_available)
-            .iter()
-            .position(|candidate| *candidate == self)
-            .unwrap_or(0)
-    }
-
-    fn next(self, auto_available: bool, bypass_available: bool) -> Self {
-        let choices = Self::choices(auto_available, bypass_available);
-        let current = choices
-            .iter()
-            .position(|candidate| *candidate == self)
-            .unwrap_or(choices.len() - 1);
-        choices[(current + 1) % choices.len()]
+        "bypassPermissions"
     }
 }
 
@@ -1315,9 +1216,6 @@ pub enum Action {
     ActivateCodex,
     ActivateOpenCode,
     SetFast(bool),
-    /// Hand Claude the permission mode the badge just cycled to.
-    SetClaudePermissionMode(ClaudePermissionMode),
-    DisableClaudeAutoMode,
     OpenClaudePermissions(Option<String>),
     UpdateClaudePermission {
         action: &'static str,
@@ -1801,12 +1699,6 @@ enum PendingInteraction {
     },
     SettingPicker {
         setting: DisplaySetting,
-        selected: usize,
-    },
-    ClaudePermissionPicker {
-        selected: usize,
-    },
-    ClaudeAutoModeConsent {
         selected: usize,
     },
     ClaudePermissionsPanel {
@@ -3216,7 +3108,6 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
             | PendingInteraction::SidePanelScope { .. }
             | PendingInteraction::RuntimePicker { .. }
             | PendingInteraction::SettingPicker { .. }
-            | PendingInteraction::ClaudePermissionPicker { .. }
             | PendingInteraction::ClaudePermissionsPanel { .. }
             | PendingInteraction::ClaudePermissionScopePicker { .. }
             | PendingInteraction::ClaudePermissionRuleInput { .. }
@@ -3775,12 +3666,6 @@ pub struct AppState {
     /// trigger a redraw on its own.
     five_hour_remaining: Option<String>,
     fast_mode: bool,
-    /// Claude's permission mode for this thread and the optional modes exposed
-    /// by its own resolved settings.
-    claude_permission_mode: ClaudePermissionMode,
-    bypass_permissions_allowed: bool,
-    claude_auto_mode_disabled: bool,
-    claude_auto_mode_confirmed: bool,
     side_parent: Option<SideParent>,
     /// BTW panes run the plan silently: steps still advance, but the panel and
     /// its transcript cards stay off the split view.
@@ -4015,10 +3900,6 @@ impl AppState {
             five_hour_reset_at,
             five_hour_remaining: remaining_label(five_hour_reset_at, unix_now()),
             fast_mode: read_fast_mode(),
-            claude_permission_mode: ClaudePermissionMode::Default,
-            bypass_permissions_allowed: false,
-            claude_auto_mode_disabled: false,
-            claude_auto_mode_confirmed: false,
             side_parent: None,
             plan_panel_hidden: false,
             last_assistant_markdown: None,
@@ -4417,7 +4298,6 @@ impl AppState {
         self.selected_model = index;
         self.selected_effort = effort.clone();
         self.context_window = model.context_window;
-        self.normalize_claude_permission_mode_for_selected_model();
         self.clear_provider_completions();
         let detail = if effort.is_empty() {
             format!("↳ {} · {model_name}", provider.label())
@@ -4533,7 +4413,6 @@ impl AppState {
         if !model.supports_effort(&self.selected_effort) {
             self.selected_effort = model.default_effort.clone();
         }
-        self.normalize_claude_permission_mode_for_selected_model();
     }
 
     /// True until `thread/start` answers. The UI is fully painted before that, so
@@ -4611,10 +4490,6 @@ impl AppState {
                     | (
                         Action::PersistResponseDisplayMode(_),
                         Action::PersistResponseDisplayMode(_)
-                    )
-                    | (
-                        Action::SetClaudePermissionMode(_),
-                        Action::SetClaudePermissionMode(_)
                     )
                     | (
                         Action::PersistVibeDisplayModes { .. },
@@ -5206,7 +5081,6 @@ impl AppState {
             response_length: self.response_length_label().to_owned(),
             response_display_mode: self.response_display_mode.label().to_owned(),
             fast_mode: self.effective_fast_mode(),
-            claude_permission: self.claude_permission_badge(),
             effort: self.selected_effort.clone(),
             shell_display_mode: self.shell_display_mode().label().to_owned(),
             diff_display_mode: self.diff_display_mode().label().to_owned(),
@@ -5301,79 +5175,24 @@ impl AppState {
         }
     }
 
-    /// The permission mode Claude runs the next turn under. Only Claude sessions
-    /// have one; a Codex thread keeps its Fast badge in the same slot.
+    /// Claude requests bypass with an SDK-verified auto fallback.
     pub fn claude_permission_mode(&self) -> Option<ClaudePermissionMode> {
         self.selected_model_name()
             .starts_with("claude:")
-            .then_some(self.claude_permission_mode)
+            .then_some(ClaudePermissionMode::BypassPermissions)
     }
 
-    /// The mode a Claude session should open under, badge or no badge. Resuming a
-    /// Claude thread from a Codex session still has to send it, and that is the
-    /// case [`Self::claude_permission_mode`] deliberately hides.
+    /// The fixed mode used when opening or resuming a Claude session.
     pub fn claude_permission_mode_setting(&self) -> ClaudePermissionMode {
-        self.claude_permission_mode
+        ClaudePermissionMode::BypassPermissions
     }
 
-    fn claude_permission_badge(&self) -> Option<PermissionBadge> {
-        self.claude_permission_mode().map(|mode| PermissionBadge {
-            label: mode.label().to_owned(),
-            tone: mode.tone(),
-        })
-    }
-
-    /// Steps to the next mode and reports it, so the caller can tell the runtime.
-    /// The badge itself is the feedback — a notice under the composer would only
-    /// flash away while the reading it duplicates stays on screen.
+    /// The former mode shortcut is inert.
     pub fn cycle_claude_permission_mode(&mut self) -> Action {
-        let auto_available = self.claude_auto_mode_available();
-        let mode = self
-            .claude_permission_mode
-            .next(auto_available, self.bypass_permissions_allowed);
-        self.choose_claude_permission_mode(mode)
-    }
-
-    pub fn set_claude_permission_mode(&mut self, mode: ClaudePermissionMode) {
-        self.claude_permission_mode = mode;
-    }
-
-    pub fn apply_claude_permission_status(&mut self, status: &Value) {
-        self.apply_claude_permission_policy(status);
-        let mode = status
-            .get("defaultMode")
-            .and_then(Value::as_str)
-            .and_then(ClaudePermissionMode::from_wire)
-            .unwrap_or_default();
-        self.claude_auto_mode_confirmed |= mode == ClaudePermissionMode::Auto;
-        self.claude_permission_mode = if (mode == ClaudePermissionMode::Auto
-            && self.selected_model_name().starts_with("claude:")
-            && !self.claude_auto_mode_available())
-            || (mode == ClaudePermissionMode::BypassPermissions && !self.bypass_permissions_allowed)
-        {
-            ClaudePermissionMode::Default
-        } else {
-            mode
-        };
-    }
-
-    pub fn apply_claude_permission_policy(&mut self, status: &Value) {
-        self.bypass_permissions_allowed = status
-            .get("bypassAvailable")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        self.claude_auto_mode_disabled = status
-            .get("autoDisabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-    }
-
-    pub fn set_claude_auto_mode_disabled(&mut self, disabled: bool) {
-        self.claude_auto_mode_disabled = disabled;
+        Action::None
     }
 
     pub fn open_claude_permissions(&mut self, status: &Value, notice: Option<String>) {
-        self.apply_claude_permission_policy(status);
         if let Some(notice) = notice {
             self.composer_notice = Some((notice, Instant::now()));
         }
@@ -5442,33 +5261,6 @@ impl AppState {
         });
     }
 
-    fn claude_auto_mode_available(&self) -> bool {
-        !self.claude_auto_mode_disabled
-            && self
-                .selected_model()
-                .is_some_and(|model| model.supports_auto_mode)
-    }
-
-    fn normalize_claude_permission_mode_for_selected_model(&mut self) {
-        if (self.claude_permission_mode == ClaudePermissionMode::Auto
-            && self.selected_model_name().starts_with("claude:")
-            && !self.claude_auto_mode_available())
-            || (self.claude_permission_mode == ClaudePermissionMode::BypassPermissions
-                && !self.bypass_permissions_allowed)
-        {
-            self.claude_permission_mode = ClaudePermissionMode::Default;
-        }
-    }
-
-    pub fn open_claude_permission_picker(&mut self) {
-        let auto_available = self.claude_auto_mode_available();
-        self.pending = Some(PendingInteraction::ClaudePermissionPicker {
-            selected: self
-                .claude_permission_mode
-                .picker_index(auto_available, self.bypass_permissions_allowed),
-        });
-    }
-
     /// Opens the Vibe preset picker, the way `/vibemode` and the composer's Vibe
     /// badge do — a menu instead of an instant cycle.
     pub fn open_vibe_mode_picker(&mut self) {
@@ -5491,42 +5283,6 @@ impl AppState {
                 ResponseDisplayMode::Completed => 1,
             },
         );
-    }
-
-    fn apply_claude_permission_picker(&mut self, selected: usize) -> Action {
-        let Some(mode) = ClaudePermissionMode::choices(
-            self.claude_auto_mode_available(),
-            self.bypass_permissions_allowed,
-        )
-        .get(selected)
-        .copied() else {
-            return Action::None;
-        };
-        self.choose_claude_permission_mode(mode)
-    }
-
-    fn choose_claude_permission_mode(&mut self, mode: ClaudePermissionMode) -> Action {
-        if mode == ClaudePermissionMode::Auto && !self.claude_auto_mode_confirmed {
-            self.pending = Some(PendingInteraction::ClaudeAutoModeConsent { selected: 0 });
-            return Action::None;
-        }
-        self.claude_permission_mode = mode;
-        Action::SetClaudePermissionMode(mode)
-    }
-
-    fn apply_claude_auto_mode_consent(&mut self, selected: usize) -> Action {
-        match selected {
-            0 => {
-                self.claude_auto_mode_confirmed = true;
-                self.claude_permission_mode = ClaudePermissionMode::Auto;
-                Action::SetClaudePermissionMode(ClaudePermissionMode::Auto)
-            }
-            2 => {
-                self.claude_auto_mode_disabled = true;
-                Action::DisableClaudeAutoMode
-            }
-            _ => Action::None,
-        }
     }
 
     pub fn effective_fast_mode(&self) -> bool {
@@ -5710,10 +5466,6 @@ impl AppState {
         });
         side.show_welcome = false;
         side.fast_mode = self.fast_mode;
-        side.claude_permission_mode = self.claude_permission_mode;
-        side.bypass_permissions_allowed = self.bypass_permissions_allowed;
-        side.claude_auto_mode_disabled = self.claude_auto_mode_disabled;
-        side.claude_auto_mode_confirmed = self.claude_auto_mode_confirmed;
         side.response_length = self.response_length;
         side.response_display_mode = self.response_display_mode;
         side.vibe_mode = self.vibe_mode;
@@ -5798,7 +5550,6 @@ impl AppState {
             })
             .or_else(|| effort.map(ToOwned::to_owned))
             .unwrap_or_else(|| self.selected_effort.clone());
-        self.normalize_claude_permission_mode_for_selected_model();
         if self.selected_provider() != previous_provider {
             self.clear_provider_completions();
         }
@@ -7270,10 +7021,8 @@ impl AppState {
         }
 
         match key.code {
-            // Shift+Tab arrives as BackTab on terminals without the Kitty keyboard
-            // protocol, and as a shifted Tab with it. Either way it cycles Claude's
-            // permission mode, as it does in the CLI — so the shifted Tab is claimed
-            // here, ahead of the plain Tab that queues a prompt during a turn.
+            // Claude's permission mode is fixed, so Shift+Tab is consumed without
+            // changing the session or queueing a prompt.
             KeyCode::BackTab | KeyCode::Tab if key.code == KeyCode::BackTab || shift => {
                 if self.claude_permission_mode().is_some() {
                     return self.cycle_claude_permission_mode();
@@ -8380,20 +8129,13 @@ impl AppState {
                 self.set_account_plan(AccountPlan::from_claude(account, usage));
             }
             "claude/permissionMode/rejected" => {
-                if let Some(mode) = params
-                    .get("effectivePermissionMode")
-                    .and_then(Value::as_str)
-                    .and_then(ClaudePermissionMode::from_wire)
-                {
-                    self.set_claude_permission_mode(mode);
-                }
                 self.push_notice(
                     BlockKind::Warning,
-                    "권한 모드 전환 거부",
+                    "Claude 권한 모드 폴백",
                     params
                         .get("message")
                         .and_then(Value::as_str)
-                        .unwrap_or("Claude 설정 또는 관리 정책에서 이 모드를 허용하지 않습니다."),
+                        .unwrap_or("Bypass 모드를 사용할 수 없어 auto 모드로 실행합니다."),
                 );
             }
             "turn/started" => {
@@ -9865,50 +9607,6 @@ impl AppState {
                 self.pending = Some(PendingInteraction::SettingPicker { setting, selected });
                 Action::None
             }
-            PendingInteraction::ClaudePermissionPicker { mut selected } => {
-                let count = ClaudePermissionMode::choices(
-                    self.claude_auto_mode_available(),
-                    self.bypass_permissions_allowed,
-                )
-                .len();
-                match key.code {
-                    KeyCode::Esc => return Action::None,
-                    KeyCode::Left | KeyCode::Up => selected = selected.saturating_sub(1),
-                    KeyCode::Char('p') if ctrl => selected = selected.saturating_sub(1),
-                    KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
-                        selected = (selected + 1).min(count - 1);
-                    }
-                    KeyCode::Char('n') if ctrl => selected = (selected + 1).min(count - 1),
-                    KeyCode::Char(ch) if !ctrl && !alt && ('1'..='9').contains(&ch) => {
-                        let index = ch.to_digit(10).unwrap_or(1) as usize - 1;
-                        if index < count {
-                            return self.apply_claude_permission_picker(index);
-                        }
-                    }
-                    KeyCode::Enter => return self.apply_claude_permission_picker(selected),
-                    _ => {}
-                }
-                self.pending = Some(PendingInteraction::ClaudePermissionPicker { selected });
-                Action::None
-            }
-            PendingInteraction::ClaudeAutoModeConsent { mut selected } => {
-                match key.code {
-                    KeyCode::Esc | KeyCode::Char('n') if !ctrl && !alt => return Action::None,
-                    KeyCode::Up | KeyCode::Left => selected = selected.saturating_sub(1),
-                    KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
-                        selected = (selected + 1).min(2);
-                    }
-                    KeyCode::Char(ch @ '1'..='3') if !ctrl && !alt => {
-                        return self.apply_claude_auto_mode_consent(
-                            ch.to_digit(10).unwrap_or(1) as usize - 1,
-                        );
-                    }
-                    KeyCode::Enter => return self.apply_claude_auto_mode_consent(selected),
-                    _ => {}
-                }
-                self.pending = Some(PendingInteraction::ClaudeAutoModeConsent { selected });
-                Action::None
-            }
             PendingInteraction::ClaudePermissionsPanel {
                 mut tab,
                 mut selected,
@@ -11068,52 +10766,6 @@ impl AppState {
                 }),
                 hint: "←→ to adjust  ·  Enter to confirm  ·  Esc to cancel".to_owned(),
                 style: OverlayStyle::Picker,
-                input: None,
-                input_label: "",
-                input_placeholder: "",
-            }),
-            PendingInteraction::ClaudePermissionPicker { selected } => Some(OverlayView {
-                closable: true,
-                title: "Permission mode".to_owned(),
-                lines: Vec::new(),
-                slider: Some(EffortSlider {
-                    efforts: ClaudePermissionMode::choices(
-                        self.claude_auto_mode_available(),
-                        self.bypass_permissions_allowed,
-                    )
-                    .iter()
-                    .map(|mode| mode.picker_label().to_owned())
-                    .collect(),
-                    selected: *selected,
-                    detail: None,
-                }),
-                hint: "←→ Move  ·  Enter Apply  ·  Esc Close".to_owned(),
-                style: OverlayStyle::Picker,
-                input: None,
-                input_label: "",
-                input_placeholder: "",
-            }),
-            PendingInteraction::ClaudeAutoModeConsent { selected } => Some(OverlayView {
-                closable: false,
-                title: "Enable auto mode?".to_owned(),
-                lines: [
-                    "Auto mode executes actions without permission prompts after a safety classifier reviews them.",
-                    "It reduces prompts but does not guarantee safety. Use it only when you trust the task direction.",
-                    "Yes, enable auto mode",
-                    "No",
-                    "No, don't ask again",
-                ]
-                .into_iter()
-                .enumerate()
-                .map(|(index, text)| OverlayLine {
-                    text: text.to_owned(),
-                    selected: index >= 2 && index - 2 == *selected,
-                    muted: index < 2,
-                })
-                .collect(),
-                slider: None,
-                hint: "↑↓ select  ·  Enter confirm  ·  Esc cancel".to_owned(),
-                style: OverlayStyle::Panel,
                 input: None,
                 input_label: "",
                 input_placeholder: "",
@@ -12484,7 +12136,6 @@ impl AppState {
         self.selected_model = index;
         self.selected_effort = selected_effort.clone();
         self.context_window = context_window.or(self.context_window);
-        self.normalize_claude_permission_mode_for_selected_model();
         if next_provider != previous_provider {
             self.clear_provider_completions();
         }
@@ -12931,15 +12582,6 @@ impl AppState {
                 self.pending = Some(PendingInteraction::StatusLinePicker { selected: row });
                 self.toggle_status_line_field(StatusLineField::ALL[row])
             }
-            Some(PendingInteraction::ClaudeAutoModeConsent { selected }) => {
-                match row.checked_sub(2) {
-                    Some(choice) if choice < 3 => self.apply_claude_auto_mode_consent(choice),
-                    _ => {
-                        self.pending = Some(PendingInteraction::ClaudeAutoModeConsent { selected });
-                        Action::Tick(false)
-                    }
-                }
-            }
             Some(PendingInteraction::SessionPicker(mut picker)) => match picker.click_row(row) {
                 SessionPickerResult::Select(thread_id) => Action::ResumeThread(thread_id),
                 SessionPickerResult::Cancel => Action::None,
@@ -13210,20 +12852,6 @@ impl AppState {
                     self.apply_setting_picker(setting, step)
                 } else {
                     self.pending = Some(PendingInteraction::SettingPicker { setting, selected });
-                    Action::Tick(false)
-                }
-            }
-            Some(PendingInteraction::ClaudePermissionPicker { selected }) => {
-                if step
-                    < ClaudePermissionMode::choices(
-                        self.claude_auto_mode_available(),
-                        self.bypass_permissions_allowed,
-                    )
-                    .len()
-                {
-                    self.apply_claude_permission_picker(step)
-                } else {
-                    self.pending = Some(PendingInteraction::ClaudePermissionPicker { selected });
                     Action::Tick(false)
                 }
             }
@@ -19244,10 +18872,6 @@ mod tests {
             started_at: Instant::now(),
             elapsed: None,
         });
-        // A new session reads its starting mode from the settings on disk, so the
-        // baseline is pinned here rather than left to whatever the machine saved.
-        state.claude_permission_mode = ClaudePermissionMode::Auto;
-
         state.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         assert_eq!(state.editor.text(), " ");
         assert!(
@@ -19268,7 +18892,7 @@ mod tests {
         );
         assert_eq!(
             state.claude_permission_mode(),
-            Some(ClaudePermissionMode::Auto),
+            Some(ClaudePermissionMode::BypassPermissions),
             "folding the plan is not a permission change"
         );
     }
@@ -19849,11 +19473,12 @@ mod tests {
             "claude:sonnet",
             Some("high"),
         );
-        claude.claude_permission_mode = ClaudePermissionMode::DontAsk;
-
         for (state, expected) in [
             (&mut codex, "permissions: Full Access (:danger-full-access)"),
-            (&mut claude, "permissions: don't ask (dontAsk)"),
+            (
+                &mut claude,
+                "permissions: ⏵⏵ bypass permissions → auto fallback (bypassPermissions)",
+            ),
         ] {
             assert!(matches!(
                 state.run_slash_command("/status"),
@@ -25188,7 +24813,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_mode_requires_the_same_session_opt_in_as_claude_code() {
+    fn claude_mode_always_requests_bypass_with_auto_fallback() {
         let mut state = AppState::new(
             "claude:thread".to_owned(),
             "cwd".to_owned(),
@@ -25197,21 +24822,11 @@ mod tests {
             "claude:sonnet",
             Some("high"),
         );
-        state.claude_permission_mode = ClaudePermissionMode::Plan;
-
-        assert!(matches!(state.cycle_claude_permission_mode(), Action::None));
-        assert_eq!(
-            state.overlay_view().expect("auto opt-in").title,
-            "Enable auto mode?"
-        );
-        assert!(matches!(
-            state.handle_key(KeyEvent::from(KeyCode::Enter)),
-            Action::SetClaudePermissionMode(ClaudePermissionMode::Auto)
-        ));
         assert_eq!(
             state.claude_permission_mode(),
-            Some(ClaudePermissionMode::Auto)
+            Some(ClaudePermissionMode::BypassPermissions)
         );
+        assert!(matches!(state.cycle_claude_permission_mode(), Action::None));
     }
 
     #[test]
@@ -25293,64 +24908,8 @@ mod tests {
         );
     }
 
-    /// The badge walks Claude's modes in order and stops short of a bypass when
-    /// settings forbid it.
     #[test]
-    fn the_permission_badge_cycles_the_available_claude_modes() {
-        let mut state = AppState::new(
-            "claude:thread".to_owned(),
-            "cwd".to_owned(),
-            "account".to_owned(),
-            vec![test_model("claude:sonnet", "Sonnet", true)],
-            "claude:sonnet",
-            Some("high"),
-        );
-        state.claude_permission_mode = ClaudePermissionMode::Default;
-        state.bypass_permissions_allowed = false;
-        state.claude_auto_mode_confirmed = true;
-
-        assert_eq!(
-            state.claude_permission_mode(),
-            Some(ClaudePermissionMode::Default)
-        );
-        let walked = std::iter::repeat_with(|| match state.cycle_claude_permission_mode() {
-            Action::SetClaudePermissionMode(mode) => mode,
-            _ => panic!("confirmed auto mode should switch immediately"),
-        })
-        .take(4)
-        .collect::<Vec<_>>();
-        assert_eq!(
-            walked,
-            [
-                ClaudePermissionMode::AcceptEdits,
-                ClaudePermissionMode::Plan,
-                ClaudePermissionMode::Auto,
-                ClaudePermissionMode::Default,
-            ]
-        );
-
-        state.bypass_permissions_allowed = true;
-        state.claude_permission_mode = ClaudePermissionMode::Default;
-        let walked = std::iter::repeat_with(|| match state.cycle_claude_permission_mode() {
-            Action::SetClaudePermissionMode(mode) => mode,
-            _ => panic!("confirmed auto mode should switch immediately"),
-        })
-        .take(5)
-        .collect::<Vec<_>>();
-        assert_eq!(
-            walked,
-            [
-                ClaudePermissionMode::AcceptEdits,
-                ClaudePermissionMode::Plan,
-                ClaudePermissionMode::BypassPermissions,
-                ClaudePermissionMode::Auto,
-                ClaudePermissionMode::Default,
-            ]
-        );
-    }
-
-    #[test]
-    fn unsupported_claude_models_hide_and_leave_auto_mode() {
+    fn unsupported_claude_models_still_request_bypass_with_auto_fallback() {
         let mut model = test_model("claude:haiku", "Haiku", true);
         model.supports_auto_mode = false;
         let mut state = AppState::new(
@@ -25361,27 +24920,17 @@ mod tests {
             "claude:haiku",
             Some("high"),
         );
-        state.claude_permission_mode = ClaudePermissionMode::Auto;
-
         state.replace_models(state.models.clone());
 
         assert_eq!(
             state.claude_permission_mode(),
-            Some(ClaudePermissionMode::Default)
+            Some(ClaudePermissionMode::BypassPermissions)
         );
-        state.open_claude_permission_picker();
-        let choices = state
-            .overlay_view()
-            .and_then(|view| view.slider)
-            .expect("permission choices")
-            .efforts;
-        assert!(!choices.iter().any(|choice| choice == "Auto mode"));
     }
 
-    /// Shift+Tab is how the CLI cycles these, so it cycles them here too — and
-    /// the badge is the only feedback, with no notice flashing under the composer.
+    /// The former mode shortcut is inert while the preferred/fallback pair is fixed.
     #[test]
-    fn both_shift_tab_encodings_cycle_claude_permissions_without_queueing() {
+    fn both_shift_tab_encodings_keep_the_claude_mode_pair_fixed() {
         for (key, busy) in [(KeyCode::BackTab, false), (KeyCode::Tab, true)] {
             let mut state = AppState::new(
                 "claude:thread".to_owned(),
@@ -25391,20 +24940,16 @@ mod tests {
                 "claude:sonnet",
                 Some("high"),
             );
-            state.claude_permission_mode = ClaudePermissionMode::Default;
             state.busy = busy;
             if busy {
                 state.editor.set_text("queued prompt");
             }
 
             let action = state.handle_key(KeyEvent::new(key, KeyModifiers::SHIFT));
-            assert!(matches!(
-                action,
-                Action::SetClaudePermissionMode(ClaudePermissionMode::AcceptEdits)
-            ));
+            assert!(matches!(action, Action::None));
             assert_eq!(
                 state.claude_permission_mode(),
-                Some(ClaudePermissionMode::AcceptEdits)
+                Some(ClaudePermissionMode::BypassPermissions)
             );
             assert!(state.queued_prompts.is_empty());
             assert!(state.composer_notice.is_none());
@@ -25436,32 +24981,6 @@ mod tests {
     #[test]
     fn a_codex_thread_has_no_permission_mode() {
         assert_eq!(test_state().claude_permission_mode(), None);
-    }
-
-    /// Claude reports mode values in mixed case, so wire parsing must preserve them.
-    #[test]
-    fn permission_modes_are_read_back_case_insensitively() {
-        assert_eq!(
-            ClaudePermissionMode::from_wire("acceptedits"),
-            Some(ClaudePermissionMode::AcceptEdits)
-        );
-        assert_eq!(
-            ClaudePermissionMode::from_wire("bypasspermissions"),
-            Some(ClaudePermissionMode::BypassPermissions)
-        );
-        assert_eq!(
-            ClaudePermissionMode::from_wire("plan"),
-            Some(ClaudePermissionMode::Plan)
-        );
-        assert_eq!(
-            ClaudePermissionMode::from_wire("auto"),
-            Some(ClaudePermissionMode::Auto)
-        );
-        assert_eq!(
-            ClaudePermissionMode::from_wire("dontask"),
-            Some(ClaudePermissionMode::DontAsk)
-        );
-        assert_eq!(ClaudePermissionMode::from_wire("nonsense"), None);
     }
 
     /// A new session has no turn to report usage yet, so the gauge has to come

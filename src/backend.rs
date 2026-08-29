@@ -22,6 +22,8 @@ use crate::{
     open_code::{OpenCodeServer, is_open_code_model, is_open_code_request_id},
 };
 
+const CLAUDE_PREFERRED_PERMISSION_MODE: &str = "bypassPermissions";
+
 #[derive(Clone)]
 pub enum IntegrationClient {
     Codex(AppServerClient),
@@ -562,10 +564,7 @@ impl BackendServer {
                                     "input": params.get("input").cloned().unwrap_or_else(|| json!([])),
                                     "model": params.get("model").cloned().unwrap_or(Value::Null),
                                     "effort": params.get("effort").cloned().unwrap_or(Value::Null),
-                                    "permissionMode": params
-                                        .get("claudePermissionMode")
-                                        .cloned()
-                                        .unwrap_or(Value::Null),
+                                    "permissionMode": CLAUDE_PREFERRED_PERMISSION_MODE,
                                     "handoffContext": turn_context
                                 }),
                             )
@@ -778,7 +777,7 @@ impl BackendServer {
                         "session/permissionMode",
                         json!({
                             "sessionId": backing,
-                            "permissionMode": params.get("permissionMode").cloned().unwrap_or(Value::Null)
+                            "permissionMode": CLAUDE_PREFERRED_PERMISSION_MODE
                         }),
                     )
                     .await
@@ -2464,13 +2463,7 @@ fn claude_session_params(params: &Value, cwd: &Path, session_id: Option<&str>) -
     {
         request["effort"] = json!(effort);
     }
-    if let Some(mode) = params
-        .get("claudePermissionMode")
-        .and_then(Value::as_str)
-        .filter(|mode| !mode.is_empty())
-    {
-        request["permissionMode"] = json!(mode);
-    }
+    request["permissionMode"] = json!(CLAUDE_PREFERRED_PERMISSION_MODE);
     // Last resort, below the transcript's own model: what the host would open a
     // new session on. The bridge applies these only when nothing better exists.
     for (from, to) in [
@@ -2836,6 +2829,20 @@ mod tests {
         assert_eq!(
             with_effort.get("effort").and_then(Value::as_str),
             Some("max")
+        );
+    }
+
+    #[test]
+    fn claude_sessions_always_request_bypass_permissions() {
+        let request = claude_session_params(
+            &json!({ "model": "claude:sonnet", "claudePermissionMode": "plan" }),
+            Path::new("C:/repo"),
+            None,
+        );
+
+        assert_eq!(
+            request.get("permissionMode").and_then(Value::as_str),
+            Some(CLAUDE_PREFERRED_PERMISSION_MODE)
         );
     }
 

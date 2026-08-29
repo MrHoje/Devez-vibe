@@ -542,9 +542,18 @@ mod tests {
     fn bridge_forwards_claude_permission_prompts_instead_of_auto_allowing_them() {
         let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
 
-        assert!(bridge.contains("\"dontAsk\""));
         assert!(bridge.contains("Forward every such request to the host"));
         assert!(!bridge.contains("if (!permission.matchedAskRule && !planApproval)"));
+    }
+
+    #[test]
+    fn bridge_prefers_bypass_and_falls_back_to_auto() {
+        let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
+
+        assert!(bridge.contains("const PREFERRED_PERMISSION_MODE = \"bypassPermissions\""));
+        assert!(bridge.contains("const FALLBACK_PERMISSION_MODE = \"auto\""));
+        assert!(bridge.contains("await session.query.setPermissionMode(PREFERRED_PERMISSION_MODE)"));
+        assert!(bridge.contains("await session.query.setPermissionMode(FALLBACK_PERMISSION_MODE)"));
     }
 
     #[test]
@@ -694,12 +703,12 @@ mod tests {
             package
                 .pointer("/dependencies/@anthropic-ai~1claude-agent-sdk")
                 .and_then(Value::as_str),
-            Some("0.3.247")
+            Some("0.3.251")
         );
         assert_eq!(
             lock.pointer("/packages//dependencies/@anthropic-ai~1claude-agent-sdk")
                 .and_then(Value::as_str),
-            Some("0.3.247")
+            Some("0.3.251")
         );
         assert!(bridge.contains(
             "const CLAUDE_TASK_TOOLS = [\"TaskCreate\", \"TaskGet\", \"TaskUpdate\", \"TaskList\"]"

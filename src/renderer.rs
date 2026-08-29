@@ -415,24 +415,6 @@ pub enum VibeTone {
     Super,
 }
 
-/// The Claude permission mode badge, as the composer should paint it. Claude
-/// Code gives each mode its own colour, so the badge carries one rather than
-/// deriving it from a label the renderer would have to parse.
-#[derive(Clone, PartialEq, Eq)]
-pub struct PermissionBadge {
-    pub label: String,
-    pub tone: PermissionTone,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum PermissionTone {
-    Neutral,
-    AcceptEdits,
-    Plan,
-    Auto,
-    Bypass,
-}
-
 pub struct ComposerMode {
     /// Current Git branch, shown as a display-only composer badge.
     pub branch: Option<String>,
@@ -447,12 +429,8 @@ pub struct ComposerMode {
     /// Whether completed progress responses remain visible or fold into the
     /// prompt once the final answer arrives.
     pub response_display_mode: String,
-    /// Codex's fast service tier. Claude uses the same visual slot for its
-    /// permission mode instead.
+    /// Codex's fast service tier. Claude has no control in this visual slot.
     pub fast_mode: bool,
-    /// Claude's permission mode, painted where a Codex thread shows Fast. `None`
-    /// for the runtimes that have no such mode.
-    pub claude_permission: Option<PermissionBadge>,
     #[allow(dead_code)]
     pub effort: String,
     pub shell_display_mode: String,
@@ -5225,10 +5203,6 @@ enum Tone {
     ResponseCompleted,
     FastOff,
     VibeSuper,
-    ClaudeAcceptEdits,
-    ClaudePlan,
-    ClaudeAuto,
-    ClaudeBypass,
     ModelChange,
     SyntaxComment,
     SyntaxString,
@@ -5282,9 +5256,6 @@ pub enum Pick {
     PromptSection,
     McpSection(String),
     PluginSection(String),
-    /// Claude's permission mode badge: cycles the mode the way Shift+Tab does
-    /// in the Claude Code CLI.
-    ClaudePermissionMode,
     /// The status line's model name: opens `/model`.
     Model,
     /// The status line's effort reading: opens `/effort`.
@@ -5896,11 +5867,6 @@ fn activity_line_with_composer_controls(
         badge
             .fast_index
             .map(|index| (badge_start + index, Pick::FastMode)),
-    );
-    picks.extend(
-        badge
-            .permission_index
-            .map(|index| (badge_start + index, Pick::ClaudePermissionMode)),
     );
     line.tail.push(rule_gap(gap));
     line.tail.extend(badge.spans);
@@ -11706,7 +11672,7 @@ const COMPOSER_MODE_TAIL_RULE: usize = 2;
 const COMPOSER_NOTICE_GAP: usize = 2;
 /// Rule segment trailing a transient notice at the right edge.
 const COMPOSER_NOTICE_TAIL_RULE: usize = 2;
-/// Separator between the permission mode and the fast-tier flag.
+/// Separator between composer controls.
 const COMPOSER_BADGE_SEPARATOR: &str = " · ";
 
 /// Rule the composer's top line opens with when it carries a label.
@@ -11775,11 +11741,6 @@ fn input_top_line_with_controls(
             badge
                 .fast_index
                 .map(|index| (badge_start + index, Pick::FastMode)),
-        );
-        picks.extend(
-            badge
-                .permission_index
-                .map(|index| (badge_start + index, Pick::ClaudePermissionMode)),
         );
         tail.push(rule_gap(COMPOSER_MODE_GAP));
         tail.extend(badge.spans);
@@ -11995,7 +11956,6 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
         shell_display_mode_index: None,
         diff_display_mode_index: None,
         fast_index: None,
-        permission_index: None,
     };
     if mode.model.starts_with("claude:") {
         let primary_spans = show_response
@@ -12009,38 +11969,17 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
                 })
             })
             .unwrap_or_else(|| vec![vibe_mode_span.clone()]);
-        let ladder = mode
-            .claude_permission
-            .iter()
-            .map(|permission| BadgeSpans {
-                spans: [
-                    display_spans.clone(),
-                    vec![PaintSpan {
-                        text: permission.label.clone(),
-                        tone: permission_tone(permission.tone),
-                        bold: false,
-                    }],
-                    vec![separator_span()],
-                    primary_spans.clone(),
-                ]
-                .concat(),
-                vibe_mode_index: Some(display_width + 2),
-                response_display_mode_index: show_response.then_some(display_width + 4),
-                shell_display_mode_index: None,
-                diff_display_mode_index: None,
-                fast_index: None,
-                permission_index: Some(display_width),
-            })
-            .chain(std::iter::once(BadgeSpans {
+        let ladder = [
+            BadgeSpans {
                 spans: [display_spans.clone(), primary_spans.clone()].concat(),
                 vibe_mode_index: Some(display_width),
                 response_display_mode_index: show_response.then_some(display_width + 2),
                 shell_display_mode_index: None,
                 diff_display_mode_index: None,
                 fast_index: None,
-                permission_index: None,
-            }))
-            .chain(std::iter::once(vibe_only));
+            },
+            vibe_only,
+        ];
         return ladder
             .into_iter()
             .find(|candidate| spans_width(&candidate.spans) <= budget);
@@ -12064,7 +12003,6 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
         shell_display_mode_index: None,
         diff_display_mode_index: None,
         fast_index: Some(display_width + primary_spans.len() + 1),
-        permission_index: None,
     };
     // OpenCode has no service-tier switch, so its composer never shows Fast.
     let hide_fast = is_open_code_model_label(&mode.model);
@@ -12077,7 +12015,6 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
             shell_display_mode_index: None,
             diff_display_mode_index: None,
             fast_index: None,
-            permission_index: None,
         },
         vibe_only,
     ]
@@ -12096,17 +12033,6 @@ struct BadgeSpans {
     shell_display_mode_index: Option<usize>,
     diff_display_mode_index: Option<usize>,
     fast_index: Option<usize>,
-    permission_index: Option<usize>,
-}
-
-fn permission_tone(tone: PermissionTone) -> Tone {
-    match tone {
-        PermissionTone::Neutral => Tone::FastOff,
-        PermissionTone::AcceptEdits => Tone::ClaudeAcceptEdits,
-        PermissionTone::Plan => Tone::ClaudePlan,
-        PermissionTone::Auto => Tone::ClaudeAuto,
-        PermissionTone::Bypass => Tone::ClaudeBypass,
-    }
 }
 
 fn separator_span() -> PaintSpan {
@@ -12702,10 +12628,6 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::ResponseCompleted => blend(palette.blue, palette.muted, 72),
         Tone::FastOff => palette.muted,
         Tone::VibeSuper => palette.warning,
-        Tone::ClaudeAcceptEdits => theme::claude_mode_colors().accept_edits,
-        Tone::ClaudePlan => theme::claude_mode_colors().plan,
-        Tone::ClaudeAuto => theme::claude_mode_colors().auto,
-        Tone::ClaudeBypass => theme::claude_mode_colors().bypass,
         Tone::ModelChange => palette.foreground,
         Tone::SyntaxComment => palette.syntax_comment,
         Tone::SyntaxString => palette.syntax_string,
@@ -16963,7 +16885,6 @@ mod tests {
             response_length: "Short".to_owned(),
             response_display_mode: "Completed".to_owned(),
             fast_mode,
-            claude_permission: None,
             effort: "high".to_owned(),
             cost: None,
             shell_display_mode: "Collapse".to_owned(),
@@ -17283,46 +17204,28 @@ mod tests {
         assert!(!painted(&line).contains("Fast:"));
     }
 
-    /// Claude places its permission mode before Vibe, with each
-    /// control painted in its own colour and clickable on its own columns.
+    /// Claude's fixed permission mode is intentionally absent from the composer.
     #[test]
-    fn claude_composer_shows_the_permission_mode_in_the_fast_slot() {
+    fn claude_composer_hides_the_fixed_permission_mode() {
         let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
         mode.model = "claude:sonnet".to_owned();
-        mode.claude_permission = Some(PermissionBadge {
-            label: "⏸ plan mode".to_owned(),
-            tone: PermissionTone::Plan,
-        });
 
         let line = input_top_line(120, "", Some(&mode));
 
-        assert!(painted(&line).contains("⏸ plan mode · Vibe: On"));
+        assert!(!painted(&line).contains("auto mode"));
         assert!(!painted(&line).contains("Response:"));
-        assert!(painted(&line).contains("⏸ plan mode"));
-        assert_eq!(
-            pick_on(&line, "⏸ plan mode"),
-            Some(Pick::ClaudePermissionMode)
-        );
         assert_eq!(pick_on(&line, "Vibe: On"), Some(Pick::VibeMode));
-        assert!(
-            line.tail
-                .iter()
-                .any(|span| span.tone == Tone::ClaudePlan && span.text.contains("plan mode"))
-        );
     }
 
     #[test]
     fn claude_super_vibe_keeps_response_after_vibe() {
         let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, false);
         mode.model = "claude:sonnet".to_owned();
-        mode.claude_permission = Some(PermissionBadge {
-            label: "⏸ plan mode".to_owned(),
-            tone: PermissionTone::Plan,
-        });
 
         let line = input_top_line(120, "", Some(&mode));
 
-        assert!(painted(&line).contains("⏸ plan mode · Vibe: Super Vibe · Response: Completed"));
+        assert!(painted(&line).contains("Vibe: Super Vibe · Response: Completed"));
+        assert!(!painted(&line).contains("mode"));
         assert_eq!(
             pick_on(&line, "Response: Completed"),
             Some(Pick::ResponseDisplayMode)
@@ -18398,7 +18301,6 @@ mod tests {
                 response_length: "짧게".to_owned(),
                 response_display_mode: "완료".to_owned(),
                 fast_mode: false,
-                claude_permission: None,
                 effort: "high".to_owned(),
                 shell_display_mode: "숨김".to_owned(),
                 diff_display_mode: "숨김".to_owned(),

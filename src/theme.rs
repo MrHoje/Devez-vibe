@@ -688,37 +688,6 @@ pub fn palette_of(theme: ThemeKind) -> &'static ThemePalette {
     }
 }
 
-/// Colours Claude Code paints its own permission-mode indicator with, so the
-/// composer badge reads like the CLI's `⏵⏵ accept edits` line rather than like a
-/// second Devez control. Taken verbatim from the CLI's `autoAccept`, `planMode`,
-/// `warning`, and `error` theme entries — it ships one set for dark terminals
-/// and one for light, and so do we.
-#[derive(Clone, Copy)]
-pub struct ClaudeModeColors {
-    pub accept_edits: Rgb,
-    pub plan: Rgb,
-    pub auto: Rgb,
-    pub bypass: Rgb,
-}
-
-pub fn claude_mode_colors() -> ClaudeModeColors {
-    if relative_luminance(palette().background) > 0.5 {
-        ClaudeModeColors {
-            accept_edits: Rgb(135, 0, 255),
-            plan: Rgb(0, 102, 102),
-            auto: Rgb(150, 108, 30),
-            bypass: Rgb(171, 43, 63),
-        }
-    } else {
-        ClaudeModeColors {
-            accept_edits: Rgb(175, 135, 255),
-            plan: Rgb(72, 150, 140),
-            auto: Rgb(255, 193, 7),
-            bypass: Rgb(255, 107, 128),
-        }
-    }
-}
-
 pub fn load(cli_override: Option<&str>) -> Result<ThemeKind> {
     if let Some(value) = cli_override {
         return ThemeKind::parse(value)
