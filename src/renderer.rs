@@ -465,6 +465,15 @@ pub struct PlanSummary {
     pub elapsed: Option<Duration>,
 }
 
+/// A prompt already steered into the running turn: the display text and the
+/// model that took it, so the held card can look exactly like the committed
+/// one will.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SteeredPromptView {
+    pub model: String,
+    pub display: String,
+}
+
 /// One provider subagent that is still running, including in the background.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubagentView {
@@ -523,9 +532,9 @@ pub struct View<'a> {
     pub editor: &'a Editor,
     pub composer_images: &'a [String],
     pub queued_prompts: Vec<String>,
-    /// Prompts already steered into the running turn, shown next to the queue
-    /// until the in-flight answer lands and their card joins the transcript.
-    pub steered_prompts: Vec<String>,
+    /// Prompts already steered into the running turn, drawn as regular prompt
+    /// cards under the in-flight answer until their block joins the transcript.
+    pub steered_prompts: Vec<SteeredPromptView>,
     /// Running subagents shown in the side panel when it is open, or under the
     /// status line as the narrow-layout fallback.
     pub subagents: Vec<SubagentView>,
@@ -5681,30 +5690,21 @@ fn queue_preview_line(prompt: &str, index: usize, width: u16) -> PaintLine {
     .with_picks(&[(0, Pick::RemoveQueuedPrompt(index))])
 }
 
-/// A steered prompt already went to the agent, so its row carries no remove
-/// pick; it only reassures that the message is in and waiting for its place
-/// in the transcript.
-fn steer_preview_lines(prompts: &[String], width: u16) -> Vec<PaintLine> {
-    prompts
-        .iter()
-        .map(|prompt| PaintLine {
-            prefix: " ".to_owned(),
-            prefix_tone: Tone::Muted,
-            text: String::new(),
-            tone: Tone::Muted,
-            bold: false,
-            tool_heading: None,
-            pick: None,
-            tail: vec![PaintSpan {
-                text: format!(
-                    "Steer: {}",
-                    compact_right(prompt, usize::from(width).saturating_sub(11))
-                ),
-                tone: Tone::Muted,
-                bold: false,
-            }],
-        })
-        .collect()
+/// A steered prompt already went to the agent, so it is drawn as the same
+/// prompt card it will become in the transcript; it sits under the in-flight
+/// answer until that answer lands and the real card takes over.
+fn steer_preview_lines(prompts: &[SteeredPromptView], width: u16) -> Vec<PaintLine> {
+    let mut lines = Vec::new();
+    for prompt in prompts {
+        let block = Block::new(
+            BlockKind::User,
+            prompt.model.as_str(),
+            prompt.display.as_str(),
+        );
+        lines.push(PaintLine::blank());
+        lines.extend(user_prompt_lines(&block, width));
+    }
+    lines
 }
 
 /// Running subagents are listed under the status line, one row each, so a fan-out
@@ -6213,7 +6213,7 @@ fn normal_frame_with_expansion(
     composer_images: &[String],
     composer_highlights: &[String],
     queued_prompts: &[String],
-    steered_prompts: &[String],
+    steered_prompts: &[SteeredPromptView],
     subagents: &[SubagentView],
     composer_placeholder: &str,
     welcome: Option<WelcomeView>,
@@ -6231,6 +6231,14 @@ fn normal_frame_with_expansion(
         lines.push(PaintLine::blank());
     }
     lines.extend(live_lines);
+    // Held steer cards follow the in-flight answer, exactly where they will
+    // land in the transcript once that answer is on the record.
+    if !steered_prompts.is_empty() {
+        while lines.last() == Some(&PaintLine::blank()) {
+            lines.pop();
+        }
+        lines.extend(steer_preview_lines(steered_prompts, width));
+    }
 
     let mut dock_index = lines.len();
     let composer_mode = status.composer_mode.as_ref();
@@ -6302,7 +6310,6 @@ fn normal_frame_with_expansion(
             lines.push(PaintLine::blank());
         }
     }
-    lines.extend(steer_preview_lines(steered_prompts, width));
     lines.extend(queue_preview_lines(queued_prompts, width));
 
     // Recalled history is labelled on the composer rule, so the position stays

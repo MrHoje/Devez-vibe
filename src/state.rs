@@ -32,7 +32,8 @@ use crate::{
         HIDDEN_STATUS_LINE, IntegrationItemState, IntegrationItemView, LiveBlockView, ModeAccent,
         OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS,
         PlanStep, PlanStepStatus, PlanSummary, ProviderHandoffBlock, ProviderIntegrationView,
-        SIDE_PANEL_WIDTHS, StatusLineView, SubagentView, SuggestionView, VibeTone, View,
+        SIDE_PANEL_WIDTHS, StatusLineView, SteeredPromptView, SubagentView, SuggestionView,
+        VibeTone, View,
         WelcomeView, format_clock_time, format_elapsed, visible_window,
     },
     rollout::{PlanSnapshot, Rollout, RolloutEvent, RolloutKind},
@@ -6287,7 +6288,10 @@ impl AppState {
             steered_prompts: self
                 .pending_steer_prompts
                 .iter()
-                .map(|pending| pending.display.clone())
+                .map(|pending| SteeredPromptView {
+                    model: pending.model.clone(),
+                    display: pending.display.clone(),
+                })
                 .collect(),
             subagents: self
                 .subagents
