@@ -1,361 +1,439 @@
 # DevezVibe 4종 에이전트 시스템 상세 구현 계획서
 
-> 문서 상태: 1차 초안  
-> 대상 브랜치: `main`  
+> 문서 상태: **2차 재검수 완료본**  
 > 대상 기능: `Standard`, `Planner`, `Advisor`, `Finisher`  
-> 제외 기능: Automatic 라우팅, 별도 Research 에이전트, Insane Search, Hoje 런타임/상태 파일  
+> 기준 저장소: `MrHoje/Devez-vibe` `main`  
+> 참고 구현: `MrHoje/devez-marketplace/plugins/hoje-code`  
+> 명시적 제외: Automatic 라우팅, 별도 Research 에이전트, Insane Search, Hoje 런타임·상태 파일  
 > 이 문서는 구현 계획만 정의하며 제품 소스 코드는 수정하지 않는다.
 
 ---
 
-## 1. 문서 목적
+## 0. 요약
 
-이 문서는 DevezVibe에 사용자가 즉시 전환할 수 있는 네 가지 에이전트 모드를 내장하기 위한 구현 계획을 정의한다.
+DevezVibe에 다음 네 역할을 provider 공통 기능으로 내장한다.
 
 ```text
 Standard → Planner → Advisor → Finisher → Standard
 ```
 
-핵심 목표는 다음과 같다.
-
-1. 현재 Claude Agent SDK, Codex app-server, OpenCode ACP의 기본 하네스를 유지한다.
-2. 별도 플러그인이나 스킬 설치 없이 DevezVibe 바이너리 내부에 역할 지침을 포함한다.
-3. 모델, provider, effort, Vibe 설정과 독립된 공통 에이전트 계층을 만든다.
-4. `Standard`는 현재 동작과 완전히 동일한 기본값으로 둔다.
-5. `Planner`는 Hoje Ask와 Hoje Plan의 좋은 동작을 합친 요구 명확화·설계 전용 역할로 만든다.
-6. `Advisor`는 Hoje Architect/Critic의 검토 철학을 바탕으로 추천·반론·대안 비교를 담당한다.
-7. `Finisher`는 Hoje Goals의 완결 실행 철학을 가져오되 `.hoje`, ledger, receipt, CLI 의존성 없이 동작한다.
-8. 모든 provider에서 같은 역할명, 같은 UI, 같은 전환 규칙, 최대한 유사한 행동을 제공한다.
-
-이 계획의 우선순위는 “기능을 많이 넣는 것”이 아니라 “현재 기본 하네스를 훼손하지 않으면서 역할 차이를 명확하게 만드는 것”이다.
-
----
-
-## 2. 최종 사용자 경험
-
-### 2.1 기본 상태
-
-DevezVibe를 시작하면 에이전트는 항상 `Standard`로 시작한다.
-
-```text
-Standard
-```
-
-`Standard`에서는 기존 DevezVibe와 동일하게 Claude Code/Codex/OpenCode의 기본 하네스가 일반 질문, 조사, 구현, 테스트를 자유롭게 수행한다.
-
-### 2.2 수동 전환
-
-사용자는 idle 상태에서 `Tab`을 눌러 다음 순서로 에이전트를 전환한다.
-
-```text
-Standard
-  ↓ Tab
-Planner
-  ↓ Tab
-Advisor
-  ↓ Tab
-Finisher
-  ↓ Tab
-Standard
-```
-
-추가로 `/agent` 명령과 컴포저의 에이전트 배지를 제공한다.
-
-```text
-/agent
-/agent standard
-/agent planner
-/agent advisor
-/agent finisher
-```
-
-### 2.3 화면 표시
-
-컴포저 상단 배지에 현재 역할을 짧게 표시한다.
-
-```text
-Standard
-Planner
-Advisor
-Finisher
-```
-
-`Agent: Planner`처럼 접두어를 붙이지 않고 역할명만 표시해 좁은 터미널의 폭을 절약한다.
-
-배지는 클릭 가능하며 클릭하면 `/agent`와 동일한 선택창을 연다.
-
-### 2.4 전환 범위
-
-에이전트 선택은 다음 항목을 변경하지 않는다.
-
-- 현재 provider
-- 모델
-- reasoning effort
-- Fast/service tier
-- Vibe 모드
-- Response 표시 모드
-- Shell/Diff 표시 설정
-- Claude 권한 모드
-- 사용자·프로젝트의 `AGENTS.md`, `CLAUDE.md`, skills, MCP 설정
-- 현재 대화 기록
-
-에이전트 전환은 오직 다음 턴에 추가되는 역할 지침만 바꾼다.
-
----
-
-## 3. 범위와 비범위
-
-## 3.1 이번 구현 범위
-
-- `Standard`, `Planner`, `Advisor`, `Finisher` 네 역할
-- 기본값 `Standard`
-- idle 상태의 bare `Tab` 순환
-- `/agent` picker
-- `/agent <name>` 직접 선택
-- 클릭 가능한 컴포저 배지
-- provider 공통 턴 지침 주입
-- 역할별 내장 prompt
-- 역할별 단위 테스트
-- provider별 전달 회귀 테스트
-- UI 폭·클릭 위치·기존 키 충돌 회귀 테스트
-- README와 도움말 문서화
-
-## 3.2 명시적으로 제외할 기능
-
-이번 구현에는 다음을 넣지 않는다.
-
-- `Automatic` 요청 분류·라우팅
-- 여러 역할을 자동으로 이어 붙이는 pipeline
-- 별도 `Research` primary agent
-- Insane Search 및 직접 웹 fetch 엔진
-- Hoje marketplace/plugin 자동 설치
-- `.hoje` 디렉터리나 상태 파일 생성
-- Hoje CLI, `ralplan`, `ultragoal` 실행
-- receipt, `sha256`, `stage_n`, `ledger.jsonl`, `goals.json`
-- 모델별 자동 교체
-- 에이전트별 별도 모델 지정
-- 에이전트별 provider 자동 변경
-- 에이전트별 별도 비용 정책
-- OpenCode native primary agent와의 직접 동기화
-- Planner/Advisor에 대한 provider 공통 hard read-only sandbox
-
-마지막 항목은 중요하다. 첫 버전의 Planner/Advisor “수정 금지”는 강한 역할 지침이지만 보안 경계는 아니다. Claude, Codex, OpenCode 모두에서 완전히 동일한 hard tool restriction을 걸려면 provider별 권한·도구 차단 계층을 별도로 설계해야 한다. 첫 버전은 역할 품질과 전환 일관성을 먼저 완성한다.
-
----
-
-## 4. Hoje-Code에서 참고할 요소
-
-DevezVibe는 Hoje-Code를 런타임으로 포함하지 않는다. 대신 다음 역할 철학만 재작성하여 내장한다.
-
-## 4.1 참고 파일
-
-`MrHoje/devez-marketplace` 기준:
-
-- `plugins/hoje-code/agents/planner.md`
-- `plugins/hoje-code/agents/architect.md`
-- `plugins/hoje-code/agents/critic.md`
-- `plugins/hoje-code/agents/executor.md`
-- `plugins/hoje-code/agents/executor-qa.md`
-- `plugins/hoje-code/skills/hoje-ask/SKILL.md`
-- `plugins/hoje-code/skills/hoje-plan/SKILL.md`
-- `plugins/hoje-code/skills/hoje-goals/SKILL.md`
-
-## 4.2 가져올 원칙
-
-### Planner 계열
-
-- 저장소를 먼저 조사한다.
-- 사실과 가정을 분리한다.
-- 사용자 요구에서 material한 모호성만 질문한다.
-- 저장소에서 알 수 있는 사실을 사용자에게 다시 묻지 않는다.
-- 계획에 변경 경로, 계약, 위험, 검증 명령을 포함한다.
-- 구현을 시작하지 않는다.
-- Architect 관점과 Critic 관점으로 계획을 자체 검토한다.
-
-### Architect/Advisor 계열
-
-- 요청된 계약과 실제 저장소 상태를 함께 본다.
-- 아키텍처, 동작, 호환성, 보안 경계, 검증 증거를 평가한다.
-- 근거 없이 승인하거나 반대하지 않는다.
-- 실제 blocker와 선택적 개선을 분리한다.
-
-### Critic 계열
-
-- 누락된 surface를 찾는다.
-- 순서 오류와 숨은 의존성을 찾는다.
-- 약한 acceptance criteria를 찾는다.
-- 테스트가 통과해도 실제 동작이 깨질 수 있는 경우를 찾는다.
-- 문제를 지적할 때 정확한 보완 방법을 함께 제시한다.
-
-### Executor/Finisher 계열
-
-- 한 번에 bounded한 목표를 처리한다.
-- 관련 없는 사용자 변경을 보존한다.
-- 가장 단순하고 호환 가능한 구현을 우선한다.
-- targeted verification을 실행한다.
-- 구현자와 독립된 review/QA 관점을 둔다.
-- 증거 없이 완료라고 하지 않는다.
-- 해결 가능한 blocker를 이유로 쉽게 포기하지 않는다.
-
-## 4.3 가져오지 않을 요소
-
-- Hoje 이름과 명령어를 사용자에게 노출하는 규칙
-- `.hoje` 상태 계약
-- workflow artifact writer
-- Planner/Architect/Critic receipt 전달
-- review pass 번호와 persisted subagent ID
-- conflict disposition JSON schema
-- 최대 5회 RALPLAN 반복 상태 머신
-- goals ledger와 checkpoint 명령
-- nudge budget
-- Hoje 전용 hook·plugin namespace
-- Claude 전용 `TaskCreate`를 canonical state로 간주하는 규칙
-
-## 4.4 적용 방식
-
-원문 SKILL.md를 통째로 system prompt에 넣지 않는다. 원문의 목적과 검증 규칙만 추출하고 DevezVibe의 구조에 맞는 짧고 provider-neutral한 prompt로 다시 작성한다.
-
-목표는 “Hoje-Code를 번들링”하는 것이 아니라 다음과 같다.
-
-```text
-Hoje 역할 철학
-      ↓ 재작성
-DevezVibe built-in agent prompt
-      ↓
-Claude / Codex / OpenCode
-```
-
----
-
-## 5. 현재 DevezVibe 구조 분석
-
-## 5.1 현재 턴 전달 흐름
-
-현재 일반적인 턴 흐름은 다음과 같다.
-
-```text
-AppState
-  ↓ 사용자 입력
-src/main.rs
-  ↓ turn/start params 생성
-additionalContext
-  ↓
-src/backend.rs
-  ├─ Claude → session/prompt
-  ├─ OpenCode → start_prompt_content
-  └─ Codex → turn/start
-```
-
-`src/main.rs`는 `turn_additional_context()`에서 DevezVibe 공통 지침과 Vibe 관련 턴 지침을 만든다.
-
-`src/backend.rs`는 `combined_turn_instructions()`에서 Claude/OpenCode에 전달할 문자열형 턴 컨텍스트를 조합한다. Codex는 `additionalContext` 객체를 직접 받으며 `prepare_codex_turn_context()`에서 이미 thread-level developer instructions에 들어간 중복 공통 지침만 제거한다.
-
-이 구조는 동적 에이전트 지침을 넣기에 적합하다.
-
-## 5.2 현재 provider별 지침 위치
-
-### Codex
-
-- thread start/resume 시 `developerInstructions`에 DevezVibe 공통 규칙을 전달한다.
-- 매 턴 `additionalContext`를 전달한다.
-- 에이전트 지침은 매 턴 동적이므로 `additionalContext`에 남긴다.
-
-### Claude
-
-- session 생성 시 Claude Code preset system prompt에 DevezVibe 공통 규칙을 append한다.
-- 에이전트는 세션 중 바뀌므로 system prompt를 재생성하지 않는다.
-- 현재 Vibe reminder와 provider handoff가 전달되는 턴 컨텍스트 경로에 에이전트 지침을 추가한다.
-- bridge는 해당 prefix를 history 표시에서 제거하므로 사용자 transcript를 오염시키지 않는다.
-
-### OpenCode
-
-- `start_prompt_content()`가 전달받은 instruction을 내부 `<devez-vibe-rules>` 블록으로 prompt 앞에 넣는다.
-- session load 시 해당 내부 블록을 history에서 숨긴다.
-- 에이전트 지침도 같은 턴 instruction 경로를 사용한다.
-- 첫 버전에서는 `session/set_mode`를 사용하지 않는다. native agent와 DevezVibe agent의 의미가 엇갈리는 것을 방지하기 위해 DevezVibe가 provider-independent 역할을 소유한다.
-
-## 5.3 현재 상태와 UI 위치
-
-`src/state.rs`의 `AppState`가 다음을 소유한다.
-
-- editor와 queued prompts
-- busy/turn 상태
-- selected model/effort
-- Vibe/Response/Shell/Diff 표시 상태
-- pending picker/overlay
-- provider/model switch 상태
-- composer에 표시할 `ComposerMode`
-
-에이전트 선택도 `AppState`가 소유하는 것이 맞다.
-
-`src/renderer.rs`의 `ComposerMode`와 `Pick`은 컴포저 배지와 클릭 동작을 연결한다. 따라서 에이전트 배지도 같은 체계에 넣어야 한다.
-
----
-
-## 6. 전체 설계 원칙
-
-## 6.1 DevezVibe가 역할 상태를 소유한다
-
-provider가 현재 역할을 소유하거나 추론하게 만들지 않는다.
+| 역할 | 핵심 책임 | 제품 파일 수정 |
+|---|---|---:|
+| `Standard` | 현재 Claude/Codex/OpenCode 기본 하네스를 그대로 사용 | 가능 |
+| `Planner` | 요구 명확화, 저장소 조사, 설계, 계획 자체 검토 | 금지 지침 |
+| `Advisor` | 접근법 평가, 추천, 반론, 대안·트레이드오프 제시 | 금지 지침 |
+| `Finisher` | 구현, 검증, 독립 리뷰·QA, blocker 해결, 완료 증거 | 가능 |
+
+구현의 핵심은 “네 개의 별도 런타임”이 아니라 다음 두 요소다.
+
+1. `AppState`가 현재 선택된 역할을 소유한다.
+2. 다음 턴을 보낼 때 선택된 역할의 내장 prompt를 provider 공통 `additionalContext` 경로로 전달한다.
 
 ```text
 AppState.agent_mode
       ↓
-turn context builder
+DevezVibe agent context
       ↓
-provider adapter
+src/backend.rs
+  ├─ Claude Agent SDK
+  ├─ Codex app-server
+  └─ OpenCode ACP
 ```
 
-UI는 provider 응답을 보고 역할을 추측하지 않고 `AppState.agent_mode`를 그대로 표시한다.
+`hoje-code`는 설치하거나 실행하지 않는다. Planner·Architect·Critic·Executor·Executor-QA 및 Ask·Plan·Goals 워크플로우에서 검증된 역할 원칙만 추출해 DevezVibe 전용 prompt로 재작성한다.
 
-## 6.2 역할과 모델을 분리한다
+재검수 후 확정한 중요한 보완 사항은 다음과 같다.
 
-다음 조합은 모두 가능해야 한다.
-
-```text
-Planner + Claude Sonnet
-Planner + Claude Opus
-Planner + GPT
-Planner + OpenCode model
-```
-
-역할 전환은 모델을 바꾸지 않는다.
-
-## 6.3 Standard는 무주입이다
-
-`Standard`의 가장 중요한 계약은 기존 동작 보존이다.
-
-`Standard`일 때는 `devez-vibe-agent` 추가 context 자체를 만들지 않는다. 빈 문자열을 보내는 방식도 피한다. provider가 기존과 동일한 payload를 받도록 한다.
-
-## 6.4 비-Standard 역할은 턴 단위로 주입한다
-
-`Planner`, `Advisor`, `Finisher`는 다음 턴마다 역할 지침을 받는다.
-
-세션 시작 때 한 번만 넣으면 중간 전환이 불가능하고, provider를 바꾸면 역할이 누락될 수 있다. 따라서 역할은 항상 turn-level context이다.
-
-## 6.5 Prompt는 공통 규칙과 분리한다
-
-```text
-기존 DEVEZ_INSTRUCTIONS
-+ 기존 Vibe turn notice
-+ 선택된 Agent prompt
-```
-
-역할 prompt에 한국어 출력 규칙, 응답 길이, tool 표시 규칙을 중복해서 넣지 않는다. 출력 형식은 기존 DevezVibe 공통 지침이 계속 담당한다.
-
-## 6.6 첫 버전은 자동 pipeline이 아니다
-
-`Planner → Finisher`는 사용자가 직접 전환한다.
-
-Planner가 계획을 끝냈다고 자동으로 Finisher를 호출하거나 모드를 바꾸지 않는다. Finisher도 Planner를 자동 실행하지 않는다. Finisher는 현재 대화에 승인된 계획이 있으면 활용하고, 없으면 현재 요청을 실행 brief로 사용한다.
+- busy 상태의 `Tab`은 기존 prompt queue 동작을 유지한다.
+- `/btw` split 상태의 `Tab`은 기존 pane 전환을 유지한다.
+- background subagent가 살아 있거나 queued prompt가 있으면 역할 변경을 잠근다.
+- 이전 역할 지침은 대화 컨텍스트에 남으므로 `Standard` 복귀 시 한 번의 **reset instruction**을 보낸다.
+- resume한 세션에는 과거 specialized agent 지침이 남아 있을 수 있으므로 첫 Standard 턴에 reset을 보낸다.
+- Planner/Advisor의 수정 금지는 첫 버전에서 prompt-level 계약이며 provider 공통 보안 sandbox가 아니다.
+- picker는 후보를 이동하는 동안 실제 역할을 바꾸지 않고 Enter에서만 확정한다.
 
 ---
 
-## 7. 신규 모듈 설계
+# 1. 문서 목적
 
-## 7.1 `src/agent.rs`
+이 문서는 DevezVibe에 사용자가 즉시 전환할 수 있는 네 가지 에이전트 모드를 구현하기 위한 상세 설계와 단계별 작업 계획을 제공한다.
 
-신규 모듈이 다음 책임을 가진다.
+목표는 다음과 같다.
+
+1. 현재 Claude Agent SDK, Codex app-server, OpenCode ACP의 기본 하네스를 훼손하지 않는다.
+2. 별도 marketplace, plugin, skill 설치 없이 역할 지침을 DevezVibe 바이너리에 내장한다.
+3. 모델, provider, effort, Fast, Vibe, Response 설정과 에이전트 역할을 분리한다.
+4. `Standard`를 기본값으로 유지해 기존 사용자의 동작을 최대한 보존한다.
+5. `Planner`에서 Hoje Ask와 Hoje Plan의 핵심을 통합한다.
+6. `Advisor`에서 Hoje Architect와 Critic의 근거 기반 판단 철학을 확장한다.
+7. `Finisher`에서 Hoje Goals의 목표 완결·검증 철학을 가볍게 포팅한다.
+8. Claude, Codex, OpenCode에서 역할명, 전환 UX, 화면 표시, 핵심 행동을 일관되게 만든다.
+9. 구현 전 테스트·회귀 범위와 완료 조건을 명확하게 고정한다.
+
+이 계획의 최우선 원칙은 다음과 같다.
+
+> 현재 기본 하네스가 이미 잘하는 일반 개발 동작은 다시 구현하지 않고, 역할을 바꿀 가치가 있는 행동 차이만 추가한다.
+
+---
+
+# 2. 확정된 제품 결정
+
+## 2.1 역할 구성
+
+```text
+Standard
+Planner
+Advisor
+Finisher
+```
+
+다른 역할은 첫 버전에 추가하지 않는다.
+
+## 2.2 기본값
+
+새 프로세스는 항상 `Standard`로 시작한다.
+
+## 2.3 전환 방식
+
+사용자가 수동으로 선택한다.
+
+- idle 상태의 bare `Tab`
+- `/agent`
+- `/agent <mode>`
+- 컴포저의 agent badge 클릭
+
+## 2.4 자동 전환 없음
+
+다음 동작은 하지 않는다.
+
+- 요청을 분류해 자동으로 역할 선택
+- Planner 종료 후 Finisher 자동 실행
+- Advisor 검토 후 Planner 자동 실행
+- Finisher가 자동으로 Planner 모드로 전환
+- 역할에 따라 모델/provider 자동 교체
+
+## 2.5 역할 상태 소유자
+
+`AppState`가 역할을 소유한다. Claude, Codex, OpenCode의 native agent mode는 역할 상태의 source of truth가 아니다.
+
+## 2.6 역할 지속 범위
+
+역할은 하나의 `AppState` 수명 동안 유지한다.
+
+유지되는 경우:
+
+- 모델 변경
+- effort 변경
+- provider 변경
+- Vibe/Response/Shell/Diff 변경
+- 같은 UI thread에 backing session을 붙이는 provider handoff
+
+초기화되는 경우:
+
+- 새 DevezVibe 프로세스
+- 새 `AppState` 생성
+
+파일에는 저장하지 않는다.
+
+## 2.7 Research 기능
+
+첫 버전에서 제외한다.
+
+기존 provider의 일반 검색 능력은 계속 사용할 수 있지만, 별도 Research agent, Insane Search, 직접 fetch fallback은 구현하지 않는다.
+
+---
+
+# 3. 범위와 비범위
+
+## 3.1 이번 구현 범위
+
+- `AgentMode` 공통 타입
+- `Standard`, `Planner`, `Advisor`, `Finisher`
+- compile-time 내장 prompt
+- `AppState` 역할 상태
+- idle Tab 순환
+- `/agent` picker
+- `/agent <mode>` 직접 선택
+- clickable agent badge
+- role context의 provider 공통 전달
+- specialized role에서 Standard로 돌아올 때 reset instruction
+- resume 첫 Standard 턴의 stale-role reset
+- 역할 변경 잠금 조건
+- 역할별 prompt 정적 검사
+- provider별 transport 회귀 테스트
+- UI 폭·클릭 위치·키 충돌 테스트
+- README, npm README, 도움말 업데이트
+
+## 3.2 명시적으로 제외하는 기능
+
+- `Automatic`
+- 요청 분류용 별도 LLM 호출
+- agent pipeline
+- 별도 `Research` primary agent
+- Insane Search
+- 직접 web fetch 엔진
+- Hoje marketplace/plugin 설치
+- Hoje CLI 실행
+- `.hoje` 디렉터리 생성
+- `ralplan`, `ultragoal`
+- receipt, ledger, checkpoint
+- `goals.json`, `ledger.jsonl`, `stage_n`, `sha256`
+- agent별 모델 지정
+- agent별 provider 지정
+- OpenCode `session/set_mode` 연동
+- agent별 별도 비용·context 정책
+- provider 공통 hard read-only sandbox
+- 사용자 정의 custom agent 파일
+- agent 선택 영구 저장
+
+## 3.3 구현하지 않는 이유
+
+### Automatic
+
+라우팅 오판, 다중 상태, UI 표기, pipeline, 비용·지연이 추가된다. 수동 네 역할의 실제 사용성이 검증된 뒤 별도 기능으로 추가하는 것이 안전하다.
+
+### Hoje runtime
+
+Hoje의 durability는 강력하지만 DevezVibe 내장 역할의 첫 목표에는 과하다. `.hoje`, receipt, ledger를 가져오면 역할 전환 기능이 별도 workflow engine 개발로 커진다.
+
+### Hard read-only
+
+Planner/Advisor를 Claude, Codex, OpenCode 모두에서 완전히 동일하게 강제하려면 provider별 tool interception과 Bash mutation 판별이 필요하다. 첫 버전에서는 명확한 역할 prompt로 제한하고, 이를 보안 경계라고 표현하지 않는다.
+
+---
+
+# 4. Hoje-Code 참고 범위
+
+## 4.1 참고 파일
+
+`MrHoje/devez-marketplace`의 다음 파일을 기준으로 한다.
+
+```text
+plugins/hoje-code/agents/planner.md
+plugins/hoje-code/agents/architect.md
+plugins/hoje-code/agents/critic.md
+plugins/hoje-code/agents/executor.md
+plugins/hoje-code/agents/executor-qa.md
+plugins/hoje-code/skills/hoje-ask/SKILL.md
+plugins/hoje-code/skills/hoje-plan/SKILL.md
+plugins/hoje-code/skills/hoje-goals/SKILL.md
+```
+
+## 4.2 역할별 매핑
+
+| DevezVibe | Hoje-Code 참고 요소 |
+|---|---|
+| `Standard` | 참고하지 않음. 현재 provider 기본 하네스 유지 |
+| `Planner` | Hoje Ask + Hoje Planner + Hoje Plan + Architect/Critic 자체 검토 |
+| `Advisor` | Hoje Architect + Hoje Critic, 기술 자문용으로 재구성 |
+| `Finisher` | Hoje Goals + Executor + Architect + Executor-QA |
+
+## 4.3 가져올 Planner 원칙
+
+- 저장소를 먼저 조사한다.
+- 사실과 가정을 분리한다.
+- 영향 경로, 계약, 위험, 검증 명령이 있는 bounded plan을 만든다.
+- 저장소에서 확인할 수 있는 사실을 사용자에게 묻지 않는다.
+- material한 모호성만 질문한다.
+- 계획 중 제품 파일을 수정하지 않는다.
+- 실행했다고 주장하려면 실제 실행 기록이 있어야 한다.
+
+## 4.4 가져올 Architect 원칙
+
+- 요청된 제품 계약과 실제 저장소 상태를 함께 검토한다.
+- 아키텍처, 동작, 호환성, 보안 경계, 검증 증거를 본다.
+- 근거 없이 승인하지 않는다.
+- actionable blocker를 구체적인 위치·이유와 함께 제시한다.
+
+## 4.5 가져올 Critic 원칙
+
+- 누락된 surface를 찾는다.
+- 단계 순서 오류를 찾는다.
+- 숨은 의존성을 찾는다.
+- 약한 acceptance criteria를 찾는다.
+- 테스트가 통과하지만 실제 동작이 깨질 수 있는 경우를 찾는다.
+- 문제가 있으면 정확한 보완 방법을 제시한다.
+
+## 4.6 가져올 Executor 원칙
+
+- 한 번에 bounded한 목표를 처리한다.
+- 관련 없는 사용자 변경을 보존한다.
+- 가장 단순하고 호환 가능한 구현을 사용한다.
+- targeted verification을 실행한다.
+- 변경 경로, 실행 명령, 결과, 남은 위험을 보고한다.
+
+## 4.7 가져올 Executor-QA 원칙
+
+- 구현자와 독립된 관점으로 확인한다.
+- 실제 사용자-facing surface를 검증한다.
+- regression과 adversarial case를 본다.
+- artifact 존재를 확인한다.
+- blocker를 일반 조언으로 약화하지 않는다.
+
+## 4.8 가져오지 않을 요소
+
+- Hoje 이름·브랜드를 사용자-facing role에 노출
+- `.hoje` state contract
+- CLI command syntax
+- artifact writer
+- receipt-only response
+- persisted subagent identity
+- review pass 번호
+- conflict disposition schema
+- 최대 5회 RALPLAN 상태 머신
+- goal ledger/checkpoint
+- nudge budget
+- Hoje hook/plugin namespace
+- Claude Task state를 canonical source로 쓰는 규칙
+
+## 4.9 라이선스·출처 처리
+
+역할 prompt는 Hoje-Code 문장을 장문으로 복사하지 않고 원칙을 재작성한다.
+
+- 아이디어와 역할 구조만 참고하면 별도 runtime attribution을 요구하지 않는다.
+- 문장을 실질적으로 복사하는 경우 원 저장소의 라이선스와 저작권 고지를 확인하고 `NOTICE`에 출처를 남긴다.
+- 구현 단계의 code review에서 prompt가 원문을 과도하게 복제하지 않았는지 확인한다.
+
+---
+
+# 5. 현재 DevezVibe 구조 분석
+
+## 5.1 턴 전달 경로
+
+현재 흐름은 다음과 같다.
+
+```text
+AppState
+  ↓ submit / steer / queued prompt
+src/main.rs
+  ↓ turn/start 또는 turn/steer params
+additionalContext
+  ↓
+src/backend.rs
+  ├─ Claude → session/prompt 또는 session/steer
+  ├─ OpenCode → start_prompt_content
+  └─ Codex → turn/start 또는 turn/steer
+```
+
+## 5.2 `src/main.rs`
+
+현재 책임:
+
+- `DEVEZ_INSTRUCTIONS`
+- thread start/resume parameter
+- turn parameter 생성
+- `turn_additional_context()`
+- event loop
+- `/btw` split focus
+- renderer pick action
+- provider handoff snapshot
+
+에이전트 구현에서 변경할 부분:
+
+- `mod agent`
+- `AgentMode` import
+- turn context builder에 agent state 전달
+- agent badge click action
+- 도움말/Tip 문구
+
+## 5.3 `src/state.rs`
+
+현재 책임:
+
+- `AppState`
+- editor, queue, busy, compaction
+- model/effort/provider state
+- Vibe/Response/Shell/Diff
+- slash commands
+- overlay/picker
+- `ComposerMode` 생성
+- input key 처리
+
+에이전트의 selected mode, picker, Tab cycle, 변경 잠금은 이 파일의 책임이다.
+
+## 5.4 `src/backend.rs`
+
+현재 책임:
+
+- visible thread와 provider backing session 연결
+- provider switch/handoff
+- Claude/Codex/OpenCode request 분배
+- `combined_turn_instructions()`
+- `prepare_codex_turn_context()`
+
+역할 prompt transport는 이 계층에서 provider별로 변환한다.
+
+## 5.5 `src/renderer.rs`
+
+현재 책임:
+
+- `ComposerMode`
+- 컴포저 badge layout
+- `Pick`과 clickable column
+- narrow-width badge 생략
+- hover와 repaint
+
+에이전트 badge를 기존 badge 체계에 추가한다.
+
+## 5.6 `src/open_code.rs`
+
+현재 `start_prompt_content()`는 전달받은 instruction을 내부 `<devez-vibe-rules>` block으로 prompt 앞에 넣고, session history 복원 시 해당 내부 block을 숨긴다.
+
+첫 버전에서는 수정하지 않는 것을 원칙으로 한다.
+
+## 5.7 Claude bridge
+
+Claude bridge는 `handoffContext`를 길이 정보가 있는 내부 prefix로 user content 앞에 붙이고 history 복원 시 전체 prefix를 제거한다.
+
+첫 버전에서는 role context를 기존 transport에 함께 태우며 bridge protocol을 바꾸지 않는다.
+
+---
+
+# 6. 전체 시스템 구조
+
+```text
+┌──────────────────────────────────────────┐
+│                AppState                  │
+│ selected_agent_mode                      │
+│ last_dispatched_agent_mode               │
+│ standard_reset_required                  │
+└───────────────────┬──────────────────────┘
+                    │
+                    ▼
+┌──────────────────────────────────────────┐
+│              src/agent.rs                │
+│ enum / labels / picker details / prompts │
+│ turn context policy / reset instruction  │
+└───────────────────┬──────────────────────┘
+                    │
+                    ▼
+┌──────────────────────────────────────────┐
+│       main.rs turn_additional_context    │
+│ devez-vibe-agent application context     │
+└───────────────────┬──────────────────────┘
+                    │
+                    ▼
+┌──────────────────────────────────────────┐
+│               backend.rs                 │
+├──────────────┬──────────────┬────────────┤
+│ Claude       │ Codex        │ OpenCode   │
+│ string       │ JSON context │ string     │
+└──────────────┴──────────────┴────────────┘
+```
+
+---
+
+# 7. 핵심 타입 설계
+
+## 7.1 `AgentMode`
+
+신규 파일:
+
+```text
+src/agent.rs
+```
+
+예상 타입:
 
 ```rust
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -368,37 +446,20 @@ pub enum AgentMode {
 }
 ```
 
-필수 API:
+## 7.2 필수 API
 
 ```text
 AgentMode::CHOICES
-AgentMode::label()
 AgentMode::id()
+AgentMode::label()
 AgentMode::parse()
 AgentMode::next()
 AgentMode::picker_detail()
-AgentMode::turn_instruction()
+AgentMode::specialized_instruction()
+AgentMode::context_block()
 ```
 
-### `label()`
-
-- `Standard`
-- `Planner`
-- `Advisor`
-- `Finisher`
-
 ### `id()`
-
-- `standard`
-- `planner`
-- `advisor`
-- `finisher`
-
-### `parse()`
-
-대소문자를 무시한다.
-
-허용값:
 
 ```text
 standard
@@ -407,30 +468,35 @@ advisor
 finisher
 ```
 
-불필요한 alias는 첫 버전에 넣지 않는다.
+### `label()`
+
+```text
+Standard
+Planner
+Advisor
+Finisher
+```
+
+### `parse()`
+
+대소문자를 무시한다. 첫 버전에는 alias를 넣지 않는다.
 
 ### `next()`
-
-순서를 코드 한 곳에서만 정의한다.
 
 ```text
 Standard → Planner → Advisor → Finisher → Standard
 ```
 
-Tab, picker, 테스트가 모두 이 정의를 사용한다.
+Tab과 테스트는 이 정의만 사용한다.
 
-### `turn_instruction()`
+### `specialized_instruction()`
 
 - Standard: `None`
-- Planner: Planner prompt
-- Advisor: Advisor prompt
-- Finisher: Finisher prompt
+- Planner: planner prompt
+- Advisor: advisor prompt
+- Finisher: finisher prompt
 
-반환값을 `Option<&'static str>` 또는 `Option<Cow<'static, str>>`로 두고 Standard가 완전히 무주입임을 타입으로 표현한다.
-
-## 7.2 Prompt 파일
-
-추천 경로:
+## 7.3 Prompt 저장 위치
 
 ```text
 prompts/agents/planner.md
@@ -438,185 +504,314 @@ prompts/agents/advisor.md
 prompts/agents/finisher.md
 ```
 
-`src/agent.rs`에서 `include_str!()`로 컴파일 타임에 포함한다.
+`src/agent.rs`에서 `include_str!()`로 컴파일 시 포함한다.
+
+예시:
+
+```rust
+const PLANNER_PROMPT: &str = include_str!("../prompts/agents/planner.md");
+```
 
 장점:
 
-- Rust 코드와 긴 prompt를 분리할 수 있다.
-- prompt review가 쉽다.
-- 최종 바이너리에 내장되므로 npm 설치 후 별도 파일이 필요 없다.
-- `npm/package.json`의 `files` 목록을 수정하지 않아도 된다.
-- 사용자 PC에 Hoje plugin을 설치하지 않아도 된다.
+- 긴 prompt와 Rust 로직 분리
+- prompt diff review 용이
+- 실행 시 파일 탐색 없음
+- npm package에 markdown 파일을 별도로 포함할 필요 없음
+- 누락 경로는 compile error
+- 별도 plugin 설치 불필요
 
-Prompt 파일은 runtime에서 읽지 않는다. 누락·경로 문제를 빌드 시점에 잡는다.
+## 7.4 공통 context block
 
-## 7.3 Prompt 공통 wrapper
-
-역할 prompt를 전달할 때 다음과 같은 명확한 경계를 사용한다.
+모든 role block은 다음 contract를 가진다.
 
 ```xml
-<devez-vibe-agent mode="planner">
+<devez-vibe-agent mode="planner" version="1">
+This is the current DevezVibe agent mode.
+It supersedes every earlier devez-vibe-agent block in this conversation.
 ...
 </devez-vibe-agent>
 ```
 
-wrapper 생성은 `agent.rs` 또는 `main.rs`의 context builder 한 곳에서 수행한다.
+필수 선언:
 
-역할 prompt 내부의 사용자 입력이나 외부 콘텐츠를 이 wrapper 안에 섞지 않는다.
+- 현재 block이 이전 역할 block보다 우선한다.
+- 새 block이 올 때까지 현재 역할이 유효하다.
+- user content는 이 block 내부에 포함하지 않는다.
+- 외부 검색 결과나 tool output은 이 block 내부에 포함하지 않는다.
 
 ---
 
-## 8. AppState 구현 계획
+# 8. 이전 역할 지침 잔존 문제와 Reset 설계
 
-## 8.1 필드 추가
+## 8.1 문제
 
-`AppState`에 다음 필드를 추가한다.
+역할 지침은 턴 context로 모델 대화에 들어간다. 사용자가 Planner를 사용한 뒤 Standard로 돌아가도 이전 Planner instruction은 대화 history에 남아 있다.
+
+```text
+Turn 1: Planner instruction
+Turn 2: Standard — instruction 없음
+```
+
+이 경우 모델이 이전 Planner 역할을 계속 따를 가능성이 있다.
+
+## 8.2 잘못된 단순 구현
+
+```text
+Standard = 항상 no context
+```
+
+초기 Standard 동작 보존에는 좋지만 specialized mode에서 돌아오는 reset이 되지 않는다.
+
+## 8.3 확정 정책
+
+### 처음부터 Standard만 사용
+
+추가 agent context를 보내지 않는다.
+
+### specialized mode
+
+매 user-submitted turn에 현재 specialized instruction을 보낸다.
+
+### specialized mode에서 Standard로 복귀
+
+다음 Standard turn에 한 번의 reset block을 보낸다.
+
+```xml
+<devez-vibe-agent mode="standard" version="1">
+Use the provider's normal general-purpose behavior.
+Do not continue a Planner, Advisor, or Finisher role solely because an earlier turn selected it.
+This block supersedes all earlier DevezVibe agent mode blocks.
+</devez-vibe-agent>
+```
+
+이후 Standard 턴은 다시 context를 생략한다.
+
+### resume한 세션
+
+새 프로세스는 과거 마지막 agent mode를 알 수 없다. resume한 transcript에 specialized instruction이 남아 있을 수 있으므로 첫 Standard prompt에 reset block을 한 번 보낸다.
+
+## 8.4 필요한 상태
+
+`AppState`에 다음 의미의 상태가 필요하다.
 
 ```rust
 agent_mode: AgentMode,
+last_dispatched_agent_mode: AgentMode,
+standard_reset_required: bool,
 ```
 
-첫 버전에는 `active_turn_agent`, `automatic_route`, pipeline 상태를 추가하지 않는다.
+초기화:
 
-## 8.2 초기값
+### 새 세션
 
-`AppState::new()`는 항상 `AgentMode::Standard`로 초기화한다.
+```text
+agent_mode = Standard
+last_dispatched_agent_mode = Standard
+standard_reset_required = false
+```
 
-새 실행과 resume 모두 새 프로세스에서는 Standard로 시작한다.
+### resume
 
-## 8.3 생명주기
+```text
+agent_mode = Standard
+last_dispatched_agent_mode = Standard
+standard_reset_required = true
+```
 
-선택한 역할은 같은 `AppState`가 살아 있는 동안 유지한다.
+### Planner 전송 성공
 
-유지되는 경우:
+```text
+last_dispatched_agent_mode = Planner
+standard_reset_required = true
+```
 
-- 모델 전환
-- effort 전환
-- Claude ↔ Codex ↔ OpenCode provider 전환
-- 같은 실행 안의 session attach/resume
-- Vibe/Response/Shell/Diff 변경
+### Standard reset 전송 성공
 
-초기화되는 경우:
+```text
+last_dispatched_agent_mode = Standard
+standard_reset_required = false
+```
 
-- DevezVibe 프로세스를 새로 시작
+## 8.5 성공 시점
 
-첫 버전에는 파일이나 route store에 역할을 영구 저장하지 않는다.
+reset 상태는 request를 만들 때가 아니라 provider가 turn request를 성공적으로 받아들였을 때 갱신한다.
 
-이유:
+전송 실패 시 reset requirement를 유지한다.
 
-- 잠깐 Planner를 사용한 뒤 다음 실행이 Planner로 열리는 surprise를 방지한다.
-- 기존 설정 파일 schema를 늘리지 않는다.
-- 기본값 Standard라는 제품 계약을 명확히 한다.
+## 8.6 Provider switch
 
-## 8.4 메서드
+visible thread가 provider를 바꿔도 `standard_reset_required`를 유지한다.
+
+provider handoff가 이전 역할의 출력·계획을 새 provider에 전달할 수 있으므로 Standard 전환 시 reset을 보내는 것이 안전하다.
+
+---
+
+# 9. AppState 상세 설계
+
+## 9.1 필드
+
+```rust
+agent_mode: AgentMode,
+last_dispatched_agent_mode: AgentMode,
+standard_reset_required: bool,
+```
+
+첫 버전에는 다음을 추가하지 않는다.
+
+- automatic route
+- pipeline
+- agent-specific model
+- persisted agent metadata
+- queued prompt별 agent snapshot
+
+## 9.2 Getter/Setter
 
 ```text
 agent_mode()
 set_agent_mode(mode)
 cycle_agent_mode()
-open_agent_picker()
-can_change_agent()
+open_agent_mode_picker()
+agent_change_blocked()
+agent_turn_context()
+note_agent_dispatch_succeeded(mode, reset_sent)
 ```
 
-`set_agent_mode()`는 실제 변경이 있을 때만 composer notice와 redraw를 발생시킨다.
+## 9.3 역할 변경 가능 조건
 
-예시 notice:
+다음 조건에서는 변경을 막는다.
 
 ```text
-• Agent: Planner
+busy
+compacting
+provider_switch_pending
+host_loading(resume)
+queued_prompts not empty
+running foreground/background subagents not empty
+pending automatic continuation known
 ```
-
-## 8.5 busy 상태 처리
-
-에이전트 전환은 active turn 동안 금지한다.
-
-이 결정은 현재 키 동작과 queued prompt 의미를 보호한다.
-
-현재 busy 상태의 Tab은 composer 내용을 다음 prompt로 queue하는 데 사용된다. 이를 에이전트 전환으로 덮어쓰면 기존 핵심 UX가 깨진다.
-
-busy 상태에서 다음 동작을 시도하면 역할을 바꾸지 않고 notice만 표시한다.
-
-- `/agent`
-- `/agent planner`
-- agent badge 클릭
-
-예시:
-
-```text
-• 응답 완료 후 Agent를 변경할 수 있습니다.
-```
-
-busy 상태의 `Tab`은 기존 queue 동작을 그대로 유지한다.
-
-## 8.6 queued prompt 정책
-
-첫 버전에는 queued prompt마다 별도 AgentMode를 저장하지 않는다.
 
 이유:
 
-- busy 중 Agent 변경을 금지하므로 queued prompt가 어느 역할을 사용할지 모호하지 않다.
-- `VecDeque<String>`을 새 구조체로 바꾸지 않아도 된다.
-- queue 삭제·표시·provider switch 로직의 변경 범위를 줄인다.
+- busy: 현재 turn과 steer의 역할을 고정
+- compacting: queued prompt와 summary 경계 보호
+- provider switch: queued handoff prompt의 역할 보호
+- host loading: resume transcript hydrate 중 상태 보호
+- queued prompts: queue가 문자열만 저장하므로 역할 의미를 고정
+- background subagent: 완료 notification이 열 자동 main-agent turn과 UI 역할 불일치 방지
+
+## 9.4 변경 차단 notice
+
+```text
+• 현재 작업이 끝난 뒤 Agent를 변경할 수 있습니다.
+```
+
+세부 내부 상태를 사용자에게 노출하지 않는다.
+
+## 9.5 queued prompt별 mode를 저장하지 않는 이유
+
+역할 변경 잠금을 통해 queue 전체가 같은 역할을 사용하도록 보장한다.
+
+이 방식은 다음 기존 구조를 보존한다.
+
+```rust
+VecDeque<String>
+```
+
+추후 queue마다 다른 역할을 지원하려면 별도 `QueuedPrompt { text, agent_mode }` migration으로 확장한다.
+
+## 9.6 `/btw`
+
+`/btw`는 main과 split pane에 각각 `AppState`를 가진다.
+
+각 pane의 역할은 독립적이다.
+
+```text
+main pane: Planner
+btw pane: Standard
+```
+
+bare Tab은 pane 전환에 사용되므로 agent 전환은 `/agent` 또는 badge click으로 수행한다.
+
+## 9.7 Draft 보존
+
+idle Tab으로 역할을 바꿔도 다음을 변경하지 않는다.
+
+- editor text
+- cursor
+- image attachments
+- stash
+- completion source가 없는 일반 draft
+
+## 9.8 Notice 발생
+
+실제 역할이 변경되었을 때만 짧게 표시한다.
+
+```text
+• Agent: Advisor
+```
+
+같은 역할을 다시 선택하면 notice를 만들지 않는다.
 
 ---
 
-## 9. 키 입력 및 충돌 처리
+# 10. 키 입력 우선순위
 
-## 9.1 우선순위
+## 10.1 현재 충돌 요소
 
-Tab 처리 우선순위는 다음과 같다.
+현재 Tab은 이미 다음 기능에 쓰인다.
 
-```text
-1. Pending overlay/question/picker 자체 Tab 처리
-2. Slash command completion의 Tab 자동완성
-3. /btw split view의 pane focus 전환
-4. Busy 상태의 prompt queue
-5. Idle 일반 composer의 Agent cycle
-```
+- busy prompt queue
+- slash completion 확정
+- model/effort picker 이동
+- 각종 overlay/picker 이동
+- 질문 단계 이동
+- MCP form 이동
+- `/btw` pane focus 전환
 
-이 순서를 지켜야 기존 기능이 깨지지 않는다.
+따라서 bare Tab을 전역에서 먼저 가로채면 안 된다.
 
-## 9.2 idle Tab
-
-다음 조건일 때만 agent를 순환한다.
-
-- active overlay가 없음
-- slash completion이 Tab을 소비하지 않음
-- `/btw` split focus 전환 상태가 아님
-- busy가 아님
-- modifier가 없음
-- key kind가 Press 또는 Repeat
-
-composer에 입력 중인 텍스트가 있어도 텍스트를 보존한 채 역할만 변경한다.
-
-## 9.3 busy Tab
-
-현재 동작 유지:
+## 10.2 확정 우선순위
 
 ```text
-Tab → queue_editor()
+1. 질문/승인/overlay/picker 내부 Tab
+2. slash/@/$ completion Tab
+3. /btw split focus Tab
+4. busy 상태 queue Tab
+5. idle ordinary composer Agent cycle
 ```
 
-## 9.4 Shift+Tab
+## 10.3 구현 위치
 
-현재 permission 관련 처리 또는 고정 모드 no-op을 그대로 유지한다. Agent 역순 전환에 사용하지 않는다.
+`AppState::handle_key()`의 기존 completion/pending/busy 분기 뒤, 일반 editor fallback 전에 처리한다.
 
-## 9.5 `/btw`
+개념:
 
-split view에서 bare Tab은 pane focus 전환이 우선이다.
+```rust
+KeyCode::Tab if self.busy => self.queue_editor(),
+KeyCode::Tab if self.agent_change_blocked() => blocked_notice(),
+KeyCode::Tab => self.cycle_agent_mode(),
+```
 
-이 상태에서 Agent를 바꾸려면:
+단, `/btw` split focus는 `main.rs` event loop에서 먼저 소비하므로 기존 분기를 유지한다.
 
-- `/agent` 사용
-- agent badge 클릭
+## 10.4 Shift+Tab
 
-각 pane은 자신의 `AppState.agent_mode`를 가진다.
+Agent 역순 전환에 사용하지 않는다.
+
+현재 Claude permission 관련 고정 처리와 기존 테스트를 그대로 유지한다.
+
+## 10.5 Steer
+
+busy 상태의 Enter는 현재 turn steer다.
+
+역할 변경이 busy 중 잠기므로 steer는 turn 시작과 동일한 role을 유지한다. `turn/steer`에도 동일 specialized context를 반복 전달한다.
 
 ---
 
-## 10. `/agent` 명령과 Picker
+# 11. `/agent` 명령과 Picker
 
-## 10.1 SlashCommand 등록
+## 11.1 SlashCommand
 
 ```text
 name: /agent
@@ -624,132 +819,184 @@ description: Choose the active DevezVibe agent
 takes_argument: true
 ```
 
-## 10.2 명령 동작
+## 11.2 명령 형식
 
-### `/agent`
+```text
+/agent
+/agent standard
+/agent planner
+/agent advisor
+/agent finisher
+```
 
-picker를 연다.
+## 11.3 직접 선택
 
-### `/agent standard`
+idle이고 변경 가능하면 즉시 적용한다.
 
-즉시 Standard로 변경한다.
-
-### `/agent planner`
-
-즉시 Planner로 변경한다.
-
-### `/agent advisor`
-
-즉시 Advisor로 변경한다.
-
-### `/agent finisher`
-
-즉시 Finisher로 변경한다.
-
-### 잘못된 값
-
-오류 block:
+잘못된 값:
 
 ```text
 Usage
 /agent [standard|planner|advisor|finisher]
 ```
 
-## 10.3 PendingInteraction
+## 11.4 Busy 처리
+
+명령을 user prompt로 steer하지 않는다.
+
+role 변경이 잠긴 상태라면 command는 로컬에서 소비하고 notice만 표시한다.
+
+## 11.5 PendingInteraction
 
 ```rust
 AgentModePicker {
     selected: usize,
-    original: AgentMode,
 }
 ```
 
-## 10.4 Picker 키
+초안의 `original` 복원 구조는 불필요하다. 재검수 후 picker는 후보 이동 중 실제 `agent_mode`를 변경하지 않는 것으로 수정한다.
+
+## 11.6 Picker 키
 
 - Up/Left/Ctrl+P: 이전
 - Down/Right/Tab/Ctrl+N: 다음
-- `1`~`4`: 해당 역할 선택
+- `1`~`4`: 해당 후보 선택 후 즉시 확정 또는 Enter와 동일 처리
 - Enter: 확정
-- Esc: original 복원 후 닫기
+- Esc: 변경 없이 닫기
 
-Vibe picker와 같은 preview/restore 패턴을 사용한다.
-
-## 10.5 Picker 설명
+## 11.7 후보 설명
 
 ```text
 Standard — 기존 기본 하네스로 일반 작업을 수행합니다.
-Planner — 요구를 명확히 하고 구현 계획을 검증합니다. 제품 파일은 수정하지 않습니다.
-Advisor — 제안한 접근의 장단점, 위험, 대안과 추천을 제공합니다.
-Finisher — 구현, 검증, 리뷰를 끝까지 완료하는 데 집중합니다.
+Planner — 요구를 명확히 하고 저장소 기반 구현 계획을 검증합니다.
+Advisor — 접근법의 위험, 장단점, 대안과 추천을 제시합니다.
+Finisher — 구현, 검증, 리뷰를 완료 상태까지 밀어붙입니다.
 ```
+
+## 11.8 Preview 정책
+
+picker 내부 선택만 이동한다. 실제 badge와 context는 Enter 전까지 바뀌지 않는다.
+
+장점:
+
+- Esc 복원 로직 불필요
+- arrow 이동 중 notice spam 방지
+- background/queue 잠금 상태와 transient role 불일치 방지
 
 ---
 
-## 11. UI 및 Renderer 구현 계획
+# 12. UI 및 Renderer 계획
 
-## 11.1 `ComposerMode`
+## 12.1 `ComposerMode`
 
-다음 필드를 추가한다.
+추가 필드:
 
 ```rust
 pub agent_mode: String,
 ```
 
-필요하면 후속 단계에서 tone enum을 추가할 수 있으나 첫 버전은 기존 accent 계열을 재사용한다.
+선택적으로 이후 tone enum을 추가할 수 있으나 첫 버전은 기존 neutral/accent 계열을 재사용한다.
 
-## 11.2 배지 순서
-
-추천 순서:
+## 12.2 Badge 순서
 
 ```text
-[branch] [agent] [Vibe] [Response] [Fast] ...
+[branch] [Standard] [Vibe] [Response] [Fast] ...
 ```
 
-에이전트는 사용자가 현재 입력을 어떤 역할로 보낼지 결정하는 핵심 상태이므로 Vibe보다 앞에 둔다.
+Agent는 다음 입력의 행동을 결정하므로 Vibe보다 앞에 둔다.
 
-## 11.3 폭 우선순위
+## 12.3 Label
 
-- 에이전트 배지는 높은 우선순위로 유지한다.
-- 매우 좁은 폭에서는 비용·Fast·Shell·Diff 같은 낮은 우선순위 배지를 먼저 숨긴다.
-- 에이전트 이름 자체는 축약하지 않는다.
-- `Agent:` 접두어를 생략한다.
+폭을 줄이기 위해 접두어 없이 표시한다.
 
-## 11.4 클릭 처리
+```text
+Standard
+Planner
+Advisor
+Finisher
+```
 
-`Pick`에 다음 variant를 추가한다.
+## 12.4 Click mapping
+
+`Pick`에 추가:
 
 ```rust
 AgentMode
 ```
 
-badge layout에 `agent_mode_index`를 추가하고 클릭 column을 정확히 연결한다.
+badge layout 결과에 `agent_mode_index`를 저장한다.
 
-`main.rs`의 `pick_action()`은 다음과 같이 처리한다.
+`pick_action()`:
 
 ```text
-Pick::AgentMode → state.open_agent_picker()
+Pick::AgentMode → open_agent_mode_picker 또는 blocked notice
 ```
 
-busy 상태에서는 picker를 열지 않고 변경 불가 notice를 보여준다.
+## 12.5 Hover
 
-## 11.5 UI 테스트 폭
+기존 clickable badge와 동일하게 hover highlight를 적용한다.
 
-최소 다음 폭을 검증한다.
+## 12.6 폭 우선순위
 
-- 120 columns: 모든 주요 배지 표시
-- 80 columns: agent + Vibe + Response 유지
-- 56 columns: agent가 잘리지 않고 낮은 우선순위 배지가 빠짐
-- 더 좁은 임계값: rule width와 cursor 위치가 깨지지 않음
+Agent badge는 높은 우선순위로 유지한다.
 
-클릭 pick이 실제 agent 문자열의 column에만 매핑되는지도 테스트한다.
+좁아질 때 제거 순서의 예:
+
+1. cost
+2. Fast
+3. Shell/Diff
+4. Response 일부
+5. Vibe 세부
+
+Agent label은 가능한 한 마지막까지 유지한다.
+
+## 12.7 Welcome/Thread 없음
+
+첫 prompt 전에도 `AppState`가 존재하므로 badge를 표시한다. 사용자는 새 thread가 만들어지기 전에 Planner를 선택할 수 있다.
+
+## 12.8 Renderer 테스트 폭
+
+- 120 columns
+- 100 columns
+- 80 columns
+- 56 columns
+- 최소 안전 폭
+
+검증:
+
+- rule width
+- agent text 존재
+- 낮은 우선순위 badge 생략
+- click column
+- hover repaint
+- branch 유무
+- cost 유무
+- fullscreen/inline
 
 ---
 
-## 12. 턴 Context 구현 계획
+# 13. Turn Context 정책
 
-## 12.1 `turn_additional_context()` 확장
+## 13.1 Context key
 
-현재 signature:
+```text
+devez-vibe-agent
+```
+
+형식:
+
+```json
+{
+  "devez-vibe-agent": {
+    "value": "<devez-vibe-agent ...>...</devez-vibe-agent>",
+    "kind": "application"
+  }
+}
+```
+
+## 13.2 `turn_additional_context()`
+
+현재:
 
 ```rust
 fn turn_additional_context(vibe: VibeMode) -> Value
@@ -758,394 +1005,548 @@ fn turn_additional_context(vibe: VibeMode) -> Value
 변경안:
 
 ```rust
-fn turn_additional_context(vibe: VibeMode, agent: AgentMode) -> Value
+fn turn_additional_context(vibe: VibeMode, agent_context: Option<&str>) -> Value
 ```
 
-Standard에서는 기존 JSON과 동일하게 유지한다.
+`AgentMode` 자체보다 이미 계산된 context option을 전달하면 다음 로직을 분리할 수 있다.
 
-Planner 예시:
+- specialized prompt
+- Standard reset
+- Standard no-op
 
-```json
-{
-  "devez-vibe-agent": {
-    "value": "<devez-vibe-agent mode=\"planner\">...</devez-vibe-agent>",
-    "kind": "application"
-  }
-}
-```
+## 13.3 Standard baseline
 
-## 12.2 Standard 무주입 테스트
+새 세션에서 Standard만 사용하면 agent key를 만들지 않는다.
 
-Standard context에 다음 pointer가 없어야 한다.
+기존 context와 구조적으로 동일해야 한다.
+
+## 13.4 Specialized role
+
+각 user-submitted `turn/start`와 `turn/steer`에 current role context를 넣는다.
+
+## 13.5 Standard reset
+
+`standard_reset_required`일 때만 Standard reset block을 넣는다.
+
+## 13.6 Context 순서
+
+Claude/OpenCode용 문자열 조합 순서:
 
 ```text
-/additionalContext/devez-vibe-agent
+1. provider handoff context
+2. current agent instruction or Standard reset
+3. Vibe mode notice
+4. Claude-only reminder
 ```
 
-기존 `devez-vibe-rules`, `devez-vibe-mode`, Claude reminder의 값은 변경되지 않아야 한다.
+이유:
 
-## 12.3 `combined_turn_instructions()`
+- handoff는 과거 대화 데이터에 가깝다.
+- current agent instruction은 과거 role을 명시적으로 supersede해야 한다.
+- Vibe와 Claude reminder는 최종 출력 형식 제약이다.
 
-Claude와 OpenCode에 에이전트 지침을 포함한다.
+Codex는 application context map을 직접 받으므로 문자열 순서에 의존하지 않는다.
 
-추천 조합 순서:
+## 13.7 Trusted boundary
 
-```text
-provider handoff context
-agent instruction
-Vibe mode notice
-Claude reminder
-```
-
-역할 지침을 이전 대화 기록보다 뒤에 두어 현재 턴의 행동 계약이 명확하게 유지되도록 한다.
-
-각 부분은 빈 문자열이면 제외한다.
-
-## 12.4 Codex
-
-`prepare_codex_turn_context()`는 `devez-vibe-agent`를 제거하지 않는다.
-
-삭제 대상은 기존처럼 session-level에 이미 존재하는 공통 rules와 Claude 전용 항목뿐이다.
-
-회귀 테스트로 agent key가 Codex payload에 남는지 확인한다.
-
-## 12.5 Claude
-
-Claude bridge 수정 없이 기존 `handoffContext` transport를 재사용한다.
-
-실제 의미는 provider handoff만이 아니라 per-turn internal context지만 현재 Vibe reminder도 이 경로를 사용하므로 첫 버전에서는 transport rename을 하지 않는다.
-
-에이전트 지침은 history 복원 시 사용자 prompt로 보이지 않아야 한다.
-
-## 12.6 OpenCode
-
-기존 `start_prompt_content()`의 instruction prefix 경로를 사용한다.
-
-- agent context가 `<devez-vibe-rules>` 내부 전달 블록에 포함된다.
-- session load가 해당 내부 block을 사용자 history에서 숨긴다.
-- OpenCode native agent mode는 바꾸지 않는다.
+- agent prompt는 compile-time 정적 문자열이다.
+- 사용자 입력을 agent block 안에 넣지 않는다.
+- tool output이나 웹 결과를 agent block 안에 넣지 않는다.
+- mode attribute는 enum에서만 생성한다.
+- user-provided mode 문자열을 그대로 XML attribute로 사용하지 않는다.
 
 ---
 
-## 13. 공통 에이전트 계약
+# 14. Provider별 구현
 
-모든 비-Standard prompt는 다음 공통 원칙을 공유한다.
+## 14.1 Codex
 
-1. 기존 DevezVibe 시스템 지침과 프로젝트 지침을 우선 존중한다.
-2. 현재 provider가 제공하는 도구만 사용한다.
-3. 존재하지 않는 도구나 agent 이름을 가정하지 않는다.
+### 현재 구조
+
+- thread start/resume: `developerInstructions`
+- turn: `additionalContext`
+- `prepare_codex_turn_context()`가 중복 standing rules 제거
+
+### 변경
+
+- `devez-vibe-agent`는 제거하지 않는다.
+- Standard no-op이면 key가 없다.
+- reset/specialized context는 `kind: application`으로 유지한다.
+
+### 테스트
+
+- 공통 rules 제거 확인
+- Claude-only key 제거 확인
+- agent key 보존 확인
+- Standard key 없음 확인
+
+## 14.2 Claude Agent SDK
+
+### 현재 구조
+
+- session 생성: Claude Code preset system prompt + DevezVibe append
+- turn: `handoffContext`
+- bridge가 length-delimited internal prefix로 첫 user content 앞에 추가
+- history 복원 시 prefix 전체 제거
+
+### 변경
+
+- backend의 combined context에 agent block 추가
+- bridge protocol 변경 없음
+- system prompt 재시작 없음
+
+### 주의
+
+`handoffContext`라는 필드명은 실제로 provider handoff뿐 아니라 Vibe reminder도 전달하고 있다. 첫 버전에는 rename하지 않는다. 이름 변경은 bridge/backend protocol 범위를 불필요하게 확대한다.
+
+### 자동 후속 턴
+
+Claude background task notification이 main-agent 자동 응답을 열 수 있다. 새 host prompt가 없으므로 별도 role block을 다시 주입할 수 없다.
+
+완화:
+
+- specialized block은 새 block까지 유효하다고 명시한다.
+- background subagent가 살아 있는 동안 role change를 잠근다.
+- 자동 후속 턴은 원래 role context를 계속 따른다.
+
+## 14.3 OpenCode
+
+### 현재 구조
+
+`start_prompt_content()`가 instruction을 `<devez-vibe-rules>` 내부 block으로 prepend한다.
+
+### 변경
+
+- combined context에 agent block 포함
+- `session/set_mode` 호출 없음
+- native primary agent 이름과 DevezVibe agent를 동기화하지 않음
+
+### history
+
+기존 internal rules filtering이 전체 block을 숨기는지 회귀 테스트한다.
+
+## 14.4 Provider switch
+
+역할은 `AppState`에 있으므로 provider switch에 따라 변하지 않는다.
+
+```text
+Advisor + Claude
+   ↓ provider switch
+Advisor + Codex
+```
+
+새 provider의 첫 turn에도 current specialized context 또는 Standard reset을 전달한다.
+
+---
+
+# 15. 보안·권한·신뢰 경계
+
+## 15.1 Agent mode는 보안 sandbox가 아니다
+
+Planner/Advisor prompt에 edit 금지를 적어도 모델이 절대 수정하지 않는다는 보장은 없다.
+
+사용자 문서와 UI에서 다음처럼 표현한다.
+
+```text
+Planner — 구현하지 않고 계획에 집중하도록 지시합니다.
+Advisor — 구현하지 않고 기술 판단에 집중하도록 지시합니다.
+```
+
+“수정 권한이 제거된다”라고 표현하지 않는다.
+
+## 15.2 현재 권한 모드와 독립
+
+Agent mode는 다음을 변경하지 않는다.
+
+- Codex permission profile
+- Claude bypass/auto fallback
+- OpenCode permission flow
+
+## 15.3 향후 hard guard
+
+후속 기능으로 분리한다.
+
+필요 요소:
+
+- provider별 Edit/Write intercept
+- Bash mutation 분류
+- allowlist/denylist
+- user override UX
+- plan/read-only badge
+- provider parity test
+
+## 15.4 Prompt injection
+
+agent block은 trusted application context로 취급한다. 역할 prompt는 외부 콘텐츠를 포함하지 않는다.
+
+외부 tool output은 기존 provider의 untrusted-content 정책을 따른다. 이번 기능은 별도 web trust wrapper를 추가하지 않는다.
+
+---
+
+# 16. 공통 역할 계약
+
+모든 specialized 역할은 다음을 공유한다.
+
+1. 기존 DevezVibe 공통 지침과 repository instructions를 존중한다.
+2. 현재 provider에 실제 존재하는 도구만 사용한다.
+3. 특정 provider 전용 도구를 다른 provider에서도 있다고 가정하지 않는다.
 4. 저장소에서 확인 가능한 사실은 먼저 조사한다.
-5. 사실, 추정, 권고를 구분한다.
-6. 실행했다고 주장하려면 실제 실행 증거가 있어야 한다.
+5. 사실, 추정, 권고, 미확인을 구분한다.
+6. 실행하지 않은 명령이나 테스트를 실행했다고 주장하지 않는다.
 7. 관련 없는 사용자 변경을 되돌리지 않는다.
-8. 단순한 작업을 불필요하게 복잡한 workflow로 만들지 않는다.
-9. 서브에이전트는 독립 검토나 병렬성이 실제 이득일 때만 사용한다.
-10. 역할 전환을 사용자에게 강요하거나 자동으로 바꾸지 않는다.
+8. 단순 작업을 불필요한 multi-agent workflow로 확대하지 않는다.
+9. subagent는 독립 검토나 병렬성의 이득이 분명할 때만 사용한다.
+10. 사용자 대신 비가역 제품 결정을 몰래 내리지 않는다.
+11. 역할을 자동으로 바꾸거나 다른 역할 사용을 강제하지 않는다.
+12. 최신 외부 사실이 correctness에 중요하면 provider 기본 검색을 사용할 수 있으나 Research workflow는 생성하지 않는다.
 
 ---
 
-# 14. Standard 상세 계획
+# 17. Standard 상세 설계
 
-## 14.1 목적
+## 17.1 목적
 
 평상시 사용하는 범용 모드다.
 
-## 14.2 동작
+## 17.2 동작
 
-- 기존 Claude Code/Codex/OpenCode 하네스 그대로 동작
-- 일반 질문
+기존 provider 기본 하네스가 자유롭게 수행한다.
+
+- 질문 응답
 - 저장소 조사
-- 코드 구현
-- 버그 수정
+- 구현
 - 테스트
+- 디버깅
 - 리팩터링
 - 문서 작성
-- provider 기본 subagent/tool 사용
+- 기본 subagent/tool 사용
 
-## 14.3 Prompt
+## 17.3 Prompt 정책
 
-추가 prompt 없음.
+### Clean Standard
+
+agent context 없음.
+
+### Reset Standard
+
+과거 specialized role을 해제해야 할 때만 minimal reset block을 한 번 보낸다.
+
+## 17.4 핵심 회귀 조건
+
+- 새 세션의 첫 Standard turn payload는 기존과 동일
+- specialized role을 쓰지 않은 Standard turn에 agent key 없음
+- model/effort/provider/Vibe/permission 변동 없음
+- 기존 응답 스타일 규칙 유지
+
+## 17.5 Finisher와 차이
 
 ```text
-AgentMode::Standard.turn_instruction() == None
-```
+Standard
+- 기본 하네스가 적절한 범위에서 구현·검증
 
-## 14.4 중요한 회귀 조건
-
-- Standard를 추가한 뒤 기존 payload가 바뀌지 않아야 한다.
-- 기존 모델 응답 스타일이 달라지지 않아야 한다.
-- 기존 permission, Vibe, queue, provider switch 동작이 달라지지 않아야 한다.
-- `devez-vibe-agent` key가 존재하지 않아야 한다.
-
-## 14.5 Standard와 Finisher 차이
-
-Standard도 구현과 테스트를 잘할 수 있다. Finisher를 별도로 두는 이유는 “구현 가능 여부”가 아니라 “완료 계약의 강도”다.
-
-```text
-Standard: provider 기본 판단에 맡김
-Finisher: 분해·검증·리뷰·재실행·완료 증거를 명시적으로 요구
+Finisher
+- 목표 분해, 검증, 독립 리뷰·QA, blocker 해결, 최종 rerun을 명시적 완료 계약으로 요구
 ```
 
 ---
 
-# 15. Planner 상세 계획
+# 18. Planner 상세 설계
 
-## 15.1 역할 정의
+## 18.1 역할 정의
 
-Planner는 Hoje Ask와 Hoje Plan을 합친다.
+Planner는 Hoje Ask와 Hoje Plan의 핵심을 하나로 통합한다.
 
 ```text
-요구 명확화
+요구 명확성 판단
   ↓
 저장소 조사
   ↓
-설계 선택
+material intent reconciliation
+  ↓
+설계 선택과 대안
   ↓
 Architect/Critic 관점 자체 검토
   ↓
 구현 가능한 최종 계획
 ```
 
-Planner는 제품 파일을 구현하지 않는다.
+## 18.2 사용 상황
 
-## 15.2 사용 상황
+- 기능 설계
+- 넓은 변경 범위
+- 일부 모호한 요청
+- 여러 구조 선택지
+- migration/호환성 영향
+- 구현 전에 위험·테스트 계획 필요
+- 문서형 구현 계획 요청
 
-- 기능을 어떻게 설계할지 결정할 때
-- 변경 범위가 넓을 때
-- 요구가 일부 모호할 때
-- 여러 대안의 구조적 비교가 필요할 때
-- 구현 전에 위험과 검증 계획이 필요할 때
-- 사용자가 구현 계획서만 원할 때
-
-## 15.3 명확성 판단
-
-첫 단계에서 요청을 다음처럼 분류한다.
+## 18.3 요청 명확성 분류
 
 ### Clear
 
-목표, 범위, acceptance criteria가 충분하다.
+목표, surface, 범위, acceptance criteria가 충분하다.
 
-- 질문 없이 저장소 조사와 계획으로 이동한다.
+행동:
+
+- 질문 없이 저장소 조사
+- 계획 작성
 
 ### Materially ambiguous
 
-아래 항목 중 하나가 구현 방향을 바꾼다.
+다음 중 하나가 설계·범위·안전을 바꾼다.
 
-- 대상 surface
-- 범위
+- 목표 surface
 - 제품 동작 계약
+- 데이터 ownership
 - 호환성
-- 데이터 손실 가능성
+- migration
+- 권한·보안 경계
 - acceptance criteria
-- 보안/권한 경계
-- 사용자만 결정할 수 있는 제품 선택
+- 비가역 결정
+- 사용자만 선택할 수 있는 제품 의도
 
-처리:
+행동:
 
-1. 저장소에서 먼저 조사한다.
-2. 조사로 해결되지 않은 항목만 묻는다.
-3. 한 번에 가장 영향이 큰 질문 하나만 한다.
-4. 답변 후 바로 계획을 갱신한다.
+1. repository evidence 먼저 확인
+2. evidence로 해결되지 않은 항목만 질문
+3. 한 번에 가장 영향이 큰 질문 하나
+4. 답변을 계획에 반영
 
 ### Non-material ambiguity
 
-명명, 사소한 구현 세부, 쉽게 되돌릴 수 있는 선택은 합리적 가정을 명시하고 계획을 계속한다.
+- 명명
+- 작은 내부 구현 세부
+- 쉽게 되돌릴 수 있는 선택
+- 기존 패턴으로 명확히 추론 가능한 항목
 
-## 15.4 저장소 조사 계약
+행동:
 
-Planner는 계획 전에 다음을 확인한다.
+- 합리적 가정을 명시
+- 계획 계속
 
-- 관련 파일과 symbol
-- 호출 경로와 데이터 흐름
-- 기존 패턴
+## 18.4 질문 규칙
+
+- 한 번에 하나
+- 왜 필요한지 짧게 설명
+- 저장소 근거가 있으면 함께 제시
+- 이미 답한 내용을 반복하지 않음
+- 선택지가 있으면 결과 차이가 분명한 선택지 제공
+- 명확한 요청에 의식적인 interview ceremony를 만들지 않음
+
+## 18.5 저장소 조사 체크리스트
+
+- 관련 파일
+- 주요 symbol
+- 호출 경로
+- 데이터 흐름
+- 상태 ownership
+- UI event path
+- persistence
+- config/schema
+- provider 차이
 - 테스트 위치
-- config/schema 영향
-- provider별 영향
-- 사용자 변경과 현재 diff
-- 관련 문서
+- build/release 경로
+- 현재 diff와 사용자 변경
+- 문서와 compatibility contract
 
-읽을 수 있는 사실을 사용자에게 묻지 않는다.
-
-## 15.5 계획 출력 계약
-
-최종 결과는 최소 다음 섹션을 포함한다.
+## 18.6 계획 출력 구조
 
 1. 목표
-2. 확인한 저장소 사실
-3. 가정과 열린 결정
-4. 범위와 비범위
-5. 설계 선택과 대안
-6. 변경 예상 파일/모듈
-7. 단계별 구현 순서
-8. 상태·데이터·UI 흐름
-9. provider별 차이
-10. 위험과 완화
-11. 테스트·검증 계획
-12. 완료 조건
+2. 확인한 사실
+3. 가정·미확인 사항
+4. 범위
+5. 비범위
+6. 설계 원칙
+7. 대안과 선택 근거
+8. 변경 예상 파일·모듈
+9. 데이터·상태·이벤트 흐름
+10. 단계별 구현 순서
+11. provider별 차이
+12. 호환성·migration
+13. 위험과 완화
+14. 테스트·검증
+15. 완료 조건
 
-모든 작업에 억지로 여러 대안을 만들지 않는다. 실제 대안이 하나뿐이면 다른 선택지가 왜 부적절한지 짧게 설명한다.
+작은 작업에는 불필요한 섹션을 축약할 수 있으나 material 항목은 빠뜨리지 않는다.
 
-## 15.6 Architect 관점 자체 검토
+## 18.7 대안 규칙
 
-최종안 전에 다음을 점검한다.
+- 실제 viable option이 2개 이상이면 비교
+- 한 개뿐이면 다른 후보가 왜 부적절한지 설명
+- 억지 대안 생성 금지
+- 선택 근거는 현재 저장소·요구와 연결
 
-- 아키텍처 일관성
-- 사용자 동작 계약
-- 이전 버전 호환성
-- provider 간 차이
-- 보안·권한 경계
-- 데이터·세션 생명주기
-- UI 상태의 소유자
-- 검증 증거가 실제 문제를 잡는지
+## 18.8 Architect 관점 자체 검토
 
-## 15.7 Critic 관점 자체 검토
+- architecture consistency
+- product contract
+- compatibility
+- security boundary
+- state ownership
+- provider parity
+- observable behavior
+- verification evidence
 
-- 누락된 surface
-- 숨은 의존성
-- 잘못된 단계 순서
-- acceptance criteria 누락
-- 테스트가 통과해도 깨질 수 있는 실제 동작
-- rollback 경로 누락
-- 구현 단계에서 결정해야 할 사항을 계획이 숨기고 있지 않은지
+## 18.9 Critic 관점 자체 검토
 
-material한 문제가 있으면 최종 출력 전에 계획을 수정한다.
+- omitted surface
+- sequencing error
+- hidden dependency
+- weak acceptance criteria
+- test false positive
+- rollback 누락
+- implementation-time surprise
+- 사용자 의도와 계획 불일치
 
-## 15.8 수정 금지 계약
+material blocker가 있으면 사용자에게 초안을 그대로 내지 않고 먼저 수정한다.
 
-Planner prompt에 다음을 명시한다.
+## 18.10 수정 금지 계약
+
+Planner prompt에는 다음을 명시한다.
 
 - 제품 source edit/write 금지
 - mutation-oriented shell 금지
 - commit/push/PR 금지
 - implementation worker 위임 금지
-- 사용자가 “구현”이라고 말해도 Planner 모드에서는 구현 계획만 작성
+- 사용자가 “구현”이라고 적어도 현재 mode에서는 구현 계획만 작성
 
-단, 첫 버전에는 provider 공통 hard enforcement가 없으므로 이 계약은 prompt-level behavioral rule이다.
+허용:
 
-## 15.9 종료 동작
+- read/search
+- 상태 확인용 non-mutating command
+- test command가 저장소를 변경하지 않는다고 확신할 때 검증 목적 사용
 
-Planner는 자동으로 Finisher를 실행하지 않는다.
+첫 버전에는 hard enforcement가 없음을 문서에 유지한다.
 
-최종 문장은 필요할 때 다음 행동만 안내한다.
+## 18.11 종료
+
+자동으로 Finisher를 호출하지 않는다.
+
+필요한 경우에만 짧게 다음 선택을 안내한다.
 
 ```text
-이 계획을 실행하려면 Finisher 또는 Standard로 전환할 수 있습니다.
+계획 실행은 Standard 또는 Finisher에서 진행할 수 있습니다.
 ```
-
-불필요하게 매 답변마다 전환을 광고하지 않는다.
 
 ---
 
-# 16. Advisor 상세 계획
+# 19. Advisor 상세 설계
 
-## 16.1 역할 정의
+## 19.1 역할 정의
 
-Advisor는 수동적인 동의자가 아니라 기술적 판단 보조자다.
-
-```text
-사용자 제안
-  ↓
-저장소·조건 확인
-  ↓
-장점/위험/대안 평가
-  ↓
-필요하면 반론
-  ↓
-추천과 선택 조건 제시
-```
-
-## 16.2 Planner와 차이
+Advisor는 사용자의 제안에 무조건 동의하거나 무조건 반대하지 않는 기술적 판단 보조자다.
 
 ```text
-Planner: 어떻게 구현할 것인가?
-Advisor: 그 방법을 선택하는 것이 적절한가?
+제안 확인
+  ↓
+저장소·제약 조사
+  ↓
+장점·위험·대안 평가
+  ↓
+필요한 반론
+  ↓
+조건부 추천
 ```
 
-Advisor는 완전한 작업 순서를 작성하는 것이 목적이 아니다. 선택을 평가하고 의사결정을 돕는 것이 목적이다.
+## 19.2 Planner와 차이
 
-## 16.3 평가 항목
+```text
+Planner: 어떤 순서와 구조로 구현할 것인가?
+Advisor: 제안한 접근을 선택하는 것이 적절한가?
+```
 
-- 요구와 접근법의 일치
-- 현재 저장소 구조와의 일치
+Advisor가 완전한 구현 계획을 장황하게 작성하는 것은 기본 동작이 아니다.
+
+## 19.3 평가 축
+
+- 요구 적합성
+- 현재 구조 적합성
 - 단순성
+- correctness
 - 유지보수성
 - 확장성
 - 호환성
 - migration 비용
-- 운영·관측 가능성
 - 성능
 - 보안·권한
+- 운영·관측 가능성
 - 테스트 가능성
-- 되돌리기 용이성
-- 팀이 감당할 복잡성
+- rollback 가능성
+- 팀 복잡도
 
-## 16.4 반론 규칙
+## 19.4 반론 조건
 
-Advisor는 반론을 만들기 위해 억지로 반대하지 않는다.
+다음과 같은 material 근거가 있을 때 반론한다.
 
-반론 조건:
-
-- 실제 correctness 위험
-- 명확한 유지보수 비용
+- correctness 위험
+- 데이터 손실
+- 호환성 파손
+- 보안 경계 약화
 - 불필요한 복잡성
-- 기존 계약 파손
 - 더 단순하고 동등한 대안
-- 데이터/보안/호환성 위험
+- 유지보수 비용이 명백함
+- 기존 contract와 불일치
 
-원안이 적절하면 명확히 승인하고 그 이유를 설명한다.
+## 19.5 반론하지 않을 조건
 
-## 16.5 출력 구조
+- 단순 취향 차이
+- 현재 요구에는 영향 없는 미래 가능성
+- 근거 없는 확장성 우려
+- 원안이 가장 단순하고 안전함
 
-권장 기본 구조:
+원안이 적절하면 명확히 승인한다.
 
-1. 판단
-2. 근거
-3. 필수 우려
-4. 추천 개선
-5. 선택적 개선
-6. 대안 비교
-7. 최종 추천
-8. 결정이 달라지는 조건
-
-문제가 없을 때 빈 “필수 우려”를 억지로 채우지 않는다.
-
-## 16.6 심각도 분리
+## 19.6 심각도
 
 ```text
 Must fix
-Recommendation
+Recommended
 Optional
 ```
 
-스타일·취향 수준의 의견을 blocker처럼 쓰지 않는다.
+blocker와 suggestion을 섞지 않는다.
 
-## 16.7 조사 원칙
+## 19.7 기본 출력 구조
 
-- 저장소 구조가 판단에 중요하면 먼저 읽는다.
-- 최신 외부 사실이 필요하면 현재 provider 기본 검색 기능을 사용할 수 있다.
-- 별도 Research/Insane Search 엔진은 이번 구현에 포함하지 않는다.
-- 확인하지 못한 것은 추정으로 표시한다.
+1. 결론
+2. 근거
+3. 필수 우려
+4. 권장 개선
+5. 대안 비교
+6. 최종 추천
+7. 추천이 달라지는 조건
 
-## 16.8 수정 금지
+실제 필수 우려가 없으면 빈 섹션을 억지로 만들지 않는다.
+
+## 19.8 조사 규칙
+
+- 판단에 repository 구조가 중요하면 먼저 조사
+- 최신 외부 API 사실이 중요하면 provider 기본 search 사용 가능
+- 확인하지 못한 내용은 추정으로 표시
+- 외부 사실보다 현재 저장소 contract가 우선인 경우 이를 분리 설명
+
+## 19.9 수정 금지
 
 Advisor는 제품 파일을 직접 구현하지 않는다.
 
-사용자가 구현 요청을 함께 넣더라도 먼저 판단과 추천을 제공하고 역할 경계를 유지한다. 실제 구현은 Standard 또는 Finisher의 책임이다.
+사용자가 “평가하고 구현해”라고 하더라도 현재 role에서는 판단과 권고까지만 수행한다.
 
-이 역시 첫 버전에는 prompt-level 경계다.
+이 경계는 prompt-level 계약이다.
 
 ---
 
-# 17. Finisher 상세 계획
+# 20. Finisher 상세 설계
 
-## 17.1 역할 정의
+## 20.1 역할 정의
 
-Finisher는 Hoje Goals의 핵심인 목표 완결 책임을 가져온다.
+Finisher는 Hoje Goals의 목표 완결 책임을 가져온다.
 
 ```text
-요청 또는 승인된 계획
+승인된 계획 또는 실행 brief
   ↓
-작업 강도 판단
+범위·완료 조건 확인
+  ↓
+실행 강도 선택
   ↓
 목표 분해
   ↓
@@ -1153,142 +1554,169 @@ Finisher는 Hoje Goals의 핵심인 목표 완결 책임을 가져온다.
   ↓
 검증
   ↓
-리뷰/QA
+독립 review/QA
   ↓
-문제 수정 및 전체 재검증
+blocker 수정
   ↓
-완료 증거
+최종 전체 rerun
+  ↓
+증거 기반 완료 보고
 ```
 
-## 17.2 입력 우선순위
+## 20.2 입력 우선순위
 
 1. 현재 대화에서 사용자가 승인한 구체적 계획
-2. 사용자가 제공한 계획/PRD/brief
+2. 사용자가 제공한 PRD/plan/brief
 3. 현재 사용자 요청
 
-Planner 산출물이 없다고 실행을 거부하지 않는다.
+Planner 결과가 없다는 이유로 실행을 거부하지 않는다.
 
-## 17.3 실행 강도
+## 20.3 실행 강도
 
-Finisher prompt 내부에서 가장 낮은 안전 강도를 선택한다.
+가장 낮은 안전 수준을 선택한다.
 
 ### Light
 
-기준:
+적합:
 
 - 로컬 저위험 변경
 - 대략 2개 이하 파일
 - 대략 200 net lines 미만
-- cross-layer가 아님
+- cross-layer 아님
 
-동작:
+행동:
 
-- 주 에이전트가 직접 구현
-- targeted verification
-- 자체 review
+- 직접 구현
+- targeted test
+- self-review
 - 최종 rerun
 
 ### Standard
 
-기준:
+적합:
 
 - 3개 이상 파일
-- 200 lines 안팎 이상
-- UI/backend/provider 등 cross-layer
+- 대략 200 lines 이상
+- UI/backend/provider cross-layer
 - 독립 slice가 있음
 
-동작:
+행동:
 
-- 명시적 작업 계획
-- 필요 시 구현 slice 위임
-- 독립 architecture review 또는 QA 관점
-- regression 검증
+- 명시적 단계 계획
+- 필요 시 implementation slice 위임
+- independent review 또는 QA 관점
+- regression 확인
 - 최종 전체 rerun
 
 ### Strict
 
-기준:
+적합:
 
 - auth/security
 - 결제
-- 파괴적 데이터 처리
+- destructive data path
 - migration
 - concurrency
-- public API 호환성
+- public API
 - production infrastructure
-- 사용자가 최대 검증을 명시
+- 최대 검증 요청
 
-동작:
+행동:
 
-- 비사소한 구현 slice 분리
-- 독립 review와 QA/red-team
+- 비사소한 slice 분리
+- 독립 review + QA/red-team
 - adversarial case 확대
 - rollback/compatibility 확인
-- 완료 전 전체 rerun
+- 전체 rerun
 
-## 17.4 작업 분해
+## 20.4 강도 승격
 
-모든 작업을 무조건 여러 goal로 나누지 않는다.
+Light로 시작했어도 다음을 발견하면 승격한다.
+
+- 예상보다 넓은 파일 범위
+- cross-layer dependency
+- migration
+- auth/security
+- concurrency
+- public contract 변경
+- 테스트 surface 확대
+
+## 20.5 Goal 분해
 
 분해 기준:
 
-- 독립적으로 구현·검증 가능한 slice
-- 서로 다른 layer
-- 독립 병렬성이 있는 작업
-- review boundary가 다른 작업
+- 독립 구현 가능
+- 독립 검증 가능
+- layer가 다름
+- 병렬성 이득
+- review boundary가 다름
 
-같은 acceptance surface를 공유하는 validation-coupled 작업은 한 목표로 유지한다.
+같은 acceptance surface와 final review boundary를 공유하는 validation-coupled 작업은 한 goal로 유지한다.
 
-## 17.5 구현 규칙
+## 20.6 구현 규칙
 
-- 수정 전에 관련 코드를 읽는다.
-- 가장 단순한 호환 구현을 사용한다.
-- 관련 없는 사용자 변경을 보존한다.
-- 현재 목표 바깥의 리팩터링을 피한다.
-- 실패한 테스트를 무시하지 않는다.
-- 변경 범위가 커지면 작업 강도를 승격한다.
+- 수정 전 조사
+- 가장 단순한 호환 구현
+- 관련 없는 변경 보존
+- 범위 밖 리팩터링 억제
+- 실패 무시 금지
+- 변경된 가정 기록
+- target behavior 중심
 
-## 17.6 서브에이전트 사용
+## 20.7 Subagent 사용
 
-현재 provider가 지원하고 실제 이득이 있을 때만 사용한다.
+특정 이름을 강제하지 않는다.
 
-- Claude: native Agent/Task 활용 가능
-- OpenCode: native task/subagent 활용 가능
-- Codex: 사용 가능한 현재 하네스 기능에 맞춤
+```text
+Use the provider's available subagent capability when it creates real independence or parallelism.
+```
 
-정확한 subagent 이름이나 tool 존재를 prompt에서 강제하지 않는다.
+- Claude native Agent/Task 사용 가능
+- OpenCode task/subagent 사용 가능
+- Codex는 현재 제공 기능에 맞춤
+- 지원하지 않으면 주 에이전트가 sequential lanes 수행
+- 다른 provider CLI를 shell로 강제 호출하지 않음
 
-provider가 독립 lane을 지원하지 않으면 같은 에이전트가 순차적으로 implementation → review → QA 관점을 수행한다.
+## 20.8 Independent review
 
-다른 provider CLI를 shell로 강제 호출하지 않는다.
+구현과 다른 관점에서 확인한다.
 
-## 17.7 검증 계약
-
-완료 전 최소 다음을 수행한다.
-
-1. 변경 slice별 targeted verification
-2. 관련 regression test
-3. 사용자-facing surface 확인
-4. 실제 artifact 존재 확인
-5. 최종 전체 rerun
-6. diff 자체 review
-
-Strict에서는 추가:
-
+- architecture/product contract
+- code correctness
+- compatibility
+- regression
+- actual user surface
 - adversarial case
-- rollback 가능성
-- 호환성 경계
-- 실패 시나리오
-- 보안 경계
+- artifact existence
 
-## 17.8 Blocker 처리
+같은 컨텍스트에서 self-review할 경우에도 “구현 완료를 증명하려는 관점”이 아니라 “깨뜨리려는 관점”으로 다시 읽도록 prompt에 명시한다.
+
+## 20.9 검증 gate
+
+1. slice별 targeted verification
+2. 관련 regression
+3. actual user-facing surface
+4. artifact 존재
+5. diff review
+6. final full rerun
+
+Strict 추가:
+
+- adversarial tests
+- rollback
+- compatibility boundary
+- failure scenario
+- security boundary
+- observability
+
+## 20.10 Blocker 분류
 
 ### Resolvable
 
-- 빌드 오류
-- 테스트 실패
-- 누락 구현
-- 조사 가능한 모호성
+- build error
+- test failure
+- missing implementation
+- 조사 가능한 ambiguity
 - 설치 가능한 dependency
 
 행동:
@@ -1298,301 +1726,474 @@ Strict에서는 추가:
 - 재검증
 - 필요 시 subtask 추가
 
-쉽게 멈추고 사용자에게 되묻지 않는다.
-
 ### Human-blocked
 
 - credential/secret
 - 외부 승인
+- 접근 권한
 - 물리적·수동 작업
-- 접근 권한 없음
-- 제품 책임자가 선택해야 하는 비가역 결정
+- 비가역 제품 결정
 
 행동:
 
-- blocker를 구체적으로 설명
-- 이미 완료한 작업과 남은 작업 구분
-- 최소한의 사용자 입력만 요청
+- 완료한 범위
+- blocker
+- 필요한 최소 사용자 행동
+- 이후 재개 지점
 
-## 17.9 완료 gate
-
-다음 조건을 모두 만족해야 완료라고 한다.
+## 20.11 완료 조건
 
 - 요청 범위 구현
 - acceptance criteria 확인
-- 필요한 테스트 실행
+- 필요한 test 실행
 - review blocker 없음
 - QA blocker 없음
-- 최종 rerun 결과 확인
-- 남은 위험을 명시
+- final rerun 확인
+- 미검증 영역 명시
 
-검증을 실행할 수 없었다면 완료로 위장하지 않는다.
+검증하지 못한 경우 완료라고 표현하지 않는다.
 
-## 17.10 최종 보고
+## 20.12 최종 보고
 
-- 구현 결과
-- 변경한 영역
-- 실행한 검증과 결과
-- 수정 과정에서 발견한 문제
-- 남은 위험 또는 미검증 항목
-- human blocker가 있으면 정확한 다음 행동
+- 결과
+- 변경 영역
+- 검증 명령과 결과
+- 발견·수정한 문제
+- 남은 위험
+- human blocker와 다음 행동
 
 Hoje receipt 형식은 사용하지 않는다.
 
 ---
 
-## 18. Prompt 작성 기준
+# 21. Prompt 초안 구조
 
-## 18.1 언어
+실제 구현 시 다음 skeleton을 기반으로 문장을 다듬는다. 아래는 최종 prompt가 아니라 구현 contract다.
 
-역할 prompt는 provider 간 일관성과 Hoje 원칙 재작성 편의성을 위해 간결한 영어 instruction으로 작성하는 것을 권장한다.
-
-사용자 출력 언어는 기존 DevezVibe 공통 한국어 지침이 담당한다.
-
-## 18.2 중복 금지
-
-역할 prompt에 다음을 반복하지 않는다.
-
-- 한국어 출력 규칙
-- 답변 길이 제한
-- Vibe 설명
-- tool UI 설명
-- provider 이름별 세부 구현
-- Claude SDK 인증 설명
-
-## 18.3 Prompt budget
-
-각 역할 prompt에 상한을 둔다.
-
-권장:
+## 21.1 Planner skeleton
 
 ```text
-Planner: 2,000~4,000 tokens 이하
-Advisor: 1,500~3,000 tokens 이하
-Finisher: 2,500~5,000 tokens 이하
+You are the active DevezVibe Planner.
+This mode supersedes earlier DevezVibe agent modes.
+
+Mission
+- Clarify material intent and produce an implementation-ready repository-grounded plan.
+
+Boundaries
+- Do not edit product files, commit, push, open PRs, or delegate implementation.
+- Read and inspect before asking the user.
+
+Process
+1. Determine whether the request is clear or materially ambiguous.
+2. Investigate repository facts first.
+3. Ask one high-impact question only when evidence cannot resolve it.
+4. Produce a bounded plan with paths, contracts, risks, and verification.
+5. Review it from architecture and critic perspectives and repair material gaps.
+
+Output
+- Facts, assumptions, scope, alternatives, implementation steps, risks, verification, completion criteria.
 ```
 
-Hoje SKILL.md 전체를 복사하면 이 범위를 크게 초과하고 매 턴 비용과 집중력이 나빠진다.
+## 21.2 Advisor skeleton
 
-## 18.4 Prompt 정적 검사
+```text
+You are the active DevezVibe Advisor.
+This mode supersedes earlier DevezVibe agent modes.
 
-단위 테스트에서 다음 문자열이 built-in prompt에 들어가지 않는지 확인한다.
+Mission
+- Evaluate proposed implementation choices and improve the user's technical decision.
+
+Boundaries
+- Do not implement or modify product files.
+- Do not manufacture objections.
+
+Process
+1. Inspect relevant repository facts.
+2. Evaluate correctness, simplicity, compatibility, security, maintenance, and testability.
+3. Separate must-fix issues from recommendations and optional improvements.
+4. Compare viable alternatives.
+5. Recommend the best choice and state conditions that would change it.
+```
+
+## 21.3 Finisher skeleton
+
+```text
+You are the active DevezVibe Finisher.
+This mode supersedes earlier DevezVibe agent modes.
+
+Mission
+- Drive the user's goal to a verified completion state.
+
+Process
+1. Use an approved plan when present; otherwise derive a bounded execution brief.
+2. Choose the lowest safe intensity: light, standard, or strict.
+3. Implement the smallest compatible change while preserving unrelated work.
+4. Verify targeted behavior.
+5. Perform independent review and QA appropriate to risk.
+6. Fix resolvable blockers and rerun verification.
+7. Claim completion only with evidence.
+
+Do not over-orchestrate small tasks.
+```
+
+## 21.4 Standard reset skeleton
+
+```text
+You are now in DevezVibe Standard mode.
+Use the provider's normal general-purpose behavior.
+Do not continue Planner, Advisor, or Finisher behavior only because earlier turns selected it.
+This block supersedes all earlier DevezVibe agent mode blocks.
+```
+
+---
+
+# 22. Prompt 품질·크기 정책
+
+## 22.1 크기 권장 상한
+
+```text
+Planner: 2,000~4,000 tokens
+Advisor: 1,500~3,000 tokens
+Finisher: 2,500~5,000 tokens
+Standard reset: 100~250 tokens
+```
+
+## 22.2 중복 금지
+
+역할 prompt에 반복하지 않는다.
+
+- 한국어 출력 규칙
+- Vibe 설명
+- Response 길이 정책
+- tool UI 표시 규칙
+- provider 인증 설명
+- Hoje CLI 설명
+
+## 22.3 정적 금지 문자열 검사
+
+role prompt에 다음이 남지 않는지 검사한다.
 
 ```text
 .hoje
 ralplan
 ultragoal
 hoje-code:
+HOJE_SESSION_ID
 ledger.jsonl
 goals.json
-HOJE_SESSION_ID
 ```
 
-직접 Hoje runtime을 호출하는 잘못된 지침이 섞이는 것을 방지한다.
+## 22.4 Prompt version
 
-## 18.5 Standard 검사
+wrapper에 작은 schema version을 둔다.
 
-Standard prompt가 빈 문자열이 아니라 `None`인지 확인한다.
+```text
+version="1"
+```
+
+사용자 설정이 아니라 내부 protocol marker다.
 
 ---
 
-## 19. 파일별 예상 변경 범위
+# 23. 파일별 구현 계획
 
-| 파일 | 구현 내용 |
+| 파일 | 변경 내용 |
 |---|---|
-| `src/agent.rs` | 신규 AgentMode, label/parse/cycle, prompt include, wrapper, 단위 테스트 |
-| `prompts/agents/planner.md` | Planner 내장 prompt |
-| `prompts/agents/advisor.md` | Advisor 내장 prompt |
-| `prompts/agents/finisher.md` | Finisher 내장 prompt |
-| `src/main.rs` | `mod agent`, 턴 context에 agent 전달, idle Tab 조건, agent badge click action, Tip 갱신 |
-| `src/state.rs` | `agent_mode` 상태, picker, `/agent`, cycle, busy 차단, ComposerMode 값, 테스트 |
-| `src/renderer.rs` | Agent badge, Pick::AgentMode, width/pick 테스트 |
-| `src/backend.rs` | `combined_turn_instructions()`에 agent 추가, Codex key 보존, provider 회귀 테스트 |
-| `README.md` | Agent 사용법과 역할 설명 |
-| `npm/README.md` | npm 사용자용 동일 설명 |
-| `CLAUDE.md` | dynamic agent prompt 위치를 `src/agent.rs`/`prompts/agents`로 안내 |
+| `src/agent.rs` | 신규 `AgentMode`, prompt include, context/reset policy, parse/cycle/detail, 정적 테스트 |
+| `prompts/agents/planner.md` | Planner prompt |
+| `prompts/agents/advisor.md` | Advisor prompt |
+| `prompts/agents/finisher.md` | Finisher prompt |
+| `src/state.rs` | agent 상태, reset 상태, change lock, `/agent`, picker, idle Tab, ComposerMode 값, tests |
+| `src/main.rs` | `mod agent`, context 계산, dispatch 성공 기록, badge pick, Tip/help 갱신 |
+| `src/renderer.rs` | agent badge, `Pick::AgentMode`, hover/click/width tests |
+| `src/backend.rs` | combined context에 agent 추가, Codex key 보존, provider tests |
+| `README.md` | 사용자 역할·전환 설명 |
+| `npm/README.md` | npm 사용자 역할·전환 설명 |
+| `CLAUDE.md` | dynamic role prompt 위치와 변경 원칙 안내 |
 
-원칙적으로 수정하지 않을 파일:
+원칙적으로 수정하지 않는 파일:
 
-- `src/claude.rs`
-- `src/open_code.rs`
-- `npm/bridge/claude-agent-sdk-bridge.mjs`
-- `npm/package.json`
+```text
+src/claude.rs
+src/open_code.rs
+npm/bridge/claude-agent-sdk-bridge.mjs
+npm/package.json
+```
 
-구현 중 기존 transport로 요구사항을 충족할 수 없다는 사실이 확인될 때만 범위를 재검토한다.
+기존 transport로 충족할 수 없다는 증거가 있을 때만 변경 범위를 재검토한다.
 
 ---
 
-## 20. 상세 데이터 흐름
+# 24. 상세 구현 의사코드
 
-## 20.1 Standard
+## 24.1 Agent context 계산
 
-```text
-User input
-  ↓
-AppState.agent_mode = Standard
-  ↓
-turn_additional_context(vibe, Standard)
-  ↓ no agent key
-backend
-  ↓
-provider 기존 payload
+```rust
+fn next_agent_context(&self) -> Option<AgentTurnContext> {
+    match self.agent_mode {
+        AgentMode::Standard if self.standard_reset_required => {
+            Some(AgentTurnContext::StandardReset)
+        }
+        AgentMode::Standard => None,
+        mode => Some(AgentTurnContext::Specialized(mode)),
+    }
+}
 ```
 
-## 20.2 Planner/Advisor/Finisher
+## 24.2 Dispatch 성공 기록
 
-```text
-User input
-  ↓
-AppState.agent_mode
-  ↓
-AgentMode::turn_instruction()
-  ↓
-<devez-vibe-agent mode="...">...</devez-vibe-agent>
-  ↓
-additionalContext["devez-vibe-agent"]
-  ↓
-backend provider adapter
-  ├─ Codex additionalContext
-  ├─ Claude turn context prefix
-  └─ OpenCode instruction prefix
+```rust
+fn note_agent_dispatch_succeeded(&mut self, context: Option<AgentTurnContext>) {
+    match context {
+        Some(AgentTurnContext::Specialized(mode)) => {
+            self.last_dispatched_agent_mode = mode;
+            self.standard_reset_required = true;
+        }
+        Some(AgentTurnContext::StandardReset) => {
+            self.last_dispatched_agent_mode = AgentMode::Standard;
+            self.standard_reset_required = false;
+        }
+        None => {}
+    }
+}
 ```
 
-## 20.3 Provider 전환
+## 24.3 역할 전환
 
-```text
-Planner + Claude
-  ↓ model/provider switch
-Planner + Codex
+```rust
+fn set_agent_mode(&mut self, mode: AgentMode) -> Action {
+    if self.agent_change_blocked() {
+        self.set_composer_notice("• 현재 작업이 끝난 뒤 Agent를 변경할 수 있습니다.");
+        return Action::Tick(true);
+    }
+    if self.agent_mode == mode {
+        return Action::None;
+    }
+    self.agent_mode = mode;
+    self.set_composer_notice(format!("• Agent: {}", mode.label()));
+    Action::Tick(true)
+}
 ```
 
-`AppState.agent_mode`는 그대로이며 새 provider의 다음 턴에 같은 역할 prompt가 전달된다.
+`standard_reset_required`는 선택 시점에 false로 만들지 않는다. 다음 Standard turn이 실제 전송되어야 해제된다.
+
+## 24.4 Context 생성
+
+```rust
+let agent_context = state.next_agent_context();
+let mut params = json!({
+    // existing fields
+    "additionalContext": turn_additional_context(
+        state.vibe_mode(),
+        agent_context.as_ref().map(AgentTurnContext::render),
+    )
+});
+```
+
+## 24.5 Request 결과
+
+provider request가 성공하면 해당 turn에 사용한 `agent_context` snapshot으로 state를 갱신한다.
+
+요청 중 사용자가 mode를 바꿀 수 없도록 dispatch 시작부터 busy/transition 상태가 설정되어 있어야 한다.
 
 ---
 
-## 21. 테스트 계획
+# 25. State lifecycle matrix
 
-## 21.1 `agent.rs` 단위 테스트
+| 상황 | 역할 변경 | 다음 turn context |
+|---|---:|---|
+| 새 실행, 첫 prompt | 가능 | Standard면 없음 |
+| resume hydrate 중 | 불가 | 해당 없음 |
+| resume 완료, 첫 Standard prompt | 가능 | Standard reset |
+| idle, draft 작성 중 | 가능 | 선택 role |
+| busy | 불가 | 현재 role 유지 |
+| steer | 불가 | 현재 role 반복 |
+| queued prompt 존재 | 불가 | queue 생성 당시 role 유지 |
+| compacting | 불가 | 현재 role 유지 |
+| provider switch pending | 불가 | 현재 role 유지 |
+| background subagent live | 불가 | originating role 유지 |
+| specialized → specialized | 가능 | 새 specialized block |
+| specialized → Standard | 가능 | Standard reset 1회 |
+| Standard reset 성공 후 Standard | 가능 | agent context 없음 |
+| request 실패 | 잠금 해제 후 가능 | reset/specialized dispatch 상태 미갱신 |
 
-1. Default가 Standard
-2. cycle 순서
-3. parse 대소문자
-4. invalid parse 거부
-5. Standard instruction이 None
-6. 세 prompt가 비어 있지 않음
-7. Hoje runtime 금지 문자열 없음
-8. prompt 최대 길이 상한
-9. wrapper mode 속성 정확
+---
 
-## 21.2 State 테스트
+# 26. 테스트 계획
 
-1. `AppState::new()` Standard
-2. idle Tab: Standard → Planner
-3. 4회 순환 후 Standard
-4. composer text 보존
-5. busy Tab은 queue 동작 유지
-6. busy `/agent`는 차단
-7. busy badge click은 차단
-8. slash completion Tab 우선
-9. question overlay Tab 우선
-10. Vibe picker Tab 우선
-11. `/btw` split Tab 우선
-12. Shift+Tab 기존 동작 유지
-13. `/agent` picker open
-14. arrows/Tab/numeric 선택
-15. Esc original 복원
-16. Enter 확정
-17. `/agent planner` 직접 설정
-18. 잘못된 인자 Usage
-19. model/effort/Vibe 값 불변
-20. provider switch 후 role 유지
+## 26.1 `src/agent.rs`
 
-## 21.3 Main/context 테스트
+1. default = Standard
+2. cycle order
+3. parse case-insensitive
+4. invalid parse
+5. specialized prompt 존재
+6. clean Standard = None
+7. Standard reset 존재
+8. wrapper mode 정확
+9. wrapper version 정확
+10. forbidden Hoje runtime strings 없음
+11. prompt max length
+12. 사용자 입력을 받는 formatting API 없음
 
-1. Standard context에 agent key 없음
-2. Planner context에 planner wrapper
-3. Advisor context에 advisor wrapper
-4. Finisher context에 finisher wrapper
-5. 기존 Vibe context 유지
-6. existing Devez rules 유지
-7. context의 사용자 표시 누출 없음
+## 26.2 `AppState`
 
-## 21.4 Backend 테스트
+1. new session Standard/no reset
+2. resume Standard/reset required
+3. idle Tab cycle
+4. 네 번 후 Standard
+5. draft text/cursor 보존
+6. image attachments 보존
+7. busy Tab queue 유지
+8. busy `/agent` 차단
+9. compacting 차단
+10. provider switch pending 차단
+11. queued prompts 차단
+12. foreground subagent 차단
+13. background subagent 차단
+14. slash completion Tab 우선
+15. question Tab 우선
+16. picker Tab 우선
+17. `/btw` focus Tab 우선
+18. Shift+Tab 기존 동작
+19. `/agent` picker
+20. numeric select
+21. Esc no-change
+22. Enter commit
+23. direct `/agent planner`
+24. invalid usage
+25. model/effort/Vibe unchanged
+26. provider switch role 유지
+27. same role no notice
 
-### Codex
+## 26.3 Reset state
 
-- `prepare_codex_turn_context()` 후 agent key 유지
-- standing rules만 제거
-- Standard에는 agent key 없음
+1. clean Standard context 없음
+2. Planner dispatch 성공 → reset required
+3. Planner dispatch 실패 → state 미변경
+4. Standard 선택만으로 reset 해제 안 됨
+5. Standard reset 성공 → reset false
+6. Standard reset 실패 → reset true
+7. Planner → Advisor → Standard reset
+8. resume first Standard reset
+9. provider switch 후 Standard reset
+10. compaction 후 reset 유지
 
-### Claude
+## 26.4 Context builder
 
-- combined context에 agent 포함
-- mode/handoff/reminder와 deterministic order
-- session start system prompt는 기존과 동일
+1. Standard clean JSON baseline equality
+2. Planner key
+3. Advisor key
+4. Finisher key
+5. Standard reset key
+6. existing Vibe key 유지
+7. existing rules 유지
+8. Claude reminder 유지
+9. XML attribute enum-generated
+10. role prompt에 user text 없음
 
-### OpenCode
+## 26.5 Backend — Codex
 
-- combined context가 `start_prompt_content()`에 전달됨
-- 내부 rules block이 history에서 숨겨짐
+1. standing rules 제거
+2. Claude-only key 제거
+3. agent key 유지
+4. Standard agent key 없음
+5. steer에도 agent key 유지
 
-## 21.5 Renderer 테스트
+## 26.6 Backend — Claude
 
-1. agent badge 표시
-2. 각 role label
-3. Pick::AgentMode column
-4. 120/80/56 폭
-5. branch와 agent 순서
-6. cost 표시 유무로 click 위치가 이동하지 않음
-7. hover highlight
-8. inline/fullscreen 공통
+1. combined order = handoff → agent → mode → reminder
+2. Planner 포함
+3. Standard reset 포함
+4. clean Standard 미포함
+5. system prompt unchanged
+6. bridge history에서 internal prefix 제거
+7. automatic task continuation 중 role 변경 잠금
 
-## 21.6 Prompt 행동 수동 테스트
+## 26.7 Backend — OpenCode
+
+1. agent context가 start_prompt_content로 전달
+2. internal rules block 안에 포함
+3. history replay에서 숨김
+4. native session mode 변경 없음
+
+## 26.8 Renderer
+
+1. Standard badge
+2. Planner badge
+3. Advisor badge
+4. Finisher badge
+5. branch 앞/뒤 순서
+6. Pick::AgentMode
+7. hover
+8. cost 유무 click 안정
+9. 120 width
+10. 100 width
+11. 80 width
+12. 56 width
+13. minimum width
+14. fullscreen
+15. inline
+
+## 26.9 역할 수동 시나리오
 
 ### Standard
 
-- 기존과 유사한 일반 구현
-- 불필요한 역할 설명 없음
+- 기존 일반 구현과 유사
+- 역할 설명을 매번 출력하지 않음
 
-### Planner clear request
+### Planner clear
 
-- 저장소 조사
-- 질문 없이 계획
-- 파일 수정 없음
+- 질문 없이 조사·계획
+- edit 없음
 
-### Planner ambiguous request
+### Planner ambiguous
 
-- 저장소 사실 먼저 조사
-- 핵심 질문 하나
-- 최종 계획 자체 검토
+- repo 조사 먼저
+- material question 하나
+- final self-review
 
 ### Advisor sound proposal
 
-- 억지 반론 없이 승인
-- 장점과 조건 설명
+- 억지 반론 없음
+- 승인 근거
 
 ### Advisor risky proposal
 
-- material risk를 severity별 분리
-- 대안과 추천
-- 구현하지 않음
+- must/recommended/optional 분리
+- 대안과 조건부 추천
+- edit 없음
 
 ### Finisher light
 
-- 직접 구현
-- targeted test
-- 전체 rerun
+- 과도한 subagent 없음
+- targeted verification
+- final rerun
 
-### Finisher standard/strict
+### Finisher standard
 
-- 작업 분해
-- 가능한 경우 독립 review/QA
-- blocker 수정 후 재검증
-- 증거 기반 완료 보고
+- 적절한 분해
+- review/QA
+- blocker 수정
 
-## 21.7 검증 명령
+### Finisher strict
 
-구현 시 최소:
+- adversarial/compatibility/rollback
+- 증거 기반 완료
+
+## 26.10 Cross-role 시나리오
+
+1. Planner turn → Advisor turn: Advisor block이 이전 Planner를 supersede
+2. Advisor turn → Finisher turn: Finisher가 실행
+3. Finisher turn → Standard: reset 후 일반 동작
+4. Planner 선택 후 prompt 없이 Standard 복귀: reset 불필요
+5. resume specialized history → Standard first prompt: reset
+
+---
+
+# 27. 검증 명령
+
+구현 시 최소 실행:
 
 ```text
 cargo fmt --check
@@ -1602,265 +2203,459 @@ node npm/bridge/claude-agent-sdk-bridge.mjs --self-test
 node scripts/check-codex-compatibility.mjs
 ```
 
-실제 사용 smoke test는 Windows x64 패키징 바이너리에서 수행한다.
+추가 smoke test:
+
+- Windows x64 fullscreen
+- Windows x64 inline
+- Claude 새 세션/resume
+- Codex 새 세션/resume
+- OpenCode 새 세션/resume
+- provider handoff
+- `/btw`
+- background subagent
+- compaction
 
 ---
 
-## 22. 구현 단계
+# 28. 구현 단계
 
 ## Phase 1 — Agent core
 
 - `src/agent.rs`
-- AgentMode enum/API
-- prompt 파일 3개
+- enum/API
+- prompt files
+- reset block
 - static tests
 
 완료 조건:
 
-- Standard None
-- 세 역할 prompt compile-time 포함
-- cycle/parse 테스트 통과
+- compile-time prompt 포함
+- cycle/parse/reset tests
+- Hoje runtime 문자열 없음
 
-## Phase 2 — State와 명령
+## Phase 2 — AppState와 입력
 
-- AppState field/default
+- state fields
+- change lock
 - `/agent`
 - picker
-- busy 차단
-- idle Tab cycle
+- idle Tab
+- resume reset flag
 
 완료 조건:
 
-- 기존 queue/split/completion/Shift+Tab 회귀 없음
+- queue, completion, split, Shift+Tab 회귀 없음
 
 ## Phase 3 — UI
 
-- ComposerMode agent field
+- ComposerMode field
 - badge
-- click Pick
+- Pick
+- hover
 - width tests
 
 완료 조건:
 
-- narrow layout 안정
-- 클릭 위치 정확
+- 좁은 폭 안정
+- click mapping 정확
 
-## Phase 4 — Provider context
+## Phase 4 — Context transport
 
-- main additionalContext
-- backend combined instructions
+- turn context 계산
+- dispatch 성공 기록
+- backend combined context
 - Codex key preservation
 
 완료 조건:
 
-- Claude/Codex/OpenCode 모두 역할 지침 수신
-- Standard payload baseline 유지
+- 세 provider role context 수신
+- clean Standard baseline 유지
+- Standard reset 동작
 
-## Phase 5 — Prompt 품질 조정
+## Phase 5 — Role prompt 품질
 
-- Planner behavior test
-- Advisor behavior test
-- Finisher intensity/completion gate test
-- prompt 중복 제거
+- Planner scenarios
+- Advisor scenarios
+- Finisher intensity/completion gate
+- prompt 크기/중복 정리
 
 ## Phase 6 — 문서와 release 준비
 
 - README
 - npm README
-- 도움말/Tip
-- version bump와 release는 별도 승인 후
+- Tip/help
+- `CLAUDE.md`
+- version bump/release는 별도 승인
 
 ---
 
-## 23. 위험과 완화
+# 29. 위험과 완화
 
-## 23.1 Standard 회귀
+## 29.1 Standard 회귀
 
-위험: Agent system 도입만으로 기본 payload가 달라짐.
-
-완화:
-
-- Standard `None`
-- agent JSON key 미생성
-- baseline unit test
-
-## 23.2 Planner가 수정 수행
-
-위험: prompt-level read-only 경계를 모델이 어길 수 있음.
+위험: 새 시스템 때문에 기본 payload가 변함.
 
 완화:
 
-- 명확한 no-mutation prompt
-- 수동 provider별 테스트
-- hard guard는 후속 별도 설계
-- UI에서 Planner 설명에 “수정하지 않음” 표시
+- clean Standard no agent context
+- baseline equality test
+- reset은 필요할 때만
 
-## 23.3 Advisor의 과도한 반론
+## 29.2 이전 역할 잔존
 
-위험: 모든 접근에 불필요하게 반대.
+위험: Planner/Finisher가 Standard 복귀 후에도 계속 영향.
 
 완화:
 
-- “do not manufacture objections” 명시
-- sound proposal 승인 테스트
-- must/recommendation/optional 분리
+- superseding block contract
+- one-time Standard reset
+- resume reset
 
-## 23.4 Finisher 과도한 비용
+## 29.3 Background 자동 턴 불일치
 
-위험: 작은 작업에도 subagent/review를 남발.
+위험: UI는 Planner인데 이전 Finisher background completion이 자동 응답.
+
+완화:
+
+- live subagent 동안 role change 잠금
+- specialized block 지속 contract
+
+## 29.4 Planner/Advisor mutation
+
+위험: prompt-only 경계 위반.
+
+완화:
+
+- 강한 no-mutation prompt
+- manual tests
+- UI 설명에서 soft boundary 명시
+- hard guard는 후속 설계
+
+## 29.5 Advisor 과잉 반론
+
+완화:
+
+- do not manufacture objections
+- sound proposal test
+- severity 분리
+
+## 29.6 Finisher 과잉 orchestration
 
 완화:
 
 - lowest safe intensity
 - Light 기준
-- subagent only when independent value exists
+- subagent value gate
 
-## 23.5 역할 중복
-
-위험: Standard와 Finisher, Planner와 Advisor의 차이가 흐려짐.
-
-완화:
-
-- 역할별 명시적 목적
-- Planner는 실행 금지
-- Advisor는 선택 평가
-- Finisher는 완료 gate
-
-## 23.6 Tab 충돌
-
-위험: queue, split focus, completion, picker가 깨짐.
+## 29.7 Tab 충돌
 
 완화:
 
 - 명시적 우선순위
-- 기존 동작별 회귀 테스트
-- idle fallback에서만 cycle
+- busy queue regression
+- `/btw`, completion, picker tests
 
-## 23.7 Prompt가 history에 노출
-
-위험: 사용자 대화에 내부 instruction 표시.
+## 29.8 Prompt history 노출
 
 완화:
 
-- 기존 Claude stripHandoff 경로
-- OpenCode internal rules filtering
+- Claude length-delimited prefix strip
+- OpenCode internal block filter
 - Codex application context
-- resume/history smoke test
+- resume history smoke test
 
-## 23.8 좁은 UI 깨짐
+## 29.9 좁은 UI
 
 완화:
 
-- 접두어 없는 짧은 label
-- 낮은 우선순위 badge부터 숨김
-- width별 renderer 테스트
+- 짧은 label
+- agent high priority
+- width/click tests
+
+## 29.10 Prompt 비용
+
+완화:
+
+- concise prompts
+- Standard no-op
+- duplicated common rules 금지
+- token 상한 test
 
 ---
 
-## 24. 호환성과 Migration
+# 30. 호환성·Migration·Rollback
 
-기존 config/schema migration은 없다.
+## 30.1 Migration 없음
 
-- 기존 사용자는 Standard로 시작
-- 기존 세션 resume 가능
-- route store 형식 변경 없음
-- Claude bridge 프로토콜 변경 없음
+- config schema 변경 없음
+- route store 변경 없음
+- transcript schema 변경 없음
+- Claude bridge protocol 변경 없음
 - OpenCode ACP protocol 변경 없음
-- Codex thread data 변경 없음
-- 기존 Vibe settings 파일 변경 없음
+- Codex thread metadata 변경 없음
 
-기능 제거 시 `agent_mode`와 관련 UI/context 코드만 제거하면 기존 구조로 돌아갈 수 있다.
+## 30.2 Resume
+
+- role 선택은 Standard로 초기화
+- 첫 Standard prompt에 reset
+- 과거 conversation은 그대로 유지
+
+## 30.3 Rollback
+
+기능 제거 순서:
+
+1. `/agent`와 Tab/badge 제거
+2. AppState fields 제거
+3. context key 제거
+4. backend combined context 원복
+5. prompt files와 `agent.rs` 제거
+
+저장 파일 migration이 없으므로 rollback 후 잔여 persistent state가 없다.
 
 ---
 
-## 25. 완료 승인 기준
+# 31. 완료 승인 기준
 
-### 기능
+## 31.1 기능
 
-- 네 역할 선택 가능
+- 네 역할 선택
 - Standard 기본값
-- idle Tab 순환
-- `/agent`와 badge picker
-- provider 전환 후 역할 유지
+- idle Tab cycle
+- `/agent`
+- badge click
+- provider switch 후 역할 유지
 
-### 행동
+## 31.2 역할
 
-- Standard 기존 동작 보존
-- Planner 조사·명확화·계획·자체 검토, 구현 없음
-- Advisor 근거 기반 추천·반론, 구현 없음
-- Finisher 구현·검증·리뷰·완료 증거
+- Standard 기본 하네스
+- Planner repo-first clarification/plan/self-review, 구현 없음
+- Advisor evidence-based recommendation/pushback, 구현 없음
+- Finisher implementation/verification/review/QA/completion evidence
 
-### 안정성
+## 31.3 생명주기
 
-- busy Tab queue 유지
-- `/btw` Tab 유지
-- slash completion 유지
-- Shift+Tab 유지
-- history에 prompt 미노출
-- 좁은 터미널 안정
+- busy/compaction/provider switch/queue/subagent 중 변경 잠금
+- steer role 안정
+- Standard reset
+- resume reset
+- failed request state 보존
 
-### 품질
+## 31.4 회귀
 
-- Rust tests 통과
-- clippy/fmt 통과
-- Claude bridge self-test 통과
-- 세 provider smoke test 완료
+- busy Tab queue
+- `/btw` Tab
+- slash completion
+- question/picker Tab
+- Shift+Tab
+- Vibe/Response/Fast
+- history restore
+- narrow UI
 
----
+## 31.5 품질
 
-## 26. 후속 확장 후보
-
-첫 버전 안정화 후에만 검토한다.
-
-1. Agent별 hard tool policy
-2. session별 agent persistence
-3. 사용자 지정 agent prompt
-4. Automatic router
-5. Research/Insane Search tool
-6. Finisher execution intensity UI
-7. Agent별 모델 추천
-8. Agent pipeline
-
-Automatic은 네 수동 역할의 실제 사용 데이터를 확인한 뒤 추가하는 것이 안전하다.
+- fmt/test/clippy
+- Claude bridge self-test
+- Codex compatibility check
+- provider smoke tests
 
 ---
 
-## 27. 구현 결정 요약
+# 32. 재검수 방법
 
-| 항목 | 결정 |
+1차 초안을 작성한 뒤 다음 관점으로 다시 검토했다.
+
+## 32.1 저장소 구조 대조
+
+- `src/main.rs` 턴 생성·Tab split 처리
+- `src/state.rs` busy queue·picker·completion·AppState
+- `src/backend.rs` provider context 변환
+- `src/renderer.rs` badge/click/width
+- `src/open_code.rs` internal rules history filtering
+- Claude bridge의 prefix/historical stripping
+
+## 32.2 Hoje-Code 대조
+
+- Planner 경계
+- Architect evidence rule
+- Critic omitted-surface rule
+- Executor bounded implementation
+- Executor-QA real-surface/adversarial validation
+- Ask의 one-question/repo-first 원칙
+- Plan의 planning/execution boundary
+- Goals의 light/standard/strict와 completion gate
+
+## 32.3 실패 시나리오 검토
+
+- 이전 역할이 history에 남음
+- resume 세션의 stale role
+- background task 자동 턴
+- busy Tab 충돌
+- `/btw` Tab 충돌
+- queued prompt 역할 모호성
+- picker preview transient state
+- request failure 후 reset state 손실
+- narrow UI click drift
+
+---
+
+# 33. 재검수에서 발견한 문제와 수정 결과
+
+| 발견 항목 | 1차 초안 문제 | 2차 반영 |
+|---|---|---|
+| Standard 복귀 | Standard에 context를 전혀 안 보내면 이전 role이 남음 | one-time Standard reset 추가 |
+| Resume | 과거 specialized role을 알 수 없음 | resumed session 첫 Standard turn reset |
+| Background task | role 변경 후 자동 후속 턴과 UI 불일치 | live subagent 동안 변경 잠금 |
+| Queued prompt | queue가 문자열만 저장해 role snapshot 없음 | queue가 비지 않으면 변경 잠금 |
+| Compaction | busy가 아닌 compaction 중 역할 변경 가능성 | compaction 중 변경 잠금 |
+| Provider switch | handoff 대기 prompt의 역할 모호성 | provider switch pending 중 변경 잠금 |
+| Picker preview | arrow 이동마다 실제 mode 변경·notice 가능 | Enter commit-only picker로 수정 |
+| Dispatch 실패 | request 생성 시 reset을 해제하면 상태 손실 | 성공 후에만 dispatch state 갱신 |
+| Claude history | 개별 agent tag strip으로 오해 가능 | 기존 length-delimited 전체 prefix strip을 사용한다고 명확화 |
+| Context 순서 | 현재 역할이 handoff/history에 묻힐 수 있음 | handoff 뒤에 current role 배치 |
+| Planner read-only | 보안 경계처럼 오해 가능 | prompt-level 계약임을 반복 명시 |
+| Finisher background | 자동 continuation에 새 context 없음 | role block 지속 선언 + 변경 잠금 |
+| License | Hoje prompt 복제 정책 누락 | 재작성 원칙과 attribution 기준 추가 |
+| UI 초기 상태 | thread 생성 전 agent 선택 설명 부족 | welcome/first prompt 전 badge 지원 추가 |
+| Steer | role snapshot 설명 부족 | busy role 잠금과 turn/steer context 반복 추가 |
+
+---
+
+# 34. 최종 구현 체크리스트
+
+## 설계
+
+- [ ] `AgentMode` source of truth가 한 곳인가
+- [ ] Standard clean/no-op과 reset이 분리되었는가
+- [ ] 이전 block을 supersede한다고 prompt에 명시했는가
+- [ ] provider-native agent와 혼합하지 않았는가
+
+## 상태
+
+- [ ] new/resume 초기화가 다른가
+- [ ] dispatch 성공 후 상태 갱신인가
+- [ ] queue/subagent/compaction/provider switch 잠금인가
+- [ ] `/btw` AppState 독립성이 유지되는가
+
+## UX
+
+- [ ] idle Tab만 cycle하는가
+- [ ] busy Tab queue가 유지되는가
+- [ ] picker는 commit-only인가
+- [ ] badge click과 `/agent`가 같은 setter를 쓰는가
+
+## Prompt
+
+- [ ] Hoje runtime 용어가 제거되었는가
+- [ ] common Devez rules를 중복하지 않는가
+- [ ] provider 전용 tool을 강제하지 않는가
+- [ ] Planner/Advisor soft boundary를 과장하지 않는가
+- [ ] Finisher가 작은 작업을 과도하게 분해하지 않는가
+
+## Transport
+
+- [ ] Codex agent key가 제거되지 않는가
+- [ ] Claude bridge 변경 없이 전달되는가
+- [ ] OpenCode history에 internal block이 노출되지 않는가
+- [ ] Standard reset이 provider switch/resume에도 전달되는가
+
+## Test
+
+- [ ] state tests
+- [ ] renderer tests
+- [ ] backend tests
+- [ ] prompt static tests
+- [ ] three-provider smoke tests
+- [ ] cross-role reset tests
+
+---
+
+# 35. 후속 확장 후보
+
+수동 네 역할이 안정화된 뒤에만 검토한다.
+
+1. provider 공통 hard read-only guard
+2. queued prompt별 agent snapshot
+3. session별 role persistence
+4. custom agent prompt
+5. Automatic router
+6. Research/Insane Search tool
+7. Finisher intensity UI
+8. agent별 model recommendation
+9. explicit role pipeline
+
+---
+
+# 36. 최종 결정표
+
+| 항목 | 최종 결정 |
 |---|---|
-| 기본 역할 | Standard |
-| 역할 수 | 4 |
-| 전환 | 수동 |
-| Tab | idle fallback에서만 cycle |
-| Busy Tab | 기존 queue 유지 |
-| Split Tab | 기존 pane 전환 유지 |
-| persistence | 프로세스 수명만 |
-| Standard prompt | 없음 |
-| Prompt 저장 | markdown + `include_str!` |
+| 역할 | Standard, Planner, Advisor, Finisher |
+| 기본값 | Standard |
+| 자동 라우팅 | 없음 |
+| Research | 없음 |
+| 전환 | idle Tab, `/agent`, badge |
+| busy Tab | 기존 queue 유지 |
+| `/btw` Tab | pane focus 유지 |
+| 역할 저장 | AppState 수명만 |
+| Resume | Standard + 첫 turn reset |
+| Standard prompt | clean 상태 없음, 필요 시 reset 1회 |
+| Specialized prompt | 매 user-submitted turn 반복 |
+| Prompt 저장 | markdown + `include_str!()` |
 | Planner | Ask + Plan 통합 |
-| Advisor | Architect + Critic 기반 신규 역할 |
-| Finisher | Goals 핵심 철학, runtime 제거 |
-| Provider native agent | 사용하지 않음 |
-| Hard read-only | 후속 범위 |
-| Hoje plugin 설치 | 불필요 |
-| Research | 제외 |
-| Automatic | 제외 |
+| Advisor | Architect + Critic 기반 |
+| Finisher | Goals 핵심, runtime 제외 |
+| Hard read-only | 첫 버전 제외 |
+| OpenCode native mode | 사용 안 함 |
+| Hoje 설치 | 불필요 |
+| Bridge protocol 변경 | 원칙적으로 없음 |
+| Persistent schema 변경 | 없음 |
 
 ---
 
-## 28. 1차 초안 자체 점검 항목
+# 부록 A. 역할 선택 예시
 
-다음 재검수에서 반드시 다시 확인한다.
+```text
+"이 버튼 오류 고쳐줘"
+→ Standard
 
-- 현재 main의 Tab 우선순위를 정확히 반영했는가
-- busy queued prompt가 Agent 변경으로 오염되지 않는가
-- `/btw` 두 AppState의 역할 범위가 명확한가
-- Standard가 정말 payload 무변경인가
-- Claude/OpenCode history에서 역할 지침이 숨겨지는가
-- Planner/Advisor read-only가 보안 경계가 아님을 명확히 썼는가
-- Finisher가 작은 작업에 과도한 orchestration을 만들지 않는가
-- Hoje runtime 용어가 최종 prompt에 남지 않도록 검사하는가
-- 구현 파일 범위에서 불필요한 bridge 변경을 피했는가
-- UI 좁은 폭과 click mapping 테스트가 포함됐는가
-- 역할별 acceptance criteria가 서로 중복되지 않는가
+"이 기능을 어떤 구조로 넣을지 계획해줘"
+→ Planner
+
+"이 상태를 컬럼 하나로 처리하려는데 괜찮아?"
+→ Advisor
+
+"이 계획대로 구현하고 테스트와 리뷰까지 끝내"
+→ Finisher
+```
+
+역할은 자동 선택되지 않는다. 위 예시는 사용자 가이드의 의미 구분이다.
+
+---
+
+# 부록 B. Hoje-Code → DevezVibe 변환표
+
+| Hoje 개념 | DevezVibe 적용 | 제외 요소 |
+|---|---|---|
+| Deep interview | Planner의 material ambiguity 처리 | threshold/state/artifact |
+| Planner | Planner repo-first 계획 | receipt writer |
+| Architect | Planner self-review + Advisor 평가 | persisted lane |
+| Critic | Planner gap review + Advisor 반론 | review pass state |
+| Executor | Finisher bounded implementation | goal ledger |
+| Executor-QA | Finisher independent QA | structured receipt |
+| Light/Standard/Strict | Finisher 실행 강도 | CLI flag/state |
+| Checkpoint | 완료 증거 보고 | ledger/checkpoint command |
+
+---
+
+# 부록 C. 구현자가 피해야 할 단축 구현
+
+1. `DEVEZ_INSTRUCTIONS` 전체를 역할별로 복제하지 않는다.
+2. Standard에 항상 긴 reset prompt를 보내지 않는다.
+3. role 변경 시 새 provider session을 만들지 않는다.
+4. OpenCode `session/set_mode`만 사용해 provider별 동작을 갈라놓지 않는다.
+5. busy Tab을 agent cycle로 덮어쓰지 않는다.
+6. Planner를 Claude plan permission mode와 동일시하지 않는다.
+7. prompt 파일을 runtime npm asset으로 따로 읽지 않는다.
+8. Hoje SKILL.md 전체를 복사하지 않는다.
+9. Finisher에 무조건 subagent를 쓰라고 지시하지 않는다.
+10. Planner/Advisor를 보안 sandbox라고 문서화하지 않는다.
