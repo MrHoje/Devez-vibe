@@ -8128,16 +8128,6 @@ impl AppState {
                 }
                 self.set_account_plan(AccountPlan::from_claude(account, usage));
             }
-            "claude/permissionMode/rejected" => {
-                self.push_notice(
-                    BlockKind::Warning,
-                    "Claude 권한 모드 폴백",
-                    params
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Bypass 모드를 사용할 수 없어 auto 모드로 실행합니다."),
-                );
-            }
             "turn/started" => {
                 if let Some(turn_id) = params
                     .get("turn")

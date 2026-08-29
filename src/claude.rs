@@ -554,6 +554,8 @@ mod tests {
         assert!(bridge.contains("const FALLBACK_PERMISSION_MODE = \"auto\""));
         assert!(bridge.contains("await session.query.setPermissionMode(PREFERRED_PERMISSION_MODE)"));
         assert!(bridge.contains("await session.query.setPermissionMode(FALLBACK_PERMISSION_MODE)"));
+        assert_eq!(bridge.matches("await applyPermissionMode(session);").count(), 1);
+        assert!(!bridge.contains("claude/permissionMode/rejected"));
     }
 
     #[test]

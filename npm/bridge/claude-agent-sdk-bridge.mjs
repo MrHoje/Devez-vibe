@@ -365,47 +365,36 @@ function permissionError(error) {
   return error?.message || String(error);
 }
 
-// No tool-capable turn is admitted until the SDK has confirmed bypass mode or,
-// when policy rejects it, confirmed auto mode. A double rejection fails the
-// session instead of silently continuing in the bootstrap default mode.
+// Each session tries bypass once. When policy rejects it, the session silently
+// stays on confirmed auto mode for its remaining lifetime. A double rejection
+// fails the session instead of continuing in the bootstrap default mode.
 async function applyPermissionMode(session) {
   if (session.permissionModeVerified
       && (session.permissionMode === PREFERRED_PERMISSION_MODE
         || (session.bypassUnavailable && session.permissionMode === FALLBACK_PERMISSION_MODE))) {
-    return null;
+    return;
   }
   if (!session.bypassUnavailable) {
     try {
       await session.query.setPermissionMode(PREFERRED_PERMISSION_MODE);
       session.permissionMode = PREFERRED_PERMISSION_MODE;
       session.permissionModeVerified = true;
-      return null;
+      return;
     } catch (error) {
       session.bypassUnavailable = true;
-      session.bypassRejection = permissionError(error);
     }
   }
   try {
     await session.query.setPermissionMode(FALLBACK_PERMISSION_MODE);
     session.permissionMode = FALLBACK_PERMISSION_MODE;
     session.permissionModeVerified = true;
-    return session.bypassRejection;
+    return;
   } catch (error) {
     session.permissionModeVerified = false;
     throw new Error(
       `Claude bypass 모드가 거부되었고 auto 폴백도 적용하지 못했습니다: ${permissionError(error)}`,
     );
   }
-}
-
-function notifyPermissionFallback(session, rejection) {
-  if (!rejection) return;
-  notify("claude/permissionMode/rejected", {
-    threadId: visibleSession(session.id),
-    permissionMode: PREFERRED_PERMISSION_MODE,
-    effectivePermissionMode: FALLBACK_PERMISSION_MODE,
-    message: `Bypass 모드를 사용할 수 없어 auto 모드로 실행합니다: ${rejection}`,
-  });
 }
 
 async function claudePermissionStatus(params) {
@@ -1160,7 +1149,6 @@ async function createSession(params, resumeId) {
     permissionMode: BOOTSTRAP_PERMISSION_MODE,
     permissionModeVerified: false,
     bypassUnavailable: false,
-    bypassRejection: null,
     models: [],
     queue,
     query: null,
@@ -1204,10 +1192,9 @@ async function createSession(params, resumeId) {
     });
   session.consumer = consumer;
   let initialization;
-  let permissionRejection;
   try {
     initialization = await agentQuery.initializationResult();
-    permissionRejection = await applyPermissionMode(session);
+    await applyPermissionMode(session);
   } catch (error) {
     sessions.delete(id);
     queue.close();
@@ -1215,7 +1202,6 @@ async function createSession(params, resumeId) {
     await Promise.race([consumer, new Promise((resolve) => setTimeout(resolve, 1000))]);
     throw error;
   }
-  notifyPermissionFallback(session, permissionRejection);
   session.models = Array.isArray(initialization.models) ? initialization.models : [];
   const capabilities = modelCapabilities(session.models, params.model);
   // A resumed session can only name its model as the resolved id the transcript
@@ -2590,9 +2576,6 @@ async function runPrompt(session, params) {
     const model = stripClaudeModel(params.model);
     await session.query.setModel(model);
     session.model = visibleModel(params.model);
-    // Model switches can change which permission modes policy accepts. Recheck
-    // the preferred/fallback pair before admitting the turn.
-    session.permissionModeVerified = false;
   }
   session.steerPending = 0;
   const effort = supportedEffort(modelCapabilities(session.models, params.model || session.model), params.effort);
@@ -2600,8 +2583,6 @@ async function runPrompt(session, params) {
     await session.query.applyFlagSettings({ effortLevel: effort });
   }
   session.effort = effort;
-  const permissionRejection = await applyPermissionMode(session);
-  notifyPermissionFallback(session, permissionRejection);
   const content = await inputContent(params.input, params.handoffContext);
   const turnId = beginTurn(session, params.input);
   session.queue.push({
@@ -3047,12 +3028,7 @@ async function dispatch(method, params = {}) {
   if (method === "session/permissionMode") {
     const session = lookupSession(params.sessionId);
     if (!session) return { permissionMode: PREFERRED_PERMISSION_MODE };
-    const rejection = await applyPermissionMode(session);
-    notifyPermissionFallback(session, rejection);
-    return {
-      permissionMode: session.permissionMode,
-      ...(rejection ? { rejection } : {}),
-    };
+    return { permissionMode: session.permissionMode };
   }
   // The host clears its `Working` row on `turn/completed` alone, so a single
   // dropped notification would strand the spinner forever. This answers "is the
@@ -3222,15 +3198,14 @@ async function runPermissionModeSelfTest() {
     permissionMode: BOOTSTRAP_PERMISSION_MODE,
     permissionModeVerified: false,
     bypassUnavailable: false,
-    bypassRejection: null,
     query: { setPermissionMode },
   });
 
   const preferredCalls = [];
   const preferred = fakeSession(async (mode) => preferredCalls.push(mode));
-  const preferredRejection = await applyPermissionMode(preferred);
-  if (preferredRejection !== null
-      || preferred.permissionMode !== PREFERRED_PERMISSION_MODE
+  await applyPermissionMode(preferred);
+  await applyPermissionMode(preferred);
+  if (preferred.permissionMode !== PREFERRED_PERMISSION_MODE
       || preferredCalls.join(",") !== PREFERRED_PERMISSION_MODE) {
     throw new Error(`Claude bypass permission self-test failed: ${JSON.stringify(preferredCalls)}`);
   }
@@ -3240,10 +3215,9 @@ async function runPermissionModeSelfTest() {
     fallbackCalls.push(mode);
     if (mode === PREFERRED_PERMISSION_MODE) throw new Error("organization policy");
   });
-  const fallbackRejection = await applyPermissionMode(fallback);
   await applyPermissionMode(fallback);
-  if (fallbackRejection !== "organization policy"
-      || fallback.permissionMode !== FALLBACK_PERMISSION_MODE
+  await applyPermissionMode(fallback);
+  if (fallback.permissionMode !== FALLBACK_PERMISSION_MODE
       || fallbackCalls.join(",") !== `${PREFERRED_PERMISSION_MODE},${FALLBACK_PERMISSION_MODE}`) {
     throw new Error(`Claude auto fallback self-test failed: ${JSON.stringify(fallbackCalls)}`);
   }
