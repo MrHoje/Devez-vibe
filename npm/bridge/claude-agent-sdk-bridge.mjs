@@ -116,7 +116,7 @@ function sanitizedEnvironment() {
   const env = { ...process.env };
   delete env.ANTHROPIC_API_KEY;
   delete env.ANTHROPIC_AUTH_TOKEN;
-  env.CLAUDE_AGENT_SDK_CLIENT_APP = `devez-vibe/${VERSION}`;
+  env.CLAUDE_AGENT_SDK_CLIENT_APP = `dvz/${VERSION}`;
   return env;
 }
 
