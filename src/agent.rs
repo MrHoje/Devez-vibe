@@ -117,14 +117,26 @@ impl AgentTurnContext {
             ),
             Self::StandardReset => (AgentMode::Standard, STANDARD_RESET),
         };
-        // Every role answers under the same Devez response rules; the block
-        // changes how the work is approached, never how the answer is formatted.
+        // A specialized role keeps the language and readability rules but not
+        // the length caps: a plan or a final report squeezed into a few bullets
+        // loses exactly the substance the role exists for.
+        let response_rules = match self {
+            Self::Specialized(_) => {
+                "The standing DevezVibe language and formatting rules apply to this role \
+                 unchanged — answer in Korean, structured and readable. Only the response-length \
+                 caps do not apply to this role's output."
+            }
+            Self::StandardReset => {
+                "The response rules and length caps from the standing DevezVibe instructions \
+                 apply unchanged."
+            }
+        };
         format!(
             "<devez-vibe-agent mode=\"{}\" version=\"1\">\nThis block sets the current DevezVibe \
              agent mode. It supersedes every earlier devez-vibe-agent block in this conversation, \
-             and stays in effect until another one arrives. The response rules and length caps \
-             from the standing DevezVibe instructions apply to this role unchanged.\n\n{}\n</devez-vibe-agent>",
+             and stays in effect until another one arrives. {}\n\n{}\n</devez-vibe-agent>",
             mode.id(),
+            response_rules,
             body.trim()
         )
     }
@@ -183,18 +195,15 @@ mod tests {
         let reset = AgentTurnContext::StandardReset.render();
         assert!(reset.contains("mode=\"builder\""));
         assert!(reset.contains("Do not continue a Planner"));
-        // Every role — reset included — answers under the same response rules,
-        // with no per-role formatting carve-outs.
-        for context in [
-            AgentTurnContext::StandardReset,
-            AgentTurnContext::Specialized(AgentMode::Planner),
-            AgentTurnContext::Specialized(AgentMode::Advisor),
-            AgentTurnContext::Specialized(AgentMode::Finisher),
-        ] {
-            let block = context.render();
-            assert!(!block.contains("deliverable"));
-            assert!(block.contains("response rules and length caps"));
+        // A specialized role keeps the language rules but drops the length
+        // caps; the reset restores the full rules, caps included.
+        for mode in [AgentMode::Planner, AgentMode::Advisor, AgentMode::Finisher] {
+            let block = AgentTurnContext::Specialized(mode).render();
+            assert!(block.contains("language and formatting rules"));
+            assert!(block.contains("caps do not apply"));
         }
+        assert!(reset.contains("length caps"));
+        assert!(reset.contains("apply unchanged"));
     }
 
     /// The role prompts are the product's own text, not a copy of the plugin
