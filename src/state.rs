@@ -5156,7 +5156,6 @@ impl AppState {
 
     fn composer_mode(&self) -> ComposerMode {
         ComposerMode {
-            agent: self.agent_mode,
             branch: self.branch.clone(),
             vibe_mode: self.vibe_mode.label().to_owned(),
             vibe_tone: match self.vibe_mode {
@@ -12117,6 +12116,7 @@ impl AppState {
             })
         });
         StatusLineView {
+            agent: self.agent_mode,
             model: self
                 .status_line_settings
                 .enabled(StatusLineField::Model)

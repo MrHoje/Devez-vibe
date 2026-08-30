@@ -385,6 +385,8 @@ pub struct SuggestionView {
 }
 
 pub struct StatusLineView {
+    /// The agent role, painted left of the model so the role reads first.
+    pub agent: AgentMode,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub context: Option<String>,
@@ -417,8 +419,6 @@ pub enum VibeTone {
 }
 
 pub struct ComposerMode {
-    /// The agent role, drawn into the prompt prefix when it is not `Standard`.
-    pub agent: AgentMode,
     /// Current Git branch, shown as a display-only composer badge.
     pub branch: Option<String>,
     pub vibe_mode: String,
@@ -7676,6 +7676,11 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         .is_some_and(|model| !is_open_code_model_label(model));
     let mut spans = Vec::new();
     let mut picks = Vec::new();
+    push_status_span(
+        &mut spans,
+        status.agent.label(),
+        agent_prompt_tone(status.agent),
+    );
     if let Some(model) = status.model.filter(|model| !model.is_empty()) {
         let span = push_status_span(
             &mut spans,
@@ -11497,16 +11502,8 @@ fn input_lines_with_controls(
     let display_chars = display.chars().collect::<Vec<_>>();
     let panel_width = (width as usize).saturating_sub(1).max(16);
     let side_prefix = "│ ";
-    // A specialized role names itself in the prompt so the input line reads
-    // `Planner > `; Standard keeps the bare prompt it always had.
-    let agent = mode.map(|mode| mode.agent).unwrap_or_default();
-    let first_prefix = match agent {
-        AgentMode::Standard => "> ".to_owned(),
-        role => format!("{} > ", role.label()),
-    };
-    let first_prefix = first_prefix.as_str();
-    let continuation_padding = " ".repeat(UnicodeWidthStr::width(first_prefix));
-    let continuation_prefix = continuation_padding.as_str();
+    let first_prefix = "> ";
+    let continuation_prefix = "  ";
     let content_width = panel_width
         .saturating_sub(
             UnicodeWidthStr::width(side_prefix)
@@ -11649,16 +11646,11 @@ fn input_lines_with_controls(
                 bold: false,
             },
         ]);
-        let prompt_tone = if index == 0 && agent != AgentMode::Standard {
-            agent_prompt_tone(agent)
-        } else {
-            chrome_tone
-        };
         rows.push(PaintLine {
             prefix: side_prefix.to_owned(),
             prefix_tone: chrome_tone,
             text: prompt_prefix.to_owned(),
-            tone: prompt_tone,
+            tone: chrome_tone,
             bold: false,
             tool_heading: None,
             pick: None,
@@ -12653,7 +12645,7 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::AgentStandard => palette.muted,
         Tone::AgentPlanner => palette.blue,
         Tone::AgentAdvisor => palette.purple,
-        Tone::AgentFinisher => palette.success,
+        Tone::AgentFinisher => palette.error,
         Tone::Border => palette.border,
         Tone::SidePanelDivider => blend(
             palette.hover_bg,
@@ -15323,6 +15315,7 @@ mod tests {
     fn status_line_effort_icon_survives_copy_for_composer_paste() {
         let line = status_line_row(
             Some(StatusLineView {
+                agent: AgentMode::Standard,
                 model: None,
                 effort: Some("high".to_owned()),
                 context: None,
@@ -15337,9 +15330,12 @@ mod tests {
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
         renderer.previous_lines = vec![line];
 
-        assert!(renderer.begin_selection(0, 0));
-        assert!(renderer.update_selection(6, 0));
-        let SelectionResult::Copy(copied) = renderer.finish_selection(6, 0) else {
+        // The role opens the row, so the effort reading starts after
+        // " Standard | ".
+        let start = " Standard | ".len() as u16;
+        assert!(renderer.begin_selection(start, 0));
+        assert!(renderer.update_selection(start + 5, 0));
+        let SelectionResult::Copy(copied) = renderer.finish_selection(start + 5, 0) else {
             panic!("status line selection should copy");
         };
         assert_eq!(copied, "◆ high");
@@ -16918,7 +16914,6 @@ mod tests {
 
     fn test_mode(label: &str, accent: ModeAccent, fast_mode: bool) -> ComposerMode {
         ComposerMode {
-            agent: AgentMode::Standard,
             branch: None,
             vibe_mode: "Vibe: On".to_owned(),
             vibe_tone: VibeTone::On,
@@ -16940,46 +16935,6 @@ mod tests {
         mode.vibe_mode = "Vibe: Super Vibe".to_owned();
         mode.vibe_tone = VibeTone::Super;
         mode
-    }
-
-    /// A specialized role names itself in the prompt prefix with its own
-    /// colour; Standard keeps the bare `> ` it always had.
-    #[test]
-    fn a_specialized_role_names_itself_in_the_composer_prompt() {
-        let editor = Editor::default();
-        let mut mode = test_mode("Default", ModeAccent::Calm, false);
-        mode.agent = AgentMode::Planner;
-
-        let (rows, _, _, _) = input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
-
-        assert_eq!(rows[1].text, "Planner > ");
-        assert_eq!(rows[1].tone, Tone::AgentPlanner);
-
-        mode.agent = AgentMode::Standard;
-        let (rows, _, _, _) = input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
-        assert_eq!(rows[1].text, "> ");
-    }
-
-    /// The wider role prefix must not desynchronize wrapped rows: continuation
-    /// rows pad to the same width so the click-to-cursor math stays aligned.
-    #[test]
-    fn the_role_prefix_keeps_continuation_rows_aligned() {
-        let mut editor = Editor::default();
-        editor.set_text("alpha\nbeta");
-        let mut mode = test_mode("Default", ModeAccent::Calm, false);
-        mode.agent = AgentMode::Finisher;
-
-        let (rows, _, _, layout) =
-            input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
-
-        assert_eq!(rows[1].text, "Finisher > ");
-        assert_eq!(rows[2].text, " ".repeat("Finisher > ".len()));
-        let columns = layout
-            .rows
-            .iter()
-            .map(|row| row.start_column)
-            .collect::<Vec<_>>();
-        assert_eq!(columns, vec![columns[0]; columns.len()]);
     }
 
     #[test]
@@ -18375,7 +18330,6 @@ mod tests {
             line: None,
             composer_notice: None,
             composer_mode: Some(ComposerMode {
-                agent: AgentMode::Standard,
                 branch: Some("main".to_owned()),
                 vibe_mode: "Super Vibe".to_owned(),
                 vibe_tone: VibeTone::Super,
@@ -20916,6 +20870,7 @@ mod tests {
     fn status_line_is_trimmed_to_terminal_width() {
         let line = status_line_row(
             Some(StatusLineView {
+                agent: AgentMode::Standard,
                 model: Some("GPT-5.6 Codex".to_owned()),
                 effort: Some("xhigh".to_owned()),
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
@@ -20928,7 +20883,7 @@ mod tests {
             32,
         );
         assert!(painted_width(&line) <= 32);
-        assert!(line.text.trim_start().starts_with("GPT-5.6 Codex"));
+        assert!(line.text.trim_start().starts_with("Standard"));
         assert!(painted(&line).ends_with("..."));
     }
 
@@ -20936,6 +20891,7 @@ mod tests {
     fn status_line_keeps_model_and_effort_when_branch_is_removed() {
         let line = status_line_row(
             Some(StatusLineView {
+                agent: AgentMode::Standard,
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 context: None,
@@ -20945,7 +20901,7 @@ mod tests {
                 notice: None,
             }),
             "",
-            30,
+            45,
         );
 
         assert!(painted(&line).contains("GPT-5.6 Sol"));
@@ -20957,6 +20913,7 @@ mod tests {
         theme::set_current(ThemeKind::Dark);
         let line = status_line_row(
             Some(StatusLineView {
+                agent: AgentMode::Standard,
                 model: Some("DeepSeek V4 Flash · OpenCode Go".to_owned()),
                 effort: Some("high".to_owned()),
                 context: None,
@@ -20972,14 +20929,22 @@ mod tests {
         assert!(painted(&line).contains("DeepSeek V4 Flash · OpenCode Go"));
         assert!(painted(&line).ends_with("←→ effort"));
         assert!(!painted(&line).contains("Shift + ↑↓"));
-        assert_eq!(line.tone, Tone::ModelOpenCode);
-        assert_eq!(tone_rgb(line.tone), Some(Rgb(0x5C, 0x9C, 0xF5)));
+        // The role opens the row, so the model keeps its colour one span over.
+        let model_tone = line
+            .tail
+            .iter()
+            .find(|span| span.text.contains("OpenCode Go"))
+            .map(|span| span.tone)
+            .expect("the model reading is painted");
+        assert_eq!(model_tone, Tone::ModelOpenCode);
+        assert_eq!(tone_rgb(model_tone), Some(Rgb(0x5C, 0x9C, 0xF5)));
     }
 
     #[test]
     fn status_line_places_the_model_and_effort_shortcuts_at_the_far_right() {
         let line = status_line_row(
             Some(StatusLineView {
+                agent: AgentMode::Standard,
                 model: Some("GPT-5.6 Codex".to_owned()),
                 effort: Some("xhigh".to_owned()),
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
@@ -20999,6 +20964,7 @@ mod tests {
     #[test]
     fn opening_the_side_panel_hides_only_composer_context() {
         let mut status = Some(StatusLineView {
+            agent: AgentMode::Standard,
             model: Some("GPT-5.6 Codex".to_owned()),
             effort: Some("xhigh".to_owned()),
             context: Some("ctx: 164k/258k (63%)".to_owned()),
@@ -21029,6 +20995,7 @@ mod tests {
     fn status_line_places_the_five_hour_countdown_before_its_percent() {
         let line = status_line_row(
             Some(StatusLineView {
+                agent: AgentMode::Standard,
                 model: None,
                 effort: None,
                 context: None,
@@ -21048,6 +21015,7 @@ mod tests {
     fn status_line_omits_a_disabled_branch_slot() {
         let line = status_line_row(
             Some(StatusLineView {
+                agent: AgentMode::Standard,
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 context: None,
@@ -21061,7 +21029,8 @@ mod tests {
         );
 
         assert_eq!(line.prefix, " ");
-        assert_eq!(line.text, "GPT-5.6 Sol");
+        assert_eq!(line.text, "Standard");
+        assert!(painted(&line).contains("GPT-5.6 Sol"));
     }
 
     /// The two readings the status line lets you change answer to a click; the
@@ -21070,6 +21039,7 @@ mod tests {
     fn the_model_and_effort_readings_are_the_only_clickable_status_spans() {
         let line = status_line_row(
             Some(StatusLineView {
+                agent: AgentMode::Standard,
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
@@ -21088,7 +21058,14 @@ mod tests {
         assert_eq!(pick_on(&line, "45k/256k"), None);
         assert_eq!(pick_on(&line, "5h: 12%"), None);
         assert_eq!(pick_on(&line, "week: 34%"), None);
-        assert_eq!(line.tone, Tone::StatusModelSol);
+        assert_eq!(line.tone, Tone::AgentStandard);
+        assert_eq!(
+            line.tail
+                .iter()
+                .find(|span| span.text == "GPT-5.6 Sol")
+                .map(|span| span.tone),
+            Some(Tone::StatusModelSol)
+        );
         assert!(word_background(Tone::StatusModelSol).is_none());
         assert!(word_background(Tone::StatusEffortHigh).is_none());
         assert_eq!(
@@ -21104,6 +21081,7 @@ mod tests {
     fn effort_status_reading_has_no_unicode_width_override() {
         let line = status_line_row(
             Some(StatusLineView {
+                agent: AgentMode::Standard,
                 model: None,
                 effort: Some("high".to_owned()),
                 context: None,
@@ -22759,6 +22737,7 @@ mod tests {
         theme::set_current(ThemeKind::Dark);
         let line = status_line_row(
             Some(StatusLineView {
+                agent: AgentMode::Standard,
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 context: None,
