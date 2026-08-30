@@ -5162,6 +5162,7 @@ impl AppState {
 
     fn composer_mode(&self) -> ComposerMode {
         ComposerMode {
+            agent: self.agent_mode,
             branch: self.branch.clone(),
             vibe_mode: self.vibe_mode.label().to_owned(),
             vibe_tone: match self.vibe_mode {

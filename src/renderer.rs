@@ -419,6 +419,8 @@ pub enum VibeTone {
 }
 
 pub struct ComposerMode {
+    /// The agent role; the composer's `>` glyph borrows its colour.
+    pub agent: AgentMode,
     /// Current Git branch, shown as a display-only composer badge.
     pub branch: Option<String>,
     pub vibe_mode: String,
@@ -7518,8 +7520,14 @@ fn overlay_frame_with_expansion(
                             )
                             .into_iter()
                             .map(|line| {
+                                // The border split moved the marker/number into
+                                // span 0 and the label into span 1, so the click
+                                // region needs both to cover the visible row.
                                 close_panel_row(split_panel_border(line, Tone::Accent), panel_width)
-                                    .with_picks(&[(0, Pick::Row(row_index))])
+                                    .with_picks(&[
+                                        (0, Pick::Row(row_index)),
+                                        (1, Pick::Row(row_index)),
+                                    ])
                             }),
                         );
                     }
@@ -7560,8 +7568,14 @@ fn overlay_frame_with_expansion(
                             } else {
                                 Tone::Muted
                             };
+                            // Span 0 is the marker/number after the border
+                            // split; without span 1 the click region stops
+                            // short of the label and reads as shifted left.
                             close_panel_row(split_panel_border(line, marker), panel_width)
-                                .with_picks(&[(0, Pick::Row(row_index))])
+                                .with_picks(&[
+                                    (0, Pick::Row(row_index)),
+                                    (1, Pick::Row(row_index)),
+                                ])
                         }),
                     );
                 }
@@ -11625,6 +11639,14 @@ fn input_lines_with_controls(
         } else {
             continuation_prefix
         };
+        // The `>` glyph reads in the active role's colour, so the composer
+        // itself says which role the prompt will be sent under.
+        let prompt_tone = if index == 0 {
+            mode.map(|mode| agent_prompt_tone(mode.agent))
+                .unwrap_or(chrome_tone)
+        } else {
+            chrome_tone
+        };
         let content_width = UnicodeWidthStr::width(content.as_str());
         let content_tone = if is_placeholder {
             Tone::Muted
@@ -11653,7 +11675,7 @@ fn input_lines_with_controls(
             prefix: side_prefix.to_owned(),
             prefix_tone: chrome_tone,
             text: prompt_prefix.to_owned(),
-            tone: chrome_tone,
+            tone: prompt_tone,
             bold: false,
             tool_heading: None,
             pick: None,
@@ -12645,7 +12667,7 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::StatusEffortUltra => palette.status.effort_ultra,
         // Standard is the default and stays quiet; the three specialized roles
         // borrow colours already in the palette rather than adding theme fields.
-        Tone::AgentStandard => palette.muted,
+        Tone::AgentStandard => palette.sky_blue,
         Tone::AgentPlanner => palette.blue,
         Tone::AgentAdvisor => palette.purple,
         Tone::AgentFinisher => palette.error,
@@ -16917,6 +16939,7 @@ mod tests {
 
     fn test_mode(label: &str, accent: ModeAccent, fast_mode: bool) -> ComposerMode {
         ComposerMode {
+            agent: AgentMode::Standard,
             branch: None,
             vibe_mode: "Vibe: On".to_owned(),
             vibe_tone: VibeTone::On,
@@ -16949,12 +16972,27 @@ mod tests {
 
         assert_eq!(rows[0].tone, Tone::ModelTerra);
         assert_eq!(rows[1].prefix_tone, Tone::ModelTerra);
-        assert_eq!(rows[1].tone, Tone::ModelTerra);
+        // The `>` glyph carries the agent colour; the rest of the chrome keeps
+        // the model tone.
+        assert_eq!(rows[1].tone, Tone::AgentStandard);
         assert_eq!(
             rows[1].tail.last().map(|span| span.tone),
             Some(Tone::ModelTerra)
         );
         assert_eq!(rows.last().map(|line| line.tone), Some(Tone::ModelTerra));
+    }
+
+    /// A specialized role colours the `>` glyph with its own tone.
+    #[test]
+    fn the_prompt_glyph_borrows_the_agent_colour() {
+        let editor = Editor::default();
+        let mut mode = test_mode("Default", ModeAccent::Calm, false);
+        mode.agent = AgentMode::Finisher;
+
+        let (rows, _, _, _) = input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
+
+        assert_eq!(rows[1].text, "> ");
+        assert_eq!(rows[1].tone, Tone::AgentFinisher);
     }
 
     #[test]
@@ -18333,6 +18371,7 @@ mod tests {
             line: None,
             composer_notice: None,
             composer_mode: Some(ComposerMode {
+                agent: AgentMode::Standard,
                 branch: Some("main".to_owned()),
                 vibe_mode: "Super Vibe".to_owned(),
                 vibe_tone: VibeTone::Super,
@@ -21903,6 +21942,61 @@ mod tests {
                 .any(|line| line.contains("여기에 직접 입력")),
             "the placeholder still occupies the IME cells: {empty_painted:?}"
         );
+    }
+
+    /// The click region of a question option starts at the panel border, not
+    /// at the label: the border split leaves the marker and number in span 0,
+    /// and a region that skipped them read as shifted left of the row.
+    #[test]
+    fn question_option_click_region_covers_the_marker_number_and_label() {
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                closable: false,
+                title: "테스트".to_owned(),
+                lines: vec![
+                    OverlayLine {
+                        text: "질문 본문".to_owned(),
+                        selected: false,
+                        muted: true,
+                    },
+                    OverlayLine {
+                        text: "선택지 A".to_owned(),
+                        selected: true,
+                        muted: false,
+                    },
+                ],
+                slider: None,
+                hint: String::new(),
+                style: OverlayStyle::Question,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            },
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+        let line = frame
+            .lines
+            .iter()
+            .find(|line| painted(line).contains("선택지 A"))
+            .expect("the option row is painted");
+        let columns = line
+            .pick
+            .as_ref()
+            .and_then(|regions| regions.columns_of(&Pick::Row(1)))
+            .expect("the option row answers to a click");
+        // The row paints as `│ ❯  1. 선택지 A`, so the label spans columns
+        // 8..16. The click region must reach from the marker through the label
+        // (the usual one-column bleed on either side is fine).
+        assert!(columns.start <= 2, "region misses the marker: {columns:?}");
+        assert!(columns.end >= 16, "region stops short of the label: {columns:?}");
     }
 
     #[test]
