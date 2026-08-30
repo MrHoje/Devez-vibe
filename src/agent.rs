@@ -123,8 +123,10 @@ impl AgentTurnContext {
         let response_rules = match self {
             Self::Specialized(_) => {
                 "The standing DevezVibe language and formatting rules apply to this role \
-                 unchanged — answer in Korean, structured and readable. Only the response-length \
-                 caps do not apply to this role's output."
+                 unchanged — answer in Korean, structured and readable. The tight \
+                 response-length caps are relaxed for this role's output, with a soft bound in \
+                 their place: include only the sections that matter for this task, keep the \
+                 whole answer around 15 lines, and keep each item to a sentence or two."
             }
             Self::StandardReset => {
                 "The response rules and length caps from the standing DevezVibe instructions \
@@ -200,7 +202,8 @@ mod tests {
         for mode in [AgentMode::Planner, AgentMode::Advisor, AgentMode::Finisher] {
             let block = AgentTurnContext::Specialized(mode).render();
             assert!(block.contains("language and formatting rules"));
-            assert!(block.contains("caps do not apply"));
+            assert!(block.contains("caps are relaxed"));
+            assert!(block.contains("around 15 lines"));
         }
         assert!(reset.contains("length caps"));
         assert!(reset.contains("apply unchanged"));
