@@ -15,7 +15,7 @@ use serde_json::{Map, Value, json};
 use crate::terminal_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    agent::{AgentMode, AgentTurnContext},
+    agent::{self, AgentMode, AgentTurnContext},
     completion::{
         CompletionCandidate, CompletionKind, CompletionMode, CompletionSource, CompletionTarget,
         completion_target, completion_text, filter_candidates,
@@ -6418,8 +6418,14 @@ impl AppState {
             cwd: self.cwd.clone(),
             welcome: self.show_welcome.then(|| self.welcome_view()),
             suggestions: if self.pending.is_none() {
-                self.completion_suggestion_views()
-                    .unwrap_or_else(|| self.slash_suggestion_views())
+                self.completion_suggestion_views().unwrap_or_else(|| {
+                    let agents = self.agent_suggestion_views();
+                    if agents.is_empty() {
+                        self.slash_suggestion_views()
+                    } else {
+                        agents
+                    }
+                })
             } else {
                 Vec::new()
             },
@@ -7057,6 +7063,57 @@ impl AppState {
                             self.insert_completion(target, selected);
                         }
                         return Action::None;
+                    }
+                    KeyCode::Esc => {
+                        self.suggestions_dismissed_text = Some(self.editor.text());
+                        self.command_selection = 0;
+                        return Action::None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let agent_matches = self.matching_agent_arguments();
+        if !agent_matches.is_empty() {
+            if ctrl {
+                match key.code {
+                    KeyCode::Char('p') => {
+                        self.command_selection = self.command_selection.saturating_sub(1);
+                        return Action::None;
+                    }
+                    KeyCode::Char('n') => {
+                        self.command_selection =
+                            (self.command_selection + 1).min(agent_matches.len() - 1);
+                        return Action::None;
+                    }
+                    _ => {}
+                }
+            }
+            if !ctrl && !alt && !shift {
+                match key.code {
+                    KeyCode::Up => {
+                        self.command_selection = self.command_selection.saturating_sub(1);
+                        return Action::None;
+                    }
+                    KeyCode::Down => {
+                        self.command_selection =
+                            (self.command_selection + 1).min(agent_matches.len() - 1);
+                        return Action::None;
+                    }
+                    KeyCode::Tab => {
+                        let selected =
+                            agent_matches[self.command_selection.min(agent_matches.len() - 1)];
+                        self.editor.set_text(format!("/agent {}", selected.id()));
+                        self.command_selection = 0;
+                        return Action::None;
+                    }
+                    KeyCode::Enter => {
+                        let selected =
+                            agent_matches[self.command_selection.min(agent_matches.len() - 1)];
+                        self.editor.set_text(format!("/agent {}", selected.id()));
+                        self.command_selection = 0;
+                        return self.submit_editor();
                     }
                     KeyCode::Esc => {
                         self.suggestions_dismissed_text = Some(self.editor.text());
@@ -11753,6 +11810,41 @@ impl AppState {
                         .is_some_and(|model| !model.efforts.is_empty())
             })
             .filter(|command| command.name.starts_with(&text))
+            .collect()
+    }
+
+    /// Role candidates once the composer holds `/agent ` and a partial
+    /// argument, mirroring how command names complete.
+    fn matching_agent_arguments(&self) -> Vec<AgentMode> {
+        let text = self.editor.text();
+        let Some(rest) = text.strip_prefix("/agent ") else {
+            return Vec::new();
+        };
+        if rest.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        let rest = rest.to_ascii_lowercase();
+        agent::CHOICES
+            .into_iter()
+            .filter(|mode| mode.id().starts_with(&rest))
+            .collect()
+    }
+
+    fn agent_suggestion_views(&self) -> Vec<SuggestionView> {
+        if self.suggestions_dismissed_text.as_deref() == Some(self.editor.text().as_str()) {
+            return Vec::new();
+        }
+        self.matching_agent_arguments()
+            .into_iter()
+            .enumerate()
+            .map(|(index, mode)| SuggestionView {
+                command: format!("/agent {}", mode.id()),
+                description: format!("{} — {}", mode.label(), mode.detail()),
+                selected: index == self.command_selection,
+                category: None,
+                panel_title: "Agents",
+                hint: None,
+            })
             .collect()
     }
 
@@ -22400,6 +22492,27 @@ mod tests {
 
         state.prepare_new_thread();
         assert_eq!(state.next_agent_context(), None);
+    }
+
+    /// `/agent ` lists every role with its description, narrows on a partial
+    /// argument, and Enter both fills and runs the command.
+    #[test]
+    fn agent_arguments_complete_like_slash_commands() {
+        let mut state = idle_test_state();
+        state.editor.set_text("/agent ");
+        let suggestions = state.view().suggestions;
+        assert_eq!(suggestions.len(), 4);
+        assert!(suggestions[0].command.ends_with("builder"));
+        assert!(suggestions[0].description.contains("Builder"));
+
+        state.editor.set_text("/agent p");
+        let suggestions = state.view().suggestions;
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].command, "/agent planner");
+
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(state.agent_mode, AgentMode::Planner);
+        assert!(state.editor.is_empty());
     }
 
     /// A process launched with `-r` never calls `prepare_resume`, so the reset
