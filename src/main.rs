@@ -2245,6 +2245,7 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
             Action::Tick(true)
         }
         Pick::OpenLink(target) => Action::OpenUrl(target),
+        Pick::AgentMode => state.click_agent_mode(),
         Pick::Model => state.run_command("/model"),
         Pick::EffortSetting => state.run_command("/effort"),
         Pick::Subagent(index) => state.open_subagent(index),
@@ -7184,7 +7185,7 @@ mod tests {
             reset
                 .pointer("/devez-vibe-agent/value")
                 .and_then(Value::as_str)
-                .is_some_and(|block| block.contains("mode=\"standard\""))
+                .is_some_and(|block| block.contains("mode=\"builder\""))
         );
 
         assert!(

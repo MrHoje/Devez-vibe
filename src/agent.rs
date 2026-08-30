@@ -42,7 +42,7 @@ impl AgentMode {
     /// The wire and command spelling, e.g. `/agent planner`.
     pub fn id(self) -> &'static str {
         match self {
-            Self::Standard => "standard",
+            Self::Standard => "builder",
             Self::Planner => "planner",
             Self::Advisor => "advisor",
             Self::Finisher => "finisher",
@@ -52,7 +52,7 @@ impl AgentMode {
     /// The name shown in the status line and notices.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Standard => "Standard",
+            Self::Standard => "Builder",
             Self::Planner => "Planner",
             Self::Advisor => "Advisor",
             Self::Finisher => "Finisher",
@@ -190,7 +190,7 @@ mod tests {
             assert!(block.contains("supersedes every earlier devez-vibe-agent block"));
         }
         let reset = AgentTurnContext::StandardReset.render();
-        assert!(reset.contains("mode=\"standard\""));
+        assert!(reset.contains("mode=\"builder\""));
         assert!(reset.contains("Do not continue a Planner"));
         // The deliverable exemption belongs to specialized roles alone; a reset
         // restores plain preset behavior with no carve-outs.

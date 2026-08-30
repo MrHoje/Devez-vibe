@@ -5272,6 +5272,8 @@ pub enum Pick {
     PromptSection,
     McpSection(String),
     PluginSection(String),
+    /// The status line's agent reading: cycles to the next role, like Tab.
+    AgentMode,
     /// The status line's model name: opens `/model`.
     Model,
     /// The status line's effort reading: opens `/effort`.
@@ -7676,11 +7678,12 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         .is_some_and(|model| !is_open_code_model_label(model));
     let mut spans = Vec::new();
     let mut picks = Vec::new();
-    push_status_span(
+    let agent_span = push_status_span(
         &mut spans,
         status.agent.label(),
         agent_prompt_tone(status.agent),
     );
+    picks.push((agent_span, Pick::AgentMode));
     if let Some(model) = status.model.filter(|model| !model.is_empty()) {
         let span = push_status_span(
             &mut spans,
@@ -15331,8 +15334,8 @@ mod tests {
         renderer.previous_lines = vec![line];
 
         // The role opens the row, so the effort reading starts after
-        // " Standard | ".
-        let start = " Standard | ".len() as u16;
+        // " Builder | ".
+        let start = " Builder | ".len() as u16;
         assert!(renderer.begin_selection(start, 0));
         assert!(renderer.update_selection(start + 5, 0));
         let SelectionResult::Copy(copied) = renderer.finish_selection(start + 5, 0) else {
@@ -20883,7 +20886,7 @@ mod tests {
             32,
         );
         assert!(painted_width(&line) <= 32);
-        assert!(line.text.trim_start().starts_with("Standard"));
+        assert!(line.text.trim_start().starts_with("Builder"));
         assert!(painted(&line).ends_with("..."));
     }
 
@@ -21029,14 +21032,14 @@ mod tests {
         );
 
         assert_eq!(line.prefix, " ");
-        assert_eq!(line.text, "Standard");
+        assert_eq!(line.text, "Builder");
         assert!(painted(&line).contains("GPT-5.6 Sol"));
     }
 
-    /// The two readings the status line lets you change answer to a click; the
-    /// ones that only report — context and limits — do not.
+    /// The agent, model and effort readings answer to a click; the ones that
+    /// only report — context and limits — do not.
     #[test]
-    fn the_model_and_effort_readings_are_the_only_clickable_status_spans() {
+    fn the_agent_model_and_effort_readings_are_the_only_clickable_status_spans() {
         let line = status_line_row(
             Some(StatusLineView {
                 agent: AgentMode::Standard,
@@ -21052,6 +21055,7 @@ mod tests {
             80,
         );
 
+        assert_eq!(pick_on(&line, "Builder"), Some(Pick::AgentMode));
         assert_eq!(pick_on(&line, "GPT-5.6 Sol"), Some(Pick::Model));
         assert_eq!(pick_on(&line, "high"), Some(Pick::EffortSetting));
         assert_eq!(pick_on(&line, "main"), None);

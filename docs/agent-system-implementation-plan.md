@@ -1030,20 +1030,32 @@ fn turn_additional_context(vibe: VibeMode, agent_context: Option<&str>) -> Value
 
 ## 13.6 Context 순서
 
-Claude/OpenCode용 문자열 조합 순서:
+`src/backend.rs`의 `combined_turn_instructions()`가 만드는 현재 순서는 다음과 같다.
 
 ```text
-1. provider handoff context
-2. current agent instruction or Standard reset
-3. Vibe mode notice
-4. Claude-only reminder
+1. Vibe mode notice        (Claude/Codex만)
+2. provider handoff context
+3. Claude-only reminder    (Claude만)
+```
+
+문서 1차·2차 초안은 handoff를 첫 번째로 적었으나 이는 실제 구현과 다르다. 기존 Vibe 안내는 handoff보다 앞에 있으며, 이 순서는 이번 기능에서 바꾸지 않는다.
+
+확정 순서:
+
+```text
+1. Vibe mode notice        (기존 위치 유지)
+2. provider handoff context
+3. current agent instruction or Standard reset
+4. Claude-only reminder    (기존 위치 유지)
 ```
 
 이유:
 
-- handoff는 과거 대화 데이터에 가깝다.
-- current agent instruction은 과거 role을 명시적으로 supersede해야 한다.
-- Vibe와 Claude reminder는 최종 출력 형식 제약이다.
+- 기존 Vibe 안내와 Claude reminder의 상대 위치를 바꾸지 않아야 관련 회귀와 기존 테스트가 유지된다.
+- handoff는 과거 대화 데이터에 가까우므로 current agent instruction이 그 뒤에 와야 과거 role을 명시적으로 supersede한다.
+- Claude reminder는 최종 출력 형식 제약이므로 마지막에 남는다.
+
+구현 시 `combined_turn_instructions()`의 `parts` 배열에 agent 항목을 handoff 다음, Claude reminder 앞에 삽입한다. 기존 항목의 순서를 재배치하지 않는다.
 
 Codex는 application context map을 직접 받으므로 문자열 순서에 의존하지 않는다.
 
@@ -1115,9 +1127,30 @@ Claude background task notification이 main-agent 자동 응답을 열 수 있�
 
 `start_prompt_content()`가 instruction을 `<devez-vibe-rules>` 내부 block으로 prepend한다.
 
-### 변경
+`combined_turn_instructions()`는 runtime별로 서로 다른 항목만 통과시킨다. OpenCode는 의도적으로 공통 rules와 Vibe 안내를 받지 않으며, 현재는 provider handoff만 전달된다.
 
-- combined context에 agent block 포함
+```rust
+let mode = (runtime != RuntimeKind::OpenCode).then(...)
+let claude_reminder = (runtime == RuntimeKind::Claude).then(...)
+```
+
+### 필수 변경
+
+agent block은 이 필터에서 OpenCode를 제외하지 않는다. 세 provider 모두 통과해야 한다.
+
+```text
+devez-vibe-rules            → Claude/Codex는 system·thread 쪽에서 보유, OpenCode 제외 유지
+devez-vibe-mode             → OpenCode 제외 유지
+claude-devez-vibe-reminder  → Claude 전용 유지
+devez-vibe-agent            → Claude / Codex / OpenCode 모두 전달
+```
+
+이 예외를 넣지 않으면 OpenCode에서 역할 지침과 Standard reset이 한 번도 전달되지 않고, UI badge만 바뀌는 상태가 된다. 2차 초안의 "combined context에 agent block 포함"은 이 필터 변경을 전제로 한 서술이다.
+
+`src/open_code.rs`는 여전히 수정하지 않는다. 변경 지점은 `src/backend.rs`의 통과 조건 한 곳이다.
+
+### 그 밖의 변경
+
 - `session/set_mode` 호출 없음
 - native primary agent 이름과 DevezVibe agent를 동기화하지 않음
 
@@ -2112,10 +2145,13 @@ provider request가 성공하면 해당 turn에 사용한 `agent_context` snapsh
 
 ## 26.7 Backend — OpenCode
 
-1. agent context가 start_prompt_content로 전달
-2. internal rules block 안에 포함
-3. history replay에서 숨김
-4. native session mode 변경 없음
+1. `combined_turn_instructions()`가 OpenCode runtime에서 agent context를 통과시킴
+2. 같은 호출에서 공통 rules와 Vibe 안내는 계속 제외됨
+3. agent context가 start_prompt_content로 전달
+4. internal rules block 안에 포함
+5. history replay에서 숨김
+6. native session mode 변경 없음
+7. Standard reset도 OpenCode에 전달됨
 
 ## 26.8 Renderer
 
@@ -2512,6 +2548,8 @@ node scripts/check-codex-compatibility.mjs
 | Dispatch 실패 | request 생성 시 reset을 해제하면 상태 손실 | 성공 후에만 dispatch state 갱신 |
 | Claude history | 개별 agent tag strip으로 오해 가능 | 기존 length-delimited 전체 prefix strip을 사용한다고 명확화 |
 | Context 순서 | 현재 역할이 handoff/history에 묻힐 수 있음 | handoff 뒤에 current role 배치 |
+| Context 순서 실제값 | 초안이 handoff를 첫 항목으로 기술했으나 구현은 Vibe 안내가 먼저임 | 실제 순서를 기준으로 재작성하고 기존 항목 재배치 금지 |
+| OpenCode 전달 | OpenCode는 combined 필터에서 handoff만 통과해 역할이 전달되지 않음 | agent key를 세 provider 모두 통과시키는 예외를 명시 |
 | Planner read-only | 보안 경계처럼 오해 가능 | prompt-level 계약임을 반복 명시 |
 | Finisher background | 자동 continuation에 새 context 없음 | role block 지속 선언 + 변경 잠금 |
 | License | Hoje prompt 복제 정책 누락 | 재작성 원칙과 attribution 기준 추가 |
