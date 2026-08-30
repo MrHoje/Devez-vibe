@@ -59,13 +59,13 @@ impl AgentMode {
         }
     }
 
-    /// One line for the picker, in the UI language of the rest of the composer.
+    /// One line for the picker.
     pub fn detail(self) -> &'static str {
         match self {
-            Self::Standard => "일상 작업에 최적화된 기본 에이전트입니다.",
-            Self::Planner => "요구를 명확히 하고 저장소 기반 구현 계획을 세웁니다.",
-            Self::Advisor => "접근법의 위험, 장단점, 대안과 추천을 제시합니다.",
-            Self::Finisher => "구현, 검증, 리뷰를 완료 상태까지 밀어붙입니다.",
+            Self::Standard => "The default agent, tuned for everyday work.",
+            Self::Planner => "Clarifies requirements and plans from the repository.",
+            Self::Advisor => "Weighs risks and trade-offs, then recommends.",
+            Self::Finisher => "Implements, verifies, and reviews until done.",
         }
     }
 
@@ -117,23 +117,14 @@ impl AgentTurnContext {
             ),
             Self::StandardReset => (AgentMode::Standard, STANDARD_RESET),
         };
-        // A plan or a verdict squeezed into a response-length cap loses exactly
-        // the substance the role exists for, so the deliverable is exempted the
-        // way the presets already exempt questions and option lists.
-        let precedence = match self {
-            Self::Specialized(_) => {
-                "The role's deliverable — its plan, verdict, or final report — counts as content \
-                 the response-length caps already exempt; keep the conversational framing around \
-                 it as brief as those caps ask.\n"
-            }
-            Self::StandardReset => "",
-        };
+        // Every role answers under the same Devez response rules; the block
+        // changes how the work is approached, never how the answer is formatted.
         format!(
             "<devez-vibe-agent mode=\"{}\" version=\"1\">\nThis block sets the current DevezVibe \
              agent mode. It supersedes every earlier devez-vibe-agent block in this conversation, \
-             and stays in effect until another one arrives.\n{}\n{}\n</devez-vibe-agent>",
+             and stays in effect until another one arrives. The response rules and length caps \
+             from the standing DevezVibe instructions apply to this role unchanged.\n\n{}\n</devez-vibe-agent>",
             mode.id(),
-            precedence,
             body.trim()
         )
     }
@@ -192,15 +183,17 @@ mod tests {
         let reset = AgentTurnContext::StandardReset.render();
         assert!(reset.contains("mode=\"builder\""));
         assert!(reset.contains("Do not continue a Planner"));
-        // The deliverable exemption belongs to specialized roles alone; a reset
-        // restores plain preset behavior with no carve-outs.
-        assert!(!reset.contains("deliverable"));
-        for mode in [AgentMode::Planner, AgentMode::Advisor, AgentMode::Finisher] {
-            assert!(
-                AgentTurnContext::Specialized(mode)
-                    .render()
-                    .contains("deliverable")
-            );
+        // Every role — reset included — answers under the same response rules,
+        // with no per-role formatting carve-outs.
+        for context in [
+            AgentTurnContext::StandardReset,
+            AgentTurnContext::Specialized(AgentMode::Planner),
+            AgentTurnContext::Specialized(AgentMode::Advisor),
+            AgentTurnContext::Specialized(AgentMode::Finisher),
+        ] {
+            let block = context.render();
+            assert!(!block.contains("deliverable"));
+            assert!(block.contains("response rules and length caps"));
         }
     }
 
