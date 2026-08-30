@@ -1,3 +1,4 @@
+mod agent;
 mod app_server;
 mod backend;
 mod child_process;
@@ -29,6 +30,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use agent::AgentTurnContext;
 use anyhow::{Context, Result, bail};
 use app_server::ServerEvent;
 use arboard::{Clipboard, ImageData};
@@ -257,7 +259,7 @@ async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
     state.push_notice(
         BlockKind::Update,
         "Tip",
-        "/: Command\n@: Mentions\n$: Skills\n/provider: Set Claude Codex provider\n/side-panel: Choose side panel size\n/vibemode: Set Vibe mode\n/Response: Set Response compression type\nShift + ↑↓ model · ←→ effort\nAlt + P: Cycle side panel size",
+        "/: Command\n@: Mentions\n$: Skills\n/provider: Set Claude Codex provider\n/side-panel: Choose side panel size\n/vibemode: Set Vibe mode\n/Response: Set Response compression type\nTab: Cycle agent role\nShift + ↑↓ model · ←→ effort\nAlt + P: Cycle side panel size",
     );
     if fallback_to_claude {
         state.push_notice(
@@ -326,6 +328,9 @@ async fn start_session(
 ) -> Result<()> {
     state.set_host_loading(is_resuming);
     if is_resuming {
+        // The transcript being reopened can still carry a specialized role from
+        // the process that wrote it, so the first Standard turn retires it.
+        state.note_resumed_transcript();
         server.prepare_resume_runtime(resume_id).await?;
     }
     let claude = claude_session_settings(state);
@@ -1189,13 +1194,14 @@ async fn start_split_turn(
     state.note_pending_turn_model(&model);
     state.note_pending_turn_effort(&effort);
     let input = state.turn_input(text);
+    let agent_context = state.next_agent_context();
     let mut params = json!({
         "threadId": state.thread_id,
         "input": input,
         "model": model,
         "serviceTier": state.service_tier(),
         "permissions": state.permission_profile(),
-        "additionalContext": turn_additional_context(state.vibe_mode())
+        "additionalContext": turn_additional_context(state.vibe_mode(), agent_context)
     });
     if !effort.is_empty() {
         params["effort"] = json!(effort);
@@ -1208,6 +1214,8 @@ async fn start_split_turn(
     }
     if let Err(error) = server.request("turn/start", params).await {
         state.set_request_failed(error.to_string());
+    } else {
+        state.note_agent_dispatch_succeeded(agent_context);
     }
 }
 
@@ -4383,8 +4391,8 @@ fn resume_thread_params(thread_id: &str, claude: &ClaudeSessionSettings) -> Valu
 /// preset. Claude also gets one short per-turn reminder for the response limits
 /// it tends to miss. The full rules stay here for the one runtime with no
 /// standing instructions of its own.
-fn turn_additional_context(vibe: VibeMode) -> Value {
-    json!({
+fn turn_additional_context(vibe: VibeMode, agent: Option<AgentTurnContext>) -> Value {
+    let mut context = json!({
         "devez-vibe-rules": {
             "value": DEVEZ_INSTRUCTIONS,
             "kind": "application"
@@ -4401,7 +4409,16 @@ fn turn_additional_context(vibe: VibeMode) -> Value {
             "value": vibe.turn_notice(),
             "kind": "application"
         }
-    })
+    });
+    // Standard adds no key at all once its reset has landed, so a session that
+    // never leaves Standard sends exactly what it sent before roles existed.
+    if let Some(agent) = agent {
+        context["devez-vibe-agent"] = json!({
+            "value": agent.render(),
+            "kind": "application"
+        });
+    }
+    context
 }
 
 /// Every value Codex accepts for `sessionStartSource`. It rejects the whole
@@ -5236,13 +5253,14 @@ async fn start_turn(
     state.note_pending_turn_model(&model);
     state.note_pending_turn_effort(&effort);
     let input = state.turn_input(text);
+    let agent_context = state.next_agent_context();
     let mut params = json!({
         "threadId": state.thread_id,
         "input": input,
         "model": model,
         "serviceTier": state.service_tier(),
         "permissions": state.permission_profile(),
-        "additionalContext": turn_additional_context(state.vibe_mode())
+        "additionalContext": turn_additional_context(state.vibe_mode(), agent_context)
     });
     if !effort.is_empty() {
         params["effort"] = json!(effort);
@@ -5256,7 +5274,9 @@ async fn start_turn(
     match await_with_activity(state, renderer, server.request("turn/start", params)).await? {
         // The response reserves an id, but the app-server makes it
         // interruptible only after the subsequent `turn/started` notification.
-        Ok(_) => {}
+        // The role is recorded here rather than at build time so a failed send
+        // leaves a Standard reset still owed.
+        Ok(_) => state.note_agent_dispatch_succeeded(agent_context),
         Err(error) => state.set_request_failed(error.to_string()),
     }
     Ok(())
@@ -7102,7 +7122,7 @@ mod tests {
     #[test]
     fn every_turn_names_the_active_preset() {
         let notice = |vibe| {
-            turn_additional_context(vibe)
+            turn_additional_context(vibe, None)
                 .pointer("/devez-vibe-mode/value")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
@@ -7139,9 +7159,44 @@ mod tests {
         }
     }
 
+    /// The role travels as its own application context key, and a Standard turn
+    /// with nothing owed adds no key at all.
+    #[test]
+    fn the_turn_carries_the_selected_role_and_nothing_when_standard() {
+        let planner = turn_additional_context(
+            VibeMode::Vibe,
+            Some(AgentTurnContext::Specialized(agent::AgentMode::Planner)),
+        );
+        let block = planner
+            .pointer("/devez-vibe-agent/value")
+            .and_then(Value::as_str)
+            .expect("a specialized turn names its role");
+        assert!(block.starts_with("<devez-vibe-agent mode=\"planner\""));
+        assert_eq!(
+            planner
+                .pointer("/devez-vibe-agent/kind")
+                .and_then(Value::as_str),
+            Some("application")
+        );
+
+        let reset = turn_additional_context(VibeMode::Vibe, Some(AgentTurnContext::StandardReset));
+        assert!(
+            reset
+                .pointer("/devez-vibe-agent/value")
+                .and_then(Value::as_str)
+                .is_some_and(|block| block.contains("mode=\"standard\""))
+        );
+
+        assert!(
+            turn_additional_context(VibeMode::Vibe, None)
+                .get("devez-vibe-agent")
+                .is_none()
+        );
+    }
+
     #[test]
     fn every_turn_restates_the_rules() {
-        let context = turn_additional_context(VibeMode::Vibe);
+        let context = turn_additional_context(VibeMode::Vibe, None);
 
         assert_eq!(
             context
