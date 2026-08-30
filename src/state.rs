@@ -10972,8 +10972,10 @@ impl AppState {
                     .into_iter()
                     .enumerate()
                     .map(|(index, mode)| OverlayLine {
+                        // The US separator splits the row into the name and
+                        // description columns the slash-command list draws.
                         text: format!(
-                            "{}. {}{}  {}",
+                            "{}. {}{}\u{1f}{}",
                             index + 1,
                             mode.label(),
                             if mode == self.agent_mode { " ●" } else { "" },

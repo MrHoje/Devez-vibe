@@ -62,7 +62,7 @@ impl AgentMode {
     /// One line for the picker, in the UI language of the rest of the composer.
     pub fn detail(self) -> &'static str {
         match self {
-            Self::Standard => "기존 기본 하네스로 일반 작업을 수행합니다.",
+            Self::Standard => "일상 작업에 최적화된 기본 에이전트입니다.",
             Self::Planner => "요구를 명확히 하고 저장소 기반 구현 계획을 세웁니다.",
             Self::Advisor => "접근법의 위험, 장단점, 대안과 추천을 제시합니다.",
             Self::Finisher => "구현, 검증, 리뷰를 완료 상태까지 밀어붙입니다.",

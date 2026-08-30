@@ -6801,6 +6801,59 @@ fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine
     lines
 }
 
+/// A picker row drawn the way the slash-command list draws its own: marker and
+/// name light up in the accent when selected, the description stays muted.
+fn picker_suggestion_row(
+    name: &str,
+    description: &str,
+    selected: bool,
+    name_width: usize,
+    panel_width: usize,
+) -> PaintLine {
+    let inner_width = panel_width.saturating_sub(2);
+    let fixed_width = 4 + name_width + 2;
+    let description_width = inner_width
+        .saturating_sub(SUGGESTION_RIGHT_INSET)
+        .saturating_sub(fixed_width);
+    let name = compact_right(name, name_width);
+    let name_padding = name_width.saturating_sub(UnicodeWidthStr::width(name.as_str()));
+    let description = compact_right(description, description_width);
+    let marker = if selected { "❯" } else { " " };
+    let name_tone = if selected { Tone::Accent } else { Tone::Plain };
+    let line = PaintLine {
+        prefix: "│".to_owned(),
+        prefix_tone: Tone::Border,
+        text: " ".to_owned(),
+        tone: Tone::Muted,
+        bold: false,
+        tool_heading: None,
+        pick: None,
+        tail: vec![
+            PaintSpan {
+                text: marker.to_owned(),
+                tone: if selected { Tone::Accent } else { Tone::Muted },
+                bold: selected,
+            },
+            PaintSpan {
+                text: "  ".to_owned(),
+                tone: Tone::Muted,
+                bold: false,
+            },
+            PaintSpan {
+                text: format!("{name}{}  ", " ".repeat(name_padding)),
+                tone: name_tone,
+                bold: selected,
+            },
+            PaintSpan {
+                text: description,
+                tone: Tone::Muted,
+                bold: false,
+            },
+        ],
+    };
+    close_panel_row(line, panel_width)
+}
+
 fn named_suggestion_line(
     suggestion: &SuggestionView,
     label: &str,
@@ -7223,9 +7276,31 @@ fn overlay_frame_with_expansion(
                 lines.push(panel_padding_row(panel_width));
             }
 
+            // A row may carry a two-column body (name US description); the
+            // name column is sized once so every description starts flush.
+            let picker_name_width = overlay
+                .lines
+                .iter()
+                .filter_map(|row| row.text.split_once('\u{1f}').map(|(name, _)| name))
+                .map(UnicodeWidthStr::width)
+                .max()
+                .unwrap_or_default();
             for (row_index, row) in overlay.lines.iter().enumerate() {
                 if row.text.is_empty() {
                     lines.push(panel_padding_row(panel_width));
+                    continue;
+                }
+                if let Some((name, description)) = row.text.split_once('\u{1f}') {
+                    lines.push(
+                        picker_suggestion_row(
+                            name,
+                            description,
+                            row.selected,
+                            picker_name_width,
+                            panel_width,
+                        )
+                        .with_picks(&[(0, Pick::Row(row_index)), (1, Pick::Row(row_index))]),
+                    );
                     continue;
                 }
                 for (part_index, part) in row.text.lines().enumerate() {
@@ -12668,7 +12743,9 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         // Standard is the default and stays quiet; the three specialized roles
         // borrow colours already in the palette rather than adding theme fields.
         Tone::AgentStandard => palette.sky_blue,
-        Tone::AgentPlanner => palette.blue,
+        // OpenCode paints its plan agent in the theme's secondary blue, and
+        // this palette field carries exactly that reference value per theme.
+        Tone::AgentPlanner => palette.model_opencode,
         Tone::AgentAdvisor => palette.purple,
         Tone::AgentFinisher => palette.error,
         Tone::Border => palette.border,
