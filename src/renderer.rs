@@ -27,6 +27,7 @@ use crossterm::{
     },
 };
 use crate::{
+    agent::AgentMode,
     editor::{ATTACHMENT_PLACEHOLDER, Editor},
     selection::{
         CellPosition, CellRange, CopyLine, Selection, SelectionFinish, extract_text,
@@ -416,6 +417,8 @@ pub enum VibeTone {
 }
 
 pub struct ComposerMode {
+    /// The agent role, drawn into the prompt prefix when it is not `Standard`.
+    pub agent: AgentMode,
     /// Current Git branch, shown as a display-only composer badge.
     pub branch: Option<String>,
     pub vibe_mode: String,
@@ -5201,6 +5204,10 @@ enum Tone {
     StatusEffortXHigh,
     StatusEffortMax,
     StatusEffortUltra,
+    AgentStandard,
+    AgentPlanner,
+    AgentAdvisor,
+    AgentFinisher,
     Border,
     SidePanelDivider,
     Branch,
@@ -11490,8 +11497,16 @@ fn input_lines_with_controls(
     let display_chars = display.chars().collect::<Vec<_>>();
     let panel_width = (width as usize).saturating_sub(1).max(16);
     let side_prefix = "│ ";
-    let first_prefix = "> ";
-    let continuation_prefix = "  ";
+    // A specialized role names itself in the prompt so the input line reads
+    // `Planner > `; Standard keeps the bare prompt it always had.
+    let agent = mode.map(|mode| mode.agent).unwrap_or_default();
+    let first_prefix = match agent {
+        AgentMode::Standard => "> ".to_owned(),
+        role => format!("{} > ", role.label()),
+    };
+    let first_prefix = first_prefix.as_str();
+    let continuation_padding = " ".repeat(UnicodeWidthStr::width(first_prefix));
+    let continuation_prefix = continuation_padding.as_str();
     let content_width = panel_width
         .saturating_sub(
             UnicodeWidthStr::width(side_prefix)
@@ -11634,11 +11649,16 @@ fn input_lines_with_controls(
                 bold: false,
             },
         ]);
+        let prompt_tone = if index == 0 && agent != AgentMode::Standard {
+            agent_prompt_tone(agent)
+        } else {
+            chrome_tone
+        };
         rows.push(PaintLine {
             prefix: side_prefix.to_owned(),
             prefix_tone: chrome_tone,
             text: prompt_prefix.to_owned(),
-            tone: chrome_tone,
+            tone: prompt_tone,
             bold: false,
             tool_heading: None,
             pick: None,
@@ -12552,6 +12572,15 @@ fn status_model_tone(model: &str) -> Option<Tone> {
     }
 }
 
+fn agent_prompt_tone(mode: AgentMode) -> Tone {
+    match mode {
+        AgentMode::Standard => Tone::AgentStandard,
+        AgentMode::Planner => Tone::AgentPlanner,
+        AgentMode::Advisor => Tone::AgentAdvisor,
+        AgentMode::Finisher => Tone::AgentFinisher,
+    }
+}
+
 fn status_effort_tone(effort: &str) -> Option<Tone> {
     Some(match effort {
         "low" => Tone::StatusEffortLow,
@@ -12619,6 +12648,12 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::StatusEffortXHigh => palette.status.effort_xhigh,
         Tone::StatusEffortMax => palette.status.effort_max,
         Tone::StatusEffortUltra => palette.status.effort_ultra,
+        // Standard is the default and stays quiet; the three specialized roles
+        // borrow colours already in the palette rather than adding theme fields.
+        Tone::AgentStandard => palette.muted,
+        Tone::AgentPlanner => palette.blue,
+        Tone::AgentAdvisor => palette.purple,
+        Tone::AgentFinisher => palette.success,
         Tone::Border => palette.border,
         Tone::SidePanelDivider => blend(
             palette.hover_bg,
@@ -16883,6 +16918,7 @@ mod tests {
 
     fn test_mode(label: &str, accent: ModeAccent, fast_mode: bool) -> ComposerMode {
         ComposerMode {
+            agent: AgentMode::Standard,
             branch: None,
             vibe_mode: "Vibe: On".to_owned(),
             vibe_tone: VibeTone::On,
@@ -16904,6 +16940,46 @@ mod tests {
         mode.vibe_mode = "Vibe: Super Vibe".to_owned();
         mode.vibe_tone = VibeTone::Super;
         mode
+    }
+
+    /// A specialized role names itself in the prompt prefix with its own
+    /// colour; Standard keeps the bare `> ` it always had.
+    #[test]
+    fn a_specialized_role_names_itself_in_the_composer_prompt() {
+        let editor = Editor::default();
+        let mut mode = test_mode("Default", ModeAccent::Calm, false);
+        mode.agent = AgentMode::Planner;
+
+        let (rows, _, _, _) = input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
+
+        assert_eq!(rows[1].text, "Planner > ");
+        assert_eq!(rows[1].tone, Tone::AgentPlanner);
+
+        mode.agent = AgentMode::Standard;
+        let (rows, _, _, _) = input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
+        assert_eq!(rows[1].text, "> ");
+    }
+
+    /// The wider role prefix must not desynchronize wrapped rows: continuation
+    /// rows pad to the same width so the click-to-cursor math stays aligned.
+    #[test]
+    fn the_role_prefix_keeps_continuation_rows_aligned() {
+        let mut editor = Editor::default();
+        editor.set_text("alpha\nbeta");
+        let mut mode = test_mode("Default", ModeAccent::Calm, false);
+        mode.agent = AgentMode::Finisher;
+
+        let (rows, _, _, layout) =
+            input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
+
+        assert_eq!(rows[1].text, "Finisher > ");
+        assert_eq!(rows[2].text, " ".repeat("Finisher > ".len()));
+        let columns = layout
+            .rows
+            .iter()
+            .map(|row| row.start_column)
+            .collect::<Vec<_>>();
+        assert_eq!(columns, vec![columns[0]; columns.len()]);
     }
 
     #[test]
@@ -18299,6 +18375,7 @@ mod tests {
             line: None,
             composer_notice: None,
             composer_mode: Some(ComposerMode {
+                agent: AgentMode::Standard,
                 branch: Some("main".to_owned()),
                 vibe_mode: "Super Vibe".to_owned(),
                 vibe_tone: VibeTone::Super,

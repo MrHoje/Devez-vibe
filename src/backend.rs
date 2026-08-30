@@ -2357,11 +2357,18 @@ fn combined_turn_instructions(params: &Value, runtime: RuntimeKind) -> Option<St
                 .and_then(Value::as_str)
         })
         .flatten();
+    // The agent role is the one piece every runtime needs: OpenCode is skipped
+    // for the shared rules and the mode notice, but a role that never reaches it
+    // would leave the status line claiming a role the session is not in.
+    let agent = params
+        .pointer("/additionalContext/devez-vibe-agent/value")
+        .and_then(Value::as_str);
     let parts = [
         mode,
         params
             .pointer("/additionalContext/provider-handoff/value")
             .and_then(Value::as_str),
+        agent,
         claude_reminder,
     ]
     .into_iter()
@@ -2937,6 +2944,76 @@ mod tests {
         assert_eq!(
             combined_turn_instructions(&params, RuntimeKind::OpenCode).as_deref(),
             Some("history")
+        );
+    }
+
+    /// Every runtime needs the role, including the one that is skipped for the
+    /// shared rules and the preset notice.
+    #[test]
+    fn the_agent_role_reaches_all_three_runtimes() {
+        let params = json!({
+            "additionalContext": {
+                "devez-vibe-rules": { "value": "codex rules", "kind": "application" },
+                "claude-devez-vibe-rules": { "value": "claude rules", "kind": "application" },
+                "devez-vibe-mode": { "value": "super vibe", "kind": "application" },
+                "claude-devez-vibe-reminder": { "value": "claude reminder", "kind": "application" },
+                "devez-vibe-agent": { "value": "planner block", "kind": "application" }
+            }
+        });
+
+        // The role sits after the handoff slot and before the output reminder.
+        assert_eq!(
+            combined_turn_instructions(&params, RuntimeKind::Claude).as_deref(),
+            Some("super vibe\n\nplanner block\n\nclaude reminder")
+        );
+        assert_eq!(
+            combined_turn_instructions(&params, RuntimeKind::Codex).as_deref(),
+            Some("super vibe\n\nplanner block")
+        );
+        assert_eq!(
+            combined_turn_instructions(&params, RuntimeKind::OpenCode).as_deref(),
+            Some("planner block")
+        );
+    }
+
+    /// A Standard turn with its reset already spent sends no role key, and the
+    /// combined instructions have to look exactly as they did before roles.
+    #[test]
+    fn a_turn_without_a_role_key_is_unchanged() {
+        let params = json!({
+            "additionalContext": {
+                "devez-vibe-mode": { "value": "super vibe", "kind": "application" }
+            }
+        });
+
+        assert_eq!(
+            combined_turn_instructions(&params, RuntimeKind::Claude).as_deref(),
+            Some("super vibe")
+        );
+        assert_eq!(
+            combined_turn_instructions(&params, RuntimeKind::OpenCode).as_deref(),
+            None
+        );
+    }
+
+    /// Codex strips the keys its thread instructions already hold; the role is
+    /// not one of them.
+    #[test]
+    fn the_codex_boundary_keeps_the_agent_role() {
+        let mut params = json!({
+            "additionalContext": {
+                "devez-vibe-rules": { "value": "full rules", "kind": "application" },
+                "devez-vibe-agent": { "value": "planner block", "kind": "application" }
+            }
+        });
+
+        prepare_codex_turn_context(&mut params);
+
+        assert_eq!(
+            params
+                .pointer("/additionalContext/devez-vibe-agent/value")
+                .and_then(Value::as_str),
+            Some("planner block")
         );
     }
 
