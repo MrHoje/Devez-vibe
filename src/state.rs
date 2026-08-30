@@ -1697,6 +1697,11 @@ enum PendingInteraction {
     RuntimePicker {
         selected: usize,
     },
+    /// `/agent` or the status line's agent reading: which role the next turn
+    /// is sent under. Moving the cursor previews nothing; Enter commits.
+    AgentPicker {
+        selected: usize,
+    },
     /// A subagent's recorded work, opened from its row under the composer. Read
     /// only: closing it hands the main thread straight back.
     SubagentTranscript {
@@ -3114,6 +3119,7 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
             | PendingInteraction::SidePanelPicker { .. }
             | PendingInteraction::SidePanelScope { .. }
             | PendingInteraction::RuntimePicker { .. }
+            | PendingInteraction::AgentPicker { .. }
             | PendingInteraction::SettingPicker { .. }
             | PendingInteraction::ClaudePermissionsPanel { .. }
             | PendingInteraction::ClaudePermissionScopePicker { .. }
@@ -4101,10 +4107,32 @@ impl AppState {
         self.set_agent_mode(self.agent_mode.next())
     }
 
-    /// The status line's agent reading: a click steps the role the way Tab
-    /// does, honoring the same busy/queue locks.
+    /// The status line's agent reading and bare `/agent` share this picker.
+    fn open_agent_picker(&mut self) -> Action {
+        if self.agent_change_blocked() {
+            self.set_composer_notice(
+                "• 현재 작업이 끝난 뒤 Agent를 변경할 수 있습니다.".to_owned(),
+            );
+            return Action::Tick(true);
+        }
+        let selected = agent::CHOICES
+            .into_iter()
+            .position(|mode| mode == self.agent_mode)
+            .unwrap_or(0);
+        self.pending = Some(PendingInteraction::AgentPicker { selected });
+        Action::Tick(true)
+    }
+
+    fn apply_agent_choice(&mut self, index: usize) -> Action {
+        let Some(mode) = agent::CHOICES.get(index).copied() else {
+            return Action::None;
+        };
+        self.set_agent_mode(mode)
+    }
+
+    /// The status line's agent reading opens the same picker `/agent` does.
     pub fn click_agent_mode(&mut self) -> Action {
-        self.cycle_agent_mode()
+        self.open_agent_picker()
     }
 
     /// What the next turn should carry about the role. `Standard` sends nothing
@@ -9313,15 +9341,7 @@ impl AppState {
             }
             "/agent" => {
                 let Some(argument) = parts.get(1) else {
-                    // Bare `/agent` reports where the session already is rather
-                    // than moving it, since Tab is the way to move.
-                    let mode = self.agent_mode;
-                    self.set_composer_notice(format!(
-                        "• Agent: {} — {}",
-                        mode.label(),
-                        mode.detail()
-                    ));
-                    return Action::Tick(true);
+                    return self.open_agent_picker();
                 };
                 let Some(mode) = AgentMode::parse(argument) else {
                     self.set_composer_notice(
@@ -9754,6 +9774,26 @@ impl AppState {
                     _ => {}
                 }
                 self.pending = Some(PendingInteraction::RuntimePicker { selected });
+                Action::None
+            }
+            PendingInteraction::AgentPicker { mut selected } => {
+                let count = agent::CHOICES.len();
+                match key.code {
+                    KeyCode::Esc => return Action::None,
+                    KeyCode::Up => selected = selected.saturating_sub(1),
+                    KeyCode::Char('p') if ctrl => selected = selected.saturating_sub(1),
+                    KeyCode::Char('k') if !ctrl && !alt => selected = selected.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Tab => selected = (selected + 1).min(count - 1),
+                    KeyCode::Char('n') if ctrl => selected = (selected + 1).min(count - 1),
+                    KeyCode::Char('j') if !ctrl && !alt => selected = (selected + 1).min(count - 1),
+                    KeyCode::Char(ch @ '1'..='4') => {
+                        let row = ch.to_digit(10).unwrap_or(1) as usize - 1;
+                        return self.apply_agent_choice(row);
+                    }
+                    KeyCode::Enter => return self.apply_agent_choice(selected),
+                    _ => {}
+                }
+                self.pending = Some(PendingInteraction::AgentPicker { selected });
                 Action::None
             }
             PendingInteraction::SettingPicker {
@@ -10920,6 +10960,31 @@ impl AppState {
                 slider: None,
                 hint: "1-3 Select  ·  ↑↓ Move  ·  Enter Use  ·  Space Toggle connection  ·  Esc Close"
                     .to_owned(),
+                style: OverlayStyle::Picker,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            }),
+            PendingInteraction::AgentPicker { selected } => Some(OverlayView {
+                closable: true,
+                title: "Agent".to_owned(),
+                lines: agent::CHOICES
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, mode)| OverlayLine {
+                        text: format!(
+                            "{}. {}{}  {}",
+                            index + 1,
+                            mode.label(),
+                            if mode == self.agent_mode { " ●" } else { "" },
+                            mode.detail()
+                        ),
+                        selected: index == *selected,
+                        muted: false,
+                    })
+                    .collect(),
+                slider: None,
+                hint: "1-4 Select  ·  ↑↓ Move  ·  Enter Use  ·  Esc Close".to_owned(),
                 style: OverlayStyle::Picker,
                 input: None,
                 input_label: "",
@@ -12734,6 +12799,9 @@ impl AppState {
             // a mis-aimed click never drops a provider.
             Some(PendingInteraction::RuntimePicker { .. }) if row < RUNTIME_CHOICES.len() => {
                 self.apply_runtime_choice(row)
+            }
+            Some(PendingInteraction::AgentPicker { .. }) if row < agent::CHOICES.len() => {
+                self.apply_agent_choice(row)
             }
             Some(PendingInteraction::SkillsPicker {
                 provider,
@@ -22493,6 +22561,33 @@ mod tests {
 
         state.prepare_new_thread();
         assert_eq!(state.next_agent_context(), None);
+    }
+
+    /// Bare `/agent` opens a picker over the four roles; Enter commits the
+    /// highlighted one, and moving the cursor alone changes nothing.
+    #[test]
+    fn bare_agent_command_opens_a_role_picker() {
+        let mut state = idle_test_state();
+
+        state.editor.set_text("/agent");
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        let overlay = state.view().overlay.expect("the picker is open");
+        assert_eq!(overlay.title, "Agent");
+        assert_eq!(overlay.lines.len(), 4);
+        assert!(overlay.lines[0].text.contains("Builder"));
+        assert!(overlay.lines[3].text.contains("Finisher"));
+
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(state.agent_mode, AgentMode::Standard);
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(state.agent_mode, AgentMode::Planner);
+        assert!(state.pending.is_none());
+
+        // Esc leaves the role untouched.
+        state.editor.set_text("/agent");
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(state.agent_mode, AgentMode::Planner);
     }
 
     /// `/agent ` lists every role with its description, narrows on a partial
