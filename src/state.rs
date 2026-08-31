@@ -6442,7 +6442,9 @@ impl AppState {
                 // from, so its own hint sits exactly where the chord applies.
                 "Ctrl+S: restore stashed draft"
             } else {
-                ""
+                // Idle is when Tab actually changes the role, so the hint sits
+                // in the empty composer rather than in /help alone.
+                "Tab: Change dvz agent"
             },
             cwd: self.cwd.clone(),
             welcome: self.show_welcome.then(|| self.welcome_view()),
@@ -16021,7 +16023,7 @@ mod tests {
         assert_eq!(state.editor.cursor(), cursor);
         assert_eq!(state.composer_images, [r"C:\Temp\shot.bmp"]);
         assert!(state.stashed_prompt.is_none());
-        assert_eq!(state.view().composer_placeholder, "");
+        assert_eq!(state.view().composer_placeholder, "Tab: Change dvz agent");
 
         // A second stash replaces the first.
         state.handle_key(ctrl_s);
@@ -22447,6 +22449,17 @@ mod tests {
             state.view().composer_placeholder,
             "Enter: steer · Alt+Enter: queue"
         );
+    }
+
+    /// Idle is when Tab actually changes the role, so the empty composer
+    /// carries the agent hint instead of staying blank.
+    #[test]
+    fn idle_empty_composer_shows_the_agent_tab_hint() {
+        let mut state = busy_state_with_live_turn();
+        state.busy = false;
+        state.turn_id = None;
+
+        assert_eq!(state.view().composer_placeholder, "Tab: Change dvz agent");
     }
 
     #[test]
