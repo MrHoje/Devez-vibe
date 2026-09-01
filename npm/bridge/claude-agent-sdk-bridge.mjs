@@ -2854,6 +2854,86 @@ async function readableCwd(id, cwd) {
   return await transcriptCwd(id) || cwd;
 }
 
+const transcriptPaths = new Map();
+
+/** Locate `id`'s transcript file under any project folder. */
+async function transcriptPath(id) {
+  const cached = transcriptPaths.get(id);
+  if (cached && existsSync(cached)) return cached;
+  let entries;
+  try {
+    entries = await readdir(claudeProjectsDir(), { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const path = join(claudeProjectsDir(), entry.name, `${id}.jsonl`);
+    if (existsSync(path)) {
+      transcriptPaths.set(id, path);
+      return path;
+    }
+  }
+  return null;
+}
+
+/**
+ * The conversation a transcript records, in file order. The SDK's own reader
+ * walks the parentUuid chain backwards from the tail, and a compaction boundary
+ * has no parent, so everything said before the last compaction silently drops
+ * out of a resumed session's history. Reading the file directly keeps the whole
+ * conversation. A resume can re-append earlier messages under their original
+ * uuids, so each uuid's first appearance wins.
+ */
+function transcriptEntries(raw) {
+  const messages = [];
+  const seen = new Set();
+  for (const line of raw.split("\n")) {
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!entry || typeof entry !== "object" || entry.isSidechain) continue;
+    if (entry.type !== "user" && entry.type !== "assistant" && entry.type !== "system") continue;
+    if (typeof entry.uuid === "string" && entry.uuid) {
+      if (seen.has(entry.uuid)) continue;
+      seen.add(entry.uuid);
+    }
+    messages.push(entry);
+  }
+  return messages;
+}
+
+async function transcriptMessagesAt(path) {
+  let raw;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch {
+    return [];
+  }
+  return transcriptEntries(raw);
+}
+
+/** Every message of `id`'s conversation: the transcript file when it exists,
+ * the SDK's reader for sessions that left none behind. */
+async function sessionMessages(id, cwd) {
+  const path = await transcriptPath(id);
+  if (path) {
+    const messages = await transcriptMessagesAt(path);
+    if (messages.length) return messages;
+  }
+  try {
+    return await getSessionMessages(id, {
+      dir: await readableCwd(id, cwd),
+      includeSystemMessages: true,
+    });
+  } catch {
+    return [];
+  }
+}
+
 function sameCwd(left, right) {
   if (!left || !right) return !left && !right;
   const normalize = (value) => value.replaceAll("\\", "/").replace(/\/$/, "");
@@ -2902,7 +2982,7 @@ async function transcriptSessions(cwd) {
       const id = file.name.slice(0, -".jsonl".length);
       try {
         const [messages, metadata] = await Promise.all([
-          getSessionMessages(id, { dir: recordedCwd, includeSystemMessages: true }),
+          transcriptMessagesAt(path),
           stat(path),
         ]);
         if (!messages.length) continue;
@@ -3054,7 +3134,7 @@ async function dispatch(method, params = {}) {
     const id = liveSessionId(params.sessionId);
     const existing = sessions.get(id);
     if (existing) {
-      const messages = await getSessionMessages(id, { dir: existing.cwd, includeSystemMessages: true });
+      const messages = await sessionMessages(id, existing.cwd);
       if (!existing.tasks.size) existing.tasks = historyState(messages).tasks;
       return {
         id,
@@ -3072,7 +3152,7 @@ async function dispatch(method, params = {}) {
     // The transcript itself decides whether there is anything to resume:
     // getSessionInfo only sees sessions the CLI indexed, and a bridge-run session
     // whose transcript is intact can be missing from that index.
-    const messages = await getSessionMessages(id, { dir, includeSystemMessages: true });
+    const messages = await sessionMessages(id, params.cwd);
     if (!messages.length) throw new Error(`Claude 세션을 찾을 수 없습니다: ${id}`);
     const info = await getSessionInfo(id, { dir });
     const lastModel = [...messages].reverse().find((message) => message.type === "assistant")?.message?.model;
@@ -3109,7 +3189,7 @@ async function dispatch(method, params = {}) {
   }
   if (method === "session/history") {
     const id = liveSessionId(params.sessionId);
-    const messages = await getSessionMessages(id, { dir: await readableCwd(id, params.cwd), includeSystemMessages: true });
+    const messages = await sessionMessages(id, params.cwd);
     return { data: historyTurns(messages), nextCursor: null };
   }
   if (method === "session/prompt") return startPrompt(params);
@@ -3248,6 +3328,28 @@ async function runSelfTest() {
   }]);
   if (!equivalentCwd || preview !== "세션 목록 질문") {
     throw new Error(`Claude session list self-test failed: ${JSON.stringify({ equivalentCwd, preview })}`);
+  }
+  // A compacted transcript keeps every turn on disk; the reader must return the
+  // pre-compaction turns, skip resume-replayed duplicates and sidechains, and
+  // leave the summary itself to the history filter.
+  const compactedTranscript = [
+    JSON.stringify({ type: "user", uuid: "before-compact", message: { role: "user", content: "compact 이전 질문" } }),
+    JSON.stringify({ type: "assistant", uuid: "before-compact-answer", message: { role: "assistant", model: "claude-opus-5", content: [{ type: "text", text: "이전 답변." }] } }),
+    JSON.stringify({ type: "attachment", uuid: "attachment-noise" }),
+    JSON.stringify({ type: "system", subtype: "compact_boundary", uuid: "compact-1", parentUuid: null }),
+    JSON.stringify({ type: "user", uuid: "compact-summary", isCompactSummary: true, message: { role: "user", content: "This session is being continued from a previous conversation." } }),
+    JSON.stringify({ type: "user", uuid: "before-compact", message: { role: "user", content: "재개가 다시 적은 복사본" } }),
+    JSON.stringify({ type: "user", uuid: "sidechain-user", isSidechain: true, message: { role: "user", content: "subagent" } }),
+    "not json",
+    JSON.stringify({ type: "user", uuid: "after-compact", message: { role: "user", content: "compact 이후 질문" } }),
+    JSON.stringify({ type: "assistant", uuid: "after-compact-answer", message: { role: "assistant", model: "claude-opus-5", content: [{ type: "text", text: "이후 답변." }] } }),
+  ].join("\n");
+  const restored = transcriptEntries(compactedTranscript);
+  const restoredPrompts = historyTurns(restored)
+    .map((turn) => turn.items.find((item) => item.type === "userMessage")?.content?.[0]?.text);
+  if (restored.length !== 6
+    || JSON.stringify(restoredPrompts) !== JSON.stringify(["compact 이전 질문", "compact 이후 질문"])) {
+    throw new Error(`Claude compacted transcript self-test failed: ${JSON.stringify({ restored: restored.length, restoredPrompts })}`);
   }
   const latestOptions = makeOptions({ cwd: process.cwd(), permissionMode: "plan" }, "00000000-0000-4000-8000-000000000000");
   if (latestOptions.permissionMode !== BOOTSTRAP_PERMISSION_MODE

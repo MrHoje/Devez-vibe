@@ -645,6 +645,19 @@ mod tests {
         assert!(bridge.contains("function noteCompactBoundary(session, metadata)"));
     }
 
+    /// The SDK's own reader walks the parentUuid chain, which a compaction
+    /// boundary breaks, so a resumed session would lose everything said before
+    /// the last compact. History has to come from the transcript file itself.
+    #[test]
+    fn bridge_restores_history_from_the_transcript_file_across_compactions() {
+        let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
+
+        assert!(bridge.contains("function transcriptEntries(raw)"));
+        assert!(bridge.contains("async function sessionMessages(id, cwd)"));
+        assert!(bridge.contains("const messages = await sessionMessages(id, params.cwd);"));
+        assert!(bridge.contains("Claude compacted transcript self-test failed"));
+    }
+
     #[test]
     fn bridge_reads_the_current_claude_account_without_a_session() {
         let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
