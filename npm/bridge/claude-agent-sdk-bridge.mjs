@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { spawn } from "node:child_process";
-import { createReadStream, existsSync, readdirSync } from "node:fs";
+import { execFile, spawn } from "node:child_process";
+import { createReadStream, existsSync, readFileSync, readdirSync } from "node:fs";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
 import {
   deleteSession,
   forkSession,
@@ -120,13 +121,76 @@ function sanitizedEnvironment() {
   return env;
 }
 
+// Per executable path: `true` once the installed Claude Code proved newer than
+// the SDK's bundle, `false` or a pending promise otherwise.
+const externalCliChoices = new Map();
+
+function parseVersion(text) {
+  const match = String(text || "").match(/([0-9]+)[.]([0-9]+)[.]([0-9]+)/);
+  return match ? match.slice(1, 4).map(Number) : null;
+}
+
+function isNewerVersion(candidate, baseline) {
+  const a = parseVersion(candidate);
+  const b = parseVersion(baseline);
+  if (!a || !b) return false;
+  for (let index = 0; index < 3; index++) {
+    if (a[index] !== b[index]) return a[index] > b[index];
+  }
+  return false;
+}
+
+// The installed Claude Code wins only when it is a real executable — a .cmd
+// shim fails with EINVAL — and strictly newer than the CLI the SDK bundles, so
+// updating Claude Code alone surfaces new models without a DevezVibe release
+// while an equal or older install keeps the bundle the SDK was tested with.
+function prefersInstalledCli(executable, installedVersion, bundledVersion) {
+  if (!String(executable || "").toLowerCase().endsWith(".exe")) return false;
+  return isNewerVersion(installedVersion, bundledVersion);
+}
+
+function bundledCliVersion() {
+  try {
+    const entry = fileURLToPath(import.meta.resolve("@anthropic-ai/claude-agent-sdk"));
+    const manifest = JSON.parse(readFileSync(join(dirname(entry), "manifest.json"), "utf8"));
+    return String(manifest.version || "");
+  } catch {
+    return "";
+  }
+}
+
+function installedCliVersion(executable) {
+  return new Promise((resolve) => {
+    execFile(executable, ["--version"], { timeout: 5000, windowsHide: true }, (error, stdout) => {
+      resolve(error ? "" : String(stdout || ""));
+    });
+  });
+}
+
+/** Decide once per executable, before the first session or catalog query. */
+async function ensureClaudeExecutableChoice(params) {
+  const executable = String(params?.claudePath || "").trim();
+  if (process.platform !== "win32" || !executable || externalCliChoices.has(executable)) return;
+  const pending = (async () => {
+    if (!existsSync(executable)) return false;
+    const installed = await installedCliVersion(executable);
+    return prefersInstalledCli(executable, installed, bundledCliVersion());
+  })().catch(() => false);
+  externalCliChoices.set(executable, pending);
+  externalCliChoices.set(executable, await pending);
+}
+
 function applyClaudeExecutable(options, params) {
   const executable = String(params.claudePath || "").trim();
   if (!executable) return;
-  // On Windows use the SDK's matching native CLI bundle. It reads the same
-  // ~/.claude credentials, settings, hooks, skills, and plugins, while avoiding
-  // EINVAL from command shims and incompatible separately-installed CLI builds.
-  if (process.platform === "win32") return;
+  // On Windows the SDK's matching native CLI bundle is the default: it reads
+  // the same ~/.claude credentials, settings, hooks, skills, and plugins, and
+  // avoids EINVAL from command shims. A newer installed Claude Code overrides
+  // it — see prefersInstalledCli.
+  if (process.platform === "win32") {
+    if (externalCliChoices.get(executable) === true) options.pathToClaudeCodeExecutable = executable;
+    return;
+  }
   options.pathToClaudeCodeExecutable = executable;
 }
 
@@ -296,6 +360,7 @@ async function loadModelCatalog(params) {
   const cacheKey = catalogCacheKey(params);
   if (modelCatalogs.has(cacheKey)) return modelCatalogs.get(cacheKey);
   const pending = (async () => {
+    await ensureClaudeExecutableChoice(params);
     const input = new AsyncQueue();
     const options = {
       cwd: params.cwd || process.cwd(),
@@ -1215,6 +1280,7 @@ async function createSession(params, resumeId) {
     lastContextUsage: null,
     lastContextWindow: 0,
   };
+  await ensureClaudeExecutableChoice(params);
   const agentQuery = await startAgentQuery(queue, makeOptions(params, id, resumeId));
   session.query = agentQuery;
   sessions.set(id, session);
@@ -3428,6 +3494,16 @@ async function runSelfTest() {
     || familyCapabilities(successorModels, "claude-opus-4-7")?.value !== "opus[1m]"
     || familyCapabilities(successorModels, "gpt-5.6") !== undefined) {
     throw new Error("Claude model successor self-test failed");
+  }
+  // Only a real, strictly newer installed CLI replaces the SDK bundle.
+  if (!prefersInstalledCli("C:/Users/me/.local/bin/claude.exe", "2.1.260 (Claude Code)", "2.1.258")
+    || prefersInstalledCli("C:/Users/me/.local/bin/claude.exe", "2.1.258 (Claude Code)", "2.1.258")
+    || prefersInstalledCli("C:/Users/me/.local/bin/claude.exe", "2.1.9", "2.1.258")
+    || prefersInstalledCli("C:/Users/me/AppData/Roaming/npm/claude.cmd", "2.1.260", "2.1.258")
+    || prefersInstalledCli("C:/Users/me/.local/bin/claude.exe", "", "2.1.258")
+    || prefersInstalledCli("C:/Users/me/.local/bin/claude.exe", "2.1.260", "")
+    || !isNewerVersion("2.2.0", "2.1.999")) {
+    throw new Error("Claude installed CLI preference self-test failed");
   }
   const latestOptions = makeOptions({ cwd: process.cwd(), permissionMode: "plan" }, "00000000-0000-4000-8000-000000000000");
   if (latestOptions.permissionMode !== BOOTSTRAP_PERMISSION_MODE

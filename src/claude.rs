@@ -674,6 +674,19 @@ mod tests {
         assert!(bridge.contains("Claude model successor self-test failed"));
     }
 
+    /// On Windows the SDK bundle stays the default, but an installed Claude Code
+    /// that is a real executable and strictly newer takes over, so updating
+    /// Claude Code alone surfaces new models.
+    #[test]
+    fn bridge_prefers_a_newer_installed_claude_code_on_windows() {
+        let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
+
+        assert!(bridge.contains("function prefersInstalledCli(executable, installedVersion, bundledVersion)"));
+        assert!(bridge.contains("async function ensureClaudeExecutableChoice(params)"));
+        assert!(bridge.contains("if (externalCliChoices.get(executable) === true) options.pathToClaudeCodeExecutable = executable;"));
+        assert!(bridge.contains("Claude installed CLI preference self-test failed"));
+    }
+
     #[test]
     fn bridge_reads_the_current_claude_account_without_a_session() {
         let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
