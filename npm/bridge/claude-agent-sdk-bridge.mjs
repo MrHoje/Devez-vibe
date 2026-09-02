@@ -155,6 +155,22 @@ function modelCapabilities(models, model) {
     : capabilities;
 }
 
+// A transcript names the resolved id it ran on. When that model has since left
+// the CLI's list (Fable 5 gave way to Fable 5.1), the host cannot match the old
+// id, keeps its own default selected, and the next prompt's setModel silently
+// moves the session onto that default. Staying inside the family — the list's
+// first entry of the same name, which is its newest — keeps a Fable session on
+// Fable.
+function familyCapabilities(models, model) {
+  const family = String(stripClaudeModel(model) || "")
+    .toLowerCase()
+    .match(/(fable|opus|sonnet|haiku)/)?.[1];
+  if (!family) return undefined;
+  return models.find((candidate) => candidate.value && candidate.value !== "default"
+    && [candidate.value, candidate.resolvedModel, candidate.displayName]
+      .some((name) => String(name || "").toLowerCase().includes(family)));
+}
+
 function opus48Capabilities(models, existing = {}) {
   // The CLI now exposes the Opus alias as `opus[1m]` (and only `default`
   // resolves to it), so an exact `value === "opus"` match finds nothing and the
@@ -251,8 +267,33 @@ function claudeCatalogEntries(models, defaultResolvedModel) {
   return entries;
 }
 
+function catalogCacheKey(params) {
+  return `${params.claudePath || "claude"}\n${params.cwd || process.cwd()}`;
+}
+
+/** The catalog the host already holds for this cwd, or null before it asked. */
+async function cachedCatalogValues(params) {
+  // A resumed session carries the cwd its transcript recorded, which can spell
+  // the host's folder differently; the model list does not vary by folder, so
+  // any catalog this bridge has already loaded will do.
+  const cached = modelCatalogs.get(catalogCacheKey(params)) || [...modelCatalogs.values()][0];
+  if (!cached) return null;
+  let catalog;
+  try {
+    catalog = await cached;
+  } catch {
+    return null;
+  }
+  const values = new Set();
+  for (const entry of catalog?.data || []) {
+    const value = stripClaudeModel(entry.model);
+    if (value) values.add(value);
+  }
+  return values;
+}
+
 async function loadModelCatalog(params) {
-  const cacheKey = `${params.claudePath || "claude"}\n${params.cwd || process.cwd()}`;
+  const cacheKey = catalogCacheKey(params);
   if (modelCatalogs.has(cacheKey)) return modelCatalogs.get(cacheKey);
   const pending = (async () => {
     const input = new AsyncQueue();
@@ -1203,7 +1244,29 @@ async function createSession(params, resumeId) {
     throw error;
   }
   session.models = Array.isArray(initialization.models) ? initialization.models : [];
-  const capabilities = modelCapabilities(session.models, params.model);
+  let capabilities = modelCapabilities(session.models, params.model);
+  // The CLI still lists a resumed session's own model after it left the general
+  // catalog (Fable 5 once Fable 5.1 shipped). The host only knows the catalog:
+  // an id outside it leaves the host on its default, and the next prompt's
+  // setModel then silently moves the session there. Move to the family's newest
+  // catalog entry instead, so a Fable session stays on Fable.
+  const catalogValues = await cachedCatalogValues(params);
+  const stale = capabilities?.value && capabilities.value !== "default"
+    && catalogValues && !catalogValues.has(capabilities.value);
+  if ((stale || !capabilities) && stripClaudeModel(params.model)) {
+    const known = catalogValues
+      ? session.models.filter((candidate) => catalogValues.has(candidate.value))
+      : session.models;
+    const successor = familyCapabilities(known, capabilities?.value || params.model);
+    if (successor?.value && successor.value !== capabilities?.value) {
+      try {
+        await agentQuery.setModel(successor.value);
+        capabilities = successor;
+      } catch {
+        // Keep the transcript's model when the CLI refuses the switch.
+      }
+    }
+  }
   // A resumed session can only name its model as the resolved id the transcript
   // recorded (`claude-opus-4-5-...`), which matches nothing in the host's model
   // list. Report the catalog value instead so the picker lands on that model.
@@ -3350,6 +3413,21 @@ async function runSelfTest() {
   if (restored.length !== 6
     || JSON.stringify(restoredPrompts) !== JSON.stringify(["compact 이전 질문", "compact 이후 질문"])) {
     throw new Error(`Claude compacted transcript self-test failed: ${JSON.stringify({ restored: restored.length, restoredPrompts })}`);
+  }
+  // A model that left the CLI's list resolves to its family's newest entry, so a
+  // Fable 5 transcript resumes on Fable 5.1 instead of the host's default.
+  const successorModels = [
+    { value: "default", resolvedModel: "claude-opus-5[1m]" },
+    { value: "claude-fable-5-1[1m]", resolvedModel: "claude-fable-5-1", displayName: "Fable 5.1" },
+    { value: "opus[1m]", resolvedModel: "claude-opus-5[1m]", displayName: "Opus 5" },
+    { value: "sonnet", resolvedModel: "claude-sonnet-5", displayName: "Sonnet 5" },
+  ];
+  if (modelCapabilities(successorModels, "claude-fable-5") !== undefined
+    || familyCapabilities(successorModels, "claude-fable-5")?.value !== "claude-fable-5-1[1m]"
+    || familyCapabilities(successorModels, "claude:fable")?.value !== "claude-fable-5-1[1m]"
+    || familyCapabilities(successorModels, "claude-opus-4-7")?.value !== "opus[1m]"
+    || familyCapabilities(successorModels, "gpt-5.6") !== undefined) {
+    throw new Error("Claude model successor self-test failed");
   }
   const latestOptions = makeOptions({ cwd: process.cwd(), permissionMode: "plan" }, "00000000-0000-4000-8000-000000000000");
   if (latestOptions.permissionMode !== BOOTSTRAP_PERMISSION_MODE

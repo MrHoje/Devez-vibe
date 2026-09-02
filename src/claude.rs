@@ -661,6 +661,19 @@ mod tests {
         assert!(bridge.contains("Claude compacted transcript self-test failed"));
     }
 
+    /// A resumed transcript may name a model the general catalog no longer
+    /// lists (Fable 5 after Fable 5.1 shipped). Left alone, the host cannot
+    /// select it and the next prompt moves the session onto the host default.
+    #[test]
+    fn bridge_keeps_a_resumed_session_in_its_model_family() {
+        let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
+
+        assert!(bridge.contains("function familyCapabilities(models, model)"));
+        assert!(bridge.contains("function cachedCatalogValues(params)"));
+        assert!(bridge.contains("await agentQuery.setModel(successor.value);"));
+        assert!(bridge.contains("Claude model successor self-test failed"));
+    }
+
     #[test]
     fn bridge_reads_the_current_claude_account_without_a_session() {
         let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
