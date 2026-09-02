@@ -12724,6 +12724,53 @@ impl AppState {
     /// A click on a row inside an open picker. `row` is the position in
     /// `OverlayView::lines`, so each picker maps it back onto its own list — the
     /// window it scrolled to, or the header rows it printed first.
+    /// A click on a row of the composer's suggestion list does what Enter on
+    /// that row would. The three lists the composer can open — `/` commands,
+    /// `/agent` arguments, and `@`/`$` completions — are keyed the same way and
+    /// resolved in the same order the view builds them, so the pointer and the
+    /// keyboard never disagree about which entry a row names.
+    pub fn click_suggestion(&mut self, index: usize) -> Action {
+        if let Some((target, matches)) = self.matching_completions() {
+            let Some(candidate) = matches.get(index).cloned() else {
+                return Action::None;
+            };
+            self.command_selection = index;
+            self.insert_completion(&target, &candidate);
+            return Action::None;
+        }
+        let agents = self.matching_agent_arguments();
+        if !agents.is_empty() {
+            let Some(selected) = agents.get(index).copied() else {
+                return Action::None;
+            };
+            self.editor.set_text(format!("/agent {}", selected.id()));
+            self.command_selection = 0;
+            return self.submit_editor();
+        }
+        let Some(selected) = self.matching_slash_commands().get(index).copied() else {
+            return Action::None;
+        };
+        self.editor.set_text(selected.name);
+        self.composer_images.clear();
+        self.command_selection = 0;
+        self.submit_editor()
+    }
+
+    /// A click on a source tab above the `$` list switches catalogues the way
+    /// ←→ do, and the new list starts from its first row.
+    pub fn click_completion_source(&mut self, index: usize) -> Action {
+        let source = match index {
+            0 => CompletionSource::User,
+            1 => CompletionSource::Plugin,
+            _ => CompletionSource::Provider,
+        };
+        if self.dollar_completion_source != source {
+            self.dollar_completion_source = source;
+            self.command_selection = 0;
+        }
+        Action::None
+    }
+
     pub fn click_overlay_row(&mut self, row: usize) -> Action {
         match self.pending.take() {
             Some(PendingInteraction::ModelPicker {
@@ -24180,6 +24227,61 @@ mod tests {
         assert_eq!(
             filesystem,
             [Some("Dir".to_owned()), Some("File".to_owned())]
+        );
+    }
+
+    /// A click on a completion row inserts it, exactly as Enter would, and a
+    /// click on a source tab switches catalogues the way the arrow keys do.
+    #[test]
+    fn clicking_a_completion_row_inserts_it_and_a_tab_switches_source() {
+        let mut state = composer_completion_state();
+        state.editor.set_text("$rev");
+        let listed = state
+            .view()
+            .suggestions
+            .iter()
+            .map(|suggestion| suggestion.command.clone())
+            .collect::<Vec<_>>();
+        let clicked = listed
+            .iter()
+            .position(|command| command == "review")
+            .expect("the skill is listed");
+
+        state.click_suggestion(clicked);
+        assert!(
+            state.editor.text().contains("review"),
+            "the click must insert what the row named: {}",
+            state.editor.text()
+        );
+
+        state.editor.set_text("$rev");
+        assert_eq!(state.dollar_completion_source, CompletionSource::User);
+        state.click_completion_source(1);
+        assert_eq!(state.dollar_completion_source, CompletionSource::Plugin);
+        state.click_completion_source(2);
+        assert_eq!(state.dollar_completion_source, CompletionSource::Provider);
+    }
+
+    /// A click on a slash-command row runs it, the same as Enter on that row.
+    #[test]
+    fn clicking_a_slash_command_row_runs_it() {
+        let mut state = test_state();
+        state.editor.set_text("/mod");
+        let listed = state
+            .view()
+            .suggestions
+            .iter()
+            .map(|suggestion| suggestion.command.clone())
+            .collect::<Vec<_>>();
+        let clicked = listed
+            .iter()
+            .position(|command| command == "/model")
+            .expect("the command is listed");
+
+        state.click_suggestion(clicked);
+        assert!(
+            matches!(state.pending, Some(PendingInteraction::ModelPicker { .. })),
+            "the click must run the command the row named"
         );
     }
 

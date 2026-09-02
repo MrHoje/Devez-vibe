@@ -2254,6 +2254,8 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
         Pick::Prompt(block_id) => Action::ScrollToPrompt(block_id),
         Pick::Close => state.close_overlay(),
         Pick::Row(index) => state.click_overlay_row(index),
+        Pick::Suggestion(index) => state.click_suggestion(index),
+        Pick::CompletionSource(index) => state.click_completion_source(index),
         Pick::Effort(step) => state.click_effort_step(step),
     }
 }

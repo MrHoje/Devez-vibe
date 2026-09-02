@@ -62,10 +62,10 @@ impl AgentMode {
     /// One line for the picker.
     pub fn detail(self) -> &'static str {
         match self {
-            Self::Standard => "The default agent, tuned for everyday work.",
-            Self::Planner => "Clarifies requirements and plans from the repository.",
-            Self::Advisor => "Weighs risks and trade-offs, then recommends.",
-            Self::Finisher => "Implements, verifies, and reviews until done.",
+            Self::Standard => "평소 작업에 맞춘 기본 역할입니다.",
+            Self::Planner => "저장소를 살펴 요구사항을 정리하고 계획을 세웁니다.",
+            Self::Advisor => "위험과 득실을 견주어 무엇을 고를지 권합니다.",
+            Self::Finisher => "구현하고 검증한 뒤 끝까지 다듬습니다.",
         }
     }
 

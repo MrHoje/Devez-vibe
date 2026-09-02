@@ -5288,6 +5288,12 @@ pub enum Pick {
     History(u64),
     /// A recent prompt row in the docked panel: jumps to that transcript block.
     Prompt(u64),
+    /// A row of the composer's own suggestion list, whatever opened it: `/`,
+    /// `@`, or `$`. Clicking one does what Enter on it would.
+    Suggestion(usize),
+    /// A source tab above the `$` list: switches which catalogue is listed,
+    /// the same way ←→ do.
+    CompletionSource(usize),
     /// The `✕` on a panel's top rule: closes what Esc closes.
     Close,
 }
@@ -6579,6 +6585,22 @@ fn question_tab_row(tabs: &str, width: usize) -> PaintLine {
     line
 }
 
+/// The tabs a source row offers, in the order they were painted. The row only
+/// fits as many as the width allows and marks the overflow with an ellipsis, so
+/// the tabs are counted off what was actually drawn rather than off the text it
+/// was asked to draw. Separators and that ellipsis are furniture, not tabs.
+fn completion_tab_picks(row: &PaintLine) -> Vec<(usize, Pick)> {
+    let mut picks = Vec::new();
+    for (index, span) in row.tail.iter().enumerate() {
+        if span.text == QUESTION_TAB_SEPARATOR || span.text == "…" {
+            continue;
+        }
+        // Span `0` is the row's own text, so a tail entry sits one span later.
+        picks.push((index + 1, Pick::CompletionSource(picks.len())));
+    }
+    picks
+}
+
 /// The row's leading `│` belongs to the panel, not to the row. Toning the whole
 /// prefix with the selection painted that border in the accent as well, so the
 /// box read as though its own edge were the thing being picked. Keep the border
@@ -6601,10 +6623,12 @@ fn split_panel_border(mut line: PaintLine, marker_tone: Tone) -> PaintLine {
     line
 }
 
-/// The whole inside of a boxed row answers to a pointer, not just the columns
-/// its label happens to reach: a one-word answer beside a wide box is a thin
-/// target, and the highlight reads as a button the row's width. The two borders
-/// stay out of it — pressing the box itself is not picking what it holds.
+/// A question option answers to a pointer across the whole inside of its box,
+/// not just the columns its label happens to reach: a one-word answer beside a
+/// wide box is a thin target, and the highlight reads as a button the row's
+/// width. Only the question box goes this wide — every other list keeps its
+/// region on its own text. The two borders stay out of it either way, so
+/// pressing the box itself is never picking what it holds.
 fn pick_panel_interior(mut line: PaintLine, panel_width: usize, pick: Pick) -> PaintLine {
     line.pick = Some(PickRegions::span(1, panel_width.saturating_sub(1), pick));
     line
@@ -6750,17 +6774,18 @@ fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine
     let mut lines = vec![panel_title_row(title, panel_width, false)];
     lines.push(panel_padding_row(panel_width));
     if let Some(tabs) = tabs {
-        lines.push(close_panel_row(
-            question_tab_row(tabs, inner_width),
-            panel_width,
-        ));
+        let row = question_tab_row(tabs, inner_width);
+        let picks = completion_tab_picks(&row);
+        lines.push(close_panel_row(row.with_picks(&picks), panel_width));
         lines.push(panel_padding_row(panel_width));
     }
-    let visible = &suggestions[visible_window(
+    let window = visible_window(
         suggestions.iter().position(|item| item.selected),
         suggestions.len(),
         SUGGESTION_ROWS,
-    )];
+    );
+    let first_visible = window.start;
+    let visible = &suggestions[window];
     let completion_name_width = suggestions
         .iter()
         .filter_map(|suggestion| {
@@ -6779,7 +6804,7 @@ fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine
         .unwrap_or(COMMAND_COLUMN_WIDTH)
         .max(COMMAND_COLUMN_WIDTH)
         .min(inner_width.saturating_sub(13 + SUGGESTION_RIGHT_INSET));
-    for suggestion in visible {
+    for (offset, suggestion) in visible.iter().enumerate() {
         let marker = if suggestion.selected { "❯" } else { " " };
         let line = match suggestion.category.as_deref() {
             Some(category) => named_suggestion_line(
@@ -6797,7 +6822,11 @@ fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine
                 panel_width,
             ),
         };
-        lines.push(line);
+        // A long list scrolls, so the row's place on screen is not its place in
+        // the list: a click has to name the entry, not the line it landed on.
+        let index = first_visible + offset;
+        let picks = suggestion_row_picks(|| Pick::Suggestion(index));
+        lines.push(line.with_picks(&picks));
     }
     let hint = suggestions
         .iter()
@@ -6812,6 +6841,23 @@ fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine
 
 /// A picker row drawn the way the slash-command list draws its own: marker and
 /// name light up in the accent when selected, the description stays muted.
+/// Spans a name-and-description row paints between its borders, shared by the
+/// two-column pickers and the composer's suggestion list because both rows are
+/// built the same way. `0` is the row's own text — the single blank the left
+/// border leaves behind — so the marker lands on `1` and the description on
+/// `4`, with the gap and the name column in between.
+const PICKER_SUGGESTION_MARKER_SPAN: usize = 1;
+const PICKER_SUGGESTION_LAST_TEXT_SPAN: usize = 4;
+
+/// The click regions of a name-and-description row: the marker through the
+/// description, never the blank the left border leaves behind, whose bleed
+/// would carry the highlight onto the border itself.
+fn suggestion_row_picks(pick: impl Fn() -> Pick) -> Vec<(usize, Pick)> {
+    (PICKER_SUGGESTION_MARKER_SPAN..=PICKER_SUGGESTION_LAST_TEXT_SPAN)
+        .map(|span| (span, pick()))
+        .collect()
+}
+
 fn picker_suggestion_row(
     name: &str,
     description: &str,
@@ -7300,6 +7346,11 @@ fn overlay_frame_with_expansion(
                     continue;
                 }
                 if let Some((name, description)) = row.text.split_once('\u{1f}') {
+                    // The row spends its columns on a marker, a name and a
+                    // description, and all three are the offer: a region that
+                    // stopped at the marker left both columns dead to a click.
+                    // The padding out to the borders stays furniture.
+                    let picks = suggestion_row_picks(|| Pick::Row(row_index));
                     lines.push(
                         picker_suggestion_row(
                             name,
@@ -7308,7 +7359,7 @@ fn overlay_frame_with_expansion(
                             picker_name_width,
                             panel_width,
                         )
-                        .with_picks(&[(0, Pick::Row(row_index)), (1, Pick::Row(row_index))]),
+                        .with_picks(&picks),
                     );
                     continue;
                 }
@@ -21606,6 +21657,96 @@ mod tests {
         assert_eq!(description_column(&first), description_column(&scrolled));
     }
 
+    /// A suggestion row answers to a click the way Enter on it would, and a
+    /// scrolled list still names the entry rather than the screen row. The
+    /// region opens after the left border so the highlight cannot paint it.
+    #[test]
+    fn suggestion_rows_answer_to_a_click_on_the_entry_they_name() {
+        let mut suggestions = (0..7)
+            .map(|index| SuggestionView {
+                command: format!("item-{index}"),
+                description: format!("description-{index}"),
+                selected: index == 0,
+                category: Some("Skill".to_owned()),
+                panel_title: "Mentions",
+                hint: None,
+            })
+            .collect::<Vec<_>>();
+        let first = suggestion_lines(&suggestions, 80);
+        let row = first
+            .iter()
+            .find(|line| painted(line).contains("item-0"))
+            .expect("the first row is painted");
+        let columns = row
+            .pick
+            .as_ref()
+            .and_then(|regions| regions.columns_of(&Pick::Suggestion(0)))
+            .expect("the row answers to a click");
+        assert!(
+            columns.start >= 1,
+            "region must open after the left border: {columns:?}"
+        );
+        let painted_row = painted(row);
+        let description_column = painted_row
+            .find("description-0")
+            .map(|at| UnicodeWidthStr::width(&painted_row[..at]))
+            .expect("the description column is painted");
+        assert!(
+            columns.contains(&description_column),
+            "the description column must answer to a click: {columns:?}"
+        );
+
+        suggestions[0].selected = false;
+        suggestions[6].selected = true;
+        let scrolled = suggestion_lines(&suggestions, 80);
+        let scrolled_row = scrolled
+            .iter()
+            .find(|line| painted(line).contains("item-1"))
+            .expect("the scrolled list starts at the second entry");
+        assert!(
+            scrolled_row
+                .pick
+                .as_ref()
+                .and_then(|regions| regions.columns_of(&Pick::Suggestion(1)))
+                .is_some(),
+            "a scrolled row must name its entry, not its screen row"
+        );
+    }
+
+    /// The `$` list draws its catalogues as a tab row, and each tab answers to a
+    /// click the way the arrow keys do.
+    #[test]
+    fn dollar_source_tabs_answer_to_a_click() {
+        let suggestions = vec![SuggestionView {
+            command: "review".to_owned(),
+            description: "리뷰".to_owned(),
+            selected: true,
+            category: Some("Skill".to_owned()),
+            panel_title: "Skills\u{001e}[ User ]   Plugins     Claude",
+            hint: None,
+        }];
+        let lines = suggestion_lines(&suggestions, 80);
+        let tabs = lines
+            .iter()
+            .find(|line| painted(line).contains("[ User ]"))
+            .expect("the tab row is painted");
+        let regions = tabs.pick.as_ref().expect("the tabs answer to a click");
+        let painted_tabs = painted(tabs);
+        for (index, label) in ["[ User ]", "Plugins", "Claude"].into_iter().enumerate() {
+            let columns = regions
+                .columns_of(&Pick::CompletionSource(index))
+                .unwrap_or_else(|| panic!("tab {label} answers to a click"));
+            let at = painted_tabs
+                .find(label)
+                .map(|byte| UnicodeWidthStr::width(&painted_tabs[..byte]))
+                .unwrap_or_else(|| panic!("tab {label} is painted"));
+            assert!(
+                columns.contains(&at),
+                "tab {label} must answer over its own name: {columns:?}"
+            );
+        }
+    }
+
     #[test]
     fn completion_panel_uses_dynamic_heading_categories_and_hint() {
         let suggestions = vec![
@@ -22083,6 +22224,66 @@ mod tests {
             "region must span the row between its borders"
         );
         assert!(row_width > 16, "the row is wider than its label: {row_width}");
+    }
+
+    /// A picker row that carries a name and a description column offers both:
+    /// the click region reaches from the marker through the description, and
+    /// stops on the last painted character rather than running to the border.
+    #[test]
+    fn two_column_picker_row_click_region_covers_the_name_and_description() {
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                closable: false,
+                title: "에이전트".to_owned(),
+                lines: vec![OverlayLine {
+                    text: "1. 개발자\u{1f}스펙을 보고 구현한다".to_owned(),
+                    selected: true,
+                    muted: false,
+                }],
+                slider: None,
+                hint: String::new(),
+                style: OverlayStyle::Picker,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            },
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+        let line = frame
+            .lines
+            .iter()
+            .find(|line| painted(line).contains("스펙을 보고"))
+            .expect("the option row is painted");
+        let columns = line
+            .pick
+            .as_ref()
+            .and_then(|regions| regions.columns_of(&Pick::Row(0)))
+            .expect("the option row answers to a click");
+        let painted = painted(line);
+        let description_end = painted
+            .find("구현한다")
+            .map(|byte| UnicodeWidthStr::width(&painted[..byte]) + UnicodeWidthStr::width("구현한다"))
+            .expect("the description column is painted");
+        assert!(
+            (1..=2).contains(&columns.start),
+            "region must open after the left border and reach the marker: {columns:?}"
+        );
+        assert!(
+            columns.end >= description_end,
+            "region stops short of the description: {columns:?}"
+        );
+        assert!(
+            columns.end < painted_line_width(line) - 1,
+            "region must stop on the text, not run to the border: {columns:?}"
+        );
     }
 
     #[test]
