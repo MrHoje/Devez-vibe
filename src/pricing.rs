@@ -138,12 +138,19 @@ pub fn estimate_usd(model: &str, totals: TokenTotals) -> Option<f64> {
         .iter()
         .find(|(slug, _, _)| model.contains(slug))
         .copied()?;
+    // Fable 5.1 cut cache reads to $0.25/MTok — 0.025x its input rate, against
+    // the 0.1x every other model on either vendor still charges.
+    let cache_read_multiplier = if model.contains("claude-fable-5-1") {
+        0.025
+    } else {
+        CACHE_READ_MULTIPLIER
+    };
     let input_rate = input_rate / 1_000_000.0;
     let output_rate = output_rate / 1_000_000.0;
     Some(
         totals.input_new as f64 * input_rate
             + totals.cache_write as f64 * input_rate * CACHE_WRITE_MULTIPLIER
-            + totals.cache_read as f64 * input_rate * CACHE_READ_MULTIPLIER
+            + totals.cache_read as f64 * input_rate * cache_read_multiplier
             + totals.output as f64 * output_rate,
     )
 }
@@ -161,6 +168,19 @@ pub fn format_usd(cost: f64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn fable_5_1_charges_the_cheaper_cache_read_rate() {
+        let totals = TokenTotals {
+            input_new: 0,
+            cache_write: 0,
+            cache_read: 1_000_000,
+            output: 0,
+        };
+        // $0.25/MTok on Fable 5.1; Fable 5 stays at 0.1x of $10 = $1.00.
+        assert!((estimate_usd("claude-fable-5-1[1m]", totals).unwrap() - 0.25).abs() < 1e-9);
+        assert!((estimate_usd("claude-fable-5", totals).unwrap() - 1.0).abs() < 1e-9);
+    }
 
     #[test]
     fn breakdown_splits_cached_and_written_tokens_out_of_the_input_total() {
