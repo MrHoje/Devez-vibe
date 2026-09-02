@@ -6623,12 +6623,12 @@ fn split_panel_border(mut line: PaintLine, marker_tone: Tone) -> PaintLine {
     line
 }
 
-/// A question option answers to a pointer across the whole inside of its box,
-/// not just the columns its label happens to reach: a one-word answer beside a
-/// wide box is a thin target, and the highlight reads as a button the row's
-/// width. Only the question box goes this wide — every other list keeps its
-/// region on its own text. The two borders stay out of it either way, so
-/// pressing the box itself is never picking what it holds.
+/// A row answers to a pointer across the whole inside of its box, not just the
+/// columns its label happens to reach: a one-word entry beside a wide box is a
+/// thin target, and the highlight reads as a button the row's width. The
+/// question box and the composer's own suggestion list go this wide; the
+/// pickers keep their region on their text. The two borders stay out of it
+/// either way, so pressing the box itself is never picking what it holds.
 fn pick_panel_interior(mut line: PaintLine, panel_width: usize, pick: Pick) -> PaintLine {
     line.pick = Some(PickRegions::span(1, panel_width.saturating_sub(1), pick));
     line
@@ -6825,8 +6825,11 @@ fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine
         // A long list scrolls, so the row's place on screen is not its place in
         // the list: a click has to name the entry, not the line it landed on.
         let index = first_visible + offset;
-        let picks = suggestion_row_picks(|| Pick::Suggestion(index));
-        lines.push(line.with_picks(&picks));
+        lines.push(pick_panel_interior(
+            line,
+            panel_width,
+            Pick::Suggestion(index),
+        ));
     }
     let hint = suggestions
         .iter()
@@ -21657,9 +21660,9 @@ mod tests {
         assert_eq!(description_column(&first), description_column(&scrolled));
     }
 
-    /// A suggestion row answers to a click the way Enter on it would, and a
-    /// scrolled list still names the entry rather than the screen row. The
-    /// region opens after the left border so the highlight cannot paint it.
+    /// A suggestion row answers to a click the way Enter on it would, anywhere
+    /// between its borders, and a scrolled list still names the entry rather
+    /// than the screen row.
     #[test]
     fn suggestion_rows_answer_to_a_click_on_the_entry_they_name() {
         let mut suggestions = (0..7)
@@ -21682,18 +21685,10 @@ mod tests {
             .as_ref()
             .and_then(|regions| regions.columns_of(&Pick::Suggestion(0)))
             .expect("the row answers to a click");
-        assert!(
-            columns.start >= 1,
-            "region must open after the left border: {columns:?}"
-        );
-        let painted_row = painted(row);
-        let description_column = painted_row
-            .find("description-0")
-            .map(|at| UnicodeWidthStr::width(&painted_row[..at]))
-            .expect("the description column is painted");
-        assert!(
-            columns.contains(&description_column),
-            "the description column must answer to a click: {columns:?}"
+        assert_eq!(
+            columns,
+            1..painted_line_width(row) - 1,
+            "region must span the row between its borders"
         );
 
         suggestions[0].selected = false;

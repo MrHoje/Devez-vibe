@@ -19,10 +19,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "/ 명령, @ 경로, $ 목록을 마우스로 바로 고를 수 있습니다.",
-    "$ 목록 위의 User·Plugins·제공자 탭도 눌러서 바꿀 수 있습니다.",
-    "/agent 목록에서 이름과 설명을 눌러도 골라지고, 역할 설명을 한국어로 바꿨습니다.",
-    "선택한 줄의 강조가 왼쪽 테두리까지 물들던 문제를 고쳤습니다.",
+    "/ 명령, @ 경로, $ 목록에서 좌우 테두리 사이 행 전체가 눌리고 밝아집니다.",
+    "이름이 짧은 항목도 행 끝까지 눌려, 설명 옆 빈 곳을 눌러도 골라집니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
