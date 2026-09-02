@@ -5209,7 +5209,7 @@ enum Tone {
     AgentStandard,
     AgentPlanner,
     AgentAdvisor,
-    AgentFinisher,
+    AgentGoalRunner,
     Border,
     SidePanelDivider,
     Branch,
@@ -12729,7 +12729,7 @@ fn agent_prompt_tone(mode: AgentMode) -> Tone {
         AgentMode::Standard => Tone::AgentStandard,
         AgentMode::Planner => Tone::AgentPlanner,
         AgentMode::Advisor => Tone::AgentAdvisor,
-        AgentMode::Finisher => Tone::AgentFinisher,
+        AgentMode::GoalRunner => Tone::AgentGoalRunner,
     }
 }
 
@@ -12807,7 +12807,7 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         // this palette field carries exactly that reference value per theme.
         Tone::AgentPlanner => palette.model_opencode,
         Tone::AgentAdvisor => palette.purple,
-        Tone::AgentFinisher => palette.error,
+        Tone::AgentGoalRunner => palette.error,
         Tone::Border => palette.border,
         Tone::SidePanelDivider => blend(
             palette.hover_bg,
@@ -17124,12 +17124,12 @@ mod tests {
     fn the_prompt_glyph_borrows_the_agent_colour() {
         let editor = Editor::default();
         let mut mode = test_mode("Default", ModeAccent::Calm, false);
-        mode.agent = AgentMode::Finisher;
+        mode.agent = AgentMode::GoalRunner;
 
         let (rows, _, _, _) = input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
 
         assert_eq!(rows[1].text, "> ");
-        assert_eq!(rows[1].tone, Tone::AgentFinisher);
+        assert_eq!(rows[1].tone, Tone::AgentGoalRunner);
     }
 
     #[test]

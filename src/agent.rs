@@ -17,7 +17,7 @@ pub enum AgentMode {
     Standard,
     Planner,
     Advisor,
-    Finisher,
+    GoalRunner,
 }
 
 /// Every role, in the order Tab cycles through them.
@@ -25,17 +25,17 @@ pub const CHOICES: [AgentMode; 4] = [
     AgentMode::Standard,
     AgentMode::Planner,
     AgentMode::Advisor,
-    AgentMode::Finisher,
+    AgentMode::GoalRunner,
 ];
 
 const PLANNER_PROMPT: &str = include_str!("../prompts/agents/planner.md");
 const ADVISOR_PROMPT: &str = include_str!("../prompts/agents/advisor.md");
-const FINISHER_PROMPT: &str = include_str!("../prompts/agents/finisher.md");
+const GOAL_RUNNER_PROMPT: &str = include_str!("../prompts/agents/goal-runner.md");
 
 /// Sent once when the user returns to `Standard`, because the previous role's
 /// instruction is still sitting in the conversation history.
 const STANDARD_RESET: &str = "Use the provider's normal general-purpose behavior for this and \
-following turns. Do not continue a Planner, Advisor, or Finisher role solely because an earlier \
+following turns. Do not continue a Planner, Advisor, or Goal Runner role solely because an earlier \
 turn selected one.";
 
 impl AgentMode {
@@ -45,7 +45,7 @@ impl AgentMode {
             Self::Standard => "builder",
             Self::Planner => "planner",
             Self::Advisor => "advisor",
-            Self::Finisher => "finisher",
+            Self::GoalRunner => "goal-runner",
         }
     }
 
@@ -55,17 +55,17 @@ impl AgentMode {
             Self::Standard => "Builder",
             Self::Planner => "Planner",
             Self::Advisor => "Advisor",
-            Self::Finisher => "Finisher",
+            Self::GoalRunner => "Goal Runner",
         }
     }
 
     /// One line for the picker.
     pub fn detail(self) -> &'static str {
         match self {
-            Self::Standard => "평소 작업에 맞춘 기본 역할입니다.",
-            Self::Planner => "저장소를 살펴 요구사항을 정리하고 계획을 세웁니다.",
-            Self::Advisor => "위험과 득실을 견주어 무엇을 고를지 권합니다.",
-            Self::Finisher => "구현하고 검증한 뒤 끝까지 다듬습니다.",
+            Self::Standard => "일상적인 개발 작업 전반을 유연하게 처리합니다.",
+            Self::Planner => "요구사항을 분석해 체계적인 구현 계획을 수립합니다.",
+            Self::Advisor => "기술적 선택과 위험 요소를 검토해 최적의 방향을 제시합니다.",
+            Self::GoalRunner => "목표를 정하고 끝까지 완수합니다.",
         }
     }
 
@@ -80,8 +80,8 @@ impl AgentMode {
         match self {
             Self::Standard => Self::Planner,
             Self::Planner => Self::Advisor,
-            Self::Advisor => Self::Finisher,
-            Self::Finisher => Self::Standard,
+            Self::Advisor => Self::GoalRunner,
+            Self::GoalRunner => Self::Standard,
         }
     }
 
@@ -91,7 +91,7 @@ impl AgentMode {
             Self::Standard => None,
             Self::Planner => Some(PLANNER_PROMPT),
             Self::Advisor => Some(ADVISOR_PROMPT),
-            Self::Finisher => Some(FINISHER_PROMPT),
+            Self::GoalRunner => Some(GOAL_RUNNER_PROMPT),
         }
     }
 }
@@ -161,7 +161,7 @@ mod tests {
             vec![
                 AgentMode::Planner,
                 AgentMode::Advisor,
-                AgentMode::Finisher,
+                AgentMode::GoalRunner,
                 AgentMode::Standard,
             ]
         );
@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn parse_ignores_case_and_rejects_unknown_names() {
         assert_eq!(AgentMode::parse("Planner"), Some(AgentMode::Planner));
-        assert_eq!(AgentMode::parse(" FINISHER "), Some(AgentMode::Finisher));
+        assert_eq!(AgentMode::parse(" GOAL-RUNNER "), Some(AgentMode::GoalRunner));
         assert_eq!(AgentMode::parse("plan"), None);
         assert_eq!(AgentMode::parse(""), None);
     }
@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn standard_carries_no_instruction_of_its_own() {
         assert!(AgentMode::Standard.specialized_instruction().is_none());
-        for mode in [AgentMode::Planner, AgentMode::Advisor, AgentMode::Finisher] {
+        for mode in [AgentMode::Planner, AgentMode::Advisor, AgentMode::GoalRunner] {
             let prompt = mode
                 .specialized_instruction()
                 .expect("specialized roles ship a prompt");
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn every_block_declares_its_mode_and_supersedes_earlier_ones() {
-        for mode in [AgentMode::Planner, AgentMode::Advisor, AgentMode::Finisher] {
+        for mode in [AgentMode::Planner, AgentMode::Advisor, AgentMode::GoalRunner] {
             let block = AgentTurnContext::Specialized(mode).render();
             assert!(block.starts_with(&format!("<devez-vibe-agent mode=\"{}\"", mode.id())));
             assert!(block.ends_with("</devez-vibe-agent>"));
@@ -199,7 +199,7 @@ mod tests {
         assert!(reset.contains("Do not continue a Planner"));
         // A specialized role keeps the language rules but drops the length
         // caps; the reset restores the full rules, caps included.
-        for mode in [AgentMode::Planner, AgentMode::Advisor, AgentMode::Finisher] {
+        for mode in [AgentMode::Planner, AgentMode::Advisor, AgentMode::GoalRunner] {
             let block = AgentTurnContext::Specialized(mode).render();
             assert!(block.contains("language and formatting rules"));
             assert!(block.contains("caps are relaxed"));
@@ -213,7 +213,7 @@ mod tests {
     /// they were modelled on, and they must not name its runtime.
     #[test]
     fn role_prompts_avoid_external_runtime_vocabulary() {
-        for mode in [AgentMode::Planner, AgentMode::Advisor, AgentMode::Finisher] {
+        for mode in [AgentMode::Planner, AgentMode::Advisor, AgentMode::GoalRunner] {
             let prompt = mode
                 .specialized_instruction()
                 .expect("specialized roles ship a prompt")
