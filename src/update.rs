@@ -19,9 +19,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "에이전트 역할 Finisher의 이름을 Goal Runner로 바꿨습니다.",
-    "이제 /agent goal-runner로 고르며, goal까지만 쳐도 자동완성됩니다.",
-    "네 역할의 설명 문구를 하는 일이 더 잘 드러나도록 다시 썼습니다.",
+    "Builder 역할 색을 브라운베이지 계열로 바꿨습니다.",
+    "네 역할 색을 테마마다 따로 정해, 밝은 테마와 어두운 테마에서 고르게 읽힙니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

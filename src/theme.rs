@@ -169,6 +169,13 @@ pub struct ThemePalette {
     pub model_terra: Rgb,
     pub model_luna: Rgb,
     pub model_spark: Rgb,
+    /// The agent roles. Each theme carries its own four so a role reads the
+    /// same weight on a light background as on a dark one instead of borrowing
+    /// a colour that happens to sit nearby in the palette.
+    pub agent_builder: Rgb,
+    pub agent_planner: Rgb,
+    pub agent_advisor: Rgb,
+    pub agent_goal_runner: Rgb,
     pub status: StatusLinePalette,
     pub code: Rgb,
     pub syntax_comment: Rgb,
@@ -265,6 +272,10 @@ pub const MINIMAL: ThemePalette = ThemePalette {
     model_terra: Rgb(0x2E, 0x7D, 0x32),
     model_luna: Rgb(0x6C, 0x5C, 0xE7),
     model_spark: Rgb(0xEA, 0xB3, 0x08),
+    agent_builder: Rgb(0x7A, 0x53, 0x26),
+    agent_planner: Rgb(0x25, 0x63, 0xEB),
+    agent_advisor: Rgb(0x7C, 0x3A, 0xED),
+    agent_goal_runner: Rgb(0xDC, 0x26, 0x26),
     status: StatusLinePalette {
         text: Rgb(0x0F, 0x14, 0x22),
         separator: Rgb(0x0F, 0x14, 0x22),
@@ -329,6 +340,10 @@ pub const SOFT: ThemePalette = ThemePalette {
     model_terra: Rgb(0x55, 0x7A, 0x46),
     model_luna: Rgb(0x8E, 0x7A, 0xB5),
     model_spark: Rgb(0xC2, 0x9B, 0x38),
+    agent_builder: Rgb(0x5F, 0x40, 0x1C),
+    agent_planner: Rgb(0x42, 0x63, 0x8F),
+    agent_advisor: Rgb(0x68, 0x4B, 0x8A),
+    agent_goal_runner: Rgb(0xA3, 0x3E, 0x3E),
     status: StatusLinePalette {
         text: Rgb(0x16, 0x12, 0x0C),
         separator: Rgb(0x16, 0x12, 0x0C),
@@ -393,6 +408,10 @@ pub const DARK: ThemePalette = ThemePalette {
     model_terra: Rgb(0x81, 0xC7, 0x84),
     model_luna: Rgb(0xC4, 0xB5, 0xFD),
     model_spark: Rgb(0xFD, 0xE0, 0x47),
+    agent_builder: Rgb(0xD5, 0xAE, 0x7C),
+    agent_planner: Rgb(0x5C, 0x9C, 0xF5),
+    agent_advisor: Rgb(0xA7, 0x8B, 0xFA),
+    agent_goal_runner: Rgb(0xF8, 0x71, 0x71),
     status: StatusLinePalette {
         text: Rgb(0xC7, 0xC8, 0xCB),
         separator: Rgb(0x82, 0x90, 0xA0),
@@ -460,6 +479,10 @@ pub const GRAY: ThemePalette = ThemePalette {
     model_terra: Rgb(0x0B, 0x7A, 0x35),
     model_luna: Rgb(0x77, 0x30, 0xA8),
     model_spark: Rgb(0x8F, 0x5A, 0x00),
+    agent_builder: Rgb(0x7A, 0x53, 0x26),
+    agent_planner: Rgb(0x1E, 0x5F, 0xAB),
+    agent_advisor: Rgb(0x77, 0x30, 0xA8),
+    agent_goal_runner: Rgb(0xC5, 0x30, 0x30),
     status: StatusLinePalette {
         text: Rgb(0x1F, 0x29, 0x37),
         separator: Rgb(0x5F, 0x67, 0x74),
@@ -526,6 +549,10 @@ pub const SOFT_PINK: ThemePalette = ThemePalette {
     model_terra: Rgb(0x25, 0x72, 0x3C),
     model_luna: Rgb(0x84, 0x58, 0x8F),
     model_spark: Rgb(0x9A, 0x65, 0x0B),
+    agent_builder: Rgb(0x7D, 0x4F, 0x2C),
+    agent_planner: Rgb(0x32, 0x6A, 0x9F),
+    agent_advisor: Rgb(0x84, 0x58, 0x8F),
+    agent_goal_runner: Rgb(0xC2, 0x41, 0x3E),
     status: StatusLinePalette {
         text: Rgb(0x3B, 0x29, 0x31),
         separator: Rgb(0x73, 0x57, 0x63),
@@ -592,6 +619,10 @@ pub const MIDNIGHT: ThemePalette = ThemePalette {
     model_terra: Rgb(0x34, 0xD3, 0x99),
     model_luna: Rgb(0xC4, 0xB5, 0xFD),
     model_spark: Rgb(0xFD, 0xE0, 0x47),
+    agent_builder: Rgb(0xD3, 0xAC, 0x7A),
+    agent_planner: Rgb(0x5C, 0x9C, 0xF5),
+    agent_advisor: Rgb(0xA7, 0x8B, 0xFA),
+    agent_goal_runner: Rgb(0xF8, 0x71, 0x71),
     status: StatusLinePalette {
         text: Rgb(0xCB, 0xD5, 0xE1),
         separator: Rgb(0x82, 0x90, 0xA0),
@@ -781,6 +812,10 @@ mod tests {
                 ("syntax_function", palette.syntax_function),
                 ("syntax_attribute", palette.syntax_attribute),
                 ("syntax_property", palette.syntax_property),
+                ("agent_builder", palette.agent_builder),
+                ("agent_planner", palette.agent_planner),
+                ("agent_advisor", palette.agent_advisor),
+                ("agent_goal_runner", palette.agent_goal_runner),
             ];
             for (name, color) in text_colors {
                 let ratio = contrast_ratio(color, palette.background);
@@ -1083,6 +1118,24 @@ mod tests {
                 usage,
                 "{} usage colors differ from DevezCode",
                 theme.display_name()
+            );
+        }
+    }
+
+    /// A role is read off its colour, so two roles sharing one would make the
+    /// composer rule ambiguous about which role the next turn is sent under.
+    #[test]
+    fn agent_roles_never_share_a_color() {
+        for theme in ThemeKind::ALL {
+            let palette = palette_of(theme);
+            assert_all_distinct(
+                theme,
+                &[
+                    ("builder", palette.agent_builder),
+                    ("planner", palette.agent_planner),
+                    ("advisor", palette.agent_advisor),
+                    ("goal runner", palette.agent_goal_runner),
+                ],
             );
         }
     }

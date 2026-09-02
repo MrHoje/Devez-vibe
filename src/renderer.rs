@@ -12800,14 +12800,13 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::StatusEffortXHigh => palette.status.effort_xhigh,
         Tone::StatusEffortMax => palette.status.effort_max,
         Tone::StatusEffortUltra => palette.status.effort_ultra,
-        // Standard is the default and stays quiet; the three specialized roles
-        // borrow colours already in the palette rather than adding theme fields.
-        Tone::AgentStandard => palette.sky_blue,
-        // OpenCode paints its plan agent in the theme's secondary blue, and
-        // this palette field carries exactly that reference value per theme.
-        Tone::AgentPlanner => palette.model_opencode,
-        Tone::AgentAdvisor => palette.purple,
-        Tone::AgentGoalRunner => palette.error,
+        // Each role owns a colour per theme, so Builder's brown-beige stays
+        // brown-beige and every role keeps its weight on a light background as
+        // well as on a dark one.
+        Tone::AgentStandard => palette.agent_builder,
+        Tone::AgentPlanner => palette.agent_planner,
+        Tone::AgentAdvisor => palette.agent_advisor,
+        Tone::AgentGoalRunner => palette.agent_goal_runner,
         Tone::Border => palette.border,
         Tone::SidePanelDivider => blend(
             palette.hover_bg,
