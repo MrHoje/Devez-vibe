@@ -6601,6 +6601,15 @@ fn split_panel_border(mut line: PaintLine, marker_tone: Tone) -> PaintLine {
     line
 }
 
+/// The whole inside of a boxed row answers to a pointer, not just the columns
+/// its label happens to reach: a one-word answer beside a wide box is a thin
+/// target, and the highlight reads as a button the row's width. The two borders
+/// stay out of it — pressing the box itself is not picking what it holds.
+fn pick_panel_interior(mut line: PaintLine, panel_width: usize, pick: Pick) -> PaintLine {
+    line.pick = Some(PickRegions::span(1, panel_width.saturating_sub(1), pick));
+    line
+}
+
 fn panelize_content_line(mut line: PaintLine, panel_width: usize) -> PaintLine {
     line.prefix.insert(0, '│');
     line.prefix_tone = Tone::Border;
@@ -7595,14 +7604,14 @@ fn overlay_frame_with_expansion(
                             )
                             .into_iter()
                             .map(|line| {
-                                // The border split moved the marker/number into
-                                // span 0 and the label into span 1, so the click
-                                // region needs both to cover the visible row.
-                                close_panel_row(split_panel_border(line, Tone::Accent), panel_width)
-                                    .with_picks(&[
-                                        (0, Pick::Row(row_index)),
-                                        (1, Pick::Row(row_index)),
-                                    ])
+                                pick_panel_interior(
+                                    close_panel_row(
+                                        split_panel_border(line, Tone::Accent),
+                                        panel_width,
+                                    ),
+                                    panel_width,
+                                    Pick::Row(row_index),
+                                )
                             }),
                         );
                     }
@@ -7643,14 +7652,11 @@ fn overlay_frame_with_expansion(
                             } else {
                                 Tone::Muted
                             };
-                            // Span 0 is the marker/number after the border
-                            // split; without span 1 the click region stops
-                            // short of the label and reads as shifted left.
-                            close_panel_row(split_panel_border(line, marker), panel_width)
-                                .with_picks(&[
-                                    (0, Pick::Row(row_index)),
-                                    (1, Pick::Row(row_index)),
-                                ])
+                            pick_panel_interior(
+                                close_panel_row(split_panel_border(line, marker), panel_width),
+                                panel_width,
+                                Pick::Row(row_index),
+                            )
                         }),
                     );
                 }
@@ -22021,11 +22027,12 @@ mod tests {
         );
     }
 
-    /// The click region of a question option starts at the panel border, not
-    /// at the label: the border split leaves the marker and number in span 0,
-    /// and a region that skipped them read as shifted left of the row.
+    /// A question option answers to a click anywhere inside its box, not only
+    /// where its label happens to reach: a short answer was otherwise a thin
+    /// target beside a wide row. The two borders stay out of the region, so
+    /// pressing the box itself is still not picking what it holds.
     #[test]
-    fn question_option_click_region_covers_the_marker_number_and_label() {
+    fn question_option_click_region_covers_the_row_between_its_borders() {
         let frame = overlay_frame(
             &[],
             OverlayView {
@@ -22069,11 +22076,13 @@ mod tests {
             .as_ref()
             .and_then(|regions| regions.columns_of(&Pick::Row(1)))
             .expect("the option row answers to a click");
-        // The row paints as `│ ❯  1. 선택지 A`, so the label spans columns
-        // 8..16. The click region must reach from the marker through the label
-        // (the usual one-column bleed on either side is fine).
-        assert!(columns.start <= 2, "region misses the marker: {columns:?}");
-        assert!(columns.end >= 16, "region stops short of the label: {columns:?}");
+        let row_width = painted_line_width(line);
+        assert_eq!(
+            columns,
+            1..row_width - 1,
+            "region must span the row between its borders"
+        );
+        assert!(row_width > 16, "the row is wider than its label: {row_width}");
     }
 
     #[test]

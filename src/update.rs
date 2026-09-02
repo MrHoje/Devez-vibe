@@ -19,9 +19,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "대화를 분기해 새 스레드를 열 때 원래 대화의 모델과 추론 강도를 그대로 이어받습니다.",
-    "분기한 대화를 나중에 다시 열어도 처음 열렸던 모델과 추론 강도가 유지됩니다.",
-    "OpenCode 대화를 분기할 때 모델과 추론 강도가 기본값으로 되돌아가던 문제를 고쳤습니다.",
+    "질문 선택지를 마우스로 고를 때 좌우 테두리 사이 행 전체가 눌리고 밝아집니다.",
+    "글자가 짧은 선택지도 행 끝까지 눌려, 라벨 옆 빈 곳을 눌러도 답이 골라집니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
