@@ -19,8 +19,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "Builder 역할 색을 브라운베이지 계열로 바꿨습니다.",
-    "네 역할 색을 테마마다 따로 정해, 밝은 테마와 어두운 테마에서 고르게 읽힙니다.",
+    "Builder 역할 색을 이전의 파란 계열로 되돌리고, Planner 역할 색을 녹색 계열로 바꿨습니다.",
+    "도구 실행 중에 끼어든 스티어 입력이 그에 대한 응답보다 앞에 표시됩니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

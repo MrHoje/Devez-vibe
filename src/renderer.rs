@@ -5826,6 +5826,30 @@ fn queue_preview_lines(prompts: &[String], width: u16) -> Vec<PaintLine> {
 /// Places the full composer control strip at the right edge of a one-line
 /// activity row. A narrow terminal keeps the controls on the composer rule,
 /// where they can use their existing progressive compression.
+/// A notice on the idle row above the composer. It sits where the `Working`
+/// label starts, so the composer badge keeps its own right-hand slot.
+fn idle_notice_line(notice: &str, width: u16) -> Option<PaintLine> {
+    let available = (width as usize).saturating_sub(IDLE_NOTICE_RESERVED_COLUMNS);
+    let text = compact_right(notice, available);
+    if text.is_empty() {
+        return None;
+    }
+    Some(PaintLine {
+        prefix: " ".to_owned(),
+        prefix_tone: Tone::Accent,
+        text,
+        tone: Tone::Accent,
+        bold: false,
+        tool_heading: None,
+        pick: None,
+        tail: Vec::new(),
+    })
+}
+
+/// The leading gutter plus the trailing edge the composer badge shares with the
+/// status row below it.
+const IDLE_NOTICE_RESERVED_COLUMNS: usize = 4;
+
 fn activity_line_with_composer_controls(
     mut line: PaintLine,
     mode: &ComposerMode,
@@ -6316,15 +6340,26 @@ fn normal_frame_with_expansion(
         dock_index = dock_index.min(lines.len());
     }
     if !activity_uses_composer_spacer {
+        // With no turn running there is no `Working` label on the row above the
+        // composer, so a notice takes that row instead of the composer rule —
+        // one reading place for every notice, whether a turn is running or not.
+        let notice_row = (activity.is_none() && suggestions.is_empty())
+            .then_some(composer_notice)
+            .flatten()
+            .and_then(|notice| idle_notice_line(notice, width));
+        if notice_row.is_some() {
+            composer_notice = None;
+        }
+        let spacer = notice_row.unwrap_or_else(PaintLine::blank);
         if idle_controls_can_use_composer_spacer
             && let Some(mode) = composer_controls_mode
             && let Some(row) =
-                activity_line_with_composer_controls(PaintLine::blank(), mode, None, width)
+                activity_line_with_composer_controls(spacer.clone(), mode, None, width)
         {
             lines.push(row);
             composer_controls_mode = None;
         } else {
-            lines.push(PaintLine::blank());
+            lines.push(spacer);
         }
     }
     lines.extend(queue_preview_lines(queued_prompts, width));
@@ -12800,9 +12835,9 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::StatusEffortXHigh => palette.status.effort_xhigh,
         Tone::StatusEffortMax => palette.status.effort_max,
         Tone::StatusEffortUltra => palette.status.effort_ultra,
-        // Each role owns a colour per theme, so Builder's brown-beige stays
-        // brown-beige and every role keeps its weight on a light background as
-        // well as on a dark one.
+        // Each role owns a colour per theme (Builder sky blue, Planner green),
+        // so every role keeps its weight on a light background as well as on
+        // a dark one.
         Tone::AgentStandard => palette.agent_builder,
         Tone::AgentPlanner => palette.agent_planner,
         Tone::AgentAdvisor => palette.agent_advisor,
@@ -16579,10 +16614,10 @@ mod tests {
         assert_eq!(line_suffix("src/main.rs:83:12").as_deref(), Some(":83:12"));
     }
 
-    /// The transient notice belongs to the composer bottom rule, leaving the spacer
-    /// row above the input untouched.
+    /// With no turn running the transient notice takes the row the `Working`
+    /// label would use, above the composer, leaving the composer rule untouched.
     #[test]
-    fn transient_notice_sits_on_the_composer_bottom_rule() {
+    fn transient_notice_sits_on_the_activity_row_above_the_composer() {
         let editor = Editor::default();
         let frame = normal_frame(
             &[],
@@ -16602,30 +16637,30 @@ mod tests {
         let notice = frame
             .lines
             .iter()
-            .position(|line| {
-                line.tail
-                    .iter()
-                    .any(|span| span.text == "• Copied to clipboard")
-            })
+            .position(|line| line.text == "• Copied to clipboard")
             .expect("notice row");
+        let composer_top = frame
+            .lines
+            .iter()
+            .position(|line| painted(line).starts_with('╭'))
+            .expect("composer top rule");
         assert_eq!(
-            frame.lines[notice].tone,
-            Tone::Border,
-            "the composer rule should keep its border tone"
+            notice + 1,
+            composer_top,
+            "the notice should take the row directly above the composer"
         );
+        assert_eq!(frame.lines[notice].tone, Tone::Accent, "notice is off-theme");
         assert!(
-            painted(&frame.lines[notice]).starts_with('╰'),
-            "the notice should sit on the rule, not replace it"
-        );
-        assert_eq!(
-            frame.lines[notice].tail[1].tone,
-            Tone::Accent,
-            "notice is off-theme"
+            frame
+                .lines
+                .iter()
+                .all(|line| !painted(line).contains("╰  • Copied to clipboard")),
+            "the composer rule should no longer carry the notice"
         );
     }
 
     #[test]
-    fn transient_notice_is_right_aligned_on_the_composer_bottom_rule() {
+    fn transient_notice_starts_where_the_working_label_does() {
         let editor = Editor::default();
         let frame = normal_frame(
             &[],
@@ -16645,16 +16680,9 @@ mod tests {
         let notice = frame
             .lines
             .iter()
-            .find(|line| {
-                line.tail
-                    .iter()
-                    .any(|span| span.text == "• Copied to clipboard")
-            })
+            .find(|line| line.text == "• Copied to clipboard")
             .expect("notice row");
-        assert_eq!(
-            painted(notice),
-            format!("╰{}  • Copied to clipboard ─╯", "─".repeat(52))
-        );
+        assert_eq!(painted(notice), " • Copied to clipboard");
     }
 
     #[test]

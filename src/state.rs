@@ -5842,6 +5842,14 @@ impl AppState {
         self.response_collapse = None;
     }
 
+    /// Whether assistant text is still streaming in: the answer it belongs to
+    /// predates anything the user types now, so a steer card has to wait for it.
+    fn assistant_text_in_flight(&self) -> bool {
+        self.active
+            .values()
+            .any(|item| matches!(item.block.kind, BlockKind::Assistant))
+    }
+
     /// Slots every held steer card into the transcript, in Enter order. Runs
     /// where the in-flight answer is known to be on the record already: after a
     /// completed assistant message, at turn end, or before a fresh prompt.
@@ -8806,13 +8814,24 @@ impl AppState {
         }
         let started_at = Instant::now();
         if steering {
-            // The turn already has a response in flight; the card waits for it
-            // (see `pending_steer_prompts`) while the text itself steers now.
-            self.pending_steer_prompts.push(PendingSteerPrompt {
-                display,
-                model: self.selected_model_name().to_owned(),
-                started_at,
-            });
+            let model = self.selected_model_name().to_owned();
+            if self.assistant_text_in_flight() {
+                // The turn already has a response in flight; the card waits for
+                // it (see `pending_steer_prompts`) while the text itself steers
+                // now.
+                self.pending_steer_prompts.push(PendingSteerPrompt {
+                    display,
+                    model,
+                    started_at,
+                });
+            } else {
+                // Nothing is being answered right now (the agent is between
+                // messages, e.g. running tools), so the next assistant text is
+                // the reaction to this steer and the card must precede it.
+                self.flush_pending_steer_prompts();
+                let prompt = Block::new(BlockKind::User, &model, display);
+                self.begin_turn_prompt(prompt, started_at);
+            }
             Action::Steer(text)
         } else {
             self.flush_pending_steer_prompts();
@@ -21487,15 +21506,14 @@ mod tests {
             .filter(|block| matches!(block.kind, BlockKind::ProgressGroup))
             .collect::<Vec<_>>();
 
-        // The steer card waits for the answer already in flight, so the first
-        // response completed after the steer still groups with the first
-        // prompt; only what follows the card belongs to the new prompt.
+        // No answer was in flight when the steer landed, so the card slots in
+        // at once and everything completed after it belongs to the new prompt.
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].title, "+2 Response");
+        assert_eq!(groups[0].title, "+1 Response");
         assert_eq!(groups[0].children()[0].body, "첫 요청 진행 기록");
-        assert_eq!(groups[0].children()[1].body, "추가 요청 확인");
-        assert_eq!(groups[1].title, "+1 Response");
-        assert_eq!(groups[1].children()[0].body, "추가 요청 수정");
+        assert_eq!(groups[1].title, "+2 Response");
+        assert_eq!(groups[1].children()[0].body, "추가 요청 확인");
+        assert_eq!(groups[1].children()[1].body, "추가 요청 수정");
     }
 
     /// Tabs and stray CRs from a raw clipboard paste shear the composer's right
@@ -21520,6 +21538,12 @@ mod tests {
         ));
         state.drain_committed();
         state.set_turn_started("turn-1".to_owned());
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({ "itemId": "old-answer", "delta": "이전 요청 " }),
+        );
+        state.flush_stream_text();
+        state.drain_committed();
 
         assert!(matches!(
             state.submit_text("끼어든 질문".to_owned(), "끼어든 질문".to_owned()),
@@ -21545,6 +21569,54 @@ mod tests {
         // "첫 요청" in the middle is the earlier card re-committed with its
         // duration stamped; it updates the existing row instead of adding one.
         assert_eq!(order, vec!["이전 요청 완료 보고", "첫 요청", "끼어든 질문"]);
+    }
+
+    /// The mirror case: a prompt steered while the agent was between messages
+    /// (running tools, no text in flight) used to wait for the next assistant
+    /// text, which is the reaction to the steer itself, so the record read
+    /// answer-then-question. With nothing in flight the card lands at once.
+    #[test]
+    fn steered_prompt_with_no_text_in_flight_precedes_the_reaction() {
+        let mut state = test_state();
+        assert!(matches!(
+            state.submit_text("첫 요청".to_owned(), "첫 요청".to_owned()),
+            Action::Submit(_)
+        ));
+        state.drain_committed();
+        state.set_turn_started("turn-1".to_owned());
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "item": { "id": "progress-1", "type": "agentMessage", "phase": "commentary", "text": "코드를 찾겠습니다." }
+            }),
+        );
+        state.drain_committed();
+
+        assert!(matches!(
+            state.submit_text("끼어든 질문".to_owned(), "끼어든 질문".to_owned()),
+            Action::Steer(_)
+        ));
+        let card = state
+            .drain_committed()
+            .into_iter()
+            .filter(|block| matches!(block.kind, BlockKind::User))
+            .map(|block| block.body)
+            .collect::<Vec<_>>();
+        assert_eq!(card, vec!["첫 요청", "끼어든 질문"]);
+
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "item": { "id": "reaction", "type": "agentMessage", "phase": "commentary", "text": "브랜치를 먼저 받아오겠습니다." }
+            }),
+        );
+        let order = state
+            .drain_committed()
+            .into_iter()
+            .filter(|block| matches!(block.kind, BlockKind::User | BlockKind::Assistant))
+            .map(|block| block.body)
+            .collect::<Vec<_>>();
+        assert_eq!(order, vec!["브랜치를 먼저 받아오겠습니다."]);
     }
 
     #[test]
