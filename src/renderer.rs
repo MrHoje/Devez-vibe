@@ -14106,6 +14106,28 @@ mod tests {
     }
 
     #[test]
+    fn probe_preedit_transition_bytes() {
+        let underlined = CellStyle {
+            underlined: true,
+            ..CellStyle::plain()
+        };
+        let mut a = CellFrame::new(30, 1);
+        a.write(0, 0, "│ > ", CellStyle::plain());
+        a.write(4, 0, "안", underlined);
+        let mut b = CellFrame::new(30, 1);
+        b.write(0, 0, "│ > 안", CellStyle::plain());
+        b.write(6, 0, "ㄴ", underlined);
+        let mut c = CellFrame::new(30, 1);
+        c.write(0, 0, "│ > 안", CellStyle::plain());
+        c.write(6, 0, "녀", underlined);
+        for (previous, current) in [(&a, &b), (&b, &c)] {
+            let mut out = Vec::new();
+            emit_frame_diff(&mut out, Some(previous), current).expect("diff emits");
+            println!("{:?}", String::from_utf8(out).expect("utf8"));
+        }
+    }
+
+    #[test]
     fn a_damaged_korean_composer_row_repaints_its_tail_with_one_cursor_move() {
         let mut before = CellFrame::new(20, 1);
         before.write(0, 0, "› 안녕", CellStyle::plain());

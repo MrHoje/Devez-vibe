@@ -37,6 +37,8 @@ pub enum PreeditInput {
 #[derive(Debug, Default)]
 pub struct PreeditCapture {
     buffer: Option<String>,
+    /// The frame character whose press was counted, so its release is not.
+    pressed: Option<char>,
 }
 
 impl PreeditCapture {
@@ -50,29 +52,39 @@ impl PreeditCapture {
     }
 
     pub fn observe(&mut self, key: KeyEvent) -> PreeditInput {
+        let KeyCode::Char(ch) = key.code else {
+            return PreeditInput::Key(key);
+        };
         if !self.claims(&key) {
             return PreeditInput::Key(key);
         }
-        // Windows reports a release for every press; the press already counted.
+        // Windows reports a release for every press, and the press already
+        // counted. A character ConPTY has no key for, and does not class as a
+        // letter, arrives as an Alt code instead: a single release with no press
+        // before it. The markers are such characters, so a release on its own
+        // counts as the character itself.
         if key.kind == KeyEventKind::Release {
-            return PreeditInput::Swallowed;
+            if self.pressed.take() == Some(ch) {
+                return PreeditInput::Swallowed;
+            }
+        } else {
+            self.pressed = Some(ch);
         }
-        match key.code {
-            KeyCode::Char(PREEDIT_START) => {
+        match ch {
+            PREEDIT_START => {
                 self.buffer = Some(String::new());
                 PreeditInput::Swallowed
             }
-            KeyCode::Char(PREEDIT_END) => match self.buffer.take() {
+            PREEDIT_END => match self.buffer.take() {
                 Some(text) => PreeditInput::Update(text),
                 None => PreeditInput::Swallowed,
             },
-            KeyCode::Char(ch) => {
+            _ => {
                 if let Some(buffer) = &mut self.buffer {
                     buffer.push(ch);
                 }
                 PreeditInput::Swallowed
             }
-            _ => PreeditInput::Key(key),
         }
     }
 }
@@ -130,6 +142,31 @@ mod tests {
             PreeditInput::Swallowed
         );
         let plain = key('a', KeyEventKind::Press);
+        assert_eq!(capture.observe(plain), PreeditInput::Key(plain));
+    }
+
+    #[test]
+    fn markers_delivered_as_alt_code_releases_still_frame_the_preedit() {
+        // ConPTY turns the private-use markers into Alt codes: one release each,
+        // no press. The Hangul in between still comes as press and release.
+        let mut capture = PreeditCapture::default();
+        assert_eq!(
+            capture.observe(key(PREEDIT_START, KeyEventKind::Release)),
+            PreeditInput::Swallowed
+        );
+        assert_eq!(
+            capture.observe(key('안', KeyEventKind::Press)),
+            PreeditInput::Swallowed
+        );
+        assert_eq!(
+            capture.observe(key('안', KeyEventKind::Release)),
+            PreeditInput::Swallowed
+        );
+        assert_eq!(
+            capture.observe(key(PREEDIT_END, KeyEventKind::Release)),
+            PreeditInput::Update("안".to_owned())
+        );
+        let plain = key('안', KeyEventKind::Press);
         assert_eq!(capture.observe(plain), PreeditInput::Key(plain));
     }
 

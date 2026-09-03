@@ -6760,10 +6760,16 @@ impl AppState {
         self.disarm_quit();
         let old_text = self.editor.text();
         let binding_count = self.selected_completion_bindings.len();
+        let sanitized = pasted.then(|| sanitize_pasted_text(text));
+        let text = sanitized.as_deref().unwrap_or(text);
+        // A committed Hangul syllable and the Space that ended its composition
+        // can arrive inside the paste classifier's fast window. Settle the
+        // matching preedit before either insertion path so it cannot follow the
+        // cursor and briefly reappear one space to the right.
+        self.settle_preedit_for_text(text);
         if pasted {
-            self.editor.insert_paste_str(&sanitize_pasted_text(text));
+            self.editor.insert_paste_str(text);
         } else {
-            self.settle_preedit_for_text(text);
             self.editor.insert_str(text);
         }
         self.command_selection = 0;
@@ -6807,6 +6813,13 @@ impl AppState {
     }
 
     fn settle_preedit_for_text(&mut self, committed: &str) {
+        // The paste classifier may batch the whole preedit with the ordinary
+        // key that ended it, most visibly `syllable + Space`. The committed
+        // prefix still settles the preedit even though more input follows it.
+        if !self.composer_preedit.is_empty() && committed.starts_with(&self.composer_preedit) {
+            self.composer_preedit.clear();
+            return;
+        }
         if let Some(rest) = crate::preedit::preedit_after_commit(&self.composer_preedit, committed)
         {
             self.composer_preedit = rest;
@@ -16150,6 +16163,19 @@ mod tests {
         // Any other key only arrives once the composition is over.
         state.set_composer_preedit("ㅅ");
         state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(state.composer_preedit(), "");
+    }
+
+    #[test]
+    fn a_fast_hangul_commit_and_space_settle_the_preedit_even_as_a_paste_burst() {
+        let mut state = test_state();
+        state.set_composer_preedit("녕");
+
+        // ConPTY delivers the committed syllable and the Space key close enough
+        // together for the paste classifier to batch them as pasted text.
+        state.handle_buffered_composer_text("녕 ", true);
+
+        assert_eq!(state.editor.text(), "녕 ");
         assert_eq!(state.composer_preedit(), "");
     }
 

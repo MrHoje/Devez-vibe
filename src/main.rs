@@ -6410,6 +6410,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn probe_second_syllable_preedit_survives_the_commit_before_it() {
+        use crossterm::event::{KeyEventKind, KeyEventState};
+        use preedit::{PREEDIT_END, PREEDIT_START, PreeditCapture, PreeditInput};
+        fn release(ch: char) -> KeyEvent {
+            KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Release,
+                state: KeyEventState::NONE,
+            }
+        }
+        fn frame(text: char) -> Vec<KeyEvent> {
+            vec![
+                release(PREEDIT_START),
+                press(KeyCode::Char(text), KeyModifiers::NONE),
+                release(text),
+                release(PREEDIT_END),
+            ]
+        }
+        let mut state = starting_state();
+        let mut buffer = ComposerPasteBuffer::new();
+        let mut capture = PreeditCapture::default();
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        let t0 = Instant::now();
+        let mut keys = Vec::new();
+        keys.extend(frame('ㅇ'));
+        keys.extend(frame('아'));
+        keys.extend(frame('안'));
+        keys.push(press(KeyCode::Char('안'), KeyModifiers::NONE));
+        keys.push(release('안'));
+        keys.extend(frame('ㄴ'));
+        let mut log = Vec::new();
+        for (index, key) in keys.into_iter().enumerate() {
+            let now = t0 + Duration::from_micros(200 * index as u64);
+            if capture.claims(&key) {
+                if let PreeditInput::Update(text) = capture.observe(key) {
+                    flush_composer_paste_now(&mut state, &mut buffer);
+                    let changed = state.set_composer_preedit(&text);
+                    log.push(format!(
+                        "preedit {text:?} changed={changed} text={:?}",
+                        state.editor.text()
+                    ));
+                }
+            } else {
+                let action =
+                    observe_composer_key_with_scroll(&mut state, &mut renderer, &mut buffer, key, now);
+                log.push(format!(
+                    "key {:?} {:?} tick_false={} buffering={}",
+                    key.code,
+                    key.kind,
+                    matches!(action, Action::Tick(false)),
+                    buffer.is_buffering()
+                ));
+            }
+        }
+        println!("{}", log.join("\n"));
+        assert_eq!(state.editor.text(), "안");
+        assert_eq!(state.view().composer_preedit, "ㄴ");
+        assert!(!buffer.is_buffering());
+    }
+
     fn starting_state() -> AppState {
         AppState::new(
             String::new(),
