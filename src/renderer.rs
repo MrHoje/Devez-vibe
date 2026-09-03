@@ -5637,7 +5637,7 @@ fn activity_lines_with_progress(
     progress_phase: f32,
     width: u16,
 ) -> Vec<PaintLine> {
-    let tone = activity_model.and_then(model_tone).unwrap_or(Tone::Plain);
+    let tone = activity_model.and_then(chrome_model_tone).unwrap_or(Tone::Plain);
     if UnicodeWidthStr::width(activity) > width.saturating_sub(2) as usize {
         return wrapped_line(" ", tone, activity, tone, false, width);
     }
@@ -17130,6 +17130,25 @@ mod tests {
                 .collect::<String>(),
             "Working.. (2m 12s)"
         );
+    }
+
+    #[test]
+    fn opencode_activity_uses_the_opencode_model_tone() {
+        let line = activity_lines(
+            "Working.. (2m 12s)",
+            Some("opencode:anthropic/claude-sonnet-5"),
+            0.5,
+            80,
+        )
+        .pop()
+        .expect("working row");
+
+        assert_eq!(line.tone, Tone::ModelOpenCode);
+        assert_eq!(
+            line.tail.first().map(|span| span.tone),
+            Some(Tone::ModelOpenCode)
+        );
+        assert_eq!(tone_rgb(line.tone), Some(theme::palette().model_opencode));
     }
 
     #[test]
