@@ -4742,7 +4742,7 @@ fn split_pane_header(label: &str, width: u16, active: bool) -> PaintLine {
         + UnicodeWidthStr::width(label)
         + UnicodeWidthStr::width(marker);
     let shortcut = compact_right(
-        "Tab switch · Ctrl+C close",
+        "Shift+Tab switch · Ctrl+C close",
         usize::from(width).saturating_sub(used + COMPOSER_RULE_MIN + 2),
     );
     let rule_width = usize::from(width).saturating_sub(
@@ -13226,7 +13226,8 @@ mod tests {
         assert_eq!(active.lines.len(), 12);
         assert!(active.lines[0] == PaintLine::blank());
         assert!(
-            painted_line_text(&active.lines[1]).starts_with("┌─ BTW · Tab switch · Ctrl+C close ─")
+            painted_line_text(&active.lines[1])
+                .starts_with("┌─ BTW · Shift+Tab switch · Ctrl+C close ─")
         );
         assert_eq!(painted_line_width(&active.lines[1]), 79);
         assert_eq!(active.lines[1].prefix_tone, Tone::Muted);

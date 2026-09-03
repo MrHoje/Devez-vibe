@@ -3546,6 +3546,9 @@ pub struct AppState {
     /// The role the next turn is sent under. Tab, `/agent` and the status line
     /// badge all move this one field; no provider owns it.
     agent_mode: AgentMode,
+    /// The role captured when the current turn started. Live plan chrome keeps
+    /// this colour even when Tab selects a different role for the next turn.
+    active_turn_agent: AgentMode,
     /// Whether a `Standard` turn still owes the conversation a reset block. A
     /// specialized instruction stays in history after its turn, so going quiet
     /// is not enough to retire it.
@@ -3852,6 +3855,7 @@ impl AppState {
             queued_prompts: VecDeque::new(),
             pending_steer_prompts: Vec::new(),
             agent_mode: AgentMode::Standard,
+            active_turn_agent: AgentMode::Standard,
             standard_reset_required: false,
             thread_id,
             resume_id: String::new(),
@@ -4076,13 +4080,12 @@ impl AppState {
         self.busy || self.compacting()
     }
 
-    /// The role is frozen wherever a turn's role is already decided but not yet
-    /// spent: a running turn and its steers, a queue that stores text alone, a
-    /// compaction boundary, a pending provider handoff, a resume still
-    /// hydrating, and any subagent whose completion can open a follow-up turn.
+    /// The role stays frozen when an unsent prompt cannot carry its own role: a
+    /// text-only queue, a compaction boundary, a pending provider handoff, a
+    /// resume still hydrating, or a subagent that can open a follow-up turn.
+    /// A plain running turn is safe because its role was captured at submission.
     fn agent_change_blocked(&self) -> bool {
-        self.busy
-            || self.compacting()
+        self.compacting()
             || self.provider_switch_pending()
             || self.host_loading
             || !self.queued_prompts.is_empty()
@@ -6319,6 +6322,7 @@ impl AppState {
         // A resumed transcript can still hold a specialized role's instruction
         // from the previous process, so the first Standard turn has to retire it.
         self.agent_mode = AgentMode::Standard;
+        self.active_turn_agent = AgentMode::Standard;
         self.standard_reset_required = true;
     }
 
@@ -6426,7 +6430,7 @@ impl AppState {
                 && self.response_display_mode == ResponseDisplayMode::Completed,
             plan_active: self.plan_is_active(),
             plan_shimmer_phase: self.plan_shimmer_phase(),
-            plan_agent: self.agent_mode,
+            plan_agent: self.active_turn_agent,
             editor: &self.editor,
             composer_images: &self.composer_images,
             queued_prompts: self.queued_prompts.iter().cloned().collect(),
@@ -6727,7 +6731,7 @@ impl AppState {
             plan_summary: self.visible_plan_summary(),
             plan_active: self.plan_is_active(),
             plan_shimmer_phase: self.plan_shimmer_phase(),
-            plan_agent: self.agent_mode,
+            plan_agent: self.active_turn_agent,
             composer_notice: self
                 .composer_notice
                 .as_ref()
@@ -8873,6 +8877,7 @@ impl AppState {
         self.commit_welcome_card();
         let steering = self.busy;
         if !steering {
+            self.active_turn_agent = self.agent_mode;
             self.reset_turn_item_tracking();
         }
         let started_at = Instant::now();
@@ -22928,10 +22933,39 @@ mod tests {
         }
     }
 
-    /// A running turn owns its role: Tab reports instead of switching.
+    /// Tab selects the next turn's role without repainting the active turn's plan.
     #[test]
-    fn tab_during_a_turn_leaves_the_role_alone() {
+    fn tab_during_a_turn_changes_the_next_role_only() {
         let mut state = busy_state_with_live_turn();
+
+        state.handle_key(KeyEvent::from(KeyCode::Tab));
+
+        assert_eq!(state.agent_mode, AgentMode::Planner);
+        assert_eq!(state.view().plan_agent, AgentMode::Standard);
+        assert_eq!(state.animation_view().plan_agent, AgentMode::Standard);
+        assert_eq!(
+            state.view().composer_mode.expect("composer mode").agent,
+            AgentMode::Planner
+        );
+    }
+
+    #[test]
+    fn a_new_turn_captures_its_agent_before_the_next_selection_changes() {
+        let mut state = idle_test_state();
+        state.set_agent_mode(AgentMode::Planner);
+        state.editor.set_text("start under planner");
+
+        assert!(matches!(state.submit_editor(), Action::Submit(_)));
+        state.handle_key(KeyEvent::from(KeyCode::Tab));
+
+        assert_eq!(state.agent_mode, AgentMode::Advisor);
+        assert_eq!(state.view().plan_agent, AgentMode::Planner);
+    }
+
+    #[test]
+    fn a_queued_prompt_keeps_the_agent_selection_locked() {
+        let mut state = busy_state_with_live_turn();
+        state.queued_prompts.push_back("next prompt".to_owned());
 
         state.handle_key(KeyEvent::from(KeyCode::Tab));
 

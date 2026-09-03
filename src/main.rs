@@ -1152,6 +1152,20 @@ fn focused_state_mut<'a>(
     }
 }
 
+fn is_btw_focus_switch(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::BackTab | KeyCode::Tab)
+        && key.modifiers == KeyModifiers::SHIFT
+        && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+}
+
+fn btw_focus_after_key(
+    btw_open: bool,
+    focus: SplitFocus,
+    key: &KeyEvent,
+) -> Option<SplitFocus> {
+    (btw_open && is_btw_focus_switch(key)).then(|| focus.toggled())
+}
+
 fn event_thread_id(params: &Value) -> Option<&str> {
     params
         .get("threadId")
@@ -1554,14 +1568,12 @@ async fn event_loop(
                                 )
                             });
                         }
-                        if btw_state.is_some()
-                            && key.code == KeyCode::Tab
-                            && key.modifiers.is_empty()
-                            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                        if let Some(next_focus) =
+                            btw_focus_after_key(btw_state.is_some(), split_focus, &key)
                         {
                             let input_state = focused_state_mut(state, &mut btw_state, split_focus);
                             flush_composer_paste(input_state, &mut composer_paste, Instant::now());
-                            split_focus = split_focus.toggled();
+                            split_focus = next_focus;
                             renderer.clear_selection();
                             Action::Tick(true)
                         } else {
@@ -6799,6 +6811,36 @@ mod tests {
         assert_eq!(
             event_thread_id(&json!({ "turn": { "threadId": "main-thread" } })),
             Some("main-thread")
+        );
+    }
+
+    #[test]
+    fn shift_tab_switches_btw_focus_while_plain_tab_cycles_the_agent() {
+        let back_tab = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+        let shifted_tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT);
+        assert_eq!(
+            btw_focus_after_key(true, SplitFocus::Main, &back_tab),
+            Some(SplitFocus::Btw)
+        );
+        assert_eq!(
+            btw_focus_after_key(true, SplitFocus::Btw, &shifted_tab),
+            Some(SplitFocus::Main)
+        );
+        assert_eq!(
+            btw_focus_after_key(false, SplitFocus::Main, &back_tab),
+            None
+        );
+
+        let plain_tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(
+            btw_focus_after_key(true, SplitFocus::Main, &plain_tab),
+            None
+        );
+        let mut state = state_with_a_model();
+        state.handle_key(plain_tab);
+        assert_eq!(
+            state.view().composer_mode.expect("composer mode").agent,
+            agent::AgentMode::Planner
         );
     }
 

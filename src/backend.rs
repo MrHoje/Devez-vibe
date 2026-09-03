@@ -74,6 +74,13 @@ struct Route {
     claude_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_effort: Option<String>,
+    /// OpenCode's ACP session/load response reports the workspace defaults, not
+    /// the selection the loaded session last ran on. Keep that selection beside
+    /// the route so resume can restore both the runtime and the picker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    open_code_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    open_code_effort: Option<String>,
     /// Monotonic-enough wall-clock stamp used when several dvz processes merge
     /// their route maps. Older route files deserialize this as zero.
     #[serde(default)]
@@ -96,7 +103,7 @@ impl Route {
     /// that resumes it: a thread that mixed runtimes, or a Claude-backed one, whose id
     /// the CLI can rotate while the thread keeps the id it was announced under.
     fn is_worth_storing(&self) -> bool {
-        self.backing_count() > 1 || self.claude_id.is_some()
+        self.backing_count() > 1 || self.claude_id.is_some() || self.open_code_model.is_some()
     }
 
     fn has_claude_codex_backings(&self) -> bool {
@@ -404,6 +411,11 @@ impl BackendServer {
                         None,
                         cwd,
                     );
+                    self.note_open_code_selection(
+                        id,
+                        model,
+                        params.get("effort").and_then(Value::as_str),
+                    );
                     Ok(response)
                 } else {
                     let response = self.codex()?.request(method, params).await?;
@@ -433,9 +445,32 @@ impl BackendServer {
                     Ok(response)
                 } else if self.is_open_code_thread(&visible) {
                     let open_code = self.open_code()?;
-                    let cwd = request_cwd(&params).unwrap_or_else(|| self.cwd.clone());
+                    let route = self.route(&visible);
+                    let cwd = request_cwd(&params)
+                        .or_else(|| route.as_ref().map(|route| route.cwd.clone()))
+                        .unwrap_or_else(|| self.cwd.clone());
+                    apply_remembered_open_code_selection(&mut params, route.as_ref());
                     let backing = self.backing_id(&visible, RuntimeKind::OpenCode)?;
                     let mut response = open_code.resume_session(&cwd, &backing).await?;
+                    let model = params
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .filter(|model| is_open_code_model(model))
+                        .map(ToOwned::to_owned);
+                    let effort = params
+                        .get("effort")
+                        .and_then(Value::as_str)
+                        .filter(|effort| !effort.is_empty())
+                        .map(ToOwned::to_owned);
+                    if let Some(model) = model.as_deref() {
+                        open_code
+                            .set_model(&backing, model, effort.as_deref())
+                            .await?;
+                        response["model"] = json!(model);
+                        if let Some(effort) = effort.as_deref() {
+                            response["reasoningEffort"] = json!(effort);
+                        }
+                    }
                     response["id"] = json!(visible);
                     self.register_route(
                         &visible,
@@ -611,6 +646,12 @@ impl BackendServer {
                             turn_model.as_deref(),
                             turn_effort.as_deref(),
                         );
+                    } else if selected == RuntimeKind::OpenCode {
+                        self.note_open_code_selection(
+                            &visible,
+                            turn_model.as_deref(),
+                            turn_effort.as_deref(),
+                        );
                     }
                     if let Some(snapshot) = snapshot {
                         if switching {
@@ -721,6 +762,11 @@ impl BackendServer {
                         Some(id.to_owned()),
                         None,
                         cwd,
+                    );
+                    self.note_open_code_selection(
+                        id,
+                        response.get("model").and_then(Value::as_str),
+                        response.get("reasoningEffort").and_then(Value::as_str),
                     );
                     Ok(response)
                 } else {
@@ -1212,6 +1258,8 @@ impl BackendServer {
                 claude_seen_through: 0,
                 claude_model: None,
                 claude_effort: None,
+                open_code_model: None,
+                open_code_effort: None,
                 updated_at: 0,
             });
             route.active = active;
@@ -1469,6 +1517,30 @@ impl BackendServer {
             }
             if let Some(effort) = effort {
                 route.claude_effort = Some(effort.to_owned());
+            }
+            route.touch();
+        }
+        self.persist_routes();
+    }
+
+    /// Remembers what an OpenCode turn ran on because ACP reloads the session on
+    /// workspace defaults instead of reporting the session's previous selection.
+    fn note_open_code_selection(&self, visible: &str, model: Option<&str>, effort: Option<&str>) {
+        let model = model.filter(|model| is_open_code_model(model));
+        let effort = effort.filter(|effort| !effort.is_empty());
+        if model.is_none() && effort.is_none() {
+            return;
+        }
+        {
+            let mut routes = self.routes.lock().expect("routes mutex");
+            let Some(route) = routes.get_mut(visible) else {
+                return;
+            };
+            if let Some(model) = model {
+                route.open_code_model = Some(model.to_owned());
+            }
+            if let Some(effort) = effort {
+                route.open_code_effort = Some(effort.to_owned());
             }
             route.touch();
         }
@@ -2340,9 +2412,16 @@ fn prepare_codex_turn_context(params: &mut Value) {
 
 fn combined_turn_instructions(params: &Value, runtime: RuntimeKind) -> Option<String> {
     // Claude holds the full rules as its system prompt and Codex as its thread
-    // instructions, so neither turn restates them. OpenCode is left alone on
-    // purpose: it receives neither the rules nor the response-mode notice, and
-    // only the handoff summary still travels with the turn.
+    // instructions, so neither turn restates them. OpenCode has no standing
+    // instruction slot of its own, so unlike the other two it must carry the
+    // shared rules with the turn or they never reach it.
+    let rules = (runtime == RuntimeKind::OpenCode)
+        .then(|| {
+            params
+                .pointer("/additionalContext/devez-vibe-rules/value")
+                .and_then(Value::as_str)
+        })
+        .flatten();
     let mode = (runtime != RuntimeKind::OpenCode)
         .then(|| {
             params
@@ -2358,12 +2437,13 @@ fn combined_turn_instructions(params: &Value, runtime: RuntimeKind) -> Option<St
         })
         .flatten();
     // The agent role is the one piece every runtime needs: OpenCode is skipped
-    // for the shared rules and the mode notice, but a role that never reaches it
-    // would leave the status line claiming a role the session is not in.
+    // for the mode notice, but a role that never reaches it would leave the
+    // status line claiming a role the session is not in.
     let agent = params
         .pointer("/additionalContext/devez-vibe-agent/value")
         .and_then(Value::as_str);
     let parts = [
+        rules,
         mode,
         params
             .pointer("/additionalContext/provider-handoff/value")
@@ -2451,6 +2531,30 @@ fn apply_remembered_claude_selection(params: &mut Value, route: Option<&Route>) 
     }
 }
 
+fn apply_remembered_open_code_selection(params: &mut Value, route: Option<&Route>) {
+    for (key, remembered) in [
+        (
+            "model",
+            route.and_then(|route| route.open_code_model.clone()),
+        ),
+        (
+            "effort",
+            route.and_then(|route| route.open_code_effort.clone()),
+        ),
+    ] {
+        let requested = params
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty());
+        if requested {
+            continue;
+        }
+        if let Some(value) = remembered {
+            params[key] = json!(value);
+        }
+    }
+}
+
 fn claude_session_params(params: &Value, cwd: &Path, session_id: Option<&str>) -> Value {
     let mut request = json!({
         "cwd": cwd,
@@ -2514,6 +2618,8 @@ mod tests {
             claude_seen_through: 7,
             claude_model: None,
             claude_effort: None,
+            open_code_model: None,
+            open_code_effort: None,
             updated_at: 0,
         }
     }
@@ -2577,6 +2683,40 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_open_code_thread_prefers_what_its_own_turns_ran_on() {
+        let mut remembered = route(RuntimeKind::OpenCode, None, None);
+        remembered.open_code_id = Some("ses_1".to_owned());
+        remembered.open_code_model = Some("opencode:anthropic/claude-sonnet".to_owned());
+        remembered.open_code_effort = Some("high".to_owned());
+        let mut params = json!({});
+
+        apply_remembered_open_code_selection(&mut params, Some(&remembered));
+
+        assert_eq!(params["model"], json!("opencode:anthropic/claude-sonnet"));
+        assert_eq!(params["effort"], json!("high"));
+        assert!(
+            remembered.is_worth_storing(),
+            "an OpenCode-only route must survive restart once it has a selection"
+        );
+    }
+
+    #[test]
+    fn an_explicit_open_code_selection_outranks_the_remembered_selection() {
+        let mut remembered = route(RuntimeKind::OpenCode, None, None);
+        remembered.open_code_model = Some("opencode:anthropic/claude-sonnet".to_owned());
+        remembered.open_code_effort = Some("high".to_owned());
+        let mut params = json!({
+            "model": "opencode:openai/gpt-5",
+            "effort": "low"
+        });
+
+        apply_remembered_open_code_selection(&mut params, Some(&remembered));
+
+        assert_eq!(params["model"], json!("opencode:openai/gpt-5"));
+        assert_eq!(params["effort"], json!("low"));
+    }
+
+    #[test]
     fn a_claude_named_thread_running_on_codex_resumes_from_its_rollout() {
         let switched = route(
             RuntimeKind::Codex,
@@ -2630,6 +2770,30 @@ mod tests {
             "a sibling room's dvz must not drop routes it never knew about"
         );
         assert!(stored.contains_key("claude:room-two"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_open_code_selection_survives_a_process_restart() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("dvz-opencode-route-{suffix}"));
+        let path = dir.join("session-routes.json");
+        let mut remembered = route(RuntimeKind::OpenCode, None, None);
+        remembered.open_code_id = Some("ses_1".to_owned());
+        remembered.open_code_model = Some("opencode:anthropic/claude-sonnet".to_owned());
+        remembered.open_code_effort = Some("high".to_owned());
+
+        save_routes(&path, &HashMap::from([("ses_1".to_owned(), remembered)])).unwrap();
+        let restored = load_routes(&path);
+
+        assert_eq!(
+            restored["ses_1"].open_code_model.as_deref(),
+            Some("opencode:anthropic/claude-sonnet")
+        );
+        assert_eq!(restored["ses_1"].open_code_effort.as_deref(), Some("high"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2931,8 +3095,10 @@ mod tests {
         insert_handoff_context(&mut params, "history");
 
         // Claude opens on the rules as its system prompt, so its turn carries
-        // only the preset, handoff, and short output reminder. OpenCode takes
-        // neither the rules nor the preset, leaving the handoff alone.
+        // only the preset, handoff, and short output reminder. Codex holds the
+        // rules as its thread instructions, so its turn carries the preset and
+        // handoff. OpenCode has no standing instruction slot, so its turn has
+        // to carry the shared rules itself, alongside the handoff.
         assert_eq!(
             combined_turn_instructions(&params, RuntimeKind::Claude).as_deref(),
             Some("super vibe\n\nhistory\n\nclaude reminder")
@@ -2943,7 +3109,7 @@ mod tests {
         );
         assert_eq!(
             combined_turn_instructions(&params, RuntimeKind::OpenCode).as_deref(),
-            Some("history")
+            Some("codex rules\n\nhistory")
         );
     }
 
@@ -2972,7 +3138,7 @@ mod tests {
         );
         assert_eq!(
             combined_turn_instructions(&params, RuntimeKind::OpenCode).as_deref(),
-            Some("planner block")
+            Some("codex rules\n\nplanner block")
         );
     }
 
