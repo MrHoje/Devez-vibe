@@ -600,7 +600,6 @@ async fn await_thread(
             event = events.next() => {
                 match event {
                     Some(Ok(Event::Key(key))) if preedit_capture.claims(&key) => {
-                        input_log::record(|| format!("frame {:?} kind={:?}", key.code, key.kind));
                         match preedit_capture.observe(alt_code.normalize(key)) {
                             PreeditInput::Update(text) => apply_composer_preedit_update(
                                 state,
@@ -1525,7 +1524,6 @@ async fn event_loop(
             terminal_event = terminal_events.next() => {
                 match terminal_event {
                     Some(Ok(Event::Key(key))) if preedit_capture.claims(&key) => {
-                        input_log::record(|| format!("frame {:?} kind={:?}", key.code, key.kind));
                         match preedit_capture.observe(alt_code.normalize(key)) {
                             PreeditInput::Update(text) => {
                                 let input_state =
@@ -1541,7 +1539,6 @@ async fn event_loop(
                         }
                     }
                     Some(Ok(Event::Key(key))) => {
-                        let raw_kind = key.kind;
                         let key = alt_code.normalize(key);
                         if input_log::enabled() {
                             let selection = renderer.composer_selection_range();
@@ -1551,7 +1548,7 @@ async fn event_loop(
                                 .text();
                             input_log::record(|| {
                                 format!(
-                                    "key {:?} mods={:?} kind={:?} raw={raw_kind:?} select_all={select_all} \
+                                    "key {:?} mods={:?} kind={:?} select_all={select_all} \
                                      selection={selection:?} composer={text:?}",
                                     key.code, key.modifiers, key.kind
                                 )
