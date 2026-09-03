@@ -5531,12 +5531,6 @@ fn attach_pasted_local_image(state: &mut AppState, text: &str) -> bool {
 }
 
 fn apply_composer_text(state: &mut AppState, text: BufferedText) {
-    let trace = input_log::enabled().then(|| {
-        format!(
-            "apply text={:?} pasted={} target={:?}",
-            text.text, text.pasted, text.target
-        )
-    });
     match text.target {
         BufferedTextTarget::PendingUserInput(target) => {
             state.handle_buffered_prompt_text(&target, &text.text);
@@ -5548,11 +5542,6 @@ fn apply_composer_text(state: &mut AppState, text: BufferedText) {
             state.handle_buffered_composer_text(&text.text, true);
         }
         BufferedTextTarget::Composer => {}
-    }
-    if let Some(trace) = trace {
-        let composer = state.editor.text();
-        let preedit = state.composer_preedit();
-        input_log::record(|| format!("{trace} -> composer={composer:?} preedit={preedit:?}"));
     }
 }
 

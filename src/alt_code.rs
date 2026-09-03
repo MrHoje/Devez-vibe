@@ -21,34 +21,20 @@ pub struct AltCodeKeys {
 impl AltCodeKeys {
     /// Every key event goes through here on its way to being handled.
     pub fn normalize(&mut self, key: KeyEvent) -> KeyEvent {
-        let raw = key;
-        let normalized = match key.code {
-            KeyCode::Char(ch) if key.kind != KeyEventKind::Release => {
-                self.pressed = Some(ch);
-                key
-            }
-            KeyCode::Char(ch) if self.pressed.take() == Some(ch) => key,
-            KeyCode::Char(_) => KeyEvent {
-                kind: KeyEventKind::Press,
-                ..key
-            },
-            _ => key,
+        let KeyCode::Char(ch) = key.code else {
+            return key;
         };
-        crate::input_log::record(|| {
-            format!(
-                "event raw code={:?} mods={:?} kind={:?} state={:?} -> \
-                 code={:?} mods={:?} kind={:?} state={:?}",
-                raw.code,
-                raw.modifiers,
-                raw.kind,
-                raw.state,
-                normalized.code,
-                normalized.modifiers,
-                normalized.kind,
-                normalized.state,
-            )
-        });
-        normalized
+        if key.kind != KeyEventKind::Release {
+            self.pressed = Some(ch);
+            return key;
+        }
+        if self.pressed.take() == Some(ch) {
+            return key;
+        }
+        KeyEvent {
+            kind: KeyEventKind::Press,
+            ..key
+        }
     }
 }
 

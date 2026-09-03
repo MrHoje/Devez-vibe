@@ -6776,6 +6776,7 @@ impl AppState {
         self.sync_selected_completion_bindings(&old_text, binding_count);
     }
 
+    #[cfg(test)]
     pub fn composer_preedit(&self) -> &str {
         &self.composer_preedit
     }
