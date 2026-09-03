@@ -3529,6 +3529,9 @@ struct StashedPrompt {
 
 pub struct AppState {
     pub editor: Editor,
+    /// The syllable the host's IME is still composing, drawn at the cursor
+    /// without being part of the draft. See `preedit`.
+    composer_preedit: String,
     composer_images: Vec<String>,
     /// The draft `Ctrl+S` set aside, waiting for the chord that brings it back.
     stashed_prompt: Option<StashedPrompt>,
@@ -3605,9 +3608,9 @@ pub struct AppState {
     /// submitted prompts and steers, this includes answers to blocking questions
     /// so response grouping cannot move later provider output above that answer.
     turn_response_boundaries: Vec<Block>,
-    /// User prompt cards withdrawn by an interrupt before assistant text began.
-    /// The renderer may already own them, so their ids cross the state boundary
-    /// once and trigger a transcript rebuild.
+    /// Prompt cards cancelled while startup still owns their text and before any
+    /// provider request was sent. The renderer may already own them, so their ids
+    /// cross the state boundary once and trigger a transcript rebuild.
     discarded_prompt_ids: Vec<u64>,
     response_grouped: bool,
     response_collapse: Option<ResponseCollapseTransition>,
@@ -3843,6 +3846,7 @@ impl AppState {
             .and_then(|model| model.context_window);
         let mut state = Self {
             editor: Editor::default(),
+            composer_preedit: String::new(),
             composer_images: Vec::new(),
             stashed_prompt: None,
             queued_prompts: VecDeque::new(),
@@ -4705,7 +4709,7 @@ impl AppState {
     /// Drops a prompt that was queued before the thread existed, so Ctrl+C reads
     /// the same as interrupting a live turn.
     pub fn cancel_queued_prompt(&mut self) {
-        self.discard_unanswered_turn_prompts();
+        self.discard_unsent_turn_prompts();
         self.last_completed_duration = self.turn_started_at.map(|started| started.elapsed());
         self.last_completed_at = self.last_completed_duration.map(|_| chrono::Local::now());
         self.turn_interrupted = self.last_completed_duration.is_some();
@@ -5989,7 +5993,6 @@ impl AppState {
     /// Interrupt an active turn immediately, or remember the request until the
     /// app-server announces that a just-started turn is active.
     fn request_interrupt(&mut self) -> Action {
-        self.discard_unanswered_turn_prompts();
         // Before `thread/start` binds a session, the main-loop startup helper
         // owns queued-prompt cancellation. Keep its established Ctrl+C/Esc
         // path rather than treating that as a pending turn.
@@ -6014,7 +6017,7 @@ impl AppState {
         Action::Tick(true)
     }
 
-    fn discard_unanswered_turn_prompts(&mut self) {
+    fn discard_unsent_turn_prompts(&mut self) {
         if self.turn_response_visible || self.turn_prompts.is_empty() {
             return;
         }
@@ -6438,6 +6441,7 @@ impl AppState {
                 })
                 .collect(),
             composer_highlights: self.composer_highlight_tokens(),
+            composer_preedit: &self.composer_preedit,
             composer_placeholder: if self.provider_switch_pending() {
                 "Enter: queue for switched provider · Alt+Enter: queue"
             } else if self.busy {
@@ -6449,7 +6453,7 @@ impl AppState {
             } else {
                 // Idle is when Tab actually changes the role, so the hint sits
                 // in the empty composer rather than in /help alone.
-                "Tab: Change dvz agent"
+                "Tab: Cycle agent role"
             },
             cwd: self.cwd.clone(),
             welcome: self.show_welcome.then(|| self.welcome_view()),
@@ -6750,10 +6754,54 @@ impl AppState {
         if pasted {
             self.editor.insert_paste_str(&sanitize_pasted_text(text));
         } else {
+            self.settle_preedit_for_text(text);
             self.editor.insert_str(text);
         }
         self.command_selection = 0;
         self.sync_selected_completion_bindings(&old_text, binding_count);
+    }
+
+    #[cfg(test)]
+    pub fn composer_preedit(&self) -> &str {
+        &self.composer_preedit
+    }
+
+    /// Takes the host's latest preedit; true when the composer has to repaint.
+    pub fn set_composer_preedit(&mut self, text: &str) -> bool {
+        if self.composer_preedit == text {
+            return false;
+        }
+        self.composer_preedit = text.to_owned();
+        true
+    }
+
+    /// Keeps the preedit in step with what reaches the prompt. The committed
+    /// syllable is the text the IME was showing, so it comes off the front and
+    /// the host's next frame brings the syllable that follows. Any other key
+    /// only arrives once the composition is over.
+    fn settle_preedit_for_key(&mut self, key: &KeyEvent) {
+        if self.composer_preedit.is_empty() {
+            return;
+        }
+        match key.code {
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                let mut committed = [0; 4];
+                let committed = ch.encode_utf8(&mut committed);
+                self.settle_preedit_for_text(committed);
+            }
+            _ => self.composer_preedit.clear(),
+        }
+    }
+
+    fn settle_preedit_for_text(&mut self, committed: &str) {
+        if let Some(rest) = crate::preedit::preedit_after_commit(&self.composer_preedit, committed)
+        {
+            self.composer_preedit = rest;
+        }
     }
 
     fn handle_inserted_text(&mut self, text: &str, pasted: bool) {
@@ -6955,6 +7003,9 @@ impl AppState {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
+        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            self.settle_preedit_for_key(&key);
+        }
         if !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
             self.disarm_quit();
         }
@@ -16045,6 +16096,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_committed_syllable_settles_the_preedit_it_was_shown_as() {
+        let mut state = test_state();
+        assert!(state.set_composer_preedit("녕"));
+        assert!(!state.set_composer_preedit("녕"));
+        assert_eq!(state.view().composer_preedit, "녕");
+
+        // The commit of the shown syllable takes it down before the host's next
+        // frame brings the syllable that follows.
+        state.handle_key(KeyEvent::new(KeyCode::Char('녕'), KeyModifiers::NONE));
+        assert_eq!(state.editor.text(), "녕");
+        assert_eq!(state.composer_preedit(), "");
+
+        // A commit that reached the prompt through the paste batch counts too.
+        state.set_composer_preedit("하");
+        state.handle_buffered_composer_text("하", false);
+        assert_eq!(state.editor.text(), "녕하");
+        assert_eq!(state.composer_preedit(), "");
+
+        // Any other key only arrives once the composition is over.
+        state.set_composer_preedit("ㅅ");
+        state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(state.composer_preedit(), "");
+    }
+
     fn test_state() -> AppState {
         AppState::new(
             "thread".to_owned(),
@@ -16113,7 +16189,7 @@ mod tests {
         assert_eq!(state.editor.cursor(), cursor);
         assert_eq!(state.composer_images, [r"C:\Temp\shot.bmp"]);
         assert!(state.stashed_prompt.is_none());
-        assert_eq!(state.view().composer_placeholder, "Tab: Change dvz agent");
+        assert_eq!(state.view().composer_placeholder, "Tab: Cycle agent role");
 
         // A second stash replaces the first.
         state.handle_key(ctrl_s);
@@ -22469,9 +22545,9 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_before_assistant_text_discards_the_sent_prompt() {
+    fn interrupt_before_assistant_text_keeps_the_sent_prompt() {
         let mut state = test_state();
-        state.editor.set_text("표시하지 않을 요청");
+        state.editor.set_text("빠르게 중단한 요청");
         assert!(matches!(state.submit_editor(), Action::Submit(_)));
         let prompt = state.drain_committed().pop().expect("submitted prompt");
         state.set_turn_started("turn-1".to_owned());
@@ -22481,9 +22557,24 @@ mod tests {
             Action::Interrupt
         ));
 
-        assert_eq!(state.take_discarded_prompt_ids(), vec![prompt.id()]);
-        assert!(state.turn_prompts.is_empty());
+        assert!(state.take_discarded_prompt_ids().is_empty());
+        assert_eq!(state.turn_prompts.last().map(Block::id), Some(prompt.id()));
         assert!(state.drain_committed().is_empty());
+    }
+
+    #[test]
+    fn interrupt_before_turn_started_keeps_the_sent_prompt() {
+        let mut state = test_state();
+        state.editor.set_text("시작 확인 전 중단한 요청");
+        assert!(matches!(state.submit_editor(), Action::Submit(_)));
+        let prompt = state.drain_committed().pop().expect("submitted prompt");
+
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Esc)),
+            Action::Tick(true)
+        ));
+        assert!(state.take_discarded_prompt_ids().is_empty());
+        assert_eq!(state.turn_prompts.last().map(Block::id), Some(prompt.id()));
     }
 
     #[test]
@@ -22512,7 +22603,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_before_a_received_delta_is_painted_discards_the_prompt() {
+    fn interrupt_before_a_received_delta_is_painted_keeps_the_prompt() {
         let mut state = test_state();
         state.editor.set_text("아직 표시되지 않은 요청");
         assert!(matches!(state.submit_editor(), Action::Submit(_)));
@@ -22527,7 +22618,8 @@ mod tests {
             state.handle_key(KeyEvent::from(KeyCode::Esc)),
             Action::Interrupt
         ));
-        assert_eq!(state.take_discarded_prompt_ids(), vec![prompt.id()]);
+        assert!(state.take_discarded_prompt_ids().is_empty());
+        assert_eq!(state.turn_prompts.last().map(Block::id), Some(prompt.id()));
     }
 
     #[test]
@@ -22653,7 +22745,7 @@ mod tests {
         state.busy = false;
         state.turn_id = None;
 
-        assert_eq!(state.view().composer_placeholder, "Tab: Change dvz agent");
+        assert_eq!(state.view().composer_placeholder, "Tab: Cycle agent role");
     }
 
     #[test]

@@ -535,6 +535,10 @@ pub struct View<'a> {
     /// The agent role selected in the composer, used for the plan shimmer colour.
     pub plan_agent: AgentMode,
     pub editor: &'a Editor,
+    /// The syllable the host's IME is still composing, drawn underlined at the
+    /// cursor and pushing the rest of the prompt along like the committed
+    /// character will. Empty outside a composition.
+    pub composer_preedit: &'a str,
     pub composer_images: &'a [String],
     pub queued_prompts: Vec<String>,
     /// Prompts already steered into the running turn, drawn as regular prompt
@@ -690,6 +694,10 @@ pub struct Renderer {
     /// Transcript start held for the render immediately after a prompt-hosted
     /// History toggle, keeping that prompt on the pointer's screen row.
     history_view_start_anchor: Option<usize>,
+    /// Whether the last frame showed a blocking question. Closing one replaces
+    /// a wide highlighted picker with transcript and composer rows in a single
+    /// frame, so that transition must not reuse the picker's painted cells.
+    question_overlay_open: bool,
     theme: ThemeKind,
     history: Vec<Block>,
     /// Transcript owned by the lower `/btw` pane while split view is open.
@@ -1052,8 +1060,17 @@ fn devez_composer_hint_signal(columns: usize) -> String {
     format!("\x1b]777;devez-composer-hint-v1;{columns}\x07")
 }
 
-fn composer_hint_columns(editor: &Editor, composer_images: &[String], placeholder: &str) -> usize {
-    if editor.is_empty() && composer_images.is_empty() && !placeholder.is_empty() {
+fn composer_hint_columns(
+    editor: &Editor,
+    composer_images: &[String],
+    placeholder: &str,
+    preedit: &str,
+) -> usize {
+    if editor.is_empty()
+        && composer_images.is_empty()
+        && preedit.is_empty()
+        && !placeholder.is_empty()
+    {
         UnicodeWidthStr::width(placeholder)
     } else {
         0
@@ -1386,6 +1403,7 @@ impl Renderer {
             last_transcript_screen_start: 0,
             history_view_rows_anchor: None,
             history_view_start_anchor: None,
+            question_overlay_open: false,
             theme: selected_theme,
             history: Vec::new(),
             split_history: Vec::new(),
@@ -1601,6 +1619,18 @@ impl Renderer {
         self.history_view_start_anchor = None;
         self.clear_selection();
         true
+    }
+
+    /// A question panel can leave its wide selected-row background behind when
+    /// the host replays a localized cell diff onto the newly committed prompt.
+    /// Forget only the painted cell cache on close, making that single frame a
+    /// fresh paint without bringing back the old viewport anchor.
+    fn observe_question_overlay(&mut self, style: Option<OverlayStyle>) {
+        let open = style == Some(OverlayStyle::Question);
+        if self.mode == RenderMode::Fullscreen && self.question_overlay_open && !open {
+            self.painted_frame = None;
+        }
+        self.question_overlay_open = open;
     }
 
     /// Places a previously sent prompt at the top of the fullscreen transcript,
@@ -2624,6 +2654,7 @@ impl Renderer {
         self.cursor_line = 0;
         self.cursor_col = 0;
         self.cursor_shown = true;
+        self.question_overlay_open = false;
         self.last_width = 0;
         self.last_height = 0;
         execute!(
@@ -2655,6 +2686,7 @@ impl Renderer {
     pub fn render(&mut self, committed: &[Block], view: View<'_>) -> Result<()> {
         self.split_active = false;
         set_chat_layout(view.chat_layout);
+        self.observe_question_overlay(view.overlay.as_ref().map(|overlay| overlay.style));
         let response_collapse_changed = self.update_response_collapse(view.response_collapse);
         let committed_without_startup = view.plan_summary.is_some().then(|| {
             committed
@@ -2709,6 +2741,11 @@ impl Renderer {
         }
         let width = side_panel.map_or(total_width, |layout| layout.main_width as u16);
         if width != self.last_width {
+            if self.last_width == 0 {
+                // The first frame, and the first after a clear, tells the host
+                // that preedit frames are understood; see `preedit`.
+                queue!(self.out, Print(crate::preedit::support_signal()))?;
+            }
             queue!(self.out, Print(devez_layout_signal(width)))?;
         }
         // The host masks the placeholder hint while an IME preedit sits over it
@@ -2720,6 +2757,7 @@ impl Renderer {
             view.editor,
             view.composer_images,
             view.composer_placeholder,
+            view.composer_preedit,
         ));
         let frame_width = width;
         // Fullscreen assistant output shares the transcript surface with its
@@ -2757,6 +2795,7 @@ impl Renderer {
                 live_lines,
                 view.editor,
                 view.composer_images,
+                view.composer_preedit,
                 &view.composer_highlights,
                 &view.queued_prompts,
                 &view.steered_prompts,
@@ -4092,7 +4131,7 @@ fn cell_style(tone: Tone, bold: bool, background: Option<Rgb>, selected: bool) -
         background,
         bold,
         italic: tone == Tone::Thinking,
-        underlined: tone == Tone::MarkdownLink,
+        underlined: matches!(tone, Tone::MarkdownLink | Tone::ComposerPreedit),
         crossed_out: tone == Tone::PlanDone,
     }
 }
@@ -4962,6 +5001,7 @@ fn split_pane_frame_scrolled(
             live_lines,
             view.editor,
             view.composer_images,
+            view.composer_preedit,
             &view.composer_highlights,
             &view.queued_prompts,
             &view.steered_prompts,
@@ -5177,6 +5217,8 @@ struct StatusArea {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tone {
     Plain,
+    /// Composer text the IME has not committed yet: foreground, underlined.
+    ComposerPreedit,
     Muted,
     /// Muted *and* italic: reserved for reasoning summaries.
     Thinking,
@@ -6246,6 +6288,7 @@ fn normal_frame(
         live_lines,
         editor,
         &[],
+        "",
         &[],
         &[],
         &[],
@@ -6278,6 +6321,7 @@ fn normal_frame_with_expansion(
     live_lines: Vec<PaintLine>,
     editor: &Editor,
     composer_images: &[String],
+    composer_preedit: &str,
     composer_highlights: &[String],
     queued_prompts: &[String],
     steered_prompts: &[SteeredPromptView],
@@ -6400,6 +6444,7 @@ fn normal_frame_with_expansion(
         input_lines_with_controls(
             editor,
             composer_images,
+            composer_preedit,
             composer_highlights,
             width,
             &recalled,
@@ -11438,19 +11483,21 @@ fn copy_joins_next(line: &PaintLine) -> bool {
 
 #[cfg(test)]
 fn composer_display(editor: &Editor, composer_images: &[String]) -> (String, usize) {
-    let (display, cursor, _) = composer_display_with_spans(editor, composer_images);
+    let (display, cursor, _, _) = composer_display_with_spans(editor, composer_images, "");
     (display, cursor)
 }
 
-/// The composer text as painted, its cursor, and the composer characters each
-/// painted character stands for. An image label and a collapsed-paste summary are
-/// each one unit: every character of them answers to the whole span behind them,
-/// so a drag that touches any part deletes the attachment or the paste whole.
-/// Padding around the labels stands for nothing and carries an empty span.
+/// The composer text as painted, its cursor, the composer characters each
+/// painted character stands for, and where the preedit sits in the painted
+/// text. An image label and a collapsed-paste summary are each one unit: every
+/// character of them answers to the whole span behind them, so a drag that
+/// touches any part deletes the attachment or the paste whole. Padding around
+/// the labels and the preedit stand for nothing and carry an empty span.
 fn composer_display_with_spans(
     editor: &Editor,
     composer_images: &[String],
-) -> (String, usize, Vec<Range<usize>>) {
+    preedit: &str,
+) -> (String, usize, Vec<Range<usize>>, Range<usize>) {
     let labels = (1..=composer_images.len())
         .map(|index| format!("[Image #{index}]"))
         .collect::<Vec<_>>();
@@ -11494,6 +11541,23 @@ fn composer_display_with_spans(
     if source_cursor == chars.len() {
         display_cursor = display.chars().count();
     }
+    // The preedit sits where the committed syllable will, with the cursor after
+    // it, so the rest of the prompt already wraps the way it will once the
+    // syllable lands.
+    let preedit_start = display_cursor;
+    if !preedit.is_empty() {
+        let at = display
+            .char_indices()
+            .nth(display_cursor)
+            .map_or(display.len(), |(at, _)| at);
+        display.insert_str(at, preedit);
+        let cursor = editor.cursor();
+        spans.splice(
+            display_cursor..display_cursor,
+            preedit.chars().map(|_| cursor..cursor),
+        );
+        display_cursor += preedit.chars().count();
+    }
     if image_index < labels.len() {
         // Attachments with no placeholder of their own: nothing in the composer
         // stands behind these labels, so nothing can be deleted through them.
@@ -11506,7 +11570,7 @@ fn composer_display_with_spans(
         spans.extend(trailing.chars().map(|_| end..end));
         display.push_str(&trailing);
     }
-    (display, display_cursor, spans)
+    (display, display_cursor, spans, preedit_start..display_cursor)
 }
 
 /// The composer's own text before image labels, with the characters behind each
@@ -11669,6 +11733,7 @@ fn input_lines(
     input_lines_with_controls(
         editor,
         composer_images,
+        "",
         &[],
         width,
         label,
@@ -11682,6 +11747,7 @@ fn input_lines(
 fn input_lines_with_controls(
     editor: &Editor,
     composer_images: &[String],
+    composer_preedit: &str,
     composer_highlights: &[String],
     width: u16,
     label: &str,
@@ -11696,8 +11762,8 @@ fn input_lines_with_controls(
     // border. This prevents the transient glyph from flashing at the new row's
     // right edge before the committed syllable is painted.
     const COMPOSER_IME_RIGHT_GUTTER: usize = 4;
-    let (display, editor_cursor, display_spans) =
-        composer_display_with_spans(editor, composer_images);
+    let (display, editor_cursor, display_spans, preedit_range) =
+        composer_display_with_spans(editor, composer_images, composer_preedit);
     let display_chars = display.chars().collect::<Vec<_>>();
     let panel_width = (width as usize).saturating_sub(1).max(16);
     let side_prefix = "│ ";
@@ -11713,6 +11779,8 @@ fn input_lines_with_controls(
         .max(4);
     let mut raw_rows = vec![String::new()];
     let mut row_glyphs: Vec<Vec<ComposerGlyph>> = vec![Vec::new()];
+    // The preedit's characters within each row, so they can be underlined.
+    let mut row_preedit: Vec<Option<Range<usize>>> = vec![None];
     // One row exists before the first glyph lands, so the vec starts holding
     // that row's empty range rather than a range of rows.
     #[allow(clippy::single_range_in_vec_init)]
@@ -11738,6 +11806,7 @@ fn input_lines_with_controls(
             row_ranges[row].end = span.start;
             raw_rows.push(String::new());
             row_glyphs.push(Vec::new());
+            row_preedit.push(None);
             row_ranges.push(span.end..span.end);
             row += 1;
             column = input_prefix_width;
@@ -11750,6 +11819,7 @@ fn input_lines_with_controls(
             row_ranges[row].end = span.start;
             raw_rows.push(String::new());
             row_glyphs.push(Vec::new());
+            row_preedit.push(None);
             row_ranges.push(span.start..span.start);
             row += 1;
             column = input_prefix_width;
@@ -11757,6 +11827,10 @@ fn input_lines_with_controls(
                 cursor_row = row;
                 cursor_column = column;
             }
+        }
+        if preedit_range.contains(&index) {
+            let at = raw_rows[row].chars().count();
+            row_preedit[row].get_or_insert(at..at).end = at + 1;
         }
         raw_rows[row].push(ch);
         row_ranges[row].end = span.end;
@@ -11797,13 +11871,17 @@ fn input_lines_with_controls(
         controls_mode,
     ));
     let chrome_tone = composer_chrome_tone(mode);
-    for (index, raw) in raw_rows
+    for (index, (raw, preedit_cells)) in raw_rows
         .into_iter()
+        .zip(row_preedit)
         .enumerate()
         .skip(visible_start)
         .take(visible_end - visible_start)
     {
-        let is_placeholder = editor.is_empty() && composer_images.is_empty() && index == 0;
+        let is_placeholder = editor.is_empty()
+            && composer_images.is_empty()
+            && composer_preedit.is_empty()
+            && index == 0;
         let content = if is_placeholder {
             if placeholder.is_empty() {
                 String::new()
@@ -11832,7 +11910,12 @@ fn input_lines_with_controls(
         } else {
             Tone::Plain
         };
-        let mut tail = composer_token_spans(&content, content_tone, composer_highlights);
+        let mut tail = match preedit_cells {
+            Some(cells) => {
+                composer_spans_with_preedit(&content, cells, content_tone, composer_highlights)
+            }
+            None => composer_token_spans(&content, content_tone, composer_highlights),
+        };
         tail.extend([
             PaintSpan {
                 text: " ".repeat(panel_width.saturating_sub(
@@ -11880,6 +11963,36 @@ fn input_lines_with_controls(
             .collect(),
     };
     (rows, cursor_row - visible_start + 1, cursor_column, layout)
+}
+
+/// A composer row's spans with the preedit at `preedit` (in characters of
+/// `content`) underlined in place. The text around it is highlighted as usual;
+/// the preedit itself is never a command token.
+fn composer_spans_with_preedit(
+    content: &str,
+    preedit: Range<usize>,
+    tone: Tone,
+    highlights: &[String],
+) -> Vec<PaintSpan> {
+    let chars = content.chars().collect::<Vec<_>>();
+    let start = preedit.start.min(chars.len());
+    let end = preedit.end.clamp(start, chars.len());
+    let before = chars[..start].iter().collect::<String>();
+    let shown = chars[start..end].iter().collect::<String>();
+    let after = chars[end..].iter().collect::<String>();
+    let mut spans = Vec::new();
+    if !before.is_empty() {
+        spans.extend(composer_token_spans(&before, tone, highlights));
+    }
+    spans.push(PaintSpan {
+        text: shown,
+        tone: Tone::ComposerPreedit,
+        bold: false,
+    });
+    if !after.is_empty() {
+        spans.extend(composer_token_spans(&after, tone, highlights));
+    }
+    spans
 }
 
 /// Prompt rows the composer paints before it starts scrolling instead of growing.
@@ -12795,7 +12908,7 @@ fn status_effort_tone(effort: &str) -> Option<Tone> {
 fn tone_rgb(tone: Tone) -> Option<Rgb> {
     let palette = theme::palette();
     Some(match tone {
-        Tone::Plain => palette.foreground,
+        Tone::Plain | Tone::ComposerPreedit => palette.foreground,
         Tone::Muted | Tone::Thinking | Tone::PlanDone => palette.muted,
         Tone::Accent => palette.accent,
         Tone::User => palette.blue,
@@ -12910,7 +13023,7 @@ fn set_tone(out: &mut impl Write, tone: Tone) -> Result<()> {
     if tone == Tone::Thinking {
         queue!(out, SetAttribute(Attribute::Italic))?;
     }
-    if tone == Tone::MarkdownLink {
+    if matches!(tone, Tone::MarkdownLink | Tone::ComposerPreedit) {
         queue!(out, SetAttribute(Attribute::Underlined))?;
     }
     if tone == Tone::PlanDone {
@@ -12955,6 +13068,7 @@ mod tests {
             plan_shimmer_phase: None,
             plan_agent: AgentMode::Standard,
             editor,
+            composer_preedit: "",
             composer_images: &[],
             queued_prompts: Vec::new(),
             steered_prompts: Vec::new(),
@@ -17159,7 +17273,7 @@ mod tests {
     fn empty_composer_hints_have_no_leading_padding() {
         let editor = Editor::default();
 
-        for hint in ["Tab: Change dvz agent", "Enter: steer · Alt+Enter: queue"] {
+        for hint in ["Tab: Cycle agent role", "Enter: steer · Alt+Enter: queue"] {
             let (rows, _, _, _) = input_lines(&editor, &[], 80, "", hint, None, None);
             assert!(painted(&rows[1]).starts_with(&format!("│ > {hint}")));
             assert!(!painted(&rows[1]).starts_with(&format!("│ >  {hint}")));
@@ -17188,6 +17302,7 @@ mod tests {
         let (rows, _, _, _) = input_lines_with_controls(
             &editor,
             &[],
+            "",
             &highlights,
             100,
             "",
@@ -17221,6 +17336,7 @@ mod tests {
         let (rows, _, _, _) = input_lines_with_controls(
             &editor,
             &[],
+            "",
             &highlights,
             100,
             "",
@@ -17408,6 +17524,7 @@ mod tests {
             Vec::new(),
             &editor,
             &[],
+            "",
             &[],
             &[],
             &[],
@@ -18575,6 +18692,7 @@ mod tests {
             live_lines,
             &editor,
             &[],
+            "",
             &[],
             &[],
             &[],
@@ -22268,6 +22386,24 @@ mod tests {
         assert!(row_width > 16, "the row is wider than its label: {row_width}");
     }
 
+    #[test]
+    fn closing_a_question_discards_the_highlighted_panel_frame_once() {
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.painted_frame = Some(CellFrame::new(80, 24));
+
+        renderer.observe_question_overlay(Some(OverlayStyle::Picker));
+        assert!(renderer.painted_frame.is_some());
+        renderer.observe_question_overlay(Some(OverlayStyle::Question));
+        assert!(renderer.painted_frame.is_some());
+
+        renderer.observe_question_overlay(None);
+        assert!(renderer.painted_frame.is_none());
+
+        renderer.painted_frame = Some(CellFrame::new(80, 24));
+        renderer.observe_question_overlay(None);
+        assert!(renderer.painted_frame.is_some());
+    }
+
     /// A picker row that carries a name and a description column offers both:
     /// the click region reaches from the marker through the description, and
     /// stops on the last painted character rather than running to the border.
@@ -23575,21 +23711,61 @@ mod tests {
     }
 
     #[test]
+    fn a_preedit_is_drawn_underlined_at_the_cursor_and_moves_the_tail_along() {
+        let mut editor = Editor::default();
+        editor.set_text("가나");
+        editor.move_left();
+        let (rows, cursor_row, cursor_col, _) =
+            input_lines_with_controls(&editor, &[], "ㄷ", &[], 40, "", "hint", None, None, None);
+        let spans = rows[1]
+            .tail
+            .iter()
+            .take(3)
+            .map(|span| (span.text.as_str(), span.tone))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            spans,
+            [
+                ("가", Tone::Plain),
+                ("ㄷ", Tone::ComposerPreedit),
+                ("나", Tone::Plain)
+            ]
+        );
+        // The cursor follows the preedit: `│ > ` plus two wide glyphs.
+        assert_eq!((cursor_row, cursor_col), (1, 8));
+
+        // The preedit takes the placeholder's place in an empty composer.
+        let empty = Editor::default();
+        let (rows, _, _, _) =
+            input_lines_with_controls(&empty, &[], "ㄷ", &[], 40, "", "hint", None, None, None);
+        assert!(rows[1].tail.iter().all(|span| span.text != "hint"));
+        assert_eq!(rows[1].tail[0].text, "ㄷ");
+        assert_eq!(rows[1].tail[0].tone, Tone::ComposerPreedit);
+    }
+
+    #[test]
     fn composer_hint_signal_reports_only_an_empty_visible_hint() {
         let empty = Editor::default();
         assert_eq!(
-            devez_composer_hint_signal(composer_hint_columns(&empty, &[], "Tab: Change dvz agent")),
+            devez_composer_hint_signal(composer_hint_columns(
+                &empty,
+                &[],
+                "Tab: Cycle agent role",
+                ""
+            )),
             "\x1b]777;devez-composer-hint-v1;21\x07"
         );
 
         let mut typed = Editor::default();
         typed.insert('ㅁ');
-        assert_eq!(composer_hint_columns(&typed, &[], "hint"), 0);
+        assert_eq!(composer_hint_columns(&typed, &[], "hint", ""), 0);
         assert_eq!(
-            composer_hint_columns(&empty, &["image.png".to_owned()], "hint"),
+            composer_hint_columns(&empty, &["image.png".to_owned()], "hint", ""),
             0
         );
-        assert_eq!(composer_hint_columns(&empty, &[], ""), 0);
+        assert_eq!(composer_hint_columns(&empty, &[], "", ""), 0);
+        // A preedit drawn by the composer already took the hint's place.
+        assert_eq!(composer_hint_columns(&empty, &[], "hint", "ㄴ"), 0);
     }
 
     #[test]

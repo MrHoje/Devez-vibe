@@ -11,6 +11,7 @@ mod integrations;
 mod open_code;
 mod paste;
 mod perf;
+mod preedit;
 mod pricing;
 mod provider;
 mod renderer;
@@ -45,6 +46,7 @@ use editor::Editor;
 use futures_util::StreamExt;
 use integrations::{McpServerInfo, PluginCatalog, PluginDetail};
 use paste::{BufferedText, BufferedTextTarget, ComposerInput, ComposerPasteBuffer, PasteBurst};
+use preedit::{PreeditCapture, PreeditInput};
 use provider::{ProviderAuthKind, ProviderAuthRequest};
 use renderer::{
     BlockKind, Pick, RenderMode, Renderer, SIDE_PANEL_INTEGRATIONS_CONNECTED, SelectionResult,
@@ -562,6 +564,7 @@ async fn await_thread(
 ) -> Result<Startup> {
     let mut events = EventStream::new();
     let mut composer_paste = ComposerPasteBuffer::new();
+    let mut preedit_capture = PreeditCapture::default();
     let mut spinner_tick = tokio::time::interval(Duration::from_millis(120));
     spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut queued = None;
@@ -593,6 +596,15 @@ async fn await_thread(
             }
             event = events.next() => {
                 match event {
+                    Some(Ok(Event::Key(key))) if preedit_capture.claims(&key) => {
+                        match preedit_capture.observe(key) {
+                            PreeditInput::Update(text) => {
+                                flush_composer_paste_now(state, &mut composer_paste);
+                                Action::Tick(state.set_composer_preedit(&text))
+                            }
+                            _ => Action::None,
+                        }
+                    }
                     Some(Ok(Event::Key(key))) => {
                         renderer.clear_selection();
                         if suppress_side_exit_key(
@@ -839,6 +851,7 @@ async fn choose_startup_session(
     let editor = Editor::default();
     let mut events = EventStream::new();
     let mut paste_burst = PasteBurst::new();
+    let mut preedit_capture = PreeditCapture::default();
     let mut composer_notice = None;
 
     let result = loop {
@@ -860,7 +873,8 @@ async fn choose_startup_session(
                 steered_prompts: Vec::new(),
                 subagents: Vec::new(),
                 composer_highlights: Vec::new(),
-            composer_placeholder: "",
+                composer_placeholder: "",
+                composer_preedit: "",
                 welcome: None,
                 suggestions: Vec::new(),
                 activity: None,
@@ -882,6 +896,10 @@ async fn choose_startup_session(
             },
         )?;
         match events.next().await {
+            Some(Ok(Event::Key(key))) if preedit_capture.claims(&key) => {
+                // The picker has no composer to show a preedit in.
+                preedit_capture.observe(key);
+            }
             Some(Ok(Event::Key(key))) => {
                 renderer.clear_selection();
                 composer_notice = None;
@@ -1358,6 +1376,7 @@ async fn event_loop(
     let mut update_rx = Some(update_rx);
     let mut terminal_events = EventStream::new();
     let mut composer_paste = ComposerPasteBuffer::new();
+    let mut preedit_capture = PreeditCapture::default();
     let mut activity_tick = tokio::time::interval(Duration::from_millis(80));
     activity_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // Streamed text is revealed here rather than when a delta lands, so the pace
@@ -1496,6 +1515,20 @@ async fn event_loop(
         let action = tokio::select! {
             terminal_event = terminal_events.next() => {
                 match terminal_event {
+                    Some(Ok(Event::Key(key))) if preedit_capture.claims(&key) => {
+                        match preedit_capture.observe(key) {
+                            PreeditInput::Update(text) => {
+                                let input_state =
+                                    focused_state_mut(state, &mut btw_state, split_focus);
+                                // A syllable still in the paste batch was committed
+                                // before this preedit, so it lands first.
+                                flush_composer_paste_now(input_state, &mut composer_paste);
+                                input_log::record(|| format!("preedit {text:?}"));
+                                Action::Tick(input_state.set_composer_preedit(&text))
+                            }
+                            _ => Action::None,
+                        }
+                    }
                     Some(Ok(Event::Key(key))) => {
                         if input_log::enabled() {
                             let selection = renderer.composer_selection_range();
