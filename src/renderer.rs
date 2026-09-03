@@ -1048,6 +1048,18 @@ fn devez_layout_signal(main_width: u16) -> String {
     format!("\x1b]777;devez-layout-v1;{main_width}\x07")
 }
 
+fn devez_composer_hint_signal(columns: usize) -> String {
+    format!("\x1b]777;devez-composer-hint-v1;{columns}\x07")
+}
+
+fn composer_hint_columns(editor: &Editor, composer_images: &[String], placeholder: &str) -> usize {
+    if editor.is_empty() && composer_images.is_empty() && !placeholder.is_empty() {
+        1 + UnicodeWidthStr::width(placeholder)
+    } else {
+        0
+    }
+}
+
 /// Where the docked panel sits once the terminal is wide enough to carry it
 /// without squeezing the conversation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2699,6 +2711,14 @@ impl Renderer {
         if width != self.last_width {
             queue!(self.out, Print(devez_layout_signal(width)))?;
         }
+        queue!(
+            self.out,
+            Print(devez_composer_hint_signal(composer_hint_columns(
+                view.editor,
+                view.composer_images,
+                view.composer_placeholder,
+            )))
+        )?;
         let frame_width = width;
         // Fullscreen assistant output shares the transcript surface with its
         // completed form. Keeping active and completed text on one surface
@@ -23552,6 +23572,24 @@ mod tests {
                 "\x1b]777;devez-layout-v1;141\x07",
             ]
         );
+    }
+
+    #[test]
+    fn composer_hint_signal_reports_only_an_empty_visible_hint() {
+        let empty = Editor::default();
+        assert_eq!(
+            devez_composer_hint_signal(composer_hint_columns(&empty, &[], "Tab: Change dvz agent")),
+            "\x1b]777;devez-composer-hint-v1;22\x07"
+        );
+
+        let mut typed = Editor::default();
+        typed.insert('ㅁ');
+        assert_eq!(composer_hint_columns(&typed, &[], "hint"), 0);
+        assert_eq!(
+            composer_hint_columns(&empty, &["image.png".to_owned()], "hint"),
+            0
+        );
+        assert_eq!(composer_hint_columns(&empty, &[], ""), 0);
     }
 
     #[test]

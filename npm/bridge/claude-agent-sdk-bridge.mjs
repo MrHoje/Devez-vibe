@@ -1548,10 +1548,6 @@ function processAssistant(session, message) {
     session.model,
   );
   const content = Array.isArray(message.message?.content) ? message.message.content : [];
-  const hasToolUse = content.some((block) => block.type === "tool_use");
-  const hasVisibleText = session.turn.sawVisibleText || content.some(
-    (block) => block.type === "text" && String(block.text || "").trim(),
-  );
   // Without partial SDK events, replay completed text before tool items so the
   // visible order still matches the assistant content order.
   if (!session.streamBlocks.size && !session.turn.sawStreamText) {
@@ -4427,12 +4423,11 @@ async function runSelfTest() {
     .map((line) => JSON.parse(line));
   const openingMessageIndex = openingEvents.findIndex((event) =>
     event.method === "item/completed"
-      && event.params?.item?.type === "agentMessage"
-      && event.params.item.text === "요청 내용을 확인하고 필요한 작업을 진행하겠습니다.");
+      && event.params?.item?.type === "agentMessage");
   const openingToolIndex = openingEvents.findIndex((event) =>
     event.method === "item/started" && event.params?.item?.type === "dynamicToolCall");
-  if (openingMessageIndex < 0 || openingToolIndex < 0 || openingMessageIndex > openingToolIndex) {
-    throw new Error(`Claude opening notice order self-test failed: ${JSON.stringify(openingEvents)}`);
+  if (openingMessageIndex >= 0 || openingToolIndex < 0) {
+    throw new Error(`Claude tool-first turn self-test failed: ${JSON.stringify(openingEvents)}`);
   }
   const languageCaptured = [];
   process.stdout.write = (chunk) => {

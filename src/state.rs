@@ -8658,12 +8658,8 @@ impl AppState {
                 ));
             }
             "warning" | "configWarning" | "guardianWarning" | "deprecationNotice" => {
-                let message = params
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or_else(|| params.as_str().unwrap_or("Codex 경고"));
                 self.committed
-                    .push(Block::new(BlockKind::Warning, "경고", message));
+                    .push(codex_warning_block(method, params));
             }
             "model/rerouted" => {
                 if let (Some(from), Some(to)) = (
@@ -13810,6 +13806,40 @@ impl AppState {
             }
         }
     }
+}
+
+fn codex_warning_block(method: &str, params: &Value) -> Block {
+    let summary = params
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| params.get("summary").and_then(Value::as_str))
+        .or_else(|| params.as_str())
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or("경고 세부 정보를 받지 못했습니다.");
+    let mut body = summary.to_owned();
+    if let Some(details) = params
+        .get("details")
+        .and_then(Value::as_str)
+        .filter(|details| !details.trim().is_empty() && *details != summary)
+    {
+        body.push_str("\n\n");
+        body.push_str(details);
+    }
+    if let Some(path) = params
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+    {
+        body.push_str("\n\n파일: ");
+        body.push_str(path);
+    }
+    let title = match method {
+        "configWarning" => "설정 경고",
+        "guardianWarning" => "안전 경고",
+        "deprecationNotice" => "지원 종료 안내",
+        _ => "경고",
+    };
+    Block::new(BlockKind::Warning, title, body)
 }
 
 fn next_question_or_reply(
@@ -19561,6 +19591,57 @@ mod tests {
         assert!(state.take_account_refresh());
         // The flag is consumed, so the event loop refreshes exactly once.
         assert!(!state.take_account_refresh());
+    }
+
+    #[test]
+    fn codex_warning_notifications_keep_their_native_message_fields() {
+        let cases = [
+            (
+                "warning",
+                json!({ "message": "일반 경고" }),
+                "경고",
+                "일반 경고",
+            ),
+            (
+                "guardianWarning",
+                json!({ "message": "안전 검토 필요" }),
+                "안전 경고",
+                "안전 검토 필요",
+            ),
+            (
+                "configWarning",
+                json!({
+                    "summary": "설정 항목을 읽지 못했습니다.",
+                    "details": "지원되는 이름으로 변경하세요.",
+                    "path": "C:\\Users\\tester\\.codex\\config.toml"
+                }),
+                "설정 경고",
+                "설정 항목을 읽지 못했습니다.\n\n지원되는 이름으로 변경하세요.\n\n파일: C:\\Users\\tester\\.codex\\config.toml",
+            ),
+            (
+                "deprecationNotice",
+                json!({ "summary": "이 기능은 곧 제거됩니다.", "details": null }),
+                "지원 종료 안내",
+                "이 기능은 곧 제거됩니다.",
+            ),
+        ];
+
+        for (method, params, title, body) in cases {
+            let mut state = test_state();
+            state.handle_notification(method, &params);
+            let warning = state.committed.last().expect("warning block");
+            assert!(matches!(warning.kind, BlockKind::Warning));
+            assert_eq!(warning.title, title, "{method}");
+            assert_eq!(warning.body, body, "{method}");
+        }
+    }
+
+    #[test]
+    fn codex_warning_without_text_reports_missing_details_instead_of_a_fake_message() {
+        let warning = codex_warning_block("configWarning", &json!({}));
+
+        assert_eq!(warning.title, "설정 경고");
+        assert_eq!(warning.body, "경고 세부 정보를 받지 못했습니다.");
     }
 
     /// One-off events belong in the composer notice next to the copy message,
