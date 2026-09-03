@@ -3,9 +3,10 @@
 //! An IME hands its text over only when it commits, so a composer bug that only
 //! shows up under a Korean keyboard cannot be read off the screen: the order and
 //! the timing of the events behind it are the whole story. Setting
-//! `DVZ_INPUT_LOG` to a path — or to `1` for `dvz-input.log` in the temporary
-//! directory — appends one line per event, so a session can be replayed after
-//! the fact.
+//! `DVZ_INPUT_LOG` to a path — or to `1` for `dvz-input-<pid>.log` in the
+//! temporary directory — appends one line per event, so a session can be replayed after
+//! the fact. A copy of the binary named `dvz-debug` traces on its own, so a
+//! session started from a host that sets no variables still leaves a log.
 
 use std::{
     env,
@@ -46,12 +47,39 @@ fn sink() -> Option<&'static Mutex<std::fs::File>> {
 }
 
 fn log_path() -> Option<PathBuf> {
-    let value = env::var("DVZ_INPUT_LOG").ok()?;
+    let Ok(value) = env::var("DVZ_INPUT_LOG") else {
+        // A copy of the binary named `dvz-debug` exists to reproduce an input
+        // problem, so it traces without the variable having to be set first.
+        return (running_as_debug_copy() || traces_by_default()).then(default_log_path);
+    };
     match value.trim() {
         "" | "0" => None,
-        "1" => Some(env::temp_dir().join("dvz-input.log")),
+        "1" => Some(default_log_path()),
         path => Some(PathBuf::from(path)),
     }
+}
+
+fn default_log_path() -> PathBuf {
+    // Several sessions run at once, so each one gets its own file rather than
+    // interleaving with the others.
+    env::temp_dir().join(format!("dvz-input-{}.log", std::process::id()))
+}
+
+/// A build made for reproducing an input problem: `DVZ_TRACE_INPUT=1` in the
+/// environment at build time turns the trace on for that binary alone, so a
+/// host that sets no variables still leaves a log.
+fn traces_by_default() -> bool {
+    matches!(option_env!("DVZ_TRACE_INPUT"), Some("1"))
+}
+
+fn running_as_debug_copy() -> bool {
+    env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_stem()
+                .map(|stem| stem.to_string_lossy().eq_ignore_ascii_case("dvz-debug"))
+        })
+        .unwrap_or(false)
 }
 
 fn started() -> Instant {

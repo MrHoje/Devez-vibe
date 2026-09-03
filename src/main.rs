@@ -1,4 +1,5 @@
 mod agent;
+mod alt_code;
 mod app_server;
 mod backend;
 mod child_process;
@@ -32,6 +33,7 @@ use std::{
 };
 
 use agent::AgentTurnContext;
+use alt_code::AltCodeKeys;
 use anyhow::{Context, Result, bail};
 use app_server::ServerEvent;
 use arboard::{Clipboard, ImageData};
@@ -565,6 +567,7 @@ async fn await_thread(
     let mut events = EventStream::new();
     let mut composer_paste = ComposerPasteBuffer::new();
     let mut preedit_capture = PreeditCapture::default();
+    let mut alt_code = AltCodeKeys::default();
     let mut spinner_tick = tokio::time::interval(Duration::from_millis(120));
     spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut queued = None;
@@ -597,7 +600,8 @@ async fn await_thread(
             event = events.next() => {
                 match event {
                     Some(Ok(Event::Key(key))) if preedit_capture.claims(&key) => {
-                        match preedit_capture.observe(key) {
+                        input_log::record(|| format!("frame {:?} kind={:?}", key.code, key.kind));
+                        match preedit_capture.observe(alt_code.normalize(key)) {
                             PreeditInput::Update(text) => apply_composer_preedit_update(
                                 state,
                                 &mut composer_paste,
@@ -607,6 +611,7 @@ async fn await_thread(
                         }
                     }
                     Some(Ok(Event::Key(key))) => {
+                        let key = alt_code.normalize(key);
                         renderer.clear_selection();
                         if suppress_side_exit_key(
                             &mut side_exit_key_guard,
@@ -853,6 +858,7 @@ async fn choose_startup_session(
     let mut events = EventStream::new();
     let mut paste_burst = PasteBurst::new();
     let mut preedit_capture = PreeditCapture::default();
+    let mut alt_code = AltCodeKeys::default();
     let mut composer_notice = None;
 
     let result = loop {
@@ -899,9 +905,10 @@ async fn choose_startup_session(
         match events.next().await {
             Some(Ok(Event::Key(key))) if preedit_capture.claims(&key) => {
                 // The picker has no composer to show a preedit in.
-                preedit_capture.observe(key);
+                preedit_capture.observe(alt_code.normalize(key));
             }
             Some(Ok(Event::Key(key))) => {
+                let key = alt_code.normalize(key);
                 renderer.clear_selection();
                 composer_notice = None;
                 match picker.handle_key(paste_burst.observe(key, Instant::now())) {
@@ -1378,6 +1385,7 @@ async fn event_loop(
     let mut terminal_events = EventStream::new();
     let mut composer_paste = ComposerPasteBuffer::new();
     let mut preedit_capture = PreeditCapture::default();
+    let mut alt_code = AltCodeKeys::default();
     let mut activity_tick = tokio::time::interval(Duration::from_millis(80));
     activity_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // Streamed text is revealed here rather than when a delta lands, so the pace
@@ -1517,7 +1525,8 @@ async fn event_loop(
             terminal_event = terminal_events.next() => {
                 match terminal_event {
                     Some(Ok(Event::Key(key))) if preedit_capture.claims(&key) => {
-                        match preedit_capture.observe(key) {
+                        input_log::record(|| format!("frame {:?} kind={:?}", key.code, key.kind));
+                        match preedit_capture.observe(alt_code.normalize(key)) {
                             PreeditInput::Update(text) => {
                                 let input_state =
                                     focused_state_mut(state, &mut btw_state, split_focus);
@@ -1532,6 +1541,8 @@ async fn event_loop(
                         }
                     }
                     Some(Ok(Event::Key(key))) => {
+                        let raw_kind = key.kind;
+                        let key = alt_code.normalize(key);
                         if input_log::enabled() {
                             let selection = renderer.composer_selection_range();
                             let select_all = renderer.composer_select_all_active();
@@ -1540,7 +1551,7 @@ async fn event_loop(
                                 .text();
                             input_log::record(|| {
                                 format!(
-                                    "key {:?} mods={:?} kind={:?} select_all={select_all} \
+                                    "key {:?} mods={:?} kind={:?} raw={raw_kind:?} select_all={select_all} \
                                      selection={selection:?} composer={text:?}",
                                     key.code, key.modifiers, key.kind
                                 )
