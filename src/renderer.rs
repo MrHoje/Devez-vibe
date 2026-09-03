@@ -744,6 +744,9 @@ pub struct Renderer {
     /// Where the composer's prompt text was last painted, so a drag over it can
     /// be turned back into the characters it covered.
     composer_selection: Option<ComposerSelection>,
+    /// Screen rows the last frame kept out of the sequential wide-row repaint:
+    /// the composer's prompt rows, or a question's inline answer row.
+    painted_input_rows: Range<usize>,
     /// True while the highlight is the one Ctrl+A made. It stands for the whole
     /// prompt rather than the cells it was taken from, so an edit answers to the
     /// composer's own length even when the paint behind it is a frame stale.
@@ -1435,6 +1438,7 @@ impl Renderer {
             selection: Selection::default(),
             last_click: None,
             composer_selection: None,
+            painted_input_rows: 0..0,
             composer_select_all: false,
             reported_select_all: false,
             composer_navigation_layout: None,
@@ -2753,12 +2757,18 @@ impl Renderer {
         // signal therefore has to follow the frame that repaints the composer
         // row: sent ahead of it, the mask lifts while the hint text is still on
         // screen and the hint flashes once before the committed syllable lands.
-        let composer_hint_signal = devez_composer_hint_signal(composer_hint_columns(
-            view.editor,
-            view.composer_images,
-            view.composer_placeholder,
-            view.composer_preedit,
-        ));
+        // An overlay hides the composer row, so there is no hint to mask; the
+        // signal must not lift cells beside a question's inline answer instead.
+        let composer_hint_signal = devez_composer_hint_signal(if view.overlay.is_some() {
+            0
+        } else {
+            composer_hint_columns(
+                view.editor,
+                view.composer_images,
+                view.composer_placeholder,
+                view.composer_preedit,
+            )
+        });
         let frame_width = width;
         // Fullscreen assistant output shares the transcript surface with its
         // completed form. Keeping active and completed text on one surface
@@ -2789,7 +2799,14 @@ impl Renderer {
             view.subagents.as_slice()
         };
         let mut frame = if let Some(overlay) = view.overlay {
-            overlay_frame_with_expansion(live_lines, overlay, view.welcome, status, frame_width)
+            overlay_frame_with_expansion(
+                live_lines,
+                overlay,
+                view.welcome,
+                status,
+                frame_width,
+                view.composer_preedit,
+            )
         } else {
             normal_frame_with_expansion(
                 live_lines,
@@ -2978,29 +2995,34 @@ impl Renderer {
         self.split_btw_scroll_back = btw.scroll_back;
         self.split_btw_view_rows = btw.view_rows;
 
-        let (cursor_line, cursor_col, composer_selection, composer_layout) = match focus {
-            SplitFocus::Main => (
-                main.cursor_line,
-                main.cursor_col,
-                main.composer_selection,
-                main.composer_layout,
-            ),
-            SplitFocus::Btw => (
-                main_rows + btw.cursor_line,
-                btw.cursor_col,
-                btw.composer_selection.map(|mut selection| {
-                    selection.first_row += main_rows;
-                    selection
-                }),
-                btw.composer_layout,
-            ),
-        };
+        let (cursor_line, cursor_col, composer_selection, composer_layout, inline_input_rows) =
+            match focus {
+                SplitFocus::Main => (
+                    main.cursor_line,
+                    main.cursor_col,
+                    main.composer_selection,
+                    main.composer_layout,
+                    main.inline_input_rows,
+                ),
+                SplitFocus::Btw => (
+                    main_rows + btw.cursor_line,
+                    btw.cursor_col,
+                    btw.composer_selection.map(|mut selection| {
+                        selection.first_row += main_rows;
+                        selection
+                    }),
+                    btw.composer_layout,
+                    btw.inline_input_rows
+                        .map(|rows| main_rows + rows.start..main_rows + rows.end),
+                ),
+            };
         let mut screen = main.lines;
         screen.extend(btw.lines);
         self.reconcile_selection(&screen, 0, &[]);
         let composer_rows = composer_selection
             .as_ref()
             .map(|composer| composer.first_row..composer.first_row + composer.layout.rows.len())
+            .or(inline_input_rows)
             .unwrap_or(0..0);
         self.paint_screen(
             &screen,
@@ -3454,6 +3476,10 @@ impl Renderer {
                     first_row: plan_rows + view_rows + index + 1,
                     layout,
                 });
+        let inline_input_rows = frame
+            .inline_input_rows
+            .take()
+            .map(|rows| plan_rows + view_rows + rows.start..plan_rows + view_rows + rows.end);
         let (mut screen, cursor_line) = compose_screen(
             &display_wrapped,
             frame.lines,
@@ -3493,6 +3519,7 @@ impl Renderer {
         let composer_rows = composer_selection
             .as_ref()
             .map(|composer| composer.first_row..composer.first_row + composer.layout.rows.len())
+            .or(inline_input_rows)
             .unwrap_or(0..0);
         self.paint_screen(
             &screen,
@@ -3747,13 +3774,13 @@ impl Renderer {
         // Korean row temporarily occupies the new continuation row. Repaint
         // that geometry transition sequentially once so the old final glyph
         // cannot flash on the still-empty row below.
-        let previous_composer_rows = self
-            .composer_selection
-            .as_ref()
-            .map(|composer| composer.first_row..composer.first_row + composer.layout.rows.len())
-            .unwrap_or(0..0);
-        let protected_composer_rows =
-            composer_rows_protected_from_sequential_repaint(previous_composer_rows, composer_rows);
+        let previous_composer_rows = self.painted_input_rows.clone();
+        self.painted_input_rows = composer_rows.clone();
+        let protected_composer_rows = composer_rows_protected_from_sequential_repaint(
+            previous_composer_rows,
+            composer_rows,
+            self.question_overlay_open,
+        );
         let mut sequential_rows = full_repaint_rows.to_vec();
         sequential_rows.extend(wide_rows_requiring_sequential_repaint(
             self.painted_frame.as_ref(),
@@ -3993,11 +4020,21 @@ fn wide_rows_requiring_sequential_repaint(
 /// Stable composer rows keep their local diff so ordinary typing does not move
 /// the caret across the row. A wrap that changes their screen range protects
 /// none for one frame, allowing the displaced old Korean row to be repainted.
+/// An open question panel protects none either: its rows restyle on every
+/// arrow key while their screen range stays put, and those mid-row patches are
+/// exactly what ConPTY replays with the wide glyphs duplicated (a Korean option
+/// row then reads as different syllables). Nothing is being typed on a row the
+/// picker owns, so the caret has nowhere to travel.
 fn composer_rows_protected_from_sequential_repaint(
     previous: Range<usize>,
     current: Range<usize>,
+    question_open: bool,
 ) -> Range<usize> {
-    if previous == current { current } else { 0..0 }
+    if !question_open && previous == current {
+        current
+    } else {
+        0..0
+    }
 }
 
 /// A plan state change first reaches the normal render path, before the next
@@ -4677,6 +4714,8 @@ struct SplitPaneFrame {
     cursor_col: usize,
     composer_selection: Option<ComposerSelection>,
     composer_layout: Option<ComposerLayout>,
+    /// Screen rows of a question's inline answer, in the pane's own rows.
+    inline_input_rows: Option<Range<usize>>,
     max_scroll: usize,
     scroll_back: usize,
     view_rows: usize,
@@ -4995,7 +5034,14 @@ fn split_pane_frame_scrolled(
     };
     let overlay = active.then_some(view.overlay).flatten();
     let mut frame = if let Some(overlay) = overlay {
-        overlay_frame_with_expansion(live_lines, overlay, view.welcome, status, content_width)
+        overlay_frame_with_expansion(
+            live_lines,
+            overlay,
+            view.welcome,
+            status,
+            content_width,
+            view.composer_preedit,
+        )
     } else {
         normal_frame_with_expansion(
             live_lines,
@@ -5054,6 +5100,7 @@ fn split_pane_frame_scrolled(
             shift_composer_layout(layout, 2);
         }
     }
+    let inline_input_rows = frame.inline_input_rows.take();
     let (mut lines, cursor_line) = compose_screen(
         &transcript,
         frame.lines,
@@ -5062,6 +5109,10 @@ fn split_pane_frame_scrolled(
         frame.cursor_line,
     );
     let fixed_rows = fixed_top.len();
+    let inline_input_rows = inline_input_rows.map(|rows| {
+        let top = outer_top_rows + fixed_rows + view_rows;
+        top + rows.start..top + rows.end
+    });
     lines.splice(0..0, fixed_top);
     if let Some(label) = label {
         lines = lines
@@ -5078,6 +5129,7 @@ fn split_pane_frame_scrolled(
         cursor_col: frame.cursor_col + usize::from(boxed) * 2,
         composer_selection,
         composer_layout,
+        inline_input_rows,
         max_scroll,
         scroll_back,
         view_rows,
@@ -5188,6 +5240,10 @@ struct Frame {
     /// The prompt rows of the composer this frame carries, if it has one, so a
     /// drag over them can be mapped back to composer characters.
     composer_layout: Option<ComposerLayout>,
+    /// The rows a question's free-text answer is typed on, when it is typed on
+    /// its option row. Like the composer's rows they keep their local diff, so
+    /// an IME preedit update never hides the cursor to repaint the row whole.
+    inline_input_rows: Option<Range<usize>>,
     activity_index: Option<usize>,
 }
 
@@ -5202,6 +5258,10 @@ impl Frame {
         self.lines.remove(0);
         self.cursor_line = self.cursor_line.saturating_sub(1);
         self.composer_index = self.composer_index.map(|index| index.saturating_sub(1));
+        self.inline_input_rows = self
+            .inline_input_rows
+            .take()
+            .map(|rows| rows.start.saturating_sub(1)..rows.end.saturating_sub(1));
         self.activity_index = self.activity_index.map(|index| index.saturating_sub(1));
         true
     }
@@ -5475,7 +5535,17 @@ impl PaintLine {
     /// spans in paint order — `0` is `text`, `1` onward is `tail` — so a caller
     /// marks the badge it just placed without having to know what the row's
     /// prefix or the spans ahead of it cost in columns.
-    fn with_picks(mut self, picks: &[(usize, Pick)]) -> Self {
+    fn with_picks(self, picks: &[(usize, Pick)]) -> Self {
+        self.with_picks_bleed(picks, PICK_BLEED)
+    }
+
+    /// Clickable spans whose highlight stops at the text itself, with no
+    /// breathing room either side.
+    fn with_tight_picks(self, picks: &[(usize, Pick)]) -> Self {
+        self.with_picks_bleed(picks, 0)
+    }
+
+    fn with_picks_bleed(mut self, picks: &[(usize, Pick)], bleed: usize) -> Self {
         let mut column = UnicodeWidthStr::width(self.prefix.as_str());
         let mut regions = Vec::new();
         for (index, text) in std::iter::once(self.text.as_str())
@@ -5489,11 +5559,7 @@ impl PaintLine {
                 // The status model badge already owns a padded background,
                 // so its hover stops at that badge instead of bleeding into
                 // the adjacent separators.
-                let bleed = if matches!(pick, Pick::Model) {
-                    0
-                } else {
-                    PICK_BLEED
-                };
+                let bleed = if matches!(pick, Pick::Model) { 0 } else { bleed };
                 regions.push((
                     column.saturating_sub(bleed),
                     column + width + bleed,
@@ -5980,7 +6046,7 @@ fn activity_line_with_composer_controls(
     line.tail.push(rule_gap(gap));
     line.tail.extend(badge.spans);
     line.tail.push(rule_gap(1));
-    Some(line.with_picks(&picks))
+    Some(line.with_tight_picks(&picks))
 }
 
 fn painted_line_text(line: &PaintLine) -> String {
@@ -6476,6 +6542,7 @@ fn normal_frame_with_expansion(
         dock_index,
         composer_index: Some(composer_index),
         composer_layout: Some(composer_layout),
+        inline_input_rows: None,
         activity_index,
     }
 }
@@ -7367,7 +7434,7 @@ fn overlay_frame(
         ShellDisplayMode::Collapse,
         DiffDisplayMode::Collapse,
     );
-    overlay_frame_with_expansion(live_lines, overlay, welcome, status, width)
+    overlay_frame_with_expansion(live_lines, overlay, welcome, status, width, "")
 }
 
 fn overlay_frame_with_expansion(
@@ -7376,6 +7443,7 @@ fn overlay_frame_with_expansion(
     welcome: Option<WelcomeView>,
     status: StatusArea,
     width: u16,
+    composer_preedit: &str,
 ) -> Frame {
     let mut lines = Vec::new();
     // A picker docks over the transcript rather than replacing the screen, so the
@@ -7391,6 +7459,7 @@ fn overlay_frame_with_expansion(
     // Set when a free-text answer is typed on the option row it was picked on,
     // which is where the cursor then belongs.
     let mut inline_cursor = None;
+    let mut inline_input_rows = None;
     let mut cursor_line = lines.len();
     let mut cursor_col = 0;
     let mut composer_index = None;
@@ -7421,12 +7490,15 @@ fn overlay_frame_with_expansion(
                 let left_inset = panel_width
                     .saturating_sub(2 + search_width)
                     .saturating_div(2);
-                let (input, input_cursor_line, input_cursor_col, _) = input_lines(
+                let (input, input_cursor_line, input_cursor_col, _) = input_lines_with_controls(
                     editor,
+                    &[],
+                    composer_preedit,
                     &[],
                     input_width,
                     overlay.input_label,
                     overlay.input_placeholder,
+                    None,
                     None,
                     None,
                 );
@@ -7495,7 +7567,7 @@ fn overlay_frame_with_expansion(
                         // 켜 둔 항목은 커서가 떠나도 색을 지킨다.
                         Tone::Accent
                     } else {
-                        model_tone(part).unwrap_or(Tone::Plain)
+                        picker_model_tone(part)
                     };
                     let wrapped = wrapped_line_with_continuation(
                         prefix,
@@ -7746,8 +7818,10 @@ fn overlay_frame_with_expansion(
                         editor,
                         UnicodeWidthStr::width(prefix.as_str()),
                         wrap_width,
+                        composer_preedit,
                     );
                     inline_cursor = Some((lines.len() + cursor_row, cursor_column));
+                    let first_input_row = lines.len();
                     for (part_index, part) in rows_text.iter().enumerate() {
                         let line_prefix = if part_index == 0 {
                             prefix.clone()
@@ -7777,6 +7851,7 @@ fn overlay_frame_with_expansion(
                             }),
                         );
                     }
+                    inline_input_rows = Some(first_input_row..lines.len());
                     continue;
                 }
                 for (part_index, part) in row.text.lines().enumerate() {
@@ -7838,13 +7913,16 @@ fn overlay_frame_with_expansion(
         lines.push(PaintLine::blank());
         // A picker's own input is not the composer, so a drag over it stays a
         // copy: there is no prompt buffer behind it for a delete to reach.
-        let (input, input_cursor_line, input_cursor_col, _) = input_lines(
+        let (input, input_cursor_line, input_cursor_col, _) = input_lines_with_controls(
             editor,
+            &[],
+            composer_preedit,
             &[],
             width,
             overlay.input_label,
             overlay.input_placeholder,
             None,
+            status.composer_mode.as_ref(),
             status.composer_mode.as_ref(),
         );
         composer_index = Some(lines.len());
@@ -7868,6 +7946,7 @@ fn overlay_frame_with_expansion(
         dock_index,
         composer_index,
         composer_layout: None,
+        inline_input_rows,
         activity_index: None,
     }
 }
@@ -7882,6 +7961,11 @@ fn fit_frame(frame: &mut Frame, target_rows: usize) {
         frame.composer_index = frame
             .composer_index
             .map(|index| index.saturating_sub(dropped));
+        frame.inline_input_rows = frame
+            .inline_input_rows
+            .take()
+            .map(|rows| rows.start.saturating_sub(dropped)..rows.end.saturating_sub(dropped))
+            .filter(|rows| !rows.is_empty());
         frame.activity_index = frame
             .activity_index
             .and_then(|index| index.checked_sub(dropped));
@@ -7900,6 +7984,16 @@ fn fit_frame(frame: &mut Frame, target_rows: usize) {
             .is_some_and(|index| index >= dock_index)
         {
             frame.composer_index = frame.composer_index.map(|index| index + padding);
+        }
+        if frame
+            .inline_input_rows
+            .as_ref()
+            .is_some_and(|rows| rows.start >= dock_index)
+        {
+            frame.inline_input_rows = frame
+                .inline_input_rows
+                .take()
+                .map(|rows| rows.start + padding..rows.end + padding);
         }
         if frame
             .activity_index
@@ -7941,17 +8035,44 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         agent_prompt_tone(status.agent),
     );
     picks.push((agent_span, Pick::AgentMode));
+    let mut model_shown = false;
     if let Some(model) = status.model.filter(|model| !model.is_empty()) {
-        let span = push_status_span(
-            &mut spans,
-            compact_right(&model, 40),
-            status_model_tone(&model).unwrap_or(Tone::StatusText),
-        );
-        picks.push((span, Pick::Model));
+        model_shown = true;
+        let label = compact_right(&model, 40);
+        let tone = status_model_tone(&model).unwrap_or(Tone::StatusText);
+        // An OpenCode reading is `model · provider`: the runtime name is
+        // secondary to the model itself, so it steps back to the same muted
+        // colour the shortcut hint wears at the far right of the row.
+        let split = label
+            .rsplit_once(" · ")
+            .map(|(name, provider)| (name.to_owned(), provider.to_owned()));
+        match split {
+            Some((name, provider)) => {
+                let span = push_status_span(&mut spans, name, tone);
+                picks.push((span, Pick::Model));
+                spans.push(PaintSpan {
+                    text: format!(" · {provider}"),
+                    tone: Tone::Muted,
+                    bold: false,
+                });
+                picks.push((span + 1, Pick::Model));
+            }
+            None => {
+                let span = push_status_span(&mut spans, label, tone);
+                picks.push((span, Pick::Model));
+            }
+        }
     }
     if let Some(effort) = status.effort.filter(|effort| !effort.is_empty()) {
         let tone = status_effort_tone(&effort).unwrap_or(Tone::StatusText);
-        let span = push_status_span(&mut spans, format!("◆ {effort}"), tone);
+        // The effort belongs to the model beside it, so the two are joined by a
+        // dot rather than parted by the bar the other readings use.
+        let separator = if model_shown {
+            STATUS_PAIR_SEPARATOR
+        } else {
+            STATUS_SEPARATOR
+        };
+        let span = push_status_span_after(&mut spans, separator, effort, tone);
         picks.push((span, Pick::EffortSetting));
     }
     if let Some(context) = status.context.filter(|context| !context.is_empty()) {
@@ -7968,11 +8089,25 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         (None, Some(left)) => Some(format!("5h: {left}")),
         (None, None) => None,
     };
+    let mut five_hour_shown = false;
     if let Some(five_hour) = five_hour {
+        five_hour_shown = true;
         push_status_span(&mut spans, five_hour, Tone::StatusText);
     }
     if let Some(percent) = status.weekly_percent {
-        push_status_span(&mut spans, format!("week: {percent}%"), Tone::StatusText);
+        // Two readings of the same limit: the week follows its 5h window on a
+        // dot instead of reading as a separate item.
+        let separator = if five_hour_shown {
+            STATUS_PAIR_SEPARATOR
+        } else {
+            STATUS_SEPARATOR
+        };
+        push_status_span_after(
+            &mut spans,
+            separator,
+            format!("week: {percent}%"),
+            Tone::StatusText,
+        );
     }
     // Composer controls live on the top rule, so the status row only carries
     // provider usage and notices.
@@ -8017,7 +8152,7 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         pick: None,
         tail: spans.into_iter().skip(1).collect(),
     }
-    .with_picks(&picks)
+    .with_tight_picks(&picks)
 }
 
 fn status_line_shortcut_hint(has_model_shortcut: bool, has_effort: bool) -> &'static str {
@@ -8155,6 +8290,21 @@ fn side_panel_context_line(context: &str, content_width: usize, context_tone: To
 }
 
 fn push_status_span(spans: &mut Vec<PaintSpan>, text: impl Into<String>, tone: Tone) -> usize {
+    push_status_span_after(spans, STATUS_SEPARATOR, text, tone)
+}
+
+/// The bar between two readings that belong apart, and the dot between two that
+/// read as one setting — a model and its effort, a 5h window and the week it
+/// sits in.
+const STATUS_SEPARATOR: &str = " | ";
+const STATUS_PAIR_SEPARATOR: &str = " · ";
+
+fn push_status_span_after(
+    spans: &mut Vec<PaintSpan>,
+    separator: &str,
+    text: impl Into<String>,
+    tone: Tone,
+) -> usize {
     if spans.is_empty() {
         spans.push(PaintSpan {
             text: text.into(),
@@ -8164,7 +8314,7 @@ fn push_status_span(spans: &mut Vec<PaintSpan>, text: impl Into<String>, tone: T
         return 0;
     }
     spans.push(PaintSpan {
-        text: " | ".to_owned(),
+        text: separator.to_owned(),
         tone: Tone::StatusSeparator,
         bold: false,
     });
@@ -11622,12 +11772,23 @@ fn inline_answer_rows(
     editor: &Editor,
     prefix_width: usize,
     wrap_width: u16,
+    preedit: &str,
 ) -> (Vec<String>, usize, usize) {
-    let text = editor.text().replace('\n', " ");
+    let mut text = editor.text().replace('\n', " ");
+    // The syllable the IME is still composing sits where it will commit, with
+    // the cursor after it, exactly as the main composer shows it.
+    let mut cursor_index = editor.cursor();
+    if !preedit.is_empty() {
+        let at = text
+            .char_indices()
+            .nth(cursor_index)
+            .map_or(text.len(), |(at, _)| at);
+        text.insert_str(at, preedit);
+        cursor_index += preedit.chars().count();
+    }
     let content_width = (wrap_width as usize)
         .saturating_sub(prefix_width + 1)
         .max(4);
-    let cursor_index = editor.cursor();
     let mut rows = vec![String::new()];
     let mut cursor_row = 0;
     let mut cursor_column = prefix_width;
@@ -11723,6 +11884,7 @@ fn composer_token_spans(content: &str, base_tone: Tone, highlights: &[String]) -
     spans
 }
 
+#[cfg(test)]
 fn input_lines(
     editor: &Editor,
     composer_images: &[String],
@@ -12094,7 +12256,7 @@ fn input_top_line_with_controls(
             pick: None,
             tail,
         }
-        .with_picks(&picks);
+        .with_tight_picks(&picks);
     }
     let spans = [
         PaintSpan {
@@ -12118,7 +12280,7 @@ fn input_top_line_with_controls(
         pick: None,
         tail: spans.into_iter().chain(tail).collect(),
     }
-    .with_picks(&picks)
+    .with_tight_picks(&picks)
 }
 
 fn input_bottom_line(
@@ -12785,6 +12947,16 @@ fn chrome_model_tone(model: &str) -> Option<Tone> {
     model_tone(model)
 }
 
+/// The colour a picker row wears. An OpenCode listing reads `model · provider`
+/// and carries other vendors' model names verbatim, so a family colour there
+/// would name a runtime the row is not offering: those rows stay plain.
+fn picker_model_tone(row: &str) -> Tone {
+    if row.contains(" · ") {
+        return Tone::Plain;
+    }
+    model_tone(row).unwrap_or(Tone::Plain)
+}
+
 fn model_tone(model: &str) -> Option<Tone> {
     // OpenCode rides other vendors' models (claude, gpt), so the substring
     // matches below would steal their colors for a different runtime.
@@ -13230,6 +13402,7 @@ mod tests {
             dock_index: 1,
             composer_index: Some(4),
             composer_layout: None,
+            inline_input_rows: None,
             activity_index: Some(3),
         };
 
@@ -14418,6 +14591,7 @@ mod tests {
             dock_index: 1,
             composer_index: Some(1),
             composer_layout: None,
+            inline_input_rows: None,
             activity_index: None,
         };
 
@@ -14444,6 +14618,7 @@ mod tests {
             dock_index: 1,
             composer_index: Some(2),
             composer_layout: None,
+            inline_input_rows: None,
             activity_index: Some(1),
         };
 
@@ -14465,6 +14640,7 @@ mod tests {
             dock_index: 3,
             composer_index: Some(3),
             composer_layout: None,
+            inline_input_rows: None,
             activity_index: None,
         };
 
@@ -15606,7 +15782,7 @@ mod tests {
     }
 
     #[test]
-    fn status_line_effort_icon_survives_copy_for_composer_paste() {
+    fn status_line_effort_reading_survives_copy_for_composer_paste() {
         let line = status_line_row(
             Some(StatusLineView {
                 agent: AgentMode::Standard,
@@ -15628,15 +15804,15 @@ mod tests {
         // " Builder | ".
         let start = " Builder | ".len() as u16;
         assert!(renderer.begin_selection(start, 0));
-        assert!(renderer.update_selection(start + 5, 0));
-        let SelectionResult::Copy(copied) = renderer.finish_selection(start + 5, 0) else {
+        assert!(renderer.update_selection(start + 3, 0));
+        let SelectionResult::Copy(copied) = renderer.finish_selection(start + 3, 0) else {
             panic!("status line selection should copy");
         };
-        assert_eq!(copied, "◆ high");
+        assert_eq!(copied, "high");
 
         let mut editor = Editor::default();
         editor.insert_paste_str(&copied);
-        assert_eq!(composer_display(&editor, &[]).0, "◆ high");
+        assert_eq!(composer_display(&editor, &[]).0, "high");
     }
 
     #[test]
@@ -18449,6 +18625,7 @@ mod tests {
             dock_index: 2,
             composer_index: Some(4),
             composer_layout: None,
+            inline_input_rows: None,
             activity_index: Some(3),
         };
         let streaming_row = screen_row(&older, streaming);
@@ -18468,6 +18645,7 @@ mod tests {
             dock_index: 0,
             composer_index: Some(3),
             composer_layout: None,
+            inline_input_rows: None,
             activity_index: Some(2),
         };
         let shifted_row = screen_row(&completed_transcript, completed_frame());
@@ -19953,6 +20131,7 @@ mod tests {
             dock_index: 1,
             composer_index: Some(1),
             composer_layout: None,
+            inline_input_rows: None,
             activity_index: None,
         };
         let (view_rows, live_rows) = split_rows(10, frame.lines.len(), 0);
@@ -21243,7 +21422,7 @@ mod tests {
         );
 
         assert!(painted(&line).contains("GPT-5.6 Sol"));
-        assert!(painted(&line).contains("◆ high"));
+        assert!(painted(&line).contains("GPT-5.6 Sol · high"));
     }
 
     #[test]
@@ -21271,11 +21450,20 @@ mod tests {
         let model_tone = line
             .tail
             .iter()
-            .find(|span| span.text.contains("OpenCode Go"))
+            .find(|span| span.text.contains("DeepSeek V4 Flash"))
             .map(|span| span.tone)
             .expect("the model reading is painted");
         assert_eq!(model_tone, Tone::ModelOpenCode);
         assert_eq!(tone_rgb(model_tone), Some(theme::palette().model_opencode));
+        // The runtime trailing the model name steps back to the muted colour
+        // the shortcut hint uses.
+        let provider_tone = line
+            .tail
+            .iter()
+            .find(|span| span.text.contains("OpenCode Go"))
+            .map(|span| span.tone)
+            .expect("the runtime reading is painted");
+        assert_eq!(provider_tone, Tone::Muted);
     }
 
     #[test]
@@ -21316,7 +21504,7 @@ mod tests {
         let line = status_line_row(status, "", 120);
 
         assert!(painted(&line).contains("GPT-5.6 Codex"));
-        assert!(painted(&line).contains("◆ xhigh"));
+        assert!(painted(&line).contains("GPT-5.6 Codex · xhigh"));
         assert!(!painted(&line).contains("ctx:"));
         assert!(painted(&line).contains("3h 6m: 14%"));
         assert!(painted(&line).contains("week: 27%"));
@@ -21410,7 +21598,7 @@ mod tests {
         assert_eq!(
             line.tail
                 .iter()
-                .find(|span| span.text == "◆ high")
+                .find(|span| span.text == "high")
                 .map(|span| span.tone),
             Some(Tone::StatusEffortHigh)
         );
@@ -21433,7 +21621,7 @@ mod tests {
             80,
         );
 
-        assert!(painted(&line).contains("◆ high"));
+        assert!(painted(&line).contains("high"));
     }
 
     /// Before the first status arrives the row is a plain fallback string, with no
@@ -22322,6 +22510,75 @@ mod tests {
         );
     }
 
+    /// The syllable Windows IME is still composing is painted on the answer
+    /// row, with the cursor after it, the way the main composer shows it; and
+    /// that row is reported so a preedit repaint never hides the cursor.
+    #[test]
+    fn question_overlay_paints_the_ime_preedit_on_the_answer_row() {
+        let mut editor = Editor::default();
+        editor.insert_str("직접 쓴 답");
+        let overlay = OverlayView {
+            closable: false,
+            title: "테스트".to_owned(),
+            lines: vec![
+                OverlayLine {
+                    text: "어느 것 고를래?".to_owned(),
+                    selected: false,
+                    muted: false,
+                },
+                OverlayLine {
+                    text: "선택지 A\n첫 번째".to_owned(),
+                    selected: false,
+                    muted: false,
+                },
+                OverlayLine {
+                    text: "직접 입력".to_owned(),
+                    selected: true,
+                    muted: false,
+                },
+                OverlayLine {
+                    text: "이 내용으로 대화하기".to_owned(),
+                    selected: false,
+                    muted: false,
+                },
+            ],
+            slider: None,
+            hint: "Enter Send · Esc Cancel".to_owned(),
+            style: OverlayStyle::Question,
+            input: Some(&editor),
+            input_label: "Answer",
+            input_placeholder: "여기에 직접 입력…",
+        };
+        let status = StatusArea {
+            fallback: String::new(),
+            line: None,
+            composer_notice: None,
+            composer_mode: None,
+        };
+
+        let frame = overlay_frame_with_expansion(Vec::new(), overlay, None, status, 80, "한");
+        let typed = frame.lines.iter().map(painted).collect::<Vec<_>>();
+        let answer_row = typed
+            .iter()
+            .position(|line| line.contains("직접 쓴 답한"))
+            .expect("the composing syllable is missing from the answer row");
+        assert!(typed[answer_row].starts_with("│ ❯  2. 직접 쓴 답한"));
+        assert_eq!(frame.cursor_line, answer_row);
+        assert_eq!(
+            frame.cursor_col,
+            UnicodeWidthStr::width("│ ❯  2. 직접 쓴 답한")
+        );
+        assert_eq!(frame.inline_input_rows, Some(answer_row..answer_row + 1));
+
+        // Trimming the frame from the top moves the protected row with it.
+        let mut trimmed = frame;
+        let rows = trimmed.lines.len();
+        fit_frame(&mut trimmed, rows - 2);
+        assert_eq!(
+            trimmed.inline_input_rows,
+            Some(answer_row - 2..answer_row - 1)
+        );
+    }
     /// A question option answers to a click anywhere inside its box, not only
     /// where its label happens to reach: a short answer was otherwise a thin
     /// target beside a wide row. The two borders stay out of the region, so
@@ -23324,10 +23581,10 @@ mod tests {
         let text = painted(&line);
         let start = UnicodeWidthStr::width(&text[..text.find("Vibe: On").unwrap()]);
 
-        // A column either side of the vibe label is part of the target.
+        // The target is the label itself, with no column to spare either side.
         assert_eq!(
             Renderer::hover_columns(&line, None, Some(&Pick::VibeMode)),
-            Some(start - 1..start + 9)
+            Some(start..start + 8)
         );
         // Nothing on the rule answers for a pick it does not carry.
         assert_eq!(
@@ -23338,7 +23595,7 @@ mod tests {
     }
 
     #[test]
-    fn response_badge_hover_keeps_a_leading_click_cell() {
+    fn response_badge_hover_starts_on_its_own_label() {
         theme::set_current(ThemeKind::Dark);
         let line = activity_line_with_composer_controls(
             PaintLine::blank(),
@@ -23353,7 +23610,7 @@ mod tests {
         let response_start =
             UnicodeWidthStr::width(&text[..text.find("Response: Completed").unwrap()]);
 
-        assert_eq!(hovered.start, response_start.saturating_sub(1));
+        assert_eq!(hovered.start, response_start);
     }
 
     /// A long activity label crowds the controls off the active row. They belong
@@ -25192,10 +25449,30 @@ mod tests {
         current.write(0, 1, "› 첫 입력값", CellStyle::plain());
         current.write(0, 2, "  둘째 입력값", CellStyle::plain());
 
-        let protected = composer_rows_protected_from_sequential_repaint(1..3, 1..3);
+        let protected = composer_rows_protected_from_sequential_repaint(1..3, 1..3, false);
         assert_eq!(protected, 1..3);
         let rows = wide_rows_requiring_sequential_repaint(Some(&previous), &current, protected);
         assert_eq!(rows, vec![0]);
+    }
+
+    /// Moving the highlight through a question's Korean options restyles rows
+    /// whose screen range never moves. Those are the mid-row patches ConPTY
+    /// replays with the wide glyphs duplicated, so the picker protects none of
+    /// its rows and each changed option row repaints from column zero.
+    #[test]
+    fn an_open_question_panel_repaints_its_korean_option_rows_sequentially() {
+        let mut previous = CellFrame::new(32, 3);
+        previous.write(0, 0, "무엇을 할까요?", CellStyle::plain());
+        previous.write(0, 1, "› 1. 커밋하기", CellStyle::plain());
+        previous.write(0, 2, "  2. 그대로 둠", CellStyle::plain());
+        let mut current = previous.clone();
+        current.write(0, 1, "  1. 커밋하기", CellStyle::plain());
+        current.write(0, 2, "› 2. 그대로 둠", CellStyle::plain());
+
+        let protected = composer_rows_protected_from_sequential_repaint(1..3, 1..3, true);
+        assert_eq!(protected, 0..0);
+        let rows = wide_rows_requiring_sequential_repaint(Some(&previous), &current, protected);
+        assert_eq!(rows, vec![1, 2]);
     }
 
     #[test]
@@ -25214,7 +25491,7 @@ mod tests {
         // The composer moved from 2..3 to 1..3 when the continuation row was
         // inserted. No composer row is protected during this one transition,
         // so both the moved Korean row and its old screen row repaint from zero.
-        let protected = composer_rows_protected_from_sequential_repaint(2..3, 1..3);
+        let protected = composer_rows_protected_from_sequential_repaint(2..3, 1..3, false);
         assert_eq!(protected, 0..0);
         let rows = wide_rows_requiring_sequential_repaint(Some(&previous), &current, protected);
         assert_eq!(rows, vec![1, 2]);
