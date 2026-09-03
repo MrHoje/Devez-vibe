@@ -853,7 +853,7 @@ async fn choose_startup_session(
                 fold_progress_groups: false,
                 plan_active: false,
                 plan_shimmer_phase: None,
-                plan_effort: None,
+                plan_agent: agent::AgentMode::Standard,
                 editor: &editor,
                 composer_images: &[],
                 queued_prompts: Vec::new(),
@@ -1234,6 +1234,7 @@ async fn open_btw(
                 "claudeDeveloperInstructions": CLAUDE_DEVEZ_INSTRUCTIONS,
                 "serviceTier": main.service_tier(),
                 "ephemeral": true,
+                "excludeTurns": true,
                 "threadSource": "devez-vibe"
             }),
         )
@@ -2640,6 +2641,7 @@ async fn execute_action(
                         "claudeDeveloperInstructions": CLAUDE_DEVEZ_INSTRUCTIONS,
                         "serviceTier": state.service_tier(),
                         "ephemeral": true,
+                        "excludeTurns": true,
                         "threadSource": "devez-vibe"
                     }),
                 )
@@ -4373,6 +4375,9 @@ fn resume_thread_params(thread_id: &str, claude: &ClaudeSessionSettings) -> Valu
         "developerInstructions": DEVEZ_INSTRUCTIONS,
         "claudeDeveloperInstructions": CLAUDE_DEVEZ_INSTRUCTIONS,
         "claudePermissionMode": claude.permission_mode,
+        // Paginated threads warn when the resume answer carries the whole
+        // history. The turns are re-listed page by page right after anyway.
+        "excludeTurns": true,
         "initialTurnsPage": {
             "limit": 100,
             "sortDirection": "asc",
@@ -7069,6 +7074,7 @@ mod tests {
                 .and_then(Value::as_str),
             Some("full")
         );
+        assert_eq!(params.get("excludeTurns"), Some(&json!(true)));
     }
 
     #[test]

@@ -532,8 +532,8 @@ pub struct View<'a> {
     pub plan_active: bool,
     /// A one-shot frame shimmer started by a plan creation or update.
     pub plan_shimmer_phase: Option<f32>,
-    /// The effort fixed when the active request started, used for plan shimmer.
-    pub plan_effort: Option<&'a str>,
+    /// The agent role selected in the composer, used for the plan shimmer colour.
+    pub plan_agent: AgentMode,
     pub editor: &'a Editor,
     pub composer_images: &'a [String],
     pub queued_prompts: Vec<String>,
@@ -587,7 +587,7 @@ pub struct AnimationView<'a> {
     pub plan_summary: Option<&'a PlanSummary>,
     pub plan_active: bool,
     pub plan_shimmer_phase: Option<f32>,
-    pub plan_effort: Option<&'a str>,
+    pub plan_agent: AgentMode,
     pub composer_notice: Option<&'a str>,
     pub composer_mode: Option<ComposerMode>,
 }
@@ -2784,7 +2784,7 @@ impl Renderer {
                 view.activity_phase,
                 view.plan_active,
                 view.plan_shimmer_phase,
-                view.plan_effort,
+                view.plan_agent,
                 view.waiting_for_response,
                 &view.subagents,
                 &view.cwd,
@@ -3092,7 +3092,7 @@ impl Renderer {
                     view.activity_phase,
                     view.plan_active,
                     view.plan_shimmer_phase,
-                    view.plan_effort,
+                    view.plan_agent,
                 )
             })
             .unwrap_or_default();
@@ -3242,7 +3242,7 @@ impl Renderer {
         activity_phase: f32,
         plan_active: bool,
         plan_shimmer_phase: Option<f32>,
-        plan_effort: Option<&str>,
+        plan_agent: AgentMode,
         waiting_for_response: bool,
         subagents: &[SubagentView],
         cwd: &str,
@@ -3266,7 +3266,7 @@ impl Renderer {
                     activity_phase,
                     plan_active,
                     plan_shimmer_phase,
-                    plan_effort,
+                    plan_agent,
                 )
             })
             .unwrap_or_default();
@@ -4898,7 +4898,7 @@ fn split_pane_frame_scrolled(
             view.activity_phase,
             view.plan_active,
             view.plan_shimmer_phase,
-            view.plan_effort,
+            view.plan_agent,
         ));
     }
     let fixed_capacity = rows.saturating_sub(outer_top_rows + outer_bottom_rows + 3);
@@ -9033,7 +9033,7 @@ fn fixed_plan_summary_lines(
     phase: f32,
     plan_active: bool,
     plan_shimmer_phase: Option<f32>,
-    plan_effort: Option<&str>,
+    plan_agent: AgentMode,
 ) -> Vec<PaintLine> {
     let line_width = panel_span(width);
     let completed = summary
@@ -9041,9 +9041,7 @@ fn fixed_plan_summary_lines(
         .iter()
         .filter(|step| step.status == PlanStepStatus::Completed)
         .count();
-    let effort_tone = plan_effort
-        .and_then(effort_tone)
-        .unwrap_or_else(|| plan_effort_tone(summary.steps.len()));
+    let agent_tone = agent_prompt_tone(plan_agent);
     let all_completed = !summary.steps.is_empty() && completed == summary.steps.len();
     let completion_displayed = all_completed && !plan_active;
     let displayed_completed = completed.saturating_sub(usize::from(all_completed && plan_active));
@@ -9174,7 +9172,7 @@ fn fixed_plan_summary_lines(
     header_tail.extend(plan_title_shimmer_spans(
         &title,
         plan_shimmer_phase,
-        effort_tone,
+        agent_tone,
     ));
     header_tail.extend([
         PaintSpan {
@@ -9229,19 +9227,7 @@ fn fixed_plan_summary_lines(
     lines
 }
 
-/// A new plan starts at low twice, then advances one effort colour per added step.
-fn plan_effort_tone(step_count: usize) -> Tone {
-    match step_count.saturating_sub(2) {
-        0 => Tone::EffortLow,
-        1 => Tone::EffortMedium,
-        2 => Tone::EffortHigh,
-        3 => Tone::EffortXHigh,
-        4 => Tone::EffortMax,
-        _ => Tone::EffortUltra,
-    }
-}
-
-fn plan_title_shimmer_spans(text: &str, phase: Option<f32>, effort_tone: Tone) -> Vec<PaintSpan> {
+fn plan_title_shimmer_spans(text: &str, phase: Option<f32>, agent_tone: Tone) -> Vec<PaintSpan> {
     let Some(phase) = phase else {
         return vec![PaintSpan {
             text: text.to_owned(),
@@ -9260,7 +9246,7 @@ fn plan_title_shimmer_spans(text: &str, phase: Option<f32>, effort_tone: Tone) -
     .map(|span| PaintSpan {
         tone: match span.tone {
             Tone::Shimmer(_, level) => Tone::PlanShimmer(
-                tone_rgb(effort_tone).unwrap_or(theme::palette().foreground),
+                tone_rgb(agent_tone).unwrap_or(theme::palette().foreground),
                 level,
             ),
             tone => tone,
@@ -12964,7 +12950,7 @@ mod tests {
             cwd: String::new(),
             plan_active: false,
             plan_shimmer_phase: None,
-            plan_effort: None,
+            plan_agent: AgentMode::Standard,
             editor,
             composer_images: &[],
             queued_prompts: Vec::new(),
@@ -23609,7 +23595,7 @@ mod tests {
             elapsed: None,
         };
 
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, true, None, None);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, true, None, AgentMode::Standard);
 
         assert_eq!(lines.len(), 11);
         assert!(painted(&lines[0]).starts_with("┌── Updated Plan · 0 / 7"));
@@ -23642,7 +23628,7 @@ mod tests {
         };
         for (rows, width) in [(18, 60), (24, 80), (32, 120)] {
             let answer_row = |summary: &PlanSummary| {
-                let plan = fixed_plan_summary_lines(summary, width, 0.0, true, None, None);
+                let plan = fixed_plan_summary_lines(summary, width, 0.0, true, None, AgentMode::Standard);
                 let plan_rows = plan.len();
                 let mut transcript = text_rows(40, "history");
                 transcript.last_mut().expect("answer row").text = "streamed answer".to_owned();
@@ -23773,7 +23759,7 @@ mod tests {
         assert_eq!(waiting[4].tone, Tone::Accent);
         assert!(waiting.iter().all(|line| !painted(line).contains('⏱')));
 
-        let waiting_card = fixed_plan_summary_lines(&finished, 80, 0.0, true, None, None);
+        let waiting_card = fixed_plan_summary_lines(&finished, 80, 0.0, true, None, AgentMode::Standard);
         assert!(painted(&waiting_card[0]).contains("Updated Plan · 2 / 3 Working"));
         assert_ne!(waiting_card[4].prefix, "  ✔  ");
         assert_eq!(waiting_card[4].prefix_tone, Tone::Accent);
@@ -24116,7 +24102,7 @@ mod tests {
             elapsed: None,
         };
 
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None, None);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None, AgentMode::Standard);
 
         assert!(painted(&lines[0]).ends_with(" Alt + W ▲ ─┐"));
         assert_eq!(UnicodeWidthStr::width(painted(&lines[0]).as_str()), 79);
@@ -24139,7 +24125,7 @@ mod tests {
             elapsed: None,
         };
 
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None, None);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None, AgentMode::Standard);
 
         assert_eq!(lines.len(), 2);
         assert!(painted(&lines[0]).starts_with("─── Updated Plan"));
@@ -24843,7 +24829,7 @@ mod tests {
             elapsed: None,
         };
 
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None, None);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None, AgentMode::Standard);
 
         assert!(painted(&lines[2]).contains("  ✔  Task 1"));
         assert!(painted(&lines[3]).contains("     Task 2"));
@@ -24867,7 +24853,7 @@ mod tests {
             elapsed: Some(Duration::from_secs(94)),
         };
 
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None, None);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.0, false, None, AgentMode::Standard);
         let elapsed_line = painted(&lines[3]);
         let bottom_border = painted(&lines[4]);
 
@@ -25089,8 +25075,8 @@ mod tests {
             started_at: Instant::now(),
             elapsed: Some(Duration::from_secs(63)),
         };
-        let active = fixed_plan_summary_lines(&summary, 80, 0.0, true, None, None);
-        let completed = fixed_plan_summary_lines(&summary, 80, 0.0, false, None, None);
+        let active = fixed_plan_summary_lines(&summary, 80, 0.0, true, None, AgentMode::Standard);
+        let completed = fixed_plan_summary_lines(&summary, 80, 0.0, false, None, AgentMode::Standard);
         let border_row = completed.len() - 1;
 
         let repainted =
@@ -25115,7 +25101,7 @@ mod tests {
             started_at: Instant::now(),
             elapsed: None,
         };
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.5, true, None, None);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.5, true, None, AgentMode::Standard);
         assert!(lines[2].prefix.contains('⠴'));
         assert_eq!(lines[2].text, "Working task");
         assert_eq!(lines[2].tone, Tone::Accent);
@@ -25124,18 +25110,7 @@ mod tests {
     }
 
     #[test]
-    fn active_plan_border_advances_effort_after_two_low_steps() {
-        assert_eq!(plan_effort_tone(1), Tone::EffortLow);
-        assert_eq!(plan_effort_tone(2), Tone::EffortLow);
-        assert_eq!(plan_effort_tone(3), Tone::EffortMedium);
-        assert_eq!(plan_effort_tone(4), Tone::EffortHigh);
-        assert_eq!(plan_effort_tone(5), Tone::EffortXHigh);
-        assert_eq!(plan_effort_tone(6), Tone::EffortMax);
-        assert_eq!(plan_effort_tone(7), Tone::EffortUltra);
-    }
-
-    #[test]
-    fn plan_update_shimmer_uses_the_active_request_effort() {
+    fn plan_update_shimmer_uses_the_selected_agent_role_colour() {
         let summary = PlanSummary {
             explanation: None,
             steps: (1..=7)
@@ -25151,7 +25126,7 @@ mod tests {
             elapsed: None,
         };
 
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.5, true, Some(0.5), Some("medium"));
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.5, true, Some(0.5), AgentMode::GoalRunner);
         let shimmer_colours = lines[0]
             .tail
             .iter()
@@ -25165,7 +25140,7 @@ mod tests {
         assert!(
             shimmer_colours
                 .iter()
-                .all(|colour| *colour == tone_rgb(Tone::EffortMedium).expect("effort colour"))
+                .all(|colour| *colour == tone_rgb(Tone::AgentGoalRunner).expect("agent colour"))
         );
     }
 
@@ -25174,7 +25149,7 @@ mod tests {
         assert_eq!(PLAN_SHIMMER_BAND, SHIMMER_BAND * 2.5);
         assert_eq!(PLAN_SHIMMER_LOOPS, 5.0);
         let title =
-            plan_title_shimmer_spans("Updated Plan · 1 / 3", Some(0.125), Tone::EffortMedium);
+            plan_title_shimmer_spans("Updated Plan · 1 / 3", Some(0.125), Tone::AgentPlanner);
 
         assert!(
             title
@@ -25182,7 +25157,7 @@ mod tests {
                 .any(|span| matches!(span.tone, Tone::PlanShimmer(_, _)))
         );
         assert_eq!(
-            plan_title_shimmer_spans("Updated Plan · 1 / 3", None, Tone::EffortMedium)[0].tone,
+            plan_title_shimmer_spans("Updated Plan · 1 / 3", None, Tone::AgentPlanner)[0].tone,
             Tone::Plain
         );
     }
@@ -25202,7 +25177,7 @@ mod tests {
             elapsed: None,
         };
 
-        let lines = fixed_plan_summary_lines(&summary, 80, 0.5, false, None, None);
+        let lines = fixed_plan_summary_lines(&summary, 80, 0.5, false, None, AgentMode::Standard);
 
         assert_eq!(lines[2].prefix, "  ▸  ");
         assert_eq!(lines[2].prefix_tone, Tone::Accent);

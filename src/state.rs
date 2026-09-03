@@ -6414,10 +6414,7 @@ impl AppState {
                 && self.response_display_mode == ResponseDisplayMode::Completed,
             plan_active: self.plan_is_active(),
             plan_shimmer_phase: self.plan_shimmer_phase(),
-            plan_effort: self
-                .active_turn_effort
-                .as_deref()
-                .or(self.pending_turn_effort.as_deref()),
+            plan_agent: self.agent_mode,
             editor: &self.editor,
             composer_images: &self.composer_images,
             queued_prompts: self.queued_prompts.iter().cloned().collect(),
@@ -6717,10 +6714,7 @@ impl AppState {
             plan_summary: self.visible_plan_summary(),
             plan_active: self.plan_is_active(),
             plan_shimmer_phase: self.plan_shimmer_phase(),
-            plan_effort: self
-                .active_turn_effort
-                .as_deref()
-                .or(self.pending_turn_effort.as_deref()),
+            plan_agent: self.agent_mode,
             composer_notice: self
                 .composer_notice
                 .as_ref()
