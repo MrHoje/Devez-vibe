@@ -598,10 +598,11 @@ async fn await_thread(
                 match event {
                     Some(Ok(Event::Key(key))) if preedit_capture.claims(&key) => {
                         match preedit_capture.observe(key) {
-                            PreeditInput::Update(text) => {
-                                flush_composer_paste_now(state, &mut composer_paste);
-                                Action::Tick(state.set_composer_preedit(&text))
-                            }
+                            PreeditInput::Update(text) => apply_composer_preedit_update(
+                                state,
+                                &mut composer_paste,
+                                &text,
+                            ),
                             _ => Action::None,
                         }
                     }
@@ -1520,11 +1521,12 @@ async fn event_loop(
                             PreeditInput::Update(text) => {
                                 let input_state =
                                     focused_state_mut(state, &mut btw_state, split_focus);
-                                // A syllable still in the paste batch was committed
-                                // before this preedit, so it lands first.
-                                flush_composer_paste_now(input_state, &mut composer_paste);
                                 input_log::record(|| format!("preedit {text:?}"));
-                                Action::Tick(input_state.set_composer_preedit(&text))
+                                apply_composer_preedit_update(
+                                    input_state,
+                                    &mut composer_paste,
+                                    &text,
+                                )
                             }
                             _ => Action::None,
                         }
@@ -5671,6 +5673,19 @@ fn flush_composer_paste_now(state: &mut AppState, buffer: &mut ComposerPasteBuff
     }
 }
 
+fn apply_composer_preedit_update(
+    state: &mut AppState,
+    buffer: &mut ComposerPasteBuffer,
+    text: &str,
+) -> Action {
+    // A syllable and the key that ended its composition can still be waiting in
+    // the paste classifier. Flushing them changes the editor even when that same
+    // text already settled the preedit, so either change must request a repaint.
+    let flushed = flush_composer_paste_now(state, buffer);
+    let preedit_changed = state.set_composer_preedit(text);
+    Action::Tick(flushed || preedit_changed)
+}
+
 fn flush_composer_paste(
     state: &mut AppState,
     buffer: &mut ComposerPasteBuffer,
@@ -6472,6 +6487,37 @@ mod tests {
         assert!(!buffer.is_buffering());
     }
 
+    #[test]
+    fn preedit_end_repaints_a_flushed_space_or_punctuation() {
+        for trailing in [' ', '('] {
+            let mut state = starting_state();
+            let mut buffer = ComposerPasteBuffer::new();
+            let t0 = Instant::now();
+            state.set_composer_preedit("가");
+
+            assert!(
+                buffer
+                    .observe(press(KeyCode::Char('가'), KeyModifiers::NONE), t0)
+                    .is_empty()
+            );
+            assert!(
+                buffer
+                    .observe(
+                        press(KeyCode::Char(trailing), KeyModifiers::NONE),
+                        t0 + Duration::from_millis(1),
+                    )
+                    .is_empty()
+            );
+
+            let action = apply_composer_preedit_update(&mut state, &mut buffer, "");
+
+            assert!(matches!(action, Action::Tick(true)));
+            assert_eq!(state.editor.text(), format!("가{trailing}"));
+            assert_eq!(state.view().composer_preedit, "");
+            assert!(!buffer.is_buffering());
+        }
+    }
+
     fn starting_state() -> AppState {
         AppState::new(
             String::new(),
@@ -6867,7 +6913,7 @@ mod tests {
             vec![ComposerInput::Key(press(KeyCode::Up, KeyModifiers::NONE))],
         );
         assert_eq!(state.editor.text(), "abcdefghijkl");
-        assert_eq!(state.editor.display_cursor(), 4);
+        assert_eq!(state.editor.display_cursor(), 2);
         assert_eq!(state.editor.history_position(), None);
 
         apply_composer_inputs_with_scroll(
