@@ -19,7 +19,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "한자 입력 진단을 마치고 배포용 로그를 제거했습니다.",
+    "한글 조합 밑줄이 글자의 하단 모음 획을 가리지 않도록 개선했습니다.",
+    "선택 목록의 클릭 영역과 키보드 전용 화면의 마우스 반응을 일관되게 개선했습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

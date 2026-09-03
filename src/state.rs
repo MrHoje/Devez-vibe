@@ -11250,7 +11250,7 @@ impl AppState {
                     lines,
                     slider: None,
                     hint: "↑↓ scroll  ·  Esc to return".to_owned(),
-                    style: OverlayStyle::Panel,
+                    style: OverlayStyle::KeyboardOnlyPanel,
                     input: None,
                     input_label: "",
                     input_placeholder: "",
@@ -11400,7 +11400,7 @@ impl AppState {
                 slider: None,
                 hint: "잠시 기다려 주세요.".to_owned(),
                 closable: false,
-                style: OverlayStyle::Panel,
+                style: OverlayStyle::KeyboardOnlyPanel,
                 input: None,
                 input_label: "",
                 input_placeholder: "",
@@ -11439,7 +11439,7 @@ impl AppState {
                     slider: None,
                     hint: "O Open browser  Enter Send code  Esc Cancel".to_owned(),
                     closable: false,
-                    style: OverlayStyle::Panel,
+                    style: OverlayStyle::KeyboardOnlyPanel,
                     input: Some(editor),
                     input_label: "인증 코드",
                     input_placeholder: "브라우저에 표시된 코드를 입력…",
@@ -11471,7 +11471,7 @@ impl AppState {
                 slider: None,
                 hint: "O 브라우저 다시 열기".to_owned(),
                 closable: false,
-                style: OverlayStyle::Panel,
+                style: OverlayStyle::KeyboardOnlyPanel,
                 input: None,
                 input_label: "",
                 input_placeholder: "",
@@ -11488,7 +11488,7 @@ impl AppState {
                     .map(|text| OverlayLine {
                         text: text.clone(),
                         selected: false,
-                        muted: false,
+                        muted: true,
                     })
                     .collect::<Vec<_>>();
                 lines.extend(choices.iter().enumerate().map(|(index, choice)| OverlayLine {
@@ -11539,7 +11539,7 @@ impl AppState {
                     lines,
                     slider: None,
                     hint: "↑↓ Select   Enter Confirm".to_owned(),
-                    style: OverlayStyle::Panel,
+                    style: OverlayStyle::KeyboardOnlyPanel,
                     input: None,
                     input_label: "",
                     input_placeholder: "",
@@ -11655,7 +11655,7 @@ impl AppState {
                     } else {
                         "↑↓ select   Enter next   Alt+D decline   Esc cancel".to_owned()
                     },
-                    style: OverlayStyle::Panel,
+                    style: OverlayStyle::KeyboardOnlyPanel,
                     input: text_input.then_some(&form.editor),
                     input_label: "Value",
                     input_placeholder: "",
@@ -11698,7 +11698,7 @@ impl AppState {
                 ],
                 slider: None,
                 hint: "o open   Enter continue   n decline   Esc cancel".to_owned(),
-                style: OverlayStyle::Panel,
+                style: OverlayStyle::KeyboardOnlyPanel,
                 input: None,
                 input_label: "",
                 input_placeholder: "",
@@ -11712,7 +11712,7 @@ impl AppState {
                     .map(|(index, method)| OverlayLine {
                         text: format!("{}. {}  ·  {}", index + 1, method.label(), method.detail()),
                         selected: index == *selected,
-                        muted: index != *selected,
+                        muted: false,
                     })
                     .collect(),
                 slider: None,
@@ -11741,7 +11741,7 @@ impl AppState {
                     .collect(),
                 slider: None,
                 hint: "Esc cancel".to_owned(),
-                style: OverlayStyle::Panel,
+                style: OverlayStyle::KeyboardOnlyPanel,
                 input: None,
                 input_label: "",
                 input_placeholder: "",
@@ -11752,7 +11752,7 @@ impl AppState {
                     .map(|text| OverlayLine {
                         text: text.clone(),
                         selected: false,
-                        muted: false,
+                        muted: true,
                     })
                     .collect::<Vec<_>>();
                 lines.push(OverlayLine {
@@ -12991,6 +12991,15 @@ impl AppState {
             {
                 self.pending = Some(PendingInteraction::StatusLinePicker { selected: row });
                 self.toggle_status_line_field(StatusLineField::ALL[row])
+            }
+            Some(PendingInteraction::LoginMethodPicker { selected }) => {
+                match LoginMethod::CHOICES.get(row).copied() {
+                    Some(method) => Action::StartLogin(method),
+                    None => {
+                        self.pending = Some(PendingInteraction::LoginMethodPicker { selected });
+                        Action::Tick(false)
+                    }
+                }
             }
             Some(PendingInteraction::SessionPicker(mut picker)) => match picker.click_row(row) {
                 SessionPickerResult::Select(thread_id) => Action::ResumeThread(thread_id),
@@ -19635,6 +19644,8 @@ mod tests {
         assert_eq!(overlay.lines.len(), LoginMethod::CHOICES.len());
         assert!(overlay.lines[0].text.starts_with("1. "));
         assert!(overlay.lines[0].selected);
+        assert!(matches!(overlay.style, OverlayStyle::Panel));
+        assert!(overlay.lines.iter().all(|line| !line.muted));
         assert_eq!(overlay.hint, "↑↓ select   Enter confirm   Esc cancel");
 
         state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -19647,6 +19658,12 @@ mod tests {
         state.run_slash_command("/login");
         let by_digit = state.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
         assert!(matches!(by_digit, Action::StartLogin(LoginMethod::Browser)));
+
+        state.run_slash_command("/login");
+        assert!(matches!(
+            state.click_overlay_row(1),
+            Action::StartLogin(LoginMethod::DeviceCode)
+        ));
     }
 
     #[test]

@@ -4,10 +4,11 @@
 //! to itself and only the committed syllable reaches the PTY. DevezCode's
 //! terminal paints its own preview over the cursor cell instead, which covers
 //! whatever the prompt already has to the right of the cursor. Once this
-//! process announces `devez-preedit-v1`, the host forwards every change of the
+//! process announces `devez-preedit-v2`, the host forwards every change of the
 //! preedit as ordinary input framed by two private-use characters, so the
 //! composer can draw the syllable in place and shift the rest of the prompt
-//! the way the committed character will.
+//! the way the committed character will. Version 2 leaves the visual underline
+//! to the host, which can place it below the terminal glyph instead of across it.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
@@ -19,7 +20,7 @@ pub const PREEDIT_END: char = '\u{E001}';
 /// Tells DevezCode that preedit frames are understood, so it may send them and
 /// stop painting its own preview.
 pub fn support_signal() -> String {
-    "\x1b]777;devez-preedit-v1;1\x07".to_owned()
+    "\x1b]777;devez-preedit-v2;1\x07".to_owned()
 }
 
 /// What a key turned out to be once the preedit frames are taken out.
@@ -112,6 +113,11 @@ mod tests {
             kind,
             state: KeyEventState::NONE,
         }
+    }
+
+    #[test]
+    fn support_signal_requests_host_owned_preedit_decoration() {
+        assert_eq!(support_signal(), "\x1b]777;devez-preedit-v2;1\x07");
     }
 
     #[test]

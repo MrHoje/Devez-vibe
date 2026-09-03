@@ -344,7 +344,11 @@ pub struct EffortSlider {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum OverlayStyle {
     Panel,
+    /// A panel whose rows respond to keys but do not handle pointer selection.
+    KeyboardOnlyPanel,
     CompactPanel,
+    /// A compact panel whose rows respond to keys but do not handle pointer selection.
+    KeyboardOnlyCompactPanel,
     Picker,
     SearchPicker {
         /// Whether the embedded search field owns the keyboard focus, and with
@@ -535,9 +539,9 @@ pub struct View<'a> {
     /// The agent role selected in the composer, used for the plan shimmer colour.
     pub plan_agent: AgentMode,
     pub editor: &'a Editor,
-    /// The syllable the host's IME is still composing, drawn underlined at the
-    /// cursor and pushing the rest of the prompt along like the committed
-    /// character will. Empty outside a composition.
+    /// The syllable the host's IME is still composing, drawn at the cursor and
+    /// pushing the rest of the prompt along like the committed character will.
+    /// The v2 host owns its underline. Empty outside a composition.
     pub composer_preedit: &'a str,
     pub composer_images: &'a [String],
     pub queued_prompts: Vec<String>,
@@ -4168,7 +4172,7 @@ fn cell_style(tone: Tone, bold: bool, background: Option<Rgb>, selected: bool) -
         background,
         bold,
         italic: tone == Tone::Thinking,
-        underlined: matches!(tone, Tone::MarkdownLink | Tone::ComposerPreedit),
+        underlined: tone == Tone::MarkdownLink,
         crossed_out: tone == Tone::PlanDone,
     }
 }
@@ -5277,7 +5281,7 @@ struct StatusArea {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tone {
     Plain,
-    /// Composer text the IME has not committed yet: foreground, underlined.
+    /// Composer text the IME has not committed yet: foreground, host-decorated.
     ComposerPreedit,
     Muted,
     /// Muted *and* italic: reserved for reasoning summaries.
@@ -6801,9 +6805,9 @@ fn split_panel_border(mut line: PaintLine, marker_tone: Tone) -> PaintLine {
 /// A row answers to a pointer across the whole inside of its box, not just the
 /// columns its label happens to reach: a one-word entry beside a wide box is a
 /// thin target, and the highlight reads as a button the row's width. The
-/// question box and the composer's own suggestion list go this wide; the
-/// pickers keep their region on their text. The two borders stay out of it
-/// either way, so pressing the box itself is never picking what it holds.
+/// question box, pickers and the composer's own suggestion list all go this
+/// wide. The two borders stay out of it, so pressing the box itself is never
+/// picking what it holds.
 fn pick_panel_interior(mut line: PaintLine, panel_width: usize, pick: Pick) -> PaintLine {
     line.pick = Some(PickRegions::span(1, panel_width.saturating_sub(1), pick));
     line
@@ -7019,23 +7023,6 @@ fn suggestion_lines(suggestions: &[SuggestionView], width: u16) -> Vec<PaintLine
 
 /// A picker row drawn the way the slash-command list draws its own: marker and
 /// name light up in the accent when selected, the description stays muted.
-/// Spans a name-and-description row paints between its borders, shared by the
-/// two-column pickers and the composer's suggestion list because both rows are
-/// built the same way. `0` is the row's own text — the single blank the left
-/// border leaves behind — so the marker lands on `1` and the description on
-/// `4`, with the gap and the name column in between.
-const PICKER_SUGGESTION_MARKER_SPAN: usize = 1;
-const PICKER_SUGGESTION_LAST_TEXT_SPAN: usize = 4;
-
-/// The click regions of a name-and-description row: the marker through the
-/// description, never the blank the left border leaves behind, whose bleed
-/// would carry the highlight onto the border itself.
-fn suggestion_row_picks(pick: impl Fn() -> Pick) -> Vec<(usize, Pick)> {
-    (PICKER_SUGGESTION_MARKER_SPAN..=PICKER_SUGGESTION_LAST_TEXT_SPAN)
-        .map(|span| (span, pick()))
-        .collect()
-}
-
 fn picker_suggestion_row(
     name: &str,
     description: &str,
@@ -7529,21 +7516,17 @@ fn overlay_frame_with_expansion(
                     continue;
                 }
                 if let Some((name, description)) = row.text.split_once('\u{1f}') {
-                    // The row spends its columns on a marker, a name and a
-                    // description, and all three are the offer: a region that
-                    // stopped at the marker left both columns dead to a click.
-                    // The padding out to the borders stays furniture.
-                    let picks = suggestion_row_picks(|| Pick::Row(row_index));
-                    lines.push(
+                    lines.push(pick_panel_interior(
                         picker_suggestion_row(
                             name,
                             description,
                             row.selected,
                             picker_name_width,
                             panel_width,
-                        )
-                        .with_picks(&picks),
-                    );
+                        ),
+                        panel_width,
+                        Pick::Row(row_index),
+                    ));
                     continue;
                 }
                 for (part_index, part) in row.text.lines().enumerate() {
@@ -7582,14 +7565,11 @@ fn overlay_frame_with_expansion(
                         let line = close_panel_row(line, panel_width);
                         // A muted row is the picker talking, not offering: a
                         // summary or a heading answers to no click, so it must
-                        // not light up as though it did. What is on offer is the
-                        // row's own text — the panel borders and the padding out
-                        // to them are furniture, and highlighting them would read
-                        // as the box itself being pressed.
+                        // not light up as though it did.
                         if row.muted {
                             line
                         } else {
-                            line.with_picks(&[(0, Pick::Row(row_index))])
+                            pick_panel_interior(line, panel_width, Pick::Row(row_index))
                         }
                     }));
                 }
@@ -7620,11 +7600,8 @@ fn overlay_frame_with_expansion(
             lines.push(panel_padding_row(panel_width));
             lines.push(panel_rule_row("╰─ ", &overlay.hint, '╯', panel_width));
         }
-        OverlayStyle::CompactPanel => {
-            /// `" ❯  "`: what a compact row spends before its own text starts.
-            /// The extra blank after the marker keeps the text on one column even
-            /// where the glyph is drawn two cells wide.
-            const COMPACT_ROW_GUTTER_COLUMNS: usize = 4;
+        OverlayStyle::CompactPanel | OverlayStyle::KeyboardOnlyCompactPanel => {
+            let mouse_rows = overlay.style == OverlayStyle::CompactPanel;
             /// Blank columns kept before the right border so a truncated row
             /// never crowds the box.
             const COMPACT_ROW_RIGHT_INSET: usize = 3;
@@ -7653,25 +7630,16 @@ fn overlay_frame_with_expansion(
                     },
                     row.selected,
                 );
-                if !row.muted {
-                    // The same span the taller pickers offer: the row's own text,
-                    // never the marker gutter, the borders, or the padding out to
-                    // them. Those are furniture, and lighting them up would read
-                    // as the box itself being pressed.
-                    let start =
-                        UnicodeWidthStr::width(line.prefix.as_str()) + COMPACT_ROW_GUTTER_COLUMNS;
-                    let end = UnicodeWidthStr::width(line.prefix.as_str())
-                        + UnicodeWidthStr::width(line.text.trim_end());
-                    if end > start {
-                        line.pick = Some(PickRegions::span(start, end, Pick::Row(row_index)));
-                    }
+                if mouse_rows && !row.muted {
+                    line = pick_panel_interior(line, panel_width, Pick::Row(row_index));
                 }
                 lines.push(line);
             }
             lines.push(panel_padding_row(panel_width));
             lines.push(panel_rule_row("╰─ ", &overlay.hint, '╯', panel_width));
         }
-        OverlayStyle::Panel => {
+        OverlayStyle::Panel | OverlayStyle::KeyboardOnlyPanel => {
+            let mouse_rows = overlay.style == OverlayStyle::Panel;
             // A closed box: every row lands on exactly `panel_width` columns.
             let panel_width = panel_span(width);
             lines.push(panel_rule_row_closable(
@@ -7724,14 +7692,11 @@ fn overlay_frame_with_expansion(
                         let line = close_panel_row(line, panel_width);
                         // A muted row is the picker talking, not offering: a
                         // summary or a heading answers to no click, so it must
-                        // not light up as though it did. What is on offer is the
-                        // row's own text — the panel borders and the padding out
-                        // to them are furniture, and highlighting them would read
-                        // as the box itself being pressed.
-                        if row.muted {
+                        // not light up as though it did.
+                        if row.muted || !mouse_rows {
                             line
                         } else {
-                            line.with_picks(&[(0, Pick::Row(row_index))])
+                            pick_panel_interior(line, panel_width, Pick::Row(row_index))
                         }
                     }));
                 }
@@ -11943,7 +11908,7 @@ fn input_lines_with_controls(
         .max(4);
     let mut raw_rows = vec![String::new()];
     let mut row_glyphs: Vec<Vec<ComposerGlyph>> = vec![Vec::new()];
-    // The preedit's characters within each row, so they can be underlined.
+    // The preedit's characters within each row, so they keep their own span.
     let mut row_preedit: Vec<Option<Range<usize>>> = vec![None];
     // One row exists before the first glyph lands, so the vec starts holding
     // that row's empty range rather than a range of rows.
@@ -12119,8 +12084,8 @@ fn input_lines_with_controls(
 }
 
 /// A composer row's spans with the preedit at `preedit` (in characters of
-/// `content`) underlined in place. The text around it is highlighted as usual;
-/// the preedit itself is never a command token.
+/// `content`) tagged in place. The text around it is highlighted as usual; the
+/// preedit itself is never a command token and its underline belongs to the host.
 fn composer_spans_with_preedit(
     content: &str,
     preedit: Range<usize>,
@@ -13150,7 +13115,7 @@ fn set_tone(out: &mut impl Write, tone: Tone) -> Result<()> {
     if tone == Tone::Thinking {
         queue!(out, SetAttribute(Attribute::Italic))?;
     }
-    if matches!(tone, Tone::MarkdownLink | Tone::ComposerPreedit) {
+    if tone == Tone::MarkdownLink {
         queue!(out, SetAttribute(Attribute::Underlined))?;
     }
     if tone == Tone::PlanDone {
@@ -14234,24 +14199,22 @@ mod tests {
     }
 
     #[test]
-    fn probe_preedit_transition_bytes() {
-        let underlined = CellStyle {
-            underlined: true,
-            ..CellStyle::plain()
-        };
+    fn preedit_transition_bytes_do_not_enable_a_terminal_underline() {
+        let preedit = CellStyle::plain();
         let mut a = CellFrame::new(30, 1);
         a.write(0, 0, "❯ ", CellStyle::plain());
-        a.write(2, 0, "안", underlined);
+        a.write(2, 0, "안", preedit);
         let mut b = CellFrame::new(30, 1);
         b.write(0, 0, "❯ 안", CellStyle::plain());
-        b.write(4, 0, "ㄴ", underlined);
+        b.write(4, 0, "ㄴ", preedit);
         let mut c = CellFrame::new(30, 1);
         c.write(0, 0, "❯ 안", CellStyle::plain());
-        c.write(4, 0, "녀", underlined);
+        c.write(4, 0, "녀", preedit);
         for (previous, current) in [(&a, &b), (&b, &c)] {
             let mut out = Vec::new();
             emit_frame_diff(&mut out, Some(previous), current).expect("diff emits");
-            println!("{:?}", String::from_utf8(out).expect("utf8"));
+            let output = String::from_utf8(out).expect("utf8");
+            assert!(!output.contains("\x1b[4m"));
         }
     }
 
@@ -16868,6 +16831,19 @@ mod tests {
         set_tone(&mut output, Tone::MarkdownLink).expect("link tone renders");
         assert!(
             String::from_utf8(output)
+                .expect("terminal bytes are UTF-8")
+                .contains("\x1b[4m")
+        );
+    }
+
+    #[test]
+    fn preedit_underlining_is_left_to_the_v2_host_in_both_render_modes() {
+        assert!(!cell_style(Tone::ComposerPreedit, false, None, false).underlined);
+
+        let mut output = Vec::new();
+        set_tone(&mut output, Tone::ComposerPreedit).expect("preedit tone renders");
+        assert!(
+            !String::from_utf8(output)
                 .expect("terminal bytes are UTF-8")
                 .contains("\x1b[4m")
         );
@@ -22655,11 +22631,9 @@ mod tests {
         assert!(renderer.painted_frame.is_some());
     }
 
-    /// A picker row that carries a name and a description column offers both:
-    /// the click region reaches from the marker through the description, and
-    /// stops on the last painted character rather than running to the border.
+    /// A two-column picker uses the same full-row target as every other picker.
     #[test]
-    fn two_column_picker_row_click_region_covers_the_name_and_description() {
+    fn two_column_picker_row_click_region_covers_the_whole_row() {
         let frame = overlay_frame(
             &[],
             OverlayView {
@@ -22696,23 +22670,7 @@ mod tests {
             .as_ref()
             .and_then(|regions| regions.columns_of(&Pick::Row(0)))
             .expect("the option row answers to a click");
-        let painted = painted(line);
-        let description_end = painted
-            .find("구현한다")
-            .map(|byte| UnicodeWidthStr::width(&painted[..byte]) + UnicodeWidthStr::width("구현한다"))
-            .expect("the description column is painted");
-        assert!(
-            (1..=2).contains(&columns.start),
-            "region must open after the left border and reach the marker: {columns:?}"
-        );
-        assert!(
-            columns.end >= description_end,
-            "region stops short of the description: {columns:?}"
-        );
-        assert!(
-            columns.end < painted_line_width(line) - 1,
-            "region must stop on the text, not run to the border: {columns:?}"
-        );
+        assert_eq!(columns, 1..painted_line_width(line) - 1);
     }
 
     #[test]
@@ -23271,7 +23229,9 @@ mod tests {
                 input_focused: true,
             },
             OverlayStyle::Panel,
+            OverlayStyle::KeyboardOnlyPanel,
             OverlayStyle::CompactPanel,
+            OverlayStyle::KeyboardOnlyCompactPanel,
             OverlayStyle::Question,
         ] {
             let frame = overlay_frame(
@@ -23629,10 +23589,9 @@ mod tests {
         assert_eq!(pick_on(&rule, "Vibe: On"), Some(Pick::VibeMode));
     }
 
-    /// A row offers its own text, so the highlight runs from the number to the end
-    /// of the name and leaves both borders alone.
+    /// A selectable picker entry owns the whole row between its borders.
     #[test]
-    fn hovering_a_picker_row_lights_its_text_and_not_the_borders() {
+    fn hovering_a_picker_row_lights_the_whole_row_inside_the_borders() {
         let frame = overlay_frame(
             &[],
             OverlayView {
@@ -23665,26 +23624,19 @@ mod tests {
             .find(|line| painted(line).contains("GPT-5.6 Sol"))
             .expect("the model row");
 
-        let painted_row = painted(row);
-        let start = UnicodeWidthStr::width(&painted_row[..painted_row.find('1').unwrap()]);
-        let end = start + UnicodeWidthStr::width("1. GPT-5.6 Sol") + 1;
         assert_eq!(
             Renderer::hover_columns(row, None, Some(&Pick::Row(0))),
-            Some(start - 1..end)
+            Some(1..painted_line_width(row) - 1)
         );
-        // Both borders stay outside the highlight even with the column of bleed.
-        assert!(start > 1);
-        assert!(end < painted_line_width(row));
         assert_eq!(
             Renderer::hover_columns(row, None, Some(&Pick::Row(1))),
             None
         );
     }
 
-    /// A compact row offers the same span a taller picker's row does: its own
-    /// text, with the marker gutter, the inset and both borders left out.
+    /// Compact lists use the same full-row target as the taller pickers.
     #[test]
-    fn hovering_a_compact_row_lights_its_text_and_not_the_furniture() {
+    fn hovering_a_compact_row_lights_the_whole_row_inside_the_borders() {
         let frame = overlay_frame(
             &[],
             OverlayView {
@@ -23717,18 +23669,103 @@ mod tests {
             .find(|line| painted(line).contains("Fix the picker"))
             .expect("the session row");
 
-        let painted_row = painted(row);
-        let start = UnicodeWidthStr::width(&painted_row[..painted_row.find('2').unwrap()]);
         assert_eq!(
             Renderer::hover_columns(row, None, Some(&Pick::Row(0))),
-            Some(start..start + UnicodeWidthStr::width("2h ago    Fix the picker"))
+            Some(1..painted_line_width(row) - 1)
         );
-        // The border and the `❯` gutter lead the row; the inset and the closing
-        // border trail it. None of them light up.
-        assert!(start > 1);
-        assert!(
-            start + UnicodeWidthStr::width("2h ago    Fix the picker") < painted_line_width(row)
-        );
+    }
+
+    #[test]
+    fn panel_and_search_picker_rows_light_the_whole_row_inside_the_borders() {
+        for style in [
+            OverlayStyle::Panel,
+            OverlayStyle::SearchPicker {
+                input_focused: false,
+            },
+        ] {
+            let frame = overlay_frame(
+                &[],
+                OverlayView {
+                    closable: false,
+                    title: "Options".to_owned(),
+                    lines: vec![OverlayLine {
+                        text: "Selectable option".to_owned(),
+                        selected: true,
+                        muted: false,
+                    }],
+                    slider: None,
+                    hint: "Enter select".to_owned(),
+                    style,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                },
+                None,
+                StatusArea {
+                    fallback: String::new(),
+                    line: None,
+                    composer_notice: None,
+                    composer_mode: None,
+                },
+                80,
+            );
+            let row = frame
+                .lines
+                .iter()
+                .find(|line| painted(line).contains("Selectable option"))
+                .expect("the option row");
+
+            assert_eq!(
+                Renderer::hover_columns(row, None, Some(&Pick::Row(0))),
+                Some(1..painted_line_width(row) - 1)
+            );
+        }
+    }
+
+    #[test]
+    fn keyboard_only_rows_do_not_advertise_pointer_selection() {
+        for style in [
+            OverlayStyle::KeyboardOnlyPanel,
+            OverlayStyle::KeyboardOnlyCompactPanel,
+        ] {
+            let frame = overlay_frame(
+                &[],
+                OverlayView {
+                    closable: false,
+                    title: "Options".to_owned(),
+                    lines: vec![OverlayLine {
+                        text: "Keyboard option".to_owned(),
+                        selected: true,
+                        muted: false,
+                    }],
+                    slider: None,
+                    hint: "Enter select".to_owned(),
+                    style,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                },
+                None,
+                StatusArea {
+                    fallback: String::new(),
+                    line: None,
+                    composer_notice: None,
+                    composer_mode: None,
+                },
+                80,
+            );
+            let row = frame
+                .lines
+                .iter()
+                .find(|line| painted(line).contains("Keyboard option"))
+                .expect("the keyboard-only row");
+
+            assert!(row.pick.is_none());
+            assert_eq!(
+                Renderer::hover_columns(row, None, Some(&Pick::Row(0))),
+                None
+            );
+        }
     }
 
     /// The panel border shifts every column of the track along with it, so the
@@ -23962,7 +23999,7 @@ mod tests {
     }
 
     #[test]
-    fn a_preedit_is_drawn_underlined_at_the_cursor_and_moves_the_tail_along() {
+    fn a_preedit_is_drawn_at_the_cursor_and_moves_the_tail_along() {
         let mut editor = Editor::default();
         editor.set_text("가나");
         editor.move_left();

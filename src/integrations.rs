@@ -548,7 +548,7 @@ impl McpPicker {
                 .notice
                 .clone()
                 .unwrap_or_else(|| "Move ↑↓  ·  Toggle Space  ·  Details Enter  ·  Sign in L  ·  Reconnect Ctrl+R  ·  Close Esc".to_owned()),
-            style: OverlayStyle::CompactPanel,
+            style: OverlayStyle::KeyboardOnlyCompactPanel,
             input: Some(&self.query),
             input_label: "",
             input_placeholder: "서버 또는 도구 이름으로 검색…",
@@ -567,7 +567,7 @@ impl McpPicker {
                 }],
                 slider: None,
                 hint: "Esc Back".to_owned(),
-                style: OverlayStyle::Panel,
+                style: OverlayStyle::KeyboardOnlyPanel,
                 input: None,
                 input_label: "",
                 input_placeholder: "",
@@ -654,7 +654,7 @@ impl McpPicker {
             lines,
             slider: None,
             hint,
-            style: OverlayStyle::CompactPanel,
+            style: OverlayStyle::KeyboardOnlyCompactPanel,
             input: None,
             input_label: "",
             input_placeholder: "",
@@ -1507,7 +1507,7 @@ impl PluginPicker {
                 .unwrap_or_else(|| {
                     "Move ↑↓  ·  Open Enter  ·  Marketplaces M  ·  Close Esc".to_owned()
                 }),
-            style: OverlayStyle::CompactPanel,
+            style: OverlayStyle::KeyboardOnlyCompactPanel,
             input: None,
             input_label: "",
             input_placeholder: "",
@@ -1576,7 +1576,7 @@ impl PluginPicker {
                 .notice
                 .clone()
                 .unwrap_or_else(|| "Move ↑↓  ·  Toggle Space  ·  Details Enter  ·  Back Esc".to_owned()),
-            style: OverlayStyle::CompactPanel,
+            style: OverlayStyle::KeyboardOnlyCompactPanel,
             input: Some(&self.query),
             input_label: "",
             input_placeholder: "플러그인 검색…",
@@ -1708,7 +1708,7 @@ impl PluginPicker {
                 }],
                 slider: None,
                 hint: "Esc Back".to_owned(),
-                style: OverlayStyle::Panel,
+                style: OverlayStyle::KeyboardOnlyPanel,
                 input: None,
                 input_label: "",
                 input_placeholder: "",
@@ -1744,7 +1744,7 @@ impl PluginPicker {
             lines,
             slider: None,
             hint: self.notice.clone().unwrap_or_else(|| actions.join("  ")),
-            style: OverlayStyle::CompactPanel,
+            style: OverlayStyle::KeyboardOnlyCompactPanel,
             input: None,
             input_label: "",
             input_placeholder: "",
@@ -1930,7 +1930,7 @@ impl MarketplacePicker {
                     .notice
                     .clone()
                     .unwrap_or_else(|| "Enter Add  Esc Cancel".to_owned()),
-                style: OverlayStyle::Panel,
+                style: OverlayStyle::KeyboardOnlyPanel,
                 input: Some(source),
                 input_label: "Source",
                 input_placeholder: "owner/repo 또는 ./path",
@@ -1975,7 +1975,7 @@ impl MarketplacePicker {
             hint: self.notice.clone().unwrap_or_else(|| {
                 "A Add  X Remove  U Refresh all Git marketplaces  Esc Back".to_owned()
             }),
-            style: OverlayStyle::CompactPanel,
+            style: OverlayStyle::KeyboardOnlyCompactPanel,
             input: None,
             input_label: "",
             input_placeholder: "",
@@ -2103,7 +2103,10 @@ mod tests {
         let mcp_picker = McpPicker::new(servers);
         let mcp = mcp_picker.overlay_view();
         assert_eq!(mcp.lines.len(), MANAGEMENT_ROWS);
-        assert!(matches!(mcp.style, OverlayStyle::CompactPanel));
+        assert!(matches!(
+            mcp.style,
+            OverlayStyle::KeyboardOnlyCompactPanel
+        ));
         assert!(mcp.lines[0].text.contains("도구 1개"));
         assert!(mcp.lines.iter().all(|line| !line.text.contains('\n')));
 
@@ -2113,14 +2116,20 @@ mod tests {
         );
         let plugins = plugin_picker.overlay_view();
         assert_eq!(plugins.lines.len(), MANAGEMENT_ROWS);
-        assert!(matches!(plugins.style, OverlayStyle::CompactPanel));
+        assert!(matches!(
+            plugins.style,
+            OverlayStyle::KeyboardOnlyCompactPanel
+        ));
         assert!(plugins.lines.iter().all(|line| !line.text.contains('\n')));
 
         let catalog = PluginCatalog::from_value(&plugin_response());
         let marketplace_picker = MarketplacePicker::new(catalog.marketplaces);
         let marketplaces = marketplace_picker.overlay_view();
         assert_eq!(marketplaces.lines.len(), MANAGEMENT_ROWS);
-        assert!(matches!(marketplaces.style, OverlayStyle::CompactPanel));
+        assert!(matches!(
+            marketplaces.style,
+            OverlayStyle::KeyboardOnlyCompactPanel
+        ));
         assert!(
             marketplaces
                 .lines
