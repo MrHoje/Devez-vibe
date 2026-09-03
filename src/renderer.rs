@@ -1054,7 +1054,7 @@ fn devez_composer_hint_signal(columns: usize) -> String {
 
 fn composer_hint_columns(editor: &Editor, composer_images: &[String], placeholder: &str) -> usize {
     if editor.is_empty() && composer_images.is_empty() && !placeholder.is_empty() {
-        1 + UnicodeWidthStr::width(placeholder)
+        UnicodeWidthStr::width(placeholder)
     } else {
         0
     }
@@ -11805,13 +11805,10 @@ fn input_lines_with_controls(
     {
         let is_placeholder = editor.is_empty() && composer_images.is_empty() && index == 0;
         let content = if is_placeholder {
-            // The cursor rests on the first cell after the prompt prefix, so a
-            // hint that started there would be read through the cursor block.
-            // One blank column keeps both legible.
             if placeholder.is_empty() {
                 String::new()
             } else {
-                format!(" {placeholder}")
+                placeholder.to_owned()
             }
         } else {
             raw
@@ -17156,6 +17153,17 @@ mod tests {
             Some(Tone::ModelTerra)
         );
         assert_eq!(rows.last().map(|line| line.tone), Some(Tone::ModelTerra));
+    }
+
+    #[test]
+    fn empty_composer_hints_have_no_leading_padding() {
+        let editor = Editor::default();
+
+        for hint in ["Tab: Change dvz agent", "Enter: steer · Alt+Enter: queue"] {
+            let (rows, _, _, _) = input_lines(&editor, &[], 80, "", hint, None, None);
+            assert!(painted(&rows[1]).starts_with(&format!("│ > {hint}")));
+            assert!(!painted(&rows[1]).starts_with(&format!("│ >  {hint}")));
+        }
     }
 
     /// A specialized role colours the `>` glyph with its own tone.
@@ -23571,7 +23579,7 @@ mod tests {
         let empty = Editor::default();
         assert_eq!(
             devez_composer_hint_signal(composer_hint_columns(&empty, &[], "Tab: Change dvz agent")),
-            "\x1b]777;devez-composer-hint-v1;22\x07"
+            "\x1b]777;devez-composer-hint-v1;21\x07"
         );
 
         let mut typed = Editor::default();
