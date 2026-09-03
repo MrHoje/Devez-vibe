@@ -3608,9 +3608,9 @@ pub struct AppState {
     /// submitted prompts and steers, this includes answers to blocking questions
     /// so response grouping cannot move later provider output above that answer.
     turn_response_boundaries: Vec<Block>,
-    /// Prompt cards cancelled while startup still owns their text and before any
-    /// provider request was sent. The renderer may already own them, so their ids
-    /// cross the state boundary once and trigger a transcript rebuild.
+    /// User prompt cards withdrawn by an interrupt before assistant text began.
+    /// The renderer may already own them, so their ids cross the state boundary
+    /// once and trigger a transcript rebuild.
     discarded_prompt_ids: Vec<u64>,
     response_grouped: bool,
     response_collapse: Option<ResponseCollapseTransition>,
@@ -4709,7 +4709,7 @@ impl AppState {
     /// Drops a prompt that was queued before the thread existed, so Ctrl+C reads
     /// the same as interrupting a live turn.
     pub fn cancel_queued_prompt(&mut self) {
-        self.discard_unsent_turn_prompts();
+        self.discard_unanswered_turn_prompts();
         self.last_completed_duration = self.turn_started_at.map(|started| started.elapsed());
         self.last_completed_at = self.last_completed_duration.map(|_| chrono::Local::now());
         self.turn_interrupted = self.last_completed_duration.is_some();
@@ -5691,13 +5691,18 @@ impl AppState {
         };
         let prompt_history = turns
             .iter()
+            .filter(|turn| !unanswered_cancelled_turn(turn))
             .filter_map(|turn| turn.get("items").and_then(Value::as_array))
             .flatten()
             .filter_map(user_message_text)
             .collect::<Vec<_>>();
         self.editor.replace_history(prompt_history);
         self.turn_interrupted = false;
-        self.last_completed_duration = turns.iter().rev().find_map(completed_turn_duration);
+        self.last_completed_duration = turns
+            .iter()
+            .rev()
+            .filter(|turn| !unanswered_cancelled_turn(turn))
+            .find_map(completed_turn_duration);
         // 재개한 스레드는 지난 턴이 끝난 시각을 알려 주지 않아 시각을 비워 둔다.
         self.last_completed_at = None;
         // Neither the turn nor the rollout names a model for every prompt — a
@@ -5706,6 +5711,9 @@ impl AppState {
         // the plain accent.
         let resumed_model = self.selected_model_name().to_owned();
         for turn in turns {
+            if unanswered_cancelled_turn(turn) {
+                continue;
+            }
             let Some(items) = turn.get("items").and_then(Value::as_array) else {
                 continue;
             };
@@ -5993,6 +6001,7 @@ impl AppState {
     /// Interrupt an active turn immediately, or remember the request until the
     /// app-server announces that a just-started turn is active.
     fn request_interrupt(&mut self) -> Action {
+        self.discard_unanswered_turn_prompts();
         // Before `thread/start` binds a session, the main-loop startup helper
         // owns queued-prompt cancellation. Keep its established Ctrl+C/Esc
         // path rather than treating that as a pending turn.
@@ -6017,7 +6026,7 @@ impl AppState {
         Action::Tick(true)
     }
 
-    fn discard_unsent_turn_prompts(&mut self) {
+    fn discard_unanswered_turn_prompts(&mut self) {
         if self.turn_response_visible || self.turn_prompts.is_empty() {
             return;
         }
@@ -14684,6 +14693,29 @@ fn completed_turn_duration(turn: &Value) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
+/// A provider may persist the user's text before an immediate interrupt lands.
+/// Keep completed and visibly answered turns, but mirror the live transcript by
+/// omitting an interrupted turn that never produced assistant text.
+fn unanswered_cancelled_turn(turn: &Value) -> bool {
+    let cancelled = matches!(
+        turn.get("status").and_then(Value::as_str),
+        Some("aborted" | "cancelled" | "canceled" | "interrupted")
+    );
+    cancelled
+        && !turn
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|item| {
+                item.get("type").and_then(Value::as_str) == Some("agentMessage")
+                    && item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty())
+            })
+}
+
 fn group_turn_response(blocks: Vec<Block>) -> Vec<Block> {
     let assistant_indices = blocks
         .iter()
@@ -21051,6 +21083,59 @@ mod tests {
     }
 
     #[test]
+    fn resume_omits_unanswered_cancelled_prompts_but_keeps_answered_interrupts() {
+        let mut state = test_state();
+        state.load_history(
+            &json!({
+                "turns": [
+                    {
+                        "status": "completed",
+                        "durationMs": 1_000,
+                        "items": [{
+                            "type": "userMessage",
+                            "content": [{ "type": "text", "text": "완료한 요청" }]
+                        }]
+                    },
+                    {
+                        "status": "interrupted",
+                        "durationMs": 9_000,
+                        "items": [{
+                            "type": "userMessage",
+                            "content": [{ "type": "text", "text": "즉시 취소한 요청" }]
+                        }]
+                    },
+                    {
+                        "status": "aborted",
+                        "durationMs": 3_000,
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "content": [{ "type": "text", "text": "응답 뒤 중단한 요청" }]
+                            },
+                            { "id": "answer", "type": "agentMessage", "text": "일부 응답" }
+                        ]
+                    }
+                ]
+            }),
+            None,
+        );
+
+        let prompts = state
+            .committed
+            .iter()
+            .filter(|block| matches!(block.kind, BlockKind::User))
+            .map(|block| block.body.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(prompts, ["완료한 요청", "응답 뒤 중단한 요청"]);
+        assert_eq!(state.last_completed_duration, Some(Duration::from_secs(3)));
+
+        state.editor.history_previous();
+        assert_eq!(state.editor.text(), "응답 뒤 중단한 요청");
+        state.editor.history_previous();
+        assert_eq!(state.editor.text(), "완료한 요청");
+    }
+
+    #[test]
     fn completed_turn_records_its_elapsed_time_on_the_last_prompt() {
         let mut state = test_state();
         state.editor.set_text("응답 시간을 기록해");
@@ -22545,9 +22630,9 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_before_assistant_text_keeps_the_sent_prompt() {
+    fn interrupt_before_assistant_text_discards_the_sent_prompt() {
         let mut state = test_state();
-        state.editor.set_text("빠르게 중단한 요청");
+        state.editor.set_text("표시하지 않을 요청");
         assert!(matches!(state.submit_editor(), Action::Submit(_)));
         let prompt = state.drain_committed().pop().expect("submitted prompt");
         state.set_turn_started("turn-1".to_owned());
@@ -22557,13 +22642,13 @@ mod tests {
             Action::Interrupt
         ));
 
-        assert!(state.take_discarded_prompt_ids().is_empty());
-        assert_eq!(state.turn_prompts.last().map(Block::id), Some(prompt.id()));
+        assert_eq!(state.take_discarded_prompt_ids(), vec![prompt.id()]);
+        assert!(state.turn_prompts.is_empty());
         assert!(state.drain_committed().is_empty());
     }
 
     #[test]
-    fn interrupt_before_turn_started_keeps_the_sent_prompt() {
+    fn interrupt_before_turn_started_discards_the_sent_prompt() {
         let mut state = test_state();
         state.editor.set_text("시작 확인 전 중단한 요청");
         assert!(matches!(state.submit_editor(), Action::Submit(_)));
@@ -22573,8 +22658,8 @@ mod tests {
             state.handle_key(KeyEvent::from(KeyCode::Esc)),
             Action::Tick(true)
         ));
-        assert!(state.take_discarded_prompt_ids().is_empty());
-        assert_eq!(state.turn_prompts.last().map(Block::id), Some(prompt.id()));
+        assert_eq!(state.take_discarded_prompt_ids(), vec![prompt.id()]);
+        assert!(state.turn_prompts.is_empty());
     }
 
     #[test]
@@ -22603,7 +22688,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_before_a_received_delta_is_painted_keeps_the_prompt() {
+    fn interrupt_before_a_received_delta_is_painted_discards_the_prompt() {
         let mut state = test_state();
         state.editor.set_text("아직 표시되지 않은 요청");
         assert!(matches!(state.submit_editor(), Action::Submit(_)));
@@ -22618,8 +22703,8 @@ mod tests {
             state.handle_key(KeyEvent::from(KeyCode::Esc)),
             Action::Interrupt
         ));
-        assert!(state.take_discarded_prompt_ids().is_empty());
-        assert_eq!(state.turn_prompts.last().map(Block::id), Some(prompt.id()));
+        assert_eq!(state.take_discarded_prompt_ids(), vec![prompt.id()]);
+        assert!(state.turn_prompts.is_empty());
     }
 
     #[test]

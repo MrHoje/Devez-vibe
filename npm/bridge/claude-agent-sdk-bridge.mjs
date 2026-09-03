@@ -2902,7 +2902,16 @@ function historyState(messages) {
     tasks,
     turns: turns
     .filter((candidate) => !candidate.synthetic)
-    .map(({ synthetic: _, ...candidate }) => candidate),
+    .map(({ synthetic: _, ...candidate }) => {
+      const answered = candidate.items.some((item) =>
+        item.type === "agentMessage" && String(item.text || "").trim());
+      // Claude persists the user record before an immediate interrupt. Native
+      // resume hides that dangling prompt, so expose it as interrupted for the
+      // common host history filter instead of calling every transcript turn
+      // completed.
+      if (!answered) candidate.status = "interrupted";
+      return candidate;
+    }),
   };
 }
 
@@ -3599,6 +3608,10 @@ async function runSelfTest() {
     || prompts.some((prompt, index) => prompt?.content?.[0]?.text !== expected[index][0]
       || prompt.model !== expected[index][1])) {
     throw new Error(`Claude history self-test failed: ${JSON.stringify(turns)}`);
+  }
+  const interrupted = historyTurns([user("cancelled", "취소한 요청")]);
+  if (interrupted.length !== 1 || interrupted[0].status !== "interrupted") {
+    throw new Error(`Claude interrupted prompt history self-test failed: ${JSON.stringify(interrupted)}`);
   }
   const taskUse = (uuid, id, name, input) => ({
     type: "assistant",
