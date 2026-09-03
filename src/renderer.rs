@@ -2711,14 +2711,16 @@ impl Renderer {
         if width != self.last_width {
             queue!(self.out, Print(devez_layout_signal(width)))?;
         }
-        queue!(
-            self.out,
-            Print(devez_composer_hint_signal(composer_hint_columns(
-                view.editor,
-                view.composer_images,
-                view.composer_placeholder,
-            )))
-        )?;
+        // The host masks the placeholder hint while an IME preedit sits over it
+        // and drops that mask as soon as this signal reports zero columns. The
+        // signal therefore has to follow the frame that repaints the composer
+        // row: sent ahead of it, the mask lifts while the hint text is still on
+        // screen and the hint flashes once before the committed syllable lands.
+        let composer_hint_signal = devez_composer_hint_signal(composer_hint_columns(
+            view.editor,
+            view.composer_images,
+            view.composer_placeholder,
+        ));
         let frame_width = width;
         // Fullscreen assistant output shares the transcript surface with its
         // completed form. Keeping active and completed text on one surface
@@ -2774,7 +2776,7 @@ impl Renderer {
         self.side_panel_footer = side_panel_footer;
 
         if self.mode == RenderMode::Fullscreen {
-            return self.render_fullscreen(
+            self.render_fullscreen(
                 committed,
                 frame,
                 width,
@@ -2793,7 +2795,10 @@ impl Renderer {
                 view.stream_fade_tail,
                 streamed_lines,
                 streamed_rows,
-            );
+            )?;
+            queue!(self.out, Print(composer_hint_signal))?;
+            self.out.flush()?;
+            return Ok(());
         }
 
         let max_live = height.max(3) as usize;
@@ -2858,6 +2863,7 @@ impl Renderer {
         self.last_width = width;
         self.last_total_width = total_width;
         self.last_height = height;
+        queue!(self.out, Print(composer_hint_signal))?;
         self.out.flush()?;
         Ok(())
     }
