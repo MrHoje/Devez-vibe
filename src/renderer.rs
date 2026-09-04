@@ -2688,9 +2688,15 @@ impl Renderer {
         )
     }
 
-    fn remove_startup_update_from_history(&mut self) -> bool {
+    fn remove_startup_update_from_history(&mut self, include_welcome: bool) -> bool {
         let before = self.history.len();
-        self.history.retain(|block| !is_startup_banner(block));
+        self.history.retain(|block| {
+            if include_welcome {
+                !is_startup_banner(block)
+            } else {
+                !is_startup_update(block)
+            }
+        });
         let removed = self.history.len() != before;
         if removed {
             self.wrapped_width = 0;
@@ -2744,10 +2750,24 @@ impl Renderer {
         set_chat_layout(view.chat_layout);
         self.observe_question_overlay(view.overlay.as_ref().map(|overlay| overlay.style));
         let response_collapse_changed = self.update_response_collapse(view.response_collapse);
-        let committed_without_startup = view.plan_summary.is_some().then(|| {
+        // The welcome masthead survives until the first plan, but the tip card is
+        // only a launch hint: the first prompt the user sends takes it away.
+        let drop_welcome = view.plan_summary.is_some();
+        let drop_tip = drop_welcome
+            || committed
+                .iter()
+                .chain(self.history.iter())
+                .any(|block| matches!(block.kind, BlockKind::User));
+        let committed_without_startup = drop_tip.then(|| {
             committed
                 .iter()
-                .filter(|block| !is_startup_banner(block))
+                .filter(|block| {
+                    if drop_welcome {
+                        !is_startup_banner(block)
+                    } else {
+                        !is_startup_update(block)
+                    }
+                })
                 .cloned()
                 .collect::<Vec<_>>()
         });
@@ -2766,7 +2786,7 @@ impl Renderer {
             self.history_view_start_anchor = None;
         }
         let startup_update_removed =
-            view.plan_summary.is_some() && self.remove_startup_update_from_history();
+            drop_tip && self.remove_startup_update_from_history(drop_welcome);
         if self.mode == RenderMode::Inline
             && (mode_changed || startup_update_removed)
             && !response_collapse_changed
@@ -16230,7 +16250,7 @@ mod tests {
             renderer.history = vec![startup, available, answer];
             renderer.wrapped_width = 80;
 
-            assert!(renderer.remove_startup_update_from_history());
+            assert!(renderer.remove_startup_update_from_history(true));
             assert_eq!(
                 renderer
                     .history
@@ -16240,8 +16260,26 @@ mod tests {
                 ["Update Available", "Codex"]
             );
             assert_eq!(renderer.wrapped_width, 0);
-            assert!(!renderer.remove_startup_update_from_history());
+            assert!(!renderer.remove_startup_update_from_history(true));
         }
+    }
+
+    #[test]
+    fn first_prompt_removes_the_tip_but_keeps_the_welcome() {
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.history = vec![
+            Block::welcome("Codex", "Super Vibe", "D:\\hojeSource\\Devez-vibe", "", &[]),
+            Block::new(BlockKind::Update, "Tip", "/provider"),
+            Block::new(BlockKind::User, "Codex", "첫 프롬프트"),
+        ];
+        renderer.wrapped_width = 80;
+
+        assert!(renderer.remove_startup_update_from_history(false));
+        assert!(!renderer.history.iter().any(is_startup_update));
+        assert!(renderer
+            .history
+            .iter()
+            .any(|block| matches!(block.kind, BlockKind::Welcome)));
     }
 
     #[test]
