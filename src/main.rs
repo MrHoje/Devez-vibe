@@ -475,13 +475,13 @@ async fn await_with_activity<T>(
         |wake| match wake {
             Wake::Tick => activity_frame(state, renderer),
             // Esc here means the prompt just sent, so the cancel is recorded now and
-            // leaves with the turn the moment it opens. Everything else waits for the
-            // event loop's own key handling.
-            Wake::Input(Ok(Event::Key(key))) if is_wait_interrupt_key(&key) => {
-                if state.note_interrupt_while_sending() {
-                    draw(state, renderer)?;
-                }
-                Ok(())
+            // leaves with the turn the moment it opens. An Esc this wait has no turn
+            // to attach to — the session itself is still being built — is passed on
+            // like any other key, and the wait that sends the prompt takes it.
+            Wake::Input(Ok(Event::Key(key)))
+                if is_wait_interrupt_key(&key) && state.note_interrupt_while_sending() =>
+            {
+                draw(state, renderer)
             }
             Wake::Input(event) => {
                 input_hub::defer(event);

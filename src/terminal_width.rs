@@ -48,6 +48,15 @@ pub(crate) fn width_may_differ_on_host(ch: char) -> bool {
     UnicodeWidthChar::width(ch).unwrap_or(0) != ModernUnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
+/// Characters the web renderer on top of the console may draw one column
+/// narrower than the console reserved for them. The console counts a surrogate
+/// pair as two columns, but the bundled Unicode 6 provider gives an astral
+/// emoji a single cell, so a row carrying one ends up pulled left on screen and
+/// leaves an unpainted gap at its right edge.
+pub(crate) fn host_may_draw_narrower(ch: char) -> bool {
+    use_devezcode_xterm_widths() && ch as u32 >= 0x10000
+}
+
 /// Exact combining ranges from the bundled xterm 6 `UnicodeV6.ts` provider.
 /// Newer combining marks deliberately stay width 1 because that is what the
 /// actual host buffer does; mixing Unicode versions is the bug this module prevents.

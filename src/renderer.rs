@@ -38,7 +38,10 @@ use crate::{
         QUESTION_TAB_SEPARATOR, ShellDisplayMode,
     },
     syntax::{self, SyntaxKind},
-    terminal_width::{UnicodeWidthChar, UnicodeWidthStr, width_may_differ_on_host, wrap_ascii_space},
+    terminal_width::{
+        UnicodeWidthChar, UnicodeWidthStr, host_may_draw_narrower, width_may_differ_on_host,
+        wrap_ascii_space,
+    },
     theme::{self, Rgb, ThemeKind},
 };
 
@@ -4023,6 +4026,16 @@ fn plan_row_requires_full_repaint(previous: &PaintLine, current: &PaintLine) -> 
 /// on such a row must repaint it whole: a cell diff moves the cursor into the
 /// row's middle, and ConPTY re-synthesizes that jump with each wide glyph
 /// duplicated and the columns drifted.
+/// Whether any glyph on the row is one the web renderer may draw narrower than
+/// the console reserved for it, which pulls the rest of the row left on screen.
+fn paint_line_holds_narrower_host_glyphs(line: &PaintLine) -> bool {
+    std::iter::once(line.prefix.as_str())
+        .chain(std::iter::once(line.text.as_str()))
+        .chain(line.tail.iter().map(|span| span.text.as_str()))
+        .flat_map(str::chars)
+        .any(host_may_draw_narrower)
+}
+
 fn paint_line_holds_wide_glyphs(line: &PaintLine) -> bool {
     std::iter::once(line.prefix.as_str())
         .chain(std::iter::once(line.text.as_str()))
@@ -4289,7 +4302,20 @@ fn paint_line_into_frame(
         let trailing_right = boxed_content
             .as_ref()
             .map(|columns| columns.end)
-            .unwrap_or_else(|| background_width.unwrap_or(frame.width).saturating_sub(1));
+            .unwrap_or_else(|| {
+                let right = background_width.unwrap_or(frame.width);
+                // The card normally leaves the final column bare. A row holding
+                // an emoji is drawn narrower than the console reserved for it,
+                // so its cells sit further left and the gap that opens at the
+                // right edge would stay unpainted. Painting that last column
+                // too lets the end-of-line erase carry the card colour across
+                // the gap.
+                if paint_line_holds_narrower_host_glyphs(line) {
+                    right
+                } else {
+                    right.saturating_sub(1)
+                }
+            });
         let (start, right) = if matches!(line.tone, Tone::UserPrompt | Tone::UserPromptPadding) {
             let prompt_prefix = boxed_content
                 .as_ref()
@@ -13992,6 +14018,40 @@ mod tests {
             row_background(Tone::UserPrompt)
         );
         assert_eq!(frame.cell(7, 0).style.background, None);
+    }
+
+    /// An emoji is drawn one column narrower than the console reserved for it,
+    /// so its row sits pulled left on screen. Painting the final column too
+    /// lets the end-of-line erase carry the card colour across that gap.
+    #[test]
+    fn an_emoji_prompt_row_paints_its_rightmost_cell_too() {
+        set_chat_layout(false);
+        with_devezcode_xterm_widths(|| {
+            let mut frame = CellFrame::new(8, 1);
+
+            paint_line_into_frame(
+                &mut frame,
+                0,
+                &PaintLine {
+                    prefix: " ".to_owned(),
+                    prefix_tone: Tone::Plain,
+                    text: "\u{1f43e}".to_owned(),
+                    tone: Tone::UserPrompt,
+                    bold: true,
+                    tool_heading: None,
+                    pick: None,
+                    tail: Vec::new(),
+                },
+                None,
+                None,
+                None,
+            );
+
+            assert_eq!(
+                frame.cell(7, 0).style.background,
+                row_background(Tone::UserPrompt)
+            );
+        });
     }
 
     #[test]

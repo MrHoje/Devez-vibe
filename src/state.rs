@@ -21220,6 +21220,26 @@ mod tests {
         assert!(state.take_pending_interrupt().is_none());
     }
 
+    /// The first prompt waits for its session before it waits for its turn. An Esc
+    /// pressed during that first wait has nothing to attach to yet, so it has to be
+    /// left for the wait that actually sends the prompt.
+    #[test]
+    fn cancel_before_the_session_exists_is_left_for_the_send() {
+        let mut state = test_state();
+        state.thread_id = String::new();
+        state.editor.set_text("세션부터 만드는 첫 요청");
+        assert!(matches!(state.submit_editor(), Action::Submit(_)));
+
+        assert!(!state.note_interrupt_while_sending());
+        assert!(!state.turn_interrupted);
+
+        // The session lands, and the same Esc reaches the prompt's own wait.
+        state.thread_id = "thread".to_owned();
+        assert!(state.note_interrupt_while_sending());
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
+        assert_eq!(state.take_pending_interrupt().as_deref(), Some("turn-1"));
+    }
+
     /// A live turn belongs to the event loop's own Esc, which is not racing a send.
     #[test]
     fn cancel_during_a_send_is_ignored_once_the_turn_is_live() {
