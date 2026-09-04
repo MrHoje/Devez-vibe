@@ -670,8 +670,49 @@ impl Drop for TerminalSession {
 /// frame and handing it over in one write is what keeps the pace even.
 const FRAME_BUFFER_BYTES: usize = 512 * 1024;
 
+/// Stdout with an optional carbon copy of everything the renderer emits.
+/// Set `DEVEZ_VIBE_SCREEN_LOG` to a file path to capture the escape stream for
+/// a screen-corruption report; unset, this is a plain pass-through.
+pub struct ScreenLog {
+    inner: Stdout,
+    log: Option<std::fs::File>,
+}
+
+impl ScreenLog {
+    fn new() -> Self {
+        let log = std::env::var_os("DEVEZ_VIBE_SCREEN_LOG").and_then(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+        });
+        Self {
+            inner: stdout(),
+            log,
+        }
+    }
+}
+
+impl Write for ScreenLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        if let Some(log) = self.log.as_mut() {
+            let _ = log.write_all(&buf[..written]);
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Some(log) = self.log.as_mut() {
+            let _ = log.flush();
+        }
+        self.inner.flush()
+    }
+}
+
 pub struct Renderer {
-    out: BufWriter<Stdout>,
+    out: BufWriter<ScreenLog>,
     mode: RenderMode,
     previous_lines: Vec<PaintLine>,
     cursor_line: usize,
@@ -1396,7 +1437,7 @@ impl Renderer {
     pub fn new(selected_theme: ThemeKind, mode: RenderMode) -> Self {
         theme::set_current(selected_theme);
         Self {
-            out: BufWriter::with_capacity(FRAME_BUFFER_BYTES, stdout()),
+            out: BufWriter::with_capacity(FRAME_BUFFER_BYTES, ScreenLog::new()),
             mode,
             previous_lines: Vec::new(),
             cursor_line: 0,
