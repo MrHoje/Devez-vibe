@@ -431,14 +431,14 @@ mod tests {
                 extract_text(
                     &lines,
                     CellRange {
-                        start: point(3, 0),
-                        end: point(3, 0),
+                        start: point(2, 0),
+                        end: point(2, 0),
                     }
                 ),
                 "B"
             );
             assert_eq!(
-                selection_chunks("A🐾B", 0, Some(3..4)),
+                selection_chunks("A🐾B", 0, Some(2..3)),
                 vec![
                     SelectionChunk {
                         text: "A🐾".to_owned(),

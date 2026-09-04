@@ -14538,6 +14538,33 @@ mod tests {
                 text[..erase].contains(&colour),
                 "the erase carries the card colour"
             );
+
+            // The prompt card that showed this bug was a row of emoji: the
+            // renderer draws each in one cell, the console reserves two.
+            let mut emoji = CellFrame::new(12, 1);
+            emoji.fill(
+                0,
+                0,
+                11,
+                1,
+                CellStyle {
+                    background: Some(card),
+                    ..CellStyle::plain()
+                },
+            );
+            emoji.write(
+                0,
+                0,
+                "🐾🐾🐾🐾🐾🐾🐾",
+                CellStyle {
+                    background: Some(card),
+                    ..CellStyle::plain()
+                },
+            );
+            assert!(
+                console_safe_row_end(&emoji, 0) < emoji.width - 1,
+                "an emoji row runs past the right edge on the console"
+            );
         });
     }
 
@@ -16328,9 +16355,9 @@ mod tests {
     #[test]
     fn devezcode_widths_match_xterm6_for_emoji_and_cjk() {
         with_devezcode_xterm_widths(|| {
-            assert_eq!(UnicodeWidthStr::width("🐾"), 2);
-            assert_eq!(UnicodeWidthStr::width("👩‍💻"), 4);
-            assert_eq!(UnicodeWidthStr::width("🇰🇷"), 4);
+            assert_eq!(UnicodeWidthStr::width("🐾"), 1);
+            assert_eq!(UnicodeWidthStr::width("👩‍💻"), 2);
+            assert_eq!(UnicodeWidthStr::width("🇰🇷"), 2);
             assert_eq!(UnicodeWidthStr::width("가"), 2);
             assert_eq!(UnicodeWidthChar::width('\u{0301}'), Some(0));
             assert_eq!(UnicodeWidthChar::width('\u{1ab0}'), Some(1));
@@ -16354,11 +16381,10 @@ mod tests {
 
             assert_eq!(frame.cell(0, 0).glyph, "A");
             assert_eq!(frame.cell(1, 0).glyph, "🐾");
-            assert!(frame.cell(2, 0).continuation);
-            assert_eq!(frame.cell(3, 0).glyph, "B");
-            assert_eq!(frame.cell(4, 0).glyph, "가");
-            assert!(frame.cell(5, 0).continuation);
-            assert_eq!(frame.cell(6, 0).glyph, "C");
+            assert_eq!(frame.cell(2, 0).glyph, "B");
+            assert_eq!(frame.cell(3, 0).glyph, "가");
+            assert!(frame.cell(4, 0).continuation);
+            assert_eq!(frame.cell(5, 0).glyph, "C");
         });
     }
 

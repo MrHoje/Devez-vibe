@@ -363,10 +363,14 @@ fn xterm_unicode6_width(codepoint: u32) -> usize {
     if in_sorted_ranges(codepoint, XTERM6_HIGH_COMBINING) {
         return 0;
     }
-    // Both layers give an astral character two columns: the console counts the
-    // surrogate pair, and the renderer draws the emoji double width. Only the
-    // ambiguous BMP characters below disagree, and those stay one column here.
-    2
+    // The renderer draws an astral emoji in a single cell even though the
+    // console reserves two for the surrogate pair. Layout follows the renderer,
+    // and `console_width` below is what output has to stay under.
+    if (0x20000..=0x2fffd).contains(&codepoint) || (0x30000..=0x3fffd).contains(&codepoint) {
+        2
+    } else {
+        1
+    }
 }
 
 /// Columns the console reserves for a character, which is not always what the
@@ -557,9 +561,10 @@ mod tests {
     }
 
     #[test]
-    fn paw_prints_take_two_cells_each_like_both_layers_draw_them() {
+    fn paw_prints_lay_out_one_cell_each_the_way_the_renderer_draws_them() {
         with_devezcode_xterm_widths(|| {
-            assert_eq!(wrap_ascii_space("🐾🐾🐾🐾🐾", 5), ["🐾🐾", "🐾🐾", "🐾"]);
+            assert_eq!(wrap_ascii_space("🐾🐾🐾🐾🐾", 5), ["🐾🐾🐾🐾🐾"]);
+            assert_eq!(console_width("🐾🐾🐾🐾🐾"), 10);
         });
     }
 
