@@ -35,8 +35,8 @@ pub enum AgentMode {
 pub const BUILTIN: [AgentMode; 4] = [
     AgentMode::Standard,
     AgentMode::Planner,
-    AgentMode::GoalRunner,
     AgentMode::Reviewer,
+    AgentMode::GoalRunner,
 ];
 
 /// Every role Tab cycles through: the built-in four first, then whatever the
@@ -270,8 +270,8 @@ mod tests {
             seen[..3],
             [
                 AgentMode::Planner,
-                AgentMode::GoalRunner,
                 AgentMode::Reviewer,
+                AgentMode::GoalRunner,
             ]
         );
         assert_eq!(seen.last().copied(), Some(AgentMode::Standard));

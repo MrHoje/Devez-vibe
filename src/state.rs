@@ -23017,7 +23017,7 @@ mod tests {
         state.handle_key(KeyEvent::from(KeyCode::Tab));
         assert_eq!(state.agent_mode, AgentMode::Planner);
 
-        for expected in [AgentMode::GoalRunner, AgentMode::Reviewer] {
+        for expected in [AgentMode::Reviewer, AgentMode::GoalRunner] {
             state.handle_key(KeyEvent::from(KeyCode::Tab));
             assert_eq!(state.agent_mode, expected);
         }
@@ -23055,7 +23055,7 @@ mod tests {
         assert!(matches!(state.submit_editor(), Action::Submit(_)));
         state.handle_key(KeyEvent::from(KeyCode::Tab));
 
-        assert_eq!(state.agent_mode, AgentMode::GoalRunner);
+        assert_eq!(state.agent_mode, AgentMode::Reviewer);
         assert_eq!(state.view().plan_agent, AgentMode::Planner);
     }
 
@@ -23100,7 +23100,7 @@ mod tests {
         assert_eq!(overlay.title, "Agent");
         assert_eq!(overlay.lines.len(), agent::choices().len());
         assert!(overlay.lines[0].text.contains("Builder"));
-        assert!(overlay.lines[2].text.contains("Goal Runner"));
+        assert!(overlay.lines[2].text.contains("Reviewer"));
 
         state.handle_key(KeyEvent::from(KeyCode::Down));
         assert_eq!(state.agent_mode, AgentMode::Standard);
