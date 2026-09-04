@@ -5462,6 +5462,7 @@ enum Tone {
     AssistantBubble,
     AssistantBubbleHalf,
     Model56,
+    ModelAstra,
     ModelSol,
     ModelTerra,
     ModelLuna,
@@ -5473,6 +5474,7 @@ enum Tone {
     ModelFable,
     ModelOpenCode,
     StatusModel56,
+    StatusModelAstra,
     StatusModelSol,
     StatusModelTerra,
     StatusModelLuna,
@@ -13207,6 +13209,8 @@ fn model_tone(model: &str) -> Option<Tone> {
         Some(Tone::ModelFable)
     } else if model.contains("spark") {
         Some(Tone::ModelSpark)
+    } else if model.contains("gpt-6") && model.contains("astra") {
+        Some(Tone::ModelAstra)
     } else if model.contains("5.6") && model.contains("sol") {
         Some(Tone::ModelSol)
     } else if model.contains("5.6") && model.contains("terra") {
@@ -13228,6 +13232,7 @@ fn status_model_tone(model: &str) -> Option<Tone> {
     }
     match model_tone(model)? {
         Tone::Model56 => Some(Tone::StatusModel56),
+        Tone::ModelAstra => Some(Tone::StatusModelAstra),
         Tone::ModelSol => Some(Tone::StatusModelSol),
         Tone::ModelTerra => Some(Tone::StatusModelTerra),
         Tone::ModelLuna => Some(Tone::StatusModelLuna),
@@ -13298,6 +13303,7 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::AssistantBubble => palette.foreground,
         Tone::AssistantBubbleHalf => blend(palette.background, palette.foreground, 20),
         Tone::Model56 => palette.model_gpt56,
+        Tone::ModelAstra | Tone::StatusModelAstra => palette.model_astra,
         Tone::ModelSol => palette.model_sol,
         Tone::ModelTerra => palette.model_terra,
         Tone::ModelLuna => palette.model_luna,
@@ -24485,6 +24491,18 @@ mod tests {
                 Tone::ModelFable,
                 Some(Tone::StatusModelFable),
                 palette.status.model_fable,
+            ),
+            (
+                "GPT-6 Astra",
+                Tone::ModelAstra,
+                Some(Tone::StatusModelAstra),
+                palette.model_astra,
+            ),
+            (
+                "gpt-6-astra",
+                Tone::ModelAstra,
+                Some(Tone::StatusModelAstra),
+                palette.model_astra,
             ),
             ("GPT-5.6 Terra", Tone::ModelTerra, None, palette.model_terra),
             ("GPT-5.6", Tone::Model56, None, palette.model_gpt56),

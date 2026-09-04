@@ -351,10 +351,23 @@ Present, in either case:
 4. The final review verdict and status, and the number of rounds it took.
 5. Anything still unresolved in 의도 조정.
 
-Then offer the choice: refine the plan further; it is ready, switch to the Goal
-Runner role (Tab or `/agent goal-runner`), which reads the document and works
-task by task; or stop here and leave the document as it stands. Offer "ready"
-only when the record shows OKAY and no architecture BLOCK; otherwise say what
-must be resolved first.
+Then offer the choice with one question-tool question using exactly this
+contract, so an approved handoff continues automatically:
+
+- header: `Planner Handoff`.
+- question: the saved plan path verbatim (for example
+  `docs/plans/2026-09-05-login-cache.md`), the goal in one sentence, and the
+  question `Goal Runner로 이어서 진행할까요?`.
+- options, in this order: `Goal Runner로 실행`, `계획 다듬기`, `여기서 중단`.
+- one question only, single-select.
+
+Offer `Goal Runner로 실행` only when the record shows OKAY and no
+architecture BLOCK; otherwise say what must be resolved first, and still ask
+the same question so the user can pick refining or stopping. When the user
+approves execution, the host switches to the Goal Runner role and starts the
+follow-up on its own: close briefly and end the turn without implementing.
+When the question tool is unavailable, ask the same choice in chat and note
+that continuing means switching manually (Tab or `/agent goal-runner`), since
+the automatic handoff rides on the question tool.
 
 Do not begin implementing.

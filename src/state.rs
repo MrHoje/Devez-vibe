@@ -1980,6 +1980,7 @@ struct McpApprovalOption {
     persist: Option<&'static str>,
 }
 
+#[derive(Clone)]
 struct Question {
     id: String,
     header: String,
@@ -1990,6 +1991,7 @@ struct Question {
     multi_select: bool,
 }
 
+#[derive(Clone)]
 struct QuestionOption {
     label: String,
     description: String,
@@ -4102,6 +4104,32 @@ impl AppState {
         }
         self.agent_mode = mode;
         Action::Tick(true)
+    }
+
+    /// Dedicated Planner → Goal Runner handoff: switch the next turn's role
+    /// and queue the follow-up prompt that starts it, so approving the
+    /// Planner's handoff question continues automatically. Only the
+    /// standardized handoff (Planner role, a `docs/plans/` document) may use
+    /// this; anything else falls back to the manual Tab/`/agent` switch.
+    /// Returns whether the switch and the queued follow-up both landed.
+    pub fn request_agent_handoff(&mut self, plan_path: &str) -> bool {
+        if self.agent_mode != AgentMode::Planner {
+            return false;
+        }
+        let plan = plan_path.trim();
+        if !(plan.starts_with("docs/plans/")
+            && plan.ends_with(".md")
+            && plan.len() > "docs/plans/.md".len())
+        {
+            return false;
+        }
+        self.set_agent_mode(AgentMode::GoalRunner);
+        if self.agent_mode != AgentMode::GoalRunner {
+            return false;
+        }
+        self.queued_prompts
+            .push_back(format!("{plan} 계획을 Goal Runner로 실행해줘."));
+        true
     }
 
     fn cycle_agent_mode(&mut self) -> Action {
@@ -13932,12 +13960,73 @@ fn next_question_or_reply(
 ) -> Action {
     if current + 1 == questions.len() {
         commit_user_input_answers(state, &questions, &answers);
+        // An approved Planner handoff continues on its own: the structured
+        // answer (not free text) arms the role switch and queues the
+        // follow-up, which the turn-completion drain starts under Goal Runner.
+        if state.agent_mode == AgentMode::Planner
+            && let Some(plan) = planner_handoff_plan_path(&questions, &answers)
+        {
+            state.request_agent_handoff(&plan);
+        }
         return Action::RpcResponse {
             id,
             result: answers_response(&answers),
         };
     }
     show_question(id, questions, current + 1, answers, state)
+}
+
+/// The exact contract the Planner's handoff question follows so the approval
+/// below is matched on structured input, never on prose.
+const PLANNER_HANDOFF_HEADER: &str = "Planner Handoff";
+const PLANNER_HANDOFF_EXECUTE_LABEL: &str = "Goal Runner로 실행";
+
+/// The plan document approved for automatic execution, if these answers are
+/// the Planner handoff's execute choice. Anything else — refine, stop,
+/// another role, another question — yields nothing and keeps manual control.
+fn planner_handoff_plan_path(
+    questions: &[Question],
+    answers: &BTreeMap<String, Vec<String>>,
+) -> Option<String> {
+    if questions.len() != 1 {
+        return None;
+    }
+    let question = &questions[0];
+    if question.header != PLANNER_HANDOFF_HEADER {
+        return None;
+    }
+    // Single-select only: a multi-pick (or a second answer row) is never an
+    // approval, even when one of the picks names the execute choice.
+    if question.multi_select {
+        return None;
+    }
+    if !question
+        .options
+        .iter()
+        .any(|option| option.label == PLANNER_HANDOFF_EXECUTE_LABEL)
+    {
+        return None;
+    }
+    let picked = answers.get(&question.id)?;
+    if picked.len() != 1 || picked[0].trim() != PLANNER_HANDOFF_EXECUTE_LABEL {
+        return None;
+    }
+    extract_plan_path(&question.question)
+}
+
+/// First `docs/plans/*.md` path in the question text. Backticks, quotes and
+/// trailing punctuation around it are not part of the path.
+fn extract_plan_path(text: &str) -> Option<String> {
+    let start = text.find("docs/plans/")?;
+    let rest = &text[start..];
+    let end = rest
+        .find(|c: char| {
+            c.is_whitespace() || matches!(c, '`' | '"' | '\'' | ')' | ']' | '}' | '>')
+        })
+        .unwrap_or(rest.len());
+    let path = rest[..end].trim_end_matches(['.', ',', ':', ';']);
+    (path.ends_with(".md") && path.len() > "docs/plans/.md".len())
+        .then(|| path.to_owned())
 }
 
 /// Opens one question of a multi-step ask, restoring whatever answer it already
@@ -23073,6 +23162,249 @@ mod tests {
                 .as_ref()
                 .is_some_and(|(notice, _)| notice.contains("Agent를 변경할 수 있습니다"))
         );
+    }
+
+    fn handoff_questions(plan_line: &str) -> Vec<Question> {
+        // Literals on purpose: these must match prompts/agents/planner.md, so
+        // a drift in either direction fails the suite instead of following it.
+        vec![Question {
+            id: "handoff".to_owned(),
+            header: "Planner Handoff".to_owned(),
+            question: plan_line.to_owned(),
+            options: [
+                ("Goal Runner로 실행", "승인하면 Goal Runner가 바로 실행합니다."),
+                ("계획 다듬기", "계획을 더 다듬습니다."),
+                ("여기서 중단", "문서만 남기고 멈춥니다."),
+            ]
+            .into_iter()
+            .map(|(label, description)| QuestionOption {
+                label: label.to_owned(),
+                description: description.to_owned(),
+            })
+            .collect(),
+            allow_other: true,
+            multi_select: false,
+        }]
+    }
+
+    fn handoff_answers(choice: &str) -> BTreeMap<String, Vec<String>> {
+        let mut answers = BTreeMap::new();
+        answers.insert("handoff".to_owned(), vec![choice.to_owned()]);
+        answers
+    }
+
+    /// The prompt contract and the detector share the same literals.
+    #[test]
+    fn planner_prompt_handoff_contract_matches_the_detector() {
+        let prompt = include_str!("../prompts/agents/planner.md");
+        for literal in [
+            PLANNER_HANDOFF_HEADER,
+            PLANNER_HANDOFF_EXECUTE_LABEL,
+            "계획 다듬기",
+            "여기서 중단",
+            "Goal Runner로 이어서 진행할까요?",
+        ] {
+            assert!(
+                prompt.contains(literal),
+                "planner prompt dropped the handoff literal {literal:?}"
+            );
+        }
+    }
+
+    /// Approving the Planner handoff switches the next turn to Goal Runner
+    /// and queues the follow-up carrying the plan path.
+    #[test]
+    fn approved_planner_handoff_switches_role_and_queues_the_follow_up() {
+        let mut state = idle_test_state();
+        state.set_agent_mode(AgentMode::Planner);
+        let questions = handoff_questions(
+            "`docs/plans/2026-09-05-login-cache.md` 계획입니다. \
+             Goal Runner로 이어서 진행할까요?",
+        );
+
+        let action = next_question_or_reply(
+            json!(1),
+            questions,
+            0,
+            handoff_answers("Goal Runner로 실행"),
+            &mut state,
+        );
+
+        assert!(matches!(action, Action::RpcResponse { .. }));
+        assert_eq!(state.agent_mode, AgentMode::GoalRunner);
+        // The switch only moves the next turn: the running turn's capture is
+        // untouched, exactly like a mid-turn Tab switch.
+        assert_eq!(state.active_turn_agent, AgentMode::Standard);
+        assert_eq!(
+            state.queued_prompts.front().map(String::as_str),
+            Some("docs/plans/2026-09-05-login-cache.md 계획을 Goal Runner로 실행해줘.")
+        );
+        // The queued follow-up drains into a Goal Runner turn on completion.
+        let queued = state.take_queued_prompt().expect("handoff queued a prompt");
+        assert!(matches!(state.start_queued_prompt(queued), Action::Submit(_)));
+        assert_eq!(state.active_turn_agent, AgentMode::GoalRunner);
+    }
+
+    /// Refining or stopping never arms the automatic switch.
+    #[test]
+    fn planner_handoff_without_execute_approval_leaves_role_and_queue_alone() {
+        for choice in ["계획 다듬기", "여기서 중단"] {
+            let mut state = idle_test_state();
+            state.set_agent_mode(AgentMode::Planner);
+            let questions = handoff_questions(
+                "docs/plans/2026-09-05-login-cache.md 계획입니다. \
+                 Goal Runner로 이어서 진행할까요?",
+            );
+
+            next_question_or_reply(json!(1), questions, 0, handoff_answers(choice), &mut state);
+
+            assert_eq!(state.agent_mode, AgentMode::Planner);
+            assert!(state.queued_prompts.is_empty());
+        }
+    }
+
+    /// The handoff fires only on its own contract: another role, another
+    /// header, more than one question, no execute option, several picks, or
+    /// no plan path in the question all stay manual.
+    #[test]
+    fn planner_handoff_ignores_anything_outside_its_contract() {
+        // Another role answering the same question shape.
+        let mut state = idle_test_state();
+        state.set_agent_mode(AgentMode::Reviewer);
+        let questions = handoff_questions("docs/plans/2026-09-05-x.md Goal Runner로 이어서 진행할까요?");
+        next_question_or_reply(
+            json!(1),
+            questions,
+            0,
+            handoff_answers("Goal Runner로 실행"),
+            &mut state,
+        );
+        assert_eq!(state.agent_mode, AgentMode::Reviewer);
+        assert!(state.queued_prompts.is_empty());
+
+        // Planner but a different question.
+        let mut state = idle_test_state();
+        state.set_agent_mode(AgentMode::Planner);
+        let mut questions = handoff_questions("docs/plans/2026-09-05-x.md Goal Runner로 이어서 진행할까요?");
+        questions[0].header = "Question 1/1".to_owned();
+        next_question_or_reply(
+            json!(1),
+            questions,
+            0,
+            handoff_answers("Goal Runner로 실행"),
+            &mut state,
+        );
+        assert_eq!(state.agent_mode, AgentMode::Planner);
+        assert!(state.queued_prompts.is_empty());
+
+        // Planner handoff shape but no plan document named.
+        let mut state = idle_test_state();
+        state.set_agent_mode(AgentMode::Planner);
+        let questions = handoff_questions("계획이 준비됐습니다. Goal Runner로 이어서 진행할까요?");
+        next_question_or_reply(
+            json!(1),
+            questions,
+            0,
+            handoff_answers("Goal Runner로 실행"),
+            &mut state,
+        );
+        assert_eq!(state.agent_mode, AgentMode::Planner);
+        assert!(state.queued_prompts.is_empty());
+
+        // Two questions at once is never the single handoff question: the
+        // closing reply still finds a pair and stays manual.
+        let mut state = idle_test_state();
+        state.set_agent_mode(AgentMode::Planner);
+        let mut questions = handoff_questions("docs/plans/2026-09-05-x.md Goal Runner로 이어서 진행할까요?");
+        questions.push(questions[0].clone());
+        let mut answers = BTreeMap::new();
+        answers.insert("handoff".to_owned(), vec!["Goal Runner로 실행".to_owned()]);
+        next_question_or_reply(json!(1), questions, 1, answers, &mut state);
+        assert_eq!(state.agent_mode, AgentMode::Planner);
+        assert!(state.queued_prompts.is_empty());
+
+        // The execute option itself missing from the offered choices.
+        let mut state = idle_test_state();
+        state.set_agent_mode(AgentMode::Planner);
+        let mut questions = handoff_questions("docs/plans/2026-09-05-x.md Goal Runner로 이어서 진행할까요?");
+        questions[0].options.retain(|option| option.label != "Goal Runner로 실행");
+        next_question_or_reply(
+            json!(1),
+            questions,
+            0,
+            handoff_answers("Goal Runner로 실행"),
+            &mut state,
+        );
+        assert_eq!(state.agent_mode, AgentMode::Planner);
+        assert!(state.queued_prompts.is_empty());
+
+        // Several picks at once are not an approval, even with execute among them.
+        let mut state = idle_test_state();
+        state.set_agent_mode(AgentMode::Planner);
+        let mut questions = handoff_questions("docs/plans/2026-09-05-x.md Goal Runner로 이어서 진행할까요?");
+        questions[0].multi_select = true;
+        let mut answers = BTreeMap::new();
+        answers.insert(
+            "handoff".to_owned(),
+            vec!["Goal Runner로 실행".to_owned(), "계획 다듬기".to_owned()],
+        );
+        next_question_or_reply(json!(1), questions, 0, answers, &mut state);
+        assert_eq!(state.agent_mode, AgentMode::Planner);
+        assert!(state.queued_prompts.is_empty());
+    }
+
+    /// The switch API itself only honours a Planner holding a plan document.
+    #[test]
+    fn handoff_request_rejects_anything_but_a_planner_with_a_plan() {
+        let mut state = idle_test_state();
+        state.set_agent_mode(AgentMode::Reviewer);
+        assert!(!state.request_agent_handoff("docs/plans/2026-09-05-x.md"));
+        assert_eq!(state.agent_mode, AgentMode::Reviewer);
+
+        let mut state = idle_test_state();
+        state.set_agent_mode(AgentMode::Planner);
+        for bad in ["", "other/plan.md", "docs/plans/notes.txt", "docs/plans/.md"] {
+            assert!(!state.request_agent_handoff(bad), "must reject {bad:?}");
+        }
+        assert_eq!(state.agent_mode, AgentMode::Planner);
+        assert!(state.queued_prompts.is_empty());
+    }
+
+    /// A blocked role change (here: a prompt already queued) queues nothing
+    /// more and leaves the notice the manual path already shows.
+    #[test]
+    fn planner_handoff_blocked_change_queues_no_follow_up() {
+        let mut state = busy_state_with_live_turn();
+        state.set_agent_mode(AgentMode::Planner);
+        state.queued_prompts.push_back("earlier prompt".to_owned());
+
+        assert!(!state.request_agent_handoff("docs/plans/2026-09-05-x.md"));
+
+        assert_eq!(state.agent_mode, AgentMode::Planner);
+        assert_eq!(
+            state.queued_prompts.iter().collect::<Vec<_>>(),
+            [&"earlier prompt".to_owned()]
+        );
+        assert!(
+            state
+                .composer_notice
+                .as_ref()
+                .is_some_and(|(notice, _)| notice.contains("Agent를 변경할 수 있습니다"))
+        );
+    }
+
+    #[test]
+    fn handoff_plan_path_tolerates_quotes_and_trailing_punctuation() {
+        assert_eq!(
+            extract_plan_path("(`docs/plans/2026-09-05-x.md`), 실행할까요?"),
+            Some("docs/plans/2026-09-05-x.md".to_owned())
+        );
+        assert_eq!(
+            extract_plan_path("경로 docs/plans/2026-09-05-x.md."),
+            Some("docs/plans/2026-09-05-x.md".to_owned())
+        );
+        assert_eq!(extract_plan_path("계획만 있고 경로 없음"), None);
+        assert_eq!(extract_plan_path("docs/plans/.md"), None);
     }
 
 

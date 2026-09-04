@@ -19,21 +19,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "Tab 역할 순환과 역할 선택 창의 순서를 Planner 다음 Reviewer, Goal Runner로 바꿨습니다.",
-    "선택지 창이 뜨는 순간 한글이 다른 글자로 보이던 문제를 수정했습니다.",
-    "이모지가 들어간 줄 때문에 화면이 한 줄씩 어긋나 겹쳐 보이던 문제를 수정했습니다.",
-    "화면 출력 기록 스위치를 추가했습니다.",
-    "가운뎃점과 화살표, 이모지의 칸 수를 실제 화면과 맞춰 줄이 밀리고 겹치던 문제를 수정했습니다.",
-    "카드와 선택지 창의 오른쪽 세로선이 어긋나 보이던 문제를 수정했습니다.",
-    "이모지가 많은 줄에서 카드 배경이 오른쪽부터 사라지던 문제를 수정했습니다.",
-    "새 대화를 열 때 현재 공급자의 모델과 스킬, 플러그인 목록을 다시 불러오도록 개선했습니다.",
-    "이모지 행의 오른쪽 배경 경계와 상태줄의 effort 안내가 잘리던 문제를 수정했습니다.",
-    "구버전 DevezCode에서는 이모지 행의 배경을 직접 채우고, 새 폭 프로필에서는 발바닥 이모지를 2칸으로 맞췄습니다.",
-    "명령 목록이 열려도 입력창 위의 브랜치와 모드 표시가 제자리를 지키도록 수정했습니다.",
-    "전용 폴더에 파일을 두면 원하는 에이전트 역할을 직접 추가할 수 있습니다.",
-    "첫 프롬프트를 입력하면 시작 안내 문구가 사라지고, 알림 카드는 위아래 선만 남깁니다.",
-    "Advisor 역할을 빼고 Reviewer 역할을 더했으며, Planner와 Goal Runner는 계획 문서와 독립 검토 게이트를 거치도록 다시 짰습니다.",
-    "구현·리뷰·검증 서브에이전트가 역할별로 고정된 모델로 동작합니다.",
+    "GPT-6 Astra의 모델 표시와 입력창에 녹색을 적용하고 테마별 가독성을 보정했습니다.",
+    "Planner에서 계획 실행을 승인하면 Goal Runner로 전환해 자동으로 이어서 실행합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
