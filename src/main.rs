@@ -3795,7 +3795,7 @@ async fn open_provider_connection(
 /// prompt opens one, so the new conversation is named after the runtime it actually
 /// runs on. Returns `true` when the user quits, which this path never does.
 async fn start_new_thread(
-    _server: &BackendServer,
+    server: &mut BackendServer,
     state: &mut AppState,
     renderer: &mut Renderer,
 ) -> Result<bool> {
@@ -3806,7 +3806,94 @@ async fn start_new_thread(
     // runtime is selected by then. Until it does, the screen is an empty new
     // conversation with no session behind it.
     draw(state, renderer)?;
+    let refresh_errors = refresh_new_thread_catalogs(server, state).await;
+    if !refresh_errors.is_empty() {
+        state.push_notice(
+            BlockKind::Warning,
+            "새 세션 목록 새로고침 실패",
+            refresh_errors.join("\n"),
+        );
+    }
+    draw(state, renderer)?;
     Ok(false)
+}
+
+/// Refreshes only the catalogues that may change outside this process. Models
+/// belong to Codex alone here; Skills and Plugins follow the selected provider.
+/// Each result lands independently so one failed request keeps its previous
+/// catalogue without preventing the fresh conversation from opening.
+async fn refresh_new_thread_catalogs(
+    server: &mut BackendServer,
+    state: &mut AppState,
+) -> Vec<String> {
+    let model = state.selected_model_name().to_owned();
+    if open_code::is_open_code_model(&model) {
+        return match server.open_code_provider_api() {
+            Some(api) => match api.skills().await {
+                Ok(response) => {
+                    state.update_skills(&response);
+                    Vec::new()
+                }
+                Err(error) => vec![format!("Skill 조회 실패: {error}")],
+            },
+            None => vec!["Skill 조회 실패: OpenCode 연결이 없습니다.".to_owned()],
+        };
+    }
+
+    let using_codex = is_codex_model(&model);
+    if using_codex && let Err(error) = server.start_codex().await {
+        return vec![format!("Codex 목록 조회 실패: {error}")];
+    }
+    let Some(client) = server.integration_client(&model) else {
+        return vec!["Skills·Plugins 조회 연결이 없습니다.".to_owned()];
+    };
+    let skills_client = client.clone();
+    let plugins_client = client;
+    let cwd = state.cwd.clone();
+    let model_refresh = async {
+        if using_codex {
+            Some(server.codex_model_catalog().await)
+        } else {
+            None
+        }
+    };
+    let skills_refresh = skills_client.request(
+        "skills/list",
+        json!({ "cwd": cwd.clone(), "cwds": [cwd.clone()], "forceReload": true }),
+    );
+    let plugins_refresh = plugins_client.request(
+        "plugin/installed",
+        json!({ "cwd": cwd.clone(), "cwds": [cwd] }),
+    );
+    let (models, skills, plugins) =
+        tokio::join!(model_refresh, skills_refresh, plugins_refresh);
+
+    let mut errors = Vec::new();
+    if let Some(models) = models {
+        match models {
+            Ok(response) => {
+                let models = parse_models(&response);
+                if models.is_empty() {
+                    errors.push("Codex 모델 조회 실패: 사용 가능한 모델이 없습니다.".to_owned());
+                } else {
+                    state.replace_codex_models(models);
+                }
+            }
+            Err(error) => errors.push(format!("Codex 모델 조회 실패: {error}")),
+        }
+    }
+    match skills {
+        Ok(response) => state.update_skills_for_model(&model, &response),
+        Err(error) => errors.push(format!("Skill 조회 실패: {error}")),
+    }
+    match plugins {
+        Ok(response) => state.update_plugins_for_model(&response, &model),
+        Err(error) => {
+            state.note_plugin_query_error_for_model(error.to_string(), &model);
+            errors.push(format!("플러그인 조회 실패: {error}"));
+        }
+    }
+    errors
 }
 
 /// `/resume`, given the same treatment as [`start_new_thread`]: the screen resets

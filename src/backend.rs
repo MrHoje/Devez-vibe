@@ -852,6 +852,18 @@ impl BackendServer {
         }
     }
 
+    /// Reads only Codex's model catalogue. The ordinary `model/list` route also
+    /// merges Claude and OpenCode entries, which is useful at startup but would
+    /// needlessly refresh other providers when `/new` only needs Codex changes.
+    pub async fn codex_model_catalog(&self) -> Result<Value> {
+        self.codex()?
+            .request(
+                "model/list",
+                json!({ "includeHidden": false, "limit": 100 }),
+            )
+            .await
+    }
+
     pub fn client(&self) -> Option<AppServerClient> {
         self.codex.as_ref().map(AppServer::client)
     }

@@ -4544,6 +4544,22 @@ impl AppState {
         }
     }
 
+    /// Replaces Codex entries without disturbing the independently managed
+    /// Claude and OpenCode catalogues already loaded into this session.
+    pub fn replace_codex_models(&mut self, mut models: Vec<ModelInfo>) {
+        models.retain(|model| ModelProvider::from_model(&model.model) == ModelProvider::Codex);
+        if models.is_empty() {
+            return;
+        }
+        models.extend(
+            self.models
+                .iter()
+                .filter(|model| ModelProvider::from_model(&model.model) != ModelProvider::Codex)
+                .cloned(),
+        );
+        self.replace_models(models);
+    }
+
     /// True until `thread/start` answers. The UI is fully painted before that, so
     /// anything that would talk to the thread has to wait for it.
     pub fn thread_pending(&self) -> bool {
@@ -20886,6 +20902,45 @@ mod tests {
         state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(state.selected_model_display_name(), "GPT-5.6 Sol");
         assert!(state.overlay_view().is_none());
+    }
+
+    #[test]
+    fn replacing_codex_models_keeps_other_provider_catalogues() {
+        let mut state = AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![
+                test_model("gpt-old", "GPT Old", true),
+                test_model("opencode:local/model", "OpenCode Model", false),
+                test_model("claude:sonnet", "Claude Sonnet", false),
+            ],
+            "gpt-old",
+            Some("high"),
+        );
+
+        state.replace_codex_models(vec![test_model("gpt-new", "GPT New", true)]);
+
+        assert_eq!(state.selected_model_name(), "gpt-new");
+        assert_eq!(
+            state
+                .models()
+                .iter()
+                .map(|model| model.model.as_str())
+                .collect::<Vec<_>>(),
+            ["gpt-new", "opencode:local/model", "claude:sonnet"]
+        );
+    }
+
+    #[test]
+    fn an_empty_codex_refresh_keeps_the_existing_catalogue() {
+        let mut state = test_state();
+        let before = state.selected_model_name().to_owned();
+
+        state.replace_codex_models(Vec::new());
+
+        assert_eq!(state.selected_model_name(), before);
+        assert!(!state.models().is_empty());
     }
 
     #[test]

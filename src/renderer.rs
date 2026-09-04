@@ -4707,6 +4707,28 @@ fn emit_row_sequential(
     };
     set_cell_style(out, frame.cell(erase_column, row).style)?;
     queue!(out, Clear(ClearType::UntilNewLine))?;
+    // The erase above fills xterm cells that the hidden console counted
+    // differently. Reapply later background boundaries at their absolute frame
+    // columns so an emoji row ends exactly where the other prompt rows do.
+    if row_end < frame.width.saturating_sub(1) {
+        let mut background = frame.cell(erase_column, row).style.background;
+        for column in row_end..frame.width {
+            let style = frame.cell(column, row).style;
+            if style.background == background {
+                continue;
+            }
+            queue!(
+                out,
+                MoveTo(
+                    column.min(u16::MAX as usize) as u16,
+                    screen_row.min(u16::MAX as usize) as u16
+                )
+            )?;
+            set_cell_style(out, style)?;
+            queue!(out, Clear(ClearType::UntilNewLine))?;
+            background = style.background;
+        }
+    }
     queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
     Ok(())
 }
@@ -8192,9 +8214,22 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         .map(|span| UnicodeWidthStr::width(span.text.as_str()))
         .sum::<usize>();
     let hint_width = UnicodeWidthStr::width(shortcut_hint);
-    if !shortcut_hint.is_empty() && content_width + hint_width <= max_width {
+    // The hidden Windows console reserves two columns for arrows and the
+    // middle dot while DevezCode's xterm displays them in one. Leave that
+    // discrepancy as trailing room before right-aligning the hint; the output
+    // safety cut then removes blank cells instead of the end of `effort`.
+    let console_extra = spans
+        .iter()
+        .map(|span| {
+            console_width(span.text.as_str())
+                .saturating_sub(UnicodeWidthStr::width(span.text.as_str()))
+        })
+        .sum::<usize>()
+        + console_width(shortcut_hint).saturating_sub(hint_width);
+    let aligned_width = max_width.saturating_sub(console_extra);
+    if !shortcut_hint.is_empty() && content_width + hint_width <= aligned_width {
         spans.push(PaintSpan {
-            text: " ".repeat(max_width - content_width - hint_width),
+            text: " ".repeat(aligned_width - content_width - hint_width),
             tone: Tone::Muted,
             bold: false,
         });
@@ -14532,11 +14567,20 @@ mod tests {
             let mut output = Vec::new();
             emit_row_sequential(&mut output, &frame, 0, 0).expect("row emits");
             let text = String::from_utf8(output).expect("terminal bytes are UTF-8");
-            let erase = text.rfind("\x1b[K").expect("the row ends with an erase");
+            let erase = text.find("\x1b[K").expect("the clipped tail is filled");
             let colour = format!("[48;2;{};{};{}m", card.0, card.1, card.2);
             assert!(
                 text[..erase].contains(&colour),
                 "the erase carries the card colour"
+            );
+            assert_eq!(
+                text.matches("\x1b[K").count(),
+                2,
+                "the final frame-cell background is restored after filling the gap"
+            );
+            assert!(
+                text.contains("\x1b[1;12H"),
+                "the ordinary one-cell right margin is restored at its absolute column"
             );
 
             // The prompt card that showed this bug was a row of emoji: the
@@ -14564,6 +14608,38 @@ mod tests {
             assert!(
                 console_safe_row_end(&emoji, 0) < emoji.width - 1,
                 "an emoji row runs past the right edge on the console"
+            );
+        });
+    }
+
+    #[test]
+    fn a_devezcode_status_row_keeps_its_whole_right_hand_hint() {
+        with_devezcode_xterm_widths(|| {
+            let line = status_line_row(
+                Some(StatusLineView {
+                    agent: AgentMode::Standard,
+                    model: Some("GPT-5.6 Codex".to_owned()),
+                    effort: Some("xhigh".to_owned()),
+                    context: Some("ctx: 38k/1000k (3%)".to_owned()),
+                    five_hour_percent: Some(97),
+                    five_hour_remaining: Some("25m".to_owned()),
+                    weekly_percent: Some(43),
+                    notice: None,
+                }),
+                "",
+                120,
+            );
+            assert!(painted(&line).ends_with("Shift + ↑↓ model · ←→ effort"));
+            assert!(console_width(painted(&line).as_str()) <= 118);
+
+            let mut frame = CellFrame::new(120, 1);
+            paint_line_into_frame(&mut frame, 0, &line, None, None, None);
+            let mut output = Vec::new();
+            emit_row_sequential(&mut output, &frame, 0, 0).expect("row emits");
+            let text = String::from_utf8(output).expect("terminal bytes are UTF-8");
+            assert!(
+                text.contains("Shift + ↑↓ model · ←→ effort"),
+                "the host hint must not be clipped by the console safety margin"
             );
         });
     }
