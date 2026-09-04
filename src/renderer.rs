@@ -1631,11 +1631,15 @@ impl Renderer {
 
     /// A question panel can leave its wide selected-row background behind when
     /// the host replays a localized cell diff onto the newly committed prompt.
-    /// Forget only the painted cell cache on close, making that single frame a
-    /// fresh paint without bringing back the old viewport anchor.
+    /// Forget only the painted cell cache on either transition, making that
+    /// single frame a fresh paint without bringing back the old viewport
+    /// anchor. Opening needs it as much as closing: the panel lands on rows the
+    /// streaming answer just repainted, and a localized diff onto those rows is
+    /// replayed with the wide glyphs duplicated, so the Korean prompt reads as
+    /// different syllables from the moment it appears.
     fn observe_question_overlay(&mut self, style: Option<OverlayStyle>) {
         let open = style == Some(OverlayStyle::Question);
-        if self.mode == RenderMode::Fullscreen && self.question_overlay_open && !open {
+        if self.mode == RenderMode::Fullscreen && self.question_overlay_open != open {
             self.painted_frame = None;
         }
         self.question_overlay_open = open;
@@ -3104,8 +3108,14 @@ impl Renderer {
     }
 
     pub fn render_animation(&mut self, view: AnimationView<'_>) -> Result<bool> {
+        // An open question panel owns the screen while it waits for a key, and
+        // this fast path patches spinner rows in place. Those mid-row patches
+        // are replayed by the host with the wide glyphs of neighbouring rows
+        // duplicated, which corrupts the Korean options standing right beside
+        // them. Nothing on screen needs to animate until the panel closes.
         if self.split_active
             || self.mode != RenderMode::Fullscreen
+            || self.question_overlay_open
             || self.last_width == 0
             || self.previous_lines.is_empty()
             || self.painted_frame.is_none()
@@ -22615,14 +22625,82 @@ mod tests {
     }
 
     #[test]
-    fn closing_a_question_discards_the_highlighted_panel_frame_once() {
+    /// The spinner's in-place row patch is exactly the mid-row write the host
+    /// replays with neighbouring wide glyphs duplicated, so it must not run
+    /// while Korean options are standing on screen waiting for a key.
+    #[test]
+    fn an_open_question_panel_stops_the_animation_fast_path() {
+        fn animation_view() -> AnimationView<'static> {
+            AnimationView {
+                activity: Some("Thinking".to_owned()),
+                activity_model: None,
+                activity_phase: 0.0,
+                waiting_for_response: false,
+                activity_progress_phase: 0.0,
+                plan_summary: None,
+                plan_active: false,
+                plan_shimmer_phase: None,
+                plan_agent: AgentMode::Standard,
+                composer_notice: None,
+                composer_mode: None,
+            }
+        }
+        fn ready_renderer() -> Renderer {
+            let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+            renderer.painted_frame = Some(CellFrame::new(80, 24));
+            renderer.last_width = 80;
+            renderer.last_total_width = 80;
+            renderer.previous_lines = vec![
+                PaintLine {
+                    prefix: String::new(),
+                    prefix_tone: Tone::Muted,
+                    text: String::new(),
+                    tone: Tone::Muted,
+                    bold: false,
+                    tool_heading: None,
+                    pick: None,
+                    tail: Vec::new(),
+                };
+                24
+            ];
+            renderer.animation_activity_row = Some(1);
+            renderer
+        }
+
+        let mut open = ready_renderer();
+        open.observe_question_overlay(Some(OverlayStyle::Question));
+        open.painted_frame = Some(CellFrame::new(80, 24));
+        assert!(
+            !open.render_animation(animation_view()).expect("no io error"),
+            "an open question panel takes the full render path"
+        );
+
+        let mut closed = ready_renderer();
+        assert!(
+            closed.render_animation(animation_view()).expect("no io error"),
+            "without the panel the fast path still runs"
+        );
+    }
+
+    fn opening_and_closing_a_question_discards_the_panel_frame_once() {
         let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
         renderer.painted_frame = Some(CellFrame::new(80, 24));
 
         renderer.observe_question_overlay(Some(OverlayStyle::Picker));
         assert!(renderer.painted_frame.is_some());
+
         renderer.observe_question_overlay(Some(OverlayStyle::Question));
-        assert!(renderer.painted_frame.is_some());
+        assert!(
+            renderer.painted_frame.is_none(),
+            "the frame the panel lands on must be repainted whole"
+        );
+
+        renderer.painted_frame = Some(CellFrame::new(80, 24));
+        renderer.observe_question_overlay(Some(OverlayStyle::Question));
+        assert!(
+            renderer.painted_frame.is_some(),
+            "staying open keeps the ordinary diff"
+        );
 
         renderer.observe_question_overlay(None);
         assert!(renderer.painted_frame.is_none());
