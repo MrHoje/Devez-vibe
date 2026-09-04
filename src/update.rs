@@ -24,6 +24,7 @@ pub const RELEASE_NOTES: &[&str] = &[
     "화면 출력 기록 스위치를 추가했습니다.",
     "가운뎃점과 화살표, 이모지의 칸 수를 실제 화면과 맞춰 줄이 밀리고 겹치던 문제를 수정했습니다.",
     "카드와 선택지 창의 오른쪽 세로선이 어긋나 보이던 문제를 수정했습니다.",
+    "이모지가 많은 줄에서 카드 배경이 오른쪽부터 사라지던 문제를 수정했습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

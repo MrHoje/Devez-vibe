@@ -4697,7 +4697,15 @@ fn emit_row_sequential(
         set_cell_style(out, style)?;
         queue!(out, Print(text))?;
     }
-    set_cell_style(out, frame.cell(frame.width - 1, row).style)?;
+    // A row cut short for the console ends mid-card, so the erase has to carry
+    // the colour of the cell it stopped on. Rows that ran to the end keep using
+    // the final cell, which is the one the erase would have painted anyway.
+    let erase_column = if row_end < frame.width.saturating_sub(1) {
+        row_end.saturating_sub(1)
+    } else {
+        frame.width - 1
+    };
+    set_cell_style(out, frame.cell(erase_column, row).style)?;
     queue!(out, Clear(ClearType::UntilNewLine))?;
     queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
     Ok(())
@@ -14488,6 +14496,51 @@ mod tests {
         });
     }
 
+    /// A row cut short for the console stops inside the card, so the erase that
+    /// fills the rest has to use the colour it stopped on. Using the row's own
+    /// final cell would paint that tail in the colour outside the card and the
+    /// card would look like its background ran out early.
+    #[test]
+    fn a_cut_row_erases_in_the_colour_it_stopped_on() {
+        with_devezcode_xterm_widths(|| {
+            let card = theme::palette().user_prompt_bg;
+            let mut frame = CellFrame::new(12, 1);
+            frame.fill(
+                0,
+                0,
+                11,
+                1,
+                CellStyle {
+                    background: Some(card),
+                    ..CellStyle::plain()
+                },
+            );
+            frame.write(
+                0,
+                0,
+                "\u{00b7}\u{00b7}\u{00b7}\u{00b7}\u{00b7}\u{00b7}\u{00b7}",
+                CellStyle {
+                    background: Some(card),
+                    ..CellStyle::plain()
+                },
+            );
+            assert!(
+                console_safe_row_end(&frame, 0) < frame.width - 1,
+                "the row has to be cut for this test to mean anything"
+            );
+
+            let mut output = Vec::new();
+            emit_row_sequential(&mut output, &frame, 0, 0).expect("row emits");
+            let text = String::from_utf8(output).expect("terminal bytes are UTF-8");
+            let erase = text.rfind("\x1b[K").expect("the row ends with an erase");
+            let colour = format!("[48;2;{};{};{}m", card.0, card.1, card.2);
+            assert!(
+                text[..erase].contains(&colour),
+                "the erase carries the card colour"
+            );
+        });
+    }
+
     #[test]
     fn terminal_diff_uses_erase_for_a_changed_final_cell() {
         let previous = CellFrame::new(8, 1);
@@ -16275,9 +16328,9 @@ mod tests {
     #[test]
     fn devezcode_widths_match_xterm6_for_emoji_and_cjk() {
         with_devezcode_xterm_widths(|| {
-            assert_eq!(UnicodeWidthStr::width("🐾"), 1);
-            assert_eq!(UnicodeWidthStr::width("👩‍💻"), 2);
-            assert_eq!(UnicodeWidthStr::width("🇰🇷"), 2);
+            assert_eq!(UnicodeWidthStr::width("🐾"), 2);
+            assert_eq!(UnicodeWidthStr::width("👩‍💻"), 4);
+            assert_eq!(UnicodeWidthStr::width("🇰🇷"), 4);
             assert_eq!(UnicodeWidthStr::width("가"), 2);
             assert_eq!(UnicodeWidthChar::width('\u{0301}'), Some(0));
             assert_eq!(UnicodeWidthChar::width('\u{1ab0}'), Some(1));
@@ -16301,10 +16354,11 @@ mod tests {
 
             assert_eq!(frame.cell(0, 0).glyph, "A");
             assert_eq!(frame.cell(1, 0).glyph, "🐾");
-            assert_eq!(frame.cell(2, 0).glyph, "B");
-            assert_eq!(frame.cell(3, 0).glyph, "가");
-            assert!(frame.cell(4, 0).continuation);
-            assert_eq!(frame.cell(5, 0).glyph, "C");
+            assert!(frame.cell(2, 0).continuation);
+            assert_eq!(frame.cell(3, 0).glyph, "B");
+            assert_eq!(frame.cell(4, 0).glyph, "가");
+            assert!(frame.cell(5, 0).continuation);
+            assert_eq!(frame.cell(6, 0).glyph, "C");
         });
     }
 

@@ -363,11 +363,10 @@ fn xterm_unicode6_width(codepoint: u32) -> usize {
     if in_sorted_ranges(codepoint, XTERM6_HIGH_COMBINING) {
         return 0;
     }
-    if (0x20000..=0x2fffd).contains(&codepoint) || (0x30000..=0x3fffd).contains(&codepoint) {
-        2
-    } else {
-        1
-    }
+    // Both layers give an astral character two columns: the console counts the
+    // surrogate pair, and the renderer draws the emoji double width. Only the
+    // ambiguous BMP characters below disagree, and those stay one column here.
+    2
 }
 
 /// Columns the console reserves for a character, which is not always what the
@@ -558,9 +557,9 @@ mod tests {
     }
 
     #[test]
-    fn display_profile_wraps_five_paw_prints_as_five_cells() {
+    fn paw_prints_take_two_cells_each_like_both_layers_draw_them() {
         with_devezcode_xterm_widths(|| {
-            assert_eq!(wrap_ascii_space("🐾🐾🐾🐾🐾", 5), ["🐾🐾🐾🐾🐾"]);
+            assert_eq!(wrap_ascii_space("🐾🐾🐾🐾🐾", 5), ["🐾🐾", "🐾🐾", "🐾"]);
         });
     }
 
