@@ -39,7 +39,7 @@ use crate::{
     },
     syntax::{self, SyntaxKind},
     terminal_width::{
-        UnicodeWidthChar, UnicodeWidthStr, host_may_draw_narrower, width_may_differ_on_host,
+        UnicodeWidthChar, UnicodeWidthStr, console_width, width_may_differ_on_host,
         wrap_ascii_space,
     },
     theme::{self, Rgb, ThemeKind},
@@ -4026,16 +4026,6 @@ fn plan_row_requires_full_repaint(previous: &PaintLine, current: &PaintLine) -> 
 /// on such a row must repaint it whole: a cell diff moves the cursor into the
 /// row's middle, and ConPTY re-synthesizes that jump with each wide glyph
 /// duplicated and the columns drifted.
-/// Whether any glyph on the row is one the web renderer may draw narrower than
-/// the console reserved for it, which pulls the rest of the row left on screen.
-fn paint_line_holds_narrower_host_glyphs(line: &PaintLine) -> bool {
-    std::iter::once(line.prefix.as_str())
-        .chain(std::iter::once(line.text.as_str()))
-        .chain(line.tail.iter().map(|span| span.text.as_str()))
-        .flat_map(str::chars)
-        .any(host_may_draw_narrower)
-}
-
 fn paint_line_holds_wide_glyphs(line: &PaintLine) -> bool {
     std::iter::once(line.prefix.as_str())
         .chain(std::iter::once(line.text.as_str()))
@@ -4302,20 +4292,7 @@ fn paint_line_into_frame(
         let trailing_right = boxed_content
             .as_ref()
             .map(|columns| columns.end)
-            .unwrap_or_else(|| {
-                let right = background_width.unwrap_or(frame.width);
-                // The card normally leaves the final column bare. A row holding
-                // an emoji is drawn narrower than the console reserved for it,
-                // so its cells sit further left and the gap that opens at the
-                // right edge would stay unpainted. Painting that last column
-                // too lets the end-of-line erase carry the card colour across
-                // the gap.
-                if paint_line_holds_narrower_host_glyphs(line) {
-                    right
-                } else {
-                    right.saturating_sub(1)
-                }
-            });
+            .unwrap_or_else(|| background_width.unwrap_or(frame.width).saturating_sub(1));
         let (start, right) = if matches!(line.tone, Tone::UserPrompt | Tone::UserPromptPadding) {
             let prompt_prefix = boxed_content
                 .as_ref()
@@ -4519,7 +4496,8 @@ fn emit_frame_diff_at(
                 .then_some(0),
         }
         .filter(|start| start + 1 < current.width);
-        let diff_end = tail_start.unwrap_or(current.width);
+        let row_end = console_safe_row_end(current, row);
+        let diff_end = tail_start.unwrap_or(current.width).min(row_end);
         let mut column = 0;
         while column < diff_end {
             let cell = current.cell(column, row);
@@ -4654,6 +4632,37 @@ fn tail_repaint_start(previous: &CellFrame, current: &CellFrame, row: usize) -> 
 /// Clears and repaints a semantic plan row from its first column without moving
 /// the cursor between style runs. ConPTY can duplicate wide glyphs when a host
 /// overwrites an existing Korean row or replays a cursor jump in its middle.
+/// The column a row has to stop at so the console never wraps it onto the next
+/// line. Layout follows what the web renderer draws, but the console reserves
+/// an extra column for a middle dot, an arrow or an emoji; a row laid out to
+/// the full width would therefore run past the right edge and push the whole
+/// screen down. Trailing cells beyond this point are dropped, and the row's
+/// end-of-line erase paints that tail in the row's own colour.
+fn console_safe_row_end(frame: &CellFrame, row: usize) -> usize {
+    let console_columns = |column: usize| {
+        let cell = frame.cell(column, row);
+        if cell.continuation {
+            0
+        } else {
+            console_width(&cell.glyph).max(1)
+        }
+    };
+    // Rows that fit keep the ordinary path, including the erase that paints the
+    // physical final cell without printing into the autowrap column.
+    if (0..frame.width).map(console_columns).sum::<usize>() <= frame.width {
+        return frame.width;
+    }
+    let mut used = 0;
+    for column in 0..frame.width {
+        let width = console_columns(column);
+        if used + width >= frame.width {
+            return column;
+        }
+        used += width;
+    }
+    frame.width
+}
+
 fn emit_row_sequential(
     out: &mut impl Write,
     frame: &CellFrame,
@@ -4670,11 +4679,12 @@ fn emit_row_sequential(
         ResetColor,
         Clear(ClearType::CurrentLine)
     )?;
+    let row_end = console_safe_row_end(frame, row).min(frame.width.saturating_sub(1));
     let mut column = 0;
-    while column + 1 < frame.width {
+    while column < row_end {
         let style = frame.cell(column, row).style;
         let mut text = String::new();
-        while column + 1 < frame.width {
+        while column < row_end {
             let cell = frame.cell(column, row);
             if !cell.continuation && cell.style != style {
                 break;
@@ -14020,40 +14030,6 @@ mod tests {
         assert_eq!(frame.cell(7, 0).style.background, None);
     }
 
-    /// An emoji is drawn one column narrower than the console reserved for it,
-    /// so its row sits pulled left on screen. Painting the final column too
-    /// lets the end-of-line erase carry the card colour across that gap.
-    #[test]
-    fn an_emoji_prompt_row_paints_its_rightmost_cell_too() {
-        set_chat_layout(false);
-        with_devezcode_xterm_widths(|| {
-            let mut frame = CellFrame::new(8, 1);
-
-            paint_line_into_frame(
-                &mut frame,
-                0,
-                &PaintLine {
-                    prefix: " ".to_owned(),
-                    prefix_tone: Tone::Plain,
-                    text: "\u{1f43e}".to_owned(),
-                    tone: Tone::UserPrompt,
-                    bold: true,
-                    tool_heading: None,
-                    pick: None,
-                    tail: Vec::new(),
-                },
-                None,
-                None,
-                None,
-            );
-
-            assert_eq!(
-                frame.cell(7, 0).style.background,
-                row_background(Tone::UserPrompt)
-            );
-        });
-    }
-
     #[test]
     fn user_prompt_border_uses_the_prompt_background() {
         set_chat_layout(false);
@@ -14487,6 +14463,29 @@ mod tests {
                 .expect("terminal bytes are UTF-8")
                 .ends_with("\x1b[?2026l")
         );
+    }
+
+    /// The console reserves an extra column for a middle dot, so a row filled
+    /// with them runs past the right edge and would wrap the screen down a
+    /// line. The row stops early instead; its end-of-line erase paints the rest.
+    #[test]
+    fn a_row_the_console_counts_wider_stops_before_the_right_edge() {
+        with_devezcode_xterm_widths(|| {
+            let mut frame = CellFrame::new(8, 1);
+            frame.write(0, 0, "\u{00b7}\u{00b7}\u{00b7}\u{00b7}\u{00b7}", CellStyle::plain());
+            assert!(
+                console_safe_row_end(&frame, 0) < frame.width,
+                "a row the console counts as wider than the screen stops early"
+            );
+
+            let mut plain = CellFrame::new(8, 1);
+            plain.write(0, 0, "abcde", CellStyle::plain());
+            assert_eq!(
+                console_safe_row_end(&plain, 0),
+                plain.width,
+                "a row that fits keeps the ordinary path"
+            );
+        });
     }
 
     #[test]
@@ -16276,13 +16275,13 @@ mod tests {
     #[test]
     fn devezcode_widths_match_xterm6_for_emoji_and_cjk() {
         with_devezcode_xterm_widths(|| {
-            assert_eq!(UnicodeWidthStr::width("🐾"), 2);
-            assert_eq!(UnicodeWidthStr::width("👩‍💻"), 4);
-            assert_eq!(UnicodeWidthStr::width("🇰🇷"), 4);
+            assert_eq!(UnicodeWidthStr::width("🐾"), 1);
+            assert_eq!(UnicodeWidthStr::width("👩‍💻"), 2);
+            assert_eq!(UnicodeWidthStr::width("🇰🇷"), 2);
             assert_eq!(UnicodeWidthStr::width("가"), 2);
             assert_eq!(UnicodeWidthChar::width('\u{0301}'), Some(0));
             assert_eq!(UnicodeWidthChar::width('\u{1ab0}'), Some(1));
-            assert_eq!(UnicodeWidthChar::width('\u{1d167}'), Some(2));
+            assert_eq!(UnicodeWidthChar::width('\u{1d167}'), Some(0));
             assert_eq!(
                 UnicodeWidthChar::width(char::from_u32(0x20000).expect("CJK extension")),
                 Some(2)
@@ -16302,11 +16301,10 @@ mod tests {
 
             assert_eq!(frame.cell(0, 0).glyph, "A");
             assert_eq!(frame.cell(1, 0).glyph, "🐾");
-            assert!(frame.cell(2, 0).continuation);
-            assert_eq!(frame.cell(3, 0).glyph, "B");
-            assert_eq!(frame.cell(4, 0).glyph, "가");
-            assert!(frame.cell(5, 0).continuation);
-            assert_eq!(frame.cell(6, 0).glyph, "C");
+            assert_eq!(frame.cell(2, 0).glyph, "B");
+            assert_eq!(frame.cell(3, 0).glyph, "가");
+            assert!(frame.cell(4, 0).continuation);
+            assert_eq!(frame.cell(5, 0).glyph, "C");
         });
     }
 

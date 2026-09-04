@@ -48,15 +48,6 @@ pub(crate) fn width_may_differ_on_host(ch: char) -> bool {
     UnicodeWidthChar::width(ch).unwrap_or(0) != ModernUnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
-/// Characters the web renderer on top of the console may draw one column
-/// narrower than the console reserved for them. The console counts a surrogate
-/// pair as two columns, but the bundled Unicode 6 provider gives an astral
-/// emoji a single cell, so a row carrying one ends up pulled left on screen and
-/// leaves an unpainted gap at its right edge.
-pub(crate) fn host_may_draw_narrower(ch: char) -> bool {
-    use_devezcode_xterm_widths() && ch as u32 >= 0x10000
-}
-
 /// Exact combining ranges from the bundled xterm 6 `UnicodeV6.ts` provider.
 /// Newer combining marks deliberately stay width 1 because that is what the
 /// actual host buffer does; mixing Unicode versions is the bug this module prevents.
@@ -329,6 +320,22 @@ const CONSOLE_WIDE_AMBIGUOUS: &[(u32, u32)] = &[
     (0xf8f7, 0xf8f7),
 ];
 
+const XTERM6_HIGH_COMBINING: &[(u32, u32)] = &[
+    (0x10a01, 0x10a03),
+    (0x10a05, 0x10a06),
+    (0x10a0c, 0x10a0f),
+    (0x10a38, 0x10a3a),
+    (0x10a3f, 0x10a3f),
+    (0x1d167, 0x1d169),
+    (0x1d173, 0x1d182),
+    (0x1d185, 0x1d18b),
+    (0x1d1aa, 0x1d1ad),
+    (0x1d242, 0x1d244),
+    (0xe0001, 0xe0001),
+    (0xe0020, 0xe007f),
+    (0xe0100, 0xe01ef),
+];
+
 fn xterm_unicode6_width(codepoint: u32) -> usize {
     if codepoint < 0x20 || (0x7f..0xa0).contains(&codepoint) {
         return 0;
@@ -339,9 +346,6 @@ fn xterm_unicode6_width(codepoint: u32) -> usize {
     if codepoint < 0x10000 {
         if in_sorted_ranges(codepoint, XTERM6_BMP_COMBINING) {
             return 0;
-        }
-        if in_sorted_ranges(codepoint, CONSOLE_WIDE_AMBIGUOUS) {
-            return 2;
         }
         return usize::from(
             codepoint >= 0x1100
@@ -356,10 +360,40 @@ fn xterm_unicode6_width(codepoint: u32) -> usize {
                     || (0xffe0..=0xffe6).contains(&codepoint)),
         ) + 1;
     }
-    // Above the BMP the console advances two columns for every character it is
-    // given, emoji and combining marks alike, because it counts the surrogate
-    // pair rather than the glyph. Measured, not assumed.
-    2
+    if in_sorted_ranges(codepoint, XTERM6_HIGH_COMBINING) {
+        return 0;
+    }
+    if (0x20000..=0x2fffd).contains(&codepoint) || (0x30000..=0x3fffd).contains(&codepoint) {
+        2
+    } else {
+        1
+    }
+}
+
+/// Columns the console reserves for a character, which is not always what the
+/// web renderer on top of it draws. Measured on this platform by writing each
+/// character to a console and reading the cursor column back: the console
+/// counts a surrogate pair as two columns and widens 598 ambiguous characters —
+/// the middle dot and the arrows among them — that the renderer keeps narrow.
+/// Layout follows the renderer so borders line up; this is what output has to
+/// stay under so a row never wraps itself onto the next line.
+pub(crate) fn console_width_char(ch: char) -> usize {
+    let displayed = UnicodeWidthChar::width(ch).unwrap_or(0);
+    if !use_devezcode_xterm_widths() {
+        return displayed;
+    }
+    let codepoint = ch as u32;
+    if codepoint >= 0x10000 {
+        return 2;
+    }
+    if displayed == 1 && in_sorted_ranges(codepoint, CONSOLE_WIDE_AMBIGUOUS) {
+        return 2;
+    }
+    displayed
+}
+
+pub(crate) fn console_width(text: &str) -> usize {
+    text.chars().map(console_width_char).sum()
 }
 
 #[cfg(not(test))]
@@ -514,8 +548,8 @@ mod tests {
                 ('가', 2),
             ] {
                 assert_eq!(
-                    UnicodeWidthChar::width(ch),
-                    Some(columns),
+                    console_width_char(ch),
+                    columns,
                     "U+{:04X} takes {columns} console columns",
                     ch as u32
                 );
@@ -524,9 +558,9 @@ mod tests {
     }
 
     #[test]
-    fn console_profile_wraps_paw_prints_as_two_cells_each() {
+    fn display_profile_wraps_five_paw_prints_as_five_cells() {
         with_devezcode_xterm_widths(|| {
-            assert_eq!(wrap_ascii_space("🐾🐾🐾🐾🐾", 5), ["🐾🐾", "🐾🐾", "🐾"]);
+            assert_eq!(wrap_ascii_space("🐾🐾🐾🐾🐾", 5), ["🐾🐾🐾🐾🐾"]);
         });
     }
 
