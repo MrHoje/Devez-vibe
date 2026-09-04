@@ -6020,13 +6020,32 @@ impl AppState {
             }
             return Action::Interrupt;
         }
-        if !self.pending_interrupt {
-            self.pending_interrupt = true;
-            self.turn_interrupted = true;
-            self.last_completed_duration = self.turn_started_at.map(|started| started.elapsed());
-            self.last_completed_at = self.last_completed_duration.map(|_| chrono::Local::now());
-        }
+        self.remember_interrupt();
         Action::Tick(true)
+    }
+
+    /// Esc pressed while a prompt is still on its way to the runtime. There is no
+    /// turn to interrupt yet, so the request is remembered and leaves with the
+    /// turn as soon as it opens. Returns whether the screen has something new.
+    pub fn note_interrupt_while_sending(&mut self) -> bool {
+        // A turn that is already live belongs to the event loop's own Esc, which
+        // ends the wait it would be racing against anyway.
+        if self.thread_pending() || self.turn_id.is_some() || self.pending_interrupt {
+            return false;
+        }
+        self.discard_unanswered_turn_prompts();
+        self.remember_interrupt();
+        true
+    }
+
+    fn remember_interrupt(&mut self) {
+        if self.pending_interrupt {
+            return;
+        }
+        self.pending_interrupt = true;
+        self.turn_interrupted = true;
+        self.last_completed_duration = self.turn_started_at.map(|started| started.elapsed());
+        self.last_completed_at = self.last_completed_duration.map(|_| chrono::Local::now());
     }
 
     fn discard_unanswered_turn_prompts(&mut self) {
@@ -21181,6 +21200,36 @@ mod tests {
         assert_eq!(state.editor.text(), "응답 뒤 중단한 요청");
         state.editor.history_previous();
         assert_eq!(state.editor.text(), "완료한 요청");
+    }
+
+    /// Esc pressed while the prompt is still on its way has no turn to stop yet.
+    /// The cancel has to survive that gap and leave with the turn that opens.
+    #[test]
+    fn cancel_during_a_prompt_send_leaves_with_the_turn_that_opens() {
+        let mut state = test_state();
+        state.editor.set_text("보내자마자 중단할 요청");
+        assert!(matches!(state.submit_editor(), Action::Submit(_)));
+
+        assert!(state.note_interrupt_while_sending());
+        // The same Esc held down must not queue a second cancel.
+        assert!(!state.note_interrupt_while_sending());
+        assert!(state.turn_interrupted);
+
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
+        assert_eq!(state.take_pending_interrupt().as_deref(), Some("turn-1"));
+        assert!(state.take_pending_interrupt().is_none());
+    }
+
+    /// A live turn belongs to the event loop's own Esc, which is not racing a send.
+    #[test]
+    fn cancel_during_a_send_is_ignored_once_the_turn_is_live() {
+        let mut state = test_state();
+        state.editor.set_text("이미 시작한 요청");
+        assert!(matches!(state.submit_editor(), Action::Submit(_)));
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
+
+        assert!(!state.note_interrupt_while_sending());
+        assert!(state.take_pending_interrupt().is_none());
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod claude;
 mod completion;
 mod devezcode;
 mod editor;
+mod input_hub;
 mod input_log;
 mod integrations;
 mod open_code;
@@ -439,6 +440,8 @@ async fn run_after_startup(
     queued: Option<String>,
 ) -> Result<()> {
     draw(state, renderer)?;
+    // Startup's own stream is gone by now, so the shared one can take the terminal.
+    input_hub::install();
 
     let (update_tx, update_rx) = mpsc::channel(1);
     tokio::spawn(async move {
@@ -457,40 +460,86 @@ async fn run_after_startup(
 }
 
 /// Keeps the activity row alive while a request needed to begin a turn is waiting
-/// for its acknowledgement. The request itself still owns the ordering; only the
-/// paint clock is allowed to advance alongside it.
+/// for its acknowledgement, and takes the Esc pressed during that wait. The
+/// request itself still owns the ordering; only the paint clock and the cancel
+/// are allowed to advance alongside it.
 async fn await_with_activity<T>(
     state: &mut AppState,
     renderer: &mut Renderer,
     request: impl Future<Output = T>,
 ) -> Result<T> {
-    await_with_ticks(request, Duration::from_millis(80), || {
-        let tick = state.render_tick();
-        if !tick.redraw {
-            return Ok(());
-        }
-        let animated = tick.animation_only && renderer.render_animation(state.animation_view())?;
-        if !animated {
-            draw(state, renderer)?;
-        }
-        Ok(())
-    })
+    await_with_ticks(
+        request,
+        Duration::from_millis(80),
+        true,
+        |wake| match wake {
+            Wake::Tick => activity_frame(state, renderer),
+            // Esc here means the prompt just sent, so the cancel is recorded now and
+            // leaves with the turn the moment it opens. Everything else waits for the
+            // event loop's own key handling.
+            Wake::Input(Ok(Event::Key(key))) if is_wait_interrupt_key(&key) => {
+                if state.note_interrupt_while_sending() {
+                    draw(state, renderer)?;
+                }
+                Ok(())
+            }
+            Wake::Input(event) => {
+                input_hub::defer(event);
+                Ok(())
+            }
+        },
+    )
     .await
+}
+
+/// The paint the activity row needs between a request and its answer.
+fn activity_frame(state: &mut AppState, renderer: &mut Renderer) -> Result<()> {
+    let tick = state.render_tick();
+    if !tick.redraw {
+        return Ok(());
+    }
+    let animated = tick.animation_only && renderer.render_animation(state.animation_view())?;
+    if !animated {
+        draw(state, renderer)?;
+    }
+    Ok(())
+}
+
+/// Esc alone, and only as a press: a wait is no place to guess at the other
+/// meanings the event loop gives the key.
+fn is_wait_interrupt_key(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Esc
+        && key.modifiers.is_empty()
+        && !matches!(key.kind, KeyEventKind::Release)
+}
+
+/// What woke a waiting request: the paint clock, or a key the user pressed while
+/// the request was still in flight.
+enum Wake {
+    Tick,
+    Input(input_hub::Incoming),
 }
 
 async fn await_with_ticks<T>(
     request: impl Future<Output = T>,
     interval: Duration,
-    mut on_tick: impl FnMut() -> Result<()>,
+    read_input: bool,
+    mut on_wake: impl FnMut(Wake) -> Result<()>,
 ) -> Result<T> {
     let start = tokio::time::Instant::now() + interval;
     let mut ticker = tokio::time::interval_at(start, interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut reading_input = read_input;
     tokio::pin!(request);
     loop {
         tokio::select! {
             response = &mut request => return Ok(response),
-            _ = ticker.tick() => on_tick()?,
+            _ = ticker.tick() => on_wake(Wake::Tick)?,
+            event = input_hub::next_event(), if reading_input => match event {
+                Some(event) => on_wake(Wake::Input(event))?,
+                // The terminal closed its stream; only the request can end the wait now.
+                None => reading_input = false,
+            },
         }
     }
 }
@@ -1395,7 +1444,6 @@ async fn event_loop(
     update_rx: mpsc::Receiver<String>,
 ) -> Result<()> {
     let mut update_rx = Some(update_rx);
-    let mut terminal_events = EventStream::new();
     let mut composer_paste = ComposerPasteBuffer::new();
     let mut preedit_capture = PreeditCapture::default();
     let mut alt_code = AltCodeKeys::default();
@@ -1535,7 +1583,7 @@ async fn event_loop(
         let mut action_focus = split_focus;
         let paste_deadline = composer_paste.flush_deadline();
         let action = tokio::select! {
-            terminal_event = terminal_events.next() => {
+            terminal_event = input_hub::next_event() => {
                 match terminal_event {
                     Some(Ok(Event::Key(key))) if preedit_capture.claims(&key) => {
                         match preedit_capture.observe(alt_code.normalize(key)) {
@@ -8328,6 +8376,39 @@ mod tests {
         assert_eq!(guard, None);
     }
 
+    /// Only a bare Esc press cancels a send. Anything the event loop gives another
+    /// meaning to has to reach it untouched.
+    #[test]
+    fn only_a_bare_escape_press_cancels_a_waiting_send() {
+        use crossterm::event::{KeyEventKind, KeyEventState};
+
+        let escape = |modifiers, kind| KeyEvent {
+            code: KeyCode::Esc,
+            modifiers,
+            kind,
+            state: KeyEventState::NONE,
+        };
+
+        assert!(is_wait_interrupt_key(&escape(
+            KeyModifiers::NONE,
+            KeyEventKind::Press
+        )));
+        assert!(!is_wait_interrupt_key(&escape(
+            KeyModifiers::NONE,
+            KeyEventKind::Release
+        )));
+        assert!(!is_wait_interrupt_key(&escape(
+            KeyModifiers::SHIFT,
+            KeyEventKind::Press
+        )));
+        assert!(!is_wait_interrupt_key(&KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }));
+    }
+
     #[tokio::test]
     async fn a_slow_start_request_keeps_advancing_its_paint_clock() {
         use std::sync::{
@@ -8349,7 +8430,10 @@ mod tests {
                     "ready"
                 },
                 Duration::from_millis(2),
-                || {
+                // The terminal belongs to the test harness here, so the wait
+                // watches its clock alone.
+                false,
+                |_| {
                     ticks.fetch_add(1, Ordering::SeqCst);
                     wake.notify_one();
                     Ok(())
