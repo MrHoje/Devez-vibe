@@ -38,7 +38,7 @@ use crate::{
         QUESTION_TAB_SEPARATOR, ShellDisplayMode,
     },
     syntax::{self, SyntaxKind},
-    terminal_width::{UnicodeWidthChar, UnicodeWidthStr, wrap_ascii_space},
+    terminal_width::{UnicodeWidthChar, UnicodeWidthStr, width_may_differ_on_host, wrap_ascii_space},
     theme::{self, Rgb, ThemeKind},
 };
 
@@ -3987,7 +3987,15 @@ fn paint_line_holds_wide_glyphs(line: &PaintLine) -> bool {
         .chain(std::iter::once(line.text.as_str()))
         .chain(line.tail.iter().map(|span| span.text.as_str()))
         .flat_map(str::chars)
-        .any(|ch| UnicodeWidthChar::width(ch).unwrap_or(0) > 1)
+        .any(|ch| UnicodeWidthChar::width(ch).unwrap_or(0) > 1 || width_may_differ_on_host(ch))
+}
+
+/// A cell whose columns the host may lay out differently than this frame did:
+/// the trailing half of a wide glyph, or a character the console sizes as two
+/// cells while this build keeps it at one (a modern emoji under the xterm 6
+/// profile). Either way a mid-row patch comes back with the columns shifted.
+fn cell_columns_may_shift_on_host(cell: &Cell) -> bool {
+    cell.continuation || cell.glyph.chars().any(width_may_differ_on_host)
 }
 
 /// The cell-level twin of [`paint_line_holds_wide_glyphs`] for one-row frames:
@@ -3999,7 +4007,8 @@ fn wide_row_needs_sequential_repaint(previous: &CellFrame, current: &CellFrame) 
     }
     (0..current.width).any(|column| previous.cell(column, 0) != current.cell(column, 0))
         && (0..current.width).any(|column| {
-            previous.cell(column, 0).continuation || current.cell(column, 0).continuation
+            cell_columns_may_shift_on_host(previous.cell(column, 0))
+                || cell_columns_may_shift_on_host(current.cell(column, 0))
         })
 }
 
@@ -4026,7 +4035,7 @@ fn wide_rows_requiring_sequential_repaint(
                 && previous.cells[start..end]
                     .iter()
                     .chain(&current.cells[start..end])
-                    .any(|cell| cell.continuation)
+                    .any(cell_columns_may_shift_on_host)
         })
         .collect()
 }
@@ -4439,7 +4448,7 @@ fn emit_frame_diff_at(
             // glyph still walks from column zero in one continuous run so the
             // host never replays style-run jumps into its middle.
             None => (0..current.width)
-                .any(|column| current.cell(column, row).continuation)
+                .any(|column| cell_columns_may_shift_on_host(current.cell(column, row)))
                 .then_some(0),
         }
         .filter(|start| start + 1 < current.width);
@@ -4559,8 +4568,8 @@ fn tail_repaint_start(previous: &CellFrame, current: &CellFrame, row: usize) -> 
     let row_carries_wide = (0..current.width).any(|column| {
         let before = previous.cell(column, row);
         let after = current.cell(column, row);
-        before.continuation
-            || after.continuation
+        cell_columns_may_shift_on_host(before)
+            || cell_columns_may_shift_on_host(after)
             || UnicodeWidthStr::width(before.glyph.as_str()) > 1
             || UnicodeWidthStr::width(after.glyph.as_str()) > 1
     });
@@ -25576,6 +25585,28 @@ mod tests {
     /// replays with the wide glyphs duplicated, so the picker protects none of
     /// its rows and each changed option row repaints from column zero.
     #[test]
+    /// A modern emoji stays one cell under the xterm 6 profile while the console
+    /// that replays our output sizes it as two. Such a row must reprint whole,
+    /// or the patch comes back with every column after the emoji shifted.
+    #[test]
+    fn an_emoji_row_repaints_sequentially_even_though_its_cells_are_narrow() {
+        with_devezcode_xterm_widths(|| {
+            let mut previous = CellFrame::new(32, 2);
+            previous.write(0, 0, "\u{1f43e} paw row (12s)", CellStyle::plain());
+            previous.write(0, 1, "plain ascii row (12s)", CellStyle::plain());
+            let mut current = previous.clone();
+            current.write(0, 0, "\u{1f43e} paw row (40s)", CellStyle::plain());
+            current.write(0, 1, "plain ascii row (40s)", CellStyle::plain());
+
+            let rows = wide_rows_requiring_sequential_repaint(Some(&previous), &current, 0..0);
+            assert_eq!(
+                rows,
+                vec![0],
+                "the emoji row reprints whole while the ascii row keeps its diff"
+            );
+        });
+    }
+
     fn an_open_question_panel_repaints_its_korean_option_rows_sequentially() {
         let mut previous = CellFrame::new(32, 3);
         previous.write(0, 0, "무엇을 할까요?", CellStyle::plain());

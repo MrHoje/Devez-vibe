@@ -20,6 +20,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
     "선택지 창이 뜨는 순간 한글이 다른 글자로 보이던 문제를 수정했습니다.",
+    "이모지가 들어간 줄 때문에 화면이 한 줄씩 어긋나 겹쳐 보이던 문제를 수정했습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

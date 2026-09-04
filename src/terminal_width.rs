@@ -39,6 +39,15 @@ impl UnicodeWidthStr {
     }
 }
 
+/// Characters this build and the host may size differently. The xterm 6 profile
+/// keeps a modern emoji at one cell, while the console layer that replays our
+/// output sizes it as two. A mid-row patch on such a row therefore comes back
+/// with its columns shifted, exactly as a wide glyph does, so callers treat
+/// those rows as wide and reprint them whole from column zero.
+pub(crate) fn width_may_differ_on_host(ch: char) -> bool {
+    UnicodeWidthChar::width(ch).unwrap_or(0) != ModernUnicodeWidthChar::width(ch).unwrap_or(0)
+}
+
 /// Exact combining ranges from the bundled xterm 6 `UnicodeV6.ts` provider.
 /// Newer combining marks deliberately stay width 1 because that is what the
 /// actual host buffer does; mixing Unicode versions is the bug this module prevents.
