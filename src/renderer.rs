@@ -6560,8 +6560,10 @@ fn normal_frame_with_expansion(
     let mut composer_notice = status.composer_notice.as_deref();
     let mut composer_controls_mode = composer_mode;
     let activity_uses_composer_spacer = activity.is_some() && suggestions.is_empty();
-    let idle_controls_can_use_composer_spacer =
-        activity.is_none() && suggestions.is_empty() && composer_mode.is_some();
+    // A suggestion panel still leaves the spacer above the composer, so the
+    // controls keep that row instead of dropping onto the composer rule the
+    // moment `/`, `@` or `$` opens the list.
+    let idle_controls_can_use_composer_spacer = activity.is_none() && composer_mode.is_some();
     let mut activity_index = None;
     // Transient rows stay in the pinned dock instead of scrolling away with the
     // conversation. Activity leads any command suggestions.
