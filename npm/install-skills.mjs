@@ -10,14 +10,14 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const packageRoot = dirname(fileURLToPath(import.meta.url));
-const sourceRoot = join(packageRoot, "skills", "luna-loop");
+const skillNames = ["luna-loop", "insane-search"];
 const userHome = homedir();
 const codexHome = process.env.CODEX_HOME?.trim() || join(userHome, ".codex");
 const claudeHome = process.env.CLAUDE_CONFIG_DIR?.trim() || join(userHome, ".claude");
 
-const targets = [
-  { name: "Codex", path: join(codexHome, "skills", "luna-loop") },
-  { name: "Claude", path: join(claudeHome, "skills", "luna-loop") },
+const homes = [
+  { name: "Codex", root: join(codexHome, "skills") },
+  { name: "Claude", root: join(claudeHome, "skills") },
 ];
 
 function copyTree(source, destination) {
@@ -47,20 +47,25 @@ function pruneTree(source, destination) {
   }
 }
 
-if (!existsSync(join(sourceRoot, "SKILL.md"))) {
-  console.error(`스킬 원본(luna-loop)을 찾지 못했습니다: ${sourceRoot}`);
-  process.exit(1);
-}
-
 let failed = false;
-for (const target of targets) {
-  try {
-    copyTree(sourceRoot, target.path);
-    pruneTree(sourceRoot, target.path);
-    console.log(`스킬 설치 완료 (${target.name}): ${target.path}`);
-  } catch (error) {
+for (const skill of skillNames) {
+  const sourceRoot = join(packageRoot, "skills", skill);
+  // 원본이 없으면 그 스킬만 건너뛴다. 하나가 빠졌다고 나머지 설치까지 막지 않는다.
+  if (!existsSync(join(sourceRoot, "SKILL.md"))) {
     failed = true;
-    console.error(`스킬 설치 실패 (${target.name}): ${error instanceof Error ? error.message : error}`);
+    console.error(`스킬 원본(${skill})을 찾지 못했습니다: ${sourceRoot}`);
+    continue;
+  }
+  for (const home of homes) {
+    const target = join(home.root, skill);
+    try {
+      copyTree(sourceRoot, target);
+      pruneTree(sourceRoot, target);
+      console.log(`스킬 설치 완료 (${home.name}/${skill}): ${target}`);
+    } catch (error) {
+      failed = true;
+      console.error(`스킬 설치 실패 (${home.name}/${skill}): ${error instanceof Error ? error.message : error}`);
+    }
   }
 }
 

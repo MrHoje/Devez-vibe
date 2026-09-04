@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OpenCode 모델색 대안 시안</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: "Pretendard", "Malgun Gothic", sans-serif; margin: 0; padding: 28px; background: #101012; color: #E8E8E8; }
+  h1 { font-size: 22px; margin: 0 0 8px; }
+  .sub { color: #AAAAAA; font-size: 13px; margin-bottom: 18px; line-height: 1.6; }
+  .toolbar { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
+  .toolbar button { border: 1px solid #555; background: #1F1F1E; color: #E8E8E8; padding: 8px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+  .toolbar button.active { background: #E8E8E8; color: #111; border-color: #E8E8E8; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
+  .card { border-radius: 14px; padding: 18px; border: 1px solid rgba(128,128,128,.35); }
+  .card h2 { font-size: 15px; margin: 0 0 4px; }
+  .card .hex { font-family: monospace; font-size: 13px; opacity: .9; }
+  .card .desc { font-size: 12.5px; line-height: 1.6; opacity: .85; margin: 8px 0 12px; }
+  .preview { border-radius: 10px; padding: 12px; margin-bottom: 10px; }
+  .row { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 6px 8px; border-radius: 8px; }
+  .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid currentColor; white-space: nowrap; }
+  .composer { margin-top: 10px; border-radius: 8px; padding: 10px; font-size: 13px; border: 1px dashed rgba(128,128,128,.6); }
+  .meta { display: flex; gap: 8px; flex-wrap: wrap; font-size: 11px; opacity: .85; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; vertical-align: -1px; margin-right: 4px; border: 1px solid rgba(0,0,0,.3); }
+  .current { outline: 2px solid #888; }
+  body.light { background: #F2F2F2; color: #1F2937; }
+  body.light .sub { color: #5F6774; }
+  body.light .toolbar button { background: #fff; color: #111; border-color: #ccc; }
+  body.light .toolbar button.active { background: #111; color: #fff; border-color: #111; }
+  .pick { margin-top: 10px; display: flex; gap: 8px; }
+  .pick button { flex: 1; border-radius: 8px; border: 1px solid currentColor; background: transparent; padding: 7px; cursor: pointer; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>OpenCode 모델색 대안 6종</h1>
+<div class="sub">
+현재 색이 탁해 보이는 이유: 채도가 낮고 명도 대비가 약해서 배경에 묻힘.<br>
+아래는 같은 따뜻함 유지형 2종 + 시인성 우선형 4종. 상단 버튼으로 어두운/밝은 배경에서 비교 가능.<br>
+컴포저 입력 글자는 현재 기본 텍스트색(어두운 배경 #E8E8E8 / 밝은 배경 #0F172A) 그대로 두는 전제.
+</div>
+<div class="toolbar">
+<button id="btnDark" class="active">어두운 배경</button>
+<button id="btnLight">밝은 배경</button>
+</div>
+<div class="grid" id="grid"></div>
+<script>
+const alternatives = [
+  {
+    id: "A", name: "A · 현재 색 (기준)",
+    dark: "#D0B28D", light: "#806447",
+    desc: "지금 적용된 탁한 베이지. 따뜻하지만 채도가 낮아 다른 모델색보다 흐릿함.",
+    pros: "따뜻한 정체성 유지", cons: "탁함, 시인성 낮음", current: true
+  },
+  {
+    id: "B", name: "B · 생생한 앰버",
+    dark: "#FBBF24", light: "#B45309",
+    desc: "베이지 계열을 살리면서 채도를 확 올린 형태. 어두운 배경에서 가장 잘 띔.",
+    pros: "정체성 유지 + 선명", cons: "경고색과 살짝 근접"
+  },
+  {
+    id: "C", name: "C · 제공자 블루 통일",
+    dark: "#60A5FA", light: "#2563EB",
+    desc: "다른 모델과 같은 기본 파랑으로 통일. 가장 정돈되고 기본색에 가까움.",
+    pros: "가장 기본, 깔끔", cons: "OpenCode 구분감 약해짐"
+  },
+  {
+    id: "D", name: "D · 청량한 시안",
+    dark: "#22D3EE", light: "#0E7490",
+    desc: "파랑에서 살짝 벗어난 시원한 하늘색. 기존 파랑 모델과 겹치지 않음.",
+    pros: "산뜻, 구분 잘됨", cons: "차가운 인상"
+  },
+  {
+    id: "E", name: "E · 산호 로즈",
+    dark: "#FB7185", light: "#BE123C",
+    desc: "따뜻한 계열을 유지하되 붉은기로 선명하게. 어두운 배경 대비가 강함.",
+    pros: "따뜻 + 존재감", cons: "오류색과 계열이近接"
+  },
+  {
+    id: "F", name: "F · 민트 틸",
+    dark: "#2DD4BF", light: "#0F766E",
+    desc: "녹색 모델과 겹치지 않는 청록. 차분하면서도 탁하지 않음.",
+    pros: "차분, 세련", cons: "기존 녹색과 혼동 가능"
+  },
+  {
+    id: "G", name: "G · 밝은 피치 (베이지 개선형)",
+    dark: "#F59E6C", light: "#9A4D12",
+    desc: "현재 베이지의 Hue는 두고 명도와 채도만 올린 최소 변경안.",
+    pros: "변경 최소, 따뜻함 유지", cons: "주황 모델과 근접"
+  }
+];
+const grid = document.getElementById("grid");
+let mode = "dark";
+function render() {
+  grid.innerHTML = "";
+  alternatives.forEach(a => {
+    const hex = mode === "dark" ? a.dark : a.light;
+    const bg = mode === "dark" ? "#1F1F1E" : "#F8FAFC";
+    const fg = mode === "dark" ? "#E8E8E8" : "#0F172A";
+    const card = document.createElement("div");
+    card.className = "card" + (a.current ? " current" : "");
+    card.style.background = bg;
+    card.style.color = fg;
+    card.innerHTML =
+      "<h2>" + a.name + "</h2>" +
+      "<div class='hex'><span class='dot' style='background:" + hex + "'></span>" + hex + "</div>" +
+      "<div class='desc'>" + a.desc + "<br>장점: " + a.pros + " / 아쉬움: " + a.cons + "</div>" +
+      "<div class='preview' style='background:" + (mode==="dark" ? "#262626" : "#EEF2F7") + "'>" +
+        "<div class='row'><span class='badge' style='color:" + hex + "'>opencode</span><span style='color:" + hex + "'>GPT-5.5 · Opus 4.5</span></div>" +
+        "<div class='row' style='color:" + fg + "'>컴포저 입력 글자는 기본 텍스트색 그대로</div>" +
+        "<div class='composer' style='color:" + fg + "'>| 안녕하세요, 이 색으로 입력됩니다</div>" +
+      "</div>" +
+      "<div class='meta'><span>배경 " + bg + "</span><span>본문 " + fg + "</span></div>";
+    grid.appendChild(card);
+  });
+  document.body.className = mode === "light" ? "light" : "";
+  document.getElementById("btnDark").className = mode==="dark" ? "active" : "";
+  document.getElementById("btnLight").className = mode==="light" ? "active" : "";
+}
+document.getElementById("btnDark").onclick = () => { mode="dark"; render(); };
+document.getElementById("btnLight").onclick = () => { mode="light"; render(); };
+render();
+</script>
+</body>
+</html>

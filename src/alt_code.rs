@@ -9,13 +9,19 @@
 //! reports it as a single release with no press before it, so a prompt that
 //! ignores releases drops the character.
 
+use std::collections::HashMap;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 /// Turns the lone release of an Alt code back into the press it stands for.
 #[derive(Debug, Default)]
 pub struct AltCodeKeys {
-    /// The character whose press was seen, so its own release stays a release.
-    pressed: Option<char>,
+    /// How many presses of each character are still held down, so each of
+    /// their own releases stays a release. A single slot was enough while
+    /// presses and releases strictly alternated, but fast typing overlaps
+    /// them (`Press 가`, `Press 나`, `Release 가`, `Release 나`): the first
+    /// release would then look like a lone Alt code and insert `가` twice.
+    pressed: HashMap<char, usize>,
 }
 
 impl AltCodeKeys {
@@ -24,11 +30,26 @@ impl AltCodeKeys {
         let KeyCode::Char(ch) = key.code else {
             return key;
         };
-        if key.kind != KeyEventKind::Release {
-            self.pressed = Some(ch);
+        if key.kind == KeyEventKind::Press {
+            // A hold reports one press and then repeats, but a single release
+            // closes all of them, so only presses open a hold.
+            if !self.pressed.contains_key(&ch) && self.pressed.len() >= 32 {
+                // Press-only terminals never send the releases that would
+                // close a hold. Drop the stale holds instead of growing.
+                self.pressed.clear();
+            }
+            *self.pressed.entry(ch).or_default() += 1;
             return key;
         }
-        if self.pressed.take() == Some(ch) {
+        if key.kind == KeyEventKind::Repeat {
+            return key;
+        }
+        if let Some(count) = self.pressed.get_mut(&ch) {
+            if *count > 1 {
+                *count -= 1;
+            } else {
+                self.pressed.remove(&ch);
+            }
             return key;
         }
         KeyEvent {
@@ -116,5 +137,93 @@ mod tests {
             state: KeyEventState::NONE,
         };
         assert_eq!(keys.normalize(enter), enter);
+    }
+
+    #[test]
+    fn overlapping_presses_keep_their_own_releases() {
+        let mut keys = AltCodeKeys::default();
+        let typed = [
+            key('가', KeyEventKind::Press),
+            key('나', KeyEventKind::Press),
+            key('가', KeyEventKind::Release),
+            key('나', KeyEventKind::Release),
+        ];
+        let seen: Vec<KeyEvent> = typed
+            .into_iter()
+            .map(|event| keys.normalize(event))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                key('가', KeyEventKind::Press),
+                key('나', KeyEventKind::Press),
+                key('가', KeyEventKind::Release),
+                key('나', KeyEventKind::Release),
+            ]
+        );
+    }
+
+    #[test]
+    fn pressing_the_same_key_twice_before_either_release_keeps_both_releases() {
+        let mut keys = AltCodeKeys::default();
+        let typed = [
+            key('가', KeyEventKind::Press),
+            key('가', KeyEventKind::Press),
+            key('가', KeyEventKind::Release),
+            key('가', KeyEventKind::Release),
+        ];
+        let seen: Vec<KeyEvent> = typed
+            .into_iter()
+            .map(|event| keys.normalize(event))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                key('가', KeyEventKind::Press),
+                key('가', KeyEventKind::Press),
+                key('가', KeyEventKind::Release),
+                key('가', KeyEventKind::Release),
+            ]
+        );
+    }
+
+    #[test]
+    fn repeats_do_not_open_an_extra_hold() {
+        let mut keys = AltCodeKeys::default();
+        assert_eq!(
+            keys.normalize(key('가', KeyEventKind::Press)),
+            key('가', KeyEventKind::Press)
+        );
+        assert_eq!(
+            keys.normalize(key('가', KeyEventKind::Repeat)),
+            key('가', KeyEventKind::Repeat)
+        );
+        assert_eq!(
+            keys.normalize(key('가', KeyEventKind::Release)),
+            key('가', KeyEventKind::Release)
+        );
+        assert_eq!(
+            keys.normalize(key('가', KeyEventKind::Release)),
+            key('가', KeyEventKind::Press)
+        );
+    }
+
+    #[test]
+    fn press_only_terminals_do_not_accumulate_holds() {
+        let mut keys = AltCodeKeys::default();
+        for ch in ('가'..='힣').take(40) {
+            assert_eq!(
+                keys.normalize(key(ch, KeyEventKind::Press)),
+                key(ch, KeyEventKind::Press)
+            );
+        }
+        assert!(
+            keys.pressed.len() <= 32,
+            "stale holds stay bounded without releases"
+        );
+        assert_eq!(
+            keys.normalize(key('★', KeyEventKind::Release)),
+            key('★', KeyEventKind::Press)
+        );
     }
 }

@@ -24,7 +24,9 @@
     "bin/dvz.exe",
     "bridge/claude-agent-sdk-bridge.mjs",
     "install-skills.mjs",
+    "prepare-search-deps.mjs",
     "skills/luna-loop/",
+    "skills/insane-search/",
     "README.md",
     "LICENSE"
   ],
@@ -38,7 +40,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "postinstall": "node install-skills.mjs"
+    "postinstall": "node install-skills.mjs && node prepare-search-deps.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.260"

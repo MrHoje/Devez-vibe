@@ -2571,6 +2571,8 @@ fn claude_session_params(params: &Value, cwd: &Path, session_id: Option<&str>) -
     let mut request = json!({
         "cwd": cwd,
         "model": params.get("model").cloned().unwrap_or_else(|| json!("claude:default")),
+        // The fixed-model lanes the Planner and Goal Runner roles dispatch by name.
+        "agents": crate::subagents::claude_agent_definitions(),
         "systemPrompt": params
             .get("claudeDeveloperInstructions")
             .or_else(|| params.pointer("/additionalContext/claude-devez-vibe-rules/value"))

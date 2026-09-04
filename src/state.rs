@@ -15,7 +15,7 @@ use serde_json::{Map, Value, json};
 use crate::terminal_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
-    agent::{self, AgentMode, AgentTurnContext},
+    agent::{self, AgentMode},
     completion::{
         CompletionCandidate, CompletionKind, CompletionMode, CompletionSource, CompletionTarget,
         completion_target, completion_text, filter_candidates,
@@ -3549,10 +3549,6 @@ pub struct AppState {
     /// The role captured when the current turn started. Live plan chrome keeps
     /// this colour even when Tab selects a different role for the next turn.
     active_turn_agent: AgentMode,
-    /// Whether a `Standard` turn still owes the conversation a reset block. A
-    /// specialized instruction stays in history after its turn, so going quiet
-    /// is not enough to retire it.
-    standard_reset_required: bool,
     pub thread_id: String,
     /// The id a later `-r` has to use for this thread, when that is no longer the
     /// thread's own id. A Claude-named room whose turns moved to Codex keeps its
@@ -3856,7 +3852,6 @@ impl AppState {
             pending_steer_prompts: Vec::new(),
             agent_mode: AgentMode::Standard,
             active_turn_agent: AgentMode::Standard,
-            standard_reset_required: false,
             thread_id,
             resume_id: String::new(),
             turn_id: None,
@@ -4093,8 +4088,8 @@ impl AppState {
             || !self.codex_subagents.is_empty()
     }
 
-    /// Selecting a role never clears `standard_reset_required`: only a turn that
-    /// actually carried the reset can retire the role still in history.
+    /// The next turn carries the new role's block, which supersedes the one
+    /// still in history.
     pub fn set_agent_mode(&mut self, mode: AgentMode) -> Action {
         if self.agent_change_blocked() {
             self.set_composer_notice(
@@ -4106,7 +4101,6 @@ impl AppState {
             return Action::None;
         }
         self.agent_mode = mode;
-        self.set_composer_notice(format!("• Agent: {}", mode.label()));
         Action::Tick(true)
     }
 
@@ -4142,34 +4136,9 @@ impl AppState {
         self.open_agent_picker()
     }
 
-    /// What the next turn should carry about the role. `Standard` sends nothing
-    /// once its reset has landed, which keeps a Standard-only session byte for
-    /// byte identical to the behavior before roles existed.
-    pub fn next_agent_context(&self) -> Option<AgentTurnContext> {
-        match self.agent_mode {
-            AgentMode::Standard if self.standard_reset_required => {
-                Some(AgentTurnContext::StandardReset)
-            }
-            AgentMode::Standard => None,
-            mode => Some(AgentTurnContext::Specialized(mode)),
-        }
-    }
-
-    /// A process started with `-r` opens straight onto a resumed transcript
-    /// without going through `prepare_resume`, so the reset it owes is recorded
-    /// here instead.
-    pub fn note_resumed_transcript(&mut self) {
-        self.standard_reset_required = true;
-    }
-
-    /// Recorded only once the provider accepted the request, so a failed send
-    /// leaves the reset still owed.
-    pub fn note_agent_dispatch_succeeded(&mut self, context: Option<AgentTurnContext>) {
-        match context {
-            Some(AgentTurnContext::Specialized(_)) => self.standard_reset_required = true,
-            Some(AgentTurnContext::StandardReset) => self.standard_reset_required = false,
-            None => {}
-        }
+    /// The role the next turn is sent under.
+    pub fn agent_mode(&self) -> AgentMode {
+        self.agent_mode
     }
 
     fn provider_model_indices(&self, provider: ModelProvider) -> Vec<usize> {
@@ -4242,14 +4211,10 @@ impl AppState {
         if self.selected_provider() == ModelProvider::OpenCode {
             return;
         }
-        let Some(index) = self
-            .models
-            .iter()
-            .position(|model| crate::open_code::is_open_code_model(&model.model))
-        else {
+        if !self.opencode_loaded() {
             return;
-        };
-        self.apply_model(index, None);
+        }
+        self.switch_provider(ModelProvider::OpenCode);
     }
 
     /// Whether the runtime on a `/provider` row may be dialled at all. Nothing is
@@ -6354,17 +6319,14 @@ impl AppState {
         self.turn_started_at = None;
         self.last_completed_duration = None;
         self.last_completed_at = None;
-        // A resumed transcript can still hold a specialized role's instruction
-        // from the previous process, so the first Standard turn has to retire it.
+        // A resumed transcript reopens on Builder; its first turn carries the
+        // Builder block, which supersedes any role still in history.
         self.agent_mode = AgentMode::Standard;
         self.active_turn_agent = AgentMode::Standard;
-        self.standard_reset_required = true;
     }
 
     pub fn prepare_new_thread(&mut self) {
         self.prepare_resume();
-        // An empty conversation has no earlier role to retire.
-        self.standard_reset_required = false;
         self.editor.clear();
         self.composer_images.clear();
         self.show_welcome = true;
@@ -9029,7 +8991,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/provider [claude|codex|opencode]  Claude·Codex 전환, OpenCode 연결\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|advisor|goal-runner]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
+                    format!("/provider [claude|codex|opencode]  Claude·Codex 전환, OpenCode 연결\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|goal-runner|reviewer]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
                 ));
                 Action::None
             }
@@ -9469,7 +9431,7 @@ impl AppState {
                 };
                 let Some(mode) = AgentMode::parse(argument) else {
                     self.set_composer_notice(
-                        "• /agent [builder|planner|advisor|goal-runner]".to_owned(),
+                        "• /agent [builder|planner|goal-runner|reviewer]".to_owned(),
                     );
                     return Action::Tick(true);
                 };
@@ -12298,8 +12260,8 @@ impl AppState {
         self.last_completed_duration.map(|duration| {
             let elapsed = format_elapsed(duration.as_secs());
             match self.last_completed_at {
-                Some(at) => format!("✧ Completed ({elapsed}) · {}", format_clock_time(at)),
-                None => format!("✧ Completed ({elapsed})"),
+                Some(at) => format!("❖ Completed ({elapsed}) · {}", format_clock_time(at)),
+                None => format!("❖ Completed ({elapsed})"),
             }
         })
     }
@@ -21198,7 +21160,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(state.activity().as_deref(), Some("✧ Completed (1m 5s)"));
+        assert_eq!(state.activity().as_deref(), Some("❖ Completed (1m 5s)"));
         assert_eq!(
             state.committed[0].response_duration(),
             Some(Duration::from_secs(65))
@@ -22682,7 +22644,7 @@ mod tests {
         state.handle_notification("turn/completed", &json!({}));
         let completed = state.activity().expect("완료 표시");
         let expected = format!(
-            "✧ Completed (10s) · {}",
+            "❖ Completed (10s) · {}",
             format_clock_time(state.last_completed_at.expect("완료 시각"))
         );
         assert_eq!(completed, expected);
@@ -22761,7 +22723,7 @@ mod tests {
         assert!(
             state
                 .activity()
-                .is_some_and(|activity| activity.starts_with("✧ Completed"))
+                .is_some_and(|activity| activity.starts_with("❖ Completed"))
         );
         // A stale answer about a turn that is no longer the live one changes nothing.
         state.set_turn_started("turn-2".to_owned());
@@ -23052,7 +23014,7 @@ mod tests {
         state.handle_key(KeyEvent::from(KeyCode::Tab));
         assert_eq!(state.agent_mode, AgentMode::Planner);
 
-        for expected in [AgentMode::Advisor, AgentMode::GoalRunner, AgentMode::Standard] {
+        for expected in [AgentMode::GoalRunner, AgentMode::Reviewer, AgentMode::Standard] {
             state.handle_key(KeyEvent::from(KeyCode::Tab));
             assert_eq!(state.agent_mode, expected);
         }
@@ -23083,7 +23045,7 @@ mod tests {
         assert!(matches!(state.submit_editor(), Action::Submit(_)));
         state.handle_key(KeyEvent::from(KeyCode::Tab));
 
-        assert_eq!(state.agent_mode, AgentMode::Advisor);
+        assert_eq!(state.agent_mode, AgentMode::GoalRunner);
         assert_eq!(state.view().plan_agent, AgentMode::Planner);
     }
 
@@ -23103,51 +23065,17 @@ mod tests {
         );
     }
 
-    /// Standard sends nothing until a specialized role has been used; then it
-    /// owes exactly one reset, and only a delivered turn clears the debt.
-    #[test]
-    fn standard_sends_one_reset_after_a_specialized_role() {
-        let mut state = idle_test_state();
-        assert_eq!(state.next_agent_context(), None);
 
+    /// A resumed transcript reopens on Builder regardless of the role the
+    /// previous process ended on.
+    #[test]
+    fn resume_returns_to_builder() {
+        let mut state = idle_test_state();
         state.set_agent_mode(AgentMode::Planner);
-        let planner = state.next_agent_context();
-        assert_eq!(
-            planner,
-            Some(AgentTurnContext::Specialized(AgentMode::Planner))
-        );
-        state.note_agent_dispatch_succeeded(planner);
-
-        state.set_agent_mode(AgentMode::Standard);
-        let reset = state.next_agent_context();
-        assert_eq!(reset, Some(AgentTurnContext::StandardReset));
-
-        // A send that never reached the provider leaves the reset owed.
-        state.note_agent_dispatch_succeeded(None);
-        assert_eq!(
-            state.next_agent_context(),
-            Some(AgentTurnContext::StandardReset)
-        );
-
-        state.note_agent_dispatch_succeeded(reset);
-        assert_eq!(state.next_agent_context(), None);
-    }
-
-    /// A resumed transcript can still hold an old role, so its first Standard
-    /// turn carries a reset that a brand new thread does not.
-    #[test]
-    fn resume_owes_a_reset_and_a_new_thread_does_not() {
-        let mut state = idle_test_state();
+        assert_eq!(state.agent_mode(), AgentMode::Planner);
 
         state.prepare_resume();
-        assert_eq!(state.agent_mode, AgentMode::Standard);
-        assert_eq!(
-            state.next_agent_context(),
-            Some(AgentTurnContext::StandardReset)
-        );
-
-        state.prepare_new_thread();
-        assert_eq!(state.next_agent_context(), None);
+        assert_eq!(state.agent_mode(), AgentMode::Standard);
     }
 
     /// Bare `/agent` opens a picker over the four roles; Enter commits the
@@ -23162,7 +23090,7 @@ mod tests {
         assert_eq!(overlay.title, "Agent");
         assert_eq!(overlay.lines.len(), 4);
         assert!(overlay.lines[0].text.contains("Builder"));
-        assert!(overlay.lines[3].text.contains("Goal Runner"));
+        assert!(overlay.lines[2].text.contains("Goal Runner"));
 
         state.handle_key(KeyEvent::from(KeyCode::Down));
         assert_eq!(state.agent_mode, AgentMode::Standard);
@@ -23196,21 +23124,6 @@ mod tests {
         state.handle_key(KeyEvent::from(KeyCode::Enter));
         assert_eq!(state.agent_mode, AgentMode::Planner);
         assert!(state.editor.is_empty());
-    }
-
-    /// A process launched with `-r` never calls `prepare_resume`, so the reset
-    /// it owes is recorded on its own.
-    #[test]
-    fn a_process_opened_on_a_resumed_transcript_owes_a_reset() {
-        let mut state = idle_test_state();
-        assert_eq!(state.next_agent_context(), None);
-
-        state.note_resumed_transcript();
-
-        assert_eq!(
-            state.next_agent_context(),
-            Some(AgentTurnContext::StandardReset)
-        );
     }
 
     #[test]

@@ -6,6 +6,7 @@
 2. [계획과 실행](#%EA%B3%84%ED%9A%8D%EA%B3%BC-%EC%8B%A4%ED%96%89)
 3. [리소스 관리](#%EB%A6%AC%EC%86%8C%EC%8A%A4-%EA%B4%80%EB%A6%AC)
 4. [기록](#%EA%B8%B0%EB%A1%9D)
+5. [지식베이스](#%EC%A7%80%EC%8B%9D%EB%B2%A0%EC%9D%B4%EC%8A%A4)
 
 ## 작업 원칙
 
@@ -27,3 +28,17 @@
 ## 기록
 
 * 반복될 가능성이 큰 실수나 중요한 교훈만 `.Codex.md`에 기록한다.
+
+## 지식베이스
+
+* 절차, 설계 근거, 진단 기록 같은 지식 문서는 `.knowledge/` 폴더에 적재한다. `docs/`에는 HTML 미리보기 같은 산출물만 둔다.
+* 새 지식 문서를 추가하거나 이름을 바꾸면 아래 목록도 함께 갱신한다.
+* 문서 목록
+  * `Claude-Agent-SDK-호환성-업데이트.md` — Claude Code·SDK 업데이트 시 브리지 영향 확인과 최신화 절차
+  * `Codex-CLI-호환성-업데이트.md` — Codex CLI 업데이트 시 app-server 프로토콜·모델 카탈로그 영향 확인 절차
+  * `배포-버전-갱신.md` — Cargo.toml 버전과 웰컴 UI 표기, npm 패키지 배포 절차
+  * `토큰사용량-단가-갱신.md` — 컴포저 추정 비용의 모델별 단가표 갱신 절차, DevezCode와 동일 단가 유지
+  * `한글-글리프-깨짐-진단.md` — 전각 글리프가 다른 글자로 보이는 증상의 원인과 수정 방법
+  * `agent-system-implementation-plan.md` — Builder·Planner·Goal Runner·Reviewer 역할 시스템의 초기 구현 계획서
+  * `side-panel-reference.md` — 제거된 우측 도킹 정보 패널의 예전 구현 참고 자료
+  * `builder-ponytail.md` — Builder 역할에 넣은 Ponytail 최소 코드 규칙의 적용 내용과 제거 절차

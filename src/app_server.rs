@@ -130,6 +130,7 @@ impl AppServer {
         apply_mcp_2026_protocol_override(&mut command);
         apply_update_plan_tool_override(&mut command);
         apply_devezcode_room_override(&mut command, devezcode_room);
+        provision_devez_subagents();
         crate::child_process::isolate_backend(&mut command);
         let mut child = command
             .stdin(Stdio::piped())
@@ -426,6 +427,17 @@ fn codex_config_declares_update_plan_tool() -> bool {
         .map(|home| home.join("config.toml"))
         .and_then(|path| std::fs::read_to_string(path).ok())
         .is_some_and(|config| config_declares_update_plan_tool(&config))
+}
+
+/// Codex reads custom agents from `~/.codex/agents/`, so the fixed-model lanes
+/// the role prompts dispatch have to exist there before the app-server starts.
+/// Files already present are the user's and are left alone. A write failure is
+/// not fatal to the session: the roles fall back to plain subagents with the
+/// model named in the dispatch, so it is deliberately not surfaced here.
+fn provision_devez_subagents() {
+    if let Some(home) = crate::state::codex_home() {
+        let _ = crate::subagents::provision_codex_agents(&home);
+    }
 }
 
 /// `enabled` is far too common a key to match on its own — the plugin sections

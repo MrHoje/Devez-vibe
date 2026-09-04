@@ -700,6 +700,9 @@ function makeOptions(params, sessionId, resume) {
     // Task tools left the default surface in SDK 0.3.233. Listing them here
     // keeps the plan panel available without replacing the Claude Code preset.
     allowedTools: [...CLAUDE_TASK_TOOLS],
+    // The fixed-model lanes the Planner and Goal Runner roles dispatch. The
+    // host owns the definitions so Claude and Codex read the same text.
+    ...(params.agents ? { agents: params.agents } : {}),
     // DevezVibe keeps per-task controls available through Claude's TaskStop
     // tool, so a turn interrupt must not tear down independent background work.
     perTaskStopAffordance: true,

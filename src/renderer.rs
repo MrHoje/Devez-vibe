@@ -5490,8 +5490,8 @@ enum Tone {
     StatusEffortUltra,
     AgentStandard,
     AgentPlanner,
-    AgentAdvisor,
     AgentGoalRunner,
+    AgentReviewer,
     Border,
     SidePanelDivider,
     Branch,
@@ -5919,7 +5919,7 @@ fn activity_lines_with_progress(
             tail,
         }];
     }
-    if activity.starts_with("✧ Completed (") {
+    if activity.starts_with("❖ Completed (") {
         return vec![PaintLine {
             prefix: " ".to_owned(),
             prefix_tone: tone,
@@ -6149,58 +6149,88 @@ fn activity_line_with_composer_controls(
     // edge without clipping Fast's right-hand hit area.
     let right_edge = (width as usize).saturating_sub(3);
     if let Some(notice) = notice {
+        let extra_left = line_console_extra(&line);
         let available = right_edge.saturating_sub(painted_line_width(&line));
-        let notice = compact_right(notice, available);
-        if notice.is_empty() {
-            return None;
+        let mut notice_budget = available.saturating_sub(extra_left);
+        loop {
+            let notice = compact_right(notice, notice_budget);
+            if notice.is_empty() {
+                return None;
+            }
+            let extra_notice = text_console_extra(&notice);
+            let extra_total = extra_left.saturating_add(extra_notice);
+            let notice_width = UnicodeWidthStr::width(notice.as_str());
+            let gap = available.saturating_sub(notice_width);
+            if gap >= extra_total {
+                line.tail.push(rule_gap(gap.saturating_sub(extra_total)));
+                line.tail.push(PaintSpan {
+                    text: notice,
+                    tone: Tone::Accent,
+                    bold: false,
+                });
+                line.tail.push(rule_gap(1));
+                return Some(line);
+            }
+            if notice_width == 0 {
+                return None;
+            }
+            // Shrink the notice instead of letting the safety cut eat its tail.
+            notice_budget = notice_width.saturating_sub(1);
         }
-        line.tail.push(rule_gap(
-            available.saturating_sub(UnicodeWidthStr::width(notice.as_str())),
-        ));
-        line.tail.push(PaintSpan {
-            text: notice,
-            tone: Tone::Accent,
-            bold: false,
-        });
-        line.tail.push(rule_gap(1));
-        return Some(line);
     }
-    let available = right_edge
+    let extra_left = line_console_extra(&line);
+    let mut badge_budget = right_edge
         .saturating_sub(painted_line_width(&line))
         .saturating_sub(COMPOSER_MODE_GAP);
-    let badge = fitting_badge_spans(mode, available)?;
-    let gap = right_edge - painted_line_width(&line) - spans_width(&badge.spans);
-    let badge_start = line.tail.len() + 2;
-    let mut picks = Vec::new();
-    picks.extend(
-        badge
-            .shell_display_mode_index
-            .map(|index| (badge_start + index, Pick::ShellDisplayMode)),
-    );
-    picks.extend(
-        badge
-            .diff_display_mode_index
-            .map(|index| (badge_start + index, Pick::DiffDisplayMode)),
-    );
-    picks.extend(
-        badge
-            .vibe_mode_index
-            .map(|index| (badge_start + index, Pick::VibeMode)),
-    );
-    picks.extend(
-        badge
-            .response_display_mode_index
-            .map(|index| (badge_start + index, Pick::ResponseDisplayMode)),
-    );
-    picks.extend(
-        badge
-            .fast_index
-            .map(|index| (badge_start + index, Pick::FastMode)),
-    );
-    line.tail.push(rule_gap(gap));
-    line.tail.extend(badge.spans);
-    line.tail.push(rule_gap(1));
-    Some(line.with_tight_picks(&picks))
+    loop {
+        let badge = fitting_badge_spans(mode, badge_budget)?;
+        let badge_width = spans_width(&badge.spans);
+        let extra_total = extra_left.saturating_add(spans_console_extra(&badge.spans));
+        let gap = right_edge
+            .saturating_sub(painted_line_width(&line))
+            .saturating_sub(badge_width);
+        // Keep the design spacing even after leaving the console discrepancy as
+        // trailing room; otherwise drop to the next badge rung instead of
+        // clipping the tail. The caller falls back to the composer rule.
+        if gap >= extra_total.saturating_add(COMPOSER_MODE_GAP) {
+            let gap = gap.saturating_sub(extra_total);
+            let badge_start = line.tail.len() + 2;
+            let mut picks = Vec::new();
+            picks.extend(
+                badge
+                    .shell_display_mode_index
+                    .map(|index| (badge_start + index, Pick::ShellDisplayMode)),
+            );
+            picks.extend(
+                badge
+                    .diff_display_mode_index
+                    .map(|index| (badge_start + index, Pick::DiffDisplayMode)),
+            );
+            picks.extend(
+                badge
+                    .vibe_mode_index
+                    .map(|index| (badge_start + index, Pick::VibeMode)),
+            );
+            picks.extend(
+                badge
+                    .response_display_mode_index
+                    .map(|index| (badge_start + index, Pick::ResponseDisplayMode)),
+            );
+            picks.extend(
+                badge
+                    .fast_index
+                    .map(|index| (badge_start + index, Pick::FastMode)),
+            );
+            line.tail.push(rule_gap(gap));
+            line.tail.extend(badge.spans);
+            line.tail.push(rule_gap(1));
+            return Some(line.with_tight_picks(&picks));
+        }
+        if badge_width == 0 {
+            return None;
+        }
+        badge_budget = badge_width.saturating_sub(1);
+    }
 }
 
 fn painted_line_text(line: &PaintLine) -> String {
@@ -12315,20 +12345,47 @@ fn input_top_line_with_controls(
         Default::default()
     };
     let left_width = UnicodeWidthStr::width(left.as_str());
+    let extra_left = text_console_extra(left.as_str());
     // Right-hand badges eat into this budget; whatever survives stays as rule.
     let mut budget = panel_width.saturating_sub(left_width + COMPOSER_RULE_MIN);
     // A bare rule paints as one span before the tail; a labelled one spends three
     // — the opening stroke, the label, then the fill.
     let tail_offset = if left.is_empty() { 1 } else { 3 };
 
-    // The mode is persistent state, so it anchors the far right.
-    let badge = controls_mode.and_then(|mode| {
+    // The mode is persistent state, so it anchors the far right. The rule fill
+    // absorbs the console discrepancy so the safety cut removes rule cells
+    // instead of the badge tail; otherwise drop to the next badge rung.
+    let badge = if let Some(mode) = controls_mode {
         // Blanks either side of the badge plus the rule stub that trails it.
         let reserved = COMPOSER_MODE_GAP + 1 + COMPOSER_MODE_TAIL_RULE;
-        let badge = fitting_badge_spans(mode, budget.saturating_sub(reserved))?;
-        budget -= spans_width(&badge.spans) + reserved;
-        Some(badge)
-    });
+        let mut badge_budget = budget.saturating_sub(reserved);
+        let mut chosen: Option<BadgeSpans> = None;
+        loop {
+            let Some(candidate) = fitting_badge_spans(mode, badge_budget) else {
+                break;
+            };
+            let candidate_width = spans_width(&candidate.spans);
+            let extra_total =
+                extra_left.saturating_add(spans_console_extra(&candidate.spans));
+            let remaining = budget
+                .saturating_sub(candidate_width)
+                .saturating_sub(reserved);
+            if remaining >= extra_total {
+                budget = remaining.saturating_sub(extra_total);
+                chosen = Some(candidate);
+                break;
+            }
+            if candidate_width == 0 {
+                break;
+            }
+            badge_budget = candidate_width.saturating_sub(1);
+        }
+        chosen
+    } else {
+        // No badge: still leave room for the label discrepancy in the fill.
+        budget = budget.saturating_sub(extra_left);
+        None
+    };
 
     let mut tail = Vec::new();
     // Where the badge lands once the rule ahead of it is counted: the gap span
@@ -12433,31 +12490,59 @@ fn input_bottom_line(
     };
 
     let reserved = COMPOSER_NOTICE_GAP + 1 + COMPOSER_NOTICE_TAIL_RULE;
-    let notice = compact_right(notice, panel_width.saturating_sub(reserved));
-    let fill =
-        "─".repeat(panel_width.saturating_sub(UnicodeWidthStr::width(notice.as_str()) + reserved));
+    let mut notice_budget = panel_width.saturating_sub(reserved);
+    loop {
+        let notice = compact_right(notice, notice_budget);
+        let extra_notice = text_console_extra(&notice);
+        let notice_width = UnicodeWidthStr::width(notice.as_str());
+        let fill_width = panel_width
+            .saturating_sub(notice_width + reserved)
+            .saturating_sub(extra_notice);
+        // The fill absorbs the discrepancy; if even an empty fill cannot leave
+        // room, shrink the notice instead of clipping its tail.
+        if fill_width > 0
+            || notice_width.saturating_add(reserved).saturating_add(extra_notice) <= panel_width
+        {
+            let fill = "─".repeat(fill_width);
+            return PaintLine {
+                prefix: String::new(),
+                prefix_tone: chrome_tone,
+                text: fill,
+                tone: chrome_tone,
+                bold: false,
+                tool_heading: None,
+                pick: None,
+                tail: vec![
+                    rule_gap(COMPOSER_NOTICE_GAP),
+                    PaintSpan {
+                        text: notice,
+                        tone: Tone::Accent,
+                        bold: false,
+                    },
+                    rule_gap(1),
+                    PaintSpan {
+                        text: "─".repeat(COMPOSER_NOTICE_TAIL_RULE),
+                        tone: chrome_tone,
+                        bold: false,
+                    },
+                ],
+            };
+        }
+        if notice_width == 0 {
+            // Fall through to the bare rule below rather than looping forever.
+            break;
+        }
+        notice_budget = notice_width.saturating_sub(1);
+    }
     PaintLine {
         prefix: String::new(),
         prefix_tone: chrome_tone,
-        text: fill,
+        text: "─".repeat(panel_width),
         tone: chrome_tone,
         bold: false,
         tool_heading: None,
         pick: None,
-        tail: vec![
-            rule_gap(COMPOSER_NOTICE_GAP),
-            PaintSpan {
-                text: notice,
-                tone: Tone::Accent,
-                bold: false,
-            },
-            rule_gap(1),
-            PaintSpan {
-                text: "─".repeat(COMPOSER_NOTICE_TAIL_RULE),
-                tone: chrome_tone,
-                bold: false,
-            },
-        ],
+        tail: Vec::new(),
     }
 }
 
@@ -12639,6 +12724,28 @@ fn spans_width(spans: &[PaintSpan]) -> usize {
         .iter()
         .map(|span| UnicodeWidthStr::width(span.text.as_str()))
         .sum()
+}
+
+/// Hidden console columns beyond what the host draws. Middle dots and arrows
+/// cost two console columns for one host cell, so rows ending at the right
+/// edge must leave that many extra blanks or the safety cut eats content.
+fn spans_console_extra(spans: &[PaintSpan]) -> usize {
+    spans
+        .iter()
+        .map(|span| {
+            console_width(span.text.as_str()).saturating_sub(UnicodeWidthStr::width(span.text.as_str()))
+        })
+        .sum()
+}
+
+fn text_console_extra(text: &str) -> usize {
+    console_width(text).saturating_sub(UnicodeWidthStr::width(text))
+}
+
+fn line_console_extra(line: &PaintLine) -> usize {
+    text_console_extra(line.prefix.as_str())
+        + text_console_extra(line.text.as_str())
+        + spans_console_extra(&line.tail)
 }
 
 /// The status line's colour for a reasoning effort, shared with the effort
@@ -13142,8 +13249,8 @@ fn agent_prompt_tone(mode: AgentMode) -> Tone {
     match mode {
         AgentMode::Standard => Tone::AgentStandard,
         AgentMode::Planner => Tone::AgentPlanner,
-        AgentMode::Advisor => Tone::AgentAdvisor,
         AgentMode::GoalRunner => Tone::AgentGoalRunner,
+        AgentMode::Reviewer => Tone::AgentReviewer,
     }
 }
 
@@ -13219,8 +13326,8 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         // a dark one.
         Tone::AgentStandard => palette.agent_builder,
         Tone::AgentPlanner => palette.agent_planner,
-        Tone::AgentAdvisor => palette.agent_advisor,
         Tone::AgentGoalRunner => palette.agent_goal_runner,
+        Tone::AgentReviewer => palette.agent_reviewer,
         Tone::Border => palette.border,
         Tone::SidePanelDivider => blend(
             palette.hover_bg,
@@ -14639,6 +14746,66 @@ mod tests {
             assert!(
                 text.contains("Shift + ↑↓ model · ←→ effort"),
                 "the host hint must not be clipped by the console safety margin"
+            );
+        });
+    }
+
+    #[test]
+    fn a_devezcode_activity_row_keeps_its_badge_tail() {
+        with_devezcode_xterm_widths(|| {
+            let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, false);
+            mode.branch = Some("main".to_owned());
+            mode.response_display_mode = "All".to_owned();
+            let activity = activity_lines("❖ Completed (8m 17s) · 11:48 PM", None, 0.5, 120);
+            let line = activity_line_with_composer_controls(activity[0].clone(), &mode, None, 120)
+                .expect("badge fits beside a short activity label");
+            let text = painted(&line);
+            assert!(
+                text.contains("Response: All"),
+                "badge tail must survive layout, got {text:?}"
+            );
+            assert!(
+                console_width(text.as_str()) <= 118,
+                "activity plus badge must leave trailing room, got {text:?}"
+            );
+
+            let mut frame = CellFrame::new(120, 1);
+            paint_line_into_frame(&mut frame, 0, &line, None, None, None);
+            let mut output = Vec::new();
+            emit_row_sequential(&mut output, &frame, 0, 0).expect("row emits");
+            let emitted = String::from_utf8(output).expect("terminal bytes are UTF-8");
+            assert!(
+                emitted.contains("Response: All"),
+                "the safety cut must remove blanks instead of the badge tail"
+            );
+        });
+    }
+
+    #[test]
+    fn a_devezcode_composer_rule_keeps_its_badge_tail() {
+        with_devezcode_xterm_widths(|| {
+            let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, false);
+            mode.branch = Some("main".to_owned());
+            mode.response_display_mode = "All".to_owned();
+            let line = input_top_line(120, "", Some(&mode));
+            let text = painted(&line);
+            assert!(
+                text.contains("Response: All"),
+                "composer badge tail must survive layout, got {text:?}"
+            );
+            assert!(
+                console_width(text.as_str()) <= 120,
+                "composer rule must fit the console width, got {text:?}"
+            );
+
+            let mut frame = CellFrame::new(120, 1);
+            paint_line_into_frame(&mut frame, 0, &line, None, None, None);
+            let mut output = Vec::new();
+            emit_row_sequential(&mut output, &frame, 0, 0).expect("row emits");
+            let emitted = String::from_utf8(output).expect("terminal bytes are UTF-8");
+            assert!(
+                emitted.contains("Response: All"),
+                "the safety cut must remove rule cells instead of the badge tail"
             );
         });
     }
@@ -17389,7 +17556,7 @@ mod tests {
                 "Working",
                 Some(Tone::Plain),
             ),
-            ("✧ Completed (1m 36s)", "Completed", None),
+            ("❖ Completed (1m 36s)", "Completed", None),
         ] {
             let frame = normal_frame(
                 &live,
@@ -17601,7 +17768,7 @@ mod tests {
     fn settled_activity_labels_never_shimmer() {
         for (label, expected_prefix, expected_text, expected_tone) in [
             (
-                "✧ Completed (2m 12s)",
+                "❖ Completed (2m 12s)",
                 Some(" "),
                 None,
                 Some(Tone::ModelTerra),
