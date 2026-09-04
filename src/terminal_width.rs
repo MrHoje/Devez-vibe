@@ -363,9 +363,12 @@ fn xterm_unicode6_width(codepoint: u32) -> usize {
     if in_sorted_ranges(codepoint, XTERM6_HIGH_COMBINING) {
         return 0;
     }
-    // The renderer draws an astral emoji in a single cell even though the
-    // console reserves two for the surrogate pair. Layout follows the renderer,
-    // and `console_width` below is what output has to stay under.
+    if codepoint == 0x1f43e && use_devezcode_paw_width() {
+        return 2;
+    }
+    // The renderer draws most astral emoji in a single cell even though the
+    // console reserves two for the surrogate pair. The paired DevezCode profile
+    // above widens the observed paw-print glyph; other emoji keep Unicode 6.
     if (0x20000..=0x2fffd).contains(&codepoint) || (0x30000..=0x3fffd).contains(&codepoint) {
         2
     } else {
@@ -410,6 +413,7 @@ fn use_devezcode_xterm_widths() -> bool {
 #[cfg(test)]
 thread_local! {
     static TEST_DEVEZCODE_XTERM_WIDTHS: TestCell<bool> = const { TestCell::new(false) };
+    static TEST_DEVEZCODE_PAW_WIDTH: TestCell<bool> = const { TestCell::new(false) };
 }
 
 #[cfg(test)]
@@ -417,9 +421,30 @@ fn use_devezcode_xterm_widths() -> bool {
     TEST_DEVEZCODE_XTERM_WIDTHS.get()
 }
 
+#[cfg(not(test))]
+fn use_devezcode_paw_width() -> bool {
+    env::var("DEVEZCODE_TERM_WIDTH_PROFILE").as_deref() == Ok("xterm6-unicode6-paw2")
+}
+
+#[cfg(test)]
+fn use_devezcode_paw_width() -> bool {
+    TEST_DEVEZCODE_PAW_WIDTH.get()
+}
+
 #[cfg(test)]
 pub(crate) fn with_devezcode_xterm_widths<T>(test: impl FnOnce() -> T) -> T {
     TEST_DEVEZCODE_XTERM_WIDTHS.set(true);
+    TEST_DEVEZCODE_PAW_WIDTH.set(true);
+    let result = test();
+    TEST_DEVEZCODE_PAW_WIDTH.set(false);
+    TEST_DEVEZCODE_XTERM_WIDTHS.set(false);
+    result
+}
+
+#[cfg(test)]
+fn with_legacy_devezcode_xterm_widths<T>(test: impl FnOnce() -> T) -> T {
+    TEST_DEVEZCODE_XTERM_WIDTHS.set(true);
+    TEST_DEVEZCODE_PAW_WIDTH.set(false);
     let result = test();
     TEST_DEVEZCODE_XTERM_WIDTHS.set(false);
     result
@@ -561,10 +586,18 @@ mod tests {
     }
 
     #[test]
-    fn paw_prints_lay_out_one_cell_each_the_way_the_renderer_draws_them() {
+    fn paw_prints_lay_out_two_cells_each_like_the_devezcode_provider() {
         with_devezcode_xterm_widths(|| {
-            assert_eq!(wrap_ascii_space("🐾🐾🐾🐾🐾", 5), ["🐾🐾🐾🐾🐾"]);
+            assert_eq!(wrap_ascii_space("🐾🐾🐾🐾🐾", 5), ["🐾🐾", "🐾🐾", "🐾"]);
             assert_eq!(console_width("🐾🐾🐾🐾🐾"), 10);
+        });
+    }
+
+    #[test]
+    fn legacy_devezcode_profile_keeps_the_old_paw_width_until_the_host_updates() {
+        with_legacy_devezcode_xterm_widths(|| {
+            assert_eq!(UnicodeWidthStr::width("🐾"), 1);
+            assert_eq!(console_width("🐾"), 2);
         });
     }
 

@@ -4697,38 +4697,42 @@ fn emit_row_sequential(
         set_cell_style(out, style)?;
         queue!(out, Print(text))?;
     }
-    // A row cut short for the console ends mid-card, so the erase has to carry
-    // the colour of the cell it stopped on. Rows that ran to the end keep using
-    // the final cell, which is the one the erase would have painted anyway.
-    let erase_column = if row_end < frame.width.saturating_sub(1) {
-        row_end.saturating_sub(1)
-    } else {
-        frame.width - 1
-    };
-    set_cell_style(out, frame.cell(erase_column, row).style)?;
-    queue!(out, Clear(ClearType::UntilNewLine))?;
-    // The erase above fills xterm cells that the hidden console counted
-    // differently. Reapply later background boundaries at their absolute frame
-    // columns so an emoji row ends exactly where the other prompt rows do.
     if row_end < frame.width.saturating_sub(1) {
-        let mut background = frame.cell(erase_column, row).style.background;
-        for column in row_end..frame.width {
+        // ConPTY counts an astral emoji as two columns, while DevezCode's xterm
+        // buffer advances one. CSI K is therefore replayed with the terminal's
+        // default erase colour and leaves a gap exactly as wide as the emoji
+        // count. Paint the truncated tail as explicit background spaces at the
+        // absolute xterm columns instead. The physical console also stays below
+        // its autowrap column because each tail run contains narrow spaces only.
+        let mut column = row_end;
+        while column + 1 < frame.width {
+            let start = column;
             let style = frame.cell(column, row).style;
-            if style.background == background {
-                continue;
+            while column + 1 < frame.width
+                && frame.cell(column, row).style.background == style.background
+            {
+                column += 1;
             }
             queue!(
                 out,
                 MoveTo(
-                    column.min(u16::MAX as usize) as u16,
+                    start.min(u16::MAX as usize) as u16,
                     screen_row.min(u16::MAX as usize) as u16
                 )
             )?;
             set_cell_style(out, style)?;
-            queue!(out, Clear(ClearType::UntilNewLine))?;
-            background = style.background;
+            queue!(out, Print(" ".repeat(column - start)))?;
         }
+        queue!(
+            out,
+            MoveTo(
+                frame.width.saturating_sub(1).min(u16::MAX as usize) as u16,
+                screen_row.min(u16::MAX as usize) as u16
+            )
+        )?;
     }
+    set_cell_style(out, frame.cell(frame.width - 1, row).style)?;
+    queue!(out, Clear(ClearType::UntilNewLine))?;
     queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
     Ok(())
 }
@@ -14531,12 +14535,10 @@ mod tests {
         });
     }
 
-    /// A row cut short for the console stops inside the card, so the erase that
-    /// fills the rest has to use the colour it stopped on. Using the row's own
-    /// final cell would paint that tail in the colour outside the card and the
-    /// card would look like its background ran out early.
+    /// A row cut short for the console must print the missing xterm background
+    /// cells. CSI K alone leaves a staircase whose width matches the emoji count.
     #[test]
-    fn a_cut_row_erases_in_the_colour_it_stopped_on() {
+    fn another_cut_astral_emoji_row_prints_its_missing_card_background_cells() {
         with_devezcode_xterm_widths(|| {
             let card = theme::palette().user_prompt_bg;
             let mut frame = CellFrame::new(12, 1);
@@ -14553,7 +14555,7 @@ mod tests {
             frame.write(
                 0,
                 0,
-                "\u{00b7}\u{00b7}\u{00b7}\u{00b7}\u{00b7}\u{00b7}\u{00b7}",
+                "🐱🐱🐱🐱🐱🐱🐱",
                 CellStyle {
                     background: Some(card),
                     ..CellStyle::plain()
@@ -14567,47 +14569,22 @@ mod tests {
             let mut output = Vec::new();
             emit_row_sequential(&mut output, &frame, 0, 0).expect("row emits");
             let text = String::from_utf8(output).expect("terminal bytes are UTF-8");
-            let erase = text.find("\x1b[K").expect("the clipped tail is filled");
             let colour = format!("[48;2;{};{};{}m", card.0, card.1, card.2);
             assert!(
-                text[..erase].contains(&colour),
-                "the erase carries the card colour"
+                text.contains("\x1b[1;6H"),
+                "the missing card tail starts at the xterm column after emitted cells"
             );
             assert_eq!(
                 text.matches("\x1b[K").count(),
-                2,
-                "the final frame-cell background is restored after filling the gap"
-            );
-            assert!(
-                text.contains("\x1b[1;12H"),
-                "the ordinary one-cell right margin is restored at its absolute column"
-            );
-
-            // The prompt card that showed this bug was a row of emoji: the
-            // renderer draws each in one cell, the console reserves two.
-            let mut emoji = CellFrame::new(12, 1);
-            emoji.fill(
-                0,
-                0,
-                11,
                 1,
-                CellStyle {
-                    background: Some(card),
-                    ..CellStyle::plain()
-                },
+                "only the reserved autowrap cell uses an erase"
             );
-            emoji.write(
-                0,
-                0,
-                "🐾🐾🐾🐾🐾🐾🐾",
-                CellStyle {
-                    background: Some(card),
-                    ..CellStyle::plain()
-                },
-            );
+            let tail = text.find("\x1b[1;6H").expect("tail cursor move");
+            let margin = text.find("\x1b[1;12H").expect("right margin cursor move");
             assert!(
-                console_safe_row_end(&emoji, 0) < emoji.width - 1,
-                "an emoji row runs past the right edge on the console"
+                text[tail..margin].contains(&colour)
+                    && text[tail..margin].contains("      "),
+                "the clipped cells are explicitly painted with the card colour"
             );
         });
     }
@@ -16431,7 +16408,7 @@ mod tests {
     #[test]
     fn devezcode_widths_match_xterm6_for_emoji_and_cjk() {
         with_devezcode_xterm_widths(|| {
-            assert_eq!(UnicodeWidthStr::width("🐾"), 1);
+            assert_eq!(UnicodeWidthStr::width("🐾"), 2);
             assert_eq!(UnicodeWidthStr::width("👩‍💻"), 2);
             assert_eq!(UnicodeWidthStr::width("🇰🇷"), 2);
             assert_eq!(UnicodeWidthStr::width("가"), 2);
@@ -16457,10 +16434,11 @@ mod tests {
 
             assert_eq!(frame.cell(0, 0).glyph, "A");
             assert_eq!(frame.cell(1, 0).glyph, "🐾");
-            assert_eq!(frame.cell(2, 0).glyph, "B");
-            assert_eq!(frame.cell(3, 0).glyph, "가");
-            assert!(frame.cell(4, 0).continuation);
-            assert_eq!(frame.cell(5, 0).glyph, "C");
+            assert!(frame.cell(2, 0).continuation);
+            assert_eq!(frame.cell(3, 0).glyph, "B");
+            assert_eq!(frame.cell(4, 0).glyph, "가");
+            assert!(frame.cell(5, 0).continuation);
+            assert_eq!(frame.cell(6, 0).glyph, "C");
         });
     }
 

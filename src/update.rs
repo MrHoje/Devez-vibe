@@ -27,6 +27,7 @@ pub const RELEASE_NOTES: &[&str] = &[
     "이모지가 많은 줄에서 카드 배경이 오른쪽부터 사라지던 문제를 수정했습니다.",
     "새 대화를 열 때 현재 공급자의 모델과 스킬, 플러그인 목록을 다시 불러오도록 개선했습니다.",
     "이모지 행의 오른쪽 배경 경계와 상태줄의 effort 안내가 잘리던 문제를 수정했습니다.",
+    "구버전 DevezCode에서는 이모지 행의 배경을 직접 채우고, 새 폭 프로필에서는 발바닥 이모지를 2칸으로 맞췄습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
