@@ -128,6 +128,7 @@ impl AppServer {
         let mut command = codex_command(&resolved_codex);
         apply_originator_override(&mut command);
         apply_mcp_2026_protocol_override(&mut command);
+        apply_update_plan_tool_override(&mut command);
         apply_devezcode_room_override(&mut command, devezcode_room);
         crate::child_process::isolate_backend(&mut command);
         let mut child = command
@@ -408,6 +409,60 @@ fn apply_unstable_features_warning_override(command: &mut Command) {
     command.arg("-c").arg(UNSTABLE_WARNING_OVERRIDE);
 }
 
+/// Codex 0.152 turned the planning tool into an opt-in, so a launch that never
+/// asks for it is served no `update_plan` at all and the plan card Devez Vibe
+/// draws from those calls would stay empty. Ask for it on this invocation; a
+/// config that already decided the setting wins, so turning it off stays
+/// possible.
+fn apply_update_plan_tool_override(command: &mut Command) {
+    if codex_config_declares_update_plan_tool() {
+        return;
+    }
+    command.arg("-c").arg(UPDATE_PLAN_TOOL_OVERRIDE);
+}
+
+fn codex_config_declares_update_plan_tool() -> bool {
+    crate::state::codex_home()
+        .map(|home| home.join("config.toml"))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|config| config_declares_update_plan_tool(&config))
+}
+
+/// `enabled` is far too common a key to match on its own — the plugin sections
+/// of an ordinary config are full of it — so the section header has to be
+/// folded into the key path first. The dotted form and the table form of the
+/// same setting both count as the user's decision.
+fn config_declares_update_plan_tool(config: &str) -> bool {
+    let mut section: Vec<String> = Vec::new();
+    for line in config.lines() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+            section = header.split('.').map(toml_key).collect();
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let mut path = section.clone();
+        path.extend(key.split('.').map(toml_key));
+        match path.join(".").as_str() {
+            "tools.update_plan.enabled" => return true,
+            // An inline table decides the same setting one level up.
+            "tools.update_plan" if value.contains("enabled") => return true,
+            "tools" if value.contains("update_plan") && value.contains("enabled") => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn toml_key(part: &str) -> String {
+    part.trim().trim_matches(['"', '\'']).to_owned()
+}
+
 fn codex_config_declares_mcp_2026_protocol() -> bool {
     codex_config_declares(&[MCP_2026_FEATURE_KEY, "features.mcp_2026_07_28"])
 }
@@ -508,6 +563,7 @@ fn toml_string(value: &str) -> String {
 const ORIGINATOR_OVERRIDE_ENV: &str = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
 const MCP_2026_FEATURE_KEY: &str = "mcp_2026_07_28";
 const MCP_2026_PROTOCOL_OVERRIDE: &str = "features.mcp_2026_07_28=true";
+const UPDATE_PLAN_TOOL_OVERRIDE: &str = "tools.update_plan.enabled=true";
 const UNSTABLE_WARNING_KEY: &str = "suppress_unstable_features_warning";
 const UNSTABLE_WARNING_OVERRIDE: &str = "suppress_unstable_features_warning=true";
 
@@ -741,6 +797,45 @@ mod tests {
         }
         if !carries_flag {
             assert!(!carries_warning);
+        }
+    }
+
+    #[test]
+    fn the_planning_tool_is_asked_for_unless_the_config_decided_it() {
+        // Codex 0.152 made `tools.update_plan.enabled` default to false, and a
+        // plugin section full of `enabled` must not read as that decision.
+        assert!(!config_declares_update_plan_tool(
+            "model = \"gpt-5\"\n[plugins.\"documents@runtime\"]\nenabled = true\n"
+        ));
+        assert!(config_declares_update_plan_tool(
+            "tools.update_plan.enabled = false\n"
+        ));
+        assert!(config_declares_update_plan_tool(
+            "[tools.update_plan]\nenabled = true\n"
+        ));
+        assert!(config_declares_update_plan_tool(
+            "[tools]\nupdate_plan = { enabled = false }\n"
+        ));
+        assert!(!config_declares_update_plan_tool(
+            "[tools]\nweb_search = { enabled = true }\n"
+        ));
+        // A commented-out line is not a decision.
+        assert!(!config_declares_update_plan_tool(
+            "[tools.update_plan]\n# enabled = true\n"
+        ));
+
+        let mut command = codex_command(Path::new("codex"));
+        apply_update_plan_tool_override(&mut command);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        // The real Codex home decides, so only assert the pair stays together.
+        if let Some(index) = args.iter().position(|arg| arg == UPDATE_PLAN_TOOL_OVERRIDE) {
+            assert_eq!(args.get(index - 1).map(String::as_str), Some("-c"));
+        } else {
+            assert!(codex_config_declares_update_plan_tool());
         }
     }
 
