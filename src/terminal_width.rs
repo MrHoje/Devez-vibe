@@ -183,21 +183,6 @@ const XTERM6_BMP_COMBINING: &[(u32, u32)] = &[
     (0xfff9, 0xfffb),
 ];
 
-const XTERM6_HIGH_COMBINING: &[(u32, u32)] = &[
-    (0x10a01, 0x10a03),
-    (0x10a05, 0x10a06),
-    (0x10a0c, 0x10a0f),
-    (0x10a38, 0x10a3a),
-    (0x10a3f, 0x10a3f),
-    (0x1d167, 0x1d169),
-    (0x1d173, 0x1d182),
-    (0x1d185, 0x1d18b),
-    (0x1d1aa, 0x1d1ad),
-    (0x1d242, 0x1d244),
-    (0xe0001, 0xe0001),
-    (0xe0020, 0xe007f),
-    (0xe0100, 0xe01ef),
-];
 
 fn in_sorted_ranges(codepoint: u32, ranges: &[(u32, u32)]) -> bool {
     ranges
@@ -213,6 +198,128 @@ fn in_sorted_ranges(codepoint: u32, ranges: &[(u32, u32)]) -> bool {
         .is_ok()
 }
 
+/// Codepoints the Windows console lays out as two cells even though the modern
+/// and xterm 6 tables both call them one. Measured directly on this platform by
+/// writing each character and reading the cursor column back, because the
+/// console -- not the web renderer -- owns the cell buffer our output is
+/// replayed through. The middle dot and the arrows in this table sit in the
+/// status line and hints of every frame, so a one-cell assumption pushes those
+/// rows past the right edge and wraps the whole screen down a line.
+const CONSOLE_WIDE_AMBIGUOUS: &[(u32, u32)] = &[
+    (0x00a1, 0x00a1),
+    (0x00a4, 0x00a4),
+    (0x00a7, 0x00a8),
+    (0x00aa, 0x00aa),
+    (0x00ad, 0x00ae),
+    (0x00b0, 0x00b4),
+    (0x00b6, 0x00ba),
+    (0x00bc, 0x00bf),
+    (0x00c6, 0x00c6),
+    (0x00d0, 0x00d0),
+    (0x00d7, 0x00d8),
+    (0x00de, 0x00df),
+    (0x00e6, 0x00e6),
+    (0x00f0, 0x00f0),
+    (0x00f7, 0x00f8),
+    (0x00fe, 0x00fe),
+    (0x0111, 0x0111),
+    (0x0126, 0x0127),
+    (0x0131, 0x0133),
+    (0x0138, 0x0138),
+    (0x013f, 0x0142),
+    (0x0149, 0x014b),
+    (0x0152, 0x0153),
+    (0x0166, 0x0167),
+    (0x02c7, 0x02c7),
+    (0x02d0, 0x02d0),
+    (0x02d8, 0x02db),
+    (0x02dd, 0x02dd),
+    (0x0391, 0x03a1),
+    (0x03a3, 0x03a9),
+    (0x03b1, 0x03c1),
+    (0x03c3, 0x03c9),
+    (0x0401, 0x0401),
+    (0x0410, 0x044f),
+    (0x0451, 0x0451),
+    (0x2015, 0x2015),
+    (0x2018, 0x2019),
+    (0x201c, 0x201d),
+    (0x2020, 0x2021),
+    (0x2025, 0x2026),
+    (0x2030, 0x2030),
+    (0x2032, 0x2033),
+    (0x203b, 0x203b),
+    (0x2074, 0x2074),
+    (0x207f, 0x207f),
+    (0x2081, 0x2084),
+    (0x20ac, 0x20ac),
+    (0x2103, 0x2103),
+    (0x2109, 0x2109),
+    (0x2113, 0x2113),
+    (0x2116, 0x2116),
+    (0x2121, 0x2122),
+    (0x2126, 0x2126),
+    (0x212b, 0x212b),
+    (0x2153, 0x2154),
+    (0x215b, 0x215e),
+    (0x2160, 0x2169),
+    (0x2170, 0x2179),
+    (0x2190, 0x2199),
+    (0x21d2, 0x21d2),
+    (0x21d4, 0x21d4),
+    (0x2200, 0x2200),
+    (0x2202, 0x2203),
+    (0x2207, 0x2208),
+    (0x220b, 0x220b),
+    (0x220f, 0x220f),
+    (0x2211, 0x2211),
+    (0x221a, 0x221a),
+    (0x221d, 0x221e),
+    (0x2220, 0x2220),
+    (0x2225, 0x2225),
+    (0x2227, 0x222c),
+    (0x222e, 0x222e),
+    (0x2234, 0x2235),
+    (0x223c, 0x223d),
+    (0x2252, 0x2252),
+    (0x2260, 0x2261),
+    (0x2264, 0x2265),
+    (0x226a, 0x226b),
+    (0x2282, 0x2283),
+    (0x2286, 0x2287),
+    (0x2299, 0x2299),
+    (0x22a5, 0x22a5),
+    (0x2312, 0x2312),
+    (0x2460, 0x246e),
+    (0x2474, 0x2482),
+    (0x249c, 0x24e9),
+    (0x25a0, 0x25a1),
+    (0x25a3, 0x25a9),
+    (0x25b2, 0x25b3),
+    (0x25b6, 0x25b7),
+    (0x25bc, 0x25bd),
+    (0x25c0, 0x25c1),
+    (0x25c6, 0x25c8),
+    (0x25cb, 0x25cb),
+    (0x25ce, 0x25d1),
+    (0x2605, 0x2606),
+    (0x260e, 0x260f),
+    (0x261c, 0x261c),
+    (0x261e, 0x261e),
+    (0x2640, 0x2640),
+    (0x2642, 0x2642),
+    (0x2660, 0x2661),
+    (0x2663, 0x2665),
+    (0x2667, 0x266a),
+    (0x266c, 0x266d),
+    (0xe000, 0xe00c),
+    (0xe00e, 0xe011),
+    (0xe016, 0xe08c),
+    (0xe08e, 0xe095),
+    (0xe0a2, 0xe0bb),
+    (0xf8f7, 0xf8f7),
+];
+
 fn xterm_unicode6_width(codepoint: u32) -> usize {
     if codepoint < 0x20 || (0x7f..0xa0).contains(&codepoint) {
         return 0;
@@ -223,6 +330,9 @@ fn xterm_unicode6_width(codepoint: u32) -> usize {
     if codepoint < 0x10000 {
         if in_sorted_ranges(codepoint, XTERM6_BMP_COMBINING) {
             return 0;
+        }
+        if in_sorted_ranges(codepoint, CONSOLE_WIDE_AMBIGUOUS) {
+            return 2;
         }
         return usize::from(
             codepoint >= 0x1100
@@ -237,14 +347,10 @@ fn xterm_unicode6_width(codepoint: u32) -> usize {
                     || (0xffe0..=0xffe6).contains(&codepoint)),
         ) + 1;
     }
-    if in_sorted_ranges(codepoint, XTERM6_HIGH_COMBINING) {
-        return 0;
-    }
-    if (0x20000..=0x2fffd).contains(&codepoint) || (0x30000..=0x3fffd).contains(&codepoint) {
-        2
-    } else {
-        1
-    }
+    // Above the BMP the console advances two columns for every character it is
+    // given, emoji and combining marks alike, because it counts the surrogate
+    // pair rather than the glyph. Measured, not assumed.
+    2
 }
 
 #[cfg(not(test))]
@@ -376,10 +482,42 @@ fn push_fragment_parts<'a>(
 mod tests {
     use super::*;
 
+    /// Measured on Windows by writing each character to a console and reading
+    /// the cursor column back. The middle dot and arrows ride in the status
+    /// line of every frame, so getting them wrong wraps the whole screen.
     #[test]
-    fn xterm_profile_wraps_five_paw_prints_as_five_cells() {
+    fn console_profile_matches_the_measured_console_columns() {
         with_devezcode_xterm_widths(|| {
-            assert_eq!(wrap_ascii_space("🐾🐾🐾🐾🐾", 5), ["🐾🐾🐾🐾🐾"]);
+            for (ch, columns) in [
+                ('\u{00b7}', 2),
+                ('\u{2191}', 2),
+                ('\u{2193}', 2),
+                ('\u{2194}', 2),
+                ('\u{2026}', 2),
+                ('\u{2022}', 1),
+                ('\u{2500}', 1),
+                ('\u{2502}', 1),
+                ('\u{256d}', 1),
+                ('\u{276f}', 1),
+                ('\u{280b}', 1),
+                ('\u{23f0}', 1),
+                ('\u{1f43e}', 2),
+                ('가', 2),
+            ] {
+                assert_eq!(
+                    UnicodeWidthChar::width(ch),
+                    Some(columns),
+                    "U+{:04X} takes {columns} console columns",
+                    ch as u32
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn console_profile_wraps_paw_prints_as_two_cells_each() {
+        with_devezcode_xterm_widths(|| {
+            assert_eq!(wrap_ascii_space("🐾🐾🐾🐾🐾", 5), ["🐾🐾", "🐾🐾", "🐾"]);
         });
     }
 

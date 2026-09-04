@@ -21,7 +21,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const RELEASE_NOTES: &[&str] = &[
     "선택지 창이 뜨는 순간 한글이 다른 글자로 보이던 문제를 수정했습니다.",
     "이모지가 들어간 줄 때문에 화면이 한 줄씩 어긋나 겹쳐 보이던 문제를 수정했습니다.",
-    "화면 겹침 원인을 추적할 수 있도록 화면 출력 기록 스위치를 추가했습니다.",
+    "화면 출력 기록 스위치를 추가했습니다.",
+    "가운뎃점과 화살표, 이모지의 칸 수를 실제 화면과 맞춰 줄이 밀리고 겹치던 문제를 수정했습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

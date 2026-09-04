@@ -16216,13 +16216,13 @@ mod tests {
     #[test]
     fn devezcode_widths_match_xterm6_for_emoji_and_cjk() {
         with_devezcode_xterm_widths(|| {
-            assert_eq!(UnicodeWidthStr::width("🐾"), 1);
-            assert_eq!(UnicodeWidthStr::width("👩‍💻"), 2);
-            assert_eq!(UnicodeWidthStr::width("🇰🇷"), 2);
+            assert_eq!(UnicodeWidthStr::width("🐾"), 2);
+            assert_eq!(UnicodeWidthStr::width("👩‍💻"), 4);
+            assert_eq!(UnicodeWidthStr::width("🇰🇷"), 4);
             assert_eq!(UnicodeWidthStr::width("가"), 2);
             assert_eq!(UnicodeWidthChar::width('\u{0301}'), Some(0));
             assert_eq!(UnicodeWidthChar::width('\u{1ab0}'), Some(1));
-            assert_eq!(UnicodeWidthChar::width('\u{1d167}'), Some(0));
+            assert_eq!(UnicodeWidthChar::width('\u{1d167}'), Some(2));
             assert_eq!(
                 UnicodeWidthChar::width(char::from_u32(0x20000).expect("CJK extension")),
                 Some(2)
@@ -16242,10 +16242,11 @@ mod tests {
 
             assert_eq!(frame.cell(0, 0).glyph, "A");
             assert_eq!(frame.cell(1, 0).glyph, "🐾");
-            assert_eq!(frame.cell(2, 0).glyph, "B");
-            assert_eq!(frame.cell(3, 0).glyph, "가");
-            assert!(frame.cell(4, 0).continuation);
-            assert_eq!(frame.cell(5, 0).glyph, "C");
+            assert!(frame.cell(2, 0).continuation);
+            assert_eq!(frame.cell(3, 0).glyph, "B");
+            assert_eq!(frame.cell(4, 0).glyph, "가");
+            assert!(frame.cell(5, 0).continuation);
+            assert_eq!(frame.cell(6, 0).glyph, "C");
         });
     }
 

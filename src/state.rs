@@ -15987,8 +15987,8 @@ mod tests {
     #[test]
     fn devezcode_skill_columns_compact_with_xterm_width() {
         with_devezcode_xterm_widths(|| {
-            assert_eq!(compact_skill_column("🐾🐾", 2), "🐾🐾");
-            assert_eq!(UnicodeWidthStr::width("🐾🐾"), 2);
+            assert_eq!(compact_skill_column("🐾🐾", 4), "🐾🐾");
+            assert_eq!(UnicodeWidthStr::width("🐾🐾"), 4);
         });
     }
 
