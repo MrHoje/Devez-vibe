@@ -4106,7 +4106,6 @@ impl AppState {
             return Action::None;
         }
         self.agent_mode = mode;
-        self.set_composer_notice(format!("• Agent: {}", mode.label()));
         Action::Tick(true)
     }
 
@@ -4122,7 +4121,7 @@ impl AppState {
             );
             return Action::Tick(true);
         }
-        let selected = agent::CHOICES
+        let selected = agent::choices()
             .into_iter()
             .position(|mode| mode == self.agent_mode)
             .unwrap_or(0);
@@ -4131,7 +4130,7 @@ impl AppState {
     }
 
     fn apply_agent_choice(&mut self, index: usize) -> Action {
-        let Some(mode) = agent::CHOICES.get(index).copied() else {
+        let Some(mode) = agent::choices().get(index).copied() else {
             return Action::None;
         };
         self.set_agent_mode(mode)
@@ -9468,9 +9467,12 @@ impl AppState {
                     return self.open_agent_picker();
                 };
                 let Some(mode) = AgentMode::parse(argument) else {
-                    self.set_composer_notice(
-                        "• /agent [builder|planner|advisor|goal-runner]".to_owned(),
-                    );
+                    let names = agent::choices()
+                        .into_iter()
+                        .map(|mode| mode.id())
+                        .collect::<Vec<_>>()
+                        .join("|");
+                    self.set_composer_notice(format!("• /agent [{names}]"));
                     return Action::Tick(true);
                 };
                 self.set_agent_mode(mode)
@@ -9901,7 +9903,7 @@ impl AppState {
                 Action::None
             }
             PendingInteraction::AgentPicker { mut selected } => {
-                let count = agent::CHOICES.len();
+                let count = agent::choices().len();
                 match key.code {
                     KeyCode::Esc => return Action::None,
                     KeyCode::Up => selected = selected.saturating_sub(1),
@@ -9910,7 +9912,7 @@ impl AppState {
                     KeyCode::Down | KeyCode::Tab => selected = (selected + 1).min(count - 1),
                     KeyCode::Char('n') if ctrl => selected = (selected + 1).min(count - 1),
                     KeyCode::Char('j') if !ctrl && !alt => selected = (selected + 1).min(count - 1),
-                    KeyCode::Char(ch @ '1'..='4') => {
+                    KeyCode::Char(ch @ '1'..='9') => {
                         let row = ch.to_digit(10).unwrap_or(1) as usize - 1;
                         return self.apply_agent_choice(row);
                     }
@@ -11092,7 +11094,7 @@ impl AppState {
             PendingInteraction::AgentPicker { selected } => Some(OverlayView {
                 closable: true,
                 title: "Agent".to_owned(),
-                lines: agent::CHOICES
+                lines: agent::choices()
                     .into_iter()
                     .enumerate()
                     .map(|(index, mode)| OverlayLine {
@@ -12015,7 +12017,7 @@ impl AppState {
             return Vec::new();
         }
         let rest = rest.to_ascii_lowercase();
-        agent::CHOICES
+        agent::choices()
             .into_iter()
             .filter(|mode| mode.id().starts_with(&rest))
             .collect()
@@ -12972,7 +12974,7 @@ impl AppState {
             Some(PendingInteraction::RuntimePicker { .. }) if row < RUNTIME_CHOICES.len() => {
                 self.apply_runtime_choice(row)
             }
-            Some(PendingInteraction::AgentPicker { .. }) if row < agent::CHOICES.len() => {
+            Some(PendingInteraction::AgentPicker { .. }) if row < agent::choices().len() => {
                 self.apply_agent_choice(row)
             }
             Some(PendingInteraction::SkillsPicker {
@@ -23052,10 +23054,17 @@ mod tests {
         state.handle_key(KeyEvent::from(KeyCode::Tab));
         assert_eq!(state.agent_mode, AgentMode::Planner);
 
-        for expected in [AgentMode::Advisor, AgentMode::GoalRunner, AgentMode::Standard] {
+        for expected in [AgentMode::Advisor, AgentMode::GoalRunner] {
             state.handle_key(KeyEvent::from(KeyCode::Tab));
             assert_eq!(state.agent_mode, expected);
         }
+        // Whatever the agents folder adds sits after the built-ins, so the
+        // cycle returns to Builder only once every role has been through.
+        for _ in agent::BUILTIN.len()..agent::choices().len() {
+            state.handle_key(KeyEvent::from(KeyCode::Tab));
+        }
+        state.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(state.agent_mode, AgentMode::Standard);
     }
 
     /// Tab selects the next turn's role without repainting the active turn's plan.
@@ -23160,7 +23169,7 @@ mod tests {
         state.handle_key(KeyEvent::from(KeyCode::Enter));
         let overlay = state.view().overlay.expect("the picker is open");
         assert_eq!(overlay.title, "Agent");
-        assert_eq!(overlay.lines.len(), 4);
+        assert_eq!(overlay.lines.len(), agent::choices().len());
         assert!(overlay.lines[0].text.contains("Builder"));
         assert!(overlay.lines[3].text.contains("Goal Runner"));
 
@@ -23184,7 +23193,7 @@ mod tests {
         let mut state = idle_test_state();
         state.editor.set_text("/agent ");
         let suggestions = state.view().suggestions;
-        assert_eq!(suggestions.len(), 4);
+        assert_eq!(suggestions.len(), agent::choices().len());
         assert!(suggestions[0].command.ends_with("builder"));
         assert!(suggestions[0].description.contains("Builder"));
 

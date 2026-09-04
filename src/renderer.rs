@@ -9265,24 +9265,20 @@ fn notice_card_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         content
     };
     let inner = content.iter().map(painted_line_width).max().unwrap_or(0);
-    // Card walls share the marker's muted tone so the two corners, both side
-    // rules, and any marker gutters read as one unbroken frame.
+    // The two rules share the marker's muted tone so the corners and the frame
+    // read as one line.
     let border = Tone::Muted;
     let mut lines = Vec::with_capacity(content.len() + 3);
     lines.push(PaintLine {
         tone: border,
         ..PaintLine::plain(format!("┌{}┐", "─".repeat(inner + 2)))
     });
-    // Each row sits between two side rules; the right wall is padded flush so
-    // the box closes at the same column on every line.
+    // The card borrows the tip card's open frame: a rule above, a rule below,
+    // and no side walls. Rows keep the wall's two columns as indent so their
+    // text still starts inside the frame.
     for mut row in content {
-        let pad = inner.saturating_sub(painted_line_width(&row));
-        row.prefix = format!("│ {}", row.prefix);
-        row.tail.push(PaintSpan {
-            text: format!("{} │", " ".repeat(pad)),
-            tone: border,
-            bold: false,
-        });
+        row.prefix = format!("  {}", row.prefix);
+        row.pick = row.pick.map(|regions| regions.shifted(2));
         lines.push(row);
     }
     lines.push(PaintLine {
@@ -13144,6 +13140,13 @@ fn agent_prompt_tone(mode: AgentMode) -> Tone {
         AgentMode::Planner => Tone::AgentPlanner,
         AgentMode::Advisor => Tone::AgentAdvisor,
         AgentMode::GoalRunner => Tone::AgentGoalRunner,
+        // A user-defined role borrows one of the specialized colours in turn,
+        // so it reads as a role rather than as Builder.
+        AgentMode::Custom(index) => match index % 3 {
+            0 => Tone::AgentPlanner,
+            1 => Tone::AgentAdvisor,
+            _ => Tone::AgentGoalRunner,
+        },
     }
 }
 
@@ -16299,10 +16302,9 @@ mod tests {
         let card_width = painted_width(&lines[0]);
         assert!(card_width < 55);
         assert_eq!(painted_width(&lines[2]), card_width);
-        assert!([&lines[1]].iter().all(|line| {
-            let painted = painted(line);
-            painted.starts_with('│') && painted.ends_with('│') && painted_width(line) == card_width
-        }));
+        // The frame is open at the sides, so rows carry no walls at all.
+        assert!([&lines[1]].iter().all(|line| !painted(line).contains('│')));
+        assert!(painted(&lines[1]).starts_with("  "));
         assert!(lines[3].text.is_empty());
     }
 
@@ -16316,11 +16318,10 @@ mod tests {
         let lines = block_lines(&block, 80);
 
         let detail = &lines[1];
-        // The arrow, model name, separator, effort, then the closing wall.
-        assert_eq!(detail.tail.len(), 5);
+        // The arrow, model name, separator, then effort. No closing wall follows.
+        assert_eq!(detail.tail.len(), 4);
         assert_eq!(detail.tail[1].tone, Tone::ModelTerra);
         assert_eq!(detail.tail[3].tone, Tone::EffortHigh);
-        assert!(detail.tail[4].text.ends_with('│'));
     }
 
     #[test]
@@ -16335,9 +16336,9 @@ mod tests {
         assert!(painted(&lines[0]).starts_with('┌'));
         assert!(painted(&lines[1]).contains("◆ Provider"));
         assert!(painted(&lines[2]).contains("↳ 현재 Codex provider를 사용 중입니다."));
-        // Walled rows now match the corner rows column for column.
-        assert_eq!(painted_width(&lines[0]), painted_width(&lines[2]));
-        assert!(painted(&lines[2]).starts_with('│') && painted(&lines[2]).ends_with('│'));
+        // Rows sit inside the open frame without side walls.
+        assert!(!painted(&lines[2]).contains('│'));
+        assert!(painted(&lines[2]).starts_with("  "));
     }
 
     #[test]
