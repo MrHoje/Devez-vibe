@@ -22,9 +22,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "컴포저의 지식 모드를 Vibe 오른쪽에 Knowledge: Auto·Off로 표시합니다.",
-    "컴포저의 Vibe 클릭을 On·Super Vibe·Off 순서의 즉시 전환으로 변경했습니다.",
-    "/fast와 상태줄 Fast 클릭이 선택창 없이 바로 켜고 끄도록 변경했습니다.",
+    "Codex 자동 지식 분석을 막던 잘못된 hooks 설정을 제거했습니다.",
+    "컴포저의 Knowledge 배지를 클릭하면 Auto·Off가 즉시 전환되도록 변경했습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

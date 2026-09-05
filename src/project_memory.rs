@@ -689,8 +689,6 @@ async fn run_codex(paths: &RuntimePaths, root: &Path, prompt: &str) -> Result<St
         .arg("model_reasoning_effort=\"low\"")
         .arg("--config")
         .arg("approval_policy=\"never\"")
-        .arg("--config")
-        .arg("hooks=[]")
         .arg("--color")
         .arg("never")
         .arg("--output-last-message")

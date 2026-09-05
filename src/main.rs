@@ -2351,8 +2351,14 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
             }
         }
         Pick::KnowledgeMode => {
-            state.open_knowledge_mode_picker();
-            Action::None
+            let previous = state.knowledge_mode();
+            let mode = if previous.enabled() {
+                project_memory::KnowledgeMode::Off
+            } else {
+                project_memory::KnowledgeMode::On
+            };
+            state.set_knowledge_mode(mode);
+            Action::PersistKnowledgeMode { previous, mode }
         }
         Pick::FastMode => state.run_command("/fast"),
         Pick::ShellDisplayMode => {
@@ -6878,16 +6884,30 @@ mod tests {
     }
 
     #[test]
-    fn clicking_the_knowledge_badge_opens_its_project_picker() {
+    fn clicking_the_knowledge_badge_toggles_and_persists_the_project_mode() {
         let mut state = starting_state();
+        state.set_knowledge_mode(project_memory::KnowledgeMode::Off);
 
         let action = pick_action(&mut state, Pick::KnowledgeMode);
 
-        assert!(matches!(action, Action::None));
-        assert_eq!(
-            state.view().overlay.map(|overlay| overlay.title),
-            Some("프로젝트 지식 관리".to_owned())
-        );
+        assert!(matches!(
+            action,
+            Action::PersistKnowledgeMode {
+                previous: project_memory::KnowledgeMode::Off,
+                mode: project_memory::KnowledgeMode::On
+            }
+        ));
+        assert_eq!(state.knowledge_mode(), project_memory::KnowledgeMode::On);
+        assert!(state.view().overlay.is_none());
+
+        assert!(matches!(
+            pick_action(&mut state, Pick::KnowledgeMode),
+            Action::PersistKnowledgeMode {
+                previous: project_memory::KnowledgeMode::On,
+                mode: project_memory::KnowledgeMode::Off
+            }
+        ));
+        assert_eq!(state.knowledge_mode(), project_memory::KnowledgeMode::Off);
     }
 
     #[test]
