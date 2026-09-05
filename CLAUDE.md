@@ -27,7 +27,8 @@
 
 ## 기록
 
-* 반복될 가능성이 큰 실수나 중요한 교훈만 `.Codex.md`에 기록한다.
+* 반복될 가능성이 큰 실수나 중요한 교훈은 알맞은 `.knowledge/` 문서에 기록한다.
+* 기존 문서에 맞는 주제가 없으면 새 지식 문서를 만들고 아래 문서 목록도 함께 갱신한다.
 
 ## 지식베이스
 
@@ -39,6 +40,8 @@
   * `배포-버전-갱신.md` — Cargo.toml 버전과 웰컴 UI 표기, npm 패키지 배포 절차
   * `토큰사용량-단가-갱신.md` — 컴포저 추정 비용의 모델별 단가표 갱신 절차, DevezCode와 동일 단가 유지
   * `한글-글리프-깨짐-진단.md` — 전각 글리프가 다른 글자로 보이는 증상의 원인과 수정 방법
+  * `Windows-호스트-통합-주의.md` — ConPTY 특수 입력과 배치 파일 안의 PowerShell 본문 처리 주의사항
+  * `에이전트-역할-확장-주의.md` — 사용자 정의 역할 추가 시 동적 개수와 내장 역할 보호 원칙
   * `agent-system-implementation-plan.md` — Builder·Planner·Goal Runner·Reviewer 역할 시스템의 초기 구현 계획서
   * `side-panel-reference.md` — 제거된 우측 도킹 정보 패널의 예전 구현 참고 자료
   * `builder-ponytail.md` — Builder 역할에 넣은 Ponytail 최소 코드 규칙의 적용 내용과 제거 절차
