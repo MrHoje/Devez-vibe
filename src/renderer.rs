@@ -6128,10 +6128,10 @@ fn artifact_line(artifacts: &[ArtifactView], width: u16) -> Option<PaintLine> {
     let latest = artifacts.last()?;
     let more = match artifacts.len() {
         0 | 1 => String::new(),
-        count => format!(" · +{} more", count - 1),
+        count => format!(" +{} more", count - 1),
     };
     // The trailing `x` is the CLI's own dismiss key, drawn here as a click target.
-    let dismiss = " · x";
+    let dismiss = "  x";
     let reserved = 1
         + UnicodeWidthStr::width(ARTIFACT_GLYPH)
         + 2
@@ -6154,7 +6154,7 @@ fn artifact_line(artifacts: &[ArtifactView], width: u16) -> Option<PaintLine> {
             bold: false,
         },
         PaintSpan {
-            text: format!("{more} · "),
+            text: format!("{more}  "),
             tone: Tone::Muted,
             bold: false,
         },
@@ -18333,7 +18333,8 @@ mod tests {
         assert!(text.contains("devez-test.html"), "{text}");
         assert!(text.contains("+1 more"), "{text}");
         assert!(text.starts_with(" ⧉  devez-test.html"), "{text}");
-        assert!(text.ends_with("+1 more · x"), "{text}");
+        assert!(text.ends_with("devez-test.html +1 more  x"), "{text}");
+        assert!(!text.contains('·'), "{text}");
         assert!(!text.contains("click to open"), "{text}");
         assert!(!text.contains("old.html"), "{text}");
         assert_eq!(pick_on(&line, "x"), Some(Pick::DismissArtifacts));
