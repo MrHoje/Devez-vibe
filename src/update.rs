@@ -19,8 +19,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "Astra 모델 표시를 이미지와 같은 블루톤으로 바꿨습니다.",
-    "밝은 테마에는 대비를 확보한 짙은 블루를, 어두운 테마에는 원본의 밝은 블루를 적용했습니다.",
+    "Astra 모델 표시를 각 테마의 Claude Opus와 같은 색상으로 바꿨습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
