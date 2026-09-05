@@ -3146,9 +3146,43 @@ function transcriptEntries(raw) {
       if (seen.has(entry.uuid)) continue;
       seen.add(entry.uuid);
     }
+    // The transcript file spells the SDK's tool_use_result as toolUseResult.
+    if (entry.tool_use_result === undefined && entry.toolUseResult !== undefined) entry.tool_use_result = entry.toolUseResult;
     messages.push(entry);
   }
   return messages;
+}
+
+// Pages the transcript published with the Artifact tool, oldest first and each
+// URL at its latest publish, so a resumed session gets its row under the status
+// line back the way the CLI rehydrates its own footer.
+function publishedArtifacts(messages) {
+  const inputs = new Map();
+  const artifacts = new Map();
+  for (const message of messages) {
+    for (const block of contentBlocks(message.message)) {
+      if (block.type === "tool_use" && block.name === "Artifact") inputs.set(block.id, block.input || {});
+      if (block.type !== "tool_result" || !inputs.has(block.tool_use_id)) continue;
+      const result = message.tool_use_result;
+      if (typeof result?.url !== "string") continue;
+      artifacts.delete(result.url);
+      artifacts.set(result.url, {
+        url: result.url,
+        title: String(result.title || ""),
+        path: String(result.path || inputs.get(block.tool_use_id).file_path || ""),
+      });
+    }
+  }
+  return [...artifacts.values()];
+}
+
+// Sent after the resume reply, which the host has already cleared its row for.
+function restoreArtifacts(id, messages) {
+  const artifacts = publishedArtifacts(messages);
+  if (!artifacts.length) return;
+  setImmediate(() => {
+    for (const artifact of artifacts) notify("turn/artifact/published", { threadId: id, ...artifact });
+  });
 }
 
 async function transcriptMessagesAt(path) {
@@ -3381,6 +3415,7 @@ async function dispatch(method, params = {}) {
     if (existing) {
       const messages = await sessionMessages(id, existing.cwd);
       if (!existing.tasks.size) existing.tasks = historyState(messages).tasks;
+      restoreArtifacts(id, messages);
       return {
         id,
         thread: { id, turns: [] },
@@ -3414,6 +3449,7 @@ async function dispatch(method, params = {}) {
     session.lastContextUsage = tokenUsage?.last || null;
     session.lastContextWindow = tokenUsage?.modelContextWindow || 0;
     session.tasks = historyState(messages).tasks;
+    restoreArtifacts(id, messages);
     return {
       id,
       thread: { id, turns: [] },
@@ -3643,6 +3679,25 @@ async function runSelfTest() {
   if (restored.length !== 6
     || JSON.stringify(restoredPrompts) !== JSON.stringify(["compact 이전 질문", "compact 이후 질문"])) {
     throw new Error(`Claude compacted transcript self-test failed: ${JSON.stringify({ restored: restored.length, restoredPrompts })}`);
+  }
+  // A resumed transcript lists its Artifact pages once each at their latest
+  // publish, read through the file's toolUseResult spelling.
+  const artifactTranscript = [
+    JSON.stringify({ type: "assistant", uuid: "art-1", message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_a1", name: "Artifact", input: { file_path: "C:\\tmp\\first.html" } }] } }),
+    JSON.stringify({ type: "user", uuid: "art-1r", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_a1", content: "ok" }] }, toolUseResult: { url: "https://claude.ai/code/artifact/one", title: "One" } }),
+    JSON.stringify({ type: "assistant", uuid: "art-2", message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_a2", name: "Artifact", input: { file_path: "C:\\tmp\\second.html" } }] } }),
+    JSON.stringify({ type: "user", uuid: "art-2r", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_a2", content: "ok" }] }, toolUseResult: { url: "https://claude.ai/code/artifact/two", path: "C:\\tmp\\second.html", title: "Two" } }),
+    JSON.stringify({ type: "assistant", uuid: "art-3", message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_a3", name: "Artifact", input: { action: "read", url: "https://claude.ai/code/artifact/one" } }] } }),
+    JSON.stringify({ type: "user", uuid: "art-3r", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_a3", content: "<html>" }] }, toolUseResult: { content: "<html>" } }),
+    JSON.stringify({ type: "assistant", uuid: "art-4", message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_a4", name: "Artifact", input: { file_path: "C:\\tmp\\first.html" } }] } }),
+    JSON.stringify({ type: "user", uuid: "art-4r", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_a4", content: "ok" }] }, toolUseResult: { url: "https://claude.ai/code/artifact/one", path: "C:\\tmp\\first.html", title: "One", updated: true } }),
+  ].join("\n");
+  const restoredArtifacts = publishedArtifacts(transcriptEntries(artifactTranscript));
+  if (JSON.stringify(restoredArtifacts) !== JSON.stringify([
+    { url: "https://claude.ai/code/artifact/two", title: "Two", path: "C:\\tmp\\second.html" },
+    { url: "https://claude.ai/code/artifact/one", title: "One", path: "C:\\tmp\\first.html" },
+  ])) {
+    throw new Error(`Claude artifact resume self-test failed: ${JSON.stringify(restoredArtifacts)}`);
   }
   // A model that left the CLI's list resolves to its family's newest entry, so a
   // Fable 5 transcript resumes on Fable 5.1 instead of the host's default.

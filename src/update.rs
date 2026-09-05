@@ -19,8 +19,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude가 HTML 페이지를 claude.ai Artifact로 게시하면 상태줄 아래에 파일 이름 행이 나타납니다. 클릭하면 브라우저로 열리고 x로 숨길 수 있습니다.",
-    "Claude 세션에서 Artifact 도구를 켭니다. 계정에 기능이 열려 있지 않으면 도구가 나타나지 않으며 다른 동작에는 영향이 없습니다.",
+    "Claude 세션을 재개하면 이전에 게시한 Artifact 링크 행이 상태줄 아래에 다시 나타납니다. 순정 Claude Code와 같은 동작입니다.",
+    "Artifact 링크 행에서 안내 문구를 없애고, 밑줄은 파일 이름에만 표시하며 숨기기 표시를 X로 바꿨습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

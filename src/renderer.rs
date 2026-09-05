@@ -6130,29 +6130,35 @@ fn artifact_line(artifacts: &[ArtifactView], width: u16) -> Option<PaintLine> {
         0 | 1 => String::new(),
         count => format!(" · +{} more", count - 1),
     };
-    let hint = " · click to open · x";
+    let dismiss = " · X";
     let reserved = 1
         + UnicodeWidthStr::width(ARTIFACT_GLYPH)
         + 2
         + UnicodeWidthStr::width(more.as_str())
-        + UnicodeWidthStr::width(hint);
+        + UnicodeWidthStr::width(dismiss);
     let name = compact_right(
         &latest.name,
         usize::from(width).saturating_sub(reserved + 1),
     );
+    // The gap sits in its own span so the link underline starts at the name.
     let tail = vec![
         PaintSpan {
-            text: format!("  {name}"),
-            tone: Tone::MarkdownLink,
-            bold: false,
-        },
-        PaintSpan {
-            text: format!("{more} · click to open · "),
+            text: "  ".to_owned(),
             tone: Tone::Muted,
             bold: false,
         },
         PaintSpan {
-            text: "x".to_owned(),
+            text: name,
+            tone: Tone::MarkdownLink,
+            bold: false,
+        },
+        PaintSpan {
+            text: format!("{more} · "),
+            tone: Tone::Muted,
+            bold: false,
+        },
+        PaintSpan {
+            text: "X".to_owned(),
             tone: Tone::Muted,
             bold: false,
         },
@@ -6170,8 +6176,8 @@ fn artifact_line(artifacts: &[ArtifactView], width: u16) -> Option<PaintLine> {
         }
         .with_tight_picks(&[
             (0, Pick::OpenLink(latest.url.clone())),
-            (1, Pick::OpenLink(latest.url.clone())),
-            (3, Pick::DismissArtifacts),
+            (2, Pick::OpenLink(latest.url.clone())),
+            (4, Pick::DismissArtifacts),
         ]),
     )
 }
@@ -18325,8 +18331,14 @@ mod tests {
         let text = painted(&line);
         assert!(text.contains("devez-test.html"), "{text}");
         assert!(text.contains("+1 more"), "{text}");
-        assert!(text.ends_with("click to open · x"), "{text}");
+        assert!(text.ends_with("+1 more · X"), "{text}");
+        assert!(!text.contains("click to open"), "{text}");
         assert!(!text.contains("old.html"), "{text}");
+        // Only the name carries the link underline: the glyph and the gap do not.
+        assert_eq!(line.tail[1].text, "devez-test.html");
+        assert_eq!(line.tail[1].tone, Tone::MarkdownLink);
+        assert_ne!(line.tone, Tone::MarkdownLink);
+        assert_ne!(line.tail[0].tone, Tone::MarkdownLink);
         let regions = &line.pick.as_ref().expect("clickable").0;
         assert!(regions.iter().any(|(_, _, pick)| {
             *pick == Pick::OpenLink("https://claude.ai/code/artifact/new".to_owned())

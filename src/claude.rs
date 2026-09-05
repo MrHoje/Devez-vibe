@@ -791,6 +791,8 @@ mod tests {
         assert!(bridge.contains("notify(\"turn/subagent/line\""));
         // The artifact row under the status line listens for this method name.
         assert!(bridge.contains("notify(\"turn/artifact/published\""));
+        // A resume replays the transcript's published pages into that row.
+        assert!(bridge.contains("restoreArtifacts(id, messages)"));
         assert!(bridge.contains("findSubagent(session, message.parent_tool_use_id)"));
         assert!(bridge.contains("keepBackgroundSubagent(session, block.tool_use_id"));
         assert!(bridge.contains("result?.status === \"async_launched\""));
