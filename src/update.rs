@@ -19,9 +19,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "검토자와 검수자 서브에이전트가 리뷰 패키지 옆에 JSON 판정 파일을 씁니다.",
-    "Goal Runner가 판정 파일 값으로만 검토 게이트를 통과시키고, 파일이 없거나 깨지면 통과로 보지 않습니다.",
-    "이전 판 검토자·검수자 지침으로 만든 Codex 에이전트 파일도 새 지침으로 갱신합니다.",
+    "Builder 역할의 응답 분량 제한에서 상세 설명 요청 예외를 없앴습니다. 이제 선택·승인을 요청하는 답변에만 예외를 둡니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
