@@ -31,6 +31,7 @@ const LOCK_WAIT: Duration = Duration::from_secs(120);
 const STALE_LOCK: Duration = Duration::from_secs(600);
 const MAX_PENDING_JOBS: usize = 32;
 const MAX_PROCESS_OUTPUT_BYTES: usize = 1_048_576;
+const KNOWLEDGE_RUNTIME_ENABLED: bool = false;
 const GENERATED_HEADER: &str = "<!-- DevezVibe가 자동 생성하는 파일입니다. 직접 작성한 지식은 .knowledge 루트에 보관하세요. -->";
 const CODEX_MEMORY_MODEL: &str = "gpt-5.6-luna";
 const CLAUDE_MEMORY_MODEL: &str = "haiku";
@@ -56,36 +57,6 @@ pub enum KnowledgeMode {
 }
 
 impl KnowledgeMode {
-    pub const PICKER_CHOICES: [Self; 2] = [Self::Off, Self::On];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Off => "Knowledge: Off",
-            Self::On => "Knowledge: Auto",
-        }
-    }
-
-    pub const fn picker_label(self) -> &'static str {
-        match self {
-            Self::Off => "Off",
-            Self::On => "Auto",
-        }
-    }
-
-    pub const fn picker_detail(self) -> &'static str {
-        match self {
-            Self::Off => "이 프로젝트의 세션을 분석하거나 지식 파일을 만들지 않습니다.",
-            Self::On => "완료된 작업에서 재사용할 지식을 추려 .knowledge/auto에 기록합니다.",
-        }
-    }
-
-    pub const fn picker_index(self) -> usize {
-        match self {
-            Self::Off => 0,
-            Self::On => 1,
-        }
-    }
-
     pub const fn enabled(self) -> bool {
         matches!(self, Self::On)
     }
@@ -107,12 +78,8 @@ pub struct RuntimePaths {
 
 #[derive(Clone, Debug)]
 pub enum KnowledgeUpdate {
-    Saved {
-        project_root: PathBuf,
-    },
-    Unchanged {
-        project_root: PathBuf,
-    },
+    Saved,
+    Unchanged,
     Failed {
         project_root: PathBuf,
         message: String,
@@ -189,13 +156,16 @@ struct CapturedOutput {
 }
 
 pub fn read_mode(cwd: &str) -> KnowledgeMode {
-    if cfg!(test) {
+    if !KNOWLEDGE_RUNTIME_ENABLED || cfg!(test) {
         return KnowledgeMode::Off;
     }
     read_mode_for_root(&project_root(Path::new(cwd)))
 }
 
 fn read_mode_for_root(root: &Path) -> KnowledgeMode {
+    if !KNOWLEDGE_RUNTIME_ENABLED {
+        return KnowledgeMode::Off;
+    }
     let Some(path) = project_modes_path() else {
         return KnowledgeMode::Off;
     };
@@ -218,6 +188,7 @@ fn read_mode_from_path(path: &Path, root: &Path) -> KnowledgeMode {
     mode_in(&modes, root)
 }
 
+#[allow(dead_code)]
 pub fn write_mode(cwd: &str, mode: KnowledgeMode) -> std::io::Result<()> {
     let path = project_modes_path().ok_or_else(|| {
         std::io::Error::new(
@@ -535,11 +506,11 @@ async fn process_queued_turn(
     let update = match process_turn_locked(paths, &root, &queued.turn).await {
         Ok(true) => {
             let _ = fs::remove_file(path);
-            KnowledgeUpdate::Saved { project_root: root }
+            KnowledgeUpdate::Saved
         }
         Ok(false) => {
             let _ = fs::remove_file(path);
-            KnowledgeUpdate::Unchanged { project_root: root }
+            KnowledgeUpdate::Unchanged
         }
         Err(error) => {
             queued.attempts = queued.attempts.saturating_add(1);
@@ -1299,12 +1270,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mode_labels_use_auto_and_off_wording() {
-        assert_eq!(KnowledgeMode::Off.label(), "Knowledge: Off");
-        assert_eq!(KnowledgeMode::On.label(), "Knowledge: Auto");
+    fn runtime_mode_is_fixed_off() {
+        assert!(!KNOWLEDGE_RUNTIME_ENABLED);
+        assert_eq!(read_mode("C:/source/project"), KnowledgeMode::Off);
         assert_eq!(
-            KnowledgeMode::PICKER_CHOICES.map(KnowledgeMode::picker_label),
-            ["Off", "Auto"]
+            read_mode_for_root(Path::new("C:/source/project")),
+            KnowledgeMode::Off
         );
     }
 

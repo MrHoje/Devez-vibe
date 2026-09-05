@@ -22,8 +22,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "Codex 자동 지식 분석을 막던 잘못된 hooks 설정을 제거했습니다.",
-    "컴포저의 Knowledge 배지를 클릭하면 Auto·Off가 즉시 전환되도록 변경했습니다.",
+    "사이드패널이 열리면 브랜치·Vibe 상태를 Context 위에 반응형으로 표시합니다.",
+    "사이드패널 사용 중에도 Working·Completed 상태는 컴포저 위에 유지합니다.",
+    "자동 지식 코드는 보존하되 런타임을 Off로 고정하고 명령·표시·성공 알림을 제거했습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

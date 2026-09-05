@@ -557,7 +557,7 @@ impl SlashCommand {
     }
 }
 
-const SLASH_COMMANDS: [SlashCommand; 34] = [
+const SLASH_COMMANDS: [SlashCommand; 33] = [
     SlashCommand {
         name: "/provider",
         description: "Switch between the Claude and Codex providers, or connect OpenCode",
@@ -676,11 +676,6 @@ const SLASH_COMMANDS: [SlashCommand; 34] = [
     SlashCommand {
         name: "/vibemode",
         description: "Customize response, shell, and diff display (Alt+V cycles the preset)",
-        takes_argument: false,
-    },
-    SlashCommand {
-        name: "/knowledge",
-        description: "프로젝트 자동 지식 관리를 켜거나 끕니다",
         takes_argument: false,
     },
     SlashCommand {
@@ -1317,10 +1312,6 @@ pub enum Action {
         shell: ShellDisplayMode,
         diff: DiffDisplayMode,
     },
-    PersistKnowledgeMode {
-        previous: KnowledgeMode,
-        mode: KnowledgeMode,
-    },
     PersistStatusLine {
         key_path: &'static str,
         enabled: bool,
@@ -1714,10 +1705,6 @@ enum PendingInteraction {
         response: ResponseLength,
         shell: ShellDisplayMode,
         diff: DiffDisplayMode,
-    },
-    KnowledgeModePicker {
-        selected: usize,
-        previous: KnowledgeMode,
     },
     StatusLinePicker {
         selected: usize,
@@ -3106,7 +3093,6 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
             | PendingInteraction::ClaudePermissionScopePicker { .. }
             | PendingInteraction::ClaudePermissionRuleInput { .. }
             | PendingInteraction::VibeModePicker { .. }
-            | PendingInteraction::KnowledgeModePicker { .. }
             | PendingInteraction::StatusLinePicker { .. }
             | PendingInteraction::SkillsPicker { .. }
             | PendingInteraction::SubagentTranscript { .. }
@@ -5232,8 +5218,6 @@ impl AppState {
         ComposerMode {
             agent: self.agent_mode,
             branch: self.branch.clone(),
-            knowledge_mode: self.knowledge_mode.label().to_owned(),
-            knowledge_enabled: self.knowledge_mode.enabled(),
             vibe_mode: self.vibe_mode.label().to_owned(),
             vibe_tone: match self.vibe_mode {
                 VibeMode::Normal => VibeTone::Off,
@@ -5430,13 +5414,6 @@ impl AppState {
             response: self.response_length,
             shell: self.shell_display_mode,
             diff: self.diff_display_mode,
-        });
-    }
-
-    pub fn open_knowledge_mode_picker(&mut self) {
-        self.pending = Some(PendingInteraction::KnowledgeModePicker {
-            selected: self.knowledge_mode.picker_index(),
-            previous: self.knowledge_mode,
         });
     }
 
@@ -9348,15 +9325,6 @@ impl AppState {
                     .push(Block::new(BlockKind::Error, "Usage", "/vibemode"));
                 Action::None
             }
-            "/knowledge" if parts.len() == 1 => {
-                self.open_knowledge_mode_picker();
-                Action::None
-            }
-            "/knowledge" => {
-                self.committed
-                    .push(Block::new(BlockKind::Error, "Usage", "/knowledge"));
-                Action::None
-            }
             "/theme" if parts.len() == 1 => {
                 self.pending = Some(PendingInteraction::ThemePicker {
                     theme_index: theme::current().index(),
@@ -10307,40 +10275,6 @@ impl AppState {
                     response,
                     shell,
                     diff,
-                });
-                Action::None
-            }
-            PendingInteraction::KnowledgeModePicker {
-                mut selected,
-                previous,
-            } => {
-                let moved = match key.code {
-                    KeyCode::Esc => {
-                        self.knowledge_mode = previous;
-                        return Action::None;
-                    }
-                    KeyCode::Enter => {
-                        return Action::PersistKnowledgeMode {
-                            previous,
-                            mode: self.knowledge_mode,
-                        };
-                    }
-                    KeyCode::Left | KeyCode::Up | KeyCode::Char('p') if !alt => {
-                        selected = selected.saturating_sub(1);
-                        true
-                    }
-                    KeyCode::Right | KeyCode::Down | KeyCode::Tab | KeyCode::Char('n') if !alt => {
-                        selected = (selected + 1).min(KnowledgeMode::PICKER_CHOICES.len() - 1);
-                        true
-                    }
-                    _ => false,
-                };
-                if moved {
-                    self.knowledge_mode = KnowledgeMode::PICKER_CHOICES[selected];
-                }
-                self.pending = Some(PendingInteraction::KnowledgeModePicker {
-                    selected,
-                    previous,
                 });
                 Action::None
             }
@@ -11482,27 +11416,6 @@ impl AppState {
                         detail: Some(vibe.picker_detail().to_owned()),
                     }),
                     hint: "←→ Move  ·  Enter Apply  ·  Esc Cancel".to_owned(),
-                    style: OverlayStyle::Picker,
-                    input: None,
-                    input_label: "",
-                    input_placeholder: "",
-                })
-            }
-            PendingInteraction::KnowledgeModePicker { selected, .. } => {
-                let mode = KnowledgeMode::PICKER_CHOICES[*selected];
-                Some(OverlayView {
-                    closable: true,
-                    title: "프로젝트 지식 관리".to_owned(),
-                    lines: Vec::new(),
-                    slider: Some(EffortSlider {
-                        efforts: KnowledgeMode::PICKER_CHOICES
-                            .iter()
-                            .map(|mode| mode.picker_label().to_owned())
-                            .collect(),
-                        selected: *selected,
-                        detail: Some(mode.picker_detail().to_owned()),
-                    }),
-                    hint: "방향키 이동 · Enter 적용 · Esc 취소".to_owned(),
                     style: OverlayStyle::Picker,
                     input: None,
                     input_label: "",
@@ -12812,16 +12725,8 @@ impl AppState {
         self.knowledge_mode
     }
 
-    pub fn set_knowledge_mode(&mut self, mode: KnowledgeMode) {
-        self.knowledge_mode = mode;
-    }
-
     pub fn take_completed_knowledge_turn(&mut self) -> Option<KnowledgeTurn> {
         self.completed_knowledge_turn.take()
-    }
-
-    pub fn show_knowledge_notice(&mut self, text: impl Into<String>) {
-        self.set_composer_notice(text.into());
     }
 
     pub const fn response_length(&self) -> ResponseLength {
@@ -13518,18 +13423,6 @@ impl AppState {
                         response,
                         shell,
                         diff,
-                    });
-                    Action::Tick(false)
-                }
-            }
-            Some(PendingInteraction::KnowledgeModePicker { selected, previous }) => {
-                if let Some(mode) = KnowledgeMode::PICKER_CHOICES.get(step).copied() {
-                    self.knowledge_mode = mode;
-                    Action::PersistKnowledgeMode { previous, mode }
-                } else {
-                    self.pending = Some(PendingInteraction::KnowledgeModePicker {
-                        selected,
-                        previous,
                     });
                     Action::Tick(false)
                 }
@@ -17592,35 +17485,6 @@ mod tests {
     }
 
     #[test]
-    fn knowledge_mode_picker_is_project_off_by_default_and_restores_on_escape() {
-        let mut state = test_state();
-        assert_eq!(state.knowledge_mode(), KnowledgeMode::Off);
-
-        state.run_slash_command("/knowledge");
-        let slider = state
-            .overlay_view()
-            .and_then(|overlay| overlay.slider)
-            .expect("knowledge choices");
-        assert_eq!(slider.efforts, ["Off", "Auto"]);
-        assert_eq!(slider.selected, 0);
-
-        state.handle_key(KeyEvent::from(KeyCode::Right));
-        assert_eq!(state.knowledge_mode(), KnowledgeMode::On);
-        state.handle_key(KeyEvent::from(KeyCode::Esc));
-        assert_eq!(state.knowledge_mode(), KnowledgeMode::Off);
-
-        state.run_slash_command("/knowledge");
-        state.handle_key(KeyEvent::from(KeyCode::Right));
-        assert!(matches!(
-            state.handle_key(KeyEvent::from(KeyCode::Enter)),
-            Action::PersistKnowledgeMode {
-                previous: KnowledgeMode::Off,
-                mode: KnowledgeMode::On
-            }
-        ));
-    }
-
-    #[test]
     fn successful_turn_queues_knowledge_with_the_model_that_ran_it() {
         let mut state = test_state();
         state.knowledge_mode = KnowledgeMode::On;
@@ -20950,7 +20814,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_badge_carries_only_project_knowledge_and_vibe_modes() {
+    fn composer_badge_carries_only_the_vibe_mode() {
         let mut state = test_state();
         state.set_fast_mode(false);
         state.set_response_display_mode(ResponseDisplayMode::Completed);
@@ -20958,7 +20822,6 @@ mod tests {
         let badge = state.composer_mode();
 
         assert_eq!(badge.label, "Full Access");
-        assert_eq!(badge.knowledge_mode, "Knowledge: Off");
         assert_eq!(badge.vibe_mode, "Vibe: On");
 
         state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
@@ -21091,6 +20954,7 @@ mod tests {
         ] {
             assert!(names(&mut codex, command).contains(&command), "{command}");
         }
+        assert!(names(&mut codex, "/knowledge").is_empty());
 
         let mut claude = AppState::new(
             "thread".to_owned(),

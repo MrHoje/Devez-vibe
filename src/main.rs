@@ -265,7 +265,7 @@ async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
     state.push_notice(
         BlockKind::Update,
         "Tip",
-        "/: Command\n@: Mentions\n$: Skills\n/provider: Set Claude Codex provider\n/side-panel: Choose side panel size\n/vibemode: Set Vibe mode\n/knowledge: Set project knowledge mode\n/Response: Set Response compression type\nTab: Cycle agent role\nShift + ↑↓ model · ←→ effort\nAlt + P: Cycle side panel size",
+        "/: Command\n@: Mentions\n$: Skills\n/provider: Set Claude Codex provider\n/side-panel: Choose side panel size\n/vibemode: Set Vibe mode\n/Response: Set Response compression type\nTab: Cycle agent role\nShift + ↑↓ model · ←→ effort\nAlt + P: Cycle side panel size",
     );
     if fallback_to_claude {
         state.push_notice(
@@ -777,8 +777,7 @@ fn hold_until_thread(
         | Action::SetTheme(_)
         | Action::Copy(_)
         | Action::Cut(_)
-        | Action::OpenUrl(_)
-        | Action::PersistKnowledgeMode { .. }) => Some(action),
+        | Action::OpenUrl(_)) => Some(action),
         Action::ShowStatus => Some(Action::ShowStatus),
         Action::ScrollToBottom => Some(Action::ScrollToBottom),
         // Once a switch is owed, the prompt belongs to the session being resumed. The
@@ -1970,19 +1969,13 @@ async fn event_loop(
             }
             Some(update) = knowledge_rx.recv() => {
                 match update {
-                    project_memory::KnowledgeUpdate::Saved { project_root }
-                        if project_memory::same_project(&state.cwd, &project_root) =>
-                    {
-                        state.show_knowledge_notice("프로젝트 지식을 갱신했습니다.");
-                    }
                     project_memory::KnowledgeUpdate::Failed { project_root, message }
                         if project_memory::same_project(&state.cwd, &project_root) =>
                     {
                         state.push_notice(BlockKind::Warning, "지식 갱신 실패", message);
                     }
-                    project_memory::KnowledgeUpdate::Unchanged { project_root } => {
-                        let _ = project_root;
-                    }
+                    project_memory::KnowledgeUpdate::Saved
+                    | project_memory::KnowledgeUpdate::Unchanged => {}
                     _ => {}
                 }
                 Action::None
@@ -2350,16 +2343,6 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
                 diff,
             }
         }
-        Pick::KnowledgeMode => {
-            let previous = state.knowledge_mode();
-            let mode = if previous.enabled() {
-                project_memory::KnowledgeMode::Off
-            } else {
-                project_memory::KnowledgeMode::On
-            };
-            state.set_knowledge_mode(mode);
-            Action::PersistKnowledgeMode { previous, mode }
-        }
         Pick::FastMode => state.run_command("/fast"),
         Pick::ShellDisplayMode => {
             state.cycle_shell_display_mode();
@@ -2526,7 +2509,6 @@ async fn execute_action(
         | Action::Copy(_)
         | Action::Cut(_)
         | Action::OpenUrl(_)
-        | Action::PersistKnowledgeMode { .. }
         | Action::SetTheme(_)
         | Action::ScrollToBottom
         | Action::ScrollToPrompt(_)
@@ -4354,21 +4336,6 @@ fn execute_local_action(
             renderer.set_theme(selected)?;
             if let Err(error) = theme::save(selected) {
                 state.push_notice(BlockKind::Warning, "테마 저장 실패", error.to_string());
-            }
-        }
-        Action::PersistKnowledgeMode { previous, mode } => {
-            if let Err(error) = project_memory::write_mode(&state.cwd, mode) {
-                state.set_knowledge_mode(previous);
-                state.push_notice(
-                    BlockKind::Warning,
-                    "지식 관리 설정 저장 실패",
-                    error.to_string(),
-                );
-            } else {
-                state.show_knowledge_notice(format!(
-                    "지식 관리 {}",
-                    if mode.enabled() { "켜짐" } else { "꺼짐" }
-                ));
             }
         }
         Action::ScrollToBottom => {
@@ -6881,33 +6848,6 @@ mod tests {
             assert_eq!(state.vibe_mode(), expected);
         }
         assert!(state.view().overlay.is_none());
-    }
-
-    #[test]
-    fn clicking_the_knowledge_badge_toggles_and_persists_the_project_mode() {
-        let mut state = starting_state();
-        state.set_knowledge_mode(project_memory::KnowledgeMode::Off);
-
-        let action = pick_action(&mut state, Pick::KnowledgeMode);
-
-        assert!(matches!(
-            action,
-            Action::PersistKnowledgeMode {
-                previous: project_memory::KnowledgeMode::Off,
-                mode: project_memory::KnowledgeMode::On
-            }
-        ));
-        assert_eq!(state.knowledge_mode(), project_memory::KnowledgeMode::On);
-        assert!(state.view().overlay.is_none());
-
-        assert!(matches!(
-            pick_action(&mut state, Pick::KnowledgeMode),
-            Action::PersistKnowledgeMode {
-                previous: project_memory::KnowledgeMode::On,
-                mode: project_memory::KnowledgeMode::Off
-            }
-        ));
-        assert_eq!(state.knowledge_mode(), project_memory::KnowledgeMode::Off);
     }
 
     #[test]

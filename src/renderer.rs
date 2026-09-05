@@ -432,8 +432,6 @@ pub struct ComposerMode {
     pub agent: AgentMode,
     /// Current Git branch, shown as a display-only composer badge.
     pub branch: Option<String>,
-    pub knowledge_mode: String,
-    pub knowledge_enabled: bool,
     pub vibe_mode: String,
     pub vibe_tone: VibeTone,
     #[allow(dead_code)]
@@ -1908,11 +1906,24 @@ impl Renderer {
         }
         if self.column_is_in_panel(column) {
             let layout = self.side_panel?;
-            let content_row = usize::from(row).checked_sub(1)?;
             let content_column = usize::from(column).checked_sub(layout.content_left())?;
             if content_column >= layout.content_width() {
                 return None;
             }
+            let screen_row = usize::from(row);
+            let footer_start = self
+                .previous_lines
+                .len()
+                .saturating_sub(self.side_panel_footer.len().saturating_add(1));
+            if screen_row >= footer_start && screen_row + 1 < self.previous_lines.len() {
+                return self
+                    .side_panel_footer
+                    .get(screen_row - footer_start)?
+                    .pick
+                    .as_ref()?
+                    .at(content_column);
+            }
+            let content_row = screen_row.checked_sub(1)?;
             return self
                 .side_panel_content
                 .get(content_row)?
@@ -2815,7 +2826,13 @@ impl Renderer {
             .and_then(|panel_width| side_panel_layout(total_width, panel_width));
         let mut status_line = view.status_line;
         let side_panel_footer = side_panel
-            .map(|layout| move_context_to_side_panel(&mut status_line, layout.content_width()))
+            .map(|layout| {
+                move_context_to_side_panel(
+                    &mut status_line,
+                    view.composer_mode.as_ref(),
+                    layout.content_width(),
+                )
+            })
             .unwrap_or_default();
         if side_panel != self.side_panel {
             // Opening or closing moves every row's right edge, so the diff has
@@ -2906,6 +2923,7 @@ impl Renderer {
                 view.activity_phase,
                 view.activity_progress_phase,
                 status,
+                side_panel.is_none(),
                 frame_width,
             )
         };
@@ -3213,7 +3231,8 @@ impl Renderer {
             }
             let mut line = activity_rows.pop().expect("one activity row");
             let composer_notice = view.composer_notice;
-            if let Some(mode) = view.composer_mode.as_ref()
+            if (self.side_panel.is_none() || composer_notice.is_some())
+                && let Some(mode) = view.composer_mode.as_ref()
                 && let Some(with_controls) = activity_line_with_composer_controls(
                     line.clone(),
                     mode,
@@ -5224,6 +5243,7 @@ fn split_pane_frame_scrolled(
             view.activity_phase,
             view.activity_progress_phase,
             status,
+            true,
             content_width,
         )
     };
@@ -5560,8 +5580,6 @@ pub enum Pick {
     DismissArtifacts,
     /// The Vibe preset applies its response and transcript display settings.
     VibeMode,
-    /// Enables or disables automatic project knowledge management.
-    KnowledgeMode,
     /// Opens the same service-tier picker as `/fast`.
     FastMode,
     ShellDisplayMode,
@@ -6287,11 +6305,6 @@ fn activity_line_with_composer_controls(
             );
             picks.extend(
                 badge
-                    .knowledge_mode_index
-                    .map(|index| (badge_start + index, Pick::KnowledgeMode)),
-            );
-            picks.extend(
-                badge
                     .vibe_mode_index
                     .map(|index| (badge_start + index, Pick::VibeMode)),
             );
@@ -6628,6 +6641,7 @@ fn normal_frame(
         0.5,
         0.5,
         status,
+        true,
         width,
     )
 }
@@ -6662,6 +6676,7 @@ fn normal_frame_with_expansion(
     activity_phase: f32,
     activity_progress_phase: f32,
     status: StatusArea,
+    composer_controls_enabled: bool,
     width: u16,
 ) -> Frame {
     let mut lines = Vec::new();
@@ -6684,7 +6699,7 @@ fn normal_frame_with_expansion(
     // During a response, every transient notice uses the same right-hand slot.
     let activity_composer_notice = status.composer_notice.as_deref();
     let mut composer_notice = status.composer_notice.as_deref();
-    let mut composer_controls_mode = composer_mode;
+    let mut composer_controls_mode = composer_controls_enabled.then_some(composer_mode).flatten();
     let activity_uses_composer_spacer = activity.is_some() && suggestions.is_empty();
     // A suggestion panel still leaves the spacer above the composer, so the
     // controls keep that row instead of dropping onto the composer rule the
@@ -6705,7 +6720,9 @@ fn normal_frame_with_expansion(
             activity_progress_phase,
             width,
         );
-        if let Some(mode) = composer_controls_mode
+        let activity_mode = composer_controls_mode
+            .or_else(|| activity_composer_notice.and(composer_mode));
+        if let Some(mode) = activity_mode
             && let Some(row) = activity_line_with_composer_controls(
                 activity_rows[0].clone(),
                 mode,
@@ -8342,7 +8359,7 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
             Tone::StatusText,
         );
     }
-    // Knowledge and Vibe live on the composer rule. Fast belongs beside the
+    // Vibe lives on the composer rule. Fast belongs beside the
     // Codex model and effort here; the remaining fields are usage and notices.
     if let Some(notice) = status.notice.filter(|notice| !notice.is_empty()) {
         push_status_span(&mut spans, notice, Tone::Muted);
@@ -8443,40 +8460,90 @@ fn side_panel_section_heading(
 
 fn side_panel_status_lines(
     status: Option<&StatusLineView>,
+    mode: Option<&ComposerMode>,
     content_width: usize,
 ) -> Vec<PaintLine> {
-    let Some(status) = status else {
-        return Vec::new();
-    };
-    let Some(context) = status
-        .context
-        .as_deref()
-        .filter(|context| !context.is_empty())
-    else {
-        return Vec::new();
+    let mut lines = mode
+        .map(|mode| side_panel_mode_lines(mode, content_width))
+        .unwrap_or_default();
+    let Some((status, context)) = status.zip(
+        status
+            .and_then(|status| status.context.as_deref())
+            .filter(|context| !context.is_empty()),
+    ) else {
+        return lines;
     };
     let context_tone = status
         .model
         .as_deref()
         .and_then(model_tone)
         .unwrap_or(Tone::Border);
-    vec![
+    lines.extend([
         side_panel_divider(content_width),
         side_panel_context_line(context, content_width, context_tone),
-    ]
+    ]);
+    lines
 }
 
 fn move_context_to_side_panel(
     status: &mut Option<StatusLineView>,
+    mode: Option<&ComposerMode>,
     content_width: usize,
 ) -> Vec<PaintLine> {
-    let lines = side_panel_status_lines(status.as_ref(), content_width);
-    if !lines.is_empty()
-        && let Some(status) = status.as_mut()
-    {
+    let has_context = status
+        .as_ref()
+        .and_then(|status| status.context.as_deref())
+        .is_some_and(|context| !context.is_empty());
+    let lines = side_panel_status_lines(status.as_ref(), mode, content_width);
+    if has_context && let Some(status) = status.as_mut() {
         status.context = None;
     }
     lines
+}
+
+fn side_panel_mode_lines(mode: &ComposerMode, content_width: usize) -> Vec<PaintLine> {
+    let combined = full_badge_spans(mode, true);
+    if spans_width(&combined.spans) <= content_width {
+        return vec![badge_line(combined)];
+    }
+
+    let mut lines = mode
+        .branch
+        .as_deref()
+        .filter(|branch| !branch.is_empty())
+        .map(|branch| {
+            vec![PaintLine {
+                text: compact_right(&format!("* {branch}"), content_width),
+                tone: Tone::Branch,
+                ..PaintLine::plain("")
+            }]
+        })
+        .unwrap_or_default();
+    lines.push(badge_line(full_badge_spans(mode, false)));
+    lines
+}
+
+fn badge_line(badge: BadgeSpans) -> PaintLine {
+    let picks = [badge
+        .vibe_mode_index
+        .map(|index| (index, Pick::VibeMode))]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let mut spans = badge.spans.into_iter();
+    let first = spans.next().unwrap_or(PaintSpan {
+        text: String::new(),
+        tone: Tone::Muted,
+        bold: false,
+    });
+    PaintLine {
+        text: first.text,
+        tone: first.tone,
+        bold: first.bold,
+        tail: spans.collect(),
+        ..PaintLine::plain("")
+    }
+    .with_tight_picks(&picks)
 }
 
 fn side_panel_context_line(context: &str, content_width: usize, context_tone: Tone) -> PaintLine {
@@ -12433,7 +12500,6 @@ const COMPOSER_NOTICE_GAP: usize = 2;
 /// Rule segment trailing a transient notice at the right edge.
 const COMPOSER_NOTICE_TAIL_RULE: usize = 2;
 /// Separator between composer controls.
-const COMPOSER_BADGE_SEPARATOR: &str = " · ";
 
 /// Rule the composer's top line opens with when it carries a label.
 const OPENING_RULE: &str = "── ";
@@ -12513,11 +12579,6 @@ fn input_top_line_with_controls(
             badge
                 .diff_display_mode_index
                 .map(|index| (badge_start + index, Pick::DiffDisplayMode)),
-        );
-        picks.extend(
-            badge
-                .knowledge_mode_index
-                .map(|index| (badge_start + index, Pick::KnowledgeMode)),
         );
         picks.extend(
             badge
@@ -12657,64 +12718,39 @@ fn composer_chrome_tone(mode: Option<&ComposerMode>) -> Tone {
         .unwrap_or(Tone::Border)
 }
 
-/// Widest Vibe/knowledge badge pair that fits without clipping a label.
+/// Widest Vibe badge that fits without clipping its label.
 fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans> {
-    let mut display_spans = Vec::new();
-    if let Some(branch) = mode.branch.as_deref().filter(|branch| !branch.is_empty()) {
-        display_spans.push(PaintSpan {
+    let combined = full_badge_spans(mode, true);
+    let vibe_only = full_badge_spans(mode, false);
+    [combined, vibe_only]
+        .into_iter()
+        .find(|candidate| spans_width(&candidate.spans) <= budget)
+}
+
+fn full_badge_spans(mode: &ComposerMode, include_branch: bool) -> BadgeSpans {
+    let mut spans = Vec::new();
+    if include_branch
+        && let Some(branch) = mode.branch.as_deref().filter(|branch| !branch.is_empty())
+    {
+        spans.push(PaintSpan {
             text: format!("* {branch}"),
             tone: Tone::Branch,
             bold: false,
         });
-        display_spans.push(display_separator_span());
+        spans.push(display_separator_span());
     }
-    let display_width = display_spans.len();
-    let vibe_mode_span = PaintSpan {
+    let vibe_mode_index = spans.len();
+    spans.push(PaintSpan {
         text: mode.vibe_mode.clone(),
         tone: vibe_tone(mode.vibe_tone),
         bold: false,
-    };
-    let knowledge_mode_span = PaintSpan {
-        text: mode.knowledge_mode.clone(),
-        tone: if mode.knowledge_enabled {
-            Tone::ResponseCompleted
-        } else {
-            Tone::FastOff
-        },
-        bold: false,
-    };
-    let combined = BadgeSpans {
-        spans: [
-            display_spans.clone(),
-            vec![
-                vibe_mode_span.clone(),
-                separator_span(),
-                knowledge_mode_span.clone(),
-            ],
-        ]
-        .concat(),
-        knowledge_mode_index: Some(display_width + 2),
-        vibe_mode_index: Some(display_width),
+    });
+    BadgeSpans {
+        spans,
+        vibe_mode_index: Some(vibe_mode_index),
         shell_display_mode_index: None,
         diff_display_mode_index: None,
-    };
-    let vibe_only = BadgeSpans {
-        spans: [display_spans.clone(), vec![vibe_mode_span]].concat(),
-        knowledge_mode_index: None,
-        vibe_mode_index: Some(display_width),
-        shell_display_mode_index: None,
-        diff_display_mode_index: None,
-    };
-    let knowledge_only = BadgeSpans {
-        spans: [display_spans, vec![knowledge_mode_span]].concat(),
-        knowledge_mode_index: Some(display_width),
-        vibe_mode_index: None,
-        shell_display_mode_index: None,
-        diff_display_mode_index: None,
-    };
-    [combined, vibe_only, knowledge_only]
-    .into_iter()
-    .find(|candidate| spans_width(&candidate.spans) <= budget)
+    }
 }
 
 /// The badge as painted, plus where its two clickable parts sit inside it. The
@@ -12722,18 +12758,9 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
 /// that picked the candidate knows which rung it settled on.
 struct BadgeSpans {
     spans: Vec<PaintSpan>,
-    knowledge_mode_index: Option<usize>,
     vibe_mode_index: Option<usize>,
     shell_display_mode_index: Option<usize>,
     diff_display_mode_index: Option<usize>,
-}
-
-fn separator_span() -> PaintSpan {
-    PaintSpan {
-        text: COMPOSER_BADGE_SEPARATOR.to_owned(),
-        tone: Tone::Muted,
-        bold: false,
-    }
 }
 
 fn display_separator_span() -> PaintSpan {
@@ -14798,7 +14825,7 @@ mod tests {
                 .expect("badge fits beside a short activity label");
             let text = painted(&line);
             assert!(
-                text.contains("Vibe: Super Vibe · Knowledge: Off"),
+                text.contains("* main | Vibe: Super Vibe"),
                 "badge tail must survive layout, got {text:?}"
             );
             assert!(
@@ -14826,7 +14853,7 @@ mod tests {
             let line = input_top_line(120, "", Some(&mode));
             let text = painted(&line);
             assert!(
-                text.contains("Vibe: Super Vibe · Knowledge: Off"),
+                text.contains("* main | Vibe: Super Vibe"),
                 "composer badge tail must survive layout, got {text:?}"
             );
             assert!(
@@ -17680,7 +17707,8 @@ mod tests {
         assert!(!painted(&frame.lines[activity]).contains("View: Chat"));
         assert!(!painted(&frame.lines[activity]).contains("Response:"));
         assert!(!painted(&frame.lines[activity]).contains("Fast:"));
-        assert!(painted(&frame.lines[activity]).contains("Knowledge: Off"));
+        assert!(painted(&frame.lines[activity]).contains("Vibe: On"));
+        assert!(!painted(&frame.lines[activity]).contains("Knowledge:"));
         assert!(!painted(&frame.lines[activity + 1]).contains("View: Chat"));
         assert_eq!(painted_width(&frame.lines[activity]), 158);
         assert_eq!(frame.lines[activity + 1].tone, Tone::ModelTerra);
@@ -17901,8 +17929,6 @@ mod tests {
         ComposerMode {
             agent: AgentMode::Standard,
             branch: None,
-            knowledge_mode: "Knowledge: Off".to_owned(),
-            knowledge_enabled: false,
             vibe_mode: "Vibe: On".to_owned(),
             vibe_tone: VibeTone::On,
             label: label.to_owned(),
@@ -18213,6 +18239,7 @@ mod tests {
                 composer_notice: None,
                 composer_mode: None,
             },
+            true,
             80,
         );
         let composer_index = frame.composer_index.expect("composer index");
@@ -18294,6 +18321,7 @@ mod tests {
                 composer_notice: None,
                 composer_mode: None,
             },
+            true,
             80,
         );
         let composer_index = frame.composer_index.expect("composer index");
@@ -18324,14 +18352,11 @@ mod tests {
             [
                 "  ",
                 "Vibe: On",
-                " · ",
-                "Knowledge: Off",
                 " ",
                 "──"
             ]
         );
         assert_eq!(line.tail[1].tone, Tone::FastOn);
-        assert_eq!(line.tail[3].tone, Tone::FastOff);
         assert!(!painted(&line).contains("Response:"));
         assert!(!painted(&line).contains("Fast:"));
     }
@@ -18360,13 +18385,14 @@ mod tests {
     }
 
     #[test]
-    fn claude_super_vibe_keeps_only_knowledge_and_vibe_controls() {
+    fn claude_super_vibe_keeps_only_the_vibe_control() {
         let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, false);
         mode.model = "claude:sonnet".to_owned();
 
         let line = input_top_line(120, "", Some(&mode));
 
-        assert!(painted(&line).contains("Vibe: Super Vibe · Knowledge: Off"));
+        assert!(painted(&line).contains("Vibe: Super Vibe"));
+        assert!(!painted(&line).contains("Knowledge:"));
         assert!(!painted(&line).contains("mode"));
         assert_eq!(pick_on(&line, "Response: Completed"), None);
         assert!(!painted(&line).contains("Fast:"));
@@ -18394,8 +18420,56 @@ mod tests {
         assert!(!painted(&frame.lines[composer - 1]).contains("View: Chat"));
         assert!(!painted(&frame.lines[composer - 1]).contains("Response:"));
         assert!(!painted(&frame.lines[composer - 1]).contains("Fast:"));
-        assert!(painted(&frame.lines[composer - 1]).contains("Knowledge: Off"));
+        assert!(painted(&frame.lines[composer - 1]).contains("Vibe: On"));
+        assert!(!painted(&frame.lines[composer - 1]).contains("Knowledge:"));
         assert!(!painted(&frame.lines[composer]).contains("View: Chat"));
+    }
+
+    #[test]
+    fn composer_rule_keeps_only_its_rule_when_side_panel_owns_modes() {
+        let mode = super_vibe_mode("Full Access", ModeAccent::Danger, false);
+
+        let line = input_top_line_with_controls(120, "", Some(&mode), None);
+
+        assert!(!painted(&line).contains("Vibe:"));
+        assert!(!painted(&line).contains("Knowledge:"));
+        assert_eq!(painted(&line), "─".repeat(120));
+    }
+
+    #[test]
+    fn side_panel_keeps_working_above_the_composer_without_mode_badges() {
+        let editor = Editor::default();
+        let frame = normal_frame_with_expansion(
+            Vec::new(),
+            &editor,
+            &[],
+            "",
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            "",
+            None,
+            &[],
+            Some("Working"),
+            None,
+            0.5,
+            0.5,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: Some(super_vibe_mode("Full Access", ModeAccent::Danger, false)),
+            },
+            false,
+            120,
+        );
+
+        assert!(frame.lines.iter().any(|line| painted(line).contains("Working")));
+        assert!(frame.lines.iter().all(|line| {
+            !painted(line).contains("Vibe:") && !painted(line).contains("Knowledge:")
+        }));
     }
 
     /// What the row answers with at the first column of `label`.
@@ -18422,7 +18496,6 @@ mod tests {
         let mode = super_vibe_mode("Full Access", ModeAccent::Danger, true);
         let line = input_top_line(120, "", Some(&mode));
         assert_eq!(pick_on(&line, "View: Chat"), None);
-        assert_eq!(pick_on(&line, "Knowledge: Off"), Some(Pick::KnowledgeMode));
         assert_eq!(pick_on(&line, "Vibe: Super Vibe"), Some(Pick::VibeMode));
         assert_eq!(pick_on(&line, "Response: Completed"), None);
         assert_eq!(pick_on(&line, "Fast: On"), None);
@@ -18451,23 +18524,22 @@ mod tests {
         let line = input_top_line(120, "3/12", Some(&mode));
 
         assert_eq!(pick_on(&line, "Vibe: Super Vibe"), Some(Pick::VibeMode));
-        assert_eq!(pick_on(&line, "Knowledge: Off"), Some(Pick::KnowledgeMode));
+        assert!(!painted(&line).contains("Knowledge:"));
         assert_eq!(pick_on(&line, "Response: Completed"), None);
         assert_eq!(pick_on(&line, "Fast: On"), None);
         assert_eq!(pick_on(&line, "[$0.95]"), None);
         assert_eq!(pick_on(&line, "3/12"), None);
     }
 
-    /// The compact rule keeps the two remaining controls clickable.
+    /// The compact rule keeps the remaining control clickable.
     #[test]
-    fn compact_rule_keeps_knowledge_and_vibe_clickable() {
+    fn compact_rule_keeps_vibe_clickable() {
         let mode = super_vibe_mode("Full Access", ModeAccent::Danger, true);
         let line = input_top_line(56, "", Some(&mode));
 
-        assert!(painted(&line).contains("Knowledge: Off"));
+        assert!(!painted(&line).contains("Knowledge:"));
         assert!(!painted(&line).contains("Response:"));
         assert!(!painted(&line).contains("Fast:"));
-        assert_eq!(pick_on(&line, "Knowledge: Off"), Some(Pick::KnowledgeMode));
         assert_eq!(pick_on(&line, "Vibe: Super Vibe"), Some(Pick::VibeMode));
     }
 
@@ -18487,8 +18559,6 @@ mod tests {
             [
                 "  ",
                 "Vibe: Super Vibe",
-                " · ",
-                "Knowledge: Off",
                 " ",
                 "──"
             ]
@@ -18516,7 +18586,7 @@ mod tests {
         let line = input_top_line(120, "", Some(&mode));
 
         assert!(painted(&line).contains(
-            "* main | Vibe: Super Vibe · Knowledge: Off"
+            "* main | Vibe: Super Vibe"
         ));
         assert!(!painted(&line).contains("$0.95"));
     }
@@ -18533,22 +18603,8 @@ mod tests {
     }
 
     #[test]
-    fn knowledge_badge_opens_its_project_mode_picker() {
-        let line = input_top_line(
-            120,
-            "",
-            Some(&test_mode("Full Access", ModeAccent::Danger, false)),
-        );
-
-        assert_eq!(
-            pick_on(&line, "Knowledge: Off"),
-            Some(Pick::KnowledgeMode)
-        );
-    }
-
-    #[test]
-    fn knowledge_and_vibe_badges_use_their_role_tones() {
-        let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, true);
+    fn vibe_badge_uses_its_role_tone() {
+        let mode = super_vibe_mode("Full Access", ModeAccent::Danger, true);
         let tones = |mode: &ComposerMode| {
             fitting_badge_spans(mode, 120)
                 .unwrap()
@@ -18559,17 +18615,12 @@ mod tests {
         };
 
         let on = tones(&mode);
-        assert!(on.contains(&("Knowledge: Off".to_owned(), Tone::FastOff)));
         assert!(on.contains(&("Vibe: Super Vibe".to_owned(), Tone::VibeSuper)));
+        assert!(!on.iter().any(|(text, _)| text.starts_with("Knowledge:")));
         assert!(!on.iter().any(|(text, _)| text == "View: Chat"));
         assert!(!on.iter().any(|(text, _)| text.starts_with("Response:")));
         assert!(!on.iter().any(|(text, _)| text.starts_with("Fast:")));
 
-        mode.knowledge_enabled = true;
-        mode.knowledge_mode = "Knowledge: Auto".to_owned();
-        mode.vibe_tone = VibeTone::On;
-        let ordinary = tones(&mode);
-        assert!(ordinary.contains(&("Knowledge: Auto".to_owned(), Tone::ResponseCompleted)));
     }
 
     #[test]
@@ -18632,20 +18683,20 @@ mod tests {
     }
 
     #[test]
-    fn hidden_cost_leaves_room_for_knowledge_and_vibe_controls() {
+    fn hidden_cost_leaves_room_for_the_vibe_control() {
         let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, true);
         mode.cost = Some("$0.95".to_owned());
         let line = input_top_line(66, "", Some(&mode));
         assert_eq!(rule_width(&line), 66);
         assert!(!painted(&line).contains("$0.95"));
         assert!(painted(&line).contains("Vibe: Super Vibe"));
-        assert!(painted(&line).contains("Knowledge: Off"));
+        assert!(!painted(&line).contains("Knowledge:"));
         assert!(!painted(&line).contains("Response:"));
         assert!(!painted(&line).contains("Fast:"));
     }
 
     #[test]
-    fn tight_composer_rule_keeps_knowledge_and_vibe() {
+    fn tight_composer_rule_keeps_vibe() {
         let mode = super_vibe_mode("Full Access", ModeAccent::Danger, true);
         let line = input_top_line(56, "", Some(&mode));
         let texts = line
@@ -18660,8 +18711,6 @@ mod tests {
             [
                 "  ",
                 "Vibe: Super Vibe",
-                " · ",
-                "Knowledge: Off",
                 " ",
                 "──"
             ]
@@ -19439,8 +19488,6 @@ mod tests {
             composer_mode: Some(ComposerMode {
                 agent: AgentMode::Standard,
                 branch: Some("main".to_owned()),
-                knowledge_mode: "Knowledge: Off".to_owned(),
-                knowledge_enabled: false,
                 vibe_mode: "Super Vibe".to_owned(),
                 vibe_tone: VibeTone::Super,
                 label: String::new(),
@@ -19468,6 +19515,7 @@ mod tests {
             0.5,
             0.5,
             status,
+            true,
             width,
         );
         if !committed.is_empty() && renderer.response_collapse.is_none() {
@@ -22105,7 +22153,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_the_side_panel_hides_only_composer_context() {
+    fn opening_the_side_panel_moves_modes_above_context() {
         let mut status = Some(StatusLineView {
             agent: AgentMode::Standard,
             model: Some("GPT-5.6 Codex".to_owned()),
@@ -22117,8 +22165,10 @@ mod tests {
             weekly_percent: Some(27),
             notice: None,
         });
+        let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, false);
+        mode.branch = Some("feature/panel".to_owned());
 
-        let footer = move_context_to_side_panel(&mut status, 44);
+        let footer = move_context_to_side_panel(&mut status, Some(&mode), 44);
         let line = status_line_row(status, "", 120);
 
         assert!(painted(&line).contains("GPT-5.6 Codex"));
@@ -22127,12 +22177,53 @@ mod tests {
         assert!(painted(&line).contains("3h 6m: 14%"));
         assert!(painted(&line).contains("week: 27%"));
         assert!(painted(&line).ends_with("Shift + ↑↓ model · ←→ effort"));
-        assert_eq!(footer.len(), 2);
-        assert_eq!(painted(&footer[0]), "─".repeat(44));
-        assert_eq!(footer[0].tone, Tone::SidePanelDivider);
-        assert!(painted(&footer[1]).starts_with("Context: "));
-        assert!(painted(&footer[1]).ends_with("164/258K (63%)"));
-        assert_eq!(footer[1].tail[0].tone, Tone::Model56);
+        assert_eq!(footer.len(), 3);
+        assert_eq!(painted(&footer[0]), "* feature/panel | Vibe: Super Vibe");
+        assert_eq!(pick_on(&footer[0], "Vibe: Super Vibe"), Some(Pick::VibeMode));
+        assert!(!painted(&footer[0]).contains("Knowledge:"));
+        assert_eq!(painted(&footer[1]), "─".repeat(44));
+        assert_eq!(footer[1].tone, Tone::SidePanelDivider);
+        assert!(painted(&footer[2]).starts_with("Context: "));
+        assert!(painted(&footer[2]).ends_with("164/258K (63%)"));
+        assert_eq!(footer[2].tail[0].tone, Tone::Model56);
+    }
+
+    #[test]
+    fn a_wide_side_panel_keeps_branch_and_modes_on_one_line() {
+        let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, false);
+        mode.branch = Some("feature/panel".to_owned());
+
+        let lines = side_panel_mode_lines(&mode, 56);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            painted(&lines[0]),
+            "* feature/panel | Vibe: Super Vibe"
+        );
+        assert_eq!(pick_on(&lines[0], "Vibe: Super Vibe"), Some(Pick::VibeMode));
+        assert!(!painted(&lines[0]).contains("Knowledge:"));
+    }
+
+    #[test]
+    fn side_panel_footer_modes_keep_their_click_targets() {
+        let layout =
+            side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
+        let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, false);
+        mode.branch = Some("feature/panel".to_owned());
+        let footer = side_panel_mode_lines(&mode, layout.content_width());
+        let vibe_column = painted(&footer[0]).find("Vibe: Super Vibe").unwrap();
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.side_panel = Some(layout);
+        renderer.side_panel_footer = footer;
+        renderer.previous_lines = vec![PaintLine::blank(); 4];
+
+        assert_eq!(
+            renderer.pick_at(
+                (layout.content_left() + vibe_column) as u16,
+                2,
+            ),
+            Some(Pick::VibeMode)
+        );
     }
 
     #[test]
@@ -24267,24 +24358,6 @@ mod tests {
             None
         );
         assert_eq!(Renderer::hover_columns(&line, None, None), None);
-    }
-
-    #[test]
-    fn knowledge_badge_hover_starts_on_its_own_label() {
-        theme::set_current(ThemeKind::Dark);
-        let line = activity_line_with_composer_controls(
-            PaintLine::blank(),
-            &super_vibe_mode("Full Access", ModeAccent::Danger, false),
-            None,
-            120,
-        )
-        .expect("activity row has controls");
-        let hovered = Renderer::hover_columns(&line, None, Some(&Pick::KnowledgeMode))
-            .expect("knowledge badge is clickable");
-        let text = painted(&line);
-        let knowledge_start = UnicodeWidthStr::width(&text[..text.find("Knowledge: Off").unwrap()]);
-
-        assert_eq!(hovered.start, knowledge_start);
     }
 
     /// A long activity label crowds the controls off the active row. They belong
