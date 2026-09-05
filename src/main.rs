@@ -916,7 +916,6 @@ async fn choose_startup_session(
                 plan_summary: None,
                 response_collapse: None,
                 fold_progress_groups: false,
-                response_display_mode: state::ResponseDisplayMode::Completed,
                 plan_active: false,
                 plan_shimmer_phase: None,
                 plan_agent: agent::AgentMode::Standard,

@@ -19,7 +19,6 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "Super Vibe에서 Response가 All일 때도 프롬프트를 눌러 응답 묶음을 접고 펼 수 있습니다.",
     "Planner와 Reviewer 역할의 쓰기 금지를 제공자 차원에서 막도록 강제했습니다.",
     "Goal Runner가 서브에이전트 전달 내용과 검토 diff를 실행 작업 폴더의 파일로 주고받습니다.",
     "서브에이전트 프롬프트를 갱신할 때 예전 판을 더 넓게 알아보고 교체합니다.",

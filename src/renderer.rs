@@ -35,7 +35,7 @@ use crate::{
     },
     state::{
         CHECKED_BOX, COMPLETION_TAB_MARKER, DiffDisplayMode, QUESTION_TAB_CURSOR,
-        QUESTION_TAB_SEPARATOR, ResponseDisplayMode, ShellDisplayMode,
+        QUESTION_TAB_SEPARATOR, ShellDisplayMode,
     },
     syntax::{self, SyntaxKind},
     terminal_width::{
@@ -535,9 +535,6 @@ pub struct View<'a> {
     /// Progress records are disclosure rows only in Super Vibe. Other presets
     /// render their child responses exactly as ordinary transcript blocks.
     pub fold_progress_groups: bool,
-    /// Whether a prompt's progress group starts open: `All` shows it, `Completed`
-    /// hides it. A click stores the departure from that default.
-    pub response_display_mode: ResponseDisplayMode,
     /// Whether the current turn is still active, so an in-progress plan row may animate.
     pub plan_active: bool,
     /// A one-shot frame shimmer started by a plan creation or update.
@@ -781,7 +778,6 @@ pub struct Renderer {
     expanded_tools: HashSet<u64>,
     response_collapse: Option<(u64, f32)>,
     fold_progress_groups: bool,
-    response_display_mode: ResponseDisplayMode,
     /// Wrapped transcript rows owned by folded progress records. Double-click
     /// word selection is intentionally disabled only inside these rows.
     progress_group_rows: Vec<Range<usize>>,
@@ -1482,7 +1478,6 @@ impl Renderer {
             expanded_tools: HashSet::new(),
             response_collapse: None,
             fold_progress_groups: false,
-            response_display_mode: ResponseDisplayMode::Completed,
             progress_group_rows: Vec::new(),
             hovered_tool: None,
             painted_hovered_tool: None,
@@ -1862,11 +1857,7 @@ impl Renderer {
             .then(|| self.prompt_for_progress_group(id))
             .flatten();
         let hosted_history_toggle = hosted_prompt.is_some();
-        let expanding = if hosted_history_toggle {
-            !self.is_prompt_group_expanded(id)
-        } else {
-            !self.expanded_tools.contains(&id)
-        };
+        let expanding = !self.expanded_tools.contains(&id);
         let latest_prompt = self
             .history
             .iter()
@@ -2645,42 +2636,18 @@ impl Renderer {
         None
     }
 
-    /// A stored id means "opposite of the default", so it cannot outlive a
-    /// default that just flipped.
-    fn apply_response_display_mode(&mut self, mode: ResponseDisplayMode) -> bool {
-        if self.response_display_mode == mode {
-            return false;
-        }
-        self.response_display_mode = mode;
-        self.expanded_tools.clear();
-        true
-    }
-
-    /// `expanded_tools` records the click, not the state: a prompt group starts
-    /// open in `All` and closed in `Completed`, so a stored id flips whichever
-    /// default the current display mode sets.
-    fn is_prompt_group_expanded(&self, group_id: u64) -> bool {
-        let toggled = self.expanded_tools.contains(&group_id);
-        match self.response_display_mode {
-            ResponseDisplayMode::All => !toggled,
-            ResponseDisplayMode::Completed => {
-                toggled
-                    || self
-                        .response_reveal_for(group_id)
-                        .is_some_and(|value| value > f32::EPSILON)
-            }
-        }
-    }
-
     fn history_block_lines(&self, block: &Block, width: u16) -> Vec<PaintLine> {
         if matches!(block.kind, BlockKind::User)
             && self.fold_progress_groups
             && let Some(group) = self.progress_group_for_prompt(block.id())
         {
+            let reveal = self.response_reveal_for(group.id());
+            let expanded = self.expanded_tools.contains(&group.id())
+                || reveal.is_some_and(|value| value > f32::EPSILON);
             return user_prompt_lines_with_history(
                 block,
                 width,
-                Some((group.id(), &group.title, self.is_prompt_group_expanded(group.id()))),
+                Some((group.id(), &group.title, expanded)),
                 self.chat_layout,
             );
         }
@@ -2707,7 +2674,7 @@ impl Renderer {
             return embedded_progress_group_lines(
                 block,
                 width,
-                self.is_prompt_group_expanded(block.id()),
+                self.expanded_tools.contains(&block.id()),
                 self.response_reveal_for(block.id()),
             );
         }
@@ -2805,12 +2772,10 @@ impl Renderer {
                 .collect::<Vec<_>>()
         });
         let committed = committed_without_startup.as_deref().unwrap_or(committed);
-        let display_mode_changed = self.apply_response_display_mode(view.response_display_mode);
         let mode_changed = self.shell_display_mode != view.shell_display_mode
             || self.diff_display_mode != view.diff_display_mode
             || self.chat_layout != view.chat_layout
-            || self.fold_progress_groups != view.fold_progress_groups
-            || display_mode_changed;
+            || self.fold_progress_groups != view.fold_progress_groups;
         if mode_changed {
             self.shell_display_mode = view.shell_display_mode;
             self.diff_display_mode = view.diff_display_mode;
@@ -5185,9 +5150,7 @@ fn split_pane_frame_scrolled(
         expanded_tools,
         view.shell_display_mode,
         view.diff_display_mode,
-        // The split pane has no prompt disclosure to host a group, so it keeps
-        // showing every response whenever the display mode is `All`.
-        view.fold_progress_groups && view.response_display_mode == ResponseDisplayMode::Completed,
+        view.fold_progress_groups,
     );
     // A streamed Assistant owns transcript rows in both fullscreen layouts.
     // Keeping it in the split pane's dock would revive the old live-to-history
@@ -13473,7 +13436,6 @@ mod tests {
             plan_summary: None,
             response_collapse: None,
             fold_progress_groups: false,
-            response_display_mode: ResponseDisplayMode::Completed,
             cwd: String::new(),
             plan_active: false,
             plan_shimmer_phase: None,
@@ -25345,101 +25307,6 @@ mod tests {
                 .body,
             "추가 요청 확인"
         );
-    }
-
-    #[test]
-    fn all_response_mode_opens_the_prompt_group_by_default() {
-        let prompt = Block::new(BlockKind::User, "gpt-5.6-sol", "다시 불러온 요청");
-        let progress = Block::progress_group(vec![Block::new(
-            BlockKind::Assistant,
-            "Codex",
-            "중간 진행 기록",
-        )]);
-        let progress_id = progress.id();
-        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
-        renderer.chat_layout = true;
-        renderer.fold_progress_groups = true;
-        renderer.response_display_mode = ResponseDisplayMode::All;
-        renderer.history.extend([prompt, progress]);
-        renderer.rewrap(80);
-
-        let text = renderer
-            .wrapped
-            .iter()
-            .map(painted)
-            .collect::<Vec<_>>()
-            .join("
-");
-        assert!(text.contains("Hide"));
-        assert!(text.contains("중간 진행 기록"));
-        assert!(renderer.wrapped.iter().any(|line| {
-            line.pick.as_ref().is_some_and(|regions| {
-                regions
-                    .0
-                    .iter()
-                    .any(|(_, _, pick)| *pick == Pick::History(progress_id))
-            })
-        }));
-    }
-
-    #[test]
-    fn all_response_mode_prompt_click_collapses_then_reopens_the_group() {
-        let prompt = Block::new(BlockKind::User, "gpt-5.6-sol", "눌러서 접는 요청");
-        let progress = Block::progress_group(vec![Block::new(
-            BlockKind::Assistant,
-            "Codex",
-            "보이는 중간 기록",
-        )]);
-        let progress_id = progress.id();
-        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
-        renderer.chat_layout = true;
-        renderer.fold_progress_groups = true;
-        renderer.response_display_mode = ResponseDisplayMode::All;
-        renderer.history.extend([prompt, progress]);
-        renderer.last_width = 80;
-        renderer.rewrap(80);
-        renderer.previous_lines = renderer.wrapped.clone();
-
-        assert!(renderer.toggle_tool(progress_id));
-        let collapsed = renderer
-            .wrapped
-            .iter()
-            .map(painted)
-            .collect::<Vec<_>>()
-            .join("
-");
-        assert!(collapsed.contains("+1 Response"));
-        assert!(!collapsed.contains("보이는 중간 기록"));
-
-        assert!(renderer.toggle_tool(progress_id));
-        let reopened = renderer
-            .wrapped
-            .iter()
-            .map(painted)
-            .collect::<Vec<_>>()
-            .join("
-");
-        assert!(reopened.contains("Hide"));
-        assert!(reopened.contains("보이는 중간 기록"));
-    }
-
-    /// Switching the display mode flips what a stored id means, so the toggles
-    /// have to go before the next frame reads them.
-    #[test]
-    fn changing_the_response_display_mode_drops_stored_prompt_toggles() {
-        let progress = Block::progress_group(vec![Block::new(
-            BlockKind::Assistant,
-            "Codex",
-            "진행 기록",
-        )]);
-        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
-        renderer.fold_progress_groups = true;
-        renderer.response_display_mode = ResponseDisplayMode::Completed;
-        renderer.expanded_tools.insert(progress.id());
-        renderer.history.push(progress);
-
-        renderer.apply_response_display_mode(ResponseDisplayMode::All);
-        assert!(renderer.expanded_tools.is_empty());
     }
 
     #[test]

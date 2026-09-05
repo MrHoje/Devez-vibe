@@ -5993,7 +5993,9 @@ impl AppState {
     }
 
     fn collapse_progress_before_next_answer(&mut self) {
-        if self.vibe_mode != VibeMode::SuperVibe {
+        if self.vibe_mode != VibeMode::SuperVibe
+            || self.response_display_mode != ResponseDisplayMode::Completed
+        {
             return;
         }
         let progress = self
@@ -6482,8 +6484,8 @@ impl AppState {
             overlay: self.overlay_view(),
             plan_summary: self.visible_plan_summary(),
             response_collapse: self.response_collapse_view(),
-            fold_progress_groups: self.vibe_mode == VibeMode::SuperVibe,
-            response_display_mode: self.response_display_mode,
+            fold_progress_groups: self.vibe_mode == VibeMode::SuperVibe
+                && self.response_display_mode == ResponseDisplayMode::Completed,
             plan_active: self.plan_is_active(),
             plan_shimmer_phase: self.plan_shimmer_phase(),
             plan_agent: self.active_turn_agent,
@@ -12673,7 +12675,9 @@ impl AppState {
 
     fn set_response_display_mode(&mut self, mode: ResponseDisplayMode) {
         self.response_display_mode = mode;
-        self.response_collapse = None;
+        if mode == ResponseDisplayMode::All {
+            self.response_collapse = None;
+        }
     }
 
     pub fn cycle_vibe_mode(&mut self) -> (ShellDisplayMode, DiffDisplayMode) {
@@ -17183,7 +17187,7 @@ mod tests {
     }
 
     #[test]
-    fn both_response_modes_keep_super_vibe_prompt_folding() {
+    fn all_response_mode_disables_super_vibe_progress_folding() {
         let mut state = test_state();
         while state.vibe_mode() != VibeMode::SuperVibe {
             state.cycle_vibe_mode();
@@ -17191,14 +17195,9 @@ mod tests {
 
         state.set_response_display_mode(ResponseDisplayMode::Completed);
         assert!(state.view().fold_progress_groups);
-        assert_eq!(
-            state.view().response_display_mode,
-            ResponseDisplayMode::Completed
-        );
 
         state.set_response_display_mode(ResponseDisplayMode::All);
-        assert!(state.view().fold_progress_groups);
-        assert_eq!(state.view().response_display_mode, ResponseDisplayMode::All);
+        assert!(!state.view().fold_progress_groups);
         assert!(state.response_collapse_view().is_none());
     }
 
@@ -21986,10 +21985,8 @@ mod tests {
         assert!(state.active.contains_key("delta-only-answer"));
     }
 
-    /// `All` folds the same group `Completed` does; only the group's default
-    /// openness differs, and that lives in the renderer.
     #[test]
-    fn all_response_mode_groups_progress_when_final_streaming_starts() {
+    fn all_response_mode_keeps_progress_visible_when_final_streaming_starts() {
         let mut state = test_state();
         while state.vibe_mode() != VibeMode::SuperVibe {
             state.cycle_vibe_mode();
@@ -22021,14 +22018,8 @@ mod tests {
             }),
         );
 
-        let committed = state.drain_committed();
-        let group = committed
-            .iter()
-            .find(|block| matches!(block.kind, BlockKind::ProgressGroup))
-            .expect("progress group");
-        assert_eq!(group.children()[0].body, "진행 메시지");
-        assert!(state.response_grouped);
-        assert!(state.response_collapse_view().is_none());
+        assert!(state.drain_committed().is_empty());
+        assert!(!state.response_grouped);
     }
 
     #[test]
