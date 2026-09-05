@@ -1,7 +1,10 @@
 use std::{
     env, fs,
+    fs::File,
+    io::{self, IsTerminal, Write},
     path::PathBuf,
-    process::Command,
+    process::{Command, Stdio},
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,7 +22,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "Astra 모델 표시를 최초의 테마별 청록색으로 되돌렸습니다.",
+    "업데이트를 새 창 없이 진행하고 다운로드 검증·복구·진행 표시를 추가했습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
@@ -43,89 +46,163 @@ pub async fn check_for_update() -> Option<String> {
     is_newer(&latest, CURRENT_VERSION).then_some(latest)
 }
 
-/// Hands the upgrade to a detached console. Windows keeps a lock on the running
-/// executable, so npm can only replace it once this process has exited.
+/// Downloads and validates the release before asking npm to replace the global
+/// package. npm stages package changes itself, so the active console can stay open.
 pub fn run_self_update() -> Result<()> {
-    let script_path = env::temp_dir().join(format!(
-        "devez-vibe-update-{}-{}.cmd",
+    let stage_path = env::temp_dir().join(format!(
+        "devez-vibe-update-stage-{}-{}",
         std::process::id(),
         now_secs()
     ));
-    fs::write(&script_path, update_script()).context("업데이트 스크립트를 만들지 못했습니다.")?;
+    fs::create_dir_all(&stage_path).context("업데이트 임시 폴더를 만들지 못했습니다.")?;
 
-    println!("Devez Vibe v{CURRENT_VERSION} · 최신 버전 설치를 시작합니다.");
-    println!("새 창이 열린 뒤 실행 중인 모든 Devez Vibe 세션이 종료되기를 기다립니다.");
-    println!("모든 세션이 닫히면 `npm install -g {PACKAGE}@latest`가 자동으로 실행됩니다.");
-    println!("설치가 끝나면 `dvz`를 다시 실행하세요.");
+    let result = install_update(&stage_path);
+    let _ = fs::remove_dir_all(&stage_path);
+    result
+}
 
-    let result = Command::new("cmd")
-        .args([
-            "/C",
-            "start",
-            "Devez Vibe update",
-            "cmd",
-            "/C",
-            &script_path.to_string_lossy(),
-        ])
-        .spawn();
-    if let Err(error) = result {
-        let _ = fs::remove_file(&script_path);
-        return Err(error)
-            .context("업데이트 프로세스를 시작하지 못했습니다. npm이 설치되어 있는지 확인하세요.");
+fn install_update(stage_path: &PathBuf) -> Result<()> {
+    let stage = stage_path.to_string_lossy();
+    let latest_package = format!("{PACKAGE}@latest");
+    let staged = run_npm_with_progress(
+        stage_path,
+        "download",
+        "새 버전 다운로드와 무결성 검사",
+        &[
+            "install",
+            "--prefix",
+            &stage,
+            "--ignore-scripts",
+            "--no-audit",
+            "--no-fund",
+            "--prefer-online",
+            &latest_package,
+        ],
+    )?;
+    if !staged {
+        anyhow::bail!("새 버전을 내려받지 못해 기존 설치를 유지합니다.");
     }
+
+    let staged_exe = stage_path
+        .join("node_modules")
+        .join(PACKAGE)
+        .join("bin")
+        .join("dvz.exe");
+    let version = Command::new(&staged_exe)
+        .arg("--version")
+        .output()
+        .context("내려받은 실행 파일을 실행하지 못해 기존 설치를 유지합니다.")?;
+    if !version.status.success() {
+        anyhow::bail!("내려받은 실행 파일을 검증하지 못해 기존 설치를 유지합니다.");
+    }
+    let latest = executable_version(&version.stdout)
+        .filter(|candidate| parse_version(candidate).is_some())
+        .context("내려받은 실행 파일의 버전을 확인하지 못해 기존 설치를 유지합니다.")?;
+    println!("Devez Vibe v{CURRENT_VERSION} → v{latest}");
+
+    println!("완료: 실행 파일 검증");
+    let package = format!("{PACKAGE}@{latest}");
+    let installed = run_npm_with_progress(
+        stage_path,
+        "install",
+        "기존 설치 교체",
+        &[
+            "install",
+            "-g",
+            &package,
+            "--prefer-online",
+            "--no-audit",
+            "--no-fund",
+        ],
+    )?;
+    if !installed {
+        let current = format!("{PACKAGE}@{CURRENT_VERSION}");
+        let restored = run_npm_with_progress(
+            stage_path,
+            "restore",
+            "현재 버전 복구",
+            &[
+                "install",
+                "-g",
+                &current,
+                "--prefer-online",
+                "--no-audit",
+                "--no-fund",
+            ],
+        )?;
+        if restored {
+            anyhow::bail!("업데이트에 실패해 v{CURRENT_VERSION}으로 복구했습니다.");
+        }
+        anyhow::bail!("업데이트와 자동 복구에 실패했습니다. 위 npm 오류를 확인하세요.");
+    }
+
+    println!("Devez Vibe v{latest} 설치를 마쳤습니다. `dvz`를 다시 실행하세요.");
     Ok(())
 }
 
-fn update_script() -> String {
-    format!(
-        "@echo off\r\n\
-chcp 65001 >nul\r\n\
-setlocal\r\n\
-title Devez Vibe update\r\n\
-where npm.cmd >nul 2>nul\r\n\
-if errorlevel 1 (\r\n\
-  echo npm을 찾지 못했습니다. Node.js와 npm 설치를 확인하세요.\r\n\
-  echo.\r\n\
-  pause\r\n\
-  del \"%~f0\"\r\n\
-  exit /b 1\r\n\
-)\r\n\
-echo 실행 중인 모든 Devez Vibe 세션이 종료되기를 기다리는 중입니다.\r\n\
-echo 열린 세션을 모두 닫으면 업데이트가 자동으로 시작됩니다.\r\n\
-:wait_for_dvz\r\n\
-tasklist /FI \"IMAGENAME eq dvz.exe\" /NH 2>nul | find /I \"dvz.exe\" >nul\r\n\
-if not errorlevel 1 (\r\n\
-  timeout /t 1 /nobreak >nul\r\n\
-  goto wait_for_dvz\r\n\
-)\r\n\
-echo.\r\n\
-echo Devez Vibe 최신 버전을 설치합니다.\r\n\
-set \"install_try=0\"\r\n\
-:install\r\n\
-set /a install_try+=1\r\n\
-call npm.cmd install -g {PACKAGE}@latest --prefer-online\r\n\
-if not errorlevel 1 goto update_done\r\n\
-if %install_try% GEQ 12 goto update_failed\r\n\
-echo npm 레지스트리 전파를 기다린 뒤 다시 시도합니다. ^(%install_try%/12^)\r\n\
-timeout /t 5 /nobreak >nul\r\n\
-goto install\r\n\
-:update_done\r\n\
-set \"update_exit=0\"\r\n\
-goto update_finished\r\n\
-:update_failed\r\n\
-set \"update_exit=1\"\r\n\
-:update_finished\r\n\
-echo.\r\n\
-if not \"%update_exit%\"==\"0\" (\r\n\
-  echo 업데이트에 실패했습니다. 위 오류를 확인하세요.\r\n\
-) else (\r\n\
-  echo 업데이트가 완료되었습니다. dvz를 다시 실행하세요.\r\n\
-)\r\n\
-echo.\r\n\
-pause\r\n\
-del \"%~f0\"\r\n\
-exit /b %update_exit%\r\n"
-    )
+fn executable_version(output: &[u8]) -> Option<&str> {
+    std::str::from_utf8(output).ok()?.split_whitespace().last()
+}
+
+fn npm_command() -> Command {
+    let mut command = Command::new("npm.cmd");
+    if env::var_os("FORCE_COLOR").is_some() {
+        command.env_remove("NO_COLOR");
+    }
+    command
+}
+
+fn run_npm_with_progress(
+    stage_path: &PathBuf,
+    log_name: &str,
+    label: &str,
+    args: &[&str],
+) -> Result<bool> {
+    let log_path = stage_path.join(format!("npm-{log_name}.log"));
+    let log = File::create(&log_path).context("업데이트 로그를 만들지 못했습니다.")?;
+    let mut command = npm_command();
+    command
+        .args(args)
+        .stdout(Stdio::from(
+            log.try_clone().context("업데이트 로그를 열지 못했습니다.")?,
+        ))
+        .stderr(Stdio::from(log));
+    let mut child = command
+        .spawn()
+        .context("npm을 실행하지 못했습니다. Node.js와 npm 설치를 확인하세요.")?;
+
+    let interactive = io::stdout().is_terminal();
+    let frames = ['|', '/', '-', '\\'];
+    let mut frame = 0;
+    loop {
+        if let Some(status) = child.try_wait().context("npm 실행 상태를 확인하지 못했습니다.")? {
+            if interactive {
+                print!("\r");
+            }
+            if status.success() {
+                println!("완료: {label}");
+                let _ = fs::remove_file(&log_path);
+                return Ok(true);
+            }
+            println!("실패: {label}");
+            if let Ok(details) = fs::read_to_string(&log_path)
+                && !details.trim().is_empty()
+            {
+                eprintln!("오류 상세:\n{}", details.trim());
+            }
+            return Ok(false);
+        }
+
+        if interactive {
+            print!("\r진행 중: {label} {}", frames[frame % frames.len()]);
+            io::stdout().flush().context("진행 상태를 표시하지 못했습니다.")?;
+            frame += 1;
+        } else if frame == 0 {
+            println!("진행 중: {label}");
+            frame = 1;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 async fn fetch_latest() -> Option<String> {
@@ -231,18 +308,8 @@ mod tests {
     }
 
     #[test]
-    fn updater_waits_for_every_dvz_process_before_running_npm() {
-        let script = update_script();
-        let wait = script.find("IMAGENAME eq dvz.exe").expect("dvz wait loop");
-        let install = script
-            .find("npm.cmd install -g devez-vibe@latest --prefer-online")
-            .expect("npm install");
-
-        assert!(wait < install);
-        assert!(script.contains("goto wait_for_dvz"));
-        assert!(script.contains("2>nul | find /I \"dvz.exe\""));
-        assert!(script.contains("if %install_try% GEQ 12 goto update_failed"));
-        assert!(script.contains("goto install"));
-        assert!(script.contains("del \"%~f0\""));
+    fn extracts_version_from_staged_executable() {
+        assert_eq!(executable_version(b"dvz 1.7.73\r\n"), Some("1.7.73"));
+        assert_eq!(executable_version(b""), None);
     }
 }

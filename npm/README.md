@@ -61,8 +61,8 @@ dvz [--resume [SESSION] | --continue] [--model MODEL] [--effort EFFORT]
 dvz update
 ```
 
-`npm install -g devez-vibe@latest`와 동일합니다. 별도 창이 열린 뒤 모든 `dvz` 세션이
-종료되기를 기다렸다가 설치하며, npm 레지스트리 전파가 늦으면 자동으로 재시도합니다.
+새 버전을 임시 위치에 내려받아 실행 파일을 검증한 뒤 같은 터미널에서 전역 설치합니다.
+설치가 실패하면 현재 버전 복구를 시도하며, 다른 `dvz` 세션은 종료하지 않아도 됩니다.
 
 업데이트 확인을 끄려면 `DEVEZ_VIBE_NO_UPDATE_CHECK` 환경변수를 설정합니다.
 
