@@ -29,13 +29,12 @@ use crate::{
     pricing::{self, CostLedger, TokenTotals},
     provider::{ProviderAuthRequest, ProviderPicker, ProviderPickerResult},
     renderer::{
-        AnimationView, AssistantPhase, Block, BlockKind, ComposerMode, EffortSlider,
+        AnimationView, ArtifactView, AssistantPhase, Block, BlockKind, ComposerMode, EffortSlider,
         HIDDEN_STATUS_LINE, IntegrationItemState, IntegrationItemView, LiveBlockView, ModeAccent,
-        OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS,
-        PlanStep, PlanStepStatus, PlanSummary, ProviderHandoffBlock, ProviderIntegrationView,
-        SIDE_PANEL_WIDTHS, StatusLineView, SteeredPromptView, SubagentView, SuggestionView,
-        VibeTone, View,
-        WelcomeView, format_clock_time, format_elapsed, visible_window,
+        OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS, PlanStep, PlanStepStatus, PlanSummary,
+        ProviderHandoffBlock, ProviderIntegrationView, SIDE_PANEL_WIDTHS, StatusLineView,
+        SteeredPromptView, SubagentView, SuggestionView, VibeTone, View, WelcomeView,
+        format_clock_time, format_elapsed, visible_window,
     },
     rollout::{PlanSnapshot, Rollout, RolloutEvent, RolloutKind},
     theme::{self, ThemeKind},
@@ -3419,6 +3418,14 @@ struct RunningSubagent {
     painted_elapsed_secs: u64,
 }
 
+/// A page this session published as a claude.ai Artifact, kept for the row
+/// under the status line until the user puts it away or the session changes.
+#[derive(Clone, Debug)]
+struct ArtifactLink {
+    name: String,
+    url: String,
+}
+
 /// Codex app-server reports collaboration and child-thread lifecycle separately.
 /// Keep the child metadata after its row disappears so a delayed activity event
 /// cannot revive work that a turn-completed or thread-closed event already ended.
@@ -3650,6 +3657,7 @@ pub struct AppState {
     plan_restored: bool,
     plan_shimmer_started_at: Option<Instant>,
     subagents: Vec<RunningSubagent>,
+    artifacts: Vec<ArtifactLink>,
     /// Child threads observed through Codex collaboration events. Unlike the
     /// visible rows, terminal entries stay here until the session changes.
     codex_subagents: HashMap<String, CodexSubagent>,
@@ -3910,6 +3918,7 @@ impl AppState {
             plan_restored: false,
             plan_shimmer_started_at: None,
             subagents: Vec::new(),
+            artifacts: Vec::new(),
             codex_subagents: HashMap::new(),
             subagents_settled_at: None,
             subagent_logs: HashMap::new(),
@@ -6370,6 +6379,7 @@ impl AppState {
         self.turn_response_blocks.clear();
         self.response_grouped = false;
         self.subagents.clear();
+        self.artifacts.clear();
         self.codex_subagents.clear();
         self.subagents_settled_at = None;
         self.subagent_logs.clear();
@@ -6509,6 +6519,14 @@ impl AppState {
                     description: running.description.clone(),
                     tool: running.tool.clone(),
                     elapsed: running.started_at.elapsed(),
+                })
+                .collect(),
+            artifacts: self
+                .artifacts
+                .iter()
+                .map(|artifact| ArtifactView {
+                    name: artifact.name.clone(),
+                    url: artifact.url.clone(),
                 })
                 .collect(),
             composer_highlights: self.composer_highlight_tokens(),
@@ -8655,6 +8673,31 @@ impl AppState {
                 // 걸지 않고, 빈 목록이면 지울 것도 없다.
                 self.subagents_settled_at =
                     (!self.busy && !self.subagents.is_empty()).then(Instant::now);
+            }
+            "turn/artifact/published" => {
+                if let Some(url) = params.get("url").and_then(Value::as_str) {
+                    let path = params
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let title = params
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let name = path
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .filter(|name| !name.trim().is_empty())
+                        .or(Some(title).filter(|title| !title.trim().is_empty()))
+                        .unwrap_or(url);
+                    // Republishing keeps the URL, so the row moves to the front
+                    // instead of listing the same page twice.
+                    self.artifacts.retain(|artifact| artifact.url != url);
+                    self.artifacts.push(ArtifactLink {
+                        name: name.to_owned(),
+                        url: url.to_owned(),
+                    });
+                }
             }
             "turn/subagent/line" => {
                 if let Some(parent) = params.get("parentToolUseId").and_then(Value::as_str)
@@ -13242,6 +13285,11 @@ impl AppState {
     /// the server is waiting on stays put whatever is clicked.
     /// Opens the transcript panel for the subagent shown on the clicked row. The
     /// panel starts at the newest lines, which is where the work is.
+    /// Puts the artifact row away; the next publish brings it back.
+    pub fn dismiss_artifacts(&mut self) {
+        self.artifacts.clear();
+    }
+
     pub fn open_subagent(&mut self, index: usize) -> Action {
         let Some(id) = self.subagents.get(index).map(|running| running.id.clone()) else {
             return Action::None;
@@ -18490,6 +18538,50 @@ mod tests {
             shell.children()[1].title,
             "Shell · git status --short · exit 1 · 4.1s"
         );
+    }
+
+    #[test]
+    fn published_artifacts_are_listed_by_file_name_without_duplicates_and_can_be_dismissed() {
+        let mut state = test_state();
+        let publish = |state: &mut AppState, url: &str, title: &str, path: &str| {
+            state.handle_notification(
+                "turn/artifact/published",
+                &serde_json::json!({ "url": url, "title": title, "path": path }),
+            );
+        };
+        publish(
+            &mut state,
+            "https://claude.ai/code/artifact/a",
+            "Devez test",
+            "C:/tmp/devez-test.html",
+        );
+        publish(
+            &mut state,
+            "https://claude.ai/code/artifact/b",
+            "Untitled",
+            "",
+        );
+        // Republishing the same page keeps one row and moves it to the front.
+        publish(
+            &mut state,
+            "https://claude.ai/code/artifact/a",
+            "",
+            "C:/tmp/devez-test.html",
+        );
+
+        let names = state
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Untitled", "devez-test.html"]);
+        assert_eq!(
+            state.artifacts.last().map(|artifact| artifact.url.as_str()),
+            Some("https://claude.ai/code/artifact/a")
+        );
+
+        state.dismiss_artifacts();
+        assert!(state.artifacts.is_empty());
     }
 
     #[test]

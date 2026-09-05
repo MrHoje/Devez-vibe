@@ -122,6 +122,9 @@ function sanitizedEnvironment() {
   delete env.ANTHROPIC_API_KEY;
   delete env.ANTHROPIC_AUTH_TOKEN;
   env.CLAUDE_AGENT_SDK_CLIENT_APP = `dvz/${VERSION}`;
+  // Claude Code leaves the Artifact tool off for SDK hosts unless asked; the
+  // account flag and admin policy still decide whether it actually appears.
+  env.CLAUDE_CODE_ARTIFACT ??= "1";
   return env;
 }
 
@@ -2486,6 +2489,14 @@ function processUser(session, message) {
       finishSubagentTask(session, firstLine(pending.input?.task_id || "", 80));
     }
     if (!pending) continue;
+    if (pending.name === "Artifact" && typeof message.tool_use_result?.url === "string") {
+      notify("turn/artifact/published", {
+        threadId: session.id,
+        url: message.tool_use_result.url,
+        title: String(message.tool_use_result.title || ""),
+        path: String(message.tool_use_result.path || pending.input?.file_path || ""),
+      });
+    }
     pending.toolUseId = block.tool_use_id;
     if (pending.suppressed) {
       updatePlanFromToolResult(session, pending, message);

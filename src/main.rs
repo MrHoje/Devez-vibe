@@ -924,6 +924,7 @@ async fn choose_startup_session(
                 queued_prompts: Vec::new(),
                 steered_prompts: Vec::new(),
                 subagents: Vec::new(),
+                artifacts: Vec::new(),
                 composer_highlights: Vec::new(),
                 composer_placeholder: "",
                 composer_preedit: "",
@@ -2344,6 +2345,10 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
             Action::Tick(true)
         }
         Pick::OpenLink(target) => Action::OpenUrl(target),
+        Pick::DismissArtifacts => {
+            state.dismiss_artifacts();
+            Action::Tick(true)
+        }
         Pick::AgentMode => state.click_agent_mode(),
         Pick::Model => state.run_command("/model"),
         Pick::EffortSetting => state.run_command("/effort"),

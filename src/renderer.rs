@@ -497,6 +497,16 @@ pub struct SubagentView {
     pub elapsed: Duration,
 }
 
+/// One page this session published as a claude.ai Artifact, listed under the
+/// status line the way Claude Code's own footer does, so the link stays one
+/// click away after the answer that produced it has scrolled off.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactView {
+    /// The published file's name, or the artifact title when the path is unknown.
+    pub name: String,
+    pub url: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IntegrationItemState {
     Active,
@@ -554,6 +564,8 @@ pub struct View<'a> {
     /// Running subagents shown in the side panel when it is open, or under the
     /// status line as the narrow-layout fallback.
     pub subagents: Vec<SubagentView>,
+    /// Artifacts published this session, newest last, drawn under the status line.
+    pub artifacts: Vec<ArtifactView>,
     pub composer_placeholder: &'a str,
     /// 컴포저에서 테마 강조색으로 그릴 `/`, `@`, `$` 토큰. 실제 커맨드나
     /// 후보와 일치하는 것만 담기므로, 비어 있으면 강조 없이 그린다.
@@ -2889,6 +2901,7 @@ impl Renderer {
                 &view.queued_prompts,
                 &view.steered_prompts,
                 main_subagents,
+                &view.artifacts,
                 view.composer_placeholder,
                 view.welcome,
                 &view.suggestions,
@@ -5206,6 +5219,7 @@ fn split_pane_frame_scrolled(
             &view.queued_prompts,
             &view.steered_prompts,
             if active { &view.subagents } else { &[] },
+            if active { &view.artifacts } else { &[] },
             view.composer_placeholder,
             view.welcome,
             if active { &view.suggestions } else { &[] },
@@ -5546,6 +5560,8 @@ pub enum Pick {
     RemoveQueuedPrompt(usize),
     /// A Markdown link in the transcript opens through the platform handler.
     OpenLink(String),
+    /// Hides the artifact row under the status line until the next publish.
+    DismissArtifacts,
     /// The Vibe preset applies its response and transcript display settings.
     VibeMode,
     /// Chooses whether completed progress responses stay visible or fold away.
@@ -6105,6 +6121,64 @@ fn format_subagent_elapsed(seconds: u64) -> String {
 /// tool bullet, so a fan-out reads as quieter activity under the status line.
 const SUBAGENT_GLYPH: &str = "•";
 
+/// The newest published artifact as one row under the status line: its name is
+/// the link, older ones are counted, and `x` puts the row away. Claude Code's
+/// footer shows the same three things, so the row reads the same in both.
+fn artifact_line(artifacts: &[ArtifactView], width: u16) -> Option<PaintLine> {
+    let latest = artifacts.last()?;
+    let more = match artifacts.len() {
+        0 | 1 => String::new(),
+        count => format!(" · +{} more", count - 1),
+    };
+    let hint = " · click to open · x";
+    let reserved = 1
+        + UnicodeWidthStr::width(ARTIFACT_GLYPH)
+        + 2
+        + UnicodeWidthStr::width(more.as_str())
+        + UnicodeWidthStr::width(hint);
+    let name = compact_right(
+        &latest.name,
+        usize::from(width).saturating_sub(reserved + 1),
+    );
+    let tail = vec![
+        PaintSpan {
+            text: format!("  {name}"),
+            tone: Tone::MarkdownLink,
+            bold: false,
+        },
+        PaintSpan {
+            text: format!("{more} · click to open · "),
+            tone: Tone::Muted,
+            bold: false,
+        },
+        PaintSpan {
+            text: "x".to_owned(),
+            tone: Tone::Muted,
+            bold: false,
+        },
+    ];
+    Some(
+        PaintLine {
+            prefix: " ".to_owned(),
+            prefix_tone: Tone::Muted,
+            text: ARTIFACT_GLYPH.to_owned(),
+            tone: Tone::Accent,
+            bold: false,
+            tool_heading: None,
+            pick: None,
+            tail,
+        }
+        .with_tight_picks(&[
+            (0, Pick::OpenLink(latest.url.clone())),
+            (1, Pick::OpenLink(latest.url.clone())),
+            (3, Pick::DismissArtifacts),
+        ]),
+    )
+}
+
+/// The artifact row's marker: a framed page, distinct from the subagent bullet.
+const ARTIFACT_GLYPH: &str = "⧉";
+
 fn queue_preview_lines(prompts: &[String], width: u16) -> Vec<PaintLine> {
     prompts
         .iter()
@@ -6547,6 +6621,7 @@ fn normal_frame(
         &[],
         &[],
         &[],
+        &[],
         "",
         welcome,
         suggestions,
@@ -6580,6 +6655,7 @@ fn normal_frame_with_expansion(
     queued_prompts: &[String],
     steered_prompts: &[SteeredPromptView],
     subagents: &[SubagentView],
+    artifacts: &[ArtifactView],
     composer_placeholder: &str,
     welcome: Option<WelcomeView>,
     suggestions: &[SuggestionView],
@@ -6717,10 +6793,11 @@ fn normal_frame_with_expansion(
         lines.push(status_line_row(status.line, &status.fallback, width));
     }
     // Separate the running-subagent rows from the status line with one blank row.
-    if status_line_painted && !subagents.is_empty() {
+    if status_line_painted && (!subagents.is_empty() || !artifacts.is_empty()) {
         lines.push(PaintLine::blank());
     }
     lines.extend(subagent_lines(subagents, width));
+    lines.extend(artifact_line(artifacts, width));
 
     Frame {
         lines,
@@ -13475,6 +13552,7 @@ mod tests {
             queued_prompts: Vec::new(),
             steered_prompts: Vec::new(),
             subagents: Vec::new(),
+            artifacts: Vec::new(),
             composer_highlights: Vec::new(),
             composer_placeholder: "",
             welcome: None,
@@ -18202,6 +18280,7 @@ mod tests {
             &[],
             &[],
             &[test_subagent("Explore", "Find auth code", "", 4)],
+            &[],
             "",
             None,
             &[],
@@ -18226,6 +18305,72 @@ mod tests {
 
         assert!(subagent_index > composer_index);
         assert_eq!(subagent_index, frame.lines.len() - 1);
+    }
+
+    #[test]
+    fn the_newest_artifact_sits_under_the_status_line_as_a_link_with_a_dismiss() {
+        let artifacts = vec![
+            ArtifactView {
+                name: "old.html".to_owned(),
+                url: "https://claude.ai/code/artifact/old".to_owned(),
+            },
+            ArtifactView {
+                name: "devez-test.html".to_owned(),
+                url: "https://claude.ai/code/artifact/new".to_owned(),
+            },
+        ];
+        assert!(artifact_line(&[], 80).is_none());
+
+        let line = artifact_line(&artifacts, 80).expect("artifact row");
+        let text = painted(&line);
+        assert!(text.contains("devez-test.html"), "{text}");
+        assert!(text.contains("+1 more"), "{text}");
+        assert!(text.ends_with("click to open · x"), "{text}");
+        assert!(!text.contains("old.html"), "{text}");
+        let regions = &line.pick.as_ref().expect("clickable").0;
+        assert!(regions.iter().any(|(_, _, pick)| {
+            *pick == Pick::OpenLink("https://claude.ai/code/artifact/new".to_owned())
+        }));
+        assert!(
+            regions
+                .iter()
+                .any(|(_, _, pick)| *pick == Pick::DismissArtifacts)
+        );
+
+        let editor = Editor::default();
+        let frame = normal_frame_with_expansion(
+            Vec::new(),
+            &editor,
+            &[],
+            "",
+            &[],
+            &[],
+            &[],
+            &[],
+            &artifacts,
+            "",
+            None,
+            &[],
+            None,
+            None,
+            0.5,
+            0.5,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+        let composer_index = frame.composer_index.expect("composer index");
+        let artifact_index = frame
+            .lines
+            .iter()
+            .position(|line| painted(line).contains("devez-test.html"))
+            .expect("artifact row");
+        assert!(artifact_index > composer_index);
+        assert_eq!(artifact_index, frame.lines.len() - 1);
     }
 
     #[test]
@@ -19368,6 +19513,7 @@ mod tests {
             &editor,
             &[],
             "",
+            &[],
             &[],
             &[],
             &[],

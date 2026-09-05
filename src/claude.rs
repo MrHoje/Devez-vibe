@@ -789,6 +789,8 @@ mod tests {
         assert!(bridge.contains("recordSubagentMessage(session, message)"));
         assert!(bridge.contains("recordSubagentResult(session, message)"));
         assert!(bridge.contains("notify(\"turn/subagent/line\""));
+        // The artifact row under the status line listens for this method name.
+        assert!(bridge.contains("notify(\"turn/artifact/published\""));
         assert!(bridge.contains("findSubagent(session, message.parent_tool_use_id)"));
         assert!(bridge.contains("keepBackgroundSubagent(session, block.tool_use_id"));
         assert!(bridge.contains("result?.status === \"async_launched\""));

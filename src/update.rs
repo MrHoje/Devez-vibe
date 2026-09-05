@@ -19,7 +19,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "$team-onboarding 스킬이 Claude Code 명령으로 인식되지 않던 문제를 고쳤습니다. 응답 모드 문맥보다 명령을 앞에 두어 순정 Claude Code와 같이 안내서 생성이 시작됩니다.",
+    "Claude가 HTML 페이지를 claude.ai Artifact로 게시하면 상태줄 아래에 파일 이름 행이 나타납니다. 클릭하면 브라우저로 열리고 x로 숨길 수 있습니다.",
+    "Claude 세션에서 Artifact 도구를 켭니다. 계정에 기능이 열려 있지 않으면 도구가 나타나지 않으며 다른 동작에는 영향이 없습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
