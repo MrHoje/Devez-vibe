@@ -160,8 +160,10 @@ after its report. It asks before guessing, and it stops and escalates when the
 task needs an architectural decision or it is reading file after file without
 progress.
 
-The report contract: a status of DONE, DONE_WITH_CONCERNS, BLOCKED, or
-NEEDS_CONTEXT; files changed; the tests run with their command and output;
+The report contract: a status of 완료 (DONE), 완료했으나 우려 있음
+(DONE_WITH_CONCERNS), 진행 불가 (BLOCKED), or 추가 정보 필요 (NEEDS_CONTEXT);
+accept the Korean status with the same meaning and do not require an English
+code in a user-facing report. Include files changed; tests run with command and output;
 concerns. Treat the report as claims: check the diff yourself before acting on
 it. DONE_WITH_CONCERNS — read the concerns; a correctness or scope concern is
 addressed before review. NEEDS_CONTEXT — supply it and redispatch. BLOCKED —
@@ -366,21 +368,22 @@ complete, and the report says which item failed and why.
 
 If part of the scope is unverified, say so explicitly instead of softening it.
 
-## Final report
+## 최종 보고
 
-- Outcome — complete, or incomplete with the failed gate item.
-- Intensity used, and the plan document path if one was followed.
-- What changed — files and the substance of each change.
-- Verification — each command run after the last change, with its result.
-- Review — rounds per task, findings fixed, whether review was independent or
-  self-review, which tasks were delegated and which implemented inline.
-- Rulings — every 판정 from 실행 기록, in order, each with what it costs if
-  wrong. The list is exhaustive; a ruling that stays in the record only was a
-  decision made in secret.
-- Problems found and fixed along the way, including pre-existing failures.
-- Deferred minors and parked findings, with their rulings.
-- Remaining risks and deliberately deferred items.
-- Any human blocker, with the exact next action.
-- Integration — the work sits uncommitted in the tree unless you were told
-  otherwise; state what the user can do next (commit, branch, pull request)
-  without doing it.
+쉬운 한국어 불릿으로 쓰고 글자 수·불릿 수·줄 수를 제한하지 않는다.
+항목명과 상태를 영어로 병기하지 않으며 다른 에이전트의 보고도 한국어로 풀어 쓴다.
+사용자 영향과 필요한 조치를 먼저 설명하고, 기술 식별자와 근거 위치는 필요한
+만큼만 붙인다. 중복은 합치되 아래 판단 근거를 생략하지 않는다.
+
+- 첫 불릿에 완료 여부와 핵심 이유를 쓴다. 미완료라면 충족하지 못한 완료 조건을 밝힌다.
+- 적용한 검증 수준과, 계획을 따랐다면 해당 문서의 위치를 쓴다.
+- 변경한 내용과 사용자에게 생기는 효과, 근거 파일을 쓴다.
+- 마지막 변경 후 실행한 확인 명령과 결과를 쓴다.
+- 작업별 검토 회차, 해결한 문제, 독립 검토인지 자체 검토인지, 위임한 작업과
+  직접 구현한 작업을 밝힌다.
+- 실행 기록에 남긴 모든 결정을 순서대로 설명하고, 틀렸을 때의 영향을 밝힌다.
+- 작업 중 발견하고 해결한 문제와 기존 실패, 경미하여 미룬 문제와 보류한 문제,
+  각각의 판단 이유를 쓴다.
+- 남은 위험과 미룬 범위, 사용자 조치가 필요한 장애물과 정확한 다음 행동을 쓴다.
+- 별도 지시가 없었다면 변경은 커밋되지 않은 상태임을 밝히고, 사용자가 다음에
+  할 수 있는 통합 작업을 안내한다. 안내만으로 그 작업을 실행하지 않는다.

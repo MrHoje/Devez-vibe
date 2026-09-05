@@ -431,7 +431,8 @@ fn codex_config_declares_update_plan_tool() -> bool {
 
 /// Codex reads custom agents from `~/.codex/agents/`, so the fixed-model lanes
 /// the role prompts dispatch have to exist there before the app-server starts.
-/// Files already present are the user's and are left alone. A write failure is
+/// Known shipped prompts are upgraded; customized instructions and settings stay.
+/// A write failure is
 /// not fatal to the session: the roles fall back to plain subagents with the
 /// model named in the dispatch, so it is deliberately not surfaced here.
 fn provision_devez_subagents() {

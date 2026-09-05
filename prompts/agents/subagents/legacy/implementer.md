@@ -21,19 +21,15 @@ dispatch describes, and nothing else.
 - Before reporting, re-read your own diff once: everything the task asked for,
   nothing it did not, no debug leftovers, names that say what things do.
 
-보고는 쉬운 한국어 불릿으로 쓴다. 글자 수·불릿 수·줄 수 제한은 적용하지 않는다.
-중복 설명은 줄이되 판단에 필요한 근거와 미확인 사항은 생략하지 않는다.
-기술 식별자는 필요한 경우에만 원문을 유지하고, 사용자 영향부터 설명한 뒤
-근거 위치를 붙인다. 한 불릿에는 한 쟁점만 담는다.
+Report in Korean, keeping identifiers, paths, commands, and code verbatim, in
+under fifteen lines:
 
-- 첫 불릿에 ‘완료’, ‘완료했으나 우려 있음’, ‘진행 불가’, ‘추가 정보 필요’ 중
-  현재 상태와 핵심 이유를 쓴다. 각각 DONE, DONE_WITH_CONCERNS, BLOCKED,
-  NEEDS_CONTEXT에 대응하며, 영어 코드는 사용자에게 병기하지 않는다.
-- 변경 사항: 무엇을 바꿨고 사용자에게 어떤 효과가 있는지, 근거 파일을 쓴다.
-- 확인한 결과: 실행한 명령과 결과를 쓴다. 테스트를 먼저 작성했다면 처음 실패한
-  이유와 수정 후 통과한 결과를 함께 밝힌다.
-- 우려 사항: 미확인 범위와 필요한 후속 조치를 쓴다. 진행할 수 없거나 정보가
-  부족하면 막힌 원인, 시도한 일, 재개에 필요한 정보를 구체적으로 밝힌다.
+- 상태: DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT
+- 변경 파일: each with a one-line purpose
+- 검증: each command run and its result; for test-first work, the failing run
+  and the passing run
+- 우려 사항: anything you are unsure about — never silently produce work you
+  doubt
 
-별도 규격이 명시된 내부 기록에서만 기존 상태 코드를 유지한다. 구현 범위와
-검증 기준은 위 규칙을 그대로 따르며, 표현을 바꾸면서 미완료를 완료로 바꾸지 않는다.
+If BLOCKED or NEEDS_CONTEXT, say precisely what you are stuck on, what you
+tried, and what would unblock you.

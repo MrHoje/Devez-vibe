@@ -11950,7 +11950,7 @@ impl AppState {
                     title: if question.header.is_empty() {
                         format!("Question {}/{}", current + 1, questions.len())
                     } else {
-                        question.header.clone()
+                        question_display_header(&question.header).to_owned()
                     },
                     lines,
                     slider: None,
@@ -14066,6 +14066,10 @@ fn advance_question(
 const PLANNER_HANDOFF_HEADER: &str = "Planner Handoff";
 const PLANNER_HANDOFF_EXECUTE_LABEL: &str = "Goal Runner로 실행";
 
+fn question_display_header(header: &str) -> &str {
+    if header == PLANNER_HANDOFF_HEADER { "계획 실행 확인" } else { header }
+}
+
 /// The plan document approved for automatic execution, if these answers are
 /// the Planner handoff's execute choice. Anything else — refine, stop,
 /// another role, another question — yields nothing and keeps manual control.
@@ -14166,7 +14170,7 @@ fn question_tabs(
             let header = if question.header.is_empty() {
                 format!("Q{}", index + 1)
             } else {
-                question.header.clone()
+                question_display_header(&question.header).to_owned()
             };
             let mark = if answers.contains_key(&question.id) {
                 CHECKED_BOX
@@ -23305,7 +23309,7 @@ mod tests {
             "여기서 중단",
             "Goal Runner로 이어서 진행할까요?",
             // `extract_plan_path` prefers a backticked path on this promise.
-            "wrapped in backticks and named first",
+            "wrapped in backticks",
         ] {
             assert!(
                 prompt.contains(literal),
@@ -23316,6 +23320,33 @@ mod tests {
 
     /// Approving the Planner handoff switches the next turn to Goal Runner
     /// and queues the follow-up carrying the plan path.
+    #[test]
+    fn planner_handoff_displays_korean_and_approves_a_goal_first_question() {
+        let mut state = idle_test_state();
+        state.set_agent_mode(AgentMode::Planner);
+        let questions = handoff_questions(
+            "로그인 응답 속도를 개선하는 계획입니다.\n\
+             계획 문서: `docs/plans/2026-09-05-login-cache.md`\n\
+             Goal Runner로 이어서 진행할까요?",
+        );
+        let tabs = question_tabs(&questions, 0, &BTreeMap::new());
+        assert!(tabs.contains("계획 실행 확인"));
+        assert!(!tabs.contains("Planner Handoff"));
+        show_question(json!(1), questions, 0, BTreeMap::new(), &mut state);
+        let view = state.overlay_view().unwrap();
+        assert_eq!(view.title, "계획 실행 확인");
+        assert!(view.lines[0].text.starts_with("로그인 응답 속도를 개선"));
+        let Some(PendingInteraction::UserInput { questions, .. }) = &state.pending else {
+            panic!("handoff question missing");
+        };
+        assert_eq!(questions[0].header, "Planner Handoff");
+        let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(action, Action::RpcResponse { .. }));
+        assert_eq!(state.agent_mode, AgentMode::GoalRunner);
+        assert_eq!(state.queued_prompts.front().map(String::as_str),
+            Some("docs/plans/2026-09-05-login-cache.md 계획을 Goal Runner로 실행해줘."));
+    }
+
     #[test]
     fn approved_planner_handoff_switches_role_and_queues_the_follow_up() {
         let mut state = idle_test_state();
