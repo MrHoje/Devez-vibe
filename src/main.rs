@@ -916,6 +916,7 @@ async fn choose_startup_session(
                 plan_summary: None,
                 response_collapse: None,
                 fold_progress_groups: false,
+                response_display_mode: state::ResponseDisplayMode::Completed,
                 plan_active: false,
                 plan_shimmer_phase: None,
                 plan_agent: agent::AgentMode::Standard,
@@ -1240,13 +1241,7 @@ fn draw_conversations(
     let Some(btw) = btw.as_mut() else {
         return draw(main, renderer);
     };
-    devezcode::sync(
-        main.host_session_id(),
-        main.busy,
-        main.compacting(),
-        main.host_loading(),
-        main.awaiting_input(),
-    );
+    sync_host_state(main);
     let main_discarded = main.take_discarded_prompt_ids();
     let btw_discarded = btw.take_discarded_prompt_ids();
     renderer.remove_history_blocks(&main_discarded)?;
@@ -1296,6 +1291,9 @@ async fn start_split_turn(
     }
     if let Some(provider_handoff) = provider_handoff {
         params["providerHandoff"] = provider_handoff;
+    }
+    if let Some(policy) = agent_mode.tool_policy() {
+        params["toolPolicy"] = policy;
     }
     if let Err(error) = server.request("turn/start", params).await {
         state.set_request_failed(error.to_string());
@@ -1972,6 +1970,9 @@ async fn event_loop(
                 Action::Tick(revealed)
             }
             _ = activity_tick.tick() => {
+                // Keep the host in step even when only the spinner is painted.
+                // Always publish the main pane, regardless of BTW focus.
+                sync_host_state(state);
                 if let Some(action) = state.take_expired_user_input_response() {
                     action_focus = SplitFocus::Main;
                     action
@@ -5464,6 +5465,9 @@ async fn start_turn(
     if let Some(provider_handoff) = provider_handoff {
         params["providerHandoff"] = provider_handoff;
     }
+    if let Some(policy) = agent_mode.tool_policy() {
+        params["toolPolicy"] = policy;
+    }
     // The response reserves an id, but the app-server makes it interruptible
     // only after the subsequent `turn/started` notification.
     if let Err(error) =
@@ -5893,11 +5897,13 @@ fn write_clipboard_bmp(image: &ImageData<'_>) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-fn draw(state: &mut AppState, renderer: &mut Renderer) -> Result<()> {
-    let draw_started = Instant::now();
-    // Every state change the user can see reaches a frame, so the host's copy of
-    // the session state is refreshed from the same place rather than from each
-    // of the call sites that can move it.
+fn sync_host_state(state: &AppState) {
+    // Helpers may draw a BTW pane independently; it never owns the host tab.
+    if state.side_parent_thread_id().is_some() {
+        return;
+    }
+    // Full frames and activity ticks share the same root state. Ticks also
+    // retry a failed host write while rendering uses its animation-only path.
     // The turn flag and compaction are handed over separately: the host spins its
     // tab for both, but only a finished turn is a finished response.
     devezcode::sync(
@@ -5907,6 +5913,11 @@ fn draw(state: &mut AppState, renderer: &mut Renderer) -> Result<()> {
         state.host_loading(),
         state.awaiting_input(),
     );
+}
+
+fn draw(state: &mut AppState, renderer: &mut Renderer) -> Result<()> {
+    let draw_started = Instant::now();
+    sync_host_state(state);
     let discarded_prompt_ids = state.take_discarded_prompt_ids();
     renderer.remove_history_blocks(&discarded_prompt_ids)?;
     let committed = state.drain_committed();
@@ -6946,6 +6957,41 @@ mod tests {
             event_thread_id(&json!({ "turn": { "threadId": "main-thread" } })),
             Some("main-thread")
         );
+    }
+
+    #[test]
+    fn btw_completion_after_close_keeps_the_main_turn_running() {
+        let mut main = state_with_a_model();
+        main.thread_id = "main-thread".to_owned();
+        main.set_turn_started("main-turn".to_owned());
+        for _ in 0..2 {
+            let mut btw = Some(main.forked_side_state(
+                "btw-thread".to_owned(),
+                main.cwd.clone(),
+                main.selected_model_name(),
+                Some(main.selected_effort()),
+            ));
+            btw.as_mut().unwrap().set_turn_started("btw-turn".to_owned());
+            let action = focused_state_mut(&mut main, &mut btw, SplitFocus::Btw)
+                .handle_key(KeyEvent::from(KeyCode::Esc));
+            assert!(matches!(action, Action::ReturnFromSide));
+            drop(btw.take());
+            // Completion can already be queued when unsubscribe returns. Both
+            // supported thread-id locations must stay isolated after closing.
+            for params in [
+                json!({ "threadId": "btw-thread", "turn": { "id": "btw-turn" } }),
+                json!({ "turn": { "threadId": "btw-thread", "id": "btw-turn" } }),
+            ] {
+                main.handle_notification("turn/completed", &params);
+                assert!(main.host_turn_busy());
+                assert_eq!(main.turn_id.as_deref(), Some("main-turn"));
+            }
+        }
+        main.handle_notification(
+            "turn/completed",
+            &json!({ "threadId": "main-thread", "turn": { "id": "main-turn" } }),
+        );
+        assert!(!main.host_turn_busy());
     }
 
     #[test]

@@ -36,10 +36,21 @@ const IMPLEMENTER_PROMPT: &str = include_str!("../prompts/agents/subagents/imple
 const REVIEWER_PROMPT: &str = include_str!("../prompts/agents/subagents/reviewer.md");
 const QA_PROMPT: &str = include_str!("../prompts/agents/subagents/qa.md");
 
-// Exact shipped bodies, used only to recognize defaults safe to upgrade.
-const LEGACY_IMPLEMENTER: &str = include_str!("../prompts/agents/subagents/legacy/implementer.md");
-const LEGACY_REVIEWER: &str = include_str!("../prompts/agents/subagents/legacy/reviewer.md");
-const LEGACY_QA: &str = include_str!("../prompts/agents/subagents/legacy/qa.md");
+// Exact shipped bodies, used only to recognize defaults safe to upgrade. Every
+// body ever shipped stays here, so a file written by any earlier release is
+// still recognized.
+const LEGACY_IMPLEMENTER: &[&str] = &[
+    include_str!("../prompts/agents/subagents/legacy/implementer.md"),
+    include_str!("../prompts/agents/subagents/legacy/implementer-v2.md"),
+];
+const LEGACY_REVIEWER: &[&str] = &[
+    include_str!("../prompts/agents/subagents/legacy/reviewer.md"),
+    include_str!("../prompts/agents/subagents/legacy/reviewer-v2.md"),
+];
+const LEGACY_QA: &[&str] = &[
+    include_str!("../prompts/agents/subagents/legacy/qa.md"),
+    include_str!("../prompts/agents/subagents/legacy/qa-v2.md"),
+];
 
 const EDITING_TOOLS: &[&str] = &["Read", "Edit", "Write", "Glob", "Grep", "Bash"];
 const READ_ONLY_TOOLS: &[&str] = &["Read", "Glob", "Grep", "Bash"];
@@ -146,10 +157,10 @@ fn upgraded_codex_agent(existing: &str, agent: &Subagent) -> Option<String> {
         format!("\ndeveloper_instructions = '''\n{}\n'''", prompt.replace("\r\n", "\n").trim())
             .replace('\n', newline)
     };
-    let old = block(legacy);
-    if existing.matches(&old).count() != 1 {
-        return None;
-    }
+    let old = legacy
+        .iter()
+        .map(|body| block(body))
+        .find(|old| existing.matches(old.as_str()).count() == 1)?;
     Some(existing.replacen(&old, &block(agent.prompt), 1).replacen(
         "# 이 파일이 있는 동안 DevezVibe는 다시 덮어쓰지 않습니다.",
         "# 배포된 기본 지침만 갱신하며, 직접 고친 지침과 나머지 설정은 보존합니다.",
@@ -277,23 +288,30 @@ mod tests {
             for (agent, legacy) in SUBAGENTS.iter().zip([
                 LEGACY_IMPLEMENTER, LEGACY_REVIEWER, LEGACY_REVIEWER, LEGACY_QA,
             ]) {
-                let prefix = format!(
-                    "# DevezVibe가 만든 서브에이전트 정의입니다.\nname = \"{}\"\n\
-                     model = \"my-model\"\nmodel_reasoning_effort = \"low\"\n\
-                     developer_instructions = '''\n", agent.name,
-                );
-                let suffix = "\n'''\nsandbox_mode = \"read-only\"\n# user comment\n";
-                let existing = format!("{prefix}{}{suffix}", legacy.trim()).replace('\n', newline);
-                let path = agents.join(format!("{}.toml", agent.name));
-                std::fs::write(&path, &existing).unwrap();
-                provision_codex_agents(&home).unwrap();
-                let expected = format!("{prefix}{}{suffix}", agent.prompt.trim()).replace('\n', newline);
-                assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
-                let backup = path.with_extension("toml.pre-readability.bak");
-                assert_eq!(std::fs::read_to_string(&backup).unwrap(), existing);
-                provision_codex_agents(&home).unwrap();
-                assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
-                assert_eq!(std::fs::read_to_string(&backup).unwrap(), existing);
+                // Every shipped body, oldest first, must upgrade to the current one.
+                for legacy in legacy.iter() {
+                    let prefix = format!(
+                        "# DevezVibe가 만든 서브에이전트 정의입니다.\nname = \"{}\"\n\
+                         model = \"my-model\"\nmodel_reasoning_effort = \"low\"\n\
+                         developer_instructions = '''\n", agent.name,
+                    );
+                    let suffix = "\n'''\nsandbox_mode = \"read-only\"\n# user comment\n";
+                    let existing = format!("{prefix}{}{suffix}", legacy.trim()).replace('\n', newline);
+                    let path = agents.join(format!("{}.toml", agent.name));
+                    std::fs::write(&path, &existing).unwrap();
+                    provision_codex_agents(&home).unwrap();
+                    let expected = format!("{prefix}{}{suffix}", agent.prompt.trim()).replace('\n', newline);
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+                    let backup = path.with_extension("toml.pre-readability.bak");
+                    assert_eq!(std::fs::read_to_string(&backup).unwrap(), existing);
+                    provision_codex_agents(&home).unwrap();
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+                    assert_eq!(std::fs::read_to_string(&backup).unwrap(), existing);
+                    // A later body in the same directory would reuse the backup name,
+                    // so each shipped body gets a clean directory of its own.
+                    std::fs::remove_file(&backup).unwrap();
+                    std::fs::remove_file(&path).unwrap();
+                }
             }
             std::fs::remove_dir_all(home).unwrap();
         }
@@ -304,7 +322,7 @@ mod tests {
         let agent = &SUBAGENTS[1];
         let old = format!(
             "# DevezVibe가 만든 서브에이전트 정의입니다.\ndeveloper_instructions = '''\n{}\n'''\n",
-            LEGACY_REVIEWER.trim(),
+            LEGACY_REVIEWER[0].trim(),
         );
         for custom in [
             old.replace("You are a DevezVibe reviewer.", "Custom reviewer instructions."),
@@ -326,7 +344,7 @@ mod tests {
         let path = agents.join("devez-implementer.toml");
         let original = format!(
             "# DevezVibe가 만든 서브에이전트 정의입니다.\ndeveloper_instructions = '''\n{}\n'''\n",
-            LEGACY_IMPLEMENTER.trim(),
+            LEGACY_IMPLEMENTER[0].trim(),
         );
         std::fs::write(&path, &original).unwrap();
         std::fs::create_dir_all(path.with_extension("toml.pre-readability.bak")).unwrap();

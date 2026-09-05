@@ -5993,9 +5993,7 @@ impl AppState {
     }
 
     fn collapse_progress_before_next_answer(&mut self) {
-        if self.vibe_mode != VibeMode::SuperVibe
-            || self.response_display_mode != ResponseDisplayMode::Completed
-        {
+        if self.vibe_mode != VibeMode::SuperVibe {
             return;
         }
         let progress = self
@@ -6484,8 +6482,8 @@ impl AppState {
             overlay: self.overlay_view(),
             plan_summary: self.visible_plan_summary(),
             response_collapse: self.response_collapse_view(),
-            fold_progress_groups: self.vibe_mode == VibeMode::SuperVibe
-                && self.response_display_mode == ResponseDisplayMode::Completed,
+            fold_progress_groups: self.vibe_mode == VibeMode::SuperVibe,
+            response_display_mode: self.response_display_mode,
             plan_active: self.plan_is_active(),
             plan_shimmer_phase: self.plan_shimmer_phase(),
             plan_agent: self.active_turn_agent,
@@ -8327,9 +8325,7 @@ impl AppState {
         // Codex emits child-thread events on the shared app-server stream. Read
         // them before the ordinary current-thread filter discards them.
         self.observe_codex_subagent_notification(method, params);
-        if let Some(thread_id) = params
-            .get("threadId")
-            .and_then(Value::as_str)
+        if let Some(thread_id) = crate::event_thread_id(params)
             .filter(|thread_id| !self.names_this_thread(thread_id))
         {
             self.note_background_turn(thread_id, method);
@@ -12677,9 +12673,7 @@ impl AppState {
 
     fn set_response_display_mode(&mut self, mode: ResponseDisplayMode) {
         self.response_display_mode = mode;
-        if mode == ResponseDisplayMode::All {
-            self.response_collapse = None;
-        }
+        self.response_collapse = None;
     }
 
     pub fn cycle_vibe_mode(&mut self) -> (ShellDisplayMode, DiffDisplayMode) {
@@ -17189,7 +17183,7 @@ mod tests {
     }
 
     #[test]
-    fn all_response_mode_disables_super_vibe_progress_folding() {
+    fn both_response_modes_keep_super_vibe_prompt_folding() {
         let mut state = test_state();
         while state.vibe_mode() != VibeMode::SuperVibe {
             state.cycle_vibe_mode();
@@ -17197,9 +17191,14 @@ mod tests {
 
         state.set_response_display_mode(ResponseDisplayMode::Completed);
         assert!(state.view().fold_progress_groups);
+        assert_eq!(
+            state.view().response_display_mode,
+            ResponseDisplayMode::Completed
+        );
 
         state.set_response_display_mode(ResponseDisplayMode::All);
-        assert!(!state.view().fold_progress_groups);
+        assert!(state.view().fold_progress_groups);
+        assert_eq!(state.view().response_display_mode, ResponseDisplayMode::All);
         assert!(state.response_collapse_view().is_none());
     }
 
@@ -21987,8 +21986,10 @@ mod tests {
         assert!(state.active.contains_key("delta-only-answer"));
     }
 
+    /// `All` folds the same group `Completed` does; only the group's default
+    /// openness differs, and that lives in the renderer.
     #[test]
-    fn all_response_mode_keeps_progress_visible_when_final_streaming_starts() {
+    fn all_response_mode_groups_progress_when_final_streaming_starts() {
         let mut state = test_state();
         while state.vibe_mode() != VibeMode::SuperVibe {
             state.cycle_vibe_mode();
@@ -22020,8 +22021,14 @@ mod tests {
             }),
         );
 
-        assert!(state.drain_committed().is_empty());
-        assert!(!state.response_grouped);
+        let committed = state.drain_committed();
+        let group = committed
+            .iter()
+            .find(|block| matches!(block.kind, BlockKind::ProgressGroup))
+            .expect("progress group");
+        assert_eq!(group.children()[0].body, "진행 메시지");
+        assert!(state.response_grouped);
+        assert!(state.response_collapse_view().is_none());
     }
 
     #[test]

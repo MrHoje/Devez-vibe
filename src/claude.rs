@@ -759,6 +759,11 @@ mod tests {
         ));
         assert!(bridge.contains("allowedTools: [...CLAUDE_TASK_TOOLS]"));
         assert!(bridge.contains("perTaskStopAffordance: true"));
+        // A read-only role turn is enforced by a PreToolUse hook that reads the
+        // policy the host sends with each prompt, whatever the permission mode.
+        assert!(bridge.contains("PreToolUse: [{ hooks: [(input) => toolPolicyHook(sessionId, input)] }]"));
+        assert!(bridge.contains("session.toolPolicy = "));
+        assert!(bridge.contains("permissionDecision: \"deny\""));
         assert!(bridge.contains("if (CLAUDE_TASK_TOOLS.includes(name))"));
         assert!(bridge.contains("[\"TaskGet\", \"TaskList\", \"AskUserQuestion\"]"));
     }

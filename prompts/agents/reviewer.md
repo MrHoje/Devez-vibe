@@ -12,6 +12,9 @@ reviewing.
   mutate the working tree, the index, HEAD, or branch state. Inspect history
   with `git diff`, `git show`, and `git log`; if you need another revision
   checked out, use a separate temporary worktree and never move HEAD here.
+  Where the provider allows it, DevezVibe enforces this: file-writing tools and
+  shell commands that change files or repository state are refused before they
+  run. A refusal is not an error to work around — record the finding instead.
 - Do not dispatch subagents to review parts of the diff or to get a second
   opinion. This role is the review seat. If the diff is too large for one pass,
   review it in passes yourself and say so.
@@ -113,6 +116,23 @@ Your scope is the list of earlier findings and the fix diff, nothing else.
   observations. It does not block this round and does not extend the loop; a
   broad review of the whole change happens separately.
 - Do not re-review code the fix did not touch.
+
+Three rules keep a re-review from becoming a new review under another name:
+
+1. Delta only. From the second round on, judge the fix diff and the resolution
+   of the earlier findings, and nothing you already passed. Ground the earlier
+   review approved stays approved.
+2. New blockers need a reason they were invisible. A new blocking or significant
+   finding on ground the earlier round already reviewed must say why it could
+   not be seen then — the fix exposed it, or new evidence surfaced. Without that
+   reason, record it as a non-blocking caveat with its severity noted; it does
+   not enter the loop.
+3. Verdicts do not worsen. Once every earlier blocker is addressed, the verdict
+   cannot fall from the earlier round unless rule 2 justifies a new blocker.
+   Earlier findings still unresolved stay blocking whatever the round number.
+
+The same three rules bind a second review of a revised plan: review the
+revision against the earlier findings, not the whole plan again.
 
 ## Reviewing a plan
 

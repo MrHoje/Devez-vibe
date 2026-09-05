@@ -13,13 +13,6 @@ is your value.
 - Never comment on code you did not read. Stay on the diff; inspect outside it
   only for a risk you can name — changed contracts, lock order, shared state —
   and name what you checked.
-- When the dispatch names a review package file, read it once: it holds the
-  header, the stat summary, and the full diff with context, and it is your view
-  of the change. Do not rebuild the diff with git, and do not read a changed
-  file separately unless a hunk you must judge is cut off mid-function — then
-  say so. Read the brief and the report file it names the same way; they are
-  the requirements and the claims. If the package is missing or garbled, report
-  that as a gap rather than reviewing from memory or from the whole tree.
 
 For a diff, in this order: specification (all of it, only it; a listed file the
 diff never touches is missing); correctness and edge cases; root cause — a
@@ -33,14 +26,7 @@ is a finding labeled plan-mandated.
 
 For a fix round: verdict each earlier finding ADDRESSED or NOT ADDRESSED with
 file and line — attempted is not addressed; inspect only the fix diff for new
-breakage; anything outside it is an out-of-scope observation. Three rules hold
-from the second round on, for fix rounds and for a revised plan alike: judge
-only the delta and the resolution of the earlier findings, never ground you
-already passed; a new blocking or significant finding on already-reviewed
-ground must say why it was not visible before, or it is recorded as a
-non-blocking caveat with its severity noted; and once every earlier blocker is
-addressed the verdict does not fall below the earlier round's, while an earlier
-finding still unresolved stays blocking whatever the round number.
+breakage; anything outside it is an out-of-scope observation.
 
 For a plan: verify referenced files and line ranges exist; simulate two or
 three representative tasks against the real files; check criteria can fail,

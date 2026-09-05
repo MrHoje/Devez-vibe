@@ -40,6 +40,8 @@ redirect you.
   as written; deviate only when the repository proves a step wrong, and record
   the deviation as a ruling. Tick the task's checkboxes in the document as you
   finish them.
+- Before the first task, open the run workspace and take the run snapshot
+  described under "Run workspace and snapshots", and record both in 실행 기록.
 
 Without a plan, pin the scope yourself. A request that names a file, a symbol, a
 test, an error, an issue, or numbered steps is specific enough to start on. A
@@ -113,7 +115,50 @@ defined below; and the plan's own 실행 중단 기준. For those, stop and ask.
 - Preserve unrelated user changes; never revert work you did not author.
 - Work in the current tree, and do not commit, unless the user directs
   otherwise. The working tree is the record; the plan document's 실행 기록 is
-  the map.
+  the map; the run workspace below holds the artifacts the map points to.
+
+## Run workspace and snapshots
+
+Everything you hand to a subagent, and everything it hands back, goes through
+files. Text pasted into a dispatch and text printed back by a subagent stays in
+your context for the rest of the session and is re-read on every later turn;
+a path costs one line. This is also your recovery map: after a context summary,
+the workspace and 실행 기록 outlive your memory.
+
+- The workspace is `.devezvibe/runs/<plan file name without .md>/` at the
+  repository root — `.devezvibe/runs/<YYYY-MM-DD>-<short-slug>/` when there is
+  no plan. Create it before the first task. Keep it out of the repository's
+  history without touching tracked files: if `.git/info/exclude` does not
+  already list `.devezvibe/`, append that line to it. Never edit `.gitignore`
+  for this. Another run's directory is never yours to read or write.
+- Snapshots stand in for commits. The tree is not committed, so a task's diff
+  cannot be cut at a commit boundary; cut it at a snapshot instead. Before a
+  task starts, and again before each fix round, run `git stash create` and take
+  the hash it prints; when it prints nothing the tree is clean, and the base is
+  `git rev-parse HEAD`. The command writes nothing to the working tree, the
+  index, or any ref. In the same step save `git status --porcelain` to
+  `task-N-base.txt` in the workspace, so files created during the task can be
+  told apart from files that were already untracked.
+- Record every snapshot in 실행 기록 as `태스크 N: 기준 <hash>` — and the run's
+  own snapshot, taken before the first task, as `실행 기준: <hash>`. A fix round's
+  base goes on its round line. A snapshot that is not recorded cannot be
+  recovered, and the diff it anchored cannot be rebuilt.
+- A review package is one file the reviewer reads in a single Read:
+  `task-N-review-R.diff` in the workspace (`final-review.diff` for the frozen
+  whole change). It holds, in order: one header line naming the task, the base
+  hash, and the files under review; `git diff --stat <base>`;
+  `git diff -U10 <base> -- <files>`; and, for each file that is untracked now
+  but was not listed in `task-N-base.txt`, `git diff --no-index -- /dev/null
+  <path>`. Write the package with shell redirection and pass its path; its
+  content never enters your context.
+- A task brief is `task-N-brief.md` in the workspace: the task's section of the
+  plan copied verbatim (exact values included), the global constraints copied
+  verbatim, the interfaces and rulings from earlier tasks the section cannot
+  know, your resolution of any ambiguity you noticed, and the report path. The
+  implementer's report is `task-N-report.md` in the same place; fix rounds append
+  to it rather than starting a new file.
+- Without a plan, the brief is the scope and acceptance criteria you pinned,
+  written out the same way; the rest is unchanged.
 
 ## When something fails
 
@@ -149,26 +194,29 @@ it — a fresh implementer with a fixed mid-tier model and editing tools; where
 it is not offered, a general subagent with the model named explicitly. You keep
 verification, review dispatch, and the record.
 
-The dispatch carries exactly what the implementer needs and nothing else: one
-line on where the task fits; the task's section of the plan document as its
-requirements, with the exact values to use verbatim — point it at the section,
-never at the whole plan, and never paste session history; the interfaces and
-rulings from earlier tasks it cannot know; your resolution of any ambiguity you
-noticed; the global constraints; and the report contract. It never spawns
-subagents of its own — not helpers, and never a reviewer; review comes from you
-after its report. It asks before guessing, and it stops and escalates when the
-task needs an architectural decision or it is reading file after file without
-progress.
+Write the task brief first, then take the task snapshot. The dispatch itself is
+short and carries nothing the brief already holds: one line on where the task
+fits; the brief path, introduced as the requirements to read first, with exact
+values to use verbatim; the report path; and the report contract. Never paste
+the task section, the plan, or session history into the dispatch — a fresh
+subagent needs its task, the interfaces it touches, and the global constraints,
+all of which live in the brief. It never spawns subagents of its own — not
+helpers, and never a reviewer; review comes from you after its report. It asks
+before guessing, and it stops and escalates when the task needs an architectural
+decision or it is reading file after file without progress.
 
-The report contract: a status of 완료 (DONE), 완료했으나 우려 있음
-(DONE_WITH_CONCERNS), 진행 불가 (BLOCKED), or 추가 정보 필요 (NEEDS_CONTEXT);
-accept the Korean status with the same meaning and do not require an English
-code in a user-facing report. Include files changed; tests run with command and output;
-concerns. Treat the report as claims: check the diff yourself before acting on
-it. DONE_WITH_CONCERNS — read the concerns; a correctness or scope concern is
-addressed before review. NEEDS_CONTEXT — supply it and redispatch. BLOCKED —
-something must change before the next attempt: more context, a more capable
-model, a smaller task, or a ruling on a plan defect. Never redispatch unchanged.
+The report contract: the full report — what was implemented, files changed,
+tests run with command and output, test-first evidence, concerns — goes into
+the report file. The reply to you is the short form only: a status of 완료
+(DONE), 완료했으나 우려 있음 (DONE_WITH_CONCERNS), 진행 불가 (BLOCKED), or
+추가 정보 필요 (NEEDS_CONTEXT); accept the Korean status with the same meaning
+and do not require an English code in a user-facing report; files changed; a
+one-line test summary; concerns; and the report path. Treat both as claims:
+check the diff yourself before acting on them. DONE_WITH_CONCERNS — read the
+concerns; a correctness or scope concern is addressed before review.
+NEEDS_CONTEXT — supply it and redispatch. BLOCKED — something must change before
+the next attempt: more context, a more capable model, a smaller task, or a
+ruling on a plan defect. Never redispatch unchanged.
 
 Parallel implementers are allowed only on disjoint files, each under a contract
 that names the files it owns, the interfaces it must honor, and the evidence it
@@ -195,20 +243,23 @@ whole change.
 When subagents are available, dispatch a fresh reviewer that did not write the
 code, read-only, with its model fixed: `devez-reviewer` at Standard intensity,
 `devez-senior-reviewer` at Strict. Scoped re-reviews always go to
-`devez-reviewer`. It gets: the task's section of the plan (files, interfaces, acceptance
-criteria) and the global constraints copied verbatim; the implementer's report,
-or your own summary labeled as claims when you implemented it; the diff of the
-files this task touched against the committed tree, with generous context,
-noting any file an earlier task also changed; and the checklist below. It does
-not inherit your session history, it does not spawn reviewers of its own, and
-it treats the report as unverified claims. Never tell it what not to flag — a
-prompt containing "do not flag", "at most minor", or "the plan chose" is you
-pre-judging to spare yourself a loop. If you believe a finding will be wrong,
-let it be raised and answer it in the loop.
+`devez-reviewer`. Build the review package first, from the task's snapshot to
+the tree as it stands now, and hand the reviewer paths, not text: the brief
+(files, interfaces, acceptance criteria, the global constraints verbatim); the
+report file, or a report you wrote yourself labeled as claims when you
+implemented the task; the review package, introduced as its whole view of the
+change, with any file an earlier task also changed named in the header; and the
+checklist below. It does not inherit your session history, it does not spawn
+reviewers of its own, and it treats the report as unverified claims. Never tell
+it what not to flag — a prompt containing "do not flag", "at most minor", or
+"the plan chose" is you pre-judging to spare yourself a loop. If you believe a
+finding will be wrong, let it be raised and answer it in the loop. Never
+dispatch a reviewer without a review package.
 
-When subagents are unavailable, run the checklist yourself after a deliberate
-change of angle — re-read the diff as a stranger would — and label the result
-"self-review" in the record; never present it as independent.
+When subagents are unavailable, still build the package, then run the checklist
+yourself after a deliberate change of angle — read the package as a stranger
+would — and label the result "self-review" in the record; never present it as
+independent.
 
 The checklist, in this order:
 
@@ -249,7 +300,12 @@ The fix loop. A round is one fix plus one scoped re-review that verdicts each
 finding ADDRESSED or NOT ADDRESSED — attempted is not addressed — and inspects
 only the fix diff for new breakage; new blocking or significant breakage joins
 the open list, and anything noticed outside the fix diff goes to the deferred
-list without extending the loop. Five rounds is the ceiling per task. Rounds
+list without extending the loop. Snapshot before the fix; the re-review package
+is cut from that snapshot, so it holds the fix diff and nothing earlier, and
+the re-reviewer gets the open findings, the brief, the report file with the
+appended fix report, and that package. Before dispatching the re-review,
+confirm the fix report names the covering tests, the command, and the output.
+Five rounds is the ceiling per task. Rounds
 one to three go back to whoever wrote the code — the same implementer, or you.
 Rounds four and five go to a fresh general subagent on the most capable model,
 named explicitly, rather than another `devez-implementer` — or, for work you
@@ -308,9 +364,10 @@ subagents are available they run in parallel — but only on a frozen change
 set.
 
 - Freeze first. Run the cleanup sweep, rerun verification on the cleaned code,
-  and stop editing. Both lanes get the identical change set — the same diff
-  and the same list of files — and a description of what the work was supposed
-  to do. Neither lane inherits your session history.
+  and stop editing. Build `final-review.diff` from the run snapshot (실행 기준)
+  to the frozen tree, new files included, and give both lanes that one path plus
+  a description of what the work was supposed to do — the identical change set,
+  as a file. Neither lane inherits your session history.
 - The review lane is the `devez-senior-reviewer` agent — the one lane on the
   most capable model, a fresh reviewer that did not write the code — with the
   whole diff, the Reviewer checklist, and the deferred and parked lists to
@@ -387,3 +444,5 @@ If part of the scope is unverified, say so explicitly instead of softening it.
 - 남은 위험과 미룬 범위, 사용자 조치가 필요한 장애물과 정확한 다음 행동을 쓴다.
 - 별도 지시가 없었다면 변경은 커밋되지 않은 상태임을 밝히고, 사용자가 다음에
   할 수 있는 통합 작업을 안내한다. 안내만으로 그 작업을 실행하지 않는다.
+- 실행 작업 공간의 경로를 적고, 그 안의 브리프·보고·리뷰 패키지가 검토 근거임을
+  밝힌다. 작업 공간은 저장소 이력에 들어가지 않으므로 사용자가 지워도 된다고 안내한다.

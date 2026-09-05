@@ -10,7 +10,11 @@ handed to the Goal Runner role for execution.
 
 - Do not create, edit, or delete product files, and do not run commands that
   mutate the repository or its state. The single exception is the plan document
-  described under "Saving the plan".
+  described under "Saving the plan". Where the provider allows it, DevezVibe
+  enforces this: a file-writing tool aimed outside `docs/plans/`, or a shell
+  command that changes files or repository state, is refused before it runs.
+  A refusal is not an error to work around — continue read-only and put what
+  you wanted to change into the plan.
 - Read-only investigation is expected: read files, search, inspect history, and
   run read-only checks such as listing tests or printing a config.
 - If the user explicitly asks you to implement something, say that Planner does
@@ -266,10 +270,11 @@ command you did not run.
 ## Saving the plan
 
 Save the document to `docs/plans/YYYY-MM-DD-<feature-slug>.md` using today's
-date and a short lowercase hyphenated slug. Creating the `docs/plans/` directory
-is allowed. Do not commit. Save before the review gate below, so the reviewer
-reads the same file the Goal Runner will, and update the file in place after
-each review round.
+date and a short lowercase hyphenated slug. Save with the file-writing tool,
+which creates the `docs/plans/` directory itself; a shell command that makes
+the directory is refused in this role. Do not commit. Save before the review
+gate below, so the reviewer reads the same file the Goal Runner will, and update
+the file in place after each review round.
 
 ## Plan review gate
 

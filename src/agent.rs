@@ -16,6 +16,8 @@ use std::{
     sync::OnceLock,
 };
 
+use serde_json::{Value, json};
+
 /// Which role the next turn is sent under.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AgentMode {
@@ -98,6 +100,20 @@ impl AgentMode {
         let all = choices();
         let position = all.iter().position(|mode| *mode == self).unwrap_or(0);
         all[(position + 1) % all.len()]
+    }
+
+    /// What a turn under this role may change on disk; `None` leaves the
+    /// provider's own permissions alone. Planner writes only its plan document,
+    /// Reviewer writes nothing. The prompt states the same boundary; this makes
+    /// it hold where the provider offers a hook — Claude refuses the tool call
+    /// before it runs, Codex runs a fully read-only turn in its read-only
+    /// sandbox — instead of resting on the model's word.
+    pub fn tool_policy(self) -> Option<Value> {
+        match self {
+            Self::Planner => Some(json!({ "readOnly": true, "writableRoots": ["docs/plans"] })),
+            Self::Reviewer => Some(json!({ "readOnly": true, "writableRoots": [] })),
+            Self::Standard | Self::GoalRunner | Self::Custom(_) => None,
+        }
     }
 
     /// The role's own instruction, sent on every turn.
@@ -347,6 +363,24 @@ mod tests {
             .contains("불릿 두세 개, 전체 200자 내외"));
         for mode in choices().into_iter().filter(|mode| *mode != AgentMode::Standard) {
             assert!(mode.render_turn_block().contains("Every response-length cap is lifted"));
+        }
+    }
+
+    /// The two roles whose prompts forbid edits carry a policy the providers
+    /// can enforce; the roles that implement carry none.
+    #[test]
+    fn only_the_read_only_roles_carry_a_tool_policy() {
+        let planner = AgentMode::Planner.tool_policy().unwrap();
+        assert_eq!(planner["readOnly"], true);
+        assert_eq!(planner["writableRoots"], json!(["docs/plans"]));
+        let reviewer = AgentMode::Reviewer.tool_policy().unwrap();
+        assert_eq!(reviewer["readOnly"], true);
+        assert_eq!(reviewer["writableRoots"], json!([]));
+        for mode in choices()
+            .into_iter()
+            .filter(|mode| !matches!(mode, AgentMode::Planner | AgentMode::Reviewer))
+        {
+            assert!(mode.tool_policy().is_none(), "{} must keep full tools", mode.id());
         }
     }
 

@@ -133,21 +133,7 @@ pub fn room_id() -> Option<String> {
 /// Publishes the session state DevezCode paints around the terminal. Called
 /// from every frame; cheap when nothing changed.
 pub fn sync(thread_id: &str, busy: bool, compacting: bool, loading: bool, waiting: bool) {
-    with(|reporter| {
-        if !thread_id.is_empty() && reporter.session != thread_id {
-            reporter.session = thread_id.to_owned();
-            reporter.write("sessions", thread_id);
-        }
-        let activity = Activity::from_host(busy, compacting, loading);
-        if reporter.activity != activity {
-            reporter.activity = activity;
-            reporter.write("busy", activity.status());
-        }
-        if reporter.waiting != waiting {
-            reporter.waiting = waiting;
-            reporter.write("waiting", if waiting { WAITING } else { READY });
-        }
-    });
+    with(|reporter| reporter.sync(thread_id, busy, compacting, loading, waiting));
 }
 
 /// Records the prompt that was just sent, which DevezCode shows in the session
@@ -157,7 +143,9 @@ pub fn note_prompt(text: &str) {
     if summary.is_empty() {
         return;
     }
-    with(|reporter| reporter.write("lastmsg", &summary));
+    with(|reporter| {
+        reporter.write("lastmsg", &summary);
+    });
 }
 
 /// Mirror of the last payload handed to the host, so a turn that ends with the
@@ -286,13 +274,35 @@ fn with(action: impl FnOnce(&mut Reporter)) {
 }
 
 impl Reporter {
-    fn write(&self, kind: &str, value: &str) {
+    fn sync(
+        &mut self,
+        thread_id: &str,
+        busy: bool,
+        compacting: bool,
+        loading: bool,
+        waiting: bool,
+    ) {
+        // Cache only successful writes: Windows readers can temporarily prevent
+        // the atomic rename, and the next activity tick must retry that state.
+        if !thread_id.is_empty() && self.session != thread_id && self.write("sessions", thread_id) {
+            self.session = thread_id.to_owned();
+        }
+        let activity = Activity::from_host(busy, compacting, loading);
+        if self.activity != activity && self.write("busy", activity.status()) {
+            self.activity = activity;
+        }
+        if self.waiting != waiting && self.write("waiting", if waiting { WAITING } else { READY }) {
+            self.waiting = waiting;
+        }
+    }
+
+    fn write(&self, kind: &str, value: &str) -> bool {
         if !owns_room(&self.base, &self.room, &self.owner_token) {
-            return;
+            return false;
         }
         let dir = self.base.join(kind);
         if fs::create_dir_all(&dir).is_err() {
-            return;
+            return false;
         }
         // Written whole and renamed into place: a reader that catches a
         // truncated `busy` file reads it as idle and drops the spinner
@@ -301,11 +311,13 @@ impl Reporter {
         let path = dir.join(format!("{}.txt", self.room));
         if fs::write(&temp, value).is_err() {
             let _ = fs::remove_file(&temp);
-            return;
+            return false;
         }
         if fs::rename(&temp, &path).is_err() {
             let _ = fs::remove_file(&temp);
+            return false;
         }
+        true
     }
 }
 
@@ -532,5 +544,102 @@ mod tests {
         assert!(try_claim_owner(&base, room, "next-root"));
 
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn failed_host_state_writes_are_retried_without_another_state_change() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = env::temp_dir().join(format!("devezvibe-sync-{}-{nonce}", process::id()));
+        let room = "room-test";
+        assert!(try_claim_owner(&base, room, "root"));
+        let mut reporter = Reporter {
+            base: base.clone(),
+            room: room.to_owned(),
+            owner_token: "root".to_owned(),
+            session: String::new(),
+            activity: Activity::Idle,
+            waiting: false,
+        };
+        // A directory at each destination makes the atomic rename fail.
+        for kind in ["sessions", "busy", "waiting"] {
+            fs::create_dir_all(base.join(kind).join(format!("{room}.txt"))).unwrap();
+        }
+        reporter.sync("main-thread", true, false, false, true);
+        assert!(reporter.session.is_empty());
+        assert_eq!(reporter.activity.status(), IDLE);
+        assert!(!reporter.waiting);
+        for kind in ["sessions", "busy", "waiting"] {
+            fs::remove_dir(base.join(kind).join(format!("{room}.txt"))).unwrap();
+        }
+        reporter.sync("main-thread", true, false, false, true);
+        for (kind, expected) in [
+            ("sessions", "main-thread"),
+            ("busy", BUSY),
+            ("waiting", WAITING),
+        ] {
+            assert_eq!(
+                fs::read_to_string(base.join(kind).join(format!("{room}.txt"))).unwrap(),
+                expected
+            );
+        }
+        reporter.sync("main-thread", false, false, false, false);
+        assert_eq!(
+            fs::read_to_string(base.join("busy").join(format!("{room}.txt"))).unwrap(),
+            IDLE
+        );
+        assert_eq!(
+            fs::read_to_string(base.join("waiting").join(format!("{room}.txt"))).unwrap(),
+            READY
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_reader_lock_does_not_permanently_lose_the_running_state() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = env::temp_dir().join(format!("devezvibe-lock-{}-{nonce}", process::id()));
+        let room = "room-test";
+        assert!(try_claim_owner(&base, room, "root"));
+        let mut reporter = Reporter {
+            base: base.clone(),
+            room: room.to_owned(),
+            owner_token: "root".to_owned(),
+            session: "main-thread".to_owned(),
+            activity: Activity::Idle,
+            waiting: false,
+        };
+        assert!(reporter.write("busy", IDLE));
+        let path = base.join("busy").join(format!("{room}.txt"));
+        // DevezCode reads with FileShare.ReadWrite, excluding delete/rename.
+        let reader = OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&path)
+            .unwrap();
+        reporter.sync("main-thread", true, false, false, false);
+        assert_eq!(fs::read_to_string(&path).unwrap(), IDLE);
+        drop(reader);
+        reporter.sync("main-thread", true, false, false, false);
+        assert_eq!(fs::read_to_string(&path).unwrap(), BUSY);
+        let reader = OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&path)
+            .unwrap();
+        reporter.sync("main-thread", false, false, false, false);
+        assert_eq!(fs::read_to_string(&path).unwrap(), BUSY);
+        drop(reader);
+        reporter.sync("main-thread", false, false, false, false);
+        assert_eq!(fs::read_to_string(&path).unwrap(), IDLE);
+        fs::remove_dir_all(base).unwrap();
     }
 }

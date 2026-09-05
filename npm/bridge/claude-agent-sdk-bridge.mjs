@@ -5,7 +5,7 @@ import { execFile, spawn } from "node:child_process";
 import { createReadStream, existsSync, readFileSync, readdirSync } from "node:fs";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve as resolvePath, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import {
@@ -722,7 +722,83 @@ function makeOptions(params, sessionId, resume) {
   else options.sessionId = sessionId;
   options.canUseTool = (toolName, input, permission) =>
     requestToolPermission(toolName, input, permission);
+  // Hooks run whatever the permission mode, so a read-only role turn holds even
+  // under bypass. The policy itself arrives with each prompt.
+  options.hooks = {
+    PreToolUse: [{ hooks: [(input) => toolPolicyHook(sessionId, input)] }],
+  };
   return options;
+}
+
+// A turn under a read-only role (Planner, Reviewer) carries a tool policy:
+// `{ readOnly: true, writableRoots: [...] }`. The role prompt states the same
+// boundary; this keeps it when the model forgets. File tools are judged by the
+// path they touch, shell tools by the shape of the command — a deny names the
+// rule so the model can continue read-only instead of retrying.
+const FILE_WRITING_TOOLS = ["Edit", "MultiEdit", "Write", "NotebookEdit"];
+const SHELL_TOOLS = ["Bash", "PowerShell"];
+const MUTATING_SHELL_PATTERNS = [
+  // Any git invocation naming a mutating subcommand, whatever global options
+  // (`-C .`, `-c key=value`) sit between `git` and the verb.
+  /\bgit\b[^|;&\n]*\b(?:commit|push|pull|merge|rebase|reset|checkout|switch|restore|stash|clean|add|rm|mv|cherry-pick|revert|tag|am|apply|notes|update-ref|symbolic-ref)\b/,
+  /\bgit\b[^|;&\n]*\bbranch\s+(?:-[dDmMcCf]|--delete|--move|--copy|--force)\b/,
+  /(?:^|[\s;&|(`])(?:rm|rmdir|mv|cp|mkdir|touch|tee|truncate|chmod|chown|ln|dd|patch|install|shred)\s/,
+  /\bsed\s+(?:-[a-zA-Z]*i|--in-place)/,
+  /\bperl\s+(?:-\S+\s+)*-\S*i\S*\s/,
+  /\b(?:npm|pnpm|yarn|bun)\s+(?:i|install|add|remove|rm|uninstall|publish|ci|link|update|up)\b/,
+  /\bcargo\s+(?:add|remove|install|publish|clean|fix|update|fmt)\b/,
+  /\bpip3?\s+(?:install|uninstall)\b/,
+  // A redirect into a file. `2>&1`, `>/dev/null`, `> nul`, `->` and `>=` pass.
+  /(?:^|[^<>=-])>{1,2}(?!\s*(?:&|=|\/dev\/null\b|nul\b))/i,
+  /\b(?:Set-Content|Add-Content|Out-File|Remove-Item|Move-Item|Copy-Item|New-Item|Rename-Item|Clear-Content|Set-ItemProperty|Export-Csv|Export-Clixml)\b/i,
+];
+
+function pathWithin(cwd, root, target) {
+  const normalize = (value) => {
+    const resolved = resolvePath(cwd, value).replace(/[\\/]+$/, "");
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  };
+  const base = normalize(root);
+  const candidate = normalize(target);
+  return candidate === base || candidate.startsWith(base + sep) || candidate.startsWith(`${base}/`);
+}
+
+// The reason a tool call is denied under the policy, or null when it may run.
+function toolPolicyDecision(policy, cwd, toolName, input) {
+  if (!policy || policy.readOnly !== true) return null;
+  const roots = Array.isArray(policy.writableRoots) ? policy.writableRoots.filter(Boolean) : [];
+  if (FILE_WRITING_TOOLS.includes(toolName)) {
+    const target = input?.file_path ?? input?.notebook_path ?? input?.path;
+    if (typeof target === "string" && roots.some((root) => pathWithin(cwd, root, target))) return null;
+    return roots.length
+      ? `이 역할은 읽기 전용입니다. 파일 쓰기는 ${roots.join(", ")} 아래에만 허용되며 요청한 경로는 ${target ?? "(없음)"}입니다. 다른 파일은 고치지 말고 계획에만 적습니다.`
+      : `이 역할은 읽기 전용입니다. ${toolName} 도구로 파일을 만들거나 고칠 수 없습니다. 발견한 내용은 보고에 남기고, 수정은 사용자가 역할을 바꾼 뒤 진행합니다.`;
+  }
+  if (SHELL_TOOLS.includes(toolName)) {
+    const command = String(input?.command ?? "");
+    if (MUTATING_SHELL_PATTERNS.some((pattern) => pattern.test(command))) {
+      return `이 역할은 읽기 전용입니다. 파일이나 저장소 상태를 바꾸는 명령은 실행할 수 없습니다: ${command.slice(0, 160)}. 읽기 명령과 Read·Grep·Glob 도구만 사용하고, 결과를 바꾸는 작업은 보고에 남깁니다.`;
+    }
+  }
+  return null;
+}
+
+async function toolPolicyHook(sessionId, input) {
+  const session = lookupSession(sessionId);
+  const reason = toolPolicyDecision(
+    session?.toolPolicy,
+    session?.cwd || process.cwd(),
+    input?.tool_name,
+    input?.tool_input,
+  );
+  if (!reason) return {};
+  return {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: reason,
+    },
+  };
 }
 
 async function startAgentQuery(prompt, options) {
@@ -1258,6 +1334,7 @@ async function createSession(params, resumeId) {
     permissionMode: BOOTSTRAP_PERMISSION_MODE,
     permissionModeVerified: false,
     bypassUnavailable: false,
+    toolPolicy: null,
     models: [],
     queue,
     query: null,
@@ -2711,6 +2788,11 @@ async function runPrompt(session, params) {
     await session.query.applyFlagSettings({ effortLevel: effort });
   }
   session.effort = effort;
+  // The role's read-only policy, or none: it binds this turn and the background
+  // work it starts, until the next prompt replaces it.
+  session.toolPolicy = params.toolPolicy && typeof params.toolPolicy === "object"
+    ? params.toolPolicy
+    : null;
   const content = await inputContent(params.input, params.handoffContext);
   const turnId = beginTurn(session, params.input);
   session.queue.push({
@@ -3453,8 +3535,56 @@ async function runPermissionModeSelfTest() {
   }
 }
 
+function runToolPolicySelfTest() {
+  const cwd = process.platform === "win32" ? "C:\\repo" : "/repo";
+  const reviewer = { readOnly: true, writableRoots: [] };
+  const planner = { readOnly: true, writableRoots: ["docs/plans"] };
+  const allowed = [
+    [null, "Edit", { file_path: "src/main.rs" }],
+    [{ readOnly: false }, "Bash", { command: "rm -rf target" }],
+    [reviewer, "Read", { file_path: "src/main.rs" }],
+    [reviewer, "Bash", { command: "git diff --stat HEAD~1" }],
+    [reviewer, "Bash", { command: "git log --oneline -5 && git status --porcelain" }],
+    [reviewer, "Bash", { command: "grep -rn \"->\" src | head -20" }],
+    [reviewer, "Bash", { command: "cargo test reviewer 2>&1 | tail -20" }],
+    [reviewer, "Bash", { command: "cargo test > /dev/null 2>&1; echo $?" }],
+    [reviewer, "Bash", { command: "awk '$3 >= 10' report.txt" }],
+    [reviewer, "PowerShell", { command: "Get-Content src/main.rs | Select-Object -First 5" }],
+    [planner, "Write", { file_path: "docs/plans/2026-09-05-x.md" }],
+    [planner, "Write", { file_path: `${cwd}${sep}docs${sep}plans${sep}x.md` }],
+  ];
+  const denied = [
+    [reviewer, "Edit", { file_path: "src/main.rs" }],
+    [reviewer, "Write", { file_path: "docs/plans/x.md" }],
+    [reviewer, "NotebookEdit", { notebook_path: "a.ipynb" }],
+    [planner, "Write", { file_path: "src/main.rs" }],
+    [planner, "Write", { file_path: "docs/plans/../../src/main.rs" }],
+    [planner, "Write", { file_path: "docs/plans-old/x.md" }],
+    [reviewer, "Bash", { command: "git commit -m 'x'" }],
+    [reviewer, "Bash", { command: "git -C . checkout -- src" }],
+    [reviewer, "Bash", { command: "echo hi > notes.txt" }],
+    [reviewer, "Bash", { command: "cat a >> b.log" }],
+    [reviewer, "Bash", { command: "sed -i 's/a/b/' src/main.rs" }],
+    [reviewer, "Bash", { command: "rm -rf target" }],
+    [reviewer, "Bash", { command: "cargo fmt" }],
+    [reviewer, "PowerShell", { command: "Set-Content -Path a.txt -Value x" }],
+  ];
+  for (const [policy, tool, input] of allowed) {
+    const reason = toolPolicyDecision(policy, cwd, tool, input);
+    if (reason !== null) {
+      throw new Error(`Claude tool policy self-test denied ${tool} ${JSON.stringify(input)}: ${reason}`);
+    }
+  }
+  for (const [policy, tool, input] of denied) {
+    if (toolPolicyDecision(policy, cwd, tool, input) === null) {
+      throw new Error(`Claude tool policy self-test allowed ${tool} ${JSON.stringify(input)}`);
+    }
+  }
+}
+
 async function runSelfTest() {
   await runPermissionModeSelfTest();
+  runToolPolicySelfTest();
   const equivalentCwd = process.platform === "win32"
     ? sameCwd("D:\\Repo", "d:/repo/")
     : sameCwd("/tmp/repo", "/tmp/repo/");

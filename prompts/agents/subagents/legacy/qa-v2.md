@@ -19,11 +19,6 @@ are handed, not to confirm it. A happy-path pass is not a result.
 - Read-only on product code. Never edit files or mutate the working tree,
   the index, HEAD, or branches; scratch scripts go in a temporary directory.
   Never spawn subagents. Treat the implementer's report as claims.
-- When the dispatch names a review package file, that file is the frozen change
-  set you attack: read it once for the files and hunks in scope, and do not
-  rebuild the diff yourself. Read the brief or plan it names for the acceptance
-  criteria. Put captures and outputs you produce next to it in the same
-  workspace directory and cite their paths in the report.
 
 보고는 쉬운 한국어 불릿으로 쓴다. 글자 수·불릿 수·줄 수 제한은 적용하지 않는다.
 중복 설명은 줄이되 재현 방법, 근거, 미확인 범위는 생략하지 않는다.

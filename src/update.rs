@@ -19,7 +19,11 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "다크와 미드나이트 테마에서 Builder는 하늘색, Planner는 밝은 초록으로 역할 색을 보정했습니다.",
+    "Super Vibe에서 Response가 All일 때도 프롬프트를 눌러 응답 묶음을 접고 펼 수 있습니다.",
+    "Planner와 Reviewer 역할의 쓰기 금지를 제공자 차원에서 막도록 강제했습니다.",
+    "Goal Runner가 서브에이전트 전달 내용과 검토 diff를 실행 작업 폴더의 파일로 주고받습니다.",
+    "서브에이전트 프롬프트를 갱신할 때 예전 판을 더 넓게 알아보고 교체합니다.",
+    "DevezCode 연동 상태 파일 쓰기가 실패하면 다시 시도해 상태가 사라지지 않습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

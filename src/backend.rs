@@ -600,7 +600,8 @@ impl BackendServer {
                                     "model": params.get("model").cloned().unwrap_or(Value::Null),
                                     "effort": params.get("effort").cloned().unwrap_or(Value::Null),
                                     "permissionMode": CLAUDE_PREFERRED_PERMISSION_MODE,
-                                    "handoffContext": turn_context
+                                    "handoffContext": turn_context,
+                                    "toolPolicy": params.get("toolPolicy").cloned().unwrap_or(Value::Null)
                                 }),
                             )
                             .await
@@ -633,6 +634,7 @@ impl BackendServer {
                     } else {
                         let backing = self.ensure_codex_route(&visible, &params).await?;
                         prepare_codex_turn_context(&mut params);
+                        apply_codex_tool_policy(&mut params);
                         params["threadId"] = json!(backing);
                         self.codex()?.request(method, params).await
                     }
@@ -2422,6 +2424,32 @@ fn prepare_codex_turn_context(params: &mut Value) {
     context.remove("claude-devez-vibe-reminder");
 }
 
+/// Codex built-in permission profile that lets a turn read but not write.
+const CODEX_READ_ONLY_PROFILE: &str = ":read-only";
+
+/// A role turn that may write nothing runs under Codex's read-only profile.
+/// The profile rides the same `permissions` key every turn already carries, so
+/// the next turn under a writing role restores the full-access profile on its
+/// own. Codex has no path-scoped allowance, so a policy with writable roots —
+/// Planner and its plan document — stays a prompt-level contract there. The
+/// host-side key itself never reaches the app-server.
+fn apply_codex_tool_policy(params: &mut Value) {
+    let Some(policy) = params
+        .as_object_mut()
+        .and_then(|params| params.remove("toolPolicy"))
+    else {
+        return;
+    };
+    let read_only = policy.get("readOnly").and_then(Value::as_bool) == Some(true);
+    let writes_nothing = policy
+        .get("writableRoots")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty);
+    if read_only && writes_nothing {
+        params["permissions"] = json!(CODEX_READ_ONLY_PROFILE);
+    }
+}
+
 fn combined_turn_instructions(params: &Value, runtime: RuntimeKind) -> Option<String> {
     // Claude holds the full rules as its system prompt and Codex as its thread
     // instructions, so neither turn restates them. OpenCode has no standing
@@ -3094,6 +3122,32 @@ mod tests {
         assert!(!context.contains("oldold"));
         assert!(context.contains("오래된 기록 1개"));
         assert!(context.chars().count() <= PROVIDER_HANDOFF_MAX_CHARS);
+    }
+
+    /// Reviewer turns run read-only on Codex; Planner keeps its plan-document
+    /// allowance, which Codex cannot express, so its turn is left alone. The
+    /// host-side key never goes out in either case.
+    #[test]
+    fn a_write_nothing_policy_switches_codex_to_the_read_only_profile() {
+        let mut reviewer = json!({
+            "permissions": ":danger-full-access",
+            "toolPolicy": crate::agent::AgentMode::Reviewer.tool_policy()
+        });
+        apply_codex_tool_policy(&mut reviewer);
+        assert_eq!(reviewer["permissions"], ":read-only");
+        assert!(reviewer.get("toolPolicy").is_none());
+
+        let mut planner = json!({
+            "permissions": ":danger-full-access",
+            "toolPolicy": crate::agent::AgentMode::Planner.tool_policy()
+        });
+        apply_codex_tool_policy(&mut planner);
+        assert_eq!(planner["permissions"], ":danger-full-access");
+        assert!(planner.get("toolPolicy").is_none());
+
+        let mut builder = json!({ "permissions": ":danger-full-access" });
+        apply_codex_tool_policy(&mut builder);
+        assert_eq!(builder, json!({ "permissions": ":danger-full-access" }));
     }
 
     #[test]
