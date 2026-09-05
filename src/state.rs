@@ -4087,7 +4087,9 @@ impl AppState {
             || self.host_loading
             || !self.queued_prompts.is_empty()
             || !self.subagents.is_empty()
-            || !self.codex_subagents.is_empty()
+            // Codex child metadata outlives the child for the whole thread; only
+            // one still running can open a follow-up turn.
+            || self.codex_subagents.values().any(|child| !child.terminal)
     }
 
     /// The next turn carries the new role's block, which supersedes the one
@@ -4125,11 +4127,29 @@ impl AppState {
         }
         self.set_agent_mode(AgentMode::GoalRunner);
         if self.agent_mode != AgentMode::GoalRunner {
+            // The Planner was told the host continues on its own, so a blocked
+            // switch must say that it did not, and what to do instead.
+            self.set_composer_notice(
+                "• Goal Runner 자동 전환이 막혔습니다. Tab 또는 /agent goal-runner로 직접 전환하세요."
+                    .to_owned(),
+            );
             return false;
         }
         self.queued_prompts
-            .push_back(format!("{plan} 계획을 Goal Runner로 실행해줘."));
+            .push_back(format!("{plan}{PLANNER_HANDOFF_PROMPT_SUFFIX}"));
         true
+    }
+
+    /// Interrupting the Planner turn after approving the handoff withdraws the
+    /// approval: the queued follow-up goes, and the role returns to Planner so
+    /// the next prompt is not silently sent as Goal Runner.
+    fn cancel_agent_handoff(&mut self) {
+        let before = self.queued_prompts.len();
+        self.queued_prompts
+            .retain(|prompt| !prompt.ends_with(PLANNER_HANDOFF_PROMPT_SUFFIX));
+        if self.queued_prompts.len() != before && self.agent_mode == AgentMode::GoalRunner {
+            self.agent_mode = AgentMode::Planner;
+        }
     }
 
     fn cycle_agent_mode(&mut self) -> Action {
@@ -6014,6 +6034,7 @@ impl AppState {
     /// app-server announces that a just-started turn is active.
     fn request_interrupt(&mut self) -> Action {
         self.discard_unanswered_turn_prompts();
+        self.cancel_agent_handoff();
         // Before `thread/start` binds a session, the main-loop startup helper
         // owns queued-prompt cancellation. Keep its established Ctrl+C/Esc
         // path rather than treating that as a pending turn.
@@ -10589,7 +10610,9 @@ impl AppState {
                             } else {
                                 answers.insert(question.id.clone(), vec![answer]);
                             }
-                            return next_question_or_reply(id, questions, current, answers, self);
+                            return next_question_or_typed_reply(
+                                id, questions, current, answers, self,
+                            );
                         }
                         // Claude Code makes `Other` an input option rather than a
                         // second mode. The arrows simply move focus away while the
@@ -13958,12 +13981,37 @@ fn next_question_or_reply(
     answers: BTreeMap<String, Vec<String>>,
     state: &mut AppState,
 ) -> Action {
+    advance_question(id, questions, current, answers, state, false)
+}
+
+/// Same as `next_question_or_reply`, for an answer typed into the free-text
+/// row: it never counts as the Planner handoff approval, even when it spells
+/// the execute label.
+fn next_question_or_typed_reply(
+    id: Value,
+    questions: Vec<Question>,
+    current: usize,
+    answers: BTreeMap<String, Vec<String>>,
+    state: &mut AppState,
+) -> Action {
+    advance_question(id, questions, current, answers, state, true)
+}
+
+fn advance_question(
+    id: Value,
+    questions: Vec<Question>,
+    current: usize,
+    answers: BTreeMap<String, Vec<String>>,
+    state: &mut AppState,
+    typed: bool,
+) -> Action {
     if current + 1 == questions.len() {
         commit_user_input_answers(state, &questions, &answers);
         // An approved Planner handoff continues on its own: the structured
         // answer (not free text) arms the role switch and queues the
         // follow-up, which the turn-completion drain starts under Goal Runner.
-        if state.agent_mode == AgentMode::Planner
+        if !typed
+            && state.agent_mode == AgentMode::Planner
             && let Some(plan) = planner_handoff_plan_path(&questions, &answers)
         {
             state.request_agent_handoff(&plan);
@@ -13980,6 +14028,9 @@ fn next_question_or_reply(
 /// below is matched on structured input, never on prose.
 const PLANNER_HANDOFF_HEADER: &str = "Planner Handoff";
 const PLANNER_HANDOFF_EXECUTE_LABEL: &str = "Goal Runner로 실행";
+/// Tail of the queued follow-up, so interrupting can tell it from a prompt the
+/// user queued by hand.
+const PLANNER_HANDOFF_PROMPT_SUFFIX: &str = " 계획을 Goal Runner로 실행해줘.";
 
 /// The plan document approved for automatic execution, if these answers are
 /// the Planner handoff's execute choice. Anything else — refine, stop,
@@ -14014,10 +14065,25 @@ fn planner_handoff_plan_path(
     extract_plan_path(&question.question)
 }
 
-/// First `docs/plans/*.md` path in the question text. Backticks, quotes and
-/// trailing punctuation around it are not part of the path.
+/// The `docs/plans/*.md` path the question names. The contract wraps the saved
+/// path in backticks, so a backticked path wins over a bare mention (an earlier
+/// plan in the goal sentence, the folder itself); otherwise the first complete
+/// path counts. Backticks, quotes and trailing punctuation are not part of it.
 fn extract_plan_path(text: &str) -> Option<String> {
-    let start = text.find("docs/plans/")?;
+    let mut first = None;
+    for (start, _) in text.match_indices("docs/plans/") {
+        let Some(path) = plan_path_at(text, start) else {
+            continue;
+        };
+        if text[..start].ends_with('`') {
+            return Some(path);
+        }
+        first.get_or_insert(path);
+    }
+    first
+}
+
+fn plan_path_at(text: &str, start: usize) -> Option<String> {
     let rest = &text[start..];
     let end = rest
         .find(|c: char| {
@@ -23385,11 +23451,97 @@ mod tests {
             state.queued_prompts.iter().collect::<Vec<_>>(),
             [&"earlier prompt".to_owned()]
         );
+        // The Planner was told the host continues, so the notice must say it
+        // did not and how to continue by hand.
         assert!(
             state
                 .composer_notice
                 .as_ref()
-                .is_some_and(|(notice, _)| notice.contains("Agent를 변경할 수 있습니다"))
+                .is_some_and(|(notice, _)| notice.contains("직접 전환하세요"))
+        );
+    }
+
+    /// A Codex child that has finished keeps its metadata for the thread, but
+    /// only a running one freezes the role. Otherwise the Planner's review
+    /// gate (a subagent) would block every handoff on Codex.
+    #[test]
+    fn a_finished_codex_subagent_no_longer_blocks_role_changes() {
+        let mut state = test_state();
+        let child = "00000000-0000-0000-0000-000000000102";
+        spawn_codex_subagent(&mut state, child);
+        state.busy = false;
+        assert_eq!(state.subagents.len(), 1);
+        state.set_agent_mode(AgentMode::Planner);
+        assert_eq!(state.agent_mode, AgentMode::Standard, "a running child blocks");
+
+        state.finish_codex_subagent(child);
+        assert!(state.subagents.is_empty());
+        assert!(state.codex_subagents[child].terminal);
+        state.set_agent_mode(AgentMode::Planner);
+        assert_eq!(state.agent_mode, AgentMode::Planner);
+        assert!(state.request_agent_handoff("docs/plans/2026-09-05-x.md"));
+        assert_eq!(state.agent_mode, AgentMode::GoalRunner);
+    }
+
+    /// Interrupting the Planner's closing turn after approving withdraws the
+    /// approval: the follow-up leaves the queue and the role returns to
+    /// Planner, while a prompt the user queued by hand stays.
+    #[test]
+    fn interrupting_after_approval_drops_the_handoff_and_returns_to_planner() {
+        let mut state = busy_state_with_live_turn();
+        state.set_agent_mode(AgentMode::Planner);
+        assert!(state.request_agent_handoff("docs/plans/2026-09-05-x.md"));
+        state.queued_prompts.push_back("later prompt".to_owned());
+
+        assert!(matches!(state.request_interrupt(), Action::Interrupt));
+
+        assert_eq!(state.agent_mode, AgentMode::Planner);
+        assert_eq!(
+            state.queued_prompts.iter().collect::<Vec<_>>(),
+            [&"later prompt".to_owned()]
+        );
+    }
+
+    /// Typing the execute label into the free-text row is not the structured
+    /// approval, so it never arms the switch.
+    #[test]
+    fn typed_execute_label_is_not_a_handoff_approval() {
+        let mut state = idle_test_state();
+        state.set_agent_mode(AgentMode::Planner);
+        let questions =
+            handoff_questions("`docs/plans/2026-09-05-x.md` Goal Runner로 이어서 진행할까요?");
+
+        let action = next_question_or_typed_reply(
+            json!(1),
+            questions,
+            0,
+            handoff_answers("Goal Runner로 실행"),
+            &mut state,
+        );
+
+        assert!(matches!(action, Action::RpcResponse { .. }));
+        assert_eq!(state.agent_mode, AgentMode::Planner);
+        assert!(state.queued_prompts.is_empty());
+    }
+
+    #[test]
+    fn handoff_plan_path_prefers_the_backticked_path() {
+        // The folder itself, then the saved path.
+        assert_eq!(
+            extract_plan_path("docs/plans/ 아래 `docs/plans/2026-09-05-x.md`에 저장했습니다."),
+            Some("docs/plans/2026-09-05-x.md".to_owned())
+        );
+        // An earlier plan named bare in the goal sentence does not win.
+        assert_eq!(
+            extract_plan_path(
+                "docs/plans/2026-09-01-old.md 를 대체합니다. `docs/plans/2026-09-05-x.md` 실행할까요?"
+            ),
+            Some("docs/plans/2026-09-05-x.md".to_owned())
+        );
+        // Without backticks the first complete path counts.
+        assert_eq!(
+            extract_plan_path("docs/plans/2026-09-01-a.md 와 docs/plans/2026-09-05-b.md"),
+            Some("docs/plans/2026-09-01-a.md".to_owned())
         );
     }
 
