@@ -51,6 +51,10 @@ pub struct Rollout {
     pub events: Vec<RolloutEvent>,
     pub last_plan: Option<PlanSnapshot>,
     turn_contexts: Vec<(String, String)>,
+    /// The latest `token_count` record in the `thread/tokenUsage/updated` shape.
+    /// `thread/resume` carries no usage, so this is what the status line's
+    /// context reading and window resume from.
+    pub token_usage: Option<Value>,
 }
 
 impl Rollout {
@@ -208,6 +212,7 @@ pub fn parse(text: &str) -> Rollout {
     let mut events = Vec::new();
     let mut turn_contexts = Vec::new();
     let mut last_plan = None;
+    let mut token_usage = None;
     let mut plan_started_at = HashMap::new();
     let mut plan_elapsed = HashMap::new();
     // Exec calls whose output has not arrived yet: `call_id` → the indices in
@@ -230,6 +235,13 @@ pub fn parse(text: &str) -> Rollout {
             if let Some(model) = payload.get("model").and_then(Value::as_str) {
                 turn_contexts.push((ts, model.to_owned()));
             }
+            continue;
+        }
+        if payload.get("type").and_then(Value::as_str) == Some("token_count") {
+            token_usage = payload
+                .get("info")
+                .and_then(thread_token_usage)
+                .or(token_usage);
             continue;
         }
         match payload
@@ -367,7 +379,19 @@ pub fn parse(text: &str) -> Rollout {
         events,
         last_plan,
         turn_contexts,
+        token_usage,
     }
+}
+
+/// A rollout `token_count` `info` as the `ThreadTokenUsage` the app-server sends.
+/// Breakdowns keep Codex's snake_case, which the cost parser already reads.
+fn thread_token_usage(info: &Value) -> Option<Value> {
+    let last = info.get("last_token_usage")?;
+    Some(serde_json::json!({
+        "total": info.get("total_token_usage").cloned().unwrap_or(Value::Null),
+        "last": { "totalTokens": last.get("total_tokens").and_then(Value::as_u64).unwrap_or(0) },
+        "modelContextWindow": info.get("model_context_window").cloned().unwrap_or(Value::Null),
+    }))
 }
 
 fn plan_snapshot(input: &str) -> Option<PlanSnapshot> {
@@ -1042,6 +1066,19 @@ fn parse_wall_time_ms(output: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn latest_token_count_becomes_thread_token_usage() {
+        let rollout = parse(
+            r#"{"timestamp":"1","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11},"last_token_usage":{"total_tokens":11},"model_context_window":828400}}}
+{"timestamp":"2","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":90,"output_tokens":2,"total_tokens":102},"last_token_usage":{"total_tokens":92653},"model_context_window":828400}}}"#,
+        );
+
+        let usage = rollout.token_usage.expect("token usage");
+        assert_eq!(usage["last"]["totalTokens"], 92_653);
+        assert_eq!(usage["modelContextWindow"], 828_400);
+        assert_eq!(usage["total"]["cached_input_tokens"], 90);
+    }
 
     #[test]
     fn update_plan_call_keeps_the_latest_plan_snapshot() {

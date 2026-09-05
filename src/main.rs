@@ -421,7 +421,7 @@ async fn start_session(
     if is_resuming {
         state.load_history(&thread, rollout.as_ref());
         state.begin_cost_restore();
-        apply_resumed_token_usage(state, &thread_response);
+        apply_resumed_token_usage(state, &thread_response, rollout.as_ref());
     }
     state.set_host_loading(false);
     run_after_startup(server, state, renderer, queued).await
@@ -4001,7 +4001,7 @@ async fn resume_into_state(
     };
     state.load_history(&history, rollout.as_ref());
     state.begin_cost_restore();
-    apply_resumed_token_usage(state, &response);
+    apply_resumed_token_usage(state, &response, rollout.as_ref());
     state.set_host_loading(false);
     Ok(Switched::Done(queued))
 }
@@ -6106,11 +6106,18 @@ async fn read_runtime_account_plan(server: &BackendServer, model: &str) -> Accou
 
 /// Claude only reports usage when a turn ends, so a resumed session would show an
 /// empty context on the status line. The bridge replays the stored totals instead.
-fn apply_resumed_token_usage(state: &mut AppState, response: &Value) {
+/// Codex's `thread/resume` carries no `tokenUsage`, so its context reading and
+/// window fall back to the last `token_count` the rollout recorded.
+fn apply_resumed_token_usage(
+    state: &mut AppState,
+    response: &Value,
+    rollout: Option<&rollout::Rollout>,
+) {
     let Some(usage) = response
         .get("tokenUsage")
         .filter(|value| !value.is_null())
         .cloned()
+        .or_else(|| rollout.and_then(|rollout| rollout.token_usage.clone()))
     else {
         return;
     };
