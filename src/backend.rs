@@ -3156,6 +3156,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn response_length_caps_reach_only_builder_on_every_provider() {
+        for role in crate::agent::BUILTIN {
+            for vibe in [crate::VibeMode::Normal, crate::VibeMode::Vibe, crate::VibeMode::SuperVibe] {
+                let mut params = crate::new_thread_params(
+                    ".", None, None, "startup", "low", "default", "high",
+                );
+                params["additionalContext"] = crate::turn_additional_context(vibe, role);
+                for runtime in [RuntimeKind::Codex, RuntimeKind::Claude, RuntimeKind::OpenCode] {
+                    let outgoing = match runtime {
+                        RuntimeKind::Codex => {
+                            let mut turn = params.clone();
+                            prepare_codex_turn_context(&mut turn);
+                            format!("{}\n{}", turn["developerInstructions"], turn["additionalContext"])
+                        }
+                        RuntimeKind::Claude => format!(
+                            "{}\n{}",
+                            claude_session_params(&params, Path::new("."), None)["systemPrompt"],
+                            combined_turn_instructions(&params, runtime).unwrap(),
+                        ),
+                        RuntimeKind::OpenCode => combined_turn_instructions(&params, runtime).unwrap(),
+                    };
+                    for cap in ["200자", "불릿 두세 개", "불릿 하나에 두 문장", "수정이 셋을 넘으면"] {
+                        assert_eq!(
+                            outgoing.contains(cap),
+                            role == crate::agent::AgentMode::Standard,
+                            "{} / {} / {}: {cap}",
+                            runtime.label(), role.id(), vibe.label(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// A Standard turn with its reset already spent sends no role key, and the
     /// combined instructions have to look exactly as they did before roles.
     #[test]

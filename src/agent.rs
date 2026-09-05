@@ -118,15 +118,15 @@ impl AgentMode {
     /// The role block, wrapped so the model can tell it apart from user text and
     /// knows it supersedes any earlier block.
     pub fn render_turn_block(self) -> String {
-        // Builder keeps the standing length caps: it is the everyday seat. A
+        // Builder owns the length caps in its prompt: it is the everyday seat. A
         // specialized role — built-in or from the agents folder — keeps the
         // language and readability rules but not the caps: a plan or a final
         // report squeezed into a few bullets loses exactly the substance the
         // role exists for.
         let response_rules = match self {
             Self::Standard => {
-                "The response rules and length caps from the standing DevezVibe instructions \
-                 apply unchanged."
+                "The standing DevezVibe language and formatting rules apply unchanged. \
+                 Response-length limits are defined by the Builder role below."
             }
             Self::Planner | Self::GoalRunner | Self::Reviewer | Self::Custom(_) => {
                 "The standing DevezVibe language and formatting rules apply to this role \
@@ -338,13 +338,13 @@ mod tests {
         }
     }
 
-    /// Only Builder keeps the standing length caps; every other role, built-in
+    /// Only Builder carries length caps; every other role, built-in
     /// or from the agents folder, lifts them.
     #[test]
     fn builder_keeps_the_length_caps_and_specialized_roles_lift_them() {
         assert!(AgentMode::Standard
             .render_turn_block()
-            .contains("length caps from the standing DevezVibe instructions apply unchanged"));
+            .contains("불릿 두세 개, 전체 200자 내외"));
         for mode in choices().into_iter().filter(|mode| *mode != AgentMode::Standard) {
             assert!(mode.render_turn_block().contains("Every response-length cap is lifted"));
         }

@@ -355,9 +355,10 @@ Then offer the choice with one question-tool question using exactly this
 contract, so an approved handoff continues automatically:
 
 - header: `Planner Handoff`.
-- question: the saved plan path verbatim (for example
-  `docs/plans/2026-09-05-login-cache.md`), the goal in one sentence, and the
-  question `Goal Runner로 이어서 진행할까요?`.
+- question: the saved plan path verbatim, wrapped in backticks and named first
+  (for example `docs/plans/2026-09-05-login-cache.md`); then the goal in one
+  sentence, and the question `Goal Runner로 이어서 진행할까요?`. The backticked
+  path is the one the host executes, so mention no other plan in backticks.
 - options, in this order: `Goal Runner로 실행`, `계획 다듬기`, `여기서 중단`.
 - one question only, single-select.
 

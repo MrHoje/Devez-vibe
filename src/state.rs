@@ -3538,6 +3538,9 @@ pub struct AppState {
     /// The draft `Ctrl+S` set aside, waiting for the chord that brings it back.
     stashed_prompt: Option<StashedPrompt>,
     queued_prompts: VecDeque<String>,
+    /// The Planner handoff's follow-up while it waits in the queue, so the
+    /// queue paths can tell it from prompts the user queued by hand.
+    handoff_prompt: Option<String>,
     /// Prompts steered into a running turn, held back from the transcript until
     /// the response text already in flight lands. Committing them at Enter time
     /// would split that answer: the record would read prompt-then-old-answer.
@@ -3851,6 +3854,7 @@ impl AppState {
             composer_images: Vec::new(),
             stashed_prompt: None,
             queued_prompts: VecDeque::new(),
+            handoff_prompt: None,
             pending_steer_prompts: Vec::new(),
             agent_mode: AgentMode::Standard,
             active_turn_agent: AgentMode::Standard,
@@ -4086,10 +4090,9 @@ impl AppState {
             || self.provider_switch_pending()
             || self.host_loading
             || !self.queued_prompts.is_empty()
+            // A running Codex child sits in `subagents` too; its metadata map
+            // outlives it for the whole thread and must not freeze the role.
             || !self.subagents.is_empty()
-            // Codex child metadata outlives the child for the whole thread; only
-            // one still running can open a follow-up turn.
-            || self.codex_subagents.values().any(|child| !child.terminal)
     }
 
     /// The next turn carries the new role's block, which supersedes the one
@@ -4130,26 +4133,35 @@ impl AppState {
             // The Planner was told the host continues on its own, so a blocked
             // switch must say that it did not, and what to do instead.
             self.set_composer_notice(
-                "• Goal Runner 자동 전환이 막혔습니다. Tab 또는 /agent goal-runner로 직접 전환하세요."
+                "• Goal Runner 자동 전환이 막혔습니다. 현재 작업이 끝난 뒤 Tab 또는 /agent goal-runner로 직접 전환하세요."
                     .to_owned(),
             );
             return false;
         }
-        self.queued_prompts
-            .push_back(format!("{plan}{PLANNER_HANDOFF_PROMPT_SUFFIX}"));
+        let prompt = format!("{plan} 계획을 Goal Runner로 실행해줘.");
+        self.queued_prompts.push_back(prompt.clone());
+        self.handoff_prompt = Some(prompt);
         true
     }
 
-    /// Interrupting the Planner turn after approving the handoff withdraws the
-    /// approval: the queued follow-up goes, and the role returns to Planner so
-    /// the next prompt is not silently sent as Goal Runner.
+    /// Interrupting the Planner turn (or dropping the queued follow-up) after
+    /// approving the handoff withdraws the approval: the follow-up goes, and the
+    /// role returns to Planner so the next prompt is not silently sent as Goal
+    /// Runner. Prompts the user queued by hand are untouched.
     fn cancel_agent_handoff(&mut self) {
-        let before = self.queued_prompts.len();
-        self.queued_prompts
-            .retain(|prompt| !prompt.ends_with(PLANNER_HANDOFF_PROMPT_SUFFIX));
-        if self.queued_prompts.len() != before && self.agent_mode == AgentMode::GoalRunner {
+        let Some(prompt) = self.handoff_prompt.take() else {
+            return;
+        };
+        if let Some(index) = self.queued_prompts.iter().position(|queued| *queued == prompt) {
+            self.queued_prompts.remove(index);
+        }
+        if self.agent_mode == AgentMode::GoalRunner {
             self.agent_mode = AgentMode::Planner;
         }
+    }
+
+    fn is_handoff_prompt(&self, text: &str) -> bool {
+        self.handoff_prompt.as_deref() == Some(text)
     }
 
     fn cycle_agent_mode(&mut self) -> Action {
@@ -8872,11 +8884,32 @@ impl AppState {
         self.submit_text(text.clone(), text)
     }
 
+    /// The handoff stays armed until its prompt actually starts a turn (see
+    /// `submit_text`), since a drained prompt can bounce back into the queue.
     pub fn take_queued_prompt(&mut self) -> Option<String> {
         self.queued_prompts.pop_front()
     }
 
+    /// A prompt that could not start goes back to the queue. The handoff
+    /// follow-up returns to the front it drained from; anything else waits its
+    /// turn at the back.
+    fn requeue(&mut self, text: String) {
+        if self.is_handoff_prompt(&text) {
+            self.queued_prompts.push_front(text);
+        } else {
+            self.queued_prompts.push_back(text);
+        }
+    }
+
     pub fn remove_queued_prompt(&mut self, index: usize) -> bool {
+        if self
+            .queued_prompts
+            .get(index)
+            .is_some_and(|queued| self.is_handoff_prompt(queued))
+        {
+            self.cancel_agent_handoff();
+            return true;
+        }
         self.queued_prompts.remove(index).is_some()
     }
 
@@ -8911,13 +8944,13 @@ impl AppState {
             return action;
         }
         if self.provider_switch_pending() {
-            self.queued_prompts.push_back(text);
+            self.requeue(text);
             return Action::None;
         }
         // A prompt sent mid-compaction would race the summary the runtime is
         // still writing, so it waits in the queue like one sent during a turn.
         if self.compacting() && !self.busy {
-            self.queued_prompts.push_back(text);
+            self.requeue(text);
             return Action::None;
         }
         self.commit_welcome_card();
@@ -8925,6 +8958,10 @@ impl AppState {
         if !steering {
             self.active_turn_agent = self.agent_mode;
             self.reset_turn_item_tracking();
+            // The handoff follow-up starting its turn has been delivered.
+            if self.is_handoff_prompt(&text) {
+                self.handoff_prompt = None;
+            }
         }
         let started_at = Instant::now();
         if steering {
@@ -14028,9 +14065,6 @@ fn advance_question(
 /// below is matched on structured input, never on prose.
 const PLANNER_HANDOFF_HEADER: &str = "Planner Handoff";
 const PLANNER_HANDOFF_EXECUTE_LABEL: &str = "Goal Runner로 실행";
-/// Tail of the queued follow-up, so interrupting can tell it from a prompt the
-/// user queued by hand.
-const PLANNER_HANDOFF_PROMPT_SUFFIX: &str = " 계획을 Goal Runner로 실행해줘.";
 
 /// The plan document approved for automatic execution, if these answers are
 /// the Planner handoff's execute choice. Anything else — refine, stop,
@@ -14065,10 +14099,11 @@ fn planner_handoff_plan_path(
     extract_plan_path(&question.question)
 }
 
-/// The `docs/plans/*.md` path the question names. The contract wraps the saved
-/// path in backticks, so a backticked path wins over a bare mention (an earlier
-/// plan in the goal sentence, the folder itself); otherwise the first complete
-/// path counts. Backticks, quotes and trailing punctuation are not part of it.
+/// The `docs/plans/*.md` path the question names. The contract in
+/// `prompts/agents/planner.md` wraps the saved path in backticks, so a
+/// backticked path wins over a bare mention (an earlier plan in the goal
+/// sentence, the folder itself); otherwise the first complete path counts.
+/// Backticks, quotes and trailing punctuation are not part of it.
 fn extract_plan_path(text: &str) -> Option<String> {
     let mut first = None;
     for (start, _) in text.match_indices("docs/plans/") {
@@ -23269,6 +23304,8 @@ mod tests {
             "계획 다듬기",
             "여기서 중단",
             "Goal Runner로 이어서 진행할까요?",
+            // `extract_plan_path` prefers a backticked path on this promise.
+            "wrapped in backticks and named first",
         ] {
             assert!(
                 prompt.contains(literal),
@@ -23477,6 +23514,9 @@ mod tests {
         state.finish_codex_subagent(child);
         assert!(state.subagents.is_empty());
         assert!(state.codex_subagents[child].terminal);
+        // Metadata alone (a child remembered but never started) does not block
+        // either.
+        state.remember_codex_subagent("00000000-0000-0000-0000-000000000103");
         state.set_agent_mode(AgentMode::Planner);
         assert_eq!(state.agent_mode, AgentMode::Planner);
         assert!(state.request_agent_handoff("docs/plans/2026-09-05-x.md"));
@@ -23503,25 +23543,151 @@ mod tests {
     }
 
     /// Typing the execute label into the free-text row is not the structured
-    /// approval, so it never arms the switch.
+    /// approval, so it never arms the switch. Driven through the key handler so
+    /// the free-text wiring itself is what the test pins.
     #[test]
     fn typed_execute_label_is_not_a_handoff_approval() {
-        let mut state = idle_test_state();
+        let mut state = test_state();
         state.set_agent_mode(AgentMode::Planner);
-        let questions =
-            handoff_questions("`docs/plans/2026-09-05-x.md` Goal Runner로 이어서 진행할까요?");
-
-        let action = next_question_or_typed_reply(
+        state.begin_server_request(
             json!(1),
-            questions,
-            0,
-            handoff_answers("Goal Runner로 실행"),
-            &mut state,
+            "item/tool/requestUserInput",
+            &json!({
+                "questions": [{
+                    "id": "handoff",
+                    "header": "Planner Handoff",
+                    "question": "`docs/plans/2026-09-05-x.md` Goal Runner로 이어서 진행할까요?",
+                    "options": [
+                        { "label": "Goal Runner로 실행", "description": "" },
+                        { "label": "계획 다듬기", "description": "" },
+                        { "label": "여기서 중단", "description": "" }
+                    ],
+                    "isOther": true,
+                    "multiSelect": false
+                }]
+            }),
         );
+        // Down past the three options lands on the free-text row.
+        for _ in 0..3 {
+            state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        for c in "Goal Runner로 실행".chars() {
+            state.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+
+        let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert!(matches!(action, Action::RpcResponse { .. }));
         assert_eq!(state.agent_mode, AgentMode::Planner);
         assert!(state.queued_prompts.is_empty());
+        assert!(state.handoff_prompt.is_none());
+    }
+
+    /// Dropping the queued follow-up from the queue view withdraws the approval
+    /// like an interrupt does; a hand-queued prompt at the same spot is just
+    /// removed.
+    #[test]
+    fn removing_the_queued_handoff_returns_to_planner() {
+        let mut state = busy_state_with_live_turn();
+        state.set_agent_mode(AgentMode::Planner);
+        assert!(state.request_agent_handoff("docs/plans/2026-09-05-x.md"));
+
+        assert!(state.remove_queued_prompt(0));
+
+        assert_eq!(state.agent_mode, AgentMode::Planner);
+        assert!(state.queued_prompts.is_empty());
+
+        let mut state = busy_state_with_live_turn();
+        state.set_agent_mode(AgentMode::GoalRunner);
+        state.queued_prompts.push_back("by hand".to_owned());
+        assert!(state.remove_queued_prompt(0));
+        assert_eq!(state.agent_mode, AgentMode::GoalRunner);
+    }
+
+    /// Draining the follow-up into its Goal Runner turn clears the arm, so a
+    /// later interrupt of that turn does not touch the queue or the role.
+    #[test]
+    fn draining_the_handoff_clears_the_arm() {
+        let mut state = idle_test_state();
+        state.set_agent_mode(AgentMode::Planner);
+        assert!(state.request_agent_handoff("docs/plans/2026-09-05-x.md"));
+        let queued = state.take_queued_prompt().expect("handoff queued");
+        assert!(state.handoff_prompt.is_some(), "the arm holds until the turn starts");
+        assert!(matches!(state.start_queued_prompt(queued), Action::Submit(_)));
+        assert!(state.handoff_prompt.is_none());
+        state.turn_id = Some("goal-turn".to_owned());
+        state.queued_prompts.push_back("by hand".to_owned());
+
+        state.request_interrupt();
+
+        assert_eq!(state.agent_mode, AgentMode::GoalRunner);
+        assert_eq!(state.queued_prompts.len(), 1);
+    }
+
+    /// A drained handoff that cannot start yet (here: compaction in progress)
+    /// bounces back to the front of the queue with the arm still on, so a
+    /// later interrupt still withdraws it and spares the hand-queued prompt.
+    #[test]
+    fn a_bounced_handoff_returns_to_the_queue_front_still_armed() {
+        let mut state = idle_test_state();
+        state.set_agent_mode(AgentMode::Planner);
+        assert!(state.request_agent_handoff("docs/plans/2026-09-05-x.md"));
+        state.queued_prompts.push_back("by hand".to_owned());
+        let queued = state.take_queued_prompt().expect("handoff queued");
+        state.compacting_started_at = Some(Instant::now());
+
+        assert!(matches!(state.start_queued_prompt(queued), Action::None));
+
+        assert!(state.handoff_prompt.is_some());
+        assert_eq!(
+            state.queued_prompts.iter().collect::<Vec<_>>(),
+            [
+                &"docs/plans/2026-09-05-x.md 계획을 Goal Runner로 실행해줘.".to_owned(),
+                &"by hand".to_owned()
+            ]
+        );
+        state.turn_id = Some("live".to_owned());
+        state.request_interrupt();
+        assert_eq!(state.agent_mode, AgentMode::Planner);
+        assert_eq!(
+            state.queued_prompts.iter().collect::<Vec<_>>(),
+            [&"by hand".to_owned()]
+        );
+    }
+
+    /// A prompt the user submits while the handoff is armed and the turn cannot
+    /// start yet waits behind the follow-up, and an interrupt removes only the
+    /// follow-up: the handoff is identified by its text, never by position.
+    #[test]
+    fn a_bounced_user_prompt_never_displaces_the_armed_handoff() {
+        let mut state = idle_test_state();
+        state.set_agent_mode(AgentMode::Planner);
+        assert!(state.request_agent_handoff("docs/plans/2026-09-05-x.md"));
+        state.compacting_started_at = Some(Instant::now());
+
+        assert!(matches!(
+            state.start_queued_prompt("typed by the user".to_owned()),
+            Action::None
+        ));
+
+        assert!(state.handoff_prompt.is_some());
+        assert_eq!(
+            state.queued_prompts.iter().collect::<Vec<_>>(),
+            [
+                &"docs/plans/2026-09-05-x.md 계획을 Goal Runner로 실행해줘.".to_owned(),
+                &"typed by the user".to_owned()
+            ]
+        );
+        // Dropping the user's row from the queue view leaves the handoff armed.
+        assert!(state.remove_queued_prompt(1));
+        assert!(state.handoff_prompt.is_some());
+        assert_eq!(state.agent_mode, AgentMode::GoalRunner);
+
+        state.turn_id = Some("live".to_owned());
+        state.request_interrupt();
+        assert_eq!(state.agent_mode, AgentMode::Planner);
+        assert!(state.queued_prompts.is_empty());
+        assert!(state.handoff_prompt.is_none());
     }
 
     #[test]

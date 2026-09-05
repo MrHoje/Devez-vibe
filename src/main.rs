@@ -4410,8 +4410,11 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "필요한 경우에도 사용자 판단에 필요한 최소 범위만 쓴다.\n",
     "답변 형식 규칙:\n",
     "- 서론, 인사, 맺음말 요약을 쓰지 않고 결론부터 쓴다.\n",
+    "- 제공자나 역할과 관계없이 사용자에게 보이는 항목명·상태·판정은 쉬운 한국어로 쓴다. 영어 판정 코드는 기술 식별자로 취급하지 않는다. 다른 에이전트의 보고를 전달할 때도 이 규칙을 적용하되, 별도 규격이 있는 내부 기록은 유지한다.\n",
+    "- 내부 호출 관계나 약어를 나열하지 않고 사용자에게 생기는 영향과 필요한 조치를 먼저 설명한다. 근거 위치는 해당 설명 뒤에 필요한 만큼만 붙이고, 한 불릿에는 한 쟁점만 담는다.\n",
+    "- 짧게 쓰려고 띄어쓰기를 없애거나 서로 다른 쟁점을 압축하지 않는다. 중복 설명부터 줄이고, 판단에 필요한 근거·미확인 범위·후속 조치는 남긴다. 역할별 상세 보고 규칙이 있으면 그 분량을 따른다.\n",
     "- 이모티콘과 이모지를 쓰지 않는다. 답변, 진행 안내, Task 제목, 커밋 메시지 어디에도 넣지 않는다.\n",
-    "- 응답 모드와 관계없이 최종 답변은 가능한 한 불릿 두세 개, 전체 200자 내외로 쓰며 불릿 하나에 두 문장을 넘기지 않는다. 사용자가 자세한 설명을 요청할 때만 늘린다.\n",
+    "- 응답 분량은 현재 역할의 지침을 따른다. Builder 외 역할에는 글자 수·불릿 수·문장 수 제한을 적용하지 않는다.\n",
     "- 다만 사용자에게 선택이나 승인을 요청하는 답변에는 이 분량 제한을 적용하지 않는다. ",
     "고를 수 있는 선택지, 각 선택지의 결과, 판단에 필요한 사실을 하나도 빠뜨리지 않고 적고, ",
     "분량을 맞추려고 선택지를 줄이거나 문장을 도중에 끊지 않는다. ",
@@ -4456,11 +4459,7 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "사용자가 요청했거나 원인, 영향, 변경 범위, 실행 방법을 정확히 판단하는 데 꼭 필요한 경우가 아니면 ",
     "클래스명, 메서드명, 변수명 등 기술 식별자, 파일 경로, 명령어와 코드 조각을 답변에 쓰지 않는다. ",
     "필요한 경우에도 사용자 판단에 필요한 최소 범위만 쓴다.\n",
-    "최우선 분량 규칙: 응답 모드와 관계없이 최종 답변은 불릿 두세 개, 전체 200자 내외로 쓰고 불릿 하나에 두 문장을 넘기지 않는다. ",
-    "넘치면 문장을 다듬지 말고 덜 중요한 불릿을 통째로 지운다. 다른 규칙과 충돌하면 분량이 이긴다. ",
-    "정확성·보고 규칙은 이미 쓴 문장을 정확하게 만들라는 뜻이지 문장을 더 쓰라는 뜻이 아니다. ",
-    "사용자가 자세한 설명을 요청했거나 선택지를 나열할 때만 이 상한을 푼다. ",
-    "답변을 출력하기 직전에 불릿 수와 글자 수를 세고 넘치면 지운 뒤 출력한다.\n",
+    "응답 분량은 현재 역할의 지침을 따른다. Builder 외 역할에는 글자 수·불릿 수·문장 수 제한을 적용하지 않는다.\n",
     "최우선 한국어 전용 규칙: 사용자에게 보이는 text는 한 글자도 빠짐없이 한국어 문장으로만 이루어진다. ",
     "진행 안내, 도구 호출 앞뒤 라벨, 중간 보고, 최종 답변이 모두 여기에 해당하며, ",
     "모든 일반 문장은 반드시 한국어로 작성한다. 사용자가 영어로 요청해도 응답 언어는 한국어로 유지한다. ",
@@ -4490,6 +4489,9 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "종료 직전에 여러 Task를 한꺼번에 `completed`로 바꾸지 않는다.\n",
     "답변 형식 규칙:\n",
     "- 서론, 인사, 맺음말 요약을 쓰지 않고 결론부터 쓴다.\n",
+    "- 제공자나 역할과 관계없이 사용자에게 보이는 항목명·상태·판정은 쉬운 한국어로 쓴다. 영어 판정 코드는 기술 식별자로 취급하지 않는다. 다른 에이전트의 보고를 전달할 때도 이 규칙을 적용하되, 별도 규격이 있는 내부 기록은 유지한다.\n",
+    "- 내부 호출 관계나 약어를 나열하지 않고 사용자에게 생기는 영향과 필요한 조치를 먼저 설명한다. 근거 위치는 해당 설명 뒤에 필요한 만큼만 붙이고, 한 불릿에는 한 쟁점만 담는다.\n",
+    "- 짧게 쓰려고 띄어쓰기를 없애거나 서로 다른 쟁점을 압축하지 않는다. 중복 설명부터 줄이고, 판단에 필요한 근거·미확인 범위·후속 조치는 남긴다. 역할별 상세 보고 규칙이 있으면 그 분량을 따른다.\n",
     "- 이모티콘과 이모지를 쓰지 않는다. 답변, 진행 안내, Task 제목, 커밋 메시지 어디에도 넣지 않는다.\n",
     "- 산문 문단 대신 불릿과 코드 블록을 쓴다.\n",
     "- 코드 변경 보고에서도 파일 경로와 핵심 코드는 사용자 판단에 꼭 필요한 경우에만 최소한으로 보여주고, 요청받지 않은 해설을 덧붙이지 않는다.\n",
@@ -4507,7 +4509,7 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 저장소의 사실이나 원인을 조사할 때는 첫 검색 결과나 단일 키워드에 의존하지 않는다. 관련 상태·표시·입력 흐름을 추적하고, 적절한 테스트 또는 변경 이력과 교차 확인한다.\n",
     "- 검색에서 찾지 못했다는 이유만으로 기능이나 코드가 없다고 단정하지 않는다. 현재 구현, 과거 문제의 원인, 추측을 구분하고 근거가 부족하면 미확인이라고 밝힌다.\n",
     "- 최종 답변에는 직접적인 결론, 이를 뒷받침하는 핵심 근거만 담고, 확인 범위나 한계는 결론이 달라질 때만 덧붙인다. 내부 절차는 결과 판단에 필요할 때만 언급한다.\n",
-    "- 조사나 수정 결과는 독립된 수정 하나당 불릿 하나와 짧은 문장 하나만 쓰고, 서로 다른 수정, 원인, 영향을 같은 불릿이나 문장에 묶지 않는다. 수정이 셋을 넘으면 중요한 셋만 쓰고 나머지는 개수만 밝힌다. 원인은 사용자가 물었거나 판단에 필요할 때만 쓰고, 확인하지 못했으면 미확인이라고 밝힌다. `수정했습니다`, `확인했습니다`만으로 결과를 끝내지 않는다.\n",
+    "- 조사나 수정 결과는 서로 다른 쟁점을 구분하고 사용자 영향과 필요한 조치를 설명한다. 원인은 사용자가 물었거나 판단에 필요할 때만 쓰고, 확인하지 못했으면 미확인이라고 밝힌다. `수정했습니다`, `확인했습니다`만으로 결과를 끝내지 않는다.\n",
     "- 결론과 완료 보고는 바꾼 대상과 결과를 구체적으로 지목해 쓴다. `일부 수정했습니다`, `관련 부분을 개선했습니다`처럼 대상이 드러나지 않는 문장으로 얼버무리지 않는다.\n",
     "- 재개 기록, 사용자 질문, 권한 응답처럼 외부 상태를 기다리는 경우에는 실제 응답이나 오류를 받기 전 취소·거절·완료·원인을 단정하지 않는다. 질문 도구가 전달되지 않거나 응답을 받지 못했다는 오류가 오면 필요한 질문을 일반 text로 다시 보여 주고, 답이 필요한 작업은 사용자가 답하기 전 파일을 바꾸지 않는다.\n",
     "진행 보고 규칙:\n",
@@ -4517,7 +4519,7 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- Skill 적용, 지침 확인, 내부 도구 호출 같은 내부 절차는 알리지 않는다.\n",
 );
 
-const CLAUDE_TURN_REMINDER: &str = "최종 답변은 불릿 2~3개, 전체 200자 내외로 쓰고 불릿 하나에 두 문장을 넘기지 않는다. 넘치면 덜 중요한 불릿을 통째로 지운다. 필요한 경우가 아니면 영어로 응답하지 않으며, 도구 호출 앞뒤 text도 첫 글자가 한글이어야 하고 영어 문장으로 시작하거나 영어 판정 뒤 한국어를 잇지 않는다. 클래스명·메서드명·변수명·파일 경로·코드 조각은 사용자 판단에 꼭 필요할 때만 최소로 쓴다.";
+const CLAUDE_TURN_REMINDER: &str = "응답 분량은 현재 역할의 지침을 따른다. Builder 외 역할에는 글자 수·불릿 수·문장 수 제한을 적용하지 않는다. 중복 설명부터 줄이고 판단에 필요한 근거·미확인 범위·후속 조치는 남긴다. 필요한 경우가 아니면 영어로 응답하지 않으며, 도구 호출 앞뒤 text도 첫 글자가 한글이어야 하고 영어 문장으로 시작하거나 영어 판정 뒤 한국어를 잇지 않는다. 항목명·상태·판정은 쉬운 한국어로 쓰고 사용자 영향과 필요한 조치를 먼저 설명한다. 클래스명·메서드명·변수명·파일 경로·코드 조각은 사용자 판단에 꼭 필요할 때만 최소로 쓴다.";
 
 /// The Claude selections a session has to be told, because the bridge opens a
 /// fresh SDK session for every start and resume. Anything left out here comes
@@ -4583,8 +4585,8 @@ fn resume_thread_params(thread_id: &str, claude: &ClaudeSessionSettings) -> Valu
 
 /// Codex and Claude both read the full rules once — Codex as the thread's
 /// developer instructions, Claude as the system prompt the bridge appends to its
-/// preset. Claude also gets one short per-turn reminder for the response limits
-/// it tends to miss. The full rules stay here for the one runtime with no
+/// preset. Claude also gets one short per-turn reminder for language and readability.
+/// The full rules stay here for the one runtime with no
 /// standing instructions of its own.
 fn turn_additional_context(vibe: VibeMode, agent: agent::AgentMode) -> Value {
     json!({
@@ -7458,8 +7460,7 @@ mod tests {
         assert!(notice(VibeMode::SuperVibe).contains("Super Vibe"));
         assert!(notice(VibeMode::Vibe).contains("현재 응답 모드: Vibe"));
         assert!(notice(VibeMode::Normal).contains("현재 응답 모드: Off"));
-        // One length rule now holds in every mode, and it lives in the standing
-        // rules. A per-preset cap here would only contradict it.
+        // Length limits belong to Builder, not to a response preset.
         for vibe in [VibeMode::Vibe, VibeMode::SuperVibe, VibeMode::Normal] {
             assert!(!notice(vibe).contains("불릿"));
             assert!(!notice(vibe).contains("세 줄"));
@@ -7477,10 +7478,11 @@ mod tests {
             );
             assert!(notice(vibe).contains("AskUserQuestion 도구를 쓸 수 있으면"));
         }
-        // The cap the exception refers to, stated once for every mode.
-        for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS] {
-            assert!(rules.contains("불릿 두세 개, 전체 200자 내외"));
-            assert!(rules.contains("불릿 하나에 두 문장을 넘기지 않는다"));
+        // Shared rules and provider reminders must not reintroduce Builder's caps.
+        for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS, CLAUDE_TURN_REMINDER] {
+            assert!(!rules.contains("200자"));
+            assert!(!rules.contains("불릿 하나에 두 문장을 넘기지 않는다"));
+            assert!(!rules.contains("수정이 셋을 넘으면"));
             assert!(!rules.contains("세 줄"));
         }
     }
@@ -7534,7 +7536,7 @@ mod tests {
             Some(CLAUDE_DEVEZ_INSTRUCTIONS)
         );
         // Both providers hold the full rules already. Claude alone gets a short
-        // reminder for the output limits it repeatedly misses.
+        // reminder for language and readability.
         assert!(context.get("codex-devez-vibe-reminder").is_none());
         assert_eq!(
             context
@@ -7542,8 +7544,6 @@ mod tests {
                 .and_then(Value::as_str),
             Some(CLAUDE_TURN_REMINDER)
         );
-        assert!(CLAUDE_TURN_REMINDER.contains("불릿 2~3개, 전체 200자 내외"));
-        assert!(CLAUDE_TURN_REMINDER.contains("불릿 하나에 두 문장을 넘기지 않는다"));
         assert!(CLAUDE_TURN_REMINDER.contains("필요한 경우가 아니면 영어로 응답하지 않으며"));
         assert!(CLAUDE_TURN_REMINDER.contains("도구 호출 앞뒤 text도 첫 글자가 한글이어야 하고"));
         assert!(CLAUDE_TURN_REMINDER.contains("사용자 판단에 꼭 필요할 때만 최소로 쓴다"));
@@ -7561,22 +7561,13 @@ mod tests {
         );
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("두 번째 작업 도구를 호출하거나"));
         assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("TaskCreate를 대신하지 않는다"));
-        assert!(
-            CLAUDE_DEVEZ_INSTRUCTIONS.contains("독립된 수정 하나당 불릿 하나와 짧은 문장 하나")
-        );
-        assert!(
-            CLAUDE_DEVEZ_INSTRUCTIONS
-                .contains("서로 다른 수정, 원인, 영향을 같은 불릿이나 문장에 묶지 않는다")
-        );
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("서로 다른 쟁점을 구분하고"));
         assert!(DEVEZ_INSTRUCTIONS.contains("확인된 원인, 사용자에게 미치는 영향, 실제 조치"));
         assert!(DEVEZ_INSTRUCTIONS.contains("`update_plan`을 대신하지 않는다"));
         assert!(
             CLAUDE_DEVEZ_INSTRUCTIONS.contains("모든 TaskCreate의 subject에는 반드시 제목 자체")
         );
         assert!(DEVEZ_INSTRUCTIONS.contains("`update_plan`의 각 step에는 반드시 제목 자체"));
-        // The length cap is the same in every mode, so it is stated here once
-        // rather than deferred to the preset notice.
-        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("응답 모드와 관계없이"));
         for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS] {
             assert!(rules.contains("완료 문구를 붙이지 않는다"));
             assert!(rules.contains("`~한 내용을 완료했습니다.`처럼 명사절을 겹쳐 쓰거나"));

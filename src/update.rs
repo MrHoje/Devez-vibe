@@ -19,9 +19,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "GPT-6 Astra의 모델 색상을 청록색으로 변경하고 밝은 테마의 가독성을 보정했습니다.",
-    "계획 실행 승인과 취소 처리, 종료된 하위 작업의 역할 전환 처리를 보완했습니다.",
-    "검토 결과를 사용자 영향 중심의 쉬운 한국어로 안내하도록 개선했습니다.",
+    "계획 실행 대기와 취소 처리를 보완해 사용자가 대기열에 넣은 요청을 보존합니다.",
+    "응답 분량 제한을 Builder에만 적용하고 다른 역할은 필요한 설명을 충분히 제공합니다.",
+    "모든 제공자의 결과 안내를 사용자 영향 중심의 쉬운 한국어로 정리했습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
