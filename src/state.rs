@@ -27,6 +27,7 @@ use crate::{
         PluginTarget,
     },
     pricing::{self, CostLedger, TokenTotals},
+    project_memory::{self, KnowledgeMode, KnowledgeTurn},
     provider::{ProviderAuthRequest, ProviderPicker, ProviderPickerResult},
     renderer::{
         AnimationView, ArtifactView, AssistantPhase, Block, BlockKind, ComposerMode, EffortSlider,
@@ -86,14 +87,6 @@ pub enum ResponseLength {
 }
 
 impl ResponseLength {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Short => "Short",
-            Self::Normal => "Normal",
-            Self::Detailed => "Detailed",
-        }
-    }
-
     pub fn model_verbosity(self) -> &'static str {
         match self {
             Self::Short => "low",
@@ -113,13 +106,6 @@ pub enum ResponseDisplayMode {
 }
 
 impl ResponseDisplayMode {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::All => "All",
-            Self::Completed => "Completed",
-        }
-    }
-
     pub const fn config_value(self) -> &'static str {
         match self {
             Self::All => "all",
@@ -429,14 +415,6 @@ impl DiffDisplayMode {
         }
     }
 
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Hide => "Hide",
-            Self::Collapse => "Collapse",
-            Self::Expand => "Expand",
-        }
-    }
-
     fn next(self) -> Self {
         match self {
             Self::Hide => Self::Collapse,
@@ -467,14 +445,6 @@ impl ShellDisplayMode {
             "collapse" => Some(Self::Collapse),
             "expand" => Some(Self::Expand),
             _ => None,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Hide => "Hide",
-            Self::Collapse => "Collapse",
-            Self::Expand => "Expand",
         }
     }
 
@@ -587,7 +557,7 @@ impl SlashCommand {
     }
 }
 
-const SLASH_COMMANDS: [SlashCommand; 33] = [
+const SLASH_COMMANDS: [SlashCommand; 34] = [
     SlashCommand {
         name: "/provider",
         description: "Switch between the Claude and Codex providers, or connect OpenCode",
@@ -706,6 +676,11 @@ const SLASH_COMMANDS: [SlashCommand; 33] = [
     SlashCommand {
         name: "/vibemode",
         description: "Customize response, shell, and diff display (Alt+V cycles the preset)",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/knowledge",
+        description: "프로젝트 자동 지식 관리를 켜거나 끕니다",
         takes_argument: false,
     },
     SlashCommand {
@@ -1342,6 +1317,10 @@ pub enum Action {
         shell: ShellDisplayMode,
         diff: DiffDisplayMode,
     },
+    PersistKnowledgeMode {
+        previous: KnowledgeMode,
+        mode: KnowledgeMode,
+    },
     PersistStatusLine {
         key_path: &'static str,
         enabled: bool,
@@ -1735,6 +1714,10 @@ enum PendingInteraction {
         response: ResponseLength,
         shell: ShellDisplayMode,
         diff: DiffDisplayMode,
+    },
+    KnowledgeModePicker {
+        selected: usize,
+        previous: KnowledgeMode,
     },
     StatusLinePicker {
         selected: usize,
@@ -3126,6 +3109,7 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
             | PendingInteraction::ClaudePermissionScopePicker { .. }
             | PendingInteraction::ClaudePermissionRuleInput { .. }
             | PendingInteraction::VibeModePicker { .. }
+            | PendingInteraction::KnowledgeModePicker { .. }
             | PendingInteraction::StatusLinePicker { .. }
             | PendingInteraction::SkillsPicker { .. }
             | PendingInteraction::SubagentTranscript { .. }
@@ -3706,6 +3690,7 @@ pub struct AppState {
     /// its transcript cards stay off the split view.
     plan_panel_hidden: bool,
     last_assistant_markdown: Option<String>,
+    completed_knowledge_turn: Option<KnowledgeTurn>,
     composer_notice: Option<(String, Instant)>,
     /// Text, when it went up, and how long it stays. The quit warning needs a
     /// longer window than the rest, so the lifetime rides along with the notice.
@@ -3714,6 +3699,7 @@ pub struct AppState {
     response_length: ResponseLength,
     response_display_mode: ResponseDisplayMode,
     vibe_mode: VibeMode,
+    knowledge_mode: KnowledgeMode,
     conversation_view: ConversationView,
     shell_display_mode: ShellDisplayMode,
     diff_display_mode: DiffDisplayMode,
@@ -3809,6 +3795,7 @@ impl AppState {
             .unwrap_or_else(|| "high".to_owned());
         let branch = read_git_branch(&cwd);
         let vibe_mode = read_vibe_mode();
+        let knowledge_mode = project_memory::read_mode(&cwd);
         let conversation_view = read_conversation_view();
         let (default_response_length, default_shell_display_mode, default_diff_display_mode) =
             match vibe_mode {
@@ -3943,10 +3930,12 @@ impl AppState {
             side_parent: None,
             plan_panel_hidden: false,
             last_assistant_markdown: None,
+            completed_knowledge_turn: None,
             composer_notice: None,
             activity_notice: None,
             status_metadata_refreshed_at: Instant::now(),
             vibe_mode,
+            knowledge_mode,
             conversation_view,
             response_length,
             response_display_mode,
@@ -4704,6 +4693,7 @@ impl AppState {
             self.workspace_entries.clear();
             self.rebuild_completion_catalog();
         }
+        self.knowledge_mode = project_memory::read_mode(&self.cwd);
         self.restore_session_side_panel();
         self.restore_session_modes();
         self.select_model_and_effort(model, effort);
@@ -5237,10 +5227,6 @@ impl AppState {
         PermissionMode::FullAccess.profile()
     }
 
-    pub fn response_length_label(&self) -> &'static str {
-        self.response_length.label()
-    }
-
     pub fn model_verbosity(&self) -> &'static str {
         self.response_length.model_verbosity()
     }
@@ -5249,6 +5235,8 @@ impl AppState {
         ComposerMode {
             agent: self.agent_mode,
             branch: self.branch.clone(),
+            knowledge_mode: self.knowledge_mode.label().to_owned(),
+            knowledge_enabled: self.knowledge_mode.enabled(),
             vibe_mode: self.vibe_mode.label().to_owned(),
             vibe_tone: match self.vibe_mode {
                 VibeMode::Normal => VibeTone::Off,
@@ -5258,12 +5246,7 @@ impl AppState {
             label: self.permission_mode().label().to_owned(),
             accent: self.permission_mode().accent(),
             model: self.selected_model_name().to_owned(),
-            response_length: self.response_length_label().to_owned(),
-            response_display_mode: self.response_display_mode.label().to_owned(),
-            fast_mode: self.effective_fast_mode(),
             effort: self.selected_effort.clone(),
-            shell_display_mode: self.shell_display_mode().label().to_owned(),
-            diff_display_mode: self.diff_display_mode().label().to_owned(),
             cost: self.estimated_cost(),
         }
     }
@@ -5453,6 +5436,13 @@ impl AppState {
         });
     }
 
+    pub fn open_knowledge_mode_picker(&mut self) {
+        self.pending = Some(PendingInteraction::KnowledgeModePicker {
+            selected: self.knowledge_mode.picker_index(),
+            previous: self.knowledge_mode,
+        });
+    }
+
     /// Opens the Response display picker, the way `/Response` and the composer's
     /// Response badge do.
     pub fn open_response_display_picker(&mut self) {
@@ -5473,7 +5463,7 @@ impl AppState {
     }
 
     /// The explicit choice confirms the new service tier in the transcript as
-    /// well as updating the persistent composer badge.
+    /// well as updating the status-line reading.
     pub fn set_fast_mode(&mut self, enabled: bool) {
         self.fast_mode = enabled;
         self.commit_welcome_card();
@@ -5693,6 +5683,8 @@ impl AppState {
             self.workspace_entries.clear();
             self.rebuild_completion_catalog();
         }
+        self.knowledge_mode = project_memory::read_mode(&self.cwd);
+        self.completed_knowledge_turn = None;
         self.turn_id = None;
         self.pending_interrupt = false;
         self.busy = false;
@@ -5881,6 +5873,9 @@ impl AppState {
         self.stall_probe_at = None;
         let params = json!({ "threadId": self.thread_id.clone() });
         self.handle_notification("turn/completed", &params);
+        // The provider could not report how this turn ended. Settle the UI, but
+        // do not turn an unknown outcome into durable project knowledge.
+        self.completed_knowledge_turn = None;
         self.push_notice(
             BlockKind::Warning,
             "응답 종료 알림 누락",
@@ -5905,6 +5900,48 @@ impl AppState {
         self.turn_response_boundaries.clear();
         self.response_grouped = false;
         self.response_collapse = None;
+    }
+
+    fn build_completed_knowledge_turn(&self) -> Option<KnowledgeTurn> {
+        if !self.knowledge_mode.enabled() || self.turn_prompts.is_empty() {
+            return None;
+        }
+        let mut blocks = self
+            .turn_prompts
+            .iter()
+            .chain(self.turn_shell_results.iter().map(|result| &result.block))
+            .chain(self.turn_file_changes.iter())
+            .chain(self.turn_response_blocks.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        blocks.sort_by_key(Block::id);
+        blocks.dedup_by_key(|block| block.id());
+        let transcript = blocks
+            .iter()
+            .filter_map(ProviderHandoffBlock::from_block)
+            .filter(|block| !block.body.trim().is_empty())
+            .map(|block| {
+                let label = match block.kind {
+                    "user" => "사용자 요청",
+                    "assistant" => "에이전트 응답",
+                    "tool" => "명령 실행",
+                    "file_change" => "파일 변경",
+                    "reasoning" => "판단 기록",
+                    "plan" => "작업 계획",
+                    _ => "작업 기록",
+                };
+                format!("## {label}\n{}\n{}", block.title, block.body)
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!transcript.trim().is_empty()).then(|| KnowledgeTurn {
+            cwd: self.cwd.clone(),
+            model: self
+                .active_turn_model
+                .clone()
+                .unwrap_or_else(|| self.selected_model_name().to_owned()),
+            transcript,
+        })
     }
 
     /// Whether assistant text is still streaming in: the answer it belongs to
@@ -6364,6 +6401,7 @@ impl AppState {
         self.pending_turn_effort = None;
         self.active_turn_model = None;
         self.active_turn_effort = None;
+        self.completed_knowledge_turn = None;
         self.cost_restore_due = false;
         self.cost_restore_pending = false;
         self.context_window = None;
@@ -8552,6 +8590,9 @@ impl AppState {
                 // it slots in after everything this turn produced, ahead of the
                 // follow-up cycle the runtime may open for it.
                 self.flush_pending_steer_prompts();
+                self.completed_knowledge_turn = successful
+                    .then(|| self.build_completed_knowledge_turn())
+                    .flatten();
             }
             "turn/plan/updated" => {
                 let explanation = params
@@ -9312,6 +9353,15 @@ impl AppState {
             "/vibemode" => {
                 self.committed
                     .push(Block::new(BlockKind::Error, "Usage", "/vibemode"));
+                Action::None
+            }
+            "/knowledge" if parts.len() == 1 => {
+                self.open_knowledge_mode_picker();
+                Action::None
+            }
+            "/knowledge" => {
+                self.committed
+                    .push(Block::new(BlockKind::Error, "Usage", "/knowledge"));
                 Action::None
             }
             "/theme" if parts.len() == 1 => {
@@ -10264,6 +10314,40 @@ impl AppState {
                     response,
                     shell,
                     diff,
+                });
+                Action::None
+            }
+            PendingInteraction::KnowledgeModePicker {
+                mut selected,
+                previous,
+            } => {
+                let moved = match key.code {
+                    KeyCode::Esc => {
+                        self.knowledge_mode = previous;
+                        return Action::None;
+                    }
+                    KeyCode::Enter => {
+                        return Action::PersistKnowledgeMode {
+                            previous,
+                            mode: self.knowledge_mode,
+                        };
+                    }
+                    KeyCode::Left | KeyCode::Up | KeyCode::Char('p') if !alt => {
+                        selected = selected.saturating_sub(1);
+                        true
+                    }
+                    KeyCode::Right | KeyCode::Down | KeyCode::Tab | KeyCode::Char('n') if !alt => {
+                        selected = (selected + 1).min(KnowledgeMode::PICKER_CHOICES.len() - 1);
+                        true
+                    }
+                    _ => false,
+                };
+                if moved {
+                    self.knowledge_mode = KnowledgeMode::PICKER_CHOICES[selected];
+                }
+                self.pending = Some(PendingInteraction::KnowledgeModePicker {
+                    selected,
+                    previous,
                 });
                 Action::None
             }
@@ -11411,6 +11495,27 @@ impl AppState {
                     input_placeholder: "",
                 })
             }
+            PendingInteraction::KnowledgeModePicker { selected, .. } => {
+                let mode = KnowledgeMode::PICKER_CHOICES[*selected];
+                Some(OverlayView {
+                    closable: true,
+                    title: "프로젝트 지식 관리".to_owned(),
+                    lines: Vec::new(),
+                    slider: Some(EffortSlider {
+                        efforts: KnowledgeMode::PICKER_CHOICES
+                            .iter()
+                            .map(|mode| mode.picker_label().to_owned())
+                            .collect(),
+                        selected: *selected,
+                        detail: Some(mode.picker_detail().to_owned()),
+                    }),
+                    hint: "방향키 이동 · Enter 적용 · Esc 취소".to_owned(),
+                    style: OverlayStyle::Picker,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                })
+            }
             PendingInteraction::StatusLinePicker { selected } => Some(OverlayView {
                 closable: true,
                 title: "Status line".to_owned(),
@@ -12509,6 +12614,9 @@ impl AppState {
                     .selected_model()
                     .is_some_and(|model| !model.efforts.is_empty()))
             .then(|| self.selected_effort.clone()),
+            fast: self.status_line_settings.enabled(StatusLineField::Model)
+                && self.selected_provider() == ModelProvider::Codex
+                && self.effective_fast_mode(),
             context: self
                 .status_line_settings
                 .enabled(StatusLineField::Context)
@@ -12705,6 +12813,22 @@ impl AppState {
 
     pub const fn vibe_mode(&self) -> VibeMode {
         self.vibe_mode
+    }
+
+    pub const fn knowledge_mode(&self) -> KnowledgeMode {
+        self.knowledge_mode
+    }
+
+    pub fn set_knowledge_mode(&mut self, mode: KnowledgeMode) {
+        self.knowledge_mode = mode;
+    }
+
+    pub fn take_completed_knowledge_turn(&mut self) -> Option<KnowledgeTurn> {
+        self.completed_knowledge_turn.take()
+    }
+
+    pub fn show_knowledge_notice(&mut self, text: impl Into<String>) {
+        self.set_composer_notice(text.into());
     }
 
     pub const fn response_length(&self) -> ResponseLength {
@@ -13401,6 +13525,18 @@ impl AppState {
                         response,
                         shell,
                         diff,
+                    });
+                    Action::Tick(false)
+                }
+            }
+            Some(PendingInteraction::KnowledgeModePicker { selected, previous }) => {
+                if let Some(mode) = KnowledgeMode::PICKER_CHOICES.get(step).copied() {
+                    self.knowledge_mode = mode;
+                    Action::PersistKnowledgeMode { previous, mode }
+                } else {
+                    self.pending = Some(PendingInteraction::KnowledgeModePicker {
+                        selected,
+                        previous,
                     });
                     Action::Tick(false)
                 }
@@ -17412,7 +17548,7 @@ mod tests {
         }
 
         assert_eq!(state.vibe_mode_label(), "Vibe: On");
-        assert_eq!(state.response_length_label(), "Short");
+        assert_eq!(state.response_length, ResponseLength::Short);
         assert_eq!(state.shell_display_mode(), ShellDisplayMode::Collapse);
         assert_eq!(state.diff_display_mode(), DiffDisplayMode::Collapse);
     }
@@ -17457,10 +17593,106 @@ mod tests {
         );
 
         state.handle_key(KeyEvent::from(KeyCode::Esc));
-        assert_eq!(state.response_length_label(), "Short");
+        assert_eq!(state.response_length, ResponseLength::Short);
         assert_eq!(state.vibe_mode_label(), "Vibe: On");
         assert_eq!(state.shell_display_mode(), ShellDisplayMode::Collapse);
         assert_eq!(state.diff_display_mode(), DiffDisplayMode::Collapse);
+    }
+
+    #[test]
+    fn knowledge_mode_picker_is_project_off_by_default_and_restores_on_escape() {
+        let mut state = test_state();
+        assert_eq!(state.knowledge_mode(), KnowledgeMode::Off);
+
+        state.run_slash_command("/knowledge");
+        let slider = state
+            .overlay_view()
+            .and_then(|overlay| overlay.slider)
+            .expect("knowledge choices");
+        assert_eq!(slider.efforts, ["끔", "켬"]);
+        assert_eq!(slider.selected, 0);
+
+        state.handle_key(KeyEvent::from(KeyCode::Right));
+        assert_eq!(state.knowledge_mode(), KnowledgeMode::On);
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(state.knowledge_mode(), KnowledgeMode::Off);
+
+        state.run_slash_command("/knowledge");
+        state.handle_key(KeyEvent::from(KeyCode::Right));
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::PersistKnowledgeMode {
+                previous: KnowledgeMode::Off,
+                mode: KnowledgeMode::On
+            }
+        ));
+    }
+
+    #[test]
+    fn successful_turn_queues_knowledge_with_the_model_that_ran_it() {
+        let mut state = test_state();
+        state.knowledge_mode = KnowledgeMode::On;
+        state.editor.set_text("반복되는 빌드 오류를 해결해줘");
+        assert!(matches!(state.submit_editor(), Action::Submit(_)));
+        state.note_pending_turn_model("gpt-5.6-sol");
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
+        state.handle_notification(
+            "item/completed",
+            &json!({
+                "item": {
+                    "id": "answer-1",
+                    "type": "agentMessage",
+                    "text": "원인을 확인하고 재발 방지 절차를 적용했습니다."
+                }
+            }),
+        );
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "id": "turn-1", "status": "completed" } }),
+        );
+
+        let turn = state
+            .take_completed_knowledge_turn()
+            .expect("completed knowledge turn");
+        assert_eq!(turn.model, "gpt-5.6-sol");
+        assert!(turn.transcript.contains("반복되는 빌드 오류"));
+        assert!(turn.transcript.contains("재발 방지 절차"));
+        assert!(state.take_completed_knowledge_turn().is_none());
+    }
+
+    #[test]
+    fn failed_turn_never_queues_knowledge() {
+        let mut state = test_state();
+        state.knowledge_mode = KnowledgeMode::On;
+        state.editor.set_text("실패할 요청");
+        assert!(matches!(state.submit_editor(), Action::Submit(_)));
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
+        state.handle_notification(
+            "turn/completed",
+            &json!({
+                "turn": {
+                    "id": "turn-1",
+                    "status": "failed",
+                    "error": { "message": "실패" }
+                }
+            }),
+        );
+
+        assert!(state.take_completed_knowledge_turn().is_none());
+    }
+
+    #[test]
+    fn knowledge_off_never_queues_a_successful_turn() {
+        let mut state = test_state();
+        state.editor.set_text("완료되지만 기록하지 않을 요청");
+        assert!(matches!(state.submit_editor(), Action::Submit(_)));
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "id": "turn-1", "status": "completed" } }),
+        );
+
+        assert!(state.take_completed_knowledge_turn().is_none());
     }
 
     #[test]
@@ -20685,17 +20917,13 @@ mod tests {
     }
 
     #[test]
-    fn fast_mode_updates_the_composer_badge_and_reports_the_switch() {
+    fn fast_mode_updates_the_status_line_and_reports_the_switch() {
         let mut state = test_state();
 
         state.set_fast_mode(true);
 
         assert!(state.fast_mode);
-        assert!(state.composer_mode().fast_mode);
-        assert_eq!(
-            state.composer_mode().response_display_mode,
-            state.response_display_mode().label()
-        );
+        assert!(state.status_line().fast);
         assert!(state.transient_status.is_none());
         let on = state
             .committed
@@ -20704,9 +20932,15 @@ mod tests {
             .expect("fast mode notice");
         assert_eq!(on.body, "↳ On");
 
+        state.models = vec![test_model("claude:sonnet", "Claude Sonnet", true)];
+        state.selected_model = 0;
+        assert!(!state.status_line().fast);
+        state.models = vec![test_model("gpt-5.6-sol", "GPT-5.6 Sol", true)];
+        state.selected_model = 0;
+
         state.set_fast_mode(false);
 
-        assert!(!state.composer_mode().fast_mode);
+        assert!(!state.status_line().fast);
         assert_eq!(
             state
                 .committed
@@ -20718,7 +20952,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_badge_carries_fixed_access_and_response_display_mode() {
+    fn composer_badge_carries_only_project_knowledge_and_vibe_modes() {
         let mut state = test_state();
         state.set_fast_mode(false);
         state.set_response_display_mode(ResponseDisplayMode::Completed);
@@ -20726,8 +20960,8 @@ mod tests {
         let badge = state.composer_mode();
 
         assert_eq!(badge.label, "Full Access");
-        assert_eq!(badge.response_length, "Short");
-        assert_eq!(badge.response_display_mode, "Completed");
+        assert_eq!(badge.knowledge_mode, "지식: 끔");
+        assert_eq!(badge.vibe_mode, "Vibe: On");
 
         state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         assert_eq!(state.composer_mode().label, "Full Access");
@@ -23001,6 +23235,9 @@ mod tests {
     #[test]
     fn a_probe_that_finds_the_turn_over_ends_the_wait() {
         let mut state = test_state();
+        state.knowledge_mode = KnowledgeMode::On;
+        state.editor.set_text("종료 상태를 알 수 없는 요청");
+        assert!(matches!(state.submit_editor(), Action::Submit(_)));
         state.set_turn_started("turn-1".to_owned());
         state.turn_progress_at = Some(Instant::now() - TURN_STALL_SILENCE);
         let turn_id = state.take_stall_probe().expect("probe");
@@ -23012,6 +23249,7 @@ mod tests {
                 .activity()
                 .is_some_and(|activity| activity.starts_with("❖ Completed"))
         );
+        assert!(state.take_completed_knowledge_turn().is_none());
         // A stale answer about a turn that is no longer the live one changes nothing.
         state.set_turn_started("turn-2".to_owned());
         assert!(!state.resolve_stall_probe("turn-1"));

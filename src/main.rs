@@ -15,6 +15,7 @@ mod paste;
 mod perf;
 mod preedit;
 mod pricing;
+mod project_memory;
 mod provider;
 mod renderer;
 mod rollout;
@@ -264,7 +265,7 @@ async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
     state.push_notice(
         BlockKind::Update,
         "Tip",
-        "/: Command\n@: Mentions\n$: Skills\n/provider: Set Claude Codex provider\n/side-panel: Choose side panel size\n/vibemode: Set Vibe mode\n/Response: Set Response compression type\nTab: Cycle agent role\nShift + ↑↓ model · ←→ effort\nAlt + P: Cycle side panel size",
+        "/: Command\n@: Mentions\n$: Skills\n/provider: Set Claude Codex provider\n/side-panel: Choose side panel size\n/vibemode: Set Vibe mode\n/knowledge: Set project knowledge mode\n/Response: Set Response compression type\nTab: Cycle agent role\nShift + ↑↓ model · ←→ effort\nAlt + P: Cycle side panel size",
     );
     if fallback_to_claude {
         state.push_notice(
@@ -377,7 +378,7 @@ async fn start_session(
     };
     if thread_response.is_null() {
         state.set_host_loading(false);
-        return run_after_startup(server, state, renderer, queued).await;
+        return run_after_startup(server, state, renderer, queued, cli).await;
     }
     apply_claude_account_metadata(state, &thread_response);
 
@@ -424,7 +425,7 @@ async fn start_session(
         apply_resumed_token_usage(state, &thread_response, rollout.as_ref());
     }
     state.set_host_loading(false);
-    run_after_startup(server, state, renderer, queued).await
+    run_after_startup(server, state, renderer, queued, cli).await
 }
 
 /// The screen is live and the session is either bound or still waiting for the first
@@ -435,6 +436,7 @@ async fn run_after_startup(
     state: &mut AppState,
     renderer: &mut Renderer,
     queued: Option<String>,
+    cli: &Cli,
 ) -> Result<()> {
     draw(state, renderer)?;
     // Startup's own stream is gone by now, so the shared one can take the terminal.
@@ -453,7 +455,7 @@ async fn run_after_startup(
             start_turn(server, state, renderer, text, None).await?;
         }
     }
-    event_loop(server, state, renderer, update_rx).await
+    event_loop(server, state, renderer, update_rx, cli).await
 }
 
 /// Keeps the activity row alive while a request needed to begin a turn is waiting
@@ -775,7 +777,8 @@ fn hold_until_thread(
         | Action::SetTheme(_)
         | Action::Copy(_)
         | Action::Cut(_)
-        | Action::OpenUrl(_)) => Some(action),
+        | Action::OpenUrl(_)
+        | Action::PersistKnowledgeMode { .. }) => Some(action),
         Action::ShowStatus => Some(Action::ShowStatus),
         Action::ScrollToBottom => Some(Action::ScrollToBottom),
         // Once a switch is owed, the prompt belongs to the session being resumed. The
@@ -1275,13 +1278,18 @@ async fn start_split_turn(
     state.note_pending_turn_effort(&effort);
     let input = state.turn_input(text);
     let agent_mode = state.agent_mode();
+    let knowledge = project_memory::prompt_context(&state.cwd, state.knowledge_mode());
     let mut params = json!({
         "threadId": state.thread_id,
         "input": input,
         "model": model,
         "serviceTier": state.service_tier(),
         "permissions": state.permission_profile(),
-        "additionalContext": turn_additional_context(state.vibe_mode(), agent_mode)
+        "additionalContext": turn_additional_context(
+            state.vibe_mode(),
+            agent_mode,
+            knowledge.as_deref()
+        )
     });
     if !effort.is_empty() {
         params["effort"] = json!(effort);
@@ -1435,6 +1443,7 @@ async fn event_loop(
     state: &mut AppState,
     renderer: &mut Renderer,
     update_rx: mpsc::Receiver<String>,
+    cli: &Cli,
 ) -> Result<()> {
     let mut update_rx = Some(update_rx);
     let mut composer_paste = ComposerPasteBuffer::new();
@@ -1451,6 +1460,13 @@ async fn event_loop(
     let mut resize = ResizeTracker::new();
     let (workspace_tx, mut workspace_rx) = mpsc::channel(1);
     let (management_tx, mut management_rx) = mpsc::unbounded_channel();
+    let (knowledge_worker, mut knowledge_rx) = project_memory::KnowledgeWorker::start(
+        project_memory::RuntimePaths {
+            codex: cli.codex.clone(),
+            claude: cli.claude.clone(),
+            open_code: cli.open_code.clone(),
+        },
+    );
     let mut cost_restore_rx = None;
     let mut indexed_cwd = None;
     let mut integration_key = None;
@@ -1464,6 +1480,15 @@ async fn event_loop(
     draw(state, renderer)?;
 
     loop {
+        if let Some(turn) = state.take_completed_knowledge_turn()
+            && let Err(error) = knowledge_worker.enqueue(turn)
+        {
+            state.push_notice(
+                BlockKind::Warning,
+                "지식 분석 예약 실패",
+                error.to_string(),
+            );
+        }
         if let Some(thread_id) = state.take_cost_restore() {
             cost_restore_rx = Some(start_cost_restore(thread_id));
         }
@@ -1557,6 +1582,7 @@ async fn event_loop(
         if indexed_cwd.as_deref() != Some(state.cwd.as_str()) {
             let cwd = state.cwd.clone();
             indexed_cwd = Some(cwd.clone());
+            knowledge_worker.resume_project(&cwd);
             let tx = workspace_tx.clone();
             tokio::spawn(async move {
                 let root = PathBuf::from(&cwd);
@@ -1942,6 +1968,25 @@ async fn event_loop(
                 apply_management_update(state, update);
                 Action::None
             }
+            Some(update) = knowledge_rx.recv() => {
+                match update {
+                    project_memory::KnowledgeUpdate::Saved { project_root }
+                        if project_memory::same_project(&state.cwd, &project_root) =>
+                    {
+                        state.show_knowledge_notice("프로젝트 지식을 갱신했습니다.");
+                    }
+                    project_memory::KnowledgeUpdate::Failed { project_root, message }
+                        if project_memory::same_project(&state.cwd, &project_root) =>
+                    {
+                        state.push_notice(BlockKind::Warning, "지식 갱신 실패", message);
+                    }
+                    project_memory::KnowledgeUpdate::Unchanged { project_root } => {
+                        let _ = project_root;
+                    }
+                    _ => {}
+                }
+                Action::None
+            }
             _ = wait_for_paste_flush(paste_deadline), if paste_deadline.is_some() => {
                 let input_state = focused_state_mut(state, &mut btw_state, split_focus);
                 Action::Tick(flush_composer_paste(input_state, &mut composer_paste, Instant::now()))
@@ -2301,8 +2346,8 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
             state.open_vibe_mode_picker();
             Action::None
         }
-        Pick::ResponseDisplayMode => {
-            state.open_response_display_picker();
+        Pick::KnowledgeMode => {
+            state.open_knowledge_mode_picker();
             Action::None
         }
         Pick::FastMode => state.run_command("/fast"),
@@ -2471,6 +2516,7 @@ async fn execute_action(
         | Action::Copy(_)
         | Action::Cut(_)
         | Action::OpenUrl(_)
+        | Action::PersistKnowledgeMode { .. }
         | Action::SetTheme(_)
         | Action::ScrollToBottom
         | Action::ScrollToPrompt(_)
@@ -4300,6 +4346,21 @@ fn execute_local_action(
                 state.push_notice(BlockKind::Warning, "테마 저장 실패", error.to_string());
             }
         }
+        Action::PersistKnowledgeMode { previous, mode } => {
+            if let Err(error) = project_memory::write_mode(&state.cwd, mode) {
+                state.set_knowledge_mode(previous);
+                state.push_notice(
+                    BlockKind::Warning,
+                    "지식 관리 설정 저장 실패",
+                    error.to_string(),
+                );
+            } else {
+                state.show_knowledge_notice(format!(
+                    "지식 관리 {}",
+                    if mode.enabled() { "켜짐" } else { "꺼짐" }
+                ));
+            }
+        }
         Action::ScrollToBottom => {
             renderer.scroll_to_bottom();
         }
@@ -4594,8 +4655,12 @@ fn resume_thread_params(thread_id: &str, claude: &ClaudeSessionSettings) -> Valu
 /// preset. Claude also gets one short per-turn reminder for language and readability.
 /// The full rules stay here for the one runtime with no
 /// standing instructions of its own.
-fn turn_additional_context(vibe: VibeMode, agent: agent::AgentMode) -> Value {
-    json!({
+fn turn_additional_context(
+    vibe: VibeMode,
+    agent: agent::AgentMode,
+    knowledge: Option<&str>,
+) -> Value {
+    let mut context = json!({
         "devez-vibe-rules": {
             "value": DEVEZ_INSTRUCTIONS,
             "kind": "application"
@@ -4616,7 +4681,14 @@ fn turn_additional_context(vibe: VibeMode, agent: agent::AgentMode) -> Value {
             "value": agent.render_turn_block(),
             "kind": "application"
         }
-    })
+    });
+    if let Some(knowledge) = knowledge.filter(|knowledge| !knowledge.trim().is_empty()) {
+        context["devez-vibe-knowledge"] = json!({
+            "value": knowledge,
+            "kind": "application"
+        });
+    }
+    context
 }
 
 /// Every value Codex accepts for `sessionStartSource`. It rejects the whole
@@ -5452,13 +5524,18 @@ async fn start_turn(
     state.note_pending_turn_effort(&effort);
     let input = state.turn_input(text);
     let agent_mode = state.agent_mode();
+    let knowledge = project_memory::prompt_context(&state.cwd, state.knowledge_mode());
     let mut params = json!({
         "threadId": state.thread_id,
         "input": input,
         "model": model,
         "serviceTier": state.service_tier(),
         "permissions": state.permission_profile(),
-        "additionalContext": turn_additional_context(state.vibe_mode(), agent_mode)
+        "additionalContext": turn_additional_context(
+            state.vibe_mode(),
+            agent_mode,
+            knowledge.as_deref()
+        )
     });
     if !effort.is_empty() {
         params["effort"] = json!(effort);
@@ -6774,21 +6851,6 @@ mod tests {
     }
 
     #[test]
-    fn clicking_the_response_display_badge_opens_its_picker() {
-        let mut state = starting_state();
-        let before = state.response_display_mode();
-
-        let action = pick_action(&mut state, Pick::ResponseDisplayMode);
-
-        assert!(matches!(action, Action::None));
-        assert_eq!(state.response_display_mode(), before);
-        assert_eq!(
-            state.view().overlay.map(|overlay| overlay.title),
-            Some("Response".to_owned())
-        );
-    }
-
-    #[test]
     fn clicking_the_fast_badge_opens_the_fast_picker() {
         let mut state = state_with_a_model();
 
@@ -6813,6 +6875,19 @@ mod tests {
         assert_eq!(
             state.view().overlay.map(|overlay| overlay.title),
             Some("Vibe Mode".to_owned())
+        );
+    }
+
+    #[test]
+    fn clicking_the_knowledge_badge_opens_its_project_picker() {
+        let mut state = starting_state();
+
+        let action = pick_action(&mut state, Pick::KnowledgeMode);
+
+        assert!(matches!(action, Action::None));
+        assert_eq!(
+            state.view().overlay.map(|overlay| overlay.title),
+            Some("프로젝트 지식 관리".to_owned())
         );
     }
 
@@ -7508,7 +7583,7 @@ mod tests {
     #[test]
     fn every_turn_names_the_active_preset() {
         let notice = |vibe| {
-            turn_additional_context(vibe, agent::AgentMode::Standard)
+            turn_additional_context(vibe, agent::AgentMode::Standard, None)
                 .pointer("/devez-vibe-mode/value")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
@@ -7549,7 +7624,7 @@ mod tests {
     /// Builder included.
     #[test]
     fn the_turn_carries_the_selected_role() {
-        let planner = turn_additional_context(VibeMode::Vibe, agent::AgentMode::Planner);
+        let planner = turn_additional_context(VibeMode::Vibe, agent::AgentMode::Planner, None);
         let block = planner
             .pointer("/devez-vibe-agent/value")
             .and_then(Value::as_str)
@@ -7562,7 +7637,7 @@ mod tests {
             Some("application")
         );
 
-        let builder = turn_additional_context(VibeMode::Vibe, agent::AgentMode::Standard);
+        let builder = turn_additional_context(VibeMode::Vibe, agent::AgentMode::Standard, None);
         assert!(
             builder
                 .pointer("/devez-vibe-agent/value")
@@ -7572,8 +7647,29 @@ mod tests {
     }
 
     #[test]
+    fn the_turn_carries_only_the_compact_knowledge_context() {
+        let context = turn_additional_context(
+            VibeMode::Vibe,
+            agent::AgentMode::Standard,
+            Some("자동 요약과 문서 색인"),
+        );
+
+        assert_eq!(
+            context
+                .pointer("/devez-vibe-knowledge/value")
+                .and_then(Value::as_str),
+            Some("자동 요약과 문서 색인")
+        );
+        assert!(
+            turn_additional_context(VibeMode::Vibe, agent::AgentMode::Standard, None)
+                .get("devez-vibe-knowledge")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn every_turn_restates_the_rules() {
-        let context = turn_additional_context(VibeMode::Vibe, agent::AgentMode::Standard);
+        let context = turn_additional_context(VibeMode::Vibe, agent::AgentMode::Standard, None);
 
         assert_eq!(
             context

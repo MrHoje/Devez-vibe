@@ -396,6 +396,8 @@ pub struct StatusLineView {
     pub agent: AgentMode,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Codex priority service tier, shown beside the active effort.
+    pub fast: bool,
     pub context: Option<String>,
     pub five_hour_percent: Option<u8>,
     /// Countdown to the 5h window reset (`3h 33m`); absent when the provider
@@ -430,6 +432,8 @@ pub struct ComposerMode {
     pub agent: AgentMode,
     /// Current Git branch, shown as a display-only composer badge.
     pub branch: Option<String>,
+    pub knowledge_mode: String,
+    pub knowledge_enabled: bool,
     pub vibe_mode: String,
     pub vibe_tone: VibeTone,
     #[allow(dead_code)]
@@ -437,16 +441,8 @@ pub struct ComposerMode {
     #[allow(dead_code)]
     pub accent: ModeAccent,
     pub model: String,
-    pub response_length: String,
-    /// Whether completed progress responses remain visible or fold into the
-    /// prompt once the final answer arrives.
-    pub response_display_mode: String,
-    /// Codex's fast service tier. Claude has no control in this visual slot.
-    pub fast_mode: bool,
     #[allow(dead_code)]
     pub effort: String,
-    pub shell_display_mode: String,
-    pub diff_display_mode: String,
     /// What the thread is estimated to have cost so far. Absent before the first
     /// turn reports usage, and whenever the model has no published rate.
     #[allow(dead_code)]
@@ -5564,8 +5560,8 @@ pub enum Pick {
     DismissArtifacts,
     /// The Vibe preset applies its response and transcript display settings.
     VibeMode,
-    /// Chooses whether completed progress responses stay visible or fold away.
-    ResponseDisplayMode,
+    /// Enables or disables automatic project knowledge management.
+    KnowledgeMode,
     /// Opens the same service-tier picker as `/fast`.
     FastMode,
     ShellDisplayMode,
@@ -6291,18 +6287,13 @@ fn activity_line_with_composer_controls(
             );
             picks.extend(
                 badge
+                    .knowledge_mode_index
+                    .map(|index| (badge_start + index, Pick::KnowledgeMode)),
+            );
+            picks.extend(
+                badge
                     .vibe_mode_index
                     .map(|index| (badge_start + index, Pick::VibeMode)),
-            );
-            picks.extend(
-                badge
-                    .response_display_mode_index
-                    .map(|index| (badge_start + index, Pick::ResponseDisplayMode)),
-            );
-            picks.extend(
-                badge
-                    .fast_index
-                    .map(|index| (badge_start + index, Pick::FastMode)),
             );
             line.tail.push(rule_gap(gap));
             line.tail.extend(badge.spans);
@@ -8308,6 +8299,15 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         let span = push_status_span_after(&mut spans, separator, effort, tone);
         picks.push((span, Pick::EffortSetting));
     }
+    if status.fast {
+        let separator = if model_shown || has_effort {
+            STATUS_PAIR_SEPARATOR
+        } else {
+            STATUS_SEPARATOR
+        };
+        let span = push_status_span_after(&mut spans, separator, "Fast", Tone::ResponseCompleted);
+        picks.push((span, Pick::FastMode));
+    }
     if let Some(context) = status.context.filter(|context| !context.is_empty()) {
         // Keep the context marker so a narrow status row can preferentially
         // remove it before the compact reset reading. It stays aligned with the
@@ -8342,8 +8342,8 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
             Tone::StatusText,
         );
     }
-    // Composer controls live on the top rule, so the status row only carries
-    // provider usage and notices.
+    // Knowledge and Vibe live on the composer rule. Fast belongs beside the
+    // Codex model and effort here; the remaining fields are usage and notices.
     if let Some(notice) = status.notice.filter(|notice| !notice.is_empty()) {
         push_status_span(&mut spans, notice, Tone::Muted);
     }
@@ -12516,18 +12516,13 @@ fn input_top_line_with_controls(
         );
         picks.extend(
             badge
+                .knowledge_mode_index
+                .map(|index| (badge_start + index, Pick::KnowledgeMode)),
+        );
+        picks.extend(
+            badge
                 .vibe_mode_index
                 .map(|index| (badge_start + index, Pick::VibeMode)),
-        );
-        picks.extend(
-            badge
-                .response_display_mode_index
-                .map(|index| (badge_start + index, Pick::ResponseDisplayMode)),
-        );
-        picks.extend(
-            badge
-                .fast_index
-                .map(|index| (badge_start + index, Pick::FastMode)),
         );
         tail.push(rule_gap(COMPOSER_MODE_GAP));
         tail.extend(badge.spans);
@@ -12662,9 +12657,7 @@ fn composer_chrome_tone(mode: Option<&ComposerMode>) -> Tone {
         .unwrap_or(Tone::Border)
 }
 
-/// Widest badge that fits in `budget`. Codex places Response after Vibe;
-/// Claude places Access before Vibe. Tightening drops the optional
-/// controls as a unit rather than clipping a label.
+/// Widest knowledge/Vibe badge pair that fits without clipping a label.
 fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans> {
     let mut display_spans = Vec::new();
     if let Some(branch) = mode.branch.as_deref().filter(|branch| !branch.is_empty()) {
@@ -12681,124 +12674,46 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
         tone: vibe_tone(mode.vibe_tone),
         bold: false,
     };
-    let show_response = mode.vibe_tone == VibeTone::Super;
-    let response_completed = mode.response_display_mode == "Completed";
-    let response_span = PaintSpan {
-        text: format!("Response: {}", mode.response_display_mode),
-        tone: if response_completed {
+    let knowledge_mode_span = PaintSpan {
+        text: mode.knowledge_mode.clone(),
+        tone: if mode.knowledge_enabled {
             Tone::ResponseCompleted
         } else {
             Tone::FastOff
         },
         bold: false,
     };
-    let fast_span = PaintSpan {
-        text: if mode.fast_mode {
-            "Fast: On"
-        } else {
-            "Fast: Off"
-        }
-        .to_owned(),
-        tone: if mode.fast_mode {
-            Tone::ResponseCompleted
-        } else {
-            Tone::FastOff
-        },
-        bold: false,
-    };
-
-    let custom_spans = false.then(|| {
-        vec![
-            PaintSpan {
-                text: format!("Response: {}", mode.response_length),
-                tone: Tone::Muted,
-                bold: false,
-            },
-            separator_span(),
-            PaintSpan {
-                text: format!("Shell: {}", mode.shell_display_mode),
-                tone: Tone::Muted,
-                bold: false,
-            },
-            separator_span(),
-            PaintSpan {
-                text: format!("Diff: {}", mode.diff_display_mode),
-                tone: Tone::Muted,
-                bold: false,
-            },
-        ]
-    });
-    let vibe_only = BadgeSpans {
-        spans: [display_spans.clone(), vec![vibe_mode_span.clone()]].concat(),
-        vibe_mode_index: Some(display_width),
-        response_display_mode_index: None,
-        shell_display_mode_index: None,
-        diff_display_mode_index: None,
-        fast_index: None,
-    };
-    if mode.model.starts_with("claude:") {
-        let primary_spans = show_response
-            .then(|| {
-                custom_spans.unwrap_or_else(|| {
-                    vec![
-                        vibe_mode_span.clone(),
-                        separator_span(),
-                        response_span.clone(),
-                    ]
-                })
-            })
-            .unwrap_or_else(|| vec![vibe_mode_span.clone()]);
-        let ladder = [
-            BadgeSpans {
-                spans: [display_spans.clone(), primary_spans.clone()].concat(),
-                vibe_mode_index: Some(display_width),
-                response_display_mode_index: show_response.then_some(display_width + 2),
-                shell_display_mode_index: None,
-                diff_display_mode_index: None,
-                fast_index: None,
-            },
-            vibe_only,
-        ];
-        return ladder
-            .into_iter()
-            .find(|candidate| spans_width(&candidate.spans) <= budget);
-    }
-
-    let primary_spans = show_response
-        .then(|| {
-            custom_spans
-                .unwrap_or_else(|| vec![vibe_mode_span.clone(), separator_span(), response_span])
-        })
-        .unwrap_or_else(|| vec![vibe_mode_span.clone()]);
-    let with_fast = BadgeSpans {
+    let combined = BadgeSpans {
         spans: [
             display_spans.clone(),
-            primary_spans.clone(),
-            vec![separator_span(), fast_span],
+            vec![
+                knowledge_mode_span.clone(),
+                separator_span(),
+                vibe_mode_span.clone(),
+            ],
         ]
         .concat(),
-        vibe_mode_index: Some(display_width),
-        response_display_mode_index: show_response.then_some(display_width + 2),
+        knowledge_mode_index: Some(display_width),
+        vibe_mode_index: Some(display_width + 2),
         shell_display_mode_index: None,
         diff_display_mode_index: None,
-        fast_index: Some(display_width + primary_spans.len() + 1),
     };
-    // OpenCode has no service-tier switch, so its composer never shows Fast.
-    let hide_fast = is_open_code_model_label(&mode.model);
-    [
-        with_fast,
-        BadgeSpans {
-            spans: [display_spans, primary_spans].concat(),
-            vibe_mode_index: Some(display_width),
-            response_display_mode_index: show_response.then_some(display_width + 2),
-            shell_display_mode_index: None,
-            diff_display_mode_index: None,
-            fast_index: None,
-        },
-        vibe_only,
-    ]
+    let vibe_only = BadgeSpans {
+        spans: [display_spans.clone(), vec![vibe_mode_span]].concat(),
+        knowledge_mode_index: None,
+        vibe_mode_index: Some(display_width),
+        shell_display_mode_index: None,
+        diff_display_mode_index: None,
+    };
+    let knowledge_only = BadgeSpans {
+        spans: [display_spans, vec![knowledge_mode_span]].concat(),
+        knowledge_mode_index: Some(display_width),
+        vibe_mode_index: None,
+        shell_display_mode_index: None,
+        diff_display_mode_index: None,
+    };
+    [combined, vibe_only, knowledge_only]
     .into_iter()
-    .filter(|candidate| !hide_fast || candidate.fast_index.is_none())
     .find(|candidate| spans_width(&candidate.spans) <= budget)
 }
 
@@ -12807,11 +12722,10 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
 /// that picked the candidate knows which rung it settled on.
 struct BadgeSpans {
     spans: Vec<PaintSpan>,
+    knowledge_mode_index: Option<usize>,
     vibe_mode_index: Option<usize>,
-    response_display_mode_index: Option<usize>,
     shell_display_mode_index: Option<usize>,
     diff_display_mode_index: Option<usize>,
-    fast_index: Option<usize>,
 }
 
 fn separator_span() -> PaintSpan {
@@ -14849,6 +14763,7 @@ mod tests {
                     agent: AgentMode::Standard,
                     model: Some("GPT-5.6 Codex".to_owned()),
                     effort: Some("xhigh".to_owned()),
+                    fast: false,
                     context: Some("ctx: 38k/1000k (3%)".to_owned()),
                     five_hour_percent: Some(97),
                     five_hour_remaining: Some("25m".to_owned()),
@@ -14878,13 +14793,12 @@ mod tests {
         with_devezcode_xterm_widths(|| {
             let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, false);
             mode.branch = Some("main".to_owned());
-            mode.response_display_mode = "All".to_owned();
             let activity = activity_lines("❖ Completed (8m 17s) · 11:48 PM", None, 0.5, 120);
             let line = activity_line_with_composer_controls(activity[0].clone(), &mode, None, 120)
                 .expect("badge fits beside a short activity label");
             let text = painted(&line);
             assert!(
-                text.contains("Response: All"),
+                text.contains("지식: 끔 · Vibe: Super Vibe"),
                 "badge tail must survive layout, got {text:?}"
             );
             assert!(
@@ -14898,7 +14812,7 @@ mod tests {
             emit_row_sequential(&mut output, &frame, 0, 0).expect("row emits");
             let emitted = String::from_utf8(output).expect("terminal bytes are UTF-8");
             assert!(
-                emitted.contains("Response: All"),
+                emitted.contains("Vibe: Super Vibe"),
                 "the safety cut must remove blanks instead of the badge tail"
             );
         });
@@ -14909,11 +14823,10 @@ mod tests {
         with_devezcode_xterm_widths(|| {
             let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, false);
             mode.branch = Some("main".to_owned());
-            mode.response_display_mode = "All".to_owned();
             let line = input_top_line(120, "", Some(&mode));
             let text = painted(&line);
             assert!(
-                text.contains("Response: All"),
+                text.contains("지식: 끔 · Vibe: Super Vibe"),
                 "composer badge tail must survive layout, got {text:?}"
             );
             assert!(
@@ -14927,7 +14840,7 @@ mod tests {
             emit_row_sequential(&mut output, &frame, 0, 0).expect("row emits");
             let emitted = String::from_utf8(output).expect("terminal bytes are UTF-8");
             assert!(
-                emitted.contains("Response: All"),
+                emitted.contains("Vibe: Super Vibe"),
                 "the safety cut must remove rule cells instead of the badge tail"
             );
         });
@@ -16316,6 +16229,7 @@ mod tests {
                 agent: AgentMode::Standard,
                 model: None,
                 effort: Some("high".to_owned()),
+                fast: false,
                 context: None,
                 five_hour_percent: None,
                 five_hour_remaining: None,
@@ -17765,7 +17679,8 @@ mod tests {
             .expect("activity row");
         assert!(!painted(&frame.lines[activity]).contains("View: Chat"));
         assert!(!painted(&frame.lines[activity]).contains("Response:"));
-        assert!(painted(&frame.lines[activity]).contains("Fast: Off"));
+        assert!(!painted(&frame.lines[activity]).contains("Fast:"));
+        assert!(painted(&frame.lines[activity]).contains("지식: 끔"));
         assert!(!painted(&frame.lines[activity + 1]).contains("View: Chat"));
         assert_eq!(painted_width(&frame.lines[activity]), 158);
         assert_eq!(frame.lines[activity + 1].tone, Tone::ModelTerra);
@@ -17982,22 +17897,19 @@ mod tests {
                 .sum::<usize>()
     }
 
-    fn test_mode(label: &str, accent: ModeAccent, fast_mode: bool) -> ComposerMode {
+    fn test_mode(label: &str, accent: ModeAccent, _fast_mode: bool) -> ComposerMode {
         ComposerMode {
             agent: AgentMode::Standard,
             branch: None,
+            knowledge_mode: "지식: 끔".to_owned(),
+            knowledge_enabled: false,
             vibe_mode: "Vibe: On".to_owned(),
             vibe_tone: VibeTone::On,
             label: label.to_owned(),
             accent,
             model: "GPT-5.6-Terra".to_owned(),
-            response_length: "Short".to_owned(),
-            response_display_mode: "Completed".to_owned(),
-            fast_mode,
             effort: "high".to_owned(),
             cost: None,
-            shell_display_mode: "Collapse".to_owned(),
-            diff_display_mode: "Collapse".to_owned(),
         }
     }
 
@@ -18407,10 +18319,20 @@ mod tests {
         assert_eq!(rule_width(&line), 120);
         assert!(painted(&line).starts_with('─'));
         // Two blanks off the rule, the badge, then the rule resumes for two columns.
-        assert_eq!(texts, ["  ", "Vibe: On", " · ", "Fast: On", " ", "──"]);
-        assert_eq!(line.tail[1].tone, Tone::FastOn);
+        assert_eq!(
+            texts,
+            [
+                "  ",
+                "지식: 끔",
+                " · ",
+                "Vibe: On",
+                " ",
+                "──"
+            ]
+        );
+        assert_eq!(line.tail[1].tone, Tone::FastOff);
         assert!(!painted(&line).contains("Response:"));
-        assert_eq!(line.tail[3].tone, Tone::ResponseCompleted);
+        assert!(!painted(&line).contains("Fast:"));
     }
 
     #[test]
@@ -18437,18 +18359,15 @@ mod tests {
     }
 
     #[test]
-    fn claude_super_vibe_keeps_response_after_vibe() {
+    fn claude_super_vibe_keeps_only_knowledge_and_vibe_controls() {
         let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, false);
         mode.model = "claude:sonnet".to_owned();
 
         let line = input_top_line(120, "", Some(&mode));
 
-        assert!(painted(&line).contains("Vibe: Super Vibe · Response: Completed"));
+        assert!(painted(&line).contains("지식: 끔 · Vibe: Super Vibe"));
         assert!(!painted(&line).contains("mode"));
-        assert_eq!(
-            pick_on(&line, "Response: Completed"),
-            Some(Pick::ResponseDisplayMode)
-        );
+        assert_eq!(pick_on(&line, "Response: Completed"), None);
         assert!(!painted(&line).contains("Fast:"));
     }
 
@@ -18473,7 +18392,8 @@ mod tests {
 
         assert!(!painted(&frame.lines[composer - 1]).contains("View: Chat"));
         assert!(!painted(&frame.lines[composer - 1]).contains("Response:"));
-        assert!(painted(&frame.lines[composer - 1]).contains("Fast: Off"));
+        assert!(!painted(&frame.lines[composer - 1]).contains("Fast:"));
+        assert!(painted(&frame.lines[composer - 1]).contains("지식: 끔"));
         assert!(!painted(&frame.lines[composer]).contains("View: Chat"));
     }
 
@@ -18501,13 +18421,10 @@ mod tests {
         let mode = super_vibe_mode("Full Access", ModeAccent::Danger, true);
         let line = input_top_line(120, "", Some(&mode));
         assert_eq!(pick_on(&line, "View: Chat"), None);
+        assert_eq!(pick_on(&line, "지식: 끔"), Some(Pick::KnowledgeMode));
         assert_eq!(pick_on(&line, "Vibe: Super Vibe"), Some(Pick::VibeMode));
-        assert_eq!(
-            pick_on(&line, "Response: Completed"),
-            Some(Pick::ResponseDisplayMode)
-        );
-        assert_eq!(pick_on(&line, "Fast: On"), Some(Pick::FastMode));
-        assert!(painted(&line).contains("Response: Completed · Fast: On"));
+        assert_eq!(pick_on(&line, "Response: Completed"), None);
+        assert_eq!(pick_on(&line, "Fast: On"), None);
         // The rule, and the middle of the separator between the badges, are not
         // settings — the columns beside each badge belong to that badge.
         assert_eq!(pick_mid(&line, " · "), None);
@@ -18533,34 +18450,29 @@ mod tests {
         let line = input_top_line(120, "3/12", Some(&mode));
 
         assert_eq!(pick_on(&line, "Vibe: Super Vibe"), Some(Pick::VibeMode));
-        assert_eq!(
-            pick_on(&line, "Response: Completed"),
-            Some(Pick::ResponseDisplayMode)
-        );
-        assert_eq!(pick_on(&line, "Fast: On"), Some(Pick::FastMode));
+        assert_eq!(pick_on(&line, "지식: 끔"), Some(Pick::KnowledgeMode));
+        assert_eq!(pick_on(&line, "Response: Completed"), None);
+        assert_eq!(pick_on(&line, "Fast: On"), None);
         assert_eq!(pick_on(&line, "[$0.95]"), None);
         assert_eq!(pick_on(&line, "3/12"), None);
     }
 
-    /// The compact rule keeps Response before Vibe and both remain clickable.
+    /// The compact rule keeps the two remaining controls clickable.
     #[test]
-    fn compact_rule_keeps_response_and_vibe_clickable() {
+    fn compact_rule_keeps_knowledge_and_vibe_clickable() {
         let mode = super_vibe_mode("Full Access", ModeAccent::Danger, true);
         let line = input_top_line(56, "", Some(&mode));
 
-        assert!(painted(&line).contains("Response: Completed"));
+        assert!(painted(&line).contains("지식: 끔"));
+        assert!(!painted(&line).contains("Response:"));
         assert!(!painted(&line).contains("Fast:"));
+        assert_eq!(pick_on(&line, "지식: 끔"), Some(Pick::KnowledgeMode));
         assert_eq!(pick_on(&line, "Vibe: Super Vibe"), Some(Pick::VibeMode));
-        assert_eq!(
-            pick_on(&line, "Response: Completed"),
-            Some(Pick::ResponseDisplayMode)
-        );
     }
 
     #[test]
-    fn all_response_mode_uses_the_fast_off_tone() {
-        let mut mode = super_vibe_mode("Default", ModeAccent::Safe, false);
-        mode.response_display_mode = "All".to_owned();
+    fn composer_omits_response_and_fast_regardless_of_vibe_mode() {
+        let mode = super_vibe_mode("Default", ModeAccent::Safe, false);
         let line = input_top_line(80, "", Some(&mode));
         let texts = line
             .tail
@@ -18573,17 +18485,15 @@ mod tests {
             texts,
             [
                 "  ",
+                "지식: 끔",
+                " · ",
                 "Vibe: Super Vibe",
-                " · ",
-                "Response: All",
-                " · ",
-                "Fast: Off",
                 " ",
                 "──"
             ]
         );
-        assert_eq!(line.tail[3].tone, Tone::FastOff);
-        assert_eq!(line.tail[5].tone, Tone::FastOff);
+        assert!(!painted(&line).contains("Response:"));
+        assert!(!painted(&line).contains("Fast:"));
     }
 
     #[test]
@@ -18604,7 +18514,9 @@ mod tests {
 
         let line = input_top_line(120, "", Some(&mode));
 
-        assert!(painted(&line).contains("* main | Vibe: Super Vibe · Response: Completed"));
+        assert!(painted(&line).contains(
+            "* main | 지식: 끔 · Vibe: Super Vibe"
+        ));
         assert!(!painted(&line).contains("$0.95"));
     }
 
@@ -18620,7 +18532,21 @@ mod tests {
     }
 
     #[test]
-    fn vibe_and_response_badges_use_their_role_tones() {
+    fn knowledge_badge_opens_its_project_mode_picker() {
+        let line = input_top_line(
+            120,
+            "",
+            Some(&test_mode("Full Access", ModeAccent::Danger, false)),
+        );
+
+        assert_eq!(
+            pick_on(&line, "지식: 끔"),
+            Some(Pick::KnowledgeMode)
+        );
+    }
+
+    #[test]
+    fn knowledge_and_vibe_badges_use_their_role_tones() {
         let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, true);
         let tones = |mode: &ComposerMode| {
             fitting_badge_spans(mode, 120)
@@ -18632,21 +18558,16 @@ mod tests {
         };
 
         let on = tones(&mode);
+        assert!(on.contains(&("지식: 끔".to_owned(), Tone::FastOff)));
         assert!(on.contains(&("Vibe: Super Vibe".to_owned(), Tone::VibeSuper)));
         assert!(!on.iter().any(|(text, _)| text == "View: Chat"));
-        assert!(on.contains(&("Response: Completed".to_owned(), Tone::ResponseCompleted)));
-        assert!(on.contains(&("Fast: On".to_owned(), Tone::ResponseCompleted)));
+        assert!(!on.iter().any(|(text, _)| text.starts_with("Response:")));
+        assert!(!on.iter().any(|(text, _)| text.starts_with("Fast:")));
 
-        mode.response_display_mode = "All".to_owned();
-        assert!(tones(&mode).contains(&("Response: All".to_owned(), Tone::FastOff)));
-
+        mode.knowledge_enabled = true;
         mode.vibe_tone = VibeTone::On;
         let ordinary = tones(&mode);
-        assert!(
-            !ordinary
-                .iter()
-                .any(|(text, _)| text.starts_with("Response:"))
-        );
+        assert!(ordinary.contains(&("지식: 끔".to_owned(), Tone::ResponseCompleted)));
     }
 
     #[test]
@@ -18709,19 +18630,20 @@ mod tests {
     }
 
     #[test]
-    fn hidden_cost_leaves_room_for_response_control() {
+    fn hidden_cost_leaves_room_for_knowledge_and_vibe_controls() {
         let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, true);
         mode.cost = Some("$0.95".to_owned());
         let line = input_top_line(66, "", Some(&mode));
         assert_eq!(rule_width(&line), 66);
         assert!(!painted(&line).contains("$0.95"));
         assert!(painted(&line).contains("Vibe: Super Vibe"));
-        assert!(painted(&line).contains("Response: Completed"));
-        assert!(painted(&line).contains("Fast: On"));
+        assert!(painted(&line).contains("지식: 끔"));
+        assert!(!painted(&line).contains("Response:"));
+        assert!(!painted(&line).contains("Fast:"));
     }
 
     #[test]
-    fn tight_composer_rule_keeps_response_and_vibe() {
+    fn tight_composer_rule_keeps_knowledge_and_vibe() {
         let mode = super_vibe_mode("Full Access", ModeAccent::Danger, true);
         let line = input_top_line(56, "", Some(&mode));
         let texts = line
@@ -18735,9 +18657,9 @@ mod tests {
             texts,
             [
                 "  ",
-                "Vibe: Super Vibe",
+                "지식: 끔",
                 " · ",
-                "Response: Completed",
+                "Vibe: Super Vibe",
                 " ",
                 "──"
             ]
@@ -19515,17 +19437,14 @@ mod tests {
             composer_mode: Some(ComposerMode {
                 agent: AgentMode::Standard,
                 branch: Some("main".to_owned()),
+                knowledge_mode: "지식: 끔".to_owned(),
+                knowledge_enabled: false,
                 vibe_mode: "Super Vibe".to_owned(),
                 vibe_tone: VibeTone::Super,
                 label: String::new(),
                 accent: ModeAccent::Calm,
                 model: "Claude Opus 4.8".to_owned(),
-                response_length: "짧게".to_owned(),
-                response_display_mode: "완료".to_owned(),
-                fast_mode: false,
                 effort: "high".to_owned(),
-                shell_display_mode: "숨김".to_owned(),
-                diff_display_mode: "숨김".to_owned(),
                 cost: None,
             }),
         };
@@ -22060,6 +21979,7 @@ mod tests {
                 agent: AgentMode::Standard,
                 model: Some("GPT-5.6 Codex".to_owned()),
                 effort: Some("xhigh".to_owned()),
+                fast: false,
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
                 five_hour_percent: Some(12),
                 five_hour_remaining: None,
@@ -22081,6 +22001,7 @@ mod tests {
                 agent: AgentMode::Standard,
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
+                fast: false,
                 context: None,
                 five_hour_percent: None,
                 five_hour_remaining: None,
@@ -22096,6 +22017,28 @@ mod tests {
     }
 
     #[test]
+    fn codex_fast_is_shown_after_model_and_effort_on_the_status_line() {
+        let line = status_line_row(
+            Some(StatusLineView {
+                agent: AgentMode::Standard,
+                model: Some("GPT-5.6 Sol".to_owned()),
+                effort: Some("xhigh".to_owned()),
+                fast: true,
+                context: None,
+                five_hour_percent: None,
+                five_hour_remaining: None,
+                weekly_percent: None,
+                notice: None,
+            }),
+            "",
+            100,
+        );
+
+        assert!(painted(&line).contains("GPT-5.6 Sol · xhigh · Fast"));
+        assert_eq!(pick_on(&line, "Fast"), Some(Pick::FastMode));
+    }
+
+    #[test]
     fn opencode_status_uses_model_first_text_beige_and_no_model_shortcut() {
         theme::set_current(ThemeKind::Dark);
         let line = status_line_row(
@@ -22103,6 +22046,7 @@ mod tests {
                 agent: AgentMode::Standard,
                 model: Some("DeepSeek V4 Flash · OpenCode Go".to_owned()),
                 effort: Some("high".to_owned()),
+                fast: false,
                 context: None,
                 five_hour_percent: None,
                 five_hour_remaining: None,
@@ -22143,6 +22087,7 @@ mod tests {
                 agent: AgentMode::Standard,
                 model: Some("GPT-5.6 Codex".to_owned()),
                 effort: Some("xhigh".to_owned()),
+                fast: false,
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
                 five_hour_percent: Some(12),
                 five_hour_remaining: None,
@@ -22163,6 +22108,7 @@ mod tests {
             agent: AgentMode::Standard,
             model: Some("GPT-5.6 Codex".to_owned()),
             effort: Some("xhigh".to_owned()),
+            fast: false,
             context: Some("ctx: 164k/258k (63%)".to_owned()),
             five_hour_percent: Some(14),
             five_hour_remaining: Some("3h 6m".to_owned()),
@@ -22194,6 +22140,7 @@ mod tests {
                 agent: AgentMode::Standard,
                 model: None,
                 effort: None,
+                fast: false,
                 context: None,
                 five_hour_percent: Some(3),
                 five_hour_remaining: Some("4h 38m".to_owned()),
@@ -22214,6 +22161,7 @@ mod tests {
                 agent: AgentMode::Standard,
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
+                fast: false,
                 context: None,
                 five_hour_percent: None,
                 five_hour_remaining: None,
@@ -22238,6 +22186,7 @@ mod tests {
                 agent: AgentMode::Standard,
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
+                fast: false,
                 context: Some("ctx: 45k/256k (18%)".to_owned()),
                 five_hour_percent: Some(12),
                 five_hour_remaining: None,
@@ -22281,6 +22230,7 @@ mod tests {
                 agent: AgentMode::Standard,
                 model: None,
                 effort: Some("high".to_owned()),
+                fast: false,
                 context: None,
                 five_hour_percent: None,
                 five_hour_remaining: None,
@@ -24276,6 +24226,7 @@ mod tests {
                 agent: AgentMode::Standard,
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
+                fast: false,
                 context: None,
                 five_hour_percent: None,
                 five_hour_remaining: None,
@@ -24317,7 +24268,7 @@ mod tests {
     }
 
     #[test]
-    fn response_badge_hover_starts_on_its_own_label() {
+    fn knowledge_badge_hover_starts_on_its_own_label() {
         theme::set_current(ThemeKind::Dark);
         let line = activity_line_with_composer_controls(
             PaintLine::blank(),
@@ -24326,13 +24277,12 @@ mod tests {
             120,
         )
         .expect("activity row has controls");
-        let hovered = Renderer::hover_columns(&line, None, Some(&Pick::ResponseDisplayMode))
-            .expect("response badge is clickable");
+        let hovered = Renderer::hover_columns(&line, None, Some(&Pick::KnowledgeMode))
+            .expect("knowledge badge is clickable");
         let text = painted(&line);
-        let response_start =
-            UnicodeWidthStr::width(&text[..text.find("Response: Completed").unwrap()]);
+        let knowledge_start = UnicodeWidthStr::width(&text[..text.find("지식: 끔").unwrap()]);
 
-        assert_eq!(hovered.start, response_start);
+        assert_eq!(hovered.start, knowledge_start);
     }
 
     /// A long activity label crowds the controls off the active row. They belong

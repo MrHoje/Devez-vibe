@@ -2482,12 +2482,16 @@ fn combined_turn_instructions(params: &Value, runtime: RuntimeKind) -> Option<St
     let agent = params
         .pointer("/additionalContext/devez-vibe-agent/value")
         .and_then(Value::as_str);
+    let knowledge = params
+        .pointer("/additionalContext/devez-vibe-knowledge/value")
+        .and_then(Value::as_str);
     let parts = [
         rules,
         mode,
         params
             .pointer("/additionalContext/provider-handoff/value")
             .and_then(Value::as_str),
+        knowledge,
         agent,
         claude_reminder,
     ]
@@ -3217,7 +3221,7 @@ mod tests {
                 let mut params = crate::new_thread_params(
                     ".", None, None, "startup", "low", "default", "high",
                 );
-                params["additionalContext"] = crate::turn_additional_context(vibe, role);
+                params["additionalContext"] = crate::turn_additional_context(vibe, role, None);
                 for runtime in [RuntimeKind::Codex, RuntimeKind::Claude, RuntimeKind::OpenCode] {
                     let outgoing = match runtime {
                         RuntimeKind::Codex => {
@@ -3243,6 +3247,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn project_knowledge_reaches_all_three_runtimes() {
+        let mut params = json!({
+            "additionalContext": {
+                "devez-vibe-rules": { "value": "공통 규칙", "kind": "application" },
+                "devez-vibe-knowledge": { "value": "자동 지식 요약", "kind": "application" }
+            }
+        });
+
+        assert!(
+            combined_turn_instructions(&params, RuntimeKind::Claude)
+                .is_some_and(|text| text.contains("자동 지식 요약"))
+        );
+        assert!(
+            combined_turn_instructions(&params, RuntimeKind::OpenCode)
+                .is_some_and(|text| text.contains("자동 지식 요약"))
+        );
+        prepare_codex_turn_context(&mut params);
+        assert_eq!(
+            params
+                .pointer("/additionalContext/devez-vibe-knowledge/value")
+                .and_then(Value::as_str),
+            Some("자동 지식 요약")
+        );
     }
 
     /// A Standard turn with its reset already spent sends no role key, and the

@@ -22,7 +22,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "실행 중인 세션을 유지하면서 다음 실행부터 새 버전을 사용하도록 업데이트 구조를 변경했습니다.",
+    "프로젝트별 지식 관리 모드와 자동 장기 지식·간소화 요약 저장을 추가했습니다.",
+    "마지막 제공자에 맞춘 백그라운드 분석과 비밀정보·중단·동시 실행 보호를 적용했습니다.",
+    "컴포저의 Response·Fast 표시를 정리하고 Codex Fast 상태를 상태줄에 표시합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
