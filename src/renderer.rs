@@ -6130,18 +6130,28 @@ fn artifact_line(artifacts: &[ArtifactView], width: u16) -> Option<PaintLine> {
         0 | 1 => String::new(),
         count => format!(" · +{} more", count - 1),
     };
-    let dismiss = " · X";
     let reserved = 1
+        + UnicodeWidthStr::width(ARTIFACT_DISMISS)
+        + 3
         + UnicodeWidthStr::width(ARTIFACT_GLYPH)
         + 2
-        + UnicodeWidthStr::width(more.as_str())
-        + UnicodeWidthStr::width(dismiss);
+        + UnicodeWidthStr::width(more.as_str());
     let name = compact_right(
         &latest.name,
         usize::from(width).saturating_sub(reserved + 1),
     );
     // The gap sits in its own span so the link underline starts at the name.
     let tail = vec![
+        PaintSpan {
+            text: " · ".to_owned(),
+            tone: Tone::Muted,
+            bold: false,
+        },
+        PaintSpan {
+            text: ARTIFACT_GLYPH.to_owned(),
+            tone: Tone::Accent,
+            bold: false,
+        },
         PaintSpan {
             text: "  ".to_owned(),
             tone: Tone::Muted,
@@ -6153,12 +6163,7 @@ fn artifact_line(artifacts: &[ArtifactView], width: u16) -> Option<PaintLine> {
             bold: false,
         },
         PaintSpan {
-            text: format!("{more} · "),
-            tone: Tone::Muted,
-            bold: false,
-        },
-        PaintSpan {
-            text: "X".to_owned(),
+            text: more,
             tone: Tone::Muted,
             bold: false,
         },
@@ -6167,20 +6172,23 @@ fn artifact_line(artifacts: &[ArtifactView], width: u16) -> Option<PaintLine> {
         PaintLine {
             prefix: " ".to_owned(),
             prefix_tone: Tone::Muted,
-            text: ARTIFACT_GLYPH.to_owned(),
-            tone: Tone::Accent,
+            text: ARTIFACT_DISMISS.to_owned(),
+            tone: Tone::Muted,
             bold: false,
             tool_heading: None,
             pick: None,
             tail,
         }
         .with_tight_picks(&[
-            (0, Pick::OpenLink(latest.url.clone())),
+            (0, Pick::DismissArtifacts),
             (2, Pick::OpenLink(latest.url.clone())),
-            (4, Pick::DismissArtifacts),
+            (4, Pick::OpenLink(latest.url.clone())),
         ]),
     )
 }
+
+/// The artifact row's dismiss mark: the heavy cross, larger than the panels' ✕.
+const ARTIFACT_DISMISS: &str = "✖";
 
 /// The artifact row's marker: a framed page, distinct from the subagent bullet.
 const ARTIFACT_GLYPH: &str = "⧉";
@@ -18331,14 +18339,20 @@ mod tests {
         let text = painted(&line);
         assert!(text.contains("devez-test.html"), "{text}");
         assert!(text.contains("+1 more"), "{text}");
-        assert!(text.ends_with("+1 more · X"), "{text}");
+        assert!(text.starts_with(" ✖ · ⧉  devez-test.html"), "{text}");
+        assert!(text.ends_with("+1 more"), "{text}");
         assert!(!text.contains("click to open"), "{text}");
         assert!(!text.contains("old.html"), "{text}");
-        // Only the name carries the link underline: the glyph and the gap do not.
-        assert_eq!(line.tail[1].text, "devez-test.html");
-        assert_eq!(line.tail[1].tone, Tone::MarkdownLink);
-        assert_ne!(line.tone, Tone::MarkdownLink);
-        assert_ne!(line.tail[0].tone, Tone::MarkdownLink);
+        // Only the name carries the link underline: the marks and gaps do not.
+        assert_eq!(line.tail[3].text, "devez-test.html");
+        assert_eq!(line.tail[3].tone, Tone::MarkdownLink);
+        assert!(
+            std::iter::once(line.tone)
+                .chain(line.tail.iter().map(|span| span.tone))
+                .filter(|tone| *tone == Tone::MarkdownLink)
+                .count()
+                == 1
+        );
         let regions = &line.pick.as_ref().expect("clickable").0;
         assert!(regions.iter().any(|(_, _, pick)| {
             *pick == Pick::OpenLink("https://claude.ai/code/artifact/new".to_owned())
