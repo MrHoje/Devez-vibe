@@ -1,6 +1,7 @@
 {
   "name": "devez-vibe",
-  "version": "1.7.73",
+  "version": "1.7.74",
+  "type": "module",
   "description": "Stable terminal UI for Codex and Claude Agent SDK",
   "keywords": [
     "codex",
@@ -18,9 +19,10 @@
   },
   "license": "MIT",
   "bin": {
-    "dvz": "bin/dvz.exe"
+    "dvz": "bin/dvz.js"
   },
   "files": [
+    "bin/dvz.js",
     "bin/dvz.exe",
     "bridge/claude-agent-sdk-bridge.mjs",
     "install-skills.mjs",

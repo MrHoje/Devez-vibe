@@ -22,7 +22,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "업데이트를 새 창 없이 진행하고 다운로드 검증·복구·진행 표시를 추가했습니다.",
+    "실행 중인 세션을 유지하면서 다음 실행부터 새 버전을 사용하도록 업데이트 구조를 변경했습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
@@ -98,45 +98,52 @@ fn install_update(stage_path: &PathBuf) -> Result<()> {
     let latest = executable_version(&version.stdout)
         .filter(|candidate| parse_version(candidate).is_some())
         .context("내려받은 실행 파일의 버전을 확인하지 못해 기존 설치를 유지합니다.")?;
+    if latest != CURRENT_VERSION && !is_newer(latest, CURRENT_VERSION) {
+        println!("현재 v{CURRENT_VERSION}이 게시된 v{latest}보다 최신이므로 변경하지 않습니다.");
+        return Ok(());
+    }
     println!("Devez Vibe v{CURRENT_VERSION} → v{latest}");
 
     println!("완료: 실행 파일 검증");
-    let package = format!("{PACKAGE}@{latest}");
-    let installed = run_npm_with_progress(
+    let configured = run_npm_with_progress(
         stage_path,
-        "install",
-        "기존 설치 교체",
+        "configure",
+        "구성 요소 설치",
         &[
-            "install",
-            "-g",
-            &package,
-            "--prefer-online",
+            "rebuild",
+            "--prefix",
+            &stage,
+            PACKAGE,
             "--no-audit",
             "--no-fund",
         ],
     )?;
-    if !installed {
-        let current = format!("{PACKAGE}@{CURRENT_VERSION}");
-        let restored = run_npm_with_progress(
-            stage_path,
-            "restore",
-            "현재 버전 복구",
-            &[
-                "install",
-                "-g",
-                &current,
-                "--prefer-online",
-                "--no-audit",
-                "--no-fund",
-            ],
-        )?;
-        if restored {
-            anyhow::bail!("업데이트에 실패해 v{CURRENT_VERSION}으로 복구했습니다.");
-        }
-        anyhow::bail!("업데이트와 자동 복구에 실패했습니다. 위 npm 오류를 확인하세요.");
+    if !configured {
+        anyhow::bail!("구성 요소를 설치하지 못해 기존 버전을 유지합니다.");
     }
 
-    println!("Devez Vibe v{latest} 설치를 마쳤습니다. `dvz`를 다시 실행하세요.");
+    let version_root = managed_version_root(latest)?;
+    let managed_exe = version_root
+        .join("node_modules")
+        .join(PACKAGE)
+        .join("bin")
+        .join("dvz.exe");
+    if version_root.exists() {
+        let existing = Command::new(&managed_exe).arg("--version").output();
+        if !existing.is_ok_and(|output| {
+            output.status.success() && executable_version(&output.stdout) == Some(latest)
+        }) {
+            anyhow::bail!("기존 업데이트 파일이 손상되어 현재 버전을 유지합니다: {}", version_root.display());
+        }
+    } else {
+        fs::create_dir_all(version_root.parent().context("버전 저장 경로가 올바르지 않습니다.")?)
+            .context("버전 저장 폴더를 만들지 못했습니다.")?;
+        fs::rename(stage_path, &version_root).context("검증된 버전을 저장하지 못했습니다.")?;
+    }
+
+    activate_version(&managed_exe)?;
+    println!("완료: 다음 실행 버전 전환");
+    println!("Devez Vibe v{latest} 설치를 마쳤습니다. 새로 실행하는 세션부터 적용됩니다.");
     Ok(())
 }
 
@@ -150,6 +157,42 @@ fn npm_command() -> Command {
         command.env_remove("NO_COLOR");
     }
     command
+}
+
+fn managed_version_root(version: &str) -> Result<PathBuf> {
+    let local_app_data = env::var_os("LOCALAPPDATA")
+        .context("LOCALAPPDATA 환경변수를 찾지 못해 업데이트를 저장할 수 없습니다.")?;
+    Ok(PathBuf::from(local_app_data)
+        .join("DevezVibe")
+        .join("versions")
+        .join(version))
+}
+
+fn activate_version(executable: &PathBuf) -> Result<()> {
+    let pointer = executable
+        .ancestors()
+        .find(|path| path.file_name().is_some_and(|name| name == "DevezVibe"))
+        .context("업데이트 실행 파일의 저장 경로가 올바르지 않습니다.")?
+        .join("current-executable.txt");
+    let temporary = pointer.with_extension(format!("{}.tmp", std::process::id()));
+    let backup = pointer.with_extension("bak");
+
+    let mut file = File::create(&temporary).context("버전 전환 파일을 만들지 못했습니다.")?;
+    writeln!(file, "{}", executable.display()).context("버전 전환 파일을 쓰지 못했습니다.")?;
+    file.sync_all().context("버전 전환 파일을 저장하지 못했습니다.")?;
+
+    if pointer.exists() {
+        let _ = fs::remove_file(&backup);
+        fs::rename(&pointer, &backup).context("현재 버전 정보를 백업하지 못했습니다.")?;
+    }
+    if let Err(error) = fs::rename(&temporary, &pointer) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, &pointer);
+        }
+        return Err(error).context("새 버전을 활성화하지 못했습니다.");
+    }
+    let _ = fs::remove_file(backup);
+    Ok(())
 }
 
 fn run_npm_with_progress(
@@ -311,5 +354,13 @@ mod tests {
     fn extracts_version_from_staged_executable() {
         assert_eq!(executable_version(b"dvz 1.7.73\r\n"), Some("1.7.73"));
         assert_eq!(executable_version(b""), None);
+    }
+
+    #[test]
+    fn npm_launcher_uses_managed_version_with_packaged_fallback() {
+        let launcher = include_str!("../npm/bin/dvz.js");
+        assert!(launcher.contains("current-executable.txt"));
+        assert!(launcher.contains("packageExecutable"));
+        assert!(launcher.contains("existsSync(candidate)"));
     }
 }

@@ -1,7 +1,8 @@
 /target/
 /target-*/
 /.gjc/
-/npm/bin/
+/npm/bin/*
+!/npm/bin/dvz.js
 /npm/node_modules/
 /npm/LICENSE
 /.claude/
