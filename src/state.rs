@@ -570,8 +570,8 @@ const SLASH_COMMANDS: [SlashCommand; 34] = [
     },
     SlashCommand {
         name: "/fast",
-        description: "Choose the model's fast service tier",
-        takes_argument: true,
+        description: "Toggle the model's fast service tier",
+        takes_argument: false,
     },
     SlashCommand {
         name: "/response",
@@ -1806,7 +1806,6 @@ enum DisplaySetting {
     Response,
     Shell,
     Diff,
-    Fast,
 }
 
 impl DisplaySetting {
@@ -1815,7 +1814,6 @@ impl DisplaySetting {
             Self::Response => "Response",
             Self::Shell => "Shell",
             Self::Diff => "Diff",
-            Self::Fast => "Fast",
         }
     }
 
@@ -1823,7 +1821,6 @@ impl DisplaySetting {
         match self {
             Self::Response => &["All", "Completed"],
             Self::Shell | Self::Diff => &["Hide", "Collapse", "Expand"],
-            Self::Fast => &["On", "Off"],
         }
     }
 
@@ -5424,8 +5421,8 @@ impl AppState {
         });
     }
 
-    /// Opens the Vibe preset picker, the way `/vibemode` and the composer's Vibe
-    /// badge do — a menu instead of an instant cycle.
+    /// Opens the Vibe preset picker for `/vibemode`. The composer's Vibe badge
+    /// cycles the same presets immediately instead.
     pub fn open_vibe_mode_picker(&mut self) {
         self.pending = Some(PendingInteraction::VibeModePicker {
             selected: self.vibe_mode.picker_index(),
@@ -9146,7 +9143,7 @@ impl AppState {
                 let fast_help = if using_claude {
                     ""
                 } else {
-                    "/fast [on|off]  Fast 서비스 티어 선택\n"
+                    "/fast  Fast 서비스 티어 전환\n"
                 };
                 let effort_help = if self
                     .selected_model()
@@ -9200,11 +9197,7 @@ impl AppState {
                     ));
                     Action::None
                 } else {
-                    self.open_setting_picker(
-                        DisplaySetting::Fast,
-                        if self.effective_fast_mode() { 0 } else { 1 },
-                    );
-                    Action::None
+                    Action::SetFast(!self.effective_fast_mode())
                 }
             }
             "/fast" if parts.len() == 2 => {
@@ -13650,7 +13643,6 @@ impl AppState {
                 self.vibe_mode = VibeMode::Vibe;
                 Action::PersistDiffDisplayMode(mode)
             }
-            DisplaySetting::Fast => Action::SetFast(selected == 0),
         }
     }
 
@@ -17609,7 +17601,7 @@ mod tests {
             .overlay_view()
             .and_then(|overlay| overlay.slider)
             .expect("knowledge choices");
-        assert_eq!(slider.efforts, ["끔", "켬"]);
+        assert_eq!(slider.efforts, ["Off", "Auto"]);
         assert_eq!(slider.selected, 0);
 
         state.handle_key(KeyEvent::from(KeyCode::Right));
@@ -20883,7 +20875,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_diff_and_fast_commands_open_selectable_setting_pickers() {
+    fn shell_and_diff_commands_open_pickers_while_fast_toggles_directly() {
         let mut state = test_state();
 
         assert!(matches!(state.run_slash_command("/shell"), Action::None));
@@ -20909,11 +20901,17 @@ mod tests {
             Action::PersistDiffDisplayMode(DiffDisplayMode::Hide)
         ));
 
-        assert!(matches!(state.run_slash_command("/fast"), Action::None));
-        let fast = state.overlay_view().expect("fast picker");
-        assert_eq!(fast.title, "Fast");
-        assert_eq!(fast.slider.as_ref().expect("steps").efforts, ["On", "Off"]);
-        assert!(matches!(state.click_effort_step(0), Action::SetFast(true)));
+        state.set_fast_mode(false);
+        assert!(matches!(
+            state.run_slash_command("/fast"),
+            Action::SetFast(true)
+        ));
+        assert!(state.overlay_view().is_none());
+        state.set_fast_mode(true);
+        assert!(matches!(
+            state.run_slash_command("/fast"),
+            Action::SetFast(false)
+        ));
     }
 
     #[test]
@@ -20960,7 +20958,7 @@ mod tests {
         let badge = state.composer_mode();
 
         assert_eq!(badge.label, "Full Access");
-        assert_eq!(badge.knowledge_mode, "지식: 끔");
+        assert_eq!(badge.knowledge_mode, "Knowledge: Off");
         assert_eq!(badge.vibe_mode, "Vibe: On");
 
         state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));

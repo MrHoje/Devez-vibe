@@ -60,15 +60,15 @@ impl KnowledgeMode {
 
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Off => "지식: 끔",
-            Self::On => "지식: 켬",
+            Self::Off => "Knowledge: Off",
+            Self::On => "Knowledge: Auto",
         }
     }
 
     pub const fn picker_label(self) -> &'static str {
         match self {
-            Self::Off => "끔",
-            Self::On => "켬",
+            Self::Off => "Off",
+            Self::On => "Auto",
         }
     }
 
@@ -1299,6 +1299,16 @@ fn command_for(path: &Path) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mode_labels_use_auto_and_off_wording() {
+        assert_eq!(KnowledgeMode::Off.label(), "Knowledge: Off");
+        assert_eq!(KnowledgeMode::On.label(), "Knowledge: Auto");
+        assert_eq!(
+            KnowledgeMode::PICKER_CHOICES.map(KnowledgeMode::picker_label),
+            ["Off", "Auto"]
+        );
+    }
 
     fn temp_project(name: &str) -> PathBuf {
         static ID: AtomicU64 = AtomicU64::new(1);

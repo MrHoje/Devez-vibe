@@ -2337,14 +2337,18 @@ fn renderer_mouse_action(
     }
 }
 
-/// Clicking a reading on the chrome does what the key or command that owns that
-/// setting does — nothing is duplicated here, so a badge and its shortcut can
-/// never drift apart. Overlay picks belong to whoever painted the overlay.
+/// Clicking a reading on the chrome applies its shortest interaction. Overlay
+/// picks belong to whoever painted the overlay.
 fn pick_action(state: &mut AppState, pick: Pick) -> Action {
     match pick {
         Pick::VibeMode => {
-            state.open_vibe_mode_picker();
-            Action::None
+            let (shell, diff) = state.cycle_vibe_mode();
+            Action::PersistVibeDisplayModes {
+                vibe: state.vibe_mode(),
+                response: state.response_length(),
+                shell,
+                diff,
+            }
         }
         Pick::KnowledgeMode => {
             state.open_knowledge_mode_picker();
@@ -6851,31 +6855,26 @@ mod tests {
     }
 
     #[test]
-    fn clicking_the_fast_badge_opens_the_fast_picker() {
+    fn clicking_the_fast_status_reading_toggles_fast_mode() {
         let mut state = state_with_a_model();
+        state.set_fast_mode(false);
 
         let action = pick_action(&mut state, Pick::FastMode);
 
-        assert!(matches!(action, Action::None));
-        assert_eq!(
-            state.view().overlay.map(|overlay| overlay.title),
-            Some("Fast".to_owned())
-        );
+        assert!(matches!(action, Action::SetFast(true)));
+        assert!(state.view().overlay.is_none());
     }
 
     #[test]
-    fn clicking_the_vibe_badge_opens_its_picker() {
+    fn clicking_the_vibe_badge_cycles_and_persists_the_next_mode() {
         let mut state = starting_state();
-        let before = state.vibe_mode();
 
-        let action = pick_action(&mut state, Pick::VibeMode);
-
-        assert!(matches!(action, Action::None));
-        assert_eq!(state.vibe_mode(), before);
-        assert_eq!(
-            state.view().overlay.map(|overlay| overlay.title),
-            Some("Vibe Mode".to_owned())
-        );
+        for expected in [VibeMode::SuperVibe, VibeMode::Normal, VibeMode::Vibe] {
+            let action = pick_action(&mut state, Pick::VibeMode);
+            assert!(matches!(action, Action::PersistVibeDisplayModes { .. }));
+            assert_eq!(state.vibe_mode(), expected);
+        }
+        assert!(state.view().overlay.is_none());
     }
 
     #[test]

@@ -12657,7 +12657,7 @@ fn composer_chrome_tone(mode: Option<&ComposerMode>) -> Tone {
         .unwrap_or(Tone::Border)
 }
 
-/// Widest knowledge/Vibe badge pair that fits without clipping a label.
+/// Widest Vibe/knowledge badge pair that fits without clipping a label.
 fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans> {
     let mut display_spans = Vec::new();
     if let Some(branch) = mode.branch.as_deref().filter(|branch| !branch.is_empty()) {
@@ -12687,14 +12687,14 @@ fn fitting_badge_spans(mode: &ComposerMode, budget: usize) -> Option<BadgeSpans>
         spans: [
             display_spans.clone(),
             vec![
-                knowledge_mode_span.clone(),
-                separator_span(),
                 vibe_mode_span.clone(),
+                separator_span(),
+                knowledge_mode_span.clone(),
             ],
         ]
         .concat(),
-        knowledge_mode_index: Some(display_width),
-        vibe_mode_index: Some(display_width + 2),
+        knowledge_mode_index: Some(display_width + 2),
+        vibe_mode_index: Some(display_width),
         shell_display_mode_index: None,
         diff_display_mode_index: None,
     };
@@ -14798,7 +14798,7 @@ mod tests {
                 .expect("badge fits beside a short activity label");
             let text = painted(&line);
             assert!(
-                text.contains("지식: 끔 · Vibe: Super Vibe"),
+                text.contains("Vibe: Super Vibe · Knowledge: Off"),
                 "badge tail must survive layout, got {text:?}"
             );
             assert!(
@@ -14826,7 +14826,7 @@ mod tests {
             let line = input_top_line(120, "", Some(&mode));
             let text = painted(&line);
             assert!(
-                text.contains("지식: 끔 · Vibe: Super Vibe"),
+                text.contains("Vibe: Super Vibe · Knowledge: Off"),
                 "composer badge tail must survive layout, got {text:?}"
             );
             assert!(
@@ -17680,7 +17680,7 @@ mod tests {
         assert!(!painted(&frame.lines[activity]).contains("View: Chat"));
         assert!(!painted(&frame.lines[activity]).contains("Response:"));
         assert!(!painted(&frame.lines[activity]).contains("Fast:"));
-        assert!(painted(&frame.lines[activity]).contains("지식: 끔"));
+        assert!(painted(&frame.lines[activity]).contains("Knowledge: Off"));
         assert!(!painted(&frame.lines[activity + 1]).contains("View: Chat"));
         assert_eq!(painted_width(&frame.lines[activity]), 158);
         assert_eq!(frame.lines[activity + 1].tone, Tone::ModelTerra);
@@ -17901,7 +17901,7 @@ mod tests {
         ComposerMode {
             agent: AgentMode::Standard,
             branch: None,
-            knowledge_mode: "지식: 끔".to_owned(),
+            knowledge_mode: "Knowledge: Off".to_owned(),
             knowledge_enabled: false,
             vibe_mode: "Vibe: On".to_owned(),
             vibe_tone: VibeTone::On,
@@ -18323,14 +18323,15 @@ mod tests {
             texts,
             [
                 "  ",
-                "지식: 끔",
-                " · ",
                 "Vibe: On",
+                " · ",
+                "Knowledge: Off",
                 " ",
                 "──"
             ]
         );
-        assert_eq!(line.tail[1].tone, Tone::FastOff);
+        assert_eq!(line.tail[1].tone, Tone::FastOn);
+        assert_eq!(line.tail[3].tone, Tone::FastOff);
         assert!(!painted(&line).contains("Response:"));
         assert!(!painted(&line).contains("Fast:"));
     }
@@ -18365,7 +18366,7 @@ mod tests {
 
         let line = input_top_line(120, "", Some(&mode));
 
-        assert!(painted(&line).contains("지식: 끔 · Vibe: Super Vibe"));
+        assert!(painted(&line).contains("Vibe: Super Vibe · Knowledge: Off"));
         assert!(!painted(&line).contains("mode"));
         assert_eq!(pick_on(&line, "Response: Completed"), None);
         assert!(!painted(&line).contains("Fast:"));
@@ -18393,7 +18394,7 @@ mod tests {
         assert!(!painted(&frame.lines[composer - 1]).contains("View: Chat"));
         assert!(!painted(&frame.lines[composer - 1]).contains("Response:"));
         assert!(!painted(&frame.lines[composer - 1]).contains("Fast:"));
-        assert!(painted(&frame.lines[composer - 1]).contains("지식: 끔"));
+        assert!(painted(&frame.lines[composer - 1]).contains("Knowledge: Off"));
         assert!(!painted(&frame.lines[composer]).contains("View: Chat"));
     }
 
@@ -18421,7 +18422,7 @@ mod tests {
         let mode = super_vibe_mode("Full Access", ModeAccent::Danger, true);
         let line = input_top_line(120, "", Some(&mode));
         assert_eq!(pick_on(&line, "View: Chat"), None);
-        assert_eq!(pick_on(&line, "지식: 끔"), Some(Pick::KnowledgeMode));
+        assert_eq!(pick_on(&line, "Knowledge: Off"), Some(Pick::KnowledgeMode));
         assert_eq!(pick_on(&line, "Vibe: Super Vibe"), Some(Pick::VibeMode));
         assert_eq!(pick_on(&line, "Response: Completed"), None);
         assert_eq!(pick_on(&line, "Fast: On"), None);
@@ -18450,7 +18451,7 @@ mod tests {
         let line = input_top_line(120, "3/12", Some(&mode));
 
         assert_eq!(pick_on(&line, "Vibe: Super Vibe"), Some(Pick::VibeMode));
-        assert_eq!(pick_on(&line, "지식: 끔"), Some(Pick::KnowledgeMode));
+        assert_eq!(pick_on(&line, "Knowledge: Off"), Some(Pick::KnowledgeMode));
         assert_eq!(pick_on(&line, "Response: Completed"), None);
         assert_eq!(pick_on(&line, "Fast: On"), None);
         assert_eq!(pick_on(&line, "[$0.95]"), None);
@@ -18463,10 +18464,10 @@ mod tests {
         let mode = super_vibe_mode("Full Access", ModeAccent::Danger, true);
         let line = input_top_line(56, "", Some(&mode));
 
-        assert!(painted(&line).contains("지식: 끔"));
+        assert!(painted(&line).contains("Knowledge: Off"));
         assert!(!painted(&line).contains("Response:"));
         assert!(!painted(&line).contains("Fast:"));
-        assert_eq!(pick_on(&line, "지식: 끔"), Some(Pick::KnowledgeMode));
+        assert_eq!(pick_on(&line, "Knowledge: Off"), Some(Pick::KnowledgeMode));
         assert_eq!(pick_on(&line, "Vibe: Super Vibe"), Some(Pick::VibeMode));
     }
 
@@ -18485,9 +18486,9 @@ mod tests {
             texts,
             [
                 "  ",
-                "지식: 끔",
-                " · ",
                 "Vibe: Super Vibe",
+                " · ",
+                "Knowledge: Off",
                 " ",
                 "──"
             ]
@@ -18515,7 +18516,7 @@ mod tests {
         let line = input_top_line(120, "", Some(&mode));
 
         assert!(painted(&line).contains(
-            "* main | 지식: 끔 · Vibe: Super Vibe"
+            "* main | Vibe: Super Vibe · Knowledge: Off"
         ));
         assert!(!painted(&line).contains("$0.95"));
     }
@@ -18540,7 +18541,7 @@ mod tests {
         );
 
         assert_eq!(
-            pick_on(&line, "지식: 끔"),
+            pick_on(&line, "Knowledge: Off"),
             Some(Pick::KnowledgeMode)
         );
     }
@@ -18558,16 +18559,17 @@ mod tests {
         };
 
         let on = tones(&mode);
-        assert!(on.contains(&("지식: 끔".to_owned(), Tone::FastOff)));
+        assert!(on.contains(&("Knowledge: Off".to_owned(), Tone::FastOff)));
         assert!(on.contains(&("Vibe: Super Vibe".to_owned(), Tone::VibeSuper)));
         assert!(!on.iter().any(|(text, _)| text == "View: Chat"));
         assert!(!on.iter().any(|(text, _)| text.starts_with("Response:")));
         assert!(!on.iter().any(|(text, _)| text.starts_with("Fast:")));
 
         mode.knowledge_enabled = true;
+        mode.knowledge_mode = "Knowledge: Auto".to_owned();
         mode.vibe_tone = VibeTone::On;
         let ordinary = tones(&mode);
-        assert!(ordinary.contains(&("지식: 끔".to_owned(), Tone::ResponseCompleted)));
+        assert!(ordinary.contains(&("Knowledge: Auto".to_owned(), Tone::ResponseCompleted)));
     }
 
     #[test]
@@ -18637,7 +18639,7 @@ mod tests {
         assert_eq!(rule_width(&line), 66);
         assert!(!painted(&line).contains("$0.95"));
         assert!(painted(&line).contains("Vibe: Super Vibe"));
-        assert!(painted(&line).contains("지식: 끔"));
+        assert!(painted(&line).contains("Knowledge: Off"));
         assert!(!painted(&line).contains("Response:"));
         assert!(!painted(&line).contains("Fast:"));
     }
@@ -18657,9 +18659,9 @@ mod tests {
             texts,
             [
                 "  ",
-                "지식: 끔",
-                " · ",
                 "Vibe: Super Vibe",
+                " · ",
+                "Knowledge: Off",
                 " ",
                 "──"
             ]
@@ -19437,7 +19439,7 @@ mod tests {
             composer_mode: Some(ComposerMode {
                 agent: AgentMode::Standard,
                 branch: Some("main".to_owned()),
-                knowledge_mode: "지식: 끔".to_owned(),
+                knowledge_mode: "Knowledge: Off".to_owned(),
                 knowledge_enabled: false,
                 vibe_mode: "Super Vibe".to_owned(),
                 vibe_tone: VibeTone::Super,
@@ -24280,7 +24282,7 @@ mod tests {
         let hovered = Renderer::hover_columns(&line, None, Some(&Pick::KnowledgeMode))
             .expect("knowledge badge is clickable");
         let text = painted(&line);
-        let knowledge_start = UnicodeWidthStr::width(&text[..text.find("지식: 끔").unwrap()]);
+        let knowledge_start = UnicodeWidthStr::width(&text[..text.find("Knowledge: Off").unwrap()]);
 
         assert_eq!(hovered.start, knowledge_start);
     }
