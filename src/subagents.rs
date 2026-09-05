@@ -46,10 +46,12 @@ const LEGACY_IMPLEMENTER: &[&str] = &[
 const LEGACY_REVIEWER: &[&str] = &[
     include_str!("../prompts/agents/subagents/legacy/reviewer.md"),
     include_str!("../prompts/agents/subagents/legacy/reviewer-v2.md"),
+    include_str!("../prompts/agents/subagents/legacy/reviewer-v3.md"),
 ];
 const LEGACY_QA: &[&str] = &[
     include_str!("../prompts/agents/subagents/legacy/qa.md"),
     include_str!("../prompts/agents/subagents/legacy/qa-v2.md"),
+    include_str!("../prompts/agents/subagents/legacy/qa-v3.md"),
 ];
 
 const EDITING_TOOLS: &[&str] = &["Read", "Edit", "Write", "Glob", "Grep", "Bash"];

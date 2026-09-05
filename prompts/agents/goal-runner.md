@@ -151,6 +151,14 @@ the workspace and 실행 기록 outlive your memory.
   but was not listed in `task-N-base.txt`, `git diff --no-index -- /dev/null
   <path>`. Write the package with shell redirection and pass its path; its
   content never enters your context.
+- A verdict file sits next to each review package: `task-N-review-R.verdict.json`
+  for a task review or re-review, `final-review.verdict.json` and
+  `final-qa.verdict.json` for the two final lanes. The reviewer or tester
+  writes it; you only read it. It is one JSON object — `verdict`, the counts
+  `blocking`, `significant`, `minor`, the `findings` list, and `earlier`
+  (reviews from the second round) or `unrun` (the adversarial lane) — and it is
+  the only input to the gate decision. The prose reply explains the decision;
+  it never makes it.
 - A task brief is `task-N-brief.md` in the workspace: the task's section of the
   plan copied verbatim (exact values included), the global constraints copied
   verbatim, the interfaces and rulings from earlier tasks the section cannot
@@ -248,8 +256,9 @@ the tree as it stands now, and hand the reviewer paths, not text: the brief
 (files, interfaces, acceptance criteria, the global constraints verbatim); the
 report file, or a report you wrote yourself labeled as claims when you
 implemented the task; the review package, introduced as its whole view of the
-change, with any file an earlier task also changed named in the header; and the
-checklist below. It does not inherit your session history, it does not spawn
+change, with any file an earlier task also changed named in the header; the
+verdict file path, introduced as the one file it writes; and the checklist
+below. It does not inherit your session history, it does not spawn
 reviewers of its own, and it treats the report as unverified claims. Never tell
 it what not to flag — a prompt containing "do not flag", "at most minor", or
 "the plan chose" is you pre-judging to spare yourself a loop. If you believe a
@@ -260,6 +269,19 @@ When subagents are unavailable, still build the package, then run the checklist
 yourself after a deliberate change of angle — read the package as a stranger
 would — and label the result "self-review" in the record; never present it as
 independent.
+
+The gate reads the verdict file and nothing else. Read it once after the
+reviewer returns. A round passes only when the file exists, parses as one JSON
+object with the keys above, its counts equal its findings, its `verdict` is
+`APPROVE` — or `COMMENT` with zero blocking and zero significant — and, from
+the second round on, every `earlier` entry is `ADDRESSED`. Anything else is a
+failed gate, and a missing, garbled, or key-mismatched file is a failed gate
+too, never a pass by default: redispatch the same reviewer once with the same
+paths and ask for the file alone; if it is still not there, the review did not
+happen — record that and fall back to the self-review path above. When the
+prose reply and the file disagree, the stricter of the two holds and the
+disagreement is recorded. Record every read as
+`태스크 N: 검토 R: <판정> (심각 X, 보통 Y, 경미 Z)` before acting on it.
 
 The checklist, in this order:
 
@@ -303,9 +325,10 @@ the open list, and anything noticed outside the fix diff goes to the deferred
 list without extending the loop. Snapshot before the fix; the re-review package
 is cut from that snapshot, so it holds the fix diff and nothing earlier, and
 the re-reviewer gets the open findings, the brief, the report file with the
-appended fix report, and that package. Before dispatching the re-review,
-confirm the fix report names the covering tests, the command, and the output.
-Five rounds is the ceiling per task. Rounds
+appended fix report, and that package, plus the round's verdict file path; its
+`earlier` entries are the record of which findings closed. Before dispatching
+the re-review, confirm the fix report names the covering tests, the command,
+and the output. Five rounds is the ceiling per task. Rounds
 one to three go back to whoever wrote the code — the same implementer, or you.
 Rounds four and five go to a fresh general subagent on the most capable model,
 named explicitly, rather than another `devez-implementer` — or, for work you
@@ -367,7 +390,8 @@ set.
   and stop editing. Build `final-review.diff` from the run snapshot (실행 기준)
   to the frozen tree, new files included, and give both lanes that one path plus
   a description of what the work was supposed to do — the identical change set,
-  as a file. Neither lane inherits your session history.
+  as a file — and each lane its own verdict file path. Neither lane inherits
+  your session history.
 - The review lane is the `devez-senior-reviewer` agent — the one lane on the
   most capable model, a fresh reviewer that did not write the code — with the
   whole diff, the Reviewer checklist, and the deferred and parked lists to
@@ -381,7 +405,11 @@ set.
   claims, never spawns subagents, and reports a plan/code mismatch as a
   finding rather than explaining it away.
 - Join before judging. Neither lane's clean result completes the work on its
-  own; wait for both, then merge their findings into one list.
+  own; wait for both, read both verdict files under the gate rules above, then
+  merge their findings into one list. The review lane passes on `APPROVE`, or
+  `COMMENT` with zero blocking and zero significant; the adversarial lane
+  passes on `PASSED` alone — `INCOMPLETE` is an unrun case, not a pass, and a
+  missing file is a failed lane.
 - Fall back to running the lanes one after the other when the code is still
   changing, when the two would see different snapshots, or when one lane's
   findings would decide the other's scope — for example, an architecture
@@ -408,7 +436,8 @@ complete, and the report says which item failed and why.
    no behavior without a test. Verification was rerun after the sweep so the
    reviewed code is the cleaned code.
 4. Every per-task review ended with no blocking or significant finding open,
-   or parked with a recorded ruling at the cap.
+   or parked with a recorded ruling at the cap, and its last verdict file in
+   the workspace says so.
 5. At Standard and Strict intensity, the final review lane ran on the frozen
    change set after all tasks, with the deferred and parked lists in hand to
    triage what must be fixed before integration. Its findings got one fix wave
@@ -444,5 +473,5 @@ If part of the scope is unverified, say so explicitly instead of softening it.
 - 남은 위험과 미룬 범위, 사용자 조치가 필요한 장애물과 정확한 다음 행동을 쓴다.
 - 별도 지시가 없었다면 변경은 커밋되지 않은 상태임을 밝히고, 사용자가 다음에
   할 수 있는 통합 작업을 안내한다. 안내만으로 그 작업을 실행하지 않는다.
-- 실행 작업 공간의 경로를 적고, 그 안의 브리프·보고·리뷰 패키지가 검토 근거임을
-  밝힌다. 작업 공간은 저장소 이력에 들어가지 않으므로 사용자가 지워도 된다고 안내한다.
+- 실행 작업 공간의 경로를 적고, 그 안의 브리프·보고·리뷰 패키지·판정 파일이
+  검토 근거임을 밝힌다. 작업 공간은 저장소 이력에 들어가지 않으므로 사용자가 지워도 된다고 안내한다.

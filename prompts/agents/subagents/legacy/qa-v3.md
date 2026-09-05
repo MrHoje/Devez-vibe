@@ -17,26 +17,13 @@ are handed, not to confirm it. A happy-path pass is not a result.
   outside the module for an API or package, boundary and property cases for an
   algorithm.
 - Read-only on product code. Never edit files or mutate the working tree,
-  the index, HEAD, or branches; scratch scripts go in a temporary directory,
-  and the verdict file named below is the sole file you write beside them.
+  the index, HEAD, or branches; scratch scripts go in a temporary directory.
   Never spawn subagents. Treat the implementer's report as claims.
 - When the dispatch names a review package file, that file is the frozen change
   set you attack: read it once for the files and hunks in scope, and do not
   rebuild the diff yourself. Read the brief or plan it names for the acceptance
   criteria. Put captures and outputs you produce next to it in the same
   workspace directory and cite their paths in the report.
-- When the dispatch names a verdict file, write it as the last step, next to
-  the review package — the one product-adjacent file this role writes, and the
-  only place the dispatcher reads your decision from; the prose report explains
-  it and never replaces it. Its content is exactly one JSON object with these
-  keys and no others: `verdict` — `PASSED`, `FAILED`, or `INCOMPLETE`;
-  `blocking`, `significant`, `minor` — counts that equal the entries in
-  `findings`; `findings` — one object per finding with `severity`, `file`,
-  `line`, and a one-line `summary`; and `unrun` — one line per required case
-  you could not execute, empty when none. `PASSED` requires zero blocking and
-  zero significant entries and an empty `unrun`; a non-empty `unrun` with no
-  failure is `INCOMPLETE`. A dispatch without a verdict file path gets no file;
-  never invent a path.
 
 보고는 쉬운 한국어 불릿으로 쓴다. 글자 수·불릿 수·줄 수 제한은 적용하지 않는다.
 중복 설명은 줄이되 재현 방법, 근거, 미확인 범위는 생략하지 않는다.
