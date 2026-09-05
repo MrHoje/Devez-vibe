@@ -5996,7 +5996,7 @@ fn queue_preview_line(prompt: &str, index: usize, width: u16) -> PaintLine {
     PaintLine {
         prefix: " ".to_owned(),
         prefix_tone: Tone::Muted,
-        text: "X".to_owned(),
+        text: "x".to_owned(),
         tone: Tone::Muted,
         bold: false,
         tool_heading: None,
@@ -6130,28 +6130,19 @@ fn artifact_line(artifacts: &[ArtifactView], width: u16) -> Option<PaintLine> {
         0 | 1 => String::new(),
         count => format!(" · +{} more", count - 1),
     };
+    // The trailing `x` is the CLI's own dismiss key, drawn here as a click target.
+    let dismiss = " · x";
     let reserved = 1
-        + UnicodeWidthStr::width(ARTIFACT_DISMISS)
-        + 3
         + UnicodeWidthStr::width(ARTIFACT_GLYPH)
         + 2
-        + UnicodeWidthStr::width(more.as_str());
+        + UnicodeWidthStr::width(more.as_str())
+        + UnicodeWidthStr::width(dismiss);
     let name = compact_right(
         &latest.name,
         usize::from(width).saturating_sub(reserved + 1),
     );
     // The gap sits in its own span so the link underline starts at the name.
     let tail = vec![
-        PaintSpan {
-            text: " · ".to_owned(),
-            tone: Tone::Muted,
-            bold: false,
-        },
-        PaintSpan {
-            text: ARTIFACT_GLYPH.to_owned(),
-            tone: Tone::Accent,
-            bold: false,
-        },
         PaintSpan {
             text: "  ".to_owned(),
             tone: Tone::Muted,
@@ -6163,7 +6154,12 @@ fn artifact_line(artifacts: &[ArtifactView], width: u16) -> Option<PaintLine> {
             bold: false,
         },
         PaintSpan {
-            text: more,
+            text: format!("{more} · "),
+            tone: Tone::Muted,
+            bold: false,
+        },
+        PaintSpan {
+            text: "x".to_owned(),
             tone: Tone::Muted,
             bold: false,
         },
@@ -6172,23 +6168,20 @@ fn artifact_line(artifacts: &[ArtifactView], width: u16) -> Option<PaintLine> {
         PaintLine {
             prefix: " ".to_owned(),
             prefix_tone: Tone::Muted,
-            text: ARTIFACT_DISMISS.to_owned(),
-            tone: Tone::Muted,
+            text: ARTIFACT_GLYPH.to_owned(),
+            tone: Tone::Accent,
             bold: false,
             tool_heading: None,
             pick: None,
             tail,
         }
         .with_tight_picks(&[
-            (0, Pick::DismissArtifacts),
+            (0, Pick::OpenLink(latest.url.clone())),
             (2, Pick::OpenLink(latest.url.clone())),
-            (4, Pick::OpenLink(latest.url.clone())),
+            (4, Pick::DismissArtifacts),
         ]),
     )
 }
-
-/// The artifact row's dismiss mark: the heavy cross, larger than the panels' ✕.
-const ARTIFACT_DISMISS: &str = "✖";
 
 /// The artifact row's marker: a framed page, distinct from the subagent bullet.
 const ARTIFACT_GLYPH: &str = "⧉";
@@ -18144,8 +18137,8 @@ mod tests {
     fn queue_preview_is_one_line_and_truncates_the_prompt() {
         let line = queue_preview_line("a very long queued prompt", 0, 18);
 
-        assert_eq!(painted(&line), " X Queue: a very…");
-        assert_eq!(pick_on(&line, "X"), Some(Pick::RemoveQueuedPrompt(0)));
+        assert_eq!(painted(&line), " x Queue: a very…");
+        assert_eq!(pick_on(&line, "x"), Some(Pick::RemoveQueuedPrompt(0)));
     }
 
     #[test]
@@ -18159,13 +18152,13 @@ mod tests {
         assert_eq!(
             lines.iter().map(painted).collect::<Vec<_>>(),
             [
-                " X Queue: first",
-                " X Queue: second",
-                " X Queue: third",
-                " X Queue: fourth"
+                " x Queue: first",
+                " x Queue: second",
+                " x Queue: third",
+                " x Queue: fourth"
             ]
         );
-        assert_eq!(pick_on(&lines[3], "X"), Some(Pick::RemoveQueuedPrompt(3)));
+        assert_eq!(pick_on(&lines[3], "x"), Some(Pick::RemoveQueuedPrompt(3)));
     }
 
     fn test_subagent(name: &str, description: &str, tool: &str, secs: u64) -> SubagentView {
@@ -18339,13 +18332,14 @@ mod tests {
         let text = painted(&line);
         assert!(text.contains("devez-test.html"), "{text}");
         assert!(text.contains("+1 more"), "{text}");
-        assert!(text.starts_with(" ✖ · ⧉  devez-test.html"), "{text}");
-        assert!(text.ends_with("+1 more"), "{text}");
+        assert!(text.starts_with(" ⧉  devez-test.html"), "{text}");
+        assert!(text.ends_with("+1 more · x"), "{text}");
         assert!(!text.contains("click to open"), "{text}");
         assert!(!text.contains("old.html"), "{text}");
+        assert_eq!(pick_on(&line, "x"), Some(Pick::DismissArtifacts));
         // Only the name carries the link underline: the marks and gaps do not.
-        assert_eq!(line.tail[3].text, "devez-test.html");
-        assert_eq!(line.tail[3].tone, Tone::MarkdownLink);
+        assert_eq!(line.tail[1].text, "devez-test.html");
+        assert_eq!(line.tail[1].tone, Tone::MarkdownLink);
         assert!(
             std::iter::once(line.tone)
                 .chain(line.tail.iter().map(|span| span.tone))

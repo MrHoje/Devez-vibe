@@ -20,7 +20,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
     "Claude 세션을 재개하면 이전에 게시한 Artifact 링크 행이 상태줄 아래에 다시 나타납니다. 순정 Claude Code와 같은 동작입니다.",
-    "Artifact 링크 행은 ✖ · ⧉ 파일이름 순서로 표시합니다. 맨 앞의 ✖를 클릭하면 숨기고, 밑줄은 파일 이름에만 표시합니다.",
+    "Artifact 링크 행을 순정 Claude Code처럼 ⧉ 파일이름 · x 순서로 표시합니다. 끝의 x를 클릭하면 숨기고, 밑줄은 파일 이름에만 표시합니다.",
+    "대기 프롬프트(Queue) 행의 제거 표시를 소문자 x로 바꿨습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
