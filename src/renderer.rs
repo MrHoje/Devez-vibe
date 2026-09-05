@@ -11085,7 +11085,8 @@ fn markdown_line(
     bold: bool,
     width: u16,
 ) -> Vec<PaintLine> {
-    if !text.contains('`') && !text.contains("**") && !text.contains('[') {
+    if !text.contains('`') && !text.contains("**") && !text.contains('[') && !text.contains("http")
+    {
         return wrapped_line(prefix, prefix_tone, text, tone, bold, width);
     }
 
@@ -11113,11 +11114,19 @@ fn markdown_line(
             index += consumed;
             continue;
         }
+        if let Some(url) = bare_url(rest) {
+            push_highlight_span(&mut spans, url, Tone::MarkdownLink, strong);
+            links.push((url.to_owned(), url.to_owned()));
+            index += url.len();
+            continue;
+        }
 
         let next_marker = [
             rest.find("**").unwrap_or(rest.len()),
             rest.find('`').unwrap_or(rest.len()),
             rest.find('[').unwrap_or(rest.len()),
+            rest.find("http://").unwrap_or(rest.len()),
+            rest.find("https://").unwrap_or(rest.len()),
         ]
         .into_iter()
         .min()
@@ -11134,6 +11143,26 @@ fn markdown_line(
     let mut lines = styled_lines(prefix, prefix_tone, spans, tone, bold, width);
     attach_markdown_link_picks(&mut lines, &links);
     lines
+}
+
+/// A bare `http(s)://` URL at the head of `rest`, the way Claude Code's CLI
+/// turns a plain share link into a terminal hyperlink. The URL ends at the
+/// first space or non-ASCII character, and the punctuation a sentence hangs on
+/// its tail is not part of it.
+fn bare_url(rest: &str) -> Option<&str> {
+    if !rest.starts_with("http://") && !rest.starts_with("https://") {
+        return None;
+    }
+    let end = rest
+        .find(|ch: char| ch.is_whitespace() || !ch.is_ascii())
+        .unwrap_or(rest.len());
+    let url = rest[..end].trim_end_matches(|ch: char| {
+        matches!(
+            ch,
+            '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '>' | '"' | '\''
+        )
+    });
+    (url.len() > "https://".len()).then_some(url)
 }
 
 /// Collapses `[label](url)` — and the `![alt](url)` image form — down to the
@@ -16683,6 +16712,36 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["가나다", "라마바"]
         );
+    }
+
+    #[test]
+    fn bare_urls_paint_as_clickable_links_without_trailing_punctuation() {
+        let lines = markdown_line(
+            "",
+            Tone::Plain,
+            "온보딩 안내서: https://claude.ai/code/g/abc123. 팀에 보내세요",
+            Tone::Plain,
+            false,
+            100,
+        );
+        let line = &lines[0];
+        let url = "https://claude.ai/code/g/abc123";
+
+        assert!(
+            line.tail
+                .iter()
+                .any(|span| span.text == url && span.tone == Tone::MarkdownLink)
+        );
+        assert!(line.tail.iter().any(|span| span.text.starts_with(". 팀에")));
+        let regions = &line.pick.as_ref().expect("bare url is clickable").0;
+        assert!(
+            regions
+                .iter()
+                .all(|(_, _, pick)| matches!(pick, Pick::OpenLink(target) if target == url))
+        );
+        assert_eq!(regions.len(), url.chars().count());
+        assert!(bare_url("https://").is_none());
+        assert_eq!(bare_url("https://a.io/x입니다"), Some("https://a.io/x"));
     }
 
     #[test]

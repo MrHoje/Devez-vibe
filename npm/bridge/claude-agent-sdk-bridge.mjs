@@ -33,7 +33,11 @@ const CLAUDE_PROVIDER_SKILLS = new Set([
   "deep-research", "design-sync", "dataviz", "update-config", "verify", "debug",
   "code-review", "simplify", "batch", "fewer-permission-prompts", "doctor", "loop",
   "schedule", "claude-api", "run", "run-skill-generator", "security-review",
+  "team-onboarding",
 ]);
+// Built-in commands Claude Code runs only from the user's own message, never
+// from the model (disableModelInvocation), so they go in as typed `/name` text.
+const CLAUDE_USER_ONLY_COMMANDS = new Set(["team-onboarding"]);
 const OPUS_48_MODEL = "claude-opus-4-8";
 const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 const CLAUDE_TASK_TOOLS = ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList"];
@@ -2711,6 +2715,9 @@ async function inputContent(input, handoffContext) {
   const explicitSkills = [];
   for (const item of Array.isArray(input) ? input : []) {
     if (item.type === "text") content.push({ type: "text", text: item.text || "" });
+    else if (item.type === "skill" && item.name && CLAUDE_USER_ONLY_COMMANDS.has(String(item.name))) {
+      content.unshift({ type: "text", text: `/${item.name}` });
+    }
     else if (item.type === "skill" && item.name) explicitSkills.push(String(item.name));
     else if (item.type === "localImage" && item.path) {
       const bytes = await readFile(item.path);

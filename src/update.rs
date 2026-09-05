@@ -19,7 +19,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "Builder 역할의 응답 분량 제한에서 상세 설명 요청 예외를 없앴습니다. 이제 선택·승인을 요청하는 답변에만 예외를 둡니다.",
+    "답변 속 맨 URL을 클릭 가능한 링크로 그립니다. Claude Code CLI처럼 공유 링크를 클릭하면 브라우저로 열립니다.",
+    "Claude 스킬 목록에 team-onboarding을 추가했습니다. $team-onboarding으로 팀 온보딩 안내서를 만들고 공유 링크를 받을 수 있습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
