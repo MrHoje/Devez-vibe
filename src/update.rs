@@ -19,9 +19,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude 세션을 재개하면 이전에 게시한 Artifact 링크 행이 상태줄 아래에 다시 나타납니다. 순정 Claude Code와 같은 동작입니다.",
-    "Artifact 링크 행을 ⧉ 파일이름 x 순서로 구분 기호 없이 표시합니다. 끝의 x를 클릭하면 숨기고, 밑줄은 파일 이름에만 표시합니다.",
-    "대기 프롬프트(Queue) 행의 제거 표시를 소문자 x로 바꿨습니다.",
+    "Astra 모델 표시를 이미지와 같은 블루톤으로 바꿨습니다.",
+    "밝은 테마에는 대비를 확보한 짙은 블루를, 어두운 테마에는 원본의 밝은 블루를 적용했습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
