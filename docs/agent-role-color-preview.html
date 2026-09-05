@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Devez Vibe · Builder / Planner 다크 테마 색상 시안</title>
+  <style>
+    :root { color: #e8e8e8; background: #141414; font-family: "Pretendard", "Noto Sans KR", system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 38px; }
+    header, main { max-width: 1360px; margin: auto; }
+    h1 { margin: 0 0 7px; font-size: 26px; letter-spacing: -.045em; }
+    header p { margin: 0 0 10px; color: #a9aaa8; }
+    header p.note { margin-bottom: 28px; font-size: 13px; }
+    h2 { margin: 34px 0 14px; font-size: 18px; letter-spacing: -.02em; color: #e8e8e8; }
+    h2 small { color: #a9aaa8; font-weight: 400; font-size: 13px; margin-left: 10px; }
+    .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+    .card { border: 1px solid #333; border-radius: 14px; overflow: hidden; background: #1f1f1e; box-shadow: 0 14px 34px rgba(0,0,0,.35); }
+    .card.current { border-color: #555; }
+    .card .head { display: flex; justify-content: space-between; align-items: baseline; padding: 12px 16px; border-bottom: 1px solid #333; }
+    .card .head b { font-size: 14px; }
+    .card .head span { font: 700 12px ui-monospace, Consolas, monospace; }
+    .card .ratio { color: #a9aaa8; font: 12px ui-monospace, Consolas, monospace; }
+    .panes { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .pane { padding: 16px 16px 18px; font: 13px/1.75 ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .pane.dark { background: #1f1f1e; color: #e8e8e8; }
+    .pane.midnight { background: #111827; color: #e5e7eb; }
+    .pane .label { font: 11px "Pretendard", "Noto Sans KR", system-ui, sans-serif; color: #8a8f99; margin-bottom: 8px; letter-spacing: .02em; }
+    .status { color: #c7c8cb; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .midnight .status { color: #cbd5e1; }
+    .status .sep { color: #8290a0; }
+    .status .model { color: #ff9e59; }
+    .status .ctx { color: #32b786; }
+    .role { font-weight: 800; }
+    .glyph { font-weight: 800; }
+    .prompt { margin-top: 10px; }
+    .prompt .text { color: inherit; }
+    .plan { margin-top: 10px; font-weight: 700; }
+    .others { margin-top: 12px; padding-top: 10px; border-top: 1px dashed #3a3a3a; color: #8a8f99; font-size: 12px; }
+    .others b { font-weight: 800; }
+    .gr { color: #f87171; }
+    .rv { color: #a78bfa; }
+    @media (max-width: 1100px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 720px) { body { padding: 20px; } .grid { grid-template-columns: 1fr; } .panes { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Builder / Planner 다크 테마 색상 시안</h1>
+    <p>역할 색은 상태줄의 역할 이름, 컴포저의 <b>❯</b> 글리프, 계획 카드 제목에 쓰입니다. Goal Runner(#F87171)와 Reviewer(#A78BFA)는 그대로 두고 두 색만 바꿉니다.</p>
+    <p class="note">각 카드의 왼쪽은 Dark(#1F1F1E), 오른쪽은 Midnight(#111827) 배경입니다. 괄호 안 숫자는 배경 대비 명암비이며 4.5 이상이면 본문 글자 기준을 만족합니다.</p>
+  </header>
+  <main>
+    <h2>Builder <small>현재 Dark #6CA0BD · Midnight #84B1E4 — 채도가 낮은 강청색이라 옆의 빨강·보라보다 한 톤 가라앉아 보입니다</small></h2>
+    <div class="grid" id="builder"></div>
+
+    <h2>Planner <small>현재 Dark·Midnight 모두 #42965F — 어둡고 탁한 녹색이라 상태줄 회색 글자와 비슷한 밝기로 묻힙니다</small></h2>
+    <div class="grid" id="planner"></div>
+  </main>
+
+  <script>
+    const DARK = '#1f1f1e', MIDNIGHT = '#111827';
+    const builder = [
+      { name: '현재', dark: '#6CA0BD', midnight: '#84B1E4', why: '지금 값. 채도가 낮아 회색빛이 돕니다.', current: true },
+      { name: '시안 1 · Sky 400', dark: '#38BDF8', midnight: '#38BDF8', why: '맑은 하늘색. 빨강·보라와 같은 밝기대라 네 역할이 한 세트로 읽힙니다.' },
+      { name: '시안 2 · Blue 400', dark: '#60A5FA', midnight: '#60A5FA', why: '팔레트의 파랑과 같은 값. 링크·브랜치 색과 겹치는 점은 감안해야 합니다.' },
+      { name: '시안 3 · Sky 300', dark: '#7DD3FC', midnight: '#7DD3FC', why: '한 단계 밝은 하늘색. 부드럽지만 대비는 가장 높습니다.' },
+      { name: '시안 4 · Cyan 400', dark: '#22D3EE', midnight: '#22D3EE', why: '청록에 가까운 파랑. Astra 청록(#2DD4BF)과 인접하니 모델 표시와 함께 볼 때 주의가 필요합니다.' },
+      { name: '시안 5 · Steel 보정', dark: '#7FB8DC', midnight: '#8FC0EA', why: '현재 색조를 유지하고 채도와 밝기만 올린 보수적 안. 변화가 가장 작습니다.' },
+    ];
+    const planner = [
+      { name: '현재', dark: '#42965F', midnight: '#42965F', why: '지금 값. 밝기가 낮아 상태줄 회색과 비슷한 무게로 보입니다.', current: true },
+      { name: '시안 1 · Green 400', dark: '#4ADE80', midnight: '#4ADE80', why: '선명한 초록. 빨강·보라와 같은 밝기대로 가장 무난합니다.' },
+      { name: '시안 2 · Emerald 400', dark: '#34D399', midnight: '#34D399', why: 'Midnight의 success 색과 같은 값. 청록 기운이 있어 Builder 하늘색과 거리는 좁아집니다.' },
+      { name: '시안 3 · Green 300', dark: '#86EFAC', midnight: '#86EFAC', why: '연한 민트 초록. 대비가 가장 높고 부드럽습니다.' },
+      { name: '시안 4 · Lime 400', dark: '#A3E635', midnight: '#A3E635', why: '노랑 기운의 연두. 파랑 계열 Builder와 색상 거리가 가장 멉니다.' },
+      { name: '시안 5 · Green 보정', dark: '#5FBF7A', midnight: '#5FBF7A', why: '현재 색조를 유지하고 밝기만 올린 보수적 안. 차분함은 남기고 묻힘만 줄입니다.' },
+    ];
+
+    function lum(hex) {
+      const c = hex.replace('#', '');
+      const [r, g, b] = [0, 2, 4].map(i => parseInt(c.slice(i, i + 2), 16) / 255)
+        .map(v => v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4));
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    }
+    function ratio(a, b) { const [x, y] = [lum(a), lum(b)].sort((p, q) => q - p); return ((x + 0.05) / (y + 0.05)).toFixed(1); }
+
+    function pane(theme, bg, colour, role, other) {
+      const otherLabel = role === 'Builder' ? 'Planner' : 'Builder';
+      return `
+        <div class="pane ${theme}">
+          <div class="label">${theme === 'dark' ? 'Dark' : 'Midnight'} (${ratio(colour, bg)})</div>
+          <div class="status"><span class="role" style="color:${colour}">${role}</span> <span class="sep">·</span> <span class="model">gpt-5.6-sol</span> <span class="sep">·</span> <span class="ctx">166k/828k</span></div>
+          <div class="prompt"><span class="glyph" style="color:${colour}">❯</span> <span class="text">컨텍스트 복원해줘</span></div>
+          <div class="plan" style="color:${colour}">✢ Updated Plan · 1 / 3</div>
+          <div class="others"><b style="color:${colour}">${role}</b> <b style="color:${other}">${otherLabel}</b> <b class="gr">Goal Runner</b> <b class="rv">Reviewer</b></div>
+        </div>`;
+    }
+
+    function render(id, list, role, otherDark, otherMidnight) {
+      document.getElementById(id).innerHTML = list.map(c => `
+        <section class="card ${c.current ? 'current' : ''}">
+          <div class="head"><b>${c.name}</b><span style="color:${c.dark}">${c.dark}${c.dark !== c.midnight ? ' / ' + c.midnight : ''}</span></div>
+          <div class="panes">${pane('dark', DARK, c.dark, role, otherDark)}${pane('midnight', MIDNIGHT, c.midnight, role, otherMidnight)}</div>
+          <div class="head" style="border-top:1px solid #333;border-bottom:0"><span class="ratio" style="font-family:inherit">${c.why}</span></div>
+        </section>`).join('');
+    }
+    render('builder', builder, 'Builder', '#42965F', '#42965F');
+    render('planner', planner, 'Planner', '#6CA0BD', '#84B1E4');
+  </script>
+</body>
+</html>

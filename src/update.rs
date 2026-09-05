@@ -19,10 +19,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "플래너의 계획 실행 확인을 한국어 제목과 목표 중심 설명으로 안내합니다.",
-    "계획 승인에 필요한 작업 요약과 미확정 사항이 빠지지 않도록 안내 규칙을 정리했습니다.",
-    "보조 에이전트의 분량 제한과 영어 판정을 정리하고 기존 기본 설정을 백업 후 갱신합니다.",
-    "Codex 세션을 다시 열 때 기록에서 컨텍스트 사용량과 상한을 복원합니다.",
+    "다크와 미드나이트 테마에서 Builder는 하늘색, Planner는 밝은 초록으로 역할 색을 보정했습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
