@@ -2713,10 +2713,11 @@ function stripHandoff(text) {
 async function inputContent(input, handoffContext) {
   const content = [];
   const explicitSkills = [];
+  let userCommand;
   for (const item of Array.isArray(input) ? input : []) {
     if (item.type === "text") content.push({ type: "text", text: item.text || "" });
     else if (item.type === "skill" && item.name && CLAUDE_USER_ONLY_COMMANDS.has(String(item.name))) {
-      content.unshift({ type: "text", text: `/${item.name}` });
+      userCommand ??= String(item.name);
     }
     else if (item.type === "skill" && item.name) explicitSkills.push(String(item.name));
     else if (item.type === "localImage" && item.path) {
@@ -2740,7 +2741,14 @@ async function inputContent(input, handoffContext) {
       ].join("\n"),
     });
   }
-  return prependHandoff(content.length ? content : [{ type: "text", text: "" }], handoffContext);
+  const result = prependHandoff(content.length ? content : [{ type: "text", text: "" }], handoffContext);
+  if (userCommand) {
+    // Claude Code reads the command from the very start of the message text, so
+    // it goes ahead of the handoff block and whatever else the user typed.
+    const first = result.find((item) => item.type === "text");
+    first.text = `/${userCommand}\n\n${first.text}`;
+  }
+  return result;
 }
 
 async function startPrompt(params) {

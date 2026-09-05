@@ -19,8 +19,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "답변 속 맨 URL을 클릭 가능한 링크로 그립니다. Claude Code CLI처럼 공유 링크를 클릭하면 브라우저로 열립니다.",
-    "Claude 스킬 목록에 team-onboarding을 추가했습니다. $team-onboarding으로 팀 온보딩 안내서를 만들고 공유 링크를 받을 수 있습니다.",
+    "$team-onboarding 스킬이 Claude Code 명령으로 인식되지 않던 문제를 고쳤습니다. 응답 모드 문맥보다 명령을 앞에 두어 순정 Claude Code와 같이 안내서 생성이 시작됩니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
