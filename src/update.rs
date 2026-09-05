@@ -19,10 +19,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "Planner와 Reviewer 역할의 쓰기 금지를 제공자 차원에서 막도록 강제했습니다.",
-    "Goal Runner가 서브에이전트 전달 내용과 검토 diff를 실행 작업 폴더의 파일로 주고받습니다.",
-    "서브에이전트 프롬프트를 갱신할 때 예전 판을 더 넓게 알아보고 교체합니다.",
-    "DevezCode 연동 상태 파일 쓰기가 실패하면 다시 시도해 상태가 사라지지 않습니다.",
+    "검토자와 검수자 서브에이전트가 리뷰 패키지 옆에 JSON 판정 파일을 씁니다.",
+    "Goal Runner가 판정 파일 값으로만 검토 게이트를 통과시키고, 파일이 없거나 깨지면 통과로 보지 않습니다.",
+    "이전 판 검토자·검수자 지침으로 만든 Codex 에이전트 파일도 새 지침으로 갱신합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
