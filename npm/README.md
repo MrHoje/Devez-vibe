@@ -53,6 +53,12 @@ dvz [--resume [SESSION] | --continue] [--model MODEL] [--effort EFFORT]
 `--resume`만 입력하면 검색 가능한 세션 피커를 열고, `--continue`는 현재 폴더의 가장 최근
 세션을 바로 이어갑니다. 실행 중 전체 명령은 `/help`에서 확인합니다.
 
+설치 상태와 제공자 연결 준비 상태는 다음 명령으로 점검합니다.
+
+```powershell
+dvz doctor
+```
+
 ## 업데이트
 
 새 버전이 배포되면 시작 시 안내 배너가 표시됩니다. 배너의 안내대로 실행하면 됩니다.

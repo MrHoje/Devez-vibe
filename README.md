@@ -59,6 +59,7 @@ SDK 자식 프로세스에서 제거되며, 기존 `claude` 로그인 저장소�
 ```text
 dvz [--resume [SESSION] | --continue] [--model MODEL] [--effort EFFORT]
     [--cwd PATH] [--codex PATH] [--claude PATH] [--theme THEME]
+dvz doctor
 dvz update
 ```
 
@@ -68,6 +69,8 @@ dvz update
 
 OpenCode provider는 실행 중 `/provider opencode` 또는 `/connect`로 연결하며,
 API key 또는 OAuth로 인증합니다 (`opencode-go` 포함).
+
+`dvz doctor`는 현재 실행 파일, 작업 폴더, 업데이트 전환 경로와 각 제공자의 실행 준비 상태를 점검합니다.
 
 ### 업데이트
 

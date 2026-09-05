@@ -5,6 +5,7 @@ mod backend;
 mod child_process;
 mod claude;
 mod completion;
+mod doctor;
 mod devezcode;
 mod editor;
 mod input_hub;
@@ -134,6 +135,8 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Command {
+    /// Check the local Devez Vibe installation and provider runtimes.
+    Doctor,
     /// Install the latest published release from npm.
     Update,
     /// Print the Devez Vibe version.
@@ -145,6 +148,21 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     if let Some(command) = cli.command.as_ref() {
         match command {
+            Command::Doctor => {
+                let cwd = resolve_cwd(cli.cwd.as_deref())?;
+                let healthy = doctor::run(
+                    &cli.codex,
+                    &cli.open_code,
+                    &cli.node,
+                    &cli.claude,
+                    &cwd,
+                )
+                .await?;
+                if !healthy {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             Command::Update => return update::run_self_update(),
             Command::Version => {
                 println!("Devez Vibe v{}", update::CURRENT_VERSION);

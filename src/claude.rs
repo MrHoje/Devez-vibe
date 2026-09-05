@@ -472,7 +472,7 @@ fn format_rpc_error(error: &Value) -> String {
     }
 }
 
-fn resolve_bridge_path(cwd: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_bridge_path(cwd: &Path) -> Result<PathBuf> {
     if let Some(path) = env::var_os("DEVEZ_VIBE_CLAUDE_BRIDGE").map(PathBuf::from)
         && path.is_file()
     {

@@ -616,7 +616,7 @@ fn vendored_codex_binary(root: &Path) -> Option<PathBuf> {
         .find(|binary| binary.is_file())
 }
 
-fn resolve_command(command: &Path) -> PathBuf {
+pub(crate) fn resolve_command(command: &Path) -> PathBuf {
     if command.components().count() > 1 || command.exists() {
         return command.to_path_buf();
     }
