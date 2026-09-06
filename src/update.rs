@@ -22,9 +22,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
+    "MemoryHub 배지를 Vibe: On과 같은 색상으로 표시합니다.",
     "DevezVibe 밖에서 Claude와 Codex가 만든 프로젝트 메모리도 공용 지식에 합칩니다.",
-    "동기화는 백그라운드에서 처리하고 성공 알림 없이 MemoryHub 활성 상태만 표시합니다.",
-    "일반 작업을 최대 5개씩 묶어 분석 모델의 반복 호출과 토큰 사용량을 줄입니다.",
+    "동기화는 백그라운드에서 처리하고 일반 작업을 묶어 토큰 사용량을 줄입니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

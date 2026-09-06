@@ -12750,7 +12750,7 @@ fn full_badge_spans(mode: &ComposerMode, include_branch: bool) -> BadgeSpans {
         spans.push(display_separator_span());
         spans.push(PaintSpan {
             text: "MemoryHub".to_owned(),
-            tone: Tone::Plain,
+            tone: Tone::FastOn,
             bold: false,
         });
     }
@@ -17963,6 +17963,13 @@ mod tests {
 
         let line = input_top_line(80, "", Some(&mode));
         assert!(painted(&line).contains("Vibe: On | MemoryHub"));
+        assert_eq!(
+            line.tail
+                .iter()
+                .find(|span| span.text == "MemoryHub")
+                .map(|span| span.tone),
+            Some(Tone::FastOn)
+        );
     }
 
     #[test]
