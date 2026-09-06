@@ -3,6 +3,7 @@ use std::{
     env, fs,
     ops::Range,
     path::{Path, PathBuf},
+    sync::{Arc, atomic::{AtomicBool, Ordering}},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -557,7 +558,7 @@ impl SlashCommand {
     }
 }
 
-const SLASH_COMMANDS: [SlashCommand; 33] = [
+const SLASH_COMMANDS: [SlashCommand; 34] = [
     SlashCommand {
         name: "/provider",
         description: "Switch between the Claude and Codex providers, or connect OpenCode",
@@ -601,6 +602,11 @@ const SLASH_COMMANDS: [SlashCommand; 33] = [
     SlashCommand {
         name: "/logout",
         description: "Sign out of the current account",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/memory-hub",
+        description: "Share project memory across Claude, Codex, and OpenCode",
         takes_argument: false,
     },
     SlashCommand {
@@ -1237,6 +1243,8 @@ pub enum Action {
     StartLogin(LoginMethod),
     CancelLogin(String),
     Logout,
+    DvzMemoryLogin,
+    DvzMemoryLogout,
     OpenPlugins {
         scope: Option<PluginScope>,
         notice: Option<String>,
@@ -1640,6 +1648,17 @@ struct ApprovalChoice {
 }
 
 enum PendingInteraction {
+    DvzMemoryPicker {
+        selected: usize,
+        account: Option<crate::dvz_memory::DvzMemoryAccount>,
+    },
+    DvzMemoryConnecting {
+        cancelled: Arc<AtomicBool>,
+    },
+    DvzMemoryLogin {
+        user_code: String,
+        cancelled: Arc<AtomicBool>,
+    },
     ModelPicker {
         model_index: usize,
         effort_index: usize,
@@ -3093,6 +3112,9 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
             | PendingInteraction::ClaudePermissionScopePicker { .. }
             | PendingInteraction::ClaudePermissionRuleInput { .. }
             | PendingInteraction::VibeModePicker { .. }
+            | PendingInteraction::DvzMemoryPicker { .. }
+            | PendingInteraction::DvzMemoryConnecting { .. }
+            | PendingInteraction::DvzMemoryLogin { .. }
             | PendingInteraction::StatusLinePicker { .. }
             | PendingInteraction::SkillsPicker { .. }
             | PendingInteraction::SubagentTranscript { .. }
@@ -5126,6 +5148,55 @@ impl AppState {
     /// Opens the sign-in method list.
     pub fn open_login_picker(&mut self) {
         self.pending = Some(PendingInteraction::LoginMethodPicker { selected: 0 });
+    }
+
+    pub fn open_dvz_memory(&mut self) {
+        self.pending = Some(PendingInteraction::DvzMemoryPicker {
+            selected: 0,
+            account: crate::dvz_memory::account(),
+        });
+    }
+
+    pub fn begin_dvz_memory_connecting(&mut self, cancelled: Arc<AtomicBool>) {
+        self.pending = Some(PendingInteraction::DvzMemoryConnecting { cancelled });
+    }
+
+    pub fn begin_dvz_memory_login(&mut self, user_code: String, cancelled: Arc<AtomicBool>) {
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.pending = Some(PendingInteraction::DvzMemoryLogin {
+            user_code,
+            cancelled,
+        });
+    }
+
+    pub fn finish_dvz_memory_login(
+        &mut self,
+        result: std::result::Result<crate::dvz_memory::DvzMemoryAccount, String>,
+    ) {
+        self.pending = None;
+        match result {
+            Ok(account) => {
+                self.knowledge_mode = KnowledgeMode::On;
+                self.push_notice(
+                    BlockKind::System,
+                    "GitHub login complete",
+                    format!("Connected as @{} · {}", account.login, account.repository),
+                );
+            }
+            Err(error) => self.push_notice(BlockKind::Error, "GitHub login failed", error),
+        }
+    }
+
+    pub fn finish_dvz_memory_logout(&mut self) {
+        self.pending = None;
+        self.knowledge_mode = KnowledgeMode::Off;
+        self.push_notice(
+            BlockKind::System,
+            "GitHub logout complete",
+            "Remote memory was preserved.",
+        );
     }
 
     /// Login id of an in-flight `/login`, so a caller can cancel it.
@@ -9133,7 +9204,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/provider [claude|codex|opencode]  Claude·Codex 전환, OpenCode 연결\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|goal-runner|reviewer]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
+                    format!("/provider [claude|codex|opencode]  Claude·Codex 전환, OpenCode 연결\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|goal-runner|reviewer]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n/memory-hub  GitHub 프로젝트 메모리 동기화\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
                 ));
                 Action::None
             }
@@ -9396,6 +9467,15 @@ impl AppState {
             }
             "/logout" => {
                 self.confirm_logout();
+                Action::None
+            }
+            "/memory-hub" if parts.len() == 1 => {
+                self.open_dvz_memory();
+                Action::None
+            }
+            "/memory-hub" => {
+                self.committed
+                    .push(Block::new(BlockKind::Error, "Usage", "/memory-hub"));
                 Action::None
             }
             "/plugins" if parts.len() == 1 => Action::OpenPlugins {
@@ -9677,6 +9757,65 @@ impl AppState {
             code => code,
         };
         match pending {
+            PendingInteraction::DvzMemoryPicker {
+                mut selected,
+                account,
+            } => {
+                let count = if account.is_some() { 2 } else { 1 };
+                match hotkey {
+                    KeyCode::Esc => return Action::None,
+                    KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
+                        selected = (selected + 1).min(count - 1)
+                    }
+                    KeyCode::Char(ch @ '1'..='2') => {
+                        let choice = ch.to_digit(10).unwrap_or(1) as usize - 1;
+                        if choice < count {
+                            return if account.is_some() && choice == 1 {
+                                Action::DvzMemoryLogout
+                            } else {
+                                Action::DvzMemoryLogin
+                            };
+                        }
+                    }
+                    KeyCode::Enter => {
+                        return if account.is_some() && selected == 1 {
+                            Action::DvzMemoryLogout
+                        } else {
+                            Action::DvzMemoryLogin
+                        };
+                    }
+                    _ => {}
+                }
+                self.pending = Some(PendingInteraction::DvzMemoryPicker { selected, account });
+                Action::None
+            }
+            PendingInteraction::DvzMemoryConnecting { cancelled } => match key.code {
+                KeyCode::Esc => {
+                    cancelled.store(true, Ordering::Relaxed);
+                    Action::None
+                }
+                _ => {
+                    self.pending = Some(PendingInteraction::DvzMemoryConnecting { cancelled });
+                    Action::None
+                }
+            },
+            PendingInteraction::DvzMemoryLogin {
+                user_code,
+                cancelled,
+            } => match key.code {
+                KeyCode::Esc => {
+                    cancelled.store(true, Ordering::Relaxed);
+                    Action::None
+                }
+                _ => {
+                    self.pending = Some(PendingInteraction::DvzMemoryLogin {
+                        user_code,
+                        cancelled,
+                    });
+                    Action::None
+                }
+            },
             PendingInteraction::ModelPicker {
                 mut model_index,
                 mut effort_index,
@@ -10948,6 +11087,102 @@ impl AppState {
 
     fn overlay_view(&self) -> Option<OverlayView<'_>> {
         match self.pending.as_ref()? {
+            PendingInteraction::DvzMemoryPicker { selected, account } => {
+                let mut lines = vec![
+                    OverlayLine {
+                        text: "Share project memory across Claude, Codex, and OpenCode.".to_owned(),
+                        selected: false,
+                        muted: true,
+                    },
+                    OverlayLine {
+                        text: "Memory is stored in your private dvz-memory-hub repository."
+                            .to_owned(),
+                        selected: false,
+                        muted: true,
+                    },
+                    OverlayLine {
+                        text: String::new(),
+                        selected: false,
+                        muted: true,
+                    },
+                ];
+                if let Some(account) = account {
+                    lines.push(OverlayLine {
+                        text: format!("GitHub: @{} · {}", account.login, account.repository),
+                        selected: false,
+                        muted: true,
+                    });
+                    lines.push(OverlayLine {
+                        text: "1. Change GitHub account".to_owned(),
+                        selected: *selected == 0,
+                        muted: false,
+                    });
+                    lines.push(OverlayLine {
+                        text: "2. Logout".to_owned(),
+                        selected: *selected == 1,
+                        muted: false,
+                    });
+                } else {
+                    lines.push(OverlayLine {
+                        text: "GitHub: Not connected".to_owned(),
+                        selected: false,
+                        muted: true,
+                    });
+                    lines.push(OverlayLine {
+                        text: "1. Login".to_owned(),
+                        selected: true,
+                        muted: false,
+                    });
+                }
+                Some(OverlayView {
+                    closable: true,
+                    title: "Memory Hub".to_owned(),
+                    lines,
+                    slider: None,
+                    hint: "1-2 select  ·  ↑↓ navigate  ·  Enter confirm  ·  Esc cancel".to_owned(),
+                    style: OverlayStyle::Panel,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                })
+            }
+            PendingInteraction::DvzMemoryConnecting { .. } => Some(OverlayView {
+                closable: true,
+                title: "GitHub login".to_owned(),
+                lines: vec![OverlayLine {
+                    text: "Preparing secure login…".to_owned(),
+                    selected: true,
+                    muted: false,
+                }],
+                slider: None,
+                hint: "Esc cancel".to_owned(),
+                style: OverlayStyle::KeyboardOnlyPanel,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            }),
+            PendingInteraction::DvzMemoryLogin { user_code, .. } => Some(OverlayView {
+                closable: true,
+                title: "GitHub login".to_owned(),
+                lines: vec![
+                    OverlayLine {
+                        text: format!("Code: {user_code}"),
+                        selected: true,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: "Complete authorization in your browser.".to_owned(),
+                        selected: false,
+                        muted: true,
+                    },
+                ],
+                slider: None,
+                hint: "Esc close".to_owned(),
+                style: OverlayStyle::KeyboardOnlyPanel,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            }),
             PendingInteraction::ModelPicker {
                 model_index,
                 effort_index,
@@ -13083,6 +13318,20 @@ impl AppState {
                     }
                 }
             }
+            Some(PendingInteraction::DvzMemoryPicker {
+                selected,
+                account,
+            }) => match row.checked_sub(4) {
+                Some(0) => Action::DvzMemoryLogin,
+                Some(1) if account.is_some() => Action::DvzMemoryLogout,
+                _ => {
+                    self.pending = Some(PendingInteraction::DvzMemoryPicker {
+                        selected,
+                        account,
+                    });
+                    Action::Tick(false)
+                }
+            },
             // A click picks the runtime; the connection switch stays on Space, so
             // a mis-aimed click never drops a provider.
             Some(PendingInteraction::RuntimePicker { .. }) if row < RUNTIME_CHOICES.len() => {
@@ -20053,6 +20302,58 @@ mod tests {
 
         assert!(matches!(action, Action::None));
         assert!(state.overlay_view().is_none());
+    }
+
+    #[test]
+    fn dvz_memory_picker_uses_the_requested_english_actions() {
+        let mut state = test_state();
+        state.pending = Some(PendingInteraction::DvzMemoryPicker {
+            selected: 0,
+            account: None,
+        });
+        let overlay = state.overlay_view().expect("Memory Hub login overlay");
+        assert!(overlay.lines.iter().any(|line| line.text == "1. Login"));
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::DvzMemoryLogin
+        ));
+
+        state.pending = Some(PendingInteraction::DvzMemoryPicker {
+            selected: 0,
+            account: Some(crate::dvz_memory::DvzMemoryAccount::fixture("octocat")),
+        });
+
+        let overlay = state.overlay_view().expect("Memory Hub overlay");
+        assert_eq!(overlay.title, "Memory Hub");
+        assert!(overlay.lines.iter().any(|line| line.text == "1. Change GitHub account"));
+        assert!(overlay.lines.iter().any(|line| line.text == "2. Logout"));
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
+            Action::DvzMemoryLogin
+        ));
+
+        state.pending = Some(PendingInteraction::DvzMemoryPicker {
+            selected: 1,
+            account: Some(crate::dvz_memory::DvzMemoryAccount::fixture("octocat")),
+        });
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::DvzMemoryLogout
+        ));
+
+        state.pending = Some(PendingInteraction::DvzMemoryPicker {
+            selected: 0,
+            account: Some(crate::dvz_memory::DvzMemoryAccount::fixture("octocat")),
+        });
+        assert!(matches!(
+            state.click_overlay_row(4),
+            Action::DvzMemoryLogin
+        ));
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        state.begin_dvz_memory_connecting(Arc::clone(&cancelled));
+        state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(cancelled.load(Ordering::Relaxed));
     }
 
     #[test]

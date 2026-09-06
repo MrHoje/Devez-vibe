@@ -26,12 +26,12 @@ const EXISTING_MEMORY_CHARS: usize = 12_000;
 const SUMMARY_INPUT_CHARS: usize = 3_000;
 const MEMORY_OUTPUT_CHARS: usize = 12_000;
 const SUMMARY_OUTPUT_CHARS: usize = 3_000;
+const NATIVE_MEMORY_CHARS: usize = 4_000;
 const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(300);
 const LOCK_WAIT: Duration = Duration::from_secs(120);
 const STALE_LOCK: Duration = Duration::from_secs(600);
 const MAX_PENDING_JOBS: usize = 32;
 const MAX_PROCESS_OUTPUT_BYTES: usize = 1_048_576;
-const KNOWLEDGE_RUNTIME_ENABLED: bool = false;
 const GENERATED_HEADER: &str = "<!-- DevezVibe가 자동 생성하는 파일입니다. 직접 작성한 지식은 .knowledge 루트에 보관하세요. -->";
 const CODEX_MEMORY_MODEL: &str = "gpt-5.6-luna";
 const CLAUDE_MEMORY_MODEL: &str = "haiku";
@@ -78,8 +78,8 @@ pub struct RuntimePaths {
 
 #[derive(Clone, Debug)]
 pub enum KnowledgeUpdate {
-    Saved,
-    Unchanged,
+    Saved { project_root: PathBuf },
+    Unchanged { project_root: PathBuf },
     Failed {
         project_root: PathBuf,
         message: String,
@@ -156,22 +156,26 @@ struct CapturedOutput {
 }
 
 pub fn read_mode(cwd: &str) -> KnowledgeMode {
-    if !KNOWLEDGE_RUNTIME_ENABLED || cfg!(test) {
+    if cfg!(test) {
         return KnowledgeMode::Off;
     }
-    read_mode_for_root(&project_root(Path::new(cwd)))
+    let _ = cwd;
+    crate::dvz_memory::account()
+        .map(|_| KnowledgeMode::On)
+        .unwrap_or(KnowledgeMode::Off)
 }
 
 fn read_mode_for_root(root: &Path) -> KnowledgeMode {
-    if !KNOWLEDGE_RUNTIME_ENABLED {
+    if cfg!(test) {
         return KnowledgeMode::Off;
     }
-    let Some(path) = project_modes_path() else {
-        return KnowledgeMode::Off;
-    };
-    read_mode_from_path(&path, root)
+    let _ = root;
+    crate::dvz_memory::account()
+        .map(|_| KnowledgeMode::On)
+        .unwrap_or(KnowledgeMode::Off)
 }
 
+#[cfg(test)]
 fn read_mode_from_path(path: &Path, root: &Path) -> KnowledgeMode {
     let Some(parent) = path.parent().filter(|parent| parent.is_dir()) else {
         return KnowledgeMode::Off;
@@ -220,6 +224,7 @@ fn write_mode_to_path(path: &Path, root: &Path, mode: KnowledgeMode) -> std::io:
     write_recoverable(path, &text)
 }
 
+#[cfg(test)]
 fn mode_in(modes: &ProjectModes, root: &Path) -> KnowledgeMode {
     let key = project_key(root);
     modes
@@ -256,9 +261,6 @@ pub fn prompt_context(cwd: &str, mode: KnowledgeMode) -> Option<String> {
     }
     let root = project_root(Path::new(cwd));
     let knowledge = root.join(".knowledge");
-    if !knowledge.is_dir() {
-        return Some(empty_guidance());
-    }
     if ensure_output_path_is_safe(&root).is_err() {
         return Some(
             "프로젝트 지식 폴더가 심볼릭 링크이거나 안전한 일반 경로가 아니어서 자동 지식을 참고하지 않는다."
@@ -266,35 +268,42 @@ pub fn prompt_context(cwd: &str, mode: KnowledgeMode) -> Option<String> {
         );
     }
     let summary = read_capped_regular(
-        &knowledge.join("auto").join("SUMMARY.md"),
+        &auto_memory_dir(&root).join("SUMMARY.md"),
         SUMMARY_INPUT_CHARS,
     )
     .unwrap_or_default();
-    let mut documents = WalkBuilder::new(&knowledge)
-        .hidden(false)
-        .ignore(false)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .parents(false)
-        .follow_links(false)
-        .build()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
-        .filter_map(|entry| {
-            let path = entry.path();
-            let name = path.file_name().and_then(|value| value.to_str())?;
-            if name.contains(".devez-vibe.tmp") || name.contains(".devez-vibe.bak") {
-                return None;
-            }
-            Some(
-                path.strip_prefix(&root)
-                    .ok()?
-                    .to_string_lossy()
-                    .replace('\\', "/"),
-            )
-        })
-        .collect::<Vec<_>>();
+    let mut documents = if knowledge.is_dir() {
+        WalkBuilder::new(&knowledge)
+            .hidden(false)
+            .ignore(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .parents(false)
+            .follow_links(false)
+            .build()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+            .filter_map(|entry| {
+                let path = entry.path();
+                if path.starts_with(knowledge.join("auto")) {
+                    return None;
+                }
+                let name = path.file_name().and_then(|value| value.to_str())?;
+                if name.contains(".devez-vibe.tmp") || name.contains(".devez-vibe.bak") {
+                    return None;
+                }
+                Some(
+                    path.strip_prefix(&root)
+                        .ok()?
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     documents.sort();
     documents.truncate(100);
     let index = truncate_middle(
@@ -307,15 +316,23 @@ pub fn prompt_context(cwd: &str, mode: KnowledgeMode) -> Option<String> {
     );
     let summary = redact_secrets(generated_body(&summary));
     let summary = summary.trim();
+    let native_memory = claude_auto_memory(&root)
+        .map(|memory| redact_secrets(&memory))
+        .unwrap_or_default();
     Some(format!(
         "프로젝트 지식 관리가 켜져 있다. 현재 저장소와 사용자 지시가 지식 문서보다 우선한다. \
          수동 문서는 자동 생성 문서보다 우선한다. 작업과 관련된 문서만 선택해서 읽고, \
          모든 문서를 한꺼번에 컨텍스트에 넣지 않는다. 아래 색인은 크기 제한이 있으며, \
-         필요하면 .knowledge 전체를 검색한다.\n\n자동 지식 요약:\n{}\n\n사용 가능한 지식 파일:\n{}",
+         필요하면 .knowledge 전체를 검색한다.\n\n자동 지식 요약:\n{}\n\nClaude에서 가져온 프로젝트 메모리:\n{}\n\n사용 가능한 지식 파일:\n{}",
         if summary.is_empty() {
             "아직 없음"
         } else {
             summary
+        },
+        if native_memory.trim().is_empty() {
+            "아직 없음"
+        } else {
+            native_memory.trim()
         },
         if index.is_empty() {
             "- 아직 없음"
@@ -323,10 +340,6 @@ pub fn prompt_context(cwd: &str, mode: KnowledgeMode) -> Option<String> {
             &index
         },
     ))
-}
-
-fn empty_guidance() -> String {
-    "프로젝트 지식 관리가 켜져 있지만 아직 .knowledge 문서가 없다. 현재 저장소와 사용자 지시를 우선하고, 관련 지식 문서가 생기면 필요한 파일만 선택해서 읽는다.".to_owned()
 }
 
 pub fn project_root(cwd: &Path) -> PathBuf {
@@ -369,6 +382,17 @@ fn project_modes_path() -> Option<PathBuf> {
 
 fn pending_jobs_root() -> Option<PathBuf> {
     project_modes_path().and_then(|path| Some(path.parent()?.join("knowledge-jobs")))
+}
+
+pub(crate) fn auto_memory_dir(root: &Path) -> PathBuf {
+    if cfg!(test) {
+        return root.join(".knowledge").join("auto");
+    }
+    project_modes_path()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| root.to_path_buf())
+        .join("memory-cache")
+        .join(project_id(root))
 }
 
 fn project_id(root: &Path) -> String {
@@ -506,11 +530,11 @@ async fn process_queued_turn(
     let update = match process_turn_locked(paths, &root, &queued.turn).await {
         Ok(true) => {
             let _ = fs::remove_file(path);
-            KnowledgeUpdate::Saved
+            KnowledgeUpdate::Saved { project_root: root }
         }
         Ok(false) => {
             let _ = fs::remove_file(path);
-            KnowledgeUpdate::Unchanged
+            KnowledgeUpdate::Unchanged { project_root: root }
         }
         Err(error) => {
             queued.attempts = queued.attempts.saturating_add(1);
@@ -537,13 +561,22 @@ async fn process_turn_locked(
         return Ok(false);
     }
     ensure_output_path_is_safe(root)?;
-    let memory_path = root.join(".knowledge").join("auto").join("MEMORY.md");
+    let memory_path = auto_memory_dir(root).join("MEMORY.md");
     let existing = read_regular_text(&memory_path)?.unwrap_or_default();
-    let existing = redact_secrets(generated_body(&existing));
+    let mut existing = redact_secrets(generated_body(&existing));
+    if let Some(native) = claude_auto_memory(root) {
+        let native = redact_secrets(&native);
+        if !native.trim().is_empty() && !existing.contains(native.trim()) {
+            existing = truncate_middle(
+                &format!("{existing}\n\n## Claude에서 가져온 프로젝트 메모리\n{}", native.trim()),
+                EXISTING_MEMORY_CHARS,
+            );
+        }
+    }
     if existing.chars().count() > EXISTING_MEMORY_CHARS {
         bail!("자동 장기 지식이 12,000자를 넘어 안전하게 병합할 수 없습니다.");
     }
-    let summary_path = root.join(".knowledge").join("auto").join("SUMMARY.md");
+    let summary_path = auto_memory_dir(root).join("SUMMARY.md");
     let repair_summary = !existing.is_empty() && !summary_path.is_file();
     let prompt = analysis_prompt(
         &existing,
@@ -578,7 +611,7 @@ fn apply_memory_output(root: &Path, output: MemoryOutput) -> Result<bool> {
         bail!("지식 분석 결과가 허용된 크기를 초과했습니다.");
     }
     ensure_output_path_is_safe(root)?;
-    let auto = root.join(".knowledge").join("auto");
+    let auto = auto_memory_dir(root);
     fs::create_dir_all(&auto)?;
     let memory_path = auto.join("MEMORY.md");
     let summary_path = auto.join("SUMMARY.md");
@@ -1007,6 +1040,32 @@ fn read_capped_regular(path: &Path, limit: usize) -> Option<String> {
         .map(|text| truncate_middle(&text, limit))
 }
 
+fn claude_auto_memory(root: &Path) -> Option<String> {
+    let home = env::var_os("USERPROFILE")
+        .or_else(|| env::var_os("HOME"))
+        .map(PathBuf::from)?;
+    let project = claude_project_key(root);
+    read_capped_regular(
+        &home
+            .join(".claude")
+            .join("projects")
+            .join(project)
+            .join("memory")
+            .join("MEMORY.md"),
+        NATIVE_MEMORY_CHARS,
+    )
+}
+
+fn claude_project_key(root: &Path) -> String {
+    root.to_string_lossy()
+        .chars()
+        .map(|character| match character {
+            ':' | '\\' | '/' => '-',
+            character => character,
+        })
+        .collect()
+}
+
 fn read_regular_text(path: &Path) -> Result<Option<String>> {
     recover_recoverable(path)?;
     let metadata = match fs::symlink_metadata(path) {
@@ -1070,11 +1129,12 @@ fn redact_secrets(text: &str) -> String {
 }
 
 fn ensure_output_path_is_safe(root: &Path) -> Result<()> {
+    let auto = auto_memory_dir(root);
     for path in [
         root.join(".knowledge"),
-        root.join(".knowledge").join("auto"),
-        root.join(".knowledge").join("auto").join("MEMORY.md"),
-        root.join(".knowledge").join("auto").join("SUMMARY.md"),
+        auto.clone(),
+        auto.join("MEMORY.md"),
+        auto_memory_dir(root).join("SUMMARY.md"),
     ] {
         if let Ok(metadata) = fs::symlink_metadata(&path)
             && metadata.file_type().is_symlink()
@@ -1270,8 +1330,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_mode_is_fixed_off() {
-        assert!(!KNOWLEDGE_RUNTIME_ENABLED);
+    fn tests_do_not_enable_runtime_memory() {
         assert_eq!(read_mode("C:/source/project"), KnowledgeMode::Off);
         assert_eq!(
             read_mode_for_root(Path::new("C:/source/project")),
@@ -1307,6 +1366,14 @@ mod tests {
             analysis_provider("opencode:anthropic/claude-sonnet-4-6"),
             AnalysisProvider::OpenCode(model) if model == "anthropic/claude-sonnet-4-6"
         ));
+    }
+
+    #[test]
+    fn claude_memory_key_uses_the_cli_project_directory_shape() {
+        assert_eq!(
+            claude_project_key(Path::new("C:\\Source\\devezVibe")),
+            "C--Source-devezVibe"
+        );
     }
 
     #[test]
@@ -1475,7 +1542,7 @@ mod tests {
         assert!(context.contains("[REDACTED]"));
         assert!(!context.contains("abcdefghijklmnop"));
         assert!(context.contains(".knowledge/수동.md"));
-        assert!(context.contains(".knowledge/auto/SUMMARY.md"));
+        assert!(!context.contains(".knowledge/auto/SUMMARY.md"));
 
         fs::remove_dir_all(root).expect("temporary project cleanup");
     }

@@ -22,9 +22,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "dvz doctor로 실행 파일, 작업 폴더와 업데이트 전환 경로를 점검할 수 있습니다.",
-    "Codex app-server를 실제 초기화해 설정 오류와 연결 실패를 진단합니다.",
-    "Claude Code·Node.js·연결 파일과 OpenCode 실행 준비 상태를 함께 표시합니다.",
+    "/memory-hub에서 GitHub 로그인만으로 private dvz-memory-hub 저장소를 준비합니다.",
+    "Claude·Codex·OpenCode 프로젝트 지식을 provider 사이에서 공유합니다.",
+    "프로젝트 메모리 업로드와 다운로드를 백그라운드에서 처리합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
