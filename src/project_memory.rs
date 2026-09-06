@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env, fs,
     io::{Read as _, Write as _},
     path::{Path, PathBuf},
@@ -13,12 +14,13 @@ use std::{
 use anyhow::{Context, Result, bail};
 use ignore::WalkBuilder;
 use regex::Regex;
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
     sync::mpsc,
-    time::{sleep, timeout},
+    time::{MissedTickBehavior, sleep, timeout},
 };
 
 const TURN_INPUT_CHARS: usize = 14_000;
@@ -26,11 +28,13 @@ const EXISTING_MEMORY_CHARS: usize = 12_000;
 const SUMMARY_INPUT_CHARS: usize = 3_000;
 const MEMORY_OUTPUT_CHARS: usize = 12_000;
 const SUMMARY_OUTPUT_CHARS: usize = 3_000;
-const NATIVE_MEMORY_CHARS: usize = 4_000;
+const NATIVE_MEMORY_CHARS: usize = 12_000;
 const ANALYSIS_TIMEOUT: Duration = Duration::from_secs(300);
 const LOCK_WAIT: Duration = Duration::from_secs(120);
 const STALE_LOCK: Duration = Duration::from_secs(600);
 const MAX_PENDING_JOBS: usize = 32;
+const MEMORY_BATCH_TURNS: usize = 5;
+const MEMORY_BATCH_WAIT: Duration = Duration::from_secs(300);
 const MAX_PROCESS_OUTPUT_BYTES: usize = 1_048_576;
 const GENERATED_HEADER: &str = "<!-- DevezVibe가 자동 생성하는 파일입니다. 직접 작성한 지식은 .knowledge 루트에 보관하세요. -->";
 const CODEX_MEMORY_MODEL: &str = "gpt-5.6-luna";
@@ -78,40 +82,91 @@ pub struct RuntimePaths {
 
 #[derive(Clone, Debug)]
 pub enum KnowledgeUpdate {
-    Saved { project_root: PathBuf },
-    Unchanged { project_root: PathBuf },
+    Saved,
+    Unchanged,
+    Warning {
+        project_root: PathBuf,
+        message: String,
+    },
     Failed {
         project_root: PathBuf,
         message: String,
     },
 }
 
+#[derive(Clone)]
 pub struct KnowledgeWorker {
-    jobs: mpsc::UnboundedSender<PathBuf>,
+    jobs: mpsc::UnboundedSender<KnowledgeJob>,
+}
+
+enum KnowledgeJob {
+    Turn(KnowledgeTurn),
+    SyncProject { cwd: String, model: String },
 }
 
 impl KnowledgeWorker {
     pub fn start(paths: RuntimePaths) -> (Self, mpsc::UnboundedReceiver<KnowledgeUpdate>) {
-        let (job_tx, mut job_rx) = mpsc::unbounded_channel::<PathBuf>();
+        let (job_tx, mut job_rx) = mpsc::unbounded_channel::<KnowledgeJob>();
         let (update_tx, update_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
-            while let Some(path) = job_rx.recv().await {
-                process_queued_turn(&paths, &path, &update_tx).await;
+            let mut active_project: Option<(String, String)> = None;
+            let mut native_tick = tokio::time::interval(Duration::from_secs(60));
+            native_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            native_tick.tick().await;
+            loop {
+                tokio::select! {
+                    job = job_rx.recv() => match job {
+                        Some(KnowledgeJob::Turn(turn)) => {
+                            queue_turn(&paths, turn, &update_tx).await;
+                        }
+                        Some(KnowledgeJob::SyncProject { cwd, model }) => {
+                            active_project = Some((cwd.clone(), model.clone()));
+                            sync_project(&paths, &cwd, &model, &update_tx).await;
+                        }
+                        None => break,
+                    },
+                    _ = native_tick.tick(), if active_project.is_some() => {
+                        if let Some((cwd, model)) = active_project.as_ref() {
+                            process_pending_project(&paths, cwd, false, &update_tx).await;
+                            import_native_project(&paths, cwd, model, &update_tx).await;
+                        }
+                    }
+                }
             }
         });
         (Self { jobs: job_tx }, update_rx)
     }
 
-    pub fn enqueue(&self, mut turn: KnowledgeTurn) -> Result<()> {
-        turn.transcript = redact_secrets(&truncate_middle(&turn.transcript, TURN_INPUT_CHARS));
-        let path = write_pending_turn(&turn)?;
-        let _ = self.jobs.send(path);
-        Ok(())
+    pub fn enqueue(&self, turn: KnowledgeTurn) -> Result<()> {
+        self.jobs
+            .send(KnowledgeJob::Turn(turn))
+            .map_err(|_| anyhow::anyhow!("지식 분석 작업기가 종료되었습니다."))
     }
 
-    pub fn resume_project(&self, cwd: &str) {
-        for path in pending_job_paths(cwd) {
-            let _ = self.jobs.send(path);
+    pub fn sync_project(&self, cwd: &str, model: &str) {
+        let _ = self.jobs.send(KnowledgeJob::SyncProject {
+            cwd: cwd.to_owned(),
+            model: model.to_owned(),
+        });
+    }
+}
+
+async fn queue_turn(
+    paths: &RuntimePaths,
+    mut turn: KnowledgeTurn,
+    updates: &mpsc::UnboundedSender<KnowledgeUpdate>,
+) {
+    turn.transcript = redact_secrets(&truncate_middle(&turn.transcript, TURN_INPUT_CHARS));
+    let root = project_root(Path::new(&turn.cwd));
+    match write_pending_turn(&turn, None) {
+        Ok(_) => {
+            process_pending_project(paths, &turn.cwd, false, updates).await;
+        }
+        Err(error) => {
+            let _ = updates.send(KnowledgeUpdate::Failed {
+                project_root: root,
+                message: error.to_string(),
+            });
         }
     }
 }
@@ -119,6 +174,8 @@ impl KnowledgeWorker {
 #[derive(Serialize, Deserialize)]
 struct QueuedTurn {
     attempts: u8,
+    #[serde(default)]
+    native_fingerprint: Option<String>,
     turn: KnowledgeTurn,
 }
 
@@ -140,6 +197,12 @@ struct MemoryOutput {
     summary: String,
 }
 
+#[derive(Default)]
+struct NativeMemoryScan {
+    content: String,
+    warnings: Vec<String>,
+}
+
 enum AnalysisProvider {
     Codex,
     Claude,
@@ -159,20 +222,24 @@ pub fn read_mode(cwd: &str) -> KnowledgeMode {
     if cfg!(test) {
         return KnowledgeMode::Off;
     }
-    let _ = cwd;
-    crate::dvz_memory::account()
-        .map(|_| KnowledgeMode::On)
-        .unwrap_or(KnowledgeMode::Off)
+    if crate::dvz_memory::account().is_some()
+        && crate::dvz_memory::github_project(Path::new(cwd)).is_some()
+    {
+        KnowledgeMode::On
+    } else {
+        KnowledgeMode::Off
+    }
 }
 
 fn read_mode_for_root(root: &Path) -> KnowledgeMode {
     if cfg!(test) {
         return KnowledgeMode::Off;
     }
-    let _ = root;
-    crate::dvz_memory::account()
-        .map(|_| KnowledgeMode::On)
-        .unwrap_or(KnowledgeMode::Off)
+    if crate::dvz_memory::account().is_some() && crate::dvz_memory::github_project(root).is_some() {
+        KnowledgeMode::On
+    } else {
+        KnowledgeMode::Off
+    }
 }
 
 #[cfg(test)]
@@ -315,23 +382,15 @@ pub fn prompt_context(cwd: &str, mode: KnowledgeMode) -> Option<String> {
         4_000,
     );
     let summary = redact_secrets(generated_body(&summary));
-    let native_memory = claude_auto_memory(&root)
-        .map(|memory| redact_secrets(&memory))
-        .unwrap_or_default();
-    let shared_memory = [summary.trim(), native_memory.trim()]
-        .into_iter()
-        .filter(|memory| !memory.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
     Some(format!(
         "프로젝트 지식 관리가 켜져 있다. 현재 저장소와 사용자 지시가 지식 문서보다 우선한다. \
          수동 문서는 자동 생성 문서보다 우선한다. 작업과 관련된 문서만 선택해서 읽고, \
          모든 문서를 한꺼번에 컨텍스트에 넣지 않는다. 아래 색인은 크기 제한이 있으며, \
          필요하면 .knowledge 전체를 검색한다.\n\n공용 프로젝트 메모리:\n{}\n\n사용 가능한 지식 파일:\n{}",
-        if shared_memory.is_empty() {
+        if summary.trim().is_empty() {
             "아직 없음"
         } else {
-            &shared_memory
+            summary.trim()
         },
         if index.is_empty() {
             "- 아직 없음"
@@ -439,7 +498,7 @@ fn pending_job_paths(cwd: &str) -> Vec<PathBuf> {
     paths
 }
 
-fn write_pending_turn(turn: &KnowledgeTurn) -> Result<PathBuf> {
+fn write_pending_turn(turn: &KnowledgeTurn, native_fingerprint: Option<String>) -> Result<PathBuf> {
     static JOB_ID: AtomicU64 = AtomicU64::new(1);
     let directory =
         pending_project_dir(&turn.cwd).context("DevezVibe 지식 작업 경로를 찾을 수 없습니다.")?;
@@ -459,11 +518,127 @@ fn write_pending_turn(turn: &KnowledgeTurn) -> Result<PathBuf> {
     ));
     let queued = QueuedTurn {
         attempts: 0,
+        native_fingerprint,
         turn: turn.clone(),
     };
     let contents = serde_json::to_string(&queued)?;
     write_recoverable(&path, &contents)?;
     Ok(path)
+}
+
+async fn sync_project(
+    paths: &RuntimePaths,
+    cwd: &str,
+    model: &str,
+    updates: &mpsc::UnboundedSender<KnowledgeUpdate>,
+) {
+    let root = project_root(Path::new(cwd));
+    if read_mode_for_root(&root) != KnowledgeMode::On {
+        return;
+    }
+    if let Err(error) = crate::dvz_memory::download_project(&root).await {
+        let _ = updates.send(KnowledgeUpdate::Failed {
+            project_root: root,
+            message: error.to_string(),
+        });
+        return;
+    }
+    process_pending_project(paths, cwd, true, updates).await;
+    import_native_project(paths, cwd, model, updates).await;
+}
+
+async fn import_native_project(
+    paths: &RuntimePaths,
+    cwd: &str,
+    model: &str,
+    updates: &mpsc::UnboundedSender<KnowledgeUpdate>,
+) {
+    let root = project_root(Path::new(cwd));
+    if read_mode_for_root(&root) != KnowledgeMode::On {
+        return;
+    }
+    let import = tokio::task::spawn_blocking({
+        let root = root.clone();
+        move || native_project_memories(&root)
+    })
+    .await;
+    let native = match import {
+        Ok(native) => native,
+        Err(error) => {
+            let _ = updates.send(KnowledgeUpdate::Failed {
+                project_root: root,
+                message: format!("순정 CLI 메모리 수집 작업이 중단되었습니다: {error}"),
+            });
+            return;
+        }
+    };
+    for warning in native.warnings {
+        let _ = updates.send(KnowledgeUpdate::Warning {
+            project_root: root.clone(),
+            message: warning,
+        });
+    }
+    let native = redact_secrets(&native.content);
+    if native.trim().is_empty() {
+        return;
+    }
+    let fingerprint = content_fingerprint(&native);
+    if read_native_fingerprint(&root).as_deref() == Some(fingerprint.as_str()) {
+        return;
+    }
+    let turn = KnowledgeTurn {
+        cwd: cwd.to_owned(),
+        model: model.to_owned(),
+        transcript: format!("## 순정 CLI에서 가져온 프로젝트 메모리\n{}", native.trim()),
+    };
+    match write_pending_turn(&turn, Some(fingerprint)) {
+        Ok(path) => process_queued_turn(paths, &path, updates).await,
+        Err(error) => {
+            let _ = updates.send(KnowledgeUpdate::Failed {
+                project_root: root,
+                message: error.to_string(),
+            });
+        }
+    }
+}
+
+async fn process_pending_project(
+    paths: &RuntimePaths,
+    cwd: &str,
+    force: bool,
+    updates: &mpsc::UnboundedSender<KnowledgeUpdate>,
+) {
+    let mut regular = Vec::new();
+    let mut native = Vec::new();
+    for path in pending_job_paths(cwd) {
+        match fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<QueuedTurn>(&bytes).ok())
+        {
+            Some(queued) if queued.native_fingerprint.is_some() => native.push(path),
+            Some(_) => regular.push(path),
+            None => quarantine_job(&path, "corrupt"),
+        }
+    }
+    let oldest_age = regular.first().and_then(|path| {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+    });
+    let due = memory_batch_due(regular.len(), oldest_age);
+    if force || due {
+        process_queued_turns(paths, &regular, updates).await;
+    }
+    if force {
+        for path in native {
+            process_queued_turn(paths, &path, updates).await;
+        }
+    }
+}
+
+fn memory_batch_due(count: usize, oldest_age: Option<Duration>) -> bool {
+    count >= MEMORY_BATCH_TURNS || oldest_age.is_some_and(|age| age >= MEMORY_BATCH_WAIT)
 }
 
 fn prune_quarantined_jobs(directory: &Path) {
@@ -497,11 +672,19 @@ async fn process_queued_turn(
     path: &Path,
     updates: &mpsc::UnboundedSender<KnowledgeUpdate>,
 ) {
-    let Some(initial) = fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<QueuedTurn>(&bytes).ok())
-    else {
-        quarantine_job(path, "corrupt");
+    process_queued_turns(paths, &[path.to_path_buf()], updates).await;
+}
+
+async fn process_queued_turns(
+    paths: &RuntimePaths,
+    job_paths: &[PathBuf],
+    updates: &mpsc::UnboundedSender<KnowledgeUpdate>,
+) {
+    let Some(initial) = job_paths.iter().find_map(|path| {
+        fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<QueuedTurn>(&bytes).ok())
+    }) else {
         return;
     };
     let root = project_root(Path::new(&initial.turn.cwd));
@@ -515,32 +698,52 @@ async fn process_queued_turn(
             return;
         }
     };
-    let Some(mut queued) = fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<QueuedTurn>(&bytes).ok())
-    else {
-        quarantine_job(path, "corrupt");
-        return;
-    };
-    if read_mode_for_root(&root) != KnowledgeMode::On {
-        let _ = fs::remove_file(path);
+    let mut queued = Vec::new();
+    for path in job_paths {
+        match fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<QueuedTurn>(&bytes).ok())
+        {
+            Some(job) if same_project(&job.turn.cwd, &root) => {
+                queued.push((path.clone(), job));
+            }
+            Some(_) => {}
+            None => quarantine_job(path, "corrupt"),
+        }
+    }
+    if queued.is_empty() {
         return;
     }
-    let update = match process_turn_locked(paths, &root, &queued.turn).await {
-        Ok(true) => {
+    if read_mode_for_root(&root) != KnowledgeMode::On {
+        for (path, _) in queued {
             let _ = fs::remove_file(path);
-            KnowledgeUpdate::Saved { project_root: root }
+        }
+        return;
+    }
+    let turn = combined_turn(&queued);
+    let processed = match process_turn_locked(paths, &root, &turn).await {
+        Ok(changed) => crate::dvz_memory::upload_project(&root)
+            .await
+            .map(|_| changed),
+        Err(error) => Err(error),
+    };
+    let update = match processed {
+        Ok(true) => {
+            complete_queued_turns(&root, &queued, updates);
+            KnowledgeUpdate::Saved
         }
         Ok(false) => {
-            let _ = fs::remove_file(path);
-            KnowledgeUpdate::Unchanged { project_root: root }
+            complete_queued_turns(&root, &queued, updates);
+            KnowledgeUpdate::Unchanged
         }
         Err(error) => {
-            queued.attempts = queued.attempts.saturating_add(1);
-            if queued.attempts >= 3 {
-                quarantine_job(path, "failed");
-            } else if let Ok(contents) = serde_json::to_string(&queued) {
-                let _ = write_recoverable(path, &contents);
+            for (path, queued) in &mut queued {
+                queued.attempts = queued.attempts.saturating_add(1);
+                if queued.attempts >= 3 {
+                    quarantine_job(path, "failed");
+                } else if let Ok(contents) = serde_json::to_string(queued) {
+                    let _ = write_recoverable(path, &contents);
+                }
             }
             KnowledgeUpdate::Failed {
                 project_root: root,
@@ -549,6 +752,50 @@ async fn process_queued_turn(
         }
     };
     let _ = updates.send(update);
+}
+
+fn combined_turn(queued: &[(PathBuf, QueuedTurn)]) -> KnowledgeTurn {
+    if queued.len() == 1 {
+        queued[0].1.turn.clone()
+    } else {
+        let per_turn = TURN_INPUT_CHARS.saturating_sub(queued.len() * 40) / queued.len();
+        let transcript = queued
+            .iter()
+            .enumerate()
+            .map(|(index, (_, queued))| {
+                format!(
+                    "## 묶음 작업 {}\n{}",
+                    index + 1,
+                    truncate_middle(&queued.turn.transcript, per_turn)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let latest = &queued.last().expect("queued batch is not empty").1.turn;
+        KnowledgeTurn {
+            cwd: latest.cwd.clone(),
+            model: latest.model.clone(),
+            transcript: truncate_middle(&transcript, TURN_INPUT_CHARS),
+        }
+    }
+}
+
+fn complete_queued_turns(
+    root: &Path,
+    queued: &[(PathBuf, QueuedTurn)],
+    updates: &mpsc::UnboundedSender<KnowledgeUpdate>,
+) {
+    for (path, queued) in queued {
+        if let Some(fingerprint) = queued.native_fingerprint.as_deref()
+            && let Err(error) = write_native_fingerprint(root, fingerprint)
+        {
+            let _ = updates.send(KnowledgeUpdate::Warning {
+                project_root: root.to_path_buf(),
+                message: error.to_string(),
+            });
+        }
+        let _ = fs::remove_file(path);
+    }
 }
 
 async fn process_turn_locked(
@@ -562,16 +809,7 @@ async fn process_turn_locked(
     ensure_output_path_is_safe(root)?;
     let memory_path = auto_memory_dir(root).join("MEMORY.md");
     let existing = read_regular_text(&memory_path)?.unwrap_or_default();
-    let mut existing = redact_secrets(generated_body(&existing));
-    if let Some(native) = claude_auto_memory(root) {
-        let native = redact_secrets(&native);
-        if !native.trim().is_empty() && !existing.contains(native.trim()) {
-            existing = truncate_middle(
-                &format!("{existing}\n\n{}", native.trim()),
-                EXISTING_MEMORY_CHARS,
-            );
-        }
-    }
+    let existing = redact_secrets(generated_body(&existing));
     if existing.chars().count() > EXISTING_MEMORY_CHARS {
         bail!("자동 장기 지식이 12,000자를 넘어 안전하게 병합할 수 없습니다.");
     }
@@ -638,7 +876,7 @@ fn analysis_provider(model: &str) -> AnalysisProvider {
 
 fn analysis_prompt(existing: &str, transcript: &str, repair_summary: bool) -> String {
     format!(
-        r#"완료된 개발 작업에서 다음 세션에도 재사용할 프로젝트 지식만 추출한다.
+        r#"완료된 개발 작업 또는 순정 CLI 메모리에서 다음 세션에도 재사용할 프로젝트 지식만 추출한다.
 
 반드시 다른 글 없이 아래 JSON 하나만 출력한다.
 {{"changed":true|false,"memory":"전체 통합 장기 지식 Markdown","summary":"간소화한 주입용 Markdown"}}
@@ -1041,10 +1279,41 @@ fn read_capped_regular(path: &Path, limit: usize) -> Option<String> {
         .map(|text| truncate_middle(&text, limit))
 }
 
-fn claude_auto_memory(root: &Path) -> Option<String> {
-    let home = env::var_os("USERPROFILE")
+fn native_project_memories(root: &Path) -> NativeMemoryScan {
+    let Some(home) = env::var_os("USERPROFILE")
         .or_else(|| env::var_os("HOME"))
-        .map(PathBuf::from)?;
+        .map(PathBuf::from)
+    else {
+        return NativeMemoryScan::default();
+    };
+    native_project_memories_in(root, &home)
+}
+
+fn native_project_memories_in(root: &Path, home: &Path) -> NativeMemoryScan {
+    let mut memories = Vec::new();
+    let mut warnings = Vec::new();
+    if let Some(memory) = claude_auto_memory_in(root, home)
+        && !memory.trim().is_empty()
+    {
+        memories.push(format!("### 외부 메모리 항목\n{}", memory.trim()));
+    }
+    match codex_project_memories_in(root, home) {
+        Ok(codex_memories) => {
+            for memory in codex_memories {
+                if !memory.trim().is_empty() {
+                    memories.push(format!("### 외부 메모리 항목\n{}", memory.trim()));
+                }
+            }
+        }
+        Err(error) => warnings.push(error.to_string()),
+    }
+    NativeMemoryScan {
+        content: truncate_middle(&memories.join("\n\n"), NATIVE_MEMORY_CHARS),
+        warnings,
+    }
+}
+
+fn claude_auto_memory_in(root: &Path, home: &Path) -> Option<String> {
     let project = claude_project_key(root);
     read_capped_regular(
         &home
@@ -1055,6 +1324,114 @@ fn claude_auto_memory(root: &Path) -> Option<String> {
             .join("MEMORY.md"),
         NATIVE_MEMORY_CHARS,
     )
+}
+
+fn codex_project_memories_in(root: &Path, home: &Path) -> Result<Vec<String>> {
+    let directory = home.join(".codex");
+    let Some(memory_path) = latest_versioned_file(&directory, "memories_", ".sqlite") else {
+        return Ok(Vec::new());
+    };
+    let Some(state_path) = latest_versioned_file(&directory, "state_", ".sqlite") else {
+        return Ok(Vec::new());
+    };
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_URI;
+    let state = Connection::open_with_flags(&state_path, flags)
+        .with_context(|| format!("Codex 프로젝트 정보 읽기 실패: {}", state_path.display()))?;
+    let current_remote = crate::dvz_memory::github_project(root);
+    let mut project_threads = HashSet::new();
+    let mut statement = state
+        .prepare("SELECT id, cwd, git_origin_url FROM threads ORDER BY updated_at DESC LIMIT 10000")
+        .context("Codex 프로젝트 정보 형식이 호환되지 않습니다.")?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (thread_id, cwd, remote) = row?;
+        let same_remote = current_remote.as_ref().is_some_and(|current| {
+            remote
+                .as_deref()
+                .and_then(crate::dvz_memory::github_project_from_remote)
+                .as_ref()
+                == Some(current)
+        });
+        if same_remote || same_project(&cwd, root) {
+            project_threads.insert(thread_id);
+        }
+    }
+    if project_threads.is_empty() {
+        return Ok(Vec::new());
+    }
+    let memory = Connection::open_with_flags(&memory_path, flags)
+        .with_context(|| format!("Codex 메모리 읽기 실패: {}", memory_path.display()))?;
+    let mut statement = memory
+        .prepare(
+            "SELECT thread_id, substr(raw_memory, 1, ?1) \
+             FROM stage1_outputs ORDER BY generated_at DESC LIMIT 10000",
+        )
+        .context("Codex 메모리 형식이 호환되지 않습니다.")?;
+    let rows = statement.query_map([NATIVE_MEMORY_CHARS as i64 / 2], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut memories = Vec::new();
+    for row in rows {
+        let (thread_id, memory) = row?;
+        if project_threads.contains(&thread_id) {
+            memories.push(truncate_middle(&memory, NATIVE_MEMORY_CHARS / 2));
+        }
+        if memories.len() >= 20 {
+            break;
+        }
+    }
+    Ok(memories)
+}
+
+fn latest_versioned_file(directory: &Path, prefix: &str, suffix: &str) -> Option<PathBuf> {
+    fs::read_dir(directory)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?;
+            let version = name
+                .strip_prefix(prefix)?
+                .strip_suffix(suffix)?
+                .parse::<u32>()
+                .ok()?;
+            fs::symlink_metadata(&path)
+                .ok()
+                .filter(|metadata| metadata.file_type().is_file())
+                .map(|_| (version, path))
+        })
+        .max_by_key(|(version, _)| *version)
+        .map(|(_, path)| path)
+}
+
+fn content_fingerprint(text: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn native_fingerprint_path(root: &Path) -> PathBuf {
+    auto_memory_dir(root).join("NATIVE_IMPORT")
+}
+
+fn read_native_fingerprint(root: &Path) -> Option<String> {
+    read_capped_regular(&native_fingerprint_path(root), 64).map(|value| value.trim().to_owned())
+}
+
+fn write_native_fingerprint(root: &Path, fingerprint: &str) -> Result<()> {
+    ensure_output_path_is_safe(root)?;
+    fs::create_dir_all(auto_memory_dir(root))?;
+    write_recoverable(&native_fingerprint_path(root), fingerprint).map_err(Into::into)
 }
 
 fn claude_project_key(root: &Path) -> String {
@@ -1136,6 +1513,7 @@ fn ensure_output_path_is_safe(root: &Path) -> Result<()> {
         auto.clone(),
         auto.join("MEMORY.md"),
         auto_memory_dir(root).join("SUMMARY.md"),
+        native_fingerprint_path(root),
     ] {
         if let Ok(metadata) = fs::symlink_metadata(&path)
             && metadata.file_type().is_symlink()
@@ -1378,11 +1756,165 @@ mod tests {
     }
 
     #[test]
+    fn memory_requests_only_hand_work_to_the_background_worker() {
+        let (jobs, mut queued) = mpsc::unbounded_channel();
+        let worker = KnowledgeWorker { jobs };
+        let turn = KnowledgeTurn {
+            cwd: "C:/source/project".to_owned(),
+            model: "gpt-5.6-luna".to_owned(),
+            transcript: "작업 기록".to_owned(),
+        };
+
+        worker.enqueue(turn).expect("background enqueue");
+        assert!(matches!(queued.try_recv(), Ok(KnowledgeJob::Turn(_))));
+        worker.sync_project("C:/source/project", "gpt-5.6-luna");
+        assert!(matches!(
+            queued.try_recv(),
+            Ok(KnowledgeJob::SyncProject { .. })
+        ));
+    }
+
+    #[test]
+    fn ordinary_turns_wait_for_a_batch_or_the_idle_deadline() {
+        assert!(!memory_batch_due(1, Some(Duration::from_secs(299))));
+        assert!(memory_batch_due(5, None));
+        assert!(memory_batch_due(1, Some(Duration::from_secs(300))));
+    }
+
+    #[test]
+    fn batched_analysis_keeps_a_bounded_slice_of_every_turn() {
+        let queued = (1..=5)
+            .map(|index| {
+                (
+                    PathBuf::from(format!("{index}.json")),
+                    QueuedTurn {
+                        attempts: 0,
+                        native_fingerprint: None,
+                        turn: KnowledgeTurn {
+                            cwd: "C:/source/project".to_owned(),
+                            model: format!("model-{index}"),
+                            transcript: format!("턴-{index}\n{}", "내용".repeat(4_000)),
+                        },
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let combined = combined_turn(&queued);
+        for index in 1..=5 {
+            assert!(combined.transcript.contains(&format!("턴-{index}")));
+        }
+        assert!(combined.transcript.chars().count() <= TURN_INPUT_CHARS);
+        assert_eq!(combined.model, "model-5");
+    }
+
+    #[test]
     fn claude_memory_key_uses_the_cli_project_directory_shape() {
         assert_eq!(
             claude_project_key(Path::new("C:\\Source\\devezVibe")),
             "C--Source-devezVibe"
         );
+    }
+
+    #[test]
+    fn native_memory_import_keeps_only_the_current_project() {
+        let root = temp_project("native-import");
+        let home = root.join("home");
+        let claude_memory = home
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_key(&root))
+            .join("memory")
+            .join("MEMORY.md");
+        fs::create_dir_all(claude_memory.parent().unwrap()).expect("Claude memory directory");
+        fs::write(&claude_memory, "Claude 프로젝트 지식").expect("Claude memory");
+
+        let codex = home.join(".codex");
+        fs::create_dir_all(&codex).expect("Codex directory");
+        let state = Connection::open(codex.join("state_5.sqlite")).expect("Codex state");
+        state
+            .execute_batch(
+                "CREATE TABLE threads (\
+                    id TEXT, cwd TEXT, git_origin_url TEXT, updated_at INTEGER\
+                 );\
+                 INSERT INTO threads VALUES ('same', 'PLACEHOLDER', NULL, 2);\
+                 INSERT INTO threads VALUES ('other', 'C:/another/project', NULL, 1);",
+            )
+            .expect("Codex threads");
+        state
+            .execute(
+                "UPDATE threads SET cwd = ?1 WHERE id = 'same'",
+                [root.join("src").to_string_lossy().as_ref()],
+            )
+            .expect("matching Codex cwd");
+        let memory = Connection::open(codex.join("memories_1.sqlite")).expect("Codex memory");
+        memory
+            .execute_batch(
+                "CREATE TABLE stage1_outputs (\
+                    thread_id TEXT, raw_memory TEXT, generated_at INTEGER\
+                 );\
+                 INSERT INTO stage1_outputs VALUES ('same', 'Codex 프로젝트 지식', 2);\
+                 INSERT INTO stage1_outputs VALUES ('other', '다른 프로젝트 비밀', 1);",
+            )
+            .expect("Codex memories");
+
+        let imported = native_project_memories_in(&root, &home).content;
+        assert!(imported.contains("Claude 프로젝트 지식"));
+        assert!(imported.contains("Codex 프로젝트 지식"));
+        assert!(!imported.contains("다른 프로젝트 비밀"));
+
+        drop(memory);
+        drop(state);
+        fs::remove_dir_all(root).expect("temporary project cleanup");
+    }
+
+    #[test]
+    fn native_memory_fingerprint_changes_only_with_content() {
+        assert_eq!(
+            content_fingerprint("같은 지식"),
+            content_fingerprint("같은 지식")
+        );
+        assert_ne!(
+            content_fingerprint("기존 지식"),
+            content_fingerprint("새 지식")
+        );
+    }
+
+    #[test]
+    fn incompatible_codex_memory_does_not_block_claude_memory() {
+        let root = temp_project("native-import-fallback");
+        let home = root.join("home");
+        let claude_memory = home
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_key(&root))
+            .join("memory")
+            .join("MEMORY.md");
+        fs::create_dir_all(claude_memory.parent().unwrap()).expect("Claude memory directory");
+        fs::write(&claude_memory, "보존할 Claude 지식").expect("Claude memory");
+        let codex = home.join(".codex");
+        fs::create_dir_all(&codex).expect("Codex directory");
+        drop(Connection::open(codex.join("state_5.sqlite")).expect("incompatible Codex state"));
+        drop(Connection::open(codex.join("memories_1.sqlite")).expect("Codex memory"));
+
+        let imported = native_project_memories_in(&root, &home);
+        assert!(imported.content.contains("보존할 Claude 지식"));
+        assert_eq!(imported.warnings.len(), 1);
+
+        fs::remove_dir_all(root).expect("temporary project cleanup");
+    }
+
+    #[test]
+    fn native_fingerprint_round_trips_in_the_project_cache() {
+        let root = temp_project("native-fingerprint");
+
+        write_native_fingerprint(&root, "0123456789abcdef").expect("native fingerprint");
+        assert_eq!(
+            read_native_fingerprint(&root).as_deref(),
+            Some("0123456789abcdef")
+        );
+
+        fs::remove_dir_all(root).expect("temporary project cleanup");
     }
 
     #[test]

@@ -120,12 +120,12 @@ pub fn activate_account(cwd: &Path, account: &DvzMemoryAccount) -> Result<()> {
 
 pub fn clear_local_project(cwd: &Path) -> Result<()> {
     let root = crate::project_memory::project_root(cwd);
-    for name in ["MEMORY.md", "SUMMARY.md"] {
+    for name in ["MEMORY.md", "SUMMARY.md", "NATIVE_IMPORT"] {
         let path = crate::project_memory::auto_memory_dir(&root).join(name);
         let Some(contents) = read_local_document(&path)? else {
             continue;
         };
-        if contents.starts_with(GENERATED_HEADER) {
+        if name == "NATIVE_IMPORT" || contents.starts_with(GENERATED_HEADER) {
             fs::remove_file(path)?;
         }
     }
@@ -223,11 +223,12 @@ pub async fn complete_login(
 }
 
 pub async fn download_project(cwd: &Path) -> Result<bool> {
+    let Some(project) = github_project(cwd) else {
+        return Ok(false);
+    };
     let Some(account) = authenticated_account().await? else {
         return Ok(false);
     };
-    let project =
-        github_project(cwd).context("현재 프로젝트의 GitHub origin을 찾을 수 없습니다.")?;
     let client = github_client()?;
     let mut changed = false;
     for name in ["MEMORY.md", "SUMMARY.md"] {
@@ -243,11 +244,12 @@ pub async fn download_project(cwd: &Path) -> Result<bool> {
 }
 
 pub async fn upload_project(cwd: &Path) -> Result<bool> {
+    let Some(project) = github_project(cwd) else {
+        return Ok(false);
+    };
     let Some(account) = authenticated_account().await? else {
         return Ok(false);
     };
-    let project =
-        github_project(cwd).context("현재 프로젝트의 GitHub origin을 찾을 수 없습니다.")?;
     let client = github_client()?;
     let mut changed = false;
     for name in ["MEMORY.md", "SUMMARY.md"] {
@@ -477,7 +479,7 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-fn github_project(cwd: &Path) -> Option<String> {
+pub(crate) fn github_project(cwd: &Path) -> Option<String> {
     let root = crate::project_memory::project_root(cwd);
     let output = Command::new("git")
         .args(["-C", root.to_str()?, "remote", "get-url", "origin"])
@@ -487,7 +489,7 @@ fn github_project(cwd: &Path) -> Option<String> {
     github_project_from_remote(std::str::from_utf8(&output.stdout).ok()?.trim())
 }
 
-fn github_project_from_remote(remote: &str) -> Option<String> {
+pub(crate) fn github_project_from_remote(remote: &str) -> Option<String> {
     let path = remote
         .strip_prefix("git@github.com:")
         .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
@@ -650,6 +652,16 @@ fn delete_secret() -> Result<()> {
 mod tests {
     use super::*;
 
+    fn temp_project(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "devez-memory-{name}-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        fs::create_dir_all(root.join(".git")).expect("git marker");
+        root
+    }
+
     #[test]
     fn github_remotes_map_to_one_project_key() {
         for remote in [
@@ -668,6 +680,38 @@ mod tests {
     fn non_github_and_nested_remotes_are_rejected() {
         assert!(github_project_from_remote("https://gitlab.com/openai/codex.git").is_none());
         assert!(github_project_from_remote("https://github.com/openai/codex/extra").is_none());
+    }
+
+    #[test]
+    fn clearing_project_memory_also_resets_the_native_import_fingerprint() {
+        let root = temp_project("clear-native");
+        let cache = crate::project_memory::auto_memory_dir(&root);
+        fs::create_dir_all(&cache).expect("memory cache");
+        fs::write(cache.join("MEMORY.md"), GENERATED_HEADER).expect("memory document");
+        fs::write(cache.join("SUMMARY.md"), GENERATED_HEADER).expect("summary document");
+        fs::write(cache.join("NATIVE_IMPORT"), "0123456789abcdef").expect("fingerprint");
+
+        clear_local_project(&root).expect("clear project memory");
+        assert!(!cache.join("MEMORY.md").exists());
+        assert!(!cache.join("SUMMARY.md").exists());
+        assert!(!cache.join("NATIVE_IMPORT").exists());
+
+        fs::remove_dir_all(root).expect("temporary project cleanup");
+    }
+
+    #[tokio::test]
+    async fn projects_without_a_github_origin_skip_sync_without_an_error() {
+        let root = std::env::temp_dir().join(format!(
+            "devez-memory-no-origin-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        fs::create_dir_all(&root).expect("temporary directory");
+
+        assert!(!download_project(&root).await.expect("silent download skip"));
+        assert!(!upload_project(&root).await.expect("silent upload skip"));
+
+        fs::remove_dir_all(root).expect("temporary directory cleanup");
     }
 
     #[tokio::test]

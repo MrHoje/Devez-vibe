@@ -606,7 +606,7 @@ const SLASH_COMMANDS: [SlashCommand; 34] = [
     },
     SlashCommand {
         name: "/memory-hub",
-        description: "Share project memory across every connected provider",
+        description: "Collect native CLI memory and share it across every connected provider",
         takes_argument: false,
     },
     SlashCommand {
@@ -5178,7 +5178,7 @@ impl AppState {
         self.pending = None;
         match result {
             Ok(account) => {
-                self.knowledge_mode = KnowledgeMode::On;
+                self.knowledge_mode = project_memory::read_mode(&self.cwd);
                 self.push_notice(
                     BlockKind::System,
                     "GitHub login complete",
@@ -5295,6 +5295,7 @@ impl AppState {
                 VibeMode::Vibe => VibeTone::On,
                 VibeMode::SuperVibe => VibeTone::Super,
             },
+            memory_hub: self.knowledge_mode.enabled(),
             label: self.permission_mode().label().to_owned(),
             accent: self.permission_mode().accent(),
             model: self.selected_model_name().to_owned(),
@@ -11090,7 +11091,8 @@ impl AppState {
             PendingInteraction::DvzMemoryPicker { selected, account } => {
                 let mut lines = vec![
                     OverlayLine {
-                        text: "Share project memory across every connected provider.".to_owned(),
+                        text: "Collect native CLI memory and share it across every connected provider."
+                            .to_owned(),
                         selected: false,
                         muted: true,
                     },
@@ -17766,6 +17768,15 @@ mod tests {
     }
 
     #[test]
+    fn composer_marks_memory_hub_only_for_an_active_project() {
+        let mut state = test_state();
+        assert!(!state.composer_mode().memory_hub);
+
+        state.knowledge_mode = KnowledgeMode::On;
+        assert!(state.composer_mode().memory_hub);
+    }
+
+    #[test]
     fn failed_turn_never_queues_knowledge() {
         let mut state = test_state();
         state.knowledge_mode = KnowledgeMode::On;
@@ -20312,12 +20323,8 @@ mod tests {
             account: None,
         });
         let overlay = state.overlay_view().expect("Memory Hub login overlay");
-        assert!(
-            overlay
-                .lines
-                .iter()
-                .any(|line| line.text == "Share project memory across every connected provider.")
-        );
+        assert!(overlay.lines.iter().any(|line| line.text
+            == "Collect native CLI memory and share it across every connected provider."));
         assert!(overlay.lines.iter().any(|line| line.text == "1. Login"));
         assert!(matches!(
             state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),

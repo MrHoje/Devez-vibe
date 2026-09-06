@@ -434,6 +434,7 @@ pub struct ComposerMode {
     pub branch: Option<String>,
     pub vibe_mode: String,
     pub vibe_tone: VibeTone,
+    pub memory_hub: bool,
     #[allow(dead_code)]
     pub label: String,
     #[allow(dead_code)]
@@ -12745,6 +12746,14 @@ fn full_badge_spans(mode: &ComposerMode, include_branch: bool) -> BadgeSpans {
         tone: vibe_tone(mode.vibe_tone),
         bold: false,
     });
+    if mode.memory_hub {
+        spans.push(display_separator_span());
+        spans.push(PaintSpan {
+            text: "MemoryHub".to_owned(),
+            tone: Tone::Plain,
+            bold: false,
+        });
+    }
     BadgeSpans {
         spans,
         vibe_mode_index: Some(vibe_mode_index),
@@ -17931,6 +17940,7 @@ mod tests {
             branch: None,
             vibe_mode: "Vibe: On".to_owned(),
             vibe_tone: VibeTone::On,
+            memory_hub: false,
             label: label.to_owned(),
             accent,
             model: "GPT-5.6-Terra".to_owned(),
@@ -17944,6 +17954,15 @@ mod tests {
         mode.vibe_mode = "Vibe: Super Vibe".to_owned();
         mode.vibe_tone = VibeTone::Super;
         mode
+    }
+
+    #[test]
+    fn active_memory_hub_appears_to_the_right_of_vibe_mode() {
+        let mut mode = test_mode("Default", ModeAccent::Calm, false);
+        mode.memory_hub = true;
+
+        let line = input_top_line(80, "", Some(&mode));
+        assert!(painted(&line).contains("Vibe: On | MemoryHub"));
     }
 
     #[test]
@@ -19490,6 +19509,7 @@ mod tests {
                 branch: Some("main".to_owned()),
                 vibe_mode: "Super Vibe".to_owned(),
                 vibe_tone: VibeTone::Super,
+                memory_hub: false,
                 label: String::new(),
                 accent: ModeAccent::Calm,
                 model: "Claude Opus 4.8".to_owned(),

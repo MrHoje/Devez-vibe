@@ -1051,10 +1051,7 @@ enum ManagementUpdate {
     DvzMemoryLoginFinished(
         std::result::Result<dvz_memory::DvzMemoryAccount, String>,
     ),
-    DvzMemorySync {
-        operation: &'static str,
-        result: std::result::Result<bool, String>,
-    },
+    DvzMemoryLogoutFinished(std::result::Result<(), String>),
     Skill {
         provider: SkillProvider,
         name: String,
@@ -1109,18 +1106,9 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
         ManagementUpdate::DvzMemoryLoginFinished(result) => {
             state.finish_dvz_memory_login(result);
         }
-        ManagementUpdate::DvzMemorySync { operation, result } => match result {
-            Ok(true) => state.push_notice(
-                BlockKind::System,
-                format!("Memory Hub {operation} complete"),
-                "Project memory is up to date.",
-            ),
-            Ok(false) => {}
-            Err(error) => state.push_notice(
-                BlockKind::Warning,
-                format!("Memory Hub {operation} failed"),
-                error,
-            ),
+        ManagementUpdate::DvzMemoryLogoutFinished(result) => match result {
+            Ok(()) => state.finish_dvz_memory_logout(),
+            Err(error) => state.push_notice(BlockKind::Error, "GitHub logout failed", error),
         },
         ManagementUpdate::Skill {
             provider,
@@ -1646,19 +1634,8 @@ async fn event_loop(
         if indexed_cwd.as_deref() != Some(state.cwd.as_str()) {
             let cwd = state.cwd.clone();
             indexed_cwd = Some(cwd.clone());
-            knowledge_worker.resume_project(&cwd);
-            if dvz_memory::account().is_some() {
-                let sender = management_tx.clone();
-                let memory_cwd = PathBuf::from(&cwd);
-                tokio::spawn(async move {
-                    let result = dvz_memory::download_project(&memory_cwd)
-                        .await
-                        .map_err(|error| error.to_string());
-                    let _ = sender.send(ManagementUpdate::DvzMemorySync {
-                        operation: "download",
-                        result,
-                    });
-                });
+            if state.knowledge_mode().enabled() {
+                knowledge_worker.sync_project(&cwd, state.selected_model_name());
             }
             let tx = workspace_tx.clone();
             tokio::spawn(async move {
@@ -2042,7 +2019,14 @@ async fn event_loop(
                 Action::None
             }
             Some(update) = management_rx.recv() => {
+                let refresh_memory = matches!(
+                    &update,
+                    ManagementUpdate::DvzMemoryLoginFinished(Ok(_))
+                );
                 apply_management_update(state, update);
+                if refresh_memory {
+                    knowledge_worker.sync_project(&state.cwd, state.selected_model_name());
+                }
                 Action::None
             }
             Some(update) = knowledge_rx.recv() => {
@@ -2052,20 +2036,10 @@ async fn event_loop(
                     {
                         state.push_notice(BlockKind::Warning, "지식 갱신 실패", message);
                     }
-                    project_memory::KnowledgeUpdate::Saved { project_root } => {
-                        let sender = management_tx.clone();
-                        tokio::spawn(async move {
-                            let result = dvz_memory::upload_project(&project_root)
-                                .await
-                                .map_err(|error| error.to_string());
-                            let _ = sender.send(ManagementUpdate::DvzMemorySync {
-                                operation: "upload",
-                                result,
-                            });
-                        });
-                    }
-                    project_memory::KnowledgeUpdate::Unchanged { project_root } => {
-                        let _ = project_root;
+                    project_memory::KnowledgeUpdate::Warning { project_root, message }
+                        if project_memory::same_project(&state.cwd, &project_root) =>
+                    {
+                        state.push_notice(BlockKind::Warning, "순정 메모리 일부 제외", message);
                     }
                     _ => {}
                 }
@@ -2640,33 +2614,23 @@ async fn execute_action(
                 if cancelled.load(Ordering::Relaxed) {
                     return;
                 }
-                if let Ok(account) = &result {
-                    if let Err(error) = dvz_memory::activate_account(&cwd, account) {
-                        result = Err(error.to_string());
-                    } else {
-                        let sync = dvz_memory::download_project(&cwd)
-                            .await
-                            .map_err(|error| error.to_string());
-                        let _ = sender.send(ManagementUpdate::DvzMemorySync {
-                            operation: "download",
-                            result: sync,
-                        });
-                    }
+                if let Ok(account) = &result
+                    && let Err(error) = dvz_memory::activate_account(&cwd, account)
+                {
+                    result = Err(error.to_string());
                 }
                 let _ = sender.send(ManagementUpdate::DvzMemoryLoginFinished(result));
             });
         }
         Action::DvzMemoryLogout => {
-            let logout = dvz_memory::clear_local_project(Path::new(&state.cwd))
-                .and_then(|_| dvz_memory::logout());
-            match logout {
-                Ok(()) => state.finish_dvz_memory_logout(),
-                Err(error) => state.push_notice(
-                    BlockKind::Error,
-                    "GitHub logout failed",
-                    error.to_string(),
-                ),
-            }
+            let sender = management_tx.clone();
+            let cwd = PathBuf::from(&state.cwd);
+            tokio::task::spawn_blocking(move || {
+                let result = dvz_memory::clear_local_project(&cwd)
+                    .and_then(|_| dvz_memory::logout())
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(ManagementUpdate::DvzMemoryLogoutFinished(result));
+            });
         }
         Action::Submit(text) => {
             renderer.scroll_to_bottom();
