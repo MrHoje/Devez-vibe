@@ -22,9 +22,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "/memory-hub에서 GitHub 로그인만으로 private dvz-memory-hub 저장소를 준비합니다.",
-    "Claude·Codex·OpenCode 프로젝트 지식을 provider 사이에서 공유합니다.",
-    "프로젝트 메모리 업로드와 다운로드를 백그라운드에서 처리합니다.",
+    "모든 연결 제공자의 완료된 작업을 하나의 프로젝트 메모리로 취합합니다.",
+    "Grok 등 OpenCode에 추가되는 제공자도 별도 목록 없이 자동으로 포함합니다.",
+    "표현이 다르거나 겹치는 지식은 의미 기준으로 하나로 정리합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

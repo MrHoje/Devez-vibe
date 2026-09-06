@@ -315,24 +315,23 @@ pub fn prompt_context(cwd: &str, mode: KnowledgeMode) -> Option<String> {
         4_000,
     );
     let summary = redact_secrets(generated_body(&summary));
-    let summary = summary.trim();
     let native_memory = claude_auto_memory(&root)
         .map(|memory| redact_secrets(&memory))
         .unwrap_or_default();
+    let shared_memory = [summary.trim(), native_memory.trim()]
+        .into_iter()
+        .filter(|memory| !memory.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
     Some(format!(
         "프로젝트 지식 관리가 켜져 있다. 현재 저장소와 사용자 지시가 지식 문서보다 우선한다. \
          수동 문서는 자동 생성 문서보다 우선한다. 작업과 관련된 문서만 선택해서 읽고, \
          모든 문서를 한꺼번에 컨텍스트에 넣지 않는다. 아래 색인은 크기 제한이 있으며, \
-         필요하면 .knowledge 전체를 검색한다.\n\n자동 지식 요약:\n{}\n\nClaude에서 가져온 프로젝트 메모리:\n{}\n\n사용 가능한 지식 파일:\n{}",
-        if summary.is_empty() {
+         필요하면 .knowledge 전체를 검색한다.\n\n공용 프로젝트 메모리:\n{}\n\n사용 가능한 지식 파일:\n{}",
+        if shared_memory.is_empty() {
             "아직 없음"
         } else {
-            summary
-        },
-        if native_memory.trim().is_empty() {
-            "아직 없음"
-        } else {
-            native_memory.trim()
+            &shared_memory
         },
         if index.is_empty() {
             "- 아직 없음"
@@ -568,7 +567,7 @@ async fn process_turn_locked(
         let native = redact_secrets(&native);
         if !native.trim().is_empty() && !existing.contains(native.trim()) {
             existing = truncate_middle(
-                &format!("{existing}\n\n## Claude에서 가져온 프로젝트 메모리\n{}", native.trim()),
+                &format!("{existing}\n\n{}", native.trim()),
                 EXISTING_MEMORY_CHARS,
             );
         }
@@ -646,6 +645,8 @@ fn analysis_prompt(existing: &str, transcript: &str, repair_summary: bool) -> St
 
 규칙:
 - 장기 지식은 확정된 설계 결정, 반복 가능한 절차, 재발 가능한 실수, 검증된 원인과 해결법만 포함한다.
+- 작업을 수행한 제공자와 모델은 출처일 뿐이므로 제공자별 섹션을 만들지 않고 의미 기준으로 통합한다.
+- 표현만 다르거나 포함 관계인 지식은 하나로 합치고 동일한 사실을 중복해서 남기지 않는다.
 - 단순 작업 내역, 임시 상태, 추측, 인사, 사용자 개인 정보, 비밀정보는 포함하지 않는다.
 - 새로 남길 지식이 없으면 changed=false이고 memory와 summary는 빈 문자열이다.
 - 기존 장기 지식이 있고 주입용 요약 복구가 필요하면 새 지식이 없어도 changed=true로 반환한다.
@@ -1363,9 +1364,17 @@ mod tests {
             AnalysisProvider::Claude
         ));
         assert!(matches!(
-            analysis_provider("opencode:anthropic/claude-sonnet-4-6"),
-            AnalysisProvider::OpenCode(model) if model == "anthropic/claude-sonnet-4-6"
+            analysis_provider("opencode:xai/grok-4"),
+            AnalysisProvider::OpenCode(model) if model == "xai/grok-4"
         ));
+    }
+
+    #[test]
+    fn analysis_prompt_requires_provider_neutral_semantic_deduplication() {
+        let prompt = analysis_prompt("기존 지식", "새 작업", false);
+
+        assert!(prompt.contains("제공자별 섹션을 만들지 않고 의미 기준으로 통합"));
+        assert!(prompt.contains("포함 관계인 지식은 하나로 합치고"));
     }
 
     #[test]

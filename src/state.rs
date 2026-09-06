@@ -606,7 +606,7 @@ const SLASH_COMMANDS: [SlashCommand; 34] = [
     },
     SlashCommand {
         name: "/memory-hub",
-        description: "Share project memory across Claude, Codex, and OpenCode",
+        description: "Share project memory across every connected provider",
         takes_argument: false,
     },
     SlashCommand {
@@ -11090,7 +11090,7 @@ impl AppState {
             PendingInteraction::DvzMemoryPicker { selected, account } => {
                 let mut lines = vec![
                     OverlayLine {
-                        text: "Share project memory across Claude, Codex, and OpenCode.".to_owned(),
+                        text: "Share project memory across every connected provider.".to_owned(),
                         selected: false,
                         muted: true,
                     },
@@ -17734,12 +17734,12 @@ mod tests {
     }
 
     #[test]
-    fn successful_turn_queues_knowledge_with_the_model_that_ran_it() {
+    fn every_provider_turn_queues_shared_knowledge_with_the_model_that_ran_it() {
         let mut state = test_state();
         state.knowledge_mode = KnowledgeMode::On;
         state.editor.set_text("반복되는 빌드 오류를 해결해줘");
         assert!(matches!(state.submit_editor(), Action::Submit(_)));
-        state.note_pending_turn_model("gpt-5.6-sol");
+        state.note_pending_turn_model("opencode:xai/grok-4");
         state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
         state.handle_notification(
             "item/completed",
@@ -17759,7 +17759,7 @@ mod tests {
         let turn = state
             .take_completed_knowledge_turn()
             .expect("completed knowledge turn");
-        assert_eq!(turn.model, "gpt-5.6-sol");
+        assert_eq!(turn.model, "opencode:xai/grok-4");
         assert!(turn.transcript.contains("반복되는 빌드 오류"));
         assert!(turn.transcript.contains("재발 방지 절차"));
         assert!(state.take_completed_knowledge_turn().is_none());
@@ -20312,6 +20312,12 @@ mod tests {
             account: None,
         });
         let overlay = state.overlay_view().expect("Memory Hub login overlay");
+        assert!(
+            overlay
+                .lines
+                .iter()
+                .any(|line| line.text == "Share project memory across every connected provider.")
+        );
         assert!(overlay.lines.iter().any(|line| line.text == "1. Login"));
         assert!(matches!(
             state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
