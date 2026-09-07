@@ -9077,7 +9077,7 @@ impl AppState {
         }
         // A prompt sent mid-compaction would race the summary the runtime is
         // still writing, so it waits in the queue like one sent during a turn.
-        if self.compacting() && !self.busy {
+        if self.compacting() {
             self.requeue(text);
             return Action::None;
         }
@@ -22100,6 +22100,25 @@ mod tests {
         state.handle_notification("thread/compacted", &json!({}));
 
         assert!(!state.compacting());
+    }
+
+    #[test]
+    fn prompt_submitted_during_compaction_waits_in_the_queue() {
+        let mut state = busy_state_with_live_turn();
+        state.begin_compaction();
+        state.editor.set_text("압축 뒤에 실행해");
+
+        let action = state.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        assert!(matches!(action, Action::None));
+        assert_eq!(state.view().queued_prompts, ["압축 뒤에 실행해"]);
+
+        state.handle_notification("turn/completed", &json!({}));
+        let queued = state.take_queued_prompt().expect("queued prompt");
+        assert!(matches!(
+            state.start_queued_prompt(queued),
+            Action::Submit(text) if text == "압축 뒤에 실행해"
+        ));
     }
 
     /// A compaction that runs as a turn must not fall back to the `Working` label

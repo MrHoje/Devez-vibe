@@ -22,9 +22,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude 지식 분석 결과를 구조화된 JSON으로 받아 파싱 실패를 줄입니다.",
-    "MemoryHub 배지를 Vibe: On과 같은 색상으로 표시합니다.",
-    "동기화는 백그라운드에서 처리하고 일반 작업을 묶어 토큰 사용량을 줄입니다.",
+    "compact 진행 중 보낸 프롬프트를 대기열에 보관하고 압축이 끝난 뒤 실행합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
