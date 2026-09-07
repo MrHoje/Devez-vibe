@@ -26,6 +26,7 @@ pub const RELEASE_NOTES: &[&str] = &[
     "보낸 프롬프트 하단에 소요시간과 완료 시각을 표시합니다.",
     "모델·effort·fast·provider·theme 변경 성공 카드를 표시하지 않습니다.",
     "프롬프트 하단 메타정보에서 모델·effort를 제외합니다.",
+    "자동 지식 동기화와 프롬프트 주입 기능을 제거합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

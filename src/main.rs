@@ -6,7 +6,6 @@ mod child_process;
 mod claude;
 mod completion;
 mod doctor;
-mod dvz_memory;
 mod devezcode;
 mod editor;
 mod input_hub;
@@ -17,7 +16,6 @@ mod paste;
 mod perf;
 mod preedit;
 mod pricing;
-mod project_memory;
 mod provider;
 mod renderer;
 mod rollout;
@@ -34,7 +32,6 @@ use std::{
     future::Future,
     io::Read,
     path::{Path, PathBuf},
-    sync::{Arc, atomic::{AtomicBool, Ordering}},
     time::{Duration, Instant},
 };
 
@@ -398,7 +395,7 @@ async fn start_session(
     };
     if thread_response.is_null() {
         state.set_host_loading(false);
-        return run_after_startup(server, state, renderer, queued, cli).await;
+        return run_after_startup(server, state, renderer, queued).await;
     }
     apply_claude_account_metadata(state, &thread_response);
 
@@ -445,7 +442,7 @@ async fn start_session(
         apply_resumed_token_usage(state, &thread_response, rollout.as_ref());
     }
     state.set_host_loading(false);
-    run_after_startup(server, state, renderer, queued, cli).await
+    run_after_startup(server, state, renderer, queued).await
 }
 
 /// The screen is live and the session is either bound or still waiting for the first
@@ -456,7 +453,6 @@ async fn run_after_startup(
     state: &mut AppState,
     renderer: &mut Renderer,
     queued: Option<String>,
-    cli: &Cli,
 ) -> Result<()> {
     draw(state, renderer)?;
     // Startup's own stream is gone by now, so the shared one can take the terminal.
@@ -475,7 +471,7 @@ async fn run_after_startup(
             start_turn(server, state, renderer, text, None).await?;
         }
     }
-    event_loop(server, state, renderer, update_rx, cli).await
+    event_loop(server, state, renderer, update_rx).await
 }
 
 /// Keeps the activity row alive while a request needed to begin a turn is waiting
@@ -1043,15 +1039,6 @@ async fn choose_startup_session(
 }
 
 enum ManagementUpdate {
-    DvzMemoryLoginStarted {
-        url: String,
-        user_code: String,
-        cancelled: Arc<AtomicBool>,
-    },
-    DvzMemoryLoginFinished(
-        std::result::Result<dvz_memory::DvzMemoryAccount, String>,
-    ),
-    DvzMemoryLogoutFinished(std::result::Result<(), String>),
     Skill {
         provider: SkillProvider,
         name: String,
@@ -1086,30 +1073,6 @@ enum ManagementUpdate {
 
 fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
     match update {
-        ManagementUpdate::DvzMemoryLoginStarted {
-            url,
-            user_code,
-            cancelled,
-        } => {
-            if cancelled.load(Ordering::Relaxed) {
-                return;
-            }
-            state.begin_dvz_memory_login(user_code, cancelled);
-            if let Err(error) = open_url(&url) {
-                state.push_notice(
-                    BlockKind::Warning,
-                    "GitHub browser open failed",
-                    error.to_string(),
-                );
-            }
-        }
-        ManagementUpdate::DvzMemoryLoginFinished(result) => {
-            state.finish_dvz_memory_login(result);
-        }
-        ManagementUpdate::DvzMemoryLogoutFinished(result) => match result {
-            Ok(()) => state.finish_dvz_memory_logout(),
-            Err(error) => state.push_notice(BlockKind::Error, "GitHub logout failed", error),
-        },
         ManagementUpdate::Skill {
             provider,
             name,
@@ -1330,7 +1293,6 @@ async fn start_split_turn(
     state.note_pending_turn_effort(&effort);
     let input = state.turn_input(text);
     let agent_mode = state.agent_mode();
-    let knowledge = project_memory::prompt_context(&state.cwd, state.knowledge_mode());
     let mut params = json!({
         "threadId": state.thread_id,
         "input": input,
@@ -1340,7 +1302,7 @@ async fn start_split_turn(
         "additionalContext": turn_additional_context(
             state.vibe_mode(),
             agent_mode,
-            knowledge.as_deref()
+            None
         )
     });
     if !effort.is_empty() {
@@ -1495,7 +1457,6 @@ async fn event_loop(
     state: &mut AppState,
     renderer: &mut Renderer,
     update_rx: mpsc::Receiver<String>,
-    cli: &Cli,
 ) -> Result<()> {
     let mut update_rx = Some(update_rx);
     let mut composer_paste = ComposerPasteBuffer::new();
@@ -1512,13 +1473,6 @@ async fn event_loop(
     let mut resize = ResizeTracker::new();
     let (workspace_tx, mut workspace_rx) = mpsc::channel(1);
     let (management_tx, mut management_rx) = mpsc::unbounded_channel();
-    let (knowledge_worker, mut knowledge_rx) = project_memory::KnowledgeWorker::start(
-        project_memory::RuntimePaths {
-            codex: cli.codex.clone(),
-            claude: cli.claude.clone(),
-            open_code: cli.open_code.clone(),
-        },
-    );
     let mut cost_restore_rx = None;
     let mut indexed_cwd = None;
     let mut integration_key = None;
@@ -1532,15 +1486,6 @@ async fn event_loop(
     draw(state, renderer)?;
 
     loop {
-        if let Some(turn) = state.take_completed_knowledge_turn()
-            && let Err(error) = knowledge_worker.enqueue(turn)
-        {
-            state.push_notice(
-                BlockKind::Warning,
-                "지식 분석 예약 실패",
-                error.to_string(),
-            );
-        }
         if let Some(thread_id) = state.take_cost_restore() {
             cost_restore_rx = Some(start_cost_restore(thread_id));
         }
@@ -1634,9 +1579,6 @@ async fn event_loop(
         if indexed_cwd.as_deref() != Some(state.cwd.as_str()) {
             let cwd = state.cwd.clone();
             indexed_cwd = Some(cwd.clone());
-            if state.knowledge_mode().enabled() {
-                knowledge_worker.sync_project(&cwd, state.selected_model_name());
-            }
             let tx = workspace_tx.clone();
             tokio::spawn(async move {
                 let root = PathBuf::from(&cwd);
@@ -2019,30 +1961,7 @@ async fn event_loop(
                 Action::None
             }
             Some(update) = management_rx.recv() => {
-                let refresh_memory = matches!(
-                    &update,
-                    ManagementUpdate::DvzMemoryLoginFinished(Ok(_))
-                );
                 apply_management_update(state, update);
-                if refresh_memory {
-                    knowledge_worker.sync_project(&state.cwd, state.selected_model_name());
-                }
-                Action::None
-            }
-            Some(update) = knowledge_rx.recv() => {
-                match update {
-                    project_memory::KnowledgeUpdate::Failed { project_root, message }
-                        if project_memory::same_project(&state.cwd, &project_root) =>
-                    {
-                        state.push_notice(BlockKind::Warning, "지식 갱신 실패", message);
-                    }
-                    project_memory::KnowledgeUpdate::Warning { project_root, message }
-                        if project_memory::same_project(&state.cwd, &project_root) =>
-                    {
-                        state.push_notice(BlockKind::Warning, "순정 메모리 일부 제외", message);
-                    }
-                    _ => {}
-                }
                 Action::None
             }
             _ = wait_for_paste_flush(paste_deadline), if paste_deadline.is_some() => {
@@ -2582,55 +2501,6 @@ async fn execute_action(
         Action::ShowStatus => {
             refresh_account(server, state).await;
             state.show_status();
-        }
-        Action::DvzMemoryLogin => {
-            let cancelled = Arc::new(AtomicBool::new(false));
-            state.begin_dvz_memory_connecting(Arc::clone(&cancelled));
-            let sender = management_tx.clone();
-            let cwd = PathBuf::from(&state.cwd);
-            tokio::spawn(async move {
-                let authorization = match dvz_memory::begin_login().await {
-                    Ok(authorization) => authorization,
-                    Err(error) => {
-                        if !cancelled.load(Ordering::Relaxed) {
-                            let _ = sender.send(ManagementUpdate::DvzMemoryLoginFinished(Err(
-                                error.to_string(),
-                            )));
-                        }
-                        return;
-                    }
-                };
-                if cancelled.load(Ordering::Relaxed) {
-                    return;
-                }
-                let _ = sender.send(ManagementUpdate::DvzMemoryLoginStarted {
-                    url: authorization.verification_uri.clone(),
-                    user_code: authorization.user_code.clone(),
-                    cancelled: Arc::clone(&cancelled),
-                });
-                let mut result = dvz_memory::complete_login(authorization, &cancelled)
-                    .await
-                    .map_err(|error| error.to_string());
-                if cancelled.load(Ordering::Relaxed) {
-                    return;
-                }
-                if let Ok(account) = &result
-                    && let Err(error) = dvz_memory::activate_account(&cwd, account)
-                {
-                    result = Err(error.to_string());
-                }
-                let _ = sender.send(ManagementUpdate::DvzMemoryLoginFinished(result));
-            });
-        }
-        Action::DvzMemoryLogout => {
-            let sender = management_tx.clone();
-            let cwd = PathBuf::from(&state.cwd);
-            tokio::task::spawn_blocking(move || {
-                let result = dvz_memory::clear_local_project(&cwd)
-                    .and_then(|_| dvz_memory::logout())
-                    .map_err(|error| error.to_string());
-                let _ = sender.send(ManagementUpdate::DvzMemoryLogoutFinished(result));
-            });
         }
         Action::Submit(text) => {
             renderer.scroll_to_bottom();
@@ -5615,7 +5485,6 @@ async fn start_turn(
     state.note_pending_turn_effort(&effort);
     let input = state.turn_input(text);
     let agent_mode = state.agent_mode();
-    let knowledge = project_memory::prompt_context(&state.cwd, state.knowledge_mode());
     let mut params = json!({
         "threadId": state.thread_id,
         "input": input,
@@ -5625,7 +5494,7 @@ async fn start_turn(
         "additionalContext": turn_additional_context(
             state.vibe_mode(),
             agent_mode,
-            knowledge.as_deref()
+            None
         )
     });
     if !effort.is_empty() {

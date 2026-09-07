@@ -72,10 +72,6 @@ API key 또는 OAuth로 인증합니다 (`opencode-go` 포함).
 
 `dvz doctor`는 현재 실행 파일, 작업 폴더, 업데이트 전환 경로와 각 제공자의 실행 준비 상태를 점검합니다.
 
-`/memory-hub`는 브라우저에서 GitHub에 로그인하고 private `dvz-memory-hub` 저장소를 만든 뒤,
-현재 GitHub 프로젝트의 지식을 Claude·Codex·OpenCode 사이에서 자동 동기화합니다. 기존 Git
-자격증명과 환경변수는 사용하지 않습니다.
-
 ### 업데이트
 
 새 버전이 배포되면 시작 시 안내 배너가 표시됩니다.
@@ -143,7 +139,6 @@ dvz update
 cargo build --release
 ```
 
-GitHub OAuth App은 Device Flow를 켜야 하며 Memory Hub는 `repo` 권한을 요청합니다.
 공개 client ID만 실행 파일에 포함되며 토큰이나 client secret은 포함하지 않습니다.
 
 빌드 결과는 `target/release/dvz.exe`입니다. 바로 실행하려면:

@@ -3,7 +3,6 @@ use std::{
     env, fs,
     ops::Range,
     path::{Path, PathBuf},
-    sync::{Arc, atomic::{AtomicBool, Ordering}},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -28,7 +27,6 @@ use crate::{
         PluginTarget,
     },
     pricing::{self, CostLedger, TokenTotals},
-    project_memory::{self, KnowledgeMode, KnowledgeTurn},
     provider::{ProviderAuthRequest, ProviderPicker, ProviderPickerResult},
     renderer::{
         AnimationView, ArtifactView, AssistantPhase, Block, BlockKind, ComposerMode, EffortSlider,
@@ -558,7 +556,7 @@ impl SlashCommand {
     }
 }
 
-const SLASH_COMMANDS: [SlashCommand; 34] = [
+const SLASH_COMMANDS: [SlashCommand; 33] = [
     SlashCommand {
         name: "/provider",
         description: "Switch between the Claude and Codex providers, or connect OpenCode",
@@ -602,11 +600,6 @@ const SLASH_COMMANDS: [SlashCommand; 34] = [
     SlashCommand {
         name: "/logout",
         description: "Sign out of the current account",
-        takes_argument: false,
-    },
-    SlashCommand {
-        name: "/memory-hub",
-        description: "Collect native CLI memory and share it across every connected provider",
         takes_argument: false,
     },
     SlashCommand {
@@ -1243,8 +1236,6 @@ pub enum Action {
     StartLogin(LoginMethod),
     CancelLogin(String),
     Logout,
-    DvzMemoryLogin,
-    DvzMemoryLogout,
     OpenPlugins {
         scope: Option<PluginScope>,
         notice: Option<String>,
@@ -1648,17 +1639,6 @@ struct ApprovalChoice {
 }
 
 enum PendingInteraction {
-    DvzMemoryPicker {
-        selected: usize,
-        account: Option<crate::dvz_memory::DvzMemoryAccount>,
-    },
-    DvzMemoryConnecting {
-        cancelled: Arc<AtomicBool>,
-    },
-    DvzMemoryLogin {
-        user_code: String,
-        cancelled: Arc<AtomicBool>,
-    },
     ModelPicker {
         model_index: usize,
         effort_index: usize,
@@ -3112,9 +3092,6 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
             | PendingInteraction::ClaudePermissionScopePicker { .. }
             | PendingInteraction::ClaudePermissionRuleInput { .. }
             | PendingInteraction::VibeModePicker { .. }
-            | PendingInteraction::DvzMemoryPicker { .. }
-            | PendingInteraction::DvzMemoryConnecting { .. }
-            | PendingInteraction::DvzMemoryLogin { .. }
             | PendingInteraction::StatusLinePicker { .. }
             | PendingInteraction::SkillsPicker { .. }
             | PendingInteraction::SubagentTranscript { .. }
@@ -3695,7 +3672,6 @@ pub struct AppState {
     /// its transcript cards stay off the split view.
     plan_panel_hidden: bool,
     last_assistant_markdown: Option<String>,
-    completed_knowledge_turn: Option<KnowledgeTurn>,
     composer_notice: Option<(String, Instant)>,
     /// Text, when it went up, and how long it stays. The quit warning needs a
     /// longer window than the rest, so the lifetime rides along with the notice.
@@ -3704,7 +3680,6 @@ pub struct AppState {
     response_length: ResponseLength,
     response_display_mode: ResponseDisplayMode,
     vibe_mode: VibeMode,
-    knowledge_mode: KnowledgeMode,
     conversation_view: ConversationView,
     shell_display_mode: ShellDisplayMode,
     diff_display_mode: DiffDisplayMode,
@@ -3800,7 +3775,6 @@ impl AppState {
             .unwrap_or_else(|| "high".to_owned());
         let branch = read_git_branch(&cwd);
         let vibe_mode = read_vibe_mode();
-        let knowledge_mode = project_memory::read_mode(&cwd);
         let conversation_view = read_conversation_view();
         let (default_response_length, default_shell_display_mode, default_diff_display_mode) =
             match vibe_mode {
@@ -3935,12 +3909,10 @@ impl AppState {
             side_parent: None,
             plan_panel_hidden: false,
             last_assistant_markdown: None,
-            completed_knowledge_turn: None,
             composer_notice: None,
             activity_notice: None,
             status_metadata_refreshed_at: Instant::now(),
             vibe_mode,
-            knowledge_mode,
             conversation_view,
             response_length,
             response_display_mode,
@@ -4687,7 +4659,6 @@ impl AppState {
             self.workspace_entries.clear();
             self.rebuild_completion_catalog();
         }
-        self.knowledge_mode = project_memory::read_mode(&self.cwd);
         self.restore_session_side_panel();
         self.restore_session_modes();
         self.select_model_and_effort(model, effort);
@@ -5139,55 +5110,6 @@ impl AppState {
         self.pending = Some(PendingInteraction::LoginMethodPicker { selected: 0 });
     }
 
-    pub fn open_dvz_memory(&mut self) {
-        self.pending = Some(PendingInteraction::DvzMemoryPicker {
-            selected: 0,
-            account: crate::dvz_memory::account(),
-        });
-    }
-
-    pub fn begin_dvz_memory_connecting(&mut self, cancelled: Arc<AtomicBool>) {
-        self.pending = Some(PendingInteraction::DvzMemoryConnecting { cancelled });
-    }
-
-    pub fn begin_dvz_memory_login(&mut self, user_code: String, cancelled: Arc<AtomicBool>) {
-        if cancelled.load(Ordering::Relaxed) {
-            return;
-        }
-        self.pending = Some(PendingInteraction::DvzMemoryLogin {
-            user_code,
-            cancelled,
-        });
-    }
-
-    pub fn finish_dvz_memory_login(
-        &mut self,
-        result: std::result::Result<crate::dvz_memory::DvzMemoryAccount, String>,
-    ) {
-        self.pending = None;
-        match result {
-            Ok(account) => {
-                self.knowledge_mode = project_memory::read_mode(&self.cwd);
-                self.push_notice(
-                    BlockKind::System,
-                    "GitHub login complete",
-                    format!("Connected as @{} · {}", account.login, account.repository),
-                );
-            }
-            Err(error) => self.push_notice(BlockKind::Error, "GitHub login failed", error),
-        }
-    }
-
-    pub fn finish_dvz_memory_logout(&mut self) {
-        self.pending = None;
-        self.knowledge_mode = KnowledgeMode::Off;
-        self.push_notice(
-            BlockKind::System,
-            "GitHub logout complete",
-            "Remote memory was preserved.",
-        );
-    }
-
     /// Login id of an in-flight `/login`, so a caller can cancel it.
     pub fn active_login_id(&self) -> Option<&str> {
         match self.pending.as_ref() {
@@ -5284,7 +5206,6 @@ impl AppState {
                 VibeMode::Vibe => VibeTone::On,
                 VibeMode::SuperVibe => VibeTone::Super,
             },
-            memory_hub: self.knowledge_mode.enabled(),
             label: self.permission_mode().label().to_owned(),
             accent: self.permission_mode().accent(),
             model: self.selected_model_name().to_owned(),
@@ -5712,8 +5633,6 @@ impl AppState {
             self.workspace_entries.clear();
             self.rebuild_completion_catalog();
         }
-        self.knowledge_mode = project_memory::read_mode(&self.cwd);
-        self.completed_knowledge_turn = None;
         self.turn_id = None;
         self.pending_interrupt = false;
         self.busy = false;
@@ -5902,9 +5821,6 @@ impl AppState {
         self.stall_probe_at = None;
         let params = json!({ "threadId": self.thread_id.clone() });
         self.handle_notification("turn/completed", &params);
-        // The provider could not report how this turn ended. Settle the UI, but
-        // do not turn an unknown outcome into durable project knowledge.
-        self.completed_knowledge_turn = None;
         self.push_notice(
             BlockKind::Warning,
             "응답 종료 알림 누락",
@@ -5929,48 +5845,6 @@ impl AppState {
         self.turn_response_boundaries.clear();
         self.response_grouped = false;
         self.response_collapse = None;
-    }
-
-    fn build_completed_knowledge_turn(&self) -> Option<KnowledgeTurn> {
-        if !self.knowledge_mode.enabled() || self.turn_prompts.is_empty() {
-            return None;
-        }
-        let mut blocks = self
-            .turn_prompts
-            .iter()
-            .chain(self.turn_shell_results.iter().map(|result| &result.block))
-            .chain(self.turn_file_changes.iter())
-            .chain(self.turn_response_blocks.iter())
-            .cloned()
-            .collect::<Vec<_>>();
-        blocks.sort_by_key(Block::id);
-        blocks.dedup_by_key(|block| block.id());
-        let transcript = blocks
-            .iter()
-            .filter_map(ProviderHandoffBlock::from_block)
-            .filter(|block| !block.body.trim().is_empty())
-            .map(|block| {
-                let label = match block.kind {
-                    "user" => "사용자 요청",
-                    "assistant" => "에이전트 응답",
-                    "tool" => "명령 실행",
-                    "file_change" => "파일 변경",
-                    "reasoning" => "판단 기록",
-                    "plan" => "작업 계획",
-                    _ => "작업 기록",
-                };
-                format!("## {label}\n{}\n{}", block.title, block.body)
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        (!transcript.trim().is_empty()).then(|| KnowledgeTurn {
-            cwd: self.cwd.clone(),
-            model: self
-                .active_turn_model
-                .clone()
-                .unwrap_or_else(|| self.selected_model_name().to_owned()),
-            transcript,
-        })
     }
 
     /// Whether assistant text is still streaming in: the answer it belongs to
@@ -6431,7 +6305,6 @@ impl AppState {
         self.pending_turn_effort = None;
         self.active_turn_model = None;
         self.active_turn_effort = None;
-        self.completed_knowledge_turn = None;
         self.cost_restore_due = false;
         self.cost_restore_pending = false;
         self.context_window = None;
@@ -8620,9 +8493,6 @@ impl AppState {
                 // it slots in after everything this turn produced, ahead of the
                 // follow-up cycle the runtime may open for it.
                 self.flush_pending_steer_prompts();
-                self.completed_knowledge_turn = successful
-                    .then(|| self.build_completed_knowledge_turn())
-                    .flatten();
             }
             "turn/plan/updated" => {
                 let explanation = params
@@ -9189,7 +9059,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/provider [claude|codex|opencode]  Claude·Codex 전환, OpenCode 연결\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|goal-runner|reviewer]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n/memory-hub  GitHub 프로젝트 메모리 동기화\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
+                    format!("/provider [claude|codex|opencode]  Claude·Codex 전환, OpenCode 연결\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|goal-runner|reviewer]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
                 ));
                 Action::None
             }
@@ -9452,15 +9322,6 @@ impl AppState {
             }
             "/logout" => {
                 self.confirm_logout();
-                Action::None
-            }
-            "/memory-hub" if parts.len() == 1 => {
-                self.open_dvz_memory();
-                Action::None
-            }
-            "/memory-hub" => {
-                self.committed
-                    .push(Block::new(BlockKind::Error, "Usage", "/memory-hub"));
                 Action::None
             }
             "/plugins" if parts.len() == 1 => Action::OpenPlugins {
@@ -9742,65 +9603,6 @@ impl AppState {
             code => code,
         };
         match pending {
-            PendingInteraction::DvzMemoryPicker {
-                mut selected,
-                account,
-            } => {
-                let count = if account.is_some() { 2 } else { 1 };
-                match hotkey {
-                    KeyCode::Esc => return Action::None,
-                    KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
-                    KeyCode::Down | KeyCode::Tab | KeyCode::Char('j') => {
-                        selected = (selected + 1).min(count - 1)
-                    }
-                    KeyCode::Char(ch @ '1'..='2') => {
-                        let choice = ch.to_digit(10).unwrap_or(1) as usize - 1;
-                        if choice < count {
-                            return if account.is_some() && choice == 1 {
-                                Action::DvzMemoryLogout
-                            } else {
-                                Action::DvzMemoryLogin
-                            };
-                        }
-                    }
-                    KeyCode::Enter => {
-                        return if account.is_some() && selected == 1 {
-                            Action::DvzMemoryLogout
-                        } else {
-                            Action::DvzMemoryLogin
-                        };
-                    }
-                    _ => {}
-                }
-                self.pending = Some(PendingInteraction::DvzMemoryPicker { selected, account });
-                Action::None
-            }
-            PendingInteraction::DvzMemoryConnecting { cancelled } => match key.code {
-                KeyCode::Esc => {
-                    cancelled.store(true, Ordering::Relaxed);
-                    Action::None
-                }
-                _ => {
-                    self.pending = Some(PendingInteraction::DvzMemoryConnecting { cancelled });
-                    Action::None
-                }
-            },
-            PendingInteraction::DvzMemoryLogin {
-                user_code,
-                cancelled,
-            } => match key.code {
-                KeyCode::Esc => {
-                    cancelled.store(true, Ordering::Relaxed);
-                    Action::None
-                }
-                _ => {
-                    self.pending = Some(PendingInteraction::DvzMemoryLogin {
-                        user_code,
-                        cancelled,
-                    });
-                    Action::None
-                }
-            },
             PendingInteraction::ModelPicker {
                 mut model_index,
                 mut effort_index,
@@ -11072,103 +10874,6 @@ impl AppState {
 
     fn overlay_view(&self) -> Option<OverlayView<'_>> {
         match self.pending.as_ref()? {
-            PendingInteraction::DvzMemoryPicker { selected, account } => {
-                let mut lines = vec![
-                    OverlayLine {
-                        text: "Collect native CLI memory and share it across every connected provider."
-                            .to_owned(),
-                        selected: false,
-                        muted: true,
-                    },
-                    OverlayLine {
-                        text: "Memory is stored in your private dvz-memory-hub repository."
-                            .to_owned(),
-                        selected: false,
-                        muted: true,
-                    },
-                    OverlayLine {
-                        text: String::new(),
-                        selected: false,
-                        muted: true,
-                    },
-                ];
-                if let Some(account) = account {
-                    lines.push(OverlayLine {
-                        text: format!("GitHub: @{} · {}", account.login, account.repository),
-                        selected: false,
-                        muted: true,
-                    });
-                    lines.push(OverlayLine {
-                        text: "1. Change GitHub account".to_owned(),
-                        selected: *selected == 0,
-                        muted: false,
-                    });
-                    lines.push(OverlayLine {
-                        text: "2. Logout".to_owned(),
-                        selected: *selected == 1,
-                        muted: false,
-                    });
-                } else {
-                    lines.push(OverlayLine {
-                        text: "GitHub: Not connected".to_owned(),
-                        selected: false,
-                        muted: true,
-                    });
-                    lines.push(OverlayLine {
-                        text: "1. Login".to_owned(),
-                        selected: true,
-                        muted: false,
-                    });
-                }
-                Some(OverlayView {
-                    closable: true,
-                    title: "Memory Hub".to_owned(),
-                    lines,
-                    slider: None,
-                    hint: "1-2 select  ·  ↑↓ navigate  ·  Enter confirm  ·  Esc cancel".to_owned(),
-                    style: OverlayStyle::Panel,
-                    input: None,
-                    input_label: "",
-                    input_placeholder: "",
-                })
-            }
-            PendingInteraction::DvzMemoryConnecting { .. } => Some(OverlayView {
-                closable: true,
-                title: "GitHub login".to_owned(),
-                lines: vec![OverlayLine {
-                    text: "Preparing secure login…".to_owned(),
-                    selected: true,
-                    muted: false,
-                }],
-                slider: None,
-                hint: "Esc cancel".to_owned(),
-                style: OverlayStyle::KeyboardOnlyPanel,
-                input: None,
-                input_label: "",
-                input_placeholder: "",
-            }),
-            PendingInteraction::DvzMemoryLogin { user_code, .. } => Some(OverlayView {
-                closable: true,
-                title: "GitHub login".to_owned(),
-                lines: vec![
-                    OverlayLine {
-                        text: format!("Code: {user_code}"),
-                        selected: true,
-                        muted: false,
-                    },
-                    OverlayLine {
-                        text: "Complete authorization in your browser.".to_owned(),
-                        selected: false,
-                        muted: true,
-                    },
-                ],
-                slider: None,
-                hint: "Esc close".to_owned(),
-                style: OverlayStyle::KeyboardOnlyPanel,
-                input: None,
-                input_label: "",
-                input_placeholder: "",
-            }),
             PendingInteraction::ModelPicker {
                 model_index,
                 effort_index,
@@ -12932,14 +12637,6 @@ impl AppState {
         self.vibe_mode
     }
 
-    pub const fn knowledge_mode(&self) -> KnowledgeMode {
-        self.knowledge_mode
-    }
-
-    pub fn take_completed_knowledge_turn(&mut self) -> Option<KnowledgeTurn> {
-        self.completed_knowledge_turn.take()
-    }
-
     pub const fn response_length(&self) -> ResponseLength {
         self.response_length
     }
@@ -13294,20 +12991,6 @@ impl AppState {
                     }
                 }
             }
-            Some(PendingInteraction::DvzMemoryPicker {
-                selected,
-                account,
-            }) => match row.checked_sub(4) {
-                Some(0) => Action::DvzMemoryLogin,
-                Some(1) if account.is_some() => Action::DvzMemoryLogout,
-                _ => {
-                    self.pending = Some(PendingInteraction::DvzMemoryPicker {
-                        selected,
-                        account,
-                    });
-                    Action::Tick(false)
-                }
-            },
             // A click picks the runtime; the connection switch stays on Space, so
             // a mis-aimed click never drops a provider.
             Some(PendingInteraction::RuntimePicker { .. }) if row < RUNTIME_CHOICES.len() => {
@@ -17699,82 +17382,6 @@ mod tests {
     }
 
     #[test]
-    fn every_provider_turn_queues_shared_knowledge_with_the_model_that_ran_it() {
-        let mut state = test_state();
-        state.knowledge_mode = KnowledgeMode::On;
-        state.editor.set_text("반복되는 빌드 오류를 해결해줘");
-        assert!(matches!(state.submit_editor(), Action::Submit(_)));
-        state.note_pending_turn_model("opencode:xai/grok-4");
-        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
-        state.handle_notification(
-            "item/completed",
-            &json!({
-                "item": {
-                    "id": "answer-1",
-                    "type": "agentMessage",
-                    "text": "원인을 확인하고 재발 방지 절차를 적용했습니다."
-                }
-            }),
-        );
-        state.handle_notification(
-            "turn/completed",
-            &json!({ "turn": { "id": "turn-1", "status": "completed" } }),
-        );
-
-        let turn = state
-            .take_completed_knowledge_turn()
-            .expect("completed knowledge turn");
-        assert_eq!(turn.model, "opencode:xai/grok-4");
-        assert!(turn.transcript.contains("반복되는 빌드 오류"));
-        assert!(turn.transcript.contains("재발 방지 절차"));
-        assert!(state.take_completed_knowledge_turn().is_none());
-    }
-
-    #[test]
-    fn composer_marks_memory_hub_only_for_an_active_project() {
-        let mut state = test_state();
-        assert!(!state.composer_mode().memory_hub);
-
-        state.knowledge_mode = KnowledgeMode::On;
-        assert!(state.composer_mode().memory_hub);
-    }
-
-    #[test]
-    fn failed_turn_never_queues_knowledge() {
-        let mut state = test_state();
-        state.knowledge_mode = KnowledgeMode::On;
-        state.editor.set_text("실패할 요청");
-        assert!(matches!(state.submit_editor(), Action::Submit(_)));
-        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
-        state.handle_notification(
-            "turn/completed",
-            &json!({
-                "turn": {
-                    "id": "turn-1",
-                    "status": "failed",
-                    "error": { "message": "실패" }
-                }
-            }),
-        );
-
-        assert!(state.take_completed_knowledge_turn().is_none());
-    }
-
-    #[test]
-    fn knowledge_off_never_queues_a_successful_turn() {
-        let mut state = test_state();
-        state.editor.set_text("완료되지만 기록하지 않을 요청");
-        assert!(matches!(state.submit_editor(), Action::Submit(_)));
-        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-1" } }));
-        state.handle_notification(
-            "turn/completed",
-            &json!({ "turn": { "id": "turn-1", "status": "completed" } }),
-        );
-
-        assert!(state.take_completed_knowledge_turn().is_none());
-    }
-
-    #[test]
     fn shifted_arrows_change_model_and_effort_without_wrapping() {
         let mut state = test_state();
         state
@@ -20276,60 +19883,6 @@ mod tests {
 
         assert!(matches!(action, Action::None));
         assert!(state.overlay_view().is_none());
-    }
-
-    #[test]
-    fn dvz_memory_picker_uses_the_requested_english_actions() {
-        let mut state = test_state();
-        state.pending = Some(PendingInteraction::DvzMemoryPicker {
-            selected: 0,
-            account: None,
-        });
-        let overlay = state.overlay_view().expect("Memory Hub login overlay");
-        assert!(overlay.lines.iter().any(|line| line.text
-            == "Collect native CLI memory and share it across every connected provider."));
-        assert!(overlay.lines.iter().any(|line| line.text == "1. Login"));
-        assert!(matches!(
-            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            Action::DvzMemoryLogin
-        ));
-
-        state.pending = Some(PendingInteraction::DvzMemoryPicker {
-            selected: 0,
-            account: Some(crate::dvz_memory::DvzMemoryAccount::fixture("octocat")),
-        });
-
-        let overlay = state.overlay_view().expect("Memory Hub overlay");
-        assert_eq!(overlay.title, "Memory Hub");
-        assert!(overlay.lines.iter().any(|line| line.text == "1. Change GitHub account"));
-        assert!(overlay.lines.iter().any(|line| line.text == "2. Logout"));
-        assert!(matches!(
-            state.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)),
-            Action::DvzMemoryLogin
-        ));
-
-        state.pending = Some(PendingInteraction::DvzMemoryPicker {
-            selected: 1,
-            account: Some(crate::dvz_memory::DvzMemoryAccount::fixture("octocat")),
-        });
-        assert!(matches!(
-            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            Action::DvzMemoryLogout
-        ));
-
-        state.pending = Some(PendingInteraction::DvzMemoryPicker {
-            selected: 0,
-            account: Some(crate::dvz_memory::DvzMemoryAccount::fixture("octocat")),
-        });
-        assert!(matches!(
-            state.click_overlay_row(4),
-            Action::DvzMemoryLogin
-        ));
-
-        let cancelled = Arc::new(AtomicBool::new(false));
-        state.begin_dvz_memory_connecting(Arc::clone(&cancelled));
-        state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(cancelled.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -23387,7 +22940,6 @@ mod tests {
     #[test]
     fn a_probe_that_finds_the_turn_over_ends_the_wait() {
         let mut state = test_state();
-        state.knowledge_mode = KnowledgeMode::On;
         state.editor.set_text("종료 상태를 알 수 없는 요청");
         assert!(matches!(state.submit_editor(), Action::Submit(_)));
         state.set_turn_started("turn-1".to_owned());
@@ -23401,7 +22953,6 @@ mod tests {
                 .activity()
                 .is_some_and(|activity| activity.starts_with("❖ Completed"))
         );
-        assert!(state.take_completed_knowledge_turn().is_none());
         // A stale answer about a turn that is no longer the live one changes nothing.
         state.set_turn_started("turn-2".to_owned());
         assert!(!state.resolve_stall_probe("turn-1"));

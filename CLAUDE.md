@@ -45,5 +45,3 @@
   * `agent-system-implementation-plan.md` — Builder·Planner·Goal Runner·Reviewer 역할 시스템의 초기 구현 계획서
   * `side-panel-reference.md` — 제거된 우측 도킹 정보 패널의 예전 구현 참고 자료
   * `builder-ponytail.md` — Builder 역할에 넣은 Ponytail 최소 코드 규칙의 적용 내용과 제거 절차
-  * `프로젝트-지식-자동관리.md` — 프로젝트별 지식 모드, 제공자별 분석 모델, `.knowledge/auto` 저장과 주입 규칙
-  * `Memory-Hub-외부메모리-검수보고.md` — 순정 CLI 메모리 취합, 백그라운드 동기화, 토큰 절감과 검증 결과
