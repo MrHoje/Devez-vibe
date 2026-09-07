@@ -140,8 +140,6 @@ pub struct Block {
     children: Vec<Block>,
     assistant_phase: AssistantPhase,
     response_duration: Option<Duration>,
-    prompt_model: Option<String>,
-    prompt_effort: Option<String>,
     response_completed_at: Option<chrono::DateTime<chrono::Local>>,
 }
 
@@ -233,8 +231,6 @@ impl Block {
             children: Vec::new(),
             assistant_phase: AssistantPhase::Unknown,
             response_duration: None,
-            prompt_model: None,
-            prompt_effort: None,
             response_completed_at: None,
         }
     }
@@ -268,19 +264,6 @@ impl Block {
 
     pub const fn response_duration(&self) -> Option<Duration> {
         self.response_duration
-    }
-
-    pub fn set_prompt_context(&mut self, model: impl Into<String>, effort: impl Into<String>) {
-        self.prompt_model = Some(model.into());
-        self.prompt_effort = Some(effort.into());
-    }
-
-    pub fn prompt_model(&self) -> Option<&str> {
-        self.prompt_model.as_deref()
-    }
-
-    pub fn prompt_effort(&self) -> Option<&str> {
-        self.prompt_effort.as_deref()
     }
 
     pub fn set_response_completed_at(&mut self, at: chrono::DateTime<chrono::Local>) {
@@ -11071,8 +11054,6 @@ fn user_prompt_lines_with_history(
             width,
             history,
             block.response_duration(),
-            block.prompt_model(),
-            block.prompt_effort(),
             block.response_completed_at(),
             false,
         );
@@ -11119,8 +11100,6 @@ fn user_prompt_lines_with_history(
     let footer_width = prompt_footer_label(
         history,
         block.response_duration(),
-        block.prompt_model(),
-        block.prompt_effort(),
         block.response_completed_at(),
     )
         .map(|label| UnicodeWidthStr::width(label.as_str()))
@@ -11158,8 +11137,6 @@ fn user_prompt_lines_with_history(
         width,
         history,
         block.response_duration(),
-        block.prompt_model(),
-        block.prompt_effort(),
         block.response_completed_at(),
         true,
     );
@@ -11172,8 +11149,6 @@ fn user_prompt_lines_with_history(
 fn prompt_footer_label(
     history: Option<(u64, &str, bool)>,
     response_duration: Option<Duration>,
-    prompt_model: Option<&str>,
-    prompt_effort: Option<&str>,
     response_completed_at: Option<chrono::DateTime<chrono::Local>>,
 ) -> Option<String> {
     let history = history.map(|(_, title, expanded)| {
@@ -11184,31 +11159,16 @@ fn prompt_footer_label(
         }
     });
     let duration = response_duration.map(|duration| format_elapsed(duration.as_secs()));
-    let prompt = match (prompt_model, prompt_effort) {
-        (Some(model), Some(effort)) if !effort.is_empty() => format!("{model} · {effort}"),
-        (Some(model), _) => model.to_owned(),
-        _ => String::new(),
-    };
-    let has_prompt_context = prompt_model.is_some() || prompt_effort.is_some();
     let completion = match (duration, response_completed_at) {
-        (Some(duration), Some(at)) if has_prompt_context => {
-            format!("({duration}) · {}", format_clock_time(at))
-        }
-        (Some(duration), None) if has_prompt_context => format!("({duration})"),
         (Some(duration), Some(at)) => format!("{duration} · {}", format_clock_time(at)),
         (Some(duration), None) => duration,
         _ => String::new(),
     };
-    let metadata = match (prompt.is_empty(), completion.is_empty()) {
-        (false, false) => Some(format!("{prompt} {completion}")),
-        (false, true) => Some(prompt),
-        (true, false) => Some(completion),
-        (true, true) => None,
-    };
-    match (history, metadata) {
-        (Some(history), Some(metadata)) => Some(format!("{history}  {metadata}")),
-        (Some(history), None) => Some(history),
-        (None, metadata) => metadata,
+    match (history, completion.is_empty()) {
+        (Some(history), false) => Some(format!("{history}  {completion}")),
+        (Some(history), true) => Some(history),
+        (None, false) => Some(completion),
+        (None, true) => None,
     }
 }
 
@@ -11217,8 +11177,6 @@ fn attach_prompt_footer(
     width: u16,
     history: Option<(u64, &str, bool)>,
     response_duration: Option<Duration>,
-    prompt_model: Option<&str>,
-    prompt_effort: Option<&str>,
     response_completed_at: Option<chrono::DateTime<chrono::Local>>,
     chat_layout: bool,
 ) {
@@ -11247,8 +11205,6 @@ fn attach_prompt_footer(
     let Some(label) = prompt_footer_label(
         history,
         response_duration,
-        prompt_model,
-        prompt_effort,
         response_completed_at,
     ) else {
         return;
@@ -25832,9 +25788,8 @@ mod tests {
     }
 
     #[test]
-    fn completed_prompt_footer_shows_model_effort_duration_and_time() {
+    fn completed_prompt_footer_shows_duration_and_time() {
         let mut prompt = Block::new(BlockKind::User, "gpt-5.6-luna", "보낸 프롬프트");
-        prompt.set_prompt_context("GPT-5.6 Luna", "xhigh");
         prompt.set_response_duration(Duration::from_secs(7));
         let completed_at = chrono::Local::now();
         prompt.set_response_completed_at(completed_at);
@@ -25842,10 +25797,10 @@ mod tests {
         let lines = user_prompt_lines_with_history(&prompt, 80, None, true);
         let footer = lines
             .iter()
-            .find(|line| painted(line).contains("GPT-5.6 Luna · xhigh"))
+            .find(|line| painted(line).contains("7s · "))
             .expect("prompt metadata footer");
         let expected = format!(
-            "GPT-5.6 Luna · xhigh (7s) · {}  ",
+            "7s · {}  ",
             format_clock_time(completed_at)
         );
 

@@ -23,8 +23,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
     "compact 진행 중 보낸 프롬프트를 대기열에 보관하고 압축이 끝난 뒤 실행합니다.",
-    "보낸 프롬프트 하단에 모델·effort·소요시간·완료 시각을 표시합니다.",
+    "보낸 프롬프트 하단에 소요시간과 완료 시각을 표시합니다.",
     "모델·effort·fast·provider·theme 변경 성공 카드를 표시하지 않습니다.",
+    "프롬프트 하단 메타정보에서 모델·effort를 제외합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

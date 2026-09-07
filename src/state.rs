@@ -3516,8 +3516,6 @@ struct McpFailure {
 struct PendingSteerPrompt {
     display: String,
     model: String,
-    model_display: String,
-    effort: String,
     started_at: Instant,
 }
 
@@ -5988,21 +5986,13 @@ impl AppState {
     /// completed assistant message, at turn end, or before a fresh prompt.
     fn flush_pending_steer_prompts(&mut self) {
         for pending in std::mem::take(&mut self.pending_steer_prompts) {
-            let mut prompt = Block::new(BlockKind::User, &pending.model, pending.display);
-            prompt.set_prompt_context(pending.model_display, pending.effort);
+            let prompt = Block::new(BlockKind::User, &pending.model, pending.display);
             self.begin_turn_prompt(prompt, pending.started_at);
         }
     }
 
     fn begin_turn_prompt(&mut self, prompt: Block, started_at: Instant) {
         self.finish_active_turn_prompt(started_at);
-        let mut prompt = prompt;
-        if prompt.prompt_model().is_none() {
-            prompt.set_prompt_context(
-                self.selected_model_display_name().to_owned(),
-                self.selected_effort.clone(),
-            );
-        }
         self.turn_prompt_started_at.insert(prompt.id(), started_at);
         self.turn_prompts.push(prompt.clone());
         self.turn_response_boundaries.push(prompt.clone());
@@ -9095,8 +9085,6 @@ impl AppState {
                 self.pending_steer_prompts.push(PendingSteerPrompt {
                     display,
                     model,
-                    model_display: self.selected_model_display_name().to_owned(),
-                    effort: self.selected_effort.clone(),
                     started_at,
                 });
             } else {
@@ -21961,8 +21949,6 @@ mod tests {
                 .map(|duration| duration.as_secs()),
             Some(70)
         );
-        assert_eq!(completed_prompt.prompt_model(), Some("GPT-5.6 Sol"));
-        assert_eq!(completed_prompt.prompt_effort(), Some("high"));
         assert!(completed_prompt.response_completed_at().is_some());
     }
 
