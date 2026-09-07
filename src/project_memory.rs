@@ -39,6 +39,7 @@ const MAX_PROCESS_OUTPUT_BYTES: usize = 1_048_576;
 const GENERATED_HEADER: &str = "<!-- DevezVibe가 자동 생성하는 파일입니다. 직접 작성한 지식은 .knowledge 루트에 보관하세요. -->";
 const CODEX_MEMORY_MODEL: &str = "gpt-5.6-luna";
 const CLAUDE_MEMORY_MODEL: &str = "haiku";
+const MEMORY_JSON_SCHEMA: &str = r#"{"type":"object","properties":{"changed":{"type":"boolean"},"memory":{"type":"string"},"summary":{"type":"string"}},"required":["changed","memory","summary"],"additionalProperties":false}"#;
 const OPEN_CODE_MEMORY_CONFIG: &str = r#"{
     "permission": "deny",
     "instructions": [],
@@ -1007,13 +1008,28 @@ async fn run_claude(paths: &RuntimePaths, root: &Path, prompt: &str) -> Result<S
         .arg("--tools")
         .arg("")
         .arg("--output-format")
-        .arg("text")
+        .arg("json")
+        .arg("--json-schema")
+        .arg(MEMORY_JSON_SCHEMA)
         .arg("--system-prompt")
         .arg("프로젝트 지식 추출기다. 도구를 사용하지 말고 입력 데이터만 분석해 요구된 JSON만 출력한다.")
         .current_dir(root);
     let output = run_with_input(command, prompt).await?;
     ensure_success(&output)?;
-    String::from_utf8(output.stdout).context("Claude 지식 분석 결과가 UTF-8이 아닙니다.")
+    let text = String::from_utf8(output.stdout).context("Claude 지식 분석 결과가 UTF-8이 아닙니다.")?;
+    claude_result_text(&text)
+}
+
+fn claude_result_text(text: &str) -> Result<String> {
+    let value = serde_json::from_str::<serde_json::Value>(text).ok();
+    if let Some(result) = value
+        .as_ref()
+        .and_then(|value| value.get("result"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return Ok(result.to_owned());
+    }
+    Ok(text.to_owned())
 }
 
 async fn run_open_code(
@@ -1732,6 +1748,7 @@ mod tests {
     fn provider_selection_uses_the_requested_memory_models() {
         assert_eq!(CODEX_MEMORY_MODEL, "gpt-5.6-luna");
         assert_eq!(CLAUDE_MEMORY_MODEL, "haiku");
+        assert!(MEMORY_JSON_SCHEMA.contains("\"additionalProperties\":false"));
         assert!(OPEN_CODE_MEMORY_CONFIG.contains("\"permission\": \"deny\""));
         assert!(matches!(
             analysis_provider("gpt-5.6-sol"),
@@ -1753,6 +1770,17 @@ mod tests {
 
         assert!(prompt.contains("제공자별 섹션을 만들지 않고 의미 기준으로 통합"));
         assert!(prompt.contains("포함 관계인 지식은 하나로 합치고"));
+    }
+
+    #[test]
+    fn claude_json_envelope_returns_the_structured_result() {
+        let result = claude_result_text(
+            r#"{"type":"result","result":"{\"changed\":false,\"memory\":\"\",\"summary\":\"\"}"}"#,
+        )
+        .expect("Claude result envelope");
+
+        assert!(result.starts_with('{'));
+        assert!(result.contains("\"changed\":false"));
     }
 
     #[test]
