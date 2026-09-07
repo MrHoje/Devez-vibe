@@ -3516,6 +3516,8 @@ struct McpFailure {
 struct PendingSteerPrompt {
     display: String,
     model: String,
+    model_display: String,
+    effort: String,
     started_at: Instant,
 }
 
@@ -4450,22 +4452,11 @@ impl AppState {
         };
 
         let model = &self.models[index];
-        let model_name = model.display_name.clone();
         let effort = model.default_effort.clone();
         self.selected_model = index;
         self.selected_effort = effort.clone();
         self.context_window = model.context_window;
         self.clear_provider_completions();
-        let detail = if effort.is_empty() {
-            format!("↳ {} · {model_name}", provider.label())
-        } else {
-            format!("↳ {} · {model_name} · {effort}", provider.label())
-        };
-        self.committed.push(Block::new(
-            BlockKind::ModelChange,
-            "✓ Provider changed",
-            detail,
-        ));
         self.refresh_usage_for_selected_provider();
     }
 
@@ -5508,16 +5499,10 @@ impl AppState {
                 .is_some_and(|model| model.fast_service_tier.is_some())
     }
 
-    /// The explicit choice confirms the new service tier in the transcript as
-    /// well as updating the status-line reading.
+    /// The explicit choice updates the status-line reading.
     pub fn set_fast_mode(&mut self, enabled: bool) {
         self.fast_mode = enabled;
         self.commit_welcome_card();
-        self.committed.push(Block::new(
-            BlockKind::ModelChange,
-            "✓ Fast changed",
-            if enabled { "↳ On" } else { "↳ Off" },
-        ));
     }
 
     pub fn set_copy_notice(&mut self) {
@@ -6003,13 +5988,21 @@ impl AppState {
     /// completed assistant message, at turn end, or before a fresh prompt.
     fn flush_pending_steer_prompts(&mut self) {
         for pending in std::mem::take(&mut self.pending_steer_prompts) {
-            let prompt = Block::new(BlockKind::User, &pending.model, pending.display);
+            let mut prompt = Block::new(BlockKind::User, &pending.model, pending.display);
+            prompt.set_prompt_context(pending.model_display, pending.effort);
             self.begin_turn_prompt(prompt, pending.started_at);
         }
     }
 
     fn begin_turn_prompt(&mut self, prompt: Block, started_at: Instant) {
         self.finish_active_turn_prompt(started_at);
+        let mut prompt = prompt;
+        if prompt.prompt_model().is_none() {
+            prompt.set_prompt_context(
+                self.selected_model_display_name().to_owned(),
+                self.selected_effort.clone(),
+            );
+        }
         self.turn_prompt_started_at.insert(prompt.id(), started_at);
         self.turn_prompts.push(prompt.clone());
         self.turn_response_boundaries.push(prompt.clone());
@@ -6027,6 +6020,7 @@ impl AppState {
             return;
         };
         prompt.set_response_duration(completed_at.saturating_duration_since(started_at));
+        prompt.set_response_completed_at(chrono::Local::now());
         self.committed.push(prompt.clone());
     }
 
@@ -9101,6 +9095,8 @@ impl AppState {
                 self.pending_steer_prompts.push(PendingSteerPrompt {
                     display,
                     model,
+                    model_display: self.selected_model_display_name().to_owned(),
+                    effort: self.selected_effort.clone(),
                     started_at,
                 });
             } else {
@@ -12876,7 +12872,6 @@ impl AppState {
             .filter(|effort| model.supports_effort(effort))
             .unwrap_or(&model.default_effort)
             .to_owned();
-        let model_name = model.display_name.clone();
         let context_window = model.context_window;
         self.selected_model = index;
         self.selected_effort = selected_effort.clone();
@@ -12884,15 +12879,6 @@ impl AppState {
         if next_provider != previous_provider {
             self.clear_provider_completions();
         }
-        self.committed.push(Block::new(
-            BlockKind::ModelChange,
-            "✓ Model changed",
-            if selected_effort.is_empty() {
-                format!("↳ {model_name}")
-            } else {
-                format!("↳ {model_name} · {selected_effort}")
-            },
-        ));
     }
 
     fn move_model_index(&self, model_index: usize, direction: i8) -> usize {
@@ -13798,22 +13784,11 @@ impl AppState {
         if !model.supports_effort(effort) {
             return;
         }
-        let model_name = model.display_name.clone();
         self.selected_effort = effort.to_owned();
-        self.committed.push(Block::new(
-            BlockKind::ModelChange,
-            "✓ Effort changed",
-            format!("↳ {model_name} · {effort}"),
-        ));
     }
 
     fn apply_theme(&mut self, selected: ThemeKind) -> Action {
         self.commit_welcome_card();
-        self.committed.push(Block::new(
-            BlockKind::ModelChange,
-            "✓ Theme changed",
-            format!("↳ {}", selected.display_name()),
-        ));
         Action::SetTheme(selected)
     }
 
@@ -21093,7 +21068,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_mode_updates_the_status_line_and_reports_the_switch() {
+    fn fast_mode_updates_the_status_line_without_a_transcript_notice() {
         let mut state = test_state();
 
         state.set_fast_mode(true);
@@ -21101,12 +21076,10 @@ mod tests {
         assert!(state.fast_mode);
         assert!(state.status_line().fast);
         assert!(state.transient_status.is_none());
-        let on = state
+        assert!(!state
             .committed
             .iter()
-            .find(|block| block.title == "✓ Fast changed")
-            .expect("fast mode notice");
-        assert_eq!(on.body, "↳ On");
+            .any(|block| block.title == "✓ Fast changed"));
 
         state.models = vec![test_model("claude:sonnet", "Claude Sonnet", true)];
         state.selected_model = 0;
@@ -21117,14 +21090,10 @@ mod tests {
         state.set_fast_mode(false);
 
         assert!(!state.status_line().fast);
-        assert_eq!(
-            state
-                .committed
-                .iter()
-                .rfind(|block| block.title == "✓ Fast changed")
-                .map(|block| block.body.as_str()),
-            Some("↳ Off")
-        );
+        assert!(!state
+            .committed
+            .iter()
+            .any(|block| block.title == "✓ Fast changed"));
     }
 
     #[test]
@@ -21170,7 +21139,7 @@ mod tests {
     }
 
     #[test]
-    fn model_change_commits_welcome_before_the_change_card() {
+    fn model_change_commits_only_the_welcome_card() {
         let mut state = test_state();
         state
             .models
@@ -21179,9 +21148,7 @@ mod tests {
         state.apply_model(1, Some("xhigh"));
 
         assert!(matches!(state.committed[0].kind, BlockKind::Welcome));
-        assert!(matches!(state.committed[1].kind, BlockKind::ModelChange));
-        assert_eq!(state.committed[1].title, "✓ Model changed");
-        assert!(state.committed[1].body.starts_with("↳ "));
+        assert_eq!(state.committed.len(), 1);
         assert!(!state.show_welcome);
     }
 
@@ -21215,15 +21182,15 @@ mod tests {
     }
 
     #[test]
-    fn effort_change_uses_the_same_checked_card_as_model_change() {
+    fn effort_change_does_not_add_a_transcript_notice() {
         let mut state = test_state();
 
         state.apply_effort("xhigh");
 
-        let card = state.committed.last().expect("effort card");
-        assert!(matches!(card.kind, BlockKind::ModelChange));
-        assert_eq!(card.title, "✓ Effort changed");
-        assert_eq!(card.body, "↳ GPT-5.6 Sol · xhigh");
+        assert!(!state
+            .committed
+            .iter()
+            .any(|block| block.title == "✓ Effort changed"));
     }
 
     #[test]
@@ -21312,9 +21279,10 @@ mod tests {
             state.run_slash_command("/theme soft"),
             Action::SetTheme(ThemeKind::Soft)
         ));
-        let card = state.committed.last().expect("theme card");
-        assert_eq!(card.title, "✓ Theme changed");
-        assert_eq!(card.body, "↳ Soft");
+        assert!(!state
+            .committed
+            .iter()
+            .any(|block| block.title == "✓ Theme changed"));
 
         assert!(matches!(
             state.run_slash_command("/theme softpink"),
@@ -21993,6 +21961,9 @@ mod tests {
                 .map(|duration| duration.as_secs()),
             Some(70)
         );
+        assert_eq!(completed_prompt.prompt_model(), Some("GPT-5.6 Sol"));
+        assert_eq!(completed_prompt.prompt_effort(), Some("high"));
+        assert!(completed_prompt.response_completed_at().is_some());
     }
 
     #[test]
@@ -26359,14 +26330,10 @@ mod tests {
 
         state.run_slash_command("/provider claude");
         assert_eq!(state.selected_model_name(), "claude:sonnet");
-        assert_eq!(
-            state.committed.last().map(|block| block.title.as_str()),
-            Some("✓ Provider changed")
-        );
-        assert_eq!(
-            state.committed.last().map(|block| block.body.as_str()),
-            Some("↳ Claude · Claude Sonnet 5 · high")
-        );
+        assert!(!state
+            .committed
+            .iter()
+            .any(|block| block.title == "✓ Provider changed"));
 
         state.run_slash_command("/model");
         let overlay = state.overlay_view().expect("Claude model picker");
