@@ -6016,7 +6016,7 @@ fn queue_preview_line(prompt: &str, index: usize, model: Option<&str>, width: u1
         compact_right(&prompt, usize::from(width).saturating_sub(14))
     );
     let padding = usize::from(width)
-        .saturating_sub(1)
+        .saturating_sub(2)
         .saturating_sub(2 + UnicodeWidthStr::width(text.as_str()) + 1);
     PaintLine {
         prefix: "▌ ".to_owned(),
@@ -9950,7 +9950,7 @@ fn side_panel_subagent_lines(subagents: &[SubagentView], content_width: usize) -
     let mut lines = vec![
         PaintLine {
             text: compact_right(
-                &format!("Subagents  {} 실행 중", subagents.len()),
+                &format!("Subagents  {} Running", subagents.len()),
                 content_width,
             ),
             bold: true,
@@ -10121,13 +10121,13 @@ fn side_panel_provider_heading(
     content_width: usize,
 ) -> PaintLine {
     let (prefix, prefix_tone, detail) = if !provider.enabled {
-        ("× ", Tone::Error, "연결 안 됨")
+        ("× ", Tone::Error, "Disconnected")
     } else if provider.active {
-        ("▸ ", Tone::Accent, "사용 중")
+        ("▸ ", Tone::Accent, "Active")
     } else if provider.mcp.is_some() || provider.plugins.is_some() {
-        ("· ", Tone::Muted, "최근 확인")
+        ("· ", Tone::Muted, "Cached")
     } else {
-        ("· ", Tone::Muted, "대기")
+        ("· ", Tone::Muted, "Idle")
     };
     let available = content_width.saturating_sub(UnicodeWidthStr::width(prefix));
     PaintLine {
@@ -10162,21 +10162,21 @@ fn side_panel_integration_section(
             );
             if error.is_some() {
                 lines.push(side_panel_integration_placeholder(
-                    "새로고침 실패",
+                    "Refresh failed",
                     content_width,
                 ));
             }
         }
         Some(_) if error.is_some() => lines.push(side_panel_integration_placeholder(
-            "현재 상태 미확인",
+            "Status unknown",
             content_width,
         )),
-        Some(_) => lines.push(side_panel_integration_placeholder("없음", content_width)),
+        Some(_) => lines.push(side_panel_integration_placeholder("None", content_width)),
         None => lines.push(side_panel_integration_placeholder(
             if error.is_some() {
-                "현재 상태 미확인"
+                "Status unknown"
             } else {
-                "아직 확인하지 않음"
+                "Not checked yet"
             },
             content_width,
         )),
@@ -18111,7 +18111,7 @@ mod tests {
     fn queue_preview_is_one_line_and_truncates_the_prompt() {
         let line = queue_preview_line("a very long\nqueued prompt", 0, Some("claude:opus[1m]"), 18);
 
-        assert_eq!(painted(&line), "▌ Queue : a v…  x");
+        assert_eq!(painted(&line), "▌ Queue : a v… x");
         assert_eq!(line.prefix_tone, Tone::ModelOpus);
         assert_eq!(line.tone, Tone::UserPrompt);
         assert_eq!(pick_on(&line, "x"), Some(Pick::RemoveQueuedPrompt(0)));
@@ -18127,7 +18127,7 @@ mod tests {
 
         assert!(lines.iter().all(|line| painted(line).starts_with("▌ Queue : ")));
         assert!(lines.iter().all(|line| painted(line).ends_with('x')));
-        assert!(lines.iter().all(|line| painted_line_width(line) == 79));
+        assert!(lines.iter().all(|line| painted_line_width(line) == 78));
         assert!(lines.iter().all(|line| line.prefix_tone == Tone::ModelSol));
         assert_eq!(pick_on(&lines[3], "x"), Some(Pick::RemoveQueuedPrompt(3)));
     }
@@ -18221,7 +18221,7 @@ mod tests {
 
         let lines = side_panel_subagent_lines(&subagents, 44);
 
-        assert_eq!(painted(&lines[0]), "Subagents  2 실행 중");
+        assert_eq!(painted(&lines[0]), "Subagents  2 Running");
         assert!(lines[1] == PaintLine::blank());
         assert_eq!(painted(&lines[2]), "• Explore · Find auth code · 1m 33s");
         assert_eq!(painted(&lines[3]), "• developer · Fix the parser · 3s");
@@ -18242,7 +18242,7 @@ mod tests {
 
         let lines = side_panel_subagent_lines(&subagents, 44);
 
-        assert_eq!(painted(&lines[0]), "Subagents  6 실행 중");
+        assert_eq!(painted(&lines[0]), "Subagents  6 Running");
         assert_eq!(painted(&lines[2 + SIDE_PANEL_SUBAGENT_LIMIT]), "… +1");
     }
 
@@ -25304,7 +25304,7 @@ mod tests {
 
         let lines = side_panel_integration_lines(&providers, 42, usize::MAX);
 
-        assert_eq!(painted(&lines[0]), "▸ Codex  사용 중");
+        assert_eq!(painted(&lines[0]), "▸ Codex  Active");
         assert_eq!(painted(&lines[1]), "▲ MCP");
         assert_eq!(
             lines[1].pick.as_ref().and_then(|picks| picks.at(0)),
@@ -25320,7 +25320,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| painted(line) == "× Claude  연결 안 됨")
+                .any(|line| painted(line) == "× Claude  Disconnected")
         );
 
         providers[1].mcp_expanded = false;
@@ -25358,7 +25358,7 @@ mod tests {
         let lines = side_panel_integration_lines(&providers, 30, 4);
 
         assert_eq!(lines.len(), 4);
-        assert_eq!(painted(&lines[0]), "▸ Codex  사용 중");
+        assert_eq!(painted(&lines[0]), "▸ Codex  Active");
         assert_eq!(painted(&lines[1]), "▲ MCP");
         assert!(painted(lines.last().expect("overflow marker")).starts_with("… +"));
     }

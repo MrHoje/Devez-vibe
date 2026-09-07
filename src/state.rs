@@ -8289,6 +8289,17 @@ impl AppState {
         // Anything this thread says counts as the turn still being alive, so the
         // stall probe only fires on a wait that has genuinely gone silent.
         self.turn_progress_at = Some(Instant::now());
+        // Codex puts a subagent's turn on the parent's stream as well, and such a
+        // notice can carry the parent's thread id or none at all — so the filter
+        // above lets it through. Ending the wait on it drops the spinner while the
+        // answer is still streaming, so only the turn we are waiting on ends it.
+        if method == "turn/completed"
+            && let Some(active) = self.turn_id.as_deref()
+            && let Some(finished) = params.pointer("/turn/id").and_then(Value::as_str)
+            && active != finished
+        {
+            return;
+        }
         // A finishing notice arrives while the last words of the answer are still
         // waiting their turn on screen. Handling it now would flush them all at
         // once, which lands as a block of text appearing at full strength — the
@@ -11298,7 +11309,7 @@ impl AppState {
                     .collect::<Vec<_>>();
                 if lines.is_empty() {
                     lines.push(OverlayLine {
-                        text: "아직 기록된 작업이 없습니다.".to_owned(),
+                        text: "No activity recorded yet.".to_owned(),
                         selected: false,
                         muted: true,
                     });
@@ -11310,7 +11321,7 @@ impl AppState {
                         Some(running) => format!("{} · {}", running.name, running.description),
                         // The row is gone once the subagent finishes, but the
                         // record it left behind stays readable.
-                        None => "Subagent · 완료됨".to_owned(),
+                        None => "Subagent · Finished".to_owned(),
                     },
                     lines,
                     slider: None,
@@ -18829,6 +18840,29 @@ mod tests {
         assert!(state.codex_subagents[child].terminal);
     }
 
+    /// Codex reports a subagent's turn on the parent stream too, sometimes under
+    /// the parent's thread id. Ending the visible turn on it drops the spinner
+    /// while the answer is still streaming.
+    #[test]
+    fn a_subagent_turn_completion_leaves_the_visible_turn_running() {
+        let mut state = test_state();
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "parent-turn" } }));
+        assert!(state.busy, "the prompt's turn is running");
+
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "id": "child-turn", "status": "completed" } }),
+        );
+        assert!(state.busy, "another turn's completion must not end this one");
+        assert!(state.view().activity.is_some_and(|row| row.starts_with("Working")));
+
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "id": "parent-turn", "status": "completed" } }),
+        );
+        assert!(!state.busy, "the turn we waited on ends the wait");
+    }
+
     #[test]
     fn every_terminal_codex_turn_event_removes_the_running_row() {
         let child = "00000000-0000-0000-0000-000000000109";
@@ -19165,7 +19199,7 @@ mod tests {
 
         assert_eq!(
             state.overlay_view().map(|overlay| overlay.title),
-            Some("Subagent · 완료됨".to_owned())
+            Some("Subagent · Finished".to_owned())
         );
     }
 

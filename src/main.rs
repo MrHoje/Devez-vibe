@@ -1825,7 +1825,7 @@ async fn event_loop(
                     }
                     Some(Ok(Event::Resize(columns, rows))) => {
                         renderer.clear_selection();
-                        resize.observe((columns, rows));
+                        resize.observe_announced((columns, rows));
                         // The relayout lands on the settle tick, not here.
                         Action::Tick(false)
                     }
@@ -2434,6 +2434,17 @@ impl ResizeTracker {
         if size == self.size {
             return;
         }
+        self.size = size;
+        self.settle_at = Some(Instant::now() + Self::SETTLE);
+    }
+
+    /// A resize the terminal announced on its own. DevezCode repaints a
+    /// reattached screen by bouncing the grid and letting it land back on the
+    /// size it started from, so the announcement can carry no net change while
+    /// rows were still dropped on screen. Arm the relayout either way: the
+    /// diff paint only rewrites rows whose content moved, which leaves a
+    /// steady row — the status line — blank until something else does.
+    fn observe_announced(&mut self, size: (u16, u16)) {
         self.size = size;
         self.settle_at = Some(Instant::now() + Self::SETTLE);
     }
@@ -9197,6 +9208,23 @@ mod tests {
         assert!(resize.settled(), "the size the drag ended on is laid out");
         assert!(!resize.settled(), "and only once");
         assert!(!resize.pending());
+    }
+
+    #[test]
+    fn an_announced_resize_relayouts_even_when_the_grid_lands_back_where_it_was() {
+        let mut resize = ResizeTracker::new();
+        let (columns, rows) = resize.size;
+
+        // The host's reattach kick: rows down one, then straight back.
+        resize.observe_announced((columns, rows - 1));
+        resize.observe_announced((columns, rows));
+        assert!(
+            resize.pending(),
+            "a net-zero bounce still owes a full repaint"
+        );
+
+        std::thread::sleep(ResizeTracker::SETTLE + Duration::from_millis(20));
+        assert!(resize.settled(), "the screen is laid out again");
     }
 
     #[test]

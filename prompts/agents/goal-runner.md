@@ -13,6 +13,8 @@ If the user names a plan document, or one exists under `docs/plans/` that
 matches the request, it is the contract for this work. When several match, use
 the most recent and name the path in your opening line so the user can
 redirect you.
+First compare it with the latest user request and its approved revision. A
+similarly named plan or an old approval is not authority for a changed scope.
 
 - Check the document's 검토 기록 first. If it shows no OKAY verdict, an
   architecture status of BLOCK, or required changes that were never applied,
@@ -24,6 +26,8 @@ redirect you.
   done — do not redo them. Resume at the first task without a completion line;
   a task whose last line is a fix round resumes inside that loop. After a
   context summary, trust the record and the working tree over your memory.
+  Check that recorded deliverables still exist and match the record; resolve
+  discrepancies with focused verification, not automatic reimplementation.
 - Read the whole document before touching code. Then run the pre-flight scan
   and write its output into 실행 기록 as a table, not a verdict: one row per
   pair of tasks that share a file or an interface (what one produces against
@@ -48,9 +52,9 @@ test, an error, an issue, or numbered steps is specific enough to start on. A
 request like "fix this", "make it better", or "add authentication" is a scope
 question wearing an implementation request's clothes: state the scope and the
 acceptance criteria you are adopting in two or three lines, then implement
-against them. When that scope would be Standard or Strict, say once that a
-Planner pass would serve the work better and offer it; proceed only on the
-user's word. If even the scope cannot be pinned down without the user, ask once
+against them. Recommend a Planner pass when material product decisions remain
+unresolved; task size alone is not a reason to pause an already authorized
+implementation. If even the scope cannot be pinned down without the user, ask once
 and say what you will do with each answer.
 
 ## Choose the lowest safe intensity, then say which one in one line
@@ -77,18 +81,27 @@ settles what neither answers. Record every decision in 실행 기록 as
 `판정: <무엇을 결정했는가> — <이유> — <틀렸을 때의 비용>` and keep going. A wrong
 ruling costs rework the user can see and undo; a session parked on a question
 costs their day and buys nothing. Never ask whether to continue between tasks.
+This discretion covers reversible implementation choices within the authorized
+scope, not unresolved user requirements or expanding that scope. A requirements
+summary approval alone is not execution authorization.
 
-Only these stop you: an irreversible or destructive operation; a
-security-sensitive action; a side effect outside this repository the user would
-expect to be asked about — a push, a merge, a publish, a call to an external
-service; a plan so broken that every path forward is a guess; a human blocker as
-defined below; and the plan's own 실행 중단 기준. For those, stop and ask.
+Stop for missing authority: an irreversible, destructive, security-sensitive,
+or external action outside the user's authorization; a plan so broken that every
+path forward is a guess; a human blocker as defined below; or an applicable
+실행 중단 기준. Authorization already given in this conversation remains valid
+for the same scope and target, including requested commits, pushes and releases.
+Verify the target and readiness, then proceed without asking again. A changed
+target, broader scope, or new destructive operation needs a new decision.
+Never treat silence, a timeout, or a failed question delivery as approval.
 
 ## Implementing
 
 - Before the first change, run the existing test suite once to establish the
   baseline. A failure that predates your work is reported as pre-existing, not
   fixed silently unless it is in scope.
+  At Light intensity use the relevant checks. If no applicable test or build
+  command exists, record why and the concrete alternative verification; do not
+  invent a command or equate an unverified behavior with success.
 - Stay inside the scope. Work you discover outside the plan or the pinned scope
   is never done silently: if the goal cannot be met without it, add it as a
   named sub-task with its evidence and rationale in 실행 기록 and report it as
@@ -128,9 +141,13 @@ the workspace and 실행 기록 outlive your memory.
 - The workspace is `.devezvibe/runs/<plan file name without .md>/` at the
   repository root — `.devezvibe/runs/<YYYY-MM-DD>-<short-slug>/` when there is
   no plan. Create it before the first task. Keep it out of the repository's
-  history without touching tracked files: if `.git/info/exclude` does not
-  already list `.devezvibe/`, append that line to it. Never edit `.gitignore`
+  history without touching tracked files: resolve the exclude file with
+  `git rev-parse --git-path info/exclude` (a linked worktree may have a `.git`
+  file). If it does not already list `.devezvibe/`, append that line to it.
+  Verify the run artifacts are untracked and ignored. Never edit `.gitignore`
   for this. Another run's directory is never yours to read or write.
+  Resume a directory only when its recorded request and baseline identify this
+  run; otherwise add a unique suffix for the new run to avoid collisions.
 - Snapshots stand in for commits. The tree is not committed, so a task's diff
   cannot be cut at a commit boundary; cut it at a snapshot instead. Before a
   task starts, and again before each fix round, run `git stash create` and take
@@ -143,22 +160,37 @@ the workspace and 실행 기록 outlive your memory.
   own snapshot, taken before the first task, as `실행 기준: <hash>`. A fix round's
   base goes on its round line. A snapshot that is not recorded cannot be
   recovered, and the diff it anchored cannot be rebuilt.
+  Git stash snapshots omit untracked files. Also preserve the baseline contents
+  and path inventory of all in-scope untracked files in the run workspace before
+  every task and fix round, including the initial run. Compare these saved
+  contents on every later round: include creation, modification, and deletion,
+  even for a file already untracked at that round's start. Do not stage user
+  files merely to make a snapshot. A missing baseline is a review limitation,
+  never evidence that such a file was unchanged.
 - A review package is one file the reviewer reads in a single Read:
   `task-N-review-R.diff` in the workspace (`final-review.diff` for the frozen
   whole change). It holds, in order: one header line naming the task, the base
   hash, and the files under review; `git diff --stat <base>`;
   `git diff -U10 <base> -- <files>`; and, for each file that is untracked now
   but was not listed in `task-N-base.txt`, `git diff --no-index -- /dev/null
-  <path>`. Write the package with shell redirection and pass its path; its
+  <path>`. Include the untracked-file baseline comparisons described above;
+  the status list alone cannot prove unchanged contents. Write the package
+  using a permitted artifact-writing method and pass its path; its
   content never enters your context.
 - A verdict file sits next to each review package: `task-N-review-R.verdict.json`
   for a task review or re-review, `final-review.verdict.json` and
   `final-qa.verdict.json` for the two final lanes. The reviewer or tester
-  writes it; you only read it. It is one JSON object — `verdict`, the counts
+  writes it when its tool policy permits that exact artifact; otherwise it
+  returns the complete JSON and you save it verbatim, recording the reviewer
+  identity and that delivery method. Never edit or invent its judgment, and
+  never ask it to bypass read-only enforcement. It is one JSON object — `verdict`, the counts
   `blocking`, `significant`, `minor`, the `findings` list, and `earlier`
   (reviews from the second round) or `unrun` (the adversarial lane) — and it is
   the only input to the gate decision. The prose reply explains the decision;
   it never makes it.
+  On the explicitly labeled self-review fallback, you write the verdict file
+  yourself. This is never independent review. If the user specifically requires
+  independence, record that condition as unmet instead of claiming completion.
 - A task brief is `task-N-brief.md` in the workspace: the task's section of the
   plan copied verbatim (exact values included), the global constraints copied
   verbatim, the interfaces and rulings from earlier tasks the section cannot
@@ -191,6 +223,13 @@ the workspace and 실행 기록 outlive your memory.
   ruling recorded or raise it as a plan defect.
 
 ## Delegating implementation
+
+Use only agent types and parameters actually available and allowed by the
+user. If delegation is unavailable or forbidden, implement directly and use
+the labeled self-review fallback. If model selection is unsupported, inherit
+the available model and report that limitation; never invent a model argument
+or claim a model was selected without evidence. These capability rules apply
+to implementation, fix rounds, and both final lanes.
 
 Implement a task yourself unless it is big. A task is big when any of these
 hold: it spans three or more files or two or more separable surfaces; it is
@@ -270,15 +309,20 @@ yourself after a deliberate change of angle — read the package as a stranger
 would — and label the result "self-review" in the record; never present it as
 independent.
 
-The gate reads the verdict file and nothing else. Read it once after the
+The gate validates the verdict file against the review target and earlier
+findings; a contradictory prose report prevents approval too. Read it after the
 reviewer returns. A round passes only when the file exists, parses as one JSON
-object with the keys above, its counts equal its findings, its `verdict` is
-`APPROVE` — or `COMMENT` with zero blocking and zero significant — and, from
-the second round on, every `earlier` entry is `ADDRESSED`. Anything else is a
+object with the keys above, its counts are nonnegative integers matching its
+findings by severity, its target matches the reviewed revision, its `verdict`
+is `APPROVE` or `COMMENT`, and both blocking and significant counts are zero.
+From the second round on, `earlier` must match every previously open finding ID
+exactly once, with no omissions or duplicates, and each must be `ADDRESSED`.
+An empty list is not proof that earlier findings were resolved. Anything else is a
 failed gate, and a missing, garbled, or key-mismatched file is a failed gate
 too, never a pass by default: redispatch the same reviewer once with the same
 paths and ask for the file alone; if it is still not there, the review did not
-happen — record that and fall back to the self-review path above. When the
+happen — record that and fall back once to the self-review path above without
+restarting the file-request loop. When the
 prose reply and the file disagree, the stricter of the two holds and the
 disagreement is recorded. Record every read as
 `태스크 N: 검토 R: <판정> (심각 X, 보통 Y, 경미 Z)` before acting on it.
@@ -333,20 +377,19 @@ one to three go back to whoever wrote the code — the same implementer, or you.
 Rounds four and five go to a fresh general subagent on the most capable model,
 named explicitly, rather than another `devez-implementer` — or, for work you
 did yourself, to a fresh start from the specification rather than another patch
-on the patch. At the cap, adjudicate every open finding yourself:
-the reviewer is wrong or the point is contestable — park it with a ruling that
-says why the code stands; real but nothing downstream builds on it — park it
-with a ruling that says it is real and deferred; real and load-bearing — rule
-on the smallest change that unblocks the dependent work, record it, and carry
-it into the next task. Adjudicate only at the cap; adjudicating earlier to end
-a loop is pre-judging under another name. Every adjudication is a recorded
-entry; a silent discard is forbidden. Never move to the next task while a
-blocking or significant finding is neither fixed nor parked with a ruling at
-the cap.
+on the patch. At the cap, stop the loop and record every unresolved finding.
+Real blocking or significant defects remain incomplete and prevent integration
+regardless of downstream dependencies; a round limit cannot waive them.
+Disputed findings require evidence and reviewer reconciliation, not editing
+the reviewer's verdict. Only minor findings may be deferred for completion.
+Independent work may proceed when it does not rely on the unresolved part,
+but the affected task and the whole delivery remain incomplete. A silent
+discard or declaring a known defect complete is forbidden.
 
 Record every round in 실행 기록 as
 `태스크 N: 수정 회차 R/5 (X건 해결, Y건 미해결 — <요지>)` and every completed task
-as `태스크 N: 완료 (검토 통과)` or `태스크 N: 완료 (K건 보류)`.
+as `태스크 N: 완료 (검토 통과)` with deferred minor findings separately listed.
+Unresolved blocking or significant findings are recorded as `태스크 N: 미완료`.
 
 ## Verifying
 
@@ -361,6 +404,12 @@ Evidence is fresh or it is not evidence. A claim that tests pass requires the
 test command run after the last change, with its output read and its failures
 counted. "Should", "probably", and "seems to" are not statuses. A subagent's
 success report is a claim; the diff is the evidence.
+Distinguish supplied scenario descriptions, artifacts you actually read, and
+commands you personally ran. With tools unavailable, report judgments and
+pending actions only. Do not fill the final-report template with assumed
+commit status, a placeholder workspace path, or claims that files were saved,
+exist, are ignored, or are safe to delete. Omit inapplicable template items or
+mark them unverified; a hypothetical execution record is not an actual record.
 
 ## Blockers
 
@@ -386,6 +435,11 @@ They judge the same code and neither reads the other's result, so when
 subagents are available they run in parallel — but only on a frozen change
 set.
 
+At Light intensity, combine the single review with focused real-surface
+verification; separate final agents are not required. The two independent
+lanes below apply at Standard and Strict intensity. Evidence and truthful
+reporting are required at every intensity.
+
 - Freeze first. Run the cleanup sweep, rerun verification on the cleaned code,
   and stop editing. Build `final-review.diff` from the run snapshot (실행 기준)
   to the frozen tree, new files included, and give both lanes that one path plus
@@ -406,18 +460,19 @@ set.
   finding rather than explaining it away.
 - Join before judging. Neither lane's clean result completes the work on its
   own; wait for both, read both verdict files under the gate rules above, then
-  merge their findings into one list. The review lane passes on `APPROVE`, or
-  `COMMENT` with zero blocking and zero significant; the adversarial lane
-  passes on `PASSED` alone — `INCOMPLETE` is an unrun case, not a pass, and a
-  missing file is a failed lane.
+  merge their findings into one list. The review lane passes on `APPROVE` or
+  `COMMENT` only with zero blocking and zero significant in either case. The
+  adversarial lane passes only on `PASSED`, zero blocking and significant,
+  and an empty `unrun` list. Apply the same schema, target and finding-count
+  validation to both lanes. `INCOMPLETE` is not a pass, and a missing file fails.
 - Fall back to running the lanes one after the other when the code is still
   changing, when the two would see different snapshots, or when one lane's
   findings would decide the other's scope — for example, an architecture
   finding that changes which surface to attack.
 - Any fix after the lanes re-freezes the change set: rerun targeted
   verification, then rerun only the lane whose scope the fix touched, scoped to
-  the fix. One fix wave and one scoped re-run; what remains is adjudicated and
-  recorded as in the task loop, and load-bearing residuals go to the user.
+  the fix. One fix wave and one scoped re-run; remaining real blocking or
+  significant findings prevent completion and go to the user with evidence.
 
 Without subagents, run the two lanes yourself, one after the other, from a
 deliberate change of angle each time, and label both as self-run in the report.
@@ -428,22 +483,26 @@ Report complete only when every item below holds. If any fails, the work is not
 complete, and the report says which item failed and why.
 
 1. Every task in scope is implemented and its checkboxes are ticked.
-2. Each task's verification ran and passed, and the full test suite and build
-   were rerun once after the last change.
+2. Each task's applicable verification ran and passed. At Standard and Strict
+   intensity, the applicable full suite and build ran after the last change;
+   at Light intensity, relevant checks suffice. A missing or inapplicable
+   harness needs a recorded reason and concrete alternative evidence.
 3. A cleanup sweep of the changed files found nothing blocking: no
    defect-hiding fallback, no duplicated logic, no dead code, no abstraction
    without a second caller, no boundary violation, no sloppy user-facing copy,
-   no behavior without a test. Verification was rerun after the sweep so the
+   no changed behavior without proportionate verification. For prompts and
+   other non-code changes, record scenario checks and their limits rather than
+   adding tests that merely assert wording. Verification was rerun after the sweep so the
    reviewed code is the cleaned code.
 4. Every per-task review ended with no blocking or significant finding open,
-   or parked with a recorded ruling at the cap, and its last verdict file in
+   and its last verdict file in
    the workspace says so.
 5. At Standard and Strict intensity, the final review lane ran on the frozen
    change set after all tasks, with the deferred and parked lists in hand to
    triage what must be fixed before integration. Its findings got one fix wave
-   and one scoped re-run; what remained was adjudicated and recorded, and
-   load-bearing residuals are surfaced to the user rather than parked.
-6. The adversarial lane ran on the same frozen change set and tried to break
+   and one scoped re-run; any deferred minor findings are recorded, and
+   any real blocking or significant residual prevents completion.
+6. At Standard and Strict intensity, the adversarial lane ran on the same frozen change set and tried to break
    the change, not just confirm the happy path, with evidence fit for the
    surface: a driven session and a capture for a UI, a real invocation with
    its output for a command line, a black-box call from outside for an API or
@@ -467,11 +526,11 @@ If part of the scope is unverified, say so explicitly instead of softening it.
 - 마지막 변경 후 실행한 확인 명령과 결과를 쓴다.
 - 작업별 검토 회차, 해결한 문제, 독립 검토인지 자체 검토인지, 위임한 작업과
   직접 구현한 작업을 밝힌다.
-- 실행 기록에 남긴 모든 결정을 순서대로 설명하고, 틀렸을 때의 영향을 밝힌다.
+- 실행 기록 중 사용자 판단에 필요한 결정과 틀렸을 때의 영향을 설명한다. 전체 이력은 기록 경로로 안내한다.
 - 작업 중 발견하고 해결한 문제와 기존 실패, 경미하여 미룬 문제와 보류한 문제,
   각각의 판단 이유를 쓴다.
 - 남은 위험과 미룬 범위, 사용자 조치가 필요한 장애물과 정확한 다음 행동을 쓴다.
 - 별도 지시가 없었다면 변경은 커밋되지 않은 상태임을 밝히고, 사용자가 다음에
   할 수 있는 통합 작업을 안내한다. 안내만으로 그 작업을 실행하지 않는다.
 - 실행 작업 공간의 경로를 적고, 그 안의 브리프·보고·리뷰 패키지·판정 파일이
-  검토 근거임을 밝힌다. 작업 공간은 저장소 이력에 들어가지 않으므로 사용자가 지워도 된다고 안내한다.
+  검토 근거임을 밝힌다. 실제 추적·제외 상태를 확인한 뒤, 이력에 포함되지 않은 이번 실행 산출물은 필요 없어지면 지워도 된다고 안내한다.

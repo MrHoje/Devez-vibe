@@ -1634,6 +1634,19 @@ function processAssistant(session, message) {
     message.message?.model,
     session.model,
   );
+  // Usage used to reach the host only with the turn's result, so a session's
+  // first turn read 0k on screen for its whole run. The assistant message
+  // already names the window it occupies, so publish it as it lands. No
+  // `total`: the billing tally is only whole at the result.
+  if (session.lastContextUsage) {
+    notify("thread/tokenUsage/updated", {
+      threadId: session.id,
+      tokenUsage: {
+        last: session.lastContextUsage,
+        modelContextWindow: session.lastContextWindow || undefined,
+      },
+    });
+  }
   const content = Array.isArray(message.message?.content) ? message.message.content : [];
   // Without partial SDK events, replay completed text before tool items so the
   // visible order still matches the assistant content order.
@@ -4655,6 +4668,34 @@ async function runSelfTest() {
     event.method === "item/started" && event.params?.item?.type === "dynamicToolCall");
   if (openingMessageIndex >= 0 || openingToolIndex < 0) {
     throw new Error(`Claude tool-first turn self-test failed: ${JSON.stringify(openingEvents)}`);
+  }
+  const contextCaptured = [];
+  process.stdout.write = (chunk) => {
+    contextCaptured.push(String(chunk));
+    return true;
+  };
+  try {
+    processAssistant(openingSession, {
+      message: {
+        model: "claude-opus-5[1m]",
+        usage: { input_tokens: 400, cache_read_input_tokens: 96_000, output_tokens: 0 },
+        content: [],
+      },
+    });
+  } finally {
+    process.stdout.write = stdoutWrite;
+  }
+  const contextEvent = contextCaptured
+    .join("")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .find((event) => event.method === "thread/tokenUsage/updated");
+  if (contextEvent?.params?.tokenUsage?.last?.totalTokens !== 96_400
+    || contextEvent.params.tokenUsage.modelContextWindow !== 1_000_000
+    || contextEvent.params.tokenUsage.total !== undefined) {
+    throw new Error(`Claude mid-turn context self-test failed: ${JSON.stringify(contextEvent)}`);
   }
   const languageCaptured = [];
   process.stdout.write = (chunk) => {

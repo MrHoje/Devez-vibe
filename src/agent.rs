@@ -81,7 +81,7 @@ impl AgentMode {
     pub fn detail(self) -> &'static str {
         match self {
             Self::Standard => "일상적인 개발 작업 전반을 유연하게 처리합니다.",
-            Self::Planner => "요구사항을 분석해 체계적인 구현 계획을 수립합니다.",
+            Self::Planner => "꼼꼼한 요구사항 인터뷰와 확인을 거쳐 구현 계획을 수립합니다.",
             Self::GoalRunner => "목표를 정하고 끝까지 완수합니다.",
             Self::Reviewer => "변경 내용과 계획을 근거 기반으로 검토해 심각도와 판정을 냅니다.",
             Self::Custom(index) => custom_role(index)
