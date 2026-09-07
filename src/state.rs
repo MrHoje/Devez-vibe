@@ -4398,11 +4398,6 @@ impl AppState {
         self.commit_welcome_card();
         let previous_provider = self.selected_provider();
         if previous_provider == provider {
-            self.committed.push(Block::new(
-                BlockKind::System,
-                "Provider",
-                format!("현재 {} provider를 사용 중입니다.", provider.label()),
-            ));
             return;
         }
 
@@ -5884,7 +5879,6 @@ impl AppState {
             return;
         };
         prompt.set_response_duration(completed_at.saturating_duration_since(started_at));
-        prompt.set_response_completed_at(chrono::Local::now());
         self.committed.push(prompt.clone());
     }
 
@@ -21502,7 +21496,6 @@ mod tests {
                 .map(|duration| duration.as_secs()),
             Some(70)
         );
-        assert!(completed_prompt.response_completed_at().is_some());
     }
 
     #[test]
@@ -25871,6 +25864,12 @@ mod tests {
             .committed
             .iter()
             .any(|block| block.title == "✓ Provider changed"));
+
+        state.run_slash_command("/provider claude");
+        assert!(!state
+            .committed
+            .iter()
+            .any(|block| block.title == "Provider"));
 
         state.run_slash_command("/model");
         let overlay = state.overlay_view().expect("Claude model picker");

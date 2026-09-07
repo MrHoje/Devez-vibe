@@ -140,7 +140,6 @@ pub struct Block {
     children: Vec<Block>,
     assistant_phase: AssistantPhase,
     response_duration: Option<Duration>,
-    response_completed_at: Option<chrono::DateTime<chrono::Local>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -231,7 +230,6 @@ impl Block {
             children: Vec::new(),
             assistant_phase: AssistantPhase::Unknown,
             response_duration: None,
-            response_completed_at: None,
         }
     }
 
@@ -264,14 +262,6 @@ impl Block {
 
     pub const fn response_duration(&self) -> Option<Duration> {
         self.response_duration
-    }
-
-    pub fn set_response_completed_at(&mut self, at: chrono::DateTime<chrono::Local>) {
-        self.response_completed_at = Some(at);
-    }
-
-    pub const fn response_completed_at(&self) -> Option<chrono::DateTime<chrono::Local>> {
-        self.response_completed_at
     }
 
     pub fn shell_group(kind: BlockKind, title: impl Into<String>, children: Vec<Block>) -> Self {
@@ -6016,23 +6006,34 @@ fn activity_lines_with_progress(
     }]
 }
 
-fn queue_preview_line(prompt: &str, index: usize, width: u16) -> PaintLine {
+fn queue_preview_line(prompt: &str, index: usize, model: Option<&str>, width: u16) -> PaintLine {
+    let prompt = prompt
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
     PaintLine {
-        prefix: " ".to_owned(),
-        prefix_tone: Tone::Muted,
-        text: "x".to_owned(),
-        tone: Tone::Muted,
+        prefix: String::new(),
+        prefix_tone: Tone::Plain,
+        text: "x ".to_owned(),
+        tone: Tone::UserPrompt,
         bold: false,
         tool_heading: None,
         pick: None,
-        tail: vec![PaintSpan {
-            text: format!(
-                " Queue: {}",
-                compact_right(prompt, usize::from(width).saturating_sub(11))
-            ),
-            tone: Tone::Muted,
-            bold: false,
-        }],
+        tail: vec![
+            PaintSpan {
+                text: "▌ ".to_owned(),
+                tone: model.and_then(chrome_model_tone).unwrap_or(Tone::Accent),
+                bold: false,
+            },
+            PaintSpan {
+                text: format!(
+                    "Queue : {}",
+                    compact_right(&prompt, usize::from(width).saturating_sub(13))
+                ),
+                tone: Tone::UserPrompt,
+                bold: false,
+            },
+        ],
     }
     .with_picks(&[(0, Pick::RemoveQueuedPrompt(index))])
 }
@@ -6210,11 +6211,11 @@ fn artifact_line(artifacts: &[ArtifactView], width: u16) -> Option<PaintLine> {
 /// The artifact row's marker: a framed page, distinct from the subagent bullet.
 const ARTIFACT_GLYPH: &str = "⧉";
 
-fn queue_preview_lines(prompts: &[String], width: u16) -> Vec<PaintLine> {
+fn queue_preview_lines(prompts: &[String], model: Option<&str>, width: u16) -> Vec<PaintLine> {
     prompts
         .iter()
         .enumerate()
-        .map(|(index, prompt)| queue_preview_line(prompt, index, width))
+        .map(|(index, prompt)| queue_preview_line(prompt, index, model, width))
         .collect()
 }
 
@@ -6789,7 +6790,11 @@ fn normal_frame_with_expansion(
             lines.push(spacer);
         }
     }
-    lines.extend(queue_preview_lines(queued_prompts, width));
+    lines.extend(queue_preview_lines(
+        queued_prompts,
+        composer_mode.map(|mode| mode.model.as_str()),
+        width,
+    ));
 
     // Recalled history is labelled on the composer rule, so the position stays
     // visible for as long as the entry does.
@@ -11053,7 +11058,6 @@ fn user_prompt_lines_with_history(
             width,
             history,
             block.response_duration(),
-            block.response_completed_at(),
             false,
         );
         if history.is_some() {
@@ -11099,7 +11103,6 @@ fn user_prompt_lines_with_history(
     let footer_width = prompt_footer_label(
         history,
         block.response_duration(),
-        block.response_completed_at(),
     )
         .map(|label| UnicodeWidthStr::width(label.as_str()))
         .unwrap_or_default();
@@ -11136,7 +11139,6 @@ fn user_prompt_lines_with_history(
         width,
         history,
         block.response_duration(),
-        block.response_completed_at(),
         true,
     );
     if history.is_some() {
@@ -11148,7 +11150,6 @@ fn user_prompt_lines_with_history(
 fn prompt_footer_label(
     history: Option<(u64, &str, bool)>,
     response_duration: Option<Duration>,
-    response_completed_at: Option<chrono::DateTime<chrono::Local>>,
 ) -> Option<String> {
     let history = history.map(|(_, title, expanded)| {
         if expanded {
@@ -11157,12 +11158,9 @@ fn prompt_footer_label(
             title.to_owned()
         }
     });
-    let duration = response_duration.map(|duration| format_elapsed(duration.as_secs()));
-    let completion = match (duration, response_completed_at) {
-        (Some(duration), Some(at)) => format!("{duration} · {}", format_clock_time(at)),
-        (Some(duration), None) => duration,
-        _ => String::new(),
-    };
+    let completion = response_duration
+        .map(|duration| format_elapsed(duration.as_secs()))
+        .unwrap_or_default();
     match (history, completion.is_empty()) {
         (Some(history), false) => Some(format!("{history}  {completion}")),
         (Some(history), true) => Some(history),
@@ -11176,7 +11174,6 @@ fn attach_prompt_footer(
     width: u16,
     history: Option<(u64, &str, bool)>,
     response_duration: Option<Duration>,
-    response_completed_at: Option<chrono::DateTime<chrono::Local>>,
     chat_layout: bool,
 ) {
     if let Some((group_id, _, _)) = history {
@@ -11201,11 +11198,7 @@ fn attach_prompt_footer(
         }
     }
 
-    let Some(label) = prompt_footer_label(
-        history,
-        response_duration,
-        response_completed_at,
-    ) else {
+    let Some(label) = prompt_footer_label(history, response_duration) else {
         return;
     };
     let label_width = UnicodeWidthStr::width(label.as_str());
@@ -18112,9 +18105,11 @@ mod tests {
 
     #[test]
     fn queue_preview_is_one_line_and_truncates_the_prompt() {
-        let line = queue_preview_line("a very long queued prompt", 0, 18);
+        let line = queue_preview_line("a very long\nqueued prompt", 0, Some("claude:opus[1m]"), 18);
 
-        assert_eq!(painted(&line), " x Queue: a very…");
+        assert_eq!(painted(&line), "x ▌ Queue : a ve…");
+        assert_eq!(line.tail[0].tone, Tone::ModelOpus);
+        assert_eq!(line.tone, Tone::UserPrompt);
         assert_eq!(pick_on(&line, "x"), Some(Pick::RemoveQueuedPrompt(0)));
     }
 
@@ -18124,17 +18119,18 @@ mod tests {
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        let lines = queue_preview_lines(&prompts, 80);
+        let lines = queue_preview_lines(&prompts, Some("gpt-5.6-sol"), 80);
 
         assert_eq!(
             lines.iter().map(painted).collect::<Vec<_>>(),
             [
-                " x Queue: first",
-                " x Queue: second",
-                " x Queue: third",
-                " x Queue: fourth"
+                "x ▌ Queue : first",
+                "x ▌ Queue : second",
+                "x ▌ Queue : third",
+                "x ▌ Queue : fourth"
             ]
         );
+        assert!(lines.iter().all(|line| line.tail[0].tone == Tone::ModelSol));
         assert_eq!(pick_on(&lines[3], "x"), Some(Pick::RemoveQueuedPrompt(3)));
     }
 
@@ -25761,23 +25757,18 @@ mod tests {
     }
 
     #[test]
-    fn completed_prompt_footer_shows_duration_and_time() {
+    fn completed_prompt_footer_shows_duration_without_completion_time() {
         let mut prompt = Block::new(BlockKind::User, "gpt-5.6-luna", "보낸 프롬프트");
         prompt.set_response_duration(Duration::from_secs(7));
-        let completed_at = chrono::Local::now();
-        prompt.set_response_completed_at(completed_at);
 
         let lines = user_prompt_lines_with_history(&prompt, 80, None, true);
         let footer = lines
             .iter()
-            .find(|line| painted(line).contains("7s · "))
-            .expect("prompt metadata footer");
-        let expected = format!(
-            "7s · {}  ",
-            format_clock_time(completed_at)
-        );
+            .find(|line| painted(line).contains("7s"))
+            .expect("prompt duration footer");
 
-        assert!(painted(footer).ends_with(&expected));
+        assert!(painted(footer).ends_with("7s  "));
+        assert!(!painted(footer).contains("·"));
         assert_eq!(footer.tail[0].tone, Tone::History);
     }
 
