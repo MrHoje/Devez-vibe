@@ -48,7 +48,7 @@ type DetachedMap = Arc<Mutex<HashMap<u64, DetachedTurn>>>;
 type ToolMap = Arc<Mutex<HashMap<String, Value>>>;
 type StreamMap = Arc<Mutex<HashMap<String, SessionStreams>>>;
 type ActiveMap = Arc<Mutex<HashMap<String, ActiveTurn>>>;
-type LoadingMap = Arc<Mutex<HashMap<String, Vec<HistoryChunk>>>>;
+type LoadingMap = Arc<Mutex<HashMap<String, LoadedHistory>>>;
 type HistoryMap = Arc<Mutex<HashMap<String, Value>>>;
 type Notification = (String, Value);
 
@@ -74,6 +74,12 @@ struct HistoryChunk {
     user: bool,
     message_id: Option<String>,
     text: String,
+}
+
+#[derive(Default)]
+struct LoadedHistory {
+    chunks: Vec<HistoryChunk>,
+    token_usage: Option<Value>,
 }
 
 /// ACP는 본문·사고 조각만 흘려보내고 항목 경계를 알리지 않는다. 조각을
@@ -1054,7 +1060,7 @@ impl OpenCodeServer {
         self.loading
             .lock()
             .await
-            .insert(session_id.to_owned(), Vec::new());
+            .insert(session_id.to_owned(), LoadedHistory::default());
         let result = self
             .client
             .request(
@@ -1066,20 +1072,23 @@ impl OpenCodeServer {
                 }),
             )
             .await;
-        let chunks = self
+        let loaded = self
             .loading
             .lock()
             .await
             .remove(session_id)
             .unwrap_or_default();
         let response = result?;
-        let turns = history_turns(session_id, &chunks);
+        let turns = history_turns(session_id, &loaded.chunks);
         let model = current_model(&response)
             .map(|model| format!("opencode:{model}"))
             .unwrap_or_else(|| "opencode:unknown/unknown".to_owned());
         let effort = current_config_option(&response, "effort").unwrap_or("default");
         let mut value = thread_response(session_id, cwd, &model, effort);
         value["thread"]["turns"] = Value::Array(turns.clone());
+        if let Some(token_usage) = loaded.token_usage {
+            value["tokenUsage"] = token_usage;
+        }
         self.history.lock().await.insert(
             session_id.to_owned(),
             json!({ "data": turns, "nextCursor": null }),
@@ -1382,9 +1391,13 @@ async fn route_message(
         // session/load가 재생 중인 세션의 조각은 화면 대신 복원 버퍼로 간다.
         {
             let mut loading = loading.lock().await;
-            if let Some(chunks) = loading.get_mut(&session_id) {
+            if let Some(loaded) = loading.get_mut(&session_id) {
                 if let Some(update) = params.get("update") {
-                    record_history_chunk(chunks, update);
+                    if let Some(usage) = usage_update_token_usage(update) {
+                        loaded.token_usage = Some(usage);
+                    } else {
+                        record_history_chunk(&mut loaded.chunks, update);
+                    }
                 }
                 return;
             }
@@ -1538,23 +1551,31 @@ async fn route_session_update(
             );
         }
         Some("usage_update") => {
-            let used = update.get("used").and_then(Value::as_u64).unwrap_or(0);
-            let size = update.get("size").and_then(Value::as_u64);
+            let Some(token_usage) = usage_update_token_usage(update) else {
+                return;
+            };
             notify(
                 events,
                 "thread/tokenUsage/updated",
                 json!({
                     "threadId": session_id,
-                    "tokenUsage": {
-                        "last": { "totalTokens": used },
-                        "total": { "totalTokens": used },
-                        "modelContextWindow": size
-                    }
+                    "tokenUsage": token_usage
                 }),
             );
         }
         _ => {}
     }
+}
+
+fn usage_update_token_usage(update: &Value) -> Option<Value> {
+    (update.get("sessionUpdate").and_then(Value::as_str) == Some("usage_update")).then(|| {
+        let used = update.get("used").and_then(Value::as_u64).unwrap_or(0);
+        json!({
+            "last": { "totalTokens": used },
+            "total": { "totalTokens": used },
+            "modelContextWindow": update.get("size").cloned().unwrap_or(Value::Null)
+        })
+    })
 }
 
 fn tool_item(update: &Value, completed: bool) -> Value {
@@ -3015,7 +3036,10 @@ mod tests {
         let detached: DetachedMap = Arc::new(Mutex::new(HashMap::new()));
         let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, mut event_rx) = mpsc::unbounded_channel::<ServerEvent>();
-        loading.lock().await.insert("ses_1".to_owned(), Vec::new());
+        loading
+            .lock()
+            .await
+            .insert("ses_1".to_owned(), LoadedHistory::default());
 
         route_message(
             json!({
@@ -3042,9 +3066,47 @@ mod tests {
         // 재생 조각은 화면 알림 대신 복원 버퍼로 간다.
         assert!(event_rx.try_recv().is_err());
         let buffered = loading.lock().await.remove("ses_1").expect("버퍼");
-        assert_eq!(buffered.len(), 1);
-        assert!(!buffered[0].user);
-        assert_eq!(buffered[0].text, "복원된 답변");
+        assert_eq!(buffered.chunks.len(), 1);
+        assert!(!buffered.chunks[0].user);
+        assert_eq!(buffered.chunks[0].text, "복원된 답변");
+    }
+
+    #[tokio::test]
+    async fn usage_updates_during_load_restore_context_immediately() {
+        let tools: ToolMap = Arc::new(Mutex::new(HashMap::new()));
+        let streams: StreamMap = Arc::new(Mutex::new(HashMap::new()));
+        let loading: LoadingMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let detached: DetachedMap = Arc::new(Mutex::new(HashMap::new()));
+        let active: ActiveMap = Arc::new(Mutex::new(HashMap::new()));
+        let (event_tx, _event_rx) = mpsc::unbounded_channel::<ServerEvent>();
+        loading
+            .lock()
+            .await
+            .insert("ses_1".to_owned(), LoadedHistory::default());
+
+        route_message(
+            json!({
+                "method": "session/update",
+                "params": {
+                    "sessionId": "ses_1",
+                    "update": { "sessionUpdate": "usage_update", "used": 42_000, "size": 200_000 }
+                }
+            }),
+            &pending,
+            &detached,
+            &active,
+            &loading,
+            &tools,
+            &streams,
+            &event_tx,
+        )
+        .await;
+
+        let loaded = loading.lock().await.remove("ses_1").expect("버퍼");
+        let usage = loaded.token_usage.expect("사용량");
+        assert_eq!(usage["last"]["totalTokens"], 42_000);
+        assert_eq!(usage["modelContextWindow"], 200_000);
     }
 
     #[test]

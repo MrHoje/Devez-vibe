@@ -15769,13 +15769,18 @@ fn read_codex_usage() -> (Option<u8>, Option<u8>, Option<u64>) {
 }
 
 pub fn load_model_context_windows(models: &mut [ModelInfo]) {
-    let Some(root) = codex_home()
-        .and_then(|home| fs::read_to_string(home.join("models_cache.json")).ok())
-        .and_then(|json| serde_json::from_str::<Value>(&json).ok())
-    else {
+    let Some(home) = codex_home() else {
         return;
     };
-    apply_model_context_cache(models, &root);
+    if let Some(root) = fs::read_to_string(home.join("models_cache.json"))
+        .ok()
+        .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+    {
+        apply_model_context_cache(models, &root);
+    }
+    if let Ok(config) = fs::read_to_string(home.join("config.toml")) {
+        apply_configured_context_window(models, &config);
+    }
 }
 
 fn apply_model_context_cache(models: &mut [ModelInfo], root: &Value) {
@@ -15802,6 +15807,29 @@ fn apply_model_context_cache(models: &mut [ModelInfo], root: &Value) {
             .and_then(Value::as_u64)
             .unwrap_or(100);
         model.context_window = Some(raw_window.saturating_mul(effective_percent) / 100);
+    }
+}
+
+fn apply_configured_context_window(models: &mut [ModelInfo], config: &str) {
+    let Some(window) = config
+        .lines()
+        .take_while(|line| !line.trim_start().starts_with('['))
+        .filter_map(|line| line.split('#').next())
+        .filter_map(|line| line.split_once('='))
+        .find_map(|(key, value)| {
+            (key.trim() == "model_context_window")
+                .then(|| value.trim().trim_matches(['"', '\'']).parse::<u64>().ok())
+                .flatten()
+        })
+        .filter(|window| *window > 0)
+    else {
+        return;
+    };
+    for model in models
+        .iter_mut()
+        .filter(|model| ModelProvider::from_model(&model.model) == ModelProvider::Codex)
+    {
+        model.context_window = Some(window);
     }
 }
 
@@ -24078,6 +24106,27 @@ mod tests {
             state.view().status_line.and_then(|status| status.context),
             Some("ctx: 0k/258k (0%)".to_owned())
         );
+    }
+
+    #[test]
+    fn configured_context_window_overrides_only_codex_models() {
+        let mut models = vec![
+            test_model("gpt-5.6-sol", "GPT-5.6-Sol", true),
+            test_model("claude:sonnet", "Sonnet", false),
+            test_model("opencode:openai/gpt-5", "OpenCode GPT-5", false),
+        ];
+        for model in &mut models {
+            model.context_window = Some(258_400);
+        }
+
+        apply_configured_context_window(
+            &mut models,
+            "model_context_window = 1000000\n[profile.test]\nmodel_context_window = 2000000\n",
+        );
+
+        assert_eq!(models[0].context_window, Some(1_000_000));
+        assert_eq!(models[1].context_window, Some(258_400));
+        assert_eq!(models[2].context_window, Some(258_400));
     }
 
     #[test]

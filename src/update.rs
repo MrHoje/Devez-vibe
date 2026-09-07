@@ -22,12 +22,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "compact 진행 중 보낸 프롬프트를 대기열에 보관하고 압축이 끝난 뒤 실행합니다.",
-    "보낸 프롬프트 하단에 소요시간만 표시합니다.",
-    "모델·effort·fast·provider·theme 변경 성공 카드를 표시하지 않습니다.",
-    "프롬프트 하단 메타정보에서 모델·effort를 제외합니다.",
-    "이미 사용 중인 provider를 다시 선택할 때 중복 안내 카드를 표시하지 않습니다.",
-    "자동 지식 동기화와 프롬프트 주입 기능을 제거합니다.",
+    "Codex 새 세션의 컨텍스트 상한에 model_context_window 설정을 즉시 반영합니다.",
+    "Codex와 OpenCode 세션을 재개하면 첫 프롬프트 전에도 저장된 컨텍스트 사용량을 복원합니다.",
+    "대기 중인 프롬프트의 삭제 표시를 행 오른쪽 끝에 배치합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

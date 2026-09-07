@@ -427,8 +427,11 @@ async fn start_session(
         .unwrap_or_else(|| cwd.to_str().unwrap_or("."))
         .to_owned();
 
+    let rollout_id = server
+        .active_codex_thread_id(&thread_id)
+        .unwrap_or_else(|| thread_id.clone());
     let rollout = is_resuming
-        .then(|| state::codex_home().and_then(|home| rollout::load(&home, &thread_id)))
+        .then(|| state::codex_home().and_then(|home| rollout::load(&home, &rollout_id)))
         .flatten();
     state.attach_thread(thread_id, actual_cwd, &actual_model, Some(&actual_effort));
     // A thread whose turns already moved to another runtime resumes from that

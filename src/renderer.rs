@@ -6011,31 +6011,35 @@ fn queue_preview_line(prompt: &str, index: usize, model: Option<&str>, width: u1
         .chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .collect::<String>();
+    let text = format!(
+        "Queue : {}",
+        compact_right(&prompt, usize::from(width).saturating_sub(14))
+    );
+    let padding = usize::from(width)
+        .saturating_sub(1)
+        .saturating_sub(2 + UnicodeWidthStr::width(text.as_str()) + 1);
     PaintLine {
-        prefix: String::new(),
-        prefix_tone: Tone::Plain,
-        text: "x ".to_owned(),
+        prefix: "▌ ".to_owned(),
+        prefix_tone: model.and_then(chrome_model_tone).unwrap_or(Tone::Accent),
+        text,
         tone: Tone::UserPrompt,
         bold: false,
         tool_heading: None,
         pick: None,
         tail: vec![
             PaintSpan {
-                text: "▌ ".to_owned(),
-                tone: model.and_then(chrome_model_tone).unwrap_or(Tone::Accent),
+                text: " ".repeat(padding),
+                tone: Tone::UserPrompt,
                 bold: false,
             },
             PaintSpan {
-                text: format!(
-                    "Queue : {}",
-                    compact_right(&prompt, usize::from(width).saturating_sub(13))
-                ),
-                tone: Tone::UserPrompt,
+                text: "x".to_owned(),
+                tone: Tone::Muted,
                 bold: false,
             },
         ],
     }
-    .with_picks(&[(0, Pick::RemoveQueuedPrompt(index))])
+    .with_picks(&[(2, Pick::RemoveQueuedPrompt(index))])
 }
 
 /// A steered prompt already went to the agent, so it is drawn as the same
@@ -18107,8 +18111,8 @@ mod tests {
     fn queue_preview_is_one_line_and_truncates_the_prompt() {
         let line = queue_preview_line("a very long\nqueued prompt", 0, Some("claude:opus[1m]"), 18);
 
-        assert_eq!(painted(&line), "x ▌ Queue : a ve…");
-        assert_eq!(line.tail[0].tone, Tone::ModelOpus);
+        assert_eq!(painted(&line), "▌ Queue : a v…  x");
+        assert_eq!(line.prefix_tone, Tone::ModelOpus);
         assert_eq!(line.tone, Tone::UserPrompt);
         assert_eq!(pick_on(&line, "x"), Some(Pick::RemoveQueuedPrompt(0)));
     }
@@ -18121,16 +18125,10 @@ mod tests {
             .collect::<Vec<_>>();
         let lines = queue_preview_lines(&prompts, Some("gpt-5.6-sol"), 80);
 
-        assert_eq!(
-            lines.iter().map(painted).collect::<Vec<_>>(),
-            [
-                "x ▌ Queue : first",
-                "x ▌ Queue : second",
-                "x ▌ Queue : third",
-                "x ▌ Queue : fourth"
-            ]
-        );
-        assert!(lines.iter().all(|line| line.tail[0].tone == Tone::ModelSol));
+        assert!(lines.iter().all(|line| painted(line).starts_with("▌ Queue : ")));
+        assert!(lines.iter().all(|line| painted(line).ends_with('x')));
+        assert!(lines.iter().all(|line| painted_line_width(line) == 79));
+        assert!(lines.iter().all(|line| line.prefix_tone == Tone::ModelSol));
         assert_eq!(pick_on(&lines[3], "x"), Some(Pick::RemoveQueuedPrompt(3)));
     }
 
@@ -23385,7 +23383,6 @@ mod tests {
         assert!(row_width > 16, "the row is wider than its label: {row_width}");
     }
 
-    #[test]
     /// The spinner's in-place row patch is exactly the mid-row write the host
     /// replays with neighbouring wide glyphs duplicated, so it must not run
     /// while Korean options are standing on screen waiting for a key.
@@ -23443,6 +23440,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn opening_and_closing_a_question_discards_the_panel_frame_once() {
         let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
         renderer.painted_frame = Some(CellFrame::new(80, 24));
@@ -26342,11 +26340,6 @@ mod tests {
         assert_eq!(rows, vec![0]);
     }
 
-    /// Moving the highlight through a question's Korean options restyles rows
-    /// whose screen range never moves. Those are the mid-row patches ConPTY
-    /// replays with the wide glyphs duplicated, so the picker protects none of
-    /// its rows and each changed option row repaints from column zero.
-    #[test]
     /// A modern emoji stays one cell under the xterm 6 profile while the console
     /// that replays our output sizes it as two. Such a row must reprint whole,
     /// or the patch comes back with every column after the emoji shifted.
@@ -26369,6 +26362,11 @@ mod tests {
         });
     }
 
+    /// Moving the highlight through a question's Korean options restyles rows
+    /// whose screen range never moves. Those are the mid-row patches ConPTY
+    /// replays with the wide glyphs duplicated, so the picker protects none of
+    /// its rows and each changed option row repaints from column zero.
+    #[test]
     fn an_open_question_panel_repaints_its_korean_option_rows_sequentially() {
         let mut previous = CellFrame::new(32, 3);
         previous.write(0, 0, "무엇을 할까요?", CellStyle::plain());
