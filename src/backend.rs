@@ -635,6 +635,9 @@ impl BackendServer {
                         let backing = self.ensure_codex_route(&visible, &params).await?;
                         prepare_codex_turn_context(&mut params);
                         apply_codex_tool_policy(&mut params);
+                        if method == "turn/start" {
+                            apply_codex_question_mode(&mut params)?;
+                        }
                         params["threadId"] = json!(backing);
                         self.codex()?.request(method, params).await
                     }
@@ -2427,6 +2430,26 @@ fn prepare_codex_turn_context(params: &mut Value) {
 /// Codex built-in permission profile that lets a turn read but not write.
 const CODEX_READ_ONLY_PROFILE: &str = ":read-only";
 
+/// Default-mode questions do not suspend model execution, even with the
+/// request-user-input feature enabled. Plan mode supplies the blocking runtime
+/// contract; our prompt leaves editing/review policy with the app's agent role.
+fn apply_codex_question_mode(params: &mut Value) -> Result<()> {
+    let model = params
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+        .context("질문 대기를 설정할 모델이 없습니다.")?;
+    params["collaborationMode"] = json!({
+        "mode": "plan",
+        "settings": {
+            "model": model,
+            "reasoning_effort": params.get("effort"),
+            "developer_instructions": crate::CODEX_QUESTION_INSTRUCTIONS
+        }
+    });
+    Ok(())
+}
+
 /// A role turn that may write nothing runs under Codex's read-only profile.
 /// The profile rides the same `permissions` key every turn already carries, so
 /// the next turn under a writing role restores the full-access profile on its
@@ -2647,6 +2670,10 @@ fn thread_id(params: &Value) -> Result<&str> {
         .and_then(Value::as_str)
         .context("요청에 threadId가 없습니다.")
 }
+
+#[cfg(test)]
+#[path = "codex_question_tests.rs"]
+mod question_runtime_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3152,6 +3179,36 @@ mod tests {
         let mut builder = json!({ "permissions": ":danger-full-access" });
         apply_codex_tool_policy(&mut builder);
         assert_eq!(builder, json!({ "permissions": ":danger-full-access" }));
+    }
+
+    #[test]
+    fn codex_question_mode_preserves_model_effort_and_role_permissions() {
+        for model in [
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ] {
+            for permissions in [":read-only", ":danger-full-access"] {
+                let mut params = json!({"model": model, "effort": "high", "permissions": permissions});
+                apply_codex_question_mode(&mut params).unwrap();
+                assert_eq!(params["collaborationMode"]["mode"], "plan");
+                assert_eq!(params["collaborationMode"]["settings"]["model"], model);
+                assert_eq!(
+                    params["collaborationMode"]["settings"]["reasoning_effort"],
+                    "high"
+                );
+                assert_eq!(
+                    params["collaborationMode"]["settings"]["developer_instructions"],
+                    crate::CODEX_QUESTION_INSTRUCTIONS
+                );
+                assert_eq!(params["permissions"], permissions);
+            }
+        }
+        let mut missing_effort = json!({"model": "gpt-5.6-sol"});
+        apply_codex_question_mode(&mut missing_effort).unwrap();
+        assert!(missing_effort["collaborationMode"]["settings"]["reasoning_effort"].is_null());
+        assert!(apply_codex_question_mode(&mut json!({})).is_err());
     }
 
     #[test]

@@ -2776,8 +2776,8 @@ impl Renderer {
         set_chat_layout(view.chat_layout);
         self.observe_question_overlay(view.overlay.as_ref().map(|overlay| overlay.style));
         let response_collapse_changed = self.update_response_collapse(view.response_collapse);
-        // The welcome masthead survives until the first plan, but the tip card is
-        // only a launch hint: the first prompt the user sends takes it away.
+        // The welcome masthead survives until the first plan. The first prompt
+        // removes the release notes.
         let drop_welcome = view.plan_summary.is_some();
         let drop_tip = drop_welcome
             || committed
@@ -6737,7 +6737,7 @@ fn normal_frame_with_expansion(
 ) -> Frame {
     let mut lines = Vec::new();
     if let Some(welcome) = welcome {
-        lines.extend(welcome_lines(welcome, width));
+        lines.extend(welcome_lines(welcome, width, true));
         lines.push(PaintLine::blank());
     }
     lines.extend(live_lines);
@@ -6904,12 +6904,11 @@ fn normal_frame_with_expansion(
     }
 }
 
-/// The welcome card is deliberately two rows: the product headline and the
-/// working folder. Everything else lives behind `/help` and the status line.
+/// The welcome card shows the product, working folder and Korean release notes.
 /// One blank row leads it so the headline never sits on the terminal's top edge.
-fn welcome_lines(welcome: WelcomeView, width: u16) -> Vec<PaintLine> {
+fn welcome_lines(welcome: WelcomeView, width: u16, show_news: bool) -> Vec<PaintLine> {
     let column_width = panel_span(width);
-    vec![
+    let mut lines = vec![
         PaintLine::blank(),
         plain_line(
             &format!("DEVEZ VIBE  v{}", crate::update::CURRENT_VERSION),
@@ -6921,7 +6920,19 @@ fn welcome_lines(welcome: WelcomeView, width: u16) -> Vec<PaintLine> {
             Tone::Muted,
             false,
         ),
-    ]
+    ];
+    if show_news {
+        lines.push(PaintLine::blank());
+        lines.extend(update_lines(
+            &Block::new(
+                BlockKind::Update,
+                "What's New",
+                crate::update::RELEASE_NOTES.join("\n"),
+            ),
+            width,
+        ));
+    }
+    lines
 }
 
 fn plain_line(text: &str, tone: Tone, bold: bool) -> PaintLine {
@@ -7190,21 +7201,7 @@ fn panel_bottom(inner_width: usize) -> PaintLine {
 
 /// Release notes use the same compact heading-and-rows rhythm as the task list.
 fn update_lines(block: &Block, width: u16) -> Vec<PaintLine> {
-    let max_width = panel_span(width);
-    let line_width = if is_startup_update(block) {
-        let title_width = UnicodeWidthStr::width(block.title.as_str()) + 6;
-        let body_width = block
-            .body
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(UnicodeWidthStr::width)
-            .max()
-            .unwrap_or_default()
-            + 15;
-        title_width.max(body_width).min(max_width)
-    } else {
-        max_width
-    };
+    let line_width = panel_span(width);
     let title = compact_text(&block.title, line_width.saturating_sub(7));
     let title_width = UnicodeWidthStr::width(title.as_str());
     let rule = "─".repeat(line_width.saturating_sub(6 + title_width));
@@ -7215,11 +7212,6 @@ fn update_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         },
         PaintLine::blank(),
     ];
-    let wrap_width = if is_startup_update(block) {
-        line_width.saturating_sub(1).min(u16::MAX as usize) as u16
-    } else {
-        width
-    };
     for note in block.body.lines().filter(|line| !line.trim().is_empty()) {
         lines.extend(wrapped_line(
             "  •  ",
@@ -7227,7 +7219,7 @@ fn update_lines(block: &Block, width: u16) -> Vec<PaintLine> {
             note,
             Tone::Muted,
             false,
-            wrap_width,
+            width,
         ));
     }
     lines.push(PaintLine::blank());
@@ -7240,7 +7232,7 @@ fn update_lines(block: &Block, width: u16) -> Vec<PaintLine> {
 }
 
 fn is_startup_update(block: &Block) -> bool {
-    matches!(block.kind, BlockKind::Update) && block.title == "Tip"
+    matches!(block.kind, BlockKind::Update) && block.title == "What's New"
 }
 
 /// `/help` output. It is a reference sheet, not a notice, so it drops the
@@ -7791,7 +7783,7 @@ fn overlay_frame_with_expansion(
     // `/model`, `/effort` or `/resume` is open. On a short terminal `fit_frame`
     // trims it from the top, the same way it does under the normal frame.
     if let Some(welcome) = welcome {
-        lines.extend(welcome_lines(welcome, width));
+        lines.extend(welcome_lines(welcome, width, true));
         lines.push(PaintLine::blank());
     }
     lines.extend(live_lines);
@@ -10585,6 +10577,7 @@ fn block_lines_with_mode_at(
                 credits: values.map(ToOwned::to_owned).collect(),
             },
             width,
+            false,
         );
         lines.push(PaintLine::blank());
         return lines;
@@ -16561,51 +16554,9 @@ mod tests {
     }
 
     #[test]
-    fn startup_tip_fits_its_longest_item_with_ten_right_padding_columns() {
-        let longest = "/side-panel (Alt + P): Toggle side panel";
-        let block = Block::new(
-            BlockKind::Update,
-            "Tip",
-            format!("/provider: Set provider\n{longest}\nShift + ↑↓ model · ←→ effort"),
-        );
-        let lines = block_lines(&block, 80);
-        let expected_width = UnicodeWidthStr::width(longest) + 15;
-        let longest_line = lines
-            .iter()
-            .find(|line| line.text == longest)
-            .expect("longest tip");
-
-        assert_eq!(
-            UnicodeWidthStr::width(painted(&lines[0]).as_str()),
-            expected_width
-        );
-        assert_eq!(
-            UnicodeWidthStr::width(painted(&lines[lines.len() - 2]).as_str()),
-            expected_width
-        );
-        assert_eq!(
-            expected_width - UnicodeWidthStr::width(painted(longest_line).as_str()),
-            10
-        );
-
-        let narrow = block_lines(&block, 24);
-        assert_eq!(UnicodeWidthStr::width(painted(&narrow[0]).as_str()), 23);
-        assert_eq!(
-            UnicodeWidthStr::width(painted(&narrow[narrow.len() - 2]).as_str()),
-            23
-        );
-        assert!(
-            narrow[2..narrow.len() - 2]
-                .iter()
-                .filter(|line| !painted(line).is_empty())
-                .all(|line| UnicodeWidthStr::width(painted(line).as_str()) <= 21)
-        );
-    }
-
-    #[test]
     fn first_plan_removes_only_the_startup_tip() {
         for mode in [RenderMode::Fullscreen, RenderMode::Inline] {
-            let startup = Block::new(BlockKind::Update, "Tip", "/provider");
+            let startup = Block::new(BlockKind::Update, "What's New", "/provider");
             let available = Block::new(
                 BlockKind::Update,
                 "Update Available",
@@ -16631,17 +16582,27 @@ mod tests {
     }
 
     #[test]
-    fn first_prompt_removes_the_tip_but_keeps_the_welcome() {
+    fn first_prompt_removes_news_but_keeps_the_welcome() {
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
         renderer.history = vec![
             Block::welcome("Codex", "Super Vibe", "D:\\hojeSource\\Devez-vibe", "", &[]),
-            Block::new(BlockKind::Update, "Tip", "/provider"),
+            Block::new(BlockKind::Update, "What's New", "/provider"),
+            Block::new(BlockKind::Update, "What's New", crate::update::RELEASE_NOTES.join("\n")),
             Block::new(BlockKind::User, "Codex", "첫 프롬프트"),
         ];
+        let news = block_lines(&renderer.history[2], 80);
+        assert!(news.iter().any(|line| painted(line).contains("What's New")));
         renderer.wrapped_width = 80;
 
         assert!(renderer.remove_startup_update_from_history(false));
         assert!(!renderer.history.iter().any(is_startup_update));
+        let remaining = renderer.history.iter()
+            .flat_map(|block| block_lines(block, 80))
+            .map(|line| painted(&line))
+            .collect::<Vec<_>>().join("\n");
+        assert!(!remaining.contains("What's New"));
+        assert!(remaining.contains("DEVEZ VIBE"));
+        assert!(remaining.contains("첫 프롬프트"));
         assert!(renderer
             .history
             .iter()
@@ -20862,7 +20823,7 @@ mod tests {
         let width = 120;
         let committed = vec![
             Block::welcome("Codex", "Super Vibe", "D:\\hojeSource\\Devez-vibe", "", &[]),
-            Block::new(BlockKind::Update, "Tip", "/provider: Set provider"),
+            Block::new(BlockKind::Update, "What's New", "/provider: Set provider"),
             Block::new(BlockKind::User, "Codex", "첫 프롬프트 위치 기준"),
         ];
         let answer = Block::new(
@@ -20923,7 +20884,7 @@ mod tests {
                             "",
                             &[],
                         ),
-                        Block::new(BlockKind::Update, "Tip", "/provider: Set provider"),
+                        Block::new(BlockKind::Update, "What's New", "/provider: Set provider"),
                         Block::new(BlockKind::User, "Claude", "첫 프롬프트 위치 기준"),
                     ];
                     simulate_fullscreen_frame(
@@ -22733,15 +22694,24 @@ mod tests {
     }
 
     #[test]
-    fn the_welcome_card_is_two_borderless_rows_under_one_blank_row() {
+    fn the_welcome_card_frames_korean_news_with_an_english_heading() {
         for width in [28u16, 70, 140] {
-            let lines = welcome_lines(test_welcome(), width);
+            let lines = welcome_lines(test_welcome(), width, true);
 
-            assert_eq!(
-                lines.len(),
-                3,
-                "width {width}: expected one blank row and two content rows"
-            );
+            let heading = painted(&lines[4]);
+            assert!(heading.starts_with("┌── What's New "));
+            assert!(heading.ends_with('┐'));
+            let bottom = painted(&lines[lines.len() - 2]);
+            assert!(bottom.starts_with('└'));
+            assert!(bottom.ends_with('┘'));
+            assert_eq!(UnicodeWidthStr::width(heading.as_str()), UnicodeWidthStr::width(bottom.as_str()));
+            let news = lines[5..]
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<String>();
+            for note in crate::update::RELEASE_NOTES {
+                assert!(news.replace(' ', "").contains(&note.replace(' ', "")));
+            }
             assert!(
                 lines[0] == PaintLine::blank(),
                 "width {width}: the leading blank row is missing"
@@ -22772,14 +22742,14 @@ mod tests {
     }
 
     #[test]
-    fn the_welcome_card_drops_plan_credits_and_release_notes() {
-        let painted_card = welcome_lines(test_welcome(), 110)
+    fn the_welcome_card_drops_account_details() {
+        let painted_card = welcome_lines(test_welcome(), 110, true)
             .iter()
             .map(painted)
             .collect::<Vec<_>>()
             .join("\n");
 
-        for gone in ["Plan", "Resets", "Account", "What's new", "2026-08-01"] {
+        for gone in ["Plan", "Resets", "Account", "2026-08-01"] {
             assert!(
                 !painted_card.contains(gone),
                 "{gone} still on the welcome card: {painted_card}"
@@ -23403,6 +23373,49 @@ mod tests {
             painted.iter().any(|line| line.contains("답변")),
             "the typed answer never reached the panel: {painted:?}"
         );
+    }
+
+    #[test]
+    fn codex_and_claude_questions_paint_the_same_selection_panel() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let questions = serde_json::json!({"questions": [{
+            "id": "q1", "header": "선택", "question": "어떤 방법을 쓸까요?",
+            "options": [{"label": "첫째", "description": "첫 방법"},
+                        {"label": "둘째", "description": "둘째 방법"}]
+        }]});
+        let mut codex = questions.clone();
+        codex["isBlocking"] = serde_json::json!(true);
+        let claude = serde_json::json!({"encoding": "base64-json",
+            "payload": STANDARD.encode(serde_json::to_vec(&questions).unwrap())});
+        let mut panels = Vec::new();
+        for (model, params) in [("gpt-5.6-sol", codex), ("claude:opus", claude)] {
+            let mut state = crate::state::AppState::new(
+                "thread".into(),
+                "cwd".into(),
+                "account".into(),
+                Vec::new(),
+                model,
+                None,
+            );
+            state.begin_server_request(serde_json::json!(1), "item/tool/requestUserInput", &params);
+            let view = state.view();
+            let frame = overlay_frame(
+                &[],
+                view.overlay.unwrap(),
+                None,
+                StatusArea {
+                    fallback: String::new(),
+                    line: None,
+                    composer_notice: None,
+                    composer_mode: None,
+                },
+                80,
+            );
+            panels.push(frame.lines.iter().map(painted).collect::<Vec<_>>());
+        }
+        assert_eq!(panels[0], panels[1]);
+        assert!(panels[0].iter().any(|line| line.contains("첫째")));
+        assert!(panels[0].iter().any(|line| line.contains("둘째")));
     }
 
     /// The answer is written on the row it was picked on, with the options still

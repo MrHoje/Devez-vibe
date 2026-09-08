@@ -3641,7 +3641,6 @@ pub struct AppState {
     /// repeated searches/tool results from producing identical transcript rows.
     seen_operation_signatures: HashSet<String>,
     pending: Option<PendingInteraction>,
-    pending_user_input_deadline: Option<(Value, Instant)>,
     /// Tokens the *current* prompt occupies, not the thread's running tally.
     /// The tally climbs past the window on every turn and is not a context gauge.
     context_tokens: u64,
@@ -3909,7 +3908,6 @@ impl AppState {
             completed_item_ids: HashSet::new(),
             seen_operation_signatures: HashSet::new(),
             pending: None,
-            pending_user_input_deadline: None,
             context_tokens: 0,
             token_totals: TokenTotals::default(),
             cost_ledger: Some(CostLedger::default()),
@@ -5856,7 +5854,7 @@ impl AppState {
     /// The answer decides whether the wait ends — silence alone never does, since
     /// a long think looks exactly the same from here.
     pub fn take_stall_probe(&mut self) -> Option<String> {
-        if !self.busy || self.compacting() {
+        if !self.busy || self.compacting() || self.awaiting_input() {
             self.stall_probe_at = None;
             return None;
         }
@@ -5877,7 +5875,7 @@ impl AppState {
     /// The runtime reports the turn we are still waiting on is over: its
     /// `turn/completed` never arrived, so end the wait exactly as that would have.
     pub fn resolve_stall_probe(&mut self, turn_id: &str) -> bool {
-        if !self.busy || self.turn_id.as_deref() != Some(turn_id) {
+        if !self.busy || self.turn_id.as_deref() != Some(turn_id) || self.awaiting_input() {
             return false;
         }
         self.stall_probe_at = None;
@@ -7673,7 +7671,20 @@ impl AppState {
     }
 
     pub fn begin_server_request(&mut self, id: Value, method: &str, params: &Value) -> Action {
+        if method == "item/tool/requestUserInput" {
+            // A modal takes over the frame. Apply any paced turn boundary first
+            // so cancelling this question cannot target the preceding turn.
+            self.flush_before_question();
+        }
         if self.pending.is_some() {
+            if method == "item/tool/requestUserInput" {
+                self.push_notice(
+                    BlockKind::Error,
+                    "질문 대기 실패",
+                    "답변을 기다리는 동안 다른 질문이 도착해 작업을 중단합니다.",
+                );
+                return self.cancel_user_question(id);
+            }
             if method == "mcpServer/elicitation/request" {
                 return Action::RpcResponse {
                     id,
@@ -7821,11 +7832,29 @@ impl AppState {
             }
             "item/tool/requestUserInput" => {
                 let questions = parse_questions(params);
-                if questions.is_empty() {
-                    return Action::RpcResponse {
-                        id,
-                        result: json!({ "answers": {} }),
-                    };
+                if params.get("isBlocking").and_then(Value::as_bool) == Some(false)
+                    || questions.is_empty()
+                    || questions.iter().any(|question| {
+                        question.id.trim().is_empty()
+                            || question.question.trim().is_empty()
+                            || question
+                                .options
+                                .iter()
+                                .any(|option| option.label.trim().is_empty())
+                    })
+                    || questions
+                        .iter()
+                        .map(|question| &question.id)
+                        .collect::<HashSet<_>>()
+                        .len()
+                        != questions.len()
+                {
+                    self.push_notice(
+                        BlockKind::Error,
+                        "질문 대기 실패",
+                        "답변을 안전하게 기다릴 수 없는 질문입니다. 작업을 중단합니다.",
+                    );
+                    return self.cancel_user_question(id);
                 }
                 self.finish_active_turn_prompt(Instant::now());
                 self.pending = Some(PendingInteraction::UserInput {
@@ -7836,11 +7865,6 @@ impl AppState {
                     editor: Editor::default(),
                     answers: BTreeMap::new(),
                 });
-                self.pending_user_input_deadline = params
-                    .get("autoResolutionMs")
-                    .and_then(Value::as_u64)
-                    .and_then(|millis| Instant::now().checked_add(Duration::from_millis(millis)))
-                    .map(|deadline| (id.clone(), deadline));
                 Action::None
             }
             "mcpServer/elicitation/request" => {
@@ -7954,33 +7978,65 @@ impl AppState {
         if matches {
             self.pending = None;
         }
-        if self
-            .pending_user_input_deadline
-            .as_ref()
-            .is_some_and(|(id, _)| id == request_id)
-        {
-            self.pending_user_input_deadline = None;
-        }
     }
 
-    pub fn take_expired_user_input_response(&mut self) -> Option<Action> {
-        let (request_id, deadline) = self.pending_user_input_deadline.as_ref()?;
-        if Instant::now() < *deadline {
+    fn cancel_user_question(&mut self, id: Value) -> Action {
+        self.clear_resolved_server_request(&id);
+        let interrupt = matches!(self.request_interrupt(), Action::Interrupt);
+        Action::CancelUserInput { id, interrupt }
+    }
+
+    fn flush_before_question(&mut self) {
+        self.flush_stream_text();
+        self.held_final_frame_ticks = 0;
+        self.release_held_notifications(false);
+    }
+
+    /// Older/incompatible runtimes can publish an async question as plain text.
+    /// Never let that look like an answered modal and continue the user's work.
+    pub fn reject_unanswered_question(&mut self, method: &str, params: &Value) -> Option<Action> {
+        if params
+            .get("threadId")
+            .and_then(Value::as_str)
+            .is_some_and(|thread| !self.names_this_thread(thread))
+        {
             return None;
         }
-        let request_id = request_id.clone();
-        self.pending_user_input_deadline = None;
-        if !matches!(
-            self.pending.as_ref(),
-            Some(PendingInteraction::UserInput { id, .. }) if id == &request_id
-        ) {
+        // Our answer handler removes the prompt before sending the response.
+        // Resolving a still-visible question therefore is not a user answer.
+        if let Some(PendingInteraction::UserInput { id, .. }) = &self.pending
+            && ((method == "serverRequest/resolved" && params.get("requestId") == Some(id))
+                || (method == "turn/completed"
+                    && params
+                        .pointer("/turn/id")
+                        .and_then(Value::as_str)
+                        .is_none_or(|turn| self.turn_id.as_deref() == Some(turn))))
+        {
+            self.pending = None;
+            self.push_notice(
+                BlockKind::Error,
+                "질문 대기 중단",
+                "답변 전에 질문이 종료되어 작업을 중단합니다. 사용자의 새 지시를 기다립니다.",
+            );
+            return Some(self.request_interrupt());
+        }
+        if method != "item/completed"
+            || params.pointer("/item/type").and_then(Value::as_str) != Some("agentMessage")
+            || params.pointer("/item/delivery").and_then(Value::as_str) != Some("async")
+            || params
+                .pointer("/item/questions")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+        {
             return None;
         }
-        self.pending = None;
-        Some(Action::RpcResponse {
-            id: request_id,
-            result: json!({ "answers": {} }),
-        })
+        self.flush_before_question();
+        self.push_notice(
+            BlockKind::Error,
+            "질문 대기 실패",
+            "응답 대기 대신 비동기 질문이 전달되어 작업을 중단합니다. 답변 없이 계속하지 않습니다.",
+        );
+        Some(self.request_interrupt())
     }
 
     /// The runtime names one Claude session two ways — bare, and `claude:`-prefixed.
@@ -9039,6 +9095,9 @@ impl AppState {
     /// The handoff stays armed until its prompt actually starts a turn (see
     /// `submit_text`), since a drained prompt can bounce back into the queue.
     pub fn take_queued_prompt(&mut self) -> Option<String> {
+        if self.turn_interrupted || self.awaiting_input() {
+            return None;
+        }
         self.queued_prompts.pop_front()
     }
 
@@ -10801,9 +10860,7 @@ impl AppState {
                 if key.code == KeyCode::Esc {
                     // 순정과 같게: Esc는 답을 보내지 않고 턴을 멈춘다. 빈 답을
                     // 돌려주면 도구가 성공한 셈이 되어 턴이 그대로 이어진다.
-                    self.clear_resolved_server_request(&id);
-                    let interrupt = matches!(self.request_interrupt(), Action::Interrupt);
-                    return Action::CancelUserInput { id, interrupt };
+                    return self.cancel_user_question(id);
                 }
 
                 let question = &questions[current];
@@ -10930,13 +10987,10 @@ impl AppState {
                                     id, questions, current, answers, self,
                                 );
                             }
-                            // Chatting instead answers nothing: the tool gets
-                            // what has been answered so far, exactly as Esc.
+                            // Leaving the question is cancellation, not an empty
+                            // successful answer that could resume execution.
                             if selected == chat_instead {
-                                return Action::RpcResponse {
-                                    id,
-                                    result: answers_response(&answers),
-                                };
+                                return self.cancel_user_question(id);
                             }
                             // Focusing the free-text row is enough. The next key is
                             // input immediately; no hidden Enter-only mode exists.
@@ -13384,10 +13438,7 @@ impl AppState {
                             next_question_or_reply(id, questions, current, answers, self)
                         }
                     }
-                    Some(clicked) if clicked == chat_instead => Action::RpcResponse {
-                        id,
-                        result: answers_response(&answers),
-                    },
+                    Some(clicked) if clicked == chat_instead => self.cancel_user_question(id),
                     Some(clicked) if clicked == question.options.len() && question.allow_other => {
                         self.pending = Some(PendingInteraction::UserInput {
                             id,
@@ -13683,6 +13734,11 @@ impl AppState {
             &welcome.cwd,
             &welcome.account,
             &welcome.credits,
+        ));
+        self.committed.push(Block::new(
+            BlockKind::Update,
+            "What's New",
+            crate::update::RELEASE_NOTES.join("\n"),
         ));
         self.show_welcome = false;
     }
@@ -14216,6 +14272,13 @@ fn advance_question(
     typed: bool,
 ) -> Action {
     if current + 1 == questions.len() {
+        if let Some(unanswered) = questions.iter().position(|question| {
+            !answers.get(&question.id).is_some_and(|answers| {
+                !answers.is_empty() && answers.iter().all(|answer| !answer.trim().is_empty())
+            })
+        }) {
+            return show_question(id, questions, unanswered, answers, state);
+        }
         commit_user_input_answers(state, &questions, &answers);
         // An approved Planner handoff continues on its own: the structured
         // answer (not free text) arms the role switch and queues the
@@ -14558,13 +14621,13 @@ fn parse_questions(params: &Value) -> Vec<Question> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|question| {
+        .map(|question| {
             let options = question
                 .get("options")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter_map(|option| {
+                .map(|option| {
                     Some(QuestionOption {
                         label: option.get("label")?.as_str()?.to_owned(),
                         description: option
@@ -14574,7 +14637,7 @@ fn parse_questions(params: &Value) -> Vec<Question> {
                             .to_owned(),
                     })
                 })
-                .collect();
+                .collect::<Option<Vec<_>>>()?;
             Some(Question {
                 id: question.get("id")?.as_str()?.to_owned(),
                 header: question
@@ -14594,7 +14657,8 @@ fn parse_questions(params: &Value) -> Vec<Question> {
                     .unwrap_or(false),
             })
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
 }
 
 fn assistant_phase(item: &Value) -> AssistantPhase {
@@ -16665,6 +16729,23 @@ mod tests {
         state.handle_key(ctrl_s);
         state.handle_key(ctrl_s);
         assert_eq!(state.editor.text(), "newer draft");
+    }
+
+    #[test]
+    fn help_replaces_tip_and_whatsnew_commands() {
+        let mut state = test_state();
+        state.editor.set_text("/");
+        let commands = state.matching_slash_commands();
+        assert!(commands.iter().any(|entry| entry.name == "/help"));
+        for removed in ["/tip", "/whatsnew"] {
+            assert!(!commands.iter().any(|entry| entry.name == removed));
+        }
+        assert!(matches!(state.run_slash_command("/help"), Action::None));
+        let help = state.committed.last().unwrap();
+        assert_eq!(help.title, "Commands");
+        assert!(help.body.contains("Tab"));
+        assert!(!help.body.contains("/tip"));
+        assert!(!help.body.contains("/whatsnew"));
     }
 
     #[test]
@@ -19534,14 +19615,11 @@ mod tests {
             }),
         );
 
-        // The welcome card is committed on the first plan update; the plan itself
-        // stays in the fixed panel instead of becoming a transcript card.
-        assert!(
-            state
-                .committed
-                .iter()
-                .all(|block| matches!(block.kind, BlockKind::Welcome))
-        );
+        // Only the startup welcome and news are committed. The plan stays in
+        // its fixed panel instead of becoming a transcript card.
+        assert_eq!(state.committed.len(), 2);
+        assert!(matches!(state.committed[0].kind, BlockKind::Welcome));
+        assert_eq!(state.committed[1].title, "What's New");
         assert_eq!(
             state
                 .plan_summary
@@ -20923,7 +21001,8 @@ mod tests {
         let blocks = state.drain_committed();
 
         assert!(matches!(blocks[0].kind, BlockKind::Welcome));
-        assert!(matches!(blocks[1].kind, BlockKind::System));
+        assert_eq!(blocks[1].title, "What's New");
+        assert!(matches!(blocks[2].kind, BlockKind::System));
         assert!(!state.show_welcome);
     }
 
@@ -20947,7 +21026,7 @@ mod tests {
     }
 
     #[test]
-    fn model_change_commits_only_the_welcome_card() {
+    fn model_change_keeps_welcome_and_news_until_the_first_prompt() {
         let mut state = test_state();
         state
             .models
@@ -20956,7 +21035,8 @@ mod tests {
         state.apply_model(1, Some("xhigh"));
 
         assert!(matches!(state.committed[0].kind, BlockKind::Welcome));
-        assert_eq!(state.committed.len(), 1);
+        assert_eq!(state.committed.len(), 2);
+        assert_eq!(state.committed[1].title, "What's New");
         assert!(!state.show_welcome);
     }
 
@@ -20969,7 +21049,8 @@ mod tests {
 
         assert!(matches!(action, Action::Submit(message) if message == "hello"));
         assert!(matches!(state.committed[0].kind, BlockKind::Welcome));
-        assert!(matches!(state.committed[1].kind, BlockKind::User));
+        assert_eq!(state.committed[1].title, "What's New");
+        assert!(matches!(state.committed[2].kind, BlockKind::User));
         assert!(!state.show_welcome);
     }
 
@@ -24790,8 +24871,9 @@ mod tests {
     }
 
     #[test]
-    fn user_input_auto_resolution_sends_one_empty_answer() {
-        let mut state = test_state();
+    fn user_input_never_auto_answers_even_with_a_zero_timeout() {
+        let mut state = busy_state_with_live_turn();
+        state.queued_prompts.push_back("나중 작업".into());
         state.begin_server_request(
             json!(41),
             "item/tool/requestUserInput",
@@ -24805,18 +24887,19 @@ mod tests {
             }),
         );
 
-        let Some(Action::RpcResponse { id, result }) = state.take_expired_user_input_response()
-        else {
-            panic!("expired question should submit an empty answer");
-        };
-        assert_eq!(id, json!(41));
-        assert_eq!(result, json!({ "answers": {} }));
-        assert!(state.pending.is_none());
-        assert!(state.take_expired_user_input_response().is_none());
+        for _ in 0..100 {
+            state.render_tick();
+            assert!(state.awaiting_input());
+            assert!(state.take_queued_prompt().is_none());
+        }
+        let action = state.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, Action::RpcResponse { result, .. }
+            if result["answers"]["q1"]["answers"] == json!(["예"])));
+        assert!(!state.awaiting_input());
     }
 
     #[test]
-    fn resolved_or_user_answered_question_wins_the_auto_resolution_race() {
+    fn resolved_or_user_answered_question_closes_only_once() {
         let question = json!({
             "autoResolutionMs": 0,
             "questions": [{
@@ -24829,7 +24912,9 @@ mod tests {
         let mut resolved = test_state();
         resolved.begin_server_request(json!(42), "item/tool/requestUserInput", &question);
         resolved.handle_notification("serverRequest/resolved", &json!({ "requestId": 42 }));
-        assert!(resolved.take_expired_user_input_response().is_none());
+        assert!(!resolved.awaiting_input());
+        resolved.handle_notification("serverRequest/resolved", &json!({ "requestId": 42 }));
+        assert!(!resolved.awaiting_input());
 
         let mut answered = test_state();
         answered.begin_server_request(json!(43), "item/tool/requestUserInput", &question);
@@ -24837,7 +24922,249 @@ mod tests {
             answered.handle_key(KeyEvent::from(KeyCode::Enter)),
             Action::RpcResponse { .. }
         ));
-        assert!(answered.take_expired_user_input_response().is_none());
+        assert!(!answered.awaiting_input());
+        assert!(!matches!(
+            answered.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::RpcResponse { .. }
+        ));
+    }
+
+    fn blocking_test_question() -> Value {
+        json!({"isBlocking": true, "questions": [{"id": "q1", "question": "선택하세요",
+            "options": [{"label": "첫째"}, {"label": "둘째"}]}]})
+    }
+
+    #[test]
+    fn unanswered_question_cannot_be_released_by_stall_checks_or_remote_resolution() {
+        for notification in ["serverRequest/resolved", "turn/completed"] {
+            let mut state = busy_state_with_live_turn();
+            state.begin_server_request(
+                json!(9),
+                "item/tool/requestUserInput",
+                &blocking_test_question(),
+            );
+            state.turn_progress_at = Some(Instant::now() - TURN_STALL_SILENCE * 100);
+            assert!(state.take_stall_probe().is_none());
+            assert!(!state.resolve_stall_probe("live-turn"));
+            assert!(state.awaiting_input());
+            state.queued_prompts.push_back("다음 작업".into());
+            let params = json!({"threadId": "main-thread", "requestId": 9,
+                "turn": {"id": "live-turn", "status": "completed"}});
+            assert!(matches!(
+                state.reject_unanswered_question(notification, &params),
+                Some(Action::Interrupt)
+            ));
+            assert!(state.turn_interrupted);
+            assert!(state.take_queued_prompt().is_none());
+        }
+        let mut state = busy_state_with_live_turn();
+        state.begin_server_request(
+            json!(9),
+            "item/tool/requestUserInput",
+            &blocking_test_question(),
+        );
+        assert!(
+            state
+                .reject_unanswered_question("serverRequest/resolved", &json!({"requestId": 10}))
+                .is_none()
+        );
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            state
+                .reject_unanswered_question("serverRequest/resolved", &json!({"requestId": 9}))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn empty_direct_answer_and_repeated_enter_cannot_skip_the_question() {
+        let mut state = busy_state_with_live_turn();
+        state.begin_server_request(
+            json!(9),
+            "item/tool/requestUserInput",
+            &blocking_test_question(),
+        );
+        state.handle_key(KeyEvent::from(KeyCode::Char('3')));
+        for _ in 0..3 {
+            assert!(matches!(
+                state.handle_key(KeyEvent::from(KeyCode::Enter)),
+                Action::None
+            ));
+            assert!(state.awaiting_input());
+        }
+        state.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(state.awaiting_input());
+    }
+
+    #[test]
+    fn asynchronous_question_after_paced_text_stops_the_correct_turn() {
+        let mut state = busy_state_with_live_turn();
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({"itemId": "old-answer", "delta": "이전 답변"}),
+        );
+        state.handle_notification("turn/completed", &json!({"turn": {"id": "live-turn"}}));
+        state.handle_notification("turn/started", &json!({"turn": {"id": "next-turn"}}));
+        let params = json!({"threadId": "main-thread", "item": {"type": "agentMessage", "delivery": "async", "questions": [{"title": "선택하세요"}]}});
+        assert!(matches!(
+            state.reject_unanswered_question("item/completed", &params),
+            Some(Action::Interrupt)
+        ));
+        assert_eq!(state.turn_id.as_deref(), Some("next-turn"));
+    }
+
+    #[test]
+    fn question_cancellation_targets_the_new_turn_behind_paced_text() {
+        let mut state = busy_state_with_live_turn();
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({"itemId": "old-answer", "delta": "아직 표시하지 않은 이전 답변"}),
+        );
+        state.handle_notification(
+            "turn/completed",
+            &json!({"turn": {"id": "live-turn", "status": "completed"}}),
+        );
+        state.handle_notification("turn/started", &json!({"turn": {"id": "new-turn"}}));
+        assert_eq!(state.turn_id.as_deref(), Some("live-turn"));
+        state.begin_server_request(
+            json!(9),
+            "item/tool/requestUserInput",
+            &blocking_test_question(),
+        );
+        assert_eq!(state.turn_id.as_deref(), Some("new-turn"));
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Esc)),
+            Action::CancelUserInput {
+                interrupt: true,
+                ..
+            }
+        ));
+        assert_eq!(state.turn_id.as_deref(), Some("new-turn"));
+    }
+
+    #[test]
+    fn malformed_and_nonblocking_questions_stop_instead_of_answering_empty() {
+        let mut nonblocking = blocking_test_question();
+        nonblocking["isBlocking"] = json!(false);
+        for question in [
+            nonblocking,
+            json!({"questions": []}),
+            json!({"questions": [{"id": "q1", "question": ""}]}),
+            json!({"questions": [{"id": "q1", "question": "정상"}, {"id": "q2"}]}),
+            json!({"questions": [{"id": "q1", "question": "정상", "options": [{}]}]}),
+            json!({"questions": [{"id": "q1", "question": "첫 질문"}, {"id": "q1", "question": "둘째 질문"}]}),
+        ] {
+            let mut state = busy_state_with_live_turn();
+            assert!(matches!(
+                state.begin_server_request(json!(9), "item/tool/requestUserInput", &question),
+                Action::CancelUserInput {
+                    interrupt: true,
+                    ..
+                }
+            ));
+            assert!(state.turn_interrupted);
+        }
+    }
+
+    #[test]
+    fn chat_instead_cancels_from_keyboard_and_mouse_without_releasing_queued_work() {
+        for mouse in [false, true] {
+            let mut state = busy_state_with_live_turn();
+            state.queued_prompts.push_back("다음 작업".into());
+            state.begin_server_request(
+                json!(9),
+                "item/tool/requestUserInput",
+                &blocking_test_question(),
+            );
+            let action = if mouse {
+                state.click_overlay_row(4)
+            } else {
+                state.handle_key(KeyEvent::from(KeyCode::Char('4')))
+            };
+            assert!(matches!(
+                action,
+                Action::CancelUserInput {
+                    interrupt: true,
+                    ..
+                }
+            ));
+            state.handle_notification(
+                "turn/completed",
+                &json!({"turn": {"status": "interrupted"}}),
+            );
+            assert!(state.take_queued_prompt().is_none());
+            assert_eq!(state.queued_prompts.len(), 1);
+            assert!(!state.awaiting_input());
+        }
+    }
+
+    #[test]
+    fn jumping_to_the_last_question_does_not_submit_partial_answers() {
+        let mut state = busy_state_with_live_turn();
+        let mut question = blocking_test_question();
+        question["questions"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id": "q2", "question": "둘째 질문", "options": [{"label": "답"}]}));
+        state.begin_server_request(json!(9), "item/tool/requestUserInput", &question);
+        state.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(
+            matches!(&state.pending, Some(PendingInteraction::UserInput { current: 0, answers, .. }) if answers.len() == 1)
+        );
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        let result = state.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(result, Action::RpcResponse { result, .. } if result["answers"].as_object().unwrap().len() == 2)
+        );
+    }
+
+    #[test]
+    fn repeated_questions_stop_and_async_messages_cannot_bypass_the_wait() {
+        let mut state = busy_state_with_live_turn();
+        state.begin_server_request(
+            json!(9),
+            "item/tool/requestUserInput",
+            &blocking_test_question(),
+        );
+        assert!(matches!(
+            state.begin_server_request(
+                json!(10),
+                "item/tool/requestUserInput",
+                &blocking_test_question()
+            ),
+            Action::CancelUserInput {
+                interrupt: true,
+                ..
+            }
+        ));
+        let mut state = busy_state_with_live_turn();
+        let mut params = json!({"threadId": "main-thread", "item": {"type": "agentMessage", "delivery": "async", "questions": [{"title": "선택하세요", "options": ["첫째", "둘째"]}]}});
+        assert!(matches!(
+            state.reject_unanswered_question("item/completed", &params),
+            Some(Action::Interrupt)
+        ));
+        assert!(state.turn_interrupted);
+        params["threadId"] = json!("another-thread");
+        assert!(
+            state
+                .reject_unanswered_question("item/completed", &params)
+                .is_none()
+        );
+        params["threadId"] = json!("main-thread");
+        params["item"]["delivery"] = Value::Null;
+        assert!(
+            state
+                .reject_unanswered_question("item/completed", &params)
+                .is_none()
+        );
     }
 
     #[test]

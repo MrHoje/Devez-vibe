@@ -70,6 +70,16 @@ Codex 0.x.y 기준으로 호환성 업데이트해
 
 ## 확인 기록
 
+### 선택 질문의 응답 대기
+
+- 0.153.4에서 일반 모드의 `request_user_input`은 기능을 켜도 `isBlocking: false`다. Astra의 `request_user_input_async`는 `agentMessage`의 `delivery: async`와 `questions`로 전달되어 기존 선택 창 요청과 다르다.
+- 매 `turn/start`에 `collaborationMode.mode: plan`과 별도의 `settings.developer_instructions`를 함께 전달한다. 전자는 실행을 멈추는 질문을 활성화하고, 후자는 내장 계획 전용 지침을 대체하여 실제 계획·수정·검토 범위는 DevezVibe 역할에 맡긴다. 설정 중 하나만 바꾸면 일반 모드에서 작업이 계속되거나 개발 역할이 계획만 하는 회귀가 생긴다.
+- 선택 모델·추론 수준·역할별 쓰기 권한은 유지한다. `turn/steer`는 진행 중인 턴의 설정을 바꾸지 않는다. 새 대화·재개·제공자 전환·곁가지 대화 모두 공통 `turn/start` 경로를 사용한다.
+- 질문은 시간 경과로 자동 응답하지 않는다. Codex의 취소는 빈 답변을 보내지 않고 턴을 중단한다. 건너뛴 질문의 일부 답변만 제출하지 않으며, 비동기 질문이 들어오면 작업을 중단한다. 질문을 열기 전에 밀린 화면 상태를 반영하여 취소 대상 턴이 이전 턴으로 남지 않게 한다.
+- 다음 Codex 갱신 때 `cargo test -- --ignored`를 무작정 실행하지 말고, `cargo test live_codex_question -- --ignored --nocapture`로 실제 모델을 사용하는 질문 시험을 명시적으로 실행한다. 모델별 무응답 중 후속 실행 없음·답변 후 파일 생성·취소 후 파일 미생성·새 지시로 재개를 대조한다.
+- 2026-09-08 검증: 일반 시험 1,201개와 Astra·Sol·Terra·Luna 실제 시험 4개를 통과했다. 각 모델에서 답변과 취소 전 각각 30초 동안 파일 생성·후속 도구·최종 응답이 없었으며, 직접 입력한 답변 이후에만 파일이 생성되고 취소한 파일은 새 작업 재개 후에도 생성되지 않았다. 같은 질문의 Claude·Codex 렌더링 결과도 일치했다.
+- 별도 비판적 재검증으로 화면 출력 지연 중 취소 대상 턴, 빈 입력·일부 답변·중복 질문·대기열 재개, 오래된 상태 조회와 서버의 자동 종료 알림을 시험했다. 사용자 답변 없는 질문 해제는 정상 재개로 처리하지 않는다.
+
 | 날짜 | 확인 Codex 버전 | 결과 | 비고 |
 | --- | --- | --- | --- |
 | 2026-08-13 | 0.147.0 | 반영 완료 | MCP 2026-07-28 프로토콜이 `features.mcp_2026_07_28` opt-in으로 추가돼 app-server 실행 시 `-c`로 켠다(사용자 config 선언이 있으면 존중). 이 opt-in은 Codex가 개발 중 기능 경고를 출력하게 하므로 같은 실행에 `suppress_unstable_features_warning=true`도 함께 넘긴다(사용자 config 선언이 있으면 존중). `initialize` capabilities는 `extensions`에 `openai/form`을 선언하도록 바뀌어 legacy alias와 함께 보낸다. `mcpServerStatus/list`의 `nextCursor`는 `limit: 100` 단일 조회로 계속 충분해 미적용. |

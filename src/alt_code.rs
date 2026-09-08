@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 /// Turns the lone release of an Alt code back into the press it stands for.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AltCodeKeys {
     /// How many presses of each character are still held down, so each of
     /// their own releases stays a release. A single slot was enough while
@@ -22,6 +22,16 @@ pub struct AltCodeKeys {
     /// them (`Press 가`, `Press 나`, `Release 가`, `Release 나`): the first
     /// release would then look like a lone Alt code and insert `가` twice.
     pressed: HashMap<char, usize>,
+    external_windows: bool,
+}
+
+impl Default for AltCodeKeys {
+    fn default() -> Self {
+        Self {
+            pressed: HashMap::new(),
+            external_windows: cfg!(windows) && crate::devezcode::room_id().is_none(),
+        }
+    }
 }
 
 impl AltCodeKeys {
@@ -29,6 +39,13 @@ impl AltCodeKeys {
     pub fn normalize(&mut self, key: KeyEvent) -> KeyEvent {
         let KeyCode::Char(ch) = key.code else {
             return key;
+        };
+        // External Windows terminals can release Caps Lock's `A` as `a`.
+        // Match the held key without changing the text or DevezCode's path.
+        let ch = if self.external_windows {
+            ch.to_ascii_lowercase()
+        } else {
+            ch
         };
         if key.kind == KeyEventKind::Press {
             // A hold reports one press and then repeats, but a single release
@@ -72,6 +89,53 @@ mod tests {
             kind,
             state: KeyEventState::NONE,
         }
+    }
+
+    #[test]
+    fn external_caps_lock_releases_do_not_insert_lowercase() {
+        let mut keys = AltCodeKeys {
+            pressed: HashMap::new(),
+            external_windows: true,
+        };
+        for ch in 'A'..='Z' {
+            let press = key(ch, KeyEventKind::Press);
+            let repeat = key(ch, KeyEventKind::Repeat);
+            let release = key(ch.to_ascii_lowercase(), KeyEventKind::Release);
+            assert_eq!(keys.normalize(press), press);
+            assert_eq!(keys.normalize(repeat), repeat);
+            assert_eq!(keys.normalize(release), release);
+        }
+        assert!(keys.pressed.is_empty());
+        let shifted = KeyEvent {
+            modifiers: KeyModifiers::SHIFT,
+            ..key('A', KeyEventKind::Press)
+        };
+        assert_eq!(keys.normalize(shifted), shifted);
+        let released = KeyEvent {
+            kind: KeyEventKind::Release,
+            ..shifted
+        };
+        assert_eq!(keys.normalize(released), released);
+        assert_eq!(
+            keys.normalize(key('★', KeyEventKind::Release)),
+            key('★', KeyEventKind::Press)
+        );
+    }
+
+    #[test]
+    fn hosted_character_matching_stays_case_sensitive() {
+        let mut keys = AltCodeKeys {
+            pressed: HashMap::new(),
+            external_windows: false,
+        };
+        let press = key('A', KeyEventKind::Press);
+        assert_eq!(keys.normalize(press), press);
+        assert_eq!(
+            keys.normalize(key('a', KeyEventKind::Release)),
+            key('a', KeyEventKind::Press)
+        );
+        let release = key('A', KeyEventKind::Release);
+        assert_eq!(keys.normalize(release), release);
     }
 
     #[test]

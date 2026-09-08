@@ -19,11 +19,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Release notes kept with the build for the changelog, but not shown at startup.
-#[allow(dead_code)]
+/// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "실행 중에도 30분마다 새 버전이 있는지 확인합니다.",
-    "새 버전이 있으면 상태 줄 아래에 영어 갱신 안내를 계속 표시합니다.",
+    "심층 조사를 위한 Researcher 역할을 추가했습니다.",
+    "선택지를 표시하고 답변을 기다리는 기능을 Codex 제공자에도 추가했습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

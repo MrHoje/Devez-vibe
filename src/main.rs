@@ -280,11 +280,6 @@ async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
         &startup_model.model,
         Some(&startup_model.effort),
     );
-    state.push_notice(
-        BlockKind::Update,
-        "Tip",
-        "/: Command\n@: Mentions\n$: Skills\n/provider: Set Claude Codex provider\n/side-panel: Choose side panel size\n/vibemode: Set Vibe mode\n/Response: Set Response compression type\nTab: Cycle agent role\nShift + ↑↓ model · ←→ effort\nAlt + P: Cycle side panel size",
-    );
     if fallback_to_claude {
         state.push_notice(
             BlockKind::Warning,
@@ -1860,53 +1855,57 @@ async fn event_loop(
                             SplitFocus::Main
                         };
                         let target = focused_state_mut(state, &mut btw_state, action_focus);
-                        target.handle_notification(&method, &params);
-                        if method == "turn/completed" && !target_is_btw {
-                            server.persist_provider_handoff(
-                                &target.thread_id,
-                                provider_handoff_snapshot(target, renderer),
-                            );
-                        }
-                        if matches!(
-                            method.as_str(),
-                            "mcpServer/oauthLogin/completed" | "mcpServer/startupStatus/updated"
-                        ) {
-                            integration_key = None;
-                        }
-                        // Claude-only hand-off: this notification carries the SDK's
-                        // fresh account usage at the end of every turn, and the host
-                        // has no statusLine hook for us to ride on. Codex limits
-                        // arrive through `account/rateLimits/read` on another schema
-                        // and never reach here.
-                        if method == "claude/account/updated" {
-                            devezcode::publish_claude_rate_limits(
-                                params.get("usage").filter(|value| !value.is_null()),
-                            );
-                        }
-                        let interrupt_after_start = method == "turn/started"
-                            && target.take_pending_interrupt().is_some();
-                        if target.take_account_refresh() {
-                            refresh_account(server, target).await;
-                        }
-                        if interrupt_after_start {
-                            Action::Interrupt
-                        } else if method == "turn/completed"
-                            // A runtime that compacts without running a turn ends
-                            // the wait here, so the queue drains from here too.
-                            || (method == "thread/compacted" && !target.host_turn_busy())
-                        {
-                            target
-                                .take_queued_prompt()
-                                .map(|text| target.start_queued_prompt(text))
-                                .unwrap_or(Action::None)
-                        } else if method == "skills/changed" {
-                            Action::RefreshSkills
-                        } else if is_paced_text_delta(&method) {
-                            // The frame tick paints this; drawing on arrival would
-                            // put the provider's cadence back on screen.
-                            Action::Tick(false)
+                        if let Some(action) = target.reject_unanswered_question(&method, &params) {
+                            action
                         } else {
-                            Action::None
+                            target.handle_notification(&method, &params);
+                            if method == "turn/completed" && !target_is_btw {
+                                server.persist_provider_handoff(
+                                    &target.thread_id,
+                                    provider_handoff_snapshot(target, renderer),
+                                );
+                            }
+                            if matches!(
+                                method.as_str(),
+                                "mcpServer/oauthLogin/completed" | "mcpServer/startupStatus/updated"
+                            ) {
+                                integration_key = None;
+                            }
+                            // Claude-only hand-off: this notification carries the SDK's
+                            // fresh account usage at the end of every turn, and the host
+                            // has no statusLine hook for us to ride on. Codex limits
+                            // arrive through `account/rateLimits/read` on another schema
+                            // and never reach here.
+                            if method == "claude/account/updated" {
+                                devezcode::publish_claude_rate_limits(
+                                    params.get("usage").filter(|value| !value.is_null()),
+                                );
+                            }
+                            let interrupt_after_start = method == "turn/started"
+                                && target.take_pending_interrupt().is_some();
+                            if target.take_account_refresh() {
+                                refresh_account(server, target).await;
+                            }
+                            if interrupt_after_start {
+                                Action::Interrupt
+                            } else if method == "turn/completed"
+                                // A runtime that compacts without running a turn ends
+                                // the wait here, so the queue drains from here too.
+                                || (method == "thread/compacted" && !target.host_turn_busy())
+                            {
+                                target
+                                    .take_queued_prompt()
+                                    .map(|text| target.start_queued_prompt(text))
+                                    .unwrap_or(Action::None)
+                            } else if method == "skills/changed" {
+                                Action::RefreshSkills
+                            } else if is_paced_text_delta(&method) {
+                                // The frame tick paints this; drawing on arrival would
+                                // put the provider's cadence back on screen.
+                                Action::Tick(false)
+                            } else {
+                                Action::None
+                            }
                         }
                     }
                     Some(ServerEvent::Request { id, method, params }) => {
@@ -2009,38 +2008,27 @@ async fn event_loop(
                 // Keep the host in step even when only the spinner is painted.
                 // Always publish the main pane, regardless of BTW focus.
                 sync_host_state(state);
-                if let Some(action) = state.take_expired_user_input_response() {
-                    action_focus = SplitFocus::Main;
-                    action
-                } else if let Some(action) = btw_state
-                    .as_mut()
-                    .and_then(AppState::take_expired_user_input_response)
-                {
-                    action_focus = SplitFocus::Btw;
-                    action
-                } else {
-                    let main_tick = state.render_tick();
-                    let btw_tick = btw_state.as_mut().map(AppState::render_tick);
-                    let mut redraw = main_tick.redraw
-                        || btw_tick.as_ref().is_some_and(|tick| tick.redraw);
-                    animation_tick = btw_state.is_none() && main_tick.animation_only;
-                    if renderer.recover_external_screen_write() {
-                        redraw = true;
-                        animation_tick = false;
-                    }
-                    // Ctrl+wheel font zoom changes the cell grid without always
-                    // sending a `Resize`, so the size is polled here as well.
-                    resize.observe(terminal_size());
-                    if resize.settled() {
-                        renderer.relayout()?;
-                        redraw = true;
-                        animation_tick = false;
-                    } else if resize.pending() {
-                        // Nothing painted onto a grid that is still moving survives.
-                        redraw = false;
-                    }
-                    Action::Tick(redraw)
+                let main_tick = state.render_tick();
+                let btw_tick = btw_state.as_mut().map(AppState::render_tick);
+                let mut redraw = main_tick.redraw
+                    || btw_tick.as_ref().is_some_and(|tick| tick.redraw);
+                animation_tick = btw_state.is_none() && main_tick.animation_only;
+                if renderer.recover_external_screen_write() {
+                    redraw = true;
+                    animation_tick = false;
                 }
+                // Ctrl+wheel font zoom changes the cell grid without always
+                // sending a `Resize`, so the size is polled here as well.
+                resize.observe(terminal_size());
+                if resize.settled() {
+                    renderer.relayout()?;
+                    redraw = true;
+                    animation_tick = false;
+                } else if resize.pending() {
+                    // Nothing painted onto a grid that is still moving survives.
+                    redraw = false;
+                }
+                Action::Tick(redraw)
             }
         };
 
@@ -2623,14 +2611,14 @@ async fn execute_action(
             }
         }
         Action::RunShell(command) => run_local_shell(state, renderer, command).await?,
-        Action::Interrupt => interrupt_turn(server, state).await,
-        // Cancelling a question the runtime is blocked on takes both halves: the
-        // request has to be answered so the bridge stops waiting, and the turn it
-        // belongs to has to stop, or the tool would simply carry on unanswered.
+        Action::Interrupt => {
+            interrupt_turn(server, state).await;
+        }
+        // Claude's bridge understands cancellation. Codex's typed answer does
+        // not: interrupt its turn without ever releasing an empty answer.
         Action::CancelUserInput { id, interrupt } => {
-            // Codex types this reply as `{answers}`, so the cancel marker rides
-            // alongside an empty answer set rather than replacing it.
-            if let Err(error) = server.respond(id, json!({ "answers": {}, "cancelled": true })) {
+            if claude::is_claude_request_id(&id)
+                && let Err(error) = server.respond(id, json!({ "answers": {}, "cancelled": true })) {
                 state.push_notice(BlockKind::Error, "응답 전송 실패", error.to_string());
             }
             if interrupt {
@@ -4520,6 +4508,18 @@ fn config_value_write_params(key_path: &str, value: &str) -> Value {
         "mergeStrategy": "upsert"
     })
 }
+
+// The app owns the active agent role; Codex's Plan transport is used only for
+// blocking questions. Supplying this replaces its built-in planning-only prompt.
+const CODEX_QUESTION_INSTRUCTIONS: &str = concat!(
+    "작업 범위와 계획·구현·검토 여부는 현재 DevezVibe 에이전트 역할과 사용자 지시를 따른다. ",
+    "현재 역할이 허용하는 파일 수정과 명령 실행을 실제로 수행한다.\n",
+    "사용자에게 선택이나 확인이 필요하면 반드시 request_user_input 도구를 단독 호출한다. ",
+    "질문을 다른 도구와 병렬 호출하지 말고, 사용자 답변이 도착할 때까지 후속 작업과 최종 응답을 멈춘다. ",
+    "request_user_input_async는 사용하지 않는다. ",
+    "취소, 빈 답변, 도구 오류, 시간 경과를 승인이나 선택으로 해석하지 않는다. ",
+    "이 경우 작업을 중단하고 사용자의 새 지시를 기다린다.\n",
+);
 
 /// Sent as `developerInstructions` on every thread Devez Vibe starts, so these
 /// rules hold for every user without any per-machine configuration.
