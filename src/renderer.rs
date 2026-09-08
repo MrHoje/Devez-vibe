@@ -6794,6 +6794,15 @@ fn normal_frame_with_expansion(
             lines.push(spacer);
         }
     }
+    // Compaction's activity row carries a progress bar, so a queued prompt
+    // directly beneath it reads as part of that block. One blank row separates
+    // them.
+    if !queued_prompts.is_empty()
+        && activity.is_some_and(|activity| activity.starts_with(COMPACTING_LABEL))
+        && lines.last() != Some(&PaintLine::blank())
+    {
+        lines.push(PaintLine::blank());
+    }
     lines.extend(queue_preview_lines(
         queued_prompts,
         composer_mode.map(|mode| mode.model.as_str()),
@@ -18284,6 +18293,50 @@ mod tests {
 
         assert!(subagent_index > composer_index);
         assert_eq!(subagent_index, frame.lines.len() - 1);
+    }
+
+    /// Compaction's activity row carries a progress bar, so a queued prompt gets
+    /// a blank row of its own. An ordinary turn keeps the queue tight.
+    #[test]
+    fn a_queued_prompt_clears_the_compaction_progress_row() {
+        let queue_index = |activity: &str| {
+            let editor = Editor::default();
+            let frame = normal_frame_with_expansion(
+                Vec::new(),
+                &editor,
+                &[],
+                "",
+                &[],
+                &["queued prompt".to_owned()],
+                &[],
+                &[],
+                &[],
+                "",
+                None,
+                &[],
+                Some(activity),
+                None,
+                0.5,
+                0.5,
+                StatusArea {
+                    fallback: String::new(),
+                    line: None,
+                    composer_notice: None,
+                    composer_mode: None,
+                },
+                true,
+                80,
+            );
+            let index = frame
+                .lines
+                .iter()
+                .position(|line| painted(line).contains("Queue :"))
+                .expect("queue row");
+            (frame.lines[index - 1] == PaintLine::blank(), index)
+        };
+
+        assert!(queue_index("Compacting.. (4s)").0);
+        assert!(!queue_index("Working.. (4s)").0);
     }
 
     #[test]

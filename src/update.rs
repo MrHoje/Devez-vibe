@@ -22,14 +22,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "Planner가 요구사항과 예외 상황을 한 항목씩 인터뷰하고 요약 승인을 받은 뒤 구현 계획을 작성합니다.",
-    "인터뷰의 미응답·중단·재개·선택 위임 처리와 요구사항 승인 및 실행 승인의 구분을 명확히 합니다.",
-    "Reviewer가 신규 파일과 자체 검토를 구분하고, Goal Runner가 미해결 결함을 완료로 처리하지 않도록 검토 기준을 강화합니다.",
-    "검토 도구가 없는 환경의 대체 절차와 이미 승인된 작업의 실행 기준을 명확히 합니다.",
-    "대기 중인 프롬프트의 삭제 표시가 오른쪽 경계에 겹치지 않도록 간격을 조정합니다.",
-    "Claude 세션의 컨텍스트 사용량을 턴이 끝나기 전에도 갱신합니다.",
-    "서브에이전트의 턴이 끝나도 진행 중인 답변이 끝난 것처럼 보이지 않게 합니다.",
-    "화면을 다시 붙였을 때 상태 줄이 비어 보이던 문제를 고칩니다.",
+    "컨텍스트 압축 중에 대기 중인 프롬프트가 진행률 표시 바로 아래 붙지 않도록 한 줄을 띄웁니다.",
+    "서브에이전트 지침 파일의 줄바꿈을 고정해 윈도우 환경에서 기본 지침 갱신 검사가 어긋나던 문제를 막습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
