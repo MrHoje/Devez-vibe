@@ -22,8 +22,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude 선택지 패널이 하단 공간의 절반 이상을 차지하면 펼친 Updated Plan을 임시로 접습니다.",
-    "선택을 마치면 Updated Plan을 선택 전 상태로 되돌리며, 원래 접혀 있던 계획은 그대로 유지합니다.",
+    "재개한 Updated Plan을 다음 프롬프트가 시작된 뒤에도 유지합니다.",
+    "새 Updated Plan이 도착하면 복원된 계획을 자연스럽게 교체합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

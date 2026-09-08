@@ -3658,9 +3658,6 @@ pub struct AppState {
     /// The turn that published the visible plan. A later turn must not revive
     /// its completed final step while it is still waiting for its own plan.
     plan_turn_id: Option<String>,
-    /// 재개한 세션에서 기록으로부터 되살린 계획. 다음 턴이 시작되면 지난 세션의
-    /// 계획이 화면에 남지 않도록 비운다.
-    plan_restored: bool,
     plan_shimmer_started_at: Option<Instant>,
     subagents: Vec<RunningSubagent>,
     artifacts: Vec<ArtifactLink>,
@@ -3922,7 +3919,6 @@ impl AppState {
             show_welcome: true,
             plan_summary: None,
             plan_turn_id: None,
-            plan_restored: false,
             plan_shimmer_started_at: None,
             subagents: Vec::new(),
             artifacts: Vec::new(),
@@ -5826,7 +5822,6 @@ impl AppState {
             elapsed: None,
         });
         self.plan_turn_id = None;
-        self.plan_restored = true;
     }
 
     pub fn set_turn_started(&mut self, turn_id: String) {
@@ -5834,12 +5829,6 @@ impl AppState {
         if self.turn_id.as_deref() != Some(turn_id.as_str()) && !acknowledging_local_prompt {
             self.reset_turn_item_tracking();
             self.plan_turn_id = None;
-        }
-        // 지난 세션에서 되살린 계획은 새 턴이 자기 계획을 낼 때까지 그대로 남아
-        // 갱신되지 않는 것처럼 보인다. 새 턴이 시작되는 순간 자리를 비운다.
-        if self.plan_restored {
-            self.plan_restored = false;
-            self.plan_summary = None;
         }
         self.turn_id = Some(turn_id);
         self.busy = true;
@@ -6379,7 +6368,6 @@ impl AppState {
         self.activity_notice = None;
         self.quit_armed_at = None;
         self.plan_summary = None;
-        self.plan_restored = false;
         self.response_collapse = None;
         self.turn_response_blocks.clear();
         self.response_grouped = false;
@@ -8646,7 +8634,6 @@ impl AppState {
                     elapsed,
                 });
                 self.plan_turn_id = self.turn_id.clone();
-                self.plan_restored = false;
                 self.plan_shimmer_started_at = Some(Instant::now());
                 self.commit_welcome_card();
             }
@@ -19579,9 +19566,9 @@ mod tests {
         assert!(state.view().plan_summary.is_none());
     }
 
-    /// 재개한 세션의 옛 계획이 다음 턴까지 남아 갱신되지 않는 것처럼 보이지 않게 한다.
+    /// 재개한 계획은 새 계획이 실제로 도착할 때까지 유지하고 그때 교체한다.
     #[test]
-    fn a_restored_plan_makes_way_for_the_next_turn() {
+    fn a_restored_plan_stays_until_the_next_plan_arrives() {
         let mut state = test_state();
         state.restore_plan_snapshot(&PlanSnapshot {
             explanation: None,
@@ -19594,7 +19581,10 @@ mod tests {
         assert!(state.plan_summary.is_some());
 
         state.set_turn_started("turn-after-resume".to_owned());
-        assert!(state.plan_summary.is_none());
+        assert_eq!(
+            state.plan_summary.as_ref().unwrap().steps[0].text,
+            "1. 지난 세션 작업"
+        );
 
         state.handle_notification(
             "turn/plan/updated",
