@@ -6498,6 +6498,9 @@ impl AppState {
             live_blocks,
             overlay: self.overlay_view(),
             plan_summary: self.visible_plan_summary(),
+            auto_collapse_plan_for_large_questions: crate::claude::is_claude_model(
+                self.selected_model_name(),
+            ),
             response_collapse: self.response_collapse_view(),
             fold_progress_groups: self.vibe_mode == VibeMode::SuperVibe
                 && self.response_display_mode == ResponseDisplayMode::Completed,

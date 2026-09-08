@@ -22,9 +22,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "Researcher가 주장별 원출처·독립 확인·충돌·최신성을 판정하고 조회 시각과 본문 해시가 포함된 근거 묶음을 남깁니다.",
-    "스캔 PDF와 표, 영상 자막과 시각, Wayback 보관 자료를 처리하고 사용자 승인 쿠키와 프록시는 대상 호스트와 임시 세션으로 제한합니다.",
-    "Claude와 Codex 모델은 high를 지원하면 기본 추론 강도로 선택하고 /provider의 모델 별칭은 대소문자와 관계없이 인식합니다.",
+    "Claude 선택지 패널이 하단 공간의 절반 이상을 차지하면 펼친 Updated Plan을 임시로 접습니다.",
+    "선택을 마치면 Updated Plan을 선택 전 상태로 되돌리며, 원래 접혀 있던 계획은 그대로 유지합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

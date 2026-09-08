@@ -935,6 +935,7 @@ async fn choose_startup_session(
                 overlay: Some(picker.overlay_view()),
                 cwd: String::new(),
                 plan_summary: None,
+                auto_collapse_plan_for_large_questions: false,
                 response_collapse: None,
                 fold_progress_groups: false,
                 plan_active: false,

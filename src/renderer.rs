@@ -534,6 +534,8 @@ pub struct View<'a> {
     pub overlay: Option<OverlayView<'a>>,
     /// A persistent right-hand panel, available only to the fullscreen renderer.
     pub plan_summary: Option<&'a PlanSummary>,
+    /// Claude 질문 패널이 화면의 절반을 차지할 때 펼친 계획을 한 프레임 동안만 접는다.
+    pub auto_collapse_plan_for_large_questions: bool,
     /// The newly folded progress group and the share of its rows still visible.
     pub response_collapse: Option<(u64, f32)>,
     /// Progress records are disclosure rows only in Super Vibe. Other presets
@@ -2938,6 +2940,7 @@ impl Renderer {
                 total_width,
                 height.max(3),
                 view.plan_summary,
+                view.auto_collapse_plan_for_large_questions,
                 view.activity_phase,
                 view.plan_active,
                 view.plan_shimmer_phase,
@@ -3412,6 +3415,7 @@ impl Renderer {
         total_width: u16,
         height: u16,
         plan_summary: Option<&PlanSummary>,
+        auto_collapse_plan_for_large_questions: bool,
         activity_phase: f32,
         plan_active: bool,
         plan_shimmer_phase: Option<f32>,
@@ -3430,7 +3434,7 @@ impl Renderer {
         // The docked panel is where the plan lives while it is open, so the
         // transcript keeps its own full height and draws no card of its own.
         let plan_in_panel = self.side_panel.is_some();
-        let plan_lines = plan_summary
+        let expanded_plan_lines = plan_summary
             .filter(|_| !plan_in_panel)
             .map(|summary| {
                 fixed_plan_summary_lines(
@@ -3443,6 +3447,35 @@ impl Renderer {
                 )
             })
             .unwrap_or_default();
+        let expanded_plan_rows = expanded_plan_lines.len().min(rows.saturating_sub(1));
+        let expanded_content_rows = rows.saturating_sub(expanded_plan_rows).max(1);
+        let temporarily_collapsed = !plan_in_panel
+            && plan_summary.is_some_and(|summary| {
+                should_temporarily_collapse_plan(
+                    auto_collapse_plan_for_large_questions,
+                    summary.expanded,
+                    frame.question_panel_rows.min(expanded_content_rows),
+                    expanded_content_rows,
+                )
+            });
+        let plan_lines = if temporarily_collapsed {
+            plan_summary
+                .map(|summary| {
+                    let mut collapsed = summary.clone();
+                    collapsed.expanded = false;
+                    fixed_plan_summary_lines(
+                        &collapsed,
+                        width,
+                        activity_phase,
+                        plan_active,
+                        plan_shimmer_phase,
+                        plan_agent,
+                    )
+                })
+                .unwrap_or_default()
+        } else {
+            expanded_plan_lines
+        };
         let plan_rows = plan_lines.len().min(rows.saturating_sub(1));
         let content_rows = rows.saturating_sub(plan_rows).max(1);
         if !committed.is_empty() && self.response_collapse.is_none() {
@@ -5420,6 +5453,8 @@ struct Frame {
     cursor_col: usize,
     show_cursor: bool,
     dock_index: usize,
+    /// 질문 상자와 그 입력란이 차지하는 행 수. 하단 상태줄은 포함하지 않는다.
+    question_panel_rows: usize,
     composer_index: Option<usize>,
     /// The prompt rows of the composer this frame carries, if it has one, so a
     /// drag over them can be mapped back to composer characters.
@@ -6849,6 +6884,7 @@ fn normal_frame_with_expansion(
         cursor_col: input_cursor_col,
         show_cursor: true,
         dock_index,
+        question_panel_rows: 0,
         composer_index: Some(composer_index),
         composer_layout: Some(composer_layout),
         inline_input_rows: None,
@@ -8203,6 +8239,11 @@ fn overlay_frame_with_expansion(
     } else {
         false
     };
+    let question_panel_rows = if overlay.style == OverlayStyle::Question {
+        lines.len().saturating_sub(dock_index)
+    } else {
+        0
+    };
     if status.fallback != HIDDEN_STATUS_LINE {
         lines.push(PaintLine::blank());
         lines.push(status_line_row(status.line, &status.fallback, width));
@@ -8214,11 +8255,24 @@ fn overlay_frame_with_expansion(
         lines,
         show_cursor,
         dock_index,
+        question_panel_rows,
         composer_index,
         composer_layout: None,
         inline_input_rows,
         activity_index: None,
     }
+}
+
+fn should_temporarily_collapse_plan(
+    enabled: bool,
+    expanded: bool,
+    question_rows: usize,
+    available_rows: usize,
+) -> bool {
+    enabled
+        && expanded
+        && question_rows > 0
+        && question_rows >= available_rows.div_ceil(2)
 }
 
 fn fit_frame(frame: &mut Frame, target_rows: usize) {
@@ -13536,6 +13590,7 @@ mod tests {
             live_blocks: Vec::new(),
             overlay: None,
             plan_summary: None,
+            auto_collapse_plan_for_large_questions: false,
             response_collapse: None,
             fold_progress_groups: false,
             cwd: String::new(),
@@ -13750,6 +13805,7 @@ mod tests {
             cursor_col: 0,
             show_cursor: true,
             dock_index: 1,
+            question_panel_rows: 0,
             composer_index: Some(4),
             composer_layout: None,
             inline_input_rows: None,
@@ -15105,6 +15161,7 @@ mod tests {
             cursor_col: 0,
             show_cursor: true,
             dock_index: 1,
+            question_panel_rows: 0,
             composer_index: Some(1),
             composer_layout: None,
             inline_input_rows: None,
@@ -15132,6 +15189,7 @@ mod tests {
             cursor_col: 0,
             show_cursor: true,
             dock_index: 1,
+            question_panel_rows: 0,
             composer_index: Some(2),
             composer_layout: None,
             inline_input_rows: None,
@@ -15154,6 +15212,7 @@ mod tests {
             cursor_col: 0,
             show_cursor: true,
             dock_index: 3,
+            question_panel_rows: 0,
             composer_index: Some(3),
             composer_layout: None,
             inline_input_rows: None,
@@ -19354,6 +19413,7 @@ mod tests {
             cursor_col: 0,
             show_cursor: true,
             dock_index: 2,
+            question_panel_rows: 0,
             composer_index: Some(4),
             composer_layout: None,
             inline_input_rows: None,
@@ -19374,6 +19434,7 @@ mod tests {
             cursor_col: 0,
             show_cursor: true,
             dock_index: 0,
+            question_panel_rows: 0,
             composer_index: Some(3),
             composer_layout: None,
             inline_input_rows: None,
@@ -20857,6 +20918,7 @@ mod tests {
             cursor_col: 0,
             show_cursor: true,
             dock_index: 1,
+            question_panel_rows: 0,
             composer_index: Some(1),
             composer_layout: None,
             inline_input_rows: None,
@@ -24974,6 +25036,53 @@ mod tests {
         assert!(lines[9].text.is_empty());
         assert!(painted(&lines[10]).starts_with('└'));
         assert!(painted(&lines[10]).ends_with('┘'));
+    }
+
+    #[test]
+    fn large_claude_question_temporarily_collapses_only_an_expanded_plan() {
+        assert!(should_temporarily_collapse_plan(true, true, 10, 20));
+        assert!(!should_temporarily_collapse_plan(true, true, 9, 20));
+        assert!(!should_temporarily_collapse_plan(false, true, 10, 20));
+        assert!(!should_temporarily_collapse_plan(true, false, 10, 20));
+    }
+
+    #[test]
+    fn question_panel_height_excludes_the_status_line() {
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                closable: false,
+                title: "질문".to_owned(),
+                lines: vec![
+                    OverlayLine {
+                        text: "선택할까요?".to_owned(),
+                        selected: false,
+                        muted: false,
+                    },
+                    OverlayLine {
+                        text: "예\n설명".to_owned(),
+                        selected: true,
+                        muted: false,
+                    },
+                ],
+                slider: None,
+                hint: "Enter Select".to_owned(),
+                style: OverlayStyle::Question,
+                input: None,
+                input_label: "",
+                input_placeholder: "",
+            },
+            None,
+            StatusArea {
+                fallback: "상태".to_owned(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+
+        assert_eq!(frame.question_panel_rows, frame.lines.len() - 2);
     }
 
     #[test]
