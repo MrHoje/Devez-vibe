@@ -464,8 +464,16 @@ async fn run_after_startup(
 
     let (update_tx, update_rx) = mpsc::channel(1);
     tokio::spawn(async move {
-        if let Some(latest) = update::check_for_update().await {
-            let _ = update_tx.send(latest).await;
+        loop {
+            if let Some(latest) = update::check_for_update().await
+                && update_tx.send(latest).await.is_err()
+            {
+                break;
+            }
+            tokio::select! {
+                _ = update_tx.closed() => break,
+                _ = tokio::time::sleep(Duration::from_secs(update::CHECK_INTERVAL_SECS)) => {}
+            }
         }
     });
 

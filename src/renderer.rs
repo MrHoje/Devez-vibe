@@ -407,6 +407,7 @@ pub struct StatusLineView {
     pub five_hour_remaining: Option<String>,
     pub weekly_percent: Option<u8>,
     pub notice: Option<String>,
+    pub update_notice: Option<String>,
 }
 
 /// Internal footer marker used when the user disables the status line entirely.
@@ -6872,8 +6873,15 @@ fn normal_frame_with_expansion(
     let cursor_line = composer_index + input_cursor_line;
     lines.extend(input_lines);
     let status_line_painted = status.fallback != HIDDEN_STATUS_LINE;
+    let update_notice = status
+        .line
+        .as_ref()
+        .and_then(|line| line.update_notice.clone());
     if status_line_painted {
         lines.push(status_line_row(status.line, &status.fallback, width));
+    }
+    if let Some(notice) = update_notice {
+        lines.push(status_line_row(None, &notice, width));
     }
     // Separate the running-subagent rows from the status line with one blank row.
     if status_line_painted && (!subagents.is_empty() || !artifacts.is_empty()) {
@@ -14917,6 +14925,7 @@ mod tests {
                     five_hour_remaining: Some("25m".to_owned()),
                     weekly_percent: Some(43),
                     notice: None,
+                    update_notice: None,
                 }),
                 "",
                 120,
@@ -16387,6 +16396,7 @@ mod tests {
                 five_hour_remaining: None,
                 weekly_percent: None,
                 notice: None,
+                update_notice: None,
             }),
             "",
             80,
@@ -18360,7 +18370,7 @@ mod tests {
     }
 
     #[test]
-    fn running_subagents_sit_below_the_status_line() {
+    fn update_notice_and_subagents_sit_below_the_status_line() {
         let editor = Editor::default();
         let frame = normal_frame_with_expansion(
             Vec::new(),
@@ -18381,7 +18391,19 @@ mod tests {
             0.5,
             StatusArea {
                 fallback: String::new(),
-                line: None,
+                line: Some(StatusLineView {
+                    agent: AgentMode::Standard,
+                    shell_mode: false,
+                    model: None,
+                    effort: None,
+                    fast: false,
+                    context: None,
+                    five_hour_percent: None,
+                    five_hour_remaining: None,
+                    weekly_percent: None,
+                    notice: None,
+                    update_notice: Some("Update available: 1.8.3 · dvz update".to_owned()),
+                }),
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -18397,6 +18419,14 @@ mod tests {
 
         assert!(subagent_index > composer_index);
         assert_eq!(subagent_index, frame.lines.len() - 1);
+        let update_index = frame
+            .lines
+            .iter()
+            .position(|line| painted(line).contains("Update available:"))
+            .expect("update notice");
+        assert!(update_index > composer_index);
+        assert!(update_index < subagent_index);
+        assert!(painted(&frame.lines[update_index]).ends_with("dvz update"));
     }
 
     /// Compaction's activity row carries a progress bar, so a queued prompt gets
@@ -22230,6 +22260,7 @@ mod tests {
                 five_hour_remaining: None,
                 weekly_percent: Some(34),
                 notice: Some("connected".to_owned()),
+                update_notice: None,
             }),
             "",
             32,
@@ -22253,6 +22284,7 @@ mod tests {
                 five_hour_remaining: None,
                 weekly_percent: None,
                 notice: None,
+                update_notice: None,
             }),
             "",
             80,
@@ -22278,6 +22310,7 @@ mod tests {
                 five_hour_remaining: None,
                 weekly_percent: None,
                 notice: None,
+                update_notice: None,
             }),
             "",
             45,
@@ -22301,6 +22334,7 @@ mod tests {
                 five_hour_remaining: None,
                 weekly_percent: None,
                 notice: None,
+                update_notice: None,
             }),
             "",
             100,
@@ -22325,6 +22359,7 @@ mod tests {
                 five_hour_remaining: None,
                 weekly_percent: None,
                 notice: None,
+                update_notice: None,
             }),
             "",
             100,
@@ -22367,6 +22402,7 @@ mod tests {
                 five_hour_remaining: None,
                 weekly_percent: Some(34),
                 notice: None,
+                update_notice: None,
             }),
             "",
             120,
@@ -22389,6 +22425,7 @@ mod tests {
             five_hour_remaining: Some("3h 6m".to_owned()),
             weekly_percent: Some(27),
             notice: None,
+            update_notice: None,
         });
         let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, false);
         mode.branch = Some("feature/panel".to_owned());
@@ -22465,6 +22502,7 @@ mod tests {
                 five_hour_remaining: Some("4h 38m".to_owned()),
                 weekly_percent: None,
                 notice: None,
+                update_notice: None,
             }),
             "",
             80,
@@ -22487,6 +22525,7 @@ mod tests {
                 five_hour_remaining: None,
                 weekly_percent: None,
                 notice: None,
+                update_notice: None,
             }),
             "",
             80,
@@ -22513,6 +22552,7 @@ mod tests {
                 five_hour_remaining: None,
                 weekly_percent: Some(34),
                 notice: None,
+                update_notice: None,
             }),
             "",
             80,
@@ -22558,6 +22598,7 @@ mod tests {
                 five_hour_remaining: None,
                 weekly_percent: None,
                 notice: None,
+                update_notice: None,
             }),
             "",
             80,
@@ -24555,6 +24596,7 @@ mod tests {
                 five_hour_remaining: None,
                 weekly_percent: Some(34),
                 notice: None,
+                update_notice: None,
             }),
             "",
             120,

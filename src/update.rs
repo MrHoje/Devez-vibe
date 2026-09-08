@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 /// npm package that publishes the `dvz` binary.
 const PACKAGE: &str = "devez-vibe";
 /// Registry lookups are cached so startup stays offline-friendly.
-const CHECK_INTERVAL_SECS: u64 = 60 * 60 * 12;
+pub const CHECK_INTERVAL_SECS: u64 = 60 * 30;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -22,8 +22,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "컴포저 첫 글자 !로 Shell Mode에 들어가 현재 작업 폴더에서 PowerShell 명령을 직접 실행합니다.",
-    "Shell Mode의 ! 표식, 컴포저 위아래 선, 상태줄 문구를 일반 텍스트색으로 표시합니다.",
+    "실행 중에도 30분마다 새 버전이 있는지 확인합니다.",
+    "새 버전이 있으면 상태 줄 아래에 영어 갱신 안내를 계속 표시합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
@@ -330,6 +330,21 @@ fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_cache_expires_after_thirty_minutes() {
+        let path = env::temp_dir().join(format!("dvz-update-cache-test-{}.json", std::process::id()));
+        write_cache(&path, "1.8.3");
+        assert_eq!(read_cache(&path).as_deref(), Some("1.8.3"));
+        fs::write(&path, json!({
+            "checkedAt": now_secs() - 30 * 60,
+            "latest": "1.8.3"
+        }).to_string()).unwrap();
+        assert_eq!(read_cache(&path), None);
+        fs::write(&path, "invalid json").unwrap();
+        assert_eq!(read_cache(&path), None);
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn detects_newer_versions() {

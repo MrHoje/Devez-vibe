@@ -3657,6 +3657,7 @@ pub struct AppState {
     cost_restore_pending: bool,
     context_window: Option<u64>,
     transient_status: Option<String>,
+    update_notice: Option<String>,
     show_welcome: bool,
     plan_summary: Option<PlanSummary>,
     /// The turn that published the visible plan. A later turn must not revive
@@ -3921,6 +3922,7 @@ impl AppState {
             cost_restore_pending: false,
             context_window,
             transient_status: None,
+            update_notice: None,
             show_welcome: true,
             plan_summary: None,
             plan_turn_id: None,
@@ -6447,13 +6449,9 @@ impl AppState {
         id
     }
 
-    /// Announce a newer published release above the composer history.
+    /// Keep the release notice visible without adding it to the conversation.
     pub fn push_update_available(&mut self, latest: &str) {
-        self.push_notice(
-            BlockKind::Update,
-            "Update Available",
-            format!("New version {latest} is available. Run: dvz update"),
-        );
+        self.update_notice = Some(format!("Update available: {latest} · dvz update"));
     }
 
     pub fn drain_committed(&mut self) -> Vec<Block> {
@@ -12678,6 +12676,7 @@ impl AppState {
                 .then_some(self.weekly_percent)
                 .flatten(),
             notice: self.transient_status.clone(),
+            update_notice: self.update_notice.clone(),
         }
     }
 
@@ -12687,6 +12686,7 @@ impl AppState {
             .iter()
             .any(|field| self.status_line_settings.enabled(*field))
             || self.transient_status.is_some()
+            || self.update_notice.is_some()
     }
 
     /// Second step of `/model`: ask how long the pick lasts. A model with no
@@ -20928,18 +20928,22 @@ mod tests {
     }
 
     #[test]
-    fn new_version_update_notice_is_english() {
+    fn update_notice_stays_below_composer_without_repeating_in_history() {
         let mut state = test_state();
         state.show_welcome = false;
+        state.status_line_settings = StatusLineSettings([false; 5]);
 
         state.push_update_available("1.3.11");
-        let blocks = state.drain_committed();
-
-        assert_eq!(blocks[0].title, "Update Available");
+        state.push_update_available("1.3.11");
+        assert!(state.drain_committed().is_empty());
         assert_eq!(
-            blocks[0].body,
-            "New version 1.3.11 is available. Run: dvz update"
+            state.view().status_line.unwrap().update_notice.as_deref(),
+            Some("Update available: 1.3.11 · dvz update")
         );
+        state.push_update_available("1.3.12");
+        assert!(state.status_line().update_notice.unwrap().contains("1.3.12"));
+        state.run_slash_command("/clear");
+        assert!(state.status_line().update_notice.unwrap().contains("1.3.12"));
     }
 
     #[test]
