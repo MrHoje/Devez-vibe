@@ -88,7 +88,8 @@ def _install_common_patches(*, probe_verdict, grid_verdict, fb_order):
         return {"fallback_when_challenge": list(fb_order)}
 
     def fake_run_pw(url, *, profile_id, success_selectors=None, device_class="auto",
-                    timeout=90, profile_dir=None, force_executor=None, proxy=None):
+                    timeout=90, profile_dir=None, force_executor=None, proxy=None,
+                    cookies=None):
         browser_calls.append(force_executor)
         att = Attempt(phase="fallback", executor=force_executor, url=url,
                       url_transform="original", impersonate=None, referer="")

@@ -89,6 +89,7 @@ async function main() {
     };
     if (args.proxy) ctxOpts.proxy = args.proxy;
     ctx = await chromium.launchPersistentContext(profileDir, ctxOpts);
+    if (Array.isArray(args.cookies) && args.cookies.length) await ctx.addCookies(args.cookies);
     const page = await ctx.newPage();
     const deadline = Date.now() + timeoutMs;
     const rem = (cap) => Math.max(1000, Math.min(cap || timeoutMs, deadline - Date.now()));

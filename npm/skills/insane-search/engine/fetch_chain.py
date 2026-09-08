@@ -34,7 +34,9 @@ from __future__ import annotations
 import os
 import random
 import time
+import hashlib
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .content_safety import ContentSafetyReport, analyze_untrusted_content, wrap_untrusted_content
@@ -131,8 +133,17 @@ class FetchResult:
     block_class: str = ""
     proxy_used: bool = False
     network_diagnosis: dict = field(default_factory=dict)
+    session_seeded: bool = False
+    retrieved_at: str = ""
+    content_sha256: str = ""
 
     def __post_init__(self) -> None:
+        if not self.retrieved_at:
+            self.retrieved_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        if not self.content_sha256:
+            self.content_sha256 = hashlib.sha256(
+                self.content.encode("utf-8", "surrogatepass")
+            ).hexdigest()
         report = analyze_untrusted_content(self.content, source_url=self.final_url)
         if not self.content_trust:
             self.content_trust = report.content_trust
@@ -154,6 +165,64 @@ class FetchResult:
             },
         )
         return wrap_untrusted_content(self.content, report=report, source_url=self.final_url)
+
+    def evidence_record(self) -> dict[str, Any]:
+        """Return provenance metadata without exposing fetched content or secrets."""
+        from .url_masking import mask_url
+
+        requested_url = self.trace[0].url if self.trace else self.final_url
+        source = self.extraction_source or "raw"
+        if not self.ok:
+            source_kind = "unknown"
+            currentness = "unavailable"
+        elif source.startswith("archive+"):
+            source_kind = "archive"
+            currentness = "historical_snapshot"
+        elif source.startswith("pdf"):
+            source_kind = "document"
+            currentness = "current"
+        elif (self.profile_used or "").startswith(("phase0:youtube", "phase0:media", "phase0:threads")):
+            source_kind = "media"
+            currentness = "current"
+        else:
+            source_kind = "web"
+            currentness = "current"
+        winning_attempt = next(
+            (attempt for attempt in reversed(self.trace) if attempt.verdict in _OK_VALUES),
+            self.trace[-1] if self.trace else None,
+        )
+        access_method = winning_attempt.executor if winning_attempt else "unknown"
+        return {
+            "requested_url": mask_url(requested_url),
+            "final_url": mask_url(self.final_url),
+            "retrieved_at": self.retrieved_at,
+            "retrieval_status": "succeeded" if self.ok else "failed",
+            "source_timestamp": self.extraction_meta.get("snapshot_timestamp", ""),
+            "source_kind": source_kind,
+            "currentness": currentness,
+            "access_method": access_method,
+            "source_route": self.profile_used or "",
+            "content_sha256": self.content_sha256,
+            "content_length": len(self.content),
+            "extraction_source": source,
+            "extraction_quality": self.extraction_quality,
+            "content_trust": self.content_trust,
+            "prompt_injection_risk": self.prompt_injection_risk,
+            "session_seeded": self.session_seeded,
+            "proxy_used": self.proxy_used,
+        }
+
+    def to_evidence_bundle(self) -> dict[str, Any]:
+        """Pair compact provenance with boundary-wrapped, untrusted content."""
+        operational = self.to_dict()
+        operational.pop("evidence", None)
+        operational.pop("retrieved_at", None)
+        operational.pop("content_sha256", None)
+        return {
+            "evidence": self.evidence_record(),
+            "result": operational,
+            "untrusted_content": self.to_untrusted_text(),
+        }
 
     def to_dict(self) -> dict:
         return {
@@ -180,6 +249,10 @@ class FetchResult:
             "block_class": self.block_class,
             "proxy_used": self.proxy_used,
             "network_diagnosis": self.network_diagnosis,
+            "session_seeded": self.session_seeded,
+            "retrieved_at": self.retrieved_at,
+            "content_sha256": self.content_sha256,
+            "evidence": self.evidence_record(),
         }
 
 
@@ -196,6 +269,10 @@ class FetchResult:
 import io as _io
 import json as _json
 import re as _re
+import shutil as _shutil
+import subprocess as _subprocess
+import tempfile as _tempfile
+from pathlib import Path as _Path
 
 try:
     from pypdf import PdfReader as _PdfReader
@@ -243,6 +320,9 @@ _JSONLD_MAX_BLOB = 200_000       # chars of a single ld+json blob given to json.
 _RESCUE_MAX_TEXT = 1_000_000     # chars any rescue path may return as content
 _PDF_MAX_BYTES = 25 * 1024 * 1024  # PDF bodies above this are never parsed
 _INNER_TEXT_MAX = 1_000_000      # chars of Playwright innerText accepted
+_PDF_TABLE_MAX_CHARS = 200_000
+_OCR_MAX_PAGES = 20
+_OCR_TOTAL_TIMEOUT = 120.0
 
 
 def _quality_score(md: str) -> float:
@@ -302,6 +382,30 @@ def _extract_json_ld_text(html: str) -> str:
     return "\n\n".join(out)
 
 
+def _pdf_table_to_markdown(table: list[list[Any]]) -> str:
+    """Convert one bounded pdfplumber table to Markdown without losing units."""
+    if not table:
+        return ""
+    rows: list[list[str]] = []
+    width = min(max((len(row or []) for row in table), default=0), 20)
+    if width == 0:
+        return ""
+    for raw_row in table[:100]:
+        raw_row = raw_row or []
+        row = []
+        for cell in list(raw_row[:width]) + [""] * max(0, width - len(raw_row)):
+            value = _re.sub(r"\s+", " ", str(cell or "")).strip().replace("|", r"\|")
+            row.append(value)
+        rows.append(row)
+    if not any(any(cell for cell in row) for row in rows):
+        return ""
+    header = rows[0]
+    lines = ["| " + " | ".join(header) + " |",
+             "| " + " | ".join("---" for _ in header) + " |"]
+    lines.extend("| " + " | ".join(row) + " |" for row in rows[1:])
+    return "\n".join(lines)
+
+
 def _extract_pdf_pdfplumber(body: bytes) -> tuple[str, str]:
     """(title, text) via pdfplumber, or ("", "") on failure / no text layer.
     Same bounds as the pypdf path: ≤80 pages, text capped at _RESCUE_MAX_TEXT."""
@@ -326,6 +430,24 @@ def _extract_pdf_pdfplumber(body: bytes) -> tuple[str, str]:
                 take = t[:_RESCUE_MAX_TEXT - total]
                 parts.append(take)
                 total += len(take)
+                if total < _RESCUE_MAX_TEXT:
+                    try:
+                        tables = page.extract_tables() or []
+                    except Exception:
+                        tables = []
+                    for table in tables[:20]:
+                        markdown = _pdf_table_to_markdown(table)
+                        if not markdown:
+                            continue
+                        take_table = markdown[:min(
+                            _PDF_TABLE_MAX_CHARS,
+                            _RESCUE_MAX_TEXT - total,
+                        )]
+                        if take_table:
+                            parts.append("[PDF table]\n" + take_table)
+                            total += len(take_table)
+                        if total >= _RESCUE_MAX_TEXT:
+                            break
                 if total >= _RESCUE_MAX_TEXT:
                     break
             return title, "\n\n".join(p for p in parts if p).strip()
@@ -362,7 +484,66 @@ def _extract_pdf_pypdf(body: bytes) -> tuple[str, str, str]:
         return "", "", f"pdf_error:{type(e).__name__}"
 
 
-def _extract_pdf(body: bytes, url: str) -> tuple[str, str, float, str]:
+def _extract_pdf_ocr(body: bytes) -> tuple[str, str]:
+    """OCR a scanned PDF with local Poppler and Tesseract when explicitly enabled."""
+    pdftoppm = _shutil.which("pdftoppm")
+    tesseract = _shutil.which("tesseract")
+    if not pdftoppm or not tesseract:
+        return "", "pdf_ocr_tools_missing"
+    started = time.monotonic()
+    try:
+        with _tempfile.TemporaryDirectory(prefix="insane-pdf-ocr-") as root:
+            root_path = _Path(root)
+            source = root_path / "source.pdf"
+            source.write_bytes(body)
+            rendered = _subprocess.run(
+                [pdftoppm, "-f", "1", "-l", str(_OCR_MAX_PAGES), "-r", "150",
+                 "-png", str(source), str(root_path / "page")],
+                capture_output=True, timeout=60, check=False,
+            )
+            if rendered.returncode != 0:
+                return "", "pdf_ocr_render_failed"
+
+            language = "eng"
+            try:
+                listed = _subprocess.run(
+                    [tesseract, "--list-langs"], capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=10, check=False)
+                languages = set((listed.stdout or "").split())
+                if "kor" in languages:
+                    language = "kor+eng" if "eng" in languages else "kor"
+            except Exception:
+                pass
+
+            parts: list[str] = []
+            total = 0
+            for image in sorted(root_path.glob("page-*.png"))[:_OCR_MAX_PAGES]:
+                remaining = _OCR_TOTAL_TIMEOUT - (time.monotonic() - started)
+                if remaining <= 1:
+                    break
+                completed = _subprocess.run(
+                    [tesseract, str(image), "stdout", "-l", language],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                    timeout=min(20, remaining), check=False,
+                )
+                if completed.returncode != 0:
+                    continue
+                text = (completed.stdout or "").strip()
+                take = text[:_RESCUE_MAX_TEXT - total]
+                if take:
+                    parts.append(take)
+                    total += len(take)
+                if total >= _RESCUE_MAX_TEXT:
+                    break
+            output = "\n\n".join(parts).strip()
+            return (output, "") if output else ("", "pdf_ocr_no_text")
+    except _subprocess.TimeoutExpired:
+        return "", "pdf_ocr_timeout"
+    except Exception as exc:
+        return "", f"pdf_ocr_error:{type(exc).__name__}"
+
+
+def _extract_pdf(body: bytes, url: str, enable_ocr: bool = False) -> tuple[str, str, float, str]:
     """Returns (title, text, quality, error_code). error_code is "" on success.
     Caps at 80 pages to keep token budget sane; reports pdf_no_text_layer for
     scanned PDFs (so the caller knows rendering will not help either).
@@ -373,7 +554,7 @@ def _extract_pdf(body: bytes, url: str) -> tuple[str, str, float, str]:
     the extracted text is capped at _RESCUE_MAX_TEXT."""
     if len(body) > _PDF_MAX_BYTES:
         return "", "", 0.0, "pdf_too_large"
-    if _pdfplumber is None and _PdfReader is None:
+    if _pdfplumber is None and _PdfReader is None and not enable_ocr:
         return "", "", 0.0, "pdf_no_extractor"
 
     # 1) pdfplumber (preferred). Only adopt when it yields text.
@@ -387,6 +568,12 @@ def _extract_pdf(body: bytes, url: str) -> tuple[str, str, float, str]:
         return y_title, y_text, _quality_score(y_text), ""
     if y_err and y_err != "pypdf_missing":
         return y_title, "", 0.0, y_err
+
+    if enable_ocr:
+        ocr_text, ocr_error = _extract_pdf_ocr(body)
+        if ocr_text:
+            return (p_title or y_title), ocr_text, _quality_score(ocr_text), "pdf_ocr"
+        return (p_title or y_title), "", 0.0, ocr_error
 
     # Neither produced text: prefer any title we found; report no text layer.
     return (p_title or y_title), "", 0.0, "pdf_no_text_layer"
@@ -459,7 +646,8 @@ class _PWResp:
 
 def _extract_response(resp, final_url: str, inner_text: str = "",
                       enable_markdown: bool = True,
-                      enable_maincontent: bool = False) -> tuple[str, str, float, dict]:
+                      enable_maincontent: bool = False,
+                      enable_ocr: bool = False) -> tuple[str, str, float, dict]:
     """Returns (title, content, quality, meta); meta = {source, error,
     inner_text_used}. The raw body wins by default — see the module-block
     comment for when a rescue path may replace it.
@@ -480,9 +668,11 @@ def _extract_response(resp, final_url: str, inner_text: str = "",
             except Exception:
                 pass
             if bytes(body[:5]) == b"%PDF-" or ctype_pdf:
-                title, text, quality, err = _extract_pdf(bytes(body), final_url)
+                title, text, quality, err = _extract_pdf(
+                    bytes(body), final_url, enable_ocr=enable_ocr)
                 if text:
-                    return title, text, quality, {"source": "pdf", "error": err or "",
+                    source = "pdf+ocr" if err == "pdf_ocr" else "pdf"
+                    return title, text, quality, {"source": source, "error": "",
                                                   "inner_text_used": False}
                 return title, f"[PDF binary, {len(body)} bytes; extractor={err or 'ok'}]", \
                        0.0, {"source": "pdf", "error": err, "inner_text_used": False}
@@ -548,13 +738,16 @@ def _extract_response(resp, final_url: str, inner_text: str = "",
 
 def _maybe_extract(resp, final_url: str, *, enable_extraction: bool,
                    inner_text: str = "", enable_markdown: bool = True,
-                   enable_maincontent: bool = False) -> tuple[str, str, float, dict]:
+                   enable_maincontent: bool = False,
+                   enable_ocr: bool = False) -> tuple[str, str, float, dict]:
     """Run rescue extraction when enabled; otherwise raw text + consistent meta."""
     if not enable_extraction:
         return "", getattr(resp, "text", "") or "", 0.0, \
                {"source": "raw_disabled", "error": "", "inner_text_used": False}
     return _extract_response(resp, final_url, inner_text=inner_text,
-                             enable_markdown=enable_markdown, enable_maincontent=enable_maincontent)
+                             enable_markdown=enable_markdown,
+                             enable_maincontent=enable_maincontent,
+                             enable_ocr=enable_ocr)
 
 
 # --- curl_cffi probe executor ------------------------------------------------
@@ -761,6 +954,69 @@ def _winning_route(result: FetchResult) -> Optional[dict]:
     return None
 
 
+def _archive_fallback(
+    base: FetchResult,
+    url: str,
+    *,
+    timeout: int,
+    proxy: Optional[str],
+    enable_extraction: bool,
+    enable_markdown: bool,
+    enable_maincontent: bool,
+) -> FetchResult:
+    """Opt-in historical fallback. A snapshot is always labeled non-current."""
+    try:
+        from .phase0 import route_archive
+        archived = route_archive(url, timeout=timeout, proxy=proxy)
+    except Exception as exc:
+        archived = {
+            "ok": False,
+            "attempts": [{
+                "route": "wayback", "ok": False, "status": 0, "bytes": 0,
+                "note": f"{type(exc).__name__}",
+            }],
+        }
+    trace = list(base.trace)
+    for item in archived.get("attempts") or []:
+        trace.append(Attempt(
+            phase="archive", executor=item.get("route") or "wayback",
+            url=archived.get("final_url") or url, url_transform="original",
+            impersonate=None, referer="", status=int(item.get("status") or 0),
+            body_size=int(item.get("bytes") or 0),
+            verdict=(Verdict.STRONG_OK.value if item.get("ok") else Verdict.BLOCKED.value),
+            reasons=[item.get("note")] if item.get("note") else [],
+        ))
+    if not archived.get("ok"):
+        base.trace = trace
+        notes = [item.get("note") for item in archived.get("attempts") or [] if item.get("note")]
+        base.summary += f"; archive_failed={notes[-1] if notes else 'unknown'}"
+        return base
+
+    final_url = str(archived.get("final_url") or url)
+    _title, content, quality, meta = _maybe_extract(
+        _PWResp(str(archived.get("content") or ""), final_url), final_url,
+        enable_extraction=enable_extraction,
+        enable_markdown=enable_markdown,
+        enable_maincontent=enable_maincontent,
+    )
+    source = "archive+" + (meta.get("source") or "raw")
+    meta = dict(meta)
+    meta.update({
+        "source": source,
+        "snapshot_timestamp": str(archived.get("timestamp") or ""),
+    })
+    return FetchResult(
+        ok=True, content=content, final_url=final_url,
+        verdict=Verdict.STRONG_OK.value, profile_used="archive:wayback",
+        trace=trace, summary="Historical archive fallback succeeded",
+        planned_attempts=base.planned_attempts,
+        executed_attempts=base.executed_attempts,
+        grid_exhausted=base.grid_exhausted, stop_reason="success",
+        extraction_quality=quality, extraction_source=source,
+        extraction_meta=meta,
+    )
+
+
 def fetch(
     url: str,
     *,
@@ -777,7 +1033,12 @@ def fetch(
     enable_retry: bool = True,
     enable_markdown: bool = True,
     enable_maincontent: bool = False,
+    enable_ocr: bool = False,
+    enable_archive: bool = False,
+    force_media: bool = False,
+    include_media_transcript: bool = False,
     proxy: Optional[str] = None,
+    cookie_file: Optional[str] = None,
 ) -> FetchResult:
     """Public entrypoint — the generic grid wrapped with per-host self-learning.
 
@@ -807,6 +1068,12 @@ def fetch(
     for raw HTML. No-op when markdownify is not installed.
     ``enable_maincontent`` (opt-in) instead strips boilerplate via resiliparse."""
     proxy = normalize_proxy(proxy)
+    cookies: list[dict] = []
+    if cookie_file:
+        from .session_input import load_cookie_file
+        from .transport import POOL, _host_of
+        cookies = load_cookie_file(cookie_file, url)
+        POOL.seed_cookies(_host_of(url), cookies, proxy=proxy)
     priority: Optional[dict] = None
     learned_existed = False
     uh = dict(user_hint or {})
@@ -829,10 +1096,21 @@ def fetch(
         priority=priority,
         enable_extraction=enable_extraction, enable_retry=enable_retry,
         enable_markdown=enable_markdown, enable_maincontent=enable_maincontent,
-        proxy=proxy,
+        enable_ocr=enable_ocr, force_media=force_media,
+        include_media_transcript=include_media_transcript,
+        proxy=proxy, cookies=cookies,
     )
 
+    if enable_archive and not result.ok:
+        result = _archive_fallback(
+            result, url, timeout=timeout, proxy=proxy,
+            enable_extraction=enable_extraction,
+            enable_markdown=enable_markdown,
+            enable_maincontent=enable_maincontent,
+        )
+
     result.proxy_used = proxy is not None
+    result.session_seeded = bool(cookies)
     if not result.ok:
         result.network_diagnosis = diagnose_trace(result.trace)
 
@@ -876,7 +1154,11 @@ def _fetch_core(
     enable_retry: bool = True,
     enable_markdown: bool = True,
     enable_maincontent: bool = False,
+    enable_ocr: bool = False,
+    force_media: bool = False,
+    include_media_transcript: bool = False,
     proxy: Optional[str] = None,
+    cookies: Optional[list[dict]] = None,
 ) -> FetchResult:
     """Fetch `url` using the generic diversity grid.
 
@@ -917,8 +1199,18 @@ def _fetch_core(
     # is what made Reddit/X look "blocked" (grid 403'd .json; nobody tried .rss).
     if enable_phase0:
         try:
-            from .phase0 import route as _phase0_route
-            p0 = _phase0_route(url, timeout=timeout, proxy=proxy)
+            if force_media:
+                from .phase0 import route_media as _phase0_route_media
+                p0 = _phase0_route_media(
+                    url, timeout=timeout, proxy=proxy,
+                    include_transcript=include_media_transcript,
+                    cookies=cookies)
+            else:
+                from .phase0 import route as _phase0_route
+                p0 = _phase0_route(
+                    url, timeout=timeout, proxy=proxy,
+                    include_media_transcript=include_media_transcript,
+                    cookies=cookies)
         except Exception as e:  # router must never break the generic chain
             p0 = None
             trace.append(Attempt(
@@ -936,12 +1228,19 @@ def _fetch_core(
                     reasons=[a["note"]] if a.get("note") else [],
                 ))
             if p0["ok"]:
+                content_kind = p0.get("content_kind") or "phase0"
                 return FetchResult(
                     ok=True, content=p0["content"], final_url=p0["final_url"],
                     verdict=Verdict.STRONG_OK.value,
                     profile_used=f"phase0:{p0['platform']}", trace=trace,
                     summary=f"Phase 0 official route: {p0['platform']}:{p0['route']}",
                     stop_reason="success",
+                    extraction_quality=_quality_score(p0["content"]),
+                    extraction_source=content_kind,
+                    extraction_meta={
+                        "source": content_kind,
+                        "transcript_available": bool(p0.get("transcript")),
+                    },
                 )
             # Recognised platform but every official route failed → fall through
             # to the generic grid (don't give up; R6).
@@ -988,7 +1287,9 @@ def _fetch_core(
                                  planned=0, executed=curl_attempts,
                                  grid_exhausted=False, stop_reason="success",
                                  enable_extraction=enable_extraction,
-                                 enable_markdown=enable_markdown, enable_maincontent=enable_maincontent)
+                                 enable_markdown=enable_markdown,
+                                 enable_maincontent=enable_maincontent,
+                                 enable_ocr=enable_ocr)
         if probe_attempt.verdict == Verdict.SUSPECT_OK.value:
             best_suspect = (probe_resp, probe_attempt)
         elif probe_attempt.verdict in _TERMINAL_NONSUCCESS_VALUES:
@@ -1030,7 +1331,9 @@ def _fetch_core(
                                      planned=planned, executed=curl_attempts,
                                      grid_exhausted=False, stop_reason="success",
                                      enable_extraction=enable_extraction,
-                                     enable_markdown=enable_markdown, enable_maincontent=enable_maincontent)
+                                     enable_markdown=enable_markdown,
+                                     enable_maincontent=enable_maincontent,
+                                     enable_ocr=enable_ocr)
             if att.verdict == Verdict.SUSPECT_OK.value and best_suspect is None:
                 best_suspect = (resp, att)
             if att.verdict in _TERMINAL_NONSUCCESS_VALUES:
@@ -1073,7 +1376,7 @@ def _fetch_core(
                     url, profile_id=profile_used or "unknown_challenge",
                     success_selectors=success_selectors, device_class=device_class,
                     force_executor=fb_name, timeout=timeout if timeout and timeout > 30 else 90,
-                    proxy=proxy,
+                    proxy=proxy, cookies=cookies,
                 )
                 trace.append(pw_attempt)
                 if not is_mcp_stub and getattr(pw_attempt, "_executed", True):
@@ -1086,7 +1389,9 @@ def _fetch_core(
                     _t, pw_out, pw_q, pw_meta = _maybe_extract(
                         _PWResp(pw_content, pw_attempt.url), pw_attempt.url,
                         enable_extraction=enable_extraction, inner_text=pw_inner,
-                        enable_markdown=enable_markdown, enable_maincontent=enable_maincontent)
+                        enable_markdown=enable_markdown,
+                        enable_maincontent=enable_maincontent,
+                        enable_ocr=enable_ocr)
                     return FetchResult(
                         ok=True, content=pw_out, final_url=pw_attempt.url,
                         verdict=pw_attempt.verdict, profile_used=profile_used,
@@ -1246,11 +1551,13 @@ def fetch_many(urls: list[str], **kwargs) -> list[FetchResult]:
 def _build_result(resp, attempt: Attempt, trace: list[Attempt], profile_used: Optional[str],
                   *, planned: int, executed: int, grid_exhausted: bool, stop_reason: str,
                   enable_extraction: bool = True, enable_markdown: bool = True,
-                  enable_maincontent: bool = False) -> FetchResult:
+                  enable_maincontent: bool = False,
+                  enable_ocr: bool = False) -> FetchResult:
     final_url = str(getattr(resp, "url", attempt.url))
     _t, content, quality, meta = _maybe_extract(
         resp, final_url, enable_extraction=enable_extraction,
-        enable_markdown=enable_markdown, enable_maincontent=enable_maincontent)
+        enable_markdown=enable_markdown, enable_maincontent=enable_maincontent,
+        enable_ocr=enable_ocr)
     return FetchResult(
         ok=True,
         content=content,

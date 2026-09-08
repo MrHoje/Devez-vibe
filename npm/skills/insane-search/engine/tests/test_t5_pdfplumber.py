@@ -116,11 +116,14 @@ def t_no_extractor_graceful() -> None:
 def t_no_agpl_import() -> None:
     # AGPL guard: no actual import of pymupdf / fitz (the pymupdf import name).
     # A prohibition mention in a comment is fine — only real imports are banned.
-    import subprocess
-    r = subprocess.run(
-        ["grep", "-rnE", r"^\s*(import|from)\s+(pymupdf|fitz)\b", "engine/"],
-        capture_output=True, text=True, cwd=ROOT)
-    assert r.stdout.strip() == "", f"AGPL pymupdf/fitz import found:\n{r.stdout}"
+    import pathlib
+    import re
+    hits = []
+    pattern = re.compile(r"^\s*(import|from)\s+(pymupdf|fitz)\b", re.MULTILINE)
+    for path in (pathlib.Path(ROOT) / "engine").rglob("*.py"):
+        if pattern.search(path.read_text(encoding="utf-8", errors="ignore")):
+            hits.append(str(path))
+    assert not hits, f"AGPL pymupdf/fitz import found: {hits}"
     print("  ✓ no AGPL pymupdf/fitz import in engine/ (comment mention allowed)")
 
 

@@ -8,7 +8,9 @@ from pathlib import Path
 
 import pytest
 
-_MODULE_PATH = Path(__file__).resolve().parents[1] / "engine" / "x_search.py"
+_SKILL_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_SKILL_ROOT))
+_MODULE_PATH = _SKILL_ROOT / "engine" / "x_search.py"
 _SPEC = importlib.util.spec_from_file_location("engine.x_search", _MODULE_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
 x_search = importlib.util.module_from_spec(_SPEC)

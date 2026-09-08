@@ -19,6 +19,8 @@ def main() -> int:
     timeout_ms = int(args.get("timeout", 60000))
     with InvisiblePlaywright(**launch) as browser:
         page = browser.new_page()
+        if args.get("cookies"):
+            page.context.add_cookies(args["cookies"])
         page.set_default_timeout(timeout_ms)
         response = page.goto(args["url"], wait_until="domcontentloaded", timeout=timeout_ms)
         page.wait_for_timeout(3500)

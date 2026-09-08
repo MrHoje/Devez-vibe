@@ -25,13 +25,17 @@ Each attempt dict: {"route","platform","ok","status","bytes","note"}.
 from __future__ import annotations
 
 import importlib.util
+import html
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 from typing import Optional
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 
 # --- low-level helpers -------------------------------------------------------
@@ -188,33 +192,254 @@ def _ytdlp_argv() -> Optional[list[str]]:
     return None
 
 
-def _youtube(url: str, timeout: int, proxy: Optional[str] = None) -> dict:
+def _clean_caption_line(line: str) -> str:
+    line = re.sub(r"<[^>]+>", "", line)
+    line = html.unescape(line).strip()
+    return "" if line.startswith(("Kind:", "Language:")) else line
+
+
+def _vtt_segments(vtt: str) -> list[dict[str, str]]:
+    """Parse bounded WebVTT cues so final citations can include timestamps."""
+    source = (vtt or "")[:2_000_000].splitlines()
+    segments: list[dict[str, str]] = []
+    total = 0
+    index = 0
+    while index < len(source):
+        timing = source[index].strip()
+        if "-->" not in timing:
+            index += 1
+            continue
+        start, end = [part.strip().split()[0] for part in timing.split("-->", 1)]
+        index += 1
+        cue: list[str] = []
+        while index < len(source) and source[index].strip():
+            line = _clean_caption_line(source[index])
+            if line and (not cue or cue[-1] != line):
+                cue.append(line)
+            index += 1
+        text = " ".join(cue).strip()
+        if text and segments and text.startswith(segments[-1]["text"]):
+            text = text[len(segments[-1]["text"]):].strip()
+        if text and (not segments or segments[-1]["text"] != text):
+            take = text[:max(0, 500_000 - total)]
+            if take:
+                segments.append({"start": start, "end": end, "text": take})
+                total += len(take)
+        if total >= 500_000 or len(segments) >= 5000:
+            break
+        index += 1
+    return segments
+
+
+def _vtt_to_text(vtt: str) -> str:
+    lines: list[str] = []
+    for segment in _vtt_segments(vtt):
+        text = segment["text"]
+        if not lines or lines[-1] != text:
+            lines.append(text)
+    return "\n".join(lines)[:500_000]
+
+
+def _choose_subtitle_language(metadata: dict, preferred: tuple[str, ...] = ("ko", "en")) -> tuple[str, str] | None:
+    """Choose a creator subtitle first, then an automatic caption."""
+    for key, source in (("subtitles", "creator"), ("automatic_captions", "automatic")):
+        available = metadata.get(key) or {}
+        for wanted in preferred:
+            if wanted in available:
+                return wanted, source
+            match = next((lang for lang in available if lang.lower().startswith(wanted.lower() + "-")), None)
+            if match:
+                return match, source
+    return None
+
+
+_YTDLP_ARGV_CACHE: Optional[list[str]] = None
+
+
+def _ensure_ytdlp_argv(allow_install: bool) -> Optional[list[str]]:
+    """Resolve yt-dlp, optionally installing it into an isolated first-use venv."""
+    global _YTDLP_ARGV_CACHE
+    available = _ytdlp_argv()
+    if available is not None:
+        return available
+    if not allow_install:
+        return None
+    if os.environ.get("INSANE_AUTO_INSTALL", "").strip().lower() in ("0", "false", "no"):
+        return None
+    if _YTDLP_ARGV_CACHE is not None:
+        return _YTDLP_ARGV_CACHE or None
+    root = os.path.expanduser("~/.insane-search/media-venv")
+    python = os.path.join(
+        root, "Scripts", "python.exe") if os.name == "nt" else os.path.join(root, "bin", "python")
+    try:
+        if not os.path.isfile(python):
+            subprocess.run(
+                [sys.executable, "-m", "venv", root], capture_output=True,
+                text=True, timeout=180, check=False)
+        probe = subprocess.run(
+            [python, "-m", "yt_dlp", "--version"], capture_output=True,
+            text=True, timeout=30, check=False)
+        if probe.returncode != 0:
+            installed = subprocess.run(
+                [python, "-m", "pip", "install", "yt-dlp", "-q"],
+                capture_output=True, text=True, timeout=300, check=False)
+            if installed.returncode != 0:
+                _YTDLP_ARGV_CACHE = []
+                return None
+        _YTDLP_ARGV_CACHE = [python, "-m", "yt_dlp"]
+        return list(_YTDLP_ARGV_CACHE)
+    except Exception:
+        _YTDLP_ARGV_CACHE = []
+        return None
+
+
+def _attach_transcript(metadata: dict, url: str, argv: list[str], timeout: int,
+                       proxy: Optional[str], cookie_path: Optional[str] = None) -> dict:
+    choice = _choose_subtitle_language(metadata)
+    if choice is None:
+        metadata["research_transcript"] = {"available": False, "reason": "no_subtitles"}
+        return metadata
+    language, source = choice
+    try:
+        with tempfile.TemporaryDirectory(prefix="insane-media-") as root:
+            command = argv + [
+                "--write-subs", "--write-auto-subs", "--sub-langs", language,
+                "--sub-format", "vtt", "--skip-download", "--no-playlist",
+                "--paths", root, "-o", "%(id)s.%(ext)s",
+            ]
+            if proxy:
+                command += ["--proxy", proxy]
+            if cookie_path:
+                command += ["--cookies", cookie_path]
+            completed = subprocess.run(
+                command + [url], capture_output=True, text=True,
+                timeout=max(timeout, 90), check=False)
+            files = sorted(Path(root).glob("*.vtt"))
+            text = ""
+            segments: list[dict[str, str]] = []
+            if completed.returncode == 0 and files:
+                raw_vtt = files[0].read_text(encoding="utf-8", errors="replace")
+                segments = _vtt_segments(raw_vtt)
+                text = _vtt_to_text(raw_vtt)
+            metadata["research_transcript"] = {
+                "available": bool(text),
+                "language": language,
+                "source": source,
+                "text": text,
+                "segments": segments,
+                "reason": "" if text else "subtitle_download_failed",
+            }
+    except subprocess.TimeoutExpired:
+        metadata["research_transcript"] = {"available": False, "reason": "subtitle_timeout"}
+    except Exception as exc:
+        metadata["research_transcript"] = {
+            "available": False, "reason": f"subtitle_error:{type(exc).__name__}"}
+    return metadata
+
+
+def _compact_media_metadata(metadata: dict) -> dict:
+    """Drop signed streams and extractor internals that waste research tokens."""
+    keys = (
+        "id", "title", "description", "uploader", "uploader_id", "channel",
+        "channel_id", "duration", "duration_string", "upload_date", "timestamp",
+        "release_date", "webpage_url", "original_url", "availability", "live_status",
+        "view_count", "like_count", "comment_count", "categories", "tags", "chapters",
+    )
+    compact = {key: metadata[key] for key in keys if metadata.get(key) is not None}
+    compact["subtitle_languages"] = sorted((metadata.get("subtitles") or {}).keys())[:100]
+    compact["automatic_caption_languages"] = sorted(
+        (metadata.get("automatic_captions") or {}).keys())[:100]
+    if "research_transcript" in metadata:
+        compact["research_transcript"] = metadata["research_transcript"]
+    return compact
+
+
+def _write_cookie_jar(cookies: list[dict]) -> str:
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", prefix="insane-media-cookies-", suffix=".txt",
+        delete=False)
+    try:
+        handle.write("# Netscape HTTP Cookie File\n")
+        for cookie in cookies:
+            domain = str(cookie.get("domain") or "")
+            include_subdomains = "TRUE" if domain.startswith(".") else "FALSE"
+            fields = (
+                domain, include_subdomains, str(cookie.get("path") or "/"),
+                "TRUE" if cookie.get("secure") else "FALSE",
+                str(int(cookie.get("expires") or 0)), str(cookie.get("name") or ""),
+                str(cookie.get("value") or ""),
+            )
+            handle.write("\t".join(fields) + "\n")
+        return handle.name
+    finally:
+        handle.close()
+
+
+def _media(url: str, timeout: int, proxy: Optional[str] = None,
+           include_transcript: bool = False, platform: str = "media",
+           cookies: Optional[list[dict]] = None,
+           auto_install: bool = False) -> dict:
     attempts: list[dict] = []
-    argv = _ytdlp_argv()
+    argv = _ensure_ytdlp_argv(auto_install)
     if argv is None:
-        attempts.append(_attempt("youtube", "yt-dlp", False, 0, "", "yt-dlp not installed"))
-        return {"platform": "youtube", "ok": False, "route": None, "content": "",
+        attempts.append(_attempt(platform, "yt-dlp", False, 0, "", "yt-dlp not installed"))
+        return {"platform": platform, "ok": False, "route": None, "content": "",
                 "final_url": url, "attempts": attempts}
+    cookie_path = _write_cookie_jar(cookies) if cookies else None
     try:
         command = argv + ["--dump-json", "--skip-download"]
         if proxy:
             command += ["--proxy", proxy]
+        if cookie_path:
+            command += ["--cookies", cookie_path]
         p = subprocess.run(
             command + [url],
             capture_output=True, text=True, timeout=max(timeout, 60),
         )
         ok = p.returncode == 0 and p.stdout.strip().startswith("{")
-        note = "json" if ok else (p.stderr or "").strip()[:80]
-        attempts.append(_attempt("youtube", "yt-dlp", ok, 200 if ok else 0, p.stdout, note))
+        diagnostic = p.stderr or ""
+        if cookie_path:
+            diagnostic = diagnostic.replace(cookie_path, "<cookie-file>")
+        if cookies:
+            from .session_input import redact_cookie_values
+            diagnostic = redact_cookie_values(diagnostic, cookies) or ""
+        note = "json" if ok else diagnostic.strip()[:80]
+        attempts.append(_attempt(platform, "yt-dlp", ok, 200 if ok else 0, p.stdout, note))
         if ok:
-            return {"platform": "youtube", "ok": True, "route": "yt-dlp",
-                    "content": p.stdout, "final_url": url, "attempts": attempts}
+            metadata = json.loads(p.stdout)
+            if include_transcript:
+                metadata = _attach_transcript(
+                    metadata, url, argv, timeout, proxy, cookie_path)
+            if include_transcript or platform == "media":
+                metadata = _compact_media_metadata(metadata)
+            transcript_available = bool(
+                (metadata.get("research_transcript") or {}).get("available"))
+            return {"platform": platform, "ok": True, "route": "yt-dlp",
+                    "content": json.dumps(metadata, ensure_ascii=False),
+                    "final_url": url, "attempts": attempts,
+                    "content_kind": ("media+transcript" if transcript_available
+                                     else "media_metadata"),
+                    "transcript": transcript_available}
     except FileNotFoundError:
-        attempts.append(_attempt("youtube", "yt-dlp", False, 0, "", "yt-dlp not installed"))
+        attempts.append(_attempt(platform, "yt-dlp", False, 0, "", "yt-dlp not installed"))
     except Exception as e:
-        attempts.append(_attempt("youtube", "yt-dlp", False, 0, "", f"{type(e).__name__}"))
-    return {"platform": "youtube", "ok": False, "route": None, "content": "",
+        attempts.append(_attempt(platform, "yt-dlp", False, 0, "", f"{type(e).__name__}"))
+    finally:
+        if cookie_path:
+            try:
+                Path(cookie_path).unlink()
+            except OSError:
+                pass
+    return {"platform": platform, "ok": False, "route": None, "content": "",
             "final_url": url, "attempts": attempts}
+
+
+def _youtube(url: str, timeout: int, proxy: Optional[str] = None,
+             include_transcript: bool = False,
+             cookies: Optional[list[dict]] = None) -> dict:
+    return _media(
+        url, timeout, proxy, include_transcript, platform="youtube", cookies=cookies,
+        auto_install=include_transcript)
 
 
 # --- threads -----------------------------------------------------------------
@@ -273,8 +498,100 @@ _ROUTERS = {"reddit": _reddit, "x": _x, "youtube": _youtube, "threads": _threads
 
 
 # --- public entrypoint -------------------------------------------------------
-def route(url: str, *, timeout: int = 15, proxy: Optional[str] = None) -> Optional[dict]:
+def route_media(url: str, *, timeout: int = 15, proxy: Optional[str] = None,
+                include_transcript: bool = False,
+                cookies: Optional[list[dict]] = None) -> dict:
+    return _media(
+        url, timeout, proxy, include_transcript, platform="media", cookies=cookies,
+        auto_install=True)
+
+
+class _ArchiveResponse:
+    def __init__(self, status: int, text: str, url: str, transport: str):
+        self.status_code = status
+        self.text = text
+        self.url = url
+        self.transport = transport
+
+    def json(self):
+        return json.loads(self.text)
+
+
+def _archive_get(url: str, timeout: int, proxy: Optional[str]) -> _ArchiveResponse:
+    try:
+        response = _cffi_get(url, timeout=timeout, proxy=proxy)
+        response.transport = "curl_cffi"
+        return response
+    except Exception:
+        from .executor import run_playwright_fallback
+        attempt, body = run_playwright_fallback(
+            url, profile_id="unknown_challenge", force_executor="scrapling",
+            timeout=max(timeout, 60), proxy=proxy)
+        inner = str(getattr(attempt, "_inner_text", "") or "").strip()
+        if inner:
+            text = inner
+        else:
+            text = html.unescape(re.sub(r"(?s)<[^>]+>", " ", body or ""))
+            text = re.sub(r"\s+", " ", text).strip()
+        return _ArchiveResponse(
+            int(getattr(attempt, "status", 0) or 0), text if text else body,
+            str(getattr(attempt, "url", "") or url), "system_browser")
+
+
+def route_archive(url: str, *, timeout: int = 15, proxy: Optional[str] = None) -> dict:
+    """Retrieve the closest public Wayback snapshot without treating it as current."""
+    from .safety import allow_private_default, classify_url
+
+    attempts: list[dict] = []
+    safe, reason = classify_url(url, allow_private_default())
+    if not safe:
+        attempts.append(_attempt("archive", "wayback-available", False, 0, "", reason))
+        return {"platform": "archive", "ok": False, "route": None, "content": "",
+                "final_url": url, "attempts": attempts, "timestamp": ""}
+    try:
+        api_url = "https://archive.org/wayback/available?url=" + quote(url, safe="")
+        response = _archive_get(api_url, timeout=timeout, proxy=proxy)
+        data = response.json() if response.status_code == 200 else {}
+        closest = ((data.get("archived_snapshots") or {}).get("closest") or {})
+        snapshot = str(closest.get("url") or "")
+        timestamp = str(closest.get("timestamp") or "")
+        valid_snapshot = (
+            closest.get("available") is True
+            and str(closest.get("status") or "") == "200"
+            and urlsplit(snapshot).hostname == "web.archive.org"
+        )
+        attempts.append(_attempt(
+            "archive", "wayback-available", valid_snapshot, response.status_code,
+            response.text,
+            (("snapshot:" + getattr(response, "transport", "unknown")) if valid_snapshot
+             else (f"status={response.status_code}" if response.status_code != 200
+                   else "no_snapshot"))))
+        if not valid_snapshot:
+            return {"platform": "archive", "ok": False, "route": None, "content": "",
+                    "final_url": url, "attempts": attempts, "timestamp": ""}
+        page = _archive_get(snapshot, timeout=max(timeout, 30), proxy=proxy)
+        ok = page.status_code == 200 and len(page.text or "") >= 200
+        attempts.append(_attempt(
+            "archive", "wayback-snapshot", ok, page.status_code, page.text,
+            (("historical_snapshot:" + getattr(page, "transport", "unknown"))
+             if ok else "snapshot_fetch_failed")))
+        return {"platform": "archive", "ok": ok,
+                "route": "wayback" if ok else None,
+                "content": page.text if ok else "", "final_url": snapshot if ok else url,
+                "attempts": attempts, "timestamp": timestamp if ok else ""}
+    except Exception as exc:
+        attempts.append(_attempt(
+            "archive", "wayback-available", False, 0, "", f"{type(exc).__name__}"))
+        return {"platform": "archive", "ok": False, "route": None, "content": "",
+                "final_url": url, "attempts": attempts, "timestamp": ""}
+
+
+def route(url: str, *, timeout: int = 15, proxy: Optional[str] = None,
+          include_media_transcript: bool = False,
+          cookies: Optional[list[dict]] = None) -> Optional[dict]:
     platform = _detect(url)
     if platform is None:
         return None
+    if platform == "youtube":
+        return _youtube(url, timeout, proxy, include_media_transcript, cookies)
     return _ROUTERS[platform](url, timeout, proxy)

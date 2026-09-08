@@ -27,6 +27,8 @@ def main() -> int:
         browser = p.chromium.launch(**launch)
         try:
             page = browser.new_page()
+            if args.get("cookies"):
+                page.context.add_cookies(args["cookies"])
             page.goto(args["url"], timeout=timeout_ms, wait_until="domcontentloaded")
             page.wait_for_timeout(5000)  # JS challenge solve window
             sel = args.get("waitSelector")

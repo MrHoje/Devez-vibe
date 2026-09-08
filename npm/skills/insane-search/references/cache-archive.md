@@ -55,6 +55,14 @@ done
 
 ## 3. Wayback Machine (Internet Archive)
 
+현재 페이지 접근이 실패한 뒤 가장 가까운 스냅샷을 자동 조회하려면 다음을 쓴다.
+
+```bash
+python3 -m engine "{URL}" --archive --bundle
+```
+
+성공 결과는 `source_kind=archive`, `currentness=historical_snapshot`, `source_timestamp`로 표시된다. 현재 상태의 증거로 사용하면 안 된다. 자동 경로는 공식 조회 API만 사용하며, 스냅샷이 없으면 원래 실패 결과를 유지한다.
+
 ```bash
 # 스냅샷 존재 여부 확인
 curl -sL "https://archive.org/wayback/available?url={URL}"
@@ -77,7 +85,7 @@ curl -sL "https://web.archive.org/cdx/search/cdx?url={URL}&output=json&fl=timest
 ## 시도 순서
 
 ```
-1. AMP 캐시 (뉴스/미디어 사이트 → 높은 성공률)
-2. archive.today (페이월/삭제 콘텐츠 → 아카이브 있으면 확실)
-3. Wayback Machine (오래된 콘텐츠 → 스냅샷 있으면 확실)
+1. 엔진 `--archive` (공식 Wayback 조회, 과거 자료로 명시)
+2. AMP 캐시 (뉴스/미디어 사이트 → 높은 성공률)
+3. archive.today (페이월/삭제 콘텐츠 → 아카이브가 이미 있을 때)
 ```

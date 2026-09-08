@@ -20,6 +20,8 @@ def main() -> int:
         options["wait_selector"] = args["waitSelector"]
     if args.get("proxy"):
         options["proxy"] = args["proxy"]
+    if args.get("cookies"):
+        options["cookies"] = args["cookies"]
 
     page = StealthyFetcher.fetch(args["url"], **options)
     html = getattr(page, "html_content", "") or ""

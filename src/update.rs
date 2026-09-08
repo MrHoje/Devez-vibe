@@ -22,9 +22,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "근거 중심 Researcher 역할을 추가하고 Reviewer 구현은 유지한 채 역할 선택 화면과 /agent 명령에서는 잠시 숨깁니다.",
-    "차단된 공개 페이지는 가벼운 검색 경로가 실패할 때만 숨김 Scrapling과 Firefox를 순서대로 호출하고 네트워크 차단 원인과 승인된 프록시 경로를 함께 처리합니다.",
-    "/provider에서 모델까지 지정하면 연결 성공 후 해당 모델을 적용하고, 연결이나 모델 조회에 실패하면 보류된 선택을 지웁니다.",
+    "Researcher가 주장별 원출처·독립 확인·충돌·최신성을 판정하고 조회 시각과 본문 해시가 포함된 근거 묶음을 남깁니다.",
+    "스캔 PDF와 표, 영상 자막과 시각, Wayback 보관 자료를 처리하고 사용자 승인 쿠키와 프록시는 대상 호스트와 임시 세션으로 제한합니다.",
+    "Claude와 Codex 모델은 high를 지원하면 기본 추론 강도로 선택하고 /provider의 모델 별칭은 대소문자와 관계없이 인식합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

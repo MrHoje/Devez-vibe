@@ -36,6 +36,13 @@ from .fetch_chain import Attempt
 TEMPLATES_DIR = os.path.join(os.path.dirname(__file__), "templates")
 
 
+def _redact_diagnostics(text: Optional[str], proxy: Optional[str],
+                        cookies: Optional[list[dict]]) -> Optional[str]:
+    from .network import redact_proxy
+    from .session_input import redact_cookie_values
+    return redact_cookie_values(redact_proxy(text, proxy), cookies)
+
+
 def _profile_dir_for(url: str, choice: str) -> str:
     """Per-host + per-device Chrome profile directory.
 
@@ -174,7 +181,7 @@ def _run_python_template(template: str, args: dict, timeout: int = 90,
 
 def _run_protocol_stealth(
     att: Attempt, url: str, *, success_selectors: Optional[list[str]], timeout: int, t0: float,
-    proxy: Optional[str] = None,
+    proxy: Optional[str] = None, cookies: Optional[list[dict]] = None,
 ) -> tuple[Attempt, str]:
     """nodriver (raw CDP, no Playwright shim) first, patchright channel=chrome next.
 
@@ -187,9 +194,13 @@ def _run_protocol_stealth(
     if proxy:
         from .network import proxy_for_browser
         args["proxy"] = proxy_for_browser(proxy)
+    if cookies:
+        args["cookies"] = cookies
     if success_selectors:
         args["waitSelector"] = success_selectors[0]
-    for pkg, template in (("nodriver", "nodriver_fetch.py"), ("patchright", "patchright_fetch.py")):
+    drivers = (("patchright", "patchright_fetch.py"),) if cookies else (
+        ("nodriver", "nodriver_fetch.py"), ("patchright", "patchright_fetch.py"))
+    for pkg, template in drivers:
         if not _module_available(pkg) and not _auto_install(pkg):
             continue
         att._executed = True
@@ -197,8 +208,7 @@ def _run_protocol_stealth(
         att.executor = f"protocol_stealth_chrome:{pkg}"
         att.elapsed_s = round(time.time() - t0, 3)
         if rc != 0 or not stdout:
-            from .network import redact_proxy
-            att.error = f"{pkg}: {(redact_proxy(stderr, proxy) or 'no stdout')[:200]}"
+            att.error = f"{pkg}: {(_redact_diagnostics(stderr, proxy, cookies) or 'no stdout')[:200]}"
             continue
         resp = _FakeResp(stdout)
         vr = validate(resp, success_selectors=success_selectors)
@@ -255,7 +265,7 @@ def _scrapling_python() -> Optional[str]:
 def _run_scrapling(
     att: Attempt, url: str, *, profile_id: str,
     success_selectors: Optional[list[str]], timeout: int, t0: float,
-    proxy: Optional[str],
+    proxy: Optional[str], cookies: Optional[list[dict]] = None,
 ) -> tuple[Attempt, str]:
     """Run Scrapling as the primary hidden browser fallback."""
     python = _scrapling_python()
@@ -279,6 +289,8 @@ def _run_scrapling(
     if proxy:
         from .network import proxy_for_browser
         args["proxy"] = proxy_for_browser(proxy)
+    if cookies:
+        args["cookies"] = cookies
 
     att._executed = True
     if python == sys.executable:
@@ -291,8 +303,7 @@ def _run_scrapling(
     att.executor = "scrapling:stealthy_fetcher"
     att.elapsed_s = round(time.time() - t0, 3)
     if rc != 0 or not stdout:
-        from .network import redact_proxy
-        att.error = (redact_proxy(stderr, proxy) or "no stdout")[:300]
+        att.error = (_redact_diagnostics(stderr, proxy, cookies) or "no stdout")[:300]
         att.verdict = Verdict.UNKNOWN.value
         return att, ""
 
@@ -312,6 +323,7 @@ def _run_scrapling(
 def _run_stealth_firefox(
     att: Attempt, url: str, *, success_selectors: Optional[list[str]], timeout: int,
     t0: float, profile_dir: Optional[str], proxy: Optional[str],
+    cookies: Optional[list[dict]] = None,
 ) -> tuple[Attempt, str]:
     """Run the optional Python-only stealth Firefox without a sidecar server."""
     module = "invisible_playwright"
@@ -325,10 +337,13 @@ def _run_stealth_firefox(
         att.elapsed_s = round(time.time() - t0, 3)
         return att, ""
 
+    ephemeral_profile = None
+    if cookies and profile_dir is None:
+        ephemeral_profile = tempfile.mkdtemp(prefix="insane-firefox-session-")
     args: dict = {
         "url": url,
         "timeout": timeout * 1000,
-        "profileDir": profile_dir or _profile_dir_for(url, "stealth_firefox"),
+        "profileDir": profile_dir or ephemeral_profile or _profile_dir_for(url, "stealth_firefox"),
         "headless": True,
     }
     if success_selectors:
@@ -336,15 +351,18 @@ def _run_stealth_firefox(
     if proxy:
         from .network import proxy_for_browser
         args["proxy"] = proxy_for_browser(proxy)
+    if cookies:
+        args["cookies"] = cookies
 
     rc, stdout, stderr = _run_python_template(
         "invisible_playwright_fetch.py", args, timeout=timeout + 30)
+    if ephemeral_profile:
+        shutil.rmtree(ephemeral_profile, ignore_errors=True)
     att._executed = True
     att.executor = "stealth_firefox:invisible_playwright"
     att.elapsed_s = round(time.time() - t0, 3)
     if rc != 0 or not stdout:
-        from .network import redact_proxy
-        att.error = (redact_proxy(stderr, proxy) or "no stdout")[:300]
+        att.error = (_redact_diagnostics(stderr, proxy, cookies) or "no stdout")[:300]
         att.verdict = Verdict.UNKNOWN.value
         return att, ""
 
@@ -429,6 +447,7 @@ def run_playwright_fallback(
     profile_dir: Optional[str] = None,
     force_executor: Optional[str] = None,
     proxy: Optional[str] = None,
+    cookies: Optional[list[dict]] = None,
 ) -> tuple[Attempt, str]:
     """Invoke the appropriate Playwright executor.
 
@@ -457,17 +476,17 @@ def run_playwright_fallback(
     if choice == "scrapling":
         return _run_scrapling(
             att, url, profile_id=profile_id, success_selectors=success_selectors,
-            timeout=timeout, t0=t0, proxy=proxy)
+            timeout=timeout, t0=t0, proxy=proxy, cookies=cookies)
 
     if choice == "protocol_stealth_chrome":
         return _run_protocol_stealth(
             att, url, success_selectors=success_selectors, timeout=timeout,
-            t0=t0, proxy=proxy)
+            t0=t0, proxy=proxy, cookies=cookies)
 
     if choice == "stealth_firefox":
         return _run_stealth_firefox(
             att, url, success_selectors=success_selectors, timeout=timeout,
-            t0=t0, profile_dir=profile_dir, proxy=proxy)
+            t0=t0, profile_dir=profile_dir, proxy=proxy, cookies=cookies)
 
     if choice.startswith("playwright_mcp"):
         att.error = (
@@ -499,6 +518,9 @@ def run_playwright_fallback(
         att.elapsed_s = round(time.time() - t0, 3)
         return att, ""
 
+    ephemeral_profile = None
+    if cookies and profile_dir is None:
+        ephemeral_profile = tempfile.mkdtemp(prefix="insane-browser-session-")
     args: dict = {
         "url": url,
         # Per-host + per-device profile isolation. A single shared profile dir
@@ -506,7 +528,7 @@ def run_playwright_fallback(
         # profile-lock collisions when two fallbacks ran concurrently. Hashing
         # the host (not storing it) keeps the No-Site-Name Rule intact while
         # letting a host reuse its own warm storageState across calls.
-        "profileDir": profile_dir or _profile_dir_for(url, choice),
+        "profileDir": profile_dir or ephemeral_profile or _profile_dir_for(url, choice),
         "timeout": timeout * 1000,
         "headless": True,
     }
@@ -517,15 +539,18 @@ def run_playwright_fallback(
     if proxy:
         from .network import proxy_for_browser
         args["proxy"] = proxy_for_browser(proxy)
+    if cookies:
+        args["cookies"] = cookies
 
     att._executed = True
     rc, stdout, stderr = _run_node_template(template, args, timeout=timeout + 10,
                                             deps_root=deps_root)
+    if ephemeral_profile:
+        shutil.rmtree(ephemeral_profile, ignore_errors=True)
     att.elapsed_s = round(time.time() - t0, 3)
 
     if rc != 0 or not stdout:
-        from .network import redact_proxy
-        att.error = (redact_proxy(stderr, proxy) or "no stdout")[:300]
+        att.error = (_redact_diagnostics(stderr, proxy, cookies) or "no stdout")[:300]
         att.verdict = Verdict.UNKNOWN.value
         return att, ""
 

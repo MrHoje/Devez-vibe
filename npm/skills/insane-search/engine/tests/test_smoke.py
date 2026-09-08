@@ -104,6 +104,10 @@ def t_online_benign_site():
         max_attempts=3,
         enable_playwright=False,
     )
+    if (not r.ok and r.network_diagnosis.get("category")
+            == "certificate_verification"):
+        print("  - skipped: host certificate trust blocks the curl-only lane")
+        return
     assert r.ok, f"{r.summary} | trace: {[a.verdict for a in r.trace]}"
     assert r.verdict in ("strong_ok", "weak_ok"), r.verdict
     print(f"  ✓ benign site → verdict={r.verdict} size={len(r.content)}")

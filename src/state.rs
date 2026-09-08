@@ -1070,12 +1070,20 @@ impl ModelInfo {
                 })
             })
             .collect::<Vec<_>>();
+        let model = value.get("model")?.as_str()?.to_owned();
+        let default_effort = if ModelProvider::from_model(&model) != ModelProvider::OpenCode
+            && efforts.iter().any(|effort| effort.id == "high")
+        {
+            "high".to_owned()
+        } else {
+            value.get("defaultReasoningEffort")?.as_str()?.to_owned()
+        };
         let display_name = normalized_model_display_name(value.get("displayName")?.as_str()?);
         Some(Self {
             id: value.get("id")?.as_str()?.to_owned(),
-            model: value.get("model")?.as_str()?.to_owned(),
+            model,
             display_name,
-            default_effort: value.get("defaultReasoningEffort")?.as_str()?.to_owned(),
+            default_effort,
             efforts,
             is_default: value
                 .get("isDefault")
@@ -21005,6 +21013,29 @@ mod tests {
     }
 
     #[test]
+    fn claude_and_codex_models_prefer_high_as_the_supported_default() {
+        let default = |name: &str, efforts: &[&str], fallback: &str| {
+            ModelInfo::from_value(&json!({
+                "id": name,
+                "model": name,
+                "displayName": name,
+                "supportedReasoningEfforts": efforts
+                    .iter()
+                    .map(|effort| json!({"reasoningEffort": effort}))
+                    .collect::<Vec<_>>(),
+                "defaultReasoningEffort": fallback
+            }))
+            .expect("model")
+            .default_effort
+        };
+
+        assert_eq!(default("gpt-5.6-sol", &["low", "high"], "low"), "high");
+        assert_eq!(default("claude:sonnet", &["low", "high"], "low"), "high");
+        assert_eq!(default("gpt-basic", &["medium"], "medium"), "medium");
+        assert_eq!(default("opencode:test/model", &["low", "high"], "low"), "low");
+    }
+
+    #[test]
     fn model_display_names_replace_all_gpt_variant_hyphens() {
         assert_eq!(
             normalized_model_display_name("GPT-5.3-Codex-Spark"),
@@ -26128,10 +26159,10 @@ mod tests {
         state.claude_provider_enabled = true;
         state.codex_provider_enabled = true;
 
-        state.run_slash_command("/provider claude fable");
+        state.run_slash_command("/provider claude FaBlE");
         assert_eq!(state.selected_model_name(), "claude:claude-fable-5-1");
 
-        state.run_slash_command("/provider claude opus");
+        state.run_slash_command("/provider claude Opus");
         assert_eq!(state.selected_model_name(), "claude:opus");
 
         assert!(matches!(
@@ -26146,13 +26177,16 @@ mod tests {
             ("luna", "gpt-5.6-luna"),
             ("astra", "gpt-6-astra"),
         ] {
-            state.run_slash_command(&format!("/provider codex {alias}"));
+            state.run_slash_command(&format!(
+                "/provider codex {}",
+                alias.to_ascii_uppercase()
+            ));
             assert_eq!(state.selected_model_name(), expected);
         }
 
-        state.run_slash_command("/provider claude sonnet");
+        state.run_slash_command("/provider claude Sonnet");
         assert_eq!(state.selected_model_name(), "claude:sonnet");
-        state.run_slash_command("/provider claude haiku");
+        state.run_slash_command("/provider claude HAIKU");
         assert_eq!(state.selected_model_name(), "claude:haiku");
 
         state.run_slash_command("/provider codex astra");

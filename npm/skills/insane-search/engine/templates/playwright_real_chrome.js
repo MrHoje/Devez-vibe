@@ -103,6 +103,7 @@ async function main() {
     }
     if (args.proxy) ctxOpts.proxy = args.proxy;
     ctx = await chromium.launchPersistentContext(profileDir, ctxOpts);
+    if (Array.isArray(args.cookies) && args.cookies.length) await ctx.addCookies(args.cookies);
     const page = await ctx.newPage();
     // Single shared deadline across warmup + main + reload navigations so the
     // first nav can't eat the whole budget and starve the rest.

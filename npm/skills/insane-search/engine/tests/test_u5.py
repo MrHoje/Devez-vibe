@@ -7,8 +7,12 @@ grid priority reordering, and winning-route extraction from a trace."""
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 from datetime import datetime, timezone, timedelta
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..", "..")))
 
 from engine import learning
 from engine.fetch_chain import _build_plan, _winning_route, _load_profiles, FetchResult, Attempt

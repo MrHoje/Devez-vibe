@@ -26,6 +26,16 @@ title, uploader, duration, view_count, description, tags 등 구조화 JSON 반�
 
 ### 자막 추출
 
+에이전트에서 메타데이터와 실제 자막을 한 번에 받으려면 다음을 우선한다. 제작자 자막을 자동 자막보다 우선하고, 한국어 뒤 영어를 선택하며, 연속 중복과 시각 제어 줄을 제거한다.
+
+```bash
+python3 -m engine "URL" --media-transcript --bundle
+```
+
+`research_transcript.source`가 `creator`인지 `automatic`인지 확인한다. 자동 자막은 고유명사와 숫자를 별도 출처로 대조하고, 최종 인용에는 가능한 경우 영상 시각을 함께 적는다.
+
+`--media`와 `--media-transcript`를 처음 실제 호출할 때 `yt-dlp`가 없으면 `~/.insane-search/media-venv`에 격리 설치한다. 사용자 Python 환경과 별도이며 `INSANE_AUTO_INSTALL=0`이면 설치하지 않고 다음 경로로 넘어간다. 조사 결과는 서명된 스트림 URL과 내부 extractor 필드를 제거해 원본 메타데이터보다 훨씬 작게 반환한다.
+
 ```bash
 yt-dlp --write-sub --write-auto-sub --sub-lang "en,ko" --skip-download -o "/tmp/%(id)s" "URL"
 cat /tmp/VIDEO_ID.*.vtt

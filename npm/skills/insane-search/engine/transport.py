@@ -74,11 +74,40 @@ class _Entry:
 class SessionPool:
     """Thread-safe pool of curl_cffi Sessions keyed by host, identity, and route."""
     _entries: dict = field(default_factory=dict)
+    _seeds: dict = field(default_factory=dict)
     _lock: Any = field(default_factory=threading.Lock)
 
     def _key(self, host: str, impersonate: str, proxy: Optional[str] = None) -> tuple:
         from .network import proxy_cache_key
         return (host, impersonate, proxy_cache_key(proxy))
+
+    def _seed_key(self, host: str, proxy: Optional[str] = None) -> tuple:
+        from .network import proxy_cache_key
+        return (host, proxy_cache_key(proxy))
+
+    @staticmethod
+    def _apply_cookies(ent: _Entry, host: str, cookies: list[dict],
+                       user_agent: Optional[str] = None) -> bool:
+        ok = False
+        for cookie in cookies or []:
+            name = cookie.get("name")
+            value = cookie.get("value")
+            if not name:
+                continue
+            try:
+                ent.session.cookies.set(
+                    name, value, domain=cookie.get("domain") or host,
+                    path=cookie.get("path") or "/")
+                ok = True
+            except Exception:
+                try:
+                    ent.session.cookies.set(name, value)
+                    ok = True
+                except Exception:
+                    continue
+        if user_agent:
+            ent.injected_ua = user_agent
+        return ok
 
     def get(self, host: str, impersonate: str, proxy: Optional[str] = None) -> Optional[_Entry]:
         """Return (creating if needed) the pool entry, or None if curl_cffi
@@ -102,8 +131,26 @@ class SessionPool:
                 # fall back to a one-shot get by returning None.
                 return None
             ent = _Entry(session=sess)
+            seed = self._seeds.get(self._seed_key(host, proxy))
+            if seed:
+                self._apply_cookies(ent, host, seed[0], seed[1])
             self._entries[key] = ent
             return ent
+
+    def seed_cookies(self, host: str, cookies: list[dict],
+                     user_agent: Optional[str] = None,
+                     proxy: Optional[str] = None) -> bool:
+        """Apply explicit user-supplied cookies to all current and future identities."""
+        if not cookies:
+            return False
+        seed_key = self._seed_key(host, proxy)
+        route_key = seed_key[1]
+        with self._lock:
+            self._seeds[seed_key] = ([dict(cookie) for cookie in cookies], user_agent)
+            for (entry_host, _impersonate, entry_route), ent in self._entries.items():
+                if entry_host == host and entry_route == route_key:
+                    self._apply_cookies(ent, host, cookies, user_agent)
+            return True
 
     def warmup(self, host: str, impersonate: str, root_url: str, timeout: int = 15,
                proxy: Optional[str] = None) -> bool:
@@ -133,24 +180,7 @@ class SessionPool:
         ent = self.get(host, impersonate, proxy)
         if ent is None:
             return False
-        ok = False
-        for c in cookies or []:
-            name = c.get("name")
-            value = c.get("value")
-            if not name:
-                continue
-            try:
-                ent.session.cookies.set(name, value, domain=c.get("domain") or host)
-                ok = True
-            except Exception:
-                try:
-                    ent.session.cookies.set(name, value)
-                    ok = True
-                except Exception:
-                    continue
-        if user_agent:
-            ent.injected_ua = user_agent
-        return ok
+        return self._apply_cookies(ent, host, cookies, user_agent)
 
     def request(self, url: str, *, impersonate: str, referer: str = "",
                 timeout: int = 25, extra_headers: Optional[dict] = None,
@@ -263,6 +293,7 @@ class SessionPool:
                 except Exception:
                     pass
             self._entries.clear()
+            self._seeds.clear()
 
 
 # Process-wide pool. Disable via INSANE_NO_SESSION_POOL=1 (one-shot mode).

@@ -40,6 +40,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="TOTAL curl-attempt budget. Default: None = exhaustive (honours R6).")
     p.add_argument("--proxy", default=None, metavar="URL",
                    help="User-approved HTTP(S) or SOCKS proxy URL for every network route.")
+    p.add_argument("--cookie-file", default=None, metavar="PATH",
+                   help="Explicit JSON or Netscape cookie export, scoped to the target host.")
     p.add_argument("--no-retry", action="store_true",
                    help="Disable transient-status (429/502/503/504) probe retry.")
     p.add_argument("--no-extract", action="store_true",
@@ -52,12 +54,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--maincontent", action="store_true",
                    help="Strip boilerplate (nav/footer/ads) to the article body via "
                         "optional resiliparse. Off by default; wins over --markdown.")
+    p.add_argument("--ocr", action="store_true",
+                   help="OCR scanned PDFs with local pdftoppm and tesseract when available.")
+    p.add_argument("--archive", action="store_true",
+                   help="After current-page failure, try a labeled historical Wayback snapshot.")
+    p.add_argument("--media", action="store_true",
+                   help="Treat the URL as media and route it through yt-dlp metadata extraction.")
+    p.add_argument("--media-transcript", action="store_true",
+                   help="Fetch a Korean or English subtitle transcript through yt-dlp.")
     p.add_argument("--no-playwright", action="store_true",
                    help="Skip Playwright fallback (curl-only).")
     p.add_argument("--no-phase0", action="store_true",
                    help="Skip the Phase 0 official-API router (generic grid only).")
-    p.add_argument("--json", action="store_true",
-                   help="Emit FetchResult as JSON to stdout (content omitted).")
+    output = p.add_mutually_exclusive_group()
+    output.add_argument("--json", action="store_true",
+                        help="Emit FetchResult as JSON to stdout (content omitted).")
+    output.add_argument("--bundle", action="store_true",
+                        help="Emit provenance plus boundary-wrapped untrusted content as JSON.")
     p.add_argument("--trace", action="store_true",
                    help="Print per-attempt trace to stderr.")
     return p
@@ -81,7 +94,12 @@ def main(argv: list[str] | None = None) -> int:
             enable_retry=not args.no_retry,
             enable_markdown=not args.no_markdown,
             enable_maincontent=args.maincontent,
+            enable_ocr=args.ocr,
+            enable_archive=args.archive,
+            force_media=args.media or args.media_transcript,
+            include_media_transcript=args.media_transcript,
             proxy=args.proxy,
+            cookie_file=args.cookie_file,
         )
     except Exception as e:
         print(f"engine fatal: {type(e).__name__}: {e}", file=sys.stderr)
@@ -132,7 +150,9 @@ def main(argv: list[str] | None = None) -> int:
             print("   ➜ must_invoke_playwright_mcp = TRUE — drive MCP Playwright from the agent session.", file=sys.stderr)
         print("════════════════════════════════════════════════════════════════", file=sys.stderr)
 
-    if args.json:
+    if args.bundle:
+        print(json.dumps(result.to_evidence_bundle(), ensure_ascii=False, indent=2))
+    elif args.json:
         payload = result.to_dict()
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
