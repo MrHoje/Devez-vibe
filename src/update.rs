@@ -22,8 +22,8 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release notes kept with the build for the changelog, but not shown at startup.
 #[allow(dead_code)]
 pub const RELEASE_NOTES: &[&str] = &[
-    "재개한 Updated Plan을 다음 프롬프트가 시작된 뒤에도 유지합니다.",
-    "새 Updated Plan이 도착하면 복원된 계획을 자연스럽게 교체합니다.",
+    "컴포저 첫 글자 !로 Shell Mode에 들어가 현재 작업 폴더에서 PowerShell 명령을 직접 실행합니다.",
+    "Shell Mode의 ! 표식, 컴포저 위아래 선, 상태줄 문구를 일반 텍스트색으로 표시합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

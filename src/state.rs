@@ -1223,6 +1223,7 @@ pub enum Action {
     ShowStatus,
     Submit(String),
     Steer(String),
+    RunShell(String),
     Interrupt,
     NewThread,
     OpenResume,
@@ -3543,6 +3544,9 @@ struct StashedPrompt {
 
 pub struct AppState {
     pub editor: Editor,
+    /// `!` entered on an empty composer runs the following text locally instead
+    /// of sending it to a provider.
+    shell_mode: bool,
     /// The syllable the host's IME is still composing, drawn at the cursor
     /// without being part of the draft. See `preedit`.
     composer_preedit: String,
@@ -3861,6 +3865,7 @@ impl AppState {
             .and_then(|model| model.context_window);
         let mut state = Self {
             editor: Editor::default(),
+            shell_mode: false,
             composer_preedit: String::new(),
             composer_images: Vec::new(),
             stashed_prompt: None,
@@ -5260,6 +5265,7 @@ impl AppState {
     fn composer_mode(&self) -> ComposerMode {
         ComposerMode {
             agent: self.agent_mode,
+            shell_mode: self.shell_mode,
             branch: self.branch.clone(),
             vibe_mode: self.vibe_mode.label().to_owned(),
             vibe_tone: match self.vibe_mode {
@@ -6351,6 +6357,7 @@ impl AppState {
         self.shell_batches.clear();
         self.reset_turn_item_tracking();
         self.pending = None;
+        self.shell_mode = false;
         self.context_tokens = 0;
         self.token_totals = TokenTotals::default();
         self.cost_ledger = Some(CostLedger::default());
@@ -6403,6 +6410,41 @@ impl AppState {
         body: impl Into<String>,
     ) {
         self.committed.push(Block::new(kind, title, body));
+    }
+
+    pub fn begin_local_shell(&mut self, command: &str) -> Block {
+        self.commit_welcome_card();
+        let block = Block::new(BlockKind::Tool, "Running Shell Command", command);
+        self.committed.push(block.clone());
+        block
+    }
+
+    pub fn finish_local_shell(
+        &mut self,
+        anchor: &Block,
+        command: &str,
+        output: String,
+        exit_code: i32,
+        duration_ms: u64,
+    ) -> u64 {
+        let kind = if exit_code == 0 {
+            BlockKind::Tool
+        } else {
+            BlockKind::Warning
+        };
+        let mut block = Block::new(
+            kind,
+            format!(
+                "Shell · {} · exit {exit_code} · {}",
+                compact_command(command, 96),
+                format_duration(duration_ms)
+            ),
+            output,
+        );
+        block.adopt_id(anchor);
+        let id = block.id();
+        self.committed.push(block);
+        id
     }
 
     /// Announce a newer published release above the composer history.
@@ -6525,9 +6567,15 @@ impl AppState {
                     url: artifact.url.clone(),
                 })
                 .collect(),
-            composer_highlights: self.composer_highlight_tokens(),
+            composer_highlights: if self.shell_mode {
+                Vec::new()
+            } else {
+                self.composer_highlight_tokens()
+            },
             composer_preedit: &self.composer_preedit,
-            composer_placeholder: if self.provider_switch_pending() {
+            composer_placeholder: if self.shell_mode {
+                "Run a shell command"
+            } else if self.provider_switch_pending() {
                 "Enter: queue for switched provider · Alt+Enter: queue"
             } else if self.busy {
                 "Enter: steer · Alt+Enter: queue"
@@ -6542,7 +6590,7 @@ impl AppState {
             },
             cwd: self.cwd.clone(),
             welcome: self.show_welcome.then(|| self.welcome_view()),
-            suggestions: if self.pending.is_none() {
+            suggestions: if self.pending.is_none() && !self.shell_mode {
                 self.completion_suggestion_views().unwrap_or_else(|| {
                     let agents = self.agent_suggestion_views();
                     if agents.is_empty() {
@@ -6843,11 +6891,7 @@ impl AppState {
         // matching preedit before either insertion path so it cannot follow the
         // cursor and briefly reappear one space to the right.
         self.settle_preedit_for_text(text);
-        if pasted {
-            self.editor.insert_paste_str(text);
-        } else {
-            self.editor.insert_str(text);
-        }
+        self.insert_composer_text(text, pasted);
         self.command_selection = 0;
         self.sync_selected_completion_bindings(&old_text, binding_count);
     }
@@ -6950,11 +6994,7 @@ impl AppState {
             }
             Some(_) => {}
             None => {
-                if pasted {
-                    self.editor.insert_paste_str(text);
-                } else {
-                    self.editor.insert_str(text);
-                }
+                self.insert_composer_text(text, pasted);
                 self.command_selection = 0;
             }
         }
@@ -6962,6 +7002,27 @@ impl AppState {
             self.normalize_pending_model_picker();
         }
         self.sync_selected_completion_bindings(&old_text, binding_count);
+    }
+
+    fn insert_composer_text(&mut self, text: &str, pasted: bool) {
+        let text = if !self.shell_mode
+            && self.editor.is_empty()
+            && self.composer_images.is_empty()
+            && let Some(command) = text.strip_prefix('!')
+        {
+            self.shell_mode = true;
+            command
+        } else {
+            text
+        };
+        if text.is_empty() {
+            return;
+        }
+        if pasted {
+            self.editor.insert_paste_str(text);
+        } else {
+            self.editor.insert_str(text);
+        }
     }
 
     fn normalize_pending_model_picker(&mut self) {
@@ -7110,7 +7171,7 @@ impl AppState {
         let old_text = self.editor.text();
         let binding_count = self.selected_completion_bindings.len();
         let action = self.handle_key_inner(key);
-        if !matches!(action, Action::Submit(_) | Action::Steer(_)) {
+        if !matches!(action, Action::Submit(_) | Action::Steer(_) | Action::RunShell(_)) {
             self.sync_selected_completion_bindings(&old_text, binding_count);
         }
         action
@@ -7172,16 +7233,31 @@ impl AppState {
             }
         }
 
+        if self.shell_mode
+            && self.editor.is_empty()
+            && self.composer_images.is_empty()
+            && (matches!(key.code, KeyCode::Esc | KeyCode::Backspace)
+                || (key.code == KeyCode::Char('u') && ctrl))
+        {
+            self.shell_mode = false;
+            return Action::None;
+        }
+
         if key.code == KeyCode::Esc && !self.busy {
             self.editor.clear();
             self.composer_images.clear();
+            self.shell_mode = false;
             self.selected_completion_bindings.clear();
             self.suggestions_dismissed_text = None;
             self.command_selection = 0;
             return Action::None;
         }
 
-        let completion_matches = self.matching_completions();
+        let completion_matches = if self.shell_mode {
+            None
+        } else {
+            self.matching_completions()
+        };
         if let Some((target, matches)) = completion_matches.as_ref() {
             if ctrl {
                 match key.code {
@@ -7256,7 +7332,11 @@ impl AppState {
             }
         }
 
-        let agent_matches = self.matching_agent_arguments();
+        let agent_matches = if self.shell_mode {
+            Vec::new()
+        } else {
+            self.matching_agent_arguments()
+        };
         if !agent_matches.is_empty() {
             if ctrl {
                 match key.code {
@@ -7307,7 +7387,11 @@ impl AppState {
             }
         }
 
-        let slash_matches = self.matching_slash_commands();
+        let slash_matches = if self.shell_mode {
+            Vec::new()
+        } else {
+            self.matching_slash_commands()
+        };
         if !slash_matches.is_empty() && ctrl {
             match key.code {
                 KeyCode::Char('p') => {
@@ -7405,7 +7489,11 @@ impl AppState {
                 Action::Tick(true)
             }
             KeyCode::Char('c') if ctrl => {
-                if self.busy {
+                if self.shell_mode {
+                    self.shell_mode = false;
+                    self.editor.clear();
+                    Action::None
+                } else if self.busy {
                     if self.quit_armed() {
                         Action::Quit
                     } else {
@@ -7499,11 +7587,16 @@ impl AppState {
             }
             // Tab now cycles the agent role, so the prompt queue moved onto
             // Alt+Enter. Shift+Enter and Ctrl+Enter still insert a newline.
+            KeyCode::Enter if self.shell_mode && (alt || shift || ctrl) => {
+                self.editor.newline();
+                Action::None
+            }
             KeyCode::Enter if alt && self.queueing_prompts() => self.queue_editor(),
             KeyCode::Enter if alt || shift || ctrl => {
                 self.editor.newline();
                 Action::None
             }
+            KeyCode::Tab if self.shell_mode => Action::None,
             KeyCode::Tab => self.cycle_agent_mode(),
             KeyCode::Enter => self.submit_editor(),
             KeyCode::Esc if self.busy => self.request_interrupt(),
@@ -7566,7 +7659,7 @@ impl AppState {
                 Action::None
             }
             KeyCode::Char(ch) if !ctrl => {
-                self.editor.insert(ch);
+                self.insert_composer_text(&ch.to_string(), false);
                 self.suggestions_dismissed_text = None;
                 self.command_selection = 0;
                 if matches!(ch, '$' | '@') {
@@ -8913,6 +9006,20 @@ impl AppState {
         // A fresh install has picked no runtime yet, so the first prompt opens
         // the picker instead of guessing one. Nothing leaves the composer, and
         // slash commands still run — `/provider` among them.
+        if self.shell_mode {
+            if !self.composer_images.is_empty() {
+                self.set_composer_notice("Shell Mode에서는 이미지를 첨부할 수 없습니다.".to_owned());
+                return Action::None;
+            }
+            let command = self.editor.text();
+            if command.trim().is_empty() {
+                return Action::None;
+            }
+            self.editor.clear();
+            self.shell_mode = false;
+            self.selected_completion_bindings.clear();
+            return Action::RunShell(command.trim().to_owned());
+        }
         let text = self.editor.text();
         let command = text.starts_with('/') && !text.contains('\n');
         if self.provider_choice_pending && !self.any_provider_connected() && !command {
@@ -12537,6 +12644,7 @@ impl AppState {
         });
         StatusLineView {
             agent: self.agent_mode,
+            shell_mode: self.shell_mode,
             model: self
                 .status_line_settings
                 .enabled(StatusLineField::Model)
@@ -12574,7 +12682,8 @@ impl AppState {
     }
 
     fn status_line_has_content(&self) -> bool {
-        StatusLineField::ALL
+        self.shell_mode
+            || StatusLineField::ALL
             .iter()
             .any(|field| self.status_line_settings.enabled(*field))
             || self.transient_status.is_some()
@@ -25743,6 +25852,67 @@ mod tests {
         assert!(state.editor.is_empty());
         assert_eq!(state.composer_image_count(), 0);
         assert!(state.view().suggestions.is_empty());
+    }
+
+    #[test]
+    fn leading_bang_enters_shell_mode_and_submits_a_local_command() {
+        let mut state = test_state();
+
+        state.handle_key(KeyEvent::from(KeyCode::Char('!')));
+
+        assert!(state.editor.is_empty());
+        let view = state.view();
+        assert!(view.composer_mode.as_ref().is_some_and(|mode| mode.shell_mode));
+        assert!(view.status_line.as_ref().is_some_and(|status| status.shell_mode));
+        assert!(view.suggestions.is_empty());
+
+        state.handle_paste("Get-Location");
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::RunShell(command) if command == "Get-Location"
+        ));
+        assert!(!state.view().composer_mode.unwrap().shell_mode);
+        assert!(!state.busy);
+    }
+
+    #[test]
+    fn pasted_leading_bang_enters_shell_mode_but_later_bang_stays_a_prompt() {
+        let mut shell = test_state();
+        shell.handle_paste("!git status");
+        assert_eq!(shell.editor.text(), "git status");
+        assert!(matches!(
+            shell.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::RunShell(command) if command == "git status"
+        ));
+
+        let mut prompt = test_state();
+        prompt.handle_paste("explain !important");
+        assert!(matches!(
+            prompt.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::Submit(text) if text == "explain !important"
+        ));
+    }
+
+    #[test]
+    fn local_shell_completion_replaces_its_running_card() {
+        let mut state = test_state();
+        let anchor = state.begin_local_shell("Write-Output hello");
+        state.drain_committed();
+
+        let id = state.finish_local_shell(
+            &anchor,
+            "Write-Output hello",
+            "hello".to_owned(),
+            0,
+            25,
+        );
+        let completed = state.drain_committed().pop().expect("shell result");
+
+        assert_eq!(completed.id(), id);
+        assert_eq!(completed.id(), anchor.id());
+        assert!(matches!(completed.kind, BlockKind::Tool));
+        assert_eq!(completed.title, "Shell · Write-Output hello · exit 0 · 25ms");
+        assert_eq!(completed.body, "hello");
     }
 
     #[test]

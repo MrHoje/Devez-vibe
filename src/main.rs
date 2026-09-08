@@ -53,7 +53,7 @@ use paste::{BufferedText, BufferedTextTarget, ComposerInput, ComposerPasteBuffer
 use preedit::{PreeditCapture, PreeditInput};
 use provider::{ProviderAuthKind, ProviderAuthRequest};
 use renderer::{
-    BlockKind, Pick, RenderMode, Renderer, SIDE_PANEL_INTEGRATIONS_CONNECTED, SelectionResult,
+    Block, BlockKind, Pick, RenderMode, Renderer, SIDE_PANEL_INTEGRATIONS_CONNECTED, SelectionResult,
     SplitFocus, TerminalSession, View,
 };
 use serde_json::{Value, json};
@@ -63,6 +63,7 @@ use state::{
     load_model_context_windows,
 };
 use tokio::{
+    process::Command as TokioCommand,
     sync::mpsc,
     time::{MissedTickBehavior, timeout},
 };
@@ -796,6 +797,7 @@ fn hold_until_thread(
         | Action::SetTheme(_)
         | Action::Copy(_)
         | Action::Cut(_)
+        | Action::RunShell(_)
         | Action::OpenUrl(_)) => Some(action),
         Action::ShowStatus => Some(Action::ShowStatus),
         Action::ScrollToBottom => Some(Action::ScrollToBottom),
@@ -2495,6 +2497,69 @@ async fn interrupt_turn(server: &mut BackendServer, state: &mut AppState) {
     }
 }
 
+fn local_shell_command(command: &str, cwd: &str) -> TokioCommand {
+    #[cfg(windows)]
+    let mut process = {
+        let mut process = TokioCommand::new("powershell.exe");
+        let command = format!(
+            "$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); {command}"
+        );
+        process
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+            .arg(command);
+        process
+    };
+    #[cfg(not(windows))]
+    let mut process = {
+        let mut process = TokioCommand::new("sh");
+        process.args(["-lc", command]);
+        process
+    };
+    process.current_dir(cwd);
+    child_process::isolate_backend(&mut process);
+    process
+}
+
+fn local_shell_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut text = String::from_utf8_lossy(stdout).into_owned();
+    if !stderr.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&String::from_utf8_lossy(stderr));
+    }
+    let text = text.trim_end_matches(['\r', '\n']);
+    if text.is_empty() {
+        "No output".to_owned()
+    } else {
+        text.to_owned()
+    }
+}
+
+async fn run_local_shell(
+    state: &mut AppState,
+    renderer: &mut Renderer,
+    command: String,
+) -> Result<()> {
+    renderer.scroll_to_bottom();
+    let cwd = state.view().cwd;
+    let anchor: Block = state.begin_local_shell(&command);
+    draw(state, renderer)?;
+    let started = Instant::now();
+    let result = local_shell_command(&command, &cwd).output().await;
+    let (output, exit_code) = match result {
+        Ok(output) => (
+            local_shell_output(&output.stdout, &output.stderr),
+            output.status.code().unwrap_or(-1),
+        ),
+        Err(error) => (error.to_string(), -1),
+    };
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let id = state.finish_local_shell(&anchor, &command, output, exit_code, duration_ms);
+    renderer.toggle_tool(id);
+    Ok(())
+}
+
 async fn execute_action(
     server: &mut BackendServer,
     state: &mut AppState,
@@ -2549,6 +2614,7 @@ async fn execute_action(
                 state.push_notice(BlockKind::Error, "추가 입력 실패", error.to_string());
             }
         }
+        Action::RunShell(command) => run_local_shell(state, renderer, command).await?,
         Action::Interrupt => interrupt_turn(server, state).await,
         // Cancelling a question the runtime is blocked on takes both halves: the
         // request has to be answered so the bridge stops waiting, and the turn it
@@ -6584,6 +6650,18 @@ mod tests {
 
     use super::*;
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn local_shell_command_runs_without_a_provider() {
+        let output = local_shell_command("Write-Output '직접 실행'", ".")
+            .output()
+            .await
+            .expect("PowerShell starts");
+
+        assert!(output.status.success());
+        assert_eq!(local_shell_output(&output.stdout, &output.stderr), "직접 실행");
+    }
+
     #[test]
     fn claude_account_status_prefers_email_and_reports_signed_out() {
         assert_eq!(
@@ -8714,6 +8792,14 @@ mod tests {
             .is_some()
         );
         assert!(hold_until_thread(&mut state, Action::Quit, &mut queued).is_some());
+        assert!(
+            hold_until_thread(
+                &mut state,
+                Action::RunShell("Get-Location".to_owned()),
+                &mut queued
+            )
+            .is_some()
+        );
         assert!(hold_until_thread(&mut state, Action::Compact, &mut queued).is_none());
     }
 

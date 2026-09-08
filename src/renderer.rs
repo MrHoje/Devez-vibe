@@ -394,6 +394,8 @@ pub struct SuggestionView {
 pub struct StatusLineView {
     /// The agent role, painted left of the model so the role reads first.
     pub agent: AgentMode,
+    /// A local `!` command replaces the role label while it is being composed.
+    pub shell_mode: bool,
     pub model: Option<String>,
     pub effort: Option<String>,
     /// Codex priority service tier, shown beside the active effort.
@@ -430,6 +432,8 @@ pub enum VibeTone {
 pub struct ComposerMode {
     /// The agent role; the composer's `❯` glyph borrows its colour.
     pub agent: AgentMode,
+    /// Whether the composer is collecting a local shell command.
+    pub shell_mode: bool,
     /// Current Git branch, shown as a display-only composer badge.
     pub branch: Option<String>,
     pub vibe_mode: String,
@@ -8353,12 +8357,16 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         .is_some_and(|model| !is_open_code_model_label(model));
     let mut spans = Vec::new();
     let mut picks = Vec::new();
-    let agent_span = push_status_span(
-        &mut spans,
-        status.agent.label(),
-        agent_prompt_tone(status.agent),
-    );
-    picks.push((agent_span, Pick::AgentMode));
+    if status.shell_mode {
+        push_status_span(&mut spans, "Shell Mode", Tone::Plain);
+    } else {
+        let agent_span = push_status_span(
+            &mut spans,
+            status.agent.label(),
+            agent_prompt_tone(status.agent),
+        );
+        picks.push((agent_span, Pick::AgentMode));
+    }
     let mut model_shown = false;
     if let Some(model) = status.model.filter(|model| !model.is_empty()) {
         model_shown = true;
@@ -12369,7 +12377,8 @@ fn input_lines_with_controls(
     let display_chars = display.chars().collect::<Vec<_>>();
     let panel_width = (width as usize).saturating_sub(1).max(16);
     let side_prefix = "";
-    let first_prefix = "❯ ";
+    let shell_mode = mode.is_some_and(|mode| mode.shell_mode);
+    let first_prefix = if shell_mode { "! " } else { "❯ " };
     let continuation_prefix = "  ";
     let content_width = panel_width
         .saturating_sub(
@@ -12497,11 +12506,15 @@ fn input_lines_with_controls(
         } else {
             continuation_prefix
         };
-        // The `❯` glyph reads in the active role's colour, so the composer
-        // itself says which role the prompt will be sent under.
+        // Shell mode stays plain; ordinary prompts borrow the active role's
+        // colour so the composer says which role receives the prompt.
         let prompt_tone = if index == 0 {
-            mode.map(|mode| agent_prompt_tone(mode.agent))
-                .unwrap_or(chrome_tone)
+            if shell_mode {
+                Tone::Plain
+            } else {
+                mode.map(|mode| agent_prompt_tone(mode.agent))
+                    .unwrap_or(chrome_tone)
+            }
         } else {
             chrome_tone
         };
@@ -12814,6 +12827,9 @@ fn input_bottom_line(
 }
 
 fn composer_chrome_tone(mode: Option<&ComposerMode>) -> Tone {
+    if mode.is_some_and(|mode| mode.shell_mode) {
+        return Tone::Plain;
+    }
     mode.and_then(|mode| chrome_model_tone(&mode.model))
         .unwrap_or(Tone::Border)
 }
@@ -14892,6 +14908,7 @@ mod tests {
             let line = status_line_row(
                 Some(StatusLineView {
                     agent: AgentMode::Standard,
+                    shell_mode: false,
                     model: Some("GPT-5.6 Codex".to_owned()),
                     effort: Some("xhigh".to_owned()),
                     fast: false,
@@ -16361,6 +16378,7 @@ mod tests {
         let line = status_line_row(
             Some(StatusLineView {
                 agent: AgentMode::Standard,
+                shell_mode: false,
                 model: None,
                 effort: Some("high".to_owned()),
                 fast: false,
@@ -18035,6 +18053,7 @@ mod tests {
     fn test_mode(label: &str, accent: ModeAccent, _fast_mode: bool) -> ComposerMode {
         ComposerMode {
             agent: AgentMode::Standard,
+            shell_mode: false,
             branch: None,
             vibe_mode: "Vibe: On".to_owned(),
             vibe_tone: VibeTone::On,
@@ -18070,6 +18089,29 @@ mod tests {
             Some(Tone::ModelTerra)
         );
         assert_eq!(rows.last().map(|line| line.tone), Some(Tone::ModelTerra));
+    }
+
+    #[test]
+    fn shell_mode_replaces_the_composer_marker_with_a_bang() {
+        let editor = Editor::default();
+        let mut mode = test_mode("Default", ModeAccent::Calm, false);
+        mode.shell_mode = true;
+
+        let (rows, _, _, _) = input_lines(
+            &editor,
+            &[],
+            80,
+            "",
+            "Run a shell command",
+            None,
+            Some(&mode),
+        );
+
+        assert_eq!(rows[1].text, "! ");
+        assert_eq!(rows[0].tone, Tone::Plain);
+        assert_eq!(rows[1].tone, Tone::Plain);
+        assert_eq!(rows.last().unwrap().tone, Tone::Plain);
+        assert!(!painted(&rows[1]).contains('❯'));
     }
 
     #[test]
@@ -19637,6 +19679,7 @@ mod tests {
             composer_notice: None,
             composer_mode: Some(ComposerMode {
                 agent: AgentMode::Standard,
+                shell_mode: false,
                 branch: Some("main".to_owned()),
                 vibe_mode: "Super Vibe".to_owned(),
                 vibe_tone: VibeTone::Super,
@@ -22178,6 +22221,7 @@ mod tests {
         let line = status_line_row(
             Some(StatusLineView {
                 agent: AgentMode::Standard,
+                shell_mode: false,
                 model: Some("GPT-5.6 Codex".to_owned()),
                 effort: Some("xhigh".to_owned()),
                 fast: false,
@@ -22196,10 +22240,36 @@ mod tests {
     }
 
     #[test]
+    fn shell_mode_replaces_the_status_role_without_an_agent_click() {
+        let line = status_line_row(
+            Some(StatusLineView {
+                agent: AgentMode::Standard,
+                shell_mode: true,
+                model: Some("GPT-5.6 Sol".to_owned()),
+                effort: Some("high".to_owned()),
+                fast: false,
+                context: None,
+                five_hour_percent: None,
+                five_hour_remaining: None,
+                weekly_percent: None,
+                notice: None,
+            }),
+            "",
+            80,
+        );
+
+        assert!(painted(&line).trim_start().starts_with("Shell Mode"));
+        assert!(!painted(&line).contains("Builder"));
+        assert_eq!(pick_on(&line, "Shell Mode"), None);
+        assert_eq!(line.tone, Tone::Plain);
+    }
+
+    #[test]
     fn status_line_keeps_model_and_effort_when_branch_is_removed() {
         let line = status_line_row(
             Some(StatusLineView {
                 agent: AgentMode::Standard,
+                shell_mode: false,
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 fast: false,
@@ -22222,6 +22292,7 @@ mod tests {
         let line = status_line_row(
             Some(StatusLineView {
                 agent: AgentMode::Standard,
+                shell_mode: false,
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("xhigh".to_owned()),
                 fast: true,
@@ -22245,6 +22316,7 @@ mod tests {
         let line = status_line_row(
             Some(StatusLineView {
                 agent: AgentMode::Standard,
+                shell_mode: false,
                 model: Some("DeepSeek V4 Flash · OpenCode Go".to_owned()),
                 effort: Some("high".to_owned()),
                 fast: false,
@@ -22286,6 +22358,7 @@ mod tests {
         let line = status_line_row(
             Some(StatusLineView {
                 agent: AgentMode::Standard,
+                shell_mode: false,
                 model: Some("GPT-5.6 Codex".to_owned()),
                 effort: Some("xhigh".to_owned()),
                 fast: false,
@@ -22307,6 +22380,7 @@ mod tests {
     fn opening_the_side_panel_moves_modes_above_context() {
         let mut status = Some(StatusLineView {
             agent: AgentMode::Standard,
+            shell_mode: false,
             model: Some("GPT-5.6 Codex".to_owned()),
             effort: Some("xhigh".to_owned()),
             fast: false,
@@ -22382,6 +22456,7 @@ mod tests {
         let line = status_line_row(
             Some(StatusLineView {
                 agent: AgentMode::Standard,
+                shell_mode: false,
                 model: None,
                 effort: None,
                 fast: false,
@@ -22403,6 +22478,7 @@ mod tests {
         let line = status_line_row(
             Some(StatusLineView {
                 agent: AgentMode::Standard,
+                shell_mode: false,
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 fast: false,
@@ -22428,6 +22504,7 @@ mod tests {
         let line = status_line_row(
             Some(StatusLineView {
                 agent: AgentMode::Standard,
+                shell_mode: false,
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 fast: false,
@@ -22472,6 +22549,7 @@ mod tests {
         let line = status_line_row(
             Some(StatusLineView {
                 agent: AgentMode::Standard,
+                shell_mode: false,
                 model: None,
                 effort: Some("high".to_owned()),
                 fast: false,
@@ -24468,6 +24546,7 @@ mod tests {
         let line = status_line_row(
             Some(StatusLineView {
                 agent: AgentMode::Standard,
+                shell_mode: false,
                 model: Some("GPT-5.6 Sol".to_owned()),
                 effort: Some("high".to_owned()),
                 fast: false,
