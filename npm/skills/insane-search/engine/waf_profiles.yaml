@@ -59,6 +59,8 @@ akamai_bot_manager:
     - mobile_subdomain   # www.* → m.* — strong observational win in SSR sites
   fallback_when_challenge:
     - curl_grid_exhaust   # try more impersonate × referer × url combos
+    - scrapling
+    - stealth_firefox
     - protocol_stealth_chrome
     - playwright_real_chrome
   notes: |
@@ -80,9 +82,11 @@ cloudflare_turnstile:
     - google_search
     - self_root
   fallback_when_challenge:
-    - playwright_mcp       # MCP sufficient; Chromium TLS passes CF baseline
+    - scrapling
+    - stealth_firefox
     - protocol_stealth_chrome  # nodriver passes gates all Playwright shims fail
     - playwright_real_chrome
+    - playwright_mcp       # optional agent-session fallback; never a local server requirement
 
 f5_big_ip:
   detectors:
@@ -117,6 +121,8 @@ datadome_probable:
   tls_impersonate_candidates:
     - [safari, chrome]
   fallback_when_challenge:
+    - scrapling
+    - stealth_firefox
     - protocol_stealth_chrome
     - playwright_real_chrome
   notes: |
@@ -134,6 +140,8 @@ perimeterx_human:
   tls_impersonate_candidates:
     - [safari, chrome]
   fallback_when_challenge:
+    - scrapling
+    - stealth_firefox
     - protocol_stealth_chrome
     - playwright_real_chrome
   notes: |
@@ -160,6 +168,8 @@ kasada_ips:
   url_transform_order:
     - original
   fallback_when_challenge:
+    - scrapling
+    - stealth_firefox
     - protocol_stealth_chrome
     - playwright_real_chrome
   notes: |
@@ -185,8 +195,10 @@ imperva_incapsula:
   url_transform_order:
     - original
   fallback_when_challenge:
-    - playwright_real_chrome
+    - scrapling
+    - stealth_firefox
     - protocol_stealth_chrome
+    - playwright_real_chrome
   notes: |
     Imperva/Incapsula (Distil merged here). Cookie family incap_ses_*/
     visid_incap_* is the reliable artifact; body markers fire on the block page.
@@ -212,9 +224,11 @@ unknown_challenge:
     - original
     - mobile_subdomain
   fallback_when_challenge:
-    - playwright_mcp
+    - scrapling
+    - stealth_firefox
     - protocol_stealth_chrome
     - playwright_real_chrome
+    - playwright_mcp
   notes: |
     When detector returns low-confidence results we land here. Broad,
     conservative grid. Evidence from these runs should feed observations/

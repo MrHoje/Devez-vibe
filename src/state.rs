@@ -1134,6 +1134,7 @@ impl ModelInfo {
             "sol" => identity.contains("5.6") && identity.contains("sol"),
             "terra" => identity.contains("5.6") && identity.contains("terra"),
             "luna" => identity.contains("5.6") && identity.contains("luna"),
+            "astra" => identity.contains("astra"),
             "5.5" => identity.contains("5.5"),
             "5.4" => identity.contains("5.4") && !identity.contains("mini"),
             "mini" | "5.4-mini" => identity.contains("5.4") && identity.contains("mini"),
@@ -1164,6 +1165,36 @@ fn normalized_model_display_name(display_name: &str) -> String {
     } else {
         display_name.to_owned()
     }
+}
+
+fn model_family_version(model: &ModelInfo, family: &str) -> Vec<u32> {
+    [&model.display_name, &model.model]
+        .into_iter()
+        .find_map(|identity| {
+            let identity = identity.to_ascii_lowercase();
+            let rest = identity.split_once(family)?.1;
+            let mut version = Vec::new();
+            let mut digits = String::new();
+            let mut started = false;
+            for character in rest.chars() {
+                if character.is_ascii_digit() {
+                    digits.push(character);
+                    started = true;
+                } else if started && matches!(character, '.' | '-' | '_') {
+                    if !digits.is_empty() {
+                        version.push(digits.parse().ok()?);
+                        digits.clear();
+                    }
+                } else if started {
+                    break;
+                }
+            }
+            if !digits.is_empty() {
+                version.push(digits.parse().ok()?);
+            }
+            (!version.is_empty()).then_some(version)
+        })
+        .unwrap_or_default()
 }
 
 fn move_model_index_in(candidates: &[usize], model_index: usize, direction: i8) -> usize {
@@ -3607,6 +3638,7 @@ pub struct AppState {
     cost_ledger: Option<CostLedger>,
     pending_turn_model: Option<String>,
     pending_turn_effort: Option<String>,
+    pending_provider_model: Option<String>,
     active_turn_model: Option<String>,
     active_turn_effort: Option<String>,
     cost_restore_due: bool,
@@ -3872,6 +3904,7 @@ impl AppState {
             cost_ledger: Some(CostLedger::default()),
             pending_turn_model: None,
             pending_turn_effort: None,
+            pending_provider_model: None,
             active_turn_model: None,
             active_turn_effort: None,
             cost_restore_due: false,
@@ -4188,6 +4221,28 @@ impl AppState {
         self.provider_model_indices(self.selected_provider())
     }
 
+    fn provider_model_index(&self, provider: ModelProvider, query: &str) -> Option<usize> {
+        let matches = self
+            .provider_model_indices(provider)
+            .into_iter()
+            .filter(|index| self.models[*index].matches_query(query));
+        let family = query.trim().to_ascii_lowercase();
+        if provider == ModelProvider::Claude && matches!(family.as_str(), "fable" | "opus") {
+            matches.max_by_key(|index| model_family_version(&self.models[*index], &family))
+        } else {
+            matches.into_iter().next()
+        }
+    }
+
+    fn apply_provider_model(&mut self, provider: ModelProvider, query: &str) {
+        let Some(index) = self.provider_model_index(provider, query) else {
+            self.committed
+                .push(Block::new(BlockKind::Error, "모델을 찾을 수 없음", query));
+            return;
+        };
+        self.apply_model(index, None);
+    }
+
     fn model_picker_indices(&self, query: Option<&Editor>) -> Vec<usize> {
         let candidates = self.current_provider_model_indices();
         let Some(query) = query else {
@@ -4449,6 +4504,13 @@ impl AppState {
 
     pub fn switch_to_codex(&mut self) {
         self.switch_provider(ModelProvider::Codex);
+        if let Some(query) = self.pending_provider_model.take() {
+            self.apply_provider_model(ModelProvider::Codex, &query);
+        }
+    }
+
+    pub fn clear_pending_provider_model(&mut self) {
+        self.pending_provider_model = None;
     }
 
     pub fn switch_to_open_code(&mut self) {
@@ -9064,7 +9126,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/provider [claude|codex|opencode]  Claude·Codex 전환, OpenCode 연결\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|goal-runner|reviewer]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
+                    format!("/provider [claude|codex|opencode] [MODEL]  provider와 모델 선택\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|researcher|goal-runner]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
                 ));
                 Action::None
             }
@@ -9085,11 +9147,46 @@ impl AppState {
                     Action::None
                 }
             },
+            "/provider" if parts.len() == 3 => {
+                let query = parts[2];
+                match parts[1].to_ascii_lowercase().as_str() {
+                    "claude" => {
+                        let Some(index) = self.provider_model_index(ModelProvider::Claude, query)
+                        else {
+                            self.committed.push(Block::new(
+                                BlockKind::Error,
+                                "모델을 찾을 수 없음",
+                                query,
+                            ));
+                            return Action::None;
+                        };
+                        let action = self.apply_runtime_choice(0);
+                        self.apply_model(index, None);
+                        action
+                    }
+                    "codex" if self.selected_provider() == ModelProvider::Codex => {
+                        self.apply_provider_model(ModelProvider::Codex, query);
+                        Action::None
+                    }
+                    "codex" => {
+                        self.pending_provider_model = Some(query.to_owned());
+                        self.apply_runtime_choice(1)
+                    }
+                    _ => {
+                        self.committed.push(Block::new(
+                            BlockKind::Error,
+                            "Usage",
+                            "/provider [claude|codex] [MODEL]",
+                        ));
+                        Action::None
+                    }
+                }
+            }
             "/provider" => {
                 self.committed.push(Block::new(
                     BlockKind::Error,
                     "Usage",
-                    "/provider [claude|codex|opencode]",
+                    "/provider [claude|codex|opencode] [MODEL]",
                 ));
                 Action::None
             }
@@ -23297,13 +23394,13 @@ mod tests {
         state.handle_key(KeyEvent::from(KeyCode::Tab));
         assert_eq!(state.agent_mode, AgentMode::Planner);
 
-        for expected in [AgentMode::Reviewer, AgentMode::GoalRunner] {
+        for expected in [AgentMode::Researcher, AgentMode::GoalRunner] {
             state.handle_key(KeyEvent::from(KeyCode::Tab));
             assert_eq!(state.agent_mode, expected);
         }
         // Whatever the agents folder adds sits after the built-ins, so the
         // cycle returns to Builder only once every role has been through.
-        for _ in agent::BUILTIN.len()..agent::choices().len() {
+        for _ in agent::VISIBLE.len()..agent::choices().len() {
             state.handle_key(KeyEvent::from(KeyCode::Tab));
         }
         state.handle_key(KeyEvent::from(KeyCode::Tab));
@@ -23335,7 +23432,7 @@ mod tests {
         assert!(matches!(state.submit_editor(), Action::Submit(_)));
         state.handle_key(KeyEvent::from(KeyCode::Tab));
 
-        assert_eq!(state.agent_mode, AgentMode::Reviewer);
+        assert_eq!(state.agent_mode, AgentMode::Researcher);
         assert_eq!(state.view().plan_agent, AgentMode::Planner);
     }
 
@@ -23867,7 +23964,7 @@ mod tests {
         assert_eq!(overlay.title, "Agent");
         assert_eq!(overlay.lines.len(), agent::choices().len());
         assert!(overlay.lines[0].text.contains("Builder"));
-        assert!(overlay.lines[2].text.contains("Reviewer"));
+        assert!(overlay.lines[2].text.contains("Researcher"));
 
         state.handle_key(KeyEvent::from(KeyCode::Down));
         assert_eq!(state.agent_mode, AgentMode::Standard);
@@ -23901,6 +23998,13 @@ mod tests {
         state.handle_key(KeyEvent::from(KeyCode::Enter));
         assert_eq!(state.agent_mode, AgentMode::Planner);
         assert!(state.editor.is_empty());
+
+        state.editor.set_text("/agent r");
+        let suggestions = state.view().suggestions;
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].command, "/agent researcher");
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(state.agent_mode, AgentMode::Researcher);
     }
 
     #[test]
@@ -25997,6 +26101,64 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(model_lines.len(), 2);
         assert!(model_lines.iter().all(|line| line.text.contains("GPT")));
+    }
+
+    #[test]
+    fn provider_command_selects_model_alias_and_latest_claude_family() {
+        let models = vec![
+            test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
+            test_model("gpt-5.6-terra", "GPT-5.6 Terra", false),
+            test_model("gpt-5.6-luna", "GPT-5.6 Luna", false),
+            test_model("gpt-6-astra", "GPT-6 Astra", false),
+            test_model("claude:claude-fable-5", "Claude Fable 5", false),
+            test_model("claude:claude-fable-5-1", "Claude Fable 5.1", false),
+            test_model("claude:claude-opus-4-8", "Claude Opus 4.8", false),
+            test_model("claude:opus", "Claude Opus 5", false),
+            test_model("claude:sonnet", "Claude Sonnet 5", false),
+            test_model("claude:haiku", "Claude Haiku 4.5", false),
+        ];
+        let mut state = AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            models,
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+        state.claude_provider_enabled = true;
+        state.codex_provider_enabled = true;
+
+        state.run_slash_command("/provider claude fable");
+        assert_eq!(state.selected_model_name(), "claude:claude-fable-5-1");
+
+        state.run_slash_command("/provider claude opus");
+        assert_eq!(state.selected_model_name(), "claude:opus");
+
+        assert!(matches!(
+            state.run_slash_command("/provider codex astra"),
+            Action::ActivateCodex
+        ));
+        state.switch_to_codex();
+        assert_eq!(state.selected_model_name(), "gpt-6-astra");
+        for (alias, expected) in [
+            ("sol", "gpt-5.6-sol"),
+            ("terra", "gpt-5.6-terra"),
+            ("luna", "gpt-5.6-luna"),
+            ("astra", "gpt-6-astra"),
+        ] {
+            state.run_slash_command(&format!("/provider codex {alias}"));
+            assert_eq!(state.selected_model_name(), expected);
+        }
+
+        state.run_slash_command("/provider claude sonnet");
+        assert_eq!(state.selected_model_name(), "claude:sonnet");
+        state.run_slash_command("/provider claude haiku");
+        assert_eq!(state.selected_model_name(), "claude:haiku");
+
+        state.run_slash_command("/provider codex astra");
+        state.clear_pending_provider_model();
+        state.switch_to_codex();
+        assert_eq!(state.selected_model_name(), "gpt-5.6-sol");
     }
 
     #[test]

@@ -5524,6 +5524,7 @@ enum Tone {
     AgentPlanner,
     AgentGoalRunner,
     AgentReviewer,
+    AgentResearcher,
     Border,
     SidePanelDivider,
     Branch,
@@ -13351,6 +13352,7 @@ fn agent_prompt_tone(mode: AgentMode) -> Tone {
         AgentMode::Planner => Tone::AgentPlanner,
         AgentMode::GoalRunner => Tone::AgentGoalRunner,
         AgentMode::Reviewer => Tone::AgentReviewer,
+        AgentMode::Researcher => Tone::AgentResearcher,
         // A user-defined role borrows one of the specialized colours in turn,
         // so it reads as a role rather than as Builder.
         AgentMode::Custom(index) => match index % 3 {
@@ -13436,6 +13438,7 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::AgentPlanner => palette.agent_planner,
         Tone::AgentGoalRunner => palette.agent_goal_runner,
         Tone::AgentReviewer => palette.agent_reviewer,
+        Tone::AgentResearcher => palette.agent_researcher,
         Tone::Border => palette.border,
         Tone::SidePanelDivider => blend(
             palette.hover_bg,

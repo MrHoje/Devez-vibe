@@ -143,8 +143,8 @@ def _module_available(name: str) -> bool:
         return False
 
 
-def _auto_install(pkg: str) -> bool:
-    if os.environ.get("INSANE_AUTO_INSTALL", "").strip() not in ("1", "true", "yes"):
+def _auto_install(pkg: str, module: Optional[str] = None) -> bool:
+    if os.environ.get("INSANE_AUTO_INSTALL", "").strip().lower() not in ("1", "true", "yes"):
         return False
     try:
         subprocess.run([sys.executable, "-m", "pip", "install", pkg, "-q"],
@@ -152,16 +152,17 @@ def _auto_install(pkg: str) -> bool:
     except Exception:
         return False
     importlib.invalidate_caches()
-    return _module_available(pkg)
+    return _module_available(module or pkg)
 
 
-def _run_python_template(template: str, args: dict, timeout: int = 90) -> tuple[int, str, str]:
+def _run_python_template(template: str, args: dict, timeout: int = 90,
+                         python_executable: Optional[str] = None) -> tuple[int, str, str]:
     path = os.path.join(TEMPLATES_DIR, template)
     if not os.path.isfile(path):
         return 127, "", f"template not found: {path}"
     try:
         proc = subprocess.run(
-            [sys.executable, path], input=json.dumps(args), cwd=TEMPLATES_DIR,
+            [python_executable or sys.executable, path], input=json.dumps(args), cwd=TEMPLATES_DIR,
             capture_output=True, text=True, timeout=timeout,
         )
         return proc.returncode, proc.stdout, proc.stderr
@@ -173,6 +174,7 @@ def _run_python_template(template: str, args: dict, timeout: int = 90) -> tuple[
 
 def _run_protocol_stealth(
     att: Attempt, url: str, *, success_selectors: Optional[list[str]], timeout: int, t0: float,
+    proxy: Optional[str] = None,
 ) -> tuple[Attempt, str]:
     """nodriver (raw CDP, no Playwright shim) first, patchright channel=chrome next.
 
@@ -181,17 +183,22 @@ def _run_protocol_stealth(
     strongest free option, patchright the license-safe next. Missing drivers are
     reported so the caller continues down its fallback list.
     """
-    args: dict = {"url": url, "timeout": timeout * 1000}
+    args: dict = {"url": url, "timeout": timeout * 1000, "headless": True}
+    if proxy:
+        from .network import proxy_for_browser
+        args["proxy"] = proxy_for_browser(proxy)
     if success_selectors:
         args["waitSelector"] = success_selectors[0]
     for pkg, template in (("nodriver", "nodriver_fetch.py"), ("patchright", "patchright_fetch.py")):
         if not _module_available(pkg) and not _auto_install(pkg):
             continue
+        att._executed = True
         rc, stdout, stderr = _run_python_template(template, args, timeout=timeout + 30)
         att.executor = f"protocol_stealth_chrome:{pkg}"
         att.elapsed_s = round(time.time() - t0, 3)
         if rc != 0 or not stdout:
-            att.error = f"{pkg}: {(stderr or 'no stdout')[:200]}"
+            from .network import redact_proxy
+            att.error = f"{pkg}: {(redact_proxy(stderr, proxy) or 'no stdout')[:200]}"
             continue
         resp = _FakeResp(stdout)
         vr = validate(resp, success_selectors=success_selectors)
@@ -205,6 +212,156 @@ def _run_protocol_stealth(
         att.error = "nodriver/patchright not installed (pip install nodriver, or INSANE_AUTO_INSTALL=1)"
     att.verdict = Verdict.UNKNOWN.value
     return att, ""
+
+
+_SCRAPLING_PYTHON_CACHE: Optional[str] = None
+
+
+def _scrapling_python() -> Optional[str]:
+    """Return an isolated Scrapling runtime, creating it on first real use."""
+    global _SCRAPLING_PYTHON_CACHE
+    if _module_available("scrapling"):
+        return sys.executable
+    if _SCRAPLING_PYTHON_CACHE is not None:
+        return _SCRAPLING_PYTHON_CACHE or None
+    if os.environ.get("INSANE_AUTO_INSTALL", "").strip().lower() in ("0", "false", "no"):
+        _SCRAPLING_PYTHON_CACHE = ""
+        return None
+
+    root = os.path.expanduser("~/.insane-search/scrapling-venv")
+    python = os.path.join(root, "Scripts", "python.exe") if os.name == "nt" else os.path.join(root, "bin", "python")
+    try:
+        if not os.path.isfile(python):
+            subprocess.run(
+                [sys.executable, "-m", "venv", root], capture_output=True,
+                text=True, timeout=180, check=False)
+        probe = subprocess.run(
+            [python, "-c", "import scrapling"], capture_output=True,
+            text=True, timeout=30, check=False)
+        if probe.returncode != 0:
+            install = subprocess.run(
+                [python, "-m", "pip", "install", "scrapling[fetchers]>=0.4.8", "-q"],
+                capture_output=True, text=True, timeout=600, check=False)
+            if install.returncode != 0:
+                _SCRAPLING_PYTHON_CACHE = ""
+                return None
+        _SCRAPLING_PYTHON_CACHE = python
+        return python
+    except Exception:
+        _SCRAPLING_PYTHON_CACHE = ""
+        return None
+
+
+def _run_scrapling(
+    att: Attempt, url: str, *, profile_id: str,
+    success_selectors: Optional[list[str]], timeout: int, t0: float,
+    proxy: Optional[str],
+) -> tuple[Attempt, str]:
+    """Run Scrapling as the primary hidden browser fallback."""
+    python = _scrapling_python()
+    if python is None:
+        att.executor = "scrapling:stealthy_fetcher"
+        att.error = "Scrapling installation failed or is unavailable"
+        att.verdict = Verdict.UNKNOWN.value
+        att.elapsed_s = round(time.time() - t0, 3)
+        return att, ""
+
+    args: dict = {
+        "url": url,
+        "timeout": max(timeout, 60) * 1000,
+        "headless": True,
+        "realChrome": True,
+        "solveCloudflare": profile_id in ("cloudflare_turnstile", "unknown_challenge"),
+        "blockAds": True,
+    }
+    if success_selectors:
+        args["waitSelector"] = success_selectors[0]
+    if proxy:
+        from .network import proxy_for_browser
+        args["proxy"] = proxy_for_browser(proxy)
+
+    att._executed = True
+    if python == sys.executable:
+        rc, stdout, stderr = _run_python_template(
+            "scrapling_fetch.py", args, timeout=max(timeout, 60) + 30)
+    else:
+        rc, stdout, stderr = _run_python_template(
+            "scrapling_fetch.py", args, timeout=max(timeout, 60) + 30,
+            python_executable=python)
+    att.executor = "scrapling:stealthy_fetcher"
+    att.elapsed_s = round(time.time() - t0, 3)
+    if rc != 0 or not stdout:
+        from .network import redact_proxy
+        att.error = (redact_proxy(stderr, proxy) or "no stdout")[:300]
+        att.verdict = Verdict.UNKNOWN.value
+        return att, ""
+
+    html, final_url, status, cookies, user_agent, automation, inner_text = _parse_envelope(stdout, url)
+    resp = _FakeResp(html, status=status, final_url=final_url)
+    vr = validate(resp, success_selectors=success_selectors)
+    att.status = status
+    att.body_size = len(html)
+    att.verdict = vr.verdict.value
+    att.reasons = list(vr.reasons) + ([f"automation:{automation}"] if automation else [])
+    att.url = final_url or url
+    if inner_text:
+        att._inner_text = inner_text
+    return att, html
+
+
+def _run_stealth_firefox(
+    att: Attempt, url: str, *, success_selectors: Optional[list[str]], timeout: int,
+    t0: float, profile_dir: Optional[str], proxy: Optional[str],
+) -> tuple[Attempt, str]:
+    """Run the optional Python-only stealth Firefox without a sidecar server."""
+    module = "invisible_playwright"
+    if not _module_available(module) and not _auto_install("invisible-playwright", module):
+        att.executor = "stealth_firefox:invisible_playwright"
+        att.error = (
+            "invisible-playwright not installed "
+            "(pip install invisible-playwright, or INSANE_AUTO_INSTALL=1)"
+        )
+        att.verdict = Verdict.UNKNOWN.value
+        att.elapsed_s = round(time.time() - t0, 3)
+        return att, ""
+
+    args: dict = {
+        "url": url,
+        "timeout": timeout * 1000,
+        "profileDir": profile_dir or _profile_dir_for(url, "stealth_firefox"),
+        "headless": True,
+    }
+    if success_selectors:
+        args["waitSelector"] = success_selectors[0]
+    if proxy:
+        from .network import proxy_for_browser
+        args["proxy"] = proxy_for_browser(proxy)
+
+    rc, stdout, stderr = _run_python_template(
+        "invisible_playwright_fetch.py", args, timeout=timeout + 30)
+    att._executed = True
+    att.executor = "stealth_firefox:invisible_playwright"
+    att.elapsed_s = round(time.time() - t0, 3)
+    if rc != 0 or not stdout:
+        from .network import redact_proxy
+        att.error = (redact_proxy(stderr, proxy) or "no stdout")[:300]
+        att.verdict = Verdict.UNKNOWN.value
+        return att, ""
+
+    html, final_url, status, cookies, user_agent, automation, inner_text = _parse_envelope(stdout, url)
+    resp = _FakeResp(html, status=status, final_url=final_url)
+    vr = validate(resp, success_selectors=success_selectors)
+    att.status = status
+    att.body_size = len(html)
+    att.verdict = vr.verdict.value
+    att.reasons = list(vr.reasons) + ([f"automation:{automation}"] if automation else [])
+    att.url = final_url or url
+    if vr.verdict in (Verdict.STRONG_OK, Verdict.WEAK_OK) and cookies:
+        _bridge_cookies_to_pool(
+            url, cookies, user_agent, proxy=proxy, impersonate="firefox")
+    if inner_text:
+        att._inner_text = inner_text
+    return att, html
 
 
 def _run_node_template(template: str, args: dict, timeout: int = 90,
@@ -271,13 +428,14 @@ def run_playwright_fallback(
     timeout: int = 90,
     profile_dir: Optional[str] = None,
     force_executor: Optional[str] = None,
+    proxy: Optional[str] = None,
 ) -> tuple[Attempt, str]:
     """Invoke the appropriate Playwright executor.
 
     force_executor: caller-specified executor name (from a profile's
     `fallback_when_challenge` list). When set, it overrides capability-based
     inference. Recognized values: "playwright_real_chrome",
-    "playwright_mobile_chrome", "playwright_mcp".
+    "playwright_mobile_chrome", "playwright_mcp", "scrapling", "stealth_firefox".
 
     Returns (Attempt, html_content). Attempt.verdict reflects validation.
     """
@@ -294,9 +452,22 @@ def run_playwright_fallback(
         impersonate=None,
         referer="",
     )
+    att._executed = False
+
+    if choice == "scrapling":
+        return _run_scrapling(
+            att, url, profile_id=profile_id, success_selectors=success_selectors,
+            timeout=timeout, t0=t0, proxy=proxy)
 
     if choice == "protocol_stealth_chrome":
-        return _run_protocol_stealth(att, url, success_selectors=success_selectors, timeout=timeout, t0=t0)
+        return _run_protocol_stealth(
+            att, url, success_selectors=success_selectors, timeout=timeout,
+            t0=t0, proxy=proxy)
+
+    if choice == "stealth_firefox":
+        return _run_stealth_firefox(
+            att, url, success_selectors=success_selectors, timeout=timeout,
+            t0=t0, profile_dir=profile_dir, proxy=proxy)
 
     if choice.startswith("playwright_mcp"):
         att.error = (
@@ -337,18 +508,24 @@ def run_playwright_fallback(
         # letting a host reuse its own warm storageState across calls.
         "profileDir": profile_dir or _profile_dir_for(url, choice),
         "timeout": timeout * 1000,
+        "headless": True,
     }
     if choice == "playwright_mobile_chrome":
         args["device"] = "iPhone 13 Pro"
     if success_selectors:
         args["waitSelector"] = success_selectors[0]
+    if proxy:
+        from .network import proxy_for_browser
+        args["proxy"] = proxy_for_browser(proxy)
 
+    att._executed = True
     rc, stdout, stderr = _run_node_template(template, args, timeout=timeout + 10,
                                             deps_root=deps_root)
     att.elapsed_s = round(time.time() - t0, 3)
 
     if rc != 0 or not stdout:
-        att.error = (stderr or "no stdout")[:300]
+        from .network import redact_proxy
+        att.error = (redact_proxy(stderr, proxy) or "no stdout")[:300]
         att.verdict = Verdict.UNKNOWN.value
         return att, ""
 
@@ -369,7 +546,7 @@ def run_playwright_fallback(
     # cookies + UA a plain HTTP client needs. Seed the curl_cffi pool so
     # subsequent same-host pages are collected cheaply (FlareSolverr pattern).
     if vr.verdict in (Verdict.STRONG_OK, Verdict.WEAK_OK) and cookies:
-        _bridge_cookies_to_pool(url, cookies, user_agent)
+        _bridge_cookies_to_pool(url, cookies, user_agent, proxy=proxy)
 
     # Stash the rendered innerText for the render-merge step: many SPAs expose
     # visible text only via innerText; the rescue gate in fetch_chain compares
@@ -408,12 +585,14 @@ def _parse_envelope(stdout: str, url: str):
     return stdout, url, 200, [], None, None, ""
 
 
-def _bridge_cookies_to_pool(url: str, cookies: list, user_agent: Optional[str]) -> None:
+def _bridge_cookies_to_pool(url: str, cookies: list, user_agent: Optional[str],
+                            proxy: Optional[str] = None,
+                            impersonate: str = "chrome") -> None:
     try:
         from .transport import POOL, pool_enabled, _host_of
         if not pool_enabled():
             return
-        # Browser is real Chrome → seed the "chrome" curl identity for this host.
-        POOL.inject_cookies(_host_of(url), "chrome", cookies, user_agent=user_agent)
+        POOL.inject_cookies(_host_of(url), impersonate, cookies,
+                            user_agent=user_agent, proxy=proxy)
     except Exception:
         pass

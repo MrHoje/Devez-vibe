@@ -21,7 +21,10 @@ def main() -> int:
     with sync_playwright() as p:
         # Headful by default — headless Chrome is scored as a bot before the
         # protocol fingerprint is even examined.
-        browser = p.chromium.launch(channel="chrome", headless=bool(args.get("headless", False)))
+        launch = {"channel": "chrome", "headless": bool(args.get("headless", False))}
+        if args.get("proxy"):
+            launch["proxy"] = args["proxy"]
+        browser = p.chromium.launch(**launch)
         try:
             page = browser.new_page()
             page.goto(args["url"], timeout=timeout_ms, wait_until="domcontentloaded")

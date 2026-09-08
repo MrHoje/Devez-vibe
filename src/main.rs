@@ -2596,6 +2596,7 @@ async fn execute_action(
                     // The switch never reached disk, so the row goes back to what
                     // the next launch will actually read.
                     state.restore_provider_connection(key_path, !connected);
+                    state.clear_pending_provider_model();
                     state.push_notice(
                         BlockKind::Warning,
                         "Provider 연결 저장 실패",
@@ -3781,10 +3782,14 @@ async fn activate_codex(server: &mut BackendServer, state: &mut AppState) {
                 state.switch_to_codex();
             }
             Err(error) => {
+                state.clear_pending_provider_model();
                 state.push_notice(BlockKind::Error, "Codex 모델 조회 실패", error.to_string())
             }
         },
-        Err(error) => state.push_notice(BlockKind::Error, "Codex 사용 불가", error.to_string()),
+        Err(error) => {
+            state.clear_pending_provider_model();
+            state.push_notice(BlockKind::Error, "Codex 사용 불가", error.to_string());
+        }
     }
 }
 

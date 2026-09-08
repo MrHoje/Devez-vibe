@@ -177,6 +177,7 @@ pub struct ThemePalette {
     pub agent_planner: Rgb,
     pub agent_goal_runner: Rgb,
     pub agent_reviewer: Rgb,
+    pub agent_researcher: Rgb,
     pub status: StatusLinePalette,
     pub code: Rgb,
     pub syntax_comment: Rgb,
@@ -278,6 +279,7 @@ pub const MINIMAL: ThemePalette = ThemePalette {
     agent_planner: Rgb(0x15, 0x80, 0x3D),
     agent_goal_runner: Rgb(0xDC, 0x26, 0x26),
     agent_reviewer: Rgb(0x7C, 0x3A, 0xED),
+    agent_researcher: Rgb(0x9A, 0x67, 0x00),
     status: StatusLinePalette {
         text: Rgb(0x0F, 0x14, 0x22),
         separator: Rgb(0x0F, 0x14, 0x22),
@@ -347,6 +349,7 @@ pub const SOFT: ThemePalette = ThemePalette {
     agent_planner: Rgb(0x16, 0x65, 0x34),
     agent_goal_runner: Rgb(0xA3, 0x3E, 0x3E),
     agent_reviewer: Rgb(0x68, 0x4B, 0x8A),
+    agent_researcher: Rgb(0x8A, 0x4B, 0x08),
     status: StatusLinePalette {
         text: Rgb(0x16, 0x12, 0x0C),
         separator: Rgb(0x16, 0x12, 0x0C),
@@ -416,6 +419,7 @@ pub const DARK: ThemePalette = ThemePalette {
     agent_planner: Rgb(0x5F, 0xBF, 0x7A),
     agent_goal_runner: Rgb(0xF8, 0x71, 0x71),
     agent_reviewer: Rgb(0xA7, 0x8B, 0xFA),
+    agent_researcher: Rgb(0xFB, 0xBF, 0x24),
     status: StatusLinePalette {
         text: Rgb(0xC7, 0xC8, 0xCB),
         separator: Rgb(0x82, 0x90, 0xA0),
@@ -488,6 +492,7 @@ pub const GRAY: ThemePalette = ThemePalette {
     agent_planner: Rgb(0x0B, 0x7A, 0x35),
     agent_goal_runner: Rgb(0xC5, 0x30, 0x30),
     agent_reviewer: Rgb(0x77, 0x30, 0xA8),
+    agent_researcher: Rgb(0x8F, 0x5A, 0x00),
     status: StatusLinePalette {
         text: Rgb(0x1F, 0x29, 0x37),
         separator: Rgb(0x5F, 0x67, 0x74),
@@ -559,6 +564,7 @@ pub const SOFT_PINK: ThemePalette = ThemePalette {
     agent_planner: Rgb(0x25, 0x72, 0x3C),
     agent_goal_runner: Rgb(0xC2, 0x41, 0x3E),
     agent_reviewer: Rgb(0x84, 0x58, 0x8F),
+    agent_researcher: Rgb(0x9A, 0x65, 0x0B),
     status: StatusLinePalette {
         text: Rgb(0x3B, 0x29, 0x31),
         separator: Rgb(0x73, 0x57, 0x63),
@@ -630,6 +636,7 @@ pub const MIDNIGHT: ThemePalette = ThemePalette {
     agent_planner: Rgb(0x5F, 0xBF, 0x7A),
     agent_goal_runner: Rgb(0xF8, 0x71, 0x71),
     agent_reviewer: Rgb(0xA7, 0x8B, 0xFA),
+    agent_researcher: Rgb(0xFB, 0xBF, 0x24),
     status: StatusLinePalette {
         text: Rgb(0xCB, 0xD5, 0xE1),
         separator: Rgb(0x82, 0x90, 0xA0),
@@ -824,6 +831,7 @@ mod tests {
                 ("agent_planner", palette.agent_planner),
                 ("agent_goal_runner", palette.agent_goal_runner),
                 ("agent_reviewer", palette.agent_reviewer),
+                ("agent_researcher", palette.agent_researcher),
             ];
             for (name, color) in text_colors {
                 let ratio = contrast_ratio(color, palette.background);
@@ -1143,6 +1151,7 @@ mod tests {
                     ("planner", palette.agent_planner),
                     ("goal runner", palette.agent_goal_runner),
                     ("reviewer", palette.agent_reviewer),
+                    ("researcher", palette.agent_researcher),
                 ],
             );
         }

@@ -7,8 +7,10 @@
 
 | Approach | 실행기 | TLS 스택 | 적합 WAF | 한계 |
 |----------|--------|----------|----------|------|
+| **Primary** | `scrapling_fetch.py` | 시스템 Chrome + Patchright | Cloudflare Turnstile/Interstitial, 일반 anti-bot | 첫 사용 시 Python 패키지 설치 |
 | **1. MCP** | `mcp__playwright__*` 도구 | Playwright 번들 Chromium (BoringSSL) | Cloudflare 기본, CAPTCHA 없는 SPA, JS 챌린지 약한 사이트 | Akamai Bot Manager 등 TLS-감지형 WAF에 **즉시 탐지됨** (`channel` 옵션 없음) |
 | **2. Local Node + `channel:'chrome'`** | `engine/templates/playwright_real_chrome.js` | 시스템 설치 실제 Chrome | Akamai Bot Manager, PerimeterX, DataDome 강화 설정 | Node + Chrome 시스템 설치 필요 |
+| **3. Local Python + stealth Firefox** | `engine/templates/invisible_playwright_fetch.py` | 패치된 Firefox | Node·MCP 서버 없이 엔진 수준 지문이 필요한 경우 | 선택 패키지와 약 544MB의 압축 해제 공간 필요 |
 
 `engine/executor.py`가 프로파일 태그를 보고 자동 라우팅하므로, 이 선택을 스킬 외부에서 의식할 필요는 없다.
 
@@ -91,7 +93,7 @@ chromium.use(stealth);
 
 const ctx = await chromium.launchPersistentContext(profileDir, {
   channel: 'chrome',        // ← 핵심: 번들 Chromium 아닌 실제 Chrome
-  headless: false,          // Akamai는 headless 탐지. headful 필요.
+  headless: true,           // DevezVibe 기본값: 화면을 띄우지 않음.
   viewport: { width: 1366, height: 900 },
 });
 ```
@@ -105,7 +107,7 @@ const iPhone = devices['iPhone 13 Pro'];
 const ctx = await chromium.launchPersistentContext(profileDir, {
   channel: 'chrome',          // TLS는 실제 Chrome
   ...iPhone,                  // UA/viewport/isMobile/hasTouch 자동 주입
-  headless: false,
+  headless: true,
 });
 ```
 
@@ -121,6 +123,23 @@ const ctx = await chromium.launchPersistentContext(profileDir, {
 | `needs_js_exec` only | Approach 1 (MCP) | Cloudflare Turnstile |
 | `needs_real_tls_stack` only | Approach 2 (real_chrome) | 일부 DataDome 설정 |
 | 둘 다 없음 | curl 체인에서 해결. Playwright 안 씀 | F5 BIG-IP (TLS만 대응 필요) |
+
+## Primary — Scrapling
+
+`scrapling`은 브라우저 폴백의 첫 실행기다. `StealthyFetcher`를 시스템 Chrome의 숨김 모드로 한 번 호출하고 즉시 종료하며, Cloudflare 프로파일이나 미확인 챌린지에서는 `solve_cloudflare=True`를 함께 쓴다. 광고 요청은 차단하지만 CAPTCHA에 필요한 일반 자원은 유지한다.
+
+처음 필요할 때만 `~/.insane-search/scrapling-venv`에 `scrapling[fetchers]`를 설치한다. 사용자 Python 환경은 건드리지 않고, 브라우저 번들은 받지 않으며 `real_chrome=True`로 시스템 Chrome을 사용한다. 자동 설치를 원하지 않으면 `INSANE_AUTO_INSTALL=0`을 지정한다.
+
+## Approach 3 — Local Python + stealth Firefox
+
+`stealth_firefox`는 `invisible-playwright`를 같은 Python 프로세스 환경에서 직접 실행한다. 별도 MCP·REST 서버가 없고, 브라우저 지문은 페이지 스크립트가 아니라 패치된 Firefox 엔진에서 제공된다.
+
+```bash
+pip install invisible-playwright
+python -m invisible_playwright fetch
+```
+
+브라우저 다운로드가 크므로 엔진이 조용히 받지는 않는다. 패키지가 없으면 해당 폴백은 실행되지 않은 것으로 기록하고 다음 로컬 실행기를 시도한다. 사용자가 지정한 HTTP(S)·SOCKS 프록시는 브라우저 시작 시 전달되며 자격정보는 trace에 남기지 않는다.
 
 `device_class="mobile"`이 지정되면 real_chrome → mobile 변종으로 swap.
 

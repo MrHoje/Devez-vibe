@@ -38,6 +38,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
 
 from .content_safety import ContentSafetyReport, analyze_untrusted_content, wrap_untrusted_content
+from .network import diagnose_trace, normalize_proxy, redact_proxy
 from .validators import Verdict, validate, TERMINAL_NONSUCCESS
 from .waf_detector import detect, load_profile, _load_profiles, last_load_error
 from .url_transforms import iter_transformed
@@ -128,6 +129,8 @@ class FetchResult:
     # (browser / more routes may help); "infra_or_auth" = every route uniformly
     # 401/404 → a real wall stealth cannot clear.
     block_class: str = ""
+    proxy_used: bool = False
+    network_diagnosis: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         report = analyze_untrusted_content(self.content, source_url=self.final_url)
@@ -175,6 +178,8 @@ class FetchResult:
             "extraction_source": self.extraction_source,
             "extraction_meta": self.extraction_meta,
             "block_class": self.block_class,
+            "proxy_used": self.proxy_used,
+            "network_diagnosis": self.network_diagnosis,
         }
 
 
@@ -555,7 +560,7 @@ def _maybe_extract(resp, final_url: str, *, enable_extraction: bool,
 # --- curl_cffi probe executor ------------------------------------------------
 def _curl_probe(
     url: str, *, impersonate: str, referer: str, timeout: int = 20,
-    enable_retry: bool = False,
+    enable_retry: bool = False, proxy: Optional[str] = None,
 ) -> tuple[Any, Optional[str]]:
     """Returns (response, error_str). response may be None on exception.
 
@@ -564,8 +569,10 @@ def _curl_probe(
     The pool degrades to a one-shot GET when a Session can't be created.
     """
     from .transport import POOL
-    return POOL.request(url, impersonate=impersonate, referer=referer, timeout=timeout,
-                        max_retries=2 if enable_retry else 0)
+    response, error = POOL.request(
+        url, impersonate=impersonate, referer=referer, timeout=timeout,
+        max_retries=2 if enable_retry else 0, proxy=proxy)
+    return response, redact_proxy(error, proxy)
 
 
 def _run_attempt(
@@ -579,12 +586,13 @@ def _run_attempt(
     timeout: int,
     phase: str,
     enable_retry: bool = False,
+    proxy: Optional[str] = None,
 ) -> tuple[Attempt, Any]:
     """Execute one curl_cffi attempt and produce an Attempt record."""
     referer_url = REFERER_STRATEGIES.get(referer_name, REFERER_STRATEGIES["none"])(url)
     t0 = time.time()
     resp, err = _curl_probe(url, impersonate=impersonate, referer=referer_url, timeout=timeout,
-                            enable_retry=enable_retry)
+                            enable_retry=enable_retry, proxy=proxy)
     elapsed = round(time.time() - t0, 3)
 
     att = Attempt(
@@ -769,6 +777,7 @@ def fetch(
     enable_retry: bool = True,
     enable_markdown: bool = True,
     enable_maincontent: bool = False,
+    proxy: Optional[str] = None,
 ) -> FetchResult:
     """Public entrypoint — the generic grid wrapped with per-host self-learning.
 
@@ -797,6 +806,7 @@ def fetch(
     <pre>/<code> → fences); ``extraction_source`` becomes "raw+md". Set False
     for raw HTML. No-op when markdownify is not installed.
     ``enable_maincontent`` (opt-in) instead strips boilerplate via resiliparse."""
+    proxy = normalize_proxy(proxy)
     priority: Optional[dict] = None
     learned_existed = False
     uh = dict(user_hint or {})
@@ -819,7 +829,12 @@ def fetch(
         priority=priority,
         enable_extraction=enable_extraction, enable_retry=enable_retry,
         enable_markdown=enable_markdown, enable_maincontent=enable_maincontent,
+        proxy=proxy,
     )
+
+    result.proxy_used = proxy is not None
+    if not result.ok:
+        result.network_diagnosis = diagnose_trace(result.trace)
 
     try:
         from . import learning
@@ -861,6 +876,7 @@ def _fetch_core(
     enable_retry: bool = True,
     enable_markdown: bool = True,
     enable_maincontent: bool = False,
+    proxy: Optional[str] = None,
 ) -> FetchResult:
     """Fetch `url` using the generic diversity grid.
 
@@ -902,7 +918,7 @@ def _fetch_core(
     if enable_phase0:
         try:
             from .phase0 import route as _phase0_route
-            p0 = _phase0_route(url, timeout=timeout)
+            p0 = _phase0_route(url, timeout=timeout, proxy=proxy)
         except Exception as e:  # router must never break the generic chain
             p0 = None
             trace.append(Attempt(
@@ -947,7 +963,8 @@ def _fetch_core(
         if pool_enabled():
             _root = _root_of(url)
             if _root != url:
-                POOL.warmup(_host_of(url), base_impersonate, _root, timeout=min(timeout, 15))
+                POOL.warmup(_host_of(url), base_impersonate, _root,
+                            timeout=min(timeout, 15), proxy=proxy)
     except Exception:
         pass
 
@@ -960,6 +977,7 @@ def _fetch_core(
         referer_name=base_referer, success_selectors=success_selectors,
         known_bad_sizes=None, timeout=timeout, phase="probe",
         enable_retry=enable_retry,
+        proxy=proxy,
     )
     trace.append(probe_attempt)
     curl_attempts += 1
@@ -1001,6 +1019,7 @@ def _fetch_core(
             referer_name=cand.referer, success_selectors=success_selectors,
             known_bad_sizes=list(cand.known_bad_sizes) if cand.known_bad_sizes else None,
             timeout=timeout, phase="grid",
+            proxy=proxy,
         )
         trace.append(att)
         curl_attempts += 1
@@ -1034,7 +1053,8 @@ def _fetch_core(
         try:
             from .executor import run_playwright_fallback
             fb_profile = load_profile(profile_used or "unknown_challenge", profiles=profiles)
-            fb_order = fb_profile.get("fallback_when_challenge") or ["playwright_real_chrome"]
+            fb_order = fb_profile.get("fallback_when_challenge") or [
+                "scrapling", "stealth_firefox", "playwright_real_chrome"]
             for fb_name in fb_order:
                 if fb_name == "curl_grid_exhaust":
                     continue
@@ -1053,9 +1073,10 @@ def _fetch_core(
                     url, profile_id=profile_used or "unknown_challenge",
                     success_selectors=success_selectors, device_class=device_class,
                     force_executor=fb_name, timeout=timeout if timeout and timeout > 30 else 90,
+                    proxy=proxy,
                 )
                 trace.append(pw_attempt)
-                if not is_mcp_stub:
+                if not is_mcp_stub and getattr(pw_attempt, "_executed", True):
                     browser_used += 1
                 if pw_attempt.verdict in _OK_VALUES:
                     # Render-merge: the executor stashes the rendered innerText
@@ -1134,7 +1155,8 @@ def _untried_routes(stop_reason, grid_exhausted) -> tuple[list[str], bool]:
 
 
 _REAL_EXECUTORS = frozenset({
-    "curl_cffi", "playwright_real_chrome", "playwright_mobile_chrome"})
+    "curl_cffi", "playwright_real_chrome", "playwright_mobile_chrome",
+    "scrapling:stealthy_fetcher", "stealth_firefox:invisible_playwright"})
 _INFRA_AUTH_VERDICTS = frozenset({Verdict.AUTH_REQUIRED.value, Verdict.NOT_FOUND.value})
 _WAF_VERDICTS = frozenset({
     Verdict.CHALLENGE.value, Verdict.BLOCKED.value,

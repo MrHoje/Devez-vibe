@@ -38,6 +38,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Per-attempt timeout seconds (default 25).")
     p.add_argument("--max-attempts", type=int, default=None,
                    help="TOTAL curl-attempt budget. Default: None = exhaustive (honours R6).")
+    p.add_argument("--proxy", default=None, metavar="URL",
+                   help="User-approved HTTP(S) or SOCKS proxy URL for every network route.")
     p.add_argument("--no-retry", action="store_true",
                    help="Disable transient-status (429/502/503/504) probe retry.")
     p.add_argument("--no-extract", action="store_true",
@@ -62,6 +64,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
     args = build_parser().parse_args(argv)
     try:
         result = fetch(
@@ -76,6 +81,7 @@ def main(argv: list[str] | None = None) -> int:
             enable_retry=not args.no_retry,
             enable_markdown=not args.no_markdown,
             enable_maincontent=args.maincontent,
+            proxy=args.proxy,
         )
     except Exception as e:
         print(f"engine fatal: {type(e).__name__}: {e}", file=sys.stderr)
@@ -140,6 +146,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\n[engine] ok={result.ok} verdict={result.verdict} "
               f"profile={result.profile_used} attempts={len(result.trace)}",
               file=sys.stderr)
+        if result.network_diagnosis:
+            print(f"[engine] network_diagnosis={result.network_diagnosis}", file=sys.stderr)
 
     return 0 if result.ok else 1
 

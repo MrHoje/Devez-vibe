@@ -72,17 +72,18 @@ class _Entry:
 
 @dataclass
 class SessionPool:
-    """Thread-safe pool of curl_cffi Sessions keyed by (host, impersonate)."""
+    """Thread-safe pool of curl_cffi Sessions keyed by host, identity, and route."""
     _entries: dict = field(default_factory=dict)
     _lock: Any = field(default_factory=threading.Lock)
 
-    def _key(self, host: str, impersonate: str) -> tuple:
-        return (host, impersonate)
+    def _key(self, host: str, impersonate: str, proxy: Optional[str] = None) -> tuple:
+        from .network import proxy_cache_key
+        return (host, impersonate, proxy_cache_key(proxy))
 
-    def get(self, host: str, impersonate: str) -> Optional[_Entry]:
+    def get(self, host: str, impersonate: str, proxy: Optional[str] = None) -> Optional[_Entry]:
         """Return (creating if needed) the pool entry, or None if curl_cffi
         is unavailable."""
-        key = self._key(host, impersonate)
+        key = self._key(host, impersonate, proxy)
         with self._lock:
             ent = self._entries.get(key)
             if ent is not None:
@@ -92,7 +93,10 @@ class SessionPool:
             except ImportError:
                 return None
             try:
-                sess = cffi_requests.Session(impersonate=impersonate)
+                kwargs = {"impersonate": impersonate}
+                if proxy:
+                    kwargs["proxy"] = proxy
+                sess = cffi_requests.Session(**kwargs)
             except Exception:
                 # Some impersonate names need a newer curl_cffi; let caller
                 # fall back to a one-shot get by returning None.
@@ -101,10 +105,11 @@ class SessionPool:
             self._entries[key] = ent
             return ent
 
-    def warmup(self, host: str, impersonate: str, root_url: str, timeout: int = 15) -> bool:
+    def warmup(self, host: str, impersonate: str, root_url: str, timeout: int = 15,
+               proxy: Optional[str] = None) -> bool:
         """Hit the site root once per (host, impersonate) so a WAF sensor can
         set a resolved session cookie before the real (deep) request. Idempotent."""
-        ent = self.get(host, impersonate)
+        ent = self.get(host, impersonate, proxy)
         if ent is None or ent.warmed:
             return False
         from . import safety
@@ -121,10 +126,11 @@ class SessionPool:
             return False
 
     def inject_cookies(self, host: str, impersonate: str,
-                       cookies: list[dict], user_agent: Optional[str] = None) -> bool:
+                       cookies: list[dict], user_agent: Optional[str] = None,
+                       proxy: Optional[str] = None) -> bool:
         """Seed a session with cookies harvested by a real browser. Subsequent
         requests on this (host, impersonate) reuse the browser-cleared state."""
-        ent = self.get(host, impersonate)
+        ent = self.get(host, impersonate, proxy)
         if ent is None:
             return False
         ok = False
@@ -150,7 +156,8 @@ class SessionPool:
                 timeout: int = 25, extra_headers: Optional[dict] = None,
                 allow_private: Optional[bool] = None,
                 max_redirects: Optional[int] = None,
-                max_retries: int = 0) -> tuple[Any, Optional[str]]:
+                max_retries: int = 0,
+                proxy: Optional[str] = None) -> tuple[Any, Optional[str]]:
         """GET via the pooled session (cookie + connection reuse), with an SSRF
         guard: the initial URL and EVERY redirect hop are validated against the
         private/loopback/link-local/metadata block-list before being fetched.
@@ -181,15 +188,20 @@ class SessionPool:
         if extra_headers:
             headers.update(extra_headers)
 
-        ent = self.get(host, impersonate)
+        ent = self.get(host, impersonate, proxy)
         if ent is None:
             try:
                 from curl_cffi import requests as cffi_requests
             except ImportError:
                 return None, "curl_cffi not installed"
             def _do_get(u):
-                return cffi_requests.get(u, impersonate=impersonate, headers=headers,
-                                         timeout=timeout, allow_redirects=False)
+                kwargs = {
+                    "impersonate": impersonate, "headers": headers,
+                    "timeout": timeout, "allow_redirects": False,
+                }
+                if proxy:
+                    kwargs["proxy"] = proxy
+                return cffi_requests.get(u, **kwargs)
             return self._fetch_following(_do_get, url, allow_private, max_redirects, None,
                                          max_retries=max_retries)
 

@@ -21,7 +21,13 @@ async def main() -> int:
     # signal alone, so a headless CDP lane loses challenges a headful one clears
     # (matching the headless:false default of the Playwright templates).
     headless = bool(args.get("headless", False))
-    browser = await uc.start(headless=headless)
+    browser_args = []
+    proxy = args.get("proxy") or {}
+    if proxy:
+        if proxy.get("username") or proxy.get("password"):
+            raise ValueError("nodriver does not support authenticated proxy URLs")
+        browser_args.append(f"--proxy-server={proxy['server']}")
+    browser = await uc.start(headless=headless, browser_args=browser_args)
     try:
         tab = await browser.get(args["url"])
         await tab.sleep(6)  # JS challenge solve window

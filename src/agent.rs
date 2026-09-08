@@ -7,7 +7,7 @@
 //!
 //! Every role, `Standard` included, carries its own block on every turn. Each
 //! block declares that it supersedes the earlier ones, so switching roles needs
-//! no separate reset. Roles beyond the built-in four come from the app's own
+//! no separate reset. Roles beyond the built-in five come from the app's own
 //! agents folder — see [`CustomRole`].
 
 use std::{
@@ -28,23 +28,34 @@ pub enum AgentMode {
     Planner,
     GoalRunner,
     Reviewer,
+    Researcher,
     /// A role defined by a file in the app's own agents folder. The payload is
     /// the role's index in [`custom_roles`].
     Custom(u8),
 }
 
 /// The roles compiled into the app, in the order Tab cycles through them.
-pub const BUILTIN: [AgentMode; 4] = [
+pub const BUILTIN: [AgentMode; 5] = [
     AgentMode::Standard,
     AgentMode::Planner,
     AgentMode::Reviewer,
     AgentMode::GoalRunner,
+    AgentMode::Researcher,
 ];
 
-/// Every role Tab cycles through: the built-in four first, then whatever the
+/// Built-in roles shown in the picker, slash completion, and Tab cycle.
+/// Reviewer remains implemented but is temporarily hidden from these surfaces.
+pub const VISIBLE: [AgentMode; 4] = [
+    AgentMode::Standard,
+    AgentMode::Planner,
+    AgentMode::Researcher,
+    AgentMode::GoalRunner,
+];
+
+/// Every role Tab cycles through: visible built-ins first, then whatever the
 /// agents folder defines, so adding a role never renumbers the built-ins.
 pub fn choices() -> Vec<AgentMode> {
-    let mut all = BUILTIN.to_vec();
+    let mut all = VISIBLE.to_vec();
     all.extend((0..custom_roles().len()).map(|index| AgentMode::Custom(index as u8)));
     all
 }
@@ -53,6 +64,7 @@ const BUILDER_PROMPT: &str = include_str!("../prompts/agents/builder.md");
 const PLANNER_PROMPT: &str = include_str!("../prompts/agents/planner.md");
 const GOAL_RUNNER_PROMPT: &str = include_str!("../prompts/agents/goal-runner.md");
 const REVIEWER_PROMPT: &str = include_str!("../prompts/agents/reviewer.md");
+const RESEARCHER_PROMPT: &str = include_str!("../prompts/agents/researcher.md");
 
 impl AgentMode {
     /// The wire and command spelling, e.g. `/agent planner`.
@@ -62,6 +74,7 @@ impl AgentMode {
             Self::Planner => "planner",
             Self::GoalRunner => "goal-runner",
             Self::Reviewer => "reviewer",
+            Self::Researcher => "researcher",
             Self::Custom(index) => custom_role(index).map_or("custom", |role| role.id.as_str()),
         }
     }
@@ -73,6 +86,7 @@ impl AgentMode {
             Self::Planner => "Planner",
             Self::GoalRunner => "Goal Runner",
             Self::Reviewer => "Reviewer",
+            Self::Researcher => "Researcher",
             Self::Custom(index) => custom_role(index).map_or("Custom", |role| role.label.as_str()),
         }
     }
@@ -84,6 +98,7 @@ impl AgentMode {
             Self::Planner => "꼼꼼한 요구사항 인터뷰와 확인을 거쳐 구현 계획을 수립합니다.",
             Self::GoalRunner => "목표를 정하고 끝까지 완수합니다.",
             Self::Reviewer => "변경 내용과 계획을 근거 기반으로 검토해 심각도와 판정을 냅니다.",
+            Self::Researcher => "여러 출처를 깊이 조사해 근거와 한계를 함께 보고합니다.",
             Self::Custom(index) => custom_role(index)
                 .map_or("사용자가 정의한 역할입니다.", |role| role.detail.as_str()),
         }
@@ -103,15 +118,17 @@ impl AgentMode {
     }
 
     /// What a turn under this role may change on disk; `None` leaves the
-    /// provider's own permissions alone. Planner writes only its plan document,
-    /// Reviewer writes nothing. The prompt states the same boundary; this makes
+    /// provider's own permissions alone. Planner writes only its plan document;
+    /// Reviewer and Researcher write nothing. The prompt states the same boundary; this makes
     /// it hold where the provider offers a hook — Claude refuses the tool call
     /// before it runs, Codex runs a fully read-only turn in its read-only
     /// sandbox — instead of resting on the model's word.
     pub fn tool_policy(self) -> Option<Value> {
         match self {
             Self::Planner => Some(json!({ "readOnly": true, "writableRoots": ["docs/plans"] })),
-            Self::Reviewer => Some(json!({ "readOnly": true, "writableRoots": [] })),
+            Self::Reviewer | Self::Researcher => {
+                Some(json!({ "readOnly": true, "writableRoots": [] }))
+            }
             Self::Standard | Self::GoalRunner | Self::Custom(_) => None,
         }
     }
@@ -123,6 +140,7 @@ impl AgentMode {
             Self::Planner => PLANNER_PROMPT,
             Self::GoalRunner => GOAL_RUNNER_PROMPT,
             Self::Reviewer => REVIEWER_PROMPT,
+            Self::Researcher => RESEARCHER_PROMPT,
             // A `Custom` index only ever comes from `choices()`, so the folder
             // role exists; the fallback keeps the type total without a panic.
             Self::Custom(index) => {
@@ -144,7 +162,11 @@ impl AgentMode {
                 "The standing DevezVibe language and formatting rules apply unchanged. \
                  Response-length limits are defined by the Builder role below."
             }
-            Self::Planner | Self::GoalRunner | Self::Reviewer | Self::Custom(_) => {
+            Self::Planner
+            | Self::GoalRunner
+            | Self::Reviewer
+            | Self::Researcher
+            | Self::Custom(_) => {
                 "The standing DevezVibe language and formatting rules apply to this role \
                  unchanged — answer in Korean, structured and readable. Every response-length \
                  cap is lifted for this role's output: no bullet count, no character count, and \
@@ -280,13 +302,13 @@ mod tests {
             mode = mode.next();
             seen.push(mode);
         }
-        // The built-in four keep their order and open the cycle, whatever the
+        // The visible built-ins keep their order and open the cycle, whatever the
         // agents folder adds after them.
         assert_eq!(
             seen[..3],
             [
                 AgentMode::Planner,
-                AgentMode::Reviewer,
+                AgentMode::Researcher,
                 AgentMode::GoalRunner,
             ]
         );
@@ -299,8 +321,9 @@ mod tests {
     #[test]
     fn choices_open_with_the_built_in_roles() {
         let all = choices();
-        assert_eq!(all[..BUILTIN.len()], BUILTIN);
-        assert!(all[BUILTIN.len()..]
+        assert_eq!(all[..VISIBLE.len()], VISIBLE);
+        assert!(!all.contains(&AgentMode::Reviewer));
+        assert!(all[VISIBLE.len()..]
             .iter()
             .all(|mode| matches!(mode, AgentMode::Custom(_))));
     }
@@ -331,7 +354,8 @@ mod tests {
     fn parse_ignores_case_and_rejects_unknown_names() {
         assert_eq!(AgentMode::parse("Planner"), Some(AgentMode::Planner));
         assert_eq!(AgentMode::parse(" GOAL-RUNNER "), Some(AgentMode::GoalRunner));
-        assert_eq!(AgentMode::parse("Reviewer"), Some(AgentMode::Reviewer));
+        assert_eq!(AgentMode::parse("Reviewer"), None);
+        assert_eq!(AgentMode::parse("Researcher"), Some(AgentMode::Researcher));
         assert_eq!(AgentMode::parse("plan"), None);
         assert_eq!(AgentMode::parse(""), None);
     }
@@ -342,6 +366,9 @@ mod tests {
             assert!(!mode.instruction().trim().is_empty(), "{} prompt is empty", mode.id());
         }
         assert!(AgentMode::Standard.instruction().contains("Builder role"));
+        assert!(AgentMode::Researcher
+            .instruction()
+            .contains("Researcher role"));
     }
 
     #[test]
@@ -366,7 +393,7 @@ mod tests {
         }
     }
 
-    /// The two roles whose prompts forbid edits carry a policy the providers
+    /// The three roles whose prompts forbid edits carry a policy the providers
     /// can enforce; the roles that implement carry none.
     #[test]
     fn only_the_read_only_roles_carry_a_tool_policy() {
@@ -376,9 +403,17 @@ mod tests {
         let reviewer = AgentMode::Reviewer.tool_policy().unwrap();
         assert_eq!(reviewer["readOnly"], true);
         assert_eq!(reviewer["writableRoots"], json!([]));
+        let researcher = AgentMode::Researcher.tool_policy().unwrap();
+        assert_eq!(researcher["readOnly"], true);
+        assert_eq!(researcher["writableRoots"], json!([]));
         for mode in choices()
             .into_iter()
-            .filter(|mode| !matches!(mode, AgentMode::Planner | AgentMode::Reviewer))
+            .filter(|mode| {
+                !matches!(
+                    mode,
+                    AgentMode::Planner | AgentMode::Reviewer | AgentMode::Researcher
+                )
+            })
         {
             assert!(mode.tool_policy().is_none(), "{} must keep full tools", mode.id());
         }
@@ -388,7 +423,12 @@ mod tests {
     /// they were modelled on, and they must not name those runtimes.
     #[test]
     fn role_prompts_avoid_external_runtime_vocabulary() {
-        for mode in [AgentMode::Planner, AgentMode::GoalRunner, AgentMode::Reviewer] {
+        for mode in [
+            AgentMode::Planner,
+            AgentMode::GoalRunner,
+            AgentMode::Reviewer,
+            AgentMode::Researcher,
+        ] {
             let prompt = mode.instruction().to_ascii_lowercase();
             for forbidden in ["hoje", "ultragoal", "ralplan", ".hoje", "superpowers", "gajae"] {
                 assert!(

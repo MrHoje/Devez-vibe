@@ -35,10 +35,10 @@ from urllib.parse import urlsplit
 
 
 # --- low-level helpers -------------------------------------------------------
-def _cffi_get(url: str, *, impersonate: str = "safari", timeout: int = 15):
+def _cffi_get(url: str, *, impersonate: str = "safari", timeout: int = 15,
+              proxy: Optional[str] = None):
     from curl_cffi import requests as r  # lazy: engine works even if missing
-    return r.get(
-        url,
+    kwargs = dict(
         impersonate=impersonate,  # type: ignore[arg-type]
         timeout=timeout,
         headers={
@@ -47,6 +47,9 @@ def _cffi_get(url: str, *, impersonate: str = "safari", timeout: int = 15):
         },
         allow_redirects=True,
     )
+    if proxy:
+        kwargs["proxy"] = proxy
+    return r.get(url, **kwargs)
 
 
 def _host(url: str) -> str:
@@ -76,7 +79,7 @@ def _detect(url: str) -> Optional[str]:
 
 
 # --- reddit ------------------------------------------------------------------
-def _reddit(url: str, timeout: int) -> dict:
+def _reddit(url: str, timeout: int, proxy: Optional[str] = None) -> dict:
     attempts: list[dict] = []
     base = url.split("?", 1)[0].rstrip("/")
     # Build an .rss / .json target from the path (works for /r/<sub> and post URLs).
@@ -85,7 +88,7 @@ def _reddit(url: str, timeout: int) -> dict:
 
     # Route 1: RSS (the route that actually survives — Reddit gates the JSON API).
     try:
-        x = _cffi_get(rss_url, timeout=timeout)
+        x = _cffi_get(rss_url, timeout=timeout, proxy=proxy)
         ok = x.status_code == 200 and ("<rss" in x.text or "<feed" in x.text)
         attempts.append(_attempt("reddit", "rss", ok, x.status_code, x.text,
                                  "feed" if ok else "no-feed-markers"))
@@ -97,7 +100,7 @@ def _reddit(url: str, timeout: int) -> dict:
 
     # Route 2: JSON via curl_cffi (often 403 now, but try — cheap).
     try:
-        x = _cffi_get(json_url, timeout=timeout)
+        x = _cffi_get(json_url, timeout=timeout, proxy=proxy)
         ok = x.status_code == 200 and x.text.lstrip().startswith(("{", "["))
         attempts.append(_attempt("reddit", "json", ok, x.status_code, x.text,
                                  "json" if ok else f"status={x.status_code}"))
@@ -115,14 +118,15 @@ def _reddit(url: str, timeout: int) -> dict:
 _TWEET_ID_RE = re.compile(r"/status(?:es)?/(\d+)")
 
 
-def _x(url: str, timeout: int) -> dict:
+def _x(url: str, timeout: int, proxy: Optional[str] = None) -> dict:
     attempts: list[dict] = []
     m = _TWEET_ID_RE.search(url)
 
     if m:  # single tweet → tweet-result + oembed (both no-auth, reliable)
         tid = m.group(1)
         try:
-            x = _cffi_get(f"https://cdn.syndication.twimg.com/tweet-result?id={tid}&token=a", timeout=timeout)
+            x = _cffi_get(f"https://cdn.syndication.twimg.com/tweet-result?id={tid}&token=a",
+                          timeout=timeout, proxy=proxy)
             d = x.json() if x.status_code == 200 else {}
             ok = bool(d.get("text"))
             attempts.append(_attempt("x", "tweet-result", ok, x.status_code, x.text,
@@ -134,7 +138,7 @@ def _x(url: str, timeout: int) -> dict:
             attempts.append(_attempt("x", "tweet-result", False, 0, "", f"{type(e).__name__}"))
         try:
             ourl = f"https://publish.twitter.com/oembed?url=https://twitter.com/i/status/{tid}&omit_script=1"
-            x = _cffi_get(ourl, timeout=timeout)
+            x = _cffi_get(ourl, timeout=timeout, proxy=proxy)
             d = x.json() if x.status_code == 200 else {}
             ok = bool(d.get("html"))
             attempts.append(_attempt("x", "oembed", ok, x.status_code, x.text,
@@ -151,7 +155,7 @@ def _x(url: str, timeout: int) -> dict:
             surl = f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{handle}"
             for attempt_no in range(2):
                 try:
-                    x = _cffi_get(surl, timeout=timeout)
+                    x = _cffi_get(surl, timeout=timeout, proxy=proxy)
                     ok = x.status_code == 200 and "__NEXT_DATA__" in x.text
                     attempts.append(_attempt("x", f"syndication-timeline#{attempt_no+1}", ok,
                                              x.status_code, x.text,
@@ -184,7 +188,7 @@ def _ytdlp_argv() -> Optional[list[str]]:
     return None
 
 
-def _youtube(url: str, timeout: int) -> dict:
+def _youtube(url: str, timeout: int, proxy: Optional[str] = None) -> dict:
     attempts: list[dict] = []
     argv = _ytdlp_argv()
     if argv is None:
@@ -192,8 +196,11 @@ def _youtube(url: str, timeout: int) -> dict:
         return {"platform": "youtube", "ok": False, "route": None, "content": "",
                 "final_url": url, "attempts": attempts}
     try:
+        command = argv + ["--dump-json", "--skip-download"]
+        if proxy:
+            command += ["--proxy", proxy]
         p = subprocess.run(
-            argv + ["--dump-json", "--skip-download", url],
+            command + [url],
             capture_output=True, text=True, timeout=max(timeout, 60),
         )
         ok = p.returncode == 0 and p.stdout.strip().startswith("{")
@@ -214,7 +221,7 @@ def _youtube(url: str, timeout: int) -> dict:
 _THREADS_POST_RE = re.compile(r"/post/([A-Za-z0-9_-]+)")
 
 
-def _threads(url: str, timeout: int) -> dict:
+def _threads(url: str, timeout: int, proxy: Optional[str] = None) -> dict:
     """Threads video post → signed CDN URLs from the page's inline JSON.
 
     yt-dlp has no Threads extractor, but an anonymous GET with a curl_cffi
@@ -231,7 +238,7 @@ def _threads(url: str, timeout: int) -> dict:
                 "final_url": url, "attempts": attempts}
     code = m.group(1)
     try:
-        x = _cffi_get(url, timeout=timeout)
+        x = _cffi_get(url, timeout=timeout, proxy=proxy)
         raw = x.text if x.status_code == 200 else ""
         code_pos = [c.start() for c in re.finditer(r'"code"\s*:\s*"%s"' % re.escape(code), raw)]
         blocks = list(re.finditer(r'"video_versions"\s*:\s*\[(.*?)\]', raw))
@@ -266,8 +273,8 @@ _ROUTERS = {"reddit": _reddit, "x": _x, "youtube": _youtube, "threads": _threads
 
 
 # --- public entrypoint -------------------------------------------------------
-def route(url: str, *, timeout: int = 15) -> Optional[dict]:
+def route(url: str, *, timeout: int = 15, proxy: Optional[str] = None) -> Optional[dict]:
     platform = _detect(url)
     if platform is None:
         return None
-    return _ROUTERS[platform](url, timeout)
+    return _ROUTERS[platform](url, timeout, proxy)

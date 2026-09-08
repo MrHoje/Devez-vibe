@@ -101,6 +101,7 @@ async function main() {
     } else {
       ctxOpts.viewport = viewport;
     }
+    if (args.proxy) ctxOpts.proxy = args.proxy;
     ctx = await chromium.launchPersistentContext(profileDir, ctxOpts);
     const page = await ctx.newPage();
     // Single shared deadline across warmup + main + reload navigations so the
