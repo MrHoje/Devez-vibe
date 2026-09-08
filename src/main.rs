@@ -1926,6 +1926,9 @@ async fn event_loop(
                     }
                     Some(ServerEvent::ProviderUnavailable { provider, message }) => {
                         if provider == "Codex" {
+                            if let Some(btw) = btw_state.as_mut() {
+                                btw.fallback_from_codex(message.clone());
+                            }
                             state.fallback_from_codex(message);
                         } else {
                             state.push_notice(
@@ -4509,8 +4512,8 @@ fn config_value_write_params(key_path: &str, value: &str) -> Value {
     })
 }
 
-// The app owns the active agent role; Codex's Plan transport is used only for
-// blocking questions. Supplying this replaces its built-in planning-only prompt.
+// The app owns the active role and waits for explicit question answers.
+// Keep Codex in Default mode so its normal development tools remain available.
 const CODEX_QUESTION_INSTRUCTIONS: &str = concat!(
     "작업 범위와 계획·구현·검토 여부는 현재 DevezVibe 에이전트 역할과 사용자 지시를 따른다. ",
     "현재 역할이 허용하는 파일 수정과 명령 실행을 실제로 수행한다.\n",

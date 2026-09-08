@@ -4534,6 +4534,33 @@ impl AppState {
         if self.selected_provider() != ModelProvider::Codex {
             return false;
         }
+        let message = message.into();
+        let unanswered = matches!(self.pending, Some(PendingInteraction::UserInput { .. }));
+        if self.busy || unanswered {
+            self.set_request_failed(message.clone());
+        }
+        if unanswered {
+            // A dead transport cannot accept this answer, including after a
+            // provider fallback. Keep queued work paused until fresh input.
+            if let Some(PendingInteraction::UserInput {
+                editor, answers, ..
+            }) = self.pending.take()
+            {
+                let mut drafts = answers.into_values().flatten().collect::<Vec<_>>();
+                if !editor.is_empty() {
+                    drafts.push(editor.text());
+                }
+                if !drafts.is_empty() {
+                    self.editor.move_to_display_index(self.editor.chars().len());
+                    if !self.editor.is_empty() {
+                        self.editor.insert('\n');
+                    }
+                    self.editor.insert_str(&drafts.join("\n"));
+                    self.set_composer_notice("미전송 답변을 입력창에 보관했습니다.".to_owned());
+                }
+            }
+            self.turn_interrupted = true;
+        }
         if self
             .provider_model_indices(ModelProvider::Claude)
             .is_empty()
@@ -4541,15 +4568,11 @@ impl AppState {
             self.push_notice(
                 BlockKind::Error,
                 "Codex 사용 불가",
-                format!("{}\nClaude 모델도 찾을 수 없습니다.", message.into()),
+                format!("{message}\nClaude 모델도 찾을 수 없습니다."),
             );
             return false;
         }
 
-        let message = message.into();
-        if self.busy {
-            self.set_request_failed(message.clone());
-        }
         self.push_notice(
             BlockKind::Warning,
             "Codex 사용 불가",
@@ -7832,8 +7855,7 @@ impl AppState {
             }
             "item/tool/requestUserInput" => {
                 let questions = parse_questions(params);
-                if params.get("isBlocking").and_then(Value::as_bool) == Some(false)
-                    || questions.is_empty()
+                if questions.is_empty()
                     || questions.iter().any(|question| {
                         question.id.trim().is_empty()
                             || question.question.trim().is_empty()
@@ -8018,7 +8040,14 @@ impl AppState {
                 "질문 대기 중단",
                 "답변 전에 질문이 종료되어 작업을 중단합니다. 사용자의 새 지시를 기다립니다.",
             );
-            return Some(self.request_interrupt());
+            let action = self.request_interrupt();
+            if method == "turn/completed" {
+                // The runtime is already idle. Apply its completion without
+                // sending a stale interrupt or leaving the spinner running.
+                self.dispatch_notification(method, params);
+                return Some(Action::None);
+            }
+            return Some(action);
         }
         if method != "item/completed"
             || params.pointer("/item/type").and_then(Value::as_str) != Some("agentMessage")
@@ -9856,6 +9885,20 @@ impl AppState {
     fn handle_pending_key(&mut self, key: KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if let Some(PendingInteraction::UserInput {
+            questions,
+            current,
+            selected,
+            ..
+        }) = &self.pending
+            && key.kind == KeyEventKind::Repeat
+            && (key.code == KeyCode::Enter
+                || (!user_input_text_focused(&questions[*current], *selected)
+                    && matches!(key.code, KeyCode::Char('0'..='9'))))
+        {
+            // Holding a confirmation key must not answer the next question too.
+            return Action::None;
+        }
         let pending = self.pending.take().expect("pending checked");
         // 한글 IME가 켜진 채 승인 프롬프트에 답하면 y/a/n이 두벌식 자모로
         // 도착한다. 자유 입력이 없는 프롬프트에서만 같은 키로 취급한다.
@@ -10857,8 +10900,8 @@ impl AppState {
                 mut editor,
                 mut answers,
             } => {
-                if key.code == KeyCode::Esc {
-                    // 순정과 같게: Esc는 답을 보내지 않고 턴을 멈춘다. 빈 답을
+                if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c')) {
+                    // Esc와 Ctrl+C는 답을 보내지 않고 턴을 멈춘다. 빈 답을
                     // 돌려주면 도구가 성공한 셈이 되어 턴이 그대로 이어진다.
                     return self.cancel_user_question(id);
                 }
@@ -10866,6 +10909,7 @@ impl AppState {
                 let question = &questions[current];
                 if user_input_text_focused(question, selected) {
                     match key.code {
+                        KeyCode::Enter if !key.modifiers.is_empty() => {}
                         KeyCode::Enter => {
                             let Some(answer) = editor.take_for_submit() else {
                                 // Enter can reach the app while Windows Terminal
@@ -10966,7 +11010,7 @@ impl AppState {
                                 &question.options[selected].label,
                             );
                         }
-                        KeyCode::Enter => {
+                        KeyCode::Enter if key.modifiers.is_empty() => {
                             if selected < question.options.len() {
                                 if question.multi_select {
                                     // 아직 아무 줄도 켜지 않았으면 커서가 놓인 줄이 답이다.
@@ -24935,6 +24979,177 @@ mod tests {
     }
 
     #[test]
+    fn native_default_question_waits_even_when_its_ui_hint_is_nonmodal() {
+        let mut state = busy_state_with_live_turn();
+        let mut question = blocking_test_question();
+        question["isBlocking"] = json!(false);
+        question["autoResolutionMs"] = json!(0);
+        assert!(matches!(
+            state.begin_server_request(json!(9), "item/tool/requestUserInput", &question),
+            Action::None
+        ));
+        for _ in 0..100 {
+            state.render_tick();
+            assert!(state.awaiting_input());
+        }
+        assert!(
+            matches!(state.handle_key(KeyEvent::from(KeyCode::Char('2'))), Action::RpcResponse { result, .. }
+            if result["answers"]["q1"]["answers"] == json!(["둘째"]))
+        );
+    }
+
+    #[test]
+    fn control_c_cancels_both_choice_and_direct_answer_without_submitting() {
+        for direct in [false, true] {
+            let mut state = busy_state_with_live_turn();
+            state.begin_server_request(
+                json!(9),
+                "item/tool/requestUserInput",
+                &blocking_test_question(),
+            );
+            if direct {
+                state.handle_key(KeyEvent::from(KeyCode::Char('3')));
+                state.handle_key(KeyEvent::from(KeyCode::Char('답')));
+            }
+            assert!(matches!(
+                state.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+                Action::CancelUserInput {
+                    interrupt: true,
+                    ..
+                }
+            ));
+            assert!(!state.awaiting_input());
+            assert!(state.turn_interrupted);
+        }
+    }
+
+    #[test]
+    fn disconnect_drops_the_unanswerable_question_and_does_not_run_queued_work() {
+        for fallback_available in [false, true] {
+            let mut state = busy_state_with_live_turn();
+            if fallback_available {
+                state
+                    .models
+                    .push(test_model("claude:sonnet", "Claude Sonnet", false));
+            }
+            state.begin_server_request(
+                json!(9),
+                "item/tool/requestUserInput",
+                &blocking_test_question(),
+            );
+            state.queued_prompts.push_back("다음 작업".into());
+            assert_eq!(
+                state.fallback_from_codex("시험용 연결 종료"),
+                fallback_available
+            );
+            assert!(!state.awaiting_input());
+            assert!(!state.busy);
+            assert!(state.turn_id.is_none());
+            assert!(state.turn_interrupted);
+            assert!(state.take_queued_prompt().is_none());
+            assert!(!matches!(
+                state.handle_key(KeyEvent::from(KeyCode::Enter)),
+                Action::RpcResponse { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn disconnect_preserves_unsubmitted_question_text_and_the_composer_draft() {
+        for fallback_available in [false, true] {
+            let mut state = busy_state_with_live_turn();
+            if fallback_available {
+                state
+                    .models
+                    .push(test_model("claude:sonnet", "Claude Sonnet", false));
+            }
+            state.editor.set_text("원래 초안");
+            let mut question = blocking_test_question();
+            let mut second = question["questions"][0].clone();
+            second["id"] = json!("q2");
+            question["questions"].as_array_mut().unwrap().push(second);
+            state.begin_server_request(json!(9), "item/tool/requestUserInput", &question);
+            state.handle_key(KeyEvent::from(KeyCode::Char('3')));
+            for ch in "첫 답변".chars() {
+                state.handle_key(KeyEvent::from(KeyCode::Char(ch)));
+            }
+            assert!(matches!(
+                state.handle_key(KeyEvent::from(KeyCode::Enter)),
+                Action::None
+            ));
+            state.handle_key(KeyEvent::from(KeyCode::Char('3')));
+            for ch in "둘째 초안".chars() {
+                state.handle_key(KeyEvent::from(KeyCode::Char(ch)));
+            }
+            state.fallback_from_codex("연결 종료");
+            assert_eq!(state.editor.text(), "원래 초안\n첫 답변\n둘째 초안");
+            assert!(!state.awaiting_input());
+            assert!(state.turn_interrupted);
+        }
+    }
+
+    #[test]
+    fn held_confirmation_keys_cannot_answer_subsequent_questions() {
+        for code in [KeyCode::Enter, KeyCode::Char('1')] {
+            let mut state = busy_state_with_live_turn();
+            let mut question = blocking_test_question();
+            question["questions"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"id": "q2", "question": "둘째 질문", "options": [{"label": "답"}]}));
+            state.begin_server_request(json!(9), "item/tool/requestUserInput", &question);
+            assert!(matches!(
+                state.handle_key(KeyEvent::from(code)),
+                Action::None
+            ));
+            let mut repeated = KeyEvent::from(code);
+            repeated.kind = KeyEventKind::Repeat;
+            for _ in 0..5 {
+                assert!(matches!(state.handle_key(repeated), Action::None));
+                assert!(state.awaiting_input());
+            }
+            assert!(matches!(
+                state.handle_key(KeyEvent::from(code)),
+                Action::RpcResponse { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn modified_enter_waits_instead_of_confirming_a_question() {
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::SHIFT,
+            KeyModifiers::ALT,
+        ] {
+            let mut state = busy_state_with_live_turn();
+            state.begin_server_request(
+                json!(9),
+                "item/tool/requestUserInput",
+                &blocking_test_question(),
+            );
+            assert!(matches!(
+                state.handle_key(KeyEvent::new(KeyCode::Enter, modifiers)),
+                Action::None
+            ));
+            assert!(state.awaiting_input());
+            state.handle_key(KeyEvent::from(KeyCode::Char('3')));
+            state.handle_key(KeyEvent::from(KeyCode::Char('앞')));
+            assert!(matches!(
+                state.handle_key(KeyEvent::new(KeyCode::Enter, modifiers)),
+                Action::None
+            ));
+            assert!(state.awaiting_input());
+            state.handle_key(KeyEvent::from(KeyCode::Char('뒤')));
+            let Action::RpcResponse { result, .. } = state.handle_key(KeyEvent::from(KeyCode::Enter))
+            else {
+                panic!("직접 입력 제출 실패")
+            };
+            assert_eq!(result["answers"]["q1"]["answers"], json!(["앞뒤"]));
+        }
+    }
+
+    #[test]
     fn unanswered_question_cannot_be_released_by_stall_checks_or_remote_resolution() {
         for notification in ["serverRequest/resolved", "turn/completed"] {
             let mut state = busy_state_with_live_turn();
@@ -24950,10 +25165,15 @@ mod tests {
             state.queued_prompts.push_back("다음 작업".into());
             let params = json!({"threadId": "main-thread", "requestId": 9,
                 "turn": {"id": "live-turn", "status": "completed"}});
-            assert!(matches!(
-                state.reject_unanswered_question(notification, &params),
-                Some(Action::Interrupt)
-            ));
+            let action = state.reject_unanswered_question(notification, &params);
+            if notification == "turn/completed" {
+                assert!(matches!(action, Some(Action::None)));
+                assert!(!state.busy);
+                assert!(state.turn_id.is_none());
+                assert!(!state.pending_interrupt);
+            } else {
+                assert!(matches!(action, Some(Action::Interrupt)));
+            }
             assert!(state.turn_interrupted);
             assert!(state.take_queued_prompt().is_none());
         }
@@ -25047,11 +25267,8 @@ mod tests {
     }
 
     #[test]
-    fn malformed_and_nonblocking_questions_stop_instead_of_answering_empty() {
-        let mut nonblocking = blocking_test_question();
-        nonblocking["isBlocking"] = json!(false);
+    fn malformed_questions_stop_instead_of_answering_empty() {
         for question in [
-            nonblocking,
             json!({"questions": []}),
             json!({"questions": [{"id": "q1", "question": ""}]}),
             json!({"questions": [{"id": "q1", "question": "정상"}, {"id": "q2"}]}),

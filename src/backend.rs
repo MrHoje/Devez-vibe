@@ -2430,9 +2430,9 @@ fn prepare_codex_turn_context(params: &mut Value) {
 /// Codex built-in permission profile that lets a turn read but not write.
 const CODEX_READ_ONLY_PROFILE: &str = ":read-only";
 
-/// Default-mode questions do not suspend model execution, even with the
-/// request-user-input feature enabled. Plan mode supplies the blocking runtime
-/// contract; our prompt leaves editing/review policy with the app's agent role.
+/// Native question RPCs await the host reply in Default mode too. The
+/// `isBlocking` flag describes presentation, not completion of the tool call.
+/// Explicitly reset Plan mode persisted by 1.8.4: it disables update_plan.
 fn apply_codex_question_mode(params: &mut Value) -> Result<()> {
     let model = params
         .get("model")
@@ -2440,7 +2440,7 @@ fn apply_codex_question_mode(params: &mut Value) -> Result<()> {
         .filter(|model| !model.is_empty())
         .context("질문 대기를 설정할 모델이 없습니다.")?;
     params["collaborationMode"] = json!({
-        "mode": "plan",
+        "mode": "default",
         "settings": {
             "model": model,
             "reasoning_effort": params.get("effort"),
@@ -3192,7 +3192,7 @@ mod tests {
             for permissions in [":read-only", ":danger-full-access"] {
                 let mut params = json!({"model": model, "effort": "high", "permissions": permissions});
                 apply_codex_question_mode(&mut params).unwrap();
-                assert_eq!(params["collaborationMode"]["mode"], "plan");
+                assert_eq!(params["collaborationMode"]["mode"], "default");
                 assert_eq!(params["collaborationMode"]["settings"]["model"], model);
                 assert_eq!(
                     params["collaborationMode"]["settings"]["reasoning_effort"],

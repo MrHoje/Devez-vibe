@@ -23384,7 +23384,7 @@ mod tests {
                         {"label": "둘째", "description": "둘째 방법"}]
         }]});
         let mut codex = questions.clone();
-        codex["isBlocking"] = serde_json::json!(true);
+        codex["isBlocking"] = serde_json::json!(false);
         let claude = serde_json::json!({"encoding": "base64-json",
             "payload": STANDARD.encode(serde_json::to_vec(&questions).unwrap())});
         let mut panels = Vec::new();
@@ -23416,6 +23416,46 @@ mod tests {
         assert_eq!(panels[0], panels[1]);
         assert!(panels[0].iter().any(|line| line.contains("첫째")));
         assert!(panels[0].iter().any(|line| line.contains("둘째")));
+    }
+
+    #[test]
+    fn question_modified_enter_keeps_the_visible_draft_without_submitting() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut state = crate::state::AppState::new(
+            "thread".into(),
+            "cwd".into(),
+            "account".into(),
+            Vec::new(),
+            "gpt-6-astra",
+            None,
+        );
+        state.begin_server_request(serde_json::json!(1), "item/tool/requestUserInput", &serde_json::json!({
+            "isBlocking": false, "questions": [{"id": "q1", "question": "선택하세요", "options": [{"label": "첫째"}, {"label": "둘째"}]}]
+        }));
+        state.handle_key(KeyEvent::from(KeyCode::Char('3')));
+        state.handle_key(KeyEvent::from(KeyCode::Char('앞')));
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        state.handle_key(KeyEvent::from(KeyCode::Char('뒤')));
+        assert!(state.awaiting_input());
+        let view = state.view();
+        let frame = overlay_frame(
+            &[],
+            view.overlay.unwrap(),
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            40,
+        );
+        let rows = frame.lines.iter().map(painted).collect::<Vec<_>>();
+        assert!(
+            rows.iter().any(|row| row.contains("앞뒤")),
+            "입력한 초안이 보이지 않음: {rows:?}"
+        );
+        assert!(rows.iter().all(|row| !row.contains('\n')));
     }
 
     /// The answer is written on the row it was picked on, with the options still

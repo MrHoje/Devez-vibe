@@ -129,6 +129,12 @@ impl AppServer {
         apply_originator_override(&mut command);
         apply_mcp_2026_protocol_override(&mut command);
         apply_update_plan_tool_override(&mut command);
+        // Keep normal development tools available while exposing the native
+        // question RPC. The host holds its response until the user answers.
+        command
+            .arg("-c")
+            .arg("features.default_mode_request_user_input=true");
+        apply_unstable_features_warning_override(&mut command);
         apply_devezcode_room_override(&mut command, devezcode_room);
         provision_devez_subagents();
         crate::child_process::isolate_backend(&mut command);
