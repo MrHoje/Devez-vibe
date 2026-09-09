@@ -5802,14 +5802,33 @@ impl AppState {
         // one model, so use it rather than dropping the prompt's marker back to
         // the plain accent.
         let resumed_model = self.selected_model_name().to_owned();
+        let mut async_questions = Vec::new();
         for turn in turns {
-            if unanswered_cancelled_turn(turn) {
-                continue;
-            }
             let Some(items) = turn.get("items").and_then(Value::as_array) else {
                 continue;
             };
-            let mut blocks = merged_turn_blocks(&self.cwd, turn, items, rollout);
+            let mut blocks = if unanswered_cancelled_turn(turn) {
+                Vec::new()
+            } else {
+                merged_turn_blocks(&self.cwd, turn, items, rollout)
+            };
+            for block in &mut blocks {
+                if matches!(block.kind, BlockKind::User)
+                    && let Some(restored) = restored_async_answer(block, &async_questions)
+                {
+                    *block = restored;
+                }
+            }
+            for item in items {
+                if item.get("type").and_then(Value::as_str) == Some("agentMessage")
+                    && item.get("delivery").and_then(Value::as_str) == Some("async")
+                    && let Some(questions) = item.get("questions").and_then(Value::as_array)
+                {
+                    async_questions = questions.iter().filter_map(|question|
+                        question.get("title").and_then(Value::as_str).map(str::to_owned)
+                    ).collect();
+                }
+            }
             if let Some(duration) = completed_turn_duration(turn)
                 && let Some(prompt) = blocks
                     .iter_mut()
@@ -15280,6 +15299,32 @@ fn user_message_text(item: &Value) -> Option<String> {
         .filter(|body| !body.is_empty())
 }
 
+fn restored_async_answer(block: &Block, questions: &[String]) -> Option<Block> {
+    let mut text = block.body.strip_prefix("질문에 대한 사용자 답변:\n")?;
+    if questions.is_empty() {
+        return None;
+    }
+    let mut pairs = Vec::new();
+    for (index, question) in questions.iter().enumerate() {
+        text = text.strip_prefix(question)?.strip_prefix('\n')?;
+        let answer = if let Some(next) = questions.get(index + 1) {
+            let (answer, _) = text.split_once(&format!("\n\n{next}\n"))?;
+            text = &text[answer.len() + 2..];
+            answer
+        } else {
+            text
+        };
+        if answer.trim().is_empty() {
+            return None;
+        }
+        pairs.push((question.trim().to_owned(), strip_recommendation_mark(answer.trim()).to_owned()));
+    }
+    let mut restored = Block::question_answers(pairs);
+    restored.title = block.title.clone();
+    restored.adopt_id(block);
+    Some(restored)
+}
+
 fn completed_item_block(cwd: &str, item: &Value) -> Option<Block> {
     match item.get("type")?.as_str()? {
         "userMessage" => user_message_text(item)
@@ -18936,6 +18981,21 @@ mod tests {
             .find(|block| matches!(block.kind, BlockKind::User))
             .expect("replayed prompt");
         assert_eq!(prompt.title, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn restored_async_answer_preserves_unmatched_and_incomplete_messages() {
+        let questions = vec!["첫 질문".to_owned(), "둘째 질문".to_owned()];
+        for body in [
+            "일반 메시지\n첫 질문\n답변",
+            "질문에 대한 사용자 답변:\n다른 질문\n답변",
+            "질문에 대한 사용자 답변:\n첫 질문\n답변",
+            "질문에 대한 사용자 답변:\n첫 질문\n답변\n\n둘째 질문\n",
+        ] {
+            let block = Block::new(BlockKind::User, "gpt-5.6-sol", body);
+            assert!(restored_async_answer(&block, &questions).is_none());
+            assert_eq!(block.body, body);
+        }
     }
 
     #[test]

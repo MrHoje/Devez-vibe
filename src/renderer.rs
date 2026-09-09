@@ -24489,6 +24489,39 @@ mod tests {
     }
 
     #[test]
+    fn resumed_async_answers_restore_separate_question_and_arrow_cards() {
+        use crate::state::AppState;
+        let questions = ["업데이트 문구를 정해주세요.\n\n1. 링크 수정\n2. 지침 보강", "다음 질문"];
+        for status in ["completed", "interrupted"] {
+            for answer in ["첫째", "기존 업데이트 노트 유지하고 배포\n둘째 줄"] {
+                let mut state = AppState::new(
+                    "thread".into(), "cwd".into(), "account".into(), Vec::new(), "gpt-5.6-sol", None,
+                );
+                state.load_history(&serde_json::json!({"turns": [
+                    {"status": status, "items": [{"type": "agentMessage", "delivery": "async", "questions": [
+                        {"title": questions[0]}, {"title": questions[1]}
+                    ]}]},
+                    {"model": "gpt-5.6-sol", "items": [{"type": "userMessage", "content": [
+                        {"type": "text", "text": format!("질문에 대한 사용자 답변:\n{}\n{answer}\n\n{}\n둘째 답변", questions[0], questions[1])}
+                    ]}]}
+                ]}), None);
+                let blocks = state.drain_committed();
+                let restored = blocks.iter().find(|block| matches!(block.kind, BlockKind::User)).unwrap();
+                let mut expected = Block::question_answers(vec![
+                    (questions[0].into(), answer.into()), (questions[1].into(), "둘째 답변".into()),
+                ]);
+                expected.title = "gpt-5.6-sol".into();
+                for width in [30, 80] {
+                    let actual = user_prompt_lines_with_history(restored, width, None, false);
+                    assert_eq!(actual.iter().filter(|line| line.prefix.contains("└─▶")).count(), 2);
+                    assert_eq!(actual.iter().map(painted).collect::<Vec<_>>(),
+                        user_prompt_lines_with_history(&expected, width, None, false).iter().map(painted).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn codex_and_claude_question_answers_paint_the_same_arrow_rows() {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         use crossterm::event::{KeyCode, KeyEvent};

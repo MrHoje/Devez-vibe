@@ -99,7 +99,7 @@ async fn live_codex_async_question_recovery() {
     let result = std::panic::AssertUnwindSafe(async {
         server.initialize().await.unwrap();
         let response = server.request("thread/start", json!({
-            "model": model, "ephemeral": true, "cwd": std::env::temp_dir(),
+            "model": model, "cwd": std::env::temp_dir(),
             "approvalPolicy": "never", "permissions": ":read-only",
             "developerInstructions": "질문 연결 시험입니다. 파일·셸·검색·하위 에이전트를 사용하지 마세요."
         })).await.unwrap();
@@ -164,7 +164,10 @@ async fn live_codex_async_question_recovery() {
                 }
             }
         }
-        if free_text { state.handle_paste("첫째".into()); }
+        if !free_text {
+            state.handle_key(KeyEvent::from(KeyCode::Char('3')));
+        }
+        state.handle_paste("첫째\n직접 입력한 둘째 줄".into());
         let Action::Submit(answer) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
             panic!("비동기 질문 답변이 새 작업으로 전달되지 않음");
         };
@@ -172,6 +175,19 @@ async fn live_codex_async_question_recovery() {
         start(&server, &mut state, model, &answer).await;
         let response = finish(&mut server, &mut state, false).await;
         assert!(response.contains("첫째"), "실제 최종 응답에 사용자 답변이 없음: {response}");
+        let resumed = AppServer::spawn(Path::new("codex"), None).await.unwrap();
+        std::mem::replace(&mut server, resumed).shutdown().await;
+        server.initialize().await.unwrap();
+        let history = server.request("thread/resume", json!({
+            "threadId": state.thread_id
+        })).await.unwrap();
+        let mut restored = AppState::new(state.thread_id.clone(), state.cwd.clone(),
+            "시험".into(), Vec::new(), model, Some("low"));
+        restored.load_history(&history["thread"], None);
+        let blocks = restored.drain_committed();
+        assert!(blocks.iter().any(|block| block.body.contains("↳ 첫째\n직접 입력한 둘째 줄")),
+            "저장된 대화에서 직접 입력 답변 상자를 복원하지 못함: {}", history["thread"]);
+        server.request("thread/archive", json!({"threadId": state.thread_id})).await.unwrap();
     }).catch_unwind().await;
     server.shutdown().await;
     if let Err(panic) = result {
