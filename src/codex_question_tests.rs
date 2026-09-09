@@ -15,6 +15,89 @@ use std::{
 };
 use tokio::time::{Instant, timeout};
 
+#[tokio::test]
+#[ignore = "실제 Codex 로그인과 모델 호출 필요"]
+async fn live_codex_async_question_recovery() {
+    let model = "gpt-6-astra";
+    let mut server = AppServer::spawn(Path::new("codex"), None).await.unwrap();
+    let result = std::panic::AssertUnwindSafe(async {
+        server.initialize().await.unwrap();
+        let response = server.request("thread/start", json!({
+            "model": model, "ephemeral": true, "cwd": std::env::temp_dir(),
+            "approvalPolicy": "never", "permissions": ":read-only",
+            "developerInstructions": "질문 연결 시험입니다. 파일·셸·검색·하위 에이전트를 사용하지 마세요."
+        })).await.unwrap();
+        let mut state = AppState::new(
+            response["thread"]["id"].as_str().unwrap().into(),
+            std::env::temp_dir().to_string_lossy().into(), "시험".into(),
+            Vec::new(), model, Some("low"),
+        );
+        server.request("turn/start", json!({
+            "threadId": state.thread_id, "model": model, "effort": "low",
+            "collaborationMode": {"mode": "default", "settings": {
+                "model": model, "reasoning_effort": "low",
+                "developer_instructions": "비동기 질문 복구를 검증합니다. 반드시 request_user_input_async로 첫째와 둘째 중 고르는 질문 하나를 보내세요. 다른 도구를 쓰지 마세요."
+            }},
+            "input": [{"type": "text", "text": "비동기 질문을 보내고 사용자 답변을 기다리세요. 답변을 받으면 그 값만 말하세요."}]
+        })).await.unwrap();
+        let mut question_seen = false;
+        let mut free_text = false;
+        loop {
+            let event = timeout(Duration::from_secs(120), server.next_event()).await.unwrap().unwrap();
+            match event {
+                ServerEvent::Notification { method, params } => {
+                    if let Some(action) = state.reject_unanswered_question(&method, &params) {
+                        assert!(matches!(action, Action::Interrupt), "예상하지 않은 복구 동작");
+                        assert!(state.awaiting_input());
+                        free_text = params.pointer("/item/questions/0/options")
+                            .and_then(Value::as_array).is_none_or(Vec::is_empty);
+                        question_seen = true;
+                        server.request("turn/interrupt", json!({"threadId": state.thread_id, "turnId": state.turn_id})).await.unwrap();
+                    } else {
+                        state.handle_notification(&method, &params);
+                    }
+                    if method == "turn/completed" {
+                        assert!(question_seen, "비동기 질문 없이 종료됨");
+                        break;
+                    }
+                }
+                ServerEvent::Request { method, .. } => panic!("예상하지 않은 요청: {method}"),
+                ServerEvent::Closed(message) => panic!("{message}"),
+                _ => {}
+            }
+        }
+        // The interrupted runtime remains idle; the local question stays open.
+        let until = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < until {
+            state.render_tick();
+            assert!(state.awaiting_input());
+            assert!(state.take_queued_prompt().is_none());
+            if let Ok(Some(event)) = timeout(Duration::from_millis(100), server.next_event()).await {
+                match event {
+                    ServerEvent::Notification { method, params } => {
+                        assert_ne!(method, "turn/started");
+                        assert_ne!(method, "item/started");
+                        state.handle_notification(&method, &params);
+                    }
+                    ServerEvent::Request { method, .. } => panic!("대기 중 요청: {method}"),
+                    _ => {}
+                }
+            }
+        }
+        if free_text { state.handle_paste("첫째".into()); }
+        let Action::Submit(answer) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+            panic!("비동기 질문 답변이 새 작업으로 전달되지 않음");
+        };
+        assert!(answer.contains("첫째"));
+        start(&server, &state, model, &answer).await;
+        finish(&mut server, &mut state, false).await;
+    }).catch_unwind().await;
+    server.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 async fn event(server: &mut AppServer, state: &mut AppState) -> ServerEvent {
     let event = timeout(Duration::from_secs(120), server.next_event())
         .await

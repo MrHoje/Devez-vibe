@@ -8004,6 +8004,9 @@ impl AppState {
 
     fn cancel_user_question(&mut self, id: Value) -> Action {
         self.clear_resolved_server_request(&id);
+        if is_async_question(&id) && !self.busy {
+            return Action::None;
+        }
         let interrupt = matches!(self.request_interrupt(), Action::Interrupt);
         Action::CancelUserInput { id, interrupt }
     }
@@ -8014,8 +8017,8 @@ impl AppState {
         self.release_held_notifications(false);
     }
 
-    /// Older/incompatible runtimes can publish an async question as plain text.
-    /// Never let that look like an answered modal and continue the user's work.
+    /// Async questions have no RPC to hold. Stop their turn, retain the question,
+    /// and submit the explicit answer as a new user turn after it has stopped.
     pub fn reject_unanswered_question(&mut self, method: &str, params: &Value) -> Option<Action> {
         if params
             .get("threadId")
@@ -8027,6 +8030,7 @@ impl AppState {
         // Our answer handler removes the prompt before sending the response.
         // Resolving a still-visible question therefore is not a user answer.
         if let Some(PendingInteraction::UserInput { id, .. }) = &self.pending
+            && !is_async_question(id)
             && ((method == "serverRequest/resolved" && params.get("requestId") == Some(id))
                 || (method == "turn/completed"
                     && params
@@ -8060,12 +8064,32 @@ impl AppState {
             return None;
         }
         self.flush_before_question();
-        self.push_notice(
-            BlockKind::Error,
-            "질문 대기 실패",
-            "응답 대기 대신 비동기 질문이 전달되어 작업을 중단합니다. 답변 없이 계속하지 않습니다.",
+        if let (Some(active), Some(source)) = (
+            self.turn_id.as_deref(),
+            params.get("turnId").and_then(Value::as_str),
+        ) && active != source {
+            return Some(Action::None);
+        }
+        let questions = params["item"]["questions"].as_array()?;
+        let questions = questions.iter().enumerate().map(|(index, question)| {
+            let options = match question.get("options") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::Array(options)) => options.iter().map(|option| {
+                    json!({"label": option.as_str().unwrap_or_default()})
+                }).collect::<Vec<_>>(),
+                Some(_) => vec![json!({"label": ""})],
+            };
+            json!({"id": index.to_string(), "question": question.get("title"), "options": options})
+        }).collect::<Vec<_>>();
+        let action = self.begin_server_request(
+            json!({"devezAsyncQuestion": true}),
+            "item/tool/requestUserInput",
+            &json!({"questions": questions}),
         );
-        Some(self.request_interrupt())
+        if !matches!(action, Action::None) {
+            return Some(action);
+        }
+        Some(if self.busy { self.request_interrupt() } else { Action::None })
     }
 
     /// The runtime names one Claude session two ways — bare, and `claude:`-prefixed.
@@ -14315,6 +14339,10 @@ fn advance_question(
     state: &mut AppState,
     typed: bool,
 ) -> Action {
+    if is_async_question(&id) && state.busy {
+        // Do not race turn/interrupt with a new turn, even on a fast click.
+        return show_question(id, questions, current, answers, state);
+    }
     if current + 1 == questions.len() {
         if let Some(unanswered) = questions.iter().position(|question| {
             !answers.get(&question.id).is_some_and(|answers| {
@@ -14323,7 +14351,9 @@ fn advance_question(
         }) {
             return show_question(id, questions, unanswered, answers, state);
         }
-        commit_user_input_answers(state, &questions, &answers);
+        if !is_async_question(&id) {
+            commit_user_input_answers(state, &questions, &answers);
+        }
         // An approved Planner handoff continues on its own: the structured
         // answer (not free text) arms the role switch and queues the
         // follow-up, which the turn-completion drain starts under Goal Runner.
@@ -14333,6 +14363,20 @@ fn advance_question(
         {
             state.request_agent_handoff(&plan);
         }
+        if is_async_question(&id) {
+            let text = questions
+                .iter()
+                .map(|question| {
+                    format!(
+                        "{}\n{}",
+                        question.question,
+                        answers[&question.id].join("\n")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            return state.submit_text(format!("질문에 대한 사용자 답변:\n{text}"), text);
+        }
         return Action::RpcResponse {
             id,
             result: answers_response(&answers),
@@ -14341,13 +14385,21 @@ fn advance_question(
     show_question(id, questions, current + 1, answers, state)
 }
 
+fn is_async_question(id: &Value) -> bool {
+    id.get("devezAsyncQuestion").and_then(Value::as_bool) == Some(true)
+}
+
 /// The exact contract the Planner's handoff question follows so the approval
 /// below is matched on structured input, never on prose.
 const PLANNER_HANDOFF_HEADER: &str = "Planner Handoff";
 const PLANNER_HANDOFF_EXECUTE_LABEL: &str = "Goal Runner로 실행";
 
 fn question_display_header(header: &str) -> &str {
-    if header == PLANNER_HANDOFF_HEADER { "계획 실행 확인" } else { header }
+    if header == PLANNER_HANDOFF_HEADER {
+        "계획 실행 확인"
+    } else {
+        header
+    }
 }
 
 /// The plan document approved for automatic execution, if these answers are
@@ -25221,6 +25273,100 @@ mod tests {
     }
 
     #[test]
+    fn async_question_preserves_choices_until_stopped_and_answered() {
+        let mut state = busy_state_with_live_turn();
+        let params = json!({"threadId": "main-thread", "item": {
+            "type": "agentMessage", "delivery": "async",
+            "questions": [{"title": "어느 쪽인가요?", "options": ["첫째", "둘째"]}]
+        }});
+        assert!(matches!(
+            state.reject_unanswered_question("item/completed", &params),
+            Some(Action::Interrupt)
+        ));
+        assert!(state.awaiting_input());
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::None
+        ));
+        assert!(state.awaiting_input());
+        let completed = json!({"threadId": "main-thread", "turn": {"id": "live-turn", "status": "interrupted"}});
+        assert!(
+            state
+                .reject_unanswered_question("turn/completed", &completed)
+                .is_none()
+        );
+        state.handle_notification("turn/completed", &completed);
+        state.flush_before_question();
+        for _ in 0..100 {
+            state.render_tick();
+            assert!(state.awaiting_input());
+            assert!(state.take_queued_prompt().is_none());
+        }
+        let action = state.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(action, Action::Submit(text) if text.contains("어느 쪽인가요?") && text.contains("첫째"))
+        );
+        assert!(!state.awaiting_input());
+    }
+
+    #[test]
+    fn async_question_free_text_and_cancellation_do_not_send_rpc_answers() {
+        for cancel in [false, true] {
+            let mut state = busy_state_with_live_turn();
+            let params = json!({"item": {"type": "agentMessage", "delivery": "async",
+                "questions": [{"title": "입력하세요"}]}});
+            state.reject_unanswered_question("item/completed", &params);
+            state.handle_notification(
+                "turn/completed",
+                &json!({"turn": {"id": "live-turn", "status": "interrupted"}}),
+            );
+            state.flush_before_question();
+            if cancel {
+                assert!(matches!(
+                    state.handle_key(KeyEvent::from(KeyCode::Esc)),
+                    Action::None
+                ));
+                assert!(!state.pending_interrupt);
+                assert!(state.take_queued_prompt().is_none());
+            } else {
+                assert!(matches!(
+                    state.handle_key(KeyEvent::from(KeyCode::Enter)),
+                    Action::None
+                ));
+                state.handle_paste("직접 답변".into());
+                assert!(
+                    matches!(state.handle_key(KeyEvent::from(KeyCode::Enter)), Action::Submit(text) if text.contains("직접 답변"))
+                );
+            }
+            assert!(!state.awaiting_input());
+        }
+    }
+
+    #[test]
+    fn malformed_async_question_stops_without_presenting_invalid_choices() {
+        for question in [
+            json!({"title": ""}),
+            json!({"title": "선택", "options": [42]}),
+        ] {
+            let mut state = busy_state_with_live_turn();
+            let action = state.reject_unanswered_question(
+                "item/completed",
+                &json!({"item": {
+                    "type": "agentMessage", "delivery": "async", "questions": [question]
+                }}),
+            );
+            assert!(matches!(
+                action,
+                Some(Action::CancelUserInput {
+                    interrupt: true,
+                    ..
+                })
+            ));
+            assert!(!state.awaiting_input());
+        }
+    }
+
+    #[test]
     fn asynchronous_question_after_paced_text_stops_the_correct_turn() {
         let mut state = busy_state_with_live_turn();
         state.handle_notification(
@@ -25344,7 +25490,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_questions_stop_and_async_messages_cannot_bypass_the_wait() {
+    fn repeated_questions_stop_and_async_messages_preserve_the_wait() {
         let mut state = busy_state_with_live_turn();
         state.begin_server_request(
             json!(9),
