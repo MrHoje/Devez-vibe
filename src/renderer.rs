@@ -7222,14 +7222,18 @@ fn update_lines(block: &Block, width: u16) -> Vec<PaintLine> {
         PaintLine::blank(),
     ];
     for note in block.body.lines().filter(|line| !line.trim().is_empty()) {
-        lines.extend(wrapped_line(
-            "  •  ",
-            Tone::Muted,
-            note,
-            Tone::Muted,
-            false,
-            width,
-        ));
+        let mut spans = vec![PaintSpan {
+            text: note.to_owned(),
+            tone: Tone::Muted,
+            bold: false,
+        }];
+        trim_status_spans(&mut spans, line_width.saturating_sub(5));
+        lines.push(PaintLine {
+            prefix: "  •  ".to_owned(),
+            prefix_tone: Tone::Muted,
+            tone: Tone::Muted,
+            ..PaintLine::plain(spans.into_iter().map(|span| span.text).collect::<String>())
+        });
     }
     lines.push(PaintLine::blank());
     lines.push(PaintLine {
@@ -11320,7 +11324,7 @@ fn prompt_footer_spans(
     response_agent: Option<AgentMode>,
 ) -> Vec<PaintSpan> {
     let mut spans = Vec::new();
-    let Some(agent) = response_agent else {
+    let Some(agent) = response_agent.filter(|agent| *agent != AgentMode::Standard) else {
         if let Some(text) = prompt_footer_label(history, response_duration) {
             spans.push(PaintSpan { text, tone: Tone::History, bold: false });
         }
@@ -22760,10 +22764,17 @@ mod tests {
             assert_eq!(UnicodeWidthStr::width(heading.as_str()), UnicodeWidthStr::width(bottom.as_str()));
             let news = lines[5..]
                 .iter()
-                .map(|line| line.text.as_str())
-                .collect::<String>();
-            for note in crate::update::RELEASE_NOTES {
-                assert!(news.replace(' ', "").contains(&note.replace(' ', "")));
+                .filter(|line| line.prefix == "  •  ")
+                .collect::<Vec<_>>();
+            assert_eq!(news.len(), crate::update::RELEASE_NOTES.len());
+            for (line, note) in news.iter().zip(crate::update::RELEASE_NOTES) {
+                assert!(painted_width(line) <= panel_span(width));
+                if UnicodeWidthStr::width(*note) > panel_span(width).saturating_sub(5) {
+                    assert!(line.text.ends_with("..."));
+                    assert!(note.starts_with(line.text.strip_suffix("...").unwrap()));
+                } else {
+                    assert_eq!(&line.text, note);
+                }
             }
             assert!(
                 lines[0] == PaintLine::blank(),
@@ -26172,6 +26183,12 @@ mod tests {
                         prompt.response_agent = Some(agent);
                         prompt.response_duration = duration;
                         let lines = user_prompt_lines_with_history(&prompt, 80, history, chat);
+                        if agent == AgentMode::Standard {
+                            let mut without_agent = prompt.clone();
+                            without_agent.response_agent = None;
+                            assert!(lines == user_prompt_lines_with_history(&without_agent, 80, history, chat));
+                            continue;
+                        }
                         let footer = lines.iter().find(|line| line.tail.iter().any(|span| span.text == agent.label())).expect("agent footer");
                         let name = footer.tail.iter().find(|span| span.text == agent.label()).unwrap();
                         assert_eq!(name.tone, agent_prompt_tone(agent));
