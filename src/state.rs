@@ -12308,6 +12308,7 @@ impl AppState {
                 let text_focused = user_input_text_focused(question, *selected);
                 if !question.options.is_empty() {
                     lines.extend(question.options.iter().enumerate().map(|(index, option)| {
+                        let display_label = question_option_display_label(&option.label);
                         // 다중 선택 질문은 줄마다 켜짐 상태를 앞에 달아 보여 준다.
                         let label = if question.multi_select {
                             format!(
@@ -12317,10 +12318,10 @@ impl AppState {
                                 } else {
                                     UNCHECKED_BOX
                                 },
-                                option.label
+                                display_label
                             )
                         } else {
-                            option.label.clone()
+                            display_label.to_owned()
                         };
                         OverlayLine {
                             text: format!("{label}\n{}", option.description),
@@ -14815,6 +14816,33 @@ fn answer_picked(answers: &BTreeMap<String, Vec<String>>, id: &str, label: &str)
     answers
         .get(id)
         .is_some_and(|picks| picks.iter().any(|pick| pick == label))
+}
+
+// 화면이 번호를 붙이므로 모델의 목록 번호만 숨긴다. 답변으로 보낼 원문은 유지한다.
+fn question_option_display_label(label: &str) -> &str {
+    let trimmed = label.trim_start();
+    let (digits, closing) = if let Some(rest) = trimmed.strip_prefix('(') {
+        (rest, Some(')'))
+    } else if let Some(rest) = trimmed.strip_prefix('[') {
+        (rest, Some(']'))
+    } else {
+        (trimmed, None)
+    };
+    let count = digits.bytes().take_while(u8::is_ascii_digit).count();
+    if count == 0 {
+        return label;
+    }
+    let suffix = &digits[count..];
+    let text = match closing {
+        Some(end) => suffix.strip_prefix(end),
+        None => suffix.strip_prefix('.').or_else(|| suffix.strip_prefix(')')),
+    };
+    match text {
+        Some(text) if text.starts_with(char::is_whitespace) && !text.trim().is_empty() => {
+            text.trim_start()
+        }
+        _ => label,
+    }
 }
 
 fn parse_questions(params: &Value) -> Vec<Question> {
@@ -25156,6 +25184,53 @@ mod tests {
     fn blocking_test_question() -> Value {
         json!({"isBlocking": true, "questions": [{"id": "q1", "question": "선택하세요",
             "options": [{"label": "첫째"}, {"label": "둘째"}]}]})
+    }
+
+    #[test]
+    fn question_option_display_label_preserves_numbers_in_the_content() {
+        for label in ["1. 첫째", "2) 첫째", "(3) 첫째", "[4] 첫째", "  12.\t첫째"] {
+            assert_eq!(question_option_display_label(label), "첫째", "{label}");
+        }
+        for label in [
+            "첫째", "1.8.9 유지", "1.5배", "2026년", "2개 선택", "123", "1.",
+            "1. ", "(1)", "[1]", "[2026]년", "1.선택", "가. 선택", "", "  ",
+        ] {
+            assert_eq!(question_option_display_label(label), label);
+        }
+    }
+
+    #[test]
+    fn question_numbers_are_removed_only_from_display_labels() {
+        for multi_select in [false, true] {
+            let mut state = test_state();
+            let mut question = blocking_test_question();
+            question["questions"][0]["multiSelect"] = json!(multi_select);
+            question["questions"][0]["options"] = json!([
+                {"label": "1. 첫째", "description": "1.8.9 유지"},
+                {"label": "2) 둘째", "description": "2개 선택"}
+            ]);
+            state.begin_server_request(json!(9), "item/tool/requestUserInput", &question);
+            let overlay = state.overlay_view().unwrap();
+            let marker = if multi_select {
+                format!("{UNCHECKED_BOX} ")
+            } else {
+                String::new()
+            };
+            assert_eq!(overlay.lines[1].text, format!("{marker}첫째\n1.8.9 유지"));
+            assert_eq!(overlay.lines[2].text, format!("{marker}둘째\n2개 선택"));
+            if multi_select {
+                state.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+                assert_eq!(
+                    state.overlay_view().unwrap().lines[1].text,
+                    format!("{CHECKED_BOX} 첫째\n1.8.9 유지")
+                );
+            }
+            let Action::RpcResponse { result, .. } = state.handle_key(KeyEvent::from(KeyCode::Enter))
+            else {
+                panic!("the selected answer must be submitted");
+            };
+            assert_eq!(result["answers"]["q1"]["answers"], json!(["1. 첫째"]));
+        }
     }
 
     #[test]

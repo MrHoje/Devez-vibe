@@ -23454,8 +23454,8 @@ mod tests {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         let questions = serde_json::json!({"questions": [{
             "id": "q1", "header": "선택", "question": "어떤 방법을 쓸까요?",
-            "options": [{"label": "첫째", "description": "첫 방법"},
-                        {"label": "둘째", "description": "둘째 방법"}]
+            "options": [{"label": "1. 첫째", "description": "첫 방법"},
+                        {"label": "2) 둘째", "description": "둘째 방법"}]
         }]});
         let mut codex = questions.clone();
         codex["isBlocking"] = serde_json::json!(false);
@@ -23488,8 +23488,8 @@ mod tests {
             panels.push(frame.lines.iter().map(painted).collect::<Vec<_>>());
         }
         assert_eq!(panels[0], panels[1]);
-        assert!(panels[0].iter().any(|line| line.contains("첫째")));
-        assert!(panels[0].iter().any(|line| line.contains("둘째")));
+        assert!(panels[0].iter().any(|line| line.starts_with("│ ❯  1. 첫째")));
+        assert!(panels[0].iter().any(|line| line.starts_with("│    2. 둘째")));
     }
 
     #[test]
