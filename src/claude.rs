@@ -548,15 +548,35 @@ mod tests {
     }
 
     #[test]
-    fn bridge_prefers_bypass_and_falls_back_to_auto() {
+    fn bridge_verifies_auto_without_permission_bypass() {
         let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
 
-        assert!(bridge.contains("const PREFERRED_PERMISSION_MODE = \"bypassPermissions\""));
-        assert!(bridge.contains("const FALLBACK_PERMISSION_MODE = \"auto\""));
+        assert!(bridge.contains("const PREFERRED_PERMISSION_MODE = \"auto\""));
+        assert!(!bridge.contains("allowDangerouslySkipPermissions: true"));
         assert!(bridge.contains("await session.query.setPermissionMode(PREFERRED_PERMISSION_MODE)"));
-        assert!(bridge.contains("await session.query.setPermissionMode(FALLBACK_PERMISSION_MODE)"));
         assert_eq!(bridge.matches("await applyPermissionMode(session);").count(), 1);
         assert!(!bridge.contains("claude/permissionMode/rejected"));
+    }
+
+    #[tokio::test]
+    #[ignore = "실제 Claude SDK 초기화와 로그인 필요"]
+    async fn live_claude_auto_permission_mode() {
+        let cwd = std::env::current_dir().unwrap();
+        let server = ClaudeServer::new(Path::new("node"), Path::new("claude"), &cwd).unwrap();
+        let result = async {
+            let opened = timeout(Duration::from_secs(60), server.request("session/start", json!({
+                "cwd": std::env::temp_dir(), "model": "claude:sonnet", "permissionMode": "bypassPermissions"
+            }))).await.unwrap()?;
+            let id = opened["id"].clone();
+            let actual = server.request("session/permissionMode", json!({"sessionId": id})).await?;
+            assert_eq!(actual["permissionMode"], "auto");
+            server.request("session/resume", json!({"sessionId": id, "model": "claude:sonnet"})).await?;
+            let resumed = server.request("session/permissionMode", json!({"sessionId": id})).await?;
+            assert_eq!(resumed["permissionMode"], "auto");
+            Ok::<(), anyhow::Error>(())
+        }.await;
+        server.shutdown().await;
+        result.unwrap();
     }
 
     #[test]

@@ -4,6 +4,7 @@ import {
   mkdirSync,
   readdirSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -11,6 +12,7 @@ import { fileURLToPath } from "node:url";
 
 const packageRoot = dirname(fileURLToPath(import.meta.url));
 const skillNames = ["luna-loop", "insane-search"];
+const bundledMarker = ".devez-vibe-bundled-skill";
 const userHome = homedir();
 const codexHome = process.env.CODEX_HOME?.trim() || join(userHome, ".codex");
 const claudeHome = process.env.CLAUDE_CONFIG_DIR?.trim() || join(userHome, ".claude");
@@ -61,6 +63,7 @@ for (const skill of skillNames) {
     try {
       copyTree(sourceRoot, target);
       pruneTree(sourceRoot, target);
+      writeFileSync(join(target, bundledMarker), `${skill}\n`, "utf8");
       console.log(`스킬 설치 완료 (${home.name}/${skill}): ${target}`);
     } catch (error) {
       failed = true;

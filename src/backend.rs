@@ -22,7 +22,7 @@ use crate::{
     open_code::{OpenCodeServer, is_open_code_model, is_open_code_request_id},
 };
 
-const CLAUDE_PREFERRED_PERMISSION_MODE: &str = "bypassPermissions";
+const CLAUDE_PREFERRED_PERMISSION_MODE: &str = "auto";
 
 #[derive(Clone)]
 pub enum IntegrationClient {
@@ -3077,7 +3077,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_sessions_always_request_bypass_permissions() {
+    fn claude_sessions_always_request_auto_permissions() {
         let request = claude_session_params(
             &json!({ "model": "claude:sonnet", "claudePermissionMode": "plan" }),
             Path::new("C:/repo"),

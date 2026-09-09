@@ -21,8 +21,10 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "심층 조사를 위한 Researcher 역할을 추가했습니다.",
-    "선택지를 표시하고 답변을 기다리는 기능을 Codex 제공자에도 추가했습니다.",
+    "보낸 프롬프트에 처리 역할을 역할별 색상으로 표시하고, 완료 후 소요 시간을 함께 표시합니다.",
+    "질문 답변이 중복 알림이나 전송 실패로 사라지지 않도록 하고, 보내지 않은 초안의 첨부가 답변에 섞이지 않도록 수정했습니다.",
+    "Claude는 자동 승인 검토를 사용하고, Codex는 전체 접근이 정책상 거절되면 허용되는 낮은 권한으로 전환합니다.",
+    "하위 에이전트의 작업 이름을 읽기 쉽게 표시하고 경과 시간을 함께 보여 줍니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

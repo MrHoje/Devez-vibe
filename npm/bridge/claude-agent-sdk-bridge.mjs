@@ -471,41 +471,28 @@ function adoptSessionId(session, incoming) {
 }
 
 const BOOTSTRAP_PERMISSION_MODE = "default";
-const PREFERRED_PERMISSION_MODE = "bypassPermissions";
-const FALLBACK_PERMISSION_MODE = "auto";
+const PREFERRED_PERMISSION_MODE = "auto";
 
 function permissionError(error) {
   return error?.message || String(error);
 }
 
-// Each session tries bypass once. When policy rejects it, the session silently
-// stays on confirmed auto mode for its remaining lifetime. A double rejection
-// fails the session instead of continuing in the bootstrap default mode.
+// Verify auto before exposing the session. If policy rejects it, fail rather
+// than silently continuing in the bootstrap mode or bypassing the classifier.
 async function applyPermissionMode(session) {
   if (session.permissionModeVerified
-      && (session.permissionMode === PREFERRED_PERMISSION_MODE
-        || (session.bypassUnavailable && session.permissionMode === FALLBACK_PERMISSION_MODE))) {
+      && session.permissionMode === PREFERRED_PERMISSION_MODE) {
     return;
   }
-  if (!session.bypassUnavailable) {
-    try {
-      await session.query.setPermissionMode(PREFERRED_PERMISSION_MODE);
-      session.permissionMode = PREFERRED_PERMISSION_MODE;
-      session.permissionModeVerified = true;
-      return;
-    } catch (error) {
-      session.bypassUnavailable = true;
-    }
-  }
   try {
-    await session.query.setPermissionMode(FALLBACK_PERMISSION_MODE);
-    session.permissionMode = FALLBACK_PERMISSION_MODE;
+    await session.query.setPermissionMode(PREFERRED_PERMISSION_MODE);
+    session.permissionMode = PREFERRED_PERMISSION_MODE;
     session.permissionModeVerified = true;
     return;
   } catch (error) {
     session.permissionModeVerified = false;
     throw new Error(
-      `Claude bypass 모드가 거부되었고 auto 폴백도 적용하지 못했습니다: ${permissionError(error)}`,
+      `Claude 자동 승인 모드를 적용하지 못했습니다: ${permissionError(error)}`,
     );
   }
 }
@@ -521,7 +508,7 @@ async function claudePermissionStatus(params) {
     || effective.bypassPermissionsModeAccepted === true;
   const bypassAvailable = permissions.disableBypassPermissionsMode !== "disable" && bypassAccepted;
   const autoDisabled = effective.disableAutoMode === "disable";
-  const defaultMode = bypassAvailable ? PREFERRED_PERMISSION_MODE : FALLBACK_PERMISSION_MODE;
+  const defaultMode = PREFERRED_PERMISSION_MODE;
   const rules = [];
   const directories = [];
   for (const source of resolved.sources) {
@@ -687,12 +674,8 @@ function makeOptions(params, sessionId, resume) {
   const options = {
     cwd: params.cwd || process.cwd(),
     includePartialMessages: true,
-    // Initialization performs no tool work. The bridge verifies bypass or its
-    // auto fallback immediately afterwards and before exposing the session.
+    // Initialization performs no tool work. Verify auto before exposing the session.
     permissionMode: BOOTSTRAP_PERMISSION_MODE,
-    // Not a mode, a capability: the SDK refuses the preferred bypass transition
-    // outright unless the session was initialized with this allowance.
-    allowDangerouslySkipPermissions: true,
     enableFileCheckpointing: true,
     persistSession: true,
     settingSources: ["user", "project", "local"],
@@ -1340,7 +1323,6 @@ async function createSession(params, resumeId) {
     effort: params.effort || "",
     permissionMode: BOOTSTRAP_PERMISSION_MODE,
     permissionModeVerified: false,
-    bypassUnavailable: false,
     toolPolicy: null,
     models: [],
     queue,
@@ -1908,6 +1890,8 @@ function numberedTaskSubject(subject, index) {
 // 서브에이전트는 자기 메시지를 부모 Task 툴콜의 `parent_tool_use_id`와 함께 흘려보낸다.
 // 그 ID로 묶어 두면 지금 어떤 에이전트가 무슨 도구를 돌리는지 그대로 복원할 수 있다.
 const SUBAGENT_TOOLS = ["Agent", "Task"];
+// 행 요약 상한. 사용자가 읽는 한 줄이라 지침의 80자 요청과 같은 값으로 자른다.
+const SUBAGENT_DESCRIPTION_LIMIT = 80;
 const SUBAGENT_PULSE_MS = 5000;
 const BACKGROUND_SUBAGENT_LEASE_MS = 60_000;
 
@@ -1916,11 +1900,7 @@ function startSubagent(session, block) {
   const existing = findSubagent(session, block.id);
   if (existing) {
     existing.toolUseId = block.id;
-    existing.name = firstLine(input.subagent_type || input.agentType || existing.name || "agent", 40);
-    existing.description = firstLine(
-      input.description || input.prompt || existing.description || "",
-      120,
-    );
+    existing.name = firstLine(input.name || input.subagent_type || input.agentType || existing.name || "agent", 40);
     existing.lastSeenAt = Date.now();
     emitSubagents(session);
     return;
@@ -1930,8 +1910,9 @@ function startSubagent(session, block) {
     toolUseId: block.id,
     taskId: "",
     background: false,
-    name: firstLine(input.subagent_type || input.agentType || "agent", 40),
-    description: firstLine(input.description || input.prompt || "", 120),
+    name: firstLine(input.name || input.subagent_type || input.agentType || "agent", 40),
+    // 행은 이름과 경과 시간만 보인다. 무엇을 시켰는지는 이름이 말하게 한다.
+    description: "",
     tool: "",
     startedAt: Date.now(),
     lastSeenAt: Date.now(),
@@ -1958,16 +1939,20 @@ function startDelegatedSubagent(session, block) {
     taskId: "",
     background: false,
     name: firstLine(delegatedAgentModel(command) || "codex", 40),
-    description: firstLine(command.replace(/\s+/g, " "), 120),
+    description: firstLine(command.replace(/\s+/g, " "), SUBAGENT_DESCRIPTION_LIMIT),
     tool: "",
+    command: true,
     startedAt: Date.now(),
     lastSeenAt: Date.now(),
   });
   emitSubagents(session);
 }
 
+// Bash의 백그라운드 실행 접수는 backgroundTaskId로 온다. Agent의 비동기 접수와
+// 같은 의미이므로 같은 경로로 행을 남긴다.
 function isBackgroundSubagentResult(result) {
-  return result?.isAsync === true || result?.status === "async_launched";
+  return result?.isAsync === true || result?.status === "async_launched"
+    || typeof result?.backgroundTaskId === "string";
 }
 
 // Claude Code treats an async Agent result as a launch receipt. The agent remains
@@ -1977,8 +1962,15 @@ function keepBackgroundSubagent(session, toolUseId, result) {
   const running = findSubagent(session, toolUseId);
   if (!running) return false;
   running.background = true;
-  running.taskId = firstLine(result?.agentId || result?.taskId || "", 80);
+  running.taskId = firstLine(result?.agentId || result?.taskId || result?.backgroundTaskId || "", 80);
   running.lastSeenAt = Date.now();
+  // level 스냅숏이 접수 결과보다 먼저 와서 자리표시자 행을 만들었으면 여기서 접는다.
+  // task_started가 오지 않는 빌드에서는 이 경로가 유일한 병합 지점이다.
+  const placeholder = running.taskId ? session.subagents.get(`task:${running.taskId}`) : null;
+  if (placeholder && placeholder !== running) {
+    running.command ||= placeholder.command;
+    session.subagents.delete(placeholder.id);
+  }
   if (running.taskId) {
     session.knownSubagents.set(running.taskId, {
       name: running.name,
@@ -2004,7 +1996,7 @@ function resumeBackgroundSubagent(session, toolUseId, pending, result) {
     taskId,
     background: true,
     name: known?.name || "agent",
-    description: known?.description || firstLine(input.summary || input.message || "", 120),
+    description: "",
     tool: "",
     startedAt: Date.now(),
     lastSeenAt: Date.now(),
@@ -2057,10 +2049,10 @@ function upsertStructuredSubagent(session, message) {
   // into it before publishing the next snapshot.
   if (byTool && byTask && byTool !== byTask) {
     byTool.background ||= byTask.background;
+    byTool.command ||= byTask.command;
     byTool.taskId ||= byTask.taskId;
     byTool.toolUseId ||= byTask.toolUseId;
     if ((!byTool.name || byTool.name === "agent") && byTask.name) byTool.name = byTask.name;
-    if (!byTool.description) byTool.description = byTask.description;
     if (!byTool.tool) byTool.tool = byTask.tool;
     byTool.startedAt = Math.min(byTool.startedAt, byTask.startedAt);
     byTool.lastSeenAt = Math.max(byTool.lastSeenAt || 0, byTask.lastSeenAt || 0);
@@ -2077,7 +2069,7 @@ function upsertStructuredSubagent(session, message) {
       taskId,
       background: false,
       name: subagentType || known?.name || "agent",
-      description: firstLine(message.description || known?.description || "", 120),
+      description: "",
       tool: "",
       startedAt: Date.now(),
       lastSeenAt: Date.now(),
@@ -2086,9 +2078,8 @@ function upsertStructuredSubagent(session, message) {
   }
   if (toolUseId) running.toolUseId = toolUseId;
   if (taskId) running.taskId = taskId;
-  if (subagentType) running.name = subagentType;
-  const description = firstLine(message.description || "", 120);
-  if (description) running.description = description;
+  // Agent 호출이 붙인 작업 이름이 있으면 SDK가 뒤늦게 알려 주는 에이전트 종류로 덮지 않는다.
+  if (subagentType && (!running.name || running.name === "agent")) running.name = subagentType;
   running.lastSeenAt = Date.now();
   if (running.taskId) {
     session.knownSubagents.set(running.taskId, {
@@ -2153,8 +2144,9 @@ function syncBackgroundSubagents(session, tasks) {
         taskId,
         background: true,
         name: known?.name || backgroundTaskName(task?.task_type),
-        description: firstLine(task?.description || known?.description || "", 120),
+        description: "",
         tool: "",
+        command: !isSubagentTaskType(task?.task_type),
         startedAt: Date.now(),
         lastSeenAt: Date.now(),
       };
@@ -2163,7 +2155,10 @@ function syncBackgroundSubagents(session, tasks) {
     }
     running.background = true;
     running.lastSeenAt = Date.now();
-    const description = firstLine(task?.description || "", 120);
+    // 에이전트 행은 이름만 보이지만, 백그라운드 명령 행은 명령문이 곧 내용이다.
+    const description = isSubagentTaskType(task?.task_type)
+      ? ""
+      : firstLine(task?.description || "", SUBAGENT_DESCRIPTION_LIMIT);
     if (description && description !== running.description) {
       running.description = description;
       changed = true;
@@ -2223,7 +2218,6 @@ function processSubagentSystemMessage(session, message) {
     }
     const running = taskId && findSubagent(session, taskId);
     if (!running) return false;
-    if (patch.description) running.description = firstLine(patch.description, 120);
     if (patch.is_backgrounded === true) running.background = true;
     running.lastSeenAt = Date.now();
     emitSubagents(session);
@@ -2361,11 +2355,15 @@ function emitSubagents(session, pulse = false) {
   // 구조화된 진행 신호가 끊긴 백그라운드 행은 pulse로 영구 연장하지 않는다.
   // 정상 작업은 task_progress/background_tasks_changed가 lease를 갱신하고,
   // 종료 edge와 level 신호를 모두 놓친 행만 유한 시간 뒤 제거된다.
+  // 백그라운드 명령(셸로 띄운 검증자 포함)에는 task_progress가 오지 않으므로
+  // lease를 적용하면 살아 있는 행이 1분 뒤 사라진다. 명령 행은 종료 통지와
+  // level 스냅숏으로만 지운다.
   if (pulse) {
     const now = Date.now();
     for (const [id, agent] of session.subagents) {
       const lastSeenAt = agent.lastSeenAt || agent.startedAt || now;
-      if (agent.background && now - lastSeenAt >= BACKGROUND_SUBAGENT_LEASE_MS) {
+      if (agent.background && !agent.command
+        && now - lastSeenAt >= BACKGROUND_SUBAGENT_LEASE_MS) {
         session.subagents.delete(id);
       }
     }
@@ -2493,7 +2491,7 @@ function processUser(session, message) {
   for (const block of content) {
     if (block.type !== "tool_result") continue;
     const pending = session.tools.get(block.tool_use_id);
-    const staysInBackground = SUBAGENT_TOOLS.includes(pending?.name)
+    const staysInBackground = (SUBAGENT_TOOLS.includes(pending?.name) || pending?.name === "Bash")
       && keepBackgroundSubagent(session, block.tool_use_id, message.tool_use_result);
     if (!staysInBackground) finishSubagent(session, block.tool_use_id);
     if (pending?.name === "SendMessage") {
@@ -3571,7 +3569,6 @@ async function runPermissionModeSelfTest() {
     id: "permission-mode-self-test",
     permissionMode: BOOTSTRAP_PERMISSION_MODE,
     permissionModeVerified: false,
-    bypassUnavailable: false,
     query: { setPermissionMode },
   });
 
@@ -3581,22 +3578,12 @@ async function runPermissionModeSelfTest() {
   await applyPermissionMode(preferred);
   if (preferred.permissionMode !== PREFERRED_PERMISSION_MODE
       || preferredCalls.join(",") !== PREFERRED_PERMISSION_MODE) {
-    throw new Error(`Claude bypass permission self-test failed: ${JSON.stringify(preferredCalls)}`);
+    throw new Error(`Claude auto permission self-test failed: ${JSON.stringify(preferredCalls)}`);
   }
 
-  const fallbackCalls = [];
-  const fallback = fakeSession(async (mode) => {
-    fallbackCalls.push(mode);
-    if (mode === PREFERRED_PERMISSION_MODE) throw new Error("organization policy");
-  });
-  await applyPermissionMode(fallback);
-  await applyPermissionMode(fallback);
-  if (fallback.permissionMode !== FALLBACK_PERMISSION_MODE
-      || fallbackCalls.join(",") !== `${PREFERRED_PERMISSION_MODE},${FALLBACK_PERMISSION_MODE}`) {
-    throw new Error(`Claude auto fallback self-test failed: ${JSON.stringify(fallbackCalls)}`);
-  }
-
+  const rejectedCalls = [];
   const rejected = fakeSession(async (mode) => {
+    rejectedCalls.push(mode);
     throw new Error(`${mode} rejected`);
   });
   let doubleRejection = "";
@@ -3605,7 +3592,8 @@ async function runPermissionModeSelfTest() {
   } catch (error) {
     doubleRejection = permissionError(error);
   }
-  if (!doubleRejection.includes("auto 폴백도 적용하지 못했습니다")) {
+  if (!doubleRejection.includes("자동 승인 모드를 적용하지 못했습니다")
+      || rejectedCalls.join(",") !== "auto" || rejected.permissionModeVerified) {
     throw new Error(`Claude permission double rejection self-test failed: ${doubleRejection}`);
   }
 }
@@ -4442,6 +4430,133 @@ async function runSelfTest() {
       tool_use_id: "toolu_reordered",
       status: "completed",
       summary: "Agent finished",
+    });
+
+    // 셸로 띄운 백그라운드 검증자: 접수 결과가 행을 지우지 않고, 진행 신호가 없어도
+    // lease로 사라지지 않으며, 종료 통지로만 내려간다.
+    const commandSession = {
+      id: "command-self-test",
+      turn: { id: "command-turn", sawStreamText: false },
+      turnSequence: 1,
+      itemSequence: 1,
+      streamBlocks: new Map(),
+      tools: new Map([[
+        "toolu_bash",
+        {
+          name: "Bash",
+          input: { command: "codex exec -m gpt-5.6-luna --json -", run_in_background: true },
+          item: { id: "toolu_bash", type: "commandExecution", command: "codex exec -m gpt-5.6-luna --json -" },
+        },
+      ]]),
+      subagents: new Map(),
+      knownSubagents: new Map(),
+      hiddenSubagentTasks: new Set(),
+      ambientSubagentTasks: new Set(),
+      subagentPulse: null,
+      lastContextUsage: null,
+    };
+    startDelegatedSubagent(commandSession, {
+      id: "toolu_bash",
+      input: { command: "codex exec -m gpt-5.6-luna --json -" },
+    });
+    processSubagentSystemMessage(commandSession, {
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "bash-1", task_type: "local_bash", description: "회귀 관점 Luna 검증자" }],
+    });
+    processSubagentSystemMessage(commandSession, {
+      type: "system",
+      subtype: "task_started",
+      task_id: "bash-1",
+      tool_use_id: "toolu_bash",
+      task_type: "local_bash",
+      description: "회귀 관점 Luna 검증자",
+    });
+    processUser(commandSession, {
+      message: { content: [{ type: "tool_result", tool_use_id: "toolu_bash", content: "Command running in background with ID: bash-1" }] },
+      tool_use_result: { backgroundTaskId: "bash-1", interrupted: false, stdout: "", stderr: "" },
+    });
+    const commandRow = findSubagent(commandSession, "toolu_bash");
+    if (commandSession.subagents.size !== 1
+      || !commandRow?.background
+      || commandRow.taskId !== "bash-1"
+      || commandRow.name !== "gpt-5.6-luna"
+      || commandRow.command !== true) {
+      throw new Error(`Claude background command receipt self-test failed: ${JSON.stringify([...commandSession.subagents])}`);
+    }
+    commandSession.subagents.set("toolu_agent_idle", {
+      id: "toolu_agent_idle",
+      toolUseId: "toolu_agent_idle",
+      taskId: "agent-idle",
+      background: true,
+      name: "Explore",
+      description: "",
+      tool: "",
+      startedAt: Date.now() - BACKGROUND_SUBAGENT_LEASE_MS * 2,
+      lastSeenAt: Date.now() - BACKGROUND_SUBAGENT_LEASE_MS * 2,
+    });
+    commandRow.lastSeenAt = Date.now() - BACKGROUND_SUBAGENT_LEASE_MS * 2;
+    emitSubagents(commandSession, true);
+    if (!commandSession.subagents.has("toolu_bash") || commandSession.subagents.has("toolu_agent_idle")) {
+      throw new Error(`Claude background command lease self-test failed: ${JSON.stringify([...commandSession.subagents.keys()])}`);
+    }
+    processUser(commandSession, {
+      origin: { kind: "task-notification" },
+      message: { content: `<task-notification>
+<task-id>bash-1</task-id><tool-use-id>toolu_bash</tool-use-id>
+<status>completed</status><summary>Background command "회귀 관점 Luna 검증자" completed (exit code 0)</summary>
+</task-notification>` },
+    });
+    if (commandSession.subagents.size !== 0) {
+      throw new Error("Claude background command notification did not finish the delegated verifier");
+    }
+    // 위임 실행이 아닌 일반 백그라운드 명령도 level 스냅숏의 행이 lease로 사라지지 않는다.
+    processSubagentSystemMessage(commandSession, {
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "bash-2", task_type: "local_bash", description: "빌드 감시" }],
+    });
+    const plainCommand = findSubagent(commandSession, "bash-2");
+    plainCommand.lastSeenAt = Date.now() - BACKGROUND_SUBAGENT_LEASE_MS * 2;
+    emitSubagents(commandSession, true);
+    if (!findSubagent(commandSession, "bash-2") || plainCommand.name !== "Bash" || plainCommand.command !== true) {
+      throw new Error(`Claude plain background command lease self-test failed: ${JSON.stringify([...commandSession.subagents])}`);
+    }
+    processSubagentSystemMessage(commandSession, {
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [],
+    });
+    if (commandSession.subagents.size !== 0) {
+      throw new Error("Claude background command snapshot did not remove a finished command");
+    }
+    // task_started 없이 level 스냅숏 → 접수 결과 순서로 와도 자리표시자가 중복 행으로 남지 않는다.
+    commandSession.tools.set("toolu_bash_late", {
+      name: "Bash",
+      input: { command: "codex exec -m gpt-5.6-luna --json -", run_in_background: true },
+      item: { id: "toolu_bash_late", type: "commandExecution", command: "codex exec -m gpt-5.6-luna --json -" },
+    });
+    startDelegatedSubagent(commandSession, {
+      id: "toolu_bash_late",
+      input: { command: "codex exec -m gpt-5.6-luna --json -" },
+    });
+    processSubagentSystemMessage(commandSession, {
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "bash-3", task_type: "local_bash", description: "흐름 관점 Luna 검증자" }],
+    });
+    processUser(commandSession, {
+      message: { content: [{ type: "tool_result", tool_use_id: "toolu_bash_late", content: "Command running in background with ID: bash-3" }] },
+      tool_use_result: { backgroundTaskId: "bash-3", interrupted: false, stdout: "", stderr: "" },
+    });
+    const lateRow = findSubagent(commandSession, "toolu_bash_late");
+    if (commandSession.subagents.size !== 1 || lateRow?.taskId !== "bash-3" || lateRow.command !== true) {
+      throw new Error(`Claude late receipt placeholder self-test failed: ${JSON.stringify([...commandSession.subagents])}`);
+    }
+    processSubagentSystemMessage(commandSession, {
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [],
     });
 
     processSubagentSystemMessage(structuredSession, {

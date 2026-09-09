@@ -62,17 +62,19 @@ const QUIT_ARM_WINDOW: Duration = Duration::from_secs(3);
 /// running. Long enough that an ordinary think never triggers it.
 const TURN_STALL_SILENCE: Duration = Duration::from_secs(20);
 
-/// The permission presets Codex exposes through `/permissions`, cycled with Shift+Tab.
+/// The effective Codex permissions selected automatically by the runtime adapter.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PermissionMode {
     FullAccess,
+    Workspace,
+    ReadOnly,
 }
 
-/// Claude requests bypass permissions and lets the bridge fall back to auto.
+/// Claude uses classifier-based automatic approval review.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub enum ClaudePermissionMode {
     #[default]
-    BypassPermissions,
+    Auto,
 }
 
 /// Controls the desired response length. Codex names the underlying setting
@@ -467,7 +469,9 @@ impl ShellDisplayMode {
 impl PermissionMode {
     pub fn label(self) -> &'static str {
         match self {
-            Self::FullAccess => "Full Access",
+            Self::FullAccess => "전체 접근",
+            Self::Workspace => "작업 폴더 수정",
+            Self::ReadOnly => "읽기 전용",
         }
     }
 
@@ -475,24 +479,27 @@ impl PermissionMode {
     pub fn profile(self) -> &'static str {
         match self {
             Self::FullAccess => ":danger-full-access",
+            Self::Workspace => ":workspace",
+            Self::ReadOnly => ":read-only",
         }
     }
 
     fn accent(self) -> ModeAccent {
         match self {
             Self::FullAccess => ModeAccent::Danger,
+            Self::Workspace | Self::ReadOnly => ModeAccent::Calm,
         }
     }
 }
 
 impl ClaudePermissionMode {
     pub fn label(self) -> &'static str {
-        "⏵⏵ bypass permissions → auto fallback"
+        "자동 승인 검토"
     }
 
     /// The value the Claude Agent SDK takes for `permissionMode`.
     pub fn wire(self) -> &'static str {
-        "bypassPermissions"
+        "auto"
     }
 }
 
@@ -1905,6 +1912,28 @@ struct SkillBinding {
     source: Option<String>,
 }
 
+const BUNDLED_SKILL_MARKER: &str = ".devez-vibe-bundled-skill";
+const BUNDLED_INSANE_SEARCH_SKILL: &str = include_str!("../npm/skills/insane-search/SKILL.md");
+const BUNDLED_LUNA_LOOP_SKILL: &str = include_str!("../npm/skills/luna-loop/SKILL.md");
+
+fn is_devez_bundled_skill_copy(skill: &SkillBinding) -> bool {
+    if skill.source.is_some() || !skill.scope.eq_ignore_ascii_case("user") {
+        return false;
+    }
+    let expected = match skill.name.as_str() {
+        "insane-search" => BUNDLED_INSANE_SEARCH_SKILL,
+        "luna-loop" => BUNDLED_LUNA_LOOP_SKILL,
+        _ => return false,
+    };
+    let path = Path::new(&skill.path);
+    let Some(folder) = path.parent() else {
+        return false;
+    };
+    fs::read_to_string(folder.join(BUNDLED_SKILL_MARKER))
+        .is_ok_and(|marker| marker.trim() == skill.name)
+        && fs::read_to_string(path).is_ok_and(|body| body == expected)
+}
+
 impl SkillBinding {
     fn completion_source(&self) -> CompletionSource {
         if self.source.is_some() {
@@ -2802,6 +2831,7 @@ fn parse_skill_bindings(response: &Value) -> Vec<SkillBinding> {
                     .map(ToOwned::to_owned),
             })
         })
+        .filter(|skill| !is_devez_bundled_skill_copy(skill))
         .filter(|skill| {
             seen.insert((
                 skill.name.clone(),
@@ -3440,7 +3470,6 @@ struct CodexSubagent {
     agent_path: Option<String>,
     nickname: Option<String>,
     role: Option<String>,
-    description: String,
     tool: String,
     has_run: bool,
     terminal: bool,
@@ -3554,6 +3583,11 @@ pub struct AppState {
     /// The draft `Ctrl+S` set aside, waiting for the chord that brings it back.
     stashed_prompt: Option<StashedPrompt>,
     queued_prompts: VecDeque<String>,
+    /// Keep an async answer separate from the unsent composer until turn/start succeeds.
+    pending_async_answer: Option<String>,
+    /// Async notifications may be repeated after their answer starts a new turn.
+    handled_async_questions: HashSet<String>,
+    codex_permission_mode: PermissionMode,
     /// The Planner handoff's follow-up while it waits in the queue, so the
     /// queue paths can tell it from prompts the user queued by hand.
     handoff_prompt: Option<String>,
@@ -3870,6 +3904,9 @@ impl AppState {
             composer_images: Vec::new(),
             stashed_prompt: None,
             queued_prompts: VecDeque::new(),
+            pending_async_answer: None,
+            handled_async_questions: HashSet::new(),
+            codex_permission_mode: PermissionMode::FullAccess,
             handoff_prompt: None,
             pending_steer_prompts: Vec::new(),
             agent_mode: AgentMode::Standard,
@@ -4840,6 +4877,7 @@ impl AppState {
     /// Code's `Other` option. Its buffered keys carry this identity so they can
     /// never be redirected into the main composer or a later question.
     pub fn pending_text_input_target(&self) -> Option<String> {
+        if self.async_answer_waiting_for_stop() { return None; }
         let PendingInteraction::UserInput {
             id,
             questions,
@@ -5028,6 +5066,9 @@ impl AppState {
     }
 
     pub fn turn_input(&mut self, text: String) -> Vec<Value> {
+        if self.pending_async_answer.as_deref() == Some(text.as_str()) {
+            return vec![json!({"type": "text", "text": text, "text_elements": []})];
+        }
         let triggers = mention_triggers(&text);
         let text_chars = text.chars().collect::<Vec<_>>();
         let mut input = vec![json!({
@@ -5265,7 +5306,7 @@ impl AppState {
     }
 
     pub fn permission_mode(&self) -> PermissionMode {
-        PermissionMode::FullAccess
+        self.codex_permission_mode
     }
 
     pub fn shell_display_mode(&self) -> ShellDisplayMode {
@@ -5391,16 +5432,16 @@ impl AppState {
         }
     }
 
-    /// Claude requests bypass with an SDK-verified auto fallback.
+    /// Claude requests the SDK-verified auto mode.
     pub fn claude_permission_mode(&self) -> Option<ClaudePermissionMode> {
         self.selected_model_name()
             .starts_with("claude:")
-            .then_some(ClaudePermissionMode::BypassPermissions)
+            .then_some(ClaudePermissionMode::Auto)
     }
 
     /// The fixed mode used when opening or resuming a Claude session.
     pub fn claude_permission_mode_setting(&self) -> ClaudePermissionMode {
-        ClaudePermissionMode::BypassPermissions
+        ClaudePermissionMode::Auto
     }
 
     /// The former mode shortcut is inert.
@@ -5854,6 +5895,7 @@ impl AppState {
     }
 
     pub fn set_turn_started(&mut self, turn_id: String) {
+        self.pending_async_answer = None;
         let acknowledging_local_prompt = self.busy && self.turn_id.is_none();
         if self.turn_id.as_deref() != Some(turn_id.as_str()) && !acknowledging_local_prompt {
             self.reset_turn_item_tracking();
@@ -5913,6 +5955,7 @@ impl AppState {
     }
 
     fn reset_turn_item_tracking(&mut self) {
+        self.pending_async_answer = None;
         self.turn_response_started = false;
         self.turn_response_visible = false;
         self.completed_item_ids.clear();
@@ -5948,8 +5991,9 @@ impl AppState {
         }
     }
 
-    fn begin_turn_prompt(&mut self, prompt: Block, started_at: Instant) {
+    fn begin_turn_prompt(&mut self, mut prompt: Block, started_at: Instant) {
         self.finish_active_turn_prompt(started_at);
+        prompt.response_agent = Some(self.active_turn_agent);
         self.turn_prompt_started_at.insert(prompt.id(), started_at);
         self.turn_prompts.push(prompt.clone());
         self.turn_response_boundaries.push(prompt.clone());
@@ -6068,15 +6112,42 @@ impl AppState {
         self.end_compaction();
         self.turn_id = None;
         self.pending_interrupt = false;
-        self.turn_interrupted = false;
+        self.turn_interrupted = true;
         self.turn_started_at = None;
+        if let Some(answer) = self.pending_async_answer.take() {
+            if matches!(&self.pending, Some(PendingInteraction::UserInput { id, .. }) if is_async_question(id)) {
+                self.pending = None;
+            }
+            self.preserve_failed_question_answer(&answer);
+        }
         self.committed
             .push(Block::new(BlockKind::Error, "요청 실패", message));
+    }
+
+    fn preserve_failed_question_answer(&mut self, answer: &str) {
+        self.cancel_agent_handoff();
+        self.turn_interrupted = true;
+        self.editor.move_to_display_index(self.editor.chars().len());
+        if !self.editor.is_empty() {
+            self.editor.insert('\n');
+        }
+        self.editor.insert_str(answer);
+        self.set_composer_notice("미전송 답변을 입력창에 보관했습니다.".to_owned());
+    }
+
+    pub fn restore_failed_question_response(&mut self, result: &Value) {
+        let Some(answers) = result.get("answers").and_then(Value::as_object) else { return; };
+        let text = answers.values().filter_map(|answer| answer.get("answers")?.as_array())
+            .flatten().filter_map(Value::as_str).collect::<Vec<_>>().join("\n");
+        if !text.is_empty() {
+            self.preserve_failed_question_answer(&text);
+        }
     }
 
     /// Interrupt an active turn immediately, or remember the request until the
     /// app-server announces that a just-started turn is active.
     fn request_interrupt(&mut self) -> Action {
+        self.pending_async_answer = None;
         self.discard_unanswered_turn_prompts();
         self.cancel_agent_handoff();
         // Before `thread/start` binds a session, the main-loop startup helper
@@ -6374,6 +6445,8 @@ impl AppState {
     }
 
     pub fn prepare_resume(&mut self) {
+        self.codex_permission_mode = PermissionMode::FullAccess;
+        self.handled_async_questions.clear();
         self.committed.clear();
         self.active.clear();
         self.active_order.clear();
@@ -6966,6 +7039,7 @@ impl AppState {
     }
 
     fn handle_inserted_text(&mut self, text: &str, pasted: bool) {
+        if self.async_answer_waiting_for_stop() { return; }
         let sanitized = pasted.then(|| sanitize_pasted_text(text));
         let text = sanitized.as_deref().unwrap_or(text);
         // Pasted or buffered text is input, not a quit, so it disarms like a keypress.
@@ -7701,6 +7775,9 @@ impl AppState {
         }
         if self.pending.is_some() {
             if method == "item/tool/requestUserInput" {
+                if matches!(&self.pending, Some(PendingInteraction::UserInput { id: pending_id, .. }) if *pending_id == id) {
+                    return Action::None;
+                }
                 self.push_notice(
                     BlockKind::Error,
                     "질문 대기 실패",
@@ -7988,6 +8065,11 @@ impl AppState {
         )
     }
 
+    fn async_answer_waiting_for_stop(&self) -> bool {
+        self.pending_async_answer.is_some()
+            && matches!(&self.pending, Some(PendingInteraction::UserInput { id, .. }) if is_async_question(id))
+    }
+
     fn clear_resolved_server_request(&mut self, request_id: &Value) {
         let matches = match self.pending.as_ref() {
             Some(PendingInteraction::Approval { id, .. })
@@ -8026,6 +8108,21 @@ impl AppState {
             .is_some_and(|thread| !self.names_this_thread(thread))
         {
             return None;
+        }
+        if method == "turn/completed"
+            && matches!(&self.pending, Some(PendingInteraction::UserInput { id, .. }) if is_async_question(id))
+            && params.pointer("/turn/id").and_then(Value::as_str)
+                .is_none_or(|turn| self.turn_id.as_deref() == Some(turn))
+        {
+            self.flush_before_question();
+            self.dispatch_notification(method, params);
+            if let Some(answer) = self.pending_async_answer.take() {
+                self.pending = None;
+                let action = self.submit_text(answer.clone(), answer.clone());
+                self.pending_async_answer = Some(answer);
+                return Some(action);
+            }
+            return Some(Action::None);
         }
         // Our answer handler removes the prompt before sending the response.
         // Resolving a still-visible question therefore is not a user answer.
@@ -8071,6 +8168,11 @@ impl AppState {
             return Some(Action::None);
         }
         let questions = params["item"]["questions"].as_array()?;
+        if let Some(id) = params.pointer("/item/id").and_then(Value::as_str)
+            && !self.handled_async_questions.insert(id.to_owned())
+        {
+            return Some(Action::None);
+        }
         let questions = questions.iter().enumerate().map(|(index, question)| {
             let options = match question.get("options") {
                 None | Some(Value::Null) => Vec::new(),
@@ -8082,7 +8184,7 @@ impl AppState {
             json!({"id": index.to_string(), "question": question.get("title"), "options": options})
         }).collect::<Vec<_>>();
         let action = self.begin_server_request(
-            json!({"devezAsyncQuestion": true}),
+            json!({"devezAsyncQuestion": true, "itemId": params.pointer("/item/id")}),
             "item/tool/requestUserInput",
             &json!({"questions": questions}),
         );
@@ -8116,11 +8218,7 @@ impl AppState {
         agent_path: Option<&str>,
         nickname: Option<&str>,
         role: Option<&str>,
-        description: Option<&str>,
     ) {
-        let description = description
-            .map(|prompt| compact_command(&strip_workspace_prefix(prompt, &self.cwd), 96))
-            .filter(|description| !description.is_empty());
         let metadata = self.codex_subagents.entry(id.to_owned()).or_default();
         if let Some(path) = agent_path.map(str::trim).filter(|path| !path.is_empty()) {
             metadata.agent_path = Some(path.to_owned());
@@ -8134,9 +8232,6 @@ impl AppState {
         if let Some(role) = role.map(str::trim).filter(|role| !role.is_empty()) {
             metadata.role = Some(role.to_owned());
         }
-        if let Some(description) = description {
-            metadata.description = description;
-        }
         self.refresh_codex_subagent_row(id);
     }
 
@@ -8145,11 +8240,9 @@ impl AppState {
             return;
         };
         let name = metadata.display_name();
-        let description = metadata.description.clone();
         let tool = metadata.tool.clone();
         if let Some(running) = self.subagents.iter_mut().find(|running| running.id == id) {
             running.name = name;
-            running.description = description;
             running.tool = tool;
         }
     }
@@ -8170,17 +8263,16 @@ impl AppState {
         metadata.probe_failures = 0;
         metadata.has_run = true;
         let name = metadata.display_name();
-        let description = metadata.description.clone();
         let tool = metadata.tool.clone();
         if let Some(running) = self.subagents.iter_mut().find(|running| running.id == id) {
             running.name = name;
-            running.description = description;
             running.tool = tool;
         } else {
             self.subagents.push(RunningSubagent {
                 id: id.to_owned(),
                 name,
-                description,
+                // Codex 행은 이름과 경과 시간만 보인다. 무엇을 시켰는지는 task_name이 말한다.
+                description: String::new(),
                 tool,
                 started_at: Instant::now(),
                 painted_elapsed_secs: 0,
@@ -8260,7 +8352,6 @@ impl AppState {
                     None,
                     thread.get("agentNickname").and_then(Value::as_str),
                     thread.get("agentRole").and_then(Value::as_str),
-                    None,
                 );
                 if thread.pointer("/status/type").and_then(Value::as_str) == Some("active") {
                     self.start_codex_subagent(id, true);
@@ -8338,7 +8429,6 @@ impl AppState {
                     item.get("agentPath").and_then(Value::as_str),
                     None,
                     None,
-                    None,
                 );
                 match item.get("kind").and_then(Value::as_str) {
                     Some("started") => self.start_codex_subagent(id, false),
@@ -8385,15 +8475,6 @@ impl AppState {
 
         for id in receivers {
             self.remember_codex_subagent(&id);
-            if tool == "spawnAgent" {
-                self.update_codex_subagent_identity(
-                    &id,
-                    None,
-                    None,
-                    None,
-                    item.get("prompt").and_then(Value::as_str),
-                );
-            }
             let agent_status = item
                 .get("agentsStates")
                 .and_then(Value::as_object)
@@ -8698,6 +8779,18 @@ impl AppState {
                         .or_else(|| Some(self.selected_effort.clone()));
                     self.set_turn_started(turn_id.to_owned());
                 }
+            }
+            "devez/permissions/updated" => {
+                let mode = match params.get("profile").and_then(Value::as_str) {
+                    Some(":danger-full-access") => PermissionMode::FullAccess,
+                    Some(":workspace") => PermissionMode::Workspace,
+                    Some(":read-only") => PermissionMode::ReadOnly,
+                    _ => return,
+                };
+                if self.codex_permission_mode != mode && params.get("lowered") == Some(&json!(true)) {
+                    self.push_notice(BlockKind::Warning, "권한 자동 조정", format!("전체 접근이 허용되지 않아 {} 모드로 전환했습니다.", mode.label()));
+                }
+                self.codex_permission_mode = mode;
             }
             "turn/completed" => {
                 let turn_error = params
@@ -9534,8 +9627,8 @@ impl AppState {
             "/permissions" if parts.len() == 1 => {
                 self.committed.push(Block::new(
                     BlockKind::System,
-                    "Permissions",
-                    "Codex는 현재 Full Access 권한 프로필을 사용합니다.",
+                    "권한",
+                    format!("현재 Codex 권한은 {}입니다.", self.permission_mode().label()),
                 ));
                 Action::None
             }
@@ -9909,6 +10002,12 @@ impl AppState {
     fn handle_pending_key(&mut self, key: KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if self.async_answer_waiting_for_stop()
+            && key.code != KeyCode::Esc
+            && !(ctrl && key.code == KeyCode::Char('c'))
+        {
+            return Action::None;
+        }
         if let Some(PendingInteraction::UserInput {
             questions,
             current,
@@ -12265,7 +12364,9 @@ impl AppState {
                         } else {
                             ""
                         };
-                        if text_focused {
+                        if self.async_answer_waiting_for_stop() {
+                            "작업 중단 확인 후 답변을 전송합니다 · Esc 취소".to_owned()
+                        } else if text_focused {
                             "Enter Send · Esc Cancel".to_owned()
                         } else if question.multi_select {
                             format!("Space Select · Enter Confirm · ↑/↓ Move{steps} · Esc Cancel")
@@ -13249,6 +13350,14 @@ impl AppState {
     }
 
     pub fn click_overlay_row(&mut self, row: usize) -> Action {
+        if self.async_answer_waiting_for_stop() {
+            if let Some(PendingInteraction::UserInput { id, questions, current, .. }) = &self.pending
+                && row == chat_instead_index(&questions[*current]) + 1
+            {
+                return self.cancel_user_question(id.clone());
+            }
+            return Action::None;
+        }
         match self.pending.take() {
             Some(PendingInteraction::ModelPicker {
                 model_index,
@@ -14339,10 +14448,6 @@ fn advance_question(
     state: &mut AppState,
     typed: bool,
 ) -> Action {
-    if is_async_question(&id) && state.busy {
-        // Do not race turn/interrupt with a new turn, even on a fast click.
-        return show_question(id, questions, current, answers, state);
-    }
     if current + 1 == questions.len() {
         if let Some(unanswered) = questions.iter().position(|question| {
             !answers.get(&question.id).is_some_and(|answers| {
@@ -14375,7 +14480,14 @@ fn advance_question(
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            return state.submit_text(format!("질문에 대한 사용자 답변:\n{text}"), text);
+            let prompt = format!("질문에 대한 사용자 답변:\n{text}");
+            if state.busy {
+                state.pending_async_answer = Some(prompt);
+                return show_question(id, questions, current, answers, state);
+            }
+            let action = state.submit_text(prompt.clone(), text);
+            state.pending_async_answer = Some(prompt);
+            return action;
         }
         return Action::RpcResponse {
             id,
@@ -16034,39 +16146,6 @@ fn pretty_json(value: Option<&Value>) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
-/// 자식 에이전트 행에 쓸 짧은 요약을 Codex는 따로 주지 않아 spawnAgent 프롬프트
-/// 앞부분이 그대로 라벨이 된다. 프롬프트마다 되풀이되는 작업 폴더 절대경로와 그
-/// 앞의 머리말은 행마다 같은 자리만 먹으므로 표시 전에 걷어낸다. 경로가 머리말이
-/// 아니라 본문 한가운데에서 처음 나오면 손대지 않는다.
-const WORKSPACE_PREFIX_SCAN: usize = 20;
-
-fn strip_workspace_prefix(prompt: &str, cwd: &str) -> String {
-    let one_line = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-    let root = cwd.trim_end_matches(['/', '\\']);
-    if root.is_empty() {
-        return one_line;
-    }
-    // Windows는 대소문자를 가리지 않고 두 구분자를 모두 받는다. 접기는 바이트 수를
-    // 바꾸지 않으므로 여기서 찾은 위치를 원문에 그대로 쓸 수 있다.
-    let fold = |text: &str| text.replace('\\', "/").to_ascii_lowercase();
-    let Some(at) = fold(&one_line).find(&fold(root)) else {
-        return one_line;
-    };
-    if one_line[..at].chars().count() > WORKSPACE_PREFIX_SCAN {
-        return one_line;
-    }
-    let rest = one_line[at + root.len()..].trim_start_matches(['/', '\\']);
-    let rest = ["에서는", "에서의", "에서", "에는", "의", "에", "를", "을", "는", "은"]
-        .into_iter()
-        .find_map(|particle| rest.strip_prefix(particle))
-        .unwrap_or(rest);
-    let rest = rest.trim_start_matches([' ', ',', ':', '-', '·']).trim();
-    match rest.is_empty() {
-        true => one_line,
-        false => rest.to_owned(),
-    }
-}
-
 fn compact_command(command: &str, max_chars: usize) -> String {
     let one_line = command.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.chars().count() <= max_chars {
@@ -16536,6 +16615,7 @@ fn parse_fast_mode(config: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    include!("question_audit_tests.rs");
     use super::*;
     use crate::terminal_width::with_devezcode_xterm_widths;
 
@@ -19131,7 +19211,7 @@ mod tests {
                     "status": "completed",
                     "senderThreadId": "thread",
                     "receiverThreadIds": [child],
-                    "prompt": "인증 흐름을 조사하고 결과를 보고해",
+                    "prompt": "인증 흐름을 조사하고 결과를 보고해\n먼저 로그인 경로를 찾고 호출 순서를 정리해라.",
                     "agentsStates": {
                         (child): { "status": "running", "message": null }
                     }
@@ -19161,6 +19241,7 @@ mod tests {
 
         assert_eq!(state.view().subagents.len(), 1);
         assert_eq!(state.view().subagents[0].name, "Agent");
+        assert_eq!(state.view().subagents[0].description, "");
 
         state.handle_notification(
             "thread/started",
@@ -19464,33 +19545,6 @@ mod tests {
             }),
         );
         state
-    }
-
-    #[test]
-    fn a_codex_subagent_label_drops_the_repeated_workspace_prefix() {
-        assert_eq!(
-            strip_workspace_prefix(
-                "현재 저장소 D:\\hojeSource\\Devez-vibe의 renderer.rs 테스트를 감사하라",
-                "D:\\hojeSource\\Devez-vibe",
-            ),
-            "renderer.rs 테스트를 감사하라"
-        );
-        assert_eq!(
-            strip_workspace_prefix(
-                "Audit d:/hojesource/devez-vibe/src/state.rs for leaks",
-                "D:\\hojeSource\\Devez-vibe",
-            ),
-            "src/state.rs for leaks",
-            "either separator and either case still names the same folder"
-        );
-        assert_eq!(
-            strip_workspace_prefix(
-                "렌더러 테스트가 어떤 순서로 실패하는지 먼저 확인한 다음 왜 D:\\hojeSource\\Devez-vibe 밖을 읽는지 밝혀라",
-                "D:\\hojeSource\\Devez-vibe",
-            ),
-            "렌더러 테스트가 어떤 순서로 실패하는지 먼저 확인한 다음 왜 D:\\hojeSource\\Devez-vibe 밖을 읽는지 밝혀라",
-            "a path deep in the body is content, not a heading"
-        );
     }
 
     fn subagent_line_notification(kind: &str, text: &str) -> Value {
@@ -20051,7 +20105,7 @@ mod tests {
         );
         assert_eq!(
             state.claude_permission_mode(),
-            Some(ClaudePermissionMode::BypassPermissions),
+            Some(ClaudePermissionMode::Auto),
             "folding the plan is not a permission change"
         );
     }
@@ -20692,10 +20746,10 @@ mod tests {
             Some("high"),
         );
         for (state, expected) in [
-            (&mut codex, "permissions: Full Access (:danger-full-access)"),
+            (&mut codex, "permissions: 전체 접근 (:danger-full-access)"),
             (
                 &mut claude,
-                "permissions: ⏵⏵ bypass permissions → auto fallback (bypassPermissions)",
+                "permissions: 자동 승인 검토 (auto)",
             ),
         ] {
             assert!(matches!(
@@ -20825,6 +20879,70 @@ mod tests {
         let overlay = state.overlay_view().expect("status line picker stays open");
         assert_eq!(overlay.lines[1].text, format!("{UNCHECKED_BOX} Effort"));
         assert!(overlay.lines[1].selected);
+    }
+
+    #[test]
+    fn only_the_unchanged_devez_bundled_skill_copy_is_hidden() {
+        let root = env::temp_dir().join(format!(
+            "devez-bundled-skill-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let make_copy = |folder: &str, body: &str, marker: bool| {
+            let folder = root.join(folder).join("insane-search");
+            fs::create_dir_all(&folder).unwrap();
+            let skill = folder.join("SKILL.md");
+            fs::write(&skill, body).unwrap();
+            if marker {
+                fs::write(folder.join(BUNDLED_SKILL_MARKER), "insane-search\n").unwrap();
+            }
+            skill.to_string_lossy().into_owned()
+        };
+        let bundled = make_copy("bundled", BUNDLED_INSANE_SEARCH_SKILL, true);
+        let separate = make_copy("separate", BUNDLED_INSANE_SEARCH_SKILL, false);
+        let modified = make_copy(
+            "modified",
+            &format!("{BUNDLED_INSANE_SEARCH_SKILL}\n# user change\n"),
+            true,
+        );
+        let plugin = make_copy("plugin", BUNDLED_INSANE_SEARCH_SKILL, true);
+        let entry = |path: &str, plugin_id: Option<&str>| {
+            let mut value = json!({
+                "name": "insane-search",
+                "path": path,
+                "enabled": true,
+                "scope": "user"
+            });
+            if let Some(plugin_id) = plugin_id {
+                value["pluginId"] = json!(plugin_id);
+            }
+            value
+        };
+        let response = json!({
+            "data": [{
+                "skills": [
+                    entry(&bundled, None),
+                    entry(&separate, None),
+                    entry(&modified, None),
+                    entry(&plugin, Some("insane-search@external"))
+                ]
+            }]
+        });
+
+        let bindings = parse_skill_bindings(&response);
+        let paths = bindings
+            .iter()
+            .map(|skill| skill.path.as_str())
+            .collect::<Vec<_>>();
+        fs::remove_dir_all(root).unwrap();
+
+        assert!(!paths.contains(&bundled.as_str()));
+        assert!(paths.contains(&separate.as_str()));
+        assert!(paths.contains(&modified.as_str()));
+        assert!(paths.contains(&plugin.as_str()));
     }
 
     #[test]
@@ -21082,11 +21200,11 @@ mod tests {
 
         let badge = state.composer_mode();
 
-        assert_eq!(badge.label, "Full Access");
+        assert_eq!(badge.label, "전체 접근");
         assert_eq!(badge.vibe_mode, "Vibe: On");
 
         state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-        assert_eq!(state.composer_mode().label, "Full Access");
+        assert_eq!(state.composer_mode().label, "전체 접근");
     }
 
     #[test]
@@ -23748,6 +23866,14 @@ mod tests {
 
         assert_eq!(state.agent_mode, AgentMode::Researcher);
         assert_eq!(state.view().plan_agent, AgentMode::Planner);
+        assert_eq!(state.turn_prompts.last().unwrap().response_agent, Some(AgentMode::Planner));
+        state.editor.set_text("steer while next role is researcher");
+        assert!(matches!(state.submit_editor(), Action::Steer(_)));
+        assert_eq!(state.turn_prompts.last().unwrap().response_agent, Some(AgentMode::Planner));
+        state.finish_active_turn_prompt(Instant::now());
+        let completed = state.committed.last().unwrap();
+        assert_eq!(completed.response_agent, Some(AgentMode::Planner));
+        assert!(completed.response_duration().is_some());
     }
 
     #[test]
@@ -25284,18 +25410,8 @@ mod tests {
             Some(Action::Interrupt)
         ));
         assert!(state.awaiting_input());
-        assert!(matches!(
-            state.handle_key(KeyEvent::from(KeyCode::Enter)),
-            Action::None
-        ));
-        assert!(state.awaiting_input());
         let completed = json!({"threadId": "main-thread", "turn": {"id": "live-turn", "status": "interrupted"}});
-        assert!(
-            state
-                .reject_unanswered_question("turn/completed", &completed)
-                .is_none()
-        );
-        state.handle_notification("turn/completed", &completed);
+        assert!(matches!(state.reject_unanswered_question("turn/completed", &completed), Some(Action::None)));
         state.flush_before_question();
         for _ in 0..100 {
             state.render_tick();
@@ -27498,7 +27614,7 @@ mod tests {
             codex
                 .committed
                 .last()
-                .is_some_and(|block| block.body.contains("Full Access"))
+                .is_some_and(|block| block.body.contains("전체 접근"))
         );
     }
 
@@ -27664,7 +27780,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_mode_always_requests_bypass_with_auto_fallback() {
+    fn claude_mode_always_requests_auto() {
         let mut state = AppState::new(
             "claude:thread".to_owned(),
             "cwd".to_owned(),
@@ -27675,7 +27791,7 @@ mod tests {
         );
         assert_eq!(
             state.claude_permission_mode(),
-            Some(ClaudePermissionMode::BypassPermissions)
+            Some(ClaudePermissionMode::Auto)
         );
         assert!(matches!(state.cycle_claude_permission_mode(), Action::None));
     }
@@ -27760,7 +27876,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_claude_models_still_request_bypass_with_auto_fallback() {
+    fn unsupported_claude_models_still_request_auto() {
         let mut model = test_model("claude:haiku", "Haiku", true);
         model.supports_auto_mode = false;
         let mut state = AppState::new(
@@ -27775,7 +27891,7 @@ mod tests {
 
         assert_eq!(
             state.claude_permission_mode(),
-            Some(ClaudePermissionMode::BypassPermissions)
+            Some(ClaudePermissionMode::Auto)
         );
     }
 
@@ -27800,7 +27916,7 @@ mod tests {
             assert!(matches!(action, Action::None));
             assert_eq!(
                 state.claude_permission_mode(),
-                Some(ClaudePermissionMode::BypassPermissions)
+                Some(ClaudePermissionMode::Auto)
             );
             assert!(state.queued_prompts.is_empty());
             assert!(state.composer_notice.is_none());

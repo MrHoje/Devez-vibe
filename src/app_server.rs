@@ -117,6 +117,7 @@ pub struct AppServer {
     child: Child,
     client: AppServerClient,
     events: mpsc::UnboundedReceiver<ServerEvent>,
+    permission_events: mpsc::UnboundedSender<ServerEvent>,
     writer_task: JoinHandle<()>,
     reader_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
@@ -156,6 +157,7 @@ impl AppServer {
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Value>();
         let (event_tx, events) = mpsc::unbounded_channel::<ServerEvent>();
+        let permission_events = event_tx.clone();
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(20)));
 
@@ -249,6 +251,7 @@ impl AppServer {
             child,
             client,
             events,
+            permission_events,
             writer_task,
             reader_task,
             stderr_task,
@@ -262,6 +265,17 @@ impl AppServer {
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        if matches!(method, "thread/start" | "thread/resume" | "thread/fork" | "turn/start") {
+            let thread = params.get("threadId").cloned();
+            let (response, profile, lowered) = request_with_permissions(&self.client, method, params).await?;
+            if let Some(thread) = response.pointer("/thread/id").cloned().or(thread) {
+                let _ = self.permission_events.send(ServerEvent::Notification {
+                    method: "devez/permissions/updated".to_owned(),
+                    params: json!({"threadId": thread, "profile": profile, "lowered": lowered}),
+                });
+            }
+            return Ok(response);
+        }
         self.client.request(method, params).await
     }
 
@@ -646,6 +660,50 @@ pub(crate) fn resolve_command(command: &Path) -> PathBuf {
     command.to_path_buf()
 }
 
+async fn request_with_permissions(
+    client: &AppServerClient,
+    method: &str,
+    params: Value,
+) -> Result<(Value, String, bool)> {
+    if !params.is_object() {
+        bail!("Codex 권한 요청의 매개변수는 객체여야 합니다.");
+    }
+    let requested = params.get("permissions").and_then(Value::as_str).unwrap_or(":danger-full-access");
+    let descending = [":danger-full-access", ":workspace", ":read-only"];
+    // Explicit role restrictions, including read-only review turns, still apply.
+    let profiles = if requested == descending[0] { &descending[..] } else { std::slice::from_ref(&requested) };
+    for (index, profile) in profiles.iter().enumerate() {
+        let mut attempt = params.clone();
+        attempt["permissions"] = json!(profile);
+        if *profile == ":danger-full-access" {
+            attempt["approvalPolicy"] = json!("never");
+        } else if index > 0 {
+            // A restricted mode inherits the runtime's permitted approval policy.
+            attempt.as_object_mut().unwrap().remove("approvalPolicy");
+            attempt.as_object_mut().unwrap().remove("approvalsReviewer");
+        }
+        match client.request(method, attempt).await {
+            Ok(response) => {
+                let actual = response.pointer("/activePermissionProfile/id")
+                    .and_then(Value::as_str).unwrap_or(profile).to_owned();
+                return Ok((response, actual, index > 0));
+            }
+            Err(error) if index + 1 < profiles.len() && permission_configuration_rejected(&error.to_string()) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("a permissions candidate is always present")
+}
+
+fn permission_configuration_rejected(error: &str) -> bool {
+    let message = error.to_ascii_lowercase().replace(['_', '-'], " ");
+    let setting = (message.contains("permission") && message.contains("profile"))
+        || message.contains("sandbox mode") || message.contains("sandbox policy")
+        || message.contains("approval policy") || message.contains("approvals reviewer");
+    setting && ["not allowed", "not permitted", "disallowed", "forbidden", "requirement", "disabled", "restricted"]
+        .iter().any(|rejection| message.contains(rejection))
+}
+
 async fn route_message(
     message: Value,
     pending: &PendingMap,
@@ -730,6 +788,97 @@ fn condense_error_message(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn permission_fallback_only_retries_rejected_configuration() {
+        let denied = "permission profile :danger-full-access is not allowed by requirements";
+        for (requested, replies, profiles) in [
+            (":danger-full-access", vec![None], vec![":danger-full-access"]),
+            (":danger-full-access", vec![Some(denied), None], vec![":danger-full-access", ":workspace"]),
+            (":danger-full-access", vec![Some(denied), Some("sandbox mode workspace-write is not allowed"), None], vec![":danger-full-access", ":workspace", ":read-only"]),
+            (":danger-full-access", vec![Some(denied), Some(denied), Some(denied)], vec![":danger-full-access", ":workspace", ":read-only"]),
+            (":danger-full-access", vec![Some("approval_policy never is not allowed"), None], vec![":danger-full-access", ":workspace"]),
+            (":danger-full-access", vec![Some("authentication expired")], vec![":danger-full-access"]),
+            (":danger-full-access", vec![Some("command execution failed: permission denied")], vec![":danger-full-access"]),
+            (":read-only", vec![Some(denied)], vec![":read-only"]),
+        ] {
+            let (outbound, mut messages) = mpsc::unbounded_channel();
+            let pending = Arc::new(Mutex::new(HashMap::new()));
+            let client = AppServerClient {
+                outbound: Arc::new(StdMutex::new(Some(outbound))),
+                pending: pending.clone(), next_id: Arc::new(AtomicU64::new(1)),
+            };
+            let params = json!({"threadId": "thread", "permissions": requested, "approvalPolicy": "on-request",
+                "model": "model", "input": [{"type": "text", "text": "사용자 작업"}]});
+            let task = tokio::spawn(async move { request_with_permissions(&client, "turn/start", params).await });
+            let (events, _) = mpsc::unbounded_channel();
+            for (index, (reply, profile)) in replies.iter().zip(&profiles).enumerate() {
+                let message = timeout(Duration::from_secs(2), messages.recv()).await.unwrap().unwrap();
+                assert_eq!(message["params"]["permissions"], *profile);
+                assert_eq!(message["params"]["threadId"], "thread");
+                assert_eq!(message["params"]["input"][0]["text"], "사용자 작업");
+                if *profile == ":danger-full-access" {
+                    assert_eq!(message["params"]["approvalPolicy"], "never");
+                } else if index > 0 {
+                    assert!(message["params"].get("approvalPolicy").is_none());
+                }
+                let response = if let Some(error) = reply {
+                    json!({"id": message["id"], "error": {"code": -32600, "message": error}})
+                } else {
+                    json!({"id": message["id"], "result": {"turn": {"id": "new-turn"}}})
+                };
+                route_message(response, &pending, &events).await;
+            }
+            let result = task.await.unwrap();
+            assert_eq!(result.is_ok(), replies.last() == Some(&None));
+            if let Ok((_, profile, lowered)) = result {
+                assert_eq!(profile, *profiles.last().unwrap());
+                assert_eq!(lowered, profiles.len() > 1);
+            }
+            assert!(messages.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "설치된 Codex의 권한 프로필과 응답 확인"]
+    async fn live_codex_permission_profiles() {
+        let mut server = AppServer::spawn(Path::new("codex"), None).await.unwrap();
+        server.initialize().await.unwrap();
+        let profiles = server.client.request("permissionProfile/list", json!({})).await.unwrap();
+        println!("지원 권한: {profiles}");
+        for profile in [":danger-full-access", ":workspace", ":read-only"] {
+            let response = server.client.request("thread/start", json!({
+                "model": "gpt-5.6-sol", "ephemeral": true, "cwd": std::env::temp_dir(),
+                "permissions": profile, "approvalPolicy": "never"
+            })).await.unwrap();
+            println!("적용 권한: {}", json!({"profile": response["activePermissionProfile"], "approvalPolicy": response["approvalPolicy"], "reviewer": response["approvalsReviewer"], "sandbox": response["sandbox"]["type"]}));
+        }
+        let response = server.request("thread/start", json!({"cwd": std::env::temp_dir(), "model": "gpt-5.6-sol",
+            "ephemeral": false, "approvalPolicy": "on-request"})).await.unwrap();
+        assert_eq!(response["approvalPolicy"], "never");
+        assert_eq!(response["activePermissionProfile"]["id"], ":danger-full-access");
+        // A thread is resumable only after its first turn has created a rollout.
+        server.request("turn/start", json!({"threadId": response["thread"]["id"], "model": "gpt-5.6-sol", "effort": "low",
+            "input": [{"type": "text", "text": "도구를 쓰지 말고 확인이라는 한 단어로만 답하세요."}]})).await.unwrap();
+        loop {
+            match timeout(Duration::from_secs(60), server.next_event()).await.unwrap().unwrap() {
+                ServerEvent::Notification { method, params } if method == "turn/completed" => {
+                    assert_eq!(params["turn"]["status"], "completed");
+                    break;
+                }
+                ServerEvent::Request { method, .. } => panic!("예상하지 않은 요청: {method}"),
+                ServerEvent::Closed(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        let resumed = server.request("thread/resume", json!({"threadId": response["thread"]["id"],
+            "approvalPolicy": "on-request"})).await.unwrap();
+        assert_eq!(resumed["approvalPolicy"], "never");
+        assert_eq!(resumed["activePermissionProfile"]["id"], ":danger-full-access");
+        println!("새 대화와 재개에서 전체 접근·승인 요청 없음 확인");
+        server.shutdown().await;
+    }
+
 
     #[test]
     fn initialize_enables_interactive_mcp_forms() {

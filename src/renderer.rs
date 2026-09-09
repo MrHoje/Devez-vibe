@@ -140,6 +140,7 @@ pub struct Block {
     children: Vec<Block>,
     assistant_phase: AssistantPhase,
     response_duration: Option<Duration>,
+    pub(crate) response_agent: Option<AgentMode>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,6 +231,7 @@ impl Block {
             children: Vec::new(),
             assistant_phase: AssistantPhase::Unknown,
             response_duration: None,
+            response_agent: None,
         }
     }
 
@@ -6132,6 +6134,13 @@ fn subagent_description_span(description: &str, available: usize) -> Option<Pain
     })
 }
 
+/// Codex는 `/root/eghis2_daily_popup`처럼 경로형 식별자를, Claude는 `devez-reviewer`처럼
+/// 하이픈 식별자를 이름으로 주므로 두 제공자 행이 같은 낱말 형태로 읽히게 정리한다.
+fn subagent_display_name(name: &str) -> String {
+    let name = name.trim().strip_prefix("/root/").unwrap_or(name.trim());
+    name.replace(['_', '-'], " ")
+}
+
 fn subagent_line(subagent: &SubagentView, index: usize, width: u16) -> PaintLine {
     let elapsed = format!(" · {}", format_subagent_elapsed(subagent.elapsed.as_secs()));
     // The gutter, glyph, and elapsed reading are fixed, so the name is compacted
@@ -6139,7 +6148,7 @@ fn subagent_line(subagent: &SubagentView, index: usize, width: u16) -> PaintLine
     let reserved =
         1 + UnicodeWidthStr::width(SUBAGENT_GLYPH) + 2 + UnicodeWidthStr::width(elapsed.as_str());
     let available = usize::from(width).saturating_sub(reserved + 1);
-    let name = compact_right(&subagent.name, available);
+    let name = compact_right(&subagent_display_name(&subagent.name), available);
     let description = subagent_description_span(
         &subagent.description,
         available.saturating_sub(UnicodeWidthStr::width(name.as_str())),
@@ -10036,7 +10045,7 @@ fn side_panel_subagent_lines(subagents: &[SubagentView], content_width: usize) -
         let available = content_width.saturating_sub(
             UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(elapsed.as_str()),
         );
-        let name = compact_right(&subagent.name, available);
+        let name = compact_right(&subagent_display_name(&subagent.name), available);
         let description = subagent_description_span(
             &subagent.description,
             available.saturating_sub(UnicodeWidthStr::width(name.as_str())),
@@ -11135,6 +11144,7 @@ fn user_prompt_lines_with_history(
             width,
             history,
             block.response_duration(),
+            block.response_agent,
             false,
         );
         if history.is_some() {
@@ -11177,12 +11187,14 @@ fn user_prompt_lines_with_history(
             " ".repeat(CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP)
         );
     }
-    let footer_width = prompt_footer_label(
+    let footer_width = prompt_footer_spans(
         history,
         block.response_duration(),
+        block.response_agent,
     )
-        .map(|label| UnicodeWidthStr::width(label.as_str()))
-        .unwrap_or_default();
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+        .sum::<usize>();
     let text_width = lines
         .iter()
         .map(|line| UnicodeWidthStr::width(line.text.as_str()))
@@ -11216,6 +11228,7 @@ fn user_prompt_lines_with_history(
         width,
         history,
         block.response_duration(),
+        block.response_agent,
         true,
     );
     if history.is_some() {
@@ -11251,6 +11264,7 @@ fn attach_prompt_footer(
     width: u16,
     history: Option<(u64, &str, bool)>,
     response_duration: Option<Duration>,
+    response_agent: Option<AgentMode>,
     chat_layout: bool,
 ) {
     if let Some((group_id, _, _)) = history {
@@ -11275,10 +11289,11 @@ fn attach_prompt_footer(
         }
     }
 
-    let Some(label) = prompt_footer_label(history, response_duration) else {
+    let spans = prompt_footer_spans(history, response_duration, response_agent);
+    if spans.is_empty() {
         return;
-    };
-    let label_width = UnicodeWidthStr::width(label.as_str());
+    }
+    let label_width = spans.iter().map(|span| UnicodeWidthStr::width(span.text.as_str())).sum::<usize>();
     let Some(bottom) = lines.last_mut() else {
         return;
     };
@@ -11291,16 +11306,42 @@ fn attach_prompt_footer(
     // the terminal's protected autowrap cell therefore remains untouched.
     bottom.text = " ".repeat(padding_width - label_width - right_padding);
     bottom.tail.clear();
-    bottom.tail.push(PaintSpan {
-        text: label,
-        tone: Tone::History,
-        bold: false,
-    });
+    bottom.tail.extend(spans);
     bottom.tail.push(PaintSpan {
         text: " ".repeat(right_padding),
         tone: Tone::UserPromptPadding,
         bold: false,
     });
+}
+
+fn prompt_footer_spans(
+    history: Option<(u64, &str, bool)>,
+    response_duration: Option<Duration>,
+    response_agent: Option<AgentMode>,
+) -> Vec<PaintSpan> {
+    let mut spans = Vec::new();
+    let Some(agent) = response_agent else {
+        if let Some(text) = prompt_footer_label(history, response_duration) {
+            spans.push(PaintSpan { text, tone: Tone::History, bold: false });
+        }
+        return spans;
+    };
+    if let Some(label) = prompt_footer_label(history, None) {
+        spans.push(PaintSpan { text: format!("{label}  "), tone: Tone::History, bold: false });
+    }
+    spans.push(PaintSpan {
+        text: agent.label().to_owned(),
+        tone: agent_prompt_tone(agent),
+        bold: false,
+    });
+    if let Some(duration) = response_duration {
+        spans.push(PaintSpan {
+            text: format!(" · {}", format_elapsed(duration.as_secs())),
+            tone: Tone::History,
+            bold: false,
+        });
+    }
+    spans
 }
 
 /// Wall-clock elapsed shared by the activity row and completed prompt footer.
@@ -18250,6 +18291,18 @@ mod tests {
         let subagent = test_subagent("Explore", "", "Grep(fn login)", 4);
 
         assert_eq!(painted(&subagent_line(&subagent, 0, 80)), " •  Explore · 4s");
+    }
+
+    #[test]
+    fn subagent_row_names_drop_the_root_path_and_read_as_words() {
+        let codex = test_subagent("/root/eghis2_daily_popup", "", "", 28);
+        let claude = test_subagent("devez-reviewer", "변경 검토", "", 3);
+
+        assert_eq!(painted(&subagent_line(&codex, 0, 80)), " •  eghis2 daily popup · 28s");
+        assert_eq!(
+            painted(&subagent_line(&claude, 1, 80)),
+            " •  devez reviewer · 변경 검토 · 3s"
+        );
     }
 
     #[test]
@@ -26107,6 +26160,32 @@ mod tests {
         assert!(painted(footer).ends_with("7s  "));
         assert!(!painted(footer).contains("·"));
         assert_eq!(footer.tail[0].tone, Tone::History);
+    }
+
+    #[test]
+    fn prompt_footer_colors_only_the_processing_agent() {
+        for agent in crate::agent::BUILTIN {
+            for chat in [false, true] {
+                for history in [None, Some((99, "+1 Response", false)), Some((99, "+1 Response", true))] {
+                    for duration in [None, Some(Duration::from_secs(12))] {
+                        let mut prompt = Block::new(BlockKind::User, "gpt-5.6-luna", "짧음");
+                        prompt.response_agent = Some(agent);
+                        prompt.response_duration = duration;
+                        let lines = user_prompt_lines_with_history(&prompt, 80, history, chat);
+                        let footer = lines.iter().find(|line| line.tail.iter().any(|span| span.text == agent.label())).expect("agent footer");
+                        let name = footer.tail.iter().find(|span| span.text == agent.label()).unwrap();
+                        assert_eq!(name.tone, agent_prompt_tone(agent));
+                        assert!(painted_line_width(footer) < 80);
+                        if duration.is_some() {
+                            assert!(painted(footer).contains(&format!("{} · 12s", agent.label())));
+                            assert_eq!(footer.tail.iter().find(|span| span.text == " · 12s").unwrap().tone, Tone::History);
+                        } else {
+                            assert!(!painted(footer).contains("12s"));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

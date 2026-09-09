@@ -3817,7 +3817,8 @@ async fn execute_action(
             }
         }
         Action::RpcResponse { id, result } => {
-            if let Err(error) = server.respond(id, result) {
+            if let Err(error) = server.respond(id, result.clone()) {
+                state.restore_failed_question_response(&result);
                 state.push_notice(BlockKind::Error, "응답 전송 실패", error.to_string());
             }
         }
@@ -4520,6 +4521,7 @@ const CODEX_QUESTION_INSTRUCTIONS: &str = concat!(
     "사용자에게 선택이나 확인이 필요하면 반드시 request_user_input 도구를 단독 호출한다. ",
     "질문을 다른 도구와 병렬 호출하지 말고, 사용자 답변이 도착할 때까지 후속 작업과 최종 응답을 멈춘다. ",
     "request_user_input_async는 사용하지 않는다. ",
+    "직접 입력한 답변도 사용자의 답변으로 취급하고, 선택지나 권장값으로 임의 치환하지 않는다. ",
     "취소, 빈 답변, 도구 오류, 시간 경과를 승인이나 선택으로 해석하지 않는다. ",
     "이 경우 작업을 중단하고 사용자의 새 지시를 기다린다.\n",
 );
@@ -4567,6 +4569,8 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 무엇을 알아냈는지 담기지 않은 진행 문장은 쓰지 않는다. ",
     "`다음 부분을 이어서 확인하겠습니다.`, `이어서 진행하겠습니다.`, `계속 확인하겠습니다.`처럼 ",
     "다음에 무엇을 왜 보는지 없는 문장은 같은 응답에서 한 번도 쓰지 않는다.\n",
+    "서브에이전트 규칙: spawn_agent로 하위 에이전트를 띄울 때 task_name은 그 이름만 보고도 무슨 작업을 하는지 알 수 있게 대상과 동작을 담은 영문 소문자·숫자·밑줄 이름으로 짓는다. ",
+    "예: `eghis2_daily_popup_add`, `login_timeout_fix`. `worker`, `agent1`처럼 작업이 드러나지 않는 이름은 쓰지 않는다.\n",
     "계획 규칙:\n",
     "- 실행 단계가 두 개 이상이거나 도구를 두 번 이상 호출할 작업, 설계 판단이 필요한 작업에서는 첫 작업 도구 호출 전에 반드시 `update_plan`을 호출해 짧은 계획을 먼저 세운다. 진행 안내 문장, 조사 항목 나열, 답변 본문의 불릿은 `update_plan`을 대신하지 않는다.\n",
     "- 단순 질문, 단 한 번의 고립된 조회, 한 줄 수정처럼 도구 한 번으로 끝난다고 확신할 수 있는 요청에만 계획을 만들지 않는다. 한 번으로 끝날지 확신할 수 없으면 반드시 계획부터 만든다. 첫 작업 도구를 호출한 뒤 두 번째 도구 앞에서 계획을 만드는 것은 지침 위반이다.\n",
@@ -4611,6 +4615,8 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "동시에 `in_progress`인 Task는 하나만 두고, 현재 Task를 `completed`로 바꾼 뒤 다음 Task를 `in_progress`로 바꾸고 해당 작업을 시작한다. ",
     "각 Task의 첫 Read, Grep, Glob, Bash 등 작업 도구를 호출하기 전에 그 Task를 `in_progress`로 바꾸고, 그 작업이 끝난 직후 `completed`로 바꾼다. ",
     "종료 직전에 여러 Task를 한꺼번에 `completed`로 바꾸지 않는다.\n",
+    "서브에이전트 규칙: Agent 도구를 호출할 때 name 인자를 반드시 넣고, 그 이름만 보고도 무슨 작업을 하는지 알 수 있게 대상과 동작을 담은 영문 소문자·숫자·밑줄 이름으로 짓는다. ",
+    "예: `eghis2_daily_popup_add`, `login_timeout_fix`. `worker`, `agent1`처럼 작업이 드러나지 않는 이름은 쓰지 않는다.\n",
     "답변 형식 규칙:\n",
     "- 서론, 인사, 맺음말 요약을 쓰지 않고 결론부터 쓴다.\n",
     "- 제공자나 역할과 관계없이 사용자에게 보이는 항목명·상태·판정은 쉬운 한국어로 쓴다. 영어 판정 코드는 기술 식별자로 취급하지 않는다. 다른 에이전트의 보고를 전달할 때도 이 규칙을 적용하되, 별도 규격이 있는 내부 기록은 유지한다.\n",
@@ -7596,7 +7602,7 @@ mod tests {
         ClaudeSessionSettings {
             model: "claude:opus".to_owned(),
             effort: "xhigh".to_owned(),
-            permission_mode: "bypassPermissions".to_owned(),
+            permission_mode: "auto".to_owned(),
         }
     }
 
@@ -7622,7 +7628,7 @@ mod tests {
             params
                 .pointer("/claudePermissionMode")
                 .and_then(Value::as_str),
-            Some("bypassPermissions")
+            Some("auto")
         );
         assert!(params.get("model").is_none());
         assert!(params.get("effort").is_none());
@@ -7846,6 +7852,10 @@ mod tests {
             assert!(rules.contains("필요한 질문을 일반 text로 다시 보여 주고"));
             assert!(rules.contains("결론 정리"));
             assert!(rules.contains("종료 직전에 여러 Task를 한꺼번에"));
+        }
+        // 서브에이전트 행은 이름만 보이므로 두 지침 모두 작업이 드러나는 이름을 요구한다.
+        for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS] {
+            assert!(rules.contains("무슨 작업을 하는지 알 수 있게"));
         }
         // The rules kept naming the notice "진행 안내", so the model started
         // printing that very term as a heading; the ban has to say the term is

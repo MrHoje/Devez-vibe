@@ -74,6 +74,13 @@ Claude Agent SDK 업데이트 영향 확인해
 
 ## 확인 기록
 
+### 자동 승인 모드 고정
+
+- 사용자 지시에 따라 Claude는 `auto`로 고정한다. 기존 `bypassPermissions` 우선 시도와 대체 모드 분기를 제거했고, `allowDangerouslySkipPermissions`도 설정하지 않는다.
+- 초기화는 도구를 실행하지 않는 `default`에서 시작한 뒤 SDK의 `setPermissionMode("auto")` 성공을 확인하고 세션을 공개한다. 자동 모드가 정책상 거절되면 다른 모드로 몰래 전환하지 않고 오류를 반환한다.
+- 새 대화와 재개 요청은 과거에 저장된 모드와 관계없이 자동 모드를 사용한다. 고정 모드 표시 및 `/status`도 자동 승인 검토로 맞췄다.
+- 브리지 자체 검사와 실제 SDK 세션 시작·재개 후 `session/permissionMode` 응답의 `auto`를 확인했다. 지원하지 않는 모델이나 조직에서 자동 모드를 거절하는 경우는 우회하지 않는다.
+
 | 날짜 | 확인 SDK / Claude Code 버전 | 결과 | 비고 |
 | --- | --- | --- | --- |
 | 2026-08-13 | 0.3.231 / 2.1.231 | 버전 상향 | 0.3.223 → 0.3.231. 브리지가 쓰는 `Query` 메서드 계약은 그대로다. 신규 타입(`OnElicitation`/`OnUserDialog`의 `requestId`·null 반환, `terminal_slash_commands`, `policyHelpers`, `dialogExpiry`, `crossSessionInbound`, plugin `command` 소스, AWS sigv4 정책)은 모두 Devez Vibe가 쓰지 않는 경로라 미적용. 상향으로 들어오는 수정: 공백뿐인 메시지의 400, Windows 확장 길이·UNC 경로 처리, 좁은 터미널·비문자열 도구 인자 크래시, `/model` 이후 이전 모델 되돌아감, 스트리밍 중 응답 일부 소실·중복. `set_model` 중간 전환은 Devez Vibe가 모델을 turn 시작에만 적용하는 설계라 미적용(steer는 진행 중 turn에 합류). |

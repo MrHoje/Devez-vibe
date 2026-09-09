@@ -16,6 +16,82 @@ use std::{
 use tokio::time::{Instant, timeout};
 
 #[tokio::test]
+#[ignore = "실제 Codex 로그인과 네 모델 호출 필요"]
+async fn live_codex_natural_question_delivery() {
+    let results = futures_util::stream::iter(["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"])
+        .map(|model| async move {
+            let mut server = AppServer::spawn(Path::new("codex"), None).await.unwrap();
+            let result = std::panic::AssertUnwindSafe(async {
+                server.initialize().await.unwrap();
+                let response = server.request("thread/start", json!({
+                    "model": model, "ephemeral": true, "cwd": std::env::temp_dir(),
+                    "approvalPolicy": "never", "permissions": ":read-only",
+                    "developerInstructions": crate::DEVEZ_INSTRUCTIONS
+                })).await.unwrap();
+                assert_eq!(response["model"], model);
+                let mut state = AppState::new(response["thread"]["id"].as_str().unwrap().into(),
+                    std::env::temp_dir().to_string_lossy().into(), "시험".into(), Vec::new(), model, Some("low"));
+                start(&server, &mut state, model,
+                    "화면 색상을 밝게 또는 어둡게 중 제가 고르게 질문해 주세요. 제가 답하기 전에는 최종 답변을 하지 말고, 답변을 받은 뒤 그 값만 말하세요. 목록 이외의 문자열을 직접 입력해도 그 문자열을 바꾸지 말고 그대로 최종 답변하세요. 파일이나 셸 작업은 필요 없습니다.").await;
+                let mut native = false;
+                let mut async_question_seen = false;
+                loop {
+                    match timeout(Duration::from_secs(120), server.next_event()).await.unwrap().unwrap() {
+                        ServerEvent::Request { id, method, params } => {
+                            assert_eq!(method, "item/tool/requestUserInput");
+                            assert!(matches!(state.begin_server_request(id, &method, &params), Action::None));
+                            native = true;
+                            break;
+                        }
+                        ServerEvent::Notification { method, params } => {
+                            match state.reject_unanswered_question(&method, &params) {
+                                Some(Action::Interrupt) => {
+                                    async_question_seen = true;
+                                    server.request("turn/interrupt", json!({"threadId": state.thread_id, "turnId": state.turn_id})).await.unwrap();
+                                }
+                                Some(Action::None) => {}
+                                Some(_) => panic!("질문 연결 실패: {model}"),
+                                None => state.handle_notification(&method, &params),
+                            }
+                            if method == "turn/completed" {
+                                assert!(async_question_seen, "질문 없이 종료됨: {model}");
+                                break;
+                            }
+                        }
+                        ServerEvent::Closed(message) => panic!("{message}"),
+                        _ => {}
+                    }
+                }
+                assert!(state.awaiting_input());
+                hold_question(&mut server, &mut state, &std::env::temp_dir().join("devez-natural-question-no-file"), 5).await;
+                for _ in 0..20 {
+                    if state.pending_text_input_target().is_some() { break; }
+                    state.handle_key(KeyEvent::from(KeyCode::Down));
+                }
+                assert!(state.pending_text_input_target().is_some(), "직접 입력 칸으로 이동하지 못함: {model}");
+                let answer = format!("답변_{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos());
+                state.handle_paste(&answer);
+                match state.handle_key(KeyEvent::from(KeyCode::Enter)) {
+                    Action::RpcResponse { id, result } => {
+                        assert!(native);
+                        assert!(result.to_string().contains(&answer), "실제 전송할 답변이 다름: {model} {result}");
+                        server.respond(id, result).unwrap();
+                    }
+                    Action::Submit(text) => { assert!(!native); start(&server, &mut state, model, &text).await; }
+                    _ => panic!("실제 질문 답변 제출 실패: {model}"),
+                }
+                let response = finish(&mut server, &mut state, false).await;
+                assert!(response.contains(&answer), "답변이 최종 응답에 없음: {model} {response}");
+                println!("검증 통과: {model} 실제 지침·자연어 질문·직접 입력·최종 응답");
+            }).catch_unwind().await;
+            server.shutdown().await;
+            (model, result)
+        }).buffer_unordered(4).collect::<Vec<_>>().await;
+    let failed = results.iter().filter(|(_, result)| result.is_err()).map(|(model, _)| *model).collect::<Vec<_>>();
+    assert!(failed.is_empty(), "자연어 질문 검증 실패: {failed:?}");
+}
+
+#[tokio::test]
 #[ignore = "실제 Codex 로그인과 모델 호출 필요"]
 async fn live_codex_async_question_recovery() {
     let model = "gpt-6-astra";
@@ -47,6 +123,10 @@ async fn live_codex_async_question_recovery() {
             match event {
                 ServerEvent::Notification { method, params } => {
                     if let Some(action) = state.reject_unanswered_question(&method, &params) {
+                        if matches!(action, Action::None) {
+                            assert_eq!(method, "turn/completed");
+                            break;
+                        }
                         assert!(matches!(action, Action::Interrupt), "예상하지 않은 복구 동작");
                         assert!(state.awaiting_input());
                         free_text = params.pointer("/item/questions/0/options")
@@ -89,8 +169,9 @@ async fn live_codex_async_question_recovery() {
             panic!("비동기 질문 답변이 새 작업으로 전달되지 않음");
         };
         assert!(answer.contains("첫째"));
-        start(&server, &state, model, &answer).await;
-        finish(&mut server, &mut state, false).await;
+        start(&server, &mut state, model, &answer).await;
+        let response = finish(&mut server, &mut state, false).await;
+        assert!(response.contains("첫째"), "실제 최종 응답에 사용자 답변이 없음: {response}");
     }).catch_unwind().await;
     server.shutdown().await;
     if let Err(panic) = result {
@@ -106,20 +187,20 @@ async fn event(server: &mut AppServer, state: &mut AppState) -> ServerEvent {
     if let ServerEvent::Notification { method, params } = &event {
         assert!(
             state.reject_unanswered_question(method, params).is_none(),
-            "비동기 질문이 도착함"
+            "예상하지 않은 질문 상태 변경: {method} {params}"
         );
         state.handle_notification(method, params);
     }
     event
 }
 
-async fn start(server: &AppServer, state: &AppState, model: &str, prompt: &str) {
+async fn start(server: &AppServer, state: &mut AppState, model: &str, prompt: &str) {
     start_with_effort(server, state, model, "low", prompt).await;
 }
 
 async fn start_with_effort(
     server: &AppServer,
-    state: &AppState,
+    state: &mut AppState,
     model: &str,
     effort: &str,
     prompt: &str,
@@ -127,8 +208,11 @@ async fn start_with_effort(
     let mut params = json!({
         "threadId": state.thread_id, "model": model, "effort": effort,
         "permissions": ":danger-full-access",
-        "input": [{"type": "text", "text": prompt}]
+        "additionalContext": crate::turn_additional_context(state.vibe_mode(), state.agent_mode(), None),
+        "input": state.turn_input(prompt.to_owned())
     });
+    super::prepare_codex_turn_context(&mut params);
+    super::apply_codex_tool_policy(&mut params);
     apply_codex_question_mode(&mut params).unwrap();
     server.request("turn/start", params).await.unwrap();
 }
@@ -220,10 +304,14 @@ async fn hold_question(server: &mut AppServer, state: &mut AppState, marker: &Pa
     assert!(state.awaiting_input(), "질문이 저절로 닫힘");
 }
 
-async fn finish(server: &mut AppServer, state: &mut AppState, cancelled: bool) {
+async fn finish(server: &mut AppServer, state: &mut AppState, cancelled: bool) -> String {
+    let mut response = String::new();
     loop {
         match event(server, state).await {
             ServerEvent::Notification { method, params } => {
+                if method == "item/completed" && params.pointer("/item/type").and_then(Value::as_str) == Some("agentMessage") {
+                    response.push_str(params.pointer("/item/text").and_then(Value::as_str).unwrap_or_default());
+                }
                 if cancelled {
                     assert_ne!(method, "item/agentMessage/delta", "취소 후 응답이 이어짐");
                     if method == "item/started" {
@@ -246,7 +334,7 @@ async fn finish(server: &mut AppServer, state: &mut AppState, cancelled: bool) {
                         },
                         "{params}"
                     );
-                    return;
+                    return response;
                 }
             }
             ServerEvent::Request { method, params, .. } => {
@@ -295,7 +383,7 @@ async fn exercise_session(server: &mut AppServer, model: &str, root: &Path, stam
         model,
         Some("low"),
     );
-    start(server, &state, model,
+    start(server, &mut state, model,
         "먼저 update_plan으로 '1. 선택 대기' 작업을 in_progress로 등록하세요. 이어서 request_user_input으로 첫째 또는 둘째를 고르는 질문 하나를 하세요. 답변 전에는 파일을 만들거나 다른 도구를 쓰지 마세요. 답변을 받으면 choice.txt에 사용자 답변을 그대로 적으세요. 직접 입력 답변도 그대로 사용하세요.").await;
     let id = await_question(server, &mut state, true).await;
     hold_question(server, &mut state, &root.join("choice.txt"), 90).await;
@@ -319,11 +407,12 @@ async fn exercise_session(server: &mut AppServer, model: &str, root: &Path, stam
     assert_eq!(
         std::fs::read_to_string(root.join("choice.txt"))
             .unwrap()
+            .trim_start_matches('\u{feff}')
             .trim(),
         answer
     );
 
-    start(server, &state, model,
+    start(server, &mut state, model,
         "request_user_input으로 첫째 또는 둘째를 고르는 질문 하나를 하세요. 답변을 받기 전에는 다른 작업을 하지 마세요. 답변을 받으면 cancelled.txt에 답변을 적으세요.").await;
     await_question(server, &mut state, false).await;
     hold_question(server, &mut state, &root.join("cancelled.txt"), 30).await;
@@ -356,12 +445,13 @@ async fn exercise_session(server: &mut AppServer, model: &str, root: &Path, stam
     finish(server, &mut state, true).await;
     assert!(!root.join("cancelled.txt").exists());
 
-    start(server, &state, model,
+    start(server, &mut state, model,
         "이전 질문은 취소했습니다. 새 작업으로 resumed.txt에 resumed를 적으세요. cancelled.txt는 만들지 마세요. 추가 질문은 필요하지 않습니다.").await;
     finish(server, &mut state, false).await;
     assert_eq!(
         std::fs::read_to_string(root.join("resumed.txt"))
             .unwrap()
+            .trim_start_matches('\u{feff}')
             .trim(),
         "resumed"
     );
@@ -465,7 +555,7 @@ async fn matrix_case(model: &str, effort: &str) {
         assert_eq!(response["model"], model, "다른 모델로 대체됨");
         let mut state = AppState::new(response["thread"]["id"].as_str().unwrap().into(), root.to_string_lossy().into(),
             "시험".into(), Vec::new(), model, Some(effort));
-        start_with_effort(&server, &state, model, effort,
+        start_with_effort(&server, &mut state, model, effort,
             "먼저 update_plan으로 '1. 선택 대기' 작업을 in_progress로 등록하세요. 다음으로 request_user_input을 호출해 '첫째'와 '둘째' 두 선택지를 주세요. 답변이 도착하기 전에는 후속 작업이나 최종 답변을 하지 마세요. 답변을 받으면 선택된 항목만 그대로 말하세요.").await;
         await_question(&mut server, &mut state, true).await;
         hold_question(&mut server, &mut state, &root.join(format!("devez-never-{model}-{effort}.txt")), 10).await;
@@ -544,7 +634,7 @@ async fn live_codex_question_legacy_resume() {
             "developerInstructions": crate::CODEX_QUESTION_INSTRUCTIONS})).await.unwrap();
         assert_eq!(response["model"], model);
         let mut state = AppState::new(id.clone(), root.to_string_lossy().into(), "시험".into(), Vec::new(), model, Some("low"));
-        start(&resumed, &state, model,
+        start(&resumed, &mut state, model,
             "먼저 update_plan으로 '1. 재개 확인'을 in_progress로 등록하세요. 다음으로 request_user_input으로 첫째와 둘째 중 선택하게 하고, 답변 후 선택한 값만 말하세요. 다른 도구는 사용하지 마세요.").await;
         await_question(&mut resumed, &mut state, true).await;
         hold_question(&mut resumed, &mut state, &root.join("never.txt"), 10).await;
@@ -584,7 +674,7 @@ async fn live_codex_question_disconnect() {
             assert_eq!(response["model"], model);
             let mut state = AppState::new(response["thread"]["id"].as_str().unwrap().into(), root.to_string_lossy().into(),
                 "시험".into(), Vec::new(), model, Some("low"));
-            start(&server, &state, model, "request_user_input으로 첫째와 둘째 중 하나를 고르게 하세요. 다른 도구를 쓰지 말고 답변을 기다리세요. 답변을 받은 경우에만 disconnected.txt에 답변을 쓰세요.").await;
+            start(&server, &mut state, model, "request_user_input으로 첫째와 둘째 중 하나를 고르게 하세요. 다른 도구를 쓰지 말고 답변을 기다리세요. 답변을 받은 경우에만 disconnected.txt에 답변을 쓰세요.").await;
             await_question(&mut server, &mut state, false).await;
             hold_question(&mut server, &mut state, &root.join("disconnected.txt"), 5).await;
             state.fallback_from_codex("시험용 연결 종료");
