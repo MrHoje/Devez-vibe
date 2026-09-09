@@ -24,6 +24,7 @@ mod state;
 mod subagents;
 mod syntax;
 mod terminal_width;
+mod terminal_graphics;
 mod theme;
 mod update;
 
@@ -456,6 +457,8 @@ async fn run_after_startup(
     draw(state, renderer)?;
     // Startup's own stream is gone by now, so the shared one can take the terminal.
     input_hub::install();
+    input_hub::query_graphics().await;
+    if terminal_graphics::size().is_some() { renderer.relayout()?; }
 
     let (update_tx, update_rx) = mpsc::channel(1);
     tokio::spawn(async move {
@@ -2024,6 +2027,7 @@ async fn event_loop(
                 // sending a `Resize`, so the size is polled here as well.
                 resize.observe(terminal_size());
                 if resize.settled() {
+                    input_hub::query_graphics().await;
                     renderer.relayout()?;
                     redraw = true;
                     animation_tick = false;
@@ -4516,6 +4520,8 @@ fn config_value_write_params(key_path: &str, value: &str) -> Value {
 // The app owns the active role and waits for explicit question answers.
 // Keep Codex in Default mode so its normal development tools remain available.
 const CODEX_QUESTION_INSTRUCTIONS: &str = concat!(
+    "선택지의 label에는 짧은 항목명만 넣는다. 설명이 필요하고 도구가 description을 지원하면 description에 별도로 넣는다.\n",
+    "설명을 label에 괄호·대시·줄바꿈으로 합쳐 넣지 않는다. description을 지원하지 않는 도구에서는 항목명만 전달한다. 설명이 불필요하면 억지로 만들지 않는다.\n",
     "작업 범위와 계획·구현·검토 여부는 현재 DevezVibe 에이전트 역할과 사용자 지시를 따른다. ",
     "현재 역할이 허용하는 파일 수정과 명령 실행을 실제로 수행한다.\n",
     "사용자에게 선택이나 확인이 필요하면 반드시 request_user_input 도구를 단독 호출한다. ",

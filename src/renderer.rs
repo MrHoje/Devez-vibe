@@ -266,6 +266,17 @@ impl Block {
         self.response_duration
     }
 
+    pub fn question_answers(answers: Vec<(String, String)>) -> Self {
+        let body = answers.iter().map(|(question, answer)| {
+            format!("{}:\n  ↳ {answer}", question.trim_end_matches([':', '：', '?', '？']))
+        }).collect::<Vec<_>>().join("\n\n");
+        let mut block = Self::new(BlockKind::User, "질문 답변", body);
+        block.children = answers.into_iter().map(|(question, answer)| {
+            Self::new(BlockKind::User, question, answer)
+        }).collect();
+        block
+    }
+
     pub fn shell_group(kind: BlockKind, title: impl Into<String>, children: Vec<Block>) -> Self {
         let child_id = children.first().map(Block::id);
         let mut block = Self::new(kind, title, "");
@@ -2483,7 +2494,7 @@ impl Renderer {
             self.previous_lines.get(row).is_some_and(|line| {
                 matches!(
                     line.tone,
-                    Tone::AssistantBubbleHalf | Tone::UserPromptPadding
+                    Tone::AssistantBubbleHalf | Tone::UserPromptPadding | Tone::UserPromptHalf
                 )
             })
         };
@@ -2512,7 +2523,7 @@ impl Renderer {
             return false;
         };
         match line.tone {
-            Tone::AssistantBubbleHalf => line.text.starts_with('▀'),
+            Tone::AssistantBubbleHalf | Tone::UserPromptHalf => line.text.starts_with('▀'),
             Tone::UserPromptPadding => screen_row
                 .checked_sub(1)
                 .and_then(|row| self.previous_lines.get(row))
@@ -4371,7 +4382,8 @@ fn paint_line_into_frame(
     hovered_columns: Option<Range<usize>>,
     background_width: Option<usize>,
 ) {
-    let background = row_background(line.tone);
+    let question_card = is_question_card_line(line);
+    let background = if question_card { Some(theme::palette().user_prompt_bg) } else { row_background(line.tone) };
     let bubble_background = bubble_background(line);
     let boxed_content = boxed_split_content_columns(line);
     if let Some(background) = background {
@@ -4388,7 +4400,9 @@ fn paint_line_into_frame(
                 .unwrap_or(line.prefix.as_str());
             let prefix_width = boxed_content.as_ref().map_or(0, |columns| columns.start)
                 + UnicodeWidthStr::width(prompt_prefix);
-            let start = if chat_layout() {
+            let start = if question_card {
+                prefix_width.saturating_sub(if line.prefix.ends_with("▌ ") || line.prefix.ends_with("█ ") { 2 } else { 1 })
+            } else if chat_layout() {
                 let marker_width = usize::from(prompt_prefix.ends_with("› "))
                     * (CHAT_BUBBLE_PADDING + CHAT_BUBBLE_RIGHT_GAP + 2);
                 prefix_width.saturating_sub(marker_width + 1)
@@ -4458,7 +4472,7 @@ fn paint_line_into_frame(
         .as_ref()
         .filter(|columns| columns.start < prefix_width)
         .and(history_background);
-    let prefix_background = if boxed_content.is_some() {
+    let prefix_background = if boxed_content.is_some() || question_card {
         word_background(line.prefix_tone)
     } else {
         history_prefix_background.or_else(|| {
@@ -4467,10 +4481,20 @@ fn paint_line_into_frame(
                 .or(background)
         })
     };
+    let half_question = line.tone == Tone::UserPromptHalf;
+    let prefix_split = if question_card {
+        line.prefix.rfind('▌').unwrap_or_else(|| line.prefix.len().saturating_sub(1))
+    } else if half_question {
+        line.prefix.rfind(['▖', '▘']).unwrap_or(line.prefix.len())
+    } else { line.prefix.len() };
+    for (prefix, prefix_background) in [
+        (&line.prefix[..prefix_split], prefix_background),
+        (&line.prefix[prefix_split..], if half_question { Some(theme::palette().user_prompt_bg) } else if question_card { background } else { prefix_background }),
+    ] {
     paint_text_into_frame(
         frame,
         row,
-        &line.prefix,
+        prefix,
         &mut column,
         line.prefix_tone,
         false,
@@ -4478,6 +4502,7 @@ fn paint_line_into_frame(
         selected_columns.as_ref(),
         text_hovered_columns,
     );
+    }
     paint_text_into_frame(
         frame,
         row,
@@ -4895,6 +4920,9 @@ fn emit_synchronized_frame_diff_with_full_rows(
             result = emit_frame_diff(out, diff_previous.as_ref().or(previous), current);
         }
     }
+    if result.is_ok() {
+        result = emit_question_corner_images(out, previous, current, full_rows, repaint_full_frame, crate::terminal_graphics::size());
+    }
     if let Some((column, row, show)) = cursor {
         queue!(out, MoveTo(column, row))?;
         if show && (!cursor_shown || hide_cursor) {
@@ -4907,6 +4935,35 @@ fn emit_synchronized_frame_diff_with_full_rows(
         (Ok(()), Err(error)) => Err(error.into()),
         (Ok(()), Ok(())) => Ok(()),
     }
+}
+
+fn emit_question_corner_images(
+    out: &mut impl Write,
+    previous: Option<&CellFrame>,
+    current: &CellFrame,
+    full_rows: &[usize],
+    force: bool,
+    pixels: Option<(u16, u16)>,
+) -> Result<()> {
+    let Some((width, height)) = pixels else { return Ok(()); };
+    let previous = previous.filter(|old| old.width == current.width && old.height == current.height);
+    for row in 0..current.height {
+        let range = row * current.width..(row + 1) * current.width;
+        if !force && !full_rows.contains(&row) && previous.is_some_and(|old| old.cells[range.clone()] == current.cells[range]) {
+            continue;
+        }
+        for col in 1..current.width.saturating_sub(1) {
+            let cell = current.cell(col, row);
+            let top = match cell.glyph.as_str() { "▖" => true, "▘" => false, _ => continue };
+            let (Some(line), Some(fill)) = (cell.style.foreground, cell.style.background) else { continue; };
+            let right = current.cell(col + 1, row);
+            if right.glyph != if top { "▄" } else { "▀" } || right.style.foreground != Some(fill) { continue; }
+            let outside = current.cell(col - 1, row).style.background.unwrap_or(theme::palette().background);
+            let Some(data) = crate::terminal_graphics::corner(width, height, top, line, fill, outside) else { continue; };
+            queue!(out, Print("\x1b7"), MoveTo(col as u16, row as u16), Print(data), Print("\x1b8"))?;
+        }
+    }
+    Ok(())
 }
 
 fn frame_changed_outside_row(
@@ -5531,6 +5588,7 @@ enum Tone {
     StatusSeparator,
     UserPrompt,
     UserPromptPadding,
+    UserPromptHalf,
     AssistantBubble,
     AssistantBubbleHalf,
     Model56,
@@ -6544,7 +6602,7 @@ fn selection_columns_for_line(
     // A bubble's rounded edge rows are chrome, not text.
     if matches!(
         line.tone,
-        Tone::AssistantBubbleHalf | Tone::UserPromptPadding
+        Tone::AssistantBubbleHalf | Tone::UserPromptPadding | Tone::UserPromptHalf
     ) {
         return None;
     }
@@ -10630,6 +10688,7 @@ fn block_lines_with_mode_at(
     if is_help_block(block) {
         return help_card_lines(block, width);
     }
+
     if matches!(block.kind, BlockKind::Error) && block.title == "Unknown command" {
         return wrapped_line(
             "● ",
@@ -11124,6 +11183,9 @@ fn user_prompt_lines_with_history(
     history: Option<(u64, &str, bool)>,
     chat_layout: bool,
 ) -> Vec<PaintLine> {
+    if !block.children.is_empty() && width >= 12 {
+        return question_answer_lines(block, width, history);
+    }
     let marker_tone = chrome_model_tone(&block.title).unwrap_or(Tone::User);
     if !chat_layout {
         // 세로선은 블록에 기록된 전송 시점 모델 색을 쓰고, 모델을 못 알아보면 기존 강조색으로 돌아간다.
@@ -11249,6 +11311,60 @@ fn user_prompt_lines_with_history(
         lines.push(PaintLine::blank());
     }
     lines
+}
+
+fn question_answer_lines(block: &Block, width: u16, history: Option<(u64, &str, bool)>) -> Vec<PaintLine> {
+    let mut lines = Vec::new();
+    let indent = usize::from(width.saturating_sub(8)).min(6);
+    let branch_left = " ".repeat(indent - 4);
+    for (index, pair) in block.children.iter().enumerate() {
+        if index > 0 { lines.push(PaintLine::blank()); }
+        let last = index + 1 == block.children.len();
+        let mut question = pair.clone();
+        question.body = pair.title.clone();
+        question.title = block.title.clone();
+        if last {
+            question.response_duration = block.response_duration;
+            question.response_agent = block.response_agent;
+        }
+        let mut question_lines = user_prompt_lines_with_history(&question, width, history.filter(|_| last), false);
+        if last && history.is_some() { question_lines.pop(); }
+        lines.extend(question_lines);
+        let mut answer = pair.clone();
+        answer.title = block.title.clone();
+        let answer_lines = user_prompt_lines_with_history(&answer, width - indent as u16, None, false);
+        let last_row = answer_lines.len() - 1;
+        for (row, mut line) in answer_lines.into_iter().enumerate() {
+            if row == 0 || row == last_row {
+                let top = row == 0;
+                line.prefix = if top { "▖" } else { "▘" }.to_owned();
+                line.text = if top { "▄" } else { "▀" }.repeat(usize::from(width - 1) - indent - 1);
+                line.tone = Tone::UserPromptHalf;
+                line.tail.clear();
+                line.pick = None;
+            } else {
+                line.prefix = "▌ ".to_owned();
+            }
+            let gutter = match row {
+                0 => format!("{branch_left}╷   "),
+                1 => format!("{branch_left}└─▶ "),
+                _ => " ".repeat(indent),
+            };
+            line.prefix = format!("{gutter}{}", line.prefix);
+            line.pick = line.pick.map(|regions| regions.shifted(indent));
+            lines.push(line);
+        }
+    }
+    for line in &mut lines {
+        if matches!(line.tone, Tone::UserPrompt | Tone::UserPromptPadding) {
+            line.tail.push(PaintSpan { text: String::new(), tone: Tone::UserPrompt, bold: false });
+        }
+    }
+    lines
+}
+
+fn is_question_card_line(line: &PaintLine) -> bool {
+    line.tail.last().is_some_and(|span| span.text.is_empty() && span.tone == Tone::UserPrompt)
 }
 
 fn prompt_footer_label(
@@ -13251,24 +13367,34 @@ fn print_line_with_selection_bounded(
     hovered_columns: Option<Range<usize>>,
     background_width: Option<usize>,
 ) -> Result<()> {
-    let background = row_background(line.tone);
+    let question_card = is_question_card_line(line);
+    let background = if question_card { Some(theme::palette().user_prompt_bg) } else { row_background(line.tone) };
     let bubble_background = bubble_background(line);
-    if let Some(background) = background {
+    if let Some(background) = background.filter(|_| !question_card) {
         queue!(out, SetBackgroundColor(rgb_color(background)))?;
     }
     let mut column = 0;
+    let half_question = line.tone == Tone::UserPromptHalf;
+    let prefix_split = if question_card {
+        line.prefix.rfind('▌').unwrap_or_else(|| line.prefix.len().saturating_sub(1))
+    } else if half_question {
+        line.prefix.rfind(['▖', '▘']).unwrap_or(line.prefix.len())
+    } else { line.prefix.len() };
+    for (prefix, prefix_background) in [
+        (&line.prefix[..prefix_split], word_background(line.prefix_tone).or(bubble_background).or(background.filter(|_| !question_card))),
+        (&line.prefix[prefix_split..], if half_question { Some(theme::palette().user_prompt_bg) } else { background }),
+    ] {
     print_hovered_chunks(
         out,
-        &line.prefix,
+        prefix,
         &mut column,
         selected_columns.as_ref(),
         hovered_columns.as_ref(),
         line.prefix_tone,
         false,
-        word_background(line.prefix_tone)
-            .or(bubble_background)
-            .or(background),
+        prefix_background,
     )?;
+    }
     print_hovered_chunks(
         out,
         &line.text,
@@ -13526,7 +13652,7 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::StatusText => palette.status.text,
         Tone::StatusSeparator => palette.status.separator,
         Tone::UserPrompt => palette.foreground,
-        Tone::UserPromptPadding => palette.user_prompt_bg,
+        Tone::UserPromptPadding | Tone::UserPromptHalf => palette.user_prompt_bg,
         Tone::AssistantBubble => palette.foreground,
         Tone::AssistantBubbleHalf => blend(palette.background, palette.foreground, 20),
         Tone::Model56 => palette.model_gpt56,
@@ -23493,6 +23619,229 @@ mod tests {
     }
 
     #[test]
+    fn native_and_async_question_defaults_and_editing_paint_identically() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use crossterm::event::{KeyCode, KeyEvent};
+        use crate::state::AppState;
+
+        for question_count in [1, 2] {
+            for option_count in [0, 2, 12] {
+                let options = (1..=option_count).map(|i| format!("{i}.선택 항목 {i}")).collect::<Vec<_>>();
+                let questions = (0..question_count).map(|i| serde_json::json!({
+                    "id": format!("q{i}"), "question": "어떤 방법으로 진행할까요?",
+                    "options": options.iter().map(|label| serde_json::json!({"label": label})).collect::<Vec<_>>()
+                })).collect::<Vec<_>>();
+                let mut states = Vec::new();
+                for route in 0..3 {
+                    let model = if route == 0 { "claude:opus" } else { "gpt-5.6-sol" };
+                    let mut state = AppState::new("thread".into(), "cwd".into(), "account".into(), Vec::new(), model, None);
+                    if route == 2 {
+                        let questions = (0..question_count).map(|_| serde_json::json!({
+                            "title": "어떤 방법으로 진행할까요?", "options": options
+                        })).collect::<Vec<_>>();
+                        state.reject_unanswered_question("item/completed", &serde_json::json!({
+                            "item": {"id": "questions", "type": "agentMessage", "delivery": "async", "questions": questions}
+                        }));
+                    } else {
+                        let mut params = serde_json::json!({"questions": questions});
+                        if route == 0 {
+                            for question in params["questions"].as_array_mut().unwrap() {
+                                question["header"] = serde_json::json!("질문");
+                            }
+                            params = serde_json::json!({"encoding": "base64-json",
+                                "payload": STANDARD.encode(serde_json::to_vec(&params).unwrap())});
+                        }
+                        state.begin_server_request(serde_json::json!(1), "item/tool/requestUserInput", &params);
+                    }
+                    states.push(state);
+                }
+                for stage in 0..3 {
+                    for state in &mut states {
+                        if stage == 1 {
+                            for _ in 0..option_count { state.handle_key(KeyEvent::from(KeyCode::Down)); }
+                            state.handle_paste("직접 답변\n다음 줄".into());
+                        } else if stage == 2 && option_count > 0 {
+                            state.handle_key(KeyEvent::from(KeyCode::Up));
+                            if question_count > 1 { state.handle_key(KeyEvent::from(KeyCode::Tab)); }
+                        }
+                    }
+                    for width in [30, 80, 120] {
+                        let frames = states.iter().map(|state| {
+                            let view = state.view();
+                            let overlay = view.overlay.unwrap();
+                            assert_eq!(overlay.title, "질문");
+                            let frame = overlay_frame(&[], overlay, None, StatusArea {
+                                fallback: String::new(), line: None, composer_notice: None, composer_mode: None,
+                            }, width);
+                            frame.lines.into_iter().map(|line| (
+                                painted(&line), line.prefix_tone, line.tone, line.bold,
+                                line.tail.into_iter().map(|span| (span.text, span.tone, span.bold)).collect::<Vec<_>>()
+                            )).collect::<Vec<_>>()
+                        }).collect::<Vec<_>>();
+                        assert_eq!(frames[0], frames[1], "native: {question_count}/{option_count}/{stage}/{width}");
+                        assert_eq!(frames[0], frames[2], "async: {question_count}/{option_count}/{stage}/{width}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_graphics_repaints_only_the_changed_corner_rows() {
+        let block = Block::question_answers(vec![("질문".into(), "답변".into())]);
+        let lines = user_prompt_lines_with_history(&block, 40, None, false);
+        let mut frame = CellFrame::new(40, lines.len());
+        for (row, line) in lines.iter().enumerate() {
+            paint_line_into_frame(&mut frame, row, line, None, None, None);
+        }
+        let mut bytes = Vec::new();
+        emit_question_corner_images(&mut bytes, None, &frame, &[], false, Some((10,20))).unwrap();
+        let output = String::from_utf8(bytes).unwrap();
+        assert_eq!(output.matches("\x1bP0;1;0q").count(), 2);
+        let mut bytes = Vec::new();
+        emit_question_corner_images(&mut bytes, Some(&frame), &frame, &[], false, Some((10,20))).unwrap();
+        assert!(bytes.is_empty());
+        emit_question_corner_images(&mut bytes, Some(&frame), &frame, &[3], false, Some((10,20))).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap().matches("\x1bP0;1;0q").count(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "Windows Terminal의 별도 창에서 실제 그림 표시 검증"]
+    async fn live_native_question_corners() {
+        let _terminal = TerminalSession::enter(RenderMode::Fullscreen).unwrap();
+        crate::input_hub::install();
+        crate::input_hub::query_graphics().await;
+        assert!(crate::terminal_graphics::size().is_some());
+        let mut block = Block::question_answers(vec![("얇은 반 줄 모서리 검증".into(), "선택지 A".into())]);
+        block.title = "gpt-6-astra".into();
+        let lines = user_prompt_lines_with_history(&block, 70, None, false);
+        let mut frame = CellFrame::new(70, lines.len());
+        for (row, line) in lines.iter().enumerate() {
+            paint_line_into_frame(&mut frame, row, line, None, None, None);
+        }
+        let mut out = std::io::stdout();
+        execute!(out, Clear(ClearType::All)).unwrap();
+        emit_synchronized_frame_diff_with_full_rows(&mut out, None, &frame, &[], true, None, false).unwrap();
+        out.flush().unwrap();
+        if let Ok(path) = std::env::var("DEVEZ_GRAPHICS_TEST_RESULT") {
+            std::fs::write(path, "rendered").unwrap();
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+
+    #[test]
+    fn question_answer_cards_connect_outside_the_indented_answer() {
+        let mut block = Block::question_answers(vec![(
+            "어떤 방식으로 표시할까요?".into(),
+            "질문 아래에 답변 상자를 연결해서 표시".into(),
+        )]);
+        block.set_response_duration(Duration::from_secs(32));
+        for width in [12, 30, 80] {
+            let lines = user_prompt_lines_with_history(&block, width, Some((7, "응답 보기", false)), false);
+            let indent = usize::from(width.saturating_sub(8)).min(6);
+            let arrow = lines.iter().position(|line| line.prefix.contains("└─▶ ")).unwrap();
+            assert!(arrow > 0);
+            assert_eq!(lines.iter().filter(|line| line.tone == Tone::UserPromptPadding).count(), 2);
+            assert_eq!(lines.iter().filter(|line| line.tone == Tone::UserPromptHalf).count(), 2);
+            if width == 80 {
+                assert_eq!(lines.len(), 6);
+                assert_eq!(arrow, 4);
+                assert!(lines.iter().all(|line| line != &PaintLine::blank()));
+                assert!(lines[..arrow - 1].iter().any(|line| painted(line).contains("32s")));
+                assert!(lines[arrow - 1..].iter().all(|line| !painted(line).contains("32s")));
+            }
+            assert!(lines[..arrow].iter().any(|line| painted(line).contains("어떤")));
+            assert!(lines.iter().all(|line| painted_line_width(line) <= usize::from(width - 1)),
+                "width {width}: {:?}", lines.iter().map(painted).collect::<Vec<_>>());
+            assert_eq!(lines.iter().filter(|line| line.prefix.contains("└─▶")).count(), 1);
+            for line in &lines[arrow..] {
+                if let Some(picks) = &line.pick {
+                    assert!(picks.0.iter().all(|(start, end, _)| *start > indent && *end < usize::from(width)));
+                }
+            }
+            let previous_layout = chat_layout();
+            let frames = [false, true].map(|layout| {
+                set_chat_layout(layout);
+                let mut frame = CellFrame::new(usize::from(width), lines.len());
+                for (row, line) in lines.iter().enumerate() {
+                    paint_line_into_frame(&mut frame, row, line, None, None, None);
+                }
+                frame
+            });
+            set_chat_layout(previous_layout);
+            assert!(frames[0] == frames[1], "question card cells depend on chat layout");
+            let frame = &frames[0];
+            let bottom_row = lines.len() - 1;
+            for (row, glyph) in [(arrow - 1, "▄"), (bottom_row, "▀")] {
+                assert_eq!(frame.cell(indent, row).glyph, if row == arrow - 1 { "▖" } else { "▘" });
+                assert_eq!(frame.cell(indent, row).style.foreground, tone_rgb(chrome_model_tone(&block.title).unwrap_or(Tone::Accent)));
+                assert_eq!(frame.cell(indent, row).style.background, Some(theme::palette().user_prompt_bg));
+                assert_eq!(frame.cell(indent + 1, row).glyph, glyph);
+                assert_eq!(frame.cell(indent + 1, row).style.foreground, Some(theme::palette().user_prompt_bg));
+                assert_eq!(frame.cell(indent + 1, row).style.background, None);
+            }
+            assert_eq!(frame.cell(indent - 4, arrow - 2).glyph, if indent == 4 { "▌" } else { " " });
+            for row in [arrow - 1] {
+                assert_eq!(frame.cell(indent - 4, row).glyph, "╷");
+                assert_eq!(frame.cell(indent - 4, row).style.background, None);
+                assert_eq!(frame.cell(indent - 4, row).style.foreground, frame.cell(indent - 4, arrow).style.foreground);
+            }
+            assert_eq!(frame.cell(indent - 4, arrow).style.background, None);
+            assert_eq!(frame.cell(indent, arrow).glyph, "▌");
+            assert_eq!(frame.cell(indent - 4, arrow).style.foreground, tone_rgb(chrome_model_tone(&block.title).unwrap_or(Tone::Accent)));
+            assert_eq!(frame.cell(indent, arrow).style.background, Some(theme::palette().user_prompt_bg));
+            assert_eq!(frame.cell(indent + 1, arrow).style.background, Some(theme::palette().user_prompt_bg));
+            assert_eq!(frame.cell(indent + 2, arrow).style.background, Some(theme::palette().user_prompt_bg));
+            assert_eq!(frame.cell(usize::from(width - 2), arrow).style.background, Some(theme::palette().user_prompt_bg));
+            assert_eq!(frame.cell(usize::from(width - 1), arrow).style.background, None);
+            if width == 80 && let Ok(path) = std::env::var("DEVEZ_VIBE_QUESTION_PREVIEW") {
+                let rgb = |color: Rgb| vec![color.0, color.1, color.2];
+                let palette = theme::palette();
+                let cells = frame.cells.iter().map(|cell| serde_json::json!({
+                    "glyph": cell.glyph, "continuation": cell.continuation,
+                    "fg": rgb(cell.style.foreground.unwrap_or(palette.foreground)),
+                    "bg": rgb(cell.style.background.unwrap_or(palette.background))
+                })).collect::<Vec<_>>();
+                std::fs::write(path, serde_json::to_vec(&serde_json::json!({
+                    "width": frame.width, "height": frame.height, "cells": cells
+                })).unwrap()).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn question_half_padding_keeps_the_duration_on_the_question() {
+        let mut block = Block::question_answers(vec![("질문".into(), "가".repeat(10))]);
+        block.set_response_duration(Duration::from_secs(32));
+        let lines = user_prompt_lines_with_history(&block, 30, None, false);
+        let bottom = lines.last().unwrap();
+        assert_eq!(bottom.tone, Tone::UserPromptHalf);
+        assert!(bottom.text.chars().all(|ch| ch == '▀'));
+        assert!(bottom.tail.is_empty());
+        assert!(lines[..3].iter().any(|line| painted(line).contains("32s")));
+        assert!(lines[3..].iter().all(|line| !painted(line).contains("32s")));
+        assert!(lines.iter().all(|line| painted_line_width(line) <= 29));
+    }
+
+    #[test]
+    fn question_answer_cards_keep_multiline_text_and_multiple_pairs_separate() {
+        let block = Block::question_answers(vec![
+            ("첫 질문\n추가 설명".into(), "첫 답변\n\n  ↳ 직접 입력한 문구".into()),
+            ("둘째 질문".into(), "둘째 답변".into()),
+        ]);
+        let lines = user_prompt_lines_with_history(&block, 80, None, false);
+        assert_eq!(lines.len(), 16, "card padding remains without an extra question-answer gap");
+        assert_eq!(lines.iter().filter(|line| line.prefix.contains("└─▶")).count(), 2);
+        let text = lines.iter().map(painted).collect::<Vec<_>>().join("\n");
+        for expected in ["첫 질문", "추가 설명", "첫 답변", "↳ 직접 입력한 문구", "둘째 질문", "둘째 답변"] {
+            assert!(text.contains(expected));
+        }
+        let ordinary = Block::new(BlockKind::User, "질문 답변", block.body.clone());
+        assert!(user_prompt_lines_with_history(&ordinary, 80, None, false).iter()
+            .all(|line| !line.prefix.contains("└─▶")));
+    }
+
+    #[test]
     fn codex_and_claude_question_answers_paint_the_same_arrow_rows() {
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         use crossterm::event::{KeyCode, KeyEvent};
@@ -23563,8 +23912,10 @@ mod tests {
                         assert_eq!(actual.iter().map(painted).collect::<Vec<_>>(),
                             expected.iter().map(painted).collect::<Vec<_>>());
                         for (actual, expected) in actual.iter().zip(&expected) {
+                            assert_eq!(actual.prefix_tone, chrome_model_tone(&answer.title).unwrap_or(Tone::Accent));
                             assert_eq!(actual.tone, expected.tone);
                             assert_eq!(actual.bold, expected.bold);
+                            assert!(actual.tail == expected.tail);
                         }
                     }
                 }

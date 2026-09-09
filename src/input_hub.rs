@@ -11,7 +11,7 @@ use std::{
     sync::{Mutex as StdMutex, OnceLock},
 };
 
-use crossterm::event::{Event, EventStream};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind};
 use futures_util::StreamExt;
 use tokio::sync::Mutex;
 
@@ -35,6 +35,77 @@ fn hub() -> &'static InputHub {
 /// stream of its own, so the hub is armed only once that one is gone.
 pub fn install() {
     let _ = hub();
+}
+
+pub async fn query_graphics() {
+    use std::io::{IsTerminal, Write};
+    if !cfg!(windows) || std::env::var_os("WT_SESSION").is_none() || !io::stdout().is_terminal() {
+        return;
+    }
+    crate::terminal_graphics::set_size(0, 0);
+    let mut events = hub().events.lock().await;
+    let Some(features) = terminal_report(&mut events, "\x1b[c", "\x1b[?", 'c').await else {
+        return;
+    };
+    if !features.iter().skip(1).any(|&feature| feature == 4) {
+        return;
+    }
+    if let Some(pixels) = terminal_report(&mut events, "\x1b[16t", "\x1b[6;", 't').await
+        && pixels.len() == 2
+    {
+        crate::terminal_graphics::set_size(pixels[1], pixels[0]);
+    }
+    let _ = io::stdout().flush();
+}
+
+async fn terminal_report(
+    events: &mut EventStream,
+    query: &str,
+    prefix: &str,
+    final_char: char,
+) -> Option<Vec<u16>> {
+    use std::io::Write;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    {
+        let mut out = io::stdout().lock();
+        out.write_all(query.as_bytes()).ok()?;
+        out.flush().ok()?;
+    }
+    let mut pending = Vec::new();
+    let mut chars = Vec::new();
+    let mut char_events = Vec::new();
+    while pending.len() < 512 {
+        let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.next()).await else {
+            break;
+        };
+        if let Ok(Event::Key(key)) = &event
+            && key.kind != KeyEventKind::Release
+        {
+            let ch = match key.code {
+                KeyCode::Esc => Some('\x1b'),
+                KeyCode::Char(ch) => Some(ch),
+                _ => None,
+            };
+            if let Some(ch) = ch {
+                chars.push(ch);
+                char_events.push(pending.len());
+            }
+        }
+        pending.push(event);
+        if let Some((range, values)) = crate::terminal_graphics::report(&chars, prefix, final_char)
+        {
+            for (index, event) in pending.into_iter().enumerate() {
+                if !char_events[range.clone()].contains(&index) {
+                    defer(event);
+                }
+            }
+            return Some(values);
+        }
+    }
+    for event in pending {
+        defer(event);
+    }
+    None
 }
 
 /// The next terminal event, taking anything a waiting request set aside first.

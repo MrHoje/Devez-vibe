@@ -8121,11 +8121,11 @@ impl AppState {
                     Some(PendingInteraction::UserInput {
                         questions, answers, ..
                     }) => {
-                        user_input_answers_body(&questions, &answers)
+                        user_input_answer_block(&questions, &answers, self.active_cost_model())
                     }
-                    _ => answer.clone(),
+                    _ => Block::new(BlockKind::User, "질문 답변", answer.clone()),
                 };
-                let action = self.submit_text(answer.clone(), display);
+                let action = self.submit_prompt(answer.clone(), display);
                 self.pending_async_answer = Some(answer);
                 return Some(action);
             }
@@ -8167,6 +8167,8 @@ impl AppState {
         {
             return None;
         }
+        let source_id = params.pointer("/item/id").and_then(Value::as_str);
+        let source_block_id = source_id.and_then(|id| self.active.get(id)).map(|active| active.block.id());
         self.flush_before_question();
         if let (Some(active), Some(source)) = (
             self.turn_id.as_deref(),
@@ -8197,6 +8199,15 @@ impl AppState {
         );
         if !matches!(action, Action::None) {
             return Some(action);
+        }
+        if let Some(id) = source_id {
+            self.active.remove(id);
+            self.active_order.retain(|active_id| active_id != id);
+        }
+        if let Some(id) = source_block_id {
+            self.committed.retain(|block| block.id() != id);
+            self.turn_response_blocks.retain(|block| block.id() != id);
+            self.discarded_prompt_ids.push(id);
         }
         Some(if self.busy { self.request_interrupt() } else { Action::None })
     }
@@ -9291,6 +9302,11 @@ impl AppState {
     }
 
     fn submit_text(&mut self, text: String, display: String) -> Action {
+        let title = self.selected_model_name().to_owned();
+        self.submit_prompt(text, Block::new(BlockKind::User, title, display))
+    }
+
+    fn submit_prompt(&mut self, text: String, prompt: Block) -> Action {
         if text.is_empty() && self.composer_images.is_empty() {
             return Action::None;
         }
@@ -9329,14 +9345,13 @@ impl AppState {
         }
         let started_at = Instant::now();
         if steering {
-            let model = self.selected_model_name().to_owned();
             if self.assistant_text_in_flight() {
                 // The turn already has a response in flight; the card waits for
                 // it (see `pending_steer_prompts`) while the text itself steers
                 // now.
                 self.pending_steer_prompts.push(PendingSteerPrompt {
-                    display,
-                    model,
+                    display: prompt.body,
+                    model: prompt.title,
                     started_at,
                 });
             } else {
@@ -9344,13 +9359,11 @@ impl AppState {
                 // messages, e.g. running tools), so the next assistant text is
                 // the reaction to this steer and the card must precede it.
                 self.flush_pending_steer_prompts();
-                let prompt = Block::new(BlockKind::User, &model, display);
                 self.begin_turn_prompt(prompt, started_at);
             }
             Action::Steer(text)
         } else {
             self.flush_pending_steer_prompts();
-            let prompt = Block::new(BlockKind::User, self.selected_model_name(), display);
             self.begin_turn_prompt(prompt, started_at);
             self.busy = true;
             // Time the turn from Enter, not from the server's acknowledgement: a
@@ -12360,7 +12373,7 @@ impl AppState {
                     closable: false,
                     // 단계는 탭 줄이 이미 말해 주므로 제목은 이 질문의 이름만 든다.
                     title: if question.header.is_empty() {
-                        format!("Question {}/{}", current + 1, questions.len())
+                        "질문".to_owned()
                     } else {
                         question_display_header(&question.header).to_owned()
                     },
@@ -13965,7 +13978,7 @@ impl AppState {
         let Some(id) = item.get("id").and_then(Value::as_str) else {
             return;
         };
-        if self.completed_item_ids.contains(id) {
+        if self.completed_item_ids.contains(id) || self.handled_async_questions.contains(id) {
             return;
         }
         let Some(mut block) = active_item_block(&self.cwd, item) else {
@@ -14034,6 +14047,9 @@ impl AppState {
 
     fn complete_item(&mut self, item: &Value) {
         let id = item.get("id").and_then(Value::as_str);
+        if id.is_some_and(|id| self.handled_async_questions.contains(id)) {
+            return;
+        }
         if let Some(id) = id
             && !self.completed_item_ids.insert(id.to_owned())
         {
@@ -14107,6 +14123,9 @@ impl AppState {
         let Some(item_id) = params.get("itemId").and_then(Value::as_str) else {
             return;
         };
+        if self.handled_async_questions.contains(item_id) {
+            return;
+        }
         let Some(delta) = params.get("delta").and_then(Value::as_str) else {
             return;
         };
@@ -14493,9 +14512,9 @@ fn advance_question(
                 state.pending_async_answer = Some(prompt);
                 return show_question(id, questions, current, answers, state);
             }
-            let action = state.submit_text(
+            let action = state.submit_prompt(
                 prompt.clone(),
-                user_input_answers_body(&questions, &answers),
+                user_input_answer_block(&questions, &answers, state.active_cost_model()),
             );
             state.pending_async_answer = Some(prompt);
             return action;
@@ -14622,8 +14641,8 @@ fn question_tabs(
         .iter()
         .enumerate()
         .map(|(index, question)| {
-            let header = if question.header.is_empty() {
-                format!("Q{}", index + 1)
+            let header = if question.header.is_empty() || question.header == "질문" {
+                format!("질문 {}", index + 1)
             } else {
                 question_display_header(&question.header).to_owned()
             };
@@ -14669,10 +14688,11 @@ fn restore_question_focus(
 }
 
 // 동기·비동기 질문 모두 같은 질문 줄과 답변 화살표를 표시한다.
-fn user_input_answers_body(
+fn user_input_answer_block(
     questions: &[Question],
     answers: &BTreeMap<String, Vec<String>>,
-) -> String {
+    model: &str,
+) -> Block {
     let answered = questions
         .iter()
         .filter_map(|question| {
@@ -14686,17 +14706,15 @@ fn user_input_answers_body(
             (!picks.is_empty()).then(|| (question, picks.join(", ")))
         })
         .collect::<Vec<_>>();
-    answered
+    let mut block = Block::question_answers(answered
         .into_iter()
         .map(|(question, answer)| {
-            let question = question
-                .question
-                .trim()
-                .trim_end_matches([':', '：', '?', '？']);
-            format!("{question}:\n  ↳ {answer}")
+            (question.question.trim().to_owned(), answer)
         })
         .collect::<Vec<_>>()
-        .join("\n\n")
+    );
+    block.title = model.to_owned();
+    block
 }
 
 /// Leave the answer in conversation history when the blocking question closes.
@@ -14707,16 +14725,11 @@ fn commit_user_input_answers(
     questions: &[Question],
     answers: &BTreeMap<String, Vec<String>>,
 ) {
-    let body = user_input_answers_body(questions, answers);
-    if body.is_empty() {
+    let answer = user_input_answer_block(questions, answers, state.active_cost_model());
+    if answer.body.is_empty() {
         return;
     }
     state.commit_welcome_card();
-    // 답변 블록도 사용자가 직접 보낸 메시지와 같은 모델 색을 써야 하므로 제목에
-    // 모델 이름을 넣는다. "You"로 두면 렌더러가 모델을 못 알아보고 기본 강조색으로
-    // 떨어진다.
-    let title = state.selected_model_name().to_owned();
-    let answer = Block::new(BlockKind::User, title, body);
     state.begin_turn_prompt(answer, Instant::now());
 }
 
@@ -14837,29 +14850,48 @@ fn answer_picked(answers: &BTreeMap<String, Vec<String>>, id: &str, label: &str)
 }
 
 // 화면이 번호를 붙이므로 모델의 목록 번호만 숨긴다. 답변으로 보낼 원문은 유지한다.
-fn question_option_display_label(label: &str) -> &str {
-    let trimmed = label.trim_start();
-    let (digits, closing) = if let Some(rest) = trimmed.strip_prefix('(') {
-        (rest, Some(')'))
-    } else if let Some(rest) = trimmed.strip_prefix('[') {
-        (rest, Some(']'))
-    } else {
-        (trimmed, None)
-    };
-    let count = digits.bytes().take_while(u8::is_ascii_digit).count();
-    if count == 0 {
-        return label;
-    }
-    let suffix = &digits[count..];
-    let text = match closing {
-        Some(end) => suffix.strip_prefix(end),
-        None => suffix.strip_prefix('.').or_else(|| suffix.strip_prefix(')')),
-    };
-    match text {
-        Some(text) if text.starts_with(char::is_whitespace) && !text.trim().is_empty() => {
-            text.trim_start()
+fn question_option_display_label(mut label: &str) -> &str {
+    loop {
+        let trimmed = label.trim_start();
+        if let Some(first) = trimmed.chars().next()
+            && ('①'..='⑳').contains(&first)
+            && !trimmed[first.len_utf8()..].trim().is_empty()
+        {
+            label = trimmed[first.len_utf8()..].trim_start();
+            continue;
         }
-        _ => label,
+        let (digits, closing) = if let Some(rest) = trimmed.strip_prefix('(') {
+            (rest, Some(')'))
+        } else if let Some(rest) = trimmed.strip_prefix('[') {
+            (rest, Some(']'))
+        } else {
+            (trimmed, None)
+        };
+        let count = digits.bytes().take_while(u8::is_ascii_digit).count();
+        if count == 0 {
+            return label;
+        }
+        let suffix = &digits[count..];
+        let text = match closing {
+            Some(end) => suffix.strip_prefix(end),
+            None => suffix
+                .strip_prefix('.')
+                .or_else(|| suffix.strip_prefix(')')),
+        };
+        // 공백 없는 ASCII 점 표기(1.txt, 1.8.11)와 네 자리 연도는 보존한다.
+        match text {
+            Some(text)
+                if !text.trim().is_empty()
+                    && ((count <= 3 && (closing.is_some() || suffix.starts_with(')')))
+                        || text.starts_with(char::is_whitespace)
+                        || (closing.is_none()
+                            && suffix.starts_with('.')
+                            && text.chars().next().is_some_and(|ch| !ch.is_ascii()))) =>
+            {
+                label = text.trim_start();
+            }
+            _ => return label,
+        }
     }
 }
 
@@ -14897,7 +14929,8 @@ fn parse_questions(params: &Value) -> Vec<Question> {
                 header: question
                     .get("header")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
+                    .filter(|header| !header.trim().is_empty())
+                    .unwrap_or("질문")
                     .to_owned(),
                 question: question.get("question")?.as_str()?.to_owned(),
                 options,
@@ -14925,6 +14958,8 @@ fn assistant_phase(item: &Value) -> AssistantPhase {
 
 fn active_item_block(cwd: &str, item: &Value) -> Option<Block> {
     match item.get("type")?.as_str()? {
+        "agentMessage" if item.get("delivery").and_then(Value::as_str) == Some("async")
+            && item.get("questions").and_then(Value::as_array).is_some_and(|questions| !questions.is_empty()) => None,
         "agentMessage" => Some(
             Block::new(
                 BlockKind::Assistant,
@@ -17408,11 +17443,11 @@ mod tests {
         // 셋째 질문에서 두 단계 뒤로 물러난다. Shift+Tab도 같은 길이다.
         state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         let overlay = state.overlay_view().expect("둘째 질문이 다시 열려야 한다");
-        assert!(overlay.title.contains("2/3"));
+        assert_eq!(overlay.title, "질문");
         assert!(
             overlay.lines[0]
                 .text
-                .contains(&format!("{QUESTION_TAB_CURSOR} {CHECKED_BOX} Q2")),
+                .contains(&format!("{QUESTION_TAB_CURSOR} {CHECKED_BOX} 질문 2")),
             "탭 줄이 지금 질문을 짚어야 한다"
         );
         assert!(
@@ -25205,16 +25240,33 @@ mod tests {
     }
 
     #[test]
+    fn question_answer_keeps_the_model_that_asked_it() {
+        let mut state = busy_state_with_live_turn();
+        state.active_turn_model = Some("gpt-6-astra".to_owned());
+        assert_ne!(state.selected_model_name(), "gpt-6-astra");
+        state.begin_server_request(json!(9), "item/tool/requestUserInput", &blocking_test_question());
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        let answer = state.drain_committed().into_iter()
+            .find(|block| matches!(block.kind, BlockKind::User)).unwrap();
+        assert_eq!(answer.title, "gpt-6-astra");
+        state.active_turn_model = Some("claude:opus".to_owned());
+        assert_eq!(answer.title, "gpt-6-astra");
+    }
+
+    #[test]
     fn question_option_display_label_preserves_numbers_in_the_content() {
-        for label in ["1. 첫째", "2) 첫째", "(3) 첫째", "[4] 첫째", "  12.\t첫째"] {
+        for label in ["1. 첫째", "2) 첫째", "(3) 첫째", "[4] 첫째", "  12.\t첫째",
+            "1.첫째", "2)첫째", "(3)첫째", "[4]첫째", "①첫째", "1. 2)③첫째"] {
             assert_eq!(question_option_display_label(label), "첫째", "{label}");
         }
         for label in [
             "첫째", "1.8.9 유지", "1.5배", "2026년", "2개 선택", "123", "1.",
-            "1. ", "(1)", "[1]", "[2026]년", "1.선택", "가. 선택", "", "  ",
+            "1. ", "(1)", "[1]", "[2026]년", "1.txt", "1.8.11", "가. 선택", "", "  ", "①",
         ] {
             assert_eq!(question_option_display_label(label), label);
         }
+        let repeated = format!("{}첫째", "1)".repeat(10_000));
+        assert_eq!(question_option_display_label(&repeated), "첫째");
     }
 
     #[test]
@@ -25518,6 +25570,55 @@ mod tests {
             matches!(action, Action::Submit(text) if text.contains("어느 쪽인가요?") && text.contains("첫째"))
         );
         assert!(!state.awaiting_input());
+    }
+
+    #[test]
+    fn async_question_source_does_not_survive_selection_or_cancellation() {
+        for (cancel, deferred_completion) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut state = busy_state_with_live_turn();
+            state.handle_notification("item/completed", &json!({"item": {
+                "id": "explanation", "type": "agentMessage", "text": "작업 설명"
+            }}));
+            state.handle_notification("item/agentMessage/delta", &json!({
+                "itemId": "question-source", "delta": "선택하세요\n첫째\n둘째"
+            }));
+            if deferred_completion {
+                state.handle_notification("turn/completed", &json!({
+                    "turn": {"id": "live-turn", "status": "completed"}
+                }));
+            } else {
+                state.flush_stream_text();
+            }
+            let params = json!({"item": {
+                "id": "question-source", "type": "agentMessage", "delivery": "async",
+                "text": "선택하세요\n첫째\n둘째",
+                "questions": [{"title": "선택하세요", "options": ["첫째", "둘째"]}]
+            }});
+            state.reject_unanswered_question("item/completed", &params);
+            assert!(!state.active.contains_key("question-source"));
+            state.reject_unanswered_question("turn/completed", &json!({
+                "turn": {"id": "live-turn", "status": "interrupted"}
+            }));
+            state.handle_key(KeyEvent::from(if cancel { KeyCode::Esc } else { KeyCode::Enter }));
+            let blocks = state.drain_committed();
+            assert!(blocks.iter().any(|block| block.body == "작업 설명"));
+            assert!(blocks.iter().all(|block| block.body != "선택하세요\n첫째\n둘째"));
+            if !cancel {
+                assert!(blocks.iter().any(|block| matches!(block.kind, BlockKind::User)
+                    && block.body == "선택하세요:\n  ↳ 첫째"));
+            }
+            state.set_turn_started("new-turn".into());
+            state.handle_notification("item/started", &json!({"item": {
+                "id": "question-source", "type": "agentMessage"
+            }}));
+            state.handle_notification("item/agentMessage/delta", &json!({
+                "itemId": "question-source", "delta": "선택하세요\n첫째\n둘째"
+            }));
+            state.handle_notification("item/completed", &params);
+            assert!(!state.active.contains_key("question-source"));
+            assert!(state.drain_committed().is_empty());
+            assert!(completed_item_block("cwd", &params["item"]).is_none());
+        }
     }
 
     #[test]
