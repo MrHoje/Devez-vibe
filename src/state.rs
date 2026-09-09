@@ -9936,8 +9936,8 @@ impl AppState {
             unknown => {
                 self.committed.push(Block::new(
                     BlockKind::Error,
-                    "알 수 없는 명령",
-                    format!("{unknown} — /help로 목록을 확인하세요."),
+                    "Unknown command",
+                    format!("{unknown} — Use /help to see available commands."),
                 ));
                 Action::None
             }
@@ -21308,8 +21308,10 @@ mod tests {
             Action::None
         ));
         let error = state.committed.last().expect("unknown-command error");
-        assert_eq!(error.title, "알 수 없는 명령");
+        assert_eq!(error.title, "Unknown command");
         assert!(error.body.contains("/renderer"));
+        state.run_slash_command("/솓");
+        assert_eq!(state.committed.last().unwrap().body, "/솓 — Use /help to see available commands.");
     }
 
     /// A command only some runtimes answer is offered only while one of those

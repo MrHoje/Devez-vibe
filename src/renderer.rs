@@ -10630,6 +10630,16 @@ fn block_lines_with_mode_at(
     if is_help_block(block) {
         return help_card_lines(block, width);
     }
+    if matches!(block.kind, BlockKind::Error) && block.title == "Unknown command" {
+        return wrapped_line(
+            "● ",
+            Tone::Accent,
+            &format!("{}: {}", block.title, block.body),
+            Tone::Accent,
+            false,
+            width,
+        );
+    }
     if matches!(block.kind, BlockKind::ModelChange | BlockKind::System) {
         return notice_card_lines(block, width);
     }
@@ -26171,6 +26181,20 @@ mod tests {
         assert!(painted(footer).ends_with("7s  "));
         assert!(!painted(footer).contains("·"));
         assert_eq!(footer.tail[0].tone, Tone::History);
+    }
+
+    #[test]
+    fn unknown_command_uses_one_line_and_the_theme_accent() {
+        for theme_kind in ThemeKind::ALL {
+            theme::set_current(theme_kind);
+            let block = Block::new(BlockKind::Error, "Unknown command", "/솓 — Use /help to see available commands.");
+            let lines = block_lines(&block, 100);
+            assert_eq!(lines.len(), 1);
+            assert_eq!(painted(&lines[0]), "● Unknown command: /솓 — Use /help to see available commands.");
+            assert_eq!(tone_rgb(lines[0].prefix_tone), Some(theme::palette().accent));
+            assert_eq!(lines[0].tone, Tone::Accent);
+        }
+        theme::set_current(ThemeKind::Dark);
     }
 
     #[test]
