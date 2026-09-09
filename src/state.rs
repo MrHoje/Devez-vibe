@@ -8117,8 +8117,15 @@ impl AppState {
             self.flush_before_question();
             self.dispatch_notification(method, params);
             if let Some(answer) = self.pending_async_answer.take() {
-                self.pending = None;
-                let action = self.submit_text(answer.clone(), answer.clone());
+                let display = match self.pending.take() {
+                    Some(PendingInteraction::UserInput {
+                        questions, answers, ..
+                    }) => {
+                        user_input_answers_body(&questions, &answers)
+                    }
+                    _ => answer.clone(),
+                };
+                let action = self.submit_text(answer.clone(), display);
                 self.pending_async_answer = Some(answer);
                 return Some(action);
             }
@@ -14486,7 +14493,10 @@ fn advance_question(
                 state.pending_async_answer = Some(prompt);
                 return show_question(id, questions, current, answers, state);
             }
-            let action = state.submit_text(prompt.clone(), text);
+            let action = state.submit_text(
+                prompt.clone(),
+                user_input_answers_body(&questions, &answers),
+            );
             state.pending_async_answer = Some(prompt);
             return action;
         }
@@ -14658,14 +14668,11 @@ fn restore_question_focus(
     (0, editor)
 }
 
-/// Leave the answer in conversation history when the blocking question closes.
-/// The RPC response alone reaches the model but otherwise leaves no visible proof
-/// that Enter sent the text the user just typed.
-fn commit_user_input_answers(
-    state: &mut AppState,
+// 동기·비동기 질문 모두 같은 질문 줄과 답변 화살표를 표시한다.
+fn user_input_answers_body(
     questions: &[Question],
     answers: &BTreeMap<String, Vec<String>>,
-) {
+) -> String {
     let answered = questions
         .iter()
         .filter_map(|question| {
@@ -14679,10 +14686,7 @@ fn commit_user_input_answers(
             (!picks.is_empty()).then(|| (question, picks.join(", ")))
         })
         .collect::<Vec<_>>();
-    if answered.is_empty() {
-        return;
-    }
-    let body = answered
+    answered
         .into_iter()
         .map(|(question, answer)| {
             let question = question
@@ -14692,7 +14696,21 @@ fn commit_user_input_answers(
             format!("{question}:\n  ↳ {answer}")
         })
         .collect::<Vec<_>>()
-        .join("\n\n");
+        .join("\n\n")
+}
+
+/// Leave the answer in conversation history when the blocking question closes.
+/// The RPC response alone reaches the model but otherwise leaves no visible proof
+/// that Enter sent the text the user just typed.
+fn commit_user_input_answers(
+    state: &mut AppState,
+    questions: &[Question],
+    answers: &BTreeMap<String, Vec<String>>,
+) {
+    let body = user_input_answers_body(questions, answers);
+    if body.is_empty() {
+        return;
+    }
     state.commit_welcome_card();
     // 답변 블록도 사용자가 직접 보낸 메시지와 같은 모델 색을 써야 하므로 제목에
     // 모델 이름을 넣는다. "You"로 두면 렌더러가 모델을 못 알아보고 기본 강조색으로

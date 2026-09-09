@@ -23493,6 +23493,86 @@ mod tests {
     }
 
     #[test]
+    fn codex_and_claude_question_answers_paint_the_same_arrow_rows() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use crossterm::event::{KeyCode, KeyEvent};
+        use crate::state::{Action, AppState};
+
+        for typed in [false, true] {
+            let mut answers = Vec::new();
+            for (model, asynchronous, early) in [
+                ("claude:opus", false, false),
+                ("gpt-5.6-sol", false, false),
+                ("gpt-5.6-sol", true, false),
+                ("gpt-5.6-sol", true, true),
+            ] {
+                let mut state = AppState::new(
+                    "thread".into(), "cwd".into(), "account".into(), Vec::new(), model, None,
+                );
+                state.set_turn_started("turn".into());
+                let stopped = serde_json::json!({"turn": {"id": "turn", "status": "interrupted"}});
+                if asynchronous {
+                    state.reject_unanswered_question("item/completed", &serde_json::json!({
+                        "item": {"id": "question", "type": "agentMessage", "delivery": "async",
+                            "questions": [{"title": "어떤 방법인가요?", "options": ["첫째 (권장)", "둘째"]}]}
+                    }));
+                    if !early {
+                        state.reject_unanswered_question("turn/completed", &stopped);
+                    }
+                } else {
+                    let questions = serde_json::json!({"questions": [{
+                        "id": "q1", "question": "어떤 방법인가요?",
+                        "options": [{"label": "첫째 (권장)"}, {"label": "둘째"}]
+                    }]});
+                    let params = if model.starts_with("claude:") {
+                        serde_json::json!({"encoding": "base64-json",
+                            "payload": STANDARD.encode(serde_json::to_vec(&questions).unwrap())})
+                    } else {
+                        questions
+                    };
+                    state.begin_server_request(serde_json::json!(1), "item/tool/requestUserInput", &params);
+                }
+                if typed {
+                    state.handle_key(KeyEvent::from(KeyCode::Char('3')));
+                    state.handle_paste("직접 답변\n둘째 줄".into());
+                }
+                let mut action = state.handle_key(KeyEvent::from(KeyCode::Enter));
+                if early {
+                    assert!(matches!(action, Action::None));
+                    assert!(state.drain_committed().iter().all(|block| !matches!(block.kind, BlockKind::User)));
+                    action = state.reject_unanswered_question("turn/completed", &stopped).unwrap();
+                }
+                if asynchronous {
+                    let Action::Submit(text) = action else { panic!("async answer must start a turn") };
+                    assert_eq!(text, format!("질문에 대한 사용자 답변:\n어떤 방법인가요?\n{}",
+                        if typed { "직접 답변\n둘째 줄" } else { "첫째 (권장)" }));
+                } else {
+                    assert!(matches!(action, Action::RpcResponse { .. }));
+                }
+                let blocks = state.drain_committed();
+                let answer = blocks.into_iter().find(|block| matches!(block.kind, BlockKind::User)).unwrap();
+                assert_eq!(answer.body, format!("어떤 방법인가요:\n  ↳ {}",
+                    if typed { "직접 답변\n둘째 줄" } else { "첫째" }));
+                answers.push(answer);
+            }
+            for width in [30, 80] {
+                for chat in [false, true] {
+                    let expected = user_prompt_lines_with_history(&answers[0], width, None, chat);
+                    for answer in &answers[1..] {
+                        let actual = user_prompt_lines_with_history(answer, width, None, chat);
+                        assert_eq!(actual.iter().map(painted).collect::<Vec<_>>(),
+                            expected.iter().map(painted).collect::<Vec<_>>());
+                        for (actual, expected) in actual.iter().zip(&expected) {
+                            assert_eq!(actual.tone, expected.tone);
+                            assert_eq!(actual.bold, expected.bold);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn question_modified_enter_keeps_the_visible_draft_without_submitting() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut state = crate::state::AppState::new(
