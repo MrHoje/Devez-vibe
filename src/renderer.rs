@@ -11553,13 +11553,9 @@ fn markdown_line(
             continue;
         }
         if rest.starts_with('`') {
-            let ticks = rest.bytes().take_while(|&byte| byte == b'`').count();
-            let after_tick = &rest[ticks..];
-            if let Some((end, _)) = after_tick.match_indices(&rest[..ticks]).find(|(end, _)| {
-                !after_tick[..*end].ends_with('`') && !after_tick[*end + ticks..].starts_with('`')
-            }) {
-                push_highlight_span(&mut spans, &after_tick[..end], Tone::InlineCode, false);
-                index += end + ticks * 2;
+            if let Some((code, consumed)) = inline_code(rest) {
+                push_highlight_span(&mut spans, code, Tone::InlineCode, false);
+                index += consumed;
                 continue;
             }
             // 닫히지 않은 코드도 원문을 유지하며 안쪽의 링크를 활성화하지 않는다.
@@ -11608,6 +11604,61 @@ fn markdown_line(
     let mut lines = styled_lines(prefix, prefix_tone, spans, tone, bold, width);
     attach_markdown_link_picks(&mut lines, &links);
     lines
+}
+
+fn inline_code(rest: &str) -> Option<(&str, usize)> {
+    rest.strip_prefix('`')?;
+    let ticks = rest.bytes().take_while(|&byte| byte == b'`').count();
+    let after_tick = &rest[ticks..];
+    let (end, _) = after_tick.match_indices(&rest[..ticks]).find(|(end, _)| {
+        !after_tick[..*end].ends_with('`') && !after_tick[*end + ticks..].starts_with('`')
+    })?;
+    Some((&after_tick[..end], end + ticks * 2))
+}
+
+/// 다음 입력에서 화면에 숨길 링크 주소 범위. 원문은 보존하되 타이핑 시간은 쓰지 않는다.
+pub(crate) fn hidden_streaming_link_range(body: &str, pending: &str) -> Option<Range<usize>> {
+    let line_start = body.rfind('\n').map_or(0, |index| index + 1);
+    let line = &body[line_start..];
+    let pending_line = pending.split(['\r', '\n']).next()?;
+    if pending_line.is_empty() || (!line.contains('[') && !pending_line.contains('[')) {
+        return None;
+    }
+    let text = format!("{line}{pending_line}");
+    if !text.contains("](")
+        || text.trim_start().starts_with('>')
+        || markdown_table_cells(&text).is_some()
+        || body[..line_start]
+            .lines()
+            .filter(|line| line.trim_start().starts_with("```"))
+            .count()
+            % 2
+            != 0
+    {
+        return None;
+    }
+    let mut index = 0;
+    while index < text.len() {
+        let rest = &text[index..];
+        if rest.starts_with('`') {
+            index += inline_code(rest)?.1;
+            continue;
+        }
+        if let Some((_, _, consumed)) = inline_link(rest, true) {
+            if let Some(close) = rest.find("](")
+                && close > if rest.starts_with("![") { 2 } else { 1 }
+                && index + consumed > line.len()
+            {
+                return Some(
+                    (index + close).saturating_sub(line.len())..index + consumed - line.len(),
+                );
+            }
+            index += consumed;
+        } else {
+            index += rest.chars().next()?.len_utf8();
+        }
+    }
+    None
 }
 
 /// A bare `http(s)://` URL at the head of `rest`, the way Claude Code's CLI
@@ -17658,6 +17709,103 @@ mod tests {
 
         assert_eq!(lines.len(), 1);
         assert_eq!(rendered, "변경: src/main.rs:83, Cargo.toml:29");
+    }
+
+    #[test]
+    fn streaming_hidden_link_addresses_do_not_delay_following_text() {
+        set_chat_layout(false);
+        let frames_until_next_word = |address: &str| {
+            let mut state = crate::state::AppState::new(
+                "thread".into(),
+                "cwd".into(),
+                "account".into(),
+                Vec::new(),
+                "gpt-5.6-sol",
+                None,
+            );
+            state.set_turn_started("turn".to_owned());
+            state.handle_notification(
+                "item/agentMessage/delta",
+                &serde_json::json!({
+                    "itemId": "answer", "delta": "[문서](",
+                }),
+            );
+            for _ in 0..100 {
+                state.drain_stream_text(Duration::from_millis(40));
+            }
+            state.handle_notification(
+                "item/agentMessage/delta",
+                &serde_json::json!({
+                    "itemId": "answer", "delta": format!("{address}) 다음"),
+                }),
+            );
+            for frame in 1..=400 {
+                state.drain_stream_text(Duration::from_millis(40));
+                let view = state.view();
+                let lines = render_streamed_transcript_lines(
+                    &view.live_blocks,
+                    80,
+                    &HashSet::new(),
+                    ShellDisplayMode::Hide,
+                    DiffDisplayMode::Hide,
+                )
+                .0;
+                if lines.iter().map(painted).any(|line| line.contains("다음")) {
+                    assert_eq!(
+                        view.live_blocks[0].block.body,
+                        format!("[문서]({address}) 다음")
+                    );
+                    return frame;
+                }
+            }
+            panic!("다음 문장이 표시되지 않음");
+        };
+        let short = frames_until_next_word("https://example.com/a");
+        let long = frames_until_next_word(&format!("https://example.com/{}", "a".repeat(4096)));
+        eprintln!(
+            "링크 뒤 다음 단어 표시: 짧은 주소 {}ms, 긴 주소 {}ms",
+            short * 40,
+            long * 40
+        );
+        assert!(
+            long <= short + 1,
+            "숨긴 주소 때문에 화면이 멈춤: 짧은 주소 {}ms, 긴 주소 {}ms",
+            short * 40,
+            long * 40
+        );
+    }
+
+    #[test]
+    fn hidden_link_ranges_preserve_code_quotes_tables_and_visible_addresses() {
+        for body in [
+            "`[문서](",
+            "``예 `코드` [문서](",
+            "```text\n[문서](",
+            "> [문서](",
+            "| 항목 | [문서](",
+            "[](",
+            "주소: https://example.com/",
+        ] {
+            assert!(
+                hidden_streaming_link_range(body, "https://example.com/path) 다음").is_none(),
+                "화면에 보일 글자를 숨김 처리함: {body:?}"
+            );
+        }
+        for body in [
+            "[문서](",
+            "첫 줄\n[문서](",
+            "```text\n코드\n```\n[문서](",
+            "`예제` [문서](",
+            "[완료](https://example.com/ready) [문서](",
+        ] {
+            let pending = "https://example.com/path_(draft)) 다음";
+            let hidden = hidden_streaming_link_range(body, pending).expect("숨긴 주소");
+            assert_eq!(&pending[hidden], "https://example.com/path_(draft))");
+        }
+        let pending = "[문서](</D:/긴 경로/문서 )/file.md:83>) 다음";
+        let hidden =
+            hidden_streaming_link_range("열기: ", pending).expect("아직 출력하지 않은 주소");
+        assert_eq!(&pending[hidden], "](</D:/긴 경로/문서 )/file.md:83>)");
     }
 
     #[test]

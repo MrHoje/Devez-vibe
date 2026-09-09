@@ -1472,6 +1472,8 @@ const FINAL_STREAM_FRAME_TICKS: u8 = 5;
 pub struct StreamReveal {
     pub clusters: usize,
     pub backlog: usize,
+    /// 주소가 완성되면 새 글자가 없어도 클릭 대상과 줄 번호를 다시 그린다.
+    pub links_changed: bool,
     /// The settling tail changed length, so the frame needs repainting even when
     /// no new character appeared.
     pub fade_changed: bool,
@@ -1483,7 +1485,11 @@ pub struct StreamReveal {
 
 impl StreamReveal {
     pub fn changed(&self) -> bool {
-        self.clusters > 0 || self.fade_changed || self.released || self.final_frame_ready
+        self.clusters > 0
+            || self.links_changed
+            || self.fade_changed
+            || self.released
+            || self.final_frame_ready
     }
 }
 
@@ -1499,7 +1505,7 @@ impl TextPace {
         self.pending.push_str(delta);
     }
 
-    fn take(&mut self, elapsed: Duration) -> Option<String> {
+    fn take(&mut self, elapsed: Duration, visible_end: usize) -> Option<String> {
         if self.pending.is_empty() {
             // The rate is kept, not cleared. Claude's deltas arrive in bursts
             // separated by short gaps, and restarting from the floor at every gap
@@ -1508,7 +1514,8 @@ impl TextPace {
             return None;
         }
         let step = elapsed.min(STREAM_MAX_STEP).as_secs_f32();
-        let backlog = visible_cluster_count(&self.pending) as f32;
+        let visible = &self.pending[..visible_end.min(self.pending.len())];
+        let backlog = visible_cluster_count(visible) as f32;
         let demand = (backlog / STREAM_TARGET_LATENCY).clamp(STREAM_MIN_RATE, STREAM_MAX_RATE);
         let closing = if demand > self.rate {
             STREAM_RATE_ATTACK
@@ -1524,7 +1531,7 @@ impl TextPace {
         if size < 1.0 {
             return None;
         }
-        let end = visible_cluster_end(&self.pending, size as usize);
+        let end = visible_cluster_end(visible, size as usize);
         Some(self.pending.drain(..end).collect())
     }
 
@@ -14176,7 +14183,44 @@ impl AppState {
     pub fn drain_stream_text(&mut self, elapsed: Duration) -> StreamReveal {
         let mut reveal = StreamReveal::default();
         for active in self.active.values_mut() {
-            if let Some(chunk) = active.pace.take(elapsed) {
+            let assistant = matches!(active.block.kind, BlockKind::Assistant);
+            let mut paced = false;
+            loop {
+                let hidden = if assistant {
+                    crate::renderer::hidden_streaming_link_range(
+                        &active.block.body,
+                        &active.pace.pending,
+                    )
+                } else {
+                    None
+                };
+                if let Some(range) = &hidden
+                    && range.start == 0
+                {
+                    let chunk = active.pace.pending.drain(..range.end).collect::<String>();
+                    append_capped(&mut active.block.body, &chunk);
+                    active.revision = active.revision.wrapping_add(1);
+                    reveal.links_changed = true;
+                    continue;
+                }
+                if paced {
+                    break;
+                }
+                paced = true;
+                // 다음 줄은 코드·표 문맥을 다시 확인한 뒤 속도를 계산한다.
+                let line_end = if assistant {
+                    active
+                        .pace
+                        .pending
+                        .find('\n')
+                        .map_or(active.pace.pending.len(), |end| end + 1)
+                } else {
+                    active.pace.pending.len()
+                };
+                let visible_end = hidden.map_or(line_end, |range| range.start.min(line_end));
+                let Some(chunk) = active.pace.take(elapsed, visible_end) else {
+                    break;
+                };
                 reveal.clusters += visible_cluster_count(&chunk);
                 append_capped(&mut active.block.body, &chunk);
                 active.revision = active.revision.wrapping_add(1);
@@ -14185,7 +14229,7 @@ impl AppState {
         }
         reveal.fade_changed = self.advance_stream_fade(reveal.clusters, elapsed);
         (reveal.final_frame_ready, reveal.released) =
-            self.release_held_notifications(reveal.clusters > 0);
+            self.release_held_notifications(reveal.clusters > 0 || reveal.links_changed);
         reveal
     }
 
@@ -23404,6 +23448,76 @@ mod tests {
     }
 
     #[test]
+    fn hidden_link_addresses_finish_without_fading_or_waiting_on_raw_characters() {
+        let mut state = test_state();
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({
+                "itemId": "item-1", "delta": "[문서](",
+            }),
+        );
+        drain_frames(&mut state, 1000);
+        assert_eq!(state.active["item-1"].block.body, "[문서](");
+        assert_eq!(state.stream_fade_tail, 0.0);
+        let address = format!("https://example.com/{}_(draft)", "a".repeat(4096));
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({
+                "itemId": "item-1", "delta": format!("{address})"),
+            }),
+        );
+        state.handle_notification("turn/completed", &json!({}));
+        let reveal = state.drain_stream_text(TEST_FRAME);
+        assert_eq!(reveal.clusters, 0, "숨긴 주소에 타이핑 시간을 쓰면 안 됨");
+        assert_eq!(reveal.backlog, 0);
+        assert_eq!(
+            state.stream_fade_tail, 0.0,
+            "숨긴 주소 때문에 링크가 다시 흐려지면 안 됨"
+        );
+        assert!(reveal.links_changed && reveal.changed());
+        assert!(
+            !reveal.released,
+            "완성된 링크는 기록으로 넘어가기 전 화면에 표시해야 함"
+        );
+        assert_eq!(
+            state.active["item-1"].block.body,
+            format!("[문서]({address})")
+        );
+        for _ in 0..FINAL_STREAM_FRAME_TICKS + 1 {
+            state.drain_stream_text(TEST_FRAME);
+        }
+        assert!(state.held_notifications.is_empty());
+        assert!(
+            state
+                .committed
+                .iter()
+                .any(|block| block.body == format!("[문서]({address})"))
+        );
+    }
+
+    #[test]
+    fn hidden_link_addresses_on_new_lines_do_not_count_as_visible_text() {
+        let count = |size| {
+            let mut state = test_state();
+            state.handle_notification("item/agentMessage/delta", &json!({
+                "itemId": "item-1",
+                "delta": format!("첫 줄\n[문서](https://example.com/{}) 다음", "a".repeat(size)),
+            }));
+            state.active.get_mut("item-1").unwrap().pace.rate = STREAM_MAX_RATE;
+            let mut clusters = 0;
+            for _ in 0..100 {
+                let reveal = state.drain_stream_text(Duration::from_millis(40));
+                clusters += reveal.clusters;
+                if reveal.backlog == 0 {
+                    return clusters;
+                }
+            }
+            panic!("스트리밍 입력이 남음");
+        };
+        assert_eq!(count(1), count(4096), "주소 길이가 밝기 효과에 영향을 줌");
+    }
+
+    #[test]
     fn streamed_text_is_revealed_on_frames_instead_of_on_arrival() {
         let mut state = test_state();
         let text = "한 문장이 통째로 도착해도 화면에는 나눠서 드러납니다.";
@@ -23431,7 +23545,8 @@ mod tests {
         let revealed = |elapsed| {
             let mut pace = TextPace::default();
             pace.push(&text);
-            pace.take(elapsed).map(|chunk| chunk.chars().count())
+            pace.take(elapsed, usize::MAX)
+                .map(|chunk| chunk.chars().count())
         };
 
         let one = revealed(TEST_FRAME * 5).expect("a short gap reveals text");
@@ -23446,16 +23561,16 @@ mod tests {
         let mut pace = TextPace::default();
         pace.push(&"흐름을 유지하는지 확인하는 긴 문장입니다.".repeat(6));
         for _ in 0..10 {
-            pace.take(TEST_FRAME);
+            pace.take(TEST_FRAME, usize::MAX);
         }
         let reached = pace.rate;
         assert!(reached > STREAM_MIN_RATE);
 
         // Drained dry, then the next burst lands.
         while !pace.pending.is_empty() {
-            pace.take(TEST_FRAME);
+            pace.take(TEST_FRAME, usize::MAX);
         }
-        assert!(pace.take(TEST_FRAME).is_none());
+        assert!(pace.take(TEST_FRAME, usize::MAX).is_none());
         assert!(pace.rate >= reached * 0.9, "{} vs {reached}", pace.rate);
     }
 
