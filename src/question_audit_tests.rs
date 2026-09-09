@@ -4,6 +4,226 @@ fn audit_async_question(item: &str, questions: Value) -> Value {
     }})
 }
 
+#[test]
+fn esc_approval_declines_independently_of_order_and_selection() {
+    for (method, params, expected) in [
+        ("item/commandExecution/requestApproval", json!({"claudePermission": true}), json!({"decision": "decline"})),
+        ("item/commandExecution/requestApproval", json!({}), json!({"decision": "decline"})),
+        ("item/commandExecution/requestApproval", json!({"availableDecisions": ["decline", "acceptForSession", "accept", "cancel"]}), json!({"decision": "decline"})),
+        ("item/commandExecution/requestApproval", json!({"availableDecisions": ["cancel", "accept"]}), json!({"decision": "cancel"})),
+        ("item/fileChange/requestApproval", json!({}), json!({"decision": "decline"})),
+        ("item/permissions/requestApproval", json!({"permissions": {"network": {"enabled": true}}}), json!({"permissions": {}, "scope": "turn"})),
+    ] {
+        for move_selection in [false, true] {
+            let mut state = busy_state_with_live_turn();
+            state.begin_server_request(json!(41), method, &params);
+            if move_selection { state.handle_key(KeyEvent::from(KeyCode::Down)); }
+            assert!(matches!(state.handle_key(KeyEvent::from(KeyCode::Esc)),
+                Action::RpcResponse { id, result } if id == json!(41) && result == expected), "{method}: {params}");
+            assert!(!state.awaiting_input());
+            assert!(!state.turn_interrupted, "거절이 전체 작업 중단으로 바뀜");
+        }
+    }
+    let mut state = busy_state_with_live_turn();
+    state.begin_server_request(json!(41), "item/commandExecution/requestApproval", &json!({"availableDecisions": ["accept"]}));
+    assert!(matches!(state.handle_key(KeyEvent::from(KeyCode::Esc)), Action::RpcError { .. }));
+}
+
+#[test]
+fn esc_mcp_approval_never_persists_permission() {
+    for (meta, expected) in [
+        (json!({"persist": ["session", "always"]}), "decline"),
+        (json!({"codex_approval_kind": "mcp_tool_call", "persist": ["session", "always"]}), "cancel"),
+    ] {
+        let mut state = busy_state_with_live_turn();
+        state.begin_server_request(json!(42), "mcpServer/elicitation/request", &json!({
+            "message": "도구 실행 허용", "_meta": meta
+        }));
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        let Action::RpcResponse { id, result } = state.handle_key(KeyEvent::from(KeyCode::Esc)) else { panic!("거절 응답 없음") };
+        assert_eq!(id, json!(42));
+        assert_eq!(result, mcp_elicitation_response(expected, None));
+        assert!(!state.awaiting_input());
+    }
+}
+
+#[test]
+fn esc_queue_waits_for_completion_then_runs_once_in_order() {
+    for model in ["claude:opus", "gpt-5.6-sol"] {
+        let mut state = AppState::new("thread".into(), "cwd".into(), "account".into(), Vec::new(), model, None);
+        state.set_turn_started("turn".into());
+        for text in ["다음 요청", "그다음 요청"] {
+            state.editor.set_text(text);
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        }
+        state.editor.set_text("미전송 초안");
+        state.handle_notification("item/agentMessage/delta", &json!({"itemId": "answer", "delta": "남겨야 할 응답"}));
+        assert!(matches!(state.handle_key(KeyEvent::from(KeyCode::Esc)), Action::Interrupt));
+        assert!(state.take_queued_prompt().is_none(), "중단 확인 전에 후속 요청 실행");
+        assert_eq!(state.editor.text(), "미전송 초안");
+        state.handle_notification("turn/completed", &json!({"turn": {"id": "turn", "status": "interrupted"}}));
+        let first = state.take_queued_prompt().expect("ESC 후 대기열이 멈춤");
+        assert_eq!(first, "다음 요청");
+        assert!(!state.busy);
+        assert!(state.drain_committed().iter().any(|block| block.body == "남겨야 할 응답"));
+        assert!(matches!(state.start_queued_prompt(first), Action::Submit(_)));
+        assert!(state.take_queued_prompt().is_none());
+        state.set_turn_started("next".into());
+        state.handle_notification("turn/completed", &json!({"turn": {"id": "next", "status": "completed"}}));
+        assert_eq!(state.take_queued_prompt().as_deref(), Some("그다음 요청"));
+        assert!(state.take_queued_prompt().is_none());
+        assert_eq!(state.editor.text(), "미전송 초안");
+    }
+}
+
+#[test]
+fn esc_queue_ignores_old_or_other_thread_completion_after_next_turn_starts() {
+    for completed in [
+        json!({"threadId": "main-thread", "turn": {"id": "live-turn", "status": "interrupted"}}),
+        json!({"threadId": "other-thread", "turn": {"id": "other-turn", "status": "completed"}}),
+    ] {
+        let mut state = busy_state_with_live_turn();
+        state.queued_prompts.extend(["첫 후속 요청".into(), "두 번째 후속 요청".into()]);
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        state.handle_notification("turn/completed", &json!({"turn": {"id": "live-turn", "status": "interrupted"}}));
+        let next = state.take_queued_prompt().unwrap();
+        assert!(matches!(state.start_queued_prompt(next), Action::Submit(_)));
+        state.set_turn_started("next-turn".into());
+        // Match the event loop: it tries to drain after every completed notice,
+        // including one the state rejected as stale or from another thread.
+        state.handle_notification("turn/completed", &completed);
+        assert!(state.take_queued_prompt().is_none(), "실행 중인 다음 턴에 후후속 요청이 끼어듦");
+        assert_eq!(state.queued_prompts.len(), 1);
+        assert_eq!(state.turn_id.as_deref(), Some("next-turn"));
+    }
+}
+
+#[test]
+fn queued_prompt_waits_for_normal_completion_behind_paced_text() {
+    let mut state = busy_state_with_live_turn();
+    state.queued_prompts.push_back("다음 요청".into());
+    state.handle_notification("item/agentMessage/delta", &json!({"itemId": "answer", "delta": "남겨야 할 응답"}));
+    assert!(state.take_queued_prompt().is_none());
+    state.handle_notification("turn/completed", &json!({"turn": {"id": "live-turn", "status": "completed"}}));
+    let next = state.take_queued_prompt().expect("완료 알림이 보류돼 대기열이 멈춤");
+    assert!(matches!(state.start_queued_prompt(next), Action::Submit(_)), "끝난 턴으로 추가 입력을 보냄");
+}
+
+#[test]
+fn esc_queue_does_not_send_or_consume_draft_attachments() {
+    let mut state = busy_state_with_live_turn();
+    state.queued_prompts.push_back("다음 요청".into());
+    state.editor.set_text("아직 보내지 않은 초안");
+    state.attach_local_image("C:/private/unsent.png".into());
+    let draft = state.editor.text();
+    state.handle_key(KeyEvent::from(KeyCode::Esc));
+    state.handle_notification("turn/completed", &json!({"turn": {"id": "live-turn", "status": "interrupted"}}));
+    let next = state.take_queued_prompt().unwrap();
+    let Action::Submit(text) = state.start_queued_prompt(next) else { panic!("후속 요청 시작 실패") };
+    let input = state.turn_input(text);
+    assert_eq!(input.len(), 1, "대기 요청에 미전송 초안의 이미지가 섞임");
+    assert_eq!(state.composer_image_count(), 1);
+    assert_eq!(state.editor.text(), draft);
+    state.set_turn_started("next-turn".into());
+    let Action::Steer(text) = state.submit_editor() else { panic!("초안 전송 실패") };
+    assert!(state.turn_input(text).iter().any(|item| item["type"] == "localImage"));
+    assert_eq!(state.composer_image_count(), 0);
+}
+
+#[test]
+fn queued_input_resolves_its_mentions_without_taking_draft_bindings() {
+    let mut state = busy_state_with_live_turn();
+    state.update_apps(&json!({"data": [{"id": "calendar", "name": "Calendar", "isAccessible": true, "isEnabled": true}]}));
+    state.queued_prompts.push_back("$calendar 대기 요청".into());
+    state.editor.set_text("$calendar 미전송 초안");
+    state.selected_completion_bindings.push(SelectedCompletionBinding {
+        sigil: '$', trigger: "calendar".into(), token: "$calendar".into(), range: 0..9,
+        kind: CompletionKind::App, name: "초안 전용 선택".into(), path: "app://draft-only".into(),
+    });
+    state.handle_key(KeyEvent::from(KeyCode::Esc));
+    state.handle_notification("turn/completed", &json!({"turn": {"id": "live-turn", "status": "interrupted"}}));
+    let next = state.take_queued_prompt().unwrap();
+    let Action::Submit(text) = state.start_queued_prompt(next) else { panic!("후속 요청 시작 실패") };
+    let input = state.turn_input(text);
+    assert!(input.iter().all(|item| item["path"] != "app://draft-only"));
+    assert!(input.iter().any(|item| item["type"] == "mention"));
+    assert_eq!(state.selected_completion_bindings.len(), 1);
+    assert_eq!(state.editor.text(), "$calendar 미전송 초안");
+}
+
+#[test]
+fn esc_queue_does_not_resume_after_failures() {
+    for failure in ["interrupt", "start", "answer", "turn", "malformed", "error"] {
+        let mut state = busy_state_with_live_turn();
+        state.queued_prompts.push_back("다음 요청".into());
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        match failure {
+            "interrupt" => state.set_interrupt_failed("중단 실패"),
+            "start" => state.set_request_failed("시작 실패"),
+            "answer" => state.restore_failed_question_response(&json!({"answers": {"q": {"answers": ["보관할 답"]}}})),
+            "malformed" => { state.begin_server_request(json!(1), "item/tool/requestUserInput", &json!({"questions": []})); }
+            "error" => state.handle_notification("error", &json!({"error": {"message": "실행 오류"}, "willRetry": false})),
+            _ => {}
+        }
+        state.handle_notification("turn/completed", &json!({"turn": {
+            "id": "live-turn", "status": if failure == "turn" { "failed" } else { "interrupted" }
+        }}));
+        state.flush_before_question();
+        assert!(state.take_queued_prompt().is_none(), "{failure}");
+        assert_eq!(state.queued_prompts.len(), 1);
+    }
+}
+
+#[test]
+fn esc_during_start_resumes_queue_only_after_the_deferred_stop() {
+    let mut state = test_state();
+    state.editor.set_text("시작할 요청");
+    state.submit_editor();
+    state.queued_prompts.push_back("다음 요청".into());
+    assert!(state.note_interrupt_while_sending());
+    assert!(state.take_queued_prompt().is_none());
+    state.set_turn_started("turn".into());
+    assert_eq!(state.take_pending_interrupt().as_deref(), Some("turn"));
+    assert!(state.take_queued_prompt().is_none());
+    state.handle_notification("turn/completed", &json!({"turn": {"id": "turn", "status": "interrupted"}}));
+    assert_eq!(state.take_queued_prompt().as_deref(), Some("다음 요청"));
+}
+
+#[test]
+fn esc_question_keeps_one_cancellation_record_without_answering() {
+    for asynchronous in [false, true] {
+        for stopped in [false, true] {
+            let mut state = busy_state_with_live_turn();
+            if asynchronous {
+                state.reject_unanswered_question("item/completed", &audit_async_question("question", json!([
+                    {"title": "어느 색인가요?", "options": ["빨강", "파랑"]},
+                    {"title": "이유를 적어 주세요"}
+                ])));
+                if stopped { audit_stop_question_turn(&mut state); }
+            } else {
+                state.begin_server_request(json!(7), "item/tool/requestUserInput", &json!({"questions": [
+                    {"id": "q1", "question": "어느 색인가요?", "options": [{"label": "빨강"}, {"label": "파랑"}]},
+                    {"id": "q2", "question": "이유를 적어 주세요"}
+                ]}));
+            }
+            state.drain_committed();
+            let action = state.handle_key(KeyEvent::from(KeyCode::Esc));
+            assert!(matches!(action, Action::CancelUserInput { .. } | Action::None));
+            assert!(!state.awaiting_input());
+            let records = state.drain_committed().into_iter()
+                .filter(|block| block.title == "질문 답변 취소").collect::<Vec<_>>();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].title, "질문 답변 취소");
+            assert_eq!(records[0].body, "어느 색인가요? (빨강 / 파랑)\n이유를 적어 주세요");
+            assert!(matches!(records[0].kind, BlockKind::Warning));
+            state.handle_key(KeyEvent::from(KeyCode::Esc));
+            state.handle_notification("turn/completed", &json!({"turn": {"id": "live-turn", "status": "interrupted"}}));
+            state.flush_before_question();
+            assert!(state.drain_committed().iter().all(|block| block.title != "질문 답변 취소"));
+        }
+    }
+}
+
 fn audit_stop_question_turn(state: &mut AppState) -> Option<Action> {
     let params = json!({"threadId": "main-thread", "turn": {"id": "live-turn", "status": "interrupted"}});
     let action = state.reject_unanswered_question("turn/completed", &params);

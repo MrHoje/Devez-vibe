@@ -1448,16 +1448,7 @@ async fn execute_split_conversation_action(
             Ok(false)
         }
         Action::Interrupt => {
-            if let Some(turn_id) = state.turn_id.clone()
-                && let Err(error) = server
-                    .request(
-                        "turn/interrupt",
-                        json!({ "threadId": state.thread_id, "turnId": turn_id }),
-                    )
-                    .await
-            {
-                state.push_notice(BlockKind::Error, "중단 실패", error.to_string());
-            }
+            interrupt_turn(server, state).await;
             Ok(false)
         }
         action => execute_action(server, state, renderer, management_tx, action).await,
@@ -2496,7 +2487,7 @@ async fn interrupt_turn(server: &mut BackendServer, state: &mut AppState) {
     };
     let params = json!({ "threadId": state.thread_id, "turnId": turn_id });
     if let Err(error) = server.request("turn/interrupt", params).await {
-        state.push_notice(BlockKind::Error, "중단 실패", error.to_string());
+        state.set_interrupt_failed(error.to_string());
     }
 }
 
@@ -7565,41 +7556,25 @@ mod tests {
         assert!(params.get("effort").is_none());
     }
 
-    /// Nothing else in a turn carries which preset is active. The preset no
-    /// longer changes how the answer is written, so what rides along is the
-    /// language rule and the exception the length cap kept breaking.
+    /// Display presets carry only the same two-sentence reminder to the model.
     #[test]
-    fn every_turn_names_the_active_preset() {
+    fn every_preset_sends_only_the_question_and_language_reminder() {
         let notice = |vibe| {
             turn_additional_context(vibe, agent::AgentMode::Standard, None)
                 .pointer("/devez-vibe-mode/value")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
-                .expect("the turn names its preset")
+                .expect("the turn carries its reminder")
         };
 
-        assert!(notice(VibeMode::SuperVibe).contains("Super Vibe"));
-        assert!(notice(VibeMode::Vibe).contains("현재 응답 모드: Vibe"));
-        assert!(notice(VibeMode::Normal).contains("현재 응답 모드: Off"));
-        // Length limits belong to Builder, not to a response preset.
         for vibe in [VibeMode::Vibe, VibeMode::SuperVibe, VibeMode::Normal] {
-            assert!(!notice(vibe).contains("불릿"));
-            assert!(!notice(vibe).contains("세 줄"));
-            assert!(!notice(vibe).contains("파일 경로"));
-            assert!(!notice(vibe).contains("자세히"));
-        }
-        // The English tool-call label leaks through the system prompt, so every
-        // preset repeats the language rule where the turn cannot miss it.
-        for vibe in [VibeMode::Vibe, VibeMode::SuperVibe, VibeMode::Normal] {
-            assert!(notice(vibe).contains("영어로 시작하는 진행 문장"));
-            assert!(notice(vibe).contains("첫 글자가 한글 음절이어야 하고"));
-            assert!(!notice(vibe).contains("Now"));
-            assert!(
-                notice(vibe).contains("선택이나 승인을 요청할 때는 이 분량 제한을 적용하지 않는다")
+            assert_eq!(
+                notice(vibe),
+                "사용 가능한 질문 도구로 묻고, 없거나 실패하면 본문에 선택지·결과를 빠짐없이 쓴다.\n\
+                 진행·답변의 첫 글자가 한글 음절이어야 하고, 기술 식별자를 제외하면 한국어로 쓴다."
             );
-            assert!(notice(vibe).contains("사용 가능한 질문 도구로"));
         }
-        // Shared rules and provider reminders must not reintroduce Builder's caps.
+        // Shared rules and provider reminders must not reintroduce numeric caps.
         for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS, CLAUDE_TURN_REMINDER] {
             assert!(!rules.contains("200자"));
             assert!(!rules.contains("불릿 하나에 두 문장을 넘기지 않는다"));

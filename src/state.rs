@@ -229,29 +229,6 @@ pub enum VibeMode {
     Normal,
 }
 
-/// Repeated at the end of every preset notice. The rules say this too, but a
-/// rule in the system prompt loses to the model's own habit of labelling its
-/// next tool call in English — `Now the arming API, gap, and reset:` — so the
-/// turn restates it where it is hardest to miss. `concat!` takes literals only,
-/// so the sentence is spelled out in each arm rather than shared as a constant.
-macro_rules! language_notice {
-    () => {
-        "진행·답변의 첫 글자가 한글 음절이어야 하고, 기술 식별자를 제외하면 한국어로 쓴다. \
-         영어로 시작하는 진행 문장이나 영어 판정 뒤에 한국어를 잇지 않는다."
-    };
-}
-
-/// The length caps are what make the presets useful, and they are also what
-/// truncated the one answer that must stay whole — the one asking the user to
-/// pick. A cap the turn repeats beats a rule it does not, so the exception is
-/// restated beside the cap instead of only in the system prompt.
-macro_rules! choice_notice {
-    () => {
-        "사용자에게 선택이나 승인을 요청할 때는 이 분량 제한을 적용하지 않는다. \
-         사용 가능한 질문 도구로 묻고, 없거나 실패하면 본문에 선택지·결과를 빠짐없이 쓴다."
-    };
-}
-
 impl VibeMode {
     const PICKER_CHOICES: [Self; 3] = [Self::Normal, Self::Vibe, Self::SuperVibe];
 
@@ -302,33 +279,10 @@ impl VibeMode {
         }
     }
 
-    /// What the turn tells the model about the preset it is answering under. The
-    /// preset governs what the transcript collapses, not how the answer is
-    /// written: one length rule now holds in every mode, and asking the answer to
-    /// hide paths and identifiers on top of that only cost the user the one place
-    /// they were still readable. What stays here is what a turn cannot get
-    /// elsewhere — the choice exception and the language rule.
+    /// The same question and language reminder accompanies every display preset.
     pub const fn turn_notice(self) -> &'static str {
-        match self {
-            Self::Vibe => concat!(
-                "현재 응답 모드: Vibe. ",
-                choice_notice!(),
-                " ",
-                language_notice!(),
-            ),
-            Self::SuperVibe => concat!(
-                "현재 응답 모드: Super Vibe. ",
-                choice_notice!(),
-                " ",
-                language_notice!(),
-            ),
-            Self::Normal => concat!(
-                "현재 응답 모드: Off. ",
-                choice_notice!(),
-                " ",
-                language_notice!()
-            ),
-        }
+        "사용 가능한 질문 도구로 묻고, 없거나 실패하면 본문에 선택지·결과를 빠짐없이 쓴다.\n\
+         진행·답변의 첫 글자가 한글 음절이어야 하고, 기술 식별자를 제외하면 한국어로 쓴다."
     }
 }
 
@@ -1415,15 +1369,15 @@ impl LoginMethod {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Browser => "ChatGPT 계정으로 로그인",
-            Self::DeviceCode => "기기 코드로 로그인",
+            Self::Browser => "Sign in with ChatGPT",
+            Self::DeviceCode => "Sign in with a device code",
         }
     }
 
     fn detail(self) -> &'static str {
         match self {
-            Self::Browser => "브라우저가 열립니다",
-            Self::DeviceCode => "코드를 다른 기기에 입력합니다",
+            Self::Browser => "Opens your browser",
+            Self::DeviceCode => "Enter the code on another device",
         }
     }
 }
@@ -2160,6 +2114,9 @@ impl McpApproval {
 
     fn handle_key(&mut self, key: KeyEvent) -> Option<Value> {
         match key.code {
+            KeyCode::Esc => self.options.iter()
+                .find(|option| matches!(option.action, "decline" | "cancel"))
+                .map(|option| mcp_elicitation_response(option.action, None)),
             KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
                 None
@@ -3576,6 +3533,8 @@ pub struct AppState {
     /// The draft `Ctrl+S` set aside, waiting for the chord that brings it back.
     stashed_prompt: Option<StashedPrompt>,
     queued_prompts: VecDeque<String>,
+    /// The next turn_input belongs to a queued text, not the current draft.
+    queued_input_pending: bool,
     /// Keep an async answer separate from the unsent composer until turn/start succeeds.
     pending_async_answer: Option<String>,
     /// Async notifications may be repeated after their answer starts a new turn.
@@ -3607,6 +3566,8 @@ pub struct AppState {
     /// app-server has announced that the turn is active.
     pending_interrupt: bool,
     turn_interrupted: bool,
+    /// Only an explicit Esc on a running response may resume the local queue.
+    resume_queue_after_interrupt: bool,
     /// When this turn last showed a sign of life. A `turn/completed` that never
     /// arrives would otherwise leave the activity row waiting on nothing.
     turn_progress_at: Option<Instant>,
@@ -3898,6 +3859,7 @@ impl AppState {
             stashed_prompt: None,
             queued_prompts: VecDeque::new(),
             pending_async_answer: None,
+            queued_input_pending: false,
             handled_async_questions: HashSet::new(),
             codex_permission_mode: PermissionMode::FullAccess,
             handoff_prompt: None,
@@ -3909,6 +3871,7 @@ impl AppState {
             turn_id: None,
             pending_interrupt: false,
             turn_interrupted: false,
+            resume_queue_after_interrupt: false,
             turn_progress_at: None,
             stall_probe_at: None,
             quit_armed_at: None,
@@ -5059,6 +5022,7 @@ impl AppState {
     }
 
     pub fn turn_input(&mut self, text: String) -> Vec<Value> {
+        let queued = std::mem::take(&mut self.queued_input_pending);
         if self.pending_async_answer.as_deref() == Some(text.as_str()) {
             return vec![json!({"type": "text", "text": text, "text_elements": []})];
         }
@@ -5069,12 +5033,15 @@ impl AppState {
             "text": text,
             "text_elements": []
         })];
-        for path in std::mem::take(&mut self.composer_images) {
-            input.push(json!({ "type": "localImage", "path": path }));
+        if !queued {
+            for path in std::mem::take(&mut self.composer_images) {
+                input.push(json!({ "type": "localImage", "path": path }));
+            }
         }
         let mut added_paths = Vec::new();
         let mut resolved_tokens = Vec::new();
-        for binding in std::mem::take(&mut self.selected_completion_bindings) {
+        let bindings = if queued { Vec::new() } else { std::mem::take(&mut self.selected_completion_bindings) };
+        for binding in bindings {
             if !binding.matches_text(&text_chars) || added_paths.contains(&binding.path) {
                 continue;
             }
@@ -5812,6 +5779,7 @@ impl AppState {
             .filter_map(|turn| turn.get("items").and_then(Value::as_array))
             .flatten()
             .filter_map(user_message_text)
+            .filter(|text| !text.starts_with("질문에 대한 사용자 답변:\n"))
             .collect::<Vec<_>>();
         self.editor.replace_history(prompt_history);
         self.turn_interrupted = false;
@@ -5948,6 +5916,8 @@ impl AppState {
     }
 
     fn reset_turn_item_tracking(&mut self) {
+        self.queued_input_pending = false;
+        self.resume_queue_after_interrupt = false;
         self.pending_async_answer = None;
         self.turn_response_started = false;
         self.turn_response_visible = false;
@@ -6101,6 +6071,8 @@ impl AppState {
     }
 
     pub fn set_request_failed(&mut self, message: impl Into<String>) {
+        self.queued_input_pending = false;
+        self.resume_queue_after_interrupt = false;
         self.busy = false;
         self.end_compaction();
         self.turn_id = None;
@@ -6118,6 +6090,7 @@ impl AppState {
     }
 
     fn preserve_failed_question_answer(&mut self, answer: &str) {
+        self.resume_queue_after_interrupt = false;
         self.cancel_agent_handoff();
         self.turn_interrupted = true;
         self.editor.move_to_display_index(self.editor.chars().len());
@@ -6140,6 +6113,7 @@ impl AppState {
     /// Interrupt an active turn immediately, or remember the request until the
     /// app-server announces that a just-started turn is active.
     fn request_interrupt(&mut self) -> Action {
+        self.resume_queue_after_interrupt = false;
         self.pending_async_answer = None;
         self.discard_unanswered_turn_prompts();
         self.cancel_agent_handoff();
@@ -6173,7 +6147,13 @@ impl AppState {
         }
         self.discard_unanswered_turn_prompts();
         self.remember_interrupt();
+        self.resume_queue_after_interrupt = !self.queued_prompts.is_empty();
         true
+    }
+
+    pub fn set_interrupt_failed(&mut self, message: impl Into<String>) {
+        self.resume_queue_after_interrupt = false;
+        self.push_notice(BlockKind::Error, "중단 실패", message);
     }
 
     fn remember_interrupt(&mut self) {
@@ -6187,14 +6167,18 @@ impl AppState {
     }
 
     fn discard_unanswered_turn_prompts(&mut self) {
+        // Question/answer cards already record an interaction, even before the
+        // next assistant response is painted.
         if self.turn_response_visible || self.turn_prompts.is_empty() {
             return;
         }
         let ids = self
             .turn_prompts
-            .drain(..)
+            .iter()
+            .filter(|prompt| prompt.children().is_empty())
             .map(|prompt| prompt.id())
             .collect::<HashSet<_>>();
+        self.turn_prompts.retain(|block| !ids.contains(&block.id()));
         self.committed.retain(|block| !ids.contains(&block.id()));
         self.turn_prompt_started_at
             .retain(|id, _| !ids.contains(id));
@@ -6476,6 +6460,8 @@ impl AppState {
         self.turn_id = None;
         self.pending_interrupt = false;
         self.turn_interrupted = false;
+        self.resume_queue_after_interrupt = false;
+        self.queued_input_pending = false;
         self.turn_started_at = None;
         self.last_completed_duration = None;
         self.last_completed_at = None;
@@ -7685,7 +7671,11 @@ impl AppState {
             KeyCode::Tab if self.shell_mode => Action::None,
             KeyCode::Tab => self.cycle_agent_mode(),
             KeyCode::Enter => self.submit_editor(),
-            KeyCode::Esc if self.busy => self.request_interrupt(),
+            KeyCode::Esc if self.busy => {
+                let action = self.request_interrupt();
+                self.resume_queue_after_interrupt = !self.queued_prompts.is_empty();
+                action
+            }
             code if (code == KeyCode::Backspace && ctrl) || code == KeyCode::Char('\u{8}') => {
                 self.delete_from_composer(Editor::delete_word_left);
                 self.command_selection = 0;
@@ -8084,6 +8074,20 @@ impl AppState {
         }
         let interrupt = matches!(self.request_interrupt(), Action::Interrupt);
         Action::CancelUserInput { id, interrupt }
+    }
+
+    fn cancel_visible_question(&mut self, id: Value, questions: &[Question]) -> Action {
+        let body = questions.iter().map(|question| {
+            let options = question.options.iter().map(|option| option.label.as_str())
+                .collect::<Vec<_>>().join(" / ");
+            if options.is_empty() {
+                question.question.clone()
+            } else {
+                format!("{} ({options})", question.question)
+            }
+        }).collect::<Vec<_>>().join("\n");
+        self.push_notice(BlockKind::Warning, "질문 답변 취소", body);
+        self.cancel_user_question(id)
     }
 
     fn flush_before_question(&mut self) {
@@ -8812,6 +8816,9 @@ impl AppState {
                     .get("turn")
                     .and_then(|turn| turn.get("status"))
                     .and_then(Value::as_str);
+                if turn_error.is_some() || turn_status == Some("failed") {
+                    self.resume_queue_after_interrupt = false;
+                }
                 let successful = !self.turn_interrupted
                     && turn_error.is_none()
                     && !matches!(turn_status, Some("failed" | "aborted" | "interrupted"));
@@ -9115,6 +9122,9 @@ impl AppState {
                     .get("willRetry")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                if !retry {
+                    self.resume_queue_after_interrupt = false;
+                }
                 let provider = params
                     .get("provider")
                     .and_then(Value::as_str)
@@ -9214,6 +9224,7 @@ impl AppState {
     }
 
     fn submit_editor(&mut self) -> Action {
+        self.queued_input_pending = false;
         // A fresh install has picked no runtime yet, so the first prompt opens
         // the picker instead of guessing one. Nothing leaves the composer, and
         // slash commands still run — `/provider` among them.
@@ -9246,15 +9257,28 @@ impl AppState {
     }
 
     pub fn start_queued_prompt(&mut self, text: String) -> Action {
-        self.submit_text(text.clone(), text)
+        let action = self.submit_text(text.clone(), text);
+        self.queued_input_pending = matches!(&action, Action::Submit(_) | Action::Steer(_));
+        action
     }
 
     /// The handoff stays armed until its prompt actually starts a turn (see
     /// `submit_text`), since a drained prompt can bounce back into the queue.
     pub fn take_queued_prompt(&mut self) -> Option<String> {
-        if self.turn_interrupted || self.awaiting_input() {
+        if self.resume_queue_after_interrupt
+            || self.held_notifications.iter().any(|(method, _)| method == "turn/completed")
+        {
+            // Completion can be held behind paced text. Apply it before starting
+            // another turn, but never turn an unacknowledged stop into a steer.
+            self.flush_before_question();
+        }
+        if self.host_turn_busy()
+            || (self.turn_interrupted && !self.resume_queue_after_interrupt)
+            || self.awaiting_input()
+        {
             return None;
         }
+        self.resume_queue_after_interrupt = false;
         self.queued_prompts.pop_front()
     }
 
@@ -10986,6 +11010,18 @@ impl AppState {
                 mut selected,
                 choices,
             } => match key.code {
+                KeyCode::Esc => {
+                    let decline = choices.iter().find(|choice| {
+                        choice.result.get("decision").and_then(Value::as_str) == Some("decline")
+                            || (choice.result.get("permissions") == Some(&json!({}))
+                                && choice.result.get("scope").and_then(Value::as_str) == Some("turn"))
+                    }).or_else(|| choices.iter().find(|choice|
+                        choice.result.get("decision").and_then(Value::as_str) == Some("cancel")));
+                    match decline {
+                        Some(choice) => Action::RpcResponse { id, result: choice.result.clone() },
+                        None => Action::RpcError { id, message: "승인 요청에 거절 응답이 없습니다.".into() },
+                    }
+                }
                 KeyCode::Up => {
                     selected = selected.saturating_sub(1);
                     self.pending = Some(PendingInteraction::Approval {
@@ -11039,7 +11075,7 @@ impl AppState {
                 if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c')) {
                     // Esc와 Ctrl+C는 답을 보내지 않고 턴을 멈춘다. 빈 답을
                     // 돌려주면 도구가 성공한 셈이 되어 턴이 그대로 이어진다.
-                    return self.cancel_user_question(id);
+                    return self.cancel_visible_question(id, &questions);
                 }
 
                 let question = &questions[current];
@@ -11170,7 +11206,7 @@ impl AppState {
                             // Leaving the question is cancellation, not an empty
                             // successful answer that could resume execution.
                             if selected == chat_instead {
-                                return self.cancel_user_question(id);
+                                return self.cancel_visible_question(id, &questions);
                             }
                             // Focusing the free-text row is enough. The next key is
                             // input immediately; no hidden Enter-only mode exists.
@@ -12011,7 +12047,7 @@ impl AppState {
                     title: title.clone(),
                     lines,
                     slider: None,
-                    hint: "↑↓ Select   Enter Confirm".to_owned(),
+                    hint: "↑↓ Select   Enter Confirm   Esc Decline".to_owned(),
                     style: OverlayStyle::Panel,
                     input: None,
                     input_label: "",
@@ -12048,7 +12084,7 @@ impl AppState {
                     title: "MCP approval".to_owned(),
                     lines,
                     slider: None,
-                    hint: "↑↓ Select   Enter Confirm".to_owned(),
+                    hint: "↑↓ Select   Enter Confirm   Esc Cancel".to_owned(),
                     style: OverlayStyle::KeyboardOnlyPanel,
                     input: None,
                     input_label: "",
@@ -13365,10 +13401,10 @@ impl AppState {
 
     pub fn click_overlay_row(&mut self, row: usize) -> Action {
         if self.async_answer_waiting_for_stop() {
-            if let Some(PendingInteraction::UserInput { id, questions, current, .. }) = &self.pending
+            if let Some(PendingInteraction::UserInput { questions, current, .. }) = &self.pending
                 && row == chat_instead_index(&questions[*current]) + 1
             {
-                return self.cancel_user_question(id.clone());
+                return self.handle_pending_key(KeyEvent::from(KeyCode::Esc));
             }
             return Action::None;
         }
@@ -13629,7 +13665,7 @@ impl AppState {
                             next_question_or_reply(id, questions, current, answers, self)
                         }
                     }
-                    Some(clicked) if clicked == chat_instead => self.cancel_user_question(id),
+                    Some(clicked) if clicked == chat_instead => self.cancel_visible_question(id, &questions),
                     Some(clicked) if clicked == question.options.len() && question.allow_other => {
                         self.pending = Some(PendingInteraction::UserInput {
                             id,
@@ -18859,6 +18895,33 @@ mod tests {
     }
 
     #[test]
+    fn resumed_async_answers_stay_in_transcript_but_not_composer_history() {
+        let mut state = test_state();
+        let answer = "질문에 대한 사용자 답변:\n하나를 골라 주세요.\n첫 번째 선택지";
+        let prompt = "이 문구를 설명해 줘: 질문에 대한 사용자 답변:\n첫 번째 선택지";
+        let thread = json!({"turns": [
+            {"id": "prompt", "items": [{"type": "userMessage", "content": [
+                {"type": "text", "text": prompt}
+            ]}]},
+            {"id": "answer", "items": [{"type": "userMessage", "content": [
+                {"type": "text", "text": answer}
+            ]}]}
+        ]});
+        state.editor.set_text("작성 중인 초안");
+
+        state.load_history(&thread, None);
+
+        state.editor.history_previous();
+        assert_eq!(state.editor.text(), prompt);
+        assert_eq!(state.editor.history_position(), Some((1, 1)));
+        state.editor.history_next();
+        assert_eq!(state.editor.text(), "작성 중인 초안");
+        assert!(state.drain_committed().iter().any(|block|
+            matches!(block.kind, BlockKind::User) && block.body == answer
+        ));
+    }
+
+    #[test]
     fn resumed_codex_and_claude_prompts_replace_composer_history() {
         for model in ["gpt-5.6-sol", "claude:claude-sonnet-5"] {
             let mut state = test_state();
@@ -23653,6 +23716,80 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_after_question_answer_keeps_question_and_answer() {
+        for (model, asynchronous, early) in [
+            ("claude:opus", false, false),
+            ("gpt-5.6-sol", false, false),
+            ("gpt-5.6-sol", true, false),
+            ("gpt-5.6-sol", true, true),
+        ] {
+            for starting in [false, true] {
+                let mut state = AppState::new(
+                    "thread".into(), "cwd".into(), "account".into(), Vec::new(), model, None,
+                );
+                state.editor.set_text("질문해 주세요");
+                state.submit_editor();
+                state.set_turn_started("turn".into());
+                let stopped = json!({"turn": {"id": "turn", "status": "interrupted"}});
+                if asynchronous {
+                    state.reject_unanswered_question("item/completed", &json!({"item": {
+                        "id": "question", "type": "agentMessage", "delivery": "async",
+                        "questions": [{"title": "어떤 방법인가요?", "options": ["첫째", "둘째"]}]
+                    }}));
+                    if !early {
+                        state.reject_unanswered_question("turn/completed", &stopped);
+                    }
+                } else {
+                    state.begin_server_request(json!(1), "item/tool/requestUserInput", &json!({
+                        "questions": [{"id": "q1", "question": "어떤 방법인가요?",
+                            "options": [{"label": "첫째"}, {"label": "둘째"}]}]
+                    }));
+                }
+                let mut action = state.handle_key(KeyEvent::from(KeyCode::Enter));
+                if early {
+                    action = state.reject_unanswered_question("turn/completed", &stopped).unwrap();
+                }
+                assert!(matches!(action, Action::Submit(_) | Action::RpcResponse { .. }));
+                let blocks = state.drain_committed();
+                let answer = blocks.iter().find(|block| !block.children().is_empty()).unwrap();
+                state.take_discarded_prompt_ids();
+                if asynchronous && !starting {
+                    state.set_turn_started("answer-turn".into());
+                }
+                assert!(matches!(state.handle_key(KeyEvent::from(KeyCode::Esc)),
+                    Action::Interrupt | Action::Tick(true)));
+                assert!(!state.take_discarded_prompt_ids().contains(&answer.id()), "{model}, async={asynchronous}, starting={starting}");
+                state.handle_notification("turn/completed", &json!({"turn": {
+                    "id": if asynchronous { "answer-turn" } else { "turn" }, "status": "interrupted"
+                }}));
+                state.flush_before_question();
+                assert!(state.take_discarded_prompt_ids().is_empty());
+                assert!(state.turn_prompts.iter().any(|block| block.id() == answer.id()));
+                assert_eq!(answer.children()[0].title, "어떤 방법인가요?");
+                assert_eq!(answer.children()[0].body, "첫째");
+            }
+        }
+    }
+
+    #[test]
+    fn interrupt_after_question_answer_still_discards_unanswered_steer() {
+        let mut state = busy_state_with_live_turn();
+        state.begin_server_request(json!(1), "item/tool/requestUserInput", &json!({
+            "questions": [{"id": "q", "question": "선택하세요",
+                "options": [{"label": "첫째"}]}]
+        }));
+        assert!(matches!(state.handle_key(KeyEvent::from(KeyCode::Enter)), Action::RpcResponse { .. }));
+        let answer = state.drain_committed().pop().unwrap();
+        state.editor.set_text("추가 요청");
+        assert!(matches!(state.submit_editor(), Action::Steer(_)));
+        let prompt = state.drain_committed().pop().unwrap();
+
+        assert!(matches!(state.handle_key(KeyEvent::from(KeyCode::Esc)), Action::Interrupt));
+        assert_eq!(state.take_discarded_prompt_ids(), vec![prompt.id()]);
+        assert_eq!(state.turn_prompts.iter().map(Block::id).collect::<Vec<_>>(), vec![answer.id()]);
+    }
+
+    #[test]
     fn interrupt_before_assistant_text_discards_the_sent_prompt() {
         let mut state = test_state();
         state.editor.set_text("표시하지 않을 요청");
@@ -24974,7 +25111,7 @@ mod tests {
     }
 
     #[test]
-    fn command_approval_ignores_shortcut_and_escape_keys() {
+    fn command_approval_ignores_unbound_shortcut_keys() {
         let mut state = command_approval_state();
         for code in [
             KeyCode::Char('y'),
@@ -24982,7 +25119,6 @@ mod tests {
             KeyCode::Char('n'),
             KeyCode::Char('ㅛ'),
             KeyCode::Char('ㅜ'),
-            KeyCode::Esc,
             KeyCode::Tab,
         ] {
             assert!(matches!(
@@ -25005,7 +25141,7 @@ mod tests {
         ));
         let overlay = state.overlay_view().expect("approval selection");
         assert!(overlay.lines[3].selected);
-        assert_eq!(overlay.hint, "↑↓ Select   Enter Confirm");
+        assert_eq!(overlay.hint, "↑↓ Select   Enter Confirm   Esc Decline");
         match state.handle_key(KeyEvent::from(KeyCode::Enter)) {
             Action::RpcResponse { result, .. } => {
                 assert_eq!(
@@ -25909,7 +26045,6 @@ mod tests {
             KeyCode::Char('n'),
             KeyCode::Char('2'),
             KeyCode::Tab,
-            KeyCode::Esc,
         ] {
             assert!(matches!(
                 state.handle_key(KeyEvent::from(code)),
@@ -27860,7 +27995,7 @@ mod tests {
                 .iter()
                 .any(|line| line.text.contains("이 프로젝트에서 항상 허용"))
         );
-        assert_eq!(overlay.hint, "↑↓ Select   Enter Confirm");
+        assert_eq!(overlay.hint, "↑↓ Select   Enter Confirm   Esc Decline");
 
         let mut state = test_state();
         state.begin_server_request(
@@ -27878,7 +28013,7 @@ mod tests {
                 line.text == "이 프로젝트에서 항상 허용: Bash(npm test)"
             })
         );
-        assert_eq!(overlay.hint, "↑↓ Select   Enter Confirm");
+        assert_eq!(overlay.hint, "↑↓ Select   Enter Confirm   Esc Decline");
     }
 
     #[test]

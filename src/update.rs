@@ -21,10 +21,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "보낸 프롬프트에 처리 역할을 역할별 색상으로 표시하고, 완료 후 소요 시간을 함께 표시합니다.",
-    "질문 답변이 중복 알림이나 전송 실패로 사라지지 않도록 하고, 보내지 않은 초안의 첨부가 답변에 섞이지 않도록 수정했습니다.",
-    "Claude는 자동 승인 검토를 사용하고, Codex는 전체 접근이 정책상 거절되면 허용되는 낮은 권한으로 전환합니다.",
-    "하위 에이전트의 작업 이름을 읽기 쉽게 표시하고 경과 시간을 함께 보여 줍니다.",
+    "응답 중 링크 주소가 길게 나타났다 줄어드는 현상을 없애고, 링크가 완성되면 바로가기를 활성화합니다.",
+    "대기 요청이 다른 요청에 끼어들거나 미전송 초안의 이미지·자동완성 선택을 가져가는 문제를 수정합니다.",
+    "Builder의 고정 분량 제한을 없애고, 중요한 근거를 유지하면서 간결하게 답하도록 합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

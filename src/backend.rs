@@ -3272,7 +3272,7 @@ mod tests {
     }
 
     #[test]
-    fn response_length_caps_reach_only_builder_on_every_provider() {
+    fn fixed_response_length_caps_are_absent_on_every_provider() {
         for role in crate::agent::BUILTIN {
             for vibe in [crate::VibeMode::Normal, crate::VibeMode::Vibe, crate::VibeMode::SuperVibe] {
                 let mut params = crate::new_thread_params(
@@ -3294,9 +3294,8 @@ mod tests {
                         RuntimeKind::OpenCode => combined_turn_instructions(&params, runtime).unwrap(),
                     };
                     for cap in ["200자", "불릿 두세 개", "불릿 하나에 두 문장", "수정이 셋을 넘으면"] {
-                        assert_eq!(
-                            outgoing.contains(cap),
-                            role == crate::agent::AgentMode::Standard,
+                        assert!(
+                            !outgoing.contains(cap),
                             "{} / {} / {}: {cap}",
                             runtime.label(), role.id(), vibe.label(),
                         );

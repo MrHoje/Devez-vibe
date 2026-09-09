@@ -2701,6 +2701,7 @@ impl Renderer {
                     self.diff_display_mode,
                     self.expanded_tools.contains(&child.id()),
                     None,
+                    false,
                 );
                 append_compact_open_code_response(&mut lines, previous, child, child_lines);
                 previous = Some(child);
@@ -2724,6 +2725,7 @@ impl Renderer {
             self.diff_display_mode,
             self.expanded_tools.contains(&block.id()),
             self.response_reveal_for(block.id()),
+            false,
         )
     }
 
@@ -6655,12 +6657,14 @@ fn render_live_block_lines(
     let mut lines = Vec::new();
     let mut previous = None;
     for block in visible {
-        let block_lines = block_group_lines(
+        let block_lines = block_group_lines_at(
             block,
             width,
             shell_display_mode,
             diff_display_mode,
             expanded_tools.contains(&block.id()),
+            None,
+            true,
         );
         append_compact_open_code_response(&mut lines, previous, block, block_lines);
         previous = Some(block);
@@ -6691,12 +6695,14 @@ fn render_streamed_transcript_lines(
         if is_blank_bodied_assistant_block(&block) {
             continue;
         }
-        let mut lines = block_group_lines(
+        let mut lines = block_group_lines_at(
             &block,
             width,
             shell_display_mode,
             diff_display_mode,
             expanded_tools.contains(&block.id()),
+            None,
+            true,
         );
         // 활성 응답과 완료 기록이 같은 꼬리 행을 가져야 턴 종료 순간 답변이 한 행
         // 내려가지 않는다. 닫힌 문단과 블록 구분 줄이 겹치면 화면에는 하나만 둔다.
@@ -10530,6 +10536,7 @@ fn block_group_lines(
         diff_display_mode,
         expanded,
         None,
+        false,
     )
 }
 
@@ -10540,6 +10547,7 @@ fn block_group_lines_at(
     diff_display_mode: DiffDisplayMode,
     expanded: bool,
     response_reveal: Option<f32>,
+    streaming: bool,
 ) -> Vec<PaintLine> {
     let mut lines = block_lines_with_mode_at(
         block,
@@ -10548,6 +10556,7 @@ fn block_group_lines_at(
         diff_display_mode,
         expanded,
         response_reveal,
+        streaming,
     );
     while matches!(lines.last(), Some(line) if line == &PaintLine::blank()) {
         lines.pop();
@@ -10623,6 +10632,7 @@ fn block_lines_with_mode(
         diff_display_mode,
         expanded,
         None,
+        false,
     )
 }
 
@@ -10633,6 +10643,7 @@ fn block_lines_with_mode_at(
     diff_display_mode: DiffDisplayMode,
     expanded: bool,
     response_reveal: Option<f32>,
+    streaming: bool,
 ) -> Vec<PaintLine> {
     if is_bash_block(block) {
         return shell_group_lines(block, width, shell_display_mode, expanded);
@@ -10797,6 +10808,10 @@ fn block_lines_with_mode_at(
     }
     let mut line_index = 0;
     while let Some(raw_line) = raw_lines.get(line_index).copied() {
+        let streaming_line = streaming
+            && conversational
+            && line_index + 1 == raw_lines.len()
+            && !body.ends_with(['\r', '\n']);
         let trimmed = raw_line.trim_start();
         if let Some(language) = trimmed.strip_prefix("```") {
             if code {
@@ -10857,6 +10872,7 @@ fn block_lines_with_mode_at(
                 content_tone,
                 false,
                 conversational_width,
+                streaming_line,
             ));
             line_index = table_start;
         } else if trimmed.starts_with('#') {
@@ -10869,6 +10885,7 @@ fn block_lines_with_mode_at(
                 Tone::MarkdownHeading,
                 true,
                 conversational_width,
+                streaming_line,
             ));
         } else if let Some(item) = trimmed
             .strip_prefix("- ")
@@ -10889,6 +10906,7 @@ fn block_lines_with_mode_at(
                 content_tone,
                 false,
                 conversational_width,
+                streaming_line,
             ));
         } else if let Some(quote) = trimmed.strip_prefix("> ") {
             let (prefix, prefix_tone) =
@@ -10911,6 +10929,7 @@ fn block_lines_with_mode_at(
                 content_tone,
                 false,
                 conversational_width,
+                streaming_line,
             ));
         }
         line_index += 1;
@@ -11515,6 +11534,7 @@ fn markdown_line(
     tone: Tone,
     bold: bool,
     width: u16,
+    streaming: bool,
 ) -> Vec<PaintLine> {
     if !text.contains('`') && !text.contains("**") && !text.contains('[') && !text.contains("http")
     {
@@ -11532,16 +11552,30 @@ fn markdown_line(
             index += 2;
             continue;
         }
-        if let Some(after_tick) = rest.strip_prefix('`')
-            && let Some(end) = after_tick.find('`')
-        {
-            push_highlight_span(&mut spans, &after_tick[..end], Tone::InlineCode, false);
-            index += end + 2;
-            continue;
+        if rest.starts_with('`') {
+            let ticks = rest.bytes().take_while(|&byte| byte == b'`').count();
+            let after_tick = &rest[ticks..];
+            if let Some((end, _)) = after_tick.match_indices(&rest[..ticks]).find(|(end, _)| {
+                !after_tick[..*end].ends_with('`') && !after_tick[*end + ticks..].starts_with('`')
+            }) {
+                push_highlight_span(&mut spans, &after_tick[..end], Tone::InlineCode, false);
+                index += end + ticks * 2;
+                continue;
+            }
+            // 닫히지 않은 코드도 원문을 유지하며 안쪽의 링크를 활성화하지 않는다.
+            push_highlight_span(&mut spans, rest, tone, strong);
+            break;
         }
-        if let Some((label, target, consumed)) = inline_link(rest) {
-            push_highlight_span(&mut spans, &label, Tone::MarkdownLink, strong);
-            links.push((label, target));
+        if let Some((label, target, consumed)) = inline_link(rest, streaming) {
+            let link_tone = if streaming || target.is_some() {
+                Tone::MarkdownLink
+            } else {
+                tone
+            };
+            push_highlight_span(&mut spans, &label, link_tone, strong);
+            if let Some(target) = target {
+                links.push((label, target));
+            }
             index += consumed;
             continue;
         }
@@ -11601,17 +11635,47 @@ fn bare_url(rest: &str) -> Option<&str> {
 /// A `:line` (or `:line:column`) tail on the target is worth reading, so it gets
 /// grafted onto the label; the rest of the path is noise the label already says.
 /// Returns the text to paint plus how many bytes of `rest` it consumed.
-fn inline_link(rest: &str) -> Option<(String, String, usize)> {
+/// Streaming tails expose only the label and have no click target until closed.
+fn inline_link(rest: &str, streaming: bool) -> Option<(String, Option<String>, usize)> {
     let image = rest.starts_with("![");
     let body = if image { &rest[1..] } else { rest };
     let after_bracket = body.strip_prefix('[')?;
-    let close = after_bracket.find("](")?;
+    let Some(close) = after_bracket.find("](") else {
+        // 마지막 줄의 링크 이름은 먼저 표시하되 주소가 완성되기 전에는 열지 않는다.
+        let label = after_bracket.strip_suffix(']').unwrap_or(after_bracket);
+        return (streaming && !label.contains(['[', ']']))
+            .then(|| (label.to_owned(), None, rest.len()));
+    };
     let label = &after_bracket[..close];
     if label.contains('[') {
         return None;
     }
     let after_paren = &after_bracket[close + 2..];
-    let end = after_paren.find(')')?;
+    // 주소 안의 괄호와 링크를 닫는 괄호를 구분한다. <...> 안에서는 괄호가 경로다.
+    let end = if after_paren.starts_with('<') {
+        after_paren.find(">)").map(|index| index + 1)
+    } else {
+        let mut depth = 0;
+        after_paren.char_indices().find_map(|(index, ch)| match ch {
+            '(' => {
+                depth += 1;
+                None
+            }
+            ')' if depth == 0 => Some(index),
+            ')' => {
+                depth -= 1;
+                None
+            }
+            _ => None,
+        })
+    };
+    let Some(end) = end else {
+        return Some((
+            if streaming { label } else { rest }.to_owned(),
+            None,
+            rest.len(),
+        ));
+    };
     let raw_target = &after_paren[..end];
     let target = markdown_link_target_body(raw_target);
     let consumed = usize::from(image) + 1 + close + 2 + end + 1;
@@ -11624,7 +11688,7 @@ fn inline_link(rest: &str) -> Option<(String, String, usize)> {
     {
         text.push_str(&suffix);
     }
-    Some((text, markdown_link_open_target(raw_target), consumed))
+    Some((text, Some(markdown_link_open_target(raw_target)), consumed))
 }
 
 /// Converts Codex-style local file targets into values understood by the
@@ -11674,13 +11738,10 @@ fn is_local_file_target(target: &str) -> bool {
 /// visible spans, so clickable regions are rebuilt from their display text in
 /// parse order and attached to every wrapped fragment of the label.
 fn attach_markdown_link_picks(lines: &mut [PaintLine], links: &[(String, String)]) {
-    let mut links = links.iter();
-    let Some((first_label, first_target)) = links.next() else {
-        return;
-    };
-    let mut label = first_label.as_str();
-    let mut target = first_target.as_str();
-    let mut remaining = label.chars().count();
+    let mut links = links
+        .iter()
+        .map(|(label, target)| (label.as_str(), target.as_str()))
+        .peekable();
 
     for line in lines {
         let mut column = UnicodeWidthStr::width(line.prefix.as_str());
@@ -11690,17 +11751,26 @@ fn attach_markdown_link_picks(lines: &mut [PaintLine], links: &[(String, String)
         {
             for ch in span.0.chars() {
                 let width = UnicodeWidthChar::width(ch).unwrap_or(0);
-                if span.1 == Tone::MarkdownLink && remaining > 0 {
-                    regions.push((column, column + width, Pick::OpenLink(target.to_owned())));
-                    remaining -= 1;
-                    if remaining == 0 {
-                        let Some((next_label, next_target)) = links.next() else {
-                            column += width;
-                            continue;
-                        };
-                        label = next_label.as_str();
-                        target = next_target.as_str();
-                        remaining = label.chars().count();
+                if span.1 == Tone::MarkdownLink {
+                    while let Some((label, _)) = links.peek_mut() {
+                        // 줄바꿈에서 생략한 공백은 다음 링크의 글자로 세지 않는다.
+                        if !ch.is_whitespace() {
+                            *label = label.trim_start_matches(char::is_whitespace);
+                        }
+                        if !label.is_empty() {
+                            break;
+                        }
+                        links.next();
+                    }
+                    if let Some((label, target)) = links.peek_mut()
+                        && let Some(rest) = label.strip_prefix(ch)
+                    {
+                        regions.push((
+                            column,
+                            column + width,
+                            Pick::OpenLink((*target).to_owned()),
+                        ));
+                        *label = rest;
                     }
                 }
                 column += width;
@@ -17026,6 +17096,7 @@ mod tests {
             Tone::Plain,
             false,
             100,
+            false,
         );
         let line = &lines[0];
         let url = "https://claude.ai/code/g/abc123";
@@ -17056,6 +17127,7 @@ mod tests {
             Tone::Plain,
             false,
             22,
+            false,
         );
 
         assert_eq!(painted(&lines[0]), "● 가나다");
@@ -17231,6 +17303,7 @@ mod tests {
             Tone::Plain,
             false,
             100,
+            false,
         );
         let line = &lines[0];
         let rendered = std::iter::once(line.text.as_str())
@@ -17259,6 +17332,7 @@ mod tests {
             Tone::MarkdownHeading,
             true,
             100,
+            false,
         );
         let line = &lines[0];
 
@@ -17575,6 +17649,7 @@ mod tests {
             Tone::Plain,
             false,
             200,
+            false,
         );
         let line = &lines[0];
         let rendered = std::iter::once(line.text.as_str())
@@ -17586,6 +17661,401 @@ mod tests {
     }
 
     #[test]
+    fn streaming_link_labels_hide_delimiters_while_the_name_arrives() {
+        for (source, expected) in [
+            ("[", ""),
+            ("[한", "한"),
+            ("[한글 문서", "한글 문서"),
+            ("[한글 문서]", "한글 문서"),
+            ("[한글 문서](https://example.com", "한글 문서"),
+            ("![그림](https://example.com", "그림"),
+            ("[](https://example.com", ""),
+        ] {
+            let lines = markdown_line("", Tone::Plain, source, Tone::Plain, false, 80, true);
+            assert_eq!(lines.iter().map(painted).collect::<String>(), expected);
+            assert!(lines.iter().all(|line| line.pick.is_none()));
+        }
+    }
+
+    #[test]
+    fn streaming_link_destinations_never_expand_the_label_or_open_early() {
+        for chat in [false, true] {
+            set_chat_layout(chat);
+            for width in [24, 80] {
+                for streamed in [false, true] {
+                    let render = |block: &Block| {
+                        let live = [LiveBlockView { block, revision: 0 }];
+                        if streamed {
+                            render_streamed_transcript_lines(
+                                &live,
+                                width,
+                                &HashSet::new(),
+                                ShellDisplayMode::Hide,
+                                DiffDisplayMode::Hide,
+                            )
+                            .0
+                        } else {
+                            render_live_block_lines(
+                                &live,
+                                width,
+                                &HashSet::new(),
+                                ShellDisplayMode::Hide,
+                                DiffDisplayMode::Hide,
+                            )
+                        }
+                    };
+                    for (destination, target, label) in [
+                        (
+                            "https://example.com/a/very/long/path/to/the/document",
+                            "https://example.com/a/very/long/path/to/the/document",
+                            "문서",
+                        ),
+                        (
+                            "</D:/긴 경로/docs/document.md:83:12>",
+                            "D:/긴 경로/docs/document.md",
+                            "문서:83:12",
+                        ),
+                        (
+                            "https://example.com/guide_(draft)/installation",
+                            "https://example.com/guide_(draft)/installation",
+                            "문서",
+                        ),
+                        (
+                            "</D:/긴 경로/문서 (초안)/document.md:83:12>",
+                            "D:/긴 경로/문서 (초안)/document.md",
+                            "문서:83:12",
+                        ),
+                        (
+                            "</D:/긴 경로/문서 )/document.md:83:12>",
+                            "D:/긴 경로/문서 )/document.md",
+                            "문서:83:12",
+                        ),
+                    ] {
+                        let prefix = "열기: [문서](";
+                        let source = format!("{prefix}{destination})");
+                        let mut block = Block::new(BlockKind::Assistant, "Codex", prefix);
+                        let baseline = render(&block).iter().map(painted).collect::<Vec<_>>();
+                        assert!(baseline.iter().any(|row| row.contains("열기: 문서")));
+                        for end in source
+                            .char_indices()
+                            .map(|(index, _)| index)
+                            .filter(|&end| end >= prefix.len())
+                        {
+                            block.body = source[..end].to_owned();
+                            let lines = render(&block);
+                            assert_eq!(
+                                lines.iter().map(painted).collect::<Vec<_>>(),
+                                baseline,
+                                "입력 중 주소가 화면을 늘림: {width}, {streamed}, {:?}",
+                                block.body
+                            );
+                            assert!(
+                                lines.iter().all(|line| line.pick.is_none()),
+                                "미완성 주소를 열 수 있음: {:?}",
+                                block.body
+                            );
+                        }
+                        block.body = source;
+                        let complete = render(&block);
+                        let visible = complete.iter().map(painted).collect::<Vec<_>>();
+                        assert!(visible.iter().any(|row| row.contains(label)));
+                        assert!(
+                            complete
+                                .iter()
+                                .filter_map(|line| line.pick.as_ref())
+                                .flat_map(|picks| &picks.0)
+                                .any(|(_, _, pick)| *pick == Pick::OpenLink(target.to_owned()))
+                        );
+                        if label == "문서" {
+                            assert_eq!(visible, baseline, "링크 완성 순간 화면이 줄어듦");
+                        }
+                        assert_eq!(
+                            visible,
+                            block_group_lines(
+                                &block,
+                                width,
+                                ShellDisplayMode::Hide,
+                                DiffDisplayMode::Hide,
+                                false,
+                            )
+                            .iter()
+                            .map(painted)
+                            .collect::<Vec<_>>()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_links_keep_click_targets_after_wrapped_label_spaces() {
+        for label in ["가나 다라", " 가나  다라 ", "\t가나\t다라\t", " "] {
+            for width in [8, 12, 24, 80] {
+                for pending in [false, true] {
+                    let source = format!(
+                        "[{label}](https://example.com/a) [마바 사아](https://example.com/b) [자차 카타](https://example.com/c{}",
+                        if pending { "" } else { ")" },
+                    );
+                    let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+                    renderer.previous_lines =
+                        markdown_line("  ", Tone::Plain, &source, Tone::Plain, false, width, true);
+                    for (row, line) in renderer.previous_lines.iter().enumerate() {
+                        let mut column = 0;
+                        for ch in painted(line).chars() {
+                            let cells = UnicodeWidthChar::width(ch).unwrap_or(0);
+                            let expected = match ch {
+                                '가' | '나' | '다' | '라' => Some("https://example.com/a"),
+                                '마' | '바' | '사' | '아' => Some("https://example.com/b"),
+                                '자' | '차' | '카' | '타' if !pending => {
+                                    Some("https://example.com/c")
+                                }
+                                '자' | '차' | '카' | '타' => None,
+                                _ => {
+                                    column += cells;
+                                    continue;
+                                }
+                            }
+                            .map(|target| Pick::OpenLink(target.to_owned()));
+                            for cell in column..column + cells {
+                                assert_eq!(
+                                    renderer.pick_at(cell as u16, row as u16),
+                                    expected,
+                                    "줄바꿈 뒤 클릭 대상 오류: {source:?}, width={width}, ch={ch}"
+                                );
+                            }
+                            column += cells;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_links_inside_code_spans_stay_literal_and_unclickable() {
+        for delimiter in ["`", "``", "```"] {
+            for code in [
+                "[문서](https://example.com/complete)",
+                "예 `코드` [문서](https://example.com/pending",
+            ] {
+                if delimiter == "`" && code.contains('`') {
+                    continue;
+                }
+                for closed in [false, true] {
+                    let source = format!(
+                        "예: {delimiter}{code}{}",
+                        if closed { delimiter } else { "" }
+                    );
+                    for streaming in [false, true] {
+                        let lines = markdown_line(
+                            "",
+                            Tone::Plain,
+                            &source,
+                            Tone::Plain,
+                            false,
+                            120,
+                            streaming,
+                        );
+                        assert!(
+                            lines.iter().map(painted).collect::<String>().contains(code),
+                            "코드 안의 링크 원문이 축약됨: {source:?}"
+                        );
+                        assert!(
+                            lines.iter().all(|line| line.pick.is_none()),
+                            "코드 안의 링크를 열 수 있음: {source:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_links_follow_provider_completion_and_interruption_on_screen() {
+        for (model, provider) in [("gpt-5.6-sol", "Codex"), ("claude:opus", "Claude")] {
+            for interrupted in [false, true] {
+                for width in [24, 80] {
+                    let mut state = crate::state::AppState::new(
+                        "thread".into(),
+                        "cwd".into(),
+                        "account".into(),
+                        Vec::new(),
+                        model,
+                        None,
+                    );
+                    state.set_turn_started("turn".to_owned());
+                    let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+                    let mut received = String::new();
+                    for chunk in [
+                        "열기: [검사](",
+                        "https://example.com/guide_(",
+                        "draft)",
+                        "/path",
+                        ")",
+                    ] {
+                        if interrupted && chunk == ")" {
+                            break;
+                        }
+                        received.push_str(chunk);
+                        state.handle_notification(
+                            "item/agentMessage/delta",
+                            &serde_json::json!({
+                                "itemId": "answer", "provider": provider, "delta": chunk,
+                            }),
+                        );
+                        for _ in 0..100 {
+                            if state.drain_stream_text(Duration::from_millis(40)).backlog == 0 {
+                                break;
+                            }
+                        }
+                        let live = state
+                            .view()
+                            .live_blocks
+                            .iter()
+                            .map(|live| live.block.clone())
+                            .collect::<Vec<_>>();
+                        assert_eq!(live[0].body, received);
+                        renderer.previous_lines = simulate_fullscreen_frame(
+                            &mut renderer,
+                            &[],
+                            &live,
+                            Some("Working"),
+                            None,
+                            24,
+                            width,
+                        );
+                        let (row, column) = renderer
+                            .previous_lines
+                            .iter()
+                            .enumerate()
+                            .find_map(|(row, line)| {
+                                let text = painted(line);
+                                text.find("검사")
+                                    .map(|start| (row, UnicodeWidthStr::width(&text[..start])))
+                            })
+                            .expect("스트리밍 링크 이름");
+                        assert_eq!(
+                            renderer.pick_at(column as u16, row as u16),
+                            (chunk == ")").then(|| Pick::OpenLink(
+                                "https://example.com/guide_(draft)/path".to_owned()
+                            ))
+                        );
+                    }
+                    state.handle_notification("turn/completed", &serde_json::json!({
+                        "turn": { "id": "turn", "status": if interrupted { "interrupted" } else { "completed" } }
+                    }));
+                    assert!(state.view().live_blocks.is_empty());
+                    let committed = state.drain_committed();
+                    let answer = committed
+                        .iter()
+                        .find(|block| matches!(block.kind, BlockKind::Assistant))
+                        .expect("보존된 응답");
+                    assert_eq!(answer.body, received, "완료·중단 처리에서 원문이 바뀜");
+                    renderer.previous_lines = simulate_fullscreen_frame(
+                        &mut renderer,
+                        &committed,
+                        &[],
+                        Some("Completed"),
+                        None,
+                        24,
+                        width,
+                    );
+                    let targets = renderer
+                        .previous_lines
+                        .iter()
+                        .filter_map(|line| line.pick.as_ref())
+                        .flat_map(|picks| &picks.0)
+                        .filter(|(_, _, pick)| matches!(pick, Pick::OpenLink(_)))
+                        .collect::<Vec<_>>();
+                    if interrupted {
+                        assert!(targets.is_empty(), "중단된 미완성 주소가 클릭 가능함");
+                        assert!(
+                            renderer
+                                .previous_lines
+                                .iter()
+                                .map(painted)
+                                .any(|row| row.contains("https://")),
+                            "중단된 미완성 링크의 주소가 사라짐"
+                        );
+                    } else {
+                        assert!(!targets.is_empty(), "완성된 링크가 클릭되지 않음");
+                        assert!(targets.iter().all(|(_, _, pick)| *pick
+                            == Pick::OpenLink(
+                                "https://example.com/guide_(draft)/path".to_owned()
+                            )));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_links_preserve_code_plain_text_and_finished_targets() {
+        set_chat_layout(false);
+        let render = |block: &Block| {
+            render_streamed_transcript_lines(
+                &[LiveBlockView { block, revision: 0 }],
+                120,
+                &HashSet::new(),
+                ShellDisplayMode::Hide,
+                DiffDisplayMode::Hide,
+            )
+            .0
+        };
+        for body in [
+            "`[문서](https://example.com/path`",
+            "`[문서](https://example.com/path",
+            "```text\n[문서](https://example.com/path",
+            "[Enter] 키를 누르세요",
+            "미완성 [문서](https://example.com/path\n다음 줄",
+            "주소: https://example.com/path",
+        ] {
+            let block = Block::new(BlockKind::Assistant, "Codex", body);
+            assert_eq!(
+                render(&block).iter().map(painted).collect::<Vec<_>>(),
+                block_group_lines(
+                    &block,
+                    120,
+                    ShellDisplayMode::Hide,
+                    DiffDisplayMode::Hide,
+                    false
+                )
+                .iter()
+                .map(painted)
+                .collect::<Vec<_>>(),
+                "원문 표시가 달라짐: {body:?}"
+            );
+        }
+        let block = Block::new(
+            BlockKind::Assistant,
+            "Codex",
+            "[완료](https://example.com/ready) [다음](https://example.com/pending",
+        );
+        let live = render(&block);
+        assert!(
+            live.iter()
+                .map(painted)
+                .any(|row| row.contains("완료 다음"))
+        );
+        let targets = live
+            .iter()
+            .filter_map(|line| line.pick.as_ref())
+            .flat_map(|picks| &picks.0)
+            .collect::<Vec<_>>();
+        assert!(!targets.is_empty());
+        assert!(targets.iter().all(|(_, _, pick)|
+            *pick == Pick::OpenLink("https://example.com/ready".to_owned())));
+        assert!(
+            block_lines(&block, 120)
+                .iter()
+                .map(painted)
+                .any(|row| row.contains("https://example.com/pending")),
+            "완료하거나 중단한 미완성 링크는 원문을 보존해야 함"
+        );
+    }
+
+    #[test]
     fn markdown_link_label_keeps_its_click_target() {
         let lines = markdown_line(
             "  ",
@@ -17594,6 +18064,7 @@ mod tests {
             Tone::Plain,
             false,
             80,
+            false,
         );
         let line = &lines[0];
         let start = UnicodeWidthStr::width("  열기: ");
@@ -17617,6 +18088,7 @@ mod tests {
             Tone::Plain,
             false,
             100,
+            false,
         );
         let line = &lines[0];
 
@@ -17688,6 +18160,7 @@ mod tests {
             Tone::Plain,
             false,
             80,
+            false,
         );
         assert_eq!(lines[0].text, "[Enter] Continue when done");
         assert_eq!(line_suffix("https://example.com:8080"), None);
@@ -23824,6 +24297,32 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_question_record_paints_question_and_options() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        for model in ["claude:opus", "gpt-5.6-sol"] {
+            let mut state = crate::state::AppState::new(
+                "thread".into(), "cwd".into(), "account".into(), Vec::new(), model, None,
+            );
+            state.set_turn_started("turn".into());
+            state.begin_server_request(serde_json::json!(7), "item/tool/requestUserInput", &serde_json::json!({
+                "questions": [{"id": "q", "question": "어느 색인가요?",
+                    "options": [{"label": "빨강"}, {"label": "파랑"}]}]
+            }));
+            state.handle_key(KeyEvent::from(KeyCode::Esc));
+            let records = state.drain_committed();
+            let cancelled = records.iter().find(|block| block.title == "질문 답변 취소").unwrap();
+            for width in [30, 80] {
+                let rows = block_lines(cancelled, width).iter().map(painted).collect::<Vec<_>>().join("\n");
+                assert!(rows.contains("질문 답변 취소"));
+                assert!(rows.contains("어느 색인가요?"));
+                assert!(rows.contains("빨강"));
+                assert!(rows.contains("파랑"));
+                assert!(!rows.contains("↳"), "취소한 질문이 선택된 답변으로 표시됨");
+            }
+        }
+    }
+
+    #[test]
     fn question_answer_cards_keep_multiline_text_and_multiple_pairs_separate() {
         let block = Block::question_answers(vec![
             ("첫 질문\n추가 설명".into(), "첫 답변\n\n  ↳ 직접 입력한 문구".into()),
@@ -26310,6 +26809,7 @@ mod tests {
             DiffDisplayMode::Collapse,
             false,
             Some(1.0),
+            false,
         );
         let folding = block_lines_with_mode_at(
             &progress,
@@ -26318,6 +26818,7 @@ mod tests {
             DiffDisplayMode::Collapse,
             false,
             Some(0.4),
+            false,
         );
         let closed = block_lines_with_mode_at(
             &progress,
@@ -26326,6 +26827,7 @@ mod tests {
             DiffDisplayMode::Collapse,
             false,
             None,
+            false,
         );
         let reopened = block_lines_with_mode_at(
             &progress,
@@ -26334,6 +26836,7 @@ mod tests {
             DiffDisplayMode::Collapse,
             true,
             None,
+            false,
         );
 
         assert!(open.len() > folding.len());
