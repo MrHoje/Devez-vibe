@@ -34,7 +34,7 @@ pub enum AgentMode {
     Custom(u8),
 }
 
-/// The roles compiled into the app, in the order Tab cycles through them.
+/// The roles compiled into the app, reserved against custom role names.
 pub const BUILTIN: [AgentMode; 5] = [
     AgentMode::Standard,
     AgentMode::Planner,
@@ -44,11 +44,11 @@ pub const BUILTIN: [AgentMode; 5] = [
 ];
 
 /// Built-in roles shown in the picker, slash completion, and Tab cycle.
-/// Reviewer remains implemented but is temporarily hidden from these surfaces.
-pub const VISIBLE: [AgentMode; 4] = [
+pub const VISIBLE: [AgentMode; 5] = [
     AgentMode::Standard,
     AgentMode::Planner,
     AgentMode::Researcher,
+    AgentMode::Reviewer,
     AgentMode::GoalRunner,
 ];
 
@@ -300,10 +300,11 @@ mod tests {
         // The visible built-ins keep their order and open the cycle, whatever the
         // agents folder adds after them.
         assert_eq!(
-            seen[..3],
+            seen[..4],
             [
                 AgentMode::Planner,
                 AgentMode::Researcher,
+                AgentMode::Reviewer,
                 AgentMode::GoalRunner,
             ]
         );
@@ -317,7 +318,7 @@ mod tests {
     fn choices_open_with_the_built_in_roles() {
         let all = choices();
         assert_eq!(all[..VISIBLE.len()], VISIBLE);
-        assert!(!all.contains(&AgentMode::Reviewer));
+        assert!(all.contains(&AgentMode::Reviewer));
         assert!(all[VISIBLE.len()..]
             .iter()
             .all(|mode| matches!(mode, AgentMode::Custom(_))));
@@ -349,7 +350,7 @@ mod tests {
     fn parse_ignores_case_and_rejects_unknown_names() {
         assert_eq!(AgentMode::parse("Planner"), Some(AgentMode::Planner));
         assert_eq!(AgentMode::parse(" GOAL-RUNNER "), Some(AgentMode::GoalRunner));
-        assert_eq!(AgentMode::parse("Reviewer"), None);
+        assert_eq!(AgentMode::parse("Reviewer"), Some(AgentMode::Reviewer));
         assert_eq!(AgentMode::parse("Researcher"), Some(AgentMode::Researcher));
         assert_eq!(AgentMode::parse("plan"), None);
         assert_eq!(AgentMode::parse(""), None);

@@ -23902,7 +23902,7 @@ mod tests {
         state.handle_key(KeyEvent::from(KeyCode::Tab));
         assert_eq!(state.agent_mode, AgentMode::Planner);
 
-        for expected in [AgentMode::Researcher, AgentMode::GoalRunner] {
+        for expected in [AgentMode::Researcher, AgentMode::Reviewer, AgentMode::GoalRunner] {
             state.handle_key(KeyEvent::from(KeyCode::Tab));
             assert_eq!(state.agent_mode, expected);
         }
@@ -24517,10 +24517,18 @@ mod tests {
 
         state.editor.set_text("/agent r");
         let suggestions = state.view().suggestions;
-        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions.len(), 2);
         assert_eq!(suggestions[0].command, "/agent researcher");
+        assert_eq!(suggestions[1].command, "/agent reviewer");
         state.handle_key(KeyEvent::from(KeyCode::Enter));
         assert_eq!(state.agent_mode, AgentMode::Researcher);
+
+        state.editor.set_text("/agent rev");
+        let suggestions = state.view().suggestions;
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].command, "/agent reviewer");
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(state.agent_mode, AgentMode::Reviewer);
     }
 
     #[test]
