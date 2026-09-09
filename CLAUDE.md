@@ -47,3 +47,4 @@
   * `agent-system-implementation-plan.md` — Builder·Planner·Goal Runner·Reviewer 역할 시스템의 초기 구현 계획서
   * `side-panel-reference.md` — 제거된 우측 도킹 정보 패널의 예전 구현 참고 자료
   * `builder-ponytail.md` — Builder 역할에 넣은 Ponytail 최소 코드 규칙의 적용 내용과 제거 절차
+  * `지침-축약-검증.md` — 기본·역할 지침의 축약 전후 토큰 수, 보존 조건, 검증 결과

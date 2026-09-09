@@ -42,16 +42,19 @@ const QA_PROMPT: &str = include_str!("../prompts/agents/subagents/qa.md");
 const LEGACY_IMPLEMENTER: &[&str] = &[
     include_str!("../prompts/agents/subagents/legacy/implementer.md"),
     include_str!("../prompts/agents/subagents/legacy/implementer-v2.md"),
+    include_str!("../prompts/agents/subagents/legacy/implementer-v3.md"),
 ];
 const LEGACY_REVIEWER: &[&str] = &[
     include_str!("../prompts/agents/subagents/legacy/reviewer.md"),
     include_str!("../prompts/agents/subagents/legacy/reviewer-v2.md"),
     include_str!("../prompts/agents/subagents/legacy/reviewer-v3.md"),
+    include_str!("../prompts/agents/subagents/legacy/reviewer-v4.md"),
 ];
 const LEGACY_QA: &[&str] = &[
     include_str!("../prompts/agents/subagents/legacy/qa.md"),
     include_str!("../prompts/agents/subagents/legacy/qa-v2.md"),
     include_str!("../prompts/agents/subagents/legacy/qa-v3.md"),
+    include_str!("../prompts/agents/subagents/legacy/qa-v4.md"),
 ];
 
 const EDITING_TOOLS: &[&str] = &["Read", "Edit", "Write", "Glob", "Grep", "Bash"];
@@ -172,18 +175,26 @@ fn upgraded_codex_agent(existing: &str, agent: &Subagent) -> Option<String> {
 
 /// Keep a recovery copy before replacing the file with a fully written sibling.
 fn save_upgraded_agent(path: &Path, existing: &str, updated: &str) -> std::io::Result<()> {
-    let backup = path.with_extension("toml.pre-readability.bak");
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(&backup) {
-        Ok(mut file) => {
-            file.write_all(existing.as_bytes())?;
-            file.sync_all()?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if std::fs::read(&backup)? != existing.as_bytes() {
-                return Err(error);
+    for generation in 1.. {
+        let extension = if generation == 1 {
+            "toml.pre-readability.bak".to_owned()
+        } else {
+            format!("toml.pre-readability-{generation}.bak")
+        };
+        let backup = path.with_extension(extension);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&backup) {
+            Ok(mut file) => {
+                file.write_all(existing.as_bytes())?;
+                file.sync_all()?;
+                break;
             }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if std::fs::read(&backup)? == existing.as_bytes() {
+                    break;
+                }
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
     }
     let temporary = path.with_extension(format!("toml.{}.tmp", std::process::id()));
     let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
@@ -336,6 +347,28 @@ mod tests {
         ] {
             assert!(upgraded_codex_agent(&custom, agent).is_none());
         }
+    }
+
+    #[test]
+    fn a_later_prompt_upgrade_preserves_each_previous_backup() {
+        let home = std::env::temp_dir().join(format!("devez-upgrade-later-{}", std::process::id()));
+        let agents = home.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let agent = &SUBAGENTS[1];
+        let path = agents.join("devez-reviewer.toml");
+        let existing = codex_agent_toml(agent).replace(agent.prompt.trim(), LEGACY_REVIEWER.last().unwrap().trim());
+        let original_backup = path.with_extension("toml.pre-readability.bak");
+        std::fs::write(&original_backup, "earlier shipped settings").unwrap();
+        std::fs::write(&path, &existing).unwrap();
+
+        provision_codex_agents(&home).unwrap();
+        provision_codex_agents(&home).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), codex_agent_toml(agent));
+        assert_eq!(std::fs::read_to_string(original_backup).unwrap(), "earlier shipped settings");
+        assert_eq!(std::fs::read_to_string(path.with_extension("toml.pre-readability-2.bak")).unwrap(), existing);
+        assert!(!path.with_extension("toml.pre-readability-3.bak").exists());
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

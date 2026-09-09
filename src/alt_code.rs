@@ -69,6 +69,15 @@ impl AltCodeKeys {
             }
             return key;
         }
+        // An ASCII key is on every layout, so its lone release is never an
+        // Alt code. In an external terminal a Windows IME takes the presses of
+        // the keys it composes with and lets their releases through once the
+        // syllable is committed; turned around, that release would type the
+        // key's letter after the syllable. DevezCode sends text itself, so its
+        // path never sees these and stays as it was.
+        if self.external_windows && ch.is_ascii() {
+            return key;
+        }
         KeyEvent {
             kind: KeyEventKind::Press,
             ..key
@@ -119,6 +128,49 @@ mod tests {
         assert_eq!(
             keys.normalize(key('★', KeyEventKind::Release)),
             key('★', KeyEventKind::Press)
+        );
+    }
+
+    #[test]
+    fn external_ime_key_releases_without_a_press_stay_releases() {
+        let mut keys = AltCodeKeys {
+            pressed: HashMap::new(),
+            external_windows: true,
+        };
+        // The IME took the presses of d, k, s while composing 안; the terminal
+        // still reports the releases of the last keys after the commit.
+        assert_eq!(
+            keys.normalize(key('안', KeyEventKind::Press)),
+            key('안', KeyEventKind::Press)
+        );
+        assert_eq!(
+            keys.normalize(key('안', KeyEventKind::Release)),
+            key('안', KeyEventKind::Release)
+        );
+        assert_eq!(
+            keys.normalize(key('s', KeyEventKind::Release)),
+            key('s', KeyEventKind::Release)
+        );
+        assert_eq!(
+            keys.normalize(key('k', KeyEventKind::Release)),
+            key('k', KeyEventKind::Release)
+        );
+        // A real Alt code is still turned around.
+        assert_eq!(
+            keys.normalize(key('★', KeyEventKind::Release)),
+            key('★', KeyEventKind::Press)
+        );
+    }
+
+    #[test]
+    fn hosted_ascii_release_without_a_press_still_becomes_a_press() {
+        let mut keys = AltCodeKeys {
+            pressed: HashMap::new(),
+            external_windows: false,
+        };
+        assert_eq!(
+            keys.normalize(key('s', KeyEventKind::Release)),
+            key('s', KeyEventKind::Press)
         );
     }
 

@@ -167,13 +167,8 @@ impl AgentMode {
             | Self::Reviewer
             | Self::Researcher
             | Self::Custom(_) => {
-                "The standing DevezVibe language and formatting rules apply to this role \
-                 unchanged — answer in Korean, structured and readable. Every response-length \
-                 cap is lifted for this role's output: no bullet count, no character count, and \
-                 no line count applies. Length follows the work — include every section the task \
-                 needs, at the depth needed to be acted on, and stop when the substance is \
-                 covered rather than when a budget runs out. Do not pad, and do not drop or \
-                 compress a section to stay short."
+                "Korean language and formatting rules still apply. Every response-length cap is lifted: \
+                 preserve all material findings and evidence without padding."
             }
         };
         format!(
@@ -387,7 +382,7 @@ mod tests {
     fn builder_keeps_the_length_caps_and_specialized_roles_lift_them() {
         assert!(AgentMode::Standard
             .render_turn_block()
-            .contains("불릿 두세 개, 전체 200자 내외"));
+            .contains("불릿 두세 개, 공백 포함 전체 200자 이하"));
         for mode in choices().into_iter().filter(|mode| *mode != AgentMode::Standard) {
             assert!(mode.render_turn_block().contains("Every response-length cap is lifted"));
         }
