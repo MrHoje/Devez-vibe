@@ -1,13 +1,13 @@
 # Codex CLI Compatibility Report
 
-- Mode: latest
-- Target Codex CLI: 0.153.2
-- Baseline Codex CLI: 0.153.2
+- Mode: fixed
+- Target Codex CLI: 0.154.0
+- Baseline Codex CLI: 0.154.0
 - Result: schema matches
-- Baseline SHA-256: f4288d375d24125a2f1c738fb35a143301775625b57c4bda33be0853b59bb1e1
-- Current SHA-256: f4288d375d24125a2f1c738fb35a143301775625b57c4bda33be0853b59bb1e1
+- Baseline SHA-256: 0273c95bda7341893a89cb61cbde3127ec4f269100db376978724040777b5d10
+- Current SHA-256: 0273c95bda7341893a89cb61cbde3127ec4f269100db376978724040777b5d10
 - Added generated files: none
 - Removed generated files: none
 - Diff artifact: none
 - Next action: 호환
-- Reproduce: node scripts/check-codex-compatibility.mjs --mode latest
+- Reproduce: node scripts/check-codex-compatibility.mjs --mode fixed --version 0.154.0

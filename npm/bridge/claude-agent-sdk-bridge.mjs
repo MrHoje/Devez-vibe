@@ -1419,7 +1419,7 @@ async function safeAccount(agentQuery) {
 }
 
 async function safeUsage(agentQuery) {
-  try { return await agentQuery.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET(); }
+  try { return await agentQuery.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true }); }
   catch { return null; }
 }
 
@@ -1901,6 +1901,7 @@ function startSubagent(session, block) {
   if (existing) {
     existing.toolUseId = block.id;
     existing.name = firstLine(input.name || input.subagent_type || input.agentType || existing.name || "agent", 40);
+    existing.backgroundTask = false;
     existing.lastSeenAt = Date.now();
     emitSubagents(session);
     return;
@@ -1975,6 +1976,7 @@ function keepBackgroundSubagent(session, toolUseId, result) {
     session.knownSubagents.set(running.taskId, {
       name: running.name,
       description: running.description,
+      backgroundTask: running.backgroundTask === true,
     });
   }
   return true;
@@ -2005,6 +2007,7 @@ function resumeBackgroundSubagent(session, toolUseId, pending, result) {
   session.knownSubagents.set(taskId, {
     name: running.name,
     description: running.description,
+    backgroundTask: false,
   });
   emitSubagents(session);
   return true;
@@ -2080,11 +2083,13 @@ function upsertStructuredSubagent(session, message) {
   if (taskId) running.taskId = taskId;
   // Agent 호출이 붙인 작업 이름이 있으면 SDK가 뒤늦게 알려 주는 에이전트 종류로 덮지 않는다.
   if (subagentType && (!running.name || running.name === "agent")) running.name = subagentType;
+  if (subagentType || isSubagentTaskType(message.task_type)) running.backgroundTask = false;
   running.lastSeenAt = Date.now();
   if (running.taskId) {
     session.knownSubagents.set(running.taskId, {
       name: running.name,
       description: running.description,
+      backgroundTask: running.backgroundTask === true,
     });
   }
   return running;
@@ -2147,6 +2152,8 @@ function syncBackgroundSubagents(session, tasks) {
         description: "",
         tool: "",
         command: !isSubagentTaskType(task?.task_type),
+        // 셸로 띄운 위임 에이전트도 있으므로 command와 별도로 표시 종류를 보존한다.
+        backgroundTask: known?.backgroundTask ?? !isSubagentTaskType(task?.task_type),
         startedAt: Date.now(),
         lastSeenAt: Date.now(),
       };
@@ -2382,6 +2389,7 @@ function emitSubagents(session, pulse = false) {
       id: agent.id,
       name: agent.name,
       description: agent.description,
+      backgroundTask: agent.backgroundTask === true,
       tool: agent.tool,
       elapsedMs: Date.now() - agent.startedAt,
     })),
@@ -3648,6 +3656,22 @@ function runToolPolicySelfTest() {
 async function runSelfTest() {
   await runPermissionModeSelfTest();
   runToolPolicySelfTest();
+  const planUsage = { rate_limits: { five_hour: { utilization: 25 } }, behaviors: null };
+  let usageOptions;
+  const fetchedUsage = await safeUsage({
+    async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET(options) {
+      usageOptions = options;
+      return planUsage;
+    },
+  });
+  const unavailableUsage = await safeUsage({
+    async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET() {
+      throw new Error("usage unavailable");
+    },
+  });
+  if (usageOptions?.skipBehaviors !== true || fetchedUsage !== planUsage || unavailableUsage !== null) {
+    throw new Error("Claude plan usage self-test failed");
+  }
   const equivalentCwd = process.platform === "win32"
     ? sameCwd("D:\\Repo", "d:/repo/")
     : sameCwd("/tmp/repo", "/tmp/repo/");
@@ -4388,7 +4412,7 @@ async function runSelfTest() {
       summary: "Reading lifecycle source",
     });
     const structured = structuredSession.subagents.get("toolu_structured");
-    if (!structured?.background || structured.tool !== "Read") {
+    if (!structured?.background || structured.tool !== "Read" || structured.backgroundTask === true) {
       throw new Error(`Claude structured task progress self-test failed: ${JSON.stringify(structured)}`);
     }
     processSubagentSystemMessage(structuredSession, {
@@ -4481,6 +4505,7 @@ async function runSelfTest() {
       || !commandRow?.background
       || commandRow.taskId !== "bash-1"
       || commandRow.name !== "gpt-5.6-luna"
+      || commandRow.backgroundTask === true
       || commandRow.command !== true) {
       throw new Error(`Claude background command receipt self-test failed: ${JSON.stringify([...commandSession.subagents])}`);
     }
@@ -4550,8 +4575,18 @@ async function runSelfTest() {
       tool_use_result: { backgroundTaskId: "bash-3", interrupted: false, stdout: "", stderr: "" },
     });
     const lateRow = findSubagent(commandSession, "toolu_bash_late");
-    if (commandSession.subagents.size !== 1 || lateRow?.taskId !== "bash-3" || lateRow.command !== true) {
+    if (commandSession.subagents.size !== 1 || lateRow?.taskId !== "bash-3"
+      || lateRow.command !== true || lateRow.backgroundTask === true) {
       throw new Error(`Claude late receipt placeholder self-test failed: ${JSON.stringify([...commandSession.subagents])}`);
+    }
+    commandSession.subagents.delete(lateRow.id);
+    processSubagentSystemMessage(commandSession, {
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [{ task_id: "bash-3", task_type: "local_bash" }],
+    });
+    if (findSubagent(commandSession, "bash-3")?.backgroundTask !== false) {
+      throw new Error("Claude restored delegated agent was classified as a background task");
     }
     processSubagentSystemMessage(commandSession, {
       type: "system",
@@ -4646,11 +4681,21 @@ async function runSelfTest() {
     processSubagentSystemMessage(structuredSession, {
       type: "system",
       subtype: "background_tasks_changed",
-      tasks: [{ task_id: "shell-1", task_type: "local_shell", description: "sleep 600" }],
+      tasks: [
+        { task_id: "shell-1", task_type: "local_shell", description: "sleep 600" },
+        { task_id: "workflow-1", task_type: "workflow", description: "run checks" },
+        { task_id: "monitor-1", task_type: "monitor", description: "watch build" },
+      ],
     });
     const shell = findSubagent(structuredSession, "shell-1");
-    if (shell?.name !== "Bash" || shell.description !== "sleep 600") {
+    if (shell?.name !== "Bash" || shell.description !== "sleep 600" || shell.backgroundTask !== true) {
       throw new Error(`Claude background command self-test failed: ${JSON.stringify(shell)}`);
+    }
+    for (const [id, name] of [["workflow-1", "Workflow"], ["monitor-1", "Monitor"]]) {
+      const task = findSubagent(structuredSession, id);
+      if (task?.name !== name || task.backgroundTask !== true) {
+        throw new Error(`Claude background task kind self-test failed: ${JSON.stringify(task)}`);
+      }
     }
     processSubagentSystemMessage(structuredSession, {
       type: "system",
@@ -4728,6 +4773,18 @@ async function runSelfTest() {
     .filter(Boolean)
     .map((line) => JSON.parse(line));
   const lifecycleMethods = lifecycleEvents.map((event) => event.method);
+  const taskRows = lifecycleEvents
+    .filter((event) => event.method === "turn/subagents/updated")
+    .flatMap((event) => event.params.subagents);
+  for (const [id, backgroundTask] of [
+    ["task:shell-1", true], ["task:workflow-1", true], ["task:monitor-1", true],
+    ["toolu_structured", false], ["toolu_bash", false], ["toolu_bash_late", false],
+  ]) {
+    const rows = taskRows.filter((row) => row.id === id);
+    if (!rows.length || rows.some((row) => row.backgroundTask !== backgroundTask)) {
+      throw new Error(`Claude emitted task kind self-test failed: ${id}`);
+    }
+  }
   if (!lifecycleMethods.includes("turn/subagents/updated")
     || lifecycleMethods.filter((method) => method === "turn/started").length < 3
     || !lifecycleEvents.some((event) => event.method === "item/completed"

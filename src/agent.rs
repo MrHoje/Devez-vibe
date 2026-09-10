@@ -357,7 +357,7 @@ mod tests {
         for mode in choices() {
             assert!(!mode.instruction().trim().is_empty(), "{} prompt is empty", mode.id());
         }
-        assert!(AgentMode::Standard.instruction().contains("Builder role"));
+        assert_eq!(AgentMode::Standard.instruction(), BUILDER_PROMPT);
         assert!(AgentMode::Researcher
             .instruction()
             .contains("Researcher role"));
@@ -375,23 +375,25 @@ mod tests {
 
     /// Builder keeps unique scope, risk, and pre-send rules alongside shared ones.
     #[test]
-    fn builder_prefers_concise_answers_without_fixed_length_caps() {
+    fn builder_caps_answers_except_explicit_detailed_analysis() {
         let builder = AgentMode::Standard.render_turn_block();
-        assert!(builder.contains("글자 수·불릿 수·문장 수의 고정 제한을 두지 않는다"));
+        assert!(!builder.contains("고정 제한을 두지 않는다"));
         assert!(builder.contains("이전 역할의 응답 분량 지침은 아래 규칙으로 대체한다"));
         assert!(builder.contains("한국어·형식·근거 보존은 공통 지침을 따른다"));
         assert!(builder.contains("단순 질문과 완료 보고는 짧게 답한다"));
         assert!(builder.contains("묻는 범위만 답하고, 추가 설명은 요청받을 때 제공한다"));
         for requirement in [
-            "모든 답변은 사용자가 판단하는 데 필요한 내용을 가장 짧고 명확하게 전달한다",
+            "공백·탭·줄바꿈을 제외한 200자 이내",
+            "사용자가 상세한 분석을 명시적으로 요청한 경우에만 해당 답변의 나머지 제한도 해제",
+            "선택·승인 설명과 코드 블록은 분량 제한과 글자 수 계산에서 제외",
             "핵심 근거·사용자 영향·필요한 조치만 남긴다",
-            "분석·설명·선택·승인은 판단에 필요한 만큼만 늘리며",
-            "중요한 위험·선택 결과를 분량 때문에 생략하지 않는다",
-            "전송 전에 같은 뜻의 문장과 불필요한 항목을 삭제한다",
+            "중요한 근거·미확인 범위·위험·선택 결과를 보존",
+            "전송 전에 중복·불필요한 항목을 삭제하고 예외 부분과 공백을 제외한 글자 수를 확인",
+            "200자를 넘으면 문장을 중간에서 자르지 말고 다시 요약",
         ] {
             assert!(builder.contains(requirement), "missing Builder rule: {requirement}");
         }
-        for removed_cap in ["200자", "불릿 두세 개", "두 문장을 넘기지", "수정이 셋을 넘으면"] {
+        for removed_cap in ["불릿 두세 개", "두 문장을 넘기지", "수정이 셋을 넘으면"] {
             assert!(!builder.contains(removed_cap));
         }
         for mode in choices().into_iter().filter(|mode| *mode != AgentMode::Standard) {

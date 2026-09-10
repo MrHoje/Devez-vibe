@@ -21,9 +21,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "응답 중 링크 주소가 길게 나타났다 줄어드는 현상을 없애고, 링크가 완성되면 바로가기를 활성화합니다.",
-    "대기 요청이 다른 요청에 끼어들거나 미전송 초안의 이미지·자동완성 선택을 가져가는 문제를 수정합니다.",
-    "Builder의 고정 분량 제한을 없애고, 중요한 근거를 유지하면서 간결하게 답하도록 합니다.",
+    "답변의 문단·불릿 사이를 한 줄씩 띄워 읽기 쉽게 합니다.",
+    "Builder 답변을 공백 제외 200자 이내로 작성합니다. 명시적으로 요청한 상세 분석은 제외합니다.",
+    "하단 실행 목록에서 서브에이전트와 일반 백그라운드 작업을 구분합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

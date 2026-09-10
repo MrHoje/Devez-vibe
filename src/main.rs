@@ -1311,11 +1311,7 @@ async fn start_split_turn(
         "model": model,
         "serviceTier": state.service_tier(),
         "permissions": state.permission_profile(),
-        "additionalContext": turn_additional_context(
-            state.vibe_mode(),
-            agent_mode,
-            None
-        )
+        "additionalContext": turn_additional_context(agent_mode, None)
     });
     if !effort.is_empty() {
         params["effort"] = json!(effort);
@@ -4523,12 +4519,14 @@ const CODEX_QUESTION_INSTRUCTIONS: &str = concat!(
 const DEVEZ_INSTRUCTIONS: &str = concat!(
     "Updated Plan의 설명과 Task 제목은 자연스러운 한국어로 쓰고 기술 식별자는 원문을 유지한다.\n",
     "답변 형식:\n",
+    "- 진행·답변의 첫 글자는 한글 음절로 쓰며, 기술 식별자를 제외하면 한국어로 쓴다.\n",
+    "- 문단과 불릿 항목 사이에는 빈 줄을 한 줄 넣는다. 주제가 바뀌면 줄바꿈만 하지 말고 별도 문단이나 불릿으로 나눈다. 코드 블록과 표 내부의 줄 간격은 유지한다.\n",
     "- 결론부터 한국어 불릿·코드 블록으로 쓴다. 서론·인사·맺음말 요약·이모지는 쓰지 않는다. 항목명·상태·판정과 다른 에이전트의 보고도 쉬운 한국어로 풀고, 영어 판정은 별도 규격의 내부 기록에만 유지한다.\n",
     "- 한 불릿에 한 쟁점을 담고 사용자 영향과 필요한 조치를 먼저 설명한다. 기술 식별자·경로·명령·코드는 사용자가 요청했거나 원인·영향·범위·실행 판단에 필요할 때만 최소로 쓴다.\n",
     "- 중복을 줄이되 띄어쓰기를 없애거나 서로 다른 쟁점을 압축하지 않는다. 판단에 필요한 근거·미확인 범위·후속 조치는 남긴다.\n",
-    "- 분량은 현재 역할의 지침을 따른다. Builder 외 역할에는 글자 수·불릿 수·문장 수 제한을 적용하지 않는다. 선택·승인 답변은 분량 제한 없이 선택지·결과·판단 근거를 모두 제공하며 문장을 자르지 않는다.\n",
+    "- 분량은 현재 역할 지침을 따르되 Builder 외 역할에는 글자·불릿·문장 수 제한을 두지 않는다. 선택·승인 설명은 분량 제한 없이 선택지·결과·판단 근거를 온전히 제공한다.\n",
     "- 계획 승인·실행 판단에는 목표·주요 작업·검토 결과·미확정 사항을 요약하고 상세 구현은 계획 문서에 둔다. 이미 정한 결정이나 제외한 선택지를 다시 나열하지 않는다.\n",
-    "- 실제 변경 작업을 마쳤을 때만 마지막 문장을 구체적인 대상과 동작을 적은 `~했습니다.`로 끝낸다. 질문·조사·설명에는 완료 문구를 붙이지 않는다. `~한 내용을 완료했습니다.`처럼 명사절을 겹치지 않는다.\n",
+    "- 실제 변경을 마쳤을 때만 마지막 문장을 구체적인 대상·동작을 담은 `~했습니다.`로 끝낸다. 질문·조사·설명에는 완료 표현을 쓰지 않고, `~한 내용을 완료했습니다.` 같은 겹친 명사절은 피한다.\n",
     "근거와 상태:\n",
     "- 프로젝트의 .knowledge가 있으면 파일명·검색으로 작업 관련 문서를 찾아 필요한 부분만 읽는다.\n",
     "- 핵심 질문을 확정하고 실제 확인한 근거로 답한다. 관련 입력·상태·표시 흐름을 추적하고 테스트 또는 변경 이력과 교차 확인한다. 첫 검색·한 키워드·검색 실패만으로 원인이나 기능 부재를 단정하지 않는다.\n",
@@ -4548,7 +4546,7 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
 const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "Devez Vibe에서 작업한다. Task 설명과 제목은 한국어로 쓰고 기술 식별자는 원문을 유지한다.\n",
     "최우선 한국어 전용 규칙:\n",
-    "- 진행·도구 앞뒤 문장·최종 답변은 모두 한국어로 쓰며 응답 언어는 한국어로 유지한다. 사용자에게 보이는 문장의 첫 글자가 한글 음절이어야 한다. 기술 식별자와 사용자가 그대로 인용한 문자열만 예외다.\n",
+    "- 진행·도구 앞뒤 문장·최종 답변은 모두 한국어로 쓴다. 사용자에게 보이는 문장의 첫 글자가 한글 음절이어야 한다. 기술 식별자와 사용자가 그대로 인용한 문자열만 예외다.\n",
     "- 영어 낱말로 시작해 한국어를 잇거나 영어로 도구 결과를 판정하지 않는다. 출력 전에 기술 식별자가 아닌 영어를 한국어로 바꾼다.\n",
     "시작과 작업 목록:\n",
     "- 단순 질문이 아닌 작업의 첫 응답 content block은 대상과 수행 동작을 담은 짧은 안내 text다. 어떤 tool_use도 이 text보다 먼저 출력하지 않는다. 이 의무는 첫 assistant message에만 적용한다.\n",
@@ -4557,24 +4555,25 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 각 Task의 첫 Read/Grep/Glob/Bash 전에 in_progress, 끝난 직후 completed로 바꾼다. 동시에 진행 중인 Task는 하나이며 종료 직전에 여러 Task를 일괄 완료하지 않는다.\n",
     "- Agent 호출의 name은 대상과 동작을 담은 영문 소문자·숫자·밑줄 이름으로 짓는다.\n",
     "답변:\n",
+    "- 문단과 불릿 항목 사이에는 빈 줄을 한 줄 넣는다. 주제가 바뀌면 줄바꿈만 하지 말고 별도 문단이나 불릿으로 나눈다. 코드 블록과 표 내부의 줄 간격은 유지한다.\n",
     "- 결론부터 한국어 불릿·코드 블록으로 쓴다. 서론·인사·맺음말 요약·이모지는 쓰지 않는다. 항목명·상태·판정과 다른 에이전트의 보고도 쉬운 한국어로 풀고 영어 판정은 별도 규격의 내부 기록에만 유지한다.\n",
     "- 한 불릿에 한 쟁점을 담고 사용자 영향과 필요한 조치를 먼저 쓴다. 기술 식별자·경로·명령·코드는 사용자가 요청했거나 원인·영향·범위·실행 판단에 필요할 때만 최소로 쓴다.\n",
     "- 중복을 줄이되 띄어쓰기를 없애거나 서로 다른 쟁점을 압축하지 않는다. 판단에 필요한 근거·미확인 범위·후속 조치를 남긴다.\n",
-    "- 분량은 현재 역할의 지침을 따른다. Builder 외 역할에는 글자 수·불릿 수·문장 수 제한을 적용하지 않는다. 선택·승인 답변은 분량 제한 없이 선택지·결과·판단 근거를 모두 제공하며 문장을 자르지 않는다.\n",
+    "- 분량은 현재 역할 지침을 따르되 Builder 외 역할에는 글자·불릿·문장 수 제한을 두지 않는다. 선택·승인 설명은 분량 제한 없이 선택지·결과·판단 근거를 온전히 제공한다.\n",
     "- 선택·승인은 사용 가능한 AskUserQuestion 도구로 묻는다. 도구가 없거나 실패했거나 선택지를 모두 담지 못할 때는 일반 문장으로 선택지와 결과를 빠짐없이 제시하고 마지막 문장에서 선택을 묻는다. 무응답을 승인으로 해석하지 않는다.\n",
     "- 계획 승인·실행 판단에는 목표·주요 작업·검토 결과·미확정 사항을 요약하고 상세 구현은 계획 문서에 둔다. 이미 정한 결정이나 제외한 선택지를 반복하지 않는다.\n",
-    "- 실제 변경 작업을 마쳤을 때만 마지막 불릿을 구체적인 대상과 동작을 적은 `~했습니다.`로 끝낸다. 질문·조사·설명에는 완료 문구를 붙이지 않는다. `~한 내용을 완료했습니다.`처럼 명사절을 겹치지 않는다.\n",
+    "- 실제 변경을 마쳤을 때만 마지막 문장을 구체적인 대상·동작을 담은 `~했습니다.`로 끝낸다. 질문·조사·설명에는 완료 표현을 쓰지 않고, `~한 내용을 완료했습니다.` 같은 겹친 명사절은 피한다.\n",
     "근거와 상태:\n",
     "- 프로젝트의 .knowledge가 있으면 파일명·검색으로 작업 관련 문서를 찾아 필요한 부분만 읽는다.\n",
     "- 핵심 질문을 확정하고 실제 확인한 근거로 답한다. 관련 입력·상태·표시 흐름을 추적하고 테스트 또는 변경 이력과 교차 확인한다. 첫 검색·한 키워드·검색 실패만으로 원인이나 기능 부재를 단정하지 않는다.\n",
-    "- 현재 구현·과거 원인·추정을 구분하고 근거가 없으면 미확인이라고 쓴다. 사용자 영향과 필요한 조치부터 설명하고, 원인은 요청받았거나 판단에 필요할 때만 쓴다. 확인 범위와 한계는 결론에 영향을 줄 때 남긴다.\n",
+    "- 현재 구현·과거 원인·추정을 구분하고 근거가 없으면 미확인이라고 쓴다. 원인은 요청받았거나 판단에 필요할 때만 쓴다. 확인 범위와 한계는 결론에 영향을 줄 때 남긴다.\n",
     "- 외부 상태는 실제 응답·오류 전까지 완료·취소·거절·원인을 단정하지 않는다. 질문 전달 실패나 무응답 오류는 필요한 질문을 일반 문장으로 다시 제시하고, 답이 필요한 변경은 응답 전 실행하지 않는다.\n",
     "진행:\n",
     "- 라벨·머리글 없이 알린다. 첫 안내 이후에는 새 사실이나 범위 변경이 사용자 판단을 바꿀 때만 짧게 보고하고, 알릴 내용이 없으면 도구를 바로 호출한다.\n",
     "- 반복 계획·내용 없는 진행 문장·내부 도구나 Skill 적용 절차를 알리지 않는다.\n",
 );
 
-const CLAUDE_TURN_REMINDER: &str = "한국어로 사용자 영향과 필요한 조치부터 쓴다. 분량은 현재 역할을 따르며 선택·승인 답변은 제한하지 않는다. 근거·미확인 범위는 남기고 기술 식별자는 판단에 필요할 때만 쓴다. 새 사실 없는 진행 문장은 생략한다.";
+const CLAUDE_TURN_REMINDER: &str = "한국어로 사용자 영향과 필요한 조치부터 쓴다. 분량과 예외는 현재 역할을 따른다. 근거·미확인 범위는 남기고 기술 식별자는 판단에 필요할 때만 쓴다. 새 사실 없는 진행 문장은 생략한다.";
 
 /// The Claude selections a session has to be told, because the bridge opens a
 /// fresh SDK session for every start and resume. Anything left out here comes
@@ -4644,7 +4643,6 @@ fn resume_thread_params(thread_id: &str, claude: &ClaudeSessionSettings) -> Valu
 /// The full rules stay here for the one runtime with no
 /// standing instructions of its own.
 fn turn_additional_context(
-    vibe: VibeMode,
     agent: agent::AgentMode,
     knowledge: Option<&str>,
 ) -> Value {
@@ -4659,10 +4657,6 @@ fn turn_additional_context(
         },
         "claude-devez-vibe-reminder": {
             "value": CLAUDE_TURN_REMINDER,
-            "kind": "application"
-        },
-        "devez-vibe-mode": {
-            "value": vibe.turn_notice(),
             "kind": "application"
         },
         "devez-vibe-agent": {
@@ -5518,11 +5512,7 @@ async fn start_turn(
         "model": model,
         "serviceTier": state.service_tier(),
         "permissions": state.permission_profile(),
-        "additionalContext": turn_additional_context(
-            state.vibe_mode(),
-            agent_mode,
-            None
-        )
+        "additionalContext": turn_additional_context(agent_mode, None)
     });
     if !effort.is_empty() {
         params["effort"] = json!(effort);
@@ -7558,23 +7548,13 @@ mod tests {
         assert!(params.get("effort").is_none());
     }
 
-    /// Display presets carry only the same two-sentence reminder to the model.
     #[test]
-    fn every_preset_sends_only_the_question_and_language_reminder() {
-        let notice = |vibe| {
-            turn_additional_context(vibe, agent::AgentMode::Standard, None)
-                .pointer("/devez-vibe-mode/value")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .expect("the turn carries its reminder")
-        };
-
-        for vibe in [VibeMode::Vibe, VibeMode::SuperVibe, VibeMode::Normal] {
-            assert_eq!(
-                notice(vibe),
-                "사용 가능한 질문 도구로 묻고, 없거나 실패하면 본문에 선택지·결과를 빠짐없이 쓴다.\n\
-                 진행·답변의 첫 글자가 한글 음절이어야 하고, 기술 식별자를 제외하면 한국어로 쓴다."
-            );
+    fn turn_context_omits_mode_notice_and_base_rules_keep_language() {
+        let context = turn_additional_context(agent::AgentMode::Standard, None);
+        assert!(context.get("devez-vibe-mode").is_none());
+        for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS] {
+            assert!(rules.contains("첫 글자"));
+            assert!(rules.contains("한글 음절"));
         }
         // Shared rules and provider reminders must not reintroduce numeric caps.
         for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS, CLAUDE_TURN_REMINDER] {
@@ -7589,7 +7569,7 @@ mod tests {
     /// Builder included.
     #[test]
     fn the_turn_carries_the_selected_role() {
-        let planner = turn_additional_context(VibeMode::Vibe, agent::AgentMode::Planner, None);
+        let planner = turn_additional_context(agent::AgentMode::Planner, None);
         let block = planner
             .pointer("/devez-vibe-agent/value")
             .and_then(Value::as_str)
@@ -7602,7 +7582,7 @@ mod tests {
             Some("application")
         );
 
-        let builder = turn_additional_context(VibeMode::Vibe, agent::AgentMode::Standard, None);
+        let builder = turn_additional_context(agent::AgentMode::Standard, None);
         assert!(
             builder
                 .pointer("/devez-vibe-agent/value")
@@ -7614,7 +7594,6 @@ mod tests {
     #[test]
     fn the_turn_carries_only_the_compact_knowledge_context() {
         let context = turn_additional_context(
-            VibeMode::Vibe,
             agent::AgentMode::Standard,
             Some("자동 요약과 문서 색인"),
         );
@@ -7626,7 +7605,7 @@ mod tests {
             Some("자동 요약과 문서 색인")
         );
         assert!(
-            turn_additional_context(VibeMode::Vibe, agent::AgentMode::Standard, None)
+            turn_additional_context(agent::AgentMode::Standard, None)
                 .get("devez-vibe-knowledge")
                 .is_none()
         );
@@ -7634,7 +7613,7 @@ mod tests {
 
     #[test]
     fn every_turn_restates_the_rules() {
-        let context = turn_additional_context(VibeMode::Vibe, agent::AgentMode::Standard, None);
+        let context = turn_additional_context(agent::AgentMode::Standard, None);
 
         assert_eq!(
             context

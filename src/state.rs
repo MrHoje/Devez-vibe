@@ -278,12 +278,6 @@ impl VibeMode {
             Self::SuperVibe => "Diff와 명령어 등을 모두 숨깁니다.",
         }
     }
-
-    /// The same question and language reminder accompanies every display preset.
-    pub const fn turn_notice(self) -> &'static str {
-        "사용 가능한 질문 도구로 묻고, 없거나 실패하면 본문에 선택지·결과를 빠짐없이 쓴다.\n\
-         진행·답변의 첫 글자가 한글 음절이어야 하고, 기술 식별자를 제외하면 한국어로 쓴다."
-    }
 }
 
 impl StatusLineField {
@@ -3405,6 +3399,7 @@ struct ResponseCollapseTransition {
 struct RunningSubagent {
     id: String,
     name: String,
+    is_background_task: bool,
     description: String,
     tool: String,
     started_at: Instant,
@@ -6651,6 +6646,7 @@ impl AppState {
                 .map(|running| SubagentView {
                     id: running.id.clone(),
                     name: running.name.clone(),
+                    is_background_task: running.is_background_task,
                     description: running.description.clone(),
                     tool: running.tool.clone(),
                     elapsed: running.started_at.elapsed(),
@@ -7976,7 +7972,26 @@ impl AppState {
                 Action::None
             }
             "mcpServer/elicitation/request" => {
-                let mode = params.get("mode").and_then(Value::as_str).unwrap_or("form");
+                let mode = match params.get("mode") {
+                    None => "form",
+                    Some(value) => value.as_str().unwrap_or(""),
+                };
+                if !matches!(mode, "form" | "openai/form" | "openaiForm" | "url") {
+                    let message = if mode == "openai/userVerification" {
+                        "이 환경에서는 Codex 사용자 인증 요청을 처리할 수 없습니다. 인증이 필요한 작업을 계속하려면 사용자 인증을 지원하는 Codex 환경을 사용하세요."
+                    } else {
+                        "지원하지 않는 형식의 MCP 요청입니다."
+                    };
+                    self.push_notice(
+                        BlockKind::Warning,
+                        "MCP 요청을 처리할 수 없음",
+                        format!("{message}\n서버 요청을 안전하게 거부했습니다."),
+                    );
+                    return Action::RpcResponse {
+                        id,
+                        result: mcp_elicitation_response("decline", None),
+                    };
+                }
                 if mode == "url" {
                     let Some(url) = params.get("url").and_then(Value::as_str) else {
                         return Action::RpcResponse {
@@ -8312,6 +8327,7 @@ impl AppState {
             self.subagents.push(RunningSubagent {
                 id: id.to_owned(),
                 name,
+                is_background_task: false,
                 // Codex 행은 이름과 경과 시간만 보인다. 무엇을 시켰는지는 task_name이 말한다.
                 description: String::new(),
                 tool,
@@ -8991,6 +9007,10 @@ impl AppState {
                             .unwrap_or_else(|| started_at.elapsed().as_secs());
                         Some(RunningSubagent {
                             id: id.to_owned(),
+                            is_background_task: entry
+                                .get("backgroundTask")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
                             name: entry
                                 .get("name")
                                 .and_then(Value::as_str)
@@ -17289,6 +17309,37 @@ mod tests {
     }
 
     #[test]
+    fn mcp_startup_recovery_list_clears_remembered_failure() {
+        let mut state = test_state();
+        state.handle_notification("mcpServer/startupStatus/updated", &json!({
+            "name": "custom", "status": "failed", "error": "spawn failed"
+        }));
+        assert_eq!(state.mcp_failures.len(), 1);
+        state.handle_notification("mcpServer/startupStatus/updated", &json!({
+            "name": "custom", "status": "ready", "error": null
+        }));
+        // The event loop invalidates integration_key on this notification and
+        // refreshes the list, which is authoritative for tools and runtime status.
+        let response = json!({"data": [{
+            "name": "custom", "runtimeStatus": "connected", "toolsError": null,
+            "tools": {}, "authStatus": "unsupported"
+        }]});
+        let model = state.selected_model_name().to_owned();
+        state.update_mcp_servers_for_model(&response, &model);
+        assert!(state.mcp_failures.is_empty());
+        let servers = McpServerInfo::list_from_value(&response);
+        let restored = servers[0].panel_item();
+        assert_eq!(restored.state, IntegrationItemState::Active);
+        assert_eq!(restored.detail, "연결됨");
+        state.open_mcp_picker(servers, None);
+        let Some(PendingInteraction::McpPicker(picker)) = &state.pending else {
+            panic!("MCP picker expected");
+        };
+        let view = picker.overlay_view();
+        assert!(view.lines.iter().all(|line| !line.text.contains("실패")));
+    }
+
+    #[test]
     fn mcp_startup_failures_do_not_cross_provider_snapshots() {
         let mut state = AppState::new(
             "thread".to_owned(),
@@ -19283,6 +19334,30 @@ mod tests {
             bash.children()[0].title,
             "Shell · cargo test · exit 101 · 2.0s"
         );
+    }
+
+    #[test]
+    fn subagent_snapshots_preserve_task_kind_without_inferring_it_from_the_name() {
+        let mut state = test_state();
+        state.handle_notification("turn/subagents/updated", &json!({
+            "subagents": [
+                { "id": "shell", "name": "Bash", "backgroundTask": true, "description": "npm test" },
+                { "id": "agent", "name": "Bash", "backgroundTask": false },
+                { "id": "legacy", "name": "Workflow" }
+            ]
+        }));
+        let rows = state.view().subagents;
+        assert!(rows[0].is_background_task);
+        assert_eq!(rows[0].description, "npm test");
+        assert!(!rows[1].is_background_task);
+        assert!(!rows[2].is_background_task);
+
+        let started_at = state.subagents[0].started_at;
+        state.handle_notification("turn/subagents/updated", &json!({
+            "subagents": [{ "id": "shell", "name": "review changes", "backgroundTask": false }]
+        }));
+        assert!(!state.view().subagents[0].is_background_task);
+        assert_eq!(state.subagents[0].started_at, started_at);
     }
 
     #[test]
@@ -25215,6 +25290,63 @@ mod tests {
             Some("cancel")
         );
         assert!(response.get("content").is_some_and(Value::is_null));
+    }
+
+    #[test]
+    fn mcp_user_verification_cancels_while_another_prompt_is_pending() {
+        let mut state = command_approval_state();
+        let action = state.begin_server_request(json!(99), "mcpServer/elicitation/request", &json!({
+            "mode": "openai/userVerification", "threadId": "another-thread",
+            "title": "Verify", "description": "Authenticate", "challenge": "secret"
+        }));
+        assert!(matches!(action, Action::RpcResponse { ref id, ref result }
+            if id == &json!(99) && result == &mcp_elicitation_response("cancel", None)));
+        assert!(matches!(state.pending, Some(PendingInteraction::Approval { ref id, .. }) if id == &json!(21)));
+    }
+
+    #[test]
+    fn mcp_unsupported_modes_decline_without_approval_or_exposing_challenges() {
+        for mode in [json!("openai/userVerification"), json!("futureMode"), json!(null), json!(7)] {
+            let mut state = test_state();
+            let action = state.begin_server_request(
+                json!(9),
+                "mcpServer/elicitation/request",
+                &json!({
+                    "serverName": "custom",
+                    "threadId": "another-thread",
+                    "mode": mode,
+                    "title": "Verify identity",
+                    "description": "Please authenticate",
+                    "challenge": "secret-challenge",
+                    "_meta": {"codex_approval_kind": "tool_suggestion", "install_url": "https://example.com"}
+                }),
+            );
+            assert!(matches!(action, Action::RpcResponse { ref id, ref result }
+                if id == &json!(9) && result == &mcp_elicitation_response("decline", None)), "mode {mode}");
+            assert!(state.pending.is_none(), "mode {mode}");
+            let warning = state.committed.last().expect("unsupported mode warning");
+            assert!(matches!(warning.kind, BlockKind::Warning));
+            assert!(!warning.body.contains("secret-challenge"));
+        }
+    }
+
+    #[test]
+    fn mcp_supported_form_modes_preserve_approval_and_form_flows() {
+        for mode in [None, Some("form"), Some("openai/form"), Some("openaiForm")] {
+            for schema in [json!({"type": "object", "properties": {}}), json!({
+                "type": "object", "properties": {"name": {"type": "string"}}
+            })] {
+                let mut state = test_state();
+                let mut params = json!({"serverName": "custom", "message": "Input", "requestedSchema": schema});
+                if let Some(mode) = mode { params["mode"] = json!(mode); }
+                assert!(matches!(state.begin_server_request(json!(9), "mcpServer/elicitation/request", &params), Action::None));
+                if schema["properties"].as_object().unwrap().is_empty() {
+                    assert!(matches!(state.pending, Some(PendingInteraction::McpApproval(_))));
+                } else {
+                    assert!(matches!(state.pending, Some(PendingInteraction::McpForm(_))));
+                }
+            }
+        }
     }
 
     #[test]

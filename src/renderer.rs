@@ -498,12 +498,13 @@ pub struct SteeredPromptView {
     pub display: String,
 }
 
-/// One provider subagent that is still running, including in the background.
+/// One running provider subagent or ordinary background task.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubagentView {
     /// The parent `Task` tool-use id: what the transcript panel is keyed on.
     pub id: String,
     pub name: String,
+    pub is_background_task: bool,
     pub description: String,
     pub tool: String,
     pub elapsed: Duration,
@@ -6178,6 +6179,14 @@ fn subagent_lines(subagents: &[SubagentView], width: u16) -> Vec<PaintLine> {
 const SUBAGENT_DESCRIPTION_MIN_WIDTH: usize = 12;
 const SUBAGENT_DESCRIPTION_SEPARATOR: &str = " · ";
 
+fn subagent_label_prefix(subagent: &SubagentView) -> &'static str {
+    if subagent.is_background_task {
+        "background task: "
+    } else {
+        "sub agnet: "
+    }
+}
+
 /// 이름 옆에 그 호출로 무엇을 시켰는지 붙인다. 자리가 모자라면 None을 돌려
 /// 이름과 경과 시간만 남긴다.
 fn subagent_description_span(description: &str, available: usize) -> Option<PaintSpan> {
@@ -6202,11 +6211,15 @@ fn subagent_display_name(name: &str) -> String {
 }
 
 fn subagent_line(subagent: &SubagentView, index: usize, width: u16) -> PaintLine {
+    let label = subagent_label_prefix(subagent);
     let elapsed = format!(" · {}", format_subagent_elapsed(subagent.elapsed.as_secs()));
-    // The gutter, glyph, and elapsed reading are fixed, so the name is compacted
+    // The gutter, glyph, label, and elapsed reading are fixed, so the name is compacted
     // first and the call description takes only what the name leaves behind.
-    let reserved =
-        1 + UnicodeWidthStr::width(SUBAGENT_GLYPH) + 2 + UnicodeWidthStr::width(elapsed.as_str());
+    let reserved = 1
+        + UnicodeWidthStr::width(SUBAGENT_GLYPH)
+        + 2
+        + UnicodeWidthStr::width(label)
+        + UnicodeWidthStr::width(elapsed.as_str());
     let available = usize::from(width).saturating_sub(reserved + 1);
     let name = compact_right(&subagent_display_name(&subagent.name), available);
     let description = subagent_description_span(
@@ -6216,7 +6229,7 @@ fn subagent_line(subagent: &SubagentView, index: usize, width: u16) -> PaintLine
 
     let mut picks = vec![(0, Pick::Subagent(index)), (1, Pick::Subagent(index))];
     let mut tail = vec![PaintSpan {
-        text: format!("  {name}"),
+        text: format!("  {label}{name}"),
         tone: Tone::Plain,
         bold: false,
     }];
@@ -6955,10 +6968,6 @@ fn normal_frame_with_expansion(
     }
     if let Some(notice) = update_notice {
         lines.push(status_line_row(None, &notice, width));
-    }
-    // Separate the running-subagent rows from the status line with one blank row.
-    if status_line_painted && (!subagents.is_empty() || !artifacts.is_empty()) {
-        lines.push(PaintLine::blank());
     }
     lines.extend(subagent_lines(subagents, width));
     lines.extend(artifact_line(artifacts, width));
@@ -10108,10 +10117,13 @@ fn side_panel_subagent_lines(subagents: &[SubagentView], content_width: usize) -
         PaintLine::blank(),
     ];
     for (index, subagent) in subagents.iter().take(SIDE_PANEL_SUBAGENT_LIMIT).enumerate() {
+        let label = subagent_label_prefix(subagent);
         let elapsed = format!(" · {}", format_subagent_elapsed(subagent.elapsed.as_secs()));
         let prefix = "• ";
         let available = content_width.saturating_sub(
-            UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(elapsed.as_str()),
+            UnicodeWidthStr::width(prefix)
+                + UnicodeWidthStr::width(label)
+                + UnicodeWidthStr::width(elapsed.as_str()),
         );
         let name = compact_right(&subagent_display_name(&subagent.name), available);
         let description = subagent_description_span(
@@ -10128,7 +10140,7 @@ fn side_panel_subagent_lines(subagents: &[SubagentView], content_width: usize) -
         lines.push(PaintLine {
             prefix: prefix.to_owned(),
             prefix_tone: Tone::Accent,
-            text: name,
+            text: format!("{label}{name}"),
             tone: Tone::Plain,
             tail,
             pick: Some(PickRegions::span(0, content_width, Pick::Subagent(index))),
@@ -19022,9 +19034,39 @@ mod tests {
         SubagentView {
             id: format!("toolu_{name}"),
             name: name.to_owned(),
+            is_background_task: false,
             description: description.to_owned(),
             tool: tool.to_owned(),
             elapsed: Duration::from_secs(secs),
+        }
+    }
+
+    #[test]
+    fn background_tasks_keep_their_kind_description_and_elapsed_time() {
+        for name in ["Bash", "Workflow", "Monitor"] {
+            let mut task = test_subagent(name, "npm test", "", 29);
+            task.is_background_task = true;
+            let line = subagent_line(&task, 0, 80);
+            assert_eq!(
+                painted(&line),
+                format!(" •  background task: {name} · npm test · 29s")
+            );
+            assert_eq!(pick_on(&line, "background task:"), Some(Pick::Subagent(0)));
+            assert_eq!(pick_on(&line, "npm test"), Some(Pick::Subagent(0)));
+            assert_eq!(pick_on(&line, "29s"), None);
+            let lines = side_panel_subagent_lines(&[task.clone()], 80);
+            assert_eq!(
+                painted(&lines[2]),
+                format!("• background task: {name} · npm test · 29s")
+            );
+            let narrow = subagent_line(&task, 0, 32);
+            assert!(painted(&narrow).starts_with(" •  background task: "));
+            assert!(painted(&narrow).ends_with(" · 29s"));
+            assert!(painted_line_width(&narrow) <= 32);
+            let narrow_panel = side_panel_subagent_lines(&[task], 32);
+            assert!(painted(&narrow_panel[2]).starts_with("• background task: "));
+            assert!(painted(&narrow_panel[2]).ends_with(" · 29s"));
+            assert!(painted_line_width(&narrow_panel[2]) <= 32);
         }
     }
 
@@ -19041,8 +19083,8 @@ mod tests {
                 .map(painted)
                 .collect::<Vec<_>>(),
             [
-                " •  Explore · Find auth code · 1m 33s",
-                " •  developer · Fix the parser · 3s",
+                " •  sub agnet: Explore · Find auth code · 1m 33s",
+                " •  sub agnet: developer · Fix the parser · 3s",
             ]
         );
     }
@@ -19051,7 +19093,10 @@ mod tests {
     fn a_subagent_row_without_a_description_shows_only_its_name() {
         let subagent = test_subagent("Explore", "", "Grep(fn login)", 4);
 
-        assert_eq!(painted(&subagent_line(&subagent, 0, 80)), " •  Explore · 4s");
+        assert_eq!(
+            painted(&subagent_line(&subagent, 0, 80)),
+            " •  sub agnet: Explore · 4s"
+        );
     }
 
     #[test]
@@ -19059,10 +19104,13 @@ mod tests {
         let codex = test_subagent("/root/eghis2_daily_popup", "", "", 28);
         let claude = test_subagent("devez-reviewer", "변경 검토", "", 3);
 
-        assert_eq!(painted(&subagent_line(&codex, 0, 80)), " •  eghis2 daily popup · 28s");
+        assert_eq!(
+            painted(&subagent_line(&codex, 0, 80)),
+            " •  sub agnet: eghis2 daily popup · 28s"
+        );
         assert_eq!(
             painted(&subagent_line(&claude, 1, 80)),
-            " •  devez reviewer · 변경 검토 · 3s"
+            " •  sub agnet: devez reviewer · 변경 검토 · 3s"
         );
     }
 
@@ -19078,19 +19126,25 @@ mod tests {
         let line = subagent_line(&subagent, 0, 30);
 
         assert!(!painted(&line).contains("hidden"));
+        assert!(painted(&line).starts_with(" •  sub agnet: "));
         assert!(painted(&line).ends_with(" · 1m 33s"));
         assert!(painted_line_width(&line) <= 30);
+
+        let lines = side_panel_subagent_lines(&[subagent], 30);
+        assert!(painted(&lines[2]).starts_with("• sub agnet: "));
+        assert!(painted(&lines[2]).ends_with(" · 1m 33s"));
+        assert!(painted_line_width(&lines[2]) <= 30);
     }
 
     #[test]
     fn a_narrow_subagent_row_drops_the_description_before_the_name() {
         let subagent = test_subagent("Explore", "Find the auth code path", "", 4);
 
-        let line = subagent_line(&subagent, 0, 26);
+        let line = subagent_line(&subagent, 0, 36);
 
         assert!(painted(&line).contains("Explore"));
         assert!(!painted(&line).contains("Find"));
-        assert!(painted_line_width(&line) <= 26);
+        assert!(painted_line_width(&line) <= 36);
     }
 
     #[test]
@@ -19104,6 +19158,7 @@ mod tests {
         );
 
         assert_eq!(pick_on(&lines[0], "•"), Some(Pick::Subagent(0)));
+        assert_eq!(pick_on(&lines[0], "sub agnet:"), Some(Pick::Subagent(0)));
         assert_eq!(pick_on(&lines[0], "Explore"), Some(Pick::Subagent(0)));
         assert_eq!(pick_on(&lines[0], "Find auth code"), Some(Pick::Subagent(0)));
         assert_eq!(pick_on(&lines[1], "developer"), Some(Pick::Subagent(1)));
@@ -19121,8 +19176,14 @@ mod tests {
 
         assert_eq!(painted(&lines[0]), "Subagents  2 Running");
         assert!(lines[1] == PaintLine::blank());
-        assert_eq!(painted(&lines[2]), "• Explore · Find auth code · 1m 33s");
-        assert_eq!(painted(&lines[3]), "• developer · Fix the parser · 3s");
+        assert_eq!(
+            painted(&lines[2]),
+            "• sub agnet: Explore · Find auth c… · 1m 33s"
+        );
+        assert_eq!(
+            painted(&lines[3]),
+            "• sub agnet: developer · Fix the parser · 3s"
+        );
         assert_eq!(pick_on(&lines[2], "Explore"), Some(Pick::Subagent(0)));
         assert_eq!(pick_on(&lines[2], "1m 33s"), Some(Pick::Subagent(0)));
         assert_eq!(pick_on(&lines[3], "developer"), Some(Pick::Subagent(1)));
@@ -19200,7 +19261,7 @@ mod tests {
             .position(|line| painted(line).contains("Update available:"))
             .expect("update notice");
         assert!(update_index > composer_index);
-        assert!(update_index < subagent_index);
+        assert_eq!(update_index + 1, subagent_index);
         assert!(painted(&frame.lines[update_index]).ends_with("dvz update"));
     }
 

@@ -224,7 +224,7 @@ async fn start_with_effort(
     let mut params = json!({
         "threadId": state.thread_id, "model": model, "effort": effort,
         "permissions": ":danger-full-access",
-        "additionalContext": crate::turn_additional_context(state.vibe_mode(), state.agent_mode(), None),
+        "additionalContext": crate::turn_additional_context(state.agent_mode(), None),
         "input": state.turn_input(prompt.to_owned())
     });
     super::prepare_codex_turn_context(&mut params);

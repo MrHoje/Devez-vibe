@@ -2413,8 +2413,7 @@ fn insert_handoff_context(params: &mut Value, context: &str) {
 
 /// Codex receives `additionalContext` directly. It already holds the rules as
 /// the thread's developer instructions, so the standing copies are dropped here
-/// along with the Claude-only entries, leaving the turn carrying the preset
-/// alone.
+/// along with the Claude-only entries and the retired display-mode notice.
 fn prepare_codex_turn_context(params: &mut Value) {
     let Some(context) = params
         .get_mut("additionalContext")
@@ -2425,6 +2424,7 @@ fn prepare_codex_turn_context(params: &mut Value) {
     context.remove("devez-vibe-rules");
     context.remove("claude-devez-vibe-rules");
     context.remove("claude-devez-vibe-reminder");
+    context.remove("devez-vibe-mode");
 }
 
 /// Codex built-in permission profile that lets a turn read but not write.
@@ -2485,13 +2485,6 @@ fn combined_turn_instructions(params: &Value, runtime: RuntimeKind) -> Option<St
                 .and_then(Value::as_str)
         })
         .flatten();
-    let mode = (runtime != RuntimeKind::OpenCode)
-        .then(|| {
-            params
-                .pointer("/additionalContext/devez-vibe-mode/value")
-                .and_then(Value::as_str)
-        })
-        .flatten();
     let claude_reminder = (runtime == RuntimeKind::Claude)
         .then(|| {
             params
@@ -2499,9 +2492,8 @@ fn combined_turn_instructions(params: &Value, runtime: RuntimeKind) -> Option<St
                 .and_then(Value::as_str)
         })
         .flatten();
-    // The agent role is the one piece every runtime needs: OpenCode is skipped
-    // for the mode notice, but a role that never reaches it would leave the
-    // status line claiming a role the session is not in.
+    // Every runtime needs the role; otherwise the status line would claim a
+    // role the session is not in.
     let agent = params
         .pointer("/additionalContext/devez-vibe-agent/value")
         .and_then(Value::as_str);
@@ -2510,7 +2502,6 @@ fn combined_turn_instructions(params: &Value, runtime: RuntimeKind) -> Option<St
         .and_then(Value::as_str);
     let parts = [
         rules,
-        mode,
         params
             .pointer("/additionalContext/provider-handoff/value")
             .and_then(Value::as_str),
@@ -3223,18 +3214,14 @@ mod tests {
         });
         insert_handoff_context(&mut params, "history");
 
-        // Claude opens on the rules as its system prompt, so its turn carries
-        // only the preset, handoff, and short output reminder. Codex holds the
-        // rules as its thread instructions, so its turn carries the preset and
-        // handoff. OpenCode has no standing instruction slot, so its turn has
-        // to carry the shared rules itself, alongside the handoff.
+        // Ignore the legacy mode notice; preserve handoff and provider rules.
         assert_eq!(
             combined_turn_instructions(&params, RuntimeKind::Claude).as_deref(),
-            Some("super vibe\n\nhistory\n\nclaude reminder")
+            Some("history\n\nclaude reminder")
         );
         assert_eq!(
             combined_turn_instructions(&params, RuntimeKind::Codex).as_deref(),
-            Some("super vibe\n\nhistory")
+            Some("history")
         );
         assert_eq!(
             combined_turn_instructions(&params, RuntimeKind::OpenCode).as_deref(),
@@ -3242,8 +3229,7 @@ mod tests {
         );
     }
 
-    /// Every runtime needs the role, including the one that is skipped for the
-    /// shared rules and the preset notice.
+    /// Every runtime needs the role, without the retired mode notice.
     #[test]
     fn the_agent_role_reaches_all_three_runtimes() {
         let params = json!({
@@ -3259,11 +3245,11 @@ mod tests {
         // The role sits after the handoff slot and before the output reminder.
         assert_eq!(
             combined_turn_instructions(&params, RuntimeKind::Claude).as_deref(),
-            Some("super vibe\n\nplanner block\n\nclaude reminder")
+            Some("planner block\n\nclaude reminder")
         );
         assert_eq!(
             combined_turn_instructions(&params, RuntimeKind::Codex).as_deref(),
-            Some("super vibe\n\nplanner block")
+            Some("planner block")
         );
         assert_eq!(
             combined_turn_instructions(&params, RuntimeKind::OpenCode).as_deref(),
@@ -3272,13 +3258,13 @@ mod tests {
     }
 
     #[test]
-    fn fixed_response_length_caps_are_absent_on_every_provider() {
+    fn only_builder_receives_the_200_character_cap_on_every_provider() {
         for role in crate::agent::BUILTIN {
             for vibe in [crate::VibeMode::Normal, crate::VibeMode::Vibe, crate::VibeMode::SuperVibe] {
                 let mut params = crate::new_thread_params(
                     ".", None, None, "startup", "low", "default", "high",
                 );
-                params["additionalContext"] = crate::turn_additional_context(vibe, role, None);
+                params["additionalContext"] = crate::turn_additional_context(role, None);
                 for runtime in [RuntimeKind::Codex, RuntimeKind::Claude, RuntimeKind::OpenCode] {
                     let outgoing = match runtime {
                         RuntimeKind::Codex => {
@@ -3293,7 +3279,20 @@ mod tests {
                         ),
                         RuntimeKind::OpenCode => combined_turn_instructions(&params, runtime).unwrap(),
                     };
-                    for cap in ["200자", "불릿 두세 개", "불릿 하나에 두 문장", "수정이 셋을 넘으면"] {
+                    assert_eq!(
+                        outgoing.contains("200자"),
+                        role == crate::agent::AgentMode::Standard,
+                        "{} / {}", runtime.label(), role.id(),
+                    );
+                    if role == crate::agent::AgentMode::Standard {
+                        assert!(outgoing.contains("공백·탭·줄바꿈을 제외"));
+                        assert!(outgoing.contains("상세한 분석을 명시적으로 요청한 경우에만"));
+                        assert!(outgoing.contains("선택·승인 설명과 코드 블록은 분량 제한과 글자 수 계산에서 제외"));
+                        assert!(!outgoing.contains("선택·승인 설명과 코드 블록도 포함"));
+                        assert!(!outgoing.contains("선택·승인 답변은 제한하지 않는다"));
+                        assert!(!outgoing.contains("선택·승인은 분량 제한 없이"));
+                    }
+                    for cap in ["불릿 두세 개", "불릿 하나에 두 문장", "수정이 셋을 넘으면"] {
                         assert!(
                             !outgoing.contains(cap),
                             "{} / {} / {}: {cap}",
@@ -3331,10 +3330,9 @@ mod tests {
         );
     }
 
-    /// A Standard turn with its reset already spent sends no role key, and the
-    /// combined instructions have to look exactly as they did before roles.
+    /// A legacy mode notice alone must not produce turn instructions.
     #[test]
-    fn a_turn_without_a_role_key_is_unchanged() {
+    fn a_legacy_mode_notice_produces_no_turn_instructions() {
         let params = json!({
             "additionalContext": {
                 "devez-vibe-mode": { "value": "super vibe", "kind": "application" }
@@ -3343,7 +3341,7 @@ mod tests {
 
         assert_eq!(
             combined_turn_instructions(&params, RuntimeKind::Claude).as_deref(),
-            Some("super vibe")
+            None
         );
         assert_eq!(
             combined_turn_instructions(&params, RuntimeKind::OpenCode).as_deref(),
@@ -3373,7 +3371,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_turn_keeps_only_the_preset_at_the_provider_boundary() {
+    fn codex_turn_removes_duplicate_rules_and_legacy_mode_notice() {
         let mut params = json!({
             "additionalContext": {
                 "devez-vibe-rules": { "value": "full rules", "kind": "application" },
@@ -3406,7 +3404,7 @@ mod tests {
             params
                 .pointer("/additionalContext/devez-vibe-mode/value")
                 .and_then(Value::as_str),
-            Some("mode")
+            None
         );
     }
 

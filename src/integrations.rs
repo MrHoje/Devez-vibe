@@ -80,9 +80,9 @@ pub struct McpServerInfo {
     pub tools: Vec<String>,
     pub resources: usize,
     pub website_url: Option<String>,
-    /// Claude exposes the live transport state directly. Codex omits it for
-    /// listed servers, which already means the server completed startup.
+    /// Codex `runtimeStatus`, or the legacy Claude `status`.
     pub connection_status: Option<String>,
+    pub tools_error: Option<String>,
     /// Set from `mcpServer/startupStatus/updated` when a server failed to start.
     pub failure: Option<String>,
 }
@@ -136,7 +136,13 @@ impl McpServerInfo {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
             connection_status: entry
-                .get("status")
+                .get("runtimeStatus")
+                .and_then(Value::as_str)
+                .or_else(|| entry.get("status").and_then(Value::as_str))
+                .or_else(|| entry.get("runtimeStatus").map(|_| "unknown"))
+                .map(ToOwned::to_owned),
+            tools_error: entry
+                .get("toolsError")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
             failure: (entry.get("status").and_then(Value::as_str) == Some("failed")).then(|| {
@@ -151,6 +157,7 @@ impl McpServerInfo {
 
     pub fn needs_login(&self) -> bool {
         self.auth_status == "notLoggedIn"
+            || matches!(self.connection_status.as_deref(), Some("needs-auth" | "authenticationRequired"))
     }
 
     /// Builds a server entry for tests that only care about name, auth and tool
@@ -166,6 +173,7 @@ impl McpServerInfo {
             resources: 0,
             website_url: None,
             connection_status: None,
+            tools_error: None,
             failure: None,
         }
     }
@@ -173,6 +181,9 @@ impl McpServerInfo {
     fn status(&self) -> &str {
         if self.failure.is_some() {
             return "failed";
+        }
+        if self.tools_error.is_some() {
+            return "도구 조회 실패";
         }
         if let Some(status) = self.connection_status.as_deref() {
             return status;
@@ -203,10 +214,16 @@ impl McpServerInfo {
                     "실패".to_owned()
                 },
             )
-        } else if self.needs_login() || self.connection_status.as_deref() == Some("needs-auth") {
+        } else if self.needs_login() {
             (IntegrationItemState::Inactive, "로그인 필요".to_owned())
-        } else if self.connection_status.as_deref() == Some("pending") {
+        } else if self.tools_error.is_some() {
+            (IntegrationItemState::Inactive, "도구 조회 실패".to_owned())
+        } else if matches!(self.connection_status.as_deref(), Some("pending" | "starting")) {
             (IntegrationItemState::Pending, "연결 중".to_owned())
+        } else if self.connection_status.as_deref() == Some("notStarted") {
+            (IntegrationItemState::Inactive, "시작 전".to_owned())
+        } else if self.connection_status.as_deref() == Some("cancelled") {
+            (IntegrationItemState::Inactive, "연결 취소".to_owned())
         } else if matches!(self.connection_status.as_deref(), None | Some("connected")) {
             let tools = self.tools.len();
             (
@@ -521,7 +538,11 @@ impl McpPicker {
                         },
                         server.label()
                     ),
-                    &format!("{} · 도구 {}개", server.status(), server.tools.len()),
+                    &if server.tools_error.is_some() {
+                        server.status().to_owned()
+                    } else {
+                        format!("{} · 도구 {}개", server.status(), server.tools.len())
+                    },
                 ),
                 selected: start + offset == self.selected,
                 muted: false,
@@ -586,6 +607,13 @@ impl McpPicker {
                 muted: false,
             });
         }
+        if let Some(error) = server.tools_error.as_deref() {
+            lines.push(OverlayLine {
+                text: format!("도구 조회 오류: {error}"),
+                selected: false,
+                muted: false,
+            });
+        }
         lines.push(OverlayLine {
             text: format!("Auth: {}", server.auth_status),
             selected: false,
@@ -618,11 +646,15 @@ impl McpPicker {
             muted: true,
         });
         lines.push(OverlayLine {
-            text: format!("Tools ({})", server.tools.len()),
+            text: if server.tools_error.is_some() {
+                "도구 목록을 조회하지 못했습니다.".to_owned()
+            } else {
+                format!("Tools ({})", server.tools.len())
+            },
             selected: false,
             muted: false,
         });
-        if server.tools.is_empty() {
+        if server.tools.is_empty() && server.tools_error.is_none() {
             lines.push(OverlayLine {
                 text: "  이 서버는 도구를 제공하지 않습니다.".to_owned(),
                 selected: false,
@@ -2165,6 +2197,62 @@ mod tests {
                 .text
                 .starts_with("[ ] Browser")
         );
+    }
+
+    #[test]
+    fn codex_mcp_tools_error_is_not_an_empty_catalog_and_recovers() {
+        let mut response = json!({"data": [{
+            "name": "browser", "authStatus": "unsupported", "tools": {},
+            "runtimeStatus": "connected", "toolsError": "discovery timed out"
+        }]});
+        let servers = McpServerInfo::list_from_value(&response);
+        assert_eq!(servers[0].panel_item().state, IntegrationItemState::Inactive);
+        assert_eq!(servers[0].panel_item().detail, "도구 조회 실패");
+        let mut picker = McpPicker::new(servers);
+        assert!(picker.overlay_view().lines[0].text.contains("도구 조회 실패"));
+        assert!(!picker.overlay_view().lines[0].text.contains("도구 0개"));
+        picker.handle_key(press(KeyCode::Enter));
+        let detail = picker.overlay_view();
+        assert!(detail.lines.iter().any(|line| line.text.contains("discovery timed out")));
+        assert!(!detail.lines.iter().any(|line| line.text.contains("도구를 제공하지 않습니다")));
+
+        response["data"][0]["toolsError"] = Value::Null;
+        let servers = McpServerInfo::list_from_value(&response);
+        assert_eq!(servers[0].panel_item().state, IntegrationItemState::Active);
+        assert_eq!(servers[0].panel_item().detail, "연결됨");
+        let mut picker = McpPicker::new(servers);
+        picker.handle_key(press(KeyCode::Enter));
+        assert!(picker.overlay_view().lines.iter().any(|line| line.text.contains("도구를 제공하지 않습니다")));
+    }
+
+    #[test]
+    fn codex_mcp_runtime_states_preserve_connection_meaning() {
+        for (runtime, expected_state, expected_detail) in [
+            ("notStarted", IntegrationItemState::Inactive, "시작 전"),
+            ("starting", IntegrationItemState::Pending, "연결 중"),
+            ("connected", IntegrationItemState::Active, "연결됨"),
+            ("authenticationRequired", IntegrationItemState::Inactive, "로그인 필요"),
+            ("failed", IntegrationItemState::Inactive, "실패"),
+            ("cancelled", IntegrationItemState::Inactive, "연결 취소"),
+            ("disabled", IntegrationItemState::Inactive, "비활성"),
+            ("futureState", IntegrationItemState::Unknown, "미확인"),
+        ] {
+            let server = McpServerInfo::from_value(&json!({
+                "name": "browser", "runtimeStatus": runtime,
+                "authStatus": "unsupported", "tools": {}, "toolsError": null
+            })).unwrap();
+            assert_eq!(server.panel_item().state, expected_state, "{runtime}");
+            assert_eq!(server.panel_item().detail, expected_detail, "{runtime}");
+            assert_eq!(server.needs_login(), runtime == "authenticationRequired");
+        }
+        let server = McpServerInfo::from_value(&json!({
+            "name": "browser", "runtimeStatus": null, "authStatus": "unsupported"
+        })).unwrap();
+        assert_eq!(server.panel_item().state, IntegrationItemState::Unknown);
+        let legacy = McpServerInfo::from_value(&json!({
+            "name": "browser", "authStatus": "unsupported", "tools": {}
+        })).unwrap();
+        assert_eq!(legacy.panel_item().state, IntegrationItemState::Active);
     }
 
     #[test]
