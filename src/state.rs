@@ -4242,7 +4242,7 @@ impl AppState {
     fn apply_provider_model(&mut self, provider: ModelProvider, query: &str) {
         let Some(index) = self.provider_model_index(provider, query) else {
             self.committed
-                .push(Block::new(BlockKind::Error, "Model not found", format!("{query} — Switch with /provider {}, then use /model to see available models.", provider.label().to_ascii_lowercase())));
+                .push(Block::new(BlockKind::Error, "Model not found", format!("{query}\nSwitch with /provider {}, then use /model to see available models.", provider.label().to_ascii_lowercase())));
             return;
         };
         self.apply_model(index, None);
@@ -9536,7 +9536,7 @@ impl AppState {
                     self.committed.push(Block::new(
                         BlockKind::Error,
                         "Usage",
-                        "/provider [claude|codex|opencode] or /provider [claude|codex] MODEL — For OpenCode, switch with /provider opencode, then select a model with /model.",
+                        "/provider [claude|codex|opencode]\n/provider [claude|codex] MODEL\nOpenCode: /provider opencode, then /model.",
                     ));
                     Action::None
                 }
@@ -9550,7 +9550,7 @@ impl AppState {
                             self.committed.push(Block::new(
                                 BlockKind::Error,
                                 "Model not found",
-                                format!("{query} — Switch with /provider claude, then use /model to see available models."),
+                                format!("{query}\nSwitch with /provider claude, then use /model to see available models."),
                             ));
                             return Action::None;
                         };
@@ -9570,7 +9570,7 @@ impl AppState {
                         self.committed.push(Block::new(
                             BlockKind::Error,
                             "Usage",
-                            "/provider [claude|codex|opencode] or /provider [claude|codex] MODEL — For OpenCode, switch with /provider opencode, then select a model with /model.",
+                            "/provider [claude|codex|opencode]\n/provider [claude|codex] MODEL\nOpenCode: /provider opencode, then /model.",
                         ));
                         Action::None
                     }
@@ -9580,7 +9580,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::Error,
                     "Usage",
-                    "/provider [claude|codex|opencode] or /provider [claude|codex] MODEL — For OpenCode, switch with /provider opencode, then select a model with /model.",
+                    "/provider [claude|codex|opencode]\n/provider [claude|codex] MODEL\nOpenCode: /provider opencode, then /model.",
                 ));
                 Action::None
             }
@@ -9660,7 +9660,7 @@ impl AppState {
                     });
                 let Some(index) = index else {
                     self.committed
-                        .push(Block::new(BlockKind::Error, "Model not found", format!("{query} — Use /model to see available models for the current provider.")));
+                        .push(Block::new(BlockKind::Error, "Model not found", format!("{query}\nUse /model to see available models for the current provider.")));
                     return Action::None;
                 };
                 let effort = parts.get(2).copied();
@@ -9702,7 +9702,7 @@ impl AppState {
                     self.committed.push(Block::new(
                         BlockKind::Error,
                         "Unsupported reasoning effort",
-                        format!("{effort} — Use /effort to check support and available values for the current model."),
+                        format!("{effort}\nUse /effort to check support and available values for the current model."),
                     ));
                 }
                 Action::None
@@ -21678,7 +21678,7 @@ mod tests {
             assert!(matches!(error.kind, BlockKind::Error));
             assert_eq!(error.title, "Usage");
             assert!(error.body.contains("/provider [claude|codex] MODEL"));
-            assert!(error.body.contains("switch with /provider opencode, then select a model with /model"));
+            assert!(error.body.contains("OpenCode: /provider opencode, then /model."));
             assert!(!error.body.contains("[claude|codex|opencode] [MODEL]"));
             assert_eq!(state.selected_model_name(), model);
         }

@@ -1211,7 +1211,7 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
                     state.push_notice(
                         BlockKind::Error,
                         "MCP login failed",
-                        "The server did not return a login URL (authorizationUrl). — Use /mcp to check the server status.",
+                        "The server did not return a login URL (authorizationUrl).\nUse /mcp to check the server status.",
                     );
                 }
             }
@@ -3067,7 +3067,7 @@ async fn execute_action(
                         state.push_notice(
                             BlockKind::Error,
                             "Provider connection failed",
-                            "No API key was provided. — Use /connect to select a provider and enter an API key.",
+                            "No API key was provided.\nUse /connect to select a provider and enter an API key.",
                         );
                         return Ok(false);
                     };
@@ -6091,7 +6091,7 @@ fn start_login_flow(state: &mut AppState, method: LoginMethod, response: &Value)
                 _ => state.push_notice(
                     BlockKind::Error,
                     "Login failed",
-                    "The server did not return a login ID (loginId) or login URL (authUrl). — Use /login to try again.",
+                    "The server did not return a login ID (loginId) or login URL (authUrl).\nUse /login to try again.",
                 ),
             }
         }
@@ -6107,7 +6107,7 @@ fn start_login_flow(state: &mut AppState, method: LoginMethod, response: &Value)
                 _ => state.push_notice(
                     BlockKind::Error,
                     "Login failed",
-                    "The server did not return one or more required fields: loginId, verificationUrl, userCode. — Use /login to try again.",
+                    "The server did not return one or more required fields: loginId, verificationUrl, userCode.\nUse /login to try again.",
                 ),
             }
         }

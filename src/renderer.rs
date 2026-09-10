@@ -10725,20 +10725,26 @@ fn block_lines_with_mode_at(
             .map(str::trim)
             .filter(|line| !line.is_empty())
             .collect::<Vec<_>>()
-            .join(" — ");
+            .join("\n");
         let message = match (block.title.is_empty(), body.is_empty()) {
             (_, true) => block.title.clone(),
             (true, false) => body,
             (false, false) => format!("{}: {}", block.title, body),
         };
-        return wrapped_line(
-            "● ",
-            Tone::Accent,
-            &message,
-            Tone::Accent,
-            false,
-            width,
-        );
+        return message
+            .split('\n')
+            .enumerate()
+            .flat_map(|(index, line)| {
+                wrapped_line(
+                    if index == 0 { "● " } else { "  " },
+                    Tone::Accent,
+                    line,
+                    Tone::Accent,
+                    false,
+                    width,
+                )
+            })
+            .collect();
     }
     if matches!(block.kind, BlockKind::ModelChange | BlockKind::System) {
         return notice_card_lines(block, width);
@@ -27456,14 +27462,15 @@ mod tests {
     fn error_notices_share_inline_format_and_preserve_details() {
         for (title, body, expected) in [
             ("Usage", "/provider [claude|codex|opencode]", "● Usage: /provider [claude|codex|opencode]"),
-            ("연결 실패", "인증 만료\r\n\r\n다시 로그인하세요.", "● 연결 실패: 인증 만료 — 다시 로그인하세요."),
+            ("연결 실패", "인증 만료\r\n\r\n다시 로그인하세요.", "● 연결 실패: 인증 만료\n  다시 로그인하세요."),
+            ("Usage", "/provider [claude|codex|opencode]\n/provider [claude|codex] MODEL\nOpenCode: /provider opencode, then /model.", "● Usage: /provider [claude|codex|opencode]\n  /provider [claude|codex] MODEL\n  OpenCode: /provider opencode, then /model."),
             ("연결 종료", "", "● 연결 종료"),
             ("", "서버 응답 없음", "● 서버 응답 없음"),
         ] {
             let block = Block::new(BlockKind::Error, title, body);
             let lines = block_lines(&block, 100);
-            assert_eq!(lines.len(), 1);
-            assert_eq!(painted(&lines[0]), expected);
+            assert_eq!(lines.len(), expected.lines().count());
+            assert_eq!(lines.iter().map(painted).collect::<Vec<_>>().join("\n"), expected);
             assert_eq!(lines[0].prefix_tone, Tone::Accent);
             assert_eq!(lines[0].tone, Tone::Accent);
             assert!(!lines[0].bold);
@@ -27473,7 +27480,7 @@ mod tests {
             assert!(narrow.iter().skip(1).all(|line| line.prefix == "  "));
             assert!(narrow.iter().all(|line| painted_line_width(line) < 24));
             let restored = narrow.iter().map(|line| line.text.as_str()).collect::<String>();
-            assert_eq!(restored.replace(' ', ""), expected.trim_start_matches("● ").replace(' ', ""));
+            assert_eq!(restored.replace(' ', ""), expected.trim_start_matches("● ").replace([' ', '\n'], ""));
         }
     }
 
