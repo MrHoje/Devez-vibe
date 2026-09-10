@@ -669,6 +669,7 @@ impl TerminalSession {
             // private mouse modes together, which otherwise lets a wheel tick
             // reach the composer as an Up/Down history key.
             disable_alternate_scroll(&mut stdout())?;
+            execute!(stdout(), Print("\x1b]777;devez-context-v1;1\x07"))?;
         }
         Ok(Self { mode })
     }
@@ -677,6 +678,7 @@ impl TerminalSession {
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         if self.mode == RenderMode::Fullscreen {
+            let _ = execute!(stdout(), Print("\x1b]777;devez-context-v1;0\x07"));
             // Undone before the colour reset below, so the OSC restores land on
             // the main screen where they are what the user keeps looking at.
             let _ = execute!(stdout(), DisableMouseCapture);
@@ -10716,11 +10718,23 @@ fn block_lines_with_mode_at(
         return help_card_lines(block, width);
     }
 
-    if matches!(block.kind, BlockKind::Error) && block.title == "Unknown command" {
+    if matches!(block.kind, BlockKind::Error) {
+        let body = block
+            .body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" — ");
+        let message = match (block.title.is_empty(), body.is_empty()) {
+            (_, true) => block.title.clone(),
+            (true, false) => body,
+            (false, false) => format!("{}: {}", block.title, body),
+        };
         return wrapped_line(
             "● ",
             Tone::Accent,
-            &format!("{}: {}", block.title, block.body),
+            &message,
             Tone::Accent,
             false,
             width,
@@ -10744,7 +10758,7 @@ fn block_lines_with_mode_at(
         }
         BlockKind::Assistant => (RESPONSE_BULLET_PREFIX, Tone::FastOff),
         BlockKind::Warning => ("▲ ", Tone::Warning),
-        BlockKind::Error => ("✕ ", Tone::Error),
+        BlockKind::Error => unreachable!("error blocks are rendered separately"),
     };
 
     let conversational = matches!(block.kind, BlockKind::Assistant);
@@ -11762,7 +11776,7 @@ fn inline_link(rest: &str, streaming: bool) -> Option<(String, Option<String>, u
 /// platform opener. Windows absolute paths arrive with a URI-like leading
 /// slash, while source links can carry a line/column suffix that is useful in
 /// the label but is not part of the file name.
-fn markdown_link_open_target(target: &str) -> String {
+pub(crate) fn markdown_link_open_target(target: &str) -> String {
     let target = markdown_link_target_body(target);
     let target = target
         .strip_prefix('/')
@@ -27436,6 +27450,31 @@ mod tests {
             assert_eq!(lines[0].tone, Tone::Accent);
         }
         theme::set_current(ThemeKind::Dark);
+    }
+
+    #[test]
+    fn error_notices_share_inline_format_and_preserve_details() {
+        for (title, body, expected) in [
+            ("Usage", "/provider [claude|codex|opencode]", "● Usage: /provider [claude|codex|opencode]"),
+            ("연결 실패", "인증 만료\r\n\r\n다시 로그인하세요.", "● 연결 실패: 인증 만료 — 다시 로그인하세요."),
+            ("연결 종료", "", "● 연결 종료"),
+            ("", "서버 응답 없음", "● 서버 응답 없음"),
+        ] {
+            let block = Block::new(BlockKind::Error, title, body);
+            let lines = block_lines(&block, 100);
+            assert_eq!(lines.len(), 1);
+            assert_eq!(painted(&lines[0]), expected);
+            assert_eq!(lines[0].prefix_tone, Tone::Accent);
+            assert_eq!(lines[0].tone, Tone::Accent);
+            assert!(!lines[0].bold);
+
+            let narrow = block_lines(&block, 24);
+            assert_eq!(narrow[0].prefix, "● ");
+            assert!(narrow.iter().skip(1).all(|line| line.prefix == "  "));
+            assert!(narrow.iter().all(|line| painted_line_width(line) < 24));
+            let restored = narrow.iter().map(|line| line.text.as_str()).collect::<String>();
+            assert_eq!(restored.replace(' ', ""), expected.trim_start_matches("● ").replace(' ', ""));
+        }
     }
 
     #[test]

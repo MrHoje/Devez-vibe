@@ -1280,6 +1280,7 @@ pub enum Action {
     },
     RefreshSkills,
     OpenUrl(String),
+    OpenLinkDirectory(String),
     SetTheme(ThemeKind),
     /// Write the picked model and effort into `~/.codex/config.toml`.
     PersistModelDefault {
@@ -4241,7 +4242,7 @@ impl AppState {
     fn apply_provider_model(&mut self, provider: ModelProvider, query: &str) {
         let Some(index) = self.provider_model_index(provider, query) else {
             self.committed
-                .push(Block::new(BlockKind::Error, "모델을 찾을 수 없음", query));
+                .push(Block::new(BlockKind::Error, "Model not found", format!("{query} — Switch with /provider {}, then use /model to see available models.", provider.label().to_ascii_lowercase())));
             return;
         };
         self.apply_model(index, None);
@@ -4470,7 +4471,7 @@ impl AppState {
             self.committed.push(Block::new(
                 BlockKind::Error,
                 "Provider unavailable",
-                format!("{} 모델을 찾을 수 없습니다.", provider.label()),
+                format!("No models were found for {}.", provider.label()),
             ));
             return;
         };
@@ -5223,8 +5224,8 @@ impl AppState {
         } else {
             self.push_notice(
                 BlockKind::Error,
-                "로그인 실패",
-                error.unwrap_or("알 수 없는 오류로 로그인이 완료되지 않았습니다."),
+                "Login failed",
+                error.unwrap_or("Login did not complete due to an unknown error."),
             );
         }
     }
@@ -6335,7 +6336,7 @@ impl AppState {
 
     pub fn provider_connection_failed(&mut self, message: impl Into<String>) {
         self.pending = None;
-        self.push_notice(BlockKind::Error, "Provider 연결 실패", message.into());
+        self.push_notice(BlockKind::Error, "Provider connection failed", message.into());
     }
 
     pub fn open_plugin_picker(
@@ -8898,11 +8899,11 @@ impl AppState {
                 if let Some(error) = turn_error {
                     self.committed.push(Block::new(
                         BlockKind::Error,
-                        "Turn 실패",
+                        "Response generation failed",
                         error
                             .get("message")
                             .and_then(Value::as_str)
-                            .unwrap_or("알 수 없는 오류"),
+                            .unwrap_or("Unknown error"),
                     ));
                 }
                 self.flush_orphaned_active();
@@ -9164,7 +9165,7 @@ impl AppState {
                     .get("error")
                     .and_then(|error| error.get("message"))
                     .and_then(Value::as_str)
-                    .unwrap_or("알 수 없는 Codex 오류");
+                    .unwrap_or("The provider did not return error details.");
                 let retry = params
                     .get("willRetry")
                     .and_then(Value::as_bool)
@@ -9183,12 +9184,13 @@ impl AppState {
                         BlockKind::Error
                     },
                     if retry {
-                        "재시도 중"
+                        "Retrying"
                     } else {
                         match provider {
-                            "Codex" => "Codex 오류",
-                            "Claude" => "Claude 오류",
-                            _ => "OpenCode 오류",
+                            "Codex" => "Codex error",
+                            "Claude" => "Claude error",
+                            "OpenCode" => "OpenCode error",
+                            _ => "Provider error",
                         }
                     },
                     message,
@@ -9237,7 +9239,7 @@ impl AppState {
                         params
                             .get("error")
                             .and_then(Value::as_str)
-                            .unwrap_or("OAuth 인증을 완료하지 못했습니다.")
+                            .unwrap_or("OAuth authentication did not complete.")
                             .to_owned()
                     },
                 ));
@@ -9518,7 +9520,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/provider [claude|codex|opencode] [MODEL]  provider와 모델 선택\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|researcher|goal-runner]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
+                    format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex] MODEL  Select a provider and model\nFor OpenCode, switch with /provider opencode, then select a model with /model\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|researcher|goal-runner]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
                 ));
                 Action::None
             }
@@ -9534,7 +9536,7 @@ impl AppState {
                     self.committed.push(Block::new(
                         BlockKind::Error,
                         "Usage",
-                        "/provider [claude|codex|opencode]",
+                        "/provider [claude|codex|opencode] or /provider [claude|codex] MODEL — For OpenCode, switch with /provider opencode, then select a model with /model.",
                     ));
                     Action::None
                 }
@@ -9547,8 +9549,8 @@ impl AppState {
                         else {
                             self.committed.push(Block::new(
                                 BlockKind::Error,
-                                "모델을 찾을 수 없음",
-                                query,
+                                "Model not found",
+                                format!("{query} — Switch with /provider claude, then use /model to see available models."),
                             ));
                             return Action::None;
                         };
@@ -9568,7 +9570,7 @@ impl AppState {
                         self.committed.push(Block::new(
                             BlockKind::Error,
                             "Usage",
-                            "/provider [claude|codex] [MODEL]",
+                            "/provider [claude|codex|opencode] or /provider [claude|codex] MODEL — For OpenCode, switch with /provider opencode, then select a model with /model.",
                         ));
                         Action::None
                     }
@@ -9578,7 +9580,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::Error,
                     "Usage",
-                    "/provider [claude|codex|opencode] [MODEL]",
+                    "/provider [claude|codex|opencode] or /provider [claude|codex] MODEL — For OpenCode, switch with /provider opencode, then select a model with /model.",
                 ));
                 Action::None
             }
@@ -9590,7 +9592,7 @@ impl AppState {
                     self.committed.push(Block::new(
                         BlockKind::Error,
                         "Fast mode unavailable",
-                        "현재 모델은 Fast 서비스 티어를 지원하지 않습니다.",
+                        "The current model does not support the Fast service tier.",
                     ));
                     Action::None
                 } else {
@@ -9605,7 +9607,7 @@ impl AppState {
                     self.committed.push(Block::new(
                         BlockKind::Error,
                         "Fast mode unavailable",
-                        "현재 모델은 Fast 서비스 티어를 지원하지 않습니다.",
+                        "The current model does not support the Fast service tier.",
                     ));
                     Action::None
                 } else {
@@ -9658,7 +9660,7 @@ impl AppState {
                     });
                 let Some(index) = index else {
                     self.committed
-                        .push(Block::new(BlockKind::Error, "모델을 찾을 수 없음", query));
+                        .push(Block::new(BlockKind::Error, "Model not found", format!("{query} — Use /model to see available models for the current provider.")));
                     return Action::None;
                 };
                 let effort = parts.get(2).copied();
@@ -9673,7 +9675,7 @@ impl AppState {
                     self.committed.push(Block::new(
                         BlockKind::Error,
                         "Effort unavailable",
-                        "현재 모델은 reasoning effort를 지원하지 않습니다.",
+                        "The current model does not support reasoning effort.",
                     ));
                     return Action::None;
                 }
@@ -9699,8 +9701,8 @@ impl AppState {
                 } else {
                     self.committed.push(Block::new(
                         BlockKind::Error,
-                        "지원하지 않는 reasoning effort",
-                        effort,
+                        "Unsupported reasoning effort",
+                        format!("{effort} — Use /effort to check support and available values for the current model."),
                     ));
                 }
                 Action::None
@@ -21661,6 +21663,49 @@ mod tests {
         assert_eq!(state.committed.last().unwrap().body, "/솓 — Use /help to see available commands.");
     }
 
+    #[test]
+    fn command_errors_explain_supported_input_without_changing_selection() {
+        let mut state = test_state();
+        let model = state.selected_model_name().to_owned();
+        let effort = state.selected_effort.clone();
+        for command in [
+            "/provider invalid",
+            "/provider opencode missing-model",
+            "/provider codex extra argument",
+        ] {
+            state.run_slash_command(command);
+            let error = state.committed.last().unwrap();
+            assert!(matches!(error.kind, BlockKind::Error));
+            assert_eq!(error.title, "Usage");
+            assert!(error.body.contains("/provider [claude|codex] MODEL"));
+            assert!(error.body.contains("switch with /provider opencode, then select a model with /model"));
+            assert!(!error.body.contains("[claude|codex|opencode] [MODEL]"));
+            assert_eq!(state.selected_model_name(), model);
+        }
+        state.run_slash_command("/model missing-model");
+        assert!(state.committed.last().unwrap().body.contains("Use /model"));
+        assert_eq!(state.selected_model_name(), model);
+        state.run_slash_command("/effort invalid");
+        assert!(state.committed.last().unwrap().body.contains("Use /effort"));
+        assert_eq!(state.selected_effort, effort);
+    }
+
+    #[test]
+    fn provider_errors_preserve_details_without_inventing_a_provider() {
+        let mut state = test_state();
+        state.handle_notification("error", &json!({
+            "provider": "Custom",
+            "error": {"message": "HTTP 503\nrequest-id: test-request"}
+        }));
+        let error = state.committed.last().unwrap();
+        assert_eq!(error.title, "Provider error");
+        assert_eq!(error.body, "HTTP 503\nrequest-id: test-request");
+        state.handle_notification("error", &json!({"provider": "Claude"}));
+        let error = state.committed.last().unwrap();
+        assert_eq!(error.title, "Claude error");
+        assert!(!error.body.contains("Codex"));
+    }
+
     /// A command only some runtimes answer is offered only while one of those
     /// runtimes is selected, so the list never suggests a guaranteed failure.
     #[test]
@@ -24418,7 +24463,15 @@ mod tests {
     /// The prompt contract and the detector share the same literals.
     #[test]
     fn planner_prompt_handoff_contract_matches_the_detector() {
-        let prompt = include_str!("../prompts/agents/planner.md");
+        let block = AgentMode::Planner.render_turn_block();
+        let prompt = if let Some(directory) = block.lines().find_map(|line| line.strip_prefix("Directory: ")) {
+            let directory: String = serde_json::from_str(directory).expect("absolute guide directory");
+            std::fs::read_to_string(std::path::Path::new(&directory).join("review-handoff.md"))
+                .expect("the handoff procedure is readable at the delivered path")
+        } else {
+            assert!(block.contains("Delivery: inline"));
+            block
+        };
         for literal in [
             PLANNER_HANDOFF_HEADER,
             PLANNER_HANDOFF_EXECUTE_LABEL,

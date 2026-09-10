@@ -18,6 +18,7 @@ mod preedit;
 mod pricing;
 mod provider;
 mod renderer;
+mod role_guides;
 mod rollout;
 mod selection;
 mod state;
@@ -804,7 +805,8 @@ fn hold_until_thread(
         | Action::Copy(_)
         | Action::Cut(_)
         | Action::RunShell(_)
-        | Action::OpenUrl(_)) => Some(action),
+        | Action::OpenUrl(_)
+        | Action::OpenLinkDirectory(_)) => Some(action),
         Action::ShowStatus => Some(Action::ShowStatus),
         Action::ScrollToBottom => Some(Action::ScrollToBottom),
         // Once a switch is owed, the prompt belongs to the session being resumed. The
@@ -1208,12 +1210,12 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
                 } else {
                     state.push_notice(
                         BlockKind::Error,
-                        "MCP login 실패",
-                        "authorizationUrl이 없습니다.",
+                        "MCP login failed",
+                        "The server did not return a login URL (authorizationUrl). — Use /mcp to check the server status.",
                     );
                 }
             }
-            Err(error) => state.push_notice(BlockKind::Error, "MCP login 실패", error),
+            Err(error) => state.push_notice(BlockKind::Error, "MCP login failed", error),
         },
     }
 }
@@ -1366,7 +1368,7 @@ async fn open_btw(
         main.push_notice(
             BlockKind::Error,
             "BTW 시작 실패",
-            "thread/fork 응답에 thread ID가 없습니다.",
+            "The thread/fork response did not include a thread ID.",
         );
         return None;
     };
@@ -2194,6 +2196,7 @@ enum MouseRequest {
     SelectionStart(u16, u16),
     SelectionUpdate(u16, u16),
     SelectionEnd(u16, u16),
+    ContextClick(u16, u16),
     CancelSelection,
     Hover(u16, u16),
     None,
@@ -2233,6 +2236,9 @@ fn mouse_request(mouse: &MouseEvent) -> MouseRequest {
             MouseRequest::SelectionEnd(mouse.column, mouse.row)
         }
         MouseEventKind::Moved => MouseRequest::Hover(mouse.column, mouse.row),
+        MouseEventKind::Down(MouseButton::Right) => {
+            MouseRequest::ContextClick(mouse.column, mouse.row)
+        }
         _ => MouseRequest::None,
     }
 }
@@ -2263,6 +2269,9 @@ fn renderer_mouse_action(
     }
 
     match request {
+        MouseRequest::ContextClick(column, row) => {
+            context_click_action(renderer.pick_at(column, row), &mut std::io::stdout())
+        }
         MouseRequest::Scroll(delta, _, row) => Action::Tick(renderer.scroll_at(row, delta)),
         MouseRequest::SelectionStart(column, row) => {
             Action::Tick(renderer.begin_selection(column, row))
@@ -2563,6 +2572,7 @@ async fn execute_action(
         | Action::Copy(_)
         | Action::Cut(_)
         | Action::OpenUrl(_)
+        | Action::OpenLinkDirectory(_)
         | Action::SetTheme(_)
         | Action::ScrollToBottom
         | Action::ScrollToPrompt(_)
@@ -2880,7 +2890,7 @@ async fn execute_action(
                         state.push_notice(
                             BlockKind::Error,
                             "Side conversation failed",
-                            "thread/fork 응답에 thread ID가 없습니다.",
+                            "The thread/fork response did not include a thread ID.",
                         );
                     }
                 }
@@ -3056,8 +3066,8 @@ async fn execute_action(
                     let Some(api_key) = api_key else {
                         state.push_notice(
                             BlockKind::Error,
-                            "Provider 연결 실패",
-                            "API key가 없습니다.",
+                            "Provider connection failed",
+                            "No API key was provided. — Use /connect to select a provider and enter an API key.",
                         );
                         return Ok(false);
                     };
@@ -3070,7 +3080,7 @@ async fn execute_action(
                         }
                         Err(error) => state.push_notice(
                             BlockKind::Error,
-                            "Provider 연결 실패",
+                            "Provider connection failed",
                             error.to_string(),
                         ),
                     }
@@ -3160,8 +3170,8 @@ async fn execute_action(
             let Some(client) = server.integration_client(&model) else {
                 state.push_notice(
                     BlockKind::Error,
-                    "MCP login 실패",
-                    "현재 provider가 연결되지 않았습니다.",
+                    "MCP login failed",
+                    "The current provider is not connected.",
                 );
                 return Ok(false);
             };
@@ -3208,7 +3218,7 @@ async fn execute_action(
                 .await
             {
                 Ok(response) => start_login_flow(state, method, &response),
-                Err(error) => state.push_notice(BlockKind::Error, "로그인 실패", error.to_string()),
+                Err(error) => state.push_notice(BlockKind::Error, "Login failed", error.to_string()),
             }
         }
         Action::CancelLogin(login_id) => {
@@ -4393,6 +4403,17 @@ fn execute_local_action(
                 state.push_notice(BlockKind::Warning, "브라우저 열기 실패", error.to_string());
             }
         }
+        Action::OpenLinkDirectory(target) => {
+            let result = link_directory(&target, Path::new(&state.cwd)).and_then(|directory| {
+                if let Some(directory) = directory {
+                    open_url(&directory.to_string_lossy())?;
+                }
+                Ok(())
+            });
+            if let Err(error) = result {
+                state.push_notice(BlockKind::Warning, "폴더 열기 실패", error.to_string());
+            }
+        }
         Action::SetTheme(selected) => {
             renderer.set_theme(selected)?;
             if let Err(error) = theme::save(selected) {
@@ -5433,6 +5454,45 @@ fn format_apps_needing_auth(response: &Value) -> String {
         .join("\n")
 }
 
+fn context_click_action(pick: Option<Pick>, out: &mut impl std::io::Write) -> Action {
+    if let Some(Pick::OpenLink(target)) = pick {
+        let _ = out.write_all(b"\x1b]777;devez-context-link-v1\x07");
+        let _ = out.flush();
+        return Action::OpenLinkDirectory(target);
+    }
+    // The host waits for the TUI hit test before using the clipboard.
+    let _ = out.write_all(b"\x1b]777;devez-context-paste-v1\x07");
+    let _ = out.flush();
+    Action::Tick(false)
+}
+
+fn link_directory(target: &str, cwd: &Path) -> Result<Option<PathBuf>> {
+    let target = renderer::markdown_link_open_target(target);
+    let path = if target
+        .get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
+    {
+        reqwest::Url::parse(&target)?
+            .to_file_path()
+            .map_err(|_| anyhow::anyhow!("파일 경로를 읽을 수 없습니다: {target}"))?
+    } else {
+        let path = PathBuf::from(&target);
+        if !path.is_absolute() && reqwest::Url::parse(&target).is_ok() {
+            return Ok(None);
+        }
+        cwd.join(path)
+    };
+    let directory = if path.is_dir() {
+        path
+    } else {
+        path.parent().context("상위 폴더가 없습니다")?.to_path_buf()
+    };
+    if !directory.is_dir() {
+        bail!("폴더를 찾을 수 없습니다: {}", directory.display());
+    }
+    Ok(Some(directory))
+}
+
 fn open_url(url: &str) -> Result<()> {
     #[cfg(windows)]
     let mut command = {
@@ -6030,8 +6090,8 @@ fn start_login_flow(state: &mut AppState, method: LoginMethod, response: &Value)
                 }
                 _ => state.push_notice(
                     BlockKind::Error,
-                    "로그인 실패",
-                    "app-server가 loginId 또는 authUrl을 반환하지 않았습니다.",
+                    "Login failed",
+                    "The server did not return a login ID (loginId) or login URL (authUrl). — Use /login to try again.",
                 ),
             }
         }
@@ -6046,8 +6106,8 @@ fn start_login_flow(state: &mut AppState, method: LoginMethod, response: &Value)
                 ),
                 _ => state.push_notice(
                     BlockKind::Error,
-                    "로그인 실패",
-                    "app-server가 verificationUrl 또는 userCode를 반환하지 않았습니다.",
+                    "Login failed",
+                    "The server did not return one or more required fields: loginId, verificationUrl, userCode. — Use /login to try again.",
                 ),
             }
         }
@@ -6942,6 +7002,43 @@ mod tests {
             ),
             Action::OpenUrl(ref target) if target == "file:///C:/Temp/preview.html"
         ));
+    }
+
+    #[test]
+    fn context_click_links_never_request_clipboard_paste() {
+        for target in ["file:///C:/Temp/a.md", "https://example.com", "C:/Temp/a.md"] {
+            let mut output = Vec::new();
+            assert!(matches!(
+                context_click_action(Some(Pick::OpenLink(target.to_owned())), &mut output),
+                Action::OpenLinkDirectory(ref value) if value == target
+            ));
+            assert_eq!(output, b"\x1b]777;devez-context-link-v1\x07");
+        }
+        for pick in [None, Some(Pick::History(1))] {
+            let mut output = Vec::new();
+            assert!(matches!(context_click_action(pick, &mut output), Action::Tick(false)));
+            assert_eq!(output, b"\x1b]777;devez-context-paste-v1\x07");
+        }
+    }
+
+    #[test]
+    fn context_click_directories_resolve_file_urls_paths_and_missing_files() {
+        let cwd = std::env::current_dir().unwrap();
+        let file = cwd.join("Cargo.toml");
+        assert_eq!(link_directory(&file.to_string_lossy(), &cwd).unwrap(), Some(cwd.clone()));
+        assert_eq!(link_directory("Cargo.toml", &cwd).unwrap(), Some(cwd.clone()));
+        let uri = reqwest::Url::from_file_path(&file).unwrap().to_string();
+        assert_eq!(link_directory(&format!("{uri}:12:3"), &cwd).unwrap(), Some(cwd.clone()));
+        assert_eq!(link_directory(&cwd.to_string_lossy(), &cwd).unwrap(), Some(cwd.clone()));
+        assert_eq!(link_directory("not-created-file.md", &cwd).unwrap(), Some(cwd.clone()));
+        assert!(link_directory("missing-parent-for-context-test/file.md", &cwd).is_err());
+        for url in ["https://example.com/a.md", "mailto:test@example.com", "ftp://example.com/a"] {
+            assert_eq!(link_directory(url, &cwd).unwrap(), None);
+        }
+        assert!(link_directory("file:///%ZZ", &cwd).is_err());
+        let spaced = cwd.join("한글 공백#%.md");
+        let encoded = reqwest::Url::from_file_path(spaced).unwrap().to_string();
+        assert_eq!(link_directory(&encoded, &cwd).unwrap(), Some(cwd));
     }
 
     #[test]
@@ -9184,7 +9281,7 @@ mod tests {
                 MouseEventKind::Down(MouseButton::Right),
                 KeyModifiers::NONE
             )),
-            MouseRequest::None
+            MouseRequest::ContextClick(4, 7)
         );
     }
 

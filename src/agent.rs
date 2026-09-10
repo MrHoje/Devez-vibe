@@ -17,6 +17,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
+use crate::role_guides::{self, Guide};
 
 /// Which role the next turn is sent under.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -65,6 +66,12 @@ const PLANNER_PROMPT: &str = include_str!("../prompts/agents/planner.md");
 const GOAL_RUNNER_PROMPT: &str = include_str!("../prompts/agents/goal-runner.md");
 const REVIEWER_PROMPT: &str = include_str!("../prompts/agents/reviewer.md");
 const RESEARCHER_PROMPT: &str = include_str!("../prompts/agents/researcher.md");
+
+const PLANNER_GUIDES: &[Guide] = &[
+    Guide { name: "requirements.md", body: include_str!("../prompts/agents/planner/requirements.md") },
+    Guide { name: "plan.md", body: include_str!("../prompts/agents/planner/plan.md") },
+    Guide { name: "review-handoff.md", body: include_str!("../prompts/agents/planner/review-handoff.md") },
+];
 
 impl AgentMode {
     /// The wire and command spelling, e.g. `/agent planner`.
@@ -152,6 +159,17 @@ impl AgentMode {
     /// The role block, wrapped so the model can tell it apart from user text and
     /// knows it supersedes any earlier block.
     pub fn render_turn_block(self) -> String {
+        self.render_turn_block_at(&role_guides::cache_root())
+    }
+
+    fn guides(self) -> &'static [Guide] {
+        match self {
+            Self::Planner => PLANNER_GUIDES,
+            _ => &[],
+        }
+    }
+
+    fn render_turn_block_at(self, guide_root: &Path) -> String {
         // Reset Builder's response rules while retaining the shared instructions.
         let response_rules = match self {
             Self::Standard => {
@@ -170,10 +188,10 @@ impl AgentMode {
         format!(
             "<devez-vibe-agent mode=\"{}\" version=\"1\">\nThis block sets the current DevezVibe \
              agent mode. It supersedes every earlier devez-vibe-agent block in this conversation, \
-             and stays in effect until another one arrives. {}\n\n{}\n</devez-vibe-agent>",
+             and stays in effect until another one arrives. Guides loaded for a different mode no longer apply. {}\n\n{}\n</devez-vibe-agent>",
             self.id(),
             response_rules,
-            self.instruction().trim()
+            role_guides::render(self.instruction(), self.id(), self.guides(), guide_root)
         )
     }
 }
@@ -371,6 +389,69 @@ mod tests {
             assert!(block.ends_with("</devez-vibe-agent>"));
             assert!(block.contains("supersedes every earlier devez-vibe-agent block"));
         }
+    }
+
+    #[test]
+    fn procedural_roles_expose_a_guide_directory_instead_of_all_procedures() {
+        let root = std::env::temp_dir().join(format!("devez-agent-guides-test-{}", std::process::id()));
+        for mode in [AgentMode::Planner] {
+            let block = mode.render_turn_block_at(&root);
+            let directory = block.lines().find_map(|line| line.strip_prefix("Directory: "))
+                .expect("staged roles must give the model a readable absolute guide directory");
+            let directory: String = serde_json::from_str(directory).unwrap();
+            assert!(Path::new(&directory).is_absolute());
+            assert!(Path::new(&directory).is_dir());
+            for guide in mode.guides() {
+                assert_eq!(fs::read_to_string(Path::new(&directory).join(guide.name)).unwrap(), guide.body);
+                assert!(block.contains(&format!("[{}](<", guide.name)), "missing guide link: {}", guide.name);
+                assert!(!block.contains(guide.body.trim()), "procedure was eagerly injected");
+            }
+            assert!(!block.contains("{{ROLE_GUIDES}}"));
+        }
+    }
+
+    #[test]
+    fn nonprocedural_roles_keep_the_same_body_without_provisioning() {
+        let occupied = std::env::temp_dir().join(format!("devez-agent-guide-blocked-{}", std::process::id()));
+        fs::write(&occupied, "occupied").unwrap();
+        for mode in [AgentMode::Standard, AgentMode::Researcher, AgentMode::Reviewer, AgentMode::GoalRunner] {
+            let block = mode.render_turn_block_at(&occupied);
+            assert!(block.contains(mode.instruction().trim()));
+            assert!(!block.contains("devez-role-guides"));
+        }
+        assert_eq!(fs::read_to_string(occupied).unwrap(), "occupied");
+    }
+
+    /// Opt-in fixture export uses the same renderer and compiled guide bodies
+    /// as the product, so live-model tests never rebuild a look-alike prompt.
+    #[test]
+    #[ignore = "exports prompt fixtures for live-model scenario tests"]
+    fn export_role_guide_fixtures() {
+        let output = PathBuf::from(std::env::var_os("DEVEZ_ROLE_FIXTURES").expect("set an absolute fixture output path"));
+        assert!(output.is_absolute());
+        let directory = output.parent().unwrap();
+        fs::create_dir_all(directory).unwrap();
+        let blocked = directory.join("cache-unavailable");
+        fs::write(&blocked, "occupied").unwrap();
+        let root = directory.join("역할 지침 cache");
+        let mut roles = serde_json::Map::new();
+        for mode in [AgentMode::Standard, AgentMode::Planner, AgentMode::GoalRunner, AgentMode::Reviewer] {
+            let block = mode.render_turn_block_at(&root);
+            let guides: Vec<_> = mode.guides().iter().map(|guide| json!({"name":guide.name,"body":guide.body})).collect();
+            roles.insert(mode.id().to_owned(), json!({
+                "block": block,
+                "inline": mode.render_turn_block_at(&blocked),
+                "guides": guides,
+                "toolPolicy": mode.tool_policy(),
+            }));
+        }
+        fs::write(output, serde_json::to_string_pretty(&json!({
+            "roles": roles,
+            "codexBase": crate::DEVEZ_INSTRUCTIONS,
+            "claudeBase": crate::CLAUDE_DEVEZ_INSTRUCTIONS,
+            "codexQuestion": crate::CODEX_QUESTION_INSTRUCTIONS,
+            "claudeReminder": crate::CLAUDE_TURN_REMINDER,
+        })).unwrap()).unwrap();
     }
 
     /// Builder keeps unique scope, risk, and pre-send rules alongside shared ones.
