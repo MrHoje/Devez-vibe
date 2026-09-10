@@ -287,7 +287,10 @@ impl Reporter {
         if !thread_id.is_empty() && self.session != thread_id && self.write("sessions", thread_id) {
             self.session = thread_id.to_owned();
         }
-        let activity = Activity::from_host(busy, compacting, loading);
+        // Async Codex questions outlive their runtime turn. The host clears its
+        // waiting badge and posts completion on running -> idle, so the pending
+        // interaction must keep the host active until it is answered or closed.
+        let activity = Activity::from_host(busy || waiting, compacting, loading);
         if self.activity != activity && self.write("busy", activity.status()) {
             self.activity = activity;
         }
@@ -435,6 +438,125 @@ mod tests {
             Activity::from_host(false, true, true).status(),
             "compacting"
         );
+    }
+
+    #[test]
+    fn host_question_lifecycle_keeps_unanswered_turns_active() {
+        use crate::state::{Action, AppState};
+        use crossterm::event::{KeyCode, KeyEvent};
+
+        for asynchronous in [false, true] {
+            for outcome in ["answer", "cancel", "send_failure", "disconnect"] {
+                let nonce = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let base =
+                    env::temp_dir().join(format!("devezvibe-question-{}-{nonce}", process::id()));
+                let room = "question-test";
+                assert!(try_claim_owner(&base, room, "root"));
+                let mut reporter = Reporter {
+                    base: base.clone(),
+                    room: room.into(),
+                    owner_token: "root".into(),
+                    session: String::new(),
+                    activity: Activity::Idle,
+                    waiting: false,
+                };
+                assert!(reporter.write("busy", IDLE));
+                assert!(reporter.write("waiting", READY));
+                let mut state = AppState::new(
+                    "main-thread".into(),
+                    "cwd".into(),
+                    "account".into(),
+                    Vec::new(),
+                    "gpt-6-astra",
+                    None,
+                );
+                state.set_turn_started("live-turn".into());
+                let mut check = |state: &AppState, activity: &str, waiting: &str| {
+                    reporter.sync(
+                        state.host_session_id(),
+                        state.busy,
+                        state.compacting(),
+                        state.host_loading(),
+                        state.awaiting_input(),
+                    );
+                    for (kind, expected) in [("busy", activity), ("waiting", waiting)] {
+                        assert_eq!(
+                            fs::read_to_string(base.join(kind).join(format!("{room}.txt")))
+                                .unwrap(),
+                            expected,
+                            "async={asynchronous}, outcome={outcome}, kind={kind}"
+                        );
+                    }
+                };
+                check(&state, BUSY, READY);
+                let question = json!({"threadId": "main-thread", "item": {
+                    "id": "question", "type": "agentMessage", "delivery": "async",
+                    "questions": [{"title": "선택하세요", "options": ["첫째", "둘째"]}]
+                }});
+                if asynchronous {
+                    state.reject_unanswered_question("item/completed", &question);
+                } else {
+                    state.begin_server_request(json!(41), "item/tool/requestUserInput", &json!({
+                        "questions": [{"id": "q", "header": "질문", "question": "선택하세요",
+                            "options": [{"label": "첫째", "description": ""}, {"label": "둘째", "description": ""}]}]
+                    }));
+                }
+                check(&state, BUSY, WAITING);
+                if asynchronous {
+                    state.reject_unanswered_question("turn/completed", &json!({
+                        "threadId": "main-thread", "turn": {"id": "live-turn", "status": "interrupted"}
+                    }));
+                    assert!(!state.busy, "실제 제공자 턴은 종료되어야 함");
+                    state.reject_unanswered_question("item/completed", &question);
+                }
+                // Idle renderer ticks and duplicate events must never publish a
+                // completion while the question is still visible.
+                for _ in 0..100 {
+                    state.render_tick();
+                    check(&state, BUSY, WAITING);
+                }
+                if outcome == "disconnect" {
+                    state.fallback_from_codex("연결 종료");
+                } else {
+                    let action = state.handle_key(KeyEvent::from(if outcome == "cancel" {
+                        KeyCode::Esc
+                    } else {
+                        KeyCode::Enter
+                    }));
+                    assert!(!state.awaiting_input());
+                    if outcome != "cancel" {
+                        match action {
+                            Action::Submit(text) => {
+                                state.turn_input(text);
+                            }
+                            Action::RpcResponse { result, .. } => {
+                                if outcome == "send_failure" {
+                                    state.restore_failed_question_response(&result);
+                                }
+                            }
+                            _ => panic!("답변 전송 동작 누락"),
+                        }
+                        if outcome == "send_failure" {
+                            state.set_request_failed("시험 전송 실패");
+                            assert!(state.editor.text().contains("첫째"));
+                        } else {
+                            check(&state, BUSY, READY);
+                        }
+                    }
+                    if state.busy {
+                        state.handle_notification(
+                            "turn/completed",
+                            &json!({"turn": {"id": "live-turn", "status": "completed"}}),
+                        );
+                    }
+                }
+                check(&state, IDLE, READY);
+                fs::remove_dir_all(base).unwrap();
+            }
+        }
     }
 
     #[test]

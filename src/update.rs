@@ -21,7 +21,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude 사용량 한도로 멈춘 작업을 초기화 후 자동으로 이어가며, 대기 시간을 표시하고 Esc로 취소할 수 있습니다.",
+    "Codex 선택지 답변을 기다리는 동안 완료로 표시되던 문제를 수정했습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

@@ -23,6 +23,9 @@ fn main() -> std::io::Result<()> {
     let path = std::env::var("DVZ_EVLOG").unwrap_or_else(|_| "evlog.txt".to_owned());
     let mut log = OpenOptions::new().create(true).append(true).open(path)?;
     enable_raw_mode()?;
+    if std::env::args().any(|arg| arg == "--mouse") {
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+    }
     let started = Instant::now();
     let mut last = Instant::now();
     writeln!(log, "-- session start --")?;
@@ -48,5 +51,8 @@ fn main() -> std::io::Result<()> {
     }
     writeln!(log, "-- session end --")?;
     log.flush()?;
+    if std::env::args().any(|arg| arg == "--mouse") {
+        crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)?;
+    }
     disable_raw_mode()
 }
