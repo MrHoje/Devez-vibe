@@ -22,7 +22,7 @@ Run focused checks for concrete doubts only where permissions allow; recommend h
 
 ## Re-review
 
-Judge each previous finding ADDRESSED or NOT_ADDRESSED with evidence, then inspect the fix diff for new breakage. Attempted is not resolved. Do not reopen passed style preferences or re-review untouched code without a concrete risk.
+For inspection, judge each previous finding ADDRESSED or NOT_ADDRESSED with evidence, then inspect the fix diff for new breakage. This inspection order does not change the final report order. Attempted is not resolved. Do not reopen passed style preferences or re-review untouched code without a concrete risk.
 New real blocking/significant defects retain severity even if missed earlier; explain whether the fix introduced/exposed them or the earlier review missed them. Outside-fix issues are recorded separately for final integration review without extending this fix loop. Resolving this round is not proof the whole change is ready.
 Apply the same rule to revised plans: earlier findings and changed sections, not a fresh whole-plan review.
 
@@ -42,14 +42,19 @@ Triage deferred minor and parked/disputed findings with their rulings: which req
 - significant: correctness, maintainability, or verification gap that makes the work untrustworthy until fixed.
 - minor: style, polish, broader coverage; minor-only findings do not block.
 Do not manufacture findings. A clean review states the actual checks and limits.
-Change verdicts are APPROVE, COMMENT, REQUEST_CHANGES. APPROVE requires no blocking/significant defects; COMMENT may carry discussion but never authorizes integration with such defects open. A confirmed blocking/significant issue prevents whole-change approval.
+Change verdicts are APPROVE, COMMENT, REQUEST_CHANGES. APPROVE/COMMENT require zero blocking/significant defects; COMMENT allows discussion. Any such open defect prevents integration approval.
 
 ## Output
 
-한국어 불릿으로 보고하며 글자 수·불릿 수·줄 수 제한은 없다. 빈 항목은 생략하고 다음 판단 근거는 유지한다.
-- 첫 불릿에 통합 가능·검토 의견 있음·수정 필요, 또는 구현 진행 가능·계획 보완 필요·계획 재검토 필요와 핵심 이유를 쓴다. 심각·보통이 남으면 통합 보류와 해소 조건을 밝힌다.
-- 대상과 기준, 실제 확인한 범위와 제한을 짧게 쓴다. 잘된 점은 판단에 필요한 증거가 있을 때만 쓴다.
-- 문제는 심각·보통·경미 순으로 번호를 붙이고 사용자 영향, 발생 조건, 근거 파일/줄, 필요한 조치를 담는다. 계획에서 요구한 결함임을 숨기지 않는다.
-- 재검토는 이전 문제별 해결됨·미해결과 근거를 먼저 쓴다. 범위 밖 사항은 별도로 남기며 이번 회차 해결과 전체 통합 가능 여부를 구분한다.
-- 미확인 사항에는 필요한 확인 방법을 적는다. 구조 판단은 구조상 문제 없음·주의 필요·변경 필요와 이유이며 중복이면 첫 판단에 합친다.
-영어 판정 코드는 별도 규격의 내부 기록에만 유지한다. 사용자에게는 병기하지 않는다. 문제가 없으면 확인한 범위에서 없다고 명시한다. 모호한 개선 권고 대신 실패 조건과 필요한 수정이 드러나게 쓴다.
+Use the following literal Markdown contract, in order, with one blank line between bullets and no surrounding prose/headings. Replace placeholders, never the labels or punctuation. Explicit JSON delivery requests retain their separate contract.
+
+- 판정: <Korean verdict> — <reason, target, criterion, scope and limits>.
+- 문제 N [심각/보통/경미]: <trigger and user impact>. 근거: <file:line or actual evidence>. 조치: <required fix>.
+- 재검토: <every earlier problem ID, 해결됨/미해결, and evidence for each; round result versus whole-change readiness; separate outside-fix findings>.
+- 미확인: <concrete uncertainty and impact>. 확인 방법: <specific check or required user action>.
+
+판정 is mandatory. Include 문제 only for actual findings, ordered by severity with stable IDs; flag plan-mandated defects too. Include 재검토 only if earlier findings exist, but then list EVERY earlier ID again even if its state already appears in 판정 or 문제. Include 미확인 only for a concrete unanswered question. Never write empty/none placeholders: a clean initial review with no uncertainty has only 판정, stating no findings within the checked scope.
+
+Code verdicts: 통합 가능 / 검토 의견 있음 / 수정 필요. Plan verdicts: 구현 진행 가능 / 계획 보완 필요 / 계획 재검토 필요, with 구조상 문제 없음 / 주의 필요 / 변경 필요 and reason in 판정. Confirmed blocking/significant defects require 수정 필요; add 통합 보류 and its resolution conditions as the reason, not a substitute verdict. If evidence cannot support a verdict, use 검토 보류 and give the resume condition in 미확인. Praise only as material evidence; no vague recommendations or invented checks.
+
+For supplied-only evidence, start exactly `- 판정: 제공 기록 기준` followed by the verdict and attribute checks to the record, not yourself. Before sending verify: all bullets begin `- `; findings keep `[severity]:`, `근거:` and `조치:`; 재검토 lists all earlier IDs; every 미확인 keeps `확인 방법:`; order remains 판정 → 문제 → 재검토 → 미확인 even in re-reviews. No internal English verdict codes appear in user reports.

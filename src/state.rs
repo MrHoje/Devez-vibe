@@ -3689,7 +3689,7 @@ pub struct AppState {
     /// 완료 표시에 붙는 벽시계 시각. 경과 시간과 달리 되짚어 계산할 수 없어
     /// 턴이 끝나는 순간에만 기록한다.
     last_completed_at: Option<chrono::DateTime<chrono::Local>>,
-    branch: Option<String>,
+    branch: Option<(String, bool)>,
     five_hour_percent: Option<u8>,
     weekly_percent: Option<u8>,
     /// Unix timestamp the 5h window resets at, so the status row can count down.
@@ -5292,7 +5292,8 @@ impl AppState {
         ComposerMode {
             agent: self.agent_mode,
             shell_mode: self.shell_mode,
-            branch: self.branch.clone(),
+            branch: self.branch.as_ref().map(|(name, _)| name.clone()),
+            is_worktree: self.branch.as_ref().is_some_and(|(_, worktree)| *worktree),
             vibe_mode: self.vibe_mode.label().to_owned(),
             vibe_tone: match self.vibe_mode {
                 VibeMode::Normal => VibeTone::Off,
@@ -16387,10 +16388,11 @@ fn plain_folder(cwd: String) -> String {
         .into_owned()
 }
 
-fn read_git_branch(cwd: &str) -> Option<String> {
+fn read_git_branch(cwd: &str) -> Option<(String, bool)> {
     let mut directory = PathBuf::from(cwd);
     for _ in 0..10 {
         let marker = directory.join(".git");
+        let mut is_worktree = false;
         let head = if marker.is_dir() {
             fs::read_to_string(marker.join("HEAD")).ok()
         } else if marker.is_file() {
@@ -16402,13 +16404,14 @@ fn read_git_branch(cwd: &str) -> Option<String> {
                 } else {
                     directory.join(git_dir)
                 };
+                is_worktree = git_dir.join("commondir").is_file();
                 fs::read_to_string(git_dir.join("HEAD")).ok()
             })
         } else {
             None
         };
         if let Some(branch) = head.as_deref().and_then(parse_git_branch) {
-            return Some(branch);
+            return Some((branch, is_worktree));
         }
         if !directory.pop() {
             break;
@@ -16837,6 +16840,34 @@ mod tests {
     include!("question_audit_tests.rs");
     use super::*;
     use crate::terminal_width::with_devezcode_xterm_widths;
+
+    #[test]
+    fn git_branch_distinguishes_linked_worktree_from_regular_git_directory() {
+        let root = env::temp_dir().join(format!(
+            "devez-worktree-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let project = root.join("project");
+        let nested = project.join("src");
+        let git_dir = project.join(".git");
+        fs::create_dir_all(&nested).unwrap();
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let cwd = nested.to_str().unwrap();
+        assert_eq!(read_git_branch(cwd), Some(("main".to_owned(), false)));
+
+        let metadata = root.join("metadata");
+        fs::rename(&git_dir, &metadata).unwrap();
+        fs::write(&git_dir, "gitdir: ../metadata\n").unwrap();
+        assert_eq!(read_git_branch(cwd), Some(("main".to_owned(), false)));
+
+        fs::write(metadata.join("commondir"), "../common\n").unwrap();
+        assert_eq!(read_git_branch(cwd), Some(("main".to_owned(), true)));
+        fs::write(&git_dir, format!("gitdir: {}\n", metadata.display())).unwrap();
+        assert_eq!(read_git_branch(cwd), Some(("main".to_owned(), true)));
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn devezcode_skill_columns_compact_with_xterm_width() {

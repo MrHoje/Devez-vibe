@@ -450,6 +450,7 @@ pub struct ComposerMode {
     pub shell_mode: bool,
     /// Current Git branch, shown as a display-only composer badge.
     pub branch: Option<String>,
+    pub is_worktree: bool,
     pub vibe_mode: String,
     pub vibe_tone: VibeTone,
     #[allow(dead_code)]
@@ -8690,7 +8691,10 @@ fn side_panel_mode_lines(mode: &ComposerMode, content_width: usize) -> Vec<Paint
         .filter(|branch| !branch.is_empty())
         .map(|branch| {
             vec![PaintLine {
-                text: compact_right(&format!("* {branch}"), content_width),
+                text: compact_right(
+                    &format!("{}{branch}", if mode.is_worktree { "" } else { "* " }),
+                    content_width,
+                ),
                 tone: Tone::Branch,
                 ..PaintLine::plain("")
             }]
@@ -11901,7 +11905,7 @@ fn styled_lines(
 
     let mut pending_space = Vec::new();
     let mut pending_space_width = 0;
-    for (whitespace, parts, token_width) in tokens {
+    for (whitespace, mut parts, token_width) in tokens {
         if whitespace {
             pending_space.extend(parts);
             pending_space_width += token_width;
@@ -11912,19 +11916,12 @@ fn styled_lines(
             rows.push(Vec::new());
             used = 0;
             pending_space.clear();
-            pending_space_width = 0;
         }
-        if used > 0 {
-            for span in pending_space.drain(..) {
-                push_highlight_span(
-                    rows.last_mut().expect("at least one styled row"),
-                    &span.text,
-                    span.tone,
-                    span.bold,
-                );
-            }
-            used += pending_space_width;
+        if used > 0 || (rows.len() == 1 && fallback_tone == Tone::Code) {
+            pending_space.append(&mut parts);
+            parts = std::mem::take(&mut pending_space);
         }
+        pending_space.clear();
         pending_space_width = 0;
 
         for span in parts {
@@ -13154,7 +13151,7 @@ fn full_badge_spans(mode: &ComposerMode, include_branch: bool) -> BadgeSpans {
         && let Some(branch) = mode.branch.as_deref().filter(|branch| !branch.is_empty())
     {
         spans.push(PaintSpan {
-            text: format!("* {branch}"),
+            text: format!("{}{branch}", if mode.is_worktree { "" } else { "* " }),
             tone: Tone::Branch,
             bold: false,
         });
@@ -18840,6 +18837,7 @@ mod tests {
             agent: AgentMode::Standard,
             shell_mode: false,
             branch: None,
+            is_worktree: false,
             vibe_mode: "Vibe: On".to_owned(),
             vibe_tone: VibeTone::On,
             label: label.to_owned(),
@@ -19068,6 +19066,56 @@ mod tests {
             assert!(painted(&narrow_panel[2]).ends_with(" · 29s"));
             assert!(painted_line_width(&narrow_panel[2]) <= 32);
         }
+    }
+
+    #[test]
+    fn code_block_preserves_leading_spaces() {
+        let lines = block_lines(
+            &Block::new(
+                BlockKind::Assistant,
+                "Codex",
+                "```csharp\nif(GetLinker() is Cv3Linker)\n{\n    ActivateWindow(pro.MainWindowHandle);\n    return;\n}\n```",
+            ),
+            80,
+        );
+        let rendered = lines
+            .iter()
+            .map(|line| painted(line).trim_end().to_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line == "      ActivateWindow(pro.MainWindowHandle);")
+        );
+        assert!(rendered.iter().any(|line| line == "      return;"));
+    }
+
+    #[test]
+    fn styled_code_indentation_wraps_within_width() {
+        for width in [4, 12, 40] {
+            let lines = styled_lines(
+                "",
+                Tone::Plain,
+                highlight_code("        return;", "csharp"),
+                Tone::Code,
+                false,
+                width,
+            );
+            assert_eq!(
+                lines.iter().map(painted).collect::<String>(),
+                "        return;"
+            );
+            assert!(lines.iter().all(|line| {
+                UnicodeWidthStr::width(painted(line).as_str()) < width as usize
+            }));
+        }
+        let lines = markdown_line(
+            "", Tone::Plain, "alpha beta gamma", Tone::Plain, false, 11, false,
+        );
+        assert_eq!(
+            lines.iter().map(painted).collect::<Vec<_>>(),
+            vec!["alpha beta", "gamma"]
+        );
     }
 
     #[test]
@@ -19645,6 +19693,22 @@ mod tests {
             "* main | Vibe: Super Vibe"
         ));
         assert!(!painted(&line).contains("$0.95"));
+    }
+
+    #[test]
+    fn worktree_branch_omits_star_in_composer_and_side_panel() {
+        let mut mode = test_mode("Full Access", ModeAccent::Danger, false);
+        mode.branch = Some("feature/task".to_owned());
+        mode.is_worktree = true;
+
+        let line = input_top_line(120, "", Some(&mode));
+        assert!(painted(&line).contains("feature/task | Vibe: On"));
+        assert!(!painted(&line).contains('*'));
+        for width in [15, 120] {
+            let lines = side_panel_mode_lines(&mode, width);
+            assert!(painted(&lines[0]).contains("feature/task"));
+            assert!(!painted(&lines[0]).contains('*'));
+        }
     }
 
     #[test]
@@ -20547,6 +20611,7 @@ mod tests {
                 agent: AgentMode::Standard,
                 shell_mode: false,
                 branch: Some("main".to_owned()),
+                is_worktree: false,
                 vibe_mode: "Super Vibe".to_owned(),
                 vibe_tone: VibeTone::Super,
                 label: String::new(),

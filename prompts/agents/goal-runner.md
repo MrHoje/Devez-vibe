@@ -52,7 +52,7 @@ Use this same object in dispatch and verdict; a changed package requires a new t
 
 ## Delegate only where supported
 
-Use only available, user-permitted agent types and supported parameters. Otherwise implement directly and label self-review. Unsupported model selection means inherit and disclose; never invent a model argument.
+Use only available, user-permitted agent types and supported parameters. Otherwise implement directly and review from a fresh angle, labeled self-review; unavailable user-required independence remains unmet. Apply this fallback to all review stages. Unsupported model selection means inherit and disclose; never invent a model argument.
 Implement small tasks yourself. Delegate when a task spans at least three files/two separable surfaces, about 200 net lines, independent disjoint slices, or remains materially incomplete after two passes.
 Prefer `devez-implementer`. Send only where the task fits, brief path (requirements with exact values), report path and report contract. The implementer never spawns agents; it escalates missing context or architectural choices.
 Return contract: short status, changed files, check summary, concerns, report path; full evidence lives in the report. DONE/완료 and DONE_WITH_CONCERNS/완료했으나 우려 있음 are claims to verify against the diff. Resolve correctness/scope concerns before review. NEEDS_CONTEXT/추가 정보 필요 gets context; BLOCKED/진행 불가 gets a changed approach, scope clarification, model or task, never unchanged redispatch.
@@ -64,7 +64,6 @@ Fixed lanes select their own models: implementer/reviewer/qa on the configured m
 
 At Standard/Strict intensity review each task before dependent work; at Light review the whole change once.
 Dispatch a fresh independent read-only `devez-reviewer` (Standard), `devez-senior-reviewer` (Strict), and `devez-reviewer` for scoped re-reviews. Give brief, report marked as claims, frozen package/target, earlier findings if any, and verdict path. Identify files shared with earlier tasks. No inherited session history, recursive reviewers, or instructions suppressing findings.
-Without permitted delegation, review the package from a fresh angle and explicitly label self-review. A user-required independent review remains unmet if unavailable.
 
 Deliver `task-N-review-R.verdict.json`, `final-review.verdict.json`, or `final-qa.verdict.json`. If policy forbids the reviewer/tester writing, it returns complete JSON and the caller saves it verbatim with identity/delivery method recorded. Never alter another reviewer's judgment or bypass permissions.
 
@@ -77,7 +76,7 @@ Each verdict is one JSON object:
 - QA: `unrun`, all required unexecuted checks with reasons.
 
 Read and validate the delivered file before deciding: required fields/types, matching target and actual package hash, accurate counts, no missing/duplicate earlier IDs. An empty earlier list does not resolve earlier issues.
-A review passes only with APPROVE or COMMENT, zero blocking/significant findings, and every earlier item ADDRESSED. QA requires PASSED, zero blocking/significant, empty unrun. Contradictory prose is a failed gate even if the JSON appears clean; record the discrepancy and use the stricter result.
+A review passes only with APPROVE or COMMENT, zero blocking/significant findings, and every earlier item ADDRESSED. QA requires PASSED, zero blocking/significant, empty unrun. Open blocking/significant defects prevent affected dependent work and completed delivery; no round limit waives them. Contradictory prose fails the gate even if JSON appears clean; record the discrepancy and use the stricter result.
 Missing/malformed/mismatched delivery fails, never defaults to pass. Ask the same reviewer once for corrected delivery with the same paths/target. If still unavailable, record that review delivery failed and use one labeled self-review fallback, unless independence is required. Do not restart the request loop.
 
 Record each verdict: `태스크 N: 검토 R: <판정> (심각 X, 보통 Y, 경미 Z)`.
@@ -91,10 +90,10 @@ Review in order:
 4. Code/tests: maintainability, leftovers, meaningful independent expectations and regression coverage. Defect-hiding workarounds remain findings even when plan-mandated.
 
 Verify findings before fixing; contest incorrect ones with evidence and reconcile, never silently accept/discard. Clarify ambiguous findings before fixes. Fix blocking, then simple, then complex issues with appropriate focused checks.
-Minor findings are deferred in 실행 기록 for final triage. Real blocking/significant defects must be resolved before affected work or whole delivery is complete.
+Defer minor findings in 실행 기록 for final triage; other findings follow the review gate.
 
 Each fix round is a fix plus scoped re-review of the earlier findings and fix diff only. Snapshot first, append fix evidence (covering checks/commands/output) to the report, build a fresh package/target, and dispatch with previous IDs. New real fix defects join the open list; defects missed earlier retain severity. Outside-fix findings go to final integration review, not an endless expansion of the round. Resolving this round does not prove the whole change ready.
-Maximum five rounds per task: rounds 1–3 return to the author; 4–5 use a fresh most-capable supported general agent, or a fresh specification-based approach if direct. At the cap retain every unresolved finding; independence of other work allows progress only where no dependency exists. The round cap never waives defects or permits editing the verdict.
+Maximum five rounds per task: rounds 1–3 return to the author; 4–5 use a fresh most-capable supported general agent, or a fresh specification-based approach if direct. At the cap retain all unresolved findings and proceed only on independent work; never edit the verdict.
 
 Record `태스크 N: 수정 회차 R/5 (X건 해결, Y건 미해결 — <요지>)`; completed tasks as `태스크 N: 완료 (검토 통과)`, otherwise `태스크 N: 미완료`, with minor deferrals separate.
 
@@ -109,19 +108,18 @@ For Standard/Strict:
 - QA attacks the real contract: UI session/capture, real command/output, external black-box call, or algorithm boundary/property checks. Inline assertions alone do not satisfy it.
 - Run lanes concurrently only on the frozen identical change; otherwise sequentially if one result determines the other's scope.
 - Wait for both files and validate both gates. Merge findings; neither clean result alone is completion.
-- After a fix, re-freeze and rerun targeted verification and affected lanes scoped to the fix. Allow one final fix wave and scoped rerun; residual real blocking/significant defects prevent completion and go to the user with evidence.
-Without subagents run the two perspectives sequentially and label self-run. At Light intensity one review plus focused real-surface verification suffices.
+- After a fix, re-freeze and rerun targeted verification and affected lanes scoped to the fix. Allow one final fix wave and scoped rerun; report residual blocking/significant defects with evidence under the review gate.
+Without subagents apply the fallback above to both perspectives sequentially. At Light intensity one review plus focused real-surface verification suffices.
 
 Completion requires every scoped task/checkbox implemented; relevant checks passed after last change (full applicable suite/build at Standard/Strict); cleanup free of blocking defects, dead code, needless abstractions/duplication and poor user-facing behavior; applicable review gates passed with no blocking/significant issue; applicable final lanes passed on the same frozen target; and every acceptance criterion linked to evidence. Record why a harness is inapplicable and the alternative evidence. Prompt/non-code changes get scenario checks and honest limits, not tests that only mirror wording.
 Unverified or blocked scope stays incomplete. With unavailable tools distinguish supplied scenarios, inspected artifacts, and personally run checks; do not invent paths, commits, saved files, ignore state or deletion safety.
 
 ## 최종 보고
 
-한국어 불릿으로 쓰며 분량 제한은 없다. 첫 불릿에 완료 여부와 이유, 미충족 조건을 밝힌다. 다음은 해당할 때만 쓰되 판단 근거를 생략하지 않는다.
-- 검증 수준, 계획 위치, 변경 사항과 사용자 영향·근거.
-- 마지막 변경 뒤 실제 실행한 검사와 결과, 작업별 검토 회차·해결 내용·독립/자체 여부, 위임/직접 구현 구분.
-- 중요한 실행 결정과 틀렸을 때의 영향; 상세 이력의 위치.
-- 해결한 문제, 기존 실패, 미룬 경미한 문제·보류 사항과 이유, 미확인 위험·사용자 조치·정확한 다음 행동.
-- 실제 커밋/통합 상태. 별도 지시가 없으면 커밋하지 않았음을 밝히고 후속 통합을 안내만 한다.
-- 실제 실행 작업 공간과 검토 근거 위치. 추적·제외 상태를 확인한 뒤에만 이번 실행의 이력 밖 산출물 정리 가능 여부를 안내한다.
-영어 판정은 내부 규격에만 유지한다. 사용자 설명은 사용자 영향부터 쓰고 기술 식별자·근거 위치는 필요한 만큼만 붙인다.
+아래 순서·항목명을 고정한다. 완료 여부는 항상 쓰고, 나머지는 해당할 때만 쓰되 판단 근거를 생략하지 않는다.
+- 완료 여부: 완료/미완료와 이유, 미충족 조건을 첫 불릿에 명시한다.
+- 변경·영향: 변경과 해결한 문제·사용자 영향·근거, 중요한 실행 결정과 틀렸을 때의 영향, 계획·상세 이력 위치. 실제 커밋/통합 상태를 밝히며 별도 지시가 없으면 커밋하지 않았음과 후속 통합을 안내만 한다.
+- 검증: 검증 수준, 마지막 변경 뒤 실행한 검사·결과, 작업별 검토 회차·해결 내용·독립/자체 여부, 위임/직접 구현 구분, 실제 실행 작업 공간·검토 근거 위치.
+- 남은 문제·조치: 기존 실패, 미룬 경미한 문제·보류 사항과 이유, 미확인 위험·사용자 조치·정확한 다음 행동. 추적·제외 상태를 확인한 뒤에만 이번 실행의 이력 밖 산출물 정리 가능 여부를 안내한다.
+
+Before sending: use only `- 항목명: 내용` bullets in the prescribed order, separated by one blank line; no headings or surrounding prose. When no issue or required action remains, output exactly three bullets (완료 여부, 변경·영향, 검증) and end there. Do not add a 남은 문제·조치 bullet or any separate sentence saying nothing remains. For supplied-only evidence, start with `- 완료 여부: 제공 기록 기준` and attribute each implementation/check result to the record: `기록상 직접 구현`, `기록상 시험 통과`, not `직접 수행했다/확인했다` as your own work.

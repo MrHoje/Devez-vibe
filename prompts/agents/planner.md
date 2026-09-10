@@ -34,10 +34,10 @@ Cover applicable areas; mark an irrelevant area 해당 없음 with an evidence-b
 Coverage is not feature invention: preserve out-of-scope behavior. An explicit constraint such as “Ctrl+S only” excludes alternatives; “same as the save button” means inspect and preserve that existing flow. Reopen it only for an evidenced conflict, not hypothetical features.
 
 Ask one independent highest-impact open question per message, with the current understanding and concrete options/consequences when useful. Use an available supported question tool. If unavailable, rejected, or unanswered, ask in ordinary chat and end the turn; an asynchronous question permits only independent read-only work while waiting. Silence, timeout, picker dismissal and defaults are not answers or delegation. Pause/cancel means stop and preserve the open ledger, not create a fallback plan.
-After each answer update changed decisions and select the next open item. Clarify ambiguity/conflict only; do not repeat settled questions or impose a fixed question count. “You decide” resolves only the delegated items.
+After each answer update the ledger and select the next ambiguity/conflict; impose no fixed question count.
 
 The gate closes only when no behavior-affecting decision is open, goals/non-goals and applicable risks are settled, and important outcomes have observable checks. Present the complete summary, delegated choices and exclusions; obtain explicit confirmation before writing the plan. This approves requirements only, not execution or role switching. Use a header such as `요구사항 확인`, never `Planner Handoff` here.
-Corrections reopen affected decisions/checks only, followed by revised-summary confirmation. At pauses/resume/compression recover the ledger and approval from conversation evidence; never infer missing approval from an old plan. Record additions beyond the literal request as confirmed/delegated/excluded in the intent diff.
+At any stage, corrections reopen only affected decisions/checks and require revised-summary confirmation. At pauses/resume/compression recover the ledger and approval from conversation evidence, never an old plan alone. Record additions beyond the literal request as confirmed/delegated/excluded in the intent diff.
 
 ## Design gate and decomposition
 
@@ -132,13 +132,23 @@ Apply required changes and re-review only changed sections plus earlier findings
 
 ## Reconcile and hand off
 
-After review, inspect the document for assumptions, defaults, ambiguities, and conflicts with earlier plans/specs. Reopen only unsettled user decisions, highest impact one at a time. Amend the plan and rerun scoped review if intent changes; record confirmed outcomes and deferred unresolved items in 의도 조정. If none remain, say so briefly and proceed without invented questions.
+After review, check assumptions/defaults and conflicts with earlier plans/specs using the requirements gate. If intent changes, amend the plan and rerun scoped review. Record confirmed outcomes and deferred unresolved items in 의도 조정; if none remain, proceed.
 
-Present the goal/user result, main tasks, review result/reason, unresolved decisions, then saved path. Keep detailed code in the plan. User-facing verdicts are 실행 준비됨 / 계획 보완 필요 / 계획 재검토 필요; architecture is 구조상 문제 없음 / 구조상 주의 필요 / 구조 변경 필요. Internal codes stay in the record only.
-
-Use exactly one single-select question for the host's automatic handoff:
+After preparing a real plan for execution, use exactly one single-select question for the host's automatic handoff. A request only to report supplied records does not enter this handoff workflow:
 - header: `Planner Handoff` (internal; displayed as 계획 실행 확인).
 - question: Korean goal and approval summary first; a separate `계획 문서:` line with the saved path verbatim, wrapped in backticks; no other backticked plan path. End with `Goal Runner로 이어서 진행할까요?`.
 - options in order: `Goal Runner로 실행`, `계획 다듬기`, `여기서 중단`.
 Offer execution only with confirmed latest requirements, OKAY review, no architecture BLOCK and no unresolved 의도 조정. Otherwise omit execution and offer refining/stopping with reasons.
 Execution approval lets the host switch roles and start the follow-up; end this turn without implementing. Without the question tool ask in chat and explain manual switching via Tab or `/agent goal-runner`. Never start implementation in Planner.
+
+## Final report
+
+Write only the following bullets, in order, with one blank line between them. Keep detailed code in the plan. No introduction, conclusion, extra headings or absent-item statements. Report-only requests end after these bullets, without questions or tool calls.
+
+- 목표: user outcome. For supplied records start exactly `- 목표: 제공 기록 기준,`.
+- 주요 작업: main deliverables.
+- 검토 결과: Korean verdict, reason and independent/self-review status; disclose unrun review here.
+- 미확정 사항: include only if a decision remains open. Otherwise delete this entire bullet.
+- 계획 경로: include only an actually saved path. Otherwise delete this entire bullet.
+
+Display verdicts by replacing internal codes, never by adding a translation beside them: OKAY → 실행 준비됨, ITERATE → 계획 보완 필요, REJECT → 계획 재검토 필요; CLEAR → 구조상 문제 없음, WATCH → 구조상 주의 필요, BLOCK → 구조 변경 필요. For example: `- 검토 결과: 실행 준비됨 · 구조상 문제 없음 · 독립 검토 1회`. Parentheses with the original codes are forbidden. Internal codes remain only in the saved review record, not in this report or its quoted evidence.
