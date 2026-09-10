@@ -452,6 +452,7 @@ pub struct ComposerMode {
     pub branch: Option<String>,
     pub is_worktree: bool,
     pub vibe_mode: String,
+    pub auto_knowledge: bool,
     pub vibe_tone: VibeTone,
     #[allow(dead_code)]
     pub label: String,
@@ -5689,6 +5690,7 @@ pub enum Pick {
     VibeMode,
     /// Opens the same service-tier picker as `/fast`.
     FastMode,
+    AutoKnowledge,
     ShellDisplayMode,
     DiffDisplayMode,
     PlanSummary,
@@ -8702,14 +8704,28 @@ fn side_panel_mode_lines(mode: &ComposerMode, content_width: usize) -> Vec<Paint
             }]
         })
         .unwrap_or_default();
-    lines.push(badge_line(full_badge_spans(mode, false)));
+    let mut badge = full_badge_spans(mode, false);
+    if spans_width(&badge.spans) > content_width && badge.auto_knowledge_index.is_some() {
+        let knowledge = badge.spans.pop().unwrap();
+        badge.spans.pop(); // The separator belongs between badges on the same row.
+        badge.auto_knowledge_index = None;
+        lines.push(badge_line(badge));
+        lines.push(PaintLine {
+            text: knowledge.text,
+            tone: knowledge.tone,
+            ..PaintLine::plain("")
+        }.with_tight_picks(&[(0, Pick::AutoKnowledge)]));
+    } else {
+        lines.push(badge_line(badge));
+    }
     lines
 }
 
 fn badge_line(badge: BadgeSpans) -> PaintLine {
-    let picks = [badge
-        .vibe_mode_index
-        .map(|index| (index, Pick::VibeMode))]
+    let picks = [
+        badge.vibe_mode_index.map(|index| (index, Pick::VibeMode)),
+        badge.auto_knowledge_index.map(|index| (index, Pick::AutoKnowledge)),
+    ]
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
@@ -13020,6 +13036,11 @@ fn input_top_line_with_controls(
                 .vibe_mode_index
                 .map(|index| (badge_start + index, Pick::VibeMode)),
         );
+        picks.extend(
+            badge
+                .auto_knowledge_index
+                .map(|index| (badge_start + index, Pick::AutoKnowledge)),
+        );
         tail.push(rule_gap(COMPOSER_MODE_GAP));
         tail.extend(badge.spans);
         tail.push(rule_gap(1));
@@ -13183,9 +13204,24 @@ fn full_badge_spans(mode: &ComposerMode, include_branch: bool) -> BadgeSpans {
         tone: vibe_tone(mode.vibe_tone),
         bold: false,
     });
+    let auto_knowledge_index = mode.auto_knowledge.then(|| {
+        spans.push(PaintSpan {
+            text: " · ".to_owned(),
+            tone: Tone::Muted,
+            bold: false,
+        });
+        let index = spans.len();
+        spans.push(PaintSpan {
+            text: "Auto Knowledge".to_owned(),
+            tone: Tone::ResponseCompleted,
+            bold: false,
+        });
+        index
+    });
     BadgeSpans {
         spans,
         vibe_mode_index: Some(vibe_mode_index),
+        auto_knowledge_index,
         shell_display_mode_index: None,
         diff_display_mode_index: None,
     }
@@ -13197,6 +13233,7 @@ fn full_badge_spans(mode: &ComposerMode, include_branch: bool) -> BadgeSpans {
 struct BadgeSpans {
     spans: Vec<PaintSpan>,
     vibe_mode_index: Option<usize>,
+    auto_knowledge_index: Option<usize>,
     shell_display_mode_index: Option<usize>,
     diff_display_mode_index: Option<usize>,
 }
@@ -18859,6 +18896,7 @@ mod tests {
             branch: None,
             is_worktree: false,
             vibe_mode: "Vibe: On".to_owned(),
+            auto_knowledge: false,
             vibe_tone: VibeTone::On,
             label: label.to_owned(),
             accent,
@@ -19689,6 +19727,40 @@ mod tests {
         );
         assert!(!painted(&line).contains("Response:"));
         assert!(!painted(&line).contains("Fast:"));
+    }
+
+    #[test]
+    fn auto_knowledge_badge_follows_vibe_only_when_enabled() {
+        let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, false);
+        mode.branch = Some("main".to_owned());
+        let off = input_top_line(120, "", Some(&mode));
+        assert!(!painted(&off).contains("Auto Knowledge"));
+        assert!(!painted(&off).contains(" · "));
+        mode.auto_knowledge = true;
+        let on = input_top_line(120, "", Some(&mode));
+        assert!(painted(&on).contains("* main | Vibe: Super Vibe · Auto Knowledge"));
+        assert_eq!(pick_on(&on, "Vibe: Super Vibe"), Some(Pick::VibeMode));
+        assert_eq!(pick_on(&on, "Auto Knowledge"), Some(Pick::AutoKnowledge));
+        for width in [24, 40, 60, 80, 120] {
+            assert_eq!(rule_width(&input_top_line(width, "", Some(&mode))), width);
+        }
+        mode.auto_knowledge = false;
+        assert_eq!(painted(&input_top_line(120, "", Some(&mode))), painted(&off));
+    }
+
+    #[test]
+    fn auto_knowledge_wraps_in_a_narrow_side_panel_with_clicks_intact() {
+        let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, false);
+        mode.auto_knowledge = true;
+        mode.branch = Some("feature/knowledge".to_owned());
+        for width in [22, 34, 46, 80] {
+            let lines = side_panel_mode_lines(&mode, width);
+            assert!(lines.iter().all(|line| painted_width(line) <= width));
+            let knowledge = lines.iter().find(|line| painted(line).contains("Auto Knowledge")).unwrap();
+            assert_eq!(pick_on(knowledge, "Auto Knowledge"), Some(Pick::AutoKnowledge));
+            let vibe = lines.iter().find(|line| painted(line).contains("Vibe: Super Vibe")).unwrap();
+            assert_eq!(pick_on(vibe, "Vibe: Super Vibe"), Some(Pick::VibeMode));
+        }
     }
 
     #[test]
@@ -20633,6 +20705,7 @@ mod tests {
                 branch: Some("main".to_owned()),
                 is_worktree: false,
                 vibe_mode: "Super Vibe".to_owned(),
+                auto_knowledge: false,
                 vibe_tone: VibeTone::Super,
                 label: String::new(),
                 accent: ModeAccent::Calm,

@@ -23,6 +23,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const RELEASE_NOTES: &[&str] = &[
     "입력창에서 Ctrl+Z로 편집을 취소하고 Ctrl+Y로 다시 실행하며, 텍스트·붙여넣기·첨부 이미지를 함께 복원합니다.",
     "/worktree [이름]으로 현재 브랜치를 기반으로 작업 트리를 만들고 새 대화로 진입합니다.",
+    "/auto-knowledge로 프로젝트별 자동 기록 상태를 저장하며, 켜면 .knowledge의 지식 문서와 인덱스를 갱신합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

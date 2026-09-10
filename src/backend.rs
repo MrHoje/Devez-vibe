@@ -699,13 +699,11 @@ impl BackendServer {
             }
             "thread/fork" => {
                 let visible = thread_id(&params)?;
+                let cwd = request_cwd(&params)
+                    .or_else(|| self.route(visible).map(|route| route.cwd))
+                    .unwrap_or_else(|| self.cwd.clone());
                 if self.route_kind(visible) == RuntimeKind::Claude {
-                    let route = self.route(visible);
                     let backing = self.backing_id(visible, RuntimeKind::Claude)?;
-                    let cwd = route
-                        .as_ref()
-                        .map(|route| route.cwd.clone())
-                        .unwrap_or_else(|| self.cwd.clone());
                     let mut response = self
                         .claude
                         .request("session/fork", {
@@ -743,10 +741,6 @@ impl BackendServer {
                         .as_ref()
                         .and_then(|route| route.open_code_id.as_deref())
                         .unwrap_or(visible);
-                    let cwd = route
-                        .as_ref()
-                        .map(|route| route.cwd.clone())
-                        .unwrap_or_else(|| self.cwd.clone());
                     let model = params.get("model").and_then(Value::as_str);
                     let effort = params
                         .get("effort")
@@ -3264,7 +3258,7 @@ mod tests {
                 let mut params = crate::new_thread_params(
                     ".", None, None, "startup", "low", "default", "high",
                 );
-                params["additionalContext"] = crate::turn_additional_context(role, None);
+                params["additionalContext"] = crate::turn_additional_context(role, false);
                 for runtime in [RuntimeKind::Codex, RuntimeKind::Claude, RuntimeKind::OpenCode] {
                     let outgoing = match runtime {
                         RuntimeKind::Codex => {
@@ -3305,29 +3299,21 @@ mod tests {
     }
 
     #[test]
-    fn project_knowledge_reaches_all_three_runtimes() {
-        let mut params = json!({
-            "additionalContext": {
-                "devez-vibe-rules": { "value": "공통 규칙", "kind": "application" },
-                "devez-vibe-knowledge": { "value": "자동 지식 요약", "kind": "application" }
+    fn auto_knowledge_state_reaches_all_three_runtimes() {
+        for enabled in [true, false] {
+            let entry = crate::auto_knowledge_context(enabled);
+            let instruction = entry["value"].as_str().unwrap();
+            let steering = json!({"devez-vibe-knowledge": entry});
+            let starting = crate::turn_additional_context(crate::agent::AgentMode::Standard, enabled);
+            for context in [starting, steering] {
+                let mut params = json!({"additionalContext": context});
+                for runtime in [RuntimeKind::Claude, RuntimeKind::OpenCode] {
+                    assert!(combined_turn_instructions(&params, runtime).unwrap().contains(instruction));
+                }
+                prepare_codex_turn_context(&mut params);
+                assert_eq!(params["additionalContext"]["devez-vibe-knowledge"]["value"], instruction);
             }
-        });
-
-        assert!(
-            combined_turn_instructions(&params, RuntimeKind::Claude)
-                .is_some_and(|text| text.contains("자동 지식 요약"))
-        );
-        assert!(
-            combined_turn_instructions(&params, RuntimeKind::OpenCode)
-                .is_some_and(|text| text.contains("자동 지식 요약"))
-        );
-        prepare_codex_turn_context(&mut params);
-        assert_eq!(
-            params
-                .pointer("/additionalContext/devez-vibe-knowledge/value")
-                .and_then(Value::as_str),
-            Some("자동 지식 요약")
-        );
+        }
     }
 
     /// A legacy mode notice alone must not produce turn instructions.

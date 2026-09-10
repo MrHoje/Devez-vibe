@@ -457,7 +457,7 @@ async fn run_after_startup(
     queued: Option<String>,
 ) -> Result<()> {
     draw(state, renderer)?;
-    // Startup's own stream is gone by now, so the shared one can take the terminal.
+    // Startup and subsequent waits use the same terminal input queue.
     input_hub::install();
     input_hub::query_graphics().await;
     if terminal_graphics::size().is_some() { renderer.relayout()?; }
@@ -640,7 +640,6 @@ async fn await_thread(
     plan: impl Future<Output = AccountPlan>,
     mut side_exit_key_guard: Option<Instant>,
 ) -> Result<Startup> {
-    let mut events = EventStream::new();
     let mut composer_paste = ComposerPasteBuffer::new();
     let mut preedit_capture = PreeditCapture::default();
     let mut alt_code = AltCodeKeys::default();
@@ -659,6 +658,7 @@ async fn await_thread(
         let paste_deadline = composer_paste.flush_deadline();
         let action = tokio::select! {
             thread_response = &mut thread => {
+                flush_composer_paste(state, &mut composer_paste, Instant::now());
                 // In practice the plan lands first, but never drop it on the floor.
                 if plan_pending {
                     state.set_account_plan(plan.as_mut().await);
@@ -673,7 +673,7 @@ async fn await_thread(
                 state.set_account_plan(account_plan);
                 Action::None
             }
-            event = events.next() => {
+            event = input_hub::next_event() => {
                 match event {
                     Some(Ok(Event::Key(key))) if preedit_capture.claims(&key) => {
                         match preedit_capture.observe(alt_code.normalize(key)) {
@@ -803,6 +803,7 @@ fn hold_until_thread(
         | Action::Tick(_)
         | Action::Quit
         | Action::SetTheme(_)
+        | Action::PersistAutoKnowledge(_)
         | Action::Copy(_)
         | Action::Cut(_)
         | Action::RunShell(_)
@@ -1314,7 +1315,7 @@ async fn start_split_turn(
         "model": model,
         "serviceTier": state.service_tier(),
         "permissions": state.permission_profile(),
-        "additionalContext": turn_additional_context(agent_mode, None)
+        "additionalContext": turn_additional_context(agent_mode, state.auto_knowledge())
     });
     if !effort.is_empty() {
         params["effort"] = json!(effort);
@@ -1437,7 +1438,10 @@ async fn execute_split_conversation_action(
                     json!({
                         "threadId": state.thread_id,
                         "expectedTurnId": turn_id,
-                        "input": input
+                        "input": input,
+                        "additionalContext": {
+                            "devez-vibe-knowledge": auto_knowledge_context(state.auto_knowledge())
+                        }
                     }),
                 )
                 .await
@@ -2334,6 +2338,7 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
             }
         }
         Pick::FastMode => state.run_command("/fast"),
+        Pick::AutoKnowledge => state.run_command("/auto-knowledge"),
         Pick::ShellDisplayMode => {
             state.cycle_shell_display_mode();
             Action::PersistVibeDisplayModes {
@@ -2560,6 +2565,20 @@ async fn run_local_shell(
     Ok(())
 }
 
+fn worktree_fork_params(state: &AppState, path: &Path) -> Value {
+    json!({
+        "threadId": state.thread_id,
+        "cwd": path,
+        "model": state.selected_model_name(),
+        "effort": state.selected_effort(),
+        "claudeDeveloperInstructions": CLAUDE_DEVEZ_INSTRUCTIONS,
+        "serviceTier": state.service_tier(),
+        "ephemeral": false,
+        "excludeTurns": true,
+        "threadSource": "devez-vibe"
+    })
+}
+
 async fn execute_action(
     server: &mut BackendServer,
     state: &mut AppState,
@@ -2609,7 +2628,10 @@ async fn execute_action(
             let params = json!({
                 "threadId": state.thread_id,
                 "expectedTurnId": turn_id,
-                "input": input
+                "input": input,
+                "additionalContext": {
+                    "devez-vibe-knowledge": auto_knowledge_context(state.auto_knowledge())
+                }
             });
             if let Err(error) = server.request("turn/steer", params).await {
                 state.push_notice(BlockKind::Error, "추가 입력 실패", error.to_string());
@@ -2634,11 +2656,14 @@ async fn execute_action(
         Action::Worktree(name) => {
             let cwd = PathBuf::from(&state.cwd);
             let result = await_with_activity(state, renderer, async move {
-                tokio::task::spawn_blocking(move || worktree::create(&cwd, name.as_deref())).await?
+                tokio::task::spawn_blocking(move || worktree::prepare(&cwd, name.as_deref())).await?
             })
             .await?;
             match result {
                 Ok(path) => {
+                    let previous_cwd = state.cwd.clone();
+                    let previous_thread = state.thread_id.clone();
+                    let fork = (!state.thread_pending()).then(|| worktree_fork_params(state, &path));
                     let model = state.selected_model_name().to_owned();
                     let effort = state.selected_effort().to_owned();
                     state.attach_thread(
@@ -2647,7 +2672,65 @@ async fn execute_action(
                         &model,
                         Some(&effort),
                     );
-                    return start_new_thread(server, state, renderer).await;
+                    state.begin_thread_switch();
+                    state.set_host_loading(true);
+                    state.push_notice(BlockKind::System, "작업 트리 준비 중", "파일과 대화를 준비하고 있습니다. 입력한 요청은 준비가 끝나면 실행합니다.");
+                    draw(state, renderer)?;
+                    let destination = path.clone();
+                    let account_plan = state.account_plan().clone();
+                    let result = await_thread(
+                        server,
+                        state,
+                        renderer,
+                        async {
+                            tokio::task::spawn_blocking(move || worktree::checkout(&destination)).await??;
+                            match fork {
+                                Some(params) => {
+                                    let response = server.request("thread/fork", params).await?;
+                                    if response.pointer("/thread/id").and_then(Value::as_str)
+                                        .filter(|id| !id.is_empty()).is_none()
+                                    {
+                                        anyhow::bail!("대화 복제 응답에 세션 ID가 없습니다.");
+                                    }
+                                    Ok(response)
+                                }
+                                None => Ok(Value::Null),
+                            }
+                        },
+                        std::future::ready(account_plan),
+                        None,
+                    )
+                    .await;
+                    state.set_host_loading(false);
+                    match result {
+                        Ok(Startup::Quit) => return Ok(true),
+                        Ok(Startup::Ready { thread_response, queued }) => {
+                            if let Some(id) = thread_response.pointer("/thread/id").and_then(Value::as_str) {
+                                let model = thread_response.get("model").and_then(Value::as_str).unwrap_or(&model);
+                                let effort = thread_response.get("reasoningEffort").and_then(Value::as_str).unwrap_or(&effort);
+                                state.attach_thread(id.to_owned(), path.to_string_lossy().into_owned(), &model, Some(&effort));
+                                state.note_resume_id(&server.resume_id(id));
+                                state.begin_cost_restore();
+                                apply_claude_account_metadata(state, &thread_response);
+                            }
+                            state.push_notice(BlockKind::System, "작업 트리 준비 완료", path.to_string_lossy());
+                            if !state.has_deferred_resume()
+                                && let Some(text) = queued
+                                && (!state.thread_pending() || open_pending_thread(server, state, renderer).await?)
+                            {
+                                start_turn(server, state, renderer, text, None).await?;
+                            }
+                            if !state.thread_pending() {
+                                apply_deferred_startup_actions(server, state).await;
+                            }
+                        }
+                        Err(error) => {
+                            // Keep partial files for inspection, but never run a queued prompt there.
+                            state.attach_thread(previous_thread, previous_cwd, &model, Some(&effort));
+                            state.set_request_failed(format!("작업 트리 전환 실패: {error}\n원래 대화와 폴더로 돌아왔습니다. 생성된 작업 트리는 보존했습니다: {}", path.display()));
+                        }
+                    }
+                    return Ok(false);
                 }
                 Err(error) => {
                     state.push_notice(BlockKind::Error, "작업 트리 생성 실패", error.to_string());
@@ -2694,6 +2777,11 @@ async fn execute_action(
                         error.to_string(),
                     );
                 }
+            }
+        }
+        Action::PersistAutoKnowledge(enabled) => {
+            if let Err(error) = state::write_project_auto_knowledge(&state.cwd, enabled) {
+                state.push_notice(BlockKind::Warning, "자동 지식 기록 설정 저장 실패", error.to_string());
             }
         }
         Action::SetFast(enabled) => {
@@ -4285,7 +4373,10 @@ async fn send_queued_prompt(
     let params = json!({
         "threadId": state.thread_id,
         "expectedTurnId": turn_id,
-        "input": input
+        "input": input,
+        "additionalContext": {
+            "devez-vibe-knowledge": auto_knowledge_context(state.auto_knowledge())
+        }
     });
     if let Err(error) =
         await_with_activity(state, renderer, server.request("turn/steer", params)).await?
@@ -4584,7 +4675,7 @@ const DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 실제 변경을 마쳤을 때만 마지막 문장을 구체적인 대상·동작을 담은 `~했습니다.`로 끝낸다. 질문·조사·설명에는 완료 표현을 쓰지 않고, `~한 내용을 완료했습니다.` 같은 겹친 명사절은 피한다.\n",
     "근거와 상태:\n",
     "- 제공받은 기록만으로 보고하면 첫 항목에 '제공 기록 기준'을 밝힌다. 기록의 작성·구현·검사·확인을 자신이 수행했다고 쓰지 않는다. 직접 수행한 일과 기록상 결과를 문장마다 구분한다.\n",
-    "- 프로젝트의 .knowledge가 있으면 파일명·검색으로 작업 관련 문서를 찾아 필요한 부분만 읽는다.\n",
+    "- auto-knowledge 상태와 관계없이 프로젝트의 .knowledge가 있으면 .knowledge/knowledge-index.md를 먼저 읽고 작업 관련 문서의 필요한 부분만 읽는다. 인덱스가 없으면 파일명·검색으로 찾는다.\n",
     "- 핵심 질문을 확정하고 실제 확인한 근거로 답한다. 관련 입력·상태·표시 흐름을 추적하고 테스트 또는 변경 이력과 교차 확인한다. 첫 검색·한 키워드·검색 실패만으로 원인이나 기능 부재를 단정하지 않는다.\n",
     "- 현재 구현·과거 원인·추정을 구분하고 근거가 없으면 미확인이라고 쓴다. 변경 결과는 확인된 원인·사용자 영향·실제 조치로 설명하며 확인 범위와 한계는 판단에 필요한 만큼 남긴다. 막연한 개선·수정 완료 문구로 대체하지 않는다.\n",
     "- 외부 상태는 실제 응답·오류 전까지 완료·취소·거절·원인을 단정하지 않는다. 질문 전달 실패나 무응답 오류는 필요한 질문을 일반 문장으로 다시 제시하고, 답이 필요한 변경은 응답 전 실행하지 않는다.\n",
@@ -4620,7 +4711,7 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 계획 승인·실행 판단에는 목표·주요 작업·검토 결과·미확정 사항을 요약하고 상세 구현은 계획 문서에 둔다. 이미 정한 결정이나 제외한 선택지를 반복하지 않는다.\n",
     "- 실제 변경을 마쳤을 때만 마지막 문장을 구체적인 대상·동작을 담은 `~했습니다.`로 끝낸다. 질문·조사·설명에는 완료 표현을 쓰지 않고, `~한 내용을 완료했습니다.` 같은 겹친 명사절은 피한다.\n",
     "근거와 상태:\n",
-    "- 프로젝트의 .knowledge가 있으면 파일명·검색으로 작업 관련 문서를 찾아 필요한 부분만 읽는다.\n",
+    "- auto-knowledge 상태와 관계없이 프로젝트의 .knowledge가 있으면 .knowledge/knowledge-index.md를 먼저 읽고 작업 관련 문서의 필요한 부분만 읽는다. 인덱스가 없으면 파일명·검색으로 찾는다.\n",
     "- 핵심 질문을 확정하고 실제 확인한 근거로 답한다. 관련 입력·상태·표시 흐름을 추적하고 테스트 또는 변경 이력과 교차 확인한다. 첫 검색·한 키워드·검색 실패만으로 원인이나 기능 부재를 단정하지 않는다.\n",
     "- 제공받은 기록만으로 보고하면 첫 항목에 '제공 기록 기준'을 밝힌다. 기록의 작성·구현·검사·확인을 자신이 수행했다고 쓰지 않는다. 직접 수행한 일과 기록상 결과를 문장마다 구분한다.\n",
     "- 현재 구현·과거 원인·추정을 구분하고 근거가 없으면 미확인이라고 쓴다. 원인은 요청받았거나 판단에 필요할 때만 쓴다. 확인 범위와 한계는 결론에 영향을 줄 때 남긴다.\n",
@@ -4699,11 +4790,8 @@ fn resume_thread_params(thread_id: &str, claude: &ClaudeSessionSettings) -> Valu
 /// preset. Claude also gets one short per-turn reminder for language and readability.
 /// The full rules stay here for the one runtime with no
 /// standing instructions of its own.
-fn turn_additional_context(
-    agent: agent::AgentMode,
-    knowledge: Option<&str>,
-) -> Value {
-    let mut context = json!({
+fn turn_additional_context(agent: agent::AgentMode, auto_knowledge: bool) -> Value {
+    json!({
         "devez-vibe-rules": {
             "value": DEVEZ_INSTRUCTIONS,
             "kind": "application"
@@ -4719,15 +4807,26 @@ fn turn_additional_context(
         "devez-vibe-agent": {
             "value": agent.render_turn_block(),
             "kind": "application"
-        }
-    });
-    if let Some(knowledge) = knowledge.filter(|knowledge| !knowledge.trim().is_empty()) {
-        context["devez-vibe-knowledge"] = json!({
-            "value": knowledge,
-            "kind": "application"
-        });
-    }
-    context
+        },
+        "devez-vibe-knowledge": auto_knowledge_context(auto_knowledge)
+    })
+}
+
+/// Steering updates only this choice, preserving the active turn's role.
+fn auto_knowledge_context(auto_knowledge: bool) -> Value {
+    let knowledge = if auto_knowledge {
+        concat!(
+            "현재 auto-knowledge는 On이다. 이전 auto-knowledge 상태 지침을 대체한다.\n",
+            "반복 실수, 검증된 해결법, 이후 작업에 필요한 확정 정보를 .knowledge의 주제별 문서에 기록한다. 기존 문서에 합치고 필요한 경우 폴더·문서를 만든다.\n",
+            "문서를 추가·수정·이름 변경하면 .knowledge/knowledge-index.md의 문서 제목·경로·간략한 설명도 갱신한다. 추측·임시 상태·민감정보는 기록하지 않는다. 현재 역할의 쓰기 제한과 사용자 지시를 따른다."
+        )
+    } else {
+        "현재 auto-knowledge는 Off이다. 이전 auto-knowledge 상태 지침을 대체한다. .knowledge 문서와 인덱스를 자동으로 생성·갱신하지 않는다. 사용자가 기록을 명시적으로 요청하면 수행한다."
+    };
+    json!({
+        "value": knowledge,
+        "kind": "application"
+    })
 }
 
 /// Every value Codex accepts for `sessionStartSource`. It rejects the whole
@@ -5608,7 +5707,7 @@ async fn start_turn(
         "model": model,
         "serviceTier": state.service_tier(),
         "permissions": state.permission_profile(),
-        "additionalContext": turn_additional_context(agent_mode, None)
+        "additionalContext": turn_additional_context(agent_mode, state.auto_knowledge())
     });
     if !effort.is_empty() {
         params["effort"] = json!(effort);
@@ -7683,7 +7782,7 @@ mod tests {
 
     #[test]
     fn turn_context_omits_mode_notice_and_base_rules_keep_language() {
-        let context = turn_additional_context(agent::AgentMode::Standard, None);
+        let context = turn_additional_context(agent::AgentMode::Standard, false);
         assert!(context.get("devez-vibe-mode").is_none());
         for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS] {
             assert!(rules.contains("첫 글자"));
@@ -7702,7 +7801,7 @@ mod tests {
     /// Builder included.
     #[test]
     fn the_turn_carries_the_selected_role() {
-        let planner = turn_additional_context(agent::AgentMode::Planner, None);
+        let planner = turn_additional_context(agent::AgentMode::Planner, false);
         let block = planner
             .pointer("/devez-vibe-agent/value")
             .and_then(Value::as_str)
@@ -7715,7 +7814,7 @@ mod tests {
             Some("application")
         );
 
-        let builder = turn_additional_context(agent::AgentMode::Standard, None);
+        let builder = turn_additional_context(agent::AgentMode::Standard, false);
         assert!(
             builder
                 .pointer("/devez-vibe-agent/value")
@@ -7725,28 +7824,33 @@ mod tests {
     }
 
     #[test]
-    fn the_turn_carries_only_the_compact_knowledge_context() {
-        let context = turn_additional_context(
-            agent::AgentMode::Standard,
-            Some("자동 요약과 문서 색인"),
-        );
+    fn auto_knowledge_badge_and_startup_allow_the_picker_without_a_thread() {
+        let mut state = starting_state();
+        assert!(matches!(pick_action(&mut state, Pick::AutoKnowledge), Action::None));
+        assert_eq!(state.view().overlay.unwrap().title, "Auto Knowledge");
+        let action = state.click_effort_step(0);
+        assert!(state.auto_knowledge());
+        assert!(matches!(hold_until_thread(&mut state, action, &mut None), Some(Action::PersistAutoKnowledge(true))));
+    }
 
-        assert_eq!(
-            context
-                .pointer("/devez-vibe-knowledge/value")
-                .and_then(Value::as_str),
-            Some("자동 요약과 문서 색인")
-        );
-        assert!(
-            turn_additional_context(agent::AgentMode::Standard, None)
-                .get("devez-vibe-knowledge")
-                .is_none()
-        );
+    #[test]
+    fn auto_knowledge_context_replaces_on_with_off_and_always_reads_the_index() {
+        for enabled in [true, false, true] {
+            let context = turn_additional_context(agent::AgentMode::Standard, enabled);
+            let instruction = context["devez-vibe-knowledge"]["value"].as_str().unwrap();
+            assert!(instruction.contains(if enabled { "auto-knowledge는 On" } else { "auto-knowledge는 Off" }));
+            assert!(instruction.contains("이전 auto-knowledge 상태 지침을 대체"));
+            assert_eq!(instruction.contains("반복 실수"), enabled);
+            assert_eq!(instruction.contains("자동으로 생성·갱신하지 않는다"), !enabled);
+            for key in ["devez-vibe-rules", "claude-devez-vibe-rules"] {
+                assert!(context[key]["value"].as_str().unwrap().contains(".knowledge/knowledge-index.md를 먼저 읽고"));
+            }
+        }
     }
 
     #[test]
     fn every_turn_restates_the_rules() {
-        let context = turn_additional_context(agent::AgentMode::Standard, None);
+        let context = turn_additional_context(agent::AgentMode::Standard, false);
 
         assert_eq!(
             context
@@ -7787,17 +7891,31 @@ mod tests {
     }
 
     #[test]
-    fn worktree_new_thread_uses_destination_for_provider_requests() {
+    fn worktree_keeps_history_and_queues_requests_for_the_fork() {
         let mut state = starting_state();
         let model = state.selected_model_name().to_owned();
         let effort = state.selected_effort().to_owned();
         let cwd = "C:/repo.worktrees/main-worktree-1";
+        state.attach_thread("parent-thread".to_owned(), "C:/repo".to_owned(), &model, Some(&effort));
+        state.push_notice(BlockKind::Assistant, "이전 답변", "유지할 대화 내용");
+        let params = worktree_fork_params(&state, Path::new(cwd));
+        assert_eq!(params["threadId"], "parent-thread");
+        assert_eq!(params["cwd"], cwd);
+        assert_eq!(params["ephemeral"], false);
         state.attach_thread(String::new(), cwd.to_owned(), &model, Some(&effort));
-        state.prepare_new_thread();
         state.begin_thread_switch();
+        assert!(state.drain_committed().iter().any(|block| block.body == "유지할 대화 내용"));
         assert!(state.thread_pending());
         assert_eq!(state.cwd, cwd);
         assert_eq!(state.selected_model_name(), model);
+        state.set_host_loading(true);
+        state.handle_paste("파일을 확인해줘");
+        let submit = state.handle_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        let mut queued = None;
+        assert!(hold_until_thread(&mut state, submit, &mut queued).is_none());
+        assert_eq!(queued.as_deref(), Some("파일을 확인해줘"));
+        assert!(state.thread_pending());
+        assert_eq!(state.cwd, cwd);
         for provider in ["gpt-5.6-sol", "claude:sonnet"] {
             let params = new_thread_params(&state.cwd, Some(provider), None, "clear", "low", "default", &effort);
             assert_eq!(params["cwd"], cwd);

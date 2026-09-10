@@ -31,8 +31,7 @@ fn hub() -> &'static InputHub {
     })
 }
 
-/// Builds the shared stream before the first reader needs it. Startup owns a
-/// stream of its own, so the hub is armed only once that one is gone.
+/// Ensures the shared stream used by startup and subsequent waits is installed.
 pub fn install() {
     let _ = hub();
 }

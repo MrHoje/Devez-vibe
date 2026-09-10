@@ -28,24 +28,10 @@
 
 ## 기록
 
-* 반복될 가능성이 큰 실수나 중요한 교훈은 알맞은 `.knowledge/` 문서에 기록한다.
-* 기존 문서에 맞는 주제가 없으면 새 지식 문서를 만들고 아래 문서 목록도 함께 갱신한다.
+* auto-knowledge가 켜져 있으면 반복될 가능성이 큰 실수나 중요한 교훈을 알맞은 `.knowledge/` 문서에 기록한다. 기존 문서에 맞는 주제가 없으면 새 지식 문서를 만든다.
 
 ## 지식베이스
 
 * 절차, 설계 근거, 진단 기록 같은 지식 문서는 `.knowledge/` 폴더에 적재한다. `docs/`에는 HTML 미리보기 같은 산출물만 둔다.
-* 새 지식 문서를 추가하거나 이름을 바꾸면 아래 목록도 함께 갱신한다.
-* 문서 목록
-  * `Claude-Agent-SDK-호환성-업데이트.md` — Claude Code·SDK 업데이트 시 브리지 영향 확인과 최신화 절차
-  * `Codex-CLI-호환성-업데이트.md` — Codex CLI 업데이트 시 app-server 프로토콜·모델 카탈로그 영향 확인 절차
-  * `배포-버전-갱신.md` — Cargo.toml 버전과 웰컴 UI 표기, npm 패키지 배포 절차
-  * `토큰사용량-단가-갱신.md` — 컴포저 추정 비용의 모델별 단가표 갱신 절차, DevezCode와 동일 단가 유지
-  * `컨텍스트-표시-복원.md` — provider별 새 세션·재개 직후 컨텍스트 사용량과 상한 복원 기준
-  * `스트리밍-링크-지연.md` — 숨긴 링크 주소의 출력 지연·밝기 효과 제외와 시간 순서 검증 기준
-  * `한글-글리프-깨짐-진단.md` — 전각 글리프가 다른 글자로 보이는 증상의 원인과 수정 방법
-  * `Windows-호스트-통합-주의.md` — ConPTY 특수 입력과 배치 파일 안의 PowerShell 본문 처리 주의사항
-  * `에이전트-역할-확장-주의.md` — 사용자 정의 역할 추가 시 동적 개수와 내장 역할 보호 원칙
-  * `agent-system-implementation-plan.md` — Builder·Planner·Goal Runner·Reviewer 역할 시스템의 초기 구현 계획서
-  * `side-panel-reference.md` — 제거된 우측 도킹 정보 패널의 예전 구현 참고 자료
-  * `builder-ponytail.md` — Builder 역할에 넣은 Ponytail 최소 코드 규칙의 적용 내용과 제거 절차
-  * `지침-축약-검증.md` — 기본·역할 지침의 축약 전후 토큰 수, 보존 조건, 검증 결과
+* auto-knowledge 상태와 관계없이 `.knowledge/`가 있으면 [knowledge-index.md](.knowledge/knowledge-index.md)를 먼저 읽고 작업 관련 문서의 필요한 부분만 읽는다.
+* 지식 문서를 추가하거나 이름·내용을 바꾸면 인덱스의 제목과 간략한 설명도 함께 갱신한다.

@@ -504,7 +504,7 @@ impl SlashCommand {
     }
 }
 
-const SLASH_COMMANDS: [SlashCommand; 34] = [
+const SLASH_COMMANDS: [SlashCommand; 35] = [
     SlashCommand {
         name: "/provider",
         description: "Switch between the Claude and Codex providers, or connect OpenCode",
@@ -518,6 +518,11 @@ const SLASH_COMMANDS: [SlashCommand; 34] = [
     SlashCommand {
         name: "/fast",
         description: "Toggle the model's fast service tier",
+        takes_argument: false,
+    },
+    SlashCommand {
+        name: "/auto-knowledge",
+        description: "반복 실수와 필요한 지식의 자동 기록 켜기·끄기",
         takes_argument: false,
     },
     SlashCommand {
@@ -577,7 +582,7 @@ const SLASH_COMMANDS: [SlashCommand; 34] = [
     },
     SlashCommand {
         name: "/worktree",
-        description: "작업 트리를 만들고 새 대화로 진입",
+        description: "현재 대화를 이어받아 작업 트리로 진입",
         takes_argument: true,
     },
     SlashCommand {
@@ -1297,6 +1302,7 @@ pub enum Action {
     PersistSidePanelDefault(SidePanelStage),
     /// Save whether completed progress responses stay visible or fold away.
     PersistResponseDisplayMode(ResponseDisplayMode),
+    PersistAutoKnowledge(bool),
     /// Save the transcript's Shell display preference for future sessions.
     PersistShellDisplayMode(ShellDisplayMode),
     PersistDiffDisplayMode(DiffDisplayMode),
@@ -1794,6 +1800,7 @@ enum DisplaySetting {
     Response,
     Shell,
     Diff,
+    AutoKnowledge,
 }
 
 impl DisplaySetting {
@@ -1802,6 +1809,7 @@ impl DisplaySetting {
             Self::Response => "Response",
             Self::Shell => "Shell",
             Self::Diff => "Diff",
+            Self::AutoKnowledge => "Auto Knowledge",
         }
     }
 
@@ -1809,11 +1817,18 @@ impl DisplaySetting {
         match self {
             Self::Response => &["All", "Completed"],
             Self::Shell | Self::Diff => &["Hide", "Collapse", "Expand"],
+            Self::AutoKnowledge => &["On", "Off"],
         }
     }
 
     fn detail(self, selected: usize) -> Option<String> {
         match (self, selected) {
+            (Self::AutoKnowledge, 0) => Some(
+                "프로젝트별로 저장합니다. 다음 요청부터 필요한 지식을 .knowledge에 기록하고 knowledge-index.md를 갱신합니다.".to_owned(),
+            ),
+            (Self::AutoKnowledge, 1) => Some(
+                "이 프로젝트의 자동 기록을 끕니다. 다음 요청부터 적용하며 기존 지식의 인덱스는 계속 먼저 읽습니다.".to_owned(),
+            ),
             (Self::Response, 0) => Some(
                 "Super Vibe 모드에서만 동작합니다. 모든 진행 응답을 항상 표시합니다."
                     .to_owned(),
@@ -3716,6 +3731,7 @@ pub struct AppState {
     /// trigger a redraw on its own.
     five_hour_remaining: Option<String>,
     fast_mode: bool,
+    auto_knowledge: bool,
     side_parent: Option<SideParent>,
     /// BTW panes run the plan silently: steps still advance, but the panel and
     /// its transcript cards stay off the split view.
@@ -3823,6 +3839,7 @@ impl AppState {
             .or_else(|| effort.map(ToOwned::to_owned))
             .unwrap_or_else(|| "high".to_owned());
         let branch = read_git_branch(&cwd);
+        let auto_knowledge = read_project_auto_knowledge(&cwd);
         let vibe_mode = read_vibe_mode();
         let conversation_view = read_conversation_view();
         let (default_response_length, default_shell_display_mode, default_diff_display_mode) =
@@ -3964,6 +3981,7 @@ impl AppState {
             five_hour_reset_at,
             five_hour_remaining: remaining_label(five_hour_reset_at, unix_now()),
             fast_mode: read_fast_mode(),
+            auto_knowledge,
             side_parent: None,
             plan_panel_hidden: false,
             last_assistant_markdown: None,
@@ -4759,6 +4777,9 @@ impl AppState {
         self.resume_id = String::new();
         let cwd = plain_folder(cwd);
         if self.cwd != cwd {
+            if project_settings_key(&self.cwd) != project_settings_key(&cwd) {
+                self.auto_knowledge = read_project_auto_knowledge(&cwd);
+            }
             self.cwd = cwd;
             self.branch = read_git_branch(&self.cwd);
             self.workspace_entries.clear();
@@ -4831,6 +4852,10 @@ impl AppState {
         self.turn_id = None;
         self.pending_interrupt = false;
         self.turn_started_at = None;
+    }
+
+    pub fn account_plan(&self) -> &AccountPlan {
+        &self.account_plan
     }
 
     pub fn set_account_plan(&mut self, plan: AccountPlan) {
@@ -5319,6 +5344,7 @@ impl AppState {
             branch: self.branch.as_ref().map(|(name, _)| name.clone()),
             is_worktree: self.branch.as_ref().is_some_and(|(_, worktree)| *worktree),
             vibe_mode: self.vibe_mode.label().to_owned(),
+            auto_knowledge: self.auto_knowledge,
             vibe_tone: match self.vibe_mode {
                 VibeMode::Normal => VibeTone::Off,
                 VibeMode::Vibe => VibeTone::On,
@@ -5542,6 +5568,10 @@ impl AppState {
         self.commit_welcome_card();
     }
 
+    pub fn auto_knowledge(&self) -> bool {
+        self.auto_knowledge
+    }
+
     pub fn set_copy_notice(&mut self) {
         // Ctrl+C spent on a copy is not a quit attempt, so it cannot leave the
         // quit armed behind for the next Ctrl+C to trip over.
@@ -5704,6 +5734,9 @@ impl AppState {
         });
         side.show_welcome = false;
         side.fast_mode = self.fast_mode;
+        if project_settings_key(&side.cwd) == project_settings_key(&self.cwd) {
+            side.auto_knowledge = self.auto_knowledge;
+        }
         side.response_length = self.response_length;
         side.response_display_mode = self.response_display_mode;
         side.vibe_mode = self.vibe_mode;
@@ -5747,6 +5780,9 @@ impl AppState {
         self.resume_id = String::new();
         let cwd = plain_folder(cwd);
         if self.cwd != cwd {
+            if project_settings_key(&self.cwd) != project_settings_key(&cwd) {
+                self.auto_knowledge = read_project_auto_knowledge(&cwd);
+            }
             self.cwd = cwd;
             self.workspace_entries.clear();
             self.rebuild_completion_catalog();
@@ -9385,6 +9421,10 @@ impl AppState {
         // the picker instead of guessing one. Nothing leaves the composer, and
         // slash commands still run — `/provider` among them.
         if self.shell_mode {
+            if self.host_loading {
+                self.set_composer_notice("준비가 끝난 뒤 셸 명령을 다시 실행하세요.".to_owned());
+                return Action::None;
+            }
             if !self.composer_images.is_empty() {
                 self.set_composer_notice("Shell Mode에서는 이미지를 첨부할 수 없습니다.".to_owned());
                 return Action::None;
@@ -9627,7 +9667,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex] MODEL  Select a provider and model\nFor OpenCode, switch with /provider opencode, then select a model with /model\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|researcher|goal-runner]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+Z / Ctrl+Y  입력 실행 취소·다시 실행\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
+                    format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex] MODEL  Select a provider and model\nFor OpenCode, switch with /provider opencode, then select a model with /model\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}/auto-knowledge [on|off]  지식 자동 기록 켜기·끄기\n{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|researcher|goal-runner]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+Z / Ctrl+Y  입력 실행 취소·다시 실행\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
                 ));
                 Action::None
             }
@@ -9691,6 +9731,14 @@ impl AppState {
                 ));
                 Action::None
             }
+            "/auto-knowledge" if parts.len() == 1 => {
+                self.open_setting_picker(DisplaySetting::AutoKnowledge, usize::from(!self.auto_knowledge));
+                Action::None
+            }
+            "/auto-knowledge" => self.set_display_setting(
+                DisplaySetting::AutoKnowledge,
+                if parts.len() == 2 { parts[1] } else { "" },
+            ),
             "/fast" if parts.len() == 1 => {
                 if self
                     .selected_model()
@@ -14062,7 +14110,7 @@ impl AppState {
                 "Usage",
                 format!(
                     "/{} [{}]",
-                    setting.title().to_ascii_lowercase(),
+                    setting.title().to_ascii_lowercase().replace(' ', "-"),
                     setting.choices().join("|")
                 ),
             ));
@@ -14073,6 +14121,10 @@ impl AppState {
 
     fn apply_setting_picker(&mut self, setting: DisplaySetting, selected: usize) -> Action {
         match setting {
+            DisplaySetting::AutoKnowledge => {
+                self.auto_knowledge = selected == 0;
+                Action::PersistAutoKnowledge(self.auto_knowledge)
+            }
             DisplaySetting::Response => {
                 let mode = match selected {
                     0 => ResponseDisplayMode::All,
@@ -16879,6 +16931,72 @@ fn config_value(config: &str, key: &str) -> Option<String> {
     })
 }
 
+fn project_settings_key(cwd: &str) -> String {
+    let path = fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
+    let key = plain_folder(path.to_string_lossy().into_owned());
+    #[cfg(windows)]
+    let key = key.replace('\\', "/").trim_end_matches('/').to_lowercase();
+    key
+}
+
+fn project_auto_knowledge_path() -> Option<PathBuf> {
+    Some(vibe_settings_path()?.parent()?.join("project-auto-knowledge.json"))
+}
+
+fn read_project_auto_knowledge(cwd: &str) -> bool {
+    // Unit-test defaults must not depend on the developer's own project choices.
+    if cfg!(test) {
+        return false;
+    }
+    project_auto_knowledge_path().is_some_and(|path| read_project_auto_knowledge_at(&path, cwd))
+}
+
+fn read_project_auto_knowledge_at(path: &Path, cwd: &str) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<BTreeMap<String, bool>>(&text).ok())
+        .and_then(|settings| settings.get(&project_settings_key(cwd)).copied())
+        .unwrap_or(false)
+}
+
+pub(crate) fn write_project_auto_knowledge(cwd: &str, enabled: bool) -> std::io::Result<()> {
+    let path = project_auto_knowledge_path().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "프로젝트 설정 경로를 찾을 수 없습니다.")
+    })?;
+    write_project_auto_knowledge_at(&path, cwd, enabled)
+}
+
+fn write_project_auto_knowledge_at(path: &Path, cwd: &str, enabled: bool) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Write};
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Separate windows may update different projects at the same time.
+    let lock = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .open(path.with_extension("lock"))?;
+    lock.lock()?;
+    let mut settings = match fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str::<BTreeMap<String, bool>>(&text)
+            .map_err(|error| Error::new(ErrorKind::InvalidData, error))?,
+        Err(error) if error.kind() == ErrorKind::NotFound => BTreeMap::new(),
+        Err(error) => return Err(error),
+    };
+    settings.insert(project_settings_key(cwd), enabled);
+    let text = serde_json::to_vec_pretty(&settings)?;
+    let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+    let result = (|| {
+        file.write_all(&text)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 fn vibe_settings_path() -> Option<PathBuf> {
     env::var_os("APPDATA")
         .map(PathBuf::from)
@@ -17270,6 +17388,18 @@ mod tests {
         state.handle_buffered_composer_text(" third", false);
         state.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
         assert_eq!(state.editor.text(), "first third");
+    }
+
+    #[test]
+    fn worktree_loading_preserves_shell_input_until_files_are_ready() {
+        let mut state = test_state();
+        state.set_host_loading(true);
+        state.handle_paste("!echo hello");
+        assert!(matches!(state.submit_editor(), Action::None));
+        assert!(state.shell_mode);
+        assert_eq!(state.editor.text(), "echo hello");
+        state.set_host_loading(false);
+        assert!(matches!(state.submit_editor(), Action::RunShell(command) if command == "echo hello"));
     }
 
     #[test]
@@ -21794,6 +21924,145 @@ mod tests {
             state.run_slash_command("/fast"),
             Action::SetFast(false)
         ));
+    }
+
+    #[test]
+    fn auto_knowledge_picker_confirms_cancels_and_accepts_explicit_values() {
+        let mut state = test_state();
+        assert!(!state.auto_knowledge());
+        assert!(!state.composer_mode().auto_knowledge);
+        assert!(matches!(state.run_slash_command("/auto-knowledge"), Action::None));
+        let picker = state.overlay_view().unwrap();
+        assert_eq!(picker.title, "Auto Knowledge");
+        let slider = picker.slider.unwrap();
+        assert_eq!(slider.efforts, ["On", "Off"]);
+        assert_eq!(slider.selected, 1);
+        state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!state.auto_knowledge());
+        assert!(state.overlay_view().is_none());
+
+        state.run_slash_command("/auto-knowledge");
+        state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::PersistAutoKnowledge(true)
+        ));
+        assert!(state.composer_mode().auto_knowledge);
+        state.run_slash_command("/auto-knowledge");
+        assert_eq!(state.overlay_view().unwrap().slider.unwrap().selected, 0);
+        assert!(matches!(state.click_effort_step(1), Action::PersistAutoKnowledge(false)));
+        assert!(!state.composer_mode().auto_knowledge);
+
+        for value in ["on", "ON"] {
+            assert!(matches!(
+                state.run_slash_command(&format!("/auto-knowledge {value}")),
+                Action::PersistAutoKnowledge(true)
+            ));
+        }
+        for command in ["/auto-knowledge invalid", "/auto-knowledge off extra"] {
+            assert!(matches!(state.run_slash_command(command), Action::None));
+            assert!(state.auto_knowledge());
+            assert_eq!(state.committed.last().unwrap().body, "/auto-knowledge [On|Off]");
+        }
+        assert!(matches!(state.run_slash_command("/auto-knowledge off"), Action::PersistAutoKnowledge(false)));
+        assert!(!state.auto_knowledge());
+    }
+
+    #[test]
+    fn auto_knowledge_survives_new_and_side_conversations() {
+        let mut state = test_state();
+        state.run_slash_command("/auto-knowledge on");
+        let side = state.forked_side_state("side".to_owned(), state.cwd.clone(), state.selected_model_name(), Some(state.selected_effort()));
+        assert!(side.auto_knowledge());
+        let other = state.forked_side_state("other".to_owned(), "other-project".to_owned(), state.selected_model_name(), Some(state.selected_effort()));
+        assert!(!other.auto_knowledge());
+        state.prepare_new_thread();
+        assert!(state.auto_knowledge());
+        state.attach_thread("resumed".to_owned(), "other-project".to_owned(), "gpt-5.6-sol", Some("high"));
+        assert!(!state.auto_knowledge());
+        state.run_slash_command("/auto-knowledge on");
+        state.set_thread("third".to_owned(), "third-project".to_owned(), "gpt-5.6-sol", Some("high"));
+        assert!(!state.auto_knowledge());
+    }
+
+    #[test]
+    fn auto_knowledge_project_settings_round_trip_without_cross_project_leaks() {
+        let root = env::temp_dir().join(format!("devez-auto-knowledge-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let first = root.join("프로젝트 #A");
+        let second = root.join("프로젝트 B");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let path = root.join("settings/auto-knowledge.json");
+        let first = first.to_string_lossy().into_owned();
+        let second = second.to_string_lossy().into_owned();
+        assert!(!read_project_auto_knowledge_at(&path, &first));
+        write_project_auto_knowledge_at(&path, &first, true).unwrap();
+        assert!(read_project_auto_knowledge_at(&path, &first));
+        assert!(!read_project_auto_knowledge_at(&path, &second));
+        let alias = Path::new(&first).join(".").to_string_lossy().into_owned();
+        assert!(read_project_auto_knowledge_at(&path, &alias));
+        #[cfg(windows)]
+        assert!(read_project_auto_knowledge_at(&path, &first.to_uppercase().replace('\\', "/")));
+        write_project_auto_knowledge_at(&path, &second, true).unwrap();
+        write_project_auto_knowledge_at(&path, &alias, false).unwrap();
+        assert!(!read_project_auto_knowledge_at(&path, &first));
+        assert!(read_project_auto_knowledge_at(&path, &second));
+        let stored: BTreeMap<String, bool> = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(stored.len(), 2);
+        fs::write(&path, "broken settings").unwrap();
+        assert!(write_project_auto_knowledge_at(&path, &first, true).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "broken settings");
+        assert!(!read_project_auto_knowledge_at(&path, &first));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn auto_knowledge_concurrent_projects_keep_every_saved_choice() {
+        let root = env::temp_dir().join(format!("devez-auto-knowledge-concurrent-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let path = root.join("auto-knowledge.json");
+        let barrier = std::sync::Barrier::new(4);
+        let projects: Vec<_> = (0..4).map(|index| root.join(format!("project-{index}")).to_string_lossy().into_owned()).collect();
+        std::thread::scope(|scope| {
+            for project in &projects {
+                let path = &path;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    write_project_auto_knowledge_at(path, project, true).unwrap();
+                });
+            }
+        });
+        for project in &projects {
+            assert!(read_project_auto_knowledge_at(&path, project));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn auto_knowledge_keeps_the_choice_when_only_folder_spelling_changes() {
+        let mut state = test_state();
+        state.attach_thread("first".to_owned(), "C:/repo".to_owned(), "gpt-5.6-sol", None);
+        state.run_slash_command("/auto-knowledge on");
+        state.attach_thread("second".to_owned(), r"c:\repo\".to_owned(), "gpt-5.6-sol", None);
+        assert!(state.auto_knowledge());
+    }
+
+    #[test]
+    fn auto_knowledge_is_available_for_every_provider() {
+        for model in ["gpt-5.6-sol", "claude:sonnet", "opencode:test/model"] {
+            let mut state = AppState::new(
+                "thread".to_owned(), "cwd".to_owned(), "account".to_owned(),
+                vec![test_model(model, model, true)], model, Some("high"),
+            );
+            state.editor.set_text("/auto-k");
+            assert!(state.matching_slash_commands().iter().any(|command| command.name == "/auto-knowledge"));
+            state.run_slash_command("/help");
+            assert!(state.committed.last().unwrap().body.contains("/auto-knowledge [on|off]"));
+            state.run_slash_command("/auto-knowledge");
+            assert_eq!(state.overlay_view().unwrap().title, "Auto Knowledge");
+        }
     }
 
     #[test]

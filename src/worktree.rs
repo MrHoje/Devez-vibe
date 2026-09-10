@@ -33,6 +33,8 @@ mod tests {
         let repo = temp.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         git(&repo, &["init", "-b", "main"]).unwrap();
+        std::fs::write(repo.join("tracked.txt"), "committed").unwrap();
+        git(&repo, &["add", "tracked.txt"]).unwrap();
         git(
             &repo,
             &[
@@ -48,8 +50,13 @@ mod tests {
         )
         .unwrap();
         std::fs::write(repo.join("uncommitted.txt"), "keep").unwrap();
-        let first = create(&repo, None).unwrap();
+        let first = prepare(&repo, None).unwrap();
         assert_eq!(first.file_name().unwrap(), "main-worktree-1");
+        assert!(first.join(".git").is_file());
+        assert!(!first.join("tracked.txt").exists());
+        checkout(&first).unwrap();
+        assert_eq!(std::fs::read_to_string(first.join("tracked.txt")).unwrap(), "committed");
+        assert!(git(&first, &["status", "--porcelain"]).unwrap().is_empty());
         assert!(!first.join("uncommitted.txt").exists());
         assert_eq!(
             git(&first, &["branch", "--show-current"]).unwrap(),
@@ -77,6 +84,12 @@ mod tests {
             nested,
             temp.join("repo.worktrees/main-worktree-1-worktree-feature/login")
         );
+        let conflict = prepare(&repo, Some("conflict")).unwrap();
+        std::fs::write(conflict.join("tracked.txt"), "external edit").unwrap();
+        assert!(checkout(&conflict).is_err());
+        assert_eq!(std::fs::read_to_string(conflict.join("tracked.txt")).unwrap(), "external edit");
+        std::fs::remove_file(conflict.join("tracked.txt")).unwrap();
+        checkout(&conflict).unwrap();
         for name in [
             "../escape",
             "/absolute",
@@ -96,14 +109,28 @@ mod tests {
             "keep"
         );
         assert!(create(&temp, None).is_err());
-        for path in [&first, &third, &fifth, &named, &nested] {
+        for path in [&first, &third, &fifth, &named, &nested, &conflict] {
             git(&repo, &["worktree", "remove", path.to_str().unwrap()]).unwrap();
         }
         std::fs::remove_dir_all(temp).unwrap();
     }
 }
 
-pub fn create(cwd: &Path, requested: Option<&str>) -> Result<PathBuf> {
+#[cfg(test)]
+fn create(cwd: &Path, requested: Option<&str>) -> Result<PathBuf> {
+    let path = prepare(cwd, requested)?;
+    checkout(&path)?;
+    Ok(path)
+}
+
+pub fn checkout(path: &Path) -> Result<()> {
+    git(path, &["read-tree", "HEAD"])?;
+    // Do not overwrite a file created externally while the new screen is open.
+    git(path, &["checkout-index", "--all"])?;
+    Ok(())
+}
+
+pub fn prepare(cwd: &Path, requested: Option<&str>) -> Result<PathBuf> {
     let common = git(
         cwd,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -182,6 +209,7 @@ pub fn create(cwd: &Path, requested: Option<&str>) -> Result<PathBuf> {
         &[
             "worktree",
             "add",
+            "--no-checkout",
             "-b",
             &name,
             path.to_str()
