@@ -3908,6 +3908,11 @@ async fn start_new_thread(
     state: &mut AppState,
     renderer: &mut Renderer,
 ) -> Result<bool> {
+    if state.waiting_for_usage_limit() {
+        server.request("turn/interrupt", json!({
+            "threadId": state.thread_id, "turnId": state.turn_id
+        })).await?;
+    }
     renderer.clear_screen()?;
     state.prepare_new_thread();
     state.begin_thread_switch();
@@ -4063,6 +4068,11 @@ async fn resume_into_state(
     thread_id: &str,
     protect_side_exit_keys: bool,
 ) -> Result<Switched> {
+    if state.waiting_for_usage_limit() {
+        server.request("turn/interrupt", json!({
+            "threadId": state.thread_id, "turnId": state.turn_id
+        })).await?;
+    }
     let previous_thread = state.thread_id.clone();
     // Read before the screen resets: the resumed session has to reopen on the
     // model, effort and permission mode the picker currently holds.

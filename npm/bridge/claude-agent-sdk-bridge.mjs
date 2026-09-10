@@ -1364,6 +1364,8 @@ async function createSession(params, resumeId) {
       if (session.turn) finishTurn(session, error);
     })
     .finally(() => {
+      clearUsageLimitWait(session);
+      if (session.turn) finishTurn(session, new Error("Claude 연결이 종료되었습니다."));
       clearSubagents(session);
     });
   session.consumer = consumer;
@@ -2551,6 +2553,80 @@ function toolOutput(content, structured) {
   return content == null ? "" : JSON.stringify(content, null, 2);
 }
 
+function clearUsageLimitWait(session) {
+  if (!session.usageLimitWait) return false;
+  clearInterval(session.usageLimitWait.timer);
+  session.usageLimitWait = null;
+  notify("claude/usageLimit/waiting", { threadId: session.id, resetsAt: null });
+  return true;
+}
+
+function resumeAfterUsageLimit(session, wait, now = Date.now()) {
+  if (!wait || session.usageLimitWait !== wait || now < wait.resetsAt) return;
+  clearUsageLimitWait(session);
+  if (session.turn !== wait.turn || session.turn.interruptRequested) return;
+  // A long sleep must not launch unattended work when the machine wakes up.
+  if (now - wait.lastTick > 30 * 60 * 1000) {
+    finishTurn(session, new Error("사용량 한도가 초기화되었습니다. 계속하려면 요청을 보내 주세요."));
+    return;
+  }
+  session.turn.rateLimitInfo = null;
+  session.turn.assistantError = null;
+  session.turn.sawStreamText = false;
+  session.turn.sawVisibleText = false;
+  notify("warning", { threadId: session.id, message: "Claude 사용량 한도 초기화 시각이 되어 작업을 이어갑니다." });
+  // Reuse the live query: model, effort, role policy and permission checks stay
+  // intact. Never replay the original prompt (which may contain side effects).
+  try {
+    session.queue.push({
+      type: "user",
+      message: { role: "user", content: [{ type: "text", text: "사용량 한도로 중단된 작업을 이어서 진행하세요. 이미 완료한 작업은 반복하지 말고 현재 상태를 확인한 뒤 남은 작업을 수행하세요." }] },
+      parent_tool_use_id: null,
+      session_id: session.id,
+    });
+  } catch (error) {
+    finishTurn(session, error);
+  }
+}
+
+function waitForUsageLimit(session) {
+  const turn = session.turn;
+  const info = turn?.rateLimitInfo;
+  const now = Date.now();
+  const resetsAt = typeof info?.resetsAt === "number" ? info.resetsAt * 1000 + 1000 : NaN;
+  if (!turn || turn.interruptRequested || turn.assistantError !== "rate_limit" || info?.status !== "rejected"
+    || !["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"].includes(info.rateLimitType)
+    || info.isUsingOverage || info.overageInUse
+    || !Number.isFinite(resetsAt) || resetsAt <= now || resetsAt - now > 24 * 60 * 60 * 1000
+    || (turn.usageLimitRetries || 0) >= 3) return false;
+  if (session.usageLimitWait) return true;
+  turn.usageLimitRetries = (turn.usageLimitRetries || 0) + 1;
+  flushPendingPlan(session);
+  clearForegroundSubagents(session);
+  session.streamBlocks.clear();
+  const wait = { turn, resetsAt, lastTick: now, timer: null };
+  session.usageLimitWait = wait;
+  notify("claude/usageLimit/waiting", { threadId: session.id, resetsAt: Math.ceil(resetsAt / 1000) });
+  wait.timer = setInterval(() => {
+    const tick = Date.now();
+    resumeAfterUsageLimit(session, wait, tick);
+    wait.lastTick = tick;
+  }, 1000);
+  notify("warning", {
+    threadId: session.id,
+    message: `Claude 사용량 한도에 도달했습니다. ${new Date(resetsAt).toLocaleString("ko-KR")} 이후 자동으로 이어갑니다.\nEsc로 대기를 취소할 수 있습니다.`,
+  });
+  return true;
+}
+
+function cancelUsageLimitWait(session) {
+  if (!clearUsageLimitWait(session)) return false;
+  if (session.turn) session.turn.interruptRequested = true;
+  finishTurn(session, null);
+  notify("warning", { threadId: session.id, message: "Claude 사용량 한도 자동 재개 대기를 취소했습니다." });
+  return true;
+}
+
 async function processResult(session, message) {
   if (!session.turn) return;
   for (const denial of Array.isArray(message.permission_denials) ? message.permission_denials : []) {
@@ -2580,8 +2656,9 @@ async function processResult(session, message) {
     },
   });
   const error = message.is_error && !interrupted
-    ? { message: message.errors?.join("\n") || message.stop_reason || "Claude 실행 실패" }
+    ? { message: message.errors?.join("\n") || message.result || message.stop_reason || "Claude 실행 실패" }
     : null;
+  if (error && waitForUsageLimit(session)) return;
   finishTurn(session, error, message.duration_ms);
   notify("claude/account/updated", {
     threadId: session.id,
@@ -2654,10 +2731,11 @@ async function runPendingPrompt(session) {
 }
 
 function finishTurn(session, error, durationMs) {
+  clearUsageLimitWait(session);
   if (!session.turn) return;
   flushPendingPlan(session);
   clearForegroundSubagents(session);
-  const turn = { id: session.turn.id, status: error ? "failed" : "completed" };
+  const turn = { id: session.turn.id, status: error ? "failed" : session.turn.interruptRequested ? "interrupted" : "completed" };
   if (error) turn.error = { message: error instanceof Error ? error.message : error.message || String(error) };
   if (durationMs != null) turn.durationMs = durationMs;
   notify("turn/completed", { threadId: session.id, turn });
@@ -2681,12 +2759,19 @@ function beginUntrackedTurn(session, message) {
 async function consumeMessage(session, message) {
   adoptSessionId(session, message.session_id);
   beginUntrackedTurn(session, message);
+  // A queued SDK response may beat the timer. It already resumes the work.
+  if (!message.parent_tool_use_id && (message.type === "assistant" || message.type === "stream_event")) {
+    clearUsageLimitWait(session);
+  }
   if (message.type === "stream_event") {
     if (message.event?.type === "content_block_delta" && (message.event?.delta?.text || message.event?.delta?.thinking)) {
       if (session.turn) session.turn.sawStreamText = true;
     }
     await processStreamEvent(session, message);
-  } else if (message.type === "assistant") processAssistant(session, message);
+  } else if (message.type === "assistant") {
+    if (session.turn && !message.parent_tool_use_id) session.turn.assistantError = message.error || null;
+    processAssistant(session, message);
+  }
   else if (message.type === "user") processUser(session, message);
   else if (message.type === "result") await processResult(session, message);
   else if (message.type === "system" && processSubagentSystemMessage(session, message)) {
@@ -2702,6 +2787,7 @@ async function consumeMessage(session, message) {
       reason: message.decision_reason || message.decision_reason_type,
     });
   } else if (message.type === "rate_limit_event") {
+    if (session.turn) session.turn.rateLimitInfo = message.rate_limit_info;
     notify("claude/account/updated", { threadId: session.id, rateLimitInfo: message.rate_limit_info });
   } else if (message.type === "system" && message.subtype === "api_retry") {
     notify("warning", { threadId: session.id, provider: "Claude", message: `Claude API 재시도 ${message.attempt}/${message.max_retries}` });
@@ -2785,6 +2871,7 @@ async function startPrompt(params) {
   const id = liveSessionId(params.sessionId);
   const session = sessions.get(id);
   if (!session) throw new Error(`Claude 세션을 찾을 수 없습니다: ${id}`);
+  cancelUsageLimitWait(session);
   // Claude runs one turn at a time, so extra input waits its turn instead of
   // failing — the same queueing the CLI does for a prompt typed while it works.
   if (session.turn) {
@@ -2801,6 +2888,7 @@ async function steerPrompt(params) {
   const id = liveSessionId(params.sessionId);
   const session = sessions.get(id);
   if (!session) throw new Error(`Claude 세션을 찾을 수 없습니다: ${id}`);
+  cancelUsageLimitWait(session);
   if (!session.turn) return runPrompt(session, params);
   if (params.expectedTurnId && params.expectedTurnId !== session.turn.id) {
     throw new Error(`turn ID가 일치하지 않습니다: ${params.expectedTurnId}`);
@@ -3501,6 +3589,7 @@ async function dispatch(method, params = {}) {
     if (session) {
       session.pendingPrompts.length = 0;
       session.steerPending = 0;
+      if (cancelUsageLimitWait(session)) return {};
     }
     if (session?.turn) {
       const turn = session.turn;
@@ -3543,6 +3632,7 @@ async function dispatch(method, params = {}) {
   if (method === "session/close") {
     const session = lookupSession(params.sessionId);
     if (session) {
+      clearUsageLimitWait(session);
       clearSubagents(session);
       session.queue.close();
       session.query.close();
@@ -3561,6 +3651,7 @@ async function dispatch(method, params = {}) {
   }
   if (method === "shutdown") {
     for (const session of sessions.values()) {
+      clearUsageLimitWait(session);
       clearSubagents(session);
       session.queue.close();
       session.query.close();
@@ -4206,6 +4297,107 @@ async function runSelfTest() {
         async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET() { return null; },
       },
     };
+    // Replay SDK limit/result frames without spending the account's allowance.
+    const retryInputs = [];
+    const limitSession = {
+      ...automaticTurnSession,
+      id: "usage-limit-self-test",
+      query: { ...automaticTurnSession.query, async applyFlagSettings() {} },
+      subagents: new Map(),
+      streamBlocks: new Map(),
+      queue: { push(value) { retryInputs.push(value); } },
+    };
+    sessions.set(limitSession.id, limitSession);
+    const failedResult = { type: "result", is_error: true, errors: ["Usage limit reached"], modelUsage: {} };
+    const rejectLimit = async (extra = {}) => {
+      await consumeMessage(limitSession, {
+        type: "rate_limit_event",
+        rate_limit_info: { status: "rejected", rateLimitType: "five_hour", resetsAt: Date.now() / 1000 + 60, ...extra },
+      });
+      await consumeMessage(limitSession, {
+        type: "assistant", error: "rate_limit", message: { content: [] },
+      });
+    };
+    beginTurn(limitSession);
+    await rejectLimit();
+    await consumeMessage(limitSession, failedResult);
+    if (!limitSession.usageLimitWait || !limitSession.turn) throw new Error("Usage limit did not wait in the active turn");
+    const waitingTurn = limitSession.turn;
+    const wait = limitSession.usageLimitWait;
+    resumeAfterUsageLimit(limitSession, wait, wait.resetsAt);
+    resumeAfterUsageLimit(limitSession, wait, wait.resetsAt);
+    if (retryInputs.length !== 1 || limitSession.turn !== waitingTurn
+      || retryInputs[0].message.content[0].text.includes("Usage limit reached")) {
+      throw new Error("Usage limit continuation duplicated or replaced the session turn");
+    }
+    await rejectLimit();
+    await consumeMessage(limitSession, failedResult);
+    const cancelledWait = limitSession.usageLimitWait;
+    await dispatch("session/interrupt", { sessionId: limitSession.id });
+    resumeAfterUsageLimit(limitSession, cancelledWait, cancelledWait.resetsAt);
+    if (limitSession.turn || retryInputs.length !== 1) throw new Error("Cancelled usage limit resumed");
+    for (const info of [
+      { resetsAt: undefined }, { resetsAt: NaN }, { resetsAt: Date.now() / 1000 - 1 },
+      { resetsAt: Date.now() / 1000 + 90000 }, { status: "allowed_warning" },
+      { rateLimitType: "overage" }, { isUsingOverage: true },
+    ]) {
+      beginTurn(limitSession);
+      await rejectLimit(info);
+      await consumeMessage(limitSession, failedResult);
+      if (limitSession.usageLimitWait || limitSession.turn) throw new Error("Ineligible usage limit started a wait");
+    }
+    beginTurn(limitSession);
+    await rejectLimit();
+    await consumeMessage(limitSession, { ...failedResult, is_error: false });
+    if (limitSession.usageLimitWait) throw new Error("Successful turn started a usage wait");
+    beginTurn(limitSession);
+    await rejectLimit();
+    await consumeMessage(limitSession, { type: "assistant", error: "server_error", message: { content: [] } });
+    await consumeMessage(limitSession, failedResult);
+    if (limitSession.usageLimitWait) throw new Error("Unrelated server error started a usage wait");
+    beginTurn(limitSession);
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await rejectLimit();
+      await consumeMessage(limitSession, failedResult);
+      const retry = limitSession.usageLimitWait;
+      if (attempt < 3) {
+        if (!retry) throw new Error("Usage limit retry ended too early");
+        resumeAfterUsageLimit(limitSession, retry, retry.resetsAt);
+      } else if (retry || limitSession.turn) throw new Error("Repeated limits retried without a bound");
+    }
+    beginTurn(limitSession);
+    await rejectLimit();
+    await consumeMessage(limitSession, failedResult);
+    const sleptWait = limitSession.usageLimitWait;
+    const beforeSleep = retryInputs.length;
+    resumeAfterUsageLimit(limitSession, sleptWait, sleptWait.resetsAt + 31 * 60 * 1000);
+    if (limitSession.turn || retryInputs.length !== beforeSleep) throw new Error("Long sleep resumed unattended work");
+    beginTurn(limitSession);
+    await rejectLimit();
+    await consumeMessage(limitSession, failedResult);
+    const replacedWait = limitSession.usageLimitWait;
+    await startPrompt({ sessionId: limitSession.id, input: [{ type: "text", text: "새 요청" }] });
+    resumeAfterUsageLimit(limitSession, replacedWait, replacedWait.resetsAt);
+    if (retryInputs.length !== beforeSleep + 1
+      || retryInputs.at(-1).message.content[0].text !== "새 요청") throw new Error("New prompt did not replace the wait");
+    finishTurn(limitSession, null);
+    beginTurn(limitSession);
+    await rejectLimit();
+    await consumeMessage(limitSession, failedResult);
+    limitSession.usageLimitWait.resetsAt = Date.now() + 10;
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    if (limitSession.usageLimitWait || retryInputs.length !== beforeSleep + 2) throw new Error("Usage limit timer did not resume");
+    finishTurn(limitSession, null);
+    beginTurn(limitSession);
+    await rejectLimit();
+    await consumeMessage(limitSession, failedResult);
+    const closedWait = limitSession.usageLimitWait;
+    limitSession.query.close = () => {};
+    limitSession.queue.close = () => {};
+    await dispatch("session/close", { sessionId: limitSession.id });
+    resumeAfterUsageLimit(limitSession, closedWait, closedWait.resetsAt);
+    if (retryInputs.length !== beforeSleep + 2) throw new Error("Closed session resumed");
+    sessions.delete(limitSession.id);
     await consumeMessage(automaticTurnSession, {
       type: "assistant",
       parent_tool_use_id: null,
@@ -4994,6 +5186,7 @@ lines.on("line", async (line) => {
 
 lines.on("close", () => {
   for (const session of sessions.values()) {
+    clearUsageLimitWait(session);
     clearSubagents(session);
     session.query.close();
   }

@@ -3565,6 +3565,7 @@ pub struct AppState {
     /// visible id on screen, but only the rollout id resumes the conversation.
     resume_id: String,
     pub turn_id: Option<String>,
+    claude_usage_limit_reset: Option<i64>,
     /// Set when the user interrupts after `turn/start` answers but before the
     /// app-server has announced that the turn is active.
     pending_interrupt: bool,
@@ -3872,6 +3873,7 @@ impl AppState {
             thread_id,
             resume_id: String::new(),
             turn_id: None,
+            claude_usage_limit_reset: None,
             pending_interrupt: false,
             turn_interrupted: false,
             resume_queue_after_interrupt: false,
@@ -4788,6 +4790,7 @@ impl AppState {
     /// Puts the session back into its pending state while the replacement thread
     /// loads, so the cleared screen is immediately repainted with loading status.
     pub fn begin_thread_switch(&mut self) {
+        self.claude_usage_limit_reset = None;
         self.thread_id.clear();
         self.spinner_frame = 0;
     }
@@ -5879,6 +5882,7 @@ impl AppState {
     }
 
     pub fn set_turn_started(&mut self, turn_id: String) {
+        self.claude_usage_limit_reset = None;
         self.pending_async_answer = None;
         let acknowledging_local_prompt = self.busy && self.turn_id.is_none();
         if self.turn_id.as_deref() != Some(turn_id.as_str()) && !acknowledging_local_prompt {
@@ -6445,6 +6449,7 @@ impl AppState {
     }
 
     pub fn prepare_resume(&mut self) {
+        self.claude_usage_limit_reset = None;
         self.codex_permission_mode = PermissionMode::FullAccess;
         self.handled_async_questions.clear();
         self.committed.clear();
@@ -6499,6 +6504,10 @@ impl AppState {
         self.editor.clear();
         self.composer_images.clear();
         self.show_welcome = true;
+    }
+
+    pub fn waiting_for_usage_limit(&self) -> bool {
+        self.claude_usage_limit_reset.is_some()
     }
 
     pub fn push_notice(
@@ -8810,6 +8819,9 @@ impl AppState {
             }
             // Plan or auth mode changed underneath us; pull the fresh values.
             "account/updated" => self.account_refresh_due = true,
+            "claude/usageLimit/waiting" => {
+                self.claude_usage_limit_reset = params.get("resetsAt").and_then(Value::as_i64);
+            }
             "claude/account/updated" => {
                 let account = params.get("account").filter(|value| !value.is_null());
                 let usage = params.get("usage").filter(|value| !value.is_null());
@@ -8820,7 +8832,9 @@ impl AppState {
                 {
                     self.account = label.to_owned();
                 }
-                self.set_account_plan(AccountPlan::from_claude(account, usage));
+                if account.is_some() || usage.is_some() {
+                    self.set_account_plan(AccountPlan::from_claude(account, usage));
+                }
             }
             "turn/started" => {
                 if let Some(turn_id) = params
@@ -8852,6 +8866,7 @@ impl AppState {
                 self.codex_permission_mode = mode;
             }
             "turn/completed" => {
+                self.claude_usage_limit_reset = None;
                 let turn_error = params
                     .get("turn")
                     .and_then(|turn| turn.get("error"))
@@ -12828,6 +12843,12 @@ impl AppState {
         }
         if self.host_loading {
             return Some("Loading session..".to_owned());
+        }
+        if self.busy && !self.turn_interrupted {
+            if let Some(reset) = self.claude_usage_limit_reset {
+                let remaining = reset.saturating_sub(chrono::Utc::now().timestamp()).max(0) as u64;
+                return Some(format!("한도 초기화 대기 · {} 후 자동 재개 · Esc 취소", format_elapsed(remaining)));
+            }
         }
         // Compaction outranks the ordinary turn label: the runtime that runs it as
         // a turn would otherwise report a `Working` response the user never asked for.
@@ -20784,6 +20805,25 @@ mod tests {
         assert!(state.take_account_refresh());
         // The flag is consumed, so the event loop refreshes exactly once.
         assert!(!state.take_account_refresh());
+    }
+
+    #[test]
+    fn claude_usage_limit_wait_is_visible_and_cancellable() {
+        let mut state = test_state();
+        state.set_turn_started("limit-turn".into());
+        state.handle_notification("claude/usageLimit/waiting", &json!({
+            "resetsAt": chrono::Utc::now().timestamp() + 60
+        }));
+        assert!(state.waiting_for_usage_limit());
+        assert!(state.activity().unwrap().contains("한도 초기화 대기"));
+        assert!(state.activity().unwrap().contains("Esc 취소"));
+        assert!(matches!(state.handle_key(KeyEvent::from(KeyCode::Esc)), Action::Interrupt));
+        state.handle_notification("turn/completed", &json!({"turn": {"status": "interrupted"}}));
+        assert!(!state.waiting_for_usage_limit());
+        state.set_turn_started("resumed-turn".into());
+        state.handle_notification("claude/usageLimit/waiting", &json!({"resetsAt": 1}));
+        state.handle_notification("claude/usageLimit/waiting", &json!({"resetsAt": null}));
+        assert!(state.activity().unwrap().starts_with("Working"));
     }
 
     #[test]

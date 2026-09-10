@@ -21,9 +21,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "답변의 문단·불릿 사이를 한 줄씩 띄워 읽기 쉽게 합니다.",
-    "Builder 답변을 공백 제외 200자 이내로 작성합니다. 명시적으로 요청한 상세 분석은 제외합니다.",
-    "하단 실행 목록에서 서브에이전트와 일반 백그라운드 작업을 구분합니다.",
+    "Claude 사용량 한도로 멈춘 작업을 초기화 후 자동으로 이어가며, 대기 시간을 표시하고 Esc로 취소할 수 있습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
