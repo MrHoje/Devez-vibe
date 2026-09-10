@@ -29,6 +29,23 @@ pub struct Editor {
 }
 
 impl Editor {
+    pub fn snapshot(&self) -> Stash {
+        Stash {
+            buffer: self.buffer.clone(),
+            cursor: self.cursor,
+            collapsed_paste_lines: self.collapsed_paste_lines,
+            collapsed_paste_start: self.collapsed_paste_start,
+            collapsed_paste_end: self.collapsed_paste_end,
+        }
+    }
+
+    pub fn matches_snapshot(&self, snapshot: &Stash) -> bool {
+        self.buffer == snapshot.buffer
+            && self.collapsed_paste_lines == snapshot.collapsed_paste_lines
+            && self.collapsed_paste_start == snapshot.collapsed_paste_start
+            && self.collapsed_paste_end == snapshot.collapsed_paste_end
+    }
+
     pub fn is_empty(&self) -> bool {
         self.buffer.iter().all(|&ch| ch == ATTACHMENT_PLACEHOLDER)
     }

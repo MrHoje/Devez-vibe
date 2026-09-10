@@ -504,7 +504,7 @@ impl SlashCommand {
     }
 }
 
-const SLASH_COMMANDS: [SlashCommand; 33] = [
+const SLASH_COMMANDS: [SlashCommand; 34] = [
     SlashCommand {
         name: "/provider",
         description: "Switch between the Claude and Codex providers, or connect OpenCode",
@@ -574,6 +574,11 @@ const SLASH_COMMANDS: [SlashCommand; 33] = [
         name: "/reload-plugins",
         description: "Apply plugin changes to this session",
         takes_argument: false,
+    },
+    SlashCommand {
+        name: "/worktree",
+        description: "작업 트리를 만들고 새 대화로 진입",
+        takes_argument: true,
     },
     SlashCommand {
         name: "/new",
@@ -1174,6 +1179,7 @@ pub enum Action {
     RunShell(String),
     Interrupt,
     NewThread,
+    Worktree(Option<String>),
     OpenResume,
     ResumeThread(String),
     ActivateCodex,
@@ -1903,6 +1909,7 @@ struct MentionBinding {
     description: String,
 }
 
+#[derive(Clone)]
 struct SelectedCompletionBinding {
     sigil: char,
     trigger: String,
@@ -3524,6 +3531,13 @@ struct StashedPrompt {
     images: Vec<String>,
 }
 
+struct ComposerEdit {
+    composer: Stash,
+    images: Vec<String>,
+    bindings: Vec<SelectedCompletionBinding>,
+    shell_mode: bool,
+}
+
 pub struct AppState {
     pub editor: Editor,
     /// `!` entered on an empty composer runs the following text locally instead
@@ -3535,6 +3549,8 @@ pub struct AppState {
     composer_images: Vec<String>,
     /// The draft `Ctrl+S` set aside, waiting for the chord that brings it back.
     stashed_prompt: Option<StashedPrompt>,
+    composer_undo: VecDeque<ComposerEdit>,
+    composer_redo: Vec<ComposerEdit>,
     queued_prompts: VecDeque<String>,
     /// The next turn_input belongs to a queued text, not the current draft.
     queued_input_pending: bool,
@@ -3861,6 +3877,8 @@ impl AppState {
             composer_preedit: String::new(),
             composer_images: Vec::new(),
             stashed_prompt: None,
+            composer_undo: VecDeque::new(),
+            composer_redo: Vec::new(),
             queued_prompts: VecDeque::new(),
             pending_async_answer: None,
             queued_input_pending: false,
@@ -5113,6 +5131,7 @@ impl AppState {
     }
 
     pub fn attach_local_image(&mut self, path: String) {
+        let before = self.composer_snapshot();
         if !self
             .composer_images
             .iter()
@@ -5121,6 +5140,7 @@ impl AppState {
             let index = self.editor.insert_attachment();
             self.composer_images.insert(index, path);
         }
+        self.record_composer_edit(before);
     }
 
     #[allow(dead_code)]
@@ -6450,6 +6470,8 @@ impl AppState {
 
     pub fn prepare_resume(&mut self) {
         self.claude_usage_limit_reset = None;
+        self.composer_undo.clear();
+        self.composer_redo.clear();
         self.codex_permission_mode = PermissionMode::FullAccess;
         self.handled_async_questions.clear();
         self.committed.clear();
@@ -6964,8 +6986,55 @@ impl AppState {
         }
     }
 
+    fn composer_snapshot(&self) -> ComposerEdit {
+        ComposerEdit {
+            composer: self.editor.snapshot(),
+            images: self.composer_images.clone(),
+            bindings: self.selected_completion_bindings.clone(),
+            shell_mode: self.shell_mode,
+        }
+    }
+
+    fn record_composer_edit(&mut self, before: ComposerEdit) {
+        if self.editor.matches_snapshot(&before.composer)
+            && self.composer_images == before.images
+            && self.shell_mode == before.shell_mode
+        {
+            return;
+        }
+        if self.composer_undo.len() == 100 {
+            self.composer_undo.pop_front();
+        }
+        self.composer_undo.push_back(before);
+        self.composer_redo.clear();
+    }
+
+    fn restore_composer_edit(&mut self, redo: bool) {
+        let saved = if redo {
+            self.composer_redo.pop()
+        } else {
+            self.composer_undo.pop_back()
+        };
+        let Some(saved) = saved else { return; };
+        let current = self.composer_snapshot();
+        if redo {
+            self.composer_undo.push_back(current);
+        } else {
+            self.composer_redo.push(current);
+        }
+        self.editor.restore_stash(saved.composer);
+        self.composer_images = saved.images;
+        self.selected_completion_bindings = saved.bindings;
+        self.shell_mode = saved.shell_mode;
+        self.composer_preedit.clear();
+        self.suggestions_dismissed_text = None;
+        self.command_selection = 0;
+    }
+
     pub fn handle_paste(&mut self, text: &str) {
+        let before = self.composer_snapshot();
         self.handle_inserted_text(text, true);
+        self.record_composer_edit(before);
     }
 
     /// Applies text to the exact pending question that owned the key when it
@@ -6985,6 +7054,7 @@ impl AppState {
     /// Buffered composer text belongs to the draft that owned its key even if a
     /// server prompt opened before the short classification delay expired.
     pub fn handle_buffered_composer_text(&mut self, text: &str, pasted: bool) {
+        let before = self.composer_snapshot();
         self.disarm_quit();
         let old_text = self.editor.text();
         let binding_count = self.selected_completion_bindings.len();
@@ -6998,6 +7068,7 @@ impl AppState {
         self.insert_composer_text(text, pasted);
         self.command_selection = 0;
         self.sync_selected_completion_bindings(&old_text, binding_count);
+        self.record_composer_edit(before);
     }
 
     #[cfg(test)]
@@ -7193,6 +7264,7 @@ impl AppState {
         if self.pending.is_some() {
             return false;
         }
+        let before = self.composer_snapshot();
         let mut first_image = None;
         let mut images = 0;
         let mut seen = 0;
@@ -7219,6 +7291,7 @@ impl AppState {
         }
         self.command_selection = 0;
         self.disarm_quit();
+        self.record_composer_edit(before);
         true
     }
 
@@ -7273,11 +7346,34 @@ impl AppState {
         if !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)) {
             self.disarm_quit();
         }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.pending.is_none()
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && ctrl
+            && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char('z' | 'ㅋ' | 'y' | 'ㅛ'))
+        {
+            self.restore_composer_edit(matches!(key.code, KeyCode::Char('y' | 'ㅛ')));
+            return Action::None;
+        }
+        let before = self.composer_snapshot();
         let old_text = self.editor.text();
         let binding_count = self.selected_completion_bindings.len();
         let action = self.handle_key_inner(key);
         if !matches!(action, Action::Submit(_) | Action::Steer(_) | Action::RunShell(_)) {
             self.sync_selected_completion_bindings(&old_text, binding_count);
+        }
+        if matches!(action, Action::Submit(_) | Action::Steer(_) | Action::RunShell(_))
+            || (key.code == KeyCode::Enter && !self.editor.matches_snapshot(&before.composer)
+                && self.editor.is_empty())
+            || (self.pending.is_none()
+                && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                && ctrl && matches!(key.code, KeyCode::Char('s' | 'ㄴ')))
+        {
+            self.composer_undo.clear();
+            self.composer_redo.clear();
+        } else {
+            self.record_composer_edit(before);
         }
         action
     }
@@ -7665,10 +7761,6 @@ impl AppState {
             }
             KeyCode::Char('u') if ctrl => {
                 self.delete_from_composer(Editor::delete_to_line_start);
-                Action::None
-            }
-            KeyCode::Char('y') if ctrl => {
-                self.editor.yank();
                 Action::None
             }
             // Ctrl+S sets the draft aside, as it does in the CLI, and brings it
@@ -9535,7 +9627,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex] MODEL  Select a provider and model\nFor OpenCode, switch with /provider opencode, then select a model with /model\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|researcher|goal-runner]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
+                    format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex] MODEL  Select a provider and model\nFor OpenCode, switch with /provider opencode, then select a model with /model\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|researcher|goal-runner]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+Z / Ctrl+Y  입력 실행 취소·다시 실행\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
                 ));
                 Action::None
             }
@@ -9990,6 +10082,17 @@ impl AppState {
             "/side-panel" => {
                 self.committed
                     .push(Block::new(BlockKind::Error, "Usage", "/side-panel"));
+                Action::None
+            }
+            "/worktree" if self.busy || self.side_parent.is_some() => {
+                self.push_notice(BlockKind::Warning, "진입 불가", "응답을 중단하고 기본 대화에서 /worktree를 실행하세요.");
+                Action::None
+            }
+            "/worktree" if parts.len() <= 2 => {
+                Action::Worktree(parts.get(1).map(|name| (*name).to_owned()))
+            }
+            "/worktree" => {
+                self.push_notice(BlockKind::Error, "사용법", "/worktree [이름]");
                 Action::None
             }
             "/new" | "/clear" if self.busy => {
@@ -17114,6 +17217,134 @@ mod tests {
     }
 
     #[test]
+    fn composer_undo_redo_restores_unicode_and_cursor() {
+        let mut state = test_state();
+        state.handle_buffered_composer_text("한글🙂", false);
+        state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(state.editor.text(), "한🙂");
+        state.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert_eq!(state.editor.text(), "한글🙂");
+        assert_eq!(state.editor.display_cursor(), 2);
+        state.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!(state.editor.text(), "한🙂");
+        assert_eq!(state.editor.display_cursor(), 1);
+    }
+
+    #[test]
+    fn composer_undo_redo_restores_paste_and_attachment_selection() {
+        let mut state = test_state();
+        let paste = "one\ntwo\nthree\nfour\nfive\nsix";
+        state.handle_paste(paste);
+        state.attach_local_image("image.png".to_owned());
+        state.delete_composer_selection(0..state.editor.chars().len());
+        let undo = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        let redo = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL);
+        state.handle_key(undo);
+        assert_eq!(state.editor.text(), paste);
+        assert_eq!(state.editor.paste_summary_lines(), Some(6));
+        assert_eq!(state.composer_images, ["image.png"]);
+        state.handle_key(undo);
+        assert!(state.composer_images.is_empty());
+        state.handle_key(undo);
+        assert!(state.editor.is_empty());
+        state.handle_key(redo);
+        state.handle_key(redo);
+        assert_eq!(state.composer_images, ["image.png"]);
+        state.handle_key(redo);
+        assert!(state.editor.is_empty());
+        assert!(state.composer_images.is_empty());
+    }
+
+    #[test]
+    fn composer_undo_redo_new_edit_discards_redo_but_navigation_does_not() {
+        let mut state = test_state();
+        state.handle_paste("first");
+        state.handle_paste(" second");
+        state.handle_key(KeyEvent::new(KeyCode::Char('ㅋ'), KeyModifiers::CONTROL));
+        state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Char('ㅛ'), KeyModifiers::CONTROL));
+        assert_eq!(state.editor.text(), "first second");
+        state.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        state.editor.move_end();
+        state.handle_buffered_composer_text(" third", false);
+        state.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!(state.editor.text(), "first third");
+    }
+
+    #[test]
+    fn composer_undo_redo_does_not_restore_a_submitted_shell_command() {
+        let mut state = test_state();
+        state.handle_paste("!echo hello");
+        state.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert!(!state.shell_mode);
+        state.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert!(state.shell_mode);
+        assert!(matches!(state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Action::RunShell(_)));
+        state.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert!(state.editor.is_empty());
+        assert!(!state.shell_mode);
+    }
+
+    #[test]
+    fn composer_undo_redo_ignores_release_and_blocking_prompt() {
+        let mut state = test_state();
+        state.handle_paste("draft");
+        let mut undo = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        undo.kind = KeyEventKind::Release;
+        state.handle_key(undo);
+        assert_eq!(state.editor.text(), "draft");
+        state.open_runtime_picker();
+        undo.kind = KeyEventKind::Press;
+        state.handle_key(undo);
+        assert_eq!(state.editor.text(), "draft");
+    }
+
+    #[test]
+    fn composer_undo_redo_restores_completion_binding() {
+        let mut state = composer_completion_state();
+        state.handle_paste("@rev");
+        state.handle_key(KeyEvent::from(KeyCode::Enter));
+        let completed = state.editor.text();
+        let count = state.selected_completion_bindings.len();
+        assert!(count > 0);
+        state.delete_composer_selection(0..state.editor.chars().len());
+        assert!(state.selected_completion_bindings.is_empty());
+        state.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert_eq!(state.editor.text(), completed);
+        assert_eq!(state.selected_completion_bindings.len(), count);
+        assert!(state.selected_completion_bindings.iter().all(|binding| binding.matches_text(state.editor.chars())));
+    }
+
+    #[test]
+    fn composer_undo_redo_stash_and_new_thread_clear_history() {
+        let mut state = test_state();
+        state.handle_paste("draft");
+        state.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        state.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert!(state.editor.is_empty());
+        state.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(state.editor.text(), "draft");
+        state.handle_paste(" text");
+        state.prepare_new_thread();
+        assert!(state.composer_undo.is_empty());
+        assert!(state.composer_redo.is_empty());
+    }
+
+    #[test]
+    fn composer_undo_redo_history_is_bounded_and_empty_is_noop() {
+        let mut state = test_state();
+        let undo = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        state.handle_key(undo);
+        for _ in 0..105 {
+            state.handle_buffered_composer_text("x", false);
+        }
+        assert_eq!(state.composer_undo.len(), 100);
+        for _ in 0..105 { state.handle_key(undo); }
+        assert_eq!(state.editor.text(), "xxxxx");
+    }
+
+    #[test]
     fn ctrl_a_asks_for_a_full_selection_only_when_the_composer_has_text() {
         let mut state = test_state();
         let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
@@ -20656,6 +20887,19 @@ mod tests {
     }
 
     /// `/clear`는 `/new`의 별칭이고, Ctrl+L에는 더 이상 아무 동작도 걸려 있지 않다.
+    #[test]
+    fn worktree_command_parses_optional_name_and_blocks_busy_sessions() {
+        let mut state = test_state();
+        assert!(matches!(state.run_slash_command("/worktree"), Action::Worktree(None)));
+        assert!(matches!(state.run_slash_command("/worktree feature/login"), Action::Worktree(Some(name)) if name == "feature/login"));
+        assert!(matches!(state.run_slash_command("/worktree one two"), Action::None));
+        state.busy = true;
+        assert!(matches!(state.run_slash_command("/worktree"), Action::None));
+        state.busy = false;
+        state.restore_side_parent("parent".to_owned(), None);
+        assert!(matches!(state.run_slash_command("/worktree named"), Action::None));
+    }
+
     #[test]
     fn clear_starts_a_new_conversation_and_ctrl_l_does_nothing() {
         let mut state = test_state();
@@ -26763,7 +27007,7 @@ mod tests {
                 .chars()
                 .iter()
                 .all(|&ch| ch != ATTACHMENT_PLACEHOLDER),
-            "yank must not restore an attachment without its image"
+            "redo without undo must not restore an attachment"
         );
     }
 

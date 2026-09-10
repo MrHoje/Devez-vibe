@@ -119,7 +119,7 @@ dvz update
 - `$`로 Plugin·Skill·App을, `@`로 Plugin·Skill·파일·폴더를 검색하고
   Codex와 같은 표기로 입력하는 composer 자동완성
 - `Ctrl+Backspace`/`Ctrl+W` 단어 삭제, `Ctrl+K`/`Ctrl+U` 줄 삭제,
-  `Ctrl+Y` 복원, `Alt+B`/`Alt+F` 단어 이동, `Ctrl+J` 줄바꿈
+  `Ctrl+Z` 실행 취소, `Ctrl+Y` 다시 실행, `Alt+B`/`Alt+F` 단어 이동, `Ctrl+J` 줄바꿈
 - `/exit`을 `/quit`과 같은 정상 종료 명령으로 지원
 
 ### 렌더링

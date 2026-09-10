@@ -28,6 +28,7 @@ mod terminal_width;
 mod terminal_graphics;
 mod theme;
 mod update;
+mod worktree;
 
 use std::{
     env, fs,
@@ -2630,6 +2631,29 @@ async fn execute_action(
             }
         }
         Action::NewThread => return start_new_thread(server, state, renderer).await,
+        Action::Worktree(name) => {
+            let cwd = PathBuf::from(&state.cwd);
+            let result = await_with_activity(state, renderer, async move {
+                tokio::task::spawn_blocking(move || worktree::create(&cwd, name.as_deref())).await?
+            })
+            .await?;
+            match result {
+                Ok(path) => {
+                    let model = state.selected_model_name().to_owned();
+                    let effort = state.selected_effort().to_owned();
+                    state.attach_thread(
+                        String::new(),
+                        path.to_string_lossy().into_owned(),
+                        &model,
+                        Some(&effort),
+                    );
+                    return start_new_thread(server, state, renderer).await;
+                }
+                Err(error) => {
+                    state.push_notice(BlockKind::Error, "작업 트리 생성 실패", error.to_string());
+                }
+            }
+        }
         Action::OpenResume => open_resume_picker(server, state).await,
         Action::ResumeThread(target) => {
             return resume_thread(server, state, renderer, &target).await;
@@ -7759,6 +7783,25 @@ mod tests {
         assert!(!DEVEZ_INSTRUCTIONS.contains("TaskCreate"));
         for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS, CLAUDE_TURN_REMINDER] {
             assert!(!rules.contains("200자"));
+        }
+    }
+
+    #[test]
+    fn worktree_new_thread_uses_destination_for_provider_requests() {
+        let mut state = starting_state();
+        let model = state.selected_model_name().to_owned();
+        let effort = state.selected_effort().to_owned();
+        let cwd = "C:/repo.worktrees/main-worktree-1";
+        state.attach_thread(String::new(), cwd.to_owned(), &model, Some(&effort));
+        state.prepare_new_thread();
+        state.begin_thread_switch();
+        assert!(state.thread_pending());
+        assert_eq!(state.cwd, cwd);
+        assert_eq!(state.selected_model_name(), model);
+        for provider in ["gpt-5.6-sol", "claude:sonnet"] {
+            let params = new_thread_params(&state.cwd, Some(provider), None, "clear", "low", "default", &effort);
+            assert_eq!(params["cwd"], cwd);
+            assert_eq!(params["model"], provider);
         }
     }
 
