@@ -10,3 +10,28 @@
 /docs/superpowers/
 /.worktrees/
 /.playwright-mcp/
+
+# 설치 의존성, Python 캐시, 개인 세션 상태
+node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+/.hoje/
+/generated-images/
+
+# 산출물은 기본 제외하고 재사용 기준·검사 근거만 보존한다.
+/artifacts/*
+!/artifacts/codex-compatibility/
+/artifacts/codex-compatibility/*
+!/artifacts/codex-compatibility/baseline-version.txt
+!/artifacts/codex-compatibility/schema.ts
+!/artifacts/knowledge-search-evaluation/
+/artifacts/knowledge-search-evaluation/*
+!/artifacts/knowledge-search-evaluation/README.md
+!/artifacts/knowledge-search-evaluation/document-audit.md
+!/artifacts/knowledge-search-evaluation/check_documents.py
+!/artifacts/knowledge-search-evaluation/evaluate.ps1
+!/artifacts/knowledge-search-evaluation/results.json
+!/artifacts/knowledge-search-evaluation/results-current.json
+/tools/opentui-panel-probe/

@@ -1,5 +1,9 @@
 # DevezVibe 4종 에이전트 시스템 상세 구현 계획서
 
+> 과거 설계 기록이다. 아래 `Standard`·`Planner`·`Advisor`·`Finisher`, Research 제외, 일회성 reset 설명은 초기안의 용어와 결정이다. 현재 구현 지침으로 적용하지 않는다.
+>
+> 2026-09-11 소스의 내장 역할은 Builder·Planner·Researcher·Reviewer·Goal Runner이며, 모든 역할은 매 턴 지침을 전달한다. 현재 기준은 [역할 확장](에이전트-역할-확장-주의.md), [역할 파일 규격](custom-agent-roles.md), [지침 검증](지침-축약-검증.md)과 [src/agent.rs](../src/agent.rs)를 따른다.
+
 > 문서 상태: **2차 재검수 완료본**  
 > 대상 기능: `Standard`, `Planner`, `Advisor`, `Finisher`  
 > 기준 저장소: `MrHoje/Devez-vibe` `main`  

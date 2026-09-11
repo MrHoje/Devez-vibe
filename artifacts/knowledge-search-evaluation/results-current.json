@@ -1,0 +1,238 @@
+﻿{
+    "documentCount":  16,
+    "indexSha256":  "20B0714C3A72E6723CE66517C28EE4CE64504C797332C5B3670BFD3287CB9D4C",
+    "cases":  [
+                  {
+                      "question":  "새 버전을 배포할 때 무엇을 바꿔야 하나?",
+                      "pattern":  "배포|버전",
+                      "expected":  "배포-버전-갱신.md",
+                      "indexCandidates":  [
+                                              "Claude-Agent-SDK-호환성-업데이트.md",
+                                              "Codex-CLI-호환성-업데이트.md",
+                                              "배포-버전-갱신.md",
+                                              "2026-09-05-supervibe-response-all-prompt-toggle.md"
+                                          ],
+                      "indexFound":  true,
+                      "bodyCandidates":  [
+                                             "배포-버전-갱신.md",
+                                             "Claude-Agent-SDK-호환성-업데이트.md",
+                                             "Codex-CLI-호환성-업데이트.md",
+                                             "2026-09-05-supervibe-response-all-prompt-toggle.md",
+                                             "자동-지식-기록과-검색.md",
+                                             "agent-system-implementation-plan.md",
+                                             "지침-축약-검증.md",
+                                             "custom-agent-roles.md",
+                                             "Windows-호스트-통합-주의.md",
+                                             "한글-글리프-깨짐-진단.md",
+                                             "토큰사용량-단가-갱신.md"
+                                         ],
+                      "bodyFound":  true,
+                      "evidence":  [
+                                       "1:# Devez Vibe 배포 버전 갱신 절차"
+                                   ]
+                  },
+                  {
+                      "question":  "토큰 사용량 단가는 어디에서 바꾸나?",
+                      "pattern":  "토큰|단가",
+                      "expected":  "토큰사용량-단가-갱신.md",
+                      "indexCandidates":  [
+                                              "토큰사용량-단가-갱신.md",
+                                              "지침-축약-검증.md"
+                                          ],
+                      "indexFound":  true,
+                      "bodyCandidates":  [
+                                             "배포-버전-갱신.md",
+                                             "Codex-CLI-호환성-업데이트.md",
+                                             "Claude-Agent-SDK-호환성-업데이트.md",
+                                             "builder-ponytail.md",
+                                             "지침-축약-검증.md",
+                                             "토큰사용량-단가-갱신.md",
+                                             "컨텍스트-표시-복원.md"
+                                         ],
+                      "bodyFound":  true,
+                      "evidence":  [
+                                       "1:# 토큰 사용량 비용($) 단가 — 갱신 프로세스"
+                                   ]
+                  },
+                  {
+                      "question":  "세션을 재개하면 컨텍스트 사용량이 왜 0인가?",
+                      "pattern":  "재개|컨텍스트",
+                      "expected":  "컨텍스트-표시-복원.md",
+                      "indexCandidates":  [
+                                              "Claude-Agent-SDK-호환성-업데이트.md",
+                                              "컨텍스트-표시-복원.md"
+                                          ],
+                      "indexFound":  true,
+                      "bodyCandidates":  [
+                                             "배포-버전-갱신.md",
+                                             "Codex-CLI-호환성-업데이트.md",
+                                             "Claude-Agent-SDK-호환성-업데이트.md",
+                                             "builder-ponytail.md",
+                                             "agent-system-implementation-plan.md",
+                                             "지침-축약-검증.md",
+                                             "컨텍스트-표시-복원.md",
+                                             "토큰사용량-단가-갱신.md"
+                                         ],
+                      "bodyFound":  true,
+                      "evidence":  [
+                                       "1:# 컨텍스트 표시 복원 기준"
+                                   ]
+                  },
+                  {
+                      "question":  "링크 뒤 문장이 늦게 나타나는 이유는?",
+                      "pattern":  "링크|늦게",
+                      "expected":  "스트리밍-링크-지연.md",
+                      "indexCandidates":  [
+                                              "스트리밍-링크-지연.md"
+                                          ],
+                      "indexFound":  true,
+                      "bodyCandidates":  [
+                                             "배포-버전-갱신.md",
+                                             "스트리밍-링크-지연.md",
+                                             "지침-축약-검증.md"
+                                         ],
+                      "bodyFound":  true,
+                      "evidence":  [
+                                       "1:# 스트리밍 링크의 표시 지연"
+                                   ]
+                  },
+                  {
+                      "question":  "한글이 다른 글자로 깨져 보이면 어떻게 진단하나?",
+                      "pattern":  "한글|깨져",
+                      "expected":  "한글-글리프-깨짐-진단.md",
+                      "indexCandidates":  [
+                                              "한글-글리프-깨짐-진단.md",
+                                              "Windows-호스트-통합-주의.md"
+                                          ],
+                      "indexFound":  true,
+                      "bodyCandidates":  [
+                                             "배포-버전-갱신.md",
+                                             "Codex-CLI-호환성-업데이트.md",
+                                             "지침-축약-검증.md",
+                                             "Windows-호스트-통합-주의.md",
+                                             "한글-글리프-깨짐-진단.md"
+                                         ],
+                      "bodyFound":  true,
+                      "evidence":  [
+                                       "1:# 한글(전각) 글리프 깨짐 — 진단과 수정"
+                                   ]
+                  },
+                  {
+                      "question":  "사용자 정의 역할을 추가할 때 주의점은?",
+                      "pattern":  "사용자 정의|역할",
+                      "expected":  "에이전트-역할-확장-주의.md",
+                      "indexCandidates":  [
+                                              "에이전트-역할-확장-주의.md",
+                                              "custom-agent-roles.md",
+                                              "지침-축약-검증.md",
+                                              "agent-system-implementation-plan.md"
+                                          ],
+                      "indexFound":  true,
+                      "bodyCandidates":  [
+                                             "배포-버전-갱신.md",
+                                             "Codex-CLI-호환성-업데이트.md",
+                                             "자동-지식-기록과-검색.md",
+                                             "Claude-Agent-SDK-호환성-업데이트.md",
+                                             "builder-ponytail.md",
+                                             "custom-agent-roles.md",
+                                             "에이전트-역할-확장-주의.md",
+                                             "한글-글리프-깨짐-진단.md",
+                                             "지침-축약-검증.md",
+                                             "agent-system-implementation-plan.md"
+                                         ],
+                      "bodyFound":  true,
+                      "evidence":  [
+                                       "1:# 에이전트 역할 확장 주의사항"
+                                   ]
+                  },
+                  {
+                      "question":  "Claude SDK를 올릴 때 호환성을 어떻게 확인하나?",
+                      "pattern":  "Claude.*SDK",
+                      "expected":  "Claude-Agent-SDK-호환성-업데이트.md",
+                      "indexCandidates":  [
+                                              "Claude-Agent-SDK-호환성-업데이트.md"
+                                          ],
+                      "indexFound":  true,
+                      "bodyCandidates":  [
+                                             "배포-버전-갱신.md",
+                                             "Codex-CLI-호환성-업데이트.md",
+                                             "Claude-Agent-SDK-호환성-업데이트.md",
+                                             "agent-system-implementation-plan.md",
+                                             "스트리밍-링크-지연.md",
+                                             "토큰사용량-단가-갱신.md"
+                                         ],
+                      "bodyFound":  true,
+                      "evidence":  [
+                                       "1:# Claude Agent SDK 호환성 업데이트 절차"
+                                   ]
+                  },
+                  {
+                      "question":  "비동기 질문에 답하지 않았는데 완료로 표시되는 이유는?",
+                      "pattern":  "비동기|질문|완료",
+                      "expected":  "Windows-호스트-통합-주의.md",
+                      "indexCandidates":  [
+                                              "Codex-CLI-호환성-업데이트.md",
+                                              "Windows-호스트-통합-주의.md"
+                                          ],
+                      "indexFound":  true,
+                      "bodyCandidates":  [
+                                             "배포-버전-갱신.md",
+                                             "Codex-CLI-호환성-업데이트.md",
+                                             "Claude-Agent-SDK-호환성-업데이트.md",
+                                             "2026-09-05-supervibe-response-all-prompt-toggle.md",
+                                             "자동-지식-기록과-검색.md",
+                                             "agent-system-implementation-plan.md",
+                                             "지침-축약-검증.md",
+                                             "Windows-호스트-통합-주의.md",
+                                             "스트리밍-링크-지연.md"
+                                         ],
+                      "bodyFound":  true,
+                      "evidence":  [
+                                       "5:- 답하지 않은 비동기 질문이 완료로 표시됨: 아래 「Codex 비동기 질문의 호스트 대기 상태」."
+                                   ]
+                  },
+                  {
+                      "question":  "한글 입력 뒤 영문이 덧붙는 현상은 왜 생기나?",
+                      "pattern":  "영문|덧붙",
+                      "expected":  "Windows-호스트-통합-주의.md",
+                      "indexCandidates":  [
+                                              "Windows-호스트-통합-주의.md"
+                                          ],
+                      "indexFound":  true,
+                      "bodyCandidates":  [
+                                             "배포-버전-갱신.md",
+                                             "Codex-CLI-호환성-업데이트.md",
+                                             "builder-ponytail.md",
+                                             "지침-축약-검증.md",
+                                             "Windows-호스트-통합-주의.md",
+                                             "한글-글리프-깨짐-진단.md"
+                                         ],
+                      "bodyFound":  true,
+                      "evidence":  [
+                                       "6:- 한글 입력 뒤 영문이 덧붙음·누름 없이 놓기 이벤트만 옴: 「ConPTY 입력 변환」."
+                                   ]
+                  },
+                  {
+                      "question":  "재배선 뒤 상태줄이 빈 채로 남는 이유는?",
+                      "pattern":  "재배선|상태줄",
+                      "expected":  "Windows-호스트-통합-주의.md",
+                      "indexCandidates":  [
+                                              "Windows-호스트-통합-주의.md"
+                                          ],
+                      "indexFound":  true,
+                      "bodyCandidates":  [
+                                             "custom-agent-roles.md",
+                                             "Windows-호스트-통합-주의.md",
+                                             "지침-축약-검증.md",
+                                             "한글-글리프-깨짐-진단.md"
+                                         ],
+                      "bodyFound":  true,
+                      "evidence":  [
+                                       "7:- 재배선 뒤 상태줄이 빈 채로 남음: 「호스트 재배선 뒤 상태줄만 빈 채 남는 증상」."
+                                   ]
+                  }
+              ],
+    "indexFound":  10,
+    "bodyFound":  10,
+    "scope":  "작성자가 구성한 고정 검색어의 후보 포함 여부. 순위·실제 제공자 준수율·임베딩 비교 아님."
+}

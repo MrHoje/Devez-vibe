@@ -1,0 +1,217 @@
+﻿{
+    "documentCount":  13,
+    "indexSha256":  "6E6866CC088CC6D5AD335E1F0A2F7EAEB8441C9D86254C9C07CE56BA066F2EB4",
+    "cases":  [
+                  {
+                      "question":  "새 버전을 배포할 때 무엇을 바꿔야 하나?",
+                      "pattern":  "배포|버전",
+                      "expected":  "배포-버전-갱신.md",
+                      "indexCandidates":  [
+                                              "배포-버전-갱신.md"
+                                          ],
+                      "indexFound":  true,
+                      "bodyCandidates":  [
+                                             "배포-버전-갱신.md",
+                                             "agent-system-implementation-plan.md",
+                                             "Codex-CLI-호환성-업데이트.md",
+                                             "Claude-Agent-SDK-호환성-업데이트.md",
+                                             "Windows-호스트-통합-주의.md",
+                                             "지침-축약-검증.md"
+                                         ],
+                      "bodyFound":  true,
+                      "evidence":  [
+                                       "1:# Devez Vibe 배포 버전 갱신 절차"
+                                   ]
+                  },
+                  {
+                      "question":  "토큰 사용량 단가는 어디에서 바꾸나?",
+                      "pattern":  "토큰|단가",
+                      "expected":  "토큰사용량-단가-갱신.md",
+                      "indexCandidates":  [
+                                              "토큰사용량-단가-갱신.md",
+                                              "지침-축약-검증.md"
+                                          ],
+                      "indexFound":  true,
+                      "bodyCandidates":  [
+                                             "builder-ponytail.md",
+                                             "Claude-Agent-SDK-호환성-업데이트.md",
+                                             "지침-축약-검증.md",
+                                             "토큰사용량-단가-갱신.md",
+                                             "Codex-CLI-호환성-업데이트.md",
+                                             "배포-버전-갱신.md"
+                                         ],
+                      "bodyFound":  true,
+                      "evidence":  [
+                                       "1:# 토큰 사용량 비용($) 단가 — 갱신 프로세스"
+                                   ]
+                  },
+                  {
+                      "question":  "세션을 재개하면 컨텍스트 사용량이 왜 0인가?",
+                      "pattern":  "재개|컨텍스트",
+                      "expected":  "컨텍스트-표시-복원.md",
+                      "indexCandidates":  [
+                                              "컨텍스트-표시-복원.md"
+                                          ],
+                      "indexFound":  true,
+                      "bodyCandidates":  [
+                                             "Claude-Agent-SDK-호환성-업데이트.md",
+                                             "builder-ponytail.md",
+                                             "지침-축약-검증.md",
+                                             "agent-system-implementation-plan.md",
+                                             "컨텍스트-표시-복원.md",
+                                             "토큰사용량-단가-갱신.md",
+                                             "Codex-CLI-호환성-업데이트.md",
+                                             "배포-버전-갱신.md"
+                                         ],
+                      "bodyFound":  true,
+                      "evidence":  [
+                                       "1:# 컨텍스트 표시 복원 기준"
+                                   ]
+                  },
+                  {
+                      "question":  "링크 뒤 문장이 늦게 나타나는 이유는?",
+                      "pattern":  "링크|늦게",
+                      "expected":  "스트리밍-링크-지연.md",
+                      "indexCandidates":  [
+                                              "스트리밍-링크-지연.md"
+                                          ],
+                      "indexFound":  true,
+                      "bodyCandidates":  [
+                                             "지침-축약-검증.md",
+                                             "스트리밍-링크-지연.md",
+                                             "배포-버전-갱신.md"
+                                         ],
+                      "bodyFound":  true,
+                      "evidence":  [
+                                       "1:# 스트리밍 링크의 표시 지연"
+                                   ]
+                  },
+                  {
+                      "question":  "한글이 다른 글자로 깨져 보이면 어떻게 진단하나?",
+                      "pattern":  "한글|깨져",
+                      "expected":  "한글-글리프-깨짐-진단.md",
+                      "indexCandidates":  [
+                                              "한글-글리프-깨짐-진단.md"
+                                          ],
+                      "indexFound":  true,
+                      "bodyCandidates":  [
+                                             "Windows-호스트-통합-주의.md",
+                                             "한글-글리프-깨짐-진단.md",
+                                             "지침-축약-검증.md",
+                                             "배포-버전-갱신.md",
+                                             "Codex-CLI-호환성-업데이트.md"
+                                         ],
+                      "bodyFound":  true,
+                      "evidence":  [
+                                       "1:# 한글(전각) 글리프 깨짐 — 진단과 수정"
+                                   ]
+                  },
+                  {
+                      "question":  "사용자 정의 역할을 추가할 때 주의점은?",
+                      "pattern":  "사용자 정의|역할",
+                      "expected":  "에이전트-역할-확장-주의.md",
+                      "indexCandidates":  [
+                                              "에이전트-역할-확장-주의.md",
+                                              "agent-system-implementation-plan.md",
+                                              "builder-ponytail.md",
+                                              "지침-축약-검증.md"
+                                          ],
+                      "indexFound":  true,
+                      "bodyCandidates":  [
+                                             "builder-ponytail.md",
+                                             "Claude-Agent-SDK-호환성-업데이트.md",
+                                             "agent-system-implementation-plan.md",
+                                             "한글-글리프-깨짐-진단.md",
+                                             "에이전트-역할-확장-주의.md",
+                                             "Codex-CLI-호환성-업데이트.md",
+                                             "지침-축약-검증.md",
+                                             "배포-버전-갱신.md"
+                                         ],
+                      "bodyFound":  true,
+                      "evidence":  [
+                                       "1:# 에이전트 역할 확장 주의사항"
+                                   ]
+                  },
+                  {
+                      "question":  "Claude SDK를 올릴 때 호환성을 어떻게 확인하나?",
+                      "pattern":  "Claude.*SDK",
+                      "expected":  "Claude-Agent-SDK-호환성-업데이트.md",
+                      "indexCandidates":  [
+                                              "Claude-Agent-SDK-호환성-업데이트.md"
+                                          ],
+                      "indexFound":  true,
+                      "bodyCandidates":  [
+                                             "Claude-Agent-SDK-호환성-업데이트.md",
+                                             "agent-system-implementation-plan.md",
+                                             "Codex-CLI-호환성-업데이트.md",
+                                             "배포-버전-갱신.md"
+                                         ],
+                      "bodyFound":  true,
+                      "evidence":  [
+                                       "1:# Claude Agent SDK 호환성 업데이트 절차"
+                                   ]
+                  },
+                  {
+                      "question":  "비동기 질문에 답하지 않았는데 완료로 표시되는 이유는?",
+                      "pattern":  "비동기|질문|완료",
+                      "expected":  "Windows-호스트-통합-주의.md",
+                      "indexCandidates":  [
+
+                                          ],
+                      "indexFound":  false,
+                      "bodyCandidates":  [
+                                             "Claude-Agent-SDK-호환성-업데이트.md",
+                                             "agent-system-implementation-plan.md",
+                                             "Windows-호스트-통합-주의.md",
+                                             "지침-축약-검증.md",
+                                             "스트리밍-링크-지연.md",
+                                             "Codex-CLI-호환성-업데이트.md",
+                                             "배포-버전-갱신.md"
+                                         ],
+                      "bodyFound":  true,
+                      "evidence":  [
+                                       "3:## Codex 비동기 질문의 호스트 대기 상태 — 2026-09-10"
+                                   ]
+                  },
+                  {
+                      "question":  "한글 입력 뒤 영문이 덧붙는 현상은 왜 생기나?",
+                      "pattern":  "영문|덧붙",
+                      "expected":  "Windows-호스트-통합-주의.md",
+                      "indexCandidates":  [
+
+                                          ],
+                      "indexFound":  false,
+                      "bodyCandidates":  [
+                                             "builder-ponytail.md",
+                                             "지침-축약-검증.md",
+                                             "Windows-호스트-통합-주의.md",
+                                             "Codex-CLI-호환성-업데이트.md",
+                                             "배포-버전-갱신.md"
+                                         ],
+                      "bodyFound":  true,
+                      "evidence":  [
+                                       "25:외부 터미널(Windows Terminal·conhost)에서는 한글 IME가 조합에 쓴 키의 누름을 가져가고 놓기만 통과시키며, `crossterm`은 놓기 이벤트의 빈 문자를 자판 배열로 되살려 영문 놓기 이벤트로 전달한다. 누름 없는 놓기를 Alt 코드로 보고 누름으로 되돌리면 음절 뒤에 마지막 키의 영문이 덧붙으므로, 외부 터미널에서는 ASCII 문자의 홀로 온 놓기를 되돌리지 않는다. DevezCode 호스트 경로는 텍스트를 직접 보내므로 이 규칙을 적용하지 않는다."
+                                   ]
+                  },
+                  {
+                      "question":  "재배선 뒤 상태줄이 빈 채로 남는 이유는?",
+                      "pattern":  "재배선|상태줄",
+                      "expected":  "Windows-호스트-통합-주의.md",
+                      "indexCandidates":  [
+
+                                          ],
+                      "indexFound":  false,
+                      "bodyCandidates":  [
+                                             "Windows-호스트-통합-주의.md",
+                                             "한글-글리프-깨짐-진단.md"
+                                         ],
+                      "bodyFound":  true,
+                      "evidence":  [
+                                       "29:## 호스트 재배선 뒤 상태줄만 빈 채 남는 증상"
+                                   ]
+                  }
+              ],
+    "indexFound":  7,
+    "bodyFound":  10,
+    "scope":  "작성자가 구성한 고정 검색어의 후보 포함 여부. 순위·실제 제공자 준수율·임베딩 비교 아님."
+}

@@ -2,7 +2,9 @@
 
 2026-07-27 커밋 `b4f1216`(feat: add OpenTUI panel rendering probe)에서 우측 도킹 정보 패널이
 완성 상태로 구현되었고, 같은 날 `60d5eff`(chore: preserve current renderer updates)에서 전량
-제거되었다. 현재 `main`에는 `print_line_with_selection_bounded`의 주석 한 줄만 남아 있다.
+제거되었다. 이 기록은 당시 도킹 정보 패널을 가리키며, 현재 앱의 설정 사이드패널 전체가 없다는 뜻이 아니다.
+
+2026-09-11 현재 설정·auto knowledge 표시는 [src/renderer.rs](../src/renderer.rs)와 [자동 지식 기록](자동-지식-기록과-검색.md)을 참조한다. 아래 코드 조각과 상수는 과거 구현의 보관본이다.
 
 이 문서는 재구현 시 참고할 핵심 조각을 원문 그대로 옮긴 것이다. 현재 렌더러와 구조가 달라
 그대로 붙여넣을 수 없으므로 설계 근거와 상수 값을 참고 대상으로 삼는다.
@@ -245,6 +247,6 @@ let info_panel_span = PaintSpan { /* mode.info_panel_open 에 따라 라벨 변�
 - `shift_p_toggles_the_info_panel_without_editing_the_composer`
 - `clicking_the_panel_badge_toggles_the_info_panel`
 
-## 8. 함께 남은 실험 도구
+## 8. 과거 실험 도구
 
-`tools/opentui-panel-probe/`는 같은 커밋에서 추가된 OpenTUI 패널 렌더링 확인용 Bun 스크립트다.
+`tools/opentui-panel-probe/`는 같은 커밋에서 추가된 OpenTUI 패널 렌더링 확인용 도구였다. 2026-09-11 점검 시 소스·패키지 선언 없이 `dist`와 `node_modules` 생성물만 남아 있어 Git 추적에서 제외했다. 재구현에 필요한 원본은 위 과거 커밋에서 확인하며, 로컬 생성물의 존재를 유지보수되는 소스가 있다는 뜻으로 해석하지 않는다.

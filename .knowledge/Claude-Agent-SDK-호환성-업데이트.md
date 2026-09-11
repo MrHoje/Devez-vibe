@@ -1,5 +1,7 @@
 # Claude Agent SDK 호환성 업데이트 절차
 
+2026-09-11 소스의 SDK 선언은 [npm/package.json](../npm/package.json)을 기준으로 한다. 아래 확인 기록의 '최신'·'미배포'는 해당 날짜의 상태다. SDK 0.3.267·사용량 조회 변경은 [배포 기록](배포-버전-갱신.md)의 1.8.18, 한도 자동 재개는 1.8.22 기록에 후속 결과가 있다. 이번 문서 점검에서는 공개 서비스나 설치본을 다시 조회하지 않았다.
+
 ## 목적
 
 Devez Vibe는 `@anthropic-ai/claude-agent-sdk`가 함께 배포하는 Claude Code 실행 파일을
@@ -29,10 +31,10 @@ Claude Agent SDK 업데이트 영향 확인해
    ```powershell
    npm pack @anthropic-ai/claude-agent-sdk@<버전>
    tar -xzf anthropic-ai-claude-agent-sdk-<버전>.tgz
-   diff -u npm/node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts package/sdk.d.ts
+   git diff --no-index -- <기존-sdk.d.ts-절대경로> <임시-폴더>/package/sdk.d.ts
    ```
 
-   사용자 눈에 보이는 변화는 `anthropics/claude-code`의 `CHANGELOG.md`로 함께 본다.
+   위 다운로드·압축 해제는 별도 임시 폴더에서 실행한다. `git diff --no-index`의 종료 코드 1은 차이가 있다는 뜻이다. 사용자 눈에 보이는 변화는 `anthropics/claude-code`의 `CHANGELOG.md`로 함께 본다.
 
 3. Devez Vibe에서 영향을 받을 지점을 대조한다.
 
@@ -61,7 +63,7 @@ Claude Agent SDK 업데이트 영향 확인해
 - 실시간 모델 목록 조회가 실패해도 선택할 수 있도록 `src/claude.rs`의 예비 모델 목록을 함께 갱신한다.
 - 새 모델 계열이면 브리지의 계열별 기능·표시명 정규화, 모델 검색 별칭, 렌더러 색상까지 함께 확인한다. 기존 계열이면 불필요한 분기를 추가하지 않는다.
 - 단가가 기존 계열과 다르면 `.knowledge/토큰사용량-단가-갱신.md` 절차를 따른다.
-- 검증 후 사용자는 전역 패키지를 갱신하고 `dvz`를 완전히 재시작해야 한다. 기존 세션은 기존 모델을 유지하므로 필요하면 `/model`에서 바꾼다.
+- 검증·배포 후에는 [배포 절차](배포-버전-갱신.md)에 따라 `dvz update`로 다음 실행 버전까지 전환하고 새 프로세스에서 확인한다. 기존 세션은 기존 모델을 유지하므로 필요하면 `/model`에서 바꾼다.
 
 ## 판단 기준
 

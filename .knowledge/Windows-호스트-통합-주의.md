@@ -1,5 +1,15 @@
 # Windows 호스트 통합 주의사항
 
+## 증상별 찾기
+
+- 답하지 않은 비동기 질문이 완료로 표시됨: 아래 「Codex 비동기 질문의 호스트 대기 상태」.
+- 한글 입력 뒤 영문이 덧붙음·누름 없이 놓기 이벤트만 옴: 「ConPTY 입력 변환」.
+- 재배선 뒤 상태줄이 빈 채로 남음: 「호스트 재배선 뒤 상태줄만 빈 채 남는 증상」.
+- 복사한 글자는 정상인데 화면 한글이 깨짐·이모지 폭이 밀림: [글리프 진단](한글-글리프-깨짐-진단.md).
+- 검색식 때문에 파일이 비워짐·배치 안 PowerShell이 오실행됨: 「cmd.exe 검색 명령」과 「배치 파일 안의 PowerShell 본문」.
+
+아래 배포·미배포 표현은 당시 기록이다. 비동기 질문 변경의 최종 배포는 같은 절의 Vibe 1.8.23·DevezCode 1.27.2 기록을 함께 읽는다. 현재 확인 위치는 [src/devezcode.rs](../src/devezcode.rs), [src/input_hub.rs](../src/input_hub.rs), [호스트 상태 검사](../scripts/test-devezcode-question-state.mjs)다.
+
 ## Codex 비동기 질문의 호스트 대기 상태 — 2026-09-10
 
 - 비동기 질문은 제공자 턴이 종료되어도 `AppState.awaiting_input()`이 참이다. `busy=false`만 호스트에 전달하면 DevezCode가 대기 표시를 지우고 완료로 처리한다. `src/devezcode.rs`는 미응답 질문도 호스트의 `running` 상태로 유지한다. 실제 제공자 `busy` 값은 바꾸지 않는다.
