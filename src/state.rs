@@ -8256,20 +8256,6 @@ impl AppState {
         Action::CancelUserInput { id, interrupt }
     }
 
-    fn cancel_visible_question(&mut self, id: Value, questions: &[Question]) -> Action {
-        let body = questions.iter().map(|question| {
-            let options = question.options.iter().map(|option| option.label.as_str())
-                .collect::<Vec<_>>().join(" / ");
-            if options.is_empty() {
-                question.question.clone()
-            } else {
-                format!("{} ({options})", question.question)
-            }
-        }).collect::<Vec<_>>().join("\n");
-        self.push_notice(BlockKind::Warning, "질문 답변 취소", body);
-        self.cancel_user_question(id)
-    }
-
     fn flush_before_question(&mut self) {
         self.flush_stream_text();
         self.held_final_frame_ticks = 0;
@@ -11290,7 +11276,7 @@ impl AppState {
                 if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c')) {
                     // Esc와 Ctrl+C는 답을 보내지 않고 턴을 멈춘다. 빈 답을
                     // 돌려주면 도구가 성공한 셈이 되어 턴이 그대로 이어진다.
-                    return self.cancel_visible_question(id, &questions);
+                    return self.cancel_user_question(id);
                 }
 
                 let question = &questions[current];
@@ -11421,7 +11407,7 @@ impl AppState {
                             // Leaving the question is cancellation, not an empty
                             // successful answer that could resume execution.
                             if selected == chat_instead {
-                                return self.cancel_visible_question(id, &questions);
+                                return self.cancel_user_question(id);
                             }
                             // Focusing the free-text row is enough. The next key is
                             // input immediately; no hidden Enter-only mode exists.
@@ -13886,7 +13872,7 @@ impl AppState {
                             next_question_or_reply(id, questions, current, answers, self)
                         }
                     }
-                    Some(clicked) if clicked == chat_instead => self.cancel_visible_question(id, &questions),
+                    Some(clicked) if clicked == chat_instead => self.cancel_user_question(id),
                     Some(clicked) if clicked == question.options.len() && question.allow_other => {
                         self.pending = Some(PendingInteraction::UserInput {
                             id,

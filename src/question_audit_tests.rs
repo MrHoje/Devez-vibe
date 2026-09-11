@@ -190,7 +190,7 @@ fn esc_during_start_resumes_queue_only_after_the_deferred_stop() {
 }
 
 #[test]
-fn esc_question_keeps_one_cancellation_record_without_answering() {
+fn esc_question_cancels_without_answering_or_recording() {
     for asynchronous in [false, true] {
         for stopped in [false, true] {
             let mut state = busy_state_with_live_turn();
@@ -210,12 +210,7 @@ fn esc_question_keeps_one_cancellation_record_without_answering() {
             let action = state.handle_key(KeyEvent::from(KeyCode::Esc));
             assert!(matches!(action, Action::CancelUserInput { .. } | Action::None));
             assert!(!state.awaiting_input());
-            let records = state.drain_committed().into_iter()
-                .filter(|block| block.title == "질문 답변 취소").collect::<Vec<_>>();
-            assert_eq!(records.len(), 1);
-            assert_eq!(records[0].title, "질문 답변 취소");
-            assert_eq!(records[0].body, "어느 색인가요? (빨강 / 파랑)\n이유를 적어 주세요");
-            assert!(matches!(records[0].kind, BlockKind::Warning));
+            assert!(state.drain_committed().iter().all(|block| block.title != "질문 답변 취소"));
             state.handle_key(KeyEvent::from(KeyCode::Esc));
             state.handle_notification("turn/completed", &json!({"turn": {"id": "live-turn", "status": "interrupted"}}));
             state.flush_before_question();

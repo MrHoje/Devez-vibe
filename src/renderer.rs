@@ -24664,32 +24664,6 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_question_record_paints_question_and_options() {
-        use crossterm::event::{KeyCode, KeyEvent};
-        for model in ["claude:opus", "gpt-5.6-sol"] {
-            let mut state = crate::state::AppState::new(
-                "thread".into(), "cwd".into(), "account".into(), Vec::new(), model, None,
-            );
-            state.set_turn_started("turn".into());
-            state.begin_server_request(serde_json::json!(7), "item/tool/requestUserInput", &serde_json::json!({
-                "questions": [{"id": "q", "question": "어느 색인가요?",
-                    "options": [{"label": "빨강"}, {"label": "파랑"}]}]
-            }));
-            state.handle_key(KeyEvent::from(KeyCode::Esc));
-            let records = state.drain_committed();
-            let cancelled = records.iter().find(|block| block.title == "질문 답변 취소").unwrap();
-            for width in [30, 80] {
-                let rows = block_lines(cancelled, width).iter().map(painted).collect::<Vec<_>>().join("\n");
-                assert!(rows.contains("질문 답변 취소"));
-                assert!(rows.contains("어느 색인가요?"));
-                assert!(rows.contains("빨강"));
-                assert!(rows.contains("파랑"));
-                assert!(!rows.contains("↳"), "취소한 질문이 선택된 답변으로 표시됨");
-            }
-        }
-    }
-
-    #[test]
     fn question_answer_cards_keep_multiline_text_and_multiple_pairs_separate() {
         let block = Block::question_answers(vec![
             ("첫 질문\n추가 설명".into(), "첫 답변\n\n  ↳ 직접 입력한 문구".into()),
