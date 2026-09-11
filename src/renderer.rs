@@ -11422,14 +11422,16 @@ fn question_answer_lines(block: &Block, width: u16, history: Option<(u64, &str, 
     for (index, pair) in block.children.iter().enumerate() {
         if index > 0 { lines.push(PaintLine::blank()); }
         let last = index + 1 == block.children.len();
-        lines.extend(question_card_lines(
-            &pair.title,
-            chrome_model_tone(&block.title).unwrap_or(Tone::Accent),
-            width,
-            history.filter(|_| last),
-            last.then(|| block.response_duration()).flatten(),
-            last.then_some(block.response_agent).flatten(),
-        ));
+        let mut question = pair.clone();
+        question.body = pair.title.clone();
+        question.title = block.title.clone();
+        if last {
+            question.response_duration = block.response_duration;
+            question.response_agent = block.response_agent;
+        }
+        let mut question_lines = user_prompt_lines_with_history(&question, width, history.filter(|_| last), false);
+        if last && history.is_some() { question_lines.pop(); }
+        lines.extend(question_lines);
         let mut answer = pair.clone();
         answer.title = block.title.clone();
         let answer_lines = user_prompt_lines_with_history(&answer, width - indent as u16, None, false);
@@ -11458,51 +11460,6 @@ fn question_answer_lines(block: &Block, width: u16, history: Option<(u64, &str, 
     for line in &mut lines {
         if matches!(line.tone, Tone::UserPrompt | Tone::UserPromptPadding) {
             line.tail.push(PaintSpan { text: String::new(), tone: Tone::UserPrompt, bold: false });
-        }
-    }
-    lines
-}
-
-/// 질문은 답변 상자와 달리 Updated Plan 카드처럼 테두리만 둘러 그린다. 테두리
-/// 색은 보낸 시점의 모델 색을 그대로 쓰고, 응답 기록 라벨과 소요 시간은 아래
-/// 테두리의 오른쪽에 얹어 본문 폭을 줄이지 않는다.
-fn question_card_lines(
-    text: &str,
-    border_tone: Tone,
-    width: u16,
-    history: Option<(u64, &str, bool)>,
-    response_duration: Option<Duration>,
-    response_agent: Option<AgentMode>,
-) -> Vec<PaintLine> {
-    let line_width = usize::from(width).saturating_sub(1).max(4);
-    // 테두리는 글자가 아니라 줄의 머리이므로 prefix에 둔다. 그러면 모델 색은
-    // 기존 세로선처럼 prefix_tone에 남고 본문 톤은 모델과 무관하게 유지된다.
-    let border = |rule: String| PaintLine {
-        prefix: rule,
-        prefix_tone: border_tone,
-        ..PaintLine::blank()
-    };
-    let mut lines = vec![border(format!("┌{}┐", "─".repeat(line_width - 2)))];
-    for row in text.lines() {
-        lines.extend(wrapped_line("  ", border_tone, row, Tone::Plain, false, line_width as u16));
-    }
-    let footer = prompt_footer_spans(history, response_duration, response_agent);
-    let footer_width = footer
-        .iter()
-        .map(|span| UnicodeWidthStr::width(span.text.as_str()))
-        .sum::<usize>();
-    if footer_width > 0 && footer_width + 5 <= line_width {
-        let mut bottom = border(format!("└{}", "─".repeat(line_width - footer_width - 5)));
-        bottom.tail.push(PaintSpan { text: " ".to_owned(), tone: border_tone, bold: false });
-        bottom.tail.extend(footer);
-        bottom.tail.push(PaintSpan { text: " ─┘".to_owned(), tone: border_tone, bold: false });
-        lines.push(bottom);
-    } else {
-        lines.push(border(format!("└{}┘", "─".repeat(line_width - 2))));
-    }
-    if let Some((group_id, _, _)) = history {
-        for line in &mut lines {
-            line.pick = Some(PickRegions::span(0, line_width, Pick::History(group_id)));
         }
     }
     lines
@@ -24688,8 +24645,7 @@ mod tests {
             let indent = usize::from(width.saturating_sub(8)).min(6);
             let arrow = lines.iter().position(|line| line.prefix.contains("└─▶ ")).unwrap();
             assert!(arrow > 0);
-            assert!(painted(&lines[0]).starts_with('┌') && painted(&lines[0]).ends_with('┐'));
-            assert!(painted(&lines[arrow - 2]).starts_with('└'));
+            assert_eq!(lines.iter().filter(|line| line.tone == Tone::UserPromptPadding).count(), 2);
             assert_eq!(lines.iter().filter(|line| line.tone == Tone::UserPromptHalf).count(), 2);
             if width == 80 {
                 assert_eq!(lines.len(), 6);
@@ -24728,7 +24684,7 @@ mod tests {
                 assert_eq!(frame.cell(indent + 1, row).style.foreground, Some(theme::palette().user_prompt_bg));
                 assert_eq!(frame.cell(indent + 1, row).style.background, None);
             }
-            assert_eq!(frame.cell(indent - 4, arrow - 2).glyph, if indent == 4 { "└" } else { "─" });
+            assert_eq!(frame.cell(indent - 4, arrow - 2).glyph, if indent == 4 { "▌" } else { " " });
             for row in [arrow - 1] {
                 assert_eq!(frame.cell(indent - 4, row).glyph, "╷");
                 assert_eq!(frame.cell(indent - 4, row).style.background, None);
