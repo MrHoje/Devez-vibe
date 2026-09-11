@@ -10,6 +10,13 @@
 
 아래 배포·미배포 표현은 당시 기록이다. 비동기 질문 변경의 최종 배포는 같은 절의 Vibe 1.8.23·DevezCode 1.27.2 기록을 함께 읽는다. 현재 확인 위치는 [src/devezcode.rs](../src/devezcode.rs), [src/input_hub.rs](../src/input_hub.rs), [호스트 상태 검사](../scripts/test-devezcode-question-state.mjs)다.
 
+## 질문 모서리 보정과 일반 이미지 출력의 차이 — 2026-09-10
+
+- DevezVibe `c9a0250`과 DevezCode `9bb5b95`는 2026-09-09에 각각 모서리 보정을 추가했다. DevezCode `a9321df`에는 해당 보정의 1.26.26 배포 버전 변경이 있다. 원격 배포 상태는 이 조사에서 조회하지 않았다.
+- Vibe의 `src/input_hub.rs::query_graphics`는 Windows Terminal 환경과 Sixel 지원 응답을 확인하며, `src/terminal_graphics.rs`는 모서리 한 칸을 3색 Sixel로 만든다.
+- DevezCode의 `Resources/Terminal/web/devez-question-corners.js`는 Sixel을 해석하지 않는다. 특정 문자·RGB 조합을 찾아 CSS 배경으로 모서리를 덮으며 `terminal.html`에서 설치한다. 일반 JPG 출력 기능으로 간주하면 안 된다.
+- 현재 구조에서 응답 영역에 일반 JPG를 표시하려면 Vibe의 이미지 전달·출력과 DevezCode의 이미지 수신·렌더링을 모두 확장해야 한다.
+
 ## Codex 비동기 질문의 호스트 대기 상태 — 2026-09-10
 
 - 비동기 질문은 제공자 턴이 종료되어도 `AppState.awaiting_input()`이 참이다. `busy=false`만 호스트에 전달하면 DevezCode가 대기 표시를 지우고 완료로 처리한다. `src/devezcode.rs`는 미응답 질문도 호스트의 `running` 상태로 유지한다. 실제 제공자 `busy` 값은 바꾸지 않는다.
