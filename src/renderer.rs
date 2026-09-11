@@ -4528,6 +4528,14 @@ fn paint_line_into_frame(
         text_hovered_columns,
     );
     }
+    // 기록 띠는 집기 영역 안에서만 칠한다. 질문 줄처럼 오른쪽 라벨만 집는
+    // 줄은 본문까지 프롬프트 배경으로 물들면 안 된다.
+    let within_history = |column: usize| {
+        history_columns
+            .as_ref()
+            .is_some_and(|columns| column >= columns.start && column < columns.end)
+    };
+    let text_start = column;
     paint_text_into_frame(
         frame,
         row,
@@ -4535,7 +4543,7 @@ fn paint_line_into_frame(
         &mut column,
         line.tone,
         line.bold,
-        history_background.or_else(|| {
+        history_background.filter(|_| within_history(text_start)).or_else(|| {
             word_background(line.tone)
                 .or(bubble_background)
                 .or(background)
@@ -4547,6 +4555,7 @@ fn paint_line_into_frame(
         if span.tone == Tone::CopyJoin {
             continue;
         }
+        let span_start = column;
         let is_outer_right = boxed_content.is_some() && index + 1 == line.tail.len();
         let span_background = if is_outer_right {
             word_background(span.tone)
@@ -4562,7 +4571,7 @@ fn paint_line_into_frame(
             &mut column,
             span.tone,
             span.bold,
-            history_background.or(span_background),
+            history_background.filter(|_| within_history(span_start)).or(span_background),
             selected_columns.as_ref(),
             text_hovered_columns,
         );
@@ -11422,15 +11431,34 @@ fn question_answer_lines(block: &Block, width: u16, history: Option<(u64, &str, 
     for (index, pair) in block.children.iter().enumerate() {
         if index > 0 { lines.push(PaintLine::blank()); }
         let last = index + 1 == block.children.len();
-        let mut question = pair.clone();
-        question.body = pair.title.clone();
-        question.title = block.title.clone();
-        if last {
-            question.response_duration = block.response_duration;
-            question.response_agent = block.response_agent;
+        // 질문 줄은 배경도 테두리도 없이 응답 줄과 같은 불릿으로 시작하고, 기록
+        // 라벨은 줄을 늘리지 않도록 마지막 질문 줄의 오른쪽 끝에 얹는다.
+        let history = history.filter(|_| last);
+        let mut question_lines = pair
+            .title
+            .lines()
+            .enumerate()
+            .flat_map(|(row, text)| {
+                let prefix = if row == 0 { RESPONSE_BULLET_PREFIX } else { "  " };
+                wrapped_line(prefix, Tone::Plain, text, Tone::Plain, false, width)
+            })
+            .collect::<Vec<_>>();
+        // 소요 시간은 질문 줄에 띄우지 않는다. 기록 라벨과 역할 표시만 남긴다.
+        let footer = prompt_footer_spans(history, None, last.then_some(block.response_agent).flatten());
+        let room = usize::from(width).saturating_sub(1);
+        if !footer.is_empty() && let Some(line) = question_lines.last_mut() {
+            let label = footer.iter().map(|span| UnicodeWidthStr::width(span.text.as_str())).sum::<usize>();
+            let used = painted_line_width(line);
+            if used + label < room {
+                line.tail.push(PaintSpan { text: " ".repeat(room - used - label), tone: Tone::Plain, bold: false });
+                line.tail.extend(footer);
+                // 기록 펼치기는 라벨 위에서만 받는다. 줄 전체를 집기 영역으로 두면
+                // 질문 줄에 프롬프트 배경 띠가 다시 칠해진다.
+                if let Some((group_id, _, _)) = history {
+                    line.pick = Some(PickRegions::span(room - label, room, Pick::History(group_id)));
+                }
+            }
         }
-        let mut question_lines = user_prompt_lines_with_history(&question, width, history.filter(|_| last), false);
-        if last && history.is_some() { question_lines.pop(); }
         lines.extend(question_lines);
         let mut answer = pair.clone();
         answer.title = block.title.clone();
@@ -24645,14 +24673,14 @@ mod tests {
             let indent = usize::from(width.saturating_sub(8)).min(6);
             let arrow = lines.iter().position(|line| line.prefix.contains("└─▶ ")).unwrap();
             assert!(arrow > 0);
-            assert_eq!(lines.iter().filter(|line| line.tone == Tone::UserPromptPadding).count(), 2);
+            assert!(lines[..arrow - 1].iter().all(|line| !matches!(line.tone, Tone::UserPrompt | Tone::UserPromptPadding)));
             assert_eq!(lines.iter().filter(|line| line.tone == Tone::UserPromptHalf).count(), 2);
             if width == 80 {
-                assert_eq!(lines.len(), 6);
-                assert_eq!(arrow, 4);
+                assert_eq!(lines.len(), 4, "질문 줄과 답변 상자 사이에 빈 줄이 생기지 않는다");
+                assert_eq!(arrow, 2);
                 assert!(lines.iter().all(|line| line != &PaintLine::blank()));
-                assert!(lines[..arrow - 1].iter().any(|line| painted(line).contains("32s")));
-                assert!(lines[arrow - 1..].iter().all(|line| !painted(line).contains("32s")));
+                assert!(lines.iter().all(|line| !painted(line).contains("32s")));
+                assert!(painted(&lines[0]).starts_with(RESPONSE_BULLET_PREFIX));
             }
             assert!(lines[..arrow].iter().any(|line| painted(line).contains("어떤")));
             assert!(lines.iter().all(|line| painted_line_width(line) <= usize::from(width - 1)),
@@ -24684,7 +24712,7 @@ mod tests {
                 assert_eq!(frame.cell(indent + 1, row).style.foreground, Some(theme::palette().user_prompt_bg));
                 assert_eq!(frame.cell(indent + 1, row).style.background, None);
             }
-            assert_eq!(frame.cell(indent - 4, arrow - 2).glyph, if indent == 4 { "▌" } else { " " });
+            assert!(frame.cell(indent - 4, arrow - 2).style.background.is_none());
             for row in [arrow - 1] {
                 assert_eq!(frame.cell(indent - 4, row).glyph, "╷");
                 assert_eq!(frame.cell(indent - 4, row).style.background, None);
@@ -24714,7 +24742,7 @@ mod tests {
     }
 
     #[test]
-    fn question_half_padding_keeps_the_duration_on_the_question() {
+    fn question_rows_start_with_a_bullet_and_drop_the_duration() {
         let mut block = Block::question_answers(vec![("질문".into(), "가".repeat(10))]);
         block.set_response_duration(Duration::from_secs(32));
         let lines = user_prompt_lines_with_history(&block, 30, None, false);
@@ -24722,8 +24750,8 @@ mod tests {
         assert_eq!(bottom.tone, Tone::UserPromptHalf);
         assert!(bottom.text.chars().all(|ch| ch == '▀'));
         assert!(bottom.tail.is_empty());
-        assert!(lines[..3].iter().any(|line| painted(line).contains("32s")));
-        assert!(lines[3..].iter().all(|line| !painted(line).contains("32s")));
+        assert!(lines.iter().all(|line| !painted(line).contains("32s")));
+        assert_eq!(lines[0].prefix, RESPONSE_BULLET_PREFIX);
         assert!(lines.iter().all(|line| painted_line_width(line) <= 29));
     }
 
@@ -24734,7 +24762,7 @@ mod tests {
             ("둘째 질문".into(), "둘째 답변".into()),
         ]);
         let lines = user_prompt_lines_with_history(&block, 80, None, false);
-        assert_eq!(lines.len(), 16, "card padding remains without an extra question-answer gap");
+        assert_eq!(lines.len(), 12, "질문은 일반 출력 행이라 상자 여백 줄이 붙지 않는다");
         assert_eq!(lines.iter().filter(|line| line.prefix.contains("└─▶")).count(), 2);
         let text = lines.iter().map(painted).collect::<Vec<_>>().join("\n");
         for expected in ["첫 질문", "추가 설명", "첫 답변", "↳ 직접 입력한 문구", "둘째 질문", "둘째 답변"] {
@@ -24849,7 +24877,9 @@ mod tests {
                         assert_eq!(actual.iter().map(painted).collect::<Vec<_>>(),
                             expected.iter().map(painted).collect::<Vec<_>>());
                         for (actual, expected) in actual.iter().zip(&expected) {
-                            assert_eq!(actual.prefix_tone, chrome_model_tone(&answer.title).unwrap_or(Tone::Accent));
+                            assert_eq!(actual.prefix_tone, expected.prefix_tone);
+                            assert!(actual.prefix.trim_start_matches(['•', ' ']).is_empty()
+                                || actual.prefix_tone == chrome_model_tone(&answer.title).unwrap_or(Tone::Accent));
                             assert_eq!(actual.tone, expected.tone);
                             assert_eq!(actual.bold, expected.bold);
                             assert!(actual.tail == expected.tail);
@@ -28508,3 +28538,4 @@ mod tests {
         assert_eq!(painted_line_text(first), "• 이제 부착 처리를 봅니다.");
     }
 }
+
