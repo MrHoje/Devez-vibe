@@ -802,6 +802,9 @@ pub struct Renderer {
     /// temporary assistant rows. Selection and scrolling must use the same row
     /// grid the user sees rather than the committed-history subset alone.
     fullscreen_display_lines: Vec<PaintLine>,
+    /// 지난 프레임의 표시용 줄 중 확정 전사와 같은 앞부분의 길이. 확정 전사는 뒤로만
+    /// 자라므로 이만큼은 다시 만들지 않는다. 전사를 다시 감싸면 0으로 되돌린다.
+    reusable_display_prefix: usize,
     wrapped_width: u16,
     shell_display_mode: ShellDisplayMode,
     diff_display_mode: DiffDisplayMode,
@@ -1502,6 +1505,7 @@ impl Renderer {
             scroll_back: 0,
             wrapped: Vec::new(),
             fullscreen_display_lines: Vec::new(),
+            reusable_display_prefix: 0,
             wrapped_width: 0,
             shell_display_mode: ShellDisplayMode::Collapse,
             diff_display_mode: DiffDisplayMode::Collapse,
@@ -1814,6 +1818,7 @@ impl Renderer {
         self.split_btw_view_rows = 0;
         self.split_selection_focus = None;
         self.wrapped.clear();
+        self.reusable_display_prefix = 0;
         self.wrapped_width = 0;
         self.scroll_back = 0;
         self.expanded_tools.clear();
@@ -3527,7 +3532,16 @@ impl Renderer {
             self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
         }
         self.fullscreen_stream_rows = streamed_rows;
-        let mut display_wrapped = self.wrapped.clone();
+        // 지난 프레임이 만든 줄을 그대로 물려받아 확정 전사에서 새로 생긴 부분과
+        // 이번 스트리밍 줄만 다시 만든다. 전사 전체를 복제하면 대화가 길어질수록
+        // 프레임마다 그만큼을 새로 할당하게 된다.
+        let mut display_wrapped = std::mem::take(&mut self.fullscreen_display_lines);
+        reuse_display_prefix(
+            &mut display_wrapped,
+            &self.wrapped,
+            self.reusable_display_prefix,
+        );
+        self.reusable_display_prefix = self.wrapped.len();
         display_wrapped.extend(streamed_lines);
         let anchored_view_rows = self.history_view_rows_anchor;
         let live_rows_after_absorb = frame.lines.len().saturating_sub(1);
@@ -3823,6 +3837,9 @@ impl Renderer {
                     .copied();
                 let range =
                     append_compact_open_code_response(&mut self.wrapped, previous, block, lines);
+                // 붙이면서 직전 블록의 꼬리 줄을 다듬을 수 있으므로 그 지점부터는
+                // 지난 프레임 줄을 믿지 않는다.
+                self.reusable_display_prefix = self.reusable_display_prefix.min(range.start);
                 if matches!(block.kind, BlockKind::ProgressGroup) && self.fold_progress_groups {
                     let content_end = range.end.saturating_sub(usize::from(
                         self.wrapped.get(range.end.saturating_sub(1)) == Some(&PaintLine::blank()),
@@ -3859,6 +3876,7 @@ impl Renderer {
             previous = Some(block);
         }
         self.wrapped = wrapped;
+        self.reusable_display_prefix = 0;
         self.progress_group_rows = progress_group_rows;
         self.wrapped_width = width;
     }
@@ -5795,6 +5813,15 @@ struct PaintSpan {
     bold: bool,
 }
 
+/// 지난 프레임의 표시용 줄에서 확정 전사와 같은 앞부분만 남기고 나머지를 다시 채운다.
+/// `reusable`은 그때 확정 전사가 차지하던 길이이며, 전사를 다시 감싸 앞부분을 믿을 수
+/// 없게 되면 0이 들어온다.
+fn reuse_display_prefix(display: &mut Vec<PaintLine>, wrapped: &[PaintLine], reusable: usize) {
+    let reused = reusable.min(display.len()).min(wrapped.len());
+    display.truncate(reused);
+    display.extend_from_slice(&wrapped[reused..]);
+}
+
 impl PaintLine {
     fn plain(text: impl Into<String>) -> Self {
         Self {
@@ -6973,6 +7000,10 @@ fn normal_frame_with_expansion(
     }
     if let Some(notice) = update_notice {
         lines.push(status_line_row(None, &notice, width));
+    }
+    // Separate the running-subagent rows from the status line with one blank row.
+    if status_line_painted && (!subagents.is_empty() || !artifacts.is_empty()) {
+        lines.push(PaintLine::blank());
     }
     lines.extend(subagent_lines(subagents, width));
     lines.extend(artifact_line(artifacts, width));
@@ -11391,16 +11422,14 @@ fn question_answer_lines(block: &Block, width: u16, history: Option<(u64, &str, 
     for (index, pair) in block.children.iter().enumerate() {
         if index > 0 { lines.push(PaintLine::blank()); }
         let last = index + 1 == block.children.len();
-        let mut question = pair.clone();
-        question.body = pair.title.clone();
-        question.title = block.title.clone();
-        if last {
-            question.response_duration = block.response_duration;
-            question.response_agent = block.response_agent;
-        }
-        let mut question_lines = user_prompt_lines_with_history(&question, width, history.filter(|_| last), false);
-        if last && history.is_some() { question_lines.pop(); }
-        lines.extend(question_lines);
+        lines.extend(question_card_lines(
+            &pair.title,
+            chrome_model_tone(&block.title).unwrap_or(Tone::Accent),
+            width,
+            history.filter(|_| last),
+            last.then(|| block.response_duration()).flatten(),
+            last.then_some(block.response_agent).flatten(),
+        ));
         let mut answer = pair.clone();
         answer.title = block.title.clone();
         let answer_lines = user_prompt_lines_with_history(&answer, width - indent as u16, None, false);
@@ -11429,6 +11458,51 @@ fn question_answer_lines(block: &Block, width: u16, history: Option<(u64, &str, 
     for line in &mut lines {
         if matches!(line.tone, Tone::UserPrompt | Tone::UserPromptPadding) {
             line.tail.push(PaintSpan { text: String::new(), tone: Tone::UserPrompt, bold: false });
+        }
+    }
+    lines
+}
+
+/// 질문은 답변 상자와 달리 Updated Plan 카드처럼 테두리만 둘러 그린다. 테두리
+/// 색은 보낸 시점의 모델 색을 그대로 쓰고, 응답 기록 라벨과 소요 시간은 아래
+/// 테두리의 오른쪽에 얹어 본문 폭을 줄이지 않는다.
+fn question_card_lines(
+    text: &str,
+    border_tone: Tone,
+    width: u16,
+    history: Option<(u64, &str, bool)>,
+    response_duration: Option<Duration>,
+    response_agent: Option<AgentMode>,
+) -> Vec<PaintLine> {
+    let line_width = usize::from(width).saturating_sub(1).max(4);
+    // 테두리는 글자가 아니라 줄의 머리이므로 prefix에 둔다. 그러면 모델 색은
+    // 기존 세로선처럼 prefix_tone에 남고 본문 톤은 모델과 무관하게 유지된다.
+    let border = |rule: String| PaintLine {
+        prefix: rule,
+        prefix_tone: border_tone,
+        ..PaintLine::blank()
+    };
+    let mut lines = vec![border(format!("┌{}┐", "─".repeat(line_width - 2)))];
+    for row in text.lines() {
+        lines.extend(wrapped_line("  ", border_tone, row, Tone::Plain, false, line_width as u16));
+    }
+    let footer = prompt_footer_spans(history, response_duration, response_agent);
+    let footer_width = footer
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+        .sum::<usize>();
+    if footer_width > 0 && footer_width + 5 <= line_width {
+        let mut bottom = border(format!("└{}", "─".repeat(line_width - footer_width - 5)));
+        bottom.tail.push(PaintSpan { text: " ".to_owned(), tone: border_tone, bold: false });
+        bottom.tail.extend(footer);
+        bottom.tail.push(PaintSpan { text: " ─┘".to_owned(), tone: border_tone, bold: false });
+        lines.push(bottom);
+    } else {
+        lines.push(border(format!("└{}┘", "─".repeat(line_width - 2))));
+    }
+    if let Some((group_id, _, _)) = history {
+        for line in &mut lines {
+            line.pick = Some(PickRegions::span(0, line_width, Pick::History(group_id)));
         }
     }
     lines
@@ -19367,7 +19441,9 @@ mod tests {
             .position(|line| painted(line).contains("Update available:"))
             .expect("update notice");
         assert!(update_index > composer_index);
-        assert_eq!(update_index + 1, subagent_index);
+        // 상태줄·갱신 안내와 서브에이전트 행 사이에는 빈 줄 하나가 들어간다.
+        assert_eq!(update_index + 2, subagent_index);
+        assert!(frame.lines[update_index + 1] == PaintLine::blank());
         assert!(painted(&frame.lines[update_index]).ends_with("dvz update"));
     }
 
@@ -23134,6 +23210,37 @@ mod tests {
         );
     }
 
+    /// 앞부분 재사용은 전사 전체를 다시 만든 결과와 같아야 한다.
+    #[test]
+    fn reusing_the_display_prefix_matches_a_full_rebuild() {
+        let wrapped = ["첫 줄", "둘째 줄", "셋째 줄"]
+            .map(PaintLine::plain)
+            .to_vec();
+
+        // 지난 프레임: 확정 전사 두 줄 뒤에 스트리밍 줄이 붙어 있었다.
+        let mut grew = vec![
+            wrapped[0].clone(),
+            wrapped[1].clone(),
+            PaintLine::plain("스트리밍"),
+        ];
+        reuse_display_prefix(&mut grew, &wrapped, 2);
+        assert!(grew == wrapped);
+
+        // 전사를 다시 감싼 뒤에는 앞부분을 믿을 수 없어 전부 다시 만든다.
+        let mut rewrapped = vec![PaintLine::plain("옛 줄"), PaintLine::plain("스트리밍")];
+        reuse_display_prefix(&mut rewrapped, &wrapped, 0);
+        assert!(rewrapped == wrapped);
+
+        // 표시용 줄이 밖에서 비워졌거나 전사가 줄어들어도 어긋나지 않는다.
+        let mut emptied = Vec::new();
+        reuse_display_prefix(&mut emptied, &wrapped, 2);
+        assert!(emptied == wrapped);
+
+        let mut shrunk = wrapped.clone();
+        reuse_display_prefix(&mut shrunk, &wrapped[..1], 3);
+        assert!(shrunk == wrapped[..1]);
+    }
+
     #[test]
     fn fullscreen_rewrap_adjusts_a_scrolled_reader_by_the_total_row_delta() {
         let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
@@ -24581,7 +24688,8 @@ mod tests {
             let indent = usize::from(width.saturating_sub(8)).min(6);
             let arrow = lines.iter().position(|line| line.prefix.contains("└─▶ ")).unwrap();
             assert!(arrow > 0);
-            assert_eq!(lines.iter().filter(|line| line.tone == Tone::UserPromptPadding).count(), 2);
+            assert!(painted(&lines[0]).starts_with('┌') && painted(&lines[0]).ends_with('┐'));
+            assert!(painted(&lines[arrow - 2]).starts_with('└'));
             assert_eq!(lines.iter().filter(|line| line.tone == Tone::UserPromptHalf).count(), 2);
             if width == 80 {
                 assert_eq!(lines.len(), 6);
@@ -24620,7 +24728,7 @@ mod tests {
                 assert_eq!(frame.cell(indent + 1, row).style.foreground, Some(theme::palette().user_prompt_bg));
                 assert_eq!(frame.cell(indent + 1, row).style.background, None);
             }
-            assert_eq!(frame.cell(indent - 4, arrow - 2).glyph, if indent == 4 { "▌" } else { " " });
+            assert_eq!(frame.cell(indent - 4, arrow - 2).glyph, if indent == 4 { "└" } else { "─" });
             for row in [arrow - 1] {
                 assert_eq!(frame.cell(indent - 4, row).glyph, "╷");
                 assert_eq!(frame.cell(indent - 4, row).style.background, None);

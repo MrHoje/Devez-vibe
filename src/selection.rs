@@ -38,8 +38,9 @@ impl CellRange {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SelectionFinish {
     Copy(CellRange),
-    /// A press and release on the same cell. The cell itself is reported, not
-    /// just its row: chrome like the composer badges is clickable per span.
+    /// A press and release on the same cell, or one cell away on the same row.
+    /// The pressed cell is reported, not just its row: chrome like the composer
+    /// badges is clickable per span.
     Click(CellPosition),
     None,
 }
@@ -82,11 +83,19 @@ impl Selection {
     }
 
     pub fn update(&mut self, point: CellPosition) -> bool {
-        if !self.dragging || self.anchor.is_none() || self.focus == Some(point) {
+        let Some(anchor) = self.anchor else {
+            return false;
+        };
+        if !self.dragging || self.focus == Some(point) {
             return false;
         }
         self.focus = Some(point);
-        self.moved = true;
+        // A click that slips one cell sideways is still a click: the pointer
+        // wobbles on press, and the prompt's disclosure would otherwise copy
+        // instead of expanding.
+        if anchor.row != point.row || anchor.column.abs_diff(point.column) > 1 {
+            self.moved = true;
+        }
         true
     }
 
@@ -106,10 +115,10 @@ impl Selection {
         }
         self.focus = Some(point);
         self.dragging = false;
-        if !self.moved && anchor == point {
+        if !self.moved && anchor.row == point.row && anchor.column.abs_diff(point.column) <= 1 {
             self.anchor = None;
             self.focus = None;
-            return SelectionFinish::Click(point);
+            return SelectionFinish::Click(anchor);
         }
         let (start, end) = if anchor <= point {
             (anchor, point)
@@ -329,6 +338,33 @@ mod tests {
         assert_eq!(
             selection.finish(point(2, 7)),
             SelectionFinish::Click(point(2, 7))
+        );
+    }
+
+    #[test]
+    fn a_one_cell_wobble_still_finishes_as_a_click() {
+        let mut selection = Selection::default();
+        selection.begin(point(2, 7));
+        selection.update(point(3, 7));
+
+        assert_eq!(
+            selection.finish(point(3, 7)),
+            SelectionFinish::Click(point(2, 7))
+        );
+    }
+
+    #[test]
+    fn a_two_cell_drag_still_copies() {
+        let mut selection = Selection::default();
+        selection.begin(point(2, 7));
+        selection.update(point(4, 7));
+
+        assert_eq!(
+            selection.finish(point(4, 7)),
+            SelectionFinish::Copy(CellRange {
+                start: point(2, 7),
+                end: point(4, 7),
+            })
         );
     }
 

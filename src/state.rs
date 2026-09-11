@@ -4690,6 +4690,12 @@ impl AppState {
         self.busy || self.compacting()
     }
 
+    /// A background child can outlive the turn that started it. The host tab
+    /// keeps spinning while those rows live so work in flight never looks done.
+    pub fn host_children_busy(&self) -> bool {
+        !self.subagents.is_empty()
+    }
+
     pub fn host_loading(&self) -> bool {
         self.host_loading
     }
@@ -19785,10 +19791,15 @@ mod tests {
         state.handle_notification("turn/completed", &json!({}));
 
         assert_eq!(state.view().subagents.len(), 1);
+        assert!(
+            state.host_children_busy(),
+            "the host tab keeps spinning while the child runs past the turn"
+        );
 
         state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
 
         assert!(state.view().subagents.is_empty());
+        assert!(!state.host_children_busy());
     }
 
     #[test]

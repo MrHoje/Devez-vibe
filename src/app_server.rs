@@ -115,6 +115,8 @@ pub enum ServerEvent {
 
 pub struct AppServer {
     child: Child,
+    /// app-server가 띄운 MCP 서버까지 함께 끝낸다.
+    _job: Option<crate::child_process::BackendJob>,
     client: AppServerClient,
     events: mpsc::UnboundedReceiver<ServerEvent>,
     permission_events: mpsc::UnboundedSender<ServerEvent>,
@@ -151,6 +153,7 @@ impl AppServer {
                 )
             })?;
 
+        let job = crate::child_process::adopt_backend(&child);
         let stdin = child.stdin.take().context("app-server stdin 연결 실패")?;
         let stdout = child.stdout.take().context("app-server stdout 연결 실패")?;
         let stderr = child.stderr.take().context("app-server stderr 연결 실패")?;
@@ -249,6 +252,7 @@ impl AppServer {
 
         Ok(Self {
             child,
+            _job: job,
             client,
             events,
             permission_events,

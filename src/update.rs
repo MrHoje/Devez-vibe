@@ -2,7 +2,7 @@ use std::{
     env, fs,
     fs::File,
     io::{self, IsTerminal, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -143,6 +143,9 @@ fn install_update(stage_path: &PathBuf) -> Result<()> {
     }
 
     activate_version(&managed_exe)?;
+    if let Some(versions) = version_root.parent() {
+        prune_versions(versions, &[latest, CURRENT_VERSION]);
+    }
     println!("완료: 다음 실행 버전 전환");
     println!("Devez Vibe v{latest} 설치를 마쳤습니다. 새로 실행하는 세션부터 적용됩니다.");
     Ok(())
@@ -167,6 +170,21 @@ fn managed_version_root(version: &str) -> Result<PathBuf> {
         .join("DevezVibe")
         .join("versions")
         .join(version))
+}
+
+/// 더 쓰지 않는 버전 폴더를 지운다. 다른 세션이 실행 중인 버전은 파일이 잠겨
+/// 삭제에 실패하므로 그대로 두고 다음 업데이트에서 다시 시도한다.
+fn prune_versions(root: &Path, keep: &[&str]) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if keep.contains(&name.to_string_lossy().as_ref()) {
+            continue;
+        }
+        let _ = fs::remove_dir_all(entry.path());
+    }
 }
 
 fn activate_version(executable: &PathBuf) -> Result<()> {
@@ -370,6 +388,24 @@ mod tests {
     fn extracts_version_from_staged_executable() {
         assert_eq!(executable_version(b"dvz 1.7.73\r\n"), Some("1.7.73"));
         assert_eq!(executable_version(b""), None);
+    }
+
+    #[test]
+    fn prune_keeps_only_requested_versions() {
+        let root = env::temp_dir().join(format!("dvz-prune-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for version in ["1.8.2", "1.8.25", "1.8.26"] {
+            fs::create_dir_all(root.join(version).join("node_modules")).unwrap();
+        }
+        prune_versions(&root, &["1.8.26", "1.8.25"]);
+        let mut left: Vec<String> = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["1.8.25", "1.8.26"]);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

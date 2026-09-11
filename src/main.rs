@@ -2551,7 +2551,19 @@ async fn run_local_shell(
     let anchor: Block = state.begin_local_shell(&command);
     draw(state, renderer)?;
     let started = Instant::now();
-    let result = local_shell_command(&command, &cwd).output().await;
+    let mut process = local_shell_command(&command, &cwd);
+    process
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // 셸이 다시 띄운 프로세스는 작업 개체가 잡는다. 명령이 끝나거나 dvz가 끝나면
+    // 개체가 버려지면서 함께 정리된다.
+    let result = match process.spawn() {
+        Ok(child) => {
+            let _job = child_process::adopt_backend(&child);
+            child.wait_with_output().await
+        }
+        Err(error) => Err(error),
+    };
     let (output, exit_code) = match result {
         Ok(output) => (
             local_shell_output(&output.stdout, &output.stderr),
@@ -6159,9 +6171,10 @@ fn sync_host_state(state: &AppState) {
     // retry a failed host write while rendering uses its animation-only path.
     // The turn flag and compaction are handed over separately: the host spins its
     // tab for both, but only a finished turn is a finished response.
+    // Background children outlive the turn, so the tab stays busy until they end.
     devezcode::sync(
         state.host_session_id(),
-        state.busy,
+        state.busy || state.host_children_busy(),
         state.compacting(),
         state.host_loading(),
         state.awaiting_input(),

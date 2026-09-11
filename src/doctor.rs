@@ -248,22 +248,33 @@ async fn probe_command_paths(path: &Path, args: &[&Path]) -> Probe {
     let resolved = crate::app_server::resolve_command(path);
     let found = resolved.is_file();
     let mut command = command_for(&resolved);
-    command.args(args).stdin(Stdio::null());
-    match timeout(COMMAND_TIMEOUT, command.output()).await {
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let failed = |error: std::io::Error| Probe {
+        found,
+        success: false,
+        detail: if found {
+            one_line(&error.to_string())
+        } else {
+            format!("명령을 찾을 수 없음: {}", path.display())
+        },
+    };
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return failed(error),
+    };
+    // 시간이 초과되면 작업 개체를 버려 프로브와 그것이 띄운 프로세스까지 함께 끝낸다.
+    let _job = crate::child_process::adopt_backend(&child);
+    match timeout(COMMAND_TIMEOUT, child.wait_with_output()).await {
         Ok(Ok(output)) => Probe {
             found: true,
             success: output.status.success(),
             detail: output_detail(&output.stdout, &output.stderr, output.status.success()),
         },
-        Ok(Err(error)) => Probe {
-            found,
-            success: false,
-            detail: if found {
-                one_line(&error.to_string())
-            } else {
-                format!("명령을 찾을 수 없음: {}", path.display())
-            },
-        },
+        Ok(Err(error)) => failed(error),
         Err(_) => Probe {
             found: true,
             success: false,
@@ -348,6 +359,19 @@ fn print_report(checks: &[Check]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// spawn 방식으로 바꾼 뒤에도 프로브가 출력과 종료 상태를 그대로 읽는지 확인한다.
+    #[tokio::test]
+    async fn probe_reports_command_output() {
+        #[cfg(windows)]
+        let probe = probe_command(Path::new("cmd.exe"), &["/c", "echo devez"]).await;
+        #[cfg(not(windows))]
+        let probe = probe_command(Path::new("/bin/echo"), &["devez"]).await;
+
+        assert!(probe.found);
+        assert!(probe.success);
+        assert_eq!(probe.detail, "devez");
+    }
 
     #[test]
     fn parses_supported_node_versions() {

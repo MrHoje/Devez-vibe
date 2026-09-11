@@ -495,6 +495,8 @@ impl OpenCodeClient {
 
 pub struct OpenCodeServer {
     child: Child,
+    /// `.cmd` 런처가 감싼 실제 OpenCode 프로세스까지 함께 끝낸다.
+    _job: Option<crate::child_process::BackendJob>,
     client: OpenCodeClient,
     provider_auth: ProviderAuthServer,
     /// session/load가 진행 중인 세션의 재생 조각 버퍼.
@@ -744,6 +746,7 @@ impl OpenCodeServer {
         let mut child = command.spawn().with_context(|| {
             format!("OpenCode ACP를 시작하지 못했습니다: {}", resolved.display())
         })?;
+        let job = crate::child_process::adopt_backend(&child);
         let stdin = child.stdin.take().context("OpenCode ACP stdin 연결 실패")?;
         let stdout = child
             .stdout
@@ -918,6 +921,7 @@ impl OpenCodeServer {
         };
         Ok(Self {
             child,
+            _job: job,
             client,
             provider_auth,
             loading,

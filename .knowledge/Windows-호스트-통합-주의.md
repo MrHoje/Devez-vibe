@@ -46,3 +46,12 @@ DevezCode는 재배선·커튼 걷기 뒤 화면을 ConPTY 재방출로 복원�
 
 - 구분 표식을 찾을 때 명령줄에 적힌 표식이 먼저 잡힐 수 있으므로 첫 위치가 아니라 마지막 위치를 기준으로 본문을 분리한다.
 - 파일이 LF로만 저장되면 `cmd`가 `exit /b` 뒤의 PowerShell 본문까지 명령으로 실행할 수 있으므로 혼합 배치 파일은 CRLF로 저장한다.
+
+## 실기기 그래픽 시험 실행 — 2026-09-11
+
+Sixel 모서리 관련 `#[ignore]` 시험(`live_native_terminal_metrics`, `live_native_question_corners`)은 세션 안에서 못 본다. `wt.exe -w new cmd.exe /c <배치>`로 새 창을 띄워 실행한다.
+
+- **표준 출력을 파일로 돌리지 않는다.** `query_graphics`는 `io::stdout().is_terminal()`을 먼저 보므로 `> log.txt`를 붙이면 감지가 통째로 꺼지고 시험이 0.00초 만에 실패한다. 결과는 `DEVEZ_GRAPHICS_TEST_RESULT` 파일로 받는다.
+- 창 안의 그림은 화면 캡처(`CopyFromScreen`)로 확인한다.
+- 이 PC의 Windows Terminal에서 확인된 값: DA1이 Sixel(4)을 보고하고 셀 크기는 10×20 픽셀이며, 답변 카드의 위·아래 모서리 한 칸이 실제로 Sixel로 그려진다.
+- 그려진 모서리의 청록은 글리프 쪽보다 1/255 밝다. `corner()`가 팔레트를 퍼센트로 적는 양자화 때문이며 눈으로 구분되지 않는다. 색이 한 단계 다르다는 이유로 버그로 보지 않는다.

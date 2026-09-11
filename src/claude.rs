@@ -41,6 +41,8 @@ pub struct ClaudeClient {
 
 struct ClaudeProcess {
     child: Child,
+    /// 브리지가 띄운 Claude CLI와 MCP 서버까지 함께 끝낸다.
+    _job: Option<crate::child_process::BackendJob>,
     writer_task: JoinHandle<()>,
     reader_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
@@ -119,6 +121,7 @@ impl ClaudeClient {
                 self.bridge_path.display()
             )
         })?;
+        let job = crate::child_process::adopt_backend(&child);
         let stdin = child.stdin.take().context("Claude SDK stdin 연결 실패")?;
         let stdout = child.stdout.take().context("Claude SDK stdout 연결 실패")?;
         let stderr = child.stderr.take().context("Claude SDK stderr 연결 실패")?;
@@ -221,6 +224,7 @@ impl ClaudeClient {
 
         *self.process.lock().await = Some(ClaudeProcess {
             child,
+            _job: job,
             writer_task,
             reader_task,
             stderr_task,
