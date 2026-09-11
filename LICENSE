@@ -1,18 +1,6 @@
-DevezCode source code license
-
-The MIT License below applies only to the DevezCode source code and to files
-that are not listed in the exception below.
-
-Exceptions:
-
-* `Resources/Images/FileTypes/` and `Resources/Licenses/` are Microsoft Visual
-  Studio Image Library materials, subject to the included Microsoft terms.
-* `Resources/Images/ShellPresets/` contains third-party brand assets, subject
-  to their respective owners' terms.
-
 MIT License
 
-Copyright (c) 2026 DevezCode contributors
+Copyright (c) 2026 Devez Vibe contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

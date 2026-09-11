@@ -91,69 +91,49 @@ dvz update
 
 ### 세션
 
-- 새 스레드 시작, 세션 검색 피커, ID/이름 기반 resume
-- `--resume [SESSION]`, `--continue` 및 실행 중 `/resume`
-- `/new` 성공 시 이전 대화와 화면을 비우고 새 세션으로 전환
-- 시작과 `/new` 세션 전환 시 화면과 스크롤백을 비우고 새 화면으로 전환
+- 새 스레드 시작, 검색 가능한 세션 피커, ID/이름 기반 resume
 - `/btw`(별칭 `/side`)로 현재 대화를 유지한 채 임시 곁가지 대화 진행
-- `/compact`로 현재 대화 압축, `/copy`로 마지막 응답을 Markdown으로 복사
 - `/worktree`로 현재 대화를 이어받아 Git 작업 트리로 진입
 
 ### 에이전트 역할
 
-- Builder·Planner·Researcher·Reviewer·Goal Runner 5개 내장 역할을 `/agent`로 선택하고
-  `Tab`으로 순환
-- Planner는 `docs/plans`에만, Reviewer와 Researcher는 아무 파일도 쓰지 않는 읽기 전용
-- `%APPDATA%\DevezVibe\agents`에 역할당 `.md` 파일 하나를 두면 사용자 정의 역할을 추가
-- `/auto-knowledge`로 반복 실수와 필요한 지식의 자동 기록을 켜고 끄기
+역할은 다음 턴에 전달되는 지침과 쓰기 권한을 함께 바꿉니다. `/agent`로 고르고 `Tab`으로
+순환합니다.
+
+| 역할 | 성격 | 쓰기 범위 |
+| --- | --- | --- |
+| Builder | 일상적인 개발 작업 전반 | 제한 없음 |
+| Planner | 요구사항 인터뷰 후 구현 계획 수립 | `docs/plans`만 |
+| Researcher | 여러 출처를 조사해 근거와 한계를 보고 | 없음 |
+| Reviewer | 변경과 계획을 검토해 심각도와 판정 | 없음 |
+| Goal Runner | 목표를 정하고 끝까지 완수 | 제한 없음 |
+
+- `%APPDATA%\DevezVibe\agents`에 역할당 `.md` 파일 하나를 두면 사용자 정의 역할 추가
+- `/auto-knowledge`로 반복 실수와 필요한 지식의 자동 기록 켜고 끄기
 
 ### 모델과 effort
 
-- 모델 카탈로그 기반 `/model` 선택과 좌우 effort 조절
-- Codex CLI 정렬을 유지하고 hidden 모델을 제외한 `/model` 피커
-- `/model sol`, `/model terra`, `/model luna`, `/model spark` 등 짧은 모델 별칭
-- 모델 번호 표시 및 피커에서 `1`~`9` 숫자키 즉시 선택
-- `/effort` 슬라이더에서 서버 지원 effort만 노출 (`max`·`ultra` 포함)
-- 설명·Auto 없이 모델명과 지원 수준만 표시하는 `/effort` 슬라이더
-- Sol·Terra·Luna·Spark 모델 색상을 picker와 statusline에 공통 적용
-- `/fast`로 모델의 fast 서비스 등급 전환, `/provider`로 Claude·Codex·OpenCode 전환
+- 모델 카탈로그 기반 `/model` 선택과 `/effort`에서 서버가 지원하는 수준만 노출
+- `/model sol`, `/model terra`, `/model luna`, `/model spark` 등 짧은 별칭과 숫자키 선택
+- `/provider`로 Claude·Codex·OpenCode 전환, `/fast`로 fast 서비스 등급 전환
 
 ### 스트리밍과 승인
 
 - 응답, reasoning summary, 명령, 파일 변경, MCP 호출 스트리밍
-- Claude `TaskCreate`/`TaskUpdate`를 공통 작업 단계 패널로 실시간 표시
-- Claude Code 세션 검색·resume, 구독 usage, `AskUserQuestion` 입력 왕복
-- 명령/파일 변경 승인과 `/permissions`의 provider별 권한 규칙 관리
+- 명령·파일 변경 승인과 `/permissions`의 provider별 권한 규칙 관리
 - 실행 중 입력 steer 및 `Esc`/`Ctrl+C` 중단
-- 실행 시간, 파일 diff 통계, 진행 상태 표시
-- `/mcp`로 MCP 서버 조회·재연결·로그인, `/plugins`·`/skills`·`/reload-plugins`로
-  플러그인과 스킬 관리
 
 ### 입력 (composer)
 
-- `/` 명령 자동완성 및 키보드 모델 선택기
-- `/` 명령 자동완성 패널을 하단 입력 영역 바로 위에 고정
-- `$`로 Plugin·Skill·App을, `@`로 Plugin·Skill·파일·폴더를 검색하고
-  Codex와 같은 표기로 입력하는 composer 자동완성
-- `Ctrl+Backspace`/`Ctrl+W` 단어 삭제, `Ctrl+K`/`Ctrl+U` 줄 삭제,
-  `Ctrl+Z` 실행 취소, `Ctrl+Y` 다시 실행, `Alt+B`/`Alt+F` 단어 이동, `Ctrl+J` 줄바꿈
-- `/exit`을 `/quit`과 같은 정상 종료 명령으로 지원
+- `/` 명령 자동완성과 `$`(Plugin·Skill·App), `@`(Plugin·Skill·파일·폴더) 검색
+- `Ctrl+Z`/`Ctrl+Y` 실행 취소·다시 실행, `Ctrl+W`/`Ctrl+K` 단어·줄 삭제, `Ctrl+J` 줄바꿈
+- `Alt+B`/`Alt+F` 단어 이동
 
 ### 렌더링
 
-- 일반 터미널 스크롤백을 보존하는 증분 렌더링
-- 활성 영역 전체 삭제 없이 변경된 터미널 행만 갱신
-- 좌우 테두리와 복사용 공백이 없는 하단 composer
-- `You`/`Codex` 헤더 없이 마커와 본문으로 이어지는 대화 출력
-- 보낸 프롬프트는 전체 행에 은은한 배경색 적용
-- Markdown 제목·목록·인용·코드 블록 표현
+- 터미널 스크롤백을 보존하며 변경된 행만 갱신하는 증분 렌더링
 - Git 브랜치, 모델, effort, context, 5h/주간 한도, Fast 상태를 표시하는 하단 상태줄
-- 모델별 실제 유효 context window를 첫 입력 전부터 표시
-- `/vibemode`로 응답·shell·diff 표시를 한 번에 조절 (`Alt+V`가 프리셋 순환),
-  개별 조절은 `/response`·`/shell`·`/diff`
-- `/theme`로 Minimal·Soft·Dark 계열 테마 전환, `/statusline`으로 상태줄 표시 전환,
-  `/side-panel`로 도킹 사이드 패널 크기 선택
-- `--renderer`로 전체 화면과 인라인 렌더러 선택
+- `/vibemode`(`Alt+V`)로 응답·shell·diff 표시를 한 번에 조절
 
 ## 소스에서 빌드
 
