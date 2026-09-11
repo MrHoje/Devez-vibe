@@ -21,9 +21,10 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "입력창에서 Ctrl+Z로 편집을 취소하고 Ctrl+Y로 다시 실행하며, 텍스트·붙여넣기·첨부 이미지를 함께 복원합니다.",
-    "/worktree [이름]으로 현재 브랜치를 기반으로 작업 트리를 만들고 새 대화로 진입합니다.",
-    "/auto-knowledge로 프로젝트별 자동 기록 상태를 저장하며, 켜면 .knowledge의 지식 문서와 인덱스를 갱신합니다.",
+    "프롬프트나 접힌 응답 행을 누를 때 마우스가 한 칸 흔들려도 복사되지 않고 응답이 펼쳐집니다.",
+    "턴이 끝나도 백그라운드 서브에이전트나 background task가 남아 있으면 DevezCode 탭 스피너가 계속 돌아갑니다.",
+    "업데이트를 마치면 더 쓰지 않는 이전 버전 파일을 자동으로 지워 디스크가 버전마다 쌓이지 않습니다.",
+    "대화나 제공자를 바꿔 닫을 때도, Devez Vibe를 끝낼 때도 백엔드가 띄운 MCP 서버까지 함께 종료되어 프로세스가 남지 않습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

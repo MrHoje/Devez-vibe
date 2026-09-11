@@ -496,15 +496,16 @@ impl SlashCommand {
     /// list — and out of `/help` — while such a runtime is selected.
     fn supports(&self, provider: ModelProvider) -> bool {
         match self.name {
-            "/login" | "/logout" | "/permissions" | "/mcp" | "/plugins" | "/reload-plugins"
-            | "/skills" => provider != ModelProvider::OpenCode,
+            "/login" | "/logout" | "/mcp" | "/plugins" | "/reload-plugins" | "/skills" => {
+                provider != ModelProvider::OpenCode
+            }
             "/fast" => provider != ModelProvider::Claude,
             _ => true,
         }
     }
 }
 
-const SLASH_COMMANDS: [SlashCommand; 35] = [
+const SLASH_COMMANDS: [SlashCommand; 34] = [
     SlashCommand {
         name: "/provider",
         description: "Switch between the Claude and Codex providers, or connect OpenCode",
@@ -534,11 +535,6 @@ const SLASH_COMMANDS: [SlashCommand; 35] = [
         name: "/effort",
         description: "Set reasoning effort",
         takes_argument: true,
-    },
-    SlashCommand {
-        name: "/permissions",
-        description: "Manage the current provider's permission rules",
-        takes_argument: false,
     },
     SlashCommand {
         name: "/theme",
@@ -9605,10 +9601,6 @@ impl AppState {
                     "OpenCode 로그아웃",
                     "터미널에서 `opencode auth logout`을 실행하세요.",
                 )),
-                "/permissions" => Some((
-                    "Permissions",
-                    "OpenCode는 현재 Full Access 권한으로 실행됩니다.",
-                )),
                 _ => None,
             };
             if let Some((title, body)) = notice {
@@ -9633,11 +9625,6 @@ impl AppState {
                 } else {
                     "/login  ChatGPT 계정 로그인\n/logout  계정 연결 해제\n"
                 };
-                let permissions_help = if on_opencode {
-                    Default::default()
-                } else {
-                    "/permissions  현재 provider 권한 규칙 관리\n"
-                };
                 let integration_help = if on_opencode {
                     Default::default()
                 } else {
@@ -9659,7 +9646,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex] MODEL  Select a provider and model\nFor OpenCode, switch with /provider opencode, then select a model with /model\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}/auto-knowledge [on|off]  지식 자동 기록 켜기·끄기\n{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|researcher|goal-runner]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+Z / Ctrl+Y  입력 실행 취소·다시 실행\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
+                    format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex] MODEL  Select a provider and model\nFor OpenCode, switch with /provider opencode, then select a model with /model\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}/auto-knowledge [on|off]  지식 자동 기록 켜기·끄기\n{effort_help}/Response [All|Completed]  응답 압축 방식\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|researcher|goal-runner]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+Z / Ctrl+Y  입력 실행 취소·다시 실행\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
                 ));
                 Action::None
             }
@@ -9852,22 +9839,6 @@ impl AppState {
                         format!("{effort}\nUse /effort to check support and available values for the current model."),
                     ));
                 }
-                Action::None
-            }
-            "/permissions" if parts.len() == 1 && using_claude => {
-                Action::OpenClaudePermissions(None)
-            }
-            "/permissions" if parts.len() == 1 => {
-                self.committed.push(Block::new(
-                    BlockKind::System,
-                    "권한",
-                    format!("현재 Codex 권한은 {}입니다.", self.permission_mode().label()),
-                ));
-                Action::None
-            }
-            "/permissions" => {
-                self.committed
-                    .push(Block::new(BlockKind::Error, "Usage", "/permissions"));
                 Action::None
             }
             "/Response" | "/response" if parts.len() == 1 => {
@@ -22271,7 +22242,6 @@ mod tests {
 
         let mut codex = test_state();
         for command in [
-            "/permissions",
             "/mcp",
             "/plugins",
             "/reload-plugins",
@@ -22297,7 +22267,6 @@ mod tests {
 
         let mut opencode = opencode_picker_state();
         for command in [
-            "/permissions",
             "/mcp",
             "/plugins",
             "/reload-plugins",
@@ -28842,7 +28811,7 @@ mod tests {
     }
 
     #[test]
-    fn permissions_command_opens_claude_rules_and_keeps_codex_fixed() {
+    fn claude_permission_panel_displays_rules() {
         let mut claude = AppState::new(
             "claude:thread".to_owned(),
             "cwd".to_owned(),
@@ -28852,10 +28821,6 @@ mod tests {
             Some("high"),
         );
 
-        assert!(matches!(
-            claude.run_slash_command("/permissions"),
-            Action::OpenClaudePermissions(None)
-        ));
         claude.open_claude_permissions(
             &json!({
                 "rules": [{
@@ -28873,22 +28838,44 @@ mod tests {
         assert_eq!(panel.title, "Permissions · Allow");
         assert!(panel.lines[0].text.contains("Read(./docs/**)"));
         assert!(panel.lines[0].text.contains("Project settings"));
-        assert!(matches!(
-            claude.run_slash_command("/permissions dont-ask"),
-            Action::None
-        ));
+    }
 
-        let mut codex = test_state();
-        assert!(matches!(
-            codex.run_slash_command("/permissions"),
-            Action::None
-        ));
-        assert!(
-            codex
-                .committed
-                .last()
-                .is_some_and(|block| block.body.contains("전체 접근"))
+    #[test]
+    fn permission_commands_are_hidden_and_inactive_for_all_providers() {
+        let claude = AppState::new(
+            "claude:thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![test_model("claude:sonnet", "Sonnet", true)],
+            "claude:sonnet",
+            Some("high"),
         );
+        for mut state in [test_state(), claude, opencode_picker_state()] {
+            for prefix in ["/", "/permission", "/permissions"] {
+                state.editor.set_text(prefix);
+                assert!(state.matching_slash_commands().iter().all(|command|
+                    !command.name.starts_with("/permission")
+                ));
+            }
+            state.run_slash_command("/help");
+            assert!(!state.committed.last().unwrap().body.contains("/permission"));
+            for command in [
+                "/permission",
+                "/permissions",
+                "/permission allow",
+                "/permissions allow",
+            ] {
+                let permission_mode = state.permission_mode();
+                assert!(matches!(
+                    state.submit_text(command.to_owned(), command.to_owned()),
+                    Action::None
+                ));
+                assert!(state.pending.is_none());
+                assert!(!state.busy);
+                assert_eq!(state.permission_mode(), permission_mode);
+                assert_eq!(state.committed.last().unwrap().title, "Unknown command");
+            }
+        }
     }
 
     #[test]
