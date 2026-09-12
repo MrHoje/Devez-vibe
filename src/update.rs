@@ -21,7 +21,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "질문 기록의 질문 줄을 기울임으로 표시해 답변과 구분합니다.",
+    "질문 기록의 질문 줄을 굵은 기울임으로 표시해 답변과 구분합니다.",
     "Windows Terminal에서 한글을 조합할 때 글자가 모델 색으로 보이던 문제를 고쳤습니다.",
     "Builder 역할 지침을 영어로 통일해 매 턴 주입 토큰을 줄였습니다.",
 ];
