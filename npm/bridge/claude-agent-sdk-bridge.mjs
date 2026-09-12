@@ -3006,6 +3006,22 @@ function isInternalHistoryText(message, text) {
   return text.trim().startsWith("[Request interrupted by user");
 }
 
+/**
+ * The answered questions of one `AskUserQuestion` call, in the order they were
+ * asked. A cancelled question carries no answers, so it restores nothing — the
+ * same as the live session, which leaves no card behind either.
+ */
+function questionAnswerPairs(input, result) {
+  const answers = result?.answers;
+  if (!answers || typeof answers !== "object") return [];
+  return (input?.questions || [])
+    .map((entry) => ({
+      question: String(entry?.question || "").trim(),
+      answer: String(answers[entry?.question] ?? "").trim(),
+    }))
+    .filter((pair) => pair.question && pair.answer);
+}
+
 function historyState(messages) {
   const turns = [];
   let turn = null;
@@ -3060,6 +3076,7 @@ function historyState(messages) {
           } else if (block.name === "TaskUpdate") {
             applyTaskUpdate(tasks, block.input || {}, turn.id, undefined, messageTime(message));
           } else if (!["TaskGet", "TaskList", "AskUserQuestion"].includes(block.name)) turn.items.push(pending.item);
+          // 질문 도구는 답변이 실려 오는 결과를 기다렸다가 질문·답변 항목으로 남긴다.
         }
       }
     } else if (message.type === "user") {
@@ -3094,6 +3111,9 @@ function historyState(messages) {
           const current = latestTaskPlan(tasks);
           tasks.clear();
           for (const [id, task] of current) tasks.set(id, task);
+        } else if (pending.name === "AskUserQuestion") {
+          const pairs = questionAnswerPairs(pending.input, message.tool_use_result);
+          if (pairs.length) turn.items.push({ id: block.tool_use_id, type: "questionAnswers", pairs });
         } else if (pending.item) {
           const output = toolOutput(block.content, message.tool_use_result);
           Object.assign(pending.item, pending.item.type === "commandExecution"
@@ -3958,6 +3978,34 @@ async function runSelfTest() {
     message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content }] },
     tool_use_result: toolUseResult,
   });
+  // 재개한 대화의 질문·답변은 항목으로 남고, 답변 없이 취소된 질문은 남지 않는다.
+  const askQuestions = {
+    questions: [
+      { question: "어떤 방법인가요?", options: [{ label: "첫 번째" }] },
+      { question: "언제 할까요?", options: [{ label: "지금" }], multiSelect: true },
+    ],
+  };
+  const answeredQuestions = historyTurns([
+    user("q-user", "선택지 띄워"),
+    taskUse("q-assistant", "ask-1", "AskUserQuestion", askQuestions),
+    taskResult("q-result", "ask-1", { answers: { "어떤 방법인가요?": "첫 번째", "언제 할까요?": "지금, 나중" } }, "answered"),
+    assistant("q-answer", "claude-opus-5", "적용했습니다."),
+  ]);
+  const answerItem = answeredQuestions[0]?.items.find((item) => item.type === "questionAnswers");
+  if (answerItem?.pairs?.length !== 2
+    || answerItem.pairs[0].question !== "어떤 방법인가요?"
+    || answerItem.pairs[1].answer !== "지금, 나중") {
+    throw new Error(`Claude question history self-test failed: ${JSON.stringify(answeredQuestions)}`);
+  }
+  const cancelledQuestion = historyTurns([
+    user("c-user", "선택지 띄워"),
+    taskUse("c-assistant", "ask-2", "AskUserQuestion", askQuestions),
+    taskResult("c-result", "ask-2", undefined, "사용자가 질문을 취소하고 작업을 중단했습니다."),
+    assistant("c-answer", "claude-opus-5", "중단했습니다."),
+  ]);
+  if (cancelledQuestion.some((turn) => turn.items.some((item) => item.type === "questionAnswers"))) {
+    throw new Error(`Claude cancelled question self-test failed: ${JSON.stringify(cancelledQuestion)}`);
+  }
   const resumedProgress = historyTurns([
     user("progress-user", "환자 변경 동기화를 수정해"),
     {

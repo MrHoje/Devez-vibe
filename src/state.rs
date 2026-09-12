@@ -15491,6 +15491,25 @@ fn completed_item_block(cwd: &str, item: &Value) -> Option<Block> {
     match item.get("type")?.as_str()? {
         "userMessage" => user_message_text(item)
             .map(|body| Block::new(BlockKind::User, UNKNOWN_PROMPT_MODEL, body)),
+        // 재개한 대화도 질문·답변을 라이브와 같은 카드로 보여 준다.
+        "questionAnswers" => {
+            let pairs = item
+                .get("pairs")?
+                .as_array()?
+                .iter()
+                .filter_map(|pair| {
+                    let question = pair.get("question")?.as_str()?.trim();
+                    let answer = pair.get("answer")?.as_str()?.trim();
+                    (!question.is_empty() && !answer.is_empty())
+                        .then(|| (question.to_owned(), answer.to_owned()))
+                })
+                .collect::<Vec<_>>();
+            (!pairs.is_empty()).then(|| {
+                let mut block = Block::question_answers(pairs);
+                block.title = UNKNOWN_PROMPT_MODEL.to_owned();
+                block
+            })
+        }
         "commandExecution" => {
             let status = item
                 .get("status")
@@ -19382,6 +19401,46 @@ mod tests {
                 ]
             }]
         })
+    }
+
+    /// 재개한 대화에서도 질문과 답변은 라이브와 같은 질문 카드로 돌아온다.
+    /// 답변이 빠진 항목은 복원할 기록이 없으므로 카드를 만들지 않는다.
+    #[test]
+    fn resumed_question_items_restore_the_answer_card() {
+        let mut state = test_state();
+        state.load_history(&json!({
+            "turns": [{
+                "id": "turn-1",
+                "items": [
+                    { "type": "userMessage", "content": [{"type": "text", "text": "선택지 띄워"}] },
+                    { "type": "questionAnswers", "id": "q1", "pairs": [
+                        {"question": "어떤 방법인가요?", "answer": "첫 번째"},
+                        {"question": "언제 할까요?", "answer": "지금"}
+                    ]},
+                    { "type": "questionAnswers", "id": "q2", "pairs": [
+                        {"question": "취소한 질문", "answer": "  "}
+                    ]},
+                    { "type": "agentMessage", "id": "item-1", "text": "적용했습니다" }
+                ]
+            }]
+        }), None);
+
+        let cards = state
+            .committed
+            .iter()
+            .filter(|block| !block.children().is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(cards.len(), 1, "답변이 없는 질문은 카드로 복원하지 않는다");
+        let restored = cards[0];
+        assert_eq!(restored.children().len(), 2);
+        assert_eq!(restored.children()[0].title, "어떤 방법인가요?");
+        assert_eq!(restored.children()[1].body, "지금");
+        assert_ne!(restored.title, UNKNOWN_PROMPT_MODEL, "재개한 모델 이름을 물려받는다");
+        let expected = Block::question_answers(vec![
+            ("어떤 방법인가요?".to_owned(), "첫 번째".to_owned()),
+            ("언제 할까요?".to_owned(), "지금".to_owned()),
+        ]);
+        assert_eq!(restored.body, expected.body, "라이브 질문 카드와 같은 본문으로 그린다");
     }
 
     /// The prompt marker is coloured from the model named on the block, so a
