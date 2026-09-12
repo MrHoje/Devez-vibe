@@ -5887,10 +5887,12 @@ impl AppState {
                     ).collect();
                 }
             }
+            // 질문 카드도 사용자 블록이라, 시간은 카드가 아니라 실제로 보낸
+            // 프롬프트에 붙여야 프롬프트 옆 소요 시간이 사라지지 않는다.
             if let Some(duration) = completed_turn_duration(turn)
                 && let Some(prompt) = blocks
                     .iter_mut()
-                    .rfind(|block| matches!(block.kind, BlockKind::User))
+                    .rfind(|block| matches!(block.kind, BlockKind::User) && block.children().is_empty())
             {
                 prompt.set_response_duration(duration);
             }
@@ -15499,7 +15501,7 @@ fn completed_item_block(cwd: &str, item: &Value) -> Option<Block> {
                 .iter()
                 .filter_map(|pair| {
                     let question = pair.get("question")?.as_str()?.trim();
-                    let answer = pair.get("answer")?.as_str()?.trim();
+                    let answer = strip_recommendation_mark(pair.get("answer")?.as_str()?.trim());
                     (!question.is_empty() && !answer.is_empty())
                         .then(|| (question.to_owned(), answer.to_owned()))
                 })
@@ -19411,10 +19413,12 @@ mod tests {
         state.load_history(&json!({
             "turns": [{
                 "id": "turn-1",
+                "startedAt": 1_784_992_108_i64,
+                "completedAt": 1_784_992_140_i64,
                 "items": [
                     { "type": "userMessage", "content": [{"type": "text", "text": "선택지 띄워"}] },
                     { "type": "questionAnswers", "id": "q1", "pairs": [
-                        {"question": "어떤 방법인가요?", "answer": "첫 번째"},
+                        {"question": "어떤 방법인가요?", "answer": "첫 번째 (권장)"},
                         {"question": "언제 할까요?", "answer": "지금"}
                     ]},
                     { "type": "questionAnswers", "id": "q2", "pairs": [
@@ -19441,6 +19445,13 @@ mod tests {
             ("언제 할까요?".to_owned(), "지금".to_owned()),
         ]);
         assert_eq!(restored.body, expected.body, "라이브 질문 카드와 같은 본문으로 그린다");
+        assert!(restored.response_duration().is_none(), "소요 시간은 질문 카드에 붙지 않는다");
+        let prompt = state
+            .committed
+            .iter()
+            .find(|block| block.body == "선택지 띄워")
+            .expect("복원한 프롬프트");
+        assert_eq!(prompt.response_duration(), Some(Duration::from_secs(32)));
     }
 
     /// The prompt marker is coloured from the model named on the block, so a
