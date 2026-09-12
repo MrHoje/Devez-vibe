@@ -4358,7 +4358,7 @@ fn cell_style(tone: Tone, bold: bool, background: Option<Rgb>, selected: bool) -
         foreground: tone_rgb(tone),
         background,
         bold,
-        italic: tone == Tone::Thinking,
+        italic: matches!(tone, Tone::Thinking | Tone::QuestionText),
         underlined: tone == Tone::MarkdownLink,
         crossed_out: tone == Tone::PlanDone,
     }
@@ -5607,6 +5607,8 @@ enum Tone {
     ScrollToBottom,
     /// Prompt-hosted History text, softened without becoming fully muted.
     History,
+    /// 질문 기록의 질문 본문: 기본 텍스트 색 그대로 기울임을 덧입힌다. 굵기는 줄에서 켠다.
+    QuestionText,
     #[allow(dead_code)]
     Success,
     Warning,
@@ -11440,7 +11442,7 @@ fn question_answer_lines(block: &Block, width: u16, history: Option<(u64, &str, 
             .enumerate()
             .flat_map(|(row, text)| {
                 let prefix = if row == 0 { RESPONSE_BULLET_PREFIX } else { "  " };
-                wrapped_line(prefix, Tone::Plain, text, Tone::Plain, false, width)
+                wrapped_line(prefix, Tone::Plain, text, Tone::QuestionText, true, width)
             })
             .collect::<Vec<_>>();
         // 소요 시간은 질문 줄에 띄우지 않는다. 기록 라벨과 역할 표시만 남긴다.
@@ -12927,11 +12929,15 @@ fn input_lines_with_controls(
             }
             None => composer_token_spans(&content, content_tone, composer_highlights),
         };
+        // An outside terminal paints the IME preedit itself, in the colour of the
+        // cell the cursor sits on — the blank right after the text. Leaving that
+        // blank in the chrome colour made the syllable being composed come out in
+        // the model colour instead of the ordinary text one.
         tail.push(PaintSpan {
             text: " ".repeat(panel_width.saturating_sub(
                 UnicodeWidthStr::width(prompt_prefix) + content_width,
             )),
-            tone: chrome_tone,
+            tone: Tone::Plain,
             bold: false,
         });
         rows.push(PaintLine {
@@ -13879,7 +13885,7 @@ fn status_effort_tone(effort: &str) -> Option<Tone> {
 fn tone_rgb(tone: Tone) -> Option<Rgb> {
     let palette = theme::palette();
     Some(match tone {
-        Tone::Plain | Tone::ComposerPreedit => palette.foreground,
+        Tone::Plain | Tone::ComposerPreedit | Tone::QuestionText => palette.foreground,
         Tone::Muted | Tone::Thinking | Tone::PlanDone => palette.muted,
         Tone::Accent => palette.accent,
         Tone::User => palette.blue,
@@ -18981,12 +18987,13 @@ mod tests {
 
         assert_eq!(rows[0].tone, Tone::ModelTerra);
         assert_eq!(rows[1].prefix_tone, Tone::ModelTerra);
-        // The `❯` glyph carries the agent colour; the rest of the chrome keeps
-        // the model tone.
+        // The `❯` glyph carries the agent colour; the rules keep the model tone.
+        // The blank the cursor sits on stays plain, so an outside terminal paints
+        // the IME preedit in the ordinary text colour.
         assert_eq!(rows[1].tone, Tone::AgentStandard);
         assert_eq!(
             rows[1].tail.last().map(|span| span.tone),
-            Some(Tone::ModelTerra)
+            Some(Tone::Plain)
         );
         assert_eq!(rows.last().map(|line| line.tone), Some(Tone::ModelTerra));
     }
@@ -24752,6 +24759,11 @@ mod tests {
         assert!(bottom.tail.is_empty());
         assert!(lines.iter().all(|line| !painted(line).contains("32s")));
         assert_eq!(lines[0].prefix, RESPONSE_BULLET_PREFIX);
+        assert_eq!(lines[0].tone, Tone::QuestionText, "질문 본문만 기울임으로 쓴다");
+        assert!(lines[0].bold, "질문 본문은 굵게도 쓴다");
+        let style = cell_style(Tone::QuestionText, false, None, false);
+        assert!(style.italic && !style.underlined);
+        assert_eq!(lines[0].prefix_tone, Tone::Plain);
         assert!(lines.iter().all(|line| painted_line_width(line) <= 29));
     }
 

@@ -3274,14 +3274,14 @@ mod tests {
                         RuntimeKind::OpenCode => combined_turn_instructions(&params, runtime).unwrap(),
                     };
                     assert_eq!(
-                        outgoing.contains("200자"),
+                        outgoing.contains("200 characters"),
                         role == crate::agent::AgentMode::Standard,
                         "{} / {}", runtime.label(), role.id(),
                     );
                     if role == crate::agent::AgentMode::Standard {
-                        assert!(outgoing.contains("공백·탭·줄바꿈을 제외"));
-                        assert!(outgoing.contains("상세한 분석을 명시적으로 요청한 경우에만"));
-                        assert!(outgoing.contains("선택·승인 설명과 코드 블록은 분량 제한과 글자 수 계산에서 제외"));
+                        assert!(outgoing.contains("excluding spaces, tabs, and line breaks"));
+                        assert!(outgoing.contains("Only when the user explicitly asks for a detailed analysis"));
+                        assert!(outgoing.contains("Choice and approval explanations and code blocks are excluded"));
                         assert!(!outgoing.contains("선택·승인 설명과 코드 블록도 포함"));
                         assert!(!outgoing.contains("선택·승인 답변은 제한하지 않는다"));
                         assert!(!outgoing.contains("선택·승인은 분량 제한 없이"));
