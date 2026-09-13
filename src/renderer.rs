@@ -2314,6 +2314,7 @@ impl Renderer {
         lines: &[PaintLine],
         plan_rows: usize,
         transcript: &[PaintLine],
+        previous_selected: Option<(usize, &[PaintLine])>,
     ) {
         let Some(range) = self.selection.range() else {
             return;
@@ -2324,9 +2325,12 @@ impl Renderer {
         // selected temporary row invalidates the highlight just as the old live
         // frame did.
         if self.selection_in_transcript {
+            // 지난 프레임의 전사는 호출부가 재사용하려고 이미 꺼내 간 뒤라, 선택
+            // 구간의 지난 줄을 인자로 받아 비교한다.
+            let (first, previous_rows) = previous_selected.unwrap_or((range.start.row, &[]));
             let changed = (range.start.row..=range.end.row).any(|row| {
-                self.fullscreen_display_lines
-                    .get(row)
+                row.checked_sub(first)
+                    .and_then(|index| previous_rows.get(index))
                     .zip(transcript.get(row))
                     .is_none_or(|(previous, current)| previous != current)
             });
@@ -3150,7 +3154,7 @@ impl Renderer {
             };
         let mut screen = main.lines;
         screen.extend(btw.lines);
-        self.reconcile_selection(&screen, 0, &[]);
+        self.reconcile_selection(&screen, 0, &[], None);
         let composer_rows = composer_selection
             .as_ref()
             .map(|composer| composer.first_row..composer.first_row + composer.layout.rows.len())
@@ -3535,6 +3539,21 @@ impl Renderer {
         // 지난 프레임이 만든 줄을 그대로 물려받아 확정 전사에서 새로 생긴 부분과
         // 이번 스트리밍 줄만 다시 만든다. 전사 전체를 복제하면 대화가 길어질수록
         // 프레임마다 그만큼을 새로 할당하게 된다.
+        // 선택이 서 있는 동안에는 선택 조정이 지난 프레임의 줄과 비교해야 한다.
+        // 바로 아래 take가 원본을 비우므로 선택 구간만 미리 복제해 둔다.
+        let previous_selected_rows = self
+            .selection
+            .range()
+            .filter(|_| self.selection_in_transcript)
+            .map(|range| {
+                (
+                    range.start.row,
+                    self.fullscreen_display_lines
+                        .get(range.start.row..=range.end.row)
+                        .unwrap_or_default()
+                        .to_vec(),
+                )
+            });
         let mut display_wrapped = std::mem::take(&mut self.fullscreen_display_lines);
         reuse_display_prefix(
             &mut display_wrapped,
@@ -3685,7 +3704,14 @@ impl Renderer {
         });
         self.last_transcript_start = start;
         self.last_transcript_screen_start = plan_rows;
-        self.reconcile_selection(&screen, plan_rows, &display_wrapped);
+        self.reconcile_selection(
+            &screen,
+            plan_rows,
+            &display_wrapped,
+            previous_selected_rows
+                .as_ref()
+                .map(|(first, rows)| (*first, rows.as_slice())),
+        );
         self.fullscreen_display_lines = display_wrapped;
         let full_repaint_rows = plan_rows_requiring_full_repaint(
             &self.previous_lines,
@@ -4342,26 +4368,28 @@ fn trailing_transcript_spacer_will_be_visible(
 }
 
 fn cell_style(tone: Tone, bold: bool, background: Option<Rgb>, selected: bool) -> CellStyle {
-    if selected {
-        return CellStyle {
-            foreground: Some(
-                tone_rgb(tone).map_or_else(theme::selection_fg, theme::selection_text),
-            ),
-            background: Some(theme::selection_bg()),
-            bold,
-            italic: false,
-            underlined: false,
-            crossed_out: false,
-        };
-    }
-    CellStyle {
+    let style = CellStyle {
         foreground: tone_rgb(tone),
         background,
         bold,
         italic: matches!(tone, Tone::Thinking | Tone::QuestionText),
         underlined: tone == Tone::MarkdownLink,
         crossed_out: tone == Tone::PlanDone,
+    };
+    if selected {
+        // 선택은 색만 바꾼다. 굵게·기울임은 글자 모양이라 선택 중에도 그대로
+        // 두고, 선택 배경과 겹치면 읽기 힘든 밑줄·취소선만 뺀다.
+        return CellStyle {
+            foreground: Some(
+                tone_rgb(tone).map_or_else(theme::selection_fg, theme::selection_text),
+            ),
+            background: Some(theme::selection_bg()),
+            underlined: false,
+            crossed_out: false,
+            ..style
+        };
     }
+    style
 }
 
 fn range_overlaps(columns: Option<&Range<usize>>, start: usize, end: usize) -> bool {
@@ -15920,7 +15948,7 @@ mod tests {
         // The paint that follows the key leaves the prompt rows alone, so the
         // highlight has to survive it.
         let lines = renderer.previous_lines.clone();
-        renderer.reconcile_selection(&lines, 0, &[]);
+        renderer.reconcile_selection(&lines, 0, &[], None);
         assert_eq!(renderer.composer_selection_range(), Some(0..10));
 
         // A drag makes an ordinary range again.
@@ -22915,6 +22943,7 @@ mod tests {
             ],
             0,
             &[],
+            None,
         );
         assert_eq!(
             renderer.finish_selection(2, 0),
@@ -22927,6 +22956,7 @@ mod tests {
             &[PaintLine::plain("replaced"), PaintLine::plain("status")],
             0,
             &[],
+            None,
         );
         assert_eq!(renderer.finish_selection(2, 0), SelectionResult::None);
     }
@@ -22945,7 +22975,7 @@ mod tests {
 
         assert!(renderer.begin_selection(5, 0));
         assert!(renderer.update_selection(7, 0));
-        renderer.reconcile_selection(&[spinner], 1, &[]);
+        renderer.reconcile_selection(&[spinner], 1, &[], None);
 
         assert!(renderer.selection.range().is_some());
     }
@@ -22968,11 +22998,16 @@ mod tests {
         assert!(renderer.update_selection(3, 1));
         assert_eq!(renderer.selected_text(), Some("활성".to_owned()));
 
+        let previous_rows = renderer.fullscreen_display_lines[1..2].to_vec();
+        let unchanged = renderer.fullscreen_display_lines.clone();
+        renderer.reconcile_selection(&unchanged, 0, &unchanged, Some((1, &previous_rows)));
+        assert!(renderer.selection.range().is_some());
+
         let changed = vec![
             PaintLine::plain("기록"),
             PaintLine::plain("활성 스트리밍 응답 추가"),
         ];
-        renderer.reconcile_selection(&changed, 0, &changed);
+        renderer.reconcile_selection(&changed, 0, &changed, Some((1, &previous_rows)));
         assert!(renderer.selection.range().is_none());
     }
 
@@ -24763,6 +24798,8 @@ mod tests {
         assert!(lines[0].bold, "질문 본문은 굵게도 쓴다");
         let style = cell_style(Tone::QuestionText, false, None, false);
         assert!(style.italic && !style.underlined);
+        let selected = cell_style(Tone::QuestionText, true, None, true);
+        assert!(selected.italic && selected.bold, "선택해도 기울임과 굵게는 남는다");
         assert_eq!(lines[0].prefix_tone, Tone::Plain);
         assert!(lines.iter().all(|line| painted_line_width(line) <= 29));
     }
