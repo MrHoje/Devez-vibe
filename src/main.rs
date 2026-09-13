@@ -4835,8 +4835,9 @@ fn auto_knowledge_context(auto_knowledge: bool) -> Value {
     let knowledge = if auto_knowledge {
         concat!(
             "현재 auto-knowledge는 On이다. 이전 auto-knowledge 상태 지침을 대체한다.\n",
-            "반복 실수, 검증된 해결법, 이후 작업에 필요한 확정 정보를 .knowledge의 주제별 문서에 기록한다. 기존 문서에 합치고 필요한 경우 폴더·문서를 만든다.\n",
-            "문서를 추가·수정·이름 변경하면 .knowledge/knowledge-index.md의 문서 제목·경로·간략한 설명도 갱신한다. 추측·임시 상태·민감정보는 기록하지 않는다. 현재 역할의 쓰기 제한과 사용자 지시를 따른다."
+            "반복 실수, 검증된 해결법, 이후 작업에 다시 필요한 확정 정보만 .knowledge의 주제별 문서에 기록한다. 기존 문서에 합치고 필요한 경우 폴더·문서를 만든다.\n",
+            "문서를 추가·수정·이름 변경하면 .knowledge/knowledge-index.md의 문서 제목·경로·간략한 설명도 갱신한다. 추측·임시 상태·민감정보는 기록하지 않는다.\n",
+            "테스트·빌드 실행 결과, 코드나 git 이력으로 다시 확인할 수 있는 내용, 이번 작업에서만 쓰는 경과는 기록하지 않는다. 남길 내용이 없으면 문서를 만들지 않는다. 현재 역할의 쓰기 제한과 사용자 지시를 따른다."
         )
     } else {
         "현재 auto-knowledge는 Off이다. 이전 auto-knowledge 상태 지침을 대체한다. .knowledge 문서와 인덱스를 자동으로 생성·갱신하지 않는다. 사용자가 기록을 명시적으로 요청하면 수행한다."
