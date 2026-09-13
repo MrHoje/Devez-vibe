@@ -576,8 +576,9 @@ impl BackendServer {
                         // model or permission change of its own.
                         if method == "turn/steer" {
                             return self
-                                .claude
-                                .request(
+                                .claude_turn(
+                                    &visible,
+                                    &backing,
                                     "session/steer",
                                     json!({
                                         "sessionId": backing,
@@ -586,13 +587,18 @@ impl BackendServer {
                                             .get("expectedTurnId")
                                             .cloned()
                                             .unwrap_or(Value::Null),
-                                        "handoffContext": turn_context
+                                        "handoffContext": turn_context,
+                                        // 합류할 턴이 사라져 새 턴이 되면 이 제한이
+                                        // 역할의 읽기 전용을 지키는 유일한 수단이다.
+                                        "toolPolicy": params.get("toolPolicy").cloned().unwrap_or(Value::Null)
                                     }),
+                                    &params,
                                 )
                                 .await;
                         }
-                        self.claude
-                            .request(
+                        self.claude_turn(
+                                &visible,
+                                &backing,
                                 "session/prompt",
                                 json!({
                                     "sessionId": backing,
@@ -603,6 +609,7 @@ impl BackendServer {
                                     "handoffContext": turn_context,
                                     "toolPolicy": params.get("toolPolicy").cloned().unwrap_or(Value::Null)
                                 }),
+                                &params,
                             )
                             .await
                     } else if selected == RuntimeKind::OpenCode {
@@ -634,9 +641,11 @@ impl BackendServer {
                     } else {
                         let backing = self.ensure_codex_route(&visible, &params).await?;
                         prepare_codex_turn_context(&mut params);
-                        apply_codex_tool_policy(&mut params);
                         if method == "turn/start" {
+                            apply_codex_tool_policy(&mut params);
                             apply_codex_question_mode(&mut params)?;
+                        } else if let Some(object) = params.as_object_mut() {
+                            object.remove("toolPolicy");
                         }
                         params["threadId"] = json!(backing);
                         self.codex()?.request(method, params).await
@@ -1695,6 +1704,43 @@ impl BackendServer {
         Ok(backing)
     }
 
+    /// 브리지가 끊겼다 다시 뜨면 세션 목록이 비어 이어 말하기가 실패한다.
+    /// 그때만 전사에서 세션을 되살린 뒤 한 번 다시 보내 대화를 잇는다.
+    async fn claude_turn(
+        &self,
+        visible: &str,
+        backing: &str,
+        method: &str,
+        mut payload: Value,
+        params: &Value,
+    ) -> Result<Value> {
+        match self.claude.request(method, payload.clone()).await {
+            Err(error) if is_missing_claude_session(&error) => error,
+            other => return other,
+        };
+        let route = self.route(visible);
+        let cwd = route
+            .as_ref()
+            .map(|route| route.cwd.clone())
+            .unwrap_or_else(|| self.cwd.clone());
+        // 되살리는 것은 새 세션을 여는 것과 같다. 이어 말하기 요청에는 지침도
+        // 모델도 실리지 않으므로, 여기서 다시 채우지 않으면 DevezVibe 규칙이
+        // 빠진 채로 세션이 열리고 고른 모델도 기본값으로 되돌아간다.
+        let mut opening = params.clone();
+        opening["claudeDeveloperInstructions"] = json!(crate::CLAUDE_DEVEZ_INSTRUCTIONS);
+        apply_remembered_claude_selection(&mut opening, route.as_ref());
+        let mut request = claude_session_params(&opening, &cwd, Some(backing));
+        if opening.get("model").and_then(Value::as_str).is_none() {
+            // 기억한 모델이 없으면 기본값 대신 비워, 전사의 마지막 모델로 연다.
+            request["model"] = Value::Null;
+        }
+        let mut resumed = self.claude.request("session/resume", request).await?;
+        self.register_claude_response_as(&mut resumed, cwd, Some(visible))?;
+        // 재개가 다른 id에 붙을 수 있으니 실제로 살아난 세션으로 보낸다.
+        payload["sessionId"] = json!(self.backing_id(visible, RuntimeKind::Claude)?);
+        self.claude.request(method, payload).await
+    }
+
     async fn ensure_claude_route(&self, visible: &str, params: &Value) -> Result<String> {
         if let Some(route) = self.route(visible)
             && let Some(backing) = route.claude_id
@@ -2607,6 +2653,11 @@ fn apply_remembered_open_code_selection(params: &mut Value, route: Option<&Route
     }
 }
 
+/// 다시 뜬 브리지에는 예전 세션이 없다. 브리지가 그때 내는 문구다.
+fn is_missing_claude_session(error: &anyhow::Error) -> bool {
+    error.to_string().contains("Claude 세션을 찾을 수 없습니다")
+}
+
 fn claude_session_params(params: &Value, cwd: &Path, session_id: Option<&str>) -> Value {
     let mut request = json!({
         "cwd": cwd,
@@ -3039,6 +3090,27 @@ mod tests {
         assert!(is_vibe_setting_key("status_line_context"));
         assert!(!is_vibe_setting_key("model"));
         assert!(!is_vibe_setting_key("plugins.example"));
+    }
+
+    /// 다시 뜬 브리지에서만 복구를 켜야 하므로 브리지 문구와 묶여 있다.
+    /// 브리지가 문구를 바꾸면 이 검사가 먼저 깨진다.
+    #[test]
+    fn a_missing_session_is_told_apart_from_other_failures() {
+        let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
+        assert_eq!(
+            bridge
+                .matches("throw new Error(`Claude 세션을 찾을 수 없습니다: ${id}`)")
+                .count(),
+            3,
+            "프롬프트·이어 말하기·재개가 내는 문구"
+        );
+
+        assert!(is_missing_claude_session(&anyhow::anyhow!(
+            "session/prompt: Claude 세션을 찾을 수 없습니다: abc"
+        )));
+        assert!(!is_missing_claude_session(&anyhow::anyhow!(
+            "session/prompt: Claude SDK 브리지가 10분 동안 응답하지 않아 요청을 중단했습니다."
+        )));
     }
 
     #[test]

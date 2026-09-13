@@ -6646,10 +6646,21 @@ impl AppState {
     }
 
     fn plan_is_active(&self) -> bool {
-        !self.plan_panel_hidden
-            && self.busy
-            && self.turn_id.is_some()
-            && self.plan_turn_id == self.turn_id
+        if self.plan_panel_hidden {
+            return false;
+        }
+        if self.busy {
+            return self.turn_id.is_some() && self.plan_turn_id == self.turn_id;
+        }
+        // 백그라운드 하위 에이전트는 턴이 끝난 뒤에도 계속 돈다. 그동안 남은
+        // 단계는 실제로 진행 중이므로 스피너를 이어 준다.
+        !self.subagents.is_empty()
+            && self.plan_summary.as_ref().is_some_and(|summary| {
+                summary
+                    .steps
+                    .iter()
+                    .any(|step| step.status != PlanStepStatus::Completed)
+            })
     }
 
     fn visible_plan_summary(&self) -> Option<&PlanSummary> {
@@ -20631,6 +20642,44 @@ mod tests {
             &json!({ "plan": [{ "step": "next", "status": "inProgress" }] }),
         );
         assert!(state.view().plan_active);
+    }
+
+    #[test]
+    fn an_unfinished_step_keeps_spinning_while_a_subagent_outlives_the_turn() {
+        let mut state = test_state();
+        state.set_turn_started("turn-one".to_owned());
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [
+                { "step": "done", "status": "completed" },
+                { "step": "review", "status": "inProgress" }
+            ] }),
+        );
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({ "subagents": [{ "id": "review", "name": "reviewer", "backgroundTask": true }] }),
+        );
+        state.handle_notification("turn/completed", &json!({}));
+        assert!(state.view().plan_active);
+
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
+        assert!(!state.view().plan_active);
+    }
+
+    #[test]
+    fn a_fully_completed_plan_stays_completed_while_a_subagent_outlives_the_turn() {
+        let mut state = test_state();
+        state.set_turn_started("turn-one".to_owned());
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [{ "step": "done", "status": "completed" }] }),
+        );
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({ "subagents": [{ "id": "review", "name": "reviewer", "backgroundTask": true }] }),
+        );
+        state.handle_notification("turn/completed", &json!({}));
+        assert!(!state.view().plan_active);
     }
 
     #[test]

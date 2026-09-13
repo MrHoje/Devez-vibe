@@ -2637,7 +2637,7 @@ async fn execute_action(
             };
             devezcode::note_prompt(&text);
             let input = state.turn_input(text);
-            let params = json!({
+            let mut params = json!({
                 "threadId": state.thread_id,
                 "expectedTurnId": turn_id,
                 "input": input,
@@ -2645,6 +2645,12 @@ async fn execute_action(
                     "devez-vibe-knowledge": auto_knowledge_context(state.auto_knowledge())
                 }
             });
+            // The running turn keeps its own role, but the turn this input lands
+            // in may be a fresh one the backend had to reopen. Carrying the role's
+            // write restriction along is what keeps a read-only role read-only then.
+            if let Some(policy) = state.agent_mode().tool_policy() {
+                params["toolPolicy"] = policy;
+            }
             if let Err(error) = server.request("turn/steer", params).await {
                 state.push_notice(BlockKind::Error, "추가 입력 실패", error.to_string());
             }

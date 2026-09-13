@@ -21,9 +21,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "질문 기록의 질문 줄을 굵은 기울임으로 표시해 답변과 구분합니다.",
-    "Windows Terminal에서 한글을 조합할 때 글자가 모델 색으로 보이던 문제를 고쳤습니다.",
-    "Builder 역할 지침을 영어로 통일해 매 턴 주입 토큰을 줄였습니다.",
+    "Claude 연결이 끊겨도 다음 요청에서 다시 연결하고 대화를 이어갑니다.",
+    "백엔드나 Claude 명령이 응답을 멈추면 기다리기만 하지 않고 중단하고 알려 줍니다.",
+    "백그라운드 하위 에이전트가 도는 동안 계획 진행 표시가 이어집니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

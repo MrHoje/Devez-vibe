@@ -52,6 +52,11 @@ type LoadingMap = Arc<Mutex<HashMap<String, LoadedHistory>>>;
 type HistoryMap = Arc<Mutex<HashMap<String, Value>>>;
 type Notification = (String, Value);
 
+/// 백엔드가 죽지 않고 응답만 멈추면 요청이 영원히 매달려 스피너만 남는다.
+/// 세션 시작이나 큰 전사 복원도 이보다 오래 걸리지는 않으므로, 넘기면
+/// 멈춘 것으로 보고 사용자에게 알린다.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Background child status is local OpenCode state, so polling once a second
 /// removes a completed row promptly without adding external network traffic.
 const BACKGROUND_SUBAGENT_STATUS_POLL: Duration = Duration::from_secs(1);
@@ -373,10 +378,17 @@ impl OpenCodeClient {
             self.pending.lock().await.remove(&id);
             return Err(error);
         }
-        match response_rx.await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(error)) => bail!("{method}: {error}"),
-            Err(_) => bail!("{method}: OpenCode ACP 응답 채널이 종료되었습니다."),
+        match timeout(REQUEST_TIMEOUT, response_rx).await {
+            Ok(Ok(Ok(result))) => Ok(result),
+            Ok(Ok(Err(error))) => bail!("{method}: {error}"),
+            Ok(Err(_)) => bail!("{method}: OpenCode ACP 응답 채널이 종료되었습니다."),
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                bail!(
+                    "{method}: OpenCode가 {}분 동안 응답하지 않아 요청을 중단했습니다.",
+                    REQUEST_TIMEOUT.as_secs() / 60
+                )
+            }
         }
     }
 
@@ -2166,6 +2178,34 @@ fn image_mime(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 백엔드가 살아 있는 채로 응답만 멈추면 요청을 끊고 알린다. 시간을 멈춘
+    /// 검사라 실제로 상한만큼 기다리지 않는다.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_backend_ends_the_request_instead_of_hanging() {
+        let (outbound, _inbox) = mpsc::unbounded_channel();
+        let client = OpenCodeClient {
+            outbound: Arc::new(StdMutex::new(Some(outbound))),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            detached: Arc::new(Mutex::new(HashMap::new())),
+            active_turns: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+            next_turn: Arc::new(AtomicU64::new(1)),
+            events: mpsc::unbounded_channel().0,
+        };
+
+        let error = client
+            .request("session/new", json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("응답하지 않아"), "{error}");
+        assert!(
+            client.pending.lock().await.is_empty(),
+            "끊은 요청은 대기 목록에 남기지 않는다"
+        );
+    }
 
     #[test]
     fn open_code_skill_catalog_is_normalized_for_composer_completion() {
