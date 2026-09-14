@@ -59,6 +59,8 @@ const NOTICE_TTL: Duration = Duration::from_millis(1_400);
 /// 편집이 이어지는 동안 패널의 변경 섹션이 git에 묻는 간격. 프레임마다 git을
 /// 띄우지 않으면서도 한 편집이 끝나기 전에 화면이 따라온다.
 const SIDE_PANEL_DIFF_INTERVAL: Duration = Duration::from_millis(1_500);
+/// 인용해 보내는 patch의 길이 한계. 순정이 diff 선택을 자르는 자리와 같다.
+const DIFF_REFERENCE_LIMIT: usize = 2_000;
 /// A second Ctrl+C only quits while its warning is still on screen, so the
 /// armed state and the notice share one window.
 const QUIT_ARM_WINDOW: Duration = Duration::from_secs(3);
@@ -1104,6 +1106,9 @@ fn move_model_index_in(candidates: &[usize], model_index: usize, direction: i8) 
 
 pub enum Action {
     None,
+    /// 클립보드에만 담고 알림은 띄우지 않는다. 인용처럼 무엇을 집었는지 화면이
+    /// 이미 보여 주는 경우, 알림은 같은 말을 한 번 더 하는 셈이다.
+    CopyQuietly(String),
     ShowStatus,
     Submit(String),
     Steer(String),
@@ -1224,7 +1229,7 @@ pub enum Action {
         model: String,
         effort: String,
     },
-    /// Save the panel width the [+]/[-] buttons settled on, for every session.
+    /// Save the panel width the [◀]/[▶] buttons settled on, for every session.
     PersistSidePanelWidth(usize),
     /// Save whether completed progress responses stay visible or fold away.
     PersistResponseDisplayMode(ResponseDisplayMode),
@@ -1345,6 +1350,14 @@ struct SideParent {
 struct ParentTurn {
     id: String,
     started_at: Instant,
+}
+
+/// 패널의 patch에서 드래그해 둔 인용. 다음 프롬프트에 실려 나가고 비워진다.
+struct DiffReference {
+    /// 인용이 나온 파일. 패널이 아직 어느 파일도 고르지 않았으면 비어 있다.
+    path: Option<String>,
+    line_count: usize,
+    text: String,
 }
 
 struct ActiveItem {
@@ -3681,6 +3694,13 @@ pub struct AppState {
     side_panel_diff_at: Option<Instant>,
     /// 직전에 본 `busy`. 턴이 끝나는 순간을 잡아 마지막 편집까지 반영한다.
     side_panel_diff_busy: bool,
+    /// 읽는 중인 diff. git은 이 저장소에서도 100ms쯤 걸려, 화면을 그리는 사이에
+    /// 부르면 그만큼 입력이 밀린다. 그래서 따로 읽고 결과만 받아 온다.
+    side_panel_diff_job: Option<std::sync::mpsc::Receiver<Vec<crate::git_diff::FileDiff>>>,
+    /// 패널의 patch에서 드래그해 둔 인용. 다음 프롬프트가 실어 보내고 비워진다.
+    diff_reference: Option<DiffReference>,
+    /// 다음 입력 앞에 붙일 인용문. 멘션 찾기가 끝난 뒤에 붙어야 해서 여기서 기다린다.
+    staged_diff_reference: Option<String>,
     status_line_settings: StatusLineSettings,
     /// Which runtimes this machine may connect to. Both start off — a fresh
     /// install picks in `/provider` — and nothing dials a runtime that is off.
@@ -3931,6 +3951,9 @@ impl AppState {
             side_panel_prompts_expanded: true,
             side_panel_diff: Vec::new(),
             side_panel_diff_path: None,
+            side_panel_diff_job: None,
+            diff_reference: None,
+            staged_diff_reference: None,
             side_panel_diff_expanded: true,
             side_panel_diff_at: None,
             side_panel_diff_busy: false,
@@ -4726,7 +4749,7 @@ impl AppState {
             self.workspace_entries.clear();
             self.rebuild_completion_catalog();
         }
-        self.restore_session_side_panel();
+        self.adopt_session_side_panel();
         self.restore_session_modes();
         self.select_model_and_effort(model, effort);
     }
@@ -5013,16 +5036,23 @@ impl AppState {
 
     pub fn turn_input(&mut self, text: String) -> Vec<Value> {
         let queued = std::mem::take(&mut self.queued_input_pending);
+        // 인용문은 사람이 쓴 글자가 아니다. 순정처럼 사용자 글자와 다른 조각으로
+        // 앞에 서야 @나 $가 멘션으로 읽히지 않고, 컴포저에서 고른 첨부의 글자
+        // 위치도 밀리지 않는다.
+        let mut input = std::mem::take(&mut self.staged_diff_reference)
+            .map(|quote| vec![json!({"type": "text", "text": quote, "text_elements": []})])
+            .unwrap_or_default();
         if self.pending_async_answer.as_deref() == Some(text.as_str()) {
-            return vec![json!({"type": "text", "text": text, "text_elements": []})];
+            input.push(json!({"type": "text", "text": text, "text_elements": []}));
+            return input;
         }
         let triggers = mention_triggers(&text);
         let text_chars = text.chars().collect::<Vec<_>>();
-        let mut input = vec![json!({
+        input.push(json!({
             "type": "text",
             "text": text,
             "text_elements": []
-        })];
+        }));
         if !queued {
             for path in std::mem::take(&mut self.composer_images) {
                 input.push(json!({ "type": "localImage", "path": path }));
@@ -6731,6 +6761,7 @@ impl AppState {
             side_panel_diff: &self.side_panel_diff,
             side_panel_diff_selected: self.side_panel_diff_path.as_deref(),
             side_panel_diff_expanded: self.side_panel_diff_expanded,
+            diff_reference_lines: self.diff_reference.as_ref().map(|quote| quote.line_count),
             side_panel_integrations: self.side_panel_integration_views(),
         }
     }
@@ -6848,7 +6879,7 @@ impl AppState {
         let inline_answer_active = self.buffers_pending_text_input();
         // Compaction animates the same row a turn does, so it keeps the frame
         // loop alive even on a runtime that reports no turn while it runs.
-        let animating = self.busy || self.compacting();
+        let animating = self.busy || self.compacting() || self.host_loading;
         // A background Claude agent outlives its parent turn. Its elapsed label
         // changes once a second, and the narrow animation path does not repaint
         // these rows, so only that boundary asks for a full frame.
@@ -7430,6 +7461,7 @@ impl AppState {
         if key.code == KeyCode::Esc && !self.busy {
             self.editor.clear();
             self.composer_images.clear();
+            self.clear_diff_reference();
             self.shell_mode = false;
             self.selected_completion_bindings.clear();
             self.suggestions_dismissed_text = None;
@@ -7659,7 +7691,7 @@ impl AppState {
                 Action::Tick(true)
             }
             // Alt+P opens the docked side panel and shuts it again; its width
-            // belongs to the [+]/[-] buttons in the panel's own masthead. A bare
+            // belongs to the [◀]/[▶] buttons in the panel's own masthead. A bare
             // capital would be swallowed by the composer's typed-text buffer, so
             // the chord carries Alt to reach this branch at all.
             KeyCode::Char('p') | KeyCode::Char('P') if alt && !ctrl => {
@@ -9452,6 +9484,29 @@ impl AppState {
         self.submit_prompt(text, Block::new(BlockKind::User, title, display))
     }
 
+    /// 인용해 둔 patch를 다음에 나갈 입력 앞에 실을 자리에 옮겨 두고 배지를 거둔다.
+    /// 문구도 자르는 자리도 순정이 diff 선택을 전할 때 쓰는 그대로다. 특히 마지막
+    /// 한 줄이 없으면 모델이 인용을 이번 지시의 대상으로 단정한다.
+    fn stage_diff_reference(&mut self) {
+        let Some(quote) = self.diff_reference.take() else {
+            return;
+        };
+        let count = quote.line_count;
+        let noun = if count == 1 { "line" } else { "lines" };
+        let place = quote
+            .path
+            .map(|path| format!(" (in {path})"))
+            .unwrap_or_default();
+        let body = match quote.text.char_indices().nth(DIFF_REFERENCE_LIMIT) {
+            Some((cut, _)) => format!("{}\n... (truncated)", &quote.text[..cut]),
+            None => quote.text,
+        };
+        self.staged_diff_reference = Some(format!(
+            "The user selected the following {count} {noun} from the diff view{place}:\n\
+             {body}\n\nThis may or may not be related to the current task."
+        ));
+    }
+
     fn submit_prompt(&mut self, text: String, prompt: Block) -> Action {
         if text.is_empty() && self.composer_images.is_empty() {
             return Action::None;
@@ -9479,6 +9534,10 @@ impl AppState {
             self.requeue(text);
             return Action::None;
         }
+        // 인용은 컴포저 글자가 아니므로 실제로 나가는 순간에야 실린다. 줄에서
+        // 되돌아간 프롬프트는 다시 이 자리를 지나므로, 그때까지 배지를 그대로 두면
+        // 인용이 엉뚱한 프롬프트에 붙지 않는다. 슬래시 명령은 위에서 갈라졌다.
+        self.stage_diff_reference();
         self.commit_welcome_card();
         let steering = self.busy;
         if !steering {
@@ -9600,7 +9659,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex] MODEL  Select a provider and model\nFor OpenCode, switch with /provider opencode, then select a model with /model\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}/auto-knowledge [on|off]  지식 자동 기록 켜기·끄기\n{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|researcher|goal-runner]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 열기·닫기\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+Z / Ctrl+Y  입력 실행 취소·다시 실행\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 열기·닫기(폭은 패널 머리글의 [+][-])\nShift+Tab  Claude 권한 모드 전환"),
+                    format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex] MODEL  Select a provider and model\nFor OpenCode, switch with /provider opencode, then select a model with /model\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}/auto-knowledge [on|off]  지식 자동 기록 켜기·끄기\n{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|researcher|goal-runner]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 열기·닫기\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+Z / Ctrl+Y  입력 실행 취소·다시 실행\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 열기·닫기(폭은 패널 머리글의 [◀][▶])\nShift+Tab  Claude 권한 모드 전환"),
                 ));
                 Action::None
             }
@@ -12805,7 +12864,9 @@ impl AppState {
             return Some(notice.to_owned());
         }
         if self.host_loading {
-            return Some("Loading session..".to_owned());
+            // The frame counter runs at 120ms; two frames per dot keeps the
+            // cycle readable at roughly one step per quarter second.
+            return Some(format!("Loading session{}", ".".repeat(self.spinner_frame / 2)));
         }
         if self.busy && !self.turn_interrupted {
             if let Some(reset) = self.claude_usage_limit_reset {
@@ -13198,11 +13259,15 @@ impl AppState {
     /// with rather than another session's.
     pub fn toggle_side_panel(&mut self) -> bool {
         self.side_panel_open = !self.side_panel_open;
+        // 패널이 닫히면 인용의 출처를 더는 볼 수 없으므로 함께 거둔다.
+        if !self.side_panel_open {
+            self.clear_diff_reference();
+        }
         let _ = write_session_side_panel_open(&self.thread_id, self.side_panel_open);
         self.side_panel_open
     }
 
-    /// 머리글의 [+]/[-]가 부르는 폭 조절. 폭은 모든 세션이 함께 쓰는 값이라 전역
+    /// 머리글의 [◀]/[▶]가 부르는 폭 조절. 폭은 모든 세션이 함께 쓰는 값이라 전역
     /// 설정에 저장한다. `total_width`는 지금 터미널의 열 수다.
     pub fn adjust_side_panel_width(&mut self, steps: isize, total_width: u16) -> Action {
         let step = crate::renderer::SIDE_PANEL_WIDTH_STEP as isize;
@@ -13224,6 +13289,20 @@ impl AppState {
         // A session nobody opened the panel in starts closed instead of
         // inheriting whatever the previous session was left on.
         self.side_panel_open = read_session_side_panel_open(&self.thread_id).unwrap_or(false);
+    }
+
+    /// 화면에 이미 열려 있던 패널은 세션이 묶여도 그대로 둔다. 기록이 없다는 것은
+    /// 이 세션에서 아직 여닫은 적이 없다는 뜻이지 닫으라는 뜻이 아니다.
+    fn adopt_session_side_panel(&mut self) {
+        if self.thread_id.is_empty() {
+            return;
+        }
+        match read_session_side_panel_open(&self.thread_id) {
+            Some(open) => self.side_panel_open = open,
+            None => {
+                let _ = write_session_side_panel_open(&self.thread_id, self.side_panel_open);
+            }
+        }
     }
 
     /// Records this session's vibe/response modes beside its thread id so a later
@@ -13317,17 +13396,37 @@ impl AppState {
         self.side_panel_diff_busy = self.busy;
         if !self.side_panel_open {
             self.side_panel_diff_at = None;
+            self.side_panel_diff_job = None;
             return false;
         }
         let due = match self.side_panel_diff_at {
             None => true,
             Some(at) => turn_ended || (self.busy && at.elapsed() >= SIDE_PANEL_DIFF_INTERVAL),
         };
-        if !due {
-            return false;
+        if due && self.side_panel_diff_job.is_none() {
+            self.side_panel_diff_at = Some(Instant::now());
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let cwd = self.cwd.clone();
+            std::thread::spawn(move || {
+                let _ = sender.send(crate::git_diff::uncommitted(Path::new(&cwd)));
+            });
+            self.side_panel_diff_job = Some(receiver);
         }
-        self.side_panel_diff_at = Some(Instant::now());
-        let files = crate::git_diff::uncommitted(Path::new(&self.cwd))
+        let Some(job) = self.side_panel_diff_job.as_ref() else {
+            return false;
+        };
+        let files = match job.try_recv() {
+            Ok(files) => files,
+            // 아직 읽는 중이면 다음 틱에 다시 본다. 스레드가 사라졌으면 그 자리를
+            // 비워 다음 차례에 새로 읽는다.
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.side_panel_diff_job = None;
+                return false;
+            }
+        };
+        self.side_panel_diff_job = None;
+        let files = files
             .into_iter()
             .map(|file| {
                 let (additions, deletions) = diff_stats(&file.patch);
@@ -13374,6 +13473,22 @@ impl AppState {
 
     pub fn select_side_panel_diff(&mut self, path: String) {
         self.side_panel_diff_path = Some(path);
+    }
+
+    /// 패널의 patch에서 끌어낸 인용을 다음 프롬프트까지 들고 있는다. 새 선택은
+    /// 앞의 것을 갈아치운다.
+    pub fn set_diff_reference(&mut self, text: String) -> bool {
+        self.diff_reference = Some(DiffReference {
+            path: self.side_panel_diff_path.clone(),
+            line_count: text.lines().count(),
+            text,
+        });
+        true
+    }
+
+    /// 인용을 거둔다. 보내고 나서, 그리고 더는 볼 수 없게 되었을 때.
+    pub fn clear_diff_reference(&mut self) -> bool {
+        self.diff_reference.take().is_some()
     }
 
     pub fn toggle_plan_summary(&mut self) {
@@ -16595,7 +16710,7 @@ fn read_vibe_config_value(key: &str) -> Option<String> {
         })
 }
 
-/// 전역 설정에 저장해 둔 패널 폭. 머리글의 [+]/[-]로 정한 값이며, 설정이 없으면
+/// 전역 설정에 저장해 둔 패널 폭. 머리글의 [◀]/[▶]로 정한 값이며, 설정이 없으면
 /// 가장 좁은 폭으로 시작한다.
 fn read_default_side_panel_width() -> usize {
     read_vibe_config_value("side_panel_width")
@@ -17075,6 +17190,24 @@ mod tests {
         assert_eq!(many[0].0, "session-5");
     }
 
+    /// 프롬프트를 보내고 세션이 묶이는 순간 패널이 닫혀 버리면, 응답을 보려고
+    /// 열어 둔 자리가 매번 사라진다.
+    #[test]
+    fn attaching_a_session_leaves_an_open_panel_open() {
+        let mut state = test_state();
+        state.toggle_side_panel();
+        assert!(state.side_panel_open());
+
+        state.attach_thread(
+            format!("attach-{}", std::process::id()),
+            "cwd".to_owned(),
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+
+        assert!(state.side_panel_open(), "묶인다고 닫히지는 않는다");
+    }
+
     #[test]
     fn display_path_leaves_paths_outside_the_session_alone() {
         assert_eq!(
@@ -17153,6 +17286,68 @@ mod tests {
             "gpt-5.6-sol",
             Some("high"),
         )
+    }
+
+    /// 패널에서 끌어낸 인용은 컴포저 글자가 아니라 배지로만 서 있다가, 보낼 때
+    /// 프롬프트 앞에 붙고 자리를 비운다.
+    #[test]
+    fn a_diff_quote_rides_along_with_the_next_prompt_and_then_clears() {
+        let mut state = test_state();
+        state.side_panel_diff_path = Some("src/main.rs".to_owned());
+        assert!(state.set_diff_reference("let fresh = 1;\nlet other = 2;".to_owned()));
+        assert_eq!(state.view().diff_reference_lines, Some(2));
+        assert!(state.editor.is_empty(), "인용은 컴포저에 글자를 넣지 않는다");
+
+        let Action::Submit(text) = state.submit_text("고쳐줘".to_owned(), "고쳐줘".to_owned())
+        else {
+            panic!("프롬프트가 나가야 한다");
+        };
+        assert_eq!(text, "고쳐줘", "인용은 보낼 때 입력에서 붙는다");
+        let input = state.turn_input(text);
+        assert_eq!(input.len(), 2);
+        assert_eq!(
+            input[0].get("text").and_then(Value::as_str).unwrap(),
+            concat!(
+                "The user selected the following 2 lines from the diff view ",
+                "(in src/main.rs):\n",
+                "let fresh = 1;\nlet other = 2;\n\n",
+                "This may or may not be related to the current task.",
+            )
+        );
+        assert_eq!(input[1].get("text").and_then(Value::as_str), Some("고쳐줘"));
+        assert_eq!(state.view().diff_reference_lines, None);
+    }
+
+    /// 줄로 되돌아간 프롬프트는 아직 나가지 않았다. 인용도 배지째 남아 있다가 그
+    /// 프롬프트가 실제로 나갈 때 함께 실린다.
+    #[test]
+    fn a_requeued_prompt_keeps_its_diff_quote_waiting() {
+        let mut state = test_state();
+        assert!(state.set_diff_reference("let fresh = 1;".to_owned()));
+        state.compacting_started_at = Some(Instant::now());
+
+        assert!(matches!(
+            state.submit_text("고쳐줘".to_owned(), "고쳐줘".to_owned()),
+            Action::None
+        ));
+        assert_eq!(state.view().diff_reference_lines, Some(1));
+
+        state.compacting_started_at = None;
+        let queued = state.queued_prompts.pop_front().unwrap();
+        let Action::Submit(text) = state.start_queued_prompt(queued) else {
+            panic!("대기하던 프롬프트가 나가야 한다");
+        };
+        let input = state.turn_input(text);
+        assert_eq!(input.len(), 2, "인용이 함께 나가지 않음: {input:?}");
+    }
+
+    /// 슬래시 명령은 인용이 앞에 붙으면 명령으로 읽히지 않는다.
+    #[test]
+    fn a_diff_quote_never_gets_in_front_of_a_slash_command() {
+        let mut state = test_state();
+        assert!(state.set_diff_reference("let fresh = 1;".to_owned()));
+        state.submit_text("/clear".to_owned(), "/clear".to_owned());
+        assert_eq!(state.view().diff_reference_lines, Some(1));
     }
 
     #[test]
@@ -18085,7 +18280,29 @@ mod tests {
         state.set_host_loading(true);
         assert!(!state.host_turn_busy());
         assert!(state.host_loading());
-        assert_eq!(state.view().activity.as_deref(), Some("Loading session.."));
+        assert_eq!(state.view().activity.as_deref(), Some("Loading session"));
+
+        // The dots cycle through "", ".", "..", "..." and start over.
+        let frames: Vec<String> = (0..9)
+            .map(|_| {
+                state.tick();
+                state.view().activity.unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(
+            frames,
+            [
+                "Loading session",
+                "Loading session.",
+                "Loading session.",
+                "Loading session..",
+                "Loading session..",
+                "Loading session...",
+                "Loading session...",
+                "Loading session",
+                "Loading session",
+            ]
+        );
 
         state.set_host_loading(false);
         assert!(!state.host_loading());
@@ -27899,6 +28116,28 @@ mod tests {
             mention_triggers("mail foo@sample.com, then use @sample"),
             vec![('@', "sample".to_owned())]
         );
+    }
+
+    /// 인용문 안의 `$이름`은 사람이 부른 것이 아니므로 skill을 끌어오지 않는다.
+    #[test]
+    fn a_diff_quote_does_not_summon_a_skill_it_happens_to_mention() {
+        let mut state = test_state();
+        state.update_skills(&json!({
+            "data": [{
+                "skills": [{
+                    "name": "calendar",
+                    "path": "C:/skills/calendar/SKILL.md",
+                    "enabled": true
+                }]
+            }]
+        }));
+        assert!(state.set_diff_reference("let day = $calendar;".to_owned()));
+        state.stage_diff_reference();
+
+        let input = state.turn_input("고쳐줘".to_owned());
+
+        assert_eq!(input.len(), 2, "인용문만 보고 붙인 항목이 있다: {input:?}");
+        assert_eq!(input[1].get("text").and_then(Value::as_str), Some("고쳐줘"));
     }
 
     #[test]

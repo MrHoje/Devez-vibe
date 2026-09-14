@@ -195,6 +195,76 @@ async fn live_codex_async_question_recovery() {
     }
 }
 
+/// 패널에서 끌어낸 인용은 사용자 글자와 별개의 조각으로 나간다. Codex가 그 조각을
+/// 받아 주는지, 모델이 그 안의 값을 읽는지는 실제로 보내 보아야 알 수 있다.
+#[tokio::test]
+#[ignore = "설치된 Codex와 실제 모델 사용 필요"]
+async fn live_codex_carries_a_diff_selection_beside_the_prompt() {
+    let model = "gpt-5.6-luna";
+    let mut server = AppServer::spawn(Path::new("codex"), None).await.unwrap();
+    let result = std::panic::AssertUnwindSafe(async {
+        server.initialize().await.unwrap();
+        let response = server
+            .request(
+                "thread/start",
+                json!({
+                    "model": model, "ephemeral": true, "cwd": std::env::temp_dir(),
+                    "approvalPolicy": "never", "permissions": ":read-only",
+                    "developerInstructions": crate::DEVEZ_INSTRUCTIONS
+                }),
+            )
+            .await
+            .unwrap();
+        let mut state = AppState::new(
+            response["thread"]["id"].as_str().unwrap().into(),
+            std::env::temp_dir().to_string_lossy().into(),
+            "시험".into(),
+            Vec::new(),
+            model,
+            Some("low"),
+        );
+        let token = format!(
+            "ZQX{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        assert!(state.set_diff_reference(format!("let rune = \"{token}\";")));
+        state.handle_paste(
+            "인용된 줄에 들어 있는 값을 그대로 한 번만 적으세요. 파일이나 셸 작업은 하지 마세요.",
+        );
+        let Action::Submit(text) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+            panic!("프롬프트가 나가야 한다");
+        };
+        let input = state.turn_input(text);
+        assert_eq!(input.len(), 2, "인용이 별도 조각으로 서지 않음: {input:?}");
+        let mut params = json!({
+            "threadId": state.thread_id, "model": model, "effort": "low",
+            "permissions": ":read-only",
+            "additionalContext": crate::turn_additional_context(state.agent_mode(), false),
+            "input": input
+        });
+        super::prepare_codex_turn_context(&mut params);
+        server
+            .request("turn/start", params)
+            .await
+            .expect("Codex가 인용 조각이 붙은 입력을 거부함");
+        let answer = finish(&mut server, &mut state, false).await;
+        assert!(
+            answer.contains(&token),
+            "모델이 인용된 값을 읽지 못함: {answer}"
+        );
+        println!("검증 통과: {model} 인용 조각 전송과 모델 인식");
+    })
+    .catch_unwind()
+    .await;
+    server.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 async fn event(server: &mut AppServer, state: &mut AppState) -> ServerEvent {
     let event = timeout(Duration::from_secs(120), server.next_event())
         .await

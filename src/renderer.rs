@@ -620,6 +620,8 @@ pub struct View<'a> {
     /// 그중 패치까지 펼쳐 둔 파일의 경로.
     pub side_panel_diff_selected: Option<&'a str>,
     pub side_panel_diff_expanded: bool,
+    /// 패널의 patch에서 인용해 둔 줄 수. 컴포저 위 배지로만 보인다.
+    pub diff_reference_lines: Option<usize>,
     pub side_panel_integrations: Vec<ProviderIntegrationView>,
 }
 
@@ -853,7 +855,6 @@ pub struct Renderer {
     side_panel_content: Vec<PaintLine>,
     /// Context and usage readings moved out of the composer status row while
     /// the panel is visible.
-    side_panel_footer: Vec<PaintLine>,
     /// 패널 위쪽(프롬프트까지)과 아래쪽 변경 섹션은 각자 스크롤한다. 둘 다 위에서
     /// 아래로 읽는 목록이라 전사의 `scroll_back`과 달리 첫 줄부터의 오프셋이다.
     side_panel_scroll: usize,
@@ -863,6 +864,9 @@ pub struct Renderer {
     side_panel_top_rows: usize,
     /// 그 아래 제자리에 남는 바뀐 파일 목록의 줄 수.
     side_panel_diff_head_rows: usize,
+    /// 인용해 둔 patch의 범위와, 그때 패치 영역이 놓여 있던 오프셋. 컴포저를
+    /// 눌러 선택이 풀려도 무엇을 들고 있는지 보이게 남겨 둔다.
+    diff_quote: Option<(CellRange, usize)>,
     /// Which surface the live drag belongs to. The transcript and the panel are
     /// two separate columns of text, so a drag stays inside the one it started
     /// on instead of running across the border between them.
@@ -1137,7 +1141,7 @@ impl CellFrame {
     }
 }
 
-/// The panel opens at this width and the header's [+]/[-] step it from here.
+/// The panel opens at this width and the header's [◀]/[▶] step it from here.
 pub(crate) const SIDE_PANEL_MIN_WIDTH: usize = 48;
 /// One click of [-] or [+] moves the panel by this many columns.
 pub(crate) const SIDE_PANEL_WIDTH_STEP: usize = 12;
@@ -1283,6 +1287,10 @@ fn paint_panel_content_row(
         let hovered = !selected && range_overlaps(hovered_columns.as_ref(), column, column + 1);
         if hovered {
             cell.style.background = Some(side_panel_hover_background());
+        } else if selected {
+            // 글자가 있는 칸은 이미 칠해져 왔다. 남은 빈 칸까지 같은 색으로
+            // 덮어야 고른 줄이 중간에 끊기지 않는다.
+            cell.style.background = Some(theme::selection_bg());
         } else {
             cell.style
                 .background
@@ -1303,7 +1311,7 @@ fn paint_side_panel_row_into_frame(
     rows: usize,
     content: &[PaintLine],
     selection: Option<CellRange>,
-    footer: &[PaintLine],
+    whole_rows: bool,
     hovered_pick: Option<&Pick>,
 ) {
     if frame_row >= frame.height || rows == 0 {
@@ -1319,19 +1327,17 @@ fn paint_side_panel_row_into_frame(
     if global_row == 0 || global_row + 1 == rows {
         return;
     }
-    let footer_start = rows.saturating_sub(footer.len().saturating_add(1));
-    if global_row >= footer_start
-        && global_row + 1 < rows
-        && let Some(line) = footer.get(global_row - footer_start)
-    {
-        let hovered_columns = Renderer::hover_columns(line, None, hovered_pick);
-        paint_panel_content_row(frame, layout, frame_row, line, None, hovered_columns);
-        return;
-    }
     // Row zero is the panel's empty top inset, so content starts one row below it.
     if let Some(line) = content.get(global_row - 1) {
-        let selected_columns =
-            selection.and_then(|range| selection_columns_for_line(line, range, global_row - 1));
+        let row = global_row - 1;
+        // patch 위의 선택은 줄을 통째로 덮으므로, 글자가 끝난 뒤의 여백까지 칠해
+        // 한 덩어리로 보이게 한다.
+        let selected_columns = selection.and_then(|range| {
+            if whole_rows && range.start.row <= row && row <= range.end.row {
+                return Some(0..layout.content_width());
+            }
+            selection_columns_for_line(line, range, row)
+        });
         let hovered_columns = Renderer::hover_columns(line, None, hovered_pick);
         paint_panel_content_row(
             frame,
@@ -1352,16 +1358,16 @@ fn paint_side_panel_into_frame(
     content: &[PaintLine],
     selection: Option<CellRange>,
 ) {
-    paint_side_panel_into_frame_with_footer(frame, layout, rows, content, selection, &[], None);
+    paint_side_panel_into_frame_with_hover(frame, layout, rows, content, selection, false, None);
 }
 
-fn paint_side_panel_into_frame_with_footer(
+fn paint_side_panel_into_frame_with_hover(
     frame: &mut CellFrame,
     layout: SidePanelLayout,
     rows: usize,
     content: &[PaintLine],
     selection: Option<CellRange>,
-    footer: &[PaintLine],
+    whole_rows: bool,
     hovered_pick: Option<&Pick>,
 ) {
     for row in 0..rows.min(frame.height) {
@@ -1373,7 +1379,7 @@ fn paint_side_panel_into_frame_with_footer(
             rows,
             content,
             selection,
-            footer,
+            whole_rows,
             hovered_pick,
         );
     }
@@ -1382,6 +1388,9 @@ fn paint_side_panel_into_frame_with_footer(
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SelectionResult {
     Copy(String),
+    /// A drag over the panel's patch. It copies like any other selection and
+    /// also becomes the reference the next prompt carries.
+    DiffCopy(String),
     /// The cell a click landed on, column first: a tool heading answers to the
     /// row alone, but the clickable chrome is only ever part of a row.
     Click(u16, u16),
@@ -1554,11 +1563,11 @@ impl Renderer {
             painted_frame: None,
             side_panel: None,
             side_panel_content: Vec::new(),
-            side_panel_footer: Vec::new(),
             side_panel_scroll: 0,
             side_panel_diff_scroll: 0,
             side_panel_top_rows: 0,
             side_panel_diff_head_rows: 0,
+            diff_quote: None,
             selection_in_panel: false,
             selection_in_transcript: false,
             selection_anchor_screen_row: None,
@@ -1702,7 +1711,7 @@ impl Renderer {
             self.side_panel_diff_head_rows = 0;
             return top;
         }
-        let capacity = rows.saturating_sub(self.side_panel_footer.len() + 2);
+        let capacity = rows.saturating_sub(2);
         let top_rows = top.len().min(if diff_head.is_empty() {
             capacity
         } else {
@@ -2044,18 +2053,6 @@ impl Renderer {
                 return None;
             }
             let screen_row = usize::from(row);
-            let footer_start = self
-                .previous_lines
-                .len()
-                .saturating_sub(self.side_panel_footer.len().saturating_add(1));
-            if screen_row >= footer_start && screen_row + 1 < self.previous_lines.len() {
-                return self
-                    .side_panel_footer
-                    .get(screen_row - footer_start)?
-                    .pick
-                    .as_ref()?
-                    .at(content_column);
-            }
             let content_row = screen_row.checked_sub(1)?;
             return self
                 .side_panel_content
@@ -2180,9 +2177,13 @@ impl Renderer {
         let in_panel = self.selection_target_is_panel(column);
         match self.selection.finish(point) {
             SelectionFinish::Copy(range) => {
+                let range = self.widen_to_whole_rows(range);
                 let text = extract_text(&self.copy_lines(), range);
                 if text.trim().is_empty() {
                     SelectionResult::None
+                } else if in_panel && self.row_is_in_diff_body(range.start.row) {
+                    self.diff_quote = Some((range, self.side_panel_diff_scroll));
+                    SelectionResult::DiffCopy(text)
                 } else {
                     SelectionResult::Copy(text)
                 }
@@ -2192,6 +2193,37 @@ impl Renderer {
             SelectionFinish::Click(_) if in_panel => SelectionResult::None,
             SelectionFinish::Click(cell) => SelectionResult::Click(cell.column, row),
             SelectionFinish::None => SelectionResult::None,
+        }
+    }
+
+    /// True for the panel rows below the changed-file list, where the patch
+    /// itself is drawn. The list above picks a file and is not part of a quote.
+    fn row_is_in_diff_body(&self, row: usize) -> bool {
+        self.side_panel_diff_head_rows > 0
+            && row >= self.side_panel_top_rows + self.side_panel_diff_head_rows
+    }
+
+    /// 패널의 patch에서는 줄 한가운데를 집어내는 일이 드물고, 보이는 줄을 통째로
+    /// 가져오는 편이 쓸모 있다. 그래서 그 영역의 드래그는 줄 전체를 덮는다.
+    fn widen_to_whole_rows(&self, range: CellRange) -> CellRange {
+        if !(self.selection_in_panel && self.row_is_in_diff_body(range.start.row)) {
+            return range;
+        }
+        let end_column = self
+            .side_panel_content
+            .get(range.end.row)
+            .map(|line| painted_line_width(line).saturating_sub(1))
+            .and_then(|column| u16::try_from(column).ok())
+            .unwrap_or(range.end.column);
+        CellRange {
+            start: CellPosition {
+                row: range.start.row,
+                column: 0,
+            },
+            end: CellPosition {
+                row: range.end.row,
+                column: end_column.max(range.end.column),
+            },
         }
     }
 
@@ -2901,6 +2933,10 @@ impl Renderer {
 
     pub fn render(&mut self, committed: &[Block], view: View<'_>) -> Result<()> {
         self.split_active = false;
+        // 인용이 거두어지면 그 하이라이트도 함께 사라진다.
+        if view.diff_reference_lines.is_none() {
+            self.diff_quote = None;
+        }
         set_chat_layout(view.chat_layout);
         self.observe_question_overlay(view.overlay.as_ref().map(|overlay| overlay.style));
         let response_collapse_changed = self.update_response_collapse(view.response_collapse);
@@ -2959,12 +2995,7 @@ impl Renderer {
             .then_some(view.side_panel_width)
             .flatten()
             .and_then(|panel_width| side_panel_layout(total_width, panel_width));
-        let mut status_line = view.status_line;
-        let side_panel_footer = side_panel
-            .map(|layout| {
-                move_context_to_side_panel(&mut status_line, layout.content_width())
-            })
-            .unwrap_or_default();
+        let status_line = view.status_line;
         if side_panel != self.side_panel {
             // Opening or closing moves every row's right edge, so the diff has
             // nothing reusable and the whole surface must be repainted.
@@ -3020,6 +3051,8 @@ impl Renderer {
             line: status_line,
             composer_notice: view.composer_notice,
             composer_mode: view.composer_mode,
+            diff_reference_lines: view.diff_reference_lines,
+            side_panel_open: side_panel.is_some(),
         };
         let main_subagents = if side_panel.is_some() {
             &[][..]
@@ -3058,7 +3091,6 @@ impl Renderer {
             )
         };
         let composer_navigation_layout = frame.composer_layout.clone();
-        self.side_panel_footer = side_panel_footer;
 
         if self.mode == RenderMode::Fullscreen {
             self.render_fullscreen(
@@ -3466,7 +3498,7 @@ impl Renderer {
                     self.previous_lines.len(),
                     &self.side_panel_content,
                     None,
-                    &self.side_panel_footer,
+                    false,
                     self.hovered_pick.as_ref(),
                 );
             }
@@ -3686,7 +3718,7 @@ impl Renderer {
                 ));
                 lines.extend(side_panel_subagent_lines(subagents, layout.content_width()));
                 if SIDE_PANEL_INTEGRATIONS_CONNECTED {
-                    let content_capacity = rows.saturating_sub(self.side_panel_footer.len() + 2);
+                    let content_capacity = rows.saturating_sub(2);
                     let remaining = content_capacity.saturating_sub(lines.len());
                     lines.extend(side_panel_integration_lines(
                         side_panel_integrations,
@@ -4014,7 +4046,11 @@ impl Renderer {
         repaint_full_frame: bool,
         stream_fade: Option<StreamFade>,
     ) -> Result<()> {
-        let selection = self.selection.range().filter(|range| {
+        let selection = self
+            .selection
+            .range()
+            .map(|range| self.widen_to_whole_rows(range))
+            .filter(|range| {
             if self.selection_in_panel {
                 selection_is_worth_painting(*range, &self.side_panel_content)
             } else if self.selection_in_transcript {
@@ -4025,6 +4061,14 @@ impl Renderer {
         });
         let transcript_selection = selection.filter(|_| !self.selection_in_panel);
         let panel_selection = selection.filter(|_| self.selection_in_panel);
+        let panel_whole_rows =
+            panel_selection.is_some_and(|range| self.row_is_in_diff_body(range.start.row));
+        // 드래그가 끝나고 컴포저로 옮겨 가도, 프롬프트가 들고 갈 줄들은 계속
+        // 칠해 둔다. 그 사이 패치가 스크롤되었으면 그만큼 따라 움직인다.
+        let (panel_selection, panel_whole_rows) = match (panel_selection, self.diff_quote) {
+            (None, Some((range, scroll))) => (shift_rows(range, scroll, self.side_panel_diff_scroll), true),
+            (selection, _) => (selection, panel_whole_rows),
+        };
         let mut frame = CellFrame::new(usize::from(total_width), lines.len());
         for (row, line) in lines.iter().enumerate() {
             let hovered = Self::hover_columns(line, self.hovered_tool, self.hovered_pick.as_ref());
@@ -4053,13 +4097,13 @@ impl Renderer {
             fade_stream_tail_into_frame(&mut frame, fade);
         }
         if let Some(layout) = self.side_panel {
-            paint_side_panel_into_frame_with_footer(
+            paint_side_panel_into_frame_with_hover(
                 &mut frame,
                 layout,
                 lines.len(),
                 &self.side_panel_content,
                 panel_selection,
-                &self.side_panel_footer,
+                panel_whole_rows,
                 self.hovered_pick.as_ref(),
             );
         }
@@ -5443,6 +5487,8 @@ fn split_pane_frame_scrolled(
             line: view.status_line,
             composer_notice: view.composer_notice,
             composer_mode: view.composer_mode,
+            diff_reference_lines: view.diff_reference_lines,
+            side_panel_open: view.side_panel_width.is_some(),
         }
     } else {
         StatusArea {
@@ -5450,6 +5496,8 @@ fn split_pane_frame_scrolled(
             line: view.status_line,
             composer_notice: None,
             composer_mode: None,
+            diff_reference_lines: view.diff_reference_lines,
+            side_panel_open: view.side_panel_width.is_some(),
         }
     };
     let overlay = active.then_some(view.overlay).flatten();
@@ -5695,6 +5743,11 @@ struct StatusArea {
     line: Option<StatusLineView>,
     composer_notice: Option<String>,
     composer_mode: Option<ComposerMode>,
+    /// 패널의 patch에서 인용해 둔 줄 수.
+    diff_reference_lines: Option<usize>,
+    /// 패널이 열려 있으면 `Working` 줄은 폭이 자주 바뀌어 배지가 들어갔다
+    /// 나왔다 한다. 그럴 때 배지는 폭이 일정한 컴포저 눈금에만 선다.
+    side_panel_open: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -5830,14 +5883,18 @@ pub enum Pick {
     PromptSection,
     McpSection(String),
     PluginSection(String),
-    /// 패널 머리글의 [-]: 패널을 12칸 좁힌다.
+    /// 패널 머리글의 [▶]: 패널을 12칸 좁힌다.
     SidePanelNarrower,
-    /// 패널 머리글의 [+]: 패널을 12칸 넓힌다.
+    /// 패널 머리글의 [◀]: 패널을 12칸 넓힌다.
     SidePanelWider,
+    /// 패널 머리글의 x와 상태줄의 Alt+P 안내: 패널을 열고 닫는다.
+    SidePanelToggle,
     /// 변경 섹션의 제목: 목록과 패치를 함께 접고 편다.
     DiffSection,
     /// 변경 목록의 파일 한 줄: 그 파일의 패치를 아래에 펼친다.
     DiffFile(String),
+    /// 컴포저 위 배지의 x: 인용을 거둔다.
+    DiffReferenceClear,
     /// The status line's agent reading: cycles to the next role, like Tab.
     AgentMode,
     /// The status line's model name: opens `/model`.
@@ -6528,6 +6585,37 @@ fn idle_notice_line(notice: &str, width: u16) -> Option<PaintLine> {
 /// status row below it.
 const IDLE_NOTICE_RESERVED_COLUMNS: usize = 4;
 
+/// 인용해 둔 patch를 알리는 컴포저 위 한 줄. 순정과 같은 문구에 인용을 거둘
+/// 단추를 오른쪽에 붙였다.
+fn diff_reference_line(count: usize, width: u16) -> PaintLine {
+    let noun = if count == 1 { "line" } else { "lines" };
+    const CLEAR: &str = " \u{b7} x";
+    let text = compact_right(
+        &format!("\u{29c9}  Selected {count} {noun} from diff view"),
+        (width as usize)
+            .saturating_sub(IDLE_NOTICE_RESERVED_COLUMNS + UnicodeWidthStr::width(CLEAR)),
+    );
+    let clear_start = 1 + UnicodeWidthStr::width(text.as_str()) + UnicodeWidthStr::width(" \u{b7} ");
+    PaintLine {
+        prefix: " ".to_owned(),
+        prefix_tone: Tone::Muted,
+        text,
+        tone: Tone::Muted,
+        bold: false,
+        tool_heading: None,
+        pick: Some(PickRegions::span(
+            clear_start,
+            clear_start + 1,
+            Pick::DiffReferenceClear,
+        )),
+        tail: vec![PaintSpan {
+            text: CLEAR.to_owned(),
+            tone: Tone::Muted,
+            bold: false,
+        }],
+    }
+}
+
 fn activity_line_with_composer_controls(
     mut line: PaintLine,
     mode: &ComposerMode,
@@ -6789,6 +6877,22 @@ fn selection_columns_for_line(
 /// click, and flashing a highlight under a single character reads as noise
 /// rather than feedback. Copying is untouched: `finish_selection` still hands
 /// back whatever the drag covered.
+/// 패치가 스크롤된 만큼 인용의 행을 옮긴다. 화면 밖으로 밀려나면 칠할 것이 없다.
+fn shift_rows(range: CellRange, from: usize, to: usize) -> Option<CellRange> {
+    let start = (range.start.row + from).checked_sub(to)?;
+    let end = (range.end.row + from).checked_sub(to)?;
+    Some(CellRange {
+        start: CellPosition {
+            row: start,
+            ..range.start
+        },
+        end: CellPosition {
+            row: end,
+            ..range.end
+        },
+    })
+}
+
 fn selection_is_worth_painting(range: CellRange, lines: &[PaintLine]) -> bool {
     const MINIMUM: usize = 2;
     let mut count = 0;
@@ -6992,6 +7096,7 @@ fn normal_frame_with_expansion(
     let mut dock_index = lines.len();
     let composer_mode = status.composer_mode.as_ref();
     // During a response, every transient notice uses the same right-hand slot.
+    let side_panel_open = status.side_panel_open;
     let activity_composer_notice = status.composer_notice.as_deref();
     let mut composer_notice = status.composer_notice.as_deref();
     let mut composer_controls_mode = composer_mode;
@@ -7015,8 +7120,9 @@ fn normal_frame_with_expansion(
             activity_progress_phase,
             width,
         );
-        let activity_mode = composer_controls_mode
-            .or_else(|| activity_composer_notice.and(composer_mode));
+        let activity_mode = (!side_panel_open || activity_composer_notice.is_some())
+            .then(|| composer_controls_mode.or_else(|| activity_composer_notice.and(composer_mode)))
+            .flatten();
         if let Some(mode) = activity_mode
             && let Some(row) = activity_line_with_composer_controls(
                 activity_rows[0].clone(),
@@ -7088,6 +7194,11 @@ fn normal_frame_with_expansion(
         composer_mode.map(|mode| mode.model.as_str()),
         width,
     ));
+    // 인용해 둔 patch는 컴포저에 글자로 들어가지 않으므로, 무엇이 딸려 갈지는
+    // 컴포저 바로 위 한 줄이 대신 알린다.
+    if let Some(count) = status.diff_reference_lines {
+        lines.push(diff_reference_line(count, width));
+    }
 
     // Recalled history is labelled on the composer rule, so the position stays
     // visible for as long as the entry does.
@@ -7117,10 +7228,15 @@ fn normal_frame_with_expansion(
         .as_ref()
         .and_then(|line| line.update_notice.clone());
     if status_line_painted {
-        lines.push(status_line_row(status.line, &status.fallback, width));
+        lines.push(status_line_row(
+            status.line,
+            &status.fallback,
+            width,
+            status.side_panel_open,
+        ));
     }
     if let Some(notice) = update_notice {
-        lines.push(status_line_row(None, &notice, width));
+        lines.push(status_line_row(None, &notice, width, side_panel_open));
     }
     // Separate the running-subagent rows from the status line with one blank row.
     if status_line_painted && (!subagents.is_empty() || !artifacts.is_empty()) {
@@ -7170,9 +7286,43 @@ fn welcome_lines(welcome: WelcomeView, width: u16, show_news: bool) -> Vec<Paint
             ),
             width,
         ));
+        lines.extend(update_lines(
+            &Block::new(BlockKind::Update, "Commands", welcome_commands()),
+            width,
+        ));
     }
     lines
 }
+
+/// 웰컴 카드가 소개하는 몇 가지 조작. 왼쪽 열을 가장 긴 항목에 맞춰 정렬한다.
+const WELCOME_COMMANDS: [(&str, &str); 8] = [
+    ("/help", "List every command"),
+    ("/provider", "Select a provider"),
+    ("/agent", "Switch agent role [Tab]"),
+    ("$", "Plugin·Skill·App search"),
+    ("@", "Plugin·Skill·files·directories search"),
+    ("Alt+P", "Show SidePanel"),
+    ("Shift + ↑↓", "Change model"),
+    ("Shift + ←→", "Change effort"),
+];
+
+fn welcome_commands() -> String {
+    let key_width = WELCOME_COMMANDS
+        .iter()
+        .map(|(key, _)| UnicodeWidthStr::width(*key))
+        .max()
+        .unwrap_or_default();
+    WELCOME_COMMANDS
+        .iter()
+        .map(|(key, description)| {
+            let pad = " ".repeat(key_width - UnicodeWidthStr::width(*key) + 2);
+            format!("{key}{pad}{description}")
+        })
+        .collect::<Vec<_>>()
+        .join("
+")
+}
+
 
 fn plain_line(text: &str, tone: Tone, bold: bool) -> PaintLine {
     PaintLine {
@@ -8493,7 +8643,12 @@ fn overlay_frame_with_expansion(
     };
     if status.fallback != HIDDEN_STATUS_LINE {
         lines.push(PaintLine::blank());
-        lines.push(status_line_row(status.line, &status.fallback, width));
+        lines.push(status_line_row(
+            status.line,
+            &status.fallback,
+            width,
+            status.side_panel_open,
+        ));
     }
 
     Frame {
@@ -8576,7 +8731,12 @@ fn fit_frame(frame: &mut Frame, target_rows: usize) {
     frame.cursor_line = frame.cursor_line.min(frame.lines.len().saturating_sub(1));
 }
 
-fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -> PaintLine {
+fn status_line_row(
+    status: Option<StatusLineView>,
+    fallback: &str,
+    width: u16,
+    side_panel_open: bool,
+) -> PaintLine {
     let Some(status) = status else {
         return PaintLine {
             prefix: " ".to_owned(),
@@ -8594,10 +8754,6 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         .effort
         .as_deref()
         .is_some_and(|effort| !effort.is_empty());
-    let has_model_shortcut = status
-        .model
-        .as_deref()
-        .is_some_and(|model| !is_open_code_model_label(model));
     let mut spans = Vec::new();
     let mut picks = Vec::new();
     if status.shell_mode {
@@ -8701,7 +8857,7 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
     // Align with the activity controls above by keeping two blank terminal
     // columns to the right of the status line.
     let max_width = width.saturating_sub(3) as usize;
-    let shortcut_hint = status_line_shortcut_hint(has_model_shortcut, has_effort);
+    let shortcut_hint = side_panel_shortcut_hint(side_panel_open);
     let content_width = spans
         .iter()
         .map(|span| UnicodeWidthStr::width(span.text.as_str()))
@@ -8726,6 +8882,8 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
             tone: Tone::Muted,
             bold: false,
         });
+        // 안내 자체가 패널을 여는 단추다. 누르면 Alt+P와 같은 일을 한다.
+        picks.push((spans.len(), Pick::SidePanelToggle));
         spans.push(PaintSpan {
             text: shortcut_hint.to_owned(),
             tone: Tone::Muted,
@@ -8750,15 +8908,6 @@ fn status_line_row(status: Option<StatusLineView>, fallback: &str, width: u16) -
         tail: spans.into_iter().skip(1).collect(),
     }
     .with_tight_picks(&picks)
-}
-
-fn status_line_shortcut_hint(has_model_shortcut: bool, has_effort: bool) -> &'static str {
-    match (has_model_shortcut, has_effort) {
-        (true, true) => "Shift + ↑↓ model · ←→ effort",
-        (true, false) => "Shift + ↑↓ model",
-        (false, true) => "←→ effort",
-        (false, false) => "",
-    }
 }
 
 fn side_panel_divider(content_width: usize) -> PaintLine {
@@ -8788,168 +8937,6 @@ fn side_panel_section_heading(
         tone: Tone::Plain,
         bold: true,
         pick: Some(PickRegions::span(0, clickable_width, pick)),
-        ..PaintLine::plain("")
-    }
-}
-
-fn side_panel_status_lines(
-    status: Option<&StatusLineView>,
-    mode: Option<&ComposerMode>,
-    content_width: usize,
-) -> Vec<PaintLine> {
-    let mut lines = mode
-        .map(|mode| side_panel_mode_lines(mode, content_width))
-        .unwrap_or_default();
-    let Some((status, context)) = status.zip(
-        status
-            .and_then(|status| status.context.as_deref())
-            .filter(|context| !context.is_empty()),
-    ) else {
-        return lines;
-    };
-    let context_tone = status
-        .model
-        .as_deref()
-        .and_then(model_tone)
-        .unwrap_or(Tone::Border);
-    lines.extend([
-        side_panel_divider(content_width),
-        side_panel_context_line(context, content_width, context_tone),
-    ]);
-    lines
-}
-
-/// 패널이 열려도 브랜치와 모드 배지는 컴포저가 계속 들고 있고, 자리를 크게
-/// 차지하는 사용량만 패널 아래로 내려온다.
-fn move_context_to_side_panel(
-    status: &mut Option<StatusLineView>,
-    content_width: usize,
-) -> Vec<PaintLine> {
-    let has_context = status
-        .as_ref()
-        .and_then(|status| status.context.as_deref())
-        .is_some_and(|context| !context.is_empty());
-    let lines = side_panel_status_lines(status.as_ref(), None, content_width);
-    if has_context && let Some(status) = status.as_mut() {
-        status.context = None;
-    }
-    lines
-}
-
-fn side_panel_mode_lines(mode: &ComposerMode, content_width: usize) -> Vec<PaintLine> {
-    let combined = full_badge_spans(mode, true);
-    if spans_width(&combined.spans) <= content_width {
-        return vec![badge_line(combined)];
-    }
-
-    let mut lines = mode
-        .branch
-        .as_deref()
-        .filter(|branch| !branch.is_empty())
-        .map(|branch| {
-            vec![PaintLine {
-                text: compact_right(
-                    &format!("{}{branch}", if mode.is_worktree { "" } else { "* " }),
-                    content_width,
-                ),
-                tone: Tone::Branch,
-                ..PaintLine::plain("")
-            }]
-        })
-        .unwrap_or_default();
-    let mut badge = full_badge_spans(mode, false);
-    if spans_width(&badge.spans) > content_width && badge.auto_knowledge_index.is_some() {
-        let knowledge = badge.spans.pop().unwrap();
-        badge.spans.pop(); // The separator belongs between badges on the same row.
-        badge.auto_knowledge_index = None;
-        lines.push(badge_line(badge));
-        lines.push(PaintLine {
-            text: knowledge.text,
-            tone: knowledge.tone,
-            ..PaintLine::plain("")
-        }.with_tight_picks(&[(0, Pick::AutoKnowledge)]));
-    } else {
-        lines.push(badge_line(badge));
-    }
-    lines
-}
-
-fn badge_line(badge: BadgeSpans) -> PaintLine {
-    let picks = [
-        badge.vibe_mode_index.map(|index| (index, Pick::VibeMode)),
-        badge.auto_knowledge_index.map(|index| (index, Pick::AutoKnowledge)),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-    let mut spans = badge.spans.into_iter();
-    let first = spans.next().unwrap_or(PaintSpan {
-        text: String::new(),
-        tone: Tone::Muted,
-        bold: false,
-    });
-    PaintLine {
-        text: first.text,
-        tone: first.tone,
-        bold: first.bold,
-        tail: spans.collect(),
-        ..PaintLine::plain("")
-    }
-    .with_tight_picks(&picks)
-}
-
-fn side_panel_context_line(context: &str, content_width: usize, context_tone: Tone) -> PaintLine {
-    let value = context.strip_prefix("ctx: ").unwrap_or(context);
-    let (counts, percent) = value
-        .rsplit_once(" (")
-        .and_then(|(counts, percent)| {
-            percent
-                .strip_suffix("%)")
-                .and_then(|percent| percent.parse::<u8>().ok())
-                .map(|percent| (counts, percent.min(100)))
-        })
-        .unwrap_or((value, 0));
-    let counts = counts
-        .split_once('/')
-        .map(|(used, window)| {
-            format!(
-                "{}/{}K",
-                used.trim_end_matches(['k', 'K']),
-                window.trim_end_matches(['k', 'K'])
-            )
-        })
-        .unwrap_or_else(|| counts.to_owned());
-    let summary = format!("{counts} ({percent}%)");
-    let label = "Context: ";
-    let fixed_width = UnicodeWidthStr::width(label) + UnicodeWidthStr::width(summary.as_str()) + 3;
-    let track = content_width
-        .saturating_sub(fixed_width)
-        .min(PROGRESS_TRACK_COLUMNS);
-    if track == 0 {
-        return PaintLine::plain(compact_right(&format!("{label}{summary}"), content_width));
-    }
-
-    let filled = ((track as f32 * percent as f32 / 100.0).round() as usize).min(track);
-    PaintLine {
-        text: label.to_owned(),
-        bold: true,
-        tail: vec![
-            PaintSpan {
-                text: "█".repeat(filled),
-                tone: context_tone,
-                bold: false,
-            },
-            PaintSpan {
-                text: "░".repeat(track.saturating_sub(filled)),
-                tone: Tone::Muted,
-                bold: false,
-            },
-            PaintSpan {
-                text: format!(" {summary}"),
-                tone: Tone::StatusText,
-                bold: false,
-            },
-        ],
         ..PaintLine::plain("")
     }
 }
@@ -9465,6 +9452,18 @@ fn file_change_patch_lines(rows: &[&str], width: u16, rows_shown: usize) -> Vec<
     let mut lines = Vec::new();
     let word_spans = intraline_highlights(rows);
 
+    // 줄 번호는 이 패치가 실제로 닿는 자릿수만큼만 자리를 차지한다. 고정 폭으로
+    // 두면 좁은 패널에서 왼쪽이 빈 채로 버려진다.
+    let number_width = rows
+        .iter()
+        .filter_map(|row| hunk_start(row))
+        .map(|(old, new)| old.max(new))
+        .max()
+        .unwrap_or(1)
+        .saturating_add(rows.len())
+        .to_string()
+        .len();
+
     let mut old_row = 0;
     let mut new_row = 0;
     let mut shown = 0;
@@ -9507,7 +9506,7 @@ fn file_change_patch_lines(rows: &[&str], width: u16, rows_shown: usize) -> Vec<
 
         lines.extend(match number {
             Some(number) => {
-                let gutter = format!("{number:>8} {marker} ");
+                let gutter = format!("{number:>number_width$} {marker} ");
                 // An unmarked row is context, so only its number dims.
                 let gutter_tone = if marker == ' ' { Tone::Muted } else { tone };
                 match word_spans[index].clone() {
@@ -10250,8 +10249,21 @@ fn side_panel_plan_lines(
     lines
 }
 
-/// 머리글 오른쪽 끝에 붙는 폭 조절 단추. 왼쪽 세 칸이 [+], 오른쪽 세 칸이 [-]다.
-const SIDE_PANEL_WIDTH_BUTTONS: &str = "[+][-]";
+/// 머리글 오른쪽 끝에 붙는 단추. 왼쪽이 넓히기, 가운데가 좁히기, 끝이 닫기다.
+const SIDE_PANEL_WIDER_BUTTON: &str = "[◀]";
+const SIDE_PANEL_NARROWER_BUTTON: &str = "[▶]";
+const SIDE_PANEL_CLOSE_BUTTON: &str = "x";
+/// 닫기 단추는 폭 단추와 붙지 않게 띄우고, 좌우 한 칸씩은 x와 함께 눌린다.
+const SIDE_PANEL_CLOSE_GAP: &str = "  ";
+const SIDE_PANEL_CLOSE_PAD: &str = " ";
+/// 상태줄 오른쪽 끝에서 패널을 여닫는 안내 겸 단추.
+fn side_panel_shortcut_hint(open: bool) -> &'static str {
+    if open {
+        "Hide SidePanel"
+    } else {
+        "Show SidePanel"
+    }
+}
 
 /// The panel's own masthead: product and version with the width buttons at its
 /// right edge, the working folder under it, then the same quiet rule every
@@ -10261,26 +10273,45 @@ fn side_panel_header_lines(cwd: &str, content_width: usize) -> Vec<PaintLine> {
         return Vec::new();
     }
     let title = format!("DEVEZ VIBE  v{}", crate::update::CURRENT_VERSION);
-    let buttons = UnicodeWidthStr::width(SIDE_PANEL_WIDTH_BUTTONS);
-    let (text, pick) = if content_width > buttons + 2 {
+    let wider = UnicodeWidthStr::width(SIDE_PANEL_WIDER_BUTTON);
+    let narrower = UnicodeWidthStr::width(SIDE_PANEL_NARROWER_BUTTON);
+    let close = UnicodeWidthStr::width(SIDE_PANEL_CLOSE_BUTTON);
+    let pad = UnicodeWidthStr::width(SIDE_PANEL_CLOSE_PAD);
+    let buttons =
+        wider + narrower + UnicodeWidthStr::width(SIDE_PANEL_CLOSE_GAP) + close + pad;
+    // 단추는 제목의 강조색을 따르지 않고 기본 글자색으로 그린다.
+    let (text, tail, pick) = if content_width > buttons + 2 {
         let title = compact_right(&title, content_width - buttons - 1);
         let start = content_width - buttons;
         let gap = start - UnicodeWidthStr::width(title.as_str());
         (
-            format!("{title}{}{SIDE_PANEL_WIDTH_BUTTONS}", " ".repeat(gap)),
+            format!("{title}{}", " ".repeat(gap)),
+            vec![PaintSpan {
+                text: format!(
+                    "{SIDE_PANEL_WIDER_BUTTON}{SIDE_PANEL_NARROWER_BUTTON}{SIDE_PANEL_CLOSE_GAP}{SIDE_PANEL_CLOSE_BUTTON}{SIDE_PANEL_CLOSE_PAD}"
+                ),
+                tone: Tone::Plain,
+                bold: false,
+            }],
             Some(PickRegions(vec![
-                (start, start + 3, Pick::SidePanelWider),
-                (start + 3, start + buttons, Pick::SidePanelNarrower),
+                (start, start + wider, Pick::SidePanelWider),
+                (start + wider, start + wider + narrower, Pick::SidePanelNarrower),
+                (
+                    content_width - close - 2 * pad,
+                    content_width,
+                    Pick::SidePanelToggle,
+                ),
             ])),
         )
     } else {
-        (compact_right(&title, content_width), None)
+        (compact_right(&title, content_width), Vec::new(), None)
     };
     vec![
         PaintLine {
             text,
             tone: Tone::Accent,
             bold: true,
+            tail,
             pick,
             ..PaintLine::plain("")
         },
@@ -14319,6 +14350,7 @@ mod tests {
             activity_progress_phase: 0.0,
             footer: HIDDEN_STATUS_LINE.to_owned(),
             status_line: None,
+            diff_reference_lines: None,
             composer_notice: None,
             composer_mode: None,
             chat_layout: false,
@@ -14857,15 +14889,30 @@ mod tests {
     /// The panel takes a fixed slice of the right edge, leaves a gap in front of
     /// it, and fills the terminal's last cell without printing into it directly.
     #[test]
-    fn the_panel_masthead_ends_with_the_two_width_buttons() {
+    fn the_panel_masthead_ends_with_the_width_and_close_buttons() {
         let content_width = 44;
         let header = side_panel_header_lines("D:/work", content_width);
 
-        assert!(painted(&header[0]).ends_with("[+][-]"));
-        let picks = header[0].pick.as_ref().expect("width buttons are clickable");
-        assert_eq!(picks.at(content_width - 6), Some(Pick::SidePanelWider));
-        assert_eq!(picks.at(content_width - 3), Some(Pick::SidePanelNarrower));
-        assert_eq!(picks.at(content_width - 7), None);
+        assert!(painted(&header[0]).ends_with("[◀][▶]  x "));
+        // 제목만 강조색이고 단추는 기본 글자색으로 그린다.
+        assert_eq!(header[0].tone, Tone::Accent);
+        assert_eq!(header[0].tail[0].tone, Tone::Plain);
+
+        let buttons = UnicodeWidthStr::width("[◀][▶]  x ");
+        let wider = UnicodeWidthStr::width("[◀]");
+        let narrower = UnicodeWidthStr::width("[▶]");
+        let picks = header[0].pick.as_ref().expect("header buttons are clickable");
+        assert_eq!(picks.at(content_width - buttons), Some(Pick::SidePanelWider));
+        assert_eq!(
+            picks.at(content_width - buttons + wider),
+            Some(Pick::SidePanelNarrower)
+        );
+        // 폭 단추 다음 첫 칸은 아무것도 아니고, x는 좌우 한 칸씩 함께 눌린다.
+        assert_eq!(picks.at(content_width - buttons + wider + narrower), None);
+        assert_eq!(picks.at(content_width - 3), Some(Pick::SidePanelToggle));
+        assert_eq!(picks.at(content_width - 2), Some(Pick::SidePanelToggle));
+        assert_eq!(picks.at(content_width - 1), Some(Pick::SidePanelToggle));
+        assert_eq!(picks.at(content_width - buttons - 1), None);
 
         // 너무 좁은 패널은 제목만 남기고 단추를 붙이지 않는다.
         assert!(side_panel_header_lines("D:/work", 6)[0].pick.is_none());
@@ -14971,36 +15018,6 @@ mod tests {
     }
 
     #[test]
-    fn the_side_panel_places_a_subdued_divider_above_context() {
-        let layout =
-            side_panel_layout(100, SIDE_PANEL_MIN_WIDTH).expect("100 columns carry the panel");
-        let mut frame = CellFrame::new(100, 4);
-        let footer = vec![
-            side_panel_divider(layout.content_width()),
-            PaintLine::plain("Context"),
-        ];
-
-        paint_side_panel_into_frame_with_footer(&mut frame, layout, 4, &[], None, &footer, None);
-
-        let context: String = (0..UnicodeWidthStr::width("Context"))
-            .map(|offset| frame.cell(layout.content_left() + offset, 2).glyph.clone())
-            .collect();
-        assert_eq!(context, "Context");
-        for column in layout.panel_left..layout.panel_left + layout.panel_width {
-            let cell = frame.cell(column, 1);
-            let in_content = (layout.content_left()
-                ..layout.content_left() + layout.content_width())
-                .contains(&column);
-            assert_eq!(cell.glyph, if in_content { "─" } else { " " });
-            assert_eq!(cell.style.background, Some(theme::palette().hover_bg));
-            assert_eq!(
-                cell.style.foreground,
-                in_content.then(|| tone_rgb(Tone::SidePanelDivider).unwrap())
-            );
-        }
-    }
-
-    #[test]
     fn side_panel_dividers_are_softer_than_the_old_border_tone() {
         let distance = |left: Rgb, right: Rgb| {
             u16::from(left.0.abs_diff(right.0))
@@ -15034,7 +15051,7 @@ mod tests {
             None,
             Some(layout.main_width),
         );
-        paint_side_panel_row_into_frame(&mut row, layout, 0, 1, 30, &[], None, &[], None);
+        paint_side_panel_row_into_frame(&mut row, layout, 0, 1, 30, &[], None, false, None);
 
         assert_eq!(
             row.cell(layout.panel_left, 0).style.background,
@@ -15636,8 +15653,9 @@ mod tests {
                 }),
                 "",
                 120,
+                false,
             );
-            assert!(painted(&line).ends_with("Shift + ↑↓ model · ←→ effort"));
+            assert!(painted(&line).ends_with("Show SidePanel"));
             assert!(console_width(painted(&line).as_str()) <= 118);
 
             let mut frame = CellFrame::new(120, 1);
@@ -15646,7 +15664,7 @@ mod tests {
             emit_row_sequential(&mut output, &frame, 0, 0).expect("row emits");
             let text = String::from_utf8(output).expect("terminal bytes are UTF-8");
             assert!(
-                text.contains("Shift + ↑↓ model · ←→ effort"),
+                text.contains("Show SidePanel"),
                 "the host hint must not be clipped by the console safety margin"
             );
         });
@@ -16128,6 +16146,108 @@ mod tests {
         assert_eq!(
             renderer.finish_selection(13, 0),
             SelectionResult::Copy("transcript row".to_owned())
+        );
+    }
+
+    /// 배지는 무엇을 들고 있는지 알리고, 오른쪽 x로 그것을 거둔다.
+    #[test]
+    fn the_quote_badge_carries_a_clear_button() {
+        let line = diff_reference_line(23, 60);
+        assert!(
+            line.text.starts_with("\u{29c9}  Selected 23 lines"),
+            "{}",
+            line.text
+        );
+        assert_eq!(
+            line.tail.last().map(|span| span.text.as_str()),
+            Some(" \u{b7} x")
+        );
+
+        let x_column = 1 + UnicodeWidthStr::width(line.text.as_str()) + 3;
+        assert_eq!(
+            line.pick
+                .as_ref()
+                .and_then(|picks| picks.columns_of(&Pick::DiffReferenceClear)),
+            Some(x_column..x_column + 1)
+        );
+    }
+
+    /// patch 위의 선택은 글자가 끝난 자리에서 멈추지 않고 패널 폭 끝까지 이어져,
+    /// 고른 줄이 한 덩어리로 보인다.
+    #[test]
+    fn a_patch_selection_lights_the_whole_panel_row() {
+        let layout =
+            side_panel_layout(100, SIDE_PANEL_MIN_WIDTH).expect("100 columns carry the panel");
+        let line = PaintLine::plain("short");
+        let range = CellRange {
+            start: CellPosition { row: 0, column: 0 },
+            end: CellPosition { row: 0, column: 4 },
+        };
+        let last_column = layout.content_left() + layout.content_width() - 1;
+
+        let background = |whole_rows: bool| {
+            let mut frame = CellFrame::new(100, 3);
+            paint_side_panel_row_into_frame(
+                &mut frame,
+                layout,
+                1,
+                1,
+                3,
+                std::slice::from_ref(&line),
+                Some(range),
+                whole_rows,
+                None,
+            );
+            (
+                frame.cell(layout.content_left(), 1).style.background,
+                frame.cell(last_column, 1).style.background,
+            )
+        };
+
+        let (text, past_text) = background(true);
+        assert_eq!(past_text, text, "줄 끝까지 같은 배경이어야 한다");
+        let (text, past_text) = background(false);
+        assert_ne!(past_text, text, "여느 선택은 글자가 끝나는 자리에서 멈춘다");
+    }
+
+    /// 패널의 patch에서 끌어낸 선택만 프롬프트가 인용하고, 열이 아니라 줄 전체를
+    /// 덮는다. 위쪽 섹션과 바뀐 파일 목록은 여느 복사와 같다.
+    #[test]
+    fn a_drag_over_the_panel_patch_answers_with_whole_quoted_rows() {
+        let layout =
+            side_panel_layout(100, SIDE_PANEL_MIN_WIDTH).expect("100 columns carry the panel");
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.previous_lines = vec![PaintLine::plain("transcript row")];
+        renderer.side_panel = Some(layout);
+        renderer.side_panel_content = vec![
+            PaintLine::plain("Updated Plan  1 / 1"),
+            PaintLine::plain("1 file changed"),
+            PaintLine::plain("let fresh = 1;"),
+            PaintLine::plain("let other = 2;"),
+        ];
+        renderer.side_panel_top_rows = 1;
+        renderer.side_panel_diff_head_rows = 1;
+
+        // 줄 한가운데에서 시작해 다음 줄 한가운데에서 놓아도 두 줄이 통째로 온다.
+        let left = layout.content_left() as u16;
+        assert!(renderer.begin_selection(left + 4, 3));
+        assert!(renderer.update_selection(left + 5, 4));
+        assert_eq!(
+            renderer.finish_selection(left + 5, 4),
+            SelectionResult::DiffCopy("let fresh = 1;\nlet other = 2;".to_owned())
+        );
+
+        // 컴포저를 눌러 선택이 풀려도 무엇을 들고 있는지는 계속 보인다.
+        assert!(renderer.diff_quote.is_some());
+        renderer.clear_selection();
+        assert!(renderer.diff_quote.is_some());
+
+        // 파일 목록 줄은 인용도 아니고 끌어간 만큼만 복사된다.
+        assert!(renderer.begin_selection(left, 2));
+        assert!(renderer.update_selection(left + 5, 2));
+        assert_eq!(
+            renderer.finish_selection(left + 5, 2),
+            SelectionResult::Copy("1 file".to_owned())
         );
     }
 
@@ -16653,6 +16773,8 @@ mod tests {
                 StatusArea {
                     fallback: String::new(),
                     line: None,
+                    diff_reference_lines: None,
+                    side_panel_open: false,
                     composer_notice: None,
                     composer_mode: None,
                 },
@@ -17055,7 +17177,7 @@ mod tests {
 
     #[test]
     fn selection_keeps_the_status_line_leading_space() {
-        let line = status_line_row(None, "status", 20);
+        let line = status_line_row(None, "status", 20, false);
         let range = CellRange {
             start: CellPosition { column: 0, row: 0 },
             end: CellPosition { column: 6, row: 0 },
@@ -17107,6 +17229,7 @@ mod tests {
             }),
             "",
             80,
+            false,
         );
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
         renderer.previous_lines = vec![line];
@@ -17865,10 +17988,10 @@ mod tests {
             [
                 r"● Update(src\main.rs)",
                 "  ⎿ Added 2 lines, removed 1 line",
-                "      90   context",
-                "      84 - let old = 1;",
-                "      91 + let new = 2;",
-                "      92 + let extra = 3;",
+                "90   context",
+                "84 - let old = 1;",
+                "91 + let new = 2;",
+                "92 + let extra = 3;",
             ]
         );
         // The counts stand out of the dim summary row.
@@ -18741,6 +18864,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: Some("• Copied to clipboard".to_owned()),
                 composer_mode: None,
             },
@@ -18784,6 +18909,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: Some("• Copied to clipboard".to_owned()),
                 composer_mode: None,
             },
@@ -18876,6 +19003,8 @@ mod tests {
                 StatusArea {
                     fallback: String::new(),
                     line: None,
+                    diff_reference_lines: None,
+                    side_panel_open: false,
                     composer_notice: notice.map(str::to_owned),
                     composer_mode: None,
                 },
@@ -18921,6 +19050,8 @@ mod tests {
         let status = || StatusArea {
             fallback: String::new(),
             line: None,
+            diff_reference_lines: None,
+            side_panel_open: false,
             composer_notice: None,
             composer_mode: None,
         };
@@ -18969,6 +19100,8 @@ mod tests {
                 StatusArea {
                     fallback: String::new(),
                     line: None,
+                    diff_reference_lines: None,
+                    side_panel_open: false,
                     composer_notice: None,
                     composer_mode: None,
                 },
@@ -19003,6 +19136,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: Some(mode),
             },
@@ -19037,6 +19172,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: Some(mode),
             },
@@ -19067,6 +19204,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: Some("• Copied to clipboard".to_owned()),
                 composer_mode: Some(mode),
             },
@@ -19105,6 +19244,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: Some("Applies to the next request".to_owned()),
                 composer_mode: Some(mode),
             },
@@ -19692,6 +19833,8 @@ mod tests {
                     notice: None,
                     update_notice: Some("Update available: 1.8.3 · dvz update".to_owned()),
                 }),
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -19744,6 +19887,8 @@ mod tests {
                 StatusArea {
                     fallback: String::new(),
                     line: None,
+                    diff_reference_lines: None,
+                    side_panel_open: false,
                     composer_notice: None,
                     composer_mode: None,
                 },
@@ -19826,6 +19971,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -19917,6 +20064,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: Some(test_mode("Full Access", ModeAccent::Danger, false)),
             },
@@ -19967,6 +20116,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: Some(super_vibe_mode("Full Access", ModeAccent::Danger, false)),
             },
@@ -20097,21 +20248,6 @@ mod tests {
     }
 
     #[test]
-    fn auto_knowledge_wraps_in_a_narrow_side_panel_with_clicks_intact() {
-        let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, false);
-        mode.auto_knowledge = true;
-        mode.branch = Some("feature/knowledge".to_owned());
-        for width in [22, 34, 46, 80] {
-            let lines = side_panel_mode_lines(&mode, width);
-            assert!(lines.iter().all(|line| painted_width(line) <= width));
-            let knowledge = lines.iter().find(|line| painted(line).contains("Auto Knowledge")).unwrap();
-            assert_eq!(pick_on(knowledge, "Auto Knowledge"), Some(Pick::AutoKnowledge));
-            let vibe = lines.iter().find(|line| painted(line).contains("Vibe: Super Vibe")).unwrap();
-            assert_eq!(pick_on(vibe, "Vibe: Super Vibe"), Some(Pick::VibeMode));
-        }
-    }
-
-    #[test]
     fn estimated_cost_is_not_shown_above_the_composer() {
         let mut mode = test_mode("Full Access", ModeAccent::Danger, true);
         mode.cost = Some("$0.95".to_owned());
@@ -20144,11 +20280,6 @@ mod tests {
         let line = input_top_line(120, "", Some(&mode));
         assert!(painted(&line).contains("feature/task | Vibe: On"));
         assert!(!painted(&line).contains('*'));
-        for width in [15, 120] {
-            let lines = side_panel_mode_lines(&mode, width);
-            assert!(painted(&lines[0]).contains("feature/task"));
-            assert!(!painted(&lines[0]).contains('*'));
-        }
     }
 
     #[test]
@@ -20307,6 +20438,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -20341,6 +20474,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -20381,6 +20516,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -20522,6 +20659,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -21046,6 +21185,8 @@ mod tests {
         let status = StatusArea {
             fallback: HIDDEN_STATUS_LINE.to_owned(),
             line: None,
+            diff_reference_lines: None,
+            side_panel_open: false,
             composer_notice: None,
             composer_mode: Some(ComposerMode {
                 agent: AgentMode::Standard,
@@ -23762,6 +23903,7 @@ mod tests {
             }),
             "",
             32,
+            false,
         );
         assert!(painted_width(&line) <= 32);
         assert!(line.text.trim_start().starts_with("Builder"));
@@ -23786,6 +23928,7 @@ mod tests {
             }),
             "",
             80,
+            false,
         );
 
         assert!(painted(&line).trim_start().starts_with("Shell Mode"));
@@ -23812,6 +23955,7 @@ mod tests {
             }),
             "",
             45,
+            false,
         );
 
         assert!(painted(&line).contains("GPT-5.6 Sol"));
@@ -23836,6 +23980,7 @@ mod tests {
             }),
             "",
             100,
+            false,
         );
 
         assert!(painted(&line).contains("GPT-5.6 Sol · xhigh · Fast"));
@@ -23861,11 +24006,11 @@ mod tests {
             }),
             "",
             100,
+            false,
         );
 
         assert!(painted(&line).contains("DeepSeek V4 Flash · OpenCode Go"));
-        assert!(painted(&line).ends_with("←→ effort"));
-        assert!(!painted(&line).contains("Shift + ↑↓"));
+        assert!(painted(&line).ends_with("Show SidePanel"));
         // The role opens the row, so the model keeps its colour one span over.
         let model_tone = line
             .tail
@@ -23904,82 +24049,41 @@ mod tests {
             }),
             "",
             120,
+            false,
         );
 
-        assert!(painted(&line).ends_with("Shift + ↑↓ model · ←→ effort"));
+        assert!(painted(&line).ends_with("Show SidePanel"));
         assert_eq!(painted_width(&line), 118);
     }
 
+    /// 안내는 패널을 여는 쪽과 닫는 쪽을 번갈아 말하고, 그 자리가 곧 단추다.
     #[test]
-    /// 패널이 열리면 자리를 많이 쓰는 사용량만 아래로 내려가고, 브랜치와 모드
-    /// 배지는 컴포저가 그대로 들고 있는다.
-    fn opening_the_side_panel_moves_only_the_context_reading() {
-        let mut status = Some(StatusLineView {
-            agent: AgentMode::Standard,
-            shell_mode: false,
-            model: Some("GPT-5.6 Codex".to_owned()),
-            effort: Some("xhigh".to_owned()),
-            fast: false,
-            context: Some("ctx: 164k/258k (63%)".to_owned()),
-            five_hour_percent: Some(14),
-            five_hour_remaining: Some("3h 6m".to_owned()),
-            weekly_percent: Some(27),
-            notice: None,
-            update_notice: None,
-        });
-        let footer = move_context_to_side_panel(&mut status, 44);
-        let line = status_line_row(status, "", 120);
+    fn the_status_hint_switches_between_showing_and_hiding_the_panel() {
+        let status = || {
+            Some(StatusLineView {
+                agent: AgentMode::Standard,
+                shell_mode: false,
+                model: Some("GPT-5.6 Codex".to_owned()),
+                effort: Some("xhigh".to_owned()),
+                fast: false,
+                context: None,
+                five_hour_percent: None,
+                five_hour_remaining: None,
+                weekly_percent: None,
+                notice: None,
+                update_notice: None,
+            })
+        };
 
-        assert!(painted(&line).contains("GPT-5.6 Codex"));
-        assert!(painted(&line).contains("GPT-5.6 Codex · xhigh"));
-        assert!(!painted(&line).contains("ctx:"));
-        assert!(painted(&line).contains("3h 6m: 14%"));
-        assert!(painted(&line).contains("week: 27%"));
-        assert!(painted(&line).ends_with("Shift + ↑↓ model · ←→ effort"));
-        assert_eq!(footer.len(), 2);
-        assert!(!painted(&footer[0]).contains("Vibe:"));
-        assert_eq!(painted(&footer[0]), "─".repeat(44));
-        assert_eq!(footer[0].tone, Tone::SidePanelDivider);
-        assert!(painted(&footer[1]).starts_with("Context: "));
-        assert!(painted(&footer[1]).ends_with("164/258K (63%)"));
-        assert_eq!(footer[1].tail[0].tone, Tone::Model56);
-    }
+        let open = status_line_row(status(), "", 120, true);
+        assert!(painted(&open).ends_with("Hide SidePanel"));
 
-    #[test]
-    fn a_wide_side_panel_keeps_branch_and_modes_on_one_line() {
-        let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, false);
-        mode.branch = Some("feature/panel".to_owned());
-
-        let lines = side_panel_mode_lines(&mode, 56);
-
-        assert_eq!(lines.len(), 1);
+        let shut = status_line_row(status(), "", 120, false);
+        assert!(painted(&shut).ends_with("Show SidePanel"));
+        let picks = shut.pick.as_ref().expect("the hint is clickable");
         assert_eq!(
-            painted(&lines[0]),
-            "* feature/panel | Vibe: Super Vibe"
-        );
-        assert_eq!(pick_on(&lines[0], "Vibe: Super Vibe"), Some(Pick::VibeMode));
-        assert!(!painted(&lines[0]).contains("Knowledge:"));
-    }
-
-    #[test]
-    fn side_panel_footer_modes_keep_their_click_targets() {
-        let layout =
-            side_panel_layout(100, SIDE_PANEL_MIN_WIDTH).expect("100 columns carry the panel");
-        let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, false);
-        mode.branch = Some("feature/panel".to_owned());
-        let footer = side_panel_mode_lines(&mode, layout.content_width());
-        let vibe_column = painted(&footer[0]).find("Vibe: Super Vibe").unwrap();
-        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
-        renderer.side_panel = Some(layout);
-        renderer.side_panel_footer = footer;
-        renderer.previous_lines = vec![PaintLine::blank(); 4];
-
-        assert_eq!(
-            renderer.pick_at(
-                (layout.content_left() + vibe_column) as u16,
-                2,
-            ),
-            Some(Pick::VibeMode)
+            picks.at(painted_width(&shut) - 1),
+            Some(Pick::SidePanelToggle)
         );
     }
 
@@ -24001,6 +24105,7 @@ mod tests {
             }),
             "",
             80,
+            false,
         );
 
         assert!(painted(&line).contains("4h 38m: 3%"));
@@ -24024,6 +24129,7 @@ mod tests {
             }),
             "",
             80,
+            false,
         );
 
         assert_eq!(line.prefix, " ");
@@ -24051,6 +24157,7 @@ mod tests {
             }),
             "",
             80,
+            false,
         );
 
         assert_eq!(pick_on(&line, "Builder"), Some(Pick::AgentMode));
@@ -24097,6 +24204,7 @@ mod tests {
             }),
             "",
             80,
+            false,
         );
 
         assert!(painted(&line).contains("high"));
@@ -24106,7 +24214,7 @@ mod tests {
     /// model or effort on it to click.
     #[test]
     fn the_status_fallback_row_has_nothing_to_click() {
-        assert!(status_line_row(None, "starting…", 40).pick.is_none());
+        assert!(status_line_row(None, "starting…", 40, false).pick.is_none());
     }
 
     #[test]
@@ -24121,6 +24229,8 @@ mod tests {
             StatusArea {
                 fallback: HIDDEN_STATUS_LINE.to_owned(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -24235,11 +24345,21 @@ mod tests {
             let heading = painted(&lines[4]);
             assert!(heading.starts_with("┌── What's New "));
             assert!(heading.ends_with('┐'));
-            let bottom = painted(&lines[lines.len() - 2]);
+            // 소식 카드 다음에 조작 안내 카드가 한 장 더 붙는다.
+            let commands_heading = lines
+                .iter()
+                .position(|line| painted(line).starts_with("┌── Commands "))
+                .expect("Commands card follows the news");
+            let bottom = painted(&lines[commands_heading - 2]);
             assert!(bottom.starts_with('└'));
             assert!(bottom.ends_with('┘'));
             assert_eq!(UnicodeWidthStr::width(heading.as_str()), UnicodeWidthStr::width(bottom.as_str()));
-            let news = lines[5..]
+            let commands = lines[commands_heading..]
+                .iter()
+                .filter(|line| line.prefix == "  •  ")
+                .count();
+            assert_eq!(commands, WELCOME_COMMANDS.len());
+            let news = lines[5..commands_heading]
                 .iter()
                 .filter(|line| line.prefix == "  •  ")
                 .collect::<Vec<_>>();
@@ -24703,6 +24823,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -24780,6 +24902,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -24846,6 +24970,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -24903,6 +25029,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -24947,6 +25075,8 @@ mod tests {
                 StatusArea {
                     fallback: String::new(),
                     line: None,
+                    diff_reference_lines: None,
+                    side_panel_open: false,
                     composer_notice: None,
                     composer_mode: None,
                 },
@@ -25012,6 +25142,8 @@ mod tests {
                             let overlay = view.overlay.unwrap();
                             assert_eq!(overlay.title, "질문");
                             let frame = overlay_frame(&[], overlay, None, StatusArea {
+                                diff_reference_lines: None,
+                                side_panel_open: false,
                                 fallback: String::new(), line: None, composer_notice: None, composer_mode: None,
                             }, width);
                             frame.lines.into_iter().map(|line| (
@@ -25324,6 +25456,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -25380,6 +25514,8 @@ mod tests {
         let status = || StatusArea {
             fallback: String::new(),
             line: None,
+            diff_reference_lines: None,
+            side_panel_open: false,
             composer_notice: None,
             composer_mode: None,
         };
@@ -25467,6 +25603,8 @@ mod tests {
         let status = StatusArea {
             fallback: String::new(),
             line: None,
+            diff_reference_lines: None,
+            side_panel_open: false,
             composer_notice: None,
             composer_mode: None,
         };
@@ -25528,6 +25666,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -25662,6 +25802,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -25725,6 +25867,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -25805,6 +25949,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -25855,6 +26001,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -25907,6 +26055,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -25965,6 +26115,8 @@ mod tests {
                 StatusArea {
                     fallback: String::new(),
                     line: None,
+                    diff_reference_lines: None,
+                    side_panel_open: false,
                     composer_notice: None,
                     composer_mode: None,
                 },
@@ -26052,6 +26204,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -26103,6 +26257,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -26166,6 +26322,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -26208,6 +26366,8 @@ mod tests {
                 StatusArea {
                     fallback: "status".to_owned(),
                     line: None,
+                    diff_reference_lines: None,
+                    side_panel_open: false,
                     composer_notice: None,
                     composer_mode: None,
                 },
@@ -26262,6 +26422,8 @@ mod tests {
                 StatusArea {
                     fallback: "status".to_owned(),
                     line: None,
+                    diff_reference_lines: None,
+                    side_panel_open: false,
                     composer_notice: None,
                     composer_mode: None,
                 },
@@ -26395,6 +26557,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -26459,6 +26623,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -26532,6 +26698,7 @@ mod tests {
             }),
             "",
             120,
+            false,
         );
         let hovered = Renderer::hover_columns(&line, None, Some(&Pick::Model)).expect("the model");
         let mut output = Vec::new();
@@ -26604,6 +26771,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -26649,6 +26818,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -26695,6 +26866,8 @@ mod tests {
                 StatusArea {
                     fallback: String::new(),
                     line: None,
+                    diff_reference_lines: None,
+                    side_panel_open: false,
                     composer_notice: None,
                     composer_mode: None,
                 },
@@ -26740,6 +26913,8 @@ mod tests {
                 StatusArea {
                     fallback: String::new(),
                     line: None,
+                    diff_reference_lines: None,
+                    side_panel_open: false,
                     composer_notice: None,
                     composer_mode: None,
                 },
@@ -26784,6 +26959,8 @@ mod tests {
             StatusArea {
                 fallback: String::new(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -27129,6 +27306,8 @@ mod tests {
             StatusArea {
                 fallback: "상태".to_owned(),
                 line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
                 composer_notice: None,
                 composer_mode: None,
             },
@@ -27428,7 +27607,7 @@ mod tests {
             3,
             std::slice::from_ref(&heading),
             None,
-            &[],
+            false,
             Some(&Pick::PromptSection),
         );
         let heading_width = painted_line_width(&heading);

@@ -583,6 +583,86 @@ mod tests {
         result.unwrap();
     }
 
+    /// 패널에서 끌어낸 인용은 사용자 글자와 별개의 조각으로 나간다. 브리지가 그
+    /// 조각을 따로 실어 보내는지, 모델이 그 안의 값을 읽는지 실제로 확인한다.
+    #[tokio::test]
+    #[ignore = "실제 Claude SDK 초기화와 로그인 필요"]
+    async fn live_claude_carries_a_diff_selection_beside_the_prompt() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let cwd = std::env::current_dir().unwrap();
+        let mut server = ClaudeServer::new(Path::new("node"), Path::new("claude"), &cwd).unwrap();
+        let result = async {
+            let opened = timeout(
+                Duration::from_secs(60),
+                server.request(
+                    "session/start",
+                    json!({ "cwd": std::env::temp_dir(), "model": "claude:sonnet" }),
+                ),
+            )
+            .await
+            .unwrap()?;
+            let id = opened["id"].clone();
+            let mut state = crate::state::AppState::new(
+                visible_thread_id(id.as_str().unwrap()),
+                std::env::temp_dir().to_string_lossy().into(),
+                "시험".into(),
+                Vec::new(),
+                "claude:sonnet",
+                None,
+            );
+            let token = format!(
+                "ZQX{}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            assert!(state.set_diff_reference(format!("let rune = \"{token}\";")));
+            state.handle_paste(
+                "인용된 줄에 들어 있는 값을 그대로 한 번만 적으세요. 도구는 쓰지 마세요.",
+            );
+            let crate::state::Action::Submit(text) =
+                state.handle_key(KeyEvent::from(KeyCode::Enter))
+            else {
+                panic!("프롬프트가 나가야 한다");
+            };
+            let input = state.turn_input(text);
+            assert_eq!(input.len(), 2, "인용이 별도 조각으로 서지 않음: {input:?}");
+            server
+                .request(
+                    "session/prompt",
+                    json!({ "sessionId": id, "input": input, "model": "claude:sonnet" }),
+                )
+                .await?;
+            let mut answer = String::new();
+            loop {
+                let event = timeout(Duration::from_secs(180), server.next_event())
+                    .await
+                    .expect("실제 모델 응답 시간 초과")
+                    .expect("연결 종료");
+                let ServerEvent::Notification { method, params } = event else {
+                    continue;
+                };
+                if method == "item/completed"
+                    && params.pointer("/item/type").and_then(Value::as_str) == Some("agentMessage")
+                {
+                    answer.push_str(params.pointer("/item/text").and_then(Value::as_str).unwrap_or_default());
+                }
+                if method == "turn/completed" {
+                    break;
+                }
+            }
+            assert!(answer.contains(&token), "모델이 인용된 값을 읽지 못함: {answer}");
+            println!("검증 통과: claude:sonnet 인용 조각 전송과 모델 인식");
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        server.shutdown().await;
+        result.unwrap();
+    }
+
     #[test]
     fn malformed_user_input_request_recovers_only_the_safe_bridge_id() {
         let line = r#"{"id":"claude-host-42","method":"item/tool/requestUserInput","params":{"payload":"\u12"}}"#;

@@ -727,6 +727,9 @@ async fn await_thread(
                             MouseClick::Composer(index) => {
                                 Action::Tick(state.move_composer_cursor(index))
                             }
+                            MouseClick::DiffSelection(text) => {
+                                Action::Tick(state.set_diff_reference(text))
+                            }
                         })
                     }
                     Some(Ok(Event::Paste(text))) => {
@@ -806,6 +809,7 @@ fn hold_until_thread(
         | Action::SetTheme(_)
         | Action::PersistAutoKnowledge(_)
         | Action::Copy(_)
+        | Action::CopyQuietly(_)
         | Action::Cut(_)
         | Action::RunShell(_)
         | Action::OpenUrl(_)
@@ -983,6 +987,7 @@ async fn choose_startup_session(
                 side_panel_diff: &[],
                 side_panel_diff_selected: None,
                 side_panel_diff_expanded: true,
+                diff_reference_lines: None,
                 side_panel_integrations: Vec::new(),
             },
         )?;
@@ -1786,6 +1791,9 @@ async fn event_loop(
                             MouseClick::Composer(index) => {
                                 Action::Tick(input_state.move_composer_cursor(index))
                             }
+                            MouseClick::DiffSelection(text) => {
+                                Action::Tick(input_state.set_diff_reference(text))
+                            }
                         })
                     }
                     Some(Ok(Event::Paste(text))) => {
@@ -2214,6 +2222,8 @@ enum MouseRequest {
 enum MouseClick {
     Pick(Pick),
     Composer(usize),
+    /// Text dragged out of the panel's patch, which the next prompt quotes.
+    DiffSelection(String),
 }
 
 /// Shift is the terminal's own escape hatch: holding it while dragging bypasses
@@ -2292,6 +2302,12 @@ fn renderer_mouse_action(
         }
         MouseRequest::SelectionEnd(column, row) => match renderer.finish_selection(column, row) {
             SelectionResult::Copy(text) => Action::Copy(text),
+            // The quote is set aside first; the text still reaches the
+            // clipboard the way any other selection does.
+            SelectionResult::DiffCopy(text) => {
+                on_click(MouseClick::DiffSelection(text.clone()));
+                Action::CopyQuietly(text)
+            }
             // A press and release on the same cell never was a drag; tool
             // headings and the session's own chrome still want that click.
             SelectionResult::Click(column, row) => {
@@ -2379,6 +2395,10 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
             state.toggle_side_panel_plugins(&provider);
             Action::Tick(true)
         }
+        Pick::SidePanelToggle => {
+            state.toggle_side_panel();
+            Action::Tick(true)
+        }
         Pick::SidePanelNarrower => state.adjust_side_panel_width(-1, terminal_size().0),
         Pick::SidePanelWider => state.adjust_side_panel_width(1, terminal_size().0),
         Pick::DiffSection => {
@@ -2389,6 +2409,7 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
             state.select_side_panel_diff(path);
             Action::Tick(true)
         }
+        Pick::DiffReferenceClear => Action::Tick(state.clear_diff_reference()),
         Pick::RemoveQueuedPrompt(index) => {
             state.remove_queued_prompt(index);
             Action::Tick(true)
@@ -2618,6 +2639,7 @@ async fn execute_action(
         action @ (Action::None
         | Action::Tick(_)
         | Action::Copy(_)
+        | Action::CopyQuietly(_)
         | Action::Cut(_)
         | Action::OpenUrl(_)
         | Action::OpenLinkDirectory(_)
@@ -4539,6 +4561,12 @@ fn execute_local_action(
             match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(&text)) {
                 Ok(()) => state.set_copy_notice(),
                 Err(error) => state.push_notice(BlockKind::Error, "복사 실패", error.to_string()),
+            }
+        }
+        Action::CopyQuietly(text) => {
+            if let Err(error) = Clipboard::new().and_then(|mut clipboard| clipboard.set_text(&text))
+            {
+                state.push_notice(BlockKind::Error, "복사 실패", error.to_string());
             }
         }
         // The composer already gave the text up; only the clipboard is left. A
@@ -7504,7 +7532,7 @@ mod tests {
     }
 
     /// The slash command is the same toggle as Alt+P: the width now belongs to
-    /// the panel's own [+]/[-] buttons.
+    /// the panel's own [◀]/[▶] buttons.
     #[test]
     fn the_side_panel_slash_command_toggles_the_panel() {
         let mut state = AppState::new(
@@ -9135,7 +9163,7 @@ mod tests {
         let view = state.view();
         assert!(view.welcome.is_none());
         assert!(view.status_line.is_some(), "the status line stays painted");
-        assert_eq!(view.activity.as_deref(), Some("Loading session.."));
+        assert_eq!(view.activity.as_deref(), Some("Loading session"));
     }
 
     /// A failed switch must not strand the UI pending against a thread that will
