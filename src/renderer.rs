@@ -7325,43 +7325,9 @@ fn welcome_lines(welcome: WelcomeView, width: u16, show_news: bool) -> Vec<Paint
             ),
             width,
         ));
-        lines.extend(update_lines(
-            &Block::new(BlockKind::Update, "Commands", welcome_commands()),
-            width,
-        ));
     }
     lines
 }
-
-/// 웰컴 카드가 소개하는 몇 가지 조작. 왼쪽 열을 가장 긴 항목에 맞춰 정렬한다.
-const WELCOME_COMMANDS: [(&str, &str); 8] = [
-    ("/help", "List every command"),
-    ("/provider", "Select a provider"),
-    ("/agent", "Switch agent role [Tab]"),
-    ("$", "Plugin·Skill·App search"),
-    ("@", "Plugin·Skill·files·directories search"),
-    ("Alt+P", "Show SidePanel"),
-    ("Shift + ↑↓", "Change model"),
-    ("Shift + ←→", "Change effort"),
-];
-
-fn welcome_commands() -> String {
-    let key_width = WELCOME_COMMANDS
-        .iter()
-        .map(|(key, _)| UnicodeWidthStr::width(*key))
-        .max()
-        .unwrap_or_default();
-    WELCOME_COMMANDS
-        .iter()
-        .map(|(key, description)| {
-            let pad = " ".repeat(key_width - UnicodeWidthStr::width(*key) + 2);
-            format!("{key}{pad}{description}")
-        })
-        .collect::<Vec<_>>()
-        .join("
-")
-}
-
 
 fn plain_line(text: &str, tone: Tone, bold: bool) -> PaintLine {
     PaintLine {
@@ -10559,12 +10525,8 @@ fn side_panel_diff_lines(
     else {
         return (lines, Vec::new());
     };
-    // 목록과 패치는 서로 다른 읽을거리라 구분선으로 갈라 둔다.
-    lines.extend([
-        PaintLine::blank(),
-        side_panel_divider(content_width),
-        PaintLine::blank(),
-    ]);
+    // 목록과 패치는 빈 줄 하나로만 갈라 둔다.
+    lines.push(PaintLine::blank());
     // 파일 이름과 줄 수는 위 목록이 이미 말하고 있으므로 패치만 펼친다.
     let patch = file_change_patch_lines(
         &file.block.body.lines().skip(1).collect::<Vec<_>>(),
@@ -13219,16 +13181,6 @@ fn input_lines_with_controls(
     let visible_end = (visible_start + COMPOSER_MAX_PROMPT_ROWS).min(raw_rows.len());
 
     let mut rows = Vec::with_capacity(visible_end - visible_start + 2);
-    // 배지가 통째로 들어가는 너비에서는 구분선을 덮지 않고 그 위 줄에 세운다.
-    let badge_row = controls_mode.and_then(|mode| composer_badge_row(mode, panel_width));
-    let controls_mode = if badge_row.is_some() {
-        None
-    } else {
-        controls_mode
-    };
-    if let Some(badge_row) = badge_row {
-        rows.push(badge_row);
-    }
     rows.push(input_top_line_with_controls(
         panel_width,
         label,
@@ -13375,36 +13327,6 @@ const COMPOSER_NOTICE_TAIL_RULE: usize = 2;
 
 /// Rule the composer's top line opens with when it carries a label.
 const OPENING_RULE: &str = "── ";
-
-/// 브랜치부터 Auto Knowledge까지가 한 줄에 다 들어가면 구분선 위에 따로 세운
-/// 줄로 오른쪽 끝에 맞춰 그린다. 그렇지 않으면 `None`을 돌려 예전처럼 구분선
-/// 안에 얹는다.
-fn composer_badge_row(mode: &ComposerMode, panel_width: usize) -> Option<PaintLine> {
-    let badge = full_badge_spans(mode, true);
-    let width = spans_width(&badge.spans) + spans_console_extra(&badge.spans);
-    let pad = panel_width.checked_sub(width)?;
-    if pad == 0 {
-        return None;
-    }
-    let picks = [
-        badge.vibe_mode_index.map(|index| (index + 1, Pick::VibeMode)),
-        badge
-            .auto_knowledge_index
-            .map(|index| (index + 1, Pick::AutoKnowledge)),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-    Some(
-        PaintLine {
-            text: " ".repeat(pad),
-            tone: Tone::Muted,
-            tail: badge.spans,
-            ..PaintLine::plain("")
-        }
-        .with_tight_picks(&picks),
-    )
-}
 
 #[cfg(test)]
 fn input_top_line(panel_width: usize, label: &str, mode: Option<&ComposerMode>) -> PaintLine {
@@ -19520,14 +19442,14 @@ mod tests {
 
         let (rows, _, _, _) = input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
 
-        assert_eq!(rows[1].tone, Tone::ModelTerra);
-        assert_eq!(rows[2].prefix_tone, Tone::ModelTerra);
+        assert_eq!(rows[0].tone, Tone::ModelTerra);
+        assert_eq!(rows[1].prefix_tone, Tone::ModelTerra);
         // The `❯` glyph carries the agent colour; the rules keep the model tone.
         // The blank the cursor sits on stays plain, so an outside terminal paints
         // the IME preedit in the ordinary text colour.
-        assert_eq!(rows[2].tone, Tone::AgentStandard);
+        assert_eq!(rows[1].tone, Tone::AgentStandard);
         assert_eq!(
-            rows[2].tail.last().map(|span| span.tone),
+            rows[1].tail.last().map(|span| span.tone),
             Some(Tone::Plain)
         );
         assert_eq!(rows.last().map(|line| line.tone), Some(Tone::ModelTerra));
@@ -19549,11 +19471,11 @@ mod tests {
             Some(&mode),
         );
 
-        assert_eq!(rows[2].text, "! ");
-        assert_eq!(rows[2].tone, Tone::Plain);
+        assert_eq!(rows[1].text, "! ");
+        assert_eq!(rows[1].tone, Tone::Plain);
         assert_eq!(rows[2].tone, Tone::Plain);
         assert_eq!(rows.last().unwrap().tone, Tone::Plain);
-        assert!(!painted(&rows[2]).contains('❯'));
+        assert!(!painted(&rows[1]).contains('❯'));
     }
 
     #[test]
@@ -19576,8 +19498,8 @@ mod tests {
 
         let (rows, _, _, _) = input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
 
-        assert_eq!(rows[2].text, "❯ ");
-        assert_eq!(rows[2].tone, Tone::AgentGoalRunner);
+        assert_eq!(rows[1].text, "❯ ");
+        assert_eq!(rows[1].tone, Tone::AgentGoalRunner);
     }
 
     #[test]
@@ -19657,8 +19579,8 @@ mod tests {
 
         let (rows, _, _, _) = input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
 
-        assert_eq!(rows[1].tone, Tone::ModelOpus);
-        assert_eq!(rows[2].prefix_tone, Tone::ModelOpus);
+        assert_eq!(rows[0].tone, Tone::ModelOpus);
+        assert_eq!(rows[1].prefix_tone, Tone::ModelOpus);
         assert_eq!(rows.last().map(|line| line.tone), Some(Tone::ModelOpus));
     }
 
@@ -20340,32 +20262,6 @@ mod tests {
         );
         assert!(!painted(&line).contains("Response:"));
         assert!(!painted(&line).contains("Fast:"));
-    }
-
-    /// 배지가 통째로 들어가는 너비에서는 구분선을 덮지 않고 그 위 줄에 선다.
-    /// 좁아지면 예전처럼 구분선 안으로 들어간다.
-    #[test]
-    fn a_wide_composer_lifts_the_badge_off_the_rule() {
-        let editor = Editor::default();
-        let mut mode = test_mode("Default", ModeAccent::Calm, false);
-        mode.branch = Some("main".to_owned());
-        mode.auto_knowledge = true;
-
-        let (rows, _, _, _) = input_lines(&editor, &[], 120, "", "Ask anything", None, Some(&mode));
-        let badge = painted(&rows[0]);
-        assert!(badge.contains("main") && badge.contains("Auto Knowledge"));
-        assert!(!badge.contains('─'));
-        let rule = painted(&rows[1]);
-        assert!(rule.chars().all(|ch| ch == '─'));
-        let badge_width = UnicodeWidthStr::width(badge.as_str());
-        assert_eq!(
-            rows[0].pick.as_ref().and_then(|picks| picks.columns_of(&Pick::AutoKnowledge)),
-            Some(badge_width - UnicodeWidthStr::width("Auto Knowledge")..badge_width)
-        );
-
-        // 좁은 창에서는 배지가 다시 구분선 위에 얹힌다.
-        let (narrow, _, _, _) = input_lines(&editor, &[], 24, "", "Ask anything", None, Some(&mode));
-        assert!(painted(&narrow[0]).contains('─'));
     }
 
     #[test]
@@ -22753,12 +22649,13 @@ mod tests {
             Some(Pick::DiffFile("README.md".to_owned()))
         );
         assert!(painted(&lines[3]).ends_with("+11 -4"));
-        // 목록과 패치 사이에는 구분선이 하나 선다.
+        // 목록과 패치 사이는 빈 줄 하나로만 갈린다.
         assert!(
             lines
                 .iter()
-                .any(|line| line.tone == Tone::SidePanelDivider)
+                .all(|line| line.tone != Tone::SidePanelDivider)
         );
+        assert!(lines.last().expect("trailing blank").text.is_empty());
         // 패치는 제자리에 남는 목록과 따로 떨어져 나온다.
         assert!(patch.iter().any(|line| painted(line).contains("time row")));
         assert!(!patch.iter().any(|line| painted(line).contains("readme row")));
@@ -24492,21 +24389,11 @@ mod tests {
             let heading = painted(&lines[4]);
             assert!(heading.starts_with("┌── What's New "));
             assert!(heading.ends_with('┐'));
-            // 소식 카드 다음에 조작 안내 카드가 한 장 더 붙는다.
-            let commands_heading = lines
-                .iter()
-                .position(|line| painted(line).starts_with("┌── Commands "))
-                .expect("Commands card follows the news");
-            let bottom = painted(&lines[commands_heading - 2]);
+            let bottom = painted(&lines[lines.len() - 2]);
             assert!(bottom.starts_with('└'));
             assert!(bottom.ends_with('┘'));
             assert_eq!(UnicodeWidthStr::width(heading.as_str()), UnicodeWidthStr::width(bottom.as_str()));
-            let commands = lines[commands_heading..]
-                .iter()
-                .filter(|line| line.prefix == "  •  ")
-                .count();
-            assert_eq!(commands, WELCOME_COMMANDS.len());
-            let news = lines[5..commands_heading]
+            let news = lines[5..]
                 .iter()
                 .filter(|line| line.prefix == "  •  ")
                 .collect::<Vec<_>>();
