@@ -10,6 +10,13 @@
 
 아래 배포·미배포 표현은 당시 기록이다. 비동기 질문 변경의 최종 배포는 같은 절의 Vibe 1.8.23·DevezCode 1.27.2 기록을 함께 읽는다. 현재 확인 위치는 [src/devezcode.rs](../src/devezcode.rs), [src/input_hub.rs](../src/input_hub.rs), [호스트 상태 검사](../scripts/test-devezcode-question-state.mjs)다.
 
+## 질문 모서리 보정과 일반 이미지 출력의 차이 — 2026-09-10
+
+- DevezVibe `c9a0250`과 DevezCode `9bb5b95`는 2026-09-09에 각각 모서리 보정을 추가했다. DevezCode `a9321df`에는 해당 보정의 1.26.26 배포 버전 변경이 있다. 원격 배포 상태는 이 조사에서 조회하지 않았다.
+- Vibe의 `src/input_hub.rs::query_graphics`는 Windows Terminal 환경과 Sixel 지원 응답을 확인하며, `src/terminal_graphics.rs`는 모서리 한 칸을 3색 Sixel로 만든다.
+- DevezCode의 `Resources/Terminal/web/devez-question-corners.js`는 Sixel을 해석하지 않는다. 특정 문자·RGB 조합을 찾아 CSS 배경으로 모서리를 덮으며 `terminal.html`에서 설치한다. 일반 JPG 출력 기능으로 간주하면 안 된다.
+- 현재 구조에서 응답 영역에 일반 JPG를 표시하려면 Vibe의 이미지 전달·출력과 DevezCode의 이미지 수신·렌더링을 모두 확장해야 한다.
+
 ## Codex 비동기 질문의 호스트 대기 상태 — 2026-09-10
 
 - 비동기 질문은 제공자 턴이 종료되어도 `AppState.awaiting_input()`이 참이다. `busy=false`만 호스트에 전달하면 DevezCode가 대기 표시를 지우고 완료로 처리한다. `src/devezcode.rs`는 미응답 질문도 호스트의 `running` 상태로 유지한다. 실제 제공자 `busy` 값은 바꾸지 않는다.
@@ -33,6 +40,8 @@
 한글 자모와 완성형 음절은 일반 누름·놓기 흐름으로 들어온다. 사설 표식 예외를 전체 문자 입력에 넓히지 않는다.
 
 외부 터미널(Windows Terminal·conhost)에서는 한글 IME가 조합에 쓴 키의 누름을 가져가고 놓기만 통과시키며, `crossterm`은 놓기 이벤트의 빈 문자를 자판 배열로 되살려 영문 놓기 이벤트로 전달한다. 누름 없는 놓기를 Alt 코드로 보고 누름으로 되돌리면 음절 뒤에 마지막 키의 영문이 덧붙으므로, 외부 터미널에서는 ASCII 문자의 홀로 온 놓기를 되돌리지 않는다. DevezCode 호스트 경로는 텍스트를 직접 보내므로 이 규칙을 적용하지 않는다.
+
+외부 터미널은 조합 미리보기를 스스로 그리며 커서가 놓인 셀의 속성을 쓴다. 커서 오른쪽 빈칸이 크롬 색(`chrome_tone`, 모델 색)이라 조합 중인 한글이 모델 색으로 보였다. 프레임 끝에서 SGR 전경색을 일반색으로 바꾸는 방법은 효과가 없었고, 컴포저 꼬리 빈칸의 tone을 `Tone::Plain`으로 바꾸는 방식으로 대응했다. DevezCode 경로는 `devez-preedit-v2`로 조합을 넘겨받아 앱이 직접 그리므로 영향이 없다. 외부 터미널 실화면 확인은 미수행이다.
 
 출력 재생 중 한글·이모지·폭 계산이 어긋나는 문제는 `.knowledge/한글-글리프-깨짐-진단.md`를 따른다.
 

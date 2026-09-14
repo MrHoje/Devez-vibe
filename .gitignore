@@ -10,6 +10,8 @@
 /docs/superpowers/
 /.worktrees/
 /.playwright-mcp/
+# 환경 변수가 풀리지 않은 채 실행된 명령이 만드는 빈 캐시 트리
+/%SystemDrive%/
 
 # 설치 의존성, Python 캐시, 개인 세션 상태
 node_modules/

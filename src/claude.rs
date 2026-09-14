@@ -25,6 +25,12 @@ use crate::app_server::ServerEvent;
 type PendingResponse = oneshot::Sender<Result<Value, String>>;
 type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
 
+/// 브리지가 죽지 않고 응답만 멈추면 요청이 영원히 매달려 스피너만 남는다.
+/// 세션 시작이나 큰 전사 복원도 이보다 오래 걸리지는 않으므로, 넘기면
+/// 멈춘 것으로 보고 사용자에게 알린다. 한도 대기는 턴 알림으로 오가므로
+/// 이 대기에 걸리지 않는다.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
 #[derive(Clone)]
 pub struct ClaudeClient {
     outbound: Arc<StdMutex<Option<mpsc::UnboundedSender<Value>>>>,
@@ -48,6 +54,25 @@ struct ClaudeProcess {
     stderr_task: JoinHandle<()>,
 }
 
+impl ClaudeProcess {
+    /// 이미 끊긴 브리지가 남긴 자원을 거둔다. `_job`이 떨어지며 브리지가 띄운
+    /// Claude CLI와 MCP 서버까지 함께 끝나므로 고아 프로세스는 남지 않는다.
+    async fn discard(mut self) {
+        self.writer_task.abort();
+        // 읽기 작업은 끝나면서 매달린 요청을 깨우고 종료를 알린다. 곧바로
+        // 끊으면 그 정리가 사라져 요청이 상한까지 매달리므로 잠깐 기다린다.
+        if timeout(Duration::from_secs(1), &mut self.reader_task)
+            .await
+            .is_err()
+        {
+            self.reader_task.abort();
+        }
+        self.stderr_task.abort();
+        let _ = self.child.start_kill();
+        let _ = timeout(Duration::from_secs(3), self.child.wait()).await;
+    }
+}
+
 impl ClaudeClient {
     pub async fn request(&self, method: &str, mut params: Value) -> Result<Value> {
         if let Some(object) = params.as_object_mut() {
@@ -64,10 +89,17 @@ impl ClaudeClient {
             self.pending.lock().await.remove(&id);
             return Err(error);
         }
-        match response_rx.await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(error)) => bail!("{method}: {error}"),
-            Err(_) => bail!("{method}: Claude SDK 응답 채널이 종료되었습니다."),
+        match timeout(REQUEST_TIMEOUT, response_rx).await {
+            Ok(Ok(Ok(result))) => Ok(result),
+            Ok(Ok(Err(error))) => bail!("{method}: {error}"),
+            Ok(Err(_)) => bail!("{method}: Claude SDK 응답 채널이 종료되었습니다."),
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                bail!(
+                    "{method}: Claude SDK 브리지가 {}분 동안 응답하지 않아 요청을 중단했습니다.",
+                    REQUEST_TIMEOUT.as_secs() / 60
+                )
+            }
         }
     }
 
@@ -102,8 +134,10 @@ impl ClaudeClient {
         {
             return Ok(());
         }
-        if self.process.lock().await.is_some() {
-            bail!("Claude SDK 브리지 연결이 종료되었습니다. Devez Vibe를 다시 시작하세요.");
+        // 브리지가 끊기면 outbound만 비고 프로세스 자리는 남는다. 남은 자리를
+        // 치우고 다시 띄워야 앱을 재시작하지 않고도 Claude 요청을 이어간다.
+        if let Some(dead) = self.process.lock().await.take() {
+            dead.discard().await;
         }
 
         let mut command = Command::new(&self.node_path);
@@ -663,10 +697,112 @@ mod tests {
         result.unwrap();
     }
 
+    /// 끊긴 브리지 자리가 남아 있어도 다음 요청이 새로 띄우는지 본다. 시작에
+    /// 실패한 오류가 나오면 재시작을 요구하는 대신 재기동을 시도한 것이다.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_dead_bridge_starts_again_instead_of_asking_for_a_restart() {
+        let client = ClaudeClient {
+            outbound: Arc::new(StdMutex::new(None)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+            process: Arc::new(Mutex::new(None)),
+            start_lock: Arc::new(Mutex::new(())),
+            events: mpsc::unbounded_channel().0,
+            node_path: PathBuf::from("devez-vibe-없는-node"),
+            claude_path: PathBuf::from("claude"),
+            bridge_path: PathBuf::from("bridge.mjs"),
+            cwd: env::temp_dir(),
+        };
+        let mut child = Command::new("cmd").args(["/c", "exit"]).spawn().unwrap();
+        let _ = child.wait().await;
+        *client.process.lock().await = Some(ClaudeProcess {
+            child,
+            _job: None,
+            writer_task: tokio::spawn(async {}),
+            reader_task: tokio::spawn(async {}),
+            stderr_task: tokio::spawn(async {}),
+        });
+
+        let error = client.ensure_started().await.unwrap_err().to_string();
+
+        assert!(error.contains("시작하지 못했습니다"), "재기동을 시도해야 한다: {error}");
+        assert!(client.process.lock().await.is_none(), "끊긴 자리는 치운다");
+    }
+
+    /// 브리지가 살아 있는 채로 응답만 멈추면 요청을 끊고 알린다. 시간을 멈춘
+    /// 검사라 실제로 상한만큼 기다리지 않는다.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_bridge_ends_the_request_instead_of_hanging() {
+        let (outbound, _inbox) = mpsc::unbounded_channel();
+        let client = ClaudeClient {
+            outbound: Arc::new(StdMutex::new(Some(outbound))),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+            process: Arc::new(Mutex::new(None)),
+            start_lock: Arc::new(Mutex::new(())),
+            events: mpsc::unbounded_channel().0,
+            node_path: PathBuf::from("node"),
+            claude_path: PathBuf::from("claude"),
+            bridge_path: PathBuf::from("bridge.mjs"),
+            cwd: env::temp_dir(),
+        };
+
+        let error = client
+            .request("session/start", json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("응답하지 않아"), "{error}");
+        assert!(
+            client.pending.lock().await.is_empty(),
+            "끊은 요청은 대기 목록에 남기지 않는다"
+        );
+    }
+
+    /// 계정·플러그인 조회가 CLI에서 멈추면 브리지 요청도 끝나지 않는다.
+    #[test]
+    fn bridge_bounds_claude_cli_lookups() {
+        let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
+
+        assert!(bridge.contains("const CLAUDE_COMMAND_TIMEOUT = 60_000;"));
+        assert!(bridge.contains("}, deadlineMs);"));
+        // 설치와 마켓플레이스 갱신은 저장소를 받아 오므로 조회 상한으로 끊지 않는다.
+        assert!(bridge.contains("const CLAUDE_INSTALL_TIMEOUT = 480_000;"));
+        assert!(bridge.contains("await runClaudeCommand(params, [\"plugin\", \"install\", id, \"--scope\", \"user\"], CLAUDE_INSTALL_TIMEOUT);"));
+        assert!(bridge.contains("await runCommandTimeoutSelfTest();"));
+    }
+
+    /// 합류할 턴이 사라진 이어 말하기는 새 턴이 된다. 그때 역할의 쓰기 제한과
+    /// 고른 추론 수준이 조용히 풀리면 읽기 전용 역할이 저장소를 고칠 수 있다.
+    #[test]
+    fn a_reopened_turn_keeps_the_role_limit_and_effort() {
+        let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
+
+        assert!(bridge.contains(r#"if ("toolPolicy" in params) {"#));
+        assert!(bridge.contains("params.effort ?? session.effort"));
+    }
+
+    /// 다시 뜬 브리지가 예전 질문과 같은 번호를 쓰면 새 질문이 사라진다.
+    #[test]
+    fn bridge_question_ids_differ_between_runs() {
+        let bridge = include_str!("../npm/bridge/claude-agent-sdk-bridge.mjs");
+
+        assert!(bridge.contains("const HOST_REQUEST_RUN ="));
+        assert!(bridge.contains("`claude-host-${HOST_REQUEST_RUN}-${nextHostRequest++}`"));
+    }
+
     #[test]
     fn malformed_user_input_request_recovers_only_the_safe_bridge_id() {
         let line = r#"{"id":"claude-host-42","method":"item/tool/requestUserInput","params":{"payload":"\u12"}}"#;
         assert_eq!(recover_user_input_request_id(line), Some("claude-host-42"));
+        // 실행마다 붙는 접두도 안전한 문자만 쓴다.
+        let with_run = r#"{"id":"claude-host-k3f9a1-42","method":"item/tool/requestUserInput"}"#;
+        assert_eq!(
+            recover_user_input_request_id(with_run),
+            Some("claude-host-k3f9a1-42")
+        );
         assert_eq!(
             recover_user_input_request_id(r#"{"id":"42","method":"turn/start"}"#),
             None

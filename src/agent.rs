@@ -173,8 +173,9 @@ impl AgentMode {
         // Reset Builder's response rules while retaining the shared instructions.
         let response_rules = match self {
             Self::Standard => {
-                "현재 역할은 Builder다. 이전 역할의 응답 분량 지침은 아래 규칙으로 대체한다. \
-                 한국어·형식·근거 보존은 공통 지침을 따른다."
+                "The current role is Builder. It replaces the previous role's response-length rules \
+                 with the rules below. Korean output, formatting, and preservation of evidence \
+                 follow the shared instructions."
             }
             Self::Planner
             | Self::GoalRunner
@@ -459,18 +460,18 @@ mod tests {
     fn builder_caps_answers_except_explicit_detailed_analysis() {
         let builder = AgentMode::Standard.render_turn_block();
         assert!(!builder.contains("고정 제한을 두지 않는다"));
-        assert!(builder.contains("이전 역할의 응답 분량 지침은 아래 규칙으로 대체한다"));
-        assert!(builder.contains("한국어·형식·근거 보존은 공통 지침을 따른다"));
-        assert!(builder.contains("단순 질문과 완료 보고는 짧게 답한다"));
-        assert!(builder.contains("묻는 범위만 답하고, 추가 설명은 요청받을 때 제공한다"));
+        assert!(builder.contains("replaces the previous role's response-length rules"));
+        assert!(builder.contains("Korean output, formatting, and preservation of evidence"));
+        assert!(builder.contains("Answer simple questions and completion reports briefly"));
+        assert!(builder.contains("Answer only what was asked"));
         for requirement in [
-            "공백·탭·줄바꿈을 제외한 200자 이내",
-            "사용자가 상세한 분석을 명시적으로 요청한 경우에만 해당 답변의 나머지 제한도 해제",
-            "선택·승인 설명과 코드 블록은 분량 제한과 글자 수 계산에서 제외",
-            "핵심 근거·사용자 영향·필요한 조치만 남긴다",
-            "중요한 근거·미확인 범위·위험·선택 결과를 보존",
-            "전송 전에 중복·불필요한 항목을 삭제하고 예외 부분과 공백을 제외한 글자 수를 확인",
-            "200자를 넘으면 문장을 중간에서 자르지 말고 다시 요약",
+            "within 200 characters, excluding spaces, tabs, and line breaks",
+            "Only when the user explicitly asks for a detailed analysis are the remaining limits lifted",
+            "Choice and approval explanations and code blocks are excluded from the length limit",
+            "Keep only the key evidence, the user impact, and the action required",
+            "Preserve important evidence, unverified scope, risks, and the consequences of a choice",
+            "Before sending, delete duplicate and unnecessary items and count the characters",
+            "exceeds 200 characters, rewrite the summary instead of cutting a sentence in the middle",
         ] {
             assert!(builder.contains(requirement), "missing Builder rule: {requirement}");
         }

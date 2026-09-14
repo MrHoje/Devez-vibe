@@ -88,8 +88,16 @@ function rpcError(error) {
   };
 }
 
+/**
+ * A restarted bridge numbers its host requests from one again, so a question it
+ * asks can collide with a card still on screen from the process before it. The
+ * host reads a repeated id as the same question resent and drops the new one,
+ * leaving that turn waiting forever — hence a per-run prefix.
+ */
+const HOST_REQUEST_RUN = Math.random().toString(36).slice(2, 8);
+
 function hostRequest(method, params, signal) {
-  const id = `claude-host-${nextHostRequest++}`;
+  const id = `claude-host-${HOST_REQUEST_RUN}-${nextHostRequest++}`;
   return new Promise((resolve, reject) => {
     const abort = () => {
       pendingHostRequests.delete(id);
@@ -930,7 +938,20 @@ async function requestToolPermission(toolName, input, permission) {
   };
 }
 
-function runClaudeCommand(params, args) {
+/**
+ * Account and plugin lookups shell out to the Claude CLI, which can stall on a
+ * network hiccup or an unexpected prompt. Without a deadline the host request
+ * behind it never returns and the user is left with a spinner, so a stalled
+ * command is killed and reported instead. Installs and marketplace updates
+ * clone repositories, so they get room to finish rather than the read budget —
+ * killing one halfway leaves the marketplace directory partly written. That
+ * budget stays under the host's own 10 minute request deadline, or the host
+ * would give up first and the install would finish unreported.
+ */
+const CLAUDE_COMMAND_TIMEOUT = 60_000;
+const CLAUDE_INSTALL_TIMEOUT = 480_000;
+
+function runClaudeCommand(params, args, deadlineMs = CLAUDE_COMMAND_TIMEOUT) {
   const executable = String(params.claudePath || "claude");
   return new Promise((resolve, reject) => {
     const child = spawn(executable, args, {
@@ -941,10 +962,21 @@ function runClaudeCommand(params, args) {
     });
     const stdout = [];
     const stderr = [];
+    const deadline = setTimeout(() => {
+      child.kill();
+      const stalled = new Error(`Claude 명령이 ${deadlineMs / 1000}초 동안 응답하지 않아 중단했습니다.`);
+      stalled.stdout = Buffer.concat(stdout).toString("utf8").trim();
+      reject(stalled);
+    }, deadlineMs);
+    deadline.unref?.();
     child.stdout.on("data", (chunk) => stdout.push(chunk));
     child.stderr.on("data", (chunk) => stderr.push(chunk));
-    child.once("error", reject);
+    child.once("error", (error) => {
+      clearTimeout(deadline);
+      reject(error);
+    });
     child.once("close", (code) => {
+      clearTimeout(deadline);
       const output = Buffer.concat(stdout).toString("utf8").trim();
       const detail = Buffer.concat(stderr).toString("utf8").trim();
       if (code === 0) resolve(output);
@@ -2916,16 +2948,26 @@ async function runPrompt(session, params) {
     session.model = visibleModel(params.model);
   }
   session.steerPending = 0;
-  const effort = supportedEffort(modelCapabilities(session.models, params.model || session.model), params.effort);
+  // Steering carries no effort of its own, so a steer that lands here because the
+  // turn it meant to join is gone must keep the level the user picked.
+  const effort = supportedEffort(
+    modelCapabilities(session.models, params.model || session.model),
+    params.effort ?? session.effort,
+  );
   if (effort) {
     await session.query.applyFlagSettings({ effortLevel: effort });
   }
   session.effort = effort;
   // The role's read-only policy, or none: it binds this turn and the background
-  // work it starts, until the next prompt replaces it.
-  session.toolPolicy = params.toolPolicy && typeof params.toolPolicy === "object"
-    ? params.toolPolicy
-    : null;
+  // work it starts, until the next prompt replaces it. Steering carries no
+  // policy of its own — it joins the turn already running — so a steer that
+  // lands here because that turn is gone must keep the policy in force rather
+  // than silently lifting the role's restrictions.
+  if ("toolPolicy" in params) {
+    session.toolPolicy = params.toolPolicy && typeof params.toolPolicy === "object"
+      ? params.toolPolicy
+      : null;
+  }
   const content = await inputContent(params.input, params.handoffContext);
   const turnId = beginTurn(session, params.input);
   session.queue.push({
@@ -3006,6 +3048,22 @@ function isInternalHistoryText(message, text) {
   return text.trim().startsWith("[Request interrupted by user");
 }
 
+/**
+ * The answered questions of one `AskUserQuestion` call, in the order they were
+ * asked. A cancelled question carries no answers, so it restores nothing — the
+ * same as the live session, which leaves no card behind either.
+ */
+function questionAnswerPairs(input, result) {
+  const answers = result?.answers;
+  if (!answers || typeof answers !== "object") return [];
+  return (input?.questions || [])
+    .map((entry) => ({
+      question: String(entry?.question || "").trim(),
+      answer: String(answers[entry?.question] ?? "").trim(),
+    }))
+    .filter((pair) => pair.question && pair.answer);
+}
+
 function historyState(messages) {
   const turns = [];
   let turn = null;
@@ -3060,6 +3118,7 @@ function historyState(messages) {
           } else if (block.name === "TaskUpdate") {
             applyTaskUpdate(tasks, block.input || {}, turn.id, undefined, messageTime(message));
           } else if (!["TaskGet", "TaskList", "AskUserQuestion"].includes(block.name)) turn.items.push(pending.item);
+          // 질문 도구는 답변이 실려 오는 결과를 기다렸다가 질문·답변 항목으로 남긴다.
         }
       }
     } else if (message.type === "user") {
@@ -3094,6 +3153,9 @@ function historyState(messages) {
           const current = latestTaskPlan(tasks);
           tasks.clear();
           for (const [id, task] of current) tasks.set(id, task);
+        } else if (pending.name === "AskUserQuestion") {
+          const pairs = questionAnswerPairs(pending.input, message.tool_use_result);
+          if (pairs.length) turn.items.push({ id: block.tool_use_id, type: "questionAnswers", pairs });
         } else if (pending.item) {
           const output = toolOutput(block.content, message.tool_use_result);
           Object.assign(pending.item, pending.item.type === "commandExecution"
@@ -3439,7 +3501,7 @@ async function dispatch(method, params = {}) {
       ? requested
       : `${requested}@${params.remoteMarketplaceName}`;
     if (!id) throw new Error("설치할 Claude 플러그인 이름이 없습니다.");
-    await runClaudeCommand(params, ["plugin", "install", id, "--scope", "user"]);
+    await runClaudeCommand(params, ["plugin", "install", id, "--scope", "user"], CLAUDE_INSTALL_TIMEOUT);
     return { pluginId: id, appsNeedingAuth: [] };
   }
   if (method === "plugin/uninstall") {
@@ -3466,7 +3528,7 @@ async function dispatch(method, params = {}) {
     const ref = params.refName ? `@${params.refName}` : "";
     const source = `${String(params.source || "")}${ref}`;
     if (!source) throw new Error("추가할 Claude 마켓플레이스 주소가 없습니다.");
-    await runClaudeCommand(params, ["plugin", "marketplace", "add", source]);
+    await runClaudeCommand(params, ["plugin", "marketplace", "add", source], CLAUDE_INSTALL_TIMEOUT);
     return { alreadyAdded: false, installedRoot: source };
   }
   if (method === "marketplace/remove") {
@@ -3476,7 +3538,7 @@ async function dispatch(method, params = {}) {
     return {};
   }
   if (method === "marketplace/upgrade") {
-    const output = await runClaudeCommand(params, ["plugin", "marketplace", "update"]);
+    const output = await runClaudeCommand(params, ["plugin", "marketplace", "update"], CLAUDE_INSTALL_TIMEOUT);
     return { message: output, consideredRoots: ["Claude marketplaces"], errors: [] };
   }
   if (method === "skills/list") return claudeSkills(params);
@@ -3744,9 +3806,42 @@ function runToolPolicySelfTest() {
   }
 }
 
+/** A command that never answers is killed and reported, not waited on forever. */
+async function runCommandTimeoutSelfTest() {
+  const started = Date.now();
+  let stalledPid = 0;
+  const stalled = runClaudeCommand(
+    { claudePath: process.execPath },
+    // Written raw, since console.log would wrap the number in colour codes.
+    // The budget is long enough for a cold node to announce itself.
+    ["-e", "process.stdout.write(String(process.pid)); setTimeout(() => {}, 60000)"],
+    2000,
+  );
+  const failure = await stalled.then(() => null, (error) => error);
+  if (!failure || !/응답하지 않아/.test(failure.message) || Date.now() - started > 30_000) {
+    throw new Error(`Claude command timeout self-test failed: ${failure?.message}`);
+  }
+  // Reporting the timeout is only half of it: the stalled child has to be gone,
+  // or every timed-out lookup leaves a process behind for the session's life.
+  stalledPid = Number(failure.stdout) || 0;
+  if (!stalledPid) throw new Error("Claude command timeout self-test read no child pid");
+  for (let waited = 0; stalledPid && waited < 5000; waited += 100) {
+    try { process.kill(stalledPid, 0); } catch { stalledPid = 0; break; }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  if (stalledPid) throw new Error(`Claude command timeout left pid ${stalledPid} running`);
+  const quick = await runClaudeCommand(
+    { claudePath: process.execPath },
+    ["-e", "process.stdout.write('ok')"],
+    30_000,
+  );
+  if (quick !== "ok") throw new Error(`Claude command self-test returned ${quick}`);
+}
+
 async function runSelfTest() {
   await runPermissionModeSelfTest();
   runToolPolicySelfTest();
+  await runCommandTimeoutSelfTest();
   const planUsage = { rate_limits: { five_hour: { utilization: 25 } }, behaviors: null };
   let usageOptions;
   const fetchedUsage = await safeUsage({
@@ -3958,6 +4053,34 @@ async function runSelfTest() {
     message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content }] },
     tool_use_result: toolUseResult,
   });
+  // 재개한 대화의 질문·답변은 항목으로 남고, 답변 없이 취소된 질문은 남지 않는다.
+  const askQuestions = {
+    questions: [
+      { question: "어떤 방법인가요?", options: [{ label: "첫 번째" }] },
+      { question: "언제 할까요?", options: [{ label: "지금" }], multiSelect: true },
+    ],
+  };
+  const answeredQuestions = historyTurns([
+    user("q-user", "선택지 띄워"),
+    taskUse("q-assistant", "ask-1", "AskUserQuestion", askQuestions),
+    taskResult("q-result", "ask-1", { answers: { "어떤 방법인가요?": "첫 번째", "언제 할까요?": "지금, 나중" } }, "answered"),
+    assistant("q-answer", "claude-opus-5", "적용했습니다."),
+  ]);
+  const answerItem = answeredQuestions[0]?.items.find((item) => item.type === "questionAnswers");
+  if (answerItem?.pairs?.length !== 2
+    || answerItem.pairs[0].question !== "어떤 방법인가요?"
+    || answerItem.pairs[1].answer !== "지금, 나중") {
+    throw new Error(`Claude question history self-test failed: ${JSON.stringify(answeredQuestions)}`);
+  }
+  const cancelledQuestion = historyTurns([
+    user("c-user", "선택지 띄워"),
+    taskUse("c-assistant", "ask-2", "AskUserQuestion", askQuestions),
+    taskResult("c-result", "ask-2", undefined, "사용자가 질문을 취소하고 작업을 중단했습니다."),
+    assistant("c-answer", "claude-opus-5", "중단했습니다."),
+  ]);
+  if (cancelledQuestion.some((turn) => turn.items.some((item) => item.type === "questionAnswers"))) {
+    throw new Error(`Claude cancelled question self-test failed: ${JSON.stringify(cancelledQuestion)}`);
+  }
   const resumedProgress = historyTurns([
     user("progress-user", "환자 변경 동기화를 수정해"),
     {

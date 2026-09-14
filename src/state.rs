@@ -429,15 +429,16 @@ impl SlashCommand {
     /// list — and out of `/help` — while such a runtime is selected.
     fn supports(&self, provider: ModelProvider) -> bool {
         match self.name {
-            "/login" | "/logout" | "/permissions" | "/mcp" | "/plugins" | "/reload-plugins"
-            | "/skills" => provider != ModelProvider::OpenCode,
+            "/login" | "/logout" | "/mcp" | "/plugins" | "/reload-plugins" | "/skills" => {
+                provider != ModelProvider::OpenCode
+            }
             "/fast" => provider != ModelProvider::Claude,
             _ => true,
         }
     }
 }
 
-const SLASH_COMMANDS: [SlashCommand; 34] = [
+const SLASH_COMMANDS: [SlashCommand; 33] = [
     SlashCommand {
         name: "/provider",
         description: "Switch between the Claude and Codex providers, or connect OpenCode",
@@ -467,11 +468,6 @@ const SLASH_COMMANDS: [SlashCommand; 34] = [
         name: "/effort",
         description: "Set reasoning effort",
         takes_argument: true,
-    },
-    SlashCommand {
-        name: "/permissions",
-        description: "Manage the current provider's permission rules",
-        takes_argument: false,
     },
     SlashCommand {
         name: "/theme",
@@ -5856,10 +5852,12 @@ impl AppState {
                     ).collect();
                 }
             }
+            // 질문 카드도 사용자 블록이라, 시간은 카드가 아니라 실제로 보낸
+            // 프롬프트에 붙여야 프롬프트 옆 소요 시간이 사라지지 않는다.
             if let Some(duration) = completed_turn_duration(turn)
                 && let Some(prompt) = blocks
                     .iter_mut()
-                    .rfind(|block| matches!(block.kind, BlockKind::User))
+                    .rfind(|block| matches!(block.kind, BlockKind::User) && block.children().is_empty())
             {
                 prompt.set_response_duration(duration);
             }
@@ -6613,10 +6611,21 @@ impl AppState {
     }
 
     fn plan_is_active(&self) -> bool {
-        !self.plan_panel_hidden
-            && self.busy
-            && self.turn_id.is_some()
-            && self.plan_turn_id == self.turn_id
+        if self.plan_panel_hidden {
+            return false;
+        }
+        if self.busy {
+            return self.turn_id.is_some() && self.plan_turn_id == self.turn_id;
+        }
+        // 백그라운드 하위 에이전트는 턴이 끝난 뒤에도 계속 돈다. 그동안 남은
+        // 단계는 실제로 진행 중이므로 스피너를 이어 준다.
+        !self.subagents.is_empty()
+            && self.plan_summary.as_ref().is_some_and(|summary| {
+                summary
+                    .steps
+                    .iter()
+                    .any(|step| step.status != PlanStepStatus::Completed)
+            })
     }
 
     fn visible_plan_summary(&self) -> Option<&PlanSummary> {
@@ -9605,10 +9614,6 @@ impl AppState {
                     "OpenCode 로그아웃",
                     "터미널에서 `opencode auth logout`을 실행하세요.",
                 )),
-                "/permissions" => Some((
-                    "Permissions",
-                    "OpenCode는 현재 Full Access 권한으로 실행됩니다.",
-                )),
                 _ => None,
             };
             if let Some((title, body)) = notice {
@@ -9633,11 +9638,6 @@ impl AppState {
                 } else {
                     "/login  ChatGPT 계정 로그인\n/logout  계정 연결 해제\n"
                 };
-                let permissions_help = if on_opencode {
-                    Default::default()
-                } else {
-                    "/permissions  현재 provider 권한 규칙 관리\n"
-                };
                 let integration_help = if on_opencode {
                     Default::default()
                 } else {
@@ -9659,7 +9659,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex] MODEL  Select a provider and model\nFor OpenCode, switch with /provider opencode, then select a model with /model\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}/auto-knowledge [on|off]  지식 자동 기록 켜기·끄기\n{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|researcher|goal-runner]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 열기·닫기\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+Z / Ctrl+Y  입력 실행 취소·다시 실행\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 열기·닫기(폭은 패널 머리글의 [◀][▶])\nShift+Tab  Claude 권한 모드 전환"),
+                    format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex] MODEL  Select a provider and model\nFor OpenCode, switch with /provider opencode, then select a model with /model\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}/auto-knowledge [on|off]  지식 자동 기록 켜기·끄기\n{effort_help}/Response [All|Completed]  응답 압축 방식\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|researcher|goal-runner]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 열기·닫기\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+Z / Ctrl+Y  입력 실행 취소·다시 실행\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 열기·닫기(폭은 패널 머리글의 [◀][▶])\nShift+Tab  Claude 권한 모드 전환"),
                 ));
                 Action::None
             }
@@ -9852,22 +9852,6 @@ impl AppState {
                         format!("{effort}\nUse /effort to check support and available values for the current model."),
                     ));
                 }
-                Action::None
-            }
-            "/permissions" if parts.len() == 1 && using_claude => {
-                Action::OpenClaudePermissions(None)
-            }
-            "/permissions" if parts.len() == 1 => {
-                self.committed.push(Block::new(
-                    BlockKind::System,
-                    "권한",
-                    format!("현재 Codex 권한은 {}입니다.", self.permission_mode().label()),
-                ));
-                Action::None
-            }
-            "/permissions" => {
-                self.committed
-                    .push(Block::new(BlockKind::Error, "Usage", "/permissions"));
                 Action::None
             }
             "/Response" | "/response" if parts.len() == 1 => {
@@ -15494,6 +15478,25 @@ fn completed_item_block(cwd: &str, item: &Value) -> Option<Block> {
     match item.get("type")?.as_str()? {
         "userMessage" => user_message_text(item)
             .map(|body| Block::new(BlockKind::User, UNKNOWN_PROMPT_MODEL, body)),
+        // 재개한 대화도 질문·답변을 라이브와 같은 카드로 보여 준다.
+        "questionAnswers" => {
+            let pairs = item
+                .get("pairs")?
+                .as_array()?
+                .iter()
+                .filter_map(|pair| {
+                    let question = pair.get("question")?.as_str()?.trim();
+                    let answer = strip_recommendation_mark(pair.get("answer")?.as_str()?.trim());
+                    (!question.is_empty() && !answer.is_empty())
+                        .then(|| (question.to_owned(), answer.to_owned()))
+                })
+                .collect::<Vec<_>>();
+            (!pairs.is_empty()).then(|| {
+                let mut block = Block::question_answers(pairs);
+                block.title = UNKNOWN_PROMPT_MODEL.to_owned();
+                block
+            })
+        }
         "commandExecution" => {
             let status = item
                 .get("status")
@@ -19459,6 +19462,55 @@ mod tests {
         })
     }
 
+    /// 재개한 대화에서도 질문과 답변은 라이브와 같은 질문 카드로 돌아온다.
+    /// 답변이 빠진 항목은 복원할 기록이 없으므로 카드를 만들지 않는다.
+    #[test]
+    fn resumed_question_items_restore_the_answer_card() {
+        let mut state = test_state();
+        state.load_history(&json!({
+            "turns": [{
+                "id": "turn-1",
+                "startedAt": 1_784_992_108_i64,
+                "completedAt": 1_784_992_140_i64,
+                "items": [
+                    { "type": "userMessage", "content": [{"type": "text", "text": "선택지 띄워"}] },
+                    { "type": "questionAnswers", "id": "q1", "pairs": [
+                        {"question": "어떤 방법인가요?", "answer": "첫 번째 (권장)"},
+                        {"question": "언제 할까요?", "answer": "지금"}
+                    ]},
+                    { "type": "questionAnswers", "id": "q2", "pairs": [
+                        {"question": "취소한 질문", "answer": "  "}
+                    ]},
+                    { "type": "agentMessage", "id": "item-1", "text": "적용했습니다" }
+                ]
+            }]
+        }), None);
+
+        let cards = state
+            .committed
+            .iter()
+            .filter(|block| !block.children().is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(cards.len(), 1, "답변이 없는 질문은 카드로 복원하지 않는다");
+        let restored = cards[0];
+        assert_eq!(restored.children().len(), 2);
+        assert_eq!(restored.children()[0].title, "어떤 방법인가요?");
+        assert_eq!(restored.children()[1].body, "지금");
+        assert_ne!(restored.title, UNKNOWN_PROMPT_MODEL, "재개한 모델 이름을 물려받는다");
+        let expected = Block::question_answers(vec![
+            ("어떤 방법인가요?".to_owned(), "첫 번째".to_owned()),
+            ("언제 할까요?".to_owned(), "지금".to_owned()),
+        ]);
+        assert_eq!(restored.body, expected.body, "라이브 질문 카드와 같은 본문으로 그린다");
+        assert!(restored.response_duration().is_none(), "소요 시간은 질문 카드에 붙지 않는다");
+        let prompt = state
+            .committed
+            .iter()
+            .find(|block| block.body == "선택지 띄워")
+            .expect("복원한 프롬프트");
+        assert_eq!(prompt.response_duration(), Some(Duration::from_secs(32)));
+    }
+
     /// The prompt marker is coloured from the model named on the block, so a
     /// replayed prompt that carries no model of its own has to inherit the one
     /// the thread reopened on rather than staying on the neutral placeholder.
@@ -20636,6 +20688,44 @@ mod tests {
             &json!({ "plan": [{ "step": "next", "status": "inProgress" }] }),
         );
         assert!(state.view().plan_active);
+    }
+
+    #[test]
+    fn an_unfinished_step_keeps_spinning_while_a_subagent_outlives_the_turn() {
+        let mut state = test_state();
+        state.set_turn_started("turn-one".to_owned());
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [
+                { "step": "done", "status": "completed" },
+                { "step": "review", "status": "inProgress" }
+            ] }),
+        );
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({ "subagents": [{ "id": "review", "name": "reviewer", "backgroundTask": true }] }),
+        );
+        state.handle_notification("turn/completed", &json!({}));
+        assert!(state.view().plan_active);
+
+        state.handle_notification("turn/subagents/updated", &json!({ "subagents": [] }));
+        assert!(!state.view().plan_active);
+    }
+
+    #[test]
+    fn a_fully_completed_plan_stays_completed_while_a_subagent_outlives_the_turn() {
+        let mut state = test_state();
+        state.set_turn_started("turn-one".to_owned());
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [{ "step": "done", "status": "completed" }] }),
+        );
+        state.handle_notification(
+            "turn/subagents/updated",
+            &json!({ "subagents": [{ "id": "review", "name": "reviewer", "backgroundTask": true }] }),
+        );
+        state.handle_notification("turn/completed", &json!({}));
+        assert!(!state.view().plan_active);
     }
 
     #[test]
@@ -22317,7 +22407,6 @@ mod tests {
 
         let mut codex = test_state();
         for command in [
-            "/permissions",
             "/mcp",
             "/plugins",
             "/reload-plugins",
@@ -22343,7 +22432,6 @@ mod tests {
 
         let mut opencode = opencode_picker_state();
         for command in [
-            "/permissions",
             "/mcp",
             "/plugins",
             "/reload-plugins",
@@ -28887,7 +28975,7 @@ mod tests {
     }
 
     #[test]
-    fn permissions_command_opens_claude_rules_and_keeps_codex_fixed() {
+    fn claude_permission_panel_displays_rules() {
         let mut claude = AppState::new(
             "claude:thread".to_owned(),
             "cwd".to_owned(),
@@ -28897,10 +28985,6 @@ mod tests {
             Some("high"),
         );
 
-        assert!(matches!(
-            claude.run_slash_command("/permissions"),
-            Action::OpenClaudePermissions(None)
-        ));
         claude.open_claude_permissions(
             &json!({
                 "rules": [{
@@ -28918,22 +29002,44 @@ mod tests {
         assert_eq!(panel.title, "Permissions · Allow");
         assert!(panel.lines[0].text.contains("Read(./docs/**)"));
         assert!(panel.lines[0].text.contains("Project settings"));
-        assert!(matches!(
-            claude.run_slash_command("/permissions dont-ask"),
-            Action::None
-        ));
+    }
 
-        let mut codex = test_state();
-        assert!(matches!(
-            codex.run_slash_command("/permissions"),
-            Action::None
-        ));
-        assert!(
-            codex
-                .committed
-                .last()
-                .is_some_and(|block| block.body.contains("전체 접근"))
+    #[test]
+    fn permission_commands_are_hidden_and_inactive_for_all_providers() {
+        let claude = AppState::new(
+            "claude:thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![test_model("claude:sonnet", "Sonnet", true)],
+            "claude:sonnet",
+            Some("high"),
         );
+        for mut state in [test_state(), claude, opencode_picker_state()] {
+            for prefix in ["/", "/permission", "/permissions"] {
+                state.editor.set_text(prefix);
+                assert!(state.matching_slash_commands().iter().all(|command|
+                    !command.name.starts_with("/permission")
+                ));
+            }
+            state.run_slash_command("/help");
+            assert!(!state.committed.last().unwrap().body.contains("/permission"));
+            for command in [
+                "/permission",
+                "/permissions",
+                "/permission allow",
+                "/permissions allow",
+            ] {
+                let permission_mode = state.permission_mode();
+                assert!(matches!(
+                    state.submit_text(command.to_owned(), command.to_owned()),
+                    Action::None
+                ));
+                assert!(state.pending.is_none());
+                assert!(!state.busy);
+                assert_eq!(state.permission_mode(), permission_mode);
+                assert_eq!(state.committed.last().unwrap().title, "Unknown command");
+            }
+        }
     }
 
     #[test]

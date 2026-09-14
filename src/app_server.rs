@@ -24,6 +24,11 @@ use tokio::{
 type PendingResponse = oneshot::Sender<Result<Value, String>>;
 type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
 
+/// app-server가 죽지 않고 응답만 멈추면 요청이 영원히 매달려 스피너만 남는다.
+/// 세션 시작이나 큰 롤아웃 복원도 이보다 오래 걸리지는 않으므로, 넘기면
+/// 멈춘 것으로 보고 사용자에게 알린다.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// The cloneable half of the app-server connection. Background work may issue
 /// requests through it while [`AppServer`] remains the sole reader of events.
 #[derive(Clone)]
@@ -50,10 +55,17 @@ impl AppServerClient {
             return Err(error);
         }
 
-        match response_rx.await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(error)) => bail!("{method}: {error}"),
-            Err(_) => bail!("{method}: app-server 응답 채널이 종료되었습니다."),
+        match timeout(REQUEST_TIMEOUT, response_rx).await {
+            Ok(Ok(Ok(result))) => Ok(result),
+            Ok(Ok(Err(error))) => bail!("{method}: {error}"),
+            Ok(Err(_)) => bail!("{method}: app-server 응답 채널이 종료되었습니다."),
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                bail!(
+                    "{method}: Codex app-server가 {}분 동안 응답하지 않아 요청을 중단했습니다.",
+                    REQUEST_TIMEOUT.as_secs() / 60
+                )
+            }
         }
     }
 
@@ -792,6 +804,30 @@ fn condense_error_message(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 백엔드가 살아 있는 채로 응답만 멈추면 요청을 끊고 알린다. 시간을 멈춘
+    /// 검사라 실제로 10분을 기다리지 않는다.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_backend_ends_the_request_instead_of_hanging() {
+        let (outbound, _inbox) = mpsc::unbounded_channel();
+        let client = AppServerClient {
+            outbound: Arc::new(StdMutex::new(Some(outbound))),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(1)),
+        };
+
+        let error = client
+            .request("session/start", json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("응답하지 않아"), "{error}");
+        assert!(
+            client.pending.lock().await.is_empty(),
+            "끊은 요청은 대기 목록에 남기지 않는다"
+        );
+    }
 
     #[tokio::test]
     async fn permission_fallback_only_retries_rejected_configuration() {

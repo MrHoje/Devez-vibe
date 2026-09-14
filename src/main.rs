@@ -2675,7 +2675,7 @@ async fn execute_action(
             };
             devezcode::note_prompt(&text);
             let input = state.turn_input(text);
-            let params = json!({
+            let mut params = json!({
                 "threadId": state.thread_id,
                 "expectedTurnId": turn_id,
                 "input": input,
@@ -2683,6 +2683,12 @@ async fn execute_action(
                     "devez-vibe-knowledge": auto_knowledge_context(state.auto_knowledge())
                 }
             });
+            // The running turn keeps its own role, but the turn this input lands
+            // in may be a fresh one the backend had to reopen. Carrying the role's
+            // write restriction along is what keeps a read-only role read-only then.
+            if let Some(policy) = state.agent_mode().tool_policy() {
+                params["toolPolicy"] = policy;
+            }
             if let Err(error) = server.request("turn/steer", params).await {
                 state.push_notice(BlockKind::Error, "추가 입력 실패", error.to_string());
             }
@@ -4763,7 +4769,7 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 한 불릿에 한 쟁점을 담고 사용자 영향과 필요한 조치를 먼저 쓴다. 기술 식별자·경로·명령·코드는 사용자가 요청했거나 원인·영향·범위·실행 판단에 필요할 때만 최소로 쓴다.\n",
     "- 중복을 줄이되 띄어쓰기를 없애거나 서로 다른 쟁점을 압축하지 않는다. 판단에 필요한 근거·미확인 범위·후속 조치를 남긴다.\n",
     "- 분량은 현재 역할 지침을 따르되 Builder 외 역할에는 글자·불릿·문장 수 제한을 두지 않는다. 선택·승인 설명은 분량 제한 없이 선택지·결과·판단 근거를 온전히 제공한다.\n",
-    "- 선택·승인은 사용 가능한 AskUserQuestion 도구로 묻는다. 도구가 없거나 실패했거나 선택지를 모두 담지 못할 때는 일반 문장으로 선택지와 결과를 빠짐없이 제시하고 마지막 문장에서 선택을 묻는다. 무응답을 승인으로 해석하지 않는다.\n",
+    "- 선택·승인은 사용 가능한 AskUserQuestion 도구로 묻는다. 도구에 담는 선택지 설명은 두 문장 이내로 줄인다. 입력이 커지면 도중에 끊겨 호출이 실패한다. 도구가 없거나 실패했거나 선택지를 모두 담지 못할 때는 일반 문장으로 선택지와 결과를 빠짐없이 제시하고 마지막 문장에서 선택을 묻는다. 무응답을 승인으로 해석하지 않는다.\n",
     "- 계획 승인·실행 판단에는 목표·주요 작업·검토 결과·미확정 사항을 요약하고 상세 구현은 계획 문서에 둔다. 이미 정한 결정이나 제외한 선택지를 반복하지 않는다.\n",
     "- 실제 변경을 마쳤을 때만 마지막 문장을 구체적인 대상·동작을 담은 `~했습니다.`로 끝낸다. 질문·조사·설명에는 완료 표현을 쓰지 않고, `~한 내용을 완료했습니다.` 같은 겹친 명사절은 피한다.\n",
     "근거와 상태:\n",
@@ -4873,8 +4879,9 @@ fn auto_knowledge_context(auto_knowledge: bool) -> Value {
     let knowledge = if auto_knowledge {
         concat!(
             "현재 auto-knowledge는 On이다. 이전 auto-knowledge 상태 지침을 대체한다.\n",
-            "반복 실수, 검증된 해결법, 이후 작업에 필요한 확정 정보를 .knowledge의 주제별 문서에 기록한다. 기존 문서에 합치고 필요한 경우 폴더·문서를 만든다.\n",
-            "문서를 추가·수정·이름 변경하면 .knowledge/knowledge-index.md의 문서 제목·경로·간략한 설명도 갱신한다. 추측·임시 상태·민감정보는 기록하지 않는다. 현재 역할의 쓰기 제한과 사용자 지시를 따른다."
+            "반복 실수, 검증된 해결법, 이후 작업에 다시 필요한 확정 정보만 .knowledge의 주제별 문서에 기록한다. 기존 문서에 합치고 필요한 경우 폴더·문서를 만든다.\n",
+            "문서를 추가·수정·이름 변경하면 .knowledge/knowledge-index.md의 문서 제목·경로·간략한 설명도 갱신한다. 추측·임시 상태·민감정보는 기록하지 않는다.\n",
+            "테스트·빌드 실행 결과, 코드나 git 이력으로 다시 확인할 수 있는 내용, 이번 작업에서만 쓰는 경과는 기록하지 않는다. 남길 내용이 없으면 문서를 만들지 않는다. 현재 역할의 쓰기 제한과 사용자 지시를 따른다."
         )
     } else {
         "현재 auto-knowledge는 Off이다. 이전 auto-knowledge 상태 지침을 대체한다. .knowledge 문서와 인덱스를 자동으로 생성·갱신하지 않는다. 사용자가 기록을 명시적으로 요청하면 수행한다."

@@ -38,6 +38,10 @@ tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
 unicode-width = "0.2"
 
+# 응답이 멈춘 백엔드 검사가 실제로 10분을 기다리지 않도록 시간을 멈춘다.
+[dev-dependencies]
+tokio = { version = "1.48", features = ["test-util"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
