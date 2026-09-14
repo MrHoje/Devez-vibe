@@ -615,6 +615,11 @@ pub struct View<'a> {
     /// The working folder shown in the side panel header.
     pub cwd: String,
     pub side_panel_prompts_expanded: bool,
+    /// 패널의 변경 섹션이 그릴 미커밋 diff.
+    pub side_panel_diff: &'a [PanelFileDiff],
+    /// 그중 패치까지 펼쳐 둔 파일의 경로.
+    pub side_panel_diff_selected: Option<&'a str>,
+    pub side_panel_diff_expanded: bool,
     pub side_panel_integrations: Vec<ProviderIntegrationView>,
 }
 
@@ -849,6 +854,15 @@ pub struct Renderer {
     /// Context and usage readings moved out of the composer status row while
     /// the panel is visible.
     side_panel_footer: Vec<PaintLine>,
+    /// 패널 위쪽(프롬프트까지)과 아래쪽 변경 섹션은 각자 스크롤한다. 둘 다 위에서
+    /// 아래로 읽는 목록이라 전사의 `scroll_back`과 달리 첫 줄부터의 오프셋이다.
+    side_panel_scroll: usize,
+    side_panel_diff_scroll: usize,
+    /// 화면에 있는 프레임에서 위쪽 영역이 차지한 줄 수. 휠이 어느 영역에
+    /// 떨어졌는지 가르는 경계다.
+    side_panel_top_rows: usize,
+    /// 그 아래 제자리에 남는 바뀐 파일 목록의 줄 수.
+    side_panel_diff_head_rows: usize,
     /// Which surface the live drag belongs to. The transcript and the panel are
     /// two separate columns of text, so a drag stays inside the one it started
     /// on instead of running across the border between them.
@@ -1123,13 +1137,15 @@ impl CellFrame {
     }
 }
 
-/// The three widths Alt+P cycles the panel through before it closes again.
-pub(crate) const SIDE_PANEL_WIDTHS: [usize; 3] = [48, 60, 72];
+/// The panel opens at this width and the header's [+]/[-] step it from here.
+pub(crate) const SIDE_PANEL_MIN_WIDTH: usize = 48;
+/// One click of [-] or [+] moves the panel by this many columns.
+pub(crate) const SIDE_PANEL_WIDTH_STEP: usize = 12;
 /// Keeps the completed MCP/Plugin panel implementation available without
 /// connecting it to session startup or the visible side panel.
 pub(crate) const SIDE_PANEL_INTEGRATIONS_CONNECTED: bool = false;
 const SIDE_PANEL_GAP: usize = 1;
-const SIDE_PANEL_MIN_MAIN_WIDTH: usize = 44;
+const SIDE_PANEL_MIN_MAIN_WIDTH: usize = SIDE_PANEL_MIN_WIDTH;
 /// Keeps section rules present without competing with the content above them.
 const SIDE_PANEL_DIVIDER_BLEND: u8 = 48;
 /// A quiet neutral lift that remains visible on the panel's secondary surface.
@@ -1199,6 +1215,15 @@ fn side_panel_layout(total_width: u16, panel_width: usize) -> Option<SidePanelLa
             panel_width,
         }
     })
+}
+
+/// 폭을 12칸 눈금에 맞추고, 본문이 최소 폭 아래로 내려가지 않게 자른다. 터미널이
+/// 좁아 최소 폭조차 담지 못하면 최소 폭을 돌려주고 레이아웃이 패널을 닫는다.
+pub(crate) fn clamped_side_panel_width(width: usize, total_width: u16) -> usize {
+    let room = usize::from(total_width).saturating_sub(SIDE_PANEL_MIN_MAIN_WIDTH + SIDE_PANEL_GAP);
+    let steps = room.saturating_sub(SIDE_PANEL_MIN_WIDTH) / SIDE_PANEL_WIDTH_STEP;
+    let widest = SIDE_PANEL_MIN_WIDTH + steps * SIDE_PANEL_WIDTH_STEP;
+    width.clamp(SIDE_PANEL_MIN_WIDTH, widest)
 }
 
 fn side_panel_background_style() -> CellStyle {
@@ -1530,6 +1555,10 @@ impl Renderer {
             side_panel: None,
             side_panel_content: Vec::new(),
             side_panel_footer: Vec::new(),
+            side_panel_scroll: 0,
+            side_panel_diff_scroll: 0,
+            side_panel_top_rows: 0,
+            side_panel_diff_head_rows: 0,
             selection_in_panel: false,
             selection_in_transcript: false,
             selection_anchor_screen_row: None,
@@ -1658,7 +1687,81 @@ impl Renderer {
         moved || cleared
     }
 
-    pub fn scroll_at(&mut self, row: u16, delta: isize) -> bool {
+    /// 패널이 보여 줄 두 영역을 한 벌의 줄로 합친다. 위쪽은 있는 만큼, 변경
+    /// 섹션이 있으면 패널의 절반까지만 쓰고 나머지를 그 섹션에 넘긴다. 각 영역은
+    /// 자기 오프셋에서 잘라 붙이므로 페인트 쪽은 스크롤을 몰라도 된다.
+    fn compose_side_panel(
+        &mut self,
+        top: Vec<PaintLine>,
+        diff_head: Vec<PaintLine>,
+        diff_body: Vec<PaintLine>,
+        rows: usize,
+    ) -> Vec<PaintLine> {
+        if self.side_panel.is_none() {
+            self.side_panel_top_rows = 0;
+            self.side_panel_diff_head_rows = 0;
+            return top;
+        }
+        let capacity = rows.saturating_sub(self.side_panel_footer.len() + 2);
+        let top_rows = top.len().min(if diff_head.is_empty() {
+            capacity
+        } else {
+            capacity / 2
+        });
+        // 변경 섹션은 아래 구분선에 붙지 않도록 늘 한 줄을 남긴다.
+        let diff_rows = capacity.saturating_sub(top_rows + 1);
+        // 바뀐 파일 목록은 무엇을 고를지 고르는 자리라 제자리에 남고, 그 아래
+        // 패치만 스크롤한다.
+        let head_rows = diff_head.len().min(diff_rows);
+        let body_rows = diff_rows - head_rows;
+        self.side_panel_top_rows = top_rows;
+        self.side_panel_diff_head_rows = head_rows;
+        self.side_panel_scroll = self
+            .side_panel_scroll
+            .min(top.len().saturating_sub(top_rows));
+        self.side_panel_diff_scroll = self
+            .side_panel_diff_scroll
+            .min(diff_body.len().saturating_sub(body_rows));
+        let mut lines = top
+            .into_iter()
+            .skip(self.side_panel_scroll)
+            .take(top_rows)
+            .collect::<Vec<_>>();
+        lines.extend(diff_head.into_iter().take(head_rows));
+        lines.extend(
+            diff_body
+                .into_iter()
+                .skip(self.side_panel_diff_scroll)
+                .take(body_rows),
+        );
+        lines
+    }
+
+    /// 패널 위에서 돈 휠은 커서가 놓인 영역만 움직인다. 위쪽과 패치는 첫 줄부터의
+    /// 오프셋으로 읽으므로 전사와 부호가 반대이고, 사이에 낀 파일 목록은 제자리에
+    /// 있으므로 휠을 받지 않는다.
+    fn scroll_side_panel(&mut self, row: u16, delta: isize) -> bool {
+        // 0번 줄은 패널의 위 여백이라 콘텐츠는 한 줄 아래에서 시작한다.
+        let row = usize::from(row);
+        let offset = if row > self.side_panel_top_rows + self.side_panel_diff_head_rows {
+            &mut self.side_panel_diff_scroll
+        } else if row > self.side_panel_top_rows {
+            return false;
+        } else {
+            &mut self.side_panel_scroll
+        };
+        let target = offset.saturating_add_signed(-delta);
+        let moved = target != *offset;
+        *offset = target;
+        moved
+    }
+
+    pub fn scroll_at(&mut self, column: u16, row: u16, delta: isize) -> bool {
+        if let Some(layout) = self.side_panel
+            && usize::from(column) >= layout.panel_left
+        {
+            return self.scroll_side_panel(row, delta);
+        }
         if !self.split_active {
             return self.scroll(delta);
         }
@@ -2859,11 +2962,7 @@ impl Renderer {
         let mut status_line = view.status_line;
         let side_panel_footer = side_panel
             .map(|layout| {
-                move_context_to_side_panel(
-                    &mut status_line,
-                    view.composer_mode.as_ref(),
-                    layout.content_width(),
-                )
+                move_context_to_side_panel(&mut status_line, layout.content_width())
             })
             .unwrap_or_default();
         if side_panel != self.side_panel {
@@ -2955,7 +3054,6 @@ impl Renderer {
                 view.activity_phase,
                 view.activity_progress_phase,
                 status,
-                side_panel.is_none(),
                 frame_width,
             )
         };
@@ -2979,6 +3077,9 @@ impl Renderer {
                 &view.subagents,
                 &view.cwd,
                 view.side_panel_prompts_expanded,
+                view.side_panel_diff,
+                view.side_panel_diff_selected,
+                view.side_panel_diff_expanded,
                 &view.side_panel_integrations,
                 view.stream_fade_tail,
                 streamed_lines,
@@ -3454,6 +3555,9 @@ impl Renderer {
         subagents: &[SubagentView],
         cwd: &str,
         side_panel_prompts_expanded: bool,
+        side_panel_diff: &[PanelFileDiff],
+        side_panel_diff_selected: Option<&str>,
+        side_panel_diff_expanded: bool,
         side_panel_integrations: &[ProviderIntegrationView],
         stream_fade_tail: usize,
         streamed_lines: Vec<PaintLine>,
@@ -3593,6 +3697,18 @@ impl Renderer {
                 lines
             })
             .unwrap_or_default();
+        let (diff_head, diff_body) = self
+            .side_panel
+            .map(|layout| {
+                side_panel_diff_lines(
+                    side_panel_diff,
+                    side_panel_diff_selected,
+                    side_panel_diff_expanded,
+                    layout.content_width(),
+                )
+            })
+            .unwrap_or_default();
+        let panel_content = self.compose_side_panel(panel_content, diff_head, diff_body, rows);
         // A panel selection points at rows of this content, so content changes
         // leave the highlight describing something else.
         if self.selection_in_panel && panel_content.len() != self.side_panel_content.len() {
@@ -5365,7 +5481,6 @@ fn split_pane_frame_scrolled(
             view.activity_phase,
             view.activity_progress_phase,
             status,
-            true,
             content_width,
         )
     };
@@ -5715,6 +5830,14 @@ pub enum Pick {
     PromptSection,
     McpSection(String),
     PluginSection(String),
+    /// 패널 머리글의 [-]: 패널을 12칸 좁힌다.
+    SidePanelNarrower,
+    /// 패널 머리글의 [+]: 패널을 12칸 넓힌다.
+    SidePanelWider,
+    /// 변경 섹션의 제목: 목록과 패치를 함께 접고 편다.
+    DiffSection,
+    /// 변경 목록의 파일 한 줄: 그 파일의 패치를 아래에 펼친다.
+    DiffFile(String),
     /// The status line's agent reading: cycles to the next role, like Tab.
     AgentMode,
     /// The status line's model name: opens `/model`.
@@ -6815,7 +6938,6 @@ fn normal_frame(
         0.5,
         0.5,
         status,
-        true,
         width,
     )
 }
@@ -6850,7 +6972,6 @@ fn normal_frame_with_expansion(
     activity_phase: f32,
     activity_progress_phase: f32,
     status: StatusArea,
-    composer_controls_enabled: bool,
     width: u16,
 ) -> Frame {
     let mut lines = Vec::new();
@@ -6873,7 +6994,7 @@ fn normal_frame_with_expansion(
     // During a response, every transient notice uses the same right-hand slot.
     let activity_composer_notice = status.composer_notice.as_deref();
     let mut composer_notice = status.composer_notice.as_deref();
-    let mut composer_controls_mode = composer_controls_enabled.then_some(composer_mode).flatten();
+    let mut composer_controls_mode = composer_mode;
     let activity_uses_composer_spacer = activity.is_some() && suggestions.is_empty();
     // A suggestion panel still leaves the spacer above the composer, so the
     // controls keep that row instead of dropping onto the composer rule the
@@ -8698,16 +8819,17 @@ fn side_panel_status_lines(
     lines
 }
 
+/// 패널이 열려도 브랜치와 모드 배지는 컴포저가 계속 들고 있고, 자리를 크게
+/// 차지하는 사용량만 패널 아래로 내려온다.
 fn move_context_to_side_panel(
     status: &mut Option<StatusLineView>,
-    mode: Option<&ComposerMode>,
     content_width: usize,
 ) -> Vec<PaintLine> {
     let has_context = status
         .as_ref()
         .and_then(|status| status.context.as_deref())
         .is_some_and(|context| !context.is_empty());
-    let lines = side_panel_status_lines(status.as_ref(), mode, content_width);
+    let lines = side_panel_status_lines(status.as_ref(), None, content_width);
     if has_context && let Some(status) = status.as_mut() {
         status.context = None;
     }
@@ -9299,7 +9421,7 @@ fn file_change_counts(block: &Block) -> (usize, usize) {
 
 fn file_change_expanded_lines(block: &Block, width: u16) -> Vec<PaintLine> {
     if block.children().is_empty() {
-        return file_change_lines(block, width);
+        return file_change_lines(block, width, FILE_CHANGE_ROWS);
     }
     block
         .children()
@@ -9320,7 +9442,7 @@ fn file_change_expanded_lines(block: &Block, width: u16) -> Vec<PaintLine> {
 /// [`print_line`] paints from their tone. Hunk headers are consumed for their
 /// numbers rather than printed — the gutter says the same thing somewhere more
 /// useful.
-fn file_change_lines(block: &Block, width: u16) -> Vec<PaintLine> {
+fn file_change_lines(block: &Block, width: u16, rows_shown: usize) -> Vec<PaintLine> {
     let mut lines = file_change_heading_lines(block, width);
     let mut rows = block.body.lines();
     if let Some(summary) = rows.next() {
@@ -9333,9 +9455,15 @@ fn file_change_lines(block: &Block, width: u16) -> Vec<PaintLine> {
             width,
         ));
     }
+    lines.extend(file_change_patch_lines(&rows.collect::<Vec<_>>(), width, rows_shown));
+    lines
+}
 
-    let rows: Vec<&str> = rows.collect();
-    let word_spans = intraline_highlights(&rows);
+/// 패치 본문만. 파일 이름과 줄 수 요약은 이미 어딘가에 적혀 있을 수 있어
+/// 따로 떼어 둔다.
+fn file_change_patch_lines(rows: &[&str], width: u16, rows_shown: usize) -> Vec<PaintLine> {
+    let mut lines = Vec::new();
+    let word_spans = intraline_highlights(rows);
 
     let mut old_row = 0;
     let mut new_row = 0;
@@ -9347,7 +9475,7 @@ fn file_change_lines(block: &Block, width: u16) -> Vec<PaintLine> {
             new_row = new;
             continue;
         }
-        if shown == FILE_CHANGE_ROWS {
+        if shown == rows_shown {
             hidden += 1;
             continue;
         }
@@ -10038,13 +10166,15 @@ fn side_panel_plan_lines(
     let heading =
         side_panel_section_heading(&title, summary.expanded, content_width, Pick::PlanSummary);
     if !summary.expanded {
+        // 접힌 섹션은 제목 한 줄이 전부다. 아래 구분선까지 비워 두면 접은 만큼
+        // 자리가 돌아오지 않는다.
         return vec![
             heading,
-            PaintLine::blank(),
             side_panel_divider(content_width),
         ];
     }
-    let mut lines = vec![heading, PaintLine::blank()];
+    // 패널 아래쪽 변경 섹션이 쓸 자리를 남기려고 섹션 안쪽 빈 줄은 두지 않는다.
+    let mut lines = vec![heading];
     let last_step_index = summary.steps.len().saturating_sub(1);
     for (index, step) in summary.steps.iter().enumerate() {
         let elapsed_text = step.elapsed.map(format_plan_elapsed);
@@ -10116,27 +10246,42 @@ fn side_panel_plan_lines(
             ..PaintLine::plain("")
         });
     }
-    if !summary.steps.is_empty() {
-        lines.push(PaintLine::blank());
-    }
     lines.push(side_panel_divider(content_width));
     lines
 }
 
-/// The panel's own masthead: product and version, the working folder under it,
-/// then the same quiet rule every other section closes with.
+/// 머리글 오른쪽 끝에 붙는 폭 조절 단추. 왼쪽 세 칸이 [+], 오른쪽 세 칸이 [-]다.
+const SIDE_PANEL_WIDTH_BUTTONS: &str = "[+][-]";
+
+/// The panel's own masthead: product and version with the width buttons at its
+/// right edge, the working folder under it, then the same quiet rule every
+/// other section closes with.
 fn side_panel_header_lines(cwd: &str, content_width: usize) -> Vec<PaintLine> {
     if content_width == 0 {
         return Vec::new();
     }
+    let title = format!("DEVEZ VIBE  v{}", crate::update::CURRENT_VERSION);
+    let buttons = UnicodeWidthStr::width(SIDE_PANEL_WIDTH_BUTTONS);
+    let (text, pick) = if content_width > buttons + 2 {
+        let title = compact_right(&title, content_width - buttons - 1);
+        let start = content_width - buttons;
+        let gap = start - UnicodeWidthStr::width(title.as_str());
+        (
+            format!("{title}{}{SIDE_PANEL_WIDTH_BUTTONS}", " ".repeat(gap)),
+            Some(PickRegions(vec![
+                (start, start + 3, Pick::SidePanelWider),
+                (start + 3, start + buttons, Pick::SidePanelNarrower),
+            ])),
+        )
+    } else {
+        (compact_right(&title, content_width), None)
+    };
     vec![
         PaintLine {
-            text: compact_right(
-                &format!("DEVEZ VIBE  v{}", crate::update::CURRENT_VERSION),
-                content_width,
-            ),
+            text,
             tone: Tone::Accent,
             bold: true,
+            pick,
             ..PaintLine::plain("")
         },
         PaintLine {
@@ -10215,6 +10360,150 @@ const SIDE_PANEL_PROMPT_LIMIT: usize = 5;
 
 /// The latest sent prompts as a compact panel section: heading, blank row,
 /// newest-first entries, another blank row, then a quiet section rule.
+/// 바뀐 파일 하나. 목록 줄에 쓸 증감과, 고르면 펼칠 패치를 함께 들고 있다.
+pub struct PanelFileDiff {
+    pub path: String,
+    pub additions: usize,
+    pub deletions: usize,
+    pub block: Block,
+}
+
+/// `+12 -4`처럼 증감을 오른쪽에 붙인다. 0인 쪽은 아예 쓰지 않아 한쪽만 바뀐
+/// 파일이 0을 달고 다니지 않는다.
+fn diff_count_spans(additions: usize, deletions: usize) -> Vec<PaintSpan> {
+    let mut spans = Vec::new();
+    if additions > 0 {
+        spans.push(PaintSpan {
+            text: format!("+{additions}"),
+            tone: Tone::Success,
+            bold: false,
+        });
+    }
+    if deletions > 0 {
+        if !spans.is_empty() {
+            spans.push(PaintSpan {
+                text: " ".to_owned(),
+                tone: Tone::Muted,
+                bold: false,
+            });
+        }
+        spans.push(PaintSpan {
+            text: format!("-{deletions}"),
+            tone: Tone::Error,
+            bold: false,
+        });
+    }
+    spans
+}
+
+/// 왼쪽 글과 오른쪽 증감 사이를 공백으로 밀어 폭을 채운다. 자리가 모자라면
+/// 왼쪽을 줄이고 증감은 남긴다 — 어느 파일이 얼마나 바뀌었는지가 먼저다.
+fn diff_summary_line(
+    label: &str,
+    counts: Vec<PaintSpan>,
+    content_width: usize,
+    tone: Tone,
+    bold: bool,
+) -> PaintLine {
+    let counts_width = counts
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.text.as_str()))
+        .sum::<usize>();
+    let label = compact_right(label, content_width.saturating_sub(counts_width + 1));
+    let gap = content_width
+        .saturating_sub(UnicodeWidthStr::width(label.as_str()) + counts_width)
+        .max(1);
+    let mut tail = vec![PaintSpan {
+        text: " ".repeat(gap),
+        tone: Tone::Muted,
+        bold: false,
+    }];
+    tail.extend(counts);
+    PaintLine {
+        text: label,
+        tone,
+        bold,
+        tail,
+        ..PaintLine::plain("")
+    }
+}
+
+/// 패널 아래쪽의 변경 섹션: 바뀐 파일 목록이 위에, 고른 파일의 패치가 아래에
+/// 온다. 패치는 전사의 파일 변경 렌더를 그대로 써서 줄 번호와 색이 같고, 스스로
+/// 스크롤하므로 뒷부분을 접지 않는다. 제자리에 남을 목록과 스크롤할 패치를
+/// 나눠 돌려준다.
+fn side_panel_diff_lines(
+    files: &[PanelFileDiff],
+    selected: Option<&str>,
+    expanded: bool,
+    content_width: usize,
+) -> (Vec<PaintLine>, Vec<PaintLine>) {
+    if content_width == 0 || files.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let additions = files.iter().map(|file| file.additions).sum::<usize>();
+    let deletions = files.iter().map(|file| file.deletions).sum::<usize>();
+    // 합계는 순정과 같이 제목 바로 옆에 붙고, 파일별 증감만 오른쪽으로 간다.
+    let mut header = side_panel_section_heading(
+        &format!(
+            "{} {} changed",
+            files.len(),
+            if files.len() == 1 { "file" } else { "files" }
+        ),
+        expanded,
+        content_width,
+        Pick::DiffSection,
+    );
+    let counts = diff_count_spans(additions, deletions);
+    if !counts.is_empty() {
+        header.tail.push(PaintSpan {
+            text: "  ".to_owned(),
+            tone: Tone::Muted,
+            bold: false,
+        });
+        header.tail.extend(counts);
+    }
+    if !expanded {
+        return (vec![header], Vec::new());
+    }
+    let mut lines = vec![header, PaintLine::blank()];
+    for file in files {
+        let chosen = selected == Some(file.path.as_str());
+        let mut line = diff_summary_line(
+            &file.path,
+            diff_count_spans(file.additions, file.deletions),
+            content_width,
+            if chosen { Tone::Plain } else { Tone::Muted },
+            chosen,
+        );
+        line.pick = Some(PickRegions::span(
+            0,
+            content_width,
+            Pick::DiffFile(file.path.clone()),
+        ));
+        lines.push(line);
+    }
+    let Some(file) = files
+        .iter()
+        .find(|file| selected == Some(file.path.as_str()))
+    else {
+        return (lines, Vec::new());
+    };
+    // 목록과 패치는 서로 다른 읽을거리라 구분선으로 갈라 둔다.
+    lines.extend([
+        PaintLine::blank(),
+        side_panel_divider(content_width),
+        PaintLine::blank(),
+    ]);
+    // 파일 이름과 줄 수는 위 목록이 이미 말하고 있으므로 패치만 펼친다.
+    let patch = file_change_patch_lines(
+        &file.block.body.lines().skip(1).collect::<Vec<_>>(),
+        u16::try_from(content_width).unwrap_or(u16::MAX),
+        usize::MAX,
+    );
+    (lines, patch)
+}
+
 fn side_panel_prompt_lines(
     history: &[Block],
     content_width: usize,
@@ -10239,11 +10528,10 @@ fn side_panel_prompt_lines(
     if !expanded {
         return vec![
             heading,
-            PaintLine::blank(),
             side_panel_divider(content_width),
         ];
     }
-    let mut lines = vec![heading, PaintLine::blank()];
+    let mut lines = vec![heading];
     for prompt in prompts {
         let text = prompt.body.split_whitespace().collect::<Vec<_>>().join(" ");
         let marker_tone = model_tone(&prompt.title).unwrap_or(Tone::User);
@@ -10262,7 +10550,6 @@ fn side_panel_prompt_lines(
             ..PaintLine::plain("")
         });
     }
-    lines.push(PaintLine::blank());
     lines.push(side_panel_divider(content_width));
     lines
 }
@@ -14039,6 +14326,9 @@ mod tests {
             diff_display_mode: DiffDisplayMode::Collapse,
             side_panel_width: None,
             side_panel_prompts_expanded: true,
+            side_panel_diff: &[],
+            side_panel_diff_selected: None,
+            side_panel_diff_expanded: true,
             side_panel_integrations: Vec::new(),
         }
     }
@@ -14567,26 +14857,51 @@ mod tests {
     /// The panel takes a fixed slice of the right edge, leaves a gap in front of
     /// it, and fills the terminal's last cell without printing into it directly.
     #[test]
+    fn the_panel_masthead_ends_with_the_two_width_buttons() {
+        let content_width = 44;
+        let header = side_panel_header_lines("D:/work", content_width);
+
+        assert!(painted(&header[0]).ends_with("[+][-]"));
+        let picks = header[0].pick.as_ref().expect("width buttons are clickable");
+        assert_eq!(picks.at(content_width - 6), Some(Pick::SidePanelWider));
+        assert_eq!(picks.at(content_width - 3), Some(Pick::SidePanelNarrower));
+        assert_eq!(picks.at(content_width - 7), None);
+
+        // 너무 좁은 패널은 제목만 남기고 단추를 붙이지 않는다.
+        assert!(side_panel_header_lines("D:/work", 6)[0].pick.is_none());
+    }
+
+    #[test]
+    fn the_width_buttons_stay_on_the_twelve_column_steps_the_terminal_allows() {
+        assert_eq!(clamped_side_panel_width(36, 200), SIDE_PANEL_MIN_WIDTH);
+        assert_eq!(clamped_side_panel_width(60, 200), 60);
+        // 120열은 48열 대화 옆에 60까지만 담는다.
+        assert_eq!(clamped_side_panel_width(72, 120), 60);
+        // 패널을 담지 못할 만큼 좁으면 최소 폭으로 되돌리고 레이아웃이 닫는다.
+        assert_eq!(clamped_side_panel_width(60, 60), SIDE_PANEL_MIN_WIDTH);
+    }
+
+    #[test]
     fn side_panel_layout_keeps_a_gap_and_reaches_the_right_edge() {
         let layout =
-            side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
+            side_panel_layout(100, SIDE_PANEL_MIN_WIDTH).expect("100 columns carry the panel");
 
-        assert_eq!(layout.panel_width, SIDE_PANEL_WIDTHS[0]);
+        assert_eq!(layout.panel_width, SIDE_PANEL_MIN_WIDTH);
         assert_eq!(layout.panel_left, layout.main_width + SIDE_PANEL_GAP);
         assert_eq!(layout.panel_left + layout.panel_width, 100);
         assert_eq!(layout.content_left(), layout.panel_left + 2);
-        assert_eq!(layout.content_width(), SIDE_PANEL_WIDTHS[0] - 4);
+        assert_eq!(layout.content_width(), SIDE_PANEL_MIN_WIDTH - 4);
     }
 
     /// A terminal that cannot spare the room keeps the conversation full width
     /// rather than squeezing it behind the panel.
     #[test]
     fn a_narrow_terminal_refuses_to_open_the_side_panel() {
-        let smallest = (SIDE_PANEL_MIN_MAIN_WIDTH + SIDE_PANEL_GAP + SIDE_PANEL_WIDTHS[0]) as u16;
+        let smallest = (SIDE_PANEL_MIN_MAIN_WIDTH + SIDE_PANEL_GAP + SIDE_PANEL_MIN_WIDTH) as u16;
 
-        assert!(side_panel_layout(smallest - 1, SIDE_PANEL_WIDTHS[0]).is_none());
+        assert!(side_panel_layout(smallest - 1, SIDE_PANEL_MIN_WIDTH).is_none());
         assert_eq!(
-            side_panel_layout(smallest, SIDE_PANEL_WIDTHS[0]).map(|layout| layout.main_width),
+            side_panel_layout(smallest, SIDE_PANEL_MIN_WIDTH).map(|layout| layout.main_width),
             Some(SIDE_PANEL_MIN_MAIN_WIDTH)
         );
     }
@@ -14597,7 +14912,7 @@ mod tests {
     fn a_bounded_row_leaves_the_gap_clear_and_fills_the_side_panel() {
         theme::set_current(ThemeKind::Dark);
         let layout =
-            side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
+            side_panel_layout(100, SIDE_PANEL_MIN_WIDTH).expect("100 columns carry the panel");
         let mut frame = CellFrame::new(100, 3);
         let line = PaintLine {
             tone: Tone::UserPromptPadding,
@@ -14626,7 +14941,7 @@ mod tests {
     #[test]
     fn empty_side_panel_uses_each_theme_surface_across_all_cells() {
         let layout =
-            side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
+            side_panel_layout(100, SIDE_PANEL_MIN_WIDTH).expect("100 columns carry the panel");
 
         for theme_kind in ThemeKind::ALL {
             theme::set_current(theme_kind);
@@ -14658,7 +14973,7 @@ mod tests {
     #[test]
     fn the_side_panel_places_a_subdued_divider_above_context() {
         let layout =
-            side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
+            side_panel_layout(100, SIDE_PANEL_MIN_WIDTH).expect("100 columns carry the panel");
         let mut frame = CellFrame::new(100, 4);
         let footer = vec![
             side_panel_divider(layout.content_width()),
@@ -14708,7 +15023,7 @@ mod tests {
     #[test]
     fn a_single_row_repaint_redraws_that_row_of_the_side_panel() {
         let layout =
-            side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
+            side_panel_layout(100, SIDE_PANEL_MIN_WIDTH).expect("100 columns carry the panel");
         let mut row = CellFrame::new(100, 1);
 
         paint_line_into_frame(
@@ -15785,7 +16100,7 @@ mod tests {
     #[test]
     fn a_drag_inside_the_side_panel_copies_the_panel_not_the_transcript() {
         let layout =
-            side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
+            side_panel_layout(100, SIDE_PANEL_MIN_WIDTH).expect("100 columns carry the panel");
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
         renderer.previous_lines = vec![
             PaintLine::plain("transcript row"),
@@ -15822,7 +16137,7 @@ mod tests {
     #[test]
     fn a_panel_drag_past_the_last_row_still_lands_on_it() {
         let layout =
-            side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
+            side_panel_layout(100, SIDE_PANEL_MIN_WIDTH).expect("100 columns carry the panel");
         let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
         renderer.previous_lines = vec![PaintLine::plain("transcript row")];
         renderer.side_panel = Some(layout);
@@ -19380,7 +19695,6 @@ mod tests {
                 composer_notice: None,
                 composer_mode: None,
             },
-            true,
             80,
         );
         let composer_index = frame.composer_index.expect("composer index");
@@ -19433,7 +19747,6 @@ mod tests {
                     composer_notice: None,
                     composer_mode: None,
                 },
-                true,
                 80,
             );
             let index = frame
@@ -19516,7 +19829,6 @@ mod tests {
                 composer_notice: None,
                 composer_mode: None,
             },
-            true,
             80,
         );
         let composer_index = frame.composer_index.expect("composer index");
@@ -19632,7 +19944,8 @@ mod tests {
     }
 
     #[test]
-    fn side_panel_keeps_working_above_the_composer_without_mode_badges() {
+    /// 패널이 열려 있어도 컴포저는 자기 배지를 계속 그린다.
+    fn side_panel_keeps_the_composer_badges_while_working() {
         let editor = Editor::default();
         let frame = normal_frame_with_expansion(
             Vec::new(),
@@ -19657,14 +19970,16 @@ mod tests {
                 composer_notice: None,
                 composer_mode: Some(super_vibe_mode("Full Access", ModeAccent::Danger, false)),
             },
-            false,
             120,
         );
 
         assert!(frame.lines.iter().any(|line| painted(line).contains("Working")));
-        assert!(frame.lines.iter().all(|line| {
-            !painted(line).contains("Vibe:") && !painted(line).contains("Knowledge:")
-        }));
+        assert!(
+            frame
+                .lines
+                .iter()
+                .any(|line| painted(line).contains("Vibe:"))
+        );
     }
 
     /// What the row answers with at the first column of `label`.
@@ -20765,7 +21080,6 @@ mod tests {
             0.5,
             0.5,
             status,
-            true,
             width,
         );
         if !committed.is_empty() && renderer.response_collapse.is_none() {
@@ -22064,6 +22378,132 @@ mod tests {
         assert_eq!(renderer.scroll_back, 36);
     }
 
+    /// 패널 위쪽과 변경 섹션은 한 벌의 줄로 합쳐지지만 각자의 오프셋에서
+    /// 잘린다. 휠은 커서가 놓인 영역만 움직이고, 패널 바깥이면 전사로 간다.
+    #[test]
+    fn side_panel_areas_scroll_on_their_own() {
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.side_panel = side_panel_layout(100, 40);
+        let layout = renderer.side_panel.unwrap();
+        let panel_column = layout.panel_left as u16;
+
+        let compose = |renderer: &mut Renderer| {
+            renderer.compose_side_panel(
+                text_rows(20, "top"),
+                text_rows(3, "list"),
+                text_rows(20, "diff"),
+                20,
+            )
+        };
+
+        let composed = compose(&mut renderer);
+        // 20줄에서 위아래 여백 둘을 뺀 18줄을 절반으로 나눠 위쪽이 9줄, 남은
+        // 8줄에서 아래 한 줄을 비우고 목록 3줄과 패치 5줄이 들어간다.
+        assert_eq!(composed.len(), 17);
+        assert_eq!(composed[0].text, "top0");
+        assert_eq!(composed[9].text, "list0");
+        assert_eq!(composed[12].text, "diff0");
+
+        // 위쪽 영역의 첫 줄은 패널의 위 여백 바로 아래에 있다.
+        assert!(renderer.scroll_at(panel_column, 1, -3));
+        assert_eq!(renderer.side_panel_scroll, 3);
+        assert_eq!(renderer.side_panel_diff_scroll, 0);
+
+        // 바뀐 파일 목록 위에서는 아무것도 움직이지 않는다.
+        assert!(!renderer.scroll_at(panel_column, 11, -4));
+        assert_eq!(renderer.side_panel_scroll, 3);
+        assert_eq!(renderer.side_panel_diff_scroll, 0);
+
+        assert!(renderer.scroll_at(panel_column, 14, -4));
+        assert_eq!(renderer.side_panel_diff_scroll, 4);
+
+        let composed = compose(&mut renderer);
+        assert_eq!(composed[0].text, "top3");
+        assert_eq!(composed[9].text, "list0");
+        assert_eq!(composed[12].text, "diff4");
+
+        // 패널 왼쪽은 전사의 것이다.
+        renderer.wrapped = text_rows(30, "t");
+        assert!(renderer.scroll_at(0, 8, 5));
+        assert_eq!(renderer.scroll_back, 5);
+        assert_eq!(renderer.side_panel_scroll, 3);
+    }
+
+    /// 변경 섹션은 바뀐 파일을 먼저 세어 보여 주고, 고른 파일의 패치만 아래에
+    /// 펼친다. 목록의 각 줄은 그 파일을 고르는 클릭 대상이다.
+    #[test]
+    fn side_panel_changes_list_every_file_and_open_only_the_chosen_patch() {
+        let files = vec![
+            PanelFileDiff {
+                path: "README.md".to_owned(),
+                additions: 1,
+                deletions: 0,
+                block: Block::new(
+                    BlockKind::FileChange,
+                    "Update(README.md)",
+                    "Added 1 line, removed 0 lines\n@@ -1,1 +1,2 @@\n title\n+readme row",
+                ),
+            },
+            PanelFileDiff {
+                path: "src/lib/time.ts".to_owned(),
+                additions: 11,
+                deletions: 4,
+                block: Block::new(
+                    BlockKind::FileChange,
+                    "Update(src/lib/time.ts)",
+                    "Added 11 lines, removed 4 lines\n@@ -1,1 +1,2 @@\n keep\n+time row",
+                ),
+            },
+        ];
+
+        let (lines, patch) = side_panel_diff_lines(&files, Some("src/lib/time.ts"), true, 44);
+
+        // 합계는 제목 옆에 붙고, 파일별 증감만 오른쪽 끝으로 간다.
+        assert_eq!(painted(&lines[0]), "▲ 2 files changed  +12 -4");
+        assert_eq!(
+            lines[0].pick.as_ref().and_then(|picks| picks.at(0)),
+            Some(Pick::DiffSection)
+        );
+        assert!(lines[1] == PaintLine::blank());
+        assert!(painted(&lines[2]).starts_with("README.md"));
+        assert!(painted(&lines[2]).ends_with("+1"));
+        assert_eq!(
+            lines[2].pick.as_ref().and_then(|picks| picks.at(0)),
+            Some(Pick::DiffFile("README.md".to_owned()))
+        );
+        assert!(painted(&lines[3]).ends_with("+11 -4"));
+        // 목록과 패치 사이에는 구분선이 하나 선다.
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.tone == Tone::SidePanelDivider)
+        );
+        // 패치는 제자리에 남는 목록과 따로 떨어져 나온다.
+        assert!(patch.iter().any(|line| painted(line).contains("time row")));
+        assert!(!patch.iter().any(|line| painted(line).contains("readme row")));
+        // 파일 이름과 줄 수 요약은 목록이 이미 말하므로 패치 위에 되풀이하지 않는다.
+        assert!(!patch.iter().any(|line| painted(line).contains("Update(")));
+        assert!(!patch.iter().any(|line| painted(line).contains("Added 11")));
+
+        // 접으면 제목 한 줄만 남고 패치까지 사라진다.
+        let (collapsed, patch) = side_panel_diff_lines(&files, Some("src/lib/time.ts"), false, 44);
+        assert_eq!(collapsed.len(), 1);
+        assert!(patch.is_empty());
+        assert_eq!(painted(&collapsed[0]), "▼ 2 files changed  +12 -4");
+    }
+
+    /// 변경 섹션이 비어 있으면 위쪽이 패널을 다 쓴다.
+    #[test]
+    fn side_panel_without_changes_gives_its_whole_height_to_the_top() {
+        let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
+        renderer.side_panel = side_panel_layout(100, 40);
+
+        let composed =
+            renderer.compose_side_panel(text_rows(20, "top"), Vec::new(), Vec::new(), 12);
+        assert_eq!(composed.len(), 10);
+        assert_eq!(composed[9].text, "top9");
+    }
+
     #[test]
     fn split_wheel_scrolls_main_and_btw_independently() {
         let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
@@ -22073,11 +22513,11 @@ mod tests {
         renderer.split_main_max_scroll = 30;
         renderer.split_btw_max_scroll = 40;
 
-        assert!(renderer.scroll_at(2, 6));
+        assert!(renderer.scroll_at(0, 2, 6));
         assert_eq!(renderer.split_main_scroll_back, 6);
         assert_eq!(renderer.split_btw_scroll_back, 0);
 
-        assert!(renderer.scroll_at(14, 9));
+        assert!(renderer.scroll_at(0, 14, 9));
         assert_eq!(renderer.split_main_scroll_back, 6);
         assert_eq!(renderer.split_btw_scroll_back, 9);
 
@@ -23471,7 +23911,9 @@ mod tests {
     }
 
     #[test]
-    fn opening_the_side_panel_moves_modes_above_context() {
+    /// 패널이 열리면 자리를 많이 쓰는 사용량만 아래로 내려가고, 브랜치와 모드
+    /// 배지는 컴포저가 그대로 들고 있는다.
+    fn opening_the_side_panel_moves_only_the_context_reading() {
         let mut status = Some(StatusLineView {
             agent: AgentMode::Standard,
             shell_mode: false,
@@ -23485,10 +23927,7 @@ mod tests {
             notice: None,
             update_notice: None,
         });
-        let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, false);
-        mode.branch = Some("feature/panel".to_owned());
-
-        let footer = move_context_to_side_panel(&mut status, Some(&mode), 44);
+        let footer = move_context_to_side_panel(&mut status, 44);
         let line = status_line_row(status, "", 120);
 
         assert!(painted(&line).contains("GPT-5.6 Codex"));
@@ -23497,15 +23936,13 @@ mod tests {
         assert!(painted(&line).contains("3h 6m: 14%"));
         assert!(painted(&line).contains("week: 27%"));
         assert!(painted(&line).ends_with("Shift + ↑↓ model · ←→ effort"));
-        assert_eq!(footer.len(), 3);
-        assert_eq!(painted(&footer[0]), "* feature/panel | Vibe: Super Vibe");
-        assert_eq!(pick_on(&footer[0], "Vibe: Super Vibe"), Some(Pick::VibeMode));
-        assert!(!painted(&footer[0]).contains("Knowledge:"));
-        assert_eq!(painted(&footer[1]), "─".repeat(44));
-        assert_eq!(footer[1].tone, Tone::SidePanelDivider);
-        assert!(painted(&footer[2]).starts_with("Context: "));
-        assert!(painted(&footer[2]).ends_with("164/258K (63%)"));
-        assert_eq!(footer[2].tail[0].tone, Tone::Model56);
+        assert_eq!(footer.len(), 2);
+        assert!(!painted(&footer[0]).contains("Vibe:"));
+        assert_eq!(painted(&footer[0]), "─".repeat(44));
+        assert_eq!(footer[0].tone, Tone::SidePanelDivider);
+        assert!(painted(&footer[1]).starts_with("Context: "));
+        assert!(painted(&footer[1]).ends_with("164/258K (63%)"));
+        assert_eq!(footer[1].tail[0].tone, Tone::Model56);
     }
 
     #[test]
@@ -23527,7 +23964,7 @@ mod tests {
     #[test]
     fn side_panel_footer_modes_keep_their_click_targets() {
         let layout =
-            side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
+            side_panel_layout(100, SIDE_PANEL_MIN_WIDTH).expect("100 columns carry the panel");
         let mut mode = super_vibe_mode("Full Access", ModeAccent::Danger, false);
         mode.branch = Some("feature/panel".to_owned());
         let footer = side_panel_mode_lines(&mode, layout.content_width());
@@ -26774,7 +27211,7 @@ mod tests {
             elapsed: None,
         };
         let layout =
-            side_panel_layout(140, SIDE_PANEL_WIDTHS[0]).expect("140 columns carry the panel");
+            side_panel_layout(140, SIDE_PANEL_MIN_WIDTH).expect("140 columns carry the panel");
         let content = side_panel_plan_lines(&summary, layout.content_width(), 0.0, false);
 
         // The total rides on the heading only once every step is done, the same
@@ -26784,16 +27221,15 @@ mod tests {
             content[0].pick.as_ref().and_then(|picks| picks.at(0)),
             Some(Pick::PlanSummary)
         );
-        assert!(content[1].text.is_empty());
-        assert_eq!(content[2].prefix, "✔ ");
-        assert_eq!(content[3].prefix, "▸ ");
-        assert_eq!(content[4].prefix, "  ");
-        assert!(painted(&content[2]).starts_with("✔ 1. 첫 단계"));
-        assert!(painted(&content[2]).ends_with("(18s)"));
-        assert!(painted(&content[3]).starts_with("▸ 2. 두 번째 단계"));
-        assert!(content[5] == PaintLine::blank());
-        assert_eq!(painted(&content[6]), "─".repeat(layout.content_width()));
-        assert_eq!(content[6].tone, Tone::SidePanelDivider);
+        // 섹션 안쪽에는 빈 줄을 두지 않는다. 제목 다음이 곧 첫 단계다.
+        assert_eq!(content[1].prefix, "✔ ");
+        assert_eq!(content[2].prefix, "▸ ");
+        assert_eq!(content[3].prefix, "  ");
+        assert!(painted(&content[1]).starts_with("✔ 1. 첫 단계"));
+        assert!(painted(&content[1]).ends_with("(18s)"));
+        assert!(painted(&content[2]).starts_with("▸ 2. 두 번째 단계"));
+        assert_eq!(painted(&content[4]), "─".repeat(layout.content_width()));
+        assert_eq!(content[4].tone, Tone::SidePanelDivider);
         assert!(
             content
                 .iter()
@@ -26814,7 +27250,7 @@ mod tests {
             .collect();
         assert_eq!(heading, UPDATED_PLAN_TITLE);
         let right = layout.panel_left + layout.panel_width - 1;
-        for row in [1, 7] {
+        for row in [1, 5] {
             assert_eq!(frame.cell(layout.panel_left, row).glyph, " ");
             assert_eq!(frame.cell(right, row).glyph, " ");
             assert_eq!(
@@ -26827,7 +27263,7 @@ mod tests {
             );
         }
         assert_eq!(
-            frame.cell(layout.content_left(), 7).style.foreground,
+            frame.cell(layout.content_left(), 5).style.foreground,
             tone_rgb(Tone::SidePanelDivider)
         );
 
@@ -26845,9 +27281,9 @@ mod tests {
         };
         let waiting = side_panel_plan_lines(&finished, layout.content_width(), 0.0, true);
         assert_eq!(painted(&waiting[0]), "▲ Updated Plan  2 / 3 Working");
-        assert_ne!(waiting[4].prefix, "✔ ");
-        assert_eq!(waiting[4].prefix_tone, Tone::Accent);
-        assert_eq!(waiting[4].tone, Tone::Accent);
+        assert_ne!(waiting[3].prefix, "✔ ");
+        assert_eq!(waiting[3].prefix_tone, Tone::Accent);
+        assert_eq!(waiting[3].tone, Tone::Accent);
         assert!(waiting.iter().all(|line| !painted(line).contains('⏱')));
 
         let waiting_card = fixed_plan_summary_lines(&finished, 80, 0.0, true, None, AgentMode::Standard);
@@ -26859,7 +27295,7 @@ mod tests {
 
         let done = side_panel_plan_lines(&finished, layout.content_width(), 0.0, false);
         assert_eq!(painted(&done[0]), "▲ Updated Plan  3 / 3  [1m 25s]");
-        assert_eq!(done[4].prefix, "✔ ");
+        assert_eq!(done[3].prefix, "✔ ");
     }
 
     #[test]
@@ -26882,7 +27318,7 @@ mod tests {
         let mut history = prompts;
         history.push(Block::new(BlockKind::Assistant, "Codex", "latest response"));
         let layout =
-            side_panel_layout(140, SIDE_PANEL_WIDTHS[0]).expect("140 columns carry the panel");
+            side_panel_layout(140, SIDE_PANEL_MIN_WIDTH).expect("140 columns carry the panel");
 
         let lines = side_panel_prompt_lines(&history, layout.content_width(), true);
 
@@ -26891,17 +27327,15 @@ mod tests {
             lines[0].pick.as_ref().and_then(|picks| picks.at(0)),
             Some(Pick::PromptSection)
         );
-        assert!(lines[1].text.is_empty());
-        assert_eq!(lines.len(), 2 + SIDE_PANEL_PROMPT_LIMIT + 2);
+        assert_eq!(lines.len(), 1 + SIDE_PANEL_PROMPT_LIMIT + 1);
         for (offset, prompt_id) in expected.into_iter().enumerate() {
-            let line = &lines[offset + 2];
+            let line = &lines[offset + 1];
             assert_eq!(
                 line.pick.as_ref().and_then(|picks| picks.at(0)),
                 Some(Pick::Prompt(prompt_id))
             );
             assert!(painted(line).contains(&format!("prompt {} continued", 7 - offset)));
         }
-        assert!(lines[lines.len() - 2] == PaintLine::blank());
         assert_eq!(
             painted(lines.last().expect("prompt divider")),
             "─".repeat(layout.content_width())
@@ -26915,7 +27349,7 @@ mod tests {
         renderer.side_panel = Some(layout);
         renderer.side_panel_content = lines;
         assert_eq!(
-            renderer.pick_at(layout.content_left() as u16, 3),
+            renderer.pick_at(layout.content_left() as u16, 2),
             Some(Pick::Prompt(history[6].id()))
         );
     }
@@ -26941,22 +27375,21 @@ mod tests {
             false,
         );
 
-        assert_eq!(plan.len(), 3);
+        // 접은 섹션은 제목과 구분선 둘뿐이고 그 사이를 비우지 않는다.
+        assert_eq!(plan.len(), 2);
         assert_eq!(painted(&plan[0]), "▼ Updated Plan  0 / 1");
         assert_eq!(
             plan[0].pick.as_ref().and_then(|picks| picks.at(0)),
             Some(Pick::PlanSummary)
         );
-        assert!(plan[1] == PaintLine::blank());
-        assert_eq!(plan[2].tone, Tone::SidePanelDivider);
-        assert_eq!(prompts.len(), 3);
+        assert_eq!(plan[1].tone, Tone::SidePanelDivider);
+        assert_eq!(prompts.len(), 2);
         assert_eq!(painted(&prompts[0]), "▼ Input Prompt");
         assert_eq!(
             prompts[0].pick.as_ref().and_then(|picks| picks.at(0)),
             Some(Pick::PromptSection)
         );
-        assert!(prompts[1] == PaintLine::blank());
-        assert_eq!(prompts[2].tone, Tone::SidePanelDivider);
+        assert_eq!(prompts[1].tone, Tone::SidePanelDivider);
     }
 
     #[test]
@@ -26977,7 +27410,7 @@ mod tests {
 
         theme::set_current(ThemeKind::Dark);
         let layout =
-            side_panel_layout(100, SIDE_PANEL_WIDTHS[0]).expect("100 columns carry the panel");
+            side_panel_layout(100, SIDE_PANEL_MIN_WIDTH).expect("100 columns carry the panel");
         let heading = side_panel_section_heading("Input Prompt", true, 44, Pick::PromptSection);
         let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
         renderer.side_panel = Some(layout);
@@ -27024,20 +27457,19 @@ mod tests {
 
         let lines = side_panel_prompt_lines(&[prompt], content_width, true);
 
-        assert_eq!(lines.len(), 5);
-        assert_eq!(lines[2].prefix, "› ");
-        assert!(painted(&lines[2]).ends_with('…'));
-        assert_eq!(lines[2].prefix_tone, Tone::ModelSol);
-        assert_eq!(lines[2].tone, Tone::Plain);
-        assert_eq!(row_background(lines[2].tone), None);
-        assert_eq!(bubble_background(&lines[2]), None);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1].prefix, "› ");
+        assert!(painted(&lines[1]).ends_with('…'));
+        assert_eq!(lines[1].prefix_tone, Tone::ModelSol);
+        assert_eq!(lines[1].tone, Tone::Plain);
+        assert_eq!(row_background(lines[1].tone), None);
+        assert_eq!(bubble_background(&lines[1]), None);
         assert_eq!(
-            lines[2].pick.as_ref().and_then(|picks| picks.at(0)),
+            lines[1].pick.as_ref().and_then(|picks| picks.at(0)),
             Some(Pick::Prompt(prompt_id))
         );
-        assert!(painted_line_width(&lines[2]) <= content_width);
-        assert!(lines[3] == PaintLine::blank());
-        assert_eq!(lines[4].tone, Tone::SidePanelDivider);
+        assert!(painted_line_width(&lines[1]) <= content_width);
+        assert_eq!(lines[2].tone, Tone::SidePanelDivider);
     }
 
     #[test]
@@ -27162,15 +27594,14 @@ mod tests {
             elapsed: None,
         };
         let layout =
-            side_panel_layout(140, SIDE_PANEL_WIDTHS[0]).expect("140 columns carry the panel");
+            side_panel_layout(140, SIDE_PANEL_MIN_WIDTH).expect("140 columns carry the panel");
         let content = side_panel_plan_lines(&summary, layout.content_width(), 0.0, false);
 
-        let rows = &content[2..content.len() - 2];
+        let rows = &content[1..content.len() - 1];
         assert_eq!(rows.len(), 1, "one step keeps one row before the divider");
         assert!(painted(&rows[0]).ends_with('…'));
         assert!(painted_line_width(&rows[0]) <= layout.content_width());
         assert_eq!(rows[0].prefix, "  ");
-        assert!(content[content.len() - 2] == PaintLine::blank());
         assert_eq!(
             painted(content.last().unwrap()),
             "─".repeat(layout.content_width())

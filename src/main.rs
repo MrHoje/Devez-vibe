@@ -8,6 +8,7 @@ mod completion;
 mod doctor;
 mod devezcode;
 mod editor;
+mod git_diff;
 mod input_hub;
 mod input_log;
 mod integrations;
@@ -979,6 +980,9 @@ async fn choose_startup_session(
                 diff_display_mode: DiffDisplayMode::Collapse,
                 side_panel_width: None,
                 side_panel_prompts_expanded: true,
+                side_panel_diff: &[],
+                side_panel_diff_selected: None,
+                side_panel_diff_expanded: true,
                 side_panel_integrations: Vec::new(),
             },
         )?;
@@ -2277,7 +2281,9 @@ fn renderer_mouse_action(
         MouseRequest::ContextClick(column, row) => {
             context_click_action(renderer.pick_at(column, row), &mut std::io::stdout())
         }
-        MouseRequest::Scroll(delta, _, row) => Action::Tick(renderer.scroll_at(row, delta)),
+        MouseRequest::Scroll(delta, column, row) => {
+            Action::Tick(renderer.scroll_at(column, row, delta))
+        }
         MouseRequest::SelectionStart(column, row) => {
             Action::Tick(renderer.begin_selection(column, row))
         }
@@ -2371,6 +2377,16 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
         }
         Pick::PluginSection(provider) => {
             state.toggle_side_panel_plugins(&provider);
+            Action::Tick(true)
+        }
+        Pick::SidePanelNarrower => state.adjust_side_panel_width(-1, terminal_size().0),
+        Pick::SidePanelWider => state.adjust_side_panel_width(1, terminal_size().0),
+        Pick::DiffSection => {
+            state.toggle_side_panel_diff();
+            Action::Tick(true)
+        }
+        Pick::DiffFile(path) => {
+            state.select_side_panel_diff(path);
             Action::Tick(true)
         }
         Pick::RemoveQueuedPrompt(index) => {
@@ -2907,17 +2923,17 @@ async fn execute_action(
             }
             state.persist_session_modes();
         }
-        Action::PersistSidePanelDefault(stage) => {
+        Action::PersistSidePanelWidth(width) => {
             if let Err(error) = server
                 .request(
                     "config/value/write",
-                    config_value_write_params("side_panel_stage", stage.config_value()),
+                    config_value_write_params("side_panel_width", &width.to_string()),
                 )
                 .await
             {
                 state.push_notice(
                     BlockKind::Warning,
-                    "사이드패널 기본값 저장 실패",
+                    "사이드패널 폭 저장 실패",
                     error.to_string(),
                 );
             }
@@ -7450,10 +7466,10 @@ mod tests {
         assert!(state.editor.history_position().is_some());
     }
 
-    /// Alt+P steps the panel through its widths and wraps closed on the
-    /// fourth press, without ever leaving a stray letter in the composer.
+    /// Alt+P opens the docked panel and shuts it again, without ever leaving a
+    /// stray letter in the composer.
     #[test]
-    fn alt_p_cycles_the_side_panel_through_its_widths_without_editing_the_composer() {
+    fn alt_p_opens_and_shuts_the_side_panel_without_editing_the_composer() {
         let mut state = AppState::new(
             String::new(),
             ".".to_owned(),
@@ -7463,9 +7479,6 @@ mod tests {
             Some("high"),
         );
         let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
-        while state.side_panel_stage() != state::SidePanelStage::Closed {
-            state.cycle_side_panel();
-        }
         // Goes through the paste burst buffer, which is what swallows a bare
         // printable key before the shortcut branches ever run.
         let mut paste = ComposerPasteBuffer::new();
@@ -7482,25 +7495,18 @@ mod tests {
             };
 
         press_alt_p(&mut state, &mut renderer, &mut paste);
-        assert_eq!(state.side_panel_stage(), state::SidePanelStage::Small);
+        assert!(state.side_panel_open());
         assert!(state.editor.text().is_empty());
 
         press_alt_p(&mut state, &mut renderer, &mut paste);
-        assert_eq!(state.side_panel_stage(), state::SidePanelStage::Medium);
-
-        press_alt_p(&mut state, &mut renderer, &mut paste);
-        assert_eq!(state.side_panel_stage(), state::SidePanelStage::Large);
-
-        press_alt_p(&mut state, &mut renderer, &mut paste);
-        assert_eq!(state.side_panel_stage(), state::SidePanelStage::Closed);
         assert!(!state.side_panel_open());
         assert!(state.editor.text().is_empty());
     }
 
-    /// The slash command opens a size picker, then asks whether the selection
-    /// belongs to this session or becomes the default.
+    /// The slash command is the same toggle as Alt+P: the width now belongs to
+    /// the panel's own [+]/[-] buttons.
     #[test]
-    fn the_side_panel_slash_command_picks_a_size_and_scope() {
+    fn the_side_panel_slash_command_toggles_the_panel() {
         let mut state = AppState::new(
             String::new(),
             ".".to_owned(),
@@ -7509,28 +7515,54 @@ mod tests {
             "gpt-5.6-sol",
             Some("high"),
         );
-        while state.side_panel_stage() != state::SidePanelStage::Closed {
-            state.cycle_side_panel();
-        }
 
         state.run_slash_command("/side-panel");
-        let picker = state.view().overlay.expect("side-panel picker");
-        assert_eq!(picker.title, "Side panel");
-        assert_eq!(
-            picker.slider.expect("size choices").efforts,
-            ["Off", "Small", "Medium", "Large"]
-        );
-
-        state.handle_key(press(KeyCode::Right, KeyModifiers::NONE));
-        state.handle_key(press(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(
-            state.view().overlay.map(|overlay| overlay.title),
-            Some("Apply to".to_owned())
-        );
-
-        state.handle_key(press(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(state.side_panel_stage(), state::SidePanelStage::Small);
+        assert!(state.side_panel_open());
         assert!(state.view().overlay.is_none());
+
+        state.run_slash_command("/side-panel");
+        assert!(!state.side_panel_open());
+    }
+
+    /// The header buttons step the width by 12 columns, never below the opening
+    /// width and never so wide that the conversation drops under it.
+    #[test]
+    fn the_panel_width_buttons_step_by_twelve_within_the_conversation_floor() {
+        let mut state = AppState::new(
+            String::new(),
+            ".".to_owned(),
+            "tester".to_owned(),
+            vec![model("gpt-5.6-sol", "high", true, &["low", "high"])],
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+        state.toggle_side_panel();
+        assert_eq!(state.side_panel_width(), 48);
+
+        // 48 already sits at the floor, so narrowing writes nothing.
+        assert!(matches!(
+            state.adjust_side_panel_width(-1, 200),
+            Action::None
+        ));
+
+        assert!(matches!(
+            state.adjust_side_panel_width(1, 200),
+            Action::PersistSidePanelWidth(60)
+        ));
+        assert_eq!(state.side_panel_width(), 60);
+
+        // 120 columns leave room for 60 beside a 48-column conversation, but not
+        // for 72, so the next click is refused rather than squeezing the chat.
+        assert!(matches!(
+            state.adjust_side_panel_width(1, 120),
+            Action::None
+        ));
+        assert_eq!(state.side_panel_width(), 60);
+
+        assert!(matches!(
+            state.adjust_side_panel_width(-1, 120),
+            Action::PersistSidePanelWidth(48)
+        ));
     }
 
     #[test]

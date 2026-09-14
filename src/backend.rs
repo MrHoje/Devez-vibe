@@ -2202,7 +2202,7 @@ fn is_vibe_setting_key(key: &str) -> bool {
             | "response_display_mode"
             | "shell_display_mode"
             | "diff_display_mode"
-            | "side_panel_stage"
+            | "side_panel_width"
             | "status_line_model"
             | "status_line_effort"
             | "status_line_context"
@@ -3035,7 +3035,7 @@ mod tests {
         assert!(is_vibe_setting_key("response_display_mode"));
         assert!(is_vibe_setting_key("shell_display_mode"));
         assert!(is_vibe_setting_key("diff_display_mode"));
-        assert!(is_vibe_setting_key("side_panel_stage"));
+        assert!(is_vibe_setting_key("side_panel_width"));
         assert!(is_vibe_setting_key("status_line_context"));
         assert!(!is_vibe_setting_key("model"));
         assert!(!is_vibe_setting_key("plugins.example"));

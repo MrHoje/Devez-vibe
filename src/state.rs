@@ -31,8 +31,9 @@ use crate::{
     renderer::{
         AnimationView, ArtifactView, AssistantPhase, Block, BlockKind, ComposerMode, EffortSlider,
         HIDDEN_STATUS_LINE, IntegrationItemState, IntegrationItemView, LiveBlockView, ModeAccent,
-        OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS, PlanStep, PlanStepStatus, PlanSummary,
-        ProviderHandoffBlock, ProviderIntegrationView, SIDE_PANEL_WIDTHS, StatusLineView,
+        OverlayLine, OverlayStyle, OverlayView, PICKER_ROWS, PanelFileDiff, PlanStep, PlanStepStatus,
+        PlanSummary,
+        ProviderHandoffBlock, ProviderIntegrationView, StatusLineView,
         SteeredPromptView, SubagentView, SuggestionView, VibeTone, View, WelcomeView,
         format_clock_time, format_elapsed, visible_window,
     },
@@ -55,6 +56,9 @@ const RESPONSE_COLLAPSE_DURATION: Duration = Duration::from_millis(120);
 
 /// One-off notices (copy, reroute, …) sit in the status line this long.
 const NOTICE_TTL: Duration = Duration::from_millis(1_400);
+/// 편집이 이어지는 동안 패널의 변경 섹션이 git에 묻는 간격. 프레임마다 git을
+/// 띄우지 않으면서도 한 편집이 끝나기 전에 화면이 따라온다.
+const SIDE_PANEL_DIFF_INTERVAL: Duration = Duration::from_millis(1_500);
 /// A second Ctrl+C only quits while its warning is still on screen, so the
 /// armed state and the notice share one window.
 const QUIT_ARM_WINDOW: Duration = Duration::from_secs(3);
@@ -137,79 +141,6 @@ pub enum DiffDisplayMode {
     Hide,
     Collapse,
     Expand,
-}
-
-/// Alt+P steps the docked side panel through three widths before it closes
-/// again, rather than a plain on/off toggle — one press to open at the
-/// narrowest width, repeat presses to widen, one more to close.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SidePanelStage {
-    #[default]
-    Closed,
-    Small,
-    Medium,
-    Large,
-}
-
-impl SidePanelStage {
-    const CHOICES: [Self; 4] = [Self::Closed, Self::Small, Self::Medium, Self::Large];
-
-    fn width(self) -> Option<usize> {
-        match self {
-            Self::Closed => None,
-            Self::Small => Some(SIDE_PANEL_WIDTHS[0]),
-            Self::Medium => Some(SIDE_PANEL_WIDTHS[1]),
-            Self::Large => Some(SIDE_PANEL_WIDTHS[2]),
-        }
-    }
-
-    fn next(self) -> Self {
-        match self {
-            Self::Closed => Self::Small,
-            Self::Small => Self::Medium,
-            Self::Medium => Self::Large,
-            Self::Large => Self::Closed,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Closed => "Off",
-            Self::Small => "Small",
-            Self::Medium => "Medium",
-            Self::Large => "Large",
-        }
-    }
-
-    fn index(self) -> usize {
-        Self::CHOICES
-            .iter()
-            .position(|stage| *stage == self)
-            .unwrap_or_default()
-    }
-
-    fn from_config_value(value: &str) -> Self {
-        match value
-            .trim()
-            .trim_matches(['"', '\''])
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "small" => Self::Small,
-            "medium" => Self::Medium,
-            "large" => Self::Large,
-            _ => Self::Closed,
-        }
-    }
-
-    pub const fn config_value(self) -> &'static str {
-        match self {
-            Self::Closed => "closed",
-            Self::Small => "small",
-            Self::Medium => "medium",
-            Self::Large => "large",
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -504,7 +435,7 @@ impl SlashCommand {
     }
 }
 
-const SLASH_COMMANDS: [SlashCommand; 35] = [
+const SLASH_COMMANDS: [SlashCommand; 34] = [
     SlashCommand {
         name: "/provider",
         description: "Switch between the Claude and Codex providers, or connect OpenCode",
@@ -606,11 +537,6 @@ const SLASH_COMMANDS: [SlashCommand; 35] = [
         takes_argument: true,
     },
     SlashCommand {
-        name: "/side",
-        description: "Alias for /btw",
-        takes_argument: true,
-    },
-    SlashCommand {
         name: "/compact",
         description: "Compact the current conversation",
         takes_argument: false,
@@ -657,7 +583,7 @@ const SLASH_COMMANDS: [SlashCommand; 35] = [
     },
     SlashCommand {
         name: "/side-panel",
-        description: "Choose the docked side panel size",
+        description: "Open or shut the docked side panel",
         takes_argument: false,
     },
     SlashCommand {
@@ -1298,8 +1224,8 @@ pub enum Action {
         model: String,
         effort: String,
     },
-    /// Save the picked side-panel size as the fallback for new sessions.
-    PersistSidePanelDefault(SidePanelStage),
+    /// Save the panel width the [+]/[-] buttons settled on, for every session.
+    PersistSidePanelWidth(usize),
     /// Save whether completed progress responses stay visible or fold away.
     PersistResponseDisplayMode(ResponseDisplayMode),
     PersistAutoKnowledge(bool),
@@ -1659,13 +1585,6 @@ enum PendingInteraction {
     },
     EffortPicker {
         effort_index: usize,
-    },
-    SidePanelPicker {
-        stage_index: usize,
-    },
-    SidePanelScope {
-        stage: SidePanelStage,
-        selected: usize,
     },
     /// `/provider`: which runtime the next prompt goes to, and which runtimes
     /// dvz may dial at all. A machine that cannot reach the Codex app-server
@@ -3127,8 +3046,6 @@ fn closable_overlay(pending: &PendingInteraction) -> bool {
         PendingInteraction::ModelPicker { .. }
             | PendingInteraction::ModelScope { .. }
             | PendingInteraction::EffortPicker { .. }
-            | PendingInteraction::SidePanelPicker { .. }
-            | PendingInteraction::SidePanelScope { .. }
             | PendingInteraction::RuntimePicker { .. }
             | PendingInteraction::AgentPicker { .. }
             | PendingInteraction::SettingPicker { .. }
@@ -3750,8 +3667,20 @@ pub struct AppState {
     diff_display_mode: DiffDisplayMode,
     /// The docked right-hand side panel's width stage. Persisted across
     /// sessions so a panel left open reopens the same way next time.
-    side_panel_stage: SidePanelStage,
+    side_panel_open: bool,
+    side_panel_width: usize,
     side_panel_prompts_expanded: bool,
+    /// 패널의 변경 섹션이 그리는 미커밋 diff. 파일 변경 블록과 같은 모양으로
+    /// 만들어 두고 전사의 렌더를 그대로 쓴다.
+    side_panel_diff: Vec<PanelFileDiff>,
+    /// 변경 목록에서 펼쳐 둔 파일. 목록에서 사라지면 첫 파일로 돌아간다.
+    side_panel_diff_path: Option<String>,
+    side_panel_diff_expanded: bool,
+    /// 마지막으로 git에 물어본 시각. 패널이 닫히면 비워, 다시 열릴 때 한 번
+    /// 즉시 읽는다.
+    side_panel_diff_at: Option<Instant>,
+    /// 직전에 본 `busy`. 턴이 끝나는 순간을 잡아 마지막 편집까지 반영한다.
+    side_panel_diff_busy: bool,
     status_line_settings: StatusLineSettings,
     /// Which runtimes this machine may connect to. Both start off — a fresh
     /// install picks in `/provider` — and nothing dials a runtime that is off.
@@ -3994,11 +3923,17 @@ impl AppState {
             response_display_mode,
             shell_display_mode,
             diff_display_mode,
-            // The stage belongs to a session, and no session is bound yet. Starting
-            // closed is what keeps a brand new session from flashing a panel open
-            // before its own (empty) stage is restored.
-            side_panel_stage: SidePanelStage::Closed,
+            // Whether the panel is open belongs to a session, and no session is
+            // bound yet. Starting closed is what keeps a brand new session from
+            // flashing a panel open before its own state is restored.
+            side_panel_open: false,
+            side_panel_width: read_default_side_panel_width(),
             side_panel_prompts_expanded: true,
+            side_panel_diff: Vec::new(),
+            side_panel_diff_path: None,
+            side_panel_diff_expanded: true,
+            side_panel_diff_at: None,
+            side_panel_diff_busy: false,
             status_line_settings: read_status_line_settings(),
             claude_provider_enabled: claude_provider_enabled(),
             codex_provider_enabled: codex_provider_enabled(),
@@ -6791,8 +6726,11 @@ impl AppState {
             chat_layout: self.conversation_view.is_chat(),
             shell_display_mode: self.shell_display_mode(),
             diff_display_mode: self.diff_display_mode(),
-            side_panel_width: self.side_panel_stage.width(),
+            side_panel_width: self.side_panel_open.then_some(self.side_panel_width),
             side_panel_prompts_expanded: self.side_panel_prompts_expanded,
+            side_panel_diff: &self.side_panel_diff,
+            side_panel_diff_selected: self.side_panel_diff_path.as_deref(),
+            side_panel_diff_expanded: self.side_panel_diff_expanded,
             side_panel_integrations: self.side_panel_integration_views(),
         }
     }
@@ -6923,6 +6861,9 @@ impl AppState {
             }
         }
         if self.sweep_settled_subagents() {
+            full_redraw = true;
+        }
+        if self.refresh_side_panel_diff() {
             full_redraw = true;
         }
         let plan_shimmer_active = self.plan_shimmer_phase().is_some();
@@ -7717,12 +7658,12 @@ impl AppState {
                 self.toggle_plan_summary();
                 Action::Tick(true)
             }
-            // Alt+P steps the docked side panel through its widths and closes
-            // it again on the fourth press. A bare capital would be swallowed
-            // by the composer's typed-text buffer, so the chord carries Alt to
-            // reach this branch at all.
+            // Alt+P opens the docked side panel and shuts it again; its width
+            // belongs to the [+]/[-] buttons in the panel's own masthead. A bare
+            // capital would be swallowed by the composer's typed-text buffer, so
+            // the chord carries Alt to reach this branch at all.
             KeyCode::Char('p') | KeyCode::Char('P') if alt && !ctrl => {
-                self.cycle_side_panel();
+                self.toggle_side_panel();
                 Action::None
             }
             // The terminal still reports a space for Shift+Space, so the composer
@@ -9659,7 +9600,7 @@ impl AppState {
                 self.committed.push(Block::new(
                     BlockKind::System,
                     "Commands",
-                    format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex] MODEL  Select a provider and model\nFor OpenCode, switch with /provider opencode, then select a model with /model\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}/auto-knowledge [on|off]  지식 자동 기록 켜기·끄기\n{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|researcher|goal-runner]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 크기와 적용 범위 선택\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+Z / Ctrl+Y  입력 실행 취소·다시 실행\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 크기 전환(닫힘→24→36→48)\nShift+Tab  Claude 권한 모드 전환"),
+                    format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex] MODEL  Select a provider and model\nFor OpenCode, switch with /provider opencode, then select a model with /model\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}/auto-knowledge [on|off]  지식 자동 기록 켜기·끄기\n{effort_help}/Response [All|Completed]  응답 압축 방식\n{permissions_help}/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/theme [minimal|soft|dark]  화면 테마\n/agent [builder|planner|researcher|goal-runner]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 열기·닫기\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+Z / Ctrl+Y  입력 실행 취소·다시 실행\nCtrl+S  입력 초안 보관·되돌리기\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 열기·닫기(폭은 패널 머리글의 [+][-])\nShift+Tab  Claude 권한 모드 전환"),
                 ));
                 Action::None
             }
@@ -10063,7 +10004,7 @@ impl AppState {
             "/continue" => Action::OpenResume,
             // `/btw` is for asking something *while* the main turn runs, so it
             // never waits for the turn to finish.
-            "/btw" | "/side" => Action::StartSide((parts.len() > 1).then(|| parts[1..].join(" "))),
+            "/btw" => Action::StartSide((parts.len() > 1).then(|| parts[1..].join(" "))),
             "/compact" if self.compacting() => {
                 self.committed.push(Block::new(
                     BlockKind::Warning,
@@ -10114,9 +10055,7 @@ impl AppState {
                 Action::None
             }
             "/side-panel" if parts.len() == 1 => {
-                self.pending = Some(PendingInteraction::SidePanelPicker {
-                    stage_index: self.side_panel_stage.index(),
-                });
+                self.toggle_side_panel();
                 Action::None
             }
             "/side-panel" => {
@@ -10517,61 +10456,6 @@ impl AppState {
                     _ => {}
                 }
                 self.pending = Some(PendingInteraction::EffortPicker { effort_index });
-                Action::None
-            }
-            PendingInteraction::SidePanelPicker { mut stage_index } => {
-                match key.code {
-                    KeyCode::Esc => return Action::None,
-                    KeyCode::Left | KeyCode::Up => {
-                        stage_index = stage_index.saturating_sub(1);
-                    }
-                    KeyCode::Char('p') if ctrl => {
-                        stage_index = stage_index.saturating_sub(1);
-                    }
-                    KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
-                        stage_index = (stage_index + 1).min(SidePanelStage::CHOICES.len() - 1);
-                    }
-                    KeyCode::Char('n') if ctrl => {
-                        stage_index = (stage_index + 1).min(SidePanelStage::CHOICES.len() - 1);
-                    }
-                    KeyCode::Char(ch) if !ctrl && !alt && ('1'..='4').contains(&ch) => {
-                        let index = ch.to_digit(10).unwrap_or(1) as usize - 1;
-                        self.open_side_panel_scope(SidePanelStage::CHOICES[index]);
-                        return Action::None;
-                    }
-                    KeyCode::Enter => {
-                        self.open_side_panel_scope(SidePanelStage::CHOICES[stage_index]);
-                        return Action::None;
-                    }
-                    _ => {}
-                }
-                self.pending = Some(PendingInteraction::SidePanelPicker { stage_index });
-                Action::None
-            }
-            PendingInteraction::SidePanelScope {
-                stage,
-                mut selected,
-            } => {
-                match key.code {
-                    KeyCode::Esc => return Action::None,
-                    KeyCode::Up | KeyCode::Left => selected = selected.saturating_sub(1),
-                    KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
-                        selected = (selected + 1).min(ModelScope::CHOICES.len() - 1);
-                    }
-                    KeyCode::Char('k') if !ctrl && !alt => selected = selected.saturating_sub(1),
-                    KeyCode::Char('j') if !ctrl && !alt => {
-                        selected = (selected + 1).min(ModelScope::CHOICES.len() - 1);
-                    }
-                    KeyCode::Char(ch) if !ctrl && !alt && ('1'..='2').contains(&ch) => {
-                        let index = ch.to_digit(10).unwrap_or(1) as usize - 1;
-                        return self.apply_side_panel_scope(stage, ModelScope::CHOICES[index]);
-                    }
-                    KeyCode::Enter => {
-                        return self.apply_side_panel_scope(stage, ModelScope::CHOICES[selected]);
-                    }
-                    _ => {}
-                }
-                self.pending = Some(PendingInteraction::SidePanelScope { stage, selected });
                 Action::None
             }
             PendingInteraction::RuntimePicker { mut selected } => {
@@ -11714,70 +11598,6 @@ impl AppState {
                     lines: Vec::new(),
                     slider: Some(effort_slider(model, *effort_index)),
                     hint: "←→ to adjust  ·  Enter to confirm  ·  Esc to cancel".to_owned(),
-                    style: OverlayStyle::Picker,
-                    input: None,
-                    input_label: "",
-                    input_placeholder: "",
-                })
-            }
-            PendingInteraction::SidePanelPicker { stage_index } => Some(OverlayView {
-                closable: true,
-                title: "Side panel".to_owned(),
-                lines: Vec::new(),
-                slider: Some(EffortSlider {
-                    efforts: SidePanelStage::CHOICES
-                        .iter()
-                        .map(|stage| stage.label().to_owned())
-                        .collect(),
-                    selected: *stage_index,
-                    detail: None,
-                }),
-                hint: "←→ to adjust  ·  Enter to continue  ·  Esc to cancel".to_owned(),
-                style: OverlayStyle::Picker,
-                input: None,
-                input_label: "",
-                input_placeholder: "",
-            }),
-            PendingInteraction::SidePanelScope { stage, selected } => {
-                let label_width = ModelScope::CHOICES
-                    .iter()
-                    .map(|scope| scope.label().len())
-                    .max()
-                    .unwrap_or_default();
-                let mut lines = vec![
-                    OverlayLine {
-                        text: stage.label().to_owned(),
-                        selected: false,
-                        muted: true,
-                    },
-                    OverlayLine {
-                        text: String::new(),
-                        selected: false,
-                        muted: true,
-                    },
-                ];
-                lines.extend(ModelScope::CHOICES.iter().enumerate().map(|(index, scope)| {
-                    let detail = match scope {
-                        ModelScope::Session => "Keeps this session's own size",
-                        ModelScope::Default => "Uses this size for new sessions",
-                    };
-                    OverlayLine {
-                        text: format!(
-                            "{}. {:<label_width$}  ·  {detail}",
-                            index + 1,
-                            scope.label()
-                        ),
-                        selected: index == *selected,
-                        muted: false,
-                    }
-                }));
-                Some(OverlayView {
-                    closable: true,
-                    title: "Apply to".to_owned(),
-                    lines,
-                    slider: None,
-                    hint: "1-2 select  ·  ↑↓ navigate  ·  Enter to apply  ·  Esc to cancel"
-                        .to_owned(),
                     style: OverlayStyle::Picker,
                     input: None,
                     input_label: "",
@@ -13210,19 +13030,6 @@ impl AppState {
         }
     }
 
-    fn open_side_panel_scope(&mut self, stage: SidePanelStage) {
-        self.pending = Some(PendingInteraction::SidePanelScope { stage, selected: 0 });
-    }
-
-    fn apply_side_panel_scope(&mut self, stage: SidePanelStage, scope: ModelScope) -> Action {
-        self.set_side_panel_stage(stage);
-        if scope == ModelScope::Default {
-            Action::PersistSidePanelDefault(stage)
-        } else {
-            Action::None
-        }
-    }
-
     fn apply_model(&mut self, index: usize, effort: Option<&str>) {
         self.commit_welcome_card();
         // One conversation, one runtime. A thread exists only once a prompt has been
@@ -13386,18 +13193,26 @@ impl AppState {
         self.diff_display_mode
     }
 
-    /// Steps the panel to its next width, wrapping closed after the widest. The
-    /// new stage is written against this session right away, so a resume reopens
-    /// on the width this session was left on rather than another session's.
-    pub fn cycle_side_panel(&mut self) -> SidePanelStage {
-        let stage = self.side_panel_stage.next();
-        self.set_side_panel_stage(stage);
-        stage
+    /// Opens or shuts the docked panel. The new state is written against this
+    /// session right away, so a resume reopens the panel this session was left
+    /// with rather than another session's.
+    pub fn toggle_side_panel(&mut self) -> bool {
+        self.side_panel_open = !self.side_panel_open;
+        let _ = write_session_side_panel_open(&self.thread_id, self.side_panel_open);
+        self.side_panel_open
     }
 
-    fn set_side_panel_stage(&mut self, stage: SidePanelStage) {
-        self.side_panel_stage = stage;
-        let _ = write_session_side_panel_stage(&self.thread_id, self.side_panel_stage);
+    /// 머리글의 [+]/[-]가 부르는 폭 조절. 폭은 모든 세션이 함께 쓰는 값이라 전역
+    /// 설정에 저장한다. `total_width`는 지금 터미널의 열 수다.
+    pub fn adjust_side_panel_width(&mut self, steps: isize, total_width: u16) -> Action {
+        let step = crate::renderer::SIDE_PANEL_WIDTH_STEP as isize;
+        let width = (self.side_panel_width as isize + steps * step).max(0) as usize;
+        let width = crate::renderer::clamped_side_panel_width(width, total_width);
+        if width == self.side_panel_width {
+            return Action::None;
+        }
+        self.side_panel_width = width;
+        Action::PersistSidePanelWidth(width)
     }
 
     /// Restores the panel this session was last left showing. Called whenever a
@@ -13407,9 +13222,8 @@ impl AppState {
             return;
         }
         // A session nobody opened the panel in starts closed instead of
-        // inheriting whatever width the previous session was left on.
-        self.side_panel_stage = read_session_side_panel_stage(&self.thread_id)
-            .unwrap_or_else(read_default_side_panel_stage);
+        // inheriting whatever the previous session was left on.
+        self.side_panel_open = read_session_side_panel_open(&self.thread_id).unwrap_or(false);
     }
 
     /// Records this session's vibe/response modes beside its thread id so a later
@@ -13487,12 +13301,79 @@ impl AppState {
 
     #[cfg(test)]
     pub fn side_panel_open(&self) -> bool {
-        self.side_panel_stage != SidePanelStage::Closed
+        self.side_panel_open
     }
 
     #[cfg(test)]
-    pub fn side_panel_stage(&self) -> SidePanelStage {
-        self.side_panel_stage
+    pub fn side_panel_width(&self) -> usize {
+        self.side_panel_width
+    }
+
+    /// 패널의 변경 섹션을 작업 트리와 맞춘다. 편집이 이어지는 동안에만 주기적으로
+    /// git에 묻고, 턴이 끝나면 마지막 편집까지 한 번 더 읽는다. 패널이 닫혀 있거나
+    /// 대화가 멈춰 있는 동안에는 git을 부르지 않는다. 내용이 바뀌었으면 true.
+    fn refresh_side_panel_diff(&mut self) -> bool {
+        let turn_ended = self.side_panel_diff_busy && !self.busy;
+        self.side_panel_diff_busy = self.busy;
+        if !self.side_panel_open {
+            self.side_panel_diff_at = None;
+            return false;
+        }
+        let due = match self.side_panel_diff_at {
+            None => true,
+            Some(at) => turn_ended || (self.busy && at.elapsed() >= SIDE_PANEL_DIFF_INTERVAL),
+        };
+        if !due {
+            return false;
+        }
+        self.side_panel_diff_at = Some(Instant::now());
+        let files = crate::git_diff::uncommitted(Path::new(&self.cwd))
+            .into_iter()
+            .map(|file| {
+                let (additions, deletions) = diff_stats(&file.patch);
+                let block = Block::new(
+                    BlockKind::FileChange,
+                    format!("{}({})", file.verb, file.path),
+                    format!(
+                        "Added {additions} {}, removed {deletions} {}\n{}",
+                        plural(additions, "line"),
+                        plural(deletions, "line"),
+                        file.patch
+                    ),
+                );
+                PanelFileDiff {
+                    path: file.path,
+                    additions,
+                    deletions,
+                    block,
+                }
+            })
+            .collect::<Vec<_>>();
+        let changed = files.len() != self.side_panel_diff.len()
+            || files.iter().zip(&self.side_panel_diff).any(|(fresh, shown)| {
+                fresh.path != shown.path || fresh.block.body != shown.block.body
+            });
+        if changed {
+            self.side_panel_diff = files;
+            // 펼쳐 둔 파일이 더는 바뀐 상태가 아니면 첫 파일로 돌아간다.
+            if !self
+                .side_panel_diff_path
+                .as_deref()
+                .is_some_and(|path| self.side_panel_diff.iter().any(|file| file.path == path))
+            {
+                self.side_panel_diff_path =
+                    self.side_panel_diff.first().map(|file| file.path.clone());
+            }
+        }
+        changed
+    }
+
+    pub fn toggle_side_panel_diff(&mut self) {
+        self.side_panel_diff_expanded = !self.side_panel_diff_expanded;
+    }
+
+    pub fn select_side_panel_diff(&mut self, path: String) {
+        self.side_panel_diff_path = Some(path);
     }
 
     pub fn toggle_plan_summary(&mut self) {
@@ -13675,16 +13556,6 @@ impl AppState {
                     }
                 }
             }
-            Some(PendingInteraction::SidePanelScope { stage, selected }) => match row
-                .checked_sub(MODEL_SCOPE_HEADER_ROWS)
-                .and_then(|choice| ModelScope::CHOICES.get(choice))
-            {
-                Some(scope) => self.apply_side_panel_scope(stage, *scope),
-                None => {
-                    self.pending = Some(PendingInteraction::SidePanelScope { stage, selected });
-                    Action::Tick(false)
-                }
-            },
             Some(PendingInteraction::ThemePicker { theme_index }) => {
                 match ThemeKind::ALL.get(row) {
                     Some(theme) => self.apply_theme(*theme),
@@ -13993,18 +13864,6 @@ impl AppState {
                     }
                     None => {
                         self.pending = Some(PendingInteraction::EffortPicker { effort_index });
-                        Action::Tick(false)
-                    }
-                }
-            }
-            Some(PendingInteraction::SidePanelPicker { stage_index }) => {
-                match SidePanelStage::CHOICES.get(step).copied() {
-                    Some(stage) => {
-                        self.open_side_panel_scope(stage);
-                        Action::None
-                    }
-                    None => {
-                        self.pending = Some(PendingInteraction::SidePanelPicker { stage_index });
                         Action::Tick(false)
                     }
                 }
@@ -16736,14 +16595,22 @@ fn read_vibe_config_value(key: &str) -> Option<String> {
         })
 }
 
-/// Where each session's own panel stage is kept. The stage is a per-session
-/// preference, so it rides beside the settings file rather than inside it.
-fn read_default_side_panel_stage() -> SidePanelStage {
-    read_vibe_config_value("side_panel_stage")
-        .map(|value| SidePanelStage::from_config_value(&value))
-        .unwrap_or_default()
+/// 전역 설정에 저장해 둔 패널 폭. 머리글의 [+]/[-]로 정한 값이며, 설정이 없으면
+/// 가장 좁은 폭으로 시작한다.
+fn read_default_side_panel_width() -> usize {
+    read_vibe_config_value("side_panel_width")
+        .and_then(|value| {
+            value
+                .trim()
+                .trim_matches('"')
+                .parse::<usize>()
+                .ok()
+        })
+        .unwrap_or(crate::renderer::SIDE_PANEL_MIN_WIDTH)
 }
 
+/// Where each session's own open/shut state is kept. It is a per-session
+/// preference, so it rides beside the settings file rather than inside it.
 fn side_panel_stages_path() -> Option<PathBuf> {
     vibe_settings_path().and_then(|path| Some(path.parent()?.join("side-panel-stages.json")))
 }
@@ -16762,27 +16629,28 @@ fn read_side_panel_stages() -> Vec<(String, String)> {
     serde_json::from_str::<Vec<(String, String)>>(&text).unwrap_or_default()
 }
 
-/// The stage `thread_id` was last left on. A session nobody has opened the panel
-/// in starts closed rather than inheriting another session's width.
-fn read_session_side_panel_stage(thread_id: &str) -> Option<SidePanelStage> {
+/// Whether `thread_id` was last left with the panel open. A session nobody has
+/// opened the panel in starts closed.
+fn read_session_side_panel_open(thread_id: &str) -> Option<bool> {
     if thread_id.is_empty() {
         return None;
     }
     read_side_panel_stages()
         .into_iter()
         .find(|(id, _)| id == thread_id)
-        .map(|(_, stage)| SidePanelStage::from_config_value(&stage))
+        .map(|(_, state)| state == "open")
 }
 
-/// Moves `thread_id` to the newest end of the list with its current stage, then
+/// Moves `thread_id` to the newest end of the list with its current state, then
 /// trims the oldest entries past the history limit.
 fn upsert_side_panel_stage(
     mut stages: Vec<(String, String)>,
     thread_id: &str,
-    stage: SidePanelStage,
+    open: bool,
 ) -> Vec<(String, String)> {
     stages.retain(|(id, _)| id != thread_id);
-    stages.push((thread_id.to_owned(), stage.config_value().to_owned()));
+    let state = if open { "open" } else { "closed" };
+    stages.push((thread_id.to_owned(), state.to_owned()));
     if stages.len() > SIDE_PANEL_STAGE_HISTORY {
         let excess = stages.len() - SIDE_PANEL_STAGE_HISTORY;
         stages.drain(0..excess);
@@ -16790,7 +16658,7 @@ fn upsert_side_panel_stage(
     stages
 }
 
-fn write_session_side_panel_stage(thread_id: &str, stage: SidePanelStage) -> std::io::Result<()> {
+fn write_session_side_panel_open(thread_id: &str, open: bool) -> std::io::Result<()> {
     if thread_id.is_empty() {
         return Ok(());
     }
@@ -16803,7 +16671,7 @@ fn write_session_side_panel_stage(thread_id: &str, stage: SidePanelStage) -> std
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let stages = upsert_side_panel_stage(read_side_panel_stages(), thread_id, stage);
+    let stages = upsert_side_panel_stage(read_side_panel_stages(), thread_id, open);
     let text = serde_json::to_string(&stages)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     fs::write(path, text)
@@ -17182,65 +17050,26 @@ mod tests {
         assert_eq!(diff_stats(diff), (0, 1));
     }
 
-    /// The stage cycles closed → small → medium → large → closed, and its saved
-    /// config value must round-trip through the same parser a restored session
-    /// reads it back with — otherwise a saved "large" would reopen closed.
+    /// Each session keeps whether it left the panel open, so reopening one
+    /// restores that session without another session's state leaking into it.
     #[test]
-    fn side_panel_stage_cycles_and_round_trips_its_config_value() {
-        let mut stage = SidePanelStage::Closed;
-        let mut widths = Vec::new();
-        for _ in 0..4 {
-            stage = stage.next();
-            widths.push(stage.width());
-        }
-        assert_eq!(
-            widths,
-            vec![
-                Some(SIDE_PANEL_WIDTHS[0]),
-                Some(SIDE_PANEL_WIDTHS[1]),
-                Some(SIDE_PANEL_WIDTHS[2]),
-                None,
-            ]
-        );
-
-        for stage in [
-            SidePanelStage::Closed,
-            SidePanelStage::Small,
-            SidePanelStage::Medium,
-            SidePanelStage::Large,
-        ] {
-            assert_eq!(
-                SidePanelStage::from_config_value(stage.config_value()),
-                stage
-            );
-        }
-        assert_eq!(
-            SidePanelStage::from_config_value("garbage"),
-            SidePanelStage::Closed
-        );
-    }
-
-    /// Each session keeps its own stage, so reopening one restores that session's
-    /// width without another session's stage leaking into it.
-    #[test]
-    fn side_panel_stages_are_kept_per_session_and_bounded() {
-        let stages = upsert_side_panel_stage(Vec::new(), "session-a", SidePanelStage::Large);
-        let stages = upsert_side_panel_stage(stages, "session-b", SidePanelStage::Small);
+    fn side_panel_open_state_is_kept_per_session_and_bounded() {
+        let stages = upsert_side_panel_stage(Vec::new(), "session-a", true);
+        let stages = upsert_side_panel_stage(stages, "session-b", false);
         // Re-saving a session moves it to the newest end rather than duplicating.
-        let stages = upsert_side_panel_stage(stages, "session-a", SidePanelStage::Medium);
+        let stages = upsert_side_panel_stage(stages, "session-a", false);
 
         assert_eq!(
             stages,
             vec![
-                ("session-b".to_owned(), "small".to_owned()),
-                ("session-a".to_owned(), "medium".to_owned()),
+                ("session-b".to_owned(), "closed".to_owned()),
+                ("session-a".to_owned(), "closed".to_owned()),
             ]
         );
 
         let mut many = Vec::new();
         for index in 0..SIDE_PANEL_STAGE_HISTORY + 5 {
-            many =
-                upsert_side_panel_stage(many, &format!("session-{index}"), SidePanelStage::Small);
+            many = upsert_side_panel_stage(many, &format!("session-{index}"), true);
         }
         assert_eq!(many.len(), SIDE_PANEL_STAGE_HISTORY);
         assert_eq!(many[0].0, "session-5");
@@ -22659,27 +22488,6 @@ mod tests {
     }
 
     #[test]
-    fn choosing_the_default_side_panel_scope_applies_and_persists_the_size() {
-        let mut state = test_state();
-        state.thread_id.clear();
-        state.run_slash_command("/side-panel");
-
-        state.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
-        let overlay = state.overlay_view().expect("side-panel scope picker");
-        assert_eq!(overlay.title, "Apply to");
-        assert_eq!(overlay.lines[0].text, "Large");
-
-        let action = state.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
-
-        assert!(matches!(
-            action,
-            Action::PersistSidePanelDefault(SidePanelStage::Large)
-        ));
-        assert_eq!(state.side_panel_stage(), SidePanelStage::Large);
-        assert!(state.overlay_view().is_none());
-    }
-
-    #[test]
     fn model_scope_options_are_fully_english() {
         let mut state = test_state();
         state.run_slash_command("/model");
@@ -27281,9 +27089,8 @@ mod tests {
     fn forked_side_state_keeps_an_independent_composer_and_parent_identity() {
         let mut parent = test_state();
         parent.editor.set_text("main draft");
-        parent.cycle_side_panel();
-        parent.cycle_side_panel();
-        let parent_panel = parent.side_panel_stage();
+        parent.toggle_side_panel();
+        let parent_panel = parent.side_panel_open();
         let mut btw = parent.forked_side_state(
             "btw-thread".to_owned(),
             parent.cwd.clone(),
@@ -27292,15 +27099,14 @@ mod tests {
         );
 
         btw.editor.set_text("btw draft");
-        btw.cycle_side_panel();
         assert_eq!(parent.editor.text(), "main draft");
         assert_eq!(btw.editor.text(), "btw draft");
         assert_eq!(btw.thread_id, "btw-thread");
         assert_eq!(btw.side_parent_thread_id(), Some(parent.thread_id.as_str()));
         assert_eq!(btw.selected_model_name(), parent.selected_model_name());
         assert_eq!(btw.selected_effort(), parent.selected_effort());
-        assert_eq!(parent.side_panel_stage(), parent_panel);
-        assert_ne!(btw.side_panel_stage(), parent.side_panel_stage());
+        assert_eq!(parent.side_panel_open(), parent_panel);
+        assert_ne!(btw.side_panel_open(), parent.side_panel_open());
         assert!(
             btw.committed.is_empty(),
             "pane header replaces the old BTW card"
