@@ -5956,6 +5956,8 @@ pub enum Pick {
     CompletionSource(usize),
     /// The `✕` on a panel's top rule: closes what Esc closes.
     Close,
+    /// 상태줄 아래 업데이트 알림: 백그라운드로 `dvz update`를 실행한다.
+    RunUpdate,
 }
 
 /// Which way a chrome row resolves to text when a pointer lands on one.
@@ -7275,7 +7277,10 @@ fn normal_frame_with_expansion(
         ));
     }
     if let Some(notice) = update_notice {
-        lines.push(status_line_row(None, &notice, width, side_panel_open));
+        lines.push(
+            status_line_row(None, &notice, width, side_panel_open)
+                .with_tight_picks(&[(0, Pick::RunUpdate)]),
+        );
     }
     // Separate the running-subagent rows from the status line with one blank row.
     if status_line_painted && (!subagents.is_empty() || !artifacts.is_empty()) {
@@ -19867,7 +19872,7 @@ mod tests {
                     five_hour_remaining: None,
                     weekly_percent: None,
                     notice: None,
-                    update_notice: Some("Update available: 1.8.3 · dvz update".to_owned()),
+                    update_notice: Some("Update available: 1.8.3 · dvz update or click here".to_owned()),
                 }),
                 diff_reference_lines: None,
                 side_panel_open: false,
@@ -19894,7 +19899,12 @@ mod tests {
         // 상태줄·갱신 안내와 서브에이전트 행 사이에는 빈 줄 하나가 들어간다.
         assert_eq!(update_index + 2, subagent_index);
         assert!(frame.lines[update_index + 1] == PaintLine::blank());
-        assert!(painted(&frame.lines[update_index]).ends_with("dvz update"));
+        assert!(painted(&frame.lines[update_index]).ends_with("dvz update or click here"));
+        // 안내 전체가 하나의 버튼이다. 누르면 업데이트가 백그라운드로 돈다.
+        assert_eq!(
+            pick_on(&frame.lines[update_index], "Update available:"),
+            Some(Pick::RunUpdate)
+        );
     }
 
     /// Compaction's activity row carries a progress bar, so a queued prompt gets

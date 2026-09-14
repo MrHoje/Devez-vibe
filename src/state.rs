@@ -1109,6 +1109,8 @@ pub enum Action {
     Submit(String),
     Steer(String),
     RunShell(String),
+    /// 업데이트 알림을 눌렀을 때 백그라운드로 도는 `dvz update`.
+    RunUpdate,
     Interrupt,
     NewThread,
     Worktree(Option<String>),
@@ -3606,6 +3608,8 @@ pub struct AppState {
     context_window: Option<u64>,
     transient_status: Option<String>,
     update_notice: Option<String>,
+    /// 알림을 눌러 시작한 업데이트가 도는 동안 다시 눌러도 겹쳐 돌지 않는다.
+    self_update_running: bool,
     show_welcome: bool,
     plan_summary: Option<PlanSummary>,
     /// The turn that published the visible plan. A later turn must not revive
@@ -3902,6 +3906,7 @@ impl AppState {
             context_window,
             transient_status: None,
             update_notice: None,
+            self_update_running: false,
             show_welcome: true,
             plan_summary: None,
             plan_turn_id: None,
@@ -6588,7 +6593,36 @@ impl AppState {
 
     /// Keep the release notice visible without adding it to the conversation.
     pub fn push_update_available(&mut self, latest: &str) {
-        self.update_notice = Some(format!("Update available: {latest} · dvz update"));
+        if self.self_update_running {
+            return;
+        }
+        self.update_notice = Some(format!(
+            "Update available: {latest} · dvz update or click here"
+        ));
+    }
+
+    /// 업데이트 알림을 누르면 같은 업데이트가 이미 돌고 있지 않을 때만 시작한다.
+    pub fn start_self_update(&mut self) -> Action {
+        if self.self_update_running {
+            return Action::None;
+        }
+        self.self_update_running = true;
+        self.update_notice = Some("Updating · dvz update 실행 중".to_owned());
+        Action::RunUpdate
+    }
+
+    pub fn finish_self_update(&mut self, result: std::result::Result<String, String>) {
+        self.self_update_running = false;
+        match result {
+            Ok(output) => {
+                self.update_notice = Some("Updated · 다시 시작하면 새 버전으로 실행됩니다".to_owned());
+                self.push_notice(BlockKind::Tool, "dvz update", output);
+            }
+            Err(error) => {
+                self.update_notice = Some("Update failed · dvz update or click here".to_owned());
+                self.push_notice(BlockKind::Warning, "dvz update 실패", error);
+            }
+        }
     }
 
     pub fn drain_committed(&mut self) -> Vec<Block> {
@@ -19035,6 +19069,23 @@ mod tests {
     }
 
     #[test]
+    fn clicking_the_update_notice_runs_one_update_at_a_time() {
+        let mut state = test_state();
+        state.push_update_available("9.9.9");
+
+        assert!(matches!(state.start_self_update(), Action::RunUpdate));
+        assert!(state.status_line().update_notice.unwrap().contains("Updating"));
+        // 도는 동안 다시 눌러도, 새 알림이 와도 두 번째 업데이트는 시작하지 않는다.
+        assert!(matches!(state.start_self_update(), Action::None));
+        state.push_update_available("9.9.9");
+        assert!(state.status_line().update_notice.unwrap().contains("Updating"));
+
+        state.finish_self_update(Ok("완료".to_owned()));
+        assert!(state.status_line().update_notice.unwrap().contains("Updated"));
+        assert!(matches!(state.start_self_update(), Action::RunUpdate));
+    }
+
+    #[test]
     fn hide_keeps_the_shell_command_the_user_ran_with_a_bang() {
         let mut state = test_state();
         state.show_welcome = false;
@@ -22288,7 +22339,7 @@ mod tests {
         assert!(state.drain_committed().is_empty());
         assert_eq!(
             state.view().status_line.unwrap().update_notice.as_deref(),
-            Some("Update available: 1.3.11 · dvz update")
+            Some("Update available: 1.3.11 · dvz update or click here")
         );
         state.push_update_available("1.3.12");
         assert!(state.status_line().update_notice.unwrap().contains("1.3.12"));

@@ -812,6 +812,7 @@ fn hold_until_thread(
         | Action::CopyQuietly(_)
         | Action::Cut(_)
         | Action::RunShell(_)
+        | Action::RunUpdate
         | Action::OpenUrl(_)
         | Action::OpenLinkDirectory(_)) => Some(action),
         Action::ShowStatus => Some(Action::ShowStatus),
@@ -1094,6 +1095,9 @@ enum ManagementUpdate {
         claude: bool,
         result: std::result::Result<Value, String>,
     },
+    SelfUpdate {
+        result: std::result::Result<String, String>,
+    },
 }
 
 fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
@@ -1186,6 +1190,7 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
                 }
             }
         },
+        ManagementUpdate::SelfUpdate { result } => state.finish_self_update(result),
         ManagementUpdate::McpReconnect { provider, result } => match result {
             Ok(response) => {
                 state.finish_mcp_reconnect(provider, &response, "재연결했습니다.".to_owned())
@@ -2426,6 +2431,7 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
         Pick::ScrollToBottom => Action::ScrollToBottom,
         Pick::History(_) => Action::None,
         Pick::Prompt(block_id) => Action::ScrollToPrompt(block_id),
+        Pick::RunUpdate => state.start_self_update(),
         Pick::Close => state.close_overlay(),
         Pick::Row(index) => state.click_overlay_row(index),
         Pick::Suggestion(index) => state.click_suggestion(index),
@@ -2614,6 +2620,36 @@ async fn run_local_shell(
     Ok(())
 }
 
+/// `dvz update`를 자식 프로세스로 돌린다. 업데이트는 수십 초가 걸리므로 메인
+/// 루프를 막지 않고, 끝나면 그 출력을 전사에 남긴다.
+fn start_self_update(sender: mpsc::UnboundedSender<ManagementUpdate>) {
+    let Ok(exe) = std::env::current_exe() else {
+        let _ = sender.send(ManagementUpdate::SelfUpdate {
+            result: Err("실행 파일 경로를 찾지 못했습니다.".to_owned()),
+        });
+        return;
+    };
+    tokio::spawn(async move {
+        let output = tokio::process::Command::new(exe)
+            .arg("update")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await;
+        let result = match output {
+            Ok(output) => {
+                let text = local_shell_output(&output.stdout, &output.stderr);
+                if output.status.success() {
+                    Ok(text)
+                } else {
+                    Err(text)
+                }
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        let _ = sender.send(ManagementUpdate::SelfUpdate { result });
+    });
+}
+
 fn worktree_fork_params(state: &AppState, path: &Path) -> Value {
     json!({
         "threadId": state.thread_id,
@@ -2694,6 +2730,7 @@ async fn execute_action(
             }
         }
         Action::RunShell(command) => run_local_shell(state, renderer, command).await?,
+        Action::RunUpdate => start_self_update(management_tx.clone()),
         Action::Interrupt => {
             interrupt_turn(server, state).await;
         }
