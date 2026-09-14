@@ -1205,14 +1205,14 @@ impl SidePanelLayout {
 }
 
 /// Leaves the conversation enough room to stay readable before docking the
-/// requested panel width at the right edge; a terminal too narrow for it keeps
-/// the panel shut rather than shrinking it to something else the user did not
-/// ask for.
+/// requested panel width at the right edge. 요청한 폭이 들어가지 않으면 패널을
+/// 접는 대신 가장 좁은 폭까지 줄여서 띄우고, 그마저 담지 못할 때만 접는다.
 fn side_panel_layout(total_width: u16, panel_width: usize) -> Option<SidePanelLayout> {
     let total = usize::from(total_width);
-    let reserved = SIDE_PANEL_GAP + panel_width;
-    (total >= SIDE_PANEL_MIN_MAIN_WIDTH + reserved).then(|| {
-        let main_width = total - reserved;
+    let room = total.saturating_sub(SIDE_PANEL_MIN_MAIN_WIDTH + SIDE_PANEL_GAP);
+    let panel_width = clamped_side_panel_width(panel_width, total_width);
+    (room >= panel_width).then(|| {
+        let main_width = total - SIDE_PANEL_GAP - panel_width;
         SidePanelLayout {
             main_width,
             panel_left: main_width + SIDE_PANEL_GAP,
@@ -10211,8 +10211,8 @@ fn side_panel_plan_lines(
             side_panel_divider(content_width),
         ];
     }
-    // 패널 아래쪽 변경 섹션이 쓸 자리를 남기려고 섹션 안쪽 빈 줄은 두지 않는다.
-    let mut lines = vec![heading];
+    // 제목과 내용 사이는 한 줄 띄운다.
+    let mut lines = vec![heading, PaintLine::blank()];
     let last_step_index = summary.steps.len().saturating_sub(1);
     for (index, step) in summary.steps.iter().enumerate() {
         let elapsed_text = step.elapsed.map(format_plan_elapsed);
@@ -10601,7 +10601,7 @@ fn side_panel_prompt_lines(
             side_panel_divider(content_width),
         ];
     }
-    let mut lines = vec![heading];
+    let mut lines = vec![heading, PaintLine::blank()];
     for prompt in prompts {
         let text = prompt.body.split_whitespace().collect::<Vec<_>>().join(" ");
         let marker_tone = model_tone(&prompt.title).unwrap_or(Tone::User);
@@ -13219,6 +13219,16 @@ fn input_lines_with_controls(
     let visible_end = (visible_start + COMPOSER_MAX_PROMPT_ROWS).min(raw_rows.len());
 
     let mut rows = Vec::with_capacity(visible_end - visible_start + 2);
+    // 배지가 통째로 들어가는 너비에서는 구분선을 덮지 않고 그 위 줄에 세운다.
+    let badge_row = controls_mode.and_then(|mode| composer_badge_row(mode, panel_width));
+    let controls_mode = if badge_row.is_some() {
+        None
+    } else {
+        controls_mode
+    };
+    if let Some(badge_row) = badge_row {
+        rows.push(badge_row);
+    }
     rows.push(input_top_line_with_controls(
         panel_width,
         label,
@@ -13365,6 +13375,36 @@ const COMPOSER_NOTICE_TAIL_RULE: usize = 2;
 
 /// Rule the composer's top line opens with when it carries a label.
 const OPENING_RULE: &str = "── ";
+
+/// 브랜치부터 Auto Knowledge까지가 한 줄에 다 들어가면 구분선 위에 따로 세운
+/// 줄로 오른쪽 끝에 맞춰 그린다. 그렇지 않으면 `None`을 돌려 예전처럼 구분선
+/// 안에 얹는다.
+fn composer_badge_row(mode: &ComposerMode, panel_width: usize) -> Option<PaintLine> {
+    let badge = full_badge_spans(mode, true);
+    let width = spans_width(&badge.spans) + spans_console_extra(&badge.spans);
+    let pad = panel_width.checked_sub(width)?;
+    if pad == 0 {
+        return None;
+    }
+    let picks = [
+        badge.vibe_mode_index.map(|index| (index + 1, Pick::VibeMode)),
+        badge
+            .auto_knowledge_index
+            .map(|index| (index + 1, Pick::AutoKnowledge)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    Some(
+        PaintLine {
+            text: " ".repeat(pad),
+            tone: Tone::Muted,
+            tail: badge.spans,
+            ..PaintLine::plain("")
+        }
+        .with_tight_picks(&picks),
+    )
+}
 
 #[cfg(test)]
 fn input_top_line(panel_width: usize, label: &str, mode: Option<&ComposerMode>) -> PaintLine {
@@ -14988,6 +15028,17 @@ mod tests {
         assert_eq!(clamped_side_panel_width(72, 120), 60);
         // 패널을 담지 못할 만큼 좁으면 최소 폭으로 되돌리고 레이아웃이 닫는다.
         assert_eq!(clamped_side_panel_width(60, 60), SIDE_PANEL_MIN_WIDTH);
+    }
+
+    #[test]
+    fn a_window_too_narrow_for_the_chosen_width_opens_the_panel_at_its_narrowest() {
+        // 72를 고른 채 창이 좁아지면 48로 줄여서라도 띄운다.
+        let layout = side_panel_layout(100, 72).expect("the panel falls back to its floor");
+        assert_eq!(layout.panel_width, SIDE_PANEL_MIN_WIDTH);
+        assert_eq!(layout.main_width, 100 - SIDE_PANEL_GAP - SIDE_PANEL_MIN_WIDTH);
+
+        // 가장 좁은 폭조차 대화를 밀어내면 그때는 접는다.
+        assert!(side_panel_layout(96, 72).is_none());
     }
 
     #[test]
@@ -19469,14 +19520,14 @@ mod tests {
 
         let (rows, _, _, _) = input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
 
-        assert_eq!(rows[0].tone, Tone::ModelTerra);
-        assert_eq!(rows[1].prefix_tone, Tone::ModelTerra);
+        assert_eq!(rows[1].tone, Tone::ModelTerra);
+        assert_eq!(rows[2].prefix_tone, Tone::ModelTerra);
         // The `❯` glyph carries the agent colour; the rules keep the model tone.
         // The blank the cursor sits on stays plain, so an outside terminal paints
         // the IME preedit in the ordinary text colour.
-        assert_eq!(rows[1].tone, Tone::AgentStandard);
+        assert_eq!(rows[2].tone, Tone::AgentStandard);
         assert_eq!(
-            rows[1].tail.last().map(|span| span.tone),
+            rows[2].tail.last().map(|span| span.tone),
             Some(Tone::Plain)
         );
         assert_eq!(rows.last().map(|line| line.tone), Some(Tone::ModelTerra));
@@ -19498,11 +19549,11 @@ mod tests {
             Some(&mode),
         );
 
-        assert_eq!(rows[1].text, "! ");
-        assert_eq!(rows[0].tone, Tone::Plain);
-        assert_eq!(rows[1].tone, Tone::Plain);
+        assert_eq!(rows[2].text, "! ");
+        assert_eq!(rows[2].tone, Tone::Plain);
+        assert_eq!(rows[2].tone, Tone::Plain);
         assert_eq!(rows.last().unwrap().tone, Tone::Plain);
-        assert!(!painted(&rows[1]).contains('❯'));
+        assert!(!painted(&rows[2]).contains('❯'));
     }
 
     #[test]
@@ -19525,8 +19576,8 @@ mod tests {
 
         let (rows, _, _, _) = input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
 
-        assert_eq!(rows[1].text, "❯ ");
-        assert_eq!(rows[1].tone, Tone::AgentGoalRunner);
+        assert_eq!(rows[2].text, "❯ ");
+        assert_eq!(rows[2].tone, Tone::AgentGoalRunner);
     }
 
     #[test]
@@ -19606,8 +19657,8 @@ mod tests {
 
         let (rows, _, _, _) = input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
 
-        assert_eq!(rows[0].tone, Tone::ModelOpus);
-        assert_eq!(rows[1].prefix_tone, Tone::ModelOpus);
+        assert_eq!(rows[1].tone, Tone::ModelOpus);
+        assert_eq!(rows[2].prefix_tone, Tone::ModelOpus);
         assert_eq!(rows.last().map(|line| line.tone), Some(Tone::ModelOpus));
     }
 
@@ -20289,6 +20340,32 @@ mod tests {
         );
         assert!(!painted(&line).contains("Response:"));
         assert!(!painted(&line).contains("Fast:"));
+    }
+
+    /// 배지가 통째로 들어가는 너비에서는 구분선을 덮지 않고 그 위 줄에 선다.
+    /// 좁아지면 예전처럼 구분선 안으로 들어간다.
+    #[test]
+    fn a_wide_composer_lifts_the_badge_off_the_rule() {
+        let editor = Editor::default();
+        let mut mode = test_mode("Default", ModeAccent::Calm, false);
+        mode.branch = Some("main".to_owned());
+        mode.auto_knowledge = true;
+
+        let (rows, _, _, _) = input_lines(&editor, &[], 120, "", "Ask anything", None, Some(&mode));
+        let badge = painted(&rows[0]);
+        assert!(badge.contains("main") && badge.contains("Auto Knowledge"));
+        assert!(!badge.contains('─'));
+        let rule = painted(&rows[1]);
+        assert!(rule.chars().all(|ch| ch == '─'));
+        let badge_width = UnicodeWidthStr::width(badge.as_str());
+        assert_eq!(
+            rows[0].pick.as_ref().and_then(|picks| picks.columns_of(&Pick::AutoKnowledge)),
+            Some(badge_width - UnicodeWidthStr::width("Auto Knowledge")..badge_width)
+        );
+
+        // 좁은 창에서는 배지가 다시 구분선 위에 얹힌다.
+        let (narrow, _, _, _) = input_lines(&editor, &[], 24, "", "Ask anything", None, Some(&mode));
+        assert!(painted(&narrow[0]).contains('─'));
     }
 
     #[test]
@@ -22194,7 +22271,7 @@ mod tests {
     #[test]
     fn side_panel_width_cycle_leaves_no_stale_stream_geometry() {
         set_chat_layout(false);
-        for (rows, total_width, panel_width) in [(18, 100, 24), (24, 120, 36), (32, 140, 48)] {
+        for (rows, total_width, panel_width) in [(18, 100, 48), (24, 120, 60), (32, 140, 72)] {
             let narrowed_width = side_panel_layout(total_width, panel_width)
                 .expect("side panel layout")
                 .main_width as u16;
@@ -22587,7 +22664,7 @@ mod tests {
     #[test]
     fn side_panel_areas_scroll_on_their_own() {
         let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
-        renderer.side_panel = side_panel_layout(100, 40);
+        renderer.side_panel = side_panel_layout(100, 48);
         let layout = renderer.side_panel.unwrap();
         let panel_column = layout.panel_left as u16;
 
@@ -22700,7 +22777,7 @@ mod tests {
     #[test]
     fn side_panel_without_changes_gives_its_whole_height_to_the_top() {
         let mut renderer = Renderer::new(ThemeKind::Dark, RenderMode::Fullscreen);
-        renderer.side_panel = side_panel_layout(100, 40);
+        renderer.side_panel = side_panel_layout(100, 48);
 
         let composed =
             renderer.compose_side_panel(text_rows(20, "top"), Vec::new(), Vec::new(), 12);
@@ -27479,15 +27556,16 @@ mod tests {
             content[0].pick.as_ref().and_then(|picks| picks.at(0)),
             Some(Pick::PlanSummary)
         );
-        // 섹션 안쪽에는 빈 줄을 두지 않는다. 제목 다음이 곧 첫 단계다.
-        assert_eq!(content[1].prefix, "✔ ");
-        assert_eq!(content[2].prefix, "▸ ");
-        assert_eq!(content[3].prefix, "  ");
-        assert!(painted(&content[1]).starts_with("✔ 1. 첫 단계"));
-        assert!(painted(&content[1]).ends_with("(18s)"));
-        assert!(painted(&content[2]).starts_with("▸ 2. 두 번째 단계"));
-        assert_eq!(painted(&content[4]), "─".repeat(layout.content_width()));
-        assert_eq!(content[4].tone, Tone::SidePanelDivider);
+        // 제목과 첫 단계 사이는 한 줄 띄운다.
+        assert!(content[1].text.is_empty());
+        assert_eq!(content[2].prefix, "✔ ");
+        assert_eq!(content[3].prefix, "▸ ");
+        assert_eq!(content[4].prefix, "  ");
+        assert!(painted(&content[2]).starts_with("✔ 1. 첫 단계"));
+        assert!(painted(&content[2]).ends_with("(18s)"));
+        assert!(painted(&content[3]).starts_with("▸ 2. 두 번째 단계"));
+        assert_eq!(painted(&content[5]), "─".repeat(layout.content_width()));
+        assert_eq!(content[5].tone, Tone::SidePanelDivider);
         assert!(
             content
                 .iter()
@@ -27521,7 +27599,7 @@ mod tests {
             );
         }
         assert_eq!(
-            frame.cell(layout.content_left(), 5).style.foreground,
+            frame.cell(layout.content_left(), 6).style.foreground,
             tone_rgb(Tone::SidePanelDivider)
         );
 
@@ -27539,9 +27617,9 @@ mod tests {
         };
         let waiting = side_panel_plan_lines(&finished, layout.content_width(), 0.0, true);
         assert_eq!(painted(&waiting[0]), "▲ Updated Plan  2 / 3 Working");
-        assert_ne!(waiting[3].prefix, "✔ ");
-        assert_eq!(waiting[3].prefix_tone, Tone::Accent);
-        assert_eq!(waiting[3].tone, Tone::Accent);
+        assert_ne!(waiting[4].prefix, "✔ ");
+        assert_eq!(waiting[4].prefix_tone, Tone::Accent);
+        assert_eq!(waiting[4].tone, Tone::Accent);
         assert!(waiting.iter().all(|line| !painted(line).contains('⏱')));
 
         let waiting_card = fixed_plan_summary_lines(&finished, 80, 0.0, true, None, AgentMode::Standard);
@@ -27585,9 +27663,10 @@ mod tests {
             lines[0].pick.as_ref().and_then(|picks| picks.at(0)),
             Some(Pick::PromptSection)
         );
-        assert_eq!(lines.len(), 1 + SIDE_PANEL_PROMPT_LIMIT + 1);
+        assert!(lines[1].text.is_empty(), "제목과 목록 사이는 한 줄 띄운다");
+        assert_eq!(lines.len(), 2 + SIDE_PANEL_PROMPT_LIMIT + 1);
         for (offset, prompt_id) in expected.into_iter().enumerate() {
-            let line = &lines[offset + 1];
+            let line = &lines[offset + 2];
             assert_eq!(
                 line.pick.as_ref().and_then(|picks| picks.at(0)),
                 Some(Pick::Prompt(prompt_id))
@@ -27607,7 +27686,7 @@ mod tests {
         renderer.side_panel = Some(layout);
         renderer.side_panel_content = lines;
         assert_eq!(
-            renderer.pick_at(layout.content_left() as u16, 2),
+            renderer.pick_at(layout.content_left() as u16, 3),
             Some(Pick::Prompt(history[6].id()))
         );
     }
@@ -27715,19 +27794,20 @@ mod tests {
 
         let lines = side_panel_prompt_lines(&[prompt], content_width, true);
 
-        assert_eq!(lines.len(), 3);
-        assert_eq!(lines[1].prefix, "› ");
-        assert!(painted(&lines[1]).ends_with('…'));
-        assert_eq!(lines[1].prefix_tone, Tone::ModelSol);
-        assert_eq!(lines[1].tone, Tone::Plain);
-        assert_eq!(row_background(lines[1].tone), None);
-        assert_eq!(bubble_background(&lines[1]), None);
+        assert_eq!(lines.len(), 4);
+        assert!(lines[1].text.is_empty());
+        assert_eq!(lines[2].prefix, "› ");
+        assert!(painted(&lines[2]).ends_with('…'));
+        assert_eq!(lines[2].prefix_tone, Tone::ModelSol);
+        assert_eq!(lines[2].tone, Tone::Plain);
+        assert_eq!(row_background(lines[2].tone), None);
+        assert_eq!(bubble_background(&lines[2]), None);
         assert_eq!(
-            lines[1].pick.as_ref().and_then(|picks| picks.at(0)),
+            lines[2].pick.as_ref().and_then(|picks| picks.at(0)),
             Some(Pick::Prompt(prompt_id))
         );
-        assert!(painted_line_width(&lines[1]) <= content_width);
-        assert_eq!(lines[2].tone, Tone::SidePanelDivider);
+        assert!(painted_line_width(&lines[2]) <= content_width);
+        assert_eq!(lines[3].tone, Tone::SidePanelDivider);
     }
 
     #[test]
@@ -27855,7 +27935,7 @@ mod tests {
             side_panel_layout(140, SIDE_PANEL_MIN_WIDTH).expect("140 columns carry the panel");
         let content = side_panel_plan_lines(&summary, layout.content_width(), 0.0, false);
 
-        let rows = &content[1..content.len() - 1];
+        let rows = &content[2..content.len() - 1];
         assert_eq!(rows.len(), 1, "one step keeps one row before the divider");
         assert!(painted(&rows[0]).ends_with('…'));
         assert!(painted_line_width(&rows[0]) <= layout.content_width());

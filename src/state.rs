@@ -3673,6 +3673,9 @@ pub struct AppState {
     vibe_mode: VibeMode,
     conversation_view: ConversationView,
     shell_display_mode: ShellDisplayMode,
+    /// `!` 로 사용자가 직접 실행한 셸 블록. 사용자가 결과를 보려고 친
+    /// 명령이므로 Hide 모드에서도 감추지 않는다.
+    local_shell_ids: HashSet<u64>,
     diff_display_mode: DiffDisplayMode,
     /// The docked right-hand side panel's width stage. Persisted across
     /// sessions so a panel left open reopens the same way next time.
@@ -3938,6 +3941,7 @@ impl AppState {
             response_length,
             response_display_mode,
             shell_display_mode,
+            local_shell_ids: HashSet::new(),
             diff_display_mode,
             // Whether the panel is open belongs to a session, and no session is
             // bound yet. Starting closed is what keeps a brand new session from
@@ -6549,6 +6553,7 @@ impl AppState {
     pub fn begin_local_shell(&mut self, command: &str) -> Block {
         self.commit_welcome_card();
         let block = Block::new(BlockKind::Tool, "Running Shell Command", command);
+        self.local_shell_ids.insert(block.id());
         self.committed.push(block.clone());
         block
     }
@@ -6597,7 +6602,9 @@ impl AppState {
             // Inline transcript rows become permanent as soon as they are
             // handed to the renderer. Drop Shell and Web Search blocks here
             // so they cannot flash for one frame and disappear later.
-            committed.retain(|block| !is_shell_hidden_block(block));
+            committed.retain(|block| {
+                self.local_shell_ids.contains(&block.id()) || !is_shell_hidden_block(block)
+            });
         }
         if self.vibe_mode == VibeMode::SuperVibe || self.plan_panel_hidden {
             committed.retain(|block| !is_plan_block(block));
@@ -19025,6 +19032,21 @@ mod tests {
         }));
 
         assert!(state.drain_committed().is_empty());
+    }
+
+    #[test]
+    fn hide_keeps_the_shell_command_the_user_ran_with_a_bang() {
+        let mut state = test_state();
+        state.show_welcome = false;
+        state.shell_display_mode = ShellDisplayMode::Hide;
+
+        let anchor = state.begin_local_shell("git status");
+        assert_eq!(state.drain_committed().len(), 1);
+
+        state.finish_local_shell(&anchor, "git status", "clean".to_owned(), 0, 12);
+        let committed = state.drain_committed();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(committed[0].body, "clean");
     }
 
     #[test]
