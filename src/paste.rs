@@ -286,7 +286,11 @@ impl ComposerPasteBuffer {
                 self.last = Some(now);
                 Vec::new()
             }
-            KeyCode::Tab if plain && (self.shortcut_paste || !self.text.is_empty() && fast) => {
+            // A Hangul IME commits the syllable being composed at the moment Tab
+            // is pressed, so one buffered character 0ms behind is not evidence of
+            // a paste — only a run already classified as one is, exactly like
+            // `Enter`. Otherwise the role switch is eaten as a literal tab.
+            KeyCode::Tab if plain && (self.shortcut_paste || self.pasted && fast) => {
                 self.text.push('\t');
                 self.pasted = true;
                 self.last = Some(now);
@@ -740,6 +744,24 @@ mod tests {
                     && key.modifiers == KeyModifiers::CONTROL
         ));
         assert!(!buffer.is_buffering());
+    }
+
+    #[test]
+    fn composer_buffer_sends_tab_after_one_fast_character() {
+        let base = Instant::now();
+        let mut buffer = ComposerPasteBuffer::new();
+        buffer.observe(press(KeyCode::Char('가')), base);
+
+        let inputs = buffer.observe(press(KeyCode::Tab), base);
+
+        assert!(matches!(
+            &inputs[0],
+            ComposerInput::Text(BufferedText { text, pasted: false, .. }) if text == "가"
+        ));
+        assert!(matches!(
+            &inputs[1],
+            ComposerInput::Key(key) if key.code == KeyCode::Tab
+        ));
     }
 
     #[test]
