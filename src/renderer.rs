@@ -11758,8 +11758,8 @@ fn question_answer_lines(block: &Block, width: u16, history: Option<(u64, &str, 
                 wrapped_line(prefix, Tone::Plain, text, Tone::QuestionText, true, width)
             })
             .collect::<Vec<_>>();
-        // 소요 시간은 질문 줄에 띄우지 않는다. 기록 라벨과 역할 표시만 남긴다.
-        let footer = prompt_footer_spans(history, None, last.then_some(block.response_agent).flatten());
+        // 질문 줄에는 소요 시간도 역할 이름도 띄우지 않고 기록 라벨만 남긴다.
+        let footer = prompt_footer_spans(history, None, None);
         let room = usize::from(width).saturating_sub(1);
         if !footer.is_empty() && let Some(line) = question_lines.last_mut() {
             let label = footer.iter().map(|span| UnicodeWidthStr::width(span.text.as_str())).sum::<usize>();

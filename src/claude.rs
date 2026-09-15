@@ -973,6 +973,8 @@ mod tests {
                 "every skipped predecessor and the target itself pass through in_progress"
             )
         );
+        // 정상 종료 턴에서만 남은 진행 중 작업을 완료로 맞춘다.
+        assert!(bridge.contains("if (turn.status === \"completed\") completeLingeringTasks(session, Date.now());"));
     }
 
     #[test]

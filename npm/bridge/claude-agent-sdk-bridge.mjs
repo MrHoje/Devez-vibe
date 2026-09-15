@@ -1849,6 +1849,19 @@ function updatePlanFromToolUse(session, name, toolUseId, input) {
   if (name === "TaskUpdate") emitPlan(session);
 }
 
+// 마지막 단계를 완료로 바꾸지 않고 답변을 끝내는 턴이 있다. 정상 종료일 때만
+// 남은 진행 중 작업을 완료로 맞춰, 끝난 계획이 진행 중으로 보이지 않게 한다.
+function completeLingeringTasks(session, at) {
+  let changed = false;
+  for (const task of session.tasks?.values() ?? []) {
+    if (task.status !== "in_progress") continue;
+    markTaskStatus(task, "completed", at);
+    task.turnId = session.turn?.id;
+    changed = true;
+  }
+  if (changed) emitPlan(session);
+}
+
 function flushPendingPlan(session) {
   if (!session.planCreatePending) return;
   session.planCreatePending = false;
@@ -2768,6 +2781,7 @@ function finishTurn(session, error, durationMs) {
   flushPendingPlan(session);
   clearForegroundSubagents(session);
   const turn = { id: session.turn.id, status: error ? "failed" : session.turn.interruptRequested ? "interrupted" : "completed" };
+  if (turn.status === "completed") completeLingeringTasks(session, Date.now());
   if (error) turn.error = { message: error instanceof Error ? error.message : error.message || String(error) };
   if (durationMs != null) turn.durationMs = durationMs;
   notify("turn/completed", { threadId: session.id, turn });
@@ -4241,6 +4255,37 @@ async function runSelfTest() {
     || batchedPlanEvents[0].params?.plan?.length !== 3
     || batchedPlanEvents[0].params.plan[0]?.status !== "inProgress") {
     throw new Error(`Claude batched plan self-test failed: ${JSON.stringify(batchedPlanEvents)}`);
+  }
+  const lingeringPlan = () => ({
+    id: "lingering-task-self-test",
+    turn: { id: "lingering-turn" },
+    tasks: new Map([
+      ["1", { subject: "1. 조사", status: "completed" }],
+      ["2", { subject: "2. 분석", status: "in_progress" }],
+    ]),
+    subagents: new Map(),
+    streamBlocks: new Map(),
+    planCreatePending: false,
+  });
+  const lingeringWrite = process.stdout.write;
+  const lingeringStatus = (session, error) => {
+    process.stdout.write = () => true;
+    try {
+      finishTurn(session, error);
+    } finally {
+      process.stdout.write = lingeringWrite;
+    }
+    return [...session.tasks.values()].map((task) => task.status).join(",");
+  };
+  const normalEnd = lingeringStatus(lingeringPlan());
+  const failedEnd = lingeringStatus(lingeringPlan(), new Error("boom"));
+  const stoppedPlan = lingeringPlan();
+  stoppedPlan.turn.interruptRequested = true;
+  const interruptedEnd = lingeringStatus(stoppedPlan);
+  if (normalEnd !== "completed,completed"
+    || failedEnd !== "completed,in_progress"
+    || interruptedEnd !== "completed,in_progress") {
+    throw new Error(`Claude lingering task self-test failed: ${normalEnd}|${failedEnd}|${interruptedEnd}`);
   }
   const usage = tokenBreakdown({
     input_tokens: 2,
