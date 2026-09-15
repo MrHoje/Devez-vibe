@@ -1046,7 +1046,6 @@ mod tests {
         assert!(bridge.contains("message.subtype === \"task_notification\""));
         assert!(bridge.contains("message.ambient === true"));
         assert!(bridge.contains("session.ambientSubagentTasks"));
-        assert!(bridge.contains("BACKGROUND_SUBAGENT_LEASE_MS"));
         assert!(bridge.contains("clearForegroundSubagents(session)"));
         assert!(bridge.contains("if (!session.turn) {"));
         assert!(bridge.contains("beginUntrackedTurn(session, message)"));

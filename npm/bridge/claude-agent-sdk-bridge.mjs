@@ -1940,7 +1940,8 @@ const SUBAGENT_TOOLS = ["Agent", "Task"];
 // 행 요약 상한. 사용자가 읽는 한 줄이라 지침의 80자 요청과 같은 값으로 자른다.
 const SUBAGENT_DESCRIPTION_LIMIT = 80;
 const SUBAGENT_PULSE_MS = 5000;
-const BACKGROUND_SUBAGENT_LEASE_MS = 60_000;
+// 자체 시험에서 "오래 조용한 행"을 만들 때 쓰는 나이.
+const IDLE_ROW_AGE_MS = 120_000;
 
 function startSubagent(session, block) {
   const input = block.input || {};
@@ -2405,25 +2406,11 @@ function firstLine(value, limit) {
   return String(value ?? "").split("\n")[0].trim().slice(0, limit);
 }
 
-function emitSubagents(session, pulse = false) {
-  // 구조화된 진행 신호가 끊긴 백그라운드 행은 pulse로 영구 연장하지 않는다.
-  // 정상 작업은 task_progress/background_tasks_changed가 lease를 갱신하고,
-  // 종료 edge와 level 신호를 모두 놓친 행만 유한 시간 뒤 제거된다.
-  // 백그라운드 명령(셸로 띄운 검증자 포함)에는 task_progress가 오지 않으므로
-  // lease를 적용하면 살아 있는 행이 1분 뒤 사라진다. 명령 행은 종료 통지와
-  // level 스냅숏으로만 지운다.
-  if (pulse) {
-    const now = Date.now();
-    for (const [id, agent] of session.subagents) {
-      const lastSeenAt = agent.lastSeenAt || agent.startedAt || now;
-      if (agent.background && !agent.command
-        && now - lastSeenAt >= BACKGROUND_SUBAGENT_LEASE_MS) {
-        session.subagents.delete(id);
-      }
-    }
-  }
+function emitSubagents(session) {
+  // 백그라운드 행은 조용하다고 지우지 않는다. 오래 걸리는 조사 에이전트는 진행
+  // 신호 없이 몇 분을 보내므로, 종료 통지와 level 스냅숏만 행을 거둔다.
   if (session.subagents.size && !session.subagentPulse) {
-    session.subagentPulse = setInterval(() => emitSubagents(session, true), SUBAGENT_PULSE_MS);
+    session.subagentPulse = setInterval(() => emitSubagents(session), SUBAGENT_PULSE_MS);
     session.subagentPulse.unref?.();
   } else if (!session.subagents.size && session.subagentPulse) {
     clearInterval(session.subagentPulse);
@@ -4877,14 +4864,16 @@ async function runSelfTest() {
       name: "Explore",
       description: "",
       tool: "",
-      startedAt: Date.now() - BACKGROUND_SUBAGENT_LEASE_MS * 2,
-      lastSeenAt: Date.now() - BACKGROUND_SUBAGENT_LEASE_MS * 2,
+      startedAt: Date.now() - IDLE_ROW_AGE_MS,
+      lastSeenAt: Date.now() - IDLE_ROW_AGE_MS,
     });
-    commandRow.lastSeenAt = Date.now() - BACKGROUND_SUBAGENT_LEASE_MS * 2;
-    emitSubagents(commandSession, true);
-    if (!commandSession.subagents.has("toolu_bash") || commandSession.subagents.has("toolu_agent_idle")) {
-      throw new Error(`Claude background command lease self-test failed: ${JSON.stringify([...commandSession.subagents.keys()])}`);
+    commandRow.lastSeenAt = Date.now() - IDLE_ROW_AGE_MS;
+    emitSubagents(commandSession);
+    // 오래 조용해도 명령 행과 에이전트 행 모두 남는다. 행은 종료 신호로만 사라진다.
+    if (!commandSession.subagents.has("toolu_bash") || !commandSession.subagents.has("toolu_agent_idle")) {
+      throw new Error(`Claude idle background row self-test failed: ${JSON.stringify([...commandSession.subagents.keys()])}`);
     }
+    commandSession.subagents.delete("toolu_agent_idle");
     processUser(commandSession, {
       origin: { kind: "task-notification" },
       message: { content: `<task-notification>
@@ -4902,8 +4891,8 @@ async function runSelfTest() {
       tasks: [{ task_id: "bash-2", task_type: "local_bash", description: "빌드 감시" }],
     });
     const plainCommand = findSubagent(commandSession, "bash-2");
-    plainCommand.lastSeenAt = Date.now() - BACKGROUND_SUBAGENT_LEASE_MS * 2;
-    emitSubagents(commandSession, true);
+    plainCommand.lastSeenAt = Date.now() - IDLE_ROW_AGE_MS;
+    emitSubagents(commandSession);
     if (!findSubagent(commandSession, "bash-2") || plainCommand.name !== "Bash" || plainCommand.command !== true) {
       throw new Error(`Claude plain background command lease self-test failed: ${JSON.stringify([...commandSession.subagents])}`);
     }
@@ -5116,13 +5105,14 @@ async function runSelfTest() {
       name: "Explore",
       description: "",
       tool: "",
-      startedAt: Date.now() - BACKGROUND_SUBAGENT_LEASE_MS - 1,
-      lastSeenAt: Date.now() - BACKGROUND_SUBAGENT_LEASE_MS - 1,
+      startedAt: Date.now() - IDLE_ROW_AGE_MS,
+      lastSeenAt: Date.now() - IDLE_ROW_AGE_MS,
     });
-    emitSubagents(structuredSession, true);
-    if (structuredSession.subagents.size !== 0) {
-      throw new Error("Claude expired background subagent lease self-test failed");
+    emitSubagents(structuredSession);
+    if (structuredSession.subagents.size !== 1) {
+      throw new Error("Claude idle background subagent self-test failed");
     }
+    structuredSession.subagents.clear();
   } finally {
     process.stdout.write = stdoutWrite;
   }

@@ -74,6 +74,18 @@ Claude Agent SDK 업데이트 영향 확인해
 - **버전 상향만으로 충분**: 결함 수정이 CLI 내부에 있어 고정 버전을 올리면 그대로
   들어옴.
 
+## 브리지 단독 구동 검증
+
+TUI를 띄우지 않고 실제 에이전트 동작을 확인할 때는 브리지를 stdio로 직접 돌린다.
+
+- `node npm/bridge/claude-agent-sdk-bridge.mjs`를 자식 프로세스로 띄우고 요청을 한 줄
+  JSON으로 보낸다. **요청의 `id`는 숫자여야 한다.** 문자열 id는 호스트 응답으로 분류돼
+  조용히 무시되며 아무 응답도 오지 않는다.
+- 순서는 `session/start`(`cwd`, `model`) → `session/prompt`(`input: [{type:"text",…}]`)다.
+  stdin이 닫히면 세션이 정리되므로 파이프를 열어 둔다.
+- `turn/subagents/updated` 알림의 `subagents` 배열이 하단 목록 그대로이므로, 행이 언제
+  생기고 사라지는지 이 알림만 보면 된다.
+
 ## 확인 기록
 
 ### 2026-09-10 사용량 한도 자동 재개 — 1.8.22 배포
