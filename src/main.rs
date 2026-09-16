@@ -2892,6 +2892,9 @@ async fn execute_action(
             }
             set_fast_mode(server, state, enabled).await;
         }
+        Action::UpdateTurnSettings { model, effort } => {
+            update_turn_settings(server, state, &model, &effort).await;
+        }
         Action::OpenClaudePermissions(notice) => match server
             .request("claude/permissions/status", json!({ "cwd": state.cwd }))
             .await
@@ -4700,6 +4703,31 @@ async fn set_fast_mode(server: &BackendServer, state: &mut AppState, enabled: bo
             }
         }
         Err(error) => state.push_notice(BlockKind::Error, "Fast 전환 실패", error.to_string()),
+    }
+}
+
+/// Codex 0.154 accepts a running turn's new model and effort. It rejects an
+/// unsupported field instead of ignoring it, so a refusal leaves the selection
+/// for the next request rather than failing the turn.
+async fn update_turn_settings(
+    server: &BackendServer,
+    state: &mut AppState,
+    model: &str,
+    effort: &str,
+) {
+    let Some(turn_id) = state.turn_id.clone().filter(|turn| !turn.is_empty()) else {
+        state.set_composer_notice("Applies to the next request".to_owned());
+        return;
+    };
+    let params = json!({
+        "threadId": state.thread_id,
+        "turnId": turn_id,
+        "model": model,
+        "effort": effort
+    });
+    match server.request("turn/settings/update", params).await {
+        Ok(_) => state.set_composer_notice("Applied to this request".to_owned()),
+        Err(_) => state.set_composer_notice("Applies to the next request".to_owned()),
     }
 }
 

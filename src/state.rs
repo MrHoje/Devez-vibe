@@ -1119,6 +1119,12 @@ pub enum Action {
     ActivateCodex,
     ActivateOpenCode,
     SetFast(bool),
+    /// Codex 0.154의 `turn/settings/update`. 진행 중인 턴에도 새 모델·추론
+    /// 수준을 적용한다.
+    UpdateTurnSettings {
+        model: String,
+        effort: String,
+    },
     OpenClaudePermissions(Option<String>),
     UpdateClaudePermission {
         action: &'static str,
@@ -5584,7 +5590,7 @@ impl AppState {
     /// notice slot with the copy message: it sits where the eye already is and
     /// `tick` clears it after 1.4s. The status line is for standing state only,
     /// so nothing parks there waiting for a new thread to wipe it.
-    fn set_composer_notice(&mut self, message: String) {
+    pub(crate) fn set_composer_notice(&mut self, message: String) {
         self.composer_notice = Some((message, Instant::now()));
     }
 
@@ -7476,23 +7482,21 @@ impl AppState {
             match key.code {
                 KeyCode::Up => {
                     if self.selected_provider() != ModelProvider::OpenCode {
-                        self.move_selected_model(-1);
+                        return self.move_selected_model(-1);
                     }
                     return Action::None;
                 }
                 KeyCode::Down => {
                     if self.selected_provider() != ModelProvider::OpenCode {
-                        self.move_selected_model(1);
+                        return self.move_selected_model(1);
                     }
                     return Action::None;
                 }
                 KeyCode::Left => {
-                    self.move_selected_effort(-1);
-                    return Action::None;
+                    return self.move_selected_effort(-1);
                 }
                 KeyCode::Right => {
-                    self.move_selected_effort(1);
-                    return Action::None;
+                    return self.move_selected_effort(1);
                 }
                 _ => {}
             }
@@ -13167,10 +13171,10 @@ impl AppState {
         move_model_index_in(&candidates, model_index, direction)
     }
 
-    fn move_selected_model(&mut self, direction: i8) {
+    fn move_selected_model(&mut self, direction: i8) -> Action {
         let next_index = self.move_model_index(self.selected_model, direction);
         if next_index == self.selected_model {
-            return;
+            return Action::None;
         }
         let model = self.models.get(next_index).map(|model| model.model.clone());
         let effort = self
@@ -13180,13 +13184,14 @@ impl AppState {
             .map(|effort| effort.id.clone());
         if let Some(model) = model {
             self.select_model_and_effort(&model, effort.as_deref());
-            self.notice_setting_applies_to_next_request();
+            return self.notice_setting_applies_to_next_request();
         }
+        Action::None
     }
 
-    fn move_selected_effort(&mut self, direction: i8) {
+    fn move_selected_effort(&mut self, direction: i8) -> Action {
         let Some(model) = self.selected_model() else {
-            return;
+            return Action::None;
         };
         let current_index = model
             .efforts
@@ -13196,7 +13201,7 @@ impl AppState {
         let next_index = match direction {
             -1 => current_index.saturating_sub(1),
             1 => (current_index + 1).min(model.efforts.len().saturating_sub(1)),
-            _ => return,
+            _ => return Action::None,
         };
         let effort = model
             .efforts
@@ -13206,14 +13211,26 @@ impl AppState {
             && let Some(effort) = effort
         {
             self.selected_effort = effort;
-            self.notice_setting_applies_to_next_request();
+            return self.notice_setting_applies_to_next_request();
         }
+        Action::None
     }
 
-    fn notice_setting_applies_to_next_request(&mut self) {
-        if self.busy {
-            self.set_composer_notice("Applies to the next request".to_owned());
+    /// Codex takes a running turn's new model and effort through
+    /// `turn/settings/update`; every other provider waits for the next request.
+    fn notice_setting_applies_to_next_request(&mut self) -> Action {
+        if !self.busy {
+            return Action::None;
         }
+        let turn = self.turn_id.clone().filter(|turn| !turn.is_empty());
+        if let (ModelProvider::Codex, Some(_)) = (self.selected_provider(), turn) {
+            return Action::UpdateTurnSettings {
+                model: self.selected_model_name().to_owned(),
+                effort: self.selected_effort.clone(),
+            };
+        }
+        self.set_composer_notice("Applies to the next request".to_owned());
+        Action::None
     }
 
     #[allow(dead_code)]
@@ -28968,6 +28985,19 @@ mod tests {
         assert_eq!(codex.selected_model_name(), "gpt-5.6-terra");
         codex.move_selected_model(-1);
         assert_eq!(codex.selected_model_name(), "gpt-5.6-sol");
+
+        // An idle selection waits for the next turn; a running Codex turn takes
+        // the change through `turn/settings/update`.
+        assert!(matches!(codex.move_selected_model(1), Action::None));
+        codex.set_turn_started("turn-1".to_owned());
+        assert!(matches!(
+            codex.move_selected_model(-1),
+            Action::UpdateTurnSettings { ref model, .. } if model == "gpt-5.6-sol"
+        ));
+        assert!(matches!(
+            codex.move_selected_effort(-1),
+            Action::UpdateTurnSettings { .. }
+        ));
 
         let mut claude = AppState::new(
             "claude:thread".to_owned(),

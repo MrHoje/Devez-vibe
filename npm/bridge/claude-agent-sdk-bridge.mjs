@@ -2802,7 +2802,18 @@ async function consumeMessage(session, message) {
     }
     await processStreamEvent(session, message);
   } else if (message.type === "assistant") {
-    if (session.turn && !message.parent_tool_use_id) session.turn.assistantError = message.error || null;
+    if (session.turn && !message.parent_tool_use_id) {
+      session.turn.assistantError = message.error || null;
+      // 2.1.273's new error: the account itself is blocked until the user
+      // verifies it, so no retry here can clear it.
+      if (message.error === "verification_required") {
+        notify("warning", {
+          threadId: session.id,
+          provider: "Claude",
+          message: "Claude 계정 확인이 필요합니다. claude.ai에서 확인을 마친 뒤 다시 요청하세요.",
+        });
+      }
+    }
     processAssistant(session, message);
   }
   else if (message.type === "user") processUser(session, message);
@@ -4527,6 +4538,18 @@ async function runSelfTest() {
     const beforeSleep = retryInputs.length;
     resumeAfterUsageLimit(limitSession, sleptWait, sleptWait.resetsAt + 31 * 60 * 1000);
     if (limitSession.turn || retryInputs.length !== beforeSleep) throw new Error("Long sleep resumed unattended work");
+    beginTurn(limitSession);
+    const beforeVerify = captured.length;
+    await consumeMessage(limitSession, {
+      type: "assistant", error: "verification_required", message: { content: [] },
+    });
+    const verifyWarning = captured.slice(beforeVerify).join("").trim().split("\n").filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .find((event) => event.method === "warning" && event.params?.message?.includes("계정 확인"));
+    if (!verifyWarning || limitSession.usageLimitWait) {
+      throw new Error(`Verification required self-test failed: ${captured.slice(beforeVerify).join("")}`);
+    }
+    finishTurn(limitSession, null);
     beginTurn(limitSession);
     await rejectLimit();
     await consumeMessage(limitSession, failedResult);

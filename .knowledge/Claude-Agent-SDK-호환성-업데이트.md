@@ -134,4 +134,5 @@ TUI를 띄우지 않고 실제 에이전트 동작을 확인할 때는 브리지
 
 | 날짜 | 확인 SDK / Claude Code 버전 | 결과 | 비고 |
 | --- | --- | --- | --- |
+| 2026-09-16 | 0.3.273 / 2.1.273 | 버전 상향 | 0.3.267 → 0.3.273. 브리지가 쓰는 `Query` 계약은 그대로다. 번들 CLI로 들어오는 수정: 서브에이전트·백그라운드 에이전트가 토큰 사용량이나 모델 id 없는 응답에서 실패로 잘못 보고되던 문제, MCP `list_changed` 반복 알림의 CPU 폭증, 프롬프트 캐시 손실, `ANTHROPIC_BASE_URL` 400 회귀. 컨텍스트 미터 2배 계산 수정은 제품이 자체 사용량 합산으로 표시하므로 자동 압축 시점에만 영향이다. 새 오류값 `verification_required`는 브리지에서 계정 확인 안내로 처리한다. `omitClaudeMd`, `reloadPlugins(holdOnCacheImpact)`, `usage_report`, context 행의 `kind`는 쓰는 경로가 없어 미적용. 실제 모델 실행 검증은 하지 않았다. |
 | 2026-08-13 | 0.3.231 / 2.1.231 | 버전 상향 | 0.3.223 → 0.3.231. 브리지가 쓰는 `Query` 메서드 계약은 그대로다. 신규 타입(`OnElicitation`/`OnUserDialog`의 `requestId`·null 반환, `terminal_slash_commands`, `policyHelpers`, `dialogExpiry`, `crossSessionInbound`, plugin `command` 소스, AWS sigv4 정책)은 모두 Devez Vibe가 쓰지 않는 경로라 미적용. 상향으로 들어오는 수정: 공백뿐인 메시지의 400, Windows 확장 길이·UNC 경로 처리, 좁은 터미널·비문자열 도구 인자 크래시, `/model` 이후 이전 모델 되돌아감, 스트리밍 중 응답 일부 소실·중복. `set_model` 중간 전환은 Devez Vibe가 모델을 turn 시작에만 적용하는 설계라 미적용(steer는 진행 중 turn에 합류). |

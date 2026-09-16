@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DevezCode 기능 보고</title>
+<style>
+  :root{
+    --bg:#f7f7f5; --panel:#ffffff; --ink:#1c1c1a; --muted:#6b6b66;
+    --line:#e2e1dc; --accent:#3f6d5a; --accent-soft:#eaf1ed; --code:#f1f0ec;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#16171a; --panel:#1e2024; --ink:#e7e7e3; --muted:#9a9a93;
+      --line:#31343a; --accent:#7fbfa2; --accent-soft:#22302a; --code:#242830;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#16171a; --panel:#1e2024; --ink:#e7e7e3; --muted:#9a9a93;
+    --line:#31343a; --accent:#7fbfa2; --accent-soft:#22302a; --code:#242830;
+  }
+  body{background:var(--bg); color:var(--ink);
+    font-family:"Pretendard","Malgun Gothic","Segoe UI",system-ui,sans-serif;
+    line-height:1.7; font-size:15px;}
+  .wrap{max-width:900px; margin:0 auto; padding-block:48px 72px; padding-left:20px; padding-right:20px;}
+  header.top{border-bottom:2px solid var(--accent); padding-bottom:20px; margin-bottom:36px;}
+  h1{font-size:28px; margin:0 0 8px; letter-spacing:-.01em;}
+  .sub{color:var(--muted); font-size:14px; margin:0;}
+  h2{font-size:20px; margin:48px 0 14px; padding-bottom:8px; border-bottom:1px solid var(--line);}
+  h3{font-size:16px; margin:28px 0 10px; color:var(--accent);}
+  p{margin:0 0 12px;}
+  ul{margin:0 0 14px; padding-left:20px;}
+  li{margin:0 0 7px;}
+  code{background:var(--code); padding:1px 5px; border-radius:4px;
+    font-family:"Cascadia Mono",Consolas,monospace; font-size:.88em;}
+  .card{background:var(--panel); border:1px solid var(--line); border-radius:10px;
+    padding:18px 22px; margin:0 0 18px;}
+  .grid{display:flex; flex-wrap:wrap; gap:16px; margin-bottom:18px;}
+  .grid > .card{flex:1 1 260px; margin:0;}
+  .grid h4{margin:0 0 6px; font-size:15px;}
+  .grid p{margin:0; font-size:14px; color:var(--muted);}
+  .tablebox{overflow-x:auto; margin:0 0 18px;}
+  table{border-collapse:collapse; width:100%; font-size:14px; min-width:480px;}
+  th,td{border:1px solid var(--line); padding:8px 10px; text-align:left; vertical-align:top;}
+  th{background:var(--accent-soft); color:var(--accent); font-weight:600;}
+  footer{margin-top:52px; padding-top:18px; border-top:1px solid var(--line);
+    color:var(--muted); font-size:13px;}
+  @media print{ body{background:#fff;} .card{break-inside:avoid;} }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <h1>DevezCode 기능 보고</h1>
+  <p class="sub">팀 내부 공유용 · Windows 데스크톱 AI 개발 워크벤치</p>
+</header>
+
+<h2>1. 한 줄 정의</h2>
+<p>여러 AI 코딩 세션을 <strong>한 창에서 프로젝트별로 관리하고, 각 세션이 지금 무엇을 하고 있는지 추적하며, 사용량을 실시간으로 확인하는</strong> Windows 데스크톱 앱이다. 터미널을 흉내 내는 것이 아니라 실제 터미널 위에서 세션이 그대로 돌아간다.</p>
+
+<div class="grid">
+  <div class="card">
+    <h4>프로젝트별 세션 관리</h4>
+    <p>세션이 프로젝트에 묶여 정리된다. 여러 저장소를 오가도 섞이지 않는다.</p>
+  </div>
+  <div class="card">
+    <h4>세션 상태 추적</h4>
+    <p>작업 중인지, 내 답을 기다리는지, 끝났는지를 목록에서 바로 구분한다.</p>
+  </div>
+  <div class="card">
+    <h4>실시간 사용량 확인</h4>
+    <p>세션별 토큰과 비용이 헤더에서 실시간으로 집계된다.</p>
+  </div>
+</div>
+
+<h2>2. 프로젝트별 세션 관리</h2>
+<ul>
+  <li><strong>프로젝트 트리와 세션 목록</strong> — 좌측에서 작업 중인 프로젝트를 고르면 그 프로젝트에 속한 세션만 보인다. 세션이 어느 저장소에서 시작됐는지 기억할 필요가 없다.</li>
+  <li><strong>탭으로 동시 실행</strong> — 여러 세션을 탭으로 띄워 놓고 필요할 때 오간다. 한 세션이 오래 도는 동안 다른 세션에서 계속 작업할 수 있다.</li>
+  <li><strong>세션 이어가기</strong> — 앱을 껐다 켜도 세션 구성이 유지되고, 이전 대화를 그대로 이어서 재개할 수 있다.</li>
+  <li><strong>세션 관리 · 정리 · 내보내기</strong> — 쌓인 세션을 목록에서 정리하고, 필요한 대화는 파일로 내보낸다.</li>
+  <li><strong>앱 밖 세션 끌어오기</strong> — 별도 터미널에서 시작한 세션을 앱 안으로 가져와 같은 방식으로 관리할 수 있다.</li>
+  <li><strong>파일 빠른 열기</strong> — 프로젝트 파일 색인을 두고 이름 일부만으로 바로 연다.</li>
+</ul>
+
+<h2>3. 세션 동작 상태 추적</h2>
+<p>세션 목록만 보고도 지금 무엇을 봐야 하는지 판단할 수 있게 상태를 구분해 표시한다.</p>
+<div class="tablebox">
+<table>
+  <thead><tr><th>상태</th><th>표시</th><th>의미</th></tr></thead>
+  <tbody>
+    <tr><td>작업 중</td><td>스피너</td><td>세션이 실제로 돌고 있다. 기다리면 된다.</td></tr>
+    <tr><td><strong>응답 대기</strong></td><td>❗ 배지</td><td>세션이 사용자 답을 기다리며 멈춰 있다. <strong>내가 가야 진행된다.</strong></td></tr>
+    <tr><td>완료</td><td>완료 기록 카드</td><td>작업이 끝났다. 결과를 확인하면 된다.</td></tr>
+  </tbody>
+</table>
+</div>
+<ul>
+  <li>상태는 화면 글자를 짐작해 판단하지 않는다. 세션이 실제로 바쁜지를 <strong>훅이나 상태 파일로 직접 확인</strong>해 표시한다.</li>
+  <li><strong>마지막 프롬프트를 세션 헤더에 표시</strong>해, 탭을 열어 보지 않아도 무슨 일을 시켜 둔 세션인지 알 수 있다.</li>
+  <li><strong>알림 팝업</strong>으로 상태 변화를 창 밖에서도 알린다.</li>
+  <li><strong>작업 대기열</strong>에 할 일을 쌓아 순서대로 처리한다.</li>
+</ul>
+
+<h2>4. 실시간 사용량 확인</h2>
+<ul>
+  <li><strong>세션별 입·출력 토큰과 비용을 헤더에서 실시간 집계</strong>한다. 어떤 작업이 얼마를 썼는지 끝나고 나서가 아니라 진행 중에 보인다.</li>
+  <li><strong>사용 한도 스냅샷</strong>을 보관해 남은 여유를 확인할 수 있다.</li>
+  <li>사용량 조회에 필요한 <strong>계정 로그인을 앱 안에서</strong> 처리한다. 별도 웹사이트를 오갈 필요가 없다.</li>
+  <li>일시적인 조회 오류로 사용량이 잘못 급락해 보이는 것을 막는 보정이 들어 있다.</li>
+</ul>
+
+<h2>5. 파일과 변경 확인</h2>
+<ul>
+  <li><strong>Markdown 뷰어 · 편집기</strong> — 결과 문서를 앱 안에서 바로 읽고 고친다.</li>
+  <li><strong>diff 뷰어</strong> — 무엇이 바뀌었는지 좌우 비교로 확인한다.</li>
+  <li><strong>Git 변경 관리</strong> — 변경 목록 확인, 스테이징, diff 보기를 앱 안에서 처리한다.</li>
+  <li><strong>이미지 · PDF · 코드 뷰어</strong>, 프로젝트 파일 탐색기.</li>
+</ul>
+
+<h2>6. 그 밖의 기능</h2>
+<ul>
+  <li><strong>미니 브라우저</strong> — 메인 창 위에 뜨는 작은 브라우저. 세션이 웹 페이지를 열어 읽고 조작할 수 있다.</li>
+  <li><strong>MCP 서버 관리</strong> — 외부 도구 연결을 앱에서 설치·연결·제어한다.</li>
+  <li><strong>플러그인 · 스킬 관리</strong> — 설치와 상세 확인을 화면에서 처리한다.</li>
+  <li><strong>자동 업데이트</strong> — 앱은 서명 검증을 거쳐 갱신되고, 사용하는 도구도 시작 시 함께 갱신된다.</li>
+  <li><strong>단축키 설정</strong>과 전역 탭 전환 키, <strong>테마</strong> 적용.</li>
+</ul>
+
+<footer>
+  본 문서는 저장소 소스와 내부 문서를 근거로 정리했다. 화면 구성 세부와 설정 항목 전체는 조사 범위에 포함하지 않았다.
+</footer>
+
+</div>
+</body>
+</html>
