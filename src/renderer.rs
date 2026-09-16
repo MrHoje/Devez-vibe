@@ -7036,12 +7036,24 @@ fn stable_streaming_markdown_body(body: &str) -> String {
     let content_end = body.trim_end_matches(['\r', '\n']).len();
     let line_start = body[..content_end].rfind('\n').map_or(0, |index| index + 1);
     let marker = body[line_start..content_end].trim_start();
-    let unfinished_at_physical_end = content_end == body.len() && matches!(marker, "`" | "``");
+    let unfinished_at_physical_end =
+        content_end == body.len() && unfinished_marker_only(marker.trim_end());
     if unfinished_at_physical_end || marker.starts_with("```") {
         body[..line_start].to_owned()
     } else {
         body.to_owned()
     }
+}
+
+/// 표식만 도착하고 읽을 내용은 아직 없는 줄. 표식은 완성되는 순간 불릿·제목 모양으로
+/// 바뀌거나 아예 사라져 그 행을 잃으므로, 미리 한 행을 차지하면 전사가 한 줄 내려갔다
+/// 올라온다. 표 줄은 다음 줄의 구분선이 와야 표로 접혀 행 수가 함께 줄어든다.
+fn unfinished_marker_only(marker: &str) -> bool {
+    !marker.is_empty()
+        && (marker.starts_with('|')
+            || marker.chars().all(|ch| {
+                matches!(ch, '-' | '*' | '+' | '>' | '#' | '`' | '.' | ' ') || ch.is_ascii_digit()
+            }))
 }
 
 #[cfg(test)]
@@ -29173,5 +29185,48 @@ mod tests {
 
         assert_eq!(painted_line_text(first), "• 이제 부착 처리를 봅니다.");
     }
-}
 
+    fn streamed_row_count(body: &str, width: u16) -> usize {
+        let block = Block::new(BlockKind::Assistant, "Codex", body);
+        let live = [LiveBlockView {
+            block: &block,
+            revision: 0,
+        }];
+        render_streamed_transcript_lines(
+            &live,
+            width,
+            &HashSet::new(),
+            ShellDisplayMode::Hide,
+            DiffDisplayMode::Hide,
+        )
+        .0
+        .len()
+    }
+
+    /// 한 글자가 더 왔는데 행이 줄면 전사가 그만큼 내려갔다 올라와 화면이 흔들린다.
+    /// 목록·제목·표 표식은 완성되는 순간 제 행을 잃으므로 그 전에는 자리를 잡지 않는다.
+    #[test]
+    fn a_streamed_answer_never_loses_a_row_while_it_grows() {
+        set_chat_layout(false);
+        let samples = [
+            "제목 앞 문장입니다.\n\n## 제목\n\n- 첫째 항목은 제법 길어서 줄을 넘길 수 있는 내용을 담습니다\n- **둘째** 항목\n\n마무리 문장입니다.",
+            "| 항목 | 설명 |\n| --- | --- |\n| 짧음 | 값 |\n| 아주 긴 항목 이름 | 아주 긴 설명이 들어가는 칸 |\n\n표 뒤 문장입니다.",
+            "1. 첫 번째 단계입니다\n2. 두 번째 단계는 조금 더 긴 설명을 담고 있습니다\n\n> 인용 [문서](https://example.com/very/long/path)\n\n```rust\nfn main() {}\n```\n\n끝 문장.",
+        ];
+        for sample in samples {
+            let chars: Vec<char> = sample.chars().collect();
+            for width in [48u16, 64, 80] {
+                let mut previous = 0usize;
+                for end in 0..=chars.len() {
+                    let partial: String = chars[..end].iter().collect();
+                    let rows = streamed_row_count(&partial, width);
+                    assert!(
+                        rows >= previous,
+                        "폭 {width}에서 {previous} -> {rows}: {partial:?}"
+                    );
+                    previous = rows;
+                }
+            }
+        }
+    }
+}
