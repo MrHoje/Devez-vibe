@@ -1527,7 +1527,7 @@ async fn event_loop(
         {
             let action = state
                 .take_queued_prompt()
-                .map(|text| state.start_queued_prompt(text))
+                .map(|queued| state.start_queued_prompt(queued))
                 .unwrap_or(Action::None);
             let handoff = matches!(&action, Action::Submit(_))
                 .then(|| provider_handoff_snapshot(state, renderer));
@@ -1909,7 +1909,7 @@ async fn event_loop(
                             {
                                 target
                                     .take_queued_prompt()
-                                    .map(|text| target.start_queued_prompt(text))
+                                    .map(|queued| target.start_queued_prompt(queued))
                                     .unwrap_or(Action::None)
                             } else if method == "skills/changed" {
                                 Action::RefreshSkills

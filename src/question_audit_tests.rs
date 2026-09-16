@@ -63,14 +63,14 @@ fn esc_queue_waits_for_completion_then_runs_once_in_order() {
         assert_eq!(state.editor.text(), "미전송 초안");
         state.handle_notification("turn/completed", &json!({"turn": {"id": "turn", "status": "interrupted"}}));
         let first = state.take_queued_prompt().expect("ESC 후 대기열이 멈춤");
-        assert_eq!(first, "다음 요청");
+        assert_eq!(first.text, "다음 요청");
         assert!(!state.busy);
         assert!(state.drain_committed().iter().any(|block| block.body == "남겨야 할 응답"));
         assert!(matches!(state.start_queued_prompt(first), Action::Submit(_)));
         assert!(state.take_queued_prompt().is_none());
         state.set_turn_started("next".into());
         state.handle_notification("turn/completed", &json!({"turn": {"id": "next", "status": "completed"}}));
-        assert_eq!(state.take_queued_prompt().as_deref(), Some("그다음 요청"));
+        assert_eq!(state.take_queued_prompt().map(|queued| queued.text).as_deref(), Some("그다음 요청"));
         assert!(state.take_queued_prompt().is_none());
         assert_eq!(state.editor.text(), "미전송 초안");
     }
@@ -186,7 +186,7 @@ fn esc_during_start_resumes_queue_only_after_the_deferred_stop() {
     assert_eq!(state.take_pending_interrupt().as_deref(), Some("turn"));
     assert!(state.take_queued_prompt().is_none());
     state.handle_notification("turn/completed", &json!({"turn": {"id": "turn", "status": "interrupted"}}));
-    assert_eq!(state.take_queued_prompt().as_deref(), Some("다음 요청"));
+    assert_eq!(state.take_queued_prompt().map(|queued| queued.text).as_deref(), Some("다음 요청"));
 }
 
 #[test]
@@ -405,4 +405,24 @@ fn permission_display_tracks_effective_profile_without_lowering_next_preference(
     assert!(state.committed.last().unwrap().body.contains("작업 폴더 수정"));
     state.handle_notification("devez/permissions/updated", &json!({"threadId": "different-thread", "profile": ":read-only", "lowered": true}));
     assert_eq!(state.permission_mode(), PermissionMode::Workspace);
+}
+
+#[test]
+fn alt_enter_queues_the_draft_image_and_sends_it_with_the_prompt() {
+    let mut state = busy_state_with_live_turn();
+    state.editor.set_text("이 화면 확인해줘");
+    state.attach_local_image("C:/shots/screen.png".into());
+    state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+    assert_eq!(state.composer_image_count(), 0, "첨부가 컴포저에 남음");
+    assert!(state.editor.is_empty());
+    assert_eq!(state.view().queued_prompts, ["이 화면 확인해줘 [Image #1]"]);
+
+    state.handle_notification("turn/completed", &json!({"turn": {"id": "live-turn", "status": "completed"}}));
+    let next = state.take_queued_prompt().expect("대기열이 비어 있음");
+    let Action::Submit(text) = state.start_queued_prompt(next) else { panic!("대기 프롬프트 시작 실패") };
+    let input = state.turn_input(text);
+    assert!(
+        input.iter().any(|item| item["type"] == "localImage" && item["path"] == "C:/shots/screen.png"),
+        "대기 프롬프트가 이미지를 싣지 않음: {input:?}"
+    );
 }

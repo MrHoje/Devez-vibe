@@ -3311,6 +3311,39 @@ impl SessionPicker {
     }
 }
 
+/// 줄에 세워 둔 프롬프트. 컴포저에 붙여 둔 이미지도 함께 기다렸다가 실제로
+/// 나갈 때 같이 실린다. `display`는 카드와 줄에 보일 글자로, 이미지 자리는
+/// `[Image #n]`으로 적혀 있다.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct QueuedPrompt {
+    pub text: String,
+    pub display: String,
+    pub images: Vec<String>,
+}
+
+impl QueuedPrompt {
+    #[cfg(test)]
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+}
+
+impl From<String> for QueuedPrompt {
+    fn from(text: String) -> Self {
+        Self {
+            display: text.clone(),
+            text,
+            images: Vec::new(),
+        }
+    }
+}
+
+impl From<&str> for QueuedPrompt {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+
 fn submission_display(source: &str, image_count: usize) -> String {
     let mut display = String::new();
     let mut image_index = 0;
@@ -3500,9 +3533,11 @@ pub struct AppState {
     stashed_prompt: Option<StashedPrompt>,
     composer_undo: VecDeque<ComposerEdit>,
     composer_redo: Vec<ComposerEdit>,
-    queued_prompts: VecDeque<String>,
+    queued_prompts: VecDeque<QueuedPrompt>,
     /// The next turn_input belongs to a queued text, not the current draft.
     queued_input_pending: bool,
+    /// Images that came out of the queue with the prompt now starting.
+    queued_images: Vec<String>,
     /// Keep an async answer separate from the unsent composer until turn/start succeeds.
     pending_async_answer: Option<String>,
     /// Async notifications may be repeated after their answer starts a new turn.
@@ -3857,6 +3892,7 @@ impl AppState {
             queued_prompts: VecDeque::new(),
             pending_async_answer: None,
             queued_input_pending: false,
+            queued_images: Vec::new(),
             handled_async_questions: HashSet::new(),
             codex_permission_mode: PermissionMode::FullAccess,
             handoff_prompt: None,
@@ -4159,7 +4195,7 @@ impl AppState {
             return false;
         }
         let prompt = format!("{plan} 계획을 Goal Runner로 실행해줘.");
-        self.queued_prompts.push_back(prompt.clone());
+        self.queued_prompts.push_back(prompt.clone().into());
         self.handoff_prompt = Some(prompt);
         true
     }
@@ -4172,7 +4208,7 @@ impl AppState {
         let Some(prompt) = self.handoff_prompt.take() else {
             return;
         };
-        if let Some(index) = self.queued_prompts.iter().position(|queued| *queued == prompt) {
+        if let Some(index) = self.queued_prompts.iter().position(|queued| queued.text == prompt) {
             self.queued_prompts.remove(index);
         }
         if self.agent_mode == AgentMode::GoalRunner {
@@ -5064,10 +5100,13 @@ impl AppState {
             "text": text,
             "text_elements": []
         }));
-        if !queued {
-            for path in std::mem::take(&mut self.composer_images) {
-                input.push(json!({ "type": "localImage", "path": path }));
-            }
+        let images = if queued {
+            std::mem::take(&mut self.queued_images)
+        } else {
+            std::mem::take(&mut self.composer_images)
+        };
+        for path in images {
+            input.push(json!({ "type": "localImage", "path": path }));
         }
         let mut added_paths = Vec::new();
         let mut resolved_tokens = Vec::new();
@@ -6727,7 +6766,7 @@ impl AppState {
             plan_agent: self.active_turn_agent,
             editor: &self.editor,
             composer_images: &self.composer_images,
-            queued_prompts: self.queued_prompts.iter().cloned().collect(),
+            queued_prompts: self.queued_prompts.iter().map(|queued| queued.display.clone()).collect(),
             steered_prompts: self
                 .pending_steer_prompts
                 .iter()
@@ -9471,15 +9510,22 @@ impl AppState {
         self.submit_text(text, display)
     }
 
-    pub fn start_queued_prompt(&mut self, text: String) -> Action {
-        let action = self.submit_text(text.clone(), text);
+    pub fn start_queued_prompt(&mut self, prompt: QueuedPrompt) -> Action {
+        let QueuedPrompt { text, display, images } = prompt;
+        self.queued_images = images;
+        let action = self.submit_text(text, display);
         self.queued_input_pending = matches!(&action, Action::Submit(_) | Action::Steer(_));
+        if !self.queued_input_pending {
+            // 줄로 되돌아간 프롬프트는 이미지를 이미 도로 가져갔고, 슬래시 명령은
+            // 애초에 첨부를 보내지 않는다.
+            self.queued_images.clear();
+        }
         action
     }
 
     /// The handoff stays armed until its prompt actually starts a turn (see
     /// `submit_text`), since a drained prompt can bounce back into the queue.
-    pub fn take_queued_prompt(&mut self) -> Option<String> {
+    pub fn take_queued_prompt(&mut self) -> Option<QueuedPrompt> {
         if self.resume_queue_after_interrupt
             || self.held_notifications.iter().any(|(method, _)| method == "turn/completed")
         {
@@ -9500,11 +9546,16 @@ impl AppState {
     /// A prompt that could not start goes back to the queue. The handoff
     /// follow-up returns to the front it drained from; anything else waits its
     /// turn at the back.
-    fn requeue(&mut self, text: String) {
-        if self.is_handoff_prompt(&text) {
-            self.queued_prompts.push_front(text);
+    fn requeue(&mut self, text: String, display: String) {
+        let queued = QueuedPrompt {
+            text,
+            display,
+            images: std::mem::take(&mut self.queued_images),
+        };
+        if self.is_handoff_prompt(&queued.text) {
+            self.queued_prompts.push_front(queued);
         } else {
-            self.queued_prompts.push_back(text);
+            self.queued_prompts.push_back(queued);
         }
     }
 
@@ -9512,7 +9563,7 @@ impl AppState {
         if self
             .queued_prompts
             .get(index)
-            .is_some_and(|queued| self.is_handoff_prompt(queued))
+            .is_some_and(|queued| self.is_handoff_prompt(&queued.text))
         {
             self.cancel_agent_handoff();
             return true;
@@ -9521,15 +9572,13 @@ impl AppState {
     }
 
     fn queue_editor(&mut self) -> Action {
-        if !self.composer_images.is_empty() {
-            self.set_composer_notice("이미지 첨부 메시지는 Enter로 전송해주세요.".to_owned());
+        if self.editor.text().trim().is_empty() {
             return Action::None;
         }
+        let images = std::mem::take(&mut self.composer_images);
+        let display = submission_display(&self.editor.display_text(), images.len());
         let text = self.editor.take_for_submit().unwrap_or_default();
-        if text.is_empty() {
-            return Action::None;
-        }
-        self.queued_prompts.push_back(text);
+        self.queued_prompts.push_back(QueuedPrompt { text, display, images });
         Action::None
     }
 
@@ -9579,13 +9628,13 @@ impl AppState {
             return action;
         }
         if self.provider_switch_pending() {
-            self.requeue(text);
+            self.requeue(text, prompt.body);
             return Action::None;
         }
         // A prompt sent mid-compaction would race the summary the runtime is
         // still writing, so it waits in the queue like one sent during a turn.
         if self.compacting() {
-            self.requeue(text);
+            self.requeue(text, prompt.body);
             return Action::None;
         }
         // 인용은 컴포저 글자가 아니므로 실제로 나가는 순간에야 실린다. 줄에서
@@ -25093,7 +25142,7 @@ mod tests {
         assert!(matches!(action, Action::None));
         assert!(state.editor.is_empty());
         assert_eq!(
-            state.queued_prompts.front().map(String::as_str),
+            state.queued_prompts.front().map(QueuedPrompt::as_str),
             Some("next prompt")
         );
     }
@@ -25171,7 +25220,7 @@ mod tests {
     #[test]
     fn a_queued_prompt_keeps_the_agent_selection_locked() {
         let mut state = busy_state_with_live_turn();
-        state.queued_prompts.push_back("next prompt".to_owned());
+        state.queued_prompts.push_back("next prompt".into());
 
         state.handle_key(KeyEvent::from(KeyCode::Tab));
 
@@ -25266,7 +25315,7 @@ mod tests {
         let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(action, Action::RpcResponse { .. }));
         assert_eq!(state.agent_mode, AgentMode::GoalRunner);
-        assert_eq!(state.queued_prompts.front().map(String::as_str),
+        assert_eq!(state.queued_prompts.front().map(QueuedPrompt::as_str),
             Some("docs/plans/2026-09-05-login-cache.md 계획을 Goal Runner로 실행해줘."));
     }
 
@@ -25293,7 +25342,7 @@ mod tests {
         // untouched, exactly like a mid-turn Tab switch.
         assert_eq!(state.active_turn_agent, AgentMode::Standard);
         assert_eq!(
-            state.queued_prompts.front().map(String::as_str),
+            state.queued_prompts.front().map(QueuedPrompt::as_str),
             Some("docs/plans/2026-09-05-login-cache.md 계획을 Goal Runner로 실행해줘.")
         );
         // The queued follow-up drains into a Goal Runner turn on completion.
@@ -25433,14 +25482,14 @@ mod tests {
     fn planner_handoff_blocked_change_queues_no_follow_up() {
         let mut state = busy_state_with_live_turn();
         state.set_agent_mode(AgentMode::Planner);
-        state.queued_prompts.push_back("earlier prompt".to_owned());
+        state.queued_prompts.push_back("earlier prompt".into());
 
         assert!(!state.request_agent_handoff("docs/plans/2026-09-05-x.md"));
 
         assert_eq!(state.agent_mode, AgentMode::Planner);
         assert_eq!(
-            state.queued_prompts.iter().collect::<Vec<_>>(),
-            [&"earlier prompt".to_owned()]
+            state.queued_prompts.iter().map(QueuedPrompt::as_str).collect::<Vec<_>>(),
+            ["earlier prompt"]
         );
         // The Planner was told the host continues, so the notice must say it
         // did not and how to continue by hand.
@@ -25485,14 +25534,14 @@ mod tests {
         let mut state = busy_state_with_live_turn();
         state.set_agent_mode(AgentMode::Planner);
         assert!(state.request_agent_handoff("docs/plans/2026-09-05-x.md"));
-        state.queued_prompts.push_back("later prompt".to_owned());
+        state.queued_prompts.push_back("later prompt".into());
 
         assert!(matches!(state.request_interrupt(), Action::Interrupt));
 
         assert_eq!(state.agent_mode, AgentMode::Planner);
         assert_eq!(
-            state.queued_prompts.iter().collect::<Vec<_>>(),
-            [&"later prompt".to_owned()]
+            state.queued_prompts.iter().map(QueuedPrompt::as_str).collect::<Vec<_>>(),
+            ["later prompt"]
         );
     }
 
@@ -25553,7 +25602,7 @@ mod tests {
 
         let mut state = busy_state_with_live_turn();
         state.set_agent_mode(AgentMode::GoalRunner);
-        state.queued_prompts.push_back("by hand".to_owned());
+        state.queued_prompts.push_back("by hand".into());
         assert!(state.remove_queued_prompt(0));
         assert_eq!(state.agent_mode, AgentMode::GoalRunner);
     }
@@ -25570,7 +25619,7 @@ mod tests {
         assert!(matches!(state.start_queued_prompt(queued), Action::Submit(_)));
         assert!(state.handoff_prompt.is_none());
         state.turn_id = Some("goal-turn".to_owned());
-        state.queued_prompts.push_back("by hand".to_owned());
+        state.queued_prompts.push_back("by hand".into());
 
         state.request_interrupt();
 
@@ -25586,7 +25635,7 @@ mod tests {
         let mut state = idle_test_state();
         state.set_agent_mode(AgentMode::Planner);
         assert!(state.request_agent_handoff("docs/plans/2026-09-05-x.md"));
-        state.queued_prompts.push_back("by hand".to_owned());
+        state.queued_prompts.push_back("by hand".into());
         let queued = state.take_queued_prompt().expect("handoff queued");
         state.compacting_started_at = Some(Instant::now());
 
@@ -25594,7 +25643,7 @@ mod tests {
 
         assert!(state.handoff_prompt.is_some());
         assert_eq!(
-            state.queued_prompts.iter().collect::<Vec<_>>(),
+            state.queued_prompts.iter().map(QueuedPrompt::as_str).collect::<Vec<_>>(),
             [
                 &"docs/plans/2026-09-05-x.md 계획을 Goal Runner로 실행해줘.".to_owned(),
                 &"by hand".to_owned()
@@ -25604,7 +25653,7 @@ mod tests {
         state.request_interrupt();
         assert_eq!(state.agent_mode, AgentMode::Planner);
         assert_eq!(
-            state.queued_prompts.iter().collect::<Vec<_>>(),
+            state.queued_prompts.iter().map(QueuedPrompt::as_str).collect::<Vec<_>>(),
             [&"by hand".to_owned()]
         );
     }
@@ -25620,13 +25669,13 @@ mod tests {
         state.compacting_started_at = Some(Instant::now());
 
         assert!(matches!(
-            state.start_queued_prompt("typed by the user".to_owned()),
+            state.start_queued_prompt("typed by the user".into()),
             Action::None
         ));
 
         assert!(state.handoff_prompt.is_some());
         assert_eq!(
-            state.queued_prompts.iter().collect::<Vec<_>>(),
+            state.queued_prompts.iter().map(QueuedPrompt::as_str).collect::<Vec<_>>(),
             [
                 &"docs/plans/2026-09-05-x.md 계획을 Goal Runner로 실행해줘.".to_owned(),
                 &"typed by the user".to_owned()
@@ -25761,7 +25810,7 @@ mod tests {
         state.busy = false;
         state.turn_id = None;
 
-        let action = state.start_queued_prompt("next prompt".to_owned());
+        let action = state.start_queued_prompt("next prompt".into());
 
         assert!(matches!(action, Action::Submit(text) if text == "next prompt"));
         assert!(state.busy);
@@ -25791,7 +25840,7 @@ mod tests {
 
         assert!(matches!(action, Action::None));
         assert_eq!(
-            state.queued_prompts.front().map(String::as_str),
+            state.queued_prompts.front().map(QueuedPrompt::as_str),
             Some("Claude로 이어서 처리해")
         );
         assert!(
@@ -25832,12 +25881,12 @@ mod tests {
         let mut state = busy_state_with_live_turn();
         state.queued_prompts = ["first", "second", "third"]
             .into_iter()
-            .map(str::to_owned)
+            .map(QueuedPrompt::from)
             .collect();
 
         assert!(state.remove_queued_prompt(1));
         assert_eq!(
-            state.queued_prompts.into_iter().collect::<Vec<_>>(),
+            state.queued_prompts.iter().map(QueuedPrompt::as_str).collect::<Vec<_>>(),
             ["first", "third"]
         );
     }

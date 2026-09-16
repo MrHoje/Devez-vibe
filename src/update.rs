@@ -21,10 +21,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "사이드 패널에서 아직 커밋하지 않은 변경을 확인하고, 바뀐 파일을 눌러 그 내용을 펼쳐 봅니다.",
-    "사이드 패널의 변경 내용에서 드래그해 고른 줄을 다음 프롬프트에 바로 첨부합니다.",
-    "답변이 정상적으로 끝나면 계획 카드의 마지막 단계도 완료로 표시되어 진행 중인 채 남지 않습니다.",
-    "질문 줄 오른쪽에 붙던 에이전트 역할 이름을 빼서 질문 문장만 보입니다.",
+    "이미지를 첨부한 상태에서도 Alt+Enter로 프롬프트를 대기열에 넣을 수 있고, 차례가 되면 이미지도 함께 전송됩니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
