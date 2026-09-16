@@ -9513,6 +9513,9 @@ impl AppState {
     pub fn start_queued_prompt(&mut self, prompt: QueuedPrompt) -> Action {
         let QueuedPrompt { text, display, images } = prompt;
         self.queued_images = images;
+        // 되돌아갈 수 있으니 이 프롬프트가 줄에서 왔다는 것을 먼저 세워 둔다.
+        // 그래야 `requeue`가 컴포저 초안이 아니라 이 프롬프트의 첨부를 도로 담는다.
+        self.queued_input_pending = true;
         let action = self.submit_text(text, display);
         self.queued_input_pending = matches!(&action, Action::Submit(_) | Action::Steer(_));
         if !self.queued_input_pending {
@@ -9547,11 +9550,15 @@ impl AppState {
     /// follow-up returns to the front it drained from; anything else waits its
     /// turn at the back.
     fn requeue(&mut self, text: String, display: String) {
-        let queued = QueuedPrompt {
-            text,
-            display,
-            images: std::mem::take(&mut self.queued_images),
+        // 나갈 때 실릴 첨부를 그대로 들려 보낸다. 출처를 가리는 기준은 `turn_input`과
+        // 같아서, 컴포저에서 온 프롬프트는 붙인 이미지를 데리고 줄로 들어가고 줄에서
+        // 온 프롬프트는 컴포저에 남은 초안의 첨부를 가져가지 않는다.
+        let images = if self.queued_input_pending {
+            std::mem::take(&mut self.queued_images)
+        } else {
+            std::mem::take(&mut self.composer_images)
         };
+        let queued = QueuedPrompt { text, display, images };
         if self.is_handoff_prompt(&queued.text) {
             self.queued_prompts.push_front(queued);
         } else {
@@ -9572,7 +9579,9 @@ impl AppState {
     }
 
     fn queue_editor(&mut self) -> Action {
-        if self.editor.text().trim().is_empty() {
+        // 붙인 이미지만으로도 프롬프트가 된다. 곧바로 보낼 때와 같은 기준이라야
+        // 첨부만 있는 프롬프트가 줄에 들어가지 못한 채 컴포저에 남지 않는다.
+        if self.editor.text().trim().is_empty() && self.composer_images.is_empty() {
             return Action::None;
         }
         let images = std::mem::take(&mut self.composer_images);
@@ -9611,7 +9620,8 @@ impl AppState {
     }
 
     fn submit_prompt(&mut self, text: String, prompt: Block) -> Action {
-        if text.is_empty() && self.composer_images.is_empty() {
+        // 줄에서 온 프롬프트의 첨부는 `queued_images`에 실려 있다.
+        if text.is_empty() && self.composer_images.is_empty() && self.queued_images.is_empty() {
             return Action::None;
         }
         if text.starts_with('/') && !text.contains('\n') {
@@ -27470,6 +27480,59 @@ mod tests {
             input[0].get("text").and_then(Value::as_str),
             Some("inspect C:\\Users\\me\\AppData\\Local\\Temp\\clipboard.png")
         );
+    }
+
+    /// 압축이나 제공자 전환으로 줄에 들어간 프롬프트도, Alt+Enter로 넣은 프롬프트도
+    /// 붙인 이미지를 데리고 나가야 한다. 컴포저에 첨부가 남으면 화면에 계속 보이고
+    /// 다음 프롬프트에 딸려 나간다. 첨부만 있는 프롬프트도 곧바로 보낼 때와 같이 선다.
+    #[test]
+    fn a_queued_prompt_carries_its_images_and_leaves_the_composer_clean() {
+        for (label, compacting, alt_enter, text) in [
+            ("압축 중 제출", true, false, "설명해"),
+            ("응답 중 Alt+Enter", false, true, "설명해"),
+            ("압축 중 첨부만", true, false, ""),
+            ("응답 중 첨부만 Alt+Enter", false, true, ""),
+        ] {
+            let mut state = test_state();
+            if compacting {
+                state.compacting_started_at = Some(Instant::now());
+            } else {
+                state.busy = true;
+            }
+            state.attach_local_image(r"C:\Temp.png".to_owned());
+            if !text.is_empty() {
+                state.handle_buffered_composer_text(text, false);
+            }
+            let key = if alt_enter {
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)
+            } else {
+                KeyEvent::from(KeyCode::Enter)
+            };
+            assert!(
+                matches!(state.handle_key(key), Action::None),
+                "{label}: 프롬프트가 줄에서 기다려야 한다"
+            );
+            assert!(
+                state.composer_images.is_empty() && state.editor.chars().is_empty(),
+                "{label}: 컴포저에 첨부가 남았다 {:?}",
+                state.composer_images
+            );
+
+            state.compacting_started_at = None;
+            state.busy = false;
+            let queued = state.take_queued_prompt().expect(label);
+            assert_eq!(queued.images, [r"C:\Temp.png"], "{label}");
+            let (Action::Submit(sent) | Action::Steer(sent)) = state.start_queued_prompt(queued)
+            else {
+                panic!("{label}: 대기하던 프롬프트가 나가야 한다");
+            };
+            let input = state.turn_input(sent);
+            assert!(
+                input.iter().any(|item| item["type"] == "localImage"
+                    && item["path"] == r"C:\Temp.png"),
+                "{label}: 이미지가 함께 나가지 않음 {input:?}"
+            );
+        }
     }
 
     #[test]
