@@ -456,7 +456,7 @@ const SLASH_COMMANDS: [SlashCommand; 33] = [
     },
     SlashCommand {
         name: "/auto-knowledge",
-        description: "반복 실수와 필요한 지식의 자동 기록 켜기·끄기",
+        description: "Toggle auto-saving lessons to .knowledge",
         takes_argument: false,
     },
     SlashCommand {
@@ -511,7 +511,7 @@ const SLASH_COMMANDS: [SlashCommand; 33] = [
     },
     SlashCommand {
         name: "/worktree",
-        description: "현재 대화를 이어받아 작업 트리로 진입",
+        description: "Continue this conversation in a git worktree",
         takes_argument: true,
     },
     SlashCommand {
