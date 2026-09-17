@@ -7830,18 +7830,6 @@ impl AppState {
                     Action::None
                 }
             }
-            KeyCode::Char('d')
-                if ctrl
-                    && self.editor.is_empty()
-                    && self.composer_images.is_empty()
-                    && !self.busy =>
-            {
-                Action::Quit
-            }
-            KeyCode::Char('d') if ctrl => {
-                self.delete_from_composer(Editor::delete);
-                Action::None
-            }
             // Ctrl+A selects the whole prompt, as it does in an ordinary editor.
             // An empty composer has nothing to select, so it keeps the historical
             // move to the line start there; Home does that job either way. With a
@@ -27633,10 +27621,6 @@ mod tests {
             ),
             (
                 KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
-                true,
-            ),
-            (
-                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
                 true,
             ),
             (KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL), true),
