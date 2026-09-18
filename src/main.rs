@@ -701,6 +701,7 @@ async fn await_thread(
                             &mut composer_paste,
                             &key,
                             Instant::now(),
+                            None,
                         ) || (is_clipboard_image_shortcut(&key) && attach_clipboard_image(state))
                         {
                             Action::None
@@ -1662,6 +1663,7 @@ async fn event_loop(
                         } else {
                             let input_state =
                                 focused_state_mut(state, &mut btw_state, split_focus);
+                            let paste_selection = composer_replace_range(renderer, input_state);
                             if suppress_side_exit_key(
                                 &mut side_exit_key_guard,
                                 &key,
@@ -1675,6 +1677,7 @@ async fn event_loop(
                                 &mut composer_paste,
                                 &key,
                                 Instant::now(),
+                                paste_selection,
                             ) || (is_clipboard_image_shortcut(&key)
                                 && attach_clipboard_image(input_state))
                             {
@@ -5958,6 +5961,7 @@ fn paste_clipboard_text_shortcut(
     buffer: &mut ComposerPasteBuffer,
     key: &KeyEvent,
     now: Instant,
+    selection: Option<std::ops::Range<usize>>,
 ) -> bool {
     if !is_paste_shortcut(key) || state.has_pending_interaction() {
         return false;
@@ -5965,6 +5969,11 @@ fn paste_clipboard_text_shortcut(
     let Some(text) = clipboard_text().filter(|text| !text.is_empty()) else {
         return false;
     };
+    // A paste replaces the selection the way typing does. The clipboard is read
+    // first, so a paste that never arrives leaves the selected text in place.
+    if let Some(range) = selection {
+        state.delete_composer_selection(range);
+    }
     apply_clipboard_text_paste(state, buffer, &text, now)
 }
 
