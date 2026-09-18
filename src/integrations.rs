@@ -82,9 +82,27 @@ pub struct McpServerInfo {
     pub website_url: Option<String>,
     /// Codex `runtimeStatus`, or the legacy Claude `status`.
     pub connection_status: Option<String>,
+    /// Where the definition came from. Claude sends it; Codex does not.
+    pub source: Option<String>,
     pub tools_error: Option<String>,
     /// Set from `mcpServer/startupStatus/updated` when a server failed to start.
     pub failure: Option<String>,
+}
+
+/// 설정 범위를 화면에 풀어 쓴다. 모르는 값은 그대로 보여 준다.
+fn mcp_source_label(source: &str) -> &str {
+    match source {
+        "sdk" => "DevezVibe 내장",
+        "plugin" => "플러그인",
+        "user" => "사용자 설정",
+        "project" => "프로젝트 설정",
+        "local" => "로컬 설정",
+        "dynamic" => "실행 중 지정",
+        "managed" | "enterprise" => "조직 관리 설정",
+        "claudeai" => "claude.ai 연결",
+        "agent" => "에이전트 설정",
+        other => other,
+    }
 }
 
 impl McpServerInfo {
@@ -141,6 +159,11 @@ impl McpServerInfo {
                 .or_else(|| entry.get("status").and_then(Value::as_str))
                 .or_else(|| entry.get("runtimeStatus").map(|_| "unknown"))
                 .map(ToOwned::to_owned),
+            source: entry
+                .get("source")
+                .and_then(Value::as_str)
+                .filter(|source| !source.is_empty())
+                .map(ToOwned::to_owned),
             tools_error: entry
                 .get("toolsError")
                 .and_then(Value::as_str)
@@ -173,6 +196,7 @@ impl McpServerInfo {
             resources: 0,
             website_url: None,
             connection_status: None,
+            source: None,
             tools_error: None,
             failure: None,
         }
@@ -619,6 +643,13 @@ impl McpPicker {
             selected: false,
             muted: true,
         });
+        if let Some(source) = server.source.as_deref() {
+            lines.push(OverlayLine {
+                text: format!("출처: {}", mcp_source_label(source)),
+                selected: false,
+                muted: true,
+            });
+        }
         if let Some(version) = server.version.as_deref() {
             lines.push(OverlayLine {
                 text: format!("Version: {version}"),
@@ -2197,6 +2228,38 @@ mod tests {
                 .text
                 .starts_with("[ ] Browser")
         );
+    }
+
+    /// Claude만 정의 출처를 보내므로, 없을 때 줄이 생기지 않아야 한다.
+    #[test]
+    fn claude_mcp_source_is_shown_and_codex_stays_unchanged() {
+        let detail = |entry: Value| {
+            let mut picker = McpPicker::new(McpServerInfo::list_from_value(&json!({
+                "data": [entry]
+            })));
+            picker.handle_key(press(KeyCode::Enter));
+            picker
+                .overlay_view()
+                .lines
+                .iter()
+                .map(|line| line.text.clone())
+                .collect::<Vec<_>>()
+        };
+        let claude = detail(json!({
+            "name": "github", "authStatus": "unsupported", "tools": {},
+            "status": "connected", "source": "project"
+        }));
+        assert!(claude.iter().any(|text| text == "출처: 프로젝트 설정"));
+        let unknown = detail(json!({
+            "name": "github", "authStatus": "unsupported", "tools": {},
+            "status": "connected", "source": "future"
+        }));
+        assert!(unknown.iter().any(|text| text == "출처: future"));
+        let codex = detail(json!({
+            "name": "github", "authStatus": "unsupported", "tools": {},
+            "runtimeStatus": "connected"
+        }));
+        assert!(!codex.iter().any(|text| text.starts_with("출처: ")));
     }
 
     #[test]

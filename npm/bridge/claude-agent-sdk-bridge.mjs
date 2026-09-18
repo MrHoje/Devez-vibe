@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { createReadStream, existsSync, readFileSync, readdirSync } from "node:fs";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join, resolve as resolvePath, sep } from "node:path";
 import { createInterface } from "node:readline";
@@ -1299,6 +1300,9 @@ function claudeMcpStatusValue(statuses) {
           ? "unsupported"
           : String(server?.status || "unknown"),
       status: String(server?.status || "unknown"),
+      // SDK 0.3.276부터 오는 정의 출처. 이름만으로는 SDK 내장·플러그인·설정을
+      // 구분할 수 없어 그대로 전달한다. 예전 CLI에서는 오지 않는다.
+      ...(server?.source ? { source: String(server.source) } : {}),
       ...(server?.error ? { error: String(server.error) } : {}),
     })),
   };
@@ -2659,6 +2663,27 @@ function cancelUsageLimitWait(session) {
   return true;
 }
 
+// SDK 0.3.276부터 알려진 기동 실패는 사유 코드로 온다. 원문 오류는 영어라
+// 조치를 바로 알기 어려우므로 사유가 있을 때만 앞줄에 한국어 안내를 붙인다.
+const STARTUP_FAILURE_GUIDES = {
+  org_pin_api_key_conflict: "조직 설정이 지정한 로그인 대신 API 키가 설정되어 있습니다. API 키·인증 토큰 환경 변수를 지우고 지정된 계정으로 로그인하세요.",
+  org_verify_failed: "로그인 계정의 조직을 확인하지 못했습니다. 네트워크를 확인하고 다시 로그인하세요.",
+  org_pin_mismatch: "조직 설정이 허용하지 않는 계정으로 로그인되어 있습니다. 허용된 조직 계정으로 다시 로그인하세요.",
+  managed_settings_invalid: "조직 관리 설정을 읽지 못했습니다. 관리자에게 설정 확인을 요청하세요.",
+  remote_settings_required_unavailable: "조직이 요구하는 관리 설정을 불러오지 못했습니다. 네트워크를 확인한 뒤 다시 시작하세요.",
+  gateway_signin_required: "게이트웨이가 이 로그인을 종료했습니다. 다시 로그인하세요.",
+  gateway_access_denied: "게이트웨이가 이 계정의 관리 설정을 거부했습니다. 관리자에게 권한을 요청하세요.",
+  proxy_invalid: "프록시 설정이 올바른 주소 형식이 아닙니다. 프록시 환경 변수를 확인하세요.",
+  temp_dir_unusable: "임시 폴더를 만들지 못했거나 안전하지 않습니다. 사용자 임시 폴더 권한을 확인하세요.",
+  cwd_unavailable: "작업 폴더가 삭제·이동되었거나 읽을 수 없습니다. 폴더를 확인한 뒤 다시 여세요.",
+  shell_tool_missing: "Windows에서 쓸 셸이 없습니다. Git Bash를 설치하거나 PowerShell 사용을 켜세요.",
+  session_held_by_background: "이어받으려는 대화가 백그라운드 세션으로 실행 중입니다. 해당 세션을 끝낸 뒤 다시 시도하세요.",
+  worktree_resume_refused: "워크트리 안전 검사에 걸려 재개가 거부되었습니다. 아래 원문에 워크트리 없이 다시 실행할 수 있는지 나옵니다.",
+  worktree_unverified: "워크트리를 지금 확인하지 못했습니다. 잠시 후 다시 시도하세요.",
+  cli_version_too_old: "Claude Code 버전이 최소 요구 버전보다 낮습니다. dvz update로 갱신하세요.",
+  bypass_root: "관리자 계정에서는 권한 우회 모드로 시작할 수 없습니다. 일반 계정으로 실행하세요.",
+};
+
 async function processResult(session, message) {
   if (!session.turn) return;
   for (const denial of Array.isArray(message.permission_denials) ? message.permission_denials : []) {
@@ -2687,8 +2712,10 @@ async function processResult(session, message) {
       modelContextWindow: totals.contextWindow || session.lastContextWindow || undefined,
     },
   });
+  const detail = message.errors?.join("\n") || message.result || message.stop_reason || "Claude 실행 실패";
+  const guide = STARTUP_FAILURE_GUIDES[message.startup_failure_reason];
   const error = message.is_error && !interrupted
-    ? { message: message.errors?.join("\n") || message.result || message.stop_reason || "Claude 실행 실패" }
+    ? { message: guide ? `${guide}\n${detail}` : detail }
     : null;
   if (error && waitForUsageLimit(session)) return;
   finishTurn(session, error, message.duration_ms);
@@ -3850,7 +3877,21 @@ async function runCommandTimeoutSelfTest() {
   if (quick !== "ok") throw new Error(`Claude command self-test returned ${quick}`);
 }
 
+// 사유가 늘어나면 안내 없이 영어 원문만 남으므로, 설치된 SDK의 목록과 대조한다.
+function startupFailureGuideGaps() {
+  const entry = createRequire(import.meta.url).resolve("@anthropic-ai/claude-agent-sdk");
+  const types = readFileSync(join(dirname(entry), "sdk.d.ts"), "utf8");
+  const union = /SDKStartupFailureReason = ([^;]+);/.exec(types)?.[1] || "";
+  const reasons = [...union.matchAll(/'([a-z_]+)'/g)].map((match) => match[1]);
+  if (!reasons.length) throw new Error("Claude 기동 실패 사유 목록을 읽지 못했습니다.");
+  return reasons.filter((reason) => !STARTUP_FAILURE_GUIDES[reason]);
+}
+
 async function runSelfTest() {
+  const startupGaps = startupFailureGuideGaps();
+  if (startupGaps.length) {
+    throw new Error(`Claude 기동 실패 안내 누락: ${startupGaps.join(", ")}`);
+  }
   await runPermissionModeSelfTest();
   runToolPolicySelfTest();
   await runCommandTimeoutSelfTest();
