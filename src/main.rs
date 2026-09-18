@@ -1740,9 +1740,9 @@ async fn event_loop(
                             {
                                 if let Some(text) = renderer.selected_text() {
                                     // This Ctrl+C is a copy, so it neither arms nor
-                                    // spends the quit.
+                                    // spends the quit. The selection stays so it can be
+                                    // copied again or typed over.
                                     input_state.disarm_quit();
-                                    renderer.clear_selection();
                                     Action::Copy(text)
                                 } else {
                                     // Typing means the drag is over and its highlight is
