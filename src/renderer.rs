@@ -2177,6 +2177,15 @@ impl Renderer {
         let in_panel = self.selection_target_is_panel(column);
         match self.selection.finish(point) {
             SelectionFinish::Copy(range) => {
+                // A drag that stays inside one row of a fold's own target is the
+                // pointer sliding over its text, not a selection: the row answers
+                // a click by expanding, so it keeps doing that here.
+                if !in_panel && self.row_drag_is_on_one_fold(&range) {
+                    // The highlight the drag painted belongs to a selection that
+                    // is not being made, so it goes before the row is expanded.
+                    self.selection.clear();
+                    return SelectionResult::Click(range.start.column, row);
+                }
                 let range = self.widen_to_whole_rows(range);
                 let text = extract_text(&self.copy_lines(), range);
                 if text.trim().is_empty() {
@@ -2194,6 +2203,27 @@ impl Renderer {
             SelectionFinish::Click(cell) => SelectionResult::Click(cell.column, row),
             SelectionFinish::None => SelectionResult::None,
         }
+    }
+
+    /// True when both ends of a drag sit on the same fold target in one row.
+    fn row_drag_is_on_one_fold(&self, range: &CellRange) -> bool {
+        if range.start.row != range.end.row {
+            return false;
+        }
+        let Some(regions) = self
+            .previous_lines
+            .get(range.start.row)
+            .and_then(|line| line.pick.as_ref())
+        else {
+            return false;
+        };
+        let (Some(start), Some(end)) = (
+            regions.at(usize::from(range.start.column)),
+            regions.at(usize::from(range.end.column)),
+        ) else {
+            return false;
+        };
+        start == end && matches!(start, Pick::History(_))
     }
 
     /// True for the panel rows below the changed-file list, where the patch
@@ -28407,6 +28437,38 @@ mod tests {
             frame.cell(1, 0).style.background,
             Some(scroll_to_bottom_background(true))
         );
+    }
+
+    /// Sliding across a folded prompt's own text expands it, as clicking does.
+    #[test]
+    fn dragging_over_folded_prompt_text_expands_instead_of_copying() {
+        let prompt = Block::new(BlockKind::User, "gpt-5.6-sol", "보낸 프롬프트");
+        let progress = Block::progress_group(vec![Block::new(
+            BlockKind::Assistant,
+            "Codex",
+            "접힌 진행 메시지",
+        )]);
+        let progress_id = progress.id();
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.fold_progress_groups = true;
+        renderer.history.extend([prompt, progress]);
+        renderer.last_width = 80;
+        renderer.rewrap(80);
+        renderer.previous_lines = renderer.wrapped.clone();
+
+        let row = renderer
+            .previous_lines
+            .iter()
+            .position(|line| painted(line).contains("보낸 프롬프트"))
+            .expect("folded prompt is visible") as u16;
+        renderer.begin_selection(2, row);
+        renderer.update_selection(9, row);
+        assert_eq!(
+            renderer.finish_selection(9, row),
+            SelectionResult::Click(2, row)
+        );
+        assert_eq!(renderer.selected_text(), None);
+        assert_eq!(renderer.pick_at(9, row), Some(Pick::History(progress_id)));
     }
 
     #[test]
