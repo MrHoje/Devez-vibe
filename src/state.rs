@@ -3583,6 +3583,9 @@ pub struct AppState {
     quit_armed_at: Option<Instant>,
     pub busy: bool,
     host_loading: bool,
+    /// Names the runtime a swap is heading for, so the wait says where the
+    /// session is going instead of reading as a plain session load.
+    provider_changing: Option<&'static str>,
     pub cwd: String,
     account: String,
     models: Vec<ModelInfo>,
@@ -3911,6 +3914,7 @@ impl AppState {
             quit_armed_at: None,
             busy: false,
             host_loading: false,
+            provider_changing: None,
             cwd,
             account,
             models,
@@ -4687,6 +4691,13 @@ impl AppState {
     /// being rebuilt, without treating the composer as an active turn.
     pub fn set_host_loading(&mut self, loading: bool) {
         self.host_loading = loading;
+    }
+
+    /// Switching runtimes waits on a backend launch, so the screen leaves the
+    /// picker at once and names what it is waiting for.
+    pub fn set_provider_changing(&mut self, provider: Option<&'static str>) {
+        self.provider_changing = provider;
+        self.host_loading = provider.is_some();
     }
 
     /// Compaction counts as work for the host tab too: the session is unavailable
@@ -12940,9 +12951,13 @@ impl AppState {
             return Some(notice.to_owned());
         }
         if self.host_loading {
+            let label = match self.provider_changing {
+                Some(provider) => format!("Changing provider to {provider}"),
+                None => "Loading session".to_owned(),
+            };
             // The frame counter runs at 120ms; two frames per dot keeps the
             // cycle readable at roughly one step per quarter second.
-            return Some(format!("Loading session{}", ".".repeat(self.spinner_frame / 2)));
+            return Some(format!("{label}{}", ".".repeat(self.spinner_frame / 2)));
         }
         if self.busy && !self.turn_interrupted {
             if let Some(reset) = self.claude_usage_limit_reset {
@@ -18377,6 +18392,26 @@ mod tests {
             state.render_tick().redraw,
             "animation resumes after leaving the inline answer"
         );
+    }
+
+    /// A runtime swap must read as a provider change, not a session load, and
+    /// the label has to go back once the swap lands.
+    #[test]
+    fn provider_change_names_its_own_wait() {
+        let mut state = test_state();
+
+        state.set_provider_changing(Some("OpenCode"));
+        assert!(state.host_loading());
+        assert_eq!(
+            state.view().activity.as_deref(),
+            Some("Changing provider to OpenCode")
+        );
+
+        state.set_provider_changing(None);
+        assert!(!state.host_loading());
+
+        state.set_host_loading(true);
+        assert_eq!(state.view().activity.as_deref(), Some("Loading session"));
     }
 
     #[test]

@@ -2834,10 +2834,10 @@ async fn execute_action(
         Action::ResumeThread(target) => {
             return resume_thread(server, state, renderer, &target).await;
         }
-        Action::ActivateCodex => activate_codex(server, state).await,
+        Action::ActivateCodex => activate_codex(server, state, renderer).await?,
         Action::ActivateOpenCode => {
             if open_code::has_connected_provider() {
-                activate_open_code(server, state).await;
+                activate_open_code(server, state, renderer).await?;
             } else {
                 open_provider_connection(server, state, renderer).await?;
             }
@@ -2847,6 +2847,11 @@ async fn execute_action(
             connected,
             activate_codex,
         } => {
+            // The pick is already made, so the wait is named before the write:
+            // the row that opened this action must not linger on screen.
+            if activate_codex {
+                begin_provider_change(state, renderer, "Codex")?;
+            }
             match server
                 .request(
                     "config/value/write",
@@ -2856,12 +2861,13 @@ async fn execute_action(
             {
                 Ok(_) => {
                     if activate_codex {
-                        crate::activate_codex(server, state).await;
+                        crate::activate_codex(server, state, renderer).await?;
                     }
                 }
                 Err(error) => {
                     // The switch never reached disk, so the row goes back to what
                     // the next launch will actually read.
+                    state.set_provider_changing(None);
                     state.restore_provider_connection(key_path, !connected);
                     state.clear_pending_provider_model();
                     state.push_notice(
@@ -4044,14 +4050,22 @@ async fn execute_action(
 /// Brings the Codex app-server up and moves the session onto it. Reached from
 /// `/provider`, both when Codex is already connected and right after the pick
 /// that connected it.
-async fn activate_codex(server: &mut BackendServer, state: &mut AppState) {
-    match server.start_codex().await {
-        Ok(()) => match server
-            .request(
+async fn activate_codex(
+    server: &mut BackendServer,
+    state: &mut AppState,
+    renderer: &mut Renderer,
+) -> Result<()> {
+    begin_provider_change(state, renderer, "Codex")?;
+    match await_with_activity(state, renderer, server.start_codex()).await? {
+        Ok(()) => match await_with_activity(
+            state,
+            renderer,
+            server.request(
                 "model/list",
                 json!({ "includeHidden": false, "limit": 100 }),
-            )
-            .await
+            ),
+        )
+        .await?
         {
             Ok(response) => {
                 state.replace_models(parse_models(&response));
@@ -4067,16 +4081,38 @@ async fn activate_codex(server: &mut BackendServer, state: &mut AppState) {
             state.push_notice(BlockKind::Error, "Codex 사용 불가", error.to_string());
         }
     }
+    state.set_provider_changing(None);
+    Ok(())
 }
 
-async fn activate_open_code(server: &mut BackendServer, state: &mut AppState) {
-    match server.start_open_code().await {
-        Ok(()) => match server
-            .request(
+/// A runtime swap waits on a backend launch. The screen leaves the picker right
+/// away and names the wait, so a prompt typed before the pick never looks like
+/// it is still sitting in the composer.
+fn begin_provider_change(
+    state: &mut AppState,
+    renderer: &mut Renderer,
+    provider: &'static str,
+) -> Result<()> {
+    state.set_provider_changing(Some(provider));
+    draw(state, renderer)
+}
+
+async fn activate_open_code(
+    server: &mut BackendServer,
+    state: &mut AppState,
+    renderer: &mut Renderer,
+) -> Result<()> {
+    begin_provider_change(state, renderer, "OpenCode")?;
+    match await_with_activity(state, renderer, server.start_open_code()).await? {
+        Ok(()) => match await_with_activity(
+            state,
+            renderer,
+            server.request(
                 "model/list",
                 json!({ "includeHidden": false, "limit": 100 }),
-            )
-            .await
+            ),
+        )
+        .await?
         {
             Ok(response) => {
                 state.replace_models(parse_models(&response));
@@ -4092,6 +4128,8 @@ async fn activate_open_code(server: &mut BackendServer, state: &mut AppState) {
         },
         Err(error) => state.push_notice(BlockKind::Error, "OpenCode 사용 불가", error.to_string()),
     }
+    state.set_provider_changing(None);
+    Ok(())
 }
 
 async fn open_provider_connection(
