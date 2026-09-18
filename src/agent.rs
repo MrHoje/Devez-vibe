@@ -174,15 +174,16 @@ impl AgentMode {
         let response_rules = match self {
             Self::Standard => {
                 "The current role is Builder. It replaces the previous role's response-length rules \
-                 with the rules below. Korean output, formatting, and preservation of evidence \
-                 follow the shared instructions."
+                 with the rules below. 사용자에게 보이는 모든 문장은 한국어로 쓰고 일본어·중국어·영어 \
+                 문장을 섞지 않는다. 서식과 근거 보존은 공통 지침을 따른다."
             }
             Self::Planner
             | Self::GoalRunner
             | Self::Reviewer
             | Self::Researcher
             | Self::Custom(_) => {
-                "Korean language and formatting rules still apply. Every response-length cap is lifted: \
+                "사용자에게 보이는 모든 문장은 한국어로 쓰고 일본어·중국어·영어 문장을 섞지 않으며 \
+                 서식 규칙도 그대로 적용한다. Every response-length cap is lifted: \
                  preserve all material findings and evidence without padding."
             }
         };
@@ -461,7 +462,7 @@ mod tests {
         let builder = AgentMode::Standard.render_turn_block();
         assert!(!builder.contains("고정 제한을 두지 않는다"));
         assert!(builder.contains("replaces the previous role's response-length rules"));
-        assert!(builder.contains("Korean output, formatting, and preservation of evidence"));
+        assert!(builder.contains("사용자에게 보이는 모든 문장은 한국어로 쓰고"));
         assert!(builder.contains("Answer simple questions and completion reports briefly"));
         assert!(builder.contains("Answer only what was asked"));
         for requirement in [
