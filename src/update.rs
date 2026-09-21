@@ -21,7 +21,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "이미지를 첨부한 상태에서도 Alt+Enter로 프롬프트를 대기열에 넣을 수 있고, 차례가 되면 이미지도 함께 전송됩니다.",
+    "상태줄의 컨텍스트 표시가 응답 중에는 200k, 턴이 끝나면 1,000k처럼 기준이 바뀌어 백분율이 튀던 것을 고쳤습니다. 이제 턴이 끝날 때 확인된 실제 컨텍스트 크기를 같은 모델을 쓰는 동안 계속 사용합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

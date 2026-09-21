@@ -1384,6 +1384,7 @@ async function createSession(params, resumeId) {
     subagentPulse: null,
     lastContextUsage: null,
     lastContextWindow: 0,
+    contextWindowModel: "",
   };
   await ensureClaudeExecutableChoice(params);
   const agentQuery = await startAgentQuery(queue, makeOptions(params, id, resumeId));
@@ -1649,11 +1650,19 @@ function processAssistant(session, message) {
     session.models,
     message.message?.model || session.model,
   );
-  session.lastContextWindow = capabilityContextWindow(
-    capabilities,
-    message.message?.model,
-    session.model,
-  );
+  // The turn's result reports the window the run actually had, and it can differ
+  // from the size guessed from the model name — a 1M tier reads as 200k here.
+  // Keep the measured one while the model stays the same, so the status line
+  // percentage stops swinging between a turn's messages and its result.
+  const contextModel = message.message?.model || session.model;
+  if (contextModel !== session.contextWindowModel || !session.lastContextWindow) {
+    session.contextWindowModel = contextModel;
+    session.lastContextWindow = capabilityContextWindow(
+      capabilities,
+      message.message?.model,
+      session.model,
+    );
+  }
   // Usage used to reach the host only with the turn's result, so a session's
   // first turn read 0k on screen for its whole run. The assistant message
   // already names the window it occupies, so publish it as it lands. No
@@ -2702,14 +2711,16 @@ async function processResult(session, message) {
     totalTokens: sum.totalTokens + Number(usage.inputTokens || 0) + Number(usage.cacheReadInputTokens || 0) + Number(usage.cacheCreationInputTokens || 0) + Number(usage.outputTokens || 0),
     contextWindow: Math.max(sum.contextWindow, Number(usage.contextWindow || 0)),
   }), { inputTokens: 0, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 0, totalTokens: 0, contextWindow: 0 });
+  // `modelUsage` reports the window the turn actually ran under, so it wins over
+  // the size guessed from the model name — and it is remembered for the next
+  // turn's messages too.
+  if (totals.contextWindow > 0) session.lastContextWindow = totals.contextWindow;
   notify("thread/tokenUsage/updated", {
     threadId: session.id,
     tokenUsage: {
       total: totals,
       ...(session.lastContextUsage ? { last: session.lastContextUsage } : {}),
-      // `modelUsage` reports the window the turn actually ran under, so it wins
-      // over the size guessed from the model name.
-      modelContextWindow: totals.contextWindow || session.lastContextWindow || undefined,
+      modelContextWindow: session.lastContextWindow || undefined,
     },
   });
   const detail = message.errors?.join("\n") || message.result || message.stop_reason || "Claude 실행 실패";
@@ -5282,6 +5293,36 @@ async function runSelfTest() {
     || contextEvent.params.tokenUsage.modelContextWindow !== 1_000_000
     || contextEvent.params.tokenUsage.total !== undefined) {
     throw new Error(`Claude mid-turn context self-test failed: ${JSON.stringify(contextEvent)}`);
+  }
+  // The window measured at a turn's result must survive the next message of the
+  // same model — the name alone reads a 1M tier as 200k.
+  openingSession.contextWindowModel = "claude-sonnet-5";
+  openingSession.lastContextWindow = 1_000_000;
+  const measuredCaptured = [];
+  process.stdout.write = (chunk) => {
+    measuredCaptured.push(String(chunk));
+    return true;
+  };
+  try {
+    processAssistant(openingSession, {
+      message: {
+        model: "claude-sonnet-5",
+        usage: { input_tokens: 1_000, output_tokens: 0 },
+        content: [],
+      },
+    });
+  } finally {
+    process.stdout.write = stdoutWrite;
+  }
+  const measuredEvent = measuredCaptured
+    .join("")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+    .find((event) => event.method === "thread/tokenUsage/updated");
+  if (measuredEvent?.params?.tokenUsage?.modelContextWindow !== 1_000_000) {
+    throw new Error(`Claude measured context window self-test failed: ${JSON.stringify(measuredEvent)}`);
   }
   const languageCaptured = [];
   process.stdout.write = (chunk) => {
