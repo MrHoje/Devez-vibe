@@ -3662,6 +3662,9 @@ pub struct AppState {
     plan_shimmer_started_at: Option<Instant>,
     subagents: Vec<RunningSubagent>,
     artifacts: Vec<ArtifactLink>,
+    /// Artifact URLs the user already put away with the row's `✕`, loaded from
+    /// disk so a resume or fork does not republish a row they dismissed.
+    dismissed_artifacts: Vec<String>,
     /// Child threads observed through Codex collaboration events. Unlike the
     /// visible rows, terminal entries stay here until the session changes.
     codex_subagents: HashMap<String, CodexSubagent>,
@@ -3959,6 +3962,7 @@ impl AppState {
             plan_shimmer_started_at: None,
             subagents: Vec::new(),
             artifacts: Vec::new(),
+            dismissed_artifacts: read_dismissed_artifacts(),
             codex_subagents: HashMap::new(),
             subagents_settled_at: None,
             subagent_logs: HashMap::new(),
@@ -9240,7 +9244,11 @@ impl AppState {
                     (!self.busy && !self.subagents.is_empty()).then(Instant::now);
             }
             "turn/artifact/published" => {
-                if let Some(url) = params.get("url").and_then(Value::as_str) {
+                if let Some(url) = params
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .filter(|url| !self.dismissed_artifacts.iter().any(|seen| seen == url))
+                {
                     let path = params
                         .get("path")
                         .and_then(Value::as_str)
@@ -14005,9 +14013,18 @@ impl AppState {
     /// the server is waiting on stays put whatever is clicked.
     /// Opens the transcript panel for the subagent shown on the clicked row. The
     /// panel starts at the newest lines, which is where the work is.
-    /// Puts the artifact row away; the next publish brings it back.
-    pub fn dismiss_artifacts(&mut self) {
-        self.artifacts.clear();
+    /// Puts the artifact row away and reports the URLs that went with it, so the
+    /// caller can remember them: a resumed or forked session republishes its
+    /// transcript's artifacts, and a dismissed row must not come back.
+    pub fn dismiss_artifacts(&mut self) -> Vec<String> {
+        let dismissed = self
+            .artifacts
+            .drain(..)
+            .map(|artifact| artifact.url)
+            .collect::<Vec<_>>();
+        self.dismissed_artifacts =
+            remember_dismissed(std::mem::take(&mut self.dismissed_artifacts), dismissed.clone());
+        dismissed
     }
 
     pub fn open_subagent(&mut self, index: usize) -> Action {
@@ -16845,6 +16862,53 @@ fn read_default_side_panel_width() -> usize {
                 .ok()
         })
         .unwrap_or(crate::renderer::SIDE_PANEL_MIN_WIDTH)
+}
+
+/// Artifacts the user put away with the row's `✕`. A resumed or forked session
+/// republishes its transcript's artifacts, so the dismissal has to outlive the
+/// session to stick; it rides beside the settings file like the panel stages.
+fn dismissed_artifacts_path() -> Option<PathBuf> {
+    vibe_settings_path().and_then(|path| Some(path.parent()?.join("dismissed-artifacts.json")))
+}
+
+/// How many dismissed URLs the file keeps, oldest dropped first.
+const DISMISSED_ARTIFACT_HISTORY: usize = 200;
+
+fn read_dismissed_artifacts() -> Vec<String> {
+    let Some(path) = dismissed_artifacts_path() else {
+        return Vec::new();
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<String>>(&text).unwrap_or_default()
+}
+
+/// Appends the newly dismissed URLs, each at its newest position, and trims the
+/// oldest entries past the history limit.
+fn remember_dismissed(mut kept: Vec<String>, urls: impl IntoIterator<Item = String>) -> Vec<String> {
+    for url in urls {
+        kept.retain(|seen| seen != &url);
+        kept.push(url);
+    }
+    if kept.len() > DISMISSED_ARTIFACT_HISTORY {
+        let excess = kept.len() - DISMISSED_ARTIFACT_HISTORY;
+        kept.drain(0..excess);
+    }
+    kept
+}
+
+pub fn write_dismissed_artifacts(urls: impl IntoIterator<Item = String>) -> std::io::Result<()> {
+    let Some(path) = dismissed_artifacts_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let kept = remember_dismissed(read_dismissed_artifacts(), urls);
+    let text = serde_json::to_string(&kept)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    fs::write(path, text)
 }
 
 /// Where each session's own open/shut state is kept. It is a per-session
@@ -19961,8 +20025,30 @@ mod tests {
             Some("https://claude.ai/code/artifact/a")
         );
 
-        state.dismiss_artifacts();
+        let dismissed = state.dismiss_artifacts();
         assert!(state.artifacts.is_empty());
+        assert_eq!(dismissed.len(), 2);
+
+        // A resume republishes the transcript's artifacts; a dismissed row must
+        // not come back with them.
+        publish(
+            &mut state,
+            "https://claude.ai/code/artifact/a",
+            "Devez test",
+            "C:/tmp/devez-test.html",
+        );
+        publish(
+            &mut state,
+            "https://claude.ai/code/artifact/c",
+            "New page",
+            "C:/tmp/new.html",
+        );
+        let names = state
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["new.html"]);
     }
 
     #[test]

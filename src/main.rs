@@ -2415,7 +2415,7 @@ fn pick_action(state: &mut AppState, pick: Pick) -> Action {
         }
         Pick::OpenLink(target) => Action::OpenUrl(target),
         Pick::DismissArtifacts => {
-            state.dismiss_artifacts();
+            let _ = crate::state::write_dismissed_artifacts(state.dismiss_artifacts());
             Action::Tick(true)
         }
         Pick::AgentMode => state.click_agent_mode(),
