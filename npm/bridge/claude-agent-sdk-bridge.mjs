@@ -428,6 +428,13 @@ function stripClaudeModel(model) {
   return model.startsWith("claude:") ? model.slice("claude:".length) : model;
 }
 
+function forkSessionSelection(params, parent) {
+  return {
+    model: parent?.model || (stripClaudeModel(params.model) ? params.model : (params.fallbackModel || params.model)),
+    effort: parent?.effort || params.effort || params.fallbackEffort,
+  };
+}
+
 function visibleModel(model) {
   if (!model) return "claude:default";
   return model.startsWith("claude:") ? model : `claude:${model}`;
@@ -3722,14 +3729,13 @@ async function dispatch(method, params = {}) {
     const source = liveSessionId(params.sessionId);
     const forked = await forkSession(source, { dir: await readableCwd(source, params.cwd) });
     const id = forked.sessionId || forked;
-    // A fork continues the thread it branched from, so the parent's own model and
-    // effort outrank the host's fallback: without this the new session opens on
-    // the model default instead of what the parent was running.
+    // The live source is authoritative. A host can carry startup defaults while
+    // the source has since changed model or effort.
     const parent = sessions.get(source);
+    const selection = forkSessionSelection(params, parent);
     const { session, account, usage } = await createSession({
       ...params,
-      model: stripClaudeModel(params.model) ? params.model : (parent?.model || params.fallbackModel || params.model),
-      effort: params.effort || parent?.effort || params.fallbackEffort,
+      ...selection,
     }, id);
     return {
       id,
@@ -4383,6 +4389,13 @@ async function runSelfTest() {
       "max",
     ) !== "max") {
     throw new Error(`Claude pinned model self-test failed: ${JSON.stringify(catalog)}`);
+  }
+  const inheritedFork = forkSessionSelection(
+    { model: "claude:sonnet", effort: "high" },
+    { model: "claude:opus", effort: "max" },
+  );
+  if (inheritedFork.model !== "claude:opus" || inheritedFork.effort !== "max") {
+    throw new Error(`Claude fork selection self-test failed: ${JSON.stringify(inheritedFork)}`);
   }
   const notification = taskNotifications({
     origin: { kind: "task-notification" },

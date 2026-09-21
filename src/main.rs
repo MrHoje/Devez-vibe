@@ -1357,16 +1357,7 @@ async fn open_btw(
     let response = server
         .request(
             "thread/fork",
-            json!({
-                "threadId": main.thread_id,
-                "model": main.selected_model_name(),
-                "effort": main.selected_effort(),
-                "claudeDeveloperInstructions": CLAUDE_DEVEZ_INSTRUCTIONS,
-                "serviceTier": main.service_tier(),
-                "ephemeral": true,
-                "excludeTurns": true,
-                "threadSource": "devez-vibe"
-            }),
+            thread_fork_params(main, None, true),
         )
         .await;
     let response = match response {
@@ -2653,18 +2644,26 @@ fn start_self_update(sender: mpsc::UnboundedSender<ManagementUpdate>) {
     });
 }
 
-fn worktree_fork_params(state: &AppState, path: &Path) -> Value {
-    json!({
+fn thread_fork_params(state: &AppState, cwd: Option<&Path>, ephemeral: bool) -> Value {
+    let mut params = json!({
         "threadId": state.thread_id,
-        "cwd": path,
         "model": state.selected_model_name(),
         "effort": state.selected_effort(),
+        "config": { "model_reasoning_effort": state.selected_effort() },
         "claudeDeveloperInstructions": CLAUDE_DEVEZ_INSTRUCTIONS,
         "serviceTier": state.service_tier(),
-        "ephemeral": false,
+        "ephemeral": ephemeral,
         "excludeTurns": true,
         "threadSource": "devez-vibe"
-    })
+    });
+    if let Some(cwd) = cwd {
+        params["cwd"] = json!(cwd);
+    }
+    params
+}
+
+fn worktree_fork_params(state: &AppState, path: &Path) -> Value {
+    thread_fork_params(state, Some(path), false)
 }
 
 async fn execute_action(
@@ -3058,16 +3057,7 @@ async fn execute_action(
             let response = server
                 .request(
                     "thread/fork",
-                    json!({
-                        "threadId": state.thread_id,
-                        "model": state.selected_model_name(),
-                        "effort": state.selected_effort(),
-                        "claudeDeveloperInstructions": CLAUDE_DEVEZ_INSTRUCTIONS,
-                        "serviceTier": state.service_tier(),
-                        "ephemeral": true,
-                        "excludeTurns": true,
-                        "threadSource": "devez-vibe"
-                    }),
+                    thread_fork_params(state, None, true),
                 )
                 .await;
             match response {
@@ -8094,6 +8084,9 @@ mod tests {
         assert_eq!(params["threadId"], "parent-thread");
         assert_eq!(params["cwd"], cwd);
         assert_eq!(params["ephemeral"], false);
+        assert_eq!(params["model"], model);
+        assert_eq!(params["effort"], effort);
+        assert_eq!(params["config"]["model_reasoning_effort"], effort);
         state.attach_thread(String::new(), cwd.to_owned(), &model, Some(&effort));
         state.begin_thread_switch();
         assert!(state.drain_committed().iter().any(|block| block.body == "유지할 대화 내용"));
