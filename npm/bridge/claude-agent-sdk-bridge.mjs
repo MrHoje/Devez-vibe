@@ -2999,7 +2999,10 @@ async function steerPrompt(params) {
 
 async function runPrompt(session, params) {
   const id = session.id;
-  if (params.model) {
+  // The session already runs this model when it started on it (a fork inherits
+  // the parent's), and re-setting it makes the CLI probe the API again, which
+  // fails the whole prompt when that check times out.
+  if (params.model && visibleModel(params.model) !== session.model) {
     const model = stripClaudeModel(params.model);
     await session.query.setModel(model);
     session.model = visibleModel(params.model);

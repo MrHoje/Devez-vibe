@@ -21,7 +21,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "세션을 분리할 때 부모 세션의 모델과 추론 수준을 Claude와 Codex에서 그대로 이어갑니다.",
+    "세션을 분기한 뒤 첫 요청이 모델 확인 실패로 거부되던 문제를 고쳤습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.
