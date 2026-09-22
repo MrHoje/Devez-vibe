@@ -21,7 +21,9 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "세션을 분기한 뒤 첫 요청이 모델 확인 실패로 거부되던 문제를 고쳤습니다.",
+    "긴 대화에서 오래된 화면 기록을 자동으로 덜어내 출력·재개 화면의 처리 부담을 줄였습니다.",
+    "응답이 밀려도 남은 글자를 한꺼번에 표시하지 않고 나누어 표시합니다.",
+    "Ctrl+Backspace가 선택 영역을 먼저 지우고 공백·단어·문장부호·줄바꿈을 각각 나누어 지웁니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

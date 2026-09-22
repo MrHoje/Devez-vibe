@@ -220,6 +220,9 @@ const CHAT_BUBBLE_PADDING: usize = 1;
 const CHAT_BUBBLE_RIGHT_GAP: usize = 1;
 /// History stays readable while sitting a little behind the prompt text.
 const HISTORY_LABEL_MUTED_BLEND: u8 = 120;
+const TRANSCRIPT_HISTORY_MAX_BYTES: usize = 4 * 1024 * 1024;
+const TRANSCRIPT_HISTORY_MAX_BLOCKS: usize = 512;
+const TRANSCRIPT_OMITTED_TITLE: &str = "이전 화면 기록 생략 · 원본 대화는 보존됨";
 
 impl Block {
     pub fn new(kind: BlockKind, title: impl Into<String>, body: impl Into<String>) -> Self {
@@ -786,6 +789,9 @@ pub struct Renderer {
     question_overlay_open: bool,
     theme: ThemeKind,
     history: Vec<Block>,
+    /// Unwrapped originals for provider handoff and its durable sidecar. Display
+    /// eviction must never erase the conversation used by another provider.
+    handoff_history: Vec<Block>,
     /// Transcript owned by the lower `/btw` pane while split view is open.
     split_history: Vec<Block>,
     split_active: bool,
@@ -1430,6 +1436,130 @@ fn merge_history_block(history: &mut Vec<Block>, incoming: Block) -> bool {
     true
 }
 
+fn block_history_usage(block: &Block) -> (usize, usize) {
+    block.children.iter().fold(
+        (1, block.title.len() + block.body.len()),
+        |(blocks, bytes), child| {
+            let (child_blocks, child_bytes) = block_history_usage(child);
+            (blocks + child_blocks, bytes + child_bytes)
+        },
+    )
+}
+
+fn is_transcript_omission_marker(block: &Block) -> bool {
+    block.id() == 0
+        && matches!(block.kind, BlockKind::System)
+        && block.title == TRANSCRIPT_OMITTED_TITLE
+}
+
+fn transcript_history_usage(history: &[Block]) -> (usize, usize) {
+    history
+        .iter()
+        .filter(|block| !is_transcript_omission_marker(block))
+        .fold((0, 0), |(blocks, bytes), block| {
+            let (block_count, block_bytes) = block_history_usage(block);
+            (blocks + block_count, bytes + block_bytes)
+        })
+}
+
+/// A single prompt or nested result must not bypass the display budget. Only
+/// display copies are shortened; handoff_history retains the original content.
+fn fit_history_block(block: &mut Block, blocks: &mut usize, bytes: &mut usize) -> bool {
+    *blocks = blocks.saturating_sub(1);
+    let mut changed = false;
+    for text in [&mut block.title, &mut block.body] {
+        if text.len() > *bytes {
+            let mut start = text.len() - *bytes;
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
+            *text = text[start..].to_owned();
+            changed = true;
+        }
+        *bytes -= text.len();
+    }
+    let mut start = block.children.len();
+    for child in block.children.iter_mut().rev() {
+        if *blocks == 0 || *bytes == 0 {
+            break;
+        }
+        changed |= fit_history_block(child, blocks, bytes);
+        start -= 1;
+    }
+    if start > 0 {
+        block.children.drain(..start);
+        changed = true;
+    }
+    changed
+}
+
+/// Remove old prompt groups in one pass. An oversized latest group retains its
+/// prompt and newest results, including a bounded suffix of nested tool output.
+fn trim_transcript_history(
+    history: &mut Vec<Block>,
+    max_blocks: usize,
+    max_bytes: usize,
+) -> bool {
+    let marker_present = history.first().is_some_and(is_transcript_omission_marker);
+    let payload_start = usize::from(marker_present);
+    let mut changed = false;
+
+    for block in &mut history[payload_start..] {
+        changed |= fit_history_block(block, &mut (max_blocks / 2).max(1), &mut (max_bytes / 2));
+    }
+    let mut usage = (0, 0);
+    let mut start = history.len();
+    for block in history[payload_start..].iter().rev() {
+        let next = block_history_usage(block);
+        if usage.0 + next.0 > max_blocks || usage.1 + next.1 > max_bytes {
+            break;
+        }
+        usage.0 += next.0;
+        usage.1 += next.1;
+        start -= 1;
+    }
+    if start > payload_start {
+        let is_prompt = |block: &Block| matches!(block.kind, BlockKind::User)
+            && block.children.is_empty() && block.title != "질문 답변";
+        if let Some(offset) = history[start..].iter().position(is_prompt) {
+            start += offset;
+            history.drain(payload_start..start);
+        } else {
+            let prompt = history[payload_start..start].iter().rposition(is_prompt)
+                .map(|index| payload_start + index);
+            if let Some(prompt) = prompt {
+                let prompt_usage = block_history_usage(&history[prompt]);
+                while start < history.len() - 1
+                    && (usage.0 + prompt_usage.0 > max_blocks || usage.1 + prompt_usage.1 > max_bytes)
+                {
+                    let removed = block_history_usage(&history[start]);
+                    usage.0 -= removed.0;
+                    usage.1 -= removed.1;
+                    start += 1;
+                }
+                history.drain(prompt + 1..start);
+                history.drain(payload_start..prompt);
+            } else {
+                history.drain(payload_start..start);
+            }
+        }
+        changed = true;
+    }
+
+    if changed && !marker_present {
+        let mut marker = Block::new(BlockKind::System, TRANSCRIPT_OMITTED_TITLE, "");
+        // The marker is screen chrome, not conversation history. Keeping its id
+        // below real blocks prevents provider handoff cursors from skipping work.
+        marker.id = 0;
+        history.insert(0, marker);
+    }
+    changed
+}
+
+fn block_contains_id(block: &Block, id: u64) -> bool {
+    block.id() == id || block.children.iter().any(|child| block_contains_id(child, id))
+}
+
 /// Appends one rendered transcript block and returns the rows it owns. OpenCode
 /// sends each progress update as a separate assistant item, so adjacent updates
 /// share one line break instead of each keeping a standalone separator row.
@@ -1525,6 +1655,7 @@ impl Renderer {
             question_overlay_open: false,
             theme: selected_theme,
             history: Vec::new(),
+            handoff_history: Vec::new(),
             split_history: Vec::new(),
             split_active: false,
             split_focus: SplitFocus::Main,
@@ -1621,7 +1752,7 @@ impl Renderer {
     /// keeps the portable, user-visible part of the transcript available for a
     /// handoff while leaving welcome cards and local UI notices behind.
     pub fn provider_handoff_blocks(&self) -> Vec<ProviderHandoffBlock> {
-        self.history
+        self.handoff_history
             .iter()
             .flat_map(|block| {
                 if matches!(block.kind, BlockKind::ProgressGroup) {
@@ -1640,7 +1771,7 @@ impl Renderer {
     }
 
     pub fn last_history_block_id(&self) -> u64 {
-        self.history.iter().map(Block::id).max().unwrap_or_default()
+        self.handoff_history.iter().map(Block::id).max().unwrap_or_default()
     }
 
     /// Removes prompt cards that were already committed before an early
@@ -1651,6 +1782,7 @@ impl Renderer {
             return Ok(());
         }
         let block_ids = block_ids.iter().copied().collect::<HashSet<_>>();
+        self.handoff_history.retain(|block| !block_ids.contains(&block.id()));
         let before = self.history.len();
         self.history
             .retain(|block| !block_ids.contains(&block.id()));
@@ -1919,6 +2051,7 @@ impl Renderer {
 
     pub fn clear_screen(&mut self) -> Result<()> {
         self.history.clear();
+        self.handoff_history.clear();
         self.split_history.clear();
         self.split_active = false;
         self.split_main_rows = 0;
@@ -2788,9 +2921,38 @@ impl Renderer {
     }
 
     fn record_inline_history(&mut self, committed: &[Block]) {
+        self.record_handoff_history(committed);
         for block in committed.iter().cloned() {
             merge_history_block(&mut self.history, block);
         }
+        self.trim_main_history();
+    }
+
+    fn record_handoff_history(&mut self, committed: &[Block]) {
+        for block in committed.iter().cloned() {
+            merge_history_block(&mut self.handoff_history, block);
+        }
+    }
+
+    fn trim_main_history(&mut self) -> bool {
+        if !trim_transcript_history(
+            &mut self.history,
+            TRANSCRIPT_HISTORY_MAX_BLOCKS,
+            TRANSCRIPT_HISTORY_MAX_BYTES,
+        ) {
+            return false;
+        }
+        self.expanded_tools
+            .retain(|id| self.history.iter().any(|block| block_contains_id(block, *id)));
+        if self.selection_in_transcript {
+            self.selection.clear();
+            self.selection_in_transcript = false;
+        }
+        self.history_view_rows_anchor = None;
+        self.history_view_start_anchor = None;
+        self.reusable_display_prefix = 0;
+        self.live_frame_cache = None;
+        true
     }
 
     fn response_reveal_for(&self, block_id: u64) -> Option<f32> {
@@ -3255,11 +3417,24 @@ impl Renderer {
         self.split_focus = focus;
         self.side_panel = None;
 
+        self.record_handoff_history(main_committed);
         for block in main_committed.iter().cloned() {
             merge_history_block(&mut self.history, block);
         }
         for block in btw_committed.iter().cloned() {
             merge_history_block(&mut self.split_history, block);
+        }
+        if self.trim_main_history() {
+            self.split_main_scroll_back = 0;
+        }
+        if trim_transcript_history(
+            &mut self.split_history,
+            TRANSCRIPT_HISTORY_MAX_BLOCKS,
+            TRANSCRIPT_HISTORY_MAX_BYTES,
+        ) {
+            self.split_btw_scroll_back = 0;
+            self.selection.clear();
+            self.split_selection_focus = None;
         }
 
         let main_rows = height / 2;
@@ -3944,11 +4119,33 @@ impl Renderer {
         view_rows: usize,
         already_visible: &HashMap<u64, usize>,
     ) {
+        self.record_handoff_history(committed);
+        if committed.is_empty() && self.wrapped_width == width {
+            return;
+        }
+        let existing = transcript_history_usage(&self.history);
+        let added = transcript_history_usage(committed);
+        if existing.0 + added.0 > TRANSCRIPT_HISTORY_MAX_BLOCKS
+            || existing.1 + added.1 > TRANSCRIPT_HISTORY_MAX_BYTES
+            || committed.iter().any(|block| {
+                let usage = block_history_usage(block);
+                usage.0 > TRANSCRIPT_HISTORY_MAX_BLOCKS / 2
+                    || usage.1 > TRANSCRIPT_HISTORY_MAX_BYTES / 2
+            })
+        {
+            for block in committed.iter().cloned() {
+                merge_history_block(&mut self.history, block);
+            }
+            self.trim_main_history();
+            self.rewrap(width);
+            return;
+        }
         if self.wrapped_width != width {
             let before = self.wrapped.len();
             for block in committed.iter().cloned() {
                 merge_history_block(&mut self.history, block);
             }
+            self.trim_main_history();
             self.rewrap(width);
             if self.scroll_back > 0 {
                 let transferred = committed
@@ -4057,6 +4254,9 @@ impl Renderer {
                     self.scroll_back = self.scroll_back.saturating_add_signed(row_delta);
                 }
             }
+        }
+        if self.trim_main_history() {
+            self.rewrap(width);
         }
     }
 
@@ -29159,6 +29359,7 @@ mod tests {
             Block::new(BlockKind::Tool, "Shell", "cargo test"),
             Block::new(BlockKind::ModelChange, "Provider", "Codex"),
         ];
+        renderer.record_handoff_history(&renderer.history.clone());
 
         let blocks = renderer.provider_handoff_blocks();
 
@@ -29167,6 +29368,110 @@ mod tests {
         assert_eq!(blocks[1].kind, "assistant");
         assert_eq!(blocks[2].kind, "tool");
         assert_eq!(renderer.last_history_block_id(), renderer.history[4].id());
+    }
+
+    #[test]
+    fn transcript_cache_drops_whole_old_prompt_groups() {
+        let old_prompt = Block::new(BlockKind::User, "Codex", "old prompt");
+        let old_answer = Block::new(BlockKind::Assistant, "Codex", "old answer");
+        let new_prompt = Block::new(BlockKind::User, "Codex", "new prompt");
+        let new_answer = Block::new(BlockKind::Assistant, "Codex", "new answer");
+        let newest_id = new_answer.id();
+        let mut history = vec![old_prompt, old_answer, new_prompt, new_answer];
+
+        assert!(trim_transcript_history(&mut history, 2, usize::MAX));
+
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].title, TRANSCRIPT_OMITTED_TITLE);
+        assert_eq!(history[0].id(), 0);
+        assert_eq!(history[1].body, "new prompt");
+        assert_eq!(history[2].body, "new answer");
+        assert_eq!(history.iter().map(Block::id).max(), Some(newest_id));
+    }
+
+    #[test]
+    fn oversized_latest_turn_keeps_its_prompt_and_newest_result() {
+        let prompt = Block::new(BlockKind::User, "Codex", "keep prompt");
+        let intermediate = Block::new(BlockKind::Tool, "Shell", "x".repeat(200));
+        let answer = Block::new(BlockKind::Assistant, "Codex", "keep answer");
+        let keep_bytes = block_history_usage(&prompt).1 + block_history_usage(&answer).1;
+        let mut history = vec![prompt, intermediate, answer];
+
+        assert!(trim_transcript_history(
+            &mut history,
+            usize::MAX,
+            keep_bytes
+        ));
+
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].title, TRANSCRIPT_OMITTED_TITLE);
+        assert_eq!(history[1].body, "keep prompt");
+        assert_eq!(history[2].body, "keep answer");
+    }
+
+    #[test]
+    fn transcript_cache_bounds_nested_results_and_unicode_but_preserves_handoff() {
+        let prompt = Block::new(BlockKind::User, "Codex", "질문".repeat(100));
+        let children = (0..80).map(|n| Block::new(BlockKind::Tool, "도구", format!("{n} {}", "한글".repeat(20)))).collect();
+        let group = Block::progress_group(children);
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        renderer.record_inline_history(&[prompt.clone(), group.clone()]);
+        assert!(trim_transcript_history(&mut renderer.history, 20, 400));
+        let usage = transcript_history_usage(&renderer.history);
+        assert!(usage.0 <= 20 && usage.1 <= 400, "{usage:?}");
+        assert!(renderer.history.last().unwrap().children.last().unwrap().body.contains("79 "));
+        let handoff = renderer.provider_handoff_blocks();
+        assert_eq!(handoff.len(), 81);
+        assert_eq!(handoff[0].body, prompt.body);
+        assert_eq!(handoff[80].body, group.children[79].body);
+        // Replacing a grouped result must not resurrect trimmed display data in
+        // the canonical transcript or duplicate provider handoff entries.
+        renderer.record_inline_history(&[group]);
+        assert_eq!(renderer.provider_handoff_blocks().len(), 81);
+    }
+
+    #[test]
+    fn long_transcript_cache_stays_bounded_across_append_resize_and_selection() {
+        let mut renderer = Renderer::new(ThemeKind::Minimal, RenderMode::Fullscreen);
+        let blocks = (0..2000).flat_map(|n| [
+            Block::new(BlockKind::User, "Codex", format!("질문 {n}")),
+            Block::new(BlockKind::Assistant, "Codex", format!("응답 {n}")),
+        ]).collect::<Vec<_>>();
+        let started = Instant::now();
+        renderer.commit_fullscreen_blocks(&blocks, 80, 20);
+        let load = started.elapsed();
+        assert!(transcript_history_usage(&renderer.history).0 <= TRANSCRIPT_HISTORY_MAX_BLOCKS);
+        assert_eq!(renderer.provider_handoff_blocks().len(), 4000);
+        assert_eq!(renderer.history.last().unwrap().body, "응답 1999");
+        let wrapped_len = renderer.wrapped.len();
+        let started = Instant::now();
+        for _ in 0..1000 {
+            renderer.commit_fullscreen_blocks(&[], 80, 20);
+        }
+        eprintln!("history_load_us={} unchanged_1000_us={} wrapped_rows={wrapped_len}", load.as_micros(), started.elapsed().as_micros());
+        assert_eq!(renderer.wrapped.len(), wrapped_len);
+        renderer.scroll_back = 10;
+        renderer.commit_fullscreen_blocks(&[], 40, 20);
+        assert!(renderer.scroll_back > 0);
+        let new = Block::new(BlockKind::User, "Codex", "새 질문");
+        renderer.commit_fullscreen_blocks(std::slice::from_ref(&new), 40, 20);
+        renderer.remove_history_blocks(&[new.id()]).unwrap();
+        assert!(!renderer.provider_handoff_blocks().iter().any(|block| block.id == new.id()));
+        assert_eq!(renderer.last_history_block_id(), blocks.last().unwrap().id());
+    }
+
+    #[test]
+    fn transcript_cache_question_answers_do_not_split_a_prompt_group() {
+        let mut history = vec![
+            Block::new(BlockKind::User, "Codex", "original prompt"),
+            Block::new(BlockKind::Tool, "tool", "old work"),
+            Block::question_answers(vec![("question".into(), "answer".into())]),
+            Block::new(BlockKind::Assistant, "Codex", "latest"),
+        ];
+        trim_transcript_history(&mut history, 3, usize::MAX);
+        assert_eq!(history[1].body, "original prompt");
+        assert_eq!(history.last().unwrap().body, "latest");
+        assert!(transcript_history_usage(&history).0 <= 3);
     }
 
     #[test]

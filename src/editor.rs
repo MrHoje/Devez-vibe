@@ -492,15 +492,28 @@ impl Editor {
     }
 
     fn move_word_left_for_delete(&mut self) {
-        while self.cursor > 0 && self.buffer[self.cursor - 1].is_whitespace() {
-            self.cursor -= 1;
+        let inline_whitespace = |ch: char| ch.is_whitespace() && !matches!(ch, '\n' | '\r');
+        if self.cursor > 0 && inline_whitespace(self.buffer[self.cursor - 1]) {
+            while self.cursor > 0 && inline_whitespace(self.buffer[self.cursor - 1]) {
+                self.cursor -= 1;
+            }
+            return;
         }
-        if self.cursor > 0 && matches!(self.buffer[self.cursor - 1], '/' | '\\') {
+        if self.cursor > 0 && matches!(self.buffer[self.cursor - 1], '\n' | '\r') {
             self.cursor -= 1;
+            if self.cursor > 0
+                && self.buffer[self.cursor] == '\n'
+                && self.buffer[self.cursor - 1] == '\r'
+            {
+                self.cursor -= 1;
+            }
+            return;
         }
+        let alphanumeric = self.buffer[self.cursor - 1].is_alphanumeric();
         while self.cursor > 0
             && !self.buffer[self.cursor - 1].is_whitespace()
-            && !matches!(self.buffer[self.cursor - 1], '/' | '\\')
+            && self.buffer[self.cursor - 1] != ATTACHMENT_PLACEHOLDER
+            && self.buffer[self.cursor - 1].is_alphanumeric() == alphanumeric
         {
             self.cursor -= 1;
         }
@@ -803,7 +816,41 @@ mod tests {
     }
 
     #[test]
-    fn delete_word_left_removes_path_segments_one_at_a_time() {
+    fn delete_word_left_after_whitespace_keeps_the_previous_word() {
+        let mut editor = Editor::default();
+        editor.set_text("                if ");
+
+        editor.delete_word_left();
+
+        assert_eq!(editor.text(), "                if");
+    }
+
+    #[test]
+    fn delete_word_left_separates_words_punctuation_and_paragraph_ends() {
+        let mut editor = Editor::default();
+        editor.set_text("call(value);\n");
+
+        editor.delete_word_left();
+        assert_eq!(editor.text(), "call(value);");
+        editor.delete_word_left();
+        assert_eq!(editor.text(), "call(value");
+        editor.delete_word_left();
+        assert_eq!(editor.text(), "call(");
+    }
+
+    #[test]
+    fn delete_word_left_treats_underscore_as_punctuation() {
+        let mut editor = Editor::default();
+        editor.set_text("send_no");
+
+        editor.delete_word_left();
+        assert_eq!(editor.text(), "send_");
+        editor.delete_word_left();
+        assert_eq!(editor.text(), "send");
+    }
+
+    #[test]
+    fn delete_word_left_separates_path_words_and_punctuation() {
         let mut editor = Editor::default();
         editor.set_text("C:/Source/devezcode");
 
@@ -811,7 +858,13 @@ mod tests {
         assert_eq!(editor.text(), "C:/Source/");
 
         editor.delete_word_left();
+        assert_eq!(editor.text(), "C:/Source");
+
+        editor.delete_word_left();
         assert_eq!(editor.text(), "C:/");
+
+        editor.delete_word_left();
+        assert_eq!(editor.text(), "C");
 
         editor.delete_word_left();
         assert_eq!(editor.text(), "");

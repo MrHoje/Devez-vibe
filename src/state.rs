@@ -64,6 +64,9 @@ const DIFF_REFERENCE_LIMIT: usize = 2_000;
 /// A second Ctrl+C only quits while its warning is still on screen, so the
 /// armed state and the notice share one window.
 const QUIT_ARM_WINDOW: Duration = Duration::from_secs(3);
+/// Synthetic Korean-IME repeats arrive with the initial chord. A held key's
+/// first Windows repeat starts later, after the configured keyboard delay.
+const CTRL_BACKSPACE_REPEAT_DELAY: Duration = Duration::from_millis(200);
 /// How quiet a turn has to go before the runtime is asked whether it is still
 /// running. Long enough that an ordinary think never triggers it.
 const TURN_STALL_SILENCE: Duration = Duration::from_secs(20);
@@ -1398,6 +1401,8 @@ const STREAM_RATE_DECAY: f32 = 1.5;
 /// A stall — a slow repaint, a descheduled loop — must not turn into one large
 /// reveal once the loop comes back.
 const STREAM_MAX_STEP: Duration = Duration::from_millis(40);
+const STREAM_CATCH_UP_CLUSTERS: usize = 512;
+const STREAM_CATCH_UP_LINES: usize = 8;
 
 /// How many characters at the end of the streamed text are still rising toward
 /// full strength, and how fast that tail retreats. A longer tail spreads the rise
@@ -1408,10 +1413,6 @@ const STREAM_FADE_MAX_TAIL: f32 = 14.0;
 /// at, so the tail keeps its length while an answer flows and takes a moment to
 /// clear once it ends instead of snapping to full strength.
 const STREAM_FADE_SPEED: f32 = 40.0;
-/// How long a finishing notice may wait for the text ahead of it. A provider can
-/// hand over a long tail at once, and a turn that looks stuck is worse than a
-/// last line that lands whole.
-const HELD_NOTIFICATION_LIMIT: Duration = Duration::from_millis(1500);
 /// Keep the fully revealed live answer on screen for at least one terminal paint
 /// before its completion moves the same text into transcript history. The main
 /// loop runs this pass every 4 ms; five quiet passes clear a 60 Hz paint boundary.
@@ -1451,6 +1452,23 @@ struct TextPace {
 }
 
 impl TextPace {
+    fn take_catch_up(&mut self, clusters: &mut usize, lines: &mut usize, visible_end: usize) -> Option<String> {
+        if self.pending.is_empty() || *clusters == 0 || *lines == 0 {
+            return None;
+        }
+        let end = visible_cluster_end(&self.pending[..visible_end.min(self.pending.len())], *clusters);
+        if end == 0 {
+            return None;
+        }
+        let end = self.pending[..end].match_indices('\n').nth(*lines - 1)
+            .map_or(end, |(index, _)| index + 1);
+        let chunk = self.pending.drain(..end).collect::<String>();
+        *clusters -= visible_cluster_count(&chunk);
+        *lines -= chunk.bytes().filter(|byte| *byte == b'\n').count();
+        self.carry = 0.0;
+        Some(chunk)
+    }
+
     fn push(&mut self, delta: &str) {
         self.pending.push_str(delta);
     }
@@ -3533,6 +3551,8 @@ pub struct AppState {
     stashed_prompt: Option<StashedPrompt>,
     composer_undo: VecDeque<ComposerEdit>,
     composer_redo: Vec<ComposerEdit>,
+    ctrl_backspace_pressed_at: Option<Instant>,
+    ctrl_backspace_repeating: bool,
     queued_prompts: VecDeque<QueuedPrompt>,
     /// The next turn_input belongs to a queued text, not the current draft.
     queued_input_pending: bool,
@@ -3895,6 +3915,8 @@ impl AppState {
             stashed_prompt: None,
             composer_undo: VecDeque::new(),
             composer_redo: Vec::new(),
+            ctrl_backspace_pressed_at: None,
+            ctrl_backspace_repeating: false,
             queued_prompts: VecDeque::new(),
             pending_async_answer: None,
             queued_input_pending: false,
@@ -6001,7 +6023,7 @@ impl AppState {
     /// The answer decides whether the wait ends — silence alone never does, since
     /// a long think looks exactly the same from here.
     pub fn take_stall_probe(&mut self) -> Option<String> {
-        if !self.busy || self.compacting() || self.awaiting_input() {
+        if !self.busy || self.compacting() || self.awaiting_input() || self.stream_events_pending() {
             self.stall_probe_at = None;
             return None;
         }
@@ -7443,6 +7465,11 @@ impl AppState {
         }
     }
 
+    pub(crate) fn begin_ctrl_backspace_repeat(&mut self) {
+        self.ctrl_backspace_pressed_at = Some(Instant::now());
+        self.ctrl_backspace_repeating = false;
+    }
+
     fn sync_composer_images_after_history_navigation(&mut self) {
         let placeholders = self
             .editor
@@ -7503,6 +7530,14 @@ impl AppState {
     }
 
     fn handle_key_inner(&mut self, key: KeyEvent) -> Action {
+        let ctrl_backspace = (key.code == KeyCode::Backspace
+            && key.modifiers.contains(KeyModifiers::CONTROL))
+            || key.code == KeyCode::Char('\u{8}');
+        if matches!(key.kind, KeyEventKind::Release) && ctrl_backspace {
+            self.ctrl_backspace_pressed_at = None;
+            self.ctrl_backspace_repeating = false;
+            return Action::None;
+        }
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return Action::None;
         }
@@ -7516,14 +7551,21 @@ impl AppState {
             self.disarm_quit();
             return Action::ReturnFromSide;
         }
-        // Windows Korean IMEs may turn one Ctrl+Backspace chord into a stream
-        // of repeat records while dismantling a composed syllable. A word
-        // delete must stay one atomic editor operation.
-        if matches!(key.kind, KeyEventKind::Repeat)
-            && ((key.code == KeyCode::Backspace && key.modifiers.contains(KeyModifiers::CONTROL))
-                || key.code == KeyCode::Char('\u{8}'))
-        {
-            return Action::None;
+        if ctrl_backspace {
+            if matches!(key.kind, KeyEventKind::Press) {
+                self.begin_ctrl_backspace_repeat();
+            } else if !self.ctrl_backspace_repeating {
+                if self
+                    .ctrl_backspace_pressed_at
+                    .is_some_and(|pressed| pressed.elapsed() < CTRL_BACKSPACE_REPEAT_DELAY)
+                {
+                    return Action::None;
+                }
+                self.ctrl_backspace_repeating = true;
+            }
+        } else if matches!(key.kind, KeyEventKind::Press) {
+            self.ctrl_backspace_pressed_at = None;
+            self.ctrl_backspace_repeating = false;
         }
         if self.pending.is_some() {
             return self.handle_pending_key(key);
@@ -8925,6 +8967,10 @@ impl AppState {
             .any(|active| !active.pace.pending.is_empty())
     }
 
+    pub fn stream_events_pending(&self) -> bool {
+        self.stream_text_pending() || !self.held_notifications.is_empty()
+    }
+
     fn hold_notification(&mut self, method: &str, params: &Value) {
         if self.held_notifications.is_empty() {
             self.held_since = Some(Instant::now());
@@ -8934,23 +8980,16 @@ impl AppState {
             .push((method.to_owned(), params.clone()));
     }
 
-    /// Deliver the held notices once the text they follow has all appeared, or
-    /// once the wait has run long enough that holding them is the bigger problem.
+    /// Deliver held notices only after the text ahead of them has appeared. A
+    /// wall-clock deadline used to flush the whole remainder after a slow frame,
+    /// which produced the visible pause followed by one large output jump.
     fn release_held_notifications(&mut self, revealed_text: bool) -> (bool, bool) {
         if self.held_notifications.is_empty() {
             self.held_final_frame_ticks = 0;
             return (false, false);
         }
-        let expired = self
-            .held_since
-            .is_some_and(|since| since.elapsed() >= HELD_NOTIFICATION_LIMIT);
-        if self.stream_text_pending() && !expired {
-            return (false, false);
-        }
         if self.stream_text_pending() {
-            self.flush_stream_text();
-            self.held_final_frame_ticks = FINAL_STREAM_FRAME_TICKS;
-            return (true, false);
+            return (false, false);
         }
         if revealed_text {
             // The chunk that emptied the queue has not been rendered yet. Keep
@@ -8963,10 +9002,12 @@ impl AppState {
             self.held_final_frame_ticks -= 1;
             return (false, false);
         }
-        self.held_since = None;
         self.held_final_frame_ticks = 0;
+        self.held_since = None;
         for (method, params) in std::mem::take(&mut self.held_notifications) {
-            self.dispatch_notification(&method, &params);
+            // Later queued deltas can create a new pending stream. Its own
+            // completion must wait too instead of flushing that stream whole.
+            self.handle_notification(&method, &params);
         }
         (false, true)
     }
@@ -14487,10 +14528,17 @@ impl AppState {
     /// still holding some.
     pub fn drain_stream_text(&mut self, elapsed: Duration) -> StreamReveal {
         let mut reveal = StreamReveal::default();
-        for active in self.active.values_mut() {
+        let finishing = self.held_since.is_some_and(|since| since.elapsed() >= Duration::from_millis(120));
+        let mut clusters_left = STREAM_CATCH_UP_CLUSTERS;
+        let mut lines_left = STREAM_CATCH_UP_LINES;
+        for id in &self.active_order {
+            let Some(active) = self.active.get_mut(id) else { continue };
             let assistant = matches!(active.block.kind, BlockKind::Assistant);
             let mut paced = false;
             loop {
+                if clusters_left == 0 || lines_left == 0 {
+                    break;
+                }
                 let hidden = if assistant {
                     crate::renderer::hidden_streaming_link_range(
                         &active.block.body,
@@ -14508,7 +14556,9 @@ impl AppState {
                     reveal.links_changed = true;
                     continue;
                 }
-                if paced {
+                let catch_up = active.pace.pending.len() > 4096
+                    || (finishing && active.pace.pending.len() > 256);
+                if paced && !catch_up {
                     break;
                 }
                 paced = true;
@@ -14523,7 +14573,18 @@ impl AppState {
                     active.pace.pending.len()
                 };
                 let visible_end = hidden.map_or(line_end, |range| range.start.min(line_end));
-                let Some(chunk) = active.pace.take(elapsed, visible_end) else {
+                let chunk = if catch_up {
+                    active.pace.take_catch_up(&mut clusters_left, &mut lines_left, visible_end)
+                } else {
+                    let end = visible_cluster_end(&active.pace.pending[..visible_end], clusters_left);
+                    let chunk = active.pace.take(elapsed, end);
+                    if let Some(chunk) = &chunk {
+                        clusters_left -= visible_cluster_count(chunk);
+                        lines_left = lines_left.saturating_sub(chunk.bytes().filter(|byte| *byte == b'\n').count());
+                    }
+                    chunk
+                };
+                let Some(chunk) = chunk else {
                     break;
                 };
                 reveal.clusters += visible_cluster_count(&chunk);
@@ -24775,11 +24836,10 @@ mod tests {
         panic!("the full live answer was never revealed");
     }
 
-    /// A provider can hand over more text than the reveal can clear in any
-    /// reasonable time. The wait is bounded, but the flushed text still gets a
-    /// live frame before completion moves it into history.
+    /// Even a long-finished provider response stays on the bounded reveal path.
+    /// Completion waits instead of forcing the pending tail into one frame.
     #[test]
-    fn an_expired_finish_paints_its_full_live_frame_before_completing() {
+    fn a_finished_long_stream_never_flushes_its_pending_tail_in_one_frame() {
         let mut state = test_state();
         let text = "아주 긴 마무리 문장입니다.".repeat(400);
         state.handle_notification(
@@ -24789,24 +24849,63 @@ mod tests {
         state.handle_notification("turn/completed", &json!({}));
         assert!(!state.held_notifications.is_empty());
 
-        state.held_since = Some(Instant::now() - HELD_NOTIFICATION_LIMIT);
         let reveal = state.drain_stream_text(TEST_FRAME);
 
-        assert!(reveal.final_frame_ready);
+        assert!(!reveal.final_frame_ready);
         assert!(!state.held_notifications.is_empty());
-        assert_eq!(state.active["item-1"].block.body, text);
+        assert_ne!(state.active["item-1"].block.body, text);
         assert!(state.drain_committed().is_empty());
 
-        for _ in 0..FINAL_STREAM_FRAME_TICKS {
-            let reveal = state.drain_stream_text(TEST_FRAME);
-            assert!(!reveal.released);
-            assert!(!state.held_notifications.is_empty());
-        }
-        let reveal = state.drain_stream_text(TEST_FRAME);
-
-        assert!(reveal.released);
+        drain_frames(&mut state, 4000);
         assert!(state.held_notifications.is_empty());
         assert!(state.committed.iter().any(|block| block.body == text));
+    }
+
+    #[test]
+    fn delayed_completion_replays_later_streams_without_flushing_them() {
+        let mut state = test_state();
+        state.handle_notification("item/agentMessage/delta", &json!({"itemId":"one", "delta":"first"}));
+        state.handle_notification("item/completed", &json!({"item":{"id":"one","type":"agentMessage","text":"first"}}));
+        let second = "later answer ".repeat(1000);
+        state.handle_notification("item/agentMessage/delta", &json!({"itemId":"two", "delta":second}));
+        state.handle_notification("turn/completed", &json!({}));
+        for _ in 0..2000 {
+            state.drain_stream_text(TEST_FRAME);
+            if let Some(active) = state.active.get("two") {
+                assert!(active.block.body.is_empty());
+                assert_eq!(active.pace.pending, second);
+                assert!(state.stream_events_pending());
+                drain_frames(&mut state, 4000);
+                assert!(!state.stream_events_pending());
+                assert!(state.committed.iter().any(|block| block.body == second));
+                return;
+            }
+        }
+        panic!("second stream was flushed or never resumed");
+    }
+
+    #[test]
+    fn catch_up_limits_frames_and_preserves_long_multiline_text() {
+        let mut state = test_state();
+        let text = "한글👨‍👩‍👧‍👦\n".repeat(800);
+        state.handle_notification("item/agentMessage/delta", &json!({"itemId":"one", "delta":text}));
+        state.handle_notification("turn/completed", &json!({}));
+        let mut previous_lines = 0;
+        for _ in 0..2000 {
+            state.held_since = Some(Instant::now() - Duration::from_secs(2));
+            let reveal = state.drain_stream_text(Duration::from_secs(2));
+            assert!(reveal.clusters <= STREAM_CATCH_UP_CLUSTERS);
+            if let Some(active) = state.active.get("one") {
+                let lines = active.block.body.bytes().filter(|byte| *byte == b'\n').count();
+                assert!(lines - previous_lines <= STREAM_CATCH_UP_LINES);
+                previous_lines = lines;
+            }
+            if !state.stream_events_pending() {
+                assert!(state.committed.iter().any(|block| block.body == text));
+                return;
+            }
+        }
+        panic!("bounded catch-up never finished");
     }
 
     #[test]
@@ -27680,13 +27779,17 @@ mod tests {
     }
 
     #[test]
-    fn composer_ctrl_backspace_after_an_image_newline_removes_the_attachment() {
+    fn composer_ctrl_backspace_after_an_image_newline_removes_one_unit_at_a_time() {
         let mut state = test_state();
         state.attach_local_image(r"C:\Temp\clipboard-image.bmp".to_owned());
         state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
 
         state.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
 
+        assert_eq!(state.editor.chars(), [ATTACHMENT_PLACEHOLDER]);
+        assert_eq!(state.composer_image_count(), 1);
+
+        state.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
         assert!(state.editor.chars().is_empty());
         assert_eq!(state.composer_image_count(), 0);
 
@@ -27735,18 +27838,25 @@ mod tests {
             (
                 KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
                 false,
+                2,
             ),
             (
                 KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
                 false,
+                1,
             ),
             (
                 KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
                 true,
+                1,
             ),
-            (KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL), true),
+            (
+                KeyEvent::new(KeyCode::Delete, KeyModifiers::CONTROL),
+                true,
+                1,
+            ),
         ];
-        for (key, delete_from_start) in cases {
+        for (key, delete_from_start, presses) in cases {
             let mut state = test_state();
             if key.code == KeyCode::Delete {
                 state.editor.set_text(" ");
@@ -27757,7 +27867,9 @@ mod tests {
                 state.editor.move_home();
             }
 
-            state.handle_key(key);
+            for _ in 0..presses {
+                state.handle_key(key);
+            }
 
             assert_eq!(state.composer_image_count(), 0, "key: {key:?}");
             assert!(
@@ -27779,6 +27891,8 @@ mod tests {
         state.attach_local_image(r"C:\Temp\second.bmp".to_owned());
         state.editor.newline();
 
+        state.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
+        assert_eq!(state.composer_images.len(), 2, "newline is one delete unit");
         state.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
 
         assert_eq!(state.composer_images, [r"C:\Temp\first.bmp"]);
@@ -27969,6 +28083,20 @@ mod tests {
         state.handle_key(repeat);
 
         assert_eq!(state.editor.text(), "첫째 ");
+    }
+
+    #[test]
+    fn composer_ctrl_backspace_hold_repeats_after_the_keyboard_delay() {
+        let mut state = test_state();
+        state.handle_paste("첫째 둘째");
+        state.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
+        std::thread::sleep(Duration::from_millis(250));
+
+        let mut repeat = KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL);
+        repeat.kind = KeyEventKind::Repeat;
+        state.handle_key(repeat);
+
+        assert_eq!(state.editor.text(), "첫째");
     }
 
     fn composer_completion_state() -> AppState {

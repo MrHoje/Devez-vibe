@@ -1482,6 +1482,7 @@ async fn event_loop(
     let mut stream_tick = tokio::time::interval(STREAM_FRAME);
     stream_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_stream_reveal = Instant::now();
+    let mut handoff_to_save: Option<String> = None;
     let mut resize = ResizeTracker::new();
     let (workspace_tx, mut workspace_rx) = mpsc::channel(1);
     let (management_tx, mut management_rx) = mpsc::unbounded_channel();
@@ -1688,6 +1689,9 @@ async fn event_loop(
                             {
                                 // The drag selected composer text, so the key takes the
                                 // selection rather than the character at the cursor.
+                                if is_ctrl_backspace_key(&key) {
+                                    input_state.begin_ctrl_backspace_repeat();
+                                }
                                 renderer.clear_selection();
                                 selection_edited = true;
                                 Action::Tick(true)
@@ -1868,10 +1872,7 @@ async fn event_loop(
                         } else {
                             target.handle_notification(&method, &params);
                             if method == "turn/completed" && !target_is_btw {
-                                server.persist_provider_handoff(
-                                    &target.thread_id,
-                                    provider_handoff_snapshot(target, renderer),
-                                );
+                                handoff_to_save = Some(target.thread_id.clone());
                             }
                             if matches!(
                                 method.as_str(),
@@ -2113,6 +2114,17 @@ async fn event_loop(
             if !animated {
                 draw_conversations(state, &mut btw_state, split_focus, renderer)?;
             }
+        }
+        // Save after deferred completion reached the renderer, otherwise the
+        // sidecar can miss the final answer that was still in the reveal queue.
+        if handoff_to_save.as_deref() != Some(state.thread_id.as_str()) {
+            handoff_to_save = None;
+        } else if !state.stream_events_pending() {
+            server.persist_provider_handoff(
+                &state.thread_id,
+                provider_handoff_snapshot(state, renderer),
+            );
+            handoff_to_save = None;
         }
         // The paint above is what tells the renderer where the prompt characters
         // ended up, so the highlight is taken from it and painted by one more.
@@ -4581,6 +4593,7 @@ async fn hydrate_thread_history(server: &BackendServer, response: &Value) -> Res
         .context("thread/resume 응답에 thread.id가 없습니다.")?
         .to_owned();
     let mut cursor = None;
+    let mut seen_cursors = std::collections::HashSet::new();
     let mut turns = Vec::new();
 
     loop {
@@ -4602,6 +4615,7 @@ async fn hydrate_thread_history(server: &BackendServer, response: &Value) -> Res
         else {
             break;
         };
+        anyhow::ensure!(seen_cursors.insert(next.clone()), "대화 기록 페이지가 반복되어 재개를 중단했습니다.");
         cursor = Some(next);
     }
     thread
@@ -4922,14 +4936,9 @@ fn resume_thread_params(thread_id: &str, claude: &ClaudeSessionSettings) -> Valu
         "developerInstructions": DEVEZ_INSTRUCTIONS,
         "claudeDeveloperInstructions": CLAUDE_DEVEZ_INSTRUCTIONS,
         "claudePermissionMode": claude.permission_mode,
-        // Paginated threads warn when the resume answer carries the whole
-        // history. The turns are re-listed page by page right after anyway.
-        "excludeTurns": true,
-        "initialTurnsPage": {
-            "limit": 100,
-            "sortDirection": "asc",
-            "itemsView": "full"
-        }
+        // History is hydrated once through the provider-neutral route. Asking
+        // for an initial page here duplicated the first 100 full turns.
+        "excludeTurns": true
     });
     // Sent as fallbacks, not as the choice: the backend prefers what this
     // thread's own turns ran on, and only reaches for these when it has no
@@ -6031,17 +6040,24 @@ fn is_clipboard_image_shortcut(key: &KeyEvent) -> bool {
             || key.modifiers.contains(KeyModifiers::ALT))
 }
 
-/// Backspace and Delete on their own: with composer text drag-selected, they take
-/// the selection. Modified chords keep the meanings they already have, so
-/// Ctrl+Backspace stays a word delete.
+/// Backspace and Delete take selected composer text before applying their plain
+/// or word-delete meaning, matching an ordinary Windows editor.
 fn is_selection_delete_key(key: &KeyEvent) -> bool {
     matches!(
         key.kind,
         crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
-    ) && matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
+    ) && matches!(
+        key.code,
+        KeyCode::Backspace | KeyCode::Delete | KeyCode::Char('\u{8}')
+    )
         && !key
             .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            .intersects(KeyModifiers::ALT | KeyModifiers::SUPER)
+}
+
+fn is_ctrl_backspace_key(key: &KeyEvent) -> bool {
+    (key.code == KeyCode::Backspace && key.modifiers.contains(KeyModifiers::CONTROL))
+        || key.code == KeyCode::Char('\u{8}')
 }
 
 /// The composer characters an edit typed over the selection should take. Ctrl+A
@@ -7146,6 +7162,18 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_backspace_deletes_a_composer_selection() {
+        assert!(is_selection_delete_key(&press(
+            KeyCode::Backspace,
+            KeyModifiers::CONTROL,
+        )));
+        assert!(is_selection_delete_key(&press(
+            KeyCode::Char('\u{8}'),
+            KeyModifiers::NONE,
+        )));
+    }
+
+    #[test]
     fn clipboard_text_paste_keeps_joined_emoji_and_discards_duplicate_events() {
         let mut state = starting_state();
         let mut buffer = ComposerPasteBuffer::new();
@@ -7903,12 +7931,7 @@ mod tests {
                 .and_then(Value::as_str),
             Some(CLAUDE_DEVEZ_INSTRUCTIONS)
         );
-        assert_eq!(
-            params
-                .pointer("/initialTurnsPage/itemsView")
-                .and_then(Value::as_str),
-            Some("full")
-        );
+        assert!(params.get("initialTurnsPage").is_none());
         assert_eq!(params.get("excludeTurns"), Some(&json!(true)));
     }
 
