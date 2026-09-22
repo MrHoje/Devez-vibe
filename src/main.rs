@@ -12,6 +12,7 @@ mod git_diff;
 mod input_hub;
 mod input_log;
 mod integrations;
+mod lsp;
 mod open_code;
 mod paste;
 mod perf;
