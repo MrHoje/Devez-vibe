@@ -675,7 +675,7 @@ mod tests {
                 let event = timeout(Duration::from_secs(180), server.next_event())
                     .await
                     .expect("실제 모델 응답 시간 초과")
-                    .expect("연결 종료");
+                    .expect("Connection closed");
                 let ServerEvent::Notification { method, params } = event else {
                     continue;
                 };

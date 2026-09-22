@@ -1736,6 +1736,15 @@ enum PendingInteraction {
         detail: Vec<String>,
         action: ConfirmedAction,
     },
+    /// Anthropic's safety classifier ended the turn with no answer. Offers the
+    /// same two ways out as the stock CLI: switch to a fallback model and resend
+    /// the blocked prompt, or edit it and retry on the current model.
+    SafeguardBlock {
+        selected: usize,
+        /// (model id, display name) to switch to; `None` when no fallback fits,
+        /// leaving only the edit-and-retry choice.
+        alternate: Option<(String, String)>,
+    },
     /// Numbered list that picks the sign-in flow before starting it.
     LoginMethodPicker {
         selected: usize,
@@ -3361,6 +3370,13 @@ impl From<&str> for QueuedPrompt {
     }
 }
 
+/// Whether a Claude error is one a different model or an edited prompt can get
+/// past: the safety classifier's block, or the model's own refusal. Both end
+/// the turn with no answer, so both open the switch/edit card.
+fn is_safeguard_block(message: &str) -> bool {
+    message.contains("safeguards flagged") || message.contains("(refusal)")
+}
+
 fn submission_display(source: &str, image_count: usize) -> String {
     let mut display = String::new();
     let mut image_index = 0;
@@ -3557,6 +3573,9 @@ pub struct AppState {
     queued_input_pending: bool,
     /// Images that came out of the queue with the prompt now starting.
     queued_images: Vec<String>,
+    /// (text, display) of the last prompt that started a turn. Kept so a
+    /// safeguard-blocked turn can resend or restore it without the composer.
+    blocked_prompt: Option<(String, String)>,
     /// Keep an async answer separate from the unsent composer until turn/start succeeds.
     pending_async_answer: Option<String>,
     /// Async notifications may be repeated after their answer starts a new turn.
@@ -3920,6 +3939,7 @@ impl AppState {
             pending_async_answer: None,
             queued_input_pending: false,
             queued_images: Vec::new(),
+            blocked_prompt: None,
             handled_async_questions: HashSet::new(),
             codex_permission_mode: PermissionMode::FullAccess,
             handoff_prompt: None,
@@ -4635,7 +4655,7 @@ impl AppState {
         {
             self.push_notice(
                 BlockKind::Error,
-                "Codex 사용 불가",
+                "Codex unavailable",
                 format!("{message}\nClaude 모델도 찾을 수 없습니다."),
             );
             return false;
@@ -4643,7 +4663,7 @@ impl AppState {
 
         self.push_notice(
             BlockKind::Warning,
-            "Codex 사용 불가",
+            "Codex unavailable",
             format!("{message}\nClaude provider로 자동 전환했습니다."),
         );
         self.switch_provider(ModelProvider::Claude);
@@ -5245,7 +5265,7 @@ impl AppState {
         detail.extend(plugin.install_disclosure());
         detail.push("설치하면 포함된 Skill, MCP 서버와 Hook이 Codex에 추가됩니다.".to_owned());
         self.pending = Some(PendingInteraction::Confirm {
-            title: "플러그인을 설치할까요?".to_owned(),
+            title: "Install this plugin?".to_owned(),
             detail,
             action: ConfirmedAction::InstallPlugin(PluginInstallTarget {
                 plugin_name: plugin.name.clone(),
@@ -5257,7 +5277,7 @@ impl AppState {
 
     pub fn confirm_plugin_uninstall(&mut self, plugin: &PluginInfo) {
         self.pending = Some(PendingInteraction::Confirm {
-            title: "플러그인을 제거할까요?".to_owned(),
+            title: "Remove this plugin?".to_owned(),
             detail: vec![
                 format!("Plugin: {}", plugin.display_name),
                 format!("Marketplace: {}", plugin.marketplace_name),
@@ -5337,12 +5357,12 @@ impl AppState {
 
     pub fn cancel_login_notice(&mut self) {
         self.pending = None;
-        self.push_notice(BlockKind::Warning, "로그인 취소", "로그인을 중단했습니다.");
+        self.push_notice(BlockKind::Warning, "Sign-in cancelled", "로그인을 중단했습니다.");
     }
 
     pub fn confirm_logout(&mut self) {
         self.pending = Some(PendingInteraction::Confirm {
-            title: "로그아웃할까요?".to_owned(),
+            title: "Sign out?".to_owned(),
             detail: vec![
                 format!("Account: {}", self.account),
                 "다시 사용하려면 /login으로 재인증해야 합니다.".to_owned(),
@@ -5886,6 +5906,38 @@ impl AppState {
         }
     }
 
+    /// A Claude model to fall back to when the safety classifier blocks the
+    /// current one. Opus 4.8's safeguards are less aggressive than the 5-series;
+    /// from 4.8 itself the fallback is Sonnet 5. `None` when neither is in the
+    /// catalogue or the provider is not Claude.
+    fn safeguard_alternate_model(&self) -> Option<(String, String)> {
+        if self.selected_provider() != ModelProvider::Claude {
+            return None;
+        }
+        let target = if self.selected_model_name() == "claude:claude-opus-4-8" {
+            "claude:sonnet"
+        } else {
+            "claude:claude-opus-4-8"
+        };
+        self.models
+            .iter()
+            .find(|model| model.model == target || model.id == target)
+            .map(|model| (model.model.clone(), model.display_name.clone()))
+    }
+
+    /// Opens the safeguard choice card. Does nothing without a prompt to act on,
+    /// so a block with no recorded prompt just leaves the error block.
+    fn open_safeguard_block(&mut self) {
+        if self.blocked_prompt.is_none() {
+            return;
+        }
+        let alternate = self.safeguard_alternate_model();
+        self.pending = Some(PendingInteraction::SafeguardBlock {
+            selected: 0,
+            alternate,
+        });
+    }
+
     /// Rebuilds the transcript from a resumed thread. `rollout` fills in what
     /// `thread/resume` omits — shell runs above all — placing each one back where
     /// it ran rather than at the end of its turn.
@@ -6228,7 +6280,7 @@ impl AppState {
             self.preserve_failed_question_answer(&answer);
         }
         self.committed
-            .push(Block::new(BlockKind::Error, "요청 실패", message));
+            .push(Block::new(BlockKind::Error, "Request failed", message));
     }
 
     fn preserve_failed_question_answer(&mut self, answer: &str) {
@@ -6295,7 +6347,7 @@ impl AppState {
 
     pub fn set_interrupt_failed(&mut self, message: impl Into<String>) {
         self.resume_queue_after_interrupt = false;
-        self.push_notice(BlockKind::Error, "중단 실패", message);
+        self.push_notice(BlockKind::Error, "Interrupt failed", message);
     }
 
     fn remember_interrupt(&mut self) {
@@ -6541,7 +6593,7 @@ impl AppState {
 
     pub fn confirm_marketplace_add(&mut self, source: &str) {
         self.pending = Some(PendingInteraction::Confirm {
-            title: "마켓플레이스를 추가할까요?".to_owned(),
+            title: "Add this marketplace?".to_owned(),
             detail: vec![
                 format!("Source: {source}"),
                 "Codex가 이 소스를 체크아웃하고 플러그인 목록을 읽습니다.".to_owned(),
@@ -6554,7 +6606,7 @@ impl AppState {
 
     pub fn confirm_marketplace_remove(&mut self, name: &str) {
         self.pending = Some(PendingInteraction::Confirm {
-            title: "마켓플레이스를 제거할까요?".to_owned(),
+            title: "Remove this marketplace?".to_owned(),
             detail: vec![
                 format!("Marketplace: {name}"),
                 "설정에서 소스만 제거하며, 이미 설치된 플러그인은 남습니다.".to_owned(),
@@ -6636,6 +6688,8 @@ impl AppState {
         self.committed.push(Block::new(kind, title, body));
     }
 
+
+
     pub fn begin_local_shell(&mut self, command: &str) -> Block {
         self.commit_welcome_card();
         let block = Block::new(BlockKind::Tool, "Running Shell Command", command);
@@ -6701,7 +6755,7 @@ impl AppState {
             }
             Err(error) => {
                 self.update_notice = Some("Update failed · dvz update or click here".to_owned());
-                self.push_notice(BlockKind::Warning, "dvz update 실패", error);
+                self.push_notice(BlockKind::Warning, "dvz update failed", error);
             }
         }
     }
@@ -8402,7 +8456,7 @@ impl AppState {
                     }) => {
                         user_input_answer_block(&questions, &answers, self.active_cost_model())
                     }
-                    _ => Block::new(BlockKind::User, "질문 답변", answer.clone()),
+                    _ => Block::new(BlockKind::User, "Question answers", answer.clone()),
                 };
                 let action = self.submit_prompt(answer.clone(), display);
                 self.pending_async_answer = Some(answer);
@@ -9090,7 +9144,7 @@ impl AppState {
                     _ => return,
                 };
                 if self.codex_permission_mode != mode && params.get("lowered") == Some(&json!(true)) {
-                    self.push_notice(BlockKind::Warning, "권한 자동 조정", format!("전체 접근이 허용되지 않아 {} 모드로 전환했습니다.", mode.label()));
+                    self.push_notice(BlockKind::Warning, "Permission adjusted", format!("전체 접근이 허용되지 않아 {} 모드로 전환했습니다.", mode.label()));
                 }
                 self.codex_permission_mode = mode;
             }
@@ -9141,14 +9195,20 @@ impl AppState {
                     self.finish_active_turn_prompt(Instant::now());
                 }
                 if let Some(error) = turn_error {
+                    let message = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Unknown error");
                     self.committed.push(Block::new(
                         BlockKind::Error,
                         "Response generation failed",
-                        error
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Unknown error"),
+                        message,
                     ));
+                    if self.selected_provider() == ModelProvider::Claude
+                        && is_safeguard_block(message)
+                    {
+                        self.open_safeguard_block();
+                    }
                 }
                 self.flush_orphaned_active();
                 if successful {
@@ -9443,6 +9503,9 @@ impl AppState {
                     },
                     message,
                 ));
+                if !retry && provider == "Claude" && is_safeguard_block(message) {
+                    self.open_safeguard_block();
+                }
             }
             "warning" | "configWarning" | "guardianWarning" | "deprecationNotice" => {
                 self.committed
@@ -9729,6 +9792,9 @@ impl AppState {
             Action::Steer(text)
         } else {
             self.flush_pending_steer_prompts();
+            // Kept before the block moves into the transcript, so a safeguard
+            // block can resend or restore this exact prompt.
+            self.blocked_prompt = Some((text.clone(), prompt.body.clone()));
             self.begin_turn_prompt(prompt, started_at);
             self.busy = true;
             // Time the turn from Enter, not from the server's acknowledgement: a
@@ -10258,14 +10324,14 @@ impl AppState {
                 Action::None
             }
             "/worktree" if self.busy || self.side_parent.is_some() => {
-                self.push_notice(BlockKind::Warning, "진입 불가", "응답을 중단하고 기본 대화에서 /worktree를 실행하세요.");
+                self.push_notice(BlockKind::Warning, "Unavailable here", "응답을 중단하고 기본 대화에서 /worktree를 실행하세요.");
                 Action::None
             }
             "/worktree" if parts.len() <= 2 => {
                 Action::Worktree(parts.get(1).map(|name| (*name).to_owned()))
             }
             "/worktree" => {
-                self.push_notice(BlockKind::Error, "사용법", "/worktree [이름]");
+                self.push_notice(BlockKind::Error, "Usage", "/worktree [이름]");
                 Action::None
             }
             "/new" | "/clear" if self.busy => {
@@ -11581,6 +11647,63 @@ impl AppState {
                     Action::None
                 }
             },
+            PendingInteraction::SafeguardBlock {
+                mut selected,
+                alternate,
+            } => {
+                let switch = alternate.is_some();
+                let last = usize::from(switch); // 1 when a switch row exists, else 0
+                let choose = |this: &mut Self, index: usize| -> Action {
+                    let (text, display) = this.blocked_prompt.clone().unwrap_or_default();
+                    if switch && index == 0 {
+                        if let Some((model_id, _)) = &alternate
+                            && let Some(model_index) = this
+                                .models
+                                .iter()
+                                .position(|model| &model.model == model_id || &model.id == model_id)
+                        {
+                            this.apply_model(model_index, None);
+                        }
+                        this.submit_text(text, display)
+                    } else {
+                        // Edit-and-retry: hand the prompt back to the composer on
+                        // the current model and let the user change it.
+                        this.editor.set_text(text);
+                        Action::None
+                    }
+                };
+                match key.code {
+                    KeyCode::Esc => Action::None,
+                    KeyCode::Up => {
+                        selected = selected.saturating_sub(1);
+                        self.pending =
+                            Some(PendingInteraction::SafeguardBlock { selected, alternate });
+                        Action::None
+                    }
+                    KeyCode::Down => {
+                        selected = (selected + 1).min(last);
+                        self.pending =
+                            Some(PendingInteraction::SafeguardBlock { selected, alternate });
+                        Action::None
+                    }
+                    KeyCode::Char(digit @ '1'..='2') => {
+                        let index = digit as usize - '1' as usize;
+                        if index <= last {
+                            choose(self, index)
+                        } else {
+                            self.pending =
+                                Some(PendingInteraction::SafeguardBlock { selected, alternate });
+                            Action::None
+                        }
+                    }
+                    KeyCode::Enter => choose(self, selected),
+                    _ => {
+                        self.pending =
+                            Some(PendingInteraction::SafeguardBlock { selected, alternate });
+                        Action::None
+                    }
+                }
+            }
             PendingInteraction::LoginMethodPicker { selected } => {
                 let last = LoginMethod::CHOICES.len() - 1;
                 match key.code {
@@ -12165,7 +12288,7 @@ impl AppState {
                     muted: false,
                 }],
                 slider: None,
-                hint: "잠시 기다려 주세요.".to_owned(),
+                hint: "Please wait…".to_owned(),
                 closable: false,
                 style: OverlayStyle::KeyboardOnlyPanel,
                 input: None,
@@ -12208,8 +12331,8 @@ impl AppState {
                     closable: false,
                     style: OverlayStyle::KeyboardOnlyPanel,
                     input: Some(editor),
-                    input_label: "인증 코드",
-                    input_placeholder: "브라우저에 표시된 코드를 입력…",
+                    input_label: "Auth code",
+                    input_placeholder: "Enter the code shown in your browser…",
                 })
             }
             PendingInteraction::ProviderOAuthWaiting {
@@ -12236,7 +12359,7 @@ impl AppState {
                     },
                 ],
                 slider: None,
-                hint: "O 브라우저 다시 열기".to_owned(),
+                hint: "O reopen browser".to_owned(),
                 closable: false,
                 style: OverlayStyle::KeyboardOnlyPanel,
                 input: None,
@@ -12538,6 +12661,48 @@ impl AppState {
                     lines,
                     slider: None,
                     hint: "y / n".to_owned(),
+                    style: OverlayStyle::Panel,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                })
+            }
+            PendingInteraction::SafeguardBlock { selected, alternate } => {
+                let mut lines = vec![
+                    OverlayLine {
+                        text: "Safeguards blocked this request, so no response was produced."
+                            .to_owned(),
+                        selected: false,
+                        muted: true,
+                    },
+                    // A blank row sets the reason apart from the ways out of it.
+                    OverlayLine {
+                        text: String::new(),
+                        selected: false,
+                        muted: true,
+                    },
+                ];
+                let edit_index = if let Some((_, display)) = alternate {
+                    lines.push(OverlayLine {
+                        text: format!("1. Switch to {display} and retry"),
+                        selected: *selected == 0,
+                        muted: false,
+                    });
+                    1
+                } else {
+                    0
+                };
+                lines.push(OverlayLine {
+                    text: format!("{}. Edit prompt and retry", edit_index + 1),
+                    selected: *selected == edit_index,
+                    muted: false,
+                });
+                Some(OverlayView {
+                    closable: true,
+                    title: "Request blocked".to_owned(),
+                    lines,
+                    slider: None,
+                    hint: "↑↓ select   Enter confirm   Esc close".to_owned(),
                     style: OverlayStyle::Panel,
                     input: None,
                     input_label: "",
@@ -21867,7 +22032,7 @@ mod tests {
 
         // Signing out needs a browser round trip to undo, so it confirms first.
         let overlay = state.overlay_view().expect("logout confirmation");
-        assert!(overlay.title.contains("로그아웃"));
+        assert_eq!(overlay.title,"Sign out?");
 
         let confirmed = state.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
 
@@ -22638,6 +22803,226 @@ mod tests {
         assert_eq!(
             state.committed.last().map(|block| block.body.as_str()),
             Some("before [Image #1] after")
+        );
+    }
+
+    fn claude_test_state() -> AppState {
+        AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![
+                test_model("claude:opus", "Claude Opus 5", true),
+                test_model("claude:claude-opus-4-8", "Claude Opus 4.8", false),
+                test_model("claude:sonnet", "Claude Sonnet 5", false),
+            ],
+            "claude:opus",
+            Some("high"),
+        )
+    }
+
+    fn safeguard_turn_completed(message: &str) -> Value {
+        json!({ "turn": { "status": "failed", "error": { "message": message } } })
+    }
+
+    #[test]
+    fn safeguard_block_switches_model_and_resends_the_prompt() {
+        let mut state = claude_test_state();
+        let Action::Submit(_) =
+            state.submit_text("전역 키 후킹 방법".to_owned(), "전역 키 후킹 방법".to_owned())
+        else {
+            panic!("프롬프트가 나가야 한다");
+        };
+
+        state.handle_notification(
+            "turn/completed",
+            &safeguard_turn_completed(
+                "API Error: Opus 5's safeguards flagged this message. Details: `[cyber]`",
+            ),
+        );
+
+        let Some(PendingInteraction::SafeguardBlock {
+            selected: 0,
+            alternate: Some((id, _)),
+        }) = &state.pending
+        else {
+            panic!("차단 카드가 대체 모델과 함께 떠야 한다");
+        };
+        assert_eq!(id, "claude:claude-opus-4-8");
+
+        let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(action, Action::Submit(text) if text == "전역 키 후킹 방법"));
+        assert_eq!(state.selected_model_name(), "claude:claude-opus-4-8");
+        assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn safeguard_block_edit_restores_the_prompt_and_keeps_the_model() {
+        let mut state = claude_test_state();
+        let _ = state.submit_text("차단될 프롬프트".to_owned(), "차단될 프롬프트".to_owned());
+
+        state.handle_notification(
+            "turn/completed",
+            &safeguard_turn_completed("…safeguards flagged this message…"),
+        );
+        assert!(matches!(
+            state.pending,
+            Some(PendingInteraction::SafeguardBlock { .. })
+        ));
+
+        state.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(action, Action::None));
+        assert_eq!(state.editor.text(), "차단될 프롬프트");
+        assert_eq!(state.selected_model_name(), "claude:opus");
+        assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn a_plain_claude_error_shows_no_safeguard_card() {
+        let mut state = claude_test_state();
+        let _ = state.submit_text("정상".to_owned(), "정상".to_owned());
+
+        state.handle_notification("turn/completed", &safeguard_turn_completed("HTTP 503"));
+
+        assert!(state.pending.is_none());
+        assert_eq!(state.committed.last().map(|block| block.title.as_str()), Some("Response generation failed"));
+    }
+
+    #[test]
+    fn a_free_text_question_lets_ctrl_v_paste() {
+        let mut state = claude_test_state();
+        state.begin_server_request(
+            json!(1),
+            "item/tool/requestUserInput",
+            &json!({ "questions": [{ "id": "q", "question": "경로?", "options": [] }] }),
+        );
+
+        // The gate the Ctrl+V shortcut now checks instead of blocking on any overlay.
+        assert!(
+            state.buffers_pending_text_input(),
+            "free-text question should accept a clipboard paste"
+        );
+        state.handle_paste("C:/users/eghis");
+        assert!(
+            state.editor.text().is_empty(),
+            "paste must reach the question, not the composer"
+        );
+    }
+
+    #[test]
+    fn a_model_refusal_also_opens_the_switch_card() {
+        let mut state = claude_test_state();
+        let _ = state.submit_text("거부될 프롬프트".to_owned(), "거부될 프롬프트".to_owned());
+
+        state.handle_notification(
+            "turn/completed",
+            &safeguard_turn_completed("Claude declined to answer this request. (refusal)"),
+        );
+
+        assert!(matches!(
+            state.pending,
+            Some(PendingInteraction::SafeguardBlock { .. })
+        ));
+    }
+
+    #[test]
+    fn the_fallback_from_opus_4_8_is_sonnet() {
+        let mut state = claude_test_state();
+        state.select_model_and_effort("claude:claude-opus-4-8", None);
+        let _ = state.submit_text("차단될 프롬프트".to_owned(), "차단될 프롬프트".to_owned());
+
+        state.handle_notification(
+            "turn/completed",
+            &safeguard_turn_completed("…safeguards flagged this message…"),
+        );
+
+        let Some(PendingInteraction::SafeguardBlock {
+            alternate: Some((id, _)),
+            ..
+        }) = &state.pending
+        else {
+            panic!("대체 모델이 있어야 한다");
+        };
+        assert_eq!(id, "claude:sonnet");
+    }
+
+    #[test]
+    fn without_a_fallback_the_card_only_edits_the_prompt() {
+        let mut state = AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![test_model("claude:opus", "Claude Opus 5", true)],
+            "claude:opus",
+            Some("high"),
+        );
+        let _ = state.submit_text("복원될 프롬프트".to_owned(), "복원될 프롬프트".to_owned());
+
+        state.handle_notification(
+            "turn/completed",
+            &safeguard_turn_completed("…safeguards flagged this message…"),
+        );
+
+        assert!(
+            matches!(
+                &state.pending,
+                Some(PendingInteraction::SafeguardBlock {
+                    alternate: None,
+                    ..
+                })
+            ),
+            "대체할 모델이 없으면 전환 선택지는 없다"
+        );
+
+        let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(action, Action::None));
+        assert_eq!(state.editor.text(), "복원될 프롬프트");
+        assert_eq!(state.selected_model_name(), "claude:opus");
+    }
+
+    #[test]
+    fn a_number_key_picks_the_edit_choice_on_the_safeguard_card() {
+        let mut state = claude_test_state();
+        let _ = state.submit_text("수정할 프롬프트".to_owned(), "수정할 프롬프트".to_owned());
+
+        state.handle_notification(
+            "turn/completed",
+            &safeguard_turn_completed("…safeguards flagged this message…"),
+        );
+        let action = state.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+
+        assert!(matches!(action, Action::None));
+        assert_eq!(state.editor.text(), "수정할 프롬프트");
+        assert_eq!(state.selected_model_name(), "claude:opus");
+        assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn the_safeguard_card_paints_both_choices() {
+        let mut state = claude_test_state();
+        let _ = state.submit_text("차단될 프롬프트".to_owned(), "차단될 프롬프트".to_owned());
+
+        state.handle_notification(
+            "turn/completed",
+            &safeguard_turn_completed("…safeguards flagged this message…"),
+        );
+
+        let view = state.overlay_view().expect("차단 카드가 떠야 한다");
+        let texts = view
+            .lines
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            texts.iter().any(|text| text.contains("Claude Opus 4.8")),
+            "대체 모델 이름이 없다: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("Edit prompt")),
+            "프롬프트 수정 선택지가 없다: {texts:?}"
         );
     }
 
@@ -27033,7 +27418,7 @@ mod tests {
             for ch in "둘째 초안".chars() {
                 state.handle_key(KeyEvent::from(KeyCode::Char(ch)));
             }
-            state.fallback_from_codex("연결 종료");
+            state.fallback_from_codex("Connection closed");
             assert_eq!(state.editor.text(), "원래 초안\n첫 답변\n둘째 초안");
             assert!(!state.awaiting_input());
             assert!(state.turn_interrupted);
@@ -29387,7 +29772,7 @@ mod tests {
         assert!(!state.busy);
         assert!(state.turn_id.is_none());
         assert!(state.committed.iter().any(|block| {
-            block.title == "Codex 사용 불가" && block.body.contains("자동 전환했습니다")
+            block.title == "Codex unavailable" && block.body.contains("자동 전환했습니다")
         }));
     }
 
@@ -29500,6 +29885,7 @@ mod tests {
             } if name == "imagegen"
         ));
     }
+
 
     #[test]
     fn claude_permission_panel_displays_rules() {
@@ -29783,7 +30169,7 @@ mod tests {
         state.confirm_marketplace_add("owner/repo");
 
         let overlay = state.view().overlay.expect("confirmation overlay");
-        assert!(overlay.title.contains("마켓플레이스를 추가"));
+        assert_eq!(overlay.title,"Add this marketplace?");
         assert!(
             overlay
                 .lines

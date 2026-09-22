@@ -519,7 +519,7 @@ mod tests {
                     check(&state, BUSY, WAITING);
                 }
                 if outcome == "disconnect" {
-                    state.fallback_from_codex("연결 종료");
+                    state.fallback_from_codex("Connection closed");
                 } else {
                     let action = state.handle_key(KeyEvent::from(if outcome == "cancel" {
                         KeyCode::Esc

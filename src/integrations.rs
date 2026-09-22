@@ -596,7 +596,7 @@ impl McpPicker {
             style: OverlayStyle::KeyboardOnlyCompactPanel,
             input: Some(&self.query),
             input_label: "",
-            input_placeholder: "서버 또는 도구 이름으로 검색…",
+            input_placeholder: "Search by server or tool name…",
         }
     }
 
@@ -1642,7 +1642,7 @@ impl PluginPicker {
             style: OverlayStyle::KeyboardOnlyCompactPanel,
             input: Some(&self.query),
             input_label: "",
-            input_placeholder: "플러그인 검색…",
+            input_placeholder: "Search plugins…",
         }
     }
 
@@ -1996,7 +1996,7 @@ impl MarketplacePicker {
                 style: OverlayStyle::KeyboardOnlyPanel,
                 input: Some(source),
                 input_label: "Source",
-                input_placeholder: "owner/repo 또는 ./path",
+                input_placeholder: "owner/repo or ./path",
             };
         }
 

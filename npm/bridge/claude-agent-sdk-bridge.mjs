@@ -2700,6 +2700,23 @@ const STARTUP_FAILURE_GUIDES = {
   bypass_root: "관리자 계정에서는 권한 우회 모드로 시작할 수 없습니다. 일반 계정으로 실행하세요.",
 };
 
+/**
+ * A turn can end without the error flag yet still carry no answer: the model
+ * refused, or the response was cut off. Those slip by silently unless surfaced.
+ * Refusal is reported as an error so the host opens its model-switch card on the
+ * `(refusal)` marker; anything else is a plain notice. Normal stops give null.
+ */
+function abnormalStopOutcome(stopReason) {
+  if (!stopReason || ["end_turn", "tool_use", "stop_sequence"].includes(stopReason)) return null;
+  if (stopReason === "refusal") {
+    return { error: "Claude declined to answer this request. (refusal)" };
+  }
+  if (stopReason === "max_tokens") {
+    return { warning: "The response was cut off at its maximum length. (max_tokens)" };
+  }
+  return { warning: `The response ended unexpectedly. (${stopReason})` };
+}
+
 async function processResult(session, message) {
   if (!session.turn) return;
   for (const denial of Array.isArray(message.permission_denials) ? message.permission_denials : []) {
@@ -2732,9 +2749,27 @@ async function processResult(session, message) {
   });
   const detail = message.errors?.join("\n") || message.result || message.stop_reason || "Claude 실행 실패";
   const guide = STARTUP_FAILURE_GUIDES[message.startup_failure_reason];
-  const error = message.is_error && !interrupted
+  let error = message.is_error && !interrupted
     ? { message: guide ? `${guide}\n${detail}` : detail }
     : null;
+  if (!error && !interrupted) {
+    const outcome = abnormalStopOutcome(message.stop_reason);
+    if (outcome?.error) error = { message: outcome.error };
+    else if (outcome?.warning) {
+      notify("warning", { threadId: session.id, provider: "Claude", message: outcome.warning });
+    }
+  }
+  // An assistant-level error is otherwise kept only in turn state (for retry
+  // decisions) and never shown. Surface it when the result itself carried no
+  // error, so it cannot double with the result error above. Verification was
+  // already announced when the assistant message arrived.
+  const assistantError = session.turn?.assistantError;
+  if (!error && assistantError && assistantError !== "verification_required") {
+    const text = typeof assistantError === "string"
+      ? assistantError
+      : assistantError.message || JSON.stringify(assistantError);
+    notify("warning", { threadId: session.id, provider: "Claude", message: `Claude response error: ${text}` });
+  }
   if (error && waitForUsageLimit(session)) return;
   finishTurn(session, error, message.duration_ms);
   notify("claude/account/updated", {
@@ -2870,10 +2905,18 @@ async function consumeMessage(session, message) {
     noteCompactBoundary(session, message.compact_metadata);
     notify("thread/compacted", { threadId: session.id });
   } else if (message.type === "system" && message.subtype === "permission_denied") {
+    const reason = message.decision_reason || message.decision_reason_type;
     rememberPermissionDenial(session, {
       tool: message.tool_name,
       toolUseId: message.tool_use_id,
-      reason: message.decision_reason || message.decision_reason_type,
+      reason,
+    });
+    // The /permissions panel keeps the record, but a denial mid-turn otherwise
+    // leaves the screen silent. Show it inline too.
+    notify("warning", {
+      threadId: session.id,
+      provider: "Claude",
+      message: `${message.tool_name || "Tool"} was denied${reason ? `: ${reason}` : "."}`,
     });
   } else if (message.type === "rate_limit_event") {
     if (session.turn) session.turn.rateLimitInfo = message.rate_limit_info;
@@ -3042,13 +3085,17 @@ async function runPrompt(session, params) {
 
 // A background task notification is an internal user message that starts its
 // own Claude response even though the host did not submit a new prompt.
-function beginTurn(session, input = []) {
+function beginTurn(session, input) {
   const turnId = `claude-turn-${session.turnSequence++}-${randomUUID()}`;
+  const koreanRequest = input === undefined
+    ? Boolean(session.lastKoreanRequest)
+    : isKoreanPrompt(input);
+  session.lastKoreanRequest = koreanRequest;
   session.turn = {
     id: turnId,
     sawStreamText: false,
     sawVisibleText: false,
-    koreanRequest: isKoreanPrompt(input),
+    koreanRequest,
   };
   session.lastContextUsage = null;
   notify("turn/started", { threadId: session.id, turn: { id: turnId } });
@@ -3915,6 +3962,18 @@ async function runSelfTest() {
   await runPermissionModeSelfTest();
   runToolPolicySelfTest();
   await runCommandTimeoutSelfTest();
+  // A turn that ends with no answer must reach the user: refusal as an error
+  // carrying the marker the host's switch card keys off, the rest as a notice.
+  const refusalStop = abnormalStopOutcome("refusal");
+  const truncatedStop = abnormalStopOutcome("max_tokens");
+  const unknownStop = abnormalStopOutcome("model_context_window_exceeded");
+  if (abnormalStopOutcome("end_turn") !== null
+    || abnormalStopOutcome(undefined) !== null
+    || !refusalStop?.error?.includes("(refusal)")
+    || !truncatedStop?.warning?.includes("max_tokens")
+    || !unknownStop?.warning?.includes("model_context_window_exceeded")) {
+    throw new Error(`Claude abnormal stop notice self-test failed: ${JSON.stringify({ refusalStop, truncatedStop, unknownStop })}`);
+  }
   const planUsage = { rate_limits: { five_hour: { utilization: 25 } }, behaviors: null };
   let usageOptions;
   const fetchedUsage = await safeUsage({
@@ -5281,6 +5340,30 @@ async function runSelfTest() {
     event.method === "item/started" && event.params?.item?.type === "dynamicToolCall");
   if (openingMessageIndex >= 0 || openingToolIndex < 0) {
     throw new Error(`Claude tool-first turn self-test failed: ${JSON.stringify(openingEvents)}`);
+  }
+  const continuationSession = {
+    ...openingSession,
+    turn: null,
+    turnSequence: 1,
+    automaticTurnsPending: 0,
+    steerPending: 0,
+    streamBlocks: new Map(),
+  };
+  beginTurn(continuationSession, [{ type: "text", text: "provider 메뉴를 수정해" }]);
+  continuationSession.turn = null;
+  continuationSession.automaticTurnsPending = 1;
+  beginUntrackedTurn(continuationSession, { type: "assistant", parent_tool_use_id: null });
+  if (!continuationSession.turn?.koreanRequest
+    || normalizeProgressText(continuationSession.turn, "Now continue the implementation.") !== "") {
+    throw new Error("Claude automatic turn lost Korean progress filtering");
+  }
+  beginTurn(continuationSession, [{ type: "text", text: "Update the provider menu" }]);
+  continuationSession.turn = null;
+  continuationSession.automaticTurnsPending = 1;
+  beginUntrackedTurn(continuationSession, { type: "assistant", parent_tool_use_id: null });
+  if (continuationSession.turn?.koreanRequest
+    || normalizeProgressText(continuationSession.turn, "Now continue the implementation.") === "") {
+    throw new Error("Claude automatic turn changed English progress filtering");
   }
   const contextCaptured = [];
   process.stdout.write = (chunk) => {

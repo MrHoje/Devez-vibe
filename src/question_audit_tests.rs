@@ -158,7 +158,7 @@ fn esc_queue_does_not_resume_after_failures() {
         state.queued_prompts.push_back("다음 요청".into());
         state.handle_key(KeyEvent::from(KeyCode::Esc));
         match failure {
-            "interrupt" => state.set_interrupt_failed("중단 실패"),
+            "interrupt" => state.set_interrupt_failed("Interrupt failed"),
             "start" => state.set_request_failed("시작 실패"),
             "answer" => state.restore_failed_question_response(&json!({"answers": {"q": {"answers": ["보관할 답"]}}})),
             "malformed" => { state.begin_server_request(json!(1), "item/tool/requestUserInput", &json!({"questions": []})); }
@@ -375,7 +375,7 @@ fn audit_disconnect_after_early_confirmation_preserves_answer_once() {
     state.reject_unanswered_question("item/completed", &audit_async_question("question-1", json!([{"title": "입력하세요"}])));
     state.handle_paste("보관할 답변");
     state.handle_key(KeyEvent::from(KeyCode::Enter));
-    state.fallback_from_codex("연결 종료");
+    state.fallback_from_codex("Connection closed");
     assert!(!state.awaiting_input());
     assert_eq!(state.editor.text().matches("보관할 답변").count(), 1);
     assert!(state.take_queued_prompt().is_none());

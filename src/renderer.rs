@@ -273,7 +273,7 @@ impl Block {
         let body = answers.iter().map(|(question, answer)| {
             format!("{}:\n  ↳ {answer}", question.trim_end_matches([':', '：', '?', '？']))
         }).collect::<Vec<_>>().join("\n\n");
-        let mut block = Self::new(BlockKind::User, "질문 답변", body);
+        let mut block = Self::new(BlockKind::User, "Question answers", body);
         block.children = answers.into_iter().map(|(question, answer)| {
             Self::new(BlockKind::User, question, answer)
         }).collect();
@@ -1520,7 +1520,7 @@ fn trim_transcript_history(
     }
     if start > payload_start {
         let is_prompt = |block: &Block| matches!(block.kind, BlockKind::User)
-            && block.children.is_empty() && block.title != "질문 답변";
+            && block.children.is_empty() && block.title != "Question answers";
         if let Some(offset) = history[start..].iter().position(is_prompt) {
             start += offset;
             history.drain(payload_start..start);
@@ -8852,6 +8852,45 @@ fn overlay_frame_with_expansion(
                         }),
                     );
                 }
+            }
+            // A question with nothing to pick from types its answer inside the
+            // card, right under the prompt, instead of a detached box below it.
+            if option_count == 0
+                && let Some(editor) = overlay.input
+            {
+                let prefix = "│ ❯  ".to_owned();
+                let continuation = "│    ".to_owned();
+                let (rows_text, cursor_row, cursor_column) = inline_answer_rows(
+                    editor,
+                    UnicodeWidthStr::width(prefix.as_str()),
+                    wrap_width,
+                    composer_preedit,
+                );
+                inline_cursor = Some((lines.len() + cursor_row, cursor_column));
+                let first_input_row = lines.len();
+                for (part_index, part) in rows_text.iter().enumerate() {
+                    let line_prefix = if part_index == 0 {
+                        prefix.clone()
+                    } else {
+                        continuation.clone()
+                    };
+                    lines.extend(
+                        wrapped_line_with_continuation(
+                            &line_prefix,
+                            &continuation,
+                            Tone::Border,
+                            part,
+                            Tone::Plain,
+                            false,
+                            wrap_width,
+                        )
+                        .into_iter()
+                        .map(|line| {
+                            close_panel_row(split_panel_border(line, Tone::Accent), panel_width)
+                        }),
+                    );
+                }
+                inline_input_rows = Some(first_input_row..lines.len());
             }
             lines.push(panel_padding_row(panel_width));
             lines.push(panel_rule_row("╰─ ", &overlay.hint, '╯', panel_width));
@@ -23841,6 +23880,7 @@ mod tests {
         );
     }
 
+
     #[test]
     fn rewrapping_preserves_expanded_bash_output() {
         let block = Block::new(BlockKind::Tool, "Shell · first", "one\ntwo");
@@ -25275,6 +25315,57 @@ mod tests {
         );
     }
 
+    /// The free-text answer belongs to the question card, above the composer, so
+    /// it renders inside the panel rows and leaves no detached composer box.
+    #[test]
+    fn free_text_question_answer_sits_inside_the_card() {
+        let mut editor = Editor::default();
+        editor.insert_str("답변");
+        let frame = overlay_frame(
+            &[],
+            OverlayView {
+                closable: false,
+                title: "테스트".to_owned(),
+                lines: vec![OverlayLine {
+                    text: "무엇을 도와드릴까요?".to_owned(),
+                    selected: false,
+                    muted: false,
+                }],
+                slider: None,
+                hint: "Enter Send · Esc Cancel".to_owned(),
+                style: OverlayStyle::Question,
+                input: Some(&editor),
+                input_label: "Answer",
+                input_placeholder: "Type your answer…",
+            },
+            None,
+            StatusArea {
+                fallback: String::new(),
+                line: None,
+                diff_reference_lines: None,
+                side_panel_open: false,
+                composer_notice: None,
+                composer_mode: None,
+            },
+            80,
+        );
+        assert!(
+            frame.composer_index.is_none(),
+            "answer rendered as a detached composer box"
+        );
+        let painted = frame.lines.iter().map(painted).collect::<Vec<_>>();
+        let answer_row = painted
+            .iter()
+            .position(|line| line.contains("답변"))
+            .expect("typed answer painted");
+        let panel_end = frame.dock_index + frame.question_panel_rows;
+        assert!(
+            (frame.dock_index..panel_end).contains(&answer_row),
+            "answer row {answer_row} fell outside panel {}..{panel_end}",
+            frame.dock_index
+        );
+    }
+
     /// End to end: what the keys did has to be what the panel paints, so the
     /// answer is followed from the question arriving to the row it lands on.
     #[test]
@@ -25602,7 +25693,7 @@ mod tests {
         for expected in ["첫 질문", "추가 설명", "첫 답변", "↳ 직접 입력한 문구", "둘째 질문", "둘째 답변"] {
             assert!(text.contains(expected));
         }
-        let ordinary = Block::new(BlockKind::User, "질문 답변", block.body.clone());
+        let ordinary = Block::new(BlockKind::User, "Question answers", block.body.clone());
         assert!(user_prompt_lines_with_history(&ordinary, 80, None, false).iter()
             .all(|line| !line.prefix.contains("└─▶")));
     }
@@ -28483,7 +28574,7 @@ mod tests {
             ("Usage", "/provider [claude|codex|opencode]", "● Usage: /provider [claude|codex|opencode]"),
             ("연결 실패", "인증 만료\r\n\r\n다시 로그인하세요.", "● 연결 실패: 인증 만료\n  다시 로그인하세요."),
             ("Usage", "/provider [claude|codex|opencode]\n/provider [claude|codex] MODEL\nOpenCode: /provider opencode, then /model.", "● Usage: /provider [claude|codex|opencode]\n  /provider [claude|codex] MODEL\n  OpenCode: /provider opencode, then /model."),
-            ("연결 종료", "", "● 연결 종료"),
+            ("Connection closed", "", "● Connection closed"),
             ("", "서버 응답 없음", "● 서버 응답 없음"),
         ] {
             let block = Block::new(BlockKind::Error, title, body);

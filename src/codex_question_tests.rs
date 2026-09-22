@@ -269,7 +269,7 @@ async fn event(server: &mut AppServer, state: &mut AppState) -> ServerEvent {
     let event = timeout(Duration::from_secs(120), server.next_event())
         .await
         .expect("실제 모델 응답 시간 초과")
-        .expect("연결 종료");
+        .expect("Connection closed");
     if let ServerEvent::Notification { method, params } = &event {
         assert!(
             state.reject_unanswered_question(method, params).is_none(),

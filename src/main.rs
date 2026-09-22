@@ -287,7 +287,7 @@ async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
     if fallback_to_claude {
         state.push_notice(
             BlockKind::Warning,
-            "Codex 사용 불가",
+            "Codex unavailable",
             format!(
                 "{}\nClaude provider로 자동 전환했습니다.",
                 codex_unavailable_reason
@@ -898,7 +898,7 @@ async fn open_resume_picker(server: &BackendServer, state: &mut AppState) {
     .await
     {
         Ok(sessions) => state.open_session_picker(sessions),
-        Err(error) => state.push_notice(BlockKind::Error, "세션 목록 실패", error.to_string()),
+        Err(error) => state.push_notice(BlockKind::Error, "Session list failed", error.to_string()),
     }
 }
 
@@ -1136,7 +1136,7 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
                     !enabled,
                     Some(message.clone()),
                 ) {
-                    state.push_notice(BlockKind::Error, "Skill 변경 실패", message);
+                    state.push_notice(BlockKind::Error, "Skill update failed", message);
                 }
             }
         },
@@ -1166,7 +1166,7 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
             Err(error) => {
                 let message = format!("{name} · 변경 실패: {error}");
                 if !state.apply_plugin_enabled(provider, &id, !enabled, message.clone()) {
-                    state.push_notice(BlockKind::Error, "Plugin 변경 실패", message);
+                    state.push_notice(BlockKind::Error, "Plugin update failed", message);
                 }
             }
         },
@@ -1187,7 +1187,7 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
             Err(error) => {
                 let message = format!("{name} · 변경 실패: {error}");
                 if !state.apply_mcp_enabled(provider, &name, !enabled, message.clone()) {
-                    state.push_notice(BlockKind::Error, "MCP 변경 실패", message);
+                    state.push_notice(BlockKind::Error, "MCP update failed", message);
                 }
             }
         },
@@ -1196,7 +1196,7 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
             Ok(response) => {
                 state.finish_mcp_reconnect(provider, &response, "재연결했습니다.".to_owned())
             }
-            Err(error) => state.push_notice(BlockKind::Error, "MCP 재연결 실패", error),
+            Err(error) => state.push_notice(BlockKind::Error, "MCP reconnect failed", error),
         },
         ManagementUpdate::McpLogin {
             name,
@@ -1213,7 +1213,7 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
                     if let Err(error) = open_url(url) {
                         state.push_notice(
                             BlockKind::Warning,
-                            "브라우저 열기 실패",
+                            "Browser open failed",
                             error.to_string(),
                         );
                     }
@@ -1363,7 +1363,7 @@ async fn open_btw(
     let response = match response {
         Ok(response) => response,
         Err(error) => {
-            main.push_notice(BlockKind::Error, "BTW 시작 실패", error.to_string());
+            main.push_notice(BlockKind::Error, "BTW start failed", error.to_string());
             return None;
         }
     };
@@ -1375,7 +1375,7 @@ async fn open_btw(
     else {
         main.push_notice(
             BlockKind::Error,
-            "BTW 시작 실패",
+            "BTW start failed",
             "The thread/fork response did not include a thread ID.",
         );
         return None;
@@ -1452,7 +1452,7 @@ async fn execute_split_conversation_action(
                 )
                 .await
             {
-                state.push_notice(BlockKind::Error, "추가 입력 실패", error.to_string());
+                state.push_notice(BlockKind::Error, "Follow-up input failed", error.to_string());
             }
             Ok(false)
         }
@@ -1849,7 +1849,7 @@ async fn event_loop(
                     }
                     Some(Ok(_)) => Action::None,
                     Some(Err(error)) => {
-                        state.push_notice(BlockKind::Error, "터미널 입력 오류", error.to_string());
+                        state.push_notice(BlockKind::Error, "Terminal input error", error.to_string());
                         Action::Quit
                     }
                     None => Action::Quit,
@@ -1930,7 +1930,7 @@ async fn event_loop(
                             .begin_server_request(id, &method, &params)
                     }
                     Some(ServerEvent::ProtocolWarning(message)) => {
-                        state.push_notice(BlockKind::Warning, "프로토콜 경고", message);
+                        state.push_notice(BlockKind::Warning, "Protocol warning", message);
                         Action::None
                     }
                     Some(ServerEvent::ProviderUnavailable { provider, message }) => {
@@ -1949,7 +1949,7 @@ async fn event_loop(
                         Action::None
                     }
                     Some(ServerEvent::Closed(message)) => {
-                        state.push_notice(BlockKind::Error, "연결 종료", message);
+                        state.push_notice(BlockKind::Error, "Connection closed", message);
                         connection_closed = true;
                         Action::None
                     }
@@ -1969,7 +1969,7 @@ async fn event_loop(
             }
             Some(catalog) = recv_integrations(&mut integration_rx) => {
                 if let Err(error) = apply_integrations(state, catalog) {
-                    state.push_notice(BlockKind::Warning, "통합 기능 조회 실패", error.to_string());
+                    state.push_notice(BlockKind::Warning, "Integrations lookup failed", error.to_string());
                 }
                 Action::None
             }
@@ -2740,7 +2740,7 @@ async fn execute_action(
                 params["toolPolicy"] = policy;
             }
             if let Err(error) = server.request("turn/steer", params).await {
-                state.push_notice(BlockKind::Error, "추가 입력 실패", error.to_string());
+                state.push_notice(BlockKind::Error, "Follow-up input failed", error.to_string());
             }
         }
         Action::RunShell(command) => run_local_shell(state, renderer, command).await?,
@@ -2753,7 +2753,7 @@ async fn execute_action(
         Action::CancelUserInput { id, interrupt } => {
             if claude::is_claude_request_id(&id)
                 && let Err(error) = server.respond(id, json!({ "answers": {}, "cancelled": true })) {
-                state.push_notice(BlockKind::Error, "응답 전송 실패", error.to_string());
+                state.push_notice(BlockKind::Error, "Reply send failed", error.to_string());
             }
             if interrupt {
                 interrupt_turn(server, state).await;
@@ -2781,7 +2781,7 @@ async fn execute_action(
                     );
                     state.begin_thread_switch();
                     state.set_host_loading(true);
-                    state.push_notice(BlockKind::System, "작업 트리 준비 중", "파일과 대화를 준비하고 있습니다. 입력한 요청은 준비가 끝나면 실행합니다.");
+                    state.push_notice(BlockKind::System, "Preparing worktree", "파일과 대화를 준비하고 있습니다. 입력한 요청은 준비가 끝나면 실행합니다.");
                     draw(state, renderer)?;
                     let destination = path.clone();
                     let account_plan = state.account_plan().clone();
@@ -2820,7 +2820,7 @@ async fn execute_action(
                                 state.begin_cost_restore();
                                 apply_claude_account_metadata(state, &thread_response);
                             }
-                            state.push_notice(BlockKind::System, "작업 트리 준비 완료", path.to_string_lossy());
+                            state.push_notice(BlockKind::System, "Worktree ready", path.to_string_lossy());
                             if !state.has_deferred_resume()
                                 && let Some(text) = queued
                                 && (!state.thread_pending() || open_pending_thread(server, state, renderer).await?)
@@ -2840,7 +2840,7 @@ async fn execute_action(
                     return Ok(false);
                 }
                 Err(error) => {
-                    state.push_notice(BlockKind::Error, "작업 트리 생성 실패", error.to_string());
+                    state.push_notice(BlockKind::Error, "Worktree creation failed", error.to_string());
                 }
             }
         }
@@ -2894,7 +2894,7 @@ async fn execute_action(
         }
         Action::PersistAutoKnowledge(enabled) => {
             if let Err(error) = state::write_project_auto_knowledge(&state.cwd, enabled) {
-                state.push_notice(BlockKind::Warning, "자동 지식 기록 설정 저장 실패", error.to_string());
+                state.push_notice(BlockKind::Warning, "Auto knowledge setting save failed", error.to_string());
             }
         }
         Action::SetFast(enabled) => {
@@ -2921,7 +2921,7 @@ async fn execute_action(
         {
             Ok(status) => state.open_claude_permissions(&status, notice),
             Err(error) => {
-                state.push_notice(BlockKind::Error, "Claude 권한 조회 실패", error.to_string())
+                state.push_notice(BlockKind::Error, "Claude permissions lookup failed", error.to_string())
             }
         },
         Action::UpdateClaudePermission {
@@ -3176,7 +3176,7 @@ async fn execute_action(
                 .await
             {
                 state.end_compaction();
-                state.push_notice(BlockKind::Error, "압축 실패", error.to_string());
+                state.push_notice(BlockKind::Error, "Compaction failed", error.to_string());
             }
         }
         Action::OpenMcp(notice) => match list_mcp_servers(server, state).await {
@@ -3188,7 +3188,7 @@ async fn execute_action(
             Err(error) => {
                 let model = state.selected_model_name().to_owned();
                 state.note_mcp_query_error_for_model(error.to_string(), &model);
-                state.push_notice(BlockKind::Error, "MCP 목록 실패", error.to_string());
+                state.push_notice(BlockKind::Error, "MCP list failed", error.to_string());
             }
         },
         Action::ReconnectMcp(name) => {
@@ -3198,7 +3198,7 @@ async fn execute_action(
             let (Some(client), Some(thread_id)) = (client, thread_id) else {
                 state.push_notice(
                     BlockKind::Error,
-                    "MCP 재연결 실패",
+                    "MCP reconnect failed",
                     "현재 provider의 MCP 세션이 아직 시작되지 않았습니다.",
                 );
                 return Ok(false);
@@ -3338,7 +3338,7 @@ async fn execute_action(
                             {
                                 state.push_notice(
                                     BlockKind::Warning,
-                                    "브라우저 열기 실패",
+                                    "Browser open failed",
                                     error.to_string(),
                                 );
                             }
@@ -3379,7 +3379,7 @@ async fn execute_action(
             {
                 Ok(()) => refresh_provider_models(server, state, &provider_name).await,
                 Err(error) => {
-                    state.push_notice(BlockKind::Error, "OAuth 연결 실패", error.to_string())
+                    state.push_notice(BlockKind::Error, "OAuth connection failed", error.to_string())
                 }
             }
         }
@@ -3447,12 +3447,12 @@ async fn execute_action(
                 .request("account/login/cancel", json!({ "loginId": login_id }))
                 .await
             {
-                state.push_notice(BlockKind::Warning, "로그인 취소 실패", error.to_string());
+                state.push_notice(BlockKind::Warning, "Sign-in cancel failed", error.to_string());
             }
         }
         Action::Logout => match server.request("account/logout", json!({})).await {
             Ok(_) => state.apply_logout(),
-            Err(error) => state.push_notice(BlockKind::Error, "로그아웃 실패", error.to_string()),
+            Err(error) => state.push_notice(BlockKind::Error, "Sign-out failed", error.to_string()),
         },
         Action::OpenPlugins { scope, notice } => match list_plugins(server, state).await {
             Ok(response) => {
@@ -3461,7 +3461,7 @@ async fn execute_action(
                 state.open_plugin_picker(catalog, scope, notice);
             }
             Err(error) => {
-                state.push_notice(BlockKind::Error, "플러그인 목록 실패", error.to_string())
+                state.push_notice(BlockKind::Error, "Plugin list failed", error.to_string())
             }
         },
         Action::OpenPluginDetail { target, origin } => {
@@ -3535,7 +3535,7 @@ async fn execute_action(
                 ),
             },
             Err(error) => {
-                state.push_notice(BlockKind::Error, "플러그인 조회 실패", error.to_string())
+                state.push_notice(BlockKind::Error, "Plugin lookup failed", error.to_string())
             }
         },
         Action::PreparePluginUninstall(query) => match list_plugins(server, state).await {
@@ -3561,7 +3561,7 @@ async fn execute_action(
                 ),
             },
             Err(error) => {
-                state.push_notice(BlockKind::Error, "플러그인 조회 실패", error.to_string())
+                state.push_notice(BlockKind::Error, "Plugin lookup failed", error.to_string())
             }
         },
         Action::SetPlugin { query, enabled } => match list_plugins(server, state).await {
@@ -3625,7 +3625,7 @@ async fn execute_action(
                 ),
             },
             Err(error) => {
-                state.push_notice(BlockKind::Error, "플러그인 조회 실패", error.to_string())
+                state.push_notice(BlockKind::Error, "Plugin lookup failed", error.to_string())
             }
         },
         Action::SetPluginEnabled { plugin, enabled } => {
@@ -3842,7 +3842,7 @@ async fn execute_action(
                     let _ = refresh_integrations(server, state, true).await;
                 }
                 Err(error) => {
-                    state.push_notice(BlockKind::Error, "플러그인 설치 실패", error.to_string())
+                    state.push_notice(BlockKind::Error, "Plugin install failed", error.to_string())
                 }
             }
         }
@@ -3873,7 +3873,7 @@ async fn execute_action(
                     let _ = refresh_integrations(server, state, true).await;
                 }
                 Err(error) => {
-                    state.push_notice(BlockKind::Error, "플러그인 제거 실패", error.to_string())
+                    state.push_notice(BlockKind::Error, "Plugin removal failed", error.to_string())
                 }
             }
         }
@@ -3951,7 +3951,7 @@ async fn execute_action(
                     .await;
                 }
             },
-            Err(error) => state.push_notice(BlockKind::Error, "Skill 조회 실패", error.to_string()),
+            Err(error) => state.push_notice(BlockKind::Error, "Skill lookup failed", error.to_string()),
         },
         Action::SetSkillEnabled {
             provider,
@@ -4015,7 +4015,7 @@ async fn execute_action(
             match list_skills(server, &state.cwd, true, provider).await {
                 Ok(response) => state.update_skills_for_provider(provider, &response),
                 Err(error) => {
-                    state.push_notice(BlockKind::Warning, "Skill 새로고침 실패", error.to_string())
+                    state.push_notice(BlockKind::Warning, "Skill refresh failed", error.to_string())
                 }
             }
         }
@@ -4039,12 +4039,12 @@ async fn execute_action(
         Action::RpcResponse { id, result } => {
             if let Err(error) = server.respond(id, result.clone()) {
                 state.restore_failed_question_response(&result);
-                state.push_notice(BlockKind::Error, "응답 전송 실패", error.to_string());
+                state.push_notice(BlockKind::Error, "Reply send failed", error.to_string());
             }
         }
         Action::RpcError { id, message } => {
             if let Err(error) = server.respond_error(id, -32601, &message) {
-                state.push_notice(BlockKind::Error, "오류 응답 실패", error.to_string());
+                state.push_notice(BlockKind::Error, "Error reply failed", error.to_string());
             }
         }
     }
@@ -4078,12 +4078,12 @@ async fn activate_codex(
             }
             Err(error) => {
                 state.clear_pending_provider_model();
-                state.push_notice(BlockKind::Error, "Codex 모델 조회 실패", error.to_string())
+                state.push_notice(BlockKind::Error, "Codex model lookup failed", error.to_string())
             }
         },
         Err(error) => {
             state.clear_pending_provider_model();
-            state.push_notice(BlockKind::Error, "Codex 사용 불가", error.to_string());
+            state.push_notice(BlockKind::Error, "Codex unavailable", error.to_string());
         }
     }
     state.set_provider_changing(None);
@@ -4131,7 +4131,7 @@ async fn activate_open_code(
                 error.to_string(),
             ),
         },
-        Err(error) => state.push_notice(BlockKind::Error, "OpenCode 사용 불가", error.to_string()),
+        Err(error) => state.push_notice(BlockKind::Error, "OpenCode unavailable", error.to_string()),
     }
     state.set_provider_changing(None);
     Ok(())
@@ -4283,13 +4283,13 @@ async fn resume_thread(
     {
         Ok(thread_id) => thread_id,
         Err(error) => {
-            state.push_notice(BlockKind::Error, "세션 재개 실패", error.to_string());
+            state.push_notice(BlockKind::Error, "Session resume failed", error.to_string());
             return Ok(false);
         }
     };
 
     if let Err(error) = server.prepare_resume_runtime(&thread_id).await {
-        state.push_notice(BlockKind::Error, "세션 재개 실패", error.to_string());
+        state.push_notice(BlockKind::Error, "Session resume failed", error.to_string());
         return Ok(false);
     }
 
@@ -4520,7 +4520,7 @@ async fn send_queued_prompt(
     if let Err(error) =
         await_with_activity(state, renderer, server.request("turn/steer", params)).await?
     {
-        state.push_notice(BlockKind::Error, "추가 입력 실패", error.to_string());
+        state.push_notice(BlockKind::Error, "Follow-up input failed", error.to_string());
     }
     Ok(())
 }
@@ -4651,13 +4651,13 @@ fn execute_local_action(
         Action::Copy(text) => {
             match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(&text)) {
                 Ok(()) => state.set_copy_notice(),
-                Err(error) => state.push_notice(BlockKind::Error, "복사 실패", error.to_string()),
+                Err(error) => state.push_notice(BlockKind::Error, "Copy failed", error.to_string()),
             }
         }
         Action::CopyQuietly(text) => {
             if let Err(error) = Clipboard::new().and_then(|mut clipboard| clipboard.set_text(&text))
             {
-                state.push_notice(BlockKind::Error, "복사 실패", error.to_string());
+                state.push_notice(BlockKind::Error, "Copy failed", error.to_string());
             }
         }
         // The composer already gave the text up; only the clipboard is left. A
@@ -4666,13 +4666,13 @@ fn execute_local_action(
             match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(&text)) {
                 Ok(()) => state.set_cut_notice(),
                 Err(error) => {
-                    state.push_notice(BlockKind::Error, "잘라내기 실패", error.to_string())
+                    state.push_notice(BlockKind::Error, "Cut failed", error.to_string())
                 }
             }
         }
         Action::OpenUrl(url) => {
             if let Err(error) = open_url(&url) {
-                state.push_notice(BlockKind::Warning, "브라우저 열기 실패", error.to_string());
+                state.push_notice(BlockKind::Warning, "Browser open failed", error.to_string());
             }
         }
         Action::OpenLinkDirectory(target) => {
@@ -4683,13 +4683,13 @@ fn execute_local_action(
                 Ok(())
             });
             if let Err(error) = result {
-                state.push_notice(BlockKind::Warning, "폴더 열기 실패", error.to_string());
+                state.push_notice(BlockKind::Warning, "Folder open failed", error.to_string());
             }
         }
         Action::SetTheme(selected) => {
             renderer.set_theme(selected)?;
             if let Err(error) = theme::save(selected) {
-                state.push_notice(BlockKind::Warning, "테마 저장 실패", error.to_string());
+                state.push_notice(BlockKind::Warning, "Theme save failed", error.to_string());
             }
         }
         Action::ScrollToBottom => {
@@ -4722,7 +4722,7 @@ async fn set_fast_mode(server: &BackendServer, state: &mut AppState, enabled: bo
     let Some(params) = fast_settings_update_params(&state.thread_id, &service_tier) else {
         state.push_notice(
             BlockKind::Error,
-            "Fast 전환 실패",
+            "Fast toggle failed",
             "세션을 먼저 시작하지 못했습니다.",
         );
         return;
@@ -4744,10 +4744,10 @@ async fn set_fast_mode(server: &BackendServer, state: &mut AppState, enabled: bo
                 )
                 .await
             {
-                state.push_notice(BlockKind::Warning, "Fast 설정 저장 실패", error.to_string());
+                state.push_notice(BlockKind::Warning, "Fast setting save failed", error.to_string());
             }
         }
-        Err(error) => state.push_notice(BlockKind::Error, "Fast 전환 실패", error.to_string()),
+        Err(error) => state.push_notice(BlockKind::Error, "Fast toggle failed", error.to_string()),
     }
 }
 
@@ -5149,7 +5149,7 @@ async fn refresh_provider_models(
         }
         Err(error) => {
             state.provider_connected(provider_name);
-            state.push_notice(BlockKind::Warning, "모델 새로고침 실패", error.to_string());
+            state.push_notice(BlockKind::Warning, "Model refresh failed", error.to_string());
         }
     }
 }
@@ -5962,7 +5962,11 @@ fn paste_clipboard_text_shortcut(
     now: Instant,
     selection: Option<std::ops::Range<usize>>,
 ) -> bool {
-    if !is_paste_shortcut(key) || state.has_pending_interaction() {
+    // A blocking overlay usually swallows Ctrl+V, but a free-text question is a
+    // text field like the composer and must accept a clipboard paste too.
+    if !is_paste_shortcut(key)
+        || (state.has_pending_interaction() && !state.buffers_pending_text_input())
+    {
         return false;
     }
     let Some(text) = clipboard_text().filter(|text| !text.is_empty()) else {
@@ -6398,7 +6402,7 @@ fn start_login_flow(state: &mut AppState, method: LoginMethod, response: &Value)
                     if let Err(error) = open_url(auth_url) {
                         state.push_notice(
                             BlockKind::Warning,
-                            "브라우저 열기 실패",
+                            "Browser open failed",
                             format!("{error}\n위 Sign-in URL을 직접 열어주세요."),
                         );
                     }
