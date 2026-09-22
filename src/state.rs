@@ -1401,7 +1401,6 @@ const STREAM_RATE_DECAY: f32 = 1.5;
 /// A stall — a slow repaint, a descheduled loop — must not turn into one large
 /// reveal once the loop comes back.
 const STREAM_MAX_STEP: Duration = Duration::from_millis(40);
-const STREAM_CATCH_UP_CLUSTERS: usize = 512;
 const STREAM_CATCH_UP_LINES: usize = 8;
 
 /// How many characters at the end of the streamed text are still rising toward
@@ -1473,7 +1472,7 @@ impl TextPace {
         self.pending.push_str(delta);
     }
 
-    fn take(&mut self, elapsed: Duration, visible_end: usize) -> Option<String> {
+    fn take(&mut self, elapsed: Duration, visible_end: usize, max_clusters: usize) -> Option<String> {
         if self.pending.is_empty() {
             // The rate is kept, not cleared. Claude's deltas arrive in bursts
             // separated by short gaps, and restarting from the floor at every gap
@@ -1499,7 +1498,7 @@ impl TextPace {
         if size < 1.0 {
             return None;
         }
-        let end = visible_cluster_end(visible, size as usize);
+        let end = visible_cluster_end(visible, (size as usize).min(max_clusters));
         Some(self.pending.drain(..end).collect())
     }
 
@@ -14529,7 +14528,12 @@ impl AppState {
     pub fn drain_stream_text(&mut self, elapsed: Duration) -> StreamReveal {
         let mut reveal = StreamReveal::default();
         let finishing = self.held_since.is_some_and(|since| since.elapsed() >= Duration::from_millis(120));
-        let mut clusters_left = STREAM_CATCH_UP_CLUSTERS;
+        // Catch-up shares the same elapsed-time ceiling as ordinary pacing.
+        // A fixed 512-character allowance on a 4ms tick could reveal an entire
+        // short answer before the terminal painted another frame.
+        let mut clusters_left = (STREAM_MAX_RATE * elapsed.min(STREAM_MAX_STEP).as_secs_f32())
+            .floor()
+            .max(1.0) as usize;
         let mut lines_left = STREAM_CATCH_UP_LINES;
         for id in &self.active_order {
             let Some(active) = self.active.get_mut(id) else { continue };
@@ -14576,8 +14580,7 @@ impl AppState {
                 let chunk = if catch_up {
                     active.pace.take_catch_up(&mut clusters_left, &mut lines_left, visible_end)
                 } else {
-                    let end = visible_cluster_end(&active.pace.pending[..visible_end], clusters_left);
-                    let chunk = active.pace.take(elapsed, end);
+                    let chunk = active.pace.take(elapsed, visible_end, clusters_left);
                     if let Some(chunk) = &chunk {
                         clusters_left -= visible_cluster_count(chunk);
                         lines_left = lines_left.saturating_sub(chunk.bytes().filter(|byte| *byte == b'\n').count());
@@ -24738,7 +24741,7 @@ mod tests {
         let revealed = |elapsed| {
             let mut pace = TextPace::default();
             pace.push(&text);
-            pace.take(elapsed, usize::MAX)
+            pace.take(elapsed, usize::MAX, usize::MAX)
                 .map(|chunk| chunk.chars().count())
         };
 
@@ -24754,16 +24757,16 @@ mod tests {
         let mut pace = TextPace::default();
         pace.push(&"흐름을 유지하는지 확인하는 긴 문장입니다.".repeat(6));
         for _ in 0..10 {
-            pace.take(TEST_FRAME, usize::MAX);
+            pace.take(TEST_FRAME, usize::MAX, usize::MAX);
         }
         let reached = pace.rate;
         assert!(reached > STREAM_MIN_RATE);
 
         // Drained dry, then the next burst lands.
         while !pace.pending.is_empty() {
-            pace.take(TEST_FRAME, usize::MAX);
+            pace.take(TEST_FRAME, usize::MAX, usize::MAX);
         }
-        assert!(pace.take(TEST_FRAME, usize::MAX).is_none());
+        assert!(pace.take(TEST_FRAME, usize::MAX, usize::MAX).is_none());
         assert!(pace.rate >= reached * 0.9, "{} vs {reached}", pace.rate);
     }
 
@@ -24885,6 +24888,82 @@ mod tests {
     }
 
     #[test]
+    fn completed_text_reveal_obeys_elapsed_time() {
+        for elapsed in [
+            TEST_FRAME,
+            Duration::from_millis(16),
+            Duration::from_millis(40),
+            Duration::from_secs(2),
+        ] {
+            for text in ["가".repeat(150), "한글👨‍👩‍👧‍👦\n".repeat(800)] {
+                assert_completed_reveal_budget(&text, elapsed);
+            }
+        }
+    }
+
+    fn assert_completed_reveal_budget(text: &str, elapsed: Duration) {
+        let mut state = test_state();
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({"itemId":"paced", "delta":text}),
+        );
+        state.handle_notification(
+            "item/completed",
+            &json!({"item":{"id":"paced","type":"agentMessage","text":text}}),
+        );
+        let budget = (STREAM_MAX_RATE * elapsed.min(STREAM_MAX_STEP).as_secs_f32())
+            .floor()
+            .max(1.0) as usize;
+        for _ in 0..10000 {
+            state.held_since = Some(Instant::now() - Duration::from_secs(2));
+            let reveal = state.drain_stream_text(elapsed);
+            assert!(
+                reveal.clusters <= budget,
+                "{} clusters exceed {budget} for {elapsed:?}",
+                reveal.clusters,
+            );
+            if !state.stream_events_pending() {
+                assert!(state.committed.iter().any(|block| block.body == text));
+                return;
+            }
+        }
+        panic!("paced completion did not finish");
+    }
+
+    #[test]
+    #[ignore = "requires a local Claude transcript through DVZ_STREAM_REPLAY"]
+    fn replay_local_claude_text_with_paced_completion() {
+        let path = std::env::var_os("DVZ_STREAM_REPLAY").expect("DVZ_STREAM_REPLAY");
+        let data = std::fs::read_to_string(path).expect("local transcript");
+        let mut texts = Vec::new();
+        for line in data.lines() {
+            let Ok(entry) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if entry["type"] != "assistant" {
+                continue;
+            }
+            if let Some(content) = entry.pointer("/message/content").and_then(Value::as_array) {
+                for block in content {
+                    if block["type"] == "text"
+                        && let Some(text) = block["text"].as_str().filter(|text| !text.is_empty())
+                    {
+                        texts.push(text.to_owned());
+                    }
+                }
+            }
+        }
+        assert!(!texts.is_empty());
+        for text in texts.iter().rev().take(32) {
+            assert_completed_reveal_budget(text, TEST_FRAME);
+        }
+        eprintln!(
+            "replayed {} local assistant texts without logging their contents",
+            texts.len().min(32),
+        );
+    }
+
+    #[test]
     fn catch_up_limits_frames_and_preserves_long_multiline_text() {
         let mut state = test_state();
         let text = "한글👨‍👩‍👧‍👦\n".repeat(800);
@@ -24894,7 +24973,7 @@ mod tests {
         for _ in 0..2000 {
             state.held_since = Some(Instant::now() - Duration::from_secs(2));
             let reveal = state.drain_stream_text(Duration::from_secs(2));
-            assert!(reveal.clusters <= STREAM_CATCH_UP_CLUSTERS);
+            assert!(reveal.clusters <= 64);
             if let Some(active) = state.active.get("one") {
                 let lines = active.block.body.bytes().filter(|byte| *byte == b'\n').count();
                 assert!(lines - previous_lines <= STREAM_CATCH_UP_LINES);
