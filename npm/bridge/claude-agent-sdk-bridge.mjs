@@ -39,7 +39,10 @@ const CLAUDE_PROVIDER_SKILLS = new Set([
 // Built-in commands Claude Code runs only from the user's own message, never
 // from the model (disableModelInvocation), so they go in as typed `/name` text.
 const CLAUDE_USER_ONLY_COMMANDS = new Set(["team-onboarding"]);
-const OPUS_48_MODEL = "claude-opus-4-8";
+// Claude Code's own safeguard fallback (opus5). The host keeps it for that
+// switch but leaves it out of /model; Opus 4.8 is no longer offered.
+const PREVIOUS_OPUS_MODEL = "claude-opus-5";
+const RETIRED_OPUS_MODEL = "claude-opus-4-8";
 const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
 const CLAUDE_TASK_TOOLS = ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList"];
 let nextHostRequest = 1;
@@ -230,8 +233,8 @@ function modelCapabilities(models, model) {
   const capabilities = models.find((candidate) =>
     candidate.value === value || candidate.resolvedModel === value)
     || (!value ? models.find((candidate) => candidate.value === "default") : undefined);
-  return value === OPUS_48_MODEL
-    ? opus48Capabilities(models, capabilities)
+  return value === PREVIOUS_OPUS_MODEL
+    ? previousOpusCapabilities(models, capabilities)
     : capabilities;
 }
 
@@ -251,10 +254,10 @@ function familyCapabilities(models, model) {
       .some((name) => String(name || "").toLowerCase().includes(family)));
 }
 
-function opus48Capabilities(models, existing = {}) {
+function previousOpusCapabilities(models, existing = {}) {
   // The CLI now exposes the Opus alias as `opus[1m]` (and only `default`
   // resolves to it), so an exact `value === "opus"` match finds nothing and the
-  // synthesized Opus 4.8 row loses supportsAutoMode/supportsFastMode. Match the
+  // synthesized Opus 5 row loses supportsAutoMode/supportsFastMode. Match the
   // Opus family instead, falling back to `default`.
   const opus = models.find((model) => String(model.value || "").toLowerCase().startsWith("opus"))
     || models.find((model) => model.value === "default")
@@ -271,9 +274,9 @@ function opus48Capabilities(models, existing = {}) {
   return {
     ...opus,
     ...existing,
-    value: OPUS_48_MODEL,
-    resolvedModel: OPUS_48_MODEL,
-    displayName: "Opus 4.8",
+    value: PREVIOUS_OPUS_MODEL,
+    resolvedModel: PREVIOUS_OPUS_MODEL,
+    displayName: "Opus 5",
     supportsEffort: true,
     supportedEffortLevels,
   };
@@ -328,22 +331,23 @@ function catalogEntry(model, defaultResolvedModel) {
 }
 
 function claudeCatalogEntries(models, defaultResolvedModel) {
-  const catalogModels = models.filter((model) => model.value && model.value !== "default");
+  const catalogModels = models.filter((model) => model.value && model.value !== "default"
+    && ![model.value, model.resolvedModel]
+      .some((name) => stripClaudeModel(String(name || "")).startsWith(RETIRED_OPUS_MODEL)));
   const entries = catalogModels.map((model) => catalogEntry(model, defaultResolvedModel));
   const existingIndex = entries.findIndex((entry) =>
-    stripClaudeModel(entry.model) === OPUS_48_MODEL
-      || stripClaudeModel(entry.id) === OPUS_48_MODEL
-      || entry.displayName === "Opus 4.8");
+    stripClaudeModel(entry.model) === PREVIOUS_OPUS_MODEL
+      || stripClaudeModel(entry.id) === PREVIOUS_OPUS_MODEL);
   const existing = existingIndex >= 0 ? catalogModels[existingIndex] : {};
   if (existingIndex >= 0) entries.splice(existingIndex, 1);
-  const opus48 = catalogEntry(opus48Capabilities(models, existing), defaultResolvedModel);
-  const opus5Index = entries.findIndex((entry) => entry.displayName === "Opus 5");
-  const opusIndex = opus5Index >= 0
-    ? opus5Index
-    : entries.findIndex((entry) => /\bopus\b/i.test(entry.displayName));
+  const previousOpus = {
+    ...catalogEntry(previousOpusCapabilities(models, existing), defaultResolvedModel),
+    hidden: true,
+  };
+  const opusIndex = entries.findIndex((entry) => /\bopus\b/i.test(entry.displayName));
   const fableIndex = entries.findIndex((entry) => /\bfable\b/i.test(entry.displayName));
   const insertAfter = opusIndex >= 0 ? opusIndex : fableIndex;
-  entries.splice(insertAfter + 1, 0, opus48);
+  entries.splice(insertAfter + 1, 0, previousOpus);
   return entries;
 }
 
@@ -830,13 +834,13 @@ function permissionSuggestionLabel(suggestions) {
   const values = [...new Set([...rules, ...directories].filter(Boolean))];
   const destinations = new Set(suggestions.map((suggestion) => suggestion.destination));
   const scope = destinations.has("userSettings")
-    ? "모든 프로젝트에서"
+    ? "in all projects"
     : destinations.has("projectSettings") || destinations.has("localSettings")
-      ? "이 프로젝트에서"
-      : "이번 세션에서";
+      ? "in this project"
+      : "for this session";
   return values.length
-    ? `${scope} 항상 허용: ${values.join(", ")}`
-    : `${scope} 다시 묻지 않기`;
+    ? `Always allow ${scope}: ${values.join(", ")}`
+    : `Don't ask again ${scope}`;
 }
 
 async function requestToolPermission(toolName, input, permission) {
@@ -1486,23 +1490,64 @@ function isKoreanPrompt(input) {
     .filter((item) => item?.type === "text")
     .map((item) => String(item.text || ""))
     .join("\n");
-  return /[\uac00-\ud7a3]/.test(prompt);
+  // Jamo too: a bare `\u3147\u314b` reply is still a Korean turn.
+  return /[\uac00-\ud7a3\u3131-\u318e]/.test(prompt);
 }
 
 // `Now the tile view logic.` carries nothing a Korean reader needs, and the
 // stand-in that used to replace it carried even less — the same sentence before
 // every tool call, however many calls the turn made. Drop the line instead; the
-// tool item that follows already names what is being read.
-function normalizeProgressText(turn, text) {
+// tool item that follows already names what is being read. Any other English
+// one-liner goes too once a tool call is known to follow it
+// (`Bundle is ready; running the upload script.`).
+function normalizeProgressText(turn, text, beforeTool = false) {
   const value = String(text || "");
   const trimmed = value.trim();
-  if (turn?.koreanRequest
-    && trimmed.length <= 160
-    && !/[\uac00-\ud7a3]/.test(trimmed)
-    && /^Now\b[^\r\n]*[.!?]?$/i.test(trimmed)) {
+  if (isEnglishProgressLine(turn, trimmed)
+    && (beforeTool || /^Now\b/i.test(trimmed))) {
     return "";
   }
   return value;
+}
+
+function isEnglishProgressLine(turn, text) {
+  const trimmed = String(text || "").trim();
+  return Boolean(turn?.koreanRequest)
+    && trimmed.length <= 160
+    && !/[\r\n]/.test(trimmed)
+    && !/[\uac00-\ud7a3]/.test(trimmed);
+}
+
+// A finished English line waits for the next block: a tool call drops it,
+// anything else shows it as written.
+function releaseHeldProgress(session, dropped) {
+  const held = session.heldProgress;
+  session.heldProgress = null;
+  if (!held || dropped) return;
+  emitHeldStart(session, held);
+  held.emit(held.text);
+  emitItem(session, "completed", { id: held.id, type: "agentMessage", text: held.text, provider: "Claude" });
+}
+
+// Claude Opus 5.5 and Fable 5.1 send the notes they write between tool calls as
+// progress-update thinking blocks, and the CLI asks for their short summaries.
+// They are the reply's own words rather than reasoning, so they go out as text:
+// shown as reasoning, Super Vibe dropped them and the turn went silent before a
+// question.
+const PROGRESS_UPDATE_MODEL = /claude-(?:opus-5-5|fable-5-1|mythos-5-1)/;
+
+function isProgressUpdateModel(model) {
+  return PROGRESS_UPDATE_MODEL.test(String(model || ""));
+}
+
+function emitProgressUpdate(session, text) {
+  const visible = normalizeProgressText(session.turn, text, true);
+  if (!visible.trim()) return;
+  const id = nextItemId(session, "text");
+  emitItem(session, "started", { id, type: "agentMessage", text: "", provider: "Claude" });
+  emitDelta(session, "item/agentMessage/delta", id, visible);
+  emitItem(session, "completed", { id, type: "agentMessage", text: visible, provider: "Claude" });
+  session.turn.sawVisibleText = true;
 }
 
 // Text pacing lives in the host renderer, not here. A timer in this process
@@ -1565,11 +1610,14 @@ function emitHeldStart(session, current) {
 async function processStreamEvent(session, message) {
   if (!session.turn || message.parent_tool_use_id) return;
   const event = message.event || {};
+  if (event.type === "message_start" || event.type === "message_stop") releaseHeldProgress(session);
   if (event.type === "message_start") {
     session.streamBlocks.clear();
+    session.streamModel = event.message?.model || session.model;
   }
   if (event.type === "content_block_start") {
     const block = event.content_block || {};
+    releaseHeldProgress(session, block.type === "tool_use" || block.type === "server_tool_use");
     if (block.type !== "text" && block.type !== "thinking") return;
     const id = nextItemId(session, block.type);
     const item = block.type === "text"
@@ -1586,10 +1634,10 @@ async function processStreamEvent(session, message) {
     session.streamBlocks.set(event.index, {
       id,
       type: block.type,
+      progress: block.type === "thinking" && isProgressUpdateModel(session.streamModel),
       text: "",
       emit,
       languagePending: held ? "" : null,
-      holdEnglishProgress: false,
       pendingStart: held ? item : null,
     });
     if (!held) emitItem(session, "started", item);
@@ -1606,20 +1654,14 @@ async function processStreamEvent(session, message) {
     if (current.type === "text" && current.languagePending == null) session.turn.sawVisibleText = true;
     if (current.languagePending != null) {
       current.languagePending += delta;
-      const probe = current.languagePending.trimStart();
-      const lower = probe.toLowerCase();
-      if (!current.holdEnglishProgress && "now".startsWith(lower)) return;
-      if (/^now(?:\s|$)/i.test(probe)) {
-        current.holdEnglishProgress = true;
-        return;
-      }
+      if (isEnglishProgressLine(session.turn, current.languagePending)) return;
       emitHeldStart(session, current);
       session.turn.sawVisibleText = true;
       current.emit(current.languagePending);
       current.languagePending = null;
       return;
     }
-    current.emit(delta);
+    if (!current.progress) current.emit(delta);
     return;
   }
   if (event.type === "content_block_stop") {
@@ -1633,6 +1675,12 @@ async function processStreamEvent(session, message) {
         session.streamBlocks.delete(event.index);
         return;
       }
+      if (current.pendingStart && isEnglishProgressLine(session.turn, visible)) {
+        releaseHeldProgress(session);
+        session.heldProgress = current;
+        session.streamBlocks.delete(event.index);
+        return;
+      }
       emitHeldStart(session, current);
       if (visible.trim()) session.turn.sawVisibleText = true;
       current.emit(visible);
@@ -1640,9 +1688,10 @@ async function processStreamEvent(session, message) {
     emitHeldStart(session, current);
     const item = current.type === "text"
       ? { id: current.id, type: "agentMessage", text: current.text, provider: "Claude" }
-      : { id: current.id, type: "reasoning", summary: [current.text] };
+      : { id: current.id, type: "reasoning", summary: [current.progress ? "" : current.text] };
     emitItem(session, "completed", item);
     session.streamBlocks.delete(event.index);
+    if (current.progress) emitProgressUpdate(session, current.text);
   }
 }
 
@@ -1687,10 +1736,14 @@ function processAssistant(session, message) {
   // Without partial SDK events, replay completed text before tool items so the
   // visible order still matches the assistant content order.
   if (!session.streamBlocks.size && !session.turn.sawStreamText) {
-    for (const block of content) {
+    for (const [index, block] of content.entries()) {
       if (block.type !== "text" && block.type !== "thinking") continue;
+      if (block.type === "thinking" && isProgressUpdateModel(message.message?.model)) {
+        emitProgressUpdate(session, block.thinking);
+        continue;
+      }
       const visible = block.type === "text"
-        ? normalizeProgressText(session.turn, block.text)
+        ? normalizeProgressText(session.turn, block.text, content[index + 1]?.type === "tool_use")
         : "";
       if (block.type === "text" && !visible.trim() && String(block.text || "").trim()) continue;
       const id = nextItemId(session, block.type);
@@ -2845,6 +2898,7 @@ async function runPendingPrompt(session) {
 function finishTurn(session, error, durationMs) {
   clearUsageLimitWait(session);
   if (!session.turn) return;
+  releaseHeldProgress(session);
   flushPendingPlan(session);
   clearForegroundSubagents(session);
   const turn = { id: session.turn.id, status: error ? "failed" : session.turn.interruptRequested ? "interrupted" : "completed" };
@@ -3215,8 +3269,14 @@ function historyState(messages) {
           if (!visible.trim() && String(block.text || "").trim()) continue;
           turn.items.push({ id: `${message.uuid}-text`, type: "agentMessage", text: visible, provider: "Claude" });
         }
+        else if (block.type === "thinking" && isProgressUpdateModel(message.message?.model)) {
+          const visible = normalizeProgressText(historyTurn, block.thinking, true);
+          if (visible.trim()) turn.items.push({ id: `${message.uuid}-thinking`, type: "agentMessage", text: visible, provider: "Claude" });
+        }
         else if (block.type === "thinking") turn.items.push({ id: `${message.uuid}-thinking`, type: "reasoning", summary: [block.thinking || ""] });
         else if (block.type === "tool_use") {
+          const last = turn.items.at(-1);
+          if (last?.type === "agentMessage" && !normalizeProgressText(historyTurn, last.text, true).trim()) turn.items.pop();
           const pending = { name: block.name, input: block.input || {}, item: toolItem({}, block.id, block.name, block.input || {}) };
           tools.set(block.id, pending);
           if (block.name === "TaskCreate") {
@@ -4254,6 +4314,26 @@ async function runSelfTest() {
     || englishNowText !== "Now the answer starts.") {
     throw new Error(`Claude resumed progress normalization self-test failed: ${JSON.stringify({ resumedProgressText, englishNowText })}`);
   }
+  const jamoProgress = historyTurns([
+    user("jamo-user", "ㅇㅋ"),
+    {
+      type: "assistant",
+      uuid: "jamo-assistant",
+      message: {
+        role: "assistant",
+        model: "claude-opus-5",
+        content: [
+          { type: "text", text: "Bundle is ready; running the upload script." },
+          { type: "tool_use", id: "jamo-run", name: "PowerShell", input: { command: "upload" } },
+        ],
+      },
+    },
+    taskResult("jamo-result", "jamo-run", { content: "ok" }, "ok"),
+    assistant("jamo-final", "claude-opus-5", "Uploaded v1.2.74."),
+  ])[0]?.items.filter((item) => item.type === "agentMessage").map((item) => item.text);
+  if (JSON.stringify(jamoProgress) !== JSON.stringify(["Uploaded v1.2.74."])) {
+    throw new Error(`Claude English line before tool self-test failed: ${JSON.stringify(jamoProgress)}`);
+  }
   const taskMessages = [user("plan", "작업을 진행해")];
   for (let index = 1; index <= 6; index++) {
     const id = String(24 + index);
@@ -4425,29 +4505,33 @@ async function runSelfTest() {
   const catalogModels = [
     {
       value: "opus[1m]",
-      resolvedModel: "claude-opus-5[1m]",
-      displayName: "Opus 5",
+      resolvedModel: "claude-opus-5-5[1m]",
+      displayName: "Opus 5.5",
       supportsEffort: true,
       supportedEffortLevels: ["high", "max"],
       supportsAutoMode: true,
     },
     { value: "sonnet", resolvedModel: "claude-sonnet-5", displayName: "Sonnet 5" },
     {
-      value: "claude-opus-4-8",
-      resolvedModel: "claude-opus-4-8",
-      displayName: "Opus 4.8",
+      value: "claude-opus-5",
+      resolvedModel: "claude-opus-5",
+      displayName: "Opus 5",
       supportsEffort: false,
       supportedEffortLevels: [],
     },
+    { value: "claude-opus-4-8", resolvedModel: "claude-opus-4-8", displayName: "Opus 4.8" },
   ];
   const catalog = claudeCatalogEntries(catalogModels, "claude-sonnet-5");
-  if (catalog[0]?.displayName !== "Opus 5"
-    || catalog[1]?.displayName !== "Opus 4.8"
-    || catalog[1]?.model !== "claude:claude-opus-4-8"
+  if (catalog.length !== 3
+    || catalog[0]?.displayName !== "Opus 5.5"
+    || catalog[1]?.displayName !== "Opus 5"
+    || catalog[1]?.model !== "claude:claude-opus-5"
+    || catalog[1]?.hidden !== true
+    || catalog.some((entry) => entry.displayName === "Opus 4.8")
     || catalog[1]?.supportsAutoMode !== true
     || catalog[1]?.supportedReasoningEfforts?.[1]?.reasoningEffort !== "max"
     || supportedEffort(
-      modelCapabilities(catalogModels, "claude:claude-opus-4-8"),
+      modelCapabilities(catalogModels, "claude:claude-opus-5"),
       "max",
     ) !== "max") {
     throw new Error(`Claude pinned model self-test failed: ${JSON.stringify(catalog)}`);
@@ -5489,6 +5573,58 @@ async function runSelfTest() {
   if (keptStarted !== 0 || keptCompleted?.params?.item?.text !== "타일 보기 로직을 고쳤습니다.") {
     throw new Error(`Claude held Korean text self-test failed: ${JSON.stringify(keptEvents)}`);
   }
+  const englishLineEvents = async (next) => {
+    const captured = [];
+    process.stdout.write = (chunk) => {
+      captured.push(String(chunk));
+      return true;
+    };
+    try {
+      openingSession.streamBlocks.clear();
+      await processStreamEvent(openingSession, {
+        event: { type: "content_block_start", index: 0, content_block: { type: "text" } },
+      });
+      await processStreamEvent(openingSession, {
+        event: { type: "content_block_delta", index: 0, delta: { text: "Bundle is ready; running the upload script." } },
+      });
+      await processStreamEvent(openingSession, { event: { type: "content_block_stop", index: 0 } });
+      await processStreamEvent(openingSession, { event: next });
+    } finally {
+      process.stdout.write = stdoutWrite;
+    }
+    return captured.join("").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  };
+  const beforeTool = await englishLineEvents({ type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "t", name: "Read" } });
+  const atEnd = await englishLineEvents({ type: "message_stop" });
+  const endText = atEnd.find((event) => event.method === "item/completed")?.params?.item?.text;
+  if (beforeTool.length || endText !== "Bundle is ready; running the upload script.") {
+    throw new Error(`Claude English progress line self-test failed: ${JSON.stringify({ beforeTool, atEnd })}`);
+  }
+  const progressEvents = [];
+  process.stdout.write = (chunk) => {
+    progressEvents.push(String(chunk));
+    return true;
+  };
+  try {
+    openingSession.streamBlocks.clear();
+    for (const event of [
+      { type: "message_start", message: { model: "claude-opus-5-5" } },
+      { type: "content_block_start", index: 0, content_block: { type: "thinking" } },
+      { type: "content_block_delta", index: 0, delta: { thinking: "노트 초안 6항목을 정리했습니다." } },
+      { type: "content_block_stop", index: 0 },
+      { type: "content_block_start", index: 1, content_block: { type: "tool_use", id: "q", name: "AskUserQuestion" } },
+    ]) await processStreamEvent(openingSession, { event });
+  } finally {
+    process.stdout.write = stdoutWrite;
+    openingSession.streamModel = undefined;
+  }
+  const progressItems = progressEvents.join("").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))
+    .filter((event) => event.method === "item/completed").map((event) => event.params.item);
+  if (progressItems.find((item) => item.type === "reasoning")?.summary?.join("")
+    || progressItems.find((item) => item.type === "agentMessage")?.text !== "노트 초안 6항목을 정리했습니다.") {
+    throw new Error(`Claude progress update self-test failed: ${JSON.stringify(progressItems)}`);
+  }
+  if (!isKoreanPrompt([{ type: "text", text: "ㅇㅋ" }])) throw new Error("Claude jamo prompt self-test failed");
   const explicitSkillContent = await inputContent([
     { type: "text", text: "$debug investigate" },
     { type: "skill", name: "debug", path: "claude-command://debug" },

@@ -479,7 +479,7 @@ impl ProviderPicker {
     fn method_view(&self, provider: usize, selected: usize) -> OverlayView<'_> {
         let provider = &self.providers[provider];
         OverlayView {
-            title: format!("{} · 인증 방식", provider.name),
+            title: format!("{} · Sign-in method", provider.name),
             lines: provider
                 .methods
                 .iter()

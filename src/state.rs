@@ -209,9 +209,9 @@ impl VibeMode {
 
     const fn picker_detail(self) -> &'static str {
         match self {
-            Self::Normal => "Diff와 명령어를 모두 표시합니다.",
-            Self::Vibe => "Diff와 명령어를 압축해서 표시합니다.",
-            Self::SuperVibe => "Diff와 명령어 등을 모두 숨깁니다.",
+            Self::Normal => "Shows diffs and commands in full.",
+            Self::Vibe => "Shows diffs and commands compactly.",
+            Self::SuperVibe => "Hides diffs, commands, and other details.",
         }
     }
 }
@@ -346,9 +346,9 @@ impl ShellDisplayMode {
 impl PermissionMode {
     pub fn label(self) -> &'static str {
         match self {
-            Self::FullAccess => "전체 접근",
-            Self::Workspace => "작업 폴더 수정",
-            Self::ReadOnly => "읽기 전용",
+            Self::FullAccess => "Full access",
+            Self::Workspace => "Workspace write",
+            Self::ReadOnly => "Read only",
         }
     }
 
@@ -371,7 +371,7 @@ impl PermissionMode {
 
 impl ClaudePermissionMode {
     pub fn label(self) -> &'static str {
-        "자동 승인 검토"
+        "Auto review"
     }
 
     /// The value the Claude Agent SDK takes for `permissionMode`.
@@ -896,6 +896,8 @@ pub struct ModelInfo {
     pub context_window: Option<u64>,
     pub fast_service_tier: Option<String>,
     pub supports_auto_mode: bool,
+    /// Kept for the safeguard fallback but left out of /model.
+    pub hidden: bool,
 }
 
 #[derive(Clone)]
@@ -931,6 +933,15 @@ impl ModelProvider {
 
     fn matches(self, model: &ModelInfo) -> bool {
         Self::from_model(&model.model) == self
+    }
+
+    /// settings.toml key holding "<model> <effort>" picked for this provider.
+    fn default_model_key(self) -> &'static str {
+        match self {
+            Self::Codex => "codex_default_model",
+            Self::Claude => "claude_default_model",
+            Self::OpenCode => "opencode_default_model",
+        }
     }
 }
 
@@ -977,6 +988,10 @@ impl ModelInfo {
             context_window: value.get("contextWindow").and_then(Value::as_u64),
             supports_auto_mode: value
                 .get("supportsAutoMode")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            hidden: value
+                .get("hidden")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             fast_service_tier: value
@@ -1235,6 +1250,11 @@ pub enum Action {
     PersistModelDefault {
         model: String,
         effort: String,
+    },
+    /// Save the model a provider switch lands on, as "<model> <effort>".
+    PersistProviderModelDefault {
+        key: &'static str,
+        value: String,
     },
     /// Save the panel width the [◀]/[▶] buttons settled on, for every session.
     PersistSidePanelWidth(usize),
@@ -1566,6 +1586,7 @@ struct ShellResult {
 pub enum ModelScope {
     Session,
     Default,
+    ProviderDefault,
 }
 
 #[derive(Clone)]
@@ -1584,12 +1605,13 @@ struct ClaudePermissionDenial {
 }
 
 impl ModelScope {
-    const CHOICES: [Self; 2] = [Self::Session, Self::Default];
+    const CHOICES: [Self; 3] = [Self::Session, Self::Default, Self::ProviderDefault];
 
     fn label(self) -> &'static str {
         match self {
             Self::Session => "This session only",
             Self::Default => "Set as default",
+            Self::ProviderDefault => "Set as provider default",
         }
     }
 
@@ -1597,6 +1619,7 @@ impl ModelScope {
         match self {
             Self::Session => "Returns to the original setting next time",
             Self::Default => "Saves to ~/.codex/config.toml",
+            Self::ProviderDefault => "Used when switching to this provider",
         }
     }
 }
@@ -1786,17 +1809,17 @@ impl DisplaySetting {
     fn detail(self, selected: usize) -> Option<String> {
         match (self, selected) {
             (Self::AutoKnowledge, 0) => Some(
-                "프로젝트별로 저장합니다. 다음 요청부터 필요한 지식을 .knowledge에 기록하고 knowledge-index.md를 갱신합니다.".to_owned(),
+                "Saved per project. From the next request, records needed knowledge in .knowledge and updates knowledge-index.md.".to_owned(),
             ),
             (Self::AutoKnowledge, 1) => Some(
-                "이 프로젝트의 자동 기록을 끕니다. 다음 요청부터 적용하며 기존 지식의 인덱스는 계속 먼저 읽습니다.".to_owned(),
+                "Turns off automatic recording for this project from the next request. The existing knowledge index is still read first.".to_owned(),
             ),
             (Self::Response, 0) => Some(
-                "Super Vibe 모드에서만 동작합니다. 모든 진행 응답을 항상 표시합니다."
+                "Super Vibe mode only. Always shows every progress response."
                     .to_owned(),
             ),
             (Self::Response, 1) => Some(
-                "Super Vibe 모드에서만 동작합니다. 완료되면 마지막 답변만 남기고 이전 응답을 접습니다."
+                "Super Vibe mode only. When done, keeps the final answer and collapses earlier responses."
                     .to_owned(),
             ),
             _ => None,
@@ -3796,6 +3819,8 @@ pub struct AppState {
     codex_provider_enabled: bool,
     /// Authentication exists independently of the lazily started model catalog.
     opencode_provider_connected: bool,
+    /// `/model` choice 3 per provider, keyed by `default_model_key`.
+    provider_default_models: HashMap<&'static str, String>,
     /// Set at launch when this machine has never picked a runtime. While it is
     /// up the composer holds prompts back and points at the picker.
     provider_choice_pending: bool,
@@ -4057,6 +4082,17 @@ impl AppState {
             claude_provider_enabled: claude_provider_enabled(),
             codex_provider_enabled: codex_provider_enabled(),
             opencode_provider_connected: initial_opencode_provider_connected(),
+            provider_default_models: [
+                ModelProvider::Codex,
+                ModelProvider::Claude,
+                ModelProvider::OpenCode,
+            ]
+            .into_iter()
+            .filter_map(|provider| {
+                let key = provider.default_model_key();
+                read_vibe_config_value(key).map(|value| (key, value))
+            })
+            .collect(),
             provider_choice_pending: false,
             account_plan: AccountPlan::default(),
             account_refresh_due: false,
@@ -4310,7 +4346,7 @@ impl AppState {
         self.models
             .iter()
             .enumerate()
-            .filter_map(|(index, model)| provider.matches(model).then_some(index))
+            .filter_map(|(index, model)| (!model.hidden && provider.matches(model)).then_some(index))
             .collect()
     }
 
@@ -4438,7 +4474,7 @@ impl AppState {
         self.provider_choice_pending = true;
         self.push_notice(
             BlockKind::System,
-            "Provider 선택",
+            "Choose provider",
             "사용할 provider를 선택하세요. Enter로 연결하고 전환합니다. (나중에 /provider)",
         );
         self.open_runtime_picker();
@@ -4539,9 +4575,9 @@ impl AppState {
     /// current session as "사용 중/미사용" only adds noise.
     fn runtime_row_label(&self, index: usize) -> String {
         let connection = if self.runtime_connected(index) {
-            "연결됨"
+            "Connected"
         } else {
-            "연결 안 됨"
+            "Not connected"
         };
         format!("{} · {connection}", RUNTIME_CHOICES[index])
     }
@@ -4554,10 +4590,24 @@ impl AppState {
         }
 
         let candidates = self.provider_model_indices(provider);
-        let selected = candidates
-            .iter()
-            .copied()
-            .find(|index| self.models[*index].is_default)
+        // Settings values are read lowercased, so the saved pick matches loosely.
+        let saved = self
+            .provider_default_models
+            .get(provider.default_model_key())
+            .and_then(|value| value.rsplit_once(' '));
+        let saved_index = saved.and_then(|(saved_model, _)| {
+            candidates
+                .iter()
+                .copied()
+                .find(|index| self.models[*index].model.eq_ignore_ascii_case(saved_model))
+        });
+        let selected = saved_index
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .copied()
+                    .find(|index| self.models[*index].is_default)
+            })
             .or_else(|| candidates.first().copied());
         let Some(index) = selected else {
             self.committed.push(Block::new(
@@ -4569,7 +4619,15 @@ impl AppState {
         };
 
         let model = &self.models[index];
-        let effort = model.default_effort.clone();
+        let effort = saved
+            .filter(|_| saved_index == Some(index))
+            .and_then(|(_, saved_effort)| {
+                model
+                    .efforts
+                    .iter()
+                    .find(|effort| effort.id.eq_ignore_ascii_case(saved_effort))
+            })
+            .map_or_else(|| model.default_effort.clone(), |effort| effort.id.clone());
         self.selected_model = index;
         self.selected_effort = effort.clone();
         self.context_window = model.context_window;
@@ -5098,7 +5156,7 @@ impl AppState {
                 .map(|failure| IntegrationItemView {
                     name: failure.name.clone(),
                     state: IntegrationItemState::Inactive,
-                    detail: "실패".to_owned(),
+                    detail: "Failed".to_owned(),
                 }),
         );
         items.sort_by(|left, right| {
@@ -5343,7 +5401,7 @@ impl AppState {
         if success {
             self.push_notice(
                 BlockKind::System,
-                "로그인 완료",
+                "Signed in",
                 "계정 정보를 갱신했습니다.",
             );
         } else {
@@ -5378,7 +5436,7 @@ impl AppState {
         self.account_plan = AccountPlan::default();
         self.push_notice(
             BlockKind::Warning,
-            "로그아웃",
+            "Signed out",
             "계정 연결을 해제했습니다. /login으로 다시 로그인하세요.",
         );
     }
@@ -5907,17 +5965,17 @@ impl AppState {
     }
 
     /// A Claude model to fall back to when the safety classifier blocks the
-    /// current one. Opus 4.8's safeguards are less aggressive than the 5-series;
-    /// from 4.8 itself the fallback is Sonnet 5. `None` when neither is in the
-    /// catalogue or the provider is not Claude.
+    /// current one: Opus 5, as Claude Code itself does, hidden from /model;
+    /// from Opus 5 itself the fallback is Sonnet 5. `None` when neither is in
+    /// the catalogue or the provider is not Claude.
     fn safeguard_alternate_model(&self) -> Option<(String, String)> {
         if self.selected_provider() != ModelProvider::Claude {
             return None;
         }
-        let target = if self.selected_model_name() == "claude:claude-opus-4-8" {
+        let target = if self.selected_model_name() == "claude:claude-opus-5" {
             "claude:sonnet"
         } else {
-            "claude:claude-opus-4-8"
+            "claude:claude-opus-5"
         };
         self.models
             .iter()
@@ -6103,7 +6161,7 @@ impl AppState {
         self.handle_notification("turn/completed", &params);
         self.push_notice(
             BlockKind::Warning,
-            "응답 종료 알림 누락",
+            "Missing turn completion",
             "턴은 이미 끝났는데 종료 알림이 오지 않아 진행 표시를 정리했습니다.",
         );
         true
@@ -6581,7 +6639,7 @@ impl AppState {
             items.push(IntegrationItemView {
                 name,
                 state: IntegrationItemState::Inactive,
-                detail: "실패".to_owned(),
+                detail: "Failed".to_owned(),
             });
             items.sort_by(|left, right| {
                 integration_item_order(left.state)
@@ -8094,7 +8152,7 @@ impl AppState {
                 }
                 self.push_notice(
                     BlockKind::Error,
-                    "질문 대기 실패",
+                    "Question failed",
                     "답변을 기다리는 동안 다른 질문이 도착해 작업을 중단합니다.",
                 );
                 return self.cancel_user_question(id);
@@ -8156,7 +8214,7 @@ impl AppState {
                     detail.extend(
                         permission_detail(permissions)
                             .into_iter()
-                            .map(|line| format!("추가 {line}")),
+                            .map(|line| format!("Additional {line}")),
                     );
                 }
                 self.pending = Some(PendingInteraction::Approval {
@@ -8166,9 +8224,9 @@ impl AppState {
                         .and_then(Value::as_str)
                         .filter(|title| !title.is_empty())
                         .unwrap_or(if network_context.is_some() {
-                            "네트워크 접근을 허용할까요?"
+                            "Allow network access?"
                         } else {
-                            "명령 실행을 허용할까요?"
+                            "Allow this command?"
                         })
                         .to_owned(),
                     detail,
@@ -8193,14 +8251,14 @@ impl AppState {
                         .get("title")
                         .and_then(Value::as_str)
                         .filter(|title| !title.is_empty())
-                        .unwrap_or("파일 변경을 허용할까요?")
+                        .unwrap_or("Allow file changes?")
                         .to_owned(),
                     detail,
                     selected: 0,
                     choices: approval_choices(
                         json!({ "decision": "accept" }),
                         session.map(|result| (session_label, result)),
-                        "거부",
+                        "Deny",
                         json!({ "decision": "decline" }),
                     ),
                 });
@@ -8231,14 +8289,14 @@ impl AppState {
                         .get("title")
                         .and_then(Value::as_str)
                         .filter(|title| !title.is_empty())
-                        .unwrap_or("추가 권한을 허용할까요?")
+                        .unwrap_or("Allow additional permissions?")
                         .to_owned(),
                     detail,
                     selected: 0,
                     choices: approval_choices(
                         json!({ "permissions": requested, "scope": "turn" }),
                         session.map(|result| (session_label, result)),
-                        "거부",
+                        "Deny",
                         json!({ "permissions": {}, "scope": "turn" }),
                     ),
                 });
@@ -8264,7 +8322,7 @@ impl AppState {
                 {
                     self.push_notice(
                         BlockKind::Error,
-                        "질문 대기 실패",
+                        "Question failed",
                         "답변을 안전하게 기다릴 수 없는 질문입니다. 작업을 중단합니다.",
                     );
                     return self.cancel_user_question(id);
@@ -8293,7 +8351,7 @@ impl AppState {
                     };
                     self.push_notice(
                         BlockKind::Warning,
-                        "MCP 요청을 처리할 수 없음",
+                        "Can't handle MCP request",
                         format!("{message}\n서버 요청을 안전하게 거부했습니다."),
                     );
                     return Action::RpcResponse {
@@ -8364,7 +8422,7 @@ impl AppState {
                     Err(error) => {
                         self.committed.push(Block::new(
                             BlockKind::Warning,
-                            "MCP 폼을 표시할 수 없음",
+                            "Can't show MCP form",
                             format!("{error}\n서버 요청을 안전하게 거부했습니다."),
                         ));
                         Action::RpcResponse {
@@ -8478,7 +8536,7 @@ impl AppState {
             self.pending = None;
             self.push_notice(
                 BlockKind::Error,
-                "질문 대기 중단",
+                "Question stopped",
                 "답변 전에 질문이 종료되어 작업을 중단합니다. 사용자의 새 지시를 기다립니다.",
             );
             let action = self.request_interrupt();
@@ -9824,11 +9882,11 @@ impl AppState {
                     "OpenCode provider는 스킬 관리를 지원하지 않습니다.",
                 )),
                 "/login" => Some((
-                    "OpenCode 로그인",
+                    "OpenCode login",
                     "터미널에서 `opencode auth login`을 실행한 뒤 /connect로 다시 연결하세요.",
                 )),
                 "/logout" => Some((
-                    "OpenCode 로그아웃",
+                    "OpenCode logout",
                     "터미널에서 `opencode auth logout`을 실행하세요.",
                 )),
                 _ => None,
@@ -10105,7 +10163,7 @@ impl AppState {
                 let Some(selected) = ThemeKind::parse(parts[1]) else {
                     self.committed.push(Block::new(
                         BlockKind::Error,
-                        "지원하지 않는 테마",
+                        "Unsupported theme",
                         "minimal, soft, dark 중 하나를 선택하세요.",
                     ));
                     return Action::None;
@@ -10133,7 +10191,7 @@ impl AppState {
             "/connect" if !crate::open_code::PROVIDER_ENABLED => {
                 self.committed.push(Block::new(
                     BlockKind::Warning,
-                    "OpenCode provider 비활성화",
+                    "OpenCode provider disabled",
                     "후속 개선 전까지 OpenCode provider는 사용할 수 없습니다.",
                 ));
                 Action::None
@@ -10147,7 +10205,7 @@ impl AppState {
             "/login" if using_claude => {
                 self.push_notice(
                     BlockKind::System,
-                    "Claude 로그인",
+                    "Claude login",
                     "터미널에서 `claude auth login`을 실행한 뒤 Devez Vibe를 다시 시작하세요.",
                 );
                 Action::None
@@ -10159,7 +10217,7 @@ impl AppState {
             "/logout" if using_claude => {
                 self.push_notice(
                     BlockKind::Warning,
-                    "Claude 로그아웃",
+                    "Claude logout",
                     "터미널에서 `claude auth logout`을 실행한 뒤 Devez Vibe를 다시 시작하세요.",
                 );
                 Action::None
@@ -10254,7 +10312,7 @@ impl AppState {
             "/resume" | "/continue" if self.busy => {
                 self.committed.push(Block::new(
                     BlockKind::Warning,
-                    "진행 중",
+                    "Response in progress",
                     "현재 응답을 중단한 뒤 세션을 전환하세요.",
                 ));
                 Action::None
@@ -10268,7 +10326,7 @@ impl AppState {
             "/compact" if self.compacting() => {
                 self.committed.push(Block::new(
                     BlockKind::Warning,
-                    "압축 중",
+                    "Compacting",
                     "이미 컨텍스트를 압축하고 있습니다.",
                 ));
                 Action::None
@@ -10276,7 +10334,7 @@ impl AppState {
             "/compact" if self.busy => {
                 self.committed.push(Block::new(
                     BlockKind::Warning,
-                    "진행 중",
+                    "Response in progress",
                     "현재 응답이 끝난 뒤 컨텍스트를 압축하세요.",
                 ));
                 Action::None
@@ -10337,7 +10395,7 @@ impl AppState {
             "/new" | "/clear" if self.busy => {
                 self.committed.push(Block::new(
                     BlockKind::Warning,
-                    "진행 중",
+                    "Response in progress",
                     "현재 응답을 중단한 뒤 새 대화를 시작하세요.",
                 ));
                 Action::None
@@ -10412,19 +10470,19 @@ impl AppState {
         let connections = format!(
             "Claude {} · Codex {} · OpenCode {}",
             if self.claude_provider_enabled {
-                "연결됨"
+                "Connected"
             } else {
-                "연결 안 함"
+                "Off"
             },
             if self.codex_provider_enabled {
-                "연결됨"
+                "Connected"
             } else {
-                "연결 안 함"
+                "Off"
             },
             if self.opencode_provider_connected {
-                "연결됨"
+                "Connected"
             } else {
-                "연결 안 함"
+                "Off"
             }
         );
         self.committed.push(Block::new(
@@ -10659,7 +10717,7 @@ impl AppState {
                     KeyCode::Char('j') if !ctrl && !alt => {
                         selected = (selected + 1).min(ModelScope::CHOICES.len() - 1);
                     }
-                    KeyCode::Char(ch) if !ctrl && !alt && ('1'..='2').contains(&ch) => {
+                    KeyCode::Char(ch) if !ctrl && !alt && ('1'..='3').contains(&ch) => {
                         let index = ch.to_digit(10).unwrap_or(1) as usize - 1;
                         return self.apply_model_scope(
                             model_index,
@@ -11105,7 +11163,7 @@ impl AppState {
                                 &skill.path,
                                 skill.source.as_deref(),
                                 enabled,
-                                Some(format!("{} · 저장 중", skill.name)),
+                                Some(format!("{} · Saving", skill.name)),
                             );
                             return Action::SetSkillEnabled {
                                 provider,
@@ -11173,7 +11231,7 @@ impl AppState {
                 }
                 McpPickerResult::Toggle { name, enabled } => {
                     let provider = SkillProvider::from_model(self.selected_model_name());
-                    picker.begin_enabled(&name, enabled, format!("{name} · 저장 중"));
+                    picker.begin_enabled(&name, enabled, format!("{name} · Saving"));
                     self.pending = Some(PendingInteraction::McpPicker(picker));
                     Action::SetMcpEnabled {
                         provider,
@@ -11202,7 +11260,7 @@ impl AppState {
                     PluginPickerResult::SetEnabled { plugin, enabled } => {
                         let id = plugin.id.clone();
                         let label = plugin.display_name.clone();
-                        picker.apply_enabled(&id, enabled, format!("{label} · 저장 중"));
+                        picker.apply_enabled(&id, enabled, format!("{label} · Saving"));
                         self.pending = Some(PendingInteraction::PluginPicker(picker));
                         Action::SetPluginEnabled { plugin, enabled }
                     }
@@ -12340,7 +12398,7 @@ impl AppState {
                 url,
                 instructions,
             } => Some(OverlayView {
-                title: format!("{provider_name} · OAuth 연결 중"),
+                title: format!("{provider_name} · Connecting OAuth"),
                 lines: vec![
                     OverlayLine {
                         text: instructions.clone(),
@@ -12571,7 +12629,7 @@ impl AppState {
                         muted: true,
                     },
                     OverlayLine {
-                        text: "[o] 브라우저 열기".to_owned(),
+                        text: "[o] Open browser".to_owned(),
                         selected: true,
                         muted: false,
                     },
@@ -12581,7 +12639,7 @@ impl AppState {
                         muted: false,
                     },
                     OverlayLine {
-                        text: "[n] 거부".to_owned(),
+                        text: "[n] Deny".to_owned(),
                         selected: false,
                         muted: false,
                     },
@@ -12646,12 +12704,12 @@ impl AppState {
                     })
                     .collect::<Vec<_>>();
                 lines.push(OverlayLine {
-                    text: "[y] 계속".to_owned(),
+                    text: "[y] Continue".to_owned(),
                     selected: true,
                     muted: false,
                 });
                 lines.push(OverlayLine {
-                    text: "[n] 취소".to_owned(),
+                    text: "[n] Cancel".to_owned(),
                     selected: false,
                     muted: false,
                 });
@@ -12788,7 +12846,7 @@ impl AppState {
                     closable: false,
                     // 단계는 탭 줄이 이미 말해 주므로 제목은 이 질문의 이름만 든다.
                     title: if question.header.is_empty() {
-                        "질문".to_owned()
+                        "Question".to_owned()
                     } else {
                         question_display_header(&question.header).to_owned()
                     },
@@ -13389,6 +13447,13 @@ impl AppState {
         let Some(model) = self.models.get(model_index) else {
             return Action::None;
         };
+        if scope == ModelScope::ProviderDefault {
+            let key = ModelProvider::from_model(&model.model).default_model_key();
+            let effort = effort.unwrap_or_else(|| model.default_effort.clone());
+            let value = format!("{} {effort}", model.model);
+            self.provider_default_models.insert(key, value.clone());
+            return Action::PersistProviderModelDefault { key, value };
+        }
         Action::PersistModelDefault {
             model: model.model.clone(),
             effort: self.selected_effort.clone(),
@@ -13415,7 +13480,7 @@ impl AppState {
             {
                 self.push_notice(
                     BlockKind::Warning,
-                    "Provider 고정됨",
+                    "Provider locked",
                     format!(
                         "대화가 시작된 뒤에는 provider를 바꿀 수 없습니다. {next} 모델로 이야기하려면 /new로 새 대화를 여세요."
                     ),
@@ -14033,7 +14098,7 @@ impl AppState {
                             &skill.path,
                             skill.source.as_deref(),
                             enabled,
-                            Some(format!("{} · 저장 중", skill.name)),
+                            Some(format!("{} · Saving", skill.name)),
                         );
                         Action::SetSkillEnabled {
                             provider,
@@ -15024,7 +15089,7 @@ fn codex_warning_block(method: &str, params: &Value) -> Block {
         .or_else(|| params.get("summary").and_then(Value::as_str))
         .or_else(|| params.as_str())
         .filter(|text| !text.trim().is_empty())
-        .unwrap_or("경고 세부 정보를 받지 못했습니다.");
+        .unwrap_or("No warning details were received.");
     let mut body = summary.to_owned();
     if let Some(details) = params
         .get("details")
@@ -15039,14 +15104,14 @@ fn codex_warning_block(method: &str, params: &Value) -> Block {
         .and_then(Value::as_str)
         .filter(|path| !path.trim().is_empty())
     {
-        body.push_str("\n\n파일: ");
+        body.push_str("\n\nFile: ");
         body.push_str(path);
     }
     let title = match method {
-        "configWarning" => "설정 경고",
-        "guardianWarning" => "안전 경고",
-        "deprecationNotice" => "지원 종료 안내",
-        _ => "경고",
+        "configWarning" => "Config warning",
+        "guardianWarning" => "Safety warning",
+        "deprecationNotice" => "Deprecation notice",
+        _ => "Warning",
     };
     Block::new(BlockKind::Warning, title, body)
 }
@@ -15145,7 +15210,9 @@ const PLANNER_HANDOFF_EXECUTE_LABEL: &str = "Goal Runner로 실행";
 
 fn question_display_header(header: &str) -> &str {
     if header == PLANNER_HANDOFF_HEADER {
-        "계획 실행 확인"
+        "Confirm plan execution"
+    } else if header == "질문" {
+        "Question"
     } else {
         header
     }
@@ -15249,7 +15316,7 @@ fn question_tabs(
         .enumerate()
         .map(|(index, question)| {
             let header = if question.header.is_empty() || question.header == "질문" {
-                format!("질문 {}", index + 1)
+                format!("Question {}", index + 1)
             } else {
                 question_display_header(&question.header).to_owned()
             };
@@ -15411,8 +15478,8 @@ fn dollar_completion_panel_title(
 }
 
 /// The two rows a question carries beyond its own options.
-const OTHER_ANSWER_LABEL: &str = "직접 입력";
-const CHAT_INSTEAD_LABEL: &str = "이 내용으로 대화하기";
+const OTHER_ANSWER_LABEL: &str = "Type your own answer";
+const CHAT_INSTEAD_LABEL: &str = "Chat about this";
 
 /// Claude Code treats its automatic `Other` row as the editor itself: focus is
 /// the input mode. A question with no choices remains a plain text prompt.
@@ -16497,12 +16564,12 @@ fn permission_detail(value: &Value) -> Vec<String> {
         .and_then(Value::as_bool)
     {
         detail.push(format!(
-            "네트워크: {}",
-            if enabled { "허용" } else { "차단" }
+            "Network: {}",
+            if enabled { "allowed" } else { "blocked" }
         ));
     }
     if let Some(file_system) = value.get("fileSystem").filter(|value| !value.is_null()) {
-        detail.push(format!("파일 시스템: {}", pretty_json(Some(file_system))));
+        detail.push(format!("File system: {}", pretty_json(Some(file_system))));
     }
     if detail.is_empty() {
         detail.push(pretty_json(Some(value)));
@@ -16524,7 +16591,7 @@ fn approval_session_choice(params: &Value, response: Value) -> (Option<Value>, S
             .to_owned();
         return ((!label.is_empty()).then_some(response), label);
     }
-    (Some(response), "세션 동안 허용".to_owned())
+    (Some(response), "Allow for session".to_owned())
 }
 
 fn approval_choices(
@@ -16534,7 +16601,7 @@ fn approval_choices(
     decline: Value,
 ) -> Vec<ApprovalChoice> {
     let mut choices = vec![ApprovalChoice {
-        label: "이번만 허용".to_owned(),
+        label: "Allow once".to_owned(),
         result: once,
     }];
     if let Some((label, result)) = session {
@@ -16558,7 +16625,7 @@ fn command_approval_choices(params: &Value) -> Vec<ApprovalChoice> {
         return approval_choices(
             json!({ "decision": "accept" }),
             session.map(|result| (session_label, result)),
-            "거부",
+            "Deny",
             json!({ "decision": "decline" }),
         );
     }
@@ -16566,10 +16633,10 @@ fn command_approval_choices(params: &Value) -> Vec<ApprovalChoice> {
         return approval_choices(
             json!({ "decision": "accept" }),
             Some((
-                "세션 동안 허용".to_owned(),
+                "Allow for session".to_owned(),
                 json!({ "decision": "acceptForSession" }),
             )),
-            "거부",
+            "Deny",
             json!({ "decision": "decline" }),
         );
     };
@@ -16577,15 +16644,15 @@ fn command_approval_choices(params: &Value) -> Vec<ApprovalChoice> {
         .iter()
         .filter_map(|decision| {
             let label = match decision.as_str() {
-                Some("accept") => "이번만 허용".to_owned(),
-                Some("acceptForSession") => "세션 동안 허용".to_owned(),
-                Some("decline") => "거부".to_owned(),
-                Some("cancel") => "취소".to_owned(),
+                Some("accept") => "Allow once".to_owned(),
+                Some("acceptForSession") => "Allow for session".to_owned(),
+                Some("decline") => "Deny".to_owned(),
+                Some("cancel") => "Cancel".to_owned(),
                 Some(_) => return None,
                 None if decision.get("acceptWithExecpolicyAmendment").is_some() => {
                     let amendment =
                         decision.pointer("/acceptWithExecpolicyAmendment/execpolicy_amendment");
-                    format!("비슷한 명령도 허용: {}", pretty_json(amendment))
+                    format!("Also allow similar commands: {}", pretty_json(amendment))
                 }
                 None if decision.get("applyNetworkPolicyAmendment").is_some() => {
                     let amendment =
@@ -16593,8 +16660,8 @@ fn command_approval_choices(params: &Value) -> Vec<ApprovalChoice> {
                     let host = amendment
                         .and_then(|value| value.get("host"))
                         .and_then(Value::as_str)
-                        .unwrap_or("이 호스트");
-                    format!("이후에도 네트워크 허용: {host}")
+                        .unwrap_or("this host");
+                    format!("Always allow network: {host}")
                 }
                 None => return None,
             };
@@ -17652,6 +17719,7 @@ mod tests {
             context_window: None,
             fast_service_tier: Some("priority".to_owned()),
             supports_auto_mode: slug.starts_with("claude:"),
+            hidden: false,
         }
     }
 
@@ -18077,7 +18145,7 @@ mod tests {
             state
                 .committed
                 .iter()
-                .any(|block| block.title == "Provider 고정됨")
+                .any(|block| block.title == "Provider locked")
         );
     }
 
@@ -18177,13 +18245,13 @@ mod tests {
         let servers = McpServerInfo::list_from_value(&response);
         let restored = servers[0].panel_item();
         assert_eq!(restored.state, IntegrationItemState::Active);
-        assert_eq!(restored.detail, "연결됨");
+        assert_eq!(restored.detail, "Connected");
         state.open_mcp_picker(servers, None);
         let Some(PendingInteraction::McpPicker(picker)) = &state.pending else {
             panic!("MCP picker expected");
         };
         let view = picker.overlay_view();
-        assert!(view.lines.iter().all(|line| !line.text.contains("실패")));
+        assert!(view.lines.iter().all(|line| !line.text.contains("Failed")));
     }
 
     #[test]
@@ -18459,11 +18527,11 @@ mod tests {
         // 셋째 질문에서 두 단계 뒤로 물러난다. Shift+Tab도 같은 길이다.
         state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
         let overlay = state.overlay_view().expect("둘째 질문이 다시 열려야 한다");
-        assert_eq!(overlay.title, "질문");
+        assert_eq!(overlay.title, "Question");
         assert!(
             overlay.lines[0]
                 .text
-                .contains(&format!("{QUESTION_TAB_CURSOR} {CHECKED_BOX} 질문 2")),
+                .contains(&format!("{QUESTION_TAB_CURSOR} {CHECKED_BOX} Question 2")),
             "탭 줄이 지금 질문을 짚어야 한다"
         );
         assert!(
@@ -18759,12 +18827,12 @@ mod tests {
         assert_eq!(
             slider.detail.as_deref(),
             Some(
-                "Super Vibe 모드에서만 동작합니다. 완료되면 마지막 답변만 남기고 이전 응답을 접습니다."
+                "Super Vibe mode only. When done, keeps the final answer and collapses earlier responses."
             )
         );
         assert_eq!(
             DisplaySetting::Response.detail(0).as_deref(),
-            Some("Super Vibe 모드에서만 동작합니다. 모든 진행 응답을 항상 표시합니다.")
+            Some("Super Vibe mode only. Always shows every progress response.")
         );
 
         let action = state.click_effort_step(0);
@@ -18992,7 +19060,7 @@ mod tests {
         assert_eq!(slider.selected, 1);
         assert_eq!(
             slider.detail.as_deref(),
-            Some("Diff와 명령어를 압축해서 표시합니다.")
+            Some("Shows diffs and commands compactly.")
         );
 
         state.handle_key(KeyEvent::from(KeyCode::Right));
@@ -19004,7 +19072,7 @@ mod tests {
                 .overlay_view()
                 .and_then(|overlay| overlay.slider)
                 .and_then(|slider| slider.detail),
-            Some("Diff와 명령어 등을 모두 숨깁니다.".to_owned())
+            Some("Hides diffs, commands, and other details.".to_owned())
         );
 
         state.handle_key(KeyEvent::from(KeyCode::Esc));
@@ -21826,13 +21894,13 @@ mod tests {
             (
                 "warning",
                 json!({ "message": "일반 경고" }),
-                "경고",
+                "Warning",
                 "일반 경고",
             ),
             (
                 "guardianWarning",
                 json!({ "message": "안전 검토 필요" }),
-                "안전 경고",
+                "Safety warning",
                 "안전 검토 필요",
             ),
             (
@@ -21842,13 +21910,13 @@ mod tests {
                     "details": "지원되는 이름으로 변경하세요.",
                     "path": "C:\\Users\\tester\\.codex\\config.toml"
                 }),
-                "설정 경고",
-                "설정 항목을 읽지 못했습니다.\n\n지원되는 이름으로 변경하세요.\n\n파일: C:\\Users\\tester\\.codex\\config.toml",
+                "Config warning",
+                "설정 항목을 읽지 못했습니다.\n\n지원되는 이름으로 변경하세요.\n\nFile: C:\\Users\\tester\\.codex\\config.toml",
             ),
             (
                 "deprecationNotice",
                 json!({ "summary": "이 기능은 곧 제거됩니다.", "details": null }),
-                "지원 종료 안내",
+                "Deprecation notice",
                 "이 기능은 곧 제거됩니다.",
             ),
         ];
@@ -21867,8 +21935,8 @@ mod tests {
     fn codex_warning_without_text_reports_missing_details_instead_of_a_fake_message() {
         let warning = codex_warning_block("configWarning", &json!({}));
 
-        assert_eq!(warning.title, "설정 경고");
-        assert_eq!(warning.body, "경고 세부 정보를 받지 못했습니다.");
+        assert_eq!(warning.title, "Config warning");
+        assert_eq!(warning.body, "No warning details were received.");
     }
 
     /// One-off events belong in the composer notice next to the copy message,
@@ -22129,10 +22197,10 @@ mod tests {
             Some("high"),
         );
         for (state, expected) in [
-            (&mut codex, "permissions: 전체 접근 (:danger-full-access)"),
+            (&mut codex, "permissions: Full access (:danger-full-access)"),
             (
                 &mut claude,
-                "permissions: 자동 승인 검토 (auto)",
+                "permissions: Auto review (auto)",
             ),
         ] {
             assert!(matches!(
@@ -22400,7 +22468,7 @@ mod tests {
         ));
         let overlay = state.overlay_view().expect("optimistic skills picker");
         assert!(overlay.lines[0].text.starts_with("[ ] browser"));
-        assert!(overlay.hint.contains("저장 중"));
+        assert!(overlay.hint.contains("Saving"));
 
         state.open_skills_picker(SkillProvider::Claude, &response, None);
         assert!(matches!(
@@ -22722,11 +22790,11 @@ mod tests {
 
         let badge = state.composer_mode();
 
-        assert_eq!(badge.label, "전체 접근");
+        assert_eq!(badge.label, "Full access");
         assert_eq!(badge.vibe_mode, "Vibe: On");
 
         state.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-        assert_eq!(state.composer_mode().label, "전체 접근");
+        assert_eq!(state.composer_mode().label, "Full access");
     }
 
     #[test]
@@ -22812,13 +22880,29 @@ mod tests {
             "cwd".to_owned(),
             "account".to_owned(),
             vec![
-                test_model("claude:opus", "Claude Opus 5", true),
-                test_model("claude:claude-opus-4-8", "Claude Opus 4.8", false),
+                test_model("claude:opus", "Claude Opus 5.5", true),
+                ModelInfo {
+                    hidden: true,
+                    ..test_model("claude:claude-opus-5", "Claude Opus 5", false)
+                },
                 test_model("claude:sonnet", "Claude Sonnet 5", false),
             ],
             "claude:opus",
             Some("high"),
         )
+    }
+
+    #[test]
+    fn the_hidden_safeguard_fallback_stays_out_of_the_model_picker() {
+        let mut state = claude_test_state();
+        let visible = state
+            .current_provider_model_indices()
+            .into_iter()
+            .map(|index| state.models[index].model.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(visible, ["claude:opus", "claude:sonnet"]);
+        state.run_slash_command("/model claude-opus-5");
+        assert_eq!(state.selected_model_name(), "claude:opus");
     }
 
     fn safeguard_turn_completed(message: &str) -> Value {
@@ -22848,11 +22932,11 @@ mod tests {
         else {
             panic!("차단 카드가 대체 모델과 함께 떠야 한다");
         };
-        assert_eq!(id, "claude:claude-opus-4-8");
+        assert_eq!(id, "claude:claude-opus-5");
 
         let action = state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(action, Action::Submit(text) if text == "전역 키 후킹 방법"));
-        assert_eq!(state.selected_model_name(), "claude:claude-opus-4-8");
+        assert_eq!(state.selected_model_name(), "claude:claude-opus-5");
         assert!(state.pending.is_none());
     }
 
@@ -22928,9 +23012,9 @@ mod tests {
     }
 
     #[test]
-    fn the_fallback_from_opus_4_8_is_sonnet() {
+    fn the_fallback_from_opus_5_is_sonnet() {
         let mut state = claude_test_state();
-        state.select_model_and_effort("claude:claude-opus-4-8", None);
+        state.select_model_and_effort("claude:claude-opus-5", None);
         let _ = state.submit_text("차단될 프롬프트".to_owned(), "차단될 프롬프트".to_owned());
 
         state.handle_notification(
@@ -23017,7 +23101,7 @@ mod tests {
             .map(|line| line.text.clone())
             .collect::<Vec<_>>();
         assert!(
-            texts.iter().any(|text| text.contains("Claude Opus 4.8")),
+            texts.iter().any(|text| text.contains("Claude Opus 5")),
             "대체 모델 이름이 없다: {texts:?}"
         );
         assert!(
@@ -23363,6 +23447,7 @@ mod tests {
             context_window: None,
             fast_service_tier: Some("priority".to_owned()),
             supports_auto_mode: false,
+            hidden: false,
         };
         let mut state = AppState::new(
             "thread".to_owned(),
@@ -23500,6 +23585,37 @@ mod tests {
     }
 
     #[test]
+    fn a_provider_default_is_where_switching_back_to_that_provider_lands() {
+        let mut state = AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![
+                test_model("gpt-5.6-sol", "GPT-5.6 Sol", true),
+                test_model("claude:claude-sonnet-5", "Sonnet 5", true),
+                test_model("claude:claude-opus-5-5", "Opus 5.5", false),
+            ],
+            "gpt-5.6-sol",
+            Some("high"),
+        );
+        state.switch_provider(ModelProvider::Claude);
+        assert_eq!(state.selected_model_name(), "claude:claude-sonnet-5");
+
+        let action = state.apply_model_scope(2, 4, ModelScope::ProviderDefault);
+        assert!(matches!(
+            action,
+            Action::PersistProviderModelDefault { key: "claude_default_model", ref value }
+                if value == "claude:claude-opus-5-5 max"
+        ));
+
+        state.switch_provider(ModelProvider::Codex);
+        assert_eq!(state.selected_model_name(), "gpt-5.6-sol");
+        state.switch_provider(ModelProvider::Claude);
+        assert_eq!(state.selected_model_name(), "claude:claude-opus-5-5");
+        assert_eq!(state.selected_effort, "max");
+    }
+
+    #[test]
     fn model_scope_options_are_fully_english() {
         let mut state = test_state();
         state.run_slash_command("/model");
@@ -23510,6 +23626,7 @@ mod tests {
 
         assert!(options[0].text.contains("This session only"));
         assert!(options[1].text.contains("Set as default"));
+        assert!(options[2].text.contains("Set as provider default"));
         assert!(
             options
                 .iter()
@@ -25984,11 +26101,11 @@ mod tests {
              Goal Runner로 이어서 진행할까요?",
         );
         let tabs = question_tabs(&questions, 0, &BTreeMap::new());
-        assert!(tabs.contains("계획 실행 확인"));
+        assert!(tabs.contains("Confirm plan execution"));
         assert!(!tabs.contains("Planner Handoff"));
         show_question(json!(1), questions, 0, BTreeMap::new(), &mut state);
         let view = state.overlay_view().unwrap();
-        assert_eq!(view.title, "계획 실행 확인");
+        assert_eq!(view.title, "Confirm plan execution");
         assert!(view.lines[0].text.starts_with("로그인 응답 속도를 개선"));
         let Some(PendingInteraction::UserInput { questions, .. }) = &state.pending else {
             panic!("handoff question missing");
@@ -27120,7 +27237,7 @@ mod tests {
         );
 
         let overlay = state.overlay_view().expect("network approval");
-        assert_eq!(overlay.title, "네트워크 접근을 허용할까요?");
+        assert_eq!(overlay.title, "Allow network access?");
         assert!(
             overlay
                 .lines
@@ -27131,7 +27248,7 @@ mod tests {
             overlay
                 .lines
                 .iter()
-                .any(|line| line.text == "추가 네트워크: 허용")
+                .any(|line| line.text == "Additional Network: allowed")
         );
         assert!(
             !overlay.lines.iter().any(|line| line.text.contains("curl")),
@@ -29487,9 +29604,9 @@ mod tests {
                 .map(|line| line.text.as_str())
                 .collect::<Vec<_>>(),
             [
-                "1. Claude · 연결됨",
-                "2. Codex · 연결됨",
-                "3. OpenCode · 연결 안 됨"
+                "1. Claude · Connected",
+                "2. Codex · Connected",
+                "3. OpenCode · Not connected"
             ]
         );
         assert!(overlay.lines[0].selected);
@@ -29565,7 +29682,7 @@ mod tests {
             }
         ));
         let overlay = state.overlay_view().expect("picker stays open");
-        assert_eq!(overlay.lines[1].text, "2. Codex · 연결 안 됨");
+        assert_eq!(overlay.lines[1].text, "2. Codex · Not connected");
         state.pending = None;
 
         // The command reconnects rather than failing: choosing Codex is what
@@ -29607,9 +29724,9 @@ mod tests {
                 .map(|line| line.text.as_str())
                 .collect::<Vec<_>>(),
             [
-                "1. Claude · 연결 안 됨",
-                "2. Codex · 연결 안 됨",
-                "3. OpenCode · 연결 안 됨"
+                "1. Claude · Not connected",
+                "2. Codex · Not connected",
+                "3. OpenCode · Not connected"
             ]
         );
         state.pending = None;
@@ -29743,7 +29860,7 @@ mod tests {
 
         state.run_slash_command("/provider");
         let overlay = state.overlay_view().expect("provider picker");
-        assert_eq!(overlay.lines[2].text, "3. OpenCode · 연결됨");
+        assert_eq!(overlay.lines[2].text, "3. OpenCode · Connected");
         assert!(matches!(
             state.click_overlay_row(2),
             Action::ActivateOpenCode
@@ -29971,7 +30088,7 @@ mod tests {
         ));
 
         let overlay = state.overlay_view().expect("permission approval");
-        assert_eq!(overlay.title, "추가 권한을 허용할까요?");
+        assert_eq!(overlay.title, "Allow additional permissions?");
         assert!(
             overlay
                 .lines
@@ -29998,7 +30115,7 @@ mod tests {
             !overlay
                 .lines
                 .iter()
-                .any(|line| line.text.contains("이 프로젝트에서 항상 허용"))
+                .any(|line| line.text.contains("Always allow in this project"))
         );
         assert_eq!(overlay.hint, "↑↓ Select   Enter Confirm   Esc Decline");
 
@@ -30009,13 +30126,13 @@ mod tests {
             &json!({
                 "claudePermission": true,
                 "command": "npm test",
-                "persistentApprovalLabel": "이 프로젝트에서 항상 허용: Bash(npm test)"
+                "persistentApprovalLabel": "Always allow in this project: Bash(npm test)"
             }),
         );
         let overlay = state.overlay_view().expect("Claude persistent approval");
         assert!(
             overlay.lines.iter().any(|line| {
-                line.text == "이 프로젝트에서 항상 허용: Bash(npm test)"
+                line.text == "Always allow in this project: Bash(npm test)"
             })
         );
         assert_eq!(overlay.hint, "↑↓ Select   Enter Confirm   Esc Decline");

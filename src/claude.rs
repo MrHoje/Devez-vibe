@@ -401,17 +401,16 @@ pub fn model_catalog() -> Value {
             { "reasoningEffort": "max" }
         ])
     };
+    // Safeguard fallback only; `hidden` keeps it out of /model.
+    let mut previous_opus =
+        claude_model("claude:claude-opus-5", "Claude Opus 5", efforts(), false);
+    previous_opus["hidden"] = json!(true);
     json!({
         "data": [
             claude_model("claude:claude-fable-5-1", "Claude Fable 5.1", efforts(), false),
             claude_model("claude:fable", "Claude Fable 5", efforts(), false),
-            claude_model("claude:opus", "Claude Opus 5", efforts(), false),
-            claude_model(
-                "claude:claude-opus-4-8",
-                "Claude Opus 4.8",
-                efforts(),
-                false,
-            ),
+            claude_model("claude:opus", "Claude Opus 5.5", efforts(), false),
+            previous_opus,
             claude_model("claude:sonnet", "Claude Sonnet 5", efforts(), true),
             claude_model("claude:haiku", "Claude Haiku 4.5", json!([]), false)
         ]
@@ -829,7 +828,7 @@ mod tests {
                 "claude:claude-fable-5-1",
                 "claude:fable",
                 "claude:opus",
-                "claude:claude-opus-4-8",
+                "claude:claude-opus-5",
                 "claude:sonnet",
                 "claude:haiku"
             ]
@@ -847,8 +846,8 @@ mod tests {
             [
                 "Claude Fable 5.1",
                 "Claude Fable 5",
+                "Claude Opus 5.5",
                 "Claude Opus 5",
-                "Claude Opus 4.8",
                 "Claude Sonnet 5",
                 "Claude Haiku 4.5"
             ]
@@ -989,12 +988,12 @@ mod tests {
             package
                 .pointer("/dependencies/@anthropic-ai~1claude-agent-sdk")
                 .and_then(Value::as_str),
-            Some("0.3.276")
+            Some("0.3.280")
         );
         assert_eq!(
             lock.pointer("/packages//dependencies/@anthropic-ai~1claude-agent-sdk")
                 .and_then(Value::as_str),
-            Some("0.3.276")
+            Some("0.3.280")
         );
         assert!(bridge.contains(
             "const CLAUDE_TASK_TOOLS = [\"TaskCreate\", \"TaskGet\", \"TaskUpdate\", \"TaskList\"]"

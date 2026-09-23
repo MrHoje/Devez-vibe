@@ -21,8 +21,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude 요청이 차단되면 모델 전환 또는 프롬프트 수정 선택지를 표시합니다.",
-    "Claude 응답 거부·잘림·오류와 도구 권한 거부를 화면에 안내합니다.",
+    "Claude Agent SDK 0.3.280을 적용해 Claude Opus 5.5를 기본 Opus 모델로 사용하고, 세션 재개·자동 모드 반복 거부 등의 오류 수정을 함께 반영합니다.",
+    "`/model` 목록에서 Opus 4.8을 뺐고, Claude 요청이 차단되면 순정 Claude Code와 같이 Opus 5로 전환을 제안합니다.",
+    "한국어로 대화할 때 도구 실행 직전에 나오던 영어 진행 문장을 숨기고, `ㅇㅋ` 같은 짧은 답변도 한국어 대화로 인식합니다.",
+    "화면의 알림 제목·승인 선택지·상태 표시·목록 설명을 영어로 통일합니다.",
+    "`/model`에서 3번을 고르면 그 모델이 provider 기본 모델로 저장되어, 나중에 그 provider로 바꿀 때 자동으로 선택됩니다.",
+    "Claude Opus 5.5가 도구 실행이나 질문 직전에 남기는 진행 설명이 화면에 나오지 않던 문제를 고쳤습니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

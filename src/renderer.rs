@@ -222,7 +222,7 @@ const CHAT_BUBBLE_RIGHT_GAP: usize = 1;
 const HISTORY_LABEL_MUTED_BLEND: u8 = 120;
 const TRANSCRIPT_HISTORY_MAX_BYTES: usize = 4 * 1024 * 1024;
 const TRANSCRIPT_HISTORY_MAX_BLOCKS: usize = 512;
-const TRANSCRIPT_OMITTED_TITLE: &str = "이전 화면 기록 생략 · 원본 대화는 보존됨";
+const TRANSCRIPT_OMITTED_TITLE: &str = "Earlier screen history hidden · conversation kept";
 
 impl Block {
     pub fn new(kind: BlockKind, title: impl Into<String>, body: impl Into<String>) -> Self {
@@ -6053,25 +6053,19 @@ enum Tone {
     UserPromptHalf,
     AssistantBubble,
     AssistantBubbleHalf,
-    Model56,
     ModelAstra,
     ModelSol,
-    ModelTerra,
     ModelLuna,
     ModelSpark,
-    Model55,
     ModelHaiku,
     ModelSonnet,
     ModelOpus,
     ModelFable,
     ModelOpenCode,
-    StatusModel56,
     StatusModelAstra,
     StatusModelSol,
-    StatusModelTerra,
     StatusModelLuna,
     StatusModelSpark,
-    StatusModel55,
     StatusModelHaiku,
     StatusModelSonnet,
     StatusModelOpus,
@@ -14397,7 +14391,9 @@ fn model_tone(model: &str) -> Option<Tone> {
         return None;
     }
     let model = model.to_ascii_lowercase();
-    if model.contains("haiku") {
+    if model.contains("gpt-5.6") || model.contains("gpt-5.5") {
+        Some(Tone::Plain)
+    } else if model.contains("haiku") {
         Some(Tone::ModelHaiku)
     } else if model.contains("sonnet") {
         Some(Tone::ModelSonnet)
@@ -14409,16 +14405,10 @@ fn model_tone(model: &str) -> Option<Tone> {
         Some(Tone::ModelSpark)
     } else if model.contains("gpt-6") && model.contains("astra") {
         Some(Tone::ModelAstra)
-    } else if model.contains("5.6") && model.contains("sol") {
+    } else if model.contains("gpt-6") && model.contains("sol") {
         Some(Tone::ModelSol)
-    } else if model.contains("5.6") && model.contains("terra") {
-        Some(Tone::ModelTerra)
-    } else if model.contains("5.6") && model.contains("luna") {
+    } else if model.contains("gpt-6") && model.contains("luna") {
         Some(Tone::ModelLuna)
-    } else if model.contains("5.6") {
-        Some(Tone::Model56)
-    } else if model.contains("5.5") {
-        Some(Tone::Model55)
     } else {
         None
     }
@@ -14429,13 +14419,10 @@ fn status_model_tone(model: &str) -> Option<Tone> {
         return Some(Tone::ModelOpenCode);
     }
     match model_tone(model)? {
-        Tone::Model56 => Some(Tone::StatusModel56),
         Tone::ModelAstra => Some(Tone::StatusModelAstra),
         Tone::ModelSol => Some(Tone::StatusModelSol),
-        Tone::ModelTerra => Some(Tone::StatusModelTerra),
         Tone::ModelLuna => Some(Tone::StatusModelLuna),
         Tone::ModelSpark => Some(Tone::StatusModelSpark),
-        Tone::Model55 => Some(Tone::StatusModel55),
         Tone::ModelHaiku => Some(Tone::StatusModelHaiku),
         Tone::ModelSonnet => Some(Tone::StatusModelSonnet),
         Tone::ModelOpus => Some(Tone::StatusModelOpus),
@@ -14501,24 +14488,18 @@ fn tone_rgb(tone: Tone) -> Option<Rgb> {
         Tone::UserPromptPadding | Tone::UserPromptHalf => palette.user_prompt_bg,
         Tone::AssistantBubble => palette.foreground,
         Tone::AssistantBubbleHalf => blend(palette.background, palette.foreground, 20),
-        Tone::Model56 => palette.model_gpt56,
         Tone::ModelAstra | Tone::StatusModelAstra => palette.model_astra,
         Tone::ModelSol => palette.model_sol,
-        Tone::ModelTerra => palette.model_terra,
         Tone::ModelLuna => palette.model_luna,
         Tone::ModelSpark => palette.model_spark,
-        Tone::Model55 => palette.model_gpt55,
         Tone::ModelHaiku => palette.status.model_haiku,
         Tone::ModelSonnet => palette.status.model_sonnet,
         Tone::ModelOpus => palette.status.model_opus,
         Tone::ModelFable => palette.status.model_fable,
         Tone::ModelOpenCode => palette.model_opencode,
-        Tone::StatusModel56 => palette.model_gpt56,
         Tone::StatusModelSol => palette.model_sol,
-        Tone::StatusModelTerra => palette.model_terra,
         Tone::StatusModelLuna => palette.model_luna,
         Tone::StatusModelSpark => palette.model_spark,
-        Tone::StatusModel55 => palette.model_gpt55,
         Tone::StatusModelHaiku => palette.status.model_haiku,
         Tone::StatusModelSonnet => palette.status.model_sonnet,
         Tone::StatusModelOpus => palette.status.model_opus,
@@ -17791,7 +17772,7 @@ mod tests {
     }
 
     #[test]
-    fn model_change_detail_colours_model_and_effort() {
+    fn model_change_detail_keeps_5_6_plain_and_colours_effort() {
         let block = Block::new(
             BlockKind::ModelChange,
             "✓ Model changed",
@@ -17802,7 +17783,7 @@ mod tests {
         let detail = &lines[1];
         // The arrow, model name, separator, then effort. No closing wall follows.
         assert_eq!(detail.tail.len(), 4);
-        assert_eq!(detail.tail[1].tone, Tone::ModelTerra);
+        assert_eq!(detail.tail[1].tone, Tone::Plain);
         assert_eq!(detail.tail[3].tone, Tone::EffortHigh);
     }
 
@@ -19477,7 +19458,7 @@ mod tests {
         assert!(!painted(&frame.lines[activity]).contains("Knowledge:"));
         assert!(!painted(&frame.lines[activity + 1]).contains("View: Chat"));
         assert_eq!(painted_width(&frame.lines[activity]), 158);
-        assert_eq!(frame.lines[activity + 1].tone, Tone::ModelTerra);
+        assert_eq!(frame.lines[activity + 1].tone, Tone::Plain);
     }
 
     #[test]
@@ -19586,7 +19567,7 @@ mod tests {
     }
 
     #[test]
-    fn working_activity_uses_its_model_tone() {
+    fn working_activity_uses_plain_tone_for_5_6() {
         let line = activity_lines("Working.. (2m 12s)", Some("gpt-5.6-terra"), 0.5, 80)
             .pop()
             .expect("working row");
@@ -19596,9 +19577,9 @@ mod tests {
         assert_eq!(line.tail.first().map(|span| span.text.as_str()), Some("⠴ "));
         assert_eq!(
             line.tail.first().map(|span| span.tone),
-            Some(Tone::ModelTerra)
+            Some(Tone::Plain)
         );
-        assert_eq!(line.tone, Tone::ModelTerra);
+        assert_eq!(line.tone, Tone::Plain);
         assert_eq!(
             line.tail
                 .iter()
@@ -19637,7 +19618,7 @@ mod tests {
                 "❖ Completed (2m 12s)",
                 Some(" "),
                 None,
-                Some(Tone::ModelTerra),
+                Some(Tone::Plain),
             ),
             ("X Interrupted", None, Some("X "), None),
         ] {
@@ -19722,14 +19703,14 @@ mod tests {
     }
 
     #[test]
-    fn composer_chrome_and_prompt_use_the_model_tone() {
+    fn composer_chrome_and_prompt_use_plain_tone_for_5_6() {
         let editor = Editor::default();
         let mode = test_mode("Default", ModeAccent::Calm, false);
 
         let (rows, _, _, _) = input_lines(&editor, &[], 80, "", "Ask anything", None, Some(&mode));
 
-        assert_eq!(rows[0].tone, Tone::ModelTerra);
-        assert_eq!(rows[1].prefix_tone, Tone::ModelTerra);
+        assert_eq!(rows[0].tone, Tone::Plain);
+        assert_eq!(rows[1].prefix_tone, Tone::Plain);
         // The `❯` glyph carries the agent colour; the rules keep the model tone.
         // The blank the cursor sits on stays plain, so an outside terminal paints
         // the IME preedit in the ordinary text colour.
@@ -19738,7 +19719,7 @@ mod tests {
             rows[1].tail.last().map(|span| span.tone),
             Some(Tone::Plain)
         );
-        assert_eq!(rows.last().map(|line| line.tone), Some(Tone::ModelTerra));
+        assert_eq!(rows.last().map(|line| line.tone), Some(Tone::Plain));
     }
 
     #[test]
@@ -19891,7 +19872,7 @@ mod tests {
         assert!(lines.iter().all(|line| painted(line).starts_with("▌ Queue : ")));
         assert!(lines.iter().all(|line| painted(line).ends_with('x')));
         assert!(lines.iter().all(|line| painted_line_width(line) == 78));
-        assert!(lines.iter().all(|line| line.prefix_tone == Tone::ModelSol));
+        assert!(lines.iter().all(|line| line.prefix_tone == Tone::Plain));
         assert_eq!(pick_on(&lines[3], "x"), Some(Pick::RemoveQueuedPrompt(3)));
     }
 
@@ -24509,9 +24490,9 @@ mod tests {
                 .iter()
                 .find(|span| span.text == "GPT-5.6 Sol")
                 .map(|span| span.tone),
-            Some(Tone::StatusModelSol)
+            Some(Tone::StatusText)
         );
-        assert!(word_background(Tone::StatusModelSol).is_none());
+        assert!(word_background(Tone::StatusText).is_none());
         assert!(word_background(Tone::StatusEffortHigh).is_none());
         assert_eq!(
             line.tail
@@ -25517,7 +25498,7 @@ mod tests {
                         let frames = states.iter().map(|state| {
                             let view = state.view();
                             let overlay = view.overlay.unwrap();
-                            assert_eq!(overlay.title, "질문");
+                            assert_eq!(overlay.title, "Question");
                             let frame = overlay_frame(&[], overlay, None, StatusArea {
                                 diff_reference_lines: None,
                                 side_panel_open: false,
@@ -26672,7 +26653,7 @@ mod tests {
             .iter()
             .find(|line| line.prefix.contains('❯'))
             .expect("selected model row");
-        assert_eq!(selected.tone, Tone::ModelSol);
+        assert_eq!(selected.tone, Tone::Plain);
     }
 
     #[test]
@@ -27413,21 +27394,22 @@ mod tests {
     }
 
     #[test]
-    fn model_families_have_distinct_consistent_tones() {
-        let tones = [
-            model_tone("GPT-5.6 Sol"),
-            model_tone("GPT-5.6 Terra"),
-            model_tone("GPT-5.6 Luna"),
-            model_tone("GPT-5.5"),
-        ];
-
-        assert!(tones.iter().all(Option::is_some));
-        for left in 0..tones.len() {
-            for right in left + 1..tones.len() {
-                assert!(tones[left] != tones[right]);
-            }
+    fn gpt_5_6_and_5_5_use_plain_tones_while_gpt_6_keeps_its_colors() {
+        for model in [
+            "GPT-5.6", "GPT-5.6 Sol", "GPT-5.6 Terra", "GPT-5.6 Luna", "GPT-5.5",
+        ] {
+            assert_eq!(model_tone(model), Some(Tone::Plain));
+            assert_eq!(chrome_model_tone(model), Some(Tone::Plain));
+            assert_eq!(picker_model_tone(model), Tone::Plain);
+            assert_eq!(status_model_tone(model), None);
         }
-        assert!(model_tone("GPT-5.4").is_none());
+        for (model, tone) in [
+            ("GPT-6 Astra", Tone::ModelAstra),
+            ("GPT-6 Sol", Tone::ModelSol),
+            ("GPT-6 Luna", Tone::ModelLuna),
+        ] {
+            assert_eq!(model_tone(model), Some(tone));
+        }
     }
 
     #[test]
@@ -27522,15 +27504,14 @@ mod tests {
                 Some(Tone::StatusModelAstra),
                 palette.model_astra,
             ),
-            ("GPT-5.6 Terra", Tone::ModelTerra, None, palette.model_terra),
-            ("GPT-5.6", Tone::Model56, None, palette.model_gpt56),
+            ("GPT-6 Sol", Tone::ModelSol, Some(Tone::StatusModelSol), palette.model_sol),
+            ("GPT-6 Luna", Tone::ModelLuna, Some(Tone::StatusModelLuna), palette.model_luna),
             (
                 "GPT-5.3 Codex Spark",
                 Tone::ModelSpark,
                 None,
                 palette.model_spark,
             ),
-            ("GPT-5.5", Tone::Model55, None, palette.model_gpt55),
         ] {
             assert_eq!(super::model_tone(model), Some(model_tone));
             assert_eq!(tone_rgb(model_tone), Some(color));
@@ -28028,7 +28009,7 @@ mod tests {
         assert!(lines[1].text.is_empty());
         assert_eq!(lines[2].prefix, "› ");
         assert!(painted(&lines[2]).ends_with('…'));
-        assert_eq!(lines[2].prefix_tone, Tone::ModelSol);
+        assert_eq!(lines[2].prefix_tone, Tone::Plain);
         assert_eq!(lines[2].tone, Tone::Plain);
         assert_eq!(row_background(lines[2].tone), None);
         assert_eq!(bubble_background(&lines[2]), None);
@@ -28069,12 +28050,12 @@ mod tests {
                     IntegrationItemView {
                         name: "figma".to_owned(),
                         state: IntegrationItemState::Inactive,
-                        detail: "로그인 필요".to_owned(),
+                        detail: "Login required".to_owned(),
                     },
                     IntegrationItemView {
                         name: "playwright".to_owned(),
                         state: IntegrationItemState::Pending,
-                        detail: "연결 중".to_owned(),
+                        detail: "Connecting".to_owned(),
                     },
                 ]),
                 plugins: Some(vec![]),
@@ -28093,9 +28074,9 @@ mod tests {
         );
         assert_eq!(painted(&lines[2]), "● context7  연결됨 · 도구 12");
         assert_eq!(lines[2].prefix_tone, Tone::Success);
-        assert_eq!(painted(&lines[3]), "× figma  로그인 필요");
+        assert_eq!(painted(&lines[3]), "× figma  Login required");
         assert_eq!(lines[3].prefix_tone, Tone::Error);
-        assert_eq!(painted(&lines[4]), "○ playwright  연결 중");
+        assert_eq!(painted(&lines[4]), "○ playwright  Connecting");
         assert_eq!(lines[4].prefix_tone, Tone::Warning);
         assert!(lines.iter().any(|line| painted(line) == "▲ Plugin"));
         assert!(
@@ -28127,7 +28108,7 @@ mod tests {
                     .map(|index| IntegrationItemView {
                         name: format!("server-{index}"),
                         state: IntegrationItemState::Active,
-                        detail: "연결됨".to_owned(),
+                        detail: "Connected".to_owned(),
                     })
                     .collect(),
             ),

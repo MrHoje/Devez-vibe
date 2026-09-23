@@ -101,13 +101,13 @@ impl AgentMode {
     /// One line for the picker.
     pub fn detail(self) -> &'static str {
         match self {
-            Self::Standard => "일상적인 개발 작업 전반을 유연하게 처리합니다.",
-            Self::Planner => "꼼꼼한 요구사항 인터뷰와 확인을 거쳐 구현 계획을 수립합니다.",
-            Self::GoalRunner => "목표를 정하고 끝까지 완수합니다.",
-            Self::Reviewer => "변경 내용과 계획을 근거 기반으로 검토해 심각도와 판정을 냅니다.",
-            Self::Researcher => "여러 출처를 깊이 조사해 근거와 한계를 함께 보고합니다.",
+            Self::Standard => "Handles everyday development work flexibly.",
+            Self::Planner => "Builds an implementation plan through a careful requirements interview.",
+            Self::GoalRunner => "Sets a goal and carries it through to completion.",
+            Self::Reviewer => "Reviews changes and plans with evidence, giving severity and a verdict.",
+            Self::Researcher => "Researches multiple sources in depth and reports evidence and limits.",
             Self::Custom(index) => custom_role(index)
-                .map_or("사용자가 정의한 역할입니다.", |role| role.detail.as_str()),
+                .map_or("A user-defined role.", |role| role.detail.as_str()),
         }
     }
 

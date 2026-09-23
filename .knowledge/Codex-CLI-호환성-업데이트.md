@@ -202,6 +202,7 @@ Codex 0.x.y 기준으로 호환성 업데이트해
 
 | 날짜 | 확인 Codex 버전 | 결과 | 비고 |
 | --- | --- | --- | --- |
+| 2026-09-23 | 0.156.0 | 호환 유지 | 제거는 `thread/rollback`뿐이고 DevezVibe는 쓰지 않는다. 추가는 `rollout/compress`, 모델 `availableAccessPrograms`, 스레드 `disabledPluginIds`·`daybreakEnabled`, 재개 응답 `collaborationMode`, `mcpAppUi` 등이다. 턴마다 `collaborationMode`를 보내므로 재개 응답의 모드는 불필요하다. `personality`는 폐기 표시만 붙었고 보내지 않는다. `model/list`는 `includeHidden: false`라 모델 `hidden` 해석이 Codex 목록에 영향을 주지 않는다. 기준 스키마는 0.155.0 그대로다. |
 | 2026-09-18 | 0.155.0 | 호환 유지 | 스키마 차이는 추가뿐이다. `thread/attachment/*`, `memory/status`, `userVerification/cancel`이 늘고 `FeedbackUploadResponse`에 프롬프트 해시 필드가 붙었다. 제거·변경된 기존 메서드와 알림은 없어 DevezVibe 사용 경로는 그대로다. 기준 스키마를 0.155.0으로 갱신했다. 첨부 API는 보존할 항목이 정해질 때 검토한다. |
 | 2026-09-16 | 0.154.0 | 반영 완료 | DevezVibe가 쓰는 app-server 메서드는 모두 유지된다. 제거된 `codex mcp-server` 진입점은 app-server만 쓰므로 영향이 없다. 새 `turn/settings/update`로 진행 중인 턴의 모델·추론 수준을 바꾼다. 실험적 기능이라 거절될 수 있어 실패하면 기존대로 다음 요청부터 적용한다고 알린다. `account/rateLimits/read`의 `excludeResetCreditDetails`·`supportsLunaReserve` 인자는 미적용. |
 | 2026-09-09 | 0.153.4 | 서브에이전트 요약 제약 확인 | app-server를 직접 구동해 확인했다. `gpt-5.3-codex-spark`는 `collabAgentToolCall(spawnAgent)`의 `prompt`에 평문 지시가 실려 행 요약에 쓸 수 있다. `gpt-5.6-sol`은 멀티에이전트 v2 런타임이어서 spawnAgent 항목이 오지 않고 `subAgentActivity`의 `agentPath`(`/root/<task_name>`)만 오며, message는 API 쪽에서만 복호화되는 암호문이고 `task_name`은 소문자·숫자·밑줄만 허용된다. 따라서 sol 계열은 행에 한국어 요약을 넣을 수 없어, 두 제공자 모두 행에는 작업이 드러나는 영문 이름(task_name·Agent name)과 경과 시간만 보이도록 통일하고 지침으로 이름 짓기를 요구한다. |

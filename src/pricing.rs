@@ -118,6 +118,7 @@ const PRICES: &[(&str, f64, f64)] = &[
     // Claude — list prices; Sonnet 5 carries an intro rate, see the knowledge doc.
     ("claude-fable-5", 10.0, 50.0),
     ("claude-mythos", 10.0, 50.0),
+    ("claude-opus-5-5", 4.0, 20.0),
     ("claude-opus-5", 5.0, 25.0),
     ("claude-opus-4-8", 5.0, 25.0),
     ("claude-opus-4-7", 5.0, 25.0),
@@ -138,10 +139,13 @@ pub fn estimate_usd(model: &str, totals: TokenTotals) -> Option<f64> {
         .iter()
         .find(|(slug, _, _)| model.contains(slug))
         .copied()?;
-    // Fable 5.1 cut cache reads to $0.25/MTok — 0.025x its input rate, against
-    // the 0.1x every other model on either vendor still charges.
+    // Fable 5.1 cut cache reads to $0.25/MTok — 0.025x its input rate — and
+    // Opus 5.5 to $0.20/MTok (0.05x), against the 0.1x every other model on
+    // either vendor still charges.
     let cache_read_multiplier = if model.contains("claude-fable-5-1") {
         0.025
+    } else if model.contains("claude-opus-5-5") {
+        0.05
     } else {
         CACHE_READ_MULTIPLIER
     };
@@ -180,6 +184,9 @@ mod tests {
         // $0.25/MTok on Fable 5.1; Fable 5 stays at 0.1x of $10 = $1.00.
         assert!((estimate_usd("claude-fable-5-1[1m]", totals).unwrap() - 0.25).abs() < 1e-9);
         assert!((estimate_usd("claude-fable-5", totals).unwrap() - 1.0).abs() < 1e-9);
+        // $0.20/MTok on Opus 5.5; Opus 5 stays at 0.1x of $5 = $0.50.
+        assert!((estimate_usd("claude-opus-5-5[1m]", totals).unwrap() - 0.20).abs() < 1e-9);
+        assert!((estimate_usd("claude-opus-5", totals).unwrap() - 0.50).abs() < 1e-9);
     }
 
     #[test]
@@ -217,6 +224,7 @@ mod tests {
         assert_eq!(estimate_usd("gpt-5.6-terra", totals), Some(14.0));
         assert_eq!(estimate_usd("gpt-5.6-sol", totals), Some(35.0));
         assert_eq!(estimate_usd("gpt-5.3-codex", totals), Some(15.75));
+        assert_eq!(estimate_usd("claude-opus-5-5", totals), Some(24.0));
         assert_eq!(estimate_usd("claude-opus-5", totals), Some(30.0));
         assert_eq!(estimate_usd("claude-sonnet-5", totals), Some(18.0));
         assert_eq!(estimate_usd("claude-opus-4-1", totals), Some(90.0));

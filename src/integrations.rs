@@ -92,15 +92,15 @@ pub struct McpServerInfo {
 /// 설정 범위를 화면에 풀어 쓴다. 모르는 값은 그대로 보여 준다.
 fn mcp_source_label(source: &str) -> &str {
     match source {
-        "sdk" => "DevezVibe 내장",
-        "plugin" => "플러그인",
-        "user" => "사용자 설정",
-        "project" => "프로젝트 설정",
-        "local" => "로컬 설정",
-        "dynamic" => "실행 중 지정",
-        "managed" | "enterprise" => "조직 관리 설정",
-        "claudeai" => "claude.ai 연결",
-        "agent" => "에이전트 설정",
+        "sdk" => "DevezVibe built-in",
+        "plugin" => "Plugin",
+        "user" => "User settings",
+        "project" => "Project settings",
+        "local" => "Local settings",
+        "dynamic" => "Set at runtime",
+        "managed" | "enterprise" => "Managed settings",
+        "claudeai" => "claude.ai connector",
+        "agent" => "Agent settings",
         other => other,
     }
 }
@@ -207,7 +207,7 @@ impl McpServerInfo {
             return "failed";
         }
         if self.tools_error.is_some() {
-            return "도구 조회 실패";
+            return "Tool lookup failed";
         }
         if let Some(status) = self.connection_status.as_deref() {
             return status;
@@ -233,33 +233,33 @@ impl McpServerInfo {
             (
                 IntegrationItemState::Inactive,
                 if self.connection_status.as_deref() == Some("disabled") {
-                    "비활성".to_owned()
+                    "Disabled".to_owned()
                 } else {
-                    "실패".to_owned()
+                    "Failed".to_owned()
                 },
             )
         } else if self.needs_login() {
-            (IntegrationItemState::Inactive, "로그인 필요".to_owned())
+            (IntegrationItemState::Inactive, "Login required".to_owned())
         } else if self.tools_error.is_some() {
-            (IntegrationItemState::Inactive, "도구 조회 실패".to_owned())
+            (IntegrationItemState::Inactive, "Tool lookup failed".to_owned())
         } else if matches!(self.connection_status.as_deref(), Some("pending" | "starting")) {
-            (IntegrationItemState::Pending, "연결 중".to_owned())
+            (IntegrationItemState::Pending, "Connecting".to_owned())
         } else if self.connection_status.as_deref() == Some("notStarted") {
-            (IntegrationItemState::Inactive, "시작 전".to_owned())
+            (IntegrationItemState::Inactive, "Not started".to_owned())
         } else if self.connection_status.as_deref() == Some("cancelled") {
-            (IntegrationItemState::Inactive, "연결 취소".to_owned())
+            (IntegrationItemState::Inactive, "Cancelled".to_owned())
         } else if matches!(self.connection_status.as_deref(), None | Some("connected")) {
             let tools = self.tools.len();
             (
                 IntegrationItemState::Active,
                 if tools == 0 {
-                    "연결됨".to_owned()
+                    "Connected".to_owned()
                 } else {
-                    format!("연결됨 · 도구 {tools}")
+                    format!("Connected · {tools} tool{}", if tools == 1 { "" } else { "s" })
                 },
             )
         } else {
-            (IntegrationItemState::Unknown, "미확인".to_owned())
+            (IntegrationItemState::Unknown, "Unknown".to_owned())
         };
         IntegrationItemView {
             name: self.label().to_owned(),
@@ -565,7 +565,7 @@ impl McpPicker {
                     &if server.tools_error.is_some() {
                         server.status().to_owned()
                     } else {
-                        format!("{} · 도구 {}개", server.status(), server.tools.len())
+                        format!("{} · {} tool{}", server.status(), server.tools.len(), if server.tools.len() == 1 { "" } else { "s" })
                     },
                 ),
                 selected: start + offset == self.selected,
@@ -645,7 +645,7 @@ impl McpPicker {
         });
         if let Some(source) = server.source.as_deref() {
             lines.push(OverlayLine {
-                text: format!("출처: {}", mcp_source_label(source)),
+                text: format!("Source: {}", mcp_source_label(source)),
                 selected: false,
                 muted: true,
             });
@@ -999,11 +999,11 @@ impl PluginCatalog {
             .filter(|plugin| plugin.installed)
             .map(|plugin| {
                 let (state, detail) = if !plugin.available {
-                    (IntegrationItemState::Inactive, "관리자 차단")
+                    (IntegrationItemState::Inactive, "Blocked by admin")
                 } else if plugin.enabled {
-                    (IntegrationItemState::Active, "활성")
+                    (IntegrationItemState::Active, "Enabled")
                 } else {
-                    (IntegrationItemState::Inactive, "비활성")
+                    (IntegrationItemState::Inactive, "Disabled")
                 };
                 IntegrationItemView {
                     name: plugin.display_name.clone(),
@@ -1524,7 +1524,11 @@ impl PluginPicker {
                 let text = match row {
                     ScopeRow::Installed => management_row(
                         "Installed",
-                        &format!("플러그인 {}개", self.catalog.installed().len()),
+                        &format!(
+                            "{} plugin{}",
+                            self.catalog.installed().len(),
+                            if self.catalog.installed().len() == 1 { "" } else { "s" }
+                        ),
                     ),
                     ScopeRow::Marketplace(name) => {
                         let marketplace = self
@@ -1536,14 +1540,16 @@ impl PluginPicker {
                             Some(marketplace) => management_row(
                                 &marketplace.display_name,
                                 &format!(
-                                    "플러그인 {}개 · 설치 {}개",
-                                    marketplace.plugin_count, marketplace.installed_count
+                                    "{} plugin{} · {} installed",
+                                    marketplace.plugin_count,
+                                    if marketplace.plugin_count == 1 { "" } else { "s" },
+                                    marketplace.installed_count
                                 ),
                             ),
                             None => name.clone(),
                         }
                     }
-                    ScopeRow::Marketplaces => management_row("Marketplaces", "소스 추가·제거·갱신"),
+                    ScopeRow::Marketplaces => management_row("Marketplaces", "Add, remove, or refresh sources"),
                 };
                 OverlayLine {
                     text,
@@ -1785,20 +1791,20 @@ impl PluginPicker {
         // Only advertise the actions this plugin's policy actually allows.
         let mut actions = Vec::new();
         if !plugin.installed && plugin.available {
-            actions.push("I 설치");
+            actions.push("I Install");
         }
         if plugin.uninstall_allowed {
-            actions.push("X 제거");
+            actions.push("X Remove");
         }
         if plugin.toggle_allowed {
             actions.push(if plugin.enabled {
-                "D 비활성화"
+                "D Disable"
             } else {
-                "E 활성화"
+                "E Enable"
             });
         }
         if plugin.website_url.is_some() {
-            actions.push("O 웹사이트");
+            actions.push("O Website");
         }
         actions.push("Esc Back");
         OverlayView {
@@ -2013,9 +2019,10 @@ impl MarketplacePicker {
                 text: management_row(
                     &marketplace.name,
                     &format!(
-                        "플러그인 {}개 · {}",
+                        "{} plugin{} · {}",
                         marketplace.plugin_count,
-                        marketplace.path.as_deref().unwrap_or("Codex 원격 카탈로그")
+                        if marketplace.plugin_count == 1 { "" } else { "s" },
+                        marketplace.path.as_deref().unwrap_or("Codex remote catalog")
                     ),
                 ),
                 selected: start + offset == self.selected,
@@ -2170,7 +2177,7 @@ mod tests {
             mcp.style,
             OverlayStyle::KeyboardOnlyCompactPanel
         ));
-        assert!(mcp.lines[0].text.contains("도구 1개"));
+        assert!(mcp.lines[0].text.contains("1 tool"));
         assert!(mcp.lines.iter().all(|line| !line.text.contains('\n')));
 
         let plugin_picker = PluginPicker::new(
@@ -2211,7 +2218,7 @@ mod tests {
                 enabled: false
             } if name == "browser"
         ));
-        mcp.apply_enabled("browser", false, "저장 중");
+        mcp.apply_enabled("browser", false, "Saving");
         assert!(mcp.overlay_view().lines[0].text.starts_with("[ ] browser"));
 
         let mut plugins = PluginPicker::new(
@@ -2222,7 +2229,7 @@ mod tests {
             plugins.handle_key(press(KeyCode::Char(' '))),
             PluginPickerResult::SetEnabled { enabled: false, .. }
         ));
-        plugins.apply_enabled("browser@openai-bundled", false, "저장 중");
+        plugins.apply_enabled("browser@openai-bundled", false, "Saving");
         assert!(
             plugins.overlay_view().lines[0]
                 .text
@@ -2249,12 +2256,12 @@ mod tests {
             "name": "github", "authStatus": "unsupported", "tools": {},
             "status": "connected", "source": "project"
         }));
-        assert!(claude.iter().any(|text| text == "출처: 프로젝트 설정"));
+        assert!(claude.iter().any(|text| text == "Source: Project settings"));
         let unknown = detail(json!({
             "name": "github", "authStatus": "unsupported", "tools": {},
             "status": "connected", "source": "future"
         }));
-        assert!(unknown.iter().any(|text| text == "출처: future"));
+        assert!(unknown.iter().any(|text| text == "Source: future"));
         let codex = detail(json!({
             "name": "github", "authStatus": "unsupported", "tools": {},
             "runtimeStatus": "connected"
@@ -2270,10 +2277,10 @@ mod tests {
         }]});
         let servers = McpServerInfo::list_from_value(&response);
         assert_eq!(servers[0].panel_item().state, IntegrationItemState::Inactive);
-        assert_eq!(servers[0].panel_item().detail, "도구 조회 실패");
+        assert_eq!(servers[0].panel_item().detail, "Tool lookup failed");
         let mut picker = McpPicker::new(servers);
-        assert!(picker.overlay_view().lines[0].text.contains("도구 조회 실패"));
-        assert!(!picker.overlay_view().lines[0].text.contains("도구 0개"));
+        assert!(picker.overlay_view().lines[0].text.contains("Tool lookup failed"));
+        assert!(!picker.overlay_view().lines[0].text.contains("0 tools"));
         picker.handle_key(press(KeyCode::Enter));
         let detail = picker.overlay_view();
         assert!(detail.lines.iter().any(|line| line.text.contains("discovery timed out")));
@@ -2282,7 +2289,7 @@ mod tests {
         response["data"][0]["toolsError"] = Value::Null;
         let servers = McpServerInfo::list_from_value(&response);
         assert_eq!(servers[0].panel_item().state, IntegrationItemState::Active);
-        assert_eq!(servers[0].panel_item().detail, "연결됨");
+        assert_eq!(servers[0].panel_item().detail, "Connected");
         let mut picker = McpPicker::new(servers);
         picker.handle_key(press(KeyCode::Enter));
         assert!(picker.overlay_view().lines.iter().any(|line| line.text.contains("도구를 제공하지 않습니다")));
@@ -2291,14 +2298,14 @@ mod tests {
     #[test]
     fn codex_mcp_runtime_states_preserve_connection_meaning() {
         for (runtime, expected_state, expected_detail) in [
-            ("notStarted", IntegrationItemState::Inactive, "시작 전"),
-            ("starting", IntegrationItemState::Pending, "연결 중"),
-            ("connected", IntegrationItemState::Active, "연결됨"),
-            ("authenticationRequired", IntegrationItemState::Inactive, "로그인 필요"),
-            ("failed", IntegrationItemState::Inactive, "실패"),
-            ("cancelled", IntegrationItemState::Inactive, "연결 취소"),
-            ("disabled", IntegrationItemState::Inactive, "비활성"),
-            ("futureState", IntegrationItemState::Unknown, "미확인"),
+            ("notStarted", IntegrationItemState::Inactive, "Not started"),
+            ("starting", IntegrationItemState::Pending, "Connecting"),
+            ("connected", IntegrationItemState::Active, "Connected"),
+            ("authenticationRequired", IntegrationItemState::Inactive, "Login required"),
+            ("failed", IntegrationItemState::Inactive, "Failed"),
+            ("cancelled", IntegrationItemState::Inactive, "Cancelled"),
+            ("disabled", IntegrationItemState::Inactive, "Disabled"),
+            ("futureState", IntegrationItemState::Unknown, "Unknown"),
         ] {
             let server = McpServerInfo::from_value(&json!({
                 "name": "browser", "runtimeStatus": runtime,
@@ -2355,13 +2362,13 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(items[0].state, IntegrationItemState::Active);
-        assert_eq!(items[0].detail, "연결됨 · 도구 2");
+        assert_eq!(items[0].detail, "Connected · 2 tools");
         assert_eq!(items[1].state, IntegrationItemState::Inactive);
-        assert_eq!(items[1].detail, "실패");
+        assert_eq!(items[1].detail, "Failed");
         assert_eq!(items[2].state, IntegrationItemState::Inactive);
-        assert_eq!(items[2].detail, "로그인 필요");
+        assert_eq!(items[2].detail, "Login required");
         assert_eq!(items[3].state, IntegrationItemState::Pending);
-        assert_eq!(items[3].detail, "연결 중");
+        assert_eq!(items[3].detail, "Connecting");
     }
 
     #[test]
@@ -2676,9 +2683,9 @@ mod tests {
             .into_detail(slack, PluginDetail::default(), None);
 
         let hint = picker.overlay_view().hint;
-        assert!(hint.contains("I 설치"));
-        assert!(!hint.contains("X 제거"));
-        assert!(!hint.contains("D 비활성화"));
+        assert!(hint.contains("I Install"));
+        assert!(!hint.contains("X Remove"));
+        assert!(!hint.contains("D Disable"));
     }
 
     #[test]

@@ -877,7 +877,7 @@ fn hold_until_thread(
         _ => {
             state.push_notice(
                 BlockKind::Warning,
-                "세션 준비 중",
+                "Preparing session",
                 "세션이 준비된 뒤에 다시 실행해주세요.",
             );
             None
@@ -1123,7 +1123,7 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
                     effective,
                     Some(format!(
                         "{name} · {}",
-                        if effective { "켜짐" } else { "꺼짐" }
+                        if effective { "On" } else { "Off" }
                     )),
                 );
             }
@@ -1154,7 +1154,7 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
                     enabled,
                     format!(
                         "{name} · {}{}",
-                        if enabled { "켜짐" } else { "꺼짐" },
+                        if enabled { "On" } else { "Off" },
                         if provider == SkillProvider::Claude {
                             " · 새 대화부터 적용"
                         } else {
@@ -1181,7 +1181,7 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
                     provider,
                     &name,
                     enabled,
-                    format!("{name} · {}", if enabled { "켜짐" } else { "꺼짐" }),
+                    format!("{name} · {}", if enabled { "On" } else { "Off" }),
                 );
             }
             Err(error) => {
@@ -1942,7 +1942,7 @@ async fn event_loop(
                         } else {
                             state.push_notice(
                                 BlockKind::Warning,
-                                format!("{provider} 사용 불가"),
+                                format!("{provider} unavailable"),
                                 message,
                             );
                         }
@@ -2886,10 +2886,15 @@ async fn execute_action(
                     state.clear_pending_provider_model();
                     state.push_notice(
                         BlockKind::Warning,
-                        "Provider 연결 저장 실패",
+                        "Failed to save provider connection",
                         error.to_string(),
                     );
                 }
+            }
+        }
+        Action::PersistProviderModelDefault { key, value } => {
+            if let Err(error) = state::write_vibe_config_value(key, &value) {
+                state.push_notice(BlockKind::Warning, "Failed to save default", error.to_string());
             }
         }
         Action::PersistAutoKnowledge(enabled) => {
@@ -2955,7 +2960,7 @@ async fn execute_action(
             ),
             Err(error) => state.push_notice(
                 BlockKind::Error,
-                "Claude 권한 규칙 변경 실패",
+                "Failed to change Claude permission rule",
                 error.to_string(),
             ),
         },
@@ -2974,7 +2979,7 @@ async fn execute_action(
             {
                 state.push_notice(
                     BlockKind::Error,
-                    "Claude 권한 재시도 실패",
+                    "Failed to retry Claude permission",
                     error.to_string(),
                 );
             }
@@ -2989,7 +2994,7 @@ async fn execute_action(
             {
                 state.push_notice(
                     BlockKind::Warning,
-                    "Shell 표시 설정 저장 실패",
+                    "Failed to save Shell display setting",
                     error.to_string(),
                 );
             }
@@ -3005,7 +3010,7 @@ async fn execute_action(
             {
                 state.push_notice(
                     BlockKind::Warning,
-                    "Diff 표시 설정 저장 실패",
+                    "Failed to save Diff display setting",
                     error.to_string(),
                 );
             }
@@ -3021,7 +3026,7 @@ async fn execute_action(
             {
                 state.push_notice(
                     BlockKind::Warning,
-                    "사이드패널 폭 저장 실패",
+                    "Failed to save side panel width",
                     error.to_string(),
                 );
             }
@@ -3036,7 +3041,7 @@ async fn execute_action(
             {
                 state.push_notice(
                     BlockKind::Warning,
-                    "Response 표시 설정 저장 실패",
+                    "Failed to save Response display setting",
                     error.to_string(),
                 );
             }
@@ -3060,7 +3065,7 @@ async fn execute_action(
             {
                 state.push_notice(
                     BlockKind::Warning,
-                    "상태줄 표시 설정 저장 실패",
+                    "Failed to save status line setting",
                     error.to_string(),
                 );
             }
@@ -3360,7 +3365,7 @@ async fn execute_action(
                         }
                         Err(error) => state.push_notice(
                             BlockKind::Error,
-                            "OAuth 시작 실패",
+                            "Failed to start OAuth",
                             error.to_string(),
                         ),
                     }
@@ -3497,7 +3502,7 @@ async fn execute_action(
                 }
                 (Err(error), _) | (_, Err(error)) => state.push_notice(
                     BlockKind::Error,
-                    "플러그인 상세 조회 실패",
+                    "Failed to load plugin details",
                     error.to_string(),
                 ),
             }
@@ -3521,7 +3526,7 @@ async fn execute_action(
                 ),
                 Some(plugin) if !plugin.available => state.push_notice(
                     BlockKind::Error,
-                    "설치할 수 없는 플러그인",
+                    "Plugin can't be installed",
                     format!(
                         "{}은(는) 관리자 정책으로 비활성화되어 있습니다.",
                         plugin.display_name
@@ -3530,7 +3535,7 @@ async fn execute_action(
                 Some(plugin) => state.confirm_plugin_install(plugin),
                 None => state.push_notice(
                     BlockKind::Error,
-                    "플러그인을 찾을 수 없음",
+                    "Plugin not found",
                     format!("{query}\n/plugins에서 정확한 이름을 확인하세요."),
                 ),
             },
@@ -3542,7 +3547,7 @@ async fn execute_action(
             Ok(response) => match PluginCatalog::from_value(&response).resolve(&query) {
                 Some(plugin) if plugin.installed && !plugin.uninstall_allowed => state.push_notice(
                     BlockKind::Warning,
-                    "제거할 수 없는 플러그인",
+                    "Plugin can't be removed",
                     format!(
                         "{}은(는) 관리자에 의해 설치되었습니다.",
                         plugin.display_name
@@ -3551,12 +3556,12 @@ async fn execute_action(
                 Some(plugin) if plugin.installed => state.confirm_plugin_uninstall(plugin),
                 Some(plugin) => state.push_notice(
                     BlockKind::Warning,
-                    "설치되지 않은 플러그인",
+                    "Plugin not installed",
                     plugin.display_name.clone(),
                 ),
                 None => state.push_notice(
                     BlockKind::Error,
-                    "플러그인을 찾을 수 없음",
+                    "Plugin not found",
                     format!("{query}\n/plugins에서 정확한 이름을 확인하세요."),
                 ),
             },
@@ -3568,12 +3573,12 @@ async fn execute_action(
             Ok(response) => match PluginCatalog::from_value(&response).resolve(&query) {
                 Some(plugin) if !plugin.installed => state.push_notice(
                     BlockKind::Warning,
-                    "설치되지 않은 플러그인",
+                    "Plugin not installed",
                     format!("{}\n먼저 /plugins install {query}", plugin.display_name),
                 ),
                 Some(plugin) if !plugin.toggle_allowed => state.push_notice(
                     BlockKind::Warning,
-                    "변경할 수 없는 플러그인",
+                    "Plugin can't be changed",
                     format!("{}은(는) 관리자 정책으로 관리됩니다.", plugin.display_name),
                 ),
                 Some(plugin) if plugin.enabled == enabled => state.push_notice(
@@ -3597,7 +3602,7 @@ async fn execute_action(
                     {
                         state.push_notice(
                             BlockKind::Error,
-                            "플러그인 설정 실패",
+                            "Failed to update plugin",
                             error.to_string(),
                         );
                     } else {
@@ -3620,7 +3625,7 @@ async fn execute_action(
                 }
                 None => state.push_notice(
                     BlockKind::Error,
-                    "플러그인을 찾을 수 없음",
+                    "Plugin not found",
                     format!("{query}\n/plugins에서 정확한 이름을 확인하세요."),
                 ),
             },
@@ -3671,7 +3676,7 @@ async fn execute_action(
             }
             Err(error) => state.push_notice(
                 BlockKind::Error,
-                "마켓플레이스 조회 실패",
+                "Failed to load marketplaces",
                 error.to_string(),
             ),
         },
@@ -3709,7 +3714,7 @@ async fn execute_action(
                 }
                 Err(error) => state.push_notice(
                     BlockKind::Error,
-                    "마켓플레이스 추가 실패",
+                    "Failed to add marketplace",
                     error.to_string(),
                 ),
             }
@@ -3729,7 +3734,7 @@ async fn execute_action(
                 }
                 Err(error) => state.push_notice(
                     BlockKind::Error,
-                    "마켓플레이스 제거 실패",
+                    "Failed to remove marketplace",
                     error.to_string(),
                 ),
             }
@@ -3800,7 +3805,7 @@ async fn execute_action(
                 }
                 Err(error) => state.push_notice(
                     BlockKind::Error,
-                    "마켓플레이스 갱신 실패",
+                    "Failed to update marketplace",
                     error.to_string(),
                 ),
             }
@@ -3926,7 +3931,7 @@ async fn execute_action(
                             Some(format!(
                                 "{} · {}",
                                 skill.name,
-                                if effective { "켜짐" } else { "꺼짐" }
+                                if effective { "On" } else { "Off" }
                             )),
                         )
                         .await;
@@ -4029,7 +4034,7 @@ async fn execute_action(
                 {
                     state.push_notice(
                         BlockKind::Warning,
-                        "기본값 저장 실패",
+                        "Failed to save default",
                         format!("{key}: {error}"),
                     );
                     break;
@@ -4127,7 +4132,7 @@ async fn activate_open_code(
             }
             Err(error) => state.push_notice(
                 BlockKind::Error,
-                "OpenCode 모델 조회 실패",
+                "Failed to load OpenCode models",
                 error.to_string(),
             ),
         },
@@ -4175,7 +4180,7 @@ async fn start_new_thread(
     if !refresh_errors.is_empty() {
         state.push_notice(
             BlockKind::Warning,
-            "새 세션 목록 새로고침 실패",
+            "Failed to refresh session list",
             refresh_errors.join("\n"),
         );
     }
@@ -4478,7 +4483,7 @@ async fn apply_deferred_startup_actions(server: &BackendServer, state: &mut AppS
                 {
                     state.push_notice(
                         BlockKind::Warning,
-                        "Response 표시 설정 저장 실패",
+                        "Failed to save Response display setting",
                         error.to_string(),
                     );
                 }
@@ -4805,7 +4810,7 @@ async fn persist_vibe_display_modes(
         {
             state.push_notice(
                 BlockKind::Warning,
-                "Vibe 표시 설정 저장 실패",
+                "Failed to save Vibe display setting",
                 error.to_string(),
             );
             break;
@@ -4879,7 +4884,7 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "- 한 불릿에 한 쟁점을 담고 사용자 영향과 필요한 조치를 먼저 쓴다. 기술 식별자·경로·명령·코드는 사용자가 요청했거나 원인·영향·범위·실행 판단에 필요할 때만 최소로 쓴다.\n",
     "- 중복을 줄이되 띄어쓰기를 없애거나 서로 다른 쟁점을 압축하지 않는다. 판단에 필요한 근거·미확인 범위·후속 조치를 남긴다.\n",
     "- 분량은 현재 역할 지침을 따르되 Builder 외 역할에는 글자·불릿·문장 수 제한을 두지 않는다. 선택·승인 설명은 분량 제한 없이 선택지·결과·판단 근거를 온전히 제공한다.\n",
-    "- 선택·승인은 사용 가능한 AskUserQuestion 도구로 묻는다. 도구에 담는 선택지 설명은 두 문장 이내로 줄인다. 입력이 커지면 도중에 끊겨 호출이 실패한다. 도구가 없거나 실패했거나 선택지를 모두 담지 못할 때는 일반 문장으로 선택지와 결과를 빠짐없이 제시하고 마지막 문장에서 선택을 묻는다. 무응답을 승인으로 해석하지 않는다.\n",
+    "- 선택·승인은 사용 가능한 AskUserQuestion 도구로 묻는다. 도구에 담는 선택지 설명은 두 문장 이내로 줄인다. 입력이 커지면 도중에 끊겨 호출이 실패한다. 도구가 없거나 실패했거나 선택지를 모두 담지 못할 때는 일반 문장으로 선택지와 결과를 빠짐없이 제시하고 마지막 문장에서 선택을 묻는다. 사용자가 그대로 읽어야 할 초안·목록은 질문 도구를 부르는 응답에 쓰면 화면에 나오지 않으므로, 도구 없이 본문으로 쓰고 마지막 문장에서 묻는다. 무응답을 승인으로 해석하지 않는다.\n",
     "- 계획 승인·실행 판단에는 목표·주요 작업·검토 결과·미확정 사항을 요약하고 상세 구현은 계획 문서에 둔다. 이미 정한 결정이나 제외한 선택지를 반복하지 않는다.\n",
     "- 실제 변경을 마쳤을 때만 마지막 문장을 구체적인 대상·동작을 담은 `~했습니다.`로 끝낸다. 질문·조사·설명에는 완료 표현을 쓰지 않고, `~한 내용을 완료했습니다.` 같은 겹친 명사절은 피한다.\n",
     "근거와 상태:\n",
@@ -5225,7 +5230,7 @@ async fn reopen_marketplaces(server: &BackendServer, state: &mut AppState, notic
         }
         Err(error) => state.push_notice(
             BlockKind::Warning,
-            "마켓플레이스 새로고침 실패",
+            "Failed to refresh marketplaces",
             format!("{notice}\n{error}"),
         ),
     }
@@ -7403,6 +7408,7 @@ mod tests {
                 context_window: None,
                 fast_service_tier: Some("priority".to_owned()),
                 supports_auto_mode: false,
+                hidden: false,
             }],
             "gpt-5.6-sol",
             None,
@@ -7543,6 +7549,7 @@ mod tests {
             context_window: None,
             fast_service_tier: None,
             supports_auto_mode: false,
+            hidden: false,
         }
     }
 

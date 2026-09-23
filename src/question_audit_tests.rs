@@ -402,7 +402,7 @@ fn permission_display_tracks_effective_profile_without_lowering_next_preference(
     assert_eq!(state.permission_mode(), PermissionMode::Workspace);
     assert_eq!(state.permission_profile(), ":danger-full-access");
     state.show_status();
-    assert!(state.committed.last().unwrap().body.contains("작업 폴더 수정"));
+    assert!(state.committed.last().unwrap().body.contains("Workspace write"));
     state.handle_notification("devez/permissions/updated", &json!({"threadId": "different-thread", "profile": ":read-only", "lowered": true}));
     assert_eq!(state.permission_mode(), PermissionMode::Workspace);
 }
@@ -425,4 +425,75 @@ fn alt_enter_queues_the_draft_image_and_sends_it_with_the_prompt() {
         input.iter().any(|item| item["type"] == "localImage" && item["path"] == "C:/shots/screen.png"),
         "대기 프롬프트가 이미지를 싣지 않음: {input:?}"
     );
+}
+
+/// Streams one answer, then opens a modal the way each backend does, and
+/// reports whether the answer is still somewhere the renderer paints.
+fn answer_survives_modal(provider: &str, open: impl FnOnce(&mut AppState)) -> bool {
+    let mut state = busy_state_with_live_turn();
+    let text = "초안입니다.\n\n1. 첫 항목\n2. 둘째 항목";
+    let ids = |extra: Value| {
+        let mut params = json!({"threadId": "main-thread", "turnId": "live-turn"});
+        params.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        params
+    };
+    let item = json!({"id": "m1", "type": "agentMessage", "text": "", "provider": provider});
+    state.handle_notification("item/started", &ids(json!({"item": item})));
+    state.handle_notification("item/agentMessage/delta", &ids(json!({"itemId": "m1", "delta": text})));
+    let mut done = item.clone();
+    done["text"] = json!(text);
+    state.handle_notification("item/completed", &ids(json!({"item": done})));
+    open(&mut state);
+    assert!(state.view().overlay.is_some(), "{provider}: 창이 열려야 한다");
+    // Text still being paced out keeps revealing under the open modal; give it
+    // the frames the event loop would.
+    let mut committed = Vec::new();
+    for _ in 0..300 {
+        committed.extend(state.drain_committed());
+        let view = state.view();
+        if committed.iter().chain(view.live_blocks.iter().map(|live| live.block))
+            .any(|block| block.body.contains("둘째 항목"))
+        {
+            return true;
+        }
+        state.drain_stream_text(Duration::from_millis(40));
+        state.tick();
+    }
+    false
+}
+
+#[test]
+fn every_backend_keeps_the_answer_that_precedes_its_question_or_approval() {
+    let question = json!({"questions": [{"id": "q0", "header": "노트 승인", "question": "승인할까요?",
+        "options": [{"label": "승인", "description": ""}], "isOther": true}]});
+    // Claude's bridge and Codex both ask through the question RPC.
+    for provider in ["Claude", "Codex"] {
+        assert!(answer_survives_modal(provider, |state| {
+            state.begin_server_request(json!(5), "item/tool/requestUserInput", &question);
+        }), "{provider} 질문");
+    }
+    // Claude permissions, Codex approvals and OpenCode's `session/request_permission`
+    // (mapped by kind) all land on these three.
+    for provider in ["Claude", "Codex", "OpenCode"] {
+        for (method, params) in [
+            ("item/commandExecution/requestApproval", json!({"command": "npm test"})),
+            ("item/fileChange/requestApproval", json!({})),
+            ("item/permissions/requestApproval", json!({"permissions": {"network": {"enabled": true}}})),
+        ] {
+            assert!(answer_survives_modal(provider, |state| {
+                state.begin_server_request(json!(6), method, &params);
+            }), "{provider} {method}");
+        }
+    }
+}
+
+#[test]
+fn codex_async_question_drops_only_its_own_message() {
+    assert!(answer_survives_modal("Codex", |state| {
+        state.reject_unanswered_question("item/completed", &json!({
+            "threadId": "main-thread", "turnId": "live-turn",
+            "item": {"id": "q-msg", "type": "agentMessage", "delivery": "async", "text": "어떤 방법인가요?",
+                "questions": [{"title": "어떤 방법인가요?", "options": ["첫째", "둘째"]}]}
+        }));
+    }), "비동기 질문 앞의 별도 응답은 남아야 한다");
 }
