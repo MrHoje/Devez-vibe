@@ -1406,7 +1406,7 @@ struct ActiveItem {
 /// Clusters per second, fixed. A rate that chased the backlog turned a burst
 /// after a tool call, or a long answer at completion, into a visible pour. A
 /// steady pace may fall behind arrival, but it never jumps.
-const STREAM_RATE: f32 = 150.0;
+const STREAM_RATE: f32 = 100.0;
 /// A stall — a slow repaint, a descheduled loop — must not turn into one large
 /// reveal once the loop comes back.
 const STREAM_MAX_STEP: Duration = Duration::from_millis(40);
@@ -25271,7 +25271,7 @@ mod tests {
         assert_ne!(state.active["item-1"].block.body, text);
         assert!(state.drain_committed().is_empty());
 
-        drain_frames(&mut state, 12000);
+        drain_frames(&mut state, 20000);
         assert!(state.held_notifications.is_empty());
         assert!(state.committed.iter().any(|block| block.body == text));
     }
@@ -25290,7 +25290,7 @@ mod tests {
                 assert!(active.block.body.is_empty());
                 assert_eq!(active.pace.pending, second);
                 assert!(state.stream_events_pending());
-                drain_frames(&mut state, 24000);
+                drain_frames(&mut state, 40000);
                 assert!(!state.stream_events_pending());
                 assert!(state.committed.iter().any(|block| block.body == second));
                 return;
@@ -25383,7 +25383,7 @@ mod tests {
         let mut previous_lines = 0;
         for _ in 0..2000 {
             let reveal = state.drain_stream_text(Duration::from_secs(2));
-            assert!(reveal.clusters <= 6);
+            assert!(reveal.clusters <= 4);
             if let Some(active) = state.active.get("one") {
                 let lines = active.block.body.bytes().filter(|byte| *byte == b'\n').count();
                 assert!(lines - previous_lines <= 1);
@@ -25402,9 +25402,9 @@ mod tests {
         let mut state = test_state();
         let line = "- 짧은 줄입니다. 속도는 전체 대기량을 따라야 합니다.\n\n";
         let mut backlog_max = 0;
-        // About 130 characters a second: ordinary streaming, under the fixed rate.
+        // About 86 characters a second: ordinary streaming, under the fixed rate.
         for step in 0..2000 {
-            if step % 60 == 0 {
+            if step % 90 == 0 {
                 state.handle_notification("item/agentMessage/delta", &json!({"itemId":"one", "delta":line}));
             }
             backlog_max = backlog_max.max(state.drain_stream_text(Duration::from_millis(4)).backlog);
