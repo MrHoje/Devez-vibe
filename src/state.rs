@@ -1492,7 +1492,13 @@ impl TextPace {
         self.pending.push_str(delta);
     }
 
-    fn take(&mut self, elapsed: Duration, visible_end: usize, max_clusters: usize) -> Option<String> {
+    fn take(
+        &mut self,
+        elapsed: Duration,
+        visible_end: usize,
+        max_clusters: usize,
+        hidden_clusters: usize,
+    ) -> Option<String> {
         if self.pending.is_empty() {
             // The rate is kept, not cleared. Claude's deltas arrive in bursts
             // separated by short gaps, and restarting from the floor at every gap
@@ -1502,7 +1508,10 @@ impl TextPace {
         }
         let step = elapsed.min(STREAM_MAX_STEP).as_secs_f32();
         let visible = &self.pending[..visible_end.min(self.pending.len())];
-        let backlog = visible_cluster_count(visible) as f32;
+        // Demand is the whole backlog less a hidden link address. Counting only
+        // the current line held the pace near one line per 0.45s, so a long
+        // answer fell behind and landed in one catch-up at completion.
+        let backlog = visible_cluster_count(&self.pending).saturating_sub(hidden_clusters) as f32;
         let demand = (backlog / STREAM_TARGET_LATENCY).clamp(STREAM_MIN_RATE, STREAM_MAX_RATE);
         let closing = if demand > self.rate {
             STREAM_RATE_ATTACK
@@ -14796,7 +14805,7 @@ impl AppState {
                     break;
                 }
                 paced = true;
-                // 다음 줄은 코드·표 문맥을 다시 확인한 뒤 속도를 계산한다.
+                // 다음 줄은 코드·표 문맥을 다시 확인한 뒤 내보낸다.
                 let line_end = if assistant {
                     active
                         .pace
@@ -14806,11 +14815,14 @@ impl AppState {
                 } else {
                     active.pace.pending.len()
                 };
+                let hidden_clusters = hidden
+                    .as_ref()
+                    .map_or(0, |range| visible_cluster_count(&active.pace.pending[range.clone()]));
                 let visible_end = hidden.map_or(line_end, |range| range.start.min(line_end));
                 let chunk = if catch_up {
                     active.pace.take_catch_up(&mut clusters_left, &mut lines_left, visible_end)
                 } else {
-                    let chunk = active.pace.take(elapsed, visible_end, clusters_left);
+                    let chunk = active.pace.take(elapsed, visible_end, clusters_left, hidden_clusters);
                     if let Some(chunk) = &chunk {
                         clusters_left -= visible_cluster_count(chunk);
                         lines_left = lines_left.saturating_sub(chunk.bytes().filter(|byte| *byte == b'\n').count());
@@ -25243,7 +25255,7 @@ mod tests {
         let revealed = |elapsed| {
             let mut pace = TextPace::default();
             pace.push(&text);
-            pace.take(elapsed, usize::MAX, usize::MAX)
+            pace.take(elapsed, usize::MAX, usize::MAX, 0)
                 .map(|chunk| chunk.chars().count())
         };
 
@@ -25259,16 +25271,16 @@ mod tests {
         let mut pace = TextPace::default();
         pace.push(&"흐름을 유지하는지 확인하는 긴 문장입니다.".repeat(6));
         for _ in 0..10 {
-            pace.take(TEST_FRAME, usize::MAX, usize::MAX);
+            pace.take(TEST_FRAME, usize::MAX, usize::MAX, 0);
         }
         let reached = pace.rate;
         assert!(reached > STREAM_MIN_RATE);
 
         // Drained dry, then the next burst lands.
         while !pace.pending.is_empty() {
-            pace.take(TEST_FRAME, usize::MAX, usize::MAX);
+            pace.take(TEST_FRAME, usize::MAX, usize::MAX, 0);
         }
-        assert!(pace.take(TEST_FRAME, usize::MAX, usize::MAX).is_none());
+        assert!(pace.take(TEST_FRAME, usize::MAX, usize::MAX, 0).is_none());
         assert!(pace.rate >= reached * 0.9, "{} vs {reached}", pace.rate);
     }
 
@@ -25487,6 +25499,24 @@ mod tests {
             }
         }
         panic!("bounded catch-up never finished");
+    }
+
+    #[test]
+    fn many_short_lines_keep_pace_with_arrival() {
+        let mut state = test_state();
+        let line = "- 짧은 줄입니다. 속도는 전체 대기량을 따라야 합니다.\n\n";
+        let mut backlog_max = 0;
+        for step in 0..1000 {
+            if step % 10 == 0 {
+                state.handle_notification("item/agentMessage/delta", &json!({"itemId":"one", "delta":line}));
+            }
+            backlog_max = backlog_max.max(state.drain_stream_text(Duration::from_millis(4)).backlog);
+        }
+        for _ in 0..250 {
+            state.drain_stream_text(Duration::from_millis(4));
+        }
+        assert!(backlog_max < 800, "reveal fell behind arrival: {backlog_max}");
+        assert!(state.active.get("one").is_some_and(|active| active.pace.pending.is_empty()));
     }
 
     #[test]
