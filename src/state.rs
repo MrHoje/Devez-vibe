@@ -9650,12 +9650,15 @@ impl AppState {
     /// The handoff stays armed until its prompt actually starts a turn (see
     /// `submit_text`), since a drained prompt can bounce back into the queue.
     pub fn take_queued_prompt(&mut self) -> Option<QueuedPrompt> {
-        if self.resume_queue_after_interrupt
-            || self.held_notifications.iter().any(|(method, _)| method == "turn/completed")
-        {
-            // Completion can be held behind paced text. Apply it before starting
-            // another turn, but never turn an unacknowledged stop into a steer.
+        if self.resume_queue_after_interrupt {
+            // An acknowledged stop applies its held completion before the next
+            // turn, but never turns an unacknowledged stop into a steer.
             self.flush_before_question();
+        } else if self.held_notifications.iter().any(|(method, _)| method == "turn/completed") {
+            // Completion is waiting behind paced text. Flushing here dumped the
+            // rest of every answer the moment its turn ended; the reveal loop
+            // drains the queue once the completion is released.
+            return None;
         }
         if self.host_turn_busy()
             || (self.turn_interrupted && !self.resume_queue_after_interrupt)

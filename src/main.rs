@@ -2014,7 +2014,23 @@ async fn event_loop(
                 if revealed {
                     animation_tick = false;
                 }
-                Action::Tick(revealed)
+                // A completion held behind paced text is applied by the reveal, so
+                // the queue `turn/completed` would have drained is drained here.
+                let queued = if main_reveal.released {
+                    action_focus = SplitFocus::Main;
+                    state
+                        .take_queued_prompt()
+                        .map(|queued| state.start_queued_prompt(queued))
+                } else if btw_reveal.as_ref().is_some_and(|reveal| reveal.released) {
+                    action_focus = SplitFocus::Btw;
+                    btw_state.as_mut().and_then(|btw| {
+                        btw.take_queued_prompt()
+                            .map(|queued| btw.start_queued_prompt(queued))
+                    })
+                } else {
+                    None
+                };
+                queued.unwrap_or(Action::Tick(revealed))
             }
             _ = activity_tick.tick() => {
                 // Keep the host in step even when only the spinner is painted.

@@ -105,8 +105,19 @@ fn queued_prompt_waits_for_normal_completion_behind_paced_text() {
     state.handle_notification("item/agentMessage/delta", &json!({"itemId": "answer", "delta": "남겨야 할 응답"}));
     assert!(state.take_queued_prompt().is_none());
     state.handle_notification("turn/completed", &json!({"turn": {"id": "live-turn", "status": "completed"}}));
-    let next = state.take_queued_prompt().expect("완료 알림이 보류돼 대기열이 멈춤");
-    assert!(matches!(state.start_queued_prompt(next), Action::Submit(_)), "끝난 턴으로 추가 입력을 보냄");
+    // 남은 글자를 한꺼번에 내보내지 않고, 다 보인 뒤 완료가 풀리면 보낸다.
+    assert!(state.take_queued_prompt().is_none(), "남은 응답을 몰아서 내보내고 다음 요청을 보냄");
+    for _ in 0..1000 {
+        let reveal = state.drain_stream_text(std::time::Duration::from_millis(4));
+        assert!(reveal.clusters <= 1);
+        if reveal.released {
+            let next = state.take_queued_prompt().expect("완료 알림이 보류돼 대기열이 멈춤");
+            assert!(matches!(state.start_queued_prompt(next), Action::Submit(_)), "끝난 턴으로 추가 입력을 보냄");
+            return;
+        }
+        assert!(state.take_queued_prompt().is_none());
+    }
+    panic!("보류된 완료가 풀리지 않음");
 }
 
 #[test]
