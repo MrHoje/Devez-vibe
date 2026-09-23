@@ -1403,28 +1403,13 @@ struct ActiveItem {
 /// text over twice the time, and a frame the runtime skipped would reveal nothing
 /// at all — that is the same jitter this is meant to hide, just moved one layer
 /// down.
-/// How long the text already in hand should take to appear. Held deliberately
-/// above the gap between bursts: the reveal runs a fraction of a second behind
-/// what has arrived, and that cushion is what lets the pace stay even across a
-/// burst instead of emptying and waiting.
-const STREAM_TARGET_LATENCY: f32 = 0.45;
-/// Clusters per second. The floor keeps a thin trickle moving; the ceiling keeps
-/// a burst from arriving as one visible jump. Claude CLI 2.1.276+ often holds the
-/// final answer after a tool call and delivers it at once; at 1600 that landed
-/// as a one-second pour, while 300 still sits above ordinary streaming speed.
-const STREAM_MIN_RATE: f32 = 25.0;
-const STREAM_MAX_RATE: f32 = 300.0;
-const STREAM_CATCH_UP_RATE: f32 = 1600.0;
-/// How quickly the rate closes on the backlog's demand, per second. Both are
-/// gentle on purpose. Assistant text arrives near fifty characters a second, so
-/// the rate that matters is the average one, and a rate that chased each burst
-/// would spend the answer alternating between a sprint and a wait.
-const STREAM_RATE_ATTACK: f32 = 4.0;
-const STREAM_RATE_DECAY: f32 = 1.5;
+/// Clusters per second, fixed. A rate that chased the backlog turned a burst
+/// after a tool call, or a long answer at completion, into a visible pour. A
+/// steady pace may fall behind arrival, but it never jumps.
+const STREAM_RATE: f32 = 150.0;
 /// A stall — a slow repaint, a descheduled loop — must not turn into one large
 /// reveal once the loop comes back.
 const STREAM_MAX_STEP: Duration = Duration::from_millis(40);
-const STREAM_CATCH_UP_LINES: usize = 8;
 
 /// How many characters at the end of the streamed text are still rising toward
 /// full strength, and how fast that tail retreats. A longer tail spreads the rise
@@ -1469,62 +1454,23 @@ impl StreamReveal {
 #[derive(Default)]
 struct TextPace {
     pending: String,
-    rate: f32,
     carry: f32,
 }
 
 impl TextPace {
-    fn take_catch_up(&mut self, clusters: &mut usize, lines: &mut usize, visible_end: usize) -> Option<String> {
-        if self.pending.is_empty() || *clusters == 0 || *lines == 0 {
-            return None;
-        }
-        let end = visible_cluster_end(&self.pending[..visible_end.min(self.pending.len())], *clusters);
-        if end == 0 {
-            return None;
-        }
-        let end = self.pending[..end].match_indices('\n').nth(*lines - 1)
-            .map_or(end, |(index, _)| index + 1);
-        let chunk = self.pending.drain(..end).collect::<String>();
-        *clusters -= visible_cluster_count(&chunk);
-        *lines -= chunk.bytes().filter(|byte| *byte == b'\n').count();
-        self.carry = 0.0;
-        Some(chunk)
-    }
-
     fn push(&mut self, delta: &str) {
         self.pending.push_str(delta);
     }
 
-    fn take(
-        &mut self,
-        elapsed: Duration,
-        visible_end: usize,
-        max_clusters: usize,
-        hidden_clusters: usize,
-    ) -> Option<String> {
+    fn take(&mut self, elapsed: Duration, visible_end: usize, max_clusters: usize) -> Option<String> {
         if self.pending.is_empty() {
-            // The rate is kept, not cleared. Claude's deltas arrive in bursts
-            // separated by short gaps, and restarting from the floor at every gap
-            // is what made a steady answer read as stop-and-go.
             self.carry = 0.0;
             return None;
         }
-        let step = elapsed.min(STREAM_MAX_STEP).as_secs_f32();
         let visible = &self.pending[..visible_end.min(self.pending.len())];
-        // Demand is the whole backlog less a hidden link address. Counting only
-        // the current line held the pace near one line per 0.45s, so a long
-        // answer fell behind and landed in one catch-up at completion.
-        let backlog = visible_cluster_count(&self.pending).saturating_sub(hidden_clusters) as f32;
-        let demand = (backlog / STREAM_TARGET_LATENCY).clamp(STREAM_MIN_RATE, STREAM_MAX_RATE);
-        let closing = if demand > self.rate {
-            STREAM_RATE_ATTACK
-        } else {
-            STREAM_RATE_DECAY
-        };
-        self.rate += (demand - self.rate) * (closing * step).min(1.0);
         // Fractional budgets only stay even if the leftover carries to the next
         // reveal; truncating every time would quantize the pace to integers.
-        let budget = self.rate * step + self.carry;
+        let budget = STREAM_RATE * elapsed.min(STREAM_MAX_STEP).as_secs_f32() + self.carry;
         let size = budget.floor();
         self.carry = budget - size;
         if size < 1.0 {
@@ -1535,7 +1481,6 @@ impl TextPace {
     }
 
     fn flush(&mut self) -> Option<String> {
-        self.rate = 0.0;
         self.carry = 0.0;
         (!self.pending.is_empty()).then(|| std::mem::take(&mut self.pending))
     }
@@ -3762,7 +3707,6 @@ pub struct AppState {
     stream_fade_tail: f32,
     /// Notices waiting for the text still being revealed, in arrival order.
     held_notifications: Vec<(String, Value)>,
-    held_since: Option<Instant>,
     /// Quiet reveal ticks left before a fully visible live answer may complete.
     held_final_frame_ticks: u8,
     /// When `/compact` was sent. Compaction produces no assistant text, so the
@@ -4052,7 +3996,6 @@ impl AppState {
             turn_response_visible: false,
             stream_fade_tail: 0.0,
             held_notifications: Vec::new(),
-            held_since: None,
             held_final_frame_ticks: 0,
             last_completed_duration: None,
             last_completed_at: None,
@@ -9096,7 +9039,6 @@ impl AppState {
 
     fn hold_notification(&mut self, method: &str, params: &Value) {
         if self.held_notifications.is_empty() {
-            self.held_since = Some(Instant::now());
             self.held_final_frame_ticks = 0;
         }
         self.held_notifications
@@ -9126,7 +9068,6 @@ impl AppState {
             return (false, false);
         }
         self.held_final_frame_ticks = 0;
-        self.held_since = None;
         for (method, params) in std::mem::take(&mut self.held_notifications) {
             // Later queued deltas can create a new pending stream. Its own
             // completion must wait too instead of flushing that stream whole.
@@ -14769,29 +14710,14 @@ impl AppState {
     /// still holding some.
     pub fn drain_stream_text(&mut self, elapsed: Duration) -> StreamReveal {
         let mut reveal = StreamReveal::default();
-        let finishing = self.held_since.is_some_and(|since| since.elapsed() >= Duration::from_millis(120));
-        // Catch-up shares the same elapsed-time ceiling as ordinary pacing.
-        // A fixed 512-character allowance on a 4ms tick could reveal an entire
-        // short answer before the terminal painted another frame. Only a backlog
-        // past 4KiB runs faster: at the ordinary ceiling a long dump would take
-        // most of a minute to appear.
-        let rate = if self.active.values().any(|active| active.pace.pending.len() > 4096) {
-            STREAM_CATCH_UP_RATE
-        } else {
-            STREAM_MAX_RATE
-        };
-        let mut clusters_left = (rate * elapsed.min(STREAM_MAX_STEP).as_secs_f32())
-            .floor()
+        // One shared budget, so several live streams together keep the same pace.
+        let mut clusters_left = (STREAM_RATE * elapsed.min(STREAM_MAX_STEP).as_secs_f32())
+            .ceil()
             .max(1.0) as usize;
-        let mut lines_left = STREAM_CATCH_UP_LINES;
         for id in &self.active_order {
             let Some(active) = self.active.get_mut(id) else { continue };
             let assistant = matches!(active.block.kind, BlockKind::Assistant);
-            let mut paced = false;
-            loop {
-                if clusters_left == 0 || lines_left == 0 {
-                    break;
-                }
+            while clusters_left > 0 {
                 let hidden = if assistant {
                     crate::renderer::hidden_streaming_link_range(
                         &active.block.body,
@@ -14809,12 +14735,6 @@ impl AppState {
                     reveal.links_changed = true;
                     continue;
                 }
-                let catch_up = active.pace.pending.len() > 4096
-                    || (finishing && active.pace.pending.len() > 256);
-                if paced && !catch_up {
-                    break;
-                }
-                paced = true;
                 // 다음 줄은 코드·표 문맥을 다시 확인한 뒤 내보낸다.
                 let line_end = if assistant {
                     active
@@ -14825,26 +14745,15 @@ impl AppState {
                 } else {
                     active.pace.pending.len()
                 };
-                let hidden_clusters = hidden
-                    .as_ref()
-                    .map_or(0, |range| visible_cluster_count(&active.pace.pending[range.clone()]));
                 let visible_end = hidden.map_or(line_end, |range| range.start.min(line_end));
-                let chunk = if catch_up {
-                    active.pace.take_catch_up(&mut clusters_left, &mut lines_left, visible_end)
-                } else {
-                    let chunk = active.pace.take(elapsed, visible_end, clusters_left, hidden_clusters);
-                    if let Some(chunk) = &chunk {
-                        clusters_left -= visible_cluster_count(chunk);
-                        lines_left = lines_left.saturating_sub(chunk.bytes().filter(|byte| *byte == b'\n').count());
-                    }
-                    chunk
-                };
-                let Some(chunk) = chunk else {
-                    break;
-                };
-                reveal.clusters += visible_cluster_count(&chunk);
-                append_capped(&mut active.block.body, &chunk);
-                active.revision = active.revision.wrapping_add(1);
+                if let Some(chunk) = active.pace.take(elapsed, visible_end, clusters_left) {
+                    let clusters = visible_cluster_count(&chunk);
+                    clusters_left = clusters_left.saturating_sub(clusters);
+                    reveal.clusters += clusters;
+                    append_capped(&mut active.block.body, &chunk);
+                    active.revision = active.revision.wrapping_add(1);
+                }
+                break;
             }
             reveal.backlog += visible_cluster_count(&active.pace.pending);
         }
@@ -25223,7 +25132,6 @@ mod tests {
                 "itemId": "item-1",
                 "delta": format!("첫 줄\n[문서](https://example.com/{}) 다음", "a".repeat(size)),
             }));
-            state.active.get_mut("item-1").unwrap().pace.rate = STREAM_MAX_RATE;
             let mut clusters = 0;
             for _ in 0..100 {
                 let reveal = state.drain_stream_text(Duration::from_millis(40));
@@ -25263,35 +25171,15 @@ mod tests {
     fn a_longer_gap_reveals_proportionally_more_text() {
         let text = "이 문장은 한 번에 다 드러나지 않을 만큼 충분히 길게 이어집니다.".repeat(40);
         let revealed = |elapsed| {
-            let mut pace = TextPace { rate: STREAM_MAX_RATE, ..TextPace::default() };
+            let mut pace = TextPace::default();
             pace.push(&text);
-            pace.take(elapsed, usize::MAX, usize::MAX, 0)
+            pace.take(elapsed, usize::MAX, usize::MAX)
                 .map(|chunk| chunk.chars().count())
         };
 
         let one = revealed(TEST_FRAME * 5).expect("a short gap reveals text");
         let two = revealed(TEST_FRAME * 10).expect("a longer gap reveals text");
         assert!(two > one, "{two} should exceed {one}");
-    }
-
-    /// Deltas arrive in bursts with short gaps between them. Clearing the pace at
-    /// every gap would restart each burst from the slowest rate.
-    #[test]
-    fn a_gap_between_bursts_keeps_the_pace_it_reached() {
-        let mut pace = TextPace::default();
-        pace.push(&"흐름을 유지하는지 확인하는 긴 문장입니다.".repeat(6));
-        for _ in 0..10 {
-            pace.take(TEST_FRAME, usize::MAX, usize::MAX, 0);
-        }
-        let reached = pace.rate;
-        assert!(reached > STREAM_MIN_RATE);
-
-        // Drained dry, then the next burst lands.
-        while !pace.pending.is_empty() {
-            pace.take(TEST_FRAME, usize::MAX, usize::MAX, 0);
-        }
-        assert!(pace.take(TEST_FRAME, usize::MAX, usize::MAX, 0).is_none());
-        assert!(pace.rate >= reached * 0.9, "{} vs {reached}", pace.rate);
     }
 
     /// The settling tail follows the text: it grows while characters arrive and
@@ -25383,7 +25271,7 @@ mod tests {
         assert_ne!(state.active["item-1"].block.body, text);
         assert!(state.drain_committed().is_empty());
 
-        drain_frames(&mut state, 4000);
+        drain_frames(&mut state, 12000);
         assert!(state.held_notifications.is_empty());
         assert!(state.committed.iter().any(|block| block.body == text));
     }
@@ -25402,7 +25290,7 @@ mod tests {
                 assert!(active.block.body.is_empty());
                 assert_eq!(active.pace.pending, second);
                 assert!(state.stream_events_pending());
-                drain_frames(&mut state, 8000);
+                drain_frames(&mut state, 24000);
                 assert!(!state.stream_events_pending());
                 assert!(state.committed.iter().any(|block| block.body == second));
                 return;
@@ -25436,15 +25324,9 @@ mod tests {
             &json!({"item":{"id":"paced","type":"agentMessage","text":text}}),
         );
         for _ in 0..10000 {
-            let rate = if state.active.values().any(|active| active.pace.pending.len() > 4096) {
-                STREAM_CATCH_UP_RATE
-            } else {
-                STREAM_MAX_RATE
-            };
-            let budget = (rate * elapsed.min(STREAM_MAX_STEP).as_secs_f32())
-                .floor()
+            let budget = (STREAM_RATE * elapsed.min(STREAM_MAX_STEP).as_secs_f32())
+                .ceil()
                 .max(1.0) as usize;
-            state.held_since = Some(Instant::now() - Duration::from_secs(2));
             let reveal = state.drain_stream_text(elapsed);
             assert!(
                 reveal.clusters <= budget,
@@ -25493,19 +25375,18 @@ mod tests {
     }
 
     #[test]
-    fn catch_up_limits_frames_and_preserves_long_multiline_text() {
+    fn long_completed_text_keeps_the_fixed_pace_and_is_preserved() {
         let mut state = test_state();
         let text = "한글👨‍👩‍👧‍👦\n".repeat(800);
         state.handle_notification("item/agentMessage/delta", &json!({"itemId":"one", "delta":text}));
         state.handle_notification("turn/completed", &json!({}));
         let mut previous_lines = 0;
         for _ in 0..2000 {
-            state.held_since = Some(Instant::now() - Duration::from_secs(2));
             let reveal = state.drain_stream_text(Duration::from_secs(2));
-            assert!(reveal.clusters <= 64);
+            assert!(reveal.clusters <= 6);
             if let Some(active) = state.active.get("one") {
                 let lines = active.block.body.bytes().filter(|byte| *byte == b'\n').count();
-                assert!(lines - previous_lines <= STREAM_CATCH_UP_LINES);
+                assert!(lines - previous_lines <= 1);
                 previous_lines = lines;
             }
             if !state.stream_events_pending() {
@@ -25513,7 +25394,7 @@ mod tests {
                 return;
             }
         }
-        panic!("bounded catch-up never finished");
+        panic!("paced completion never finished");
     }
 
     #[test]
@@ -25521,9 +25402,9 @@ mod tests {
         let mut state = test_state();
         let line = "- 짧은 줄입니다. 속도는 전체 대기량을 따라야 합니다.\n\n";
         let mut backlog_max = 0;
-        // About 190 characters a second: ordinary streaming, under the rate ceiling.
+        // About 130 characters a second: ordinary streaming, under the fixed rate.
         for step in 0..2000 {
-            if step % 40 == 0 {
+            if step % 60 == 0 {
                 state.handle_notification("item/agentMessage/delta", &json!({"itemId":"one", "delta":line}));
             }
             backlog_max = backlog_max.max(state.drain_stream_text(Duration::from_millis(4)).backlog);
