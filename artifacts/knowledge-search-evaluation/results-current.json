@@ -1,30 +1,28 @@
 ﻿{
-    "documentCount":  16,
-    "indexSha256":  "20B0714C3A72E6723CE66517C28EE4CE64504C797332C5B3670BFD3287CB9D4C",
+    "documentCount":  17,
+    "indexSha256":  "1D85357C44D2C578B8F7988FFAEB720F6B15F9E4F27AD48A65FDABAFEACC5358",
     "cases":  [
                   {
                       "question":  "새 버전을 배포할 때 무엇을 바꿔야 하나?",
                       "pattern":  "배포|버전",
                       "expected":  "배포-버전-갱신.md",
                       "indexCandidates":  [
-                                              "Claude-Agent-SDK-호환성-업데이트.md",
                                               "Codex-CLI-호환성-업데이트.md",
-                                              "배포-버전-갱신.md",
-                                              "2026-09-05-supervibe-response-all-prompt-toggle.md"
+                                              "배포-버전-갱신.md"
                                           ],
                       "indexFound":  true,
                       "bodyCandidates":  [
-                                             "배포-버전-갱신.md",
-                                             "Claude-Agent-SDK-호환성-업데이트.md",
                                              "Codex-CLI-호환성-업데이트.md",
-                                             "2026-09-05-supervibe-response-all-prompt-toggle.md",
-                                             "자동-지식-기록과-검색.md",
-                                             "agent-system-implementation-plan.md",
-                                             "지침-축약-검증.md",
                                              "custom-agent-roles.md",
+                                             "자동-지식-기록과-검색.md",
+                                             "Claude-Agent-SDK-호환성-업데이트.md",
+                                             "배포-버전-갱신.md",
+                                             "토큰사용량-단가-갱신.md",
+                                             "자원-점유-누수-진단.md",
                                              "Windows-호스트-통합-주의.md",
                                              "한글-글리프-깨짐-진단.md",
-                                             "토큰사용량-단가-갱신.md"
+                                             "스트리밍-출력-지연.md",
+                                             "지침-축약-검증.md"
                                          ],
                       "bodyFound":  true,
                       "evidence":  [
@@ -36,17 +34,17 @@
                       "pattern":  "토큰|단가",
                       "expected":  "토큰사용량-단가-갱신.md",
                       "indexCandidates":  [
-                                              "토큰사용량-단가-갱신.md",
-                                              "지침-축약-검증.md"
+                                              "토큰사용량-단가-갱신.md"
                                           ],
                       "indexFound":  true,
                       "bodyCandidates":  [
+                                             "토큰사용량-단가-갱신.md",
                                              "배포-버전-갱신.md",
                                              "Codex-CLI-호환성-업데이트.md",
                                              "Claude-Agent-SDK-호환성-업데이트.md",
-                                             "builder-ponytail.md",
+                                             "응답-미표시-진단.md",
                                              "지침-축약-검증.md",
-                                             "토큰사용량-단가-갱신.md",
+                                             "자원-점유-누수-진단.md",
                                              "컨텍스트-표시-복원.md"
                                          ],
                       "bodyFound":  true,
@@ -65,13 +63,12 @@
                       "indexFound":  true,
                       "bodyCandidates":  [
                                              "배포-버전-갱신.md",
+                                             "토큰사용량-단가-갱신.md",
                                              "Codex-CLI-호환성-업데이트.md",
                                              "Claude-Agent-SDK-호환성-업데이트.md",
-                                             "builder-ponytail.md",
-                                             "agent-system-implementation-plan.md",
+                                             "자원-점유-누수-진단.md",
                                              "지침-축약-검증.md",
-                                             "컨텍스트-표시-복원.md",
-                                             "토큰사용량-단가-갱신.md"
+                                             "컨텍스트-표시-복원.md"
                                          ],
                       "bodyFound":  true,
                       "evidence":  [
@@ -81,19 +78,18 @@
                   {
                       "question":  "링크 뒤 문장이 늦게 나타나는 이유는?",
                       "pattern":  "링크|늦게",
-                      "expected":  "스트리밍-링크-지연.md",
+                      "expected":  "스트리밍-출력-지연.md",
                       "indexCandidates":  [
-                                              "스트리밍-링크-지연.md"
+                                              "스트리밍-출력-지연.md"
                                           ],
                       "indexFound":  true,
                       "bodyCandidates":  [
                                              "배포-버전-갱신.md",
-                                             "스트리밍-링크-지연.md",
-                                             "지침-축약-검증.md"
+                                             "스트리밍-출력-지연.md"
                                          ],
                       "bodyFound":  true,
                       "evidence":  [
-                                       "1:# 스트리밍 링크의 표시 지연"
+                                       "9:| 긴 답변이 점점 뒤처지다가 완료 순간 한꺼번에 표시 | 속도 수요를 대기 전체가 아니라 현재 줄 길이로 계산해 짧은 줄이 많은 답변이 초당 약 80자에 묶였다(1.8.16~1.9.25). 뒤처진 양은 완료 뒤 따라잡기나 과거의 1.5초 전량 출력으로 한 번에 나왔다 | 수요는 대기 전체에서 숨긴 링크 주소만 빼서 계산하고, 한 번에 내보내는 범위만 현재 줄 끝으로 제한한다(1.9.26). 회귀 검사는 `many_short_lines_keep_pace_with_arrival` |"
                                    ]
                   },
                   {
@@ -102,15 +98,19 @@
                       "expected":  "한글-글리프-깨짐-진단.md",
                       "indexCandidates":  [
                                               "한글-글리프-깨짐-진단.md",
-                                              "Windows-호스트-통합-주의.md"
+                                              "Windows-호스트-통합-주의.md",
+                                              "화면-문구-언어-기준.md"
                                           ],
                       "indexFound":  true,
                       "bodyCandidates":  [
                                              "배포-버전-갱신.md",
                                              "Codex-CLI-호환성-업데이트.md",
-                                             "지침-축약-검증.md",
+                                             "화면-문구-언어-기준.md",
                                              "Windows-호스트-통합-주의.md",
-                                             "한글-글리프-깨짐-진단.md"
+                                             "응답-미표시-진단.md",
+                                             "한글-글리프-깨짐-진단.md",
+                                             "지침-축약-검증.md",
+                                             "스트리밍-출력-지연.md"
                                          ],
                       "bodyFound":  true,
                       "evidence":  [
@@ -124,21 +124,20 @@
                       "indexCandidates":  [
                                               "에이전트-역할-확장-주의.md",
                                               "custom-agent-roles.md",
-                                              "지침-축약-검증.md",
-                                              "agent-system-implementation-plan.md"
+                                              "builder-ponytail.md",
+                                              "지침-축약-검증.md"
                                           ],
                       "indexFound":  true,
                       "bodyCandidates":  [
                                              "배포-버전-갱신.md",
                                              "Codex-CLI-호환성-업데이트.md",
-                                             "자동-지식-기록과-검색.md",
                                              "Claude-Agent-SDK-호환성-업데이트.md",
-                                             "builder-ponytail.md",
+                                             "자동-지식-기록과-검색.md",
                                              "custom-agent-roles.md",
                                              "에이전트-역할-확장-주의.md",
-                                             "한글-글리프-깨짐-진단.md",
                                              "지침-축약-검증.md",
-                                             "agent-system-implementation-plan.md"
+                                             "한글-글리프-깨짐-진단.md",
+                                             "builder-ponytail.md"
                                          ],
                       "bodyFound":  true,
                       "evidence":  [
@@ -155,11 +154,10 @@
                       "indexFound":  true,
                       "bodyCandidates":  [
                                              "배포-버전-갱신.md",
-                                             "Codex-CLI-호환성-업데이트.md",
+                                             "토큰사용량-단가-갱신.md",
                                              "Claude-Agent-SDK-호환성-업데이트.md",
-                                             "agent-system-implementation-plan.md",
-                                             "스트리밍-링크-지연.md",
-                                             "토큰사용량-단가-갱신.md"
+                                             "Codex-CLI-호환성-업데이트.md",
+                                             "스트리밍-출력-지연.md"
                                          ],
                       "bodyFound":  true,
                       "evidence":  [
@@ -172,19 +170,24 @@
                       "expected":  "Windows-호스트-통합-주의.md",
                       "indexCandidates":  [
                                               "Codex-CLI-호환성-업데이트.md",
-                                              "Windows-호스트-통합-주의.md"
+                                              "컨텍스트-표시-복원.md",
+                                              "Windows-호스트-통합-주의.md",
+                                              "응답-미표시-진단.md",
+                                              "도구-호출-실패-진단.md"
                                           ],
                       "indexFound":  true,
                       "bodyCandidates":  [
                                              "배포-버전-갱신.md",
                                              "Codex-CLI-호환성-업데이트.md",
+                                             "도구-호출-실패-진단.md",
                                              "Claude-Agent-SDK-호환성-업데이트.md",
-                                             "2026-09-05-supervibe-response-all-prompt-toggle.md",
+                                             "화면-문구-언어-기준.md",
                                              "자동-지식-기록과-검색.md",
-                                             "agent-system-implementation-plan.md",
-                                             "지침-축약-검증.md",
                                              "Windows-호스트-통합-주의.md",
-                                             "스트리밍-링크-지연.md"
+                                             "자원-점유-누수-진단.md",
+                                             "응답-미표시-진단.md",
+                                             "컨텍스트-표시-복원.md",
+                                             "스트리밍-출력-지연.md"
                                          ],
                       "bodyFound":  true,
                       "evidence":  [
@@ -202,8 +205,6 @@
                       "bodyCandidates":  [
                                              "배포-버전-갱신.md",
                                              "Codex-CLI-호환성-업데이트.md",
-                                             "builder-ponytail.md",
-                                             "지침-축약-검증.md",
                                              "Windows-호스트-통합-주의.md",
                                              "한글-글리프-깨짐-진단.md"
                                          ],
@@ -221,14 +222,14 @@
                                           ],
                       "indexFound":  true,
                       "bodyCandidates":  [
+                                             "배포-버전-갱신.md",
                                              "custom-agent-roles.md",
                                              "Windows-호스트-통합-주의.md",
-                                             "지침-축약-검증.md",
                                              "한글-글리프-깨짐-진단.md"
                                          ],
                       "bodyFound":  true,
                       "evidence":  [
-                                       "7:- 재배선 뒤 상태줄이 빈 채로 남음: 「호스트 재배선 뒤 상태줄만 빈 채 남는 증상」."
+                                       "8:- 재배선 뒤 상태줄이 빈 채로 남음: 「호스트 재배선 뒤 상태줄만 빈 채 남는 증상」."
                                    ]
                   }
               ],

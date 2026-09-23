@@ -11,7 +11,7 @@ $cases = @(
     @{ question='새 버전을 배포할 때 무엇을 바꿔야 하나?'; pattern='배포|버전'; expected='배포-버전-갱신.md' },
     @{ question='토큰 사용량 단가는 어디에서 바꾸나?'; pattern='토큰|단가'; expected='토큰사용량-단가-갱신.md' },
     @{ question='세션을 재개하면 컨텍스트 사용량이 왜 0인가?'; pattern='재개|컨텍스트'; expected='컨텍스트-표시-복원.md' },
-    @{ question='링크 뒤 문장이 늦게 나타나는 이유는?'; pattern='링크|늦게'; expected='스트리밍-링크-지연.md' },
+    @{ question='링크 뒤 문장이 늦게 나타나는 이유는?'; pattern='링크|늦게'; expected='스트리밍-출력-지연.md' },
     @{ question='한글이 다른 글자로 깨져 보이면 어떻게 진단하나?'; pattern='한글|깨져'; expected='한글-글리프-깨짐-진단.md' },
     @{ question='사용자 정의 역할을 추가할 때 주의점은?'; pattern='사용자 정의|역할'; expected='에이전트-역할-확장-주의.md' },
     @{ question='Claude SDK를 올릴 때 호환성을 어떻게 확인하나?'; pattern='Claude.*SDK'; expected='Claude-Agent-SDK-호환성-업데이트.md' },
