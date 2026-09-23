@@ -8,6 +8,7 @@
 - 재배선 뒤 상태줄이 빈 채로 남음: 「호스트 재배선 뒤 상태줄만 빈 채 남는 증상」.
 - 복사한 글자는 정상인데 화면 한글이 깨짐·이모지 폭이 밀림: [글리프 진단](한글-글리프-깨짐-진단.md).
 - 검색식 때문에 파일이 비워짐·배치 안 PowerShell이 오실행됨: 「cmd.exe 검색 명령」과 「배치 파일 안의 PowerShell 본문」.
+- 재개한 세션이 마지막에 쓴 모델이 아니라 방을 만들 때 고른 모델로 열림: 「DevezCode 재개 인자와 기억된 모델」.
 
 아래 배포·미배포 표현은 당시 기록이다. 비동기 질문 변경의 최종 배포는 같은 절의 Vibe 1.8.23·DevezCode 1.27.2 기록을 함께 읽는다. 현재 확인 위치는 [src/devezcode.rs](../src/devezcode.rs), [src/input_hub.rs](../src/input_hub.rs), [호스트 상태 검사](../scripts/test-devezcode-question-state.mjs)다.
 
@@ -69,3 +70,9 @@ Sixel 모서리 관련 `#[ignore]` 시험(`live_native_terminal_metrics`, `live_
 - 창 안의 그림은 화면 캡처(`CopyFromScreen`)로 확인한다.
 - 이 PC의 Windows Terminal에서 확인된 값: DA1이 Sixel(4)을 보고하고 셀 크기는 10×20 픽셀이며, 답변 카드의 위·아래 모서리 한 칸이 실제로 Sixel로 그려진다.
 - 그려진 모서리의 청록은 글리프 쪽보다 1/255 밝다. `corner()`가 팔레트를 퍼센트로 적는 양자화 때문이며 눈으로 구분되지 않는다. 색이 한 단계 다르다는 이유로 버그로 보지 않는다.
+
+## DevezCode 재개 인자와 기억된 모델 — 2026-09-23
+
+- dvz는 세션마다 마지막 Claude 모델·추론 수준을 `session-routes.json`의 `claude_model`·`claude_effort`에 기억하고, 재개 때 `--model`·`--effort`가 없으면 그 값을 쓴다. 명시 인자는 기억값보다 우선한다.
+- DevezCode는 DevezVibe 방을 띄울 때마다 방 콤보 값(`AgentRoomModel`)을 인자로 붙였다. 이 값은 세션 안 `/model` 변경을 따라가지 않아, 재개할 때마다 방을 만들 때 고른 모델로 되돌아갔다.
+- DevezCode `db6d274`부터는 라우트 저장소에 있는 세션을 재개할 때 인자를 빼고, 새 세션과 dvz가 아직 모르는 포크 사본에만 콤보 값을 넘긴다. 방이 꺼진 동안 콤보만 바꾸면 다음 재개에 반영되지 않는다.

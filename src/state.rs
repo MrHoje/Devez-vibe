@@ -1409,9 +1409,12 @@ struct ActiveItem {
 /// burst instead of emptying and waiting.
 const STREAM_TARGET_LATENCY: f32 = 0.45;
 /// Clusters per second. The floor keeps a thin trickle moving; the ceiling keeps
-/// a burst from arriving as one visible jump.
+/// a burst from arriving as one visible jump. Claude CLI 2.1.276+ often holds the
+/// final answer after a tool call and delivers it at once; at 1600 that landed
+/// as a one-second pour, while 300 still sits above ordinary streaming speed.
 const STREAM_MIN_RATE: f32 = 25.0;
-const STREAM_MAX_RATE: f32 = 1600.0;
+const STREAM_MAX_RATE: f32 = 300.0;
+const STREAM_CATCH_UP_RATE: f32 = 1600.0;
 /// How quickly the rate closes on the backlog's demand, per second. Both are
 /// gentle on purpose. Assistant text arrives near fifty characters a second, so
 /// the rate that matters is the average one, and a rate that chased each burst
@@ -14769,8 +14772,15 @@ impl AppState {
         let finishing = self.held_since.is_some_and(|since| since.elapsed() >= Duration::from_millis(120));
         // Catch-up shares the same elapsed-time ceiling as ordinary pacing.
         // A fixed 512-character allowance on a 4ms tick could reveal an entire
-        // short answer before the terminal painted another frame.
-        let mut clusters_left = (STREAM_MAX_RATE * elapsed.min(STREAM_MAX_STEP).as_secs_f32())
+        // short answer before the terminal painted another frame. Only a backlog
+        // past 4KiB runs faster: at the ordinary ceiling a long dump would take
+        // most of a minute to appear.
+        let rate = if self.active.values().any(|active| active.pace.pending.len() > 4096) {
+            STREAM_CATCH_UP_RATE
+        } else {
+            STREAM_MAX_RATE
+        };
+        let mut clusters_left = (rate * elapsed.min(STREAM_MAX_STEP).as_secs_f32())
             .floor()
             .max(1.0) as usize;
         let mut lines_left = STREAM_CATCH_UP_LINES;
@@ -25253,7 +25263,7 @@ mod tests {
     fn a_longer_gap_reveals_proportionally_more_text() {
         let text = "이 문장은 한 번에 다 드러나지 않을 만큼 충분히 길게 이어집니다.".repeat(40);
         let revealed = |elapsed| {
-            let mut pace = TextPace::default();
+            let mut pace = TextPace { rate: STREAM_MAX_RATE, ..TextPace::default() };
             pace.push(&text);
             pace.take(elapsed, usize::MAX, usize::MAX, 0)
                 .map(|chunk| chunk.chars().count())
@@ -25392,7 +25402,7 @@ mod tests {
                 assert!(active.block.body.is_empty());
                 assert_eq!(active.pace.pending, second);
                 assert!(state.stream_events_pending());
-                drain_frames(&mut state, 4000);
+                drain_frames(&mut state, 8000);
                 assert!(!state.stream_events_pending());
                 assert!(state.committed.iter().any(|block| block.body == second));
                 return;
@@ -25425,10 +25435,15 @@ mod tests {
             "item/completed",
             &json!({"item":{"id":"paced","type":"agentMessage","text":text}}),
         );
-        let budget = (STREAM_MAX_RATE * elapsed.min(STREAM_MAX_STEP).as_secs_f32())
-            .floor()
-            .max(1.0) as usize;
         for _ in 0..10000 {
+            let rate = if state.active.values().any(|active| active.pace.pending.len() > 4096) {
+                STREAM_CATCH_UP_RATE
+            } else {
+                STREAM_MAX_RATE
+            };
+            let budget = (rate * elapsed.min(STREAM_MAX_STEP).as_secs_f32())
+                .floor()
+                .max(1.0) as usize;
             state.held_since = Some(Instant::now() - Duration::from_secs(2));
             let reveal = state.drain_stream_text(elapsed);
             assert!(
@@ -25506,8 +25521,9 @@ mod tests {
         let mut state = test_state();
         let line = "- 짧은 줄입니다. 속도는 전체 대기량을 따라야 합니다.\n\n";
         let mut backlog_max = 0;
-        for step in 0..1000 {
-            if step % 10 == 0 {
+        // About 190 characters a second: ordinary streaming, under the rate ceiling.
+        for step in 0..2000 {
+            if step % 40 == 0 {
                 state.handle_notification("item/agentMessage/delta", &json!({"itemId":"one", "delta":line}));
             }
             backlog_max = backlog_max.max(state.drain_stream_text(Duration::from_millis(4)).backlog);
@@ -25515,7 +25531,7 @@ mod tests {
         for _ in 0..250 {
             state.drain_stream_text(Duration::from_millis(4));
         }
-        assert!(backlog_max < 800, "reveal fell behind arrival: {backlog_max}");
+        assert!(backlog_max < 300, "reveal fell behind arrival: {backlog_max}");
         assert!(state.active.get("one").is_some_and(|active| active.pace.pending.is_empty()));
     }
 
