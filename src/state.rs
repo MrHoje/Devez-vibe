@@ -17402,6 +17402,90 @@ fn vibe_settings_path() -> Option<PathBuf> {
         })
 }
 
+pub(crate) fn migrate_legacy_vibe_settings() -> std::io::Result<()> {
+    let (Some(codex_home), Some(settings_path)) = (codex_home(), vibe_settings_path()) else {
+        return Ok(());
+    };
+    migrate_legacy_vibe_settings_at(&codex_home.join("config.toml"), &settings_path)
+}
+
+fn migrate_legacy_vibe_settings_at(config_path: &Path, settings_path: &Path) -> std::io::Result<()> {
+    let config = match fs::read_to_string(config_path) {
+        Ok(config) => config,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut settings = match fs::read_to_string(settings_path) {
+        Ok(settings) => settings,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    let original_settings = settings.clone();
+    let mut cleaned = String::with_capacity(config.len());
+    let mut in_root = true;
+    let mut changed = false;
+    for line in config.split_inclusive('\n') {
+        if line.trim_start().starts_with('[') {
+            in_root = false;
+        }
+        let key = line.split_once('=').map(|(key, _)| key.trim());
+        if in_root && key.is_some_and(is_legacy_vibe_setting_key) {
+            let key = key.unwrap();
+            if config_value(&settings, key).is_none()
+                && let Some(value) = config_value(line, key)
+            {
+                settings = upsert_vibe_config_value(&settings, key, &value);
+            }
+            changed = true;
+        } else {
+            cleaned.push_str(line);
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+    if settings != original_settings {
+        if let Some(parent) = settings_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(settings_path, settings)?;
+    }
+    let backup = config_path.with_extension(format!(
+        "toml.devez-vibe-{}-{}.bak",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::copy(config_path, backup)?;
+    fs::write(config_path, cleaned)
+}
+
+fn is_legacy_vibe_setting_key(key: &str) -> bool {
+    matches!(
+        key,
+        "vibe_mode"
+            | "conversation_view"
+            | "response_display_mode"
+            | "shell_display_mode"
+            | "diff_display_mode"
+            | "side_panel_width"
+            | "status_line_enabled"
+            | "status_line_branch"
+            | "status_line_reset"
+            | "status_line_model"
+            | "status_line_effort"
+            | "status_line_context"
+            | "status_line_five_hour"
+            | "status_line_weekly"
+            | "codex_provider_enabled"
+            | "claude_provider_enabled"
+            | "claude_permission_mode"
+            | "auto_knowledge"
+    )
+}
+
 pub(crate) fn write_vibe_config_value(key: &str, value: &str) -> std::io::Result<()> {
     let path = vibe_settings_path().ok_or_else(|| {
         std::io::Error::new(
@@ -17476,6 +17560,36 @@ mod tests {
     include!("question_audit_tests.rs");
     use super::*;
     use crate::terminal_width::with_devezcode_xterm_widths;
+
+    #[test]
+    fn legacy_vibe_settings_move_without_overwriting_current_choices() {
+        let root = env::temp_dir().join(format!(
+            "devez-vibe-config-migration-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.toml");
+        let settings_path = root.join("settings.toml");
+        let original = "model = \"gpt-6-astra\"\nconversation_view = \"chat\"\nvibe_mode = \"super_vibe\"\nstatus_line_enabled = \"true\"\n[tui]\nstatus_line = [\"model-with-reasoning\"]\n";
+        fs::write(&config_path, original).unwrap();
+        fs::write(&settings_path, "vibe_mode = \"normal\"\n").unwrap();
+
+        migrate_legacy_vibe_settings_at(&config_path, &settings_path).unwrap();
+        let cleaned = fs::read_to_string(&config_path).unwrap();
+        let settings = fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(cleaned, "model = \"gpt-6-astra\"\n[tui]\nstatus_line = [\"model-with-reasoning\"]\n");
+        assert_eq!(config_value(&settings, "vibe_mode").as_deref(), Some("normal"));
+        assert_eq!(config_value(&settings, "conversation_view").as_deref(), Some("chat"));
+        assert_eq!(config_value(&settings, "status_line_enabled").as_deref(), Some("true"));
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
+        migrate_legacy_vibe_settings_at(&config_path, &settings_path).unwrap();
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 3);
+        for entry in fs::read_dir(&root).unwrap() {
+            fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn git_branch_distinguishes_linked_worktree_from_regular_git_directory() {

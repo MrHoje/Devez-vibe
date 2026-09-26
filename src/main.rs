@@ -177,6 +177,9 @@ async fn main() -> Result<()> {
     let selected_theme = theme::load(cli.theme.as_deref())?;
     theme::set_current(selected_theme);
     devezcode::init();
+    if let Err(error) = state::migrate_legacy_vibe_settings() {
+        eprintln!("이전 DevezVibe 설정을 옮기지 못했습니다: {error}");
+    }
     let cwd = resolve_cwd(cli.cwd.as_deref())?;
     let mut server =
         BackendServer::spawn(&cli.codex, &cli.open_code, &cli.node, &cli.claude, &cwd).await?;
