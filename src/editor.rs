@@ -497,7 +497,9 @@ impl Editor {
             while self.cursor > 0 && inline_whitespace(self.buffer[self.cursor - 1]) {
                 self.cursor -= 1;
             }
-            return;
+            if self.cursor == 0 || matches!(self.buffer[self.cursor - 1], '\n' | '\r') {
+                return;
+            }
         }
         if self.cursor > 0 && matches!(self.buffer[self.cursor - 1], '\n' | '\r') {
             self.cursor -= 1;
@@ -816,13 +818,34 @@ mod tests {
     }
 
     #[test]
-    fn delete_word_left_after_whitespace_keeps_the_previous_word() {
+    fn delete_word_left_after_whitespace_removes_the_previous_word() {
         let mut editor = Editor::default();
         editor.set_text("                if ");
 
         editor.delete_word_left();
 
-        assert_eq!(editor.text(), "                if");
+        assert_eq!(editor.text(), "                ");
+    }
+
+    #[test]
+    fn delete_word_left_removes_a_korean_word_with_its_trailing_space() {
+        let mut editor = Editor::default();
+        editor.set_text("가나다 마바사");
+
+        editor.delete_word_left();
+        assert_eq!(editor.text(), "가나다 ");
+        editor.delete_word_left();
+        assert_eq!(editor.text(), "");
+    }
+
+    #[test]
+    fn delete_word_left_does_not_cross_a_newline_after_spaces() {
+        let mut editor = Editor::default();
+        editor.set_text("가나다\n  ");
+
+        editor.delete_word_left();
+
+        assert_eq!(editor.text(), "가나다\n");
     }
 
     #[test]

@@ -28713,7 +28713,7 @@ mod tests {
     #[test]
     fn composer_ctrl_backspace_hold_repeats_after_the_keyboard_delay() {
         let mut state = test_state();
-        state.handle_paste("첫째 둘째");
+        state.handle_paste("첫째 둘째 셋째");
         state.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL));
         std::thread::sleep(Duration::from_millis(250));
 
@@ -28721,7 +28721,7 @@ mod tests {
         repeat.kind = KeyEventKind::Repeat;
         state.handle_key(repeat);
 
-        assert_eq!(state.editor.text(), "첫째");
+        assert_eq!(state.editor.text(), "첫째 ");
     }
 
     fn composer_completion_state() -> AppState {
