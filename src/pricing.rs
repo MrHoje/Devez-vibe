@@ -103,11 +103,14 @@ impl CostLedger {
 const CACHE_WRITE_MULTIPLIER: f64 = 1.25;
 const CACHE_READ_MULTIPLIER: f64 = 0.1;
 
-/// Per-million-token list prices (input, output), matched on a substring of the
+/// Per-million-token Standard short-context prices (input, output), matched on a substring of the
 /// model slug. Ordered most specific first: `gpt-5.6-luna` has to be tested
 /// before `gpt-5.6`, or the tier would fall through to the generic rate.
 const PRICES: &[(&str, f64, f64)] = &[
-    // GPT (Codex) — terra and luna were cut on 2026-07-30.
+    // GPT (Codex)
+    ("gpt-6-astra", 10.0, 50.0),
+    ("gpt-6-sol", 2.0, 10.0),
+    ("gpt-6-luna", 0.1, 0.5),
     ("gpt-5.6-terra", 2.0, 12.0),
     ("gpt-5.6-luna", 0.2, 1.2),
     ("gpt-5.6", 5.0, 30.0),
@@ -221,6 +224,9 @@ mod tests {
         };
 
         assert_eq!(estimate_usd("gpt-5.6-luna", totals), Some(1.4));
+        assert_eq!(estimate_usd("gpt-6-astra", totals), Some(60.0));
+        assert_eq!(estimate_usd("gpt-6-sol", totals), Some(12.0));
+        assert_eq!(estimate_usd("gpt-6-luna", totals), Some(0.6));
         assert_eq!(estimate_usd("gpt-5.6-terra", totals), Some(14.0));
         assert_eq!(estimate_usd("gpt-5.6-sol", totals), Some(35.0));
         assert_eq!(estimate_usd("gpt-5.3-codex", totals), Some(15.75));

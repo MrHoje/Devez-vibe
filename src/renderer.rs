@@ -9374,6 +9374,22 @@ fn is_running_shell_anchor(block: &Block) -> bool {
 fn is_web_search_block(block: &Block) -> bool {
     matches!(block.kind, BlockKind::Tool)
         && (block.title == "Web search" || block.title.starts_with("Web search ·"))
+        && !is_web_search_count_title(&block.title)
+}
+
+/// Super Vibe가 이어진 웹 검색을 세어 그리는 `Web search · 3 searches · …` 줄.
+/// 검색 블록을 숨기는 설정에서도 보여야 하므로 개별 검색 블록과 구분한다.
+pub fn is_web_search_count_title(title: &str) -> bool {
+    title
+        .strip_prefix("Web search · ")
+        .and_then(|rest| rest.split_once(' '))
+        .is_some_and(|(count, rest)| {
+            count.parse::<usize>().is_ok()
+                && ["search", "searches"].into_iter().any(|noun| {
+                    rest.strip_prefix(noun)
+                        .is_some_and(|tail| tail.is_empty() || tail.starts_with(" · "))
+                })
+        })
 }
 
 fn is_auxiliary_tool_block(block: &Block) -> bool {
@@ -23382,6 +23398,11 @@ mod tests {
                 .is_empty()
             );
         }
+        let count = Block::new(BlockKind::Tool, "Web search · 3 searches · rust ownership", "");
+        assert_eq!(
+            visible_transcript_blocks(&[count], ShellDisplayMode::Hide, DiffDisplayMode::Hide).len(),
+            1
+        );
     }
 
     #[test]

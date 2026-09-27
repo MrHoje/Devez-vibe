@@ -1629,6 +1629,11 @@ fn tool_item(update: &Value, completed: bool) -> Value {
             "exitCode": tool_exit_code(update)
         });
     }
+    // websearch 도구는 시작 때 도구 이름을, 실행 뒤에는 `<검색 제공자> "<검색어>"`를 제목으로 보낸다.
+    let query = input.get("query").and_then(Value::as_str).unwrap_or_default();
+    if title == "websearch" || (!query.is_empty() && title.ends_with(&format!("\"{query}\""))) {
+        return json!({ "id": id, "type": "webSearch", "query": query });
+    }
     if completed {
         let changes = tool_diffs(update);
         if !changes.is_empty() {
@@ -2178,6 +2183,24 @@ fn image_mime(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn websearch_tool_updates_become_web_search_items() {
+        let started = json!({ "toolCallId": "t1", "title": "websearch", "kind": "other", "rawInput": {} });
+        assert_eq!(tool_item(&started, false)["type"], "webSearch");
+        let completed = json!({
+            "toolCallId": "t1",
+            "title": "Exa Web Search \"rust async\"",
+            "kind": "other",
+            "rawInput": { "query": "rust async" },
+            "status": "completed"
+        });
+        let item = tool_item(&completed, true);
+        assert_eq!(item["type"], "webSearch");
+        assert_eq!(item["query"], "rust async");
+        let other = json!({ "toolCallId": "t2", "title": "lookup", "kind": "other", "rawInput": { "query": "x" } });
+        assert_eq!(tool_item(&other, false)["type"], "dynamicToolCall");
+    }
 
     /// 백엔드가 살아 있는 채로 응답만 멈추면 요청을 끊고 알린다. 시간을 멈춘
     /// 검사라 실제로 상한만큼 기다리지 않는다.

@@ -1039,9 +1039,9 @@ impl ModelInfo {
             "sonnet" => identity.contains("claude") && identity.contains("sonnet"),
             "opus" => identity.contains("claude") && identity.contains("opus"),
             "fable" => identity.contains("claude") && identity.contains("fable"),
-            "sol" => identity.contains("5.6") && identity.contains("sol"),
+            "sol" => self.model.starts_with("gpt-") && identity.contains("sol"),
             "terra" => identity.contains("5.6") && identity.contains("terra"),
-            "luna" => identity.contains("5.6") && identity.contains("luna"),
+            "luna" => self.model.starts_with("gpt-") && identity.contains("luna"),
             "astra" => identity.contains("astra"),
             "5.5" => identity.contains("5.5"),
             "5.4" => identity.contains("5.4") && !identity.contains("mini"),
@@ -1694,6 +1694,8 @@ enum PendingInteraction {
         detail: Vec<String>,
         selected: usize,
         choices: Vec<ApprovalChoice>,
+        guarded: bool,
+        confirming: bool,
     },
     UserInput {
         id: Value,
@@ -3612,6 +3614,9 @@ pub struct AppState {
     committed: Vec<Block>,
     active_order: Vec<String>,
     active: HashMap<String, ActiveItem>,
+    /// Super Vibe에서 이어진 웹 검색 줄의 횟수와 최근 검색어, 이번 턴에 센 검색 ID.
+    web_search_run: (usize, String),
+    counted_web_searches: HashSet<String>,
     shell_batches: HashMap<String, ShellBatch>,
     /// Completed Shell calls in the current turn. Sequential batches keep
     /// updating one transcript row instead of leaving one row per command.
@@ -3948,6 +3953,8 @@ impl AppState {
             committed: Vec::new(),
             active_order: Vec::new(),
             active: HashMap::new(),
+            web_search_run: (0, String::new()),
+            counted_web_searches: HashSet::new(),
             shell_batches: HashMap::new(),
             turn_shell_results: Vec::new(),
             turn_shell_anchor: None,
@@ -4315,8 +4322,15 @@ impl AppState {
             .into_iter()
             .filter(|index| self.models[*index].matches_query(query));
         let family = query.trim().to_ascii_lowercase();
-        if provider == ModelProvider::Claude && matches!(family.as_str(), "fable" | "opus") {
-            matches.max_by_key(|index| model_family_version(&self.models[*index], &family))
+        if (provider == ModelProvider::Claude && matches!(family.as_str(), "fable" | "opus"))
+            || (provider == ModelProvider::Codex && matches!(family.as_str(), "sol" | "luna"))
+        {
+            let version_prefix = if provider == ModelProvider::Codex {
+                "gpt-"
+            } else {
+                &family
+            };
+            matches.max_by_key(|index| model_family_version(&self.models[*index], version_prefix))
         } else {
             matches.into_iter().next()
         }
@@ -6129,6 +6143,7 @@ impl AppState {
         self.turn_response_started = false;
         self.turn_response_visible = false;
         self.completed_item_ids.clear();
+        self.counted_web_searches.clear();
         self.seen_operation_signatures.clear();
         self.turn_shell_results.clear();
         self.turn_shell_anchor = None;
@@ -8187,6 +8202,8 @@ impl AppState {
                     detail,
                     selected: 0,
                     choices,
+                    guarded: params.get("defaultToNo").and_then(Value::as_bool).unwrap_or(false),
+                    confirming: false,
                 });
                 Action::None
             }
@@ -8200,6 +8217,12 @@ impl AppState {
                 }
                 let (session, session_label) =
                     approval_session_choice(params, json!({ "decision": "acceptForSession" }));
+                let choices = approval_choices(
+                    json!({ "decision": "accept" }),
+                    session.map(|result| (session_label, result)),
+                    "Deny",
+                    json!({ "decision": "decline" }),
+                );
                 self.pending = Some(PendingInteraction::Approval {
                     id,
                     title: params
@@ -8210,12 +8233,9 @@ impl AppState {
                         .to_owned(),
                     detail,
                     selected: 0,
-                    choices: approval_choices(
-                        json!({ "decision": "accept" }),
-                        session.map(|result| (session_label, result)),
-                        "Deny",
-                        json!({ "decision": "decline" }),
-                    ),
+                    choices,
+                    guarded: params.get("defaultToNo").and_then(Value::as_bool).unwrap_or(false),
+                    confirming: false,
                 });
                 Action::None
             }
@@ -8238,6 +8258,12 @@ impl AppState {
                         "scope": "session"
                     }),
                 );
+                let choices = approval_choices(
+                    json!({ "permissions": requested, "scope": "turn" }),
+                    session.map(|result| (session_label, result)),
+                    "Deny",
+                    json!({ "permissions": {}, "scope": "turn" }),
+                );
                 self.pending = Some(PendingInteraction::Approval {
                     id,
                     title: params
@@ -8248,12 +8274,9 @@ impl AppState {
                         .to_owned(),
                     detail,
                     selected: 0,
-                    choices: approval_choices(
-                        json!({ "permissions": requested, "scope": "turn" }),
-                        session.map(|result| (session_label, result)),
-                        "Deny",
-                        json!({ "permissions": {}, "scope": "turn" }),
-                    ),
+                    choices,
+                    guarded: params.get("defaultToNo").and_then(Value::as_bool).unwrap_or(false),
+                    confirming: false,
                 });
                 Action::None
             }
@@ -10030,12 +10053,7 @@ impl AppState {
                     .ok()
                     .and_then(|number| number.checked_sub(1))
                     .and_then(|index| provider_models.get(index).copied())
-                    .or_else(|| {
-                        provider_models
-                            .iter()
-                            .copied()
-                            .find(|index| self.models[*index].matches_query(query))
-                    });
+                    .or_else(|| self.provider_model_index(self.selected_provider(), query));
                 let Some(index) = index else {
                     self.committed
                         .push(Block::new(BlockKind::Error, "Model not found", format!("{query}\nUse /model to see available models for the current provider.")));
@@ -11374,6 +11392,8 @@ impl AppState {
                 detail,
                 mut selected,
                 choices,
+                guarded,
+                confirming,
             } => match key.code {
                 KeyCode::Esc => {
                     let decline = choices.iter().find(|choice| {
@@ -11395,6 +11415,8 @@ impl AppState {
                         detail,
                         selected,
                         choices,
+                        guarded,
+                        confirming: false,
                     });
                     Action::None
                 }
@@ -11407,16 +11429,23 @@ impl AppState {
                         detail,
                         selected,
                         choices,
+                        guarded,
+                        confirming: false,
                     });
                     Action::None
                 }
                 KeyCode::Enter => {
-                    choices
-                        .get(selected)
-                        .map_or(Action::None, |choice| Action::RpcResponse {
+                    if guarded && !confirming && choices.get(selected).is_some_and(approval_is_allow) {
+                        self.pending = Some(PendingInteraction::Approval {
+                            id, title, detail, selected, choices, guarded, confirming: true,
+                        });
+                        Action::None
+                    } else {
+                        choices.get(selected).map_or(Action::None, |choice| Action::RpcResponse {
                             id,
                             result: choice.result.clone(),
                         })
+                    }
                 }
                 _ => {
                     self.pending = Some(PendingInteraction::Approval {
@@ -11425,6 +11454,8 @@ impl AppState {
                         detail,
                         selected,
                         choices,
+                        guarded,
+                        confirming: false,
                     });
                     Action::None
                 }
@@ -12385,6 +12416,7 @@ impl AppState {
                 detail,
                 selected,
                 choices,
+                confirming,
                 ..
             } => {
                 let mut lines = detail
@@ -12405,7 +12437,11 @@ impl AppState {
                     title: title.clone(),
                     lines,
                     slider: None,
-                    hint: "↑↓ Select   Enter Confirm   Esc Decline".to_owned(),
+                    hint: if *confirming {
+                        "Enter Again to Allow   Esc Decline"
+                    } else {
+                        "↑↓ Select   Enter Confirm   Esc Decline"
+                    }.to_owned(),
                     style: OverlayStyle::Panel,
                     input: None,
                     input_label: "",
@@ -14134,12 +14170,18 @@ impl AppState {
                 detail,
                 selected,
                 choices,
+                guarded,
+                confirming,
             }) => {
                 let first = detail.len();
-                if let Some(choice) = row.checked_sub(first).and_then(|index| choices.get(index)) {
-                    Action::RpcResponse {
-                        id,
-                        result: choice.result.clone(),
+                if let Some(index) = row.checked_sub(first).filter(|index| *index < choices.len()) {
+                    if guarded && approval_is_allow(&choices[index]) && (!confirming || selected != index) {
+                        self.pending = Some(PendingInteraction::Approval {
+                            id, title, detail, selected: index, choices, guarded, confirming: true,
+                        });
+                        Action::None
+                    } else {
+                        Action::RpcResponse { id, result: choices[index].result.clone() }
                     }
                 } else {
                     self.pending = Some(PendingInteraction::Approval {
@@ -14148,6 +14190,8 @@ impl AppState {
                         detail,
                         selected,
                         choices,
+                        guarded,
+                        confirming: false,
                     });
                     Action::Tick(false)
                 }
@@ -14548,9 +14592,13 @@ impl AppState {
         if self.completed_item_ids.contains(id) || self.handled_async_questions.contains(id) {
             return;
         }
+        self.count_super_vibe_web_search(item);
         let Some(mut block) = active_item_block(&self.cwd, item) else {
             return;
         };
+        if !self.active.contains_key(id) && shown_in_super_vibe(&block) {
+            self.settle_web_search_run();
+        }
         if matches!(block.kind, BlockKind::Assistant) {
             // A provider can label the streaming item's phase late or not at all.
             // Treat every new assistant item as the next visible response boundary:
@@ -14630,7 +14678,11 @@ impl AppState {
         if item.get("type").and_then(Value::as_str) == Some("userMessage") {
             return;
         }
+        self.count_super_vibe_web_search(item);
         if let Some(mut block) = completed_item_block(&self.cwd, item) {
+            if shown_in_super_vibe(&block) {
+                self.settle_web_search_run();
+            }
             if let Some(active) = active.as_ref() {
                 block.adopt_id(&active.block);
                 block.adopt_assistant_phase(&active.block);
@@ -14701,6 +14753,7 @@ impl AppState {
             // of a separate item/started notification. Settle earlier responses
             // at that same boundary so every provider reaches the common layout.
             self.collapse_progress_before_next_answer();
+            self.settle_web_search_run();
         }
         if matches!(kind, BlockKind::Assistant) && !delta.is_empty() {
             self.turn_response_started = true;
@@ -14898,6 +14951,52 @@ impl AppState {
         }
         self.turn_file_change_anchor = Some(grouped.clone());
         self.commit_replacing(grouped);
+    }
+
+    /// Super Vibe는 웹 검색 블록을 숨기므로, 이어진 검색을 진행 중 한 줄로 세어
+    /// 보여 준다. 보이는 다른 출력이 나오면 그 줄을 확정하고 다음 검색은 새로 센다.
+    fn count_super_vibe_web_search(&mut self, item: &Value) {
+        if self.vibe_mode != VibeMode::SuperVibe
+            || item.get("type").and_then(Value::as_str) != Some("webSearch")
+        {
+            return;
+        }
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        let running = self.active.contains_key(WEB_SEARCH_RUN_ID);
+        if !running {
+            self.web_search_run = (0, String::new());
+        }
+        if self.counted_web_searches.insert(id.to_owned()) {
+            self.web_search_run.0 += 1;
+        } else if !running {
+            return;
+        }
+        let query = compact_command(
+            item.get("query").and_then(Value::as_str).unwrap_or_default(),
+            88,
+        );
+        if !query.is_empty() {
+            self.web_search_run.1 = query;
+        }
+        let (count, query) = &self.web_search_run;
+        let noun = if *count == 1 { "search" } else { "searches" };
+        let title = if query.is_empty() {
+            format!("Web search · {count} {noun}")
+        } else {
+            format!("Web search · {count} {noun} · {query}")
+        };
+        let run = self.ensure_active(WEB_SEARCH_RUN_ID, BlockKind::Tool, "");
+        run.block.title = title;
+        run.revision = run.revision.wrapping_add(1);
+    }
+
+    fn settle_web_search_run(&mut self) {
+        if let Some(run) = self.active.remove(WEB_SEARCH_RUN_ID) {
+            self.active_order.retain(|id| id != WEB_SEARCH_RUN_ID);
+            self.committed.push(run.block);
+        }
     }
 
     fn ensure_active(&mut self, item_id: &str, kind: BlockKind, title: &str) -> &mut ActiveItem {
@@ -15680,6 +15779,7 @@ fn is_shell_block(block: &Block) -> bool {
 fn is_web_search_block(block: &Block) -> bool {
     matches!(block.kind, BlockKind::Tool)
         && (block.title == "Web search" || block.title.starts_with("Web search ·"))
+        && !crate::renderer::is_web_search_count_title(&block.title)
 }
 
 fn is_auxiliary_tool_block(block: &Block) -> bool {
@@ -15691,6 +15791,16 @@ fn is_auxiliary_tool_block(block: &Block) -> bool {
 
 fn is_shell_hidden_block(block: &Block) -> bool {
     is_shell_block(block) || is_web_search_block(block) || is_auxiliary_tool_block(block)
+}
+
+const WEB_SEARCH_RUN_ID: &str = "devez-web-search-run";
+
+/// Super Vibe 화면에 실제로 나타나는 블록. 이런 블록이 끼어들면 웹 검색 줄을 새로 센다.
+fn shown_in_super_vibe(block: &Block) -> bool {
+    !(is_shell_hidden_block(block)
+        || is_thinking(block)
+        || is_plan_block(block)
+        || matches!(block.kind, BlockKind::FileChange))
 }
 
 /// The plan as it reaches the transcript, in either shape it arrives in: its own
@@ -15716,8 +15826,7 @@ fn operation_signature(block: &Block) -> Option<String> {
     }
     let (family, include_title) = match block.kind {
         BlockKind::Tool
-            if block.title == "Web search"
-                || block.title.starts_with("Web search ·")
+            if is_web_search_block(block)
                 || block.title.starts_with("MCP ·")
                 || block.title.starts_with("Tool ·")
                 || block.title == "Agent" =>
@@ -16513,6 +16622,13 @@ fn permission_detail(value: &Value) -> Vec<String> {
 
 fn approval_session_choice(params: &Value, response: Value) -> (Option<Value>, String) {
     if params
+        .get("suppressAlwaysAllowRule")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return (None, String::new());
+    }
+    if params
         .get("claudePermission")
         .and_then(Value::as_bool)
         .unwrap_or(false)
@@ -16546,6 +16662,15 @@ fn approval_choices(
         result: decline,
     });
     choices
+}
+
+fn approval_is_allow(choice: &ApprovalChoice) -> bool {
+    matches!(
+        choice.result.get("decision").and_then(Value::as_str),
+        Some("accept" | "acceptForSession")
+    ) || (choice.result.get("scope").and_then(Value::as_str) == Some("session"))
+        || (choice.result.get("scope").and_then(Value::as_str) == Some("turn")
+            && choice.result.get("permissions") != Some(&json!({})))
 }
 
 fn command_approval_choices(params: &Value) -> Vec<ApprovalChoice> {
@@ -19760,6 +19885,75 @@ mod tests {
             titles,
             ["Web search · rust async", "Web search · rust channels"]
         );
+    }
+
+    #[test]
+    fn super_vibe_counts_consecutive_web_searches_on_one_line() {
+        let mut state = test_state();
+        state.show_welcome = false;
+        state.apply_vibe_mode(VibeMode::SuperVibe);
+        state.set_turn_started("turn-1".to_owned());
+        let search = |id: &str, query: &str| json!({ "id": id, "type": "webSearch", "query": query });
+        let live = |state: &AppState| {
+            state
+                .view()
+                .live_blocks
+                .iter()
+                .map(|live| live.block.title.clone())
+                .collect::<Vec<_>>()
+        };
+
+        state.start_item(&search("s1", ""));
+        assert_eq!(live(&state), ["Web search · 1 search"]);
+        state.complete_item(&search("s1", "rust async"));
+        state.start_item(&search("s2", "tokio select"));
+        state.complete_item(&search("s2", "tokio select"));
+        assert_eq!(live(&state), ["Web search · 2 searches · tokio select"]);
+
+        state.complete_item(&json!({ "id": "msg-1", "type": "agentMessage", "text": "중간 답변" }));
+        state.start_item(&search("s3", "tokio docs"));
+        assert_eq!(live(&state), ["Web search · 1 search · tokio docs"]);
+
+        state.handle_notification("turn/completed", &json!({ "turn": { "status": "completed" } }));
+        let committed = state.drain_committed();
+        let order = committed
+            .iter()
+            .filter(|block| {
+                matches!(block.kind, BlockKind::Assistant) || block.title.starts_with("Web search")
+            })
+            .map(|block| block.title.as_str())
+            .collect::<Vec<_>>();
+        let assistant = committed
+            .iter()
+            .find(|block| matches!(block.kind, BlockKind::Assistant))
+            .map(|block| block.title.as_str())
+            .expect("assistant block");
+        assert_eq!(
+            order,
+            [
+                "Web search · 2 searches · tokio select",
+                assistant,
+                "Web search · 1 search · tokio docs"
+            ]
+        );
+    }
+
+    #[test]
+    fn vibe_mode_keeps_one_row_per_web_search() {
+        let mut state = test_state();
+        state.show_welcome = false;
+        state.apply_vibe_mode(VibeMode::Vibe);
+        state.set_turn_started("turn-1".to_owned());
+        for (id, query) in [("s1", "rust async"), ("s2", "tokio select")] {
+            state.complete_item(&json!({ "id": id, "type": "webSearch", "query": query }));
+        }
+
+        let titles = state
+            .drain_committed()
+            .into_iter()
+            .map(|block| block.title)
+            .collect::<Vec<_>>();
+        assert_eq!(titles, ["Web search · rust async", "Web search · tokio select"]);
     }
 
     #[test]
@@ -23557,6 +23751,10 @@ mod tests {
             "gpt-5.6-sol",
             Some("high"),
         );
+        state.run_slash_command("/model luna");
+        assert_eq!(state.selected_model_name(), "gpt-5.6-luna");
+        state.run_slash_command("/model sol");
+        assert_eq!(state.selected_model_name(), "gpt-5.6-sol");
         state.run_slash_command("/model terra");
         assert_eq!(state.selected_model_display_name(), "GPT-5.6 Terra");
 
@@ -29580,6 +29778,8 @@ mod tests {
             test_model("gpt-5.6-terra", "GPT-5.6 Terra", false),
             test_model("gpt-5.6-luna", "GPT-5.6 Luna", false),
             test_model("gpt-6-astra", "GPT-6 Astra", false),
+            test_model("gpt-6-sol", "GPT-6 Sol", false),
+            test_model("gpt-6-luna", "GPT-6 Luna", false),
             test_model("claude:claude-fable-5", "Claude Fable 5", false),
             test_model("claude:claude-fable-5-1", "Claude Fable 5.1", false),
             test_model("claude:claude-opus-4-8", "Claude Opus 4.8", false),
@@ -29611,9 +29811,9 @@ mod tests {
         state.switch_to_codex();
         assert_eq!(state.selected_model_name(), "gpt-6-astra");
         for (alias, expected) in [
-            ("sol", "gpt-5.6-sol"),
+            ("sol", "gpt-6-sol"),
             ("terra", "gpt-5.6-terra"),
-            ("luna", "gpt-5.6-luna"),
+            ("luna", "gpt-6-luna"),
             ("astra", "gpt-6-astra"),
         ] {
             state.run_slash_command(&format!(
@@ -29622,6 +29822,11 @@ mod tests {
             ));
             assert_eq!(state.selected_model_name(), expected);
         }
+
+        state.run_slash_command("/model sol");
+        assert_eq!(state.selected_model_name(), "gpt-6-sol");
+        state.run_slash_command("/model luna");
+        assert_eq!(state.selected_model_name(), "gpt-6-luna");
 
         state.run_slash_command("/provider claude Sonnet");
         assert_eq!(state.selected_model_name(), "claude:sonnet");
@@ -30180,6 +30385,78 @@ mod tests {
             })
         );
         assert_eq!(overlay.hint, "↑↓ Select   Enter Confirm   Esc Decline");
+    }
+
+    #[test]
+    fn claude_guarded_approvals_start_on_allow_but_require_confirmation() {
+        for method in [
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+            "item/permissions/requestApproval",
+        ] {
+            let mut state = test_state();
+            state.begin_server_request(
+                json!(94),
+                method,
+                &json!({
+                    "claudePermission": true,
+                    "defaultToNo": true,
+                    "suppressAlwaysAllowRule": true,
+                    "persistentApprovalLabel": "Always allow",
+                    "command": "npm test",
+                    "grantRoot": "src/main.rs",
+                    "permissions": { "tool": "Read" }
+                }),
+            );
+            assert!(matches!(
+                state.pending.as_ref(),
+                Some(PendingInteraction::Approval { selected: 0, choices, .. })
+                    if choices.len() == 2 && choices[0].label == "Allow once"
+            ));
+            assert!(matches!(
+                state.handle_key(KeyEvent::from(KeyCode::Char('y'))),
+                Action::None
+            ));
+            assert!(matches!(
+                state.handle_key(KeyEvent::from(KeyCode::Enter)),
+                Action::None
+            ));
+            assert_eq!(
+                state.overlay_view().expect("confirmation").hint,
+                "Enter Again to Allow   Esc Decline"
+            );
+            match state.handle_key(KeyEvent::from(KeyCode::Enter)) {
+                Action::RpcResponse { result, .. } => {
+                    assert_ne!(result.get("decision").and_then(Value::as_str), Some("decline"));
+                    assert_ne!(result.get("scope").and_then(Value::as_str), Some("session"));
+                }
+                _ => panic!("guarded approval must answer after confirmation"),
+            }
+        }
+    }
+
+    #[test]
+    fn claude_guarded_approval_click_needs_confirmation() {
+        let mut state = test_state();
+        state.begin_server_request(
+            json!(95),
+            "item/commandExecution/requestApproval",
+            &json!({ "claudePermission": true, "defaultToNo": true, "command": "npm test" }),
+        );
+        let row = match state.pending.as_ref() {
+            Some(PendingInteraction::Approval { detail, .. }) => detail.len(),
+            _ => panic!("approval must be pending"),
+        };
+        assert!(matches!(state.click_overlay_row(row), Action::None));
+        assert!(matches!(
+            state.pending.as_ref(),
+            Some(PendingInteraction::Approval { confirming: true, .. })
+        ));
+        assert!(matches!(
+            state.click_overlay_row(row),
+            Action::RpcResponse { result, .. }
+                if result.get("decision").and_then(Value::as_str) == Some("accept")
+        ));
     }
 
     #[test]

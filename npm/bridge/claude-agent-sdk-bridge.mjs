@@ -902,11 +902,14 @@ async function requestToolPermission(toolName, input, permission) {
   // decide that a human answer is needed. Forward every such request to the host;
   // auto-allowing the ordinary cases here would silently defeat default/auto mode.
   const planApproval = toolName === "ExitPlanMode";
-  const persistentApprovalLabel = permissionSuggestionLabel(permission.suggestions);
+  const persistentApprovalLabel = permission.suppressAlwaysAllowRule
+    ? "" : permissionSuggestionLabel(permission.suggestions);
   const common = {
     claudePermission: true,
     title: permission.title || permission.displayName,
     persistentApprovalLabel,
+    defaultToNo: Boolean(permission.defaultToNo),
+    suppressAlwaysAllowRule: Boolean(permission.suppressAlwaysAllowRule),
   };
 
   let method = "item/permissions/requestApproval";
@@ -944,7 +947,8 @@ async function requestToolPermission(toolName, input, permission) {
   return {
     behavior: "allow",
     updatedInput: input,
-    ...(response?.decision === "acceptForSession" || response?.scope === "session"
+    ...(!permission.suppressAlwaysAllowRule
+      && (response?.decision === "acceptForSession" || response?.scope === "session")
       ? { updatedPermissions: permission.suggestions }
       : {}),
   };
@@ -3925,6 +3929,34 @@ async function runPermissionModeSelfTest() {
   }
 }
 
+async function runGuardedPermissionSelfTest() {
+  const captured = [];
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { captured.push(JSON.parse(String(chunk))); return true; };
+  try {
+    const pending = requestToolPermission("Bash", { command: "npm test" }, {
+      defaultToNo: true,
+      suppressAlwaysAllowRule: true,
+      suggestions: [{ destination: "projectSettings", rules: [{ toolName: "Bash" }] }],
+    });
+    const request = captured[0];
+    if (request.params.defaultToNo !== true
+        || request.params.suppressAlwaysAllowRule !== true
+        || request.params.persistentApprovalLabel) {
+      throw new Error("Claude guarded permission request self-test failed");
+    }
+    const reply = pendingHostRequests.get(request.id);
+    pendingHostRequests.delete(request.id);
+    reply.resolve({ decision: "acceptForSession" });
+    const result = await pending;
+    if (result.behavior !== "allow" || "updatedPermissions" in result) {
+      throw new Error("Claude guarded permission response self-test failed");
+    }
+  } finally {
+    process.stdout.write = originalWrite;
+  }
+}
+
 function runToolPolicySelfTest() {
   const cwd = process.platform === "win32" ? "C:\\repo" : "/repo";
   const reviewer = { readOnly: true, writableRoots: [] };
@@ -4020,6 +4052,7 @@ async function runSelfTest() {
     throw new Error(`Claude 기동 실패 안내 누락: ${startupGaps.join(", ")}`);
   }
   await runPermissionModeSelfTest();
+  await runGuardedPermissionSelfTest();
   runToolPolicySelfTest();
   await runCommandTimeoutSelfTest();
   // A turn that ends with no answer must reach the user: refusal as an error
