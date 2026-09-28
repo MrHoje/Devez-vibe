@@ -330,10 +330,40 @@ function catalogEntry(model, defaultResolvedModel) {
   };
 }
 
+function compareVersions(left, right) {
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    const difference = (left[index] ?? 0) - (right[index] ?? 0);
+    if (difference) return difference;
+  }
+  return 0;
+}
+
+/** Each family's newest model in CLAUDE_MODEL_ORDER first, then older ones by family and version. */
+function sortClaudeModels(models) {
+  const ranked = models.map((model) => {
+    const [family = "", version = ""] = compactClaudeModelName(model).toLowerCase().split(" ");
+    return { model, family, version: version.match(/\d+/g)?.map(Number) ?? [] };
+  });
+  const newest = new Map();
+  for (const { family, version } of ranked) {
+    if (!newest.has(family) || compareVersions(version, newest.get(family)) > 0) newest.set(family, version);
+  }
+  const tier = (entry) => (compareVersions(entry.version, newest.get(entry.family)) === 0 ? 0 : 1);
+  const familyOrder = ({ family }) => {
+    const index = CLAUDE_MODEL_ORDER.indexOf(family);
+    return index < 0 ? CLAUDE_MODEL_ORDER.length : index;
+  };
+  return ranked
+    .sort((left, right) => tier(left) - tier(right)
+      || familyOrder(left) - familyOrder(right)
+      || compareVersions(right.version, left.version))
+    .map(({ model }) => model);
+}
+
 function claudeCatalogEntries(models, defaultResolvedModel) {
-  const catalogModels = models.filter((model) => model.value && model.value !== "default"
+  const catalogModels = sortClaudeModels(models.filter((model) => model.value && model.value !== "default"
     && ![model.value, model.resolvedModel]
-      .some((name) => stripClaudeModel(String(name || "")).startsWith(RETIRED_OPUS_MODEL)));
+      .some((name) => stripClaudeModel(String(name || "")).startsWith(RETIRED_OPUS_MODEL))));
   const entries = catalogModels.map((model) => catalogEntry(model, defaultResolvedModel));
   const existingIndex = entries.findIndex((entry) =>
     stripClaudeModel(entry.model) === PREVIOUS_OPUS_MODEL
@@ -401,14 +431,6 @@ async function loadModelCatalog(params) {
       const defaultResolvedModel = String(
         models.find((model) => model.value === "default")?.resolvedModel || "",
       );
-      models.sort((left, right) => {
-        const leftFamily = String(left.value || "").match(/(fable|opus|sonnet|haiku)/i)?.[1]?.toLowerCase();
-        const rightFamily = String(right.value || "").match(/(fable|opus|sonnet|haiku)/i)?.[1]?.toLowerCase();
-        const leftOrder = CLAUDE_MODEL_ORDER.indexOf(leftFamily);
-        const rightOrder = CLAUDE_MODEL_ORDER.indexOf(rightFamily);
-        return (leftOrder < 0 ? CLAUDE_MODEL_ORDER.length : leftOrder)
-          - (rightOrder < 0 ? CLAUDE_MODEL_ORDER.length : rightOrder);
-      });
       return {
         data: claudeCatalogEntries(models, defaultResolvedModel),
       };
@@ -4574,6 +4596,19 @@ async function runSelfTest() {
       "max",
     ) !== "max") {
     throw new Error(`Claude pinned model self-test failed: ${JSON.stringify(catalog)}`);
+  }
+  const orderedNames = claudeCatalogEntries([
+    { value: "haiku", displayName: "Haiku 4.5" },
+    { value: "claude-sonnet-4-6", displayName: "Sonnet 4.6" },
+    { value: "fable", displayName: "Fable 5" },
+    { value: "opus", resolvedModel: "claude-opus-5-5", displayName: "Opus" },
+    { value: "sonnet", displayName: "Sonnet 5" },
+    { value: "claude-opus-6", displayName: "Opus 6" },
+    { value: "claude-fable-5-1", displayName: "Fable 5.1" },
+    { value: "nova", displayName: "Nova 1" },
+  ].map((model) => ({ resolvedModel: model.value, ...model })), "").filter((entry) => !entry.hidden).map((entry) => entry.displayName).join(",");
+  if (orderedNames !== "Fable 5.1,Opus 6,Sonnet 5,Haiku 4.5,Nova 1,Fable 5,Opus 5.5,Sonnet 4.6") {
+    throw new Error(`Claude model order self-test failed: ${orderedNames}`);
   }
   const inheritedFork = forkSessionSelection(
     { model: "claude:sonnet", effort: "high" },

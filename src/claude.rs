@@ -408,11 +408,12 @@ pub fn model_catalog() -> Value {
     json!({
         "data": [
             claude_model("claude:claude-fable-5-1", "Claude Fable 5.1", efforts(), false),
-            claude_model("claude:fable", "Claude Fable 5", efforts(), false),
             claude_model("claude:opus", "Claude Opus 5.5", efforts(), false),
             previous_opus,
             claude_model("claude:sonnet", "Claude Sonnet 5", efforts(), true),
-            claude_model("claude:haiku", "Claude Haiku 4.5", json!([]), false)
+            claude_model("claude:haiku", "Claude Haiku 4.5", json!([]), false),
+            // Older versions follow every family's newest, like the bridge's order.
+            claude_model("claude:fable", "Claude Fable 5", efforts(), false)
         ]
     })
 }
@@ -826,11 +827,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "claude:claude-fable-5-1",
-                "claude:fable",
                 "claude:opus",
                 "claude:claude-opus-5",
                 "claude:sonnet",
-                "claude:haiku"
+                "claude:haiku",
+                "claude:fable"
             ]
         );
         assert!(
@@ -845,11 +846,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "Claude Fable 5.1",
-                "Claude Fable 5",
                 "Claude Opus 5.5",
                 "Claude Opus 5",
                 "Claude Sonnet 5",
-                "Claude Haiku 4.5"
+                "Claude Haiku 4.5",
+                "Claude Fable 5"
             ]
         );
         assert_eq!(
