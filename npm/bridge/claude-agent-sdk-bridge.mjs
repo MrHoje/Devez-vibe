@@ -2627,6 +2627,12 @@ function processUser(session, message) {
         path: String(message.tool_use_result.path || pending.input?.file_path || ""),
       });
     }
+    // Worktree tools move the session's folder; reuse Codex's settings notice so the branch badge follows.
+    const worktreeCwd = pending.name === "EnterWorktree" ? message.tool_use_result?.worktreePath
+      : pending.name === "ExitWorktree" ? message.tool_use_result?.originalCwd : null;
+    if (!block.is_error && typeof worktreeCwd === "string") {
+      notify("thread/settings/updated", { threadId: session.id, threadSettings: { cwd: worktreeCwd } });
+    }
     pending.toolUseId = block.tool_use_id;
     if (pending.suppressed) {
       updatePlanFromToolResult(session, pending, message);
@@ -4985,6 +4991,27 @@ async function runSelfTest() {
     });
     if (lifecycleSession.subagents.size !== 0 || lifecycleSession.turn === null) {
       throw new Error("Claude failed task notification did not finish the resumed agent");
+    }
+    finishTurn(lifecycleSession, null, 1);
+
+    beginTurn(lifecycleSession);
+    const beforeWorktree = captured.length;
+    for (const [id, name, result] of [
+      ["toolu_wt1", "EnterWorktree", { worktreePath: "D:\\repo\\.claude\\worktrees\\task", message: "" }],
+      ["toolu_wt2", "ExitWorktree", { action: "keep", originalCwd: "D:\\repo", worktreePath: "D:\\repo\\.claude\\worktrees\\task", message: "" }],
+    ]) {
+      processToolUse(lifecycleSession, { type: "tool_use", id, name, input: {} });
+      processUser(lifecycleSession, {
+        message: { content: [{ type: "tool_result", tool_use_id: id, content: "" }] },
+        tool_use_result: result,
+      });
+    }
+    const worktreeCwds = captured.slice(beforeWorktree).join("").trim().split("\n")
+      .map((line) => JSON.parse(line))
+      .filter((line) => line.method === "thread/settings/updated")
+      .map((line) => line.params.threadSettings.cwd);
+    if (JSON.stringify(worktreeCwds) !== JSON.stringify(["D:\\repo\\.claude\\worktrees\\task", "D:\\repo"])) {
+      throw new Error(`Claude worktree folder self-test failed: ${JSON.stringify(worktreeCwds)}`);
     }
     finishTurn(lifecycleSession, null, 1);
 

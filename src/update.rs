@@ -21,10 +21,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Super Vibe에서 웹 검색 진행을 한 줄로 표시하고 연속 검색 횟수를 보여 줍니다.",
-    "`sol`·`luna` 별칭이 이용 가능한 최신 Codex 모델을 선택합니다.",
-    "Claude 도구 승인 창에서 한 번 허용을 기본 선택으로 유지하고, 위험 표시된 요청은 승인 전에 한 번 더 확인합니다.",
-    "Claude가 영구 허용을 금지한 요청에서는 해당 선택지를 표시하지 않습니다.",
+    "Claude가 작업 중 워크트리로 옮겨 가면 컴포저 위 브랜치 표시도 워크트리 브랜치로 바뀝니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

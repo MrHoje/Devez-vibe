@@ -3722,6 +3722,9 @@ pub struct AppState {
     /// 턴이 끝나는 순간에만 기록한다.
     last_completed_at: Option<chrono::DateTime<chrono::Local>>,
     branch: Option<(String, bool)>,
+    /// Folder the agent moved into mid-session (Claude's EnterWorktree); the
+    /// branch badge follows it while `cwd` keeps the session's own folder.
+    branch_cwd: Option<String>,
     five_hour_percent: Option<u8>,
     weekly_percent: Option<u8>,
     /// Unix timestamp the 5h window resets at, so the status row can count down.
@@ -4007,6 +4010,7 @@ impl AppState {
             last_completed_duration: None,
             last_completed_at: None,
             branch,
+            branch_cwd: None,
             five_hour_percent,
             weekly_percent,
             five_hour_reset_at,
@@ -4875,6 +4879,7 @@ impl AppState {
                 self.auto_knowledge = read_project_auto_knowledge(&cwd);
             }
             self.cwd = cwd;
+            self.branch_cwd = None;
             self.branch = read_git_branch(&self.cwd);
             self.workspace_entries.clear();
             self.rebuild_completion_catalog();
@@ -5891,6 +5896,7 @@ impl AppState {
             self.workspace_entries.clear();
             self.rebuild_completion_catalog();
         }
+        self.branch_cwd = None;
         self.turn_id = None;
         self.pending_interrupt = false;
         self.busy = false;
@@ -7124,7 +7130,7 @@ impl AppState {
             self.spinner_frame = (self.spinner_frame + 1) % SPINNER.len();
         }
         if self.status_metadata_refreshed_at.elapsed().as_secs() >= 3 {
-            let branch = read_git_branch(&self.cwd);
+            let branch = read_git_branch(self.branch_cwd.as_deref().unwrap_or(&self.cwd));
             let (five_hour_percent, weekly_percent, five_hour_reset_at) = if self
                 .selected_model()
                 .is_some_and(|model| model.model.starts_with("claude:"))
@@ -9376,6 +9382,13 @@ impl AppState {
                 // 걸지 않고, 빈 목록이면 지울 것도 없다.
                 self.subagents_settled_at =
                     (!self.busy && !self.subagents.is_empty()).then(Instant::now);
+            }
+            "thread/settings/updated" => {
+                if let Some(cwd) = params.pointer("/threadSettings/cwd").and_then(Value::as_str) {
+                    let cwd = plain_folder(cwd.to_owned());
+                    self.branch_cwd = (cwd != self.cwd).then_some(cwd);
+                    self.branch = read_git_branch(self.branch_cwd.as_deref().unwrap_or(&self.cwd));
+                }
             }
             "turn/artifact/published" => {
                 if let Some(url) = params
@@ -17742,6 +17755,31 @@ mod tests {
         fs::write(&git_dir, format!("gitdir: {}\n", metadata.display())).unwrap();
         assert_eq!(read_git_branch(cwd), Some(("main".to_owned(), true)));
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn branch_badge_follows_the_folder_the_agent_moves_into() {
+        let worktree = env::temp_dir().join(format!(
+            "devez-branch-cwd-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(worktree.join(".git")).unwrap();
+        fs::write(worktree.join(".git/HEAD"), "ref: refs/heads/feature/task\n").unwrap();
+        let mut state = test_state();
+        let moved = |cwd: &str| json!({ "threadId": "thread", "threadSettings": { "cwd": cwd } });
+
+        state.handle_notification("thread/settings/updated", &moved(worktree.to_str().unwrap()));
+        assert_eq!(state.composer_mode().branch.as_deref(), Some("feature/task"));
+
+        state.handle_notification("thread/settings/updated", &moved("cwd"));
+        assert_eq!(state.branch_cwd, None);
+        assert_eq!(state.composer_mode().branch, read_git_branch("cwd").map(|(name, _)| name));
+
+        state.handle_notification("thread/settings/updated", &moved(worktree.to_str().unwrap()));
+        state.set_thread("next".to_owned(), "cwd".to_owned(), "gpt-5.6-sol", Some("high"));
+        assert_eq!(state.branch_cwd, None, "a new conversation starts in its own folder");
+        fs::remove_dir_all(&worktree).unwrap();
     }
 
     #[test]
