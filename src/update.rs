@@ -22,6 +22,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
     "Codex와 Claude에서 MCP 로그인이 만료되거나 인증이 필요하면 긴 오류 전문 대신 다시 로그인하는 방법을 짧게 안내합니다.",
+    "Codex·Claude 응답 오류와 로그인·MCP 오류를 긴 원문 대신 핵심 문구로 줄여 보여주고, 로그인이 만료되면 다시 로그인하는 방법을 안내합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

@@ -2835,7 +2835,12 @@ async function processResult(session, message) {
   const detail = message.errors?.join("\n") || message.result || message.stop_reason || "Claude 실행 실패";
   const guide = STARTUP_FAILURE_GUIDES[message.startup_failure_reason];
   let error = message.is_error && !interrupted
-    ? { message: guide ? `${guide}\n${detail}` : detail }
+    ? {
+        message: guide ? `${guide}\n${detail}` : detail,
+        // An expired login gets the host's sign-in guide instead of the raw
+        // `API Error: 401 {...}`; Codex tags the same failure `unauthorized`.
+        ...(session.turn?.assistantError === "authentication_failed" ? { codexErrorInfo: "unauthorized" } : {}),
+      }
     : null;
   if (!error && !interrupted) {
     const outcome = abnormalStopOutcome(message.stop_reason);
@@ -2935,7 +2940,12 @@ function finishTurn(session, error, durationMs) {
   clearForegroundSubagents(session);
   const turn = { id: session.turn.id, status: error ? "failed" : session.turn.interruptRequested ? "interrupted" : "completed" };
   if (turn.status === "completed") completeLingeringTasks(session, Date.now());
-  if (error) turn.error = { message: error instanceof Error ? error.message : error.message || String(error) };
+  if (error) {
+    turn.error = {
+      message: error instanceof Error ? error.message : error.message || String(error),
+      ...(error.codexErrorInfo ? { codexErrorInfo: error.codexErrorInfo } : {}),
+    };
+  }
   if (durationMs != null) turn.durationMs = durationMs;
   notify("turn/completed", { threadId: session.id, turn });
   session.turn = null;
@@ -4806,6 +4816,21 @@ async function runSelfTest() {
     await consumeMessage(limitSession, { type: "assistant", error: "server_error", message: { content: [] } });
     await consumeMessage(limitSession, failedResult);
     if (limitSession.usageLimitWait) throw new Error("Unrelated server error started a usage wait");
+    // An expired login reaches the host tagged like Codex's `unauthorized`.
+    const authNotices = [];
+    const authWrite = process.stdout.write;
+    process.stdout.write = (chunk) => { authNotices.push(JSON.parse(String(chunk))); return true; };
+    try {
+      beginTurn(limitSession);
+      await consumeMessage(limitSession, { type: "assistant", error: "authentication_failed", message: { content: [] } });
+      await consumeMessage(limitSession, { ...failedResult, errors: ["API Error: 401 {\"type\":\"error\"}"] });
+    } finally {
+      process.stdout.write = authWrite;
+    }
+    const authTurn = authNotices.find((notice) => notice.method === "turn/completed")?.params?.turn;
+    if (authTurn?.error?.codexErrorInfo !== "unauthorized" || !authTurn.error.message.includes("401")) {
+      throw new Error(`Claude login failure lost its tag: ${JSON.stringify(authTurn)}`);
+    }
     beginTurn(limitSession);
     for (let attempt = 0; attempt < 4; attempt++) {
       await rejectLimit();

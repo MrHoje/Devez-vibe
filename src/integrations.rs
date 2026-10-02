@@ -304,7 +304,7 @@ fn failure_detail(name: &str, error: Option<&str>, reason: Option<&str>) -> Stri
     } else if expired {
         format!("Authentication expired. Run /mcp login {name}")
     } else {
-        error.unwrap_or("MCP server failed to start.").to_owned()
+        crate::app_server::condense_error_message(error.unwrap_or("MCP server failed to start."))
     }
 }
 
@@ -644,7 +644,10 @@ impl McpPicker {
         }
         if let Some(error) = server.tools_error.as_deref() {
             lines.push(OverlayLine {
-                text: format!("도구 조회 오류: {error}"),
+                text: format!(
+                    "도구 조회 오류: {}",
+                    crate::app_server::condense_error_message(error)
+                ),
                 selected: false,
                 muted: false,
             });

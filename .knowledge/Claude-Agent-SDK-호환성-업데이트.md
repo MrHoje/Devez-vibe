@@ -104,6 +104,11 @@ TUI를 띄우지 않고 실제 에이전트 동작을 확인할 때는 브리지
 - SDK `Query`에는 MCP OAuth 메서드가 없다. DevezVibe의 Claude `/mcp login`은 `reconnectMcpServer`만 호출하며, 이 호출로 로그인이 실제로 진행되는지는 확인하지 않았다.
 - MCP 시작 실패는 사용자 요청(2026-10-02)으로 채팅 경고를 띄우지 않고 `/mcp` 목록에만 표시한다. 1.9.36에서 브리지가 세션 시작 후 상태를 조회해 경고를 보내게 했지만, claude.ai 커넥터마다 경고가 떠서 제거했다. Claude `/mcp` 목록은 실패·인증 필요 서버를 직접 포함하므로 별도 감시가 필요 없다.
 
+## 턴 오류 종류
+
+- 실패한 API 호출은 `assistant` 메시지의 `error`(`authentication_failed`, `rate_limit`, `overloaded` 등)로 종류를 알리고, 이어지는 `result`의 `errors`에 `API Error: 401 {...}` 같은 원문이 온다. 브리지는 `authentication_failed`일 때 턴 오류에 Codex와 같은 `codexErrorInfo: "unauthorized"`를 붙이고, 호스트는 이를 재로그인 안내로 바꾼다.
+- 같은 오류 문구가 `assistant` 본문 텍스트로도 와서 답변처럼 표시되는지는 번들 CLI가 실행 파일이라 확인하지 못했다.
+
 ## 확인 기록
 
 ### 2026-09-10 사용량 한도 자동 재개 — 1.8.22 배포

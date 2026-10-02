@@ -775,11 +775,12 @@ fn format_rpc_error(error: &Value) -> String {
     }
 }
 
-/// An upstream failure often arrives with a whole HTML error page attached.
-/// Notices only have room for the part a person can act on, so keep the first
-/// line up to where the markup starts and cap what is left.
-fn condense_error_message(message: &str) -> String {
-    const LIMIT: usize = 200;
+/// An upstream failure often arrives with a whole HTML error page or a JSON
+/// response body attached. Notices only have room for the part a person can
+/// act on, so keep what comes before the markup, read a JSON body as its inner
+/// message, and cap each of the first two lines — a guide line can precede the
+/// error it explains.
+pub fn condense_error_message(message: &str) -> String {
     let lower = message.to_ascii_lowercase();
     let markup = ["<html", "<!doctype", "<head", "<body", "<?xml"]
         .iter()
@@ -789,7 +790,31 @@ fn condense_error_message(message: &str) -> String {
     let head = message[..markup].trim();
     // A message that is nothing but markup still has to say something.
     let head = if head.is_empty() { message } else { head };
-    let line = head.lines().next().unwrap_or_default().trim();
+    let lines = head
+        .lines()
+        .map(condense_error_line)
+        .filter(|line| !line.is_empty())
+        .take(2)
+        .collect::<Vec<_>>();
+    lines.join("\n")
+}
+
+fn condense_error_line(line: &str) -> String {
+    const LIMIT: usize = 200;
+    let line = line.trim();
+    // `API Error: 401 {"type":"error","error":{"message":"OAuth token has
+    // expired."}}` reads as `API Error: 401 OAuth token has expired.`
+    let inner = line.find('{').and_then(|start| {
+        let mut stream = serde_json::Deserializer::from_str(&line[start..]).into_iter::<Value>();
+        let body = stream.next()?.ok()?;
+        let rest = &line[start + stream.byte_offset()..];
+        let message = body
+            .pointer("/error/message")
+            .or_else(|| body.get("message"))?
+            .as_str()?;
+        Some(format!("{} {message}{rest}", line[..start].trim_end()).trim().to_owned())
+    });
+    let line = inner.as_deref().unwrap_or(line);
     let line = line.trim_end_matches([':', '-', '·']).trim_end();
     if line.chars().count() > LIMIT {
         format!(
@@ -1121,6 +1146,24 @@ mod tests {
         let condensed = condense_error_message(&long);
         assert_eq!(condensed.chars().count(), 201, "{condensed}");
         assert!(condensed.ends_with('…'), "{condensed}");
+
+        // A JSON response body reads as its inner message, trailing text and all.
+        assert_eq!(
+            condense_error_message(
+                "API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"OAuth token has expired.\"},\"request_id\":\"req_1\"} · Please run /login"
+            ),
+            "API Error: 401 OAuth token has expired. · Please run /login"
+        );
+        // A body without a message is kept as it came.
+        assert_eq!(
+            condense_error_message("HTTP 401: {\"code\": \"token_expired\"}"),
+            "HTTP 401: {\"code\": \"token_expired\"}"
+        );
+        // A guide line keeps the error it explains, and nothing past that.
+        assert_eq!(
+            condense_error_message("Sign in again.\nworktree refused\nmore\n"),
+            "Sign in again.\nworktree refused"
+        );
     }
 
     #[tokio::test]

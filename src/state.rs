@@ -5382,7 +5382,9 @@ impl AppState {
             self.push_notice(
                 BlockKind::Error,
                 "Login failed",
-                error.unwrap_or("Login did not complete due to an unknown error."),
+                crate::app_server::condense_error_message(
+                    error.unwrap_or("Login did not complete due to an unknown error."),
+                ),
             );
         }
     }
@@ -9239,14 +9241,13 @@ impl AppState {
                         .get("message")
                         .and_then(Value::as_str)
                         .unwrap_or("Unknown error");
+                    let claude = self.selected_provider() == ModelProvider::Claude;
                     self.committed.push(Block::new(
                         BlockKind::Error,
                         "Response generation failed",
-                        message,
+                        provider_error_text(error, claude),
                     ));
-                    if self.selected_provider() == ModelProvider::Claude
-                        && is_safeguard_block(message)
-                    {
+                    if claude && is_safeguard_block(message) {
                         self.open_safeguard_block();
                     }
                 }
@@ -9516,9 +9517,9 @@ impl AppState {
                 }
             }
             "error" => {
-                let message = params
-                    .get("error")
-                    .and_then(|error| error.get("message"))
+                let error = params.get("error").unwrap_or(&Value::Null);
+                let message = error
+                    .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("The provider did not return error details.");
                 let retry = params
@@ -9548,7 +9549,7 @@ impl AppState {
                             _ => "Provider error",
                         }
                     },
-                    message,
+                    provider_error_text(error, provider == "Claude"),
                 ));
                 if !retry && provider == "Claude" && is_safeguard_block(message) {
                     self.open_safeguard_block();
@@ -9594,11 +9595,12 @@ impl AppState {
                     if success {
                         format!("{name} 인증이 완료되었습니다.")
                     } else {
-                        params
-                            .get("error")
-                            .and_then(Value::as_str)
-                            .unwrap_or("OAuth authentication did not complete.")
-                            .to_owned()
+                        crate::app_server::condense_error_message(
+                            params
+                                .get("error")
+                                .and_then(Value::as_str)
+                                .unwrap_or("OAuth authentication did not complete."),
+                        )
                     },
                 ));
             }
@@ -15156,6 +15158,26 @@ fn codex_warning_block(method: &str, params: &Value) -> Block {
         _ => "Warning",
     };
     Block::new(BlockKind::Warning, title, body)
+}
+
+/// What a failed turn says on screen. An expired login gets the fix; anything
+/// else is condensed, since a raw transport error can fill the screen. The
+/// Claude bridge reports an expired login with Codex's `unauthorized` too.
+fn provider_error_text(error: &Value, claude: bool) -> String {
+    if error.get("codexErrorInfo").and_then(Value::as_str) == Some("unauthorized") {
+        return if claude {
+            "Claude login expired. Run `claude auth login` in a terminal, then restart Devez Vibe."
+        } else {
+            "Codex login expired. Run /login to sign in again."
+        }
+        .to_owned();
+    }
+    crate::app_server::condense_error_message(
+        error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("The provider did not return error details."),
+    )
 }
 
 fn next_question_or_reply(
@@ -23183,6 +23205,46 @@ mod tests {
         assert_eq!(visible, ["claude:opus", "claude:sonnet"]);
         state.run_slash_command("/model claude-opus-5");
         assert_eq!(state.selected_model_name(), "claude:opus");
+    }
+
+    #[test]
+    fn provider_errors_show_the_fix_or_a_condensed_message() {
+        let mut state = claude_test_state();
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "status": "failed", "error": {
+                "message": "API Error: 401 {\"error\":{\"message\":\"OAuth token has expired.\"}}",
+                "codexErrorInfo": "unauthorized"
+            } } }),
+        );
+        state.handle_notification(
+            "error",
+            &json!({ "provider": "Codex", "willRetry": false, "error": {
+                "message": "unexpected status 401 Unauthorized: {\"error\":{\"message\":\"Your refresh token has expired.\"}}",
+                "codexErrorInfo": "unauthorized"
+            } }),
+        );
+        state.handle_notification(
+            "error",
+            &json!({ "provider": "Codex", "willRetry": false, "error": {
+                "message": "stream error: {\"error\":{\"message\":\"Overloaded\"}}",
+                "codexErrorInfo": "serverOverloaded"
+            } }),
+        );
+        let bodies = state
+            .committed
+            .iter()
+            .filter(|block| matches!(block.kind, BlockKind::Error))
+            .map(|block| block.body.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bodies,
+            [
+                "Claude login expired. Run `claude auth login` in a terminal, then restart Devez Vibe.",
+                "Codex login expired. Run /login to sign in again.",
+                "stream error: Overloaded",
+            ]
+        );
     }
 
     fn safeguard_turn_completed(message: &str) -> Value {
