@@ -102,7 +102,7 @@ TUI를 띄우지 않고 실제 에이전트 동작을 확인할 때는 브리지
 - SDK는 MCP 서버를 세션 시작 뒤 비동기로 연결한다. Codex의 `mcpServer/startupStatus/updated` 같은 알림이 없고, 실패 사유는 `mcpServerStatus()`의 `failed`+`error`로만 알 수 있다. 매 턴 `system/init`의 `mcp_servers`에는 상태만 있고 오류 문구가 없다.
 - 인증이 필요하거나 만료된 서버는 `error` 없이 `needs-auth`로 온다. claude.ai 커넥터는 `scope`/`source`가 `claudeai`이며, claude.ai 설정에서만 승인할 수 있다.
 - SDK `Query`에는 MCP OAuth 메서드가 없다. DevezVibe의 Claude `/mcp login`은 `reconnectMcpServer`만 호출하며, 이 호출로 로그인이 실제로 진행되는지는 확인하지 않았다.
-- 브리지의 `watchMcpStartup`은 세션 시작 1초 뒤부터 `pending`이 없어질 때까지 상태를 조회한다. `failed`·`needs-auth` 서버는 Codex와 같은 시작 실패 알림으로 보내고, 호스트가 같은 짧은 안내로 표시한다.
+- MCP 시작 실패는 사용자 요청(2026-10-02)으로 채팅 경고를 띄우지 않고 `/mcp` 목록에만 표시한다. 1.9.36에서 브리지가 세션 시작 후 상태를 조회해 경고를 보내게 했지만, claude.ai 커넥터마다 경고가 떠서 제거했다. Claude `/mcp` 목록은 실패·인증 필요 서버를 직접 포함하므로 별도 감시가 필요 없다.
 
 ## 확인 기록
 

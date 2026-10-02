@@ -9603,12 +9603,8 @@ impl AppState {
                 ));
             }
             "mcpServer/startupStatus/updated" => {
+                // No chat warning: a failed server is listed in `/mcp` instead.
                 if let Some((name, detail)) = crate::integrations::parse_startup_failure(params) {
-                    self.committed.push(Block::new(
-                        BlockKind::Warning,
-                        format!("{name} unavailable"),
-                        detail.clone(),
-                    ));
                     // A server that never came up is absent from
                     // `mcpServerStatus/list`, so `/mcp` can only list it if the
                     // failure is remembered here.
@@ -18441,6 +18437,10 @@ mod tests {
             "name": "custom", "status": "failed", "error": "spawn failed"
         }));
         assert_eq!(state.mcp_failures.len(), 1);
+        assert!(
+            !state.committed.iter().any(|block| block.title.contains("unavailable")),
+            "startup failures stay out of the chat"
+        );
         state.handle_notification("mcpServer/startupStatus/updated", &json!({
             "name": "custom", "status": "ready", "error": null
         }));

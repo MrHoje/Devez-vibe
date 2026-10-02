@@ -172,7 +172,6 @@ impl McpServerInfo {
                     &name,
                     entry.get("error").and_then(Value::as_str),
                     None,
-                    entry.get("source").and_then(Value::as_str),
                 )
             }),
             name,
@@ -286,7 +285,6 @@ pub fn parse_startup_failure(params: &Value) -> Option<(String, String)> {
         &name,
         params.get("error").and_then(Value::as_str),
         params.get("failureReason").and_then(Value::as_str),
-        params.get("source").and_then(Value::as_str),
     );
     Some((name, detail))
 }
@@ -294,29 +292,17 @@ pub fn parse_startup_failure(params: &Value) -> Option<(String, String)> {
 /// The text shown for an MCP server that did not come up. Missing or expired
 /// credentials are the one failure the user can fix, so they get the fix rather
 /// than the raw transport error.
-fn failure_detail(
-    name: &str,
-    error: Option<&str>,
-    reason: Option<&str>,
-    source: Option<&str>,
-) -> String {
+fn failure_detail(name: &str, error: Option<&str>, reason: Option<&str>) -> String {
     // Codex tags only some expired logins, so a 401 in the error text counts too.
     let expired = reason == Some("reauthenticationRequired")
         || error.is_some_and(|error| {
             error.contains("token_expired") || error.contains("HTTP 401")
         });
-    // Claude reports a server waiting for sign-in as `needs-auth`.
-    let required = reason == Some("authenticationRequired");
     if expired && name == "codex_apps" {
         // The built-in apps server rides on the ChatGPT account token.
         "Codex login expired. Run /login to sign in again.".to_owned()
-    } else if (expired || required) && source == Some("claudeai") {
-        // claude.ai connectors are authorized on claude.ai, not from here.
-        "Authorization required. Connect it in claude.ai connector settings.".to_owned()
     } else if expired {
         format!("Authentication expired. Run /mcp login {name}")
-    } else if required {
-        format!("Authentication required. Run /mcp login {name}")
     } else {
         error.unwrap_or("MCP server failed to start.").to_owned()
     }
@@ -2476,26 +2462,6 @@ mod tests {
         }))
         .expect("failure");
         assert_eq!(detail, "Codex login expired. Run /login to sign in again.");
-
-        // Claude's signed-out servers, relayed by the bridge from `needs-auth`.
-        let (_, detail) = parse_startup_failure(&json!({
-            "name": "figma",
-            "status": "failed",
-            "failureReason": "authenticationRequired"
-        }))
-        .expect("failure");
-        assert_eq!(detail, "Authentication required. Run /mcp login figma");
-        let (_, detail) = parse_startup_failure(&json!({
-            "name": "claude.ai Notion",
-            "status": "failed",
-            "failureReason": "authenticationRequired",
-            "source": "claudeai"
-        }))
-        .expect("failure");
-        assert_eq!(
-            detail,
-            "Authorization required. Connect it in claude.ai connector settings."
-        );
 
         // Claude's `/mcp` list carries the raw error on the server itself.
         let servers = McpServerInfo::list_from_value(&json!({ "data": [{
