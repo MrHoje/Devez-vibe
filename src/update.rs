@@ -21,7 +21,7 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude가 작업 중 워크트리로 옮겨 가면 컴포저 위 브랜치 표시도 워크트리 브랜치로 바뀝니다.",
+    "Codex와 Claude에서 MCP 로그인이 만료되거나 인증이 필요하면 긴 오류 전문 대신 다시 로그인하는 방법을 짧게 안내합니다.",
 ];
 
 /// Latest published version, only when it is newer than the running build.

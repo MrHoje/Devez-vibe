@@ -1485,9 +1485,39 @@ async function createSession(params, resumeId) {
     session.model = visibleModel(capabilities.value);
   }
   session.effort = supportedEffort(capabilities, params.effort);
+  watchMcpStartup(session);
   const account = initialization.account || await safeAccount(agentQuery);
   const usage = await safeUsage(agentQuery);
   return { session, initialization, account, usage };
+}
+
+// Claude connects MCP servers in the background and reports a failure only
+// through mcpServerStatus(). Once nothing is pending, each failed or signed-out
+// server goes to the host as Codex's startup notification, so both providers
+// warn the same way. The first look waits a second so the host already knows
+// this thread when the notice arrives.
+async function watchMcpStartup(session, attempts = 30, delay = 1000) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    if (sessions.get(session.id) !== session) return;
+    let statuses;
+    try { statuses = await session.query.mcpServerStatus(); } catch { return; }
+    if (!Array.isArray(statuses)) return;
+    if (statuses.some((server) => server?.status === "pending")) continue;
+    for (const server of statuses) {
+      if (server?.status !== "failed" && server?.status !== "needs-auth") continue;
+      const source = server.source || server.scope;
+      notify("mcpServer/startupStatus/updated", {
+        threadId: session.id,
+        name: String(server.name || "MCP"),
+        status: "failed",
+        ...(server.status === "needs-auth" ? { failureReason: "authenticationRequired" } : {}),
+        ...(server.error ? { error: String(server.error) } : {}),
+        ...(source ? { source: String(source) } : {}),
+      });
+    }
+    return;
+  }
 }
 
 async function safeAccount(agentQuery) {
@@ -4251,6 +4281,39 @@ async function runSelfTest() {
   await reconnectClaudeMcp(fakeMcpSession, "disabled");
   if (reconnected.join(",") !== "connected,disabled") {
     throw new Error(`Claude MCP reconnect self-test failed: ${reconnected.join(",")}`);
+  }
+  // Startup failures wait out pending servers, then go out once each.
+  const startupPolls = [
+    [{ name: "slow", status: "pending" }],
+    [
+      { name: "ok", status: "connected" },
+      { name: "broken", status: "failed", error: "HTTP 401: token_expired" },
+      { name: "claude.ai Notion", status: "needs-auth", scope: "claudeai" },
+    ],
+  ];
+  const startupSession = {
+    id: "mcp-startup-self-test",
+    query: { mcpServerStatus: async () => startupPolls.shift() || [] },
+  };
+  sessions.set(startupSession.id, startupSession);
+  const startupNotices = [];
+  const startupWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { startupNotices.push(JSON.parse(String(chunk))); return true; };
+  try {
+    await watchMcpStartup(startupSession, 3, 0);
+  } finally {
+    process.stdout.write = startupWrite;
+    sessions.delete(startupSession.id);
+  }
+  const startupNames = startupNotices.map((notice) => notice.params?.name).join(",");
+  if (startupNames !== "broken,claude.ai Notion"
+    || startupNotices.some((notice) => notice.method !== "mcpServer/startupStatus/updated"
+      || notice.params?.threadId !== startupSession.id
+      || notice.params?.status !== "failed")
+    || startupNotices[0].params.error !== "HTTP 401: token_expired"
+    || startupNotices[1].params.failureReason !== "authenticationRequired"
+    || startupNotices[1].params.source !== "claudeai") {
+    throw new Error(`Claude MCP startup self-test failed: ${JSON.stringify(startupNotices)}`);
   }
   const user = (uuid, text) => ({
     type: "user",

@@ -129,7 +129,6 @@ impl McpServerInfo {
             .unwrap_or_default();
         tools.sort();
         Some(Self {
-            name,
             title: info
                 .and_then(|info| info.get("title"))
                 .and_then(Value::as_str)
@@ -169,12 +168,14 @@ impl McpServerInfo {
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
             failure: (entry.get("status").and_then(Value::as_str) == Some("failed")).then(|| {
-                entry
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("MCP 서버를 시작하지 못했습니다.")
-                    .to_owned()
+                failure_detail(
+                    &name,
+                    entry.get("error").and_then(Value::as_str),
+                    None,
+                    entry.get("source").and_then(Value::as_str),
+                )
             }),
+            name,
         })
     }
 
@@ -281,20 +282,44 @@ pub fn parse_startup_failure(params: &Value) -> Option<(String, String)> {
         .and_then(Value::as_str)
         .unwrap_or("MCP")
         .to_owned();
-    // Expired credentials are the one failure the user can fix from here, so it
-    // gets the actionable message rather than the raw transport error.
-    let detail = if params.get("failureReason").and_then(Value::as_str)
-        == Some("reauthenticationRequired")
-    {
-        format!("인증이 만료되었습니다. /mcp login {name}")
-    } else {
-        params
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("MCP 서버를 시작하지 못했습니다.")
-            .to_owned()
-    };
+    let detail = failure_detail(
+        &name,
+        params.get("error").and_then(Value::as_str),
+        params.get("failureReason").and_then(Value::as_str),
+        params.get("source").and_then(Value::as_str),
+    );
     Some((name, detail))
+}
+
+/// The text shown for an MCP server that did not come up. Missing or expired
+/// credentials are the one failure the user can fix, so they get the fix rather
+/// than the raw transport error.
+fn failure_detail(
+    name: &str,
+    error: Option<&str>,
+    reason: Option<&str>,
+    source: Option<&str>,
+) -> String {
+    // Codex tags only some expired logins, so a 401 in the error text counts too.
+    let expired = reason == Some("reauthenticationRequired")
+        || error.is_some_and(|error| {
+            error.contains("token_expired") || error.contains("HTTP 401")
+        });
+    // Claude reports a server waiting for sign-in as `needs-auth`.
+    let required = reason == Some("authenticationRequired");
+    if expired && name == "codex_apps" {
+        // The built-in apps server rides on the ChatGPT account token.
+        "Codex login expired. Run /login to sign in again.".to_owned()
+    } else if (expired || required) && source == Some("claudeai") {
+        // claude.ai connectors are authorized on claude.ai, not from here.
+        "Authorization required. Connect it in claude.ai connector settings.".to_owned()
+    } else if expired {
+        format!("Authentication expired. Run /mcp login {name}")
+    } else if required {
+        format!("Authentication required. Run /mcp login {name}")
+    } else {
+        error.unwrap_or("MCP server failed to start.").to_owned()
+    }
 }
 
 pub enum McpPickerResult {
@@ -517,7 +542,7 @@ impl McpPicker {
             .iter_mut()
             .find(|server| server.name.eq_ignore_ascii_case(name))
         {
-            server.failure = Some(detail.unwrap_or_else(|| "시작하지 못했습니다.".to_owned()));
+            server.failure = Some(detail.unwrap_or_else(|| "MCP server failed to start.".to_owned()));
         }
     }
 
@@ -2442,6 +2467,46 @@ mod tests {
         .expect("failure");
         assert_eq!(name, "github");
         assert!(detail.contains("/mcp login github"));
+
+        // An untagged 401 from the ChatGPT-backed apps server points at /login.
+        let (_, detail) = parse_startup_failure(&json!({
+            "name": "codex_apps",
+            "status": "failed",
+            "error": "MCP startup failed: unexpected server response: HTTP 401: {\"code\": \"token_expired\"}"
+        }))
+        .expect("failure");
+        assert_eq!(detail, "Codex login expired. Run /login to sign in again.");
+
+        // Claude's signed-out servers, relayed by the bridge from `needs-auth`.
+        let (_, detail) = parse_startup_failure(&json!({
+            "name": "figma",
+            "status": "failed",
+            "failureReason": "authenticationRequired"
+        }))
+        .expect("failure");
+        assert_eq!(detail, "Authentication required. Run /mcp login figma");
+        let (_, detail) = parse_startup_failure(&json!({
+            "name": "claude.ai Notion",
+            "status": "failed",
+            "failureReason": "authenticationRequired",
+            "source": "claudeai"
+        }))
+        .expect("failure");
+        assert_eq!(
+            detail,
+            "Authorization required. Connect it in claude.ai connector settings."
+        );
+
+        // Claude's `/mcp` list carries the raw error on the server itself.
+        let servers = McpServerInfo::list_from_value(&json!({ "data": [{
+            "name": "linear",
+            "status": "failed",
+            "error": "Streamable HTTP error: HTTP 401: {\"code\": \"token_expired\"}"
+        }]}));
+        assert_eq!(
+            servers[0].failure.as_deref(),
+            Some("Authentication expired. Run /mcp login linear")
+        );
 
         assert!(parse_startup_failure(&json!({ "name": "github", "status": "running" })).is_none());
         assert!(parse_startup_failure(&json!({ "unrelated": true })).is_none());

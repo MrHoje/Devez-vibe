@@ -97,6 +97,13 @@ TUI를 띄우지 않고 실제 에이전트 동작을 확인할 때는 브리지
 - 워크트리에 들어간 뒤 세션 기록은 `~/.claude/projects/<워크트리 경로>/`에 저장된다. 세션 ID로 기록을 찾을 때는 원래 프로젝트 폴더만 보지 않는다.
 - Codex·OpenCode에는 대화의 작업 폴더를 옮기는 모델 도구가 없다. 모델이 셸로 워크트리를 만들면 명령별 작업 폴더만 달라지므로 브랜치 표시를 따라가게 할 신호가 없다.
 
+## MCP 시작 실패와 인증
+
+- SDK는 MCP 서버를 세션 시작 뒤 비동기로 연결한다. Codex의 `mcpServer/startupStatus/updated` 같은 알림이 없고, 실패 사유는 `mcpServerStatus()`의 `failed`+`error`로만 알 수 있다. 매 턴 `system/init`의 `mcp_servers`에는 상태만 있고 오류 문구가 없다.
+- 인증이 필요하거나 만료된 서버는 `error` 없이 `needs-auth`로 온다. claude.ai 커넥터는 `scope`/`source`가 `claudeai`이며, claude.ai 설정에서만 승인할 수 있다.
+- SDK `Query`에는 MCP OAuth 메서드가 없다. DevezVibe의 Claude `/mcp login`은 `reconnectMcpServer`만 호출하며, 이 호출로 로그인이 실제로 진행되는지는 확인하지 않았다.
+- 브리지의 `watchMcpStartup`은 세션 시작 1초 뒤부터 `pending`이 없어질 때까지 상태를 조회한다. `failed`·`needs-auth` 서버는 Codex와 같은 시작 실패 알림으로 보내고, 호스트가 같은 짧은 안내로 표시한다.
+
 ## 확인 기록
 
 ### 2026-09-10 사용량 한도 자동 재개 — 1.8.22 배포
