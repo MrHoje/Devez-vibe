@@ -11,6 +11,8 @@ use std::{
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
+use crate::language::tr;
+
 /// npm package that publishes the `dvz` binary.
 const PACKAGE: &str = "devez-vibe";
 /// Registry lookups are cached so startup stays offline-friendly.
@@ -24,6 +26,18 @@ pub const RELEASE_NOTES: &[&str] = &[
     "Codex와 Claude에서 MCP 로그인이 만료되거나 인증이 필요하면 긴 오류 전문 대신 다시 로그인하는 방법을 짧게 안내합니다.",
     "Codex·Claude 응답 오류와 로그인·MCP 오류를 긴 원문 대신 핵심 문구로 줄여 보여주고, 로그인이 만료되면 다시 로그인하는 방법을 안내합니다.",
 ];
+
+/// The same notes, line for line, for `/language english`.
+pub const RELEASE_NOTES_EN: &[&str] = &[
+    "When an MCP login in Codex or Claude expires or needs authentication, a short sign-in hint replaces the full error.",
+    "Codex and Claude response, login, and MCP errors show a condensed message instead of the raw text, with sign-in steps when the login has expired.",
+];
+
+const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");
+
+pub fn release_notes() -> &'static [&'static str] {
+    tr(RELEASE_NOTES, RELEASE_NOTES_EN)
+}
 
 /// Latest published version, only when it is newer than the running build.
 pub async fn check_for_update() -> Option<String> {
@@ -54,7 +68,8 @@ pub fn run_self_update() -> Result<()> {
         std::process::id(),
         now_secs()
     ));
-    fs::create_dir_all(&stage_path).context("업데이트 임시 폴더를 만들지 못했습니다.")?;
+    fs::create_dir_all(&stage_path)
+        .context(tr("업데이트 임시 폴더를 만들지 못했습니다.", "Couldn't create the update staging folder."))?;
 
     let result = install_update(&stage_path);
     let _ = fs::remove_dir_all(&stage_path);
@@ -67,7 +82,7 @@ fn install_update(stage_path: &PathBuf) -> Result<()> {
     let staged = run_npm_with_progress(
         stage_path,
         "download",
-        "새 버전 다운로드와 무결성 검사",
+        tr("새 버전 다운로드와 무결성 검사", "Downloading and verifying the new version"),
         &[
             "install",
             "--prefix",
@@ -80,7 +95,10 @@ fn install_update(stage_path: &PathBuf) -> Result<()> {
         ],
     )?;
     if !staged {
-        anyhow::bail!("새 버전을 내려받지 못해 기존 설치를 유지합니다.");
+        anyhow::bail!(tr(
+            "새 버전을 내려받지 못해 기존 설치를 유지합니다.",
+            "Couldn't download the new version, so the current install stays.",
+        ));
     }
 
     let staged_exe = stage_path
@@ -91,24 +109,39 @@ fn install_update(stage_path: &PathBuf) -> Result<()> {
     let version = Command::new(&staged_exe)
         .arg("--version")
         .output()
-        .context("내려받은 실행 파일을 실행하지 못해 기존 설치를 유지합니다.")?;
+        .context(tr(
+            "내려받은 실행 파일을 실행하지 못해 기존 설치를 유지합니다.",
+            "Couldn't run the downloaded executable, so the current install stays.",
+        ))?;
     if !version.status.success() {
-        anyhow::bail!("내려받은 실행 파일을 검증하지 못해 기존 설치를 유지합니다.");
+        anyhow::bail!(tr(
+            "내려받은 실행 파일을 검증하지 못해 기존 설치를 유지합니다.",
+            "Couldn't verify the downloaded executable, so the current install stays.",
+        ));
     }
     let latest = executable_version(&version.stdout)
         .filter(|candidate| parse_version(candidate).is_some())
-        .context("내려받은 실행 파일의 버전을 확인하지 못해 기존 설치를 유지합니다.")?;
+        .context(tr(
+            "내려받은 실행 파일의 버전을 확인하지 못해 기존 설치를 유지합니다.",
+            "Couldn't read the downloaded executable's version, so the current install stays.",
+        ))?;
     if latest != CURRENT_VERSION && !is_newer(latest, CURRENT_VERSION) {
-        println!("현재 v{CURRENT_VERSION}이 게시된 v{latest}보다 최신이므로 변경하지 않습니다.");
+        println!(
+            "{}",
+            tr(
+                format!("현재 v{CURRENT_VERSION}이 게시된 v{latest}보다 최신이므로 변경하지 않습니다."),
+                format!("The running v{CURRENT_VERSION} is newer than the published v{latest}, so nothing changes."),
+            )
+        );
         return Ok(());
     }
     println!("Devez Vibe v{CURRENT_VERSION} → v{latest}");
 
-    println!("완료: 실행 파일 검증");
+    println!("{}", tr("완료: 실행 파일 검증", "Done: executable verified"));
     let configured = run_npm_with_progress(
         stage_path,
         "configure",
-        "구성 요소 설치",
+        tr("구성 요소 설치", "Installing components"),
         &[
             "rebuild",
             "--prefix",
@@ -119,7 +152,10 @@ fn install_update(stage_path: &PathBuf) -> Result<()> {
         ],
     )?;
     if !configured {
-        anyhow::bail!("구성 요소를 설치하지 못해 기존 버전을 유지합니다.");
+        anyhow::bail!(tr(
+            "구성 요소를 설치하지 못해 기존 버전을 유지합니다.",
+            "Couldn't install the components, so the current version stays.",
+        ));
     }
 
     let version_root = managed_version_root(latest)?;
@@ -133,20 +169,35 @@ fn install_update(stage_path: &PathBuf) -> Result<()> {
         if !existing.is_ok_and(|output| {
             output.status.success() && executable_version(&output.stdout) == Some(latest)
         }) {
-            anyhow::bail!("기존 업데이트 파일이 손상되어 현재 버전을 유지합니다: {}", version_root.display());
+            let root = version_root.display();
+            anyhow::bail!(tr(
+                format!("기존 업데이트 파일이 손상되어 현재 버전을 유지합니다: {root}"),
+                format!("The existing update files are damaged, so the current version stays: {root}"),
+            ));
         }
     } else {
-        fs::create_dir_all(version_root.parent().context("버전 저장 경로가 올바르지 않습니다.")?)
-            .context("버전 저장 폴더를 만들지 못했습니다.")?;
-        fs::rename(stage_path, &version_root).context("검증된 버전을 저장하지 못했습니다.")?;
+        fs::create_dir_all(
+            version_root
+                .parent()
+                .context(tr("버전 저장 경로가 올바르지 않습니다.", "The version storage path is invalid."))?,
+        )
+        .context(tr("버전 저장 폴더를 만들지 못했습니다.", "Couldn't create the version storage folder."))?;
+        fs::rename(stage_path, &version_root)
+            .context(tr("검증된 버전을 저장하지 못했습니다.", "Couldn't store the verified version."))?;
     }
 
     activate_version(&managed_exe)?;
     if let Some(versions) = version_root.parent() {
         prune_versions(versions, &[latest, CURRENT_VERSION]);
     }
-    println!("완료: 다음 실행 버전 전환");
-    println!("Devez Vibe v{latest} 설치를 마쳤습니다. 새로 실행하는 세션부터 적용됩니다.");
+    println!("{}", tr("완료: 다음 실행 버전 전환", "Done: switched the version for the next launch"));
+    println!(
+        "{}",
+        tr(
+            format!("Devez Vibe v{latest} 설치를 마쳤습니다. 새로 실행하는 세션부터 적용됩니다."),
+            format!("Installed Devez Vibe v{latest}. It applies to sessions started from now on."),
+        )
+    );
     Ok(())
 }
 
@@ -164,7 +215,10 @@ fn npm_command() -> Command {
 
 fn managed_version_root(version: &str) -> Result<PathBuf> {
     let local_app_data = env::var_os("LOCALAPPDATA")
-        .context("LOCALAPPDATA 환경변수를 찾지 못해 업데이트를 저장할 수 없습니다.")?;
+        .context(tr(
+            "LOCALAPPDATA 환경변수를 찾지 못해 업데이트를 저장할 수 없습니다.",
+            "Can't store the update because the LOCALAPPDATA variable is missing.",
+        ))?;
     Ok(PathBuf::from(local_app_data)
         .join("DevezVibe")
         .join("versions")
@@ -190,24 +244,31 @@ fn activate_version(executable: &PathBuf) -> Result<()> {
     let pointer = executable
         .ancestors()
         .find(|path| path.file_name().is_some_and(|name| name == "DevezVibe"))
-        .context("업데이트 실행 파일의 저장 경로가 올바르지 않습니다.")?
+        .context(tr(
+            "업데이트 실행 파일의 저장 경로가 올바르지 않습니다.",
+            "The update executable's storage path is invalid.",
+        ))?
         .join("current-executable.txt");
     let temporary = pointer.with_extension(format!("{}.tmp", std::process::id()));
     let backup = pointer.with_extension("bak");
 
-    let mut file = File::create(&temporary).context("버전 전환 파일을 만들지 못했습니다.")?;
-    writeln!(file, "{}", executable.display()).context("버전 전환 파일을 쓰지 못했습니다.")?;
-    file.sync_all().context("버전 전환 파일을 저장하지 못했습니다.")?;
+    let mut file = File::create(&temporary)
+        .context(tr("버전 전환 파일을 만들지 못했습니다.", "Couldn't create the version switch file."))?;
+    writeln!(file, "{}", executable.display())
+        .context(tr("버전 전환 파일을 쓰지 못했습니다.", "Couldn't write the version switch file."))?;
+    file.sync_all()
+        .context(tr("버전 전환 파일을 저장하지 못했습니다.", "Couldn't save the version switch file."))?;
 
     if pointer.exists() {
         let _ = fs::remove_file(&backup);
-        fs::rename(&pointer, &backup).context("현재 버전 정보를 백업하지 못했습니다.")?;
+        fs::rename(&pointer, &backup)
+            .context(tr("현재 버전 정보를 백업하지 못했습니다.", "Couldn't back up the current version record."))?;
     }
     if let Err(error) = fs::rename(&temporary, &pointer) {
         if backup.exists() {
             let _ = fs::rename(&backup, &pointer);
         }
-        return Err(error).context("새 버전을 활성화하지 못했습니다.");
+        return Err(error).context(tr("새 버전을 활성화하지 못했습니다.", "Couldn't activate the new version."));
     }
     let _ = fs::remove_file(backup);
     Ok(())
@@ -220,46 +281,53 @@ fn run_npm_with_progress(
     args: &[&str],
 ) -> Result<bool> {
     let log_path = stage_path.join(format!("npm-{log_name}.log"));
-    let log = File::create(&log_path).context("업데이트 로그를 만들지 못했습니다.")?;
+    let log = File::create(&log_path).context(tr("업데이트 로그를 만들지 못했습니다.", "Couldn't create the update log."))?;
     let mut command = npm_command();
     command
         .args(args)
         .stdout(Stdio::from(
-            log.try_clone().context("업데이트 로그를 열지 못했습니다.")?,
+            log.try_clone().context(tr("업데이트 로그를 열지 못했습니다.", "Couldn't open the update log."))?,
         ))
         .stderr(Stdio::from(log));
     let mut child = command
         .spawn()
-        .context("npm을 실행하지 못했습니다. Node.js와 npm 설치를 확인하세요.")?;
+        .context(tr(
+            "npm을 실행하지 못했습니다. Node.js와 npm 설치를 확인하세요.",
+            "Couldn't run npm. Check that Node.js and npm are installed.",
+        ))?;
 
     let interactive = io::stdout().is_terminal();
     let frames = ['|', '/', '-', '\\'];
     let mut frame = 0;
     loop {
-        if let Some(status) = child.try_wait().context("npm 실행 상태를 확인하지 못했습니다.")? {
+        if let Some(status) =
+            child.try_wait().context(tr("npm 실행 상태를 확인하지 못했습니다.", "Couldn't check the npm run status."))?
+        {
             if interactive {
                 print!("\r");
             }
             if status.success() {
-                println!("완료: {label}");
+                println!("{}", tr(format!("완료: {label}"), format!("Done: {label}")));
                 let _ = fs::remove_file(&log_path);
                 return Ok(true);
             }
-            println!("실패: {label}");
+            println!("{}", tr(format!("실패: {label}"), format!("Failed: {label}")));
             if let Ok(details) = fs::read_to_string(&log_path)
                 && !details.trim().is_empty()
             {
-                eprintln!("오류 상세:\n{}", details.trim());
+                eprintln!("{}\n{}", tr("오류 상세:", "Error details:"), details.trim());
             }
             return Ok(false);
         }
 
         if interactive {
-            print!("\r진행 중: {label} {}", frames[frame % frames.len()]);
-            io::stdout().flush().context("진행 상태를 표시하지 못했습니다.")?;
+            print!("\r{}: {label} {}", tr("진행 중", "In progress"), frames[frame % frames.len()]);
+            io::stdout()
+                .flush()
+                .context(tr("진행 상태를 표시하지 못했습니다.", "Couldn't show the progress."))?;
             frame += 1;
         } else if frame == 0 {
-            println!("진행 중: {label}");
+            println!("{}: {label}", tr("진행 중", "In progress"));
             frame = 1;
         }
         thread::sleep(Duration::from_millis(100));

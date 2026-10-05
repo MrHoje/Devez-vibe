@@ -17,7 +17,10 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use crate::role_guides::{self, Guide};
+use crate::{
+    language::tr,
+    role_guides::{self, Guide},
+};
 
 /// Which role the next turn is sent under.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -98,16 +101,33 @@ impl AgentMode {
         }
     }
 
-    /// One line for the picker.
+    /// One line for the picker. A custom role's own `detail` is shown as written.
     pub fn detail(self) -> &'static str {
         match self {
-            Self::Standard => "Handles everyday development work flexibly.",
-            Self::Planner => "Builds an implementation plan through a careful requirements interview.",
-            Self::GoalRunner => "Sets a goal and carries it through to completion.",
-            Self::Reviewer => "Reviews changes and plans with evidence, giving severity and a verdict.",
-            Self::Researcher => "Researches multiple sources in depth and reports evidence and limits.",
-            Self::Custom(index) => custom_role(index)
-                .map_or("A user-defined role.", |role| role.detail.as_str()),
+            Self::Standard => tr(
+                "일상적인 개발 작업을 유연하게 처리합니다.",
+                "Handles everyday development work flexibly.",
+            ),
+            Self::Planner => tr(
+                "꼼꼼한 요구 사항 인터뷰로 구현 계획을 세웁니다.",
+                "Builds an implementation plan through a careful requirements interview.",
+            ),
+            Self::GoalRunner => tr(
+                "목표를 정하고 완료될 때까지 이어서 진행합니다.",
+                "Sets a goal and carries it through to completion.",
+            ),
+            Self::Reviewer => tr(
+                "변경과 계획을 근거로 검토하고 심각도와 판정을 냅니다.",
+                "Reviews changes and plans with evidence, giving severity and a verdict.",
+            ),
+            Self::Researcher => tr(
+                "여러 출처를 깊이 조사하고 근거와 한계를 보고합니다.",
+                "Researches multiple sources in depth and reports evidence and limits.",
+            ),
+            Self::Custom(index) => match custom_role(index) {
+                Some(role) if !role.detail.is_empty() => role.detail.as_str(),
+                _ => tr("사용자가 정의한 역할입니다.", "A user-defined role."),
+            },
         }
     }
 
@@ -271,9 +291,8 @@ fn parse_custom_role(id: &str, stem: &str, text: &str) -> Option<CustomRole> {
     Some(CustomRole {
         id: id.to_owned(),
         label: front_value(front, "label").unwrap_or(stem).to_owned(),
-        detail: front_value(front, "detail")
-            .unwrap_or("사용자가 정의한 역할입니다.")
-            .to_owned(),
+        // Empty falls back to a description in the screen language at display time.
+        detail: front_value(front, "detail").unwrap_or_default().to_owned(),
         prompt: prompt.to_owned(),
     })
 }

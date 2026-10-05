@@ -20,7 +20,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::app_server::ServerEvent;
+use crate::{app_server::ServerEvent, language::tr};
 
 type PendingResponse = oneshot::Sender<Result<Value, String>>;
 type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
@@ -92,13 +92,17 @@ impl ClaudeClient {
         match timeout(REQUEST_TIMEOUT, response_rx).await {
             Ok(Ok(Ok(result))) => Ok(result),
             Ok(Ok(Err(error))) => bail!("{method}: {error}"),
-            Ok(Err(_)) => bail!("{method}: Claude SDK 응답 채널이 종료되었습니다."),
+            Ok(Err(_)) => bail!(tr(
+                format!("{method}: Claude SDK 응답 채널이 종료되었습니다."),
+                format!("{method}: the Claude SDK response channel closed."),
+            )),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
-                bail!(
-                    "{method}: Claude SDK 브리지가 {}분 동안 응답하지 않아 요청을 중단했습니다.",
-                    REQUEST_TIMEOUT.as_secs() / 60
-                )
+                let minutes = REQUEST_TIMEOUT.as_secs() / 60;
+                bail!(tr(
+                    format!("{method}: Claude SDK 브리지가 {minutes}분 동안 응답하지 않아 요청을 중단했습니다."),
+                    format!("{method}: stopped the request because the Claude SDK bridge didn't answer for {minutes} minutes."),
+                ))
             }
         }
     }
@@ -150,15 +154,16 @@ impl ClaudeClient {
             .stderr(Stdio::piped());
         crate::child_process::isolate_backend(&mut command);
         let mut child = command.spawn().with_context(|| {
-            format!(
-                "Claude Agent SDK 브리지를 시작하지 못했습니다: {}",
-                self.bridge_path.display()
+            let bridge = self.bridge_path.display();
+            tr(
+                format!("Claude Agent SDK 브리지를 시작하지 못했습니다: {bridge}"),
+                format!("Couldn't start the Claude Agent SDK bridge: {bridge}"),
             )
         })?;
         let job = crate::child_process::adopt_backend(&child);
-        let stdin = child.stdin.take().context("Claude SDK stdin 연결 실패")?;
-        let stdout = child.stdout.take().context("Claude SDK stdout 연결 실패")?;
-        let stderr = child.stderr.take().context("Claude SDK stderr 연결 실패")?;
+        let stdin = child.stdin.take().context(tr("Claude SDK stdin 연결 실패", "Claude SDK stdin connection failed"))?;
+        let stdout = child.stdout.take().context(tr("Claude SDK stdout 연결 실패", "Claude SDK stdout connection failed"))?;
+        let stderr = child.stderr.take().context(tr("Claude SDK stderr 연결 실패", "Claude SDK stderr connection failed"))?;
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Value>();
         *self.outbound.lock().expect("Claude outbound mutex") = Some(outbound_tx);
         let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(20)));
@@ -191,8 +196,9 @@ impl ClaudeClient {
                             route_message(message, &reader_pending, &reader_events).await
                         }
                         Err(error) => {
-                            let _ = reader_events.send(ServerEvent::ProtocolWarning(format!(
-                                "Claude SDK JSON 해석 실패: {error}"
+                            let _ = reader_events.send(ServerEvent::ProtocolWarning(tr(
+                                format!("Claude SDK JSON 해석 실패: {error}"),
+                                format!("Couldn't parse Claude SDK JSON: {error}"),
                             )));
                             // A malformed question used to be discarded here, leaving
                             // Claude blocked forever while the user never saw a dialog.
@@ -217,8 +223,9 @@ impl ClaudeClient {
                     },
                     Ok(None) => break,
                     Err(error) => {
-                        let _ = reader_events.send(ServerEvent::ProtocolWarning(format!(
-                            "Claude SDK 출력 읽기 실패: {error}"
+                        let _ = reader_events.send(ServerEvent::ProtocolWarning(tr(
+                            format!("Claude SDK 출력 읽기 실패: {error}"),
+                            format!("Couldn't read Claude SDK output: {error}"),
                         )));
                         break;
                     }
@@ -229,13 +236,14 @@ impl ClaudeClient {
                 .expect("Claude outbound mutex")
                 .take();
             let tail = reader_tail.lock().await;
+            let closed = tr(
+                "Claude Agent SDK 브리지 연결이 종료되었습니다.",
+                "The Claude Agent SDK bridge connection closed.",
+            );
             let detail = if tail.is_empty() {
-                "Claude Agent SDK 브리지 연결이 종료되었습니다.".to_owned()
+                closed.to_owned()
             } else {
-                format!(
-                    "Claude Agent SDK 브리지 연결이 종료되었습니다.\n{}",
-                    tail.iter().cloned().collect::<Vec<_>>().join("\n")
-                )
+                format!("{closed}\n{}", tail.iter().cloned().collect::<Vec<_>>().join("\n"))
             };
             drop(tail);
             for (_, sender) in reader_pending.lock().await.drain() {
@@ -271,9 +279,16 @@ impl ClaudeClient {
             .lock()
             .expect("Claude outbound mutex")
             .as_ref()
-            .ok_or_else(|| anyhow!("Claude SDK 브리지가 시작되지 않았거나 종료되었습니다."))?
+            .ok_or_else(|| {
+                anyhow!(tr(
+                    "Claude SDK 브리지가 시작되지 않았거나 종료되었습니다.",
+                    "The Claude SDK bridge hasn't started or has exited.",
+                ))
+            })?
             .send(message)
-            .map_err(|_| anyhow!("Claude SDK 브리지에 메시지를 보낼 수 없습니다."))
+            .map_err(|_| {
+                anyhow!(tr("Claude SDK 브리지에 메시지를 보낼 수 없습니다.", "Can't send a message to the Claude SDK bridge."))
+            })
     }
 }
 
@@ -439,7 +454,7 @@ fn claude_model(id: &str, display_name: &str, efforts: Value, is_default: bool) 
 fn claude_request_id(id: &Value) -> Result<&Value> {
     id.get("id")
         .filter(|_| is_claude_request_id(id))
-        .context("Claude 사용자 입력 요청 id가 올바르지 않습니다.")
+        .context(tr("Claude 사용자 입력 요청 id가 올바르지 않습니다.", "The Claude user input request id is invalid."))
 }
 
 /// The bridge writes host request ids before the request payload. When a
@@ -477,7 +492,8 @@ async fn route_message(
     }
     let Some(method) = message.get("method").and_then(Value::as_str) else {
         let _ = events.send(ServerEvent::ProtocolWarning(
-            "method 없는 Claude SDK 메시지를 무시했습니다.".to_owned(),
+            tr("method 없는 Claude SDK 메시지를 무시했습니다.", "Ignored a Claude SDK message without a method.")
+                .to_owned(),
         ));
         return;
     };
@@ -503,7 +519,7 @@ fn format_rpc_error(error: &Value) -> String {
     let message = error
         .get("message")
         .and_then(Value::as_str)
-        .unwrap_or("알 수 없는 Claude SDK 오류");
+        .unwrap_or(tr("알 수 없는 Claude SDK 오류", "Unknown Claude SDK error"));
     match error.get("code").and_then(Value::as_i64) {
         Some(code) => format!("{message} ({code})"),
         None => message.to_owned(),
@@ -540,7 +556,7 @@ pub(crate) fn resolve_bridge_path(cwd: &Path) -> Result<PathBuf> {
     candidates
         .into_iter()
         .find(|path| path.is_file())
-        .context("Claude Agent SDK 브리지 파일을 찾을 수 없습니다.")
+        .context(tr("Claude Agent SDK 브리지 파일을 찾을 수 없습니다.", "Can't find the Claude Agent SDK bridge file."))
 }
 
 fn resolve_command(command: &Path) -> PathBuf {

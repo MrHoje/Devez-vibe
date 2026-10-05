@@ -11,6 +11,7 @@ use serde_json::Value;
 use crate::terminal_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::editor::Editor;
+use crate::language::tr;
 use crate::renderer::{
     IntegrationItemState, IntegrationItemView, OverlayLine, OverlayStyle, OverlayView,
     visible_window,
@@ -304,7 +305,9 @@ fn failure_detail(name: &str, error: Option<&str>, reason: Option<&str>) -> Stri
     } else if expired {
         format!("Authentication expired. Run /mcp login {name}")
     } else {
-        crate::app_server::condense_error_message(error.unwrap_or("MCP server failed to start."))
+        crate::app_server::condense_error_message(
+            error.unwrap_or(tr("MCP 서버를 시작하지 못했습니다.", "MCP server failed to start.")),
+        )
     }
 }
 
@@ -471,7 +474,10 @@ impl McpPicker {
         match self.selected_server() {
             Some(server) if server.needs_login() => McpPickerResult::Login(server.name.clone()),
             Some(_) => {
-                self.notice = Some("이 서버는 OAuth 로그인이 필요하지 않습니다.".to_owned());
+                self.notice = Some(
+                    tr("이 서버는 OAuth 로그인이 필요하지 않습니다.", "This server doesn't need an OAuth sign-in.")
+                        .to_owned(),
+                );
                 McpPickerResult::None
             }
             None => McpPickerResult::None,
@@ -528,7 +534,9 @@ impl McpPicker {
             .iter_mut()
             .find(|server| server.name.eq_ignore_ascii_case(name))
         {
-            server.failure = Some(detail.unwrap_or_else(|| "MCP server failed to start.".to_owned()));
+            server.failure = Some(detail.unwrap_or_else(|| {
+                tr("MCP 서버를 시작하지 못했습니다.", "MCP server failed to start.").to_owned()
+            }));
         }
     }
 
@@ -586,9 +594,9 @@ impl McpPicker {
         if lines.is_empty() {
             lines.push(OverlayLine {
                 text: if self.servers.is_empty() {
-                    "연결된 MCP 서버가 없습니다.".to_owned()
+                    tr("연결된 MCP 서버가 없습니다.", "No MCP servers are connected.").to_owned()
                 } else {
-                    "검색 결과가 없습니다.".to_owned()
+                    tr("검색 결과가 없습니다.", "No search results.").to_owned()
                 },
                 selected: false,
                 muted: true,
@@ -617,7 +625,7 @@ impl McpPicker {
                 closable: false,
                 title: "MCP server".to_owned(),
                 lines: vec![OverlayLine {
-                    text: "서버를 찾을 수 없습니다.".to_owned(),
+                    text: tr("서버를 찾을 수 없습니다.", "Can't find the server.").to_owned(),
                     selected: false,
                     muted: true,
                 }],
@@ -644,10 +652,10 @@ impl McpPicker {
         }
         if let Some(error) = server.tools_error.as_deref() {
             lines.push(OverlayLine {
-                text: format!(
-                    "도구 조회 오류: {}",
-                    crate::app_server::condense_error_message(error)
-                ),
+                text: {
+                    let error = crate::app_server::condense_error_message(error);
+                    tr(format!("도구 조회 오류: {error}"), format!("Tool lookup error: {error}"))
+                },
                 selected: false,
                 muted: false,
             });
@@ -692,7 +700,7 @@ impl McpPicker {
         });
         lines.push(OverlayLine {
             text: if server.tools_error.is_some() {
-                "도구 목록을 조회하지 못했습니다.".to_owned()
+                tr("도구 목록을 조회하지 못했습니다.", "Couldn't look up the tool list.").to_owned()
             } else {
                 format!("Tools ({})", server.tools.len())
             },
@@ -701,7 +709,7 @@ impl McpPicker {
         });
         if server.tools.is_empty() && server.tools_error.is_none() {
             lines.push(OverlayLine {
-                text: "  이 서버는 도구를 제공하지 않습니다.".to_owned(),
+                text: tr("  이 서버는 도구를 제공하지 않습니다.", "  This server provides no tools.").to_owned(),
                 selected: false,
                 muted: true,
             });
@@ -898,7 +906,13 @@ impl PluginInfo {
             lines.push(format!("Terms: {url}"));
         }
         if self.must_show_interstitial.is_none() {
-            lines.push("설치 확인 정책이 제공되지 않아 안전하게 확인을 요구합니다.".to_owned());
+            lines.push(
+                tr(
+                    "설치 확인 정책이 제공되지 않아 안전하게 확인을 요구합니다.",
+                    "No install confirmation policy was provided, so confirmation is required to stay safe.",
+                )
+                .to_owned(),
+            );
         }
         lines
     }
@@ -999,7 +1013,7 @@ impl PluginCatalog {
                         .get("message")
                         .or_else(|| error.get("error"))
                         .and_then(Value::as_str)
-                        .unwrap_or("불러오지 못했습니다.");
+                        .unwrap_or(tr("불러오지 못했습니다.", "Failed to load."));
                     format!("{name}: {message}")
                 })
                 .collect(),
@@ -1370,7 +1384,7 @@ impl PluginPicker {
             KeyCode::Char('o') => match plugin.website_url.clone() {
                 Some(url) => PluginPickerResult::OpenUrl(url),
                 None => {
-                    self.notice = Some("웹사이트 정보가 없습니다.".to_owned());
+                    self.notice = Some(tr("웹사이트 정보가 없습니다.", "There is no website for it.").to_owned());
                     PluginPickerResult::None
                 }
             },
@@ -1393,11 +1407,11 @@ impl PluginPicker {
 
     fn install(&mut self, plugin: PluginInfo) -> PluginPickerResult {
         if plugin.installed {
-            self.notice = Some("이미 설치되어 있습니다.".to_owned());
+            self.notice = Some(tr("이미 설치되어 있습니다.", "Already installed.").to_owned());
             return PluginPickerResult::None;
         }
         if !plugin.available {
-            self.notice = Some("관리자 정책으로 설치할 수 없습니다.".to_owned());
+            self.notice = Some(tr("관리자 정책으로 설치할 수 없습니다.", "An admin policy blocks installing it.").to_owned());
             return PluginPickerResult::None;
         }
         PluginPickerResult::Install(Box::new(plugin))
@@ -1405,11 +1419,14 @@ impl PluginPicker {
 
     fn uninstall(&mut self, plugin: PluginInfo) -> PluginPickerResult {
         if !plugin.installed {
-            self.notice = Some("설치되지 않은 플러그인입니다.".to_owned());
+            self.notice = Some(tr("설치되지 않은 플러그인입니다.", "This plugin isn't installed.").to_owned());
             return PluginPickerResult::None;
         }
         if !plugin.uninstall_allowed {
-            self.notice = Some("관리자가 설치한 플러그인은 제거할 수 없습니다.".to_owned());
+            self.notice = Some(
+                tr("관리자가 설치한 플러그인은 제거할 수 없습니다.", "Plugins an admin installed can't be removed.")
+                    .to_owned(),
+            );
             return PluginPickerResult::None;
         }
         PluginPickerResult::Uninstall(Box::new(plugin))
@@ -1417,18 +1434,24 @@ impl PluginPicker {
 
     fn set_enabled(&mut self, plugin: PluginInfo, enabled: bool) -> PluginPickerResult {
         if !plugin.installed {
-            self.notice = Some("먼저 설치하세요. (i)".to_owned());
+            self.notice = Some(tr("먼저 설치하세요. (i)", "Install it first. (i)").to_owned());
             return PluginPickerResult::None;
         }
         if !plugin.toggle_allowed {
-            self.notice = Some("관리자 정책으로 관리되는 플러그인입니다.".to_owned());
+            self.notice = Some(
+                tr("관리자 정책으로 관리되는 플러그인입니다.", "An admin policy manages this plugin.").to_owned(),
+            );
             return PluginPickerResult::None;
         }
         if plugin.enabled == enabled {
-            self.notice = Some(format!(
-                "이미 {}되어 있습니다.",
-                if enabled { "활성화" } else { "비활성화" }
-            ));
+            self.notice = Some(
+                if enabled {
+                    tr("이미 활성화되어 있습니다.", "Already enabled.")
+                } else {
+                    tr("이미 비활성화되어 있습니다.", "Already disabled.")
+                }
+                .to_owned(),
+            );
             return PluginPickerResult::None;
         }
         PluginPickerResult::SetEnabled {
@@ -1563,7 +1586,10 @@ impl PluginPicker {
                             None => name.clone(),
                         }
                     }
-                    ScopeRow::Marketplaces => management_row("Marketplaces", "Add, remove, or refresh sources"),
+                    ScopeRow::Marketplaces => management_row(
+                        "Marketplaces",
+                        tr("소스 추가·제거·새로 고침", "Add, remove, or refresh sources"),
+                    ),
                 };
                 OverlayLine {
                     text,
@@ -1585,7 +1611,7 @@ impl PluginPicker {
                     self.catalog
                         .load_errors
                         .first()
-                        .map(|error| format!("오류 · {error}"))
+                        .map(|error| tr(format!("오류 · {error}"), format!("Error · {error}")))
                 })
                 .unwrap_or_else(|| {
                     "Move ↑↓  ·  Open Enter  ·  Marketplaces M  ·  Close Esc".to_owned()
@@ -1627,9 +1653,9 @@ impl PluginPicker {
         if lines.is_empty() {
             lines.push(OverlayLine {
                 text: if self.query.is_empty() {
-                    "플러그인이 없습니다.".to_owned()
+                    tr("플러그인이 없습니다.", "No plugins.").to_owned()
                 } else {
-                    "검색 결과가 없습니다.".to_owned()
+                    tr("검색 결과가 없습니다.", "No search results.").to_owned()
                 },
                 selected: false,
                 muted: true,
@@ -1770,7 +1796,7 @@ impl PluginPicker {
             }
             if !listed {
                 lines.push(OverlayLine {
-                    text: "  (없음)".to_owned(),
+                    text: tr("  (없음)", "  (none)").to_owned(),
                     selected: false,
                     muted: true,
                 });
@@ -1785,7 +1811,7 @@ impl PluginPicker {
                 closable: false,
                 title: "Plugin".to_owned(),
                 lines: vec![OverlayLine {
-                    text: "플러그인을 찾을 수 없습니다.".to_owned(),
+                    text: tr("플러그인을 찾을 수 없습니다.", "Can't find the plugin.").to_owned(),
                     selected: false,
                     muted: true,
                 }],
@@ -1912,7 +1938,8 @@ impl MarketplacePicker {
                     MarketplacePickerResult::Remove(marketplace.name.clone())
                 }
                 Some(_) => {
-                    self.notice = Some("원격 카탈로그는 제거할 수 없습니다.".to_owned());
+                    self.notice =
+                        Some(tr("원격 카탈로그는 제거할 수 없습니다.", "The remote catalog can't be removed.").to_owned());
                     MarketplacePickerResult::None
                 }
                 None => MarketplacePickerResult::None,
@@ -1935,7 +1962,7 @@ impl MarketplacePicker {
             KeyCode::Enter => {
                 let source = editor.text().trim().to_owned();
                 if source.is_empty() {
-                    self.notice = Some("추가할 소스를 입력하세요.".to_owned());
+                    self.notice = Some(tr("추가할 소스를 입력하세요.", "Enter a source to add.").to_owned());
                     return MarketplacePickerResult::None;
                 }
                 self.source = None;
@@ -1998,12 +2025,20 @@ impl MarketplacePicker {
                 title: "Add marketplace".to_owned(),
                 lines: vec![
                     OverlayLine {
-                        text: "로컬 경로, owner/repo, HTTPS 또는 SSH Git URL".to_owned(),
+                        text: tr(
+                            "로컬 경로, owner/repo, HTTPS 또는 SSH Git URL",
+                            "A local path, owner/repo, or an HTTPS or SSH Git URL",
+                        )
+                        .to_owned(),
                         selected: false,
                         muted: true,
                     },
                     OverlayLine {
-                        text: "owner/repo@ref 형식으로 브랜치를 지정할 수 있습니다.".to_owned(),
+                        text: tr(
+                            "owner/repo@ref 형식으로 브랜치를 지정할 수 있습니다.",
+                            "Pick a branch with the owner/repo@ref form.",
+                        )
+                        .to_owned(),
                         selected: false,
                         muted: true,
                     },
@@ -2045,7 +2080,7 @@ impl MarketplacePicker {
             .collect::<Vec<_>>();
         if lines.is_empty() {
             lines.push(OverlayLine {
-                text: "설정된 마켓플레이스가 없습니다.".to_owned(),
+                text: tr("설정된 마켓플레이스가 없습니다.", "No marketplaces are configured.").to_owned(),
                 selected: false,
                 muted: true,
             });

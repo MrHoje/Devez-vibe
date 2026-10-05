@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use crate::{
     editor::Editor,
+    language::tr,
     renderer::{EffortSlider, OverlayLine, OverlayStyle, OverlayView},
 };
 
@@ -290,7 +291,7 @@ impl ProviderPicker {
                         KeyCode::Enter => {
                             let value = editor.take_for_submit().unwrap_or_default();
                             if field_key == API_KEY_FIELD && value.trim().is_empty() {
-                                *validation = Some("API key를 입력하세요.".to_owned());
+                                *validation = Some(tr("API key를 입력하세요.", "Enter the API key.").to_owned());
                                 return ProviderPickerResult::None;
                             }
                             if field_key == CUSTOM_PROVIDER_FIELD
@@ -302,7 +303,11 @@ impl ProviderPicker {
                                     }))
                             {
                                 *validation =
-                                    Some("소문자, 숫자, 하이픈만 사용할 수 있습니다.".to_owned());
+                                    Some(tr(
+                                        "소문자, 숫자, 하이픈만 사용할 수 있습니다.",
+                                        "Use only lowercase letters, numbers, and hyphens.",
+                                    )
+                                    .to_owned());
                                 return ProviderPickerResult::None;
                             }
                             save_field(field, value, values);

@@ -19,6 +19,7 @@ use crate::{
         ClaudeClient, ClaudeServer, is_claude_model, is_claude_request_id, is_claude_thread,
         raw_thread_id, visible_thread_id,
     },
+    language::tr,
     open_code::{OpenCodeServer, is_open_code_model, is_open_code_request_id},
 };
 
@@ -220,8 +221,11 @@ impl BackendServer {
         // `/provider`; every path into Codex — launch, resume, switch — stops
         // here rather than waiting out a spawn that will never answer.
         if !crate::state::codex_provider_enabled() {
-            let reason =
-                "Codex provider 연결이 꺼져 있습니다. /provider에서 Codex를 켜세요.".to_owned();
+            let reason = tr(
+                "Codex provider 연결이 꺼져 있습니다. /provider에서 Codex를 켜세요.",
+                "The Codex provider connection is off. Turn Codex on in /provider.",
+            )
+            .to_owned();
             self.codex_unavailable_reason = Some(reason.clone());
             anyhow::bail!(reason);
         }
@@ -402,7 +406,10 @@ impl BackendServer {
                     let id = response
                         .get("id")
                         .and_then(Value::as_str)
-                        .context("OpenCode thread/start 응답에 id가 없습니다.")?;
+                        .context(tr(
+                            "OpenCode thread/start 응답에 id가 없습니다.",
+                            "The OpenCode thread/start response has no id.",
+                        ))?;
                     self.register_route(
                         id,
                         RuntimeKind::OpenCode,
@@ -762,7 +769,10 @@ impl BackendServer {
                     let id = response
                         .get("id")
                         .and_then(Value::as_str)
-                        .context("OpenCode thread/fork 응답에 id가 없습니다.")?;
+                        .context(tr(
+                            "OpenCode thread/fork 응답에 id가 없습니다.",
+                            "The OpenCode thread/fork response has no id.",
+                        ))?;
                     self.register_route(
                         id,
                         RuntimeKind::OpenCode,
@@ -809,9 +819,10 @@ impl BackendServer {
             "claude/permissions/retry" => {
                 let visible = thread_id(&params)?;
                 if self.route_kind(visible) != RuntimeKind::Claude {
-                    return Err(anyhow::anyhow!(
-                        "Claude 세션에서만 권한 거부를 재시도할 수 있습니다."
-                    ));
+                    return Err(anyhow::anyhow!(tr(
+                        "Claude 세션에서만 권한 거부를 재시도할 수 있습니다.",
+                        "Permission denials can be retried only in a Claude session.",
+                    )));
                 }
                 params["sessionId"] = json!(self.backing_id(visible, RuntimeKind::Claude)?);
                 self.claude.request("permissions/retry", params).await
@@ -897,7 +908,10 @@ impl BackendServer {
         params: Value,
     ) -> Result<Value> {
         self.integration_client(model)
-            .context("현재 provider는 플러그인 관리를 지원하지 않습니다.")?
+            .context(tr(
+                "현재 provider는 플러그인 관리를 지원하지 않습니다.",
+                "The current provider doesn't support plugin management.",
+            ))?
             .request(method, params)
             .await
     }
@@ -1041,7 +1055,8 @@ impl BackendServer {
         {
             let detail = match event {
                 Some(ServerEvent::Closed(detail)) => detail,
-                _ => "Codex app-server 이벤트 채널이 종료되었습니다.".to_owned(),
+                _ => tr("Codex app-server 이벤트 채널이 종료되었습니다.", "The Codex app-server event channel closed.")
+                    .to_owned(),
             };
             self.codex_unavailable_reason = Some(detail.clone());
             if let Some(codex) = self.codex.take() {
@@ -1057,7 +1072,8 @@ impl BackendServer {
         {
             let detail = match event {
                 Some(ServerEvent::Closed(detail)) => detail,
-                _ => "OpenCode ACP 이벤트 채널이 종료되었습니다.".to_owned(),
+                _ => tr("OpenCode ACP 이벤트 채널이 종료되었습니다.", "The OpenCode ACP event channel closed.")
+                    .to_owned(),
             };
             if let Some(open_code) = self.open_code.take() {
                 tokio::spawn(open_code.shutdown());
@@ -1069,7 +1085,7 @@ impl BackendServer {
         {
             let detail = match event {
                 Some(ServerEvent::Closed(detail)) => detail,
-                _ => "Claude SDK 이벤트 채널이 종료되었습니다.".to_owned(),
+                _ => tr("Claude SDK 이벤트 채널이 종료되었습니다.", "The Claude SDK event channel closed.").to_owned(),
             };
             return Some(ServerEvent::ProtocolWarning(detail));
         }
@@ -1148,18 +1164,27 @@ impl BackendServer {
     fn open_code(&self) -> Result<&OpenCodeServer> {
         self.open_code
             .as_ref()
-            .context("OpenCode가 설치되어 있지 않거나 ACP를 시작할 수 없습니다.")
+            .context(tr(
+                "OpenCode가 설치되어 있지 않거나 ACP를 시작할 수 없습니다.",
+                "OpenCode isn't installed or can't start ACP.",
+            ))
     }
 
     fn codex(&self) -> Result<&AppServer> {
         self.codex
             .as_ref()
-            .context("Codex app-server를 사용할 수 없습니다. Claude provider를 사용하세요.")
+            .context(tr(
+                "Codex app-server를 사용할 수 없습니다. Claude provider를 사용하세요.",
+                "The Codex app-server is unavailable. Use the Claude provider.",
+            ))
     }
 
     async fn ensure_open_code(&mut self) -> Result<&OpenCodeServer> {
         if !crate::open_code::PROVIDER_ENABLED {
-            anyhow::bail!("OpenCode provider는 현재 비활성화되어 있습니다.");
+            anyhow::bail!(tr(
+                "OpenCode provider는 현재 비활성화되어 있습니다.",
+                "The OpenCode provider is currently disabled.",
+            ));
         }
         if self.open_code.is_none() {
             self.open_code = Some(OpenCodeServer::spawn(&self.open_code_path, &self.cwd).await?);
@@ -1235,7 +1260,7 @@ impl BackendServer {
             .get("id")
             .or_else(|| response.pointer("/thread/id"))
             .and_then(Value::as_str)
-            .context("Claude 세션 응답에 id가 없습니다.")?
+            .context(tr("Claude 세션 응답에 id가 없습니다.", "The Claude session response has no id."))?
             .to_owned();
         let visible = visible
             .map(ToOwned::to_owned)
@@ -1411,7 +1436,7 @@ impl BackendServer {
     async fn mixed_provider_history(&self, visible: &str, params: &Value) -> Result<Value> {
         let route = self
             .route(visible)
-            .context("혼합 provider 라우트를 찾을 수 없습니다.")?;
+            .context(tr("혼합 provider 라우트를 찾을 수 없습니다.", "Can't find the mixed provider route."))?;
         let cwd = route.cwd.clone();
         let active = route.active;
 
@@ -1423,7 +1448,10 @@ impl BackendServer {
                     "sessionId": route
                         .claude_id
                         .as_deref()
-                        .context("혼합 라우트에 Claude 세션 ID가 없습니다.")?,
+                        .context(tr(
+                            "혼합 라우트에 Claude 세션 ID가 없습니다.",
+                            "The mixed route has no Claude session ID.",
+                        ))?,
                     "cwd": cwd
                 }),
             )
@@ -1447,9 +1475,10 @@ impl BackendServer {
                 }
             }
             _ if active == RuntimeKind::Codex => {
-                return Err(anyhow::anyhow!(
-                    "혼합 라우트의 Codex runtime을 시작하지 못했습니다."
-                ));
+                return Err(anyhow::anyhow!(tr(
+                    "혼합 라우트의 Codex runtime을 시작하지 못했습니다.",
+                    "Couldn't start the Codex runtime for the mixed route.",
+                )));
             }
             _ => Vec::new(),
         };
@@ -1601,7 +1630,12 @@ impl BackendServer {
         };
         backing
             .or_else(|| (self.route_kind(&visible) == kind).then(|| visible.to_owned()))
-            .with_context(|| format!("세션 `{visible}`의 런타임 연결을 찾을 수 없습니다."))
+            .with_context(|| {
+                tr(
+                    format!("세션 `{visible}`의 런타임 연결을 찾을 수 없습니다."),
+                    format!("Can't find the runtime connection for session `{visible}`."),
+                )
+            })
     }
 
     async fn ensure_open_code_route(
@@ -1627,7 +1661,10 @@ impl BackendServer {
             );
             return Ok((backing, model));
         }
-        let model = model.context("OpenCode 런타임으로 전환할 모델이 없습니다.")?;
+        let model = model.context(tr(
+            "OpenCode 런타임으로 전환할 모델이 없습니다.",
+            "There is no model to switch to on the OpenCode runtime.",
+        ))?;
         let cwd = self
             .route(visible)
             .map(|route| route.cwd)
@@ -1640,7 +1677,7 @@ impl BackendServer {
         let backing = response
             .get("id")
             .and_then(Value::as_str)
-            .context("OpenCode 전환 세션에 id가 없습니다.")?
+            .context(tr("OpenCode 전환 세션에 id가 없습니다.", "The OpenCode switch session has no id."))?
             .to_owned();
         let codex_id = self.route(visible).and_then(|route| route.codex_id);
         self.register_route(
@@ -1689,7 +1726,7 @@ impl BackendServer {
             .get("id")
             .or_else(|| response.pointer("/thread/id"))
             .and_then(Value::as_str)
-            .context("Codex 전환 세션에 id가 없습니다.")?
+            .context(tr("Codex 전환 세션에 id가 없습니다.", "The Codex switch session has no id."))?
             .to_owned();
         let open_code_id = self.route(visible).and_then(|route| route.open_code_id);
         let claude_id = self.route(visible).and_then(|route| route.claude_id);
@@ -1766,7 +1803,7 @@ impl BackendServer {
         let backing = response
             .get("id")
             .and_then(Value::as_str)
-            .context("Claude 전환 세션에 id가 없습니다.")?
+            .context(tr("Claude 전환 세션에 id가 없습니다.", "The Claude switch session has no id."))?
             .to_owned();
         let route = self.route(visible);
         self.register_route(
@@ -1966,10 +2003,11 @@ fn acquire_store_lock(path: &Path) -> Result<StoreLock> {
             Err(error) => return Err(error.into()),
         }
     }
-    anyhow::bail!(
-        "세션 저장소 잠금 획득 시간이 초과되었습니다: {}",
-        path.display()
-    )
+    let path = path.display();
+    anyhow::bail!(tr(
+        format!("세션 저장소 잠금 획득 시간이 초과되었습니다: {path}"),
+        format!("Timed out acquiring the session store lock: {path}"),
+    ))
 }
 
 fn route_aliases(routes: &HashMap<String, Route>) -> HashMap<String, String> {
@@ -2234,7 +2272,10 @@ fn vibe_setting_write(params: &Value) -> Result<bool> {
                 .map(ToOwned::to_owned)
                 .or_else(|| value.as_bool().map(|value| value.to_string()))
         })
-        .context("Vibe 설정 값이 문자열 또는 boolean이 아닙니다.")?;
+        .context(tr(
+            "Vibe 설정 값이 문자열 또는 boolean이 아닙니다.",
+            "The Vibe setting value is neither a string nor a boolean.",
+        ))?;
     crate::state::write_vibe_config_value(key, &value)?;
     Ok(true)
 }
@@ -2260,7 +2301,8 @@ fn is_vibe_setting_key(key: &str) -> bool {
 }
 
 fn write_provider_config(model: &str, effort: &str) -> Result<()> {
-    let path = provider_config_path().context("Devez Vibe 설정 경로를 찾을 수 없습니다.")?;
+    let path = provider_config_path()
+        .context(tr("Devez Vibe 설정 경로를 찾을 수 없습니다.", "Can't find the Devez Vibe settings path."))?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -2478,7 +2520,7 @@ fn apply_codex_question_mode(params: &mut Value) -> Result<()> {
         .get("model")
         .and_then(Value::as_str)
         .filter(|model| !model.is_empty())
-        .context("질문 대기를 설정할 모델이 없습니다.")?;
+        .context(tr("질문 대기를 설정할 모델이 없습니다.", "No model is available to set up question waiting."))?;
     params["collaborationMode"] = json!({
         "mode": "default",
         "settings": {
@@ -2704,7 +2746,7 @@ fn thread_id(params: &Value) -> Result<&str> {
     params
         .get("threadId")
         .and_then(Value::as_str)
-        .context("요청에 threadId가 없습니다.")
+        .context(tr("요청에 threadId가 없습니다.", "The request has no threadId."))
 }
 
 #[cfg(test)]

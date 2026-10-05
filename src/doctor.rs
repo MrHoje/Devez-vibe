@@ -6,6 +6,8 @@ use std::{
 };
 
 use anyhow::Result;
+
+use crate::language::tr;
 use tokio::{process::Command, time::timeout};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -22,10 +24,10 @@ enum Level {
 impl Level {
     fn label(self) -> &'static str {
         match self {
-            Self::Pass => "정상",
-            Self::Warn => "경고",
-            Self::Fail => "오류",
-            Self::Skip => "건너뜀",
+            Self::Pass => tr("정상", "Pass"),
+            Self::Warn => tr("경고", "Warn"),
+            Self::Fail => tr("오류", "Fail"),
+            Self::Skip => tr("건너뜀", "Skip"),
         }
     }
 }
@@ -64,7 +66,7 @@ pub async fn run(
     let mut checks = vec![
         Check::new(
             Level::Pass,
-            "버전",
+            tr("버전", "Version"),
             format!("Devez Vibe v{}", env!("CARGO_PKG_VERSION")),
         ),
         executable_check(),
@@ -106,8 +108,8 @@ pub async fn run(
     } else {
         checks.push(Check::new(
             Level::Skip,
-            "Node.js와 Claude 연결 파일",
-            "Claude Code를 사용하지 않아 확인하지 않음",
+            tr("Node.js와 Claude 연결 파일", "Node.js and Claude bridge file"),
+            tr("Claude Code를 사용하지 않아 확인하지 않음", "Not checked because Claude Code isn't used"),
         ));
     }
 
@@ -119,14 +121,14 @@ pub async fn run(
     if usable_providers == 0 {
         checks.push(Check::new(
             Level::Fail,
-            "사용 가능한 제공자",
-            "Codex, Claude Code, OpenCode 중 실행 가능한 항목이 없음",
+            tr("사용 가능한 제공자", "Usable providers"),
+            tr("Codex, Claude Code, OpenCode 중 실행 가능한 항목이 없음", "None of Codex, Claude Code, or OpenCode can run"),
         ));
     } else {
         checks.push(Check::new(
             Level::Pass,
-            "사용 가능한 제공자",
-            format!("{usable_providers}개"),
+            tr("사용 가능한 제공자", "Usable providers"),
+            tr(format!("{usable_providers}개"), usable_providers.to_string()),
         ));
     }
 
@@ -136,43 +138,43 @@ pub async fn run(
 
 fn executable_check() -> Check {
     match env::current_exe() {
-        Ok(path) => Check::new(Level::Pass, "실행 파일", path.display().to_string()),
-        Err(error) => Check::new(Level::Fail, "실행 파일", error.to_string()),
+        Ok(path) => Check::new(Level::Pass, tr("실행 파일", "Executable"), path.display().to_string()),
+        Err(error) => Check::new(Level::Fail, tr("실행 파일", "Executable"), error.to_string()),
     }
 }
 
 fn working_directory_check(cwd: &Path) -> Check {
     if cwd.is_dir() {
-        Check::new(Level::Pass, "작업 폴더", cwd.display().to_string())
+        Check::new(Level::Pass, tr("작업 폴더", "Working folder"), cwd.display().to_string())
     } else {
-        Check::new(Level::Fail, "작업 폴더", "폴더를 찾을 수 없음")
+        Check::new(Level::Fail, tr("작업 폴더", "Working folder"), tr("폴더를 찾을 수 없음", "Folder not found"))
     }
 }
 
 fn update_pointer_check() -> Check {
     let Some(root) = env::var_os("LOCALAPPDATA") else {
-        return Check::new(Level::Warn, "업데이트 전환", "LOCALAPPDATA를 찾을 수 없음");
+        return Check::new(Level::Warn, tr("업데이트 전환", "Update switch"), tr("LOCALAPPDATA를 찾을 수 없음", "LOCALAPPDATA not found"));
     };
     let pointer = PathBuf::from(root)
         .join("DevezVibe")
         .join("current-executable.txt");
     if !pointer.exists() {
-        return Check::new(Level::Pass, "업데이트 전환", "별도 활성 버전 없음");
+        return Check::new(Level::Pass, tr("업데이트 전환", "Update switch"), tr("별도 활성 버전 없음", "No separate active version"));
     }
     match fs::read_to_string(&pointer) {
         Ok(value) => {
             let target = PathBuf::from(value.trim());
             if target.is_absolute() && target.is_file() {
-                Check::new(Level::Pass, "업데이트 전환", target.display().to_string())
+                Check::new(Level::Pass, tr("업데이트 전환", "Update switch"), target.display().to_string())
             } else {
                 Check::new(
                     Level::Warn,
-                    "업데이트 전환",
-                    "활성 버전 경로가 유효하지 않음",
+                    tr("업데이트 전환", "Update switch"),
+                    tr("활성 버전 경로가 유효하지 않음", "The active version path is invalid"),
                 )
             }
         }
-        Err(error) => Check::new(Level::Warn, "업데이트 전환", error.to_string()),
+        Err(error) => Check::new(Level::Warn, tr("업데이트 전환", "Update switch"), error.to_string()),
     }
 }
 
@@ -195,26 +197,29 @@ fn node_check(probe: &Probe) -> Check {
         Some(version) => Check::new(
             Level::Warn,
             "Node.js",
-            format!("v{version}: Claude 연결에는 v18 이상 필요"),
+            tr(
+                format!("v{version}: Claude 연결에는 v18 이상 필요"),
+                format!("v{version}: the Claude bridge needs v18 or later"),
+            ),
         ),
-        None => Check::new(Level::Warn, "Node.js", "버전을 판별할 수 없음"),
+        None => Check::new(Level::Warn, "Node.js", tr("버전을 판별할 수 없음", "Can't determine the version")),
     }
 }
 
 async fn bridge_check(node_path: &Path, cwd: &Path) -> Check {
     let bridge = match crate::claude::resolve_bridge_path(cwd) {
         Ok(path) => path,
-        Err(error) => return Check::new(Level::Warn, "Claude 연결 파일", error.to_string()),
+        Err(error) => return Check::new(Level::Warn, tr("Claude 연결 파일", "Claude bridge file"), error.to_string()),
     };
     let probe = probe_command_paths(node_path, &[Path::new("--check"), &bridge]).await;
     if probe.success {
         Check::new(
             Level::Pass,
-            "Claude 연결 파일",
+            tr("Claude 연결 파일", "Claude bridge file"),
             bridge.display().to_string(),
         )
     } else {
-        Check::new(Level::Warn, "Claude 연결 파일", probe.detail)
+        Check::new(Level::Warn, tr("Claude 연결 파일", "Claude bridge file"), probe.detail)
     }
 }
 
@@ -223,16 +228,16 @@ async fn codex_runtime_check(codex_path: &Path) -> (Check, bool) {
         Ok(server) => server,
         Err(error) => {
             return (
-                Check::new(Level::Warn, "Codex 연결", one_line(&error.to_string())),
+                Check::new(Level::Warn, tr("Codex 연결", "Codex connection"), one_line(&error.to_string())),
                 false,
             );
         }
     };
     let initialized = timeout(CODEX_TIMEOUT, server.initialize()).await;
     let check = match initialized {
-        Ok(Ok(_)) => Check::new(Level::Pass, "Codex 연결", "app-server 초기화 성공"),
-        Ok(Err(error)) => Check::new(Level::Warn, "Codex 연결", one_line(&error.to_string())),
-        Err(_) => Check::new(Level::Warn, "Codex 연결", "초기화 시간이 10초를 초과함"),
+        Ok(Ok(_)) => Check::new(Level::Pass, tr("Codex 연결", "Codex connection"), tr("app-server 초기화 성공", "app-server initialized")),
+        Ok(Err(error)) => Check::new(Level::Warn, tr("Codex 연결", "Codex connection"), one_line(&error.to_string())),
+        Err(_) => Check::new(Level::Warn, tr("Codex 연결", "Codex connection"), tr("초기화 시간이 10초를 초과함", "Initialization took longer than 10 seconds")),
     };
     let usable = check.level == Level::Pass;
     server.shutdown().await;
@@ -259,7 +264,10 @@ async fn probe_command_paths(path: &Path, args: &[&Path]) -> Probe {
         detail: if found {
             one_line(&error.to_string())
         } else {
-            format!("명령을 찾을 수 없음: {}", path.display())
+            tr(
+                format!("명령을 찾을 수 없음: {}", path.display()),
+                format!("Command not found: {}", path.display()),
+            )
         },
     };
     let child = match command.spawn() {
@@ -278,7 +286,7 @@ async fn probe_command_paths(path: &Path, args: &[&Path]) -> Probe {
         Err(_) => Probe {
             found: true,
             success: false,
-            detail: "응답 시간이 5초를 초과함".to_owned(),
+            detail: tr("응답 시간이 5초를 초과함", "No response within 5 seconds").to_owned(),
         },
     }
 }
@@ -311,9 +319,9 @@ fn output_detail(stdout: &[u8], stderr: &[u8], success: bool) -> String {
     let detail = one_line(&String::from_utf8_lossy(preferred));
     if detail.is_empty() {
         if success {
-            "실행 성공".to_owned()
+            tr("실행 성공", "Ran successfully").to_owned()
         } else {
-            "실행에 실패했으나 오류 메시지가 없음".to_owned()
+            tr("실행에 실패했으나 오류 메시지가 없음", "Failed without an error message").to_owned()
         }
     } else {
         detail
@@ -336,7 +344,7 @@ fn node_major(version: &str) -> Option<u64> {
 }
 
 fn print_report(checks: &[Check]) {
-    println!("Devez Vibe 진단");
+    println!("{}", tr("Devez Vibe 진단", "Devez Vibe doctor"));
     for check in checks {
         println!(
             "{} · {} · {}",
@@ -347,12 +355,18 @@ fn print_report(checks: &[Check]) {
     }
     let count = |level| checks.iter().filter(|check| check.level == level).count();
     println!();
-    println!(
-        "요약 · 정상 {} · 경고 {} · 오류 {} · 건너뜀 {}",
+    let (pass, warn, fail, skip) = (
         count(Level::Pass),
         count(Level::Warn),
         count(Level::Fail),
         count(Level::Skip),
+    );
+    println!(
+        "{}",
+        tr(
+            format!("요약 · 정상 {pass} · 경고 {warn} · 오류 {fail} · 건너뜀 {skip}"),
+            format!("Summary · Pass {pass} · Warn {warn} · Fail {fail} · Skip {skip}"),
+        )
     );
 }
 

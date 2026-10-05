@@ -12,6 +12,7 @@ mod git_diff;
 mod input_hub;
 mod input_log;
 mod integrations;
+mod language;
 mod open_code;
 mod paste;
 mod perf;
@@ -53,6 +54,7 @@ use crossterm::event::{
 use editor::Editor;
 use futures_util::StreamExt;
 use integrations::{McpServerInfo, PluginCatalog, PluginDetail};
+use language::tr;
 use paste::{BufferedText, BufferedTextTarget, ComposerInput, ComposerPasteBuffer, PasteBurst};
 use preedit::{PreeditCapture, PreeditInput};
 use provider::{ProviderAuthKind, ProviderAuthRequest};
@@ -150,6 +152,7 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    language::load();
     if let Some(command) = cli.command.as_ref() {
         match command {
             Command::Doctor => {
@@ -178,7 +181,13 @@ async fn main() -> Result<()> {
     theme::set_current(selected_theme);
     devezcode::init();
     if let Err(error) = state::migrate_legacy_vibe_settings() {
-        eprintln!("이전 DevezVibe 설정을 옮기지 못했습니다: {error}");
+        eprintln!(
+            "{}",
+            tr(
+                format!("이전 DevezVibe 설정을 옮기지 못했습니다: {error}"),
+                format!("Couldn't move the earlier DevezVibe settings: {error}"),
+            )
+        );
     }
     let cwd = resolve_cwd(cli.cwd.as_deref())?;
     let mut server =
@@ -248,7 +257,10 @@ async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
         .await?;
     let models = parse_models(&models_response);
     if models.is_empty() {
-        bail!("app-server가 사용 가능한 모델을 반환하지 않았습니다.");
+        bail!(tr(
+            "app-server가 사용 가능한 모델을 반환하지 않았습니다.",
+            "The app-server returned no available models.",
+        ));
     }
     let fallback_open_code = prefer_open_code
         .then(|| {
@@ -291,12 +303,15 @@ async fn run(cli: &Cli, server: &mut BackendServer) -> Result<()> {
         state.push_notice(
             BlockKind::Warning,
             "Codex unavailable",
-            format!(
-                "{}\nClaude provider로 자동 전환했습니다.",
-                codex_unavailable_reason
+            {
+                let reason = codex_unavailable_reason
                     .as_deref()
-                    .unwrap_or("Codex app-server가 종료되었습니다.")
-            ),
+                    .unwrap_or(tr("Codex app-server가 종료되었습니다.", "The Codex app-server exited."));
+                tr(
+                    format!("{reason}\nClaude provider로 자동 전환했습니다."),
+                    format!("{reason}\nSwitched to the Claude provider automatically."),
+                )
+            },
         );
     }
     // No runtime is connected until this machine has picked one, so a fresh
@@ -410,7 +425,7 @@ async fn start_session(
     let thread_id = thread
         .get("id")
         .and_then(Value::as_str)
-        .context("thread 응답에 id가 없습니다.")?
+        .context(tr("thread 응답에 id가 없습니다.", "The thread response has no id."))?
         .to_owned();
     let actual_model = thread_response
         .get("model")
@@ -599,7 +614,10 @@ async fn open_pending_thread(
         match await_with_activity(state, renderer, server.request("thread/start", params)).await? {
             Ok(response) => response,
             Err(error) => {
-                state.set_request_failed(format!("세션을 시작하지 못했습니다: {error}"));
+                state.set_request_failed(tr(
+                    format!("세션을 시작하지 못했습니다: {error}"),
+                    format!("Couldn't start the session: {error}"),
+                ));
                 return Ok(false);
             }
         };
@@ -619,7 +637,10 @@ async fn open_pending_thread(
         .unwrap_or(&model)
         .to_owned();
     let (Some(thread_id), Some(cwd)) = (thread_id, cwd) else {
-        state.set_request_failed("thread/start 응답이 올바르지 않습니다.");
+        state.set_request_failed(tr(
+            "thread/start 응답이 올바르지 않습니다.",
+            "The thread/start response is invalid.",
+        ));
         return Ok(false);
     };
     let effort = response
@@ -812,6 +833,7 @@ fn hold_until_thread(
         | Action::Quit
         | Action::SetTheme(_)
         | Action::PersistAutoKnowledge(_)
+        | Action::PersistLanguage(_)
         | Action::Copy(_)
         | Action::CopyQuietly(_)
         | Action::Cut(_)
@@ -881,7 +903,7 @@ fn hold_until_thread(
             state.push_notice(
                 BlockKind::Warning,
                 "Preparing session",
-                "세션이 준비된 뒤에 다시 실행해주세요.",
+                tr("세션이 준비된 뒤에 다시 실행해주세요.", "Run it again once the session is ready."),
             );
             None
         }
@@ -916,7 +938,10 @@ async fn resolve_startup_session(
         let sessions = list_sessions(server, Some(cwd), None, 1, provider_model).await?;
         let session = sessions
             .first()
-            .context("이 작업 폴더에서 계속할 세션을 찾지 못했습니다.")?;
+            .context(tr(
+                "이 작업 폴더에서 계속할 세션을 찾지 못했습니다.",
+                "No session to continue was found in this working folder.",
+            ))?;
         return Ok(Some(session.id.clone()));
     }
 
@@ -1027,8 +1052,8 @@ async fn choose_startup_session(
                 if let Action::Copy(text) = action {
                     composer_notice = Some(
                         match Clipboard::new().and_then(|mut clipboard| clipboard.set_text(&text)) {
-                            Ok(()) => "• Copied to clipboard".to_owned(),
-                            Err(error) => format!("복사 실패: {error}"),
+                            Ok(()) => tr("• 클립보드에 복사했습니다", "• Copied to clipboard").to_owned(),
+                            Err(error) => tr(format!("복사 실패: {error}"), format!("Copy failed: {error}")),
                         },
                     );
                 }
@@ -1131,7 +1156,10 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
                 );
             }
             Err(error) => {
-                let message = format!("{name} · 변경 실패: {error}");
+                let message = tr(
+                    format!("{name} · 변경 실패: {error}"),
+                    format!("{name} · change failed: {error}"),
+                );
                 if !state.apply_skill_enabled(
                     provider,
                     &path,
@@ -1159,7 +1187,7 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
                         "{name} · {}{}",
                         if enabled { "On" } else { "Off" },
                         if provider == SkillProvider::Claude {
-                            " · 새 대화부터 적용"
+                            tr(" · 새 대화부터 적용", " · applies from the next conversation")
                         } else {
                             ""
                         }
@@ -1167,7 +1195,10 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
                 );
             }
             Err(error) => {
-                let message = format!("{name} · 변경 실패: {error}");
+                let message = tr(
+                    format!("{name} · 변경 실패: {error}"),
+                    format!("{name} · change failed: {error}"),
+                );
                 if !state.apply_plugin_enabled(provider, &id, !enabled, message.clone()) {
                     state.push_notice(BlockKind::Error, "Plugin update failed", message);
                 }
@@ -1188,7 +1219,10 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
                 );
             }
             Err(error) => {
-                let message = format!("{name} · 변경 실패: {error}");
+                let message = tr(
+                    format!("{name} · 변경 실패: {error}"),
+                    format!("{name} · change failed: {error}"),
+                );
                 if !state.apply_mcp_enabled(provider, &name, !enabled, message.clone()) {
                     state.push_notice(BlockKind::Error, "MCP update failed", message);
                 }
@@ -1197,7 +1231,7 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
         ManagementUpdate::SelfUpdate { result } => state.finish_self_update(result),
         ManagementUpdate::McpReconnect { provider, result } => match result {
             Ok(response) => {
-                state.finish_mcp_reconnect(provider, &response, "재연결했습니다.".to_owned())
+                state.finish_mcp_reconnect(provider, &response, tr("재연결했습니다.", "Reconnected.").to_owned())
             }
             Err(error) => state.push_notice(BlockKind::Error, "MCP reconnect failed", error),
         },
@@ -1211,7 +1245,10 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
                     state.push_notice(
                         BlockKind::System,
                         "MCP login",
-                        format!("브라우저에서 인증을 완료하세요.\n{url}"),
+                        tr(
+                            format!("브라우저에서 인증을 완료하세요.\n{url}"),
+                            format!("Finish authenticating in the browser.\n{url}"),
+                        ),
                     );
                     if let Err(error) = open_url(url) {
                         state.push_notice(
@@ -1225,13 +1262,19 @@ fn apply_management_update(state: &mut AppState, update: ManagementUpdate) {
                         SkillProvider::Claude,
                         &name,
                         true,
-                        format!("{name} · 로그인 연결을 다시 시도했습니다."),
+                        tr(
+                            format!("{name} · 로그인 연결을 다시 시도했습니다."),
+                            format!("{name} · retried the sign-in connection."),
+                        ),
                     );
                 } else {
                     state.push_notice(
                         BlockKind::Error,
                         "MCP login failed",
-                        "The server did not return a login URL (authorizationUrl).\nUse /mcp to check the server status.",
+                        tr(
+                            "서버가 로그인 URL(authorizationUrl)을 보내지 않았습니다.\n/mcp에서 서버 상태를 확인하세요.",
+                            "The server did not return a login URL (authorizationUrl).\nUse /mcp to check the server status.",
+                        ),
                     );
                 }
             }
@@ -1379,7 +1422,10 @@ async fn open_btw(
         main.push_notice(
             BlockKind::Error,
             "BTW start failed",
-            "The thread/fork response did not include a thread ID.",
+            tr(
+                "thread/fork 응답에 thread ID가 없습니다.",
+                "The thread/fork response did not include a thread ID.",
+            ),
         );
         return None;
     };
@@ -1436,7 +1482,10 @@ async fn execute_split_conversation_action(
         }
         Action::Steer(text) => {
             let Some(turn_id) = state.turn_id.clone() else {
-                state.set_request_failed("활성 turn ID가 없어 추가 입력을 보낼 수 없습니다.");
+                state.set_request_failed(tr(
+                    "활성 turn ID가 없어 추가 입력을 보낼 수 없습니다.",
+                    "There is no active turn ID, so the follow-up input can't be sent.",
+                ));
                 return Ok(false);
             };
             devezcode::note_prompt(&text);
@@ -2650,7 +2699,7 @@ async fn run_local_shell(
 fn start_self_update(sender: mpsc::UnboundedSender<ManagementUpdate>) {
     let Ok(exe) = std::env::current_exe() else {
         let _ = sender.send(ManagementUpdate::SelfUpdate {
-            result: Err("실행 파일 경로를 찾지 못했습니다.".to_owned()),
+            result: Err(tr("실행 파일 경로를 찾지 못했습니다.", "Couldn't find the executable path.").to_owned()),
         });
         return;
     };
@@ -2739,7 +2788,10 @@ async fn execute_action(
         Action::Steer(text) => {
             renderer.scroll_to_bottom();
             let Some(turn_id) = state.turn_id.clone() else {
-                state.set_request_failed("활성 turn ID가 없어 추가 입력을 보낼 수 없습니다.");
+                state.set_request_failed(tr(
+                    "활성 turn ID가 없어 추가 입력을 보낼 수 없습니다.",
+                    "There is no active turn ID, so the follow-up input can't be sent.",
+                ));
                 return Ok(false);
             };
             devezcode::note_prompt(&text);
@@ -2800,7 +2852,14 @@ async fn execute_action(
                     );
                     state.begin_thread_switch();
                     state.set_host_loading(true);
-                    state.push_notice(BlockKind::System, "Preparing worktree", "파일과 대화를 준비하고 있습니다. 입력한 요청은 준비가 끝나면 실행합니다.");
+                    state.push_notice(
+                        BlockKind::System,
+                        "Preparing worktree",
+                        tr(
+                            "파일과 대화를 준비하고 있습니다. 입력한 요청은 준비가 끝나면 실행합니다.",
+                            "Preparing the files and conversation. Requests you type run once it's ready.",
+                        ),
+                    );
                     draw(state, renderer)?;
                     let destination = path.clone();
                     let account_plan = state.account_plan().clone();
@@ -2816,7 +2875,10 @@ async fn execute_action(
                                     if response.pointer("/thread/id").and_then(Value::as_str)
                                         .filter(|id| !id.is_empty()).is_none()
                                     {
-                                        anyhow::bail!("대화 복제 응답에 세션 ID가 없습니다.");
+                                        anyhow::bail!(tr(
+                                            "대화 복제 응답에 세션 ID가 없습니다.",
+                                            "The conversation fork response has no session ID.",
+                                        ));
                                     }
                                     Ok(response)
                                 }
@@ -2853,7 +2915,11 @@ async fn execute_action(
                         Err(error) => {
                             // Keep partial files for inspection, but never run a queued prompt there.
                             state.attach_thread(previous_thread, previous_cwd, &model, Some(&effort));
-                            state.set_request_failed(format!("작업 트리 전환 실패: {error}\n원래 대화와 폴더로 돌아왔습니다. 생성된 작업 트리는 보존했습니다: {}", path.display()));
+                            let path = path.display();
+                            state.set_request_failed(tr(
+                                format!("작업 트리 전환 실패: {error}\n원래 대화와 폴더로 돌아왔습니다. 생성된 작업 트리는 보존했습니다: {path}"),
+                                format!("Worktree switch failed: {error}\nBack in the original conversation and folder. The created worktree was kept: {path}"),
+                            ));
                         }
                     }
                     return Ok(false);
@@ -2921,6 +2987,13 @@ async fn execute_action(
                 state.push_notice(BlockKind::Warning, "Auto knowledge setting save failed", error.to_string());
             }
         }
+        Action::PersistLanguage(english) => {
+            if let Err(error) =
+                state::write_vibe_config_value(language::CONFIG_KEY, language::config_value(english))
+            {
+                state.push_notice(BlockKind::Warning, "Language setting save failed", error.to_string());
+            }
+        }
         Action::SetFast(enabled) => {
             // Unlike a prompt, a Fast choice can be the first thread-bound action
             // after launch or `/new`. Create the selected provider's session first
@@ -2970,9 +3043,9 @@ async fn execute_action(
                 &status,
                 Some(
                     if action == "add" {
-                        "Claude 권한 규칙을 추가했습니다."
+                        tr("Claude 권한 규칙을 추가했습니다.", "Added the Claude permission rule.")
                     } else {
-                        "Claude 권한 규칙을 제거했습니다."
+                        tr("Claude 권한 규칙을 제거했습니다.", "Removed the Claude permission rule.")
                     }
                     .to_owned(),
                 ),
@@ -3133,7 +3206,10 @@ async fn execute_action(
                         state.push_notice(
                             BlockKind::Error,
                             "Side conversation failed",
-                            "The thread/fork response did not include a thread ID.",
+                            tr(
+                                "thread/fork 응답에 thread ID가 없습니다.",
+                                "The thread/fork response did not include a thread ID.",
+                            ),
                         );
                     }
                 }
@@ -3223,7 +3299,10 @@ async fn execute_action(
                 state.push_notice(
                     BlockKind::Error,
                     "MCP reconnect failed",
-                    "현재 provider의 MCP 세션이 아직 시작되지 않았습니다.",
+                    tr(
+                        "현재 provider의 MCP 세션이 아직 시작되지 않았습니다.",
+                        "The current provider's MCP session hasn't started yet.",
+                    ),
                 );
                 return Ok(false);
             };
@@ -3269,7 +3348,10 @@ async fn execute_action(
                     provider,
                     &name,
                     !enabled,
-                    format!("{name} · 변경 실패: provider가 연결되지 않았습니다."),
+                    tr(
+                        format!("{name} · 변경 실패: provider가 연결되지 않았습니다."),
+                        format!("{name} · change failed: the provider isn't connected."),
+                    ),
                 );
                 return Ok(false);
             };
@@ -3310,7 +3392,10 @@ async fn execute_action(
                         state.push_notice(
                             BlockKind::Error,
                             "Provider connection failed",
-                            "No API key was provided.\nUse /connect to select a provider and enter an API key.",
+                            tr(
+                                "API 키가 입력되지 않았습니다.\n/connect에서 provider를 고르고 API 키를 입력하세요.",
+                                "No API key was provided.\nUse /connect to select a provider and enter an API key.",
+                            ),
                         );
                         return Ok(false);
                     };
@@ -3347,7 +3432,7 @@ async fn execute_action(
                             let instructions = authorization
                                 .get("instructions")
                                 .and_then(Value::as_str)
-                                .unwrap_or("브라우저에서 인증을 완료하세요.")
+                                .unwrap_or(tr("브라우저에서 인증을 완료하세요.", "Finish authenticating in the browser."))
                                 .to_owned();
                             state.open_provider_oauth(
                                 provider_id.clone(),
@@ -3414,7 +3499,7 @@ async fn execute_action(
                 state.push_notice(
                     BlockKind::Error,
                     "MCP login failed",
-                    "The current provider is not connected.",
+                    tr("현재 provider가 연결되지 않았습니다.", "The current provider is not connected."),
                 );
                 return Ok(false);
             };
@@ -3546,16 +3631,19 @@ async fn execute_action(
                 Some(plugin) if !plugin.available => state.push_notice(
                     BlockKind::Error,
                     "Plugin can't be installed",
-                    format!(
-                        "{}은(는) 관리자 정책으로 비활성화되어 있습니다.",
-                        plugin.display_name
+                    tr(
+                        format!("{}은(는) 관리자 정책으로 비활성화되어 있습니다.", plugin.display_name),
+                        format!("{} is disabled by an admin policy.", plugin.display_name),
                     ),
                 ),
                 Some(plugin) => state.confirm_plugin_install(plugin),
                 None => state.push_notice(
                     BlockKind::Error,
                     "Plugin not found",
-                    format!("{query}\n/plugins에서 정확한 이름을 확인하세요."),
+                    tr(
+                        format!("{query}\n/plugins에서 정확한 이름을 확인하세요."),
+                        format!("{query}\nCheck the exact name in /plugins."),
+                    ),
                 ),
             },
             Err(error) => {
@@ -3567,9 +3655,9 @@ async fn execute_action(
                 Some(plugin) if plugin.installed && !plugin.uninstall_allowed => state.push_notice(
                     BlockKind::Warning,
                     "Plugin can't be removed",
-                    format!(
-                        "{}은(는) 관리자에 의해 설치되었습니다.",
-                        plugin.display_name
+                    tr(
+                        format!("{}은(는) 관리자에 의해 설치되었습니다.", plugin.display_name),
+                        format!("{} was installed by an admin.", plugin.display_name),
                     ),
                 ),
                 Some(plugin) if plugin.installed => state.confirm_plugin_uninstall(plugin),
@@ -3581,7 +3669,10 @@ async fn execute_action(
                 None => state.push_notice(
                     BlockKind::Error,
                     "Plugin not found",
-                    format!("{query}\n/plugins에서 정확한 이름을 확인하세요."),
+                    tr(
+                        format!("{query}\n/plugins에서 정확한 이름을 확인하세요."),
+                        format!("{query}\nCheck the exact name in /plugins."),
+                    ),
                 ),
             },
             Err(error) => {
@@ -3593,21 +3684,33 @@ async fn execute_action(
                 Some(plugin) if !plugin.installed => state.push_notice(
                     BlockKind::Warning,
                     "Plugin not installed",
-                    format!("{}\n먼저 /plugins install {query}", plugin.display_name),
+                    tr(
+                        format!("{}\n먼저 /plugins install {query}", plugin.display_name),
+                        format!("{}\nInstall it first with /plugins install {query}", plugin.display_name),
+                    ),
                 ),
                 Some(plugin) if !plugin.toggle_allowed => state.push_notice(
                     BlockKind::Warning,
                     "Plugin can't be changed",
-                    format!("{}은(는) 관리자 정책으로 관리됩니다.", plugin.display_name),
+                    tr(
+                        format!("{}은(는) 관리자 정책으로 관리됩니다.", plugin.display_name),
+                        format!("{} is managed by an admin policy.", plugin.display_name),
+                    ),
                 ),
                 Some(plugin) if plugin.enabled == enabled => state.push_notice(
                     BlockKind::System,
                     "Plugin unchanged",
-                    format!(
-                        "{} · already {}",
-                        plugin.display_name,
-                        if enabled { "enabled" } else { "disabled" }
-                    ),
+                    if enabled {
+                        tr(
+                            format!("{} · 이미 활성화됨", plugin.display_name),
+                            format!("{} · already enabled", plugin.display_name),
+                        )
+                    } else {
+                        tr(
+                            format!("{} · 이미 비활성화됨", plugin.display_name),
+                            format!("{} · already disabled", plugin.display_name),
+                        )
+                    },
                 ),
                 Some(plugin) => {
                     if let Err(error) = write_plugin_enabled(
@@ -3633,7 +3736,7 @@ async fn execute_action(
                                 plugin.display_name,
                                 if enabled { "enabled" } else { "disabled" },
                                 if claude::is_claude_model(state.selected_model_name()) {
-                                    "\n새 대화부터 적용됩니다."
+                                    tr("\n새 대화부터 적용됩니다.", "\nApplies from the next conversation.")
                                 } else {
                                     ""
                                 }
@@ -3645,7 +3748,10 @@ async fn execute_action(
                 None => state.push_notice(
                     BlockKind::Error,
                     "Plugin not found",
-                    format!("{query}\n/plugins에서 정확한 이름을 확인하세요."),
+                    tr(
+                        format!("{query}\n/plugins에서 정확한 이름을 확인하세요."),
+                        format!("{query}\nCheck the exact name in /plugins."),
+                    ),
                 ),
             },
             Err(error) => {
@@ -3681,9 +3787,9 @@ async fn execute_action(
                         provider,
                         &plugin.id,
                         !enabled,
-                        format!(
-                            "{} · 변경 실패: provider가 연결되지 않았습니다.",
-                            plugin.display_name
+                        tr(
+                            format!("{} · 변경 실패: provider가 연결되지 않았습니다.", plugin.display_name),
+                            format!("{} · change failed: the provider isn't connected.", plugin.display_name),
                         ),
                     );
                 }
@@ -3724,9 +3830,9 @@ async fn execute_action(
                         server,
                         state,
                         if already {
-                            format!("이미 추가되어 있습니다 · {root}")
+                            tr(format!("이미 추가되어 있습니다 · {root}"), format!("Already added · {root}"))
                         } else {
-                            format!("추가했습니다 · {root}")
+                            tr(format!("추가했습니다 · {root}"), format!("Added · {root}"))
                         },
                     )
                     .await;
@@ -3749,7 +3855,8 @@ async fn execute_action(
             {
                 Ok(_) => {
                     let _ = refresh_integrations(server, state, true).await;
-                    reopen_marketplaces(server, state, format!("제거했습니다 · {name}")).await;
+                    reopen_marketplaces(server, state, tr(format!("제거했습니다 · {name}"), format!("Removed · {name}")))
+                        .await;
                 }
                 Err(error) => state.push_notice(
                     BlockKind::Error,
@@ -3849,10 +3956,17 @@ async fn execute_action(
                     // below re-reads, so they are live at once; a bundled MCP
                     // server only starts on a reconnect.
                     let base = if using_claude {
-                        "설치했습니다. 새 대화부터 Skill과 도구가 적용됩니다."
+                        tr(
+                            "설치했습니다. 새 대화부터 Skill과 도구가 적용됩니다.",
+                            "Installed. Its skills and tools apply from the next conversation.",
+                        )
                     } else {
-                        "Skill과 멘션은 바로 사용할 수 있습니다.\n\
-                         MCP 서버가 포함된 플러그인이면 /reload-plugins로 적용하세요."
+                        tr(
+                            "Skill과 멘션은 바로 사용할 수 있습니다.\n\
+                             MCP 서버가 포함된 플러그인이면 /reload-plugins로 적용하세요.",
+                            "Skills and mentions are ready to use now.\n\
+                             If the plugin bundles an MCP server, apply it with /reload-plugins.",
+                        )
                     };
                     state.push_notice(
                         BlockKind::System,
@@ -3860,7 +3974,10 @@ async fn execute_action(
                         if auth.is_empty() {
                             base.to_owned()
                         } else {
-                            format!("{base}\n\n연결이 필요한 서비스:\n{auth}")
+                            tr(
+                                format!("{base}\n\n연결이 필요한 서비스:\n{auth}"),
+                                format!("{base}\n\nServices that need a connection:\n{auth}"),
+                            )
                         },
                     );
                     let _ = refresh_integrations(server, state, true).await;
@@ -3885,12 +4002,22 @@ async fn execute_action(
                         BlockKind::System,
                         "✓ Plugin uninstalled",
                         if using_claude {
-                            format!("{} · 새 대화부터 제외됩니다.", target.display_name)
+                            tr(
+                                format!("{} · 새 대화부터 제외됩니다.", target.display_name),
+                                format!("{} · excluded from the next conversation.", target.display_name),
+                            )
                         } else {
-                            format!(
-                                "{} · Skill과 멘션은 즉시 사라집니다.\n\
-                                 MCP 도구가 있었다면 /reload-plugins로 정리하세요.",
-                                target.display_name
+                            tr(
+                                format!(
+                                    "{} · Skill과 멘션은 즉시 사라집니다.\n\
+                                     MCP 도구가 있었다면 /reload-plugins로 정리하세요.",
+                                    target.display_name
+                                ),
+                                format!(
+                                    "{} · its skills and mentions are gone now.\n\
+                                     If it had MCP tools, clean them up with /reload-plugins.",
+                                    target.display_name
+                                ),
                             )
                         },
                     );
@@ -3919,11 +4046,11 @@ async fn execute_action(
                         server,
                         state,
                         provider,
-                        Some(format!(
-                            "{} · 이미 {}",
-                            skill.name,
-                            if enabled { "켜짐" } else { "꺼짐" }
-                        )),
+                        Some(if enabled {
+                            tr(format!("{} · 이미 켜짐", skill.name), format!("{} · already on", skill.name))
+                        } else {
+                            tr(format!("{} · 이미 꺼짐", skill.name), format!("{} · already off", skill.name))
+                        }),
                     )
                     .await
                 }
@@ -3960,7 +4087,10 @@ async fn execute_action(
                             server,
                             state,
                             provider,
-                            Some(format!("{} · 변경 실패: {error}", skill.name)),
+                            Some(tr(
+                                format!("{} · 변경 실패: {error}", skill.name),
+                                format!("{} · change failed: {error}", skill.name),
+                            )),
                         )
                         .await;
                     }
@@ -3970,7 +4100,10 @@ async fn execute_action(
                         server,
                         state,
                         provider,
-                        Some(format!("{name} · Skill을 찾을 수 없습니다.")),
+                        Some(tr(
+                            format!("{name} · Skill을 찾을 수 없습니다."),
+                            format!("{name} · skill not found."),
+                        )),
                     )
                     .await;
                 }
@@ -4018,7 +4151,10 @@ async fn execute_action(
                         &path,
                         source.as_deref(),
                         !enabled,
-                        Some(format!("{name} · 변경 실패: {error}")),
+                        Some(tr(
+                            format!("{name} · 변경 실패: {error}"),
+                            format!("{name} · change failed: {error}"),
+                        )),
                     );
                 }
                 (_, None) => {
@@ -4027,8 +4163,9 @@ async fn execute_action(
                         &path,
                         source.as_deref(),
                         !enabled,
-                        Some(format!(
-                            "{name} · 변경 실패: provider가 연결되지 않았습니다."
+                        Some(tr(
+                            format!("{name} · 변경 실패: provider가 연결되지 않았습니다."),
+                            format!("{name} · change failed: the provider isn't connected."),
                         )),
                     );
                 }
@@ -4223,18 +4360,21 @@ async fn refresh_new_thread_catalogs(
                     state.update_skills(&response);
                     Vec::new()
                 }
-                Err(error) => vec![format!("Skill 조회 실패: {error}")],
+                Err(error) => vec![tr(format!("Skill 조회 실패: {error}"), format!("Skill lookup failed: {error}"))],
             },
-            None => vec!["Skill 조회 실패: OpenCode 연결이 없습니다.".to_owned()],
+            None => vec![
+                tr("Skill 조회 실패: OpenCode 연결이 없습니다.", "Skill lookup failed: no OpenCode connection.")
+                    .to_owned(),
+            ],
         };
     }
 
     let using_codex = is_codex_model(&model);
     if using_codex && let Err(error) = server.start_codex().await {
-        return vec![format!("Codex 목록 조회 실패: {error}")];
+        return vec![tr(format!("Codex 목록 조회 실패: {error}"), format!("Codex list lookup failed: {error}"))];
     }
     let Some(client) = server.integration_client(&model) else {
-        return vec!["Skills·Plugins 조회 연결이 없습니다.".to_owned()];
+        return vec![tr("Skills·Plugins 조회 연결이 없습니다.", "No connection for looking up skills and plugins.").to_owned()];
     };
     let skills_client = client.clone();
     let plugins_client = client;
@@ -4263,23 +4403,32 @@ async fn refresh_new_thread_catalogs(
             Ok(response) => {
                 let models = parse_models(&response);
                 if models.is_empty() {
-                    errors.push("Codex 모델 조회 실패: 사용 가능한 모델이 없습니다.".to_owned());
+                    errors.push(
+                        tr(
+                            "Codex 모델 조회 실패: 사용 가능한 모델이 없습니다.",
+                            "Codex model lookup failed: no models are available.",
+                        )
+                        .to_owned(),
+                    );
                 } else {
                     state.replace_codex_models(models);
                 }
             }
-            Err(error) => errors.push(format!("Codex 모델 조회 실패: {error}")),
+            Err(error) => errors.push(tr(
+                format!("Codex 모델 조회 실패: {error}"),
+                format!("Codex model lookup failed: {error}"),
+            )),
         }
     }
     match skills {
         Ok(response) => state.update_skills_for_model(&model, &response),
-        Err(error) => errors.push(format!("Skill 조회 실패: {error}")),
+        Err(error) => errors.push(tr(format!("Skill 조회 실패: {error}"), format!("Skill lookup failed: {error}"))),
     }
     match plugins {
         Ok(response) => state.update_plugins_for_model(&response, &model),
         Err(error) => {
             state.note_plugin_query_error_for_model(error.to_string(), &model);
-            errors.push(format!("플러그인 조회 실패: {error}"));
+            errors.push(tr(format!("플러그인 조회 실패: {error}"), format!("Plugin lookup failed: {error}")));
         }
     }
     errors
@@ -4562,17 +4711,17 @@ fn parse_resumed_thread(response: &Value) -> Result<ResumedThread> {
     let id = thread
         .get("id")
         .and_then(Value::as_str)
-        .context("재개한 thread에 id가 없습니다.")?
+        .context(tr("재개한 thread에 id가 없습니다.", "The resumed thread has no id."))?
         .to_owned();
     let cwd = response
         .get("cwd")
         .and_then(Value::as_str)
-        .context("thread/resume 응답에 cwd가 없습니다.")?
+        .context(tr("thread/resume 응답에 cwd가 없습니다.", "The thread/resume response has no cwd."))?
         .to_owned();
     let model = response
         .get("model")
         .and_then(Value::as_str)
-        .context("thread/resume 응답에 model이 없습니다.")?
+        .context(tr("thread/resume 응답에 model이 없습니다.", "The thread/resume response has no model."))?
         .to_owned();
     let effort = response
         .get("reasoningEffort")
@@ -4591,17 +4740,23 @@ fn parse_resumed_thread(response: &Value) -> Result<ResumedThread> {
 fn thread_with_initial_turns(response: &Value) -> Result<Value> {
     let mut thread = response
         .get("thread")
-        .context("thread/resume 응답에 thread가 없습니다.")?
+        .context(tr("thread/resume 응답에 thread가 없습니다.", "The thread/resume response has no thread."))?
         .clone();
     if let Some(turns) = response.pointer("/initialTurnsPage/data").cloned() {
         thread
             .as_object_mut()
-            .context("thread/resume 응답의 thread 형식이 올바르지 않습니다.")?
+            .context(tr(
+                "thread/resume 응답의 thread 형식이 올바르지 않습니다.",
+                "The thread in the thread/resume response has an invalid shape.",
+            ))?
             .insert("turns".to_owned(), turns);
     } else if !thread.get("turns").is_some_and(Value::is_array) {
         thread
             .as_object_mut()
-            .context("thread/resume 응답의 thread 형식이 올바르지 않습니다.")?
+            .context(tr(
+                "thread/resume 응답의 thread 형식이 올바르지 않습니다.",
+                "The thread in the thread/resume response has an invalid shape.",
+            ))?
             .insert("turns".to_owned(), json!([]));
     }
     Ok(thread)
@@ -4614,7 +4769,7 @@ async fn hydrate_thread_history(server: &BackendServer, response: &Value) -> Res
     let thread_id = thread
         .get("id")
         .and_then(Value::as_str)
-        .context("thread/resume 응답에 thread.id가 없습니다.")?
+        .context(tr("thread/resume 응답에 thread.id가 없습니다.", "The thread/resume response has no thread.id."))?
         .to_owned();
     let mut cursor = None;
     let mut seen_cursors = std::collections::HashSet::new();
@@ -4630,7 +4785,7 @@ async fn hydrate_thread_history(server: &BackendServer, response: &Value) -> Res
         let data = page
             .get("data")
             .and_then(Value::as_array)
-            .context("thread/turns/list 응답에 data가 없습니다.")?;
+            .context(tr("thread/turns/list 응답에 data가 없습니다.", "The thread/turns/list response has no data."))?;
         turns.extend(data.iter().cloned());
         let Some(next) = page
             .get("nextCursor")
@@ -4639,7 +4794,13 @@ async fn hydrate_thread_history(server: &BackendServer, response: &Value) -> Res
         else {
             break;
         };
-        anyhow::ensure!(seen_cursors.insert(next.clone()), "대화 기록 페이지가 반복되어 재개를 중단했습니다.");
+        anyhow::ensure!(
+            seen_cursors.insert(next.clone()),
+            tr(
+                "대화 기록 페이지가 반복되어 재개를 중단했습니다.",
+                "Stopped resuming because a conversation history page repeated.",
+            )
+        );
         cursor = Some(next);
     }
     thread
@@ -4747,7 +4908,7 @@ async fn set_fast_mode(server: &BackendServer, state: &mut AppState, enabled: bo
         state.push_notice(
             BlockKind::Error,
             "Fast toggle failed",
-            "세션을 먼저 시작하지 못했습니다.",
+            tr("세션을 먼저 시작하지 못했습니다.", "Couldn't start the session first."),
         );
         return;
     };
@@ -4785,7 +4946,7 @@ async fn update_turn_settings(
     effort: &str,
 ) {
     let Some(turn_id) = state.turn_id.clone().filter(|turn| !turn.is_empty()) else {
-        state.set_composer_notice("Applies to the next request".to_owned());
+        state.set_composer_notice(tr("다음 요청부터 적용됩니다", "Applies to the next request").to_owned());
         return;
     };
     let params = json!({
@@ -4795,8 +4956,8 @@ async fn update_turn_settings(
         "effort": effort
     });
     match server.request("turn/settings/update", params).await {
-        Ok(_) => state.set_composer_notice("Applied to this request".to_owned()),
-        Err(_) => state.set_composer_notice("Applies to the next request".to_owned()),
+        Ok(_) => state.set_composer_notice(tr("이번 요청에 적용했습니다", "Applied to this request").to_owned()),
+        Err(_) => state.set_composer_notice(tr("다음 요청부터 적용됩니다", "Applies to the next request").to_owned()),
     }
 }
 
@@ -5140,7 +5301,10 @@ async fn list_plugins(server: &BackendServer, state: &AppState) -> Result<Value>
 
 async fn list_mcp_servers(server: &BackendServer, state: &AppState) -> Result<Value> {
     let thread_id = integration_mcp_thread_id(server, state)
-        .context("현재 provider의 MCP 세션이 아직 시작되지 않았습니다.")?;
+        .context(tr(
+            "현재 provider의 MCP 세션이 아직 시작되지 않았습니다.",
+            "The current provider's MCP session hasn't started yet.",
+        ))?;
     server
         .integration_request(
             state.selected_model_name(),
@@ -5284,7 +5448,7 @@ fn format_reload_report(
 ) -> String {
     let mut lines = Vec::new();
     if let Some(error) = reconnect_error {
-        lines.push(format!("MCP 재연결 실패 · {error}"));
+        lines.push(tr(format!("MCP 재연결 실패 · {error}"), format!("MCP reconnect failed · {error}")));
     } else if let Some(servers) = servers {
         let needs_login = servers
             .iter()
@@ -5292,11 +5456,15 @@ fn format_reload_report(
             .map(|server| server.name.as_str())
             .collect::<Vec<_>>();
         if !needs_login.is_empty() {
-            lines.push(format!("로그인 필요: {}", needs_login.join(", ")));
+            let needs_login = needs_login.join(", ");
+            lines.push(tr(format!("로그인 필요: {needs_login}"), format!("Sign-in needed: {needs_login}")));
         }
     }
     if let Some(error) = integrations_error {
-        lines.push(format!("일부 목록을 갱신하지 못했습니다 · {error}"));
+        lines.push(tr(
+            format!("일부 목록을 갱신하지 못했습니다 · {error}"),
+            format!("Some lists couldn't be refreshed · {error}"),
+        ));
     }
     lines.join("\n")
 }
@@ -5339,17 +5507,21 @@ fn format_upgrade_result(response: &Value) -> String {
         .collect::<Vec<_>>();
 
     let scope = if considered.is_empty() {
-        "Git 마켓플레이스".to_owned()
+        tr("Git 마켓플레이스", "Git marketplaces").to_owned()
     } else {
         considered.join(", ")
     };
     if !errors.is_empty() {
-        return format!("{scope} · {upgraded}개 갱신 · 실패: {}", errors.join("; "));
+        let errors = errors.join("; ");
+        return tr(
+            format!("{scope} · {upgraded}개 갱신 · 실패: {errors}"),
+            format!("{scope} · {upgraded} refreshed · failed: {errors}"),
+        );
     }
     if upgraded == 0 {
-        return format!("{scope} · 이미 최신 상태입니다.");
+        return tr(format!("{scope} · 이미 최신 상태입니다."), format!("{scope} · already up to date."));
     }
-    format!("{scope} · {upgraded}개를 갱신했습니다.")
+    tr(format!("{scope} · {upgraded}개를 갱신했습니다."), format!("{scope} · refreshed {upgraded}."))
 }
 
 struct IntegrationCatalog {
@@ -5400,7 +5572,10 @@ async fn fetch_integrations(
         let Some(thread_id) = mcp_thread_id else {
             return Ok(json!({
                 "data": [],
-                "unavailableReason": "provider 세션이 아직 시작되지 않았습니다."
+                "unavailableReason": tr(
+                    "provider 세션이 아직 시작되지 않았습니다.",
+                    "The provider session hasn't started yet.",
+                )
             }));
         };
         mcp_client
@@ -5449,25 +5624,25 @@ fn apply_integrations(state: &mut AppState, catalog: IntegrationCatalog) -> Resu
     match catalog.skills {
         Ok(response) if is_current_provider => state.update_skills(&response),
         Ok(_) => {}
-        Err(error) => errors.push(format!("Skill 조회 실패: {error}")),
+        Err(error) => errors.push(tr(format!("Skill 조회 실패: {error}"), format!("Skill lookup failed: {error}"))),
     }
     match catalog.plugins {
         Ok(response) => state.update_plugins_for_model(&response, &model),
         Err(error) => {
             state.note_plugin_query_error_for_model(&error, &model);
-            errors.push(format!("플러그인 조회 실패: {error}"));
+            errors.push(tr(format!("플러그인 조회 실패: {error}"), format!("Plugin lookup failed: {error}")));
         }
     }
     match catalog.apps {
         Ok(response) if is_current_provider => state.update_apps(&response),
         Ok(_) => {}
-        Err(error) => errors.push(format!("App 조회 실패: {error}")),
+        Err(error) => errors.push(tr(format!("App 조회 실패: {error}"), format!("App lookup failed: {error}"))),
     }
     match catalog.mcp {
         Ok(response) => state.update_mcp_servers_for_model(&response, &model),
         Err(error) => {
             state.note_mcp_query_error_for_model(&error, &model);
-            errors.push(format!("MCP 조회 실패: {error}"));
+            errors.push(tr(format!("MCP 조회 실패: {error}"), format!("MCP lookup failed: {error}")));
         }
     }
     if errors.is_empty() {
@@ -5594,7 +5769,11 @@ async fn start_skills_refresh(
                 .await
                 .map_err(|error| error.to_string())
         } else {
-            Err("현재 provider의 Skill 조회 연결이 없습니다.".to_owned())
+            Err(tr(
+                "현재 provider의 Skill 조회 연결이 없습니다.",
+                "The current provider has no connection for looking up skills.",
+            )
+            .to_owned())
         };
         let _ = sender.send((result_model, result)).await;
     });
@@ -5678,9 +5857,10 @@ fn skill_write_request(
 ) -> Result<(&'static str, Value)> {
     let (method, params) = match provider {
         SkillProvider::Claude => {
-            let plugin_id = source.context(
+            let plugin_id = source.context(tr(
                 "개인·프로젝트 스킬은 파일이 있으면 항상 켜져 있어 여기서 끌 수 없습니다.",
-            )?;
+                "Personal and project skills stay on while their files exist, so they can't be turned off here.",
+            ))?;
             (
                 "plugin/set-enabled",
                 json!({
@@ -5799,7 +5979,12 @@ fn link_directory(target: &str, cwd: &Path) -> Result<Option<PathBuf>> {
     {
         reqwest::Url::parse(&target)?
             .to_file_path()
-            .map_err(|_| anyhow::anyhow!("파일 경로를 읽을 수 없습니다: {target}"))?
+            .map_err(|_| {
+                anyhow::anyhow!(tr(
+                    format!("파일 경로를 읽을 수 없습니다: {target}"),
+                    format!("Can't read the file path: {target}"),
+                ))
+            })?
     } else {
         let path = PathBuf::from(&target);
         if !path.is_absolute() && reqwest::Url::parse(&target).is_ok() {
@@ -5810,10 +5995,14 @@ fn link_directory(target: &str, cwd: &Path) -> Result<Option<PathBuf>> {
     let directory = if path.is_dir() {
         path
     } else {
-        path.parent().context("상위 폴더가 없습니다")?.to_path_buf()
+        path.parent().context(tr("상위 폴더가 없습니다", "There is no parent folder"))?.to_path_buf()
     };
     if !directory.is_dir() {
-        bail!("폴더를 찾을 수 없습니다: {}", directory.display());
+        let directory = directory.display();
+        bail!(tr(
+            format!("폴더를 찾을 수 없습니다: {directory}"),
+            format!("Can't find the folder: {directory}"),
+        ));
     }
     Ok(Some(directory))
 }
@@ -5844,7 +6033,7 @@ fn open_url(url: &str) -> Result<()> {
     child_process::isolate_launcher(&mut command);
     command
         .spawn()
-        .with_context(|| format!("URL을 열지 못했습니다: {url}"))?;
+        .with_context(|| tr(format!("URL을 열지 못했습니다: {url}"), format!("Couldn't open the URL: {url}")))?;
     Ok(())
 }
 
@@ -6427,14 +6616,20 @@ fn start_login_flow(state: &mut AppState, method: LoginMethod, response: &Value)
                         state.push_notice(
                             BlockKind::Warning,
                             "Browser open failed",
-                            format!("{error}\n위 Sign-in URL을 직접 열어주세요."),
+                            tr(
+                                format!("{error}\n위 Sign-in URL을 직접 열어주세요."),
+                                format!("{error}\nOpen the Sign-in URL above yourself."),
+                            ),
                         );
                     }
                 }
                 _ => state.push_notice(
                     BlockKind::Error,
                     "Login failed",
-                    "The server did not return a login ID (loginId) or login URL (authUrl).\nUse /login to try again.",
+                    tr(
+                        "서버가 로그인 ID(loginId)나 로그인 URL(authUrl)을 보내지 않았습니다.\n/login으로 다시 시도하세요.",
+                        "The server did not return a login ID (loginId) or login URL (authUrl).\nUse /login to try again.",
+                    ),
                 ),
             }
         }
@@ -6450,7 +6645,10 @@ fn start_login_flow(state: &mut AppState, method: LoginMethod, response: &Value)
                 _ => state.push_notice(
                     BlockKind::Error,
                     "Login failed",
-                    "The server did not return one or more required fields: loginId, verificationUrl, userCode.\nUse /login to try again.",
+                    tr(
+                        "서버가 필요한 값(loginId, verificationUrl, userCode) 중 일부를 보내지 않았습니다.\n/login으로 다시 시도하세요.",
+                        "The server did not return one or more required fields: loginId, verificationUrl, userCode.\nUse /login to try again.",
+                    ),
                 ),
             }
         }
@@ -6628,7 +6826,10 @@ async fn ensure_account(server: &BackendServer) -> Result<String> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if requires_auth && response.get("account").is_none_or(Value::is_null) {
-        bail!("OpenAI 로그인이 필요합니다. 공식 `codex login`을 먼저 실행하세요.");
+        bail!(tr(
+            "OpenAI 로그인이 필요합니다. 공식 `codex login`을 먼저 실행하세요.",
+            "An OpenAI sign-in is needed. Run the official `codex login` first.",
+        ));
     }
     let account = response.get("account").unwrap_or(&Value::Null);
     let label = match account.get("type").and_then(Value::as_str) {
@@ -6693,8 +6894,6 @@ async fn start_or_resume_thread(
 }
 
 const ACTIVE_WRITER_RESUME_ERROR: &str = "already has an active writer";
-const ACTIVE_WRITER_RESUME_NOTICE: &str =
-    "이 대화는 다른 Codex 창에서 사용 중입니다. 기존 대화를 닫은 뒤 다시 시도하세요.";
 
 async fn request_resume_thread(server: &BackendServer, params: Value) -> Result<Value> {
     server
@@ -6705,7 +6904,11 @@ async fn request_resume_thread(server: &BackendServer, params: Value) -> Result<
 
 fn resume_error_message(error: &str) -> String {
     if error.contains(ACTIVE_WRITER_RESUME_ERROR) {
-        ACTIVE_WRITER_RESUME_NOTICE.to_owned()
+        tr(
+            "이 대화는 다른 Codex 창에서 사용 중입니다. 기존 대화를 닫은 뒤 다시 시도하세요.",
+            "Another Codex window is using this conversation. Close it there, then try again.",
+        )
+        .to_owned()
     } else {
         error.to_owned()
     }
@@ -6770,7 +6973,7 @@ async fn resolve_session_target(
         .or(fallback)
         .or_else(|| (sessions.len() == 1).then(|| &sessions[0]))
         .map(|session| session.id.clone())
-        .with_context(|| format!("`{target}` 세션을 찾을 수 없습니다."))
+        .with_context(|| tr(format!("`{target}` 세션을 찾을 수 없습니다."), format!("Can't find session `{target}`.")))
 }
 
 fn looks_like_thread_id(value: &str) -> bool {
@@ -6807,13 +7010,18 @@ fn choose_model<'a>(models: &'a [ModelInfo], requested: Option<&str>) -> Result<
         return models
             .iter()
             .find(|model| model.matches_query(requested))
-            .with_context(|| format!("모델 카탈로그에 `{requested}`가 없습니다."));
+            .with_context(|| {
+                tr(
+                    format!("모델 카탈로그에 `{requested}`가 없습니다."),
+                    format!("`{requested}` isn't in the model catalog."),
+                )
+            });
     }
     models
         .iter()
         .find(|model| model.is_default)
         .or_else(|| models.first())
-        .context("기본 모델을 찾을 수 없습니다.")
+        .context(tr("기본 모델을 찾을 수 없습니다.", "Can't find the default model."))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6931,14 +7139,15 @@ fn validate_effort(models: &[ModelInfo], model_name: &str, effort: Option<&str>)
             .collect::<Vec<_>>()
             .join(", ");
         let supported = if supported.is_empty() {
-            "없음"
+            tr("없음", "none")
         } else {
             &supported
         };
-        bail!(
-            "`{}` 모델은 `{effort}` reasoning을 지원하지 않습니다. 지원값: {supported}",
-            model.display_name
-        );
+        let model = &model.display_name;
+        bail!(tr(
+            format!("`{model}` 모델은 `{effort}` reasoning을 지원하지 않습니다. 지원값: {supported}"),
+            format!("Model `{model}` doesn't support `{effort}` reasoning. Supported: {supported}"),
+        ));
     }
     Ok(())
 }
@@ -6946,10 +7155,16 @@ fn validate_effort(models: &[ModelInfo], model_name: &str, effort: Option<&str>)
 fn resolve_cwd(requested: Option<&Path>) -> Result<PathBuf> {
     let path = requested
         .map(Path::to_path_buf)
-        .unwrap_or(env::current_dir().context("현재 작업 폴더를 확인할 수 없습니다.")?);
+        .unwrap_or(
+            env::current_dir()
+                .context(tr("현재 작업 폴더를 확인할 수 없습니다.", "Can't determine the current working folder."))?,
+        );
     let resolved = path
         .canonicalize()
-        .with_context(|| format!("작업 폴더를 열 수 없습니다: {}", path.display()))?;
+        .with_context(|| {
+            let path = path.display();
+            tr(format!("작업 폴더를 열 수 없습니다: {path}"), format!("Can't open the working folder: {path}"))
+        })?;
     Ok(plain_windows_path(resolved))
 }
 
@@ -7969,7 +8184,10 @@ mod tests {
     fn an_active_writer_resume_error_explains_how_to_retry() {
         let error = "thread/resume: thread 019ff007 already has an active writer (-32600)";
 
-        assert_eq!(resume_error_message(error), ACTIVE_WRITER_RESUME_NOTICE);
+        assert_eq!(
+            resume_error_message(error),
+            "이 대화는 다른 Codex 창에서 사용 중입니다. 기존 대화를 닫은 뒤 다시 시도하세요."
+        );
     }
 
     #[test]

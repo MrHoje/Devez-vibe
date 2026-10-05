@@ -22,7 +22,7 @@ use tokio::{
     time::{sleep, timeout},
 };
 
-use crate::app_server::ServerEvent;
+use crate::{app_server::ServerEvent, language::tr};
 
 /// OpenCode provider 연동. /provider opencode와 /connect가 이 스위치를 따른다.
 pub const PROVIDER_ENABLED: bool = true;
@@ -381,13 +381,17 @@ impl OpenCodeClient {
         match timeout(REQUEST_TIMEOUT, response_rx).await {
             Ok(Ok(Ok(result))) => Ok(result),
             Ok(Ok(Err(error))) => bail!("{method}: {error}"),
-            Ok(Err(_)) => bail!("{method}: OpenCode ACP 응답 채널이 종료되었습니다."),
+            Ok(Err(_)) => bail!(tr(
+                format!("{method}: OpenCode ACP 응답 채널이 종료되었습니다."),
+                format!("{method}: the OpenCode ACP response channel closed."),
+            )),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
-                bail!(
-                    "{method}: OpenCode가 {}분 동안 응답하지 않아 요청을 중단했습니다.",
-                    REQUEST_TIMEOUT.as_secs() / 60
-                )
+                let minutes = REQUEST_TIMEOUT.as_secs() / 60;
+                bail!(tr(
+                    format!("{method}: OpenCode가 {minutes}분 동안 응답하지 않아 요청을 중단했습니다."),
+                    format!("{method}: stopped the request because OpenCode didn't answer for {minutes} minutes."),
+                ))
             }
         }
     }
@@ -499,9 +503,11 @@ impl OpenCodeClient {
             .lock()
             .expect("outbound mutex")
             .as_ref()
-            .ok_or_else(|| anyhow!("OpenCode ACP 연결이 이미 종료되었습니다."))?
+            .ok_or_else(|| {
+                anyhow!(tr("OpenCode ACP 연결이 이미 종료되었습니다.", "The OpenCode ACP connection has already closed."))
+            })?
             .send(message)
-            .map_err(|_| anyhow!("OpenCode ACP에 메시지를 보낼 수 없습니다."))
+            .map_err(|_| anyhow!(tr("OpenCode ACP에 메시지를 보낼 수 없습니다.", "Can't send a message to OpenCode ACP.")))
     }
 }
 
@@ -549,7 +555,10 @@ impl ProviderAuthServer {
             }
             sleep(Duration::from_millis(100)).await;
         }
-        bail!("OpenCode provider API가 제한 시간 안에 준비되지 않았습니다.")
+        bail!(tr(
+            "OpenCode provider API가 제한 시간 안에 준비되지 않았습니다.",
+            "The OpenCode provider API wasn't ready within the time limit.",
+        ))
     }
 
     pub async fn catalog(&self) -> Result<Value> {
@@ -650,7 +659,7 @@ impl ProviderAuthServer {
         let response = request
             .send()
             .await
-            .context("OpenCode provider API 요청 실패")?;
+            .context(tr("OpenCode provider API 요청 실패", "OpenCode provider API request failed"))?;
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -669,14 +678,15 @@ impl ProviderAuthServer {
         if body.trim().is_empty() {
             Ok(Value::Null)
         } else {
-            serde_json::from_str(&body).context("OpenCode provider API 응답 해석 실패")
+            serde_json::from_str(&body)
+                .context(tr("OpenCode provider API 응답 해석 실패", "Couldn't parse the OpenCode provider API response"))
         }
     }
 
     fn url(&self, segments: &[&str]) -> Result<reqwest::Url> {
         let mut url = self.base_url.clone();
         url.path_segments_mut()
-            .map_err(|_| anyhow!("OpenCode provider API URL을 만들 수 없습니다."))?
+            .map_err(|_| anyhow!(tr("OpenCode provider API URL을 만들 수 없습니다.", "Can't build the OpenCode provider API URL.")))?
             .extend(segments);
         Ok(url)
     }
@@ -736,7 +746,7 @@ fn open_code_skill_scope(location: Option<&str>) -> &'static str {
 impl OpenCodeServer {
     pub async fn spawn(open_code_path: &Path, cwd: &Path) -> Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
-            .context("OpenCode provider API 포트를 확보하지 못했습니다.")?;
+            .context(tr("OpenCode provider API 포트를 확보하지 못했습니다.", "Couldn't reserve a port for the OpenCode provider API."))?;
         let port = listener.local_addr()?.port();
         drop(listener);
         let resolved = resolve_command(open_code_path);
@@ -756,18 +766,22 @@ impl OpenCodeServer {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().with_context(|| {
-            format!("OpenCode ACP를 시작하지 못했습니다: {}", resolved.display())
+            let resolved = resolved.display();
+            tr(
+                format!("OpenCode ACP를 시작하지 못했습니다: {resolved}"),
+                format!("Couldn't start OpenCode ACP: {resolved}"),
+            )
         })?;
         let job = crate::child_process::adopt_backend(&child);
-        let stdin = child.stdin.take().context("OpenCode ACP stdin 연결 실패")?;
+        let stdin = child.stdin.take().context(tr("OpenCode ACP stdin 연결 실패", "OpenCode ACP stdin connection failed"))?;
         let stdout = child
             .stdout
             .take()
-            .context("OpenCode ACP stdout 연결 실패")?;
+            .context(tr("OpenCode ACP stdout 연결 실패", "OpenCode ACP stdout connection failed"))?;
         let stderr = child
             .stderr
             .take()
-            .context("OpenCode ACP stderr 연결 실패")?;
+            .context(tr("OpenCode ACP stderr 연결 실패", "OpenCode ACP stderr connection failed"))?;
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Value>();
         let (event_tx, events) = mpsc::unbounded_channel::<ServerEvent>();
@@ -821,8 +835,9 @@ impl OpenCodeServer {
                                 .await;
                             }
                             Err(error) => {
-                                let _ = reader_events.send(ServerEvent::ProtocolWarning(format!(
-                                    "OpenCode ACP JSON 해석 실패: {error}"
+                                let _ = reader_events.send(ServerEvent::ProtocolWarning(tr(
+                                    format!("OpenCode ACP JSON 해석 실패: {error}"),
+                                    format!("Couldn't parse OpenCode ACP JSON: {error}"),
                                 )));
                             }
                         }
@@ -830,8 +845,9 @@ impl OpenCodeServer {
                     Ok(Some(_)) => {}
                     Ok(None) => break,
                     Err(error) => {
-                        let _ = reader_events.send(ServerEvent::ProtocolWarning(format!(
-                            "OpenCode ACP 출력 읽기 실패: {error}"
+                        let _ = reader_events.send(ServerEvent::ProtocolWarning(tr(
+                            format!("OpenCode ACP 출력 읽기 실패: {error}"),
+                            format!("Couldn't read OpenCode ACP output: {error}"),
                         )));
                         break;
                     }
@@ -839,7 +855,7 @@ impl OpenCodeServer {
             }
             let mut pending = reader_pending.lock().await;
             for (_, sender) in pending.drain() {
-                let _ = sender.send(Err("OpenCode ACP 연결이 종료되었습니다.".to_owned()));
+                let _ = sender.send(Err(tr("OpenCode ACP 연결이 종료되었습니다.", "The OpenCode ACP connection closed.").to_owned()));
             }
             drop(pending);
             // 연결이 죽으면 응답을 기다리던 턴을 닫아 스피너가 영원히 남지
@@ -853,7 +869,7 @@ impl OpenCodeServer {
                         "threadId": turn.session_id,
                         "turn": {
                             "id": turn.turn_id,
-                            "error": { "message": "OpenCode ACP 연결이 종료되었습니다." }
+                            "error": { "message": tr("OpenCode ACP 연결이 종료되었습니다.", "The OpenCode ACP connection closed.") }
                         }
                     }),
                 });
@@ -869,9 +885,7 @@ impl OpenCodeServer {
             for (method, params) in cleared {
                 notify(&reader_events, &method, params);
             }
-            let _ = reader_events.send(ServerEvent::Closed(
-                "OpenCode ACP 연결이 종료되었습니다.".to_owned(),
-            ));
+            let _ = reader_events.send(ServerEvent::Closed(tr("OpenCode ACP 연결이 종료되었습니다.", "The OpenCode ACP connection closed.").to_owned()));
         });
 
         let stderr_events = event_tx.clone();
@@ -979,7 +993,7 @@ impl OpenCodeServer {
         let session_id = response
             .get("sessionId")
             .and_then(Value::as_str)
-            .context("OpenCode 모델 조회 세션에 id가 없습니다.")?;
+            .context(tr("OpenCode 모델 조회 세션에 id가 없습니다.", "The OpenCode model lookup session has no id."))?;
         let provider_catalog = self
             .provider_auth
             .model_catalog()
@@ -1059,7 +1073,7 @@ impl OpenCodeServer {
         let session_id = response
             .get("sessionId")
             .and_then(Value::as_str)
-            .context("OpenCode 새 세션에 id가 없습니다.")?;
+            .context(tr("OpenCode 새 세션에 id가 없습니다.", "The new OpenCode session has no id."))?;
         let model = strip_model_prefix(model);
         self.set_model(session_id, model, effort).await?;
         Ok(thread_response(
@@ -1163,7 +1177,7 @@ impl OpenCodeServer {
         let forked = response
             .get("sessionId")
             .and_then(Value::as_str)
-            .context("OpenCode 분기 세션에 id가 없습니다.")?
+            .context(tr("OpenCode 분기 세션에 id가 없습니다.", "The forked OpenCode session has no id."))?
             .to_owned();
         // A fork starts on the workspace defaults, so the parent's own selection
         // has to be written onto the new session before it answers anything.
@@ -1223,9 +1237,10 @@ impl OpenCodeServer {
                     let path = item
                         .get("path")
                         .and_then(Value::as_str)
-                        .context("이미지 입력에 경로가 없습니다.")?;
-                    let data = fs::read(path)
-                        .with_context(|| format!("이미지를 읽지 못했습니다: {path}"))?;
+                        .context(tr("이미지 입력에 경로가 없습니다.", "The image input has no path."))?;
+                    let data = fs::read(path).with_context(|| {
+                        tr(format!("이미지를 읽지 못했습니다: {path}"), format!("Couldn't read the image: {path}"))
+                    })?;
                     prompt.push(json!({
                         "type": "image",
                         "data": BASE64.encode(data),
@@ -1835,7 +1850,7 @@ fn open_code_request_id(id: &Value) -> Result<Value> {
         .filter(|backend| *backend == "opencode")
         .and_then(|_| id.get("id"))
         .cloned()
-        .context("OpenCode 요청 id가 올바르지 않습니다.")
+        .context(tr("OpenCode 요청 id가 올바르지 않습니다.", "The OpenCode request id is invalid."))
 }
 
 pub fn is_open_code_request_id(id: &Value) -> bool {
@@ -2120,7 +2135,7 @@ fn format_rpc_error(error: &Value) -> String {
     let message = error
         .get("message")
         .and_then(Value::as_str)
-        .unwrap_or("알 수 없는 OpenCode ACP 오류");
+        .unwrap_or(tr("알 수 없는 OpenCode ACP 오류", "Unknown OpenCode ACP error"));
     match error.get("code").and_then(Value::as_i64) {
         Some(code) => format!("{message} ({code})"),
         None => message.to_owned(),

@@ -134,6 +134,7 @@ dvz update
 - 터미널 스크롤백을 보존하며 변경된 행만 갱신하는 증분 렌더링
 - Git 브랜치, 모델, effort, context, 5h/주간 한도, Fast 상태를 표시하는 하단 상태줄
 - `/vibemode`(`Alt+V`)로 응답·shell·diff 표시를 한 번에 조절
+- `/language korean|english`로 설명·알림·오류 문구의 언어 전환(기본 한국어, 제목·버튼·단축키는 영어 유지)
 
 ## 소스에서 빌드
 

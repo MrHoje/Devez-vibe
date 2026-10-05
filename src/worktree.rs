@@ -5,11 +5,13 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
+use crate::language::tr;
+
 fn git(cwd: &Path, args: &[&str]) -> Result<String> {
     let mut command = Command::new("git");
     command.current_dir(cwd).args(args);
     crate::child_process::isolate_launcher(&mut command);
-    let output = command.output().context("Git을 실행할 수 없습니다.")?;
+    let output = command.output().context(tr("Git을 실행할 수 없습니다.", "Can't run Git."))?;
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
@@ -137,11 +139,11 @@ pub fn prepare(cwd: &Path, requested: Option<&str>) -> Result<PathBuf> {
     )?;
     let root = Path::new(&common)
         .parent()
-        .context("저장소 경로가 없습니다.")?;
+        .context(tr("저장소 경로가 없습니다.", "There is no repository path."))?;
     let directory = root.with_file_name(format!(
         "{}.worktrees",
         root.file_name()
-            .context("저장소 이름이 없습니다.")?
+            .context(tr("저장소 이름이 없습니다.", "There is no repository name."))?
             .to_string_lossy()
     ));
     let branches = git(
@@ -149,7 +151,10 @@ pub fn prepare(cwd: &Path, requested: Option<&str>) -> Result<PathBuf> {
         &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
     )?;
     let branch = git(cwd, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .context("현재 브랜치가 없습니다. 브랜치를 체크아웃한 뒤 /worktree를 실행하세요.")?;
+        .context(tr(
+            "현재 브랜치가 없습니다. 브랜치를 체크아웃한 뒤 /worktree를 실행하세요.",
+            "There is no current branch. Check out a branch, then run /worktree.",
+        ))?;
     let name = match requested {
         Some(name) => {
             git(cwd, &["check-ref-format", "--branch", name])?;
@@ -161,7 +166,7 @@ pub fn prepare(cwd: &Path, requested: Option<&str>) -> Result<PathBuf> {
                 !branches.lines().any(|branch| branch == name)
                     && directory.join(name).symlink_metadata().is_err()
             })
-            .context("사용 가능한 작업 트리 이름이 없습니다.")?,
+            .context(tr("사용 가능한 작업 트리 이름이 없습니다.", "No worktree name is available."))?,
     };
     // Names become both branch names and relative paths; reject traversal and Windows path syntax.
     if name.is_empty()
@@ -176,30 +181,37 @@ pub fn prepare(cwd: &Path, requested: Option<&str>) -> Result<PathBuf> {
             .components()
             .any(|part| !matches!(part, Component::Normal(_)))
     {
-        bail!("작업 트리 이름에는 상대 브랜치 이름을 사용하세요.");
+        bail!(tr(
+            "작업 트리 이름에는 상대 브랜치 이름을 사용하세요.",
+            "Use a relative branch name for the worktree name.",
+        ));
     }
     git(cwd, &["check-ref-format", "--branch", &name])?;
     let path = directory.join(&name);
     if path.symlink_metadata().is_ok() || branches.lines().any(|branch| branch == name) {
-        bail!("이미 존재하는 작업 트리 또는 브랜치 이름입니다: {name}");
+        bail!(tr(
+            format!("이미 존재하는 작업 트리 또는 브랜치 이름입니다: {name}"),
+            format!("A worktree or branch with that name already exists: {name}"),
+        ));
     }
     // Never follow an existing symlink/junction in the destination's ancestors.
     for ancestor in path.ancestors().skip(1) {
         if let Ok(metadata) = ancestor.symlink_metadata() {
+            let linked = ancestor.display();
             if metadata.file_type().is_symlink() {
-                bail!(
-                    "작업 트리 경로에 연결된 폴더가 있습니다: {}",
-                    ancestor.display()
-                );
+                bail!(tr(
+                    format!("작업 트리 경로에 연결된 폴더가 있습니다: {linked}"),
+                    format!("The worktree path goes through a linked folder: {linked}"),
+                ));
             }
             #[cfg(windows)]
             {
                 use std::os::windows::fs::MetadataExt;
                 if metadata.file_attributes() & 0x400 != 0 {
-                    bail!(
-                        "작업 트리 경로에 연결된 폴더가 있습니다: {}",
-                        ancestor.display()
-                    );
+                    bail!(tr(
+                        format!("작업 트리 경로에 연결된 폴더가 있습니다: {linked}"),
+                        format!("The worktree path goes through a linked folder: {linked}"),
+                    ));
                 }
             }
         }
@@ -213,7 +225,7 @@ pub fn prepare(cwd: &Path, requested: Option<&str>) -> Result<PathBuf> {
             "-b",
             &name,
             path.to_str()
-                .context("작업 트리 경로를 읽을 수 없습니다.")?,
+                .context(tr("작업 트리 경로를 읽을 수 없습니다.", "Can't read the worktree path."))?,
             "HEAD",
         ],
     )?;

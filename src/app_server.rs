@@ -21,6 +21,8 @@ use tokio::{
     time::timeout,
 };
 
+use crate::language::tr;
+
 type PendingResponse = oneshot::Sender<Result<Value, String>>;
 type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
 
@@ -58,13 +60,17 @@ impl AppServerClient {
         match timeout(REQUEST_TIMEOUT, response_rx).await {
             Ok(Ok(Ok(result))) => Ok(result),
             Ok(Ok(Err(error))) => bail!("{method}: {error}"),
-            Ok(Err(_)) => bail!("{method}: app-server 응답 채널이 종료되었습니다."),
+            Ok(Err(_)) => bail!(tr(
+                format!("{method}: app-server 응답 채널이 종료되었습니다."),
+                format!("{method}: the app-server response channel closed."),
+            )),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
-                bail!(
-                    "{method}: Codex app-server가 {}분 동안 응답하지 않아 요청을 중단했습니다.",
-                    REQUEST_TIMEOUT.as_secs() / 60
-                )
+                let minutes = REQUEST_TIMEOUT.as_secs() / 60;
+                bail!(tr(
+                    format!("{method}: Codex app-server가 {minutes}분 동안 응답하지 않아 요청을 중단했습니다."),
+                    format!("{method}: stopped the request because the Codex app-server didn't answer for {minutes} minutes."),
+                ))
             }
         }
     }
@@ -100,9 +106,11 @@ impl AppServerClient {
             .lock()
             .expect("outbound mutex")
             .as_ref()
-            .ok_or_else(|| anyhow!("app-server 연결이 이미 종료되었습니다."))?
+            .ok_or_else(|| {
+                anyhow!(tr("app-server 연결이 이미 종료되었습니다.", "The app-server connection has already closed."))
+            })?
             .send(message)
-            .map_err(|_| anyhow!("app-server에 메시지를 보낼 수 없습니다."))
+            .map_err(|_| anyhow!(tr("app-server에 메시지를 보낼 수 없습니다.", "Can't send a message to the app-server.")))
     }
 }
 
@@ -159,16 +167,17 @@ impl AppServer {
             .stderr(Stdio::piped())
             .spawn()
             .with_context(|| {
-                format!(
-                    "Codex app-server를 시작하지 못했습니다: {}",
-                    resolved_codex.display()
+                let codex = resolved_codex.display();
+                tr(
+                    format!("Codex app-server를 시작하지 못했습니다: {codex}"),
+                    format!("Couldn't start the Codex app-server: {codex}"),
                 )
             })?;
 
         let job = crate::child_process::adopt_backend(&child);
-        let stdin = child.stdin.take().context("app-server stdin 연결 실패")?;
-        let stdout = child.stdout.take().context("app-server stdout 연결 실패")?;
-        let stderr = child.stderr.take().context("app-server stderr 연결 실패")?;
+        let stdin = child.stdin.take().context(tr("app-server stdin 연결 실패", "app-server stdin connection failed"))?;
+        let stdout = child.stdout.take().context(tr("app-server stdout 연결 실패", "app-server stdout connection failed"))?;
+        let stderr = child.stderr.take().context(tr("app-server stderr 연결 실패", "app-server stderr connection failed"))?;
 
         let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<Value>();
         let (event_tx, events) = mpsc::unbounded_channel::<ServerEvent>();
@@ -210,16 +219,18 @@ impl AppServer {
                                 route_message(message, &reader_pending, &reader_events).await;
                             }
                             Err(error) => {
-                                let _ = reader_events.send(ServerEvent::ProtocolWarning(format!(
-                                    "app-server JSON 해석 실패: {error}"
+                                let _ = reader_events.send(ServerEvent::ProtocolWarning(tr(
+                                    format!("app-server JSON 해석 실패: {error}"),
+                                    format!("Couldn't parse app-server JSON: {error}"),
                                 )));
                             }
                         }
                     }
                     Ok(None) => break,
                     Err(error) => {
-                        let _ = reader_events.send(ServerEvent::ProtocolWarning(format!(
-                            "app-server 출력 읽기 실패: {error}"
+                        let _ = reader_events.send(ServerEvent::ProtocolWarning(tr(
+                            format!("app-server 출력 읽기 실패: {error}"),
+                            format!("Couldn't read app-server output: {error}"),
                         )));
                         break;
                     }
@@ -227,13 +238,11 @@ impl AppServer {
             }
 
             let tail = reader_stderr.lock().await;
+            let closed = tr("app-server 연결이 종료되었습니다.", "The app-server connection closed.");
             let detail = if tail.is_empty() {
-                "app-server 연결이 종료되었습니다.".to_owned()
+                closed.to_owned()
             } else {
-                format!(
-                    "app-server 연결이 종료되었습니다.\n{}",
-                    tail.iter().cloned().collect::<Vec<_>>().join("\n")
-                )
+                format!("{closed}\n{}", tail.iter().cloned().collect::<Vec<_>>().join("\n"))
             };
             drop(tail);
 
@@ -682,7 +691,10 @@ async fn request_with_permissions(
     params: Value,
 ) -> Result<(Value, String, bool)> {
     if !params.is_object() {
-        bail!("Codex 권한 요청의 매개변수는 객체여야 합니다.");
+        bail!(tr(
+            "Codex 권한 요청의 매개변수는 객체여야 합니다.",
+            "The Codex permission request parameters must be an object.",
+        ));
     }
     let requested = params.get("permissions").and_then(Value::as_str).unwrap_or(":danger-full-access");
     let descending = [":danger-full-access", ":workspace", ":read-only"];
@@ -741,7 +753,8 @@ async fn route_message(
 
     let Some(method) = message.get("method").and_then(Value::as_str) else {
         let _ = events.send(ServerEvent::ProtocolWarning(
-            "method 없는 app-server 메시지를 무시했습니다.".to_owned(),
+            tr("method 없는 app-server 메시지를 무시했습니다.", "Ignored an app-server message without a method.")
+                .to_owned(),
         ));
         return;
     };
@@ -767,7 +780,7 @@ fn format_rpc_error(error: &Value) -> String {
         error
             .get("message")
             .and_then(Value::as_str)
-            .unwrap_or("알 수 없는 app-server 오류"),
+            .unwrap_or(tr("알 수 없는 app-server 오류", "Unknown app-server error")),
     );
     match code {
         Some(code) => format!("{message} ({code})"),

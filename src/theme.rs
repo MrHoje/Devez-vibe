@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use anyhow::{Context, Result};
 
+use crate::language::tr;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThemeKind {
     Minimal,
@@ -64,14 +66,14 @@ impl ThemeKind {
         }
     }
 
-    pub const fn description(self) -> &'static str {
+    pub fn description(self) -> &'static str {
         match self {
-            Self::Minimal => "cool white · blue accent",
-            Self::Soft => "warm cream · green accent",
-            Self::Dark => "charcoal · orange accent",
-            Self::Gray => "neutral gray · slate accent",
-            Self::SoftPink => "warm blush · rose accent",
-            Self::Midnight => "deep navy · azure accent",
+            Self::Minimal => tr("차가운 흰색 · 파란 강조", "cool white · blue accent"),
+            Self::Soft => tr("따뜻한 크림 · 초록 강조", "warm cream · green accent"),
+            Self::Dark => tr("차콜 · 주황 강조", "charcoal · orange accent"),
+            Self::Gray => tr("중립 회색 · 슬레이트 강조", "neutral gray · slate accent"),
+            Self::SoftPink => tr("따뜻한 분홍 · 장미색 강조", "warm blush · rose accent"),
+            Self::Midnight => tr("짙은 남색 · 하늘색 강조", "deep navy · azure accent"),
         }
     }
 
@@ -160,11 +162,14 @@ pub struct ThemePalette {
     /// inline code visually distinct instead of tinting every emphasized token
     /// with the theme accent.
     pub response: ResponsePalette,
+    pub model_gpt56: Rgb,
+    pub model_gpt55: Rgb,
     /// OpenCode chrome and status text. Uses each theme's default provider
     /// blue so the model token matches the base palette.
     pub model_opencode: Rgb,
     pub model_astra: Rgb,
     pub model_sol: Rgb,
+    pub model_terra: Rgb,
     pub model_luna: Rgb,
     pub model_spark: Rgb,
     /// The agent roles. Each theme carries its own four so a role reads the
@@ -264,9 +269,12 @@ pub const MINIMAL: ThemePalette = ThemePalette {
         link: Rgb(0x34, 0x76, 0x9E),
         inline_code: Rgb(0x7C, 0x3A, 0xED),
     },
+    model_gpt56: Rgb(0x25, 0x63, 0xEB),
+    model_gpt55: Rgb(0x25, 0x63, 0xEB),
     model_opencode: Rgb(0x25, 0x63, 0xEB),
     model_astra: Rgb(0x0F, 0x76, 0x6E),
     model_sol: Rgb(0xFF, 0x6B, 0x00),
+    model_terra: Rgb(0x2E, 0x7D, 0x32),
     model_luna: Rgb(0x6C, 0x5C, 0xE7),
     model_spark: Rgb(0xEA, 0xB3, 0x08),
     agent_builder: Rgb(0x34, 0x76, 0x9E),
@@ -331,9 +339,12 @@ pub const SOFT: ThemePalette = ThemePalette {
         link: Rgb(0x3D, 0x6E, 0x8E),
         inline_code: Rgb(0x68, 0x4B, 0x8A),
     },
+    model_gpt56: Rgb(0x25, 0x63, 0xEB),
+    model_gpt55: Rgb(0x4A, 0x69, 0x84),
     model_opencode: Rgb(0x42, 0x63, 0x8F),
     model_astra: Rgb(0x0F, 0x76, 0x6E),
     model_sol: Rgb(0xD9, 0x77, 0x06),
+    model_terra: Rgb(0x55, 0x7A, 0x46),
     model_luna: Rgb(0x8E, 0x7A, 0xB5),
     model_spark: Rgb(0xC2, 0x9B, 0x38),
     agent_builder: Rgb(0x3D, 0x6E, 0x8E),
@@ -398,9 +409,12 @@ pub const DARK: ThemePalette = ThemePalette {
         link: Rgb(0x60, 0xA5, 0xFA),
         inline_code: Rgb(0xFF, 0xA5, 0x58),
     },
+    model_gpt56: Rgb(0x00, 0xF0, 0xFF),
+    model_gpt55: Rgb(0x60, 0xA5, 0xFA),
     model_opencode: Rgb(0x60, 0xA5, 0xFA),
     model_astra: Rgb(0x2D, 0xD4, 0xBF),
     model_sol: Rgb(0xFF, 0x9E, 0x59),
+    model_terra: Rgb(0x81, 0xC7, 0x84),
     model_luna: Rgb(0xC4, 0xB5, 0xFD),
     model_spark: Rgb(0xFD, 0xE0, 0x47),
     agent_builder: Rgb(0x82, 0xAC, 0xDA),
@@ -468,9 +482,12 @@ pub const GRAY: ThemePalette = ThemePalette {
         link: Rgb(0x1E, 0x5F, 0xAB),
         inline_code: Rgb(0x77, 0x30, 0xA8),
     },
+    model_gpt56: Rgb(0x1E, 0x5F, 0xAB),
+    model_gpt55: Rgb(0x4B, 0x55, 0x63),
     model_opencode: Rgb(0x1E, 0x5F, 0xAB),
     model_astra: Rgb(0x0F, 0x76, 0x6E),
     model_sol: Rgb(0xB9, 0x47, 0x00),
+    model_terra: Rgb(0x0B, 0x7A, 0x35),
     model_luna: Rgb(0x77, 0x30, 0xA8),
     model_spark: Rgb(0x8F, 0x5A, 0x00),
     agent_builder: Rgb(0x0E, 0x6B, 0x94),
@@ -537,9 +554,12 @@ pub const SOFT_PINK: ThemePalette = ThemePalette {
         link: Rgb(0x32, 0x6A, 0x9F),
         inline_code: Rgb(0x84, 0x58, 0x8F),
     },
+    model_gpt56: Rgb(0x32, 0x6A, 0x9F),
+    model_gpt55: Rgb(0x2F, 0x6B, 0x8C),
     model_opencode: Rgb(0x32, 0x6A, 0x9F),
     model_astra: Rgb(0x0F, 0x76, 0x6E),
     model_sol: Rgb(0xC2, 0x41, 0x0C),
+    model_terra: Rgb(0x25, 0x72, 0x3C),
     model_luna: Rgb(0x84, 0x58, 0x8F),
     model_spark: Rgb(0x9A, 0x65, 0x0B),
     agent_builder: Rgb(0x2F, 0x6B, 0x8C),
@@ -606,9 +626,12 @@ pub const MIDNIGHT: ThemePalette = ThemePalette {
         link: Rgb(0x60, 0xA5, 0xFA),
         inline_code: Rgb(0xA7, 0x8B, 0xFA),
     },
+    model_gpt56: Rgb(0x00, 0xF0, 0xFF),
+    model_gpt55: Rgb(0x60, 0xA5, 0xFA),
     model_opencode: Rgb(0x60, 0xA5, 0xFA),
     model_astra: Rgb(0x2D, 0xD4, 0xBF),
     model_sol: Rgb(0xFF, 0x9E, 0x59),
+    model_terra: Rgb(0x34, 0xD3, 0x99),
     model_luna: Rgb(0xC4, 0xB5, 0xFD),
     model_spark: Rgb(0xFD, 0xE0, 0x47),
     agent_builder: Rgb(0x82, 0xAC, 0xDA),
@@ -715,7 +738,7 @@ pub fn palette_of(theme: ThemeKind) -> &'static ThemePalette {
 pub fn load(cli_override: Option<&str>) -> Result<ThemeKind> {
     if let Some(value) = cli_override {
         return ThemeKind::parse(value)
-            .with_context(|| format!("지원하지 않는 테마입니다: {value}"));
+            .with_context(|| tr(format!("지원하지 않는 테마입니다: {value}"), format!("Unsupported theme: {value}")));
     }
     Ok(read_theme_file(&devez_vibe_theme_file())
         .or_else(|| read_theme_file(&devez_code_theme_file()))
@@ -725,10 +748,18 @@ pub fn load(cli_override: Option<&str>) -> Result<ThemeKind> {
 pub fn save(theme: ThemeKind) -> Result<()> {
     let path = devez_vibe_theme_file();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("테마 설정 폴더 생성 실패: {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| {
+            let parent = parent.display();
+            tr(
+                format!("테마 설정 폴더 생성 실패: {parent}"),
+                format!("Couldn't create the theme settings folder: {parent}"),
+            )
+        })?;
     }
-    fs::write(&path, theme.id()).with_context(|| format!("테마 설정 저장 실패: {}", path.display()))
+    fs::write(&path, theme.id()).with_context(|| {
+        let path = path.display();
+        tr(format!("테마 설정 저장 실패: {path}"), format!("Couldn't save the theme setting: {path}"))
+    })
 }
 
 fn read_theme_file(path: &Path) -> Option<ThemeKind> {
