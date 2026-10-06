@@ -23,14 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Codex와 Claude에서 MCP 로그인이 만료되거나 인증이 필요하면 긴 오류 전문 대신 다시 로그인하는 방법을 짧게 안내합니다.",
-    "Codex·Claude 응답 오류와 로그인·MCP 오류를 긴 원문 대신 핵심 문구로 줄여 보여주고, 로그인이 만료되면 다시 로그인하는 방법을 안내합니다.",
+    "`/language`로 설명·알림·오류 문구를 한국어와 영어 중에서 고를 수 있습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "When an MCP login in Codex or Claude expires or needs authentication, a short sign-in hint replaces the full error.",
-    "Codex and Claude response, login, and MCP errors show a condensed message instead of the raw text, with sign-in steps when the login has expired.",
+    "`/language` switches descriptions, notices, and error messages between Korean and English.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");
