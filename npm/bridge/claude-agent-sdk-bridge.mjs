@@ -1857,11 +1857,15 @@ function prepareTaskPlanForCreate(tasks, subject) {
 // 한 단계에 걸린 시간은 진행 중으로 바뀐 순간과 완료된 순간의 차이다. 기록에는
 // 항목마다 시각이 남으므로, 다시 읽을 때도 같은 방식으로 되살릴 수 있다.
 function markTaskStatus(task, status, at) {
-  if (task.status !== status && at != null) {
+  if (task.status !== status) {
     if (status === "in_progress") {
-      task.startedAt = task.startedAt ?? at;
-    } else if (status === "completed" && task.startedAt != null) {
+      task.startedAt = at;
+      delete task.elapsedMs;
+    } else if (status === "completed" && task.startedAt != null && at != null) {
       task.elapsedMs = Math.max(0, at - task.startedAt);
+    } else if (status === "pending") {
+      delete task.startedAt;
+      delete task.elapsedMs;
     }
   }
   task.status = status;
@@ -1985,13 +1989,17 @@ function updatePlanFromToolResult(session, pending, message) {
     session.tasks = new Map();
     for (const task of value.tasks || value) {
       const id = String(task.id);
-      session.tasks.set(id, {
+      const restored = {
         id,
         subject: task.subject || task.description || "작업",
-        status: task.status || "pending",
+        status: previous.get(id)?.status || "pending",
         // 이 턴에서 다룬 적 없는 작업은 이전 턴의 것이므로 원래 turnId를 지켜 준다.
         turnId: previous.get(id)?.turnId ?? turnId,
-      });
+        startedAt: previous.get(id)?.startedAt,
+        elapsedMs: previous.get(id)?.elapsedMs,
+      };
+      markTaskStatus(restored, task.status || "pending", Date.now());
+      session.tasks.set(id, restored);
     }
     session.tasks = latestTaskPlan(session.tasks);
     emitPlan(session);
@@ -2020,8 +2028,10 @@ function emitPlan(session) {
     threadId: session.id,
     turnId: session.turn?.id,
     plan: [...session.tasks.values()].map((task, index) => ({
+      id: task.id,
       step: numberedTaskSubject(task.subject, index),
       status: planStatus(task.status),
+      elapsedMs: task.elapsedMs ?? null,
     })),
   });
 }
@@ -3348,16 +3358,18 @@ function historyState(messages) {
           tasks.clear();
           for (const task of message.tool_use_result.tasks) {
             const previous = known.get(String(task.id));
-            tasks.set(String(task.id), {
+            const restored = {
               id: String(task.id),
               subject: task.subject || "작업",
-              status: task.status || "pending",
+              status: previous?.status || "pending",
               turnId: previous?.turnId ?? turn.id,
               // A listing restates the plan; it does not re-run it, so the
               // timings already measured for these steps have to survive it.
               startedAt: previous?.startedAt,
               elapsedMs: previous?.elapsedMs,
-            });
+            };
+            markTaskStatus(restored, task.status || "pending", messageTime(message));
+            tasks.set(String(task.id), restored);
           }
           const current = latestTaskPlan(tasks);
           tasks.clear();
@@ -3381,6 +3393,7 @@ function historyState(messages) {
     // The text alone cannot say how long a step took, so the measured times ride
     // alongside it and the restored plan shows its total instead of zero.
     const steps = [...tasks.values()].map((task, index) => ({
+      id: task.id,
       step: numberedTaskSubject(task.subject, index),
       status: task.status || "pending",
       elapsedMs: task.elapsedMs ?? null,
@@ -4450,6 +4463,31 @@ async function runSelfTest() {
   if (timedPlan?.steps?.[0]?.elapsedMs !== 6000 || timedPlan.steps[0].status !== "completed") {
     throw new Error(`Claude plan step timing self-test failed: ${JSON.stringify(timedPlan)}`);
   }
+  const timedLiveSession = {
+    id: "timed-live-plan",
+    turn: { id: "timed-live-turn" },
+    tasks: historyState(timedMessages).tasks,
+  };
+  const timedLiveEvents = [];
+  const timedLiveWrite = process.stdout.write;
+  process.stdout.write = (chunk) => { timedLiveEvents.push(JSON.parse(String(chunk))); return true; };
+  try {
+    updatePlanFromToolResult(timedLiveSession, { name: "TaskList" }, {
+      tool_use_result: { tasks: [{ id: "t1", subject: "1. 확인한 설정", status: "completed" }] },
+    });
+  } finally {
+    process.stdout.write = timedLiveWrite;
+  }
+  const liveMeasured = timedLiveEvents.at(-1)?.params?.plan?.[0];
+  if (liveMeasured?.elapsedMs !== 6000 || timedLiveSession.tasks.get("t1")?.elapsedMs !== 6000) {
+    throw new Error(`Claude live plan timing self-test failed: ${JSON.stringify(liveMeasured)}`);
+  }
+  const restartedTask = { status: "pending" };
+  markTaskStatus(restartedTask, "in_progress", 1000);
+  markTaskStatus(restartedTask, "completed", 7000);
+  markTaskStatus(restartedTask, "in_progress", 9000);
+  markTaskStatus(restartedTask, "completed", 10000);
+  if (restartedTask.elapsedMs !== 1000) throw new Error("Claude restarted task timing self-test failed");
   const skippedTasks = new Map([
     ["1", { id: "1", subject: "1. 조사", status: "pending" }],
     ["2", { id: "2", subject: "2. 분석", status: "pending" }],

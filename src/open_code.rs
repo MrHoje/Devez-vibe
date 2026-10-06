@@ -85,6 +85,7 @@ struct HistoryChunk {
 struct LoadedHistory {
     chunks: Vec<HistoryChunk>,
     token_usage: Option<Value>,
+    plan: Option<Vec<Value>>,
 }
 
 /// ACP는 본문·사고 조각만 흘려보내고 항목 경계를 알리지 않는다. 조각을
@@ -1109,7 +1110,7 @@ impl OpenCodeServer {
             .remove(session_id)
             .unwrap_or_default();
         let response = result?;
-        let turns = history_turns(session_id, &loaded.chunks);
+        let turns = history_turns(session_id, &loaded.chunks, loaded.plan.as_deref());
         let model = current_model(&response)
             .map(|model| format!("opencode:{model}"))
             .unwrap_or_else(|| "opencode:unknown/unknown".to_owned());
@@ -1426,6 +1427,8 @@ async fn route_message(
                 if let Some(update) = params.get("update") {
                     if let Some(usage) = usage_update_token_usage(update) {
                         loaded.token_usage = Some(usage);
+                    } else if let Some(plan) = plan_update(update) {
+                        loaded.plan = Some(plan);
                     } else {
                         record_history_chunk(&mut loaded.chunks, update);
                     }
@@ -1559,27 +1562,7 @@ async fn route_session_update(
             }
         }
         Some("plan") => {
-            let plan = update
-                .get("entries")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|entry| {
-                    json!({
-                        "step": entry.get("content")
-                            .or_else(|| entry.get("text"))
-                            .cloned()
-                            .unwrap_or(Value::Null),
-                        "status": plan_status(entry.get("status").and_then(Value::as_str))
-                    })
-                })
-                .collect::<Vec<_>>();
-            notify(
-                events,
-                "turn/plan/updated",
-                json!({ "threadId": session_id, "plan": plan }),
-            );
+            emit_plan(update, session_id, events);
         }
         Some("usage_update") => {
             let Some(token_usage) = usage_update_token_usage(update) else {
@@ -1681,6 +1664,17 @@ fn merge_tool_update(previous: Option<Value>, update: &Value) -> Value {
 }
 
 fn emit_plan(update: &Value, session_id: &str, events: &mpsc::UnboundedSender<ServerEvent>) {
+    let Some(plan) = plan_update(update) else {
+        return;
+    };
+    notify(
+        events,
+        "turn/plan/updated",
+        json!({ "threadId": session_id, "plan": plan }),
+    );
+}
+
+fn plan_update(update: &Value) -> Option<Vec<Value>> {
     let title = update
         .get("title")
         .and_then(Value::as_str)
@@ -1689,32 +1683,41 @@ fn emit_plan(update: &Value, session_id: &str, events: &mpsc::UnboundedSender<Se
     let has_plan_input = update
         .get("rawInput")
         .is_some_and(|input| input.get("todos").is_some() || input.get("plan").is_some());
-    if !has_plan_input && title != "todowrite" && title != "update_plan" && title != "update plan" {
-        return;
+    let native_plan = update.get("sessionUpdate").and_then(Value::as_str) == Some("plan");
+    if !native_plan
+        && !has_plan_input
+        && title != "todowrite"
+        && title != "update_plan"
+        && title != "update plan"
+    {
+        return None;
     }
-    let Some(todos) = update
-        .get("rawInput")
-        .and_then(|input| input.get("todos").or_else(|| input.get("plan")))
-        .and_then(Value::as_array)
-    else {
-        return;
-    };
+    let todos = if native_plan {
+        update.get("entries")
+    } else {
+        update
+            .get("rawInput")
+            .and_then(|input| input.get("todos").or_else(|| input.get("plan")))
+    }?
+    .as_array()?;
     let plan = todos
         .iter()
         .filter_map(|todo| {
+            let text = todo
+                .get("content")
+                .or_else(|| todo.get("step"))
+                .or_else(|| todo.get("text"))
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())?;
             Some(json!({
-                "step": todo.get("content")
-                    .or_else(|| todo.get("step"))
-                    .and_then(Value::as_str)?,
-                "status": plan_status(todo.get("status").and_then(Value::as_str))
+                "id": todo.get("id").and_then(Value::as_str),
+                "step": text,
+                "status": plan_status(todo.get("status").and_then(Value::as_str)),
+                "elapsedMs": todo.get("elapsedMs").and_then(Value::as_u64)
             }))
         })
         .collect::<Vec<_>>();
-    notify(
-        events,
-        "turn/plan/updated",
-        json!({ "threadId": session_id, "plan": plan }),
-    );
+    Some(plan)
 }
 
 fn plan_status(status: Option<&str>) -> &'static str {
@@ -2026,7 +2029,7 @@ fn record_history_chunk(chunks: &mut Vec<HistoryChunk>, update: &Value) {
 
 /// 모은 조각을 load_history가 아는 turns 형태로 바꾼다. 사용자 메시지가 새
 /// 턴을 열고 나머지 항목은 그 턴에 붙는다.
-fn history_turns(session_id: &str, chunks: &[HistoryChunk]) -> Vec<Value> {
+fn history_turns(session_id: &str, chunks: &[HistoryChunk], plan: Option<&[Value]>) -> Vec<Value> {
     let mut turns: Vec<Value> = Vec::new();
     for (index, chunk) in chunks.iter().enumerate() {
         let id = format!("{session_id}-history-{index}");
@@ -2057,6 +2060,17 @@ fn history_turns(session_id: &str, chunks: &[HistoryChunk]) -> Vec<Value> {
         {
             items.push(item);
         }
+    }
+    if let Some(plan) = plan {
+        if turns.is_empty() {
+            turns.push(json!({ "id": format!("{session_id}-history-plan"), "items": [] }));
+        }
+        turns.last_mut().unwrap()["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "id": format!("{session_id}-plan"), "type": "plan", "steps": plan
+            }));
     }
     turns
 }
@@ -2726,7 +2740,7 @@ mod tests {
             }),
         );
 
-        let turns = history_turns("ses_1", &chunks);
+        let turns = history_turns("ses_1", &chunks, None);
         assert_eq!(turns.len(), 1);
         let items = turns[0]
             .get("items")
@@ -3189,6 +3203,73 @@ mod tests {
         let usage = loaded.token_usage.expect("사용량");
         assert_eq!(usage["last"]["totalTokens"], 42_000);
         assert_eq!(usage["modelContextWindow"], 200_000);
+    }
+
+    #[test]
+    fn native_plan_and_todo_updates_keep_times_in_live_and_restored_state() {
+        for update in [
+            json!({ "sessionUpdate": "plan", "entries": [
+                { "id": "1", "content": "조사", "status": "in_progress" },
+                { "id": "2", "text": "검증", "status": "completed", "elapsedMs": 6000 },
+                { "content": 42, "status": "completed" }
+            ] }),
+            json!({ "sessionUpdate": "tool_call", "title": "todowrite", "rawInput": { "todos": [
+                { "id": "1", "content": "조사", "status": "active" },
+                { "id": "2", "content": "검증", "status": "done", "elapsedMs": 6000 },
+                { "content": "", "status": "completed" }
+            ] } }),
+        ] {
+            let plan = plan_update(&update).unwrap();
+            assert_eq!(plan.len(), 2);
+            let mut state = crate::state::AppState::new(
+                "ses_1".into(),
+                "cwd".into(),
+                "시험".into(),
+                Vec::new(),
+                "opencode:test/test",
+                None,
+            );
+            state.handle_notification("turn/plan/updated", &json!({ "plan": plan }));
+            assert_eq!(
+                state.view().plan_summary.unwrap().steps[1].elapsed,
+                Some(Duration::from_secs(6))
+            );
+            let turns = history_turns("ses_1", &[], Some(&plan));
+            state.prepare_resume();
+            state.load_history(&json!({ "turns": turns }), None);
+            assert_eq!(
+                state.view().plan_summary.unwrap().steps[1].elapsed,
+                Some(Duration::from_secs(6))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_updates_during_load_are_buffered_instead_of_discarded() {
+        let loading: LoadingMap = Arc::new(Mutex::new(HashMap::new()));
+        loading
+            .lock()
+            .await
+            .insert("ses_1".to_owned(), LoadedHistory::default());
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        route_message(
+            json!({ "method": "session/update", "params": {
+            "sessionId": "ses_1", "update": { "sessionUpdate": "plan", "entries": [
+                { "content": "검증", "status": "completed", "elapsedMs": 6000 }
+            ] }
+        } }),
+            &Arc::default(),
+            &Arc::default(),
+            &Arc::default(),
+            &loading,
+            &Arc::default(),
+            &Arc::default(),
+            &event_tx,
+        )
+        .await;
+        assert!(event_rx.try_recv().is_err());
+        let loaded = loading.lock().await.remove("ses_1").unwrap();
+        assert_eq!(loaded.plan.unwrap()[0]["elapsedMs"], 6000);
     }
 
     #[test]

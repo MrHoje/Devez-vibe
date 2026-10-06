@@ -3949,14 +3949,7 @@ pub struct DeferredResume {
 /// titles sequential even when a provider omitted, reused, or styled its own
 /// number differently.
 fn numbered_plan_step(title: &str, index: usize) -> String {
-    let title = title.trim();
-    let digits = title.chars().take_while(char::is_ascii_digit).count();
-    let body = title
-        .get(digits..)
-        .and_then(|rest| rest.strip_prefix('.').or_else(|| rest.strip_prefix(')')))
-        .map(str::trim_start)
-        .filter(|rest| !rest.is_empty())
-        .unwrap_or(title);
+    let body = crate::rollout::plan_step_text(title);
     // The provider handoff passes these titles to the next model and plan updates
     // compare them, so the fallback stays one fixed word in either screen language.
     let body = if body.is_empty() { "작업" } else { body };
@@ -4209,6 +4202,7 @@ impl AppState {
                 explanation: Some("Shimmer 테스트".to_owned()),
                 steps: (1..=count)
                     .map(|index| PlanStep {
+                        id: None,
                         text: format!("테스트 작업 {index}"),
                         status: PlanStepStatus::Pending,
                         started_at: None,
@@ -6253,14 +6247,18 @@ impl AppState {
                 .iter()
                 .enumerate()
                 .map(|(index, step)| PlanStep {
+                    id: step.id.clone(),
                     text: numbered_plan_step(&step.text, index),
                     status: match step.status.as_str() {
                         "completed" => PlanStepStatus::Completed,
-                        "in_progress" => PlanStepStatus::InProgress,
+                        "in_progress" | "inProgress" => PlanStepStatus::InProgress,
                         _ => PlanStepStatus::Pending,
                     },
                     started_at: None,
-                    elapsed: step.elapsed_ms.map(Duration::from_millis),
+                    elapsed: (step.status != "pending")
+                        .then_some(step.elapsed_ms)
+                        .flatten()
+                        .map(Duration::from_millis),
                 })
                 .collect(),
             expanded: true,
@@ -9277,7 +9275,10 @@ impl AppState {
         // once, which lands as a block of text appearing at full strength — the
         // one moment the paced reveal was meant to remove. Hold it instead, and
         // keep holding everything after it so the order is preserved.
-        if !self.held_notifications.is_empty() || self.should_hold_for_stream(method) {
+        // 고정된 계획은 본문 출력 순서와 별개로 수신 시각에 갱신한다.
+        if method != "turn/plan/updated"
+            && (!self.held_notifications.is_empty() || self.should_hold_for_stream(method))
+        {
             self.hold_notification(method, params);
             return;
         }
@@ -9506,39 +9507,83 @@ impl AppState {
                     .get("explanation")
                     .and_then(Value::as_str)
                     .filter(|text| !text.trim().is_empty());
-                let steps = params
+                let plan = params
                     .get("plan")
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten()
+                    .filter(|step| step.get("step").and_then(Value::as_str).is_some())
+                    .collect::<Vec<_>>();
+                let old_titles = self
+                    .plan_summary
+                    .as_ref()
+                    .map(|summary| {
+                        summary
+                            .steps
+                            .iter()
+                            .map(|step| (step.text.as_str(), step.id.as_deref()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let titles = plan
+                    .iter()
+                    .filter_map(|step| {
+                        Some((
+                            step.get("step")?.as_str()?,
+                            step.get("id").and_then(Value::as_str),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                let matches = crate::rollout::matching_plan_steps(&old_titles, &titles);
+                let now = Instant::now();
+                let steps = plan
+                    .iter()
                     .enumerate()
                     .filter_map(|(index, step)| {
                         let text = numbered_plan_step(step.get("step")?.as_str()?, index);
                         let status = match step.get("status").and_then(Value::as_str) {
                             Some("completed") => PlanStepStatus::Completed,
-                            Some("inProgress") => PlanStepStatus::InProgress,
+                            Some("inProgress" | "in_progress") => PlanStepStatus::InProgress,
                             _ => PlanStepStatus::Pending,
                         };
                         let previous = self.plan_summary.as_ref().and_then(|summary| {
-                            summary.steps.iter().find(|previous| previous.text == text)
+                            matches[index].and_then(|index| summary.steps.get(index))
                         });
+                        let measured = step
+                            .get("elapsedMs")
+                            .and_then(Value::as_u64)
+                            .map(Duration::from_millis);
                         let started_at = match status {
-                            PlanStepStatus::InProgress => previous
-                                .and_then(|previous| previous.started_at)
-                                .or_else(|| Some(Instant::now())),
+                            PlanStepStatus::InProgress => measured
+                                .and_then(|elapsed| now.checked_sub(elapsed))
+                                .or_else(|| {
+                                    previous
+                                        .filter(|step| step.status == PlanStepStatus::InProgress)
+                                        .and_then(|previous| previous.started_at)
+                                })
+                                .or_else(|| {
+                                    previous
+                                        .filter(|step| step.status == PlanStepStatus::InProgress)
+                                        .and_then(|step| step.elapsed)
+                                        .and_then(|elapsed| now.checked_sub(elapsed))
+                                })
+                                .or(Some(now)),
                             PlanStepStatus::Completed => {
                                 previous.and_then(|previous| previous.started_at)
                             }
                             PlanStepStatus::Pending => None,
                         };
                         let elapsed = if status == PlanStepStatus::Completed {
-                            previous
-                                .and_then(|previous| previous.elapsed)
-                                .or_else(|| started_at.map(|started| started.elapsed()))
+                            measured.or_else(|| {
+                                previous.and_then(|previous| previous.elapsed).or_else(|| {
+                                    started_at.map(|started| now.saturating_duration_since(started))
+                                })
+                            })
                         } else {
                             None
                         };
                         Some(PlanStep {
+                            id: step.get("id").and_then(Value::as_str).map(str::to_owned),
                             text,
                             status,
                             started_at,
@@ -9549,8 +9594,18 @@ impl AppState {
                 let started_at = self
                     .plan_summary
                     .as_ref()
+                    .filter(|summary| {
+                        matches.iter().any(Option::is_some)
+                            && !(summary
+                                .steps
+                                .iter()
+                                .all(|step| step.status == PlanStepStatus::Completed)
+                                && steps
+                                    .iter()
+                                    .any(|step| step.status != PlanStepStatus::Completed))
+                    })
                     .map(|summary| summary.started_at)
-                    .unwrap_or_else(Instant::now);
+                    .unwrap_or(now);
                 let expanded = self
                     .plan_summary
                     .as_ref()
@@ -9562,8 +9617,9 @@ impl AppState {
                 {
                     self.plan_summary
                         .as_ref()
+                        .filter(|summary| summary.started_at == started_at)
                         .and_then(|summary| summary.elapsed)
-                        .or_else(|| Some(started_at.elapsed()))
+                        .or_else(|| Some(now.saturating_duration_since(started_at)))
                 } else {
                     None
                 };
@@ -16793,6 +16849,7 @@ fn plan_snapshot_from_steps(item: &Value) -> Option<PlanSnapshot> {
         .filter_map(|step| {
             let text = step.get("step").and_then(Value::as_str)?.trim();
             (!text.is_empty()).then_some(crate::rollout::PlanStepSnapshot {
+                id: step.get("id").and_then(Value::as_str).map(str::to_owned),
                 text: text.to_owned(),
                 status: step
                     .get("status")
@@ -16846,6 +16903,7 @@ fn plan_step_from_text(line: &str) -> Option<crate::rollout::PlanStepSnapshot> {
             ("pending", text)
         };
     (!text.trim().is_empty()).then_some(crate::rollout::PlanStepSnapshot {
+        id: None,
         text: text.trim().to_owned(),
         status: status.to_owned(),
         elapsed_ms: None,
@@ -18118,6 +18176,7 @@ fn parse_fast_mode(config: &str) -> bool {
 #[cfg(test)]
 mod tests {
     include!("question_audit_tests.rs");
+    include!("plan_audit_tests.rs");
     use super::*;
     use crate::terminal_width::with_devezcode_xterm_widths;
 
@@ -19518,6 +19577,7 @@ mod tests {
         btw.plan_summary = Some(PlanSummary {
             explanation: None,
             steps: vec![PlanStep {
+                id: None,
                 text: "1. 원인 확인".to_owned(),
                 status: PlanStepStatus::InProgress,
                 started_at: None,
@@ -19546,6 +19606,7 @@ mod tests {
         state.plan_summary = Some(PlanSummary {
             explanation: None,
             steps: vec![PlanStep {
+                id: None,
                 text: "1. 원인 확인".to_owned(),
                 status: PlanStepStatus::InProgress,
                 started_at: None,
@@ -21915,6 +21976,273 @@ mod tests {
     }
 
     #[test]
+    fn renamed_plan_steps_keep_observed_time_with_unchanged_neighbors() {
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [
+                { "step": "확인", "status": "inProgress" },
+                { "step": "검증", "status": "pending" }
+            ] }),
+        );
+        let started_at = Instant::now() - Duration::from_secs(94);
+        state.plan_summary.as_mut().unwrap().steps[0].started_at = Some(started_at);
+
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [
+                { "step": "실제 설정 확인", "status": "inProgress" },
+                { "step": "검증", "status": "pending" }
+            ] }),
+        );
+        assert_eq!(
+            state.plan_summary.as_ref().unwrap().steps[0].started_at,
+            Some(started_at)
+        );
+
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [
+                { "step": "설정과 입력 경로 확인", "status": "completed" },
+                { "step": "검증", "status": "inProgress" }
+            ] }),
+        );
+        let elapsed = state.plan_summary.as_ref().unwrap().steps[0]
+            .elapsed
+            .expect("관측한 시작 시각으로 소요 시간 계산");
+        assert!(elapsed >= Duration::from_secs(94));
+
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [
+                { "step": "입력 경로 확인 완료", "status": "completed" },
+                { "step": "검증", "status": "inProgress" }
+            ] }),
+        );
+        assert_eq!(
+            state.plan_summary.as_ref().unwrap().steps[0].elapsed,
+            Some(elapsed)
+        );
+
+        // 다른 계획은 같은 위치라는 이유만으로 이전 시간을 물려받지 않는다.
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [
+                { "step": "새 작업", "status": "completed" },
+                { "step": "새 검사", "status": "pending" }
+            ] }),
+        );
+        assert_eq!(state.plan_summary.as_ref().unwrap().steps[0].elapsed, None);
+    }
+
+    #[test]
+    fn reordered_plan_steps_do_not_exchange_elapsed_time() {
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [
+                { "step": "확인", "status": "completed" },
+                { "step": "수정", "status": "inProgress" },
+                { "step": "검증", "status": "pending" }
+            ] }),
+        );
+        state.plan_summary.as_mut().unwrap().steps[1].started_at =
+            Some(Instant::now() - Duration::from_secs(94));
+
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [
+                { "step": "확인", "status": "completed" },
+                { "step": "검증", "status": "completed" },
+                { "step": "수정", "status": "inProgress" }
+            ] }),
+        );
+        assert_eq!(state.plan_summary.as_ref().unwrap().steps[1].elapsed, None);
+    }
+
+    #[test]
+    fn plan_completion_updates_immediately_while_answer_text_waits() {
+        let mut state = test_state();
+        state.set_turn_started("turn".into());
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [
+            { "step": "확인", "status": "inProgress" },
+            { "step": "검증", "status": "pending" }
+        ] }),
+        );
+        state.plan_summary.as_mut().unwrap().steps[0].started_at =
+            Some(Instant::now() - Duration::from_secs(94));
+        state.handle_notification(
+            "item/started",
+            &json!({ "item": {
+            "id": "reply", "type": "agentMessage", "text": ""
+        } }),
+        );
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({ "itemId": "reply", "delta": "진행 설명 ".repeat(500) }),
+        );
+        state.handle_notification(
+            "item/completed",
+            &json!({ "item": {
+            "id": "reply", "type": "agentMessage", "text": "진행 설명 ".repeat(500)
+        } }),
+        );
+        assert!(state.stream_events_pending());
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [
+            { "step": "확인", "status": "completed" },
+            { "step": "검증", "status": "inProgress" }
+        ] }),
+        );
+        let step = &state.plan_summary.as_ref().unwrap().steps[0];
+        assert_eq!(step.status, PlanStepStatus::Completed);
+        assert!(step.elapsed.unwrap() >= Duration::from_secs(94));
+        assert!(
+            state.stream_text_pending(),
+            "계획 갱신이 남은 본문을 일괄 출력하지 않는다"
+        );
+        assert!(
+            state
+                .held_notifications
+                .iter()
+                .all(|(method, _)| method != "turn/plan/updated")
+        );
+    }
+
+    #[test]
+    fn native_plan_ids_preserve_single_step_renames_but_separate_new_tasks() {
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [
+            { "id": "task-1", "step": "조사", "status": "inProgress" }
+        ] }),
+        );
+        let started_at = Instant::now() - Duration::from_secs(94);
+        state.plan_summary.as_mut().unwrap().steps[0].started_at = Some(started_at);
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [
+            { "id": "task-1", "step": "조사한 설정", "status": "completed" }
+        ] }),
+        );
+        assert!(
+            state.plan_summary.as_ref().unwrap().steps[0]
+                .elapsed
+                .unwrap()
+                >= Duration::from_secs(94)
+        );
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [
+            { "id": "task-2", "step": "조사한 설정", "status": "completed" }
+        ] }),
+        );
+        assert_eq!(state.plan_summary.as_ref().unwrap().steps[0].elapsed, None);
+    }
+
+    #[test]
+    fn provider_plan_times_use_measurements_and_reset_on_restart() {
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [{ "step": "작업", "status": "inProgress" }] }),
+        );
+        let old_start = Instant::now() - Duration::from_secs(94);
+        state.plan_summary.as_mut().unwrap().steps[0].started_at = Some(old_start);
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [{ "step": "이름 변경", "status": "completed", "elapsedMs": 6000 }] }),
+        );
+        assert_eq!(
+            state.plan_summary.as_ref().unwrap().steps[0].elapsed,
+            Some(Duration::from_secs(6))
+        );
+
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [{ "step": "이름 변경", "status": "completed", "elapsedMs": -1 }] }),
+        );
+        assert_eq!(
+            state.plan_summary.as_ref().unwrap().steps[0].elapsed,
+            Some(Duration::from_secs(6))
+        );
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [{ "step": "이름 변경", "status": "inProgress" }] }),
+        );
+        let step = &state.plan_summary.as_ref().unwrap().steps[0];
+        assert!(step.started_at.unwrap() > old_start);
+        assert_eq!(step.elapsed, None);
+    }
+
+    #[test]
+    fn plan_times_follow_reordered_steps_and_survive_added_steps() {
+        let mut state = test_state();
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [
+                { "step": "확인", "status": "inProgress" },
+                { "step": "검증", "status": "pending" }
+            ] }),
+        );
+        let started_at = Instant::now() - Duration::from_secs(94);
+        state.plan_summary.as_mut().unwrap().steps[0].started_at = Some(started_at);
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [
+                { "step": "실제 설정 확인", "status": "inProgress" },
+                { "step": "검증", "status": "pending" },
+                { "step": "추가 검사", "status": "pending" }
+            ] }),
+        );
+        assert_eq!(
+            state.plan_summary.as_ref().unwrap().steps[0].started_at,
+            Some(started_at)
+        );
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [
+                { "step": "검증", "status": "pending" },
+                { "step": "실제 설정 확인", "status": "completed" },
+                { "step": "추가 검사", "status": "pending" }
+            ] }),
+        );
+        assert!(
+            state.plan_summary.as_ref().unwrap().steps[1]
+                .elapsed
+                .unwrap()
+                >= Duration::from_secs(94)
+        );
+        assert_eq!(state.plan_summary.as_ref().unwrap().steps[0].elapsed, None);
+    }
+
+    #[test]
+    fn resumed_in_progress_plan_preserves_measured_time_when_completed() {
+        let mut state = test_state();
+        state.restore_plan_snapshot(&PlanSnapshot {
+            explanation: None,
+            steps: vec![crate::rollout::PlanStepSnapshot {
+                id: None,
+                text: "작업".to_owned(),
+                status: "in_progress".to_owned(),
+                elapsed_ms: Some(6000),
+            }],
+        });
+        state.handle_notification(
+            "turn/plan/updated",
+            &json!({ "plan": [{ "step": "작업", "status": "completed" }] }),
+        );
+        assert_eq!(
+            state.plan_summary.as_ref().unwrap().steps[0].elapsed,
+            Some(Duration::from_secs(6))
+        );
+    }
+
+    #[test]
     fn completed_plan_does_not_reopen_when_the_next_turn_starts() {
         let mut state = test_state();
         state.set_turn_started("turn-one".to_owned());
@@ -22024,6 +22352,7 @@ mod tests {
         state.restore_plan_snapshot(&PlanSnapshot {
             explanation: None,
             steps: vec![crate::rollout::PlanStepSnapshot {
+                id: None,
                 text: "지난 세션 작업".to_owned(),
                 status: "completed".to_owned(),
                 elapsed_ms: Some(1_000),
@@ -22057,11 +22386,13 @@ mod tests {
             explanation: None,
             steps: vec![
                 crate::rollout::PlanStepSnapshot {
+                    id: None,
                     text: "완료 작업".to_owned(),
                     status: "completed".to_owned(),
                     elapsed_ms: Some(1_000),
                 },
                 crate::rollout::PlanStepSnapshot {
+                    id: None,
                     text: "진행 중이던 작업".to_owned(),
                     status: "in_progress".to_owned(),
                     elapsed_ms: Some(2_000),
@@ -23473,6 +23804,7 @@ mod tests {
         state.plan_summary = Some(PlanSummary {
             explanation: None,
             steps: vec![PlanStep {
+                id: None,
                 text: numbered_plan_step("", 0),
                 status: PlanStepStatus::InProgress,
                 started_at: None,

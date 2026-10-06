@@ -487,6 +487,7 @@ pub enum PlanStepStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanStep {
+    pub id: Option<String>,
     pub text: String,
     pub status: PlanStepStatus,
     pub started_at: Option<Instant>,
@@ -14947,6 +14948,7 @@ mod tests {
         let summary = PlanSummary {
             explanation: None,
             steps: vec![PlanStep {
+                id: None,
                 text: "1. 화면 정리".to_owned(),
                 status: PlanStepStatus::InProgress,
                 started_at: Some(Instant::now()),
@@ -27661,6 +27663,7 @@ mod tests {
             explanation: None,
             steps: (1..=7)
                 .map(|index| PlanStep {
+                    id: None,
                     text: format!("Task {index}"),
                     status: PlanStepStatus::Pending,
                     started_at: None,
@@ -27742,6 +27745,7 @@ mod tests {
             explanation: None,
             steps: (1..=3)
                 .map(|index| PlanStep {
+                    id: None,
                     text: format!("Task {index}"),
                     status: PlanStepStatus::Pending,
                     started_at: None,
@@ -27786,18 +27790,21 @@ mod tests {
             explanation: None,
             steps: vec![
                 PlanStep {
+                    id: None,
                     text: "1. 첫 단계".to_owned(),
                     status: PlanStepStatus::Completed,
                     started_at: None,
                     elapsed: Some(Duration::from_secs(18)),
                 },
                 PlanStep {
+                    id: None,
                     text: "2. 두 번째 단계".to_owned(),
                     status: PlanStepStatus::InProgress,
                     started_at: None,
                     elapsed: Some(Duration::from_secs(7)),
                 },
                 PlanStep {
+                    id: None,
                     text: "3. 세 번째 단계".to_owned(),
                     status: PlanStepStatus::Pending,
                     started_at: None,
@@ -27959,6 +27966,7 @@ mod tests {
         let summary = PlanSummary {
             explanation: None,
             steps: vec![PlanStep {
+                id: None,
                 text: "1. hidden step".to_owned(),
                 status: PlanStepStatus::Pending,
                 started_at: None,
@@ -28184,6 +28192,7 @@ mod tests {
         let summary = PlanSummary {
             explanation: None,
             steps: vec![PlanStep {
+                id: None,
                 text: "1. 사이드패널 폭보다 훨씬 긴 작업 단계 제목을 넣어서 잘림을 확인한다"
                     .to_owned(),
                 status: PlanStepStatus::Pending,
@@ -28215,6 +28224,7 @@ mod tests {
         let summary = PlanSummary {
             explanation: None,
             steps: vec![PlanStep {
+                id: None,
                 text: "Done".to_owned(),
                 status: PlanStepStatus::Completed,
                 started_at: None,
@@ -28238,6 +28248,7 @@ mod tests {
         let summary = PlanSummary {
             explanation: None,
             steps: vec![PlanStep {
+                id: None,
                 text: "Task".to_owned(),
                 status: PlanStepStatus::Pending,
                 started_at: None,
@@ -29041,30 +29052,35 @@ mod tests {
             explanation: None,
             steps: vec![
                 PlanStep {
+                    id: None,
                     text: "Task 1".to_owned(),
                     status: PlanStepStatus::Completed,
                     started_at: None,
                     elapsed: None,
                 },
                 PlanStep {
+                    id: None,
                     text: "Task 2".to_owned(),
                     status: PlanStepStatus::Pending,
                     started_at: None,
                     elapsed: None,
                 },
                 PlanStep {
+                    id: None,
                     text: "Task 3".to_owned(),
                     status: PlanStepStatus::Completed,
                     started_at: None,
                     elapsed: None,
                 },
                 PlanStep {
+                    id: None,
                     text: "Task 4".to_owned(),
                     status: PlanStepStatus::Pending,
                     started_at: None,
                     elapsed: None,
                 },
                 PlanStep {
+                    id: None,
                     text: "Task 5".to_owned(),
                     status: PlanStepStatus::Pending,
                     started_at: None,
@@ -29090,6 +29106,7 @@ mod tests {
         let summary = PlanSummary {
             explanation: None,
             steps: vec![PlanStep {
+                id: None,
                 text: "Done".to_owned(),
                 status: PlanStepStatus::Completed,
                 started_at: None,
@@ -29348,12 +29365,14 @@ mod tests {
             explanation: None,
             steps: vec![
                 PlanStep {
+                    id: None,
                     text: "1. 첫 단계".to_owned(),
                     status: PlanStepStatus::Completed,
                     started_at: None,
                     elapsed: Some(Duration::from_secs(17)),
                 },
                 PlanStep {
+                    id: None,
                     text: "2. 운영 전 확인 절차와 전환 조건 대조".to_owned(),
                     status: PlanStepStatus::Completed,
                     started_at: None,
@@ -29381,6 +29400,7 @@ mod tests {
         let summary = PlanSummary {
             explanation: None,
             steps: vec![PlanStep {
+                id: None,
                 text: "Working task".to_owned(),
                 status: PlanStepStatus::InProgress,
                 started_at: None,
@@ -29404,6 +29424,7 @@ mod tests {
             explanation: None,
             steps: (1..=7)
                 .map(|index| PlanStep {
+                    id: None,
                     text: format!("Task {index}"),
                     status: PlanStepStatus::Pending,
                     started_at: None,
@@ -29456,6 +29477,7 @@ mod tests {
         let summary = PlanSummary {
             explanation: None,
             steps: vec![PlanStep {
+                id: None,
                 text: "Paused task".to_owned(),
                 status: PlanStepStatus::InProgress,
                 started_at: None,

@@ -5,7 +5,6 @@
 //! can be rebuilt with those runs back in place.
 
 use std::{
-    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
@@ -84,6 +83,7 @@ pub struct PlanSnapshot {
 }
 
 pub struct PlanStepSnapshot {
+    pub id: Option<String>,
     pub text: String,
     pub status: String,
     pub elapsed_ms: Option<u64>,
@@ -213,8 +213,7 @@ pub fn parse(text: &str) -> Rollout {
     let mut turn_contexts = Vec::new();
     let mut last_plan = None;
     let mut token_usage = None;
-    let mut plan_started_at = HashMap::new();
-    let mut plan_elapsed = HashMap::new();
+    let mut plan_started_at = Vec::new();
     // Exec calls whose output has not arrived yet: `call_id` → the indices in
     // `events` its output segments fill in, in the order the script's calls
     // ran (a script can run more than one `shell_command` per turn).
@@ -244,6 +243,45 @@ pub fn parse(text: &str) -> Rollout {
                 .or(token_usage);
             continue;
         }
+        if payload.get("type").and_then(Value::as_str) == Some("function_call")
+            && matches!(
+                payload.get("name").and_then(Value::as_str),
+                Some("update_plan" | "functions.update_plan" | "tools.update_plan")
+            )
+            && let Some(arguments) = payload.get("arguments").and_then(Value::as_str)
+            && let Ok(arguments) = serde_json::from_str::<Value>(arguments)
+            && let Some(steps) = arguments.get("plan").and_then(Value::as_array)
+        {
+            let steps = steps
+                .iter()
+                .filter_map(|step| {
+                    Some(PlanStepSnapshot {
+                        id: None,
+                        text: step.get("step")?.as_str()?.to_owned(),
+                        status: step.get("status")?.as_str()?.to_owned(),
+                        elapsed_ms: None,
+                    })
+                })
+                .collect::<Vec<_>>();
+            if !steps.is_empty() {
+                let timestamp = chrono::DateTime::parse_from_rfc3339(&ts)
+                    .ok()
+                    .and_then(|time| u64::try_from(time.timestamp_millis()).ok());
+                last_plan = Some(with_plan_elapsed(
+                    PlanSnapshot {
+                        explanation: arguments
+                            .get("explanation")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        steps,
+                    },
+                    timestamp,
+                    last_plan.as_ref(),
+                    &mut plan_started_at,
+                ));
+            }
+            continue;
+        }
         match payload
             .get("type")
             .and_then(Value::as_str)
@@ -268,8 +306,8 @@ pub fn parse(text: &str) -> Rollout {
                     last_plan = Some(with_plan_elapsed(
                         plan,
                         timestamp,
+                        last_plan.as_ref(),
                         &mut plan_started_at,
-                        &mut plan_elapsed,
                     ));
                     continue;
                 }
@@ -402,6 +440,7 @@ fn plan_snapshot(input: &str) -> Option<PlanSnapshot> {
         let step = js_string(js_object_value(item, "step")?)?;
         let status = js_string(js_object_value(item, "status")?)?;
         steps.push(PlanStepSnapshot {
+            id: None,
             text: step,
             status,
             elapsed_ms: None,
@@ -592,34 +631,120 @@ fn js_array_items(input: &str) -> Vec<&str> {
     items
 }
 
+pub fn plan_step_text(title: &str) -> &str {
+    let title = title.trim();
+    let digits = title.chars().take_while(char::is_ascii_digit).count();
+    title
+        .get(digits..)
+        .and_then(|rest| rest.strip_prefix('.').or_else(|| rest.strip_prefix(')')))
+        .map(str::trim_start)
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(title)
+}
+
+/// 번호·순서 변경은 제목으로, 일부 제목 변경은 남아 있는 항목과 위치로 맞춘다.
+/// 모두 새 제목이거나 중복 제목의 위치가 바뀌면 이전 시간을 붙이지 않는다.
+pub fn matching_plan_steps(
+    previous: &[(&str, Option<&str>)],
+    current: &[(&str, Option<&str>)],
+) -> Vec<Option<usize>> {
+    let previous = previous
+        .iter()
+        .map(|(text, id)| (plan_step_text(text), *id))
+        .collect::<Vec<_>>();
+    let current = current
+        .iter()
+        .map(|(text, id)| (plan_step_text(text), *id))
+        .collect::<Vec<_>>();
+    let same_step = |old: &(&str, Option<&str>), new: &(&str, Option<&str>)| match (old.1, new.1) {
+        (Some(old), Some(new)) => old == new,
+        _ => old.0 == new.0,
+    };
+    let same_plan = previous
+        .iter()
+        .zip(&current)
+        .any(|(old, new)| same_step(old, new));
+    current
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            if previous.get(index).is_some_and(|old| same_step(old, step)) {
+                return Some(index);
+            }
+            let found = previous.iter().position(|old| same_step(old, step));
+            if found.is_some()
+                && previous.iter().filter(|old| same_step(old, step)).count() == 1
+                && current.iter().filter(|new| same_step(new, step)).count() == 1
+            {
+                return found;
+            }
+            (same_plan
+                && found.is_none()
+                && step.1.is_none()
+                && previous.get(index).is_some_and(|old| {
+                    old.1.is_none() && !current.iter().any(|new| same_step(old, new))
+                }))
+            .then_some(index)
+        })
+        .collect()
+}
+
 fn with_plan_elapsed(
     mut plan: PlanSnapshot,
     timestamp: Option<u64>,
-    started_at: &mut HashMap<String, u64>,
-    elapsed: &mut HashMap<String, u64>,
+    previous: Option<&PlanSnapshot>,
+    started_at: &mut Vec<Option<u64>>,
 ) -> PlanSnapshot {
-    for step in &mut plan.steps {
-        match (step.status.as_str(), timestamp) {
-            ("in_progress", Some(now)) => {
-                started_at.entry(step.text.clone()).or_insert(now);
-            }
-            ("completed", Some(now)) => {
-                if let Some(started) = started_at.remove(&step.text) {
-                    elapsed
-                        .entry(step.text.clone())
-                        .or_insert_with(|| now.saturating_sub(started));
+    let old_titles = previous
+        .map(|plan| {
+            plan.steps
+                .iter()
+                .map(|step| (step.text.as_str(), step.id.as_deref()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let titles = plan
+        .steps
+        .iter()
+        .map(|step| (step.text.as_str(), step.id.as_deref()))
+        .collect::<Vec<_>>();
+    let matches = matching_plan_steps(&old_titles, &titles);
+    let mut starts = Vec::with_capacity(plan.steps.len());
+    for (index, step) in plan.steps.iter_mut().enumerate() {
+        let matched = matches[index];
+        let old = matched.and_then(|index| previous.and_then(|plan| plan.steps.get(index)));
+        let old_start = matched.and_then(|index| started_at.get(index).copied().flatten());
+        let running =
+            old.is_some_and(|step| matches!(step.status.as_str(), "in_progress" | "inProgress"));
+        let completed = old.is_some_and(|step| step.status == "completed");
+        let start = match step.status.as_str() {
+            "in_progress" | "inProgress" => {
+                if running {
+                    old_start.or(timestamp)
+                } else {
+                    timestamp
                 }
             }
-            _ => {}
-        }
-        step.elapsed_ms = elapsed.get(&step.text).copied().or_else(|| {
-            timestamp.and_then(|now| {
-                started_at
-                    .get(&step.text)
-                    .map(|started| now.saturating_sub(*started))
-            })
-        });
+            "completed" if running || completed => old_start,
+            _ => None,
+        };
+        step.elapsed_ms = match step.status.as_str() {
+            "completed" => old
+                .filter(|_| completed)
+                .and_then(|step| step.elapsed_ms)
+                .or_else(|| {
+                    timestamp
+                        .zip(start)
+                        .map(|(now, start)| now.saturating_sub(start))
+                }),
+            "in_progress" | "inProgress" => timestamp
+                .zip(start)
+                .map(|(now, start)| now.saturating_sub(start)),
+            _ => None,
+        };
+        starts.push(start);
     }
+    *started_at = starts;
     plan
 }
 
@@ -1121,6 +1246,60 @@ mod tests {
         assert_eq!(plan.steps[0].elapsed_ms, Some(10_000));
         assert_eq!(plan.steps[1].elapsed_ms, Some(44_000));
         assert_eq!(plan.steps[2].elapsed_ms, Some(12_000));
+    }
+
+    #[test]
+    fn direct_update_plan_calls_restore_observed_elapsed_time() {
+        let rollout = parse(
+            r#"{"timestamp":"2026-10-06T01:00:00Z","payload":{"type":"function_call","name":"update_plan","arguments":"{\"plan\":[{\"step\":\"확인\",\"status\":\"in_progress\"}]}"}}
+{"timestamp":"2026-10-06T01:00:06Z","payload":{"type":"function_call","name":"functions.update_plan","arguments":"{\"plan\":[{\"step\":\"확인\",\"status\":\"completed\"}]}"}}"#,
+        );
+        assert_eq!(rollout.last_plan.unwrap().steps[0].elapsed_ms, Some(6000));
+    }
+
+    #[test]
+    fn plan_step_matching_rejects_ambiguous_titles_and_tracks_native_ids() {
+        for (previous, current, expected) in [
+            (
+                vec![("1. 조사", None)],
+                vec![("조사한 설정", None)],
+                vec![None],
+            ),
+            (
+                vec![("조사", Some("1"))],
+                vec![("조사한 설정", Some("1"))],
+                vec![Some(0)],
+            ),
+            (
+                vec![("조사", Some("1"))],
+                vec![("조사", Some("2"))],
+                vec![None],
+            ),
+            (
+                vec![("중복", None), ("중복", None), ("고정", None)],
+                vec![("고정", None), ("새 작업", None), ("중복", None)],
+                vec![Some(2), None, None],
+            ),
+        ] {
+            assert_eq!(matching_plan_steps(&previous, &current), expected);
+        }
+    }
+
+    #[test]
+    fn renamed_plan_steps_keep_time_on_resume_and_restarted_steps_reset_it() {
+        let rollout = parse(
+            r#"{"timestamp":"2026-10-06T01:00:00Z","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.update_plan({plan:[{step:\"1. 확인\",status:\"in_progress\"},{step:\"2. 검증\",status:\"pending\"}]})"}}
+{"timestamp":"2026-10-06T01:00:06Z","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.update_plan({plan:[{step:\"1. 실제 설정 확인\",status:\"completed\"},{step:\"2. 검증\",status:\"pending\"}]})"}}
+{"timestamp":"2026-10-06T01:00:10Z","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.update_plan({plan:[{step:\"1. 실제 설정 확인\",status:\"completed\"},{step:\"2. 검증\",status:\"in_progress\"}]})"}}"#,
+        );
+        assert_eq!(rollout.last_plan.unwrap().steps[0].elapsed_ms, Some(6000));
+        let rollout = parse(
+            r#"{"timestamp":"2026-10-06T01:00:00Z","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.update_plan({plan:[{step:\"확인\",status:\"in_progress\"}]})"}}
+{"timestamp":"2026-10-06T01:00:06Z","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.update_plan({plan:[{step:\"확인\",status:\"completed\"}]})"}}
+{"timestamp":"2026-10-06T01:01:00Z","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.update_plan({plan:[{step:\"확인\",status:\"in_progress\"}]})"}}
+{"timestamp":"2026-10-06T01:01:02Z","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.update_plan({plan:[{step:\"확인\",status:\"completed\"}]})"}}"#,
+        );
+        assert_eq!(rollout.last_plan.unwrap().steps[0].elapsed_ms, Some(2000));
     }
 
     #[test]
