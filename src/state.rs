@@ -876,10 +876,12 @@ fn plan_label(raw: &str) -> String {
         "free" => "Free".to_owned(),
         "go" => "Go".to_owned(),
         "plus" => "Plus".to_owned(),
-        // The two Pro tiers are named by their usage multiplier rather than by
-        // the server's slug, which says nothing about how much quota you get.
+        // Pro tiers are named by their usage multiplier rather than by the
+        // server's slug, which says nothing about how much quota you get.
         "prolite" => "Pro 5x".to_owned(),
         "pro" => "Pro 20x".to_owned(),
+        // No usage multiplier has been published for this tier yet.
+        "promax" => "Pro Max".to_owned(),
         "team" => "Team".to_owned(),
         "selfservebusinessusagebased" => "Business (usage-based)".to_owned(),
         "business" => "Business".to_owned(),
@@ -3538,6 +3540,8 @@ struct RunningSubagent {
     tool: String,
     started_at: Instant,
     painted_elapsed_secs: u64,
+    /// Levels below the subagent that launched it; the bridge orders the rows.
+    depth: usize,
 }
 
 /// A page this session published as a claude.ai Artifact, kept for the row
@@ -6380,6 +6384,37 @@ impl AppState {
         }
     }
 
+    /// Codex `instant_interrupt` cuts the answer being streamed when a steer
+    /// lands, and that item never completes. The steer's user message is the
+    /// cut: settle what was shown there, so the steer card and its reply follow
+    /// the cut text instead of the text landing below them at turn end.
+    fn settle_cut_answers(&mut self) {
+        let cut = self
+            .active_order
+            .iter()
+            .filter(|id| {
+                self.active
+                    .get(*id)
+                    .is_some_and(|active| matches!(active.block.kind, BlockKind::Assistant))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for id in cut {
+            if self
+                .active
+                .get(&id)
+                .is_some_and(|active| active.block.body.trim().is_empty())
+            {
+                self.active.remove(&id);
+                self.active_order.retain(|candidate| *candidate != id);
+            } else {
+                self.complete_item(&json!({ "id": id, "type": "agentMessage", "text": "" }));
+            }
+        }
+        // The steer has landed, so its card belongs here even when nothing was cut.
+        self.flush_pending_steer_prompts();
+    }
+
     fn begin_turn_prompt(&mut self, mut prompt: Block, started_at: Instant) {
         self.finish_active_turn_prompt(started_at);
         prompt.response_agent = Some(self.active_turn_agent);
@@ -7130,6 +7165,7 @@ impl AppState {
                     description: running.description.clone(),
                     tool: running.tool.clone(),
                     elapsed: running.started_at.elapsed(),
+                    depth: running.depth,
                 })
                 .collect(),
             artifacts: self
@@ -8708,9 +8744,17 @@ impl AppState {
     }
 
     fn flush_before_question(&mut self) {
-        self.flush_stream_text();
-        self.held_final_frame_ticks = 0;
-        self.release_held_notifications(false);
+        // Released deltas can open a new paced stream that holds the notices
+        // behind it again, the next turn's start among them. Each round applies
+        // at least the first notice, so this ends once nothing is held.
+        loop {
+            self.flush_stream_text();
+            self.held_final_frame_ticks = 0;
+            if self.held_notifications.is_empty() {
+                break;
+            }
+            self.release_held_notifications(false);
+        }
     }
 
     /// Async questions have no RPC to hold. Stop their turn, retain the question,
@@ -8912,6 +8956,7 @@ impl AppState {
                 tool,
                 started_at: Instant::now(),
                 painted_elapsed_secs: 0,
+                depth: 0,
             });
         }
         // A child can outlive its parent turn. Keep the existing missed-signal
@@ -9285,7 +9330,7 @@ impl AppState {
         // keep holding everything after it so the order is preserved.
         // 고정된 계획은 본문 출력 순서와 별개로 수신 시각에 갱신한다.
         if method != "turn/plan/updated"
-            && (!self.held_notifications.is_empty() || self.should_hold_for_stream(method))
+            && (!self.held_notifications.is_empty() || self.should_hold_for_stream(method, params))
         {
             self.hold_notification(method, params);
             return;
@@ -9294,11 +9339,12 @@ impl AppState {
     }
 
     /// Whether this notice has to wait for the text still being revealed.
-    fn should_hold_for_stream(&self, method: &str) -> bool {
-        matches!(
+    fn should_hold_for_stream(&self, method: &str, params: &Value) -> bool {
+        (matches!(
             method,
             "item/completed" | "turn/completed" | "turn/failed" | "turn/aborted"
-        ) && self.stream_text_pending()
+        ) || starts_user_message(method, params))
+            && self.stream_text_pending()
     }
 
     fn stream_text_pending(&self) -> bool {
@@ -9354,7 +9400,8 @@ impl AppState {
         if matches!(
             method,
             "item/completed" | "turn/completed" | "turn/failed" | "turn/aborted"
-        ) {
+        ) || starts_user_message(method, params)
+        {
             self.flush_stream_text();
         }
         match method {
@@ -9681,6 +9728,10 @@ impl AppState {
                                 .to_owned(),
                             started_at,
                             painted_elapsed_secs,
+                            depth: entry
+                                .get("depth")
+                                .and_then(Value::as_u64)
+                                .map_or(0, |depth| depth as usize),
                         })
                     })
                     .collect();
@@ -9735,6 +9786,9 @@ impl AppState {
                 }
             }
             "item/started" => {
+                if starts_user_message(method, params) {
+                    self.settle_cut_answers();
+                }
                 if let Some(item) = params.get("item") {
                     self.start_item(item);
                 }
@@ -16408,6 +16462,15 @@ fn operation_signature(block: &Block) -> Option<String> {
     })
 }
 
+/// The steer's own user message: with Codex `instant_interrupt` it is the only
+/// sign that the answer streaming before it was cut and will never complete.
+/// Codex adds a user message mid-turn only for input steered into the turn; a
+/// reasoning item in flight still completes (checked on 0.160.1).
+fn starts_user_message(method: &str, params: &Value) -> bool {
+    method == "item/started"
+        && params.pointer("/item/type").and_then(Value::as_str) == Some("userMessage")
+}
+
 fn push_latest_thinking(blocks: &mut Vec<Block>, block: Block) {
     if is_empty_thinking(&block) {
         return;
@@ -21250,6 +21313,25 @@ mod tests {
         assert_eq!(rows[0].description, "npm test");
         assert!(!rows[1].is_background_task);
         assert!(!rows[2].is_background_task);
+        // Rows from a bridge without parent links all sit at the top level.
+        assert!(rows.iter().all(|row| row.depth == 0));
+        state.handle_notification("turn/subagents/updated", &json!({
+            "subagents": [
+                { "id": "agent", "name": "explore" },
+                { "id": "shell", "name": "Bash", "backgroundTask": true, "depth": 1 }
+            ]
+        }));
+        assert_eq!(
+            state.view().subagents.iter().map(|row| row.depth).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        state.handle_notification("turn/subagents/updated", &json!({
+            "subagents": [
+                { "id": "shell", "name": "Bash", "backgroundTask": true, "description": "npm test" },
+                { "id": "agent", "name": "Bash", "backgroundTask": false },
+                { "id": "legacy", "name": "Workflow" }
+            ]
+        }));
 
         let started_at = state.subagents[0].started_at;
         state.handle_notification("turn/subagents/updated", &json!({
@@ -22736,6 +22818,8 @@ mod tests {
             ("PRO-LITE", "Pro 5x"),
             ("pro", "Pro 20x"),
             ("PRO", "Pro 20x"),
+            ("promax", "Pro Max"),
+            ("pro_max", "Pro Max"),
             ("team", "Team"),
             ("self_serve_business_usage_based", "Business (usage-based)"),
             ("business", "Business"),
@@ -25897,6 +25981,110 @@ mod tests {
         assert_eq!(order, vec!["브랜치를 먼저 받아오겠습니다."]);
     }
 
+    /// Codex `instant_interrupt` cuts the answer in flight when a steer lands:
+    /// that item never completes and the steer's user message arrives next.
+    /// Replayed from a live 0.160.1 run. The cut text used to stay live until
+    /// turn end and then land below the reply to the steer.
+    #[test]
+    fn answer_cut_by_a_steer_settles_before_the_steer_and_its_reply() {
+        let mut state = test_state();
+        assert!(matches!(
+            state.submit_text("첫 요청".to_owned(), "첫 요청".to_owned()),
+            Action::Submit(_)
+        ));
+        state.drain_committed();
+        state.set_turn_started("turn-1".to_owned());
+        state.handle_notification(
+            "item/started",
+            &json!({ "item": { "id": "first-prompt", "type": "userMessage", "content": [] } }),
+        );
+        state.handle_notification(
+            "item/started",
+            &json!({ "item": { "id": "cut", "type": "agentMessage", "text": "" } }),
+        );
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({ "itemId": "cut", "delta": "차의 역사는 길다" }),
+        );
+        assert!(matches!(
+            state.submit_text("끼어든 질문".to_owned(), "끼어든 질문".to_owned()),
+            Action::Steer(_)
+        ));
+        // The paced text is still on its way, so the cut waits for it.
+        state.handle_notification(
+            "item/started",
+            &json!({ "item": { "id": "steer", "type": "userMessage", "content": [] } }),
+        );
+        state.handle_notification(
+            "item/completed",
+            &json!({ "item": { "id": "steer", "type": "userMessage", "content": [] } }),
+        );
+        state.handle_notification(
+            "item/started",
+            &json!({ "item": { "id": "reply", "type": "agentMessage", "text": "" } }),
+        );
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({ "itemId": "reply", "delta": "STEERED" }),
+        );
+        state.handle_notification(
+            "item/completed",
+            &json!({ "item": { "id": "reply", "type": "agentMessage", "phase": "final_answer", "text": "STEERED" } }),
+        );
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "id": "turn-1", "status": "completed" } }),
+        );
+        for _ in 0..100 {
+            if !state.stream_events_pending() {
+                break;
+            }
+            state.drain_stream_text(Duration::from_secs(1));
+        }
+        assert!(!state.stream_events_pending());
+        assert!(state.active.is_empty());
+
+        let order = state
+            .drain_committed()
+            .into_iter()
+            .filter(|block| matches!(block.kind, BlockKind::User | BlockKind::Assistant))
+            .map(|block| block.body)
+            .collect::<Vec<_>>();
+        let position = |body: &str| order.iter().position(|entry| entry == body);
+        let cut = position("차의 역사는 길다").expect("cut text is on the record");
+        let steer = position("끼어든 질문").expect("steer card is on the record");
+        let reply = position("STEERED").expect("reply is on the record");
+        assert!(cut < steer && steer < reply, "{order:?}");
+        assert_eq!(order.iter().filter(|entry| *entry == "차의 역사는 길다").count(), 1);
+    }
+
+    /// Without the flag the cut never happens: the answer completes before the
+    /// steer's user message, which must then leave the record untouched.
+    #[test]
+    fn steer_user_message_after_a_completed_answer_changes_nothing() {
+        let mut state = test_state();
+        state.submit_text("첫 요청".to_owned(), "첫 요청".to_owned());
+        state.drain_committed();
+        state.set_turn_started("turn-1".to_owned());
+        state.handle_notification(
+            "item/agentMessage/delta",
+            &json!({ "itemId": "answer", "delta": "긴 답변" }),
+        );
+        state.flush_stream_text();
+        state.submit_text("끼어든 질문".to_owned(), "끼어든 질문".to_owned());
+        state.handle_notification(
+            "item/completed",
+            &json!({ "item": { "id": "answer", "type": "agentMessage", "phase": "final_answer", "text": "긴 답변" } }),
+        );
+        let before = state.drain_committed().len();
+        assert!(before > 0);
+        state.handle_notification(
+            "item/started",
+            &json!({ "item": { "id": "steer", "type": "userMessage", "content": [] } }),
+        );
+        assert!(state.drain_committed().is_empty());
+    }
+
     #[test]
     fn question_answer_splits_progress_history_before_turn_completion() {
         let mut state = test_state();
@@ -26926,6 +27114,49 @@ mod tests {
         assert!(matches!(state.handle_key(KeyEvent::from(KeyCode::Esc)), Action::Interrupt));
         assert_eq!(state.take_discarded_prompt_ids(), vec![prompt.id()]);
         assert_eq!(state.turn_prompts.iter().map(Block::id).collect::<Vec<_>>(), vec![answer.id()]);
+    }
+
+    /// Replayed from a live gpt-5.6-sol run: the turn before the question ended
+    /// on two answers, so the deltas released ahead of the question started a
+    /// new paced stream that re-held the next turn's start, and cancelling the
+    /// question interrupted the finished turn instead of the live one.
+    #[test]
+    fn question_applies_the_next_turn_even_when_released_text_paces_again() {
+        let mut state = test_state();
+        state.set_turn_started("turn-a".to_owned());
+        for (id, text) in [("progress", "파일을 쓰겠습니다."), ("final", "완료했습니다.")] {
+            state.handle_notification(
+                "item/started",
+                &json!({ "item": { "id": id, "type": "agentMessage", "text": "" } }),
+            );
+            state.handle_notification(
+                "item/agentMessage/delta",
+                &json!({ "itemId": id, "delta": text }),
+            );
+            state.handle_notification(
+                "item/completed",
+                &json!({ "item": { "id": id, "type": "agentMessage", "text": text } }),
+            );
+        }
+        state.handle_notification(
+            "turn/completed",
+            &json!({ "turn": { "id": "turn-a", "status": "completed" } }),
+        );
+        state.handle_notification("turn/started", &json!({ "turn": { "id": "turn-b" } }));
+        assert_eq!(state.turn_id.as_deref(), Some("turn-a"), "turn B's start is held");
+
+        state.begin_server_request(json!(1), "item/tool/requestUserInput", &json!({
+            "questions": [{"id": "q", "question": "선택하세요", "options": [{"label": "첫째"}]}]
+        }));
+        assert_eq!(state.turn_id.as_deref(), Some("turn-b"));
+        assert!(!state.stream_events_pending());
+        let answers = state
+            .drain_committed()
+            .into_iter()
+            .filter(|block| matches!(block.kind, BlockKind::Assistant))
+            .map(|block| block.body)
+            .collect::<Vec<_>>();
+        assert_eq!(answers, ["파일을 쓰겠습니다.", "완료했습니다."]);
     }
 
     #[test]
@@ -31789,9 +32020,9 @@ mod tests {
             }),
         );
 
-        // gpt-5.6 at $5/$30 per million: 30k fresh input (0.15) + 40k cache
-        // write ×1.25 (0.25) + 500k cache read ×0.1 (0.25) + 10k output (0.30).
-        assert_eq!(state.composer_mode().cost.as_deref(), Some("$0.95"));
+        // gpt-5.6-sol at $4/$20 per million: 30k fresh input (0.12) + 40k cache
+        // write ×1.25 (0.20) + 500k cache read ×0.1 (0.20) + 10k output (0.20).
+        assert_eq!(state.composer_mode().cost.as_deref(), Some("$0.72"));
         assert_eq!(state.token_totals.input_new, 30_000);
     }
 
@@ -31820,8 +32051,8 @@ mod tests {
             }),
         );
 
-        // 1M input on sol ($5) + the 1M delta on terra ($2).
-        assert_eq!(state.composer_mode().cost.as_deref(), Some("$7.00"));
+        // 1M input on sol ($4) + the 1M delta on terra ($2).
+        assert_eq!(state.composer_mode().cost.as_deref(), Some("$6.00"));
     }
 
     #[test]

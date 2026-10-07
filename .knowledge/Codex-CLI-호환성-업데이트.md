@@ -178,6 +178,7 @@ Codex 0.x.y 기준으로 호환성 업데이트해
 - 비동기 질문은 수신 후 턴 중단으로 대기하므로 이미 시작된 도구 실행까지 되돌린다는 보장은 없다. 기본 질문 RPC 우선 지침은 유지한다.
 - 수정 후 일반 시험 1,211개와 실제 Codex 0.153.4·Astra의 비동기 질문 복구 시험을 통과했다. 별도 실행형 시험 8개는 일반 시험에서 제외되며, 이 중 새 비동기 복구 시험만 이번에 실행했다. 1.8.6으로 배포했으며 공개 실행 파일과 빌드 산출물의 SHA-256 일치 및 설치 후 실행 버전을 확인했다.
 - 질문은 시간 경과로 자동 응답하지 않는다. Codex 취소는 빈 답변을 보내지 않고 턴을 중단한다. 일부 질문의 답만 제출하지 않으며, 밀린 화면 상태를 먼저 반영하여 취소 대상 턴을 맞춘다. 질문 대기 중 오래된 상태 조회 결과로 대기를 끝내지 않는다.
+- 밀린 화면 상태 반영(`flush_before_question`)은 보류 알림이 하나도 남지 않을 때까지 반복한다. 질문 앞 턴이 답변을 두 번 이상 낸 경우 한 번만 풀면 풀린 답변 조각이 새 대기 글을 만들어 다음 턴 시작 알림을 다시 보류했다. 그러면 질문 취소가 끝난 턴을 중단하려다 `expected active turn id … but found …`(-32600)로 실패한다.
 - 확인 키를 누르고 있을 때 다음 질문까지 자동 선택되지 않게 한다. Ctrl+C는 질문을 취소하고, Ctrl+Enter·Shift+Enter·Alt+Enter가 답변을 제출하지 않게 한다. 질문의 직접 입력은 기존 단일 줄 표시를 유지한다.
 - 다음 Codex 갱신 때 다음 시험을 명시적으로 실행한다. 실제 모델과 로그인 상태를 사용한다.
   - `cargo test live_codex_question_catalog_matrix -- --ignored --nocapture`: 모든 페이지의 모델 목록에서 GPT-5.6·GPT-6 계열과 지원 추론 수준을 열거하고 작업 목록·질문 대기·마우스 선택·답변 전달을 검사한다.
@@ -202,6 +203,7 @@ Codex 0.x.y 기준으로 호환성 업데이트해
 
 | 날짜 | 확인 Codex 버전 | 결과 | 비고 |
 | --- | --- | --- | --- |
+| 2026-10-07 | 0.160.1 | 호환 유지 | 0.155.0 기준 대비 제거는 `thread/rollback`뿐이고 추가 메서드는 `account/gatewayOAuth/*`다. `model/list` 기본 모델이 `gpt-6.1-sol`로 바뀌었다(공식 단가 $2/$10, 캐시 읽기 0.05배). 새 요금제 `promax`는 Codex 표시가 `Pro (Max)`이고 사용량 배수가 공개되지 않아 `plan_label`은 `Pro Max`로 표시한다. `Turn.error`가 "failed or interrupted"로 넓어졌지만 선택형 Guardian 차단 중단(#48796, `tooManyDenials`)에만 붙는다. 일반 중단에도 붙게 되면 `turn/completed`가 오류 블록을 띄우고 대기 입력 재개를 끄므로 `src/state.rs`를 함께 본다. 재개 기록은 이미 `thread/turns/list` 전체 페이지를 읽는다. 개발 중 기능 `instant_interrupt`를 실행 인자로 켠다(설정 파일 선언 우선). 끄면 답변 중 추가 입력이 답변 전체가 끝날 때까지 기다린다. 켜면 진행 중 답변이 끊기는데, 그 `agentMessage`에는 `item/completed`가 오지 않는다. 이어서 오는 추가 입력의 `userMessage` `item/started`에서 끊긴 답변을 확정해야 끊긴 글·추가 입력 카드·답 순서가 유지된다. 셸 명령 실행 중 추가 입력은 명령을 끊지 않고 끝난 뒤 반영되며, 추론 요약 중이면 추론 항목은 완료되고 그 뒤 답변 항목만 끊긴다. 실제 검증은 `cargo test live_codex_steer_cuts -- --ignored --nocapture`. 기준 스키마는 0.155.0 그대로다. |
 | 2026-09-23 | 0.156.0 | 호환 유지 | 제거는 `thread/rollback`뿐이고 DevezVibe는 쓰지 않는다. 추가는 `rollout/compress`, 모델 `availableAccessPrograms`, 스레드 `disabledPluginIds`·`daybreakEnabled`, 재개 응답 `collaborationMode`, `mcpAppUi` 등이다. 턴마다 `collaborationMode`를 보내므로 재개 응답의 모드는 불필요하다. `personality`는 폐기 표시만 붙었고 보내지 않는다. `model/list`는 `includeHidden: false`라 모델 `hidden` 해석이 Codex 목록에 영향을 주지 않는다. 기준 스키마는 0.155.0 그대로다. |
 | 2026-09-18 | 0.155.0 | 호환 유지 | 스키마 차이는 추가뿐이다. `thread/attachment/*`, `memory/status`, `userVerification/cancel`이 늘고 `FeedbackUploadResponse`에 프롬프트 해시 필드가 붙었다. 제거·변경된 기존 메서드와 알림은 없어 DevezVibe 사용 경로는 그대로다. 기준 스키마를 0.155.0으로 갱신했다. 첨부 API는 보존할 항목이 정해질 때 검토한다. |
 | 2026-09-16 | 0.154.0 | 반영 완료 | DevezVibe가 쓰는 app-server 메서드는 모두 유지된다. 제거된 `codex mcp-server` 진입점은 app-server만 쓰므로 영향이 없다. 새 `turn/settings/update`로 진행 중인 턴의 모델·추론 수준을 바꾼다. 실험적 기능이라 거절될 수 있어 실패하면 기존대로 다음 요청부터 적용한다고 알린다. `account/rateLimits/read`의 `excludeResetCreditDetails`·`supportsLunaReserve` 인자는 미적용. |

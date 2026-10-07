@@ -265,6 +265,138 @@ async fn live_codex_carries_a_diff_selection_beside_the_prompt() {
     }
 }
 
+/// Input steered while Codex streams an answer cuts that answer now that the
+/// launch turns `instant_interrupt` on. The reply has to come at once and the
+/// record has to read cut text, steer card, reply — in that order.
+/// cargo test live_codex_steer_cuts -- --ignored --nocapture
+#[tokio::test]
+#[ignore = "설치된 Codex와 실제 모델 사용 필요"]
+async fn live_codex_steer_cuts_the_answer_in_order() {
+    let model = "gpt-6-luna";
+    let mut server = AppServer::spawn(Path::new("codex"), None).await.unwrap();
+    let result = std::panic::AssertUnwindSafe(async {
+        server.initialize().await.unwrap();
+        let response = server
+            .request(
+                "thread/start",
+                json!({
+                    "model": model, "ephemeral": true, "cwd": std::env::temp_dir(),
+                    "approvalPolicy": "never", "permissions": ":read-only",
+                    "developerInstructions": crate::DEVEZ_INSTRUCTIONS
+                }),
+            )
+            .await
+            .unwrap();
+        let mut state = AppState::new(
+            response["thread"]["id"].as_str().unwrap().into(),
+            std::env::temp_dir().to_string_lossy().into(),
+            "시험".into(),
+            Vec::new(),
+            model,
+            Some("low"),
+        );
+        state.handle_paste("Write a detailed 1500-word essay about the history of tea, in plain prose. Do not use any tools.");
+        let Action::Submit(text) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+            panic!("프롬프트가 나가야 한다");
+        };
+        let mut params = json!({
+            "threadId": state.thread_id, "model": model, "effort": "low",
+            "permissions": ":read-only",
+            "input": state.turn_input(text)
+        });
+        super::prepare_codex_turn_context(&mut params);
+        server.request("turn/start", params).await.unwrap();
+
+        let steer = "Stop the essay right now. Reply with only the single word STEERED.";
+        let mut deltas = 0;
+        let mut steered_at = None;
+        let mut reply_latency = None;
+        // The reply word can arrive split over several deltas.
+        let mut after_steer = String::new();
+        loop {
+            let ServerEvent::Notification { method, params } = event(&mut server, &mut state).await
+            else {
+                continue;
+            };
+            if method == "item/agentMessage/delta" {
+                deltas += 1;
+                if let Some(at) = steered_at {
+                    after_steer.push_str(params["delta"].as_str().unwrap_or_default());
+                    if reply_latency.is_none() && after_steer.contains("STEERED") {
+                        reply_latency = Some(Instant::now().duration_since(at));
+                    }
+                }
+            }
+            if steered_at.is_none() && deltas >= 40 {
+                let Some(turn_id) = state.turn_id.clone() else { continue };
+                state.handle_paste(steer);
+                let Action::Steer(text) = state.handle_key(KeyEvent::from(KeyCode::Enter)) else {
+                    panic!("답변 중 입력은 추가 입력으로 나가야 한다");
+                };
+                server
+                    .request(
+                        "turn/steer",
+                        json!({
+                            "threadId": state.thread_id, "expectedTurnId": turn_id,
+                            "input": state.turn_input(text)
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                steered_at = Some(Instant::now());
+            }
+            if method == "turn/completed" {
+                break;
+            }
+        }
+        for _ in 0..600 {
+            if !state.stream_events_pending() {
+                break;
+            }
+            state.drain_stream_text(Duration::from_millis(500));
+        }
+        assert!(!state.stream_events_pending(), "보류 알림이 남음");
+
+        use crate::renderer::BlockKind;
+        let order = state
+            .drain_committed()
+            .into_iter()
+            .filter(|block| matches!(block.kind, BlockKind::User | BlockKind::Assistant))
+            .map(|block| (matches!(block.kind, BlockKind::Assistant), block.body))
+            .collect::<Vec<_>>();
+        let latency = reply_latency.expect("추가 입력에 대한 답이 없음");
+        println!("추가 입력 후 답까지 {latency:?}, 기록 순서: {order:#?}");
+        let cut = order
+            .iter()
+            .position(|(assistant, body)| *assistant && !body.contains("STEERED"))
+            .expect("끊긴 답변이 기록에 없음");
+        let card = order
+            .iter()
+            .position(|(assistant, body)| !assistant && body == steer)
+            .expect("추가 입력 카드가 기록에 없음");
+        let reply = order
+            .iter()
+            .rposition(|(assistant, body)| *assistant && body.contains("STEERED"))
+            .expect("추가 입력에 대한 답이 기록에 없음");
+        assert!(cut < card && card < reply, "기록 순서가 어긋남: {order:?}");
+        let cut_text = &order[cut].1;
+        assert!(!cut_text.trim().is_empty(), "끊긴 답변이 비어 있음");
+        assert!(cut_text.len() < 6_000, "답변이 끊기지 않고 끝까지 생성됨");
+        assert_eq!(
+            order.iter().filter(|(_, body)| body == cut_text).count(),
+            1,
+            "끊긴 답변이 중복 기록됨"
+        );
+        assert!(latency < Duration::from_secs(20), "추가 입력이 즉시 반영되지 않음: {latency:?}");
+    })
+    .catch_unwind()
+    .await;
+    server.shutdown().await;
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 async fn event(server: &mut AppServer, state: &mut AppState) -> ServerEvent {
     let event = timeout(Duration::from_secs(120), server.next_event())
         .await

@@ -5076,6 +5076,7 @@ const CLAUDE_DEVEZ_INSTRUCTIONS: &str = concat!(
     "진행:\n",
     "- 라벨·머리글 없이 알린다. 첫 안내 이후에는 새 사실이나 범위 변경이 사용자 판단을 바꿀 때만 짧게 보고하고, 알릴 내용이 없으면 도구를 바로 호출한다.\n",
     "- 반복 계획·내용 없는 진행 문장·내부 도구나 Skill 적용 절차를 알리지 않는다.\n",
+    "- 개발 서버처럼 30분 넘게 켜 둘 명령을 run_in_background로 실행할 때는 timeout에 필요한 밀리초(최대 7200000)를 지정한다. 생략하면 30분 뒤 중지된다.\n",
 );
 
 const CLAUDE_TURN_REMINDER: &str = "한국어로 사용자 영향과 필요한 조치부터 쓴다. 분량과 예외는 현재 역할을 따른다. 근거·미확인 범위는 남기고 기술 식별자는 판단에 필요할 때만 쓴다. 새 사실 없는 진행 문장은 생략한다.";
@@ -8338,6 +8339,10 @@ mod tests {
         assert!(!CLAUDE_DEVEZ_INSTRUCTIONS.contains("update_plan"));
         assert!(DEVEZ_INSTRUCTIONS.contains("update_plan"));
         assert!(!DEVEZ_INSTRUCTIONS.contains("TaskCreate"));
+        // SDK sessions stop a background command after 30 minutes unless the
+        // call sets a longer timeout; the terminal CLI has no such limit.
+        assert!(CLAUDE_DEVEZ_INSTRUCTIONS.contains("run_in_background"));
+        assert!(!DEVEZ_INSTRUCTIONS.contains("run_in_background"));
         for rules in [DEVEZ_INSTRUCTIONS, CLAUDE_DEVEZ_INSTRUCTIONS, CLAUDE_TURN_REMINDER] {
             assert!(!rules.contains("200자"));
         }

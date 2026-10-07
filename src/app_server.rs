@@ -157,6 +157,7 @@ impl AppServer {
         command
             .arg("-c")
             .arg("features.default_mode_request_user_input=true");
+        apply_instant_interrupt_override(&mut command);
         apply_unstable_features_warning_override(&mut command);
         apply_devezcode_room_override(&mut command, devezcode_room);
         provision_devez_subagents();
@@ -455,6 +456,17 @@ fn apply_unstable_features_warning_override(command: &mut Command) {
     command.arg("-c").arg(UNSTABLE_WARNING_OVERRIDE);
 }
 
+/// Input typed while Codex answers steers the turn, but without this flag it
+/// waits until the whole answer has streamed. With it the answer is cut and the
+/// input lands at once (`AppState::settle_cut_answers` keeps the record in
+/// order). A config that already decided the flag wins.
+fn apply_instant_interrupt_override(command: &mut Command) {
+    if codex_config_declares(&[INSTANT_INTERRUPT_KEY, "features.instant_interrupt"]) {
+        return;
+    }
+    command.arg("-c").arg(INSTANT_INTERRUPT_OVERRIDE);
+}
+
 /// Codex 0.152 turned the planning tool into an opt-in, so a launch that never
 /// asks for it is served no `update_plan` at all and the plan card Devez Vibe
 /// draws from those calls would stay empty. Ask for it on this invocation; a
@@ -621,6 +633,8 @@ fn toml_string(value: &str) -> String {
 const ORIGINATOR_OVERRIDE_ENV: &str = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
 const MCP_2026_FEATURE_KEY: &str = "mcp_2026_07_28";
 const MCP_2026_PROTOCOL_OVERRIDE: &str = "features.mcp_2026_07_28=true";
+const INSTANT_INTERRUPT_KEY: &str = "instant_interrupt";
+const INSTANT_INTERRUPT_OVERRIDE: &str = "features.instant_interrupt=true";
 const UPDATE_PLAN_TOOL_OVERRIDE: &str = "tools.update_plan.enabled=true";
 const UNSTABLE_WARNING_KEY: &str = "suppress_unstable_features_warning";
 const UNSTABLE_WARNING_OVERRIDE: &str = "suppress_unstable_features_warning=true";
@@ -1016,6 +1030,29 @@ mod tests {
             assert_eq!(args.get(index - 1).map(String::as_str), Some("-c"));
         } else {
             assert!(codex_config_declares_mcp_2026_protocol());
+        }
+    }
+
+    #[test]
+    fn instant_interrupt_stays_opt_out_through_the_config() {
+        let keys = [INSTANT_INTERRUPT_KEY, "features.instant_interrupt"];
+        assert!(!config_declares("[features]\ntool_search = true\n", &keys));
+        assert!(config_declares("[features]\ninstant_interrupt = false\n", &keys));
+        assert!(config_declares("features.instant_interrupt = false\n", &keys));
+        assert!(!config_declares("[features]\n# instant_interrupt = false\n", &keys));
+
+        let mut command = codex_command(Path::new("codex"));
+        apply_instant_interrupt_override(&mut command);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        // The real Codex home decides, so only assert the pair stays together.
+        if let Some(index) = args.iter().position(|arg| arg == INSTANT_INTERRUPT_OVERRIDE) {
+            assert_eq!(args.get(index - 1).map(String::as_str), Some("-c"));
+        } else {
+            assert!(codex_config_declares(&keys));
         }
     }
 

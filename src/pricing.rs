@@ -109,8 +109,10 @@ const CACHE_READ_MULTIPLIER: f64 = 0.1;
 const PRICES: &[(&str, f64, f64)] = &[
     // GPT (Codex)
     ("gpt-6-astra", 10.0, 50.0),
+    ("gpt-6.1-sol", 2.0, 10.0),
     ("gpt-6-sol", 2.0, 10.0),
     ("gpt-6-luna", 0.1, 0.5),
+    ("gpt-5.6-sol", 4.0, 20.0),
     ("gpt-5.6-terra", 2.0, 12.0),
     ("gpt-5.6-luna", 0.2, 1.2),
     ("gpt-5.6", 5.0, 30.0),
@@ -118,7 +120,7 @@ const PRICES: &[(&str, f64, f64)] = &[
     ("gpt-5.3-codex", 1.75, 14.0),
     ("codex", 1.25, 10.0),
     ("gpt-5", 1.25, 10.0),
-    // Claude — list prices; Sonnet 5 carries an intro rate, see the knowledge doc.
+    // Claude — list prices.
     ("claude-fable-5", 10.0, 50.0),
     ("claude-mythos", 10.0, 50.0),
     ("claude-opus-5-5", 4.0, 20.0),
@@ -128,7 +130,8 @@ const PRICES: &[(&str, f64, f64)] = &[
     ("claude-opus-4-6", 5.0, 25.0),
     ("claude-opus-4-5", 5.0, 25.0),
     ("claude-opus-4-1", 15.0, 75.0),
-    ("claude-sonnet-5", 3.0, 15.0),
+    // Also Sonnet 5.5, which kept Sonnet 5's price.
+    ("claude-sonnet-5", 2.0, 10.0),
     ("claude-sonnet-4-6", 3.0, 15.0),
     ("claude-sonnet-4-5", 3.0, 15.0),
     ("claude-haiku-4-5", 1.0, 5.0),
@@ -142,16 +145,17 @@ pub fn estimate_usd(model: &str, totals: TokenTotals) -> Option<f64> {
         .iter()
         .find(|(slug, _, _)| model.contains(slug))
         .copied()?;
-    // Fable 5.1 cut cache reads to $0.25/MTok — 0.025x its input rate — and
-    // Opus 5.5 to $0.20/MTok (0.05x), against the 0.1x every other model on
-    // either vendor still charges.
-    let cache_read_multiplier = if model.contains("claude-fable-5-1") {
-        0.025
-    } else if model.contains("claude-opus-5-5") {
-        0.05
-    } else {
-        CACHE_READ_MULTIPLIER
-    };
+    // Fable 5.1 and Mythos 5.1 cut cache reads to $0.25/MTok — 0.025x their
+    // input rate — and Opus 5.5 and GPT-6.1 Sol to 0.05x, against the 0.1x
+    // every other model on either vendor still charges.
+    let cache_read_multiplier =
+        if model.contains("claude-fable-5-1") || model.contains("claude-mythos-5-1") {
+            0.025
+        } else if model.contains("claude-opus-5-5") || model.contains("gpt-6.1-sol") {
+            0.05
+        } else {
+            CACHE_READ_MULTIPLIER
+        };
     let input_rate = input_rate / 1_000_000.0;
     let output_rate = output_rate / 1_000_000.0;
     Some(
@@ -187,9 +191,13 @@ mod tests {
         // $0.25/MTok on Fable 5.1; Fable 5 stays at 0.1x of $10 = $1.00.
         assert!((estimate_usd("claude-fable-5-1[1m]", totals).unwrap() - 0.25).abs() < 1e-9);
         assert!((estimate_usd("claude-fable-5", totals).unwrap() - 1.0).abs() < 1e-9);
+        assert!((estimate_usd("claude-mythos-5-1", totals).unwrap() - 0.25).abs() < 1e-9);
         // $0.20/MTok on Opus 5.5; Opus 5 stays at 0.1x of $5 = $0.50.
         assert!((estimate_usd("claude-opus-5-5[1m]", totals).unwrap() - 0.20).abs() < 1e-9);
         assert!((estimate_usd("claude-opus-5", totals).unwrap() - 0.50).abs() < 1e-9);
+        // $0.10/MTok on GPT-6.1 Sol; GPT-6 Sol stays at 0.1x of $2 = $0.20.
+        assert!((estimate_usd("gpt-6.1-sol", totals).unwrap() - 0.10).abs() < 1e-9);
+        assert!((estimate_usd("gpt-6-sol", totals).unwrap() - 0.20).abs() < 1e-9);
     }
 
     #[test]
@@ -225,14 +233,18 @@ mod tests {
 
         assert_eq!(estimate_usd("gpt-5.6-luna", totals), Some(1.4));
         assert_eq!(estimate_usd("gpt-6-astra", totals), Some(60.0));
+        assert_eq!(estimate_usd("gpt-6.1-sol", totals), Some(12.0));
         assert_eq!(estimate_usd("gpt-6-sol", totals), Some(12.0));
         assert_eq!(estimate_usd("gpt-6-luna", totals), Some(0.6));
         assert_eq!(estimate_usd("gpt-5.6-terra", totals), Some(14.0));
-        assert_eq!(estimate_usd("gpt-5.6-sol", totals), Some(35.0));
+        assert_eq!(estimate_usd("gpt-5.6-sol", totals), Some(24.0));
+        assert_eq!(estimate_usd("gpt-5.6", totals), Some(35.0));
         assert_eq!(estimate_usd("gpt-5.3-codex", totals), Some(15.75));
         assert_eq!(estimate_usd("claude-opus-5-5", totals), Some(24.0));
         assert_eq!(estimate_usd("claude-opus-5", totals), Some(30.0));
-        assert_eq!(estimate_usd("claude-sonnet-5", totals), Some(18.0));
+        assert_eq!(estimate_usd("claude-sonnet-5-5", totals), Some(12.0));
+        assert_eq!(estimate_usd("claude-sonnet-5", totals), Some(12.0));
+        assert_eq!(estimate_usd("claude-sonnet-4-6", totals), Some(18.0));
         assert_eq!(estimate_usd("claude-opus-4-1", totals), Some(90.0));
         assert_eq!(estimate_usd("unlisted-model", totals), None);
     }
@@ -246,8 +258,8 @@ mod tests {
             output: 0,
         };
 
-        // gpt-5.6 input is $5/M: write ×1.25 = 6.25, read ×0.1 = 0.50.
-        assert_eq!(estimate_usd("gpt-5.6-sol", totals), Some(6.75));
+        // gpt-5.6-sol input is $4/M: write ×1.25 = 5.00, read ×0.1 = 0.40.
+        assert!((estimate_usd("gpt-5.6-sol", totals).unwrap() - 5.40).abs() < 1e-9);
     }
 
     #[test]
@@ -276,7 +288,7 @@ mod tests {
             },
         );
 
-        // 1M input on sol ($5) + the 1M delta on terra ($2).
-        assert_eq!(ledger.estimate_usd(), Some(7.0));
+        // 1M input on sol ($4) + the 1M delta on terra ($2).
+        assert_eq!(ledger.estimate_usd(), Some(6.0));
     }
 }

@@ -2238,6 +2238,8 @@ function upsertStructuredSubagent(session, message) {
   }
   if (toolUseId) running.toolUseId = toolUseId;
   if (taskId) running.taskId = taskId;
+  const parentTaskId = firstLine(message.parent_task_id || "", 80);
+  if (parentTaskId) running.parentTaskId = parentTaskId;
   // Agent 호출이 붙인 작업 이름이 있으면 SDK가 뒤늦게 알려 주는 에이전트 종류로 덮지 않는다.
   if (subagentType && (!running.name || running.name === "agent")) running.name = subagentType;
   if (subagentType || isSubagentTaskType(message.task_type)) running.backgroundTask = false;
@@ -2319,6 +2321,11 @@ function syncBackgroundSubagents(session, tasks) {
     }
     running.background = true;
     running.lastSeenAt = Date.now();
+    const parentTaskId = firstLine(task?.parent_task_id || "", 80);
+    if (parentTaskId && parentTaskId !== running.parentTaskId) {
+      running.parentTaskId = parentTaskId;
+      changed = true;
+    }
     // 에이전트 행은 이름만 보이지만, 백그라운드 명령 행은 명령문이 곧 내용이다.
     const description = isSubagentTaskType(task?.task_type)
       ? ""
@@ -2412,8 +2419,14 @@ function processSubagentSystemMessage(session, message) {
 
 // 서브에이전트가 실제로 무엇을 했는지는 자식 메시지에만 남는다. 열람용 기록은 여기서
 // 한 줄씩 흘려보내고, 목록 행에 쓸 현재 도구만 따로 갱신한다.
+// 메시지의 agent_id는 그 하위 에이전트 작업의 task_id라 재개 뒤에도 같은 행을 찾는다.
+function messageSubagent(session, message) {
+  return findSubagent(session, message.parent_tool_use_id)
+    || (message.agent_id ? findSubagent(session, message.agent_id) : undefined);
+}
+
 function recordSubagentMessage(session, message) {
-  const running = findSubagent(session, message.parent_tool_use_id);
+  const running = messageSubagent(session, message);
   if (!running) return;
   running.lastSeenAt = Date.now();
   const content = Array.isArray(message.message?.content) ? message.message.content : [];
@@ -2436,7 +2449,7 @@ function recordSubagentMessage(session, message) {
 }
 
 function recordSubagentResult(session, message) {
-  const running = findSubagent(session, message.parent_tool_use_id);
+  const running = messageSubagent(session, message);
   if (!running) return;
   running.lastSeenAt = Date.now();
   const content = Array.isArray(message.message?.content) ? message.message.content : [];
@@ -2515,6 +2528,37 @@ function firstLine(value, limit) {
   return String(value ?? "").split("\n")[0].trim().slice(0, limit);
 }
 
+// SDK 0.3.292부터 하위 에이전트가 띄운 에이전트·명령에 parent_task_id가 붙는다.
+// 자식 행을 부모 행 바로 아래로 모아 깊이와 함께 보내면 호스트가 들여 그린다.
+// 부모가 이미 끝났거나 모르는 id면 최상위에 둔다.
+function subagentRows(session) {
+  const agents = [...session.subagents.values()];
+  const byTask = new Map(agents.filter((agent) => agent.taskId).map((agent) => [agent.taskId, agent]));
+  const children = new Map();
+  const roots = [];
+  for (const agent of agents) {
+    const parent = agent.parentTaskId ? byTask.get(agent.parentTaskId) : null;
+    if (parent && parent !== agent) {
+      if (!children.has(parent)) children.set(parent, []);
+      children.get(parent).push(agent);
+    } else {
+      roots.push(agent);
+    }
+  }
+  const rows = [];
+  const placed = new Set();
+  const place = (agent, depth) => {
+    if (placed.has(agent)) return;
+    placed.add(agent);
+    rows.push({ agent, depth });
+    for (const child of children.get(agent) || []) place(child, depth + 1);
+  };
+  for (const agent of roots) place(agent, 0);
+  // 서로를 부모로 가리키는 행은 뿌리가 없으므로 최상위로 살린다.
+  for (const agent of agents) place(agent, 0);
+  return rows;
+}
+
 function emitSubagents(session) {
   // 백그라운드 행은 조용하다고 지우지 않는다. 오래 걸리는 조사 에이전트는 진행
   // 신호 없이 몇 분을 보내므로, 종료 통지와 level 스냅숏만 행을 거둔다.
@@ -2528,13 +2572,14 @@ function emitSubagents(session) {
   notify("turn/subagents/updated", {
     threadId: session.id,
     turnId: session.turn?.id,
-    subagents: [...session.subagents.values()].map((agent) => ({
+    subagents: subagentRows(session).map(({ agent, depth }) => ({
       id: agent.id,
       name: agent.name,
       description: agent.description,
       backgroundTask: agent.backgroundTask === true,
       tool: agent.tool,
       elapsedMs: Date.now() - agent.startedAt,
+      depth,
     })),
   });
 }
@@ -2778,6 +2823,7 @@ function cancelUsageLimitWait(session) {
 // 조치를 바로 알기 어려우므로 사유가 있을 때만 앞줄에 한국어 안내를 붙인다.
 const STARTUP_FAILURE_GUIDES = {
   org_pin_api_key_conflict: "조직 설정이 지정한 로그인 대신 API 키가 설정되어 있습니다. API 키·인증 토큰 환경 변수를 지우고 지정된 계정으로 로그인하세요.",
+  provider_not_allowed: "조직 설정이 허용하지 않는 API 제공자로 연결하도록 설정되어 있습니다. 허용된 제공자로 로그인하거나 관리자에게 문의하세요.",
   org_verify_failed: "로그인 계정의 조직을 확인하지 못했습니다. 네트워크를 확인하고 다시 로그인하세요.",
   org_pin_mismatch: "조직 설정이 허용하지 않는 계정으로 로그인되어 있습니다. 허용된 조직 계정으로 다시 로그인하세요.",
   managed_settings_invalid: "조직 관리 설정을 읽지 못했습니다. 관리자에게 설정 확인을 요청하세요.",
@@ -5239,6 +5285,68 @@ async function runSelfTest() {
     if (structuredSession.subagents.size !== 0) {
       throw new Error("Claude background task snapshot did not remove a finished subagent");
     }
+
+    // parent_task_id puts what a subagent launched right under its row, one
+    // level in; a parent that is gone leaves the child at the top level.
+    const nestedSession = {
+      id: "nested-self-test",
+      turn: null,
+      subagents: new Map(),
+      knownSubagents: new Map(),
+      hiddenSubagentTasks: new Set(),
+      ambientSubagentTasks: new Set(),
+      subagentPulse: null,
+    };
+    processSubagentSystemMessage(nestedSession, {
+      type: "system",
+      subtype: "task_started",
+      task_id: "agent-outer",
+      tool_use_id: "toolu_outer",
+      task_type: "local_agent",
+      subagent_type: "Explore",
+    });
+    processSubagentSystemMessage(nestedSession, {
+      type: "system",
+      subtype: "background_tasks_changed",
+      tasks: [
+        { task_id: "shell-orphan", task_type: "local_bash", description: "npm run dev", parent_task_id: "agent-gone" },
+        { task_id: "shell-inner", task_type: "local_bash", description: "ping", parent_task_id: "agent-outer" },
+      ],
+    });
+    processSubagentSystemMessage(nestedSession, {
+      type: "system",
+      subtype: "task_started",
+      task_id: "agent-inner",
+      tool_use_id: "toolu_inner",
+      task_type: "local_agent",
+      subagent_type: "Plan",
+      parent_task_id: "agent-outer",
+    });
+    const nestedRows = () => captured.join("").trim().split("\n").filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .filter((line) => line.method === "turn/subagents/updated" && line.params.threadId === "nested-self-test")
+      .at(-1)?.params.subagents.map((row) => `${row.depth}:${row.id}`);
+    const expectedNesting = ["0:toolu_outer", "1:task:shell-inner", "1:toolu_inner", "0:task:shell-orphan"];
+    if (JSON.stringify(nestedRows()) !== JSON.stringify(expectedNesting)) {
+      throw new Error(`Claude nested subagent self-test failed: ${JSON.stringify(nestedRows())}`);
+    }
+    // Rows naming each other as parent have no root; none may vanish or repeat.
+    nestedSession.subagents.get("toolu_outer").parentTaskId = "agent-inner";
+    emitSubagents(nestedSession);
+    const looped = nestedRows() || [];
+    if (looped.length !== 4 || new Set(looped.map((row) => row.split(":").slice(1).join(":"))).size !== 4) {
+      throw new Error(`Claude subagent parent loop self-test failed: ${JSON.stringify(looped)}`);
+    }
+    // A resumed subagent's messages find its row through agent_id.
+    recordSubagentMessage(nestedSession, {
+      parent_tool_use_id: "toolu_unknown",
+      agent_id: "agent-inner",
+      message: { content: [{ type: "tool_use", id: "toolu_read", name: "Read", input: { file_path: "a.rs" } }] },
+    });
+    if (nestedSession.subagents.get("toolu_inner")?.tool !== "Read(a.rs)") {
+      throw new Error("Claude subagent agent_id self-test failed");
+    }
+    clearSubagents(nestedSession);
 
     processSubagentSystemMessage(structuredSession, {
       type: "system",

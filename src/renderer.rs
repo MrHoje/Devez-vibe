@@ -522,6 +522,8 @@ pub struct SubagentView {
     pub description: String,
     pub tool: String,
     pub elapsed: Duration,
+    /// Levels below the subagent that launched it.
+    pub depth: usize,
 }
 
 /// One page this session published as a claude.ai Artifact, listed under the
@@ -6702,17 +6704,30 @@ fn subagent_display_name(name: &str) -> String {
     name.replace(['_', '-'], " ")
 }
 
+/// What a subagent launched sits under its row, two columns in per level. The
+/// level cap and `room` keep a deep chain from pushing the row past its width.
+fn subagent_indent(subagent: &SubagentView, room: usize) -> String {
+    " ".repeat((subagent.depth.min(4) * 2).min(room))
+}
+
+/// Indent gives way first on a narrow row, so the name keeps this much.
+const SUBAGENT_NAME_MIN_WIDTH: usize = 8;
+
 fn subagent_line(subagent: &SubagentView, index: usize, width: u16) -> PaintLine {
     let label = subagent_label_prefix(subagent);
     let elapsed = format!(" · {}", format_subagent_elapsed(subagent.elapsed.as_secs()));
     // The gutter, glyph, label, and elapsed reading are fixed, so the name is compacted
     // first and the call description takes only what the name leaves behind.
-    let reserved = 1
+    let fixed = 1
         + UnicodeWidthStr::width(SUBAGENT_GLYPH)
         + 2
         + UnicodeWidthStr::width(label)
         + UnicodeWidthStr::width(elapsed.as_str());
-    let available = usize::from(width).saturating_sub(reserved + 1);
+    let indent = subagent_indent(
+        subagent,
+        usize::from(width).saturating_sub(fixed + 1 + SUBAGENT_NAME_MIN_WIDTH),
+    );
+    let available = usize::from(width).saturating_sub(fixed + indent.len() + 1);
     let name = compact_right(&subagent_display_name(&subagent.name), available);
     let description = subagent_description_span(
         &subagent.description,
@@ -6737,7 +6752,7 @@ fn subagent_line(subagent: &SubagentView, index: usize, width: u16) -> PaintLine
     });
 
     PaintLine {
-        prefix: " ".to_owned(),
+        prefix: format!(" {indent}"),
         prefix_tone: Tone::Muted,
         text: SUBAGENT_GLYPH.to_owned(),
         tone: Tone::Accent,
@@ -10664,9 +10679,18 @@ fn side_panel_subagent_lines(subagents: &[SubagentView], content_width: usize) -
     for (index, subagent) in subagents.iter().take(SIDE_PANEL_SUBAGENT_LIMIT).enumerate() {
         let label = subagent_label_prefix(subagent);
         let elapsed = format!(" · {}", format_subagent_elapsed(subagent.elapsed.as_secs()));
-        let prefix = "• ";
+        let fixed = UnicodeWidthStr::width("• ")
+            + UnicodeWidthStr::width(label)
+            + UnicodeWidthStr::width(elapsed.as_str());
+        let prefix = format!(
+            "{}• ",
+            subagent_indent(
+                subagent,
+                content_width.saturating_sub(fixed + SUBAGENT_NAME_MIN_WIDTH),
+            )
+        );
         let available = content_width.saturating_sub(
-            UnicodeWidthStr::width(prefix)
+            UnicodeWidthStr::width(prefix.as_str())
                 + UnicodeWidthStr::width(label)
                 + UnicodeWidthStr::width(elapsed.as_str()),
         );
@@ -10683,7 +10707,7 @@ fn side_panel_subagent_lines(subagents: &[SubagentView], content_width: usize) -
             bold: false,
         });
         lines.push(PaintLine {
-            prefix: prefix.to_owned(),
+            prefix,
             prefix_tone: Tone::Accent,
             text: format!("{label}{name}"),
             tone: Tone::Plain,
@@ -19926,7 +19950,35 @@ mod tests {
             description: description.to_owned(),
             tool: tool.to_owned(),
             elapsed: Duration::from_secs(secs),
+            depth: 0,
         }
+    }
+
+    #[test]
+    fn launched_rows_sit_indented_under_their_subagent() {
+        let parent = test_subagent("explore", "", "", 40);
+        let mut child = test_subagent("Bash", "npm run dev", "", 12);
+        child.is_background_task = true;
+        child.depth = 1;
+        assert_eq!(painted(&subagent_line(&parent, 0, 80)), " •  sub agnet: explore · 40s");
+        assert_eq!(
+            painted(&subagent_line(&child, 1, 80)),
+            "   •  background task: Bash · npm run dev · 12s"
+        );
+        // A deep chain stops at four levels, and on a narrow row the indent
+        // gives way before the name does.
+        child.depth = 9;
+        assert!(painted(&subagent_line(&child, 1, 80)).starts_with(&format!(" {}•", " ".repeat(8))));
+        let deep = subagent_line(&child, 1, 32);
+        assert!(painted(&deep).starts_with(" •  background task: Bash"));
+        assert!(painted_line_width(&deep) <= 32);
+        let deep_panel = side_panel_subagent_lines(&[child.clone()], 30);
+        assert!(painted(&deep_panel[2]).starts_with("• background task: Bash"));
+        assert!(painted_line_width(&deep_panel[2]) <= 30);
+        child.depth = 1;
+        let panel = side_panel_subagent_lines(&[parent, child], 80);
+        assert_eq!(painted(&panel[2]), "• sub agnet: explore · 40s");
+        assert_eq!(painted(&panel[3]), "  • background task: Bash · npm run dev · 12s");
     }
 
     #[test]

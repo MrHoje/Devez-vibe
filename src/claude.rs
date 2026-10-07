@@ -425,10 +425,11 @@ pub fn model_catalog() -> Value {
             claude_model("claude:claude-fable-5-1", "Claude Fable 5.1", efforts(), false),
             claude_model("claude:opus", "Claude Opus 5.5", efforts(), false),
             previous_opus,
-            claude_model("claude:sonnet", "Claude Sonnet 5", efforts(), true),
+            claude_model("claude:sonnet", "Claude Sonnet 5.5", efforts(), true),
             claude_model("claude:haiku", "Claude Haiku 4.5", json!([]), false),
             // Older versions follow every family's newest, like the bridge's order.
-            claude_model("claude:fable", "Claude Fable 5", efforts(), false)
+            // The `fable` alias now resolves to Fable 5.1, so Fable 5 needs its id.
+            claude_model("claude:claude-fable-5", "Claude Fable 5", efforts(), false)
         ]
     })
 }
@@ -847,7 +848,7 @@ mod tests {
                 "claude:claude-opus-5",
                 "claude:sonnet",
                 "claude:haiku",
-                "claude:fable"
+                "claude:claude-fable-5"
             ]
         );
         assert!(
@@ -864,7 +865,7 @@ mod tests {
                 "Claude Fable 5.1",
                 "Claude Opus 5.5",
                 "Claude Opus 5",
-                "Claude Sonnet 5",
+                "Claude Sonnet 5.5",
                 "Claude Haiku 4.5",
                 "Claude Fable 5"
             ]
@@ -1005,12 +1006,12 @@ mod tests {
             package
                 .pointer("/dependencies/@anthropic-ai~1claude-agent-sdk")
                 .and_then(Value::as_str),
-            Some("0.3.283")
+            Some("0.3.292")
         );
         assert_eq!(
             lock.pointer("/packages//dependencies/@anthropic-ai~1claude-agent-sdk")
                 .and_then(Value::as_str),
-            Some("0.3.283")
+            Some("0.3.292")
         );
         assert!(bridge.contains(
             "const CLAUDE_TASK_TOOLS = [\"TaskCreate\", \"TaskGet\", \"TaskUpdate\", \"TaskList\"]"
