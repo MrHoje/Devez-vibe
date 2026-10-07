@@ -657,6 +657,14 @@ const SLASH_COMMANDS: [SlashCommand; 34] = [
     },
 ];
 
+/// Whether `/name` is one of Devez Vibe's own commands, listed or alias.
+fn is_slash_command_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("reload-skills")
+        || SLASH_COMMANDS
+            .iter()
+            .any(|command| command.name[1..].eq_ignore_ascii_case(name))
+}
+
 /// At most this many credits are listed before the rest are summarised.
 const CREDIT_LIST_LIMIT: usize = 4;
 
@@ -7640,6 +7648,15 @@ impl AppState {
         if text.is_empty() {
             return;
         }
+        // Typed text mostly arrives here through the paste classifier rather
+        // than `handle_key`, so a list closed with Esc reopens on any input.
+        self.suggestions_dismissed_text = None;
+        if text.contains(['$', '@']) {
+            self.completion_mode = CompletionMode::All;
+        }
+        if text.contains('$') {
+            self.dollar_completion_source = CompletionSource::User;
+        }
         if pasted {
             self.editor.insert_paste_str(text);
         } else {
@@ -8053,53 +8070,51 @@ impl AppState {
             }
         }
 
-        let slash_matches = if self.shell_mode {
-            Vec::new()
+        let slash_count = if self.shell_mode {
+            0
         } else {
-            self.matching_slash_commands()
+            self.matching_slash_commands().len() + self.matching_slash_skills().len()
         };
-        if !slash_matches.is_empty() && ctrl {
+        if slash_count > 0 && ctrl {
             match key.code {
                 KeyCode::Char('p') => {
                     self.command_selection = self.command_selection.saturating_sub(1);
                     return Action::None;
                 }
                 KeyCode::Char('n') => {
-                    self.command_selection =
-                        (self.command_selection + 1).min(slash_matches.len() - 1);
+                    self.command_selection = (self.command_selection + 1).min(slash_count - 1);
                     return Action::None;
                 }
                 _ => {}
             }
         }
-        if !slash_matches.is_empty() && !ctrl && !alt && !shift {
+        if slash_count > 0 && !ctrl && !alt && !shift {
             match key.code {
                 KeyCode::Up => {
                     self.command_selection = self.command_selection.saturating_sub(1);
                     return Action::None;
                 }
                 KeyCode::Down => {
-                    self.command_selection =
-                        (self.command_selection + 1).min(slash_matches.len() - 1);
+                    self.command_selection = (self.command_selection + 1).min(slash_count - 1);
                     return Action::None;
                 }
                 KeyCode::Tab => {
-                    let selected =
-                        slash_matches[self.command_selection.min(slash_matches.len() - 1)];
-                    self.editor.set_text(if selected.takes_argument {
-                        format!("{} ", selected.name)
-                    } else {
-                        selected.name.to_owned()
-                    });
-                    self.composer_images.clear();
+                    let index = self.command_selection.min(slash_count - 1);
+                    let text = self.slash_choice(index, true).unwrap_or_default();
+                    if self.slash_skill_prompt(&text).is_none() {
+                        self.composer_images.clear();
+                    }
+                    self.editor.set_text(text);
                     self.command_selection = 0;
                     return Action::None;
                 }
                 KeyCode::Enter => {
-                    let selected =
-                        slash_matches[self.command_selection.min(slash_matches.len() - 1)];
-                    self.editor.set_text(selected.name);
-                    self.composer_images.clear();
+                    let index = self.command_selection.min(slash_count - 1);
+                    let text = self.slash_choice(index, false).unwrap_or_default();
+                    if self.slash_skill_prompt(&text).is_none() {
+                        self.composer_images.clear();
+                    }
+                    self.editor.set_text(text);
                     self.command_selection = 0;
                     return self.submit_editor();
                 }
@@ -8314,14 +8329,7 @@ impl AppState {
             }
             KeyCode::Char(ch) if !ctrl => {
                 self.insert_composer_text(&ch.to_string(), false);
-                self.suggestions_dismissed_text = None;
                 self.command_selection = 0;
-                if matches!(ch, '$' | '@') {
-                    self.completion_mode = CompletionMode::All;
-                }
-                if ch == '$' {
-                    self.dollar_completion_source = CompletionSource::User;
-                }
                 Action::None
             }
             _ => Action::None,
@@ -9964,7 +9972,8 @@ impl AppState {
             return Action::RunShell(command.trim().to_owned());
         }
         let text = self.editor.text();
-        let command = text.starts_with('/') && !text.contains('\n');
+        let command =
+            text.starts_with('/') && !text.contains('\n') && self.slash_skill_prompt(&text).is_none();
         if self.provider_choice_pending && !self.any_provider_connected() && !command {
             self.open_runtime_picker();
             return Action::None;
@@ -10094,6 +10103,7 @@ impl AppState {
         if text.is_empty() && self.composer_images.is_empty() && self.queued_images.is_empty() {
             return Action::None;
         }
+        let text = self.slash_skill_prompt(&text).unwrap_or(text);
         if text.starts_with('/') && !text.contains('\n') {
             let action = self.run_slash_command(&text);
             // A slash command starts no turn, so the draft that was set aside to
@@ -13344,6 +13354,7 @@ impl AppState {
                         crate::open_code::PROVIDER_ENABLED || command.name != "/connect"
                     })
                     .any(|command| command.supports(provider) && command.name == token)
+                    || self.slash_skill_prompt(token).is_some()
             }
             b'$' => {
                 self.skills
@@ -13387,6 +13398,68 @@ impl AppState {
             .collect()
     }
 
+    /// Enabled skills listed under the commands, as Claude Code's `/` menu does.
+    /// A skill sharing a command's name stays out so the command keeps it.
+    fn matching_slash_skills(&self) -> Vec<&SkillBinding> {
+        let text = self.editor.text();
+        let Some(query) = text.strip_prefix('/') else {
+            return Vec::new();
+        };
+        if text.chars().any(char::is_whitespace) {
+            return Vec::new();
+        }
+        let query = query.to_ascii_lowercase();
+        let mut skills = self
+            .skills
+            .iter()
+            .filter(|skill| {
+                skill.enabled
+                    && skill.name.to_ascii_lowercase().starts_with(&query)
+                    && skill
+                        .name
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.'))
+                    && !is_slash_command_name(&skill.name)
+            })
+            .collect::<Vec<_>>();
+        skills.sort_by(|left, right| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        skills.dedup_by(|left, right| left.name == right.name);
+        skills
+    }
+
+    /// `/name rest` naming an enabled skill is sent as the `$name rest` prompt
+    /// the `$` menu builds, so every runtime receives the skill item.
+    fn slash_skill_prompt(&self, text: &str) -> Option<String> {
+        let rest = text.strip_prefix('/')?;
+        let name = rest.split(char::is_whitespace).next().unwrap_or_default();
+        (!name.is_empty()
+            && !is_slash_command_name(name)
+            && self
+                .skills
+                .iter()
+                .any(|skill| skill.enabled && skill.name.eq_ignore_ascii_case(name)))
+        .then(|| format!("${rest}"))
+    }
+
+    /// The composer text a `/` menu row stands for: commands first, then skills.
+    fn slash_choice(&self, index: usize, for_tab: bool) -> Option<String> {
+        let commands = self.matching_slash_commands();
+        if let Some(command) = commands.get(index) {
+            return Some(if for_tab && command.takes_argument {
+                format!("{} ", command.name)
+            } else {
+                command.name.to_owned()
+            });
+        }
+        let skill = self.matching_slash_skills().into_iter().nth(index - commands.len())?;
+        Some(if for_tab { format!("/{} ", skill.name) } else { format!("/{}", skill.name) })
+    }
+
     /// Role candidates once the composer holds `/agent ` and a partial
     /// argument, mirroring how command names complete.
     fn matching_agent_arguments(&self) -> Vec<AgentMode> {
@@ -13426,12 +13499,20 @@ impl AppState {
         if self.suggestions_dismissed_text.as_deref() == Some(self.editor.text().as_str()) {
             return Vec::new();
         }
-        self.matching_slash_commands()
+        let commands = self
+            .matching_slash_commands()
             .into_iter()
+            .map(|command| (command.name.to_owned(), command.description().to_owned()));
+        let skills = self
+            .matching_slash_skills()
+            .into_iter()
+            .map(|skill| (format!("/{}", skill.name), skill.description.clone()));
+        commands
+            .chain(skills)
             .enumerate()
-            .map(|(index, command)| SuggestionView {
-                command: command.name.to_owned(),
-                description: command.description().to_owned(),
+            .map(|(index, (command, description))| SuggestionView {
+                command,
+                description,
                 selected: index == self.command_selection,
                 category: None,
                 panel_title: "Commands",
@@ -14405,11 +14486,13 @@ impl AppState {
             self.command_selection = 0;
             return self.submit_editor();
         }
-        let Some(selected) = self.matching_slash_commands().get(index).copied() else {
+        let Some(text) = self.slash_choice(index, false) else {
             return Action::None;
         };
-        self.editor.set_text(selected.name);
-        self.composer_images.clear();
+        if self.slash_skill_prompt(&text).is_none() {
+            self.composer_images.clear();
+        }
+        self.editor.set_text(text);
         self.command_selection = 0;
         self.submit_editor()
     }
@@ -30185,6 +30268,52 @@ mod tests {
         assert!(state.editor.is_empty());
         assert_eq!(state.composer_image_count(), 0);
         assert!(state.view().suggestions.is_empty());
+    }
+
+    #[test]
+    fn typed_dollar_reopens_a_list_dismissed_earlier_in_the_turn() {
+        let mut state = composer_completion_state();
+        state.busy = true;
+        state.handle_buffered_composer_text("$", false);
+        assert!(!state.view().suggestions.is_empty());
+        state.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(state.view().suggestions.is_empty());
+
+        state.handle_key(KeyEvent::from(KeyCode::Backspace));
+        state.handle_buffered_composer_text("$", false);
+        assert!(!state.view().suggestions.is_empty());
+    }
+
+    #[test]
+    fn slash_menu_lists_skills_after_commands_and_sends_them_as_skills() {
+        let mut state = test_state();
+        state.update_skills(&json!({
+            "data": [{
+                "cwd": "cwd",
+                "errors": [],
+                "skills": [
+                    { "name": "review", "path": "C:/skills/review/SKILL.md", "description": "Review a change", "enabled": true, "scope": "user" },
+                    { "name": "help", "path": "C:/skills/help/SKILL.md", "description": "Shadowed", "enabled": true, "scope": "user" },
+                    { "name": "reply", "path": "C:/skills/reply/SKILL.md", "description": "Off", "enabled": false, "scope": "user" }
+                ]
+            }]
+        }));
+        state.editor.set_text("/re");
+        let rows = state.slash_suggestion_views();
+        let last = rows.last().expect("skill row");
+        assert_eq!((last.command.as_str(), last.description.as_str()), ("/review", "Review a change"));
+        assert!(rows.iter().all(|row| row.command != "/reply"));
+        state.editor.set_text("/hel");
+        assert!(state.slash_suggestion_views().iter().all(|row| row.description != "Shadowed"));
+
+        state.editor.set_text("/rev");
+        state.handle_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(state.editor.text(), "/review ");
+        state.handle_paste("src");
+        assert!(matches!(
+            state.handle_key(KeyEvent::from(KeyCode::Enter)),
+            Action::Submit(text) if text == "$review src"
+        ));
     }
 
     #[test]

@@ -24,11 +24,13 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
     "`/language`로 설명·알림·오류 문구를 한국어와 영어 중에서 고를 수 있습니다.",
+    "Esc로 닫은 `$`·`@` 목록이 이후 같은 글자를 다시 입력해도 나타나지 않던 문제를 고쳤습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
     "`/language` switches descriptions, notices, and error messages between Korean and English.",
+    "Fixed `$` and `@` lists closed with Esc not reappearing when the same character was typed again.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

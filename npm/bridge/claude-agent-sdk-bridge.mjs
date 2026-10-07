@@ -2871,13 +2871,28 @@ async function processResult(session, message) {
     notify("warning", { threadId: session.id, provider: "Claude", message: `Claude response error: ${text}` });
   }
   if (error && waitForUsageLimit(session)) return;
-  finishTurn(session, error, message.duration_ms);
-  notify("claude/account/updated", {
-    threadId: session.id,
-    account: await safeAccount(session.query),
-    usage: await safeUsage(session.query),
-  });
-  await runPendingPrompt(session);
+  // A steer the CLI could not fold into this run gets a run of its own, which
+  // `queued_turn_count` announces. Closing the turn here dropped the host's
+  // spinner and filed a completion until that answer's first frame arrived.
+  // A count of 0 can still hide a steer read just after the result; the steer
+  // debt opens a fresh turn for it then, as before.
+  const steerFollows = !error && !interrupted && !assistantError
+    && session.steerPending > 0 && message.queued_turn_count > 0;
+  if (steerFollows) {
+    session.steerPending -= 1;
+    session.turn.awaitingSteer = true;
+    releaseHeldProgress(session);
+    flushPendingPlan(session);
+    clearForegroundSubagents(session);
+  } else {
+    finishTurn(session, error, message.duration_ms);
+  }
+  // Not awaited: the next run's frames queue behind this message, and the
+  // account lookup used to hold them back.
+  Promise.all([safeAccount(session.query), safeUsage(session.query)])
+    .then(([account, usage]) => notify("claude/account/updated", { threadId: session.id, account, usage }))
+    .catch(() => {});
+  if (!steerFollows) await runPendingPrompt(session);
 }
 
 // Compaction ends the turn's only assistant message, so the context figure would
@@ -2981,6 +2996,7 @@ async function consumeMessage(session, message) {
   // A queued SDK response may beat the timer. It already resumes the work.
   if (!message.parent_tool_use_id && (message.type === "assistant" || message.type === "stream_event")) {
     clearUsageLimitWait(session);
+    if (session.turn) session.turn.awaitingSteer = false;
   }
   if (message.type === "stream_event") {
     if (message.event?.type === "content_block_delta" && (message.event?.delta?.text || message.event?.delta?.thinking)) {
@@ -3884,6 +3900,9 @@ async function dispatch(method, params = {}) {
         if (session.turn === turn) delete turn.interruptRequested;
         throw error;
       }
+      // Kept open for a steer whose run has not begun: nothing is running to
+      // send the result that would close it.
+      if (session.turn === turn && turn.awaitingSteer) finishTurn(session, null);
     }
     return {};
   }
@@ -4868,6 +4887,64 @@ async function runSelfTest() {
     const authTurn = authNotices.find((notice) => notice.method === "turn/completed")?.params?.turn;
     if (authTurn?.error?.codexErrorInfo !== "unauthorized" || !authTurn.error.message.includes("401")) {
       throw new Error(`Claude login failure lost its tag: ${JSON.stringify(authTurn)}`);
+    }
+    // A steer answered in a run of its own stays in the turn it joined.
+    const steerNotices = [];
+    const steerWrite = process.stdout.write;
+    process.stdout.write = (chunk) => { steerNotices.push(JSON.parse(String(chunk))); return true; };
+    const steerSession = {
+      ...automaticTurnSession,
+      id: "steer-continuation-self-test",
+      turn: null,
+      streamBlocks: new Map(),
+      tools: new Map(),
+      tasks: new Map(),
+      subagents: new Map(),
+      pendingPrompts: [],
+      query: { ...automaticTurnSession.query, async interrupt() {} },
+    };
+    sessions.set(steerSession.id, steerSession);
+    const steerResult = (queued) => ({ type: "result", is_error: false, stop_reason: "end_turn", modelUsage: {}, queued_turn_count: queued });
+    const steerRun = { type: "stream_event", parent_tool_use_id: null, event: { type: "message_start", message: {} } };
+    const steerLifecycle = () => steerNotices
+      .filter((notice) => notice.method === "turn/started" || notice.method === "turn/completed")
+      .map((notice) => notice.method)
+      .join();
+    try {
+      const steerTurn = beginTurn(steerSession);
+      steerSession.steerPending = 1;
+      await consumeMessage(steerSession, steerResult(1));
+      await consumeMessage(steerSession, steerRun);
+      if (steerSession.turn?.id !== steerTurn || steerSession.steerPending !== 0) {
+        throw new Error("Claude steer run left the turn it joined");
+      }
+      await consumeMessage(steerSession, steerResult(0));
+      if (steerLifecycle() !== "turn/started,turn/completed") {
+        throw new Error(`Claude steer run reopened its turn: ${steerLifecycle()}`);
+      }
+      // A steer read only after the result still gets a turn from the debt.
+      steerNotices.length = 0;
+      beginTurn(steerSession);
+      steerSession.steerPending = 1;
+      await consumeMessage(steerSession, steerResult(0));
+      await consumeMessage(steerSession, steerRun);
+      if (steerLifecycle() !== "turn/started,turn/completed,turn/started") {
+        throw new Error(`Claude late steer lost its turn: ${steerLifecycle()}`);
+      }
+      // Esc before the steer's run begins closes the turn instead of stranding it.
+      finishTurn(steerSession, null);
+      beginTurn(steerSession);
+      steerSession.steerPending = 1;
+      await consumeMessage(steerSession, steerResult(1));
+      steerNotices.length = 0;
+      await dispatch("session/interrupt", { sessionId: steerSession.id });
+      const stopped = steerNotices.find((notice) => notice.method === "turn/completed")?.params?.turn;
+      if (steerSession.turn || stopped?.status !== "interrupted") {
+        throw new Error(`Claude steer wait survived Esc: ${JSON.stringify(stopped)}`);
+      }
+    } finally {
+      process.stdout.write = steerWrite;
+      sessions.delete(steerSession.id);
     }
     beginTurn(limitSession);
     for (let attempt = 0; attempt < 4; attempt++) {
