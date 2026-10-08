@@ -23,22 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude Code 2.1.292 기반으로 갱신해 Claude `/model`의 Sonnet이 Sonnet 5.5로 바뀌고 최신 결함 수정이 함께 적용됩니다.",
-    "Codex가 답하는 중에 보낸 추가 입력이 답변이 끝날 때까지 기다리지 않고 바로 반영됩니다.",
-    "Claude 하위 에이전트가 띄운 작업이 그 에이전트 행 아래에 들여 표시됩니다.",
-    "Claude가 개발 서버처럼 오래 켜 둘 명령을 백그라운드로 실행하면 30분 뒤 꺼지지 않도록 최대 2시간을 지정합니다.",
-    "Codex Pro Max 요금제 이름을 올바르게 표시합니다.",
-    "Codex 질문을 바로 취소할 때 이미 끝난 이전 작업을 중단하려다 실패하던 문제를 고쳤습니다.",
+    "Computer Use가 이전 연결 주소를 사용해 실패하던 문제를 고쳐, 연결 주소가 바뀌면 다음 요청에서 자동 갱신합니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Updated to Claude Code 2.1.292: Sonnet in Claude `/model` is now Sonnet 5.5, with the latest fixes included.",
-    "Follow-up input sent while Codex is answering now takes effect at once instead of waiting for the answer to finish.",
-    "Work a Claude subagent launches is now shown indented under that subagent's row.",
-    "Long-running Claude background commands such as dev servers now get up to 2 hours instead of stopping after 30 minutes.",
-    "The Codex Pro Max plan name is now shown correctly.",
-    "Fixed cancelling a Codex question right away failing because it tried to stop a turn that had already ended.",
+    "Fixed Computer Use trying an outdated connection address: when the address changes, the next request refreshes the connection automatically.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

@@ -10,8 +10,15 @@
 - 복사한 글자는 정상인데 화면 한글이 깨짐·이모지 폭이 밀림: [글리프 진단](한글-글리프-깨짐-진단.md).
 - 검색식 때문에 파일이 비워짐·배치 안 PowerShell이 오실행됨: 「cmd.exe 검색 명령」과 「배치 파일 안의 PowerShell 본문」.
 - 재개한 세션이 마지막에 쓴 모델이 아니라 방을 만들 때 고른 모델로 열림: 「DevezCode 재개 인자와 기억된 모델」.
+- 데스크톱에서는 Computer Use가 되지만 Vibe에서는 `native pipe` 연결이 실패함: 「Computer Use의 데스크톱 연결 수명」.
 
 아래 배포·미배포 표현은 당시 기록이다. 비동기 질문 변경의 최종 배포는 같은 절의 Vibe 1.8.23·DevezCode 1.27.2 기록을 함께 읽는다. 현재 확인 위치는 [src/devezcode.rs](../src/devezcode.rs), [src/input_hub.rs](../src/input_hub.rs), [호스트 상태 검사](../scripts/test-devezcode-question-state.mjs)다.
+
+## Computer Use의 데스크톱 연결 수명
+
+- Windows Computer Use는 스킬 설치만으로 실행되지 않는다. [OpenAI 공식 문서](https://learn.chatgpt.com/docs/computer-use)는 데스크톱 앱을 실행 환경으로 설명한다. 앱 승인과 보안 정책은 별도로 유지한다.
+- `config.toml`의 `mcp_servers.node_repl.env.SKY_CUA_NATIVE_PIPE_DIRECTORY`가 갱신되어도 이미 실행 중인 MCP 자식은 시작할 때 받은 환경을 유지하므로 현재 설정과 다른, 사라진 파이프로 연결할 수 있다. 주소 불일치만으로 데스크톱을 열거나 재시작한 동작이 직접 원인이라고 단정하지 않는다.
+- 진단할 때 현재 설정, 실행 중인 `node_repl`의 해당 환경값, 실제 존재하는 파이프를 대조한다. 도구 목록에 나타나는 것과 실제 연결되는 것은 별개다. 설정 주소가 바뀌었다면 기존 MCP 재연결을 먼저 사용하며, 승인 우회나 헬퍼 직접 실행으로 대체하지 않는다.
 
 ## 질문 모서리 보정과 일반 이미지 출력의 차이 — 2026-09-10
 

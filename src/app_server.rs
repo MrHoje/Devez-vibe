@@ -143,10 +143,17 @@ pub struct AppServer {
     writer_task: JoinHandle<()>,
     reader_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
+    config_path: Option<PathBuf>,
+    computer_use_pipe: Mutex<Option<String>>,
 }
 
 impl AppServer {
     pub async fn spawn(codex_path: &Path, devezcode_room: Option<&str>) -> Result<Self> {
+        let config_path = crate::state::codex_home().map(|home| home.join("config.toml"));
+        let computer_use_pipe = config_path
+            .as_deref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|config| computer_use_pipe_config(&config));
         let resolved_codex = resolve_command(codex_path);
         let mut command = codex_command(&resolved_codex);
         apply_originator_override(&mut command);
@@ -281,6 +288,8 @@ impl AppServer {
             writer_task,
             reader_task,
             stderr_task,
+            config_path,
+            computer_use_pipe: Mutex::new(computer_use_pipe),
         })
     }
 
@@ -292,6 +301,9 @@ impl AppServer {
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
         if matches!(method, "thread/start" | "thread/resume" | "thread/fork" | "turn/start") {
+            if let Some(path) = &self.config_path {
+                refresh_computer_use(&self.client, path, &self.computer_use_pipe).await?;
+            }
             let thread = params.get("threadId").cloned();
             let (response, profile, lowered) = request_with_permissions(&self.client, method, params).await?;
             if let Some(thread) = response.pointer("/thread/id").cloned().or(thread) {
@@ -302,7 +314,17 @@ impl AppServer {
             }
             return Ok(response);
         }
-        self.client.request(method, params).await
+        let reloaded_config = if method == "config/mcpServer/reload" {
+            self.config_path.as_deref()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+        } else {
+            None
+        };
+        let response = self.client.request(method, params).await?;
+        if let Some(config) = reloaded_config {
+            *self.computer_use_pipe.lock().await = computer_use_pipe_config(&config);
+        }
+        Ok(response)
     }
 
     pub fn notify(&self, method: &str, params: Option<Value>) -> Result<()> {
@@ -340,6 +362,38 @@ impl AppServer {
         self.reader_task.abort();
         self.stderr_task.abort();
     }
+}
+
+/// The desktop supplies this pipe address through the Codex configuration.
+/// Running MCP children retain the previous environment until they reload.
+fn computer_use_pipe_config(config: &str) -> Option<String> {
+    config.lines().find_map(|line| {
+        let line = line.split('#').next()?.trim();
+        let (key, value) = line.split_once('=')?;
+        let key = key.trim().trim_matches(['"', '\'']);
+        matches!(
+            key,
+            "SKY_CUA_NATIVE_PIPE_DIRECTORY"
+                | "mcp_servers.node_repl.env.SKY_CUA_NATIVE_PIPE_DIRECTORY"
+        ).then(|| value.trim().to_owned())
+    })
+}
+
+async fn refresh_computer_use(
+    client: &AppServerClient,
+    config_path: &Path,
+    cached_pipe: &Mutex<Option<String>>,
+) -> Result<()> {
+    let Ok(config) = std::fs::read_to_string(config_path) else {
+        return Ok(());
+    };
+    let pipe = computer_use_pipe_config(&config);
+    let mut cached = cached_pipe.lock().await;
+    if *cached != pipe {
+        client.request("config/mcpServer/reload", json!({})).await?;
+        *cached = pipe;
+    }
+    Ok(())
 }
 
 fn initialize_params() -> Value {
@@ -856,6 +910,58 @@ fn condense_error_line(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn computer_use_reloads_changed_pipes_and_retries_failed_reload() {
+        let path = std::env::temp_dir().join(format!("dvz-computer-use-{}-{}.toml",
+            std::process::id(), std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let original = "[mcp_servers.node_repl.env]\nSKY_CUA_NATIVE_PIPE_DIRECTORY = 'old'\n";
+        std::fs::write(&path, original).unwrap();
+        let (outbound, mut messages) = mpsc::unbounded_channel();
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let client = AppServerClient {
+            outbound: Arc::new(StdMutex::new(Some(outbound))),
+            pending: pending.clone(), next_id: Arc::new(AtomicU64::new(1)),
+        };
+        let cached = Arc::new(Mutex::new(computer_use_pipe_config(original)));
+        refresh_computer_use(&client, &path, &cached).await.unwrap();
+        std::fs::write(&path, format!("{original}model = 'unrelated'\n")).unwrap();
+        refresh_computer_use(&client, &path, &cached).await.unwrap();
+        assert!(messages.try_recv().is_err(), "unchanged pipes must not restart MCP servers");
+
+        let (events, _) = mpsc::unbounded_channel();
+        for (config, fail) in [
+            ("mcp_servers.node_repl.env.SKY_CUA_NATIVE_PIPE_DIRECTORY = 'new'\n", true),
+            ("mcp_servers.node_repl.env.SKY_CUA_NATIVE_PIPE_DIRECTORY = 'new'\n", false),
+            ("# SKY_CUA_NATIVE_PIPE_DIRECTORY = 'ignored'\n", false),
+        ] {
+            std::fs::write(&path, config).unwrap();
+            let previous = cached.lock().await.clone();
+            let task = tokio::spawn({
+                let (client, path, cached) = (client.clone(), path.clone(), cached.clone());
+                async move { refresh_computer_use(&client, &path, &cached).await }
+            });
+            let request = timeout(Duration::from_secs(2), messages.recv()).await.unwrap().unwrap();
+            assert_eq!(request["method"], "config/mcpServer/reload");
+            assert_eq!(request["params"], json!({}));
+            let reply = if fail {
+                json!({"id": request["id"], "error": {"message": "reload failed"}})
+            } else {
+                json!({"id": request["id"], "result": {}})
+            };
+            route_message(reply, &pending, &events).await;
+            let result = task.await.unwrap();
+            assert_eq!(result.is_err(), fail);
+            if let Err(error) = result {
+                assert!(error.to_string().contains("reload failed"));
+            }
+            assert_eq!(*cached.lock().await, if fail { previous } else { computer_use_pipe_config(config) });
+        }
+        std::fs::remove_file(&path).unwrap();
+        refresh_computer_use(&client, &path, &cached).await.unwrap();
+        assert!(messages.try_recv().is_err(), "unreadable settings must not interrupt development");
+    }
 
     /// 백엔드가 살아 있는 채로 응답만 멈추면 요청을 끊고 알린다. 시간을 멈춘
     /// 검사라 실제로 10분을 기다리지 않는다.
