@@ -23,12 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Computer Use가 이전 연결 주소를 사용해 실패하던 문제를 고쳐, 연결 주소가 바뀌면 다음 요청에서 자동 갱신합니다.",
+    "하위 에이전트의 Codex 모델을 `gpt-6-luna`·`gpt-6.1-sol`로 바꾸고, Claude 하위 에이전트도 역할별 추론 수준을 지정합니다. 직접 고친 모델 설정은 그대로 둡니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Fixed Computer Use trying an outdated connection address: when the address changes, the next request refreshes the connection automatically.",
+    "Updated Codex subagent models to `gpt-6-luna` and `gpt-6.1-sol`, and assigned role-specific reasoning effort to Claude subagents. Your customized model settings are preserved.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");

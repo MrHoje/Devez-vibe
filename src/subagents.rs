@@ -1,14 +1,15 @@
 //! Fixed-model subagents the specialized roles dispatch.
 //!
 //! Planner and Goal Runner hand work to three lanes — an implementer, a
-//! reviewer, and an adversarial tester. Each lane has a model and a tool scope
-//! fixed here, so the role prompt only has to name the lane: a dispatch that
-//! forgets to pick a model no longer inherits the session's most expensive one.
+//! reviewer, and an adversarial tester. Each lane has a model, a reasoning
+//! effort and a tool scope fixed here, so the role prompt only has to name the
+//! lane: a dispatch that forgets to pick a model no longer inherits the
+//! session's most expensive one.
 //!
 //! The same definitions reach every provider that has subagents. Claude gets
 //! them as SDK agent definitions through the bridge on every session; Codex
 //! reads custom agents from `~/.codex/agents/*.toml`. Known shipped instructions
-//! are upgraded without changing models, other settings, or customized prompts.
+//! and untouched shipped model settings are upgraded; customized ones are kept.
 
 use std::{io::Write, path::Path};
 
@@ -24,6 +25,8 @@ pub struct Subagent {
     pub prompt: &'static str,
     /// Claude model alias.
     pub claude_model: &'static str,
+    /// Claude reasoning effort for the lane.
+    pub claude_effort: &'static str,
     /// Claude tool allow-list; the implementer edits, the other two read.
     pub claude_tools: &'static [&'static str],
     /// Codex model id written into the agent file.
@@ -68,9 +71,10 @@ pub const SUBAGENTS: [Subagent; 4] = [
                       Use for a big task the Goal Runner delegates; it never reviews.",
         prompt: IMPLEMENTER_PROMPT,
         claude_model: "sonnet",
+        claude_effort: "medium",
         claude_tools: EDITING_TOOLS,
-        codex_model: "gpt-5.6-luna",
-        codex_effort: "medium",
+        codex_model: "gpt-6-luna",
+        codex_effort: "high",
     },
     Subagent {
         name: "devez-reviewer",
@@ -80,8 +84,9 @@ pub const SUBAGENTS: [Subagent; 4] = [
                       and never spawns subagents.",
         prompt: REVIEWER_PROMPT,
         claude_model: "sonnet",
+        claude_effort: "high",
         claude_tools: READ_ONLY_TOOLS,
-        codex_model: "gpt-5.6-terra",
+        codex_model: "gpt-6.1-sol",
         codex_effort: "high",
     },
     Subagent {
@@ -92,9 +97,10 @@ pub const SUBAGENTS: [Subagent; 4] = [
                       spawns subagents.",
         prompt: REVIEWER_PROMPT,
         claude_model: "opus",
+        claude_effort: "xhigh",
         claude_tools: READ_ONLY_TOOLS,
-        codex_model: "gpt-5.6-sol",
-        codex_effort: "high",
+        codex_model: "gpt-6.1-sol",
+        codex_effort: "xhigh",
     },
     Subagent {
         name: "devez-qa",
@@ -103,9 +109,10 @@ pub const SUBAGENTS: [Subagent; 4] = [
                       for the surface. Use for the final adversarial lane; read-only on code.",
         prompt: QA_PROMPT,
         claude_model: "sonnet",
+        claude_effort: "medium",
         claude_tools: READ_ONLY_TOOLS,
-        codex_model: "gpt-5.6-terra",
-        codex_effort: "medium",
+        codex_model: "gpt-6-luna",
+        codex_effort: "high",
     },
 ];
 
@@ -120,6 +127,7 @@ pub fn claude_agent_definitions() -> Value {
                 "prompt": agent.prompt.trim(),
                 "tools": agent.claude_tools,
                 "model": agent.claude_model,
+                "effort": agent.claude_effort,
             }),
         );
     }
@@ -131,7 +139,7 @@ pub fn claude_agent_definitions() -> Value {
 pub fn codex_agent_toml(agent: &Subagent) -> String {
     format!(
         "# DevezVibe가 만든 서브에이전트 정의입니다. 모델이나 지침을 자유롭게 고쳐도 되며,\n\
-         # 배포된 기본 지침만 갱신하며, 직접 고친 지침과 나머지 설정은 보존합니다.\n\
+         # 배포된 기본 지침과 기본 모델 설정만 갱신하며, 직접 고친 내용은 보존합니다.\n\
          name = \"{name}\"\n\
          description = \"{description}\"\n\
          model = \"{model}\"\n\
@@ -145,16 +153,18 @@ pub fn codex_agent_toml(agent: &Subagent) -> String {
     )
 }
 
-/// Replace only a recognized shipped instruction block in our generated format.
-/// Unrecognized or customized files are left byte-for-byte intact.
+/// Replace only a recognized shipped instruction block, and a model pair still
+/// at the earlier shipped default, in our generated format. Unrecognized or
+/// customized parts are left byte-for-byte intact.
 fn upgraded_codex_agent(existing: &str, agent: &Subagent) -> Option<String> {
     if !existing.starts_with("# DevezVibe가 만든 서브에이전트 정의입니다.") {
         return None;
     }
-    let legacy = match agent.name {
-        "devez-implementer" => LEGACY_IMPLEMENTER,
-        "devez-reviewer" | "devez-senior-reviewer" => LEGACY_REVIEWER,
-        "devez-qa" => LEGACY_QA,
+    let (legacy, shipped_model, shipped_effort) = match agent.name {
+        "devez-implementer" => (LEGACY_IMPLEMENTER, "gpt-5.6-luna", "medium"),
+        "devez-reviewer" => (LEGACY_REVIEWER, "gpt-5.6-terra", "high"),
+        "devez-senior-reviewer" => (LEGACY_REVIEWER, "gpt-5.6-sol", "high"),
+        "devez-qa" => (LEGACY_QA, "gpt-5.6-terra", "medium"),
         _ => return None,
     };
     let newline = if existing.contains("\r\n") { "\r\n" } else { "\n" };
@@ -162,15 +172,30 @@ fn upgraded_codex_agent(existing: &str, agent: &Subagent) -> Option<String> {
         format!("\ndeveloper_instructions = '''\n{}\n'''", prompt.replace("\r\n", "\n").trim())
             .replace('\n', newline)
     };
-    let old = legacy
+    let settings = |model: &str, effort: &str| {
+        format!("\nmodel = \"{model}\"{newline}model_reasoning_effort = \"{effort}\"{newline}")
+    };
+    let mut updated = existing.to_owned();
+    if let Some(old) = legacy
         .iter()
         .map(|body| block(body))
-        .find(|old| existing.matches(old.as_str()).count() == 1)?;
-    Some(existing.replacen(&old, &block(agent.prompt), 1).replacen(
-        "# 이 파일이 있는 동안 DevezVibe는 다시 덮어쓰지 않습니다.",
-        "# 배포된 기본 지침만 갱신하며, 직접 고친 지침과 나머지 설정은 보존합니다.",
-        1,
-    ))
+        .find(|old| existing.matches(old.as_str()).count() == 1)
+    {
+        updated = updated.replacen(&old, &block(agent.prompt), 1);
+    }
+    let old = settings(shipped_model, shipped_effort);
+    if existing.matches(old.as_str()).count() == 1 {
+        updated = updated.replacen(&old, &settings(agent.codex_model, agent.codex_effort), 1);
+    }
+    if updated == existing {
+        return None;
+    }
+    let comment = "# 배포된 기본 지침과 기본 모델 설정만 갱신하며, 직접 고친 내용은 보존합니다.";
+    Some(
+        updated
+            .replacen("# 이 파일이 있는 동안 DevezVibe는 다시 덮어쓰지 않습니다.", comment, 1)
+            .replacen("# 배포된 기본 지침만 갱신하며, 직접 고친 지침과 나머지 설정은 보존합니다.", comment, 1),
+    )
 }
 
 /// Keep a recovery copy before replacing the file with a fully written sibling.
@@ -251,9 +276,11 @@ mod tests {
         assert_eq!(agents.as_object().map(|map| map.len()), Some(4));
         let reviewer = &agents["devez-reviewer"];
         assert_eq!(reviewer["model"], "sonnet");
+        assert_eq!(reviewer["effort"], "high");
         assert!(!reviewer["tools"].as_array().unwrap().iter().any(|tool| tool == "Edit"));
         // The most capable model is reserved for one lane.
         assert_eq!(agents["devez-senior-reviewer"]["model"], "opus");
+        assert_eq!(agents["devez-senior-reviewer"]["effort"], "xhigh");
         assert_eq!(
             SUBAGENTS.iter().filter(|agent| agent.claude_model == "opus").count(),
             1
@@ -267,9 +294,9 @@ mod tests {
     fn codex_agent_file_carries_name_model_and_instructions() {
         let toml = codex_agent_toml(&SUBAGENTS[1]);
         assert!(toml.contains("name = \"devez-reviewer\""));
-        assert!(toml.contains("model = \"gpt-5.6-terra\""));
+        assert!(toml.contains("model = \"gpt-6.1-sol\""));
         assert!(toml.contains("model_reasoning_effort = \"high\""));
-        assert!(codex_agent_toml(&SUBAGENTS[2]).contains("model = \"gpt-5.6-sol\""));
+        assert!(codex_agent_toml(&SUBAGENTS[0]).contains("model = \"gpt-6-luna\""));
         assert!(toml.contains("developer_instructions = '''"));
         assert!(toml.contains("DevezVibe reviewer"));
         assert!(!SUBAGENTS.iter().any(|agent| agent.prompt.contains("'''")));
@@ -369,6 +396,31 @@ mod tests {
         assert_eq!(std::fs::read_to_string(path.with_extension("toml.pre-readability-2.bak")).unwrap(), existing);
         assert!(!path.with_extension("toml.pre-readability-3.bak").exists());
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn shipped_default_models_follow_the_current_ones_and_custom_models_stay() {
+        let agent = &SUBAGENTS[1];
+        for newline in ["\n", "\r\n"] {
+            // The previous release's file: current header line, prompt and the old pair.
+            let previous = codex_agent_toml(agent)
+                .replace(
+                    "# 배포된 기본 지침과 기본 모델 설정만 갱신하며, 직접 고친 내용은 보존합니다.",
+                    "# 배포된 기본 지침만 갱신하며, 직접 고친 지침과 나머지 설정은 보존합니다.",
+                )
+                .replace("model = \"gpt-6.1-sol\"", "model = \"gpt-5.6-terra\"")
+                .replace('\n', newline);
+            assert_eq!(
+                upgraded_codex_agent(&previous, agent).as_deref(),
+                Some(codex_agent_toml(agent).replace('\n', newline).as_str()),
+            );
+            for custom in [
+                previous.replace("gpt-5.6-terra", "my-model"),
+                previous.replace("effort = \"high\"", "effort = \"low\""),
+            ] {
+                assert!(upgraded_codex_agent(&custom, agent).is_none());
+            }
+        }
     }
 
     #[test]
