@@ -86,6 +86,13 @@ TUI를 띄우지 않고 실제 에이전트 동작을 확인할 때는 브리지
   stdin이 닫히면 세션이 정리되므로 파이프를 열어 둔다.
 - `turn/subagents/updated` 알림의 `subagents` 배열이 하단 목록 그대로이므로, 행이 언제
   생기고 사라지는지 이 알림만 보면 된다.
+- Haiku는 자동 승인 모드를 지원하지 않아 `session/start`가 `auto mode unavailable for this model`로
+  실패한다. 단독 검증은 Sonnet처럼 자동 모드를 지원하는 모델로 한다.
+- 호스트 요청(문자열 id)에는 같은 id로 `result`를 돌려준다. 일반 권한 카드의 거절은
+  `{ permissions: {}, scope: "turn" }`이므로 `scope`만 보고 허용으로 판정하지 않는다.
+  2026-10-08 전까지 브리지가 이 거절을 허용으로 처리했다(`approvalGranted`로 수정).
+- `allowedTools`에 넣은 도구는 `canUseTool`을 거치지 않아 SDK가
+  `CLAUDE_SDK_CAN_USE_TOOL_SHADOWED` 경고를 낸다. Task 도구는 의도된 경고다.
 
 ## 세션 분기 모델·추론 수준
 

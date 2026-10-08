@@ -11,6 +11,7 @@
 - 검색식 때문에 파일이 비워짐·배치 안 PowerShell이 오실행됨: 「cmd.exe 검색 명령」과 「배치 파일 안의 PowerShell 본문」.
 - 재개한 세션이 마지막에 쓴 모델이 아니라 방을 만들 때 고른 모델로 열림: 「DevezCode 재개 인자와 기억된 모델」.
 - 데스크톱에서는 Computer Use가 되지만 Vibe에서는 `native pipe` 연결이 실패함: 「Computer Use의 데스크톱 연결 수명」.
+- Claude Computer Use가 터미널에 입력함·사용자 화면 노출 없이 검증해야 함: 「Claude Computer Use(`devez-computer`)」.
 
 아래 배포·미배포 표현은 당시 기록이다. 비동기 질문 변경의 최종 배포는 같은 절의 Vibe 1.8.23·DevezCode 1.27.2 기록을 함께 읽는다. 현재 확인 위치는 [src/devezcode.rs](../src/devezcode.rs), [src/input_hub.rs](../src/input_hub.rs), [호스트 상태 검사](../scripts/test-devezcode-question-state.mjs)다.
 
@@ -27,6 +28,15 @@
 - SDK 함수 내부 시간, MCP 도구 왕복, 도구 호출 사이의 모델·네트워크·진행 처리, 화면 표시 시간을 따로 잰다. 대화 기록의 사용자 입력부터 최종 답변까지 걸린 시간을 순수 클릭 시간이나 순수 모델 추론 시간으로 바꾸지 않는다.
 - 창 제목줄에 최소화 버튼 이름이 보여도 `no cached bounds`이면 위치가 확보된 것은 아니다. 같은 접근성 클릭을 반복하지 말고 최신 화면의 버튼 위치와 `screenshotId`를 확인한다. 창 이동·크기 변경 후 이전 좌표를 쓰지 않는다.
 - `physical Escape` 중단 문구는 도구가 보고한 사유다. 사용자가 직접 키를 눌렀다는 독립 증거로 취급하지 않으며, 도구가 중단을 알리면 해당 턴의 입력을 멈춘다.
+
+## Claude Computer Use(`devez-computer`)
+
+- 번들 Claude Code CLI(2.1.292)에도 내장 `computer-use` 서버 코드가 있지만 SDK 빌드에서는 활성화 조건이 꺼져 있고 기본값이 macOS다. 켜는 방법을 찾지 말고 브리지의 자체 MCP 도구(`mcp__devez-computer__computer`)를 고친다. 문서의 `BetaAbstractComputerToolset20260801`은 Messages API 루프 전용이라 Agent SDK 세션에 넣을 수 없다.
+- 도구는 따로 묻지 않고 세션 권한 모드를 따른다. 사용자가 Codex처럼 묻지 않기를 요청해(2026-10-08) 자체 승인 창을 없앴으므로 다시 넣지 않는다. 사람에게 묻는 경우는 default 모드의 일반 권한 카드뿐이다.
+- 한 번에 모니터 하나를 다룬다. `screenshot`의 `display`로 전환하고, 이후 좌표·확대는 마지막으로 찍은 모니터 기준이다. 모든 모니터를 한 장에 담으면(개발 PC 4대, 5760×2168) 1280 폭으로 줄였을 때 읽을 수 없다. 기본 CLI의 `computer-use` 서버도 `switch_display`로 전환한다.
+- 기본 CLI는 auto·bypass 모드에서도 `computer-use` 도구를 일괄 허용하지 않고 auto 판정기로 넘긴다. 사람에게 매번 묻지는 않는다.
+- Claude Code는 MCP 이미지 결과를 `~/.claude/projects` 아래에 저장하고 도구 결과에 `[Image: source: …]` 문구를 덧붙인다. 브리지는 호스트로 보내기 전에 이미지 데이터를 지운다.
+- 사용자 화면을 모델에 보내지 않고 검증한다. 도우미는 화면 변화가 없는 `displays`·`cursor`·`shot`·제자리 `move`만 직접 실행한다. 도구가 묻지 않으므로 auto 모드의 실제 모델 턴은 전체 화면을 보낼 수 있다. 모델 턴과 클릭·입력 시험은 사용자 동의 없이 하지 않는다.
 
 ## 질문 모서리 보정과 일반 이미지 출력의 차이 — 2026-09-10
 

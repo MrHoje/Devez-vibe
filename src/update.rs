@@ -23,12 +23,14 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "하위 에이전트의 Codex 모델을 `gpt-6-luna`·`gpt-6.1-sol`로 바꾸고, Claude 하위 에이전트도 역할별 추론 수준을 지정합니다. 직접 고친 모델 설정은 그대로 둡니다.",
+    "Claude에서도 Computer Use로 여러 모니터의 화면을 보고 마우스·키보드를 조작할 수 있습니다.",
+    "Claude 권한 요청에서 거절을 골라도 작업이 실행되던 문제를 고쳤습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Updated Codex subagent models to `gpt-6-luna` and `gpt-6.1-sol`, and assigned role-specific reasoning effort to Claude subagents. Your customized model settings are preserved.",
+    "Claude can now use Computer Use to see your screens across multiple monitors and control the mouse and keyboard.",
+    "Fixed Claude permission prompts that still ran the action after you chose Deny.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");
