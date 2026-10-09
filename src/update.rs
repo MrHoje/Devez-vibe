@@ -23,14 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude에서도 Computer Use로 여러 모니터의 화면을 보고 마우스·키보드를 조작할 수 있습니다.",
-    "Claude 권한 요청에서 거절을 골라도 작업이 실행되던 문제를 고쳤습니다.",
+    "Claude `/effort`에서 Tab으로 ultracode를 켜고 끌 수 있습니다. 켜면 xhigh로 고정되고 모든 작업에 동적 워크플로우를 씁니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "Claude can now use Computer Use to see your screens across multiple monitors and control the mouse and keyboard.",
-    "Fixed Claude permission prompts that still ran the action after you chose Deny.",
+    "In Claude `/effort`, Tab turns ultracode on or off. It fixes effort at xhigh and uses dynamic workflows on every task.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");
