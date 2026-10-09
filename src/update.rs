@@ -23,12 +23,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Korean release notes shown on the welcome screen.
 pub const RELEASE_NOTES: &[&str] = &[
-    "Claude `/effort`에서 Tab으로 ultracode를 켜고 끌 수 있습니다. 켜면 xhigh로 고정되고 모든 작업에 동적 워크플로우를 씁니다.",
+    "Claude `/effort`에 ultracode를 추가했고, max 다음 단계로 고를 수 있습니다.",
 ];
 
 /// The same notes, line for line, for `/language english`.
 pub const RELEASE_NOTES_EN: &[&str] = &[
-    "In Claude `/effort`, Tab turns ultracode on or off. It fixes effort at xhigh and uses dynamic workflows on every task.",
+    "Added ultracode to Claude `/effort`; you can pick it as the step after max.",
 ];
 
 const _: () = assert!(RELEASE_NOTES.len() == RELEASE_NOTES_EN.len(), "every release note needs an English line");
