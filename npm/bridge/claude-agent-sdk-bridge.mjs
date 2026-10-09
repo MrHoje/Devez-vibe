@@ -3731,10 +3731,19 @@ async function runPrompt(session, params) {
     modelCapabilities(session.models, params.model || session.model),
     params.effort ?? session.effort,
   );
+  // Ultracode is xhigh plus standing workflows; a steer keeps the session's.
+  const ultracode = (params.ultracode ?? session.ultracode) === true && effort === "xhigh";
   if (effort) {
-    await session.query.applyFlagSettings({ effortLevel: effort });
+    await session.query.applyFlagSettings({ effortLevel: effort, ultracode });
+  }
+  // The SDK takes the flag without complaint even where dynamic workflows are
+  // off, so ask whether it actually took hold.
+  if (ultracode) {
+    const settings = await session.query.getSettings?.().catch(() => null);
+    if (settings?.applied?.ultracode === false) notify("claude/ultracode/unavailable", { threadId: id });
   }
   session.effort = effort;
+  session.ultracode = ultracode;
   // The role's read-only policy, or none: it binds this turn and the background
   // work it starts, until the next prompt replaces it. Steering carries no
   // policy of its own — it joins the turn already running — so a steer that
@@ -5496,6 +5505,32 @@ async function runSelfTest() {
     await dispatch("session/interrupt", { sessionId: limitSession.id });
     resumeAfterUsageLimit(limitSession, cancelledWait, cancelledWait.resetsAt);
     if (limitSession.turn || retryInputs.length !== 1) throw new Error("Cancelled usage limit resumed");
+    // Ultracode rides with each prompt's effort; a steer that becomes a turn keeps it.
+    const flagCalls = [];
+    const ultracodeSession = {
+      ...limitSession,
+      id: "ultracode-self-test",
+      turn: null,
+      query: {
+        ...limitSession.query,
+        async applyFlagSettings(settings) { flagCalls.push(settings); },
+        async getSettings() { return { applied: { ultracode: true } }; },
+      },
+      queue: { push() {} },
+    };
+    for (const params of [
+      { effort: "xhigh", ultracode: true },
+      {},
+      { effort: "high", ultracode: true },
+      { effort: "xhigh", ultracode: false },
+    ]) {
+      ultracodeSession.turn = null;
+      await runPrompt(ultracodeSession, { input: [], ...params });
+    }
+    const flagTrail = flagCalls.map((call) => `${call.effortLevel}:${call.ultracode}`).join(",");
+    if (flagTrail !== "xhigh:true,xhigh:true,high:false,xhigh:false") {
+      throw new Error(`Claude ultracode self-test failed: ${flagTrail}`);
+    }
     for (const info of [
       { resetsAt: undefined }, { resetsAt: NaN }, { resetsAt: Date.now() / 1000 - 1 },
       { resetsAt: Date.now() / 1000 + 90000 }, { status: "allowed_warning" },

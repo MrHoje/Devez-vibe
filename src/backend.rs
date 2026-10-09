@@ -612,6 +612,7 @@ impl BackendServer {
                                     "input": params.get("input").cloned().unwrap_or_else(|| json!([])),
                                     "model": params.get("model").cloned().unwrap_or(Value::Null),
                                     "effort": params.get("effort").cloned().unwrap_or(Value::Null),
+                                    "ultracode": params.get("ultracode").and_then(Value::as_bool).unwrap_or(false),
                                     "permissionMode": CLAUDE_PREFERRED_PERMISSION_MODE,
                                     "handoffContext": turn_context,
                                     "toolPolicy": params.get("toolPolicy").cloned().unwrap_or(Value::Null)

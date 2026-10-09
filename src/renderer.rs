@@ -365,6 +365,8 @@ pub struct OverlayView<'a> {
 pub struct EffortSlider {
     pub efforts: Vec<String>,
     pub selected: usize,
+    /// Where the ultracode badge's shimmer is, `0.0..1.0`; `None` while it is off.
+    pub ultracode_phase: Option<f32>,
     pub detail: Option<String>,
 }
 
@@ -8338,6 +8340,29 @@ fn effort_step_lines_in(slider: &EffortSlider, inner: usize) -> Vec<PaintLine> {
     ]
 }
 
+/// `✦ ULTRACODE ON ✦`, centred under the track: a bold ultra-tone label that a
+/// wide light band keeps sweeping across, its stars twinkling between two
+/// shapes as the sweep comes round.
+fn ultracode_badge_line(phase: f32, inner: usize) -> PaintLine {
+    let star = if phase < 0.5 { '✦' } else { '✧' };
+    let label = format!("{star} ULTRACODE ON {star}");
+    let base = tone_rgb(Tone::EffortUltra).unwrap_or(theme::palette().accent);
+    let mut tail = shimmer_spans_with_band(&label, phase, base, SHIMMER_BAND * 2.0);
+    for span in &mut tail {
+        span.bold = true;
+    }
+    PaintLine {
+        prefix: " ".repeat(inner.saturating_sub(label.chars().count()) / 2),
+        prefix_tone: Tone::Muted,
+        text: String::new(),
+        tone: Tone::Muted,
+        bold: false,
+        tool_heading: None,
+        pick: None,
+        tail,
+    }
+}
+
 /// A painted piece of the effort track and the step it stands for. The
 /// separators between the steps stand for nothing, and the shrinking that fits
 /// the track into a narrow panel drops steps, so which piece is which step is
@@ -8594,6 +8619,13 @@ fn overlay_frame_with_expansion(
                         .into_iter()
                         .map(|line| panelize_content_line(line, panel_width)),
                 );
+                if let Some(phase) = slider.ultracode_phase {
+                    lines.push(panel_padding_row(panel_width));
+                    lines.push(panelize_content_line(
+                        ultracode_badge_line(phase, inner_width),
+                        panel_width,
+                    ));
+                }
                 if let Some(detail) = slider.detail.as_deref() {
                     lines.push(panel_padding_row(panel_width));
                     lines.extend(
@@ -13996,7 +14028,7 @@ fn effort_tone(effort: &str) -> Option<Tone> {
         "high" => Tone::EffortHigh,
         "xhigh" => Tone::EffortXHigh,
         "max" => Tone::EffortMax,
-        "ultra" => Tone::EffortUltra,
+        "ultra" | "ultracode" => Tone::EffortUltra,
         _ => return None,
     })
 }
@@ -14517,7 +14549,7 @@ fn status_effort_tone(effort: &str) -> Option<Tone> {
         "high" => Tone::StatusEffortHigh,
         "xhigh" => Tone::StatusEffortXHigh,
         "max" => Tone::StatusEffortMax,
-        "ultra" => Tone::StatusEffortUltra,
+        "ultra" | "ultracode" => Tone::StatusEffortUltra,
         _ => return None,
     })
 }
@@ -20748,6 +20780,7 @@ mod tests {
             let slider = EffortSlider {
                 efforts: ["Off", "On", "Super Vibe"].map(ToOwned::to_owned).to_vec(),
                 selected,
+                ultracode_phase: None,
                 detail: None,
             };
             let lines = effort_step_lines(&slider, 80);
@@ -26820,6 +26853,7 @@ mod tests {
                             .map(ToOwned::to_owned)
                             .to_vec(),
                         selected: 2,
+                        ultracode_phase: None,
                         detail: None,
                     }),
                     hint: "Enter select".to_owned(),
@@ -26851,6 +26885,56 @@ mod tests {
                 panel.iter().any(|line| painted(line).contains("│ HIGH │")),
                 "width {width}: selected effort border disappeared"
             );
+        }
+    }
+
+    #[test]
+    fn the_ultracode_badge_shimmers_inside_the_picker_panel() {
+        for width in [20, 33, 80] {
+            let frame = overlay_frame(
+                &[],
+                OverlayView {
+                    closable: false,
+                    title: "Effort".to_owned(),
+                    lines: Vec::new(),
+                    slider: Some(EffortSlider {
+                        efforts: vec!["xhigh".to_owned()],
+                        selected: 0,
+                        ultracode_phase: Some(0.5),
+                        detail: Some("Tab to toggle".to_owned()),
+                    }),
+                    hint: "Enter select".to_owned(),
+                    style: OverlayStyle::Picker,
+                    input: None,
+                    input_label: "",
+                    input_placeholder: "",
+                },
+                None,
+                StatusArea {
+                    fallback: "status".to_owned(),
+                    line: None,
+                    diff_reference_lines: None,
+                    side_panel_open: false,
+                    composer_notice: None,
+                    composer_mode: None,
+                },
+                width,
+            );
+            let panel = &frame.lines[..frame.lines.len() - 2];
+
+            assert!(
+                panel
+                    .iter()
+                    .all(|line| painted_width(line) == panel_span(width)),
+                "width {width}: Picker row escapes its closed panel"
+            );
+            let badge = panel
+                .iter()
+                .find(|line| painted(line).contains("ULTRACODE ON"))
+                .expect("ultracode badge");
+            assert!(badge.tail.iter().any(|span| {
+                span.bold && matches!(span.tone, Tone::Shimmer(_, level) if level > 200)
+            }));
         }
     }
 
@@ -26909,6 +26993,7 @@ mod tests {
                 .map(ToOwned::to_owned)
                 .to_vec(),
             selected: 2,
+            ultracode_phase: None,
             detail: None,
         };
 
@@ -26958,6 +27043,7 @@ mod tests {
                 .map(ToOwned::to_owned)
                 .to_vec(),
             selected: 2,
+            ultracode_phase: None,
             detail: None,
         };
 
@@ -26986,6 +27072,7 @@ mod tests {
         let slider = EffortSlider {
             efforts: ["low", "medium", "high"].map(ToOwned::to_owned).to_vec(),
             selected: 1,
+            ultracode_phase: None,
             detail: None,
         };
         let steps = effort_step_lines(&slider, 80).remove(1);
@@ -27413,6 +27500,7 @@ mod tests {
                 slider: Some(EffortSlider {
                     efforts: ["low", "medium", "high"].map(ToOwned::to_owned).to_vec(),
                     selected: 1,
+                    ultracode_phase: None,
                     detail: None,
                 }),
                 hint: "←→ to adjust".to_owned(),
@@ -27452,6 +27540,7 @@ mod tests {
                 .map(ToOwned::to_owned)
                 .to_vec(),
             selected: 2,
+            ultracode_phase: None,
             detail: None,
         };
 
@@ -27467,6 +27556,7 @@ mod tests {
                 &EffortSlider {
                     efforts: Vec::new(),
                     selected: 0,
+                    ultracode_phase: None,
                     detail: None,
                 },
                 80,
@@ -27479,6 +27569,7 @@ mod tests {
                 .map(ToOwned::to_owned)
                 .to_vec(),
             selected: 99,
+            ultracode_phase: None,
             detail: None,
         };
         let lines = effort_step_lines(&slider, 80);

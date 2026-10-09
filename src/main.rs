@@ -1381,6 +1381,9 @@ async fn start_split_turn(
     if !effort.is_empty() {
         params["effort"] = json!(effort);
     }
+    if state.ultracode_active() {
+        params["ultracode"] = json!(true);
+    }
     if let Some(mode) = state.claude_permission_mode() {
         params["claudePermissionMode"] = json!(mode.wire());
     }
@@ -6093,6 +6096,9 @@ async fn start_turn(
     });
     if !effort.is_empty() {
         params["effort"] = json!(effort);
+    }
+    if state.ultracode_active() {
+        params["ultracode"] = json!(true);
     }
     if let Some(mode) = state.claude_permission_mode() {
         params["claudePermissionMode"] = json!(mode.wire());
