@@ -470,7 +470,6 @@ impl ProviderPicker {
                     })
                     .collect(),
                 selected: self.selected,
-                ultracode_phase: None,
                 detail: None,
             }),
             hint: "←→ Move  Enter Select  Esc Close".to_owned(),
