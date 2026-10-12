@@ -7458,7 +7458,7 @@ impl AppState {
             plan_shimmer_phase: self.plan_shimmer_phase(),
             plan_agent: self.active_turn_agent,
             editor: &self.editor,
-            composer_images: &self.composer_images,
+            composer_images: self.visible_composer_images(),
             queued_prompts: self.queued_prompts.iter().map(|queued| queued.display.clone()).collect(),
             steered_prompts: self
                 .pending_steer_prompts
@@ -8143,6 +8143,22 @@ impl AppState {
     pub(crate) fn begin_ctrl_backspace_repeat(&mut self) {
         self.ctrl_backspace_pressed_at = Some(Instant::now());
         self.ctrl_backspace_repeating = false;
+    }
+
+    /// 보낸 프롬프트의 이미지는 `turn_input`이 거둘 때까지 자리표시자 없이
+    /// 컴포저에 남는다. 첫 프롬프트가 세션을 여는 동안 그 라벨이 빈 입력란에
+    /// 남아 보이지 않게, 턴이 열리기 전에는 자리표시자가 있는 첨부만 그린다.
+    fn visible_composer_images(&self) -> &[String] {
+        if !self.busy || self.turn_id.is_some() {
+            return &self.composer_images;
+        }
+        let placeholders = self
+            .editor
+            .chars()
+            .iter()
+            .filter(|&&ch| ch == ATTACHMENT_PLACEHOLDER)
+            .count();
+        &self.composer_images[..placeholders.min(self.composer_images.len())]
     }
 
     fn sync_composer_images_after_history_navigation(&mut self) {
@@ -30879,6 +30895,19 @@ mod tests {
                 "{label}: 이미지가 함께 나가지 않음 {input:?}"
             );
         }
+    }
+
+    #[test]
+    fn sent_image_label_leaves_the_composer_before_the_turn_opens() {
+        let mut state = test_state();
+        state.attach_local_image(r"C:\Temp\clipboard-image.bmp".to_owned());
+        let Action::Submit(text) = state.submit_editor() else {
+            panic!("이미지 프롬프트가 나가야 한다");
+        };
+
+        assert!(state.view().composer_images.is_empty(), "세션을 여는 동안 [Image #1]이 남음");
+        let input = state.turn_input(text);
+        assert!(input.iter().any(|item| item["type"] == "localImage"), "숨긴 첨부가 전송에서 빠짐");
     }
 
     #[test]
