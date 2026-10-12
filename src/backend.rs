@@ -811,6 +811,50 @@ impl BackendServer {
                     self.codex()?.request(method, params).await
                 }
             }
+            // Each runtime keeps the name in its own session store, where its
+            // session list — and DevezCode — read it. A conversation that switched
+            // providers lists whichever half ran last, so every half is named.
+            "thread/name/set" => {
+                let visible = self.canonical_visible(thread_id(&params)?);
+                let active = self.route_kind(&visible);
+                if active == RuntimeKind::OpenCode {
+                    return Err(anyhow::anyhow!(tr(
+                        "OpenCode provider는 세션 이름 변경을 지원하지 않습니다.",
+                        "The OpenCode provider doesn't support renaming sessions.",
+                    )));
+                }
+                let cwd = self
+                    .route(&visible)
+                    .map(|route| route.cwd)
+                    .unwrap_or_else(|| self.cwd.clone());
+                let mut renamed = Ok(json!({}));
+                for kind in [RuntimeKind::Claude, RuntimeKind::Codex] {
+                    let Ok(backing) = self.backing_id(&visible, kind) else {
+                        continue;
+                    };
+                    let result = if kind == RuntimeKind::Claude {
+                        self.claude
+                            .request(
+                                "session/rename",
+                                json!({ "sessionId": backing, "name": params["name"], "cwd": cwd }),
+                            )
+                            .await
+                    } else {
+                        match self.codex() {
+                            Ok(codex) => {
+                                codex
+                                    .request(method, json!({ "threadId": backing, "name": params["name"] }))
+                                    .await
+                            }
+                            Err(error) => Err(error),
+                        }
+                    };
+                    if kind == active {
+                        renamed = result;
+                    }
+                }
+                renamed
+            }
             "claude/permissions/status" => self.claude.request("permissions/status", params).await,
             "claude/account/read" => self.claude.request("account/read", params).await,
             "claude/permissions/update" => self.claude.request("permissions/update", params).await,
@@ -886,6 +930,65 @@ impl BackendServer {
 
     pub fn client(&self) -> Option<AppServerClient> {
         self.codex.as_ref().map(AppServer::client)
+    }
+
+    /// Names a new thread from its first prompt: Codex with `codex_model`, Claude
+    /// with Haiku, whose short title then outranks Claude Code's own. OpenCode
+    /// names its sessions itself.
+    pub fn title_new_thread(&self, thread_id: &str, codex_model: &str, prompt: &str) {
+        match self.route_kind(thread_id) {
+            RuntimeKind::Codex => {
+                if let (Some(client), Ok(backing)) =
+                    (self.client(), self.backing_id(thread_id, RuntimeKind::Codex))
+                {
+                    crate::app_server::spawn_thread_title(
+                        &self.codex_path,
+                        client,
+                        backing,
+                        codex_model,
+                        prompt,
+                    );
+                }
+            }
+            RuntimeKind::Claude => {
+                let Ok(backing) = self.backing_id(thread_id, RuntimeKind::Claude) else {
+                    return;
+                };
+                let cwd = self
+                    .route(&self.canonical_visible(thread_id))
+                    .map(|route| route.cwd)
+                    .unwrap_or_else(|| self.cwd.clone());
+                let client = self.claude.client();
+                let request = crate::app_server::title_request(prompt);
+                tokio::spawn(async move {
+                    let Some(title) = client
+                        .request("session/title", json!({ "prompt": request }))
+                        .await
+                        .ok()
+                        .and_then(|reply| {
+                            reply
+                                .get("reply")
+                                .and_then(Value::as_str)
+                                .and_then(crate::app_server::clean_title)
+                        })
+                    else {
+                        return;
+                    };
+                    let _ = client
+                        .request(
+                            "session/rename",
+                            json!({
+                                "sessionId": backing,
+                                "name": title,
+                                "cwd": cwd,
+                                "unnamedOnly": true
+                            }),
+                        )
+                        .await;
+                });
+            }
+            RuntimeKind::OpenCode => {}
+        }
     }
 
     pub fn integration_client(&self, model: &str) -> Option<IntegrationClient> {

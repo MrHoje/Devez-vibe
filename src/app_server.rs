@@ -418,6 +418,10 @@ fn initialize_params() -> Value {
 }
 
 fn codex_command(resolved: &Path) -> Command {
+    codex_invocation(resolved, &["app-server", "--listen", "stdio://"])
+}
+
+fn codex_invocation(resolved: &Path, args: &[&str]) -> Command {
     #[cfg(windows)]
     {
         let extension = resolved
@@ -431,7 +435,7 @@ fn codex_command(resolved: &Path) -> Command {
                 && let Some(binary) = vendored_codex_binary(root)
             {
                 let mut command = Command::new(binary);
-                command.args(["app-server", "--listen", "stdio://"]);
+                command.args(args);
                 return command;
             }
 
@@ -450,27 +454,139 @@ fn codex_command(resolved: &Path) -> Command {
                         resolve_command(Path::new("node"))
                     };
                     let mut command = Command::new(node);
-                    command
-                        .arg(script)
-                        .args(["app-server", "--listen", "stdio://"]);
+                    command.arg(script).args(args);
                     return command;
                 }
             }
 
             let shell = env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
             let mut command = Command::new(shell);
-            command.args(["/d", "/s", "/c"]).arg(resolved).args([
-                "app-server",
-                "--listen",
-                "stdio://",
-            ]);
+            command.args(["/d", "/s", "/c"]).arg(resolved).args(args);
             return command;
         }
     }
 
     let mut command = Command::new(resolved);
-    command.args(["app-server", "--listen", "stdio://"]);
+    command.args(args);
     command
+}
+
+const TITLE_INSTRUCTIONS: &str =
+    "Write a title for a conversation that begins with the user request below.
+Use the language of the request, about 20 characters including spaces, no quotes or trailing punctuation.
+Reply with the title only. Do not run commands or use tools.";
+/// Enough of a long first prompt to say what it is about.
+const TITLE_PROMPT_CHARS: usize = 2_000;
+/// Titles aim at about 20 characters; this only stops a reply that ignored it.
+const TITLE_CHARS: usize = 30;
+
+/// What both runtimes are asked to title a new session from.
+pub(crate) fn title_request(prompt: &str) -> String {
+    let request: String = prompt.chars().take(TITLE_PROMPT_CHARS).collect();
+    format!("{TITLE_INSTRUCTIONS}\n\n<request>\n{request}\n</request>")
+}
+
+/// Codex's own clients name a thread from its first prompt; the app-server does
+/// not, so the title comes from a one-off `codex exec`. It loads no user config,
+/// rules or project instructions, saves no session, and runs outside the
+/// DevezCode room so the host's Codex hooks never take it for the room's thread.
+/// The name goes through `thread/name/set`, into the store Codex's own clients
+/// write and DevezCode reads.
+pub(crate) fn spawn_thread_title(
+    codex_path: &Path,
+    client: AppServerClient,
+    thread_id: String,
+    model: &str,
+    prompt: &str,
+) {
+    let mut command = codex_invocation(
+        &resolve_command(codex_path),
+        &[
+            "exec",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "--color",
+            "never",
+            "-c",
+            "model_reasoning_effort=\"low\"",
+            "-m",
+            model,
+        ],
+    );
+    command
+        .arg("-C")
+        .arg(env::temp_dir())
+        .arg("-")
+        .env_remove("DEVEZCODE_ROOM_ID")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    crate::child_process::isolate_backend(&mut command);
+    let input = title_request(prompt);
+    tokio::spawn(async move {
+        let Ok(mut child) = command.spawn() else {
+            return;
+        };
+        let _job = crate::child_process::adopt_backend(&child);
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(input.as_bytes()).await;
+        }
+        let Ok(Ok(output)) = timeout(Duration::from_secs(120), child.wait_with_output()).await
+        else {
+            return;
+        };
+        let Some(title) = output
+            .status
+            .success()
+            .then(|| clean_title(&String::from_utf8_lossy(&output.stdout)))
+            .flatten()
+        else {
+            return;
+        };
+        // A name given meanwhile — `/rename`, or another client — stays.
+        let named = client
+            .request("thread/read", json!({ "threadId": thread_id }))
+            .await
+            .is_ok_and(|response| {
+                response
+                    .pointer("/thread/name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| !name.is_empty())
+            });
+        if !named {
+            let _ = client
+                .request(
+                    "thread/name/set",
+                    json!({ "threadId": thread_id, "name": title }),
+                )
+                .await;
+        }
+    });
+}
+
+/// The reply's first line, without the quotes or markdown a model may add.
+pub(crate) fn clean_title(reply: &str) -> Option<String> {
+    let line = reply.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let title = line
+        .trim_start_matches(['#', '*', '"', '\'', '`', '“', '‘', ' '])
+        .trim_end_matches(['*', '"', '\'', '`', '”', '’', '.', '。', ' ']);
+    // A model counts characters loosely, so the cap is enforced here, at the last
+    // space that fits when the cut would split a word.
+    let title = match title.char_indices().nth(TITLE_CHARS) {
+        Some((end, next)) if !next.is_whitespace() => {
+            let fitted = &title[..end];
+            fitted.rfind(' ').map_or(fitted, |space| &fitted[..space])
+        }
+        Some((end, _)) => &title[..end],
+        None => title,
+    }
+    .trim_end();
+    (!title.is_empty()).then(|| title.to_owned())
 }
 
 /// The app-server turns `clientInfo.name` into the `originator` header it sends
@@ -1137,6 +1253,32 @@ mod tests {
         } else {
             assert!(codex_config_declares_mcp_2026_protocol());
         }
+    }
+
+    #[test]
+    fn thread_titles_keep_only_the_first_plain_line() {
+        assert_eq!(
+            clean_title("\n\"세션 자동 이름\".\nextra").as_deref(),
+            Some("세션 자동 이름")
+        );
+        assert_eq!(
+            clean_title("## **Fix login flow**").as_deref(),
+            Some("Fix login flow")
+        );
+        assert_eq!(clean_title(" \n \n"), None);
+        assert_eq!(
+            clean_title(&"가".repeat(80)).map(|title| title.chars().count()),
+            Some(TITLE_CHARS)
+        );
+        // About 20 is asked for; only a reply far past it is cut, at a space.
+        assert_eq!(
+            clean_title("세션 자동 이름 및 rename 기능 추가").as_deref(),
+            Some("세션 자동 이름 및 rename 기능 추가")
+        );
+        assert_eq!(
+            clean_title("Fix the login flow for OAuth users on Windows").as_deref(),
+            Some("Fix the login flow for OAuth")
+        );
     }
 
     #[test]

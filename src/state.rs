@@ -433,21 +433,20 @@ impl SlashCommand {
     }
 
     /// Whether the command reaches anything on `provider`. OpenCode has no
-    /// account, permission, MCP, plugin, or skill surface of its own, and Claude
-    /// has no fast service tier, so those commands stay out of the suggestion
-    /// list — and out of `/help` — while such a runtime is selected.
+    /// account, permission, MCP, plugin, skill, or session-name surface of its
+    /// own, and Claude has no fast service tier, so those commands stay out of the
+    /// suggestion list — and out of `/help` — while such a runtime is selected.
     fn supports(&self, provider: ModelProvider) -> bool {
         match self.name {
-            "/login" | "/logout" | "/mcp" | "/plugins" | "/reload-plugins" | "/skills" => {
-                provider != ModelProvider::OpenCode
-            }
+            "/login" | "/logout" | "/mcp" | "/plugins" | "/reload-plugins" | "/skills"
+            | "/rename" => provider != ModelProvider::OpenCode,
             "/fast" => provider != ModelProvider::Claude,
             _ => true,
         }
     }
 }
 
-const SLASH_COMMANDS: [SlashCommand; 34] = [
+const SLASH_COMMANDS: [SlashCommand; 35] = [
     SlashCommand {
         name: "/provider",
         korean: "Claude·Codex provider 전환 또는 OpenCode 연결",
@@ -561,6 +560,12 @@ const SLASH_COMMANDS: [SlashCommand; 34] = [
         korean: "/resume 별칭",
         english: "Alias for /resume",
         takes_argument: false,
+    },
+    SlashCommand {
+        name: "/rename",
+        korean: "현재 세션 이름 바꾸기",
+        english: "Rename the current session",
+        takes_argument: true,
     },
     SlashCommand {
         name: "/btw",
@@ -1213,6 +1218,7 @@ pub enum Action {
     StartSide(Option<String>),
     ReturnFromSide,
     Compact,
+    RenameThread(String),
     ScrollToBottom,
     ScrollToPrompt(u64),
     Copy(String),
@@ -1654,7 +1660,6 @@ struct ApprovalChoice {
 enum PendingInteraction {
     ModelPicker {
         model_index: usize,
-        effort_index: usize,
         /// OpenCode exposes enough models to warrant live filtering. Other
         /// providers keep their compact numbered picker and therefore no input.
         query: Option<Editor>,
@@ -1665,6 +1670,9 @@ enum PendingInteraction {
     /// `effort_index` one past the model's last tier is ultracode.
     EffortPicker {
         effort_index: usize,
+        /// Set when `/model` asks this for the model just picked: Enter then
+        /// moves on to `ModelScope` instead of applying.
+        model_index: Option<usize>,
     },
     /// `/provider`: which runtime the next prompt goes to, and which runtimes
     /// dvz may dial at all. A machine that cannot reach the Codex app-server
@@ -1722,8 +1730,8 @@ enum PendingInteraction {
         errors: Vec<String>,
         notice: Option<String>,
     },
-    /// Second step of `/model`: how long the pick should last. Asked after the
-    /// model is chosen so the common case (this session) stays two keystrokes.
+    /// Last step of `/model`, after the model and its effort: how long the
+    /// pick should last.
     ModelScope {
         model_index: usize,
         effort_index: usize,
@@ -3868,6 +3876,9 @@ pub struct AppState {
     /// thread's own id. A Claude-named room whose turns moved to Codex keeps its
     /// visible id on screen, but only the rollout id resumes the conversation.
     resume_id: String,
+    /// The thread this process opened, until its first prompt goes out and can
+    /// name it.
+    untitled_thread: Option<String>,
     pub turn_id: Option<String>,
     claude_usage_limit_reset: Option<i64>,
     /// Set when the user interrupts after `turn/start` answers but before the
@@ -4230,6 +4241,7 @@ impl AppState {
             active_turn_agent: AgentMode::Standard,
             thread_id,
             resume_id: String::new(),
+            untitled_thread: None,
             turn_id: None,
             claude_usage_limit_reset: None,
             pending_interrupt: false,
@@ -4649,6 +4661,12 @@ impl AppState {
         }
     }
 
+    /// The newest Codex luna model, which titles new Codex threads.
+    pub fn codex_title_model(&self) -> Option<&str> {
+        self.provider_model_index(ModelProvider::Codex, "luna")
+            .map(|index| self.models[index].model.as_str())
+    }
+
     fn apply_provider_model(&mut self, provider: ModelProvider, query: &str) {
         let Some(index) = self.provider_model_index(provider, query) else {
             self.committed
@@ -4703,18 +4721,12 @@ impl AppState {
             .collect()
     }
 
-    fn reset_filtered_model_selection(
-        &self,
-        model_index: &mut usize,
-        effort_index: &mut usize,
-        query: Option<&Editor>,
-    ) {
+    fn reset_filtered_model_selection(&self, model_index: &mut usize, query: Option<&Editor>) {
         let candidates = self.model_picker_indices(query);
         if !candidates.contains(model_index)
             && let Some(first) = candidates.first().copied()
         {
             *model_index = first;
-            *effort_index = self.effort_index_for_model(first);
         }
     }
 
@@ -5111,6 +5123,20 @@ impl AppState {
     /// anything that would talk to the thread has to wait for it.
     pub fn thread_pending(&self) -> bool {
         self.thread_id.is_empty()
+    }
+
+    pub fn note_untitled_thread(&mut self) {
+        self.untitled_thread = Some(self.thread_id.clone());
+    }
+
+    /// True once, for the first prompt sent to the thread `note_untitled_thread`
+    /// marked. A prompt to another thread first — a `/btw` fork — keeps the mark.
+    pub fn take_untitled_thread(&mut self) -> bool {
+        let first = self.untitled_thread.as_deref() == Some(self.thread_id.as_str());
+        if first {
+            self.untitled_thread = None;
+        }
+        first
     }
 
     /// Keeps DevezCode's tab spinner visible while a resumed transcript is
@@ -5884,12 +5910,13 @@ impl AppState {
         &self.selected_effort
     }
 
-    /// Ultracode runs only on a Claude model that offers xhigh.
     fn ultracode_available(&self) -> bool {
-        self.selected_provider() == ModelProvider::Claude
-            && self
-                .selected_model()
-                .is_some_and(|model| model.supports_effort("xhigh"))
+        self.selected_model().is_some_and(has_ultracode)
+    }
+
+    /// `/effort` tunes the current model; `/model`'s effort step the one just picked.
+    fn effort_picker_model(&self, model_index: Option<usize>) -> Option<&ModelInfo> {
+        self.models.get(model_index.unwrap_or(self.selected_model))
     }
 
     pub fn ultracode_active(&self) -> bool {
@@ -8025,17 +8052,15 @@ impl AppState {
     fn normalize_pending_model_picker(&mut self) {
         let Some(PendingInteraction::ModelPicker {
             mut model_index,
-            mut effort_index,
             query,
             search_focused,
         }) = self.pending.take()
         else {
             return;
         };
-        self.reset_filtered_model_selection(&mut model_index, &mut effort_index, query.as_ref());
+        self.reset_filtered_model_selection(&mut model_index, query.as_ref());
         self.pending = Some(PendingInteraction::ModelPicker {
             model_index,
-            effort_index,
             query,
             search_focused,
         });
@@ -10675,6 +10700,13 @@ impl AppState {
                     "OpenCode logout",
                     tr("터미널에서 `opencode auth logout`을 실행하세요.", "Run `opencode auth logout` in a terminal."),
                 )),
+                "/rename" => Some((
+                    "Rename",
+                    tr(
+                        "OpenCode provider는 세션 이름 변경을 지원하지 않습니다.",
+                        "The OpenCode provider doesn't support renaming sessions.",
+                    ),
+                )),
                 _ => None,
             };
             if let Some((title, body)) = notice {
@@ -10718,6 +10750,11 @@ impl AppState {
                 } else {
                     tr("/fast  Fast 서비스 티어 전환\n", "/fast  Toggle the Fast service tier\n")
                 };
+                let rename_help = if on_opencode {
+                    ""
+                } else {
+                    tr("/rename NAME  세션 이름 바꾸기\n", "/rename NAME  Rename the session\n")
+                };
                 let effort_help = if self
                     .selected_model()
                     .is_some_and(|model| !model.efforts.is_empty())
@@ -10730,8 +10767,8 @@ impl AppState {
                     BlockKind::System,
                     "Commands",
                     tr(
-                        format!("/provider [claude|codex|opencode]  provider 선택\n/provider [claude|codex] MODEL  provider와 모델 선택\nOpenCode는 /provider opencode로 전환한 뒤 /model로 모델 선택\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}/auto-knowledge [on|off]  지식 자동 기록 켜기·끄기\n{effort_help}/Response [All|Completed]  응답 압축 방식\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/vibemode  응답·Shell·Diff 표시 한 번에 설정\n/theme [minimal|soft|dark|gray|softpink|midnight]  화면 테마\n/language [korean|english]  화면 언어\n/agent [builder|planner|goal-runner|reviewer|researcher]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 열기·닫기\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/worktree [NAME]  git 작업 트리에서 대화 이어 가기\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n/exit  /quit 별칭\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+Z / Ctrl+Y  입력 실행 취소·다시 실행\nCtrl+S  입력 초안 보관·되돌리기\nCtrl+R  프롬프트 이력 검색\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 열기·닫기(폭은 패널 머리글의 [◀][▶])\nShift+Tab  Claude 권한 모드 전환"),
-                        format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex] MODEL  Select a provider and model\nFor OpenCode, switch with /provider opencode, then select a model with /model\n/model [MODEL] [EFFORT]  Select the current provider's model and effort\n{provider_help}{fast_help}/auto-knowledge [on|off]  Turn automatic knowledge recording on or off\n{effort_help}/Response [All|Completed]  Response compression\n/shell [hide|collapse|expand]  Shell display\n/diff [hide|collapse|expand]  Diff display\n/vibemode  Set response, shell, and diff display at once\n/theme [minimal|soft|dark|gray|softpink|midnight]  Screen theme\n/language [korean|english]  Screen language\n/agent [builder|planner|goal-runner|reviewer|researcher]  Choose the agent role\n/statusline  Status line items\n/side-panel  Open or close the right side panel\n{integration_help}/btw [MESSAGE]  Ephemeral side conversation\n/compact  Compact the context\n/copy  Copy the last response\n/worktree [NAME]  Continue the conversation in a git worktree\n/resume [SESSION]  Pick an earlier session\n/continue  Alias for /resume\n/new  New conversation\n/clear  Alias for /new\n{login_help}/status  Current settings\n/usage  Usage limits\n/quit  Quit\n/exit  Alias for /quit\n\n$  Search plugins, skills, and apps\n@  Search plugins, skills, files, and folders\nEsc or Ctrl+C  Stop the run\nCtrl+Enter / Shift+Enter  New line\nTab  Switch the agent role\nAlt+Enter  Queue a prompt while a response runs\nCtrl+Z / Ctrl+Y  Undo or redo input\nCtrl+S  Stash or restore the input draft\nCtrl+R  Search prompt history\nShift+Space or Alt+W  Collapse or expand task steps\nAlt+P  Open or close the right side panel (resize with [◀][▶] in the panel header)\nShift+Tab  Switch the Claude permission mode"),
+                        format!("/provider [claude|codex|opencode]  provider 선택\n/provider [claude|codex] MODEL  provider와 모델 선택\nOpenCode는 /provider opencode로 전환한 뒤 /model로 모델 선택\n/model [MODEL] [EFFORT]  현재 provider의 모델과 effort 선택\n{provider_help}{fast_help}/auto-knowledge [on|off]  지식 자동 기록 켜기·끄기\n{effort_help}/Response [All|Completed]  응답 압축 방식\n/shell [hide|collapse|expand]  Shell 표시 방식\n/diff [hide|collapse|expand]  Diff 표시 방식\n/vibemode  응답·Shell·Diff 표시 한 번에 설정\n/theme [minimal|soft|dark|gray|softpink|midnight]  화면 테마\n/language [korean|english]  화면 언어\n/agent [builder|planner|goal-runner|reviewer|researcher]  에이전트 역할 선택\n/statusline  하단 상태줄 항목 표시\n/side-panel  우측 사이드패널 열기·닫기\n{integration_help}/btw [MESSAGE]  임시 사이드 대화\n/compact  컨텍스트 압축\n/copy  마지막 답변 복사\n/worktree [NAME]  git 작업 트리에서 대화 이어 가기\n/resume [SESSION]  이전 세션 선택\n/continue  /resume 별칭\n{rename_help}/new  새 대화\n/clear  /new 별칭\n{login_help}/status  현재 설정\n/usage  사용 한도\n/quit  종료\n/exit  /quit 별칭\n\n$  Plugin·Skill·App 검색\n@  Plugin·Skill·파일·폴더 검색\nEsc 또는 Ctrl+C  실행 중단\nCtrl+Enter / Shift+Enter  줄바꿈\nTab  에이전트 역할 전환\nAlt+Enter  응답 중 프롬프트 대기열에 추가\nCtrl+Z / Ctrl+Y  입력 실행 취소·다시 실행\nCtrl+S  입력 초안 보관·되돌리기\nCtrl+R  프롬프트 이력 검색\nShift+Space 또는 Alt+W  작업 단계 접기/펴기\nAlt+P  우측 사이드패널 열기·닫기(폭은 패널 머리글의 [◀][▶])\nShift+Tab  Claude 권한 모드 전환"),
+                        format!("/provider [claude|codex|opencode]  Select a provider\n/provider [claude|codex] MODEL  Select a provider and model\nFor OpenCode, switch with /provider opencode, then select a model with /model\n/model [MODEL] [EFFORT]  Select the current provider's model and effort\n{provider_help}{fast_help}/auto-knowledge [on|off]  Turn automatic knowledge recording on or off\n{effort_help}/Response [All|Completed]  Response compression\n/shell [hide|collapse|expand]  Shell display\n/diff [hide|collapse|expand]  Diff display\n/vibemode  Set response, shell, and diff display at once\n/theme [minimal|soft|dark|gray|softpink|midnight]  Screen theme\n/language [korean|english]  Screen language\n/agent [builder|planner|goal-runner|reviewer|researcher]  Choose the agent role\n/statusline  Status line items\n/side-panel  Open or close the right side panel\n{integration_help}/btw [MESSAGE]  Ephemeral side conversation\n/compact  Compact the context\n/copy  Copy the last response\n/worktree [NAME]  Continue the conversation in a git worktree\n/resume [SESSION]  Pick an earlier session\n/continue  Alias for /resume\n{rename_help}/new  New conversation\n/clear  Alias for /new\n{login_help}/status  Current settings\n/usage  Usage limits\n/quit  Quit\n/exit  Alias for /quit\n\n$  Search plugins, skills, and apps\n@  Search plugins, skills, files, and folders\nEsc or Ctrl+C  Stop the run\nCtrl+Enter / Shift+Enter  New line\nTab  Switch the agent role\nAlt+Enter  Queue a prompt while a response runs\nCtrl+Z / Ctrl+Y  Undo or redo input\nCtrl+S  Stash or restore the input draft\nCtrl+R  Search prompt history\nShift+Space or Alt+W  Collapse or expand task steps\nAlt+P  Open or close the right side panel (resize with [◀][▶] in the panel header)\nShift+Tab  Switch the Claude permission mode"),
                     ),
                 ));
                 Action::None
@@ -10864,24 +10901,13 @@ impl AppState {
                 }
             }
             "/model" if parts.len() == 1 => {
-                let effort_index = self
-                    .selected_model()
-                    .and_then(|model| {
-                        model
-                            .efforts
-                            .iter()
-                            .position(|effort| effort.id == self.selected_effort)
-                    })
-                    .unwrap_or(0);
                 // Like `$`, the picker opens on its first tab: the stars, when
                 // there are any.
                 self.model_favorites_tab = !self.favorite_model_indices().is_empty();
                 let mut model_index = self.selected_model;
-                let mut effort_index = effort_index;
-                self.reset_filtered_model_selection(&mut model_index, &mut effort_index, None);
+                self.reset_filtered_model_selection(&mut model_index, None);
                 self.pending = Some(PendingInteraction::ModelPicker {
                     model_index,
-                    effort_index,
                     query: (self.selected_provider() == ModelProvider::OpenCode)
                         .then(Editor::default),
                     search_focused: false,
@@ -10938,7 +10964,10 @@ impl AppState {
                 } else {
                     effort_index
                 };
-                self.pending = Some(PendingInteraction::EffortPicker { effort_index });
+                self.pending = Some(PendingInteraction::EffortPicker {
+                    effort_index,
+                    model_index: None,
+                });
                 Action::None
             }
             "/effort" if parts.len() == 2 => {
@@ -11174,6 +11203,31 @@ impl AppState {
             "/resume" if parts.len() == 1 => Action::OpenResume,
             "/resume" => Action::ResumeThread(parts[1..].join(" ")),
             "/continue" => Action::OpenResume,
+            "/rename" if parts.len() == 1 => {
+                self.committed
+                    .push(Block::new(BlockKind::Error, "Usage", "/rename NAME"));
+                Action::None
+            }
+            "/rename" if self.side_parent.is_some() => {
+                self.push_notice(
+                    BlockKind::Warning,
+                    "Unavailable here",
+                    tr("기본 대화에서 /rename을 실행하세요.", "Run /rename from the main conversation."),
+                );
+                Action::None
+            }
+            "/rename" if self.thread_pending() => {
+                self.push_notice(
+                    BlockKind::Warning,
+                    "No session yet",
+                    tr(
+                        "첫 프롬프트를 보낸 뒤 이름을 바꿀 수 있습니다.",
+                        "Send the first prompt, then rename the session.",
+                    ),
+                );
+                Action::None
+            }
+            "/rename" => Action::RenameThread(parts[1..].join(" ")),
             // `/btw` is for asking something *while* the main turn runs, so it
             // never waits for the turn to finish.
             "/btw" => Action::StartSide((parts.len() > 1).then(|| parts[1..].join(" "))),
@@ -11441,7 +11495,6 @@ impl AppState {
         match pending {
             PendingInteraction::ModelPicker {
                 mut model_index,
-                mut effort_index,
                 mut query,
                 mut search_focused,
             } => {
@@ -11465,11 +11518,7 @@ impl AppState {
                             // A first star keeps the full list in view, and the
                             // last unstar falls back to it.
                             self.model_favorites_tab = self.model_favorites_tab_shown();
-                            self.reset_filtered_model_selection(
-                                &mut model_index,
-                                &mut effort_index,
-                                query.as_ref(),
-                            );
+                            self.reset_filtered_model_selection(&mut model_index, query.as_ref());
                             action = Action::PersistModelFavorites(self.model_favorites.clone());
                         }
                     }
@@ -11478,11 +11527,7 @@ impl AppState {
                         if !search_focused && !self.favorite_model_indices().is_empty() =>
                     {
                         self.model_favorites_tab = key.code == KeyCode::Left;
-                        self.reset_filtered_model_selection(
-                            &mut model_index,
-                            &mut effort_index,
-                            query.as_ref(),
-                        );
+                        self.reset_filtered_model_selection(&mut model_index, query.as_ref());
                     }
                     KeyCode::Up => {
                         let candidates = self.model_picker_indices(query.as_ref());
@@ -11495,41 +11540,31 @@ impl AppState {
                             search_focused = true;
                         } else {
                             model_index = move_model_index_in(&candidates, model_index, -1);
-                            effort_index = self.effort_index_for_model(model_index);
                         }
                     }
                     KeyCode::Char('k') if !searchable && !ctrl && !alt => {
                         let candidates = self.model_picker_indices(None);
                         model_index = move_model_index_in(&candidates, model_index, -1);
-                        effort_index = self.effort_index_for_model(model_index);
                     }
                     KeyCode::Char('p') if ctrl => {
                         let candidates = self.model_picker_indices(query.as_ref());
                         model_index = move_model_index_in(&candidates, model_index, -1);
-                        effort_index = self.effort_index_for_model(model_index);
                     }
                     KeyCode::Down if search_focused => {
                         search_focused = false;
-                        self.reset_filtered_model_selection(
-                            &mut model_index,
-                            &mut effort_index,
-                            query.as_ref(),
-                        );
+                        self.reset_filtered_model_selection(&mut model_index, query.as_ref());
                     }
                     KeyCode::Down => {
                         let candidates = self.model_picker_indices(query.as_ref());
                         model_index = move_model_index_in(&candidates, model_index, 1);
-                        effort_index = self.effort_index_for_model(model_index);
                     }
                     KeyCode::Char('j') if !searchable && !ctrl && !alt => {
                         let candidates = self.model_picker_indices(None);
                         model_index = move_model_index_in(&candidates, model_index, 1);
-                        effort_index = self.effort_index_for_model(model_index);
                     }
                     KeyCode::Char('n') if ctrl => {
                         let candidates = self.model_picker_indices(query.as_ref());
                         model_index = move_model_index_in(&candidates, model_index, 1);
-                        effort_index = self.effort_index_for_model(model_index);
                     }
                     KeyCode::Char(ch)
                         if !searchable && !ctrl && !alt && ('1'..='9').contains(&ch) =>
@@ -11537,10 +11572,7 @@ impl AppState {
                         let index = ch.to_digit(10).unwrap_or_default() as usize - 1;
                         if let Some(model_index) = self.model_picker_indices(None).get(index).copied()
                         {
-                            self.open_model_scope(
-                                model_index,
-                                self.effort_index_for_model(model_index),
-                            );
+                            self.open_model_effort(model_index);
                             return Action::None;
                         }
                     }
@@ -11558,46 +11590,26 @@ impl AppState {
                     }
                     KeyCode::Backspace if searchable && ctrl => {
                         query.as_mut().expect("searchable query").delete_word_left();
-                        self.reset_filtered_model_selection(
-                            &mut model_index,
-                            &mut effort_index,
-                            query.as_ref(),
-                        );
+                        self.reset_filtered_model_selection(&mut model_index, query.as_ref());
                     }
                     KeyCode::Backspace if searchable => {
                         query.as_mut().expect("searchable query").backspace();
-                        self.reset_filtered_model_selection(
-                            &mut model_index,
-                            &mut effort_index,
-                            query.as_ref(),
-                        );
+                        self.reset_filtered_model_selection(&mut model_index, query.as_ref());
                     }
                     KeyCode::Delete if searchable && ctrl => {
                         query
                             .as_mut()
                             .expect("searchable query")
                             .delete_word_right();
-                        self.reset_filtered_model_selection(
-                            &mut model_index,
-                            &mut effort_index,
-                            query.as_ref(),
-                        );
+                        self.reset_filtered_model_selection(&mut model_index, query.as_ref());
                     }
                     KeyCode::Delete if searchable => {
                         query.as_mut().expect("searchable query").delete();
-                        self.reset_filtered_model_selection(
-                            &mut model_index,
-                            &mut effort_index,
-                            query.as_ref(),
-                        );
+                        self.reset_filtered_model_selection(&mut model_index, query.as_ref());
                     }
                     KeyCode::Char('u') if searchable && ctrl => {
                         query.as_mut().expect("searchable query").clear();
-                        self.reset_filtered_model_selection(
-                            &mut model_index,
-                            &mut effort_index,
-                            query.as_ref(),
-                        );
+                        self.reset_filtered_model_selection(&mut model_index, query.as_ref());
                     }
                     KeyCode::Char('b') if searchable && alt => {
                         query.as_mut().expect("searchable query").move_word_left();
@@ -11607,18 +11619,14 @@ impl AppState {
                     }
                     KeyCode::Char(ch) if searchable && !ctrl && !alt => {
                         query.as_mut().expect("searchable query").insert(ch);
-                        self.reset_filtered_model_selection(
-                            &mut model_index,
-                            &mut effort_index,
-                            query.as_ref(),
-                        );
+                        self.reset_filtered_model_selection(&mut model_index, query.as_ref());
                     }
                     KeyCode::Enter => {
                         if self
                             .model_picker_indices(query.as_ref())
                             .contains(&model_index)
                         {
-                            self.open_model_scope(model_index, effort_index);
+                            self.open_model_effort(model_index);
                             return Action::None;
                         }
                     }
@@ -11626,7 +11634,6 @@ impl AppState {
                 }
                 self.pending = Some(PendingInteraction::ModelPicker {
                     model_index,
-                    effort_index,
                     query,
                     search_focused,
                 });
@@ -11671,16 +11678,24 @@ impl AppState {
                 });
                 Action::None
             }
-            PendingInteraction::EffortPicker { mut effort_index } => {
+            PendingInteraction::EffortPicker {
+                mut effort_index,
+                model_index,
+            } => {
                 let count = self
-                    .selected_model()
-                    .map(|model| model.efforts.len() + usize::from(self.ultracode_available()))
+                    .effort_picker_model(model_index)
+                    .map(effort_step_count)
                     .unwrap_or(1)
                     .max(1);
                 match key.code {
                     KeyCode::Esc => return Action::None,
                     KeyCode::Enter => {
-                        self.apply_effort_step(effort_index);
+                        match model_index {
+                            Some(model_index) => self.open_model_scope(model_index, effort_index),
+                            None => {
+                                self.apply_effort_step(effort_index);
+                            }
+                        }
                         return Action::None;
                     }
                     KeyCode::Left | KeyCode::Up => {
@@ -11697,7 +11712,10 @@ impl AppState {
                     }
                     _ => {}
                 }
-                self.pending = Some(PendingInteraction::EffortPicker { effort_index });
+                self.pending = Some(PendingInteraction::EffortPicker {
+                    effort_index,
+                    model_index,
+                });
                 Action::None
             }
             PendingInteraction::RuntimePicker { mut selected } => {
@@ -12877,11 +12895,11 @@ impl AppState {
                 selected,
             } => {
                 let model = self.models.get(*model_index)?;
-                let effort = model
-                    .efforts
-                    .get(*effort_index)
-                    .map(|effort| effort.id.as_str())
-                    .unwrap_or(&model.default_effort);
+                let effort = match model.efforts.get(*effort_index) {
+                    Some(effort) => effort.id.as_str(),
+                    None if *effort_index < effort_step_count(model) => "ultracode",
+                    None => &model.default_effort,
+                };
                 let summary = if effort.is_empty() {
                     model.display_name.clone()
                 } else {
@@ -12932,11 +12950,14 @@ impl AppState {
                     input_placeholder: "",
                 })
             }
-            PendingInteraction::EffortPicker { effort_index } => {
-                let model = self.selected_model()?;
+            PendingInteraction::EffortPicker {
+                effort_index,
+                model_index,
+            } => {
+                let model = self.effort_picker_model(*model_index)?;
                 let mut slider = effort_slider(model, *effort_index);
                 // As on Claude's track, ultracode is the step past max.
-                if self.ultracode_available() {
+                if has_ultracode(model) {
                     slider.efforts.push("ultracode".to_owned());
                     slider.selected = (*effort_index).min(model.efforts.len());
                 }
@@ -14504,7 +14525,28 @@ impl AppState {
             || self.update_notice.is_some()
     }
 
-    /// Second step of `/model`: ask how long the pick lasts. A model with no
+    /// Second step of `/model`: the picked model's effort, on the `/effort`
+    /// track. A model without tiers has nothing to ask and goes on to the scope.
+    fn open_model_effort(&mut self, model_index: usize) {
+        let Some(model) = self.models.get(model_index) else {
+            return;
+        };
+        if model.efforts.is_empty() {
+            self.open_model_scope(model_index, 0);
+            return;
+        }
+        let effort_index = if self.ultracode_active() && has_ultracode(model) {
+            model.efforts.len()
+        } else {
+            self.effort_index_for_model(model_index)
+        };
+        self.pending = Some(PendingInteraction::EffortPicker {
+            effort_index,
+            model_index: Some(model_index),
+        });
+    }
+
+    /// Last step of `/model`: ask how long the pick lasts. A model with no
     /// choice to make would only add a keystroke, so this is always asked —
     /// persisting is destructive enough that it should never be the default.
     fn open_model_scope(&mut self, model_index: usize, effort_index: usize) {
@@ -14521,12 +14563,21 @@ impl AppState {
         effort_index: usize,
         scope: ModelScope,
     ) -> Action {
-        let effort = self
-            .models
-            .get(model_index)
-            .and_then(|model| model.efforts.get(effort_index))
-            .map(|effort| effort.id.clone());
+        let model = self.models.get(model_index);
+        let ultracode =
+            model.is_some_and(|model| has_ultracode(model) && effort_index == model.efforts.len());
+        let effort = if ultracode {
+            Some("xhigh".to_owned())
+        } else {
+            model
+                .and_then(|model| model.efforts.get(effort_index))
+                .map(|effort| effort.id.clone())
+        };
         self.apply_model(model_index, effort.as_deref());
+        // The step was picked outright, so it sets ultracode either way.
+        if self.selected_model == model_index {
+            self.ultracode = ultracode;
+        }
         if scope == ModelScope::Session {
             return Action::None;
         }
@@ -15122,7 +15173,6 @@ impl AppState {
         match self.pending.take() {
             Some(PendingInteraction::ModelPicker {
                 model_index,
-                effort_index,
                 query,
                 search_focused,
             }) => {
@@ -15139,13 +15189,12 @@ impl AppState {
                     && let Some(clicked) = provider_models.get(clicked).copied()
                 {
                     // The digit keys do exactly this: take the model and move on
-                    // to the question of how long the pick lasts.
-                    self.open_model_scope(clicked, self.effort_index_for_model(clicked));
+                    // to its effort, then how long the pick lasts.
+                    self.open_model_effort(clicked);
                 } else {
                     // The blank row under the list, or the slider's own rows.
                     self.pending = Some(PendingInteraction::ModelPicker {
                         model_index,
-                        effort_index,
                         query,
                         search_focused,
                     });
@@ -15465,11 +15514,30 @@ impl AppState {
     /// A click on one step of an effort track settles it.
     pub fn click_effort_step(&mut self, step: usize) -> Action {
         match self.pending.take() {
-            Some(PendingInteraction::EffortPicker { effort_index }) => {
-                if self.apply_effort_step(step) {
+            Some(PendingInteraction::EffortPicker {
+                effort_index,
+                model_index,
+            }) => {
+                let settled = match model_index {
+                    Some(model_index) => {
+                        let fits = self
+                            .models
+                            .get(model_index)
+                            .is_some_and(|model| step < effort_step_count(model));
+                        if fits {
+                            self.open_model_scope(model_index, step);
+                        }
+                        fits
+                    }
+                    None => self.apply_effort_step(step),
+                };
+                if settled {
                     Action::None
                 } else {
-                    self.pending = Some(PendingInteraction::EffortPicker { effort_index });
+                    self.pending = Some(PendingInteraction::EffortPicker {
+                        effort_index,
+                        model_index,
+                    });
                     Action::Tick(false)
                 }
             }
@@ -18030,6 +18098,17 @@ fn format_duration(duration_ms: u64) -> String {
 }
 
 /// The tiers a model supports, for the renderer to lay out and colour.
+/// Ultracode runs only on a Claude model that offers xhigh.
+fn has_ultracode(model: &ModelInfo) -> bool {
+    ModelProvider::from_model(&model.model) == ModelProvider::Claude
+        && model.supports_effort("xhigh")
+}
+
+/// Steps on a model's effort track: its tiers, then ultracode past max.
+fn effort_step_count(model: &ModelInfo) -> usize {
+    model.efforts.len() + usize::from(has_ultracode(model))
+}
+
 fn effort_slider(model: &ModelInfo, selected: usize) -> EffortSlider {
     EffortSlider {
         efforts: model
@@ -20707,6 +20786,8 @@ mod tests {
                 .all(|line| line.text.is_empty())
         );
 
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(state.overlay_view().expect("model effort").title, "Effort");
         state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let scope = state.overlay_view().expect("model scope");
         assert_eq!(scope.title, "Apply to");
@@ -23926,6 +24007,37 @@ mod tests {
     }
 
     #[test]
+    fn rename_names_the_current_session_once_it_exists() {
+        let mut state = test_state();
+        assert!(matches!(state.run_slash_command("/rename"), Action::None));
+        assert!(matches!(
+            state.run_slash_command("/rename  로그인   수정"),
+            Action::RenameThread(name) if name == "로그인 수정"
+        ));
+        state.thread_id.clear();
+        assert!(matches!(state.run_slash_command("/rename 로그인"), Action::None));
+        state.thread_id = "thread".to_owned();
+        state.restore_side_parent("parent".to_owned(), None);
+        assert!(matches!(state.run_slash_command("/rename 로그인"), Action::None));
+    }
+
+    #[test]
+    fn only_the_first_prompt_of_an_opened_thread_is_titled() {
+        let mut state = test_state();
+        assert!(!state.take_untitled_thread());
+        state.note_untitled_thread();
+        assert!(state.take_untitled_thread());
+        assert!(!state.take_untitled_thread());
+        // `/fast` opens the thread, then a `/btw` fork sends the first prompt: the
+        // fork is not named, and the opened thread's own first prompt still is.
+        state.note_untitled_thread();
+        let opened = std::mem::replace(&mut state.thread_id, "side".to_owned());
+        assert!(!state.take_untitled_thread());
+        state.thread_id = opened;
+        assert!(state.take_untitled_thread());
+    }
+
+    #[test]
     fn clear_starts_a_new_conversation_and_ctrl_l_does_nothing() {
         let mut state = test_state();
         state.editor.insert_str("hello");
@@ -25950,8 +26062,11 @@ mod tests {
         let overlay = state.overlay_view().expect("model picker");
         assert!(overlay.lines[0].text.starts_with("1. "));
         assert!(overlay.lines[1].text.starts_with("2. "));
-        // Picking a model now asks how long it should last before applying.
+        // Picking a model asks its effort, then how long it should last.
         state.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert_eq!(state.selected_model_display_name(), "GPT-5.6 Terra");
+        assert_eq!(state.overlay_view().expect("effort picker").title, "Effort");
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(state.selected_model_display_name(), "GPT-5.6 Terra");
         assert_eq!(
             state.overlay_view().expect("scope picker").title,
@@ -26006,6 +26121,14 @@ mod tests {
         let mut state = test_state();
         state.run_slash_command("/model");
         state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // The effort step opens on the current tier; → takes the next one.
+        state.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            state.overlay_view().expect("scope picker").lines[0]
+                .text
+                .ends_with("xhigh")
+        );
 
         // Second choice in the scope list writes the config.
         let action = state.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
@@ -26013,9 +26136,46 @@ mod tests {
         assert!(matches!(
             action,
             Action::PersistModelDefault { ref model, ref effort }
-                if model == "gpt-5.6-sol" && effort == "high"
+                if model == "gpt-5.6-sol" && effort == "xhigh"
         ));
         assert!(state.overlay_view().is_none());
+    }
+
+    #[test]
+    fn the_model_effort_step_ends_on_ultracode_for_claude() {
+        let mut state = AppState::new(
+            "thread".to_owned(),
+            "cwd".to_owned(),
+            "account".to_owned(),
+            vec![test_model("claude:claude-opus-5-5", "Opus 5.5", true)],
+            "claude:claude-opus-5-5",
+            Some("high"),
+        );
+        state.run_slash_command("/model");
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        {
+            let effort = state.overlay_view().expect("effort picker");
+            let slider = effort.slider.expect("effort track");
+            assert_eq!(slider.efforts.last().map(String::as_str), Some("ultracode"));
+        }
+
+        state.click_effort_step(6);
+        assert!(
+            state.overlay_view().expect("scope picker").lines[0]
+                .text
+                .ends_with("ultracode")
+        );
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(state.ultracode_active());
+
+        // Picking a plain tier the same way leaves ultracode.
+        state.run_slash_command("/model");
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!state.ultracode_active());
+        assert_eq!(state.selected_effort, "ultra");
     }
 
     #[test]
@@ -26056,6 +26216,7 @@ mod tests {
         let mut state = test_state();
         state.run_slash_command("/model");
         state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         let overlay = state.overlay_view().expect("scope picker");
         let options = &overlay.lines[2..];
@@ -26074,6 +26235,7 @@ mod tests {
     fn model_scope_descriptions_share_a_column() {
         let mut state = test_state();
         state.run_slash_command("/model");
+        state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         state.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         let overlay = state.overlay_view().expect("scope picker");

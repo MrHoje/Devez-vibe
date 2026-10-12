@@ -5,7 +5,7 @@ import { execFile, spawn } from "node:child_process";
 import { createReadStream, existsSync, readFileSync, readdirSync } from "node:fs";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve as resolvePath, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -17,6 +17,7 @@ import {
   getSessionMessages,
   filterEscalatingDefaultMode,
   listSessions,
+  renameSession,
   resolveSettings,
   startup,
   tool,
@@ -221,9 +222,13 @@ function applyClaudeExecutable(options, params) {
 
 // The SDK model list carries no window size, so the status line would stay
 // blank until a turn reports one — and a fresh session has no turn yet. Claude
-// ships a 200k window, and the `[1m]` variants a 1M one.
+// defaults here stay unchanged; Haiku 5.5 has a native 1M window.
 function claudeContextWindow(...names) {
-  const oneMillion = names.some((name) => String(name || "").includes("[1m]"));
+  if (["1", "true"].includes(String(process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT || "").toLowerCase())) {
+    return 200_000;
+  }
+  const oneMillion = names.some((name) => String(name || "").includes("[1m]")
+    || /claude-haiku-5-5(?:$|[-\[])/i.test(String(name || "")));
   return oneMillion ? 1_000_000 : 200_000;
 }
 
@@ -3339,6 +3344,8 @@ const STARTUP_FAILURE_GUIDES = {
   org_pin_mismatch: "조직 설정이 허용하지 않는 계정으로 로그인되어 있습니다. 허용된 조직 계정으로 다시 로그인하세요.",
   managed_settings_invalid: "조직 관리 설정을 읽지 못했습니다. 관리자에게 설정 확인을 요청하세요.",
   remote_settings_required_unavailable: "조직이 요구하는 관리 설정을 불러오지 못했습니다. 네트워크를 확인한 뒤 다시 시작하세요.",
+  org_config_required_unavailable: "조직이 요구하는 정책 한도와 관리 설정을 불러오지 못했습니다. 네트워크·프록시를 확인한 뒤 다시 시작하세요.",
+  org_config_refused: "조직이 요구하는 정책 한도와 관리 설정의 조회가 거부되었습니다. 다시 로그인하거나 관리자에게 Claude Code 사용 권한을 문의하세요.",
   gateway_signin_required: "게이트웨이가 이 로그인을 종료했습니다. 다시 로그인하세요.",
   gateway_access_denied: "게이트웨이가 이 계정의 관리 설정을 거부했습니다. 관리자에게 권한을 요청하세요.",
   proxy_invalid: "프록시 설정이 올바른 주소 형식이 아닙니다. 프록시 환경 변수를 확인하세요.",
@@ -4478,6 +4485,40 @@ async function dispatch(method, params = {}) {
   if (method === "session/compact") {
     return startPrompt({ ...params, input: [{ type: "text", text: "/compact" }] });
   }
+  // The running CLI re-reads the transcript's last custom title before it
+  // re-stamps session metadata, so a rename from here survives a live session.
+  if (method === "session/rename") {
+    const id = liveSessionId(params.sessionId);
+    const dir = await readableCwd(id, params.cwd);
+    // An automatic title never replaces a name given in the meantime.
+    if (params.unnamedOnly && (await getSessionInfo(id, { dir }))?.customTitle) return {};
+    await renameSession(id, String(params.name ?? ""), { dir });
+    return {};
+  }
+  // One Haiku reply that dvz titles a new session with. It reads no settings,
+  // hooks or project files, runs no tools, keeps no transcript, and leaves the
+  // DevezCode room out so the host never takes it for the room's session.
+  if (method === "session/title") {
+    await ensureClaudeExecutableChoice(params);
+    const env = sanitizedEnvironment();
+    delete env.DEVEZCODE_ROOM_ID;
+    const options = {
+      cwd: tmpdir(),
+      model: "haiku",
+      effort: "low",
+      maxTurns: 1,
+      persistSession: false,
+      settingSources: [],
+      tools: [],
+      env,
+    };
+    applyClaudeExecutable(options, params);
+    let reply = "";
+    for await (const message of await startAgentQuery(String(params.prompt ?? ""), options)) {
+      if (message.type === "result") reply = message.result || "";
+    }
+    return { reply };
+  }
   if (method === "session/fork") {
     const source = liveSessionId(params.sessionId);
     const forked = await forkSession(source, { dir: await readableCwd(source, params.cwd) });
@@ -5280,13 +5321,31 @@ async function runSelfTest() {
   if (usage.totalTokens !== 68_802 || usage.inputTokens !== 68_502) {
     throw new Error(`Claude usage self-test failed: ${JSON.stringify(usage)}`);
   }
-  const windows = [
-    catalogEntry({ value: "opus[1m]", resolvedModel: "claude-opus-5[1m]" }, "").contextWindow,
-    catalogEntry({ value: "sonnet", resolvedModel: "claude-sonnet-5" }, "").contextWindow,
-    catalogEntry({ value: "haiku", resolvedModel: "x", contextWindow: 300_000 }, "").contextWindow,
-  ];
-  if (windows.join(",") !== "1000000,200000,300000") {
-    throw new Error(`Claude context window self-test failed: ${windows.join(",")}`);
+  const savedDisable1M = process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
+  try {
+    delete process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
+    const windows = [
+      catalogEntry({ value: "opus[1m]", resolvedModel: "claude-opus-5[1m]" }, "").contextWindow,
+      catalogEntry({ value: "sonnet", resolvedModel: "claude-sonnet-5" }, "").contextWindow,
+      catalogEntry({ value: "haiku", resolvedModel: "x", contextWindow: 300_000 }, "").contextWindow,
+      catalogEntry({ value: "haiku", resolvedModel: "claude-haiku-5-5" }, "").contextWindow,
+      catalogEntry({ value: "claude-haiku-5-5-20261007" }, "").contextWindow,
+      catalogEntry({ value: "claude-haiku-4-5-20251001" }, "").contextWindow,
+    ];
+    if (windows.join(",") !== "1000000,200000,300000,1000000,1000000,200000") {
+      throw new Error(`Claude context window self-test failed: ${windows.join(",")}`);
+    }
+    for (const disabled of ["1", "true"]) {
+      process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = disabled;
+      if (catalogEntry({ value: "haiku", resolvedModel: "claude-haiku-5-5" }, "").contextWindow !== 200_000
+        || catalogEntry({ value: "haiku", resolvedModel: "claude-haiku-5-5", contextWindow: 300_000 }, "").contextWindow !== 300_000
+        || catalogEntry({ value: "haiku", resolvedModel: "claude-haiku-5-5", contextWindowSize: 400_000 }, "").contextWindow !== 400_000) {
+        throw new Error("Claude disabled 1M context self-test failed");
+      }
+    }
+  } finally {
+    if (savedDisable1M === undefined) delete process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT;
+    else process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT = savedDisable1M;
   }
   const catalogModels = [
     {

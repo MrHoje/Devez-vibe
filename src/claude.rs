@@ -420,13 +420,18 @@ pub fn model_catalog() -> Value {
     let mut previous_opus =
         claude_model("claude:claude-opus-5", "Claude Opus 5", efforts(), false);
     previous_opus["hidden"] = json!(true);
+    let mut haiku = claude_model("claude:haiku", "Claude Haiku 5.5", efforts(), false);
+    haiku["supportsAutoMode"] = json!(true);
+    let one_million_disabled = env::var("CLAUDE_CODE_DISABLE_1M_CONTEXT")
+        .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true"));
+    haiku["contextWindow"] = json!(if one_million_disabled { 200_000 } else { 1_000_000 });
     json!({
         "data": [
             claude_model("claude:claude-fable-5-1", "Claude Fable 5.1", efforts(), false),
             claude_model("claude:opus", "Claude Opus 5.5", efforts(), false),
             previous_opus,
             claude_model("claude:sonnet", "Claude Sonnet 5.5", efforts(), true),
-            claude_model("claude:haiku", "Claude Haiku 4.5", json!([]), false),
+            haiku,
             // Older versions follow every family's newest, like the bridge's order.
             // The `fable` alias now resolves to Fable 5.1, so Fable 5 needs its id.
             claude_model("claude:claude-fable-5", "Claude Fable 5", efforts(), false)
@@ -866,7 +871,7 @@ mod tests {
                 "Claude Opus 5.5",
                 "Claude Opus 5",
                 "Claude Sonnet 5.5",
-                "Claude Haiku 4.5",
+                "Claude Haiku 5.5",
                 "Claude Fable 5"
             ]
         );
@@ -882,7 +887,23 @@ mod tests {
             .iter()
             .find(|model| model.get("model").and_then(Value::as_str) == Some("claude:haiku"))
             .unwrap();
-        assert_eq!(haiku.pointer("/supportedReasoningEfforts/0"), None);
+        assert_eq!(
+            haiku["supportedReasoningEfforts"],
+            json!([
+                { "reasoningEffort": "low" },
+                { "reasoningEffort": "medium" },
+                { "reasoningEffort": "high" },
+                { "reasoningEffort": "xhigh" },
+                { "reasoningEffort": "max" }
+            ])
+        );
+        assert_eq!(haiku["supportsAutoMode"], json!(true));
+        let one_million_disabled = env::var("CLAUDE_CODE_DISABLE_1M_CONTEXT")
+            .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true"));
+        assert_eq!(
+            haiku["contextWindow"],
+            json!(if one_million_disabled { 200_000 } else { 1_000_000 })
+        );
     }
 
     #[test]
@@ -1006,12 +1027,12 @@ mod tests {
             package
                 .pointer("/dependencies/@anthropic-ai~1claude-agent-sdk")
                 .and_then(Value::as_str),
-            Some("0.3.292")
+            Some("0.3.296")
         );
         assert_eq!(
             lock.pointer("/packages//dependencies/@anthropic-ai~1claude-agent-sdk")
                 .and_then(Value::as_str),
-            Some("0.3.292")
+            Some("0.3.296")
         );
         assert!(bridge.contains(
             "const CLAUDE_TASK_TOOLS = [\"TaskCreate\", \"TaskGet\", \"TaskUpdate\", \"TaskList\"]"

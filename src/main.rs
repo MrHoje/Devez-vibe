@@ -679,6 +679,7 @@ async fn open_pending_thread(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| state.selected_effort().to_owned());
     state.attach_thread(thread_id, cwd, &actual_model, Some(&effort));
+    state.note_untitled_thread();
     state.note_resume_id(&server.resume_id(&state.thread_id));
     apply_deferred_startup_actions(server, state).await;
     Ok(true)
@@ -3389,6 +3390,20 @@ async fn execute_action(
                 state.push_notice(BlockKind::Error, "Compaction failed", error.to_string());
             }
         }
+        Action::RenameThread(name) => match server
+            .request(
+                "thread/name/set",
+                json!({ "threadId": state.thread_id, "name": name }),
+            )
+            .await
+        {
+            Ok(_) => state.push_notice(
+                BlockKind::System,
+                "Session renamed",
+                tr(format!("새 이름: {name}"), format!("New name: {name}")),
+            ),
+            Err(error) => state.push_notice(BlockKind::Error, "Rename failed", error.to_string()),
+        },
         Action::OpenMcp(notice) => match list_mcp_servers(server, state).await {
             Ok(response) => {
                 let model = state.selected_model_name().to_owned();
@@ -6275,6 +6290,10 @@ async fn start_turn(
     devezcode::note_prompt(&text);
     let model = state.selected_model_name().to_owned();
     let effort = state.selected_effort().to_owned();
+    if state.take_untitled_thread() {
+        let title_model = state.codex_title_model().unwrap_or(&model);
+        server.title_new_thread(&state.thread_id, title_model, &text);
+    }
     state.note_pending_turn_model(&model);
     state.note_pending_turn_effort(&effort);
     let input = state.turn_input(text);
@@ -9319,14 +9338,19 @@ mod tests {
     }
 
     /// Clicking a model row does what typing its number does: takes the model and
-    /// moves on to how long the pick should last.
+    /// moves on to its effort, then how long the pick should last.
     #[test]
     fn clicking_a_model_row_carries_on_to_the_scope_question() {
         let mut state = state_with_a_model();
         pick_action(&mut state, Pick::Model);
 
         pick_action(&mut state, Pick::Row(0));
+        assert_eq!(
+            state.view().overlay.map(|overlay| overlay.title),
+            Some("Effort".to_owned())
+        );
 
+        pick_action(&mut state, Pick::Effort(0));
         assert_eq!(
             state.view().overlay.map(|overlay| overlay.title),
             Some("Apply to".to_owned())

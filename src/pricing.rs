@@ -130,7 +130,7 @@ const PRICES: &[(&str, f64, f64)] = &[
     ("claude-opus-4-6", 5.0, 25.0),
     ("claude-opus-4-5", 5.0, 25.0),
     ("claude-opus-4-1", 15.0, 75.0),
-    // Also Sonnet 5.5, which kept Sonnet 5's price.
+    // Sonnet 5.5 kept Sonnet 5's input/output prices; cache reads differ below.
     ("claude-sonnet-5", 2.0, 10.0),
     ("claude-sonnet-4-6", 3.0, 15.0),
     ("claude-sonnet-4-5", 3.0, 15.0),
@@ -146,12 +146,15 @@ pub fn estimate_usd(model: &str, totals: TokenTotals) -> Option<f64> {
         .find(|(slug, _, _)| model.contains(slug))
         .copied()?;
     // Fable 5.1 and Mythos 5.1 cut cache reads to $0.25/MTok — 0.025x their
-    // input rate — and Opus 5.5 and GPT-6.1 Sol to 0.05x, against the 0.1x
-    // every other model on either vendor still charges.
+    // input rate — and Opus 5.5, Sonnet 5.5 and GPT-6.1 Sol to 0.05x, against
+    // the 0.1x every other model on either vendor still charges.
     let cache_read_multiplier =
         if model.contains("claude-fable-5-1") || model.contains("claude-mythos-5-1") {
             0.025
-        } else if model.contains("claude-opus-5-5") || model.contains("gpt-6.1-sol") {
+        } else if model.contains("claude-opus-5-5")
+            || model.contains("claude-sonnet-5-5")
+            || model.contains("gpt-6.1-sol")
+        {
             0.05
         } else {
             CACHE_READ_MULTIPLIER
@@ -201,6 +204,17 @@ mod tests {
     }
 
     #[test]
+    fn sonnet_5_5_charges_lower_cache_reads_without_changing_sonnet_5() {
+        let totals = TokenTotals {
+            cache_read: 1_000_000,
+            ..Default::default()
+        };
+        // Published cache-hit prices per million tokens, independent of the multipliers.
+        assert!((estimate_usd("claude-sonnet-5-5[1m]", totals).unwrap() - 0.10).abs() < 1e-9);
+        assert!((estimate_usd("claude-sonnet-5", totals).unwrap() - 0.20).abs() < 1e-9);
+    }
+
+    #[test]
     fn breakdown_splits_cached_and_written_tokens_out_of_the_input_total() {
         let totals = TokenTotals::from_breakdown(&json!({
             "totalTokens": 130_000,
@@ -246,6 +260,8 @@ mod tests {
         assert_eq!(estimate_usd("claude-sonnet-5", totals), Some(12.0));
         assert_eq!(estimate_usd("claude-sonnet-4-6", totals), Some(18.0));
         assert_eq!(estimate_usd("claude-opus-4-1", totals), Some(90.0));
+        // Haiku 5.5 needs per-request pricing tiers; cumulative tokens cannot price it.
+        assert_eq!(estimate_usd("claude-haiku-5-5", totals), None);
         assert_eq!(estimate_usd("unlisted-model", totals), None);
     }
 
